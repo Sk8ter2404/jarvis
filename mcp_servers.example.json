@@ -1,0 +1,76 @@
+{
+  "_comment": [
+    "Copy this file to mcp_servers.json and edit. Every server here is",
+    "loaded by skills/mcp_tools.py on JARVIS boot — each tool the server",
+    "exposes becomes a JARVIS action named mcp_<server>_<tool>.",
+    "",
+    "Transports:",
+    "  stdio            — spawn a local subprocess (most community servers)",
+    "  sse              — connect to an HTTP server-sent-events endpoint",
+    "  streamable_http  — newer HTTP transport (mcp >= 1.x)",
+    "",
+    "Install hint: pip install \"mcp[cli]\".",
+    "Node-based servers also need a recent Node.js + npx on PATH."
+  ],
+
+  "filesystem": {
+    "transport": "stdio",
+    "command":   "npx",
+    "args":      ["-y", "@modelcontextprotocol/server-filesystem",
+                  "C:/JARVIS/data"],
+    "enabled":   true,
+    "prefix":    "fs"
+  },
+
+  "github": {
+    "transport": "stdio",
+    "command":   "npx",
+    "args":      ["-y", "@modelcontextprotocol/server-github"],
+    "env":       {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_REPLACE_ME"},
+    "enabled":   false
+  },
+
+  "brave_search": {
+    "transport": "stdio",
+    "command":   "npx",
+    "args":      ["-y", "@modelcontextprotocol/server-brave-search"],
+    "env":       {"BRAVE_API_KEY": "REPLACE_ME"},
+    "enabled":   false,
+    "prefix":    "brave"
+  },
+
+  "slack": {
+    "transport": "stdio",
+    "command":   "npx",
+    "args":      ["-y", "@modelcontextprotocol/server-slack"],
+    "env":       {
+      "SLACK_BOT_TOKEN":  "xoxb-REPLACE_ME",
+      "SLACK_TEAM_ID":    "T-REPLACE_ME"
+    },
+    "enabled":   false
+  },
+
+  "notion": {
+    "transport": "stdio",
+    "command":   "npx",
+    "args":      ["-y", "@notionhq/notion-mcp-server"],
+    "env":       {"NOTION_API_KEY": "secret_REPLACE_ME"},
+    "enabled":   false
+  },
+
+  "postgres": {
+    "transport": "stdio",
+    "command":   "npx",
+    "args":      ["-y", "@modelcontextprotocol/server-postgres",
+                  "postgresql://user:pass@localhost:5432/mydb"],
+    "enabled":   false,
+    "prefix":    "pg"
+  },
+
+  "remote_example": {
+    "transport": "sse",
+    "url":       "http://localhost:8788/sse",
+    "headers":   {"Authorization": "Bearer REPLACE_ME"},
+    "enabled":   false
+  }
+}

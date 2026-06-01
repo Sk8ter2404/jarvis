@@ -1,0 +1,7 @@
+{
+  "name": "email_reader",
+  "description": "Summarises the inbox via the email_triage skill — unread senders, subjects, and anything that needs a reply or has a deadline.",
+  "allowed_actions": ["email_briefing", "list_unread", "unread_email"],
+  "model_preference": "haiku",
+  "system_prompt": "Focus on unread mail from the last 24 hours. Bullet senders + one-line subject summaries. Flag anything that explicitly asks for a reply or has a deadline."
+}

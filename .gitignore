@@ -1,0 +1,141 @@
+# ─── Python ──────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+
+# ─── Test / coverage artifacts ─────────────────────────────────────────────
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.pytest_cache/
+
+# ─── Release build output ──────────────────────────────────────────────────
+dist/
+build/
+
+# ─── Logs ────────────────────────────────────────────────────────────────
+*.log
+logs/
+logs_staging/
+
+# ─── Backups & generated artifacts ─────────────────────────────────────────
+backups/
+_backups/
+screenshots/
+camera_previews/
+# NOTE: audio/ is NOT ignored — it's a code package (audio/itunes_bridge.py)
+# that the monolith imports at boot. Ignoring it broke the release (the
+# clean-room boot caught a ModuleNotFoundError). Never re-add `audio/` here.
+
+# ─── Scratch / runtime temp files ──────────────────────────────────────────
+*.tmp
+
+# ─── Runtime locks & state flags ───────────────────────────────────────────
+jarvis.lock
+jarvis_staging.lock
+*.singleton.lock
+.overnight_active
+.jarvis_watcher_state
+
+# ─── Credentials & tokens (never commit) ───────────────────────────────────
+microsoft_graph_token.json
+ms_graph_msal_cache.json
+gmail_credentials.json
+data/gmail_token.json
+data/*token*.json
+data/*_token.json
+# Secrets — env + smart-home/router configs (some hold OAuth secrets, the
+# DPAPI router blob, plaintext device creds). 2026-05-30 audit.
+.env
+.env.*
+!.env.example
+data/*_config.json
+data/deco_*.json
+data/sh_*_config.json
+data/*.pickle
+data/*cookie*
+# Voiceprints — biometric data + the privilege grants keyed to them.
+data/voiceprints/
+# Long-term memory + fact stores — PII (names, email, employer, financial
+# references) that must never be committed. The live prompt already gets
+# these; a git commit would publish them.
+bobert_memory.json
+memory.json
+data/chappie_facts.json
+data/long_term_memory/
+# Robot firmware secrets (WiFi/OTA passwords) — belt-and-braces; the Robot
+# Project folder has its own .gitignore too.
+**/secrets.h
+
+# --- Personal skills kept permanently LOCAL (never shipped) ------------------
+# These embed specific people or a one-off personal event; the screener skill
+# is also deeply wired into those personal skills. Generic versions would be a
+# redesign, so they stay on disk + working for the owner but are excluded from
+# the shared build. (network_deco WAS genericised to env-driven config and
+# re-included — do not re-add it here.)
+skills/vip_boss_mode.py
+skills/vip_intercept.py
+skills/trip_planner.py
+skills/teams_screener.py
+
+# --- Gitignored local extensions for dev tooling (owner-specific PII patterns
+#     + internal action names; keeps real values out of the shipped scanners) -
+tools/pii_local.py
+tools/audit_local.py
+
+# --- Runtime state, caches & HUD geometry (regenerated at runtime) -----------
+*_state.json
+hud_state.json
+hud_config.json
+hud_reticles.json
+unified_hud_geometry.json
+.morning_briefing_last
+*.flag
+JARVIS_MANUAL.xlsx
+geo_cache.json
+weather_cache.json
+notification_rules.json
+mcp_servers.json
+pending_speech.json
+injected_commands*.json
+
+# --- Per-user editor / agent settings (local, not shipped) -------------------
+.claude/settings.local.json
+
+# --- All runtime data & learned memory (PII) — ship templates instead --------
+data/*
+!data/.gitkeep
+memory/*
+!memory/.gitkeep
+tts/
+
+# --- Dev / pipeline / audit artifacts (internal, not for distribution) -------
+audit_report.json
+audit_report.md
+audit_conflict_matrix.md
+*_AUDIT_REPORT.md
+QUALITY_AUDIT_REPORT.md
+CRASH_DIAGNOSTIC_REPORT.md
+EXTERNAL_REVIEW_*.md
+MORNING_REPORT.md
+stability_smoke*.json
+_round2_queue.txt
+_prompt_drift_*.txt
+overnight_log.txt
+upgrade_log.txt
+jarvis_todo.md
+
+# --- Personal / internal docs & machine-specific launchers -------------------
+# (rewritten as clean, generic versions for the public release in Phase 5)
+CHANGELOG.md
+SETUP_GUIDE.md
+docs/CHAPPIE_MODE_SPEC.md
+_boot_jarvis.ps1
+_diag_loop.sh
+
+# --- Staging runtime ---------------------------------------------------------
+data_staging/
+logs_staging/
+
+# --- 3D-print binary assets (large; distributed separately if at all) --------
+Robot Project/

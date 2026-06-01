@@ -1,0 +1,27 @@
+# Normalise line endings for a cross-platform repo + Linux CI.
+# Text files are stored LF in the repo and checked out native; Windows
+# scripts stay CRLF; binaries are never touched.
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.sh    text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.txt   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+
+*.ps1   text eol=crlf
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.ico   binary
+*.xlsx  binary
+*.pdf   binary
+*.stl   binary
+*.3mf   binary
+*.npy   binary
+*.pt    binary

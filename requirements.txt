@@ -1,0 +1,281 @@
+# Bobert PC Companion — Python dependencies
+# Install with:  pip install -r requirements.txt
+
+# ── Speech-to-text (GPU-accelerated on the 3090) ──────────────────────────
+# faster-whisper (ctranslate2 backend) is the PRIMARY STT path and runs
+# large-v3-turbo on CUDA at ~15x real-time. ctranslate2 ships its own CUDA
+# runtime but needs the cublas + cudnn DLLs from these nvidia-* wheels, which
+# bobert_companion._register_cuda_dll_dirs() adds to PATH at boot. WITHOUT
+# these four lines a clean reinstall silently falls back to CPU openai-whisper
+# (10x slower) — they were missing until the 2026-05-30 security/GPU audit.
+faster-whisper       # primary STT — ctranslate2 CUDA backend, large-v3-turbo
+ctranslate2>=4.4     # CUDA inference engine under faster-whisper
+nvidia-cublas-cu12   # cublas64_12.dll — required by ctranslate2 on GPU
+nvidia-cudnn-cu12    # cudnn64_9.dll — required by ctranslate2 on GPU
+openai-whisper       # CPU fallback STT only (downloads ~150 MB 'base' model)
+sounddevice          # audio I/O
+soundfile            # read/write audio for TTS
+numpy                # audio math
+requests             # HTTP to robot
+opencv-python        # face detection
+
+# AI backend — install the one(s) you want:
+anthropic            # Claude API — needs ANTHROPIC_API_KEY env var
+ollama               # optional — local LLM backend (free, no internet; also run: ollama pull llama3)
+
+# TTS — primary (needs internet, great quality Microsoft neural voices):
+edge-tts
+
+# TTS — offline fallback (lower quality, no internet needed). Activated when
+# edge-tts is unreachable (e.g. Bing 503s); without it a network blip
+# silences JARVIS entirely.
+pyttsx3
+
+# TTS — local voice cloning (skills/custom_voice.py). OPTIONAL. Coqui XTTS-v2
+# clones the user's voice from a ~10 s WAV sample and renders every reply in
+# it. ~3 GB VRAM on a CUDA GPU; the skill registers cleanly without TTS
+# installed and tells the user to install it on first attempted use.
+# Set TTS_BACKEND='xtts' and XTTS_VOICE_SAMPLE='/path/to/sample.wav' to enable.
+# Uncomment to install:
+# TTS                  # Coqui TTS — bundles XTTS-v2 model loader
+# librosa              # optional, used to map edge-tts rate/pitch presets onto XTTS output
+
+# ── Machine-readable optional-dependency declarations (codebase auditor) ──────
+# The packages below are imported CONDITIONALLY (try/except, with graceful
+# fallback) and are described in prose elsewhere in this file. They're declared
+# here with the `# optional:` marker so tools/audit_codebase.py treats their
+# guarded imports as intentional — WITHOUT pip installing these (often heavy)
+# packages. Names are the IMPORT names; pip name noted where it differs.
+# optional: RealtimeTTS              # streaming TTS (core/realtime_voice)
+# optional: RealtimeSTT              # streaming STT (core/realtime_voice)
+# optional: TTS                      # Coqui XTTS-v2 voice cloning (skills/custom_voice)
+# optional: rank_bm25                # pip: rank-bm25 — BM25 retrieval (core/long_term_memory)
+# optional: pvporcupine              # Porcupine wake-word engine (core/wake_word)
+# optional: webrtc_audio_processing  # pip: webrtc-audio-processing — AEC (core/audio_processor)
+# optional: langchain_anthropic      # pip: langchain-anthropic — alt LLM backend
+# optional: diffusers                # Stable Diffusion image gen (skills/image_gen)
+# optional: google_nest_sdm          # pip: google-nest-sdm — Nest smart-home (skills/sh_nest)
+
+# Streaming realtime voice pipeline (core/realtime_voice.py). OPTIONAL.
+# RealtimeSTT delivers partial Whisper transcripts + VAD endpointing in
+# under 300 ms; RealtimeTTS streams synthesised audio as the LLM produces
+# the reply, giving first-syllable latency under 500 ms with single-queue
+# barge-in. Set VOICE_MODE='realtime' in bobert_companion.py to engage.
+# The pipeline falls back to the turn-based path automatically when
+# either dep is missing, so leaving these uncommented costs nothing.
+# Uncomment to install:
+# RealtimeSTT          # KoljaB — Whisper-backed streaming STT recorder
+# RealtimeTTS          # KoljaB — TextToAudioStream for streaming TTS
+
+# Long-term tiered memory (core/long_term_memory.py). OPTIONAL.
+# Replaces flat bobert_memory.json["facts"] lookup with working / semantic /
+# episodic tiers. chromadb + sentence-transformers handle dense semantic
+# retrieval; rank_bm25 adds a sparse lexical channel that the retriever
+# blends with the dense scores. Missing any of these degrades gracefully
+# to the JSON-mirror + most-recent-N fallback, so importing is always safe.
+# Uncomment to install (chromadb + sentence-transformers are also reused
+# by the personal-files RAG below — no need to install them twice):
+# rank_bm25                      # sparse BM25 retrieval, used in hybrid blend
+
+# Personal-files RAG (core/rag_indexer.py + skills/personal_rag.py). OPTIONAL.
+# A "second brain" that watches user folders, embeds files into a local
+# ChromaDB collection, and answers questions like 'find that doc about X'.
+# The skill registers cleanly without these — the actions return a friendly
+# "install chromadb + sentence-transformers" line until the deps are present.
+# Uncomment to install:
+# chromadb                       # persistent vector store at data/rag_chroma/
+# sentence-transformers          # BGE-small embeddings + optional reranker
+# watchdog                       # live file-change observer (recommended)
+# pypdf                          # .pdf text extraction
+# python-docx                    # .docx text extraction
+
+# Screen vision + UI automation (lets JARVIS see your screen and click things):
+pillow               # screenshots
+mss                  # reliable multi-monitor screenshots (Windows DPI-safe)
+pyautogui            # mouse/keyboard automation
+pywin32              # Windows COM (iTunes control, etc.)
+
+# System monitor skill — CPU / RAM / process / disk / network stats
+psutil
+
+# Bambu H2D printer monitor skill — MQTT client for the printer's local API
+paho-mqtt
+
+# OBS Studio voice control skill — WebSocket client for OBS 28+ (v5 protocol,
+# ws://127.0.0.1:4455). OPTIONAL: the skill registers cleanly without it and
+# tells the user to install it on first call. Set OBS_PASSWORD env var to
+# match Tools → WebSocket Server Settings.
+# Uncomment to install:
+# obs-websocket-py
+
+# Microsoft Graph (skills/ms_graph.py) — calendar + unread-mail count for the
+# morning briefing & HUD card. Replaces the Outlook COM lookup that broke
+# whenever Outlook desktop wasn't running. Auth via device-code flow:
+#     python -m skills.ms_graph --auth
+msal
+
+# News briefing skill — RSS / Atom feed parser used by skills/news_briefing.py
+# and pulled into morning_briefing/evening_briefing. Optional: the skill falls
+# back to a stdlib ElementTree parser if feedparser isn't installed, but
+# feedparser handles malformed feeds more robustly.
+feedparser
+
+# System-tray applet — animated arc-reactor icon + right-click menu (tray.py)
+pystray
+
+# Holographic HUD v2 (hud/holographic_hud_v2.py) — PyQt6 QGraphicsView arc
+# reactor on the top monitor (jarvis_todo.md 2026-05-29 09:18). Renders
+# CPU/RAM rings, current intent tag, last action, ambient/wake state, and
+# a rolling 5-line transcript with QGraphicsDropShadowEffect cyan glow.
+# Without PyQt6 the launcher subprocess exits cleanly and no other HUD
+# surface is affected; the v1 tkinter overlays remain fully usable.
+PyQt6
+
+# Audio ducking — drop Chrome / Spotify / Apple Music / Edge WASAPI session
+# volume to ~25% while JARVIS speaks, then fade back up. Windows-only;
+# bobert_companion.py imports it lazily so the rest of JARVIS still runs
+# on macOS / Linux without it.
+pycaw; sys_platform == "win32"
+comtypes; sys_platform == "win32"
+
+# Model Context Protocol client (core/mcp_client.py + skills/mcp_tools.py).
+# OPTIONAL. Unlocks the entire MCP ecosystem (filesystem, GitHub, Slack,
+# Notion, Brave Search, Postgres, Puppeteer, ...) as JARVIS actions named
+# mcp_<server>_<tool>. The skill stays silent unless both the SDK is
+# installed AND mcp_servers.json exists at the project root (see
+# mcp_servers.example.json for the schema). Most community servers run as
+# stdio subprocesses via npx, so a recent Node.js + npx on PATH is also
+# needed for the node-based servers.
+# Uncomment to install:
+# mcp                  # official Anthropic MCP Python SDK (>= 1.0)
+
+# Browser deep automation (skills/browser_agent.py). OPTIONAL.
+# Spawns a sandboxed headed Chromium controlled by Claude — sees the DOM,
+# clicks, types, recovers from page changes. Voice triggers like 'book me a
+# haircut Friday afternoon', 'fill out this form on the open tab', 'find the
+# cheapest flight to Tokyo'. Uses its own profile dir at
+# data/browser_agent_profile/ so it never touches your main Chrome/Edge
+# sessions. Skill stays silent until both browser-use AND Playwright's
+# Chromium binary are installed AND ANTHROPIC_API_KEY is set.
+# Uncomment to install:
+# browser-use          # LLM-driven Playwright agent (>=0.2)
+# playwright           # Playwright Python; after install, also run:
+#                      #   python -m playwright install chromium
+
+# Notification triage center (skills/notification_triage.py). OPTIONAL.
+# Hooks Windows UserNotificationListener so JARVIS can see every toast and
+# route it through user-tunable rules + a Haiku classifier (urgent / fyi /
+# newsletter / spam → read aloud / log / drop). winsdk is Windows-only; the
+# skill registers cleanly without it and the actions report 'winsdk not
+# installed' until the user opts in. Notification access also has to be
+# granted once in Settings → Privacy → Notifications (the skill calls
+# RequestAccessAsync on first run).
+# Uncomment to install:
+# winsdk; sys_platform == "win32"
+
+# Email triage extension (skills/email_triage.py + ms_graph write actions).
+# OPTIONAL. The skill unifies Outlook (via ms_graph + msal — already wired up
+# above) with Gmail (via google-api-python-client + google-auth-oauthlib).
+# Gmail OAuth flow:
+#   1. Create a Desktop OAuth client at Google Cloud Console → APIs &
+#      Services → Credentials, download the JSON.
+#   2. Save it as `gmail_credentials.json` at the project root.
+#   3. Run `python -m skills.email_triage --auth-gmail` once; the
+#      refresh token is cached at data/gmail_token.json.
+# The skill registers cleanly without these — actions report the install /
+# auth hint until the user opts in.
+# Uncomment to install:
+# google-api-python-client
+# google-auth-oauthlib
+# google-auth-httplib2
+
+# Generic scheduled automations / cron engine (core/scheduler.py +
+# skills/schedule_manager.py). OPTIONAL. Persistent SQLite-backed
+# APScheduler — cron, interval, and one-shot triggers, plus conditional
+# triggers like 'when the Bambu print finishes...'.  The skill registers
+# cleanly without APScheduler and every action returns a clean install
+# hint until the user opts in.
+# Uncomment to install:
+# apscheduler          # background scheduler with cron/interval/date triggers
+# sqlalchemy           # needed for the persistent SQLite jobstore (data/scheduler.db)
+
+# Phone bridge — SMS-style push & remote control (skills/phone_bridge.py).
+# OPTIONAL. Three pluggable backends, every one driven by env vars and the
+# already-mandatory `requests` dep — no extra pip installs are required.
+# The skill registers cleanly with zero backends configured and every
+# action returns the precise setup hint until the user opts in.
+#   • Telegram (two-way, free):
+#       set TELEGRAM_BOT_TOKEN (from @BotFather) AND TELEGRAM_USER_ID
+#       (your chat id; visit https://t.me/userinfobot to look it up).
+#       Inbound text from whitelisted chats is dispatched through the
+#       JARVIS command pipeline (chain → single intent → stateless LLM)
+#       and the reply is sent back via sendMessage. The bridge talks
+#       raw HTTPS at api.telegram.org, so python-telegram-bot is NOT
+#       required — it's deliberately avoided because v20+ is async-only
+#       and a 200-line bridge over `requests` is simpler.
+#   • ntfy (one-way push, no account): set NTFY_TOPIC; install the free
+#       ntfy app on your phone and subscribe to ntfy.sh/<topic>.
+#   • Pushover (one-way push, paid): set PUSHOVER_TOKEN + PUSHOVER_USER.
+# Override the stateless LLM model used to answer phone questions via
+# PHONE_BRIDGE_MODEL (default mirrors bobert_companion.CLAUDE_MODEL).
+
+# YouTube direct-URL resolver (skills/youtube_search.py). OPTIONAL.
+# Lets JARVIS resolve a search query to the canonical
+# https://www.youtube.com/watch?v=… URL without scraping a Google SERP or
+# relying on the vision-driven youtube_play pipeline (which can fall into
+# screenshot/guess loops on flaky layouts). The skill registers cleanly
+# without yt-dlp installed — the youtube_search_direct action and the
+# web_search video-intent shortcut just fall back to the existing paths
+# (Google SERP regex + opening the YouTube results page).
+# Either `pip install yt-dlp` or putting the yt-dlp binary on PATH works;
+# the skill probes both.
+# Uncomment to install:
+# yt-dlp
+
+# Local image generation (skills/image_gen.py) — OPTIONAL. The skill itself
+# adds no required deps; pick one backend:
+#   • ComfyUI (default) — run ComfyUI separately at http://localhost:8188,
+#     no Python deps here. Set IMAGE_GEN_BACKEND='comfyui'.
+#   • diffusers — pure-Python path for SDXL-Turbo on a CUDA GPU. ~5 GB of
+#     installs and a ~6 GB model download on first call. Uncomment below
+#     and set IMAGE_GEN_BACKEND='diffusers'.
+# diffusers
+# transformers
+# accelerate
+
+# ── PyTorch (CUDA build for the RTX 3090) ─────────────────────────────────
+# REQUIRED for GPU acceleration of: RAG reranker (sentence-transformers
+# CrossEncoder), long-term-memory embedder, voice-id (resemblyzer), and
+# wake-word VAD (silero). Python 3.14 has NO torch+cuda wheel on PyPI, so it
+# MUST be installed from the PyTorch CUDA index or these all silently run on
+# CPU (5-20x slower). The 2026-05-30 audit found torch was 2.12.0+cpu; this
+# is the cu126 build that put them back on the 3090. The --extra-index-url
+# adds the PyTorch CUDA index ALONGSIDE PyPI, so the cu126 torch wheel resolves
+# here while every other package still comes from PyPI. (A plain
+# `pip install torch` pulls the CPU wheel and undoes the GPU win.)
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.10.0+cu126
+
+# Standby auto-engage lyric-detection loop (skills/standby_audio_detect.py).
+# OPTIONAL. Runs whisper-tiny on a 3 s rolling mic buffer every 5 s and uses
+# librosa onset_strength (spectral flux) + a rhyme-density heuristic to
+# decide whether the mic is hearing vocal music. After 15 consecutive
+# seconds of positive detection AND the headset being the active output,
+# JARVIS auto-engages standby and TTS "I'll wait until you call, sir".
+# Without librosa the loop disables itself silently — the rest of the skill
+# (spectral classifier + wake-word gate) keeps working. Uncomment to enable:
+# librosa
+
+# Real-time mic cleanup (core/audio_processor.py — noise-cancel-1). OPTIONAL.
+# The processor applies echo cancellation → noise suppression → AGC to every
+# captured chunk before it reaches Whisper, so JARVIS can hear past TTS
+# playback, fans, HVAC, keyboard noise and distant speakers. Each layer
+# probes for a preferred backend and falls back to a numpy implementation
+# when missing, so leaving these uncommented is safe — they only enhance
+# quality if installed. Set AUDIO_PROCESSING_ENABLED=False in
+# bobert_companion.py to bypass the pipeline entirely.
+# Uncomment to install:
+# noisereduce              # spectral-subtraction noise suppression (NS layer)
+# webrtc-audio-processing  # WebRTC APM — AEC3 + NS + AGC in one binding
+                           # (Windows wheels are spotty; the processor
+                           # falls back to numpy AEC/NS/AGC when missing)

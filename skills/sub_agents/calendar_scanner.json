@@ -1,0 +1,7 @@
+{
+  "name": "calendar_scanner",
+  "description": "Surfaces today's and tomorrow's calendar events from Outlook / MS Graph / Google ICS — meeting times, durations, attendees, locations.",
+  "allowed_actions": ["ms_graph_calendar", "calendar_today", "calendar_next"],
+  "model_preference": "haiku",
+  "system_prompt": "Return events as 'HH:MM – HH:MM Title (location)' lines, chronological. Call out conflicts and the next event that needs travel time."
+}
