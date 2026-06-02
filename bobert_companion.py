@@ -13285,6 +13285,178 @@ def _run_voice_shortcuts(text: str) -> bool:
     return False
 
 
+# ──────────────────────────────────────────────────────────────────────────
+#  Experimental low-latency voice wiring (opt-in, default-off, fail-safe)
+# ──────────────────────────────────────────────────────────────────────────
+#
+# Two fully-built subsystems (core/realtime_voice.py + core/wake_word.py) are
+# wired in behind config flags that DEFAULT OFF. The SELECTION logic lives in
+# core/voice_pipeline.py (CI-unit-tested with deps absent); the monolith just
+# calls those selectors and branches, ALWAYS inside try/except so any failure
+# (missing optional dep, init error, runtime raise) transparently falls back to
+# the historical turn-based / Whisper-substring path for the rest of the
+# session. When the flags are off these helpers short-circuit to None/False on
+# their first line, so the default hot path is byte-for-byte unchanged.
+#
+# Single-element-list GIL-atomic latches (the same idiom as _sleep_mode etc.):
+#   [0] holds the live object (or None); a second slot records that we already
+#   tried + failed so we don't re-probe every loop iteration.
+_realtime_session = [None]            # RealtimeVoicePipeline | None
+_realtime_disabled_for_session = [False]
+_realtime_utterances: "queue.Queue[str]" = queue.Queue()
+
+_standby_wake_detector = [None]       # WakeWordDetector (idle) | None
+_standby_wake_disabled_for_session = [False]
+
+
+def _get_realtime_session():
+    """Return the live realtime streaming session, lazily creating it the first
+    time VOICE_MODE=='realtime' AND its deps are present. Returns None to mean
+    'stay on the turn-based loop' — which is the default and every failure mode.
+
+    Never raises. A construction failure latches _realtime_disabled_for_session
+    so we attempt it at most once per process and the loop silently stays
+    turn-based thereafter."""
+    if _realtime_session[0] is not None:
+        return _realtime_session[0]
+    if _realtime_disabled_for_session[0]:
+        return None
+    try:
+        from core import voice_pipeline as _vp
+        if not _vp.realtime_enabled():
+            # Flag off → permanently turn-based for this run; don't re-probe.
+            _realtime_disabled_for_session[0] = True
+            return None
+
+        def _on_utterance(_text: str) -> None:
+            # The session's STT thread calls this for each finalised turn; hand
+            # it to the main loop via the same blocking-queue contract the
+            # turn-based path uses (record_speech timeout semantics).
+            try:
+                _realtime_utterances.put_nowait(_text)
+            except Exception:
+                pass
+
+        sess = _vp.make_realtime_session(
+            on_user_utterance=_on_utterance,
+            stt_language="en",
+            tts_engine="system",
+            tts_voice=TTS_VOICE,
+        )
+    except Exception as _e:
+        print(f"  [voice] realtime init failed ({_e}); staying turn_based")
+        _realtime_disabled_for_session[0] = True
+        return None
+    if sess is None:
+        _realtime_disabled_for_session[0] = True
+        return None
+    _realtime_session[0] = sess
+    return sess
+
+
+def _realtime_capture(timeout: float = 20.0):
+    """Realtime-mode capture: block up to `timeout` s for the next finalised
+    utterance the streaming STT pipeline pushed onto _realtime_utterances.
+
+    Returns (text, conf) shaped exactly like transcribe() so the caller is
+    branch-symmetric with the Whisper path, or None on timeout (caller
+    ``continue``s the loop, same as record_speech() returning None). conf is
+    synthesised trustworthy metadata because RealtimeSTT already endpointed +
+    finalised the turn (no per-segment logprobs to forward)."""
+    try:
+        text = _realtime_utterances.get(timeout=timeout)
+    except queue.Empty:
+        return None
+    if not text or not text.strip():
+        return None
+    return text, {"no_speech_prob": 0.0, "avg_logprob": -0.1}
+
+
+def _get_standby_wake_detector():
+    """Return an IDLE WakeWordDetector for the standby fast-path, lazily built
+    the first time WAKE_WORD_AUTOSTART is on AND the engine's dep is present.
+    Returns None to mean 'use the Whisper-substring standby path' — the default
+    and every failure mode.
+
+    autostart=False: we do NOT let it open its own mic stream (Windows WASAPI
+    rejects a 2nd open on the device record_speech() already uses). Instead the
+    standby loop feeds it the audio buffer it just captured. Latches a
+    one-shot disable on failure so we don't re-probe each standby tick."""
+    if _standby_wake_detector[0] is not None:
+        return _standby_wake_detector[0]
+    if _standby_wake_disabled_for_session[0]:
+        return None
+    try:
+        from core import voice_pipeline as _vp
+        if not _vp.wake_word_autostart_enabled():
+            _standby_wake_disabled_for_session[0] = True
+            return None
+        det = _vp.make_wake_detector(
+            wake_words=sorted(WAKE_PHRASES),
+            sample_rate=SAMPLE_RATE,
+            autostart=False,
+        )
+    except Exception as _e:
+        print(f"  [standby] neural wake init failed ({_e}); using Whisper path")
+        _standby_wake_disabled_for_session[0] = True
+        return None
+    if det is None:
+        _standby_wake_disabled_for_session[0] = True
+        return None
+    _standby_wake_detector[0] = det
+    return det
+
+
+def _standby_wake_detected(audio) -> bool | None:
+    """Feed an already-captured float32 mono `audio` buffer to the neural wake
+    detector and report whether a wake phrase fired.
+
+    Returns:
+        True  — a wake word was detected in the buffer.
+        False — detector ran cleanly, no wake word (caller stays asleep).
+        None  — the neural path is unavailable/disabled OR errored; the caller
+                must fall back to the existing Whisper-substring check.
+
+    Never raises. Any detector error returns None so the standby loop degrades
+    to the historical path with no behaviour change."""
+    det = _get_standby_wake_detector()
+    if det is None:
+        return None
+    try:
+        # Drain any stale events from a prior buffer so we only judge this one.
+        while True:
+            try:
+                det.events.get_nowait()
+            except queue.Empty:
+                break
+        # Push the captured audio through the detector's frame pipeline in the
+        # 80ms frames it expects, exactly as its own InputStream callback would.
+        frame_size = max(1, int(SAMPLE_RATE * core_wake_frame_ms() / 1000))
+        buf = np.asarray(audio, dtype=np.float32).reshape(-1)
+        for i in range(0, buf.size - frame_size + 1, frame_size):
+            det._on_frame(buf[i:i + frame_size])
+        # Any event in the queue → a wake fired.
+        try:
+            det.events.get_nowait()
+            return True
+        except queue.Empty:
+            return False
+    except Exception as _e:
+        print(f"  [standby] neural wake check errored ({_e}); using Whisper path")
+        _standby_wake_disabled_for_session[0] = True
+        return None
+
+
+def core_wake_frame_ms() -> int:
+    """The frame size (ms) core.wake_word expects, read defensively so a tree
+    without that constant still works (falls back to 80 ms)."""
+    try:
+        from core import wake_word as _ww
+        return int(getattr(_ww, "DEFAULT_FRAME_MS", 80))
+    except Exception:
+        return 80
+
+
 def _capture_utterance(injected_text, memory):
     """Normal-mode capture phase: drain queued speech, then get the next
     utterance — an injected command (mic + Whisper bypassed, safe pass-through
@@ -13320,6 +13492,44 @@ def _capture_utterance(injected_text, memory):
             print(f"  [inject] {text}")
         set_state("listening")
         return text, conf
+
+    # ── EXPERIMENTAL: realtime streaming capture (VOICE_MODE='realtime') ──────
+    # Off by default: _get_realtime_session() returns None unless the flag is on
+    # AND RealtimeSTT/RealtimeTTS import, so this whole block is skipped and the
+    # historical record_speech()+transcribe() path below runs byte-for-byte. The
+    # streaming STT pipeline endpoints + finalises turns on its own thread and
+    # pushes them onto a queue; here we just block on that queue with the same
+    # 20 s budget record_speech() uses, returning a transcribe()-shaped tuple.
+    # Wrapped so any error degrades to the turn-based path for the rest of the
+    # session (the selector latched it; the next call returns None instantly).
+    try:
+        _rt_sess = _get_realtime_session()
+    except Exception:
+        _rt_sess = None
+    if _rt_sess is not None:
+        _heartbeat()
+        print("Listening… (realtime)")
+        resume_face_tracking()
+        try:
+            _rt_cap = _realtime_capture(timeout=20.0)
+        except Exception as _e:
+            print(f"  [voice] realtime capture errored ({_e}); "
+                  "falling back to turn_based")
+            _realtime_disabled_for_session[0] = True
+            _rt_cap = None
+            _rt_sess = None
+        if _rt_sess is not None:
+            if _rt_cap is None:
+                # No utterance within the window — mirror the record_speech()
+                # timeout branch exactly (reminders, then maybe a proactive turn).
+                if _speak_pending():
+                    set_state("idle")
+                    return None
+                if should_be_proactive():
+                    _do_proactive_turn(memory)
+                set_state("idle")
+                return None
+            return _rt_cap
 
     _heartbeat()
     print("Listening…")
@@ -13535,7 +13745,26 @@ def _handle_sleep_standby(injected_text: str | None) -> None:
         # can spot sustained song audio and refuse lyric near-misses on the
         # wake-word check below.
         _audio_music_feed(audio, SAMPLE_RATE)
-        text, _ = transcribe(audio)
+        # ── EXPERIMENTAL: neural wake detector (WAKE_WORD_AUTOSTART) ──────────
+        # Off by default: _standby_wake_detected() returns None unless the flag
+        # is on AND openWakeWord/Porcupine import, in which case the line below
+        # runs the FULL Whisper transcription exactly as before. When the neural
+        # path IS engaged it judges the captured buffer directly — no per-
+        # utterance Whisper — and we synthesise a minimal `text` so the existing
+        # wake / music-refuse / greeting logic downstream is unchanged:
+        #   True  → 'jarvis' (a wake phrase; the spectral music-refuse guard,
+        #           fed REAL audio above, still vetoes lyric near-misses).
+        #   False → '' (no wake phrase → the asleep/ignore branch). We skip the
+        #           ambient-learning feed in this case because there is no
+        #           transcript to learn from — the deliberate latency/accuracy
+        #           trade of the neural fast-path. On ANY detector error it
+        #           returns None and we fall back to Whisper for this + every
+        #           later standby tick (the selector latched the failure).
+        _wake_hit = _standby_wake_detected(audio)
+        if _wake_hit is None:
+            text, _ = transcribe(audio)
+        else:
+            text = "jarvis" if _wake_hit else ""
     tl = text.strip().lower()
     # Check for any wake phrase
     if any(wp in tl for wp in WAKE_PHRASES):
