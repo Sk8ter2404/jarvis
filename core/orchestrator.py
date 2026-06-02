@@ -66,7 +66,7 @@ _PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SUB_AGENTS_DIR = os.path.join(_PROJECT_DIR, "skills", "sub_agents")
 
 DEFAULT_PLANNER_MODEL = "claude-sonnet-4-6"
-DEFAULT_WORKER_MODEL  = "claude-haiku-4-5-20251001"
+DEFAULT_WORKER_MODEL  = "claude-haiku-4-5"
 DEFAULT_MERGER_MODEL  = "claude-sonnet-4-6"
 
 DEFAULT_MAX_PARALLEL  = 4

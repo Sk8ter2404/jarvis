@@ -757,6 +757,94 @@ def authenticate_device_flow() -> bool:
     return False
 
 
+# ─── orchestrator / voice action: calendar summary ───────────────────────
+#
+# ms_graph was a pure helper module until now (no register()/actions), so the
+# orchestrator's `calendar_scanner` sub-agent (skills/sub_agents/calendar_
+# scanner.json) was INERT — its allowed_actions (ms_graph_calendar /
+# calendar_today / calendar_next) resolved to nothing, so the worker fetched no
+# real data and the merger silently dropped the calendar. Registering a single
+# string-returning action here under those names wires the sub-agent to the
+# real Graph read in get_upcoming_events(). The orchestrator worker calls an
+# action as Callable[[str], str]: it passes a window keyword ("today" /
+# "tomorrow" / "next_14_days") and summarises the returned string per the spec's
+# system prompt. Graceful degradation mirrors the rest of this module — when
+# Graph isn't configured we return a friendly one-liner instead of crashing or
+# fabricating, so the worker's no-fabrication contract still holds (a non-empty
+# but honest "not set up" line, never invented events).
+
+_CAL_WINDOWS = ("today", "tomorrow", "next_14_days")
+
+
+def _normalise_when(arg: str) -> str:
+    """Map a free-text arg from the planner/worker to a known window keyword.
+    Defaults to 'today' (the calendar_scanner sub-agent's primary horizon)."""
+    a = (arg or "").strip().lower()
+    if not a:
+        return "today"
+    if "tomorrow" in a:
+        return "tomorrow"
+    if "week" in a or "14" in a or "upcoming" in a or "next" in a:
+        return "next_14_days"
+    if a in _CAL_WINDOWS:
+        return a
+    return "today"
+
+
+def action_calendar_today(arg: str = "") -> str:
+    """Concise, chronological summary of calendar events for a window.
+
+    ``arg`` is an optional window keyword ('today' | 'tomorrow' |
+    'next_14_days'); anything else defaults to today. Returns a plain string
+    suitable for the orchestrator worker to fold into a briefing, or read aloud
+    directly. Degrades gracefully: a friendly 'calendar isn't set up' line when
+    Graph has no credentials, and a clear 'nothing scheduled' line when the
+    window is empty — never raises, never invents events."""
+    when = _normalise_when(arg)
+    # Distinguish "no creds" (tell the user how to fix) from "configured but
+    # empty" (nothing scheduled) so the summary is honest either way.
+    try:
+        configured = is_configured()
+    except Exception:
+        configured = False
+    if not configured:
+        return ("Calendar isn't set up, sir — run `python -m skills.ms_graph "
+                "--auth` to connect Microsoft Graph.")
+    try:
+        events = get_upcoming_events(top_n=10, when=when)
+    except Exception:
+        # Any unexpected Graph/parse failure degrades to an honest line rather
+        # than bubbling an exception up into the worker.
+        return "Couldn't reach the calendar just now, sir."
+    label = {"today": "today", "tomorrow": "tomorrow",
+             "next_14_days": "the next two weeks"}[when]
+    if not events:
+        return f"Nothing on the calendar for {label}, sir."
+    lines = []
+    for e in events:
+        start = e.get("start")
+        hhmm = start.strftime("%H:%M") if hasattr(start, "strftime") else "??:??"
+        subject = (e.get("subject") or "").strip() or "(no title)"
+        organizer = (e.get("organizer") or "").strip()
+        suffix = f" ({organizer})" if organizer else ""
+        lines.append(f"{hhmm} {subject}{suffix}")
+    header = f"Calendar for {label}: {len(events)} event" \
+             + ("s" if len(events) != 1 else "")
+    return header + " — " + "; ".join(lines) + "."
+
+
+def register(actions):
+    """Expose the calendar summary under every name the calendar_scanner
+    sub-agent spec references, so the orchestrator can dispatch a real,
+    registered action. All three names point at the same string-returning
+    callable (the worker auto-runs the spec's first registered allowed_action)."""
+    actions["ms_graph_calendar"] = action_calendar_today
+    actions["calendar_today"]    = action_calendar_today
+    actions["calendar_next"]     = action_calendar_today
+    print("  [ms_graph] ready — calendar actions: ms_graph_calendar, "
+          "calendar_today, calendar_next.")
+
+
 # ─── manual smoke test / CLI ─────────────────────────────────────────────
 
 if __name__ == "__main__":

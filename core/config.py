@@ -139,7 +139,7 @@ LOCAL_LLM_BASE_URL = "http://localhost:11434"
 # Set False (or it's also gateable via JARVIS_ENABLE_ORCHESTRATOR) to disable.
 ENABLE_ORCHESTRATOR             = True
 ORCHESTRATOR_PLANNER_MODEL      = "claude-sonnet-4-6"
-ORCHESTRATOR_WORKER_MODEL       = "claude-haiku-4-5-20251001"
+ORCHESTRATOR_WORKER_MODEL       = "claude-haiku-4-5"
 ORCHESTRATOR_MERGER_MODEL       = "claude-sonnet-4-6"
 ORCHESTRATOR_MAX_PARALLEL       = 4
 ORCHESTRATOR_WORKER_TIMEOUT_S   = 30.0
