@@ -41,6 +41,19 @@ Configuration (env vars, all optional):
     JARVIS_PIPELINE_MAX_RISK            default 7   (risk_score >= this blocks)
     JARVIS_PIPELINE_SKIP_TESTER         "1" to skip stage 4 (debug only)
     JARVIS_PIPELINE_SKIP_SUITE          "1" to skip the correctness gate (debug)
+    JARVIS_PIPELINE_MAX_USD             default 25.0 (per-RUN dollar ceiling;
+                                          the loop stops at a task boundary once
+                                          estimated spend reaches it)
+
+Safety budget cap (mirrors core/diagnostic_daemons.py's DeepAudit daily cap):
+  The loop driver tallies a COARSE per-stage cost ESTIMATE (see
+  _STAGE_COST_ESTIMATE_USD) as each task runs and stops cleanly — exactly like
+  the no-progress watchdog — once the running total reaches JARVIS_PIPELINE_MAX_USD.
+  A recent uncapped run cost $413.90 over 579 iterations; this ceiling bounds
+  the blast radius of an autonomous loop. It stops at a TASK boundary so an
+  in-flight apply is never severed mid-edit. (Real per-call cost is available
+  from `claude --print --output-format json` via `total_cost_usd`; this proxy is
+  intentionally conservative because the cap is a safety net, not an accountant.)
 
 The single-stage flow is still reachable via `upgrade_jarvis.py --single-stage`
 for emergencies.
@@ -874,6 +887,100 @@ def _max_risk_score() -> int:
         return 7
 
 
+# ───────────────────────── per-run USD budget cap ─────────────────────────
+# A per-RUN dollar ceiling on the loop, mirroring the daily USD cap the
+# DeepAudit daemon already enforces (core/diagnostic_daemons.py:
+# DEEP_AUDIT_DEFAULT_BUDGET_USD / _deep_audit_budget_usd /
+# _deep_audit_budget_ok). The main pipeline had NO cap — a single uncapped run
+# cost $413.90 over 579 iterations. We stop the loop CLEANLY at a task boundary
+# (like the no-progress watchdog) once the running spend reaches the ceiling,
+# so an in-flight apply is never severed mid-edit.
+
+PIPELINE_DEFAULT_MAX_USD = 25.0
+
+# Coarse per-STAGE cost ESTIMATE (USD), summed per task as a defensible proxy
+# for real spend. Basis: the implementer is Opus with write access and by far
+# the most expensive turn (large context + long agentic edit loop); planner is
+# a cheap read-only model; reviewer is a mid model over a capped diff; the
+# tester/suite are LOCAL (no Claude call → $0). These are order-of-magnitude
+# figures, deliberately conservative — the cap is a safety net, not an
+# accounting tool (same caveat as DEEP_AUDIT_ESTIMATED_COST_PER_RUN_USD).
+# `claude --print --output-format json` exposes a real per-call `total_cost_usd`;
+# wiring that through every stage's stdout parser is a larger change, so this
+# proxy gates the loop today without destabilising the tested _invoke_claude
+# contract.
+_STAGE_COST_ESTIMATE_USD: dict[str, float] = {
+    "planner":     0.05,
+    "implementer": 1.50,
+    "reviewer":    0.20,
+}
+# Fallback when a task records an unknown/partial stage set — bill it as one
+# full planner+implementer+reviewer cycle so the estimate never UNDER-counts a
+# real Claude task to zero.
+_FULL_TASK_COST_ESTIMATE_USD = sum(_STAGE_COST_ESTIMATE_USD.values())
+
+
+def _pipeline_max_usd() -> float:
+    """Per-run USD ceiling. Env override ``JARVIS_PIPELINE_MAX_USD`` (default
+    25.0; clamped to >= 0). A value of 0 means "no cap" (the loop never stops on
+    budget) — mirrors how a 0 daily budget would disable the DeepAudit cap."""
+    try:
+        v = float(os.environ.get("JARVIS_PIPELINE_MAX_USD",
+                                 PIPELINE_DEFAULT_MAX_USD))
+        return max(0.0, v)
+    except (TypeError, ValueError):
+        return PIPELINE_DEFAULT_MAX_USD
+
+
+def _estimate_task_cost_usd(result: dict[str, Any] | None) -> float:
+    """Coarse USD estimate for ONE completed task, from which stages actually
+    ran (``result["stages"]``). A planner-only IMPOSSIBLE bail costs ~planner;
+    a full approve+test cycle costs planner+implementer+reviewer. Unknown shape
+    → bill a full cycle so we never under-count a real Claude task to $0."""
+    if not result:
+        return _FULL_TASK_COST_ESTIMATE_USD
+    stages = result.get("stages")
+    if not isinstance(stages, dict) or not stages:
+        return _FULL_TASK_COST_ESTIMATE_USD
+    total = 0.0
+    for stage_name, est in _STAGE_COST_ESTIMATE_USD.items():
+        if stage_name in stages:
+            total += est
+    # If none of the billable Claude stages were recorded (e.g. a stages dict
+    # that only carries local "tester"/"suite" keys), fall back rather than
+    # report $0 for what was still a real run.
+    return total if total > 0 else _FULL_TASK_COST_ESTIMATE_USD
+
+
+# ───────────────── refuse autonomous run with safety nets off ──────────────
+# Each of these env flags SILENTLY removes a safety net. That's defensible for
+# a human-driven single-task debug run, but DANGEROUS for an autonomous /
+# overnight loop that edits JARVIS's own brain unattended. The loop-driver
+# entry REFUSES to start when any are set on an autonomous run, unless the
+# operator passes an explicit --force-unsafe ack. (env value → human label.)
+_UNSAFE_SKIP_FLAGS: tuple[tuple[str, str], ...] = (
+    ("STABILITY_GATE_DISABLE",     "stability gate (boot smoke test) DISABLED"),
+    ("JARVIS_PIPELINE_SKIP_TESTER", "tester stage (per-task boot check) SKIPPED"),
+    ("JARVIS_PIPELINE_SKIP_SUITE",  "correctness gate (unit suite) SKIPPED"),
+)
+
+
+def _active_unsafe_skip_flags() -> list[str]:
+    """Human-readable labels for every safety-net skip flag currently set to
+    "1". Empty list = all safety nets armed."""
+    return [label for env_name, label in _UNSAFE_SKIP_FLAGS
+            if os.environ.get(env_name, "").strip() == "1"]
+
+
+def _force_unsafe_acked(argv: list[str] | None = None) -> bool:
+    """True if the operator explicitly acknowledged running with safety nets
+    off, via the ``--force-unsafe`` CLI flag or ``JARVIS_PIPELINE_FORCE_UNSAFE=1``.
+    Mirrors how ``--force-continue-after-regression`` is recognised."""
+    args = sys.argv if argv is None else argv
+    return ("--force-unsafe" in args
+            or os.environ.get("JARVIS_PIPELINE_FORCE_UNSAFE", "").strip() == "1")
+
+
 def _run_test_suite(*, project_dir: str = PROJECT_DIR) -> dict[str, Any]:
     """CORRECTNESS GATE — run the unit suite (``tools/run_tests.py``) after a
     self-edit. The tester only proves JARVIS still *boots*; this proves the
@@ -1230,10 +1337,25 @@ def run_pipeline_on_task(task_line: str, *, claude_path: str,
 
 def run_pipeline_loop_driver(*, project_dir: str, claude_path: str,
                              stream_log: str, max_iter: int,
-                             task_count: int) -> int:
+                             task_count: int,
+                             interactive: bool = False) -> int:
     """Loop until the queue is empty (or MAX_ITER, or NO_PROGRESS_LIMIT).
     Each iteration picks the first unchecked task and runs the 4-stage
-    pipeline on it. Returns 0 on clean exit, non-zero on hard failure."""
+    pipeline on it. Returns 0 on clean exit, non-zero on hard failure.
+
+    ``interactive`` distinguishes a human-driven, attended invocation from an
+    AUTONOMOUS one. The driver is the autonomous entry point: it is rendered to
+    a tempfile and spawned DETACHED by upgrade_jarvis.py / the overnight engine,
+    with no human watching. So it defaults to ``interactive=False`` (autonomous)
+    — only a caller that KNOWS a human is present (e.g. an operator at a
+    terminal) passes ``interactive=True``. On an autonomous run, having any
+    safety-net skip flag set (STABILITY_GATE_DISABLE / JARVIS_PIPELINE_SKIP_TESTER
+    / JARVIS_PIPELINE_SKIP_SUITE) is REFUSED unless ``--force-unsafe`` is acked,
+    because an unattended loop that edits JARVIS's own brain with the gates off
+    can ship a regression with nothing to catch it. A human single-task debug
+    run (the ``--task`` / ``--first-unchecked`` CLI paths, which call
+    run_pipeline_on_task directly and never reach here) may still use the flags
+    freely."""
     # Enable ANSI colors on Windows so the stream pops.
     if os.name == "nt":
         try:
@@ -1247,6 +1369,33 @@ def run_pipeline_loop_driver(*, project_dir: str, claude_path: str,
         "\x1b[36m", "\x1b[33m", "\x1b[32m", "\x1b[31m", "\x1b[90m", "\x1b[0m"
     )
     ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+    # ── REFUSE an autonomous run with safety nets disabled ───────────────
+    # Bail BEFORE opening the stream log / touching any task so an unattended
+    # loop can't churn the codebase with the gates off. A human single-task
+    # debug run never reaches here (it calls run_pipeline_on_task directly), so
+    # this only fires on the autonomous loop. --force-unsafe is the explicit ack.
+    _unsafe = _active_unsafe_skip_flags()
+    if _unsafe and not interactive and not _force_unsafe_acked():
+        banner = "\n".join([
+            f"{RED}{'=' * 64}{RESET}",
+            f"{RED}[REFUSED] autonomous pipeline run with safety nets "
+            f"DISABLED{RESET}",
+            *[f"{RED}    - {label}{RESET}" for label in _unsafe],
+            f"{YELLOW}An unattended loop edits JARVIS's own code; with these "
+            f"gates off a{RESET}",
+            f"{YELLOW}regression could ship unreviewed/untested. Refusing to "
+            f"start.{RESET}",
+            f"{GRAY}    Re-run a human-attended single task instead "
+            f"(--task / --first-unchecked),{RESET}",
+            f"{GRAY}    or pass --force-unsafe (or set "
+            f"JARVIS_PIPELINE_FORCE_UNSAFE=1) to override.{RESET}",
+            f"{RED}{'=' * 64}{RESET}",
+        ])
+        print(banner, flush=True)
+        _log_pipeline_event({"stage": "refused-unsafe", "ok": False,
+                             "skip_flags": _unsafe, "interactive": interactive})
+        return 5
 
     try:
         log_fp = open(stream_log, "a", encoding="utf-8", buffering=1)
@@ -1287,6 +1436,18 @@ def run_pipeline_loop_driver(*, project_dir: str, claude_path: str,
     NO_PROGRESS_LIMIT = 5
     no_progress = 0
     rc_out = 0
+
+    # ── Per-run USD budget cap ───────────────────────────────────────────
+    # Tally a coarse per-task cost ESTIMATE and STOP the loop cleanly (at a
+    # task boundary, like the no-progress watchdog) once it reaches the
+    # ceiling. Mirrors the DeepAudit daily-budget cap. A 0 ceiling = no cap.
+    _budget_cap_usd = _pipeline_max_usd()
+    _spend_usd = 0.0
+    if _budget_cap_usd > 0:
+        emit(f"{GRAY}  budget cap: ${_budget_cap_usd:.2f}/run "
+             f"(coarse estimate; stops at a task boundary){RESET}")
+    else:
+        emit(f"{GRAY}  budget cap: disabled (JARVIS_PIPELINE_MAX_USD=0){RESET}")
 
     # ── Stability gate setup ─────────────────────────────────────────────
     # Lazy import to avoid a circular dep (upgrade_jarvis -> driver template
@@ -1361,6 +1522,15 @@ def run_pipeline_loop_driver(*, project_dir: str, claude_path: str,
                  f"{result.get('stage_failed')}; "
                  f"rolled back, regression queued{RESET}")
 
+        # Tally estimated spend for THIS task (a rolled-back task still burned
+        # its planner/implementer/reviewer Claude calls, so it counts too).
+        # result is None only when run_pipeline_on_task raised — bill it as a
+        # full task so a crashing loop still draws down the budget.
+        _spend_usd += _estimate_task_cost_usd(result)
+        if _budget_cap_usd > 0:
+            emit(f"{GRAY}[budget] est. spend ${_spend_usd:.2f} / "
+                 f"${_budget_cap_usd:.2f} cap{RESET}")
+
         if ticked_this_iter:
             no_progress = 0
         else:
@@ -1427,6 +1597,22 @@ def run_pipeline_loop_driver(*, project_dir: str, claude_path: str,
                     rc_out = 3
                     break
 
+        # ── Budget cap: stop CLEANLY at this task boundary once estimated
+        # spend reaches the ceiling. Checked LAST in the iteration body so the
+        # current task fully finished (applied + reviewed + tested or rolled
+        # back) before we stop — we never sever an in-flight apply. Mirrors the
+        # no-progress watchdog's stop-and-break shape.
+        if _budget_cap_usd > 0 and _spend_usd >= _budget_cap_usd:
+            emit(f"{RED}[budget] estimated spend ${_spend_usd:.2f} reached "
+                 f"the ${_budget_cap_usd:.2f}/run cap — stopping at task "
+                 f"boundary{RESET}")
+            _log_pipeline_event({"stage": "budget-cap", "ok": True,
+                                 "spend_usd": round(_spend_usd, 4),
+                                 "cap_usd": _budget_cap_usd,
+                                 "iterations": i})
+            rc_out = 4
+            break
+
     # Final py_compile sweep, matching the single-stage driver.
     emit("")
     emit(f"{YELLOW}Verifying syntax of bobert_companion.py...{RESET}")
@@ -1442,6 +1628,9 @@ def run_pipeline_loop_driver(*, project_dir: str, claude_path: str,
     except (OSError, subprocess.SubprocessError) as exc:
         emit(f"{RED}py_compile failed to run: {exc!r}{RESET}")
 
+    if _budget_cap_usd > 0:
+        emit(f"{GRAY}Estimated spend this run: ${_spend_usd:.2f} "
+             f"(cap ${_budget_cap_usd:.2f}){RESET}")
     emit(f"{GREEN}Pipeline complete.{RESET}")
 
     if log_fp is not None:
