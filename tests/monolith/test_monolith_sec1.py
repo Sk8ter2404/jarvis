@@ -1198,10 +1198,18 @@ class TrayDispatchTests(_MonolithTestBase):
         # try/except; provide a fake ambient module + a stub diag module.
         fake_diag = mock.Mock()
         fake_al = mock.Mock()
+        import core
+        # ``from core import diagnostic_daemons`` resolves via the ``core``
+        # package attr once a sibling imports the real module, so patch BOTH
+        # sys.modules and the parent-package attr (see sibling test). The
+        # skill_ambient_listen fake is a flat module — sys.modules alone is
+        # correct for it.
         with mock.patch.object(self.bc, "_write_hud_state"), \
              mock.patch.dict("sys.modules",
                              {"core.diagnostic_daemons": fake_diag,
-                              "skill_ambient_listen": fake_al}):
+                              "skill_ambient_listen": fake_al}), \
+             mock.patch.object(core, "diagnostic_daemons", fake_diag,
+                               create=True):
             self.bc._dispatch_tray_command("pause_daemons_toggle", {})
         self.assertTrue(paused[0])
         fake_al.set_paused.assert_called_once_with(True)
@@ -2707,9 +2715,17 @@ class DispatchTrayCommandEdgeTests(_MonolithTestBase):
         paused[0] = True
         fake_diag = mock.Mock()
         fake_diag.resume_diagnostics.side_effect = RuntimeError("diag boom")
+        import core
+        # The monolith does ``from core import diagnostic_daemons``, which
+        # resolves via the ``core`` package attribute once any sibling test has
+        # imported the real ``core.diagnostic_daemons`` — so the sys.modules
+        # fake alone is bypassed (passes alone, FAILS in the full suite). Patch
+        # BOTH sys.modules and the parent-package attr.
         with mock.patch.object(self.bc, "_write_hud_state"), \
              mock.patch.dict("sys.modules",
-                             {"core.diagnostic_daemons": fake_diag}):
+                             {"core.diagnostic_daemons": fake_diag}), \
+             mock.patch.object(core, "diagnostic_daemons", fake_diag,
+                               create=True):
             self.bc._dispatch_tray_command("pause_daemons_toggle", {})
         self.assertFalse(paused[0])
         fake_diag.resume_diagnostics.assert_called_once()
@@ -2721,10 +2737,18 @@ class DispatchTrayCommandEdgeTests(_MonolithTestBase):
         fake_diag = mock.Mock()
         fake_al = mock.Mock()
         fake_al.set_paused.side_effect = RuntimeError("al boom")
+        import core
+        # ``from core import diagnostic_daemons`` resolves via the ``core``
+        # package attr once a sibling imports the real module, so patch BOTH
+        # sys.modules and the parent-package attr (see sibling test). The
+        # skill_ambient_listen fake is a flat module — sys.modules alone is
+        # correct for it.
         with mock.patch.object(self.bc, "_write_hud_state"), \
              mock.patch.dict("sys.modules",
                              {"core.diagnostic_daemons": fake_diag,
-                              "skill_ambient_listen": fake_al}):
+                              "skill_ambient_listen": fake_al}), \
+             mock.patch.object(core, "diagnostic_daemons", fake_diag,
+                               create=True):
             self.bc._dispatch_tray_command("pause_daemons_toggle", {})
         self.assertTrue(paused[0])
         fake_al.set_paused.assert_called_once_with(True)
