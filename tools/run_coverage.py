@@ -53,15 +53,25 @@ def main(argv: list[str]) -> int:
             print("--fail-under needs a number, e.g. --fail-under 30")
             return 2
 
-    cov = coverage.Coverage(
-        source=["core", "skills", "tools"],
-        omit=["*/tests/*", "*/__pycache__/*", "tools/run_coverage.py",
-              # gitignored personal skills — not shipped, absent on CI, so they
-              # don't belong in the shipped-coverage denominator.
-              "*/skills/vip_intercept.py", "*/skills/vip_boss_mode.py",
-              "*/skills/trip_planner.py", "*/skills/teams_screener.py"],
-        branch=False,
-    )
+    want_full = "--full" in argv
+    _omit = ["*/tests/*", "*/__pycache__/*", "tools/run_coverage.py",
+             "tools/run_tests_ci_sim.py",
+             # gitignored personal skills — not shipped, absent on CI, so they
+             # don't belong in the shipped-coverage denominator.
+             "*/skills/vip_intercept.py", "*/skills/vip_boss_mode.py",
+             "*/skills/trip_planner.py", "*/skills/teams_screener.py"]
+    if want_full:
+        # LOCAL full tier: adds the ~14K-line monolith + the other root product
+        # modules + the smaller product packages. Needs all deps present (these
+        # can't import on the bare CI runner), so this tier is local-only — the
+        # default source below is the CI light-tier gate.
+        _source = ["core", "skills", "tools", "adapters", "hud", "audio",
+                   "bobert_companion", "tray", "boot_sequence", "upgrade_jarvis"]
+        _label = "FULL local tier: core/skills/tools + monolith + root modules"
+    else:
+        _source = ["core", "skills", "tools"]
+        _label = "core/ + skills/ + tools/"
+    cov = coverage.Coverage(source=_source, omit=_omit, branch=False)
     cov.start()
     ok = _run_suite()
     cov.stop()
@@ -71,7 +81,7 @@ def main(argv: list[str]) -> int:
     total = cov.report(show_missing=want_missing, skip_covered=False,
                        file=sys.stdout)
     print("=" * 72)
-    print(f"TOTAL coverage: {total:.1f}%  (measured: core/ + skills/ + tools/)")
+    print(f"TOTAL coverage: {total:.1f}%  (measured: {_label})")
     if want_xml:
         cov.xml_report(outfile=os.path.join(_ROOT, "coverage.xml"))
         print("wrote coverage.xml")
