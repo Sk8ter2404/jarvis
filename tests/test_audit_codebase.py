@@ -1635,10 +1635,9 @@ class LeakTestTests(_AuditTestBase):
 
     def test_leak_runs_when_psutil_present(self):
         # psutil IS in the CI/dev dep set; the 100-iter no-op loop must run and
-        # report no growth (well under the thresholds).
-        try:
-            import psutil  # noqa: F401
-        except ImportError:
+        # report no growth (well under the thresholds). Probe via find_spec so
+        # there's no unused bare import (pyflakes doesn't honour `# noqa`).
+        if importlib.util.find_spec("psutil") is None:
             self.skipTest("psutil not installed")
         findings, summary = audit.check_leak()
         self.assertTrue(summary.get("ran"))
