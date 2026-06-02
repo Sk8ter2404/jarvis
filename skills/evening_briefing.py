@@ -231,10 +231,12 @@ def _tomorrow_weather_from_wttr() -> str:
         if noon:
             try:
                 desc = (noon.get("weatherDesc", [{}])[0].get("value", "") or "").strip().lower()
-            except (KeyError, IndexError, TypeError):
+            except (KeyError, IndexError, TypeError, AttributeError):
+                # AttributeError guards a string-shaped weatherDesc (e.g.
+                # "Sunny"): [0] then yields 'S', whose .get() would raise.
                 desc = ""
         return _phrase_tomorrow(max_c, min_c, desc)
-    except (KeyError, IndexError, ValueError, TypeError):
+    except (KeyError, IndexError, ValueError, TypeError, AttributeError):
         return ""
 
 
