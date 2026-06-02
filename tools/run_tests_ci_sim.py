@@ -58,6 +58,21 @@ _BLOCK = {
     "pyautogui", "mss", "pygetwindow", "win32crypt", "win32com",
 }
 
+# Packages that ARE installed on the Linux runner but whose import SELECTS A GUI
+# / DISPLAY BACKEND at import time and therefore EXPLODES on a headless host
+# (no $DISPLAY). On the real CI runner ``import pystray`` raises
+# ``Xlib.error.DisplayNameError: Bad display name ""`` because its default Linux
+# backend is X11. On this Windows box it imports fine (win32 backend), so a
+# module that does ``import pystray`` at top level would pass locally yet fail
+# the headless CI collection. Treat these like a headless-Linux import failure:
+# make a fresh ``import`` raise. (A test that needs the symbols must inject its
+# own fake into ``sys.modules`` *before* importing the module under test — which
+# satisfies the ``key in sys.modules`` bypass below, exactly like the win-only
+# handling — so a CLEAN tree still reports 0 failed / 0 errored.)
+_HEADLESS = {
+    "pystray",
+}
+
 # Windows-only stdlib / pywin32 modules that do NOT exist on the Linux runner.
 # Importing any of these on CI raises ModuleNotFoundError, so we make them look
 # absent here too. ``ctypes`` is deliberately NOT in this set — Linux ships
@@ -82,8 +97,9 @@ _PREIMPORT = (
     "numpy",
     # psutil imports its per-OS backend at import; _pslinux needs ``resource``.
     "psutil",
-    # pystray selects a GUI backend at import (X11/`gi` on "linux").
-    "pystray",
+    # NB: pystray is deliberately NOT pre-imported. On the real Linux runner it
+    # selects an X11 backend and dies headless, so we treat it as unimportable
+    # (see ``_HEADLESS``) rather than freezing the working Windows backend here.
     # Pillow has per-platform bits; harmless to lock in early.
     "PIL", "PIL.Image",
     # tzlocal/apscheduler resolve the local timezone via a Windows backend.
@@ -96,6 +112,12 @@ _PREIMPORT = (
 def _blocked(name: str) -> bool:
     head = name.split(".")[0]
     if head in _BLOCK:
+        return True
+    # Headless-display backends (pystray): importable on Windows, but a fresh
+    # import dies on the headless Linux runner. Block both the bare head and any
+    # submodule so ``import pystray`` and ``import pystray._base`` both fail
+    # unless a fake was pre-seeded into sys.modules (see _shim_should_block).
+    if head in _HEADLESS:
         return True
     # Match win-only modules both as a bare head (winreg) and dotted
     # (ctypes.wintypes) — but never block plain ``ctypes``.

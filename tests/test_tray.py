@@ -25,6 +25,8 @@ pystray facts these tests rely on (verified against the installed pystray):
   • pystray.Menu is iterable through ``.items``; pystray.Menu.SEPARATOR is the
     sentinel separator object.
 """
+import functools
+import inspect
 import io
 import json
 import os
@@ -34,7 +36,231 @@ import threading
 import unittest
 from unittest import mock
 
-import tray
+
+# --------------------------------------------------------------------------- #
+# Headless-safe pystray shim.
+#
+# ``tray.py`` does ``import pystray`` at module top. The real pystray selects a
+# GUI backend AT IMPORT TIME: on the Linux CI runner it tries the X11 backend,
+# which connects to ``$DISPLAY`` and raises
+#     Xlib.error.DisplayNameError: Bad display name ""
+# on a headless host — so merely importing ``tray`` (hence collecting this test
+# module) explodes on CI even though pystray is installed.
+#
+# We sidestep that by injecting a FAKE ``pystray`` into ``sys.modules`` BEFORE
+# importing ``tray``, so ``tray.py`` binds its module-level ``pystray`` name to
+# the fake and the real X11 backend is never touched. The fake faithfully
+# re-implements the two backend-independent classes the tray tests actually use
+# — ``pystray._base.Menu`` and ``pystray.MenuItem`` (text/checked/enabled
+# lambda evaluation, ``MenuItem(icon)`` -> ``action(icon, item)``, ``Menu.items``
+# iteration, ``Menu.SEPARATOR`` sentinel, ``.submenu`` for nested menus) — and a
+# do-nothing ``Icon`` placeholder (every test that reaches ``pystray.Icon``
+# already patches it via ``mock.patch.object(tray.pystray, "Icon")``).
+#
+# The fake is installed only for the duration of ``import tray`` and then the
+# previous ``sys.modules['pystray']`` (if any) is restored, so it can't leak
+# into other test modules that may want the real package.
+# --------------------------------------------------------------------------- #
+class _FakeMenuItem:
+    """Behavioural twin of ``pystray._base.MenuItem`` (the parts tray uses)."""
+
+    def __init__(self, text, action, checked=None, radio=False, default=False,
+                 visible=True, enabled=True):
+        self.__name__ = str(text)
+        self._text = self._wrap(text or "")
+        self._action = self._assert_action(action)
+        self._checked = self._assert_callable(checked, lambda _: None)
+        self._radio = self._wrap(radio)
+        self._default = self._wrap(default)
+        self._visible = self._wrap(visible)
+        self._enabled = self._wrap(enabled)
+
+    def __call__(self, icon):
+        if not isinstance(self._action, _FakeMenu):
+            return self._action(icon, self)
+
+    def __str__(self):
+        if isinstance(self._action, _FakeMenu):
+            return "%s =>\n%s" % (self.text, str(self._action))
+        return self.text
+
+    @property
+    def text(self):
+        return self._text(self)
+
+    @property
+    def checked(self):
+        return self._checked(self)
+
+    @property
+    def radio(self):
+        return self._radio(self) if self.checked is not None else False
+
+    @property
+    def default(self):
+        return self._default(self)
+
+    @property
+    def visible(self):
+        if isinstance(self._action, _FakeMenu):
+            return self._visible(self) and self._action.visible
+        return self._visible(self)
+
+    @property
+    def enabled(self):
+        return self._enabled(self)
+
+    @property
+    def submenu(self):
+        return self._action if isinstance(self._action, _FakeMenu) else None
+
+    @staticmethod
+    def _assert_action(action):
+        if action is None:
+            return lambda *_: None
+        if not hasattr(action, "__code__"):
+            return action
+        argcount = action.__code__.co_argcount - (
+            1 if inspect.ismethod(action) else 0)
+        if argcount == 0:
+            @functools.wraps(action)
+            def wrapper0(*args):
+                return action()
+            return wrapper0
+        if argcount == 1:
+            @functools.wraps(action)
+            def wrapper1(icon, *args):
+                return action(icon)
+            return wrapper1
+        if argcount == 2:
+            return action
+        raise ValueError(action)
+
+    @staticmethod
+    def _assert_callable(value, default):
+        if value is None:
+            return default
+        if callable(value):
+            return value
+        raise ValueError(value)
+
+    @staticmethod
+    def _wrap(value):
+        return value if callable(value) else lambda _: value
+
+
+class _FakeMenu:
+    """Behavioural twin of ``pystray._base.Menu`` (the parts tray uses)."""
+
+    SEPARATOR = _FakeMenuItem("- - - -", None)
+
+    def __init__(self, *items):
+        self._items = tuple(items)
+
+    @property
+    def items(self):
+        if (len(self._items) == 1
+                and not isinstance(self._items[0], _FakeMenuItem)
+                and callable(self._items[0])):
+            return self._items[0]()
+        return self._items
+
+    @property
+    def visible(self):
+        return bool(self)
+
+    def __call__(self, icon):
+        try:
+            return next(mi for mi in self.items if mi.default)(icon)
+        except StopIteration:
+            pass
+
+    def __iter__(self):
+        return iter(self._visible_items())
+
+    def __bool__(self):
+        return len(self._visible_items()) > 0
+
+    def __str__(self):
+        return "\n".join(
+            "\n".join("    %s" % l for l in str(i).splitlines()) for i in self)
+
+    def _visible_items(self):
+        def cleaned(items):
+            was_separator = False
+            for i in items:
+                if not i.visible:
+                    continue
+                if i is self.SEPARATOR:
+                    if was_separator:
+                        continue
+                    was_separator = True
+                else:
+                    was_separator = False
+                yield i
+
+        def strip_head(items):
+            import itertools
+            return itertools.dropwhile(lambda i: i is self.SEPARATOR, items)
+
+        def strip_tail(items):
+            return reversed(list(strip_head(reversed(list(items)))))
+
+        return tuple(strip_tail(strip_head(cleaned(self.items))))
+
+
+class _FakeIcon:
+    """Placeholder for ``pystray.Icon``. Tests that reach the real icon path
+    patch this out via ``mock.patch.object(tray.pystray, "Icon")``; it exists
+    only so the attribute is present and patchable."""
+
+    def __init__(self, *a, **k):
+        self.name = a[0] if a else k.get("name")
+        self.icon = k.get("icon")
+        self.title = k.get("title")
+        self.menu = k.get("menu")
+
+    def run(self, *a, **k):
+        pass
+
+    def stop(self, *a, **k):
+        pass
+
+
+def _make_fake_pystray():
+    import types
+    mod = types.ModuleType("pystray")
+    mod.Menu = _FakeMenu
+    mod.MenuItem = _FakeMenuItem
+    mod.Icon = _FakeIcon
+    # Some pystray consumers import the private base; expose a matching submodule
+    # so ``import pystray._base`` (should tray ever do it) also resolves to fakes.
+    base = types.ModuleType("pystray._base")
+    base.Menu = _FakeMenu
+    base.MenuItem = _FakeMenuItem
+    mod._base = base
+    return mod, base
+
+
+# Install the fake, import tray so it binds to the fake, then restore whatever
+# (if anything) previously occupied the ``pystray`` slot — keeping the fake from
+# leaking into sibling test modules.
+_saved_pystray = sys.modules.get("pystray")
+_saved_pystray_base = sys.modules.get("pystray._base")
+_fake_pystray, _fake_pystray_base = _make_fake_pystray()
+sys.modules["pystray"] = _fake_pystray
+sys.modules["pystray._base"] = _fake_pystray_base
+try:
+    import tray
+finally:
+    if _saved_pystray is not None:
+        sys.modules["pystray"] = _saved_pystray
+    else:
+        sys.modules.pop("pystray", None)
+    if _saved_pystray_base is not None:
+        sys.modules["pystray._base"] = _saved_pystray_base
+    else:
+        sys.modules.pop("pystray._base", None)
 
 
 # --------------------------------------------------------------------------- #

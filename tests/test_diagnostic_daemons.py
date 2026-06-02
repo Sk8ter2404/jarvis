@@ -498,11 +498,33 @@ class SelfDiagLoopTests(_Base):
 
 class PathHelperTests(_Base):
     def test_path_is_jarvis_variants(self):
-        self.assertTrue(dd._path_is_jarvis(r"C:\some\JARVIS\thing.py"))
+        # Cross-platform cases. ``_path_is_jarvis`` normalises "/" -> "\\" and
+        # lowercases, so forward-slash inputs match the "\\jarvis" / endswith
+        # branches on every OS. These hold identically on Windows and Linux.
+        self.assertTrue(dd._path_is_jarvis("foo/JARVIS/thing.py"))
         self.assertTrue(dd._path_is_jarvis("foo/bobert_companion.py"))
         self.assertTrue(dd._path_is_jarvis("D:/work/jarvis"))
-        self.assertTrue(dd._path_is_jarvis(dd.PROJECT_DIR + "\\x"))
         self.assertFalse(dd._path_is_jarvis(""))
+        self.assertFalse(dd._path_is_jarvis("/usr/bin/python3"))
+
+        # PROJECT_DIR branch: exercise it OS-agnostically. The helper normalises
+        # "/" -> "\\" *inside* the function but compares against the raw
+        # ``PROJECT_DIR.lower()`` needle, so on Linux a posix PROJECT_DIR (with
+        # "/" separators) would never substring-match a backslash-normalised
+        # input. Feed an already-normalised child path so the needle is present
+        # regardless of the host's path separator.
+        proj_norm = dd.PROJECT_DIR.replace("/", "\\")
+        self.assertTrue(dd._path_is_jarvis(proj_norm + "\\x"))
+
+    @unittest.skipUnless(
+        sys.platform.startswith("win"),
+        "literal Windows drive-letter/backslash paths only occur on Windows",
+    )
+    def test_path_is_jarvis_windows_paths(self):
+        # Genuinely Windows-shaped inputs: a backslash repo path matches and a
+        # backslash system path does not. On Linux these strings never appear,
+        # so the assertions are scoped to Windows rather than made to pass there.
+        self.assertTrue(dd._path_is_jarvis(r"C:\some\JARVIS\thing.py"))
         self.assertFalse(dd._path_is_jarvis(r"C:\Windows\system32\notepad.exe"))
 
     def test_latest_session_log_tail_no_dir(self):

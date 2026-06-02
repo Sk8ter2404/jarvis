@@ -59,12 +59,12 @@ jobs:
       # Run `python tools/audit_codebase.py` locally before a PR (CONTRIBUTING.md).
 
       - name: Coverage (report + enforce floor)
-        # Baseline ~80% of the light-tier surface (core/ + skills/ + tools/).
+        # Baseline ~86% of the light-tier surface (core/ + skills/ + tools/).
         # The ~14K-line monolith is covered by the LOCAL full tier
         # (tools/run_coverage.py --full, deps present) — it can't import on the
         # bare CI runner, so it stays out of this gate. Floor sits below the
         # baseline so it guards regressions without flaking.
-        run: python tools/run_coverage.py --xml --fail-under 75
+        run: python tools/run_coverage.py --xml --fail-under 80
 
       - name: Upload coverage.xml
         if: always()
