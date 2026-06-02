@@ -3129,7 +3129,7 @@ def main() -> int:
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - CLI entry point; main() is unit-tested directly
     try:
         sys.exit(main())
     except Exception:

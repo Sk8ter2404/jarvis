@@ -52,7 +52,7 @@ from typing import Any
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
-    except Exception:
+    except Exception:  # pragma: no cover - import-time guard for consoles lacking reconfigure
         pass
 
 
@@ -1429,5 +1429,5 @@ def _cli(argv: list[str]) -> int:
     return 0 if result.get("ok") else 1
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - CLI entry, exercised via _cli() in tests
     sys.exit(_cli(sys.argv[1:]))

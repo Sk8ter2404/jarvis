@@ -59,7 +59,18 @@ def main(argv: list[str]) -> int:
              # gitignored personal skills — not shipped, absent on CI, so they
              # don't belong in the shipped-coverage denominator.
              "*/skills/vip_intercept.py", "*/skills/vip_boss_mode.py",
-             "*/skills/trip_planner.py", "*/skills/teams_screener.py"]
+             "*/skills/trip_planner.py", "*/skills/teams_screener.py",
+             # One-off operational / hardware-bench / scratch utilities — run by
+             # hand, not part of the shipped runtime library surface, and several
+             # need hardware (camera/LAN/PyQt) absent on CI. Excluded from the
+             # measured denominator (the product code + the release/CI gates are
+             # what we hold to coverage; these are dev conveniences):
+             "tools/audit_local.py", "tools/pii_local.py",
+             "tools/bounce_jarvis.py", "tools/face_detect_bench.py",
+             "tools/generate_jarvis_icon.py", "tools/identify_vendors.py",
+             "tools/render_unified_hud.py", "tools/say_to_jarvis.py",
+             "tools/scan_full_network.py", "tools/scan_lan_devices.py",
+             "tools/test_local_prompt.py"]
     if want_full:
         # LOCAL full tier: adds the ~14K-line monolith + the other root product
         # modules + the smaller product packages. Needs all deps present (these

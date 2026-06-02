@@ -49,5 +49,5 @@ def main(argv: list[str]) -> int:
     return 0 if result.wasSuccessful() else 1
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - CLI entrypoint
     sys.exit(main(sys.argv[1:]))

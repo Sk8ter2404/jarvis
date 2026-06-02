@@ -168,5 +168,5 @@ def _finish(proc, fh, results, *, ok: bool) -> int:
     return 0 if ok else 1
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - CLI entrypoint
     sys.exit(main())

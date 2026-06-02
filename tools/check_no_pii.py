@@ -151,7 +151,7 @@ def _scan_file(path: str, rules: list) -> list[tuple]:
         return []
     try:
         text = raw.decode("utf-8", errors="replace")
-    except Exception:
+    except Exception:  # pragma: no cover - decode(errors="replace") never raises
         return []
     hits: list[tuple] = []
     for i, line in enumerate(text.splitlines(), 1):
@@ -209,5 +209,5 @@ def main(argv: list[str]) -> int:
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - CLI entrypoint
     sys.exit(main(sys.argv[1:]))
