@@ -382,6 +382,11 @@ class BuImportsTests(_BrowserAgentTestBase):
 
     def test_real_browser_use_present(self):
         # Sanity: with the real package, Agent + a chat wrapper are found.
+        # browser_use + langchain_anthropic are absent on the light-deps CI
+        # runner, so this real-package check only applies when they're installed.
+        import importlib.util
+        if importlib.util.find_spec("browser_use") is None:
+            self.skipTest("browser_use not installed (absent on the CI runner)")
         out = self.mod._bu_imports()
         self.assertIsNotNone(out.get("Agent"))
         self.assertIsNotNone(out.get("ChatAnthropic"))

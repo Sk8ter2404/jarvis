@@ -227,8 +227,13 @@ class InitTests(_ResetSingletonMixin, unittest.TestCase):
         self.assertEqual(p.frame_samples, 320)  # 16000*20/1000
         # No webrtc in this env.
         self.assertIsNone(p._apm)
-        # noisereduce is installed in this env.
-        self.assertIsNotNone(p._nr)
+        # _nr is loaded iff noisereduce is importable — present on the dev box,
+        # absent on the light-deps CI runner — so assert against actual presence.
+        import importlib.util
+        if importlib.util.find_spec("noisereduce") is not None:
+            self.assertIsNotNone(p._nr)
+        else:
+            self.assertIsNone(p._nr)
 
     def test_frame_samples_floor_is_one(self):
         # A tiny sample rate would compute 0 samples/frame; clamped to >=1.
@@ -314,7 +319,9 @@ class StatusTests(_ResetSingletonMixin, unittest.TestCase):
         self.assertEqual(s["sample_rate"], 16000)
         self.assertEqual(s["frame_ms"], 20)
         self.assertFalse(s["apm_available"])
-        self.assertTrue(s["noisereduce_available"])
+        import importlib.util
+        self.assertEqual(s["noisereduce_available"],
+                         importlib.util.find_spec("noisereduce") is not None)
         self.assertIsNone(s["last_playback_age_s"])  # no playback yet
         self.assertEqual(s["n_processed"], 0)
         self.assertEqual(s["agc_flatness_bounds"], (0.20, 0.80))
