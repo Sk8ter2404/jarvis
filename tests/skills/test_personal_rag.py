@@ -122,7 +122,7 @@ class PersonalRagFormattingTests(unittest.TestCase):
 
     def test_format_voice_falls_back_to_basename(self):
         out = self.mod._format_hits_for_voice(
-            [{"path": r"C:\docs\report.pdf", "snippet": "q3"}])
+            [{"path": "docs/report.pdf", "snippet": "q3"}])
         self.assertIn("report.pdf", out)
 
     # ── _format_hits_for_llm ─────────────────────────────────────────────
@@ -400,19 +400,19 @@ class RagOpenTopSuccessTests(unittest.TestCase):
 
     def test_open_top_launches_existing_file(self):
         with self.mod._lock:
-            self.mod._last_hits = [{"path": r"C:\docs\plan.md"}]
+            self.mod._last_hits = [{"path": "docs/plan.md"}]
             self.mod._last_query = "plan"
         # os.path.exists True + os.startfile mocked (startfile is Windows-only,
         # so patch it on by attribute even where absent).
         with mock.patch.object(self.mod.os.path, "exists", return_value=True), \
              mock.patch.object(self.mod.os, "startfile", create=True) as sf:
             out = self.actions["rag_open_top"]("")
-        sf.assert_called_once_with(r"C:\docs\plan.md")
+        sf.assert_called_once_with("docs/plan.md")
         self.assertIn("Opening plan.md", out)
 
     def test_open_top_startfile_failure_reported(self):
         with self.mod._lock:
-            self.mod._last_hits = [{"path": r"C:\docs\plan.md"}]
+            self.mod._last_hits = [{"path": "docs/plan.md"}]
             self.mod._last_query = "plan"
         with mock.patch.object(self.mod.os.path, "exists", return_value=True), \
              mock.patch.object(self.mod.os, "startfile", create=True,

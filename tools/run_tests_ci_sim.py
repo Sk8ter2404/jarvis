@@ -244,7 +244,20 @@ def main() -> int:
 
     def _find_spec(name, package=None):
         if _shim_should_block(name):
-            return None  # faithful: an absent module's find_spec returns None
+            # Real importlib.find_spec imports a dotted name's PARENT to locate
+            # the submodule: if that parent package is itself absent it RAISES
+            # ModuleNotFoundError (it does NOT return None). Mirror that for a
+            # dotted name whose head is blocked (e.g. find_spec(
+            # "googleapiclient.discovery") with googleapiclient absent) so
+            # dotted-probe bugs surface HERE instead of on the real runner. A
+            # bare absent top-level module → None; a submodule whose parent DOES
+            # import (e.g. ctypes.wintypes, ctypes present) → None.
+            head = name.split(".")[0]
+            if "." in name and _blocked(head):
+                raise ModuleNotFoundError(
+                    f"[ci-sim] parent {head!r} is not on the CI runner",
+                    name=name)
+            return None
         return real_find_spec(name, package)
 
     def _import_module(name, package=None):

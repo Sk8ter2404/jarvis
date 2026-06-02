@@ -21,8 +21,19 @@ from unittest import mock
 
 from tests._skill_harness import load_skill_isolated
 
+def _spec_present(name: str) -> bool:
+    # find_spec on a DOTTED name imports the parent package to locate the
+    # submodule; when the parent is absent (bare CI runner) it RAISES
+    # ModuleNotFoundError rather than returning None. Catch that so this probe
+    # degrades to "absent" instead of erroring at module-import time.
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
 _HAS_GOOGLE_API = all(
-    importlib.util.find_spec(n) is not None
+    _spec_present(n)
     for n in ("googleapiclient.discovery", "googleapiclient.errors",
               "google.oauth2.credentials", "google.auth.transport.requests",
               "google_auth_oauthlib.flow")
