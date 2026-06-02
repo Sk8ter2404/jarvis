@@ -667,6 +667,55 @@ class BadPatternTests(_AuditTestBase):
         self.assertEqual(audit._const_str(audit._kwarg_value(call, "mode")), "w")
         self.assertIsNone(audit._kwarg_value(call, "nope"))
 
+    def test_unresolvable_callee_in_file_is_skipped(self):
+        # A call whose callee is itself a call result (`f()()`) resolves to None
+        # in _ast_bad_pattern_checks and is skipped — no crash, no finding.
+        fp = self.write("mod.py", "f()()\n")
+        out = audit.check_bad_patterns([fp])
+        self.assertEqual(out, [])
+
+    def test_json_dump_call_is_noop_branch(self):
+        # `json.dump(d, f)` hits the dedicated json.dump branch (a pass) without
+        # producing a bad-pattern finding here.
+        fp = self.write("mod.py", "import json\njson.dump(d, f)\n")
+        out = audit.check_bad_patterns([fp])
+        self.assertEqual(self.by_cat(out, "open-no-encoding"), [])
+
+    def test_open_with_non_constant_mode_treated_as_text(self):
+        # open(path, modevar) — mode arg is a Name, not a str constant, so
+        # _const_str returns None; the call is treated as text (encoding wanted).
+        fp = self.write("mod.py", "m = 'r'\nf = open('a.txt', m)\n")
+        cats = self.cats(audit.check_bad_patterns([fp]))
+        self.assertIn("open-no-encoding", cats)
+
+    def test_hardcoded_path_in_trailing_comment_flagged(self):
+        # The hardcoded-path regex fires on a non-string, non-comment-leading
+        # line — here a code line with the path in a trailing comment. Build the
+        # path at runtime so no literal lives in this test file.
+        bad_path = "D:" + chr(92) + "PC Files" + chr(92) + "thing"
+        fp = self.write("mod.py", "x = 1  # see " + bad_path + "\n")
+        cats = self.cats(audit.check_bad_patterns([fp]))
+        self.assertIn("hardcoded-path", cats)
+
+    def test_bare_unassigned_thread_flagged_no_daemon(self):
+        # A Thread call that is NOT bound to `<name> = ...` exercises the
+        # _has_post_construction_daemon early-out (parent is not an Assign).
+        fp = self.write("mod.py",
+                        "import threading\nthreading.Thread(target=foo)\n")
+        cats = self.cats(audit.check_bad_patterns([fp]))
+        self.assertIn("thread-no-daemon", cats)
+
+    def test_thread_assigned_to_attribute_target_flagged(self):
+        # `self.t = Thread(...)` — the assign target is an Attribute (not a bare
+        # Name), so the post-construction-daemon check bails and the finding fires.
+        fp = self.write("mod.py",
+                        "import threading\n"
+                        "class C:\n"
+                        "    def m(self):\n"
+                        "        self.t = threading.Thread(target=foo)\n")
+        cats = self.cats(audit.check_bad_patterns([fp]))
+        self.assertIn("thread-no-daemon", cats)
+
 
 class SyntaxErrorResilienceTests(_AuditTestBase):
     """Every AST-walking checker must SWALLOW a SyntaxError file (it's already
@@ -1000,6 +1049,22 @@ class FixTransformTests(_AuditTestBase):
             audit._apply_fix_to_line("subprocess.run(['x'])", "timeout"),
             ["subprocess.run(['x'], timeout=60)"])
 
+    def test_daemon_fix_no_thread_on_line_returns_none(self):
+        # fix_kind=daemon but the line has no Thread/Timer call → no match → None.
+        self.assertIsNone(audit._apply_fix_to_line("x = 1", "daemon"))
+
+    def test_daemon_fix_already_has_daemon_returns_none(self):
+        self.assertIsNone(
+            audit._apply_fix_to_line("t = threading.Thread(target=x, daemon=True)",
+                                     "daemon"))
+
+    def test_timeout_fix_no_subprocess_on_line_returns_none(self):
+        self.assertIsNone(audit._apply_fix_to_line("x = 1", "timeout"))
+
+    def test_timeout_fix_already_has_timeout_returns_none(self):
+        self.assertIsNone(
+            audit._apply_fix_to_line("subprocess.run(['x'], timeout=5)", "timeout"))
+
     def test_unknown_fix_kind_returns_none(self):
         self.assertIsNone(audit._apply_fix_to_line("x = 1", "bogus"))
 
@@ -1034,6 +1099,38 @@ class ApplyFixesTests(_AuditTestBase):
         applied, residual = audit.apply_fixes([finding])
         self.assertEqual(applied, 0)
         self.assertEqual(len(residual), 1)
+
+    def test_apply_fixes_unreadable_file_skipped(self):
+        # The finding points at a file that can't be read → that file is skipped
+        # (the `_read_source is None` continue) with nothing applied.
+        finding = audit.Finding(severity="P2", category="open-no-encoding",
+                                file="ghost_does_not_exist.py", line=1,
+                                message="x", fixable=True, fix_kind="encoding")
+        applied, residual = audit.apply_fixes([finding])
+        self.assertEqual(applied, 0)
+
+    def test_apply_fixes_write_failure_swallowed(self):
+        # The fix matches and modifies the lines, but the write-back raises;
+        # apply_fixes must swallow it (printing to stderr) and still count it.
+        # _read_source reads in mode "r"; only the write-back open(mode "w")
+        # raises, so the read succeeds and we reach the write except.
+        self.write("mod.py", "f = open('a.txt')\n")
+        finding = audit.Finding(severity="P2", category="open-no-encoding",
+                                file="mod.py", line=1, message="x",
+                                fixable=True, fix_kind="encoding")
+        real_open = open
+
+        def open_fail_on_write(path, *a, **k):
+            mode = a[0] if a else k.get("mode", "r")
+            if "w" in mode:
+                raise OSError("read-only")
+            return real_open(path, *a, **k)
+
+        with mock.patch("builtins.open", side_effect=open_fail_on_write):
+            applied, _residual = audit.apply_fixes([finding])
+        # the in-memory transform succeeded (applied counted) even though the
+        # write failed; no exception escaped.
+        self.assertEqual(applied, 1)
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1890,6 +1987,792 @@ class MainTests(_AuditTestBase):
         self.assertIn('encoding="utf-8"', new)
         # open-no-encoding is the only finding and it's fixable → clean exit.
         self.assertEqual(rc, 0)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  Targeted branch-coverage completion: defensive guards and node-type
+#  branches that the per-checker suites above don't exercise. Each test names
+#  the exact branch it pins.
+# ═════════════════════════════════════════════════════════════════════════
+
+class CollectorBranchTests(_AuditTestBase):
+    """AnnAssign / star-package / unreadable-file branches in the name
+    collectors and _module_exported_names."""
+
+    def setUp(self):
+        super().setUp()
+        self.mkdir("skills")
+        self.mkdir("core")
+
+    def test_module_exported_names_includes_annassign(self):
+        # `x: int = 1` at module top is an AnnAssign with a Name target → x is
+        # an exported name (no __all__ present).
+        p = self.write("m.py", "y: int = 5\ndef f():\n    pass\n")
+        got = audit._module_exported_names(p)
+        self.assertIn("y", got)
+        self.assertIn("f", got)
+
+    def test_module_exported_names_unreadable_returns_empty(self):
+        # _read_source None → empty set (the early return).
+        with mock.patch.object(audit, "_read_source", return_value=(None, None)):
+            self.assertEqual(audit._module_exported_names("anything.py"), set())
+
+    def test_bc_collector_includes_annassign(self):
+        self.write("bobert_companion.py", "CONST: int = 1\ndef boot():\n    pass\n")
+        names = audit.collect_bobert_companion_names()
+        self.assertIn("CONST", names)
+
+    def test_bc_collector_star_import_from_package(self):
+        # `from pkg import *` where pkg is a package dir (pkg/__init__.py) →
+        # the collector resolves the package __init__ exports (the not-isfile
+        # branch that switches to __init__.py).
+        self.mkdir("pkg")
+        self.write("pkg/__init__.py", "EXPORTED_FROM_PKG = 1\n")
+        self.write("bobert_companion.py", "from pkg import *\nLOCAL = 2\n")
+        names = audit.collect_bobert_companion_names()
+        self.assertIn("EXPORTED_FROM_PKG", names)
+        self.assertIn("LOCAL", names)
+
+    def test_core_collector_skips_unreadable_file(self):
+        # A core/*.py whose _read_source yields None is skipped (continue) and
+        # absent from the result; a readable sibling still appears.
+        self.write("core/good.py", "def g():\n    pass\n")
+        self.write("core/bad.py", "def b():\n    pass\n")
+        bad_abs = os.path.join(self.tmp, "core", "bad.py")
+        real_read = audit._read_source
+
+        def selective_read(path, *a, **k):
+            if os.path.normpath(path) == os.path.normpath(bad_abs):
+                return (None, None)
+            return real_read(path, *a, **k)
+
+        with mock.patch.object(audit, "_read_source", side_effect=selective_read):
+            cm = audit.collect_core_module_names()
+        self.assertIn("good", cm)
+        self.assertNotIn("bad", cm)
+
+    def test_core_collector_includes_annassign(self):
+        self.write("core/c.py", "SLOT: int = 0\n")
+        cm = audit.collect_core_module_names()
+        self.assertIn("SLOT", cm["c"])
+
+
+class LocalInternalActionsTests(_AuditTestBase):
+    """_load_local_internal_actions: absent file → empty; broken file → empty."""
+
+    def test_absent_file_returns_empty(self):
+        # No tools/audit_local.py next to the module → empty set.
+        with mock.patch.object(audit.os.path, "exists", return_value=False):
+            self.assertEqual(audit._load_local_internal_actions(), set())
+
+    def test_unreadable_or_broken_file_returns_empty(self):
+        # File "exists" but exec/read raises → the except returns an empty set.
+        with mock.patch.object(audit.os.path, "exists", return_value=True), \
+             mock.patch("builtins.open", side_effect=OSError("locked")):
+            self.assertEqual(audit._load_local_internal_actions(), set())
+
+
+class RelAndRequirementsBranchTests(_AuditTestBase):
+    def test_rel_valueerror_returns_input(self):
+        # relpath raising ValueError (e.g. cross-drive on Windows) → return the
+        # path unchanged. Patch relpath to raise so this is OS-independent.
+        with mock.patch.object(audit.os.path, "relpath",
+                               side_effect=ValueError("different drive")):
+            self.assertEqual(audit._rel("C:/some/abs/path.py"), "C:/some/abs/path.py")
+
+    def test_requirements_blank_spec_line_skipped(self):
+        # A requirements line that strips to nothing after removing the version
+        # marker hits the `if not spec: continue` branch and is ignored.
+        self.write("requirements.txt", "requests==2.0\n>=1.0\n# comment\nflask\n")
+        pkgs, _optional = audit._parse_requirements_full()
+        self.assertIn("requests", pkgs)
+        self.assertIn("flask", pkgs)
+
+    def test_requirements_read_error_swallowed(self):
+        # An unreadable requirements.txt → the outer except returns empty sets.
+        self.write("requirements.txt", "requests\n")
+        with mock.patch("builtins.open", side_effect=OSError("locked")):
+            pkgs, optional = audit._parse_requirements_full()
+        self.assertEqual(pkgs, set())
+        self.assertEqual(optional, set())
+
+
+class CheckSyntaxBranchTests(_AuditTestBase):
+    def test_non_pycompile_exception_becomes_p0(self):
+        # py_compile raising a NON-PyCompileError (e.g. OSError) hits the generic
+        # except and still yields a P0 syntax finding.
+        fp = self.write("m.py", "x = 1\n")
+        with mock.patch.object(audit.py_compile, "compile",
+                               side_effect=OSError("disk gone")):
+            out = audit.check_syntax([fp])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].severity, "P0")
+        self.assertIn("could not compile", out[0].message)
+
+
+class CheckImportsBranchTests(_AuditTestBase):
+    def setUp(self):
+        super().setUp()
+        self.mkdir("skills")
+        self.write("requirements.txt", "")
+
+    def test_unreadable_file_skipped(self):
+        # _read_source None for a file in the list → continue (no crash).
+        fp = self.write("skills/s.py", "import os\n")
+        with mock.patch.object(audit, "_read_source", return_value=(None, None)):
+            out = audit.check_imports([fp])
+        self.assertEqual(out, [])
+
+    def test_duplicate_import_on_same_line_deduped(self):
+        # `import os, os` yields the same (module, line) key twice → the second
+        # hits the `if key in seen: continue` branch.
+        fp = self.write("skills/s.py", "import os, os\n")
+        out = audit.check_imports([fp])   # os is stdlib → no finding either way
+        self.assertEqual(out, [])
+
+    def test_successful_third_party_import_is_clean(self):
+        # A module that is NOT stdlib and NOT intra but imports successfully
+        # (coverage — present in the CI dep set) hits the post-__import__
+        # `continue`, producing no finding.
+        if importlib.util.find_spec("coverage") is None:
+            self.skipTest("coverage not importable")
+        fp = self.write("skills/s.py", "import coverage\n")
+        out = audit.check_imports([fp])
+        self.assertEqual([f for f in out if f.category == "imports"], [])
+
+    def test_import_raising_non_import_error_skipped(self):
+        # __import__ raising something other than ImportError (weird import-time
+        # side effect) → the `except Exception: continue` branch; no finding.
+        fp = self.write("skills/s.py", "import weird_side_effect_mod\n")
+        real_import = __import__
+
+        def fake_import(name, *a, **k):
+            if name == "weird_side_effect_mod":
+                raise RuntimeError("import had a side effect")
+            return real_import(name, *a, **k)
+
+        with mock.patch("builtins.__import__", side_effect=fake_import):
+            out = audit.check_imports([fp])
+        self.assertEqual([f for f in out if f.category == "imports"], [])
+
+    def test_project_dir_listdir_oserror_swallowed(self):
+        # The dynamic intra-module discovery wraps os.listdir(PROJECT_DIR) in
+        # try/except OSError. Make listdir raise only for PROJECT_DIR; the
+        # function must still complete.
+        fp = self.write("skills/s.py", "import os\n")
+        real_listdir = os.listdir
+        proj = audit.PROJECT_DIR
+
+        def fail_proj(path, *a, **k):
+            if os.path.normpath(path) == os.path.normpath(proj):
+                raise OSError("denied")
+            return real_listdir(path, *a, **k)
+
+        with mock.patch.object(audit.os, "listdir", side_effect=fail_proj):
+            out = audit.check_imports([fp])   # must not raise
+        self.assertIsInstance(out, list)
+
+    def test_package_discovery_inner_listdir_oserror_swallowed(self):
+        # The package-discovery loop lists each top-level dir; an inner
+        # os.listdir(<subdir>) OSError is swallowed. Raise only for a specific
+        # subdir while PROJECT_DIR itself lists fine.
+        self.mkdir("somedir")
+        fp = self.write("skills/s.py", "import os\n")
+        real_listdir = os.listdir
+        sub = os.path.join(audit.PROJECT_DIR, "somedir")
+
+        def fail_sub(path, *a, **k):
+            if os.path.normpath(path) == os.path.normpath(sub):
+                raise OSError("denied")
+            return real_listdir(path, *a, **k)
+
+        with mock.patch.object(audit.os, "listdir", side_effect=fail_sub):
+            out = audit.check_imports([fp])   # must not raise
+        self.assertIsInstance(out, list)
+
+
+class CrossRefBranchTests(_AuditTestBase):
+    def setUp(self):
+        super().setUp()
+        self.mkdir("skills")
+        self.mkdir("core")
+
+    def test_core_dotted_import_alias_attribute_resolution(self):
+        # `import core.state as st` records the alias; `st.MISSING` (not defined
+        # in core/state.py) is flagged, while `st.KNOWN` is clean.
+        self.write("bobert_companion.py", "X = 1\n")
+        self.write("core/state.py", "KNOWN = 1\n")
+        fp = self.write("skills/s.py",
+                        "import core.state as st\n"
+                        "a = st.KNOWN\n"
+                        "b = st.MISSING\n")
+        out = audit.check_cross_references([fp])
+        msgs = " ".join(f.message for f in out)
+        self.assertIn("MISSING", msgs)
+        self.assertNotIn("KNOWN", msgs)
+
+    def test_star_imports_from_bc_and_core_are_ignored(self):
+        # `from bobert_companion import *` and `from core.x import *` both hit
+        # the `alias.name == "*": continue` guards (no cross-ref findings).
+        self.write("bobert_companion.py", "X = 1\n")
+        self.write("core/cfg.py", "Y = 1\n")
+        fp = self.write("skills/s.py",
+                        "from bobert_companion import *\n"
+                        "from core.cfg import *\n")
+        out = audit.check_cross_references([fp])
+        self.assertEqual([f for f in out if f.category == "cross-ref"], [])
+
+    def test_attribute_on_non_name_base_skipped(self):
+        # With a bc alias present (so the attribute walk runs), an attribute
+        # access whose base is itself an Attribute (`a.b.c`) is skipped at the
+        # `not isinstance(node.value, ast.Name)` guard — no spurious finding.
+        self.write("bobert_companion.py", "X = 1\n")
+        fp = self.write("skills/s.py",
+                        "import bobert_companion as bc\n"
+                        "import os\n"
+                        "v = os.path.join\n"      # os.path.join → nested Attribute
+                        "w = bc.X\n")             # keeps the walk meaningful
+        out = audit.check_cross_references([fp])
+        self.assertEqual([f for f in out if f.category == "cross-ref"], [])
+
+    def test_unreadable_target_file_skipped(self):
+        # bc_names is non-empty (so the check proceeds past the early bail), but
+        # the file in the list is unreadable → `_read_source is None` continue.
+        # _read_source is also used by collect_bobert_companion_names(); make
+        # ONLY the skill file unreadable so bc_names stays populated.
+        self.write("bobert_companion.py", "X = 1\ndef boot():\n    pass\n")
+        skill = self.write("skills/s.py", "x = 1\n")
+        real_read = audit._read_source
+
+        def selective(path, *a, **k):
+            if os.path.normpath(path) == os.path.normpath(skill):
+                return (None, None)
+            return real_read(path, *a, **k)
+
+        with mock.patch.object(audit, "_read_source", side_effect=selective):
+            out = audit.check_cross_references([skill])
+        self.assertEqual(out, [])
+
+    def test_syntaxerror_target_file_skipped(self):
+        # bc_names non-empty + a syntactically-broken file → SyntaxError continue
+        # inside check_cross_references (not just the syntax checker's own path).
+        self.write("bobert_companion.py", "X = 1\n")
+        broken = self.write("skills/broken.py", "def (:\n")
+        out = audit.check_cross_references([broken])
+        self.assertEqual([f for f in out if f.category == "cross-ref"], [])
+
+
+class ActionsCheckBranchTests(_AuditTestBase):
+    def setUp(self):
+        super().setUp()
+        self.mkdir("skills")
+
+    def test_unreadable_skill_skipped(self):
+        fp = self.write("skills/s.py", "def register(actions):\n    pass\n")
+        with mock.patch.object(audit, "_read_source", return_value=(None, None)):
+            out, owners = audit.check_actions([fp], set())
+        self.assertEqual(out, [])
+
+    def test_non_actions_subscript_and_dynamic_key_skipped(self):
+        # In register(): a subscript on a DIFFERENT name (not the actions param)
+        # and a dynamic (non-constant) key both hit their `continue` branches.
+        src = ("def _h(p):\n    return ''\n"
+               "def register(actions):\n"
+               "    other = {}\n"
+               "    other['x'] = _h\n"          # subscript on non-param → skip
+               "    k = 'dyn'\n"
+               "    actions[k] = _h\n")         # dynamic key → skip
+        fp = self.write("skills/s.py", src)
+        out, owners = audit.check_actions([fp], set())
+        # neither produced a registered action / finding
+        self.assertEqual(out, [])
+        self.assertNotIn("x", owners)
+
+    def test_rhs_attribute_and_lambda_callables(self):
+        # `actions["a"] = mod.fn` (Attribute rhs) and `actions["b"] = lambda ...`
+        # (Lambda rhs) resolve callable_name via their dedicated branches.
+        src = ("import mod\n"
+               "def register(actions):\n"
+               "    actions['a'] = mod.fn\n"
+               "    actions['b'] = lambda payload: ''\n")
+        fp = self.write("skills/s.py", src)
+        out, owners = audit.check_actions([fp], set())
+        # both register cleanly (lambda takes 1 arg; attribute callable unknown
+        # arity → no arity finding)
+        self.assertIn("a", owners)
+        self.assertIn("b", owners)
+
+
+class UnreadableFileSkipBranchTests(_AuditTestBase):
+    """The `_read_source is None` continue at the top of several per-file
+    checkers (an unreadable file is silently skipped)."""
+
+    def setUp(self):
+        super().setUp()
+        self.mkdir("skills")
+
+    def test_check_bad_patterns_skips_unreadable(self):
+        fp = self.write("m.py", "x = 1\n")
+        with mock.patch.object(audit, "_read_source", return_value=(None, None)):
+            self.assertEqual(audit.check_bad_patterns([fp]), [])
+
+    def test_check_secrets_skips_unreadable(self):
+        fp = self.write("m.py", "x = 1\n")
+        with mock.patch.object(audit, "_read_source", return_value=(None, None)):
+            self.assertEqual(audit.check_secrets([fp]), [])
+
+    def test_check_state_file_writes_skips_unreadable(self):
+        fp = self.write("m.py", "x = 1\n")
+        with mock.patch.object(audit, "_read_source", return_value=(None, None)):
+            self.assertEqual(audit.check_state_file_writes([fp]), [])
+
+
+class SecretPlaceholderBranchTests(_AuditTestBase):
+    def test_all_x_placeholder_value_whitelisted(self):
+        # A password value that is all-X (>=8) looks like a placeholder → the
+        # `re.fullmatch(r"[xX*]{8,}", val)` continue suppresses the P1.
+        fp = self.write("m.py", "password = 'XXXXXXXXXX'\n")
+        out = audit.check_secrets([fp])
+        self.assertEqual([f for f in out if f.severity == "P1"], [])
+
+
+class StateFileWriteNonOpenBranchTests(_AuditTestBase):
+    def test_with_block_non_open_context_skipped(self):
+        # A `with <non-open call>():` inside the file → the context_expr is a
+        # Call but not open() → the `continue` guard fires (no state-write check).
+        src = ("def f():\n"
+               "    with contextlib.suppress(Exception):\n"
+               "        pass\n")
+        fp = self.write("m.py", src)
+        out = audit.check_state_file_writes([fp])
+        self.assertEqual(out, [])
+
+
+class ReadbackBranchTests(_AuditTestBase):
+    def test_json_file_unreadable_non_decode_error(self):
+        # A tracked json file that exists but raises a non-JSONDecodeError on
+        # open → the generic except emits a state-corruption P1.
+        self.write("hud_state.json", "{}")
+        with mock.patch("builtins.open", side_effect=OSError("locked")):
+            out = audit.check_readback()
+        self.assertTrue(any(f.category == "state-corruption"
+                            and "unreadable" in f.message for f in out))
+
+    def test_todo_unreadable_flagged(self):
+        # jarvis_todo.md present but unreadable → its own except emits a P1.
+        self.write("jarvis_todo.md", "- [ ] task\n")
+        real_open = open
+
+        def fail_todo(path, *a, **k):
+            if str(path).endswith("jarvis_todo.md"):
+                raise OSError("locked")
+            return real_open(path, *a, **k)
+
+        with mock.patch("builtins.open", side_effect=fail_todo):
+            out = audit.check_readback()
+        self.assertTrue(any(f.file == "jarvis_todo.md"
+                            and "unreadable" in f.message for f in out))
+
+
+class ResolveOpenTargetBranchTests(_AuditTestBase):
+    def test_join_without_string_args_returns_none(self):
+        # _resolve_open_target on an os.path.join() whose args are all
+        # non-constant falls through to the final `return None`.
+        node = ast.parse("os.path.join(a, b)").body[0].value
+        self.assertIsNone(audit._resolve_open_target(node))
+
+
+class MutationHygieneBranchTests(_AuditTestBase):
+    def test_unreadable_file_skipped(self):
+        fp = self.write("m.py", "x = 1\n")
+        with mock.patch.object(audit, "_read_source", return_value=(None, None)):
+            self.assertEqual(audit.check_mutation_hygiene([fp]), [])
+
+    def test_thread_target_attribute_recorded(self):
+        # `threading.Thread(target=self.worker)` → target is an Attribute; the
+        # attr name is recorded as a thread target. Pair it with an unlocked
+        # global mutation in a method of the same name to surface the finding.
+        src = ("import threading\n"
+               "CACHE = {}\n"
+               "class C:\n"
+               "    def worker(self):\n"
+               "        CACHE.clear()\n"
+               "    def go(self):\n"
+               "        threading.Thread(target=self.worker).start()\n")
+        fp = self.write("m.py", src)
+        out = audit.check_mutation_hygiene([fp])
+        self.assertTrue(all(f.category == "mutation-hygiene" for f in out))
+
+
+class ProfileSkillBranchTests(_AuditTestBase):
+    def setUp(self):
+        super().setUp()
+        self.mkdir("skills")
+
+    def test_unreadable_skill_returns_empty_profile(self):
+        fp = self.write("skills/s.py", "def register(actions):\n    pass\n")
+        with mock.patch.object(audit, "_read_source", return_value=(None, None)):
+            prof = audit._profile_skill(fp)
+        self.assertEqual(prof["actions"], {})
+        self.assertEqual(prof["writes_state"], set())
+
+    def test_thread_target_attribute_recorded(self):
+        src = ("import threading\n"
+               "def register(actions):\n"
+               "    t = threading.Thread(target=obj.run)\n")
+        fp = self.write("skills/s.py", src)
+        prof = audit._profile_skill(fp)
+        self.assertIn("run", prof["thread_targets"])
+
+    def test_atomic_writer_via_whole_module_import(self):
+        # `import core.atomic_io` (the whole module) marks uses_atomic_writer.
+        src = "import core.atomic_io\ndef register(actions):\n    pass\n"
+        fp = self.write("skills/s.py", src)
+        self.assertTrue(audit._profile_skill(fp)["uses_atomic_writer"])
+
+    def test_atomic_writer_via_from_core_import(self):
+        # `from core import atomic_io` also marks uses_atomic_writer.
+        src = "from core import atomic_io\ndef register(actions):\n    pass\n"
+        fp = self.write("skills/s.py", src)
+        self.assertTrue(audit._profile_skill(fp)["uses_atomic_writer"])
+
+    def test_register_without_args_skipped_in_profile(self):
+        # `def register():` (no args) hits the `if not node.args.args: continue`
+        # guard in the action-extraction pass.
+        src = "def register():\n    pass\n"
+        fp = self.write("skills/s.py", src)
+        prof = audit._profile_skill(fp)
+        self.assertEqual(prof["actions"], {})
+
+    def test_annassign_dict_update_registration(self):
+        # `handlers: dict = {...}` (AnnAssign with a Dict value) inside register
+        # is recognised as a registration dict for the update() form.
+        src = ("def h1(p):\n    return ''\n"
+               "def register(actions):\n"
+               "    handlers: dict = {'aa': h1}\n"
+               "    actions.update(handlers)\n")
+        fp = self.write("skills/s.py", src)
+        prof = audit._profile_skill(fp)
+        self.assertIn("aa", prof["actions"])
+
+
+class StubObjectsBranchTests(unittest.TestCase):
+    def test_stub_module_returns_callable(self):
+        m = audit._StubModule("fakecv2")
+        attr = m.SomeFunc
+        self.assertIsInstance(attr, audit._StubCallable)
+        # calling it returns another stub (chainable)
+        self.assertIsInstance(attr(), audit._StubCallable)
+
+    def test_stub_callable_dunder_attr_raises(self):
+        sc = audit._StubCallable("x")
+        with self.assertRaises(AttributeError):
+            getattr(sc, "__wrapped__")
+        # normal attribute access still returns a stub
+        self.assertIsInstance(sc.normal, audit._StubCallable)
+
+    def test_stub_module_dunder_attr_raises(self):
+        m = audit._StubModule("fake")
+        with self.assertRaises(AttributeError):
+            getattr(m, "__signature__")
+
+
+class ThreadAuditBranchTests(_AuditTestBase):
+    def test_unreadable_file_skipped(self):
+        fp = self.write("m.py", "import threading\nt = threading.Thread(target=f)\n")
+        with mock.patch.object(audit, "_read_source", return_value=(None, None)):
+            findings, summary = audit.check_thread_audit([fp])
+        self.assertEqual(findings, [])
+        self.assertEqual(summary, [])
+
+    def test_thread_target_attribute_in_summary(self):
+        # target=self.run → Attribute; recorded as target name in the summary.
+        src = ("import threading\n"
+               "t = threading.Thread(target=obj.run)\n")
+        fp = self.write("m.py", src)
+        _findings, summary = audit.check_thread_audit([fp])
+        self.assertEqual(len(summary), 1)
+        self.assertEqual(summary[0]["target"], "run")
+
+    def test_delegation_loop_with_pass_break_and_assign(self):
+        # A thread target whose loop body's top-level statements are pure
+        # delegation: a call-assignment (Assign-of-Call branch), a bare call
+        # (Expr-Call branch), and a Break (Pass/Break/Continue branch). All hit
+        # their respective `continue`s in _delegation_only → resilient, so no
+        # thread-no-try finding is emitted.
+        src = ("import threading\n"
+               "def worker():\n"
+               "    while True:\n"
+               "        x = step()\n"     # Assign-of-Call branch (2244-2245)
+               "        do()\n"           # Expr-Call branch (2240-2241)
+               "        break\n"          # Break branch (2242-2243)
+               "t = threading.Thread(target=worker)\n")
+        fp = self.write("m.py", src)
+        findings, _ = audit.check_thread_audit([fp])
+        self.assertEqual(self.by_cat(findings, "thread-no-try"), [])
+
+
+class SkillPairMatrixWriteBranchTests(_AuditTestBase):
+    def setUp(self):
+        super().setUp()
+        self.mkdir("skills")
+
+    def test_matrix_write_failure_swallowed(self):
+        # The conflict-matrix markdown write is best-effort; an OSError on the
+        # open() must be swallowed and the check must still return.
+        self.write("skills/a.py", "def register(actions):\n    pass\n")
+        self.write("skills/b.py", "def register(actions):\n    pass\n")
+        files = [os.path.join(self.tmp, "skills", "a.py"),
+                 os.path.join(self.tmp, "skills", "b.py")]
+        real_open = open
+
+        def fail_md(path, *a, **k):
+            if str(path).endswith("audit_conflict_matrix.md"):
+                raise OSError("read-only")
+            return real_open(path, *a, **k)
+
+        with mock.patch("builtins.open", side_effect=fail_md):
+            out, rows = audit.check_skill_pair_conflicts(files)
+        self.assertIsInstance(out, list)
+
+
+class CrashRecoveryNestedTryBranchTests(_AuditTestBase):
+    def test_nested_try_accepted(self):
+        # A critical function with a try that is neither a top-level statement
+        # nor the loop body's first level (it's nested inside an `if`) is still
+        # accepted via the `any(Try in ast.walk(fn))` branch.
+        crit = next(iter(audit._CRITICAL_FUNCTIONS))
+        bc = (f"def {crit}():\n"
+              "    if cond:\n"
+              "        try:\n"
+              "            pass\n"
+              "        except Exception:\n"
+              "            pass\n")
+        findings, status = audit.check_crash_recovery(bc)
+        self.assertEqual(status[crit], "ok (nested try)")
+        self.assertEqual([f for f in findings if crit in f.message], [])
+
+
+class LeakDetectionBranchTests(_AuditTestBase):
+    """Drive check_leak's growth-detection branches with a fake psutil.Process
+    so the otherwise leak-only paths are deterministically exercised."""
+
+    def _fake_proc(self, handles_after=0, files_after=0, raise_on=None):
+        class _FakeProc:
+            def __init__(self):
+                self._first_handles = True
+                self._first_files = True
+
+            def num_handles(self):
+                if self._first_handles:
+                    self._first_handles = False
+                    return 0
+                return handles_after
+
+            def open_files(self):
+                if raise_on == "open_files":
+                    raise RuntimeError("psutil hiccup")
+                if self._first_files:
+                    self._first_files = False
+                    return []
+                return [object()] * files_after
+
+            def memory_info(self):
+                class _M:
+                    rss = 0
+                return _M()
+
+        return _FakeProc
+
+    def test_handle_growth_flags_leak(self):
+        if importlib.util.find_spec("psutil") is None:
+            self.skipTest("psutil not installed")
+        import psutil
+        with mock.patch.object(psutil, "Process",
+                               self._fake_proc(handles_after=50)):
+            findings, summary = audit.check_leak()
+        self.assertTrue(summary.get("ran"))
+        self.assertTrue(any("file-handle count grew" in f.message
+                            for f in findings))
+
+    def test_open_files_growth_flags_leak(self):
+        if importlib.util.find_spec("psutil") is None:
+            self.skipTest("psutil not installed")
+        import psutil
+        with mock.patch.object(psutil, "Process",
+                               self._fake_proc(files_after=10)):
+            findings, _summary = audit.check_leak()
+        self.assertTrue(any("open-file count grew" in f.message
+                            for f in findings))
+
+    def test_inner_exception_marks_skipped(self):
+        if importlib.util.find_spec("psutil") is None:
+            self.skipTest("psutil not installed")
+        import psutil
+        with mock.patch.object(psutil, "Process",
+                               self._fake_proc(raise_on="open_files")):
+            findings, summary = audit.check_leak()
+        self.assertEqual(findings, [])
+        self.assertIn("skipped", summary)
+
+
+class ImportGraphBranchTests(_AuditTestBase):
+    def setUp(self):
+        super().setUp()
+        self.mkdir("skills")
+        self.mkdir("core")
+
+    def test_core_file_module_key_and_edges(self):
+        # A core/*.py file in the list maps to a `core.<stem>` module key and
+        # its intra import becomes an edge.
+        self.write("core/aa.py", "import bb\n")
+        self.write("skills/bb.py", "x = 1\n")
+        files = [os.path.join(self.tmp, "core", "aa.py"),
+                 os.path.join(self.tmp, "skills", "bb.py")]
+        _findings, info = audit.check_import_graph(files)
+        self.assertIn("core.aa", info["nodes"])
+
+    def test_syntaxerror_file_skipped(self):
+        # A syntactically-broken file is skipped (SyntaxError continue) without
+        # crashing the graph build.
+        broken = self.write("skills/broken.py", "def (:\n")
+        findings, info = audit.check_import_graph([broken])
+        self.assertEqual([f for f in findings if f.category == "import-cycle"], [])
+
+    def test_unreadable_file_skipped(self):
+        # _read_source None for a file in the list → the `continue` guard.
+        good = self.write("skills/good.py", "import bobert_companion\n")
+        with mock.patch.object(audit, "_read_source", return_value=(None, None)):
+            findings, info = audit.check_import_graph([good])
+        self.assertEqual(info["edge_count"], 0)
+
+    def test_relative_from_import_skipped(self):
+        # `from . import x` has node.module is None → the `continue` guard.
+        self.write("skills/aa.py", "from . import sibling\n")
+        files = [os.path.join(self.tmp, "skills", "aa.py")]
+        findings, info = audit.check_import_graph(files)
+        self.assertEqual([f for f in findings if f.category == "import-cycle"], [])
+
+
+class StateFilesSweepBranchTests(_AuditTestBase):
+    def test_unreadable_state_file_flagged(self):
+        # A tracked state file present but unreadable → P1 + 'unreadable' status.
+        self.write("hud_state.json", "{}")
+        real_open = open
+
+        def fail_hud(path, *a, **k):
+            if str(path).endswith("hud_state.json"):
+                raise OSError("locked")
+            return real_open(path, *a, **k)
+
+        with mock.patch("builtins.open", side_effect=fail_hud):
+            findings, status = audit.check_state_files()
+        self.assertTrue(status["hud_state.json"].startswith("unreadable"))
+        self.assertTrue(any(f.file == "hud_state.json" and f.severity == "P1"
+                            for f in findings))
+
+
+class MainBranchCoverageTests(_AuditTestBase):
+    def _run_main(self, argv):
+        with mock.patch.object(sys, "argv", argv):
+            return audit.main()
+
+    def _seed(self, bc_body, extra=None):
+        self.mkdir("skills")
+        self.mkdir("core")
+        self.write("requirements.txt", "")
+        self.write("bobert_companion.py", bc_body)
+        if extra:
+            for rel, body in extra.items():
+                self.write(rel, body)
+
+    def test_bc_actions_extracted_from_all_three_forms(self):
+        # ACTIONS literal keys + ACTIONS["x"]= + ACTIONS.update({...}) are all
+        # parsed out of bobert_companion.py during main().
+        bc = ("ACTIONS = {\n    'lit_a': h,\n    'lit_b': h,\n}\n"
+              "ACTIONS['idx_c'] = h\n"
+              "ACTIONS.update({'upd_d': h})\n"
+              "def main():\n    try:\n        pass\n    except Exception:\n        pass\n")
+        # A skill that documents these actions so the integration prompt check
+        # has registered actions to compare (also exercises _profile_skill in
+        # the all_registered loop).
+        skill = ("def _h(p):\n    return ''\n"
+                 "def register(actions):\n"
+                 "    actions['skill_e'] = _h\n")
+        self._seed(bc, extra={"skills/s.py": skill})
+        with mock.patch.object(audit.importlib, "import_module",
+                               side_effect=ImportError("forced")):
+            rc = self._run_main(["audit", "--quiet"])
+        self.assertIn(rc, (0, 1, 2, 3))
+        rep = self.read_json("audit_report.json")
+        self.assertIn("integration", rep)
+
+    def test_fix_non_quiet_prints_applied_line(self):
+        # --fix WITHOUT --quiet prints the "[fix] applied N" summary line.
+        import io
+        self._seed("ACTIONS = {}\ndef main():\n    try:\n        pass\n"
+                   "    except Exception:\n        pass\n",
+                   extra={"fixme.py": "f = open('a.txt')\n"})
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stdout", buf), \
+             mock.patch.object(sys, "argv",
+                               ["audit", "--no-integration", "--fix"]):
+            audit.main()
+        self.assertIn("[fix] applied", buf.getvalue())
+
+    def test_fix_introduces_syntax_error_warning_path(self):
+        # If the post-fix syntax re-check reports problems, main prints the
+        # WARNING block and keeps the (now-real) syntax findings. We simulate a
+        # clean pre-fix syntax pass and a dirty post-fix pass.
+        import io
+        self._seed("ACTIONS = {}\ndef main():\n    try:\n        pass\n"
+                   "    except Exception:\n        pass\n",
+                   extra={"fixme.py": "f = open('a.txt')\n"})
+        fake_post = [audit.Finding(severity="P0", category="syntax",
+                                   file="fixme.py", line=1,
+                                   message="py_compile failed: simulated")]
+        call_state = {"n": 0}
+        real_check_syntax = audit.check_syntax
+
+        def syntax_side_effect(files):
+            call_state["n"] += 1
+            # First call (pre-fix, line 2996) → real/clean; second call
+            # (post-fix, line 3083) → simulated syntax error.
+            if call_state["n"] >= 2:
+                return list(fake_post)
+            return real_check_syntax(files)
+
+        buf = io.StringIO()
+        err = io.StringIO()
+        with mock.patch.object(audit, "check_syntax",
+                               side_effect=syntax_side_effect), \
+             mock.patch.object(sys, "stdout", buf), \
+             mock.patch.object(sys, "stderr", err), \
+             mock.patch.object(sys, "argv",
+                               ["audit", "--no-integration", "--fix"]):
+            rc = audit.main()
+        self.assertIn("--fix introduced syntax errors", err.getvalue())
+        self.assertEqual(rc, 1)   # a P0 syntax finding now dominates
+
+    def test_duplicate_findings_deduplicated(self):
+        # Two identical Thread calls on ONE source line yield two findings with
+        # an identical (file, line, category, message) key → the second is
+        # dropped by the dedup `continue`.
+        self._seed("ACTIONS = {}\ndef main():\n    try:\n        pass\n"
+                   "    except Exception:\n        pass\n",
+                   extra={"dup.py":
+                          "import threading\n"
+                          "threading.Thread(target=a); threading.Thread(target=a)\n"})
+        rc = self._run_main(["audit", "--no-integration", "--quiet"])
+        rep = self.read_json("audit_report.json")
+        # report["findings"] is keyed by severity; thread-no-daemon is P1.
+        p1 = rep["findings"]["P1"]
+        dups = [f for f in p1
+                if f.get("category") == "thread-no-daemon"
+                and f.get("file") == "dup.py"]
+        # exactly one survives despite two call sites on the same line
+        self.assertEqual(len(dups), 1)
+        self.assertIn(rc, (0, 1, 2, 3))
 
 
 if __name__ == "__main__":

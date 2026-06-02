@@ -23,7 +23,7 @@ _SPEECH_QUEUE = os.path.join(_PROJECT_DIR, "pending_speech.json")
 
 # Ensure the project root is importable so `core.atomic_io` resolves whether
 # this module is loaded as `skills.timer` or run directly.
-if _PROJECT_DIR not in sys.path:
+if _PROJECT_DIR not in sys.path:  # pragma: no cover - import-time sys.path guard; already satisfied under the test harness (root on path)
     sys.path.insert(0, _PROJECT_DIR)
 
 from core.atomic_io import _atomic_write_json  # noqa: E402

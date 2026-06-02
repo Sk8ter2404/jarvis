@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime
 import unittest
+from unittest import mock
 
 from tests._skill_harness import load_skill_isolated
 
@@ -298,6 +299,255 @@ class SchedulePreflightTests(unittest.TestCase):
         act = self.mod._make_recurring(FakeScheduler(available=False))
         out = act("8am | brief")
         self.assertIn("apscheduler", out.lower())
+
+
+class ScheduleHelperEdgeTests(unittest.TestCase):
+    """Remaining branches in the pure parsing/formatting helpers."""
+
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("schedule_manager")
+
+    def test_bootstrap_failure_message_apscheduler_hint(self):
+        # ModuleNotFound for apscheduler → install hint for apscheduler.
+        self.mod._bootstrap_error = "ModuleNotFoundError: No module named 'apscheduler'"
+        out = self.mod._bootstrap_failure_message()
+        self.assertIn("pip install apscheduler", out)
+
+    def test_bootstrap_failure_message_unknown(self):
+        self.mod._bootstrap_error = None
+        out = self.mod._bootstrap_failure_message()
+        self.assertIn("unknown bootstrap failure", out)
+
+    def test_split_action_and_arg_empty_token(self):
+        self.assertEqual(self.mod._split_action_and_arg("   "), ("", ""))
+
+    def test_format_conditions_with_arg_and_chain(self):
+        out = self.mod._format_conditions([{
+            "id": "c2", "condition": "credits_low", "action": "warn",
+            "arg": "now", "chain": [{"action": "x", "arg": ""}],
+            "one_shot": False, "current_value": None}])
+        self.assertIn("'now'", out)         # arg branch (134)
+        self.assertIn("chained step", out)  # chain branch (136)
+        self.assertNotIn("currently", out)  # current_value None → no note
+
+
+class ScheduleParseCronPhraseEdgeTests(unittest.TestCase):
+    """_parse_cron_phrase dow/clock split corner cases."""
+
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("schedule_manager")
+        self.sched = FakeScheduler()
+
+    def test_leading_text_not_a_dow_falls_back_to_whole_clock(self):
+        # tokens[-1] ('8am') parses as a clock, but the leading 'random words'
+        # isn't a dow → clock_str resets to the whole body, which then fails to
+        # parse → ValueError (covers 216-219 bail path).
+        with self.assertRaises(ValueError):
+            self.mod._parse_cron_phrase(
+                self.sched, "random words 8am", "brief", "", [])
+
+    def test_two_token_clock_with_dow(self):
+        # Last token ('pm') alone isn't a clock; last TWO ('8:30 pm') are, and
+        # the remaining 'weekdays' is a dow (covers 220-223).
+        self.mod._parse_cron_phrase(
+            self.sched, "weekdays 8:30 pm", "brief", "", [])
+        kind, kw = self.sched.calls[-1]
+        self.assertEqual((kw["hour"], kw["minute"]), (20, 30))
+        self.assertEqual(kw["day_of_week"], "mon-fri")
+
+
+class ScheduleActionErrorBranchTests(unittest.TestCase):
+    """Preflight + error branches across every action factory."""
+
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("schedule_manager")
+        self.mod._bootstrap_error = None
+
+    def _unavailable(self):
+        return FakeScheduler(available=False)
+
+    def test_recurring_empty_primary_action(self):
+        # rhs is only '&&' separators → no primary action (covers 161).
+        act = self.mod._make_recurring(FakeScheduler())
+        out = act("8am | &&")
+        self.assertIn("Format:", out)
+
+    def test_recurring_generic_exception(self):
+        sched = FakeScheduler()
+        sched.schedule_cron = lambda **kw: (_ for _ in ()).throw(RuntimeError("db down"))
+        act = self.mod._make_recurring(sched)
+        out = act("8am | brief")
+        self.assertIn("schedule failed", out.lower())
+        self.assertIn("RuntimeError", out)
+
+    def test_once_preflight_blocks(self):
+        out = self.mod._make_once(self._unavailable())("in 30 minutes | brief")
+        self.assertIn("apscheduler", out.lower())
+
+    def test_once_missing_pipe(self):
+        out = self.mod._make_once(FakeScheduler())("just text no pipe")
+        self.assertIn("Format:", out)
+
+    def test_once_schedule_raises(self):
+        sched = FakeScheduler()
+        sched.schedule_once = lambda **kw: (_ for _ in ()).throw(OSError("io"))
+        out = self.mod._make_once(sched)("in 30 minutes | brief")
+        self.assertIn("schedule failed", out.lower())
+
+    def test_when_preflight_blocks(self):
+        out = self.mod._make_when(self._unavailable())("credits_low | warn")
+        self.assertIn("apscheduler", out.lower())
+
+    def test_when_value_error(self):
+        sched = FakeScheduler()
+        sched.schedule_when = lambda **kw: (_ for _ in ()).throw(ValueError("bad cond"))
+        out = self.mod._make_when(sched)("credits_low | warn")
+        self.assertIn("could not arm trigger", out.lower())
+        self.assertIn("bad cond", out)
+
+    def test_when_generic_exception(self):
+        sched = FakeScheduler()
+        sched.schedule_when = lambda **kw: (_ for _ in ()).throw(RuntimeError("boom"))
+        out = self.mod._make_when(sched)("credits_low | warn")
+        self.assertIn("trigger failed", out.lower())
+
+    def test_list_preflight_blocks(self):
+        out = self.mod._make_list(self._unavailable())("")
+        self.assertIn("apscheduler", out.lower())
+
+    def test_cancel_preflight_blocks(self):
+        out = self.mod._make_cancel(self._unavailable())("cron_x")
+        self.assertIn("apscheduler", out.lower())
+
+    def test_fire_preflight_blocks(self):
+        out = self.mod._make_fire(self._unavailable())("cron_x")
+        self.assertIn("apscheduler", out.lower())
+
+    def test_fire_requires_id(self):
+        out = self.mod._make_fire(FakeScheduler())("")
+        self.assertIn("Format:", out)
+
+    def test_status_preflight_blocks(self):
+        out = self.mod._make_status(self._unavailable())("")
+        self.assertIn("apscheduler", out.lower())
+
+    def test_status_includes_last_error(self):
+        sched = FakeScheduler()
+        sched.status = lambda: {
+            "running": False, "job_count": 0, "condition_count": 0,
+            "registered_conditions": [], "last_error": "boom"}
+        out = self.mod._make_status(sched)("")
+        self.assertIn("stopped", out.lower())
+        self.assertIn("Last error: boom", out)
+
+
+class _FakeSchedulerModule:
+    """A stand-in for the `core.scheduler` MODULE that register() imports."""
+
+    def __init__(self, *, available=True, bootstrap_ok=True,
+                 bootstrap_raises=False, last_error=None):
+        self._available = available
+        self._bootstrap_ok = bootstrap_ok
+        self._bootstrap_raises = bootstrap_raises
+        self._last_error = last_error
+        self.bootstrap_called_with = None
+
+    def is_available(self):
+        return self._available
+
+    def bootstrap(self, actions):
+        self.bootstrap_called_with = actions
+        if self._bootstrap_raises:
+            raise RuntimeError("bootstrap kaboom")
+        return self._bootstrap_ok
+
+    def status(self):
+        return {"last_error": self._last_error}
+
+
+class ScheduleRegisterTests(unittest.TestCase):
+    """register(): import failure + every bootstrap branch, with a fake
+    `core.scheduler` module injected into sys.modules."""
+
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("schedule_manager")
+
+    def _register_with(self, fake_module):
+        import contextlib
+        import io
+        import core  # the real package; we swap its `scheduler` attribute
+        actions = {}
+        buf = io.StringIO()
+        # register() does `from core import scheduler`, which binds the
+        # `scheduler` attribute off the already-imported `core` package — so
+        # patch that attribute, not sys.modules.
+        with mock.patch.object(core, "scheduler", fake_module, create=True), \
+             contextlib.redirect_stdout(buf):
+            self.mod.register(actions)
+        return actions, buf.getvalue()
+
+    def test_register_scheduler_import_fails(self):
+        # `from core import scheduler` raising → prints the diagnostic, returns
+        # early, registers no actions. We force the failure by removing the
+        # cached `scheduler` attribute off `core` and poisoning the submodule
+        # entry in sys.modules so the re-import raises ImportError.
+        import contextlib
+        import io
+        import sys
+        import core
+        actions = {}
+        buf = io.StringIO()
+        had_attr = hasattr(core, "scheduler")
+        saved_attr = getattr(core, "scheduler", None)
+        saved_mod = sys.modules.get("core.scheduler")
+        try:
+            if had_attr:
+                delattr(core, "scheduler")
+            sys.modules["core.scheduler"] = None  # makes import raise ImportError
+            with contextlib.redirect_stdout(buf):
+                self.mod.register(actions)
+        finally:
+            if saved_mod is not None:
+                sys.modules["core.scheduler"] = saved_mod
+            else:
+                sys.modules.pop("core.scheduler", None)
+            if had_attr:
+                core.scheduler = saved_attr
+        self.assertNotIn("schedule_recurring", actions)
+        self.assertIn("unavailable", buf.getvalue())
+
+    def test_register_happy_bootstrap(self):
+        fake = _FakeSchedulerModule(available=True, bootstrap_ok=True)
+        actions, _ = self._register_with(fake)
+        self.assertIn("schedule_recurring", actions)
+        self.assertIs(fake.bootstrap_called_with, actions)
+        self.assertIsNone(self.mod._bootstrap_error)
+
+    def test_register_bootstrap_raises_records_error(self):
+        fake = _FakeSchedulerModule(available=True, bootstrap_raises=True)
+        actions, out = self._register_with(fake)
+        self.assertIn("schedule_recurring", actions)  # still registers
+        self.assertIn("RuntimeError", self.mod._bootstrap_error)
+
+    def test_register_bootstrap_false_pulls_status_error(self):
+        fake = _FakeSchedulerModule(
+            available=True, bootstrap_ok=False,
+            last_error="No module named 'sqlalchemy'")
+        actions, out = self._register_with(fake)
+        self.assertIn("sqlalchemy", self.mod._bootstrap_error)
+        self.assertIn("pip install sqlalchemy", out)  # the sqlalchemy hint
+
+    def test_register_bootstrap_false_status_raises(self):
+        fake = _FakeSchedulerModule(available=True, bootstrap_ok=False)
+        fake.status = lambda: (_ for _ in ()).throw(RuntimeError("status boom"))
+        actions, out = self._register_with(fake)
+        self.assertIn("status() raised", self.mod._bootstrap_error)
+
+    def test_register_apscheduler_unavailable(self):
+        fake = _FakeSchedulerModule(available=False)
+        actions, out = self._register_with(fake)
+        self.assertIn("schedule_recurring", actions)
+        self.assertIn("APScheduler not installed", out)
 
 
 if __name__ == "__main__":

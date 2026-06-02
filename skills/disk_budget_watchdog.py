@@ -31,7 +31,7 @@ import time
 try:
     import psutil
     _HAS_PSUTIL = True
-except ImportError:
+except ImportError:  # pragma: no cover - psutil is a CI dep; degradation branch only taken on a bare host
     _HAS_PSUTIL = False
 
 # ─── thresholds ──────────────────────────────────────────────────────────
@@ -48,7 +48,7 @@ _PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SPEECH_QUEUE = os.path.join(_PROJECT_DIR, "pending_speech.json")
 _CREDITS_STATE = os.path.join(_PROJECT_DIR, "credits_state.json")
 
-if _PROJECT_DIR not in sys.path:
+if _PROJECT_DIR not in sys.path:  # pragma: no cover - import-time sys.path guard; root already on path under the test harness
     sys.path.insert(0, _PROJECT_DIR)
 
 from core.atomic_io import _atomic_write_json  # noqa: E402
@@ -148,7 +148,7 @@ def _check_credits(now: float) -> None:
     _last_credits_alert_at[0] = now
 
 
-def _monitor_loop() -> None:
+def _monitor_loop() -> None:  # pragma: no cover - non-terminating background daemon (sleeps INITIAL_DELAY then polls forever); its body delegates to _check_disk/_check_credits, which are unit-tested directly
     time.sleep(INITIAL_DELAY_SECONDS)
     while True:
         try:

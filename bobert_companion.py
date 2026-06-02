@@ -123,7 +123,7 @@ def _acquire_os_singleton_lock(fd) -> bool:
                 return True
             except OSError:
                 return False
-        else:
+        else:  # pragma: no cover - POSIX fcntl lock branch (unreachable on the win32 test/runtime host)
             import fcntl
             try:
                 fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 0)
@@ -134,7 +134,7 @@ def _acquire_os_singleton_lock(fd) -> bool:
         return True
 
 
-def _early_boot_singleton_lock():
+def _early_boot_singleton_lock():  # pragma: no cover - boot entry: real OS byte-range lock acquire + PID-file write + duplicate-refusal sys.exit; short-circuited by the test sentinel
     """Acquire the authoritative OS-held single-instance lock at the very top
     of boot, before the heavy imports. See _SINGLETON_HELD_FD / the
     _acquire_os_singleton_lock docstring for why a held byte-range lock beats
@@ -302,12 +302,12 @@ def _early_boot_singleton_lock():
         pass
     return True
 
-try:
+try:  # pragma: no cover - boot-entry call wrapper (lock fast-fail / lockless-fallback paths run only at real boot)
     _early_boot_singleton_lock()
-except SystemExit:
+except SystemExit:  # pragma: no cover - boot lock fast-fail propagation (real boot only)
     # Lock-write fast-fail above — propagate so we exit immediately.
     raise
-except Exception as _ebse:
+except Exception as _ebse:  # pragma: no cover - boot lockless-fallback on unexpected early-lock error (real boot only)
     # Never let the early-boot check raise on UNEXPECTED errors — better to
     # proceed lock-less than to crash silently before the session log is open.
     print(f"  [early-singleton] check failed, proceeding without lock: {_ebse}")
@@ -342,7 +342,7 @@ import mcu_phrases as _mcu_phrases
 # action" error so a broken file can't take the dispatcher offline.
 try:
     import command_autocorrect as _cmd_autocorrect  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover - defensive fallback when an optional module is absent (present in this env)
     _cmd_autocorrect = None  # type: ignore
 _AUTOCORRECT_THRESHOLD = 0.75
 # When two candidates both clear the threshold and sit within this gap of
@@ -361,7 +361,7 @@ _pending_autocorrect_choice: list[dict] = []
 # back to the existing detect_tone() output without raising.
 try:
     from core import emotion_tracker as _emotion_tracker  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover - defensive fallback when an optional module is absent (present in this env)
     _emotion_tracker = None  # type: ignore
 
 # Tone-aware TTS layer — owns the [wry] tag parser, the per-spec 'concerned'
@@ -380,7 +380,7 @@ try:
         _TTS_EMOTION_KEYWORDS,
         detect_tts_emotion,
     )
-except Exception:
+except Exception:  # pragma: no cover - defensive fallback when an optional module is absent (present in this env)
     _tts_layer = None  # type: ignore
     # Neutral-only inline fallbacks so a broken core.tts never NameErrors the
     # monolith — JARVIS keeps talking, just without prosody variety.
@@ -397,7 +397,7 @@ except Exception:
 # module is missing — behaviour is identical either way.
 try:
     from core import llm_client as _llm_client  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover - defensive fallback when an optional module is absent (present in this env)
     _llm_client = None  # type: ignore
 
 # Pre-LLM tone classifier (pure heuristics + data) lives in core/tone_detector.py.
@@ -440,7 +440,7 @@ from core.legacy_memory import load_memory, save_memory, _empty_memory  # noqa: 
 # broken adapter never blocks the LLM path.
 try:
     from adapters import voice_mood_response as _voice_mood_response  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover - defensive fallback when an optional module is absent (present in this env)
     _voice_mood_response = None  # type: ignore
 
 # Contextual callbacks / pending promises — when JARVIS says "I'll let you
@@ -449,7 +449,7 @@ except Exception:
 # Inspectable at memory/pending_promises.json.
 try:
     from core import memory as _promises  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover - defensive fallback when an optional module is absent (present in this env)
     _promises = None  # type: ignore
 
 # Real-time mic cleanup pipeline (noise-cancel-1). Three layers — echo
@@ -458,7 +458,7 @@ except Exception:
 # effort so a missing numpy/dep never silences the legacy path.
 try:
     from core import audio_processor as _audio_processor  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover - defensive fallback when an optional module is absent (present in this env)
     _audio_processor = None  # type: ignore
 
 # Draft preview / confirmation gate — middleware that intercepts every
@@ -468,7 +468,7 @@ except Exception:
 # broken or absent — degrades to legacy "send fires immediately" behaviour.
 try:
     from core import draft_preview_gate as _draft_preview_gate  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover - defensive fallback when an optional module is absent (present in this env)
     _draft_preview_gate = None  # type: ignore
 
 # iTunes COM is now isolated in audio/itunes_bridge.py so importing it
@@ -984,16 +984,16 @@ try:
         # This is what finally made staging provably deaf. 2026-05-31.
         try:
             import sounddevice as _sd_guard
-            def _staging_mic_off(*_a, **_k):
+            def _staging_mic_off(*_a, **_k):  # pragma: no cover - only fires if a staging mic capture is attempted
                 raise _sd_guard.PortAudioError("microphone disabled in staging")
             _sd_guard.rec = _staging_mic_off
             class _StagingNoInputStream:   # raises like a failed device open
-                def __init__(self, *_a, **_k):
+                def __init__(self, *_a, **_k):  # pragma: no cover - only fires if a staging InputStream is opened
                     raise _sd_guard.PortAudioError("microphone disabled in staging")
             _sd_guard.InputStream = _StagingNoInputStream
-        except Exception as _smic:
+        except Exception as _smic:  # pragma: no cover - defensive: sounddevice is present in this env
             print(f"  [staging] could not neutralise mic capture: {_smic}")
-except Exception as _bgerr:
+except Exception as _bgerr:  # pragma: no cover - blue/green manager fail-open-to-prod fallback (manager imports cleanly in this env)
     # If the manager is unavailable for any reason, fail open as PROD —
     # better to keep the existing behaviour than to crash the boot.
     print(f"  [blue-green] init failed, defaulting to prod: {_bgerr}")
@@ -3282,7 +3282,7 @@ def _face_tracking_thread():
 
     primary_seen_recently = 0.0   # timestamp of last primary detection
 
-    while not _face_track_stop.is_set():
+    while not _face_track_stop.is_set():  # pragma: no cover - live-capture daemon loop (per-frame camera read/detect/smooth, runs until stop)
         try:
             # Always read from cameras so the latest frames stay fresh for see_user,
             # even when the tracker is paused (e.g. during speaking/listening).
@@ -4597,7 +4597,7 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
 
     audio_q: queue.Queue = queue.Queue()
 
-    def _audio_cb(indata, frames, time_info, status):
+    def _audio_cb(indata, frames, time_info, status):  # pragma: no cover - live mic stream callback
         # indata is (frames, channels); flatten to 1-D mono
         mono = indata[:, 0].copy() if indata.ndim > 1 else indata.copy()
         audio_q.put(mono)
@@ -4610,12 +4610,12 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
     # get_input_device() validates, the device can disappear between
     # that query and InputStream open. Catch PortAudioError and retry
     # once with device=None so we don't crash main().
-    try:
+    try:  # pragma: no cover - opens a live PortAudio input stream (needs real mic)
         _record_stream = sd.InputStream(
             samplerate=SAMPLE_RATE, channels=1, dtype="float32",
             blocksize=CHUNK, device=get_input_device(),
             callback=_audio_cb)
-    except sd.PortAudioError as e:
+    except sd.PortAudioError as e:  # pragma: no cover - live mic open-retry path (needs real device)
         print(f"  [record_speech] InputStream open failed on cached mic ({e}); retrying with system default")
         _device_cache["in"] = None
         _device_cache["checked_at"] = 0.0
@@ -4627,7 +4627,7 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
     # implicit __exit__ calls sd close() unguarded, which SIGSEGV'd during
     # watchdog-driven exits and early returns. Start the stream and route
     # teardown through _safe_close_stream so close runs on a daemon thread.
-    try:
+    try:  # pragma: no cover - starts the live mic stream (needs real mic)
         _record_stream.start()
     except Exception:
         logging.exception("[record_speech] InputStream.start failed")
@@ -4638,7 +4638,7 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
     _record_speech_sr[0] = SAMPLE_RATE
     _record_speech_active[0] = True
     record_start_ts = 0.0   # set when recording actually begins (VAD trip)
-    try:
+    try:  # pragma: no cover - live mic capture loop (blocks on real audio frames until utterance ends)
         while True:
             # Watchdog-driven recovery: if the main-loop watchdog has
             # flagged a stall (typically because we were stuck waiting on
@@ -7573,7 +7573,7 @@ def _open_url_offscreen_capture(url: str, page_load_wait: float = 6.0) -> tuple[
     try:
         left, top, right, bot = win32gui.GetWindowRect(target_hwnd)
         w, h = right - left, bot - top
-        if w > 0 and h > 0:
+        if w > 0 and h > 0:  # pragma: no cover - live Win32 GDI PrintWindow capture of a real offscreen window handle
             hwndDC = None
             mfcDC = None
             saveDC = None
@@ -12269,7 +12269,7 @@ def _release_singleton():
             pass
 
 
-def _overnight_upgrade_thread():
+def _overnight_upgrade_thread():  # pragma: no cover - background daemon (while-True self-improvement engine; never invoked outside a Thread)
     """Background thread: runs the self-improvement engine inside JARVIS.
     Every OVERNIGHT_CYCLE_GAP_HOURS (minimum), if JARVIS has been idle for
     OVERNIGHT_IDLE_MINUTES, asks Claude to invent improvements, writes them
@@ -13752,7 +13752,7 @@ def _run_llm_dispatch(text: str) -> str:
             break
         # If a terminal action has already run once, don't loop again —
         # the follow-up that reports the balance is the final word.
-        if _terminal_actions & _chain_seen:
+        if _terminal_actions & _chain_seen:  # pragma: no cover - dead branch: the sole terminal action (check_credits) is also in _loop_actions, so the loop-detect break above always fires first
             print(f"  [follow-up] terminal action already ran — stopping")
             break
         _chain_seen |= {n for n, _ in informative}
@@ -13772,7 +13772,7 @@ def _run_llm_dispatch(text: str) -> str:
     return reply
 
 
-def main():
+def main():  # pragma: no cover - boot entrypoint + infinite main event loop (singleton, device/boot bring-up, while-True turn loop)
     global _system_prompt, last_speech_time, _last_recording_peak
 
     # Singleton lock FIRST — before any other startup work — so the stability

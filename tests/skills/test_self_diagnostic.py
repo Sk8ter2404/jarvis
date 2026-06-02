@@ -421,6 +421,17 @@ class SelfDiagFileTests(unittest.TestCase):
         self.assertIn("webcam", out)
         self.assertIn("2026-05-29", out)
 
+    def test_whats_broken_deduplicates_repeated_component(self):
+        # The same component queued twice (different dates) must collapse to a
+        # single entry via the seen-set dedup (covers the skip-`continue`).
+        with open(self.todo, "w", encoding="utf-8") as f:
+            f.write("- [ ] **2026-05-29** [self-diag] - Fix: microphone reports a.\n")
+            f.write("- [ ] **2026-05-30** [self-diag] - Fix: microphone reports b.\n")
+        out = self.actions["whats_broken"]("")
+        # One unique component → "One open repair task", mentioned once.
+        self.assertIn("One open repair task", out)
+        self.assertEqual(out.lower().count("microphone"), 1)
+
     # ── _open_selfdiag_components dedupe ──────────────────────────────────
     def test_open_components_parses_todo(self):
         with open(self.todo, "w", encoding="utf-8") as f:
@@ -473,6 +484,21 @@ class SelfDiagFileTests(unittest.TestCase):
                                      "error": "again", "latency_ms": 1, "details": {}}}}
         # Already open → not queued again.
         self.assertFalse(self.mod._queue_repair_task("webcam", run, []))
+
+    def test_queue_repair_task_unserialisable_details(self):
+        # Details with a circular reference make json.dumps raise even with
+        # default=str → the task body falls back to "(details unavailable)"
+        # but is still queued.
+        circ: dict = {}
+        circ["self"] = circ
+        run = {"probes": {"webcam": {"severity": self.mod.SEVERITY_MED,
+                                     "error": "loop", "latency_ms": 2,
+                                     "details": circ}}}
+        ok = self.mod._queue_repair_task("webcam", run, [])
+        self.assertTrue(ok)
+        with open(self.todo, encoding="utf-8") as f:
+            body = f.read()
+        self.assertIn("details unavailable", body)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -858,6 +884,14 @@ class CameraHelperTests(_ProbeTestBase):
              mock.patch.object(self.mod.subprocess, "run", return_value=proc):
             self.assertIsNone(self.mod._windows_camera_pnp_devices())
 
+    def test_windows_camera_pnp_devices_subprocess_raises(self):
+        # subprocess.run itself raising (PowerShell missing / timeout) → the
+        # outer except returns None (covers the top-level guard).
+        with mock.patch.object(self.mod.sys, "platform", "win32"), \
+             mock.patch.object(self.mod.subprocess, "run",
+                               side_effect=OSError("powershell gone")):
+            self.assertIsNone(self.mod._windows_camera_pnp_devices())
+
     def test_attempt_camera_wake_no_cv2(self):
         with block_import("cv2"):
             ok, note = self.mod._attempt_camera_wake(0)
@@ -1115,6 +1149,19 @@ class TtsProbeTests(_ProbeTestBase):
             r = self.mod._probe_tts()
         self.assertFalse(r["ok"])
         self.assertIn("both TTS backends failed", r["error"])
+
+    def test_pyttsx_engine_stop_failure_is_swallowed(self):
+        # eng.stop() raising during teardown must not fail the probe — the
+        # except around stop() swallows it and pyttsx still counts as OK.
+        mod = types.ModuleType("pyttsx3")
+        eng = mock.MagicMock()
+        eng.getProperty.return_value = ["v1"]
+        eng.stop.side_effect = RuntimeError("stop boom")
+        mod.init = mock.MagicMock(return_value=eng)
+        with inject_modules(requests=self._requests(), pyttsx3=mod):
+            r = self.mod._probe_tts()
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["details"]["pyttsx_ok"])
 
 
 # ─── Probe 4: STT ────────────────────────────────────────────────────────
@@ -1483,6 +1530,17 @@ class StateFilesProbeTests(_ProbeTestBase):
         self.assertFalse(r["ok"])
         self.assertIn("could not list project root", r["error"])
 
+    def test_getmtime_failure_falls_back_to_zero(self):
+        # If os.path.getmtime raises, mtime defaults to 0.0 → the file is NOT
+        # treated as recent (now - 0 >= 30s) so it's still parsed normally.
+        self._write("good.json", '{"a": 1}', age_s=120)
+        with mock.patch.object(self.mod.os.path, "getmtime",
+                               side_effect=OSError("stat denied")):
+            r = self.mod._probe_state_files()
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["details"]["parsed"], 1)
+        self.assertNotIn("good.json", r["details"].get("skipped_recent", []))
+
 
 # ─── Probe 9: Bambu ──────────────────────────────────────────────────────
 class BambuProbeTests(_ProbeTestBase):
@@ -1533,7 +1591,8 @@ class BambuProbeTests(_ProbeTestBase):
         self.assertEqual(r["severity"], self.mod.SEVERITY_MED)
         self.assertIn("paho-mqtt not installed", r["error"])
 
-    def _mqtt(self, connect_rc=0, fire=True, connect_raises=False):
+    def _mqtt(self, connect_rc=0, fire=True, connect_raises=False,
+              cleanup_raises=False):
         """Return a 3-level fake paho package tree (paho / paho.mqtt /
         paho.mqtt.client) so ``import paho.mqtt.client`` resolves entirely to
         fakes — the real installed ``paho`` lacks the ``mqtt`` submodule."""
@@ -1562,7 +1621,8 @@ class BambuProbeTests(_ProbeTestBase):
                     self.on_connect(self, None, None, connect_rc)
 
             def loop_stop(self):
-                pass
+                if cleanup_raises:
+                    raise RuntimeError("loop_stop boom")
 
             def disconnect(self):
                 pass
@@ -1614,6 +1674,18 @@ class BambuProbeTests(_ProbeTestBase):
             r = self.mod._probe_bambu()
         self.assertFalse(r["ok"])
         self.assertIn("raised", r["error"])
+
+    def test_cleanup_failure_is_swallowed(self):
+        # A successful connect where loop_stop()/disconnect() raise during
+        # teardown must not flip the result — the cleanup except swallows it.
+        bc = types.SimpleNamespace(BAMBU_PRINTER_IP="1.2.3.4",
+                                   BAMBU_ACCESS_CODE="code", BAMBU_SERIAL="ser")
+        with mock.patch.object(self.mod, "_bc", return_value=bc), \
+             inject_modules(**self._mqtt(connect_rc=0, cleanup_raises=True)), \
+             mock.patch.object(self.mod.threading.Event, "wait",
+                               lambda self, timeout=None: True):
+            r = self.mod._probe_bambu()
+        self.assertTrue(r["ok"])
 
 
 # ─── Probe 10: media playback ────────────────────────────────────────────
@@ -1713,6 +1785,29 @@ class SkillImportsProbeTests(_ProbeTestBase):
         self.assertFalse(r["ok"])
         self.assertIn("could not list skills dir", r["error"])
 
+    def test_non_syntax_compile_error_flagged(self):
+        # When compile() raises something OTHER than SyntaxError (e.g. a
+        # ValueError / RecursionError from a pathological source), the generic
+        # except branch records it. We force a non-SyntaxError from compile()
+        # for our skill file so that branch is exercised deterministically.
+        self._write_skill("weird.py", "x = 1\n")
+        sys.modules.pop("skill_weird", None)
+        self.addCleanup(lambda: sys.modules.pop("skill_weird", None))
+        real_compile = compile
+
+        def fake_compile(src, path, mode, *a, **k):
+            if path.endswith("weird.py"):
+                raise ValueError("pathological source")
+            return real_compile(src, path, mode, *a, **k)
+
+        with mock.patch("builtins.compile", side_effect=fake_compile):
+            r = self.mod._probe_skill_imports()
+        self.assertFalse(r["ok"])
+        self.assertIn("weird", r["error"])
+        # The recorded failure carries the ValueError class name, not SyntaxError.
+        fail = next(f for f in r["details"]["failures"] if f["skill"] == "weird")
+        self.assertIn("ValueError", fail["error"])
+
 
 # ─── Probe 12: GPU ───────────────────────────────────────────────────────
 class GpuProbeTests(_ProbeTestBase):
@@ -1776,6 +1871,20 @@ class GpuProbeTests(_ProbeTestBase):
              inject_modules(torch=self._torch(cuda_avail=False)):
             r = self.mod._probe_gpu()
         self.assertTrue(r["ok"])
+
+    def test_device_name_query_failure_is_swallowed(self):
+        # CUDA is available but get_device_name/get_device_properties raise
+        # (driver hiccup) — the probe still passes; the name/vram fields are
+        # simply omitted (covers the inner except-pass).
+        bc = types.SimpleNamespace(WHISPER_DEVICE="cuda")
+        torch = self._torch(cuda_avail=True)
+        torch.cuda.get_device_name = mock.MagicMock(
+            side_effect=RuntimeError("nvml gone"))
+        with mock.patch.object(self.mod, "_bc", return_value=bc), \
+             inject_modules(torch=torch):
+            r = self.mod._probe_gpu()
+        self.assertTrue(r["ok"])
+        self.assertNotIn("device_name", r["details"])
 
 
 # ─── Probe 13: disk ──────────────────────────────────────────────────────
@@ -1866,6 +1975,17 @@ class OptionalSkillsProbeTests(_ProbeTestBase):
             r = self.mod._probe_optional_skills()
         self.assertEqual(r["details"]["alexa"], "loaded, no probe hook")
         self.assertEqual(r["details"]["deco"], "loaded, no probe hook")
+
+    def test_alexa_probe_hook_raises(self):
+        # The ALEXA hook itself raising is caught and reported (covers the
+        # alexa-specific except branch).
+        alexa = types.ModuleType("skill_alexa")
+        alexa.diagnostic_probe = mock.MagicMock(
+            side_effect=RuntimeError("alexa boom"))
+        with inject_modules(skill_alexa=alexa):
+            r = self.mod._probe_optional_skills()
+        self.assertIn("probe-raised", r["details"]["alexa"])
+        self.assertIn("alexa boom", r["details"]["alexa"])
 
 
 # ─── _run_with_timeout ───────────────────────────────────────────────────
@@ -2132,6 +2252,17 @@ class AnnouncementTests(_ProbeTestBase):
         with mock.patch.object(self.mod, "_bc", return_value=bc):
             self.mod._proactive_announce("hi")  # no raise
 
+    def test_proactive_announce_mood_fallback_also_fails(self):
+        # mood given → first call raises TypeError (no mood kwarg) → the
+        # no-mood fallback ALSO raises → that inner failure is logged and
+        # swallowed (covers the nested except).
+        bc = mock.MagicMock()
+        bc.proactive_announce.side_effect = [TypeError("no mood kwarg"),
+                                             RuntimeError("still broken")]
+        with mock.patch.object(self.mod, "_bc", return_value=bc):
+            self.mod._proactive_announce("hi", mood="concerned_soft")  # no raise
+        self.assertEqual(bc.proactive_announce.call_count, 2)
+
     def test_push_phone_no_module(self):
         sys.modules.pop("skill_phone_bridge", None)
         self.mod._push_phone("hi")  # no raise
@@ -2289,7 +2420,33 @@ class AutoqueueTests(_ProbeTestBase):
         self.assertEqual(groups[0]["first_ts"], 1.0)
 
     def test_collect_vad_stall_no_audio_processor(self):
-        with block_import("core.audio_processor"):
+        # Poison the submodule so `from core import audio_processor` raises
+        # ImportError → the import-guard except returns None.
+        import core
+        saved_mod = sys.modules.get("core.audio_processor", _SENTINEL)
+        had_attr = hasattr(core, "audio_processor")
+        saved_attr = getattr(core, "audio_processor", None)
+        sys.modules["core.audio_processor"] = None
+        if had_attr:
+            delattr(core, "audio_processor")
+        try:
+            self.assertIsNone(self.mod._collect_vad_stall_signal())
+        finally:
+            if saved_mod is _SENTINEL:
+                sys.modules.pop("core.audio_processor", None)
+            else:
+                sys.modules["core.audio_processor"] = saved_mod
+            if had_attr:
+                core.audio_processor = saved_attr
+
+    def test_collect_vad_stall_sleep_flag_unsubscriptable(self):
+        # _sleep_mode present but not indexable → the guard treats JARVIS as
+        # sleeping (fail-safe) and returns None (covers the sleep-flag except).
+        ap = types.ModuleType("core.audio_processor")
+        ap.get_vad_state = lambda: {}
+        bc = types.SimpleNamespace(_sleep_mode=42)  # int → 42[0] raises TypeError
+        with inject_modules(**{"core.audio_processor": ap}), \
+             mock.patch.object(self.mod, "_bc", return_value=bc):
             self.assertIsNone(self.mod._collect_vad_stall_signal())
 
     def test_collect_vad_stall_no_bc(self):
@@ -2396,6 +2553,21 @@ class AutoqueueTests(_ProbeTestBase):
         with inject_modules(skill_face_tracker=mod):
             self.assertEqual(self.mod._collect_face_failure_signals(), [])
 
+    def test_collect_face_failure_skips_malformed_signal(self):
+        # A signal missing 'cam_index' makes the f-string subscript raise
+        # KeyError; that entry is skipped while a well-formed one survives
+        # (covers the per-signal except-continue).
+        mod = types.ModuleType("skill_face_tracker")
+        mod.get_read_failure_spike_signals = lambda threshold=0: [
+            {"consecutive_fails": 7},  # no cam_index → KeyError on build
+            {"cam_index": 2, "consecutive_fails": 8, "max_consecutive_fails": 8,
+             "last_error": "x", "seconds_since_last_ok": 5.0},
+        ]
+        with inject_modules(skill_face_tracker=mod):
+            out = self.mod._collect_face_failure_signals()
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["signature"], "face_read_fail::cam2")
+
     # ── formatters ───────────────────────────────────────────────────────
     def test_format_action_error_task(self):
         group = {"action": "play_music", "exc_class": "KeyError", "count": 3,
@@ -2479,6 +2651,26 @@ class AutoqueueTests(_ProbeTestBase):
         with mock.patch.object(self.mod, "_load_autoqueue_state",
                                side_effect=RuntimeError("boom")):
             self.assertEqual(self.mod._run_autoqueue_pass(), [])
+
+    def test_run_autoqueue_pass_skips_face_signal_within_cooldown(self):
+        # A face signal whose signature was queued moments ago must be skipped
+        # by the cooldown guard (the face-loop `continue`), so nothing new is
+        # appended even though the signal is still present.
+        face = {"signature": "face_read_fail::cam0", "cam_index": 0,
+                "consecutive_fails": 6}
+        fresh_state = {"face_read_fail::cam0": {"last_queued_ts": self.mod._now(),
+                                                "kind": "face_read_fail"}}
+        with mock.patch.object(self.mod, "_collect_action_error_groups",
+                               return_value=[]), \
+             mock.patch.object(self.mod, "_collect_vad_stall_signal",
+                               return_value=None), \
+             mock.patch.object(self.mod, "_collect_face_failure_signals",
+                               return_value=[face]), \
+             mock.patch.object(self.mod, "_load_autoqueue_state",
+                               return_value=fresh_state), \
+             mock.patch.object(self.mod, "_session_log_tail", return_value=[]):
+            appended = self.mod._run_autoqueue_pass()
+        self.assertEqual(appended, [])
 
 
 # ─── _queue_repair_task extra paths ──────────────────────────────────────

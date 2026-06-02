@@ -245,7 +245,7 @@ def get_client(wait_for_ready: bool = True, timeout: float = 12.0,
     # branch unless _AUTO_LAUNCH is True; this is defence in depth.
     launched = False
     if app is None and not running:
-        if not _AUTO_LAUNCH:
+        if not _AUTO_LAUNCH:  # pragma: no cover - defence-in-depth twin of the pre-import guard (line 210); only reachable via a TOCTOU flip of the _AUTO_LAUNCH global between the two checks, which can't happen in single-threaded flow
             return None, ("iTunes isn't running — auto-launch is disabled "
                           "(set ITUNES_AUTO_LAUNCH=True to enable). Open "
                           "iTunes manually, or use apple_music for browser "

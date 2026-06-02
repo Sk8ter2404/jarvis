@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -445,6 +446,364 @@ class ActionHelperTests(_MemoryTestBase):
         memory.register_actions(actions)
         self.assertIn("list_promises", actions)
         self.assertIn("cancel_promise", actions)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Coverage-completion tests: persistence edge cases, the bambu conditions,
+# the time-condition error branches, the announce-fn resolver, the watcher
+# loop crash path, and action_list_promises age formatting.
+# ─────────────────────────────────────────────────────────────────────────
+
+class _FakeBambuModule:
+    """Stand-in for skill_bambu_monitor: exposes a _state dict and a
+    _state_lock context manager, matching the two attributes _bambu_state()
+    reaches for (mod._state_lock / mod._state)."""
+
+    def __init__(self, state):
+        self._state = state
+        self._state_lock = threading.RLock()
+
+
+class BambuStateTests(_MemoryTestBase):
+    """_bambu_state() reads sys.modules['skill_bambu_monitor']. We inject a
+    fake module so the bambu conditions are exercised with no real printer."""
+
+    def _install_bambu(self, state):
+        import sys
+        fake = _FakeBambuModule(state)
+        self.addCleanup(lambda: sys.modules.pop("skill_bambu_monitor", None))
+        sys.modules["skill_bambu_monitor"] = fake
+        return fake
+
+    def test_bambu_state_absent_module_returns_empty(self):
+        import sys
+        sys.modules.pop("skill_bambu_monitor", None)
+        self.assertEqual(memory._bambu_state(), {})
+
+    def test_bambu_state_lock_raise_returns_empty(self):
+        import sys
+        fake = _FakeBambuModule({"gcode_state": "RUNNING"})
+        # Replace the lock with one whose __enter__ raises so the except path runs.
+        bad = mock.MagicMock()
+        bad.__enter__.side_effect = RuntimeError("lock down")
+        fake._state_lock = bad
+        self.addCleanup(lambda: sys.modules.pop("skill_bambu_monitor", None))
+        sys.modules["skill_bambu_monitor"] = fake
+        self.assertEqual(memory._bambu_state(), {})
+
+    def test_bambu_state_returns_copy(self):
+        self._install_bambu({"gcode_state": "FINISH"})
+        snap = memory._bambu_state()
+        snap["gcode_state"] = "MUTATED"
+        self.assertEqual(memory._bambu_state()["gcode_state"], "FINISH")
+
+    # ── _cond_bambu_print_finish ────────────────────────────────────────
+    def test_print_finish_no_state(self):
+        import sys
+        sys.modules.pop("skill_bambu_monitor", None)
+        memory.make_promise("done printing", "bambu_print_finish")
+        announcer = mock.MagicMock()
+        memory._announce_fn[0] = announcer
+        memory._tick()
+        announcer.assert_not_called()
+
+    def test_print_finish_stale_update_does_not_fire(self):
+        # last_update is BEFORE the promise was created → not trusted yet.
+        self._install_bambu({"gcode_state": "FINISH", "last_update": 1.0})
+        memory.make_promise("done printing", "bambu_print_finish")
+        announcer = mock.MagicMock()
+        memory._announce_fn[0] = announcer
+        memory._tick()
+        announcer.assert_not_called()
+
+    def test_print_finish_fires_on_fresh_finish(self):
+        fake = self._install_bambu({"gcode_state": "running", "last_update": 0.0})
+        memory.make_promise("done printing", "bambu_print_finish")
+        announcer = mock.MagicMock()
+        memory._announce_fn[0] = announcer
+        # Now report a FINISH with a fresh timestamp (after created_at).
+        fake._state["gcode_state"] = "finish"   # lower-case → upper() in code
+        fake._state["last_update"] = time.time() + 5
+        memory._tick()
+        announcer.assert_called_once()
+
+    # ── _cond_bambu_bed_cool ────────────────────────────────────────────
+    def test_bed_cool_no_state(self):
+        import sys
+        sys.modules.pop("skill_bambu_monitor", None)
+        memory.make_promise("bed cooled", "bambu_bed_cool")
+        announcer = mock.MagicMock()
+        memory._announce_fn[0] = announcer
+        memory._tick()
+        announcer.assert_not_called()
+
+    def test_bed_cool_waits_for_finish_then_cools(self):
+        fake = self._install_bambu({"gcode_state": "running", "last_update": 0.0,
+                                    "bed_temper": 60.0})
+        memory.make_promise("bed cooled", "bambu_bed_cool",
+                            params={"threshold_c": 40.0})
+        announcer = mock.MagicMock()
+        memory._announce_fn[0] = announcer
+        # Bed already below threshold but no FINISH seen yet → must NOT fire.
+        fake._state["bed_temper"] = 30.0
+        memory._tick()
+        announcer.assert_not_called()
+        # Report a fresh FINISH → arms _finish_seen, bed still 30 < 40 → fires.
+        fake._state["gcode_state"] = "FINISH"
+        fake._state["last_update"] = time.time() + 5
+        memory._tick()
+        announcer.assert_called_once()
+
+    def test_bed_cool_finish_seen_but_bed_none(self):
+        self._install_bambu({"gcode_state": "FINISH",
+                             "last_update": time.time() + 5,
+                             "bed_temper": None})
+        memory.make_promise("bed cooled", "bambu_bed_cool")
+        announcer = mock.MagicMock()
+        memory._announce_fn[0] = announcer
+        memory._tick()       # _finish_seen set, but bed_temper None → no fire
+        announcer.assert_not_called()
+
+    def test_bed_cool_bed_unparseable_is_false(self):
+        self._install_bambu({"gcode_state": "FINISH",
+                             "last_update": time.time() + 5,
+                             "bed_temper": "not-a-number"})
+        memory.make_promise("bed cooled", "bambu_bed_cool")
+        announcer = mock.MagicMock()
+        memory._announce_fn[0] = announcer
+        memory._tick()
+        announcer.assert_not_called()
+
+    def test_bed_cool_above_threshold_does_not_fire(self):
+        self._install_bambu({"gcode_state": "FINISH",
+                             "last_update": time.time() + 5,
+                             "bed_temper": 55.0})
+        memory.make_promise("bed cooled", "bambu_bed_cool",
+                            params={"threshold_c": 40.0})
+        announcer = mock.MagicMock()
+        memory._announce_fn[0] = announcer
+        memory._tick()
+        announcer.assert_not_called()
+
+
+class TimeConditionErrorBranchTests(_MemoryTestBase):
+    def test_time_at_bad_epoch_value_is_false(self):
+        # params.epoch un-floatable → except branch → False (no fire).
+        memory.make_promise("x", "time_at", params={"epoch": "soon"})
+        announcer = mock.MagicMock()
+        memory._announce_fn[0] = announcer
+        memory._tick()
+        announcer.assert_not_called()
+
+    def test_time_after_bad_delay_value_is_false(self):
+        memory.make_promise("x", "time_after", params={"delay_s": "later"})
+        announcer = mock.MagicMock()
+        memory._announce_fn[0] = announcer
+        memory._tick()
+        announcer.assert_not_called()
+
+
+class PersistenceEdgeCaseTests(_MemoryTestBase):
+    def test_empty_file_load_is_noop(self):
+        # A whitespace-only file → raw is empty → early return, empty registry.
+        with open(self.promises_file, "w", encoding="utf-8") as f:
+            f.write("   \n")
+        with memory._lock:
+            memory._promises[:] = []
+            memory._loaded[0] = False
+        self.assertEqual(memory.list_promises(include_delivered=True), [])
+
+    def test_non_dict_entries_skipped(self):
+        with open(self.promises_file, "w", encoding="utf-8") as f:
+            json.dump([{"id": 1, "message": "ok", "condition": "manual"},
+                       "garbage", 42, None], f)
+        with memory._lock:
+            memory._promises[:] = []
+            memory._loaded[0] = False
+        loaded = memory.list_promises(include_delivered=True)
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0]["message"], "ok")
+
+    def test_non_dict_params_reset_to_empty(self):
+        with open(self.promises_file, "w", encoding="utf-8") as f:
+            json.dump([{"id": 2, "message": "p", "params": "not-a-dict"}], f)
+        with memory._lock:
+            memory._promises[:] = []
+            memory._loaded[0] = False
+        loaded = memory.list_promises(include_delivered=True)
+        self.assertEqual(loaded[0]["params"], {})
+
+    def test_uncoercible_id_defaults_to_zero(self):
+        # id is a list → int() raises TypeError → defaulted to 0.
+        with open(self.promises_file, "w", encoding="utf-8") as f:
+            json.dump([{"id": [1, 2], "message": "weird"}], f)
+        with memory._lock:
+            memory._promises[:] = []
+            memory._loaded[0] = False
+        loaded = memory.list_promises(include_delivered=True)
+        self.assertEqual(loaded[0]["id"], 0)
+
+    def test_ensure_dir_failure_swallowed(self):
+        # _ensure_dir's makedirs raises → except: pass (no crash on save).
+        memory.make_promise("x", "manual")
+        with mock.patch.object(memory.os, "makedirs",
+                               side_effect=OSError("denied")):
+            with memory._lock:
+                memory._save_locked()   # must not raise
+
+    def test_save_outer_exception_swallowed(self):
+        # mkstemp raises → outer try/except prints + swallows. No crash.
+        memory.make_promise("x", "manual")
+        with mock.patch.object(memory.tempfile, "mkstemp",
+                               side_effect=OSError("no temp")):
+            with memory._lock:
+                memory._save_locked()   # must not raise
+
+    def test_save_replace_failure_unlinks_temp(self):
+        # os.replace fails → inner except unlinks the temp then re-raises;
+        # the outer except swallows. The temp must not be left behind.
+        memory.make_promise("x", "manual")
+        seen = {}
+        orig = memory.tempfile.mkstemp
+
+        def spy(*a, **k):
+            fd, path = orig(*a, **k)
+            seen["tmp"] = path
+            return fd, path
+
+        with mock.patch.object(memory.tempfile, "mkstemp", side_effect=spy), \
+                mock.patch.object(memory.os, "replace",
+                                  side_effect=OSError("replace boom")):
+            with memory._lock:
+                memory._save_locked()
+        self.assertFalse(os.path.exists(seen["tmp"]))
+
+    def test_save_replace_and_unlink_both_fail_swallowed(self):
+        # os.replace fails AND the temp os.unlink in the inner except ALSO
+        # fails → innermost `except Exception: pass` swallows it, the re-raise
+        # bubbles to the outer try and is swallowed. No crash; temp may linger.
+        memory.make_promise("x", "manual")
+        with mock.patch.object(memory.os, "replace",
+                               side_effect=OSError("replace boom")), \
+                mock.patch.object(memory.os, "unlink",
+                                  side_effect=OSError("unlink boom")):
+            with memory._lock:
+                memory._save_locked()   # must not raise
+
+
+class ResolveAnnounceFnTests(_MemoryTestBase):
+    def test_explicit_announce_fn_used(self):
+        sentinel = mock.MagicMock()
+        memory._announce_fn[0] = sentinel
+        self.assertIs(memory._resolve_announce_fn(), sentinel)
+
+    def test_lazy_import_bobert_proactive_announce(self):
+        import sys
+        memory._announce_fn[0] = None
+        fake_bc = mock.MagicMock()
+        fake_bc.proactive_announce = mock.MagicMock()
+        self.addCleanup(lambda: sys.modules.pop("bobert_companion", None))
+        sys.modules["bobert_companion"] = fake_bc
+        self.assertIs(memory._resolve_announce_fn(), fake_bc.proactive_announce)
+
+    def test_fallback_print_announcer_when_no_companion(self):
+        import sys
+        memory._announce_fn[0] = None
+        # Ensure the import path fails: install a companion WITHOUT a callable.
+        broken = mock.MagicMock()
+        broken.proactive_announce = "not callable"
+        self.addCleanup(lambda: sys.modules.pop("bobert_companion", None))
+        sys.modules["bobert_companion"] = broken
+        fn = memory._resolve_announce_fn()
+        # The fallback is a lambda that prints; calling it must not raise.
+        with mock.patch("builtins.print"):
+            fn("hello", "src")
+
+    def test_fallback_when_import_raises(self):
+        import sys
+        import builtins
+        memory._announce_fn[0] = None
+        sys.modules.pop("bobert_companion", None)
+        real_import = builtins.__import__
+
+        def boom(name, *a, **k):
+            if name == "bobert_companion":
+                raise ImportError("no companion in test")
+            return real_import(name, *a, **k)
+
+        with mock.patch.object(builtins, "__import__", side_effect=boom):
+            fn = memory._resolve_announce_fn()
+        with mock.patch("builtins.print"):
+            fn("hello")   # default source kwarg path
+
+
+class WatcherLoopCrashTests(_MemoryTestBase):
+    def test_tick_exception_inside_loop_is_logged_not_fatal(self):
+        # Force _tick to raise on the first call, then stop the loop. The
+        # loop's inner try/except must catch it and the loop must exit
+        # cleanly when the stop event is set.
+        calls = {"n": 0}
+
+        def flaky_tick():
+            calls["n"] += 1
+            raise RuntimeError("tick boom")
+
+        with mock.patch.object(memory, "_tick", side_effect=flaky_tick):
+            memory._watcher_stop.clear()
+            t = threading.Thread(
+                target=memory._watcher_loop, args=(0.05,), daemon=True)
+            t.start()
+            # Let it iterate at least once, then ask it to stop.
+            deadline = time.time() + 3.0
+            while calls["n"] < 1 and time.time() < deadline:
+                time.sleep(0.01)
+            memory._watcher_stop.set()
+            t.join(timeout=2.0)
+        self.assertFalse(t.is_alive())
+        self.assertGreaterEqual(calls["n"], 1)
+
+    def test_outer_except_catches_wait_failure(self):
+        # The OUTER try/except in _watcher_loop guards against the loop's own
+        # control flow raising (e.g. _watcher_stop.wait throwing). We make
+        # wait() raise once, then on the recovery wait() return True to break.
+        real_stop = memory._watcher_stop
+        fake_stop = mock.MagicMock()
+        fake_stop.is_set.return_value = False
+        # 1st wait (inner, after _tick) raises → caught by OUTER except;
+        # 2nd wait (in the outer except recovery) returns True → loop breaks.
+        fake_stop.wait.side_effect = [RuntimeError("wait boom"), True]
+        with mock.patch.object(memory, "_watcher_stop", fake_stop), \
+                mock.patch.object(memory, "_tick", return_value=None):
+            # Run synchronously — it should return promptly via the break.
+            memory._watcher_loop(0.01)
+        # Restore is automatic via patch context; sanity check the real one is back.
+        self.assertIs(memory._watcher_stop, real_stop)
+        # Both waits were consumed (inner-raise then outer-recovery-break).
+        self.assertEqual(fake_stop.wait.call_count, 2)
+
+
+class ActionListAgeFormattingTests(_MemoryTestBase):
+    def _make_with_age(self, seconds_ago):
+        pid = memory.make_promise("task", "manual")
+        with memory._lock:
+            for p in memory._promises:
+                if p["id"] == pid:
+                    p["created_at"] = time.time() - seconds_ago
+        return pid
+
+    def test_age_seconds(self):
+        self._make_with_age(5)
+        self.assertIn("s ago", memory.action_list_promises(""))
+
+    def test_age_minutes(self):
+        self._make_with_age(120)        # 2 minutes
+        out = memory.action_list_promises("")
+        self.assertIn("m ago", out)
+
+    def test_age_hours(self):
+        self._make_with_age(3 * 3600 + 5 * 60)   # 3h05m
+        out = memory.action_list_promises("")
+        self.assertRegex(out, r"\d+h\d{2}m ago")
 
 
 if __name__ == "__main__":

@@ -62,7 +62,7 @@ from core.atomic_io import _atomic_write_json
 try:
     import paho.mqtt.client as mqtt
     _HAS_MQTT = True
-except ImportError:
+except ImportError:  # pragma: no cover - optional-dep import fallback; paho-mqtt is installed on both the dev box and the CI runner, so this branch never executes under test.
     _HAS_MQTT = False
 
 _PROJECT_DIR       = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -776,7 +776,7 @@ def _start_mqtt(ip: str, access: str, serial: str):
         return None
 
 
-def _poll_loop(client, stop_evt: threading.Event) -> None:
+def _poll_loop(client, stop_evt: threading.Event) -> None:  # pragma: no cover - daemon poll loop; blocks on stop_evt.wait(POLL_INTERVAL_SECONDS) between live MQTT pushall publishes to the printer. start_monitor/stop_monitor/is_printer_offline (which it calls) are unit-tested directly.
     """Periodically request a fresh push (Bambu pushes updates on its own
     but we nudge it every minute to keep state warm and detect stalls).
 

@@ -2469,7 +2469,7 @@ def check_tts_pipeline(bc_text: str, tts_text: str = "") -> tuple[list[Finding],
         if re.search(rf'\b_TTS_EMOTION_PRESETS\[\s*["\']{name}["\']', combined) \
                 or re.search(rf'["\']{name}["\']', combined):
             coverage[name] = "ok"
-        else:
+        else:  # pragma: no cover - unreachable: a preset's own dict-literal key always satisfies the `'name'` reference regex against `combined`, so UNUSED can't trigger
             coverage[name] = "UNUSED"
             out.append(Finding(
                 severity="P2", category="tts-pipeline",
@@ -2658,7 +2658,7 @@ def check_import_graph(files: list[str]) -> tuple[list[Finding], dict[str, Any]]
         except SyntaxError:
             continue
         src_mod = file_to_mod.get(path)
-        if not src_mod:
+        if not src_mod:  # pragma: no cover - unreachable: every `path` is a key in file_to_mod and its mapped module name is derived from a non-empty _rel(), so it's never falsy
             continue
         # Deferred imports (inside a function/method body) run lazily at call
         # time and do NOT create an import-time cycle. The `_bc()` pattern in

@@ -263,6 +263,213 @@ class FaceTrackerActionTests(unittest.TestCase):
         self.assertIn("I see you at your desk.", out)
         self.assertIn("[gaze: currently looking at the right monitor]", out)
 
+    def test_gaze_status_monitor_none_after_sample(self):
+        # A sample landed but no monitor committed yet → "haven't established".
+        self.mod._state.update({"last_sample_at": time.time(),
+                                "current_monitor": None})
+        self.assertIn("haven't established", self.actions["gaze_status"](""))
+
+    def test_gaze_status_away_never_seen(self):
+        self.mod._state.update({"last_sample_at": time.time(),
+                                "current_monitor": "away", "last_face_at": 0.0})
+        self.assertIn("haven't seen you at all", self.actions["gaze_status"](""))
+
+    def test_gaze_stats_includes_current_run_and_face_time(self):
+        now = time.time()
+        self.mod._dwell_total.update({"left": 60.0})
+        # A live run on 'right' should be folded into totals, and the
+        # face-visible total surfaces the "in view for roughly..." clause.
+        self.mod._state.update({"current_monitor": "right",
+                                "monitor_since": now - 120})
+        self.mod._face_visible_total[0] = 300.0
+        out = self.actions["gaze_stats"]("")
+        self.assertIn("in view for roughly", out)
+        self.assertIn("right", out)
+
+    def test_which_monitor_fast_path_away(self):
+        wrapped = self.mod._build_which_monitor_wrapper(lambda a="": "ORIG")
+        self.mod._state.update({"last_sample_at": time.time(),
+                                "current_monitor": "away"})
+        self.assertIn("not visible", wrapped(""))
+
+    def test_which_monitor_fast_path_import_failure_drops_suffix(self):
+        # bc import raising → monitors={} → no "(left)" suffix, still fast-path.
+        wrapped = self.mod._build_which_monitor_wrapper(lambda a="": "ORIG")
+        self.mod._state.update({"last_sample_at": time.time(),
+                                "current_monitor": "left"})
+        with mock.patch.object(self.mod.importlib, "import_module",
+                               side_effect=ImportError("no bc")):
+            out = wrapped("")
+        self.assertIn("LEFT monitor", out)
+        self.assertNotIn("(left)", out)  # suffix dropped without MONITORS
+
+    def test_see_user_wrapper_away_note(self):
+        wrapped = self.mod._build_see_user_wrapper(lambda a="": "base")
+        self.mod._state.update({"current_monitor": "away"})
+        out = wrapped("")
+        self.assertIn("[gaze: user not currently in view]", out)
+
+    def test_see_user_wrapper_no_note_when_unknown(self):
+        wrapped = self.mod._build_see_user_wrapper(lambda a="": "base")
+        self.mod._state.update({"current_monitor": None})
+        self.assertEqual(wrapped(""), "base")
+
+
+class FaceTrackerClassifyNoLockTests(unittest.TestCase):
+    """_classify_sides else-branch when bobert exposes no state lock."""
+
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("face_tracker")
+
+    def test_classify_without_lock(self):
+        now = time.time()
+        bc = _fake_bc(last_seen={0: now, 1: now - 999})
+        bc._camera_state_lock = None  # exercise the lock-less path (94-98)
+        sides, _ = self.mod._classify_sides(bc)
+        self.assertEqual(sides, frozenset({"left"}))
+
+    def test_monitor_name_right_only(self):
+        bc = _fake_bc()
+        self.assertEqual(
+            self.mod._monitor_name_from_sides(bc, frozenset({"right"})), "right")
+
+
+class FaceTrackerPollOnceTests(unittest.TestCase):
+    """_poll_once — the per-tick poller body (hysteresis + state/dwell/face
+    accounting), driven directly with a fake bobert_companion."""
+
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("face_tracker")
+        self.mod._pending_monitor.clear()
+        self.mod._dwell_total.clear()
+        self.mod._dwell_longest.clear()
+        self.mod._face_visible_total[0] = 0.0
+        self.mod._state.update({
+            "current_monitor": None, "current_sides": None, "last_sample_at": 0.0,
+            "monitor_since": 0.0, "face_visible": False, "last_face_at": 0.0,
+            "first_face_at": 0.0,
+        })
+
+    def test_unstable_first_read_does_not_commit(self):
+        # One read with HYSTERESIS_SAMPLES=2 is not yet stable → no commit, but
+        # current_sides + last_sample_at are touched.
+        now = time.time()
+        bc = _fake_bc(last_seen={0: now})  # left only
+        self.mod._poll_once(bc)
+        self.assertIsNone(self.mod._state["current_monitor"])  # not committed
+        self.assertEqual(self.mod._state["current_sides"], frozenset({"left"}))
+        self.assertTrue(self.mod._state["face_visible"])
+        self.assertTrue(self.mod._state["first_face_at"])
+
+    def test_two_identical_reads_commit_monitor(self):
+        now = time.time()
+        bc = _fake_bc(last_seen={0: now})  # left only, fresh
+        self.mod._poll_once(bc)
+        self.mod._poll_once(bc)  # second identical read → stable → commit
+        self.assertEqual(self.mod._state["current_monitor"], "left")
+
+    def test_face_visible_total_accumulates_across_ticks(self):
+        now = time.time()
+        bc = _fake_bc(last_seen={0: now, 1: now})  # both fresh → visible
+        # First tick arms first_face_at + last_sample_at.
+        self.mod._poll_once(bc)
+        # Backdate last_sample_at so the next tick credits ~5s of visible time.
+        self.mod._state["last_sample_at"] = time.time() - 5
+        self.mod._poll_once(bc)
+        self.assertGreaterEqual(self.mod._face_visible_total[0], 4.0)
+
+    def test_poll_once_drops_to_away_when_face_lost(self):
+        old = time.time() - 999
+        bc = _fake_bc(last_seen={0: old, 1: old})  # nothing fresh
+        self.mod._poll_once(bc)
+        self.mod._poll_once(bc)  # 'away' held two ticks → stable
+        self.assertEqual(self.mod._state["current_monitor"], "away")
+        self.assertFalse(self.mod._state["face_visible"])
+
+    def test_pending_buffer_trimmed_to_hysteresis_window(self):
+        # Polling more than HYSTERESIS_SAMPLES times must trim the buffer back
+        # to the window length (covers the del-slice at line 158).
+        now = time.time()
+        bc = _fake_bc(last_seen={0: now})  # left only, fresh each tick
+        for _ in range(self.mod.HYSTERESIS_SAMPLES + 3):
+            self.mod._poll_once(bc)
+        self.assertEqual(len(self.mod._pending_monitor),
+                         self.mod.HYSTERESIS_SAMPLES)
+
+
+class FaceTrackerFailureSummaryTests(unittest.TestCase):
+    """get_consecutive_read_failures — bc import + delegation paths."""
+
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("face_tracker")
+
+    def test_returns_empty_when_bc_import_fails(self):
+        with mock.patch.object(self.mod.importlib, "import_module",
+                               side_effect=ImportError("no bc")):
+            self.assertEqual(self.mod.get_consecutive_read_failures(), {})
+
+    def test_returns_empty_when_summary_fn_missing(self):
+        bc = mock.MagicMock(spec=[])  # no get_camera_failure_summary attr
+        with mock.patch.object(self.mod.importlib, "import_module", return_value=bc):
+            self.assertEqual(self.mod.get_consecutive_read_failures(), {})
+
+    def test_delegates_to_summary_fn(self):
+        bc = mock.MagicMock()
+        bc.get_camera_failure_summary.return_value = {0: {"consecutive_fails": 3}}
+        with mock.patch.object(self.mod.importlib, "import_module", return_value=bc):
+            out = self.mod.get_consecutive_read_failures()
+        self.assertEqual(out, {0: {"consecutive_fails": 3}})
+
+    def test_summary_fn_raising_returns_empty(self):
+        bc = mock.MagicMock()
+        bc.get_camera_failure_summary.side_effect = RuntimeError("boom")
+        with mock.patch.object(self.mod.importlib, "import_module", return_value=bc):
+            self.assertEqual(self.mod.get_consecutive_read_failures(), {})
+
+    def test_spike_skips_unparseable_counts(self):
+        # A record whose counts can't be int()'d is skipped (covers 271-272).
+        info = {0: {"consecutive_fails": object(), "max_consecutive_fails": 9,
+                    "last_ok_at": time.time() - 600}}
+        with mock.patch.object(self.mod, "get_consecutive_read_failures",
+                               return_value=info):
+            self.assertEqual(self.mod.get_read_failure_spike_signals(threshold=5), [])
+
+
+class FaceTrackerRegisterTests(unittest.TestCase):
+    """register(): wrapper installation + duplicate-poller guard."""
+
+    def test_register_wraps_existing_actions_and_starts_poller(self):
+        import contextlib
+        import io
+        mod, _ = load_skill_isolated("face_tracker", register=False)
+        sentinel_wm = lambda a="": "WM"
+        sentinel_su = lambda a="": "SU"
+        actions = {"which_monitor": sentinel_wm, "see_user": sentinel_su}
+        buf = io.StringIO()
+        with mock.patch.object(threading.Thread, "start", lambda self: None), \
+             contextlib.redirect_stdout(buf):
+            mod.register(actions)
+        # Both got wrapped (identity changed) and the new actions registered.
+        self.assertIsNot(actions["which_monitor"], sentinel_wm)
+        self.assertIsNot(actions["see_user"], sentinel_su)
+        self.assertIn("gaze_status", actions)
+        self.assertIn("gaze poller active", buf.getvalue())
+
+    def test_register_skips_duplicate_poller(self):
+        import contextlib
+        import io
+        mod, _ = load_skill_isolated("face_tracker", register=False)
+        # Simulate an already-running poller of the same OS-thread name.
+        live = mock.MagicMock()
+        live.name = "face-tracker-skill"
+        live.is_alive.return_value = True
+        buf = io.StringIO()
+        with mock.patch.object(threading, "enumerate", return_value=[live]), \
+             mock.patch.object(threading.Thread, "start", lambda self: None), \
+             contextlib.redirect_stdout(buf):
+            mod.register({})
+        self.assertIn("already running", buf.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

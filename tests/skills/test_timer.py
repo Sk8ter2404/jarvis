@@ -7,11 +7,20 @@ happy paths + state, and the blue/green restore path.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import time
 import unittest
 from unittest import mock
 
 from tests._skill_harness import load_skill_isolated, no_background_threads
+
+
+def _call_silently(fn, *a, **kw):
+    """Invoke fn with stdout swallowed — the _fire closures print a 🔔 line
+    that crashes on a cp1252 console when called directly outside the loader."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        return fn(*a, **kw)
 
 
 class TimerSkillTests(unittest.TestCase):
@@ -94,6 +103,173 @@ class TimerSkillTests(unittest.TestCase):
     def test_restore_rejects_garbage(self):
         self.assertEqual(self.mod.restore_timers("not a list"), 0)
         self.assertEqual(self.mod.restore_timers([{"bad": "entry"}]), 0)
+
+    def test_restore_skips_non_dict_and_dup_id(self):
+        # non-dict entry skipped; duplicate of an already-present id skipped.
+        with no_background_threads():
+            self.actions["set_timer"]("99 minutes | existing")  # claims id #1
+        future = time.time() + 9999
+        n = self.mod.restore_timers([
+            "not-a-dict",
+            {"id": 1, "message": "dup", "fire_at": future},  # id already live
+        ])
+        self.assertEqual(n, 0)
+
+    def test_restore_rejects_blank_message_and_bad_id(self):
+        future = time.time() + 9999
+        n = self.mod.restore_timers([
+            {"id": 3, "message": "", "fire_at": future},   # blank msg
+            {"id": 0, "message": "zero-id", "fire_at": future},  # tid <= 0
+            {"id": "NaN", "message": "x", "fire_at": future},    # int() raises
+        ])
+        self.assertEqual(n, 0)
+
+    def test_restore_future_fire_callback_enqueues_and_pops(self):
+        # Rearm a future timer (no real thread), then invoke its fire callback
+        # directly to cover the closure body (152-155).
+        future = time.time() + 9999
+        with no_background_threads():
+            self.mod.restore_timers([{"id": 8, "message": "yoga", "fire_at": future}])
+        timer_obj, msg, _ = self.mod._timers[8]
+        with mock.patch.object(self.mod, "_enqueue_speech") as enq:
+            _call_silently(timer_obj.function)  # the _fire closure
+        enq.assert_called_once()
+        self.assertIn("yoga", enq.call_args[0][0])
+        self.assertNotIn(8, self.mod._timers)  # popped itself
+
+    def test_restore_fire_on_restore_exception_is_swallowed(self):
+        # _enqueue_speech raising during fire-on-restore must not abort the loop;
+        # the entry still counts as restored.
+        with mock.patch.object(self.mod, "_enqueue_speech",
+                               side_effect=RuntimeError("boom")):
+            n = _call_silently(self.mod.restore_timers,
+                               [{"id": 4, "message": "past", "fire_at": 1.0}])
+        self.assertEqual(n, 1)
+
+    # ── set_timer fire closure + format branches ─────────────────────────
+    def test_set_timer_fire_callback(self):
+        with no_background_threads():
+            self.actions["set_timer"]("5 minutes | call mom")
+        timer_obj, msg, _ = self.mod._timers[1]
+        with mock.patch.object(self.mod, "_enqueue_speech") as enq:
+            _call_silently(timer_obj.function)  # the _fire closure (182-185)
+        enq.assert_called_once()
+        self.assertIn("call mom", enq.call_args[0][0])
+        self.assertNotIn(1, self.mod._timers)
+
+    def test_set_timer_seconds_format(self):
+        with no_background_threads():
+            out = self.actions["set_timer"]("45 seconds | quick")
+        self.assertIn("45s", out)  # secs < 60 branch (195)
+
+    def test_set_timer_hours_format(self):
+        with no_background_threads():
+            out = self.actions["set_timer"]("2 hours 15 minutes | long")
+        self.assertIn("2h 15m", out)  # secs >= 3600 branch (199)
+
+    def test_set_timer_minutes_exact(self):
+        with no_background_threads():
+            out = self.actions["set_timer"]("10 minutes | exact")
+        self.assertIn("10m", out)  # no leftover seconds branch
+
+    # ── list_timers remaining-string branches ────────────────────────────
+    def test_list_timers_remaining_formats(self):
+        now = 1_000_000.0
+        sentinel = mock.MagicMock()
+        # Inject timers directly so we control fire_at precisely without threads.
+        self.mod._timers[1] = (sentinel, "soon", now + 30)        # <60 → Ns
+        self.mod._timers[2] = (sentinel, "mid", now + 90)         # <3600 → Nm Ns
+        self.mod._timers[3] = (sentinel, "far", now + 7200)       # >=3600 → Nh Nm
+        # Freeze the clock so remaining-time math is exact, not flaky.
+        with mock.patch.object(self.mod.time, "time", return_value=now):
+            out = self.actions["list_timers"]()
+        self.assertIn("30s", out)
+        self.assertIn("1m 30s", out)
+        self.assertIn("2h 0m", out)
+
+    # ── cancel_timer parse error ─────────────────────────────────────────
+    def test_cancel_timer_bad_id(self):
+        self.assertIn("format", self.actions["cancel_timer"]("notanumber").lower())
+
+
+class TimerEnqueueSpeechTests(unittest.TestCase):
+    """_enqueue_speech: proactive_announce route + atomic-file fallback."""
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("timer")
+
+    def test_enqueue_via_proactive_announce(self):
+        fake_bc = mock.MagicMock()
+        with mock.patch("importlib.import_module", return_value=fake_bc):
+            self.mod._enqueue_speech("hello")
+        fake_bc.proactive_announce.assert_called_once_with("hello", source="timer")
+
+    def test_enqueue_falls_back_to_file_when_announcer_absent(self):
+        import json as _json
+        import os as _os
+        import tempfile
+
+        # import_module returns an object WITHOUT proactive_announce → fallback.
+        bc_no_announce = mock.MagicMock(spec=[])
+        with tempfile.TemporaryDirectory() as d:
+            qpath = _os.path.join(d, "pending_speech.json")
+            with mock.patch("importlib.import_module", return_value=bc_no_announce), \
+                 mock.patch.object(self.mod, "_SPEECH_QUEUE", qpath):
+                self.mod._enqueue_speech("file-route")
+            with open(qpath, encoding="utf-8") as f:
+                data = _json.load(f)
+        self.assertEqual(data[-1]["message"], "file-route")
+
+    def test_enqueue_appends_to_existing_and_ignores_corrupt(self):
+        import json as _json
+        import os as _os
+        import tempfile
+
+        with mock.patch("importlib.import_module", side_effect=ImportError):
+            with tempfile.TemporaryDirectory() as d:
+                qpath = _os.path.join(d, "pending_speech.json")
+                # Pre-seed corrupt JSON → the read except resets data to [].
+                with open(qpath, "w", encoding="utf-8") as f:
+                    f.write("{not json")
+                with mock.patch.object(self.mod, "_SPEECH_QUEUE", qpath):
+                    self.mod._enqueue_speech("after-corrupt")
+                with open(qpath, encoding="utf-8") as f:
+                    data = _json.load(f)
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["message"], "after-corrupt")
+
+    def test_enqueue_write_failure_falls_back_to_print(self):
+        # import_module raises (parent not loaded) AND the atomic write fails →
+        # the print fallback fires instead of losing the reminder.
+        with mock.patch("importlib.import_module", side_effect=ImportError), \
+             mock.patch.object(self.mod, "_atomic_write_json",
+                               side_effect=OSError("disk full")), \
+             mock.patch.object(self.mod, "os") as fake_os:
+            fake_os.path.exists.return_value = False
+            # Should not raise despite the write failing.
+            _call_silently(self.mod._enqueue_speech, "doomed")
+
+
+class TimerEnumerateTests(unittest.TestCase):
+    """enumerate_timers snapshot for blue/green handoff."""
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("timer")
+        self.mod._timers.clear()
+        self.mod._next_id[0] = 1
+
+    def test_enumerate_empty(self):
+        self.assertEqual(self.mod.enumerate_timers(), [])
+
+    def test_enumerate_snapshots_active(self):
+        with no_background_threads():
+            self.actions["set_timer"]("30 minutes | a")
+            self.actions["set_timer"]("60 minutes | b")
+        snap = self.mod.enumerate_timers()
+        self.assertEqual(len(snap), 2)
+        self.assertEqual(snap[0]["id"], 1)
+        self.assertEqual(snap[0]["message"], "a")
+        self.assertIsInstance(snap[0]["fire_at"], float)
 
 
 if __name__ == "__main__":

@@ -34,7 +34,7 @@ _SPEECH_QUEUE = os.path.join(_PROJECT_DIR, "pending_speech.json")
 
 # Ensure the project root is importable so `core.atomic_io` resolves whether
 # this module is loaded as `skills.teams_nudge` or run directly.
-if _PROJECT_DIR not in sys.path:
+if _PROJECT_DIR not in sys.path:  # pragma: no cover - import-time sys.path guard; root already on path under the test harness
     sys.path.insert(0, _PROJECT_DIR)
 
 from core.atomic_io import _atomic_write_json  # noqa: E402
@@ -178,7 +178,7 @@ def _check_once() -> tuple[bool, str]:
     return True, msg
 
 
-def _monitor_loop():
+def _monitor_loop():  # pragma: no cover - non-terminating background daemon (sleeps INITIAL_DELAY then loops forever); its dispatch delegates to _check_once/_enqueue_speech, both unit-tested directly
     time.sleep(INITIAL_DELAY_SECONDS)
     while True:
         try:

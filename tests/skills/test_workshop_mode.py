@@ -240,5 +240,204 @@ class WorkshopStatusActionTests(unittest.TestCase):
         self.assertIn("engaged", out.lower())
 
 
+class WorkshopEnqueueSpeechTests(unittest.TestCase):
+    """_enqueue_speech routes through bobert_companion.proactive_announce, with
+    a console fallback when it's absent / returns falsy / raises."""
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("workshop_mode")
+
+    def test_routes_through_proactive_announce(self):
+        bc = types.ModuleType("bobert_companion")
+        bc.proactive_announce = mock.MagicMock(return_value=True)
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}), _quiet():
+            self.mod._enqueue_speech("hello sir")
+        bc.proactive_announce.assert_called_once()
+        # source kwarg identifies the originating skill.
+        self.assertEqual(bc.proactive_announce.call_args.kwargs.get("source"),
+                         "workshop")
+
+    def test_falls_back_when_announce_returns_falsy(self):
+        # announcer present but reports it didn't queue → console fallback line.
+        bc = types.ModuleType("bobert_companion")
+        bc.proactive_announce = mock.MagicMock(return_value=False)
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}):
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                self.mod._enqueue_speech("queued?")
+        self.assertIn("speech-queue unavailable", buf.getvalue())
+
+    def test_falls_back_when_import_raises(self):
+        # import_module raising is caught → the except-branch console line.
+        with mock.patch.object(self.mod.importlib, "import_module",
+                               side_effect=RuntimeError("no module")):
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                self.mod._enqueue_speech("boom")
+        self.assertIn("speech-queue write failed", buf.getvalue())
+
+
+class WorkshopFindWindowDegradeTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("workshop_mode")
+
+    def test_get_all_windows_raises_degrades(self):
+        fake_gw = types.ModuleType("pygetwindow")
+        fake_gw.getAllWindows = mock.MagicMock(side_effect=RuntimeError("x11"))
+        with mock.patch.dict(sys.modules, {"pygetwindow": fake_gw}):
+            self.assertEqual(self.mod._find_cad_window(), (None, None))
+
+
+class WorkshopPrintStatusLineBranchTests(unittest.TestCase):
+    """The reachable branches inside _maybe_get_print_status_line that the
+    sibling happy-path test doesn't hit: mid-print without layer/total, a
+    raising _format_minutes, and an outer exception."""
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("workshop_mode")
+
+    def _fake_bambu(self, fmt=None, **state):
+        import threading
+        m = types.ModuleType("skill_bambu_monitor")
+        m._state_lock = threading.Lock()
+        base = {"last_update": 0.0}
+        base.update(state)
+        m._state = base
+        m._format_minutes = fmt if fmt is not None else (
+            lambda mins: (f"{int(mins)} minutes" if mins else ""))
+        return m
+
+    def test_midprint_without_layers(self):
+        import time
+        fake = self._fake_bambu(last_update=time.time(), gcode_state="RUNNING",
+                                layer_num=None, total_layer=None, mc_remaining=0)
+        with mock.patch.dict(sys.modules, {"skill_bambu_monitor": fake}):
+            line = self.mod._maybe_get_print_status_line()
+        self.assertIsNotNone(line)
+        self.assertIn("mid-print", line)
+        # remaining=0 → no "remaining" tail.
+        self.assertNotIn("remaining", line)
+
+    def test_format_minutes_raises_is_swallowed(self):
+        import time
+
+        def _boom(_mins):
+            raise ValueError("bad minutes")
+
+        fake = self._fake_bambu(fmt=_boom, last_update=time.time(),
+                                gcode_state="RUNNING", layer_num=5,
+                                total_layer=50, mc_remaining=42)
+        with mock.patch.dict(sys.modules, {"skill_bambu_monitor": fake}):
+            line = self.mod._maybe_get_print_status_line()
+        # The formatter blew up → rem_str stays "" → still returns a line.
+        self.assertIsNotNone(line)
+        self.assertIn("layer 5 of 50", line)
+        self.assertNotIn("remaining", line)
+
+    def test_outer_exception_returns_none(self):
+        # A _state_lock that isn't a context manager makes `with state_lock:`
+        # raise inside the outer try → None.
+        import time
+        fake = types.ModuleType("skill_bambu_monitor")
+        fake._state_lock = object()  # not a context manager
+        fake._state = {"last_update": time.time(), "gcode_state": "RUNNING"}
+        fake._format_minutes = lambda m: ""
+        with mock.patch.dict(sys.modules, {"skill_bambu_monitor": fake}):
+            self.assertIsNone(self.mod._maybe_get_print_status_line())
+
+
+class WorkshopEnterExitBranchTests(unittest.TestCase):
+    """Defensive / secondary branches of enter/exit not covered by the happy
+    path: the audio-scale wrapper swallowing a bad audio object, a hook-install
+    failure, the print-status offer firing, and a restore failure on exit."""
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("workshop_mode")
+        self.mod._workshop_active[0] = False
+        self.mod._current_app_title[0] = None
+        self.mod._saved_play_with_lipsync[0] = None
+        self.mod._saved_system_prompt[0] = None
+
+    def test_scaled_wrapper_swallows_bad_audio(self):
+        bc = _make_fake_bc()
+        seen = {}
+        bc.play_with_lipsync = lambda audio, sr: seen.update(audio=audio, sr=sr)
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}), \
+             mock.patch.object(self.mod, "_enqueue_speech"), \
+             mock.patch.object(self.mod, "_maybe_get_print_status_line",
+                               return_value=None), _quiet():
+            self.mod._enter_workshop_mode("bambu studio", "T")
+
+            class _BadAudio:
+                def __mul__(self, _other):
+                    raise TypeError("can't scale")
+
+            bad = _BadAudio()
+            # The wrapper catches the multiply error and passes the original
+            # object straight through.
+            bc.play_with_lipsync(bad, 44100)
+        self.assertIs(seen["audio"], bad)
+
+    def test_enter_hook_install_failure_is_logged(self):
+        # bobert_companion whose play_with_lipsync attribute access raises →
+        # the install try/except prints a failure but enter still proceeds.
+        class _ExplodingBC(types.ModuleType):
+            @property
+            def play_with_lipsync(self):
+                raise RuntimeError("attr boom")
+
+        bc = _ExplodingBC("bobert_companion")
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}), \
+             mock.patch.object(self.mod, "_enqueue_speech") as enq, \
+             mock.patch.object(self.mod, "_maybe_get_print_status_line",
+                               return_value=None):
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                self.mod._enter_workshop_mode("bambu studio", "T")
+        self.assertIn("failed to install hooks", buf.getvalue())
+        # Despite the hook failure, the mode still engaged + announced.
+        self.assertTrue(self.mod._workshop_active[0])
+        self.assertTrue(any("engaged" in c.args[0].lower()
+                            for c in enq.call_args_list))
+
+    def test_enter_offers_print_status_when_running(self):
+        bc = _make_fake_bc()
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}), \
+             mock.patch.object(self.mod, "_enqueue_speech") as enq, \
+             mock.patch.object(self.mod, "_maybe_get_print_status_line",
+                               return_value="By the way, mid-print, sir."), \
+             _quiet():
+            self.mod._enter_workshop_mode("bambu studio", "T")
+        # Both the engaged line and the print-status offer were queued.
+        spoken = [c.args[0] for c in enq.call_args_list]
+        self.assertTrue(any("engaged" in m.lower() for m in spoken))
+        self.assertTrue(any("mid-print" in m for m in spoken))
+
+    def test_exit_restore_failure_is_logged(self):
+        # Engage on a healthy bc, then swap in a bc whose attribute *assignment*
+        # raises so the restore path hits its except branch.
+        bc = _make_fake_bc()
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}), \
+             mock.patch.object(self.mod, "_enqueue_speech"), \
+             mock.patch.object(self.mod, "_maybe_get_print_status_line",
+                               return_value=None), _quiet():
+            self.mod._enter_workshop_mode("bambu studio", "T")
+
+        class _ReadOnlyBC(types.ModuleType):
+            @property
+            def play_with_lipsync(self):
+                return None
+
+            @play_with_lipsync.setter
+            def play_with_lipsync(self, _v):
+                raise RuntimeError("read only")
+
+        ro = _ReadOnlyBC("bobert_companion")
+        ro._system_prompt = "BASE PROMPT"
+        with mock.patch.dict(sys.modules, {"bobert_companion": ro}), \
+             mock.patch.object(self.mod, "_enqueue_speech"):
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                self.mod._exit_workshop_mode()
+        self.assertIn("failed to restore hooks", buf.getvalue())
+        self.assertFalse(self.mod._workshop_active[0])
+
+
 if __name__ == "__main__":
     unittest.main()
