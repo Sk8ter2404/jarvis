@@ -381,12 +381,25 @@ class ScanLanArpTests(unittest.TestCase):
 
     def test_win32_creationflags_passed(self):
         raw = b"  192.168.1.1   aa-bb-cc-dd-ee-ff   dynamic\r\n"
-        with mock.patch.object(self.mod.sys, "platform", "win32"), \
+        # ``subprocess.CREATE_NO_WINDOW`` is Windows-only. ``_scan_lan_arp``
+        # passes ``creationflags=(subprocess.CREATE_NO_WINDOW if
+        # sys.platform=="win32" else 0)``; Python evaluates that kwarg before
+        # the (mocked) check_output runs. On the Linux CI the attribute is
+        # absent, so with sys.platform forced to "win32" the expression raises
+        # AttributeError, which _scan_lan_arp swallows (returning []) — leaving
+        # check_output un-called and co.call_args None. Materialise the flag
+        # (no-op on Windows, where it already holds this value) so the win32
+        # branch runs and the creationflags assertion is actually exercised on
+        # any host.
+        with mock.patch.object(self.mod.subprocess, "CREATE_NO_WINDOW",
+                               0x08000000, create=True), \
+             mock.patch.object(self.mod.sys, "platform", "win32"), \
              mock.patch.object(self.mod.subprocess, "check_output",
                                return_value=raw) as co:
             self.mod._scan_lan_arp()
         # creationflags kwarg should be present and non-zero on win32.
         self.assertIn("creationflags", co.call_args.kwargs)
+        self.assertEqual(co.call_args.kwargs["creationflags"], 0x08000000)
 
 
 # ── _atomic_write_json / _save_catalog / _load_catalog ──────────────────────
@@ -1216,7 +1229,18 @@ class PlaywrightShimTests(unittest.TestCase):
             {"name": "", "value": "skip"},      # no name → skipped
             {"name": "b", "value": "2"},        # default domain branch
         ]
-        with mock.patch.object(self.mod, "_alexapy", return_value=fake), \
+        # ``_build_login_from_playwright_cookies`` does ``from yarl import URL``
+        # to build the per-cookie URL it hands to ``jar.update_cookies``. yarl
+        # ships with aiohttp/alexapy and is present on the dev box, but the
+        # Linux CI runs light deps only, so the import raises and the function's
+        # broad ``except Exception`` returns None — the injection path is never
+        # exercised. Provide a minimal fake ``yarl`` (URL is only used as an
+        # opaque value the fake jar records) so the real injection loop runs and
+        # is covered on any host. mock.patch.dict restores sys.modules after.
+        fake_yarl = types.ModuleType("yarl")
+        fake_yarl.URL = lambda s: s
+        with mock.patch.dict(sys.modules, {"yarl": fake_yarl}), \
+             mock.patch.object(self.mod, "_alexapy", return_value=fake), \
              mock.patch.object(self.mod, "_construct_login", return_value=login):
             out = self.mod._build_login_from_playwright_cookies("e", cookies)
         self.assertIs(out, login)

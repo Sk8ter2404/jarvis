@@ -577,6 +577,17 @@ class _ProbeTestBase(unittest.TestCase):
         self._t = [1_700_000_000.0]
         mock.patch.object(self.mod, "_now", lambda: self._t[0]).start()
         mock.patch.object(self.mod.time, "sleep", lambda *_a, **_k: None).start()
+        # ``subprocess.CREATE_NO_WINDOW`` is Windows-only. The PnP/hardware-count
+        # probes reference it in a ``creationflags=(... if sys.platform=="win32"
+        # else 0)`` kwarg that Python evaluates *before* calling the (mocked)
+        # subprocess. On the Linux CI the attribute is absent, so even with
+        # ``sys.platform`` forced to "win32" the expression raises AttributeError,
+        # which the probe swallows and returns None/[] — making the win32-branch
+        # assertions fail. Materialise the flag (no-op on Windows, where it already
+        # exists with this value) so the Windows code path runs and is covered on
+        # any host. stopall() restores/removes it after each test.
+        mock.patch.object(self.mod.subprocess, "CREATE_NO_WINDOW",
+                          0x08000000, create=True).start()
         self.addCleanup(mock.patch.stopall)
 
     def _restore_bc(self):

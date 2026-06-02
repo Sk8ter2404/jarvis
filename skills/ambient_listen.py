@@ -867,7 +867,11 @@ def _audio_worker_loop() -> None:
         print(f"  [ambient-audio] {_audio_last_error}")
         return
 
-    # Read native device rate so resampling math is correct.
+    # Read native device rate so resampling math is correct. Default dev_info
+    # to {} first so the open-banner below stays safe when query_devices()
+    # raises — otherwise dev_info is unbound and the UnboundLocalError escapes
+    # before the main try/except, silently killing the audio daemon thread.
+    dev_info: dict = {}
     try:
         dev_info = sd.query_devices(device_idx)
         dev_sr = int(dev_info.get("default_samplerate") or sample_rate)
