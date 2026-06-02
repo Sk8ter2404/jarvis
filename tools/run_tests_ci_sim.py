@@ -38,6 +38,7 @@ import builtins
 import importlib
 import importlib.util
 import os
+import subprocess
 import sys
 import unittest
 
@@ -187,7 +188,50 @@ def _make_windows_absent() -> None:
             del sys.modules[mod]
 
 
+# The non-test CI gate steps from .github/workflows/ci.yml. Run as clean
+# subprocesses (exactly how CI runs each step) BEFORE the in-process platform
+# flip, so a lint / syntax / PII regression is caught locally instead of on the
+# runner. Keep this list in lockstep with ci.yml.
+_CI_GATES = (
+    ("compileall", ["-m", "compileall", "-q",
+                    "core", "skills", "tools", "tests", "adapters", "hud"]),
+    ("pyflakes tests", ["-m", "pyflakes", "tests"]),
+    ("check_no_pii", ["tools/check_no_pii.py"]),
+)
+
+
+def _run_ci_gates(root: str) -> bool:
+    """Run CI's non-test gate steps the way the runner does. Returns True iff all
+    pass; prints the tail of any failing step's output for diagnosis."""
+    all_ok = True
+    print("--- CI gate steps (mirror of ci.yml non-test steps) ---")
+    for label, argv in _CI_GATES:
+        try:
+            proc = subprocess.run([sys.executable, *argv], cwd=root,
+                                  capture_output=True, text=True)
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"[ci-sim gate] {label}: could not run ({exc})")
+            all_ok = False
+            continue
+        if proc.returncode == 0:
+            print(f"[ci-sim gate] {label}: OK")
+        else:
+            all_ok = False
+            print(f"[ci-sim gate] {label}: FAIL (exit {proc.returncode})")
+            tail = ((proc.stdout or "") + (proc.stderr or "")).splitlines()
+            for line in tail[-15:]:
+                print(f"    {line}")
+    print("--- end CI gate steps ---")
+    return all_ok
+
+
 def main() -> int:
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # Mirror CI's non-test gates (syntax sweep, lint, PII) up front, before the
+    # platform flip — these run in a normal environment on CI, so a clean
+    # subprocess here is faithful and catches regressions the test run can't.
+    gates_ok = _run_ci_gates(root)
+
     real_import = builtins.__import__
     real_find_spec = importlib.util.find_spec
     real_import_module = importlib.import_module
@@ -226,15 +270,15 @@ def main() -> int:
     importlib.util.find_spec = _find_spec
     importlib.import_module = _import_module
 
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if root not in sys.path:
         sys.path.insert(0, root)
     suite = unittest.TestLoader().discover(
         os.path.join(root, "tests"), pattern="test_*.py", top_level_dir=root)
     res = unittest.TextTestRunner(verbosity=1).run(suite)
+    gate_note = "" if gates_ok else "  [+ CI GATE FAILURE above]"
     print(f"=== CI-SIM: {res.testsRun} run, {len(res.failures)} failed, "
-          f"{len(res.errors)} errored, {len(res.skipped)} skipped ===")
-    return 0 if res.wasSuccessful() else 1
+          f"{len(res.errors)} errored, {len(res.skipped)} skipped{gate_note} ===")
+    return 0 if (res.wasSuccessful() and gates_ok) else 1
 
 
 if __name__ == "__main__":
