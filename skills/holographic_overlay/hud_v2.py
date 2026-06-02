@@ -84,8 +84,21 @@ try:
         QGraphicsDropShadowEffect,
     )
     _HAS_PYQT6 = True
+    # Base classes for the two Qt widget/scene definitions below. Aliased
+    # so the `class Foo(_QtSceneBase)` headers resolve at *import* time
+    # even when PyQt6 is missing (see the except branch). The class bodies
+    # are only ever instantiated from main(), which is gated on
+    # _HAS_PYQT6, so falling back to `object` here is import-safe.
+    _QtSceneBase = QGraphicsScene
+    _QtWidgetBase = QWidget
 except ImportError:
     _HAS_PYQT6 = False
+    # No PyQt6: keep the module importable (psutil-only consumers, CI,
+    # `python -c "import hud_v2"`) by giving the class headers a harmless
+    # base. main() prints an install hint and exits 2 before anything
+    # tries to construct these, so they are never actually used.
+    _QtSceneBase = object
+    _QtWidgetBase = object
 
 
 TICK_MS = 500  # spec — 500 ms refresh cadence
@@ -238,7 +251,7 @@ def _format_meeting(evt: dict | None) -> tuple[str, str]:
     return subject, f"in {days} d"
 
 
-class StarkStatusRingScene(QGraphicsScene):
+class StarkStatusRingScene(_QtSceneBase):
     """Stark-style reactor scene — renders the ring, the speech-state
     core, and the two text rows in a single drawBackground pass."""
 
@@ -724,7 +737,7 @@ class StarkStatusRingScene(QGraphicsScene):
             )
 
 
-class StarkStatusRingWindow(QWidget):
+class StarkStatusRingWindow(_QtWidgetBase):
     """Frameless translucent always-on-top window hosting the scene.
 
     Click-through (WA_TransparentForMouseEvents) — information-only,

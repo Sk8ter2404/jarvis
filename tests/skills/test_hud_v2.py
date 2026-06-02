@@ -1316,6 +1316,85 @@ class WindowTests(_HudBase):
         self.assertIsNotNone(win)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  No-PyQt6 import path — the genuine CI condition (PyQt6 absent).
+#
+#  REGRESSION GUARD: hud_v2 subclasses ``QGraphicsScene`` / ``QWidget`` at module
+#  scope. If those base classes are referenced unconditionally, the module raises
+#  ``NameError`` at *import* when PyQt6 is missing — defeating the ``_HAS_PYQT6 =
+#  False`` fallback and the install-hint path in ``main()``. These tests load the
+#  real source with PyQt6 forced absent (no fake layer) and assert it imports
+#  cleanly and degrades to a clear ``main() -> 2`` rather than crashing.
+#
+#  Unlike the rest of this file, these DON'T install the fake PyQt6 — they pin
+#  the PyQt6 module names to ``None`` so ``import PyQt6.QtCore`` raises
+#  ``ImportError`` exactly as on the ubuntu CI runner, regardless of whether
+#  PyQt6 happens to be installed on the machine running the suite.
+# ═══════════════════════════════════════════════════════════════════════════
+class NoPyQt6ImportTests(unittest.TestCase):
+    _PYQT6_NAMES = ("PyQt6", "PyQt6.QtCore", "PyQt6.QtGui", "PyQt6.QtWidgets")
+
+    def _load_without_pyqt6(self):
+        """Load hud_v2.py fresh with every PyQt6 import forced to fail. Restores
+        sys.modules (incl. prior absence) and drops the loaded module on
+        cleanup."""
+        saved = {n: sys.modules.get(n, _SENTINEL) for n in self._PYQT6_NAMES}
+        # Pinning a name to None makes ``import name`` raise ImportError — this
+        # is the documented stdlib hook for simulating an absent dependency.
+        for n in self._PYQT6_NAMES:
+            sys.modules[n] = None
+
+        def restore_pyqt6():
+            for n, prev in saved.items():
+                if prev is _SENTINEL:
+                    sys.modules.pop(n, None)
+                else:
+                    sys.modules[n] = prev
+        self.addCleanup(restore_pyqt6)
+
+        mod_name = f"_hud_v2_no_pyqt6_{id(self)}_{len(sys.modules)}"
+        spec = importlib.util.spec_from_file_location(mod_name, _HUD_V2_PATH)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[mod_name] = module
+        self.addCleanup(lambda: sys.modules.pop(mod_name, None))
+        spec.loader.exec_module(module)        # must NOT raise NameError
+        return module
+
+    def test_module_imports_without_pyqt6(self):
+        # The core regression: importing must succeed (no NameError from the
+        # QGraphicsScene/QWidget subclass headers) and report PyQt6 absent.
+        mod = self._load_without_pyqt6()
+        self.assertFalse(mod._HAS_PYQT6)
+
+    def test_palette_globals_are_none_without_pyqt6(self):
+        # The ``QColor(...) if _HAS_PYQT6 else None`` palette must resolve to
+        # None rather than touching the (absent) QColor symbol.
+        mod = self._load_without_pyqt6()
+        for name in ("CYAN", "AMBER", "RED", "PANEL_DARK", "TEXT_COLOR"):
+            self.assertIsNone(getattr(mod, name), name)
+
+    def test_widget_classes_still_defined_without_pyqt6(self):
+        # They degrade to an ``object`` base so the module body executes; they
+        # are never instantiated when PyQt6 is absent (main() exits first).
+        mod = self._load_without_pyqt6()
+        self.assertTrue(hasattr(mod, "StarkStatusRingScene"))
+        self.assertTrue(hasattr(mod, "StarkStatusRingWindow"))
+        self.assertTrue(issubclass(mod.StarkStatusRingScene, object))
+
+    def test_main_returns_2_and_hints_without_pyqt6(self):
+        # End-to-end: the real ``main()`` (not a patched flag) takes the
+        # install-hint branch and returns exit code 2.
+        mod = self._load_without_pyqt6()
+        buf = []
+        with mock.patch.object(mod.sys, "argv", ["hud_v2.py"]), \
+                mock.patch.object(mod.sys, "stderr") as err:
+            err.write = lambda s: buf.append(s)
+            rc = mod.main()
+        self.assertEqual(rc, 2)
+        self.assertTrue(any("PyQt6" in s for s in buf),
+                        "main() should emit the PyQt6 install hint on stderr")
+
+
 class MainEntryTests(_HudBase):
     def test_print_install_hint_writes_stderr(self):
         buf = []

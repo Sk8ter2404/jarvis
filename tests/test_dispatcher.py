@@ -247,6 +247,59 @@ class FailureResultTests(unittest.TestCase):
         self.assertTrue(out.endswith("..."))
 
 
+# ── Canonical failure-marker list (shared with the monolith) ─────────────────
+class CanonicalFailureMarkersTests(unittest.TestCase):
+    """The marker list was de-duplicated into core/failure_markers.py and is now
+    imported by BOTH core/dispatcher.py and bobert_companion._is_failure. These
+    tests pin the canonical contents and prove the extraction didn't change how
+    any historical result string classifies."""
+
+    # The exact set both sites carried before the merge (bobert_companion used
+    # "REFUSED"; the dispatcher used "refused" — identical under the
+    # case-insensitive match both apply). This is the behavioural contract.
+    _EXPECTED = {
+        "could not", "failed", "refused", "no tracks found",
+        "no window matching", "unknown ", "format:",
+    }
+
+    def test_canonical_contents(self):
+        from core.failure_markers import FAILURE_MARKERS
+        self.assertEqual(set(FAILURE_MARKERS), self._EXPECTED)
+        # Markers are stored lower-case so the case-insensitive compare is a
+        # plain substring test on the dispatcher side.
+        self.assertTrue(all(m == m.lower() for m in FAILURE_MARKERS))
+
+    def test_dispatcher_uses_the_canonical_list(self):
+        from core.failure_markers import FAILURE_MARKERS
+        # The dispatcher's module-level alias must BE the shared tuple, so the
+        # two can never drift again.
+        self.assertIs(d._FAIL_MARKERS, FAILURE_MARKERS)
+
+    def test_every_marker_classifies_as_failure(self):
+        # Each marker, embedded in a realistic result string, trips the check —
+        # covers both the dispatcher's lower-cased markers and the monolith's
+        # historical upper-case "REFUSED" (matched case-insensitively).
+        samples = {
+            "could not": "Could not capture screen",
+            "failed": "operation failed",
+            "refused": "COM REFUSED the call",       # upper in the wild
+            "no tracks found": "no tracks found matching 'x' in iTunes library",
+            "no window matching": "no window matching 'Spotify'",
+            "unknown ": "unknown command foo",
+            "format:": "bad format: expected HH:MM",
+        }
+        for marker, text in samples.items():
+            self.assertTrue(d._is_failure_result(text),
+                            f"marker {marker!r} should flag {text!r}")
+
+    def test_union_preserves_non_failure_classification(self):
+        # Strings that legitimately are NOT failures must still pass clean —
+        # the extraction added no new marker, so nothing newly trips.
+        for ok in ("all good", "music queued", "screenshot captured",
+                   "done, sir", "playing your focus mix"):
+            self.assertFalse(d._is_failure_result(ok), ok)
+
+
 # ── _format_consolidated ─────────────────────────────────────────────────────
 class FormatConsolidatedTests(unittest.TestCase):
     def _steps(self, *confs):

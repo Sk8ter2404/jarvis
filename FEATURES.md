@@ -2,7 +2,7 @@
 
 ## Overview
 
-JARVIS (internal codename "Bobert") is a Python voice-controlled desktop AI assistant for Windows that styles itself after the Iron Man JARVIS — dry, British, composed. It is a single long-running script (`C:\JARVIS\bobert_companion.py`, ~10,500 lines) that listens via microphone, transcribes with Whisper, routes the transcript through Claude as the language model, and lets Claude emit `[ACTION: name, arg]` tokens that map to ~150 registered handler functions. Around the core sits a skills system (`C:\JARVIS\skills\`, 35 modules), a HUD subsystem (`C:\JARVIS\hud\`, 6 overlay subprocesses), and several proactive background daemons (printer monitor, credit monitor, briefings, wellness nudges, banter, anticipation engine).
+JARVIS (internal codename "Bobert") is a Python voice-controlled desktop AI assistant for Windows that styles itself after the Iron Man JARVIS — dry, British, composed. It is a single long-running script (`C:\JARVIS\bobert_companion.py`, ~14,700 lines) that listens via microphone, transcribes with Whisper, routes the transcript through Claude as the language model, and lets Claude emit `[ACTION: name, arg]` tokens that map to ~150 registered handler functions. Around the core sits a skills system (`C:\JARVIS\skills\`, 78 modules), a HUD subsystem (`C:\JARVIS\hud\`, 10 overlay subprocesses), and several proactive background daemons (printer monitor, credit monitor, briefings, wellness nudges, banter, anticipation engine).
 
 ## How to invoke
 
@@ -297,8 +297,8 @@ Additional pushback / refusal layers:
 ## Key files
 
 - `C:\JARVIS\bobert_companion.py` — main loop, prompt, ACTIONS dict, all core handlers
-- `C:\JARVIS\skills\` — 35 skill modules
-- `C:\JARVIS\hud\` — 6 overlay subprocesses driven by `hud_state.json`
+- `C:\JARVIS\skills\` — 78 skill modules
+- `C:\JARVIS\hud\` — 10 overlay subprocesses driven by `hud_state.json`
 - `C:\JARVIS\upgrade_jarvis.py` — voice-triggered Claude Code pipeline
 - `C:\JARVIS\overnight_upgrade.py` — idle-watch autonomous improvement loop
 - `C:\JARVIS\iron_man_boot.py` — boot-sequence sting + HUD animation + spoken greeting
