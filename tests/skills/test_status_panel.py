@@ -760,6 +760,22 @@ class StatusShowCardTests(unittest.TestCase):
                                side_effect=ImportError("no hud_card")):
             self.mod._show_card_safe()  # must not raise
 
+    def test_show_card_bootstraps_sys_path_when_root_missing(self):
+        # When _PROJECT_DIR is not on sys.path, _show_card_safe re-inserts it
+        # before importing hud_card (covers the path-bootstrap guard).
+        hud_card = types.ModuleType("hud_card")
+        hud_card.show_card = mock.MagicMock()
+        saved = list(sys.path)
+        try:
+            sys.path[:] = [p for p in sys.path
+                           if os.path.abspath(p) != os.path.abspath(self.mod._PROJECT_DIR)]
+            with mock.patch.dict(sys.modules, {"hud_card": hud_card}):
+                self.mod._show_card_safe()
+            self.assertIn(self.mod._PROJECT_DIR, sys.path)  # re-inserted
+        finally:
+            sys.path[:] = saved
+        hud_card.show_card.assert_called_once_with("status")
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # speech queue + HUD strip publishing.
@@ -860,10 +876,75 @@ class StatusHudPublishTests(unittest.TestCase):
                                      utils={"write_hud_state": writer})
         mod._publish_hud_strip("x")
 
+    def test_publish_nameerror_when_skill_utils_undefined(self):
+        # If the module were loaded WITHOUT skill_utils injected (so referencing
+        # the `skill_utils` global raises NameError), _publish_hud_strip's
+        # `except NameError` branch must treat the writer as absent and no-op.
+        mod, _ = load_skill_isolated("status_panel")
+        saved = mod.skill_utils
+        del mod.skill_utils
+        try:
+            mod._publish_hud_strip("x")  # must not raise (NameError swallowed)
+        finally:
+            mod.skill_utils = saved
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # _hud_publish_loop + register — one iteration / thread spawn.
 # ─────────────────────────────────────────────────────────────────────────
+class StatusImportGuardTests(unittest.TestCase):
+    """Cover the module-load-time guards: the sys.path bootstrap (when the
+    project root is NOT already importable) and the optional-dep fallbacks
+    (pygetwindow absent -> _HAS_GW False). Re-execs the source file with a
+    controlled import + sys.path environment. core.atomic_io is already in
+    sys.modules, so it still resolves without the project root on sys.path."""
+
+    def _reexec(self, *, drop_root, block):
+        import importlib.util as _u
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__)))),
+            "skills", "status_panel.py")
+        # status_panel computes _PROJECT_DIR from its own __file__, so that exact
+        # dir is what its `if _PROJECT_DIR not in sys.path` checks against.
+        proj = os.path.dirname(os.path.dirname(path))
+        real_import = __import__
+
+        def _fake_import(name, *a, **k):
+            if name.split(".")[0] in block:
+                raise ImportError(f"blocked {name}")
+            return real_import(name, *a, **k)
+
+        saved_path = list(sys.path)
+        spec = _u.spec_from_file_location("status_panel_reexec", path)
+        m = _u.module_from_spec(spec)
+        m.skill_utils = {}
+        try:
+            if drop_root:
+                sys.path[:] = [p for p in sys.path
+                               if os.path.abspath(p) != os.path.abspath(proj)]
+            with mock.patch("builtins.__import__", side_effect=_fake_import):
+                spec.loader.exec_module(m)
+        finally:
+            sys.path[:] = saved_path
+        return m
+
+    def test_pygetwindow_absent_sets_flag_false(self):
+        m = self._reexec(drop_root=False, block={"pygetwindow"})
+        self.assertFalse(m._HAS_GW)
+
+    def test_path_bootstrap_inserts_project_root(self):
+        # With the project root removed from sys.path, the module's
+        # `if _PROJECT_DIR not in sys.path: sys.path.insert(...)` guard fires.
+        m = self._reexec(drop_root=True, block=set())
+        self.assertIn(m._PROJECT_DIR, sys.path)
+        # tidy up the entry the re-exec inserted
+        try:
+            sys.path.remove(m._PROJECT_DIR)
+        except ValueError:
+            pass
+
+
 class StatusLoopAndRegisterTests(unittest.TestCase):
     def setUp(self):
         self.mod, self.actions = load_skill_isolated("status_panel")

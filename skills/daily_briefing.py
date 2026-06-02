@@ -137,7 +137,7 @@ def _save_last_fired_date(iso_date: str) -> None:
                 os.replace(tmp, _STATE_FILE)
             except Exception:
                 try: os.unlink(tmp)
-                except Exception: pass
+                except Exception: pass  # pragma: no cover - defensive cleanup-of-cleanup: temp unlink rarely fails
                 raise
         except Exception as e:
             print(f"  [daily] could not persist last-fired date: {e}")
@@ -150,7 +150,7 @@ def _briefing_sources():
     whole scheduler thread on startup."""
     try:
         from . import briefing_sources  # type: ignore
-        return briefing_sources
+        return briefing_sources  # pragma: no cover - reached only when loaded as a package (skills.daily_briefing); the live/test flat loader uses the import-by-name fallback below
     except Exception:
         try:
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

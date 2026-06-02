@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import importlib.util
 import json
 import os
 import sys
@@ -1119,6 +1120,26 @@ def _rmtree(path):
         os.rmdir(path)
     except OSError:
         pass
+
+
+class MorningArrivalV2ImportGuardTests(unittest.TestCase):
+    def test_path_bootstrap_inserts_project_root(self):
+        # Re-exec the source with the project root removed from sys.path so the
+        # `if _PROJECT_DIR not in sys.path: sys.path.insert(...)` guard runs.
+        mod, _ = load_skill_isolated("morning_arrival_v2")
+        path = mod.__file__
+        proj = os.path.dirname(os.path.dirname(path))
+        spec = importlib.util.spec_from_file_location("ma_v2_reexec", path)
+        m = importlib.util.module_from_spec(spec)
+        m.skill_utils = {}
+        saved = list(sys.path)
+        try:
+            sys.path[:] = [p for p in sys.path
+                           if os.path.abspath(p) != os.path.abspath(proj)]
+            spec.loader.exec_module(m)
+            self.assertIn(m._PROJECT_DIR, sys.path)
+        finally:
+            sys.path[:] = saved
 
 
 if __name__ == "__main__":

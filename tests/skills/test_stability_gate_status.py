@@ -60,6 +60,13 @@ class StabilityGateStatusTests(unittest.TestCase):
         self._write_lines("{not valid json")
         self.assertIsNone(self.mod._read_last_record())
 
+    def test_read_last_record_all_blank_lines_is_none(self):
+        # The file exists but holds only whitespace -> last_line stays "" and
+        # the `if not last_line: return None` guard fires (no json.loads).
+        with open(self.log_path, "w", encoding="utf-8") as f:
+            f.write("\n   \n\t\n")
+        self.assertIsNone(self.mod._read_last_record())
+
     # ── _friendly_age ────────────────────────────────────────────────────
     def test_friendly_age_just_now(self):
         now = time.time()
@@ -78,6 +85,13 @@ class StabilityGateStatusTests(unittest.TestCase):
         iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now))
         with mock.patch.object(self.mod.time, "time", return_value=now + 3 * 3600):
             self.assertIn("3 hour", self.mod._friendly_age(iso))
+
+    def test_friendly_age_days(self):
+        now = time.time()
+        iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now))
+        with mock.patch.object(self.mod.time, "time",
+                               return_value=now + 3 * 86400):
+            self.assertIn("3 day", self.mod._friendly_age(iso))
 
     def test_friendly_age_unparseable_returns_input(self):
         self.assertEqual(self.mod._friendly_age("not-a-timestamp"),

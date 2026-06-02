@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import time
 import unittest
+from unittest import mock
 
 from core import voice_mood_selector as vms
 
@@ -99,6 +100,13 @@ class WorkHoursHelperTests(unittest.TestCase):
         self.assertFalse(vms._is_work_hours(_epoch_at(18)))   # exclusive end
         self.assertFalse(vms._is_work_hours(_epoch_at(7)))
         self.assertFalse(vms._is_work_hours(_epoch_at(23)))
+
+    def test_localtime_failure_is_not_work_hours(self):
+        # A bad clock value (localtime raises, e.g. OverflowError on an
+        # out-of-range epoch) degrades to "not work hours" rather than raising.
+        with mock.patch.object(vms.time, "localtime",
+                               side_effect=OverflowError("bad ts")):
+            self.assertFalse(vms._is_work_hours(1.0))
 
     def test_returned_moods_are_all_valid(self):
         # Whatever select_mood emits is always a member of VALID_MOODS.

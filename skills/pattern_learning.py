@@ -52,7 +52,6 @@ import json
 import os
 import sqlite3
 import statistics
-import sys
 import tempfile
 import threading
 import time
@@ -815,8 +814,8 @@ def _cluster_offer(dow: int, hour_start: int, action: str,
         if common_arg:
             return (f"Sir, your usual {_titlecase(common_arg)} listening "
                     f"window is upon us. Shall I queue it?")
-        return (f"Sir, this is normally when you settle into music. "
-                f"Shall I queue your usual playlist?")
+        return ("Sir, this is normally when you settle into music. "
+                "Shall I queue your usual playlist?")
     if action == "check_teams":
         return (f"Sir, you typically check Teams around {band} on {day}s — "
                 f"shall I take a look?")
@@ -825,8 +824,8 @@ def _cluster_offer(dow: int, hour_start: int, action: str,
     if action == "evening_briefing":
         return f"Sir, your usual {day} evening briefing — shall I deliver it?"
     verb = _verb_for(action)
-    return (f"Sir, it's {day} around {band} — you usually {verb.replace(' ', ' ', 1)}. "
-            f"Shall I proceed?")
+    return (f"Sir, it's {day} around {band} — you usually {verb}. "
+            "Shall I proceed?")
 
 
 def compute_weekly_digest(now: float | None = None) -> dict:

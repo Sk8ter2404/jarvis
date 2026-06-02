@@ -669,6 +669,52 @@ class BlueGreenLoopTickTests(SectionSevenBase):
         self.assertFalse(self.bc._blue_green_loop_tick())
         self._speak.assert_not_called()
 
+    def test_handoff_signal_consume_exception_swallowed(self):
+        # 13383-13384: consume_handoff_signal() raises -> _signal=None, so no
+        # announce / snapshot, and the tick completes without exiting.
+        self._p(self.bc, "BLUE_GREEN_ROLE", "prod")
+        self.bgm.consume_handoff_signal.side_effect = RuntimeError("fs gone")
+        out = self.bc._blue_green_loop_tick()
+        self.assertFalse(out)
+        self._speak.assert_not_called()
+        self.bgm.write_handoff_state.assert_not_called()
+
+    def test_upgrade_aborted_consume_exception_swallowed(self):
+        # 13425-13426: consume_upgrade_aborted_signal() raises -> _abort=None,
+        # no abort announcement.
+        self._p(self.bc, "BLUE_GREEN_ROLE", "prod")
+        self.bgm.consume_upgrade_aborted_signal.side_effect = RuntimeError("io")
+        out = self.bc._blue_green_loop_tick()
+        self.assertFalse(out)
+        self._speak.assert_not_called()
+
+    def test_handoff_failure_consume_exception_swallowed(self):
+        # 13435-13436: consume_handoff_failure_signal() raises -> _fail=None,
+        # the pending-exit timer is NOT cleared by a failure that never parsed.
+        self._p(self.bc, "BLUE_GREEN_ROLE", "prod")
+        seen = [self.bc.time.time() - 11.0]
+        self._p(self.bc, "_bg_handoff_seen_at", seen)
+        self.bgm.consume_handoff_failure_signal.side_effect = RuntimeError("io")
+        # Pending-exit timer survived (not zeroed) -> the window-elapsed check
+        # still fires and the tick reports exit.
+        out = self.bc._blue_green_loop_tick()
+        self.assertTrue(out)
+        self.assertNotEqual(seen[0], 0.0)
+
+    def test_handoff_failure_announce_exception_swallowed(self):
+        # 13443-13444: a handoff-failure signal IS present, but the spoken
+        # announcement raises -> the except logs and the tick still cancels the
+        # pending exit (seen-timer zeroed) and does not raise.
+        self._p(self.bc, "BLUE_GREEN_ROLE", "prod")
+        seen = [self.bc.time.time() - 11.0]
+        self._p(self.bc, "_bg_handoff_seen_at", seen)
+        self.bgm.consume_handoff_failure_signal.return_value = {"err": "boom"}
+        self._speak.side_effect = RuntimeError("tts dead")
+        out = self.bc._blue_green_loop_tick()
+        self.assertFalse(out)          # failure zeroes the pending-exit timer
+        self.assertEqual(seen[0], 0.0)
+        self._speak.assert_called()
+
 
 class ConsumeBlueGreenHandoffTests(SectionSevenBase):
     def setUp(self):
@@ -835,6 +881,55 @@ class DrainInjectedCommandTests(SectionSevenBase):
         self._write([])
         self._p(self.bc.os, "remove", side_effect=OSError("locked"))
         self.assertIsNone(self.bc._drain_injected_command())
+
+    def test_blank_file_remove_failure_swallowed(self):
+        # 12920-12921: a whitespace-only snapshot whose os.remove ALSO fails ->
+        # the failure is swallowed and the drain still returns None.
+        with open(self._path, "w", encoding="utf-8") as f:
+            f.write("   ")
+        self._p(self.bc.os, "remove", side_effect=OSError("locked"))
+        self.assertIsNone(self.bc._drain_injected_command())
+
+    def test_read_failure_remove_failure_swallowed(self):
+        # 12914-12917: the rename succeeds but reopening the .consuming snapshot
+        # raises (read fail) AND the subsequent os.remove ALSO raises -> both
+        # swallowed, drain returns None.
+        self._write(["whatever"])
+        real_open = open
+
+        def _flaky_open(p, *a, **k):
+            if str(p).endswith(".consuming"):
+                raise OSError("snapshot vanished")
+            return real_open(p, *a, **k)
+        self._p(self.bc.os, "remove", side_effect=OSError("locked"))
+        with mock.patch("builtins.open", _flaky_open):
+            self.assertIsNone(self.bc._drain_injected_command())
+
+    def test_requeue_fdopen_failure_closes_fd(self):
+        # 12953-12955: the tail-requeue mkstemp succeeds but os.fdopen raises
+        # (fd still owned by us) -> the cleanup os.close(fd) runs (real close so
+        # the descriptor/temp file are released) and the head is still returned
+        # (tail dropped, not re-fired).
+        self._write(["head", "tail"])
+        self._p(self.bc.os, "fdopen", side_effect=OSError("fdopen denied"))
+        self.assertEqual(self.bc._drain_injected_command(), "head")
+
+    def test_requeue_replace_failure_unlinks_tmp(self):
+        # 12957-12958: the requeue write succeeds but os.replace of the temp
+        # over INJECTED_COMMANDS_PATH raises (tmp still present) -> the cleanup
+        # os.unlink(tmp) runs (real unlink so the temp is removed) and the head
+        # is still returned.
+        self._write(["head", "tail"])
+        real_replace = self.bc.os.replace
+
+        def _flaky_replace(src, dst, *a, **k):
+            # The FIRST replace (claim of the queue -> .consuming) must succeed;
+            # only the tail-requeue replace (tmp -> INJECTED_COMMANDS_PATH) fails.
+            if str(dst).endswith(".consuming"):
+                return real_replace(src, dst, *a, **k)
+            raise OSError("replace denied")
+        self._p(self.bc.os, "replace", side_effect=_flaky_replace)
+        self.assertEqual(self.bc._drain_injected_command(), "head")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1415,6 +1510,21 @@ class SafeCloseStreamTests(SectionSevenBase):
         finally:
             gate.set()   # release the blocked daemon thread
 
+    def test_close_hang_sd_stop_exception_swallowed(self):
+        import threading as _t
+        # 4507-4510: close hangs past the timeout AND the forced sd.stop() also
+        # raises -> the except swallows it; the helper still returns promptly.
+        gate = _t.Event()
+        stream = mock.MagicMock()
+        stream.close.side_effect = lambda: gate.wait(5.0)
+        sd_stop = self._p(self.bc.sd, "stop")
+        sd_stop.side_effect = RuntimeError("sd.stop boom")
+        try:
+            self.bc._safe_close_stream(stream, timeout_sec=0.1)   # must not raise
+            sd_stop.assert_called_once()
+        finally:
+            gate.set()
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Singleton low-level helpers (_read_lock_pid / _acquire_os_singleton_lock)
@@ -1532,6 +1642,22 @@ class ReleaseSingletonPosixTests(SectionSevenBase):
         with mock.patch.dict(self.bc.sys.modules, {"fcntl": fake_fcntl},
                              clear=False):
             self.bc._release_singleton()
+        fake_fcntl.lockf.assert_called_once()
+        self.assertIsNone(self.bc._SINGLETON_HELD_FD)
+
+    def test_posix_unlock_oserror_swallowed(self):
+        # 12263-12264: on the POSIX branch fcntl.lockf raises OSError -> the
+        # except swallows it and the fd is still cleared/closed in the finally.
+        fd, path = tempfile.mkstemp()
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        self._p(self.bc, "_SINGLETON_HELD_FD", fd)
+        self._p(self.bc.sys, "platform", "linux")
+        fake_fcntl = types.ModuleType("fcntl")
+        fake_fcntl.LOCK_UN = 8
+        fake_fcntl.lockf = mock.MagicMock(side_effect=OSError("not locked"))
+        with mock.patch.dict(self.bc.sys.modules, {"fcntl": fake_fcntl},
+                             clear=False):
+            self.bc._release_singleton()   # must not raise
         fake_fcntl.lockf.assert_called_once()
         self.assertIsNone(self.bc._SINGLETON_HELD_FD)
 

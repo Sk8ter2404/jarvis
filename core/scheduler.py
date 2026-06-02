@@ -899,7 +899,7 @@ def parse_every(token: str) -> dict | None:
         return {"minutes": n}
     if unit.startswith(("hr", "hour")):
         return {"hours": n}
-    return None
+    return None  # pragma: no cover - unreachable: the regex above only admits sec/min/hr/hour units, all handled above
 
 
 def parse_when(token: str) -> datetime | None:

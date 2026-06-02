@@ -436,6 +436,16 @@ class AtomicWriteJsonTests(_MsGraphBase):
         after = set(os.listdir(self._tmp))
         self.assertEqual(before, after)
 
+    def test_cleanup_unlink_failure_is_swallowed_original_raised(self):
+        # The write fails (serialise error) AND the temp-file cleanup unlink
+        # ALSO fails -> the inner `except Exception: pass` swallows the unlink
+        # error and the ORIGINAL exception still propagates.
+        path = os.path.join(self._tmp, "out.json")
+        with mock.patch.object(self.mod.os, "unlink",
+                               side_effect=OSError("temp locked")):
+            with self.assertRaises(TypeError):  # the original serialise error
+                self.mod._atomic_write_json(path, {"bad": object()})
+
 
 # ─── DPAPI encrypt/decrypt ───────────────────────────────────────────────
 

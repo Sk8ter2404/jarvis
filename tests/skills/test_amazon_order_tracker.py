@@ -33,9 +33,11 @@ from __future__ import annotations
 
 import contextlib
 import io
+import importlib.util
 import json
 import logging
 import os
+import sys
 import tempfile
 import time
 import types
@@ -1167,6 +1169,26 @@ class RegisterTests(AmazonTestBase):
              mock.patch.object(self.mod, "start_monitor") as start:
             self.mod.register({})
         start.assert_called_once()
+
+
+class AmazonImportGuardTests(unittest.TestCase):
+    def test_path_bootstrap_inserts_project_root(self):
+        # Re-exec the source with the project root removed from sys.path so the
+        # `if _PROJECT_DIR not in sys.path: sys.path.insert(...)` guard runs.
+        mod, _ = load_skill_isolated("amazon_order_tracker")
+        path = mod.__file__
+        proj = os.path.dirname(os.path.dirname(path))
+        spec = importlib.util.spec_from_file_location("amazon_reexec", path)
+        m = importlib.util.module_from_spec(spec)
+        m.skill_utils = {}
+        saved = list(sys.path)
+        try:
+            sys.path[:] = [p for p in sys.path
+                           if os.path.abspath(p) != os.path.abspath(proj)]
+            spec.loader.exec_module(m)
+            self.assertIn(m._PROJECT_DIR, sys.path)
+        finally:
+            sys.path[:] = saved
 
 
 if __name__ == "__main__":

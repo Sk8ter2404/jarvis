@@ -505,7 +505,7 @@ def get_first_meeting_data(when: str = "today") -> dict | None:
 
 # ─── manual smoke test ───────────────────────────────────────────────────
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - manual smoke entry; run by hand, not under unittest
     print("weather:", json.dumps(get_weather_data(), default=str, indent=2))
     print("meeting (today):", json.dumps(get_first_meeting_data("today"), default=str, indent=2))
     print("meeting (tomorrow):", json.dumps(get_first_meeting_data("tomorrow"), default=str, indent=2))

@@ -71,7 +71,7 @@ import time
 try:
     import psutil
     _HAS_PSUTIL = True
-except ImportError:
+except ImportError:  # pragma: no cover - psutil is a guaranteed dep (dev + CI); import never fails
     _HAS_PSUTIL = False
 
 try:
@@ -85,7 +85,17 @@ try:
     )
     _HAS_PYQT6 = True
 except ImportError:
+    # PyQt6 absent. This module is a Qt subprocess that can't render anything
+    # without it, but import must still SUCCEED so main() can print a friendly
+    # install hint and exit 2 — the launcher treats a fast-exiting subprocess
+    # as "not engaged", so no other JARVIS surface breaks. The palette globals
+    # below already fall back to None; the two renderer classes subclass
+    # QGraphicsScene / QWidget at module scope, so give just those two names a
+    # harmless stub base. Every other Qt symbol is referenced only inside
+    # method bodies, which never run when _HAS_PYQT6 is False.
     _HAS_PYQT6 = False
+    QGraphicsScene = object
+    QWidget = object
 
 
 TICK_MS = 500  # spec — 500 ms refresh cadence
@@ -813,5 +823,5 @@ def main() -> int:
     return app.exec()
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - GUI entry point; launched as a subprocess, not under unittest
     sys.exit(main())

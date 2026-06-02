@@ -412,6 +412,51 @@ class ModuleImportTests(_HudBase):
         self.assertEqual(self.hud.CALENDAR_REFRESH_TICKS, 240)
         self.assertEqual(self.hud.GPU_CACHE_SECONDS, 4.0)
 
+    def test_pyqt6_absent_degrades_gracefully(self):
+        # Re-exec the source with PyQt6 import blocked (and any cached PyQt6
+        # submodules hidden) so the `except ImportError` guard runs. The
+        # module MUST import cleanly: hud_v2 is a Qt subprocess that can't
+        # render without PyQt6, but importing it has to succeed so main() can
+        # print an install hint and exit 2 — the launcher treats a
+        # fast-exiting subprocess as "not engaged" rather than crashing on an
+        # import-time traceback. The guard stubs the QGraphicsScene / QWidget
+        # base classes and the palette globals fall back to None.
+        real_import = __import__
+
+        def _imp(name, *a, **k):
+            if name.split(".")[0] == "PyQt6":
+                raise ImportError("blocked PyQt6")
+            return real_import(name, *a, **k)
+
+        hidden = {n: sys.modules.pop(n)
+                  for n in list(sys.modules) if n.split(".")[0] == "PyQt6"}
+        mod_name = f"_hud_v2_noqt_{id(self)}"
+        spec = importlib.util.spec_from_file_location(mod_name, _HUD_V2_PATH)
+        m = importlib.util.module_from_spec(spec)
+        sys.modules[mod_name] = m
+        self.addCleanup(lambda: sys.modules.pop(mod_name, None))
+        try:
+            with mock.patch("builtins.__import__", side_effect=_imp):
+                spec.loader.exec_module(m)        # must NOT raise
+        finally:
+            sys.modules.update(hidden)
+
+        # The ImportError guard ran: flag False, palette degraded to None.
+        self.assertFalse(m._HAS_PYQT6)
+        self.assertIsNone(m.CYAN)
+        self.assertIsNone(m.PANEL_DARK)
+        # The renderer classes are still defined (on stub bases) so the module
+        # object is whole — referencing them must not raise NameError.
+        self.assertIs(m.StarkStatusRingScene.__bases__[0], object)
+        self.assertIs(m.StarkStatusRingWindow.__bases__[0], object)
+        # End-to-end: main() takes the graceful-degrade path — prints the
+        # install hint and returns 2 without constructing a QApplication.
+        with mock.patch.object(m.sys, "argv", ["hud_v2.py"]), \
+                mock.patch.object(m, "_print_install_hint") as hint:
+            rc = m.main()
+        self.assertEqual(rc, 2)
+        hint.assert_called_once()
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  _is_parent_alive
@@ -907,6 +952,17 @@ class GpuTempTests(_HudBase):
                 mock.patch.object(self.hud.shutil, "which", return_value=None):
             s._read_gpu_temp()
         self.assertEqual(s._gpu_cached_at, 30_000.0)
+
+    def test_malformed_strip_decimal_swallowed_returns_none(self):
+        # A pulse_strip whose GPU value collects multiple dots ("4.8.5") makes
+        # float() raise inside the parse -> the inner `except Exception: pass`
+        # swallows it and the function returns None.
+        s = self._new_scene()
+        s._gpu_cached_at = 0.0
+        self._write(self.hud_state, {"pulse_strip": "GPU 4.8.5C"})
+        with mock.patch.object(self.hud.time, "time", return_value=26_000.0), \
+                mock.patch.object(self.hud.shutil, "which", return_value=None):
+            self.assertIsNone(s._read_gpu_temp())
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -2,6 +2,8 @@
 private _client() factory with a fake so these run with no network and no
 `anthropic` install: they pin the param-shaping, text extraction, streaming
 accumulation, and the on_delta-must-not-abort contract."""
+import sys
+import types
 import unittest
 from unittest import mock
 
@@ -114,6 +116,43 @@ class FirstTextTests(unittest.TestCase):
             content = [ToolBlock(), _FakeBlock("real text")]
 
         self.assertEqual(llm._first_text(Msg()), "real text")
+
+    def test_falls_back_to_historical_access_when_no_str_text(self):
+        # No block exposes a *str* `.text` (here `.text` is None on every block),
+        # so the loop finds nothing and the function falls back to the historical
+        # `msg.content[0].text` access rather than silently returning "".
+        sentinel = object()
+
+        class Blk:
+            text = None        # non-str → loop skips it
+
+        class Msg:
+            # content[0].text is the historical fallback value.
+            content = [Blk()]
+
+        Msg.content[0].text = sentinel
+        # With text re-set to a sentinel object (still non-str) the loop skips
+        # it, and the fallback returns content[0].text verbatim.
+        self.assertIs(llm._first_text(Msg()), sentinel)
+
+
+class ClientFactoryTests(unittest.TestCase):
+    def test_client_lazy_imports_and_constructs(self):
+        # Inject a fake `anthropic` module so _client() imports + constructs it
+        # without needing the real SDK or an API key. Asserts the timeout is
+        # forwarded to the Anthropic() constructor. Restores sys.modules after.
+        captured = {}
+
+        class FakeAnthropic:
+            def __init__(self, timeout=None):
+                captured["timeout"] = timeout
+
+        fake_mod = types.ModuleType("anthropic")
+        fake_mod.Anthropic = FakeAnthropic
+        with mock.patch.dict(sys.modules, {"anthropic": fake_mod}):
+            client = llm._client(12.5)
+        self.assertIsInstance(client, FakeAnthropic)
+        self.assertEqual(captured["timeout"], 12.5)
 
 
 if __name__ == "__main__":

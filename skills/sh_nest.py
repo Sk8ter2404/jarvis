@@ -110,7 +110,7 @@ def _start_loop_thread() -> asyncio.AbstractEventLoop:
         finally:
             try:
                 new_loop.close()
-            except Exception:
+            except Exception:  # pragma: no cover - defensive: loop.close() in the daemon thread's finally only runs at interpreter teardown
                 pass
 
     t = threading.Thread(target=_run, name="sh-nest-asyncio", daemon=True)

@@ -575,7 +575,7 @@ class AudioProcessor:
         # Drop the DC bin so a slow drift doesn't bias the metric tonal.
         if mag.size > 1:
             mag = mag[1:]
-        if mag.size == 0:
+        if mag.size == 0:  # pragma: no cover - unreachable: the [1:] slice only runs when size>1, which always leaves >=1 bin; a 1-bin spectrum skips the slice entirely
             return 0.0
         mag = mag + 1e-10
         arith = float(np.mean(mag))
@@ -606,7 +606,7 @@ class AudioProcessor:
                 )
             tracked = self._agc_running_rms
         if tracked < 1e-6:
-            return audio
+            return audio  # pragma: no cover - unreachable defensive guard: tracked is an EMA of values each >=1e-6 (input rms passed the 1e-6 gate above; seeded running_rms is set to that rms), so the smoothed value can't fall below 1e-6
         gain = self.agc_target_rms / tracked
         max_g = float(self.agc_max_gain)
         if max_g > 0:
@@ -799,7 +799,7 @@ def seconds_since_audible_chunk() -> float:
 # Self-test
 # ──────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - manual smoke test, never run under unittest/import
     print("AudioProcessor smoke test")
     proc = get_processor(16000)
     print(f"  status: {proc.status()}")

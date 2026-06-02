@@ -375,6 +375,18 @@ class ConfigAndIOTests(unittest.TestCase):
         leftovers = [f for f in os.listdir(tmp) if f.endswith(".tmp")]
         self.assertEqual(leftovers, [])
 
+    def test_atomic_write_cleanup_unlink_failure_swallowed(self):
+        # Write fails (serialise error) AND the temp-file cleanup unlink ALSO
+        # fails -> the inner `except Exception: pass` swallows the cleanup error
+        # and the ORIGINAL exception still propagates.
+        tmp = tempfile.mkdtemp(prefix="briefsrc_io_")
+        self.addCleanup(lambda: _rmtree(tmp))
+        path = os.path.join(tmp, "x.json")
+        with mock.patch.object(self.mod.os, "unlink",
+                               side_effect=OSError("temp locked")):
+            with self.assertRaises(TypeError):
+                self.mod._atomic_write_json(path, {"bad": object()})
+
     def test_safe_load_json_missing_file_is_none(self):
         self.assertIsNone(self.mod._safe_load_json(
             os.path.join(tempfile.gettempdir(), "definitely_not_here_briefsrc.json")))

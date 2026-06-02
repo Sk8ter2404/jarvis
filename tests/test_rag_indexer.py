@@ -28,6 +28,27 @@ import urllib.error
 from unittest import mock
 
 
+class _LockSetsGlobal:
+    """A context-manager stand-in for one of the module's init locks that
+    populates a module global on __enter__. Used to exercise the second read of
+    each double-checked-lock singleton getter: the outer check sees None, then
+    holding the (fake) lock the global is already set — emulating another thread
+    that won the init race — so the inner re-check returns it without rebuilding.
+    """
+
+    def __init__(self, attr, value):
+        self._attr = attr
+        self._value = value
+
+    def __enter__(self):
+        import core.rag_indexer as _rag
+        setattr(_rag, self._attr, self._value)
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 # ───────────────────────── fake optional deps ──────────────────────────
 # These are installed into sys.modules before the target module is imported
 # so its lazy `import chromadb` / `import numpy` / ... resolve to our fakes.
@@ -724,6 +745,16 @@ class GetEmbedderTests(_RagBase):
         rag._embed_model = sentinel
         self.assertIs(rag._get_embedder(), sentinel)
 
+    def test_double_checked_lock_returns_racer_value(self):
+        # Simulate another thread winning the init race: the outer check sees
+        # None, but by the time we hold the lock the global is populated, so the
+        # inner re-check returns that value without building a second embedder.
+        sentinel = object()
+        self.assertIsNone(rag._embed_model)
+        with mock.patch.object(rag, "_embedder_init_lock",
+                               _LockSetsGlobal("_embed_model", sentinel)):
+            self.assertIs(rag._get_embedder(), sentinel)
+
 
 class GetRerankerTests(_RagBase):
     def test_disabled_when_model_blank(self):
@@ -734,6 +765,18 @@ class GetRerankerTests(_RagBase):
         sentinel = object()
         rag._reranker = sentinel
         self.assertIs(rag._get_reranker(), sentinel)
+
+    def test_double_checked_lock_returns_racer_value(self):
+        # Model configured (so the outer guard doesn't short-circuit on a blank
+        # name) and _reranker None at the outer check, but populated by the time
+        # we hold the lock → the inner re-check returns it without loading a
+        # CrossEncoder.
+        rag.RAG_RERANKER_MODEL = "some/model"
+        sentinel = object()
+        self.assertIsNone(rag._reranker)
+        with mock.patch.object(rag, "_reranker_init_lock",
+                               _LockSetsGlobal("_reranker", sentinel)):
+            self.assertIs(rag._get_reranker(), sentinel)
 
     def test_missing_sentence_transformers_returns_none(self):
         rag.RAG_RERANKER_MODEL = "some/model"
@@ -799,6 +842,16 @@ class GetCollectionTests(_RagBase):
         sentinel = object()
         rag._collection = sentinel
         self.assertIs(rag._get_collection(), sentinel)
+
+    def test_double_checked_lock_returns_racer_value(self):
+        # _collection None at the outer check but set by the time the lock is
+        # held → the inner re-check returns it without importing chromadb or
+        # touching disk (the race-loser fast path).
+        sentinel = object()
+        self.assertIsNone(rag._collection)
+        with mock.patch.object(rag, "_collection_init_lock",
+                               _LockSetsGlobal("_collection", sentinel)):
+            self.assertIs(rag._get_collection(), sentinel)
 
     def test_creates_with_metadata_and_stamps_when_unstamped(self):
         # Fresh collection comes back with no embed_model → it gets stamped.

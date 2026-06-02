@@ -759,7 +759,7 @@ def authenticate_device_flow() -> bool:
 
 # ─── manual smoke test / CLI ─────────────────────────────────────────────
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - CLI smoke/auth entry; run by hand, not under unittest
     if "--auth" in sys.argv:
         ok = authenticate_device_flow()
         sys.exit(0 if ok else 1)

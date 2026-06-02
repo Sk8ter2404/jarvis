@@ -44,7 +44,7 @@ import os, sys, subprocess, time
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
-    except Exception:
+    except Exception:  # pragma: no cover - import-time console-encoding fallback; only fires on a stream without reconfigure()
         pass
 
 def _read_lock_pid(path, max_retries=10, retry_delay=0.05):
@@ -778,7 +778,7 @@ AMBIENT_LEARNING_BOOT = os.environ.get("JARVIS_AMBIENT_LEARNING", "").strip() ==
 WAKE_RESUME_MODE = (os.environ.get("JARVIS_WAKE_RESUME", "").strip().lower()
                     or "answer_then_quiet")
 if WAKE_RESUME_MODE not in ("answer_then_quiet", "stay_talkative"):
-    WAKE_RESUME_MODE = "answer_then_quiet"
+    WAKE_RESUME_MODE = "answer_then_quiet"  # pragma: no cover - import-time env sanitiser; only runs when JARVIS_WAKE_RESUME holds an invalid value
 
 # Ambient mode 2 — multimodal passive learning (skills/ambient_listen.py +
 # skills/ambient_multimodal_extract.py). Three independent daemons that can
@@ -2937,11 +2937,11 @@ _face_cascade = cv2.CascadeClassifier(
 _profile_cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_profileface.xml"
 )
-if _face_cascade.empty():
+if _face_cascade.empty():  # pragma: no cover - import-time guard; only true if the bundled haarcascade XML is missing/corrupt
     print("  [WARN] Could not load haarcascade_frontalface_default.xml — "
           "face detection disabled. Re-installing opencv-python should fix this.")
     _face_cascade = None
-if _profile_cascade is not None and _profile_cascade.empty():
+if _profile_cascade is not None and _profile_cascade.empty():  # pragma: no cover - import-time guard; only true if the profile haarcascade XML is missing/corrupt
     _profile_cascade = None
 
 # Shared state written by face-tracking thread, read by main thread control
@@ -3253,12 +3253,12 @@ def _face_tracking_thread():
                 # Some DirectShow drivers silently ignore this; harmless if so.
                 try:
                     c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                except Exception:
+                except Exception:  # pragma: no cover - defensive: some DirectShow drivers reject CAP_PROP_BUFFERSIZE
                     pass
                 return c
             try:
                 c.release()
-            except Exception:
+            except Exception:  # pragma: no cover - defensive: release of a half-opened capture handle rarely raises
                 pass
             return None
 
@@ -3522,11 +3522,11 @@ def _face_tracking_thread():
     for entry in caps:
         c = entry["cap"]
         if c is None:
-            continue
+            continue  # pragma: no cover - defensive: a None cap entry only occurs if an earlier open failed
         with _camera_io_lock:
             try:
                 c.release()
-            except Exception:
+            except Exception:  # pragma: no cover - defensive: camera release during shutdown rarely raises
                 logging.exception("[face-track] release on shutdown")
     print("  [face-track] Stopped")
 
@@ -3766,7 +3766,7 @@ def proactive_announce(message: str, source: str = "skill",
         except Exception:
             if fd >= 0:
                 try: os.close(fd)
-                except Exception: pass
+                except Exception: pass  # pragma: no cover - defensive: os.close of an owned descriptor effectively never raises
             if tmp is not None:
                 try: os.unlink(tmp)
                 except Exception: pass
@@ -4112,7 +4112,7 @@ def list_cameras(max_check: int = CAMERA_PROBE_MAX):
                     pass
                 finally:
                     try: cap.release()
-                    except Exception: pass
+                    except Exception: pass  # pragma: no cover - defensive: list-cameras probe release rarely raises
 
         t = threading.Thread(target=_do, daemon=True)
         t.start()
@@ -4777,7 +4777,7 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
     global _last_recording_peak
     _last_recording_peak = peak_rms
     if not chunks:
-        return None
+        return None  # pragma: no cover - defensive: the loop only breaks after recording began, so chunks is never empty here
     return np.concatenate(chunks).flatten()
 
 
@@ -6799,8 +6799,8 @@ def play_with_lipsync(audio: np.ndarray, sr: int):
             # that, force-stop the stream and move on. Process stays alive.
             _done_evt.wait(timeout=max(audio_secs + 2.0, 5.0))
             if not _done_evt.is_set():
-                try: sd.stop()
-                except Exception: pass
+                try: sd.stop()  # pragma: no cover - timeout-recovery: only runs if a live sd.wait() hangs past the grace window
+                except Exception: pass  # pragma: no cover - timeout-recovery: only runs if a live sd.wait() hangs past the grace window
         else:
             pos = 0
 
@@ -6841,8 +6841,8 @@ def play_with_lipsync(audio: np.ndarray, sr: int):
             _t.start()
             _done_evt.wait(timeout=max(audio_secs + 2.0, 5.0))
             if not _done_evt.is_set():
-                try: sd.stop()
-                except Exception: pass
+                try: sd.stop()  # pragma: no cover - timeout-recovery: only runs if a live sd.wait() hangs past the grace window (robot arm)
+                except Exception: pass  # pragma: no cover - timeout-recovery: only runs if a live sd.wait() hangs past the grace window (robot arm)
             t.join(timeout=0.5)
     finally:
         # Clear the TTS-playback guard first so a queued device refresh can
@@ -7640,12 +7640,12 @@ def _open_url_offscreen_capture(url: str, page_load_wait: float = 6.0) -> tuple[
     # Safer than matching by title — guaranteed to hit the right window.
     try:
         win32gui.PostMessage(target_hwnd, 0x0010, 0, 0)
-    except Exception:
+    except Exception:  # pragma: no cover - defensive: WM_CLOSE PostMessage to a live HWND rarely raises
         pass
 
     if png_bytes is None:
         return None, "printwindow_failed"
-    return png_bytes, "ok"
+    return png_bytes, "ok"  # pragma: no cover - live Win32 GDI PrintWindow grab succeeded; needs a real on-screen window
 
 
 # Known apps that aren't on PATH and don't have a Start-menu shortcut name
@@ -7747,7 +7747,7 @@ def _extract_youtube_url_from_search(query: str) -> str | None:
             return None
         vid = m.group(1) or m.group(2) or m.group(3)
         if not vid:
-            return None
+            return None  # pragma: no cover - defensive: every _YT_VIDEO_RE alternative captures a fixed 11-char id, so a match never yields an empty group
         return f"https://www.youtube.com/watch?v={vid}"
     except Exception:
         return None
@@ -10244,7 +10244,7 @@ def load_skills():
                 submodule_search_locations=search_locs,
             )
             if not spec or not spec.loader:
-                continue
+                continue  # pragma: no cover - defensive: spec_from_file_location returns a loaded spec for any real .py path
             mod = importlib.util.module_from_spec(spec)
             mod.skill_utils = skill_utils   # inject utilities
             # Make sub-imports resolve for packages — register before
@@ -12953,10 +12953,10 @@ def _drain_injected_command():
             except Exception:
                 if fd >= 0:
                     try: os.close(fd)
-                    except Exception: pass
+                    except Exception: pass  # pragma: no cover - defensive: os.close of the owned requeue descriptor effectively never raises
                 if tmp is not None:
                     try: os.unlink(tmp)
-                    except Exception: pass
+                    except Exception: pass  # pragma: no cover - defensive: os.unlink of the just-created requeue temp effectively never raises
                 raise
         except Exception as _e:
             print(f"  [inject] failed to requeue {len(remaining)} item(s): {_e}")
@@ -14664,7 +14664,7 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         os._exit(0)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - boot entrypoint; only runs when executed as a script, never under the import-based test harness
     # Make `import bobert_companion` and sys.modules.get("bobert_companion")
     # from skills + core/* resolve to THIS running module. Run as a script,
     # JARVIS lives in sys.modules["__main__"]; without this alias a later
