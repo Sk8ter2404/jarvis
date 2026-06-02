@@ -2255,5 +2255,1936 @@ class CallLlmMoreBranchesTests(MonolithGlobalsTestCase):
         self.assertIn("monthly", lf.call_args[0][1].lower())
 
 
+# ===========================================================================
+# THIRD BATCH — coverage-extension pass over the audio/STT/LLM/TTS spine.
+# Targets the Missing line ranges that the first two batches left in
+# 4443-6881: the per-turn classifier side-trips in _call_llm, the ollama
+# backend + phrase-rotation tails, _call_local_llm / _call_local_vision
+# failure branches, the openai-whisper + CUDA-recovery paths in transcribe,
+# the _register_cuda_dll_dirs error arms, synthesise's xtts/pyttsx3 gain +
+# wry-split-failure paths, _pyttsx3_tts's temp-file render, the _AudioDucker
+# worker/restore/duck machinery, get_mic_buffer's tap paths, and the
+# barge-in + robot arms of play_with_lipsync. Every hardware/network/thread
+# boundary is mocked; the noted genuinely-unrunnable capture/worker LOOPS
+# (record_speech VAD stream, _amp_pump/_sync/_barge_watch live bodies) are
+# driven only where _ImmediateThread lets their closure run once
+# deterministically, never as real spinning threads.
+# ===========================================================================
+@requires_monolith
+class CallLlmClassifierSideTripsTests(MonolithGlobalsTestCase):
+    """Drive the per-turn classifier branches in _call_llm that the happy-path
+    suite skips: a non-empty tone print, the voice-mood-response adapter (both
+    success and failure), and the emotion-tracker addendum (label differs /
+    matches / raises)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def setUp(self):
+        self._saved_hist = list(self.bc.conversation_history)
+        self.bc.conversation_history.clear()
+        self._patches = [
+            mock.patch.object(self.bc, "_trim_conversation_history"),
+            mock.patch.object(self.bc, "_system_prompt", "SYS"),
+            mock.patch.object(self.bc, "AI_BACKEND", "claude"),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        self.bc.conversation_history[:] = self._saved_hist
+
+    def _phrases(self):
+        m = mock.Mock()
+        m.detect_phrases_in_reply.return_value = {}
+        return m
+
+    def _client(self):
+        c = mock.Mock()
+        c.complete.return_value = "Indeed, sir."
+        return c
+
+    def test_nondefault_tone_and_mood_and_emotion_addenda(self):
+        # tone non-empty (5880), route mood non-casual (5890), voice-mood
+        # adapter applied (5899-5906), emotion label differs from tone so its
+        # addendum stacks (5917-5926).
+        vm = mock.Mock()
+        vm.apply_voice_mood_response.return_value = " [be brief]"
+        et = mock.Mock()
+        er = mock.Mock()
+        er.label = "focused"
+        er.reason = "imperatives"
+        er.addendum = " [focus mode]"
+        et.classify_emotion.return_value = er
+        captured = {}
+
+        def _complete(**kw):
+            captured["system"] = kw["system"]
+            return "On it, sir."
+        client = mock.Mock()
+        client.complete.side_effect = _complete
+        with mock.patch.object(self.bc, "detect_tone", return_value="rushed"), \
+                mock.patch.object(self.bc, "route_voice_emotion",
+                                  return_value={"mood": "stressed",
+                                                "addendum": " [stress]"}), \
+                mock.patch.object(self.bc, "_voice_mood_response", vm), \
+                mock.patch.object(self.bc, "_emotion_tracker", et), \
+                mock.patch.object(self.bc, "_llm_client", client), \
+                mock.patch.dict(sys.modules, {"anthropic": mock.Mock()}), \
+                mock.patch.object(self.bc, "_mcu_phrases", self._phrases()):
+            reply = self.bc._call_llm("hurry up and fix it")
+        self.assertEqual(reply, "On it, sir.")
+        vm.apply_voice_mood_response.assert_called_once()
+        # both addenda flowed into the per-turn system prompt
+        self.assertIn("[be brief]", captured["system"])
+        self.assertIn("[focus mode]", captured["system"])
+        # cached classifier state was stamped
+        self.assertEqual(self.bc._last_user_tone[0], "rushed")
+        self.assertIs(self.bc._last_emotion[0], er)
+
+    def test_voice_mood_adapter_exception_is_swallowed(self):
+        # 5907-5908: adapter raises → caught, addendum stays "" , call proceeds.
+        vm = mock.Mock()
+        vm.apply_voice_mood_response.side_effect = RuntimeError("vm boom")
+        with mock.patch.object(self.bc, "detect_tone", return_value=None), \
+                mock.patch.object(self.bc, "route_voice_emotion",
+                                  return_value={"mood": "casual", "addendum": ""}), \
+                mock.patch.object(self.bc, "_voice_mood_response", vm), \
+                mock.patch.object(self.bc, "_emotion_tracker", None), \
+                mock.patch.object(self.bc, "_llm_client", self._client()), \
+                mock.patch.dict(sys.modules, {"anthropic": mock.Mock()}), \
+                mock.patch.object(self.bc, "_mcu_phrases", self._phrases()):
+            reply = self.bc._call_llm("hi")
+        self.assertEqual(reply, "Indeed, sir.")
+
+    def test_emotion_tracker_exception_clears_last_emotion(self):
+        # 5927-5929: classifier raises → _last_emotion reset to None.
+        et = mock.Mock()
+        et.classify_emotion.side_effect = ValueError("bad emotion")
+        self.bc._last_emotion[0] = "stale"
+        with mock.patch.object(self.bc, "detect_tone", return_value=None), \
+                mock.patch.object(self.bc, "route_voice_emotion",
+                                  return_value={"mood": "casual", "addendum": ""}), \
+                mock.patch.object(self.bc, "_voice_mood_response", None), \
+                mock.patch.object(self.bc, "_emotion_tracker", et), \
+                mock.patch.object(self.bc, "_llm_client", self._client()), \
+                mock.patch.dict(sys.modules, {"anthropic": mock.Mock()}), \
+                mock.patch.object(self.bc, "_mcu_phrases", self._phrases()):
+            self.bc._call_llm("hi")
+        self.assertIsNone(self.bc._last_emotion[0])
+
+    def test_emotion_label_equals_tone_skips_addendum(self):
+        # 5925 false branch: er.label == tone → emotion_addendum stays "".
+        et = mock.Mock()
+        er = mock.Mock()
+        er.label = "rushed"   # identical to detect_tone's label
+        er.reason = "r"
+        er.addendum = " [DUP]"
+        et.classify_emotion.return_value = er
+        captured = {}
+
+        def _complete(**kw):
+            captured["system"] = kw["system"]
+            return "Mm."
+        client = mock.Mock()
+        client.complete.side_effect = _complete
+        with mock.patch.object(self.bc, "detect_tone", return_value="rushed"), \
+                mock.patch.object(self.bc, "route_voice_emotion",
+                                  return_value={"mood": "casual", "addendum": ""}), \
+                mock.patch.object(self.bc, "_voice_mood_response", None), \
+                mock.patch.object(self.bc, "_emotion_tracker", et), \
+                mock.patch.object(self.bc, "_llm_client", client), \
+                mock.patch.dict(sys.modules, {"anthropic": mock.Mock()}), \
+                mock.patch.object(self.bc, "_mcu_phrases", self._phrases()):
+            self.bc._call_llm("go go go")
+        self.assertNotIn("[DUP]", captured["system"])
+
+    def test_no_llm_client_uses_anthropic_messages_create(self):
+        # 5964-5969: _llm_client is None → direct anthropic.Anthropic path.
+        fake_anthropic = mock.Mock()
+        msg = mock.Mock()
+        msg.content = [mock.Mock(text="Direct path, sir.")]
+        fake_anthropic.Anthropic.return_value.messages.create.return_value = msg
+        with mock.patch.object(self.bc, "detect_tone", return_value=None), \
+                mock.patch.object(self.bc, "route_voice_emotion",
+                                  return_value={"mood": "casual", "addendum": ""}), \
+                mock.patch.object(self.bc, "_voice_mood_response", None), \
+                mock.patch.object(self.bc, "_emotion_tracker", None), \
+                mock.patch.object(self.bc, "_llm_client", None), \
+                mock.patch.dict(sys.modules, {"anthropic": fake_anthropic}), \
+                mock.patch.object(self.bc, "_mcu_phrases", self._phrases()):
+            reply = self.bc._call_llm("hello there")
+        self.assertEqual(reply, "Direct path, sir.")
+        fake_anthropic.Anthropic.return_value.messages.create.assert_called_once()
+
+    def test_unrecognised_4xx_falls_back_local(self):
+        # 5992: generic BadRequestError (not a known phrase) → _local_fallback_or.
+        a = mock.Mock()
+
+        class _BadReq(Exception):
+            pass
+        a.BadRequestError = _BadReq
+        a.RateLimitError = type("RL", (Exception,), {})
+        a.APIStatusError = type("AS", (Exception,), {})
+        client = mock.Mock()
+        client.complete.side_effect = _BadReq("model not found for this account")
+        with mock.patch.object(self.bc, "detect_tone", return_value=None), \
+                mock.patch.object(self.bc, "route_voice_emotion",
+                                  return_value={"mood": "casual", "addendum": ""}), \
+                mock.patch.object(self.bc, "_voice_mood_response", None), \
+                mock.patch.object(self.bc, "_emotion_tracker", None), \
+                mock.patch.object(self.bc, "_llm_client", client), \
+                mock.patch.dict(sys.modules, {"anthropic": a}), \
+                mock.patch.object(self.bc, "_local_fallback_or",
+                                  return_value="LOCAL4xx") as lf, \
+                mock.patch.object(self.bc, "_mcu_phrases", self._phrases()):
+            reply = self.bc._call_llm("hi")
+        self.assertEqual(reply, "LOCAL4xx")
+        self.assertIn("400", lf.call_args[0][1])
+
+    def test_unexpected_exception_falls_back_local(self):
+        # 6007-6008: a non-anthropic Exception type → generic fallback arm.
+        a = mock.Mock()
+        a.BadRequestError = type("BR", (Exception,), {})
+        a.RateLimitError = type("RL", (Exception,), {})
+        a.APIStatusError = type("AS", (Exception,), {})
+        client = mock.Mock()
+        client.complete.side_effect = KeyError("weird")
+        with mock.patch.object(self.bc, "detect_tone", return_value=None), \
+                mock.patch.object(self.bc, "route_voice_emotion",
+                                  return_value={"mood": "casual", "addendum": ""}), \
+                mock.patch.object(self.bc, "_voice_mood_response", None), \
+                mock.patch.object(self.bc, "_emotion_tracker", None), \
+                mock.patch.object(self.bc, "_llm_client", client), \
+                mock.patch.dict(sys.modules, {"anthropic": a}), \
+                mock.patch.object(self.bc, "_local_fallback_or",
+                                  return_value="LOCALerr") as lf, \
+                mock.patch.object(self.bc, "_mcu_phrases", self._phrases()):
+            reply = self.bc._call_llm("hi")
+        self.assertEqual(reply, "LOCALerr")
+        self.assertIn("Unexpected LLM error", lf.call_args[0][1])
+
+    def test_ollama_backend_success(self):
+        # 6024: AI_BACKEND == "ollama" happy path through ollama.chat.
+        fake_ollama = mock.Mock()
+        fake_ollama.chat.return_value = {"message": {"content": "Local says hi."}}
+        with mock.patch.object(self.bc, "AI_BACKEND", "ollama"), \
+                mock.patch.object(self.bc, "detect_tone", return_value=None), \
+                mock.patch.object(self.bc, "route_voice_emotion",
+                                  return_value={"mood": "casual", "addendum": ""}), \
+                mock.patch.object(self.bc, "_voice_mood_response", None), \
+                mock.patch.object(self.bc, "_emotion_tracker", None), \
+                mock.patch.dict(sys.modules, {"ollama": fake_ollama}), \
+                mock.patch.object(self.bc, "_mcu_phrases", self._phrases()):
+            reply = self.bc._call_llm("hi")
+        self.assertEqual(reply, "Local says hi.")
+
+    def test_phrase_rotation_persist_failure_is_swallowed(self):
+        # 6046-6047: detect_phrases_in_reply raises → caught, reply unchanged.
+        phrases = mock.Mock()
+        phrases.detect_phrases_in_reply.side_effect = RuntimeError("phr boom")
+        with mock.patch.object(self.bc, "detect_tone", return_value=None), \
+                mock.patch.object(self.bc, "route_voice_emotion",
+                                  return_value={"mood": "casual", "addendum": ""}), \
+                mock.patch.object(self.bc, "_voice_mood_response", None), \
+                mock.patch.object(self.bc, "_emotion_tracker", None), \
+                mock.patch.object(self.bc, "_llm_client", self._client()), \
+                mock.patch.dict(sys.modules, {"anthropic": mock.Mock()}), \
+                mock.patch.object(self.bc, "_mcu_phrases", phrases):
+            reply = self.bc._call_llm("hi")
+        self.assertEqual(reply, "Indeed, sir.")
+
+
+@requires_monolith
+class CallLocalLlmBranchTests(MonolithGlobalsTestCase):
+    """The _call_local_llm guard/return arms the first batch left uncovered:
+    the install/pull kicks, the cheatsheet swap, the HTTP-not-ok and empty-
+    text returns, and the outer-exception arm."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_disabled_returns_none(self):
+        with mock.patch.object(self.bc, "LOCAL_LLM_FALLBACK", False):
+            self.assertIsNone(self.bc._call_local_llm("sys", []))
+
+    def test_ollama_dead_kicks_install(self):
+        # 5681-5683 (already partly covered) + ensures install fired here.
+        install = mock.Mock()
+        with mock.patch.object(self.bc, "LOCAL_LLM_FALLBACK", True), \
+                mock.patch.object(self.bc, "_ollama_alive", return_value=False), \
+                mock.patch.object(self.bc, "_ollama_install_async", install):
+            self.assertIsNone(self.bc._call_local_llm("sys", []))
+        install.assert_called_once()
+
+    def test_model_absent_kicks_pull(self):
+        pull = mock.Mock()
+        with mock.patch.object(self.bc, "LOCAL_LLM_FALLBACK", True), \
+                mock.patch.object(self.bc, "_ollama_alive", return_value=True), \
+                mock.patch.object(self.bc, "_get_local_llm_model",
+                                  return_value="m:tag"), \
+                mock.patch.object(self.bc, "_ollama_has_model", return_value=False), \
+                mock.patch.object(self.bc, "_ollama_pull_async", pull):
+            self.assertIsNone(self.bc._call_local_llm("sys", []))
+        pull.assert_called_once_with("m:tag")
+
+    def test_swaps_pc_control_prompt_for_cheatsheet(self):
+        # 5698-5699: PC_CONTROL_PROMPT present in system → replaced by the
+        # compact cheatsheet before the POST.
+        captured = {}
+        fake_req = mock.Mock()
+
+        def _post(url, json=None, timeout=None):
+            captured["sys"] = json["messages"][0]["content"]
+            return _FakeResp(ok=True, json_data={"message": {"content": "ok"}})
+        fake_req.post.side_effect = _post
+        with mock.patch.object(self.bc, "LOCAL_LLM_FALLBACK", True), \
+                mock.patch.object(self.bc, "_ollama_alive", return_value=True), \
+                mock.patch.object(self.bc, "_get_local_llm_model",
+                                  return_value="m:tag"), \
+                mock.patch.object(self.bc, "_ollama_has_model", return_value=True), \
+                mock.patch.object(self.bc, "PC_CONTROL_PROMPT", "FULL-PC-PROMPT"), \
+                mock.patch.object(self.bc, "_local_cheatsheet",
+                                  return_value="CHEAT"), \
+                mock.patch.object(self.bc, "requests", fake_req):
+            out = self.bc._call_local_llm("persona FULL-PC-PROMPT tail", [])
+        self.assertEqual(out, "ok")
+        self.assertIn("CHEAT", captured["sys"])
+        self.assertNotIn("FULL-PC-PROMPT", captured["sys"])
+
+    def test_http_not_ok_returns_none(self):
+        # 5751-5753.
+        fake_req = mock.Mock()
+        fake_req.post.return_value = _FakeResp(ok=False, status_code=500,
+                                               text="boom")
+        with mock.patch.object(self.bc, "LOCAL_LLM_FALLBACK", True), \
+                mock.patch.object(self.bc, "_ollama_alive", return_value=True), \
+                mock.patch.object(self.bc, "_get_local_llm_model",
+                                  return_value="m:tag"), \
+                mock.patch.object(self.bc, "_ollama_has_model", return_value=True), \
+                mock.patch.object(self.bc, "requests", fake_req):
+            self.assertIsNone(self.bc._call_local_llm("sys", []))
+
+    def test_empty_text_returns_none(self):
+        # 5755-5756: HTTP ok but the model produced only whitespace.
+        fake_req = mock.Mock()
+        fake_req.post.return_value = _FakeResp(
+            ok=True, json_data={"message": {"content": "   "}})
+        with mock.patch.object(self.bc, "LOCAL_LLM_FALLBACK", True), \
+                mock.patch.object(self.bc, "_ollama_alive", return_value=True), \
+                mock.patch.object(self.bc, "_get_local_llm_model",
+                                  return_value="m:tag"), \
+                mock.patch.object(self.bc, "_ollama_has_model", return_value=True), \
+                mock.patch.object(self.bc, "requests", fake_req):
+            self.assertIsNone(self.bc._call_local_llm("sys", []))
+
+    def test_request_exception_returns_none(self):
+        # 5759-5761: requests.post raises → caught, None returned.
+        fake_req = mock.Mock()
+        fake_req.post.side_effect = RuntimeError("network down")
+        with mock.patch.object(self.bc, "LOCAL_LLM_FALLBACK", True), \
+                mock.patch.object(self.bc, "_ollama_alive", return_value=True), \
+                mock.patch.object(self.bc, "_get_local_llm_model",
+                                  return_value="m:tag"), \
+                mock.patch.object(self.bc, "_ollama_has_model", return_value=True), \
+                mock.patch.object(self.bc, "requests", fake_req):
+            self.assertIsNone(self.bc._call_local_llm("sys", []))
+
+
+@requires_monolith
+class CallLocalVisionBranchTests(MonolithGlobalsTestCase):
+    """The _call_local_vision failure arms: ollama-dead install kick, HTTP-
+    not-ok, non-JSON body, wrong response shape, empty content, and the
+    RequestException catch."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def _enable(self):
+        return [
+            mock.patch.object(self.bc, "LOCAL_VISION_FALLBACK", True),
+            mock.patch.object(self.bc, "LOCAL_VISION_MODEL", "vlm:7b"),
+        ]
+
+    def test_ollama_dead_kicks_install(self):
+        install = mock.Mock()
+        patches = self._enable() + [
+            mock.patch.object(self.bc, "_ollama_alive", return_value=False),
+            mock.patch.object(self.bc, "_ollama_install_async", install),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            self.assertIsNone(self.bc._call_local_vision("q", [b"img"]))
+        finally:
+            for p in patches:
+                p.stop()
+        install.assert_called_once()
+
+    def _live_patches(self, fake_req):
+        return self._enable() + [
+            mock.patch.object(self.bc, "_ollama_alive", return_value=True),
+            mock.patch.object(self.bc, "_ollama_has_model", return_value=True),
+            mock.patch.object(self.bc, "_log_gpu_state"),
+            mock.patch.object(self.bc, "requests", fake_req),
+        ]
+
+    def _run(self, fake_req):
+        patches = self._live_patches(fake_req)
+        for p in patches:
+            p.start()
+        try:
+            return self.bc._call_local_vision("describe", [b"png"])
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_http_not_ok_returns_none(self):
+        fake_req = mock.Mock()
+        fake_req.post.return_value = _FakeResp(ok=False, status_code=503,
+                                               text="down")
+        fake_req.RequestException = self.bc.requests.RequestException
+        self.assertIsNone(self._run(fake_req))
+
+    def test_non_json_body_returns_none(self):
+        bad = _FakeResp(ok=True)
+        bad.json = mock.Mock(side_effect=ValueError("not json"))
+        bad.text = "<html>"
+        fake_req = mock.Mock()
+        fake_req.post.return_value = bad
+        fake_req.RequestException = self.bc.requests.RequestException
+        self.assertIsNone(self._run(fake_req))
+
+    def test_message_not_dict_returns_none(self):
+        fake_req = mock.Mock()
+        fake_req.post.return_value = _FakeResp(
+            ok=True, json_data={"message": "oops a string"})
+        fake_req.RequestException = self.bc.requests.RequestException
+        self.assertIsNone(self._run(fake_req))
+
+    def test_empty_content_returns_none(self):
+        fake_req = mock.Mock()
+        fake_req.post.return_value = _FakeResp(
+            ok=True, json_data={"message": {"content": "  "},
+                                "done_reason": "stop"})
+        fake_req.RequestException = self.bc.requests.RequestException
+        self.assertIsNone(self._run(fake_req))
+
+    def test_request_exception_returns_none(self):
+        fake_req = mock.Mock()
+        fake_req.RequestException = self.bc.requests.RequestException
+        fake_req.post.side_effect = self.bc.requests.RequestException("boom")
+        self.assertIsNone(self._run(fake_req))
+
+
+@requires_monolith
+class TranscribeMoreBranchTests(MonolithGlobalsTestCase):
+    """The openai-whisper empty-segments arm + the CUDA-error VRAM-recovery
+    path (torch.cuda.empty_cache + model drop)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def setUp(self):
+        self._saved = (self.bc._stt, self.bc._stt_engine)
+
+    def tearDown(self):
+        self.bc._stt, self.bc._stt_engine = self._saved
+
+    def test_openai_whisper_empty_segments(self):
+        # 5298: openai path, no segments → fixed (1.0, -10.0) confidence.
+        fake_model = mock.Mock()
+        fake_model.transcribe.return_value = {"text": " hi ", "segments": []}
+        with mock.patch.object(self.bc, "_ensure_whisper"), \
+                mock.patch.object(self.bc, "_stt", fake_model), \
+                mock.patch.object(self.bc, "_stt_engine", "openai_whisper"):
+            text, conf = self.bc.transcribe(np.zeros(16, dtype=np.float32))
+        self.assertEqual(text, "hi")
+        self.assertEqual(conf["no_speech_prob"], 1.0)
+        self.assertEqual(conf["avg_logprob"], -10.0)
+
+    def test_openai_whisper_aggregates_segments(self):
+        # 5299-5302: averages no_speech_prob / avg_logprob across segments.
+        fake_model = mock.Mock()
+        fake_model.transcribe.return_value = {
+            "text": "a b",
+            "segments": [
+                {"no_speech_prob": 0.2, "avg_logprob": -1.0},
+                {"no_speech_prob": 0.4, "avg_logprob": -3.0},
+            ],
+        }
+        with mock.patch.object(self.bc, "_ensure_whisper"), \
+                mock.patch.object(self.bc, "_stt", fake_model), \
+                mock.patch.object(self.bc, "_stt_engine", "openai_whisper"):
+            text, conf = self.bc.transcribe(np.zeros(16, dtype=np.float32))
+        self.assertEqual(text, "a b")
+        self.assertAlmostEqual(conf["no_speech_prob"], 0.3, places=6)
+        self.assertAlmostEqual(conf["avg_logprob"], -2.0, places=6)
+
+    def test_cuda_error_empties_cache_and_drops_model(self):
+        # 5312-5322: a CUDA error string triggers torch.cuda.empty_cache()
+        # and nulls _stt so the next utterance reloads clean.
+        fake_model = mock.Mock()
+        fake_model.transcribe.side_effect = RuntimeError("CUBLAS_STATUS failure")
+        fake_torch = mock.Mock()
+        fake_torch.cuda.is_available.return_value = True
+        with mock.patch.object(self.bc, "_ensure_whisper"), \
+                mock.patch.object(self.bc, "_stt", fake_model), \
+                mock.patch.object(self.bc, "_stt_engine", "faster_whisper"), \
+                mock.patch.dict(sys.modules, {"torch": fake_torch}):
+            text, conf = self.bc.transcribe(np.zeros(16, dtype=np.float32))
+        self.assertEqual(text, "")
+        fake_torch.cuda.empty_cache.assert_called_once()
+        self.assertIsNone(self.bc._stt)
+
+
+@requires_monolith
+class RegisterCudaDllDirsErrorArmsTests(MonolithGlobalsTestCase):
+    """The error arms of _register_cuda_dll_dirs the scan-success tests skip:
+    nvidia import raising a non-ImportError, __path__ resolution failing, and
+    add_dll_directory raising OSError (PATH prepend still counts as success)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def setUp(self):
+        fn = self.bc._register_cuda_dll_dirs
+        self._saved = {k: getattr(fn, k) for k in
+                       ("_done", "_registered", "_missing", "_reason")
+                       if hasattr(fn, k)}
+        self._saved_path = os.environ.get("PATH", "")
+
+    def tearDown(self):
+        fn = self.bc._register_cuda_dll_dirs
+        for k in ("_done", "_registered", "_missing", "_reason"):
+            if k in self._saved:
+                setattr(fn, k, self._saved[k])
+            elif hasattr(fn, k):
+                delattr(fn, k)
+        os.environ["PATH"] = self._saved_path
+
+    def test_nvidia_import_raises_nonimport_error(self):
+        # 5015-5019: a non-ImportError from `import nvidia` records the reason.
+        fn = self.bc._register_cuda_dll_dirs
+        fn._done = False
+        real_import = __import__
+
+        def fake_import(name, *a, **k):
+            if name == "nvidia":
+                raise RuntimeError("namespace exploded")
+            return real_import(name, *a, **k)
+        with mock.patch("builtins.__import__", side_effect=fake_import):
+            fn()
+        self.assertTrue(fn._done)
+        self.assertIn("nvidia import raised", fn._reason)
+
+    def test_nvidia_path_resolution_fails(self):
+        # 5023-5027: list(nvidia.__path__)[0] raises → reason recorded.
+        fn = self.bc._register_cuda_dll_dirs
+        fn._done = False
+        fake_nvidia = mock.Mock()
+        # __path__ that raises on iteration/index
+        type(fake_nvidia).__path__ = mock.PropertyMock(
+            side_effect=RuntimeError("no path"))
+        with mock.patch.dict(sys.modules, {"nvidia": fake_nvidia}):
+            fn()
+        self.assertTrue(fn._done)
+        self.assertIn("could not resolve nvidia.__path__", fn._reason)
+
+    def test_add_dll_directory_oserror_still_registers_via_path(self):
+        # 5055-5060: add_dll_directory raises OSError, but the PATH prepend
+        # means the dir is still recorded as registered.
+        fn = self.bc._register_cuda_dll_dirs
+        fn._done = False
+        fake_nvidia = mock.Mock()
+        fake_nvidia.__path__ = [r"C:\fake\nvidia"]
+        with mock.patch.dict(sys.modules, {"nvidia": fake_nvidia}), \
+                mock.patch.object(self.bc.os.path, "isdir", return_value=True), \
+                mock.patch.object(self.bc.os, "add_dll_directory",
+                                  side_effect=OSError("denied"), create=True):
+            fn()
+        self.assertTrue(fn._done)
+        # both dirs still counted as registered (PATH prepend worked)
+        self.assertEqual(len(fn._registered), 2)
+        # and both recorded as add_dll_directory-missing
+        self.assertTrue(any("add_dll_directory" in m for m in fn._missing))
+
+
+@requires_monolith
+class EnsureWhisperOpenaiCudaFallbackTests(MonolithGlobalsTestCase):
+    """The openai-whisper CUDA-load-failure → CPU-fallback arm (5142-5155)
+    that the faster-whisper fallback test doesn't reach."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def setUp(self):
+        self._saved = (self.bc._stt, self.bc._stt_device,
+                       self.bc._stt_model_name, self.bc._stt_engine)
+        self.bc._stt = None
+
+    def tearDown(self):
+        (self.bc._stt, self.bc._stt_device,
+         self.bc._stt_model_name, self.bc._stt_engine) = self._saved
+
+    def test_openai_cuda_dll_failure_retries_cpu(self):
+        good = object()
+        calls = []
+
+        def _load(model, device=None):
+            calls.append((model, device))
+            if device == "cuda":
+                raise RuntimeError("Could not load library cudnn64_9.dll")
+            return good
+        real_import = __import__
+
+        def fake_import(name, *a, **k):
+            if name == "faster_whisper":
+                raise ImportError("absent")
+            return real_import(name, *a, **k)
+        fake_whisper = mock.Mock()
+        fake_whisper.load_model.side_effect = _load
+        with mock.patch.object(self.bc, "_register_cuda_dll_dirs"), \
+                mock.patch.object(self.bc, "_resolve_whisper_device",
+                                  return_value="cuda"), \
+                mock.patch.object(self.bc, "_force_whisper_cpu_int8", False), \
+                mock.patch.object(self.bc, "WHISPER_MODEL_CUDA", "large-v3"), \
+                mock.patch.object(self.bc, "WHISPER_MODEL_CPU", "base"), \
+                mock.patch("builtins.__import__", side_effect=fake_import), \
+                mock.patch.dict(sys.modules, {"whisper": fake_whisper}):
+            self.bc._ensure_whisper()
+        self.assertIs(self.bc._stt, good)
+        self.assertEqual(self.bc._stt_device, "cpu")
+        self.assertEqual(self.bc._stt_model_name, "base")
+        self.assertIn(("large-v3", "cuda"), calls)
+        self.assertIn(("base", "cpu"), calls)
+
+    def test_openai_non_dll_cuda_failure_retries_cpu(self):
+        # 5149 (the else branch: generic CUDA error, not a DLL pattern).
+        good = object()
+
+        def _load(model, device=None):
+            if device == "cuda":
+                raise RuntimeError("CUDA out of memory")
+            return good
+        real_import = __import__
+
+        def fake_import(name, *a, **k):
+            if name == "faster_whisper":
+                raise ImportError("absent")
+            return real_import(name, *a, **k)
+        fake_whisper = mock.Mock()
+        fake_whisper.load_model.side_effect = _load
+        with mock.patch.object(self.bc, "_register_cuda_dll_dirs"), \
+                mock.patch.object(self.bc, "_resolve_whisper_device",
+                                  return_value="cuda"), \
+                mock.patch.object(self.bc, "_force_whisper_cpu_int8", False), \
+                mock.patch.object(self.bc, "WHISPER_MODEL_CUDA", "large-v3"), \
+                mock.patch.object(self.bc, "WHISPER_MODEL_CPU", "base"), \
+                mock.patch("builtins.__import__", side_effect=fake_import), \
+                mock.patch.dict(sys.modules, {"whisper": fake_whisper}):
+            self.bc._ensure_whisper()
+        self.assertIs(self.bc._stt, good)
+        self.assertEqual(self.bc._stt_device, "cpu")
+
+
+@requires_monolith
+class ResolveWhisperDeviceTorchTests(MonolithGlobalsTestCase):
+    """The torch-backed auto branch (4976-4981) that the ctranslate2 test
+    skips."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_auto_picks_cuda_via_torch_when_ct2_missing(self):
+        # ctranslate2 import fails (printed warning, 4974-4975), torch sees a
+        # GPU → "cuda".
+        real_import = __import__
+
+        def fake_import(name, *a, **k):
+            if name == "ctranslate2":
+                raise ImportError("no ct2")
+            return real_import(name, *a, **k)
+        fake_torch = mock.Mock()
+        fake_torch.cuda.is_available.return_value = True
+        with mock.patch.object(self.bc, "WHISPER_DEVICE", "auto"), \
+                mock.patch("builtins.__import__", side_effect=fake_import), \
+                mock.patch.dict(sys.modules, {"torch": fake_torch}):
+            self.assertEqual(self.bc._resolve_whisper_device(), "cuda")
+
+    def test_auto_falls_back_cpu_when_no_backend(self):
+        # ct2 reports 0 devices, torch import fails → "cpu" (4981).
+        fake_ct2 = mock.Mock()
+        fake_ct2.get_cuda_device_count.return_value = 0
+        real_import = __import__
+
+        def fake_import(name, *a, **k):
+            if name == "torch":
+                raise ImportError("no torch")
+            return real_import(name, *a, **k)
+        with mock.patch.object(self.bc, "WHISPER_DEVICE", "auto"), \
+                mock.patch.dict(sys.modules, {"ctranslate2": fake_ct2}), \
+                mock.patch("builtins.__import__", side_effect=fake_import):
+            self.assertEqual(self.bc._resolve_whisper_device(), "cpu")
+
+
+@requires_monolith
+class CheckDependenciesMultiFeatureTests(MonolithGlobalsTestCase):
+    """The two-feature alert string (5250-5252) and the _speak-failure swallow
+    (5256-5257)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def setUp(self):
+        self._saved_hist = list(self.bc.conversation_history)
+
+    def tearDown(self):
+        self.bc.conversation_history[:] = self._saved_hist
+
+    def test_two_missing_features_builds_combined_alert(self):
+        spoken = {}
+
+        def _speak(msg):
+            spoken["msg"] = msg
+        notes = {"pkgA": "feature A is offline", "pkgB": "feature B is offline"}
+        with mock.patch.object(self.bc, "_parse_requirements",
+                               return_value=["pkgA", "pkgB"]), \
+                mock.patch.object(self.bc, "_DEP_IMPORT_NAME", {}), \
+                mock.patch.object(self.bc, "_DEP_FEATURE_NOTE", notes), \
+                mock.patch.object(self.bc, "_speak", _speak):
+            missing = self.bc.check_dependencies()
+        self.assertEqual(missing, ["pkgA", "pkgB"])
+        self.assertIn("a few things are offline", spoken["msg"])
+        self.assertIn("feature A is offline", spoken["msg"])
+
+    def test_three_missing_features_appends_and_more(self):
+        spoken = {}
+        notes = {"pkgA": "alpha", "pkgB": "beta", "pkgC": "gamma"}
+        with mock.patch.object(self.bc, "_parse_requirements",
+                               return_value=["pkgA", "pkgB", "pkgC"]), \
+                mock.patch.object(self.bc, "_DEP_IMPORT_NAME", {}), \
+                mock.patch.object(self.bc, "_DEP_FEATURE_NOTE", notes), \
+                mock.patch.object(self.bc, "_speak",
+                                  side_effect=lambda m: spoken.update(msg=m)):
+            self.bc.check_dependencies()
+        self.assertIn("and 1 more", spoken["msg"])
+
+    def test_speak_failure_is_swallowed(self):
+        # 5256-5257: _speak raises → caught; check_dependencies still returns.
+        with mock.patch.object(self.bc, "_parse_requirements",
+                               return_value=["pkgA"]), \
+                mock.patch.object(self.bc, "_DEP_IMPORT_NAME", {}), \
+                mock.patch.object(self.bc, "_DEP_FEATURE_NOTE",
+                                  {"pkgA": "alpha"}), \
+                mock.patch.object(self.bc, "_speak",
+                                  side_effect=RuntimeError("tts down")):
+            missing = self.bc.check_dependencies()
+        self.assertEqual(missing, ["pkgA"])
+
+
+@requires_monolith
+class SmallHelperBranchTests(MonolithGlobalsTestCase):
+    """One-off uncovered branches in small helpers: _log_gpu_state body,
+    _get_local_llm_model's /api/tags failure, _ollama_has_model's exception,
+    _local_cheatsheet's registry-failure swallow, _parse_intent_tag's empty
+    input, and _resolve_tts_preset's recent_peak_rms failure."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_log_gpu_state_delegates_to_core(self):
+        import core
+        fake_gpu = mock.Mock()
+        # `from core import gpu_state` resolves via the core package attribute
+        # once core.gpu_state has been imported by any sibling test, so patch
+        # BOTH sys.modules and the parent-package attr — otherwise this passes
+        # alone but the real module is used in the full suite.
+        with mock.patch.dict(sys.modules, {"core.gpu_state": fake_gpu}), \
+             mock.patch.object(core, "gpu_state", fake_gpu, create=True):
+            self.bc._log_gpu_state("m:tag")
+        fake_gpu.log_gpu_state.assert_called_once_with("m:tag")
+
+    def test_log_gpu_state_swallows_import_error(self):
+        real_import = __import__
+
+        def fake_import(name, *a, **k):
+            if name == "core.gpu_state" or (
+                    name == "core" and "gpu_state" in (a[2] or ())):
+                raise ImportError("no gpu_state")
+            return real_import(name, *a, **k)
+        with mock.patch("builtins.__import__", side_effect=fake_import):
+            # must not raise
+            self.bc._log_gpu_state("m:tag")
+
+    def test_get_local_llm_model_api_failure_returns_default(self):
+        # 5484-5485: /api/tags raises → installed=[] → LOCAL_LLM_MODEL, no cache.
+        self.bc._RESOLVED_LOCAL_LLM_MODEL[0] = None
+        saved_env = os.environ.pop("JARVIS_LOCAL_LLM_MODEL", None)
+        fake_req = mock.Mock()
+        fake_req.get.side_effect = RuntimeError("connection refused")
+        try:
+            with mock.patch.object(self.bc, "requests", fake_req), \
+                    mock.patch.object(self.bc, "LOCAL_LLM_MODEL", "def:model"):
+                out = self.bc._get_local_llm_model()
+            self.assertEqual(out, "def:model")
+            self.assertIsNone(self.bc._RESOLVED_LOCAL_LLM_MODEL[0])
+        finally:
+            if saved_env is not None:
+                os.environ["JARVIS_LOCAL_LLM_MODEL"] = saved_env
+
+    def test_ollama_has_model_exception_returns_false(self):
+        # 5519-5520.
+        fake_req = mock.Mock()
+        fake_req.get.side_effect = RuntimeError("down")
+        with mock.patch.object(self.bc, "requests", fake_req):
+            self.assertFalse(self.bc._ollama_has_model("m:tag"))
+
+    def test_ollama_has_model_http_not_ok_returns_false(self):
+        # 5513-5514.
+        fake_req = mock.Mock()
+        fake_req.get.return_value = _FakeResp(ok=False, status_code=500)
+        with mock.patch.object(self.bc, "requests", fake_req):
+            self.assertFalse(self.bc._ollama_has_model("m:tag"))
+
+    def test_local_cheatsheet_registry_failure_swallowed(self):
+        # 5660-5661: ACTIONS.keys() raises → allnames stays "", still returns.
+        self.bc._LOCAL_CHEATSHEET_CACHE[0] = None
+        boom = mock.Mock()
+        boom.keys.side_effect = RuntimeError("registry exploded")
+        try:
+            with mock.patch.object(self.bc, "ACTIONS", boom):
+                out = self.bc._local_cheatsheet()
+            self.assertIn("CONTROLLING THE PC", out)
+            self.assertIn("END PC CONTROL", out)
+        finally:
+            self.bc._LOCAL_CHEATSHEET_CACHE[0] = None
+
+    def test_parse_intent_tag_empty_input(self):
+        # 6132: empty string → (None, "").
+        self.assertEqual(self.bc._parse_intent_tag(""), (None, ""))
+
+    def test_resolve_tts_preset_peak_rms_failure_defaults_zero(self):
+        # 6164-6165: recent_peak_rms raises → peak_rms=0.0, still resolves.
+        fake_layer = mock.Mock()
+        fake_layer.resolve_tts_preset.return_value = (
+            "neutral", {"rate": "+0%", "pitch": "+0Hz", "gain": 1.0})
+        fake_ap = mock.Mock()
+        fake_ap.recent_peak_rms.side_effect = RuntimeError("no rms")
+        with mock.patch.object(self.bc, "_tts_layer", fake_layer), \
+                mock.patch.object(self.bc, "_last_emotion", [None]), \
+                mock.patch.dict(sys.modules,
+                                {"core.audio_processor": fake_ap}):
+            chosen, preset = self.bc._resolve_tts_preset("hi", None)
+        self.assertEqual(chosen, "neutral")
+        # peak_rms defaulted to 0.0 on the exception
+        self.assertEqual(fake_layer.resolve_tts_preset.call_args.kwargs["peak_rms"],
+                         0.0)
+
+
+@requires_monolith
+class SynthesiseGainPathTests(MonolithGlobalsTestCase):
+    """The gain-application + fall-through arms of synthesise the first batch
+    left: xtts success with gain, pyttsx3-backend with gain + its failure
+    fall-through, the wry-split exception, and the final edge→pyttsx3 fallback
+    with gain."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def _common(self, name, preset):
+        return [
+            mock.patch.object(self.bc, "_last_voice_route", [None]),
+            mock.patch.object(self.bc, "_last_user_tone", [None]),
+            mock.patch.object(self.bc, "_last_mood", [None]),
+            mock.patch.object(self.bc, "_resolve_tts_preset",
+                              return_value=(name, preset)),
+        ]
+
+    def test_xtts_success_applies_gain(self):
+        # 6317-6319: xtts returns audio, gain != 1.0 → clipped + returned.
+        base = np.full(6, 0.8, dtype=np.float32)
+        preset = {"rate": "+0%", "pitch": "+0Hz", "gain": 2.0}
+        patches = self._common("amused", preset) + [
+            mock.patch.dict(self.bc.__dict__, {"TTS_BACKEND": "xtts"}),
+            mock.patch.object(self.bc, "_render_xtts_or_raise",
+                              return_value=(base, 24000)),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            audio, sr = self.bc.synthesise("hi")
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertEqual(sr, 24000)
+        self.assertTrue(np.allclose(audio, 1.0))  # 0.8*2 clipped to 1.0
+
+    def test_pyttsx3_backend_applies_gain(self):
+        # 6326-6328: pyttsx3 backend selected, gain applied.
+        base = np.full(6, 0.3, dtype=np.float32)
+        preset = {"rate": "+0%", "pitch": "+0Hz", "gain": 2.0}
+        patches = self._common("neutral", preset) + [
+            mock.patch.dict(self.bc.__dict__, {"TTS_BACKEND": "pyttsx3"}),
+            mock.patch.object(self.bc, "_pyttsx3_tts",
+                              return_value=(base, 22050)),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            audio, sr = self.bc.synthesise("hi")
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertEqual(sr, 22050)
+        self.assertTrue(np.allclose(audio, 0.6))
+
+    def test_pyttsx3_backend_failure_falls_through_to_edge(self):
+        # 6329-6330: pyttsx3 backend raises → falls through to the edge render.
+        edge_audio = np.ones(4, dtype=np.float32)
+        preset = {"rate": "+0%", "pitch": "+0Hz", "gain": 1.0}
+        patches = self._common("neutral", preset) + [
+            mock.patch.dict(self.bc.__dict__, {"TTS_BACKEND": "pyttsx3"}),
+            mock.patch.object(self.bc, "_pyttsx3_tts",
+                              side_effect=RuntimeError("pyttsx3 dead")),
+            mock.patch.object(self.bc, "_render_edge_tts",
+                              return_value=(edge_audio, 24000)),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            audio, sr = self.bc.synthesise("hi")
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertEqual(sr, 24000)
+        self.assertEqual(audio.shape[0], 4)
+
+    def test_wry_split_exception_falls_back_single_pass(self):
+        # 6343-6344: split_for_wry_pause raises → wry_split stays None →
+        # single-pass edge render still succeeds.
+        fake_layer = mock.Mock()
+        fake_layer.split_for_wry_pause.side_effect = RuntimeError("split boom")
+        edge_audio = np.ones(7, dtype=np.float32)
+        preset = {"rate": "+0%", "pitch": "+0Hz", "gain": 1.0}
+        patches = self._common("wry", preset) + [
+            mock.patch.object(self.bc, "_tts_layer", fake_layer),
+            mock.patch.dict(self.bc.__dict__, {"TTS_BACKEND": "edge"}),
+            mock.patch.object(self.bc, "_render_edge_tts",
+                              return_value=(edge_audio, 24000)),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            audio, sr = self.bc.synthesise("Setup punchline")
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertEqual(audio.shape[0], 7)  # single-pass, no silence splice
+
+    def test_edge_failure_falls_to_pyttsx3_with_gain(self):
+        # 6360-6364: edge raises → pyttsx3 fallback, gain applied to its output.
+        py_audio = np.full(5, 0.4, dtype=np.float32)
+        preset = {"rate": "+0%", "pitch": "+0Hz", "gain": 2.0}
+        patches = self._common("amused", preset) + [
+            mock.patch.dict(self.bc.__dict__, {"TTS_BACKEND": "edge"}),
+            mock.patch.object(self.bc, "_render_edge_tts",
+                              side_effect=RuntimeError("edge 503")),
+            mock.patch.object(self.bc, "_pyttsx3_tts",
+                              return_value=(py_audio, 22050)),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            audio, sr = self.bc.synthesise("hi")
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertEqual(sr, 22050)
+        self.assertTrue(np.allclose(audio, 0.8))  # 0.4*2
+
+
+@requires_monolith
+class Pyttsx3RenderTests(MonolithGlobalsTestCase):
+    """The successful pyttsx3 temp-file render path (6400-6410) — engine
+    saves a WAV, soundfile reads it back, temp file is cleaned up."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_engine_renders_wav_and_cleans_up(self):
+        import soundfile as sf
+        import tempfile
+        # Real temp dir; the fake engine writes a real WAV there so sf.read
+        # decodes it. Stub pyttsx3.init() to produce that file on save.
+        tmpdir = tempfile.mkdtemp()
+        produced = {}
+
+        def _save_to_file(text, path):
+            produced["path"] = path
+            sf.write(path, np.full(120, 0.1, dtype=np.float32), 22050,
+                     format="WAV")
+        engine = mock.Mock()
+        engine.save_to_file.side_effect = _save_to_file
+        fake_pyttsx3 = mock.Mock()
+        fake_pyttsx3.init.return_value = engine
+
+        # Force NamedTemporaryFile into our temp dir so cleanup is observable.
+        real_ntf = tempfile.NamedTemporaryFile
+
+        def _ntf(*a, **k):
+            k.setdefault("dir", tmpdir)
+            return real_ntf(*a, **k)
+        with mock.patch.dict(sys.modules, {"pyttsx3": fake_pyttsx3}), \
+                mock.patch.object(self.bc.tempfile, "NamedTemporaryFile",
+                                  side_effect=_ntf):
+            audio, sr = self.bc._pyttsx3_tts("hello world")
+        self.assertEqual(sr, 22050)
+        self.assertEqual(audio.dtype, np.float32)
+        engine.runAndWait.assert_called_once()
+        engine.stop.assert_called_once()
+        # temp .wav removed in the finally
+        self.assertFalse(os.path.exists(produced["path"]))
+        try:
+            os.rmdir(tmpdir)
+        except OSError:
+            pass
+
+
+@requires_monolith
+class AudioDuckerWorkerTests(MonolithGlobalsTestCase):
+    """_AudioDucker plumbing the enumerate/fade tests don't reach:
+    _check_available, the worker loop drain (single job + sentinel),
+    _ensure_worker reuse, _enumerate_targets error arms, and duck/restore
+    enqueueing onto the (synchronous) worker."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_check_available_true_when_pycaw_imports(self):
+        # 6514-6520: reset the class latch, force win32 + successful imports.
+        saved = self.bc._AudioDucker._AVAILABLE
+        self.bc._AudioDucker._AVAILABLE = None
+        try:
+            with mock.patch.object(self.bc.sys, "platform", "win32"), \
+                    mock.patch.dict(sys.modules,
+                                    {"pycaw": mock.Mock(),
+                                     "pycaw.pycaw": mock.Mock(),
+                                     "comtypes": mock.Mock()}):
+                self.assertTrue(self.bc._AudioDucker._check_available())
+            # cached now
+            self.assertTrue(self.bc._AudioDucker._AVAILABLE)
+        finally:
+            self.bc._AudioDucker._AVAILABLE = saved
+
+    def test_check_available_false_when_pycaw_missing(self):
+        saved = self.bc._AudioDucker._AVAILABLE
+        self.bc._AudioDucker._AVAILABLE = None
+        real_import = __import__
+
+        def fake_import(name, *a, **k):
+            if name.startswith("pycaw"):
+                raise ImportError("no pycaw")
+            return real_import(name, *a, **k)
+        try:
+            with mock.patch.object(self.bc.sys, "platform", "win32"), \
+                    mock.patch("builtins.__import__", side_effect=fake_import):
+                self.assertFalse(self.bc._AudioDucker._check_available())
+        finally:
+            self.bc._AudioDucker._AVAILABLE = saved
+
+    def test_worker_loop_runs_one_job_then_sentinel_stops(self):
+        # 6540-6566: drain one (plans, level, cancellable, done_event) job —
+        # _fade_run is stubbed — then a None sentinel returns out of the loop.
+        d = self.bc._AudioDucker()
+        done = threading.Event()
+        d._work_queue.put(([("iface", 1.0)], 0.2, True, done))
+        d._work_queue.put(None)  # sentinel → loop returns
+        with mock.patch.dict(sys.modules, {"comtypes": mock.Mock()}), \
+                mock.patch.object(d, "_fade_run") as fr:
+            d._worker_loop()   # runs synchronously to the sentinel
+        fr.assert_called_once_with([("iface", 1.0)], 0.2, True)
+        self.assertTrue(done.is_set())   # done_event set in the finally
+
+    def test_worker_loop_fade_exception_still_sets_done(self):
+        # 6555-6559: _fade_run raises → caught, done_event still set.
+        d = self.bc._AudioDucker()
+        done = threading.Event()
+        d._work_queue.put(([("iface", 1.0)], None, False, done))
+        d._work_queue.put(None)
+        with mock.patch.dict(sys.modules, {"comtypes": mock.Mock()}), \
+                mock.patch.object(d, "_fade_run",
+                                  side_effect=RuntimeError("fade boom")):
+            d._worker_loop()
+        self.assertTrue(done.is_set())
+
+    def test_ensure_worker_reuses_live_thread(self):
+        # 6528-6530: a live worker thread short-circuits _ensure_worker.
+        d = self.bc._AudioDucker()
+        live = mock.Mock()
+        live.is_alive.return_value = True
+        d._worker_thread = live
+        with mock.patch.object(self.bc.threading, "Thread") as T:
+            d._ensure_worker()
+        T.assert_not_called()
+        self.assertIs(d._worker_thread, live)
+
+    def test_ensure_worker_spawns_when_none(self):
+        # 6531-6537: no thread → a daemon worker is created + started.
+        d = self.bc._AudioDucker()
+        d._worker_thread = None
+        with mock.patch.object(self.bc.threading, "Thread", _ImmediateThread):
+            # _ImmediateThread.start() runs _worker_loop synchronously; feed a
+            # sentinel first so it returns immediately instead of blocking.
+            d._work_queue.put(None)
+            with mock.patch.dict(sys.modules, {"comtypes": mock.Mock()}):
+                d._ensure_worker()
+        self.assertIsInstance(d._worker_thread, _ImmediateThread)
+
+    def test_enumerate_get_all_sessions_failure_returns_empty(self):
+        # 6580-6582: GetAllSessions raises → [] returned.
+        d = self.bc._AudioDucker()
+        fake_au = mock.Mock()
+        fake_au.GetAllSessions.side_effect = RuntimeError("WASAPI boom")
+        with mock.patch.dict(sys.modules,
+                             {"pycaw": mock.Mock(),
+                              "pycaw.pycaw": mock.Mock(AudioUtilities=fake_au),
+                              "comtypes": mock.Mock()}):
+            self.assertEqual(d._enumerate_targets(), [])
+
+    def test_enumerate_skips_unmatched_and_null_volume(self):
+        # 6591-6592 (name doesn't match) + 6594-6595 (vol_iface None) +
+        # 6602-6603 (a session that raises mid-inspect is skipped).
+        d = self.bc._AudioDucker()
+        SELF = self.bc._AudioDucker._SELF_PID
+
+        unmatched = mock.Mock()
+        unmatched.Process = mock.Mock(pid=SELF + 1)
+        unmatched.Process.name.return_value = "discord.exe"  # not a target
+
+        null_vol = mock.Mock()
+        null_vol.Process = mock.Mock(pid=SELF + 2)
+        null_vol.Process.name.return_value = "spotify.exe"
+        null_vol.SimpleAudioVolume = None
+
+        boom = mock.Mock()
+        boom.Process = mock.Mock(pid=SELF + 3)
+        boom.Process.name.side_effect = RuntimeError("dead session")
+
+        fake_au = mock.Mock()
+        fake_au.GetAllSessions.return_value = [unmatched, null_vol, boom]
+        with mock.patch.dict(sys.modules,
+                             {"pycaw": mock.Mock(),
+                              "pycaw.pycaw": mock.Mock(AudioUtilities=fake_au),
+                              "comtypes": mock.Mock()}), \
+                mock.patch.object(self.bc, "AUDIO_DUCKING_TARGETS", ["spotify"]), \
+                mock.patch.object(self.bc, "AUDIO_DUCKING_LEVEL", 0.2):
+            self.assertEqual(d._enumerate_targets(), [])
+
+    def test_enumerate_comtypes_import_failure_path(self):
+        # 6574-6576: comtypes import fails → com_inited stays False, the
+        # CoUninitialize finally is skipped (6610-6611 not taken), still works.
+        d = self.bc._AudioDucker()
+        vol = mock.Mock()
+        vol.GetMasterVolume.return_value = 0.9
+        sess = mock.Mock()
+        sess.Process = mock.Mock(pid=self.bc._AudioDucker._SELF_PID + 9)
+        sess.Process.name.return_value = "spotify.exe"
+        sess.SimpleAudioVolume = vol
+        fake_au = mock.Mock()
+        fake_au.GetAllSessions.return_value = [sess]
+        real_import = __import__
+
+        def fake_import(name, *a, **k):
+            if name == "comtypes":
+                raise ImportError("no comtypes")
+            return real_import(name, *a, **k)
+        with mock.patch.dict(sys.modules,
+                             {"pycaw": mock.Mock(),
+                              "pycaw.pycaw": mock.Mock(AudioUtilities=fake_au)}), \
+                mock.patch("builtins.__import__", side_effect=fake_import), \
+                mock.patch.object(self.bc, "AUDIO_DUCKING_TARGETS", ["spotify"]), \
+                mock.patch.object(self.bc, "AUDIO_DUCKING_LEVEL", 0.2):
+            matched = d._enumerate_targets()
+        self.assertEqual(len(matched), 1)
+
+    def test_duck_enqueues_and_restore_drains(self):
+        # duck(): 6646-6659 enqueue onto worker; restore(): 6661-6682 cancel +
+        # fade-up enqueue. _ensure_worker + the worker are stubbed so nothing
+        # spins; we assert the queue traffic + saved-state bookkeeping.
+        d = self.bc._AudioDucker()
+        iface = mock.Mock()
+        with mock.patch.object(self.bc, "AUDIO_DUCKING_ENABLED", True), \
+                mock.patch.object(d, "_check_available", return_value=True), \
+                mock.patch.object(d, "_enumerate_targets",
+                                  return_value=[(iface, 0.9)]), \
+                mock.patch.object(d, "_ensure_worker"), \
+                mock.patch.object(d._work_queue, "put") as put:
+            d.duck()
+            self.assertEqual(d._saved, [(iface, 0.9)])
+            duck_job = put.call_args_list[0][0][0]
+            self.assertEqual(duck_job[1], self.bc.AUDIO_DUCKING_LEVEL)
+            self.assertTrue(duck_job[2])   # cancellable
+        # restore: cancel set, saved cleared, fade-up (target None) enqueued
+        with mock.patch.object(d, "_ensure_worker"), \
+                mock.patch.object(d._work_queue, "put") as put2, \
+                mock.patch.object(self.bc, "AUDIO_DUCKING_FADE_MS", 50):
+            d.restore()
+        self.assertEqual(d._saved, [])
+        restore_job = put2.call_args_list[0][0][0]
+        self.assertIsNone(restore_job[1])   # fade UP to original
+        self.assertFalse(restore_job[2])    # not cancellable
+
+    def test_duck_noop_when_no_targets(self):
+        # 6651-6652: enumerate finds nothing → no save, no enqueue.
+        d = self.bc._AudioDucker()
+        with mock.patch.object(self.bc, "AUDIO_DUCKING_ENABLED", True), \
+                mock.patch.object(d, "_check_available", return_value=True), \
+                mock.patch.object(d, "_enumerate_targets", return_value=[]), \
+                mock.patch.object(d._work_queue, "put") as put:
+            d.duck()
+        put.assert_not_called()
+        self.assertEqual(d._saved, [])
+
+    def test_duck_enumerate_exception_swallowed(self):
+        # 6648-6650: _enumerate_targets raises → caught, no save.
+        d = self.bc._AudioDucker()
+        with mock.patch.object(self.bc, "AUDIO_DUCKING_ENABLED", True), \
+                mock.patch.object(d, "_check_available", return_value=True), \
+                mock.patch.object(d, "_enumerate_targets",
+                                  side_effect=RuntimeError("enum boom")):
+            d.duck()   # must not raise
+        self.assertEqual(d._saved, [])
+
+    def test_fade_run_steps_to_target(self):
+        # 6618-6638 happy path (not cancelled): 10 volume steps toward target.
+        d = self.bc._AudioDucker()
+        iface = mock.Mock()
+        iface.GetMasterVolume.return_value = 1.0
+        with mock.patch.object(self.bc, "AUDIO_DUCKING_FADE_MS", 100), \
+                mock.patch.object(self.bc.time, "sleep"):
+            d._fade_run([(iface, 1.0)], 0.2, cancellable=False)
+        self.assertEqual(iface.SetMasterVolume.call_count, 10)
+        # final step lands near the 0.2 target
+        last = iface.SetMasterVolume.call_args_list[-1][0][0]
+        self.assertAlmostEqual(last, 0.2, places=6)
+
+    def test_fade_run_skips_iface_that_raises_on_read(self):
+        # 6622-6625: GetMasterVolume raises → that iface is dropped from the plan.
+        d = self.bc._AudioDucker()
+        bad = mock.Mock()
+        bad.GetMasterVolume.side_effect = RuntimeError("read fail")
+        with mock.patch.object(self.bc, "AUDIO_DUCKING_FADE_MS", 100), \
+                mock.patch.object(self.bc.time, "sleep"):
+            d._fade_run([(bad, 1.0)], 0.2, cancellable=False)
+        bad.SetMasterVolume.assert_not_called()
+
+    def test_restore_noop_when_nothing_saved(self):
+        d = self.bc._AudioDucker()
+        d._saved = []
+        with mock.patch.object(d._work_queue, "put") as put:
+            d.restore()
+        put.assert_not_called()
+
+
+@requires_monolith
+class GetMicBufferTapPathTests(MonolithGlobalsTestCase):
+    """The wake-listener tap (Path A) and record_speech tap (Path A2) return
+    arms of get_mic_buffer — exercised by pre-seeding the tap queue and using
+    a deterministic time source so the capture while-loop runs a bounded
+    number of iterations without a real stream."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def setUp(self):
+        self._saved_active = list(self.bc._record_speech_active)
+        self._saved_sr = list(self.bc._record_speech_sr)
+
+    def tearDown(self):
+        self.bc._record_speech_active[:] = self._saved_active
+        self.bc._record_speech_sr[:] = self._saved_sr
+        sys.modules.pop("skill_wake_listener", None)
+
+    def test_path_a_taps_wake_listener(self):
+        # 4812-4831: a running detector at the right rate → tap delivers frames.
+        frame = np.ones(8000, dtype=np.float32)
+        taps = []
+
+        det = mock.Mock()
+        det.is_running.return_value = True
+        det.sample_rate = 16000
+
+        def _add_tap(q):
+            taps.append(q)
+            q.put(frame)   # pre-seed exactly one full second of audio
+        det.add_tap.side_effect = _add_tap
+        det.remove_tap = mock.Mock()
+        wl = mock.Mock()
+        wl._detector = det
+        with mock.patch.dict(sys.modules, {"skill_wake_listener": wl}), \
+                mock.patch.object(self.bc, "_mic_input_disabled",
+                                  return_value=False):
+            out = self.bc.get_mic_buffer(0.5, sample_rate=16000)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.dtype, np.float32)
+        det.remove_tap.assert_called_once()
+        # need = 16000*0.5 = 8000 samples; got exactly that, sliced to need
+        self.assertEqual(out.size, 8000)
+
+    def test_path_a_no_frames_returns_none(self):
+        # 4828-4829: deadline passes with an empty tap queue → None.
+        det = mock.Mock()
+        det.is_running.return_value = True
+        det.sample_rate = 16000
+        det.add_tap = mock.Mock()       # never seeds the queue
+        det.remove_tap = mock.Mock()
+        wl = mock.Mock()
+        wl._detector = det
+        # Deterministic clock: first read of time() is the deadline base,
+        # subsequent reads jump past it so the while-loop exits immediately.
+        times = iter([1000.0, 1000.0, 9999.0, 9999.0, 9999.0])
+        with mock.patch.dict(sys.modules, {"skill_wake_listener": wl}), \
+                mock.patch.object(self.bc, "_mic_input_disabled",
+                                  return_value=False), \
+                mock.patch.object(self.bc.time, "time",
+                                  side_effect=lambda: next(times)):
+            out = self.bc.get_mic_buffer(0.1, sample_rate=16000)
+        self.assertIsNone(out)
+        det.remove_tap.assert_called_once()
+
+    def test_path_a2_taps_record_speech_stream(self):
+        # 4841-4862: no wake listener, but record_speech owns the mic at the
+        # right rate → tap its frames.
+        frame = np.full(8000, 0.2, dtype=np.float32)
+        self.bc._record_speech_active[0] = True
+        self.bc._record_speech_sr[0] = 16000
+
+        def _add(q):
+            q.put(frame)
+        with mock.patch.object(self.bc, "_mic_input_disabled",
+                               return_value=False), \
+                mock.patch.object(self.bc, "add_record_tap",
+                                  side_effect=_add) as art, \
+                mock.patch.object(self.bc, "remove_record_tap") as rrt:
+            out = self.bc.get_mic_buffer(0.5, sample_rate=16000)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.size, 8000)
+        art.assert_called_once()
+        rrt.assert_called_once()
+
+    def test_path_a2_no_frames_returns_none(self):
+        # 4859-4860: record_speech live but never delivers → None (does NOT
+        # fall through to Path B's competing open).
+        self.bc._record_speech_active[0] = True
+        self.bc._record_speech_sr[0] = 16000
+        times = iter([1000.0, 1000.0, 9999.0, 9999.0, 9999.0])
+        with mock.patch.object(self.bc, "_mic_input_disabled",
+                               return_value=False), \
+                mock.patch.object(self.bc, "add_record_tap"), \
+                mock.patch.object(self.bc, "remove_record_tap") as rrt, \
+                mock.patch.object(self.bc.time, "time",
+                                  side_effect=lambda: next(times)):
+            out = self.bc.get_mic_buffer(0.1, sample_rate=16000)
+        self.assertIsNone(out)
+        rrt.assert_called_once()
+
+
+@requires_monolith
+class PlayWithLipsyncExtraPathsTests(MonolithGlobalsTestCase):
+    """The barge-in arm (headset + listener + watch thread) and the robot
+    lip-sync arm of play_with_lipsync. Threads run synchronously via
+    _ImmediateThread so each closure body (_amp_pump, _barge_watch, _sync,
+    _safe_wait*) executes once and the done-event is set before the bounded
+    wait, exercising the post-play teardown."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def setUp(self):
+        self._saved_flag = list(self.bc._tts_playback_active)
+        self._saved_barge = self.bc._barge_in_interrupted
+
+    def tearDown(self):
+        self.bc._tts_playback_active[:] = self._saved_flag
+        self.bc._barge_in_interrupted = self._saved_barge
+
+    def _base_patches(self, fake_sd, fake_layer, ducker):
+        return [
+            mock.patch.object(self.bc, "sd", fake_sd),
+            mock.patch.object(self.bc, "_tts_layer", fake_layer),
+            mock.patch.object(self.bc, "_audio_ducker", ducker),
+            mock.patch.object(self.bc, "get_output_device", return_value=1),
+            mock.patch.object(self.bc, "_write_hud_state"),
+            mock.patch.object(self.bc, "_feed_playback_reference"),
+            mock.patch.object(self.bc.threading, "Thread", _ImmediateThread),
+            mock.patch.object(self.bc.time, "sleep"),
+        ]
+
+    def test_barge_in_headset_path_opens_and_closes_listener(self):
+        # 6706-6726 + 6867-6868: BARGE_IN_ENABLED + headset → listener opened,
+        # watch closure runs (flag set → sd.stop), stream closed in finally.
+        fake_sd = mock.Mock()
+        fake_layer = mock.Mock()
+        fake_layer.is_muted.return_value = False
+        ducker = mock.Mock()
+        barge_stream = mock.Mock()
+        # The watch closure observes the interrupt flag and calls sd.stop().
+        self.bc._barge_in_interrupted = True
+        audio = np.zeros(48, dtype=np.float32)
+        scs_patch = mock.patch.object(self.bc, "_safe_close_stream")
+        patches = self._base_patches(fake_sd, fake_layer, ducker) + [
+            mock.patch.object(self.bc, "BARGE_IN_ENABLED", True),
+            mock.patch.object(self.bc, "ROBOT_ENABLED", False),
+            mock.patch.object(self.bc, "is_using_headset", return_value=True),
+            mock.patch.object(self.bc, "_start_barge_in_listener",
+                              return_value=barge_stream),
+            scs_patch,
+        ]
+        started = [p.start() for p in patches]
+        scs = started[patches.index(scs_patch)]
+        try:
+            self.bc.play_with_lipsync(audio, 24000)
+        finally:
+            for p in patches:
+                p.stop()
+        fake_sd.play.assert_called_once()
+        # watch thread saw the interrupt and stopped playback
+        fake_sd.stop.assert_called()
+        scs.assert_called_once_with(barge_stream)
+        self.assertFalse(self.bc._tts_playback_active[0])
+
+    def test_robot_branch_runs_sync_loop(self):
+        # 6804-6846: ROBOT_ENABLED → the _sync lip-sync closure streams mouth
+        # values via send(); sd.play + bounded wait still run.
+        fake_sd = mock.Mock()
+        fake_layer = mock.Mock()
+        fake_layer.is_muted.return_value = False
+        ducker = mock.Mock()
+        audio = np.full(96, 0.5, dtype=np.float32)
+        send_patch = mock.patch.object(self.bc, "send")
+        patches = self._base_patches(fake_sd, fake_layer, ducker) + [
+            mock.patch.object(self.bc, "BARGE_IN_ENABLED", False),
+            mock.patch.object(self.bc, "ROBOT_ENABLED", True),
+            mock.patch.object(self.bc, "is_using_headset", return_value=False),
+            send_patch,
+            mock.patch.object(self.bc, "MOUTH_SCALE", 9.0),
+        ]
+        started = [p.start() for p in patches]
+        send = started[patches.index(send_patch)]
+        try:
+            self.bc.play_with_lipsync(audio, 24000)
+        finally:
+            for p in patches:
+                p.stop()
+        fake_sd.play.assert_called_once()
+        # _sync streamed at least one mouth value and a final mouth=0.0
+        self.assertTrue(send.called)
+        self.assertFalse(self.bc._tts_playback_active[0])
+
+    def test_robot_sync_send_exception_is_logged_not_raised(self):
+        # 6817-6818 + 6823-6824: send() raises inside _sync → caught per-
+        # iteration; play_with_lipsync still completes.
+        fake_sd = mock.Mock()
+        fake_layer = mock.Mock()
+        fake_layer.is_muted.return_value = False
+        ducker = mock.Mock()
+        audio = np.full(96, 0.5, dtype=np.float32)
+        patches = self._base_patches(fake_sd, fake_layer, ducker) + [
+            mock.patch.object(self.bc, "BARGE_IN_ENABLED", False),
+            mock.patch.object(self.bc, "ROBOT_ENABLED", True),
+            mock.patch.object(self.bc, "is_using_headset", return_value=False),
+            mock.patch.object(self.bc, "send",
+                              side_effect=RuntimeError("robot offline")),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            self.bc.play_with_lipsync(audio, 24000)   # must not raise
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertFalse(self.bc._tts_playback_active[0])
+
+
+# ===========================================================================
+# FOURTH BATCH — remaining cheap, fully-mockable branches: get_mic_buffer's
+# Path-B capture (driven via the captured callback), _tts_bytes' async edge
+# stream, the _render_edge_tts cache/ndim arms, _call_local_llm's guard
+# exception swallows, _pyttsx3_tts' stereo + unlink arms, _call_llm's
+# mode-router exception, transcribe's faster-whisper non-CUDA error, and the
+# _AudioDucker.restore wait arms.
+# ===========================================================================
+@requires_monolith
+class GetMicBufferPathBTests(MonolithGlobalsTestCase):
+    """Drive get_mic_buffer's fallback InputStream (Path B): capture the
+    callback handed to the (mocked) stream, push frames through it to fill the
+    buffer, and confirm the slice + teardown. No wake listener, no live
+    record_speech."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def setUp(self):
+        self._saved_active = list(self.bc._record_speech_active)
+
+    def tearDown(self):
+        self.bc._record_speech_active[:] = self._saved_active
+
+    def test_path_b_captures_via_callback(self):
+        # 4865-4901: open a mock stream, feed one full frame through its
+        # callback so the while-loop reaches `need` and returns the slice.
+        self.bc._record_speech_active[0] = False
+        holder = {}
+
+        class _FakeStream:
+            def __init__(self, *a, **k):
+                holder["cb"] = k["callback"]
+
+            def start(self):
+                # Deliver a full second of audio the moment capture starts.
+                frame = np.ones(16000, dtype=np.float32)
+                # indata is (frames, channels); the cb flattens column 0.
+                holder["cb"](frame.reshape(-1, 1), 16000, None, None)
+
+        fake_sd = mock.Mock()
+        fake_sd.InputStream.side_effect = _FakeStream
+        with mock.patch.object(self.bc, "_mic_input_disabled",
+                               return_value=False), \
+                mock.patch.object(self.bc, "sd", fake_sd), \
+                mock.patch.object(self.bc, "get_input_device", return_value=3), \
+                mock.patch.object(self.bc, "_safe_close_stream") as scs, \
+                mock.patch.object(self.bc.time, "sleep"):
+            out = self.bc.get_mic_buffer(0.5, sample_rate=16000)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.size, 8000)   # need = 16000*0.5, sliced down
+        self.assertEqual(out.dtype, np.float32)
+        scs.assert_called_once()
+
+    def test_path_b_no_frames_returns_none(self):
+        # 4898-4899: stream starts but never delivers → deadline → None.
+        self.bc._record_speech_active[0] = False
+
+        class _SilentStream:
+            def __init__(self, *a, **k):
+                pass
+
+            def start(self):
+                pass
+
+        fake_sd = mock.Mock()
+        fake_sd.InputStream.side_effect = _SilentStream
+        times = iter([1000.0, 1000.0, 9999.0, 9999.0, 9999.0])
+        with mock.patch.object(self.bc, "_mic_input_disabled",
+                               return_value=False), \
+                mock.patch.object(self.bc, "sd", fake_sd), \
+                mock.patch.object(self.bc, "get_input_device", return_value=3), \
+                mock.patch.object(self.bc, "_safe_close_stream"), \
+                mock.patch.object(self.bc.time, "time",
+                                  side_effect=lambda: next(times)):
+            out = self.bc.get_mic_buffer(0.1, sample_rate=16000)
+        self.assertIsNone(out)
+
+
+@requires_monolith
+class TtsBytesAsyncTests(MonolithGlobalsTestCase):
+    """Run the _tts_bytes coroutine against a fake edge_tts.Communicate whose
+    .stream() is an async generator, asserting only audio chunks are kept."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_streams_audio_chunks_only(self):
+        import asyncio
+
+        class _FakeCommunicate:
+            def __init__(self, text, voice, rate=None, pitch=None):
+                self.text = text
+
+            async def stream(self):
+                yield {"type": "audio", "data": b"AB"}
+                yield {"type": "WordBoundary", "data": b"ignored"}
+                yield {"type": "audio", "data": b"CD"}
+
+        fake_edge = mock.Mock()
+        fake_edge.Communicate = _FakeCommunicate
+        with mock.patch.dict(sys.modules, {"edge_tts": fake_edge}):
+            out = asyncio.run(self.bc._tts_bytes("hi", rate="+0%", pitch="+0Hz"))
+        self.assertEqual(out, b"ABCD")   # word-boundary chunk dropped
+
+
+@requires_monolith
+class RenderEdgeTtsCacheArmsTests(MonolithGlobalsTestCase):
+    """The cache-get exception swallow (6240-6241), the stereo→mono mean
+    (6251), and the cache-put exception swallow (6255-6256)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_cache_get_raises_then_renders_stereo_and_put_raises(self):
+        import soundfile as sf
+        # Build a STEREO wav so the ndim>1 mean path (6251) runs.
+        buf = io.BytesIO()
+        sf.write(buf, np.zeros((240, 2), dtype=np.float32), 24000, format="WAV")
+        buf.seek(0)
+        raw_wav = buf.read()
+
+        fake_layer = mock.Mock()
+        fake_layer.tts_cache_get.side_effect = RuntimeError("cache read boom")
+        fake_layer.tts_cache_put.side_effect = RuntimeError("cache write boom")
+        fake_future = mock.Mock()
+        fake_future.result.return_value = raw_wav
+        with mock.patch.object(self.bc, "_tts_layer", fake_layer), \
+                mock.patch.object(self.bc, "_ensure_tts_loop"), \
+                mock.patch.object(self.bc, "_tts_loop", mock.Mock()), \
+                mock.patch.object(self.bc.asyncio, "run_coroutine_threadsafe",
+                                  return_value=fake_future):
+            audio, sr = self.bc._render_edge_tts("hi", "+0%", "+0Hz")
+        self.assertEqual(sr, 24000)
+        self.assertEqual(audio.ndim, 1)   # collapsed to mono
+        fake_layer.tts_cache_put.assert_called_once()
+
+
+@requires_monolith
+class CallLocalLlmGuardArmsTests(MonolithGlobalsTestCase):
+    """The narrow swallow/branch arms inside _call_local_llm: the cheatsheet
+    replace raising (5700-5701) and the web-search scan visiting a non-str
+    content / a see_screen-after-search (5711, 5715, 5723-5724)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def _live(self, fake_req):
+        return [
+            mock.patch.object(self.bc, "LOCAL_LLM_FALLBACK", True),
+            mock.patch.object(self.bc, "_ollama_alive", return_value=True),
+            mock.patch.object(self.bc, "_get_local_llm_model",
+                              return_value="m:tag"),
+            mock.patch.object(self.bc, "_ollama_has_model", return_value=True),
+            mock.patch.object(self.bc, "requests", fake_req),
+        ]
+
+    def test_cheatsheet_replace_exception_is_swallowed(self):
+        # 5700-5701: `_local_cheatsheet()` raises during the prompt swap →
+        # caught, the original system prompt is used, call still completes.
+        fake_req = mock.Mock()
+        fake_req.post.return_value = _FakeResp(
+            ok=True, json_data={"message": {"content": "ok"}})
+        patches = self._live(fake_req) + [
+            mock.patch.object(self.bc, "PC_CONTROL_PROMPT", "FULL"),
+            mock.patch.object(self.bc, "_local_cheatsheet",
+                              side_effect=RuntimeError("cheat boom")),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            out = self.bc._call_local_llm("persona FULL tail", [])
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertEqual(out, "ok")
+
+    def test_web_search_scan_handles_nonstr_and_see_after_search(self):
+        # 5711 (content not str → continue) + 5712-5715 (search then a later
+        # see_screen → guard NOT prepended).
+        captured = {}
+        fake_req = mock.Mock()
+
+        def _post(url, json=None, timeout=None):
+            captured["sys"] = json["messages"][0]["content"]
+            return _FakeResp(ok=True, json_data={"message": {"content": "ok"}})
+        fake_req.post.side_effect = _post
+        msgs = [
+            {"role": "assistant", "content": ["not", "a", "string"]},
+            {"role": "assistant", "content": "[ACTION: web_search, x]"},
+            {"role": "assistant", "content": "[ACTION: see_screen]"},
+        ]
+        patches = self._live(fake_req)
+        for p in patches:
+            p.start()
+        try:
+            out = self.bc._call_local_llm("BASE", msgs)
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertEqual(out, "ok")
+        # see_screen came AFTER the search → no fabrication guard prepended
+        self.assertNotIn("Do NOT fabricate", captured["sys"])
+
+
+@requires_monolith
+class Pyttsx3RenderArmTests(MonolithGlobalsTestCase):
+    """_pyttsx3_tts' stereo-mean (6409) and the temp-file unlink OSError
+    swallow (6417-6418)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_stereo_output_collapsed_and_unlink_oserror_swallowed(self):
+        import soundfile as sf
+        import tempfile
+        tmpdir = tempfile.mkdtemp()
+        produced = {}
+
+        def _save_to_file(text, path):
+            produced["path"] = path
+            sf.write(path, np.zeros((100, 2), dtype=np.float32), 22050,
+                     format="WAV")
+        engine = mock.Mock()
+        engine.save_to_file.side_effect = _save_to_file
+        fake_pyttsx3 = mock.Mock()
+        fake_pyttsx3.init.return_value = engine
+        real_ntf = tempfile.NamedTemporaryFile
+
+        def _ntf(*a, **k):
+            k.setdefault("dir", tmpdir)
+            return real_ntf(*a, **k)
+        with mock.patch.dict(sys.modules, {"pyttsx3": fake_pyttsx3}), \
+                mock.patch.object(self.bc.tempfile, "NamedTemporaryFile",
+                                  side_effect=_ntf), \
+                mock.patch.object(self.bc.os, "unlink",
+                                  side_effect=OSError("file busy")):
+            audio, sr = self.bc._pyttsx3_tts("hi")
+        self.assertEqual(sr, 22050)
+        self.assertEqual(audio.ndim, 1)   # stereo collapsed to mono
+        # clean up the real temp artifacts ourselves (unlink was stubbed out)
+        try:
+            if produced.get("path") and os.path.exists(produced["path"]):
+                os.remove(produced["path"])
+            os.rmdir(tmpdir)
+        except OSError:
+            pass
+
+
+@requires_monolith
+class CallLlmModeRouterArmTests(MonolithGlobalsTestCase):
+    """_call_llm's mode-router addendum arm — both a real addendum and the
+    import-failure swallow (5942-5943)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def setUp(self):
+        self._saved_hist = list(self.bc.conversation_history)
+        self.bc.conversation_history.clear()
+
+    def tearDown(self):
+        self.bc.conversation_history[:] = self._saved_hist
+
+    def _phrases(self):
+        m = mock.Mock()
+        m.detect_phrases_in_reply.return_value = {}
+        return m
+
+    def test_mode_router_import_failure_swallowed(self):
+        # core.mode_router import raises → mode_addendum stays "", call ok.
+        real_import = __import__
+
+        def fake_import(name, *a, **k):
+            if name == "core.mode_router" or (
+                    name == "core" and "mode_router" in (a[2] or ())):
+                raise ImportError("no mode_router")
+            return real_import(name, *a, **k)
+        client = mock.Mock()
+        client.complete.return_value = "Very good, sir."
+        with mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
+                mock.patch.object(self.bc, "detect_tone", return_value=None), \
+                mock.patch.object(self.bc, "route_voice_emotion",
+                                  return_value={"mood": "casual", "addendum": ""}), \
+                mock.patch.object(self.bc, "_voice_mood_response", None), \
+                mock.patch.object(self.bc, "_emotion_tracker", None), \
+                mock.patch.object(self.bc, "_trim_conversation_history"), \
+                mock.patch.object(self.bc, "_system_prompt", "SYS"), \
+                mock.patch.object(self.bc, "_llm_client", client), \
+                mock.patch("builtins.__import__", side_effect=fake_import), \
+                mock.patch.object(self.bc, "_mcu_phrases", self._phrases()):
+            reply = self.bc._call_llm("hi")
+        self.assertEqual(reply, "Very good, sir.")
+
+
+@requires_monolith
+class AudioDuckerRestoreWaitTests(MonolithGlobalsTestCase):
+    """_AudioDucker.restore's fade_done.wait + restore_done.wait timeout
+    swallows (6672-6673, 6681-6682)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_restore_swallows_wait_exceptions(self):
+        d = self.bc._AudioDucker()
+        d._saved = [(mock.Mock(), 0.9)]
+        # Make BOTH the fade_done wait and the freshly-created restore_done
+        # wait raise, so both try/except arms (6672-6673, 6681-6682) run.
+        boom_done = mock.Mock()
+        boom_done.wait.side_effect = RuntimeError("wait boom")
+        with mock.patch.object(d, "_ensure_worker"), \
+                mock.patch.object(d._work_queue, "put"), \
+                mock.patch.object(self.bc.threading, "Event",
+                                  return_value=boom_done):
+            # also force the in-flight fade_done to the booming event
+            d._fade_done = boom_done
+            d.restore()   # must not raise
+        self.assertEqual(d._saved, [])
+
+
+@requires_monolith
+class OllamaAsyncFailureArmTests(MonolithGlobalsTestCase):
+    """The failure / success arms inside the background `_do` closures that the
+    happy-path async tests don't reach: winget install failure (5538-5539),
+    text-pull failure (5559-5560), and the vision-pull success print
+    (5800-5802). All run synchronously via _ImmediateThread."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def setUp(self):
+        self._saved = (list(self.bc._OLLAMA_INSTALL_TRIGGERED),
+                       list(self.bc._OLLAMA_PULL_TRIGGERED),
+                       list(self.bc._LOCAL_VISION_PULL_TRIGGERED))
+        self.bc._OLLAMA_INSTALL_TRIGGERED[0] = False
+        self.bc._OLLAMA_PULL_TRIGGERED[0] = False
+        self.bc._LOCAL_VISION_PULL_TRIGGERED[0] = False
+
+    def tearDown(self):
+        (self.bc._OLLAMA_INSTALL_TRIGGERED[:],
+         self.bc._OLLAMA_PULL_TRIGGERED[:],
+         self.bc._LOCAL_VISION_PULL_TRIGGERED[:]) = self._saved
+
+    def test_install_winget_failure_swallowed(self):
+        # 5538-5539: subprocess.run raises → caught inside _do.
+        fake_sp = mock.Mock()
+        fake_sp.run.side_effect = RuntimeError("winget exploded")
+        with mock.patch.object(self.bc.threading, "Thread", _ImmediateThread), \
+                mock.patch.dict(sys.modules, {"subprocess": fake_sp}):
+            self.bc._ollama_install_async()   # must not raise
+        fake_sp.run.assert_called_once()
+        self.assertTrue(self.bc._OLLAMA_INSTALL_TRIGGERED[0])
+
+    def test_text_pull_failure_swallowed(self):
+        # 5559-5560: requests.post raises → caught inside _do.
+        fake_req = mock.Mock()
+        fake_req.post.side_effect = RuntimeError("pull down")
+        with mock.patch.object(self.bc.threading, "Thread", _ImmediateThread), \
+                mock.patch.object(self.bc, "requests", fake_req):
+            self.bc._ollama_pull_async("some:model")
+        fake_req.post.assert_called_once()
+        self.assertTrue(self.bc._OLLAMA_PULL_TRIGGERED[0])
+
+    def test_vision_pull_success_drains_stream(self):
+        # 5800-5802: a streamed pull that yields lines → the for-loop drains
+        # them and the success print fires (latch stays set).
+        resp = _FakeResp(ok=True)
+        resp.iter_lines = lambda: iter([b'{"status":"pulling"}',
+                                        b'{"status":"success"}'])
+        fake_req = mock.Mock()
+        fake_req.RequestException = self.bc.requests.RequestException
+        fake_req.post.return_value = resp
+        with mock.patch.object(self.bc.threading, "Thread", _ImmediateThread), \
+                mock.patch.object(self.bc, "requests", fake_req):
+            self.bc._ollama_pull_vision_async("vlm:7b")
+        fake_req.post.assert_called_once()
+        # success path → latch NOT reset
+        self.assertTrue(self.bc._LOCAL_VISION_PULL_TRIGGERED[0])
+
+
+@requires_monolith
+class EnsureWhisperRaiseArmTests(MonolithGlobalsTestCase):
+    """The `raise` arms of _ensure_whisper that fire when a NON-cuda device
+    load fails (faster-whisper 5132, openai-whisper 5155) and the non-DLL
+    CUDA-error print (5124)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def setUp(self):
+        self._saved = (self.bc._stt, self.bc._stt_device,
+                       self.bc._stt_model_name, self.bc._stt_engine)
+        self.bc._stt = None
+
+    def tearDown(self):
+        (self.bc._stt, self.bc._stt_device,
+         self.bc._stt_model_name, self.bc._stt_engine) = self._saved
+
+    def test_faster_whisper_cpu_load_failure_propagates(self):
+        # device resolves to cpu; the faster-whisper load raises → 5132 `raise`
+        # (no CPU retry since we're already on CPU). The outer caller sees it.
+        fake_fw = mock.Mock()
+        fake_fw.WhisperModel = mock.Mock(side_effect=RuntimeError("cpu load boom"))
+        with mock.patch.object(self.bc, "_register_cuda_dll_dirs"), \
+                mock.patch.object(self.bc, "_resolve_whisper_device",
+                                  return_value="cpu"), \
+                mock.patch.object(self.bc, "_force_whisper_cpu_int8", False), \
+                mock.patch.object(self.bc, "WHISPER_MODEL_CPU", "base"), \
+                mock.patch.dict(sys.modules, {"faster_whisper": fake_fw}):
+            with self.assertRaises(RuntimeError):
+                self.bc._ensure_whisper()
+        self.assertIsNone(self.bc._stt)
+
+    def test_openai_whisper_cpu_load_failure_propagates(self):
+        # faster-whisper absent → openai path; cpu load_model raises → 5155.
+        real_import = __import__
+
+        def fake_import(name, *a, **k):
+            if name == "faster_whisper":
+                raise ImportError("absent")
+            return real_import(name, *a, **k)
+        fake_whisper = mock.Mock()
+        fake_whisper.load_model.side_effect = RuntimeError("cpu whisper boom")
+        with mock.patch.object(self.bc, "_register_cuda_dll_dirs"), \
+                mock.patch.object(self.bc, "_resolve_whisper_device",
+                                  return_value="cpu"), \
+                mock.patch.object(self.bc, "WHISPER_MODEL_CPU", "base"), \
+                mock.patch("builtins.__import__", side_effect=fake_import), \
+                mock.patch.dict(sys.modules, {"whisper": fake_whisper}):
+            with self.assertRaises(RuntimeError):
+                self.bc._ensure_whisper()
+
+    def test_faster_whisper_non_dll_cuda_error_retries_cpu(self):
+        # 5124 (else: a non-DLL CUDA error prints the plain message) then the
+        # cuda branch retries on CPU and succeeds.
+        good = object()
+
+        def _wm(model, device=None, compute_type=None):
+            if device == "cuda":
+                raise RuntimeError("CUDA out of memory")  # not a DLL pattern
+            return good
+        fake_fw = mock.Mock()
+        fake_fw.WhisperModel = mock.Mock(side_effect=_wm)
+        with mock.patch.object(self.bc, "_register_cuda_dll_dirs"), \
+                mock.patch.object(self.bc, "_resolve_whisper_device",
+                                  return_value="cuda"), \
+                mock.patch.object(self.bc, "_force_whisper_cpu_int8", False), \
+                mock.patch.object(self.bc, "WHISPER_MODEL_CUDA", "large-v3"), \
+                mock.patch.dict(sys.modules, {"faster_whisper": fake_fw}):
+            self.bc._ensure_whisper()
+        self.assertIs(self.bc._stt, good)
+        self.assertEqual(self.bc._stt_device, "cpu")
+
+
 if __name__ == "__main__":
     unittest.main()

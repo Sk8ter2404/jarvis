@@ -1197,6 +1197,843 @@ class ActionsDictTests(SectionFiveBase):
             bc.ACTIONS["ambient_mode_off"]("")
         setter.assert_has_calls([mock.call(True), mock.call(False)])
 
+# ════════════════════════════════════════════════════════════════════════════
+#  Extra branch fills on already-covered state machines
+# ════════════════════════════════════════════════════════════════════════════
+class ShutdownPromptBranchFillTests(SectionFiveBase):
+    """Cover the try/except arms inside _handle_shutdown_prompt that the main
+    ShutdownPromptTests left unexercised (reinforced-phrase failure, NO-path
+    failure)."""
+
+    def setUp(self):
+        bc = self.bc
+        self._orig_pending = dict(bc._shutdown_prompt_pending)
+        self.addCleanup(lambda: (bc._shutdown_prompt_pending.clear(),
+                                 bc._shutdown_prompt_pending.update(self._orig_pending)))
+        self.speak = mock.patch.object(bc, "_speak").start()
+        self.shutdown = mock.patch.object(bc, "_act_shutdown_jarvis").start()
+        self.overnight = mock.patch.object(bc, "_act_start_overnight_upgrade").start()
+        self.addCleanup(mock.patch.stopall)
+
+    def _arm(self):
+        import time as _t
+        self.bc._shutdown_prompt_pending["armed"] = True
+        self.bc._shutdown_prompt_pending["expires_at"] = _t.time() + 100
+
+    def test_reinforced_phrase_dispatch_exception_still_consumes(self):
+        # 'shut down jarvis' is a SHUTDOWN_TRIGGER_PHRASE -> reinforced branch;
+        # the terminal _act_shutdown_jarvis raises but the branch returns True.
+        self._arm()
+        self.shutdown.side_effect = RuntimeError("boom")
+        self.assertTrue(self.bc._handle_shutdown_prompt("shut down jarvis"))
+        self.shutdown.assert_called_once()
+        self.assertFalse(self.bc._shutdown_prompt_pending["armed"])
+
+    def test_no_phrase_dispatch_exception_still_consumes(self):
+        # NO branch's _act_shutdown_jarvis raises -> still returns True.
+        self._arm()
+        self.shutdown.side_effect = RuntimeError("kaboom")
+        self.assertTrue(self.bc._handle_shutdown_prompt("no"))
+        self.shutdown.assert_called_once()
+
+
+class ReadFocusedWindowBranchTests(SectionFiveBase):
+    """Cover the inner-rect except arm of _read_focused_window and the
+    live-read except arm of _focus_changed_recently."""
+
+    def setUp(self):
+        bc = self.bc
+        self._orig_state = dict(bc._focused_window_state)
+        self.addCleanup(lambda: (bc._focused_window_state.clear(),
+                                 bc._focused_window_state.update(self._orig_state)))
+
+    def test_read_focused_window_rect_exception_yields_none_rect(self):
+        bc = self.bc
+        mod = types.ModuleType("win32gui")
+        mod.GetForegroundWindow = lambda: 777
+        mod.GetWindowText = lambda h: "Titled"
+        def _boom(_h):
+            raise RuntimeError("GetWindowRect failed")
+        mod.GetWindowRect = _boom
+        with _InjectModule("win32gui", mod):
+            hwnd, title, rect = bc._read_focused_window()
+        self.assertEqual(hwnd, 777)
+        self.assertEqual(title, "Titled")
+        self.assertIsNone(rect)   # inner except -> rect=None, hwnd/title intact
+
+    def test_focus_changed_recently_read_exception_falls_back_to_timestamp(self):
+        bc = self.bc
+        import time as _t
+        # Live read raises -> hwnd/title/rect default to (None,"",None); then
+        # the timestamp branch decides. Fresh changed_at -> True.
+        bc._focused_window_state["hwnd"] = 5
+        bc._focused_window_state["changed_at"] = _t.monotonic()
+        with mock.patch.object(bc, "_read_focused_window",
+                               side_effect=RuntimeError("win32 gone")):
+            self.assertTrue(bc._focus_changed_recently())
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Optional-skill bridges (lazy sys.modules lookups)
+# ════════════════════════════════════════════════════════════════════════════
+class OptionalSkillBridgeTests(SectionFiveBase):
+    def _pop_module(self, name):
+        """Remove a skill module for the test, restoring it afterwards."""
+        saved = sys.modules.pop(name, None)
+        if saved is not None:
+            self.addCleanup(lambda: sys.modules.__setitem__(name, saved))
+        return saved
+
+    # ---- _user_looking_away ----
+    def test_user_looking_away_no_tracker(self):
+        self._pop_module("skill_face_tracker")
+        self.assertFalse(self.bc._user_looking_away())
+
+    def test_user_looking_away_no_sample_yet(self):
+        bc = self.bc
+        mod = types.ModuleType("skill_face_tracker")
+        mod._snapshot_state = lambda: {"last_sample_at": None}
+        with mock.patch.dict(sys.modules, {"skill_face_tracker": mod}):
+            self.assertFalse(bc._user_looking_away())
+
+    def test_user_looking_away_true_when_monitor_away(self):
+        bc = self.bc
+        mod = types.ModuleType("skill_face_tracker")
+        mod._snapshot_state = lambda: {"last_sample_at": 123.0,
+                                       "current_monitor": "away"}
+        with mock.patch.dict(sys.modules, {"skill_face_tracker": mod}):
+            self.assertTrue(bc._user_looking_away())
+
+    def test_user_looking_away_false_when_present(self):
+        bc = self.bc
+        mod = types.ModuleType("skill_face_tracker")
+        mod._snapshot_state = lambda: {"last_sample_at": 123.0,
+                                       "current_monitor": "left"}
+        with mock.patch.dict(sys.modules, {"skill_face_tracker": mod}):
+            self.assertFalse(bc._user_looking_away())
+
+    def test_user_looking_away_swallows_exception(self):
+        bc = self.bc
+        mod = types.ModuleType("skill_face_tracker")
+        def _boom():
+            raise RuntimeError("tracker state corrupt")
+        mod._snapshot_state = _boom
+        with mock.patch.dict(sys.modules, {"skill_face_tracker": mod}):
+            self.assertFalse(bc._user_looking_away())
+
+    # ---- _bambu_print_progress ----
+    def test_bambu_progress_no_skill(self):
+        self._pop_module("skill_bambu_monitor")
+        self.assertIsNone(self.bc._bambu_print_progress())
+
+    def _make_bambu(self, gcode_state, pct):
+        import threading as _thr
+        mod = types.ModuleType("skill_bambu_monitor")
+        mod._state_lock = _thr.Lock()
+        mod._state = {"gcode_state": gcode_state, "mc_percent": pct}
+        return mod
+
+    def test_bambu_progress_running_in_range(self):
+        bc = self.bc
+        mod = self._make_bambu("RUNNING", 42)
+        with mock.patch.dict(sys.modules, {"skill_bambu_monitor": mod}):
+            self.assertEqual(bc._bambu_print_progress(), 42)
+
+    def test_bambu_progress_not_running_returns_none(self):
+        bc = self.bc
+        mod = self._make_bambu("IDLE", 42)
+        with mock.patch.dict(sys.modules, {"skill_bambu_monitor": mod}):
+            self.assertIsNone(bc._bambu_print_progress())
+
+    def test_bambu_progress_out_of_band_pct_returns_none(self):
+        bc = self.bc
+        # 100 is outside the 1..99 "actively printing" window.
+        mod = self._make_bambu("RUNNING", 100)
+        with mock.patch.dict(sys.modules, {"skill_bambu_monitor": mod}):
+            self.assertIsNone(bc._bambu_print_progress())
+
+    def test_bambu_progress_swallows_exception(self):
+        bc = self.bc
+        mod = types.ModuleType("skill_bambu_monitor")
+        # Accessing _state_lock as a context manager will explode.
+        mod._state_lock = object()
+        mod._state = {}
+        with mock.patch.dict(sys.modules, {"skill_bambu_monitor": mod}):
+            self.assertIsNone(bc._bambu_print_progress())
+
+    # ---- _audio_music_should_refuse_wake ----
+    def test_refuse_wake_no_skill(self):
+        self._pop_module("skill_standby_audio_detect")
+        self.assertFalse(self.bc._audio_music_should_refuse_wake("jarvis"))
+
+    def test_refuse_wake_delegates_true(self):
+        bc = self.bc
+        mod = types.ModuleType("skill_standby_audio_detect")
+        mod.should_refuse_wake = lambda text: True
+        with mock.patch.dict(sys.modules, {"skill_standby_audio_detect": mod}):
+            self.assertTrue(bc._audio_music_should_refuse_wake("jarvis"))
+
+    def test_refuse_wake_swallows_exception(self):
+        bc = self.bc
+        mod = types.ModuleType("skill_standby_audio_detect")
+        def _boom(text):
+            raise RuntimeError("detector down")
+        mod.should_refuse_wake = _boom
+        with mock.patch.dict(sys.modules, {"skill_standby_audio_detect": mod}):
+            self.assertFalse(bc._audio_music_should_refuse_wake("jarvis"))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  _ambient_learning_feed  (silent overheard-utterance persistence)
+# ════════════════════════════════════════════════════════════════════════════
+class AmbientLearningFeedTests(SectionFiveBase):
+    def test_drops_short_utterances(self):
+        bc = self.bc
+        # < 8 chars OR < 3 words -> dropped before any filesystem touch.
+        with mock.patch.object(bc.os, "makedirs") as mkd:
+            bc._ambient_learning_feed("you")
+            bc._ambient_learning_feed("thanks")          # 1 word
+            bc._ambient_learning_feed("ok sure")         # 2 words
+        mkd.assert_not_called()
+
+    def test_writes_record_to_staging_sibling(self):
+        import json
+        import os
+        import tempfile
+
+        bc = self.bc
+        tmp = tempfile.mkdtemp(prefix="jarvis_ambient_")
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp,
+                                                            ignore_errors=True))
+        # Redirect the data dir by patching os.path.dirname/abspath is awkward;
+        # instead patch makedirs to a no-op and os.path.join so the write lands
+        # in our temp dir. Simpler: patch the module's open target dir by
+        # pointing __file__-derived path via a join shim.
+        real_join = os.path.join
+
+        def _join_shim(a, *rest):
+            # The function computes <dir>/data then <data>/<fname>. Redirect any
+            # path that ends in our data segments into tmp.
+            if rest and rest[-1] in ("ambient_transcripts.jsonl",
+                                     "ambient_transcripts.staging.jsonl"):
+                return real_join(tmp, rest[-1])
+            if rest == ("data",):
+                return tmp
+            return real_join(a, *rest)
+
+        with mock.patch.object(bc, "_is_staging", return_value=True), \
+             mock.patch.object(bc.os, "makedirs"), \
+             mock.patch.object(bc.os.path, "join", side_effect=_join_shim):
+            bc._ambient_learning_feed("the printer just finished the benchy")
+
+        staging = real_join(tmp, "ambient_transcripts.staging.jsonl")
+        self.assertTrue(os.path.isfile(staging))
+        with open(staging, encoding="utf-8") as fh:
+            rec = json.loads(fh.readline())
+        self.assertEqual(rec["source"], "mic")
+        self.assertEqual(rec["tag"], "ambient_standby")
+        self.assertIn("benchy", rec["text"])
+
+    def test_non_staging_uses_live_filename(self):
+        import os
+        import tempfile
+
+        bc = self.bc
+        tmp = tempfile.mkdtemp(prefix="jarvis_ambient_live_")
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp,
+                                                            ignore_errors=True))
+        real_join = os.path.join
+
+        def _join_shim(a, *rest):
+            if rest and rest[-1] in ("ambient_transcripts.jsonl",
+                                     "ambient_transcripts.staging.jsonl"):
+                return real_join(tmp, rest[-1])
+            if rest == ("data",):
+                return tmp
+            return real_join(a, *rest)
+
+        with mock.patch.object(bc, "_is_staging", return_value=False), \
+             mock.patch.object(bc.os, "makedirs"), \
+             mock.patch.object(bc.os.path, "join", side_effect=_join_shim):
+            bc._ambient_learning_feed("there is a long enough sentence here")
+
+        self.assertTrue(os.path.isfile(real_join(tmp,
+                                                 "ambient_transcripts.jsonl")))
+        self.assertFalse(os.path.isfile(real_join(
+            tmp, "ambient_transcripts.staging.jsonl")))
+
+    def test_swallows_write_exception(self):
+        bc = self.bc
+        # makedirs raising must not propagate into the listen loop.
+        with mock.patch.object(bc, "_is_staging", return_value=True), \
+             mock.patch.object(bc.os, "makedirs",
+                               side_effect=OSError("disk full")):
+            # Long-enough text so it gets past the early-return guard.
+            self.assertIsNone(
+                bc._ambient_learning_feed("a sufficiently long utterance here"))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  _standby_auto_engage  (programmatic standby flip)
+# ════════════════════════════════════════════════════════════════════════════
+class StandbyAutoEngageTests(SectionFiveBase):
+    def setUp(self):
+        bc = self.bc
+        self._orig_sleep = list(bc._sleep_mode)
+        self._orig_standby = list(bc._standby_mode)
+        self.addCleanup(lambda: (bc._sleep_mode.__setitem__(0, self._orig_sleep[0]),
+                                 bc._standby_mode.__setitem__(0, self._orig_standby[0])))
+        bc._sleep_mode[0] = False
+        bc._standby_mode[0] = False
+
+    def test_engages_and_sets_flags(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_speak") as speak, \
+             mock.patch.object(bc, "set_state") as set_state, \
+             mock.patch.object(bc, "_write_hud_state") as hud:
+            changed = bc._standby_auto_engage("music")
+        self.assertTrue(changed)
+        self.assertTrue(bc._sleep_mode[0])
+        self.assertTrue(bc._standby_mode[0])
+        speak.assert_called_once()
+        set_state.assert_called_once_with("idle")
+        hud.assert_called_once()
+
+    def test_noop_when_already_standby(self):
+        bc = self.bc
+        bc._standby_mode[0] = True
+        with mock.patch.object(bc, "_speak") as speak, \
+             mock.patch.object(bc, "set_state") as set_state:
+            self.assertFalse(bc._standby_auto_engage("music"))
+        speak.assert_not_called()
+        set_state.assert_not_called()
+
+    def test_noop_when_sleep_mode(self):
+        bc = self.bc
+        bc._sleep_mode[0] = True
+        with mock.patch.object(bc, "_speak"), \
+             mock.patch.object(bc, "set_state"):
+            self.assertFalse(bc._standby_auto_engage())
+
+    def test_tts_failure_does_not_abort_engage(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_speak",
+                               side_effect=RuntimeError("audio device gone")), \
+             mock.patch.object(bc, "set_state") as set_state, \
+             mock.patch.object(bc, "_write_hud_state"):
+            self.assertTrue(bc._standby_auto_engage("music"))
+        # Flags were set under the lock before the speak attempt; set_state
+        # still runs after the swallowed TTS error.
+        self.assertTrue(bc._standby_mode[0])
+        set_state.assert_called_once_with("idle")
+
+    def test_hud_write_failure_swallowed(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_speak"), \
+             mock.patch.object(bc, "set_state"), \
+             mock.patch.object(bc, "_write_hud_state",
+                               side_effect=RuntimeError("hud pipe broken")):
+            self.assertTrue(bc._standby_auto_engage("music"))
+        self.assertTrue(bc._standby_mode[0])
+
+    def test_set_state_failure_swallowed(self):
+        bc = self.bc
+        # The trailing set_state("idle") is wrapped in its own try/except.
+        with mock.patch.object(bc, "_speak"), \
+             mock.patch.object(bc, "_write_hud_state"), \
+             mock.patch.object(bc, "set_state",
+                               side_effect=RuntimeError("face thread gone")):
+            self.assertTrue(bc._standby_auto_engage("music"))
+        self.assertTrue(bc._standby_mode[0])
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Ambient-learning + wake-resume voice actions and their ACTIONS wiring
+# ════════════════════════════════════════════════════════════════════════════
+class AmbientLearningActionTests(SectionFiveBase):
+    def setUp(self):
+        bc = self.bc
+        self._orig = {
+            "sleep": list(bc._sleep_mode),
+            "standby": list(bc._standby_mode),
+            "ambient": list(bc._ambient_learning),
+            "resume": list(bc._resume_to_ambient),
+        }
+        self.addCleanup(self._restore)
+        bc._sleep_mode[0] = False
+        bc._standby_mode[0] = False
+        bc._ambient_learning[0] = False
+        bc._resume_to_ambient[0] = False
+
+    def _restore(self):
+        bc = self.bc
+        bc._sleep_mode[0] = self._orig["sleep"][0]
+        bc._standby_mode[0] = self._orig["standby"][0]
+        bc._ambient_learning[0] = self._orig["ambient"][0]
+        bc._resume_to_ambient[0] = self._orig["resume"][0]
+
+    def test_set_on_enters_silent_standby(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_is_staging", return_value=True), \
+             mock.patch.object(bc, "_write_hud_state") as hud:
+            msg = bc._act_ambient_learning_set(True)
+        self.assertTrue(bc._sleep_mode[0])
+        self.assertTrue(bc._standby_mode[0])
+        self.assertTrue(bc._ambient_learning[0])
+        self.assertFalse(bc._resume_to_ambient[0])
+        self.assertIn("ambient-learning", msg.lower())
+        hud.assert_called_once()
+
+    def test_set_on_starts_extractor_when_not_staging(self):
+        bc = self.bc
+        ext = types.ModuleType("skill_ambient_multimodal_extract")
+        started = []
+        ext.ambient_extract_start = lambda arg: started.append(arg)
+        with mock.patch.object(bc, "_is_staging", return_value=False), \
+             mock.patch.object(bc, "_write_hud_state"), \
+             mock.patch.dict(sys.modules,
+                             {"skill_ambient_multimodal_extract": ext}):
+            bc._act_ambient_learning_set(True)
+        self.assertEqual(started, [""])
+
+    def test_set_on_extractor_exception_swallowed(self):
+        bc = self.bc
+        ext = types.ModuleType("skill_ambient_multimodal_extract")
+        def _boom(arg):
+            raise RuntimeError("extractor failed to start")
+        ext.ambient_extract_start = _boom
+        with mock.patch.object(bc, "_is_staging", return_value=False), \
+             mock.patch.object(bc, "_write_hud_state"), \
+             mock.patch.dict(sys.modules,
+                             {"skill_ambient_multimodal_extract": ext}):
+            # Must not raise despite the extractor blowing up.
+            msg = bc._act_ambient_learning_set(True)
+        self.assertIn("ambient-learning", msg.lower())
+
+    def test_set_on_hud_exception_swallowed(self):
+        bc = self.bc
+        # The ON-path's _write_hud_state is wrapped in its own try/except.
+        with mock.patch.object(bc, "_is_staging", return_value=True), \
+             mock.patch.object(bc, "_write_hud_state",
+                               side_effect=RuntimeError("hud down")):
+            msg = bc._act_ambient_learning_set(True)
+        self.assertTrue(bc._ambient_learning[0])
+        self.assertIn("ambient-learning", msg.lower())
+
+    def test_set_off_returns_to_normal(self):
+        bc = self.bc
+        bc._ambient_learning[0] = True
+        bc._sleep_mode[0] = True
+        bc._standby_mode[0] = True
+        with mock.patch.object(bc, "_write_hud_state") as hud:
+            msg = bc._act_ambient_learning_set(False)
+        self.assertFalse(bc._ambient_learning[0])
+        self.assertFalse(bc._sleep_mode[0])
+        self.assertFalse(bc._standby_mode[0])
+        self.assertFalse(bc._resume_to_ambient[0])
+        self.assertIn("off", msg.lower())
+        hud.assert_called_once()
+
+    def test_set_off_hud_exception_swallowed(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_write_hud_state",
+                               side_effect=RuntimeError("hud down")):
+            msg = bc._act_ambient_learning_set(False)
+        self.assertIn("off", msg.lower())
+
+    # ---- _act_wake_resume_set ----
+    def test_wake_resume_answer_then_quiet(self):
+        bc = self.bc
+        orig = bc.WAKE_RESUME_MODE
+        self.addCleanup(lambda: setattr(bc, "WAKE_RESUME_MODE", orig))
+        msg = bc._act_wake_resume_set("answer then quiet")  # spaces normalised
+        self.assertEqual(bc.WAKE_RESUME_MODE, "answer_then_quiet")
+        self.assertIn("answer-then-quiet", msg.lower())
+
+    def test_wake_resume_stay_talkative_hyphen_form(self):
+        bc = self.bc
+        orig = bc.WAKE_RESUME_MODE
+        self.addCleanup(lambda: setattr(bc, "WAKE_RESUME_MODE", orig))
+        msg = bc._act_wake_resume_set("stay-talkative")
+        self.assertEqual(bc.WAKE_RESUME_MODE, "stay_talkative")
+        self.assertIn("stay-talkative", msg.lower())
+
+    def test_wake_resume_unknown_mode_rejected(self):
+        bc = self.bc
+        orig = bc.WAKE_RESUME_MODE
+        self.addCleanup(lambda: setattr(bc, "WAKE_RESUME_MODE", orig))
+        msg = bc._act_wake_resume_set("banana")
+        self.assertEqual(bc.WAKE_RESUME_MODE, orig)   # unchanged
+        self.assertIn("don't recognise", msg.lower())
+
+    # ---- ACTIONS wiring for the above ----
+    def test_actions_ambient_learning_wiring(self):
+        bc = self.bc
+        for name in ("ambient_learning_mode", "ambient_learning_mode_on",
+                     "ambient_learning_mode_off", "enter_ambient_learning",
+                     "exit_ambient_learning", "wake_resume_answer_then_quiet",
+                     "wake_resume_stay_talkative"):
+            self.assertIn(name, bc.ACTIONS)
+            self.assertTrue(callable(bc.ACTIONS[name]))
+
+    def test_actions_enter_exit_delegate_with_bool(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_act_ambient_learning_set",
+                               return_value="ok") as setter:
+            bc.ACTIONS["enter_ambient_learning"]("")
+            bc.ACTIONS["exit_ambient_learning"]("")
+        setter.assert_has_calls([mock.call(True), mock.call(False)])
+
+    def test_actions_toggle_passes_negated_state(self):
+        bc = self.bc
+        bc._ambient_learning[0] = False
+        with mock.patch.object(bc, "_act_ambient_learning_set",
+                               return_value="ok") as setter:
+            bc.ACTIONS["ambient_learning_mode"]("")
+        setter.assert_called_once_with(True)   # not (not False) -> True
+
+    def test_actions_wake_resume_lambdas_delegate(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_act_wake_resume_set",
+                               return_value="ok") as setter:
+            bc.ACTIONS["wake_resume_answer_then_quiet"]("")
+            bc.ACTIONS["wake_resume_stay_talkative"]("")
+        setter.assert_has_calls([mock.call("answer_then_quiet"),
+                                 mock.call("stay_talkative")])
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Wake-greeting selection: _pick_wake_variety + context_aware_greeting
+# ════════════════════════════════════════════════════════════════════════════
+class WakeVarietyTests(SectionFiveBase):
+    def setUp(self):
+        bc = self.bc
+        self._orig_hist = list(bc._wake_history)
+        self._orig_last = list(bc._last_wake_phrase)
+        self.addCleanup(lambda: (bc._wake_history.__setitem__(slice(None),
+                                                              self._orig_hist),
+                                 bc._last_wake_phrase.__setitem__(
+                                     0, self._orig_last[0])))
+        bc._wake_history[:] = []
+        bc._last_wake_phrase[0] = None
+
+    def test_terse_tag_chosen_when_frustrated(self):
+        bc = self.bc
+        # Force tone -> frustrated so 'terse' is the only non-general preferred
+        # tag, then make random.choice deterministic.
+        picked = {}
+        def _choice(seq):
+            picked["candidates"] = seq
+            return seq[0]
+        with mock.patch.object(bc, "detect_tone", return_value="frustrated"), \
+             mock.patch.object(bc.random, "choice", side_effect=_choice):
+            text, vol = bc._pick_wake_variety(from_standby=False,
+                                              wake_text="ugh hurry up")
+        # Every candidate must carry a preferred tag (general or terse).
+        for _t, tags in picked["candidates"]:
+            self.assertTrue(tags & {"terse", "general"})
+        self.assertIsInstance(text, str)
+        self.assertEqual(vol, 1.0)
+
+    def test_soft_tag_lowers_volume_late_night(self):
+        bc = self.bc
+        # Pick a 'soft' phrase by forcing tone tired + choosing a soft entry.
+        soft_phrase = next(t for (t, tags) in bc._WAKE_PHRASE_BANK
+                           if "soft" in tags)
+        with mock.patch.object(bc, "detect_tone", return_value="tired"), \
+             mock.patch.object(bc.random, "choice",
+                               return_value=(soft_phrase, {"soft"})):
+            text, vol = bc._pick_wake_variety(from_standby=False,
+                                              wake_text="so sleepy")
+        self.assertEqual(text, soft_phrase)
+        self.assertEqual(vol, 0.85)   # soft & preferred -> quieter
+
+    def test_repeat_phrase_avoided_when_alternatives_exist(self):
+        bc = self.bc
+        # Last phrase is a general one; ensure it's filtered from candidates.
+        last = "Yes, sir?"
+        bc._last_wake_phrase[0] = last
+        seen = {}
+        def _choice(seq):
+            seen["candidates"] = seq
+            return seq[0]
+        with mock.patch.object(bc, "detect_tone", return_value=None), \
+             mock.patch.object(bc.random, "choice", side_effect=_choice):
+            bc._pick_wake_variety(from_standby=True, wake_text="")
+        self.assertNotIn(last, [t for (t, _tg) in seen["candidates"]])
+
+    def test_recent_wakes_force_terse_preference(self):
+        bc = self.bc
+        import time as _t
+        now = _t.time()
+        bc._wake_history[:] = [now - 10, now - 20]   # 2 in last 5 min
+        seen = {}
+        with mock.patch.object(bc, "detect_tone", return_value=None), \
+             mock.patch.object(bc.random, "choice",
+                               side_effect=lambda s: (seen.setdefault("c", s) or s)[0]):
+            bc._pick_wake_variety(from_standby=False, wake_text="jarvis")
+        # 'terse' joined the preferred set, so every candidate carries a
+        # preferred tag (terse / formal-from-standby? no — general at least).
+        self.assertTrue(seen["c"])
+
+    def test_playful_tone_adds_playful_tag(self):
+        bc = self.bc
+        seen = {}
+        def _choice(seq):
+            seen["candidates"] = seq
+            return seq[0]
+        with mock.patch.object(bc, "detect_tone", return_value="playful"), \
+             mock.patch.object(bc.random, "choice", side_effect=_choice):
+            bc._pick_wake_variety(from_standby=False, wake_text="heyyy")
+        # A playful-tagged phrase ("Hm?" / "Yes?") must be among the candidates.
+        cand_texts = [t for (t, _tg) in seen["candidates"]]
+        self.assertTrue(any(t in ("Hm?", "Yes?") for t in cand_texts))
+
+    def test_empty_candidate_set_falls_back_to_full_bank(self):
+        bc = self.bc
+        # A bank whose every phrase lacks any preferred tag forces the
+        # `if not candidates: candidates = list(_WAKE_PHRASE_BANK)` fallback.
+        bank = [("Alpha.", {"nonexistent"}), ("Beta.", {"nonexistent"})]
+        seen = {}
+        def _choice(seq):
+            seen["candidates"] = list(seq)
+            return seq[0]
+        with mock.patch.object(bc, "_WAKE_PHRASE_BANK", bank), \
+             mock.patch.object(bc, "detect_tone", return_value=None), \
+             mock.patch.object(bc.random, "choice", side_effect=_choice):
+            text, _vol = bc._pick_wake_variety(from_standby=False, wake_text="hi")
+        # Fallback restored the full (patched) bank as candidates.
+        self.assertEqual([t for (t, _tg) in seen["candidates"]],
+                         ["Alpha.", "Beta."])
+        self.assertEqual(text, "Alpha.")
+
+
+class ContextAwareGreetingTests(SectionFiveBase):
+    def setUp(self):
+        bc = self.bc
+        self._orig_hist = list(bc._wake_history)
+        self._orig_date = list(bc._last_wake_date)
+        self._orig_pre = list(bc._pre_wake_silence_seconds)
+        self.addCleanup(self._restore)
+        bc._wake_history[:] = []
+        bc._last_wake_date[0] = None
+
+    def _restore(self):
+        bc = self.bc
+        bc._wake_history[:] = self._orig_hist
+        bc._last_wake_date[0] = self._orig_date[0]
+        bc._pre_wake_silence_seconds[0] = self._orig_pre[0]
+
+    def _patch_now(self, hour):
+        import datetime as _dtmod
+
+        class _FakeDateTime(_dtmod.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 6, 1, hour, 30, 0)
+        return mock.patch.object(bc_datetime_mod(self.bc), "datetime",
+                                 _FakeDateTime)
+
+    def test_still_up_branch(self):
+        bc = self.bc
+        import time as _t
+        now = _t.time()
+        # 3 wakes already in the window + 02:30 local hour -> "Still up, sir?"
+        bc._wake_history[:] = [now - 5, now - 6, now - 7]
+        with mock.patch.object(bc, "_bambu_print_progress", return_value=None), \
+             mock.patch.object(bc, "_user_looking_away", return_value=False), \
+             self._patch_now(2):
+            text, vol = bc.context_aware_greeting(from_standby=False)
+        self.assertEqual(text, "Still up, sir?")
+        self.assertEqual(vol, 1.0)
+
+    def test_good_morning_first_wake(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_bambu_print_progress", return_value=None), \
+             mock.patch.object(bc, "_user_looking_away", return_value=False), \
+             self._patch_now(7):
+            text, _vol = bc.context_aware_greeting(from_standby=False)
+        self.assertEqual(text, "Good morning, sir.")
+
+    def test_bambu_print_branch(self):
+        bc = self.bc
+        # Afternoon hour so morning/still-up don't fire; printer is mid-job.
+        with mock.patch.object(bc, "_bambu_print_progress", return_value=73), \
+             mock.patch.object(bc, "_user_looking_away", return_value=False), \
+             self._patch_now(14):
+            text, vol = bc.context_aware_greeting(from_standby=False)
+        self.assertIn("73%", text)
+        self.assertEqual(vol, 1.0)
+
+    def test_looking_away_quieter_greeting(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_bambu_print_progress", return_value=None), \
+             mock.patch.object(bc, "_user_looking_away", return_value=True), \
+             self._patch_now(14):
+            text, vol = bc.context_aware_greeting(from_standby=False)
+        self.assertEqual(text, "Yes, sir?")
+        self.assertEqual(vol, 0.55)
+
+    def test_default_falls_through_to_variety(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_bambu_print_progress", return_value=None), \
+             mock.patch.object(bc, "_user_looking_away", return_value=False), \
+             mock.patch.object(bc, "_pick_wake_variety",
+                               return_value=("Standing by, sir.", 1.0)) as pv, \
+             self._patch_now(14):
+            text, vol = bc.context_aware_greeting(from_standby=True,
+                                                  wake_text="jarvis")
+        self.assertEqual(text, "Standing by, sir.")
+        pv.assert_called_once()
+
+    def test_updates_wake_history_and_date(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_bambu_print_progress", return_value=None), \
+             mock.patch.object(bc, "_user_looking_away", return_value=False), \
+             mock.patch.object(bc, "_pick_wake_variety",
+                               return_value=("x", 1.0)), \
+             self._patch_now(14):
+            bc.context_aware_greeting(from_standby=False)
+        self.assertEqual(len(bc._wake_history), 1)        # this wake recorded
+        self.assertEqual(bc._last_wake_date[0], "2026-06-01")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Mid-task status lines
+# ════════════════════════════════════════════════════════════════════════════
+class MidTaskStatusTests(SectionFiveBase):
+    def test_generic_bucket_for_unknown_action(self):
+        bc = self.bc
+        with mock.patch.object(bc.random, "choice", side_effect=lambda s: s[0]):
+            line = bc._pick_mid_task_status_line("totally_unknown_action")
+        self.assertEqual(line, bc._MID_TASK_STATUS_LINES["_generic"][0])
+
+    def test_streaming_bucket_substitutes_service(self):
+        bc = self.bc
+        # Force the {service}-bearing line so substitution runs.
+        svc_line = next(l for l in bc._MID_TASK_STATUS_LINES["streaming"]
+                        if "{service}" in l)
+        with mock.patch.object(bc.random, "choice", return_value=svc_line):
+            line = bc._pick_mid_task_status_line("netflix")
+        self.assertNotIn("{service}", line)
+        self.assertIn("Netflix", line)
+
+    def test_streaming_unknown_service_uses_fallback_label(self):
+        bc = self.bc
+        svc_line = next(l for l in bc._MID_TASK_STATUS_LINES["streaming"]
+                        if "{service}" in l)
+        # play_streaming maps to streaming bucket but its label is "the service".
+        with mock.patch.object(bc.random, "choice", return_value=svc_line):
+            line = bc._pick_mid_task_status_line("play_streaming")
+        self.assertIn("the service", line)
+
+    def test_emit_fires_once_then_latches(self):
+        bc = self.bc
+        flag = [False]
+        with mock.patch.object(bc, "_speak") as speak, \
+             mock.patch.object(bc, "_pick_mid_task_status_line",
+                               return_value="Working on it."):
+            bc._emit_mid_task_status("upgrade", "", flag)
+            self.assertTrue(flag[0])
+            bc._emit_mid_task_status("upgrade", "", flag)   # already fired -> no-op
+        speak.assert_called_once_with("Working on it.")
+
+    def test_emit_swallows_speak_failure(self):
+        bc = self.bc
+        flag = [False]
+        with mock.patch.object(bc, "_speak",
+                               side_effect=RuntimeError("tts dead")), \
+             mock.patch.object(bc, "_pick_mid_task_status_line",
+                               return_value="Almost there, sir."):
+            # Must not raise — a missed bridge line is cosmetic.
+            self.assertIsNone(bc._emit_mid_task_status("netflix", "", flag))
+        self.assertTrue(flag[0])
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Hallucination pre-flight + confirmation gate
+# ════════════════════════════════════════════════════════════════════════════
+class PreemptiveHallucinationTests(SectionFiveBase):
+    def test_returns_none_when_action_token_present(self):
+        bc = self.bc
+        # Reply already carries an [ACTION:] token -> reactive path owns it.
+        out = bc._detect_preemptive_hallucination(
+            "Entering ambient learning mode. [ACTION: ambient_learning_mode_on]")
+        self.assertIsNone(out)
+
+    def test_inject_for_known_ambient_learning_claim(self):
+        bc = self.bc
+        out = bc._detect_preemptive_hallucination(
+            "Entering ambient-learning mode, sir.")
+        self.assertIsNotNone(out)
+        verb, name, _desc = out
+        self.assertEqual(verb, "inject")
+        self.assertEqual(name, "ambient_learning_mode_on")
+        self.assertIn(name, bc.ACTIONS)
+
+    def test_refuse_for_camera_movement_claim(self):
+        bc = self.bc
+        out = bc._detect_preemptive_hallucination(
+            "Panning the camera to the left now, sir.")
+        self.assertIsNotNone(out)
+        verb, name, _desc = out
+        self.assertEqual(verb, "refuse")
+        self.assertIsNone(name)
+
+    def test_returns_none_for_innocuous_prose(self):
+        bc = self.bc
+        out = bc._detect_preemptive_hallucination(
+            "The weather looks pleasant today, sir.")
+        self.assertIsNone(out)
+
+    def test_inject_skipped_when_action_not_registered(self):
+        bc = self.bc
+        # If the mapped action is somehow absent from ACTIONS, the matching
+        # entry must fall through to 'refuse' rather than inject a dead token.
+        trimmed = {k: v for k, v in bc.ACTIONS.items()
+                   if k != "ambient_learning_mode_on"}
+        with mock.patch.object(bc, "ACTIONS", trimmed):
+            out = bc._detect_preemptive_hallucination(
+                "Entering ambient-learning mode, sir.")
+        self.assertIsNotNone(out)
+        verb, name, _desc = out
+        self.assertEqual(verb, "refuse")
+        self.assertIsNone(name)
+
+
+class NeedsConfirmationTests(SectionFiveBase):
+    def test_empty_keyword_list_never_confirms(self):
+        bc = self.bc
+        with mock.patch.object(bc, "CONFIRM_KEYWORDS", []):
+            self.assertFalse(bc._needs_confirmation("delete_everything", "now"))
+
+    def test_keyword_in_action_name(self):
+        bc = self.bc
+        with mock.patch.object(bc, "CONFIRM_KEYWORDS", ["delete", "buy"]):
+            self.assertTrue(bc._needs_confirmation("delete_file", "report.txt"))
+
+    def test_keyword_in_arg(self):
+        bc = self.bc
+        with mock.patch.object(bc, "CONFIRM_KEYWORDS", ["purchase"]):
+            self.assertTrue(bc._needs_confirmation("open_url",
+                                                   "https://shop/purchase"))
+
+    def test_no_keyword_match(self):
+        bc = self.bc
+        with mock.patch.object(bc, "CONFIRM_KEYWORDS", ["delete", "format"]):
+            self.assertFalse(bc._needs_confirmation("open_url", "example.com"))
+
+
+def bc_datetime_mod(bc):
+    """context_aware_greeting / _pick_wake_variety do `from datetime import
+    datetime as _dt` *inside* the function, so the name they resolve is the
+    `datetime` module attribute on the stdlib module — patching
+    bc.datetime won't help. They import the stdlib `datetime` module fresh each
+    call, so we patch the global `datetime` module object that the monolith
+    imported at top level."""
+    import datetime as _dtmod
+    return _dtmod
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

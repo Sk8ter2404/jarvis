@@ -17,6 +17,8 @@ tearDown.
 """
 from __future__ import annotations
 
+import io
+import itertools
 import json
 import os
 import sys
@@ -1616,6 +1618,1046 @@ class SessionResumeReaderTests(MonolithGlobalsTestCase):
             f.write("- [ ] **2026-05-30 10:00** [self-heal] — fix it\n")
             f.write("- [ ] **2026-05-30 11:00** [deep-audit] — scan\n")
         with mock.patch.object(self.bc, "TODO_FILE", todo):
+            self.assertEqual(self.bc._last_queued_task_line(), "")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  COVERAGE EXTENSION (2026-06) — additional branches in the sec4 range
+#  (take_screenshot monitor/PIL/encode paths, ask_vision connection-error and
+#  no-local tails, ask_vision_multi error fallbacks, the pyautogui-import and
+#  ui_* reticle branches, offscreen-capture poll/SetWindowPos/close paths, the
+#  streaming keyboard+strict orchestration, Apple Music sidebar fallback,
+#  iTunes COM pythoncom-absent paths, and session-resume reader edge cases).
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _fake_mss_module(sct):
+    """A MagicMock standing in for the ``mss`` module whose ``mss()`` context
+    manager yields *sct*. ``MSS`` is deleted so the monolith's
+    ``getattr(mss, 'MSS', mss.mss)`` resolves to ``mss.mss`` (mirrors the
+    existing TakeScreenshotTests idiom)."""
+    mssmod = mock.MagicMock()
+    mssmod.mss.return_value.__enter__ = lambda s: sct
+    mssmod.mss.return_value.__exit__ = lambda *a: False
+    del mssmod.MSS
+    return mssmod
+
+
+@requires_monolith
+class TakeScreenshotBranchTests(MonolithGlobalsTestCase):
+    """take_screenshot — monitor-region, PIL-fallback, and encode-failure
+    branches not exercised by the original TakeScreenshotTests."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def _fake_pil(self, size=(800, 600)):
+        img = mock.MagicMock()
+        img.size = size
+        img.resize.return_value = img
+
+        def _save(buf, format=None, optimize=None):
+            buf.write(b"PNGBYTES")
+
+        img.save.side_effect = _save
+        pil = mock.MagicMock()
+        pil.Image.frombytes.return_value = img
+        pil.Image.LANCZOS = 1
+        return pil, img
+
+    def test_named_monitor_uses_monitor_region(self):
+        # monitor in MONITORS → builds an explicit {left,top,width,height}
+        # region from MONITORS[name] rather than sct.monitors[0]. (line 6901-2)
+        name = next(iter(self.bc.MONITORS))
+        pil, _img = self._fake_pil()
+        sct = mock.MagicMock()
+        raw = mock.MagicMock()
+        raw.size = (800, 600)
+        raw.bgra = b""
+        sct.grab.return_value = raw
+        # sct.monitors[0] is deliberately NOT used on this path.
+        sct.monitors = [{"left": 999, "top": 999, "width": 1, "height": 1}]
+        with mock.patch.dict(sys.modules,
+                             {"mss": _fake_mss_module(sct), "PIL": pil}):
+            self.assertEqual(self.bc.take_screenshot(monitor=name), b"PNGBYTES")
+        x, y, w, h = self.bc.MONITORS[name]
+        sct.grab.assert_called_once_with(
+            {"left": x, "top": y, "width": w, "height": h})
+
+    def test_pil_fallback_when_mss_raises(self):
+        # mss import/grab explodes → ImageGrab.grab() fallback. (lines 6909-6920)
+        pil, _img = self._fake_pil()
+        grabbed = mock.MagicMock()
+        grabbed.size = (800, 600)
+        grabbed.resize.return_value = grabbed
+        grabbed.save.side_effect = lambda buf, **k: buf.write(b"PILBYTES")
+        pil.ImageGrab.grab.return_value = grabbed
+        mssmod = mock.MagicMock()
+        mssmod.mss.side_effect = RuntimeError("no mss here")
+        del mssmod.MSS
+        with mock.patch.dict(sys.modules, {"mss": mssmod, "PIL": pil}):
+            self.assertEqual(self.bc.take_screenshot(), b"PILBYTES")
+        pil.ImageGrab.grab.assert_called_once_with()
+
+    def test_pil_fallback_named_monitor_uses_bbox(self):
+        # mss fails AND a known monitor is requested → ImageGrab.grab(bbox=…,
+        # all_screens=True). (lines 6913-6915)
+        name = next(iter(self.bc.MONITORS))
+        x, y, w, h = self.bc.MONITORS[name]
+        pil, _img = self._fake_pil()
+        grabbed = mock.MagicMock()
+        grabbed.size = (w, h)
+        grabbed.resize.return_value = grabbed
+        grabbed.save.side_effect = lambda buf, **k: buf.write(b"BBOXBYTES")
+        pil.ImageGrab.grab.return_value = grabbed
+        mssmod = mock.MagicMock()
+        mssmod.mss.side_effect = RuntimeError("nope")
+        del mssmod.MSS
+        with mock.patch.dict(sys.modules, {"mss": mssmod, "PIL": pil}):
+            self.assertEqual(self.bc.take_screenshot(monitor=name), b"BBOXBYTES")
+        pil.ImageGrab.grab.assert_called_once_with(
+            bbox=(x, y, x + w, y + h), all_screens=True)
+
+    def test_both_capture_paths_fail_returns_none(self):
+        # mss raises and ImageGrab also raises → None. (lines 6918-6920)
+        pil, _img = self._fake_pil()
+        pil.ImageGrab.grab.side_effect = RuntimeError("no display")
+        mssmod = mock.MagicMock()
+        mssmod.mss.side_effect = RuntimeError("no mss")
+        del mssmod.MSS
+        with mock.patch.dict(sys.modules, {"mss": mssmod, "PIL": pil}):
+            self.assertIsNone(self.bc.take_screenshot())
+
+    def test_encode_failure_returns_none(self):
+        # img.save() raises during PNG encode → None. (lines 6931-6933)
+        pil, img = self._fake_pil()
+        img.save.side_effect = RuntimeError("encode boom")
+        sct = mock.MagicMock()
+        raw = mock.MagicMock()
+        raw.size = (800, 600)
+        raw.bgra = b""
+        sct.grab.return_value = raw
+        sct.monitors = [{"left": 0, "top": 0, "width": 800, "height": 600}]
+        with mock.patch.dict(sys.modules,
+                             {"mss": _fake_mss_module(sct), "PIL": pil}):
+            self.assertIsNone(self.bc.take_screenshot())
+
+
+@requires_monolith
+class AskVisionTailTests(MonolithGlobalsTestCase):
+    """ask_vision — the connection/timeout-error and no-local tail branches
+    (lines 6982-7000) the original AskVisionTests didn't reach."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_connection_error_falls_back_to_local(self):
+        # APIConnectionError → local VLM fallback returns text. (lines 6982-6986)
+        anth = _make_fake_anthropic()
+        anth.Anthropic.side_effect = anth.APIConnectionError("unreachable")
+        with mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
+             mock.patch.object(self.bc, "_call_local_vision", return_value="offline eye"), \
+             mock.patch.dict(sys.modules, {"anthropic": anth}):
+            self.assertEqual(self.bc.ask_vision("q", b"PNG"),
+                             "[local-vision] offline eye")
+
+    def test_connection_error_no_local_returns_failure(self):
+        # APITimeoutError + no local → "(vision failed: …)". (line 6987)
+        anth = _make_fake_anthropic()
+        anth.Anthropic.side_effect = anth.APITimeoutError("timed out")
+        with mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
+             mock.patch.object(self.bc, "_call_local_vision", return_value=None), \
+             mock.patch.dict(sys.modules, {"anthropic": anth}):
+            out = self.bc.ask_vision("q", b"PNG")
+        self.assertIn("vision failed", out)
+
+    def test_catchall_no_local_returns_typed_failure(self):
+        # Generic (non-anthropic) error + no local → "(vision failed:
+        # <ExcType>)" via the catch-all. (line 7000)
+        anth = _make_fake_anthropic()
+        anth.Anthropic.side_effect = RuntimeError("weird sdk")
+        with mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
+             mock.patch.object(self.bc, "_call_local_vision", return_value=None), \
+             mock.patch.dict(sys.modules, {"anthropic": anth}):
+            out = self.bc.ask_vision("q", b"PNG")
+        self.assertIn("vision failed", out)
+        self.assertIn("RuntimeError", out)
+
+    def test_screenshot_taken_when_png_none(self):
+        # png_bytes omitted → take_screenshot() is invoked. (line 6947)
+        with mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(self.bc, "AI_BACKEND", "ollama"), \
+             mock.patch.object(self.bc, "take_screenshot",
+                               return_value=b"CAP") as cap, \
+             mock.patch.object(self.bc, "_call_local_vision", return_value="x"):
+            self.bc.ask_vision("q")
+        cap.assert_called_once()
+
+
+@requires_monolith
+class AskVisionMultiTailTests(MonolithGlobalsTestCase):
+    """ask_vision_multi — non-claude no-local stub and the Claude-error→local
+    fallback tails (lines 7056, 7084-7107)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_non_claude_no_local_returns_stub(self):
+        # AI_BACKEND != claude and local fallback empty → stub. (line 7056)
+        with mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(self.bc, "AI_BACKEND", "ollama"), \
+             mock.patch.object(self.bc, "_call_local_vision", return_value=None):
+            out = self.bc.ask_vision_multi("q", {"left": b"a"})
+        self.assertIn("requires Claude backend", out)
+
+    def test_status_error_falls_back_to_local(self):
+        # Claude APIStatusError → _local_multi_fallback returns text. (7084-7090)
+        anth = _make_fake_anthropic()
+        err = anth.APIStatusError("rate")
+        err.status_code = 429
+        anth.Anthropic.side_effect = err
+        with mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
+             mock.patch.object(self.bc, "_call_local_vision", return_value="m"), \
+             mock.patch.dict(sys.modules, {"anthropic": anth}):
+            out = self.bc.ask_vision_multi("q", {"left": b"a"})
+        self.assertEqual(out, "[local-vision] m")
+
+    def test_status_error_no_local_returns_http_failure(self):
+        # Claude APIStatusError + no local → "(vision failed: HTTP …)". (7091)
+        anth = _make_fake_anthropic()
+        err = anth.APIStatusError("server")
+        err.status_code = 503
+        anth.Anthropic.side_effect = err
+        with mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
+             mock.patch.object(self.bc, "_call_local_vision", return_value=None), \
+             mock.patch.dict(sys.modules, {"anthropic": anth}):
+            out = self.bc.ask_vision_multi("q", {"left": b"a"})
+        self.assertIn("HTTP 503", out)
+
+    def test_connection_error_no_local_returns_failure(self):
+        # APIConnectionError + no local → "(vision failed: …)". (7092-7097)
+        anth = _make_fake_anthropic()
+        anth.Anthropic.side_effect = anth.APIConnectionError("down")
+        with mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
+             mock.patch.object(self.bc, "_call_local_vision", return_value=None), \
+             mock.patch.dict(sys.modules, {"anthropic": anth}):
+            out = self.bc.ask_vision_multi("q", {"left": b"a"})
+        self.assertIn("vision failed", out)
+
+    def test_connection_error_falls_back_to_local(self):
+        # APITimeoutError → local fallback returns text. (7092-7096)
+        anth = _make_fake_anthropic()
+        anth.Anthropic.side_effect = anth.APITimeoutError("slow")
+        with mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
+             mock.patch.object(self.bc, "_call_local_vision", return_value="ans"), \
+             mock.patch.dict(sys.modules, {"anthropic": anth}):
+            out = self.bc.ask_vision_multi("q", {"left": b"a"})
+        self.assertEqual(out, "[local-vision] ans")
+
+    def test_catchall_falls_back_to_local(self):
+        # Generic error in the Claude path → catch-all routes to local. (7098-7106)
+        anth = _make_fake_anthropic()
+        anth.Anthropic.side_effect = RuntimeError("kaboom")
+        with mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
+             mock.patch.object(self.bc, "_call_local_vision", return_value="cf"), \
+             mock.patch.dict(sys.modules, {"anthropic": anth}):
+            out = self.bc.ask_vision_multi("q", {"left": b"a"})
+        self.assertEqual(out, "[local-vision] cf")
+
+    def test_catchall_no_local_returns_typed_failure(self):
+        # Generic error + no local → "(vision failed: <ExcType>)". (7107)
+        anth = _make_fake_anthropic()
+        anth.Anthropic.side_effect = RuntimeError("kaboom")
+        with mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
+             mock.patch.object(self.bc, "_call_local_vision", return_value=None), \
+             mock.patch.dict(sys.modules, {"anthropic": anth}):
+            out = self.bc.ask_vision_multi("q", {"left": b"a"})
+        self.assertIn("vision failed", out)
+        self.assertIn("RuntimeError", out)
+
+
+@requires_monolith
+class FindClickTargetTranslateTests(MonolithGlobalsTestCase):
+    """find_click_target — the no-monitor virtual-origin translate failure
+    branch (lines 7255-7256) where the mss re-open raises and the raw refined
+    coords are returned unchanged."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    @staticmethod
+    def _real_png(w, h):
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.new("RGB", (w, h)).save(buf, format="PNG")
+        return buf.getvalue()
+
+    def test_virtual_origin_lookup_failure_returns_raw_coords(self):
+        # Pass-1 succeeds on a real (small) PNG; the Pass-2 full-res capture
+        # returns None so refine is skipped; with no monitor specified the
+        # translate block re-opens mss for the virtual-screen origin — and here
+        # that raises, so the raw refined (x,y) is returned unchanged.
+        # (lines 7249-7256, including the 7255-7256 except.)
+        png1 = self._real_png(100, 80)
+        with mock.patch.object(self.bc, "take_screenshot",
+                               side_effect=[png1, None]), \
+             mock.patch.object(self.bc, "_native_capture_size",
+                               return_value=(100, 80)), \
+             mock.patch.object(self.bc, "_query_vision_for_coords",
+                               return_value=(40, 50)), \
+             mock.patch.dict(sys.modules, {"mss": None}):
+            # mss=None → `import mss` raises ImportError → except → raw coords.
+            self.assertEqual(self.bc.find_click_target("a button"), (40, 50))
+
+
+@requires_monolith
+class GetPyautoguiImportSuccessTests(MonolithGlobalsTestCase):
+    """_get_pyautogui — the successful-import branch (lines 7282-7284) that
+    sets FAILSAFE/PAUSE and caches the module."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def setUp(self):
+        self._saved = self.bc._pyautogui
+
+    def tearDown(self):
+        self.bc._pyautogui = self._saved
+
+    def test_import_success_configures_and_caches(self):
+        self.bc._pyautogui = None
+        fake = mock.MagicMock()
+        with mock.patch.dict(sys.modules, {"pyautogui": fake}):
+            got = self.bc._get_pyautogui()
+        self.assertIs(got, fake)
+        self.assertIs(self.bc._pyautogui, fake)
+        self.assertTrue(fake.FAILSAFE)
+        self.assertEqual(fake.PAUSE, 0.15)
+
+
+@requires_monolith
+class UISafeRetryReraiseTests(MonolithGlobalsTestCase):
+    """_ui_safe / _nudge_from_corner — the retry-raises-a-non-failsafe path
+    (lines 7331-7332) and the nudge position-error swallow (7310-7311)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_retry_raises_other_exception_propagates(self):
+        # First call FailSafe → nudge → retry raises a *different* error,
+        # which must propagate (not be wrapped as UIFailsafeError). (7331)
+        pag = _FakePag(pos=(0, 0))
+        calls = {"n": 0}
+
+        def op():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise FailSafeException()
+            raise ValueError("second-call boom")
+
+        with self.assertRaises(ValueError):
+            self.bc._ui_safe(pag, op)
+        self.assertEqual(calls["n"], 2)
+
+    def test_nudge_position_error_returns_false(self):
+        # pag.position() raising → _nudge_from_corner swallows and returns
+        # False. (lines 7310-7311)
+        pag = _FakePag()
+        pag.position = mock.Mock(side_effect=RuntimeError("no cursor"))
+        self.assertFalse(self.bc._nudge_from_corner(pag))
+
+    def test_failsafe_with_no_nudge_raises_ui_error(self):
+        # FailSafe fires but the cursor is NOT in a corner, so
+        # _nudge_from_corner returns False → no retry, raise UIFailsafeError
+        # directly. (line 7332)
+        pag = _FakePag(pos=(500, 500))  # mid-screen → no nudge
+
+        def op():
+            raise FailSafeException()
+
+        with self.assertRaises(self.bc.UIFailsafeError):
+            self.bc._ui_safe(pag, op)
+        self.assertEqual(pag.moved, [])  # no nudge attempted
+
+
+@requires_monolith
+class UIWrapperBranchTests(MonolithGlobalsTestCase):
+    """ui_* wrappers — the no-pyautogui early returns for double_click/hotkey/
+    scroll (lines 7361, 7386, 7395) and the ui_press reticle branch when a
+    window centre is available (line 7380)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_ui_double_click_noop_without_pyautogui(self):
+        with mock.patch.object(self.bc, "_get_pyautogui", return_value=None):
+            self.assertIsNone(self.bc.ui_double_click(1, 2))
+
+    def test_ui_hotkey_noop_without_pyautogui(self):
+        with mock.patch.object(self.bc, "_get_pyautogui", return_value=None):
+            self.assertIsNone(self.bc.ui_hotkey("ctrl", "c"))
+
+    def test_ui_scroll_noop_without_pyautogui(self):
+        with mock.patch.object(self.bc, "_get_pyautogui", return_value=None):
+            self.assertIsNone(self.bc.ui_scroll(3))
+
+    def test_ui_press_publishes_reticle_at_window_center(self):
+        # center is not None → the reticle is published at it. (line 7380)
+        pag = _FakePag()
+        with mock.patch.object(self.bc, "_get_pyautogui", return_value=pag), \
+             mock.patch.object(self.bc, "_active_window_center", return_value=(9, 12)), \
+             mock.patch.object(self.bc, "_publish_reticle") as ret:
+            self.bc.ui_press("enter")
+        self.assertEqual(pag.pressed, ["enter"])
+        self.assertEqual(ret.call_args[0][:2], (9, 12))
+
+    def test_ui_click_virtual_bounds_error_still_clicks(self):
+        # _virtual_screen_bounds raising is swallowed; click proceeds with the
+        # original (unclamped) coords. (lines 7348-7349)
+        pag = _FakePag()
+        with mock.patch.object(self.bc, "_get_pyautogui", return_value=pag), \
+             mock.patch.object(self.bc, "_publish_reticle"), \
+             mock.patch.object(self.bc, "_virtual_screen_bounds",
+                               side_effect=RuntimeError("no bounds")):
+            self.bc.ui_click(33, 44)
+        self.assertEqual(pag.clicks, [(33, 44, "left")])
+
+
+@requires_monolith
+class OffscreenCaptureFlowTests(MonolithGlobalsTestCase):
+    """_open_url_offscreen_capture — the scheme-prefix, window-found poll,
+    SetWindowPos-failure, capture-error, and printwindow_failed paths past the
+    early guards already covered by OpenUrlOffscreenCaptureTests.
+
+    NOTE: the win32 GDI PrintWindow/bitmap-blit *happy* path (≈ lines
+    7581-7610) needs real HWND/DC handles and is not unit-testable here — it is
+    left for a later ``# pragma: no cover`` pass."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def _win32(self, found_hwnd=4242):
+        """A win32gui mock whose EnumWindows reports exactly one NEW chrome
+        window (so the spawn-poll finds a target). The GDI capture is forced
+        to fail so we exercise the post-capture cleanup/close without needing
+        real handles."""
+        w32 = mock.MagicMock()
+        # EnumWindows(cb, None): the callback is driven by the monolith. We
+        # bypass the real callback path by having _enum return our hwnd via a
+        # side effect on EnumWindows that invokes the callback for our hwnd.
+        def _enum(cb, _):
+            cb(found_hwnd, None)
+            return True
+        w32.EnumWindows.side_effect = _enum
+        w32.GetClassName.return_value = "Chrome_WidgetWin_1"
+        w32.IsWindowVisible.return_value = True
+        w32.GetWindowRect.return_value = (0, 0, 800, 600)
+        return w32
+
+    def test_prefixes_scheme_and_capture_fails_returns_printwindow_failed(self):
+        # url lacks scheme (→ https:// prefixed, line 7489); a NEW window is
+        # found; the GDI capture raises → png stays None → "printwindow_failed"
+        # and WM_CLOSE is posted. (lines 7489, 7549-7554, 7635-7647)
+        w32 = self._win32()
+        # First _enum_chrome_hwnds() (pre) must be EMPTY, the second (post-
+        # spawn) must contain our hwnd. Toggle GetWindowDC to raise so the
+        # capture body fails fast.
+        w32.GetWindowDC.side_effect = RuntimeError("no DC in tests")
+        states = {"spawned": False}
+
+        def _enum(cb, _):
+            if states["spawned"]:
+                cb(4242, None)
+            return True
+        w32.EnumWindows.side_effect = _enum
+
+        def _popen(*a, **k):
+            states["spawned"] = True
+            return mock.MagicMock()
+
+        # Monotonic clock that never exhausts: deadline = first_tick + 5.0, and
+        # each subsequent tick is +0.1 so the poll loop stays inside the window
+        # and exits by *finding* the new hwnd, not by timing out.
+        clock = iter(100.0 + 0.1 * i for i in itertools.count())
+        w32ui = mock.MagicMock()
+        ctypes_mod = mock.MagicMock()
+        pil = mock.MagicMock()
+        with mock.patch.dict(sys.modules, {
+                "win32gui": w32, "win32ui": w32ui, "win32con": mock.MagicMock(),
+                "ctypes": ctypes_mod, "PIL": pil}), \
+             mock.patch.object(self.bc, "_find_chrome", return_value=r"C:\chrome.exe"), \
+             mock.patch.object(self.bc.subprocess, "Popen", side_effect=_popen), \
+             mock.patch.object(self.bc.time, "sleep"), \
+             mock.patch.object(self.bc.time, "time", side_effect=lambda: next(clock)):
+            png, reason = self.bc._open_url_offscreen_capture("example.com")
+        self.assertIsNone(png)
+        self.assertEqual(reason, "printwindow_failed")
+        # WM_CLOSE (0x0010) posted to the found window.
+        w32.PostMessage.assert_called_once_with(4242, 0x0010, 0, 0)
+
+    def test_setwindowpos_error_swallowed_then_capture_fails(self):
+        # The window is found (large rect passes the >200 enum filter), then
+        # SetWindowPos raises and is swallowed (lines 7567-7568); the capture
+        # also fails (GetWindowDC raises) → "printwindow_failed".
+        w32 = self._win32()  # GetWindowRect → (0,0,800,600), passes the filter
+        w32.SetWindowPos.side_effect = RuntimeError("park failed")
+        w32.GetWindowDC.side_effect = RuntimeError("no DC")
+        states = {"spawned": False}
+
+        def _enum(cb, _):
+            if states["spawned"]:
+                cb(4242, None)
+            return True
+        w32.EnumWindows.side_effect = _enum
+
+        def _popen(*a, **k):
+            states["spawned"] = True
+            return mock.MagicMock()
+
+        clock = iter(100.0 + 0.1 * i for i in itertools.count())
+        with mock.patch.dict(sys.modules, {
+                "win32gui": w32, "win32ui": mock.MagicMock(),
+                "win32con": mock.MagicMock(), "ctypes": mock.MagicMock(),
+                "PIL": mock.MagicMock()}), \
+             mock.patch.object(self.bc, "_find_chrome", return_value=r"C:\chrome.exe"), \
+             mock.patch.object(self.bc.subprocess, "Popen", side_effect=_popen), \
+             mock.patch.object(self.bc.time, "sleep"), \
+             mock.patch.object(self.bc.time, "time", side_effect=lambda: next(clock)):
+            png, reason = self.bc._open_url_offscreen_capture("https://example.com")
+        self.assertIsNone(png)
+        self.assertEqual(reason, "printwindow_failed")
+        w32.SetWindowPos.assert_called_once()
+
+    def test_enum_callback_and_enumwindows_errors_swallowed(self):
+        # Inside _enum_chrome_hwnds: the per-window callback swallows
+        # GetClassName errors (lines 7516-7517) and EnumWindows itself is
+        # guarded (7521-7522). With EnumWindows always raising, no window is
+        # ever found → "chrome_window_not_found".
+        w32 = mock.MagicMock()
+        w32.GetClassName.side_effect = RuntimeError("class lookup failed")
+
+        def _enum(cb, _):
+            # Drive the callback once (exercising its except), then blow up to
+            # exercise the outer guard.
+            cb(1, None)
+            raise RuntimeError("EnumWindows failed")
+        w32.EnumWindows.side_effect = _enum
+
+        clock = iter(100.0 + 6.0 * i for i in itertools.count())  # 2nd tick past deadline
+        with mock.patch.dict(sys.modules, {
+                "win32gui": w32, "win32ui": mock.MagicMock(),
+                "win32con": mock.MagicMock(), "ctypes": mock.MagicMock(),
+                "PIL": mock.MagicMock()}), \
+             mock.patch.object(self.bc, "_find_chrome", return_value=r"C:\chrome.exe"), \
+             mock.patch.object(self.bc.subprocess, "Popen", return_value=mock.MagicMock()), \
+             mock.patch.object(self.bc.time, "sleep"), \
+             mock.patch.object(self.bc.time, "time", side_effect=lambda: next(clock)):
+            png, reason = self.bc._open_url_offscreen_capture("https://example.com")
+        self.assertIsNone(png)
+        self.assertEqual(reason, "chrome_window_not_found")
+
+
+@requires_monolith
+class ExtractYoutubeUrlBranchTests(MonolithGlobalsTestCase):
+    """_extract_youtube_url_from_search — the skill-raises swallow (lines
+    7727-7728)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_skill_raises_then_serp_fallback(self):
+        # find_direct_url raises → swallowed → SERP path runs and matches.
+        skill = mock.MagicMock()
+        skill.find_direct_url.side_effect = RuntimeError("yt-dlp died")
+        resp = mock.Mock(status_code=200,
+                         text="x https://www.youtube.com/watch?v=dQw4w9WgXcQ x")
+        with mock.patch.dict(sys.modules, {"skill_youtube_search": skill}), \
+             mock.patch.object(self.bc.requests, "get", return_value=resp):
+            self.assertEqual(
+                self.bc._extract_youtube_url_from_search("never gonna"),
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            )
+
+    def test_skill_returns_empty_then_serp_fallback(self):
+        # find_direct_url returns falsy → no early return → SERP path. (7725)
+        skill = mock.MagicMock()
+        skill.find_direct_url.return_value = ""
+        resp = mock.Mock(status_code=200,
+                         text="https://youtu.be/abcdefghijk here")
+        with mock.patch.dict(sys.modules, {"skill_youtube_search": skill}), \
+             mock.patch.object(self.bc.requests, "get", return_value=resp):
+            self.assertEqual(
+                self.bc._extract_youtube_url_from_search("clip"),
+                "https://www.youtube.com/watch?v=abcdefghijk",
+            )
+
+
+@requires_monolith
+class StreamingKeyboardSelectBranchTests(MonolithGlobalsTestCase):
+    """_streaming_keyboard_select_first_result — disabled, happy Tab+Enter
+    sequence, failsafe re-raise, and generic-error swallow."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def _cfg(self, **over):
+        cfg = {"keyboard_pre_wait": 0.0, "keyboard_tab_count": 3,
+               "keyboard_tab_interval": 0.0, "keyboard_post_wait": 0.0}
+        cfg.update(over)
+        return cfg
+
+    def test_disabled_returns_false(self):
+        with mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", False):
+            self.assertFalse(
+                self.bc._streaming_keyboard_select_first_result(self._cfg(), "Svc"))
+
+    def test_sends_tabs_then_enter(self):
+        presses = []
+        with mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
+             mock.patch.object(self.bc.time, "sleep"), \
+             mock.patch.object(self.bc, "ui_press", side_effect=presses.append):
+            ok = self.bc._streaming_keyboard_select_first_result(self._cfg(), "Svc")
+        self.assertTrue(ok)
+        # 3 tabs + 1 enter
+        self.assertEqual(presses, ["tab", "tab", "tab", "enter"])
+
+    def test_failsafe_propagates(self):
+        with mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
+             mock.patch.object(self.bc.time, "sleep"), \
+             mock.patch.object(self.bc, "ui_press",
+                               side_effect=self.bc.UIFailsafeError("corner")):
+            with self.assertRaises(self.bc.UIFailsafeError):
+                self.bc._streaming_keyboard_select_first_result(self._cfg(), "Svc")
+
+    def test_other_exception_returns_false(self):
+        with mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
+             mock.patch.object(self.bc.time, "sleep"), \
+             mock.patch.object(self.bc, "ui_press",
+                               side_effect=RuntimeError("kbd lost")):
+            self.assertFalse(
+                self.bc._streaming_keyboard_select_first_result(self._cfg(), "Svc"))
+
+
+@requires_monolith
+class StreamingAutoPlayBranchTests(MonolithGlobalsTestCase):
+    """_streaming_auto_play — keyboard-select path, strict-find failure,
+    ui_click failsafe surfacing, strict delegation, and the default-path
+    play-button-missing / failsafe / fullscreen branches."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def _caps(self):
+        """Enter the with-block having all auto-click capabilities enabled."""
+        return [
+            mock.patch.object(self.bc.webbrowser, "open"),
+            mock.patch.object(self.bc.time, "sleep"),
+            mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True),
+            mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True),
+            mock.patch.object(self.bc, "AI_BACKEND", "claude"),
+        ]
+
+    def test_keyboard_select_failsafe_returns_message(self):
+        # Apple Music uses select_method=keyboard; the keyboard select raising
+        # UIFailsafeError surfaces a friendly message. (lines 8233-8236)
+        with self._caps()[0], self._caps()[1], \
+             mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
+             mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
+             mock.patch.object(self.bc, "_streaming_keyboard_select_first_result",
+                               side_effect=self.bc.UIFailsafeError("in a corner, sir")):
+            out = self.bc._streaming_auto_play("apple_music", "some song")
+        self.assertIn("in a corner", out)
+
+    def test_keyboard_select_not_sent_returns_hint(self):
+        # keyboard select returns False (UI automation unavailable) → hint.
+        # (lines 8237-8242)
+        with self._caps()[0], self._caps()[1], \
+             mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
+             mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
+             mock.patch.object(self.bc, "_streaming_keyboard_select_first_result",
+                               return_value=False):
+            out = self.bc._streaming_auto_play("apple_music", "some song")
+        self.assertIn("UI", out)
+        self.assertIn("click the first result yourself", out)
+
+    def test_keyboard_path_delegates_to_play_and_verify(self):
+        # keyboard select succeeds, play_hint present, strict → delegates to
+        # _streaming_play_and_verify. (lines 8249-context, 8279)
+        with self._caps()[0], self._caps()[1], \
+             mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
+             mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
+             mock.patch.object(self.bc, "_streaming_keyboard_select_first_result",
+                               return_value=True), \
+             mock.patch.object(self.bc, "_streaming_play_and_verify",
+                               return_value="playing 'x' on Apple Music") as pv:
+            out = self.bc._streaming_auto_play("apple_music", "x")
+        self.assertEqual(out, "playing 'x' on Apple Music")
+        pv.assert_called_once()
+
+    def test_strict_vision_find_miss_returns_hint(self):
+        # Spotify is vision-select; force it strict via a patched cfg so the
+        # strict find (via _streaming_find_with_retry) returning None yields
+        # the "couldn't see the first result" hint. (lines 8248-8258)
+        cfg = dict(self.bc._STREAMING_SERVICES["spotify"])
+        cfg["verify_play"] = True
+        with self._caps()[0], self._caps()[1], \
+             mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
+             mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
+             mock.patch.dict(self.bc._STREAMING_SERVICES, {"spotify": cfg}), \
+             mock.patch.object(self.bc, "_streaming_find_with_retry", return_value=None):
+            out = self.bc._streaming_auto_play("spotify", "some album")
+        self.assertIn("couldn't see the", out)
+
+    def test_vision_click_failsafe_returns_message(self):
+        # Vision select path: ui_click raises UIFailsafeError → message.
+        # (lines 8259-8262)
+        with self._caps()[0], self._caps()[1], \
+             mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
+             mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
+             mock.patch.object(self.bc, "find_click_target", return_value=(5, 6)), \
+             mock.patch.object(self.bc, "ui_click",
+                               side_effect=self.bc.UIFailsafeError("corner")):
+            out = self.bc._streaming_auto_play("netflix", "the matrix")
+        self.assertIn("corner", out)
+
+    def test_default_play_button_missing_returns_hint(self):
+        # Netflix default path, play button not located → hint. (lines 8284-8288)
+        with self._caps()[0], self._caps()[1], \
+             mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
+             mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
+             mock.patch.object(self.bc, "find_click_target",
+                               side_effect=[(10, 20), None]), \
+             mock.patch.object(self.bc, "ui_click"):
+            out = self.bc._streaming_auto_play("netflix", "the matrix")
+        self.assertIn("couldn't locate the play", out)
+
+    def test_default_play_click_failsafe_returns_message(self):
+        # Netflix default path, play-button click raises UIFailsafeError.
+        # (lines 8289-8292)
+        with self._caps()[0], self._caps()[1], \
+             mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
+             mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
+             mock.patch.object(self.bc, "find_click_target", return_value=(10, 20)), \
+             mock.patch.object(self.bc, "ui_click",
+                               side_effect=[None, self.bc.UIFailsafeError("corner")]):
+            out = self.bc._streaming_auto_play("netflix", "the matrix")
+        self.assertIn("corner", out)
+
+
+@requires_monolith
+class StreamingGoFullscreenErrorTests(MonolithGlobalsTestCase):
+    """_streaming_go_fullscreen — the exception-swallow branch (8321-8322)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_fullscreen_press_error_swallowed(self):
+        cfg = {"fullscreen_key": "f", "fullscreen_wait": 0.0}
+        with mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
+             mock.patch.object(self.bc.time, "sleep"), \
+             mock.patch.object(self.bc, "ui_press", side_effect=RuntimeError("boom")):
+            # Must not raise.
+            self.assertIsNone(self.bc._streaming_go_fullscreen(cfg, "Svc"))
+
+
+@requires_monolith
+class AppleMusicPlaylistSidebarTests(MonolithGlobalsTestCase):
+    """_apple_music_play_playlist — the sidebar-fallback navigation branch
+    (lines 8398-8438) when the direct URL doesn't surface the playlist."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def _caps(self):
+        return mock.patch.multiple(
+            self.bc, SCREEN_VISION_ENABLED=True, UI_AUTOMATION_ENABLED=True,
+            AI_BACKEND="claude")
+
+    def test_sidebar_fallback_then_found_delegates(self):
+        # find_with_retry: miss, then hit after sidebar clicks. Library and
+        # Playlists links both found and clicked. (lines 8398-8425, 8434-8438)
+        with mock.patch.object(self.bc.webbrowser, "open"), \
+             mock.patch.object(self.bc.time, "sleep"), \
+             self._caps(), \
+             mock.patch.object(self.bc, "_streaming_find_with_retry",
+                               side_effect=[None, (12, 13)]), \
+             mock.patch.object(self.bc, "find_click_target",
+                               side_effect=[(1, 1), (2, 2)]), \
+             mock.patch.object(self.bc, "ui_click") as click, \
+             mock.patch.object(self.bc, "_streaming_play_and_verify",
+                               return_value="playing 'chill' on Apple Music") as pv:
+            out = self.bc._apple_music_play_playlist("chill")
+        self.assertEqual(out, "playing 'chill' on Apple Music")
+        # Library click, Playlists click, then the playlist tile click.
+        self.assertEqual(click.call_count, 3)
+        pv.assert_called_once()
+
+    def test_sidebar_library_click_failsafe(self):
+        # Library sidebar click raises UIFailsafeError → friendly message.
+        # (lines 8408-8411)
+        with mock.patch.object(self.bc.webbrowser, "open"), \
+             mock.patch.object(self.bc.time, "sleep"), \
+             self._caps(), \
+             mock.patch.object(self.bc, "_streaming_find_with_retry", return_value=None), \
+             mock.patch.object(self.bc, "find_click_target", return_value=(1, 1)), \
+             mock.patch.object(self.bc, "ui_click",
+                               side_effect=self.bc.UIFailsafeError("corner")):
+            out = self.bc._apple_music_play_playlist("chill")
+        self.assertIn("couldn't navigate to Apple Music Library", out)
+
+    def test_sidebar_playlists_click_failsafe(self):
+        # Library click OK, Playlists sub-link click raises. (lines 8417-8421)
+        with mock.patch.object(self.bc.webbrowser, "open"), \
+             mock.patch.object(self.bc.time, "sleep"), \
+             self._caps(), \
+             mock.patch.object(self.bc, "_streaming_find_with_retry", return_value=None), \
+             mock.patch.object(self.bc, "find_click_target",
+                               side_effect=[(1, 1), (2, 2)]), \
+             mock.patch.object(self.bc, "ui_click",
+                               side_effect=[None, self.bc.UIFailsafeError("corner")]):
+            out = self.bc._apple_music_play_playlist("chill")
+        self.assertIn("couldn't open Apple Music Playlists", out)
+
+    def test_playlist_tile_click_failsafe(self):
+        # Playlist found on first try, but the tile click raises. (8434-8438)
+        with mock.patch.object(self.bc.webbrowser, "open"), \
+             mock.patch.object(self.bc.time, "sleep"), \
+             self._caps(), \
+             mock.patch.object(self.bc, "_streaming_find_with_retry", return_value=(7, 8)), \
+             mock.patch.object(self.bc, "ui_click",
+                               side_effect=self.bc.UIFailsafeError("corner")):
+            out = self.bc._apple_music_play_playlist("chill")
+        self.assertIn("found playlist 'chill'", out)
+        self.assertIn("corner", out)
+
+
+@requires_monolith
+class AppleMusicChromeActiveErrorTests(MonolithGlobalsTestCase):
+    """_apple_music_chrome_active — the generic-exception branch (8604-8605)
+    where pygetwindow imports but enumerating windows raises."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def setUp(self):
+        self._saved_seen = self.bc._apple_music_last_seen[0]
+
+    def tearDown(self):
+        self.bc._apple_music_last_seen[0] = self._saved_seen
+
+    def test_getallwindows_raises_falls_through_to_cache(self):
+        gw = mock.MagicMock()
+        gw.getAllWindows.side_effect = RuntimeError("win enum blew up")
+        self.bc._apple_music_last_seen[0] = 0.0   # cold cache → False
+        with mock.patch.dict(sys.modules, {"pygetwindow": gw}):
+            self.assertFalse(self.bc._apple_music_chrome_active())
+
+    def test_getallwindows_raises_but_warm_cache_true(self):
+        gw = mock.MagicMock()
+        gw.getAllWindows.side_effect = RuntimeError("boom")
+        self.bc._apple_music_last_seen[0] = time.time()  # warm → True
+        with mock.patch.dict(sys.modules, {"pygetwindow": gw}):
+            self.assertTrue(self.bc._apple_music_chrome_active())
+
+
+@requires_monolith
+class RunItunesComTimeoutPythoncomTests(MonolithGlobalsTestCase):
+    """_run_itunes_com_timeout — the pythoncom-absent CoInitialize/Uninitialize
+    swallow paths (lines 8647-8648, 8658-8659) run on the worker thread."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_pythoncom_absent_still_returns_result(self):
+        # pythoncom import fails on the worker → CoInitialize swallowed (8647-8)
+        # and the CoUninitialize block is skipped (com_inited stays False).
+        with mock.patch.dict(sys.modules, {"pythoncom": None}):
+            out = self.bc._run_itunes_com_timeout(lambda: (True, "ok"), timeout=5)
+        self.assertEqual(out, (True, "ok"))
+
+    def test_pythoncom_uninit_error_swallowed(self):
+        # CoInitialize succeeds (com_inited=True) so the finally runs, but
+        # CoUninitialize raises → swallowed; result still returned. (8658-8659)
+        fake = mock.MagicMock()
+        fake.CoUninitialize.side_effect = RuntimeError("uninit failed")
+        with mock.patch.dict(sys.modules, {"pythoncom": fake}):
+            out = self.bc._run_itunes_com_timeout(lambda: (True, "done"), timeout=5)
+        self.assertEqual(out, (True, "done"))
+        fake.CoInitialize.assert_called_once()
+
+
+@requires_monolith
+class PlayMusicCoreFieldTests(MonolithGlobalsTestCase):
+    """_play_music_core — additional field-prefix mappings (song/album/track)
+    and the single-match (no '(N matches)' suffix) message form."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def _itunes_with_one_track(self, name="Track", artist="Artist", count=1):
+        app = mock.MagicMock()
+        tracks = mock.MagicMock()
+        tracks.Count = count
+        first = mock.MagicMock()
+        first.Name = name
+        first.Artist = artist
+        tracks.Item.return_value = first
+        app.LibraryPlaylist.Search.return_value = tracks
+        return app
+
+    def test_song_prefix_searches_songs_field(self):
+        app = self._itunes_with_one_track()
+        with mock.patch.object(self.bc, "_get_itunes", return_value=(app, None)):
+            ok, _msg = self.bc._play_music_core("song: yesterday")
+        self.assertTrue(ok)
+        args = app.LibraryPlaylist.Search.call_args[0]
+        self.assertEqual(args[0], "yesterday")
+        self.assertEqual(args[1], self.bc._ITUNES_SEARCH_SONGS)
+
+    def test_album_prefix_searches_albums_field(self):
+        app = self._itunes_with_one_track()
+        with mock.patch.object(self.bc, "_get_itunes", return_value=(app, None)):
+            ok, _msg = self.bc._play_music_core("album: abbey road")
+        self.assertTrue(ok)
+        self.assertEqual(app.LibraryPlaylist.Search.call_args[0][1],
+                         self.bc._ITUNES_SEARCH_ALBUMS)
+
+    def test_track_prefix_maps_to_songs_field(self):
+        app = self._itunes_with_one_track()
+        with mock.patch.object(self.bc, "_get_itunes", return_value=(app, None)):
+            ok, _msg = self.bc._play_music_core("track: come together")
+        self.assertTrue(ok)
+        self.assertEqual(app.LibraryPlaylist.Search.call_args[0][1],
+                         self.bc._ITUNES_SEARCH_SONGS)
+
+    def test_single_match_has_no_queue_suffix(self):
+        app = self._itunes_with_one_track(name="Solo", artist="One", count=1)
+        with mock.patch.object(self.bc, "_get_itunes", return_value=(app, None)):
+            ok, msg = self.bc._play_music_core("solo")
+        self.assertTrue(ok)
+        self.assertNotIn("matches", msg)
+        self.assertIn("Solo", msg)
+
+    def test_itunes_handle_none_returns_error_message(self):
+        # _get_itunes returns (None, err) inside the worker → (False, err).
+        with mock.patch.object(self.bc, "_get_itunes",
+                               return_value=(None, "iTunes asleep")):
+            ok, msg = self.bc._play_music_core("anything")
+        self.assertFalse(ok)
+        self.assertEqual(msg, "iTunes asleep")
+
+
+@requires_monolith
+class SessionResumeReaderBranchTests(MonolithGlobalsTestCase):
+    """_last_session_end_ts / _last_n_user_commands — the fall-through ladder
+    (non-numeric ts → iso parse-fail → legacy date) and the file-open-error /
+    blank-line paths not covered by SessionResumeReaderTests."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    # ---- _last_session_end_ts fall-through ladder ----
+    def test_non_numeric_ts_falls_to_iso(self):
+        # ts present but non-numeric → float() raises (8788-8789) → iso_end used.
+        pm = mock.MagicMock()
+        pm.get_session_summaries.return_value = [
+            {"ts": "not-a-number", "iso_end": "2026-05-30T20:00:00"}]
+        with mock.patch.object(self.bc, "pattern_memory", pm):
+            ts = self.bc._last_session_end_ts()
+        self.assertEqual(ts, time.mktime(time.strptime("2026-05-30T20:00:00",
+                                                       "%Y-%m-%dT%H:%M:%S")))
+
+    def test_bad_iso_falls_to_legacy_date(self):
+        # iso_end unparseable (8794-8795) → legacy `date` at 20:00. (8796-8802)
+        pm = mock.MagicMock()
+        pm.get_session_summaries.return_value = [
+            {"iso_end": "garbage-timestamp", "date": "2026-05-29"}]
+        with mock.patch.object(self.bc, "pattern_memory", pm):
+            ts = self.bc._last_session_end_ts()
+        self.assertEqual(ts, time.mktime(time.strptime("2026-05-29T20:00:00",
+                                                       "%Y-%m-%dT%H:%M:%S")))
+
+    def test_bad_date_returns_zero(self):
+        # date present but unparseable (8803-8804) → falls off → 0.0.
+        pm = mock.MagicMock()
+        pm.get_session_summaries.return_value = [{"date": "not-a-date"}]
+        with mock.patch.object(self.bc, "pattern_memory", pm):
+            self.assertEqual(self.bc._last_session_end_ts(), 0.0)
+
+    def test_empty_ts_string_skips_to_iso(self):
+        # ts falsy ("") → the `if ts:` guard skips the numeric block entirely,
+        # iso_end then drives the result.
+        pm = mock.MagicMock()
+        pm.get_session_summaries.return_value = [
+            {"ts": "", "iso_start": "2026-05-28T20:00:00"}]
+        with mock.patch.object(self.bc, "pattern_memory", pm):
+            ts = self.bc._last_session_end_ts()
+        self.assertEqual(ts, time.mktime(time.strptime("2026-05-28T20:00:00",
+                                                       "%Y-%m-%dT%H:%M:%S")))
+
+    # ---- _last_n_user_commands edge cases ----
+    def test_open_error_returns_empty(self):
+        # File exists but open() raises → []. (lines 8820-8821)
+        with mock.patch.object(self.bc.os.path, "exists", return_value=True), \
+             mock.patch("builtins.open", side_effect=OSError("locked")):
+            self.assertEqual(self.bc._last_n_user_commands(3), [])
+
+    def test_blank_lines_are_skipped(self):
+        # Blank/whitespace-only lines are skipped (line 8826); only the two
+        # real entries are returned newest-first.
+        data = "\n".join(["", "   ",
+                          json.dumps({"text": "alpha"}),
+                          json.dumps({"text": "beta"})])
+        with mock.patch.object(self.bc.os.path, "exists", return_value=True), \
+             mock.patch("builtins.open", mock.mock_open(read_data=data)):
+            self.assertEqual(self.bc._last_n_user_commands(5), ["beta", "alpha"])
+
+    def test_entry_without_text_is_skipped(self):
+        # JSON line with no 'text' field contributes nothing. (8831-8832 false)
+        data = "\n".join([json.dumps({"foo": "bar"}),
+                          json.dumps({"text": "kept"})])
+        with mock.patch.object(self.bc.os.path, "exists", return_value=True), \
+             mock.patch("builtins.open", mock.mock_open(read_data=data)):
+            self.assertEqual(self.bc._last_n_user_commands(5), ["kept"])
+
+    # ---- _last_queued_task_line file-open error ----
+    def test_last_queued_open_error_returns_empty(self):
+        # TODO_FILE exists but read raises → "". (lines 8855-8856)
+        with mock.patch.object(self.bc.os.path, "exists", return_value=True), \
+             mock.patch("builtins.open", side_effect=OSError("io")):
             self.assertEqual(self.bc._last_queued_task_line(), "")
 
 

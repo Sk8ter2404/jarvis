@@ -1589,5 +1589,1394 @@ class MiscBootHelperTests(SectionSixBase):
         self.assertIsNone(bc._release_singleton())
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  Coverage-extension pass — error/edge branches under-exercised above.
+#  Each class targets a specific uncovered span in the 10903-13152 band; all
+#  I/O (LLM/anthropic/subprocess/threads/filesystem) is mocked or redirected.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  _jarvis_pushback — close_window threshold WITHOUT an unsaved-work blurb
+#  (line 11065: the else arm of the blurb conditional).
+# ────────────────────────────────────────────────────────────────────────────
+class JarvisPushbackCloseWindowTests(SectionSixBase):
+    def test_close_window_over_threshold_no_blurb(self):
+        bc = self.bc
+        # N+1 windows whose titles carry NO unsaved hint -> blurb is None ->
+        # the plain "...windows. Are you certain?" phrase fires (line 11065).
+        n = bc.PUSHBACK_MAX_CLOSE_WINDOWS + 2
+        wins = [_FakeWin(title=f"Plain Window {i}") for i in range(n)]
+        with mock.patch.object(bc, "PUSHBACK_ENABLED", True), \
+             mock.patch.object(bc, "_find_windows_by_title", lambda low: wins):
+            out = bc._jarvis_pushback("close_window", "window")
+        self.assertIsNotNone(out)
+        phrase, reason = out
+        self.assertIn(f"close {n} windows", phrase)
+        self.assertNotIn("including", phrase)  # no blurb appended
+        self.assertIn("Are you certain?", phrase)
+        self.assertIn("close_window matched", reason)
+
+    def test_close_window_with_blurb_takes_other_branch(self):
+        bc = self.bc
+        # A clearly-unsaved title yields a blurb -> the "...including <blurb>"
+        # arm fires instead (keeps the two arms distinguished).
+        n = bc.PUSHBACK_MAX_CLOSE_WINDOWS + 1
+        wins = [_FakeWin(title="* draft.txt - Notepad")] + [
+            _FakeWin(title=f"Plain {i}") for i in range(n)]
+        with mock.patch.object(bc, "PUSHBACK_ENABLED", True), \
+             mock.patch.object(bc, "_find_windows_by_title", lambda low: wins):
+            out = bc._jarvis_pushback("close_window", "draft")
+        self.assertIsNotNone(out)
+        self.assertIn("including", out[0])
+
+    def test_find_windows_raising_is_swallowed(self):
+        bc = self.bc
+        # _find_windows_by_title throwing -> matches=[] -> below threshold ->
+        # returns None (exercises the except arm at 11056-11057).
+        with mock.patch.object(bc, "PUSHBACK_ENABLED", True), \
+             mock.patch.object(bc, "_find_windows_by_title",
+                               side_effect=RuntimeError("win32 down")):
+            self.assertIsNone(bc._jarvis_pushback("close_window", "anything"))
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  _mission_narration_cue — bad-template branch (11222-11223): a template
+#  whose .format(arg=...) raises falls back to the raw template body.
+# ────────────────────────────────────────────────────────────────────────────
+class MissionNarrationCueErrorTests(SectionSixBase):
+    def test_bad_template_falls_back_to_raw(self):
+        bc = self.bc
+        # A template referencing an unknown field raises KeyError in .format(),
+        # so the except restores tpl.rstrip() (line 11223).
+        bad = dict(bc._MISSION_NARRATION_CUES)
+        bad["weird_action"] = "Doing {nonexistent_field}"
+        with mock.patch.object(bc, "_MISSION_NARRATION_CUES", bad):
+            out = bc._mission_narration_cue("weird_action", "x", 1, 2)
+        self.assertEqual(out, "Doing {nonexistent_field}…")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  parse_and_run_actions — TTS-failure + autocorrect + UIFailsafe + mid-task
+#  branches the happy-path tests don't hit.
+# ────────────────────────────────────────────────────────────────────────────
+class ParseAndRunActionsBranchTests(SectionSixBase):
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        self._p(bc, "_write_hud_state", lambda **k: None)
+        self._p(bc, "record_session_action", lambda *a, **k: None)
+        self._p(bc, "record_action_history", lambda *a, **k: None)
+        self._p(bc, "record_action_error", lambda *a, **k: None)
+        self._p(bc, "_cmd_autocorrect", None)
+        self._p(bc, "PC_CONTROL_ENABLED", True)
+
+    def _with_action(self, name, fn, informative=False):
+        bc = self.bc
+        acts = dict(bc.ACTIONS)
+        acts[name] = fn
+        self._p(bc, "ACTIONS", acts)
+        if informative:
+            self._p(bc, "INFORMATIVE_ACTIONS",
+                    set(bc.INFORMATIVE_ACTIONS) | {name})
+
+    def test_narration_intro_tts_failure_is_caught(self):
+        # _speak raising on the intro must not abort the dispatch (11375-11376).
+        bc = self.bc
+        self._with_action("act_one", lambda a: "1")
+
+        def speak(*a, **k):
+            raise RuntimeError("intro tts dead")
+
+        with mock.patch.object(bc, "MISSION_NARRATION_ENABLED", True), \
+             mock.patch.object(bc, "MISSION_NARRATION_THRESHOLD", 3), \
+             mock.patch.object(bc, "_needs_confirmation", lambda n, a: False), \
+             mock.patch.object(bc, "_jarvis_pushback", lambda n, a: None), \
+             mock.patch.object(bc, "_speak", speak):
+            cleaned, results = bc.parse_and_run_actions(
+                "[ACTION: act_one, a] [ACTION: act_one, b] [ACTION: act_one, c]")
+        # All three still ran despite the intro TTS blowing up.
+        self.assertEqual(len(results), 3)
+
+    def test_narration_cue_tts_failure_is_caught(self):
+        # _speak raises ONLY on the per-step cue (not the intro), exercising
+        # 11473-11474 while still letting the action run.
+        bc = self.bc
+        ran = []
+        self._with_action("act_one", lambda a: ran.append(a) or "1")
+        calls = {"n": 0}
+
+        def speak(*a, **k):
+            calls["n"] += 1
+            if calls["n"] > 1:   # let the intro through, fail on cues
+                raise RuntimeError("cue tts dead")
+
+        with mock.patch.object(bc, "MISSION_NARRATION_ENABLED", True), \
+             mock.patch.object(bc, "MISSION_NARRATION_THRESHOLD", 3), \
+             mock.patch.object(bc, "_needs_confirmation", lambda n, a: False), \
+             mock.patch.object(bc, "_jarvis_pushback", lambda n, a: None), \
+             mock.patch.object(bc, "_speak", speak):
+            cleaned, results = bc.parse_and_run_actions(
+                "[ACTION: act_one, a] [ACTION: act_one, b] [ACTION: act_one, c]")
+        self.assertEqual(ran, ["a", "b", "c"])
+
+    def test_autocorrect_scoring_exception_treated_as_no_match(self):
+        # autocorrect_command_choice raising -> choice defaults to status=none
+        # -> unknown-action path (11400-11402 + 11442-11444).
+        bc = self.bc
+        fake_ac = types.SimpleNamespace(
+            autocorrect_command_choice=mock.Mock(
+                side_effect=RuntimeError("scorer exploded")))
+        with mock.patch.object(bc, "_cmd_autocorrect", fake_ac):
+            cleaned, results = bc.parse_and_run_actions("[ACTION: zzzbad, x]")
+        self.assertEqual(results[0][0], "zzzbad")
+        self.assertIn("unknown action", results[0][1])
+
+    def test_autocorrect_silent_confirm_tts_failure_is_caught(self):
+        # silent reroute whose confirmation _speak raises (11411-11412): the
+        # action still runs on the corrected name.
+        bc = self.bc
+        ran = []
+        self._with_action("real_target", lambda a: ran.append(a) or "ok")
+        fake_ac = types.SimpleNamespace(
+            autocorrect_command_choice=lambda name, keys, **kw: {
+                "status": "silent",
+                "primary": ("real_target", 0.95),
+                "secondary": None,
+            })
+
+        def speak(*a, **k):
+            raise RuntimeError("confirm tts dead")
+
+        with mock.patch.object(bc, "_cmd_autocorrect", fake_ac), \
+             mock.patch.object(bc, "_needs_confirmation", lambda n, a: False), \
+             mock.patch.object(bc, "_jarvis_pushback", lambda n, a: None), \
+             mock.patch.object(bc, "_speak", speak):
+            cleaned, results = bc.parse_and_run_actions("[ACTION: realtarget, hi]")
+        self.assertEqual(ran, ["hi"])
+        self.assertEqual(results[0][0], "real_target")
+
+    def test_autocorrect_disambig_tts_failure_is_caught(self):
+        # ambiguous branch whose 'did you mean' _speak raises (11430-11431):
+        # the choice is still queued and an AMBIGUOUS result returned.
+        bc = self.bc
+        self._with_action("opt_a", lambda a: "A")
+        self._with_action("opt_b", lambda a: "B")
+        fake_ac = types.SimpleNamespace(
+            autocorrect_command_choice=lambda name, keys, **kw: {
+                "status": "ambiguous",
+                "primary": ("opt_a", 0.80),
+                "secondary": ("opt_b", 0.78),
+            })
+
+        def speak(*a, **k):
+            raise RuntimeError("disambig tts dead")
+
+        with mock.patch.object(bc, "_cmd_autocorrect", fake_ac), \
+             mock.patch.object(bc, "_speak", speak):
+            bc._pending_autocorrect_choice.clear()
+            cleaned, results = bc.parse_and_run_actions("[ACTION: opt, x]")
+        self.assertIn("AMBIGUOUS", results[0][1])
+        self.assertEqual(len(bc._pending_autocorrect_choice), 1)
+
+    def test_autocorrect_no_candidate_falls_to_unknown(self):
+        # status='none' WITH a sub-threshold primary -> the else 'no match'
+        # branch prints best-conf (11439-11440) then unknown-action path.
+        bc = self.bc
+        fake_ac = types.SimpleNamespace(
+            autocorrect_command_choice=lambda name, keys, **kw: {
+                "status": "none",
+                "primary": ("close_thing", 0.40),
+                "secondary": None,
+            })
+        with mock.patch.object(bc, "_cmd_autocorrect", fake_ac):
+            cleaned, results = bc.parse_and_run_actions("[ACTION: clsthing, x]")
+        self.assertIn("unknown action", results[0][1])
+
+    def test_autocorrect_silent_primary_not_in_actions_falls_through(self):
+        # silent status but primary[0] not in ACTIONS -> skips the reroute,
+        # lands on unknown-action (covers the guard on 11406).
+        bc = self.bc
+        fake_ac = types.SimpleNamespace(
+            autocorrect_command_choice=lambda name, keys, **kw: {
+                "status": "silent",
+                "primary": ("ghost_never_registered", 0.99),
+                "secondary": None,
+            })
+        with mock.patch.object(bc, "_cmd_autocorrect", fake_ac):
+            cleaned, results = bc.parse_and_run_actions("[ACTION: ghosty, x]")
+        self.assertIn("unknown action", results[0][1])
+
+    def test_uifailsafe_error_yields_clean_message(self):
+        # fn raising UIFailsafeError -> the dedicated except arm (11520-11521)
+        # surfaces the message verbatim, NOT routed through _jfl.
+        bc = self.bc
+
+        def trip(_a):
+            raise bc.UIFailsafeError("fail-safe tripped, sir")
+
+        self._with_action("clicker", trip)
+        with mock.patch.object(bc, "_needs_confirmation", lambda n, a: False), \
+             mock.patch.object(bc, "_jarvis_pushback", lambda n, a: None), \
+             mock.patch.object(bc, "_speak", lambda *a, **k: None):
+            cleaned, results = bc.parse_and_run_actions("[ACTION: clicker, here]")
+        name, msg, informative = results[0]
+        self.assertEqual(name, "clicker")
+        self.assertEqual(msg, "fail-safe tripped, sir")
+        self.assertFalse(informative)
+
+    def test_action_exception_with_traceback_capture_failing(self):
+        # The inner traceback.format_exc() raising (11538-11539) must not stop
+        # the JARVIS-voice failure result from being recorded.
+        bc = self.bc
+
+        def boom(_a):
+            raise ValueError("primary boom")
+
+        self._with_action("boomer", boom)
+        with mock.patch.object(bc, "_needs_confirmation", lambda n, a: False), \
+             mock.patch.object(bc, "_jarvis_pushback", lambda n, a: None), \
+             mock.patch.object(bc, "_speak", lambda *a, **k: None), \
+             mock.patch.object(bc.traceback, "format_exc",
+                               side_effect=RuntimeError("tb unavailable")):
+            cleaned, results = bc.parse_and_run_actions("[ACTION: boomer, x]")
+        self.assertEqual(results[0][0], "boomer")
+        self.assertIn("failed", results[0][1].lower())
+
+    def test_mid_task_timer_started_and_cancelled(self):
+        # Long-running action with MID_TASK_STATUS_ENABLED -> the threading.Timer
+        # block (11488-11498) runs and the finally cancels it (11547-11553).
+        # threading.Timer is faked so NO real thread/timer is created.
+        bc = self.bc
+        events = []
+
+        class FakeTimer:
+            def __init__(self, delay, fn, args=()):
+                self.delay, self.fn, self.args = delay, fn, args
+                self.daemon = False
+
+            def start(self):
+                events.append("start")
+
+            def cancel(self):
+                events.append("cancel")
+
+            def join(self, timeout=None):
+                events.append("join")
+
+        # Pick a real long-running action name and register a fast handler.
+        long_name = sorted(bc.LONG_RUNNING_ACTIONS)[0]
+        self._with_action(long_name, lambda a: "done")
+        with mock.patch.object(bc, "MID_TASK_STATUS_ENABLED", True), \
+             mock.patch.object(bc.threading, "Timer", FakeTimer), \
+             mock.patch.object(bc, "_needs_confirmation", lambda n, a: False), \
+             mock.patch.object(bc, "_jarvis_pushback", lambda n, a: None), \
+             mock.patch.object(bc, "_speak", lambda *a, **k: None):
+            cleaned, results = bc.parse_and_run_actions(
+                f"[ACTION: {long_name}, thing]")
+        self.assertEqual(results[0][0], long_name)
+        # Timer was started then cancelled in the finally.
+        self.assertIn("start", events)
+        self.assertIn("cancel", events)
+
+    def test_mid_task_timer_start_failure_is_caught(self):
+        # threading.Timer construction raising (11496-11498) leaves _mid_task_timer
+        # None and the action still runs.
+        bc = self.bc
+
+        def bad_timer(*a, **k):
+            raise RuntimeError("no threads left")
+
+        long_name = sorted(bc.LONG_RUNNING_ACTIONS)[0]
+        self._with_action(long_name, lambda a: "done")
+        with mock.patch.object(bc, "MID_TASK_STATUS_ENABLED", True), \
+             mock.patch.object(bc.threading, "Timer", bad_timer), \
+             mock.patch.object(bc, "_needs_confirmation", lambda n, a: False), \
+             mock.patch.object(bc, "_jarvis_pushback", lambda n, a: None), \
+             mock.patch.object(bc, "_speak", lambda *a, **k: None):
+            cleaned, results = bc.parse_and_run_actions(
+                f"[ACTION: {long_name}, thing]")
+        self.assertEqual(results[0][1], "done")
+
+    def test_mid_task_timer_already_fired_is_joined(self):
+        # When the timer "fired" before fn returned, the finally join()s it
+        # (11550-11551). FakeTimer.start() flips the shared fired-flag (the
+        # third positional arg) to simulate the bridge having fired — no real
+        # thread runs.
+        bc = self.bc
+        events = []
+
+        class FakeTimer:
+            def __init__(self, delay, fn, args=()):
+                self.args = args
+                self.daemon = False
+
+            def start(self):
+                events.append("start")
+                # args == (name, arg, _mid_task_fired) — mark it fired.
+                self.args[2][0] = True
+
+            def cancel(self):
+                events.append("cancel")
+
+            def join(self, timeout=None):
+                events.append("join")
+
+        long_name = sorted(bc.LONG_RUNNING_ACTIONS)[0]
+        self._with_action(long_name, lambda a: "done")
+        with mock.patch.object(bc, "MID_TASK_STATUS_ENABLED", True), \
+             mock.patch.object(bc.threading, "Timer", FakeTimer), \
+             mock.patch.object(bc, "_needs_confirmation", lambda n, a: False), \
+             mock.patch.object(bc, "_jarvis_pushback", lambda n, a: None), \
+             mock.patch.object(bc, "_speak", lambda *a, **k: None):
+            cleaned, results = bc.parse_and_run_actions(
+                f"[ACTION: {long_name}, thing]")
+        self.assertEqual(results[0][1], "done")
+        # cancel() AND join() both ran because the fired-flag was set.
+        self.assertIn("cancel", events)
+        self.assertIn("join", events)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  get_followup_response — ollama backend + mode-router addendum import path.
+# ────────────────────────────────────────────────────────────────────────────
+class GetFollowupResponseExtraTests(SectionSixBase):
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        self._p(bc, "_last_voice_route", [{"addendum": ""}])
+        self._p(bc, "_last_user_tone", [None])
+
+    def test_ollama_backend_path(self):
+        # AI_BACKEND == 'ollama' -> the ollama.chat branch (11699-11705).
+        bc = self.bc
+        fake_ollama = types.ModuleType("ollama")
+        captured = {}
+
+        def chat(model, messages):
+            captured["model"] = model
+            captured["messages"] = messages
+            return {"message": {"content": "ollama follow-up"}}
+
+        fake_ollama.chat = chat
+        with mock.patch.object(bc, "AI_BACKEND", "ollama"), \
+             mock.patch.dict(sys.modules, {"ollama": fake_ollama}):
+            out = bc.get_followup_response([("get_time", "noon")])
+        self.assertEqual(out, "ollama follow-up")
+        # The system prompt is the first message and the action summary the last.
+        self.assertEqual(captured["messages"][0]["role"], "system")
+        self.assertIn("get_time", captured["messages"][-1]["content"])
+
+    def test_mode_router_addendum_failure_is_swallowed(self):
+        # The mode_router import / call raising (11675-11676) must not break
+        # the follow-up; the claude path still returns.
+        bc = self.bc
+
+        class FakeClient:
+            def complete(self, **kwargs):
+                return "ok, sir."
+
+        import core.mode_router as _mr
+        with mock.patch.object(bc, "AI_BACKEND", "claude"), \
+             mock.patch.object(bc, "_llm_client", FakeClient()), \
+             mock.patch.object(_mr, "system_prompt_addendum",
+                               side_effect=RuntimeError("mode router down")):
+            out = bc.get_followup_response([("x", "y")])
+        self.assertEqual(out, "ok, sir.")
+
+    def test_claude_without_llm_client_uses_anthropic_sdk(self):
+        # _llm_client is None on the claude path -> the raw anthropic SDK
+        # branch (11694-11698) is taken.
+        bc = self.bc
+        import anthropic
+        fake_msg = types.SimpleNamespace(
+            content=[types.SimpleNamespace(text="sdk follow-up")])
+
+        class FakeAnthropic:
+            def __init__(self, *a, **k):
+                self.messages = self
+
+            def create(self, **k):
+                return fake_msg
+
+        with mock.patch.object(bc, "AI_BACKEND", "claude"), \
+             mock.patch.object(bc, "_llm_client", None), \
+             mock.patch.object(anthropic, "Anthropic", FakeAnthropic):
+            out = bc.get_followup_response([("get_time", "3")])
+        self.assertEqual(out, "sdk follow-up")
+
+    def test_unknown_backend_returns_empty(self):
+        # AI_BACKEND that is neither 'claude' nor 'ollama' falls past both
+        # branches to the trailing `return ""` (11720).
+        bc = self.bc
+        with mock.patch.object(bc, "AI_BACKEND", "some_other_backend"):
+            out = bc.get_followup_response([("x", "y")])
+        self.assertEqual(out, "")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  handle_autocorrect_disambig_response — the TTS-failure + vanished-action +
+#  successful-run branches not covered by the primary suite.
+# ────────────────────────────────────────────────────────────────────────────
+class HandleAutocorrectDisambigBranchTests(SectionSixBase):
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        self._p(bc, "record_session_action", lambda *a, **k: None)
+        self._p(bc, "record_action_history", lambda *a, **k: None)
+        self.ran = []
+        acts = dict(bc.ACTIONS)
+        acts["alpha"] = lambda a: self.ran.append(("alpha", a)) or "A"
+        acts["beta"] = lambda a: self.ran.append(("beta", a)) or "B"
+        self._p(bc, "ACTIONS", acts)
+
+    def _queue(self, primary=("alpha", "q"), secondary=("beta", "q")):
+        self.bc._pending_autocorrect_choice.clear()
+        self.bc._pending_autocorrect_choice.append(
+            {"primary": primary, "secondary": secondary, "original": "alfa"})
+
+    def test_cancel_tts_failure_still_consumes(self):
+        # 'no' -> cancel; the "Cancelled, sir." _speak raising (11792-11793)
+        # must still consume the turn.
+        self._queue()
+        with mock.patch.object(self.bc, "_speak",
+                               side_effect=RuntimeError("tts dead")):
+            self.assertTrue(
+                self.bc.handle_autocorrect_disambig_response("no"))
+        self.assertEqual(self.ran, [])
+
+    def test_vanished_action_tts_failure_still_consumes(self):
+        # picked action missing AND the "can't run" _speak raises (11803-11804).
+        self._queue(primary=("ghost_action", "q"))
+        with mock.patch.object(self.bc, "_speak",
+                               side_effect=RuntimeError("tts dead")):
+            self.assertTrue(
+                self.bc.handle_autocorrect_disambig_response("first"))
+        self.assertEqual(self.ran, [])
+
+    def test_destructive_refusal_tts_failure_still_consumes(self):
+        # destructive pick refusal whose _speak raises (11819-11820).
+        bc = self.bc
+        dr = sorted(bc._DESTRUCTIVE_REPLAY_ACTIONS)[0]
+        ran = []
+        acts = dict(bc.ACTIONS)
+        acts[dr] = lambda a: ran.append(a) or "ran"
+        with mock.patch.object(bc, "ACTIONS", acts), \
+             mock.patch.object(bc, "_speak",
+                               side_effect=RuntimeError("tts dead")):
+            bc._pending_autocorrect_choice.clear()
+            bc._pending_autocorrect_choice.append(
+                {"primary": (dr, "q"), "secondary": ("beta", "q"),
+                 "original": "x"})
+            self.assertTrue(
+                bc.handle_autocorrect_disambig_response("yes"))
+        self.assertEqual(ran, [])
+
+    def test_successful_run_confirm_tts_failure_then_action_raises(self):
+        # The happy 'run' path with BOTH the confirm _speak failing (11825-11826)
+        # AND the action itself raising (11833-11834) — both swallowed, consumed.
+        bc = self.bc
+
+        def boom(_a):
+            raise RuntimeError("action exploded")
+
+        acts = dict(bc.ACTIONS)
+        acts["gamma"] = boom
+        with mock.patch.object(bc, "ACTIONS", acts), \
+             mock.patch.object(bc, "_speak",
+                               side_effect=RuntimeError("confirm tts dead")), \
+             mock.patch.object(bc, "record_session_action", lambda *a, **k: None), \
+             mock.patch.object(bc, "record_action_history", lambda *a, **k: None):
+            bc._pending_autocorrect_choice.clear()
+            bc._pending_autocorrect_choice.append(
+                {"primary": ("gamma", "q"), "secondary": ("beta", "q"),
+                 "original": "gama"})
+            self.assertTrue(
+                bc.handle_autocorrect_disambig_response("first"))
+
+    def test_successful_run_records_history(self):
+        # Plain successful pick -> fn runs, history recorded (11827-11832).
+        self._queue()
+        recorded = []
+        with mock.patch.object(self.bc, "_speak", lambda *a, **k: None), \
+             mock.patch.object(self.bc, "record_action_history",
+                               lambda *a, **k: recorded.append(a)):
+            self.assertTrue(
+                self.bc.handle_autocorrect_disambig_response("alpha"))
+        self.assertEqual(self.ran, [("alpha", "q")])
+        self.assertEqual(len(recorded), 1)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  handle_confirmation_response — the fn-missing 'continue' skip (11855-11856).
+# ────────────────────────────────────────────────────────────────────────────
+class HandleConfirmationResponseBranchTests(SectionSixBase):
+    def setUp(self):
+        super().setUp()
+        self._p(self.bc, "_speak", lambda *a, **k: None)
+
+    def test_missing_action_skipped_during_confirm(self):
+        bc = self.bc
+        ran = []
+        acts = dict(bc.ACTIONS)
+        acts["realone"] = lambda a: ran.append(a) or "ok"
+        # 'ghost' is queued but absent from ACTIONS -> the `if not fn: continue`
+        # branch (11855-11856) skips it; 'realone' still runs.
+        with mock.patch.object(bc, "ACTIONS", acts):
+            bc._pending_confirmation.clear()
+            bc._pending_confirmation.append(("ghost", "x"))
+            bc._pending_confirmation.append(("realone", "y"))
+            consumed = bc.handle_confirmation_response("yes")
+        self.assertTrue(consumed)
+        self.assertEqual(ran, ["y"])
+        self.assertEqual(list(bc._pending_confirmation), [])
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  _apply_quip_layer — the no-jarvis_quip_layer-attr early return (11886-11887)
+#  and the all-underscore-results -> primary stays None path (11890-11894).
+# ────────────────────────────────────────────────────────────────────────────
+class ApplyQuipLayerBranchTests(SectionSixBase):
+    def test_layer_without_quip_attr_returns_input(self):
+        bc = self.bc
+        # A layer object lacking jarvis_quip_layer -> early return (11886-11887).
+        layer = types.SimpleNamespace(something_else=lambda: None)
+        with mock.patch.object(bc, "_tts_layer", layer):
+            out = bc._apply_quip_layer("Done.", [("get_time", "x", True)])
+        self.assertEqual(out, "Done.")
+
+    def test_all_synthetic_results_leave_primary_none(self):
+        bc = self.bc
+        seen = {}
+
+        def quip(text, primary):
+            seen["primary"] = primary
+            return text + "!"
+
+        layer = types.SimpleNamespace(jarvis_quip_layer=quip)
+        # Every result is _-prefixed/unknown -> the loop never sets primary,
+        # so it stays None (covers the continue arms at 11891 + 11894).
+        with mock.patch.object(bc, "_tts_layer", layer):
+            out = bc._apply_quip_layer(
+                "Sure.",
+                [("_unverified_claim", "x", True),
+                 ("unknown action: zz", "y", False)])
+        self.assertEqual(out, "Sure.!")
+        self.assertIsNone(seen["primary"])
+
+    def test_empty_action_name_skipped(self):
+        bc = self.bc
+        seen = {}
+
+        def quip(text, primary):
+            seen["primary"] = primary
+            return text
+
+        layer = types.SimpleNamespace(jarvis_quip_layer=quip)
+        # Iteration is REVERSED, so the falsy name must be LAST to make the
+        # `if not n: continue` arm (11890-11891) fire before the real action.
+        with mock.patch.object(bc, "_tts_layer", layer):
+            bc._apply_quip_layer(
+                "Hi.", [("get_time", "y", True), ("", "x", True)])
+        self.assertEqual(seen["primary"], "get_time")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  _speak — under-exercised guards: boot throttle, HUD-write failure, the
+#  [wry] then late [mood] re-parse + wry-parse exception, staging-record
+#  failure, volume astype failure, and the inner set_state failure.
+# ────────────────────────────────────────────────────────────────────────────
+class SpeakBranchTests(SectionSixBase):
+    def setUp(self):
+        super().setUp()
+        self._p(self.bc, "_write_hud_state", lambda **k: None)
+
+    def test_boot_window_throttle_sleeps(self):
+        # Within 30s of boot AND <1s since last speech -> time.sleep is called
+        # (12007-12009). time.sleep is mocked so the test stays instant.
+        bc = self.bc
+        import numpy as np
+        slept = []
+        with mock.patch.object(bc, "_session_start_time", bc.time.time()), \
+             mock.patch.object(bc, "last_speech_time", bc.time.time()), \
+             mock.patch.object(bc.time, "sleep", lambda s: slept.append(s)), \
+             mock.patch.object(bc, "_tts_muted", [False]), \
+             mock.patch.object(bc, "_is_staging", lambda: False), \
+             mock.patch.object(bc, "synthesise",
+                               lambda t: (np.zeros(4, dtype=np.float32), 16000)), \
+             mock.patch.object(bc, "play_with_lipsync", lambda a, sr: None), \
+             mock.patch.object(bc, "set_state", lambda s: None):
+            bc._speak("Quick line, sir.")
+        self.assertEqual(len(slept), 1)
+        self.assertGreater(slept[0], 0.0)
+
+    def test_hud_write_failure_is_swallowed(self):
+        # _write_hud_state raising (12029-12030) must not abort the mute path.
+        bc = self.bc
+        with mock.patch.object(bc, "_session_start_time", 0.0), \
+             mock.patch.object(bc, "_write_hud_state",
+                               side_effect=RuntimeError("hud down")), \
+             mock.patch.object(bc, "_tts_muted", [True]), \
+             mock.patch.object(bc, "synthesise",
+                               side_effect=AssertionError("must not synth")):
+            self.assertIsNone(bc._speak("muted line"))
+
+    def test_wry_first_then_late_mood_tag_reparsed(self):
+        # "[wry][mood:xxx]" — wry is parsed first, then the mood re-parse arm
+        # (12049-12052) picks up the trailing mood tag. chosen_mood ends up set,
+        # both tags stripped before synthesis.
+        bc = self.bc
+        import numpy as np
+        synth_args = []
+        captured = {}
+
+        def synth(t):
+            synth_args.append(t)
+            captured["mood"] = bc._last_mood[0]
+            return (np.zeros(4, dtype=np.float32), 16000)
+
+        with mock.patch.object(bc, "_session_start_time", 0.0), \
+             mock.patch.object(bc, "_tts_muted", [False]), \
+             mock.patch.object(bc, "_is_staging", lambda: False), \
+             mock.patch.object(bc, "synthesise", synth), \
+             mock.patch.object(bc, "play_with_lipsync", lambda a, sr: None), \
+             mock.patch.object(bc, "set_state", lambda s: None):
+            bc._speak("[wry][mood:dry_amused] Oh, splendid, sir.")
+        self.assertEqual(synth_args, ["Oh, splendid, sir."])
+        self.assertEqual(captured["mood"], "dry_amused")
+
+    def test_wry_parse_exception_defaults_false(self):
+        # _tts_layer.parse_wry_tag raising (12053-12054) -> wry_flag=False and
+        # _speak proceeds normally.
+        bc = self.bc
+        import numpy as np
+        synth_args = []
+        bad_layer = types.SimpleNamespace(
+            parse_wry_tag=mock.Mock(side_effect=RuntimeError("wry parser down")))
+        with mock.patch.object(bc, "_session_start_time", 0.0), \
+             mock.patch.object(bc, "_tts_layer", bad_layer), \
+             mock.patch.object(bc, "_tts_muted", [False]), \
+             mock.patch.object(bc, "_is_staging", lambda: False), \
+             mock.patch.object(
+                 bc, "synthesise",
+                 lambda t: (synth_args.append(t)
+                            or np.zeros(4, dtype=np.float32), 16000)), \
+             mock.patch.object(bc, "play_with_lipsync", lambda a, sr: None), \
+             mock.patch.object(bc, "set_state", lambda s: None):
+            bc._speak("Plain line, sir.")
+        self.assertEqual(synth_args, ["Plain line, sir."])
+
+    def test_staging_record_failure_is_swallowed(self):
+        # staging record_reply raising (12089-12090) must not propagate; the
+        # staging path still returns None without opening audio.
+        bc = self.bc
+        fake_stg = types.ModuleType("staging_instance")
+        fake_stg.record_reply = mock.Mock(side_effect=RuntimeError("disk full"))
+        with mock.patch.object(bc, "_session_start_time", 0.0), \
+             mock.patch.object(bc, "_tts_muted", [False]), \
+             mock.patch.object(bc, "_is_staging", lambda: True), \
+             mock.patch.dict(sys.modules, {"staging_instance": fake_stg}), \
+             mock.patch.object(bc, "synthesise",
+                               side_effect=AssertionError("must not synth")):
+            self.assertIsNone(bc._speak("Staged line, sir."))
+        fake_stg.record_reply.assert_called_once()
+
+    def test_volume_scale_astype_failure_is_swallowed(self):
+        # A non-ndarray audio buffer makes the .astype attenuation raise
+        # (12110-12112); the except passes and playback still receives the
+        # original buffer.
+        bc = self.bc
+        played = []
+        # synthesise returns a plain list (no .astype) so the scale block throws.
+        with mock.patch.object(bc, "_session_start_time", 0.0), \
+             mock.patch.object(bc, "_tts_muted", [False]), \
+             mock.patch.object(bc, "_is_staging", lambda: False), \
+             mock.patch.object(bc, "synthesise",
+                               lambda t: ([0.0, 0.0, 0.0], 16000)), \
+             mock.patch.object(bc, "play_with_lipsync",
+                               lambda a, sr: played.append(a)), \
+             mock.patch.object(bc, "set_state", lambda s: None):
+            bc._speak("Quietly now, sir.", volume_scale=0.25)
+        self.assertEqual(played, [[0.0, 0.0, 0.0]])
+
+    def test_recovery_setstate_idle_also_failing(self):
+        # synthesise raises AND the recovery set_state('idle') ALSO raises
+        # (12123-12126) — both swallowed, _tts_playback_active forced False.
+        bc = self.bc
+        calls = []
+
+        def flaky_set_state(s):
+            calls.append(s)
+            if s == "idle":
+                raise RuntimeError("state machine wedged")
+
+        with mock.patch.object(bc, "_session_start_time", 0.0), \
+             mock.patch.object(bc, "_tts_muted", [False]), \
+             mock.patch.object(bc, "_is_staging", lambda: False), \
+             mock.patch.object(bc, "synthesise",
+                               side_effect=RuntimeError("synth boom")), \
+             mock.patch.object(bc, "set_state", flaky_set_state):
+            bc._speak("Anything at all, sir.")
+        # 'speaking' was set, the idle recovery was attempted, and the guard
+        # was still forced back to False in the finally.
+        self.assertIn("speaking", calls)
+        self.assertFalse(bc._tts_playback_active[0])
+
+    def test_no_tts_layer_defaults_wry_false(self):
+        # _tts_layer is None -> the else arm (12056) sets wry_flag=False and
+        # _speak still synthesises normally.
+        bc = self.bc
+        import numpy as np
+        synth_args = []
+        with mock.patch.object(bc, "_session_start_time", 0.0), \
+             mock.patch.object(bc, "_tts_layer", None), \
+             mock.patch.object(bc, "_tts_muted", [False]), \
+             mock.patch.object(bc, "_is_staging", lambda: False), \
+             mock.patch.object(
+                 bc, "synthesise",
+                 lambda t: (synth_args.append(t)
+                            or np.zeros(4, dtype=np.float32), 16000)), \
+             mock.patch.object(bc, "play_with_lipsync", lambda a, sr: None), \
+             mock.patch.object(bc, "set_state", lambda s: None):
+            bc._speak("No layer here, sir.")
+        self.assertEqual(synth_args, ["No layer here, sir."])
+
+    def test_mood_kwarg_overrides_mood_tag(self):
+        # mood= kwarg wins over a [mood:xxx] tag (12022 precedence).
+        bc = self.bc
+        import numpy as np
+        captured = {}
+
+        def synth(t):
+            captured["mood"] = bc._last_mood[0]
+            return (np.zeros(4, dtype=np.float32), 16000)
+
+        with mock.patch.object(bc, "_session_start_time", 0.0), \
+             mock.patch.object(bc, "_tts_muted", [False]), \
+             mock.patch.object(bc, "_is_staging", lambda: False), \
+             mock.patch.object(bc, "synthesise", synth), \
+             mock.patch.object(bc, "play_with_lipsync", lambda a, sr: None), \
+             mock.patch.object(bc, "set_state", lambda s: None):
+            bc._speak("[mood:calm_efficient] Noted, sir.", mood="urgent_clipped")
+        self.assertEqual(captured["mood"], "urgent_clipped")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  Power-plan helpers — the failure-print arms not hit by the happy paths.
+# ────────────────────────────────────────────────────────────────────────────
+class PowerPlanBranchTests(SectionSixBase):
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(setattr, self.bc, "_prior_power_plan_guid",
+                        self.bc._prior_power_plan_guid)
+
+    def test_activate_no_active_plan_skips(self):
+        # _get_active_power_plan_guid returns None -> "could not read" skip
+        # (12535-12537); _set_power_plan never called.
+        bc = self.bc
+        bc._prior_power_plan_guid = None
+        with mock.patch.object(bc, "_get_active_power_plan_guid",
+                               return_value=None), \
+             mock.patch.object(bc, "_set_power_plan",
+                               side_effect=AssertionError("must not switch")):
+            bc._activate_high_performance_plan()
+        self.assertIsNone(bc._prior_power_plan_guid)
+
+    def test_activate_set_plan_failure_does_not_remember(self):
+        # switch attempted but _set_power_plan returns False -> the failure
+        # print arm (12546-12547); prior guid stays unset.
+        bc = self.bc
+        bc._prior_power_plan_guid = None
+        prior = "12121212-3434-5656-7878-909090909090"
+        with mock.patch.object(bc, "_get_active_power_plan_guid",
+                               return_value=prior), \
+             mock.patch.object(bc, "_set_power_plan", return_value=False):
+            bc._activate_high_performance_plan()
+        self.assertIsNone(bc._prior_power_plan_guid)
+
+    def test_activate_unexpected_exception_is_caught(self):
+        # _get_active_power_plan_guid raising -> outer except (12548-12549).
+        bc = self.bc
+        with mock.patch.object(bc, "_get_active_power_plan_guid",
+                               side_effect=RuntimeError("powercfg exploded")):
+            bc._activate_high_performance_plan()  # no exception == pass
+
+    def test_restore_skips_when_prior_is_high_perf(self):
+        # prior == High Performance GUID -> nothing-to-restore early out
+        # (12557-12558); _set_power_plan never called.
+        bc = self.bc
+        bc._prior_power_plan_guid = bc._HIGH_PERF_GUID
+        with mock.patch.object(bc, "_set_power_plan",
+                               side_effect=AssertionError("must not run")):
+            bc._restore_prior_power_plan()
+
+    def test_restore_set_plan_failure_print_arm(self):
+        # _set_power_plan returns False on restore -> failure print (12561-12562).
+        bc = self.bc
+        prior = "abababab-cdcd-efef-0101-202020202020"
+        bc._prior_power_plan_guid = prior
+        with mock.patch.object(bc, "_set_power_plan", return_value=False) as sp:
+            bc._restore_prior_power_plan()
+        sp.assert_called_once_with(prior)
+
+    def test_restore_unexpected_exception_is_caught(self):
+        # _set_power_plan raising on restore -> outer except (12563-12564).
+        bc = self.bc
+        bc._prior_power_plan_guid = "cccccccc-dddd-eeee-ffff-000011112222"
+        with mock.patch.object(bc, "_set_power_plan",
+                               side_effect=RuntimeError("boom")):
+            bc._restore_prior_power_plan()  # no exception == pass
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  _find_cublas_dll — site.getsitepackages / getusersitepackages raising, and
+#  a usersitepackages-only hit (the second site source).
+# ────────────────────────────────────────────────────────────────────────────
+class FindCublasDllBranchTests(SectionSixBase):
+    def test_site_lookups_raise_then_fall_through(self):
+        # Both site.* calls raise (12597-12598 + 12603-12604); with nothing on
+        # PATH / CUDA_PATH / Program Files the walk returns None cleanly.
+        bc = self.bc
+        with tempfile.TemporaryDirectory() as d:
+            fake_site = types.ModuleType("site")
+            fake_site.getsitepackages = mock.Mock(
+                side_effect=RuntimeError("no sitepackages"))
+            fake_site.getusersitepackages = mock.Mock(
+                side_effect=RuntimeError("no usersite"))
+            with mock.patch.dict(sys.modules, {"site": fake_site}), \
+                 mock.patch.dict(os.environ,
+                                 {"PATH": "", "CUDA_PATH": "",
+                                  "ProgramFiles": d, "ProgramFiles(x86)": ""},
+                                 clear=False):
+                self.assertIsNone(bc._find_cublas_dll())
+
+    def test_found_in_user_site_packages(self):
+        # getsitepackages empty but getusersitepackages holds the DLL
+        # (covers the usersite append at 12601-12602 + the hit at 12607-12608).
+        bc = self.bc
+        with tempfile.TemporaryDirectory() as d:
+            bindir = os.path.join(d, "nvidia", "cublas", "bin")
+            os.makedirs(bindir)
+            dll = os.path.join(bindir, bc._CUBLAS_DLL_NAME)
+            open(dll, "w").close()
+            fake_site = types.ModuleType("site")
+            fake_site.getsitepackages = lambda: []
+            fake_site.getusersitepackages = lambda: d
+            with mock.patch.dict(sys.modules, {"site": fake_site}), \
+                 mock.patch.dict(os.environ,
+                                 {"PATH": "", "CUDA_PATH": ""}, clear=False):
+                self.assertEqual(bc._find_cublas_dll(), dll)
+
+    def test_empty_path_entries_skipped(self):
+        # A PATH with empty segments exercises the `if not p: continue` arm
+        # while still finding the DLL in a populated segment.
+        bc = self.bc
+        with tempfile.TemporaryDirectory() as d:
+            dll = os.path.join(d, bc._CUBLAS_DLL_NAME)
+            open(dll, "w").close()
+            fake_site = types.ModuleType("site")
+            fake_site.getsitepackages = lambda: []
+            fake_site.getusersitepackages = lambda: ""
+            path_val = os.pathsep + d + os.pathsep   # leading + trailing empties
+            with mock.patch.dict(sys.modules, {"site": fake_site}), \
+                 mock.patch.dict(os.environ,
+                                 {"PATH": path_val, "CUDA_PATH": ""},
+                                 clear=False):
+                self.assertEqual(bc._find_cublas_dll(), dll)
+
+    def test_site_dir_join_failure_hits_outer_except(self):
+        # getsitepackages returns a non-string entry, so os.path.join inside the
+        # loop raises -> the OUTER except (12609-12610) swallows it and the walk
+        # continues to PATH where the DLL is found.
+        bc = self.bc
+        with tempfile.TemporaryDirectory() as d:
+            dll = os.path.join(d, bc._CUBLAS_DLL_NAME)
+            open(dll, "w").close()
+            fake_site = types.ModuleType("site")
+            fake_site.getsitepackages = lambda: [None]   # join(None,...) -> TypeError
+            fake_site.getusersitepackages = lambda: ""
+            with mock.patch.dict(sys.modules, {"site": fake_site}), \
+                 mock.patch.dict(os.environ,
+                                 {"PATH": d, "CUDA_PATH": ""}, clear=False):
+                self.assertEqual(bc._find_cublas_dll(), dll)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  _preflight_cublas_check — the "already queued" (n==0) and append-failure
+#  branches of the CUDA-task queue (12734-12739).
+# ────────────────────────────────────────────────────────────────────────────
+class PreflightCublasQueueBranchTests(SectionSixBase):
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(setattr, self.bc, "_force_whisper_cpu_int8",
+                        self.bc._force_whisper_cpu_int8)
+
+    def test_task_already_queued_duplicate_skipped(self):
+        # _append_tasks returns 0 -> "already queued" branch (12734-12735).
+        bc = self.bc
+        bc._force_whisper_cpu_int8 = False
+        fake_ou = types.ModuleType("overnight_upgrade")
+        fake_ou._append_tasks = lambda tasks: 0
+        with mock.patch.object(bc, "_find_cublas_dll", return_value=None), \
+             mock.patch.object(bc, "_ctranslate2_sees_cuda", return_value=True), \
+             mock.patch.dict(sys.modules, {"overnight_upgrade": fake_ou}):
+            self.assertFalse(bc._preflight_cublas_check())
+        self.assertTrue(bc._force_whisper_cpu_int8)
+
+    def test_append_tasks_failure_is_caught(self):
+        # _append_tasks raising -> inner except (12736-12737); still forces CPU.
+        bc = self.bc
+        bc._force_whisper_cpu_int8 = False
+        fake_ou = types.ModuleType("overnight_upgrade")
+        fake_ou._append_tasks = mock.Mock(
+            side_effect=RuntimeError("todo file locked"))
+        with mock.patch.object(bc, "_find_cublas_dll", return_value=None), \
+             mock.patch.object(bc, "_ctranslate2_sees_cuda", return_value=True), \
+             mock.patch.dict(sys.modules, {"overnight_upgrade": fake_ou}):
+            self.assertFalse(bc._preflight_cublas_check())
+        self.assertTrue(bc._force_whisper_cpu_int8)
+
+    def test_overnight_upgrade_not_importable_is_caught(self):
+        # overnight_upgrade import itself failing -> outer except (12738-12739).
+        # Force the lazy `import overnight_upgrade` statement to raise.
+        bc = self.bc
+        bc._force_whisper_cpu_int8 = False
+        real_import = __import__
+
+        def boom_import(name, *a, **k):
+            if name == "overnight_upgrade":
+                raise ImportError("overnight_upgrade broken")
+            return real_import(name, *a, **k)
+
+        with mock.patch.object(bc, "_find_cublas_dll", return_value=None), \
+             mock.patch.object(bc, "_ctranslate2_sees_cuda", return_value=True), \
+             mock.patch("builtins.__import__", boom_import):
+            self.assertFalse(bc._preflight_cublas_check())
+        self.assertTrue(bc._force_whisper_cpu_int8)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  _drain_injected_command — claim-failure, read-failure, non-list payload,
+#  and the requeue-write-failure branches.
+# ────────────────────────────────────────────────────────────────────────────
+class DrainInjectedCommandBranchTests(SectionSixBase):
+    def _redirect(self, path):
+        self._p(self.bc, "INJECTED_COMMANDS_PATH", path)
+
+    def test_claim_rename_filenotfound_returns_none(self):
+        # os.replace raising FileNotFoundError (file vanished between the
+        # exists() check and the rename) -> the dedicated arm (12906-12907).
+        bc = self.bc
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inject.json")
+            self._redirect(path)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(["cmd"], f)
+            with mock.patch.object(bc.os, "replace",
+                                   side_effect=FileNotFoundError()):
+                self.assertIsNone(bc._drain_injected_command())
+
+    def test_claim_rename_failure_returns_none(self):
+        # os.replace raising a non-FileNotFound error -> claim-failed branch
+        # (12908-12910).
+        bc = self.bc
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inject.json")
+            self._redirect(path)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(["cmd"], f)
+            with mock.patch.object(bc.os, "replace",
+                                   side_effect=PermissionError("locked")):
+                self.assertIsNone(bc._drain_injected_command())
+
+    def test_read_failure_discards_snapshot(self):
+        # open() on the consumed snapshot raising -> read-failed branch
+        # (12914-12918); the .consuming file is removed.
+        bc = self.bc
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inject.json")
+            self._redirect(path)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(["cmd"], f)
+            real_open = open
+
+            def flaky_open(p, *a, **k):
+                if str(p).endswith(".consuming"):
+                    raise OSError("read error")
+                return real_open(p, *a, **k)
+
+            with mock.patch("builtins.open", flaky_open):
+                self.assertIsNone(bc._drain_injected_command())
+
+    def test_whitespace_only_file_returns_none(self):
+        # A snapshot of only whitespace -> raw == '' branch (12919-12922).
+        bc = self.bc
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inject.json")
+            self._redirect(path)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("   \n  ")
+            self.assertIsNone(bc._drain_injected_command())
+            self.assertFalse(os.path.exists(path))
+
+    def test_non_list_payload_returns_none(self):
+        # Valid JSON that isn't a list -> isinstance guard (12932-12935).
+        bc = self.bc
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inject.json")
+            self._redirect(path)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"text": "not a list"}, f)
+            self.assertIsNone(bc._drain_injected_command())
+
+    def test_non_string_non_dict_head_returns_none(self):
+        # First item is an int -> text stays '' (12969-12972) -> None.
+        bc = self.bc
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inject.json")
+            self._redirect(path)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump([123], f)
+            self.assertIsNone(bc._drain_injected_command())
+
+    def test_requeue_write_failure_still_returns_head(self):
+        # The tail-requeue write failing (12961-12962) is logged but the head
+        # is still returned and the snapshot cleaned up.
+        bc = self.bc
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inject.json")
+            self._redirect(path)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(["head", "tail"], f)
+            with mock.patch.object(bc.tempfile, "mkstemp",
+                                   side_effect=OSError("no temp space")):
+                self.assertEqual(bc._drain_injected_command(), "head")
+
+    def test_snapshot_remove_failure_swallowed_single_item(self):
+        # os.remove on the .consuming snapshot failing after a clean single-item
+        # read is swallowed (the bare except at 12963-12964); the head still
+        # returns.
+        bc = self.bc
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inject.json")
+            self._redirect(path)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(["solo"], f)
+            real_remove = bc.os.remove
+
+            def flaky_remove(p, *a, **k):
+                if str(p).endswith(".consuming"):
+                    raise OSError("remove blocked")
+                return real_remove(p, *a, **k)
+
+            with mock.patch.object(bc.os, "remove", flaky_remove):
+                self.assertEqual(bc._drain_injected_command(), "solo")
+
+    def test_corrupt_json_remove_failure_swallowed(self):
+        # Corrupt JSON path whose snapshot os.remove ALSO fails (12929-12930).
+        bc = self.bc
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "inject.json")
+            self._redirect(path)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("{bad json")
+            real_remove = bc.os.remove
+
+            def flaky_remove(p, *a, **k):
+                if str(p).endswith(".consuming"):
+                    raise OSError("remove blocked")
+                return real_remove(p, *a, **k)
+
+            with mock.patch.object(bc.os, "remove", flaky_remove):
+                self.assertIsNone(bc._drain_injected_command())
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  _speak_pending — FileNotFound during rename, empty-list snapshot, blank
+#  message skip, and the bad volume_scale / bad mood coercions.
+# ────────────────────────────────────────────────────────────────────────────
+class SpeakPendingBranchTests(SectionSixBase):
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        self.spoke = []
+        self._p(bc, "_speak",
+                lambda msg, **k: self.spoke.append((msg, k)))
+        self._p(bc, "_mark_speech_spoken", lambda m: None)
+        self._p(bc, "_speech_was_recently_spoken", lambda m: False)
+
+    def _redirect(self, path):
+        self._p(self.bc, "PENDING_SPEECH_PATH", path)
+
+    def test_rename_filenotfound_returns_false(self):
+        # os.replace raising FileNotFoundError (race lost) -> False (12992-12993).
+        bc = self.bc
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pending.json")
+            self._redirect(path)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump([{"message": "x"}], f)
+            with mock.patch.object(bc.os, "replace",
+                                   side_effect=FileNotFoundError()):
+                self.assertFalse(bc._speak_pending())
+
+    def test_empty_list_snapshot_returns_false(self):
+        # A valid empty-list snapshot -> not items branch (13010-13013).
+        bc = self.bc
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pending.json")
+            self._redirect(path)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump([], f)
+            self.assertFalse(bc._speak_pending())
+            self.assertFalse(os.path.exists(path))
+
+    def test_blank_message_entries_skipped(self):
+        # Items whose message is empty are skipped (13026-13027); a real one
+        # still speaks.
+        bc = self.bc
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pending.json")
+            self._redirect(path)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump([{"message": ""}, {"no_message_key": 1},
+                           {"message": "real one"}], f)
+            self.assertTrue(bc._speak_pending())
+        self.assertEqual([m for m, _ in self.spoke], ["real one"])
+
+    def test_bad_volume_scale_defaults_to_one(self):
+        # A non-numeric volume_scale -> ValueError -> vol=1.0 (13034-13036).
+        bc = self.bc
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pending.json")
+            self._redirect(path)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump([{"message": "hi", "volume_scale": "loud"}], f)
+            self.assertTrue(bc._speak_pending())
+        self.assertEqual(self.spoke[0][1]["volume_scale"], 1.0)
+
+    def test_invalid_mood_coerced_to_none(self):
+        # A mood not in _VOICE_MOOD_NAMES is coerced to None (13037-13039).
+        bc = self.bc
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pending.json")
+            self._redirect(path)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump([{"message": "hi", "mood": "bogus_mood"}], f)
+            self.assertTrue(bc._speak_pending())
+        self.assertIsNone(self.spoke[0][1]["mood"])
+
+    def test_valid_mood_passed_through(self):
+        # A recognised mood survives the coercion and reaches _speak.
+        bc = self.bc
+        good = sorted(bc._VOICE_MOOD_NAMES)[0]
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pending.json")
+            self._redirect(path)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump([{"message": "hi", "mood": good}], f)
+            self.assertTrue(bc._speak_pending())
+        self.assertEqual(self.spoke[0][1]["mood"], good)
+
+    def _flaky_consuming_remove(self):
+        """os.remove that raises only for the .consuming snapshot."""
+        real_remove = self.bc.os.remove
+
+        def flaky_remove(p, *a, **k):
+            if str(p).endswith(".consuming"):
+                raise OSError("remove blocked")
+            return real_remove(p, *a, **k)
+
+        return flaky_remove
+
+    def test_blank_raw_remove_failure_swallowed(self):
+        # Whitespace-only snapshot whose os.remove ALSO fails (12997-12999).
+        bc = self.bc
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pending.json")
+            self._redirect(path)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("   ")
+            with mock.patch.object(bc.os, "remove", self._flaky_consuming_remove()):
+                self.assertFalse(bc._speak_pending())
+
+    def test_corrupt_queue_remove_failure_swallowed(self):
+        # Corrupt JSON whose snapshot os.remove ALSO fails (13005-13006).
+        bc = self.bc
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pending.json")
+            self._redirect(path)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("not json")
+            with mock.patch.object(bc.os, "remove", self._flaky_consuming_remove()):
+                self.assertFalse(bc._speak_pending())
+
+    def test_final_remove_failure_swallowed(self):
+        # A normal spoke-something run whose FINAL os.remove fails (13053-13055):
+        # the failure is swallowed and the True result still returns.
+        bc = self.bc
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pending.json")
+            self._redirect(path)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump([{"message": "ping"}], f)
+            with mock.patch.object(bc.os, "remove", self._flaky_consuming_remove()):
+                self.assertTrue(bc._speak_pending())
+        self.assertEqual([m for m, _ in self.spoke], ["ping"])
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  _maybe_orchestrate — the import-failure branch (13113-13115): core.orchestrator
+#  unimportable while the gate is open -> falls through to a normal turn.
+# ────────────────────────────────────────────────────────────────────────────
+class MaybeOrchestrateImportFailureTests(SectionSixBase):
+    def test_orchestrator_import_failure_falls_through(self):
+        bc = self.bc
+        # Force the lazy `from core.orchestrator import orchestrate` to raise.
+        real_import = __import__
+
+        def boom_import(name, *a, **k):
+            if name == "core.orchestrator":
+                raise ImportError("orchestrator module missing")
+            return real_import(name, *a, **k)
+
+        with mock.patch.object(bc, "_orchestrator_enabled", return_value=True), \
+             mock.patch.object(bc, "_is_orchestration_request",
+                               return_value=True), \
+             mock.patch.object(bc, "_speak",
+                               side_effect=AssertionError("must not speak")), \
+             mock.patch("builtins.__import__", boom_import):
+            self.assertFalse(bc._maybe_orchestrate("morning briefing"))
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  _release_singleton (fd-unlock body, 12251-12269) + _move_console_to_monitor
+#  (the ctypes move path, 12486-12496).
+# ────────────────────────────────────────────────────────────────────────────
+class SingletonAndConsoleTests(SectionSixBase):
+    def test_release_singleton_unlocks_and_closes_fd(self):
+        # A real held fd drives the msvcrt unlock + os.close backstop
+        # (12251-12269). _SINGLETON_HELD_FD is restored by the harness, but we
+        # also null it defensively so a later test can't double-close.
+        bc = self.bc
+        orig = bc._SINGLETON_HELD_FD
+        self.addCleanup(setattr, bc, "_SINGLETON_HELD_FD", orig)
+        fd, path = tempfile.mkstemp()
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        os.write(fd, b"x")
+        bc._SINGLETON_HELD_FD = fd
+        bc._release_singleton()
+        # The held-fd slot is cleared and the descriptor is closed (re-closing
+        # raises OSError, proving it was already closed by the helper).
+        self.assertIsNone(bc._SINGLETON_HELD_FD)
+        with self.assertRaises(OSError):
+            os.close(fd)
+
+    def test_release_singleton_unlock_oserror_swallowed(self):
+        # msvcrt.locking raising OSError is swallowed (12257-12258); the fd is
+        # still closed in the finally.
+        bc = self.bc
+        orig = bc._SINGLETON_HELD_FD
+        self.addCleanup(setattr, bc, "_SINGLETON_HELD_FD", orig)
+        fd, path = tempfile.mkstemp()
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        bc._SINGLETON_HELD_FD = fd
+        import msvcrt
+        with mock.patch.object(msvcrt, "locking",
+                               side_effect=OSError("not locked")):
+            bc._release_singleton()
+        self.assertIsNone(bc._SINGLETON_HELD_FD)
+        with self.assertRaises(OSError):
+            os.close(fd)
+
+    def test_move_console_known_monitor_calls_setwindowpos(self):
+        # A known monitor name drives the ctypes GetConsoleWindow ->
+        # SetWindowPos path (12486-12494). ctypes is faked so nothing touches
+        # the real window manager.
+        bc = self.bc
+        calls = {}
+        fake_ctypes = types.ModuleType("ctypes")
+
+        class _User32:
+            def SetWindowPos(self, hwnd, after, x, y, cx, cy, flags):
+                calls["args"] = (hwnd, x, y, cx, cy, flags)
+                return True
+
+        class _Kernel32:
+            def GetConsoleWindow(self):
+                return 4242   # truthy hwnd
+
+        fake_ctypes.windll = types.SimpleNamespace(
+            kernel32=_Kernel32(), user32=_User32())
+        monitors = {"left": (-2560, 0, 2560, 1440)}
+        with mock.patch.object(bc, "MONITORS", monitors), \
+             mock.patch.dict(sys.modules, {"ctypes": fake_ctypes}):
+            bc._move_console_to_monitor("left")
+        self.assertIn("args", calls)
+        # hwnd forwarded; target x/y match the monitor origin; SWP_NOSIZE set.
+        self.assertEqual(calls["args"][0], 4242)
+        self.assertEqual(calls["args"][1], -2560)
+        self.assertEqual(calls["args"][2], 0)
+        self.assertEqual(calls["args"][5], 0x0001)
+
+    def test_move_console_no_hwnd_returns_early(self):
+        # GetConsoleWindow returning 0 (no console) -> early return before
+        # SetWindowPos (12490-12491).
+        bc = self.bc
+        fake_ctypes = types.ModuleType("ctypes")
+
+        class _User32:
+            def SetWindowPos(self, *a):
+                raise AssertionError("must not move when hwnd is 0")
+
+        class _Kernel32:
+            def GetConsoleWindow(self):
+                return 0
+
+        fake_ctypes.windll = types.SimpleNamespace(
+            kernel32=_Kernel32(), user32=_User32())
+        monitors = {"left": (-2560, 0, 2560, 1440)}
+        with mock.patch.object(bc, "MONITORS", monitors), \
+             mock.patch.dict(sys.modules, {"ctypes": fake_ctypes}):
+            bc._move_console_to_monitor("left")  # no exception == pass
+
+    def test_move_console_ctypes_failure_swallowed(self):
+        # An exception from the ctypes path (12495-12496) is swallowed.
+        bc = self.bc
+        fake_ctypes = types.ModuleType("ctypes")
+
+        class _Kernel32:
+            def GetConsoleWindow(self):
+                raise RuntimeError("ctypes exploded")
+
+        fake_ctypes.windll = types.SimpleNamespace(kernel32=_Kernel32())
+        monitors = {"left": (-2560, 0, 2560, 1440)}
+        with mock.patch.object(bc, "MONITORS", monitors), \
+             mock.patch.dict(sys.modules, {"ctypes": fake_ctypes}):
+            bc._move_console_to_monitor("left")  # no exception == pass
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  _preflight_api_key — the anthropic-not-importable branch (12669-12670).
+# ────────────────────────────────────────────────────────────────────────────
+class PreflightApiKeyImportFailureTests(SectionSixBase):
+    def test_anthropic_import_failure_reported(self):
+        bc = self.bc
+        real_import = __import__
+
+        def boom_import(name, *a, **k):
+            if name == "anthropic":
+                raise ImportError("no anthropic wheel")
+            return real_import(name, *a, **k)
+
+        with mock.patch.object(bc, "AI_BACKEND", "claude"), \
+             mock.patch.dict(os.environ,
+                             {"ANTHROPIC_API_KEY": "sk-test"}, clear=False), \
+             mock.patch("builtins.__import__", boom_import):
+            ok, reason = bc._preflight_api_key(timeout_sec=1.0)
+        self.assertFalse(ok)
+        self.assertIn("not importable", reason)
+
+
 if __name__ == "__main__":
     unittest.main()

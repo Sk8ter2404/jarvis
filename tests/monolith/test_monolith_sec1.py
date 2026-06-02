@@ -1518,5 +1518,1236 @@ class TrayInflightEdgeTests(_MonolithTestBase):
         self.assertEqual(seen, ["orphan", "fresh"])
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  COVERAGE-EXTENSION PASS — additional error/edge branches in lines 50-2704.
+#  Same harness + rules as the suites above: inherit _MonolithTestBase, use
+#  self.bc, mock ALL I/O, restore any directly-mutated global, never touch real
+#  hardware/network/LLM/threads.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  _read_lock_pid / _acquire_os_singleton_lock — remaining retry/error arms
+# ──────────────────────────────────────────────────────────────────────────
+class LockHelperEdgeTests(_MonolithTestBase):
+    def test_read_lock_pid_oserror_retries_then_stale(self):
+        # An OSError other than FileNotFoundError on read → retry path (77-79).
+        # After the budget is exhausted with no readable PID it returns 0.
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "jarvis.lock")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("12345")
+        real_open = open
+        calls = {"n": 0}
+
+        def _boom_open(p, *a, **k):
+            if p == path:
+                calls["n"] += 1
+                raise OSError("transient share violation")
+            return real_open(p, *a, **k)
+
+        with mock.patch("builtins.open", _boom_open), \
+             mock.patch.object(self.bc.time, "sleep", return_value=None):
+            self.assertEqual(self.bc._read_lock_pid(path, max_retries=3), 0)
+        # Every attempt hit the OSError arm (slept + continued), not a one-shot.
+        self.assertEqual(calls["n"], 3)
+
+    def test_read_lock_pid_oserror_then_recovers(self):
+        # First read raises OSError (retry), second read returns a valid PID.
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "jarvis.lock")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("777")
+        real_open = open
+        state = {"n": 0}
+
+        def _flaky_open(p, *a, **k):
+            if p == path:
+                state["n"] += 1
+                if state["n"] == 1:
+                    raise OSError("locked")
+            return real_open(p, *a, **k)
+
+        with mock.patch("builtins.open", _flaky_open), \
+             mock.patch.object(self.bc.time, "sleep", return_value=None):
+            self.assertEqual(self.bc._read_lock_pid(path, max_retries=5), 777)
+
+    def test_early_boot_acquires_lock_and_writes_pid(self):
+        # Drive the full happy path of _early_boot_singleton_lock with every
+        # filesystem touch mocked so nothing is written to the real repo and the
+        # process never exits. Covers the acquire + PID-write success arms
+        # (167-250, 299-303).
+        bc = self.bc
+        written = {}
+        real_open = open
+
+        def _fake_open(path, mode="r", *a, **k):
+            if str(path).endswith(".lock"):
+                import io
+                buf = io.StringIO()
+
+                def _close(_b=buf, _p=path):
+                    written[_p] = _b.getvalue()
+                buf.close = _close  # capture on context-manager exit
+                return buf
+            return real_open(path, mode, *a, **k)
+
+        self.addCleanup(setattr, bc, "_SINGLETON_HELD_FD",
+                        bc._SINGLETON_HELD_FD)
+        orig_env = os.environ.get("_JARVIS_SINGLETON_PID")
+
+        def _restore_env(v=orig_env):
+            if v is None:
+                os.environ.pop("_JARVIS_SINGLETON_PID", None)
+            else:
+                os.environ["_JARVIS_SINGLETON_PID"] = v
+        self.addCleanup(_restore_env)
+        os.environ.pop("_JARVIS_SINGLETON_PID", None)  # bypass re-entrancy guard
+
+        with mock.patch.object(bc.os.path, "exists", return_value=False), \
+             mock.patch.object(bc.os, "open", return_value=4242), \
+             mock.patch.object(bc.os, "close"), \
+             mock.patch.object(bc, "_acquire_os_singleton_lock",
+                               return_value=True), \
+             mock.patch("builtins.open", _fake_open), \
+             mock.patch.object(bc.sys.stdout, "flush"):
+            self.assertTrue(bc._early_boot_singleton_lock())
+        # The plain PID file was written with our PID; the held fd was kept.
+        self.assertTrue(any(v == str(os.getpid()) for v in written.values()))
+        self.assertEqual(bc._SINGLETON_HELD_FD, 4242)
+
+    def test_early_boot_duplicate_instance_exits(self):
+        # Lock acquisition fails AND the PID file names a DIFFERENT pid → another
+        # live instance → sys.exit(0). Covers the duplicate-refusal arm
+        # (205-235).
+        bc = self.bc
+        self.addCleanup(setattr, bc, "_SINGLETON_HELD_FD",
+                        bc._SINGLETON_HELD_FD)
+        orig_env = os.environ.get("_JARVIS_SINGLETON_PID")
+
+        def _restore_env(v=orig_env):
+            if v is None:
+                os.environ.pop("_JARVIS_SINGLETON_PID", None)
+            else:
+                os.environ["_JARVIS_SINGLETON_PID"] = v
+        self.addCleanup(_restore_env)
+        os.environ.pop("_JARVIS_SINGLETON_PID", None)
+
+        with mock.patch.object(bc.os.path, "exists", return_value=False), \
+             mock.patch.object(bc.os, "open", return_value=99), \
+             mock.patch.object(bc.os, "close"), \
+             mock.patch.object(bc, "_acquire_os_singleton_lock",
+                               return_value=False), \
+             mock.patch.object(bc, "_read_lock_pid", return_value=1234567), \
+             mock.patch.object(bc.sys.stdout, "flush"):
+            with self.assertRaises(SystemExit) as ctx:
+                bc._early_boot_singleton_lock()
+        self.assertEqual(ctx.exception.code, 0)
+
+    def test_early_boot_lock_held_by_self_returns_true(self):
+        # Lock acquisition fails but the PID file names US → just a second
+        # module-identity of our own process → treat as success (211-217).
+        bc = self.bc
+        self.addCleanup(setattr, bc, "_SINGLETON_HELD_FD",
+                        bc._SINGLETON_HELD_FD)
+        orig_env = os.environ.get("_JARVIS_SINGLETON_PID")
+
+        def _restore_env(v=orig_env):
+            if v is None:
+                os.environ.pop("_JARVIS_SINGLETON_PID", None)
+            else:
+                os.environ["_JARVIS_SINGLETON_PID"] = v
+        self.addCleanup(_restore_env)
+        os.environ.pop("_JARVIS_SINGLETON_PID", None)
+
+        with mock.patch.object(bc.os.path, "exists", return_value=False), \
+             mock.patch.object(bc.os, "open", return_value=55), \
+             mock.patch.object(bc.os, "close"), \
+             mock.patch.object(bc, "_acquire_os_singleton_lock",
+                               return_value=False), \
+             mock.patch.object(bc, "_read_lock_pid", return_value=os.getpid()), \
+             mock.patch.object(bc.sys.stdout, "flush"):
+            self.assertTrue(bc._early_boot_singleton_lock())
+        self.assertEqual(os.environ.get("_JARVIS_SINGLETON_PID"),
+                         str(os.getpid()))
+
+    def test_early_boot_lock_write_failure_exits_1(self):
+        # Mutex acquired but writing the plain PID file raises → fast-fail
+        # sys.exit(1) after dropping the boot-error marker + JSONL record
+        # (252-298). All file writes + makedirs are mocked away.
+        bc = self.bc
+        self.addCleanup(setattr, bc, "_SINGLETON_HELD_FD",
+                        bc._SINGLETON_HELD_FD)
+        orig_env = os.environ.get("_JARVIS_SINGLETON_PID")
+
+        def _restore_env(v=orig_env):
+            if v is None:
+                os.environ.pop("_JARVIS_SINGLETON_PID", None)
+            else:
+                os.environ["_JARVIS_SINGLETON_PID"] = v
+        self.addCleanup(_restore_env)
+        os.environ.pop("_JARVIS_SINGLETON_PID", None)
+
+        real_open = open
+
+        def _open_pid_fails(path, mode="r", *a, **k):
+            sp = str(path)
+            if sp.endswith(".lock") and ("w" in mode):
+                raise OSError("pid write denied")
+            if sp.endswith("boot_error.txt") or sp.endswith(".jsonl"):
+                import io
+                return io.StringIO()  # swallow the marker writes
+            return real_open(path, mode, *a, **k)
+
+        with mock.patch.object(bc.os.path, "exists", return_value=False), \
+             mock.patch.object(bc.os, "open", return_value=66), \
+             mock.patch.object(bc.os, "close"), \
+             mock.patch.object(bc.os, "makedirs"), \
+             mock.patch.object(bc, "_acquire_os_singleton_lock",
+                               return_value=True), \
+             mock.patch("builtins.open", _open_pid_fails), \
+             mock.patch.object(bc.sys.stdout, "flush"), \
+             mock.patch.object(bc.sys.stderr, "write"), \
+             mock.patch.object(bc.sys.stderr, "flush"):
+            with self.assertRaises(SystemExit) as ctx:
+                bc._early_boot_singleton_lock()
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_acquire_os_singleton_lock_busy_returns_false(self):
+        # Hold the byte-0 lock on a real file, then a second fd's non-blocking
+        # acquire must return False (the platform-specific OSError arm: 125/131).
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "mutex.lock")
+        fd1 = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        fd2 = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            self.assertTrue(self.bc._acquire_os_singleton_lock(fd1))
+            # fd1 owns byte 0; fd2 cannot lock it → caught OSError → False.
+            self.assertFalse(self.bc._acquire_os_singleton_lock(fd2))
+        finally:
+            os.close(fd1)
+            os.close(fd2)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  merge_memory — internal-noise drop + project dedupe
+# ──────────────────────────────────────────────────────────────────────────
+class MergeMemoryEdgeTests(_MonolithTestBase):
+    def setUp(self):
+        self._store = {"facts": [], "projects": [], "topics": [], "sessions": []}
+
+        def _fake_load():
+            import copy
+            return copy.deepcopy(self._store)
+
+        def _fake_save(m):
+            self._store = m
+
+        p_load = mock.patch.object(self.bc, "load_memory", _fake_load)
+        p_save = mock.patch.object(self.bc, "save_memory", _fake_save)
+        p_load.start()
+        p_save.start()
+        self.addCleanup(p_load.stop)
+        self.addCleanup(p_save.stop)
+
+    def test_internal_noise_fact_is_dropped(self):
+        # "n/a" is a placeholder the internal-noise classifier rejects, so the
+        # candidate is dropped before storage (1161-1163) — no save of it.
+        added_f, _ = self.bc.merge_memory(new_facts=["n/a"])
+        self.assertEqual(added_f, [])
+        self.assertEqual(self._store["facts"], [])
+
+    def test_duplicate_project_is_skipped(self):
+        # Seed an existing project; a case-different duplicate hits the
+        # dedupe `continue` (1192-1193) and is not re-added.
+        self._store["projects"] = ["Building a treehouse"]
+        _, added_p = self.bc.merge_memory(new_projects=["building A TREEHOUSE"])
+        self.assertEqual(added_p, [])
+        self.assertEqual(self._store["projects"], ["Building a treehouse"])
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  _load_chappie_standing_rules — empty-list + all-filtered → ""
+# ──────────────────────────────────────────────────────────────────────────
+class StandingRulesEdgeTests(_MonolithTestBase):
+    def _write(self, payload):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "rules.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        return path
+
+    def test_empty_rules_list_returns_empty(self):
+        # "rules": [] → falsy list → early "" (line 1248).
+        path = self._write({"rules": []})
+        with mock.patch.object(self.bc, "_CHAPPIE_STANDING_RULES_PATH", path):
+            self.assertEqual(self.bc._load_chappie_standing_rules(), "")
+
+    def test_all_entries_filtered_returns_empty(self):
+        # Every entry is missing id or text (or not a dict), so `lines` stays
+        # empty after the loop → final "" guard (line 1260), NOT the formatted
+        # block.
+        path = self._write({"rules": [
+            {"id": "NoText"},        # missing rule
+            {"rule": "NoId"},        # missing id
+            "not-a-dict",            # skipped
+            {},                      # both missing
+        ]})
+        with mock.patch.object(self.bc, "_CHAPPIE_STANDING_RULES_PATH", path):
+            self.assertEqual(self.bc._load_chappie_standing_rules(), "")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  build_system_prompt — malformed first_meeting falls through
+# ──────────────────────────────────────────────────────────────────────────
+class SystemPromptEdgeTests(_MonolithTestBase):
+    def test_malformed_first_meeting_swallowed(self):
+        # A non-ISO first_meeting makes the days-known parse raise → except/pass
+        # (1295-1296); days_known stays 0 and the prompt still builds.
+        mem = self.bc._empty_memory()
+        mem["first_meeting"] = "not-a-date"
+        with mock.patch.object(self.bc, "_load_chappie_standing_rules",
+                               return_value=""), \
+             mock.patch.object(self.bc._mcu_phrases, "render_phrasebook_block",
+                               return_value="PB"):
+            prompt = self.bc.build_system_prompt(mem)
+        self.assertIn("0 day(s)", prompt)
+        self.assertIn("PB", prompt)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  _llm_quick — ollama backend branch
+# ──────────────────────────────────────────────────────────────────────────
+class LlmQuickOllamaTests(_MonolithTestBase):
+    def test_ollama_backend_returns_message_content(self):
+        fake_ollama = mock.Mock()
+        fake_ollama.chat.return_value = {"message": {"content": "ollama says hi"}}
+        with mock.patch.object(self.bc, "AI_BACKEND", "ollama"), \
+             mock.patch.object(self.bc, "OLLAMA_MODEL", "llama3"), \
+             mock.patch.dict("sys.modules", {"ollama": fake_ollama}):
+            out = self.bc._llm_quick("sys", "user", max_tokens=33)
+        self.assertEqual(out, "ollama says hi")
+        fake_ollama.chat.assert_called_once()
+        _, kwargs = fake_ollama.chat.call_args
+        self.assertEqual(kwargs["model"], "llama3")
+        self.assertEqual(kwargs["messages"][0]["role"], "system")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  learn_from_turn worker — bad-JSON + worker-exception arms
+# ──────────────────────────────────────────────────────────────────────────
+class LearnFromTurnEdgeTests(_MonolithTestBase):
+    def test_worker_malformed_json_after_brace_returns(self):
+        # _llm_quick yields a '{' but the rest isn't valid JSON → raw_decode
+        # raises JSONDecodeError → early return before merge (1440-1442).
+        mem = self.bc._empty_memory()
+        with mock.patch.object(self.bc, "LEARN_EVERY_TURN", True), \
+             mock.patch.object(self.bc.threading, "Thread", _InlineThread), \
+             mock.patch.object(self.bc, "_llm_quick", return_value="{ broken json"), \
+             mock.patch.object(self.bc, "merge_memory") as mmerge:
+            self.bc.learn_from_turn("x", "y", mem)
+        mmerge.assert_not_called()
+
+    def test_worker_exception_is_swallowed(self):
+        # _llm_quick raising inside the worker must be caught (1460-1462), not
+        # propagate out of learn_from_turn.
+        mem = self.bc._empty_memory()
+        with mock.patch.object(self.bc, "LEARN_EVERY_TURN", True), \
+             mock.patch.object(self.bc.threading, "Thread", _InlineThread), \
+             mock.patch.object(self.bc, "_llm_quick",
+                               side_effect=RuntimeError("llm boom")), \
+             mock.patch.object(self.bc, "merge_memory") as mmerge:
+            self.bc.learn_from_turn("x", "y", mem)  # must not raise
+        mmerge.assert_not_called()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  record_action_error — prune-in-record + traceback/outer error arms
+# ──────────────────────────────────────────────────────────────────────────
+class RecordActionErrorEdgeTests(_MonolithTestBase):
+    def test_record_prunes_expired_front_entry(self):
+        # An entry older than the window is popped during the record insert
+        # itself (the while-popleft at 1540-1541), not just on snapshot.
+        log = self._restore_attr_after("_action_error_log")
+        log.clear()
+        now = self.bc.time.time()
+        window = self.bc._ACTION_ERROR_LOG_WINDOW_S
+        log.append({"ts": now - window - 100, "action": "ancient",
+                    "exc_class": "E", "exc_msg": "", "traceback": ""})
+        self.bc.record_action_error("fresh", ValueError("x"), traceback_text="")
+        actions = [e["action"] for e in log]
+        self.assertNotIn("ancient", actions)   # pruned in-record
+        self.assertIn("fresh", actions)
+
+    def test_record_default_traceback_capture_failure(self):
+        # traceback.format_exc() raising is caught and traceback_text becomes ""
+        # (1528-1529); the entry is still recorded.
+        log = self._restore_attr_after("_action_error_log")
+        log.clear()
+        with mock.patch.object(self.bc.traceback, "format_exc",
+                               side_effect=RuntimeError("no tb")):
+            self.bc.record_action_error("act", ValueError("boom"))
+        self.assertEqual(len(log), 1)
+        self.assertEqual(log[0]["traceback"], "")
+
+    def test_record_outer_failure_swallowed(self):
+        # An error inside the outer try (here: time.time raising) is swallowed
+        # by the 1542-1544 guard so recording never breaks the dispatcher.
+        log = self._restore_attr_after("_action_error_log")
+        log.clear()
+        with mock.patch.object(self.bc.time, "time",
+                               side_effect=RuntimeError("clock dead")):
+            self.bc.record_action_error("act", ValueError("boom"))  # no raise
+        self.assertEqual(len(log), 0)  # nothing appended
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  _note_camera_read_attempt — outer except guard
+# ──────────────────────────────────────────────────────────────────────────
+class CameraNoteEdgeTests(_MonolithTestBase):
+    def test_note_outer_failure_swallowed(self):
+        # time.time raising trips the outer except (1609-1610); no raise, no
+        # entry created.
+        summ = self._restore_attr_after("_camera_failure_summary")
+        summ.clear()
+        with mock.patch.object(self.bc.time, "time",
+                               side_effect=RuntimeError("clock dead")):
+            self.bc._note_camera_read_attempt(0, ok=False, fails=1)  # no raise
+        self.assertEqual(self.bc.get_camera_failure_summary(), {})
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  _load_patterns corrupt-JSON / _save_patterns write-failure arms
+# ──────────────────────────────────────────────────────────────────────────
+class PatternsEdgeTests(_MonolithTestBase):
+    def test_load_patterns_corrupt_json_returns_empty(self):
+        # Invalid JSON makes json.load raise → except arm (1627-1628) → [].
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "patterns.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{ not valid json ][")
+        with mock.patch.object(self.bc, "PATTERNS_FILE", path):
+            self.assertEqual(self.bc._load_patterns(), [])
+
+    def test_save_patterns_failure_is_swallowed(self):
+        # makedirs raising trips the except (1638-1639); no propagation.
+        with mock.patch.object(self.bc.os, "makedirs",
+                               side_effect=OSError("read-only fs")):
+            self.bc._save_patterns([{"day": "Monday"}])  # must not raise
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  record_session_action — pattern_learning log_event failure arm
+# ──────────────────────────────────────────────────────────────────────────
+class RecordSessionActionEdgeTests(_MonolithTestBase):
+    def test_pattern_learning_log_event_failure_swallowed(self):
+        # A pattern_learning module whose log_event raises must be caught
+        # (1681-1682) — the action still counts.
+        counts = self._restore_attr_after("_session_action_counts")
+        counts.clear()
+        fake_pl = mock.Mock()
+        fake_pl.log_event.side_effect = RuntimeError("pl down")
+        with mock.patch.dict("sys.modules", {"skill_pattern_learning": fake_pl}):
+            self.bc.record_session_action("get_time", "")  # must not raise
+        self.assertEqual(counts["get_time"], 1)
+        fake_pl.log_event.assert_called_once()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  detect_startup_pattern — neutral match (no strong category) → ""
+# ──────────────────────────────────────────────────────────────────────────
+class DetectStartupPatternEdgeTests(_MonolithTestBase):
+    def test_matching_but_no_strong_signal_returns_empty(self):
+        # 6 sessions, current day/hour match (>=3 matching, tally non-empty) but
+        # the dominant action is neither streaming-evening nor a build action,
+        # so execution reaches the final `return ""` (line 1765).
+        fixed = time.struct_time((2026, 6, 3, 14, 0, 0, 2, 154, -1))  # Wed 14:00
+        entries = [{"day": "Wednesday", "hour_started": 14,
+                    "top_actions": ["get_time", "weather"]} for _ in range(6)]
+        with mock.patch.object(self.bc, "_load_patterns", return_value=entries), \
+             mock.patch.object(self.bc.time, "localtime", return_value=fixed), \
+             mock.patch.object(self.bc.time, "strftime",
+                               side_effect=lambda fmt, *a: "Wednesday"):
+            self.assertEqual(self.bc.detect_startup_pattern(), "")
+
+    def test_matching_but_empty_top_actions_returns_empty(self):
+        # >=3 matching sessions but every top_actions is empty → tally stays
+        # empty → the `if not tally` guard (line 1745) returns "".
+        fixed = time.struct_time((2026, 6, 3, 14, 0, 0, 2, 154, -1))
+        entries = [{"day": "Wednesday", "hour_started": 14,
+                    "top_actions": []} for _ in range(6)]
+        with mock.patch.object(self.bc, "_load_patterns", return_value=entries), \
+             mock.patch.object(self.bc.time, "localtime", return_value=fixed), \
+             mock.patch.object(self.bc.time, "strftime",
+                               side_effect=lambda fmt, *a: "Wednesday"):
+            self.assertEqual(self.bc.detect_startup_pattern(), "")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  save_session_to_memory — recall-index failure + outer failure arms
+# ──────────────────────────────────────────────────────────────────────────
+class SaveSessionEdgeTests(_MonolithTestBase):
+    def _seed_history(self):
+        hist = self._restore_attr_after("conversation_history")
+        hist.clear()
+        for i in range(4):
+            hist.append({"role": "user", "content": f"u{i}"})
+            hist.append({"role": "assistant", "content": f"a{i}"})
+        return hist
+
+    def test_recall_index_failure_swallowed_but_session_saved(self):
+        # record_session_summary raising is caught (1816-1817); the session
+        # summary is still persisted via the fresh locked write.
+        self._seed_history()
+        mem = self.bc._empty_memory()
+        store = {"sessions": []}
+
+        def _fake_load():
+            import copy
+            return copy.deepcopy(store)
+
+        def _fake_save(m):
+            store.update(m)
+
+        with mock.patch.object(self.bc, "_llm_quick",
+                               return_value="A good session."), \
+             mock.patch.object(self.bc, "load_memory", _fake_load), \
+             mock.patch.object(self.bc, "save_memory", _fake_save), \
+             mock.patch.object(self.bc.pattern_memory, "record_session_summary",
+                               side_effect=RuntimeError("recall down")):
+            self.bc.save_session_to_memory(mem)  # must not raise
+        self.assertTrue(store["sessions"])
+        self.assertEqual(store["sessions"][-1]["summary"], "A good session.")
+
+    def test_outer_failure_swallowed(self):
+        # _llm_quick raising trips the outer except (1818-1819); no propagation
+        # and nothing is written.
+        self._seed_history()
+        mem = self.bc._empty_memory()
+        with mock.patch.object(self.bc, "_llm_quick",
+                               side_effect=RuntimeError("summary boom")), \
+             mock.patch.object(self.bc, "save_memory") as msave:
+            self.bc.save_session_to_memory(mem)  # must not raise
+            msave.assert_not_called()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  _session_summary_checkpoint_thread — single-iteration body
+# ──────────────────────────────────────────────────────────────────────────
+class SessionCheckpointThreadTests(_MonolithTestBase):
+    def _drive_one_iteration(self, *, last_len_val):
+        """Run the daemon body exactly once: the leading sleep is a no-op and
+        the trailing in-loop sleep raises a sentinel so the ``while True`` loop
+        exits after one pass instead of looping forever."""
+        class _StopLoop(Exception):
+            pass
+
+        sleeps = {"n": 0}
+
+        def _sleep(_secs):
+            sleeps["n"] += 1
+            if sleeps["n"] >= 2:   # the trailing sleep inside the while loop
+                raise _StopLoop()
+            return None            # the leading pre-loop sleep
+
+        last = self._restore_attr_after("_session_checkpoint_last_len")
+        last[0] = last_len_val
+        hist = self._restore_attr_after("conversation_history")
+        hist.clear()
+        for i in range(4):
+            hist.append({"role": "user", "content": f"u{i}"})
+            hist.append({"role": "assistant", "content": f"a{i}"})
+        with mock.patch.object(self.bc.time, "sleep", _sleep):
+            try:
+                self.bc._session_summary_checkpoint_thread()
+            except _StopLoop:
+                pass
+        return last
+
+    def test_checkpoint_writes_summary_when_history_grew(self):
+        captured = {}
+        with mock.patch.object(self.bc, "_llm_quick",
+                               return_value="Mid-session summary.\nextra"), \
+             mock.patch.object(self.bc.pattern_memory, "record_session_summary",
+                               side_effect=lambda s, **k: captured.update(s=s)):
+            last = self._drive_one_iteration(last_len_val=0)
+        self.assertEqual(captured["s"], "Mid-session summary.")
+        self.assertEqual(last[0], 8)   # checkpoint stamps the new length
+
+    def test_checkpoint_skips_when_history_unchanged(self):
+        # last_len already equals the current history length (8) → the
+        # hist_len != last guard is False, so no LLM call / no recall write.
+        with mock.patch.object(self.bc, "_llm_quick") as mq, \
+             mock.patch.object(self.bc.pattern_memory,
+                               "record_session_summary") as mrec:
+            self._drive_one_iteration(last_len_val=8)
+        mq.assert_not_called()
+        mrec.assert_not_called()
+
+    def test_checkpoint_summary_failure_swallowed(self):
+        # record_session_summary raising is caught by the inner except
+        # (1869-1870); the loop continues to the trailing sleep (our sentinel).
+        with mock.patch.object(self.bc, "_llm_quick",
+                               return_value="A summary."), \
+             mock.patch.object(self.bc.pattern_memory, "record_session_summary",
+                               side_effect=RuntimeError("recall boom")):
+            last = self._drive_one_iteration(last_len_val=0)
+        # Failed write → last_len NOT advanced (still 0).
+        self.assertEqual(last[0], 0)
+
+    def test_checkpoint_outer_loop_error_swallowed(self):
+        # An error in the snapshot/length logic (outside the inner try) is
+        # caught by the outer loop guard (1871-1872). Here list(conversation_
+        # history) raises because the global is a bad object for one iteration.
+        class _StopLoop(Exception):
+            pass
+
+        sleeps = {"n": 0}
+
+        def _sleep(_secs):
+            sleeps["n"] += 1
+            if sleeps["n"] >= 2:
+                raise _StopLoop()
+            return None
+
+        class _BadHist:
+            def __iter__(self):
+                raise RuntimeError("snapshot boom")
+
+        with mock.patch.object(self.bc, "conversation_history", _BadHist()), \
+             mock.patch.object(self.bc.time, "sleep", _sleep), \
+             mock.patch.object(self.bc, "_llm_quick") as mq:
+            try:
+                self.bc._session_summary_checkpoint_thread()
+            except _StopLoop:
+                pass
+        # The outer except absorbed the snapshot error before the LLM was hit.
+        mq.assert_not_called()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  _cleanup_old_logs — inner unlink + outer listdir error arms
+# ──────────────────────────────────────────────────────────────────────────
+class CleanupOldLogsEdgeTests(_MonolithTestBase):
+    def test_unlink_failure_per_file_swallowed(self):
+        # os.unlink raising for an excess log is caught per-file (1928-1929);
+        # the function completes without raising.
+        d = tempfile.mkdtemp()
+        keep = self.bc.LOG_KEEP_COUNT
+        for i in range(keep + 2):
+            p = os.path.join(d, f"session_{i}.log")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("x")
+            os.utime(p, (1000 + i, 1000 + i))
+        with mock.patch.object(self.bc, "LOGS_DIR", d), \
+             mock.patch.object(self.bc.os, "unlink",
+                               side_effect=OSError("locked")):
+            self.bc._cleanup_old_logs()  # must not raise
+
+    def test_listdir_failure_swallowed(self):
+        # os.listdir raising trips the outer except (1930-1931).
+        d = tempfile.mkdtemp()
+        with mock.patch.object(self.bc, "LOGS_DIR", d), \
+             mock.patch.object(self.bc.os, "listdir",
+                               side_effect=OSError("denied")):
+            self.bc._cleanup_old_logs()  # must not raise
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  setup_logging — installed excepthook body + faulthandler failure arm
+# ──────────────────────────────────────────────────────────────────────────
+class SetupLoggingEdgeTests(_MonolithTestBase):
+    def _install_with_restore(self, d, **extra_patches):
+        orig_out, orig_err = self.bc.sys.stdout, self.bc.sys.stderr
+        orig_hook = self.bc.sys.excepthook
+        orig_handle = self.bc._log_file_handle
+        orig_path = self.bc._log_file_path
+
+        def _restore():
+            self.bc.sys.stdout = orig_out
+            self.bc.sys.stderr = orig_err
+            self.bc.sys.excepthook = orig_hook
+            try:
+                if self.bc._log_file_handle is not None:
+                    self.bc._log_file_handle.close()
+            except Exception:
+                pass
+            self.bc._log_file_handle = orig_handle
+            self.bc._log_file_path = orig_path
+
+        self.addCleanup(_restore)
+
+    def test_excepthook_writes_fatal_to_stderr(self):
+        # Drive the excepthook installed by setup_logging (1961-1965) with a
+        # synthetic exception and confirm it writes the [FATAL] banner.
+        d = tempfile.mkdtemp()
+        self._install_with_restore(d)
+        with mock.patch.object(self.bc, "LOGGING_ENABLED", True), \
+             mock.patch.object(self.bc, "LOGS_DIR", d), \
+             mock.patch.object(self.bc, "_cleanup_old_logs"):
+            self.bc.setup_logging()
+        import io as _io
+        sink = _io.StringIO()
+        # Point the freshly-installed Tee at a capturable stderr, then fire the
+        # hook with a real (already-raised) exception so the traceback is valid.
+        with mock.patch.object(self.bc.sys, "stderr", sink):
+            try:
+                raise ValueError("synthetic fatal")
+            except ValueError:
+                import sys as _sys
+                self.bc.sys.excepthook(*_sys.exc_info())
+        self.assertIn("[FATAL]", sink.getvalue())
+        self.assertIn("synthetic fatal", sink.getvalue())
+
+    def test_faulthandler_failure_is_swallowed(self):
+        # faulthandler.enable raising must be caught (1985-1986); the Tee is
+        # still installed and the log file still created.
+        d = tempfile.mkdtemp()
+        self._install_with_restore(d)
+        import faulthandler as _fh
+        with mock.patch.object(self.bc, "LOGGING_ENABLED", True), \
+             mock.patch.object(self.bc, "LOGS_DIR", d), \
+             mock.patch.object(self.bc, "_cleanup_old_logs"), \
+             mock.patch.object(_fh, "enable",
+                               side_effect=RuntimeError("no faulthandler")):
+            self.bc.setup_logging()  # must not raise
+        self.assertIsInstance(self.bc.sys.stdout, self.bc._TimestampedTee)
+        self.assertTrue(os.path.exists(self.bc._log_file_path))
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  close_log — write-failure arm
+# ──────────────────────────────────────────────────────────────────────────
+class CloseLogEdgeTests(_MonolithTestBase):
+    def test_close_log_write_failure_swallowed(self):
+        # A handle whose write raises must be caught (1997-1998); no raise.
+        class _Bad:
+            def write(self, s):
+                raise OSError("disk full")
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        with mock.patch.object(self.bc, "_log_file_handle", _Bad()), \
+             mock.patch.object(self.bc.time, "strftime", return_value="TS"):
+            self.bc.close_log()  # must not raise
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  _write_hud_state — inner replace-failure cleans up temp then re-raises
+# ──────────────────────────────────────────────────────────────────────────
+class WriteHudStateEdgeTests(_MonolithTestBase):
+    def test_replace_failure_removes_temp_and_swallows(self):
+        # os.replace raising runs the inner except (2137-2143): the temp file is
+        # removed and the error re-raised into the outer pass. Net: no leftover
+        # temp, no raise.
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "hud_state.json")
+        with mock.patch.object(self.bc, "HUD_ENABLED", True), \
+             mock.patch.object(self.bc, "HUD_STATE_FILE", path), \
+             mock.patch.object(self.bc.os, "replace",
+                               side_effect=OSError("replace failed")):
+            self.bc._write_hud_state(state="x")  # must not raise
+        # No .hud_* temp left behind in the target dir.
+        leftovers = [f for f in os.listdir(d) if f.startswith(".hud_")]
+        self.assertEqual(leftovers, [])
+
+    def test_replace_and_cleanup_both_fail_swallowed(self):
+        # os.replace AND the temp-cleanup os.remove both raising exercises the
+        # nested except (2141-2142) before the re-raise lands in the outer pass.
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "hud_state.json")
+        with mock.patch.object(self.bc, "HUD_ENABLED", True), \
+             mock.patch.object(self.bc, "HUD_STATE_FILE", path), \
+             mock.patch.object(self.bc.os, "replace",
+                               side_effect=OSError("replace failed")), \
+             mock.patch.object(self.bc.os, "remove",
+                               side_effect=OSError("remove failed")):
+            self.bc._write_hud_state(state="x")  # must not raise
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  _launch_hud — monitor-pick fallback + blue/green except
+# ──────────────────────────────────────────────────────────────────────────
+class LaunchHudEdgeTests(_MonolithTestBase):
+    def test_unknown_monitor_falls_back_to_default(self):
+        # MONITORS lacks the requested HUD_MONITOR but has a "middle" fallback,
+        # so the defensive `mon = MONITORS.get("top") or ...` line (2182) runs
+        # and the launch still proceeds.
+        fake_proc = mock.Mock()
+        fake_proc.pid = 11
+        with mock.patch.object(self.bc, "HUD_ENABLED", True), \
+             mock.patch.object(self.bc, "HUD_MONITOR", "does_not_exist"), \
+             mock.patch.object(self.bc, "MONITORS",
+                               {"middle": (0, 0, 1920, 1080)}), \
+             mock.patch.object(self.bc.os.path, "exists", return_value=True), \
+             mock.patch.object(self.bc, "_bgm", None), \
+             mock.patch.object(self.bc.subprocess, "Popen",
+                               return_value=fake_proc) as mpop, \
+             mock.patch.object(self.bc, "_hud_process", None):
+            self.bc._launch_hud()
+            mpop.assert_called_once()
+        self.bc._hud_process = None
+
+    def test_blue_green_monitor_lookup_failure_swallowed(self):
+        # With _bgm active but _BLUE_GREEN_PATHS.get raising, the per-role
+        # monitor pick is caught (2176-2177) and launch continues on HUD_MONITOR.
+        fake_proc = mock.Mock()
+        fake_proc.pid = 12
+
+        class _BadPaths(dict):
+            # Only the in-try monitor-name lookup explodes (2174); the later
+            # out-of-try hud_state_file lookup (2201) must behave normally or it
+            # would propagate past the function instead of exercising 2176-2177.
+            def get(self, key, default=None):
+                if key == "monitor_name":
+                    raise RuntimeError("paths exploded")
+                return default
+
+        with mock.patch.object(self.bc, "HUD_ENABLED", True), \
+             mock.patch.object(self.bc, "HUD_MONITOR", "left"), \
+             mock.patch.object(self.bc, "MONITORS",
+                               {"left": (0, 0, 1920, 1080)}), \
+             mock.patch.object(self.bc.os.path, "exists", return_value=True), \
+             mock.patch.object(self.bc, "_bgm", object()), \
+             mock.patch.object(self.bc, "_BLUE_GREEN_PATHS", _BadPaths()), \
+             mock.patch.object(self.bc.subprocess, "Popen",
+                               return_value=fake_proc) as mpop, \
+             mock.patch.object(self.bc, "_hud_process", None):
+            self.bc._launch_hud()  # must not raise
+            mpop.assert_called_once()
+        self.bc._hud_process = None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  _publish_reticle — non-list "reticles" payload is reset
+# ──────────────────────────────────────────────────────────────────────────
+class PublishReticleEdgeTests(_MonolithTestBase):
+    def test_non_list_reticles_payload_reset(self):
+        # Valid JSON but "reticles" is a string (not a list) → the
+        # isinstance guard resets entries to [] (line 2263) before appending.
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "ret.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"reticles": "not-a-list"}, f)
+        with mock.patch.object(self.bc, "RETICLE_OVERLAY_ENABLED", True), \
+             mock.patch.object(self.bc, "RETICLE_STATE_FILE", path):
+            self.bc._publish_reticle(3, 4, "fresh")
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual([r["label"] for r in data["reticles"]], ["fresh"])
+
+    def test_final_write_failure_swallowed(self):
+        # The final atomic os.replace failing trips the outer except (2280-2281)
+        # — best-effort write, no raise.
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "ret.json")
+        with mock.patch.object(self.bc, "RETICLE_OVERLAY_ENABLED", True), \
+             mock.patch.object(self.bc, "RETICLE_STATE_FILE", path), \
+             mock.patch.object(self.bc.os, "replace",
+                               side_effect=OSError("replace failed")):
+            self.bc._publish_reticle(1, 2, "x")  # must not raise
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  _active_window_center — inner geometry error + outer getActiveWindow error
+# ──────────────────────────────────────────────────────────────────────────
+class ActiveWindowCenterEdgeTests(_MonolithTestBase):
+    def _fake_gw_module(self, **kw):
+        mod = mock.Mock()
+        for k, v in kw.items():
+            setattr(mod.getActiveWindow, k, v)
+        return mod
+
+    def test_non_numeric_geometry_returns_none(self):
+        # left/width that can't do arithmetic make the int(...) computation
+        # raise → inner except returns None (2299-2300).
+        win = mock.Mock(left=object(), top=object(), width=object(),
+                        height=object())
+        mod = mock.Mock()
+        mod.getActiveWindow.return_value = win
+        with mock.patch.dict("sys.modules", {"pygetwindow": mod}):
+            self.assertIsNone(self.bc._active_window_center())
+
+    def test_get_active_window_raises_returns_none(self):
+        # getActiveWindow itself raising trips the outer except (2306-2307).
+        mod = mock.Mock()
+        mod.getActiveWindow.side_effect = RuntimeError("win32 hiccup")
+        with mock.patch.dict("sys.modules", {"pygetwindow": mod}):
+            self.assertIsNone(self.bc._active_window_center())
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  _virtual_screen_bounds — malformed monitor tuple is skipped
+# ──────────────────────────────────────────────────────────────────────────
+class VirtualScreenBoundsEdgeTests(_MonolithTestBase):
+    def test_malformed_monitor_entry_skipped(self):
+        # A 2-tuple can't unpack to (mx,my,mw,mh) → that monitor is skipped
+        # (2320-2321); the well-formed one still defines the bounds.
+        with mock.patch.object(self.bc, "MONITORS",
+                               {"bad": (0, 0), "good": (10, 20, 100, 200)}):
+            self.assertEqual(self.bc._virtual_screen_bounds(),
+                             (10, 20, 100, 200))
+
+    def test_all_malformed_returns_default(self):
+        # Every monitor entry is malformed → xs/ys empty → safe default.
+        with mock.patch.object(self.bc, "MONITORS", {"bad": (0, 0)}):
+            self.assertEqual(self.bc._virtual_screen_bounds(),
+                             (0, 0, 2560, 1440))
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  _launch_reticle_overlay — state-file reset error + Popen failure
+# ──────────────────────────────────────────────────────────────────────────
+class LaunchReticleEdgeTests(_MonolithTestBase):
+    def test_state_reset_failure_swallowed_then_launches(self):
+        # open() for the state-file reset raising is caught (2347-2348); launch
+        # still proceeds via Popen.
+        fake_proc = mock.Mock()
+        fake_proc.pid = 5
+        state = os.path.join(tempfile.mkdtemp(), "ret.json")
+        real_open = open
+
+        def _boom_open(p, *a, **k):
+            if p == state:
+                raise OSError("state locked")
+            return real_open(p, *a, **k)
+
+        with mock.patch.object(self.bc, "RETICLE_OVERLAY_ENABLED", True), \
+             mock.patch.object(self.bc, "RETICLE_STATE_FILE", state), \
+             mock.patch.object(self.bc.os.path, "exists", return_value=True), \
+             mock.patch("builtins.open", _boom_open), \
+             mock.patch.object(self.bc.subprocess, "Popen",
+                               return_value=fake_proc) as mpop, \
+             mock.patch.object(self.bc, "_reticle_process", None):
+            self.bc._launch_reticle_overlay()
+            mpop.assert_called_once()
+        self.bc._reticle_process = None
+
+    def test_popen_failure_swallowed(self):
+        # Popen raising is caught (2359-2361) and _reticle_process reset to None.
+        state = os.path.join(tempfile.mkdtemp(), "ret.json")
+        with mock.patch.object(self.bc, "RETICLE_OVERLAY_ENABLED", True), \
+             mock.patch.object(self.bc, "RETICLE_STATE_FILE", state), \
+             mock.patch.object(self.bc.os.path, "exists", return_value=True), \
+             mock.patch.object(self.bc.subprocess, "Popen",
+                               side_effect=OSError("spawn fail")), \
+             mock.patch.object(self.bc, "_reticle_process", "sentinel"):
+            self.bc._launch_reticle_overlay()  # must not raise
+            self.assertIsNone(self.bc._reticle_process)
+        self.bc._reticle_process = None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Subprocess shutdown helpers — None-return + terminate-failure arms
+# ──────────────────────────────────────────────────────────────────────────
+class ShutdownHelperEdgeTests(_MonolithTestBase):
+    def test_shutdown_reticle_noop_when_none(self):
+        with mock.patch.object(self.bc, "_reticle_process", None):
+            self.bc._shutdown_reticle_overlay()  # early return (2367-2368)
+
+    def test_shutdown_reticle_terminate_failure_swallowed(self):
+        proc = mock.Mock()
+        proc.terminate.side_effect = OSError("already dead")
+        with mock.patch.object(self.bc, "_reticle_process", proc):
+            self.bc._shutdown_reticle_overlay()  # except 2371-2372
+        self.assertIsNone(self.bc._reticle_process)
+
+    def test_shutdown_hud_terminate_failure_swallowed(self):
+        # terminate raising hits the except (2384-2385). NOTE: unlike
+        # _shutdown_reticle, _shutdown_hud clears _hud_process *inside* the try
+        # (line 2383), so a terminate failure leaves it non-None — asserted
+        # here as the documented current behaviour, then restored.
+        proc = mock.Mock()
+        proc.terminate.side_effect = OSError("already dead")
+        with mock.patch.object(self.bc, "_hud_process", proc):
+            self.bc._shutdown_hud()  # must not raise
+            self.assertIs(self.bc._hud_process, proc)  # not cleared on failure
+        self.bc._hud_process = None
+
+    def test_shutdown_tray_terminate_failure_swallowed(self):
+        proc = mock.Mock()
+        proc.terminate.side_effect = OSError("already dead")
+        drain = self.bc._tray_drain_stop
+        pub = self.bc._tray_publisher_stop
+        drain.clear()
+        pub.clear()
+        self.addCleanup(drain.clear)
+        self.addCleanup(pub.clear)
+        with mock.patch.object(self.bc, "_tray_process", proc):
+            self.bc._shutdown_tray()  # except 2452-2453
+        self.assertTrue(drain.is_set())
+        self.assertTrue(pub.is_set())
+        self.assertIsNone(self.bc._tray_process)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  _launch_tray — missing script, stale-cleanup error, Popen failure
+# ──────────────────────────────────────────────────────────────────────────
+class LaunchTrayEdgeTests(_MonolithTestBase):
+    def test_missing_script_skips(self):
+        with mock.patch.object(self.bc, "TRAY_ENABLED", True), \
+             mock.patch.object(self.bc.os.path, "exists", return_value=False), \
+             mock.patch.object(self.bc.subprocess, "Popen") as mpop:
+            self.bc._launch_tray()  # early return (2414-2416)
+            mpop.assert_not_called()
+
+    def test_stale_cleanup_error_swallowed_then_launches(self):
+        # A stale inbox "exists" but os.remove raises → per-file except
+        # (2424-2425); launch still proceeds.
+        fake_proc = mock.Mock()
+        fake_proc.pid = 8
+        with mock.patch.object(self.bc, "TRAY_ENABLED", True), \
+             mock.patch.object(self.bc.os.path, "exists", return_value=True), \
+             mock.patch.object(self.bc.os, "remove",
+                               side_effect=OSError("locked")), \
+             mock.patch.object(self.bc.subprocess, "Popen",
+                               return_value=fake_proc) as mpop, \
+             mock.patch.object(self.bc, "_publish_audio_state"), \
+             mock.patch.object(self.bc, "_tray_process", None):
+            self.bc._launch_tray()  # must not raise
+            mpop.assert_called_once()
+        self.bc._tray_process = None
+
+    def test_popen_failure_swallowed(self):
+        with mock.patch.object(self.bc, "TRAY_ENABLED", True), \
+             mock.patch.object(self.bc.os.path, "exists", return_value=False), \
+             mock.patch.object(self.bc.os, "remove"), \
+             mock.patch.object(self.bc.subprocess, "Popen",
+                               side_effect=OSError("spawn fail")), \
+             mock.patch.object(self.bc, "_tray_process", "sentinel"):
+            # exists=False short-circuits before Popen, so force the spawn path:
+            pass
+        # Drive the actual Popen-failure arm with a present script.
+        with mock.patch.object(self.bc, "TRAY_ENABLED", True), \
+             mock.patch.object(self.bc.os.path, "exists", return_value=True), \
+             mock.patch.object(self.bc.os, "remove"), \
+             mock.patch.object(self.bc.subprocess, "Popen",
+                               side_effect=OSError("spawn fail")), \
+             mock.patch.object(self.bc, "_tray_process", "sentinel"):
+            self.bc._launch_tray()  # except 2437-2439
+            self.assertIsNone(self.bc._tray_process)
+        self.bc._tray_process = None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  _process_inflight — os.remove failures on each delete arm
+# ──────────────────────────────────────────────────────────────────────────
+class ProcessInflightRemoveEdgeTests(_MonolithTestBase):
+    def _write(self, payload_text):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "tray.json.inflight")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(payload_text)
+        return path
+
+    def test_empty_file_remove_failure_swallowed(self):
+        path = self._write("   ")
+        with mock.patch.object(self.bc.os, "remove",
+                               side_effect=OSError("locked")), \
+             mock.patch.object(self.bc, "_dispatch_tray_command") as mdisp:
+            self.assertEqual(self.bc._process_inflight(path), 0)  # 2465-2466
+            mdisp.assert_not_called()
+
+    def test_corrupt_file_remove_failure_swallowed(self):
+        path = self._write("{ broken json")
+        with mock.patch.object(self.bc.os, "remove",
+                               side_effect=OSError("locked")), \
+             mock.patch.object(self.bc, "_dispatch_tray_command") as mdisp:
+            self.assertEqual(self.bc._process_inflight(path), 0)  # 2472-2473
+            mdisp.assert_not_called()
+
+    def test_non_list_remove_failure_swallowed(self):
+        path = self._write(json.dumps({"cmd": "x"}))
+        with mock.patch.object(self.bc.os, "remove",
+                               side_effect=OSError("locked")), \
+             mock.patch.object(self.bc, "_dispatch_tray_command") as mdisp:
+            self.assertEqual(self.bc._process_inflight(path), 0)  # 2476-2477
+            mdisp.assert_not_called()
+
+    def test_read_failure_remove_failure_swallowed(self):
+        path = self._write(json.dumps([{"cmd": "a"}]))
+        real_open = open
+
+        def _boom_open(p, *a, **k):
+            if p == path:
+                raise OSError("read denied")
+            return real_open(p, *a, **k)
+
+        with mock.patch("builtins.open", _boom_open), \
+             mock.patch.object(self.bc.os, "remove",
+                               side_effect=OSError("locked")), \
+             mock.patch.object(self.bc, "_dispatch_tray_command") as mdisp:
+            self.assertEqual(self.bc._process_inflight(path), 0)  # 2481-2482
+            mdisp.assert_not_called()
+
+    def test_predispatch_remove_failure_still_dispatches(self):
+        # The pre-dispatch claim-file remove failing (2488-2489) must not stop
+        # the commands from running.
+        path = self._write(json.dumps([{"cmd": "a"}, {"cmd": "b"}]))
+        with mock.patch.object(self.bc.os, "remove",
+                               side_effect=OSError("locked")), \
+             mock.patch.object(self.bc, "_dispatch_tray_command") as mdisp:
+            self.assertEqual(self.bc._process_inflight(path), 2)
+            self.assertEqual(mdisp.call_count, 2)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  _drain_tray_commands_once — claim (os.replace) failure
+# ──────────────────────────────────────────────────────────────────────────
+class DrainClaimFailureTests(_MonolithTestBase):
+    def test_claim_replace_failure_returns_orphan_count(self):
+        # os.replace claim failing is caught (2536-2538); the function returns
+        # whatever the orphan pass produced (0 here) without raising.
+        d = tempfile.mkdtemp()
+        cmd_file = os.path.join(d, "tray_commands.json")
+        with open(cmd_file, "w", encoding="utf-8") as f:
+            json.dump([{"cmd": "x"}], f)
+        with mock.patch.object(self.bc, "TRAY_COMMANDS_FILE", cmd_file), \
+             mock.patch.object(self.bc.os, "replace",
+                               side_effect=OSError("claim failed")), \
+             mock.patch.object(self.bc, "_dispatch_tray_command") as mdisp:
+            self.assertEqual(self.bc._drain_tray_commands_once(), 0)
+            mdisp.assert_not_called()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  _dispatch_tray_command — remaining error/branch arms
+# ──────────────────────────────────────────────────────────────────────────
+class DispatchTrayCommandEdgeTests(_MonolithTestBase):
+    def test_force_wake_wake_date_failure_swallowed(self):
+        # Making _last_wake_date non-subscriptable forces the wake-date stamp to
+        # raise → caught (2569-2570); the rest of force_wake still runs.
+        sleep = self._restore_attr_after("_sleep_mode")
+        standby = self._restore_attr_after("_standby_mode")
+        sleep[0] = True
+        standby[0] = True
+        with mock.patch.object(self.bc, "_write_hud_state"), \
+             mock.patch.object(self.bc, "_speak"), \
+             mock.patch.object(self.bc, "_last_wake_date", object()), \
+             mock.patch.object(self.bc.os.path, "exists", return_value=False):
+            self.bc._dispatch_tray_command("force_wake", {})  # must not raise
+        self.assertFalse(sleep[0])
+        self.assertFalse(standby[0])
+
+    def test_force_wake_overnight_remove_failure_swallowed(self):
+        # os.remove raising during overnight-flag cleanup is caught (2577-2578).
+        sleep = self._restore_attr_after("_sleep_mode")
+        standby = self._restore_attr_after("_standby_mode")
+        sleep[0] = True
+        standby[0] = True
+        with mock.patch.object(self.bc, "_write_hud_state"), \
+             mock.patch.object(self.bc, "_speak"), \
+             mock.patch.object(self.bc.os.path, "exists", return_value=True), \
+             mock.patch.object(self.bc.os, "remove",
+                               side_effect=OSError("locked")):
+            self.bc._dispatch_tray_command("force_wake", {})  # must not raise
+        self.assertFalse(sleep[0])
+
+    def test_force_wake_speak_failure_swallowed(self):
+        # _speak raising is caught by the 2580-2581 guard.
+        sleep = self._restore_attr_after("_sleep_mode")
+        standby = self._restore_attr_after("_standby_mode")
+        sleep[0] = True
+        standby[0] = True
+        with mock.patch.object(self.bc, "_write_hud_state"), \
+             mock.patch.object(self.bc, "_speak",
+                               side_effect=RuntimeError("tts dead")), \
+             mock.patch.object(self.bc.os.path, "exists", return_value=False):
+            self.bc._dispatch_tray_command("force_wake", {})  # must not raise
+        self.assertFalse(sleep[0])
+
+    def test_open_hud_enables_flag_when_disabled(self):
+        # HUD_ENABLED False → the `if not HUD_ENABLED: HUD_ENABLED = True` body
+        # (2590-2591) runs before relaunch. mock.patch.object restores the flag.
+        with mock.patch.object(self.bc, "HUD_ENABLED", False), \
+             mock.patch.object(self.bc, "_shutdown_hud"), \
+             mock.patch.object(self.bc, "_launch_hud"):
+            self.bc._dispatch_tray_command("open_hud", {})
+            self.assertTrue(self.bc.HUD_ENABLED)
+
+    def test_restart_action_failure_swallowed(self):
+        with mock.patch.object(self.bc, "_act_restart",
+                               side_effect=RuntimeError("restart boom")):
+            self.bc._dispatch_tray_command("restart", {})  # except 2597-2598
+
+    def test_trigger_overnight_action_failure_swallowed(self):
+        with mock.patch.object(self.bc, "_act_start_overnight_upgrade",
+                               side_effect=RuntimeError("overnight boom")):
+            self.bc._dispatch_tray_command("trigger_overnight", {})  # 2602-2603
+
+    def test_ambient_toggle_action_raises_swallowed(self):
+        # The registered ambient action raising is caught (2636-2637).
+        active = self._restore_attr_after("_ambient_mode_active")
+        active[0] = False
+        boom = mock.Mock(side_effect=RuntimeError("ambient boom"))
+        with mock.patch.object(self.bc, "ACTIONS",
+                               {"ambient_listen_start": boom}), \
+             mock.patch.object(self.bc, "_write_hud_state"):
+            self.bc._dispatch_tray_command("ambient_mode_toggle", {})
+        self.assertTrue(active[0])
+        boom.assert_called_once_with("")
+
+    def test_ambient_toggle_action_not_registered(self):
+        # No matching ACTIONS entry → the else-print branch (2638-2639).
+        active = self._restore_attr_after("_ambient_mode_active")
+        active[0] = False
+        with mock.patch.object(self.bc, "ACTIONS", {}), \
+             mock.patch.object(self.bc, "_write_hud_state"):
+            self.bc._dispatch_tray_command("ambient_mode_toggle", {})
+        self.assertTrue(active[0])
+
+    def test_pause_daemons_resume_branch_and_failure(self):
+        # Start paused=True so the toggle flips to False → the `else: resume`
+        # branch (2652-2653) runs; resume_diagnostics raising hits 2654-2655.
+        paused = self._restore_attr_after("_daemons_paused")
+        paused[0] = True
+        fake_diag = mock.Mock()
+        fake_diag.resume_diagnostics.side_effect = RuntimeError("diag boom")
+        with mock.patch.object(self.bc, "_write_hud_state"), \
+             mock.patch.dict("sys.modules",
+                             {"core.diagnostic_daemons": fake_diag}):
+            self.bc._dispatch_tray_command("pause_daemons_toggle", {})
+        self.assertFalse(paused[0])
+        fake_diag.resume_diagnostics.assert_called_once()
+
+    def test_pause_daemons_ambient_set_paused_failure(self):
+        # skill_ambient_listen.set_paused raising is caught (2660-2661).
+        paused = self._restore_attr_after("_daemons_paused")
+        paused[0] = False
+        fake_diag = mock.Mock()
+        fake_al = mock.Mock()
+        fake_al.set_paused.side_effect = RuntimeError("al boom")
+        with mock.patch.object(self.bc, "_write_hud_state"), \
+             mock.patch.dict("sys.modules",
+                             {"core.diagnostic_daemons": fake_diag,
+                              "skill_ambient_listen": fake_al}):
+            self.bc._dispatch_tray_command("pause_daemons_toggle", {})
+        self.assertTrue(paused[0])
+        fake_al.set_paused.assert_called_once_with(True)
+
+    def test_generic_long_result_is_truncated(self):
+        # A registered action returning a >120-char string exercises the
+        # truncation branch (2698-2699).
+        long_line = "Z" * 200
+        fn = mock.Mock(return_value=long_line)
+        with mock.patch.object(self.bc, "ACTIONS", {"verbose": fn}), \
+             mock.patch.object(self.bc, "_HEAVY_ACTIONS", frozenset()):
+            self.bc._dispatch_tray_command("verbose", {"arg": ""})
+        fn.assert_called_once_with("")
+
+    def test_generic_nonstring_result_dispatched_branch(self):
+        # A non-string result yields head == "" → the `else: dispatched`
+        # branch (2701-2702).
+        fn = mock.Mock(return_value=12345)   # not a str
+        with mock.patch.object(self.bc, "ACTIONS", {"numbery": fn}), \
+             mock.patch.object(self.bc, "_HEAVY_ACTIONS", frozenset()):
+            self.bc._dispatch_tray_command("numbery", {"arg": ""})
+        fn.assert_called_once_with("")
+
+
 if __name__ == "__main__":
     unittest.main()
