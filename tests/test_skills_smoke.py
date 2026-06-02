@@ -29,12 +29,43 @@ def _is_intra(module_name: str | None) -> bool:
     return bool(module_name) and module_name.split(".")[0] in _INTRA_PREFIXES
 
 
+def _reset_real_scheduler_state() -> None:
+    """Some skills (e.g. schedule_manager) call the REAL
+    ``core.scheduler.bootstrap()`` in their ``register()``, which starts a live
+    apscheduler ``BackgroundScheduler`` daemon and stores it in the module-global
+    ``core.scheduler._state``. Left there, it leaks across the whole suite and
+    crashes ``test_scheduler``'s setUp (which deep-copies ``_state`` — and a live
+    scheduler "cannot be serialized"). Shut it down and reset the global state so
+    this smoke test is a good citizen. No-op if scheduler was never bootstrapped
+    or apscheduler isn't installed."""
+    try:
+        import core.scheduler as _sched
+    except Exception:
+        return
+    try:
+        _sched.shutdown(wait=False)   # sets cond_stop, shuts scheduler, _state["scheduler"]=None
+    except Exception:
+        pass
+    # Null the remaining poller refs so nothing live dangles in global state.
+    try:
+        _sched._state["cond_thread"] = None
+        _sched._state["cond_stop"] = None
+        _sched._state["actions"] = None
+        _sched._state["started_at"] = None
+    except Exception:
+        pass
+
+
 class SkillSmokeTests(unittest.TestCase):
     """One generated test_smoke_<skill> method per skill (added below)."""
 
 
 def _make_smoke(name: str):
     def test(self: unittest.TestCase) -> None:
+        # A skill's register() may bootstrap the real core.scheduler; ensure it
+        # is torn down regardless of how this test exits, so no live scheduler
+        # leaks into the global state and pollutes later tests.
+        self.addCleanup(_reset_real_scheduler_state)
         try:
             _mod, actions = load_skill_isolated(name)
         except (ImportError, ModuleNotFoundError) as exc:
@@ -57,6 +88,9 @@ class SkillActionSurfaceTests(unittest.TestCase):
     """Aggregate guards so a mass-registration regression can't pass silently."""
 
     def test_action_surface_is_populated(self):
+        # Loading every skill bootstraps the real core.scheduler (via
+        # schedule_manager.register); tear it down on exit so it doesn't leak.
+        self.addCleanup(_reset_real_scheduler_state)
         loaded = 0
         skipped = 0
         total_actions = 0

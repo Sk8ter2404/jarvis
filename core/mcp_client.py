@@ -80,7 +80,8 @@ _DEFAULT_CALL_TIMEOUT = 30.0
 
 # Shared global state. Guarded by `_lock` except for the asyncio.Event
 # instances, which are created on (and only touched from) the loop thread.
-_lock = threading.Lock()
+_lock = threading.RLock()  # reentrant: bootstrap()'s idempotent branch calls
+#                            _build_catalog(), which re-acquires this lock.
 _state: dict[str, Any] = {
     "loop":            None,    # asyncio loop running in bg thread
     "thread":          None,    # daemon thread that owns the loop

@@ -55,7 +55,11 @@ def main(argv: list[str]) -> int:
 
     cov = coverage.Coverage(
         source=["core", "skills", "tools"],
-        omit=["*/tests/*", "*/__pycache__/*", "tools/run_coverage.py"],
+        omit=["*/tests/*", "*/__pycache__/*", "tools/run_coverage.py",
+              # gitignored personal skills — not shipped, absent on CI, so they
+              # don't belong in the shipped-coverage denominator.
+              "*/skills/vip_intercept.py", "*/skills/vip_boss_mode.py",
+              "*/skills/trip_planner.py", "*/skills/teams_screener.py"],
         branch=False,
     )
     cov.start()

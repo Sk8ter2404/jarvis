@@ -26,12 +26,59 @@ def _fake_rag(available=True, hits=None):
     return rag
 
 
+class _RagStubPatch:
+    """Inject a stub ``core.rag_indexer`` so the skill's ``_rag()`` (which does
+    ``from core import rag_indexer``) resolves to the stub and NEVER imports the
+    real chromadb/OTEL stack.
+
+    Patching only ``sys.modules['core.rag_indexer']`` is NOT enough once another
+    test (e.g. tests/test_rag_indexer.py) has already imported the real module:
+    Python then satisfies ``from core import rag_indexer`` via the ``rag_indexer``
+    ATTRIBUTE on the already-loaded ``core`` package (``getattr``), bypassing the
+    sys.modules entry entirely. The real module gets imported, dragging in
+    chromadb — and doing so ~52× across this file's tests eventually segfaults
+    chromadb's native OpenTelemetry init. So we also override (and restore) the
+    ``core.rag_indexer`` package attribute. Behaves like a context manager AND a
+    started patcher (exposes ``.stop()``), matching the previous call site."""
+
+    def __init__(self, stub):
+        self.stub = stub
+        self._dict_patch = mock.patch.dict(sys.modules, {"core.rag_indexer": stub})
+        self._saved_attr = None      # (had_attr, prev_value)
+        self._core = None
+
+    def start(self):
+        self._dict_patch.start()
+        try:
+            import core as _core
+            self._core = _core
+            had = hasattr(_core, "rag_indexer")
+            self._saved_attr = (had, getattr(_core, "rag_indexer", None))
+            _core.rag_indexer = self.stub
+        except Exception:
+            self._saved_attr = None
+        return self
+
+    def stop(self):
+        if self._core is not None and self._saved_attr is not None:
+            had, prev = self._saved_attr
+            if had:
+                self._core.rag_indexer = prev
+            else:
+                try:
+                    delattr(self._core, "rag_indexer")
+                except AttributeError:
+                    pass
+        self._dict_patch.stop()
+
+
 def _load_rag_skill():
     """Load personal_rag with a fake core.rag_indexer injected so register()'s
     _rag() resolves to a stub — never importing the real chromadb/OTEL stack
-    (which stalls ~10s/test on cloud-metadata detection in this environment)."""
+    (which stalls ~10s/test on cloud-metadata detection in this environment and,
+    re-imported across the suite, can segfault chromadb's native init)."""
     stub = _fake_rag(available=False)
-    patcher = mock.patch.dict(sys.modules, {"core.rag_indexer": stub})
+    patcher = _RagStubPatch(stub)
     patcher.start()
     mod, actions = load_skill_isolated("personal_rag")
     return mod, actions, patcher
