@@ -947,6 +947,83 @@ class RunTesterTests(_PipeBase):
         self.assertIn("could not spawn", res["error"])
 
 
+# ─────────────── safety gates: risk threshold + correctness gate ───────────
+
+
+class MaxRiskScoreTests(_PipeBase):
+    def test_default_is_7(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("JARVIS_PIPELINE_MAX_RISK", None)
+            self.assertEqual(P._max_risk_score(), 7)
+
+    def test_custom_value(self):
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_MAX_RISK": "5"}):
+            self.assertEqual(P._max_risk_score(), 5)
+
+    def test_bad_value_defaults_to_7(self):
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_MAX_RISK": "high"}):
+            self.assertEqual(P._max_risk_score(), 7)
+
+    def test_clamped_to_0_10(self):
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_MAX_RISK": "99"}):
+            self.assertEqual(P._max_risk_score(), 10)
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_MAX_RISK": "-4"}):
+            self.assertEqual(P._max_risk_score(), 0)
+
+
+class RunTestSuiteTests(_PipeBase):
+    def test_skipped_via_env(self):
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_SKIP_SUITE": "1"}):
+            res = P._run_test_suite(project_dir=self.tmp)
+        self.assertTrue(res["ok"])
+        self.assertTrue(res["skipped"])
+
+    def test_skipped_when_runner_missing(self):
+        # no tools/run_tests.py in the tempdir → skip (don't wedge the queue)
+        res = P._run_test_suite(project_dir=self.tmp)
+        self.assertTrue(res["ok"])
+        self.assertTrue(res["skipped"])
+        self.assertIn("missing", res["reason"])
+
+    def test_passes_on_rc0_and_extracts_summary(self):
+        self.write(os.path.join("tools", "run_tests.py"), "# runner\n")
+        fake = _FakeCompleted(
+            returncode=0,
+            stdout="...\nJARVIS TESTS: 100 run, 0 failed, 0 errored, 2 skipped\n")
+        with mock.patch.object(P.subprocess, "run", return_value=fake):
+            res = P._run_test_suite(project_dir=self.tmp)
+        self.assertTrue(res["ok"])
+        self.assertFalse(res.get("skipped"))
+        self.assertIn("100 run", res["summary"])
+
+    def test_fails_on_nonzero_rc(self):
+        self.write(os.path.join("tools", "run_tests.py"), "# runner\n")
+        fake = _FakeCompleted(
+            returncode=1,
+            stdout="JARVIS TESTS: 100 run, 3 failed, 0 errored, 0 skipped\n")
+        with mock.patch.object(P.subprocess, "run", return_value=fake):
+            res = P._run_test_suite(project_dir=self.tmp)
+        self.assertFalse(res["ok"])
+        self.assertIn("3 failed", res["summary"])
+
+    def test_timeout_reported(self):
+        self.write(os.path.join("tools", "run_tests.py"), "# runner\n")
+        with mock.patch.object(
+                P.subprocess, "run",
+                side_effect=P.subprocess.TimeoutExpired("cmd", 1200)):
+            res = P._run_test_suite(project_dir=self.tmp)
+        self.assertFalse(res["ok"])
+        self.assertIn("timed out", res["summary"])
+
+    def test_oserror_reported(self):
+        self.write(os.path.join("tools", "run_tests.py"), "# runner\n")
+        with mock.patch.object(P.subprocess, "run",
+                               side_effect=OSError("cannot spawn")):
+            res = P._run_test_suite(project_dir=self.tmp)
+        self.assertFalse(res["ok"])
+        self.assertIn("could not spawn", res["summary"])
+
+
 # ──────────────────────────── _kill_jarvis (Windows) ──────────────────────
 
 
@@ -1667,6 +1744,110 @@ class CliTests(_PipeBase):
             buf = io.StringIO()
             with redirect_stdout(buf), mock.patch.object(sys, "stderr", buf):
                 P._cli([])
+
+
+class SafetyGateTests(_OrchBase):
+    """The risk-score gate (between stages 3 and 4) and the unit-suite
+    correctness gate (after stage 4) that make self-upgrade fail safely."""
+
+    def test_high_risk_approve_is_escalated_to_rollback(self):
+        # approve_with_warnings but risk_score 9 (>= default threshold 7) must
+        # roll back instead of shipping — and must never reach the tester.
+        lines = []
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_MAX_RISK": "7"}), \
+             mock.patch.object(P, "_run_planner", return_value=self.PLAN), \
+             mock.patch.object(P, "_run_implementer",
+                               side_effect=self._emit_implementer_change()), \
+             mock.patch.object(P, "_run_reviewer",
+                               return_value={"verdict": "approve_with_warnings",
+                                             "risk_score": 9,
+                                             "concerns": ["touches the loop"]}), \
+             mock.patch.object(P, "_run_tester") as tester, \
+             mock.patch.object(P, "_kill_jarvis", return_value=0):
+            res = P.run_pipeline_on_task(self.TASK, claude_path="/c",
+                                         project_dir=self.tmp, emit=lines.append)
+        tester.assert_not_called()
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["stage_failed"], "reviewer")
+        self.assertEqual(self.read("skills/feature.py"), "original body\n")
+        self.assertIn("[regression]", self.read("jarvis_todo.md"))
+        self.assertIn("safety threshold", "\n".join(lines))
+
+    def test_risk_just_below_threshold_proceeds(self):
+        # risk_score 6 (< 7) is allowed through to the tester and ticks.
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_MAX_RISK": "7"}), \
+             mock.patch.object(P, "_run_planner", return_value=self.PLAN), \
+             mock.patch.object(P, "_run_implementer",
+                               side_effect=self._emit_implementer_change()), \
+             mock.patch.object(P, "_run_reviewer",
+                               return_value={"verdict": "approve_with_warnings",
+                                             "risk_score": 6, "concerns": []}), \
+             mock.patch.object(P, "_run_tester",
+                               return_value={"ok": True, "rc": 0}), \
+             mock.patch.object(P, "_kill_jarvis", return_value=0):
+            res = P.run_pipeline_on_task(self.TASK, claude_path="/c",
+                                         project_dir=self.tmp, emit=self.emit)
+        self.assertTrue(res["ticked"])
+
+    def test_custom_threshold_blocks_lower_risk(self):
+        # lower the bar to 5: a risk-6 approve now blocks.
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_MAX_RISK": "5"}), \
+             mock.patch.object(P, "_run_planner", return_value=self.PLAN), \
+             mock.patch.object(P, "_run_implementer",
+                               side_effect=self._emit_implementer_change()), \
+             mock.patch.object(P, "_run_reviewer",
+                               return_value={"verdict": "approve",
+                                             "risk_score": 6, "concerns": []}), \
+             mock.patch.object(P, "_run_tester") as tester, \
+             mock.patch.object(P, "_kill_jarvis", return_value=0):
+            res = P.run_pipeline_on_task(self.TASK, claude_path="/c",
+                                         project_dir=self.tmp, emit=self.emit)
+        tester.assert_not_called()
+        self.assertEqual(res["stage_failed"], "reviewer")
+        self.assertEqual(self.read("skills/feature.py"), "original body\n")
+
+    def test_correctness_gate_failure_rolls_back(self):
+        # tester passes (JARVIS boots) but the unit suite fails -> rollback.
+        with mock.patch.object(P, "_run_planner", return_value=self.PLAN), \
+             mock.patch.object(P, "_run_implementer",
+                               side_effect=self._emit_implementer_change()), \
+             mock.patch.object(P, "_run_reviewer",
+                               return_value={"verdict": "approve",
+                                             "risk_score": 1, "concerns": []}), \
+             mock.patch.object(P, "_run_tester",
+                               return_value={"ok": True, "rc": 0}), \
+             mock.patch.object(P, "_run_test_suite",
+                               return_value={"ok": False, "skipped": False,
+                                             "summary": "TESTS: 90 run, 4 failed"}), \
+             mock.patch.object(P, "_kill_jarvis", return_value=0):
+            res = P.run_pipeline_on_task(self.TASK, claude_path="/c",
+                                         project_dir=self.tmp, emit=self.emit)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["stage_failed"], "test-suite")
+        self.assertEqual(self.read("skills/feature.py"), "original body\n")
+        todo = self.read("jarvis_todo.md")
+        self.assertIn("[regression]", todo)
+        self.assertIn("4 failed", todo)
+        self.assertIn(f"- [ ] {self.TASK}", todo)   # NOT ticked
+
+    def test_correctness_gate_pass_ticks(self):
+        with mock.patch.object(P, "_run_planner", return_value=self.PLAN), \
+             mock.patch.object(P, "_run_implementer",
+                               side_effect=self._emit_implementer_change()), \
+             mock.patch.object(P, "_run_reviewer",
+                               return_value={"verdict": "approve",
+                                             "risk_score": 1, "concerns": []}), \
+             mock.patch.object(P, "_run_tester",
+                               return_value={"ok": True, "rc": 0}), \
+             mock.patch.object(P, "_run_test_suite",
+                               return_value={"ok": True, "skipped": False,
+                                             "summary": "TESTS: 90 run, 0 failed"}), \
+             mock.patch.object(P, "_kill_jarvis", return_value=0):
+            res = P.run_pipeline_on_task(self.TASK, claude_path="/c",
+                                         project_dir=self.tmp, emit=self.emit)
+        self.assertTrue(res["ticked"])
+        self.assertEqual(self.read("skills/feature.py"),
+                         "NEW body from implementer\n")
 
 
 if __name__ == "__main__":

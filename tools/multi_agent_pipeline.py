@@ -19,17 +19,28 @@ different tool grant, narrower context):
                        waits 90s, checks process liveness + APPCRASH +
                        FATAL lines in session log.
 
-Approve  → tick the task, continue.
-Reject   → restore files from per-task backup, append [regression] task,
-           do NOT tick the original.
-Tester fail → same as reject_and_redo (restore + queue regression).
+Safety gates (between stages 3 and 4, and after 4):
+  * RISK GATE — a reviewer risk_score AT/ABOVE JARVIS_PIPELINE_MAX_RISK
+    (default 7) is escalated to reject_and_redo even on an approve verdict.
+    Degraded reviewer paths (infra error / unparseable JSON) are scored 8 so
+    they fail CLOSED through this gate instead of shipping unreviewed.
+  * CORRECTNESS GATE — after the tester proves JARVIS still BOOTS, the unit
+    suite (tools/run_tests.py) runs; a change that breaks a tested contract
+    rolls back even though it booted clean.
+
+Approve (risk < threshold) → tick the task, continue.
+Reject / risk >= threshold → restore files from per-task backup, append
+           [regression] task, do NOT tick the original.
+Tester or unit-suite fail → same as reject_and_redo (restore + queue regression).
 
 Configuration (env vars, all optional):
     JARVIS_PIPELINE_PLANNER_MODEL       default "haiku"
     JARVIS_PIPELINE_IMPLEMENTER_MODEL   default "opus"
     JARVIS_PIPELINE_REVIEWER_MODEL      default "sonnet"
     JARVIS_PIPELINE_TESTER_WAIT_S       default 90  (smoke-test deadline)
+    JARVIS_PIPELINE_MAX_RISK            default 7   (risk_score >= this blocks)
     JARVIS_PIPELINE_SKIP_TESTER         "1" to skip stage 4 (debug only)
+    JARVIS_PIPELINE_SKIP_SUITE          "1" to skip the correctness gate (debug)
 
 The single-stage flow is still reachable via `upgrade_jarvis.py --single-stage`
 for emergencies.
@@ -736,12 +747,17 @@ def _run_reviewer(task_line: str, plan: dict[str, Any], diff: str, *,
     if rc != 0:
         if no_changes and not impl_impossible and not impl_already_done:
             return _force_reject(f"reviewer infra error rc={rc}: {err[:200]}")
-        # Don't auto-reject on reviewer infra failure — that would stall the
-        # queue. Fall through with a warning.
+        # FAIL CLOSED: a reviewer infra failure means the change went UNreviewed.
+        # We score it 8 (>= the default risk threshold) so the safety gate in
+        # run_pipeline_on_task escalates it to a rollback rather than shipping an
+        # unreviewed self-edit. (A persistently-flaky reviewer stalls the queue,
+        # which the no-progress watchdog + circuit breaker then halt — the safe
+        # failure mode for a system that edits its own brain.)
         return {
             "verdict": "approve_with_warnings",
-            "risk_score": 5,
-            "concerns": [f"reviewer infra error rc={rc}: {err[:200]}"],
+            "risk_score": 8,
+            "concerns": [f"reviewer infra error rc={rc}: {err[:200]} "
+                         "(unreviewed — failing closed)"],
             "_infra_error": True,
         }
     raw = _strip_json(out)
@@ -750,10 +766,13 @@ def _run_reviewer(task_line: str, plan: dict[str, Any], diff: str, *,
     except (ValueError, TypeError):
         if no_changes and not impl_impossible and not impl_already_done:
             return _force_reject("reviewer returned unparseable JSON")
+        # FAIL CLOSED (see infra-error path above): an unparseable review is no
+        # review — score it 8 so the safety gate rolls it back.
         return {
             "verdict": "approve_with_warnings",
-            "risk_score": 5,
-            "concerns": ["reviewer returned unparseable JSON"],
+            "risk_score": 8,
+            "concerns": ["reviewer returned unparseable JSON "
+                         "(unreviewed — failing closed)"],
             "raw": out[:800],
         }
     review.setdefault("verdict", "approve_with_warnings")
@@ -837,6 +856,56 @@ def _run_tester(*, project_dir: str = PROJECT_DIR) -> dict[str, Any]:
         "stdout_tail": (result.stdout or "")[-1500:],
         "stderr_tail": (result.stderr or "")[-500:],
     }
+
+
+def _suite_disabled() -> bool:
+    return os.environ.get("JARVIS_PIPELINE_SKIP_SUITE", "").strip() == "1"
+
+
+def _max_risk_score() -> int:
+    """A reviewer ``risk_score`` AT OR ABOVE this value BLOCKS the change
+    (escalates to reject_and_redo + rollback) even when the verdict was
+    ``approve``/``approve_with_warnings``. Before this gate the score was purely
+    advisory and a risk=9 change shipped if it merely booted. Env override:
+    ``JARVIS_PIPELINE_MAX_RISK`` (default 7; clamped to 0-10)."""
+    try:
+        return max(0, min(10, int(os.environ.get("JARVIS_PIPELINE_MAX_RISK", "7"))))
+    except (TypeError, ValueError):
+        return 7
+
+
+def _run_test_suite(*, project_dir: str = PROJECT_DIR) -> dict[str, Any]:
+    """CORRECTNESS GATE — run the unit suite (``tools/run_tests.py``) after a
+    self-edit. The tester only proves JARVIS still *boots*; this proves the
+    tested behaviour contracts (intent routing, memory, action handlers, the
+    skill registry, …) are still intact, so a change that boots clean but breaks
+    a contract rolls back instead of shipping.
+
+    Returns ``{"ok": True, "skipped": True}`` (never wedges the queue) only when
+    ``JARVIS_PIPELINE_SKIP_SUITE=1`` or the runner is absent."""
+    if _suite_disabled():
+        return {"ok": True, "skipped": True,
+                "reason": "JARVIS_PIPELINE_SKIP_SUITE=1"}
+    runner = os.path.join(project_dir, "tools", "run_tests.py")
+    if not os.path.exists(runner):
+        return {"ok": True, "skipped": True, "reason": f"missing {runner}"}
+    try:
+        result = subprocess.run(
+            [sys.executable, runner],
+            cwd=project_dir, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=1200,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "skipped": False,
+                "summary": "unit suite timed out after 1200s"}
+    except OSError as exc:
+        return {"ok": False, "skipped": False,
+                "summary": f"could not spawn unit suite: {exc!r}"}
+    out = (result.stdout or "") + (result.stderr or "")
+    summary = next((ln.strip() for ln in reversed(out.splitlines())
+                    if "TESTS:" in ln), "") or f"rc={result.returncode}"
+    return {"ok": result.returncode == 0, "skipped": False,
+            "summary": summary, "stdout_tail": out[-1500:]}
 
 
 def _kill_jarvis() -> int:
@@ -1031,6 +1100,25 @@ def run_pipeline_on_task(task_line: str, *, claude_path: str,
     verdict = review.get("verdict", "approve_with_warnings")
     score = review.get("risk_score", 5)
     concerns = review.get("concerns", [])
+    # SAFETY GATE: a high risk_score must BLOCK, not merely annotate. Before
+    # this, the reviewer recorded risk_score advisorily while
+    # approve_with_warnings shipped regardless — so a risk=9 change reached the
+    # tester and shipped if it merely booted. Now a score AT/ABOVE the threshold
+    # is escalated to a rejection + rollback. This is also what makes the
+    # degraded reviewer paths (infra error / unparseable JSON, scored 8) fail
+    # CLOSED instead of shipping unreviewed.
+    try:
+        _score_int = int(score)
+    except (TypeError, ValueError):
+        _score_int = 9  # unparseable score → treat as high risk (fail closed)
+    if verdict in ("approve", "approve_with_warnings") \
+            and _score_int >= _max_risk_score():
+        concerns = list(concerns) + [
+            f"risk_score {_score_int} at/above safety threshold "
+            f"{_max_risk_score()} — auto-escalated to reject_and_redo"]
+        emit(f"  [safety] risk_score {_score_int} >= threshold "
+             f"{_max_risk_score()} — escalating {verdict} -> reject_and_redo")
+        verdict = "reject_and_redo"
     emit(f"  [stage 3/4] reviewer verdict={verdict} risk={score} "
          f"concerns={len(concerns)}")
     for c in concerns[:5]:
@@ -1060,8 +1148,8 @@ def run_pipeline_on_task(task_line: str, *, claude_path: str,
                              "verdict": "already_done", "risk_score": score,
                              "ticked": ticked,
                              "backup_dir": os.path.basename(backup_dir)})
-        emit(f"  [stage 3/4] reviewer verified ALREADY_DONE — "
-             f"skipping tester, ticking task")
+        emit("  [stage 3/4] reviewer verified ALREADY_DONE — "
+             "skipping tester, ticking task")
         return {"ok": True, "ticked": ticked, "stage_failed": None,
                 "stages": {"planner": plan, "implementer": impl,
                            "reviewer": review}}
@@ -1096,6 +1184,30 @@ def run_pipeline_on_task(task_line: str, *, claude_path: str,
     else:
         emit("  [stage 4/4] tester PASSED — JARVIS booted clean")
 
+    # CORRECTNESS GATE: the tester only proves JARVIS still BOOTS. Run the unit
+    # suite so a self-edit that breaks a tested contract (intent routing,
+    # memory, action handlers, the skill registry) rolls back instead of
+    # shipping green-on-boot. Skips cleanly (missing runner / opt-out env) so it
+    # never wedges the queue.
+    suite = _run_test_suite(project_dir=project_dir)
+    if not suite.get("ok") and not suite.get("skipped"):
+        details = (suite.get("summary") or "unit suite failed")[:400]
+        _append_regression_task(task_line, "test-suite", details)
+        r, d = _restore_files(backup_dir)
+        _log_pipeline_event({"stage": "test-suite", "ok": False,
+                             "task": task_line[:200], "suite": suite,
+                             "rollback": [r, d]})
+        emit(f"  [rollback] unit suite FAILED ({details}) — restored {r} "
+             f"file(s), deleted {d} new file(s); regression task queued")
+        return {"ok": False, "ticked": False, "stage_failed": "test-suite",
+                "stages": {"planner": plan, "implementer": impl,
+                           "reviewer": review, "tester": test_result,
+                           "suite": suite}}
+    if suite.get("skipped"):
+        emit(f"  [gate] unit suite SKIPPED ({suite.get('reason')})")
+    else:
+        emit(f"  [gate] unit suite PASSED — {suite.get('summary')}")
+
     impl_note = impl.get("note") or "implemented"
     review_tag = "approve" if verdict == "approve" else "approve+warnings"
     done_note = f"{impl_note[:120]} [{review_tag}, risk={score}]"
@@ -1107,7 +1219,8 @@ def run_pipeline_on_task(task_line: str, *, claude_path: str,
                          "backup_dir": os.path.basename(backup_dir)})
     return {"ok": True, "ticked": ticked, "stage_failed": None,
             "stages": {"planner": plan, "implementer": impl,
-                       "reviewer": review, "tester": test_result}}
+                       "reviewer": review, "tester": test_result,
+                       "suite": suite}}
 
 
 # ─────────────────────────── driver entry point ───────────────────────────
