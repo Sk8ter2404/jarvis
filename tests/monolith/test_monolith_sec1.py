@@ -243,8 +243,11 @@ class MergeMemoryTests(_MonolithTestBase):
         self.assertEqual(added_f, [])  # already present, case-insensitively
 
     def test_secret_facts_are_redacted(self):
+        # _is_secret_fact triggers on the "api key" keyword (core/memory_guards
+        # is keyword-based), so the value is a harmless placeholder — a real
+        # key-shaped token here would trip the check_no_pii leak gate itself.
         added_f, _ = self.bc.merge_memory(
-            new_facts=["my api key is sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"])
+            new_facts=["my api key is <redacted-placeholder>"])
         self.assertEqual(added_f, [])
         self.assertEqual(self._store["facts"], [])
 
