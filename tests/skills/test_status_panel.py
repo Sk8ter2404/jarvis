@@ -410,7 +410,15 @@ class StatusPingTests(unittest.TestCase):
     def test_win_ping_parses_time(self):
         proc = types.SimpleNamespace(
             stdout="Reply from 1.1.1.1: bytes=32 time=14ms TTL=57")
+        # The win32 branch sets ``cflags = subprocess.CREATE_NO_WINDOW`` — a
+        # Windows-only constant absent on the Linux CI runner. With sys.platform
+        # forced to "win32" the lookup raises AttributeError, which _read_ping_ms
+        # swallows (returning None) before the regex ever runs. Materialise the
+        # flag (no-op on Windows, where it already holds this value) so the
+        # Windows branch parses the mocked output on any host.
         with mock.patch.object(self.mod.sys, "platform", "win32"), \
+             mock.patch.object(self.mod.subprocess, "CREATE_NO_WINDOW",
+                               0x08000000, create=True), \
              mock.patch.object(self.mod.subprocess, "run", return_value=proc):
             self.assertEqual(self.mod._read_ping_ms(), 14.0)
 
@@ -423,12 +431,21 @@ class StatusPingTests(unittest.TestCase):
 
     def test_no_time_match_returns_none(self):
         proc = types.SimpleNamespace(stdout="Request timed out.")
+        # Materialise CREATE_NO_WINDOW (Windows-only) so the win32 branch is the
+        # one exercised on any host — otherwise on Linux the missing-attribute
+        # path would short-circuit to None for the wrong reason.
         with mock.patch.object(self.mod.sys, "platform", "win32"), \
+             mock.patch.object(self.mod.subprocess, "CREATE_NO_WINDOW",
+                               0x08000000, create=True), \
              mock.patch.object(self.mod.subprocess, "run", return_value=proc):
             self.assertIsNone(self.mod._read_ping_ms())
 
     def test_subprocess_exception_returns_none(self):
+        # CREATE_NO_WINDOW materialised so the OSError from run() — not a missing
+        # Windows constant — is what drives the None result on a Linux host.
         with mock.patch.object(self.mod.sys, "platform", "win32"), \
+             mock.patch.object(self.mod.subprocess, "CREATE_NO_WINDOW",
+                               0x08000000, create=True), \
              mock.patch.object(self.mod.subprocess, "run",
                                side_effect=OSError("no ping")):
             self.assertIsNone(self.mod._read_ping_ms())

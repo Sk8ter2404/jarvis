@@ -59,12 +59,12 @@ jobs:
       # Run `python tools/audit_codebase.py` locally before a PR (CONTRIBUTING.md).
 
       - name: Coverage (report + enforce floor)
-        # Baseline ~67% of the unit-testable surface (core/ + skills/ + tools/),
-        # climbing via the ongoing coverage push. The ~14K-line monolith and
-        # heavy GPU/audio modules are out of the measured set (covered by the
-        # local integration tier). Floor sits below the baseline so it guards
-        # against regressions without flaking; ratchet it up as coverage grows.
-        run: python tools/run_coverage.py --xml --fail-under 61
+        # Baseline ~74% of the unit-testable surface (core/ + skills/ + tools/).
+        # The ~14K-line monolith and the pure-hardware/GPU modules (wake_word,
+        # voice/audio daemons, the Qt HUD renderer) are out of the measured set
+        # (covered by the local integration tier). Floor sits below the baseline
+        # so it guards against regressions without flaking.
+        run: python tools/run_coverage.py --xml --fail-under 68
 
       - name: Upload coverage.xml
         if: always()

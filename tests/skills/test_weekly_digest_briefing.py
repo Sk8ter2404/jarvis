@@ -366,8 +366,13 @@ class WeeklyDigestBriefingTests(_IsolatedSkillCase):
 
     def test_eligible_ordering_in_band_before_lead_then_confidence(self):
         now = time.localtime()
-        cur_min = now.tm_hour * 60 + now.tm_min
-        lead_hour = (cur_min + 20) // 60
+        # The lead-window cluster must start at a FUTURE hour boundary so it is
+        # upcoming (never in-band) regardless of the current minute. The next
+        # hour is 1..60 min away — always within lead_min=120 yet never in-band.
+        # (The old (cur_min+20)//60 floor landed on the *current* hour whenever
+        # tm_min < 40, making this cluster in-band and, since it has the highest
+        # confidence, sorting it first — flipping the ordering assertion.)
+        lead_hour = now.tm_hour + 1
         digest = {"clusters": [
             {"key": "lead", "confidence": 0.95, "dow": now.tm_wday,
              "hour_start": lead_hour, "hour_end": lead_hour + 2, "offer": "L"},
