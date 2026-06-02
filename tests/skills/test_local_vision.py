@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import contextlib
 import io
+import sys
+import types
 import unittest
 from unittest import mock
 
@@ -206,6 +208,334 @@ class LocalVisionActionTests(unittest.TestCase):
             out = self.actions["local_click_target_by_description"]("ok button")
         self.assertIn("click failed", out)
         self.assertIn("failsafe", out)
+
+    def test_click_not_found_returns_degradation_when_vlm_down(self):
+        # _find_click_target_local returns None AND the VLM is actually down →
+        # surface the degradation message (covers line 285's `return msg`).
+        bc = _fake_bc(ollama_alive=False)
+        with _quiet(), \
+             mock.patch.object(self.mod, "_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_find_click_target_local", return_value=None):
+            out = self.actions["local_click_target_by_description"]("the play button")
+        self.assertIn("Ollama isn't running", out)
+
+
+# ── module-resolver helpers (_bobert / _take_screenshot / _call_local_vision)
+class ResolverHelperTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("local_vision")
+
+    def test_bobert_returns_none_when_neither_loaded(self):
+        # Remove both __main__ and bobert_companion → _bobert() yields None.
+        with mock.patch.dict(sys.modules, {}, clear=False):
+            saved_main = sys.modules.pop("__main__", None)
+            saved_bc = sys.modules.pop("bobert_companion", None)
+            try:
+                self.assertIsNone(self.mod._bobert())
+            finally:
+                if saved_main is not None:
+                    sys.modules["__main__"] = saved_main
+                if saved_bc is not None:
+                    sys.modules["bobert_companion"] = saved_bc
+
+    def test_bobert_prefers_main_then_bobert(self):
+        fake_main = types.ModuleType("__main__")
+        fake_bc = types.ModuleType("bobert_companion")
+        with mock.patch.dict(sys.modules, {"__main__": fake_main,
+                                           "bobert_companion": fake_bc}):
+            self.assertIs(self.mod._bobert(), fake_main)
+        # With __main__ removed, falls through to bobert_companion.
+        with mock.patch.dict(sys.modules, {"bobert_companion": fake_bc}):
+            saved = sys.modules.pop("__main__", None)
+            try:
+                self.assertIs(self.mod._bobert(), fake_bc)
+            finally:
+                if saved is not None:
+                    sys.modules["__main__"] = saved
+
+    def test_take_screenshot_delegates_to_bobert(self):
+        bc = types.SimpleNamespace(
+            take_screenshot=mock.MagicMock(return_value=b"PNG"))
+        with mock.patch.object(self.mod, "_bobert", return_value=bc):
+            self.assertEqual(self.mod._take_screenshot("left"), b"PNG")
+        bc.take_screenshot.assert_called_once_with(monitor="left")
+
+    def test_take_screenshot_none_when_no_bobert(self):
+        with mock.patch.object(self.mod, "_bobert", return_value=None):
+            self.assertIsNone(self.mod._take_screenshot("left"))
+
+    def test_take_screenshot_none_when_bobert_lacks_method(self):
+        bc = types.SimpleNamespace()   # no take_screenshot attr
+        with mock.patch.object(self.mod, "_bobert", return_value=bc):
+            self.assertIsNone(self.mod._take_screenshot(None))
+
+    def test_take_all_monitors_delegates(self):
+        bc = types.SimpleNamespace(
+            take_all_monitor_screenshots=mock.MagicMock(
+                return_value={"left": b"a"}))
+        with mock.patch.object(self.mod, "_bobert", return_value=bc):
+            self.assertEqual(self.mod._take_all_monitor_screenshots(), {"left": b"a"})
+
+    def test_take_all_monitors_empty_when_no_bobert(self):
+        with mock.patch.object(self.mod, "_bobert", return_value=None):
+            self.assertEqual(self.mod._take_all_monitor_screenshots(), {})
+
+    def test_call_local_vision_delegates(self):
+        bc = types.SimpleNamespace(
+            _call_local_vision=mock.MagicMock(return_value="answer"))
+        with mock.patch.object(self.mod, "_bobert", return_value=bc):
+            out = self.mod._call_local_vision("q", [b"png"], max_tokens=42)
+        self.assertEqual(out, "answer")
+        bc._call_local_vision.assert_called_once_with("q", [b"png"], max_tokens=42)
+
+    def test_call_local_vision_none_when_no_bobert(self):
+        with mock.patch.object(self.mod, "_bobert", return_value=None):
+            self.assertIsNone(self.mod._call_local_vision("q", [b"png"]))
+
+    def test_call_local_vision_none_when_bobert_lacks_method(self):
+        bc = types.SimpleNamespace()
+        with mock.patch.object(self.mod, "_bobert", return_value=bc):
+            self.assertIsNone(self.mod._call_local_vision("q", []))
+
+    def test_parse_monitor_prefix_delegates_to_bobert(self):
+        # When bc HAS _parse_monitor_prefix, the skill defers to it.
+        bc = types.SimpleNamespace(
+            _parse_monitor_prefix=lambda t: ("right", "stripped"))
+        with mock.patch.object(self.mod, "_bobert", return_value=bc):
+            self.assertEqual(self.mod._parse_monitor_prefix("monitor:right| x"),
+                             ("right", "stripped"))
+
+
+# ── describe: single-monitor success + _push_screen_context hooks ─────────
+class DescribePushContextTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("local_vision")
+
+    def test_describe_single_monitor_success_pushes_context(self):
+        bc = _fake_bc()
+        with _quiet(), \
+             mock.patch.object(self.mod, "_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_take_screenshot", return_value=b"png"), \
+             mock.patch.object(self.mod, "_call_local_vision",
+                               return_value="a terminal window"):
+            out = self.actions["local_describe_screen"]("monitor:left| what is this")
+        self.assertIn("[local-vision]", out)
+        self.assertIn("terminal", out)
+        bc._push_screen_context.assert_called_once()
+        # Args: (monitor, question, result, {monitor: png})
+        args = bc._push_screen_context.call_args[0]
+        self.assertEqual(args[0], "left")
+        self.assertEqual(args[3], {"left": b"png"})
+
+    def test_describe_single_monitor_capture_none(self):
+        bc = _fake_bc()
+        with _quiet(), \
+             mock.patch.object(self.mod, "_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_take_screenshot", return_value=None):
+            out = self.actions["local_describe_screen"]("monitor:left| hi")
+        self.assertIn("could not capture screen", out)
+
+    def test_describe_single_monitor_push_context_error_swallowed(self):
+        # Single-monitor path: _push_screen_context raises → swallowed, answer
+        # still returned (covers the 161-162 except branch).
+        bc = _fake_bc()
+        bc._push_screen_context.side_effect = RuntimeError("ctx boom")
+        with _quiet(), \
+             mock.patch.object(self.mod, "_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_take_screenshot", return_value=b"png"), \
+             mock.patch.object(self.mod, "_call_local_vision", return_value="desc"):
+            out = self.actions["local_describe_screen"]("monitor:left| what")
+        self.assertIn("[local-vision]", out)
+        self.assertIn("desc", out)
+
+    def test_describe_all_monitors_vlm_returns_empty(self):
+        # All-monitors path: VLM yields falsy → degradation message (line 139).
+        bc = _fake_bc(ollama_alive=False)
+        with _quiet(), \
+             mock.patch.object(self.mod, "_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_take_all_monitor_screenshots",
+                               return_value={"left": b"p1", "right": b"p2"}), \
+             mock.patch.object(self.mod, "_call_local_vision", return_value=None):
+            out = self.actions["local_describe_screen"]("what's open")
+        self.assertIn("Ollama isn't running", out)
+
+    def test_describe_all_monitors_push_context_error_swallowed(self):
+        bc = _fake_bc()
+        bc._push_screen_context.side_effect = RuntimeError("ctx boom")
+        with _quiet(), \
+             mock.patch.object(self.mod, "_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_take_all_monitor_screenshots",
+                               return_value={"left": b"p1"}), \
+             mock.patch.object(self.mod, "_call_local_vision",
+                               return_value="desc"):
+            out = self.actions["local_describe_screen"]("what")
+        # The push error is swallowed; the answer is still returned.
+        self.assertIn("[local-vision]", out)
+        self.assertIn("desc", out)
+
+    def test_describe_default_question_when_blank(self):
+        # Empty question → the skill substitutes its default describe prompt.
+        bc = _fake_bc()
+        captured = {}
+
+        def _call(prompt, pngs, max_tokens=600):
+            captured["prompt"] = prompt
+            return "ok"
+
+        with _quiet(), \
+             mock.patch.object(self.mod, "_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_take_all_monitor_screenshots",
+                               return_value={"main": b"p"}), \
+             mock.patch.object(self.mod, "_call_local_vision", side_effect=_call):
+            self.actions["local_describe_screen"]("")
+        self.assertIn("Describe in detail", captured["prompt"])
+
+
+# ── _find_click_target_local two-pass coordinate refinement ───────────────
+class _FakeImg:
+    """Minimal PIL.Image stand-in: carries a size, supports crop()/save()."""
+    def __init__(self, size):
+        self.size = size
+
+    def crop(self, box):
+        left, top, right, bottom = box
+        return _FakeImg((right - left, bottom - top))
+
+    def save(self, buf, format=None):   # noqa: A002 — mirror PIL signature
+        buf.write(b"CROP_PNG")
+
+
+def _fake_pil(open_sizes):
+    """Build a fake `PIL` package whose Image.open returns images of the given
+    sizes in call order (last repeats). ``PIL`` and ``PIL.Image`` are both
+    registered so ``from PIL import Image`` resolves to our stub."""
+    pil = types.ModuleType("PIL")
+    image_mod = types.ModuleType("PIL.Image")
+    seq = list(open_sizes)
+    state = {"i": 0}
+
+    def _open(_buf):
+        i = min(state["i"], len(seq) - 1)
+        state["i"] += 1
+        return _FakeImg(seq[i])
+
+    image_mod.open = _open
+    pil.Image = image_mod
+    return pil, image_mod
+
+
+class FindClickTargetLocalTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("local_vision")
+
+    @contextlib.contextmanager
+    def _pil(self, open_sizes):
+        pil, image_mod = _fake_pil(open_sizes)
+        with mock.patch.dict(sys.modules, {"PIL": pil, "PIL.Image": image_mod}):
+            yield
+
+    def test_find_pil_missing_returns_none(self):
+        with mock.patch.dict(sys.modules, {"PIL": None}):
+            self.assertIsNone(
+                self.mod._find_click_target_local("btn", monitor=None))
+
+    def test_find_no_bobert_returns_none(self):
+        with self._pil([(100, 100)]), \
+             mock.patch.object(self.mod, "_bobert", return_value=None):
+            self.assertIsNone(
+                self.mod._find_click_target_local("btn", monitor=None))
+
+    def test_find_first_screenshot_none(self):
+        bc = mock.MagicMock()
+        bc.take_screenshot.return_value = None
+        with self._pil([(100, 100)]), \
+             mock.patch.object(self.mod, "_bobert", return_value=bc):
+            self.assertIsNone(
+                self.mod._find_click_target_local("btn", monitor=None))
+
+    def test_find_pass1_not_found_returns_none(self):
+        bc = mock.MagicMock()
+        bc.take_screenshot.return_value = b"png"
+        with self._pil([(800, 600)]), \
+             mock.patch.object(self.mod, "_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_local_query_coords", return_value=None):
+            self.assertIsNone(
+                self.mod._find_click_target_local("btn", monitor=None))
+
+    def test_find_full_png_none_uses_low_res(self):
+        # Second take_screenshot (full res) returns None → fall back to img1's
+        # size; no refinement crop (full_w == w1). Returns the pass-1 coords.
+        bc = mock.MagicMock()
+        bc.take_screenshot.side_effect = [b"low", None]
+        bc.MONITORS = {}
+        with self._pil([(800, 600)]), \
+             mock.patch.object(self.mod, "_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_local_query_coords", return_value=(100, 200)):
+            coords = self.mod._find_click_target_local("btn", monitor=None)
+        self.assertEqual(coords, (100, 200))
+
+    def test_find_two_pass_refines_and_offsets_monitor(self):
+        # Low-res 800x600, full-res 1600x1200 (2x) → pass1 (100,200) scales to
+        # (200,400); pass2 in the crop refines to crop-local (10,20) → absolute
+        # (left+10, top+20). Monitor offset (50,60) is then added.
+        bc = mock.MagicMock()
+        bc.take_screenshot.side_effect = [b"low", b"full"]
+        bc.MONITORS = {"left": (50, 60, 1600, 1200)}
+        # pass1 returns (100,200); pass2 (in crop) returns (10,20). _quiet()
+        # swallows the 🔍 refinement print (cp1252 console can't encode it).
+        with _quiet(), self._pil([(800, 600), (1600, 1200)]), \
+             mock.patch.object(self.mod, "_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_local_query_coords",
+                               side_effect=[(100, 200), (10, 20)]):
+            coords = self.mod._find_click_target_local("play", monitor="left")
+        # full coords: 100*2=200, 200*2=400. CROP=500 → left=max(0,200-250)=0,
+        #   top=max(0,400-250)=150. refined = (0+10, 150+20) = (10, 170).
+        # + monitor offset (50, 60) → (60, 230).
+        self.assertEqual(coords, (60, 230))
+
+    def test_find_two_pass_pass2_none_keeps_scaled(self):
+        # When pass2 returns None, the scaled pass-1 coords are kept.
+        bc = mock.MagicMock()
+        bc.take_screenshot.side_effect = [b"low", b"full"]
+        bc.MONITORS = {}
+        with _quiet(), self._pil([(800, 600), (1600, 1200)]), \
+             mock.patch.object(self.mod, "_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_local_query_coords",
+                               side_effect=[(100, 200), None]):
+            coords = self.mod._find_click_target_local("x", monitor=None)
+        self.assertEqual(coords, (200, 400))   # scaled, unrefined
+
+    def test_find_monitor_not_in_MONITORS_no_offset(self):
+        bc = mock.MagicMock()
+        bc.take_screenshot.side_effect = [b"low", None]
+        bc.MONITORS = {"right": (0, 0, 100, 100)}   # 'left' absent
+        with self._pil([(400, 300)]), \
+             mock.patch.object(self.mod, "_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_local_query_coords", return_value=(40, 30)):
+            coords = self.mod._find_click_target_local("x", monitor="left")
+        self.assertEqual(coords, (40, 30))   # no offset applied
+
+    def test_click_happy_path_through_real_find(self):
+        # End-to-end click: drive the REAL _find_click_target_local (not mocked)
+        # so the action→finder→click chain is covered together.
+        bc = _fake_bc()
+        bc.take_screenshot.side_effect = [b"low", None]
+        bc.MONITORS = {}
+        with _quiet(), self._pil([(800, 600)]), \
+             mock.patch.object(self.mod, "_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_local_query_coords", return_value=(11, 22)):
+            out = self.actions["local_click_target_by_description"]("the OK button")
+        self.assertIn("clicked 'the OK button' at (11, 22)", out)
+        bc.ui_click.assert_called_once_with(11, 22)
+
+
+# ── register() ───────────────────────────────────────────────────────────
+class RegisterTests(unittest.TestCase):
+    def test_register_wires_both_actions(self):
+        mod, actions = load_skill_isolated("local_vision")
+        self.assertIs(actions["local_describe_screen"], mod.local_describe_screen)
+        self.assertIs(actions["local_click_target_by_description"],
+                      mod.local_click_target_by_description)
 
 
 if __name__ == "__main__":
