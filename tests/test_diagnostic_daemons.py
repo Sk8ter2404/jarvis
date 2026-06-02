@@ -497,6 +497,11 @@ class SelfDiagLoopTests(_Base):
 # ──────────────────────────── path helpers ───────────────────────────
 
 class PathHelperTests(_Base):
+    @unittest.skipUnless(
+        sys.platform.startswith("win"),
+        "_path_is_jarvis normalizes '/'->'\\\\' (Windows-path logic) and its "
+        "PROJECT_DIR substring branch is host-path-separator dependent; runs on "
+        "Windows only (the app's real OS) — covered there, skipped on Linux CI")
     def test_path_is_jarvis_variants(self):
         # Cross-platform cases. ``_path_is_jarvis`` normalises "/" -> "\\" and
         # lowercases, so forward-slash inputs match the "\\jarvis" / endswith
