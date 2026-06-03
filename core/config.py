@@ -354,6 +354,30 @@ SILENCE_SECS  = 1.4                # seconds of quiet before processing
 SAMPLE_RATE   = 16000              # mic capture sample rate (Hz)
 
 
+# ─── Capture auto-gain (quiet-mic normalization before Whisper) ────────
+# CONSERVATIVE input normalization applied to the recorded float32 buffer
+# right BEFORE faster-whisper sees it, on BOTH the normal turn and the
+# standby/wake path. A quiet mic records speech at a low peak RMS
+# (~0.01–0.06) where Whisper returns an EMPTY string, so the wake word
+# "JARVIS" is never heard. This boosts such audio toward a usable level
+# WITHOUT touching already-good audio.
+#
+# The helper apply_capture_auto_gain() is a pure no-op unless the captured
+# peak RMS sits in the band (NOISE_FLOOR, TARGET_PEAK):
+#   • peak ≥ TARGET_PEAK            → already loud enough, gain 1.0 (untouched)
+#   • peak ≤ NOISE_FLOOR            → pure silence/room hiss, gain 1.0 (so we
+#                                     never amplify noise into Whisper
+#                                     hallucinations)
+#   • NOISE_FLOOR < peak < TARGET   → gain = min(MAX, TARGET/peak), hard-clipped
+#                                     to [-1, 1] to prevent overflow distortion.
+# Read live via `core.config` so the Settings GUI / user_settings.json
+# override path reaches them.
+CAPTURE_AUTO_GAIN_ENABLED     = True
+CAPTURE_AUTO_GAIN_TARGET_PEAK = 0.25   # boost quiet audio up toward this peak
+CAPTURE_AUTO_GAIN_MAX         = 10.0   # never multiply by more than this
+CAPTURE_AUTO_GAIN_NOISE_FLOOR = 0.005  # peak ≤ this = silence; never amplify
+
+
 # ─── Audio processor tuning (AEC fallback + AGC flatness gate) ─────────
 # 2026-05-30 [self-heal]: extracted from core/audio_processor.py defaults
 # so they can be tuned without editing the module. The diagnostic that

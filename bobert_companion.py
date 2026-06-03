@@ -312,7 +312,7 @@ except Exception as _ebse:  # pragma: no cover - boot lockless-fallback on unexp
     # proceed lock-less than to crash silently before the session log is open.
     print(f"  [early-singleton] check failed, proceeding without lock: {_ebse}")
 
-import asyncio, io, json, logging, math, queue, random, re, tempfile, threading, time, traceback
+import asyncio, hashlib, io, json, logging, math, queue, random, re, tempfile, threading, time, traceback
 from collections import deque
 import numpy as np
 import sounddevice as sd
@@ -4851,6 +4851,57 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
     return np.concatenate(chunks).flatten()
 
 
+def apply_capture_auto_gain(audio_f32, peak_rms):
+    """CONSERVATIVE input auto-gain (normalization) for the captured mic buffer,
+    applied right BEFORE faster-whisper sees it on both the normal-turn and the
+    standby/wake path.
+
+    A quiet mic records clear speech at a low peak RMS (~0.01–0.06) where Whisper
+    returns an EMPTY string and the wake word "JARVIS" is never detected. This
+    boosts such audio toward a usable level WITHOUT degrading already-good audio.
+
+    Returns ``(audio_f32, applied_gain)``:
+
+      * auto-gain disabled, ``peak_rms`` already ≥ the loud-enough target, OR
+        ``peak_rms`` at/below a tiny noise floor (so pure silence / room hiss is
+        never amplified into Whisper hallucinations) → the audio is returned
+        UNCHANGED with ``applied_gain == 1.0``.
+      * otherwise the gain is ``min(MAX_GAIN, TARGET_PEAK / max(peak_rms, eps))``;
+        the buffer is multiplied and HARD-CLIPPED to ``[-1.0, 1.0]`` to prevent
+        overflow distortion, then returned with that gain.
+
+    Never raises: any failure returns the ORIGINAL audio at gain 1.0 so a bad
+    sample or a missing config knob can never break the capture path. The
+    thresholds are read live from ``core.config`` so the Settings-GUI /
+    ``user_settings.json`` override path reaches them.
+    """
+    try:
+        if audio_f32 is None:
+            return audio_f32, 1.0
+        from core import config as _cfg
+        if not getattr(_cfg, "CAPTURE_AUTO_GAIN_ENABLED", True):
+            return audio_f32, 1.0
+        target = float(getattr(_cfg, "CAPTURE_AUTO_GAIN_TARGET_PEAK", 0.25))
+        max_gain = float(getattr(_cfg, "CAPTURE_AUTO_GAIN_MAX", 10.0))
+        noise_floor = float(getattr(_cfg, "CAPTURE_AUTO_GAIN_NOISE_FLOOR", 0.005))
+        peak = float(peak_rms)
+        # Already loud enough, or so quiet it's silence/room hiss → leave it.
+        # (peak <= noise_floor guards against amplifying pure noise into
+        # hallucinated transcripts; peak >= target means normal audio, untouched.)
+        if not (noise_floor < peak < target):
+            return audio_f32, 1.0
+        gain = min(max_gain, target / max(peak, 1e-9))
+        if gain <= 1.0:
+            return audio_f32, 1.0
+        boosted = np.asarray(audio_f32, dtype=np.float32) * np.float32(gain)
+        # Hard-clip so the boost can never overflow [-1, 1] into harsh distortion.
+        np.clip(boosted, -1.0, 1.0, out=boosted)
+        return boosted, float(gain)
+    except Exception:
+        # A normalization failure must never break capture — return the input.
+        return audio_f32, 1.0
+
+
 def get_mic_buffer(seconds: float,
                    sample_rate: int | None = None) -> np.ndarray | None:
     """Capture `seconds` of float32 mono audio for skills that need a fixed
@@ -8904,6 +8955,12 @@ def _play_music_core(args: str, *, force: bool = False) -> tuple[bool, str]:
 
 TODO_FILE             = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_todo.md")
 UPGRADE_SUMMARY_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_upgrade_summary.json")
+# Sidecar holding the signature (sha256 of the sorted TASK LIST only, excluding
+# the timestamp) of the most recently SPOKEN upgrade announcement. Boot dedup
+# reads this so a summary whose timestamp was bumped but whose task list is
+# unchanged (the old overnight engine re-wrote the same tasks with a fresh
+# "upgraded_at") is never re-announced as if it just ran.
+UPGRADE_ANNOUNCED_SIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_upgrade_announced")
 
 
 # Phase 4D refactor: _act_queue_task moved to core/actions.py.
@@ -13789,8 +13846,17 @@ def _capture_utterance(injected_text, memory):
 
     # Keep the spectral music detector primed in normal mode too, so its
     # sustained-music state survives any sleep→standby transition triggered by
-    # a music marker below.
+    # a music marker below. Feed it the RAW audio (pre auto-gain) so its
+    # tuning is unaffected by the normalization stage below.
     _audio_music_feed(audio, SAMPLE_RATE)
+
+    # CONSERVATIVE auto-gain: a quiet mic records speech too softly for Whisper
+    # (empty transcript). Boost a sub-target buffer toward a usable peak just
+    # before transcription; a no-op for already-loud/normal audio.
+    audio, _ag = apply_capture_auto_gain(audio, _last_recording_peak)
+    if _ag > 1.0:
+        print(f"  [auto-gain] quiet input rms={_last_recording_peak:.4f} "
+              f"-> x{_ag:.1f}")
 
     print("  Transcribing…")
     text, conf = transcribe(audio)
@@ -13977,8 +14043,17 @@ def _handle_sleep_standby(injected_text: str | None) -> None:
             return
         # Feed the chunk to the spectral music detector so the standby loop
         # can spot sustained song audio and refuse lyric near-misses on the
-        # wake-word check below.
+        # wake-word check below. Fed the RAW audio (pre auto-gain) so the
+        # music-refuse guard's tuning is unaffected by the normalization below.
         _audio_music_feed(audio, SAMPLE_RATE)
+        # CONSERVATIVE auto-gain: on a QUIET mic the captured buffer is too soft
+        # for the wake check — Whisper returns '' and the neural detector never
+        # fires, so "JARVIS" is missed. Boost a sub-target buffer toward a usable
+        # peak BEFORE both wake paths; a no-op for already-loud/normal audio.
+        audio, _ag = apply_capture_auto_gain(audio, _last_recording_peak)
+        if _ag > 1.0:
+            print(f"  [auto-gain] quiet input rms={_last_recording_peak:.4f} "
+                  f"-> x{_ag:.1f}")
         # ── EXPERIMENTAL: neural wake detector (WAKE_WORD_AUTOSTART) ──────────
         # Off by default: _standby_wake_detected() returns None unless the flag
         # is on AND openWakeWord/Porcupine import, in which case the line below
@@ -14232,6 +14307,121 @@ def _run_llm_dispatch(text: str) -> str:
         if f_spoken:
             _speak(f_spoken)
     return reply
+
+
+def _upgrade_task_signature(clean_tasks) -> str:
+    """Stable signature of an upgrade summary's TASK LIST ONLY (timestamp
+    excluded), so a re-write of the same tasks with a bumped ``upgraded_at`` is
+    recognised as already-announced. sha256 over the sorted, cleaned task
+    strings — order-independent so a reshuffled-but-identical list still
+    matches."""
+    joined = "\n".join(sorted(str(t) for t in clean_tasks))
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+
+def _announce_upgrade_summary() -> None:
+    """Boot-time spoken announcement of the last upgrade cycle's work, with
+    DEDUP so the SAME task-set is never announced twice even if its timestamp
+    was bumped.
+
+    The (now-disabled) overnight engine used to re-write ``.last_upgrade_-
+    summary.json`` with a FRESH ``upgraded_at`` but the SAME old task list, so
+    every boot falsely re-announced days-old work as if it had just run. We now
+    compute a signature of the TASK LIST only (see _upgrade_task_signature) and
+    compare it to the last-announced signature persisted in UPGRADE_ANNOUNCED_-
+    SIG_FILE:
+      * signature matches the sidecar  → SKIP the spoken announcement (stale
+        replay), but STILL delete the summary file in the finally.
+      * new signature (genuine new upgrade) → announce as before, then write the
+        new signature to the sidecar, then delete the summary.
+
+    try/finally on the unlink so a corrupt summary can't get stuck re-announcing
+    on every startup. Never raises — boot must continue regardless.
+    """
+    if not os.path.exists(UPGRADE_SUMMARY_FILE):
+        return
+    try:
+        try:
+            with open(UPGRADE_SUMMARY_FILE, "r", encoding="utf-8") as _sf:
+                _summary = json.load(_sf)
+            _tasks      = _summary.get("tasks", [])
+            _when       = _summary.get("upgraded_at", "recently")
+            _syntax_ok  = _summary.get("syntax_ok", True)
+            _syn_errors = _summary.get("syntax_errors", [])
+
+            # Strip the **date** — prefix from each task so it reads naturally
+            _clean_tasks = []
+            for _t in _tasks:
+                _c = re.sub(r'^\*\*[^*]+\*\*\s*[—–-]+\s*', '', _t).strip()
+                _clean_tasks.append(_c if _c else _t)
+
+            # DEDUP: signature of the cleaned TASK LIST only (no timestamp). If it
+            # matches what we last announced, this is a stale timestamp-bumped
+            # replay — skip the speech but still delete the summary (finally).
+            _sig = _upgrade_task_signature(_clean_tasks)
+            _prev_sig = ""
+            try:
+                if os.path.exists(UPGRADE_ANNOUNCED_SIG_FILE):
+                    with open(UPGRADE_ANNOUNCED_SIG_FILE, "r", encoding="utf-8") as _gf:
+                        _prev_sig = _gf.read().strip()
+            except Exception:
+                _prev_sig = ""
+            if _clean_tasks and _sig == _prev_sig:
+                print("  [upgrade] tasks already announced — skipping stale replay")
+                return
+
+            _count = len(_clean_tasks)
+            if _count > 0:
+                _snippets = []
+                for _t in _clean_tasks[:3]:
+                    _short = _t.split(".")[0].strip()   # first sentence only
+                    if len(_short) > 70:
+                        _short = _short[:67] + "…"
+                    _snippets.append(_short)
+                _extra = f" and {_count - 3} more" if _count > 3 else ""
+                _task_line = "; ".join(_snippets) + _extra
+            else:
+                _task_line = ""
+
+            if _syntax_ok:
+                _status_line = "All syntax checks passed."
+            else:
+                _err_names = ", ".join(_syn_errors[:2]) if _syn_errors else "unknown files"
+                _status_line = f"Warning — syntax errors detected in {_err_names}. A manual review may be advisable, sir."
+
+            if _count > 0:
+                _announcement = (
+                    f"Upgrade complete, sir — ran at {_when}. "
+                    f"{_count} task{'s' if _count != 1 else ''} implemented: "
+                    f"{_task_line}. {_status_line}"
+                )
+            else:
+                # Claude Code ran but task list was empty (e.g. overnight idea gen)
+                _announcement = (
+                    f"I completed an upgrade at {_when}, sir. {_status_line}"
+                )
+
+            print(f"  [upgrade] announcing: {_announcement}")
+            try:
+                _speak(_announcement)
+            except Exception as _se:
+                print(f"  [upgrade] speak failed: {_se}")
+            # Persist the just-announced task signature so a later boot that sees
+            # the same tasks (timestamp bumped) stays silent. Best-effort: a
+            # write failure only risks one duplicate announcement, never a crash.
+            if _clean_tasks:
+                try:
+                    with open(UPGRADE_ANNOUNCED_SIG_FILE, "w", encoding="utf-8") as _gf:
+                        _gf.write(_sig)
+                except Exception as _we:
+                    print(f"  [upgrade] couldn't persist announced signature: {_we}")
+        except Exception as _e:
+            print(f"  [startup] couldn't read upgrade summary: {_e}")
+    finally:
+        try:
+            os.remove(UPGRADE_SUMMARY_FILE)
+        except Exception:
+            pass
 
 
 def main():  # pragma: no cover - boot entrypoint + infinite main event loop (singleton, device/boot bring-up, while-True turn loop)
@@ -14732,68 +14922,9 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         except Exception as e:
             print(f"  [pattern_memory] speak failed: {e}")
 
-    # Announce changes from the last upgrade cycle, if any.
-    # Use try/finally for the unlink so a corrupt summary doesn't get stuck
-    # in a loop where every startup tries to re-announce it.
-    if os.path.exists(UPGRADE_SUMMARY_FILE):
-        try:
-            try:
-                with open(UPGRADE_SUMMARY_FILE, "r", encoding="utf-8") as _sf:
-                    _summary = json.load(_sf)
-                _tasks      = _summary.get("tasks", [])
-                _when       = _summary.get("upgraded_at", "recently")
-                _syntax_ok  = _summary.get("syntax_ok", True)
-                _syn_errors = _summary.get("syntax_errors", [])
-
-                # Strip the **date** — prefix from each task so it reads naturally
-                _clean_tasks = []
-                for _t in _tasks:
-                    _c = re.sub(r'^\*\*[^*]+\*\*\s*[—–-]+\s*', '', _t).strip()
-                    _clean_tasks.append(_c if _c else _t)
-
-                _count = len(_clean_tasks)
-                if _count > 0:
-                    _snippets = []
-                    for _t in _clean_tasks[:3]:
-                        _short = _t.split(".")[0].strip()   # first sentence only
-                        if len(_short) > 70:
-                            _short = _short[:67] + "…"
-                        _snippets.append(_short)
-                    _extra = f" and {_count - 3} more" if _count > 3 else ""
-                    _task_line = "; ".join(_snippets) + _extra
-                else:
-                    _task_line = ""
-
-                if _syntax_ok:
-                    _status_line = "All syntax checks passed."
-                else:
-                    _err_names = ", ".join(_syn_errors[:2]) if _syn_errors else "unknown files"
-                    _status_line = f"Warning — syntax errors detected in {_err_names}. A manual review may be advisable, sir."
-
-                if _count > 0:
-                    _announcement = (
-                        f"Upgrade complete, sir — ran at {_when}. "
-                        f"{_count} task{'s' if _count != 1 else ''} implemented: "
-                        f"{_task_line}. {_status_line}"
-                    )
-                else:
-                    # Claude Code ran but task list was empty (e.g. overnight idea gen)
-                    _announcement = (
-                        f"I completed an upgrade at {_when}, sir. {_status_line}"
-                    )
-
-                print(f"  [upgrade] announcing: {_announcement}")
-                try:
-                    _speak(_announcement)
-                except Exception as _se:
-                    print(f"  [upgrade] speak failed: {_se}")
-            except Exception as _e:
-                print(f"  [startup] couldn't read upgrade summary: {_e}")
-        finally:
-            try:
-                os.remove(UPGRADE_SUMMARY_FILE)
-            except Exception:
-                pass
+    # Announce changes from the last upgrade cycle, if any (deduped so a
+    # timestamp-bumped replay of already-announced work stays silent).
+    _announce_upgrade_summary()
 
     # Changelog announcement — when version has bumped since the last
     # user-facing announcement, summarise the latest CHANGELOG.md entry via

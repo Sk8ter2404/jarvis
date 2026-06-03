@@ -1947,5 +1947,106 @@ class CaptureFocusedWindowPngFallbackTests(SectionSevenBase):
         self.assertIsNone(out)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  _announce_upgrade_summary  (TASK B — upgrade-announcer dedup)
+# ════════════════════════════════════════════════════════════════════════════
+class AnnounceUpgradeSummaryTests(SectionSevenBase):
+    """The boot-time upgrade announcer must DEDUP on the TASK LIST (not the
+    timestamp): a summary whose tasks were already announced — even with a
+    bumped ``upgraded_at`` — is NOT spoken again (but the summary file is still
+    deleted), while a genuinely-new task set IS spoken and updates the sidecar.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._speak = self._p(self.bc, "_speak")
+        # Isolate the summary + announced-signature sidecar into a temp dir so we
+        # never touch the real project-root dotfiles.
+        self._dir = tempfile.mkdtemp(prefix="jarvis_upgrade_test_")
+        self.addCleanup(self._cleanup_dir)
+        self._summary_path = os.path.join(self._dir, ".last_upgrade_summary.json")
+        self._sig_path = os.path.join(self._dir, ".last_upgrade_announced")
+        self._p(self.bc, "UPGRADE_SUMMARY_FILE", self._summary_path)
+        self._p(self.bc, "UPGRADE_ANNOUNCED_SIG_FILE", self._sig_path)
+
+    def _cleanup_dir(self):
+        import shutil
+        shutil.rmtree(self._dir, ignore_errors=True)
+
+    def _write_summary(self, tasks, when="11:52", syntax_ok=True):
+        with open(self._summary_path, "w", encoding="utf-8") as f:
+            json.dump({"tasks": tasks, "upgraded_at": when,
+                       "syntax_ok": syntax_ok}, f)
+
+    def _write_sig_for(self, tasks):
+        # Compute + store the signature the announcer would compute for `tasks`
+        # (after the same **date** prefix stripping the announcer applies).
+        import re as _re
+        clean = []
+        for _t in tasks:
+            _c = _re.sub(r'^\*\*[^*]+\*\*\s*[—–-]+\s*', '', _t).strip()
+            clean.append(_c if _c else _t)
+        sig = self.bc._upgrade_task_signature(clean)
+        with open(self._sig_path, "w", encoding="utf-8") as f:
+            f.write(sig)
+        return sig
+
+    # ── case 1: matching signature → NOT spoken, but summary removed ─────────
+    def test_already_announced_signature_is_not_spoken(self):
+        tasks = ["**2026-06-01** — added foo", "**2026-06-02** — fixed bar"]
+        # Pre-seed the sidecar with this task set's signature (simulating a prior
+        # boot that already announced it), then re-write the summary with a FRESH
+        # timestamp but the SAME tasks (the old overnight-engine replay bug).
+        prior_sig = self._write_sig_for(tasks)
+        self._write_summary(tasks, when="09:30")   # bumped timestamp, same tasks
+
+        self.bc._announce_upgrade_summary()
+
+        # Stale replay: nothing spoken …
+        self._speak.assert_not_called()
+        # … the summary file is STILL deleted (no stuck re-announce loop) …
+        self.assertFalse(os.path.exists(self._summary_path))
+        # … and the stored signature is untouched.
+        with open(self._sig_path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), prior_sig)
+
+    # ── case 2: new signature → spoken, sidecar updated ─────────────────────
+    def test_new_task_set_is_spoken_and_updates_sidecar(self):
+        old_tasks = ["**2026-05-30** — old work"]
+        new_tasks = ["**2026-06-03** — brand new feature",
+                     "**2026-06-03** — another new thing"]
+        # Sidecar holds the OLD signature; the summary carries genuinely-new tasks.
+        old_sig = self._write_sig_for(old_tasks)
+        self._write_summary(new_tasks, when="14:00")
+
+        self.bc._announce_upgrade_summary()
+
+        # Genuine upgrade: announced …
+        self._speak.assert_called_once()
+        spoken = self._speak.call_args[0][0].lower()
+        self.assertIn("upgrade complete", spoken)
+        # … the summary file is consumed …
+        self.assertFalse(os.path.exists(self._summary_path))
+        # … and the sidecar now holds the NEW signature (≠ the old one).
+        expected_sig = self.bc._upgrade_task_signature(
+            ["brand new feature", "another new thing"])
+        with open(self._sig_path, "r", encoding="utf-8") as f:
+            stored = f.read().strip()
+        self.assertEqual(stored, expected_sig)
+        self.assertNotEqual(stored, old_sig)
+
+    # ── a first-ever announcement (no sidecar yet) still speaks ─────────────
+    def test_first_announcement_with_no_sidecar_speaks(self):
+        tasks = ["**2026-06-03** — the very first upgrade"]
+        self._write_summary(tasks)
+        self.assertFalse(os.path.exists(self._sig_path))
+
+        self.bc._announce_upgrade_summary()
+
+        self._speak.assert_called_once()
+        self.assertFalse(os.path.exists(self._summary_path))
+        self.assertTrue(os.path.exists(self._sig_path))
+
+
 if __name__ == "__main__":
     unittest.main()
