@@ -291,6 +291,14 @@ SCHEMA: dict[str, dict] = {
         "default": True,
         "help": "Brief target flash where a UI-automation action fires.",
     },
+    "MODEL_ROUTING": {
+        "tab": "ai", "label": "Per-function model", "type": "routing",
+        "default": {"chat": "auto", "vision": "auto", "ambient": "auto"},
+        "choices": ["auto", "local", "cloud"],
+        "help": "Pick the brain per function: local (free Ollama) / cloud "
+                "(Claude) / auto (cloud, local on failure). vision = see screen, "
+                "chat = conversation, ambient = background learning.",
+    },
     "PUSHBACK_ENABLED": {
         "tab": "advanced", "label": "JARVIS-style pushback", "type": "bool",
         "default": True,
@@ -325,7 +333,7 @@ SCHEMA: dict[str, dict] = {
 
 # Field types whose key is a real persisted setting (everything except the
 # read-only "status" rows, whose keys start with "_status_").
-_PERSISTED_TYPES = {"bool", "enum", "str", "int", "float", "text"}
+_PERSISTED_TYPES = {"bool", "enum", "str", "int", "float", "text", "routing"}
 
 
 def persisted_keys() -> list[str]:
@@ -345,6 +353,8 @@ def default_settings() -> dict:
         default = SCHEMA[key]["default"]
         if isinstance(default, list):
             default = list(default)
+        elif isinstance(default, dict):
+            default = dict(default)
         out[key] = default
     return out
 
@@ -381,11 +391,23 @@ def coerce_value(spec: dict, raw):
             if isinstance(raw, str):
                 return [ln.strip() for ln in raw.splitlines() if ln.strip()]
             return list(default) if isinstance(default, list) else []
+        if typ == "routing":
+            # nested {function: route}; merge valid entries over the default,
+            # drop unknown functions / invalid routes.
+            base = dict(default) if isinstance(default, dict) else {}
+            opts = spec.get("choices") or ["auto", "local", "cloud"]
+            if isinstance(raw, dict):
+                for k, v in raw.items():
+                    if k in base and str(v) in opts:
+                        base[k] = str(v)
+            return base
         # str (and anything unknown) → string
         return str(raw)
     except (TypeError, ValueError):
         if isinstance(default, list):
             return list(default)
+        if isinstance(default, dict):
+            return dict(default)
         return default
 
 
@@ -653,6 +675,28 @@ def run_gui(start_tab: int = 0) -> int:
                 row += 1
                 continue
 
+            if typ == "routing":
+                # one dropdown per function (vision/chat/ambient), composed back
+                # into the MODEL_ROUTING dict on save via the "::" sub-keys.
+                ttk.Label(inner, text=label).grid(
+                    row=row, column=0, sticky="w", padx=2, pady=(6, 2))
+                row += 1
+                cur = settings.get(key)
+                cur = cur if isinstance(cur, dict) else {}
+                opts = spec.get("choices") or ["auto", "local", "cloud"]
+                for fn in spec.get("default", {}):
+                    ttk.Label(inner, text=f"    • {fn}").grid(
+                        row=row, column=0, sticky="w", padx=12, pady=(0, 2))
+                    rvar = tk.StringVar(value=str(cur.get(fn, spec["default"][fn])))
+                    vars_by_key[f"{key}::{fn}"] = rvar
+                    ttk.Combobox(inner, textvariable=rvar, state="readonly",
+                                 values=opts, width=28).grid(
+                        row=row, column=1, sticky="we", padx=2, pady=(0, 2))
+                    row += 1
+                _add_help(inner, spec, row)
+                row += 1
+                continue
+
             # enum / str / int / float → label + control on one row.
             ttk.Label(inner, text=label).grid(
                 row=row, column=0, sticky="w", padx=2, pady=(6, 2))
@@ -697,6 +741,13 @@ def run_gui(start_tab: int = 0) -> int:
             out[key] = var.get()
         for key, widget in text_widgets.items():
             out[key] = widget.get("1.0", "end")
+        # Fold routing sub-keys ("MODEL_ROUTING::vision") into their nested dict.
+        for compound in [c for c in list(out) if "::" in c]:
+            base, fn = compound.split("::", 1)
+            val = out.pop(compound)
+            if not isinstance(out.get(base), dict):
+                out[base] = {}
+            out[base][fn] = val
         return out
 
     def _on_save():

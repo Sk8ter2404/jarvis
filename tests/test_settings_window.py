@@ -110,6 +110,18 @@ class CoercionTests(unittest.TestCase):
         self.assertEqual(sw.coerce_value(spec, "a\n b \n\nc"), ["a", "b", "c"])
         self.assertEqual(sw.coerce_value(spec, ["x", "y"]), ["x", "y"])
 
+    def test_routing(self):
+        spec = {"type": "routing", "choices": ["auto", "local", "cloud"],
+                "default": {"chat": "auto", "vision": "auto", "ambient": "auto"}}
+        out = sw.coerce_value(spec, {"vision": "local"})          # partial merges
+        self.assertEqual(out["vision"], "local")
+        self.assertEqual(out["chat"], "auto")
+        out2 = sw.coerce_value(spec, {"vision": "bogus", "nope": "local"})
+        self.assertEqual(out2["vision"], "auto")                  # bad route dropped
+        self.assertNotIn("nope", out2)                            # unknown fn dropped
+        self.assertEqual(sw.coerce_value(spec, "garbage"),        # non-dict -> default
+                         {"chat": "auto", "vision": "auto", "ambient": "auto"})
+
 
 class RoundTripTests(unittest.TestCase):
     def test_save_then_load_roundtrip(self):
