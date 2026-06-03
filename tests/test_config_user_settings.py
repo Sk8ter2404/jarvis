@@ -62,5 +62,27 @@ class ApplyUserSettingsTests(unittest.TestCase):
             cfg._apply_user_settings()  # must not raise
 
 
+class ModelRoutingTests(unittest.TestCase):
+    def test_model_route_default_and_lookup(self):
+        self.assertEqual(cfg.model_route("nonexistent_fn"), "auto")
+        with mock.patch.object(cfg, "MODEL_ROUTING", {"vision": "local"}):
+            self.assertEqual(cfg.model_route("vision"), "local")
+            self.assertEqual(cfg.model_route("chat"), "auto")   # missing key -> default
+
+    def test_partial_dict_override_merges(self):
+        orig = dict(cfg.MODEL_ROUTING)
+        fake = {"MODEL_ROUTING": {"vision": "local"}}   # PARTIAL override
+        try:
+            m = mock.mock_open(read_data=json.dumps(fake))
+            with mock.patch("core.config.os.path.exists", return_value=True), \
+                 mock.patch("core.config.open", m, create=True):
+                cfg._apply_user_settings()
+            self.assertEqual(cfg.MODEL_ROUTING["vision"], "local")       # changed
+            self.assertEqual(cfg.MODEL_ROUTING["chat"], orig["chat"])    # kept (merge)
+            self.assertEqual(cfg.MODEL_ROUTING["ambient"], orig["ambient"])
+        finally:
+            cfg.MODEL_ROUTING = orig
+
+
 if __name__ == "__main__":
     unittest.main()

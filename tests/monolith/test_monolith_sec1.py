@@ -1877,6 +1877,27 @@ class LlmQuickOllamaTests(_MonolithTestBase):
         self.assertEqual(kwargs["messages"][0]["role"], "system")
 
 
+class ModelRoutingTests(_MonolithTestBase):
+    """Per-function MODEL_ROUTING: 'local' forces the free local brain."""
+
+    def test_llm_quick_ambient_route_local(self):
+        import core.config as cfg
+        with mock.patch.object(cfg, "MODEL_ROUTING", {"ambient": "local"}), \
+             mock.patch.object(self.bc, "_call_local_llm", return_value="fact") as ml:
+            self.assertEqual(self.bc._llm_quick("s", "u"), "fact")
+        ml.assert_called_once()
+
+    def test_ask_vision_route_local_uses_local_vlm(self):
+        import core.config as cfg
+        with mock.patch.object(cfg, "MODEL_ROUTING", {"vision": "local"}), \
+             mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(self.bc, "_call_local_vision",
+                               return_value="a button") as mv:
+            out = self.bc.ask_vision("what's here?", png_bytes=b"png")
+        self.assertEqual(out, "[local-vision] a button")
+        mv.assert_called_once()
+
+
 # ──────────────────────────────────────────────────────────────────────────
 #  learn_from_turn worker — bad-JSON + worker-exception arms
 # ──────────────────────────────────────────────────────────────────────────
