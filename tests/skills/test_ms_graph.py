@@ -1177,5 +1177,151 @@ class DeviceFlowTests(_MsGraphBase):
             self.assertFalse(self.mod.authenticate_device_flow())
 
 
+# ─── calendar action + orchestrator sub-agent wiring ─────────────────────
+#
+# ms_graph now registers a string-returning calendar action so the
+# orchestrator's `calendar_scanner` sub-agent (previously inert) can dispatch a
+# real, registered read. These tests cover the action's formatting + graceful
+# degradation (Graph fully mocked, no network) and validate the JSON spec
+# parses + references a now-registered action name.
+
+class CalendarActionTests(_MsGraphBase):
+    def test_not_configured_returns_friendly_setup_line(self):
+        # No creds → an honest 'not set up' line, never a crash, never events.
+        with mock.patch.object(self.mod, "is_configured", return_value=False):
+            out = self.mod.action_calendar_today("today")
+        self.assertIn("isn't set up", out)
+        self.assertIn("--auth", out)
+
+    def test_configured_empty_window_says_nothing_scheduled(self):
+        with mock.patch.object(self.mod, "is_configured", return_value=True), \
+             mock.patch.object(self.mod, "_graph_get", return_value={"value": []}):
+            out = self.mod.action_calendar_today("today")
+        self.assertIn("Nothing on the calendar", out)
+
+    def test_configured_with_events_formats_chronologically(self):
+        body = {"value": [
+            {"subject": "Standup",
+             "start": {"dateTime": "2026-06-02T09:00:00", "timeZone": "UTC"},
+             "organizer": {"emailAddress": {"name": "Alice"}}},
+            {"subject": "Lunch",
+             "start": {"dateTime": "2026-06-02T12:30:00", "timeZone": "UTC"},
+             "organizer": {"emailAddress": {"name": "Bob"}}},
+        ]}
+        with mock.patch.object(self.mod, "is_configured", return_value=True), \
+             mock.patch.object(self.mod, "_graph_get", return_value=body):
+            out = self.mod.action_calendar_today("today")
+        # Real subjects/organizers surface; count header present. (Times are
+        # tz-converted to naive-local so we don't assert exact HH:MM.)
+        self.assertIn("2 events", out)
+        self.assertIn("Standup", out)
+        self.assertIn("Alice", out)
+        self.assertIn("Lunch", out)
+        self.assertIn("Bob", out)
+
+    def test_event_without_organizer_omits_parenthetical(self):
+        body = {"value": [
+            {"subject": "Focus block",
+             "start": {"dateTime": "2026-06-02T14:00:00", "timeZone": "UTC"}},
+        ]}
+        with mock.patch.object(self.mod, "is_configured", return_value=True), \
+             mock.patch.object(self.mod, "_graph_get", return_value=body):
+            out = self.mod.action_calendar_today("today")
+        self.assertIn("Focus block", out)
+        self.assertEqual(out.count("("), 0)   # no organizer → no "(name)"
+
+    def test_graph_exception_degrades_without_raising(self):
+        # An unexpected failure inside get_upcoming_events must be swallowed.
+        with mock.patch.object(self.mod, "is_configured", return_value=True), \
+             mock.patch.object(self.mod, "get_upcoming_events",
+                               side_effect=RuntimeError("graph boom")):
+            out = self.mod.action_calendar_today("today")
+        self.assertIn("Couldn't reach the calendar", out)
+
+    def test_is_configured_exception_treated_as_unconfigured(self):
+        with mock.patch.object(self.mod, "is_configured",
+                               side_effect=RuntimeError("msal boom")):
+            out = self.mod.action_calendar_today("today")
+        self.assertIn("isn't set up", out)
+
+    def test_tomorrow_window_passed_through(self):
+        # The arg keyword reaches get_upcoming_events as the window.
+        with mock.patch.object(self.mod, "is_configured", return_value=True), \
+             mock.patch.object(self.mod, "get_upcoming_events",
+                               return_value=[]) as gue:
+            self.mod.action_calendar_today("tomorrow")
+        self.assertEqual(gue.call_args.kwargs.get("when"), "tomorrow")
+
+    def test_normalise_when_maps_free_text(self):
+        n = self.mod._normalise_when
+        self.assertEqual(n(""), "today")
+        self.assertEqual(n("TODAY"), "today")
+        self.assertEqual(n("what's on tomorrow"), "tomorrow")
+        self.assertEqual(n("this week"), "next_14_days")
+        self.assertEqual(n("next 14 days"), "next_14_days")
+        self.assertEqual(n("upcoming"), "next_14_days")
+        self.assertEqual(n("gibberish"), "today")
+
+    def test_action_always_returns_str(self):
+        # Contract for the orchestrator worker: Callable[[str], str].
+        with mock.patch.object(self.mod, "is_configured", return_value=False):
+            self.assertIsInstance(self.mod.action_calendar_today(""), str)
+
+
+class CalendarRegistrationTests(_MsGraphBase):
+    """register() must expose the action under every name the calendar_scanner
+    sub-agent spec references, all pointing at the one string-returning call."""
+    def test_register_populates_spec_action_names(self):
+        actions = {}
+        self.mod.register(actions)
+        for name in ("ms_graph_calendar", "calendar_today", "calendar_next"):
+            self.assertIn(name, actions)
+            self.assertTrue(callable(actions[name]))
+        # All three are the same underlying action.
+        self.assertIs(actions["ms_graph_calendar"], actions["calendar_today"])
+        self.assertIs(actions["calendar_today"], actions["calendar_next"])
+
+
+class CalendarSubAgentSpecWiringTests(unittest.TestCase):
+    """The orchestrator sub-agent JSON parses AND each action it references is
+    now registered by a freshly-built ms_graph ACTIONS (Graph mocked, no net).
+
+    This is the cross-module guard the task asks for: it fails if someone edits
+    the spec to reference an action ms_graph doesn't register, or removes the
+    registration — i.e. it would have caught the original 'inert sub-agent' bug.
+    """
+    def setUp(self):
+        self._proj = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))
+        self._spec_path = os.path.join(
+            self._proj, "skills", "sub_agents", "calendar_scanner.json")
+
+    def test_spec_parses_and_is_well_formed(self):
+        with open(self._spec_path, "r", encoding="utf-8") as f:
+            spec = json.load(f)
+        self.assertEqual(spec["name"], "calendar_scanner")
+        self.assertIsInstance(spec.get("allowed_actions"), list)
+        self.assertTrue(spec["allowed_actions"])
+        # Sub-agent model preference must be an un-dated keyword, not a dated pin.
+        self.assertEqual(spec.get("model_preference"), "haiku")
+
+    def test_spec_actions_are_registered_by_ms_graph(self):
+        with open(self._spec_path, "r", encoding="utf-8") as f:
+            spec = json.load(f)
+        # Build the real ms_graph ACTIONS via the skill harness (register()
+        # runs; no network — the action isn't *called* here, only registered).
+        _mod, actions = load_skill_isolated("ms_graph")
+        registered = set(actions)
+        # At least one allowed_action must resolve (the worker auto-runs the
+        # FIRST registered one); assert the first listed is among them so the
+        # sub-agent can't silently go inert again.
+        self.assertIn(spec["allowed_actions"][0], registered)
+        for name in spec["allowed_actions"]:
+            self.assertIn(
+                name, registered,
+                f"spec action {name!r} is not registered by ms_graph",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1149,5 +1149,31 @@ class ModuleSingletonTests(unittest.TestCase):
         self.assertIs(orch.get_orchestrator(), orch._default_orchestrator)
 
 
+class ModelConstantTests(unittest.TestCase):
+    """Guard the model-id constants against re-pinning to a dated build.
+
+    The rest of JARVIS uses un-dated aliases (claude-sonnet-4-6, claude-haiku-
+    4-5) so a model refresh doesn't require code edits and a retired dated build
+    can't silently rot the worker. A worker model like 'claude-haiku-4-5-2025…'
+    would still 'work' until Anthropic retires that exact snapshot, then fail
+    closed — so we assert NO module model constant carries an 8-digit date.
+    """
+    import re as _re
+    _DATE_RE = _re.compile(r"\d{8}")
+
+    def test_worker_model_is_undated_haiku_alias(self):
+        # The specific value F4 un-pinned: the un-dated Haiku alias.
+        self.assertEqual(orch.DEFAULT_WORKER_MODEL, "claude-haiku-4-5")
+
+    def test_no_default_model_constant_is_date_pinned(self):
+        for const in ("DEFAULT_PLANNER_MODEL", "DEFAULT_WORKER_MODEL",
+                      "DEFAULT_MERGER_MODEL"):
+            val = getattr(orch, const)
+            self.assertIsNone(
+                self._DATE_RE.search(val),
+                f"{const}={val!r} is date-pinned; use an un-dated alias",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
