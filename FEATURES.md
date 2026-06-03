@@ -2,11 +2,11 @@
 
 ## Overview
 
-JARVIS (internal codename "Bobert") is a Python voice-controlled desktop AI assistant for Windows that styles itself after the Iron Man JARVIS — dry, British, composed. It is a single long-running script (`C:\JARVIS\bobert_companion.py`, ~14,700 lines) that listens via microphone, transcribes with Whisper, routes the transcript through Claude as the language model, and lets Claude emit `[ACTION: name, arg]` tokens that map to ~150 registered handler functions. Around the core sits a skills system (`C:\JARVIS\skills\`, 78 modules), a HUD subsystem (`C:\JARVIS\hud\`, 10 overlay subprocesses), and several proactive background daemons (printer monitor, credit monitor, briefings, wellness nudges, banter, anticipation engine).
+JARVIS (internal codename "Bobert") is a Python voice-controlled desktop AI assistant for Windows that styles itself after the Iron Man JARVIS — dry, British, composed. It is a single long-running script (`C:\JARVIS\bobert_companion.py`, ~15,000 lines) that listens via microphone, transcribes with Whisper, routes the transcript through Claude as the language model, and lets Claude emit `[ACTION: name, arg]` tokens that map to ~150 registered handler functions. Around the core sits a skills system (`C:\JARVIS\skills\`, 78 modules), a HUD subsystem (`C:\JARVIS\hud\`, 10 overlay subprocesses), and several proactive background daemons (printer monitor, credit monitor, briefings, wellness nudges, banter, anticipation engine).
 
 ## How to invoke
 
-There is no push-to-talk hotkey by default — JARVIS listens continuously. Speak normally and Claude maps your phrasing to one of the registered ACTION names; you can also use the **wake/sleep phrases** below to put it into standby. A system-tray applet (`tray.py`) gives "Pause Listening / Force Upgrade / Show Today's Summary" via right-click.
+There is no push-to-talk hotkey by default — JARVIS listens continuously. Speak normally and Claude maps your phrasing to one of the registered ACTION names; you can also use the **wake/sleep phrases** below to put it into standby. A system-tray applet (`tray.py`) shows live status and a grouped right-click menu — common toggles plus five submenus (Power tools / AI / Memory / Diagnostics / Settings), the last opening the standalone **Settings GUI** (`tools/settings_window.py`).
 
 - **Wake phrases**: `jarvis`, `hey jarvis`, `wake up`, `start listening`, `i need you`, `come back`, `resume listening`, `wake`
 - **Sleep phrases**: `stop listening`, `go to sleep`, `sleep mode`, `stand by`, `go on standby`, `be quiet`, `mute yourself`, `take a break`, `go idle`, `pause listening`
@@ -165,7 +165,7 @@ There is no push-to-talk hotkey by default — JARVIS listens continuously. Spea
   - "show the workshop HUD", "hide workshop HUD", "workshop HUD status"
   - Actions: `workshop_hud`, `workshop_hud_on`, `workshop_hud_off`, `workshop_hud_toggle`, `workshop_hud_status`, `hide_workshop_hud`, `show_workshop_hud`
 - **Reticle overlay** (`hud/jarvis_reticle.py`) — translucent target reticle at click/type coordinates during UI automation. No voice commands.
-- **System tray applet** (`tray.py`) — 4-dot status grid (listening, TTS, upgrade-queue depth, Bambu state). Right-click menu: Pause Listening, Force Upgrade Now, Show Today's Summary.
+- **System tray applet** (`tray.py`) — arc-reactor icon tinted by listen state (green awake / gray standby / red muted) + speaking halo + upgrade-queue badge + Bambu print mark. Grouped right-click menu: common toggles + five submenus (Power tools / AI / Memory / Diagnostics / Settings) + About; the Settings submenu opens the standalone **Settings GUI** (`tools/settings_window.py`).
 
 ### Category 10: System monitoring & status
 
