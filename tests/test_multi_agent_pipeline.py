@@ -110,6 +110,10 @@ class _PipeBase(unittest.TestCase):
                   "JARVIS_PIPELINE_REVIEWER_MODEL",
                   "JARVIS_PIPELINE_TESTER_WAIT_S",
                   "JARVIS_PIPELINE_SKIP_TESTER",
+                  "JARVIS_PIPELINE_SKIP_SUITE",
+                  "JARVIS_PIPELINE_MAX_USD",
+                  "JARVIS_PIPELINE_FORCE_UNSAFE",
+                  "STABILITY_GATE_DISABLE",
                   "JARVIS_PIPELINE_FORCE_CONTINUE_AFTER_REGRESSION"):
             os.environ.pop(k, None)
 
@@ -982,6 +986,186 @@ class RunTesterTests(_PipeBase):
         self.assertIn("could not spawn", res["error"])
 
 
+# ─────────────── safety gates: risk threshold + correctness gate ───────────
+
+
+class MaxRiskScoreTests(_PipeBase):
+    def test_default_is_7(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("JARVIS_PIPELINE_MAX_RISK", None)
+            self.assertEqual(P._max_risk_score(), 7)
+
+    def test_custom_value(self):
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_MAX_RISK": "5"}):
+            self.assertEqual(P._max_risk_score(), 5)
+
+    def test_bad_value_defaults_to_7(self):
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_MAX_RISK": "high"}):
+            self.assertEqual(P._max_risk_score(), 7)
+
+    def test_clamped_to_0_10(self):
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_MAX_RISK": "99"}):
+            self.assertEqual(P._max_risk_score(), 10)
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_MAX_RISK": "-4"}):
+            self.assertEqual(P._max_risk_score(), 0)
+
+
+class PipelineMaxUsdTests(_PipeBase):
+    def test_default_is_25(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("JARVIS_PIPELINE_MAX_USD", None)
+            self.assertEqual(P._pipeline_max_usd(), 25.0)
+
+    def test_custom_value(self):
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_MAX_USD": "3.5"}):
+            self.assertEqual(P._pipeline_max_usd(), 3.5)
+
+    def test_zero_means_no_cap(self):
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_MAX_USD": "0"}):
+            self.assertEqual(P._pipeline_max_usd(), 0.0)
+
+    def test_negative_clamped_to_zero(self):
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_MAX_USD": "-10"}):
+            self.assertEqual(P._pipeline_max_usd(), 0.0)
+
+    def test_bad_value_defaults(self):
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_MAX_USD": "lots"}):
+            self.assertEqual(P._pipeline_max_usd(), 25.0)
+
+
+class EstimateTaskCostTests(_PipeBase):
+    def test_none_result_bills_full_cycle(self):
+        # run_pipeline_on_task raised -> bill a full task, never $0.
+        self.assertEqual(P._estimate_task_cost_usd(None),
+                         P._FULL_TASK_COST_ESTIMATE_USD)
+
+    def test_empty_stages_bills_full_cycle(self):
+        self.assertEqual(P._estimate_task_cost_usd({"stages": {}}),
+                         P._FULL_TASK_COST_ESTIMATE_USD)
+
+    def test_missing_stages_key_bills_full_cycle(self):
+        self.assertEqual(P._estimate_task_cost_usd({"ok": True}),
+                         P._FULL_TASK_COST_ESTIMATE_USD)
+
+    def test_planner_only_bills_planner(self):
+        # e.g. a planner-marked-IMPOSSIBLE task.
+        res = {"stages": {"planner": {}}}
+        self.assertEqual(P._estimate_task_cost_usd(res),
+                         P._STAGE_COST_ESTIMATE_USD["planner"])
+
+    def test_full_pipeline_sums_billable_stages(self):
+        res = {"stages": {"planner": {}, "implementer": {}, "reviewer": {},
+                          "tester": {}, "suite": {}}}
+        expected = (P._STAGE_COST_ESTIMATE_USD["planner"]
+                    + P._STAGE_COST_ESTIMATE_USD["implementer"]
+                    + P._STAGE_COST_ESTIMATE_USD["reviewer"])
+        self.assertAlmostEqual(P._estimate_task_cost_usd(res), expected)
+
+    def test_local_only_stages_fall_back_not_zero(self):
+        # A stages dict with only local (non-Claude) keys must not bill $0.
+        res = {"stages": {"tester": {}, "suite": {}}}
+        self.assertEqual(P._estimate_task_cost_usd(res),
+                         P._FULL_TASK_COST_ESTIMATE_USD)
+
+    def test_implementer_is_most_expensive_stage(self):
+        # Documented basis: implementer (Opus, writes) dominates the estimate.
+        self.assertGreater(P._STAGE_COST_ESTIMATE_USD["implementer"],
+                           P._STAGE_COST_ESTIMATE_USD["planner"])
+        self.assertGreater(P._STAGE_COST_ESTIMATE_USD["implementer"],
+                           P._STAGE_COST_ESTIMATE_USD["reviewer"])
+
+
+class UnsafeSkipFlagHelperTests(_PipeBase):
+    def test_none_active_by_default(self):
+        # _PipeBase.setUp pops all three flags -> clean slate.
+        self.assertEqual(P._active_unsafe_skip_flags(), [])
+
+    def test_each_flag_detected_when_set_to_1(self):
+        for env_name, _label in P._UNSAFE_SKIP_FLAGS:
+            with mock.patch.dict(os.environ, {env_name: "1"}):
+                active = P._active_unsafe_skip_flags()
+            self.assertEqual(len(active), 1, f"{env_name} not detected")
+
+    def test_flag_only_active_on_exactly_1(self):
+        with mock.patch.dict(os.environ, {"STABILITY_GATE_DISABLE": "true"}):
+            self.assertEqual(P._active_unsafe_skip_flags(), [])
+        with mock.patch.dict(os.environ, {"STABILITY_GATE_DISABLE": " 1 "}):
+            # stripped to "1" -> active
+            self.assertEqual(len(P._active_unsafe_skip_flags()), 1)
+
+    def test_multiple_flags_all_reported(self):
+        with mock.patch.dict(os.environ, {
+                "STABILITY_GATE_DISABLE": "1",
+                "JARVIS_PIPELINE_SKIP_TESTER": "1",
+                "JARVIS_PIPELINE_SKIP_SUITE": "1"}):
+            self.assertEqual(len(P._active_unsafe_skip_flags()), 3)
+
+    def test_force_unsafe_via_argv(self):
+        self.assertTrue(P._force_unsafe_acked(["prog", "--force-unsafe"]))
+        self.assertFalse(P._force_unsafe_acked(["prog"]))
+
+    def test_force_unsafe_via_env(self):
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_FORCE_UNSAFE": "1"}):
+            self.assertTrue(P._force_unsafe_acked(["prog"]))
+
+    def test_force_unsafe_reads_sys_argv_when_argv_none(self):
+        with mock.patch.object(sys, "argv", ["prog", "--force-unsafe"]):
+            self.assertTrue(P._force_unsafe_acked())
+
+
+class RunTestSuiteTests(_PipeBase):
+    def test_skipped_via_env(self):
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_SKIP_SUITE": "1"}):
+            res = P._run_test_suite(project_dir=self.tmp)
+        self.assertTrue(res["ok"])
+        self.assertTrue(res["skipped"])
+
+    def test_skipped_when_runner_missing(self):
+        # no tools/run_tests.py in the tempdir → skip (don't wedge the queue)
+        res = P._run_test_suite(project_dir=self.tmp)
+        self.assertTrue(res["ok"])
+        self.assertTrue(res["skipped"])
+        self.assertIn("missing", res["reason"])
+
+    def test_passes_on_rc0_and_extracts_summary(self):
+        self.write(os.path.join("tools", "run_tests.py"), "# runner\n")
+        fake = _FakeCompleted(
+            returncode=0,
+            stdout="...\nJARVIS TESTS: 100 run, 0 failed, 0 errored, 2 skipped\n")
+        with mock.patch.object(P.subprocess, "run", return_value=fake):
+            res = P._run_test_suite(project_dir=self.tmp)
+        self.assertTrue(res["ok"])
+        self.assertFalse(res.get("skipped"))
+        self.assertIn("100 run", res["summary"])
+
+    def test_fails_on_nonzero_rc(self):
+        self.write(os.path.join("tools", "run_tests.py"), "# runner\n")
+        fake = _FakeCompleted(
+            returncode=1,
+            stdout="JARVIS TESTS: 100 run, 3 failed, 0 errored, 0 skipped\n")
+        with mock.patch.object(P.subprocess, "run", return_value=fake):
+            res = P._run_test_suite(project_dir=self.tmp)
+        self.assertFalse(res["ok"])
+        self.assertIn("3 failed", res["summary"])
+
+    def test_timeout_reported(self):
+        self.write(os.path.join("tools", "run_tests.py"), "# runner\n")
+        with mock.patch.object(
+                P.subprocess, "run",
+                side_effect=P.subprocess.TimeoutExpired("cmd", 1200)):
+            res = P._run_test_suite(project_dir=self.tmp)
+        self.assertFalse(res["ok"])
+        self.assertIn("timed out", res["summary"])
+
+    def test_oserror_reported(self):
+        self.write(os.path.join("tools", "run_tests.py"), "# runner\n")
+        with mock.patch.object(P.subprocess, "run",
+                               side_effect=OSError("cannot spawn")):
+            res = P._run_test_suite(project_dir=self.tmp)
+        self.assertFalse(res["ok"])
+        self.assertIn("could not spawn", res["summary"])
+
+
 # ──────────────────────────── _kill_jarvis (Windows) ──────────────────────
 
 
@@ -1665,6 +1849,196 @@ class LoopDriverTests(LoopDriverBase):
         self.assertEqual(rc, 0)
 
 
+# ──────────────────────── budget cap (loop integration) ───────────────────
+
+
+class LoopDriverBudgetCapTests(LoopDriverBase):
+    """The per-run USD budget cap stops the loop CLEANLY at a task boundary
+    once the estimated spend reaches JARVIS_PIPELINE_MAX_USD (rc=4)."""
+
+    # Each ticked task carries a full planner+implementer+reviewer stages dict
+    # so _estimate_task_cost_usd bills the full per-task estimate.
+    _FULL_STAGES = {"planner": {}, "implementer": {}, "reviewer": {},
+                    "tester": {}, "suite": {}}
+
+    def _ticking_task(self):
+        def _on_task(task, **kw):
+            P._tick_task(task, "done")
+            return {"ok": True, "ticked": True, "stage_failed": None,
+                    "stages": dict(self._FULL_STAGES)}
+        return _on_task
+
+    def test_cap_stops_loop_at_task_boundary(self):
+        # Per-task estimate is $1.75; cap at $2.0 -> after task 2 the running
+        # total ($3.50) >= cap, so the loop stops with rc=4. Task 3 never runs.
+        self.write_todo("- [ ] t1\n- [ ] t2\n- [ ] t3\n")
+        seen = []
+
+        def _on_task(task, **kw):
+            seen.append(task)
+            P._tick_task(task, "done")
+            return {"ok": True, "ticked": True, "stage_failed": None,
+                    "stages": dict(self._FULL_STAGES)}
+
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_MAX_USD": "2.0"}), \
+             mock.patch.object(P, "run_pipeline_on_task", side_effect=_on_task):
+            rc, out = self._run_loop(max_iter=10, task_count=3)
+        self.assertEqual(rc, 4)
+        self.assertIn("reached the $2.00/run cap", out)
+        # stopped at the boundary after task 2 -> task 3 never dispatched
+        self.assertEqual(len(seen), 2)
+        # t3 still unchecked (loop stopped before it)
+        self.assertIn("- [ ] t3", self.read("jarvis_todo.md"))
+
+    def test_under_cap_drains_queue_normally(self):
+        # cap high enough that 2 tasks ($3.50) stay under it -> normal drain.
+        self.write_todo("- [ ] t1\n- [ ] t2\n")
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_MAX_USD": "100"}), \
+             mock.patch.object(P, "run_pipeline_on_task",
+                               side_effect=self._ticking_task()):
+            rc, out = self._run_loop(max_iter=10, task_count=2)
+        self.assertEqual(rc, 0)
+        self.assertIn("queue empty", out)
+        self.assertNotIn("reached the", out)
+
+    def test_cap_disabled_with_zero_never_stops_on_budget(self):
+        # MAX_USD=0 disables the cap -> queue drains, no budget line printed.
+        self.write_todo("- [ ] t1\n- [ ] t2\n")
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_MAX_USD": "0"}), \
+             mock.patch.object(P, "run_pipeline_on_task",
+                               side_effect=self._ticking_task()):
+            rc, out = self._run_loop(max_iter=10, task_count=2)
+        self.assertEqual(rc, 0)
+        self.assertIn("budget cap: disabled", out)
+        self.assertNotIn("[budget] est. spend", out)
+
+    def test_spend_surfaced_in_logging(self):
+        self.write_todo("- [ ] t1\n")
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_MAX_USD": "100"}), \
+             mock.patch.object(P, "run_pipeline_on_task",
+                               side_effect=self._ticking_task()):
+            rc, out = self._run_loop(max_iter=10, task_count=1)
+        self.assertEqual(rc, 0)
+        # per-iteration spend line + final summary line both appear
+        self.assertIn("[budget] est. spend", out)
+        self.assertIn("Estimated spend this run", out)
+
+    def test_raised_task_still_draws_budget(self):
+        # run_pipeline_on_task raises (result=None) -> billed a full task, so a
+        # crash-looping pipeline still hits the cap and stops (rather than
+        # spinning free). cap $1.0 < full-task $1.75 -> stops after 1 iter.
+        self.write_todo("- [ ] t1\n- [ ] t2\n")
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_MAX_USD": "1.0"}), \
+             mock.patch.object(P, "run_pipeline_on_task",
+                               side_effect=RuntimeError("boom")):
+            rc, out = self._run_loop(max_iter=10, task_count=2)
+        self.assertEqual(rc, 4)
+        self.assertIn("reached the $1.00/run cap", out)
+
+
+# ──────────────────── refuse autonomous run w/ safety nets off ─────────────
+
+
+class LoopDriverRefuseUnsafeTests(LoopDriverBase):
+    """The loop driver REFUSES to start an AUTONOMOUS run when a safety-net
+    skip flag is set, unless --force-unsafe (or interactive=True) overrides."""
+
+    def _ticking_task(self):
+        def _on_task(task, **kw):
+            P._tick_task(task, "done")
+            return {"ok": True, "ticked": True, "stage_failed": None,
+                    "stages": {"planner": {}, "implementer": {}, "reviewer": {}}}
+        return _on_task
+
+    def test_refuses_autonomous_when_skip_tester_set(self):
+        self.write_todo("- [ ] t1\n")
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_SKIP_TESTER": "1"}), \
+             mock.patch.object(P, "run_pipeline_on_task") as on_task:
+            rc, out = self._run_loop(max_iter=5, task_count=1)
+        self.assertEqual(rc, 5)
+        self.assertIn("REFUSED", out)
+        # never dispatched a single task
+        on_task.assert_not_called()
+        # task left untouched
+        self.assertIn("- [ ] t1", self.read("jarvis_todo.md"))
+
+    def test_refuses_autonomous_when_stability_gate_disabled(self):
+        self.write_todo("- [ ] t1\n")
+        with mock.patch.dict(os.environ, {"STABILITY_GATE_DISABLE": "1"}), \
+             mock.patch.object(P, "run_pipeline_on_task") as on_task:
+            rc, out = self._run_loop(max_iter=5, task_count=1)
+        self.assertEqual(rc, 5)
+        self.assertIn("stability gate", out)
+        on_task.assert_not_called()
+
+    def test_refuses_autonomous_when_skip_suite_set(self):
+        self.write_todo("- [ ] t1\n")
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_SKIP_SUITE": "1"}), \
+             mock.patch.object(P, "run_pipeline_on_task") as on_task:
+            rc, out = self._run_loop(max_iter=5, task_count=1)
+        self.assertEqual(rc, 5)
+        on_task.assert_not_called()
+
+    def test_force_unsafe_argv_allows_autonomous_run(self):
+        # the explicit ack lets the autonomous run proceed despite the flag.
+        self.write_todo("- [ ] t1\n")
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_SKIP_TESTER": "1"}), \
+             mock.patch.object(P, "run_pipeline_on_task",
+                               side_effect=self._ticking_task()):
+            rc, out = self._run_loop(max_iter=5, task_count=1,
+                                     argv=["prog", "--force-unsafe"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("REFUSED", out)
+        self.assertIn("queue empty", out)
+
+    def test_force_unsafe_env_allows_autonomous_run(self):
+        self.write_todo("- [ ] t1\n")
+        with mock.patch.dict(os.environ, {
+                "JARVIS_PIPELINE_SKIP_TESTER": "1",
+                "JARVIS_PIPELINE_FORCE_UNSAFE": "1"}), \
+             mock.patch.object(P, "run_pipeline_on_task",
+                               side_effect=self._ticking_task()):
+            rc, out = self._run_loop(max_iter=5, task_count=1)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("REFUSED", out)
+
+    def test_interactive_run_allowed_with_flag_set(self):
+        # A human-attended (interactive=True) run may use the skip flags.
+        self.write_todo("- [ ] t1\n")
+        log = os.path.join(self.tmp, "stream.log")
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_SKIP_TESTER": "1"}), \
+             mock.patch.object(P, "run_pipeline_on_task",
+                               side_effect=self._ticking_task()), \
+             mock.patch.object(sys, "argv", ["prog"]):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = P.run_pipeline_loop_driver(
+                    project_dir=self.tmp, claude_path="/c", stream_log=log,
+                    max_iter=5, task_count=1, interactive=True)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("REFUSED", buf.getvalue())
+
+    def test_no_flags_set_autonomous_proceeds(self):
+        # Sanity: with no skip flags, an autonomous run is NOT refused.
+        self.write_todo("- [ ] t1\n")
+        with mock.patch.object(P, "run_pipeline_on_task",
+                               side_effect=self._ticking_task()):
+            rc, out = self._run_loop(max_iter=5, task_count=1)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("REFUSED", out)
+
+    def test_refusal_is_logged_to_pipeline_jsonl(self):
+        self.write_todo("- [ ] t1\n")
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_SKIP_SUITE": "1"}), \
+             mock.patch.object(P, "run_pipeline_on_task"):
+            self._run_loop(max_iter=5, task_count=1)
+        log_text = self.read(os.path.join("data", "pipeline_runs.jsonl"))
+        recs = [json.loads(x) for x in log_text.splitlines() if x.strip()]
+        refused = [r for r in recs if r.get("stage") == "refused-unsafe"]
+        self.assertEqual(len(refused), 1)
+        self.assertIn("skip_flags", refused[0])
+
+
 # ──────────────────────────── CLI / discovery ─────────────────────────────
 
 
@@ -1777,6 +2151,110 @@ class CliTests(_PipeBase):
             buf = io.StringIO()
             with redirect_stdout(buf), mock.patch.object(sys, "stderr", buf):
                 P._cli([])
+
+
+class SafetyGateTests(_OrchBase):
+    """The risk-score gate (between stages 3 and 4) and the unit-suite
+    correctness gate (after stage 4) that make self-upgrade fail safely."""
+
+    def test_high_risk_approve_is_escalated_to_rollback(self):
+        # approve_with_warnings but risk_score 9 (>= default threshold 7) must
+        # roll back instead of shipping — and must never reach the tester.
+        lines = []
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_MAX_RISK": "7"}), \
+             mock.patch.object(P, "_run_planner", return_value=self.PLAN), \
+             mock.patch.object(P, "_run_implementer",
+                               side_effect=self._emit_implementer_change()), \
+             mock.patch.object(P, "_run_reviewer",
+                               return_value={"verdict": "approve_with_warnings",
+                                             "risk_score": 9,
+                                             "concerns": ["touches the loop"]}), \
+             mock.patch.object(P, "_run_tester") as tester, \
+             mock.patch.object(P, "_kill_jarvis", return_value=0):
+            res = P.run_pipeline_on_task(self.TASK, claude_path="/c",
+                                         project_dir=self.tmp, emit=lines.append)
+        tester.assert_not_called()
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["stage_failed"], "reviewer")
+        self.assertEqual(self.read("skills/feature.py"), "original body\n")
+        self.assertIn("[regression]", self.read("jarvis_todo.md"))
+        self.assertIn("safety threshold", "\n".join(lines))
+
+    def test_risk_just_below_threshold_proceeds(self):
+        # risk_score 6 (< 7) is allowed through to the tester and ticks.
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_MAX_RISK": "7"}), \
+             mock.patch.object(P, "_run_planner", return_value=self.PLAN), \
+             mock.patch.object(P, "_run_implementer",
+                               side_effect=self._emit_implementer_change()), \
+             mock.patch.object(P, "_run_reviewer",
+                               return_value={"verdict": "approve_with_warnings",
+                                             "risk_score": 6, "concerns": []}), \
+             mock.patch.object(P, "_run_tester",
+                               return_value={"ok": True, "rc": 0}), \
+             mock.patch.object(P, "_kill_jarvis", return_value=0):
+            res = P.run_pipeline_on_task(self.TASK, claude_path="/c",
+                                         project_dir=self.tmp, emit=self.emit)
+        self.assertTrue(res["ticked"])
+
+    def test_custom_threshold_blocks_lower_risk(self):
+        # lower the bar to 5: a risk-6 approve now blocks.
+        with mock.patch.dict(os.environ, {"JARVIS_PIPELINE_MAX_RISK": "5"}), \
+             mock.patch.object(P, "_run_planner", return_value=self.PLAN), \
+             mock.patch.object(P, "_run_implementer",
+                               side_effect=self._emit_implementer_change()), \
+             mock.patch.object(P, "_run_reviewer",
+                               return_value={"verdict": "approve",
+                                             "risk_score": 6, "concerns": []}), \
+             mock.patch.object(P, "_run_tester") as tester, \
+             mock.patch.object(P, "_kill_jarvis", return_value=0):
+            res = P.run_pipeline_on_task(self.TASK, claude_path="/c",
+                                         project_dir=self.tmp, emit=self.emit)
+        tester.assert_not_called()
+        self.assertEqual(res["stage_failed"], "reviewer")
+        self.assertEqual(self.read("skills/feature.py"), "original body\n")
+
+    def test_correctness_gate_failure_rolls_back(self):
+        # tester passes (JARVIS boots) but the unit suite fails -> rollback.
+        with mock.patch.object(P, "_run_planner", return_value=self.PLAN), \
+             mock.patch.object(P, "_run_implementer",
+                               side_effect=self._emit_implementer_change()), \
+             mock.patch.object(P, "_run_reviewer",
+                               return_value={"verdict": "approve",
+                                             "risk_score": 1, "concerns": []}), \
+             mock.patch.object(P, "_run_tester",
+                               return_value={"ok": True, "rc": 0}), \
+             mock.patch.object(P, "_run_test_suite",
+                               return_value={"ok": False, "skipped": False,
+                                             "summary": "TESTS: 90 run, 4 failed"}), \
+             mock.patch.object(P, "_kill_jarvis", return_value=0):
+            res = P.run_pipeline_on_task(self.TASK, claude_path="/c",
+                                         project_dir=self.tmp, emit=self.emit)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["stage_failed"], "test-suite")
+        self.assertEqual(self.read("skills/feature.py"), "original body\n")
+        todo = self.read("jarvis_todo.md")
+        self.assertIn("[regression]", todo)
+        self.assertIn("4 failed", todo)
+        self.assertIn(f"- [ ] {self.TASK}", todo)   # NOT ticked
+
+    def test_correctness_gate_pass_ticks(self):
+        with mock.patch.object(P, "_run_planner", return_value=self.PLAN), \
+             mock.patch.object(P, "_run_implementer",
+                               side_effect=self._emit_implementer_change()), \
+             mock.patch.object(P, "_run_reviewer",
+                               return_value={"verdict": "approve",
+                                             "risk_score": 1, "concerns": []}), \
+             mock.patch.object(P, "_run_tester",
+                               return_value={"ok": True, "rc": 0}), \
+             mock.patch.object(P, "_run_test_suite",
+                               return_value={"ok": True, "skipped": False,
+                                             "summary": "TESTS: 90 run, 0 failed"}), \
+             mock.patch.object(P, "_kill_jarvis", return_value=0):
+            res = P.run_pipeline_on_task(self.TASK, claude_path="/c",
+                                         project_dir=self.tmp, emit=self.emit)
+        self.assertTrue(res["ticked"])
+        self.assertEqual(self.read("skills/feature.py"),
+                         "NEW body from implementer\n")
 
 
 if __name__ == "__main__":
