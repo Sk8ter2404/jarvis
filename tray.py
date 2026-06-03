@@ -109,6 +109,16 @@ ASSETS_DIR         = os.path.join(PROJECT_DIR, "assets")
 DEFAULT_ICON_PATH  = os.path.join(ASSETS_DIR, "jarvis_icon.png")
 DATA_DIR           = os.path.join(PROJECT_DIR, "data")
 CHANGELOG_FILE     = os.path.join(PROJECT_DIR, "CHANGELOG.md")
+# Two DIFFERENT version sources — keeping them straight is what stops the
+# About dialog from disagreeing with GitHub:
+#   • RELEASE_VERSION_FILE — the top-level VERSION file: the shareable release
+#     string that also backs core/version.py, the git tag and the GitHub
+#     release. This is the PRIMARY "Version:" line the user sees.
+#   • VERSION_FILE (data/version.json) — the self-upgrade pipeline's INTERNAL
+#     counter, bumped a patch every overnight run (e.g. 1.0.17). Shown only as
+#     a clearly-labelled "Upgrade build" so it can't be mistaken for the
+#     release version.
+RELEASE_VERSION_FILE = os.path.join(PROJECT_DIR, "VERSION")
 VERSION_FILE       = os.path.join(DATA_DIR, "version.json")
 INSTANCES_FILE     = os.path.join(DATA_DIR, "instances.json")
 PIPELINE_LOCK_FILE = os.path.join(PROJECT_DIR, "pipeline_lock.json")
@@ -907,6 +917,20 @@ def _on_settings_advanced(icon, item):
 
 # ── About dialog ────────────────────────────────────────────────────────
 
+def _read_release_version() -> str:
+    """The shareable RELEASE version — single source of truth (top-level
+    VERSION file) that also backs core/version.py, the git tag and the GitHub
+    release. Kept SEPARATE from the self-upgrade pipeline's CHANGELOG counter
+    below so the About dialog's primary 'Version:' line always matches what
+    GitHub shows. Returns 'unknown' if the file is missing (defensive only —
+    VERSION is tracked, so a real checkout always has it)."""
+    try:
+        with open(RELEASE_VERSION_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
 def _read_version_and_upgrade() -> tuple[str, str]:
     """Parse CHANGELOG.md for the latest version + timestamp.
 
@@ -987,18 +1011,29 @@ def _format_uptime(seconds: float) -> str:
 
 
 def _about_lines() -> list[str]:
-    version, upgrade_at = _read_version_and_upgrade()
+    release = _read_release_version()
+    build, upgrade_at = _read_version_and_upgrade()
     uptime = _format_uptime(_read_uptime_seconds())
-    return [
+    lines = [
         "J.A.R.V.I.S.",
         "",
-        f"Version:      {version}",
-        f"Last upgrade: {upgrade_at}",
-        f"Uptime:       {uptime}",
+        f"Version:       {release}",      # matches GitHub + the git tag
+    ]
+    # The self-upgrade pipeline's internal counter (e.g. v1.0.17) + its
+    # timestamp — shown only when there's real upgrade history AND it differs
+    # from the release version. A fresh clone (no pipeline runs) just shows the
+    # release version, never a confusing 'Upgrade build: unknown'.
+    if build and build not in ("unknown", release, f"v{release}"):
+        lines.append(f"Upgrade build: {build}")
+    if upgrade_at and upgrade_at != "unknown":
+        lines.append(f"Last upgrade:  {upgrade_at}")
+    lines += [
+        f"Uptime:        {uptime}",
         "",
         "Personal AI assistant.",
         "Right-click the tray icon for the full menu.",
     ]
+    return lines
 
 
 def _run_about_dialog() -> int:
