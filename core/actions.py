@@ -1100,6 +1100,16 @@ def _act_version_info(_: str = "") -> str:
         return f"could not read version info: {e}"
 
 
+def _act_check_for_updates(_: str = "") -> str:
+    """Check GitHub for a NEWER published release and report it conversationally.
+
+    Delegates to core.update_checker, which is total (never raises) and degrades
+    gracefully when there's no GitHub token or no network — so this action always
+    returns a sentence, never an error."""
+    from core import update_checker as uc
+    return uc.update_message(uc.check_for_update())
+
+
 # ─── Smoke test + skills selftest (Phase 4G) ───────────────────────────
 
 def _act_run_smoke_test(_: str = "") -> str:
@@ -2384,6 +2394,7 @@ __all__ = [
     "_act_reset_memory",
     # Phase 4G — version + smoke test + selftest + memory forget + latency
     "_act_version_info",
+    "_act_check_for_updates",
     "_act_run_smoke_test",
     "_act_test_each_skill",
     "_act_forget_last_hour",

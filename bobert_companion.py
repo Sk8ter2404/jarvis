@@ -3805,6 +3805,24 @@ def proactive_announce(message: str, source: str = "skill",
         _pending_speech_lock.release()
 
 
+def _update_check_thread():
+    """Background, throttled once-per-day update check. Sleeps briefly so it
+    doesn't compete with the boot bring-up, then asks core.update_checker to
+    compare this build to the latest GitHub release and, if a newer one exists,
+    queue ONE spoken nudge via proactive_announce. Best-effort + total — any
+    failure is swallowed so it can never affect the main loop. Started from
+    main() (skipped in staging)."""
+    try:
+        time.sleep(45)  # let whisper load + the boot greeting finish first
+        from core import update_checker as _uc
+        _uc.boot_nudge(
+            lambda m: proactive_announce(m, source="update_check"),
+            enabled=UPDATE_CHECK_ENABLED,
+        )
+    except Exception as e:  # pragma: no cover - defensive; boot_nudge is total
+        print(f"  [update_check] skipped: {e}")
+
+
 def _enqueue_device_announcement(message: str) -> None:
     """Audio-device change notifier. Thin wrapper around proactive_announce()
     so the device-change call site keeps its dedicated `[audio]` log tag for
@@ -10152,6 +10170,10 @@ ACTIONS = {
     "version_info":    _act_version_info,
     "what_version":    _act_version_info,
     "when_updated":    _act_version_info,
+    # Update awareness — compare the running build to the latest GitHub release
+    "check_for_updates":  _act_check_for_updates,
+    "check_updates":      _act_check_for_updates,
+    "is_there_an_update": _act_check_for_updates,
     # Tray Power Tools submenu — these were silently dropping with
     # "unknown command" until round5-H-2 wired them in. Every handler is
     # defined just above this dict; the destructive ones (force_backup,
@@ -14320,6 +14342,11 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     # docstring + the 2026-05-30 audit finding).
     threading.Thread(target=_session_summary_checkpoint_thread,
                      daemon=True).start()
+
+    # Background, once-per-day check against the latest GitHub release; queues a
+    # single spoken nudge if a newer version is published. Skipped in staging.
+    if UPDATE_CHECK_ENABLED and not _is_staging():
+        threading.Thread(target=_update_check_thread, daemon=True).start()
 
     print("─" * 60)
     print("Press Ctrl-C to quit (session will be summarised to memory).\n")
