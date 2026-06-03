@@ -780,7 +780,11 @@ class PrintPhraseTests(unittest.TestCase):
 
     def test_no_last_update_returns_empty(self):
         st = {"gcode_state": "RUNNING", "mc_percent": 10}  # no last_update
-        with mock.patch.object(self.mod, "_import_skill", return_value=self._bm(st)):
+        # Without last_update the function falls back to bambu_overlay_state.json
+        # on disk — on a live box that real runtime file exists (a real finished
+        # print), so stub it away to keep the test hermetic regardless of host.
+        with mock.patch.object(self.mod, "_import_skill", return_value=self._bm(st)), \
+             mock.patch.object(self.mod.os.path, "exists", return_value=False):
             self.assertEqual(self.mod._section_print_phrase(), "")
 
     def test_disk_overlay_fallback_when_inprocess_empty(self):

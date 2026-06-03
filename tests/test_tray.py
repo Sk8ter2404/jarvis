@@ -271,7 +271,8 @@ class TrayTestBase(unittest.TestCase):
     _PATH_ATTRS = (
         "PROJECT_DIR", "HUD_STATE_FILE", "TRAY_COMMANDS_FILE", "TODO_FILE",
         "LOGS_DIR", "ASSETS_DIR", "DEFAULT_ICON_PATH", "DATA_DIR",
-        "CHANGELOG_FILE", "VERSION_FILE", "INSTANCES_FILE", "PIPELINE_LOCK_FILE",
+        "CHANGELOG_FILE", "RELEASE_VERSION_FILE", "VERSION_FILE",
+        "INSTANCES_FILE", "PIPELINE_LOCK_FILE",
         "OVERNIGHT_FLAG", "MEMORY_FACTS_FILE", "SETTINGS_WINDOW", "SHOW_LOG_PS1",
         "HUD_SCRIPT",
     )
@@ -1678,14 +1679,53 @@ class VersionAndUptimeTests(TrayTestBase):
         self.assertEqual(tray._format_uptime(90061), "1d 1h 1m")
         self.assertEqual(tray._format_uptime(-50), "0m")
 
+    # -- release version (single source == GitHub) --------------------------
+    def test_release_version_read_from_version_file(self):
+        self._write(tray.RELEASE_VERSION_FILE, "1.0.0-beta.1\n")
+        self.assertEqual(tray._read_release_version(), "1.0.0-beta.1")
+
+    def test_release_version_unknown_when_missing(self):
+        # VERSION file absent (temp dir) -> defensive 'unknown'.
+        self.assertEqual(tray._read_release_version(), "unknown")
+
+    def test_release_version_blank_file_is_unknown(self):
+        self._write(tray.RELEASE_VERSION_FILE, "   \n")
+        self.assertEqual(tray._read_release_version(), "unknown")
+
     def test_about_lines_structure(self):
+        # PRIMARY 'Version:' line is the RELEASE version (== GitHub + git tag),
+        # NOT the self-upgrade pipeline's CHANGELOG counter — that's the drift
+        # the user caught (tray said v1.0.17, GitHub said 1.0.0-beta.1).
+        self._write(tray.RELEASE_VERSION_FILE, "1.0.0-beta.1\n")
         self._write(tray.CHANGELOG_FILE, "## v2.0.0 — 2026-06-01 10:00\n")
         lines = tray._about_lines()
         self.assertEqual(lines[0], "J.A.R.V.I.S.")
         joined = "\n".join(lines)
-        self.assertIn("Version:", joined)
-        self.assertIn("v2.0.0", joined)
+        self.assertIn("Version:       1.0.0-beta.1", joined)
+        # The pipeline counter is still surfaced, but clearly RELABELLED so it
+        # can't be mistaken for the release version.
+        self.assertIn("Upgrade build: v2.0.0", joined)
         self.assertIn("Uptime:", joined)
+        # The pipeline counter must NOT appear on the primary Version line.
+        self.assertNotIn("Version:       v2.0.0", joined)
+
+    def test_about_lines_fresh_clone_hides_pipeline_build(self):
+        # A fresh share has the tracked VERSION file but no pipeline history
+        # (data/ + CHANGELOG upgrade entries are gitignored / absent), so the
+        # build + last-upgrade lines are hidden — no confusing 'unknown'.
+        self._write(tray.RELEASE_VERSION_FILE, "1.0.0-beta.1\n")
+        joined = "\n".join(tray._about_lines())
+        self.assertIn("Version:       1.0.0-beta.1", joined)
+        self.assertNotIn("Upgrade build", joined)
+        self.assertNotIn("Last upgrade", joined)
+
+    def test_about_lines_build_hidden_when_equal_to_release(self):
+        # If the CHANGELOG top entry == the release version, don't show a
+        # redundant 'Upgrade build' line (matches with or without a 'v').
+        self._write(tray.RELEASE_VERSION_FILE, "1.0.0-beta.1\n")
+        self._write(tray.CHANGELOG_FILE, "## v1.0.0-beta.1 — 2026-06-01 10:00\n")
+        joined = "\n".join(tray._about_lines())
+        self.assertNotIn("Upgrade build", joined)
 
 
 # --------------------------------------------------------------------------- #
