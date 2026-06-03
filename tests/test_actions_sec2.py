@@ -129,11 +129,13 @@ class _BaseActTest(unittest.TestCase):
 
 # ── _act_switch_llm_picker / _act_show_llm_stats ─────────────────────────────
 class LLMMenuTests(_BaseActTest):
-    def test_switch_llm_picker_lists_presets(self):
+    def test_switch_llm_picker_lists_models_with_costs(self):
         out = A._act_switch_llm_picker("")
-        self.assertIn("not yet implemented", out)
-        for preset in ("claude", "qwen2.5:14b", "llama3.1:8b"):
-            self.assertIn(preset, out)
+        # now lists the priced model options + a switch hint (was a stub)
+        for label in ("Claude Haiku", "Claude Sonnet", "Claude Opus", "Qwen"):
+            self.assertIn(label, out)
+        self.assertIn("/conv", out)        # cost-per-conversation shown
+        self.assertIn("switch to", out)
 
     def test_show_llm_stats_claude_backend(self):
         with mock.patch("core.config.AI_BACKEND", "claude"), \

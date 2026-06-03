@@ -376,24 +376,37 @@ def _act_restart(_: str = "") -> str:
 # ─── LLM picker stubs (Phase 4C) ───────────────────────────────────────
 
 def _act_switch_llm_picker(_: str = "") -> str:
-    """The tray menu's 'Other...' entry. A full Tk picker isn't wired up
-    yet; surface the available presets so the user can click one
-    directly from the LLM submenu."""
-    presets = ["claude", "qwen2.5:14b", "llama3.1:8b"]
-    return ("LLM picker dialog not yet implemented. "
-            f"Use the Switch LLM submenu — presets: {', '.join(presets)}")
+    """The tray menu's 'Other...' entry — list the model options with their
+    estimated cost PER CONVERSATION so the user can pick how fast it burns
+    credit, then switch via the AI submenu / 'switch to <model>'."""
+    from core import model_catalog
+    return (model_catalog.format_catalog()
+            + "\nSwitch via the AI submenu, or say 'switch to haiku / sonnet / "
+              "opus / local'.")
+
+
+def _act_model_costs(_: str = "") -> str:
+    """Report every model option + its estimated cost per conversation, so the
+    user can choose how fast it burns through credit ('what does each model
+    cost', 'how much does each model burn', 'model prices', 'compare models')."""
+    from core import model_catalog
+    return model_catalog.format_catalog()
 
 
 def _act_show_llm_stats(_: str = "") -> str:
-    """Quick summary of which backend + model are active. Per-call
-    counters would need infrastructure that doesn't exist yet; this is
-    the honest minimum so the menu entry stops printing
-    'unknown command'."""
-    # Pulls constants directly from core.config — they live in the
-    # same module as us, no late-bind needed.
+    """The active backend + model, with an estimated cost per conversation for
+    the current model (from core.model_catalog)."""
     from core.config import AI_BACKEND, CLAUDE_MODEL, OLLAMA_MODEL
+    from core import model_catalog
     model = CLAUDE_MODEL if AI_BACKEND == "claude" else OLLAMA_MODEL
-    return f"backend={AI_BACKEND}  model={model}  (per-call stats not tracked yet)"
+    entry = model_catalog.by_id(model)
+    if entry is not None:
+        c = entry.cost_per_conversation()
+        cost = "$0 (local)" if c <= 0 else f"~${c:.2f}/conv"
+        return (f"backend={AI_BACKEND}  model={model}  est. {cost} ({entry.tier})."
+                f" Say 'model costs' to compare the options.")
+    return (f"backend={AI_BACKEND}  model={model}  "
+            f"(not in the cost catalog — say 'model costs' for priced options).")
 
 
 # ─── UI automation primitives (Phase 4C) ───────────────────────────────
@@ -2346,6 +2359,7 @@ __all__ = [
     # Phase 4C — LLM picker stubs
     "_act_switch_llm_picker",
     "_act_show_llm_stats",
+    "_act_model_costs",
     # Phase 4C — UI primitives
     "_act_press",
     "_act_scroll",
