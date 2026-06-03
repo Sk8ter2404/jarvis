@@ -10187,6 +10187,11 @@ ACTIONS = {
     "switch_llm":         _act_switch_llm,
     "switch_llm_picker":  _act_switch_llm_picker,
     "show_llm_stats":     _act_show_llm_stats,
+    # Model cost transparency — list models + estimated cost per conversation
+    "model_costs":        _act_model_costs,
+    "llm_costs":          _act_model_costs,
+    "model_prices":       _act_model_costs,
+    "compare_models":     _act_model_costs,
     "clear_llm_cache":    _act_clear_llm_cache,
     # Memory submenu
     "show_recent_facts":  _act_show_recent_facts,
