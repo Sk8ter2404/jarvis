@@ -69,7 +69,7 @@ import re
 import threading
 import time
 import uuid
-from typing import Any, Callable, Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 from core.atomic_io import _atomic_write_json
 

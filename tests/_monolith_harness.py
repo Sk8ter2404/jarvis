@@ -139,6 +139,14 @@ _MONOLITH_RESTORE_NAMES = (
     "_audio_aec_enabled", "_audio_ns_enabled", "_audio_agc_enabled",
     "_jarvis_played_music_at", "_ambient_music_last_hit", "_ambient_music_hits",
     "_session_resume_done", "_main_loop_heartbeat",
+    # ── voice fast-path latches (bobert_companion-local single-element lists) ─
+    # Reset to [None]/[False] so a wake detector built (or a disable-latch
+    # tripped) in one test can't bleed into the next. (tests/monolith/
+    # test_monolith_voice_wiring.py also resets these locally; this makes the
+    # heal global.) NOTE: a clean latch does NOT guarantee _standby_wake_detected
+    # returns None — on a host with WAKE_WORD_AUTOSTART on it rebuilds a real
+    # detector, so tests wanting the Whisper branch must still mock it.
+    "_standby_wake_detector", "_standby_wake_disabled_for_session",
     # ── tray / action-dispatch queues + bookkeeping ────────────────────────
     "_pending_confirmation", "_pending_autocorrect_choice",
     "_action_error_log", "_action_history",
