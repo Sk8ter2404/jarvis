@@ -268,24 +268,45 @@ def cached_check(ttl_hours: float = 24.0, timeout: float = 6.0,
 def boot_nudge(announce, ttl_hours: float = 24.0, enabled: bool = True,
                path: Optional[str] = None,
                now: Optional[float] = None) -> Optional[dict]:
-    """Throttled boot check that speaks ONE nudge when a newer release exists.
+    """Throttled boot check that speaks ONE nudge per newer release.
 
     ``announce`` is a ``callable(str) -> Any`` — the monolith passes a wrapper
     around ``proactive_announce`` so the message lands in the pending-speech
     queue and the main loop speaks it at the next turn boundary. Total: any
     error (including a raising ``announce``) is swallowed so the boot path is
-    never affected. Returns the check result, or None when disabled/errored."""
+    never affected. Returns the check result, or None when disabled/errored.
+
+    "ONE nudge" is per *version*, not per process: the latest tag we've already
+    spoken for is persisted as ``nudged_for`` in the cache. Without it the same
+    "a new version is available" line would be re-announced on EVERY restart for
+    the whole 24h cache window — a user who restarts several times a day would
+    hear it every boot. With it, the nudge speaks once per ``latest`` tag; only
+    a genuinely newer release announces again."""
     if not enabled:
         return None
+    p = path or default_cache_path()
+    # The tag we last announced, read BEFORE cached_check runs — a TTL-expiry
+    # re-fetch rewrites the cache with a fresh result that carries no
+    # ``nudged_for``, so the prior value must be captured first.
+    nudged_for = (read_cache(p) or {}).get("nudged_for")
     try:
-        res = cached_check(ttl_hours=ttl_hours, path=path, now=now)
+        res = cached_check(ttl_hours=ttl_hours, path=p, now=now)
     except Exception:
         return None
     if res.get("update_available"):
-        try:
-            announce(update_message(res))
-        except Exception:
-            pass
+        latest = res.get("latest")
+        if latest != nudged_for:
+            try:
+                announce(update_message(res))
+            except Exception:
+                pass
+        # (Re)stamp the announced tag onto whatever cached_check just wrote so
+        # this version stays silent on later boots — within the TTL and across
+        # the next re-fetch alike. Best-effort: read_cache/write_cache never
+        # raise, so the boot path is unaffected if the write fails.
+        stamped = read_cache(p) or {}
+        stamped["nudged_for"] = latest
+        write_cache(p, stamped)
     return res
 
 
