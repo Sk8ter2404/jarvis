@@ -153,17 +153,22 @@ SCHEMA: dict[str, dict] = {
     "AI_BACKEND": {
         "tab": "ai", "label": "Primary AI backend", "type": "enum",
         "choices": ["claude", "ollama"], "default": "claude",
-        "help": "claude = prefer cloud; ollama = local-only baseline.",
+        "help": "claude = prefer cloud (paid — see per-conversation cost on the "
+                "model below); ollama = local-only baseline, $0 per conversation.",
     },
     "CLAUDE_MODEL": {
-        "tab": "ai", "label": "Claude model", "type": "str",
+        "tab": "ai", "label": "Claude model", "type": "enum",
+        "choices": ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-6"],
         "default": "claude-sonnet-4-6",
-        "help": "Cloud model id used when Claude is reachable.",
+        "help": "Cloud model + est. cost PER CONVERSATION: Haiku ~$0.02, "
+                "Sonnet ~$0.06, Opus ~$0.29. (Local Ollama is $0 — set the "
+                "backend above to ollama.)",
     },
     "LOCAL_LLM_MODEL": {
-        "tab": "ai", "label": "Local LLM model", "type": "str",
+        "tab": "ai", "label": "Local LLM model (Ollama, $0)", "type": "str",
         "default": "qwen2.5:14b-instruct-q5_K_M",
-        "help": "Ollama tag for the always-on local brain.",
+        "help": "Ollama tag for the always-on local brain — $0 per conversation. "
+                "e.g. qwen2.5:14b-instruct-q5_K_M, llama3.1:8b.",
     },
     "CLAUDE_OPTIONAL": {
         "tab": "ai", "label": "Claude is optional (never required)",
