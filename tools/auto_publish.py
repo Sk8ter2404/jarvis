@@ -103,11 +103,20 @@ def _token() -> Optional[str]:
     return None
 
 
+def _pr_head(branch: str) -> str:
+    """The PR 'head' ref. A contributor running their OWN JARVIS instance pushes
+    to their FORK and sets JARVIS_GITHUB_HEAD_OWNER to their GitHub username, so
+    the PR opens cross-fork (`youruser:branch`) against the upstream repo
+    (JARVIS_GITHUB_OWNER/REPO). Unset → same-repo (`branch`), the owner's case."""
+    owner = os.environ.get("JARVIS_GITHUB_HEAD_OWNER", "").strip()
+    return f"{owner}:{branch}" if owner else branch
+
+
 def _default_poster(branch: str, title: str, body: str) -> Optional[str]:  # pragma: no cover - real network
     tok = _token()
     if not tok:
         return None
-    payload = json.dumps({"title": title, "head": branch, "base": _BASE,
+    payload = json.dumps({"title": title, "head": _pr_head(branch), "base": _BASE,
                           "body": body}).encode("utf-8")
     req = urllib.request.Request(
         f"https://api.github.com/repos/{_OWNER}/{_REPO}/pulls",
