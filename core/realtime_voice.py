@@ -435,12 +435,24 @@ class RealtimeVoicePipeline:
             print(f"  [realtime-voice] RealtimeSTT import failed: {e}")
             return False
 
+        # The realtime partial-transcription pass runs a SECOND Whisper model
+        # CONTINUOUSLY while you speak. Without these three knobs it defaults to
+        # the heavy main model on the CPU and re-infers as fast as the loop
+        # allows — a pegged core even on a GPU box. Force a tiny model, a
+        # throttle, and the configured device (the 3090 via WHISPER_DEVICE).
+        try:
+            from core.config import WHISPER_DEVICE as _stt_device
+        except Exception:  # pragma: no cover - core.config is always importable
+            _stt_device = "cuda"
         kwargs = dict(
             model=self.stt_model,
             language=self.stt_language,
             spinner=False,
             use_microphone=True,
             enable_realtime_transcription=True,
+            realtime_model_type="tiny",
+            realtime_processing_pause=0.2,
+            device=_stt_device,
             on_realtime_transcription_update=self._on_partial,
             on_realtime_transcription_stabilized=self._on_partial,
             on_recording_start=self._on_recording_start,
@@ -487,9 +499,10 @@ class RealtimeVoicePipeline:
                 continue
             if not text or not text.strip():
                 # Some RealtimeSTT builds return empty immediately when no
-                # utterance is ready; sleep briefly so this path can't
-                # busy-spin and peg a core.
-                time.sleep(0.05)
+                # utterance is ready; sleep so this path can't busy-spin and
+                # peg a core (0.2s is plenty — finalised text isn't latency-
+                # critical, the live partials come via the realtime callback).
+                time.sleep(0.2)
                 continue
             self._last_utterance = text
             self._last_utterance_ts = time.time()
