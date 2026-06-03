@@ -124,6 +124,35 @@ def record_bug(kind: str, summary: str, *, detail: str = "", tb: str = "",
     return rep
 
 
+# Rate-limiter state for SELF-detected reports: signature -> last unix time.
+_recent_auto: Dict[str, float] = {}
+
+
+def auto_capture(exc: BaseException, *, where: str = "",
+                 context: Optional[Dict[str, Any]] = None,
+                 now: Optional[float] = None, window: float = 300.0,
+                 outbox: str = _OUTBOX) -> Optional[Dict[str, Any]]:
+    """Rate-limited SELF-detect capture. Build a scrubbed 'auto' report and
+    record it to the outbox — UNLESS the same (exception-type, where) pair was
+    already recorded within `window` seconds, so a recurring error can't spam
+    the outbox. Returns the report, or None when suppressed.
+
+    NEVER raises: a self-reporter that crashes the very thing it is reporting on
+    would be worse than the original bug, so every failure path returns None."""
+    try:
+        t = now if now is not None else time.time()
+        sig = f"{type(exc).__name__}|{where}"
+        last = _recent_auto.get(sig)
+        if last is not None and (t - last) < window:
+            return None
+        _recent_auto[sig] = t
+        rep = capture_exception(exc, where=where, context=context)
+        append_outbox(rep, outbox)
+        return rep
+    except Exception:  # pragma: no cover - the reporter must never raise
+        return None
+
+
 def format_issue(report: Dict[str, Any]) -> Tuple[str, str]:
     """Render a report as a (title, markdown-body) GitHub issue."""
     kind = report.get("kind", "user")

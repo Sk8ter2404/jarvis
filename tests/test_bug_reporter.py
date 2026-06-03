@@ -184,6 +184,60 @@ class FormatAndUrlTests(unittest.TestCase):
         self.assertIn("Hello+world", url)
 
 
+class AutoCaptureTests(unittest.TestCase):
+    """The rate-limited self-detect path."""
+
+    def setUp(self):
+        bug_reporter._recent_auto.clear()
+        self.d = tempfile.mkdtemp()
+        self.path = os.path.join(self.d, "bugs.jsonl")
+
+    def _exc(self, msg="boom"):
+        try:
+            raise ValueError(msg)
+        except ValueError as e:
+            return e
+
+    def test_first_capture_records(self):
+        rep = bug_reporter.auto_capture(self._exc(), where="dispatch",
+                                        now=100.0, outbox=self.path)
+        self.assertIsNotNone(rep)
+        self.assertEqual(rep["kind"], "auto")
+        self.assertTrue(os.path.exists(self.path))
+
+    def test_duplicate_within_window_suppressed(self):
+        bug_reporter.auto_capture(self._exc(), where="dispatch", now=100.0,
+                                  outbox=self.path)
+        dup = bug_reporter.auto_capture(self._exc(), where="dispatch", now=200.0,
+                                        outbox=self.path)
+        self.assertIsNone(dup)
+
+    def test_after_window_records_again(self):
+        bug_reporter.auto_capture(self._exc(), where="dispatch", now=100.0,
+                                  outbox=self.path)
+        again = bug_reporter.auto_capture(self._exc(), where="dispatch",
+                                          now=500.0, outbox=self.path)
+        self.assertIsNotNone(again)
+
+    def test_different_where_not_suppressed(self):
+        a = bug_reporter.auto_capture(self._exc(), where="a", now=100.0,
+                                      outbox=self.path)
+        b = bug_reporter.auto_capture(self._exc(), where="b", now=100.0,
+                                      outbox=self.path)
+        self.assertIsNotNone(a)
+        self.assertIsNotNone(b)
+
+    def test_report_is_scrubbed(self):
+        rep = bug_reporter.auto_capture(self._exc("fail at a@b.com"),
+                                        where="x", now=100.0, outbox=self.path)
+        self.assertIn("<EMAIL>", rep["summary"])
+
+    def test_default_now_uses_clock(self):
+        rep = bug_reporter.auto_capture(self._exc(), where="clock",
+                                        outbox=self.path)
+        self.assertIsNotNone(rep)
+
+
 class ReportBugActionTests(unittest.TestCase):
     """The core.actions surface (_act_report_bug) — light tier, no monolith boot."""
 

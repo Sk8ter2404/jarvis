@@ -11646,6 +11646,16 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             except Exception:
                 _tb = ""
             record_action_error(name, e, _tb)
+            # Self-detect bug report: a SCRUBBED, rate-limited record of the
+            # exception written to the LOCAL outbox (core.bug_reporter). Local
+            # only here — submission stays a separate opt-in. Never raises;
+            # disable with JARVIS_BUG_AUTO_CAPTURE=0.
+            if os.environ.get("JARVIS_BUG_AUTO_CAPTURE", "1") != "0":
+                try:
+                    import core.bug_reporter as _br
+                    _br.auto_capture(e, where=name, context={"arg": arg[:200]})
+                except Exception:
+                    pass
         finally:
             # Stop the mid-task status timer. If it hasn't fired yet,
             # cancel() prevents it from firing. If it's already mid-speech,
