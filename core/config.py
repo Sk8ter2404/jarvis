@@ -114,6 +114,15 @@ LOCAL_LLM_FALLBACK = True
 LOCAL_LLM_MODEL    = "qwen2.5:14b-instruct-q5_K_M"
 LOCAL_LLM_BASE_URL = "http://localhost:11434"
 
+# When True, every ambient/background one-shot LLM call (memory extraction,
+# proactive comments, the ambient extractor — everything routed through
+# `_llm_quick`) runs on the LOCAL model ONLY and never touches Claude, so
+# ambient learning costs $0. Foreground conversation and user-invoked briefings
+# are unaffected. Default False (Claude-first with local fallback) so a
+# cloud-only install still learns; set True (Settings GUI / user_settings.json)
+# when a local model is available and you want ambient learning to be free.
+AMBIENT_LEARNING_FORCE_LOCAL = False
+
 
 # ─── Sub-agent orchestrator (core/orchestrator.py) ─────────────────────
 # Decompose complex requests into parallel sub-tasks dispatched to

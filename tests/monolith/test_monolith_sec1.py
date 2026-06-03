@@ -358,6 +358,16 @@ class SystemPromptTests(_MonolithTestBase):
 #  _llm_quick / _parse_json_array
 # ──────────────────────────────────────────────────────────────────────────
 class LlmQuickTests(_MonolithTestBase):
+    def setUp(self):
+        super().setUp()
+        # AMBIENT_LEARNING_FORCE_LOCAL is an OWNER setting (true in this box's
+        # user_settings.json); pin it OFF here so the Claude-path tests are
+        # deterministic. The two force-local tests re-enable it explicitly.
+        import core.config as cfg
+        _p = mock.patch.object(cfg, "AMBIENT_LEARNING_FORCE_LOCAL", False)
+        _p.start()
+        self.addCleanup(_p.stop)
+
     def test_parse_json_array_extracts_first(self):
         self.assertEqual(self.bc._parse_json_array('noise [1, 2, 3] tail'),
                          [1, 2, 3])
@@ -405,6 +415,23 @@ class LlmQuickTests(_MonolithTestBase):
 
     def test_llm_quick_unknown_backend_returns_empty(self):
         with mock.patch.object(self.bc, "AI_BACKEND", "something-else"):
+            self.assertEqual(self.bc._llm_quick("s", "u"), "")
+
+    def test_llm_quick_force_local_never_calls_claude(self):
+        # AMBIENT_LEARNING_FORCE_LOCAL short-circuits to the local model so
+        # ambient learning is free (Claude is never reached).
+        import core.config as cfg
+        with mock.patch.object(cfg, "AMBIENT_LEARNING_FORCE_LOCAL", True), \
+             mock.patch.object(self.bc, "_call_local_llm",
+                               return_value="local fact") as mlocal:
+            out = self.bc._llm_quick("sys", "user")
+        self.assertEqual(out, "local fact")
+        mlocal.assert_called_once()
+
+    def test_llm_quick_force_local_empty_when_local_down(self):
+        import core.config as cfg
+        with mock.patch.object(cfg, "AMBIENT_LEARNING_FORCE_LOCAL", True), \
+             mock.patch.object(self.bc, "_call_local_llm", return_value=""):
             self.assertEqual(self.bc._llm_quick("s", "u"), "")
 
 
@@ -1827,6 +1854,15 @@ class SystemPromptEdgeTests(_MonolithTestBase):
 #  _llm_quick — ollama backend branch
 # ──────────────────────────────────────────────────────────────────────────
 class LlmQuickOllamaTests(_MonolithTestBase):
+    def setUp(self):
+        super().setUp()
+        # Pin the owner's force-local setting OFF so the ollama-backend path is
+        # what gets exercised (see LlmQuickTests.setUp).
+        import core.config as cfg
+        _p = mock.patch.object(cfg, "AMBIENT_LEARNING_FORCE_LOCAL", False)
+        _p.start()
+        self.addCleanup(_p.stop)
+
     def test_ollama_backend_returns_message_content(self):
         fake_ollama = mock.Mock()
         fake_ollama.chat.return_value = {"message": {"content": "ollama says hi"}}
