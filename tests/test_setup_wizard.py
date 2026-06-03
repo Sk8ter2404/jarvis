@@ -196,5 +196,39 @@ class MainTests(unittest.TestCase):
         self.assertFalse(r.call_args.kwargs["defaults"])
 
 
+class ClaudeCliTests(unittest.TestCase):
+    def test_found_on_path(self):
+        with mock.patch("shutil.which", return_value=r"C:\bin\claude.exe"):
+            self.assertEqual(suw.find_claude_cli(), r"C:\bin\claude.exe")
+
+    def test_found_in_known_location(self):
+        with mock.patch("shutil.which", return_value=None), \
+             mock.patch.object(suw.os.path, "exists", return_value=True):
+            self.assertIsNotNone(suw.find_claude_cli())
+
+    def test_not_found(self):
+        with mock.patch("shutil.which", return_value=None), \
+             mock.patch.object(suw.os.path, "exists", return_value=False):
+            self.assertIsNone(suw.find_claude_cli())
+
+
+class ClaudeCheckRunTests(_Tmp):
+    def test_reports_present(self):
+        out = []
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk"}, clear=False), \
+             mock.patch.object(suw, "find_claude_cli", return_value=r"C:\claude.exe"):
+            suw.run(defaults=True, env_path=self.env, settings_path=self.settings,
+                    out=out.append)
+        self.assertIn("Claude Code detected", "\n".join(out))
+
+    def test_reports_absent(self):
+        out = []
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk"}, clear=False), \
+             mock.patch.object(suw, "find_claude_cli", return_value=None):
+            suw.run(defaults=True, env_path=self.env, settings_path=self.settings,
+                    out=out.append)
+        self.assertIn("install Claude Code", "\n".join(out))
+
+
 if __name__ == "__main__":
     unittest.main()

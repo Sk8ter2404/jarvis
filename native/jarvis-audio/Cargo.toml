@@ -1,6 +1,6 @@
 [package]
 name = "jarvis-audio"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "JARVIS native always-on audio capture/wake/VAD service (roadmap M1)"
 license = "MIT"
@@ -13,7 +13,8 @@ path = "src/lib.rs"
 name = "jarvis-audio"
 path = "src/main.rs"
 
-# No external deps yet: this first cut is the IPC protocol + service skeleton
-# (std-only, builds fast). cpal capture + openWakeWord/Silero VAD + the
-# named-pipe transport land in the next increment (Phase 1 shadow mode).
 [dependencies]
+# Cross-platform audio capture (WASAPI on Windows / CoreAudio / ALSA). Moves the
+# soft-real-time capture path off the Python GIL. openWakeWord/Silero VAD + the
+# named-pipe transport land in the next increments.
+cpal = "0.15"
