@@ -255,6 +255,14 @@ VOICE_MODE = "turn_based"
 # flag only swaps the in-loop standby transcription strategy.
 WAKE_WORD_AUTOSTART = False
 
+# Alexa-style wake-word mode: when True, JARVIS BOOTS into wake-word standby —
+# silent until you say "JARVIS", then it answers one turn and (in ambient mode)
+# returns to standby — instead of always-listening. Seeds the sleep/standby
+# latches at startup (a persisted crash-survival sleep state still wins). Pairs
+# well with WAKE_WORD_AUTOSTART=True (neural detection vs Whisper-on-noise).
+# Env override JARVIS_START_IN_STANDBY.
+START_IN_STANDBY = False
+
 
 # ─── Whisper STT (faster-whisper preferred, GPU when present) ──────────
 # `WHISPER_DEVICE = 'auto'` lets ctranslate2 + torch decide; 'cuda'

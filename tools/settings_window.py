@@ -103,6 +103,13 @@ SCHEMA: dict[str, dict] = {
         "default": False,
         "help": "Use the neural detector to spot 'Hey JARVIS' while sleeping.",
     },
+    "START_IN_STANDBY": {
+        "tab": "voice", "label": "Start in wake-word mode (Alexa-style)",
+        "type": "bool", "default": False,
+        "help": "Boot SILENT; say 'JARVIS' to wake, it answers, then back to "
+                "standby — instead of always-listening. Pairs with the neural "
+                "wake-word option above.",
+    },
     "TTS_VOICE": {
         "tab": "voice", "label": "TTS voice", "type": "str",
         "default": "en-GB-RyanNeural",
