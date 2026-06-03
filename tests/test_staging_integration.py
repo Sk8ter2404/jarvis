@@ -322,12 +322,12 @@ class MainBootTests(_IntegrationBase):
     # marker -> reply-line index used by both reply readback and battery checks
     def _all_pass_map(self):
         # boot 'listening' found @1; every 'jarvis:' reply found @2; every
-        # expected marker (current time is / 1.0.0-beta / cpu) found.
+        # expected marker (current time is / 1.1.0 / cpu) found.
         return {
             "listening": 1,
             "jarvis:": 2,
             "current time is": 2,
-            "1.0.0-beta": 2,
+            "1.1.0": 2,
             "cpu": 2,
         }
 
@@ -371,7 +371,7 @@ class MainBootTests(_IntegrationBase):
     def test_boot_via_standby_fallback(self):
         # primary 'listening' missing; 'standby' fallback present
         m = {"standby": 1, "jarvis:": 2, "current time is": 2,
-             "1.0.0-beta": 2, "cpu": 2}
+             "1.1.0": 2, "cpu": 2}
         rc, out, _, _ = self._run_main([], m, seed_lines=self._seed())
         self.assertEqual(rc, 0)
         self.assertIn("3/3 passed", out)
@@ -379,7 +379,7 @@ class MainBootTests(_IntegrationBase):
     def test_boot_via_vad_fallback(self):
         # both 'listening' and 'standby' missing; '[vad]' present
         m = {"[vad]": 7, "jarvis:": 2, "current time is": 2,
-             "1.0.0-beta": 2, "cpu": 2}
+             "1.1.0": 2, "cpu": 2}
         rc, out, _, _ = self._run_main([], m, seed_lines=self._seed())
         self.assertEqual(rc, 0)
         self.assertIn("3/3 passed", out)
