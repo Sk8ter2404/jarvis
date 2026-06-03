@@ -1348,7 +1348,18 @@ def _llm_quick(system: str, user: str, max_tokens: int = 200) -> str:
     unavailable (monthly usage cap / quota / network) so background
     learning, fact-extraction and proactive comments keep working instead
     of silently failing every turn — the 2026-05-30 cap exposed this:
-    convos fell back to local but `[learn]` kept dying on the 400."""
+    convos fell back to local but `[learn]` kept dying on the 400.
+
+    When AMBIENT_LEARNING_FORCE_LOCAL is set, this one-shot ALWAYS uses the local
+    model and never touches Claude, so ambient/background learning is free."""
+    from core.config import AMBIENT_LEARNING_FORCE_LOCAL
+    if AMBIENT_LEARNING_FORCE_LOCAL:
+        local = _call_local_llm(
+            system, [{"role": "user", "content": user}], max_tokens=max_tokens)
+        if local:
+            return local
+        print("  [llm_quick] ambient forced local; local model unavailable")
+        return ""
     if AI_BACKEND == "claude":
         import anthropic
         try:
