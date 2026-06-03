@@ -17,7 +17,9 @@ default input device and converts its samples to 16-bit PCM into the ring
 buffer; `cargo run` prints the detected device). Still to come, additively (the
 Python capture path stays the live fallback the whole time):
 
-1. openWakeWord / Porcupine wake detection + Silero/WebRTC VAD + endpointing.
+1. openWakeWord / Porcupine **neural wake** detection (replacing the energy gate
+   in `src/vad.rs`, which already does RMS VAD + endpointing) + an optional
+   Silero neural VAD.
 3. The Windows named-pipe transport (`\\.\pipe\jarvis-audio`) + a Python client.
 4. Shadow mode → opt-in cutover behind `AUDIO_SERVICE_ENABLED` (default off).
 
