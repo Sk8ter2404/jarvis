@@ -110,6 +110,13 @@ SCHEMA: dict[str, dict] = {
                 "standby — instead of always-listening. Pairs with the neural "
                 "wake-word option above.",
     },
+    "AMBIENT_MUSIC_REFUSE_WAKE": {
+        "tab": "voice", "label": "Require 'JARVIS' while music is playing",
+        "type": "bool", "default": True,
+        "help": "While music plays, only obey commands that start with 'JARVIS' "
+                "(stops replies to song lyrics). Turn OFF if it keeps cutting "
+                "you off while your own music is on.",
+    },
     "TTS_VOICE": {
         "tab": "voice", "label": "TTS voice", "type": "str",
         "default": "en-GB-RyanNeural",

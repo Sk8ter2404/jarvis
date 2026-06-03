@@ -14871,7 +14871,8 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
             # through — so quiet-room turns are unaffected and the user can
             # still command over music by prefixing the wake word. Anything
             # else while music plays is treated as overheard audio and dropped.
-            if _audio_music_should_refuse_wake(text):
+            from core.config import AMBIENT_MUSIC_REFUSE_WAKE as _refuse_over_music
+            if _refuse_over_music and _audio_music_should_refuse_wake(text):
                 print(f"  [ambient-music] sustained room music active — "
                       f"ignoring non-wake utterance: '{text[:40]}'")
                 set_state("idle")

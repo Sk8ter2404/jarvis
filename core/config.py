@@ -263,6 +263,12 @@ WAKE_WORD_AUTOSTART = False
 # Env override JARVIS_START_IN_STANDBY.
 START_IN_STANDBY = False
 
+# When True (default), JARVIS ignores spoken commands while SUSTAINED room music
+# is playing UNLESS they start with the wake word "JARVIS" — so it doesn't reply
+# to song lyrics it overhears. Set False if it keeps cutting YOU off while your
+# own music plays; you can then talk to it normally over the music.
+AMBIENT_MUSIC_REFUSE_WAKE = True
+
 
 # ─── Whisper STT (faster-whisper preferred, GPU when present) ──────────
 # `WHISPER_DEVICE = 'auto'` lets ctranslate2 + torch decide; 'cuda'
