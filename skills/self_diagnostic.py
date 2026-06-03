@@ -1423,7 +1423,7 @@ def _probe_claude_api() -> dict:
     bc = _bc()
     model = (getattr(bc, "CLAUDE_MODEL", None) or
              os.environ.get("CLAUDE_MODEL") or
-             "claude-haiku-4-5-20251001")
+             "claude-haiku-4-5")
 
     try:
         # SDK-level timeout (httpx) covers the request once it's actually

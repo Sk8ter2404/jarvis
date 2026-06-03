@@ -106,7 +106,7 @@ SNOOZE_SECONDS        = 300          # don't re-speak / re-classify identical to
 MAX_NOTIFICATION_LOG  = 250          # recent_notifications ring buffer size in memory
 MAX_SPOKEN_BODY_CHARS = 220          # truncate long bodies before TTS
 ENABLE_LLM_CLASSIFIER = True         # set False to skip Haiku and just `log` unmatched
-LLM_MODEL             = "claude-haiku-4-5-20251001"
+LLM_MODEL             = "claude-haiku-4-5"
 LLM_TIMEOUT_SECONDS   = 6.0
 HIGH_PRIORITY_FLOOR   = 100          # rules with priority >= this bypass focus mode
 
