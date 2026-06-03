@@ -109,7 +109,7 @@ except Exception:  # pragma: no cover — boot-order safety
 _log = logging.getLogger(__name__)
 
 # ─── Config ──────────────────────────────────────────────────────────────
-LLM_MODEL                = "claude-haiku-4-5-20251001"
+LLM_MODEL                = "claude-haiku-4-5"
 LLM_TIMEOUT_SECONDS      = 8.0
 ENABLE_LLM_TRIAGE        = True
 DEFAULT_LIST_LIMIT       = 8
