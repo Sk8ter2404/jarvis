@@ -1352,8 +1352,8 @@ def _llm_quick(system: str, user: str, max_tokens: int = 200) -> str:
 
     When AMBIENT_LEARNING_FORCE_LOCAL is set, this one-shot ALWAYS uses the local
     model and never touches Claude, so ambient/background learning is free."""
-    from core.config import AMBIENT_LEARNING_FORCE_LOCAL
-    if AMBIENT_LEARNING_FORCE_LOCAL:
+    from core.config import AMBIENT_LEARNING_FORCE_LOCAL, model_route
+    if AMBIENT_LEARNING_FORCE_LOCAL or model_route("ambient") == "local":
         local = _call_local_llm(
             system, [{"role": "user", "content": user}], max_tokens=max_tokens)
         if local:
@@ -6004,7 +6004,10 @@ def _call_llm(user_text: str) -> str:
         + voice_mood_addendum
     )
 
-    if AI_BACKEND == "claude":
+    from core.config import model_route
+    if model_route("chat") == "local":
+        reply = _local_fallback_or(sys_prompt_now, "(the local model is unavailable, sir)")
+    elif AI_BACKEND == "claude":
         import anthropic
         try:
             if _llm_client is not None:
@@ -7001,6 +7004,12 @@ def ask_vision(question: str, png_bytes: bytes | None = None) -> str:
     if png_bytes is None:
         return "(could not capture screen)"
 
+    # Per-function routing: force the local VLM when vision is routed "local".
+    from core.config import model_route
+    if model_route("vision") == "local":
+        local = _call_local_vision(question, [png_bytes])
+        return f"[local-vision] {local}" if local else "(local vision unavailable — Ollama not reachable)"
+
     # Cloud-disabled path: jump straight to the local VLM.
     if AI_BACKEND != "claude":
         local = _call_local_vision(question, [png_bytes])
@@ -7101,6 +7110,11 @@ def ask_vision_multi(question: str, images: dict[str, bytes]) -> str:
         )
         text = _call_local_vision(prompt, pngs, max_tokens=900)
         return f"[local-vision] {text}" if text else None
+
+    from core.config import model_route
+    if model_route("vision") == "local":
+        local = _local_multi_fallback()
+        return local if local else "(local vision unavailable — Ollama not reachable)"
 
     if AI_BACKEND != "claude":
         local = _local_multi_fallback()

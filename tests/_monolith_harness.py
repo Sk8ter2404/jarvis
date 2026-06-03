@@ -255,7 +255,19 @@ class MonolithGlobalsTestCase(unittest.TestCase):
             return super().run(result)
         bc = self.bc if self.bc is not None else load_monolith()
         _capture_monolith_pristine(bc)
+        # Neutralise owner-specific LLM routing (this dev box's user_settings.json
+        # sets MODEL_ROUTING / AMBIENT_LEARNING_FORCE_LOCAL to local) so EVERY
+        # monolith test runs against the shipped defaults and stays deterministic
+        # regardless of the box it runs on. Tests that want a route override it
+        # explicitly. Restored after the test.
+        import core.config as _cfg
+        _saved_route = dict(_cfg.MODEL_ROUTING)
+        _saved_force = _cfg.AMBIENT_LEARNING_FORCE_LOCAL
+        _cfg.MODEL_ROUTING = {"chat": "auto", "vision": "auto", "ambient": "auto"}
+        _cfg.AMBIENT_LEARNING_FORCE_LOCAL = False
         try:
             return super().run(result)
         finally:
             _restore_monolith_pristine(bc)
+            _cfg.MODEL_ROUTING = _saved_route
+            _cfg.AMBIENT_LEARNING_FORCE_LOCAL = _saved_force

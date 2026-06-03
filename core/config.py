@@ -123,6 +123,26 @@ LOCAL_LLM_BASE_URL = "http://localhost:11434"
 # when a local model is available and you want ambient learning to be free.
 AMBIENT_LEARNING_FORCE_LOCAL = False
 
+# ─── Per-function model routing ────────────────────────────────────────
+# Choose, PER FUNCTION, which brain answers — so e.g. screen vision can run on
+# the free local VLM while chat stays on Claude. Each value is one of:
+#   "auto"  — Claude when available, local model on failure (the default)
+#   "local" — local Ollama model ONLY ($0, never Claude)
+#   "cloud" — Claude (today same as auto; reserved for a future no-fallback mode)
+# Override individual keys via user_settings.json (partial dicts MERGE over these
+# defaults) or the Settings GUI, e.g. {"MODEL_ROUTING": {"vision": "local"}}.
+MODEL_ROUTING = {
+    "chat":    "auto",    # foreground conversation (_call_llm)
+    "vision":  "auto",    # screen / camera vision (ask_vision / ask_vision_multi)
+    "ambient": "auto",    # background learning (_llm_quick); AMBIENT_LEARNING_FORCE_LOCAL also forces this local
+}
+
+
+def model_route(function: str) -> str:
+    """The configured backend route for a JARVIS function: 'auto' | 'local' |
+    'cloud'. Unknown functions default to 'auto'."""
+    return MODEL_ROUTING.get(function, "auto")
+
 
 # ─── Sub-agent orchestrator (core/orchestrator.py) ─────────────────────
 # Decompose complex requests into parallel sub-tasks dispatched to
@@ -535,6 +555,8 @@ def _apply_user_settings() -> None:
                 g[key] = str(val)
             elif isinstance(cur, (list, tuple)) and isinstance(val, (list, tuple)):
                 g[key] = type(cur)(val)
+            elif isinstance(cur, dict) and isinstance(val, dict):
+                g[key] = {**cur, **val}   # merge so a PARTIAL override keeps the other keys
             # other / mismatched types: keep the default rather than risk a bad value
         except Exception:
             continue
