@@ -1,0 +1,19 @@
+[package]
+name = "jarvis-audio"
+version = "0.1.0"
+edition = "2021"
+description = "JARVIS native always-on audio capture/wake/VAD service (roadmap M1)"
+license = "MIT"
+
+[lib]
+name = "jarvis_audio"
+path = "src/lib.rs"
+
+[[bin]]
+name = "jarvis-audio"
+path = "src/main.rs"
+
+# No external deps yet: this first cut is the IPC protocol + service skeleton
+# (std-only, builds fast). cpal capture + openWakeWord/Silero VAD + the
+# named-pipe transport land in the next increment (Phase 1 shadow mode).
+[dependencies]

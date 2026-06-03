@@ -14,8 +14,8 @@ Status: ☐ todo · ◐ in progress · ☑ done.
 ## Where it stands today
 
 ~101K-LOC local-first Windows voice assistant. `mic → Whisper → Claude emits
-[ACTION: …] → ~150 handlers → edge-TTS`. Public `v1.5.0` (all releases kept,
-`v1.0.0-beta.1` → `v1.5.0`); the self-upgrade pipeline's internal CHANGELOG
+[ACTION: …] → ~150 handlers → edge-TTS`. Public `v1.6.0` (all releases kept,
+`v1.0.0-beta.1` → `v1.6.0`); the self-upgrade pipeline's internal CHANGELOG
 counter (~v1.0.17) is a SEPARATE axis. **100% unit-test coverage,
 CI-green.** Genuinely strong: mature voice stack, cloud-optional (full local
 fallback on a 3090), dual-store memory + personal-files RAG, a rich proactive
@@ -31,13 +31,15 @@ the tray overhaul + standalone Settings GUI, the M3 self-upgrade safety gates, a
 **update checker** (boot nudge + the `check for updates` action), an **update
 wizard**, a first-run **setup wizard**, an automatic **PII pre-commit guard**, and
 M2 Phase 2 groundwork — the in-process **message bus** (`core/message_bus.py`,
-unwired). (Heading range above: 1.1 → 1.5.)
+unwired) — plus the **M1 native-audio-service scaffold** (`native/jarvis-audio/`,
+Rust: the IPC protocol + a buildable service skeleton, cargo-tested; capture /
+wake / VAD next). (Heading range above: 1.1 → 1.6.)
 
 ---
 
 ## 🔴 1.0.0 — Major
 
-### M1 · Streaming, sub-second hot path  ☐
+### M1 · Streaming, sub-second hot path  ◐
 Today: two serial un-streamed network round-trips per turn (Claude + edge-TTS) +
 a fixed 1.4s silence endpoint → **3–5s** felt latency. Worse, standby runs a
 **full GPU Whisper inference per utterance just to substring-match "jarvis"**
@@ -46,7 +48,9 @@ while a real neural detector (`core/wake_word.py`) sits unused.
   PCM to Python. Kills the Whisper-as-wake waste + the audio-path GIL contention.
 - Streaming STT→LLM→TTS so the first syllable plays before the reply completes.
 - *Down payment available now as F1/F2 (flip on the already-built realtime mode).*
-- **Decision needed:** Rust vs Go for the audio service.
+- **DECIDED: Rust.** Scaffold landed — `native/jarvis-audio/` (the IPC protocol
+  + a buildable service skeleton, `cargo test` green). Capture (cpal) + wake/VAD
+  + the named-pipe transport are the next increments, additive/shadow-mode.
 
 ### M2 · De-monolith via process isolation  ☐
 The monolith + ~17 shared global-state slots + ~30 `global`-rebound singletons +
