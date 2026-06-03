@@ -7240,24 +7240,40 @@ def find_click_target(description: str, monitor: str | None = None) -> tuple[int
             print(f"  [vision] ✓ Refined offset: {pass2[0]-cw//2:+},{pass2[1]-ch//2:+} px", flush=True)
         # If pass 2 fails, keep pass-1 estimate
 
-    # Translate full-res image coords → absolute screen coordinates
+    # Translate full-res image coords → absolute screen coordinates.
+    #
+    # refined_x/refined_y are in NATIVE CAPTURE PIXELS — the Pass-2 image is
+    # grabbed un-downscaled, so on a display running >100% scaling it is LARGER
+    # than the monitor's logical size. The MONITORS table and pyautogui's click
+    # space are LOGICAL (DIP). Adding a native offset to a logical origin
+    # overshoots (the click lands too far right/down — the multi-monitor miss the
+    # user hit on the 4-screen rig). So scale the offset native→logical BEFORE
+    # adding the logical origin. When native == logical (100% scale) the ratio is
+    # 1.0 and this is a no-op, so it can't regress an un-scaled setup. 2026-06-02.
+    # (Deeper fix: make the process per-monitor DPI-aware at startup so capture
+    # and click share one pixel space — a global change, deferred pending on-rig
+    # verification of this localized correction.)
     if monitor and monitor in MONITORS:
-        mx, my, _, _ = MONITORS[monitor]
-        return mx + refined_x, my + refined_y
-    # No monitor specified — take_screenshot captured sct.monitors[0], which
-    # is the virtual screen spanning every display. On a multi-monitor
-    # layout the virtual screen's top-left is NOT (0, 0) — it's the
-    # bounding-box origin of all monitors, often negative on Windows when a
-    # monitor sits left of or above the primary. Translate image coords by
-    # that origin so the returned point is in absolute screen space.
-    try:
-        import mss
-        _MSSClass = getattr(mss, "MSS", mss.mss)
-        with _MSSClass() as sct:
-            vs = sct.monitors[0]
-            return vs["left"] + refined_x, vs["top"] + refined_y
-    except Exception:
-        return refined_x, refined_y
+        mx, my, lw, lh = MONITORS[monitor]
+        sx = (lw / full_w) if full_w else 1.0
+        sy = (lh / full_h) if full_h else 1.0
+        if abs(sx - 1.0) > 0.01 or abs(sy - 1.0) > 0.01:
+            print(f"  [vision] DPI scale: monitor={monitor} "
+                  f"native={full_w}x{full_h} logical={lw}x{lh} "
+                  f"→ click x({sx:.3f},{sy:.3f})", flush=True)
+        return int(mx + refined_x * sx), int(my + refined_y * sy)
+    # No monitor specified — Pass-2 captured the whole virtual screen (mss
+    # monitors[0]). Its top-left is the bounding-box origin of all displays,
+    # often NEGATIVE on Windows when a monitor sits left of/above the primary.
+    # Scale native→logical (same reason as above) using the LOGICAL virtual-
+    # desktop size, then add the LOGICAL origin.
+    vx, vy, vw, vh = _virtual_screen_bounds()
+    sx = (vw / full_w) if full_w else 1.0
+    sy = (vh / full_h) if full_h else 1.0
+    if abs(sx - 1.0) > 0.01 or abs(sy - 1.0) > 0.01:
+        print(f"  [vision] DPI scale: virtual native={full_w}x{full_h} "
+              f"logical={vw}x{vh} → click x({sx:.3f},{sy:.3f})", flush=True)
+    return int(vx + refined_x * sx), int(vy + refined_y * sy)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -10628,6 +10644,12 @@ INFORMATIVE_ACTIONS = {
     "show_tasks", "queue_task",
     # Credits skill: balance reading is something the user explicitly asked for
     "check_credits",
+    # Bambu printer skill: check_print / how_is_the_print / print_details return
+    # the print status the user explicitly asked for, so JARVIS must take a
+    # follow-up turn to SPEAK it — without this they were logged but never voiced
+    # (the result is neither a _is_failure match nor informative). See
+    # skills/bambu_monitor.py.
+    "check_print", "how_is_the_print", "print_details",
     # Web actions: opening a URL or searching is preparatory — JARVIS should
     # follow up with see_screen to read what actually loaded rather than stopping.
     "open_url", "web_search",
