@@ -46,15 +46,28 @@ _SCRUB_RULES: List[Tuple[Any, str]] = [
     (re.compile(r"ghp_[A-Za-z0-9]{20,}"), "<KEY>"),
     (re.compile(r"gho_[A-Za-z0-9]{20,}"), "<KEY>"),
     (re.compile(r"AKIA[0-9A-Z]{16}"), "<KEY>"),
+    (re.compile(r"AIza[0-9A-Za-z_-]{35}"), "<KEY>"),                # Google API key
+    (re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
+     "<KEY>"),                                                       # JWT
     (re.compile(r"xox[bpoas]-[0-9A-Za-z-]{8,}"), "<KEY>"),
+    (re.compile(r"https://hooks\.slack\.com/services/\S+"), "<KEY>"),  # Slack webhook
+    (re.compile(r"-----BEGIN[^-]+PRIVATE KEY-----.*?-----END[^-]+PRIVATE KEY-----",
+                re.DOTALL), "<KEY>"),                                # PEM private key
     (re.compile(r"(?i)bearer\s+[A-Za-z0-9._-]{10,}"), "Bearer <KEY>"),
-    # env-style "NAME = value" for sensitive names -> redact only the value
-    (re.compile(r"(?i)\b(api[_-]?key|token|secret|password|passwd|pwd|"
-                r"access[_-]?code)\b(\s*[=:]\s*)\S+"), r"\1\2<REDACTED>"),
+    # NAME=value / NAME: value for sensitive names — underscored names too
+    # (OPENAI_API_KEY=, AWS_SECRET_ACCESS_KEY=, client_secret=) -> redact value.
+    (re.compile(r"(?i)([A-Za-z0-9_]*(?:api[_-]?key|token|secret|password|passwd|"
+                r"pwd|access[_-]?code)[A-Za-z0-9_]*)(\s*[=:]\s*)\S+"),
+     r"\1\2<REDACTED>"),
+    # connection-string password: scheme://user:pass@host  (user may be empty)
+    (re.compile(r"(://[^:/@\s]*):[^@/\s]+@"), r"\1:<REDACTED>@"),
     (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "<EMAIL>"),
     (re.compile(r"([A-Za-z]:\\Users\\)[^\\/\r\n\"']+"), r"\1<USER>"),
     (re.compile(r"(/(?:home|Users)/)[^/\r\n\"']+"), r"\1<USER>"),
+    # MAC before the IP rules so its hex groups aren't partially eaten.
+    (re.compile(r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b"), "<MAC>"),
     (re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"), "<IP>"),
+    (re.compile(r"(?i)\b(?:[a-f0-9]{1,4}:){3,7}[a-f0-9]{1,4}\b"), "<IP>"),  # IPv6
     (re.compile(r"\b[A-Fa-f0-9]{32,}\b"), "<HEX>"),
 ]
 
