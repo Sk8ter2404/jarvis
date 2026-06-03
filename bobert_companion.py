@@ -2775,6 +2775,17 @@ def _restore_tray_toggle_state() -> None:
         _sleep_mode[0] = bool(persisted.get("sleep_mode"))
     if "standby_mode" in persisted:
         _standby_mode[0] = bool(persisted.get("standby_mode"))
+    # Alexa-style boot: START_IN_STANDBY comes up SILENT in wake-word standby
+    # (say "JARVIS" to wake → it answers → back to standby) instead of always-
+    # listening — UNLESS a persisted crash-survival sleep state already decided.
+    # Env override: JARVIS_START_IN_STANDBY.
+    if "sleep_mode" not in persisted:
+        from core.config import START_IN_STANDBY as _sis_default
+        _sis = (os.environ.get("JARVIS_START_IN_STANDBY", "").strip()
+                or str(_sis_default)).strip().lower()
+        if _sis in {"1", "true", "yes", "on"}:
+            _sleep_mode[0] = True
+            _standby_mode[0] = True
     if "audio_processing_enabled" in persisted:
         _audio_master_enabled[0] = bool(persisted.get("audio_processing_enabled"))
     if "echo_cancel_enabled" in persisted:
