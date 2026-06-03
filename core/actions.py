@@ -1123,6 +1123,29 @@ def _act_check_for_updates(_: str = "") -> str:
     return uc.update_message(uc.check_for_update())
 
 
+def _act_report_bug(description: str = "") -> str:
+    """Log a bug the USER is reporting — scrubbed of personal data LOCALLY — and
+    open a pre-filled GitHub issue for them to review + submit (consent-gated; no
+    auto-send). 'report a bug: the timer never fired', 'jarvis that was wrong'."""
+    desc = (description or "").strip()
+    if not desc:
+        return ("Tell me what went wrong and I'll log it — e.g. 'report a bug: "
+                "the timer never fired'.")
+    from core import bug_reporter as br
+    rep = br.record_bug("user", desc, context={"source": "voice"})
+    url = br.browser_submit_url(rep)
+    try:
+        import webbrowser
+        opened = bool(webbrowser.open(url))
+    except Exception:
+        opened = False
+    if opened:
+        return ("Logged it, scrubbed of personal info, and opened a pre-filled "
+                "GitHub issue — review it and hit submit to send it.")
+    return ("Logged it locally, scrubbed of personal info, and saved to the bug "
+            "outbox to file when you're ready.")
+
+
 # ─── Smoke test + skills selftest (Phase 4G) ───────────────────────────
 
 def _act_run_smoke_test(_: str = "") -> str:
@@ -2409,6 +2432,7 @@ __all__ = [
     # Phase 4G — version + smoke test + selftest + memory forget + latency
     "_act_version_info",
     "_act_check_for_updates",
+    "_act_report_bug",
     "_act_run_smoke_test",
     "_act_test_each_skill",
     "_act_forget_last_hour",

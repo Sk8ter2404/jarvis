@@ -10174,6 +10174,12 @@ ACTIONS = {
     "check_for_updates":  _act_check_for_updates,
     "check_updates":      _act_check_for_updates,
     "is_there_an_update": _act_check_for_updates,
+    # Bug reporting — a USER-reported bug, scrubbed locally then offered as a
+    # pre-filled GitHub issue (consent-gated; no auto-send).
+    "report_bug":         _act_report_bug,
+    "report_a_bug":       _act_report_bug,
+    "log_a_bug":          _act_report_bug,
+    "file_a_bug":         _act_report_bug,
     # Tray Power Tools submenu — these were silently dropping with
     # "unknown command" until round5-H-2 wired them in. Every handler is
     # defined just above this dict; the destructive ones (force_backup,
