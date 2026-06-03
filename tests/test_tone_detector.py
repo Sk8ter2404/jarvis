@@ -29,8 +29,12 @@ class DetectToneTests(unittest.TestCase):
                 raise ValueError("cannot stringify")
 
         # Plain neutral current text → without the (failed) similarity signal it
-        # classifies as None; the point is that it does not raise.
-        self.assertIsNone(td.detect_tone("open the notes", prev_user_text=Boom()))
+        # classifies as None; the point is that it does not raise. Pin the clock
+        # to daytime: detect_tone's late-night fallback reads the real wall clock
+        # with no arg, so an un-pinned neutral result flakes to 'late_night' when
+        # CI runs at a late UTC hour (matches LateNightTests' pattern).
+        with mock.patch.object(td, "_is_late_night_hour", return_value=False):
+            self.assertIsNone(td.detect_tone("open the notes", prev_user_text=Boom()))
 
     def test_frustrated_repetition_phrase(self):
         self.assertEqual(td.detect_tone("I said turn it off"), "frustrated")
