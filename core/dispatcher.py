@@ -25,6 +25,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
+from core.failure_markers import FAILURE_MARKERS
+
 
 # ──────────────────────────────────────────────────────────────────────────
 #  TYPES
@@ -517,13 +519,11 @@ _COUNT_WORDS = {
 }
 
 
-# Mirror of bobert_companion._is_failure's marker list. Actions return
-# free-text strings; these substrings (case-insensitive) flag a result
-# as a failure even though the call didn't raise.
-_FAIL_MARKERS = (
-    "could not", "failed", "refused", "no tracks found",
-    "no window matching", "unknown ", "format:",
-)
+# Canonical marker list lives in core/failure_markers.py and is shared with
+# bobert_companion._is_failure so the two can't drift. Actions return free-text
+# strings; these substrings (case-insensitive) flag a result as a failure even
+# though the call didn't raise.
+_FAIL_MARKERS = FAILURE_MARKERS
 
 
 def _is_failure_result(result) -> bool:

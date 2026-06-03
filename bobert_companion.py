@@ -1135,6 +1135,10 @@ _legacy_memory.configure(MEMORY_FILE, _memory_lock)
 # isolation. merge_memory (below) uses both via this re-export.
 from core.memory_guards import _is_secret_fact, _is_internal_noise_fact  # noqa: E402,F401
 
+# Canonical action-result failure markers, shared with core/dispatcher.py so the
+# follow-up-loop _is_failure() check below can't drift from the dispatcher's.
+from core.failure_markers import FAILURE_MARKERS  # noqa: E402
+
 
 def merge_memory(new_facts=None, new_projects=None, new_topic=""):
     """Atomically merge new facts/projects/topic into bobert_memory.json.
@@ -13924,8 +13928,7 @@ def _run_llm_dispatch(text: str) -> str:
     # action (e.g. screenshot → see_screen → final answer).
     # Also auto-trigger follow-up for any FAILED action so failures
     # don't go silently unreported to the user.
-    FAIL_MARKERS = ("could not", "failed", "REFUSED", "no tracks found",
-                    "no window matching", "unknown ", "format:")
+    FAIL_MARKERS = FAILURE_MARKERS  # canonical list — see core/failure_markers.py
     def _is_failure(result: str) -> bool:
         lower = result.lower()
         return any(m.lower() in lower for m in FAIL_MARKERS)
