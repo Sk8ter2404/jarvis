@@ -1,0 +1,746 @@
+#!/usr/bin/env python3
+"""JARVIS Settings — the GUI behind the tray's Settings submenu.
+
+`tray.py` launches this with ``subprocess.Popen([sys.executable,
+SETTINGS_WINDOW, "--tab", <name>])`` from each Settings menu item
+(Voice/Audio, AI/Models, Privacy/Ambient, Integrations, Advanced) and from the
+Audio "Voice / Audio Settings…" item. Until this file existed those six menu
+items were silent no-ops — this is the surface they open.
+
+Design notes
+────────────
+* Dark theme matching the existing tray dialogs (bg ``#0d1117``, fg
+  ``#c9d1d9``, Consolas) — see tray.py's `_run_about_dialog`.
+* Reads/writes ``data/user_settings.json`` (data/ is gitignored — the schema
+  ships as ``tools/user_settings.example.json``). On first run the GUI creates
+  ``data/user_settings.json`` from the built-in defaults, which mirror
+  ``core/config.py``'s current values.
+* The live consumer of these knobs (bobert_companion / core.voice_pipeline._cfg
+  etc.) is a SEPARATE, parallel task. This file's only job is to persist a
+  valid JSON document; it never imports the monolith.
+* Writes use the same atomic temp-file + ``os.replace`` pattern as tray.py's
+  ``_send_command`` so a crash mid-save can't corrupt the settings file.
+* SECURITY: integration secrets are NEVER read from or written to the repo.
+  The Integrations tab shows only PRESENT / not-set status for each key (probed
+  from the OS environment) and never displays a secret's value. The plain
+  text fields there persist NON-secret connection hints (host/port) to the
+  user (gitignored) settings file only.
+
+Everything above the ``# ── GUI ──`` divider is import-safe with no GUI
+dependency, so the test-suite can exercise the schema, defaults, load/save
+round-trip and CLI parsing on a bare CI runner where tkinter is absent.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import tempfile
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Paths
+# ──────────────────────────────────────────────────────────────────────────
+# tools/settings_window.py → project root is one level up.
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(PROJECT_DIR, "data")
+SETTINGS_PATH = os.path.join(DATA_DIR, "user_settings.json")
+# Shipped, tracked template (data/ is fully gitignored).
+EXAMPLE_PATH = os.path.join(PROJECT_DIR, "tools", "user_settings.example.json")
+
+# Theme — identical palette to the tray dialogs.
+BG = "#0d1117"
+FG = "#c9d1d9"
+FIELD_BG = "#161b22"
+ACCENT = "#1f6feb"
+MUTED = "#8b949e"
+FONT = ("Consolas", 10)
+FONT_BOLD = ("Consolas", 11, "bold")
+FONT_SMALL = ("Consolas", 9)
+
+RESTART_NOTE = "Some changes apply on the next restart."
+
+# Order matters — drives both the Notebook tab order and `--tab` resolution.
+TAB_ORDER = ["voice", "ai", "privacy", "integrations", "advanced"]
+TAB_LABELS = {
+    "voice": "Voice / Audio",
+    "ai": "AI / Models",
+    "privacy": "Privacy / Ambient",
+    "integrations": "Integrations",
+    "advanced": "Advanced",
+}
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Settings schema
+# ──────────────────────────────────────────────────────────────────────────
+# A flat dict of JSON-key → field-spec. Each spec is a dict with:
+#   tab      one of TAB_ORDER
+#   label    human label for the control
+#   type     "bool" | "enum" | "str" | "int" | "float" | "text"
+#   default  default value (matches core/config.py's current default)
+#   help     (optional) one-line hint shown under the control
+#   choices  (enum only) list of allowed string values
+#   secret_env (integration status rows only) the OS env var probed for
+#              PRESENT/not-set; its VALUE is never read into a control
+#
+# Keeping the schema as plain data (no tkinter) lets the tests assert on
+# defaults / coverage and lets `default_settings()` build the template file
+# without ever importing the GUI.
+#
+# This is a SAFE, curated subset of core/config.py — destructive or
+# hardware-pinning knobs (CAMERAS, MONITORS, CONFIRM_KEYWORDS, robot IPs) are
+# intentionally omitted.
+SCHEMA: dict[str, dict] = {
+    # ── Voice / Audio ──────────────────────────────────────────────────
+    "VOICE_MODE": {
+        "tab": "voice", "label": "Voice pipeline", "type": "enum",
+        "choices": ["turn_based", "realtime"], "default": "turn_based",
+        "help": "realtime = low-latency streaming (needs optional deps; "
+                "falls back to turn_based).",
+    },
+    "WAKE_WORD_AUTOSTART": {
+        "tab": "voice", "label": "Neural wake-word in standby", "type": "bool",
+        "default": False,
+        "help": "Use the neural detector to spot 'Hey JARVIS' while sleeping.",
+    },
+    "TTS_VOICE": {
+        "tab": "voice", "label": "TTS voice", "type": "str",
+        "default": "en-GB-RyanNeural",
+        "help": "Edge neural voice name, e.g. en-GB-RyanNeural.",
+    },
+    "TTS_BACKEND": {
+        "tab": "voice", "label": "TTS backend", "type": "enum",
+        "choices": ["edge", "pyttsx3", "xtts"], "default": "edge",
+        "help": "edge = online neural; pyttsx3 = offline SAPI; xtts = clone.",
+    },
+    "AUDIO_PROCESSING_ENABLED": {
+        "tab": "voice", "label": "Audio processing (master)", "type": "bool",
+        "default": True,
+        "help": "Master switch for the mic-cleanup chain below.",
+    },
+    "AUDIO_ECHO_CANCEL": {
+        "tab": "voice", "label": "Echo cancellation (AEC)", "type": "bool",
+        "default": True,
+        "help": "Cancel JARVIS's own playback from the mic.",
+    },
+    "AUDIO_NOISE_SUPPRESS": {
+        "tab": "voice", "label": "Noise suppression (NS)", "type": "bool",
+        "default": True, "help": "Suppress stationary background noise.",
+    },
+    "AUDIO_AGC": {
+        "tab": "voice", "label": "Auto gain control (AGC)", "type": "bool",
+        "default": True, "help": "Normalise mic level before STT.",
+    },
+    "VAD_THRESHOLD": {
+        "tab": "voice", "label": "VAD threshold", "type": "float",
+        "default": 0.008,
+        "help": "Mic RMS to treat as speech; raise to ignore more noise.",
+    },
+    "AUDIO_DUCKING_ENABLED": {
+        "tab": "voice", "label": "Duck other apps while speaking", "type": "bool",
+        "default": True,
+        "help": "Lower other apps' volume while JARVIS talks (Windows).",
+    },
+
+    # ── AI / Models ────────────────────────────────────────────────────
+    "AI_BACKEND": {
+        "tab": "ai", "label": "Primary AI backend", "type": "enum",
+        "choices": ["claude", "ollama"], "default": "claude",
+        "help": "claude = prefer cloud; ollama = local-only baseline.",
+    },
+    "CLAUDE_MODEL": {
+        "tab": "ai", "label": "Claude model", "type": "str",
+        "default": "claude-sonnet-4-6",
+        "help": "Cloud model id used when Claude is reachable.",
+    },
+    "LOCAL_LLM_MODEL": {
+        "tab": "ai", "label": "Local LLM model", "type": "str",
+        "default": "qwen2.5:14b-instruct-q5_K_M",
+        "help": "Ollama tag for the always-on local brain.",
+    },
+    "CLAUDE_OPTIONAL": {
+        "tab": "ai", "label": "Claude is optional (never required)",
+        "type": "bool", "default": True,
+        "help": "A missing/capped Claude key is not treated as a failure.",
+    },
+    "LOCAL_LLM_FALLBACK": {
+        "tab": "ai", "label": "Fall back to local LLM", "type": "bool",
+        "default": True,
+        "help": "Serve turns on the local model when Claude is unavailable.",
+    },
+    "LOCAL_VISION_FALLBACK": {
+        "tab": "ai", "label": "Local vision fallback", "type": "bool",
+        "default": True,
+        "help": "Retry vision on the local VLM when the cloud call fails.",
+    },
+    "ENABLE_ORCHESTRATOR": {
+        "tab": "ai", "label": "Sub-agent orchestrator", "type": "bool",
+        "default": True,
+        "help": "Fan standing briefings out to parallel sub-agents.",
+    },
+
+    # ── Privacy / Ambient ──────────────────────────────────────────────
+    "AMBIENT_LISTENING_ENABLED": {
+        "tab": "privacy", "label": "Ambient listening", "type": "bool",
+        "default": False,
+        "help": "Passively transcribe surroundings to learn context. OFF "
+                "by default.",
+    },
+    "AMBIENT_SCREEN_ENABLED": {
+        "tab": "privacy", "label": "Ambient screen capture", "type": "bool",
+        "default": False,
+        "help": "Periodically read the screen for ambient context.",
+    },
+    "STANDBY_LOOP_ENABLED": {
+        "tab": "privacy", "label": "Standby music auto-detect", "type": "bool",
+        "default": True,
+        "help": "Auto-enter wake-word-only mode when music with lyrics plays.",
+    },
+    "SCREENSHOT_PRIVACY_BLOCKLIST": {
+        "tab": "privacy", "label": "Screenshot privacy blocklist", "type": "text",
+        "default": ["1password", "bitwarden", "keepass", "banking"],
+        "help": "One app/window title substring per line; screen vision skips "
+                "any window whose title matches (case-insensitive).",
+    },
+    "DAILY_BUDGET_USD": {
+        "tab": "privacy", "label": "Daily Claude $ cap", "type": "float",
+        "default": 5.0,
+        "help": "Soft daily ceiling for Claude API spend (USD).",
+    },
+    "DEEP_AUDIT_BUDGET_USD": {
+        "tab": "privacy", "label": "Deep-audit daily $ cap", "type": "float",
+        "default": 1.0,
+        "help": "Daily ceiling for the background deep-audit diagnostic (USD).",
+    },
+
+    # ── Integrations ───────────────────────────────────────────────────
+    # Status-only rows (probe env presence, never show the value):
+    "_status_anthropic": {
+        "tab": "integrations", "label": "Anthropic Claude API", "type": "status",
+        "secret_env": ["ANTHROPIC_API_KEY"],
+    },
+    "_status_porcupine": {
+        "tab": "integrations", "label": "Porcupine wake word", "type": "status",
+        "secret_env": ["PORCUPINE_ACCESS_KEY"],
+    },
+    "_status_azure_tts": {
+        "tab": "integrations", "label": "Azure TTS", "type": "status",
+        "secret_env": ["AZURE_TTS_KEY", "AZURE_TTS_REGION"],
+    },
+    "_status_elevenlabs": {
+        "tab": "integrations", "label": "ElevenLabs TTS", "type": "status",
+        "secret_env": ["ELEVENLABS_API_KEY"],
+    },
+    "_status_bambu": {
+        "tab": "integrations", "label": "Bambu Lab printer", "type": "status",
+        "secret_env": ["BAMBU_PRINTER_IP", "BAMBU_ACCESS_CODE", "BAMBU_SERIAL"],
+    },
+    "_status_govee": {
+        "tab": "integrations", "label": "Govee smart home", "type": "status",
+        "secret_env": ["GOVEE_API_KEY"],
+    },
+    "_status_hue": {
+        "tab": "integrations", "label": "Philips Hue", "type": "status",
+        "secret_env": [],
+        "config_file": "sh_hue_config.json",
+        "help": "Configured via data/sh_hue_config.json (bridge IP + button).",
+    },
+    "_status_obs": {
+        "tab": "integrations", "label": "OBS Studio", "type": "status",
+        "secret_env": ["OBS_HOST", "OBS_PASSWORD"],
+    },
+    "_status_deco": {
+        "tab": "integrations", "label": "TP-Link Deco router", "type": "status",
+        "secret_env": ["DECO_HOST", "DECO_PASSWORD"],
+    },
+    "_status_phone": {
+        "tab": "integrations", "label": "Phone bridge / push", "type": "status",
+        "secret_env": ["TELEGRAM_BOT_TOKEN", "NTFY_TOPIC", "PUSHOVER_TOKEN"],
+        "help": "PRESENT if any one channel (Telegram / ntfy / Pushover) is set.",
+        "match": "any",
+    },
+    # Non-secret connection hints persisted to user_settings.json:
+    "OBS_HOST_HINT": {
+        "tab": "integrations", "label": "OBS host (non-secret)", "type": "str",
+        "default": "",
+        "help": "e.g. localhost. Stored in user_settings.json, not the repo. "
+                "Leave the password in your .env / OS environment.",
+    },
+    "OBS_PORT_HINT": {
+        "tab": "integrations", "label": "OBS port (non-secret)", "type": "str",
+        "default": "",
+        "help": "e.g. 4455. Non-secret — safe to keep here.",
+    },
+    "HUE_BRIDGE_IP_HINT": {
+        "tab": "integrations", "label": "Hue bridge IP (non-secret)",
+        "type": "str", "default": "",
+        "help": "Local bridge IP, e.g. 192.168.1.50. Non-secret hint only.",
+    },
+
+    # ── Advanced ───────────────────────────────────────────────────────
+    "HUD_ENABLED": {
+        "tab": "advanced", "label": "On-screen HUD", "type": "bool",
+        "default": True, "help": "Drives the unified HUD at boot.",
+    },
+    "TRAY_ENABLED": {
+        "tab": "advanced", "label": "System-tray applet", "type": "bool",
+        "default": True,
+    },
+    "RETICLE_OVERLAY_ENABLED": {
+        "tab": "advanced", "label": "Click-feedback reticle", "type": "bool",
+        "default": True,
+        "help": "Brief target flash where a UI-automation action fires.",
+    },
+    "PUSHBACK_ENABLED": {
+        "tab": "advanced", "label": "JARVIS-style pushback", "type": "bool",
+        "default": True,
+        "help": "In-character objection before gray-zone bulk actions.",
+    },
+    "MISSION_NARRATION_ENABLED": {
+        "tab": "advanced", "label": "Mission narration", "type": "bool",
+        "default": True,
+        "help": "Narrate multi-step action chains aloud.",
+    },
+    "OVERNIGHT_UPGRADE_ENABLED": {
+        "tab": "advanced", "label": "Overnight self-upgrade", "type": "bool",
+        "default": False,
+        "help": "Auto-fire the upgrade pipeline when idle (currently paused).",
+    },
+    "VAD_DEBUG": {
+        "tab": "advanced", "label": "VAD debug prints", "type": "bool",
+        "default": True,
+        "help": "Print peak RMS after each utterance to tune VAD_THRESHOLD.",
+    },
+    "SCREEN_VISION_ENABLED": {
+        "tab": "advanced", "label": "Screen vision", "type": "bool",
+        "default": True,
+        "help": "Let JARVIS see and reason about the screen.",
+    },
+    "PC_CONTROL_ENABLED": {
+        "tab": "advanced", "label": "PC control", "type": "bool",
+        "default": True,
+        "help": "Allow launching apps, opening URLs, etc.",
+    },
+}
+
+# Field types whose key is a real persisted setting (everything except the
+# read-only "status" rows, whose keys start with "_status_").
+_PERSISTED_TYPES = {"bool", "enum", "str", "int", "float", "text"}
+
+
+def persisted_keys() -> list[str]:
+    """The schema keys that map to a stored value (excludes status rows)."""
+    return [k for k, s in SCHEMA.items() if s.get("type") in _PERSISTED_TYPES]
+
+
+def default_settings() -> dict:
+    """The full template: every persisted key at its schema default.
+
+    Mirrors core/config.py's current defaults so a fresh install boots with a
+    valid file. Mutable defaults (lists) are deep-copied so callers can't
+    mutate the schema by editing the result.
+    """
+    out: dict = {}
+    for key in persisted_keys():
+        default = SCHEMA[key]["default"]
+        if isinstance(default, list):
+            default = list(default)
+        out[key] = default
+    return out
+
+
+def coerce_value(spec: dict, raw):
+    """Coerce a raw value to the type its schema spec declares.
+
+    Never raises on bad input — falls back to the spec default so a hand-edited
+    settings file with a typo can't crash the GUI or a downstream reader.
+    """
+    typ = spec.get("type")
+    default = spec.get("default")
+    try:
+        if typ == "bool":
+            if isinstance(raw, bool):
+                return raw
+            if isinstance(raw, (int, float)):
+                return bool(raw)
+            if isinstance(raw, str):
+                return raw.strip().lower() in ("1", "true", "yes", "on", "y")
+            return bool(default)
+        if typ == "int":
+            return int(raw)
+        if typ == "float":
+            return float(raw)
+        if typ == "enum":
+            val = str(raw)
+            choices = spec.get("choices") or []
+            return val if val in choices else default
+        if typ == "text":
+            # Stored as a list of lines; accept a list or a newline string.
+            if isinstance(raw, list):
+                return [str(x) for x in raw]
+            if isinstance(raw, str):
+                return [ln.strip() for ln in raw.splitlines() if ln.strip()]
+            return list(default) if isinstance(default, list) else []
+        # str (and anything unknown) → string
+        return str(raw)
+    except (TypeError, ValueError):
+        if isinstance(default, list):
+            return list(default)
+        return default
+
+
+def load_settings(path: str = SETTINGS_PATH) -> dict:
+    """Load settings, layering the on-disk file over the defaults.
+
+    Missing file or missing keys fall back to defaults; every value is coerced
+    to its schema type. Unknown keys in the file are preserved untouched (so a
+    newer JARVIS that wrote extra keys isn't clobbered by an older GUI).
+    """
+    merged = default_settings()
+    raw: dict = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read().strip()
+            if text:
+                decoded = json.loads(text)
+                if isinstance(decoded, dict):
+                    raw = decoded
+        except (OSError, ValueError):
+            raw = {}
+    # Coerce known keys; pass through unknown keys verbatim.
+    for key, value in raw.items():
+        spec = SCHEMA.get(key)
+        merged[key] = coerce_value(spec, value) if spec else value
+    return merged
+
+
+def atomic_write_json(path: str, data: dict) -> None:
+    """Write `data` as pretty JSON via temp-file + os.replace.
+
+    Same crash-safe pattern as tray.py's `_send_command`: write to a temp file
+    in the destination directory, fsync-free, then atomically rename over the
+    target so a reader never observes a half-written file.
+    """
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp", prefix="usettings_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def save_settings(values: dict, path: str = SETTINGS_PATH) -> None:
+    """Persist `values` (coerced to schema types) to `path`, atomically."""
+    out = default_settings()
+    for key, value in values.items():
+        spec = SCHEMA.get(key)
+        out[key] = coerce_value(spec, value) if spec else value
+    atomic_write_json(path, out)
+
+
+def ensure_settings_file(path: str = SETTINGS_PATH) -> dict:
+    """Guarantee a valid settings file exists, creating it from defaults.
+
+    Returns the loaded settings. Called on GUI launch so a fresh install lands
+    a complete data/user_settings.json on first open.
+    """
+    if not os.path.exists(path):
+        try:
+            atomic_write_json(path, default_settings())
+        except OSError:
+            pass
+    return load_settings(path)
+
+
+def integration_status(spec: dict) -> tuple[bool, str]:
+    """Resolve a status row to (present, detail) WITHOUT exposing any secret.
+
+    Only the PRESENCE of each env var (or config file) is checked — values are
+    never read into the return. `match == "any"` means present if ANY listed
+    env var is set; otherwise ALL must be set.
+    """
+    envs = spec.get("secret_env") or []
+    present_flags = [bool((os.environ.get(e) or "").strip()) for e in envs]
+    cfg_present = False
+    cfg_file = spec.get("config_file")
+    if cfg_file:
+        cfg_present = os.path.exists(os.path.join(DATA_DIR, cfg_file))
+
+    if not envs and cfg_file:
+        return (cfg_present, "configured" if cfg_present else "not configured")
+    if not envs and not cfg_file:
+        return (False, "not configured")
+
+    if spec.get("match") == "any":
+        present = any(present_flags) or cfg_present
+    else:
+        present = all(present_flags) or (cfg_present and not envs)
+    return (present, "present" if present else "not set")
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    """Parse CLI args. `--tab <name>` selects the starting tab."""
+    parser = argparse.ArgumentParser(
+        prog="settings_window",
+        description="JARVIS settings GUI (launched from the tray).",
+    )
+    parser.add_argument(
+        "--tab", choices=TAB_ORDER, default=None,
+        help="Which tab to open first (default: the first tab).",
+    )
+    return parser.parse_args(argv)
+
+
+def resolve_start_tab(tab) -> int:
+    """Map a `--tab` name to its index in TAB_ORDER (0 when unset/unknown)."""
+    if tab in TAB_ORDER:
+        return TAB_ORDER.index(tab)
+    return 0
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  ── GUI ──   (everything below requires tkinter; kept out of import-time)
+# ──────────────────────────────────────────────────────────────────────────
+def run_gui(start_tab: int = 0) -> int:
+    """Build and run the settings window. Returns a process exit code.
+
+    Imports tkinter lazily so importing this module (for the tests, or for the
+    schema) never requires a display or the Tk libraries.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import ttk, messagebox
+    except Exception as exc:  # pragma: no cover - headless/no-Tk path
+        sys.stderr.write(f"settings_window: tkinter unavailable ({exc})\n")
+        return 2
+
+    settings = ensure_settings_file()
+
+    try:
+        root = tk.Tk()
+    except Exception as exc:  # pragma: no cover - no display
+        sys.stderr.write(f"settings_window: no display ({exc})\n")
+        return 2
+
+    root.title("JARVIS Settings")
+    root.configure(bg=BG)
+    root.geometry("640x620")
+    root.minsize(560, 480)
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+
+    # ttk dark theme.
+    style = ttk.Style()
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+    style.configure("TNotebook", background=BG, borderwidth=0)
+    style.configure("TNotebook.Tab", background=FIELD_BG, foreground=FG,
+                    padding=(12, 6), font=FONT)
+    style.map("TNotebook.Tab",
+              background=[("selected", ACCENT)],
+              foreground=[("selected", "#ffffff")])
+    style.configure("TFrame", background=BG)
+    style.configure("Card.TFrame", background=BG)
+    style.configure("TLabel", background=BG, foreground=FG, font=FONT)
+    style.configure("Help.TLabel", background=BG, foreground=MUTED,
+                    font=FONT_SMALL)
+    style.configure("Head.TLabel", background=BG, foreground=FG, font=FONT_BOLD)
+    style.configure("TCheckbutton", background=BG, foreground=FG, font=FONT)
+    style.map("TCheckbutton", background=[("active", BG)])
+    style.configure("TCombobox", fieldbackground=FIELD_BG, background=FIELD_BG,
+                    foreground=FG, font=FONT)
+    style.configure("TButton", background=FIELD_BG, foreground=FG, font=FONT,
+                    padding=(10, 5))
+    style.map("TButton", background=[("active", ACCENT)])
+
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill="both", expand=True, padx=10, pady=(10, 4))
+
+    # Tk variable per persisted key; widgets read/write these.
+    vars_by_key: dict = {}
+    text_widgets: dict = {}
+
+    def _add_help(parent, spec, row):
+        help_text = spec.get("help")
+        if help_text:
+            ttk.Label(parent, text=help_text, style="Help.TLabel",
+                      wraplength=560, justify="left").grid(
+                row=row, column=0, columnspan=2, sticky="w",
+                padx=(2, 0), pady=(0, 8))
+
+    def _build_tab(tab_key):
+        # Scrollable frame so long tabs (Advanced) don't clip.
+        outer = ttk.Frame(notebook, style="TFrame")
+        canvas = tk.Canvas(outer, bg=BG, highlightthickness=0, bd=0)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical",
+                                  command=canvas.yview)
+        inner = ttk.Frame(canvas, style="TFrame")
+        inner.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        def _on_wheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_wheel)
+
+        row = 0
+        inner.columnconfigure(1, weight=1)
+        for key, spec in SCHEMA.items():
+            if spec.get("tab") != tab_key:
+                continue
+            typ = spec.get("type")
+            label = spec.get("label", key)
+
+            if typ == "status":
+                present, detail = integration_status(spec)
+                dot = "●" if present else "○"
+                color = "#3fb950" if present else MUTED
+                badge = tk.Label(inner, text=f"{dot} {label}: {detail}",
+                                 bg=BG, fg=color, font=FONT, anchor="w")
+                badge.grid(row=row, column=0, columnspan=2, sticky="w",
+                           padx=2, pady=(2, 0))
+                row += 1
+                _add_help(inner, spec, row)
+                row += 1
+                continue
+
+            if typ == "bool":
+                var = tk.BooleanVar(value=bool(settings.get(key)))
+                vars_by_key[key] = var
+                ttk.Checkbutton(inner, text=label, variable=var).grid(
+                    row=row, column=0, columnspan=2, sticky="w",
+                    padx=2, pady=(4, 0))
+                row += 1
+                _add_help(inner, spec, row)
+                row += 1
+                continue
+
+            if typ == "text":
+                ttk.Label(inner, text=label, style="Head.TLabel").grid(
+                    row=row, column=0, columnspan=2, sticky="w",
+                    padx=2, pady=(6, 2))
+                row += 1
+                txt = tk.Text(inner, height=5, width=48, bg=FIELD_BG, fg=FG,
+                              insertbackground=FG, font=FONT,
+                              relief="flat", padx=6, pady=4)
+                cur = settings.get(key) or []
+                if isinstance(cur, list):
+                    txt.insert("1.0", "\n".join(str(x) for x in cur))
+                else:
+                    txt.insert("1.0", str(cur))
+                txt.grid(row=row, column=0, columnspan=2, sticky="we",
+                         padx=2, pady=(0, 2))
+                text_widgets[key] = txt
+                row += 1
+                _add_help(inner, spec, row)
+                row += 1
+                continue
+
+            # enum / str / int / float → label + control on one row.
+            ttk.Label(inner, text=label).grid(
+                row=row, column=0, sticky="w", padx=2, pady=(6, 2))
+            if typ == "enum":
+                var = tk.StringVar(value=str(settings.get(key, "")))
+                vars_by_key[key] = var
+                ttk.Combobox(inner, textvariable=var, state="readonly",
+                             values=spec.get("choices", []), width=28).grid(
+                    row=row, column=1, sticky="we", padx=2, pady=(6, 2))
+            else:
+                var = tk.StringVar(value=str(settings.get(key, "")))
+                vars_by_key[key] = var
+                tk.Entry(inner, textvariable=var, bg=FIELD_BG, fg=FG,
+                         insertbackground=FG, font=FONT, relief="flat").grid(
+                    row=row, column=1, sticky="we", padx=2, pady=(6, 2))
+            row += 1
+            _add_help(inner, spec, row)
+            row += 1
+
+        notebook.add(outer, text=TAB_LABELS[tab_key])
+
+    for tab_key in TAB_ORDER:
+        _build_tab(tab_key)
+
+    try:
+        notebook.select(start_tab)
+    except Exception:
+        pass
+
+    # ── bottom bar: note + buttons ──
+    bar = ttk.Frame(root, style="TFrame")
+    bar.pack(fill="x", padx=10, pady=(0, 10))
+    ttk.Label(bar, text=RESTART_NOTE, style="Help.TLabel").pack(side="left")
+
+    status_var = tk.StringVar(value="")
+    ttk.Label(bar, textvariable=status_var, style="Help.TLabel").pack(
+        side="left", padx=10)
+
+    def _collect() -> dict:
+        out: dict = dict(settings)  # keep unknown/passthrough keys
+        for key, var in vars_by_key.items():
+            out[key] = var.get()
+        for key, widget in text_widgets.items():
+            out[key] = widget.get("1.0", "end")
+        return out
+
+    def _on_save():
+        try:
+            save_settings(_collect())
+            status_var.set("Saved.")
+        except Exception as exc:
+            try:
+                messagebox.showerror("JARVIS Settings",
+                                     f"Could not save settings:\n{exc}")
+            except Exception:
+                pass
+            status_var.set("Save failed.")
+
+    def _open_json():
+        try:
+            ensure_settings_file()
+            if hasattr(os, "startfile"):
+                os.startfile(SETTINGS_PATH)  # noqa: S606 (Windows-only)
+            else:
+                status_var.set(SETTINGS_PATH)
+        except Exception as exc:
+            status_var.set(f"Open failed: {exc}")
+
+    ttk.Button(bar, text="Close", command=root.destroy).pack(
+        side="right", padx=(6, 0))
+    ttk.Button(bar, text="Save", command=_on_save).pack(side="right")
+    ttk.Button(bar, text="Open user_settings.json",
+               command=_open_json).pack(side="right", padx=(0, 6))
+
+    try:
+        root.mainloop()
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+    return 0
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    return run_gui(resolve_start_tab(args.tab))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

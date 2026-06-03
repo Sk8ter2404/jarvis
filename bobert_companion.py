@@ -2668,6 +2668,14 @@ def _dispatch_tray_command(cmd: str, entry: dict) -> None:
         _debug_mode[0] = not _debug_mode[0]
         _write_hud_state(debug_mode=bool(_debug_mode[0]))
         print(f"  [tray] debug_mode_toggle -> {_debug_mode[0]}")
+    elif cmd == "mic_mute_toggle":
+        # Mute Mic: drop captured mic input before dispatch (see
+        # _capture_utterance) so JARVIS hears nothing and stays idle — distinct
+        # from standby (wake-word-only) and Mute TTS (still acts, just silent).
+        # Drives the tray's red/muted listen indicator.
+        _mic_muted[0] = not _mic_muted[0]
+        _write_hud_state(mic_muted=bool(_mic_muted[0]))
+        print(f"  [tray] mic_mute_toggle -> {_mic_muted[0]}")
     else:
         # Generic fallthrough — route to a registered ACTIONS handler so the
         # 20+ commands tray.py sends (shutdown_jarvis, run_diagnostic, test_mic,
@@ -2742,6 +2750,8 @@ def _restore_tray_toggle_state() -> None:
 
     if "tts_muted" in persisted:
         _tts_muted[0] = bool(persisted.get("tts_muted"))
+    if "mic_muted" in persisted:
+        _mic_muted[0] = bool(persisted.get("mic_muted"))
     if "ambient_mode_active" in persisted:
         _ambient_mode_active[0] = bool(persisted.get("ambient_mode_active"))
     if "daemons_paused" in persisted:
@@ -2767,6 +2777,7 @@ def _restore_tray_toggle_state() -> None:
     # _write_hud_state from any other code path doesn't clobber them.
     _write_hud_state(
         tts_muted                = bool(_tts_muted[0]),
+        mic_muted                = bool(_mic_muted[0]),
         ambient_mode_active      = bool(_ambient_mode_active[0]),
         daemons_paused           = bool(_daemons_paused[0]),
         debug_mode               = bool(_debug_mode[0]),
@@ -2777,6 +2788,15 @@ def _restore_tray_toggle_state() -> None:
         noise_suppress_enabled   = bool(_audio_ns_enabled[0]),
         agc_enabled              = bool(_audio_agc_enabled[0]),
     )
+    # Publish the active LLM backend so the tray's AI submenu shows the right
+    # checkmark on first open (tray reads `llm_backend`: "anthropic" for Claude,
+    # else the ollama model tag it matches via .startswith()).
+    try:
+        _write_hud_state(
+            llm_backend=("anthropic" if str(AI_BACKEND).lower() == "claude"
+                         else str(OLLAMA_MODEL)))
+    except Exception:
+        pass
 
     # Bring ambient_listen up if the user had it on last time. ACTIONS
     # was populated by load_skills() already.
@@ -13547,6 +13567,17 @@ def _capture_utterance(injected_text, memory):
             print(f"  [inject] {text}")
         set_state("listening")
         return text, conf
+
+    # Mute Mic (tray "Mute Mic"): ignore the live mic entirely while muted —
+    # queued reminders still drain above and injected commands still pass, but no
+    # fresh recording is taken or dispatched. Brief sleep so the loop idles
+    # rather than busy-spinning on the immediate `continue`. Distinct from
+    # standby (which still wakes on the wake word) and Mute TTS (still acts, just
+    # silent). Drives the tray's red/muted listen indicator.
+    if _mic_muted[0]:
+        _heartbeat()
+        time.sleep(0.3)
+        return None
 
     # ── EXPERIMENTAL: realtime streaming capture (VOICE_MODE='realtime') ──────
     # Off by default: _get_realtime_session() returns None unless the flag is on

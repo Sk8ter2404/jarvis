@@ -2235,11 +2235,21 @@ def _act_switch_llm(arg: str = "") -> str:
         backend = bc.AI_BACKEND
         model = CLAUDE_MODEL if backend == "claude" else bc.OLLAMA_MODEL
         return f"current backend: {backend} (model: {model})"
+    # Publish the active backend to hud_state so the tray's AI submenu shows a
+    # checkmark on the live model. The tray reads `llm_backend`: "anthropic" for
+    # Claude, otherwise the ollama tag it matches via .startswith() (qwen…/llama…).
+    def _publish_backend(value: str) -> None:
+        try:
+            bc._write_hud_state(llm_backend=value)
+        except Exception:
+            pass
     if tag in ("claude", "anthropic"):
         bc.AI_BACKEND = "claude"
+        _publish_backend("anthropic")
         return f"switched to claude ({CLAUDE_MODEL})"
     if tag == "ollama":
         bc.AI_BACKEND = "ollama"
+        _publish_backend(bc.OLLAMA_MODEL)
         return f"switched to ollama (model: {bc.OLLAMA_MODEL})"
     # explicit model tag — verify it's one we recognise
     if tag in bc._KNOWN_OLLAMA_MODELS or any(tag.startswith(p) for p in
@@ -2247,6 +2257,7 @@ def _act_switch_llm(arg: str = "") -> str:
              "deepseek", "codellama")):
         bc.AI_BACKEND = "ollama"
         bc.OLLAMA_MODEL = tag
+        _publish_backend(tag)
         return f"switched to ollama / {tag}"
     return (f"unknown backend tag: {tag!r}. "
             f"Use 'claude' or one of: qwen2.5:14b, llama3.1:8b, mistral, ...")
