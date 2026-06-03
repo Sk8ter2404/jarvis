@@ -56,9 +56,13 @@ class RouteTests(unittest.TestCase):
 
     def test_daytime_neutral_routes_to_casual(self):
         # A neutral utterance at a daytime hour (no tone, not excited, not
-        # late-night) falls through to 'casual' with an empty addendum.
+        # late-night) falls through to 'casual' with an empty addendum. `now`
+        # pins route's OWN clock check, but the nested detect_tone reads the real
+        # wall clock with no arg — so pin tone_detector's late-night helper too,
+        # else this flakes to 'late_night' at a late UTC hour on CI.
         ts = datetime.datetime(2026, 1, 1, 14, 0).timestamp()
-        r = ve.route_voice_emotion("open the notes", now=ts)
+        with mock.patch("core.tone_detector._is_late_night_hour", return_value=False):
+            r = ve.route_voice_emotion("open the notes", now=ts)
         self.assertEqual(r["mood"], "casual")
         self.assertEqual(r["addendum"], "")
 
