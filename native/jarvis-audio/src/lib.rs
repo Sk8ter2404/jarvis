@@ -10,3 +10,4 @@
 pub mod capture;
 pub mod protocol;
 pub mod ring_buffer;
+pub mod vad;

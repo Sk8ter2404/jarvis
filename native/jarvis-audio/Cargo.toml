@@ -1,6 +1,6 @@
 [package]
 name = "jarvis-audio"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "JARVIS native always-on audio capture/wake/VAD service (roadmap M1)"
 license = "MIT"
