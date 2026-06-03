@@ -144,6 +144,41 @@ def model_route(function: str) -> str:
     return MODEL_ROUTING.get(function, "auto")
 
 
+# ─── Ambient passive-learning toggles (skills/ambient_listen.py) ───────
+# Settings-GUI / user_settings.json knobs for the passive multimodal
+# daemons. These live here (not as literals in bobert_companion.py) so a
+# saved override flows through `from core.config import *` to the
+# skills/ambient_listen.py autostart and _get_config() reads.
+#
+# AMBIENT_LISTEN_ENABLED — autostart the mic-only ambient transcription
+#   daemon. False by default because it competes with record_speech for
+#   the input device (Windows WASAPI rejects two opens on the same mic).
+# AMBIENT_SCREEN_ENABLED — autostart periodic screen-snapshot analysis via
+#   the local VLM for ambient context. False by default (privacy).
+AMBIENT_LISTEN_ENABLED = False
+AMBIENT_SCREEN_ENABLED = False
+
+# ─── Screenshot privacy blocklist (vision capture guard) ───────────────
+# Case-insensitive substring patterns checked against the FOCUSED window
+# title before ANY screen capture for vision (see_screen / ask_vision) or
+# a saved screenshot. If the active window's title contains any entry,
+# JARVIS refuses the capture instead of sending/saving the screen. Empty
+# default = no change (opt-in); add e.g. "1password", "bitwarden",
+# "banking" via the Settings GUI / user_settings.json to enforce.
+SCREENSHOT_PRIVACY_BLOCKLIST: list = []
+
+# ─── Spend ceilings (Settings GUI exposes both) ────────────────────────
+# DAILY_BUDGET_USD — hard cap on Claude spend per UTC day for the Chappie
+#   continuous-learning loop (skills/chappie_consciousness.py). Default
+#   1.0 to match that module's prior literal.
+# DEEP_AUDIT_BUDGET_USD — default daily ceiling for the background
+#   deep-audit diagnostic (core/diagnostic_daemons.py). The env var
+#   JARVIS_DEEP_AUDIT_BUDGET_USD still overrides this when set. Default
+#   5.0 to match the daemon's prior DEEP_AUDIT_DEFAULT_BUDGET_USD.
+DAILY_BUDGET_USD      = 1.0
+DEEP_AUDIT_BUDGET_USD = 5.0
+
+
 # ─── Sub-agent orchestrator (core/orchestrator.py) ─────────────────────
 # Decompose complex requests into parallel sub-tasks dispatched to
 # cheaper workers (Haiku or local Ollama) with restricted tool subsets.
@@ -502,6 +537,18 @@ MOUTH_SCALE   = 9.0     # RMS → mouth-open amount; raise if mouth barely moves
 # VAD_THRESHOLD tuning isn't invalidated — the processed chunks are
 # what we feed to Whisper.
 AUDIO_PROCESSING_ENABLED = True
+
+# Per-stage switches under the AUDIO_PROCESSING_ENABLED master. Each seeds
+# the matching runtime toggle in core/state.py (_audio_aec/ns/agc_enabled),
+# which the tray's Audio Controls submenu flips at runtime. Default True =
+# the prior hardcoded behaviour (all three stages on), so nothing changes
+# unless the user turns one off in the Settings GUI / user_settings.json.
+#   AUDIO_ECHO_CANCEL    — cancel JARVIS's own playback bleeding into the mic
+#   AUDIO_NOISE_SUPPRESS — suppress stationary background noise
+#   AUDIO_AGC            — auto-gain the mic to a target RMS before STT
+AUDIO_ECHO_CANCEL    = True
+AUDIO_NOISE_SUPPRESS = True
+AUDIO_AGC            = True
 
 
 # ─── VAD debug print (Phase 1E) ────────────────────────────────────────

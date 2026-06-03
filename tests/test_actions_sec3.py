@@ -72,6 +72,11 @@ def _base_bc(tmpdir=None):
     bc = mock.Mock()
     root = tmpdir or tempfile.gettempdir()
     bc.__file__ = os.path.join(root, "bobert_companion.py")
+    # The vision/screenshot actions consult bc.screenshot_privacy_block_reason()
+    # before capturing; a bare Mock would return a truthy Mock and trip the
+    # privacy refusal. Default it to "not blocked" so handlers run normally —
+    # the dedicated privacy tests override this.
+    bc.screenshot_privacy_block_reason.return_value = None
     return bc
 
 
@@ -760,6 +765,21 @@ class SeeScreenTests(unittest.TestCase):
             out = A._act_see_screen("what's on screen")
         self.assertIn("budget for this intent is exhausted", out)
         bc.take_all_monitor_screenshots.assert_not_called()
+
+    def test_privacy_blocklist_refuses_before_capture(self):
+        # A focused window matched SCREENSHOT_PRIVACY_BLOCKLIST: see_screen
+        # must speak the refusal and never capture or spend the budget.
+        bc = self._bc()
+        bc.screenshot_privacy_block_reason.return_value = "1password"
+        bc.SCREENSHOT_PRIVACY_REFUSAL = "REFUSED-PRIVATE"
+        with _patch_bc(bc), \
+                mock.patch("core.config.MONITORS", {"m": (0, 0, 100, 100)}):
+            out = A._act_see_screen("what's on screen")
+        self.assertEqual(out, "REFUSED-PRIVATE")
+        bc.take_all_monitor_screenshots.assert_not_called()
+        bc.take_screenshot.assert_not_called()
+        # budget untouched
+        self.assertEqual(bc._see_screen_budget_state.used, 0)
 
     def test_all_monitors_capture(self):
         bc = self._bc()

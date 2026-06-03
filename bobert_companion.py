@@ -759,7 +759,9 @@ WAKE_PHRASES = {
 # without responding. Wake phrases inside the buffer fire proactive_announce.
 # Disabled by default because it competes with record_speech for the input
 # device (Windows WASAPI rejects two opens on the same mic).
-AMBIENT_LISTEN_ENABLED                = False
+# AMBIENT_LISTEN_ENABLED now lives in core/config.py (Settings-GUI knob) and
+# arrives via `from core.config import *`; do NOT re-declare it here or the
+# literal would shadow the user's override.
 AMBIENT_LISTEN_BUFFER_MINUTES         = 10
 AMBIENT_LISTEN_CHUNK_DURATION_SECONDS = 0.5
 
@@ -810,7 +812,9 @@ if WAKE_RESUME_MODE not in ("answer_then_quiet", "stay_talkative"):
 #   AMBIENT_EXTRACT_BATCH               — max log lines per extraction pass.
 AMBIENT_AUDIO_ENABLED                  = False
 AMBIENT_AUDIO_CHUNK_DURATION_SECONDS   = 30.0
-AMBIENT_SCREEN_ENABLED                 = False
+# AMBIENT_SCREEN_ENABLED now lives in core/config.py (Settings-GUI knob) and
+# arrives via `from core.config import *`; do NOT re-declare it here or the
+# literal would shadow the user's override.
 AMBIENT_SCREEN_INTERVAL_S              = 60.0
 AMBIENT_SCREEN_BLOCKLIST               = ()      # extra regex strings
 AMBIENT_VISION_BUDGET_USD              = 1.00    # daily cap
@@ -6950,13 +6954,64 @@ def play_with_lipsync(audio: np.ndarray, sr: int):
 
 import base64
 
+# Spoken refusal returned by the vision/screenshot actions when the focused
+# window matches SCREENSHOT_PRIVACY_BLOCKLIST — kept as a single constant so
+# every entry point says the same thing.
+SCREENSHOT_PRIVACY_REFUSAL = (
+    "I'm not capturing the screen — a private window is in focus, sir."
+)
+
+
+def screenshot_privacy_block_reason() -> str | None:
+    """Return the SCREENSHOT_PRIVACY_BLOCKLIST entry matching the focused
+    window's title (case-insensitive substring), or None when capture is
+    allowed.
+
+    Empty/missing blocklist → always None (no behaviour change). Any failure
+    reading the focused window is treated as 'allowed' so a transient Win32
+    hiccup never silently blinds vision — the blocklist is an opt-in privacy
+    guard, not a hard gate."""
+    try:
+        from core import config as _cfg
+        blocklist = getattr(_cfg, "SCREENSHOT_PRIVACY_BLOCKLIST", ()) or ()
+    except Exception:
+        return None
+    if not blocklist:
+        return None
+    try:
+        _, title, _ = _read_focused_window()
+    except Exception:
+        return None
+    if not title:
+        return None
+    low = title.lower()
+    for entry in blocklist:
+        try:
+            needle = str(entry).strip().lower()
+        except Exception:
+            continue
+        if needle and needle in low:
+            return str(entry)
+    return None
+
+
 def take_screenshot(monitor: str | None = None, max_dim: int = 1568) -> bytes | None:
     """Return PNG bytes of the requested monitor (defaults to primary),
     downscaled so the longest edge is at most max_dim. Claude vision
     requires the image to be under ~5MB and ≤ 1568px on the long side.
 
     Uses mss (preferred — DPI-safe, handles all multi-monitor configs on
-    Windows without crashing) with a PIL.ImageGrab fallback."""
+    Windows without crashing) with a PIL.ImageGrab fallback.
+
+    Hard privacy gate: if the focused window matches
+    SCREENSHOT_PRIVACY_BLOCKLIST, returns None without capturing — so every
+    caller (vision, saved screenshots, the loopback grabbers) is covered even
+    if a higher-level entry point forgot to check."""
+    blocked = screenshot_privacy_block_reason()
+    if blocked:
+        print(f"  [vision] screenshot refused — private window in focus "
+              f"(matched {blocked!r})")
+        return None
     try:
         from PIL import Image
     except ImportError:
@@ -7014,7 +7069,13 @@ def ask_vision(question: str, png_bytes: bytes | None = None) -> str:
     `[local-vision] ` so the user knows the offline eye answered."""
     if not SCREEN_VISION_ENABLED:
         return "(screen vision is disabled — set SCREEN_VISION_ENABLED = True)"
+    # Privacy gate first — when a blocklisted window is focused, refuse with a
+    # spoken line instead of the generic capture-failure text. Skip the check
+    # when the caller already supplied png_bytes (it captured before whatever
+    # is now focused; the gate ran at that capture).
     if png_bytes is None:
+        if screenshot_privacy_block_reason():
+            return SCREENSHOT_PRIVACY_REFUSAL
         png_bytes = take_screenshot()
     if png_bytes is None:
         return "(could not capture screen)"

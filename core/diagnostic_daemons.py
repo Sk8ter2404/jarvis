@@ -81,7 +81,14 @@ DEEP_AUDIT_BATCH_SIZE = 10
 DEEP_AUDIT_AGGRESSIVE_GAP_S = 3600    # 1h: aggressive mtime-triggered fallback
 DEEP_AUDIT_FILES_PER_RUN = 8          # files passed to the auditor model
 DEEP_AUDIT_MAX_RUNS_PER_HOUR = 5
-DEEP_AUDIT_DEFAULT_BUDGET_USD = 5.0
+# Default daily spend ceiling for the deep-audit daemon. Sourced from
+# core/config.py (Settings GUI knob) so a saved override applies; the
+# JARVIS_DEEP_AUDIT_BUDGET_USD env var still takes priority in
+# _deep_audit_budget_usd(). Falls back to 5.0 if core.config is unimportable.
+try:
+    from core.config import DEEP_AUDIT_BUDGET_USD as DEEP_AUDIT_DEFAULT_BUDGET_USD
+except Exception:
+    DEEP_AUDIT_DEFAULT_BUDGET_USD = 5.0
 DEEP_AUDIT_MODEL = os.environ.get(
     "JARVIS_DEEP_AUDIT_MODEL", "claude-sonnet-4-6"
 )

@@ -48,7 +48,13 @@ EPISODE_INTERVAL_SEC = 300       # build episodes every 5 min
 FACT_INTERVAL_SEC    = 1800      # roll facts every 30 min
 EPISODE_GAP_SEC      = 30        # utterances within 30s collapse into one episode
 EPISODE_MAX_UTT      = 40        # cap utterances per episode to keep prompts small
-DAILY_BUDGET_USD     = 1.0       # hard cap on Claude spend per UTC day
+# Hard cap on Claude spend per UTC day. Sourced from core/config.py so the
+# Settings GUI / user_settings.json override takes effect; falls back to the
+# historical 1.0 literal when core.config can't be imported (bare test import).
+try:
+    from core.config import DAILY_BUDGET_USD as DAILY_BUDGET_USD
+except Exception:
+    DAILY_BUDGET_USD = 1.0
 APPROX_COST_PER_CALL = 0.0012    # Haiku ~$0.25/$1.25 per Mtok; 1k tokens ≈ this
 SLEEP_TICK_SEC       = 30        # main loop wakeup; cheap
 

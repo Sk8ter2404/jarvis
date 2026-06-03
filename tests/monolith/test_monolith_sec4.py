@@ -445,6 +445,41 @@ class TakeScreenshotTests(MonolithGlobalsTestCase):
             self.assertEqual(out, b"PNGBYTES")
             img.resize.assert_called_once()  # downscale happened
 
+    def test_privacy_blocklist_hard_blocks_capture(self):
+        # Focused window title matches SCREENSHOT_PRIVACY_BLOCKLIST -> hard
+        # gate returns None WITHOUT ever invoking mss/PIL, so even a caller
+        # that forgot the high-level check can't leak a private screen.
+        from core import config as cfg
+        mssmod = mock.MagicMock()
+        with mock.patch.object(cfg, "SCREENSHOT_PRIVACY_BLOCKLIST",
+                               ["1password", "banking"]), \
+                mock.patch.object(self.bc, "_read_focused_window",
+                                  return_value=(1, "Chase Banking — Home", None)), \
+                mock.patch.dict(sys.modules, {"mss": mssmod}):
+            self.assertIsNone(self.bc.take_screenshot())
+        mssmod.mss.assert_not_called()       # never reached the capture backend
+
+    def test_privacy_blocklist_empty_is_noop(self):
+        # Empty blocklist (the default) must NOT change behaviour: a private-
+        # looking title still captures normally.
+        from core import config as cfg
+        pil, _img = self._fake_pil()
+        mssmod = mock.MagicMock()
+        sct = mock.MagicMock()
+        raw = mock.MagicMock()
+        raw.size = (800, 600)
+        raw.bgra = b""
+        sct.grab.return_value = raw
+        sct.monitors = [{"left": 0, "top": 0, "width": 800, "height": 600}]
+        mssmod.mss.return_value.__enter__ = lambda s: sct
+        mssmod.mss.return_value.__exit__ = lambda *a: False
+        del mssmod.MSS
+        with mock.patch.object(cfg, "SCREENSHOT_PRIVACY_BLOCKLIST", []), \
+                mock.patch.object(self.bc, "_read_focused_window",
+                                  return_value=(1, "1Password", None)), \
+                mock.patch.dict(sys.modules, {"mss": mssmod, "PIL": pil}):
+            self.assertEqual(self.bc.take_screenshot(), b"PNGBYTES")
+
 
 @requires_monolith
 class AskVisionTests(MonolithGlobalsTestCase):

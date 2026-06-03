@@ -37,7 +37,13 @@ from __future__ import annotations
 import threading
 from typing import Optional
 
-from core.config import AUDIO_PROCESSING_ENABLED, VAD_DEBUG
+from core.config import (
+    AUDIO_AGC,
+    AUDIO_ECHO_CANCEL,
+    AUDIO_NOISE_SUPPRESS,
+    AUDIO_PROCESSING_ENABLED,
+    VAD_DEBUG,
+)
 
 
 # ─── Sleep / standby / ambient toggles ─────────────────────────────────
@@ -124,11 +130,13 @@ _last_wake_date: list[Optional[str]] = [None]
 # threading "global" through every callsite. Master flag seeds from
 # the core/config value so flipping AUDIO_PROCESSING_ENABLED in
 # core/config.py is the canonical knob; tray toggles are runtime
-# overrides only.
+# overrides only. Each per-stage slot likewise seeds from its config
+# constant (AUDIO_ECHO_CANCEL / AUDIO_NOISE_SUPPRESS / AUDIO_AGC, all
+# default True) so the Settings GUI can turn a single stage off.
 _audio_master_enabled = [AUDIO_PROCESSING_ENABLED]
-_audio_aec_enabled    = [True]
-_audio_ns_enabled     = [True]
-_audio_agc_enabled    = [True]
+_audio_aec_enabled    = [AUDIO_ECHO_CANCEL]
+_audio_ns_enabled     = [AUDIO_NOISE_SUPPRESS]
+_audio_agc_enabled    = [AUDIO_AGC]
 
 
 # ─── Tray runtime toggles ──────────────────────────────────────────────

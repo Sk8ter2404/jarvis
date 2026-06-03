@@ -29,7 +29,7 @@ _ENV_PATH = os.path.join(_ROOT, ".env")
 
 # Curated essentials to prompt for (each must be a key in sw.SCHEMA).
 _ESSENTIALS = ["AI_BACKEND", "TTS_VOICE", "VOICE_MODE", "HUD_ENABLED",
-               "TRAY_ENABLED", "AMBIENT_LISTENING_ENABLED"]
+               "TRAY_ENABLED", "AMBIENT_LISTEN_ENABLED"]
 
 
 def env_has_api_key(env_path: str) -> bool:

@@ -197,9 +197,15 @@ SCHEMA: dict[str, dict] = {
         "default": True,
         "help": "Fan standing briefings out to parallel sub-agents.",
     },
+    "AMBIENT_LEARNING_FORCE_LOCAL": {
+        "tab": "ai", "label": "Free ambient learning (local model)",
+        "type": "bool", "default": False,
+        "help": "Force ambient / background learning onto the local model so it "
+                "costs $0. Foreground conversation is unaffected.",
+    },
 
     # ── Privacy / Ambient ──────────────────────────────────────────────
-    "AMBIENT_LISTENING_ENABLED": {
+    "AMBIENT_LISTEN_ENABLED": {
         "tab": "privacy", "label": "Ambient listening", "type": "bool",
         "default": False,
         "help": "Passively transcribe surroundings to learn context. OFF "
@@ -217,19 +223,22 @@ SCHEMA: dict[str, dict] = {
     },
     "SCREENSHOT_PRIVACY_BLOCKLIST": {
         "tab": "privacy", "label": "Screenshot privacy blocklist", "type": "text",
-        "default": ["1password", "bitwarden", "keepass", "banking"],
+        "default": [],
         "help": "One app/window title substring per line; screen vision skips "
-                "any window whose title matches (case-insensitive).",
+                "any window whose title matches (case-insensitive). Empty = "
+                "off. Try: 1password, bitwarden, keepass, banking.",
     },
     "DAILY_BUDGET_USD": {
         "tab": "privacy", "label": "Daily Claude $ cap", "type": "float",
-        "default": 5.0,
-        "help": "Soft daily ceiling for Claude API spend (USD).",
+        "default": 1.0,
+        "help": "Soft daily ceiling for the Chappie continuous-learning loop's "
+                "Claude API spend (USD).",
     },
     "DEEP_AUDIT_BUDGET_USD": {
         "tab": "privacy", "label": "Deep-audit daily $ cap", "type": "float",
-        "default": 1.0,
-        "help": "Daily ceiling for the background deep-audit diagnostic (USD).",
+        "default": 5.0,
+        "help": "Daily ceiling for the background deep-audit diagnostic (USD). "
+                "The JARVIS_DEEP_AUDIT_BUDGET_USD env var overrides this.",
     },
 
     # ── Integrations ───────────────────────────────────────────────────
