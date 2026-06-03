@@ -562,6 +562,182 @@ class RenderIconTests(TrayTestBase):
         self._assert_image(tray._render_icon("idle", 0, bambu_active=True))
 
 
+class IconRedesignTests(TrayTestBase):
+    """Behavioural guarantees of the redesigned icon (legible at 16/24 px):
+    full-reactor listen tint as the primary signal, a speaking halo, a large
+    corner queue badge, and a bambu print-mark — all over the arc-reactor base
+    with a procedural disc fallback that mirrors the same overlays."""
+
+    def _img(self, *a, **k):
+        return tray._render_icon(*a, **k)
+
+    def _reactor_base(self):
+        """A luminance-varied stand-in for the real arc-reactor PNG so that
+        tinting produces visibly different pixels (a flat fill would tint to the
+        same value for every state and defeat the comparison)."""
+        from PIL import Image, ImageDraw
+        b = Image.new("RGBA", (tray.SIZE, tray.SIZE), (0, 0, 0, 0))
+        d = ImageDraw.Draw(b)
+        d.ellipse([6, 6, tray.SIZE - 6, tray.SIZE - 6], fill=(0, 190, 255, 255))
+        d.ellipse([22, 22, tray.SIZE - 22, tray.SIZE - 22], fill=(200, 240, 255, 255))
+        return b
+
+    def _nonblank_px(self, img):
+        """Count pixels with any opacity — a quick 'something rendered' gauge.
+        Uses the alpha channel's histogram (getdata() is deprecated in Pillow)."""
+        alpha = img.getchannel("A")
+        hist = alpha.histogram()       # 256 buckets, index == alpha value
+        return sum(hist[1:])           # everything with alpha > 0
+
+    # -- primary signal: full-icon listen tint reads as different colours ---- #
+    def test_procedural_muted_differs_from_awake(self):
+        awake = self._img("listening", 0, muted=False)
+        muted = self._img("listening", 0, muted=True)
+        self.assertNotEqual(awake.tobytes(), muted.tobytes())
+
+    def test_procedural_standby_differs_from_awake(self):
+        awake = self._img("listening", 0)
+        standby = self._img("standby", 0)
+        self.assertNotEqual(awake.tobytes(), standby.tobytes())
+
+    def test_base_muted_differs_from_awake(self):
+        tray._base_icon = self._reactor_base()
+        awake = self._img("listening", 0, muted=False)
+        muted = self._img("listening", 0, muted=True)
+        self.assertNotEqual(awake.tobytes(), muted.tobytes())
+
+    def test_tint_preserves_size_and_alpha_shape(self):
+        # Tinting must keep the canvas size and not fill the transparent
+        # surround (the reactor identity / shape survives).
+        base = self._reactor_base()
+        out = tray._tint_image(base, tray.LISTEN_RED, tray.TINT_STRENGTH_MUTED)
+        self.assertEqual(out.size, (tray.SIZE, tray.SIZE))
+        self.assertEqual(out.mode, "RGBA")
+        # A corner pixel of the base is fully transparent; it must stay so.
+        self.assertEqual(out.getpixel((0, 0))[3], 0)
+
+    def test_tint_failure_returns_copy(self):
+        # _tint_image must never raise — on an internal error it returns a copy.
+        base = self._reactor_base()
+        with mock.patch.object(tray.ImageChops, "multiply",
+                               side_effect=RuntimeError("chops boom")):
+            out = tray._tint_image(base, tray.LISTEN_GREEN, 0.5)
+        self.assertEqual(out.size, (tray.SIZE, tray.SIZE))
+
+    # -- speaking halo: pulsing ring appears only while speaking ------------- #
+    def test_speaking_changes_pixels_vs_quiet(self):
+        tray._base_icon = self._reactor_base()
+        quiet = self._img("idle", 0)
+        speaking = self._img("speaking", 1, tts_amplitude=0.6)
+        self.assertNotEqual(quiet.tobytes(), speaking.tobytes())
+
+    def test_halo_noop_when_not_speaking(self):
+        # speak_t == 0 -> the halo draws nothing (image unchanged).
+        base = self._reactor_base()
+        before = base.tobytes()
+        tray._draw_speaking_halo(base, 0.0, tray.SPEAK_BLUE)
+        self.assertEqual(base.tobytes(), before)
+
+    def test_halo_draws_when_speaking(self):
+        base = self._reactor_base()
+        before = base.tobytes()
+        tray._draw_speaking_halo(base, 0.9, tray.SPEAK_BLUE)
+        self.assertNotEqual(base.tobytes(), before)
+
+    def test_halo_failure_swallowed(self):
+        base = self._reactor_base()
+        with mock.patch.object(tray.ImageFilter, "GaussianBlur",
+                               side_effect=RuntimeError("blur boom")):
+            tray._draw_speaking_halo(base, 0.9, tray.SPEAK_BLUE)  # must not raise
+
+    # -- queue badge: large, high-contrast, only when count > 0 ------------- #
+    def test_queue_badge_absent_when_zero(self):
+        base = self._reactor_base()
+        before = base.tobytes()
+        tray._draw_queue_badge(base, 0, tray.QUEUE_YELLOW)
+        self.assertEqual(base.tobytes(), before)
+
+    def test_queue_badge_appears_when_count_positive(self):
+        base = self._reactor_base()
+        before = base.tobytes()
+        tray._draw_queue_badge(base, 3, tray.QUEUE_YELLOW)
+        self.assertNotEqual(base.tobytes(), before)
+
+    def test_queue_badge_in_render_changes_image(self):
+        tray._base_icon = self._reactor_base()
+        none = self._img("idle", 0, queue_count=0)
+        some = self._img("idle", 0, queue_count=5)
+        self.assertNotEqual(none.tobytes(), some.tobytes())
+
+    def test_queue_badge_overflow_renders(self):
+        # >= 100 uses the "99+" string (smaller glyph) and still renders.
+        base = self._reactor_base()
+        tray._draw_queue_badge(base, 250, tray.QUEUE_YELLOW)  # must not raise
+        self._assert_image_like(self._img("idle", 0, queue_count=250))
+
+    def test_queue_badge_is_large(self):
+        # The badge must be a LARGE corner mark (legibility at 24px), i.e. a
+        # meaningful fraction of the canvas — guard against silent shrink.
+        self.assertGreaterEqual(tray.BADGE_FRAC, 0.35)
+
+    def test_queue_badge_font_none_skips_digit(self):
+        base = self._reactor_base()
+        with mock.patch.object(tray, "_get_font", return_value=None):
+            tray._draw_queue_badge(base, 7, tray.QUEUE_YELLOW)  # disc only, no raise
+
+    def test_queue_badge_failure_swallowed(self):
+        base = self._reactor_base()
+        with mock.patch.object(tray.ImageDraw.ImageDraw, "ellipse",
+                               side_effect=RuntimeError("ellipse boom")):
+            tray._draw_queue_badge(base, 7, tray.QUEUE_YELLOW)  # must not raise
+
+    # -- bambu print-mark: secondary corner mark, only when printing -------- #
+    def test_bambu_mark_changes_image(self):
+        tray._base_icon = self._reactor_base()
+        idle = self._img("idle", 0, bambu_active=False)
+        printing = self._img("idle", 0, bambu_active=True)
+        self.assertNotEqual(idle.tobytes(), printing.tobytes())
+
+    def test_bambu_mark_failure_swallowed(self):
+        base = self._reactor_base()
+        with mock.patch.object(tray.ImageDraw.ImageDraw, "polygon",
+                               side_effect=RuntimeError("poly boom")):
+            tray._draw_bambu_mark(base)  # must not raise
+
+    # -- procedural fallback mirrors the design ----------------------------- #
+    def test_procedural_disc_renders_and_tints(self):
+        green = tray._render_reactor_disc(tray.LISTEN_GREEN)
+        red = tray._render_reactor_disc(tray.LISTEN_RED)
+        self._assert_image_like(green)
+        self._assert_image_like(red)
+        # Different tint colour -> different disc pixels.
+        self.assertNotEqual(green.tobytes(), red.tobytes())
+        # The disc actually draws something (not a blank canvas).
+        self.assertGreater(self._nonblank_px(green), 0)
+
+    def test_render_never_raises_on_garbage_state(self):
+        # Bad/oddball inputs degrade rather than crash (watchdog regression risk).
+        for st in (None, "", "???", 12345, object()):
+            self._assert_image_like(self._img(st, 0, queue_count=-3))
+
+    def test_flat_fallback_when_both_renderers_fail(self):
+        # If BOTH the base composite and the procedural renderer blow up, the
+        # final guard still returns a valid 64px RGBA image.
+        from PIL import Image
+        tray._base_icon = Image.new("RGBA", (tray.SIZE, tray.SIZE), (0, 0, 0, 255))
+        with mock.patch.object(tray, "_render_icon_with_base",
+                               side_effect=RuntimeError("base boom")), \
+             mock.patch.object(tray, "_render_icon_procedural",
+                               side_effect=RuntimeError("proc boom")):
+            self._assert_image_like(self._img("idle", 0))
+
+    def _assert_image_like(self, img):
+        from PIL import Image
+        self.assertIsInstance(img, Image.Image)
+        self.assertEqual(img.size, (tray.SIZE, tray.SIZE))
+        self.assertEqual(img.mode, "RGBA")
+
+
 class ComputeSignalColorsTests(TrayTestBase):
     def test_muted_is_red(self):
         s = tray._compute_signal_colors("listening", 0, 0.0, 0, True, False)
@@ -607,6 +783,21 @@ class ComputeSignalColorsTests(TrayTestBase):
     def test_none_state_is_green(self):
         s = tray._compute_signal_colors(None, 0, 0.0, 0, False, False)
         self.assertEqual(s["listen"], tray.LISTEN_GREEN)
+
+    def test_muted_tint_is_stronger(self):
+        # Muted pushes the tint harder than awake/standby so RED is unmistakable
+        # at 16 px — the redesign's primary-signal guarantee.
+        muted = tray._compute_signal_colors("listening", 0, 0.0, 0, True, False)
+        awake = tray._compute_signal_colors("listening", 0, 0.0, 0, False, False)
+        self.assertEqual(muted["tint_strength"], tray.TINT_STRENGTH_MUTED)
+        self.assertEqual(awake["tint_strength"], tray.TINT_STRENGTH)
+        self.assertGreater(muted["tint_strength"], awake["tint_strength"])
+
+    def test_speak_t_zero_when_quiet_positive_when_speaking(self):
+        quiet = tray._compute_signal_colors("idle", 0, 0.0, 0, False, False)
+        loud = tray._compute_signal_colors("speaking", 0, 0.0, 0, False, False)
+        self.assertEqual(quiet["speak_t"], 0.0)
+        self.assertGreater(loud["speak_t"], 0.0)
 
 
 class BlendTests(TrayTestBase):
@@ -787,6 +978,11 @@ class CommandCallbackTests(TrayTestBase):
     def test_mute_tts(self):
         self._assert_cmd(tray._on_mute_tts, "mute_tts_toggle")
 
+    def test_mute_mic(self):
+        # New mic-mute toggle — must emit EXACTLY this command name, which the
+        # bobert capture-loop handler keys off of.
+        self._assert_cmd(tray._on_mute_mic, "mic_mute_toggle")
+
     def test_ambient_mode(self):
         self._assert_cmd(tray._on_ambient_mode, "ambient_mode_toggle")
 
@@ -918,6 +1114,17 @@ class StateReaderTests(TrayTestBase):
         self.assertTrue(tray._is_tts_muted())
         self._write_hud(tts_muted=False)
         self.assertFalse(tray._is_tts_muted())
+
+    def test_is_mic_muted(self):
+        self._write_hud(mic_muted=True)
+        self.assertTrue(tray._is_mic_muted())
+        self._write_hud(mic_muted=False)
+        self.assertFalse(tray._is_mic_muted())
+
+    def test_is_mic_muted_absent_is_false(self):
+        # Until bobert publishes the field, the toggle reads unchecked.
+        self._write_hud()
+        self.assertFalse(tray._is_mic_muted())
 
     def test_is_ambient_mode(self):
         self._write_hud(ambient_mode_active=True)
@@ -1897,12 +2104,37 @@ class MainMenuConstructionTests(TrayTestBase):
         menu = captured["kwargs"]["menu"]
         texts = [getattr(it, "text", None) for it in menu.items
                  if it is not tray.pystray.Menu.SEPARATOR]
-        for expected in ("Pause Listening", "Mute TTS", "Ambient Mode",
+        for expected in ("Pause Listening", "Mute TTS", "Mute Mic",
+                         "Ambient Mode", "Open HUD",
                          "Run Upgrade Now", "Restart JARVIS", "Shut Down JARVIS",
                          "Power tools", "AI", "Audio", "Memory", "Diagnostics",
                          "Settings", "About JARVIS", "Show Today's Summary",
                          "Queue Task…", "Quit Tray Only"):
             self.assertIn(expected, texts, expected)
+
+    def test_open_hud_menu_item_wired(self):
+        # _on_open_hud used to be dead (defined, never put in a menu). Assert the
+        # "Open HUD" item now exists and its action fires the open_hud command.
+        inst, captured = self._build_icon(["tray.py"])
+        menu = captured["kwargs"]["menu"]
+        item = next(it for it in self._flatten(menu)
+                    if getattr(it, "text", None) == "Open HUD")
+        with mock.patch.object(tray, "_send_command") as sc:
+            item(mock.Mock())
+        sc.assert_called_once_with("open_hud")
+
+    def test_mute_mic_menu_item_wired_and_checks_state(self):
+        # The "Mute Mic" toggle fires mic_mute_toggle and its checkmark reflects
+        # hud_state.mic_muted (written true here).
+        self._write_hud(mic_muted=True)
+        inst, captured = self._build_icon(["tray.py"])
+        menu = captured["kwargs"]["menu"]
+        item = next(it for it in self._flatten(menu)
+                    if getattr(it, "text", None) == "Mute Mic")
+        self.assertTrue(item.checked)
+        with mock.patch.object(tray, "_send_command") as sc:
+            item(mock.Mock())
+        sc.assert_called_once_with("mic_mute_toggle")
 
     def test_status_header_items_are_disabled(self):
         # The first four items are read-only status lines (enabled=False) whose

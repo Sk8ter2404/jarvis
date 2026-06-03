@@ -16,6 +16,7 @@ moment of import. Everything else is dumb-values-only so import stays
 microsecond-fast and side-effect-free. Helpers that *consume* these
 values live in their respective modules (audio, vision, etc.).
 """
+import json
 import os
 
 # ─── Location / device role ────────────────────────────────────────────
@@ -473,3 +474,53 @@ STANDBY_LOOP_MATCH_WINDOWS        = 3       # consecutive windows to trip (3 × 
 STANDBY_LOOP_ONSET_ENERGY_MIN     = 0.30    # librosa onset_strength mean ≥ this = musical
 STANDBY_LOOP_RHYME_RATIO_MIN      = 0.30    # share of word-pairs sharing 2-char suffix
 STANDBY_LOOP_WHISPER_MODEL        = "tiny"  # whisper model name (kept small for latency)
+
+
+# ─── User settings overrides (data/user_settings.json) ─────────────────
+# The tray Settings GUI (tools/settings_window.py) writes data/user_settings.json
+# (gitignored). Apply those overrides over the defaults above so a saved setting
+# takes effect on the next start — and because bobert_companion.py does
+# `from core.config import *` AFTER this module finishes importing, every
+# consumer (the monolith, core.voice_pipeline, the skills) sees the overridden
+# value with no extra wiring.
+#
+# Safe + best-effort (the second import-time I/O in this file, after
+# RAG_INDEX_PATHS): we override ONLY a constant that already exists here — so the
+# GUI's schema, which is curated FROM this file, is the allow-list — coerce to
+# the existing constant's type, and leave the default on any error. A missing
+# file (fresh install, before the GUI ever ran) is a silent no-op.
+def _apply_user_settings() -> None:
+    path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "data", "user_settings.json")
+    try:
+        if not os.path.exists(path):
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return
+    if not isinstance(data, dict):
+        return
+    g = globals()
+    for key, val in data.items():
+        if key.startswith("_") or key not in g:
+            continue          # only override an existing public config constant
+        cur = g[key]
+        try:
+            if isinstance(cur, bool):
+                g[key] = bool(val)
+            elif isinstance(cur, int) and not isinstance(cur, bool):
+                g[key] = int(val)
+            elif isinstance(cur, float):
+                g[key] = float(val)
+            elif isinstance(cur, str):
+                g[key] = str(val)
+            elif isinstance(cur, (list, tuple)) and isinstance(val, (list, tuple)):
+                g[key] = type(cur)(val)
+            # other / mismatched types: keep the default rather than risk a bad value
+        except Exception:
+            continue
+
+
+_apply_user_settings()

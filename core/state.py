@@ -140,6 +140,9 @@ _audio_agc_enabled    = [True]
 # VAD_DEBUG print sites read _debug_mode[0] at runtime so a toggle
 # takes effect immediately.
 _tts_muted            = [False]
+_mic_muted            = [False]   # tray "Mute Mic": when True, live mic input is
+                                  # dropped before dispatch so JARVIS ignores you
+                                  # (distinct from standby, which is wake-word-only)
 _ambient_mode_active  = [False]
 _daemons_paused       = [False]
 _debug_mode           = [VAD_DEBUG]
@@ -165,6 +168,7 @@ __all__ = [
     "_audio_ns_enabled",
     "_audio_agc_enabled",
     "_tts_muted",
+    "_mic_muted",
     "_ambient_mode_active",
     "_daemons_paused",
     "_debug_mode",

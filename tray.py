@@ -6,18 +6,24 @@ Spawned as a subprocess by bobert_companion.py at startup (mirrors the
 hud / reticle launcher pattern). Reads hud_state.json sibling to
 bobert_companion.py to drive icon state.
 
-Icon layout:
-  • Base       — assets/jarvis_icon.png (cyan arc-reactor). Matches the HUD's
-                 visual identity. Falls back to a procedural 4-dot grid if
-                 the asset is missing.
-  • 4 corner pips — small status indicators composited on top of the base
-                    so the 4 signals from the legacy design remain visible:
+Icon layout (redesigned for legibility at Windows' 16/24 px rasterisations —
+the old 4-corner-pip design collapsed to indistinct ~4 px dots when the shell
+downscaled the 64 px canvas):
 
-    top-left   — listening state: green=awake, gray=standby/sleep, red=muted
-    top-right  — TTS speaking: pulsing blue when JARVIS is talking
-    bottom-left — overnight upgrade queue depth: yellow with count badge
-                  (dim when queue is empty)
-    bottom-right — Bambu H2D print state: orange=printing, white=idle
+  • Base       — assets/jarvis_icon.png (cyan arc-reactor). Matches the HUD's
+                 visual identity. Falls back to a procedural reactor disc if
+                 the asset is missing.
+  • PRIMARY signal = full-icon TINT. The whole reactor is recoloured by the
+                 listening state so it reads at any size where tiny pips don't:
+                   green = awake · gray = standby/sleep · RED = muted.
+  • Speaking   — a bold blue HALO/ring pulses around the reactor while JARVIS
+                 is talking (a large glow survives downscaling).
+  • Queue      — when the overnight-upgrade queue is non-empty, a LARGE
+                 high-contrast badge (dark disc + bright digit) sits in the
+                 bottom-right corner so a single digit is readable at 24 px.
+                 It is dropped gracefully (too small to read) at 16 px.
+  • Bambu H2D  — a small but bold orange print-mark in the top-right corner
+                 only while a print is running (secondary signal, not a pip).
 
 Right-click menu — common toggles at top, power-user verbs grouped into
 five submenus (Power tools / AI / Memory / Diagnostics / Settings), with
@@ -29,8 +35,10 @@ no overnight engine is active) are greyed out via enabled=lambda.
     ─────
     Pause Listening      [✓ when in standby]
     Mute TTS             [✓ when hud_state.tts_muted]
+    Mute Mic             [✓ when hud_state.mic_muted] — drives the red tint
     Ambient Mode         [✓ when hud_state.ambient_mode_active]
     ─────
+    Open HUD
     Run Upgrade Now
     Restart JARVIS
     Shut Down JARVIS
@@ -71,7 +79,7 @@ import time
 
 try:
     import pystray
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 except Exception as e:  # pragma: no cover - import-time hard-dep guard; tests inject a fake pystray so the real import never fails here
     print(f"[tray] missing dependency: {e}")
     print("[tray] install with:  pip install pystray pillow")
@@ -114,11 +122,11 @@ TICK_SECONDS = 0.20   # 5 Hz animation tick — fast enough for the speaking
                       # shell with icon updates.
 SIZE = 64             # tray-icon canvas (Windows scales 16/24/32/40/48 from this)
 
-# ── Per-dot palette ───────────────────────────────────────────────────────
-# Each dot's "on" colour is the bright value; "off"/dim colours are
-# computed by darkening the bright value at render time. Speaking pulses
-# between DIM and bright via a sinusoidal alpha factor; the queue badge
-# overlays a count digit when non-empty.
+# ── Signal palette ────────────────────────────────────────────────────────
+# The listen colour is now the PRIMARY signal: the whole reactor is tinted
+# toward it (see _tint_image), so it reads at any rasterisation size. The
+# speaking colour drives a pulsing halo; the queue colour the badge disc;
+# the bambu colour a small corner print-mark.
 LISTEN_GREEN = (60, 210, 90)      # awake
 LISTEN_GRAY  = (140, 140, 150)    # standby / sleep
 LISTEN_RED   = (220, 40, 40)      # muted
@@ -131,6 +139,15 @@ QUEUE_DIM    = (55, 50, 18)       # dim when queue is empty
 
 BAMBU_ORANGE = (235, 130, 30)
 BAMBU_WHITE  = (220, 220, 220)    # idle
+
+# Tint strength — how strongly the listen colour recolours the reactor.
+# Awake/standby get a gentle wash so the arc-reactor identity survives;
+# muted is pushed harder so "RED = muted" is unmistakable even at 16 px.
+TINT_STRENGTH       = 0.45
+TINT_STRENGTH_MUTED = 0.62
+# Badge geometry as a fraction of the canvas — deliberately large so a
+# single digit survives Windows' downscale to 24 px.
+BADGE_FRAC = 0.46
 
 # Backwards-compat — older code paths still reference COLORS["idle"] etc.
 # Keeps the module import-safe if anything outside this file pokes at the
@@ -259,21 +276,33 @@ def _get_font(size: int):
 def _compute_signal_colors(state: str, frame: int, tts_amplitude: float,
                            queue_count: int, muted: bool,
                            bambu_active: bool) -> dict:
-    """Resolve the four signal slots to (rgb, label) tuples.
+    """Resolve every status signal the renderers need into one dict.
 
-    Shared between the arc-reactor pip overlay and the procedural 4-dot
-    fallback so both render the same colours for the same state. The
-    pulse phase for the speaking dot is computed here too so the two
-    renderers stay in lockstep.
+    Shared by the arc-reactor renderer and the procedural fallback so both
+    show identical colours for a given state. Besides the four base colours
+    it also resolves the derived values the redesign keys off:
+
+      • ``listen``       — the tint colour (PRIMARY signal); the whole
+                           reactor is recoloured toward it.
+      • ``tint_strength``— how hard to push the tint (muted pushes harder so
+                           red is unmistakable at 16 px).
+      • ``speak``        — pulsing halo colour; ``speak_t`` is the 0..1 pulse
+                           level (0 when quiet) so the halo can fade in/out.
+      • ``queue``/``queue_count`` — badge disc colour + the integer to draw.
+      • ``bambu``/``bambu_active`` — corner print-mark colour + whether to
+                           draw it at all.
     """
     raw = str(state or "").lower()
 
     if muted:
         listen_rgb = LISTEN_RED
+        tint_strength = TINT_STRENGTH_MUTED
     elif raw in ("standby", "sleeping", "sleep"):
         listen_rgb = LISTEN_GRAY
+        tint_strength = TINT_STRENGTH
     else:
         listen_rgb = LISTEN_GREEN
+        tint_strength = TINT_STRENGTH
 
     is_speaking = (raw == "speaking") or ((tts_amplitude or 0.0) > 0.02)
     if is_speaking:
@@ -282,8 +311,10 @@ def _compute_signal_colors(state: str, frame: int, tts_amplitude: float,
         t = 0.55 + 0.45 * (math.sin(frame * 2 * math.pi / 4) + 1) / 2
         t = max(t, min(1.0, 0.55 + (tts_amplitude or 0.0) * 0.5))
         speak_rgb = _blend(SPEAK_DIM, SPEAK_BLUE, t)
+        speak_t = t
     else:
         speak_rgb = SPEAK_DIM
+        speak_t = 0.0
 
     count = max(0, int(queue_count or 0))
     queue_rgb = QUEUE_YELLOW if count > 0 else QUEUE_DIM
@@ -292,7 +323,9 @@ def _compute_signal_colors(state: str, frame: int, tts_amplitude: float,
 
     return {
         "listen": listen_rgb,
+        "tint_strength": tint_strength,
         "speak":  speak_rgb,
+        "speak_t": speak_t,
         "queue":  queue_rgb,
         "bambu":  bambu_rgb,
         "queue_count": count,
@@ -300,104 +333,174 @@ def _compute_signal_colors(state: str, frame: int, tts_amplitude: float,
     }
 
 
-def _render_icon_with_base(base: "Image.Image", signals: dict) -> Image.Image:
-    """Composite four small status pips onto the arc-reactor base icon.
+def _tint_image(base: "Image.Image", rgb: tuple, strength: float) -> "Image.Image":
+    """Recolour ``base`` toward ``rgb`` while preserving its shape + shading.
 
-    Pips are pinned to the four corners outside the reactor disc so they
-    don't obscure the JARVIS identity. The queue pip carries a numeric
-    badge when queue_count > 0, same '99+' overflow rule as the procedural
-    fallback.
+    The arc-reactor's own luminance is kept (so the ring/disc detail and the
+    transparent surround survive); only the hue is washed toward the signal
+    colour. This is the PRIMARY status channel — a full-icon tint stays
+    legible at 16 px where the old corner pips dissolved into ~4 px mush.
+    Falls back to returning a copy on any error so the renderer never raises.
     """
-    img = base.copy()
-    d   = ImageDraw.Draw(img)
+    try:
+        strength = max(0.0, min(1.0, strength))
+        src = base if base.mode == "RGBA" else base.convert("RGBA")
+        r, g, b, a = src.split()
+        # Per-pixel luminance of the original drives the brightness of the
+        # tinted result, so highlights stay bright and shadows stay dark.
+        lum = src.convert("L")
+        tinted_rgb = Image.new("RGB", src.size, rgb)
+        # Multiply the flat tint by the luminance ramp -> shaded tint.
+        shaded = ImageChops.multiply(
+            tinted_rgb, Image.merge("RGB", (lum, lum, lum)))
+        orig_rgb = Image.merge("RGB", (r, g, b))
+        mixed = Image.blend(orig_rgb, shaded, strength)
+        mr, mg, mb = mixed.split()
+        return Image.merge("RGBA", (mr, mg, mb, a))
+    except Exception:
+        return base.copy()
 
-    # Pip size scales with canvas — ~28% of canvas so they read at 16/24px
-    # Windows rasterisations but stay clear of the central reactor.
-    pip = max(10, int(SIZE * 0.28))
-    margin = 0
-    positions = {
-        "listen": (margin,                  margin),                    # TL
-        "speak":  (SIZE - pip - margin,     margin),                    # TR
-        "queue":  (margin,                  SIZE - pip - margin),       # BL
-        "bambu":  (SIZE - pip - margin,     SIZE - pip - margin),       # BR
-    }
 
-    def _draw_pip(slot: str, fill_rgb: tuple) -> tuple:
-        x, y = positions[slot]
-        # Dark halo first so the pip pops over the cyan reactor ring,
-        # then the coloured fill, then a thin highlight for that
-        # "indicator LED" look.
-        d.ellipse([x - 1, y - 1, x + pip + 1, y + pip + 1],
-                  fill=(0, 0, 0, 200))
-        d.ellipse([x, y, x + pip, y + pip],
-                  fill=fill_rgb + (255,),
-                  outline=(255, 255, 255, 140), width=1)
-        return x, y
+def _draw_speaking_halo(img: "Image.Image", speak_t: float, rgb: tuple) -> None:
+    """Draw a soft pulsing ring just inside the canvas edge while speaking.
 
-    _draw_pip("listen", signals["listen"])
-    _draw_pip("speak",  signals["speak"])
-    qx, qy = _draw_pip("queue", signals["queue"])
-    if signals["queue_count"] > 0:
-        # Numeric badge inside the queue pip.
-        text = str(signals["queue_count"]) if signals["queue_count"] < 100 else "99+"
-        fsize = max(8, int(pip * 0.62))
-        font = _get_font(fsize)
+    A large halo (not a tiny dot) is the point — it reads as "JARVIS is
+    talking" even after Windows squashes the icon to 16 px. ``speak_t`` is
+    the 0..1 pulse level; at 0 we draw nothing. Mutates ``img`` in place.
+    """
+    if speak_t <= 0.0:
+        return
+    try:
+        alpha = int(90 + 150 * max(0.0, min(1.0, speak_t)))   # 90..240
+        ring = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        rd = ImageDraw.Draw(ring)
+        w = max(2, int(SIZE * 0.09))            # bold stroke
+        inset = max(1, int(SIZE * 0.04))
+        rd.ellipse([inset, inset, SIZE - 1 - inset, SIZE - 1 - inset],
+                   outline=rgb + (alpha,), width=w)
+        # Blur so the ring reads as a glow rather than a hard circle, and so
+        # it survives downscaling without aliasing into a dotted line.
+        ring = ring.filter(ImageFilter.GaussianBlur(max(1, int(SIZE * 0.03))))
+        img.alpha_composite(ring)
+    except Exception:
+        # A halo is pure polish — never let it break the icon.
+        pass
+
+
+def _draw_queue_badge(img: "Image.Image", count: int, queue_rgb: tuple) -> None:
+    """Draw a LARGE bottom-right count badge (dark disc + bright digit).
+
+    Sized at ``BADGE_FRAC`` of the canvas with a near-opaque dark disc behind
+    a high-contrast digit so a single character is still readable once the
+    shell downscales to 24 px (it simply becomes too small to resolve at
+    16 px — an acceptable, graceful degradation). No-op when count <= 0.
+    Mutates ``img`` in place.
+    """
+    if count <= 0:
+        return
+    try:
+        d = ImageDraw.Draw(img)
+        bd = max(12, int(SIZE * BADGE_FRAC))
+        x = SIZE - bd
+        y = SIZE - bd
+        # Dark disc with a bright rim in the queue colour -> pops off any base.
+        d.ellipse([x, y, x + bd, y + bd], fill=(15, 15, 18, 235),
+                  outline=queue_rgb + (255,), width=max(2, int(bd * 0.10)))
+        text = str(count) if count < 100 else "99+"
+        # One digit gets a big glyph; "99+" needs to be smaller to fit.
+        frac = 0.66 if len(text) <= 1 else (0.5 if len(text) == 2 else 0.4)
+        font = _get_font(max(8, int(bd * frac)))
         if font is not None:
             try:
                 bbox = d.textbbox((0, 0), text, font=font)
                 tw = bbox[2] - bbox[0]
                 th = bbox[3] - bbox[1]
-                tx = qx + (pip - tw) / 2 - bbox[0]
-                ty = qy + (pip - th) / 2 - bbox[1]
-                d.text((tx, ty), text, fill=(20, 20, 20, 255), font=font)
+                tx = x + (bd - tw) / 2 - bbox[0]
+                ty = y + (bd - th) / 2 - bbox[1]
+                d.text((tx, ty), text, fill=queue_rgb + (255,), font=font)
             except Exception:
                 pass
-    _draw_pip("bambu", signals["bambu"])
+    except Exception:
+        pass
 
+
+def _draw_bambu_mark(img: "Image.Image") -> None:
+    """Draw a small bold orange print-mark in the TOP-RIGHT corner.
+
+    Only called when a Bambu print is active, so its mere presence is the
+    signal (secondary to the listen tint). Kept compact but solid + rimmed
+    so it doesn't vanish at small sizes. Mutates ``img`` in place.
+    """
+    try:
+        d = ImageDraw.Draw(img)
+        m = max(8, int(SIZE * 0.30))
+        x1 = SIZE - m
+        y0 = 0
+        # Down-pointing triangle (a nozzle laying a line) — distinct from the
+        # round queue badge so the two corners never read as the same thing.
+        d.polygon([(x1, y0), (SIZE - 1, y0), ((x1 + SIZE - 1) / 2, m)],
+                  fill=BAMBU_ORANGE + (255,), outline=(20, 20, 20, 255))
+    except Exception:
+        pass
+
+
+def _render_icon_with_base(base: "Image.Image", signals: dict) -> Image.Image:
+    """Render the arc-reactor icon with the redesigned status overlays.
+
+    Pipeline: tint the whole reactor by the listen state (primary signal) →
+    pulse a speaking halo → stamp the large queue badge (if any) → mark a
+    Bambu print (if active). At most two overlays are ever bright at once
+    (halo + badge), so the icon stays glanceable rather than busy.
+    """
+    img = _tint_image(base, signals["listen"], signals["tint_strength"])
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+    _draw_speaking_halo(img, signals["speak_t"], signals["speak"])
+    if signals["bambu_active"]:
+        _draw_bambu_mark(img)
+    _draw_queue_badge(img, signals["queue_count"], signals["queue"])
+    return img
+
+
+def _render_reactor_disc(rgb: tuple) -> "Image.Image":
+    """Procedural stand-in for the arc-reactor PNG, recoloured to ``rgb``.
+
+    Used when the asset can't be loaded. Mirrors the real design: a glowing
+    tinted disc (so the listen-state tint still reads) instead of the legacy
+    4-dot grid, keeping the fallback visually consistent with the base path.
+    """
+    img = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    c = SIZE / 2
+    outer = SIZE * 0.46
+    # Outer dark ring -> bright tinted ring -> dim core -> bright centre,
+    # echoing the reactor's concentric look so the fallback isn't jarring.
+    d.ellipse([c - outer, c - outer, c + outer, c + outer],
+              fill=(18, 22, 28, 255))
+    r2 = SIZE * 0.40
+    d.ellipse([c - r2, c - r2, c + r2, c + r2],
+              outline=rgb + (255,), width=max(2, int(SIZE * 0.07)))
+    r3 = SIZE * 0.24
+    d.ellipse([c - r3, c - r3, c + r3, c + r3],
+              fill=_blend((10, 12, 16), rgb, 0.35) + (255,))
+    r4 = SIZE * 0.12
+    d.ellipse([c - r4, c - r4, c + r4, c + r4],
+              fill=_blend(rgb, (255, 255, 255), 0.4) + (255,))
     return img
 
 
 def _render_icon_procedural(signals: dict) -> Image.Image:
-    """Fallback renderer — the legacy 2×2 status grid. Used when the arc-
-    reactor PNG asset can't be loaded so the tray still shows status."""
-    img = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
+    """Fallback renderer used when the arc-reactor PNG can't be loaded.
 
-    inset = 4
-    gap   = 3
-    dot_d = (SIZE - 2 * inset - gap) // 2
-    positions = {
-        "listen": (inset,                       inset),
-        "speak":  (inset + dot_d + gap,         inset),
-        "queue":  (inset,                       inset + dot_d + gap),
-        "bambu":  (inset + dot_d + gap,         inset + dot_d + gap),
-    }
-
-    def _draw_dot(slot: str, fill_rgb: tuple, glow: bool = True) -> tuple:
-        x, y = positions[slot]
-        outline = (255, 255, 255, 90) if glow else (40, 40, 40, 160)
-        d.ellipse([x, y, x + dot_d, y + dot_d],
-                  fill=fill_rgb + (255,), outline=outline, width=1)
-        return x, y
-
-    _draw_dot("listen", signals["listen"])
-    _draw_dot("speak",  signals["speak"])
-    qx, qy = _draw_dot("queue", signals["queue"])
-    if signals["queue_count"] > 0:
-        text = str(signals["queue_count"]) if signals["queue_count"] < 100 else "99+"
-        fsize = max(10, int(dot_d * 0.65))
-        font = _get_font(fsize)
-        if font is not None:
-            try:
-                bbox = d.textbbox((0, 0), text, font=font)
-                tw = bbox[2] - bbox[0]
-                th = bbox[3] - bbox[1]
-                tx = qx + (dot_d - tw) / 2 - bbox[0]
-                ty = qy + (dot_d - th) / 2 - bbox[1]
-                d.text((tx, ty), text, fill=(20, 20, 20, 255), font=font)
-            except Exception:
-                pass
-    _draw_dot("bambu", signals["bambu"], glow=bool(signals["bambu_active"]))
+    Builds a procedural reactor disc tinted by the listen state, then runs
+    the SAME overlay stack as the base path (halo / badge / bambu mark) so
+    status reads identically whether or not the asset is present.
+    """
+    img = _render_reactor_disc(signals["listen"])
+    _draw_speaking_halo(img, signals["speak_t"], signals["speak"])
+    if signals["bambu_active"]:
+        _draw_bambu_mark(img)
+    _draw_queue_badge(img, signals["queue_count"], signals["queue"])
     return img
 
 
@@ -408,10 +511,11 @@ def _render_icon(state: str, frame: int, mic_level: float = 0.0,
 
     Two modes — picks based on whether the arc-reactor base asset loaded:
 
-      • Base loaded    — composite four small status pips in the corners
-                         over the arc-reactor PNG (primary brand identity).
-      • Base missing   — fall back to the legacy 2×2 dot grid so the tray
-                         still ships status info even with no asset.
+      • Base loaded    — tint the arc-reactor PNG by listen state and overlay
+                         the speaking halo + queue badge + bambu mark.
+      • Base missing   — render a procedural tinted reactor disc and run the
+                         same overlay stack, so status still reads with no
+                         asset present.
 
     Returns an RGBA PIL Image suitable for assignment to pystray.Icon.icon.
     Never raises — bad inputs degrade to the fallback rather than crash
@@ -424,7 +528,8 @@ def _render_icon(state: str, frame: int, mic_level: float = 0.0,
     except Exception:
         # Worst-case: synthesise neutral signals so we still render something.
         signals = {
-            "listen": LISTEN_GRAY, "speak": SPEAK_DIM,
+            "listen": LISTEN_GRAY, "tint_strength": TINT_STRENGTH,
+            "speak": SPEAK_DIM, "speak_t": 0.0,
             "queue":  QUEUE_DIM,   "bambu": BAMBU_WHITE,
             "queue_count": 0, "bambu_active": False,
         }
@@ -434,7 +539,14 @@ def _render_icon(state: str, frame: int, mic_level: float = 0.0,
             return _render_icon_with_base(_base_icon, signals)
         except Exception:
             logging.exception("[tray] base-icon composite failed — falling back")
-    return _render_icon_procedural(signals)
+    try:
+        return _render_icon_procedural(signals)
+    except Exception:
+        # Absolute last resort: a flat tinted square so icon assignment never
+        # receives a non-image. Keeps the animation loop alive no matter what.
+        logging.exception("[tray] procedural render failed — flat fallback")
+        return Image.new("RGBA", (SIZE, SIZE),
+                         tuple(signals.get("listen", LISTEN_GRAY)) + (255,))
 
 
 # ─── Parent-process watchdog ─────────────────────────────────────────────
@@ -615,6 +727,12 @@ def _on_pause_listening(icon, item):
 def _on_mute_tts(icon, item):
     """Toggle TTS mute — JARVIS still thinks/acts but stays silent."""
     _send_command("mute_tts_toggle")
+
+def _on_mute_mic(icon, item):
+    """Toggle the microphone mute. Bobert's capture loop drops input while
+    muted and mirrors the new flag back to hud_state.mic_muted, which also
+    drives the icon's red listen tint."""
+    _send_command("mic_mute_toggle")
 
 def _on_ambient_mode(icon, item):
     """Toggle ambient mode (continuous-listen background mode)."""
@@ -1275,6 +1393,12 @@ def _is_tts_muted() -> bool:
     return bool(_read_hud_state().get("tts_muted"))
 
 
+def _is_mic_muted() -> bool:
+    """Mic-mute checkmark source. bobert publishes hud_state.mic_muted when it
+    processes the mic_mute_toggle command; absent until then -> unchecked."""
+    return bool(_read_hud_state().get("mic_muted"))
+
+
 def _is_ambient_mode() -> bool:
     return bool(_read_hud_state().get("ambient_mode_active"))
 
@@ -1388,8 +1512,8 @@ def _open_settings_window(tab: str = "") -> None:
     if os.path.exists(fallback):
         _open_path(fallback, "user_settings.json")
     else:
-        print(f"[tray] settings window not installed and no user_settings.json"
-              f" — install tools/settings_window.py to enable Settings menu")
+        print("[tray] settings window not installed and no user_settings.json"
+              " — install tools/settings_window.py to enable Settings menu")
 
 
 def main():
@@ -1529,10 +1653,13 @@ def main():
                          checked=lambda i: _is_listen_paused()),
         pystray.MenuItem("Mute TTS",        _on_mute_tts,
                          checked=lambda i: _is_tts_muted()),
+        pystray.MenuItem("Mute Mic",        _on_mute_mic,
+                         checked=lambda i: _is_mic_muted()),
         pystray.MenuItem("Ambient Mode",    _on_ambient_mode,
                          checked=lambda i: _is_ambient_mode()),
         pystray.Menu.SEPARATOR,
         # ── core lifecycle verbs ──
+        pystray.MenuItem("Open HUD",        _on_open_hud),
         pystray.MenuItem("Run Upgrade Now", _on_force_upgrade),
         pystray.MenuItem("Restart JARVIS",  _on_restart),
         pystray.MenuItem("Shut Down JARVIS", _on_shutdown_jarvis),
