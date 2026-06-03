@@ -238,6 +238,58 @@ class AutoCaptureTests(unittest.TestCase):
         self.assertIsNotNone(rep)
 
 
+class ApiSubmitTests(unittest.TestCase):
+    def test_auto_submit_flag(self):
+        with mock.patch.dict(os.environ, {"JARVIS_BUG_AUTO_SUBMIT": "1"}):
+            self.assertTrue(bug_reporter.auto_submit_enabled())
+        with mock.patch.dict(os.environ, {"JARVIS_BUG_AUTO_SUBMIT": "0"}):
+            self.assertFalse(bug_reporter.auto_submit_enabled())
+
+    def test_issue_token_lookup(self):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("JARVIS_GITHUB_TOKEN", "GITHUB_TOKEN")}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertIsNone(bug_reporter._issue_token())
+        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "g"}):
+            self.assertEqual(bug_reporter._issue_token(), "g")
+
+    def test_api_submit_no_token_returns_none(self):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("JARVIS_GITHUB_TOKEN", "GITHUB_TOKEN")}
+        with mock.patch.dict(os.environ, env, clear=True):
+            rep = bug_reporter.make_report("user", "x")
+            self.assertIsNone(bug_reporter.api_submit_issue(rep))
+
+    def test_api_submit_posts_and_returns_url(self):
+        rep = bug_reporter.make_report("auto", "Crash", tb="TB")
+        seen = {}
+
+        def opener(url, payload, token):
+            seen.update(url=url, payload=payload, token=token)
+            return "https://github.com/o/r/issues/9"
+
+        out = bug_reporter.api_submit_issue(rep, owner="o", repo="r",
+                                            token="tok", opener=opener)
+        self.assertEqual(out, "https://github.com/o/r/issues/9")
+        self.assertEqual(seen["url"], "https://api.github.com/repos/o/r/issues")
+        self.assertEqual(seen["token"], "tok")
+        self.assertIn(b"Crash", seen["payload"])
+
+    def test_api_submit_opener_none_result(self):
+        rep = bug_reporter.make_report("user", "x")
+        self.assertIsNone(bug_reporter.api_submit_issue(
+            rep, token="t", opener=lambda *a: None))
+
+    def test_api_submit_opener_raises_is_swallowed(self):
+        rep = bug_reporter.make_report("user", "x")
+
+        def boom(*a):
+            raise RuntimeError("net down")
+
+        self.assertIsNone(bug_reporter.api_submit_issue(rep, token="t",
+                                                        opener=boom))
+
+
 class ReportBugActionTests(unittest.TestCase):
     """The core.actions surface (_act_report_bug) — light tier, no monolith boot."""
 
@@ -266,6 +318,22 @@ class ReportBugActionTests(unittest.TestCase):
         out = self.A._act_report_bug("something broke")
         self.assertIn("Logged it locally", out)
         m_append.assert_called_once()
+
+    @mock.patch("core.bug_reporter.api_submit_issue",
+                return_value="https://github.com/x/y/issues/3")
+    @mock.patch("core.bug_reporter.append_outbox", return_value=True)
+    def test_api_submit_when_enabled(self, m_append, m_api):
+        with mock.patch.dict(os.environ, {"JARVIS_BUG_AUTO_SUBMIT": "1"}):
+            out = self.A._act_report_bug("broke")
+        self.assertIn("filed a GitHub issue", out)
+        m_api.assert_called_once()
+
+    @mock.patch("core.bug_reporter.api_submit_issue", return_value=None)
+    @mock.patch("core.bug_reporter.append_outbox", return_value=True)
+    def test_api_submit_failure_when_enabled(self, m_append, m_api):
+        with mock.patch.dict(os.environ, {"JARVIS_BUG_AUTO_SUBMIT": "1"}):
+            out = self.A._act_report_bug("broke")
+        self.assertIn("didn't go through", out)
 
 
 if __name__ == "__main__":

@@ -586,6 +586,25 @@ class ParseAndRunActionsTests(SectionSixBase):
             bc.parse_and_run_actions("[ACTION: boomer3, x]")
         cap.assert_not_called()
 
+    def test_action_exception_auto_submits_when_enabled(self):
+        # With both JARVIS_BUG_AUTO_CAPTURE and JARVIS_BUG_AUTO_SUBMIT on, the
+        # captured report is also POSTed via the API.
+        bc = self.bc
+        import core.bug_reporter as br
+
+        def boom(_arg):
+            raise ValueError("kaboom")
+
+        self._with_action("boomer4", boom)
+        with mock.patch.object(bc, "_needs_confirmation", lambda n, a: False), \
+             mock.patch.object(bc, "_jarvis_pushback", lambda n, a: None), \
+             mock.patch.dict(bc.os.environ, {"JARVIS_BUG_AUTO_CAPTURE": "1",
+                                             "JARVIS_BUG_AUTO_SUBMIT": "1"}), \
+             mock.patch.object(br, "auto_capture", return_value={"kind": "auto"}), \
+             mock.patch.object(br, "api_submit_issue") as sub:
+            bc.parse_and_run_actions("[ACTION: boomer4, x]")
+        sub.assert_called_once()
+
     def test_dropped_step_appended_after_real_action(self):
         bc = self.bc
         # Run a real registered informative action AND promise a see_screen read

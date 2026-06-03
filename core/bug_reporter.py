@@ -28,7 +28,9 @@ import os
 import re
 import time
 import traceback as _tb
+import urllib.error
 import urllib.parse
+import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -181,3 +183,52 @@ def browser_submit_url(report: Dict[str, Any], owner: str = _OWNER,
     title, body = format_issue(report)
     q = urllib.parse.urlencode({"title": title, "body": body, "labels": "bug"})
     return f"https://github.com/{owner}/{repo}/issues/new?{q}"
+
+
+def _issue_token() -> Optional[str]:
+    for k in ("JARVIS_GITHUB_TOKEN", "GITHUB_TOKEN"):
+        v = os.environ.get(k)
+        if v:
+            return v
+    return None
+
+
+def auto_submit_enabled() -> bool:
+    """Opt-in (default OFF): only when JARVIS_BUG_AUTO_SUBMIT=1 are reports POSTed
+    to the GitHub API automatically. Otherwise submission stays the consent-gated
+    browser-click path — nothing leaves the machine without a human."""
+    return os.environ.get("JARVIS_BUG_AUTO_SUBMIT", "0") == "1"
+
+
+def _issue_opener(url: str, payload: bytes, token: str) -> Optional[str]:  # pragma: no cover - real network
+    req = urllib.request.Request(
+        url, data=payload, method="POST",
+        headers={"Authorization": f"Bearer {token}",
+                 "Accept": "application/vnd.github+json",
+                 "Content-Type": "application/json; charset=utf-8",
+                 "User-Agent": "jarvis-bug-reporter"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data.get("html_url")
+    except (urllib.error.URLError, ValueError, OSError):
+        return None
+
+
+def api_submit_issue(report: Dict[str, Any], *, owner: str = _OWNER,
+                     repo: str = _REPO, token: Optional[str] = None,
+                     opener=None) -> Optional[str]:
+    """POST `report` as a GitHub issue via the API; return the issue URL, or None
+    (no token / API error). Total. `opener` is injectable for tests."""
+    tok = token if token is not None else _issue_token()
+    if not tok:
+        return None
+    title, body = format_issue(report)
+    payload = json.dumps({"title": title, "body": body,
+                          "labels": ["bug"]}).encode("utf-8")
+    url = f"https://api.github.com/repos/{owner}/{repo}/issues"
+    fn = opener if opener is not None else _issue_opener
+    try:
+        return fn(url, payload, tok)
+    except Exception:
+        return None
