@@ -14,8 +14,8 @@ Status: ☐ todo · ◐ in progress · ☑ done.
 ## Where it stands today
 
 ~101K-LOC local-first Windows voice assistant. `mic → Whisper → Claude emits
-[ACTION: …] → ~150 handlers → edge-TTS`. Public `v1.4.0` (all releases kept,
-`v1.0.0-beta.1` → `v1.4.0`); the self-upgrade pipeline's internal CHANGELOG
+[ACTION: …] → ~150 handlers → edge-TTS`. Public `v1.5.0` (all releases kept,
+`v1.0.0-beta.1` → `v1.5.0`); the self-upgrade pipeline's internal CHANGELOG
 counter (~v1.0.17) is a SEPARATE axis. **100% unit-test coverage,
 CI-green.** Genuinely strong: mature voice stack, cloud-optional (full local
 fallback on a 3090), dual-store memory + personal-files RAG, a rich proactive
@@ -29,7 +29,9 @@ felt most (latency, self-upgrade safety) have the clearest gaps.
 **Recently shipped (1.1 → 1.3):** realtime voice + neural wake flag-wired (F1/F2),
 the tray overhaul + standalone Settings GUI, the M3 self-upgrade safety gates, an
 **update checker** (boot nudge + the `check for updates` action), an **update
-wizard**, a first-run **setup wizard**, and an automatic **PII pre-commit guard**.
+wizard**, a first-run **setup wizard**, an automatic **PII pre-commit guard**, and
+M2 Phase 2 groundwork — the in-process **message bus** (`core/message_bus.py`,
+unwired). (Heading range above: 1.1 → 1.5.)
 
 ---
 
