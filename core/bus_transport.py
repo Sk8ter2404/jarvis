@@ -24,6 +24,13 @@ from typing import Any, List, Optional, Tuple
 
 _HEADER = struct.Struct(">I")  # 4-byte big-endian frame length
 
+# Largest frame the decoder will wait to assemble. A declared length above this
+# is treated as a corrupt/garbage prefix (or a giant frame whose sender died
+# mid-send) rather than a real frame: its header is skipped and parsing resyncs,
+# so a bogus 4-byte length can't wedge the stream or grow the buffer without
+# bound. Bus messages are small JSON control-plane frames, so 8 MiB is generous.
+_MAX_FRAME = 8 * 1024 * 1024
+
 
 def encode_frame(kind: str, name: str, payload: Any = None) -> bytes:
     """Encode one bus message to a length-prefixed JSON frame."""
@@ -34,13 +41,19 @@ def encode_frame(kind: str, name: str, payload: Any = None) -> bytes:
 def decode_frames(buffer: bytes) -> Tuple[List[dict], bytes]:
     """Parse every COMPLETE frame at the front of ``buffer``. Returns
     ``(messages, leftover_bytes)``. A frame with corrupt or non-object JSON is
-    skipped (its bytes consumed) so one bad frame can't wedge the stream. Never
-    raises."""
+    skipped (its bytes consumed) so one bad frame can't wedge the stream. A
+    length prefix exceeding ``_MAX_FRAME`` is likewise treated as corrupt: its
+    4-byte header is skipped and parsing resyncs on the following bytes, so a
+    bogus (or truncated-giant) prefix can't wedge the stream or grow the buffer
+    without bound while waiting for bytes that will never arrive. Never raises."""
     msgs: List[dict] = []
     pos = 0
     n = len(buffer)
     while n - pos >= _HEADER.size:
         (length,) = _HEADER.unpack_from(buffer, pos)
+        if length > _MAX_FRAME:
+            pos += _HEADER.size  # corrupt/oversized prefix — skip header, resync
+            continue
         end = pos + _HEADER.size + length
         if end > n:
             break  # incomplete frame — wait for more bytes
