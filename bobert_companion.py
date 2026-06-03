@@ -10185,6 +10185,28 @@ skill_utils = {
     "fulfil_promise":   (lambda pid: _promises.fulfil_promise(pid)) if _promises else (lambda pid: False),
 }
 
+# M2 Phase 1 (2026-06-02): typed capability seam. JarvisServices wraps the
+# untyped skill_utils dict above in a typed facade (one method per capability,
+# accurate signatures, graceful degradation) so skills can depend on an
+# *interface* instead of a dict of lambdas closing over monolith globals — the
+# prerequisite for later moving a capability across a process bus without
+# touching skills. See docs/design/M2-process-isolation.md §"the two seams".
+#
+# This is purely ADDITIVE: the skill_utils dict and its injection are unchanged;
+# load_skills() injects this object as `mod.services` *alongside* `mod.skill_utils`
+# so existing `skill_utils["write_hud_state"](...)` calls keep working untouched
+# and skills migrate to `services.write_hud_state(...)` one at a time. core.services
+# is stdlib-only, so importing it here can't introduce an import cycle; the
+# try/except is belt-and-braces — a hypothetical broken core/services.py must never
+# stop skills from loading (the loader just falls back to dict-only injection).
+try:
+    from core.services import JarvisServices as _JarvisServices  # noqa: E402
+    _jarvis_services = _JarvisServices.from_skill_utils(skill_utils)
+except Exception as _svc_exc:  # pragma: no cover - defensive: core.services is stdlib-only and present in this tree
+    print(f"  [skill] JarvisServices unavailable ({_svc_exc}); "
+          f"skills fall back to skill_utils dict only")
+    _jarvis_services = None
+
 
 _loaded_skill_names: set[str] = set()   # skills load_skills() has loaded
 
@@ -10251,6 +10273,13 @@ def load_skills():
                 continue  # pragma: no cover - defensive: spec_from_file_location returns a loaded spec for any real .py path
             mod = importlib.util.module_from_spec(spec)
             mod.skill_utils = skill_utils   # inject utilities
+            # M2 Phase 1: additively inject the typed JarvisServices facade
+            # alongside the dict. Skills can use `services.write_hud_state(...)`
+            # instead of `skill_utils["write_hud_state"](...)`; both reach the
+            # same lambdas. Only injected when construction succeeded above —
+            # otherwise skills keep using the dict (still present, unchanged).
+            if _jarvis_services is not None:
+                mod.services = _jarvis_services
             # Make sub-imports resolve for packages — register before
             # exec so any `from .submodule import x` inside __init__ can
             # find the parent module.

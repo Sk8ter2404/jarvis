@@ -155,20 +155,46 @@ def _enqueue_speech(message: str) -> None:
 
 # ─── HUD strip publishing (merge so we don't clobber pulse_strip) ────────
 
+def _resolve_services():
+    """Return a ``core.services.JarvisServices`` for this skill, or ``None``.
+
+    M2 Phase 1 reference migration. The loader now injects a typed
+    ``services`` facade alongside the legacy ``skill_utils`` dict
+    (bobert_companion.load_skills). We prefer that object; if only the dict was
+    injected (e.g. an older monolith, or the isolated test harness that pins
+    ``skill_utils={...}``), we wrap it on the fly via ``from_skill_utils`` so the
+    call site is identical either way. Returns ``None`` only if neither was
+    injected (referencing the globals raises ``NameError``) — caller no-ops,
+    matching the old "HUD is best-effort" degradation exactly.
+    """
+    svc = globals().get("services")
+    if svc is not None:
+        return svc
+    try:
+        utils = skill_utils  # type: ignore[name-defined]
+    except NameError:
+        return None
+    if not isinstance(utils, dict):
+        return None
+    try:
+        from core.services import JarvisServices
+    except Exception:
+        return None
+    return JarvisServices.from_skill_utils(utils)
+
+
 def _publish_hud_strip(strip: str) -> None:
     """Merge `status_panel_strip` into HUD state via the canonical writer.
-    Both this skill and `system_pulse` publish into hud_state.json — using
-    bobert_companion's _write_hud_state (via skill_utils) means we share the
-    same _hud_state_lock + cache, so neither side's strip gets clobbered."""
-    writer = None
-    try:
-        writer = skill_utils.get("write_hud_state")  # type: ignore[name-defined]
-    except NameError:
-        writer = None
-    if writer is None:
+    Both this skill and `system_pulse` publish into hud_state.json — going
+    through bobert_companion's _write_hud_state (now reached via the typed
+    `services.write_hud_state`) means we share the same _hud_state_lock + cache,
+    so neither side's strip gets clobbered."""
+    svc = _resolve_services()
+    if svc is None:
         return
     try:
-        writer(status_panel_strip=strip, status_panel_updated_at=time.time())
+        svc.write_hud_state(status_panel_strip=strip,
+                            status_panel_updated_at=time.time())
     except Exception:
         pass
 
