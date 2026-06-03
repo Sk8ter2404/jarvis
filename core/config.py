@@ -418,6 +418,14 @@ OVERNIGHT_IDLE_MINUTES     = 30    # minutes of silence before a cycle fires
 OVERNIGHT_CYCLE_GAP_HOURS  = 0.5   # minimum hours between cycles
 OVERNIGHT_MODE_HOURS       = 8     # how long .overnight_active persists
 
+# ─── Update checker ────────────────────────────────────────────────────
+# UPDATE_CHECK_ENABLED = True lets a running instance compare itself to the
+# latest GitHub release on boot (once/day, cached in data/update_check.json)
+# and queue a single spoken nudge when a newer version exists. Needs a token
+# (JARVIS_GITHUB_TOKEN / GITHUB_TOKEN) for the private repo; degrades silently
+# without one. See core/update_checker.py.
+UPDATE_CHECK_ENABLED       = True
+
 
 # ─── Personal-files RAG (Khoj-style second brain) ──────────────────────
 # Watched folders, embed, semantic search. Read by skills/personal_rag.py
