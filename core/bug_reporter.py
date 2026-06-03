@@ -38,9 +38,36 @@ _OWNER = os.environ.get("JARVIS_GITHUB_OWNER", "Sk8ter2404")
 _REPO = os.environ.get("JARVIS_GITHUB_REPO", "jarvis")
 _OUTBOX = os.path.join(_ROOT, "data", "bug_reports.jsonl")
 
+
+def _luhn(digits: str) -> bool:
+    """True if `digits` (a run of 0-9) satisfies the Luhn checksum. This gate is
+    what lets the credit-card rule redact real cards without eating arbitrary
+    long digit runs (order numbers, timestamps): only a number that actually
+    checksums as a card is removed."""
+    total = 0
+    # Walk right-to-left, doubling every second digit (the Luhn algorithm).
+    for i, ch in enumerate(reversed(digits)):
+        d = int(ch)
+        if i % 2:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def _card_sub(m: "re.Match[str]") -> str:
+    """Redact a 13-19 digit candidate to <CARD> only when it passes Luhn;
+    otherwise leave the original text untouched (it isn't a card number)."""
+    digits = m.group(0).replace(" ", "").replace("-", "")
+    return "<CARD>" if _luhn(digits) else m.group(0)
+
+
 # (compiled pattern, replacement) applied IN ORDER. Specific secret shapes run
 # before the generic catch-alls so a token isn't half-redacted by a broad rule.
-_SCRUB_RULES: List[Tuple[Any, str]] = [
+# A replacement may be a string OR a callable (re.sub semantics) — the card rule
+# uses a callable so the Luhn check can veto a non-card digit run.
+_SCRUB_RULES: List[Tuple[Any, Any]] = [
     (re.compile(r"sk-ant-[A-Za-z0-9_-]{8,}"), "<KEY>"),
     (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "<KEY>"),
     (re.compile(r"ghp_[A-Za-z0-9]{20,}"), "<KEY>"),
@@ -66,6 +93,15 @@ _SCRUB_RULES: List[Tuple[Any, str]] = [
     (re.compile(r"(/(?:home|Users)/)[^/\r\n\"']+"), r"\1<USER>"),
     # MAC before the IP rules so its hex groups aren't partially eaten.
     (re.compile(r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b"), "<MAC>"),
+    # Payment-card numbers: a 13-19 digit run (optionally space/dash grouped),
+    # redacted ONLY when it Luhn-validates so order IDs/timestamps stay intact.
+    # Before the IP/HEX rules (a spaced/contiguous card never reaches <HEX>,
+    # which needs a contiguous 32+ hex run).
+    (re.compile(r"\b(?:\d[ -]?){12,18}\d\b"), _card_sub),
+    # North-American phone numbers — conservative: a separator between the
+    # 3-3-4 groups is REQUIRED, so a bare 10-digit id/timestamp isn't caught.
+    (re.compile(r"(?<!\d)(?:\+?1[\s.-]?)?(?:\(\d{3}\)|\d{3})[\s.-]\d{3}"
+                r"[\s.-]\d{4}(?!\d)"), "<PHONE>"),
     (re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"), "<IP>"),
     (re.compile(r"(?i)\b(?:[a-f0-9]{1,4}:){3,7}[a-f0-9]{1,4}\b"), "<IP>"),  # IPv6
     (re.compile(r"\b[A-Fa-f0-9]{32,}\b"), "<HEX>"),
