@@ -11653,7 +11653,11 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             if os.environ.get("JARVIS_BUG_AUTO_CAPTURE", "1") != "0":
                 try:
                     import core.bug_reporter as _br
-                    _br.auto_capture(e, where=name, context={"arg": arg[:200]})
+                    _rep = _br.auto_capture(e, where=name,
+                                            context={"arg": arg[:200]})
+                    # Autonomous upstream submission only when opted in.
+                    if _rep is not None and _br.auto_submit_enabled():
+                        _br.api_submit_issue(_rep)
                 except Exception:
                     pass
         finally:

@@ -1133,6 +1133,14 @@ def _act_report_bug(description: str = "") -> str:
                 "the timer never fired'.")
     from core import bug_reporter as br
     rep = br.record_bug("user", desc, context={"source": "voice"})
+    # Autonomous API submission when opted in (JARVIS_BUG_AUTO_SUBMIT=1);
+    # otherwise the consent-gated browser path below.
+    if br.auto_submit_enabled():
+        issue = br.api_submit_issue(rep)
+        if issue:
+            return f"Logged it (scrubbed of personal info) and filed a GitHub issue: {issue}"
+        return ("Logged it locally (scrubbed) — auto-submit is on but the GitHub "
+                "API call didn't go through, so it's saved in the outbox.")
     url = br.browser_submit_url(rep)
     try:
         import webbrowser
