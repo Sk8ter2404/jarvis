@@ -80,3 +80,17 @@ python tools/run_tests.py && python tools/audit_codebase.py && python -m pyflake
 
 - Don't commit secrets or personal data — `check_no_pii.py` is the gate.
 - Don't hardcode personal paths, names, or LAN IPs; read them from config/env.
+
+## Enable the PII pre-commit guard (recommended)
+
+Install a one-time git hook that runs `check_no_pii.py` automatically before
+**every** commit and blocks any that would introduce a HARD PII/secret finding —
+so personal data can't slip into history by accident. On a machine with the
+gitignored owner-pattern file it loads those too.
+
+```powershell
+python tools/install_git_hooks.py
+```
+
+The hook lives under `.git/` (which git never tracks), so run it once per clone.
+Bypass a genuine false positive on a single commit with `git commit --no-verify`.
