@@ -165,6 +165,9 @@ class ScreenshotTests(unittest.TestCase):
         # bc.__file__ drives the output dir; point it inside our temp dir.
         self.fake = mock.Mock()
         self.fake.__file__ = os.path.join(self.tmp, "bobert_companion.py")
+        # _act_screenshot checks bc.screenshot_privacy_block_reason() first;
+        # default to "not blocked" so a bare Mock doesn't trip the refusal.
+        self.fake.screenshot_privacy_block_reason.return_value = None
 
     def _cleanup(self):
         import shutil
@@ -217,6 +220,21 @@ class ScreenshotTests(unittest.TestCase):
                 mock.patch.object(A.time, "strftime", return_value="s.png"):
             out = A._act_screenshot("")
         self.assertIn("not supported", out)
+
+    def test_privacy_blocklist_refuses_and_skips_powershell_fallback(self):
+        # When a SCREENSHOT_PRIVACY_BLOCKLIST window is focused, _act_screenshot
+        # must refuse BEFORE the PowerShell fallback — otherwise that fallback
+        # would capture the private screen directly, bypassing the gate that
+        # take_screenshot() enforces.
+        self.fake.screenshot_privacy_block_reason.return_value = "banking"
+        self.fake.SCREENSHOT_PRIVACY_REFUSAL = "REFUSED-PRIVATE"
+        with _patch_bc(self.fake), \
+                mock.patch.object(A.sys, "platform", "win32"), \
+                mock.patch.object(A.subprocess, "run") as mrun:
+            out = A._act_screenshot("")
+        self.assertEqual(out, "REFUSED-PRIVATE")
+        mrun.assert_not_called()                       # PowerShell never ran
+        self.fake.take_screenshot.assert_not_called()  # no capture attempted
 
 
 # ─────────────────────────────────────────────────────────────────────────

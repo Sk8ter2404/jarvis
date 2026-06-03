@@ -109,6 +109,11 @@ def _act_get_time(_: str = "") -> str:
 
 def _act_screenshot(_: str = "") -> str:
     bc = _bc()
+    # Privacy gate: refuse before the PowerShell fallback below — that path
+    # captures the screen directly and would otherwise bypass the blocklist
+    # that take_screenshot() enforces.
+    if bc.screenshot_privacy_block_reason():
+        return bc.SCREENSHOT_PRIVACY_REFUSAL
     out_dir = os.path.join(os.path.dirname(os.path.abspath(bc.__file__)), "screenshots")
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, time.strftime("screenshot_%Y%m%d_%H%M%S.png"))
@@ -1372,6 +1377,12 @@ def _act_where_is_user(_: str = "") -> str:
 
 def _act_see_screen(question: str) -> str:
     bc = _bc()
+    # Privacy gate: refuse (spoken) before spending the per-intent budget if a
+    # SCREENSHOT_PRIVACY_BLOCKLIST window is focused. take_screenshot() also
+    # hard-blocks, but checking here returns the in-character line instead of
+    # the generic "could not capture any monitor".
+    if bc.screenshot_privacy_block_reason():
+        return bc.SCREENSHOT_PRIVACY_REFUSAL
     from core.config import MONITORS
     monitor, question = bc._parse_monitor_prefix(question)
     q = question.strip() or "Describe in detail what is currently on the screen."
