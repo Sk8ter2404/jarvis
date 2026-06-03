@@ -373,6 +373,55 @@ class BootNudgeTests(unittest.TestCase):
             res = uc.boot_nudge(_boom, path=self.path)
         self.assertTrue(res["update_available"])
 
+    def test_same_version_nudges_once_within_ttl(self):
+        # The bug this fixes: an available update was re-announced on EVERY
+        # restart within the 24h cache window. A fresh cache (checked_at == the
+        # boot time) keeps cached_check offline, so this exercises the real
+        # throttle, not a mock.
+        uc.write_cache(self.path, {
+            "current": "1.1.0", "latest": "v1.2.0", "update_available": True,
+            "checked_at": 1000.0,
+        })
+        calls = []
+        # First boot inside the TTL announces the new version...
+        uc.boot_nudge(calls.append, path=self.path, now=1000.0 + 3600)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("v1.2.0", calls[0])
+        # ...and a second boot for the SAME latest tag stays silent.
+        uc.boot_nudge(calls.append, path=self.path, now=1000.0 + 7200)
+        self.assertEqual(len(calls), 1)  # still 1, not 2
+        # The throttle is persisted as nudged_for, not just in-process state.
+        self.assertEqual(uc.read_cache(self.path).get("nudged_for"), "v1.2.0")
+
+    def test_same_version_silent_after_ttl_refetch(self):
+        # After the TTL expires cached_check re-fetches and rewrites the cache
+        # WITHOUT nudged_for; the same tag must still stay silent (the nudge is
+        # once per version, not once per TTL window).
+        uc.write_cache(self.path, {
+            "current": "1.1.0", "latest": "v1.2.0", "update_available": True,
+            "nudged_for": "v1.2.0", "checked_at": 1000.0,
+        })
+        calls = []
+        with mock.patch.object(uc, "check_for_update",
+                               return_value={"current": "1.1.0", "latest": "v1.2.0",
+                                             "update_available": True}):
+            uc.boot_nudge(calls.append, path=self.path, now=1000.0 + 48 * 3600)
+        self.assertEqual(calls, [])
+        # nudged_for re-stamped, so it survives the re-fetch's cache rewrite.
+        self.assertEqual(uc.read_cache(self.path).get("nudged_for"), "v1.2.0")
+
+    def test_newer_version_nudges_again(self):
+        # Having nudged for v1.2.0, a genuinely newer v1.3.0 announces again.
+        uc.write_cache(self.path, {
+            "current": "1.1.0", "latest": "v1.3.0", "update_available": True,
+            "nudged_for": "v1.2.0", "checked_at": 1000.0,
+        })
+        calls = []
+        uc.boot_nudge(calls.append, path=self.path, now=1000.0 + 3600)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("v1.3.0", calls[0])
+        self.assertEqual(uc.read_cache(self.path).get("nudged_for"), "v1.3.0")
+
 
 class CheckForUpdatesActionTests(unittest.TestCase):
     """The core.actions surface (_act_check_for_updates) — light tier; the
