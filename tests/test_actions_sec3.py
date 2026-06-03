@@ -2057,6 +2057,421 @@ class UpgradeTests(unittest.TestCase):
                 out = A._act_upgrade()
             self.assertTrue(out.startswith("failed to spawn upgrade: spawn fail"))
 
+    def test_pending_count_read_failure_treated_as_zero(self):
+        # If opening/reading TODO_FILE raises, the except swallows it and
+        # pending stays 0 → "queue is empty" (covers the count except branch).
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "upgrade_jarvis.py"), "w",
+                      encoding="utf-8") as f:
+                f.write("# stub\n")
+            todo = os.path.join(td, "todo.md")
+            with open(todo, "w", encoding="utf-8") as f:
+                f.write("- [ ] task one\n")
+            bc = _base_bc(td)
+            bc.TODO_FILE = todo
+            real_open = open
+
+            def boom_open(path, *a, **k):
+                if os.path.abspath(path) == os.path.abspath(todo):
+                    raise OSError("read denied")
+                return real_open(path, *a, **k)
+
+            with _patch_bc(bc), \
+                    mock.patch("core.config.OVERNIGHT_UPGRADE_ENABLED", True), \
+                    mock.patch("builtins.open", side_effect=boom_open):
+                out = A._act_upgrade()
+            self.assertEqual(out, "queue is empty - nothing to upgrade right now")
+
+    def test_self_exit_closure_calls_os_exit(self):
+        # Drive the _self_exit daemon closure: capture the thread target, then
+        # run it with time.sleep + os._exit mocked.
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "upgrade_jarvis.py"), "w",
+                      encoding="utf-8") as f:
+                f.write("# stub\n")
+            todo = os.path.join(td, "todo.md")
+            with open(todo, "w", encoding="utf-8") as f:
+                f.write("- [ ] task\n")
+            bc = _base_bc(td)
+            bc.TODO_FILE = todo
+            captured = {}
+
+            def capture_thread(target=None, daemon=None):
+                captured["target"] = target
+                return mock.Mock()
+
+            with _patch_bc(bc), \
+                    mock.patch("core.config.OVERNIGHT_UPGRADE_ENABLED", True), \
+                    mock.patch.object(A.subprocess, "Popen"), \
+                    mock.patch("threading.Thread", side_effect=capture_thread):
+                A._act_upgrade()
+            # Now exercise the captured _self_exit body.
+            with mock.patch.object(A.time, "sleep"), \
+                    mock.patch.object(A.os, "_exit",
+                                      side_effect=SystemExit) as mexit:
+                with self.assertRaises(SystemExit):
+                    captured["target"]()
+            mexit.assert_called_once_with(0)
+
+    def test_self_exit_closure_exits_even_on_sleep_error(self):
+        # If time.sleep raises inside _self_exit, the except still calls _exit.
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "upgrade_jarvis.py"), "w",
+                      encoding="utf-8") as f:
+                f.write("# stub\n")
+            todo = os.path.join(td, "todo.md")
+            with open(todo, "w", encoding="utf-8") as f:
+                f.write("- [ ] task\n")
+            bc = _base_bc(td)
+            bc.TODO_FILE = todo
+            captured = {}
+
+            def capture_thread(target=None, daemon=None):
+                captured["target"] = target
+                return mock.Mock()
+
+            with _patch_bc(bc), \
+                    mock.patch("core.config.OVERNIGHT_UPGRADE_ENABLED", True), \
+                    mock.patch.object(A.subprocess, "Popen"), \
+                    mock.patch("threading.Thread", side_effect=capture_thread):
+                A._act_upgrade()
+            with mock.patch.object(A.time, "sleep",
+                                   side_effect=RuntimeError("clock boom")), \
+                    mock.patch.object(A.os, "_exit",
+                                      side_effect=SystemExit) as mexit:
+                with self.assertRaises(SystemExit):
+                    captured["target"]()
+            mexit.assert_called_once_with(0)
+
+    def test_upward_search_stops_at_filesystem_root(self):
+        # When upgrade_jarvis.py is nowhere up the tree, the loop walks up
+        # until parent == search_dir (filesystem root) and breaks → not found.
+        # Patch os.path.exists to always say "no upgrade script" and
+        # os.path.dirname to bottom out (parent == search_dir) quickly.
+        bc = _base_bc()
+        real_exists = os.path.exists
+
+        def no_upgrade(path):
+            if path.endswith("upgrade_jarvis.py"):
+                return False
+            return real_exists(path)
+
+        # dirname that bottoms out: returns the same path once at "root".
+        seq = ["/level1", "/", "/"]
+        it = iter(seq)
+
+        def fake_dirname(p):
+            try:
+                return next(it)
+            except StopIteration:
+                return "/"
+
+        with _patch_bc(bc), \
+                mock.patch("core.config.OVERNIGHT_UPGRADE_ENABLED", True), \
+                mock.patch.object(A.os.path, "exists", side_effect=no_upgrade), \
+                mock.patch.object(A.os.path, "dirname", side_effect=fake_dirname):
+            out = A._act_upgrade()
+        self.assertIn("upgrade_jarvis.py not found", out)
+
+
+# ===========================================================================
+# _act_shutdown_jarvis — graceful full teardown
+# ===========================================================================
+class ShutdownJarvisTests(unittest.TestCase):
+    def _bc(self):
+        bc = mock.Mock()
+        bc.SHUTDOWN_GOODBYE_LINES = ["Going dark, sir."]
+        bc._sleep_mode = [False]
+        return bc
+
+    def test_returns_goodbye_and_spawns_thread(self):
+        bc = self._bc()
+        with _patch_bc(bc), mock.patch("threading.Thread") as mthread:
+            out = A._act_shutdown_jarvis("")
+        self.assertEqual(out, "Going dark, sir.")
+        # sleep_mode flag flipped, goodbye spoken, daemon thread started.
+        self.assertTrue(bc._sleep_mode[0])
+        bc._speak.assert_called_once()
+        mthread.assert_called_once()
+        self.assertTrue(mthread.call_args.kwargs.get("daemon"))
+        mthread.return_value.start.assert_called_once()
+
+    def test_goodbye_tts_failure_is_swallowed(self):
+        bc = self._bc()
+        bc._speak.side_effect = RuntimeError("tts down")
+        with _patch_bc(bc), mock.patch("threading.Thread"), \
+                mock.patch("builtins.print"):
+            out = A._act_shutdown_jarvis("")
+        self.assertEqual(out, "Going dark, sir.")
+
+    def _capture_target(self, bc):
+        """Run _act_shutdown_jarvis with threading.Thread stubbed, returning
+        the captured _do_shutdown closure WITHOUT executing it."""
+        captured = {}
+
+        def capture_thread(target=None, daemon=None, **k):
+            captured["target"] = target
+            return mock.Mock()
+
+        with _patch_bc(bc), \
+                mock.patch("threading.Thread", side_effect=capture_thread):
+            A._act_shutdown_jarvis("")
+        return captured["target"]
+
+    def _run_closure(self, target, *, saver_alive=False, diag_raises=False):
+        """Execute the captured _do_shutdown body with the inner session-saver
+        thread stubbed (alive/not), a controllable core.diagnostic_daemons
+        (whose stop_diagnostic_daemons optionally raises), and os._exit raising
+        SystemExit. Returns the list of printed lines.
+
+        The source does `from core import diagnostic_daemons`, which resolves
+        against the `diagnostic_daemons` ATTRIBUTE on the already-imported
+        `core` package as well as sys.modules — so we override both and restore
+        them, mirroring the smart_home_router injection. (Patching only
+        sys.modules let the real, non-raising module win under the CI-sim
+        runner, which imports core.diagnostic_daemons for real.)"""
+        printed = []
+
+        def inner_thread(target=None, args=(), daemon=None, **k):
+            stub = mock.Mock()
+            stub.is_alive.return_value = saver_alive
+            return stub
+
+        diag_module = types.ModuleType("core.diagnostic_daemons")
+        diag_module.stop_diagnostic_daemons = mock.Mock(
+            side_effect=RuntimeError("diag boom") if diag_raises else None)
+
+        import core as core_pkg
+        old_mod = sys.modules.get("core.diagnostic_daemons")
+        had_attr = hasattr(core_pkg, "diagnostic_daemons")
+        old_attr = getattr(core_pkg, "diagnostic_daemons", None)
+
+        def restore_diag():
+            if old_mod is not None:
+                sys.modules["core.diagnostic_daemons"] = old_mod
+            else:
+                sys.modules.pop("core.diagnostic_daemons", None)
+            if had_attr:
+                setattr(core_pkg, "diagnostic_daemons", old_attr)
+            elif hasattr(core_pkg, "diagnostic_daemons"):
+                delattr(core_pkg, "diagnostic_daemons")
+
+        sys.modules["core.diagnostic_daemons"] = diag_module
+        setattr(core_pkg, "diagnostic_daemons", diag_module)
+        self.addCleanup(restore_diag)
+
+        with mock.patch.object(A.time, "sleep"), \
+                mock.patch("threading.Thread", side_effect=inner_thread), \
+                mock.patch("builtins.print",
+                           side_effect=lambda *a, **k: printed.append(
+                               " ".join(str(x) for x in a))), \
+                mock.patch.object(A.os, "_exit", side_effect=SystemExit):
+            with self.assertRaises(SystemExit):
+                target()
+        return printed
+
+    def test_do_shutdown_closure_runs_full_teardown(self):
+        # Every teardown step is a Mock on bc; the closure must reach
+        # os._exit(0) (raised as SystemExit) in its finally.
+        bc = self._bc()
+        bc.load_memory.return_value = {"facts": []}
+        target = self._capture_target(bc)
+        self._run_closure(target, saver_alive=False)
+        # Representative teardown steps were invoked.
+        bc.set_state.assert_any_call("sleep")
+        bc.save_session_pattern.assert_called_once()
+        bc._release_singleton.assert_called_once()
+
+    def test_do_shutdown_closure_tolerates_step_failures(self):
+        # EVERY teardown step raises — the per-step try/excepts (including the
+        # _face_track_stop / _focus_tracker_stop / hud-kill / diag-daemon
+        # branches) swallow them and the closure still reaches os._exit(0).
+        bc = self._bc()
+        for attr in ("save_session_pattern", "set_state", "close_log",
+                     "_restore_prior_power_plan", "_release_singleton"):
+            getattr(bc, attr).side_effect = RuntimeError(f"{attr} boom")
+        bc.sd.stop.side_effect = RuntimeError("sd boom")
+        bc._face_track_stop.set.side_effect = RuntimeError("face boom")
+        bc._focus_tracker_stop.set.side_effect = RuntimeError("focus boom")
+        # The three hud-kill callables each carry a __name__ and raise.
+        for name in ("_shutdown_hud", "_shutdown_tray",
+                     "_shutdown_reticle_overlay"):
+            killer = getattr(bc, name)
+            killer.__name__ = name
+            killer.side_effect = RuntimeError(f"{name} boom")
+        bc.load_memory.side_effect = RuntimeError("mem boom")
+        target = self._capture_target(bc)
+        # diag daemons stop_diagnostic_daemons must also raise (diag_raises).
+        printed = self._run_closure(target, saver_alive=False, diag_raises=True)
+        # Failure-path log lines were emitted (proves the except branches ran).
+        joined = "\n".join(printed)
+        self.assertIn("diag daemons stop failed", joined)
+        self.assertIn("save_session_pattern failed", joined)
+
+    def test_do_shutdown_session_save_timeout_logs(self):
+        # The session-saver inner thread stays alive past the join timeout →
+        # the "session save timed out" branch is taken, then os._exit fires.
+        bc = self._bc()
+        bc.load_memory.return_value = {"facts": []}
+        target = self._capture_target(bc)
+        printed = self._run_closure(target, saver_alive=True)
+        self.assertTrue(
+            any("session save timed out" in line for line in printed))
+
+
+# ===========================================================================
+# _act_switch_llm — backend switching with allowlist
+# ===========================================================================
+class SwitchLlmTests(unittest.TestCase):
+    def _bc(self, backend="claude", ollama="qwen2.5:14b"):
+        bc = mock.Mock()
+        bc.AI_BACKEND = backend
+        bc.OLLAMA_MODEL = ollama
+        bc._KNOWN_OLLAMA_MODELS = {"qwen2.5:14b", "llama3.1:8b"}
+        return bc
+
+    def test_blank_reports_current_claude(self):
+        bc = self._bc(backend="claude")
+        with _patch_bc(bc), \
+                mock.patch("core.config.CLAUDE_MODEL", "claude-x"):
+            out = A._act_switch_llm("")
+        self.assertIn("current backend: claude", out)
+        self.assertIn("claude-x", out)
+
+    def test_blank_reports_current_ollama_model(self):
+        bc = self._bc(backend="ollama", ollama="llama3.1:8b")
+        with _patch_bc(bc), mock.patch("core.config.CLAUDE_MODEL", "claude-x"):
+            out = A._act_switch_llm("")
+        self.assertIn("current backend: ollama", out)
+        self.assertIn("llama3.1:8b", out)
+
+    def test_switch_to_claude(self):
+        bc = self._bc(backend="ollama")
+        with _patch_bc(bc), mock.patch("core.config.CLAUDE_MODEL", "claude-x"):
+            out = A._act_switch_llm("claude")
+        self.assertEqual(bc.AI_BACKEND, "claude")
+        self.assertIn("switched to claude", out)
+
+    def test_anthropic_alias_switches_to_claude(self):
+        bc = self._bc(backend="ollama")
+        with _patch_bc(bc), mock.patch("core.config.CLAUDE_MODEL", "claude-x"):
+            out = A._act_switch_llm("anthropic")
+        self.assertEqual(bc.AI_BACKEND, "claude")
+        self.assertIn("switched to claude", out)
+
+    def test_switch_to_generic_ollama(self):
+        bc = self._bc(backend="claude", ollama="qwen2.5:14b")
+        with _patch_bc(bc), mock.patch("core.config.CLAUDE_MODEL", "claude-x"):
+            out = A._act_switch_llm("ollama")
+        self.assertEqual(bc.AI_BACKEND, "ollama")
+        self.assertIn("switched to ollama", out)
+        self.assertIn("qwen2.5:14b", out)
+
+    def test_known_model_tag_switches(self):
+        bc = self._bc(backend="claude")
+        with _patch_bc(bc), mock.patch("core.config.CLAUDE_MODEL", "claude-x"):
+            out = A._act_switch_llm("llama3.1:8b")
+        self.assertEqual(bc.AI_BACKEND, "ollama")
+        self.assertEqual(bc.OLLAMA_MODEL, "llama3.1:8b")
+        self.assertIn("switched to ollama / llama3.1:8b", out)
+
+    def test_prefix_recognised_model_tag_switches(self):
+        # A tag not in the known set but matching a known family prefix.
+        bc = self._bc(backend="claude")
+        with _patch_bc(bc), mock.patch("core.config.CLAUDE_MODEL", "claude-x"):
+            out = A._act_switch_llm("mistral-nemo")
+        self.assertEqual(bc.AI_BACKEND, "ollama")
+        self.assertEqual(bc.OLLAMA_MODEL, "mistral-nemo")
+        self.assertIn("switched to ollama / mistral-nemo", out)
+
+    def test_unknown_tag_rejected(self):
+        bc = self._bc(backend="claude")
+        with _patch_bc(bc), mock.patch("core.config.CLAUDE_MODEL", "claude-x"):
+            out = A._act_switch_llm("turbotron9000")
+        # backend unchanged on a rejected tag
+        self.assertEqual(bc.AI_BACKEND, "claude")
+        self.assertIn("unknown backend tag", out)
+
+
+# ===========================================================================
+# _act_find_on_screen — vision target locator
+# ===========================================================================
+class FindOnScreenTests(unittest.TestCase):
+    def _bc(self, coords, monitor=None):
+        bc = mock.Mock()
+        bc._parse_monitor_prefix.return_value = (monitor, "the play button")
+        bc.find_click_target.return_value = coords
+        return bc
+
+    def test_found_returns_coords(self):
+        bc = self._bc((120, 240))
+        with _patch_bc(bc), mock.patch("builtins.print"):
+            out = A._act_find_on_screen("the play button")
+        self.assertEqual(out, "found at 120,240")
+
+    def test_not_found_returns_message(self):
+        bc = self._bc(None)
+        with _patch_bc(bc), mock.patch("builtins.print"):
+            out = A._act_find_on_screen("the play button")
+        self.assertIn("could not find", out)
+
+    def test_monitor_prefix_threaded_through(self):
+        bc = self._bc((1, 2), monitor="left")
+        with _patch_bc(bc), mock.patch("builtins.print"):
+            A._act_find_on_screen("left|the play button")
+        # find_click_target is invoked with the parsed monitor.
+        _, kwargs = bc.find_click_target.call_args
+        self.assertEqual(kwargs.get("monitor"), "left")
+
+
+# ===========================================================================
+# _act_clear_llm_cache + _act_ambient_mode_toggle (small wrappers)
+# ===========================================================================
+class ClearLlmCacheTests(unittest.TestCase):
+    def test_reports_no_cache(self):
+        # No bc access needed, but patch _bc anyway to keep the monolith out.
+        with _patch_bc(mock.Mock()):
+            out = A._act_clear_llm_cache("")
+        self.assertIn("no in-process LLM cache to clear", out)
+
+
+class AmbientModeToggleTests(unittest.TestCase):
+    def test_toggles_via_set_with_negated_flag(self):
+        # _act_ambient_mode_toggle reads bc._ambient_mode_active[0] and calls
+        # _act_ambient_mode_set with the negation. We patch the sibling setter
+        # to observe the argument without driving the daemon plumbing.
+        bc = mock.Mock()
+        bc._ambient_mode_active = [False]
+        with _patch_bc(bc), \
+                mock.patch.object(A, "_act_ambient_mode_set",
+                                  return_value="Ambient mode active, sir.") as mset:
+            out = A._act_ambient_mode_toggle("")
+        mset.assert_called_once_with(True)     # negation of False
+        self.assertEqual(out, "Ambient mode active, sir.")
+
+    def test_toggles_off_when_currently_on(self):
+        bc = mock.Mock()
+        bc._ambient_mode_active = [True]
+        with _patch_bc(bc), \
+                mock.patch.object(A, "_act_ambient_mode_set",
+                                  return_value="off") as mset:
+            A._act_ambient_mode_toggle("")
+        mset.assert_called_once_with(False)
+
+
+# ===========================================================================
+# _bc() — the late-bound bobert_companion accessor itself
+# ===========================================================================
+class BcAccessorTests(unittest.TestCase):
+    def test_bc_imports_and_returns_module(self):
+        # _bc() does `import bobert_companion; return it`. We inject a fake
+        # module so the real ~14K-line monolith is never imported, and assert
+        # _bc hands back exactly that object. (The other suites patch _bc out;
+        # this one exercises its 2-line body for coverage.)
+        fake_mod = types.ModuleType("bobert_companion")
+        with mock.patch.dict(sys.modules, {"bobert_companion": fake_mod}):
+            self.assertIs(A._bc(), fake_mod)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -510,7 +510,7 @@ def register(actions):
 
 # ─── manual smoke test ───────────────────────────────────────────────────
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - manual smoke entry; run by hand, not under unittest
     print("umbrella (today):   ", get_umbrella_alert("today"))
     print("umbrella (tomorrow):", get_umbrella_alert("tomorrow"))
     print("two-hour alert:     ", get_two_hour_alert())

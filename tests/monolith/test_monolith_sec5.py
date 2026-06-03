@@ -97,6 +97,29 @@ class _InjectModule:
         return False
 
 
+class _SyncThread:
+    """threading.Thread drop-in that runs target() synchronously on start() so
+    a daemon closure body (e.g. _tray_async's _wrap) executes deterministically
+    without leaving a real thread behind."""
+
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None, name=None):
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs or {}
+        self.daemon = daemon
+        self.name = name
+
+    def start(self):
+        if self._target is not None:
+            self._target(*self._args, **self._kwargs)
+
+    def join(self, timeout=None):
+        return None
+
+    def is_alive(self):
+        return False
+
+
 @requires_monolith
 class SectionFiveBase(MonolithGlobalsTestCase):
     # setUpClass (loads the cached monolith) + per-test deep-restore of the
@@ -239,6 +262,41 @@ class SessionResumeTests(SectionFiveBase):
         out = bc.maybe_session_resume_greeting()
         self.assertEqual(out, "")
         self.assertFalse(bc._session_resume_done[0])
+
+    def test_warm_restart_long_summary_first_sentence_truncated(self):
+        # 8920-8922: no task line + no recent command, but a session summary
+        # whose first sentence exceeds 90 chars -> work is truncated to 87 + "…".
+        bc = self.bc
+        import time as _t
+        warm_ts = _t.time() - 90
+        long_first = ("Refactored the entire audio capture and playback "
+                      "pipeline including the noise cancellation stages and "
+                      "the barge-in watchdog")
+        self.assertGreater(len(long_first), 90)
+        with mock.patch.object(bc, "_last_session_end_ts", return_value=warm_ts), \
+             mock.patch.object(bc.pattern_memory, "get_session_summaries",
+                               return_value=[{"summary": long_first + ". Tail."}]):
+            text, details = bc._build_session_resume(force=False)
+        self.assertTrue(details["work"].endswith("…"))
+        self.assertEqual(len(details["work"]), 88)   # 87 chars + the ellipsis
+        self.assertIn(details["work"], text)
+
+    def test_maybe_greeting_age_print_exception_swallowed(self):
+        # 8973-8974: the warm-restart log line computes age from details; if
+        # details.get raises the except swallows it and the greeting still
+        # returns. A mapping-like details whose .get raises drives the handler.
+        bc = self.bc
+        bc._session_resume_done[0] = False
+
+        class _BadDetails(dict):
+            def get(self, *a, **k):
+                raise RuntimeError("no age")
+
+        with mock.patch.object(bc, "_build_session_resume",
+                               return_value=("Welcome back, sir.", _BadDetails())):
+            out = bc.maybe_session_resume_greeting()
+        self.assertEqual(out, "Welcome back, sir.")
+        self.assertTrue(bc._session_resume_done[0])
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -457,6 +515,37 @@ class WindowHelperTests(SectionFiveBase):
         with _InjectModule("pygetwindow", _fake_pygetwindow(active=None)):
             self.assertFalse(bc._active_window_is_terminal())
 
+    def test_find_music_window_importerror_returns_none(self):
+        # 9122-9123: `import pygetwindow` raises ImportError -> None.
+        bc = self.bc
+        with mock.patch.dict(sys.modules, {"pygetwindow": None}):
+            self.assertIsNone(bc._find_music_window())
+
+    def test_focus_music_window_minimize_restore_also_fails_returns_none(self):
+        # 9153-9154: activate() raises a genuine error, the minimize/restore
+        # fallback ALSO raises -> None.
+        bc = self.bc
+
+        class _StubbornWin(_FakeWin):
+            def minimize(self):
+                raise RuntimeError("minimize denied")
+
+        win = _StubbornWin("Spotify")
+        win._activate_exc = Exception("some genuine failure")
+        with mock.patch.object(bc, "_find_music_window", return_value=win):
+            self.assertIsNone(bc._focus_music_window())
+
+    def test_active_window_is_terminal_query_exception_returns_false(self):
+        # 9631-9632: getActiveWindow() raises -> swallowed, returns False.
+        bc = self.bc
+        mod = types.ModuleType("pygetwindow")
+
+        def _boom():
+            raise RuntimeError("getActiveWindow failed")
+        mod.getActiveWindow = _boom
+        with _InjectModule("pygetwindow", mod):
+            self.assertFalse(bc._active_window_is_terminal())
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Pure parsers / classifiers
@@ -499,6 +588,11 @@ class PureHelperTests(SectionFiveBase):
     def test_glance_ambiguous_trailing_question_mark(self):
         # pattern stored without '?' but utterance has one
         self.assertTrue(self.bc._is_glance_ambiguous_question("explain?"))
+
+    def test_glance_ambiguous_short_non_pattern_returns_false(self):
+        # 9396: <=5 words (passes the >5 guard), not in the pattern set, and no
+        # trailing '?' -> falls through to the final `return False`.
+        self.assertFalse(self.bc._is_glance_ambiguous_question("open my email now"))
 
     # ---- _is_self_close_attempt ----
     def test_self_close_attempt_positive(self):
@@ -947,6 +1041,25 @@ class TrayPlumbingTests(SectionFiveBase):
         bc._tray_async("boom", _boom)
         self.assertTrue(started.wait(timeout=5.0))
 
+    def test_tray_async_truncates_long_first_line(self):
+        # 9871-9872: a >120-char first output line is truncated to 117 + "...".
+        bc = self.bc
+        long_line = "z" * 200
+        captured = {}
+        printed = []
+
+        def _fn():
+            return long_line
+
+        # Run the _wrap body synchronously and capture the log line it prints.
+        with mock.patch.object(bc.threading, "Thread", _SyncThread), \
+             mock.patch("builtins.print",
+                        side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
+            bc._tray_async("longjob", _fn)
+        captured["log"] = "\n".join(printed)
+        self.assertIn("z" * 117 + "...", captured["log"])
+        self.assertNotIn("z" * 121, captured["log"])
+
     def test_selfdiag_module_present_and_absent(self):
         bc = self.bc
         sentinel = types.ModuleType("skill_self_diagnostic")
@@ -993,6 +1106,48 @@ class TrayPlumbingTests(SectionFiveBase):
         self.assertEqual(out, "mic probe running")
         self.assertIn("mic: OK", captured["result"])
         self.assertIn("12", captured["result"])
+
+    def test_probe_via_selfdiag_without_runner_calls_probe_directly(self):
+        # 9979: the self_diagnostic module has no _run_with_timeout helper, so
+        # the probe is called directly (runner is None branch).
+        bc = self.bc
+        sd = types.ModuleType("skill_self_diagnostic")
+        sd._probe_mic = lambda: {"ok": False, "error": "no device"}
+        sd.PER_PROBE_TIMEOUT_S = 5.0   # note: no _run_with_timeout attribute
+        captured = {}
+
+        def _fake_async(name, fn):
+            captured["result"] = fn()
+
+        with mock.patch.object(bc, "_selfdiag_module", return_value=sd), \
+             mock.patch.object(bc, "_tray_async", side_effect=_fake_async):
+            out = bc._probe_via_selfdiag("mic", "_probe_mic")
+        self.assertEqual(out, "mic probe running")
+        self.assertIn("mic: FAIL", captured["result"])
+        self.assertIn("no device", captured["result"])
+
+    def test_probe_via_selfdiag_probe_exception_reported(self):
+        # 9987-9988: the probe body raises -> the _do closure reports it as
+        # "probe raised ..." rather than propagating.
+        bc = self.bc
+        sd = types.ModuleType("skill_self_diagnostic")
+
+        def _boom():
+            raise RuntimeError("mic exploded")
+        sd._probe_mic = _boom
+        sd._run_with_timeout = lambda fn, budget, name=None: fn()
+        sd.PER_PROBE_TIMEOUT_S = 5.0
+        captured = {}
+
+        def _fake_async(name, fn):
+            captured["result"] = fn()
+
+        with mock.patch.object(bc, "_selfdiag_module", return_value=sd), \
+             mock.patch.object(bc, "_tray_async", side_effect=_fake_async):
+            out = bc._probe_via_selfdiag("mic", "_probe_mic")
+        self.assertEqual(out, "mic probe running")
+        self.assertIn("probe raised", captured["result"])
+        self.assertIn("mic exploded", captured["result"])
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1236,6 +1391,16 @@ class ShutdownPromptBranchFillTests(SectionFiveBase):
         self.assertTrue(self.bc._handle_shutdown_prompt("no"))
         self.shutdown.assert_called_once()
 
+    def test_unrelated_reply_speak_exception_swallowed(self):
+        # 9087-9088: the 'unrelated speech' arm announces "Shutdown cancelled."
+        # via _speak; if that raises it is swallowed and the function still
+        # returns False (falls through to normal routing).
+        self._arm()
+        self.speak.side_effect = RuntimeError("tts dead")
+        result = self.bc._handle_shutdown_prompt("what's the weather")
+        self.assertFalse(result)
+        self.assertFalse(self.bc._shutdown_prompt_pending["armed"])
+
 
 class ReadFocusedWindowBranchTests(SectionFiveBase):
     """Cover the inner-rect except arm of _read_focused_window and the
@@ -1271,6 +1436,19 @@ class ReadFocusedWindowBranchTests(SectionFiveBase):
         with mock.patch.object(bc, "_read_focused_window",
                                side_effect=RuntimeError("win32 gone")):
             self.assertTrue(bc._focus_changed_recently())
+
+    def test_read_focused_window_query_exception_yields_all_none(self):
+        # 9328-9329: win32gui imports fine, but GetForegroundWindow() raises
+        # -> the outer except returns (None, "", None). (The inner-rect except
+        # only covers GetWindowRect; this exercises the wrapping handler.)
+        bc = self.bc
+        mod = types.ModuleType("win32gui")
+
+        def _boom():
+            raise RuntimeError("GetForegroundWindow failed")
+        mod.GetForegroundWindow = _boom
+        with _InjectModule("win32gui", mod):
+            self.assertEqual(bc._read_focused_window(), (None, "", None))
 
 
 # ════════════════════════════════════════════════════════════════════════════

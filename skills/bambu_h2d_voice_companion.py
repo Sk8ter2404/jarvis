@@ -48,7 +48,7 @@ import threading
 import time
 
 _PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _PROJECT_DIR not in sys.path:
+if _PROJECT_DIR not in sys.path:  # pragma: no cover - import-time sys.path guard; the project root is always already on sys.path under the test harness and the live skill loader, so the insert never fires.
     sys.path.insert(0, _PROJECT_DIR)
 
 from core.atomic_io import _atomic_write_json  # noqa: E402

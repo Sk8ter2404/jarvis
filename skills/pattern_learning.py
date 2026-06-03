@@ -52,7 +52,6 @@ import json
 import os
 import sqlite3
 import statistics
-import sys
 import tempfile
 import threading
 import time
@@ -213,7 +212,7 @@ def _connect_db() -> sqlite3.Connection | None:
                 except Exception as e:
                     print(f"  [pattern_learning] sqlite schema init failed: {e}")
                     try: conn.close()
-                    except Exception: pass
+                    except Exception: pass  # pragma: no cover - defensive close after schema-init failure
                     return None
     return conn
 
@@ -282,7 +281,7 @@ def _backfill_sqlite_from_jsonl_if_empty() -> int:
             return 0
         finally:
             try: conn.close()
-            except Exception: pass
+            except Exception: pass  # pragma: no cover - defensive close in backfill finally
 
 
 def _prune_sqlite_events(max_rows: int = MAX_LOG_ENTRIES) -> None:
@@ -308,7 +307,7 @@ def _prune_sqlite_events(max_rows: int = MAX_LOG_ENTRIES) -> None:
         print(f"  [pattern_learning] sqlite prune failed: {e}")
     finally:
         try: conn.close()
-        except Exception: pass
+        except Exception: pass  # pragma: no cover - defensive close in prune finally
 
 
 # ─── logging ─────────────────────────────────────────────────────────────
@@ -365,7 +364,7 @@ def log_event(action_name: str, arg: str = "") -> None:
                         )
                 finally:
                     try: conn.close()
-                    except Exception: pass
+                    except Exception: pass  # pragma: no cover - defensive close in log-mirror finally
         except Exception as e:
             print(f"  [pattern_learning] sqlite log mirror failed: {e}")
         _writes_since_rotate[0] += 1
@@ -576,11 +575,11 @@ def aggregate() -> dict:
     for action, minutes in minutes_by_action.items():
         if len(minutes) < MIN_OCCURRENCES_PRECISE:
             continue
-        if len(minutes) < 2:
+        if len(minutes) < 2:  # pragma: no cover - unreachable: MIN_OCCURRENCES_PRECISE>=4 already guarantees len>=4
             continue
         try:
             stddev = statistics.pstdev(minutes)
-        except statistics.StatisticsError:
+        except statistics.StatisticsError:  # pragma: no cover - unreachable: pstdev only raises for <1 sample; len>=4 here
             continue
         if stddev > STDDEV_THRESHOLD_MIN:
             continue
@@ -815,8 +814,8 @@ def _cluster_offer(dow: int, hour_start: int, action: str,
         if common_arg:
             return (f"Sir, your usual {_titlecase(common_arg)} listening "
                     f"window is upon us. Shall I queue it?")
-        return (f"Sir, this is normally when you settle into music. "
-                f"Shall I queue your usual playlist?")
+        return ("Sir, this is normally when you settle into music. "
+                "Shall I queue your usual playlist?")
     if action == "check_teams":
         return (f"Sir, you typically check Teams around {band} on {day}s — "
                 f"shall I take a look?")
@@ -825,8 +824,8 @@ def _cluster_offer(dow: int, hour_start: int, action: str,
     if action == "evening_briefing":
         return f"Sir, your usual {day} evening briefing — shall I deliver it?"
     verb = _verb_for(action)
-    return (f"Sir, it's {day} around {band} — you usually {verb.replace(' ', ' ', 1)}. "
-            f"Shall I proceed?")
+    return (f"Sir, it's {day} around {band} — you usually {verb}. "
+            "Shall I proceed?")
 
 
 def compute_weekly_digest(now: float | None = None) -> dict:
@@ -871,7 +870,7 @@ def compute_weekly_digest(now: float | None = None) -> dict:
             rows = []
         finally:
             try: conn.close()
-            except Exception: pass
+            except Exception: pass  # pragma: no cover - defensive close in weekly-digest SQL finally
 
     # SQL was empty or unavailable — fall back to the JSONL so first-boot
     # systems with no SQLite mirror yet still produce a digest.
@@ -970,7 +969,7 @@ def _save_weekly_digest(digest: dict) -> None:
         print(f"  [pattern_learning] weekly digest save failed: {e}")
     finally:
         try: conn.close()
-        except Exception: pass
+        except Exception: pass  # pragma: no cover - defensive close in weekly-digest save finally
 
 
 def load_latest_weekly_digest() -> dict:
@@ -1004,7 +1003,7 @@ def load_latest_weekly_digest() -> dict:
         return {}
     finally:
         try: conn.close()
-        except Exception: pass
+        except Exception: pass  # pragma: no cover - defensive close in weekly-digest load finally
 
 
 # ─── background scheduler ────────────────────────────────────────────────
@@ -1163,7 +1162,7 @@ def register(actions):
 
 # ─── offline smoke test ──────────────────────────────────────────────────
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - manual offline smoke test entry point
     # Generate synthetic events covering a 21-day window so we can exercise
     # both broad-window and precise-clock detection without touching real data.
     print("Running offline smoke test…")

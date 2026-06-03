@@ -13,7 +13,9 @@ callables are plain in-process mocks (no hardware, no network).
 """
 from __future__ import annotations
 
+import re
 import unittest
+from unittest import mock
 
 from core import dispatcher as d
 
@@ -115,6 +117,42 @@ class MatchSingleIntentTests(unittest.TestCase):
         self.assertIsNotNone(step)
         self.assertEqual(step.action, "spotify")
         self.assertEqual(step.arg, "jazz")
+
+    def test_only_filler_or_punctuation_returns_none(self):
+        # Non-empty input that reduces to '' after lead-filler + trailing-punct
+        # stripping returns None (the post-strip empty guard).
+        self.assertIsNone(d.match_single_intent("...", ACTIONS))
+
+    def test_arg_fn_exception_yields_empty_arg(self):
+        # If a rule's arg builder raises, _match_segment swallows it and the
+        # step is returned with an empty arg rather than aborting the match.
+        with mock.patch.dict(d._INTENT_RULES[0], {"arg_fn": mock.MagicMock(
+                side_effect=RuntimeError("arg boom"))}):
+            step = d.match_single_intent("play jazz", ACTIONS)
+        self.assertIsNotNone(step)
+        self.assertEqual(step.action, "play_music")
+        self.assertEqual(step.arg, "")
+
+
+# ── arg builders: missing-capture guards ─────────────────────────────────────
+class ArgBuilderGuardTests(unittest.TestCase):
+    """The duration/timer arg builders bail to '' when the match lacks the
+    number/unit groups. The live rules always capture them, so feed a synthetic
+    group-less match to exercise the guard directly."""
+
+    def _groupless_match(self):
+        # An all-optional pattern on empty input → matches with lastindex=None,
+        # so group(1)/group(2) are absent → the `not n or not unit` guard fires.
+        m = re.match(r"(x)?", "")
+        self.assertIsNotNone(m)
+        self.assertIsNone(m.lastindex)
+        return m
+
+    def test_focus_duration_empty_when_no_groups(self):
+        self.assertEqual(d._arg_focus_duration(self._groupless_match()), "")
+
+    def test_set_timer_empty_when_no_groups(self):
+        self.assertEqual(d._arg_set_timer(self._groupless_match()), "")
 
 
 # ── command_chain_resolver (pure plan) ───────────────────────────────────────
@@ -240,6 +278,11 @@ class FailureResultTests(unittest.TestCase):
 
     def test_phrase_empty_uses_fallback(self):
         self.assertEqual(d._failure_phrase("", "timer set"), "timer set failed")
+
+    def test_phrase_punctuation_only_uses_fallback(self):
+        # A non-empty result that collapses to '' after the sentence split (e.g.
+        # a lone '.') falls back to '<fallback> failed'.
+        self.assertEqual(d._failure_phrase(".", "timer set"), "timer set failed")
 
     def test_phrase_truncated_to_80_chars(self):
         out = d._failure_phrase("x" * 100, "fb")
@@ -382,6 +425,26 @@ class ResolveAndDispatchTests(unittest.TestCase):
         # <2 steps survive → fall through to the LLM (None).
         out = d.resolve_and_dispatch(
             "play jazz and take a screenshot", {})
+        self.assertIsNone(out)
+
+    def test_action_present_at_resolve_but_none_at_dispatch_demotes(self):
+        # Race emulation: the action NAME is in actions.keys() (so the chain
+        # resolves with 2 steps) but maps to None, so actions.get() yields None
+        # at dispatch → that step is demoted to unknown. Only 1 real step then
+        # survives, which is below the 2-step chain floor → returns None.
+        actions = {"play_music": self._action("play_music"), "screenshot": None}
+        out = d.resolve_and_dispatch("play jazz, take a screenshot", actions)
+        self.assertIsNone(out)
+        # The surviving action still ran; the None-mapped one was skipped.
+        self.assertEqual(self.calls, [("play_music", "jazz")])
+
+    def test_one_real_step_falls_through_to_llm(self):
+        # A resolved 2-step chain where one action is missing leaves a single
+        # dispatched step (<2) → resolve_and_dispatch returns None rather than
+        # emitting a one-item "chain". (Distinct assertion of the floor at the
+        # tail of resolve_and_dispatch.)
+        actions = {"play_music": self._action("play_music")}  # screenshot absent
+        out = d.resolve_and_dispatch("play jazz, take a screenshot", actions)
         self.assertIsNone(out)
 
 

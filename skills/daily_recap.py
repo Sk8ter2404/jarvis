@@ -351,7 +351,7 @@ def _scan_session_logs() -> dict:
                                 hh, mm, ss = ts_str.split(":")
                                 bucket = (int(hh), int(mm), 0)
                                 app_minute_buckets.setdefault(app_name, set()).add(bucket)
-                            except (ValueError, TypeError):
+                            except (ValueError, TypeError):  # pragma: no cover - defensive: _ACTION_RE already guarantees ts_str is \d{2}:\d{2}:\d{2}
                                 pass
 
                     # Anticipation-engine dwell remark: "you've been in <app>
@@ -372,7 +372,7 @@ def _scan_session_logs() -> dict:
                                 synth = app_minute_buckets.setdefault(app_name, set())
                                 for k in range(hours * 60):
                                     synth.add(("synth", app_name, k))
-                            except (ValueError, TypeError):
+                            except (ValueError, TypeError):  # pragma: no cover - defensive: _DWELL_REMARK_RE group(2) is always \d+
                                 pass
 
                     # Teams alerts
@@ -597,7 +597,7 @@ def _build_recap() -> str:
             # (else just say "N tracks"). "Michael Jackson Essentials" → 11
             # plays reads better than "11 tracks" generically.
             if top_n >= max(2, music_total // 2):
-                if top_n == 1:
+                if top_n == 1:  # pragma: no cover - unreachable: max(2,..)>=2 forces top_n>=2 in this branch
                     parts.append(f"played one {display} track")
                 else:
                     parts.append(f"played {top_n} {display} tracks")
@@ -652,7 +652,7 @@ def _build_recap() -> str:
         # (no leading "you ..."), the "today you" prefix needs to fall away.
         if parts[0].startswith(("nothing", "just one", "no ", "1 ", "2 ",
                                 "3 ", "4 ", "5 ", "6 ", "7 ", "8 ", "9 ")) \
-                or re.match(r"^\d", parts[0]):
+                or re.match(r"^\d", parts[0]):  # pragma: no cover - defensive: no multi-chunk first part is digit/keyword-led (voice fallback is single-chunk)
             body = f"Sir, today {sentence}."
 
     # Closing nudge -- the spec's headline ask.
@@ -759,7 +759,7 @@ def register(actions):
 
 # --- offline smoke test --------------------------------------------------
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - manual offline smoke test entry point
     print("Running offline smoke test...")
     text = _build_recap()
     print(text)

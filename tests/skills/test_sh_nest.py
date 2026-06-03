@@ -264,6 +264,27 @@ class NestAsyncRunnerTests(_NestBase):
         with self.assertRaises(ValueError):
             self.mod._run_async(_boom())
 
+    def test_loop_start_timeout_raises(self):
+        # If the worker thread never signals `ready` within 5s, _start_loop_thread
+        # raises RuntimeError. Rather than wait 5s, neuter Thread.start so the
+        # worker never runs (ready stays clear) and stub the ready Event's wait()
+        # to report timeout immediately. A real threading.Event subclass keeps
+        # the Thread bookkeeping (is_set/set) intact.
+        class _ImmediateTimeoutEvent(self.mod.threading.Event):
+            def wait(self, timeout=None):
+                return False
+
+        with mock.patch.object(self.mod.threading, "Event",
+                               _ImmediateTimeoutEvent), \
+             mock.patch.object(self.mod.threading.Thread, "start",
+                               lambda self: None):
+            with self.assertRaises(RuntimeError):
+                self.mod._start_loop_thread()
+        # clean up the orphan loop we created (never ran, so just close it)
+        with self.mod._lock:
+            self.mod._state["loop"] = None
+            self.mod._state["thread"] = None
+
 
 # ─── _build_client_async ─────────────────────────────────────────────────
 class NestBuildClientTests(_NestBase):
@@ -325,6 +346,20 @@ class NestBuildClientTests(_NestBase):
         self.assertIsNone(result)
         self.assertEqual(len(closed), 1)
 
+    def test_outer_exception_returns_none(self):
+        # ClientSession() itself raises (after the aiohttp import succeeds) ->
+        # the broad outer `except Exception` swallows it and returns None.
+        aiohttp = types.ModuleType("aiohttp")
+
+        def _boom(*a, **k):
+            raise RuntimeError("session ctor exploded")
+
+        aiohttp.ClientSession = _boom
+        with inject_modules(**_fake_sdm_modules(), aiohttp=aiohttp,
+                            requests=_fake_requests()), \
+             mock.patch.object(self.mod, "_read_config", return_value=dict(_FULL_CFG)):
+            self.assertIsNone(self._build())
+
 
 # ─── _get_client caching ─────────────────────────────────────────────────
 class NestGetClientTests(_NestBase):
@@ -385,6 +420,59 @@ class NestGetClientTests(_NestBase):
             got = self.mod._get_client()
         self.assertIs(got, new)
         self.assertTrue(old_sess.closed)   # stale session was closed
+
+    def test_inner_recheck_returns_fresh_client_built_by_racer(self):
+        # The outer cache check misses (expired), but by the time we take
+        # _build_lock another caller has populated a FRESH client. The inner
+        # double-checked re-read returns it without building. We simulate the
+        # racer by populating _state when _build_lock is entered.
+        fresh = ("fresh-by-racer", "proj", "sess")
+        mod = self.mod
+
+        class _RacingLock:
+            """Stand-in for _build_lock: on entry, simulate another caller
+            having just populated a fresh client (the race the inner
+            double-check guards against)."""
+            def __enter__(self):
+                with mod._lock:
+                    mod._state["client"] = fresh
+                    mod._state["fetched_at"] = mod.time.monotonic()
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with mock.patch.object(self.mod, "_build_lock", _RacingLock()), \
+             mock.patch.object(self.mod, "_run_async",
+                               side_effect=AssertionError("must not build")):
+            got = self.mod._get_client()
+        self.assertIs(got, fresh)
+
+    def test_stale_session_close_failure_swallowed(self):
+        # The expired session's close() raises during rebuild -> the broad
+        # except swallows it (lines logging "stale session close failed") and
+        # the new client is still installed.
+        class _BadSess:
+            async def close(self):
+                raise RuntimeError("close blew up")
+
+        self.mod._state["client"] = ("old", "proj", _BadSess())
+        self.mod._state["fetched_at"] = self.mod.time.monotonic() - 999
+        new = ("new", "proj", "newsess")
+        real_run = self.mod._run_async
+        calls = {"n": 0}
+
+        def _fake_run(coro):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return new            # the (faked) build
+            return real_run(coro)     # the close() coroutine -> raises -> swallowed
+
+        with mock.patch.object(self.mod, "_build_client_async", lambda: None), \
+             mock.patch.object(self.mod, "_run_async", side_effect=_fake_run):
+            got = self.mod._get_client()
+        self.assertIs(got, new)
+        self.assertIs(self.mod._state["client"], new)
 
 
 # ─── list_devices payload parse ──────────────────────────────────────────

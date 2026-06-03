@@ -374,7 +374,7 @@ def register(actions: dict) -> None:
     actions["ring_authorize"]    = ring_authorize
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - interactive sign-in CLI entry (input()/getpass()); run by hand, not under unittest
     # Interactive sign-in path. Voice actions route here via the CLI
     # hint to keep input() / getpass() off the main audio loop.
     import sys

@@ -45,7 +45,7 @@ _log = logging.getLogger(__name__)
 # tests sometimes load it via importlib).
 _PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_DIR not in sys.path:
-    sys.path.insert(0, _PROJECT_DIR)
+    sys.path.insert(0, _PROJECT_DIR)  # pragma: no cover - import-time path bootstrap; the project root is already on sys.path under the test runner, so this branch only fires in a bare interpreter and can't be re-triggered post-import
 
 from core.atomic_io import _atomic_write_json  # noqa: E402
 

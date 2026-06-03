@@ -1314,5 +1314,93 @@ class RegisterTests(_DecoBase):
                       self.actions["disable_guest_network"])
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# 15. Import-time _atomic_write_json fallback (when core.atomic_io is absent).
+# ──────────────────────────────────────────────────────────────────────────
+class AtomicWriteFallbackTests(unittest.TestCase):
+    """On a host where ``core.atomic_io`` can't be imported at module load, the
+    skill defines its own local ``_atomic_write_json``. We re-exec the module
+    with that import blocked to bind the fallback, then exercise it (the
+    happy write AND the cleanup-on-error path)."""
+
+    def _load_module_without_core_atomic_io(self):
+        path = os.path.join(SKILLS_DIR, "network_deco.py")
+        spec = importlib.util.spec_from_file_location(
+            "skill_network_deco_nofallback", path)
+        mod = importlib.util.module_from_spec(spec)
+        mod.skill_utils = make_fake_skill_utils()
+        # Block the import so the `except` branch defines the local fallback.
+        blocked = {"core.atomic_io": None}
+        with mock.patch.dict(sys.modules, blocked), \
+                mock.patch.object(threading.Thread, "start", lambda self: None), \
+                contextlib.redirect_stdout(io.StringIO()):
+            sys.modules["skill_network_deco_nofallback"] = mod
+            spec.loader.exec_module(mod)
+        self.addCleanup(sys.modules.pop, "skill_network_deco_nofallback", None)
+        return mod
+
+    def test_fallback_is_defined_when_core_atomic_io_missing(self):
+        mod = self._load_module_without_core_atomic_io()
+        # The bound _atomic_write_json is the module-local fallback, not the
+        # core helper (its __module__ is this re-exec'd module).
+        self.assertEqual(mod._atomic_write_json.__module__,
+                         "skill_network_deco_nofallback")
+
+    def test_fallback_writes_json_atomically(self):
+        import json as _json
+        import tempfile
+        mod = self._load_module_without_core_atomic_io()
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "snap.json")
+            mod._atomic_write_json(p, {"hello": "world", "n": 3})
+            with open(p, encoding="utf-8") as f:
+                data = _json.load(f)
+        self.assertEqual(data, {"hello": "world", "n": 3})
+
+    def test_fallback_tolerates_fsync_oserror(self):
+        # On some filesystems fsync raises OSError; the fallback swallows it and
+        # still completes the write (covers the inner except-pass at 89-90).
+        import json as _json
+        import tempfile
+        mod = self._load_module_without_core_atomic_io()
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "snap.json")
+            with mock.patch.object(mod.os, "fsync",
+                                   side_effect=OSError("fsync unsupported")):
+                mod._atomic_write_json(p, {"k": "v"})
+            with open(p, encoding="utf-8") as f:
+                data = _json.load(f)
+        self.assertEqual(data, {"k": "v"})
+
+    def test_fallback_cleans_up_tmp_on_write_error(self):
+        import tempfile
+        mod = self._load_module_without_core_atomic_io()
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "snap.json")
+            # Make os.replace fail AFTER the tmp file is written so the except
+            # branch runs its unlink + re-raise (covers 92-97).
+            with mock.patch.object(mod.os, "replace",
+                                   side_effect=OSError("replace denied")):
+                with self.assertRaises(OSError):
+                    mod._atomic_write_json(p, {"x": 1})
+            # No stray *.tmp left behind in the directory.
+            leftovers = [f for f in os.listdir(d) if f.endswith(".tmp")]
+            self.assertEqual(leftovers, [])
+
+    def test_fallback_unlink_failure_is_swallowed_but_reraises(self):
+        import tempfile
+        mod = self._load_module_without_core_atomic_io()
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "snap.json")
+            # Both the replace and the cleanup unlink fail → the inner
+            # except-pass runs and the original error still propagates.
+            with mock.patch.object(mod.os, "replace",
+                                   side_effect=OSError("replace denied")), \
+                 mock.patch.object(mod.os, "unlink",
+                                   side_effect=OSError("unlink denied")):
+                with self.assertRaises(OSError):
+                    mod._atomic_write_json(p, {"x": 1})
+
+
 if __name__ == "__main__":
     unittest.main()

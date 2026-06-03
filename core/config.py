@@ -139,7 +139,7 @@ LOCAL_LLM_BASE_URL = "http://localhost:11434"
 # Set False (or it's also gateable via JARVIS_ENABLE_ORCHESTRATOR) to disable.
 ENABLE_ORCHESTRATOR             = True
 ORCHESTRATOR_PLANNER_MODEL      = "claude-sonnet-4-6"
-ORCHESTRATOR_WORKER_MODEL       = "claude-haiku-4-5-20251001"
+ORCHESTRATOR_WORKER_MODEL       = "claude-haiku-4-5"
 ORCHESTRATOR_MERGER_MODEL       = "claude-sonnet-4-6"
 ORCHESTRATOR_MAX_PARALLEL       = 4
 ORCHESTRATOR_WORKER_TIMEOUT_S   = 30.0
@@ -201,7 +201,29 @@ XTTS_LANGUAGE     = "en"         # ISO-639-1 hint for XTTS-v2
 #                  <500 ms but requires the optional RealtimeSTT +
 #                  RealtimeTTS deps. Falls back to 'turn_based' when
 #                  those deps are missing — see is_available().
+#
+# Read in the hot path by core/voice_pipeline.realtime_enabled(); the monolith
+# branches on it and ALWAYS falls back to turn_based on any error so an
+# uninstalled optional dep never breaks the default loop. Override per-machine
+# with the JARVIS_VOICE_MODE env var (it wins over this constant — see
+# voice_pipeline._cfg).
 VOICE_MODE = "turn_based"
+
+# ─── Neural wake-word in standby (experimental) ────────────────────────
+# When True, bobert_companion._handle_sleep_standby uses the neural detector in
+# core/wake_word.py (openWakeWord / Porcupine) to spot the wake phrase in the
+# captured audio buffer INSTEAD of running a full Whisper transcription of every
+# overheard utterance just to substring-match WAKE_PHRASES. Default False keeps
+# the historical Whisper-substring standby path byte-for-byte. On ANY detector
+# error the monolith falls back to that Whisper path for the rest of the
+# session. Read in the hot path by core/voice_pipeline.wake_word_autostart_-
+# enabled(); override with the JARVIS_WAKE_WORD_AUTOSTART env var.
+#
+# NOTE: this is INDEPENDENT of skills/wake_listener.py's own WAKE_WORD_AUTOSTART
+# constant, which governs that skill's separate always-on background detector
+# (the one that nudges a sleeping main loop awake via proactive_announce). This
+# flag only swaps the in-loop standby transcription strategy.
+WAKE_WORD_AUTOSTART = False
 
 
 # ─── Whisper STT (faster-whisper preferred, GPU when present) ──────────

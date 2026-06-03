@@ -12,6 +12,7 @@ Both background threads (_hud_publish_loop, _proactive_loop) are never started
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import sys
@@ -828,6 +829,39 @@ class PulseHudPublishTests(unittest.TestCase):
         utils = {"write_hud_state": writer}
         mod, _ = load_skill_isolated("system_pulse", utils=utils)
         mod._publish_hud_strip("strip")  # must not raise
+
+    def test_publish_nameerror_when_skill_utils_undefined(self):
+        # If skill_utils isn't defined as a module global, referencing it raises
+        # NameError; _publish_hud_strip's `except NameError` treats the writer as
+        # absent and no-ops.
+        mod, _ = load_skill_isolated("system_pulse")
+        saved = mod.skill_utils
+        del mod.skill_utils
+        try:
+            mod._publish_hud_strip("x")  # NameError swallowed -> no raise
+        finally:
+            mod.skill_utils = saved
+
+
+class PulseImportGuardTests(unittest.TestCase):
+    def test_pygetwindow_absent_sets_flag_false(self):
+        # Re-exec the source with pygetwindow import blocked so the optional-dep
+        # `except Exception: _HAS_GW = False` guard runs.
+        mod, _ = load_skill_isolated("system_pulse")
+        path = mod.__file__
+        real_import = __import__
+
+        def _imp(name, *a, **k):
+            if name.split(".")[0] == "pygetwindow":
+                raise ImportError("blocked pygetwindow")
+            return real_import(name, *a, **k)
+
+        spec = importlib.util.spec_from_file_location("system_pulse_reexec", path)
+        m = importlib.util.module_from_spec(spec)
+        m.skill_utils = {}
+        with mock.patch("builtins.__import__", side_effect=_imp):
+            spec.loader.exec_module(m)
+        self.assertFalse(m._HAS_GW)
 
 
 # ─────────────────────────────────────────────────────────────────────────

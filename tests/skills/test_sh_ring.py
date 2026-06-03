@@ -352,6 +352,22 @@ class RingEnumerationTests(_RingBase):
         fake_ring.devices.return_value = ["not", "a", "dict"]
         self.assertEqual(self.mod._enumerate(fake_ring), {})
 
+    def test_enumerate_skips_item_whose_id_access_raises(self):
+        # A device inside a category list whose `.id` attribute access raises is
+        # skipped via the per-item `try/except Exception: pass` (one bad device
+        # doesn't poison the whole index). A good sibling still lands.
+        good = _FakeRingDevice(name="Front Door", did="ok")
+
+        class _BadId:
+            @property
+            def id(self):
+                raise RuntimeError("id boom")
+
+        fake_ring = mock.Mock()
+        fake_ring.devices.return_value = {"doorbots": [_BadId(), good]}
+        out = self.mod._enumerate(fake_ring)
+        self.assertEqual(set(out.keys()), {"ok"})
+
     def test_list_devices_empty_without_client(self):
         with mock.patch.object(self.mod, "_get_ring", return_value=None):
             self.assertEqual(self.mod.list_devices(), [])

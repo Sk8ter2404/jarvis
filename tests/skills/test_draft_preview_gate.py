@@ -17,6 +17,9 @@ whisper runs and nothing is actually sent.
 """
 from __future__ import annotations
 
+import importlib.util
+import os
+import sys
 import unittest
 from unittest import mock
 
@@ -140,6 +143,29 @@ class DraftPreviewGateTests(unittest.TestCase):
         with mock.patch.object(self.mod, "_companion", return_value=fake_bc):
             self.assertFalse(self.mod._is_asleep_or_standby())
 
+    def test_sleep_check_swallows_getattr_error(self):
+        # If reading the companion flags raises, _is_asleep_or_standby fails
+        # OPEN (returns False -> treat as awake) via the broad except.
+        class _Boom:
+            def __getattr__(self, name):
+                raise RuntimeError("globals torn down mid-read")
+
+        with mock.patch.object(self.mod, "_companion", return_value=_Boom()):
+            self.assertFalse(self.mod._is_asleep_or_standby())
+
+    # ── _companion (real import path) ────────────────────────────────────
+    def test_companion_returns_module_on_success(self):
+        sentinel = object()
+        with mock.patch.object(self.mod.importlib, "import_module",
+                               return_value=sentinel) as imp:
+            self.assertIs(self.mod._companion(), sentinel)
+        imp.assert_called_once_with("bobert_companion")
+
+    def test_companion_returns_none_on_import_failure(self):
+        with mock.patch.object(self.mod.importlib, "import_module",
+                               side_effect=ImportError("companion not ready")):
+            self.assertIsNone(self.mod._companion())
+
     # ── status action ────────────────────────────────────────────────────
     def test_status_reports_loaded_gates(self):
         cm = mock.MagicMock()
@@ -166,6 +192,25 @@ class DraftPreviewGateTests(unittest.TestCase):
         # Both names route to the same handler.
         self.assertIs(self.actions["outbound_gate_status"],
                       self.actions["draft_preview_gate_status"])
+
+    # ── module load-time sys.path bootstrap ──────────────────────────────
+    def test_path_bootstrap_inserts_project_root(self):
+        # Re-exec the source with the project root removed from sys.path so the
+        # `if _PROJECT_DIR not in sys.path: sys.path.insert(...)` guard runs.
+        # core.* is already imported (cached) so the from-imports still resolve.
+        path = self.mod.__file__
+        proj = os.path.dirname(os.path.dirname(path))
+        spec = importlib.util.spec_from_file_location("dpg_reexec", path)
+        m = importlib.util.module_from_spec(spec)
+        m.skill_utils = {}
+        saved = list(sys.path)
+        try:
+            sys.path[:] = [p for p in sys.path
+                           if os.path.abspath(p) != os.path.abspath(proj)]
+            spec.loader.exec_module(m)
+            self.assertIn(m._PROJECT_DIR, sys.path)
+        finally:
+            sys.path[:] = saved
 
 
 if __name__ == "__main__":

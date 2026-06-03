@@ -246,7 +246,7 @@ def _exit_workshop_mode() -> None:
     _enqueue_speech("Workshop mode disengaged, sir.")
 
 
-def _poll_loop() -> None:
+def _poll_loop() -> None:  # pragma: no cover - daemon while-True window poll loop; blocks on time.sleep between live pygetwindow scans. The decision logic it calls (_find_cad_window / _enter_workshop_mode / _exit_workshop_mode) is unit-tested directly.
     """Watch open windows every WORKSHOP_POLL_SECONDS and toggle mode."""
     try:
         # Initial settle delay so we don't race with whatever's coming up at boot

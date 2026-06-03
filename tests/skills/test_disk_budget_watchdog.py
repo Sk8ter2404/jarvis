@@ -175,5 +175,127 @@ class WatchdogActionTests(unittest.TestCase):
         self.assertIn("disk reading unavailable", out)
 
 
+class WatchdogDiskEdgeTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("disk_budget_watchdog")
+
+    def test_disk_free_gb_swallows_psutil_error(self):
+        fake = mock.MagicMock()
+        fake.disk_usage.side_effect = OSError("device gone")
+        with mock.patch.object(self.mod, "_HAS_PSUTIL", True), \
+             mock.patch.object(self.mod, "psutil", fake):
+            self.assertIsNone(self.mod._disk_free_gb())
+
+    def test_check_disk_returns_when_reading_unavailable(self):
+        # free_gb is None → early return, no alert (covers line 121).
+        with mock.patch.object(self.mod, "_disk_free_gb", return_value=None), \
+             mock.patch.object(self.mod, "_enqueue_speech") as enq:
+            self.mod._check_disk(time.time())
+        enq.assert_not_called()
+
+
+class WatchdogSnapshotEdgeTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("disk_budget_watchdog")
+
+    def test_snapshot_malformed_json_returns_none_none(self):
+        fd, p = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("{ broken json ::::")
+        self.addCleanup(lambda: os.path.exists(p) and os.remove(p))
+        with mock.patch.object(self.mod, "_CREDITS_STATE", p):
+            self.assertEqual(self.mod._read_credits_snapshot(), (None, None))
+
+    def test_snapshot_missing_checked_at_gives_none_age(self):
+        fd, p = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"balance": 5.0}, f)  # no checked_at → age None
+        self.addCleanup(lambda: os.path.exists(p) and os.remove(p))
+        with mock.patch.object(self.mod, "_CREDITS_STATE", p):
+            bal, age = self.mod._read_credits_snapshot()
+        self.assertAlmostEqual(bal, 5.0)
+        self.assertIsNone(age)
+
+
+class WatchdogCreditsCheckEdgeTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("disk_budget_watchdog")
+
+    def test_check_credits_returns_when_balance_none(self):
+        # balance None → early return (covers line 136).
+        with mock.patch.object(self.mod, "_read_credits_snapshot",
+                               return_value=(None, None)), \
+             mock.patch.object(self.mod, "_enqueue_speech") as enq:
+            self.mod._check_credits(time.time())
+        enq.assert_not_called()
+
+
+class WatchdogEnqueueSpeechTests(unittest.TestCase):
+    """_enqueue_speech: proactive route + atomic-file fallback + write failure."""
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("disk_budget_watchdog")
+
+    def test_enqueue_via_proactive_announce(self):
+        fake_bc = mock.MagicMock()
+        with mock.patch("importlib.import_module", return_value=fake_bc):
+            self.mod._enqueue_speech("ann")
+        fake_bc.proactive_announce.assert_called_once_with(
+            "ann", source="disk_budget_watchdog")
+
+    def test_enqueue_file_fallback_appends(self):
+        bc_no_announce = mock.MagicMock(spec=[])
+        with tempfile.TemporaryDirectory() as d:
+            qpath = os.path.join(d, "pending_speech.json")
+            with mock.patch("importlib.import_module", return_value=bc_no_announce), \
+                 mock.patch.object(self.mod, "_SPEECH_QUEUE", qpath):
+                self.mod._enqueue_speech("via-file")
+            with open(qpath, encoding="utf-8") as f:
+                data = json.load(f)
+        self.assertEqual(data[-1]["message"], "via-file")
+
+    def test_enqueue_recovers_from_corrupt_existing_queue(self):
+        with mock.patch("importlib.import_module", side_effect=ImportError):
+            with tempfile.TemporaryDirectory() as d:
+                qpath = os.path.join(d, "pending_speech.json")
+                with open(qpath, "w", encoding="utf-8") as f:
+                    f.write("not-json{")
+                with mock.patch.object(self.mod, "_SPEECH_QUEUE", qpath):
+                    self.mod._enqueue_speech("recovered")
+                with open(qpath, encoding="utf-8") as f:
+                    data = json.load(f)
+        self.assertEqual(data, [{"ts": mock.ANY, "message": "recovered"}])
+
+    def test_enqueue_write_failure_prints_fallback(self):
+        import contextlib
+        import io as _io
+        with mock.patch("importlib.import_module", side_effect=ImportError), \
+             mock.patch.object(self.mod, "_atomic_write_json",
+                               side_effect=OSError("full")), \
+             mock.patch.object(self.mod.os.path, "exists", return_value=False):
+            buf = _io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.mod._enqueue_speech("doomed-alert")
+        self.assertIn("doomed-alert", buf.getvalue())
+
+
+class WatchdogRegisterTests(unittest.TestCase):
+    """register(): the psutil-missing degradation notice (line 196)."""
+
+    def test_register_warns_when_psutil_missing(self):
+        import contextlib
+        import io as _io
+        import threading
+
+        mod, _ = load_skill_isolated("disk_budget_watchdog", register=False)
+        buf = _io.StringIO()
+        # Neuter the monitor thread, force the psutil-missing branch, register.
+        with mock.patch.object(threading.Thread, "start", lambda self: None), \
+             mock.patch.object(mod, "_HAS_PSUTIL", False), \
+             contextlib.redirect_stdout(buf):
+            mod.register({})
+        self.assertIn("psutil missing", buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

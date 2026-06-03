@@ -14,6 +14,7 @@ hardware/OS calls happen.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import sys
@@ -661,6 +662,24 @@ class WellnessRegisterTests(unittest.TestCase):
 # Sentinels for the face-tracker installer.
 _RAISE = object()
 _NOFUNC = object()
+
+
+class WellnessImportGuardTests(unittest.TestCase):
+    def test_path_bootstrap_inserts_project_root(self):
+        mod, _ = load_skill_isolated("wellness")
+        path = mod.__file__
+        proj = os.path.dirname(os.path.dirname(path))
+        spec = importlib.util.spec_from_file_location("wellness_reexec", path)
+        m = importlib.util.module_from_spec(spec)
+        m.skill_utils = {}
+        saved = list(sys.path)
+        try:
+            sys.path[:] = [p for p in sys.path
+                           if os.path.abspath(p) != os.path.abspath(proj)]
+            spec.loader.exec_module(m)
+            self.assertIn(m._PROJECT_DIR, sys.path)
+        finally:
+            sys.path[:] = saved
 
 
 if __name__ == "__main__":

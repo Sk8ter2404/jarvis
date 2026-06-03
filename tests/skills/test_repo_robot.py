@@ -16,6 +16,7 @@ from __future__ import annotations
 import datetime
 import os
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -228,6 +229,203 @@ class MorningVolunteerTests(unittest.TestCase):
                  "parts_on_order": [{"part": "x", "eta": today, "arrived": False}]}
         with mock.patch.object(self.mod, "_load_state", return_value=state):
             self.assertEqual(self.mod.get_morning_volunteer_text(), "")
+
+    def test_no_volunteer_when_state_empty(self):
+        with mock.patch.object(self.mod, "_load_state", return_value={}):
+            self.assertEqual(self.mod.get_morning_volunteer_text(), "")
+
+    def test_blocker_resolved_too_old_no_volunteer(self):
+        today = datetime.date.today()
+        state = {
+            "next_step": "go",
+            "parts_on_order": [],
+            "blockers": [
+                # First entry is unresolved → the loop `continue`s past it
+                # (exercises the not-resolved guard) before reaching the stale
+                # resolved one whose date is out of the 3-day window.
+                {"text": "still open", "resolved": False},
+                "not-a-dict",
+                {"text": "old one", "resolved": True,
+                 "resolved_at": _iso(today - datetime.timedelta(days=10))},
+            ],
+        }
+        with mock.patch.object(self.mod, "_load_state", return_value=state), \
+             mock.patch.object(self.mod, "_save_state"):
+            self.assertEqual(self.mod.get_morning_volunteer_text(), "")
+
+
+class StateIOTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("repo_robot")
+
+    def test_load_state_missing_file(self):
+        with mock.patch.object(self.mod.os.path, "exists", return_value=False):
+            self.assertEqual(self.mod._load_state(), {})
+
+    def test_load_state_reads_dict(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "state.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('{"next_step": "flash"}')
+            with mock.patch.object(self.mod, "_STATE_FILE", path):
+                self.assertEqual(self.mod._load_state(), {"next_step": "flash"})
+
+    def test_load_state_non_dict_returns_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "state.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("[1, 2, 3]")
+            with mock.patch.object(self.mod, "_STATE_FILE", path):
+                self.assertEqual(self.mod._load_state(), {})
+
+    def test_load_state_corrupt_returns_empty(self):
+        with mock.patch.object(self.mod.os.path, "exists", return_value=True), \
+             mock.patch("builtins.open", mock.mock_open(read_data="{ bad json")):
+            self.assertEqual(self.mod._load_state(), {})
+
+    def test_save_state_roundtrips_and_stamps_updated_at(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "state.json")
+            with mock.patch.object(self.mod, "_STATE_FILE", path):
+                ok = self.mod._save_state({"next_step": "go"})
+                self.assertTrue(ok)
+                reloaded = self.mod._load_state()
+        self.assertEqual(reloaded["next_step"], "go")
+        self.assertIn("updated_at", reloaded)
+
+    def test_save_state_write_failure_returns_false(self):
+        with mock.patch.object(self.mod.os, "makedirs", return_value=None), \
+             mock.patch("builtins.open", side_effect=OSError("read-only fs")):
+            self.assertFalse(self.mod._save_state({"x": 1}))
+
+
+class TodoScanResilienceTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("repo_robot")
+
+    def test_count_todo_read_error_swallowed(self):
+        with mock.patch.object(self.mod.os.path, "exists", return_value=True), \
+             mock.patch("builtins.open", side_effect=OSError("locked")):
+            self.assertEqual(self.mod._count_todo_tasks(), (0, 0))
+
+
+class RecentLogMentionsTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("repo_robot")
+
+    def test_no_logs_dir_returns_zero(self):
+        with mock.patch.object(self.mod.os.path, "isdir", return_value=False):
+            self.assertEqual(self.mod._recent_log_mentions(), 0)
+
+    def test_counts_recent_robot_lines_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            recent = os.path.join(d, "session_recent.log")
+            stale = os.path.join(d, "session_old.log")
+            notlog = os.path.join(d, "notes.txt")
+            with open(recent, "w", encoding="utf-8") as f:
+                f.write("Flashed the ESP32\nbought milk\nrobot eye wired\n")
+            with open(stale, "w", encoding="utf-8") as f:
+                f.write("servo soldering\n")
+            with open(notlog, "w", encoding="utf-8") as f:
+                f.write("esp32 mention in non-log\n")
+            # Make `stale` old; keep `recent` fresh.
+            old = time.time() - (self.mod._RECENT_HOURS + 5) * 3600
+            os.utime(stale, (old, old))
+            with mock.patch.object(self.mod, "_LOGS_DIR", d):
+                count = self.mod._recent_log_mentions()
+        # Only the two robot lines in the recent .log file.
+        self.assertEqual(count, 2)
+
+    def test_per_file_read_error_skipped(self):
+        with tempfile.TemporaryDirectory() as d:
+            good = os.path.join(d, "session_a.log")
+            with open(good, "w", encoding="utf-8") as f:
+                f.write("esp32 flash\n")
+            with mock.patch.object(self.mod, "_LOGS_DIR", d), \
+                 mock.patch.object(self.mod.os.path, "getmtime",
+                                   side_effect=OSError("stat fail")):
+                # getmtime raising for each file → inner except → skipped.
+                self.assertEqual(self.mod._recent_log_mentions(), 0)
+
+    def test_listdir_error_swallowed(self):
+        with mock.patch.object(self.mod.os.path, "isdir", return_value=True), \
+             mock.patch.object(self.mod.os, "listdir",
+                               side_effect=OSError("denied")):
+            self.assertEqual(self.mod._recent_log_mentions(), 0)
+
+
+class StatusTailAndBlockerBranchTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("repo_robot")
+
+    def test_status_includes_flash_date_and_log_tail(self):
+        today = datetime.date.today()
+        state = {
+            "next_step": "calibrate",
+            "last_firmware_flash": {"at": _iso(today - datetime.timedelta(days=2))},
+        }
+        with mock.patch.object(self.mod, "_load_state", return_value=state), \
+             mock.patch.object(self.mod, "_count_todo_tasks", return_value=(0, 0)), \
+             mock.patch.object(self.mod, "_recent_log_mentions", return_value=4):
+            out = self.actions["robot_status"]("")
+        self.assertIn("last flash 2 days ago", out)
+        self.assertIn("Recent log mentions: 4", out)
+
+    def test_status_no_bits_uses_dash_lead(self):
+        # Empty-ish but non-empty dict (so not the "state file is empty" path),
+        # with nothing trackable → "no tracked state yet".
+        state = {"misc": "value"}
+        with mock.patch.object(self.mod, "_load_state", return_value=state), \
+             mock.patch.object(self.mod, "_count_todo_tasks", return_value=(0, 0)), \
+             mock.patch.object(self.mod, "_recent_log_mentions", return_value=0):
+            out = self.actions["robot_status"]("")
+        self.assertIn("no tracked state yet", out)
+
+    def test_blocker_action_multiple(self):
+        state = {"blockers": [
+            {"text": "PSU undersized", "since": "2026-05-30", "resolved": False},
+            {"text": "missing bracket", "resolved": False},
+        ]}
+        with mock.patch.object(self.mod, "_load_state", return_value=state):
+            out = self.actions["robot_blocker"]("")
+        self.assertIn("2 blockers", out)
+        self.assertIn("PSU undersized", out)
+        self.assertIn("missing bracket", out)
+
+    def test_next_step_action_clean_no_blockers(self):
+        state = {"next_step": "mount the head", "blockers": []}
+        with mock.patch.object(self.mod, "_load_state", return_value=state):
+            out = self.actions["next_robot_step"]("")
+        self.assertEqual(out, "Next, sir: mount the head.")
+
+
+class JustArrivedEdgeTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("repo_robot")
+
+    def test_part_without_eta_skipped(self):
+        state = {"parts_on_order": [
+            {"part": "no-eta part", "arrived": False},      # missing eta → skip
+            "garbage",                                       # not a dict → skip
+        ]}
+        self.assertEqual(self.mod._just_arrived_parts(state), [])
+
+
+class RegisterTests(unittest.TestCase):
+    def test_register_wires_actions(self):
+        mod, _ = load_skill_isolated("repo_robot", register=False)
+        actions = {}
+        mod.register(actions)
+        for name in ("robot_status", "robot_blocker", "next_robot_step"):
+            self.assertIn(name, actions)
+
+    def test_register_swallows_makedirs_failure(self):
+        mod, _ = load_skill_isolated("repo_robot", register=False)
+        actions = {}
+        with mock.patch.object(mod.os, "makedirs",
+                               side_effect=OSError("denied")):
+            mod.register(actions)   # must not raise
+        self.assertIn("robot_status", actions)
 
 
 if __name__ == "__main__":

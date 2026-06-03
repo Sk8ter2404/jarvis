@@ -189,6 +189,49 @@ class PendingFilePersistenceTests(DraftConfirmTestBase):
             data = json.load(f)
         self.assertIsNone(data.get("active"))
 
+    def test_write_pending_swallows_write_failure(self):
+        # _write_pending is best-effort: a write error (here os.makedirs raises)
+        # is logged and swallowed so a full disk can't abort a confirmation.
+        with mock.patch.object(dc.os, "makedirs", side_effect=OSError("no dir")):
+            dc._write_pending({"body": "x"})       # must not raise
+            dc._write_pending(None)                 # None branch, also swallowed
+
+
+class ImportCompanionTests(unittest.TestCase):
+    """Exercise the REAL _import_companion / _capture_and_transcribe helpers
+    (the other suites stub _import_companion, so its body never runs)."""
+
+    def test_import_companion_returns_none_on_failure(self):
+        # bobert_companion is the heavy monolith and is NOT importable on CI;
+        # force the import to fail so the except→None path runs deterministically
+        # on every host.
+        with mock.patch.object(dc.importlib, "import_module",
+                               side_effect=ImportError("no monolith")):
+            self.assertIsNone(dc._import_companion())
+
+    def test_import_companion_returns_module_on_success(self):
+        sentinel = mock.MagicMock(name="fake_companion")
+        with mock.patch.object(dc.importlib, "import_module",
+                               return_value=sentinel):
+            self.assertIs(dc._import_companion(), sentinel)
+
+    def test_capture_returns_none_when_companion_absent(self):
+        # _capture_and_transcribe short-circuits to None (hard failure) when the
+        # companion can't be imported — this is the fail-closed mic path.
+        with mock.patch.object(dc, "_import_companion", return_value=None):
+            self.assertIsNone(dc._capture_and_transcribe(1.0))
+
+
+class GateRaisesTests(DraftConfirmTestBase):
+    def test_unexpected_error_in_gate_fails_closed(self):
+        # An unexpected exception inside the locked try-block (here the
+        # transcribe step raises a surprise) is caught by the outer except and
+        # the gate fails closed (False) rather than propagating.
+        bc = _fake_companion(heard="yes")
+        with mock.patch.object(dc, "_capture_and_transcribe",
+                               side_effect=RuntimeError("surprise")):
+            self.assertFalse(self._run("ship it", "Sam", companion=bc))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -144,6 +144,17 @@ class ProcessCaptureChunkTests(MonolithGlobalsTestCase):
             out = self.bc._process_capture_chunk(self.chunk)
         self.assertIs(out, self.chunk)
 
+    def test_processor_exception_with_debug_prints_and_falls_through(self):
+        # 4461-4462: same failure but with debug mode on -> the pass-through is
+        # logged before returning the raw chunk.
+        ap = mock.Mock()
+        ap.get_processor.side_effect = RuntimeError("proc boom")
+        with mock.patch.object(self.bc, "_audio_master_enabled", [True]), \
+                mock.patch.object(self.bc, "_audio_processor", ap), \
+                mock.patch.object(self.bc, "_debug_mode", [True]):
+            out = self.bc._process_capture_chunk(self.chunk)
+        self.assertIs(out, self.chunk)
+
 
 @requires_monolith
 class FeedPlaybackReferenceTests(MonolithGlobalsTestCase):
@@ -914,6 +925,30 @@ class OllamaAsyncHelperTests(MonolithGlobalsTestCase):
         # latch reset so a transient failure doesn't block vision forever
         self.assertFalse(self.bc._LOCAL_VISION_PULL_TRIGGERED[0])
 
+    def test_vision_pull_noop_when_already_triggered(self):
+        # 5789-5790: the latch is already set -> early return, no thread/post.
+        self.bc._LOCAL_VISION_PULL_TRIGGERED[0] = True
+        fake_req = mock.Mock()
+        with mock.patch.object(self.bc.threading, "Thread", _ImmediateThread), \
+                mock.patch.object(self.bc, "requests", fake_req):
+            self.bc._ollama_pull_vision_async("vlm:7b")
+        fake_req.post.assert_not_called()
+
+    def test_text_pull_drains_stream_lines(self):
+        # 5556-5557: the streamed pull response yields lines -> the drain loop
+        # body executes (we just consume them to keep the connection moving).
+        class _LineResp(_FakeResp):
+            def iter_lines(self):
+                return iter([b'{"status":"pulling"}', b'{"status":"done"}'])
+
+        fake_req = mock.Mock()
+        fake_req.post.return_value = _LineResp(ok=True)
+        with mock.patch.object(self.bc.threading, "Thread", _ImmediateThread), \
+                mock.patch.object(self.bc, "requests", fake_req):
+            self.bc._ollama_pull_async("some:model")
+        fake_req.post.assert_called_once()
+        self.assertTrue(self.bc._OLLAMA_PULL_TRIGGERED[0])
+
 
 # ===========================================================================
 # _local_cheatsheet — compact action reference
@@ -1622,6 +1657,39 @@ class StartBargeInListenerTests(MonolithGlobalsTestCase):
         # leave the global clean for other tests
         self.bc._barge_in_interrupted = False
 
+    def test_callback_resets_on_quiet_and_returns_when_interrupted(self):
+        # 6471: a sub-threshold chunk resets the sustain counter; 6463: once the
+        # interrupt flag is already set, the callback returns immediately
+        # without re-evaluating RMS.
+        holder = {}
+        fake_sd = mock.Mock()
+
+        def _make_stream(**kwargs):
+            holder["cb"] = kwargs["callback"]
+            return mock.Mock()
+        fake_sd.InputStream.side_effect = _make_stream
+        with mock.patch.object(self.bc, "_mic_input_disabled", return_value=False), \
+                mock.patch.object(self.bc, "get_input_device", return_value=0), \
+                mock.patch.object(self.bc, "sd", fake_sd), \
+                mock.patch.object(self.bc, "BARGE_IN_THRESHOLD", 0.01), \
+                mock.patch.object(self.bc, "BARGE_IN_SUSTAIN_CHUNKS", 2):
+            self.bc._start_barge_in_listener()
+            cb = holder["cb"]
+            loud = np.full(64, 0.5, dtype=np.float32).reshape(-1, 1)
+            quiet = np.zeros((64, 1), dtype=np.float32)
+            cb(loud, 64, None, None)    # sustain == 1
+            cb(quiet, 64, None, None)   # 6471: sub-threshold → sustain reset to 0
+            self.assertFalse(self.bc._barge_in_interrupted)
+            # one loud chunk now only gets sustain back to 1, not the 2 needed
+            cb(loud, 64, None, None)
+            self.assertFalse(self.bc._barge_in_interrupted)
+            # Force the interrupted state, then a further loud chunk must early-
+            # return at 6463 (no exception, flag stays True).
+            self.bc._barge_in_interrupted = True
+            cb(loud, 64, None, None)
+            self.assertTrue(self.bc._barge_in_interrupted)
+        self.bc._barge_in_interrupted = False
+
 
 # ===========================================================================
 # _AudioDucker
@@ -1839,6 +1907,24 @@ class EnsureTtsLoopTests(MonolithGlobalsTestCase):
         # a fresh loop was created to replace the half-dead one
         nel.assert_called_once()
 
+    def test_stop_of_old_loop_exception_swallowed(self):
+        # 6216-6219: the half-dead loop's call_soon_threadsafe(stop) raises ->
+        # the except swallows it and a fresh loop is still created.
+        dead_loop = mock.Mock()
+        dead_loop.is_running.return_value = False   # not healthy -> replace
+        dead_loop.call_soon_threadsafe.side_effect = RuntimeError("loop wedged")
+        new_loop = mock.Mock()
+        self.bc._tts_loop = dead_loop
+        self.bc._tts_loop_thread = None
+        with mock.patch.object(self.bc.asyncio, "new_event_loop",
+                               return_value=new_loop) as nel, \
+                mock.patch.object(self.bc.threading, "Thread",
+                                  _ImmediateThread):
+            self.bc._ensure_tts_loop()   # must not raise
+            self.assertIs(self.bc._tts_loop, new_loop)
+        dead_loop.call_soon_threadsafe.assert_called_once()
+        nel.assert_called_once()
+
 
 # ===========================================================================
 # SECOND BATCH — deeper branch coverage on safe (non-hardware) paths
@@ -1988,6 +2074,34 @@ class CallLocalLlmWebSearchGuardTests(MonolithGlobalsTestCase):
                 mock.patch.object(self.bc, "requests", fake_req):
             self.bc._call_local_llm("BASE", msgs)
         self.assertIn("Do NOT fabricate", captured["sys"])
+
+    def test_web_search_scan_exception_is_swallowed(self):
+        # 5723-5724: the messages object passes isinstance(list) but raises when
+        # sliced for the recent-window scan -> the except swallows it and the
+        # call proceeds normally (no guard prepended, no crash).
+        class _BadSliceList(list):
+            def __getitem__(self, key):
+                if isinstance(key, slice):
+                    raise RuntimeError("slice exploded")
+                return super().__getitem__(key)
+
+        captured = {}
+        fake_req = mock.Mock()
+
+        def _post(url, json=None, timeout=None):
+            captured["sys"] = json["messages"][0]["content"]
+            return _FakeResp(ok=True, json_data={"message": {"content": "ok sir"}})
+        fake_req.post.side_effect = _post
+        msgs = _BadSliceList([{"role": "user", "content": "hi"}])
+        with mock.patch.object(self.bc, "LOCAL_LLM_FALLBACK", True), \
+                mock.patch.object(self.bc, "_ollama_alive", return_value=True), \
+                mock.patch.object(self.bc, "_get_local_llm_model",
+                                  return_value="m:tag"), \
+                mock.patch.object(self.bc, "_ollama_has_model", return_value=True), \
+                mock.patch.object(self.bc, "requests", fake_req):
+            out = self.bc._call_local_llm("BASE", msgs)
+        self.assertEqual(out, "ok sir")
+        self.assertNotIn("Do NOT fabricate", captured["sys"])
 
 
 @requires_monolith
@@ -2743,6 +2857,23 @@ class TranscribeMoreBranchTests(MonolithGlobalsTestCase):
         fake_torch.cuda.empty_cache.assert_called_once()
         self.assertIsNone(self.bc._stt)
 
+    def test_cuda_error_empty_cache_failure_still_drops_model(self):
+        # 5318-5319: torch.cuda.empty_cache() itself raises -> the except
+        # swallows it and the model is still dropped (_stt nulled) so recovery
+        # proceeds on the next utterance.
+        fake_model = mock.Mock()
+        fake_model.transcribe.side_effect = RuntimeError("CUDA out of memory")
+        fake_torch = mock.Mock()
+        fake_torch.cuda.is_available.return_value = True
+        fake_torch.cuda.empty_cache.side_effect = RuntimeError("driver wedged")
+        with mock.patch.object(self.bc, "_ensure_whisper"), \
+                mock.patch.object(self.bc, "_stt", fake_model), \
+                mock.patch.object(self.bc, "_stt_engine", "faster_whisper"), \
+                mock.patch.dict(sys.modules, {"torch": fake_torch}):
+            text, conf = self.bc.transcribe(np.zeros(16, dtype=np.float32))
+        self.assertEqual(text, "")
+        self.assertIsNone(self.bc._stt)
+
 
 @requires_monolith
 class RegisterCudaDllDirsErrorArmsTests(MonolithGlobalsTestCase):
@@ -3422,6 +3553,61 @@ class AudioDuckerWorkerTests(MonolithGlobalsTestCase):
             matched = d._enumerate_targets()
         self.assertEqual(len(matched), 1)
 
+    def test_worker_loop_coinitialize_failure_swallowed(self):
+        # 6545-6546: comtypes.CoInitialize() raises -> com_inited stays False,
+        # the loop still drains its sentinel and the CoUninitialize finally is
+        # skipped (no crash).
+        d = self.bc._AudioDucker()
+        done = threading.Event()
+        d._work_queue.put(([("iface", 1.0)], 0.2, True, done))
+        d._work_queue.put(None)
+        bad_com = mock.Mock()
+        bad_com.CoInitialize.side_effect = OSError("CoInitialize failed")
+        with mock.patch.dict(sys.modules, {"comtypes": bad_com}), \
+                mock.patch.object(d, "_fade_run"):
+            d._worker_loop()
+        self.assertTrue(done.is_set())
+        bad_com.CoUninitialize.assert_not_called()   # never inited -> never uninit
+
+    def test_worker_loop_couninitialize_failure_swallowed(self):
+        # 6561-6566: CoInitialize succeeds but the finally's CoUninitialize
+        # raises -> swallowed, the loop still returns cleanly.
+        d = self.bc._AudioDucker()
+        done = threading.Event()
+        d._work_queue.put(([("iface", 1.0)], 0.2, True, done))
+        d._work_queue.put(None)
+        com = mock.Mock()
+        com.CoUninitialize.side_effect = OSError("CoUninitialize failed")
+        with mock.patch.dict(sys.modules, {"comtypes": com}), \
+                mock.patch.object(d, "_fade_run"):
+            d._worker_loop()   # must not raise
+        self.assertTrue(done.is_set())
+        com.CoUninitialize.assert_called_once()
+
+    def test_enumerate_couninitialize_failure_swallowed(self):
+        # 6606-6611: _enumerate_targets' finally CoUninitialize raises ->
+        # swallowed; the matched list is still returned.
+        d = self.bc._AudioDucker()
+        vol = mock.Mock()
+        vol.GetMasterVolume.return_value = 0.9
+        sess = mock.Mock()
+        sess.Process = mock.Mock(pid=self.bc._AudioDucker._SELF_PID + 11)
+        sess.Process.name.return_value = "spotify.exe"
+        sess.SimpleAudioVolume = vol
+        fake_au = mock.Mock()
+        fake_au.GetAllSessions.return_value = [sess]
+        com = mock.Mock()
+        com.CoUninitialize.side_effect = OSError("CoUninitialize failed")
+        with mock.patch.dict(sys.modules,
+                             {"pycaw": mock.Mock(),
+                              "pycaw.pycaw": mock.Mock(AudioUtilities=fake_au),
+                              "comtypes": com}), \
+                mock.patch.object(self.bc, "AUDIO_DUCKING_TARGETS", ["spotify"]), \
+                mock.patch.object(self.bc, "AUDIO_DUCKING_LEVEL", 0.2):
+            matched = d._enumerate_targets()   # must not raise
+        self.assertEqual(len(matched), 1)
+        com.CoUninitialize.assert_called_once()
+
     def test_duck_enqueues_and_restore_drains(self):
         # duck(): 6646-6659 enqueue onto worker; restore(): 6661-6682 cancel +
         # fade-up enqueue. _ensure_worker + the worker are stubbed so nothing
@@ -3492,6 +3678,19 @@ class AudioDuckerWorkerTests(MonolithGlobalsTestCase):
                 mock.patch.object(self.bc.time, "sleep"):
             d._fade_run([(bad, 1.0)], 0.2, cancellable=False)
         bad.SetMasterVolume.assert_not_called()
+
+    def test_fade_run_set_volume_exception_swallowed(self):
+        # 6636-6637: the iface reads fine but SetMasterVolume raises on every
+        # step → each failure is swallowed and the fade loop runs to completion.
+        d = self.bc._AudioDucker()
+        iface = mock.Mock()
+        iface.GetMasterVolume.return_value = 1.0
+        iface.SetMasterVolume.side_effect = RuntimeError("set fail")
+        with mock.patch.object(self.bc, "AUDIO_DUCKING_FADE_MS", 100), \
+                mock.patch.object(self.bc.time, "sleep"):
+            d._fade_run([(iface, 1.0)], 0.2, cancellable=False)   # must not raise
+        # all 10 steps attempted despite every SetMasterVolume raising
+        self.assertEqual(iface.SetMasterVolume.call_count, 10)
 
     def test_restore_noop_when_nothing_saved(self):
         d = self.bc._AudioDucker()
@@ -3602,6 +3801,24 @@ class GetMicBufferTapPathTests(MonolithGlobalsTestCase):
                                   side_effect=lambda: next(times)):
             out = self.bc.get_mic_buffer(0.1, sample_rate=16000)
         self.assertIsNone(out)
+        rrt.assert_called_once()
+
+    def test_path_a2_breaks_when_record_speech_closes_mid_tap(self):
+        # 4849-4850: we enter Path A2 with record_speech holding the mic, but
+        # it releases ownership before any frame arrives — the loop sees the
+        # flag flip False and breaks (returning None, no Path-B open).
+        self.bc._record_speech_active[0] = True
+        self.bc._record_speech_sr[0] = 16000
+
+        def _add(_q):
+            # record_speech "closes the stream" right after we registered.
+            self.bc._record_speech_active[0] = False
+        with mock.patch.object(self.bc, "_mic_input_disabled",
+                               return_value=False), \
+                mock.patch.object(self.bc, "add_record_tap", side_effect=_add), \
+                mock.patch.object(self.bc, "remove_record_tap") as rrt:
+            out = self.bc.get_mic_buffer(0.5, sample_rate=16000)
+        self.assertIsNone(out)        # broke with nothing tapped
         rrt.assert_called_once()
 
 
@@ -3801,6 +4018,29 @@ class GetMicBufferPathBTests(MonolithGlobalsTestCase):
                                   side_effect=lambda: next(times)):
             out = self.bc.get_mic_buffer(0.1, sample_rate=16000)
         self.assertIsNone(out)
+
+    def test_path_b_start_failure_returns_none(self):
+        # 4893-4895: the Path-B stream constructs fine but .start() raises ->
+        # the except prints and returns None (stream still closed in finally).
+        self.bc._record_speech_active[0] = False
+
+        class _BadStartStream:
+            def __init__(self, *a, **k):
+                pass
+
+            def start(self):
+                raise RuntimeError("stream start failed")
+
+        fake_sd = mock.Mock()
+        fake_sd.InputStream.side_effect = _BadStartStream
+        with mock.patch.object(self.bc, "_mic_input_disabled",
+                               return_value=False), \
+                mock.patch.object(self.bc, "sd", fake_sd), \
+                mock.patch.object(self.bc, "get_input_device", return_value=3), \
+                mock.patch.object(self.bc, "_safe_close_stream") as scs:
+            out = self.bc.get_mic_buffer(0.1, sample_rate=16000)
+        self.assertIsNone(out)
+        scs.assert_called_once()
 
 
 @requires_monolith
@@ -4184,6 +4424,328 @@ class EnsureWhisperRaiseArmTests(MonolithGlobalsTestCase):
             self.bc._ensure_whisper()
         self.assertIs(self.bc._stt, good)
         self.assertEqual(self.bc._stt_device, "cpu")
+
+
+# ===========================================================================
+# COVERAGE-COMPLETION BATCH — record_speech live-stream setup/teardown driven
+# through a fake InputStream, plus play_with_lipsync's defensive exception
+# handlers. The capture LOOP body itself is pragma'd in the monolith as live-
+# mic-only; here we feed frames through the captured callback so the setup
+# (4587-4598), post-start publish (4638-4640), the finally release (4771-4772)
+# and the post-loop concatenate/return (4774-4781) all execute, and we drive
+# the InputStream.start() failure arm (4632-4635) with a stream whose start
+# raises.
+# ===========================================================================
+class _FakeRecordStream:
+    """Fake sd.InputStream for record_speech: captures the callback handed to
+    it and, on start(), feeds a 1 loud + N silent frame burst so the VAD loop
+    trips into recording then breaks on sustained silence."""
+
+    def __init__(self, *a, **kw):
+        self.callback = kw.get("callback")
+        self.started = False
+        self.closed = False
+        self._frames = kw.pop("_frames", None)
+
+    def start(self):
+        self.started = True
+        for f in (self._frames or []):
+            self.callback(f, len(f), None, None)
+
+    def stop(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+@requires_monolith
+class RecordSpeechLiveStreamTests(MonolithGlobalsTestCase):
+    """Drive record_speech past the mic-disabled short-circuit with a fake
+    InputStream so the (otherwise live-mic-only) setup/teardown statements run
+    deterministically. The pragma'd capture-loop body executes incidentally as
+    the fed frames are drained; we assert the function's observable result."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def _common_patches(self, fake_sd):
+        return [
+            mock.patch.object(self.bc, "_mic_input_disabled", return_value=False),
+            mock.patch.object(self.bc, "sd", fake_sd),
+            mock.patch.object(self.bc, "get_input_device", return_value=1),
+            mock.patch.object(self.bc, "_process_capture_chunk",
+                              side_effect=lambda c, sr: c),
+            mock.patch.object(self.bc, "pause_face_tracking"),
+            mock.patch.object(self.bc, "set_state"),
+            mock.patch.object(self.bc, "_heartbeat"),
+            mock.patch.object(self.bc, "_write_hud_state"),
+            mock.patch.object(self.bc, "HUD_ENABLED", False),
+            mock.patch.object(self.bc, "_record_speech_active", [False]),
+            mock.patch.object(self.bc, "_record_speech_sr", [0]),
+        ]
+
+    def test_happy_path_records_and_returns_audio(self):
+        # 4587-4598 setup, 4638-4640 publish-ownership, the capture loop break
+        # on sustained silence, 4771-4772 finally release, 4774-4781 post-loop
+        # concat + return. silence_lim == int(1.4*16000/1024) == 21, so 1 loud
+        # frame trips recording and 21 silent frames end the utterance.
+        loud = np.full(1024, 0.5, dtype=np.float32).reshape(-1, 1)
+        silent = np.zeros((1024, 1), dtype=np.float32)
+        frames = [loud] + [silent] * 21
+        fake_sd = mock.Mock()
+        fake_sd.InputStream.side_effect = (
+            lambda *a, **kw: _FakeRecordStream(*a, _frames=frames, **kw))
+        scs_patch = mock.patch.object(self.bc, "_safe_close_stream")
+        patches = self._common_patches(fake_sd) + [scs_patch]
+        started = [p.start() for p in patches]
+        scs = started[patches.index(scs_patch)]
+        try:
+            out = self.bc.record_speech(timeout=None)
+        finally:
+            for p in patches:
+                p.stop()
+        # 22 frames of 1024 samples each were concatenated and flattened.
+        self.assertIsNotNone(out)
+        self.assertEqual(out.ndim, 1)
+        self.assertEqual(out.size, 22 * 1024)
+        # ownership flag was flipped True (4639) then released in finally (4771)
+        self.assertFalse(self.bc._record_speech_active[0])
+        scs.assert_called_once()
+
+    def test_no_chunks_returns_none(self):
+        # 4779-4780: stream opens + starts but no frame ever crosses the VAD
+        # floor before the timeout, so chunks stays empty and we return None
+        # (distinct from the mic-disabled short-circuit). One sub-threshold
+        # frame, timeout already elapsed -> 4763 timeout-return path drains to
+        # the finally; assert the graceful None.
+        silent = np.zeros((1024, 1), dtype=np.float32)
+        fake_sd = mock.Mock()
+        fake_sd.InputStream.side_effect = (
+            lambda *a, **kw: _FakeRecordStream(*a, _frames=[silent], **kw))
+        patches = self._common_patches(fake_sd) + [
+            mock.patch.object(self.bc, "_safe_close_stream"),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            # timeout=0 so the first sub-threshold frame's elapsed>=timeout
+            # check returns None without recording.
+            out = self.bc.record_speech(timeout=0.0)
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertIsNone(out)
+
+    def test_inputstream_start_failure_returns_none(self):
+        # 4632-4635: InputStream opens but .start() raises -> logged,
+        # _safe_close_stream invoked, None returned (before the capture loop).
+        class _BadStartStream(_FakeRecordStream):
+            def start(self):
+                raise RuntimeError("start boom")
+
+        fake_sd = mock.Mock()
+        fake_sd.InputStream.side_effect = lambda *a, **kw: _BadStartStream(*a, **kw)
+        scs_patch = mock.patch.object(self.bc, "_safe_close_stream")
+        patches = self._common_patches(fake_sd) + [scs_patch]
+        started = [p.start() for p in patches]
+        scs = started[patches.index(scs_patch)]
+        try:
+            out = self.bc.record_speech(timeout=1.0)
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertIsNone(out)
+        scs.assert_called_once()
+
+
+@requires_monolith
+class PlayWithLipsyncDefensiveHandlerTests(MonolithGlobalsTestCase):
+    """The single-line except handlers inside play_with_lipsync's closures and
+    teardown. Threads run synchronously via _ImmediateThread; the barge-watch
+    closure is given an already-set interrupt flag so it returns at once."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def setUp(self):
+        self._saved_flag = list(self.bc._tts_playback_active)
+        self._saved_barge = self.bc._barge_in_interrupted
+
+    def tearDown(self):
+        self.bc._tts_playback_active[:] = self._saved_flag
+        self.bc._barge_in_interrupted = self._saved_barge
+
+    def _base(self, fake_sd, fake_layer, ducker, thread_cls=_ImmediateThread):
+        return [
+            mock.patch.object(self.bc, "sd", fake_sd),
+            mock.patch.object(self.bc, "_tts_layer", fake_layer),
+            mock.patch.object(self.bc, "_audio_ducker", ducker),
+            mock.patch.object(self.bc, "get_output_device", return_value=1),
+            mock.patch.object(self.bc, "_write_hud_state"),
+            mock.patch.object(self.bc, "_feed_playback_reference"),
+            mock.patch.object(self.bc.threading, "Thread", thread_cls),
+            mock.patch.object(self.bc.time, "sleep"),
+            mock.patch.object(self.bc, "_safe_close_stream"),
+        ]
+
+    def test_is_muted_probe_exception_defaults_unmuted(self):
+        # 6772-6773: _tts_layer.is_muted() raises -> _muted stays False and
+        # playback proceeds down the no-robot arm. No barge listener.
+        fake_sd = mock.Mock()
+        fake_layer = mock.Mock()
+        fake_layer.is_muted.side_effect = RuntimeError("mute probe boom")
+        ducker = mock.Mock()
+        audio = np.zeros(48, dtype=np.float32)
+        patches = self._base(fake_sd, fake_layer, ducker) + [
+            mock.patch.object(self.bc, "BARGE_IN_ENABLED", False),
+            mock.patch.object(self.bc, "ROBOT_ENABLED", False),
+            mock.patch.object(self.bc, "is_using_headset", return_value=False),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            self.bc.play_with_lipsync(audio, 24000)   # must not raise
+        finally:
+            for p in patches:
+                p.stop()
+        fake_sd.play.assert_called_once()
+        self.assertFalse(self.bc._tts_playback_active[0])
+
+    def test_sd_wait_exception_is_logged_not_raised(self):
+        # 6792-6793: sd.wait() inside _safe_wait raises -> logged, done-event
+        # still set in finally, playback completes. No barge listener.
+        fake_sd = mock.Mock()
+        fake_sd.wait.side_effect = RuntimeError("wait boom")
+        fake_layer = mock.Mock()
+        fake_layer.is_muted.return_value = False
+        ducker = mock.Mock()
+        audio = np.zeros(48, dtype=np.float32)
+        patches = self._base(fake_sd, fake_layer, ducker) + [
+            mock.patch.object(self.bc, "BARGE_IN_ENABLED", False),
+            mock.patch.object(self.bc, "ROBOT_ENABLED", False),
+            mock.patch.object(self.bc, "is_using_headset", return_value=False),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            self.bc.play_with_lipsync(audio, 24000)
+        finally:
+            for p in patches:
+                p.stop()
+        fake_sd.wait.assert_called()
+        self.assertFalse(self.bc._tts_playback_active[0])
+
+    def test_barge_watch_sd_stop_exception_swallowed(self):
+        # 6722-6723: the barge-watch closure sees the interrupt flag and calls
+        # sd.stop(), which raises -> swallowed. Flag pre-set so the closure
+        # returns immediately under _ImmediateThread.
+        fake_sd = mock.Mock()
+        fake_sd.stop.side_effect = RuntimeError("stop boom")
+        fake_layer = mock.Mock()
+        fake_layer.is_muted.return_value = False
+        ducker = mock.Mock()
+        barge_stream = mock.Mock()
+        self.bc._barge_in_interrupted = True
+        audio = np.zeros(48, dtype=np.float32)
+        patches = self._base(fake_sd, fake_layer, ducker) + [
+            mock.patch.object(self.bc, "BARGE_IN_ENABLED", True),
+            mock.patch.object(self.bc, "ROBOT_ENABLED", False),
+            mock.patch.object(self.bc, "is_using_headset", return_value=True),
+            mock.patch.object(self.bc, "_start_barge_in_listener",
+                              return_value=barge_stream),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            self.bc.play_with_lipsync(audio, 24000)   # must not raise
+        finally:
+            for p in patches:
+                p.stop()
+        fake_sd.stop.assert_called()
+        self.assertFalse(self.bc._tts_playback_active[0])
+
+    def test_ducker_restore_exception_swallowed(self):
+        # 6872-6873: _audio_ducker.restore() in the finally raises -> swallowed.
+        fake_sd = mock.Mock()
+        fake_layer = mock.Mock()
+        fake_layer.is_muted.return_value = False
+        ducker = mock.Mock()
+        ducker.restore.side_effect = RuntimeError("restore boom")
+        audio = np.zeros(48, dtype=np.float32)
+        patches = self._base(fake_sd, fake_layer, ducker) + [
+            mock.patch.object(self.bc, "BARGE_IN_ENABLED", False),
+            mock.patch.object(self.bc, "ROBOT_ENABLED", False),
+            mock.patch.object(self.bc, "is_using_headset", return_value=False),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            self.bc.play_with_lipsync(audio, 24000)   # must not raise
+        finally:
+            for p in patches:
+                p.stop()
+        ducker.restore.assert_called_once()
+        self.assertFalse(self.bc._tts_playback_active[0])
+
+    def test_robot_sd_wait_exception_is_logged_not_raised(self):
+        # 6836-6837: in the robot arm, sd.wait() inside _safe_wait_robot raises
+        # -> logged, done-event still set, playback completes. No barge listener.
+        fake_sd = mock.Mock()
+        fake_sd.wait.side_effect = RuntimeError("robot wait boom")
+        fake_layer = mock.Mock()
+        fake_layer.is_muted.return_value = False
+        ducker = mock.Mock()
+        audio = np.full(96, 0.4, dtype=np.float32)
+        patches = self._base(fake_sd, fake_layer, ducker) + [
+            mock.patch.object(self.bc, "BARGE_IN_ENABLED", False),
+            mock.patch.object(self.bc, "ROBOT_ENABLED", True),
+            mock.patch.object(self.bc, "is_using_headset", return_value=False),
+            mock.patch.object(self.bc, "send"),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            self.bc.play_with_lipsync(audio, 24000)   # must not raise
+        finally:
+            for p in patches:
+                p.stop()
+        fake_sd.wait.assert_called()
+        self.assertFalse(self.bc._tts_playback_active[0])
+
+    def test_thread_join_exceptions_swallowed(self):
+        # 6855-6856 (amp_thread.join) + 6863-6864 (barge_watch_thread.join):
+        # both joins raise in the finally -> swallowed. Barge path so the watch
+        # thread exists; interrupt flag pre-set so the closure exits at once.
+        class _JoinRaisingThread(_ImmediateThread):
+            def join(self, timeout=None):
+                raise RuntimeError("join boom")
+
+        fake_sd = mock.Mock()
+        fake_layer = mock.Mock()
+        fake_layer.is_muted.return_value = False
+        ducker = mock.Mock()
+        barge_stream = mock.Mock()
+        self.bc._barge_in_interrupted = True
+        audio = np.zeros(48, dtype=np.float32)
+        patches = self._base(fake_sd, fake_layer, ducker,
+                             thread_cls=_JoinRaisingThread) + [
+            mock.patch.object(self.bc, "BARGE_IN_ENABLED", True),
+            mock.patch.object(self.bc, "ROBOT_ENABLED", False),
+            mock.patch.object(self.bc, "is_using_headset", return_value=True),
+            mock.patch.object(self.bc, "_start_barge_in_listener",
+                              return_value=barge_stream),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            self.bc.play_with_lipsync(audio, 24000)   # must not raise
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertFalse(self.bc._tts_playback_active[0])
 
 
 if __name__ == "__main__":

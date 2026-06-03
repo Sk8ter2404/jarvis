@@ -400,6 +400,44 @@ class ChappieIOHelperTests(unittest.TestCase):
         leftovers = [n for n in os.listdir(self.tmp) if n.startswith(".chappie_")]
         self.assertEqual(leftovers, [])
 
+    def test_atomic_write_fallback_success_runs_os_replace(self):
+        # Block the `from core.atomic_io import ...` at the __import__ level (a
+        # mock on importlib.import_module does NOT intercept a `from` import) so
+        # the local tempfile->os.replace fallback fully runs and writes the file.
+        path = os.path.join(self.tmp, "viafallback.json")
+        real_import = __import__
+
+        def _imp(name, *a, **k):
+            if name == "core.atomic_io":
+                raise ImportError("no core")
+            return real_import(name, *a, **k)
+
+        with mock.patch("builtins.__import__", side_effect=_imp):
+            self.mod._atomic_write_json(path, {"ok": True})
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"ok": True})
+
+    def test_atomic_write_fallback_replace_and_cleanup_both_fail(self):
+        # Fallback runs (core blocked), the write succeeds but os.replace raises,
+        # AND the temp-file cleanup os.remove ALSO raises -> the inner
+        # `except Exception: pass` swallows the cleanup error and the original
+        # os.replace error propagates.
+        path = os.path.join(self.tmp, "doomed.json")
+        real_import = __import__
+
+        def _imp(name, *a, **k):
+            if name == "core.atomic_io":
+                raise ImportError("no core")
+            return real_import(name, *a, **k)
+
+        with mock.patch("builtins.__import__", side_effect=_imp), \
+             mock.patch.object(self.mod.os, "replace",
+                               side_effect=OSError("replace denied")), \
+             mock.patch.object(self.mod.os, "remove",
+                               side_effect=OSError("remove denied")):
+            with self.assertRaises(OSError):
+                self.mod._atomic_write_json(path, {"x": 1})
+
     # ── _load_json ────────────────────────────────────────────────────────
     def test_load_json_missing_returns_default(self):
         sentinel = {"default": True}

@@ -595,8 +595,8 @@ def _recently_modified_source_files(limit: int) -> list[str]:
         parts = set(rel.split(os.sep))
         if parts & excluded_parts:
             # Prune subtree.
-            dirnames[:] = []
-            continue
+            dirnames[:] = []  # pragma: no cover - unreachable: the dirnames filter on the next iteration's parent already strips excluded child dirs before os.walk descends, so an excluded dir is never yielded as dirpath
+            continue  # pragma: no cover - see above
         dirnames[:] = [d for d in dirnames if d not in excluded_parts]
         for fn in filenames:
             if not fn.endswith(".py"):
@@ -1145,7 +1145,7 @@ def _looks_like_text_log(sample: str) -> bool:
     if not sample:
         return False
     snippet = sample[:4096]
-    if not snippet:
+    if not snippet:  # pragma: no cover - unreachable: sample was proven truthy one line above, so sample[:4096] is always non-empty for a str
         return False
     if "\x00" in snippet:
         return False

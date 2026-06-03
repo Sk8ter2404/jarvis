@@ -369,6 +369,22 @@ class ShowCardTests(unittest.TestCase):
                                side_effect=ImportError("no hud_card")):
             self.mod._show_card_safe()   # no raise
 
+    def test_show_card_bootstraps_sys_path_when_root_missing(self):
+        # With _PROJECT_DIR absent from sys.path, _show_card_safe re-inserts it
+        # before importing hud_card (covers the call-time path-bootstrap guard).
+        seen = []
+        hud = _fake_source(show_card=lambda which: seen.append(which))
+        saved = list(sys.path)
+        try:
+            sys.path[:] = [p for p in sys.path
+                           if os.path.abspath(p) != os.path.abspath(self.mod._PROJECT_DIR)]
+            with inject_modules(hud_card=hud):
+                self.mod._show_card_safe()
+            self.assertIn(self.mod._PROJECT_DIR, sys.path)   # re-inserted
+        finally:
+            sys.path[:] = saved
+        self.assertEqual(seen, ["morning"])
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # _outlook_summary_blocking (ms_graph faked)

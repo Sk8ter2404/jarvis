@@ -103,6 +103,22 @@ class TeamsVisionParseTests(unittest.TestCase):
         self.assertFalse(has)
         self.assertIn("capture_failed", raw)
 
+    def test_unread_header_without_count_returns_no_match(self):
+        # Answer contains 'UNREAD:' (so it passes the first gate) but the regex
+        # on the first line can't extract a digit → falls to the no-match
+        # return (covers line 148).
+        has, count, raw = self._ask(answer="UNREAD: lots of them maybe")
+        self.assertFalse(has)
+        self.assertEqual(count, 0)
+        self.assertEqual(raw, "UNREAD: lots of them maybe")
+
+    def test_import_companion_delegates_to_importlib(self):
+        sentinel = mock.MagicMock(name="fake-bc-module")
+        with mock.patch("importlib.import_module", return_value=sentinel) as imp:
+            got = self.mod._import_companion()
+        imp.assert_called_once_with("bobert_companion")
+        self.assertIs(got, sentinel)
+
 
 class TeamsCheckOnceSnoozeTests(unittest.TestCase):
     def setUp(self):
@@ -151,8 +167,11 @@ class TeamsEnqueueGateTests(unittest.TestCase):
 
     def test_denied_confirmation_drops_nudge(self):
         # draft_confirm returns False → nothing should be announced/written.
+        import contextlib
+        import io
         with mock.patch.object(self.mod, "draft_confirm", return_value=False), \
-             mock.patch("importlib.import_module") as imp:
+             mock.patch("importlib.import_module") as imp, \
+             contextlib.redirect_stdout(io.StringIO()):
             self.mod._enqueue_speech("You have an unread message, sir.")
         # The companion proactive_announce path must never be reached.
         imp.assert_not_called()
@@ -165,6 +184,64 @@ class TeamsEnqueueGateTests(unittest.TestCase):
             self.mod._enqueue_speech("You have an unread message, sir.")
         bc.proactive_announce.assert_called_once()
         self.assertIn("unread message", bc.proactive_announce.call_args.args[0])
+
+    def test_denied_confirmation_prints_drop_notice(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with mock.patch.object(self.mod, "draft_confirm", return_value=False), \
+             contextlib.redirect_stdout(buf):
+            self.mod._enqueue_speech("ignored nudge")
+        self.assertIn("dropped", buf.getvalue())
+
+    def test_approved_file_fallback_when_announcer_absent(self):
+        import json
+        import os
+        import tempfile
+        # Approved, but the imported parent has no proactive_announce →
+        # falls through to the atomic file write (covers 80-90).
+        bc_no_announce = mock.MagicMock(spec=[])
+        with tempfile.TemporaryDirectory() as d:
+            qpath = os.path.join(d, "pending_speech.json")
+            with mock.patch.object(self.mod, "draft_confirm", return_value=True), \
+                 mock.patch("importlib.import_module", return_value=bc_no_announce), \
+                 mock.patch.object(self.mod, "_SPEECH_QUEUE", qpath):
+                self.mod._enqueue_speech("file-nudge")
+            with open(qpath, encoding="utf-8") as f:
+                data = json.load(f)
+        self.assertEqual(data[-1]["message"], "file-nudge")
+
+    def test_approved_file_fallback_when_import_raises(self):
+        import json
+        import os
+        import tempfile
+        # importlib raising (parent not loaded) ALSO falls through to file
+        # write (covers the except-pass at 77-78 + the file path).
+        with tempfile.TemporaryDirectory() as d:
+            qpath = os.path.join(d, "pending_speech.json")
+            # Pre-seed corrupt JSON so the read-except branch (86-87) runs too.
+            with open(qpath, "w", encoding="utf-8") as f:
+                f.write("{bad json")
+            with mock.patch.object(self.mod, "draft_confirm", return_value=True), \
+                 mock.patch("importlib.import_module", side_effect=ImportError), \
+                 mock.patch.object(self.mod, "_SPEECH_QUEUE", qpath):
+                self.mod._enqueue_speech("recovered-nudge")
+            with open(qpath, encoding="utf-8") as f:
+                data = json.load(f)
+        self.assertEqual(data, [{"ts": mock.ANY, "message": "recovered-nudge"}])
+
+    def test_approved_write_failure_prints_fallback(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with mock.patch.object(self.mod, "draft_confirm", return_value=True), \
+             mock.patch("importlib.import_module", side_effect=ImportError), \
+             mock.patch.object(self.mod, "_atomic_write_json",
+                               side_effect=OSError("disk full")), \
+             mock.patch.object(self.mod.os.path, "exists", return_value=False), \
+             contextlib.redirect_stdout(buf):
+            self.mod._enqueue_speech("doomed-nudge")
+        self.assertIn("doomed-nudge", buf.getvalue())
 
 
 class TeamsActionTests(unittest.TestCase):

@@ -169,6 +169,127 @@ class CaptureAndTranscribeTests(unittest.TestCase):
         with mock.patch.object(gate, "_import_companion", return_value=bc):
             self.assertEqual(gate._capture_and_transcribe(1.0), "yes please")
 
+    def test_record_missing_returns_empty(self):
+        # Companion present but no callable record_speech/transcribe → "".
+        bc = mock.MagicMock()
+        bc.record_speech = None
+        with mock.patch.object(gate, "_import_companion", return_value=bc):
+            self.assertEqual(gate._capture_and_transcribe(1.0), "")
+
+    def test_record_raises_returns_empty(self):
+        bc = mock.MagicMock()
+        bc.record_speech.side_effect = RuntimeError("mic down")
+        with mock.patch.object(gate, "_import_companion", return_value=bc):
+            self.assertEqual(gate._capture_and_transcribe(1.0), "")
+
+    def test_transcribe_raises_returns_empty(self):
+        bc = mock.MagicMock()
+        bc.record_speech.return_value = object()
+        bc.transcribe.side_effect = RuntimeError("whisper down")
+        with mock.patch.object(gate, "_import_companion", return_value=bc):
+            self.assertEqual(gate._capture_and_transcribe(1.0), "")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Coverage-completion: _import_companion, _speak, and the vip routing branch.
+# ─────────────────────────────────────────────────────────────────────────
+
+class ImportCompanionTests(unittest.TestCase):
+    def test_returns_module_on_success(self):
+        sentinel = object()
+        with mock.patch.object(gate.importlib, "import_module",
+                               return_value=sentinel):
+            self.assertIs(gate._import_companion(), sentinel)
+
+    def test_returns_none_on_import_error(self):
+        with mock.patch.object(gate.importlib, "import_module",
+                               side_effect=ImportError("no companion")):
+            self.assertIsNone(gate._import_companion())
+
+
+class SpeakTests(unittest.TestCase):
+    def test_routes_to_companion_speak(self):
+        bc = mock.MagicMock()
+        with mock.patch.object(gate, "_import_companion", return_value=bc):
+            gate._speak("hello sir")
+        bc._speak.assert_called_once_with("hello sir")
+
+    def test_falls_back_to_print_when_no_companion(self):
+        with mock.patch.object(gate, "_import_companion", return_value=None), \
+                mock.patch("builtins.print") as mprint:
+            gate._speak("fallback line")
+        self.assertTrue(
+            any("fallback line" in str(c) for c in mprint.call_args_list))
+
+    def test_falls_back_to_print_when_speak_missing(self):
+        bc = mock.MagicMock()
+        bc._speak = None        # not callable → fallback path
+        with mock.patch.object(gate, "_import_companion", return_value=bc), \
+                mock.patch("builtins.print") as mprint:
+            gate._speak("no speaker")
+        self.assertTrue(
+            any("no speaker" in str(c) for c in mprint.call_args_list))
+
+    def test_speak_exception_falls_back_to_print(self):
+        bc = mock.MagicMock()
+        bc._speak.side_effect = RuntimeError("tts boom")
+        with mock.patch.object(gate, "_import_companion", return_value=bc), \
+                mock.patch("builtins.print") as mprint:
+            gate._speak("after error")
+        self.assertTrue(
+            any("after error" in str(c) for c in mprint.call_args_list))
+
+
+class GetPendingVipRoutingTests(unittest.TestCase):
+    def test_vip_action_tries_vip_intercept_first(self):
+        # A send_vip_* action should consult skills.vip_intercept first.
+        order = []
+        vip = mock.MagicMock()
+        vip.get_pending_draft.return_value = {"body": "vip draft"}
+
+        def fake_import(name):
+            order.append(name)
+            if name == "skills.vip_intercept":
+                return vip
+            raise ImportError("only vip available")
+
+        with mock.patch.object(gate.importlib, "import_module",
+                               side_effect=fake_import):
+            out = gate._get_pending("send_vip_reply")
+        self.assertEqual(out, {"body": "vip draft"})
+        self.assertEqual(order[0], "skills.vip_intercept")
+
+    def test_first_provider_import_fails_falls_through(self):
+        # vip import fails → continue to email_triage which returns a draft.
+        triage = mock.MagicMock()
+        triage.get_pending_draft.return_value = {"body": "triage draft"}
+
+        def fake_import(name):
+            if name == "skills.vip_intercept":
+                raise ImportError("no vip")
+            return triage
+
+        with mock.patch.object(gate.importlib, "import_module",
+                               side_effect=fake_import):
+            out = gate._get_pending("send_vip_reply")
+        self.assertEqual(out, {"body": "triage draft"})
+
+    def test_getter_absent_skips_provider(self):
+        # Provider module present but exposes neither getter → returns None.
+        mod = mock.MagicMock()
+        del mod.get_pending_draft
+        del mod._get_pending
+        with mock.patch.object(gate.importlib, "import_module", return_value=mod):
+            self.assertIsNone(gate._get_pending("send_draft"))
+
+    def test_falls_back_to_private_getter(self):
+        # No public get_pending_draft, but a private _get_pending exists.
+        mod = mock.MagicMock()
+        del mod.get_pending_draft
+        mod._get_pending.return_value = {"body": "via private"}
+        with mock.patch.object(gate.importlib, "import_module", return_value=mod):
+            self.assertEqual(gate._get_pending("send_draft"), {"body": "via private"})
+
 
 if __name__ == "__main__":
     unittest.main()

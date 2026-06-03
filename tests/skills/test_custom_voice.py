@@ -524,6 +524,28 @@ class LoadXttsModelTests(unittest.TestCase):
             self.mod._load_xtts_model()
         self.assertEqual(api_mod.TTS.last_kwargs.get("gpu"), True)
 
+    def test_inner_recheck_returns_model_built_by_racer(self):
+        # The outer cache check misses, but by the time we acquire
+        # _xtts_model_lock another thread has built+cached a model for the same
+        # sample. The inner double-checked re-read returns it without rebuilding.
+        mod = self.mod
+        sample = r"C:\v\racer.wav"
+        racer_model = object()
+
+        class _RacingLock:
+            def __enter__(self):
+                mod._xtts_model = racer_model
+                mod._xtts_loaded_sample = sample
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with mock.patch.object(self.mod, "get_sample_path", return_value=sample), \
+             mock.patch.object(self.mod, "_xtts_model_lock", _RacingLock()):
+            got = self.mod._load_xtts_model()
+        self.assertIs(got, racer_model)
+
     def test_reloads_when_sample_changes(self):
         tts_pkg, api_mod = _make_tts_pkg()
         paths = iter([r"C:\v\one.wav", r"C:\v\two.wav"])

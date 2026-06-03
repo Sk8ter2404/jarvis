@@ -21,7 +21,7 @@ from collections import deque
 try:
     import psutil
     _HAS_PSUTIL = True
-except ImportError:
+except ImportError:  # pragma: no cover - psutil is a guaranteed dep (dev + CI); import never fails
     _HAS_PSUTIL = False
 
 # ─── thresholds ──────────────────────────────────────────────────────────

@@ -820,7 +820,7 @@ def resolve_tts_preset(
 #  SELF-TEST
 # ──────────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - interactive self-test demo, not run under unittest
     cases = [
         # (text, emotion, tone, intent, wry, expected)
         ("Quite, sir.",                None,        None,         None,    True,  "wry"),

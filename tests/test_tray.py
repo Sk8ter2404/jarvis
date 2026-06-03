@@ -1105,6 +1105,14 @@ class OpenPathCallbackTests(TrayTestBase):
                                side_effect=OSError("x")):
             tray._on_open_logs(mock.Mock(), mock.Mock())  # no raise
 
+    def test_open_logs_makedirs_error_swallowed(self):
+        # a makedirs failure (e.g. read-only volume) is swallowed; the callback
+        # still attempts to open the folder afterwards.
+        with mock.patch.object(tray.os, "makedirs", side_effect=OSError("ro")), \
+             mock.patch.object(tray.os, "startfile", create=True) as sf:
+            tray._on_open_logs(mock.Mock(), mock.Mock())  # no raise
+        sf.assert_called_once_with(tray.LOGS_DIR)
+
     def test_open_project_folder(self):
         with mock.patch.object(tray.os, "startfile", create=True) as sf:
             tray._on_open_project_folder(mock.Mock(), mock.Mock())
@@ -1422,6 +1430,39 @@ class VersionAndUptimeTests(TrayTestBase):
 
     def test_uptime_zero_when_nothing(self):
         self.assertEqual(tray._read_uptime_seconds(), 0.0)
+
+    def test_version_changelog_read_error_swallowed(self):
+        # CHANGELOG.md exists but can't be opened -> outer except swallows it and
+        # the function falls through to the version.json fallback (also absent),
+        # yielding "unknown".
+        self._write(tray.CHANGELOG_FILE, "## v1.0.0 — 2026-01-01 00:00\n")
+        with mock.patch("builtins.open", side_effect=OSError("locked")):
+            ver, at = tray._read_version_and_upgrade()
+        self.assertEqual(ver, "unknown")
+        self.assertEqual(at, "unknown")
+
+    def test_version_json_load_error_swallowed(self):
+        # No changelog header, version.json present but malformed -> the
+        # fallback's except fires and version stays "unknown".
+        os.makedirs(tray.DATA_DIR, exist_ok=True)
+        self._write(tray.VERSION_FILE, "{ not valid json")
+        ver, at = tray._read_version_and_upgrade()
+        self.assertEqual(ver, "unknown")
+
+    def test_uptime_instances_parse_error_falls_back_to_hud(self):
+        # instances.json present but malformed -> the parse except fires and the
+        # function falls back to the hud boot timestamp.
+        os.makedirs(tray.DATA_DIR, exist_ok=True)
+        self._write(tray.INSTANCES_FILE, "{ not valid json")
+        self._write_hud(boot_started_at=tray.time.time() - 45)
+        self.assertGreaterEqual(tray._read_uptime_seconds(), 30)
+
+    def test_uptime_hud_boot_non_numeric_returns_zero(self):
+        # a non-numeric hud boot_started_at makes float() raise -> the final
+        # except returns 0.0 rather than propagating.
+        with mock.patch.object(tray, "_read_hud_state",
+                               return_value={"boot_started_at": "not-a-number"}):
+            self.assertEqual(tray._read_uptime_seconds(), 0.0)
 
     def test_format_uptime_variants(self):
         self.assertEqual(tray._format_uptime(0), "0m")

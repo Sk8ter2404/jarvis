@@ -242,6 +242,28 @@ class CallActionTests(unittest.TestCase):
         out = self.mod._make_call_action(client)("fs read_file [1,2,3]")
         self.assertIn("must be a JSON object", out)
 
+    def test_unbalanced_quotes_falls_back_to_comma_split(self):
+        # An unterminated quote makes shlex.split raise ValueError; the skill
+        # then comma-splits. Use commas so the fallback yields 2 tokens.
+        client = mock.MagicMock()
+        client.call_tool.return_value = {"ok": True, "text": "done"}
+        out = self.mod._make_call_action(client)('fs, read_"file')
+        self.assertEqual(out, "done")
+        client.call_tool.assert_called_once_with("fs", 'read_"file', {})
+
+    def test_single_token_after_split_format_hint(self):
+        # One bare word → neither shlex nor comma split yields 2 tokens.
+        client = mock.MagicMock()
+        out = self.mod._make_call_action(client)("onlyserver")
+        self.assertIn("Format: mcp_call", out)
+        client.call_tool.assert_not_called()
+
+    def test_failed_call_without_error_uses_generic_message(self):
+        client = mock.MagicMock()
+        client.call_tool.return_value = {"ok": False}   # no 'error' key
+        out = self.mod._make_call_action(client)("fs read_file")
+        self.assertEqual(out, "fs.read_file failed")
+
 
 class RegisterToolActionsTests(unittest.TestCase):
     def setUp(self):
@@ -278,6 +300,240 @@ class RegisterToolActionsTests(unittest.TestCase):
         self.mod._register_tool_actions(actions, client, catalog, verbose=False)
         again = self.mod._register_tool_actions(actions, client, catalog, verbose=False)
         self.assertEqual(again, [])
+
+    def test_entry_without_action_name_skipped(self):
+        actions = {}
+        client = mock.MagicMock()
+        catalog = [{"server": "x", "tool": "y", "schema": {}}]   # no action_name
+        added = self.mod._register_tool_actions(actions, client, catalog, verbose=False)
+        self.assertEqual(added, [])
+        self.assertEqual(actions, {})
+
+    def test_verbose_prints_registration_and_collision_summaries(self):
+        # verbose=True path with >6 registered (the "+N more" tail) AND a
+        # collision against a non-MCP action.
+        def native(_):
+            return "native"
+        actions = {"mcp_collide": native}
+        client = mock.MagicMock()
+        catalog = [{"action_name": "mcp_collide", "server": "s", "tool": "t",
+                    "schema": {}}]
+        catalog += [{"action_name": f"mcp_s_t{i}", "server": "s", "tool": f"t{i}",
+                     "schema": {}} for i in range(8)]
+        added = self.mod._register_tool_actions(actions, client, catalog, verbose=True)
+        self.assertEqual(len(added), 8)
+        self.assertIs(actions["mcp_collide"], native)   # not clobbered
+
+
+class ParseArgsExtraBranchTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("mcp_tools")
+
+    def test_empty_input_no_required_returns_empty_dict(self):
+        schema = {"properties": {"opt": {"type": "string"}}}   # optional only
+        self.assertEqual(self.mod._parse_args("", schema), {})
+
+    def test_json_array_input_falls_through_to_shortcut(self):
+        # '['-prefixed input parses to a list (not a dict) → JSON branch is
+        # skipped, and the single-property shortcut treats the raw string as
+        # the value (coerced to array).
+        schema = {"properties": {"items": {"type": "array"}}}
+        out = self.mod._parse_args("[1, 2]", schema)
+        self.assertEqual(out, {"items": [1, 2]})
+
+    def test_json_object_with_invalid_json_falls_through(self):
+        # '{'-prefixed but not valid JSON → the try/except is swallowed and we
+        # fall to the single-property shortcut.
+        schema = {"properties": {"blob": {"type": "string"}}}
+        out = self.mod._parse_args("{not valid", schema)
+        self.assertEqual(out, {"blob": "{not valid"})
+
+
+class CoerceExtraBranchTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("mcp_tools")
+
+    def test_number_bad_value_left_as_string(self):
+        self.assertEqual(self.mod._coerce("not-a-number", {"type": "number"}),
+                         "not-a-number")
+
+    def test_object_json_parsed(self):
+        self.assertEqual(self.mod._coerce('{"a": 1}', {"type": "object"}),
+                         {"a": 1})
+
+    def test_unknown_type_passthrough(self):
+        self.assertEqual(self.mod._coerce("x", {"type": "weird"}), "x")
+
+
+class ListActionTruncationTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("mcp_tools")
+
+    def test_caps_at_60_and_reports_remainder(self):
+        catalog = [{"action_name": f"mcp_s_t{i:03d}", "server": "s",
+                    "tool": f"t{i}", "description": "d"} for i in range(75)]
+        out = self.mod._make_list_action(lambda: catalog)("")
+        self.assertIn("75 MCP tool(s)", out)
+        self.assertIn("...and 15 more", out)        # 75 - 60
+
+    def test_long_description_truncated(self):
+        catalog = [{"action_name": "mcp_s_t", "server": "s", "tool": "t",
+                    "description": "x" * 200}]
+        out = self.mod._make_list_action(lambda: catalog)("")
+        self.assertIn("...", out)
+
+    def test_entry_without_description_renders_name_only(self):
+        catalog = [{"action_name": "mcp_s_t", "server": "s", "tool": "t",
+                    "description": ""}]
+        out = self.mod._make_list_action(lambda: catalog)("")
+        self.assertIn("mcp_s_t", out)
+
+
+class ReloadActionTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("mcp_tools")
+
+    def test_reload_reports_servers_and_newly_registered(self):
+        client = mock.MagicMock()
+        catalog = [{"action_name": "mcp_fs_new", "server": "fs", "tool": "new",
+                    "schema": {}}]
+        client.bootstrap.return_value = catalog
+        client.list_servers.return_value = {
+            "fs": {"connected": True}, "slack": {"connected": False}}
+        actions = {}
+        holder = [[]]
+        out = self.mod._make_reload_action(client, actions, holder)("")
+        self.assertIn("1/2 server(s) connected", out)
+        self.assertIn("1 tool(s) discovered", out)
+        self.assertIn("newly registered: mcp_fs_new", out)
+        self.assertIn("restart JARVIS", out)
+        self.assertIn("mcp_fs_new", actions)
+        self.assertEqual(holder[0], catalog)
+
+    def test_reload_with_many_new_tools_truncates_list(self):
+        client = mock.MagicMock()
+        catalog = [{"action_name": f"mcp_s_t{i}", "server": "s", "tool": f"t{i}",
+                    "schema": {}} for i in range(8)]
+        client.bootstrap.return_value = catalog
+        client.list_servers.return_value = {"s": {"connected": True}}
+        out = self.mod._make_reload_action(client, {}, [[]])("")
+        self.assertIn("newly registered:", out)
+        self.assertIn("+3 more", out)              # 8 listed, head shows 5
+
+    def test_reload_no_new_tools_omits_registered_clause(self):
+        client = mock.MagicMock()
+        client.bootstrap.return_value = []
+        client.list_servers.return_value = {"s": {"connected": True}}
+        out = self.mod._make_reload_action(client, {}, [[]])("")
+        self.assertNotIn("newly registered", out)
+        self.assertIn("0 tool(s) discovered", out)
+
+    def test_reload_bootstrap_failure_reported(self):
+        client = mock.MagicMock()
+        client.bootstrap.side_effect = RuntimeError("npx blew up")
+        out = self.mod._make_reload_action(client, {}, [[]])("")
+        self.assertIn("MCP reload failed", out)
+        self.assertIn("RuntimeError", out)
+
+
+class RegisterTests(unittest.TestCase):
+    """register() does `from core import mcp_client`. We inject a fake module so
+    no real MCP SDK / servers / subprocess are touched."""
+
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("mcp_tools")
+
+    def _install_fake_core_mcp(self, fake):
+        import sys
+        import types
+        core = sys.modules.get("core")
+        created_core = False
+        if core is None:
+            core = types.ModuleType("core")
+            sys.modules["core"] = core
+            created_core = True
+        had_attr = hasattr(core, "mcp_client")
+        prev = getattr(core, "mcp_client", None)
+        core.mcp_client = fake
+        sys.modules["core.mcp_client"] = fake
+        self.addCleanup(lambda: self._restore_core(core, created_core, had_attr, prev))
+
+    def _restore_core(self, core, created_core, had_attr, prev):
+        import sys
+        sys.modules.pop("core.mcp_client", None)
+        if created_core:
+            sys.modules.pop("core", None)
+        elif had_attr:
+            core.mcp_client = prev
+        else:
+            try:
+                delattr(core, "mcp_client")
+            except AttributeError:
+                pass
+
+    def test_register_import_failure_noops(self):
+        # Force `from core import mcp_client` to raise → silent return, no actions.
+        import sys
+        actions = {}
+        fake = mock.MagicMock()
+        # A module-like object whose attribute access raises on mcp_client.
+        with mock.patch.dict(sys.modules, {"core.mcp_client": None}):
+            # Patch importlib machinery indirectly: easiest is to make `core`
+            # raise. Use builtins.__import__ shim scoped to this call.
+            real_import = __import__
+
+            def _imp(name, *a, **k):
+                if name == "core" and a and "mcp_client" in (a[2] or []):
+                    raise ImportError("no mcp sdk")
+                return real_import(name, *a, **k)
+            with mock.patch("builtins.__import__", _imp):
+                self.mod.register(actions)
+        self.assertEqual(actions, {})
+        del fake
+
+    def test_register_unavailable_client_noops(self):
+        fake = mock.MagicMock()
+        fake.is_available.return_value = False
+        self._install_fake_core_mcp(fake)
+        actions = {}
+        self.mod.register(actions)
+        self.assertEqual(actions, {})
+
+    def test_register_available_wires_management_actions_and_bootstraps(self):
+        import threading as _thr
+        fake = mock.MagicMock()
+        fake.is_available.return_value = True
+        fake.bootstrap.return_value = [
+            {"action_name": "mcp_fs_read", "server": "fs", "tool": "read",
+             "schema": {}}]
+        fake.list_servers.return_value = {"fs": {"connected": True}}
+        self._install_fake_core_mcp(fake)
+        actions = {}
+        captured = {}
+        with mock.patch.object(_thr.Thread, "start",
+                               lambda self: captured.__setitem__("t", self._target)):
+            self.mod.register(actions)
+        # Management actions are registered synchronously.
+        for name in ("mcp_status", "mcp_list_tools", "mcp_call", "mcp_reload"):
+            self.assertIn(name, actions)
+        # Drive the bootstrap thread body directly → registers the tool action.
+        captured["t"]()
+        self.assertIn("mcp_fs_read", actions)
+
+    def test_register_bootstrap_thread_swallows_exception(self):
+        import threading as _thr
+        fake = mock.MagicMock()
+        fake.is_available.return_value = True
+        fake.bootstrap.side_effect = RuntimeError("bootstrap boom")
+        self._install_fake_core_mcp(fake)
+        actions = {}
+        captured = {}
+        with mock.patch.object(_thr.Thread, "start",
+                               lambda self: captured.__setitem__("t", self._target)):
+            self.mod.register(actions)
+        captured["t"]()   # the bg bootstrap raising must be swallowed
+        # Management actions still present; no tool actions added.
+        self.assertIn("mcp_status", actions)
 
 
 if __name__ == "__main__":

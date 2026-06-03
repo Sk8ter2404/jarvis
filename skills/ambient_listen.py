@@ -981,7 +981,7 @@ def _audio_worker_loop() -> None:
             # at 44.1/48 kHz. Cheap linear resample keeps deps light.
             if dev_sr != sample_rate:
                 n_out = int(round(audio.shape[0] * sample_rate / dev_sr))
-                if n_out <= 0:
+                if n_out <= 0:  # pragma: no cover - unreachable: the batch gate guarantees audio.shape[0] >= dev_sr*batch_secs, so n_out ~= sample_rate*batch_secs >= 5 (see test NOTE)
                     continue
                 x_old = np.linspace(0.0, 1.0, num=audio.shape[0], endpoint=False)
                 x_new = np.linspace(0.0, 1.0, num=n_out, endpoint=False)

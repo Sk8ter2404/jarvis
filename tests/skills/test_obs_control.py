@@ -251,6 +251,135 @@ class ObsToggleMuteTests(unittest.TestCase):
         self.assertIn("No audio source called", out)
         self.assertIn("Mic/Aux", out)
 
+    def test_ambiguous_source_refuses(self):
+        # Two inputs contain 'aux' → ambiguous, no toggle issued (covers 214).
+        out, ws = self._run("aux", ["Mic/Aux", "Game Aux"])
+        self.assertIn("Multiple inputs match", out)
+        self.assertNotIn("ToggleInputMute", [c[0] for c in ws.calls])
+
+    def test_toggle_unknown_state_generic_confirm(self):
+        # OBS returns no inputMuted field → the generic "Toggled mute" confirm
+        # (covers 232).
+        out, _ws = self._run("mic", ["Mic/Aux"], toggle_datain={})
+        self.assertIn("Toggled mute on 'Mic/Aux'", out)
+
+    def test_get_input_list_error(self):
+        ws = _FakeWS(raise_on={"GetInputList": RuntimeError("no inputs")})
+        with mock.patch.multiple(self.mod, obsws=mock.MagicMock(return_value=ws),
+                                 obs_requests=_fake_requests()):
+            out = self.actions["obs_toggle_mute"]("mic")
+        self.assertIn("didn't return its input list", out)
+
+    def test_toggle_input_mute_error(self):
+        inputs = {"inputs": [{"inputName": "Mic/Aux"}]}
+        ws = _FakeWS(responses={"GetInputList": _Resp(inputs)},
+                     raise_on={"ToggleInputMute": RuntimeError("locked")})
+        with mock.patch.multiple(self.mod, obsws=mock.MagicMock(return_value=ws),
+                                 obs_requests=_fake_requests()):
+            out = self.actions["obs_toggle_mute"]("mic")
+        self.assertIn("refused to toggle mute", out)
+
+
+class ObsErrorBranchTests(unittest.TestCase):
+    """Remaining OBS-refusal / API-error branches across the actions."""
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("obs_control")
+        self.mod._HAS_OBSWS = True
+
+    def _ws(self, **kw):
+        ws = _FakeWS(**kw)
+        return ws, mock.patch.multiple(
+            self.mod, obsws=mock.MagicMock(return_value=ws),
+            obs_requests=_fake_requests())
+
+    def test_start_recording_generic_refusal(self):
+        ws, patch = self._ws(raise_on={"StartRecord": RuntimeError("disk error")})
+        with patch:
+            out = self.actions["obs_start_recording"]("")
+        self.assertIn("refused to start recording", out)
+
+    def test_stop_recording_generic_refusal(self):
+        ws, patch = self._ws(raise_on={"StopRecord": RuntimeError("disk error")})
+        with patch:
+            out = self.actions["obs_stop_recording"]("")
+        self.assertIn("refused to stop recording", out)
+
+    def test_stop_recording_success(self):
+        ws, patch = self._ws()
+        with patch:
+            out = self.actions["obs_stop_recording"]("")
+        self.assertEqual(out, "Recording stopped, sir.")
+        self.assertEqual(ws.calls[0][0], "StopRecord")
+
+    def test_pause_get_status_error(self):
+        ws, patch = self._ws(raise_on={"GetRecordStatus": RuntimeError("no reply")})
+        with patch:
+            out = self.actions["obs_pause_recording"]("")
+        self.assertIn("didn't answer about recording state", out)
+
+    def test_pause_toggle_error(self):
+        ws, patch = self._ws(
+            responses={"GetRecordStatus": _Resp({"outputActive": True,
+                                                 "outputPaused": False})},
+            raise_on={"PauseRecord": RuntimeError("busy")})
+        with patch:
+            out = self.actions["obs_pause_recording"]("")
+        self.assertIn("refused to toggle pause", out)
+
+    def test_switch_scene_get_list_error(self):
+        ws, patch = self._ws(raise_on={"GetSceneList": RuntimeError("no scenes")})
+        with patch:
+            out = self.actions["obs_switch_scene"]("gameplay")
+        self.assertIn("didn't return its scene list", out)
+
+    def test_switch_scene_set_error(self):
+        ws, patch = self._ws(
+            responses={"GetSceneList": _Resp(
+                {"scenes": [{"sceneName": "Gameplay"}]})},
+            raise_on={"SetCurrentProgramScene": RuntimeError("locked")})
+        with patch:
+            out = self.actions["obs_switch_scene"]("gameplay")
+        self.assertIn("refused to switch scene", out)
+
+    def test_disconnect_error_is_swallowed(self):
+        # ws.disconnect() raising in the finally must not break the result
+        # (covers the except-pass at 99-100).
+        ws = _FakeWS()
+        ws.disconnect = mock.MagicMock(side_effect=RuntimeError("already closed"))
+        with mock.patch.multiple(self.mod, obsws=mock.MagicMock(return_value=ws),
+                                 obs_requests=_fake_requests()):
+            out = self.actions["obs_start_recording"]("")
+        self.assertEqual(out, "Recording, sir.")
+
+
+class ObsImportFallbackTests(unittest.TestCase):
+    """The import-time `except` that degrades gracefully when
+    obs-websocket-py is missing (lines 48-52). We re-exec the module with the
+    library blocked in sys.modules so the import genuinely fails."""
+
+    def test_missing_library_sets_flags(self):
+        import importlib.util
+        import sys
+
+        path = self.mod_path()
+        # Block the library so `from obswebsocket import ...` raises ImportError.
+        blocked = {"obswebsocket": None}
+        with mock.patch.dict(sys.modules, blocked):
+            spec = importlib.util.spec_from_file_location("obs_control_reimport", path)
+            fresh = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(fresh)
+        self.assertFalse(fresh._HAS_OBSWS)
+        self.assertIsNotNone(fresh._IMPORT_ERROR)
+        self.assertIsNone(fresh.obsws)
+        # And the missing-dep hint surfaces the captured import error.
+        self.assertIn("obs-websocket-py is not installed", fresh._missing_dep_msg())
+
+    def mod_path(self):
+        from tests._skill_harness import skill_path
+        p, _ = skill_path("obs_control")
+        return p
+
 
 if __name__ == "__main__":
     unittest.main()

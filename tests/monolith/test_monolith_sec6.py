@@ -1476,6 +1476,26 @@ class OrchestratorGateTests(SectionSixBase):
             os.environ.pop("JARVIS_ENABLE_ORCHESTRATOR", None)
             self.assertFalse(bc._orchestrator_enabled())
 
+    def test_undefined_config_flag_falls_back_to_env(self):
+        # 13086-13087: if the ENABLE_ORCHESTRATOR global is undefined the bare
+        # `if ENABLE_ORCHESTRATOR` raises NameError, which is caught so the
+        # function falls through to the env override. Delete the attribute for
+        # the duration of the test and restore it afterwards.
+        bc = self.bc
+        had = hasattr(bc, "ENABLE_ORCHESTRATOR")
+        saved = getattr(bc, "ENABLE_ORCHESTRATOR", None)
+        if had:
+            delattr(bc, "ENABLE_ORCHESTRATOR")
+        try:
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("JARVIS_ENABLE_ORCHESTRATOR", None)
+                self.assertFalse(bc._orchestrator_enabled())
+                os.environ["JARVIS_ENABLE_ORCHESTRATOR"] = "1"
+                self.assertTrue(bc._orchestrator_enabled())
+        finally:
+            if had:
+                bc.ENABLE_ORCHESTRATOR = saved
+
     def test_is_orchestration_request_positive(self):
         for t in ("morning briefing", "orchestrate this",
                   "give me the daily rundown", "system brief"):
@@ -1935,6 +1955,40 @@ class ParseAndRunActionsBranchTests(SectionSixBase):
         # cancel() AND join() both ran because the fired-flag was set.
         self.assertIn("cancel", events)
         self.assertIn("join", events)
+
+    def test_mid_task_timer_cancel_exception_is_swallowed(self):
+        # 11552-11553: the finally's _mid_task_timer.cancel() raises -> the
+        # except swallows it so a flaky timer can't break action dispatch.
+        bc = self.bc
+        events = []
+
+        class FakeTimer:
+            def __init__(self, delay, fn, args=()):
+                self.args = args
+                self.daemon = False
+
+            def start(self):
+                events.append("start")
+
+            def cancel(self):
+                events.append("cancel")
+                raise RuntimeError("cancel exploded")
+
+            def join(self, timeout=None):
+                events.append("join")
+
+        long_name = sorted(bc.LONG_RUNNING_ACTIONS)[0]
+        self._with_action(long_name, lambda a: "done")
+        with mock.patch.object(bc, "MID_TASK_STATUS_ENABLED", True), \
+             mock.patch.object(bc.threading, "Timer", FakeTimer), \
+             mock.patch.object(bc, "_needs_confirmation", lambda n, a: False), \
+             mock.patch.object(bc, "_jarvis_pushback", lambda n, a: None), \
+             mock.patch.object(bc, "_speak", lambda *a, **k: None):
+            cleaned, results = bc.parse_and_run_actions(
+                f"[ACTION: {long_name}, thing]")
+        # Action result still returned despite the cancel() blowing up.
+        self.assertEqual(results[0][1], "done")
+        self.assertIn("cancel", events)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -2823,6 +2877,39 @@ class SpeakPendingBranchTests(SectionSixBase):
             with mock.patch.object(bc.os, "remove", self._flaky_consuming_remove()):
                 self.assertTrue(bc._speak_pending())
         self.assertEqual([m for m, _ in self.spoke], ["ping"])
+
+    def test_empty_list_remove_failure_swallowed(self):
+        # 13011-13012: a valid empty-list snapshot whose os.remove ALSO fails ->
+        # the failure is swallowed and the function still returns False.
+        bc = self.bc
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pending.json")
+            self._redirect(path)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump([], f)
+            with mock.patch.object(bc.os, "remove", self._flaky_consuming_remove()):
+                self.assertFalse(bc._speak_pending())
+
+    def test_open_after_rename_failure_returns_false(self):
+        # 13008-13009: os.replace succeeds but reopening the .consuming snapshot
+        # raises (e.g. the file vanished under us) -> the outer except returns
+        # False without touching the speak loop.
+        bc = self.bc
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pending.json")
+            self._redirect(path)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump([{"message": "ping"}], f)
+            real_open = open
+
+            def _flaky_open(p, *a, **k):
+                if str(p).endswith(".consuming"):
+                    raise OSError("snapshot vanished")
+                return real_open(p, *a, **k)
+
+            with mock.patch("builtins.open", _flaky_open):
+                self.assertFalse(bc._speak_pending())
+        self.assertEqual(self.spoke, [])
 
 
 # ────────────────────────────────────────────────────────────────────────────

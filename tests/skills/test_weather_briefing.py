@@ -26,6 +26,8 @@ bobert_companion; the real monolith is NEVER imported.
 from __future__ import annotations
 
 import contextlib
+import importlib.util
+import os
 import sys
 import types
 import unittest
@@ -916,6 +918,26 @@ class WatchLoopTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 #  register() — action wiring + watcher-arm branches
 # ─────────────────────────────────────────────────────────────────────────
+class WeatherImportGuardTests(unittest.TestCase):
+    def test_path_bootstrap_inserts_project_root(self):
+        # Re-exec the source with the project root removed from sys.path so the
+        # `if _PROJECT_DIR not in sys.path: sys.path.insert(...)` guard runs.
+        mod, _ = load_skill_isolated("weather_briefing")
+        path = mod.__file__
+        proj = os.path.dirname(os.path.dirname(path))
+        spec = importlib.util.spec_from_file_location("weather_reexec", path)
+        m = importlib.util.module_from_spec(spec)
+        m.skill_utils = {}
+        saved = list(sys.path)
+        try:
+            sys.path[:] = [p for p in sys.path
+                           if os.path.abspath(p) != os.path.abspath(proj)]
+            spec.loader.exec_module(m)
+            self.assertIn(m._PROJECT_DIR, sys.path)
+        finally:
+            sys.path[:] = saved
+
+
 class RegisterTests(unittest.TestCase):
     def setUp(self):
         self.mod, _ = load_skill_isolated("weather_briefing")
