@@ -685,33 +685,153 @@ class FindClickTargetTests(MonolithGlobalsTestCase):
              mock.patch.object(self.bc, "_query_vision_for_coords", return_value=None):
             self.assertIsNone(self.bc.find_click_target("the button"))
 
+    # A deterministic fake monitor layout used by every translate test below so
+    # the assertions DO NOT depend on this dev box's real displays (which made
+    # the prior tests leak host state and fail on any other geometry / on CI).
+    # It mirrors the OWNER's reported NEGATIVE-ORIGIN four-monitor rig: virtual
+    # desktop 7680x2880 with origin (-2560,-1440) — a monitor above-left of the
+    # primary. All dims are LOGICAL (what pyautogui clicks in).
+    FAKE_MONITORS = {
+        "left":   (-2560, 0,     2560, 1440),
+        "middle": (0,     0,     2560, 1440),
+        "right":  (2560,  0,     2560, 1440),
+        "top":    (0,     -1440, 2560, 1440),
+    }
+
+    def _fake_mss(self, left, top, width, height):
+        """An mss stand-in whose monitors[0] (virtual screen) reports the given
+        NATIVE rect — used so _captured_region / _native_capture_size are
+        deterministic instead of querying the real machine."""
+        mssmod = mock.MagicMock()
+        sct = mock.MagicMock()
+        sct.monitors = [{"left": left, "top": top,
+                         "width": width, "height": height}]
+        mssmod.mss.return_value.__enter__ = lambda s: sct
+        mssmod.mss.return_value.__exit__ = lambda *a: False
+        del mssmod.MSS  # force the getattr(mss,"MSS",mss.mss) path to mss.mss
+        return mssmod
+
     def test_known_monitor_translates_to_absolute(self):
-        # Pass1 image 1568x900, full capture fails → uses native size; with a
-        # known monitor the result is offset by the monitor origin.
-        name = "middle"
-        mx, my = self.bc.MONITORS[name][0], self.bc.MONITORS[name][1]
+        # BASELINE (single-monitor / 100% DPI, no downscale). The named monitor's
+        # LOGICAL size, the Pass-1 image size, AND the captured NATIVE size are
+        # ALL equal (1568x900), so every scale factor is exactly 1.0 and the
+        # Pass-1 coords (100,100) translate straight to (origin+100, origin+100).
+        # Pass-2 capture fails → native size comes from _native_capture_size.
+        # Geometry is injected so this is host-independent (was: read the real
+        # box's MONITORS, which leaked display state).
+        mons = {"main": (0, 0, 1568, 900)}
+        mx, my = mons["main"][0], mons["main"][1]
         pil = mock.MagicMock()
         pil.Image.open.return_value = self._fake_pil_image((1568, 900))
 
-        # take_screenshot: first call (pass1) returns bytes, second (full) None.
-        shots = [b"png1", None]
+        shots = [b"png1", None]   # pass1 ok, full(=pass2) capture fails
 
-        def fake_shot(monitor=None, max_dim=1568):
-            return shots.pop(0)
-
-        with mock.patch.dict(sys.modules, {"PIL": pil}), \
-             mock.patch.object(self.bc, "take_screenshot", side_effect=fake_shot), \
+        with mock.patch.object(self.bc, "MONITORS", mons), \
+             mock.patch.dict(sys.modules, {"PIL": pil}), \
+             mock.patch.object(self.bc, "take_screenshot",
+                               side_effect=lambda monitor=None, max_dim=1568: shots.pop(0)), \
              mock.patch.object(self.bc, "_query_vision_for_coords", return_value=(100, 100)), \
              mock.patch.object(self.bc, "_native_capture_size", return_value=(1568, 900)):
-            result = self.bc.find_click_target("the button", monitor=name)
-        # native==pass1 size → scale 1.0 → (100,100) offset by monitor origin.
+            result = self.bc.find_click_target("the button", monitor="main")
+        # image==native==logical → scale 1.0 → (100,100) offset by origin.
         self.assertEqual(result, (mx + 100, my + 100))
 
+    def test_negative_origin_monitor_offsets_by_negative_top(self):
+        # NEGATIVE-ORIGIN named monitor (the owner's "top" display at y=-1440).
+        # No downscale, 100% DPI (image==native==logical=2560x1440). A Pass-1
+        # point (1280,720) — the monitor centre — must land at the monitor's
+        # absolute centre (0+1280, -1440+720) = (1280, -720). Before the fix a
+        # naive translate that ignored the NEGATIVE top would have clicked at
+        # +720 on the primary instead.
+        mons = {"top": (0, -1440, 2560, 1440)}
+        pil = mock.MagicMock()
+        pil.Image.open.return_value = self._fake_pil_image((2560, 1440))
+        shots = [b"png1", None]
+        with mock.patch.object(self.bc, "MONITORS", mons), \
+             mock.patch.dict(sys.modules, {"PIL": pil}), \
+             mock.patch.object(self.bc, "take_screenshot",
+                               side_effect=lambda monitor=None, max_dim=1568: shots.pop(0)), \
+             mock.patch.object(self.bc, "_query_vision_for_coords", return_value=(1280, 720)), \
+             mock.patch.object(self.bc, "_native_capture_size", return_value=(2560, 1440)):
+            result = self.bc.find_click_target("the button", monitor="top")
+        self.assertEqual(result, (1280, -720))
+
+    def test_downscaled_pass1_scales_up_to_logical(self):
+        # DOWNSCALED Pass-1 image, 100% DPI, Pass-2 fails. The monitor is
+        # 3136x1800 LOGICAL == NATIVE, but Pass-1 was downscaled to 1568x900
+        # (half size). A Pass-1 coord (100,100) therefore represents logical
+        # (200,200), NOT (100,100): it must be scaled UP by native/pass1 = 2.0.
+        # This is the off-by-2x miss on any monitor wider than 1568px.
+        mons = {"main": (0, 0, 3136, 1800)}
+        pil = mock.MagicMock()
+        pil.Image.open.return_value = self._fake_pil_image((1568, 900))
+        shots = [b"png1", None]
+        with mock.patch.object(self.bc, "MONITORS", mons), \
+             mock.patch.dict(sys.modules, {"PIL": pil}), \
+             mock.patch.object(self.bc, "take_screenshot",
+                               side_effect=lambda monitor=None, max_dim=1568: shots.pop(0)), \
+             mock.patch.object(self.bc, "_query_vision_for_coords", return_value=(100, 100)), \
+             mock.patch.object(self.bc, "_native_capture_size", return_value=(3136, 1800)):
+            result = self.bc.find_click_target("the button", monitor="main")
+        # cx_full=int(100*3136/1568)=200; native==logical → *1.0; +origin(0,0).
+        self.assertEqual(result, (200, 200))
+
+    def test_known_monitor_dpi_scaled_translates_native_to_logical(self):
+        # DPI-SCALED named monitor. The monitor is 2560x1440 LOGICAL but renders
+        # at 200% so the un-downscaled Pass-2 capture is 5120x2880 NATIVE. A
+        # refined point at native (1000,1000) must scale DOWN to logical
+        # (500,500) before the logical origin is added — otherwise the click
+        # overshoots far past the target (the overshoot the owner saw).
+        name = "middle"
+        mx, my = self.FAKE_MONITORS[name][0], self.FAKE_MONITORS[name][1]
+
+        class _Img:
+            def __init__(self, size):
+                self.size = size
+
+            def crop(self, box):
+                l, t, r, b = box
+                return _Img((r - l, b - t))
+
+            def save(self, buf, format=None):
+                buf.write(b"x")
+
+        pil = mock.MagicMock()
+        # Pass-1 image then full-res (native) image.
+        imgs = [_Img((1568, 882)), _Img((5120, 2880))]
+        pil.Image.open.side_effect = lambda b: imgs.pop(0)
+        pil.Image.LANCZOS = 1
+        shots = [b"png1", b"fullpng"]
+        # Pass-1 returns a point; scaled to full it becomes the crop centre.
+        # Pass-2 returns a point inside the crop that resolves to native
+        # (1000,1000) absolute-in-image. We compute pass-1 so cx_full lands so
+        # the crop's top-left is (750,750) and pass-2 (250,250) → 750+250=1000.
+        # Pass-1 (306,306) → *5120/1568=999 ~ within a px; simpler: drive the
+        # refined point directly via pass-2 offset math below.
+        coords = [(306, 306), (250, 250)]
+
+        with mock.patch.object(self.bc, "MONITORS", self.FAKE_MONITORS), \
+             mock.patch.dict(sys.modules, {"PIL": pil}), \
+             mock.patch.object(self.bc, "take_screenshot",
+                               side_effect=lambda monitor=None, max_dim=1568: shots.pop(0)), \
+             mock.patch.object(self.bc, "_query_vision_for_coords",
+                               side_effect=lambda *a: coords.pop(0)):
+            result = self.bc.find_click_target("the button", monitor=name)
+        # cx_full = int(306*5120/1568)=999, crop left=int(999-250)=749,
+        # refined = 749 + 250 = 999 native; *logical/native = *2560/5120 = 0.5
+        # → 499; + origin. Same for Y (306*2880/882=999, top=749, +250=999,
+        # *1440/2880=0.5 → 499).
+        self.assertEqual(result, (mx + 499, my + 499))
+
     def test_two_pass_refine_no_monitor_translates_by_virtual_origin(self):
-        # Pass1 1568x900 → full 3000x1800 (bigger ⇒ pass-2 crop runs). Pass1
-        # coords (100,100) scale to full (191,200); the 500px crop clamps to
-        # (0,0); pass-2 returns (50,50) inside it ⇒ refined (50,50); monitor=None
-        # ⇒ translated by the virtual-screen origin (-100,-50) ⇒ (-50, 0).
+        # NEGATIVE-ORIGIN virtual desktop, monitor=None, 100% DPI.
+        # Pass1 1568x882 → full 7680x2880 (bigger ⇒ pass-2 crop runs). The mss
+        # virtual screen and the (injected) MONITORS agree on origin (-2560,
+        # -1440) and size 7680x2880 ⇒ native==logical ⇒ scale 1.0. A refined
+        # point at native (2560,720) — the centre of the TOP monitor within the
+        # grab — must translate to logical (-2560+2560, -1440+720) = (0,-720),
+        # i.e. the top monitor's centre. This is the exact case the owner hits:
+        # clicking something on the above-left monitor.
         class _CropImg:
             def __init__(self, size):
                 self.size = size
@@ -724,26 +844,67 @@ class FindClickTargetTests(MonolithGlobalsTestCase):
                 buf.write(b"crop")
 
         pil = mock.MagicMock()
-        imgs = [_CropImg((1568, 900)), _CropImg((3000, 1800))]
+        imgs = [_CropImg((1568, 882)), _CropImg((7680, 2880))]
         pil.Image.open.side_effect = lambda b: imgs.pop(0)
         pil.Image.LANCZOS = 1
         shots = [b"png1", b"fullpng"]
-        coords = [(100, 100), (50, 50)]  # pass1, then pass2
+        # Pass-1 (523,220) → *7680/1568=2561, *2880/882=718 ≈ centre of top mon.
+        # crop top-left = (2311, 468); pass-2 (250,252) → refined (2561,720).
+        coords = [(523, 220), (250, 252)]
 
-        mssmod = mock.MagicMock()
-        sct = mock.MagicMock()
-        sct.monitors = [{"left": -100, "top": -50, "width": 3000, "height": 1800}]
-        mssmod.mss.return_value.__enter__ = lambda s: sct
-        mssmod.mss.return_value.__exit__ = lambda *a: False
-        del mssmod.MSS
+        mssmod = self._fake_mss(-2560, -1440, 7680, 2880)
 
-        with mock.patch.dict(sys.modules, {"PIL": pil, "mss": mssmod}), \
+        with mock.patch.object(self.bc, "MONITORS", self.FAKE_MONITORS), \
+             mock.patch.dict(sys.modules, {"PIL": pil, "mss": mssmod}), \
              mock.patch.object(self.bc, "take_screenshot",
                                side_effect=lambda monitor=None, max_dim=1568: shots.pop(0)), \
              mock.patch.object(self.bc, "_query_vision_for_coords",
                                side_effect=lambda *a: coords.pop(0)):
             result = self.bc.find_click_target("the button")
-        self.assertEqual(result, (-50, 0))
+        # cx_full=int(523*7680/1568)=2561; crop left=max(0,2561-250)=2311;
+        # refined_x=2311+250=2561; scale 7680/7680=1.0 → vx(-2560)+2561=1.
+        # cy_full=int(220*2880/882)=718; crop top=max(0,718-250)=468;
+        # refined_y=468+252=720; scale 1.0 → vy(-1440)+720=-720.
+        self.assertEqual(result, (1, -720))
+
+    def test_no_monitor_dpi_scaled_virtual_scales_native_to_logical(self):
+        # monitor=None on a uniformly-200% virtual desktop: logical 7680x2880 @
+        # (-2560,-1440) but the live mss capture is 15360x5760 NATIVE. The
+        # Pass-2 full image IS that native size, so a refined native point must
+        # be scaled by logical/native (0.5) before adding the LOGICAL origin.
+        class _CropImg:
+            def __init__(self, size):
+                self.size = size
+
+            def crop(self, box):
+                left, top, right, bot = box
+                return _CropImg((right - left, bot - top))
+
+            def save(self, buf, format=None):
+                buf.write(b"crop")
+
+        pil = mock.MagicMock()
+        imgs = [_CropImg((1568, 588)), _CropImg((15360, 5760))]
+        pil.Image.open.side_effect = lambda b: imgs.pop(0)
+        pil.Image.LANCZOS = 1
+        shots = [b"png1", b"fullpng"]
+        # Pass-1 (784,294) → *15360/1568=7680, *5760/588=2880 → native centre.
+        # crop left=7430, top=2630; pass-2 (250,250) → refined (7680,2880).
+        coords = [(784, 294), (250, 250)]
+
+        mssmod = self._fake_mss(-2560, -1440, 15360, 5760)
+
+        with mock.patch.object(self.bc, "MONITORS", self.FAKE_MONITORS), \
+             mock.patch.dict(sys.modules, {"PIL": pil, "mss": mssmod}), \
+             mock.patch.object(self.bc, "take_screenshot",
+                               side_effect=lambda monitor=None, max_dim=1568: shots.pop(0)), \
+             mock.patch.object(self.bc, "_query_vision_for_coords",
+                               side_effect=lambda *a: coords.pop(0)):
+            result = self.bc.find_click_target("the button")
+        # refined native (7680,2880); scale logical/native = 7680/15360 = 0.5,
+        # 2880/5760 = 0.5 → (3840,1440); + logical origin (-2560,-1440)
+        # → (1280, 0) = dead centre of the logical virtual desktop.
+        self.assertEqual(result, (1280, 0))
 
 
 @requires_monolith
@@ -1721,7 +1882,13 @@ class TakeScreenshotBranchTests(MonolithGlobalsTestCase):
             {"left": x, "top": y, "width": w, "height": h})
 
     def test_pil_fallback_when_mss_raises(self):
-        # mss import/grab explodes → ImageGrab.grab() fallback. (lines 6909-6920)
+        # mss import/grab explodes → ImageGrab fallback. With monitor=None the
+        # fallback must grab the WHOLE virtual desktop (bbox = the virtual
+        # bounds, all_screens=True) to match the mss path — a bare grab() would
+        # return only the primary monitor and mistranslate clicks on secondary /
+        # negative-origin displays. Geometry is injected so the asserted bbox is
+        # host-independent (was: asserted grab() and leaked the real box layout).
+        mons = {"left": (-2560, 0, 2560, 1440), "main": (0, 0, 2560, 1440)}
         pil, _img = self._fake_pil()
         grabbed = mock.MagicMock()
         grabbed.size = (800, 600)
@@ -1731,9 +1898,12 @@ class TakeScreenshotBranchTests(MonolithGlobalsTestCase):
         mssmod = mock.MagicMock()
         mssmod.mss.side_effect = RuntimeError("no mss here")
         del mssmod.MSS
-        with mock.patch.dict(sys.modules, {"mss": mssmod, "PIL": pil}):
+        with mock.patch.object(self.bc, "MONITORS", mons), \
+             mock.patch.dict(sys.modules, {"mss": mssmod, "PIL": pil}):
             self.assertEqual(self.bc.take_screenshot(), b"PILBYTES")
-        pil.ImageGrab.grab.assert_called_once_with()
+        # virtual bounds of `mons` = (-2560,0)..(2560,1440) → bbox below.
+        pil.ImageGrab.grab.assert_called_once_with(
+            bbox=(-2560, 0, 2560, 1440), all_screens=True)
 
     def test_pil_fallback_named_monitor_uses_bbox(self):
         # mss fails AND a known monitor is requested → ImageGrab.grab(bbox=…,
@@ -1940,21 +2110,30 @@ class FindClickTargetTranslateTests(MonolithGlobalsTestCase):
         Image.new("RGB", (w, h)).save(buf, format="PNG")
         return buf.getvalue()
 
+    # Single-monitor layout anchored at the ORIGIN (0,0) with logical == the
+    # mocked native size, injected so the translate math is deterministic on any
+    # host. With origin (0,0) and scale 1.0 the absolute result equals the raw
+    # refined coords — the original intent of this test, now made host-safe.
+    _ORIGIN_MONITOR = {"main": (0, 0, 100, 80)}
+
     def test_virtual_origin_lookup_failure_returns_raw_coords(self):
         # Pass-1 succeeds on a real (small) PNG; the Pass-2 full-res capture
         # returns None so refine is skipped; with no monitor specified the
-        # translate block re-opens mss for the virtual-screen origin — and here
-        # that raises, so the raw refined (x,y) is returned unchanged.
-        # (lines 7249-7256, including the 7255-7256 except.)
+        # translate uses _virtual_screen_bounds() for the LOGICAL origin and the
+        # native size from _native_capture_size. mss is unavailable here, so
+        # _captured_region returns None (no origin-mismatch warning) and the math
+        # reduces to origin(0,0) + refined(40,50) → (40,50) unchanged.
         png1 = self._real_png(100, 80)
-        with mock.patch.object(self.bc, "take_screenshot",
+        with mock.patch.object(self.bc, "MONITORS", self._ORIGIN_MONITOR), \
+             mock.patch.object(self.bc, "take_screenshot",
                                side_effect=[png1, None]), \
              mock.patch.object(self.bc, "_native_capture_size",
                                return_value=(100, 80)), \
              mock.patch.object(self.bc, "_query_vision_for_coords",
                                return_value=(40, 50)), \
              mock.patch.dict(sys.modules, {"mss": None}):
-            # mss=None → `import mss` raises ImportError → except → raw coords.
+            # virtual origin (0,0), native==logical (100x80) → scale 1.0 →
+            # refined (40,50) returned unchanged.
             self.assertEqual(self.bc.find_click_target("a button"), (40, 50))
 
 
