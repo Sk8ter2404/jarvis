@@ -3,6 +3,24 @@
 Thanks for trying JARVIS! Bug reports, skill contributions, and portability
 fixes are all welcome. Rough edges are expected — it's a personal project shared as-is.
 
+## Contributing a fix
+
+JARVIS can open the pull request for you — the same `tools/auto_publish.py` its
+own self-upgrade pipeline uses. From your fork:
+
+1. Fork this repo and clone your fork (so `origin` points at your fork).
+2. Set env vars so the PR targets upstream from your fork:
+   - `JARVIS_GITHUB_OWNER` / `JARVIS_GITHUB_REPO` → the upstream (`Sk8ter2404` / `jarvis`)
+   - `JARVIS_GITHUB_HEAD_OWNER` → your GitHub username (opens the PR cross-fork)
+   - `JARVIS_GITHUB_TOKEN` → a token that can push to your fork and open PRs
+3. After making changes: `python tools/auto_publish.py --summary "what you fixed"`
+   — it branches, commits (the pre-commit PII guard runs here), pushes to your
+   fork, and opens a PR upstream. Nothing auto-merges.
+
+Prefer to do it by hand? Branch, commit, push to your fork, open a PR. Either
+way every PR runs CI (compile + lint + the full unit suite + the PII scan) and
+is reviewed before merge.
+
 ## Reporting a bug
 
 Open an issue with:

@@ -183,5 +183,17 @@ class RunOrchestrationTests(unittest.TestCase):
         self.assertFalse(poster_called)
 
 
+class PrHeadTests(unittest.TestCase):
+    def test_same_repo_when_no_head_owner(self):
+        env = {k: v for k, v in os.environ.items()
+               if k != "JARVIS_GITHUB_HEAD_OWNER"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(auto_publish._pr_head("feat/x"), "feat/x")
+
+    def test_cross_fork_when_head_owner_set(self):
+        with mock.patch.dict(os.environ, {"JARVIS_GITHUB_HEAD_OWNER": "alice"}):
+            self.assertEqual(auto_publish._pr_head("feat/x"), "alice:feat/x")
+
+
 if __name__ == "__main__":
     unittest.main()
