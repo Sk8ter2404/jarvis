@@ -880,6 +880,8 @@ MUSIC_ACTION_NAMES = {
     "media_next", "media_prev", "media_playpause",
     # apple_music_intel actions also produce playback
     "play_unheard", "play_vibe", "skip_track",
+    # itunes_library actions also start playback
+    "play_playlist", "shuffle_library",
 }
 # Window-title fragments (lowercase) likely to host an active music session
 # that swallows global media keys unless focused. Ordered by priority — first
@@ -5692,6 +5694,8 @@ def _local_cheatsheet() -> str:
         "ordinary conversation, just reply normally with no token.\n\n"
         "Most-used actions:\n"
         "  [ACTION: play_music, <artist/song/playlist>]   play music in the browser\n"
+        "  [ACTION: play_playlist, <name>]   play one of sir's OWN iTunes playlists ('shuffle ' prefix shuffles)\n"
+        "  [ACTION: list_playlists]   list sir's iTunes playlists   [ACTION: shuffle_library]   shuffle all music\n"
         "  [ACTION: pause_music]  [ACTION: resume_music]  [ACTION: next_song]\n"
         "  [ACTION: media_playpause]  [ACTION: media_next]  [ACTION: media_prev]\n"
         "  [ACTION: volume_up]  [ACTION: volume_down]  [ACTION: volume_mute]\n"
