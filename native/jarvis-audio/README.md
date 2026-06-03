@@ -10,13 +10,14 @@ Design + rationale (incl. the Rust-vs-Go decision): see
 
 ## Status
 
-**Scaffold.** This first cut implements + unit-tests the **IPC protocol**
-(`src/protocol.rs`) — the wire contract between the service and Python — and a
-buildable service skeleton (`src/main.rs`). Still to come, additively (the
+**Early.** Implemented + unit-tested so far: the **IPC protocol**
+(`src/protocol.rs`, the Rust↔Python wire contract), an audio **ring buffer**
+(`src/ring_buffer.rs`), and **cpal capture** (`src/capture.rs` — opens the
+default input device and converts its samples to 16-bit PCM into the ring
+buffer; `cargo run` prints the detected device). Still to come, additively (the
 Python capture path stays the live fallback the whole time):
 
-1. cpal ring-buffer capture (WASAPI on Windows).
-2. openWakeWord / Porcupine wake detection + Silero/WebRTC VAD + endpointing.
+1. openWakeWord / Porcupine wake detection + Silero/WebRTC VAD + endpointing.
 3. The Windows named-pipe transport (`\\.\pipe\jarvis-audio`) + a Python client.
 4. Shadow mode → opt-in cutover behind `AUDIO_SERVICE_ENABLED` (default off).
 

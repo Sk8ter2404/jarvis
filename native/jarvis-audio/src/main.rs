@@ -7,6 +7,7 @@
 //! args and prints the handshake frame it will emit, so the crate builds + runs
 //! end-to-end and the wire contract is exercised from a real entry point.
 
+use jarvis_audio::capture;
 use jarvis_audio::protocol::{Event, PROTOCOL_VERSION};
 
 fn pipe_arg() -> String {
@@ -18,11 +19,16 @@ fn pipe_arg() -> String {
 
 fn main() {
     let pipe = pipe_arg();
-    eprintln!("[jarvis-audio] scaffold build — capture/wake/VAD not yet wired.");
+    eprintln!("[jarvis-audio] cpal capture wired; wake/VAD + named-pipe transport next.");
     eprintln!("[jarvis-audio] target pipe: {pipe}");
 
-    // Emit the handshake the real service will lead with, so the protocol path
-    // is exercised end-to-end even before capture exists.
+    match capture::default_input_description() {
+        Ok(desc) => eprintln!("[jarvis-audio] default input device: {desc}"),
+        Err(e) => eprintln!("[jarvis-audio] no usable input device: {e}"),
+    }
+
+    // Emit the handshake the real service leads with, so the protocol path is
+    // exercised end-to-end.
     let hello = Event::Hello(PROTOCOL_VERSION).encode();
     eprintln!(
         "[jarvis-audio] Hello frame (v{PROTOCOL_VERSION}, {} bytes): {:02x?}",

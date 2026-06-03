@@ -93,6 +93,24 @@ def _ask_value(spec: dict, current, input_fn):
     return sw.coerce_value(spec, ans) if ans else current
 
 
+def find_claude_cli() -> Optional[str]:
+    """Path to the Claude Code CLI if installed, else None. When present, the
+    optional self-upgrade pipeline runs on a Claude Code SUBSCRIPTION (via
+    ``claude --print``) instead of burning metered Anthropic API credit."""
+    import shutil
+    found = shutil.which("claude")
+    if found:
+        return found
+    for p in (
+        os.path.expanduser(r"~\.local\bin\claude.exe"),
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs\claude-code\claude.exe"),
+        os.path.expandvars(r"%APPDATA%\npm\claude.cmd"),
+    ):
+        if p and os.path.exists(p):
+            return p
+    return None
+
+
 def run(*, input_fn=input, out=print, env_path: Optional[str] = None,
         settings_path: Optional[str] = None, defaults: bool = False) -> int:
     env_path = env_path or _ENV_PATH
@@ -127,6 +145,16 @@ def run(*, input_fn=input, out=print, env_path: Optional[str] = None,
     except Exception as e:
         out(f"\nCould not save settings: {e}")
         return 1
+
+    # 3. Claude Code (optional) — lets the self-upgrade pipeline run on a
+    #    subscription instead of metered API credit.
+    if find_claude_cli():
+        out("\nClaude Code detected - the optional self-upgrade pipeline will use\n"
+            "your subscription instead of API credit.")
+    else:
+        out("\nTip: install Claude Code (https://claude.com/claude-code) + sign in\n"
+            "so the optional self-upgrade pipeline runs on your subscription, not\n"
+            "API credit. Without it, that pipeline simply stays off.")
 
     out("\nDone. Fine-tune anything else in the Settings GUI:")
     out("  python tools/settings_window.py")

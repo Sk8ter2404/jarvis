@@ -7,4 +7,6 @@
 //! openWakeWord/Silero) and the Windows named-pipe transport land in the next
 //! increment, behind the same additive/shadow-mode plan the design lays out
 //! (the Python capture path stays the live fallback the whole time).
+pub mod capture;
 pub mod protocol;
+pub mod ring_buffer;
