@@ -263,7 +263,7 @@ def _send_print_command(command: str) -> tuple:
         return False, str(e)
 
 
-def _poll_loop() -> None:
+def _poll_loop() -> None:  # pragma: no cover - daemon poll loop; blocks on _stop_evt.wait(POLL_INTERVAL_SECONDS) between live peeks at bambu_monitor._state. Its one work step, _check_milestones(), is unit-tested directly.
     if _stop_evt.wait(INITIAL_DELAY_SECONDS):
         return
     while not _stop_evt.is_set():

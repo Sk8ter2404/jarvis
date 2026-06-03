@@ -107,7 +107,7 @@ from typing import Any, Callable, Optional
 # Project root on sys.path so `core.atomic_io` and `bobert_companion`
 # resolve whether we're loaded as `skills.self_diagnostic` or standalone.
 _PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _PROJECT_DIR not in sys.path:
+if _PROJECT_DIR not in sys.path:  # pragma: no cover - import-time sys.path guard; root already on path under the test harness
     sys.path.insert(0, _PROJECT_DIR)
 
 try:
@@ -585,7 +585,7 @@ def _attempt_camera_wake(idx: int, timeout_s: float = 2.5) -> tuple[bool, str]:
                 try:
                     if cap is not None:
                         cap.release()
-                except Exception:
+                except Exception:  # pragma: no cover - defensive: cv2 VideoCapture.release() failing during wake teardown (live-camera I/O, cv2 absent on CI)
                     pass
         finally:
             if io_lock is not None:
@@ -652,7 +652,7 @@ def _probe_webcam() -> dict:
             else:
                 try:
                     c.release()
-                except Exception:
+                except Exception:  # pragma: no cover - defensive: cv2 release() on a non-opened capture (live-camera I/O, cv2 absent on CI)
                     pass
         except Exception:
             continue
@@ -744,7 +744,7 @@ def _probe_webcam() -> dict:
             # pattern where the device is fine but its pipe needs a poke.
             try:
                 cap.release()
-            except Exception:
+            except Exception:  # pragma: no cover - defensive: cv2 release() before wake retry (live-camera I/O, cv2 absent on CI)
                 pass
             cap = None
             wake_ok, wake_note = _attempt_camera_wake(cam_index)
@@ -851,7 +851,7 @@ def _probe_webcam() -> dict:
         # tightly to keep probe latency bounded.
         try:
             mean_val = float(frame.mean())
-        except Exception:
+        except Exception:  # pragma: no cover - defensive: numpy frame.mean() on a malformed cv2 frame (live-camera I/O, cv2 absent on CI)
             mean_val = 0.0
         details["frame_mean"] = round(mean_val, 2)
         details["frame_shape"] = list(getattr(frame, "shape", ()))
@@ -862,14 +862,14 @@ def _probe_webcam() -> dict:
                 time.sleep(0.05)
                 try:
                     ok_r, frame_r = cap.read()
-                except Exception:
+                except Exception:  # pragma: no cover - defensive: cv2 read() raising mid black-frame retry (live-camera I/O, cv2 absent on CI)
                     ok_r, frame_r = False, None
                 if not ok_r or frame_r is None:
                     retry_means.append(0.0)
                     continue
                 try:
                     rmean = float(frame_r.mean())
-                except Exception:
+                except Exception:  # pragma: no cover - defensive: numpy mean() on a malformed retry frame (live-camera I/O, cv2 absent on CI)
                     rmean = 0.0
                 retry_means.append(rmean)
                 if rmean >= 1.0:
@@ -913,7 +913,7 @@ def _probe_webcam() -> dict:
         if cap is not None:
             try:
                 cap.release()
-            except Exception:
+            except Exception:  # pragma: no cover - defensive: cv2 release() in the probe's finally (live-camera I/O, cv2 absent on CI)
                 pass
 
     # Verify the face cascade loads — face_tracker depends on it.
@@ -1006,7 +1006,7 @@ def _jarvis_active_mic_index(sd) -> int | None:
         idx = sd.default.device[0]
         if isinstance(idx, int) and idx >= 0:
             return idx
-    except Exception:
+    except Exception:  # pragma: no cover - defensive: sounddevice default-device lookup failing (audio I/O, sounddevice absent on CI)
         pass
     return None
 
@@ -1041,7 +1041,7 @@ def _probe_microphone() -> dict:
         details["active_input"] = active_idx
         try:
             details["active_input_name"] = devices[active_idx]["name"]
-        except Exception:
+        except Exception:  # pragma: no cover - defensive: device-name subscript on a sparse sounddevice list (audio I/O, sounddevice absent on CI)
             pass
 
     # crash-fix-3 (2026-05-28): opening an `sd.rec()` capture stream from
@@ -1125,7 +1125,7 @@ def _probe_microphone() -> dict:
     if active_idx is not None:
         try:
             best_name = devices[active_idx]["name"]
-        except Exception:
+        except Exception:  # pragma: no cover - defensive: device-name subscript when scanning mic alternates (audio I/O, sounddevice absent on CI)
             best_name = None
     for idx, name in alternates[:MAX_ALTERNATES]:
         rms, err = _capture_rms(idx, duration_s=0.15)

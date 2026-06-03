@@ -1287,6 +1287,13 @@ class ExtractorEdgeTests(_RouterTestBase):
         self.assertIsNone(router._parse_number(""))
         self.assertIsNone(router._parse_number("   "))
 
+    def test_parse_number_superscript_digit_is_none(self):
+        # A Unicode superscript digit passes str.isdigit() but int() rejects it
+        # (category No, not Nd) → the ValueError branch returns None rather than
+        # raising. '²' is superscript two.
+        self.assertTrue("²".isdigit())
+        self.assertIsNone(router._parse_number("²"))
+
     def test_extract_percent_word_only_form(self):
         # No digits before 'percent', spelled-out number → word branch.
         self.assertEqual(router._extract_percent("forty percent"), 40)

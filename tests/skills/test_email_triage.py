@@ -10,6 +10,7 @@ and the registered voice actions' content + credential-absent degradation.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import sys
@@ -19,6 +20,24 @@ import unittest
 from unittest import mock
 
 from tests._skill_harness import load_skill_isolated
+
+def _spec_present(name: str) -> bool:
+    # find_spec on a DOTTED name imports the parent package to locate the
+    # submodule; when the parent is absent (bare CI runner) it RAISES
+    # ModuleNotFoundError rather than returning None. Catch that so this probe
+    # degrades to "absent" instead of erroring at module-import time.
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+_HAS_GOOGLE_API = all(
+    _spec_present(n)
+    for n in ("googleapiclient.discovery", "googleapiclient.errors",
+              "google.oauth2.credentials", "google.auth.transport.requests",
+              "google_auth_oauthlib.flow")
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -581,6 +600,26 @@ class EmailBriefingActionTests(EmailTriageTestBase):
         self.assertIn("1 spam", out)
 
 
+class EmailImportGuardTests(EmailTriageTestBase):
+    def test_path_bootstrap_inserts_project_root(self):
+        # Re-exec the source with the project root absent from sys.path so the
+        # `if _PROJECT_DIR not in sys.path: sys.path.insert(...)` guard runs.
+        # All heavy deps are already imported (cached) so re-exec is cheap.
+        path = self.mod.__file__
+        proj = os.path.dirname(os.path.dirname(path))
+        spec = importlib.util.spec_from_file_location("email_triage_reexec", path)
+        m = importlib.util.module_from_spec(spec)
+        m.skill_utils = {}
+        saved = list(sys.path)
+        try:
+            sys.path[:] = [p for p in sys.path
+                           if os.path.abspath(p) != os.path.abspath(proj)]
+            spec.loader.exec_module(m)
+            self.assertIn(m._PROJECT_DIR, sys.path)
+        finally:
+            sys.path[:] = saved
+
+
 class StatusActionTests(EmailTriageTestBase):
     def test_status_reports_backends_and_pending(self):
         self.mod._set_pending({"to": "a@b.com"})
@@ -735,6 +774,16 @@ class GmailDepsAvailabilityTests(EmailTriageTestBase):
             build, *_ = self.mod._probe_gmail_deps()
         self.assertIsNone(build)
         self.assertIn("not installed", self.mod._gmail_unavailable_reason[0])
+
+    @unittest.skipUnless(_HAS_GOOGLE_API,
+                         "google-api-python-client / google-auth-oauthlib absent")
+    def test_probe_deps_success_returns_all_five(self):
+        # On a host where the google libs ARE installed, the real import body
+        # runs and returns the five symbols (build, Credentials, flow, Request,
+        # HttpError) — exercising the success path, not just the except.
+        result = self.mod._probe_gmail_deps()
+        self.assertEqual(len(result), 5)
+        self.assertTrue(all(r is not None for r in result))
 
     def test_is_gmail_available_false_without_deps(self):
         with mock.patch.object(self.mod, "_probe_gmail_deps",

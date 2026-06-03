@@ -31,9 +31,10 @@ SDK and ``core.config`` import are likewise faked per-test.
 
 Coverage note
 -------------
-This suite drives ``core.diagnostic_daemons`` to ~99.6%.  The only lines that
-remain uncovered are two genuinely-unreachable defensive branches that cannot
-be exercised without editing the source:
+This suite drives ``core.diagnostic_daemons`` to 100% of the reachable
+statements.  Two genuinely-unreachable defensive branches are annotated with
+``# pragma: no cover`` in the source (they cannot be exercised without editing
+it):
 
   * ``_recently_modified_source_files`` subtree-prune (``dirnames[:] = [];
     continue``) — the line just above already strips excluded dir names from

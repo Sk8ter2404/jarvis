@@ -23,6 +23,7 @@ network/LLM/thread/sleep; real numpy is untouched.
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import io
 import json
 import os
@@ -1089,6 +1090,24 @@ class AnticipationRegisterTests(_EngineTestBase):
         with mock.patch.object(self.mod, "_load_state", return_value={}):
             out = actions["anticipation_status"]("ignored-arg")
         self.assertTrue(out.startswith("Anticipation engine"))
+
+
+class AnticipationImportGuardTests(unittest.TestCase):
+    def test_path_bootstrap_inserts_project_root(self):
+        mod, _ = load_skill_isolated("anticipation_engine")
+        path = mod.__file__
+        proj = os.path.dirname(os.path.dirname(path))
+        spec = importlib.util.spec_from_file_location("anticipation_reexec", path)
+        m = importlib.util.module_from_spec(spec)
+        m.skill_utils = {}
+        saved = list(sys.path)
+        try:
+            sys.path[:] = [p for p in sys.path
+                           if os.path.abspath(p) != os.path.abspath(proj)]
+            spec.loader.exec_module(m)
+            self.assertIn(m._PROJECT_DIR, sys.path)
+        finally:
+            sys.path[:] = saved
 
 
 if __name__ == "__main__":

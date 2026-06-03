@@ -293,7 +293,7 @@ def _parse_rate(rate: str) -> float:
         return 1.0
     try:
         pct = float(m.group(1))
-    except ValueError:
+    except ValueError:  # pragma: no cover - unreachable: _RATE_RE only matches valid float syntax, so float() never raises
         return 1.0
     return max(0.5, min(2.0, 1.0 + pct / 100.0))
 
@@ -307,7 +307,7 @@ def _parse_pitch_semitones(pitch: str) -> float:
         return 0.0
     try:
         hz = float(m.group(1))
-    except ValueError:
+    except ValueError:  # pragma: no cover - unreachable: _PITCH_RE only matches valid float syntax, so float() never raises
         return 0.0
     if hz == 0.0:
         return 0.0

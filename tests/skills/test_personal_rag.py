@@ -122,7 +122,7 @@ class PersonalRagFormattingTests(unittest.TestCase):
 
     def test_format_voice_falls_back_to_basename(self):
         out = self.mod._format_hits_for_voice(
-            [{"path": r"C:\docs\report.pdf", "snippet": "q3"}])
+            [{"path": "docs/report.pdf", "snippet": "q3"}])
         self.assertIn("report.pdf", out)
 
     # ── _format_hits_for_llm ─────────────────────────────────────────────
@@ -250,6 +250,231 @@ class PersonalRagActionTests(unittest.TestCase):
             self.mod._last_query = "ghost"
         out = self.actions["rag_open_top"]("")
         self.assertIn("no longer exists", out)
+
+
+class RagModuleHelperTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, self.actions, patcher = _load_rag_skill()
+        self.addCleanup(patcher.stop)
+
+    def test_ensure_core_on_path_inserts(self):
+        saved = list(sys.path)
+        try:
+            sys.path[:] = [p for p in sys.path if p != self.mod._PROJECT_DIR]
+            self.mod._ensure_core_on_path()
+            self.assertIn(self.mod._PROJECT_DIR, sys.path)
+        finally:
+            sys.path[:] = saved
+
+    def test_rag_import_failure_returns_none(self):
+        # Force `from core import rag_indexer` inside _rag() to raise so the
+        # except branch (print + return None) runs. Patch the core package's
+        # attribute to a property-less stub and drop the sys.modules entry, then
+        # make importlib raise via a builtins.__import__ shim.
+        real_import = __import__
+
+        def _imp(name, *a, **k):
+            if name == "core" and a and a[2] and "rag_indexer" in a[2]:
+                raise ImportError("chromadb missing")
+            return real_import(name, *a, **k)
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop("core.rag_indexer", None)
+            try:
+                import core as _core
+                if hasattr(_core, "rag_indexer"):
+                    delattr(_core, "rag_indexer")
+            except Exception:
+                pass
+            with mock.patch("builtins.__import__", _imp):
+                self.assertIsNone(self.mod._rag())
+
+
+class RagSearchQuietSuccessTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, self.actions, patcher = _load_rag_skill()
+        self.addCleanup(patcher.stop)
+
+    def test_quiet_renders_llm_block_and_caches(self):
+        rag = _fake_rag(hits=[{"path": "a.txt", "snippet": "body",
+                               "score": 0.5}])
+        with mock.patch.object(self.mod, "_rag", return_value=rag):
+            out = self.actions["rag_search_quiet"]("plan")
+        self.assertIn("path=a.txt", out)
+        self.assertEqual(self.mod._last_query, "plan")
+        self.assertEqual(len(self.mod._last_hits), 1)
+
+    def test_search_my_files_unavailable_marker(self):
+        with mock.patch.object(self.mod, "_rag",
+                               return_value=_fake_rag(available=False)):
+            out = self.mod.search_my_files("q")
+        self.assertIn("unavailable", out)
+
+    def test_search_my_files_success_caches_query(self):
+        rag = _fake_rag(hits=[{"path": "b.txt", "snippet": "x", "score": 0.1}])
+        with mock.patch.object(self.mod, "_rag", return_value=rag):
+            out = self.mod.search_my_files("topic", k=3)
+        self.assertIn("path=b.txt", out)
+        self.assertEqual(self.mod._last_query, "topic")
+
+
+class RagReindexBackgroundTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, self.actions, patcher = _load_rag_skill()
+        self.addCleanup(patcher.stop)
+
+    def test_reindex_bg_closure_runs_index_once(self):
+        import threading as _thr
+        rag = _fake_rag()
+        rag.index_once.return_value = {"files": 3}
+        captured = {}
+        with mock.patch.object(self.mod, "_rag", return_value=rag), \
+             mock.patch.object(_thr.Thread, "start",
+                               lambda self: captured.__setitem__("t", self._target)):
+            out = self.actions["rag_reindex"]("")
+        self.assertIn("background", out.lower())
+        # Drive the worker body → exercises the index_once + print branch.
+        captured["t"]()
+        rag.index_once.assert_called_once()
+
+    def test_reindex_bg_closure_swallows_failure(self):
+        import threading as _thr
+        rag = _fake_rag()
+        rag.index_once.side_effect = RuntimeError("scan boom")
+        captured = {}
+        with mock.patch.object(self.mod, "_rag", return_value=rag), \
+             mock.patch.object(_thr.Thread, "start",
+                               lambda self: captured.__setitem__("t", self._target)):
+            self.actions["rag_reindex"]("")
+        captured["t"]()   # must not raise
+
+
+class RagStatusAndConfigureBranchTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, self.actions, patcher = _load_rag_skill()
+        self.addCleanup(patcher.stop)
+
+    def test_status_offline_message(self):
+        with mock.patch.object(self.mod, "_rag",
+                               return_value=_fake_rag(available=False)):
+            out = self.actions["rag_status"]("")
+        self.assertIn("offline", out.lower())
+
+    def test_status_idle_with_never_scan(self):
+        rag = _fake_rag()
+        rag.status.return_value = {"running": False, "watchdog_active": False,
+                                   "last_full_scan_ts": 0, "errors": 0}
+        rag.collection_size.return_value = 0
+        with mock.patch.object(self.mod, "_rag", return_value=rag):
+            out = self.actions["rag_status"]("")
+        self.assertIn("idle", out)
+        self.assertIn("watchdog off", out)
+        self.assertIn("never", out)
+
+    def test_configure_module_not_loaded(self):
+        with mock.patch.object(self.mod, "_rag", return_value=None):
+            self.assertIn("not loaded",
+                          self.actions["rag_configure"]("embed_model=foo").lower())
+
+    def test_configure_int_key_success(self):
+        rag = _fake_rag()
+        rag.configure.return_value = {"RAG_CHUNK_CHARS": 800}
+        with mock.patch.object(self.mod, "_rag", return_value=rag):
+            out = self.actions["rag_configure"]("chunk_chars=800")
+        self.assertEqual(rag.configure.call_args.kwargs.get("rag_chunk_chars"), 800)
+        self.assertIn("chunk_chars set to", out)
+
+    def test_configure_string_key_success(self):
+        rag = _fake_rag()
+        rag.configure.return_value = {"RAG_EMBED_MODEL": "bge-small"}
+        with mock.patch.object(self.mod, "_rag", return_value=rag):
+            out = self.actions["rag_configure"]("embed_model=bge-small")
+        self.assertEqual(rag.configure.call_args.kwargs.get("rag_embed_model"),
+                         "bge-small")
+        self.assertIn("embed_model set to", out)
+
+
+class RagOpenTopSuccessTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, self.actions, patcher = _load_rag_skill()
+        self.addCleanup(patcher.stop)
+
+    def test_open_top_launches_existing_file(self):
+        with self.mod._lock:
+            self.mod._last_hits = [{"path": "docs/plan.md"}]
+            self.mod._last_query = "plan"
+        # os.path.exists True + os.startfile mocked (startfile is Windows-only,
+        # so patch it on by attribute even where absent).
+        with mock.patch.object(self.mod.os.path, "exists", return_value=True), \
+             mock.patch.object(self.mod.os, "startfile", create=True) as sf:
+            out = self.actions["rag_open_top"]("")
+        sf.assert_called_once_with("docs/plan.md")
+        self.assertIn("Opening plan.md", out)
+
+    def test_open_top_startfile_failure_reported(self):
+        with self.mod._lock:
+            self.mod._last_hits = [{"path": "docs/plan.md"}]
+            self.mod._last_query = "plan"
+        with mock.patch.object(self.mod.os.path, "exists", return_value=True), \
+             mock.patch.object(self.mod.os, "startfile", create=True,
+                               side_effect=OSError("no handler")):
+            out = self.actions["rag_open_top"]("")
+        self.assertIn("Couldn't open", out)
+
+
+class RagRegisterTests(unittest.TestCase):
+    def test_register_core_missing_still_registers_actions(self):
+        # _rag() returns None → register wires actions but skips autostart.
+        mod, _, patcher = _load_rag_skill()
+        self.addCleanup(patcher.stop)
+        actions = {}
+        with mock.patch.object(mod, "_rag", return_value=None):
+            mod.register(actions)
+        for name in ("rag_search", "rag_search_quiet", "search_my_files",
+                     "rag_reindex", "rag_status", "rag_configure", "rag_open_top"):
+            self.assertIn(name, actions)
+
+    def test_register_autostart_disabled_when_unavailable(self):
+        mod, _, patcher = _load_rag_skill()
+        self.addCleanup(patcher.stop)
+        actions = {}
+        with mock.patch.object(mod, "_rag",
+                               return_value=_fake_rag(available=False)), \
+             mock.patch.object(mod, "RAG_AUTOSTART", True):
+            mod.register(actions)   # prints the skip notice, no thread
+        self.assertIn("rag_search", actions)
+
+    def test_register_autostart_spawns_and_runs_initial_scan(self):
+        import threading as _thr
+        mod, _, patcher = _load_rag_skill()
+        self.addCleanup(patcher.stop)
+        rag = _fake_rag(available=True)
+        actions = {}
+        captured = {}
+        with mock.patch.object(mod, "_rag", return_value=rag), \
+             mock.patch.object(mod, "RAG_AUTOSTART", True), \
+             mock.patch.object(_thr.Thread, "start",
+                               lambda self: captured.__setitem__("t", self._target)):
+            mod.register(actions)
+        # Drive the autostart closure: sleep patched, start() called.
+        with mock.patch.object(mod.time, "sleep", return_value=None):
+            captured["t"]()
+        rag.start.assert_called_once_with(initial_scan=True)
+
+    def test_register_autostart_closure_swallows_failure(self):
+        import threading as _thr
+        mod, _, patcher = _load_rag_skill()
+        self.addCleanup(patcher.stop)
+        rag = _fake_rag(available=True)
+        rag.start.side_effect = RuntimeError("index boom")
+        actions = {}
+        captured = {}
+        with mock.patch.object(mod, "_rag", return_value=rag), \
+             mock.patch.object(mod, "RAG_AUTOSTART", True), \
+             mock.patch.object(_thr.Thread, "start",
+                               lambda self: captured.__setitem__("t", self._target)):
+            mod.register(actions)
+        with mock.patch.object(mod.time, "sleep", return_value=None):
+            captured["t"]()   # must not raise
 
 
 if __name__ == "__main__":

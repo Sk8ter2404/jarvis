@@ -197,7 +197,7 @@ def _check_and_maybe_alert():
         _check_lock.release()
 
 
-def _background_monitor_loop():
+def _background_monitor_loop():  # pragma: no cover - daemon while-True monitor loop; blocks on time.sleep(CHECK_INTERVAL_SECONDS) between live billing-page captures. Its one work step, _check_and_maybe_alert(), is unit-tested directly.
     time.sleep(INITIAL_DELAY_SECONDS)
     while True:
         try:

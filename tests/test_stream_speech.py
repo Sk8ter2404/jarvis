@@ -14,6 +14,7 @@ and the hallucination detector is injected.
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -66,6 +67,12 @@ class TestSplit(unittest.TestCase):
     def test_closing_quote_after_terminator(self):
         sents, _ = ss.split_complete_sentences('He said "go." Then left', 0)
         self.assertEqual(sents, ['He said "go."'])
+
+    def test_multiple_consecutive_terminators_consumed(self):
+        # Repeated terminators ('!!') are absorbed into one boundary; the run
+        # is consumed before the whitespace check.
+        sents, _ = ss.split_complete_sentences("Wow!! Next thing", 0)
+        self.assertEqual(sents, ["Wow!!"])
 
 
 class TestEarlySpeakerHappyPath(unittest.TestCase):
@@ -171,6 +178,36 @@ class TestEarlySpeakerFailSafe(unittest.TestCase):
         # Final text that does NOT start with what we spoke → speak full.
         diverged = "Completely different answer."
         self.assertEqual(sp.remainder(diverged), diverged)
+
+    def test_empty_chunk_is_noop(self):
+        # feed("") returns immediately without touching buffers or aborting.
+        spoken = []
+        sp = ss.EarlySpeaker(spoken.append, lambda t: False)
+        sp.feed("")
+        self.assertEqual(spoken, [])
+        self.assertFalse(sp.aborted)
+        self.assertFalse(sp.spoke_anything)
+
+    def test_split_raising_aborts_feed(self):
+        # A surprise error inside split_complete_sentences must abort early-speech
+        # (fail-safe to the blocking path), not propagate out of feed().
+        spoken = []
+        sp = ss.EarlySpeaker(spoken.append, lambda t: False)
+        with mock.patch.object(ss, "split_complete_sentences",
+                               side_effect=RuntimeError("split boom")):
+            sp.feed("A done. B done. ")    # must not raise
+        self.assertTrue(sp.aborted)
+        self.assertEqual(spoken, [])
+
+    def test_remainder_with_only_whitespace_spoken_returns_full(self):
+        # Defensive branch: _spoken is non-empty but normalises to '' (e.g. a
+        # whitespace-only entry), so spoken_concat() is '' → remainder returns
+        # the full final text rather than mis-subtracting.
+        spoken = []
+        sp = ss.EarlySpeaker(spoken.append, lambda t: False)
+        sp._spoken.append("   ")            # white-box: force already == ""
+        self.assertEqual(sp.spoken_concat(), "")
+        self.assertEqual(sp.remainder("the full reply"), "the full reply")
 
 
 class TestParityProperty(unittest.TestCase):

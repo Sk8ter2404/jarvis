@@ -415,6 +415,32 @@ class BackupRestoreTests(_PipeBase):
             restored, deleted = P._restore_files(backup)
         self.assertEqual((restored, deleted), (0, 0))
 
+    def test_backup_manifest_write_error_swallowed(self):
+        # The per-task _manifest.json write fails (disk full) -> swallowed; the
+        # backup dir is still returned so the caller proceeds.
+        self.write("skills/foo.py", "data\n")
+        import builtins
+        real_open = builtins.open
+
+        def _open(path, *a, **k):
+            if str(path).endswith("_manifest.json"):
+                raise OSError("disk full")
+            return real_open(path, *a, **k)
+
+        with mock.patch("builtins.open", _open):
+            backup = P._backup_files(["skills/foo.py"], "task")
+        self.assertTrue(os.path.isdir(backup))  # dir created, no raise
+
+    def test_restore_skips_manifest_entry_with_empty_path(self):
+        # A manifest entry whose "path" is blank is skipped (the `if not rel:
+        # continue` guard) -> restore is a no-op, returns zeros.
+        backup = P._backup_files([], "task")  # creates dir + empty manifest
+        manifest_path = os.path.join(backup, "_manifest.json")
+        with open(manifest_path, "w", encoding="utf-8") as mf:
+            json.dump({"ts": "x", "files": [{"path": "", "existed_before": True}]},
+                      mf)
+        self.assertEqual(P._restore_files(backup), (0, 0))
+
 
 # ──────────────────────────── diff computation ────────────────────────────
 
@@ -476,6 +502,15 @@ class ComputeDiffTests(_PipeBase):
         with mock.patch("builtins.open", side_effect=OSError("io error")):
             diff = P._compute_diff(backup, ["skills/a.py"])
         self.assertEqual(diff, "(no file changes)")
+
+    def test_deleted_file_shows_removals(self):
+        # File existed at backup time but is now gone (implementer deleted it)
+        # -> after_lines = [] via the `else` branch; diff shows the removed lines.
+        backup = self._backup_with("skills/gone.py", "keep1\nkeep2\n")
+        os.remove(os.path.join(self.tmp, "skills", "gone.py"))
+        diff = P._compute_diff(backup, ["skills/gone.py"])
+        self.assertIn("-keep1", diff)
+        self.assertIn("-keep2", diff)
 
 
 # ──────────────────────────── JSON extraction ─────────────────────────────
@@ -1543,6 +1578,81 @@ class LoopDriverTests(LoopDriverBase):
         self.assertIn("not ticked", out)
         # never makes progress -> watchdog trips
         self.assertEqual(rc, 2)
+
+    def test_emit_log_write_error_swallowed(self):
+        # The stream-log file opens fine, but writes to it raise mid-run
+        # (e.g. disk fills). emit() must swallow the OSError and keep going.
+        self.write_todo("- [x] done\n")  # empty queue -> straight to sweep
+        real_open = __import__("builtins").open
+
+        class _BadLog:
+            # The driver writes the startup banner directly (unguarded) before
+            # the first emit(); let that first write through, then fail every
+            # subsequent write/flush so the emit() OSError guard is exercised.
+            def __init__(self):
+                self._writes = 0
+
+            def write(self, *a, **k):
+                self._writes += 1
+                if self._writes > 1:
+                    raise OSError("disk full")
+
+            def flush(self, *a, **k):
+                raise OSError("disk full")
+
+            def close(self):
+                pass
+
+        def _open(path, *a, **k):
+            if path == os.path.join(self.tmp, "stream.log"):
+                return _BadLog()
+            return real_open(path, *a, **k)
+
+        with mock.patch("builtins.open", _open):
+            rc, out = self._run_loop(max_iter=2, task_count=0)
+        # loop still completes despite every log write failing
+        self.assertEqual(rc, 0)
+        self.assertIn("queue empty", out)
+
+    def test_log_close_error_swallowed(self):
+        # log_fp.close() at the end raises -> swallowed (the final OSError guard).
+        self.write_todo("- [x] done\n")
+        real_open = __import__("builtins").open
+
+        class _NoCloseLog:
+            def __init__(self, fp):
+                self._fp = fp
+
+            def write(self, s):
+                return self._fp.write(s)
+
+            def flush(self):
+                return self._fp.flush()
+
+            def close(self):
+                raise OSError("close failed")
+
+        def _open(path, *a, **k):
+            if path == os.path.join(self.tmp, "stream.log"):
+                return _NoCloseLog(real_open(path, *a, **k))
+            return real_open(path, *a, **k)
+
+        with mock.patch("builtins.open", _open):
+            rc, out = self._run_loop(max_iter=2, task_count=0)
+        self.assertEqual(rc, 0)
+
+    def test_first_unchecked_none_race_breaks_loop(self):
+        # _count_unchecked sees a pending task (so the loop body runs) but the
+        # follow-up _first_unchecked_task returns None (a concurrent edit ticked
+        # it) -> the `task is None` guard breaks the loop cleanly.
+        self.write_todo("- [ ] vanishes\n")
+        with mock.patch.object(P, "_count_unchecked", return_value=1), \
+             mock.patch.object(P, "_first_unchecked_task", return_value=None), \
+             mock.patch.object(P, "run_pipeline_on_task") as on_task:
+            rc, out = self._run_loop(max_iter=5, task_count=1)
+        on_task.assert_not_called()
+        self.assertEqual(rc, 0)
+        self.assertIn("no unchecked tasks", out)
 
     @unittest.skipUnless(_IS_WIN, "ctypes.windll only exists on Windows")
     def test_ansi_enable_swallows_errors_on_windows(self):

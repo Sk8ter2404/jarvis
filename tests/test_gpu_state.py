@@ -79,6 +79,13 @@ class RunNvidiaSmiTests(_GpuTestBase):
                                return_value=mock.MagicMock(returncode=1, stdout="x")):
             self.assertIsNone(gpu_state._run_nvidia_smi())
 
+    def test_none_on_unexpected_exception(self):
+        # A non-OSError surprise from subprocess.run (e.g. a ValueError on a
+        # malformed argv) is caught by the catch-all and degrades to None.
+        with mock.patch.object(gpu_state.subprocess, "run",
+                               side_effect=ValueError("weird")):
+            self.assertIsNone(gpu_state._run_nvidia_smi())
+
 
 class LogGpuStateTests(_GpuTestBase):
     def test_writes_snapshot_with_header(self):
@@ -163,6 +170,37 @@ class RotationTests(_GpuTestBase):
         # No file yet → rotation helper returns quietly, no exception.
         gpu_state._rotate_log_if_large(self.log_path)
         self.assertFalse(os.path.exists(self.log_path + ".1"))
+
+    def test_rotate_replace_failure_is_swallowed(self):
+        # An oversized file that can't be renamed (os.replace raises, e.g. a
+        # locked .1 backup on Windows) degrades to a console line, not a raise.
+        with open(self.log_path, "w", encoding="utf-8") as f:
+            f.write("x" * (gpu_state._LOG_MAX_BYTES + 1))
+        with mock.patch.object(gpu_state.os, "replace",
+                               side_effect=OSError("locked")):
+            gpu_state._rotate_log_if_large(self.log_path)   # must not raise
+        # Original file is left in place; no backup was produced.
+        self.assertTrue(os.path.exists(self.log_path))
+        self.assertFalse(os.path.exists(self.log_path + ".1"))
+
+
+class WriteFailureTests(_GpuTestBase):
+    def test_write_error_is_swallowed(self):
+        # The snapshot ran fine but the log write fails (OSError) — log_gpu_state
+        # still returns without raising; the failure is just printed.
+        with mock.patch.object(gpu_state, "_run_nvidia_smi", return_value=_SAMPLE_SMI), \
+             mock.patch.object(gpu_state, "open", create=True,
+                               side_effect=OSError("disk full")):
+            gpu_state.log_gpu_state("qwen2.5:14b")   # must not raise
+        self.assertFalse(os.path.exists(self.log_path))
+
+    def test_snapshot_without_trailing_newline_gets_one(self):
+        # When the captured snapshot doesn't end in '\n', the writer appends one
+        # so the next header starts on its own line.
+        snap = _SAMPLE_SMI.rstrip("\n")   # strip the trailing newline
+        with mock.patch.object(gpu_state, "_run_nvidia_smi", return_value=snap):
+            gpu_state.log_gpu_state("qwen2.5:14b")
+        self.assertTrue(self._read_log().endswith("\n"))
 
 
 if __name__ == "__main__":

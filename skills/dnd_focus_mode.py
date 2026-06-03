@@ -211,7 +211,7 @@ def _set_teams_presence(state: str) -> bool:
     except Exception:
         try:
             mod = sys.modules.get("skill_ms_graph")
-        except Exception:
+        except Exception:  # pragma: no cover - unreachable: dict.get() never raises; defensive only
             mod = None
     if mod is None:
         return False

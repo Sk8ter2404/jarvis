@@ -254,7 +254,7 @@ def _voice_to_ip(text: str) -> str:
         # 'dot' is no good — we only accept one octet per dot-delimited piece.
         try:
             n = int(digits)
-        except ValueError:
+        except ValueError:  # pragma: no cover - unreachable: _voice_to_digits yields only [0-9], so int() of a non-empty result never raises
             continue
         if 0 <= n <= 255:
             octets.append(str(n))
@@ -396,7 +396,7 @@ def _wizard_pick_printer(found: list[dict]) -> dict | None:
             idx = int(digits) - 1
             if 0 <= idx < len(found):
                 return found[idx]
-        except ValueError:
+        except ValueError:  # pragma: no cover - unreachable: _voice_to_digits yields only [0-9], so int() of a non-empty result never raises
             pass
     # Last-ditch: look for the model name in the reply.
     lower = (ans or "").lower()

@@ -19,6 +19,7 @@ caches never leak between tests.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import sys
@@ -1872,6 +1873,24 @@ class StartListenerAndStatusTests(_IsolatedTriageBase):
                                      "ts": time.time()})
         out = self.actions["recent_notifications_summary"]("12.5xyz")
         self.assertIn("Recent notifications", out)
+
+
+class NotificationTriageImportGuardTests(unittest.TestCase):
+    def test_path_bootstrap_inserts_project_root(self):
+        mod, _ = load_skill_isolated("notification_triage")
+        path = mod.__file__
+        proj = os.path.dirname(os.path.dirname(path))
+        spec = importlib.util.spec_from_file_location("notif_triage_reexec", path)
+        m = importlib.util.module_from_spec(spec)
+        m.skill_utils = {}
+        saved = list(sys.path)
+        try:
+            sys.path[:] = [p for p in sys.path
+                           if os.path.abspath(p) != os.path.abspath(proj)]
+            spec.loader.exec_module(m)
+            self.assertIn(m._PROJECT_DIR, sys.path)
+        finally:
+            sys.path[:] = saved
 
 
 if __name__ == "__main__":

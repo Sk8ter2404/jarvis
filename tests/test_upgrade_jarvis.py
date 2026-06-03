@@ -393,6 +393,21 @@ class BackupCodebaseTests(_UpgBase):
         self.assertTrue(os.path.isdir(os.path.join(U.BACKUP_DIR, "pipeline")))
         self.assertTrue(os.path.isdir(os.path.join(U.BACKUP_DIR, "gate_2026_batch1")))
 
+    def test_copies_hud_directory(self):
+        # the hud/ tree is snapshotted only when present (its own copytree branch)
+        self._seed_source()
+        self.write("hud/overlay.py", "H = 1\n")
+        dest = U.backup_codebase()
+        self.assertTrue(os.path.exists(os.path.join(dest, "hud", "overlay.py")))
+
+    def test_prune_oserror_swallowed(self):
+        # a listdir/rmtree failure during the prune step must not abort the
+        # snapshot (the whole prune is wrapped in try/except: pass).
+        self._seed_source()
+        with mock.patch.object(U.os, "listdir", side_effect=OSError("io")):
+            dest = U.backup_codebase()
+        self.assertTrue(os.path.isdir(dest))
+
 
 # ═══════════════════════════ get_pending_tasks ════════════════════════════
 
@@ -503,6 +518,14 @@ class GateSnapshotTests(_UpgBase):
             dest = U._gate_snapshot(1)
         self.assertTrue(os.path.isdir(dest))
 
+    def test_subdir_copytree_oserror_swallowed(self):
+        # a subdir (skills/) copytree failing OSError is swallowed; the snapshot
+        # dir is still returned so the gate can proceed.
+        self.write("skills/a.py", "a=1\n")
+        with mock.patch.object(U.shutil, "copytree", side_effect=OSError("locked")):
+            dest = U._gate_snapshot(2)
+        self.assertTrue(os.path.isdir(dest))
+
 
 class EventlogAppcrashDumpTests(_UpgBase):
     def test_returns_stdout_stripped(self):
@@ -544,6 +567,14 @@ class LatestSessionLogTailTests(_UpgBase):
     def test_unreadable_file_returns_empty(self):
         self.write("logs/session_x.log", "data\n")
         with mock.patch("builtins.open", side_effect=OSError("locked")):
+            self.assertEqual(U._latest_session_log_tail(), [])
+
+    def test_getmtime_failure_skips_candidate(self):
+        # a session_*.log whose mtime can't be stat'd (race/permission) is
+        # skipped via the `except OSError: continue` guard. With the only
+        # candidate skipped, the function returns [].
+        self.write("logs/session_a.log", "data\n")
+        with mock.patch.object(U.os.path, "getmtime", side_effect=OSError("gone")):
             self.assertEqual(U._latest_session_log_tail(), [])
 
 
@@ -634,6 +665,28 @@ class RunStabilitySmokeTestTests(_UpgBase):
             U._run_stability_smoke_test(duration_s=1)
         self.assertFalse(os.path.exists(lock))
 
+    def test_kill_exception_swallowed(self):
+        # the pre-handoff kill_running_jarvis() is belt-and-braces: if it raises
+        # the smoke test still proceeds (the failure is caught and ignored).
+        self._make_tool()
+        with mock.patch.object(U, "kill_running_jarvis",
+                               side_effect=RuntimeError("kill blew up")), \
+             mock.patch.object(U.subprocess, "run",
+                               return_value=_FakeCompleted(returncode=0)):
+            out = U._run_stability_smoke_test(duration_s=1)
+        self.assertTrue(out["ok"])
+
+    def test_lock_remove_oserror_swallowed(self):
+        # a failure removing the stale lock must not abort the smoke test.
+        self._make_tool()
+        self.write("jarvis.lock", "pid")
+        with mock.patch.object(U, "kill_running_jarvis", return_value=0), \
+             mock.patch.object(U.os, "remove", side_effect=OSError("locked")), \
+             mock.patch.object(U.subprocess, "run",
+                               return_value=_FakeCompleted(returncode=0)):
+            out = U._run_stability_smoke_test(duration_s=1)
+        self.assertTrue(out["ok"])
+
 
 # ═══════════════════════ _revert_to_snapshot ══════════════════════════════
 
@@ -723,6 +776,35 @@ class RevertToSnapshotTests(_UpgBase):
         # __pycache__ artifact left intact (not purged)
         self.assertTrue(self.exists("core/__pycache__/keep.cpython.pyc"))
 
+    def test_manifest_walk_oserror_marks_not_ok(self):
+        # building the snapshot manifest via os.walk(src) failing (OSError)
+        # flags overall not-ok and skips that subdir (the manifest except path).
+        snap = os.path.join(self.tmp, "snap")
+        os.makedirs(os.path.join(snap, "core"))
+        with open(os.path.join(snap, "core", "keep.py"), "w") as f:
+            f.write("k=1\n")
+        self.write("core/keep.py", "k=0\n")
+        with mock.patch.object(U.os, "walk", side_effect=OSError("walk denied")):
+            ok, log = U._revert_to_snapshot(snap)
+        self.assertFalse(ok)
+        self.assertIn("manifest core failed", log)
+
+    def test_purge_remove_oserror_counted(self):
+        # an extra dest file that can't be deleted increments purge_errors and
+        # is surfaced in the log, without aborting the revert.
+        snap = os.path.join(self.tmp, "snap")
+        os.makedirs(os.path.join(snap, "core"))
+        with open(os.path.join(snap, "core", "keep.py"), "w") as f:
+            f.write("k=1\n")
+        self.write("core/keep.py", "k=0\n")
+        self.write("core/extra.py", "e=1\n")   # absent from manifest -> purge
+        with mock.patch.object(U.subprocess, "run",
+                               return_value=_FakeCompleted(returncode=1)), \
+             mock.patch.object(U.os, "remove", side_effect=OSError("readonly")):
+            ok, log = U._revert_to_snapshot(snap)
+        self.assertTrue(ok)
+        self.assertIn("errors", log)
+
 
 # ═══════════════════════════ _stability_gate ══════════════════════════════
 
@@ -750,6 +832,38 @@ class StabilityGateTests(_UpgBase):
         markers = [f for f in os.listdir(os.path.join(self.tmp, "gate_x"))
                    if f.startswith("PASS_batch_2")]
         self.assertEqual(len(markers), 1)
+
+    def test_pass_kill_exception_swallowed(self):
+        # the post-smoke kill in the PASS path is belt-and-braces; if it raises
+        # the gate still records a PASS.
+        with mock.patch.dict(os.environ, {"STABILITY_GATE_DISABLE": "",
+                                          "STABILITY_GATE_DURATION_S": "30"}), \
+             mock.patch.object(U, "_gate_snapshot",
+                               return_value=os.path.join(self.tmp, "gate_k")), \
+             mock.patch.object(U, "_run_stability_smoke_test",
+                               return_value={"ok": True, "report": {"v": "PASS"}}), \
+             mock.patch.object(U, "kill_running_jarvis",
+                               side_effect=RuntimeError("kill blew up")):
+            os.makedirs(os.path.join(self.tmp, "gate_k"), exist_ok=True)
+            out = U._stability_gate(5, ["t"], batch_size=1)
+        self.assertEqual(out["verdict"], "PASS")
+        self.assertTrue(out["ok"])
+
+    def test_pass_marker_write_oserror_swallowed(self):
+        # the PASS marker file write is best-effort; an OSError on open() must
+        # not derail the PASS verdict.
+        gate_dir = os.path.join(self.tmp, "gate_m")
+        os.makedirs(gate_dir, exist_ok=True)
+        with mock.patch.dict(os.environ, {"STABILITY_GATE_DISABLE": "",
+                                          "STABILITY_GATE_DURATION_S": "30"}), \
+             mock.patch.object(U, "_gate_snapshot", return_value=gate_dir), \
+             mock.patch.object(U, "_run_stability_smoke_test",
+                               return_value={"ok": True, "report": None}), \
+             mock.patch.object(U, "kill_running_jarvis", return_value=0), \
+             mock.patch("builtins.open", side_effect=OSError("readonly snap")):
+            out = U._stability_gate(6, ["t"], batch_size=1)
+        self.assertEqual(out["verdict"], "PASS")
+        self.assertTrue(out["ok"])
 
     def test_fail_path_reverts_and_queues_regression(self):
         self.write("jarvis_todo.md", "- [ ] existing\n")
@@ -1750,6 +1864,60 @@ class MainEntryTests(_UpgBase):
              mock.patch("builtins.input", side_effect=EOFError()):
             txt = self._run_main(["upgrade_jarvis.py"])
         self.assertIn("Could not open editor", txt)
+
+
+class _NoReconfigStream(io.StringIO):
+    """A text stream whose .reconfigure() always raises, to drive the module's
+    stdout/stderr reconfigure-failure guard."""
+
+    def reconfigure(self, *a, **k):   # noqa: D401 - mimic a real stream method
+        raise OSError("cannot reconfigure")
+
+
+class ImportTimeGuardTests(unittest.TestCase):
+    """Re-exec upgrade_jarvis.py's source in a throwaway namespace with the
+    environment broken in ways the live import already handles, to cover the
+    module-top-level defensive branches (stdout reconfigure failure + each
+    optional-helper import failure). The real, already-imported `U` module and
+    sys.modules are left untouched — we exec into a private dict and never
+    register it.
+    """
+
+    def _exec_source(self, ns):
+        with open(U.__file__, "r", encoding="utf-8") as f:
+            src = f.read()
+        code = compile(src, U.__file__, "exec")
+        exec(code, ns)
+
+    def test_stdout_reconfigure_failure_swallowed(self):
+        ns = {"__name__": "upgrade_jarvis_reexec_recfg", "__file__": U.__file__}
+        with mock.patch.object(sys, "stdout", _NoReconfigStream()), \
+             mock.patch.object(sys, "stderr", _NoReconfigStream()):
+            # must not raise despite reconfigure() blowing up on both streams
+            self._exec_source(ns)
+        self.assertIn("backup_codebase", ns)
+
+    def test_optional_helper_import_failures_swallowed(self):
+        # force the two optional local helpers to fail importing -> the module
+        # sets them to None and prints an "unavailable" notice instead of dying.
+        real_import = __import__
+        targets = {"blue_green_manager", "staging_instance"}
+
+        def fake_import(name, *a, **k):
+            if name in targets:
+                raise ImportError(f"forced-absent: {name}")
+            return real_import(name, *a, **k)
+
+        ns = {"__name__": "upgrade_jarvis_reexec_imp", "__file__": U.__file__}
+        buf = io.StringIO()
+        with mock.patch("builtins.__import__", side_effect=fake_import), \
+             mock.patch.object(sys, "stdout", buf):
+            self._exec_source(ns)
+        self.assertIsNone(ns.get("_bgm"))
+        self.assertIsNone(ns.get("_stg"))
+        printed = buf.getvalue()
+        self.assertIn("blue_green_manager unavailable", printed)
+        self.assertIn("staging_instance unavailable", printed)
 
 
 if __name__ == "__main__":

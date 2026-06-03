@@ -8,6 +8,7 @@ import os
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 import core.legacy_memory as lm
 
@@ -61,6 +62,32 @@ class LegacyMemoryTests(unittest.TestCase):
         self.assertIn("projects", m)
         self.assertIn("sessions", m)
         self.assertIn("last_used_phrase_by_intent", m)
+
+    def test_save_failure_cleans_tempfile_and_reraises(self):
+        # If serialisation fails mid-write, save_memory must (a) re-raise so the
+        # caller sees the failure and (b) leave NO stray .mem_*.tmp behind — the
+        # atomic-write contract: the live store is never touched, and we don't
+        # litter the data dir with half-written temp files.
+        boom = RuntimeError("disk full")
+        with mock.patch.object(lm.json, "dump", side_effect=boom):
+            with self.assertRaises(RuntimeError):
+                lm.save_memory(lm._empty_memory())
+        leftovers = [f for f in os.listdir(self._tmp.name) if f.endswith(".tmp")]
+        self.assertEqual(leftovers, [], f"stray tempfiles: {leftovers}")
+        # The original target was never created (no successful os.replace).
+        self.assertFalse(os.path.exists(self._path))
+
+    def test_save_failure_tempfile_cleanup_error_is_suppressed(self):
+        # Belt-and-braces: even if the temp-file cleanup ALSO fails (os.remove
+        # raises), save_memory still re-raises the ORIGINAL write error — the
+        # cleanup failure is swallowed and never masks the real cause.
+        boom = RuntimeError("disk full")
+        with mock.patch.object(lm.json, "dump", side_effect=boom), \
+             mock.patch.object(lm.os, "remove",
+                               side_effect=PermissionError("locked")):
+            with self.assertRaises(RuntimeError) as cm:
+                lm.save_memory(lm._empty_memory())
+        self.assertIs(cm.exception, boom)
 
 
 if __name__ == "__main__":

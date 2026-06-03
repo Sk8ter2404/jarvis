@@ -310,7 +310,7 @@ def _compute_diff(backup_dir: str, files: list[str]) -> str:
             fromfile=f"a/{rel_norm}", tofile=f"b/{rel_norm}",
             lineterm="",
         ))
-        if not diff:
+        if not diff:  # pragma: no cover - unreachable: unequal seqs always yield a non-empty unified_diff (equality handled above)
             continue
         if len(diff) > 400:
             diff = diff[:400] + [f"... (diff truncated at 400 lines, "

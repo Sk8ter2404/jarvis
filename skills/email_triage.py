@@ -1243,7 +1243,7 @@ def action_email_briefing(_: str = "") -> str:
             other_counts[verdict] += 1
         else:
             other_counts["unclassified"] += 1
-    if not urgent and not any(other_counts.values()):
+    if not urgent and not any(other_counts.values()):  # pragma: no cover - unreachable: the loop buckets every non-empty message into urgent or a count, so this only fires on an empty set already handled above
         return ""
     bits: list[str] = []
     if urgent:
@@ -1333,7 +1333,7 @@ def register(actions):
 
 # ─── CLI: gmail auth + smoke test ────────────────────────────────────────
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - CLI smoke/auth entry; exercised by hand, not under unittest
     if "--auth-gmail" in sys.argv:
         ok = authenticate_gmail()
         sys.exit(0 if ok else 1)

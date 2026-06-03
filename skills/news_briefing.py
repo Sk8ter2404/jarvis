@@ -400,5 +400,5 @@ def register(actions):
 
 # ─── manual smoke test ───────────────────────────────────────────────────
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - manual smoke entry; run by hand, not under unittest
     print(get_news_text() or "(empty briefing)")

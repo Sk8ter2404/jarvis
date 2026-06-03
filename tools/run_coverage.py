@@ -70,19 +70,38 @@ def main(argv: list[str]) -> int:
              "tools/generate_jarvis_icon.py", "tools/identify_vendors.py",
              "tools/render_unified_hud.py", "tools/say_to_jarvis.py",
              "tools/scan_full_network.py", "tools/scan_lan_devices.py",
-             "tools/test_local_prompt.py"]
+             "tools/test_local_prompt.py",
+             # Developer-facing TEMPLATE skill (copy-me example), not a real
+             # shipped/registered skill — documentation by example, not logic.
+             "*/skills/_example_skill.py"]
     if want_full:
         # LOCAL full tier: adds the ~14K-line monolith + the other root product
         # modules + the smaller product packages. Needs all deps present (these
         # can't import on the bare CI runner), so this tier is local-only — the
         # default source below is the CI light-tier gate.
-        _source = ["core", "skills", "tools", "adapters", "hud", "audio",
+        # NB: hud/ is intentionally NOT measured — it's the PyQt holographic-
+        # overlay presentation layer (GUI paint/layout). It needs a live Qt
+        # display, can't import on the bare runner, and GUI paint code is
+        # conventionally excluded from UNIT coverage (it's exercised
+        # behaviorally by the staging tier, like the monolith's boot path).
+        # Everything with unit-testable logic IS measured.
+        _source = ["core", "skills", "tools", "adapters", "audio",
                    "bobert_companion", "tray", "boot_sequence", "upgrade_jarvis"]
         _label = "FULL local tier: core/skills/tools + monolith + root modules"
     else:
         _source = ["core", "skills", "tools"]
         _label = "core/ + skills/ + tools/"
     cov = coverage.Coverage(source=_source, omit=_omit, branch=False)
+    # Conventional never-unit-tested lines, excluded everywhere so the report
+    # reflects *reachable* code. cov.exclude ADDS to coverage's default
+    # "pragma: no cover" (it doesn't replace it). Substantive unreachable blocks
+    # (the boot entrypoint, while-True daemon loops, live mic/camera capture)
+    # carry their own inline ``# pragma: no cover - <reason>`` at the block head.
+    for _pat in (r"if __name__ == ['\"]__main__['\"]:",
+                 r"if (typing\.)?TYPE_CHECKING:",
+                 r"raise NotImplementedError",
+                 r"@(abc\.)?abstractmethod"):
+        cov.exclude(_pat)
     cov.start()
     ok = _run_suite()
     cov.stop()

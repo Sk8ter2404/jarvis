@@ -15,6 +15,7 @@ real screenshots, no window queries, no pending_speech.json writes.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import sys
@@ -682,6 +683,51 @@ class PollLoopTests(unittest.TestCase):
             with self.assertRaises(_LoopStop):
                 self.mod._poll_loop()
         logexc.assert_called()   # the poll error was logged
+
+    def test_poll_loop_logs_when_error_path_sleep_also_fails(self):
+        # _poll_once raises (outer except), then the error-path sleep ALSO raises
+        # a normal Exception -> the inner `except Exception` logs "sleep after
+        # error failed". Sequence: settle sleep #1 (no-op) -> _poll_once raises ->
+        # error-path sleep #2 raises OSError (logged at 307) -> next iter
+        # _poll_once raises -> error-path sleep #3 raises _LoopStop to break out.
+        sleeps = {"n": 0}
+
+        def _sleep(_s):
+            sleeps["n"] += 1
+            if sleeps["n"] == 2:
+                raise OSError("interrupted system call")  # caught -> inner log
+            if sleeps["n"] >= 3:
+                raise _LoopStop()                          # BaseException escapes
+
+        with mock.patch.object(self.mod.time, "sleep", side_effect=_sleep), \
+             mock.patch.object(self.mod, "_poll_once",
+                               side_effect=RuntimeError("poll boom")), \
+             mock.patch.object(self.mod.logging, "exception") as logexc:
+            with self.assertRaises(_LoopStop):
+                self.mod._poll_loop()
+        # Two distinct log lines: the poll error AND the sleep-after-error error.
+        msgs = [c.args[0] for c in logexc.call_args_list if c.args]
+        self.assertTrue(any("sleep after error failed" in m for m in msgs))
+
+
+class ScreenWatchImportGuardTests(unittest.TestCase):
+    def test_path_bootstrap_inserts_project_root(self):
+        # Re-exec the source with the project root removed from sys.path so the
+        # `if _PROJECT_DIR not in sys.path: sys.path.insert(...)` guard runs.
+        mod, _ = load_skill_isolated("screen_watch")
+        path = mod.__file__
+        proj = os.path.dirname(os.path.dirname(path))
+        spec = importlib.util.spec_from_file_location("screen_watch_reexec", path)
+        m = importlib.util.module_from_spec(spec)
+        m.skill_utils = {}
+        saved = list(sys.path)
+        try:
+            sys.path[:] = [p for p in sys.path
+                           if os.path.abspath(p) != os.path.abspath(proj)]
+            spec.loader.exec_module(m)
+            self.assertIn(m._PROJECT_DIR, sys.path)
+        finally:
+            sys.path[:] = saved
 
 
 # ── register() spawns the watcher thread ─────────────────────────────────

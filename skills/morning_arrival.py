@@ -355,7 +355,7 @@ def _count_overnight_merges() -> int:
             continue
         try:
             remain = int(m.group(1))
-        except ValueError:
+        except ValueError:  # pragma: no cover - unreachable: iter_re captures (\d+), so int() of the match never raises
             continue
         # Increment on a strict decrement of the "K task(s) remain" counter —
         # this matches what the user would observe as "Claude Code merged X

@@ -61,6 +61,15 @@ class YtdlpProbeTests(unittest.TestCase):
             self.assertEqual(self.mod._probe_ytdlp(), ["yt-dlp"])
         which.assert_not_called()
 
+    def test_probe_subprocess_exception_treated_as_absent(self):
+        # The `import yt_dlp` confirmation subprocess raises (e.g. OSError on a
+        # locked-down host) -> the broad except swallows it and the probe
+        # reports unavailable.
+        with mock.patch.object(self.mod.shutil, "which", return_value=None), \
+             mock.patch.object(self.mod.subprocess, "run",
+                               side_effect=OSError("exec denied")):
+            self.assertEqual(self.mod._probe_ytdlp(), [])
+
 
 class FindDirectUrlTests(unittest.TestCase):
     def setUp(self):
@@ -94,6 +103,13 @@ class FindDirectUrlTests(unittest.TestCase):
     def test_timeout_returns_none(self):
         with mock.patch.object(self.mod.subprocess, "run",
                                side_effect=subprocess.TimeoutExpired("yt-dlp", 10)):
+            self.assertIsNone(self.mod.find_direct_url("q"))
+
+    def test_generic_subprocess_exception_returns_none(self):
+        # A non-timeout spawn failure (OSError) hits the broad `except
+        # Exception` and degrades to None.
+        with mock.patch.object(self.mod.subprocess, "run",
+                               side_effect=OSError("spawn failed")):
             self.assertIsNone(self.mod.find_direct_url("q"))
 
     def test_empty_stdout_returns_none(self):
@@ -144,6 +160,25 @@ class YoutubeSearchDirectActionTests(unittest.TestCase):
             out = self.actions["youtube_search_direct"]("q")
         self.assertIn("couldn't open the browser", out)
         self.assertIn(_WATCH, out)
+
+    def test_no_ytdlp_fallback_swallows_browser_error(self):
+        # yt-dlp absent AND the results-page open() raises -> the except swallows
+        # it and the install-hint message is still returned.
+        self.mod._YTDLP_CMD = []
+        with mock.patch.object(self.mod.webbrowser, "open",
+                               side_effect=RuntimeError("no browser")):
+            out = self.actions["youtube_search_direct"]("lofi beats")
+        self.assertIn("yt-dlp is not installed", out)
+        self.assertIn("results page", out)
+
+    def test_no_match_fallback_swallows_browser_error(self):
+        # yt-dlp found no match AND the results-page open() raises -> swallowed;
+        # the "couldn't find a direct match" message is still returned.
+        with mock.patch.object(self.mod, "find_direct_url", return_value=None), \
+             mock.patch.object(self.mod.webbrowser, "open",
+                               side_effect=RuntimeError("no browser")):
+            out = self.actions["youtube_search_direct"]("zzz nope zzz")
+        self.assertIn("couldn't find a direct match", out)
 
 
 if __name__ == "__main__":

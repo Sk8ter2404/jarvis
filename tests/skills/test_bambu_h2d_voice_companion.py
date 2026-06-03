@@ -17,6 +17,9 @@ no real printer state is read.
 """
 from __future__ import annotations
 
+import contextlib
+import io
+import os
 import sys
 import threading
 import time
@@ -36,9 +39,17 @@ def _fake_bambu(state=None):
 
 
 class VoiceCompanionMixin:
-    def _load(self, bambu_state="__absent__"):
+    def _load(self, bambu_state="__absent__", bambu_module=None):
         patches = []
-        if bambu_state != "__absent__":
+        if bambu_module is not None:
+            # Caller supplied a fully-built fake bambu module (used when the
+            # test needs custom helper functions on it).
+            p = mock.patch.dict(sys.modules,
+                                {"skill_bambu_monitor": bambu_module})
+            p.start()
+            patches.append(p)
+            self._fake = bambu_module
+        elif bambu_state != "__absent__":
             fake = _fake_bambu(bambu_state)
             p = mock.patch.dict(sys.modules, {"skill_bambu_monitor": fake})
             p.start()
@@ -240,6 +251,275 @@ class VoiceCompanionHookTests(VoiceCompanionMixin, unittest.TestCase):
                                side_effect=RuntimeError("boom")):
             # Should not raise.
             mod._on_bambu_state_change({"filename": "x"}, "IDLE", "RUNNING")
+
+    def test_register_hook_when_not_callable(self):
+        # bambu present but register_state_change_hook is missing/non-callable.
+        fake = types.ModuleType("skill_bambu_monitor")
+        fake.register_state_change_hook = "not callable"
+        mod, _a = self._load(bambu_module=fake)
+        self.assertFalse(mod._register_bambu_hook())
+
+    def test_register_hook_raises_is_caught(self):
+        fake = _fake_bambu({"last_update": 0.0})
+        fake.register_state_change_hook = mock.MagicMock(
+            side_effect=RuntimeError("registry full"))
+        mod, _a = self._load(bambu_module=fake)
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            self.assertFalse(mod._register_bambu_hook())
+        self.assertIn("hook registration failed", buf.getvalue())
+
+
+class VoiceCompanionDelegationTests(VoiceCompanionMixin, unittest.TestCase):
+    """The formatter helpers prefer bambu_monitor's implementation when it's
+    loaded; the sibling tests only cover the bambu-absent local fallback. Here
+    we exercise the delegation path (success + the delegate-raises fallback)."""
+
+    def _bambu_with(self, **fns):
+        m = types.ModuleType("skill_bambu_monitor")
+        m._state_lock = threading.Lock()
+        m._state = {"last_update": 0.0}
+        for name, fn in fns.items():
+            setattr(m, name, fn)
+        return m
+
+    def test_format_minutes_delegates_to_bambu(self):
+        bm = self._bambu_with(_format_minutes=lambda mins: f"DELEGATED {mins}")
+        mod, _a = self._load(bambu_module=bm)
+        self.assertEqual(mod._format_minutes(7), "DELEGATED 7")
+
+    def test_format_minutes_delegate_raises_falls_back(self):
+        def _boom(_m):
+            raise RuntimeError("bm broken")
+        bm = self._bambu_with(_format_minutes=_boom)
+        mod, _a = self._load(bambu_module=bm)
+        # Falls through to the local formatter.
+        self.assertEqual(mod._format_minutes(5), "5 minutes")
+
+    def test_format_temp_delegates_and_falls_back(self):
+        bm = self._bambu_with(_format_temp=lambda t: f"T{t}")
+        mod, _a = self._load(bambu_module=bm)
+        self.assertEqual(mod._format_temp(60), "T60")
+
+        def _boom(_t):
+            raise RuntimeError("x")
+        bm2 = self._bambu_with(_format_temp=_boom)
+        mod2, _a2 = self._load(bambu_module=bm2)
+        self.assertEqual(mod2._format_temp(60), "60 degrees")
+
+    def test_format_temp_local_nonnumeric_returns_blank(self):
+        mod, _a = self._load()  # bambu absent → local path
+        self.assertEqual(mod._format_temp("hot"), "")
+
+    def test_strip_filename_delegates_and_falls_back(self):
+        bm = self._bambu_with(_strip_filename=lambda n: f"S:{n}")
+        mod, _a = self._load(bambu_module=bm)
+        self.assertEqual(mod._strip_filename("part.3mf"), "S:part.3mf")
+
+        def _boom(_n):
+            raise RuntimeError("x")
+        bm2 = self._bambu_with(_strip_filename=_boom)
+        mod2, _a2 = self._load(bambu_module=bm2)
+        self.assertEqual(mod2._strip_filename("My_Part.gcode"), "My Part")
+
+    def test_get_announcer_module_resolves(self):
+        mod, _a = self._load()
+        ann = types.ModuleType("skill_bambu_print_announcer")
+        with mock.patch.dict(sys.modules,
+                             {"skill_bambu_print_announcer": ann}):
+            self.assertIs(mod._get_announcer_module(), ann)
+        with mock.patch.dict(sys.modules,
+                             {"skill_bambu_print_announcer": None}):
+            self.assertIsNone(mod._get_announcer_module())
+
+    def test_read_state_exception_returns_none(self):
+        # A _state_lock that isn't a context manager makes the `with` raise.
+        fake = types.ModuleType("skill_bambu_monitor")
+        fake._state_lock = object()
+        fake._state = {"last_update": 1.0}
+        mod, _a = self._load(bambu_module=fake)
+        self.assertIsNone(mod._read_state())
+
+
+class VoiceCompanionAnnounceRoutingTests(VoiceCompanionMixin, unittest.TestCase):
+    def test_gated_announce_routes_through_announcer(self):
+        mod, _a = self._load()
+        ann = types.ModuleType("skill_bambu_print_announcer")
+        ann._proactive_announce = mock.MagicMock(return_value=True)
+        with mock.patch.dict(sys.modules,
+                             {"skill_bambu_print_announcer": ann}):
+            mod._gated_announce("milestone sir")
+        ann._proactive_announce.assert_called_once_with("milestone sir")
+
+    def test_gated_announce_falls_back_when_announcer_raises(self):
+        mod, _a = self._load()
+        ann = types.ModuleType("skill_bambu_print_announcer")
+        ann._proactive_announce = mock.MagicMock(side_effect=RuntimeError("x"))
+        with mock.patch.dict(sys.modules,
+                             {"skill_bambu_print_announcer": ann}), \
+             mock.patch.object(mod, "_direct_enqueue") as direct:
+            mod._gated_announce("milestone sir")
+        direct.assert_called_once_with("milestone sir")
+
+    def test_gated_announce_falls_back_when_announcer_absent(self):
+        mod, _a = self._load()
+        with mock.patch.dict(sys.modules,
+                             {"skill_bambu_print_announcer": None}), \
+             mock.patch.object(mod, "_direct_enqueue") as direct:
+            mod._gated_announce("hello")
+        direct.assert_called_once_with("hello")
+
+    def test_direct_enqueue_prefers_bobert_companion(self):
+        # Inject a fake bobert_companion into sys.modules so import_module
+        # returns it (never the real monolith file at the project root).
+        mod, _a = self._load()
+        bc = types.ModuleType("bobert_companion")
+        bc.proactive_announce = mock.MagicMock(return_value=True)
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}):
+            mod._direct_enqueue("alert sir")
+        bc.proactive_announce.assert_called_once()
+        self.assertEqual(bc.proactive_announce.call_args.kwargs.get("source"),
+                         "bambu_voice_companion")
+
+    def test_direct_enqueue_bobert_announce_raises_falls_through(self):
+        # bobert_companion present and proactive_announce IS callable but
+        # raises → the except swallows it and we fall through to the bambu
+        # enqueue path. (Bare fake module → never imports the real monolith.)
+        bm = _fake_bambu({"last_update": 0.0})
+        bm._enqueue_speech = mock.MagicMock()
+        bc = types.ModuleType("bobert_companion")
+        bc.proactive_announce = mock.MagicMock(
+            side_effect=RuntimeError("announce boom"))
+        mod, _a = self._load(bambu_module=bm)
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}):
+            mod._direct_enqueue("alert sir")
+        bm._enqueue_speech.assert_called_once_with("alert sir")
+
+    def test_direct_enqueue_bambu_enqueue_raises_falls_to_file(self):
+        # bobert absent (bare module) AND bambu's _enqueue_speech raises →
+        # the last-resort file write runs. Queue file pre-exists with valid
+        # JSON so the existing-file read branch is exercised too.
+        import json
+        import tempfile
+        bm = _fake_bambu({"last_update": 0.0})
+        bm._enqueue_speech = mock.MagicMock(side_effect=RuntimeError("nope"))
+        bc = types.ModuleType("bobert_companion")  # no proactive_announce
+        fd, p = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(p) and os.remove(p))
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump([{"ts": 1.0, "message": "old"}], f)
+        mod, _a = self._load(bambu_module=bm)
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}), \
+             mock.patch.object(mod, "_SPEECH_QUEUE", p):
+            mod._direct_enqueue("appended sir")
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual([d["message"] for d in data], ["old", "appended sir"])
+
+    def test_direct_enqueue_corrupt_and_nonlist_queue(self):
+        # Existing queue file that's non-JSON → read except (data=[]), then a
+        # second call against a queue holding a non-list JSON → the
+        # isinstance guard resets it. Both land the message.
+        import json
+        import tempfile
+        mod, _a = self._load()  # bambu absent
+        bc = types.ModuleType("bobert_companion")  # no proactive_announce
+        fd, p = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(p) and os.remove(p))
+        # (a) corrupt content → read except.
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("{ not json")
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}), \
+             mock.patch.object(mod, "_SPEECH_QUEUE", p):
+            mod._direct_enqueue("after corrupt")
+        # (b) non-list JSON → isinstance guard resets to [].
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"not": "a list"}, f)
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}), \
+             mock.patch.object(mod, "_SPEECH_QUEUE", p):
+            mod._direct_enqueue("after nonlist")
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual([d["message"] for d in data], ["after nonlist"])
+
+    def test_direct_enqueue_file_write_failure_is_logged(self):
+        mod, _a = self._load()
+        bc = types.ModuleType("bobert_companion")  # no proactive_announce
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}), \
+             mock.patch.object(mod, "_atomic_write_json",
+                               side_effect=OSError("disk full")), \
+             mock.patch.object(mod.os.path, "exists", return_value=False):
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                mod._direct_enqueue("doomed")
+        self.assertIn("speech-queue write failed", buf.getvalue())
+
+
+class VoiceCompanionScanExceptionTests(VoiceCompanionMixin, unittest.TestCase):
+    def test_layer_shift_json_dumps_failure_is_swallowed(self):
+        mod, _a = self._load()
+
+        class _Unserializable:
+            pass
+        # json.dumps on a non-str, non-serializable ams → except → no crash.
+        self.assertFalse(
+            mod._scan_for_layer_shift(0, _Unserializable()))
+
+    def test_ams_issue_json_dumps_failure_returns_false(self):
+        mod, _a = self._load()
+
+        class _Unserializable:
+            pass
+        self.assertFalse(mod._scan_for_ams_issue(0, _Unserializable()))
+
+    def test_ams_issue_no_ams_keyword_returns_false(self):
+        mod, _a = self._load()
+        # Blob has a fault word but no AMS/spool/filament keyword → early False.
+        self.assertFalse(mod._scan_for_ams_issue(0, "nozzle jam"))
+
+
+class VoiceCompanionSnapshotBranchTests(VoiceCompanionMixin, unittest.TestCase):
+    def test_milestone_without_eta(self):
+        mod, _a = self._load()
+        mod._current_filename[0] = "cube"
+        # No mc_remaining → the "Print at X%, sir." (no ETA tail) branch.
+        snap = {"filename": "cube.3mf", "mc_percent": 25}
+        with mock.patch.object(mod, "_gated_announce") as gated:
+            with mod._state_lock:
+                mod._process_snapshot(snap, "RUNNING")
+        msgs = [c.args[0] for c in gated.call_args_list]
+        self.assertTrue(any(m == "Print at 25%, sir." for m in msgs))
+
+    def test_pct_coercion_failure_skips_milestones(self):
+        mod, _a = self._load()
+        mod._current_filename[0] = "cube"
+        # Non-numeric mc_percent → pct_f stays None → no milestone announced,
+        # but the rest of the snapshot pass still runs without crashing.
+        snap = {"filename": "cube.3mf", "mc_percent": "almost"}
+        with mock.patch.object(mod, "_gated_announce") as gated, \
+             mock.patch.object(mod, "_direct_enqueue"):
+            with mod._state_lock:
+                mod._process_snapshot(snap, "RUNNING")
+        gated.assert_not_called()
+
+
+class VoiceCompanionStatusBranchTests(VoiceCompanionMixin, unittest.TestCase):
+    def test_status_pause_with_temps(self):
+        mod, actions = self._load(bambu_state={
+            "last_update": time.time(), "gcode_state": "PAUSE",
+            "nozzle_temper": 215.0, "bed_temper": 55.0})
+        out = actions["print_status"]("")
+        self.assertIn("paused", out.lower())
+        self.assertIn("nozzle at 215 degrees", out)
+
+    def test_status_running_without_filename(self):
+        # No filename → the "Print in progress" else branch.
+        mod, actions = self._load(bambu_state={
+            "last_update": time.time(), "gcode_state": "RUNNING",
+            "layer_num": 5, "total_layer": 50, "mc_remaining": 20})
+        out = actions["print_status"]("")
+        self.assertIn("Print in progress", out)
+        self.assertIn("layer 5 of 50", out)
 
 
 if __name__ == "__main__":

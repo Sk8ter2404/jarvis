@@ -55,6 +55,26 @@ class RouterShimTests(unittest.TestCase):
             self.assertIn(name, actions)
         self.assertTrue(callable(actions["smart_home_control"]))
 
+    def test_shim_degrades_when_core_import_fails(self):
+        # The `from core import smart_home_router` inside register() raises
+        # (e.g. partial install / corrupt catalog at import time) -> the shim's
+        # outer try/except swallows it, prints a hint, and returns without
+        # registering anything.
+        mod, _ = load_skill_isolated("smart_home_router_skill", register=False)
+        real_import = __import__
+
+        def _imp(name, *a, **k):
+            if name == "core" and a and len(a) >= 3 and "smart_home_router" in (a[2] or []):
+                raise ImportError("corrupt catalog")
+            if name == "core.smart_home_router":
+                raise ImportError("corrupt catalog")
+            return real_import(name, *a, **k)
+
+        actions: dict = {}
+        with mock.patch("builtins.__import__", side_effect=_imp):
+            mod.register(actions)
+        self.assertEqual(actions, {})  # nothing registered, no raise
+
     def test_shim_degrades_when_core_register_fails(self):
         # The shim wraps core.smart_home_router.register() in try/except so a
         # failure there (e.g. corrupt catalog) can't take down skill loading.

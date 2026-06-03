@@ -181,7 +181,7 @@ def _poll_once(bc) -> None:
             _state["current_sides"]  = sides
 
 
-def _poll_loop() -> None:
+def _poll_loop() -> None:  # pragma: no cover - non-terminating background daemon (sleeps INITIAL_DELAY then polls forever); each tick delegates to _poll_once, which is unit-tested directly
     time.sleep(INITIAL_DELAY_SECONDS)
     try:
         bc = importlib.import_module("bobert_companion")

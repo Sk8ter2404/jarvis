@@ -72,7 +72,7 @@ import time
 try:
     import pystray
     from PIL import Image, ImageDraw
-except Exception as e:
+except Exception as e:  # pragma: no cover - import-time hard-dep guard; tests inject a fake pystray so the real import never fails here
     print(f"[tray] missing dependency: {e}")
     print("[tray] install with:  pip install pystray pillow")
     sys.exit(1)
@@ -82,13 +82,13 @@ try:
     import tkinter as tk
     from tkinter import simpledialog
     _HAS_TK = True
-except Exception:
+except Exception:  # pragma: no cover - import-time optional-dep guard (tkinter absent on stripped Python); not reachable once the module has imported
     _HAS_TK = False
 
 try:
     import psutil
     _HAS_PSUTIL = True
-except Exception:
+except Exception:  # pragma: no cover - import-time optional-dep guard (psutil absent); not reachable once the module has imported
     _HAS_PSUTIL = False
 
 PROJECT_DIR        = os.path.dirname(os.path.abspath(__file__))
@@ -811,7 +811,7 @@ def _read_version_and_upgrade() -> tuple[str, str]:
                             ver, _, rest = after_hash.partition("—")
                             version = ver.strip()
                             upgrade_at = rest.strip()
-                        except Exception:
+                        except Exception:  # pragma: no cover - defensive; str slice/partition/strip on a matched line cannot raise
                             pass
                         break
     except Exception:
@@ -1572,5 +1572,5 @@ def main():
         print("[tray] exited")
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - CLI entrypoint; never run under unittest
     main()

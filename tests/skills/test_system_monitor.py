@@ -10,6 +10,7 @@ test _build_report and the graceful psutil-missing degradation instead.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import sys
@@ -518,6 +519,27 @@ class SystemMonitorLoopTests(unittest.TestCase):
                 self.mod._monitor_loop()
         self.assertTrue(seen["poll_sleep"])
         logexc.assert_called()
+
+
+class SystemMonitorImportGuardTests(unittest.TestCase):
+    def test_path_bootstrap_inserts_project_root(self):
+        # Re-exec the source with the project root removed from sys.path so the
+        # `if _PROJECT_DIR not in sys.path: sys.path.insert(...)` guard runs.
+        # core.atomic_io is already cached, so the from-import still resolves.
+        mod, _ = load_skill_isolated("system_monitor")
+        path = mod.__file__
+        proj = os.path.dirname(os.path.dirname(path))
+        spec = importlib.util.spec_from_file_location("system_monitor_reexec", path)
+        m = importlib.util.module_from_spec(spec)
+        m.skill_utils = {}
+        saved = list(sys.path)
+        try:
+            sys.path[:] = [p for p in sys.path
+                           if os.path.abspath(p) != os.path.abspath(proj)]
+            spec.loader.exec_module(m)
+            self.assertIn(m._PROJECT_DIR, sys.path)
+        finally:
+            sys.path[:] = saved
 
 
 class SystemMonitorRegisterTests(unittest.TestCase):

@@ -16,6 +16,8 @@ addendum, announcement enqueue) are patched so only state transitions run.
 from __future__ import annotations
 
 import contextlib
+import importlib.util
+import os
 import sys
 import tempfile
 import types
@@ -796,6 +798,24 @@ class NightOwlEnterExitWiringTests(unittest.TestCase):
             out = self.mod._exit_night_owl(trigger="auto_morning")
         self.assertIn("Good morning", out)
         self.assertIn("Good morning", enq.call_args[0][0])
+
+
+class NightOwlImportGuardTests(unittest.TestCase):
+    def test_path_bootstrap_inserts_project_root(self):
+        mod, _ = load_skill_isolated("night_owl_mode")
+        path = mod.__file__
+        proj = os.path.dirname(os.path.dirname(path))
+        spec = importlib.util.spec_from_file_location("night_owl_reexec", path)
+        m = importlib.util.module_from_spec(spec)
+        m.skill_utils = {}
+        saved = list(sys.path)
+        try:
+            sys.path[:] = [p for p in sys.path
+                           if os.path.abspath(p) != os.path.abspath(proj)]
+            spec.loader.exec_module(m)
+            self.assertIn(m._PROJECT_DIR, sys.path)
+        finally:
+            sys.path[:] = saved
 
 
 if __name__ == "__main__":

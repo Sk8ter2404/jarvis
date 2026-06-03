@@ -16,6 +16,7 @@ so nothing reaches pending_speech.json.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import sys
@@ -72,6 +73,27 @@ class PrintCompanionMixin:
             os.rmdir(self.tmpdir)
         except OSError:
             pass
+
+
+class PrintCompanionImportGuardTests(unittest.TestCase):
+    def test_path_bootstrap_inserts_project_root(self):
+        # Re-exec the source with the project root removed from sys.path so the
+        # `if _PROJECT_DIR not in sys.path: sys.path.insert(...)` guard runs.
+        # core.atomic_io is cached, so the from-import still resolves.
+        mod, _ = load_skill_isolated("proactive_print_companion")
+        path = mod.__file__
+        proj = os.path.dirname(os.path.dirname(path))
+        spec = importlib.util.spec_from_file_location("ppc_reexec", path)
+        m = importlib.util.module_from_spec(spec)
+        m.skill_utils = {}
+        saved = list(sys.path)
+        try:
+            sys.path[:] = [p for p in sys.path
+                           if os.path.abspath(p) != os.path.abspath(proj)]
+            spec.loader.exec_module(m)
+            self.assertIn(m._PROJECT_DIR, sys.path)
+        finally:
+            sys.path[:] = saved
 
 
 class PrintCompanionHelperTests(PrintCompanionMixin, unittest.TestCase):
@@ -371,6 +393,18 @@ class PrintCompanionStripFilenameTests(PrintCompanionMixin, unittest.TestCase):
         mod, _a = self._load(bambu_state={"last_update": 0.0})
         self._fake._announced_milestones = "not-a-set"
         self.assertFalse(mod._bambu_already_announced(25))
+
+    def test_bambu_already_announced_getattr_error_swallowed(self):
+        # If reading bambu_monitor's _announced_milestones raises, the broad
+        # except swallows it and the gate returns False (don't trail).
+        mod, _a = self._load()
+
+        class _Boom:
+            def __getattr__(self, name):
+                raise RuntimeError("module torn down")
+
+        with mock.patch.object(mod, "_get_bambu_module", return_value=_Boom()):
+            self.assertFalse(mod._bambu_already_announced(25))
 
     def test_read_state_swallows_lock_error(self):
         mod, _a = self._load(bambu_state={"last_update": 5.0})

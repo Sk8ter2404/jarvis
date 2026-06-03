@@ -424,6 +424,23 @@ class AtomicWriteTests(_VoiceIdBase):
         leftovers = [f for f in os.listdir(self.tmp) if f.endswith(".tmp")]
         self.assertEqual(leftovers, [])
 
+    def test_inline_fallback_tmp_remove_failure_is_swallowed(self):
+        # Both os.replace AND the finally-block os.remove fail. The ORIGINAL
+        # OSError (from replace) must still propagate while the cleanup failure
+        # is swallowed by the inner except — i.e. a doubly-unlucky filesystem
+        # never masks the real write error with a cleanup error.
+        path = os.path.join(self.tmp, "doublefail.json")
+        boom_io = types.ModuleType("core.atomic_io")
+        boom_io._atomic_write_json = mock.MagicMock(
+            side_effect=RuntimeError("atomic_io down"))
+        replace_err = OSError("no rename")
+        with inject_modules(**{"core.atomic_io": boom_io}), \
+             mock.patch.object(vid.os, "replace", side_effect=replace_err), \
+             mock.patch.object(vid.os, "remove", side_effect=OSError("rm locked")):
+            with self.assertRaises(OSError) as cm:
+                vid._atomic_write_json(path, {"q": 9})
+        self.assertIs(cm.exception, replace_err)
+
     def test_inline_fallback_when_atomic_io_raises(self):
         # ``from core import atomic_io`` is satisfied from the already-imported
         # ``core`` package attribute, so blocking the import isn't enough to
@@ -697,6 +714,19 @@ class EnrollTests(_VoiceIdBase):
             res = vid.enroll_from_audio("", np.ones(16000, dtype=np.float32), 16000)
         # unavailable error wins (resemblyzer faked off)
         self.assertFalse(res["ok"])
+
+    def test_empty_slug_rejected_before_encoder_check(self):
+        # The "empty name" guard fires only when _slug() yields a falsy string.
+        # In practice _slug never does (it falls back to "speaker"), so patch it
+        # to "" to exercise the defensive guard — it must reject BEFORE the
+        # is_available()/embedding work (here is_available would say True).
+        with mock.patch.object(vid, "_slug", return_value=""), \
+             mock.patch.object(vid, "is_available", return_value=True) as avail:
+            res = vid.enroll_from_audio("whatever",
+                                        np.ones(16000, dtype=np.float32), 16000)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], "empty name")
+        avail.assert_not_called()   # guarded out before the encoder check
 
     def test_unavailable_returns_error(self):
         with mock.patch.object(vid, "is_available", return_value=False):

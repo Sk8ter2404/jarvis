@@ -1465,6 +1465,64 @@ class SqliteErrorPathTests(_TempDataBase):
             # Outer except catches the re-raised COMMIT error → returns 0.
             self.assertEqual(self.mod._backfill_sqlite_from_jsonl_if_empty(), 0)
 
+    def test_backfill_double_checked_lock_returns_when_set_under_lock(self):
+        # is_set() False at the outer guard but True once we hold the lock →
+        # the inner re-check short-circuits (covers the double-checked-locking
+        # guard against a concurrent backfiller).
+        self._write_jsonl([self._event(1.0)])
+        seq = iter([False, True])     # outer check, then inner check
+        with mock.patch.object(self.mod._backfill_done, "is_set",
+                               side_effect=lambda: next(seq)):
+            self.assertEqual(self.mod._backfill_sqlite_from_jsonl_if_empty(), 0)
+
+    def test_backfill_rollback_failure_is_swallowed(self):
+        # COMMIT raises → ROLLBACK runs; ROLLBACK *also* raising must be
+        # swallowed by the inner except, then the original error re-raised and
+        # caught by the outer except → returns 0.
+        self._write_jsonl([self._event(1.0)])
+        real_conn = self.mod._connect_db
+
+        class _Wrap:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def execute(self, sql, *a, **k):
+                if sql == "COMMIT":
+                    raise sqlite3.OperationalError("commit boom")
+                if sql == "ROLLBACK":
+                    raise sqlite3.OperationalError("rollback boom too")
+                return self._inner.execute(sql, *a, **k)
+
+            def close(self):
+                self._inner.close()
+
+        with mock.patch.object(self.mod, "_connect_db",
+                               side_effect=lambda: _Wrap(real_conn())):
+            self.assertEqual(self.mod._backfill_sqlite_from_jsonl_if_empty(), 0)
+
+    def test_save_weekly_digest_insert_error_swallowed(self):
+        # The INSERT OR REPLACE raising is caught (covers the save except).
+        real_conn = self.mod._connect_db
+
+        class _Wrap:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def execute(self, sql, *a, **k):
+                if sql.strip().startswith("INSERT OR REPLACE"):
+                    raise sqlite3.OperationalError("save boom")
+                return self._inner.execute(sql, *a, **k)
+
+            def close(self):
+                self._inner.close()
+
+        self.mod._connect_db().close()   # ensure schema exists
+        with mock.patch.object(self.mod, "_connect_db",
+                               side_effect=lambda: _Wrap(real_conn())):
+            self.mod._save_weekly_digest({"week_start": "2026-05-25",
+                                          "computed_at": 1.0,
+                                          "clusters": []})   # no raise
+
     def test_prune_sqlite_events_query_error_swallowed(self):
         real_conn = self.mod._connect_db
 
@@ -1534,6 +1592,107 @@ class SqliteErrorPathTests(_TempDataBase):
         self._write_jsonl(rows)
         digest = self.mod.compute_weekly_digest(now=now)
         self.assertEqual(digest["clusters"], [])
+
+    def test_weekly_digest_skips_row_when_monday_of_raises(self):
+        # A bucketing row whose _monday_of() raises is skipped (covers the
+        # per-row except in the bucket loop). We drive the JSONL fallback with
+        # one valid Friday-netflix set + _monday_of patched to raise on a
+        # sentinel ts, accepting all others.
+        now = 1_700_000_000.0
+        anchor = now
+        for _ in range(8):
+            if time.localtime(anchor).tm_wday == 4:
+                break
+            anchor -= 86400
+        rows = []
+        for w in range(3):
+            ts = anchor - w * 7 * 86400
+            d = time.strftime("%Y-%m-%d", time.localtime(ts))
+            rows.append({"ts": ts, "iso": "", "date": d, "dow": "Friday",
+                         "wd": 4, "hour": 20, "min": 30, "action": "netflix",
+                         "arg": "show"})
+        # A poison ts that is INSIDE the lookback window (so it survives the
+        # cutoff filter and reaches the bucket loop) but on which _monday_of
+        # will choke.
+        poison_ts = anchor - 100.0
+        rows.append({"ts": poison_ts, "iso": "", "date": "2026-01-02",
+                     "dow": "Friday", "wd": 4, "hour": 20, "min": 30,
+                     "action": "netflix", "arg": "show"})
+        self._write_jsonl(rows)
+        real_monday = self.mod._monday_of
+
+        def _monday(ts):
+            if ts == poison_ts:
+                raise ValueError("bad ts for monday")
+            return real_monday(ts)
+
+        with mock.patch.object(self.mod, "_monday_of", side_effect=_monday):
+            digest = self.mod.compute_weekly_digest(now=now)
+        # The poison row was skipped; the 3 good weeks still cluster.
+        nf = next(c for c in digest["clusters"] if c["action"] == "netflix")
+        self.assertEqual(nf["weeks_seen"], 3)
+
+
+class LoadLatestWeeklyDigestBranchTests(_TempDataBase):
+    def test_non_list_cluster_json_coerced_to_empty(self):
+        # cluster_data is valid JSON but an object, not a list → clusters=[].
+        conn = self.mod._connect_db()
+        try:
+            conn.execute(
+                "INSERT INTO weekly_summaries(week_start, computed_at, cluster_data) "
+                "VALUES (?,?,?)", ("2026-05-25", 123.0, '{"a": 1}'))
+        finally:
+            conn.close()
+        loaded = self.mod.load_latest_weekly_digest()
+        self.assertEqual(loaded["clusters"], [])
+        self.assertEqual(loaded["week_start"], "2026-05-25")
+
+    def test_select_error_returns_empty(self):
+        # The SELECT raising → outer except → {} (and the finally closes).
+        real_conn = self.mod._connect_db
+
+        class _Wrap:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def execute(self, sql, *a, **k):
+                if sql.strip().startswith("SELECT"):
+                    raise sqlite3.OperationalError("select boom")
+                return self._inner.execute(sql, *a, **k)
+
+            def close(self):
+                self._inner.close()
+
+        # Seed a row first via the real connection so the table exists.
+        self.mod._connect_db().close()
+        with mock.patch.object(self.mod, "_connect_db",
+                               side_effect=lambda: _Wrap(real_conn())):
+            self.assertEqual(self.mod.load_latest_weekly_digest(), {})
+
+
+class AggregatePreciseNonIntGuardTests(_TempDataBase):
+    def test_precise_loop_skips_non_int_hour(self):
+        # An event with a non-int hour but truthy action+date reaches the
+        # precise-loop type guard (line ~567-568) and is skipped, while a clean
+        # cluster still forms.
+        events = []
+        base = time.time() - 20 * 86400
+        for day in range(14):
+            ts = base + day * 86400
+            d = time.strftime("%Y-%m-%d", time.localtime(ts))
+            events.append({"ts": ts, "date": d, "dow": "", "wd": 0,
+                           "hour": 9, "min": 15, "action": "check_teams",
+                           "arg": ""})
+        # Non-int hour for the SAME action → skipped by the precise guard.
+        events.append({"ts": base, "date": "2026-02-02", "dow": "", "wd": 0,
+                       "hour": "nine", "min": 15, "action": "check_teams",
+                       "arg": ""})
+        self._write_jsonl(events)
+        snap = self.mod.aggregate()
+        teams = next((p for p in snap["precise"]
+                      if p["action"] == "check_teams"), None)
+        self.assertIsNotNone(teams)
+        self.assertEqual(teams["center_clock"], "09:15")
 
 
 if __name__ == "__main__":

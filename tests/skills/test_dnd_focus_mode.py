@@ -462,6 +462,22 @@ class TeamsPresenceTests(unittest.TestCase):
                                side_effect=OSError("connection reset")):
             self.assertFalse(self.mod._set_teams_presence("DoNotDisturb"))
 
+    def test_http_error_body_read_failure_swallowed(self):
+        # On an HTTPError, the handler tries to read the response body for the
+        # log line; if THAT read() raises, the inner `except Exception: pass`
+        # swallows it and the function still returns False cleanly.
+        import urllib.error
+
+        class _BadBodyHTTPError(urllib.error.HTTPError):
+            def read(self, *a, **k):
+                raise OSError("socket already closed")
+
+        err = _BadBodyHTTPError("url", 500, "Server Error", {}, None)
+        with inject_modules(**{"skills.ms_graph": self._graph()}), \
+             mock.patch.object(self.mod.urllib.request, "urlopen",
+                               side_effect=err):
+            self.assertFalse(self.mod._set_teams_presence("DoNotDisturb"))
+
     def test_falls_back_to_sys_modules_skill_ms_graph(self):
         # When `skills.ms_graph` is unimportable, the helper consults the
         # already-loaded skill_ms_graph entry in sys.modules.

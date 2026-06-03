@@ -5,6 +5,7 @@ the addendum text. This logic ran on every utterance with zero test coverage
 before the extraction."""
 import datetime
 import unittest
+from unittest import mock
 
 import core.tone_detector as td
 
@@ -13,6 +14,23 @@ class DetectToneTests(unittest.TestCase):
     def test_none_for_empty(self):
         self.assertIsNone(td.detect_tone(""))
         self.assertIsNone(td.detect_tone("   "))
+
+    def test_none_when_text_is_only_non_letters(self):
+        # A non-empty utterance that reduces to "" after the letter-only clean
+        # (digits / punctuation only) returns None, not a tone.
+        self.assertIsNone(td.detect_tone("12345 !!! ..."))
+
+    def test_prev_user_text_str_failure_is_swallowed(self):
+        # detect_tone guards the cross-turn similarity check: if coercing/parsing
+        # prev_user_text raises, it degrades to "not similar" rather than
+        # propagating. A prev whose __str__ blows up exercises that except.
+        class Boom:
+            def __str__(self):
+                raise ValueError("cannot stringify")
+
+        # Plain neutral current text → without the (failed) similarity signal it
+        # classifies as None; the point is that it does not raise.
+        self.assertIsNone(td.detect_tone("open the notes", prev_user_text=Boom()))
 
     def test_frustrated_repetition_phrase(self):
         self.assertEqual(td.detect_tone("I said turn it off"), "frustrated")
@@ -52,6 +70,17 @@ class LateNightTests(unittest.TestCase):
         self.assertFalse(td._is_late_night_hour(datetime.datetime(2026, 1, 1, 14, 0)))
         self.assertFalse(td._is_late_night_hour(datetime.datetime(2026, 1, 1, 21, 59)))
         self.assertFalse(td._is_late_night_hour(datetime.datetime(2026, 1, 1, 5, 0)))
+
+    def test_neutral_text_late_night_fallback(self):
+        # A neutral utterance with no tone signal falls back to 'late_night'
+        # ONLY when the clock is in the band. _is_late_night_hour() reads the
+        # wall clock with no arg here, so patch it to make the branch deterministic.
+        with mock.patch.object(td, "_is_late_night_hour", return_value=True):
+            self.assertEqual(td.detect_tone("open the notes"), "late_night")
+
+    def test_neutral_text_daytime_is_none(self):
+        with mock.patch.object(td, "_is_late_night_hour", return_value=False):
+            self.assertIsNone(td.detect_tone("open the notes"))
 
 
 class AddendumTests(unittest.TestCase):

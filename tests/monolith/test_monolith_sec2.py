@@ -435,6 +435,25 @@ class RefreshDevicesTests(_MonolithSec2Base):
             sd._terminate.assert_not_called()
         self.assertGreater(self.bc._device_cache["checked_at"], 0.0)
 
+    def test_inlock_recheck_returns_when_peer_just_refreshed(self):
+        # 3872-3873: the pre-lock time gate passes (checked_at stale), but a
+        # peer thread refreshes the cache during the _devices_signature()
+        # snapshot — modelled by stamping checked_at fresh from that mock — so
+        # the in-lock re-check short-circuits before any query/_terminate.
+        self.bc._device_cache["checked_at"] = 0.0
+        sd = mock.Mock()
+
+        def _sig_then_peer_refresh():
+            # Simulate the race: another caller refreshed while we snapshotted.
+            self.bc._device_cache["checked_at"] = time.time()
+            return ((0, "Mic", 1, 0),)
+        with mock.patch.object(self.bc, "sd", sd), \
+                mock.patch.object(self.bc, "_devices_signature",
+                                  side_effect=_sig_then_peer_refresh):
+            self.bc._refresh_devices(force=False)
+        sd.query_devices.assert_not_called()
+        sd._terminate.assert_not_called()
+
     def test_record_speech_active_defers_reinit(self):
         # Drift present (force=True bypasses sig short-circuit) but record_speech
         # owns the mic → the destructive sd._terminate() must be skipped.

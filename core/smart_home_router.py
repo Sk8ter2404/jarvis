@@ -279,8 +279,8 @@ def _extract_percent(text: str) -> int | None:
         try:
             n = int(m.group(1))
             return max(0, min(100, n))
-        except ValueError:
-            return None
+        except ValueError:  # pragma: no cover - unreachable: int() on a \d+ regex group (Unicode Nd) always parses; only superscript/No digits raise and \d never matches those
+            return None  # pragma: no cover - see above
     m = re.search(r"\b([a-z\-]+)\s+percent\b", text)
     if m:
         n = _parse_number(m.group(1))
@@ -297,16 +297,16 @@ def _extract_temperature(text: str) -> int | None:
             n = int(m.group(1))
             if 40 <= n <= 110:
                 return n
-        except ValueError:
-            pass
+        except ValueError:  # pragma: no cover - unreachable: int() on a \d{2,3} regex group (Unicode Nd) always parses; \d never matches superscript/No digits
+            pass  # pragma: no cover - see above
     m = re.search(r"\b(\d{2,3})\s*(?:°|degrees?|deg)\b", text)
     if m:
         try:
             n = int(m.group(1))
             if 40 <= n <= 110:
                 return n
-        except ValueError:
-            pass
+        except ValueError:  # pragma: no cover - unreachable: int() on a \d{2,3} regex group (Unicode Nd) always parses; \d never matches superscript/No digits
+            pass  # pragma: no cover - see above
     return None
 
 
@@ -329,8 +329,8 @@ def _extract_color_temperature(text: str) -> int | None:
         return None
     try:
         k = int(m.group(1))
-    except ValueError:
-        return None
+    except ValueError:  # pragma: no cover - unreachable: int() on a \d{4} regex group (Unicode Nd) always parses; \d never matches superscript/No digits
+        return None  # pragma: no cover - see above
     return max(2000, min(6500, k))
 
 
@@ -515,9 +515,10 @@ def _resolve_devices(descriptor: str, catalog: dict,
         if typed:
             scored = typed
     scored.sort(key=lambda ds: -ds[1])
-    best = scored[0][1]
-    # If the descriptor is plural (mentions "lights"/"all"/"every"), return
-    # every device tied for best score — i.e. the whole matching room.
+    # If the descriptor is plural (mentions "lights"/"all"/"every"), fan out to
+    # the whole matching room: every matched device sharing the top match's
+    # room and type. (Don't filter on score equality — the name-match bonus in
+    # _match_score means roommates can score differently yet still belong.)
     plural = any(w in (descriptor or "").lower()
                  for w in ("lights", "lamps", "all ", "every "))
     if plural:

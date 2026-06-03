@@ -33,6 +33,7 @@ writes (state save mocked or redirected to a temp dir), no threads, no sleeps.
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import json
 import os
 import sys
@@ -152,6 +153,46 @@ def _fake_requests(resp=None, raise_exc=None):
         mod.post = mock.MagicMock(return_value=resp or _Resp(200))
         mod.get = mock.MagicMock(return_value=resp or _Resp(200))
     return mod
+
+
+class PhoneBridgeImportGuardTests(unittest.TestCase):
+    """Module-load-time guards: the sys.path bootstrap and the fail-closed
+    draft_confirm fallback when core.draft_confirm can't be imported."""
+
+    def _reexec(self, *, drop_root, block_draft_confirm):
+        mod, _ = load_skill_isolated("phone_bridge")
+        path = mod.__file__
+        proj = os.path.dirname(os.path.dirname(path))
+        real_import = __import__
+
+        def _imp(name, *a, **k):
+            if block_draft_confirm and name == "core.draft_confirm":
+                raise ImportError("blocked core.draft_confirm")
+            return real_import(name, *a, **k)
+
+        spec = importlib.util.spec_from_file_location("phone_bridge_reexec", path)
+        m = importlib.util.module_from_spec(spec)
+        m.skill_utils = {}
+        saved = list(sys.path)
+        try:
+            if drop_root:
+                sys.path[:] = [p for p in sys.path
+                               if os.path.abspath(p) != os.path.abspath(proj)]
+            with mock.patch("builtins.__import__", side_effect=_imp):
+                spec.loader.exec_module(m)
+        finally:
+            sys.path[:] = saved
+        return m
+
+    def test_path_bootstrap_inserts_project_root(self):
+        m = self._reexec(drop_root=True, block_draft_confirm=False)
+        self.assertIn(m._PROJECT_DIR, sys.path)
+
+    def test_draft_confirm_import_failure_fails_closed(self):
+        # When core.draft_confirm can't be imported, draft_confirm is set to
+        # None so gated pushes fail closed.
+        m = self._reexec(drop_root=False, block_draft_confirm=True)
+        self.assertIsNone(m.draft_confirm)
 
 
 class WhitelistTests(unittest.TestCase):
