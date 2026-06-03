@@ -1,7 +1,7 @@
 # Contributing to JARVIS
 
 Thanks for trying JARVIS! Bug reports, skill contributions, and portability
-fixes are all welcome. It's a beta — rough edges are expected.
+fixes are all welcome. Rough edges are expected — it's a personal project shared as-is.
 
 ## Reporting a bug
 

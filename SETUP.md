@@ -28,7 +28,15 @@ extras only when you want the feature that needs them.
 
 ## 3. Configure
 
-Copy the template and fill in at least your Claude key and your name:
+Quickest path — the guided **setup wizard** writes `.env` (your API key) and
+`data/user_settings.json` (the high-impact toggles):
+
+```powershell
+python tools/setup_wizard.py
+```
+
+Or configure by hand — copy the template and fill in at least your Claude key
+and your name:
 
 ```powershell
 copy .env.example .env
@@ -54,7 +62,7 @@ It loads Whisper + all skills, then reaches a listening standby. Try:
 | Say | Expect |
 |---|---|
 | "JARVIS, what time is it" | the current time |
-| "JARVIS, what version are you on" | `1.3.0` |
+| "JARVIS, what version are you on" | `1.4.0` |
 | "JARVIS, give me a system status report" | live CPU/RAM/GPU stats |
 
 Prefer to try it **without** using your mic/speakers? Boot the muted, mic-less
@@ -76,6 +84,10 @@ python tools/staging_integration.py -v
   `http://localhost:8188`; JARVIS auto-detects it.
 - **Wake word** ("Hey JARVIS"): set `PORCUPINE_ACCESS_KEY` (free at
   https://console.picovoice.ai/). Otherwise use the inject path / push-to-talk.
+- **Realtime voice / neural wake** (optional, low-latency): set
+  `JARVIS_VOICE_MODE=realtime` and/or `JARVIS_WAKE_WORD_AUTOSTART=1`. These need
+  the optional `RealtimeSTT` / `RealtimeTTS` / `openwakeword` packages and fall
+  back automatically if absent.
 
 ## 6. Optional integrations
 
@@ -104,3 +116,19 @@ one-time auth step you run from a terminal (not by voice):
   tracks failing components.
 
 Found a real bug? See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## 8. Updating
+
+JARVIS checks GitHub for a newer release on boot and speaks a heads-up when one
+is available, and you can ask **"JARVIS, check for updates"** any time. For a
+**private** repo, set `JARVIS_GITHUB_TOKEN` (a fine-grained token with read-only
+**Contents** access) so the check can reach the Releases API.
+
+To apply an update:
+
+```powershell
+python tools/update_wizard.py        # check -> fast-forward -> re-run tests -> restart
+```
+
+It only fast-forwards (never clobbers local changes), re-runs the test gate, and
+prints an exact rollback command if anything looks off.

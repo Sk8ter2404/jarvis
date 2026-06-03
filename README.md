@@ -12,7 +12,7 @@ across conversations.
         persistent memory across conversations   + a self-diagnostic loop
 ```
 
-> **Status: `1.3.0`.** This is a personal project shared for
+> **Status: `1.4.0`.** This is a personal project shared for
 > others to try. It's Windows-focused, expects some setup (your own API keys,
 > optional hardware), and is provided as-is. Expect rough edges — and please
 > file issues.
@@ -49,9 +49,9 @@ recommended for fast local Whisper but not required.
 # 1. Install dependencies
 python -m pip install -r requirements.txt
 
-# 2. Configure (copy the template, then fill in at least ANTHROPIC_API_KEY)
-copy .env.example .env
-notepad .env            # or set the vars as Windows User environment variables
+# 2. Configure — guided wizard (writes .env + data/user_settings.json):
+python tools/setup_wizard.py
+#    ...or by hand: copy .env.example .env  then fill in at least ANTHROPIC_API_KEY
 
 # 3. Run
 python bobert_companion.py
@@ -72,6 +72,19 @@ is in **[`SETUP.md`](SETUP.md)**. Every configurable key is documented in
 
 ---
 
+## Updating
+
+JARVIS checks GitHub for a newer release on boot and speaks a one-line heads-up
+when one's available (set `JARVIS_GITHUB_TOKEN` so it can reach a private repo).
+To apply an update, run the wizard — it fast-forwards, re-runs the test gate, and
+tells you to restart:
+
+```powershell
+python tools/update_wizard.py          # --check to just look, --yes to skip the prompt
+```
+
+---
+
 ## Architecture (one minute)
 
 - **`bobert_companion.py`** — the entrypoint and main loop (capture → LLM →
@@ -81,7 +94,11 @@ is in **[`SETUP.md`](SETUP.md)**. Every configurable key is documented in
 - **`skills/`** — ~78 self-contained skills. Each defines `register(actions)` and
   is loaded dynamically at boot. Drop a new `.py` in here to teach JARVIS a trick.
 - **`hud/`** — optional on-screen HUD overlays (tkinter / PyQt).
-- **`tools/`** — dev tooling: test runner, codebase auditor, coverage, etc.
+- **`tools/`** — dev tooling: test runner, codebase auditor, coverage, the
+  **Settings GUI** (`settings_window.py`), and the setup / update wizards.
+- Optional **realtime streaming voice + neural wake-word** (flag-gated via
+  `JARVIS_VOICE_MODE` / `JARVIS_WAKE_WORD_AUTOSTART`), a **system-tray** applet,
+  and on-screen HUD overlays.
 
 ---
 

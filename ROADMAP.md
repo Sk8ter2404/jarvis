@@ -14,16 +14,22 @@ Status: ☐ todo · ◐ in progress · ☑ done.
 ## Where it stands today
 
 ~101K-LOC local-first Windows voice assistant. `mic → Whisper → Claude emits
-[ACTION: …] → ~150 handlers → edge-TTS`. Public `v1.3.0`; the self-upgrade
-pipeline has internally iterated it to ~v1.0.17. **100% unit-test coverage,
+[ACTION: …] → ~150 handlers → edge-TTS`. Public `v1.4.0` (all releases kept,
+`v1.0.0-beta.1` → `v1.4.0`); the self-upgrade pipeline's internal CHANGELOG
+counter (~v1.0.17) is a SEPARATE axis. **100% unit-test coverage,
 CI-green.** Genuinely strong: mature voice stack, cloud-optional (full local
 fallback on a 3090), dual-store memory + personal-files RAG, a rich proactive
 layer (ambient listen, "Chappie" silent learner, briefings, anticipation), the
 Bambu 3D-printer companion, and self-rewriting via a multi-agent pipeline.
 
 Central tension: a feature-rich, incident-hardened system wrapped around a
-**14.7K-line mutable-global monolith an LLM edits ~20×/day** — and the two things
+**~15K-line mutable-global monolith an LLM edits ~20×/day** — and the two things
 felt most (latency, self-upgrade safety) have the clearest gaps.
+
+**Recently shipped (1.1 → 1.3):** realtime voice + neural wake flag-wired (F1/F2),
+the tray overhaul + standalone Settings GUI, the M3 self-upgrade safety gates, an
+**update checker** (boot nudge + the `check for updates` action), an **update
+wizard**, a first-run **setup wizard**, and an automatic **PII pre-commit guard**.
 
 ---
 
@@ -68,19 +74,25 @@ scariest finding. The 100% test suite is the missing correctness gate.
 - ☐ **Refuse autonomous runs when safety nets are disabled** (`STABILITY_GATE_DISABLE`
   / `JARVIS_PIPELINE_SKIP_TESTER` currently silent).
 
-### M4 · Productize for distribution  ☐
+### M4 · Productize for distribution  ◐
 Today it's "clone + pip + GPU + many env vars" into **global Python 3.14** (~7GB
 wheels, fragile CUDA DLL registration, missing 3.14 wheels). → venv + pinned
 deps + frozen installer + a no-GPU/CPU-fallback profile.
+- ☑ Shipped: first-run **setup wizard**, **Settings GUI**, **update checker +
+  update wizard**, **PII pre-commit guard** — directly addressing the
+  env-var / onboarding pain. Remaining: venv + pinned deps + frozen installer +
+  a CPU-fallback profile.
 
 ---
 
 ## 🟡 0.1.0 — Feature
 
-- **F1 · Flip on realtime streaming voice** (`core/realtime_voice.py`) — *built,
-  gated off*; fastest latency win available. ☐
-- **F2 · Activate the neural wake detector** (`core/wake_word.py`; stop paying
-  Whisper to listen for one word). ☐
+- **F1 · Realtime streaming voice** (`core/realtime_voice.py`) — built + flag-wired
+  via `core/voice_pipeline.py` (`JARVIS_VOICE_MODE=realtime`), default-off, safe
+  fallback. The native always-on service (M1) is still the bigger latency win. ◐
+- **F2 · Neural wake detector** (`core/wake_word.py`) — built + flag-wired
+  (`JARVIS_WAKE_WORD_AUTOSTART`), default-off; stops paying Whisper to listen for
+  one word once enabled. ◐
 - **F3 · Real Claude tool-use API** instead of `[ACTION: name, arg]` text parsing
   (fewer hallucination guards, more robust). ☐
 - **F4 · Wire the dead orchestrator sub-agents** — `calendar_scanner` is inert
@@ -108,7 +120,7 @@ deps + frozen installer + a no-GPU/CPU-fallback profile.
 - ☐ Harden CUDA DLL registration (silently regresses to CPU); fix camera-probe
   blocking 20–30s on a missing/busy cam.
 - ☐ Move ~50 `*_state.json` files out of the project root into `data/`.
-- ☐ Fix `FEATURES.md` undercount (says 35 skills / 6 HUDs; reality 78 / 10).
+- ☑ `FEATURES.md` skill/HUD counts corrected (78 skills / 10 HUDs).
 
 ---
 
