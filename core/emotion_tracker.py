@@ -284,7 +284,6 @@ def classify_emotion(
     raw = text.strip()
     excl_count = raw.count("!")
     n_words = len(clean.split())
-    sentence_len = len(raw)
 
     p = prosody or ProsodyHints()
     loud_spike = _is_loud_spike(p)

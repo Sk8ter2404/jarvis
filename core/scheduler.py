@@ -52,7 +52,7 @@ import os
 import threading
 import time
 from datetime import datetime, timedelta
-from typing import Any, Callable, Iterable
+from typing import Any, Callable
 
 
 _log = logging.getLogger("jarvis.scheduler")

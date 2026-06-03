@@ -1347,7 +1347,7 @@ def _act_where_is_user(_: str = "") -> str:
             if age is None:
                 state = "never seen user"
             elif age < 3.0:
-                state = f"sees user NOW (face visible)"
+                state = "sees user NOW (face visible)"
             elif age < 10.0:
                 state = f"saw user {age:.1f}s ago"
             else:
@@ -1428,7 +1428,7 @@ def _act_see_screen(question: str) -> str:
     png = bc.take_screenshot(monitor=monitor)
     if png is None:
         return "could not capture screen"
-    print(f"  [vision] Asking Claude (this takes a few seconds)...", flush=True)
+    print("  [vision] Asking Claude (this takes a few seconds)...", flush=True)
     result = bc.ask_vision(q, png)
     print(f"  [vision] Got answer ({len(result)} chars)", flush=True)
     bc._push_screen_context(monitor, q, result, {monitor: png})
@@ -1592,9 +1592,9 @@ def _act_see_user(camera_hint: str = "") -> str:
         "their posture, expression, what they're wearing, and anything notable "
         "in the background."
     )
-    print(f"  [vision] Analyzing user image...", flush=True)
+    print("  [vision] Analyzing user image...", flush=True)
     result = bc.ask_vision(question, png_bytes)
-    print(f"  [vision] Got description", flush=True)
+    print("  [vision] Got description", flush=True)
     if frame_age is not None and frame_age > 5.0:
         note = (f"(note: camera {best_idx} frame is {frame_age:.1f}s old; "
                 f"last read error: {last_err})" if last_err else
@@ -1642,16 +1642,16 @@ def _act_which_monitor(_: str = "") -> str:
 
     if sides_seen == {"left"}:
         target = "left" if "left" in MONITORS else None
-        return f"facing LEFT monitor" + (f" ({target})" if target else "")
+        return "facing LEFT monitor" + (f" ({target})" if target else "")
     if sides_seen == {"right"}:
         target = "right" if "right" in MONITORS else None
-        return f"facing RIGHT monitor" + (f" ({target})" if target else "")
+        return "facing RIGHT monitor" + (f" ({target})" if target else "")
 
     # Both sides see user -> middle area. Use vision to disambiguate middle vs top.
     if frame_for_vision is None or "top" not in MONITORS:
         return "facing middle/forward (top monitor not configured)"
 
-    print(f"  [vision] Checking head tilt for top monitor...", flush=True)
+    print("  [vision] Checking head tilt for top monitor...", flush=True)
     ok, buf = cv2.imencode(".png", frame_for_vision)
     if not ok:
         return "facing middle (couldn't check head tilt)"
@@ -2337,7 +2337,7 @@ def _act_find_on_screen(description: str) -> str:
     print(f"  [vision] Looking for '{description}'{target}...", flush=True)
     coords = bc.find_click_target(description, monitor=monitor)
     if coords is None:
-        print(f"  [vision] Not found", flush=True)
+        print("  [vision] Not found", flush=True)
         return f"could not find '{description}' on screen"
     print(f"  [vision] Found at {coords}", flush=True)
     return f"found at {coords[0]},{coords[1]}"

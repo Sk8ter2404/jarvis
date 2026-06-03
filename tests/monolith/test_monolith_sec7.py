@@ -412,6 +412,16 @@ class HandleSleepStandbyTests(SectionSevenBase):
         self._p(self.bc, "_heartbeat")
         # Default: ambient learning off, wake never refused by music.
         self._p(self.bc, "_audio_music_should_refuse_wake", return_value=False)
+        # Force the neural wake fast-path OFF (returns None) so the mic-path
+        # tests deterministically exercise the Whisper-transcribe branch on ANY
+        # host. _handle_sleep_standby calls _standby_wake_detected(audio) BEFORE
+        # transcribe(); only a None return (the neural-disabled default) falls
+        # through to the mocked transcribe — a real return (True/False) sets
+        # text directly and skips it. Without this, a box with WAKE_WORD_AUTOSTART
+        # on builds a real detector that returns False on the silent test buffer,
+        # so transcribe is never reached and the wake assertion fails. Mirrors
+        # voice-wiring's test_default_flags_use_whisper_path_selector_not_engaged.
+        self._p(self.bc, "_standby_wake_detected", return_value=None)
         # Standby starts asleep so the wake path has something to clear.
         self.bc._sleep_mode[0] = True
         self.bc._standby_mode[0] = True
