@@ -551,6 +551,41 @@ class ParseAndRunActionsTests(SectionSixBase):
         self.assertIn("failed", msg.lower())
         self.assertFalse(informative)
 
+    def test_action_exception_files_scrubbed_bug_report(self):
+        # The dispatcher's except block also self-files a scrubbed, rate-limited
+        # bug report (core.bug_reporter.auto_capture) for the failing action.
+        bc = self.bc
+        import core.bug_reporter as br
+
+        def boom(_arg):
+            raise ValueError("kaboom")
+
+        self._with_action("boomer2", boom)
+        with mock.patch.object(bc, "_needs_confirmation", lambda n, a: False), \
+             mock.patch.object(bc, "_jarvis_pushback", lambda n, a: None), \
+             mock.patch.dict(bc.os.environ, {"JARVIS_BUG_AUTO_CAPTURE": "1"}), \
+             mock.patch.object(br, "auto_capture") as cap:
+            bc.parse_and_run_actions("[ACTION: boomer2, x]")
+        cap.assert_called_once()
+        self.assertIsInstance(cap.call_args.args[0], ValueError)
+        self.assertEqual(cap.call_args.kwargs.get("where"), "boomer2")
+
+    def test_action_exception_bug_report_suppressible(self):
+        # JARVIS_BUG_AUTO_CAPTURE=0 disables the self-file hook.
+        bc = self.bc
+        import core.bug_reporter as br
+
+        def boom(_arg):
+            raise ValueError("kaboom")
+
+        self._with_action("boomer3", boom)
+        with mock.patch.object(bc, "_needs_confirmation", lambda n, a: False), \
+             mock.patch.object(bc, "_jarvis_pushback", lambda n, a: None), \
+             mock.patch.dict(bc.os.environ, {"JARVIS_BUG_AUTO_CAPTURE": "0"}), \
+             mock.patch.object(br, "auto_capture") as cap:
+            bc.parse_and_run_actions("[ACTION: boomer3, x]")
+        cap.assert_not_called()
+
     def test_dropped_step_appended_after_real_action(self):
         bc = self.bc
         # Run a real registered informative action AND promise a see_screen read
