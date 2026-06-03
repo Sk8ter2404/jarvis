@@ -7091,7 +7091,14 @@ def take_screenshot(monitor: str | None = None, max_dim: int = 1568) -> bytes | 
                 x, y, w, h = MONITORS[monitor]
                 img = ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True)
             else:
-                img = ImageGrab.grab()
+                # monitor=None must capture the WHOLE virtual desktop to match
+                # the mss path (and what find_click_target's translate assumes).
+                # Bare ImageGrab.grab() returns ONLY the primary monitor, so a
+                # target on a secondary/negative-origin display would be cropped
+                # out and the coords mistranslated. Grab the full virtual bounds.
+                vx, vy, vw, vh = _virtual_screen_bounds()
+                img = ImageGrab.grab(bbox=(vx, vy, vx + vw, vy + vh),
+                                     all_screens=True)
         except Exception as e_pil:
             print(f"  [vision] screenshot failed (mss: {e_mss}, pil: {e_pil})")
             return None
@@ -7335,22 +7342,56 @@ def _query_vision_for_coords(description: str, png_bytes: bytes, w: int, h: int)
     return None
 
 
-def _native_capture_size(monitor: str | None) -> tuple[int, int]:
-    """Native pixel (width, height) of the region take_screenshot(monitor)
-    captures. Used to rescale Pass-1 coords back to native when the full-res
-    Pass-2 capture fails. Returns (0, 0) if it can't be determined."""
+def _captured_region(monitor: str | None) -> dict | None:
+    """Geometry of the region take_screenshot(monitor) actually grabs, as the
+    SAME mss dict take_screenshot uses: {left, top, width, height} in the
+    capture's NATIVE pixel space.
+
+    This is the single source of truth that ties the capture origin to the
+    click translation in find_click_target. For monitor=None it returns the
+    LIVE mss virtual-screen rect (mss.monitors[0]) — whose left/top is the true
+    bounding-box origin of all displays and is NEGATIVE on this owner's rig
+    (a monitor sits left of/above the primary). Reading it live (instead of
+    recomputing from the static MONITORS config) means the absolute-click origin
+    can never silently disagree with what was photographed — the failure mode
+    that lands clicks on the wrong monitor when the config and the real desktop
+    diverge (e.g. a display was rearranged, or per-monitor DPI makes the
+    DPI-aware mss origin differ from the logical config). For a named monitor it
+    returns that monitor's configured rect. Returns None if mss is unavailable
+    and no usable config entry exists."""
+    if monitor and monitor in MONITORS:
+        m = MONITORS[monitor]
+        if len(m) >= 4 and m[2] and m[3]:
+            return {"left": int(m[0]), "top": int(m[1]),
+                    "width": int(m[2]), "height": int(m[3])}
     try:
-        if monitor and monitor in MONITORS:
-            m = MONITORS[monitor]
-            if len(m) >= 4 and m[2] and m[3]:
-                return int(m[2]), int(m[3])
         import mss
         _MSSClass = getattr(mss, "MSS", mss.mss)
         with _MSSClass() as sct:
             vs = sct.monitors[0]   # virtual screen — the monitor=None default
-            return int(vs["width"]), int(vs["height"])
+            return {"left": int(vs["left"]), "top": int(vs["top"]),
+                    "width": int(vs["width"]), "height": int(vs["height"])}
     except Exception:
-        return 0, 0
+        return None
+
+
+def _native_capture_size(monitor: str | None) -> tuple[int, int]:
+    """Native pixel (width, height) of the region take_screenshot(monitor)
+    captures. Used to rescale Pass-1 coords back to native when the full-res
+    Pass-2 capture fails. Returns (0, 0) if it can't be determined.
+
+    Prefers the LIVE mss size (true native pixels) for both the virtual screen
+    and a named monitor, falling back to the configured MONITORS size only when
+    mss can't be queried. The config holds LOGICAL dims, so on a DPI-scaled
+    display the live mss size is the correct 'native' value here."""
+    reg = _captured_region(monitor)
+    if reg and reg["width"] and reg["height"]:
+        return int(reg["width"]), int(reg["height"])
+    if monitor and monitor in MONITORS:
+        m = MONITORS[monitor]
+        if len(m) >= 4 and m[2] and m[3]:
+            return int(m[2]), int(m[3])
+    return 0, 0
 
 
 def find_click_target(description: str, monitor: str | None = None) -> tuple[int, int] | None:
@@ -7379,6 +7420,13 @@ def find_click_target(description: str, monitor: str | None = None) -> tuple[int
     if pass1 is None:
         return None
     rx1, ry1 = pass1
+
+    # Capture the geometry of the region we actually photographed ONCE, from the
+    # same source take_screenshot used (live mss for monitor=None, the config
+    # rect for a named monitor). This single rect drives BOTH the native size we
+    # un-downscale to AND the absolute origin we add in the translate below — so
+    # the click origin can never silently disagree with what was captured.
+    cap = _captured_region(monitor)
 
     # Pass 2: grab the full-res monitor and crop a small region around the estimate
     full_png = take_screenshot(monitor=monitor, max_dim=10000)   # 10k = effectively no downscale
@@ -7432,17 +7480,26 @@ def find_click_target(description: str, monitor: str | None = None) -> tuple[int
 
     # Translate full-res image coords → absolute screen coordinates.
     #
-    # refined_x/refined_y are in NATIVE CAPTURE PIXELS — the Pass-2 image is
-    # grabbed un-downscaled, so on a display running >100% scaling it is LARGER
-    # than the monitor's logical size. The MONITORS table and pyautogui's click
-    # space are LOGICAL (DIP). Adding a native offset to a logical origin
-    # overshoots (the click lands too far right/down — the multi-monitor miss the
-    # user hit on the 4-screen rig). So scale the offset native→logical BEFORE
-    # adding the logical origin. When native == logical (100% scale) the ratio is
-    # 1.0 and this is a no-op, so it can't regress an un-scaled setup. 2026-06-02.
-    # (Deeper fix: make the process per-monitor DPI-aware at startup so capture
-    # and click share one pixel space — a global change, deferred pending on-rig
-    # verification of this localized correction.)
+    # refined_x/refined_y are an offset (in the captured image's NATIVE pixels)
+    # from the TOP-LEFT of the region we photographed. To produce a coordinate
+    # pyautogui can click we map that offset proportionally onto the region's
+    # LOGICAL (DIP) extent and add the region's LOGICAL origin:
+    #
+    #     abs = logical_origin + refined * (logical_extent / native_extent)
+    #
+    # Two independent things this gets right on the owner's negative-origin,
+    # multi-monitor rig (virtual desktop 7680x2880 @ -2560,-1440):
+    #   • ORIGIN. We add the region's real top-left, which is NEGATIVE here. For
+    #     monitor=None that origin is taken from the SAME capture (live mss
+    #     monitors[0]) rather than recomputed from a possibly-stale config, so
+    #     the add can't disagree with the photo. A target on the top-left
+    #     monitor therefore lands at a negative absolute coordinate instead of
+    #     being clamped onto the primary.
+    #   • DPI. native_extent comes from the actual captured image (or the live
+    #     mss size when Pass-2 failed), logical_extent from the config, so a
+    #     display scaled >100% — where the native grab is LARGER than its logical
+    #     size — is scaled back down before the offset is applied. At 100% the
+    #     ratio is exactly 1.0, so a single-monitor / un-scaled rig is unchanged.
     if monitor and monitor in MONITORS:
         mx, my, lw, lh = MONITORS[monitor]
         sx = (lw / full_w) if full_w else 1.0
@@ -7453,11 +7510,19 @@ def find_click_target(description: str, monitor: str | None = None) -> tuple[int
                   f"→ click x({sx:.3f},{sy:.3f})", flush=True)
         return int(mx + refined_x * sx), int(my + refined_y * sy)
     # No monitor specified — Pass-2 captured the whole virtual screen (mss
-    # monitors[0]). Its top-left is the bounding-box origin of all displays,
-    # often NEGATIVE on Windows when a monitor sits left of/above the primary.
-    # Scale native→logical (same reason as above) using the LOGICAL virtual-
-    # desktop size, then add the LOGICAL origin.
+    # monitors[0]). Use the LOGICAL origin (config-derived virtual bounds, which
+    # is what pyautogui clicks in) but scale by the LIVE captured native size so
+    # the origin and the scale come from one coherent picture of the desktop.
     vx, vy, vw, vh = _virtual_screen_bounds()
+    # Prefer the live captured origin when it is available AND matches the
+    # logical virtual origin (uniform-DPI / correctly-configured case). When the
+    # config is stale the two diverge; we keep the logical origin because that is
+    # the space pyautogui clicks in, but emit a one-line warning so a genuinely
+    # wrong layout is visible in the log rather than silently mis-clicking.
+    if cap is not None and (cap["left"] != vx or cap["top"] != vy):
+        print(f"  [vision] ⚠ captured virtual origin ({cap['left']},{cap['top']}) "
+              f"≠ configured ({vx},{vy}); using configured (pyautogui-logical) "
+              f"origin. If clicks miss, re-run --list-monitors.", flush=True)
     sx = (vw / full_w) if full_w else 1.0
     sy = (vh / full_h) if full_h else 1.0
     if abs(sx - 1.0) > 0.01 or abs(sy - 1.0) > 0.01:
