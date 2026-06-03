@@ -49,6 +49,32 @@ class CodecTests(unittest.TestCase):
         self.assertEqual(msgs, [])
         self.assertEqual(rest, b"")
 
+    def test_oversized_prefix_skipped_and_stream_resyncs(self):
+        # A corrupt/oversized 4-byte length prefix (or a giant frame whose
+        # sender died mid-send) must NOT wedge the stream: the bad header is
+        # skipped (consumed) and the valid frames that follow still decode.
+        bad = bt._HEADER.pack(1_000_000_000)  # ~1 GiB, well over _MAX_FRAME
+        good = bt.encode_frame("event", "ok", {"n": 1})
+        msgs, rest = bt.decode_frames(bad + good + good)
+        self.assertEqual([m["name"] for m in msgs], ["ok", "ok"])
+        self.assertEqual(rest, b"")
+
+    def test_all_garbage_prefixes_consumed_not_retained(self):
+        # Every 4-byte window is an oversized prefix -> each is skipped; nothing
+        # is retained except the trailing sub-header remainder (< 4 bytes).
+        msgs, rest = bt.decode_frames(b"\xff" * 9)
+        self.assertEqual(msgs, [])
+        self.assertEqual(rest, b"\xff")  # 9 = two skipped headers + 1 leftover
+
+    def test_frame_at_cap_is_allowed_not_skipped(self):
+        # A declared length of EXACTLY _MAX_FRAME is legal (the cap is
+        # inclusive): an incomplete one is retained as leftover awaiting its
+        # large-but-valid body, NOT discarded as corrupt.
+        header = bt._HEADER.pack(bt._MAX_FRAME)
+        msgs, rest = bt.decode_frames(header)
+        self.assertEqual(msgs, [])
+        self.assertEqual(rest, header)
+
 
 class FrameReaderTests(unittest.TestCase):
     def test_streaming_reassembly(self):
@@ -58,6 +84,21 @@ class FrameReaderTests(unittest.TestCase):
         self.assertEqual(r.pending, 3)
         msgs = r.feed(frame[3:])
         self.assertEqual([m["name"] for m in msgs], ["hi"])
+        self.assertEqual(r.pending, 0)
+
+    def test_oversized_prefix_does_not_wedge_or_grow_unbounded(self):
+        # Regression: a corrupt giant length prefix used to make decode_frames
+        # return [] forever while `pending` climbed without bound, permanently
+        # wedging the connection. Now the bad header is consumed (pending back
+        # to 0) and every subsequent valid frame decodes normally.
+        r = bt.FrameReader()
+        self.assertEqual(r.feed(bt._HEADER.pack(1_000_000_000)), [])
+        self.assertEqual(r.pending, 0)  # bad prefix consumed, not retained
+        got = []
+        for i in range(11):
+            got += r.feed(bt.encode_frame("event", "tick", i))
+        self.assertEqual(len(got), 11)
+        self.assertEqual([m["payload"] for m in got], list(range(11)))
         self.assertEqual(r.pending, 0)
 
 
