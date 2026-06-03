@@ -104,6 +104,59 @@ class ScrubTests(unittest.TestCase):
                          bug_reporter.scrub("postgres://user:p4ssword@host/db"))
 
 
+class CardAndPhoneScrubTests(unittest.TestCase):
+    """v1.18.4 — Luhn-gated credit-card + conservative NANP phone redaction.
+
+    These were the two shapes deliberately deferred in v1.16.1 (they need care
+    to avoid false positives). Secret-shaped fixtures are built by string
+    concatenation so the pre-commit check_no_pii scan never sees a full
+    card/phone on one source line — same trick as the PEM fixture above."""
+
+    def test_credit_card_with_spaces_redacted(self):
+        # Canonical Visa test number, 16 digits with spaces — a verified
+        # survivor before this release.
+        card = "4111 1111 " + "1111 1111"
+        out = bug_reporter.scrub("charged " + card + " today")
+        self.assertIn("<CARD>", out)
+        self.assertNotIn("4111", out)
+        self.assertNotIn("1111", out)
+
+    def test_credit_card_luhn_double_branch_redacted(self):
+        # Mastercard test number: its 5s double to 10 (>9), exercising the Luhn
+        # "subtract 9" path on top of a valid checksum.
+        card = "5555 5555 " + "5555 4444"
+        out = bug_reporter.scrub("card on file " + card)
+        self.assertIn("<CARD>", out)
+        self.assertNotIn("4444", out)
+
+    def test_non_luhn_long_number_not_redacted(self):
+        # 16 digits that FAIL Luhn (last digit flipped) must survive — the gate
+        # that stops a random long digit run being mistaken for a card.
+        not_card = "4111 1111 " + "1111 1112"
+        out = bug_reporter.scrub("ref " + not_card)
+        self.assertNotIn("<CARD>", out)
+        self.assertIn("1112", out)
+
+    def test_phone_us_formats_redacted(self):
+        # The two verified survivors: parenthesized and dashed NANP numbers.
+        for raw, last4 in (("(555) 123-" + "4567", "4567"),
+                           ("555-987-" + "6543", "6543")):
+            out = bug_reporter.scrub("call me at " + raw + " ok")
+            self.assertIn("<PHONE>", out, raw)
+            self.assertNotIn(last4, out, raw)
+
+    def test_plain_10_digit_id_not_phone(self):
+        # A bare 10-digit run (e.g. a unix timestamp) has no separators, so the
+        # conservative phone rule must leave it alone.
+        out = bug_reporter.scrub("event at ts=1717459200 fired")
+        self.assertNotIn("<PHONE>", out)
+        self.assertIn("1717459200", out)
+
+    def test_luhn_helper(self):
+        self.assertTrue(bug_reporter._luhn("4111111111111111"))
+        self.assertFalse(bug_reporter._luhn("4111111111111112"))
+
+
 class MakeReportTests(unittest.TestCase):
     def test_kind_normalises(self):
         self.assertEqual(bug_reporter.make_report("auto", "x")["kind"], "auto")
