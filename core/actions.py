@@ -777,7 +777,19 @@ def _act_ambient_mode_set(active: bool) -> str:
     """Force ambient (silent-learning) mode on or off. Mirrors the tray
     dispatcher's ambient_mode_toggle branch so voice and tray follow the
     same code path. Persists ambient_mode_active to hud_state so the
-    setting survives a JARVIS bounce."""
+    setting survives a JARVIS bounce.
+
+    "Ambient mode" is meant to LEARN from what it overhears, so turning it on
+    must do two things, not one:
+      1. start the passive mic-transcription daemon (ambient_listen_start),
+         which now SHARES the main loop's mic via the record_speech tap so the
+         wake word keeps working, and
+      2. start the multimodal fact-EXTRACTOR daemon, which is what actually
+         distils the rolling transcripts into bobert_memory.json. Without (2)
+         the mic captured audio but nothing was ever learned — the user's
+         "i don't think it's even learning" symptom. The extractor is the same
+         one _act_ambient_learning_set starts; we skip it in staging so test
+         injects never write real memory."""
     bc = _bc()
     bc._ambient_mode_active[0] = bool(active)
     bc._write_hud_state(ambient_mode_active=bool(bc._ambient_mode_active[0]))
@@ -788,8 +800,22 @@ def _act_ambient_mode_set(active: bool) -> str:
             fn("")
         except Exception as e:
             return f"ambient daemon refused: {e}"
+    # Start / stop the fact-extractor alongside the mic daemon so ambient mode
+    # genuinely folds overheard speech into long-term memory.
+    _staging = getattr(bc, "_is_staging", lambda: False)
+    if not _staging():
+        _ext = sys.modules.get("skill_ambient_multimodal_extract")
+        if _ext is not None:
+            _ext_action = ("ambient_extract_start" if bc._ambient_mode_active[0]
+                           else "ambient_extract_stop")
+            _ext_fn = getattr(_ext, _ext_action, None)
+            if callable(_ext_fn):
+                try:
+                    _ext_fn("")
+                except Exception:
+                    pass
     state_word = "active" if bc._ambient_mode_active[0] else "off"
-    return f"Ambient mode {state_word}, sir — Chappie is {'listening quietly' if bc._ambient_mode_active[0] else 'standing down'}."
+    return f"Ambient mode {state_word}, sir — Chappie is {'listening quietly and learning' if bc._ambient_mode_active[0] else 'standing down'}."
 
 
 # ─── Skills reload (Phase 4E) ──────────────────────────────────────────

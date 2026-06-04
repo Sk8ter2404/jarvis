@@ -693,6 +693,115 @@ class MicWorkerLoopTests(_TmpDirMixin, unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# Mic worker — record_speech TAP-SHARING path (symptom-1 regression guard).
+#
+# When the host exposes add_record_tap / remove_record_tap, the worker MUST
+# share the main loop's mic via the tap instead of opening a competing
+# sd.InputStream. A second stream on the same WASAPI device starves
+# record_speech and makes JARVIS deaf to the wake word "JARVIS" — the
+# user-reported "go ambient → won't wake" bug. These tests assert the worker
+# registers a tap, NEVER opens an InputStream, transcribes the tapped frames,
+# and detaches the tap on exit.
+# ─────────────────────────────────────────────────────────────────────────
+class MicTapSharingTests(_TmpDirMixin, unittest.TestCase):
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("ambient_listen")
+        self._redirect_paths()
+        self.mod._buffer.clear()
+        self.mod._last_error = None
+
+    def _tap_bobert(self):
+        """A _FakeBobert that implements the record_speech tap API. Captures the
+        registered queue so the test can push frames the host 'captured'."""
+        bc = _FakeBobert()
+        bc.transcribe = mock.MagicMock(return_value=("tapped speech", _good_conf()))
+        bc.is_valid_speech = mock.MagicMock(return_value=(True, "ok"))
+        bc.is_ambient_music = mock.MagicMock(return_value=False)
+        bc._tap_queues = []
+        bc.add_record_tap = lambda q: (bc._tap_queues.append(q) or True)
+        bc.remove_record_tap = mock.MagicMock(name="remove_record_tap")
+        return bc
+
+    def test_tap_path_never_opens_inputstream(self):
+        bc = self._tap_bobert()
+        self.mod._wake_pattern = None
+        # An sd whose InputStream BLOWS UP if ever called — proves the worker
+        # took the tap path and never tried to open a competing stream.
+        sd = _make_sd(open_raises=AssertionError(
+            "tap path must not open an InputStream"))
+
+        # Feed 3 s of loud audio through the tap right after it's registered, so
+        # the real drain thread transfers it into the batch loop. A scripted
+        # stop event with short real sleeps lets the daemon drain thread run.
+        block = (np.ones(16000 * 3, dtype=np.float32) * 0.2)
+
+        def _on_wait(n):
+            if n == 1:
+                # Tap is registered by now; hand the host-captured frame over.
+                for q in bc._tap_queues:
+                    q.put(block)
+            time.sleep(0.03)   # yield so the drain thread moves frames across
+
+        evt = _ScriptedEvent([False, False, False, True], on_wait=_on_wait)
+        with inject_modules(sounddevice=sd), \
+             mock.patch.object(self.mod, "_get_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_stop_evt", evt), \
+             mock.patch.object(self.mod, "_focused_window_title",
+                               return_value="Notepad"):
+            self.mod._worker_loop()
+
+        # The tap was registered exactly once.
+        self.assertEqual(len(bc._tap_queues), 1)
+        # The tapped audio was transcribed + buffered (learning is alive).
+        self.assertGreaterEqual(len(self.mod._buffer), 1)
+        self.assertEqual(self.mod._buffer[-1]["text"], "tapped speech")
+        # No open error — InputStream was never touched.
+        self.assertIsNone(self.mod._last_error)
+
+    def test_tap_detached_on_exit(self):
+        bc = self._tap_bobert()
+        self.mod._wake_pattern = None
+        sd = _make_sd()  # present but should remain unused on the tap path
+        evt = _ScriptedEvent([True])   # exit immediately
+        with inject_modules(sounddevice=sd), \
+             mock.patch.object(self.mod, "_get_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_stop_evt", evt), \
+             mock.patch.object(self.mod, "_focused_window_title",
+                               return_value="Notepad"):
+            self.mod._worker_loop()
+        # On the way out the worker detaches its tap from record_speech.
+        self.assertEqual(len(bc._tap_queues), 1)
+        bc.remove_record_tap.assert_called_once_with(bc._tap_queues[0])
+
+    def test_falls_back_to_stream_when_no_tap_api(self):
+        # Host WITHOUT the tap API (older monolith) → the worker must still
+        # function via its own dedicated InputStream (the fallback path).
+        bc = _FakeBobert()
+        bc.transcribe = mock.MagicMock(return_value=("fallback speech", _good_conf()))
+        bc.is_valid_speech = mock.MagicMock(return_value=(True, "ok"))
+        bc.is_ambient_music = mock.MagicMock(return_value=False)
+        # No add_record_tap / remove_record_tap on bc.
+        self.mod._wake_pattern = None
+        block = (np.ones(16000 * 3, dtype=np.float32) * 0.2)
+
+        def _on_start(stream):
+            stream.feed(block)
+        stream = _FakeStream(on_start=_on_start)
+        sd = _make_sd(stream=stream)
+        evt = _ScriptedEvent([True])
+        with inject_modules(sounddevice=sd), \
+             mock.patch.object(self.mod, "_get_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_stop_evt", evt), \
+             mock.patch.object(self.mod, "_focused_window_title",
+                               return_value="Notepad"):
+            self.mod._worker_loop()
+        # Dedicated stream was opened + started (fallback path engaged).
+        self.assertTrue(stream.started)
+        self.assertEqual(len(self.mod._buffer), 1)
+        self.assertEqual(self.mod._buffer[0]["text"], "fallback speech")
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # System-audio (WASAPI loopback) worker (_audio_worker_loop)
 # ─────────────────────────────────────────────────────────────────────────
 class AudioWorkerLoopTests(_TmpDirMixin, unittest.TestCase):
