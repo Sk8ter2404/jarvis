@@ -4748,5 +4748,411 @@ class PlayWithLipsyncDefensiveHandlerTests(MonolithGlobalsTestCase):
         self.assertFalse(self.bc._tts_playback_active[0])
 
 
+# ===========================================================================
+# LOCAL-32B UPGRADE + RESILIENCE (feat/local-32b-upgrade)
+# ===========================================================================
+# Covers: the 32B-first preference chain, model-aware num_ctx, the honest
+# local→cloud→honest-message fallback for a LOCAL-routed turn, and the
+# best-effort Smart-App-Control event-log probe (parse / negatives / rate-
+# limit). Everything is mocked — no real Ollama, no network, no PowerShell.
+# ===========================================================================
+@requires_monolith
+class LocalNumCtxTests(MonolithGlobalsTestCase):
+    """_local_num_ctx — the 32B needs the tighter 12k window to stay 100 % on
+    the 3090; 14B/8B keep 16k. (See the measured 12k=49tps vs 16k=spill fact.)"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_32b_tag_gets_12288(self):
+        self.assertEqual(
+            self.bc._local_num_ctx("qwen2.5:32b-instruct-q4_K_M"), 12288)
+
+    def test_32b_case_insensitive(self):
+        self.assertEqual(self.bc._local_num_ctx("Qwen2.5:32B-Instruct"), 12288)
+
+    def test_other_large_tags_also_12288(self):
+        for tag in ("llama3.1:70b", "qwen:72b-chat", "yi:34b", "foo:65b"):
+            self.assertEqual(self.bc._local_num_ctx(tag), 12288, tag)
+
+    def test_14b_keeps_16384(self):
+        self.assertEqual(
+            self.bc._local_num_ctx("qwen2.5:14b-instruct-q5_K_M"), 16384)
+
+    def test_8b_keeps_16384(self):
+        self.assertEqual(
+            self.bc._local_num_ctx("llama3.1:8b-instruct-q5_K_M"), 16384)
+
+    def test_empty_or_none_defaults_16384(self):
+        self.assertEqual(self.bc._local_num_ctx(""), 16384)
+        self.assertEqual(self.bc._local_num_ctx(None), 16384)
+
+
+@requires_monolith
+class GetLocalLlmModel32bTests(MonolithGlobalsTestCase):
+    """The 32B is now first in the preference chain; it must be picked when
+    installed, fall cleanly to the 14B when the 32B is absent, and still honour
+    JARVIS_LOCAL_LLM_MODEL."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def setUp(self):
+        self._saved_cache = list(self.bc._RESOLVED_LOCAL_LLM_MODEL)
+        self.bc._RESOLVED_LOCAL_LLM_MODEL[0] = None
+        self._saved_env = os.environ.get("JARVIS_LOCAL_LLM_MODEL")
+        os.environ.pop("JARVIS_LOCAL_LLM_MODEL", None)
+
+    def tearDown(self):
+        self.bc._RESOLVED_LOCAL_LLM_MODEL[:] = self._saved_cache
+        if self._saved_env is None:
+            os.environ.pop("JARVIS_LOCAL_LLM_MODEL", None)
+        else:
+            os.environ["JARVIS_LOCAL_LLM_MODEL"] = self._saved_env
+
+    def test_chain_lists_32b_first(self):
+        self.assertEqual(self.bc._LOCAL_LLM_PREFERENCE[0],
+                         "qwen2.5:32b-instruct-q4_K_M")
+
+    def test_picks_32b_when_tags_list_it(self):
+        fake_req = mock.Mock()
+        fake_req.get.return_value = _FakeResp(ok=True, json_data={"models": [
+            {"name": "qwen2.5:32b-instruct-q4_K_M"},
+            {"name": "qwen2.5:14b-instruct-q5_K_M"},
+            {"name": "llama3.1:8b-instruct-q5_K_M"},
+        ]})
+        with mock.patch.object(self.bc, "requests", fake_req), \
+                mock.patch.object(self.bc, "_log_gpu_state"):
+            out = self.bc._get_local_llm_model()
+        self.assertEqual(out, "qwen2.5:32b-instruct-q4_K_M")
+
+    def test_falls_to_14b_when_only_14b_present(self):
+        # 32B not installed → cleanly drops to the next chain entry (14B).
+        fake_req = mock.Mock()
+        fake_req.get.return_value = _FakeResp(ok=True, json_data={"models": [
+            {"name": "qwen2.5:14b-instruct-q5_K_M"},
+            {"name": "llama3.1:8b-instruct-q5_K_M"},
+        ]})
+        with mock.patch.object(self.bc, "requests", fake_req), \
+                mock.patch.object(self.bc, "_log_gpu_state"):
+            out = self.bc._get_local_llm_model()
+        self.assertEqual(out, "qwen2.5:14b-instruct-q5_K_M")
+
+    def test_env_override_beats_installed_32b(self):
+        os.environ["JARVIS_LOCAL_LLM_MODEL"] = "  my:custom  "
+        fake_req = mock.Mock()
+        fake_req.get.return_value = _FakeResp(ok=True, json_data={"models": [
+            {"name": "qwen2.5:32b-instruct-q4_K_M"}]})
+        with mock.patch.object(self.bc, "requests", fake_req), \
+                mock.patch.object(self.bc, "_log_gpu_state"):
+            out = self.bc._get_local_llm_model()
+        self.assertEqual(out, "my:custom")
+
+
+@requires_monolith
+class CallLocalLlmNumCtxAndTuningTests(MonolithGlobalsTestCase):
+    """_call_local_llm wires the model-aware num_ctx + the light tuning knobs
+    (repeat_penalty / top_k) into the /api/chat options, and a generate read-
+    timeout returns None (so the caller can fall back) rather than raising."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def _arm(self, fake_req, model):
+        return [
+            mock.patch.object(self.bc, "LOCAL_LLM_FALLBACK", True),
+            mock.patch.object(self.bc, "_ollama_alive", return_value=True),
+            mock.patch.object(self.bc, "_get_local_llm_model", return_value=model),
+            mock.patch.object(self.bc, "_ollama_has_model", return_value=True),
+            mock.patch.object(self.bc, "requests", fake_req),
+        ]
+
+    def test_32b_model_sends_12288_and_tuning(self):
+        captured = {}
+        fake_req = mock.Mock()
+
+        def _post(url, json=None, timeout=None):
+            captured["opts"] = json["options"]
+            captured["timeout"] = timeout
+            return _FakeResp(ok=True, json_data={"message": {"content": "ok"}})
+        fake_req.post.side_effect = _post
+        patches = self._arm(fake_req, "qwen2.5:32b-instruct-q4_K_M")
+        for p in patches:
+            p.start()
+        try:
+            self.bc._call_local_llm("SYS", [{"role": "user", "content": "hi"}])
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertEqual(captured["opts"]["num_ctx"], 12288)
+        self.assertEqual(captured["opts"]["repeat_penalty"], 1.05)
+        self.assertEqual(captured["opts"]["top_k"], 40)
+        # still the conservative sampling we kept
+        self.assertEqual(captured["opts"]["temperature"], 0.4)
+        self.assertEqual(captured["opts"]["top_p"], 0.9)
+        # (connect, read) tuple so a blocked runner fails fast, not at 120 s
+        self.assertEqual(captured["timeout"], self.bc._LOCAL_GENERATE_TIMEOUT)
+        self.assertIsInstance(self.bc._LOCAL_GENERATE_TIMEOUT, tuple)
+
+    def test_14b_model_sends_16384(self):
+        captured = {}
+        fake_req = mock.Mock()
+
+        def _post(url, json=None, timeout=None):
+            captured["opts"] = json["options"]
+            return _FakeResp(ok=True, json_data={"message": {"content": "ok"}})
+        fake_req.post.side_effect = _post
+        patches = self._arm(fake_req, "qwen2.5:14b-instruct-q5_K_M")
+        for p in patches:
+            p.start()
+        try:
+            self.bc._call_local_llm("SYS", [])
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertEqual(captured["opts"]["num_ctx"], 16384)
+
+    def test_generate_timeout_returns_none(self):
+        # The SAC-blocked-runner signature: /api/tags is fine, but the generate
+        # hangs and trips the read timeout. _call_local_llm must return None
+        # (NOT raise) so the caller treats local as unavailable this turn.
+        fake_req = mock.Mock()
+        fake_req.Timeout = self.bc.requests.Timeout
+        fake_req.post.side_effect = self.bc.requests.Timeout("read timed out")
+        patches = self._arm(fake_req, "qwen2.5:32b-instruct-q4_K_M")
+        for p in patches:
+            p.start()
+        try:
+            out = self.bc._call_local_llm("SYS", [])
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertIsNone(out)
+
+
+@requires_monolith
+class LocalThenCloudOrHonestTests(MonolithGlobalsTestCase):
+    """The LOCAL-routed resilience path: local primary → Claude fallback when
+    reachable → honest message when BOTH are down (never a fabricated answer)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_local_success_returned_and_tag_stripped(self):
+        with mock.patch.object(self.bc, "_call_local_llm",
+                               return_value="[local] done sir"), \
+                mock.patch.object(self.bc, "_claude_oneshot") as cloud:
+            out = self.bc._local_then_cloud_or_honest("SYS", [])
+        self.assertEqual(out, "done sir")
+        cloud.assert_not_called()   # local answered → cloud never consulted
+
+    def test_local_down_falls_back_to_cloud(self):
+        with mock.patch.object(self.bc, "_call_local_llm", return_value=None), \
+                mock.patch.object(self.bc, "_claude_oneshot",
+                                  return_value="cloud reply sir") as cloud, \
+                mock.patch.object(self.bc, "_sac_blocked_local_recently",
+                                  return_value=False):
+            out = self.bc._local_then_cloud_or_honest("SYS", [{"role": "user",
+                                                               "content": "q"}])
+        self.assertEqual(out, "cloud reply sir")
+        cloud.assert_called_once()
+
+    def test_both_down_returns_honest_generic_message(self):
+        with mock.patch.object(self.bc, "_call_local_llm", return_value=None), \
+                mock.patch.object(self.bc, "_claude_oneshot", return_value=None), \
+                mock.patch.object(self.bc, "_sac_blocked_local_recently",
+                                  return_value=False):
+            out = self.bc._local_then_cloud_or_honest("SYS", [])
+        low = out.lower()
+        # honest: names BOTH the local model and the cloud being unreachable
+        self.assertIn("local model", low)
+        self.assertIn("cloud", low)
+        # NOT a fabricated answer to the user's question
+        self.assertNotIn("[local]", out)
+
+    def test_both_down_sac_blocked_message_is_specific(self):
+        with mock.patch.object(self.bc, "_call_local_llm", return_value=None), \
+                mock.patch.object(self.bc, "_claude_oneshot", return_value=None), \
+                mock.patch.object(self.bc, "_sac_blocked_local_recently",
+                                  return_value=True):
+            out = self.bc._local_then_cloud_or_honest("SYS", [])
+        self.assertIn("Smart App Control", out)
+
+
+@requires_monolith
+class ClaudeReachableTests(MonolithGlobalsTestCase):
+    """_claude_reachable gates whether to ATTEMPT a Claude fallback: Claude
+    backend + a key present → True; Ollama backend or keyless → False."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def setUp(self):
+        self._saved_key = os.environ.get("ANTHROPIC_API_KEY")
+
+    def tearDown(self):
+        if self._saved_key is None:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+        else:
+            os.environ["ANTHROPIC_API_KEY"] = self._saved_key
+
+    def test_true_when_claude_backend_and_key(self):
+        os.environ["ANTHROPIC_API_KEY"] = "sk-test"
+        with mock.patch.object(self.bc, "AI_BACKEND", "claude"):
+            self.assertTrue(self.bc._claude_reachable())
+
+    def test_false_when_no_key(self):
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+        with mock.patch.object(self.bc, "AI_BACKEND", "claude"):
+            self.assertFalse(self.bc._claude_reachable())
+
+    def test_false_when_ollama_backend(self):
+        os.environ["ANTHROPIC_API_KEY"] = "sk-test"
+        with mock.patch.object(self.bc, "AI_BACKEND", "ollama"):
+            self.assertFalse(self.bc._claude_reachable())
+
+
+@requires_monolith
+class CallLlmLocalRouteFallbackTests(MonolithGlobalsTestCase):
+    """_call_llm under MODEL_ROUTING['chat']=='local': a local failure must
+    fall back to Claude when reachable, and surface the honest both-down line
+    when neither works — instead of the old static '(local unavailable)'."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def setUp(self):
+        self._saved_hist = list(self.bc.conversation_history)
+        self.bc.conversation_history.clear()
+        self._patches = [
+            mock.patch.object(self.bc, "detect_tone", return_value=None),
+            mock.patch.object(self.bc, "route_voice_emotion",
+                              return_value={"mood": "casual", "addendum": ""}),
+            mock.patch.object(self.bc, "_emotion_tracker", None),
+            mock.patch.object(self.bc, "_voice_mood_response", None),
+            mock.patch.object(self.bc, "_trim_conversation_history"),
+            mock.patch.object(self.bc, "_system_prompt", "SYS"),
+        ]
+        for p in self._patches:
+            p.start()
+        import core.config as _cfg
+        self._cfg = _cfg
+        self._saved_route = dict(_cfg.MODEL_ROUTING)
+        _cfg.MODEL_ROUTING = dict(_cfg.MODEL_ROUTING, chat="local")
+
+    def tearDown(self):
+        self._cfg.MODEL_ROUTING = self._saved_route
+        for p in self._patches:
+            p.stop()
+        self.bc.conversation_history[:] = self._saved_hist
+
+    def _phrases(self):
+        m = mock.Mock()
+        m.detect_phrases_in_reply.return_value = {}
+        return m
+
+    def test_local_route_uses_local_when_it_answers(self):
+        with mock.patch.object(self.bc, "_call_local_llm",
+                               return_value="local answer sir"), \
+                mock.patch.object(self.bc, "_claude_oneshot") as cloud, \
+                mock.patch.object(self.bc, "_mcu_phrases", self._phrases()):
+            reply = self.bc._call_llm("hello")
+        self.assertEqual(reply, "local answer sir")
+        cloud.assert_not_called()
+        self.assertEqual(self.bc.conversation_history[-1]["content"],
+                         "local answer sir")
+
+    def test_local_route_falls_back_to_cloud_on_local_failure(self):
+        # local down (returns None) → Claude reachable → cloud answers.
+        with mock.patch.object(self.bc, "_call_local_llm", return_value=None), \
+                mock.patch.object(self.bc, "_claude_oneshot",
+                                  return_value="from the cloud sir"), \
+                mock.patch.object(self.bc, "_sac_blocked_local_recently",
+                                  return_value=False), \
+                mock.patch.object(self.bc, "_mcu_phrases", self._phrases()):
+            reply = self.bc._call_llm("hello")
+        self.assertEqual(reply, "from the cloud sir")
+
+    def test_local_route_honest_when_both_down(self):
+        with mock.patch.object(self.bc, "_call_local_llm", return_value=None), \
+                mock.patch.object(self.bc, "_claude_oneshot", return_value=None), \
+                mock.patch.object(self.bc, "_sac_blocked_local_recently",
+                                  return_value=False), \
+                mock.patch.object(self.bc, "_mcu_phrases", self._phrases()):
+            reply = self.bc._call_llm("hello")
+        low = reply.lower()
+        self.assertIn("local model", low)
+        self.assertIn("cloud", low)
+
+
+@requires_monolith
+class SacBlockedLocalRecentlyTests(MonolithGlobalsTestCase):
+    """_sac_blocked_local_recently — best-effort Windows event-log probe:
+    parses a blocked 3077 event as True, returns False on empty / error /
+    non-Windows, and is rate-limited (second call inside the window doesn't
+    re-fork PowerShell)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def setUp(self):
+        # Reset the module-level rate-limit cache before each test.
+        self._saved_cache = list(self.bc._SAC_CHECK_CACHE)
+        self.bc._SAC_CHECK_CACHE[0] = 0.0
+        self.bc._SAC_CHECK_CACHE[1] = False
+
+    def tearDown(self):
+        self.bc._SAC_CHECK_CACHE[:] = self._saved_cache
+
+    def test_parses_blocked_event_as_true(self):
+        fake_sp = mock.Mock()
+        fake_sp.run.return_value = mock.Mock(
+            stdout="Code Integrity blocked C:\\Users\\x\\AppData\\...\\ollama "
+                   "runner loading ggml.dll", stderr="")
+        with mock.patch.object(self.bc, "subprocess", fake_sp), \
+                mock.patch("platform.system", return_value="Windows"):
+            self.assertTrue(self.bc._sac_blocked_local_recently())
+
+    def test_empty_output_is_false(self):
+        fake_sp = mock.Mock()
+        fake_sp.run.return_value = mock.Mock(stdout="", stderr="")
+        with mock.patch.object(self.bc, "subprocess", fake_sp), \
+                mock.patch("platform.system", return_value="Windows"):
+            self.assertFalse(self.bc._sac_blocked_local_recently())
+
+    def test_subprocess_error_is_false(self):
+        fake_sp = mock.Mock()
+        fake_sp.run.side_effect = OSError("powershell missing")
+        with mock.patch.object(self.bc, "subprocess", fake_sp), \
+                mock.patch("platform.system", return_value="Windows"):
+            self.assertFalse(self.bc._sac_blocked_local_recently())
+
+    def test_non_windows_is_false_without_subprocess(self):
+        fake_sp = mock.Mock()
+        with mock.patch.object(self.bc, "subprocess", fake_sp), \
+                mock.patch("platform.system", return_value="Linux"):
+            self.assertFalse(self.bc._sac_blocked_local_recently())
+        fake_sp.run.assert_not_called()   # never forks off-Windows
+
+    def test_rate_limited_second_call_skips_subprocess(self):
+        fake_sp = mock.Mock()
+        fake_sp.run.return_value = mock.Mock(
+            stdout="ollama ggml.dll blocked", stderr="")
+        with mock.patch.object(self.bc, "subprocess", fake_sp), \
+                mock.patch("platform.system", return_value="Windows"):
+            first = self.bc._sac_blocked_local_recently()
+            second = self.bc._sac_blocked_local_recently()
+        self.assertTrue(first)
+        self.assertTrue(second)            # cached result reused
+        fake_sp.run.assert_called_once()   # NOT re-forked within the TTL window
+
+
 if __name__ == "__main__":
     unittest.main()
