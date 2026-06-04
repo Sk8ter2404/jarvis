@@ -41,20 +41,79 @@ class TimerSkillTests(unittest.TestCase):
         self.assertEqual(p("90 secs"), 90)
         self.assertEqual(p("1 hour 30 minutes"), 5400)  # compound
 
+    def test_parse_duration_natural_forms(self):
+        # The shapes the local LLM actually emits — bug 1 root cause was that
+        # only the pipe form was accepted. These must all parse.
+        p = self.mod._parse_duration
+        self.assertEqual(p("10 min"), 600)          # abbrev unit
+        self.assertEqual(p("10m"), 600)             # bare-letter unit after digit
+        self.assertEqual(p("1h"), 3600)
+        self.assertEqual(p("30s"), 30)
+        self.assertEqual(p("five minutes"), 300)    # spelled-out number
+        self.assertEqual(p("ten min"), 600)
+        self.assertEqual(p("an hour"), 3600)        # 'an'/'a' → 1
+        self.assertEqual(p("half an hour"), 1800)   # 'half a <unit>'
+        self.assertEqual(p("an hour and a half"), 5400)  # '<unit> and a half'
+        self.assertEqual(p("5"), 300)               # bare number → minutes
+        self.assertEqual(p("set a timer for 5"), 300)  # 'for' noise stripped
+
     def test_parse_duration_invalid(self):
         self.assertIsNone(self.mod._parse_duration("soon"))
         self.assertIsNone(self.mod._parse_duration(""))
+        self.assertIsNone(self.mod._parse_duration("whenever"))
+        self.assertIsNone(self.mod._parse_duration("minutes"))  # unit, no number
 
-    # ── set_timer error paths (no thread started) ────────────────────────
-    def test_set_timer_requires_pipe(self):
-        self.assertIn("format", self.actions["set_timer"]("5 minutes oops").lower())
+    # ── set_timer: BUG 1 — natural args set a REAL timer + truthful reply ──
+    def test_set_timer_bare_duration_creates_real_timer(self):
+        # "set a timer for 5 minutes" → LLM emits [ACTION: set_timer, 5 minutes].
+        # The bug: the bare duration was rejected (no timer) yet JARVIS claimed
+        # success. Now it must actually create the timer and confirm honestly.
+        with no_background_threads():
+            out = self.actions["set_timer"]("5 minutes")
+        self.assertEqual(len(self.mod._timers), 1)   # a REAL timer exists
+        self.assertIn("#1", out)
+        self.assertIn("5m", out)
 
-    def test_set_timer_bad_duration(self):
-        self.assertIn("could not parse",
-                      self.actions["set_timer"]("whenever | check oven").lower())
+    def test_set_timer_unparseable_returns_honest_error_no_timer(self):
+        # Genuinely unparseable → HONEST error, and NO timer created (so JARVIS
+        # never claims a false success).
+        out = self.actions["set_timer"]("whenever")
+        self.assertEqual(len(self.mod._timers), 0)
+        low = out.lower()
+        self.assertIn("couldn't tell how long", low)
+        # Must NOT look like a success confirmation.
+        self.assertNotIn("timer #", low)
+        self.assertNotIn("will remind you", low)
 
-    def test_set_timer_empty_message(self):
-        self.assertIn("message", self.actions["set_timer"]("5 minutes | ").lower())
+    def test_set_timer_natural_label_after_duration(self):
+        with no_background_threads():
+            out = self.actions["set_timer"]("5 minutes for tea")
+        self.assertEqual(len(self.mod._timers), 1)
+        self.assertIn("tea", out)
+        # the stored message carries the label
+        _, msg, _ = self.mod._timers[1]
+        self.assertEqual(msg, "tea")
+
+    def test_set_timer_label_then_duration(self):
+        with no_background_threads():
+            self.actions["set_timer"]("tea timer 5 minutes")
+        _, msg, _ = self.mod._timers[1]
+        self.assertEqual(msg, "tea")
+
+    def test_set_timer_unlabeled_reply_omits_placeholder(self):
+        # A bare duration gets a generic stored message but the spoken reply
+        # should NOT quote the placeholder back.
+        with no_background_threads():
+            out = self.actions["set_timer"]("5 minutes")
+        self.assertNotIn("your timer is up", out)
+
+    def test_set_timer_empty_label_pipe_still_works(self):
+        # Legacy 'duration | ' with an empty message must still set a timer
+        # (was previously rejected as "needs a message").
+        with no_background_threads():
+            out = self.actions["set_timer"]("5 minutes | ")
+        self.assertEqual(len(self.mod._timers), 1)
+        self.assertIn("#1", out)
 
     # ── set_timer happy path (threads neutered) ──────────────────────────
     def test_set_timer_happy(self):
@@ -187,9 +246,55 @@ class TimerSkillTests(unittest.TestCase):
         self.assertIn("1m 30s", out)
         self.assertIn("2h 0m", out)
 
-    # ── cancel_timer parse error ─────────────────────────────────────────
-    def test_cancel_timer_bad_id(self):
-        self.assertIn("format", self.actions["cancel_timer"]("notanumber").lower())
+    # ── cancel_timer: BUG 1 — natural args, honest "no timers" ───────────
+    def test_cancel_no_arg_cancels_the_running_one(self):
+        # "cancel my timer" with one running → cancel it and say which.
+        with no_background_threads():
+            self.actions["set_timer"]("10 minutes | tea")
+        out = self.actions["cancel_timer"]("")
+        self.assertEqual(len(self.mod._timers), 0)
+        self.assertIn("cancelled timer #1", out.lower())
+
+    def test_cancel_loose_phrase_cancels_running(self):
+        with no_background_threads():
+            self.actions["set_timer"]("10 minutes | tea")
+        out = self.actions["cancel_timer"]("my timer")
+        self.assertEqual(len(self.mod._timers), 0)
+        self.assertIn("cancelled", out.lower())
+
+    def test_cancel_no_timers_is_honest(self):
+        # No timers exist → honest message, NOT a false "cancelled".
+        out = self.actions["cancel_timer"]("")
+        low = out.lower()
+        self.assertIn("no timers", low)
+        self.assertNotIn("cancelled timer", low)
+
+    def test_cancel_no_arg_multiple_cancels_soonest(self):
+        # Several running, loose arg → cancel the soonest-to-fire and note
+        # the rest remain.
+        with no_background_threads():
+            self.actions["set_timer"]("30 minutes | far")   # #1, later
+            self.actions["set_timer"]("5 minutes | soon")   # #2, sooner
+        out = self.actions["cancel_timer"]("the timer")
+        self.assertIn("#2", out)                 # the soonest one
+        self.assertIn(1, self.mod._timers)       # the later one survives
+        self.assertNotIn(2, self.mod._timers)
+
+    def test_cancel_by_label_substring(self):
+        with no_background_threads():
+            self.actions["set_timer"]("10 minutes | tea")
+            self.actions["set_timer"]("20 minutes | laundry")
+        out = self.actions["cancel_timer"]("the tea timer")
+        self.assertIn("cancelled timer #1", out.lower())
+        self.assertIn(2, self.mod._timers)
+
+    def test_cancel_unmatched_label_is_honest(self):
+        with no_background_threads():
+            self.actions["set_timer"]("10 minutes | tea")
+        out = self.actions["cancel_timer"]("the pizza timer")
+        low = out.lower()
+        self.assertIn("don't see a timer", low)
+        self.assertEqual(len(self.mod._timers), 1)  # nothing cancelled
 
 
 class TimerEnqueueSpeechTests(unittest.TestCase):

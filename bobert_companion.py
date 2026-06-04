@@ -5763,6 +5763,20 @@ def _local_cheatsheet() -> str:
         "Put it on its own line; the system runs it and hands you the result to\n"
         "comment on. Emit an action ONLY when sir wants something DONE — for\n"
         "ordinary conversation, just reply normally with no token.\n\n"
+        "*** ALWAYS USE THE ACTION — NEVER GUESS THESE ***\n"
+        "You do NOT know the current time, date, your version, the weather, or\n"
+        "any system stat without running its action. NEVER state them from\n"
+        "memory — emit the token and let the system fill in the real value:\n"
+        "  [ACTION: get_time]            \"what time is it\" / \"what's the date\"\n"
+        "  [ACTION: version_info]        \"what version are you on\" / \"when were you updated\"\n"
+        "  [ACTION: weather_briefing]    \"what's the weather\" / \"is it going to rain\"\n"
+        "  [ACTION: system_pulse]        \"system status\" / \"how are you running\" / CPU/RAM\n"
+        "  [ACTION: whats_broken]        \"what's broken\" / \"anything wrong\"\n"
+        "  [ACTION: list_timers]         \"list my timers\" / \"what timers are running\"\n"
+        "If sir asks any of the above, your reply must contain ONLY the action\n"
+        "token (plus at most a short lead-in like \"One moment, sir.\"). Do not\n"
+        "invent a time, version number, temperature, or status — you will be\n"
+        "wrong.\n\n"
         "Most-used actions:\n"
         "  [ACTION: play_music, <artist/song/playlist>]   play music in the browser\n"
         "  [ACTION: play_playlist, <name>]   play ANY named playlist — prefers sir's local iTunes library, auto-falls back to Apple Music streaming if not owned ('shuffle ' prefix shuffles). Use this for every 'play my/the <name> playlist', NOT apple_music.\n"
@@ -5772,7 +5786,7 @@ def _local_cheatsheet() -> str:
         "  [ACTION: volume_up]  [ACTION: volume_down]  [ACTION: volume_mute]\n"
         "  [ACTION: netflix, <title>]  [ACTION: youtube, <search>]  [ACTION: spotify, <query>]\n"
         "  [ACTION: apple_music, <query>]  [ACTION: disney_plus, <title>]  [ACTION: hulu, <title>]\n"
-        "  [ACTION: set_timer, 5 minutes]   [ACTION: cancel_timer]\n"
+        "  [ACTION: set_timer, 5 minutes]   (or '5 minutes for tea')   [ACTION: list_timers]   [ACTION: cancel_timer]  (no arg cancels the running one)\n"
         "  [ACTION: see_screen]  or  [ACTION: see_screen, middle]   look at the screen & describe it\n"
         "  [ACTION: find_on_screen, <thing>]   [ACTION: recall_screen]\n"
         "  [ACTION: web_search, <query>]   open a web search in the browser\n"
@@ -11207,6 +11221,80 @@ _PREEMPTIVE_HALLUCINATION_PATTERNS: list[tuple["re.Pattern", str | None, str]] =
         r"(?:camera|cameras|webcam|webcams|lens)\b",
         re.IGNORECASE),
      None, "physically move the camera"),
+
+    # ── Fabricated INFORMATIONAL answers (local-qwen safety net) ──────────
+    # The local 14B model often answers "what time/version/weather/status" from
+    # its head instead of routing to the action (it made up "1:47 AM",
+    # "version 12.4", "64 degrees", invented CPU/RAM). When the drafted reply
+    # ASSERTS one of these facts but emitted no [ACTION:] token, inject the real
+    # action so JARVIS speaks the true value instead of the hallucination.
+    # Kept deliberately narrow — each pattern needs a concrete factual claim
+    # (an actual clock time, a version number, a temperature, a CPU/RAM stat),
+    # not a mere mention of the topic — so ordinary conversation never trips it.
+
+    # Clock time: "it's 1:47", "it is 1:47 AM", "the time is 10:52 PM",
+    # "the current time is 9 AM". Requires a real clock shape (H:MM or N AM/PM)
+    # so "it's 5 minutes left" / "it's time to go" don't match.
+    (re.compile(
+        r"\b(?:it'?s|it\s+is|the\s+(?:current\s+)?time\s+is|"
+        r"right\s+now\s+it'?s)\s+(?:about\s+|approximately\s+|around\s+)?"
+        r"\d{1,2}(?::\d{2})?\s*(?:[ap]\.?m\.?|o'?clock)\b",
+        re.IGNORECASE),
+     "get_time", "state the current time from memory"),
+    (re.compile(
+        r"\b(?:the\s+(?:current\s+)?time\s+is|it'?s\s+currently)\s+"
+        r"\d{1,2}:\d{2}\b",
+        re.IGNORECASE),
+     "get_time", "state the current time from memory"),
+
+    # Version claim: "version 1.20", "I'm on version 12.4", "running version
+    # 3", "I'm running 1.20.6". Requires the word 'version'/'running' next to a
+    # number so "version control" / "running late" don't match.
+    (re.compile(
+        r"\b(?:(?:on|running|at|i'?m\s+on|currently\s+on)\s+)?version\s+v?\d+(?:\.\d+)*\b",
+        re.IGNORECASE),
+     "version_info", "state the version from memory"),
+    (re.compile(
+        r"\bi'?m\s+running\s+v?\d+\.\d+(?:\.\d+)*\b",
+        re.IGNORECASE),
+     "version_info", "state the version from memory"),
+
+    # Weather: "64 degrees Fahrenheit", "it's 72 and sunny", "currently 58
+    # degrees and cloudy", "72°F outside". Requires a temperature TIED to a
+    # weather signal (°F/°C, fahrenheit/celsius, a weather condition, or an
+    # outdoor/now cue) so a bare "turn it 90 degrees" (rotation) doesn't match.
+    (re.compile(
+        r"\b\d{1,3}\s*(?:°\s*[fc]?\b|degrees?\s+(?:fahrenheit|celsius|[fc])\b)",
+        re.IGNORECASE),
+     "weather_briefing", "state the weather from memory"),
+    (re.compile(
+        r"\b\d{1,3}\s*(?:°|degrees?)\b(?:[^.]*?\b"
+        r"(?:outside|out\s+there|today|right\s+now|currently|"
+        r"sunny|cloudy|clear|overcast|rain(?:y|ing)?|snow(?:y|ing)?|"
+        r"windy|foggy|humid|chilly|breezy|forecast|high|low|feels\s+like))",
+        re.IGNORECASE),
+     "weather_briefing", "state the weather from memory"),
+    (re.compile(
+        r"\bit'?s\s+(?:currently\s+|about\s+)?\d{1,3}\s+and\s+"
+        r"(?:sunny|cloudy|clear|overcast|rain(?:y|ing)?|snow(?:y|ing)?|"
+        r"windy|foggy|humid|warm|cold|hot|mild|partly)\b",
+        re.IGNORECASE),
+     "weather_briefing", "state the weather from memory"),
+
+    # System stats: "CPU is at 40%", "CPU at 12", "40% CPU", "memory is at 80%",
+    # "RAM usage is 60%". Requires a percentage/number tied to cpu/ram/memory.
+    (re.compile(
+        r"\b(?:cpu|ram|memory)\s+(?:usage\s+)?(?:is\s+)?(?:at\s+|sitting\s+at\s+|around\s+)?\d{1,3}\s*%",
+        re.IGNORECASE),
+     "system_pulse", "state system stats from memory"),
+    (re.compile(
+        r"\b\d{1,3}\s*%\s+(?:cpu|ram|memory|memory\s+usage)\b",
+        re.IGNORECASE),
+     "system_pulse", "state system stats from memory"),
+    (re.compile(
+        r"\bcpu\s+(?:is\s+)?(?:at\s+|sitting\s+at\s+|running\s+at\s+)\d{1,3}\b",
+        re.IGNORECASE),
+     "system_pulse", "state system stats from memory"),
 ]
 
 
