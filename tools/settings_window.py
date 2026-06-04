@@ -60,6 +60,41 @@ FONT_SMALL = ("Consolas", 9)
 
 RESTART_NOTE = "Some changes apply on the next restart."
 
+# Local Ollama endpoint + a STATIC fallback list of common chat tags, used to
+# seed the "Local LLM model" dropdown when Ollama is unreachable at GUI-open
+# time (so the field still offers sensible choices offline). The live list is
+# probed by `installed_ollama_models()`.
+OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_MODEL_FALLBACK = [
+    "qwen2.5:32b-instruct-q4_K_M",
+    "qwen2.5:14b-instruct-q5_K_M",
+    "llama3.1:8b-instruct-q5_K_M",
+]
+# Tag substrings that are NOT chat models (embedding / vision) — excluded from
+# the chat-model dropdown. Mirrors skills/model_picker's markers.
+_NON_CHAT_MARKERS = (
+    "nomic-embed", "embed-text", "-embed", "bge-", "all-minilm",
+    "vl:", "-vl", "vision", "llava", "moondream", "bakllava",
+)
+
+
+def installed_ollama_models(base_url: str = OLLAMA_BASE_URL) -> list[str]:
+    """Installed Ollama CHAT tags via GET /api/tags (embedding + vision models
+    excluded), or the static OLLAMA_MODEL_FALLBACK list if Ollama is
+    unreachable. Import-safe: ``requests`` is imported lazily so importing this
+    module (for the tests / schema) never requires it or a network call."""
+    try:
+        import requests  # lazy: keep module import dependency-free
+        r = requests.get(f"{base_url}/api/tags", timeout=(2, 3))
+        if not r.ok:
+            return list(OLLAMA_MODEL_FALLBACK)
+        names = [m.get("name", "") for m in r.json().get("models", []) if m.get("name")]
+        chat = [n for n in names
+                if not any(mk in n.lower() for mk in _NON_CHAT_MARKERS)]
+        return chat or list(OLLAMA_MODEL_FALLBACK)
+    except Exception:
+        return list(OLLAMA_MODEL_FALLBACK)
+
 # Order matters — drives both the Notebook tab order and `--tab` resolution.
 TAB_ORDER = ["voice", "ai", "privacy", "integrations", "advanced"]
 TAB_LABELS = {
@@ -172,10 +207,13 @@ SCHEMA: dict[str, dict] = {
                 "backend above to ollama.)",
     },
     "LOCAL_LLM_MODEL": {
-        "tab": "ai", "label": "Local LLM model (Ollama, $0)", "type": "str",
+        "tab": "ai", "label": "Local LLM model (Ollama, $0)", "type": "combo",
         "default": "qwen2.5:14b-instruct-q5_K_M",
+        "choices": OLLAMA_MODEL_FALLBACK,
         "help": "Ollama tag for the always-on local brain — $0 per conversation. "
-                "e.g. qwen2.5:14b-instruct-q5_K_M, llama3.1:8b.",
+                "The list is your installed Ollama chat models (probed when this "
+                "window opens); you can also type any tag. Switch by voice too: "
+                "'switch to the 32B'.",
     },
     "CLAUDE_OPTIONAL": {
         "tab": "ai", "label": "Claude is optional (never required)",
@@ -361,7 +399,7 @@ SCHEMA: dict[str, dict] = {
 
 # Field types whose key is a real persisted setting (everything except the
 # read-only "status" rows, whose keys start with "_status_").
-_PERSISTED_TYPES = {"bool", "enum", "str", "int", "float", "text", "routing"}
+_PERSISTED_TYPES = {"bool", "enum", "str", "combo", "int", "float", "text", "routing"}
 
 
 def persisted_keys() -> list[str]:
@@ -412,6 +450,10 @@ def coerce_value(spec: dict, raw):
             val = str(raw)
             choices = spec.get("choices") or []
             return val if val in choices else default
+        if typ == "combo":
+            # Free-form string with SUGGESTED choices: unlike enum, a value
+            # outside `choices` is allowed (the user may type any Ollama tag).
+            return str(raw)
         if typ == "text":
             # Stored as a list of lines; accept a list or a newline string.
             if isinstance(raw, list):
@@ -721,6 +763,29 @@ def run_gui(start_tab: int = 0) -> int:
                                  values=opts, width=28).grid(
                         row=row, column=1, sticky="we", padx=2, pady=(0, 2))
                     row += 1
+                _add_help(inner, spec, row)
+                row += 1
+                continue
+
+            if typ == "combo":
+                # Editable dropdown: live-probed Ollama models as suggestions,
+                # but the user can still type any tag (not state="readonly").
+                ttk.Label(inner, text=label).grid(
+                    row=row, column=0, sticky="w", padx=2, pady=(6, 2))
+                values = list(spec.get("choices") or [])
+                try:
+                    values = installed_ollama_models()
+                except Exception:
+                    pass
+                cur_val = str(settings.get(key, ""))
+                if cur_val and cur_val not in values:
+                    values = [cur_val] + values  # keep a custom saved tag visible
+                var = tk.StringVar(value=cur_val)
+                vars_by_key[key] = var
+                ttk.Combobox(inner, textvariable=var, values=values,
+                             width=28).grid(
+                    row=row, column=1, sticky="we", padx=2, pady=(6, 2))
+                row += 1
                 _add_help(inner, spec, row)
                 row += 1
                 continue

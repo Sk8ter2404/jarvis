@@ -103,15 +103,18 @@ CLAUDE_OPTIONAL = True
 # The LOCAL model is JARVIS's baseline — it serves every turn when Claude
 # is unavailable (no key, capped credits, rate-limit, network glitch, 5xx)
 # and the experience is meant to be good on its own. The workshop rig's
-# 3090 (24 GB VRAM) runs qwen2.5:14b q5_K_M at ~10 GB. For local calls the
-# giant Claude-tuned PC_CONTROL_PROMPT is swapped for a compact action
-# cheatsheet (see _local_cheatsheet) and the context is capped at 16k so
-# the model fits 100 % on the GPU. The runtime selector
+# 3090 (24 GB VRAM) now runs qwen2.5:32b-instruct q4_K_M (~19 GB) as the
+# baseline brain. That model fits 100 % on the GPU ONLY at num_ctx=12288
+# (~49 tok/s, stable); at 16k it spills ~5 % to CPU and drops to ~28 tok/s,
+# so the call path picks num_ctx per-model (see _local_num_ctx). For local
+# calls the giant Claude-tuned PC_CONTROL_PROMPT is swapped for a compact
+# action cheatsheet (see _local_cheatsheet). The runtime selector
 # `_get_local_llm_model()` consults JARVIS_LOCAL_LLM_MODEL first, then walks
-# a fallback chain (qwen2.5:14b → llama3.1:8b → first available tag). Vision
+# a fallback chain (qwen2.5:32b → qwen2.5:14b → llama3.1:8b → first available
+# tag), so a box without the 32B pulled cleanly drops to the 14B. Vision
 # queries prefer the cloud but fall back to the local qwen2.5vl:7b.
 LOCAL_LLM_FALLBACK = True
-LOCAL_LLM_MODEL    = "qwen2.5:14b-instruct-q5_K_M"
+LOCAL_LLM_MODEL    = "qwen2.5:32b-instruct-q4_K_M"
 LOCAL_LLM_BASE_URL = "http://localhost:11434"
 
 # When True, every ambient/background one-shot LLM call (memory extraction,
@@ -624,8 +627,19 @@ def _apply_user_settings() -> None:
         return
     if not isinstance(data, dict):
         return
+    # Back-compat aliases: a config constant that was RENAMED still has saved
+    # user_settings.json files (and Settings-GUI writes) carrying the OLD key.
+    # Map the legacy name onto the current one so the user's override still
+    # reaches the live constant instead of being silently dropped by the
+    # `key not in g` guard below. 2026-06: AMBIENT_LISTENING_ENABLED was renamed
+    # to AMBIENT_LISTEN_ENABLED in v1.20.0; the owner's file still had the old
+    # key, so the mic-ambient daemon never autostarted ("not even learning").
+    _LEGACY_KEY_ALIASES = {
+        "AMBIENT_LISTENING_ENABLED": "AMBIENT_LISTEN_ENABLED",
+    }
     g = globals()
     for key, val in data.items():
+        key = _LEGACY_KEY_ALIASES.get(key, key)
         if key.startswith("_") or key not in g:
             continue          # only override an existing public config constant
         cur = g[key]

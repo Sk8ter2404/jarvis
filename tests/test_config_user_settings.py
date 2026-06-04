@@ -61,6 +61,27 @@ class ApplyUserSettingsTests(unittest.TestCase):
              mock.patch("core.config.open", m, create=True):
             cfg._apply_user_settings()  # must not raise
 
+    def test_legacy_ambient_listening_key_aliases_to_new_name(self):
+        # v1.20.0 renamed AMBIENT_LISTENING_ENABLED -> AMBIENT_LISTEN_ENABLED.
+        # A saved user_settings.json carrying the OLD key must still flip the
+        # NEW constant, otherwise the mic-ambient daemon never autostarts and
+        # nothing is learned (the user-reported regression). The legacy key is
+        # NOT a real config constant, so without the alias the `key not in g`
+        # guard would silently drop it.
+        orig = cfg.AMBIENT_LISTEN_ENABLED
+        self.assertFalse(hasattr(cfg, "AMBIENT_LISTENING_ENABLED"))  # legacy name is gone
+        fake = {"AMBIENT_LISTENING_ENABLED": True}
+        try:
+            cfg.AMBIENT_LISTEN_ENABLED = False
+            m = mock.mock_open(read_data=json.dumps(fake))
+            with mock.patch("core.config.os.path.exists", return_value=True), \
+                 mock.patch("core.config.open", m, create=True):
+                cfg._apply_user_settings()
+            self.assertIs(cfg.AMBIENT_LISTEN_ENABLED, True)             # alias applied
+            self.assertFalse(hasattr(cfg, "AMBIENT_LISTENING_ENABLED"))  # no stray attr created
+        finally:
+            cfg.AMBIENT_LISTEN_ENABLED = orig
+
 
 class ModelRoutingTests(unittest.TestCase):
     def test_model_route_default_and_lookup(self):

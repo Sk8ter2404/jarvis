@@ -1360,11 +1360,21 @@ def _llm_quick(system: str, user: str, max_tokens: int = 200) -> str:
     model and never touches Claude, so ambient/background learning is free."""
     from core.config import AMBIENT_LEARNING_FORCE_LOCAL, model_route
     if AMBIENT_LEARNING_FORCE_LOCAL or model_route("ambient") == "local":
+        # Ambient/background is forced to LOCAL ONLY (never touches Claude, so
+        # learning is free). When local can't answer we deliberately skip this
+        # one-shot (return "") rather than fabricating — but we LOG clearly so a
+        # wedged/blocked runner isn't a silent every-turn no-op. SAC-specific
+        # when we have evidence the runner was blocked this boot.
         local = _call_local_llm(
             system, [{"role": "user", "content": user}], max_tokens=max_tokens)
         if local:
             return local
-        print("  [llm_quick] ambient forced local; local model unavailable")
+        if _sac_blocked_local_recently():
+            print("  [llm_quick] ambient forced-local but Smart App Control "
+                  "blocked the local runner this boot — skipping this one-shot")
+        else:
+            print("  [llm_quick] ambient forced-local; local model unavailable "
+                  "— skipping this one-shot (no cloud fallback by design)")
         return ""
     if AI_BACKEND == "claude":
         import anthropic
@@ -5569,13 +5579,35 @@ def _log_gpu_state(model_name: str) -> None:
 _RESOLVED_LOCAL_LLM_MODEL: list[str | None] = [None]
 
 # Fallback chain for the local-LLM selector. First entry is the preferred
-# default (smarter on ambiguous voice intents, ~10 GB VRAM on the 3090);
-# second entry is the lower-VRAM legacy option. JARVIS_LOCAL_LLM_MODEL
-# bypasses this list entirely.
+# default (the 32B q4 — smartest on ambiguous voice intents, ~19 GB VRAM on
+# the 3090, fits 100 % on-GPU at num_ctx=12288 — see _local_num_ctx); the
+# rest are lower-VRAM fallbacks so a box that hasn't pulled the 32B cleanly
+# drops to the 14B, then the 8B. JARVIS_LOCAL_LLM_MODEL bypasses this list
+# entirely; the "first installed tag" step (below) catches anything off-list.
 _LOCAL_LLM_PREFERENCE = (
+    "qwen2.5:32b-instruct-q4_K_M",
     "qwen2.5:14b-instruct-q5_K_M",
     "llama3.1:8b-instruct-q5_K_M",
 )
+
+
+# (connect, read) timeout for the foreground /api/chat generate. The READ
+# leg is the load-bearing resilience knob: with stream=False, Ollama sends
+# NOTHING until the whole reply is ready, so a runner that's up on /api/tags
+# but can't actually generate (the classic Smart-App-Control-blocked-runner
+# case — SAC blocks ggml.dll / the runner exe, /api/tags still answers 200,
+# but /api/chat hangs) trips this read timeout and the caller falls back to
+# Claude — instead of freezing the voice thread for the old flat 120 s. 50 s
+# still comfortably covers a warm 500-token generation (≥10 tok/s; the 32B
+# does ~49) once the boot warm-up has paid the one-time model-load cost.
+_LOCAL_GENERATE_TIMEOUT = (5, 50)
+
+# Bind the real requests.Timeout class at import time so the read-timeout
+# `except` in _call_local_llm stays valid even when a test (or some other
+# caller) swaps the module-level `requests` for a bare Mock — referencing
+# `requests.Timeout` at handling time would otherwise resolve to a Mock
+# attribute and raise "catching classes that do not inherit from BaseException".
+_RequestsTimeout = requests.Timeout
 
 
 def _ollama_alive() -> bool:
@@ -5583,6 +5615,22 @@ def _ollama_alive() -> bool:
         return requests.get(f"{LOCAL_LLM_BASE_URL}/api/tags", timeout=2).ok
     except Exception:
         return False
+
+
+def _local_num_ctx(model: str) -> int:
+    """Pick the Ollama num_ctx for a model so it fits 100 % on the 3090.
+
+    MEASURED on this box (RTX 3090, 24 GB): the 32B q4_K_M at num_ctx=16384
+    spills ~5 % to CPU and runs ~28 tok/s (fragile); at num_ctx=12288 it stays
+    100 % on the GPU and runs ~49 tok/s (stable). Smaller models (14B/8B) have
+    headroom to spare, so they keep the larger 16k window. Heuristic: any tag
+    that looks like a 30B-class (or bigger) model gets the smaller 12k window.
+    """
+    tag = (model or "").lower()
+    # 32b / 34b / 65b / 70b / 72b … — the big ones that need the tighter window.
+    if any(b in tag for b in ("32b", "34b", "65b", "70b", "72b")):
+        return 12288
+    return 16384
 
 
 def _get_local_llm_model() -> str:
@@ -5799,6 +5847,12 @@ def _local_cheatsheet() -> str:
         "  [ACTION: weather_briefing]   [ACTION: news_briefing]   [ACTION: morning_briefing]\n"
         "  [ACTION: queue_task, <task for Claude Code>]   [ACTION: show_tasks]\n"
         "  [ACTION: smart_home_control, <plain request>]   [ACTION: make_picture, <prompt>]\n"
+        "Choosing YOUR OWN local brain (which Ollama model runs you):\n"
+        "  [ACTION: current_model]       \"what model are you using\" / \"what's your brain\"\n"
+        "  [ACTION: list_models]         \"what models do you have\" / \"what can you run on\"\n"
+        "  [ACTION: set_model, <name>]   \"switch to the 32B\" / \"use the fast one\" / \"use qwen\"\n"
+        "                                 (arg is a tag/size/alias: 32b, 14b, 8b, big, fast, qwen, llama)\n"
+        "  [ACTION: set_brain, <local|cloud|auto>]   \"use local\" / \"use cloud / Claude\" / \"go auto\"\n"
     )
     # Append EVERY registered action name (late-bound from the live registry —
     # ACTIONS is fully populated by the time this runs at request time).
@@ -5886,21 +5940,32 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
             "stream": False,
             "options": {
                 "num_predict": max_tokens,
-                # Cap context at 16k (was the model-default 32k). With the
-                # compact prompt the real prompt is ~8k, so 16k leaves ample
-                # room for history + generation while HALVING the KV cache so
-                # the model fits 100% on the GPU (no CPU spill → much faster).
-                "num_ctx": 16384,
+                # Cap context (was the model-default 32k). With the compact
+                # prompt the real prompt is ~8k, so even 12k leaves ample room
+                # for history + generation while keeping the KV cache small
+                # enough that the model fits 100% on the GPU (no CPU spill →
+                # much faster). Model-aware because the 32B needs the tighter
+                # window: MEASURED on the 3090, 32B@12k = 100% GPU / ~49 tok/s,
+                # but 32B@16k spills ~5% to CPU / ~28 tok/s. 14B/8B keep 16k.
+                "num_ctx": _local_num_ctx(model),
                 # Lower than Ollama's 0.8 default → more focused, less rambly,
                 # better at emitting the exact action-token grammar.
                 "temperature": 0.4,
                 "top_p": 0.9,
+                # Light, deliberately conservative tuning: a small repeat
+                # penalty curbs the local model's tendency to loop a phrase,
+                # and top_k=40 trims the long tail without hurting the
+                # action-grammar. Kept gentle so behaviour stays close to the
+                # tuning the cheatsheet/persona were validated against.
+                "repeat_penalty": 1.05,
+                "top_k": 40,
             },
             # Keep the model resident between turns so a voice burst doesn't pay
             # the ~3-5s reload each time (it competes with whisper on reload).
             "keep_alive": "20m",
         }
-        r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat", json=payload, timeout=120)
+        r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat", json=payload,
+                          timeout=_LOCAL_GENERATE_TIMEOUT)
         if not r.ok:
             print(f"  [local-llm] HTTP {r.status_code}: {r.text[:200]}")
             return None
@@ -5909,6 +5974,15 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
             return None
         print(f"  [local-llm] served via {model}")
         return text
+    except _RequestsTimeout as _e:
+        # The runner accepted the POST but never produced a reply within the
+        # read budget — almost always a blocked/wedged runner (e.g. SAC). Note
+        # it so the caller can offer the SAC-specific message, then fall back.
+        # (Uses the import-time class, not requests.Timeout, so a mocked-out
+        # `requests` global can't turn this except into a TypeError.)
+        print(f"  [local-llm] generate timed out ({_e}) — runner up but not "
+              f"responding (blocked/wedged?); treating local as unavailable")
+        return None
     except Exception as _e:
         print(f"  [local-llm] call failed: {_e}")
         return None
@@ -5930,6 +6004,231 @@ def _local_fallback_or(sys_prompt: str, default_reply: str) -> str:
     if t.startswith("[local]"):
         t = t[len("[local]"):].lstrip()
     return t
+
+
+# ── Local-brain resilience: honest fallback when the local model is down ──
+#
+# The contract (see TASKS §4): NEVER fabricate or fail silently when the local
+# brain is actually down. When local can't answer this turn, fall back to
+# Claude if it's reachable; if NEITHER works, say so honestly. A wrinkle this
+# guards against: Smart App Control can block Ollama's runner (ggml.dll / the
+# runner .exe) while /api/tags still answers 200 — so _ollama_alive() reports
+# healthy but generation hangs. We detect that via the read-timeout in
+# _call_local_llm (which returns None) AND, best-effort, via the Windows event
+# log (_sac_blocked_local_recently) so the user gets a specific explanation.
+
+# Cache for the SAC event-log probe: (monotonic_expiry, bool_result). The probe
+# forks PowerShell, so it's rate-limited to once per ~60 s and only run right
+# after a local generate has actually failed.
+_SAC_CHECK_CACHE: list = [0.0, False]
+_SAC_CHECK_TTL_S = 60.0
+
+
+def _sac_blocked_local_recently() -> bool:
+    """Best-effort: did Windows Smart App Control block Ollama's runner in the
+    last ~15 min? Returns True if a CodeIntegrity 3077 (blocked-image) event
+    naming 'ollama' or 'ggml' is found. Windows-only, never fatal, rate-limited
+    to one real probe per ~60 s. Any error / non-Windows / timeout → False."""
+    now = time.monotonic()
+    expiry, cached = _SAC_CHECK_CACHE
+    if now < expiry:
+        return cached
+
+    result = False
+    try:
+        import platform
+        if platform.system() == "Windows":
+            # CodeIntegrity/Operational Id 3077 = "image could not load because
+            # it did not meet the SAC/WDAC policy". Filter to the last 15 min,
+            # render the messages, and look for our runner / ggml in the text.
+            ps = (
+                "$ErrorActionPreference='SilentlyContinue';"
+                "$evs = Get-WinEvent -FilterHashtable @{"
+                "LogName='Microsoft-Windows-CodeIntegrity/Operational';"
+                "Id=3077;StartTime=(Get-Date).AddMinutes(-15)};"
+                "if ($evs) { $evs | ForEach-Object { $_.Message } }"
+            )
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                capture_output=True, text=True, timeout=4,
+            )
+            blob = ((out.stdout or "") + (out.stderr or "")).lower()
+            if "ollama" in blob or "ggml" in blob:
+                result = True
+    except Exception:
+        # Non-Windows, no such log, PowerShell missing, timeout, permission —
+        # all non-fatal. We simply don't have SAC evidence.
+        result = False
+
+    _SAC_CHECK_CACHE[0] = now + _SAC_CHECK_TTL_S
+    _SAC_CHECK_CACHE[1] = result
+    return result
+
+
+def _claude_reachable() -> bool:
+    """Is the Claude cloud path usable right now? True only when the backend is
+    Claude AND a key is present. (We deliberately do NOT fire a network ping
+    here — this gates whether to ATTEMPT Claude as a fallback; the attempt's own
+    try/except handles an actually-down cloud.) Ollama-backend installs and
+    keyless installs return False, so the honest 'both down' message fires."""
+    try:
+        if AI_BACKEND != "claude":
+            return False
+        return bool((os.environ.get("ANTHROPIC_API_KEY") or "").strip())
+    except Exception:
+        return False
+
+
+def _claude_oneshot(system: str, messages: list, max_tokens: int = 500) -> str | None:
+    """Single Claude completion used as the cloud fallback when the LOCAL model
+    fails on a 'local'-routed turn. Returns the text, or None if the cloud is
+    unreachable / errors (caller then emits the honest both-down message).
+    Mirrors the timeout + client-reuse the main _call_llm Claude path uses."""
+    if not _claude_reachable():
+        return None
+    try:
+        # Prefer the shared, instrumented client wrapper (same path _call_llm
+        # uses); fall back to a direct anthropic client otherwise. Either way
+        # the call is bounded by _ANTHROPIC_TIMEOUT_S so a hung cloud socket
+        # can't freeze the voice thread.
+        if _llm_client is not None:
+            return _llm_client.complete(
+                model=CLAUDE_MODEL, max_tokens=max_tokens,
+                system=system, messages=messages,
+                timeout=_ANTHROPIC_TIMEOUT_S,
+            )
+        import anthropic as _anthropic
+        msg = _anthropic.Anthropic(timeout=_ANTHROPIC_TIMEOUT_S).messages.create(
+            model=CLAUDE_MODEL, max_tokens=max_tokens,
+            system=system, messages=messages,
+        )
+        return msg.content[0].text
+    except Exception as _e:
+        print(f"  [local-llm] cloud fallback also failed ({type(_e).__name__}: {_e})")
+        return None
+
+
+def _local_unavailable_message() -> str:
+    """The honest, user-facing sentence to speak when the local brain couldn't
+    answer AND the cloud isn't an option either. Specific when we have evidence
+    Smart App Control blocked the runner this boot; generic otherwise. Never
+    fabricates an answer to the user's actual question."""
+    if _sac_blocked_local_recently():
+        return ("Windows Smart App Control blocked my local model this boot, "
+                "sir — and I can't reach the cloud either, so I'm unable to "
+                "answer that right now.")
+    return ("My local model isn't responding and I can't reach the cloud "
+            "either, sir.")
+
+
+def _local_then_cloud_or_honest(sys_prompt: str, messages: list,
+                                max_tokens: int = 500) -> str:
+    """LOCAL-routed turn with honest resilience. Try the local model; if it
+    can't answer this turn, fall back to Claude when reachable; if neither
+    works, return an honest sentence (never a fabricated answer).
+
+    This is the 'local' route's counterpart to _call_llm's Claude-first path:
+    there, Claude is tried first and local is the safety net; here local is
+    primary and Claude is the safety net."""
+    text = _call_local_llm(sys_prompt, messages, max_tokens=max_tokens)
+    if text:
+        t = text.lstrip()
+        if t.startswith("[local]"):
+            t = t[len("[local]"):].lstrip()
+        return t
+    # Local didn't answer. Prefer the cloud if we can reach it.
+    cloud = _claude_oneshot(sys_prompt, messages, max_tokens=max_tokens)
+    if cloud:
+        if _sac_blocked_local_recently():
+            print("  [local-llm] SAC blocked the local runner this boot — "
+                  "served this turn from the cloud instead")
+        else:
+            print("  [local-llm] local model unavailable — served this turn "
+                  "from the cloud instead")
+        return cloud
+    # Neither local nor cloud. Be honest; never fabricate.
+    print("  [local-llm] BOTH local and cloud unavailable — returning honest "
+          "unavailability message (no fabrication)")
+    return _local_unavailable_message()
+
+
+# Guard so the boot warm-up fires at most once per process.
+_LOCAL_WARMUP_TRIGGERED = [False]
+
+
+def _warm_up_local_llm_async() -> None:
+    """Non-blocking boot warm-up: confirm the local model actually GENERATES
+    (not merely that /api/tags answers 200 — the SAC-blocked-runner case passes
+    that check but can't generate). Runs a tiny 1-token generate on a daemon
+    thread so it NEVER delays boot, logs which model answered + that it's now
+    resident, and is otherwise best-effort. Pays the one-time model-load cost
+    up front so the first real user turn (and the 50 s generate read budget)
+    isn't competing with a cold 19 GB VRAM load.
+
+    Gated OFF in staging / test (JARVIS_STAGING / JARVIS_TEST_MODE / the
+    singleton sentinel) so the import-harness and the blue/green staging
+    instance don't spin a real Ollama generate."""
+    if _LOCAL_WARMUP_TRIGGERED[0]:
+        return
+    _LOCAL_WARMUP_TRIGGERED[0] = True
+    # Match the codebase's staging/test sentinel pattern: never warm up under
+    # the test harness or the staging instance.
+    if (os.environ.get("JARVIS_STAGING", "").strip() == "1"
+            or os.environ.get("JARVIS_TEST_MODE", "").strip() == "1"
+            or "--staging" in sys.argv
+            or _is_staging()):
+        return
+    if not LOCAL_LLM_FALLBACK:
+        return
+
+    def _do() -> None:
+        try:
+            if not _ollama_alive():
+                # Ollama not up yet — the normal lazy path (_call_local_llm)
+                # will install/pull on first real use; nothing to warm.
+                print("  [local-llm] warm-up skipped — Ollama not reachable yet")
+                return
+            model = _get_local_llm_model()
+            if not _ollama_has_model(model):
+                # Not pulled yet; _call_local_llm kicks the background pull on
+                # first real use. Don't duplicate that here.
+                print(f"  [local-llm] warm-up skipped — `{model}` not pulled yet")
+                return
+            t0 = time.monotonic()
+            # Confirm it GENERATES. 1 token, keep_alive so it stays resident.
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": "ok"}],
+                "stream": False,
+                "options": {"num_predict": 1, "num_ctx": _local_num_ctx(model)},
+                "keep_alive": "20m",
+            }
+            r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat", json=payload,
+                              timeout=_LOCAL_GENERATE_TIMEOUT)
+            dt = time.monotonic() - t0
+            if r.ok:
+                print(f"  [local-llm] warm-up OK — `{model}` generated in "
+                      f"{dt:.1f}s and is now resident (num_ctx="
+                      f"{_local_num_ctx(model)})")
+            else:
+                print(f"  [local-llm] warm-up FAILED — `{model}` HTTP "
+                      f"{r.status_code}: {r.text[:160]}")
+        except requests.Timeout:
+            # Up on /api/tags but couldn't generate within the budget — the
+            # exact blocked/wedged-runner signature. Surface SAC if we can.
+            if _sac_blocked_local_recently():
+                print("  [local-llm] warm-up FAILED — runner up but did not "
+                      "generate; Smart App Control appears to have blocked it "
+                      "this boot. Foreground turns will fall back to the cloud.")
+            else:
+                print("  [local-llm] warm-up FAILED — runner up on /api/tags "
+                      "but did not generate within the budget (blocked/wedged "
+                      "runner?). Foreground turns will fall back to the cloud.")
+        except Exception as _e:
+            print(f"  [local-llm] warm-up error (non-fatal): "
+                  f"{type(_e).__name__}: {_e}")
+
+    threading.Thread(target=_do, daemon=True, name="local-llm-warmup").start()
 
 
 # ── Local VLM (vision) over the same Ollama instance ─────────────────────
@@ -6106,7 +6405,11 @@ def _call_llm(user_text: str) -> str:
 
     from core.config import model_route
     if model_route("chat") == "local":
-        reply = _local_fallback_or(sys_prompt_now, "(the local model is unavailable, sir)")
+        # LOCAL-routed turn: local model is primary. On local failure, fall
+        # back to Claude if reachable, else speak an HONEST unavailability line
+        # (SAC-specific when we have evidence) — never a fabricated answer and
+        # never a silent freeze (the generate read-timeout trips the fallback).
+        reply = _local_then_cloud_or_honest(sys_prompt_now, conversation_history)
     elif AI_BACKEND == "claude":
         import anthropic
         try:
@@ -14799,6 +15102,14 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     # incident history. Camera + cublas results gate downstream behaviour
     # (CAMERAS may shrink; _force_whisper_cpu_int8 may flip).
     _startup_preflight()
+
+    # Non-blocking: confirm the LOCAL brain actually generates (not just that
+    # /api/tags answers) and warm it resident so the first fallback turn is
+    # fast. Daemon thread — never delays boot; gated off in staging/test.
+    try:
+        _warm_up_local_llm_async()
+    except Exception as _e:
+        print(f"  [local-llm] warm-up launch failed (non-fatal): {_e}")
 
     _ensure_whisper()   # load now so first user utterance isn't delayed
 
