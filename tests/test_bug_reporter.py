@@ -334,7 +334,11 @@ class ApiSubmitTests(unittest.TestCase):
                if k not in ("JARVIS_GITHUB_TOKEN", "GITHUB_TOKEN")}
         with mock.patch.dict(os.environ, env, clear=True):
             self.assertIsNone(bug_reporter._issue_token())
-        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "g"}):
+        # clear=True drops any real JARVIS_GITHUB_TOKEN in the dev-box env so the
+        # GITHUB_TOKEN fallback is what _issue_token() returns (JARVIS_GITHUB_TOKEN
+        # has priority — leaving it set fails this test on a box that has one,
+        # while CI, which has neither, passed regardless).
+        with mock.patch.dict(os.environ, {**env, "GITHUB_TOKEN": "g"}, clear=True):
             self.assertEqual(bug_reporter._issue_token(), "g")
 
     def test_api_submit_no_token_returns_none(self):

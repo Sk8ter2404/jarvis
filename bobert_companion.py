@@ -5765,7 +5765,7 @@ def _local_cheatsheet() -> str:
         "ordinary conversation, just reply normally with no token.\n\n"
         "Most-used actions:\n"
         "  [ACTION: play_music, <artist/song/playlist>]   play music in the browser\n"
-        "  [ACTION: play_playlist, <name>]   play one of sir's OWN iTunes playlists ('shuffle ' prefix shuffles)\n"
+        "  [ACTION: play_playlist, <name>]   play ANY named playlist — prefers sir's local iTunes library, auto-falls back to Apple Music streaming if not owned ('shuffle ' prefix shuffles). Use this for every 'play my/the <name> playlist', NOT apple_music.\n"
         "  [ACTION: list_playlists]   list sir's iTunes playlists   [ACTION: shuffle_library]   shuffle all music\n"
         "  [ACTION: pause_music]  [ACTION: resume_music]  [ACTION: next_song]\n"
         "  [ACTION: media_playpause]  [ACTION: media_next]  [ACTION: media_prev]\n"

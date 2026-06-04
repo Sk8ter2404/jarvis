@@ -5,6 +5,12 @@ Adds the library/playlist commands the existing music actions lacked:
   * list_playlists          — read back the playlists you have ("what playlists do I have")
   * shuffle_library         — shuffle-play your whole music library ("shuffle my music")
 
+play_playlist ALWAYS prefers the local iTunes COM route (instant, no fragile
+vision-clicking). When the requested name isn't in the local library — or iTunes
+itself is unreachable — it AUTOMATICALLY falls back to the monolith's browser
+`apple_music` action so an Apple-Music-curated playlist the user doesn't own can
+still stream. See `_apple_music_fallback`.
+
 Song / album / artist playback is already handled by the existing `play_music`
 action (it understands song:/album:/artist:/library: prefixes); this skill fills
 the playlist-by-name gap that `play_music` could not reach.
@@ -16,6 +22,8 @@ touch here is wrapped — any failure degrades to a spoken-friendly line, never 
 exception that could crash the action dispatcher.
 """
 from __future__ import annotations
+
+import sys
 
 from audio import itunes_bridge
 
@@ -95,18 +103,49 @@ def _strip_shuffle(text):
     return t, False
 
 
+def _apple_music_fallback(query: str) -> str | None:
+    """Last-resort route for a playlist NOT in the local iTunes library: hand
+    the request to the monolith's browser-based `apple_music` action so an
+    Apple-Music-curated playlist (one the user doesn't own) can still stream.
+
+    Reaches the running monolith via sys.modules (it runs as __main__, or is
+    importable as bobert_companion) and calls ACTIONS["apple_music"](query).
+    Returns the action's spoken string, or None if the monolith / action isn't
+    reachable for any reason — every failure degrades to None, never raises, so
+    play_playlist can fall through to its own not-found message."""
+    try:
+        bc = sys.modules.get("__main__") or sys.modules.get("bobert_companion")
+        actions = getattr(bc, "ACTIONS", None)
+        if actions and "apple_music" in actions:
+            result = actions["apple_music"](query)
+            return result if isinstance(result, str) else None
+    except Exception:
+        return None
+    return None
+
+
 def play_playlist(arg: str) -> str:
     name_q, shuffle = _strip_shuffle(arg)
     if not name_q:
         return "Which playlist would you like, sir?"
     app, err = itunes_bridge.get_client(force=True)
     if app is None:
+        # iTunes COM unreachable → try streaming the playlist on Apple Music.
+        fb = _apple_music_fallback(name_q + (" shuffle" if shuffle else ""))
+        if fb:
+            return fb
         return err or "iTunes isn't reachable right now, sir."
     try:
         pl, name = _match_playlist(_user_playlists(app), name_q)
     except Exception as e:
         return f"I couldn't read your playlists, sir: {e}"
     if pl is None:
+        # Not one of the user's OWN playlists → fall through to Apple Music
+        # streaming (e.g. a curated playlist they don't own). The apple_music
+        # action speaks its own sensible line, so return it as-is.
+        fb = _apple_music_fallback(name_q + (" shuffle" if shuffle else ""))
+        if fb:
+            return fb
         return f"I couldn't find a playlist called '{name_q}', sir."
     try:
         if shuffle:

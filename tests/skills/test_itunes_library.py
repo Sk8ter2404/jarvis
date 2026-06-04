@@ -6,6 +6,8 @@ COM or iTunes process is touched. Playlist names here are deliberately generic
 """
 from __future__ import annotations
 
+import sys
+import types
 import unittest
 from unittest import mock
 
@@ -182,6 +184,97 @@ class PlayPlaylistTests(unittest.TestCase):
         with _patch_client(_BadApp()):
             out = M.play_playlist("road trip")
         self.assertIn("couldn't read", out.lower())
+
+
+# ─── Apple Music fallback (iTunes-preferred, browser fallback) ──────────────
+
+def _fake_monolith(apple_music_fn):
+    """A stand-in __main__ module exposing an ACTIONS dict whose 'apple_music'
+    entry is `apple_music_fn` — mirrors how the live monolith is reached."""
+    bc = types.ModuleType("__main__")
+    bc.ACTIONS = {"apple_music": apple_music_fn}
+    return bc
+
+
+class AppleMusicFallbackTests(unittest.TestCase):
+    """play_playlist prefers local iTunes COM and only reaches the browser
+    apple_music action when the playlist isn't owned (or iTunes is down)."""
+
+    def setUp(self):
+        self.trip = _FakePlaylist("Road Trip", kind=2, special=0)
+        self.rock = _FakePlaylist("90s Rock", kind=2, special=0)
+        self.app = _FakeApp([
+            _FakePlaylist("Library", kind=1),
+            _FakePlaylist("Music", kind=2, special=4),
+            self.trip, self.rock,
+        ])
+
+    def test_found_playlist_does_not_call_fallback(self):
+        fb = mock.Mock(return_value="should not be used")
+        with _patch_client(self.app), \
+                mock.patch.object(M, "_apple_music_fallback") as patched_fb:
+            out = M.play_playlist("road trip")
+        self.assertTrue(self.trip.played)
+        self.assertIn("Road Trip", out)
+        patched_fb.assert_not_called()
+        fb.assert_not_called()
+
+    def test_not_found_calls_fallback_and_returns_its_string(self):
+        am = mock.Mock(return_value="Queueing Michael Jackson Essentials on Apple Music, sir.")
+        with _patch_client(self.app), \
+                mock.patch.dict(sys.modules, {"__main__": _fake_monolith(am)}):
+            sys.modules.pop("bobert_companion", None)
+            out = M.play_playlist("Michael Jackson Essentials")
+        am.assert_called_once()
+        self.assertEqual(out, "Queueing Michael Jackson Essentials on Apple Music, sir.")
+
+    def test_itunes_unreachable_calls_fallback(self):
+        am = mock.Mock(return_value="Playing it on Apple Music, sir.")
+        with _patch_client(None, "iTunes isn't running, sir."), \
+                mock.patch.dict(sys.modules, {"__main__": _fake_monolith(am)}):
+            sys.modules.pop("bobert_companion", None)
+            out = M.play_playlist("some streaming mix")
+        am.assert_called_once()
+        self.assertEqual(out, "Playing it on Apple Music, sir.")
+
+    def test_fallback_query_carries_shuffle(self):
+        am = mock.Mock(return_value="Shuffling it on Apple Music, sir.")
+        with _patch_client(self.app), \
+                mock.patch.dict(sys.modules, {"__main__": _fake_monolith(am)}):
+            sys.modules.pop("bobert_companion", None)
+            M.play_playlist("shuffle Curated Hype")
+        am.assert_called_once()
+        sent = am.call_args.args[0]
+        self.assertIn("Curated Hype", sent)
+        self.assertTrue(sent.endswith(" shuffle"))
+
+    def test_fallback_unavailable_returns_not_found(self):
+        # No ACTIONS at all on the monolith → fallback yields None → original
+        # not-found message, no exception.
+        empty = types.ModuleType("__main__")  # no ACTIONS attribute
+        with _patch_client(self.app), \
+                mock.patch.dict(sys.modules, {"__main__": empty}):
+            sys.modules.pop("bobert_companion", None)
+            out = M.play_playlist("nope nope")
+        self.assertIn("couldn't find", out.lower())
+
+    def test_fallback_swallows_action_exception(self):
+        # apple_music action raises → fallback returns None → not-found message.
+        boom = mock.Mock(side_effect=RuntimeError("vision broke"))
+        with _patch_client(self.app), \
+                mock.patch.dict(sys.modules, {"__main__": _fake_monolith(boom)}):
+            sys.modules.pop("bobert_companion", None)
+            out = M.play_playlist("still missing")
+        self.assertIn("couldn't find", out.lower())
+
+    def test_fallback_non_string_result_returns_not_found(self):
+        # apple_music returns a non-string → treated as no result → not-found.
+        weird = mock.Mock(return_value=object())
+        with _patch_client(self.app), \
+                mock.patch.dict(sys.modules, {"__main__": _fake_monolith(weird)}):
+            sys.modules.pop("bobert_companion", None)
+            out = M.play_playlist("missing too")
+        self.assertIn("couldn't find", out.lower())
 
 
 # ─── list_playlists ────────────────────────────────────────────────────────
