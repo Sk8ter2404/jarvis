@@ -2,9 +2,13 @@
 Timer / reminder skill for JARVIS.
 
 Actions added:
-  set_timer, <duration> | <message>   e.g. "5 minutes | check the oven"
+  set_timer, <duration> [| <message>] e.g. "5 minutes", "5 minutes for tea",
+                                      "an hour and a half", or the legacy
+                                      "5 minutes | check the oven"
   list_timers                         show what's pending
-  cancel_timer, <id>                  cancel by id
+  cancel_timer[, <id|label|all>]      no arg → cancel the running/soonest one;
+                                      a number → that id; "all" → clear all;
+                                      text → match a timer by its message
 
 When a timer fires it writes the reminder to pending_speech.json in the project
 root. The JARVIS main loop polls that file between listen cycles and speaks any
@@ -37,24 +41,129 @@ _next_id = [1]
 _lock    = threading.Lock()
 
 
+# Spelled-out small numbers the LLM (and users) emit in voice transcripts:
+# "set a timer for five minutes", "ten min". Kept short — anything bigger is
+# almost always dictated as digits.
+_WORD_NUMBERS = {
+    "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "twenty": 20, "thirty": 30, "forty": 40, "forty-five": 45, "forty five": 45,
+    "sixty": 60, "ninety": 90,
+}
+
+# A number followed by a unit word, as two shapes unified into one finditer
+# via an alternation:
+#   digits + (optionally bare-letter) unit:  "10m", "5 min", "30 seconds"
+#   spelled word + a SPELLED-OUT unit only:  "five minutes", "ten min"
+# Bare single-letter units (s/m/h/d) are allowed ONLY after digits — nobody
+# writes "tenm", and allowing a lone letter after a word makes the 'd' in
+# "and" parse as a day. group(1)/group(2) = digit form; group(3)/group(4) = word form.
+_DUR_UNIT_RE = re.compile(
+    r"\b(\d+(?:\.\d+)?)\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d)\b"
+    r"|"
+    r"\b([a-z]+)\s+(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)\b"
+)
+
+# "half an hour" / "half a minute" — the whole span, so we can both add 0.5
+# of the unit AND remove it from the text before the digit+unit scan (else
+# the 'an hour' inside would also score a full hour).
+_HALF_UNIT_RE = re.compile(
+    r"\bhalf\s+(?:an?\s+)?(hour|hr|minute|min|day|second|sec)s?\b")
+# "<unit> and a half" → add 0.5 of that trailing unit.
+_AND_HALF_RE = re.compile(
+    r"\b(hour|hr|minute|min|day|second|sec)s?\s+and\s+a\s+half\b")
+
+
+def _unit_seconds(unit: str) -> int:
+    if unit in ("s",) or unit.startswith("sec"):
+        return 1
+    if unit in ("m",) or unit.startswith("min"):
+        return 60
+    if unit in ("h",) or unit.startswith(("hr", "hour")):
+        return 3600
+    if unit in ("d",) or unit.startswith("day"):
+        return 86400
+    return 0
+
+
+def _word_to_num(tok: str) -> float | None:
+    tok = tok.strip()
+    try:
+        return float(tok)
+    except ValueError:
+        return _WORD_NUMBERS.get(tok)
+
+
 def _parse_duration(text: str) -> int | None:
-    """Parse '5 minutes', '30 seconds', '2 hours', '1 day' → total seconds."""
-    text = text.strip().lower()
-    total = 0
+    """Parse a free-text duration → total seconds, or None if unparseable.
+
+    Handles the shapes the local LLM and users actually emit:
+      '5 minutes', '30 seconds', '2 hours', '1 day'   (digit + unit)
+      '5 min', '10m', '90 secs', '1h'                 (abbrev / bare-letter unit)
+      'five minutes', 'an hour', 'ten min'            (spelled-out number)
+      '1 hour 30 minutes', '2 hours 15 minutes'       (combined units, summed)
+      'an hour and a half', 'half an hour'            ('and a half' / 'half a')
+      '5'                                             (bare number → minutes)
+    """
+    text = (text or "").strip().lower()
+    if not text:
+        return None
+
+    total = 0.0
     found = False
-    pattern = r"(\d+)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)"
-    for n, unit in re.findall(pattern, text):
-        n = int(n)
-        if unit.startswith(("sec",)):
-            total += n
-        elif unit.startswith(("min",)):
-            total += n * 60
-        elif unit.startswith(("hr", "hour")):
-            total += n * 3600
-        elif unit.startswith("day"):
-            total += n * 86400
+
+    # '<unit> and a half' first (covers 'an hour and a half') — add 0.5 of the
+    # trailing unit. The leading 'an hour' is still scored as a full unit below.
+    tail = _AND_HALF_RE.search(text)
+    if tail:
+        total += 0.5 * _unit_seconds(tail.group(1))
         found = True
-    return total if found else None
+
+    # 'half an hour' / 'half a minute' → 0.5 of the named unit, then REMOVE the
+    # span so the 'an hour' inside it isn't double-counted as a full hour.
+    def _half_repl(m):
+        nonlocal total, found
+        total += 0.5 * _unit_seconds(m.group(1))
+        found = True
+        return " "
+    text = _HALF_UNIT_RE.sub(_half_repl, text)
+
+    for m in _DUR_UNIT_RE.finditer(text):
+        num_tok = m.group(1) if m.group(1) is not None else m.group(3)
+        unit_tok = m.group(2) if m.group(2) is not None else m.group(4)
+        num = _word_to_num(num_tok)
+        if num is None:
+            continue
+        per = _unit_seconds(unit_tok)
+        if per:
+            total += num * per
+            found = True
+
+    if not found:
+        # Bare number with no unit ("5", "for 5", "set a timer for 5") — JARVIS
+        # convention is minutes, matching how people speak. Accept a lone digit
+        # token anywhere, or a single spelled-out number word.
+        digits = re.findall(r"\d+(?:\.\d+)?", text)
+        if len(digits) == 1:
+            num = float(digits[0])
+            if num > 0:
+                return int(round(num * 60))
+        if not digits:
+            # No digits → try a single spelled-out number word ("five").
+            # Exclude the articles 'a'/'an' (they're filler here, not a real
+            # count — otherwise "set a timer" with no number → a phantom 1-min
+            # timer). A real count requires an explicit number word.
+            words = [w for w in re.findall(r"[a-z]+", text)
+                     if w in _WORD_NUMBERS and w not in ("a", "an")]
+            if len(words) == 1:
+                num = _WORD_NUMBERS[words[0]]
+                if num > 0:
+                    return int(round(num * 60))
+        return None
+
+    secs = int(round(total))
+    return secs if secs > 0 else None
 
 
 def _enqueue_speech(message: str):
@@ -163,16 +272,66 @@ def restore_timers(payload: list) -> int:
     return restored
 
 
+# Words that introduce a label after a duration in free text:
+# "5 minutes FOR tea", "10 min TO check the oven", "30 seconds, then stretch".
+_LABEL_INTRO_RE = re.compile(r"\b(?:for|to|about|that|then|and)\b", re.IGNORECASE)
+
+
+def _split_timer_args(args: str) -> tuple[int | None, str]:
+    """Pull a (duration_seconds, label) pair out of whatever the LLM emitted.
+
+    Accepts, in priority order:
+      1. legacy 'duration | message'      → '5 minutes | check the oven'
+      2. duration + 'for/to' label        → '5 minutes for tea', '10 min to stretch'
+      3. label-then-duration              → 'tea timer 5 minutes', 'oven 10 min'
+      4. bare duration, no label          → '5 minutes', 'an hour', '5'
+    Returns (None, '') when no duration can be found so the caller can emit an
+    HONEST parse-failure instead of silently inventing one.
+    """
+    raw = (args or "").strip()
+    if not raw:
+        return None, ""
+
+    # 1. Legacy pipe form — keep supporting it verbatim.
+    if "|" in raw:
+        dur_str, label = (s.strip() for s in raw.split("|", 1))
+        return _parse_duration(dur_str), label
+
+    # 2/3. There's a duration token somewhere; split the string around the
+    # FIRST number+unit match so text on either side becomes the label.
+    m = _DUR_UNIT_RE.search(raw)
+    num_tok = (m.group(1) or m.group(3)) if m else None
+    if m and num_tok is not None and _word_to_num(num_tok) is not None:
+        secs = _parse_duration(raw)  # parse the whole thing (handles compounds)
+        before = raw[:m.start()].strip(" ,.-")
+        # Label is whatever trails the duration ("for tea"), else whatever
+        # preceded it ("tea timer"). Strip a leading "for/to" connector and a
+        # trailing/leading "timer"/"reminder" noise word.
+        after = raw[m.end():].strip(" ,.-")
+        # For compound durations ("1 hour 30 minutes for tea") keep trimming
+        # trailing duration fragments out of `after`, and drop a dangling
+        # "and a half" / "a half" so it doesn't leak into the label.
+        after = _DUR_UNIT_RE.sub("", after)
+        after = re.sub(r"^\s*(?:and\s+)?a\s+half\b", "", after).strip(" ,.-")
+        label = after or before
+        label = _LABEL_INTRO_RE.sub("", label, count=1).strip(" ,.-") if label else ""
+        label = re.sub(r"\b(?:timer|reminder)\b", "", label, flags=re.IGNORECASE).strip(" ,.-")
+        return secs, label
+
+    # 4. Bare number / spelled-out number with no unit word ("5", "five").
+    return _parse_duration(raw), ""
+
+
 def register(actions):
     def set_timer(args: str) -> str:
-        if "|" not in args:
-            return "format: set_timer, <duration> | <message>  (e.g. '5 minutes | check the oven')"
-        dur_str, msg = (s.strip() for s in args.split("|", 1))
-        secs = _parse_duration(dur_str)
+        secs, msg = _split_timer_args(args)
         if secs is None or secs <= 0:
-            return f"could not parse duration '{dur_str}'. Try '5 minutes', '30 seconds', '2 hours'."
-        if not msg:
-            return "timer needs a message describing what to remind about"
+            return ("I couldn't tell how long, sir — try 'set a timer for "
+                    "5 minutes' (or '5 minutes for tea').")
+        # A label is optional; default to a generic reminder so a bare
+        # "set a timer for 5 minutes" still fires a real, speakable timer.
+        labelled = bool(msg.strip())
+        msg = msg.strip() or "your timer is up"
 
         with _lock:
             tid = _next_id[0]
@@ -197,7 +356,9 @@ def register(actions):
             when = f"{secs // 60}m {secs % 60}s" if secs % 60 else f"{secs // 60}m"
         else:
             when = f"{secs // 3600}h {(secs % 3600) // 60}m"
-        return f"timer #{tid} set — will remind you in {when}: '{msg}'"
+        if labelled:
+            return f"timer #{tid} set — will remind you in {when}: '{msg}'"
+        return f"timer #{tid} set — will remind you in {when}"
 
     def list_timers(_: str = "") -> str:
         with _lock:
@@ -216,19 +377,7 @@ def register(actions):
                 lines.append(f"  #{tid}: '{msg}' in {rem_str}")
             return f"{len(lines)} active timer(s):\n" + "\n".join(lines)
 
-    def cancel_timer(args: str) -> str:
-        args = args.strip()
-        if args.lower() == "all":
-            with _lock:
-                count = len(_timers)
-                for tid, (timer, _, _) in list(_timers.items()):
-                    timer.cancel()
-                _timers.clear()
-            return f"cancelled {count} timer(s)"
-        try:
-            tid = int(args)
-        except ValueError:
-            return "format: cancel_timer, <id>  (or 'all')"
+    def _cancel_one(tid: int) -> str:
         with _lock:
             entry = _timers.pop(tid, None)
         if entry is None:
@@ -236,6 +385,69 @@ def register(actions):
         timer, msg, _ = entry
         timer.cancel()
         return f"cancelled timer #{tid} ('{msg}')"
+
+    def cancel_timer(args: str = "") -> str:
+        """Cancel a timer from whatever the LLM emitted.
+
+        '' / 'my timer' / 'the timer' → cancel the only running one (or, if
+        several, the one firing SOONEST, and say which). 'all' → clear them
+        all. A bare number → that id. Any other text → match a timer whose
+        message contains it. Honest 'no timers' message when none exist."""
+        args = (args or "").strip()
+        low = args.lower()
+
+        # Cancel-everything.
+        if low in ("all", "everything", "them all", "all timers"):
+            with _lock:
+                count = len(_timers)
+                for _tid, (timer, _, _) in list(_timers.items()):
+                    timer.cancel()
+                _timers.clear()
+            if not count:
+                return "there are no timers running, sir."
+            return f"cancelled {count} timer(s)"
+
+        # Explicit id ("cancel timer 3").
+        m = re.search(r"\d+", args)
+        if m and m.group(0) == args.strip("#").strip():
+            return _cancel_one(int(m.group(0)))
+
+        # No specific target — pick the single running timer, or the soonest.
+        loose = (not args) or low in (
+            "my timer", "the timer", "timer", "my", "the", "it",
+            "this", "that", "my reminder", "the reminder", "reminder",
+            "current", "active",
+        )
+        if loose:
+            with _lock:
+                if not _timers:
+                    return "there are no timers running, sir."
+                # soonest to fire = smallest fire_at
+                tid = min(_timers, key=lambda k: _timers[k][2])
+                only = len(_timers) == 1
+            res = _cancel_one(tid)
+            if only or res.startswith("no timer"):
+                return res
+            return res + " (the next one due; say 'cancel all' to clear the rest)"
+
+        # Fall back to matching the timer message by substring
+        # ("cancel the tea timer" → the timer whose message mentions tea).
+        with _lock:
+            if not _timers:
+                return "there are no timers running, sir."
+            needle = re.sub(r"\b(?:timer|reminder|for|the|my)\b", "", low).strip()
+            matches = [tid for tid, (_, msg, _) in _timers.items()
+                       if needle and needle in msg.lower()]
+        if len(matches) == 1:
+            return _cancel_one(matches[0])
+        if len(matches) > 1:
+            return (f"several timers match '{needle}', sir — "
+                    f"say the number: {', '.join(f'#{t}' for t in sorted(matches))}.")
+        # Bare number with stray chars, or unmatched label.
+        if m:
+            return _cancel_one(int(m.group(0)))
+        return (f"I don't see a timer matching '{args}', sir — "
+                "say 'list timers' to hear them, or 'cancel all'.")
 
     actions["set_timer"]    = set_timer
     actions["list_timers"]  = list_timers

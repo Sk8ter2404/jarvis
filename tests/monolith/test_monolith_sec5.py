@@ -2179,6 +2179,90 @@ class PreemptiveHallucinationTests(SectionFiveBase):
         self.assertIsNone(name)
 
 
+class FabricatedInfoHallucinationTests(SectionFiveBase):
+    """BUG 2 — local qwen fabricates time/version/weather/system answers from
+    its head instead of emitting the action. The preemptive guard must inject
+    the correct action when the drafted reply ASSERTS one of these facts with
+    no [ACTION:] token, and must NOT trip on ordinary prose.
+
+    The info actions get_time/version_info/system_pulse are core-registered;
+    weather_briefing/list_timers/whats_broken come from skills, so the cases
+    that need them register a stub into a patched ACTIONS so the test is
+    self-contained whether or not skills were loaded into the cached monolith.
+    """
+
+    def _detect_with_actions(self, reply, extra=()):
+        bc = self.bc
+        actions = dict(bc.ACTIONS)
+        for name in extra:
+            actions.setdefault(name, lambda _="": "stub")
+        with mock.patch.object(bc, "ACTIONS", actions):
+            return bc._detect_preemptive_hallucination(reply)
+
+    def _assert_injects(self, reply, action, extra=()):
+        out = self._detect_with_actions(reply, extra=extra)
+        self.assertIsNotNone(out, f"expected an inject for: {reply!r}")
+        verb, name, _desc = out
+        self.assertEqual(verb, "inject", f"expected inject for: {reply!r}")
+        self.assertEqual(name, action, f"wrong action for: {reply!r}")
+
+    # ── fabricated time → get_time ───────────────────────────────────────
+    def test_fabricated_clock_time_injects_get_time(self):
+        for reply in ("It's 1:47 AM, sir.",
+                      "The current time is 10:52 PM.",
+                      "Right now it's 9 AM."):
+            self._assert_injects(reply, "get_time")
+
+    # ── fabricated version → version_info ────────────────────────────────
+    def test_fabricated_version_injects_version_info(self):
+        for reply in ("I'm on version 12.4, sir.",
+                      "I'm running 1.20.6.",
+                      "Running version 3, sir."):
+            self._assert_injects(reply, "version_info")
+
+    # ── fabricated weather → weather_briefing ────────────────────────────
+    def test_fabricated_weather_injects_weather_briefing(self):
+        for reply in ("It's currently 64 degrees and sunny.",
+                      "Currently 58 degrees Fahrenheit, sir.",
+                      "It's 72 degrees and clear right now."):
+            self._assert_injects(reply, "weather_briefing",
+                                 extra=("weather_briefing",))
+
+    # ── fabricated system stats → system_pulse ───────────────────────────
+    def test_fabricated_system_stats_injects_system_pulse(self):
+        # system_pulse is skill-registered; supply it so the test is
+        # self-contained whether or not skills loaded into the cached monolith.
+        for reply in ("CPU is at 40% and memory is at 80%.",
+                      "You're running at 12% CPU, sir.",
+                      "Memory usage is 73%, sir."):
+            self._assert_injects(reply, "system_pulse", extra=("system_pulse",))
+
+    # ── conservative: ordinary prose must NOT trip ───────────────────────
+    def test_no_false_positive_on_innocuous_prose(self):
+        for reply in (
+            "It's 5 minutes left on your timer, sir.",   # 'it's N' but not a clock
+            "It's time to head out, sir.",
+            "I use version control for that.",
+            "You're running late for the meeting.",
+            "Turn it 90 degrees to the right.",          # rotation, not weather
+            "Rotate the model 45 degrees, sir.",
+            "The CPU handles that workload fine.",       # no number
+            "I'm 100% certain, sir.",                    # % but not cpu/ram
+            "There is a newer version available.",       # 'version' but no number
+            "It will take about 5 minutes to finish.",
+            "The weather looks pleasant today, sir.",
+        ):
+            out = self._detect_with_actions(
+                reply, extra=("weather_briefing",))
+            self.assertIsNone(out, f"false positive on: {reply!r}")
+
+    # ── never overrides an explicit action token ─────────────────────────
+    def test_skips_when_action_token_already_present(self):
+        out = self._detect_with_actions(
+            "One moment, sir. It's 1:47 AM. [ACTION: get_time]")
+        self.assertIsNone(out)
+
+
 class NeedsConfirmationTests(SectionFiveBase):
     def test_empty_keyword_list_never_confirms(self):
         bc = self.bc
