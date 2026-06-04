@@ -5391,12 +5391,28 @@ def transcribe(audio: np.ndarray) -> tuple[str, dict]:
             # faster-whisper returns (segments_generator, info). Drain to a
             # list so we can compute averages. vad_filter=True skips
             # 'inaudible' chunks; same model dims as openai-whisper.
+            # vad_filter=True runs faster-whisper's built-in Silero VAD before
+            # transcribing; on quiet/desk mics it frequently drops LEGITIMATE
+            # speech (a real "JARVIS" scores below the gate) and returns zero
+            # segments -> "". Use a permissive threshold, and if it STILL finds
+            # nothing, retry ONCE WITHOUT the VAD filter so a genuine utterance
+            # is never silently lost — the difference between "heard you" and a
+            # wall of [standby] ignored: ''. The caller's audio already cleared
+            # the mic VAD gate, so it is not pure silence.
             segments_gen, info = _stt.transcribe(
                 audio, language="en",
                 vad_filter=True,
+                vad_parameters=dict(threshold=0.3, min_speech_duration_ms=80),
                 beam_size=5,
             )
             segments = list(segments_gen)
+            if not segments:
+                segments_gen, info = _stt.transcribe(
+                    audio, language="en",
+                    vad_filter=False,
+                    beam_size=5,
+                )
+                segments = list(segments_gen)
             text = " ".join((s.text or "").strip() for s in segments).strip()
             if not segments:
                 # info still carries some signal even on empty transcription
