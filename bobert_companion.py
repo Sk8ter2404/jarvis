@@ -10947,6 +10947,39 @@ INFORMATIVE_ACTIONS = {
     "open_url", "web_search",
 }
 
+# Actions whose RESULT is already a finished, user-facing sentence that should
+# be SPOKEN VERBATIM — no follow-up LLM round-trip to restate it. These are NOT
+# in INFORMATIVE_ACTIONS on purpose: routing "I'm on version 1.20.4, last
+# updated this morning at 7:03 AM, sir." back through get_followup_response just
+# burns an LLM call to re-phrase a perfect string (and risks the LLM dropping or
+# garbling the number). Instead, the main turn loop speaks the result directly,
+# right after the inline reply, via the SAME _speak() path.
+#
+# THE BUG THIS FIXES (live session 2026-06-03): "what version are you on?" ran
+# version_info, which returned the answer to the LOG, but the user only heard
+# the "One moment, sir." preamble. version_info wasn't in INFORMATIVE_ACTIONS
+# (so no follow-up fired) and its result isn't a failure (so the failure
+# follow-up didn't fire either) — the answer was dropped on the floor. Same
+# class as the earlier check_print fix, but these results don't NEED an LLM to
+# read them back, so they get spoken verbatim rather than re-summarised.
+#
+# GUARDRAIL — only put actions here whose result is a complete spoken sentence
+# the user explicitly asked for AND that is NOT already covered by a spoken
+# confirmation. Side-effect actions (play_music / volume_up / set_timer / …)
+# must NEVER go here: their effect is the point and the inline reply already
+# confirms them, so verbatim-speaking their result would double-speak. The
+# speaker also skips any result that's already a substring of what was just
+# spoken, and skips failure results (those still route through the failure
+# follow-up). Skills register status-report aliases into ACTIONS after boot, so
+# they can extend this set the same way they extend INFORMATIVE_ACTIONS.
+SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
+    # Version / last-upgrade readout (core.actions._act_version_info + aliases).
+    "version_info", "what_version", "when_updated",
+    # Single-sentence health/status aggregator (skills/system_pulse.py) and its
+    # natural-phrasing aliases. Each returns one finished status sentence.
+    "system_pulse", "check_system", "status_report",
+}
+
 # Actions whose runtime can plausibly exceed MID_TASK_STATUS_DELAY (~8 s).
 # A timer wrapped around fn(arg) in parse_and_run_actions speaks ONE dry
 # status line if the action is still running by then — bridging the silent
@@ -12267,6 +12300,63 @@ def _apply_quip_layer(spoken_text: str,
     except Exception as _e:
         print(f"  [quip] layer skipped: {_e}")
         return spoken_text
+
+
+def _speak_verbatim_results(
+    action_results: list[tuple[str, str, bool]],
+    already_spoken: str = "",
+) -> set[str]:
+    """Speak the result of any SPEAK_RESULT_VERBATIM_ACTIONS action directly,
+    so informational answers that are already finished sentences (version_info,
+    system_pulse, …) are voiced instead of merely logged.
+
+    These actions are deliberately NOT in INFORMATIVE_ACTIONS — their result is
+    a complete, user-facing sentence that needs no LLM restatement — so without
+    this the main loop's follow-up never fires and the answer is dropped (the
+    2026-06-03 "you didn't speak it" bug). Speaks through the same _speak() path
+    the inline reply uses, right after it.
+
+    Guardrails against double-speak / noise:
+      * Only acts on actions in the explicit verbatim allow-list, so side-effect
+        actions (play_music / volume_up / set_timer) are never touched.
+      * Skips a result already contained in ``already_spoken`` (e.g. the LLM
+        inlined the answer in its prose, or the quip layer already carried it),
+        comparing case-insensitively so a fresh re-speak is suppressed.
+      * Skips failure results — those still route through the failure follow-up
+        loop so JARVIS reports the problem rather than reading a raw error.
+      * Skips empty / sentinel results.
+
+    Returns the set of action names whose result was spoken, so the caller can
+    mark them handled and avoid any later re-speak.
+    """
+    spoken_names: set[str] = set()
+    if not action_results:
+        return spoken_names
+    prior = (already_spoken or "").lower()
+    fail_markers = tuple(m.lower() for m in FAILURE_MARKERS)
+    for name, result, _is_info in action_results:
+        if not name or name.lower() not in SPEAK_RESULT_VERBATIM_ACTIONS:
+            continue
+        text = (result or "").strip()
+        if not text:
+            continue
+        low = text.lower()
+        # A failure ("could not read version info: …") belongs to the failure
+        # follow-up path, not a verbatim read-back.
+        if any(m in low for m in fail_markers):
+            continue
+        # Already voiced as part of the inline reply / quip — don't repeat it.
+        if low in prior:
+            continue
+        try:
+            _speak(text)
+            spoken_names.add(name.lower())
+            # Fold into the running spoken text so a duplicate result from a
+            # second action in the same reply isn't spoken twice.
+            prior = f"{prior} {low}".strip()
+        except Exception as _e:
+            print(f"  [verbatim_result] speak failed for {name}: {_e}")
+    return spoken_names
 
 
 # _speak() can be called from multiple threads: the main turn loop, the
@@ -14308,6 +14398,13 @@ def _run_llm_dispatch(text: str) -> str:
     if spoken_text:
         _speak(spoken_text)
 
+    # Speak verbatim-result actions (version_info, system_pulse, …) directly.
+    # Their result is a finished sentence the user asked for, but they're not
+    # in INFORMATIVE_ACTIONS, so the follow-up loop below never voices them —
+    # without this the answer is logged but never spoken (the 2026-06-03
+    # "you didn't speak it" bug). Deduped against the inline reply just spoken.
+    _spoke_verbatim = _speak_verbatim_results(action_results, spoken_text)
+
     # If any informational actions ran (see_screen, etc.), feed the
     # results back so Bobert can actually report what he found.
     # Loop in case the follow-up itself emits another informative
@@ -14387,6 +14484,10 @@ def _run_llm_dispatch(text: str) -> str:
         conversation_history.append({"role": "assistant", "content": followup})
         if f_spoken:
             _speak(f_spoken)
+        # A follow-up reply can itself emit a verbatim-result action (e.g. the
+        # LLM chains system_pulse). Voice its result here too, deduped against
+        # the follow-up prose just spoken.
+        _spoke_verbatim |= _speak_verbatim_results(current_results, f_spoken)
     return reply
 
 
