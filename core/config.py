@@ -481,6 +481,17 @@ KINECT_PRESENCE_WAKE = False
 #   confirmation). Off by default; never runs in staging/test. See
 #   audio/kinect_gestures.py (recognizer) + skills/kinect_gestures.py (wiring).
 KINECT_GESTURES_ENABLED = False
+# KINECT_POINT_CONTROL_ENABLED — when True, "point-to-control": the owner points
+#   an arm at a real device (a desk lamp, a fan) and says "turn that on/off" and
+#   JARVIS controls the right smart-home device. First calibrate each device
+#   ("calibrate pointing for the desk lamp" while pointing at it) — the pointing
+#   DIRECTION is stored in a separate gitignored data/kinect_pointing.json
+#   (never user_settings.json) bound to the real device; then a pointed "turn
+#   that on" resolves the live arm ray to the closest calibrated target within
+#   ~18° and fires the EXISTING smart-home on/off path. Off by default; never
+#   drives a device in staging/test. See audio/kinect_pointing.py (geometry +
+#   store) + skills/kinect_pointing.py (wiring).
+KINECT_POINT_CONTROL_ENABLED = False
 # KINECT_GREET_ON_ENTRY — when True (and presence is enabled), JARVIS speaks a
 #   brief varied greeting when you enter a room that had been empty for a while.
 #   Hard rate-limited (≤ once/min) and skipped mid-conversation. Off by default.
