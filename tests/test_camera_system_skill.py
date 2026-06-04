@@ -431,6 +431,93 @@ class LookAroundTests(CameraSystemBase):
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# face-ID identity enrichment of the "who's here" line (soft hook)
+# ─────────────────────────────────────────────────────────────────────────
+class IdentityEnrichmentTests(CameraSystemBase):
+    """When FACE_ID_ENABLED is on and a face is recognised, where_am_i names the
+    identity alongside the Kinect count; when off/unsure, the line is unchanged."""
+
+    def _present_kinect(self, count=1):
+        return _fake_bridge(presence={"present": True, "count": count,
+                                      "nearest_m": 0.7, "facing": True,
+                                      "ts": 0.0})
+
+    def _load_present(self, *, count=1):
+        bc = _fake_monolith(frame_ages={0: 0.2, 1: 0.3}, faces={0: 0.2})
+        mod, actions = self._load(
+            bc=bc, bridge=self._present_kinect(count),
+            gaze_snapshot={"monitor": "right", "dwell_s": 12.0,
+                           "face_visible": True, "source": "face_tracker"})
+        return mod, actions
+
+    # ---- the pure clause builder -----------------------------------------
+    def test_company_clause_off_uses_kinect_count_alone(self):
+        mod, _actions = self._load_present()
+        # identity off → original phrasing
+        self.assertEqual(
+            mod._company_clause(1, True, {"on": False}), "alone")
+        self.assertEqual(
+            mod._company_clause(3, True, {"on": False}), "with 2 other people")
+        # no kinect, no identity → empty (line unchanged)
+        self.assertEqual(mod._company_clause(0, False, {"on": False}), "")
+
+    def test_company_clause_owner_alone(self):
+        mod, _actions = self._load_present()
+        clause = mod._company_clause(
+            1, True, {"on": True, "owner": True, "others": [], "unknown": 0})
+        self.assertEqual(clause, "alone")
+
+    def test_company_clause_owner_plus_unknown(self):
+        mod, _actions = self._load_present()
+        # Kinect counts 2 bodies, face-ID named only the owner → 1 unrecognised.
+        clause = mod._company_clause(
+            2, True, {"on": True, "owner": True, "others": [], "unknown": 1})
+        self.assertEqual(clause, "with one person I don't recognise")
+
+    def test_company_clause_named_other(self):
+        mod, _actions = self._load_present()
+        clause = mod._company_clause(
+            2, True, {"on": True, "owner": True, "others": ["Dana"],
+                      "unknown": 0})
+        self.assertEqual(clause, "with Dana")
+
+    def test_company_clause_named_plus_unknown(self):
+        mod, _actions = self._load_present()
+        clause = mod._company_clause(
+            3, True, {"on": True, "owner": True, "others": ["Dana"],
+                      "unknown": 1})
+        self.assertIn("Dana", clause)
+        self.assertIn("don't recognise", clause)
+
+    # ---- end-to-end where_am_i with identity patched ---------------------
+    def test_where_am_i_names_unrecognised_company(self):
+        mod, actions = self._load_present(count=2)
+        mod._identity_read = lambda: {"on": True, "owner": True,
+                                      "others": [], "unknown": 1}
+        out = actions["where_am_i"]("")
+        self.assertIn("desk", out.lower())
+        self.assertIn("don't recognise", out.lower())
+
+    def test_where_am_i_identity_off_unchanged(self):
+        # With identity OFF, the line must read exactly as the legacy behaviour
+        # ("alone") — the enrichment is invisible.
+        mod, actions = self._load_present(count=1)
+        mod._identity_read = lambda: {"on": False, "owner": False,
+                                      "others": [], "unknown": 0}
+        out = actions["where_am_i"]("")
+        self.assertIn("alone", out.lower())
+        self.assertNotIn("recognise", out.lower())
+
+    def test_identity_read_returns_off_when_flag_disabled(self):
+        # The real _identity_read short-circuits to {"on": False} when the flag
+        # is off — no engine import, no frame grab.
+        mod, _actions = self._load(bc=None, bridge=None, kinect_enabled=False)
+        # FACE_ID_ENABLED is not in the patched flags → reads False.
+        self.assertEqual(mod._identity_read(), {"on": False, "owner": False,
+                                                "others": [], "unknown": 0})
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # no-leak guard
 # ─────────────────────────────────────────────────────────────────────────
 class NoLeakTests(CameraSystemBase):

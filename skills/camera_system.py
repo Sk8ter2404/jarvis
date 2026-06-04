@@ -91,6 +91,82 @@ def _cfg_flag(name: str, default: bool = False) -> bool:
         return default
 
 
+# ─── identity (SOFT hook into the face_id skill — never a hard dependency) ─
+
+def _face_id_skill():
+    """The live face_id skill module (registered as skill_face_id by the
+    loader), or None. We reach it lazily and never hard-import the engine, so
+    camera_system keeps working unchanged when face-ID is absent or off."""
+    return sys.modules.get("skill_face_id")
+
+
+def _identity_read() -> dict:
+    """Best-effort identity for the person at the desk, used ONLY to enrich the
+    spoken 'who's here' line. Returns:
+        {"on": bool,            # face-ID enabled AND a recognition ran
+         "owner": bool,         # the owner's face was recognised
+         "others": list[str],   # other enrolled names recognised
+         "unknown": int}        # count of faces matched to no one
+
+    Fires ONLY when FACE_ID_ENABLED is on; otherwise (or on ANY failure /
+    missing piece) returns {"on": False, ...} so the caller leaves its existing
+    behaviour untouched. NEVER raises — identity is a bonus, never a blocker."""
+    blank = {"on": False, "owner": False, "others": [], "unknown": 0}
+    if not _cfg_flag("FACE_ID_ENABLED"):
+        return blank
+    # Prefer the skill's own recognizer (it owns the webcam frame-grab + the
+    # owner-name mapping); fall back to the engine directly if the skill module
+    # isn't loaded but the engine is.
+    skill = _face_id_skill()
+    eng = sys.modules.get("audio.face_id")
+    if eng is None:
+        try:
+            from audio import face_id as eng  # type: ignore
+        except Exception:
+            eng = None
+    if eng is None:
+        return blank
+    try:
+        ok, _reason = eng.is_available()
+    except Exception:
+        ok = False
+    if not ok:
+        return blank
+    # Grab the primary webcam frame via the skill's helper (so the index +
+    # locking logic stay in one place); fall back to our own _collect_frames.
+    frame = None
+    if skill is not None:
+        grab = getattr(skill, "_grab_frame", None)
+        pidx = getattr(skill, "_primary_index", None)
+        if callable(grab) and callable(pidx):
+            try:
+                frame = grab(pidx())
+            except Exception:
+                frame = None
+    if frame is None:
+        return blank
+    try:
+        results = eng.recognize(frame)
+    except Exception:
+        return blank
+    if not results:
+        return blank
+    is_owner = getattr(skill, "_is_owner_label", None) if skill is not None else None
+    owner = False
+    others: list[str] = []
+    unknown = 0
+    for r in results:
+        nm = r.get("name")
+        if nm in (None, "unknown"):
+            unknown += 1
+            continue
+        if callable(is_owner) and is_owner(nm):
+            owner = True
+        else:
+            others.append(nm)
+    return {"on": True, "owner": owner, "others": others, "unknown": unknown}
+
+
 def _ask_vision():
     """Resolve the vision callable: prefer the injected skill_utils seam, fall
     back to the monolith's ask_vision. Returns a callable or None."""
@@ -418,18 +494,74 @@ def where_am_i(_: str = "") -> str:
         # Kinect sees a body but the webcams don't see your face.
         clauses.append("turned away from the monitor webcams")
 
-    # Company.
+    # Company. When face-ID is on and recognised someone, NAME the identity
+    # alongside the Kinect's body count ("you, alone" / "you, plus one person I
+    # don't recognise"). This is a soft enrichment: if face-ID is off or unsure,
+    # the existing Kinect-count clause is used unchanged.
     people = s["people"]
-    if kinect:
-        if people <= 1:
-            clauses.append("alone")
-        else:
-            clauses.append(f"with {people - 1} other "
-                           + ("person" if people - 1 == 1 else "people"))
+    ident = _identity_read()
+    company = _company_clause(people, kinect, ident)
+    if company:
+        clauses.append(company)
 
     looked = _sources_phrase(webcams, kinect, src["gaze"])
     sentence = ", ".join(clauses)
     return f"{sentence}, sir. {looked}."
+
+
+def _company_clause(people: int, kinect: bool, ident: dict) -> str:
+    """The 'who's here' clause that gets comma-joined into the where_am_i line
+    (the sentence already opens with 'You're at the desk').
+
+    When identity is available (ident['on'] and it recognised someone) it names
+    any OTHER enrolled people and cross-checks the Kinect body count to report
+    unrecognised company: 'alone' / 'with Dana' / 'with one person I don't
+    recognise' / 'with Dana and 2 people I don't recognise'. When face-ID is off
+    or unsure, it returns the ORIGINAL Kinect-count phrasing — and '' when the
+    Kinect isn't live — so the line is byte-for-byte unchanged without face-ID."""
+    if ident.get("on") and (ident.get("owner") or ident.get("others")
+                            or ident.get("unknown")):
+        names = list(ident.get("others", []))
+        # How many bodies are NOT accounted for by the faces we named. Prefer
+        # the Kinect's body count when it's live (it sees bodies the face camera
+        # can't); else fall back to face-ID's own unrecognised-face count.
+        named = (1 if ident.get("owner") else 0) + len(names)
+        if kinect and people > 0:
+            extra = max(people - named, int(ident.get("unknown", 0)))
+        else:
+            extra = int(ident.get("unknown", 0))
+        pieces: list[str] = []
+        if names:
+            pieces.append(_join_names(names))
+        if extra > 0:
+            pieces.append(_unknown_phrase(extra))
+        if not pieces:
+            # Just the owner (or just confirmed-no-company): alone.
+            return "alone"
+        return "with " + _join_names(pieces)
+    # No identity — original Kinect-count behaviour, untouched.
+    if kinect:
+        if people <= 1:
+            return "alone"
+        return (f"with {people - 1} other "
+                + ("person" if people - 1 == 1 else "people"))
+    return ""
+
+
+def _join_names(names: list) -> str:
+    """'a' / 'a and b' / 'a, b and c'."""
+    if not names:
+        return ""
+    if len(names) == 1:
+        return names[0]
+    return ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def _unknown_phrase(n: int) -> str:
+    """'one person I don't recognise' / 'N people I don't recognise'."""
+    if n <= 1:
+        return "one person I don't recognise"
+    return f"{n} people I don't recognise"
 
 
 def _sources_phrase(webcams: bool, kinect: bool, gaze_src: str) -> str:

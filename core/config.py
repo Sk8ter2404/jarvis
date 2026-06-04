@@ -512,6 +512,32 @@ KINECT_POSTURE_NUDGE = False
 KINECT_GUARD_ENABLED = False
 
 
+# ─── Face recognition (identity, opt-in; all default off) ──────────────
+# JARVIS can recognise WHO is at the desk — pairing the Kinect's body COUNT
+# with an actual identity from the two monitor webcams (the cameras closest to
+# the user's face). It uses OpenCV's built-in face modules (YuNet detector +
+# SFace recognizer, ONNX) — no dlib, no extra pip dependency. The ~38 MB SFace
+# model and the ~232 KB YuNet model download once to a gitignored data/models/
+# folder; the engine never raises if the download fails, it just stays off.
+#
+# PRIVACY: this is FACE BIOMETRICS. It is OFF by default and fully opt-in. The
+# face embeddings live ONLY in a gitignored data/face_enroll.json (biometric
+# PII — never committed, never shipped) and never leave the machine. Nothing is
+# captured or stored unless you explicitly enroll ("learn my face").
+#
+# FACE_ID_ENABLED — master switch. When False (default) the face_id skill
+#   refuses every action with an honest line and no camera/model work happens;
+#   situational_awareness keeps its existing webcam+Kinect behaviour unchanged.
+#   Set True to allow enrollment + recognition from the monitor webcams.
+FACE_ID_ENABLED = False
+# FACE_ID_MATCH_THRESHOLD — SFace cosine-similarity floor for a positive match.
+#   rec.match(..., FR_COSINE) returns HIGHER for more-similar faces; OpenCV's
+#   own SFace reference uses 0.363 as the same-person cutoff (a feature whose
+#   best cosine vs an enrolled person is >= this is named, else "unknown").
+#   Raise it to be stricter (fewer false matches), lower it to be more lenient.
+FACE_ID_MATCH_THRESHOLD = 0.363
+
+
 # ─── Monitor layout ────────────────────────────────────────────────────
 # Friendly names for each monitor. Each entry is (x, y, w, h). JARVIS
 # uses this for "open Google on my left monitor"-style requests and for
