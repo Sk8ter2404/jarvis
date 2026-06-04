@@ -445,6 +445,37 @@ CAMERA_LOCK_PROCESSES = {
 }
 
 
+# ─── Xbox Kinect v2 sensor (opt-in; all default False) ─────────────────
+# The Kinect v2 adds true skeleton-based room presence, head-position gaze,
+# a 1080p color camera, plus depth + infrared (night-vision) streams. It is
+# OFF by default — it's a camera + microphone array pointed at the room, so
+# every Kinect capability is opt-in and privacy-conscious. The bridge
+# (audio/kinect_bridge.py) never opens the sensor unless KINECT_ENABLED is
+# True. Flip these here (or via the matching JARVIS_* env override) to use it.
+#
+# KINECT_ENABLED — master switch. When False the bridge short-circuits every
+#   accessor and never touches pykinect2 / the Kinect Runtime. Set True to let
+#   the bridge open the sensor (Color | Body | Depth | Infrared).
+KINECT_ENABLED = False
+# KINECT_AS_CAMERA — when True, the face-tracking loop uses the Kinect's 1080p
+#   color stream as a face-tracking camera (a KinectCapture stands in for
+#   cv2.VideoCapture). Leave False to keep using the configured USB webcams; an
+#   explicit CAMERAS entry with {"type": "kinect"} also opts a slot in.
+KINECT_AS_CAMERA = False
+# KINECT_PRESENCE_ENABLED — when True, the face-tracker skill merges real
+#   skeleton presence (body count + head-facing) from the Kinect into its
+#   gaze/presence state, beating the Haar-cascade guesswork when the sensor
+#   can see the room.
+KINECT_PRESENCE_ENABLED = False
+# KINECT_PRESENCE_STANDBY — when True (and presence is enabled), JARVIS drops
+#   to standby after the room has been empty for a sustained window. Off by
+#   default so the sensor never silences JARVIS unless you ask it to.
+KINECT_PRESENCE_STANDBY = False
+# KINECT_PRESENCE_WAKE — when True (and presence is enabled), JARVIS clears
+#   standby the moment a person reappears in the Kinect's view. Off by default.
+KINECT_PRESENCE_WAKE = False
+
+
 # ─── Monitor layout ────────────────────────────────────────────────────
 # Friendly names for each monitor. Each entry is (x, y, w, h). JARVIS
 # uses this for "open Google on my left monitor"-style requests and for

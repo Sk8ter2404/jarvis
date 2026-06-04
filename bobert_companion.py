@@ -476,6 +476,11 @@ except Exception:  # pragma: no cover - defensive fallback when an optional modu
 # get_client() is the lazy entry point — see the bridge module's docstring.
 from audio import itunes_bridge as _itunes_bridge  # type: ignore
 
+# Xbox Kinect v2 is isolated in audio/kinect_bridge.py the same way — importing
+# it never touches pykinect2 / the Kinect Runtime (all lazy, inside functions).
+# The sensor is opt-in: set_enabled(KINECT_ENABLED) below gates every accessor.
+from audio import kinect_bridge as _kinect_bridge  # type: ignore
+
 # ──────────────────────────────────────────────────────────────────────────
 #  CONFIGURATION
 # ──────────────────────────────────────────────────────────────────────────
@@ -527,6 +532,11 @@ AUDIO_DUCKING_TARGETS = (
 # set_auto_launch() call MUST stay here so the bridge picks the live
 # value at boot.)
 _itunes_bridge.set_auto_launch(ITUNES_AUTO_LAUNCH)
+
+# (KINECT_ENABLED lives in core/config.py. This set_enabled() call MUST stay
+# here so the Kinect bridge picks up the live opt-in value at boot; when False
+# — the default — the bridge never opens the sensor.)
+_kinect_bridge.set_enabled(KINECT_ENABLED)
 
 # Bambu H2D corner overlay — RETIRED 2026-05-30. The unified HUD
 # (hud/jarvis_unified_hud.py) now shows live print progress + ETA inline, so
@@ -3301,7 +3311,32 @@ def _face_tracking_thread():
     LOG_FIRST_AT_FAILS  = 25
     LOG_EVERY_N_FAILS   = 25    # then every Nth fail beyond that
 
-    def _open_capture(idx: int):
+    def _open_capture(cam):
+        # `cam` is the CAMERAS dict (or, for back-compat, a bare int index).
+        # A slot is a Kinect source when it carries {"type": "kinect"} OR the
+        # global KINECT_AS_CAMERA opt-in is on — in either case we hand the
+        # loop a kinect_bridge.KinectCapture, which exposes the same
+        # .read()->(ret,bgr) / .release() contract as cv2.VideoCapture, so the
+        # rest of _face_tracking_thread is unchanged. The Kinect runtime is a
+        # shared singleton, so this never collides with cv2's DirectShow heap.
+        if isinstance(cam, dict):
+            idx = cam["index"]
+            want_kinect = (cam.get("type") == "kinect") or KINECT_AS_CAMERA
+        else:
+            idx = cam
+            want_kinect = KINECT_AS_CAMERA
+        if want_kinect:
+            try:
+                kc = _kinect_bridge.KinectCapture()
+                if kc.isOpened():
+                    print(f"  [face-track] Using Kinect v2 color stream as camera "
+                          f"(index {idx})")
+                    return kc
+                print(f"  [face-track] Kinect requested but unavailable "
+                      f"({kc._open_error}); falling back to webcam index {idx}")
+            except Exception as e:  # pragma: no cover - defensive: bridge import/open glitch
+                print(f"  [face-track] Kinect open failed ({e}); "
+                      f"falling back to webcam index {idx}")
         # Serialize against probe-sweep / list-cameras / snapshot opens &
         # releases. Without this, an abandoned probe worker's eventual
         # release() can collide with this open or its failure-path
@@ -3328,7 +3363,7 @@ def _face_tracking_thread():
     # individual captures can be released & reopened independently mid-loop.
     caps: list[dict] = []
     for cam in CAMERAS:
-        c = _open_capture(cam["index"])
+        c = _open_capture(cam)
         if c is not None:
             caps.append({"cam": cam, "cap": c, "fails": 0,
                          "next_reopen_at": 0.0, "next_wake_at": 0.0})
@@ -3363,7 +3398,7 @@ def _face_tracking_thread():
                 if c is None:
                     if now_loop < entry["next_reopen_at"]:
                         continue
-                    new_c = _open_capture(cam["index"])
+                    new_c = _open_capture(cam)
                     entry["next_reopen_at"] = now_loop + REOPEN_BACKOFF_SEC
                     if new_c is None:
                         continue
@@ -5837,6 +5872,9 @@ def _local_cheatsheet() -> str:
         "  [ACTION: set_timer, 5 minutes]   (or '5 minutes for tea')   [ACTION: list_timers]   [ACTION: cancel_timer]  (no arg cancels the running one)\n"
         "  [ACTION: see_screen]  or  [ACTION: see_screen, middle]   look at the screen & describe it\n"
         "  [ACTION: find_on_screen, <thing>]   [ACTION: recall_screen]\n"
+        "  [ACTION: kinect_status]   'kinect status' / 'is the kinect working'   (Xbox Kinect; honest if it's off/absent)\n"
+        "  [ACTION: who_is_here]   'who is in the room' / 'is anyone here'   [ACTION: scan_room]   (Kinect skeleton: body count + distance)\n"
+        "  [ACTION: kinect_look, <question>]   'what do you see through the kinect' / 'look through the kinect'\n"
         "  [ACTION: web_search, <query>]   open a web search in the browser\n"
         "  [ACTION: open_url, <url>]   [ACTION: launch_app, <app name>]\n"
         "  [ACTION: open_on_monitor, <app or url> | <left|middle|right|top>]\n"

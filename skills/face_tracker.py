@@ -33,6 +33,7 @@ This skill builds a higher-level "gaze" layer on top of that raw signal:
   • Wraps see_user to append a one-line note about the current gaze target.
 """
 import importlib
+import sys
 import threading
 import time
 
@@ -46,6 +47,15 @@ FACE_FRESH_SECONDS  = 3.0    # camera "sees user now" window
 HYSTERESIS_SAMPLES  = 2      # consecutive identical reads before commit
 GAZE_CACHE_FRESH    = 3.0    # fast-path only if last sample < this old
 INITIAL_DELAY_SECONDS = 5    # let the face-track thread come up first
+
+# ─── Kinect presence (opt-in; all gated by core.config flags) ────────────
+# When KINECT_PRESENCE_ENABLED, the poller merges true skeleton presence from
+# the Kinect v2 into the gaze state. When KINECT_PRESENCE_STANDBY, a sustained
+# empty room drops JARVIS to standby; when KINECT_PRESENCE_WAKE, a person
+# reappearing clears standby. Hysteresis windows keep a one-frame body-track
+# dropout from flapping the state.
+KINECT_EMPTY_STANDBY_SECONDS = 180.0   # room empty this long → standby
+KINECT_PRESENCE_REREAD_SEC   = 0.0     # presence is read every poll tick
 # ─────────────────────────────────────────────────────────────────────────
 
 
@@ -58,7 +68,21 @@ _state = {
     "face_visible":    False,
     "last_face_at":    0.0,
     "first_face_at":   0.0,       # first ever face sighting since skill loaded
+    # Kinect skeleton presence (populated only when KINECT_PRESENCE_ENABLED):
+    "kinect_present":  None,      # bool | None (None = no Kinect reading yet)
+    "kinect_count":    0,         # tracked-body count
+    "kinect_nearest_m": None,     # nearest body distance (metres)
+    "kinect_facing":   None,      # any body facing the sensor
+    "kinect_at":       0.0,       # monotonic ts of last Kinect presence read
+    "kinect_last_present_at": 0.0,   # last time a body WAS present
 }
+
+# Empty-room → standby bookkeeping. _kinect_empty_since records when the room
+# first went empty (0.0 = currently occupied / unknown); the standby fires only
+# after it's held empty for KINECT_EMPTY_STANDBY_SECONDS. List-wrapped so the
+# poller can mutate without `global`.
+_kinect_empty_since = [0.0]
+_kinect_standby_fired = [False]   # latch: don't re-engage every tick
 
 # Dwell tracking: name -> total seconds, name -> longest single run
 _dwell_total: dict[str, float] = {}
@@ -147,10 +171,174 @@ def _commit_state(new_monitor: str, sides: frozenset[str], now: float) -> None:
     _state["last_sample_at"]  = now
 
 
+# ─── Kinect presence integration (all opt-in via core.config flags) ──────
+
+def _cfg_flag(name: str, default: bool = False) -> bool:
+    """Read a live boolean from core.config, tolerating its absence (early
+    boot / standalone test). Read fresh each call so a Settings toggle takes
+    effect without a restart."""
+    try:
+        from core import config as _cfg
+        return bool(getattr(_cfg, name, default))
+    except Exception:
+        return default
+
+
+def _kinect_bridge():
+    """Return the live kinect_bridge module, or None. Prefer the already-loaded
+    instance (bobert_companion imports it as audio.kinect_bridge); fall back to
+    a direct import so the skill works even if the monolith hasn't loaded it."""
+    mod = sys.modules.get("audio.kinect_bridge")
+    if mod is not None:
+        return mod
+    try:
+        from audio import kinect_bridge as _kb
+        return _kb
+    except Exception:
+        return None
+
+
+def _read_kinect_presence() -> dict | None:
+    """Fetch get_presence() from the bridge, or None if Kinect presence is
+    disabled / the bridge is unavailable / it isn't actually streaming.
+    NEVER raises."""
+    if not _cfg_flag("KINECT_PRESENCE_ENABLED"):
+        return None
+    kb = _kinect_bridge()
+    if kb is None:
+        return None
+    try:
+        ok, _reason = kb.available()
+        if not ok:
+            return None
+        return kb.get_presence()
+    except Exception:
+        return None
+
+
+def _merge_kinect_presence(presence: dict, now: float) -> None:
+    """Fold a Kinect get_presence() reading into _state. Caller holds
+    _state_lock."""
+    present = bool(presence.get("present"))
+    _state["kinect_present"]   = present
+    _state["kinect_count"]     = int(presence.get("count", 0) or 0)
+    _state["kinect_nearest_m"] = presence.get("nearest_m")
+    _state["kinect_facing"]    = presence.get("facing")
+    _state["kinect_at"]        = now
+    if present:
+        _state["kinect_last_present_at"] = now
+        # A real skeleton beats the Haar guess: count it as a face sighting so
+        # gaze_status/see_user don't report "not in view" while the Kinect
+        # clearly sees a body.
+        if not _state["first_face_at"]:
+            _state["first_face_at"] = now
+        _state["last_face_at"] = now
+
+
+def _bc():
+    """The live monolith module (main or by-name), or None. Mirrors the
+    standby_audio_detect lookup pattern."""
+    return sys.modules.get("__main__") or sys.modules.get("bobert_companion")
+
+
+def _apply_kinect_presence_actions(present: bool, now: float) -> None:
+    """Drive wake/standby from Kinect presence — ONLY behind the opt-in flags.
+    Empty room for a sustained window → _standby_auto_engage('room_empty');
+    a person reappearing while in standby → clear standby (force_wake path).
+    Swallows every error so a presence read never crashes the poller."""
+    want_standby = _cfg_flag("KINECT_PRESENCE_STANDBY")
+    want_wake    = _cfg_flag("KINECT_PRESENCE_WAKE")
+    if not (want_standby or want_wake):
+        _kinect_empty_since[0] = 0.0
+        return
+    bc = _bc()
+    if bc is None:
+        return
+
+    if present:
+        # Room occupied: reset the empty timer + standby latch, and wake if
+        # we're dormant and the user opted into wake-on-presence.
+        _kinect_empty_since[0] = 0.0
+        _kinect_standby_fired[0] = False
+        if want_wake:
+            try:
+                in_standby = bool(getattr(bc, "_standby_mode")[0]) or \
+                             bool(getattr(bc, "_sleep_mode")[0])
+            except Exception:
+                in_standby = False
+            if in_standby:
+                _kinect_clear_standby(bc)
+        return
+
+    # Room empty.
+    if not want_standby:
+        return
+    if _kinect_empty_since[0] == 0.0:
+        _kinect_empty_since[0] = now
+        return
+    if _kinect_standby_fired[0]:
+        return
+    if (now - _kinect_empty_since[0]) < KINECT_EMPTY_STANDBY_SECONDS:
+        return
+    # Don't re-engage if already dormant.
+    try:
+        if bool(getattr(bc, "_standby_mode")[0]) or bool(getattr(bc, "_sleep_mode")[0]):
+            _kinect_standby_fired[0] = True
+            return
+    except Exception:
+        pass
+    engage = getattr(bc, "_standby_auto_engage", None)
+    if not callable(engage):
+        return
+    try:
+        if engage("room_empty"):
+            print("  [face-track] Kinect saw an empty room for "
+                  f"{KINECT_EMPTY_STANDBY_SECONDS:.0f}s — entering standby")
+    except Exception as e:
+        print(f"  [face-track] standby-on-empty failed: {e}")
+    _kinect_standby_fired[0] = True
+
+
+def _kinect_clear_standby(bc) -> None:
+    """Clear sleep/standby the way the force_wake tray path does — under the
+    same lock so a concurrent auto-engage can't re-assert it. Best-effort."""
+    lock = getattr(bc, "_standby_auto_engage_lock", None)
+    try:
+        sleep_flag = getattr(bc, "_sleep_mode", None)
+        standby_flag = getattr(bc, "_standby_mode", None)
+        if sleep_flag is None or standby_flag is None:
+            return
+        if lock is not None:
+            with lock:
+                sleep_flag[0] = False
+                standby_flag[0] = False
+        else:
+            sleep_flag[0] = False
+            standby_flag[0] = False
+        try:
+            bc._write_hud_state(sleep_mode=False, standby_mode=False, state="Idle")
+        except Exception:
+            pass
+        print("  [face-track] Kinect saw someone return — cleared standby")
+    except Exception as e:
+        print(f"  [face-track] wake-on-presence failed: {e}")
+
+
 def _poll_once(bc) -> None:
     sides, _side_map = _classify_sides(bc)
     raw_monitor = _monitor_name_from_sides(bc, sides)
     now = time.time()
+
+    # Kinect skeleton presence (opt-in). Read it once per tick and fold it into
+    # the gaze state; then optionally drive wake/standby behind its own flags.
+    kinect = _read_kinect_presence()
+    if kinect is not None:
+        with _state_lock:
+            _merge_kinect_presence(kinect, now)
+        try:
+            _apply_kinect_presence_actions(bool(kinect.get("present")), now)
+        except Exception as e:   # pragma: no cover - defensive: never crash the poller
+            print(f"  [face-track] kinect presence-action error: {e}")
 
     # Hysteresis: only commit when the same reading has held for N samples
     _pending_monitor.append(raw_monitor)
@@ -290,6 +478,24 @@ def get_read_failure_spike_signals(
 
 # ─── actions ─────────────────────────────────────────────────────────────
 
+def _kinect_presence_note(snap: dict, now: float) -> str:
+    """A short spoken clause about Kinect skeleton presence when it's fresh,
+    else ''. Used to enrich gaze_status with the stronger signal."""
+    if snap.get("kinect_present") is None or not snap.get("kinect_at"):
+        return ""
+    # kinect_at is monotonic; compare against a monotonic now.
+    if (time.monotonic() - snap["kinect_at"]) > 5.0:
+        return ""
+    count = snap.get("kinect_count", 0)
+    if not snap.get("kinect_present") or count <= 0:
+        return ""
+    nearest = snap.get("kinect_nearest_m")
+    who = "one person" if count == 1 else f"{count} people"
+    if nearest:
+        return f" The Kinect sees {who} about {nearest:.1f} metres away."
+    return f" The Kinect sees {who} in the room."
+
+
 def gaze_status(_: str = "") -> str:
     snap = _snapshot_state()
     if not snap["last_sample_at"]:
@@ -297,10 +503,17 @@ def gaze_status(_: str = "") -> str:
 
     now = time.time()
     monitor = snap["current_monitor"]
+    kinect_note = _kinect_presence_note(snap, now)
     if monitor is None:
+        if kinect_note:
+            return f"I haven't pinned your gaze yet, sir, but{kinect_note}"
         return "I haven't established your gaze yet, sir."
 
     if monitor == "away":
+        # The Kinect skeleton is a stronger presence signal than the Haar
+        # cascade — if it sees a body, say so rather than "not in view".
+        if kinect_note:
+            return f"You're off-camera for the webcams, sir, but{kinect_note}"
         if snap["last_face_at"]:
             ago = _format_seconds(now - snap["last_face_at"])
             return f"You're not currently in view, sir — last seen {ago} ago."
