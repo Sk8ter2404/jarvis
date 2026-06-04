@@ -5847,6 +5847,12 @@ def _local_cheatsheet() -> str:
         "  [ACTION: weather_briefing]   [ACTION: news_briefing]   [ACTION: morning_briefing]\n"
         "  [ACTION: queue_task, <task for Claude Code>]   [ACTION: show_tasks]\n"
         "  [ACTION: smart_home_control, <plain request>]   [ACTION: make_picture, <prompt>]\n"
+        "Choosing YOUR OWN local brain (which Ollama model runs you):\n"
+        "  [ACTION: current_model]       \"what model are you using\" / \"what's your brain\"\n"
+        "  [ACTION: list_models]         \"what models do you have\" / \"what can you run on\"\n"
+        "  [ACTION: set_model, <name>]   \"switch to the 32B\" / \"use the fast one\" / \"use qwen\"\n"
+        "                                 (arg is a tag/size/alias: 32b, 14b, 8b, big, fast, qwen, llama)\n"
+        "  [ACTION: set_brain, <local|cloud|auto>]   \"use local\" / \"use cloud / Claude\" / \"go auto\"\n"
     )
     # Append EVERY registered action name (late-bound from the live registry —
     # ACTIONS is fully populated by the time this runs at request time).
