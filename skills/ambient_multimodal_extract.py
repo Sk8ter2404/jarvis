@@ -382,7 +382,19 @@ def register(actions: dict) -> None:
     actions["ambient_extract_status"] = ambient_extract_status
     actions["ambient_extract_now"]    = ambient_extract_now
 
-    if _get_config("AMBIENT_EXTRACT_ENABLED", False):
+    # Autostart the extractor when EITHER it's explicitly enabled OR any ambient
+    # CAPTURE source is enabled at boot. Capture (mic / system-audio / screen)
+    # with no extractor running means transcripts pile up in the jsonl logs but
+    # nothing is ever distilled into bobert_memory.json — i.e. "it captures but
+    # doesn't learn". So if the user has turned on any ambient capture, fold the
+    # extractor in automatically rather than requiring a separate toggle. The
+    # voice command "go ambient" starts the extractor directly (see
+    # core.actions._act_ambient_mode_set); this covers the boot-enabled path.
+    _autostart = (_get_config("AMBIENT_EXTRACT_ENABLED", False)
+                  or _get_config("AMBIENT_LISTEN_ENABLED", False)
+                  or _get_config("AMBIENT_AUDIO_ENABLED", False)
+                  or _get_config("AMBIENT_SCREEN_ENABLED", False))
+    if _autostart:
         def _bg():
             try:
                 time.sleep(4.0)

@@ -658,33 +658,91 @@ def _worker_loop() -> None:
                        "ambient capture not started")
         print(f"  [ambient-listen] {_last_error}")
         return
-    try:
-        stream = sd.InputStream(
-            samplerate=sample_rate, channels=1, dtype="float32",
-            blocksize=blocksize, device=device, callback=_audio_cb)
-    except Exception as e:
-        if _wake_listener_active():
-            _last_error = ("mic locked by wake-word listener — stop "
-                           "the wake-word listener first")
-        else:
-            _last_error = f"InputStream open failed: {e}"
-        print(f"  [ambient-listen] {_last_error}")
-        return
 
-    # 2026-05-29 silent-crash fix: don't use `with stream:` — the implicit
-    # __exit__ calls sd close() unguarded, which has SIGSEGV'd at
-    # sounddevice.py:1167. Start explicitly and route teardown through
-    # _safe_close_stream so close() runs on a daemon thread with a timeout.
-    try:
-        stream.start()
-    except Exception as e:
-        _last_error = f"InputStream.start failed: {e}"
-        print(f"  [ambient-listen] {_last_error}")
-        _safe_close_stream(stream)
-        return
+    # ── PREFERRED PATH: share the main loop's mic via the record_speech tap ──
+    # bobert_companion.record_speech is the SOLE owner of the input device; it
+    # fans every captured frame out to registered taps (add_record_tap /
+    # _fanout_record_frame). Opening a SECOND sd.InputStream on the same device
+    # is exactly the WASAPI contention the host warns about — on Windows it
+    # either fails outright or starves record_speech so the main loop goes deaf
+    # to the wake word "JARVIS" (the user-reported "go ambient → won't wake"
+    # bug). So we register a TAP and consume the host's frames instead, leaving
+    # the wake/standby path fully functional. We only fall back to our own
+    # stream when the host doesn't expose the tap API (older monolith) AND no
+    # wake-word listener owns the device.
+    #
+    # The tap is a queue.Queue; a tiny shim drains it into the same audio_q the
+    # batching loop below reads, so the rest of the worker is unchanged whether
+    # we're tapping or running our own callback stream.
+    tap_q = None
+    tap_drain_stop = None
+    tap_drain_thread = None
+    add_tap = getattr(b, "add_record_tap", None)
+    remove_tap = getattr(b, "remove_record_tap", None)
+    stream = None
+    if callable(add_tap) and callable(remove_tap):
+        import queue as _queue
+        tap_q = _queue.Queue()
+        try:
+            add_tap(tap_q)   # returns whether record_speech is live right now;
+        except Exception as e:  # we register regardless so we catch it the moment it next opens.
+            _last_error = f"add_record_tap failed: {e}"
+            print(f"  [ambient-listen] {_last_error}")
+            return
 
-    print(f"  [ambient-listen] stream open on device={device}, "
-          f"sample_rate={sample_rate}, chunk={chunk_secs:.2f}s")
+        def _drain_tap():
+            # Pull frames the host captured and hand them to the batch loop.
+            while tap_drain_stop is not None and not tap_drain_stop.is_set():
+                try:
+                    frame = tap_q.get(timeout=0.2)
+                except Exception:
+                    continue
+                if frame is None:
+                    continue
+                try:
+                    chunk = (frame[:, 0].copy() if getattr(frame, "ndim", 1) > 1
+                             else frame.copy())
+                except Exception:
+                    continue
+                with q_lock:
+                    audio_q.append(chunk)
+
+        tap_drain_stop = threading.Event()
+        tap_drain_thread = threading.Thread(
+            target=_drain_tap, name="ambient-listen-mic-tap", daemon=True)
+        tap_drain_thread.start()
+        print(f"  [ambient-listen] sharing the main-loop mic via record_speech "
+              f"tap (no competing stream), sample_rate={sample_rate}, "
+              f"chunk={chunk_secs:.2f}s")
+    else:
+        # ── FALLBACK PATH: dedicated InputStream (host has no tap API) ──────
+        try:
+            stream = sd.InputStream(
+                samplerate=sample_rate, channels=1, dtype="float32",
+                blocksize=blocksize, device=device, callback=_audio_cb)
+        except Exception as e:
+            if _wake_listener_active():
+                _last_error = ("mic locked by wake-word listener — stop "
+                               "the wake-word listener first")
+            else:
+                _last_error = f"InputStream open failed: {e}"
+            print(f"  [ambient-listen] {_last_error}")
+            return
+
+        # 2026-05-29 silent-crash fix: don't use `with stream:` — the implicit
+        # __exit__ calls sd close() unguarded, which has SIGSEGV'd at
+        # sounddevice.py:1167. Start explicitly and route teardown through
+        # _safe_close_stream so close() runs on a daemon thread with a timeout.
+        try:
+            stream.start()
+        except Exception as e:
+            _last_error = f"InputStream.start failed: {e}"
+            print(f"  [ambient-listen] {_last_error}")
+            _safe_close_stream(stream)
+            return
+
+        print(f"  [ambient-listen] stream open on device={device}, "
+              f"sample_rate={sample_rate}, chunk={chunk_secs:.2f}s")
 
     samples_per_batch = int(sample_rate * batch_secs)
     pending: list[np.ndarray] = []
@@ -783,7 +841,18 @@ def _worker_loop() -> None:
         _last_error = f"worker crashed: {e}"
         print(f"  [ambient-listen] {_last_error}")
     finally:
-        _safe_close_stream(stream)
+        # Tap path: detach from record_speech's fan-out and stop the drain
+        # thread. Stream path: close our dedicated InputStream. Exactly one of
+        # these is live depending on which acquisition branch ran above.
+        if tap_drain_stop is not None:
+            tap_drain_stop.set()
+        if tap_q is not None and callable(remove_tap):
+            try:
+                remove_tap(tap_q)
+            except Exception:
+                pass
+        if stream is not None:
+            _safe_close_stream(stream)
         print("  [ambient-listen] mic worker exiting")
 
 

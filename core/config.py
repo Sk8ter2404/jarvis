@@ -624,8 +624,19 @@ def _apply_user_settings() -> None:
         return
     if not isinstance(data, dict):
         return
+    # Back-compat aliases: a config constant that was RENAMED still has saved
+    # user_settings.json files (and Settings-GUI writes) carrying the OLD key.
+    # Map the legacy name onto the current one so the user's override still
+    # reaches the live constant instead of being silently dropped by the
+    # `key not in g` guard below. 2026-06: AMBIENT_LISTENING_ENABLED was renamed
+    # to AMBIENT_LISTEN_ENABLED in v1.20.0; the owner's file still had the old
+    # key, so the mic-ambient daemon never autostarted ("not even learning").
+    _LEGACY_KEY_ALIASES = {
+        "AMBIENT_LISTENING_ENABLED": "AMBIENT_LISTEN_ENABLED",
+    }
     g = globals()
     for key, val in data.items():
+        key = _LEGACY_KEY_ALIASES.get(key, key)
         if key.startswith("_") or key not in g:
             continue          # only override an existing public config constant
         cur = g[key]
