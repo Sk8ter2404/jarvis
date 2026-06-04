@@ -5883,6 +5883,8 @@ def _local_cheatsheet() -> str:
         "  [ACTION: point_calibrate, <device>]   point-to-control: user POINTS at a device + says 'calibrate pointing for the desk lamp' (Kinect; off by default)\n"
         "  [ACTION: point_control, <on|off>]   user is POINTING at a calibrated device — 'turn that on' / 'that one off' fire this; it resolves the point + switches that device\n"
         "  [ACTION: list_point_targets]   'what can I point at'   [ACTION: point_control_on]   'turn on point control'   [ACTION: point_control_off]\n"
+        "  [ACTION: guard_on]   'guard the room' / 'watch the room' / 'arm security' / 'keep watch'   (arm ALL cameras as a security array; snapshots + alerts on motion/intrusion)\n"
+        "  [ACTION: guard_off]   'stand down' / 'disarm' / 'stop guarding'   [ACTION: guard_status]   'are you watching' / 'guard status'\n"
         "  [ACTION: web_search, <query>]   open a web search in the browser\n"
         "  [ACTION: open_url, <url>]   [ACTION: launch_app, <app name>]\n"
         "  [ACTION: open_on_monitor, <app or url> | <left|middle|right|top>]\n"

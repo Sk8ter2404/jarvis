@@ -501,6 +501,15 @@ KINECT_GREET_ON_ENTRY = False
 #   gentle posture/stand nudge after a sustained hunch (~10 min) or long seated
 #   stretch (~45 min), then cooling down (~20 min). Off by default; never nags.
 KINECT_POSTURE_NUDGE = False
+# KINECT_GUARD_ENABLED — when True, the owner may ARM guard mode (the multi-angle
+#   security array in skills/guard_mode.py): an armed background daemon watches
+#   every camera (both webcams via frame differencing + the Kinect's skeleton
+#   presence) and, on detected motion/intrusion, snapshots the frame to a
+#   gitignored data/guard_snapshots/ folder and fires ONE rate-limited proactive
+#   alert (spoken + phone-push if configured). This flag only decides whether
+#   arming is ALLOWED — arming is always an explicit voice action ('guard the
+#   room' / 'stand down'), never automatic. Off by default.
+KINECT_GUARD_ENABLED = False
 
 
 # ─── Monitor layout ────────────────────────────────────────────────────
