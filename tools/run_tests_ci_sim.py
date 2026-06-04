@@ -249,6 +249,19 @@ def _redirect_settings_to_throwaway(root: str) -> None:
     os.environ["JARVIS_SETTINGS_PATH"] = throwaway
 
 
+def _stop_lingering_daemons() -> None:
+    """Best-effort: stop any opt-in background daemon a test may have left alive
+    so it can't outlive the suite. Currently just the apple-music keep-alive
+    watchdog (a non-terminating loop). Never raises; a missing module is a
+    no-op."""
+    try:
+        mod = sys.modules.get("audio.apple_music_keeper")
+        if mod is not None and hasattr(mod, "stop_keeper"):
+            mod.stop_keeper(timeout=5.0)
+    except Exception:
+        pass
+
+
 def main() -> int:
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     # Redirect settings I/O to a throwaway copy BEFORE discovery/import (and
@@ -316,6 +329,11 @@ def main() -> int:
     suite = unittest.TestLoader().discover(
         os.path.join(root, "tests"), pattern="test_*.py", top_level_dir=root)
     res = unittest.TextTestRunner(verbosity=1).run(suite)
+    # Belt-and-suspenders: reap any lingering opt-in daemon a test left running
+    # (e.g. the apple-music keep-alive watchdog) so it can't bleed CPU into the
+    # next invocation. The real guard is per-test cleanup in the test modules;
+    # this is a harmless final sweep that never fails the run.
+    _stop_lingering_daemons()
     gate_note = "" if gates_ok else "  [+ CI GATE FAILURE above]"
     print(f"=== CI-SIM: {res.testsRun} run, {len(res.failures)} failed, "
           f"{len(res.errors)} errored, {len(res.skipped)} skipped{gate_note} ===")

@@ -2274,5 +2274,231 @@ class MainDialogModeTests(TrayTestBase):
                                       "_run_dossier_dialog")
 
 
+# --------------------------------------------------------------------------- #
+# Apple Music tray controls — now-playing label, transport commands, submenu.
+#
+# JARVIS hosts these because the UWP Apple Music app has no tray of its own.
+# Transport goes through the command IPC (the same _send_command path every
+# other tray verb uses); the now-playing label is the one thing read in-process
+# via the lazy audio.apple_music_app bridge, which the tests fake.
+# --------------------------------------------------------------------------- #
+class _FakeAppleMusicBridge:
+    """Stand-in for audio.apple_music_app used by the now-playing label."""
+    def __init__(self, running=False, now=None, running_raises=False,
+                 now_raises=False):
+        self._running = running
+        self._now = now
+        self.running_raises = running_raises
+        self.now_raises = now_raises
+
+    def is_running(self):
+        if self.running_raises:
+            raise RuntimeError("psutil boom")
+        return self._running
+
+    def now_playing(self):
+        if self.now_raises:
+            raise RuntimeError("pygetwindow boom")
+        return self._now
+
+
+class AppleMusicLabelTests(TrayTestBase):
+    def setUp(self):
+        super().setUp()
+        # The bridge accessor caches on a module global; clear it each test so a
+        # prior test's fake/sentinel doesn't leak.
+        self._saved_am = tray.__dict__.get("_apple_music_app_mod")
+        tray.__dict__.pop("_apple_music_app_mod", None)
+        self.addCleanup(self._restore_am)
+
+    def _restore_am(self):
+        if self._saved_am is None:
+            tray.__dict__.pop("_apple_music_app_mod", None)
+        else:
+            tray.__dict__["_apple_music_app_mod"] = self._saved_am
+
+    def _patch_bridge(self, bridge):
+        return mock.patch.object(tray, "_apple_music_app", return_value=bridge)
+
+    def test_label_shows_now_playing_title(self):
+        with self._patch_bridge(_FakeAppleMusicBridge(running=True,
+                                                      now="Earth Song — MJ")):
+            self.assertEqual(tray._status_text_apple_music(),
+                             "Apple Music: Earth Song — MJ")
+
+    def test_label_idle_when_running_quiet(self):
+        with self._patch_bridge(_FakeAppleMusicBridge(running=True, now=None)):
+            self.assertEqual(tray._status_text_apple_music(), "Apple Music: idle")
+
+    def test_label_closed_when_not_running(self):
+        with self._patch_bridge(_FakeAppleMusicBridge(running=False)):
+            self.assertEqual(tray._status_text_apple_music(), "Apple Music: closed")
+
+    def test_label_unavailable_when_bridge_absent(self):
+        with self._patch_bridge(None):
+            self.assertEqual(tray._status_text_apple_music(),
+                             "Apple Music: unavailable")
+
+    def test_label_truncates_long_title(self):
+        long_title = "x" * 100
+        with self._patch_bridge(_FakeAppleMusicBridge(running=True, now=long_title)):
+            out = tray._status_text_apple_music()
+        self.assertIn("…", out)
+        self.assertLessEqual(len(out), len("Apple Music: ") + 60 + 1)
+
+    def test_label_is_running_raise_degrades_to_closed(self):
+        with self._patch_bridge(_FakeAppleMusicBridge(running_raises=True)):
+            self.assertEqual(tray._status_text_apple_music(), "Apple Music: closed")
+
+    def test_label_now_playing_raise_degrades_to_idle(self):
+        with self._patch_bridge(_FakeAppleMusicBridge(running=True, now_raises=True)):
+            self.assertEqual(tray._status_text_apple_music(), "Apple Music: idle")
+
+    def test_bridge_accessor_caches_unavailable_on_import_failure(self):
+        # When the bridge can't be resolved, the accessor remembers it (sentinel)
+        # so repeated menu opens don't re-import. Force BOTH lookup paths to miss:
+        # drop it from sys.modules AND make the `from audio import ...` raise.
+        tray.__dict__.pop("_apple_music_app_mod", None)
+        real_import = __import__
+
+        def boom(name, *a, **k):
+            if name == "audio" and a and a[2] and "apple_music_app" in a[2]:
+                raise ImportError("no apple_music_app")
+            return real_import(name, *a, **k)
+
+        with mock.patch.dict(sys.modules), \
+             mock.patch("builtins.__import__", side_effect=boom):
+            sys.modules.pop("audio.apple_music_app", None)
+            self.assertIsNone(tray._apple_music_app())
+        self.assertIs(tray.__dict__.get("_apple_music_app_mod"), tray._AM_UNAVAILABLE)
+        # Second call returns None from the cached sentinel (no re-import).
+        self.assertIsNone(tray._apple_music_app())
+
+    def test_bridge_accessor_returns_cached_sentinel_without_reimport(self):
+        # Once the sentinel is cached, the accessor short-circuits to None and
+        # never touches the import machinery again.
+        tray.__dict__["_apple_music_app_mod"] = tray._AM_UNAVAILABLE
+        with mock.patch("builtins.__import__",
+                        side_effect=AssertionError("must not import")):
+            self.assertIsNone(tray._apple_music_app())
+
+    def test_bridge_accessor_returns_module_from_sys_modules(self):
+        # The happy path: the already-imported bridge in sys.modules is returned
+        # and cached, so the label can call is_running()/now_playing() on it.
+        tray.__dict__.pop("_apple_music_app_mod", None)
+        sentinel_mod = _FakeAppleMusicBridge(running=True, now="X")
+        with mock.patch.dict(sys.modules,
+                             {"audio.apple_music_app": sentinel_mod}):
+            self.assertIs(tray._apple_music_app(), sentinel_mod)
+        self.assertIs(tray.__dict__.get("_apple_music_app_mod"), sentinel_mod)
+
+
+class AppleMusicCommandTests(TrayTestBase):
+    """Each transport verb writes exactly the media/open command bobert's
+    drainer routes to the existing ACTIONS (the OS media-key path)."""
+    def _assert_cmd(self, fn, expected_cmd):
+        fn(mock.Mock(), mock.Mock())
+        self.assertEqual(self._last_command()["cmd"], expected_cmd)
+
+    def test_playpause_sends_media_playpause(self):
+        self._assert_cmd(tray._on_apple_music_playpause, "media_playpause")
+
+    def test_next_sends_media_next(self):
+        self._assert_cmd(tray._on_apple_music_next, "media_next")
+
+    def test_prev_sends_media_prev(self):
+        self._assert_cmd(tray._on_apple_music_prev, "media_prev")
+
+    def test_open_sends_open_apple_music(self):
+        self._assert_cmd(tray._on_open_apple_music, "open_apple_music")
+
+
+class AppleMusicMenuTests(TrayTestBase):
+    """The Apple Music submenu renders, exposes the transport verbs + a dynamic
+    now-playing header, and wires each verb to the right command — even when the
+    bridge is absent (the items still build; the label degrades)."""
+
+    def _build_menu(self):
+        captured = {}
+
+        def fake_thread(*a, **k):
+            return mock.Mock()
+
+        with mock.patch.object(sys, "argv", ["tray.py"]), \
+             mock.patch.object(tray, "_load_base_icon"), \
+             mock.patch.object(tray.threading, "Thread", side_effect=fake_thread), \
+             mock.patch.object(tray.pystray, "Icon") as Icon:
+            inst = Icon.return_value
+            inst.run.return_value = None
+
+            def capture(*a, **k):
+                captured["kwargs"] = k
+                return inst
+
+            Icon.side_effect = capture
+            tray.main()
+        return captured["kwargs"]["menu"]
+
+    def _flatten(self, menu):
+        items = []
+        for it in menu.items:
+            if it is tray.pystray.Menu.SEPARATOR:
+                continue
+            items.append(it)
+            sub = getattr(it, "submenu", None)
+            if sub is not None:
+                items.extend(self._flatten(sub))
+        return items
+
+    def test_apple_music_submenu_present_in_top_level(self):
+        menu = self._build_menu()
+        texts = [getattr(it, "text", None) for it in menu.items
+                 if it is not tray.pystray.Menu.SEPARATOR]
+        self.assertIn("Apple Music", texts)
+
+    def test_submenu_has_transport_items(self):
+        menu = self._build_menu()
+        texts = [getattr(it, "text", None) for it in self._flatten(menu)]
+        for expected in ("Play / Pause", "Next", "Previous", "Open Apple Music"):
+            self.assertIn(expected, texts, expected)
+
+    def test_transport_items_fire_right_commands(self):
+        menu = self._build_menu()
+        items = {getattr(it, "text", None): it for it in self._flatten(menu)}
+        for label, cmd in (("Play / Pause", "media_playpause"),
+                           ("Next", "media_next"),
+                           ("Previous", "media_prev"),
+                           ("Open Apple Music", "open_apple_music")):
+            with mock.patch.object(tray, "_send_command") as sc:
+                items[label](mock.Mock())
+            sc.assert_called_once_with(cmd)
+
+    def test_now_playing_header_present_and_dynamic(self):
+        # The header is a disabled item whose text comes from the now-playing
+        # builder; evaluating it with a fake bridge reflects the track.
+        with mock.patch.object(tray, "_apple_music_app",
+                               return_value=_FakeAppleMusicBridge(running=True,
+                                                                  now="A Song")):
+            menu = self._build_menu()
+            am_item = next(it for it in menu.items
+                           if getattr(it, "text", "") == "Apple Music")
+            header = list(am_item.submenu.items)[0]
+            self.assertFalse(header.enabled)
+            self.assertEqual(header.text, "Apple Music: A Song")
+
+    def test_submenu_builds_when_bridge_absent(self):
+        # With the bridge unavailable, the submenu must still build and its label
+        # must render the 'unavailable' text without raising.
+        with mock.patch.object(tray, "_apple_music_app", return_value=None):
+            menu = self._build_menu()
+            am_item = next(it for it in menu.items
+                           if getattr(it, "text", "") == "Apple Music")
+            header = list(am_item.submenu.items)[0]
+            self.assertEqual(header.text, "Apple Music: unavailable")
+            # Transport verbs still present + invokable (no-op send is fine).
+            texts = [getattr(it, "text", None) for it in am_item.submenu.items]
+            self.assertIn("Play / Pause", texts)
+
+
 if __name__ == "__main__":
     unittest.main()

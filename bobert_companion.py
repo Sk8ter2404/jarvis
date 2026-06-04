@@ -15352,6 +15352,20 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         threading.Thread(target=_tray_command_drainer, daemon=True).start()
         threading.Thread(target=_tray_state_publisher, daemon=True).start()
 
+    # Apple Music autostart + keep-alive (both opt-in, default off). When
+    # APPLE_MUSIC_AUTOSTART is set, launch the UWP Apple Music app once; when
+    # APPLE_MUSIC_KEEP_OPEN is set, a daemon loop relaunches it if it's closed —
+    # so the tray's Apple Music controls always have something to talk to. The
+    # keeper self-gates on the flags AND on staging (never launches the real app
+    # in tests / on the staging box) and runs entirely on background daemon
+    # threads, so this call never delays boot.
+    if APPLE_MUSIC_AUTOSTART or APPLE_MUSIC_KEEP_OPEN:
+        try:
+            from audio import apple_music_keeper as _am_keeper
+            _am_keeper.start_keeper()
+        except Exception as _e:
+            print(f"  [apple-music-keeper] startup failed: {_e}")
+
     set_state("idle")
     last_speech_time = time.time()
 

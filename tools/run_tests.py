@@ -44,6 +44,18 @@ def _redirect_settings_to_throwaway() -> None:
     os.environ["JARVIS_SETTINGS_PATH"] = throwaway
 
 
+def _stop_lingering_daemons() -> None:
+    """Best-effort: stop any opt-in background daemon a test may have left alive
+    (currently the apple-music keep-alive watchdog) so it can't outlive the
+    suite. Never raises; a never-imported module is a no-op."""
+    try:
+        mod = sys.modules.get("audio.apple_music_keeper")
+        if mod is not None and hasattr(mod, "stop_keeper"):
+            mod.stop_keeper(timeout=5.0)
+    except Exception:
+        pass
+
+
 def main(argv: list[str]) -> int:
     # Redirect settings I/O to a throwaway copy BEFORE any test is imported, so
     # a leaked real save_settings can't touch data/user_settings.json.
@@ -67,6 +79,12 @@ def main(argv: list[str]) -> int:
 
     runner = unittest.TextTestRunner(verbosity=2 if verbose else 1)
     result = runner.run(suite)
+
+    # Belt-and-suspenders: reap any opt-in background daemon a test left running
+    # (e.g. the apple-music keep-alive watchdog, a non-terminating loop) so it
+    # can't outlive the suite. Per-test cleanup is the real guard; this never
+    # fails the run and is a no-op if the module was never imported.
+    _stop_lingering_daemons()
 
     total = result.testsRun
     fails = len(result.failures)

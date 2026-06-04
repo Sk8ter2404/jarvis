@@ -31,6 +31,7 @@ exception that could crash the action dispatcher.
 """
 from __future__ import annotations
 
+import os
 import sys
 
 from audio import itunes_bridge
@@ -233,7 +234,154 @@ def shuffle_library(arg: str = "") -> str:
     return "Shuffling your music library, sir."
 
 
+# ─── "keep Apple Music always open" voice toggle ───────────────────────────
+# The UWP Apple Music app has no system tray of its own, so JARVIS hosts the
+# controls in ITS tray (tray.py) and — opt-in — keeps the app permanently
+# running so those controls always have something to talk to. These actions
+# flip the two keeper flags (core.config.APPLE_MUSIC_AUTOSTART / _KEEP_OPEN),
+# persist them via the hardened Settings writer (same path model_picker uses),
+# and launch the app now. We are HONEST in the reply: JARVIS can't put the app
+# itself in the Windows tray and does NOT toggle its mini-player view — the user
+# sets mini-player once and the app simply reopens that way.
+
+
+def _bc():
+    """Live monolith module (main or by-name), or None — for the staging gate."""
+    return sys.modules.get("__main__") or sys.modules.get("bobert_companion")
+
+
+def _apple_music_app():
+    """Lazy audio.apple_music_app bridge, or None. Never raises."""
+    mod = sys.modules.get("audio.apple_music_app")
+    if mod is not None:
+        return mod
+    try:
+        from audio import apple_music_app as _am
+        return _am
+    except Exception:
+        return None
+
+
+def _is_staging() -> bool:
+    """True on the staging/test instance — never launch the real app there.
+    Matches the monolith's gate plus the raw env var (mirrors other skills)."""
+    if os.environ.get("JARVIS_STAGING", "").strip() == "1":
+        return True
+    bc = _bc()
+    if bc is not None:
+        fn = getattr(bc, "_is_staging", None)
+        if callable(fn):
+            try:
+                return bool(fn())
+            except Exception:
+                return False
+    return False
+
+
+def _cfg_flag(name: str, default: bool = False) -> bool:
+    """Read a live boolean from core.config, tolerating its absence."""
+    try:
+        from core import config as _cfg
+        return bool(getattr(_cfg, name, default))
+    except Exception:
+        return default
+
+
+def _persist_setting(key: str, value) -> bool:
+    """Write {key: value} into data/user_settings.json WITHOUT clobbering the
+    owner's other saved settings — the EXACT path model_picker / kinect_gestures
+    use (settings_window.load_settings + save_settings, which honour
+    JARVIS_SETTINGS_PATH so tests never touch the real file). Best-effort:
+    returns False on any error (the live toggle already took effect)."""
+    try:
+        from tools import settings_window as sw
+    except Exception:
+        return False
+    try:
+        current = sw.load_settings()
+        if not isinstance(current, dict):
+            current = {}
+        current[key] = value
+        sw.save_settings(current)
+        return True
+    except Exception:
+        return False
+
+
+def _set_keeper_flags(on: bool) -> bool:
+    """Flip BOTH keeper flags live (core.config mirror) and persist them.
+    Returns True iff both persisted."""
+    try:
+        import core.config as _cfg
+        _cfg.APPLE_MUSIC_AUTOSTART = bool(on)
+        _cfg.APPLE_MUSIC_KEEP_OPEN = bool(on)
+    except Exception:
+        pass
+    ok1 = _persist_setting("APPLE_MUSIC_AUTOSTART", bool(on))
+    ok2 = _persist_setting("APPLE_MUSIC_KEEP_OPEN", bool(on))
+    return ok1 and ok2
+
+
+def keep_music_open(_: str = "") -> str:
+    """Turn on 'keep Apple Music always open': set both keeper flags, persist
+    them, launch the app now, and start the keep-alive loop. Honest about the
+    tray/mini-player reality. 'always open apple music' / 'keep apple music open
+    in the tray'."""
+    persisted = _set_keeper_flags(True)
+
+    # Launch it now (unless staging/test) so the controls have something live.
+    launch_note = ""
+    if not _is_staging():
+        amapp = _apple_music_app()
+        if amapp is not None:
+            try:
+                if not amapp.is_running():
+                    ok, err = amapp.launch()
+                    if not ok:
+                        launch_note = f" (I couldn't open it just now: {err})"
+            except Exception:
+                pass
+        # Kick the keep-alive daemon up immediately (idempotent; self-gates on
+        # the now-true flags + staging). It survives even if the launch above
+        # raced the process check.
+        try:
+            from audio import apple_music_keeper as _amk
+            _amk.start_keeper()
+        except Exception:
+            pass
+
+    msg = ("Done, sir — I'll keep Apple Music running and you can control it "
+           "from my tray icon. The app can't sit in the Windows tray itself, "
+           "but set it to mini-player once and it'll reopen that way.")
+    if not persisted:
+        msg += " (I couldn't save the setting, so it'll revert on restart.)"
+    return msg + launch_note
+
+
+def stop_keeping_music_open(_: str = "") -> str:
+    """Turn off the keep-Apple-Music-open behaviour: clear both keeper flags and
+    persist. Leaves the app running (we don't close it out from under you).
+    'stop keeping apple music open'."""
+    if not _cfg_flag("APPLE_MUSIC_AUTOSTART") and not _cfg_flag("APPLE_MUSIC_KEEP_OPEN"):
+        return "I wasn't keeping Apple Music open, sir."
+    persisted = _set_keeper_flags(False)
+    # Actually stop the keep-alive watchdog (not just flip the flag) so the
+    # background loop terminates instead of spinning on. Best-effort, never raises.
+    try:
+        from audio import apple_music_keeper as _amk
+        _amk.stop_keeper()
+    except Exception:
+        pass
+    msg = ("Understood, sir — I'll stop reopening Apple Music. It's still open "
+           "for now; close it whenever you like.")
+    if not persisted:
+        msg += " (I couldn't save the setting, so it'll revert on restart.)"
+    return msg
+
+
 def register(actions: dict) -> None:
     actions["play_playlist"] = play_playlist
     actions["list_playlists"] = list_playlists
     actions["shuffle_library"] = shuffle_library
+    actions["keep_music_open"] = keep_music_open
+    actions["stop_keeping_music_open"] = stop_keeping_music_open

@@ -606,6 +606,24 @@ BAMBU_SERIAL      = os.getenv("BAMBU_SERIAL",      "")   # env/.env only - never
 ITUNES_AUTO_LAUNCH = False
 
 
+# ─── Apple Music app (UWP) autostart + keep-alive ──────────────────────
+# The Microsoft-Store Apple Music app (process AppleMusic.exe) has NO COM
+# automation surface and NO system tray of its own, so JARVIS hosts the
+# controls in ITS tray and drives playback only the LEGITIMATE way: launch
+# the app via its AUMID and send OS media keys. These two opt-in flags let
+# the user keep the app permanently running so those tray controls always
+# have something to talk to. The keeper (audio/apple_music_keeper.py) reads
+# them; it NEVER launches anything in staging/test. Both default False so a
+# fresh install never pops the app open uninvited.
+#
+# APPLE_MUSIC_AUTOSTART — launch the Apple Music app once when JARVIS starts.
+# APPLE_MUSIC_KEEP_OPEN — keep-alive: a background loop re-launches the app if
+#   it gets closed (only ever (re)launches when it is NOT already running, so
+#   it never steals focus on a tick where the app is already up).
+APPLE_MUSIC_AUTOSTART = False
+APPLE_MUSIC_KEEP_OPEN = False
+
+
 # ─── Overnight self-improvement engine ─────────────────────────────────
 # OVERNIGHT_UPGRADE_ENABLED = True means the background thread polls
 # for idle + gap thresholds and fires the upgrade pipeline on its own.
