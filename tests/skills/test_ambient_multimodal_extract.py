@@ -525,6 +525,43 @@ class AmbientExtractRegisterTests(unittest.TestCase):
                                side_effect=RuntimeError("sleep boom")):
             captured["t"]()   # must not raise
 
+    def test_autostart_triggers_on_ambient_capture_enabled(self):
+        # The extractor must also autostart when an ambient CAPTURE source is on
+        # (mic/system-audio/screen) even if AMBIENT_EXTRACT_ENABLED itself is
+        # False — otherwise transcripts pile up but nothing is ever distilled
+        # into memory ("captures but doesn't learn"). Here ONLY
+        # AMBIENT_LISTEN_ENABLED is True.
+        mod, _ = load_skill_isolated("ambient_multimodal_extract", register=False)
+        actions = {}
+        import threading as _thr
+        captured = {}
+
+        def _cfg(name, default):
+            return name == "AMBIENT_LISTEN_ENABLED"
+
+        with mock.patch.object(_thr.Thread, "start",
+                               lambda self: captured.__setitem__("t", self._target)), \
+             mock.patch.object(mod, "_get_config", side_effect=_cfg):
+            mod.register(actions)
+        # An autostart thread WAS constructed despite AMBIENT_EXTRACT_ENABLED=False.
+        self.assertIn("t", captured)
+        with mock.patch.object(mod.time, "sleep", return_value=None), \
+             mock.patch.object(mod, "ambient_extract_start") as start:
+            captured["t"]()
+        start.assert_called_once()
+
+    def test_no_autostart_when_all_ambient_sources_off(self):
+        mod, _ = load_skill_isolated("ambient_multimodal_extract", register=False)
+        actions = {}
+        import threading as _thr
+        started = []
+        with mock.patch.object(_thr.Thread, "start",
+                               lambda self: started.append(self)), \
+             mock.patch.object(mod, "_get_config", return_value=False):
+            mod.register(actions)
+        # Everything off → no autostart thread spawned.
+        self.assertEqual(started, [])
+
 
 if __name__ == "__main__":
     unittest.main()

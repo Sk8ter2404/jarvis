@@ -429,10 +429,39 @@ class LlmQuickTests(_MonolithTestBase):
         mlocal.assert_called_once()
 
     def test_llm_quick_force_local_empty_when_local_down(self):
+        # Forced-local + local down → empty string (skip this one-shot, never
+        # fabricate). The honest-skip path now consults the SAC probe for the
+        # log line, so mock it here to keep the test off real PowerShell.
         import core.config as cfg
         with mock.patch.object(cfg, "AMBIENT_LEARNING_FORCE_LOCAL", True), \
-             mock.patch.object(self.bc, "_call_local_llm", return_value=""):
+             mock.patch.object(self.bc, "_call_local_llm", return_value=""), \
+             mock.patch.object(self.bc, "_sac_blocked_local_recently",
+                               return_value=False):
             self.assertEqual(self.bc._llm_quick("s", "u"), "")
+
+    def test_llm_quick_force_local_down_skips_via_sac_when_blocked(self):
+        # When SAC blocked the runner this boot, the forced-local empty path
+        # still returns "" (no cloud fallback by design) — but takes the
+        # SAC-specific log branch. Assert behaviour + that the probe was hit.
+        import core.config as cfg
+        with mock.patch.object(cfg, "AMBIENT_LEARNING_FORCE_LOCAL", True), \
+             mock.patch.object(self.bc, "_call_local_llm", return_value=""), \
+             mock.patch.object(self.bc, "_sac_blocked_local_recently",
+                               return_value=True) as sac:
+            self.assertEqual(self.bc._llm_quick("s", "u"), "")
+        sac.assert_called_once()
+
+    def test_llm_quick_force_local_success_skips_sac_probe(self):
+        # Happy path: local answers → return it, and never consult the SAC
+        # probe (it's only for the failure log).
+        import core.config as cfg
+        with mock.patch.object(cfg, "AMBIENT_LEARNING_FORCE_LOCAL", True), \
+             mock.patch.object(self.bc, "_call_local_llm",
+                               return_value="local fact"), \
+             mock.patch.object(self.bc, "_sac_blocked_local_recently") as sac:
+            out = self.bc._llm_quick("sys", "user")
+        self.assertEqual(out, "local fact")
+        sac.assert_not_called()
 
 
 # ──────────────────────────────────────────────────────────────────────────

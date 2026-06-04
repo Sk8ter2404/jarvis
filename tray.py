@@ -1407,6 +1407,96 @@ def _status_text_bambu() -> str:
     return "● Bambu: printing" if bool(data.get("bambu_active")) else "● Bambu: idle"
 
 
+# ── Apple Music tray controls ────────────────────────────────────────────
+# JARVIS hosts Apple Music controls in ITS tray because the UWP Apple Music
+# app has NO system tray of its own. Transport goes through the SAME command
+# IPC as every other tray verb (_send_command -> bobert's drainer -> the
+# existing media_playpause / media_next / media_prev / open_apple_music
+# ACTIONS, which drive OS media keys + an AUMID launch). We do NOT script the
+# app's UI from here — that automation is policy-restricted.
+#
+# The now-playing LABEL is the one thing read in-process: the tray imports the
+# lazy audio.apple_music_app bridge and calls now_playing() (window-title
+# parse). That bridge never raises and degrades to None when pygetwindow /
+# psutil are missing, so the label still renders ("Apple Music: idle/closed").
+
+def _apple_music_app():
+    """Late-bound, best-effort handle to the audio.apple_music_app bridge, or
+    None. Imported lazily (not at tray-module import) so a stripped install
+    without the audio package — or without the bridge's optional deps — still
+    builds the tray; the menu items just degrade to a no-op/'unknown'. Cached on
+    the module so repeated menu opens don't re-import. Never raises."""
+    cached = globals().get("_apple_music_app_mod")
+    if cached is not None:
+        return cached if cached is not _AM_UNAVAILABLE else None
+    mod = sys.modules.get("audio.apple_music_app")
+    if mod is None:
+        try:
+            from audio import apple_music_app as mod  # type: ignore
+        except Exception:
+            globals()["_apple_music_app_mod"] = _AM_UNAVAILABLE
+            return None
+    globals()["_apple_music_app_mod"] = mod
+    return mod
+
+
+# Sentinel so a failed import is remembered (and not retried every menu open)
+# without colliding with a genuine None "not looked up yet".
+_AM_UNAVAILABLE = object()
+
+
+def _status_text_apple_music() -> str:
+    """Dynamic now-playing label for the Apple Music submenu header. Shows the
+    track when the app is playing, 'idle' when it's running but quiet, and
+    'closed' when it isn't running (or the bridge/deps are unavailable). pystray
+    re-evaluates this lambda on every right-click, so it always reflects current
+    state. Never raises — any failure degrades to the closed label."""
+    amapp = _apple_music_app()
+    if amapp is None:
+        return "Apple Music: unavailable"
+    try:
+        running = amapp.is_running()
+    except Exception:
+        running = False
+    if not running:
+        return "Apple Music: closed"
+    try:
+        np = amapp.now_playing()
+    except Exception:
+        np = None
+    if np:
+        # Keep the menu row from spanning the screen on a long title.
+        np = np if len(np) <= 60 else np[:57].rstrip() + "…"
+        return f"Apple Music: {np}"
+    return "Apple Music: idle"
+
+
+def _on_apple_music_playpause(icon, item):
+    """Play/Pause the Apple Music app via the OS media-key path. Routes through
+    the same command IPC as the rest of the tray: bobert's drainer dispatches
+    `media_playpause` to ACTIONS['media_playpause'] (-> _media_key_with_focus)."""
+    _send_command("media_playpause")
+
+
+def _on_apple_music_next(icon, item):
+    """Next track via the OS media-key path (ACTIONS['media_next'])."""
+    _send_command("media_next")
+
+
+def _on_apple_music_prev(icon, item):
+    """Previous track via the OS media-key path (ACTIONS['media_prev'])."""
+    _send_command("media_prev")
+
+
+def _on_open_apple_music(icon, item):
+    """Open / focus the Apple Music app. Routes `open_apple_music` to bobert,
+    whose ACTIONS['open_apple_music'] launches it via its AUMID (it no-ops with a
+    friendly line if already running). Sending the command (rather than
+    launching from the tray subprocess directly) keeps a single launch owner and
+    matches every other tray verb."""
+    _send_command("open_apple_music")
+
+
 def _is_standby() -> bool:
     data = _read_hud_state()
     raw = str(data.get("state") or "").lower()
@@ -1643,6 +1733,21 @@ def main():
         pystray.MenuItem("Voice / Audio Settings…", _on_settings_voice),
     )
 
+    # ── Submenu: Apple Music ──
+    # JARVIS hosts these because the UWP Apple Music app has no tray of its own.
+    # A dynamic now-playing header (re-read on each menu open) sits above the
+    # transport verbs. Transport uses OS media keys (via the command IPC), and
+    # "Open Apple Music" launches the app by AUMID — no UI scripting of the app.
+    apple_music_menu = pystray.Menu(
+        pystray.MenuItem(lambda i: _status_text_apple_music(), None, enabled=False),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Play / Pause", _on_apple_music_playpause),
+        pystray.MenuItem("Next",         _on_apple_music_next),
+        pystray.MenuItem("Previous",     _on_apple_music_prev),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Open Apple Music", _on_open_apple_music),
+    )
+
     # ── Submenu: Memory ──
     memory_menu = pystray.Menu(
         pystray.MenuItem("Open Long-Term Memory",            _on_open_memory_file),
@@ -1703,6 +1808,7 @@ def main():
         pystray.MenuItem("Power tools", power_menu),
         pystray.MenuItem("AI",          ai_menu),
         pystray.MenuItem("Audio",       audio_menu),
+        pystray.MenuItem("Apple Music", apple_music_menu),
         pystray.MenuItem("Memory",      memory_menu),
         pystray.MenuItem("Diagnostics", diag_menu),
         pystray.MenuItem("Settings",    settings_menu),

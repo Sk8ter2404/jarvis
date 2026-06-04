@@ -1881,6 +1881,103 @@ class AmbientLearningActionTests(SectionFiveBase):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  _act_ambient_mode_set — the "go ambient" voice action. Regression guard for
+#  the user-reported "i don't think it's even learning": turning ambient mode
+#  ON must start BOTH the mic daemon (ambient_listen_start) AND the multimodal
+#  fact-extractor (ambient_extract_start) so overheard speech is actually folded
+#  into long-term memory. Turning it OFF stops both.
+# ════════════════════════════════════════════════════════════════════════════
+class AmbientModeSetWiringTests(SectionFiveBase):
+    def setUp(self):
+        bc = self.bc
+        self._orig = bool(bc._ambient_mode_active[0])
+        self.addCleanup(lambda: bc._ambient_mode_active.__setitem__(0, self._orig))
+        # Neutralise the mic-daemon side: ambient_listen_start/stop are present
+        # in ACTIONS; replace them with no-op spies so this test stays focused
+        # on the extractor wiring and never touches a real device.
+        self._listen_calls = []
+        self._orig_actions = dict(bc.ACTIONS)
+        self.addCleanup(lambda: (bc.ACTIONS.clear(),
+                                 bc.ACTIONS.update(self._orig_actions)))
+        bc.ACTIONS["ambient_listen_start"] = lambda a="": self._listen_calls.append(("start", a)) or "mic on"
+        bc.ACTIONS["ambient_listen_stop"]  = lambda a="": self._listen_calls.append(("stop", a)) or "mic off"
+
+    def _fake_extractor(self, *, start=None, stop=None):
+        ext = types.ModuleType("skill_ambient_multimodal_extract")
+        ext.ambient_extract_start = start or (lambda a="": None)
+        ext.ambient_extract_stop = stop or (lambda a="": None)
+        return ext
+
+    def test_on_starts_mic_daemon_and_extractor(self):
+        bc = self.bc
+        started = []
+        ext = self._fake_extractor(start=lambda a="": started.append(a))
+        with mock.patch.object(bc, "_is_staging", return_value=False), \
+             mock.patch.object(bc, "_write_hud_state"), \
+             mock.patch.dict(sys.modules,
+                             {"skill_ambient_multimodal_extract": ext}):
+            msg = bc._act_ambient_mode_set(True)
+        # Mic daemon was kicked on...
+        self.assertEqual(self._listen_calls, [("start", "")])
+        # ...AND the fact-extractor was started (the symptom-2 fix).
+        self.assertEqual(started, [""])
+        self.assertTrue(bc._ambient_mode_active[0])
+        self.assertIn("learning", msg.lower())
+
+    def test_off_stops_mic_daemon_and_extractor(self):
+        bc = self.bc
+        bc._ambient_mode_active[0] = True
+        stopped = []
+        ext = self._fake_extractor(stop=lambda a="": stopped.append(a))
+        with mock.patch.object(bc, "_is_staging", return_value=False), \
+             mock.patch.object(bc, "_write_hud_state"), \
+             mock.patch.dict(sys.modules,
+                             {"skill_ambient_multimodal_extract": ext}):
+            bc._act_ambient_mode_set(False)
+        self.assertEqual(self._listen_calls, [("stop", "")])
+        self.assertEqual(stopped, [""])
+        self.assertFalse(bc._ambient_mode_active[0])
+
+    def test_on_skips_extractor_in_staging(self):
+        bc = self.bc
+        started = []
+        ext = self._fake_extractor(start=lambda a="": started.append(a))
+        with mock.patch.object(bc, "_is_staging", return_value=True), \
+             mock.patch.object(bc, "_write_hud_state"), \
+             mock.patch.dict(sys.modules,
+                             {"skill_ambient_multimodal_extract": ext}):
+            bc._act_ambient_mode_set(True)
+        # Staging must NOT start the extractor (test injects never write memory).
+        self.assertEqual(started, [])
+
+    def test_on_extractor_exception_swallowed(self):
+        bc = self.bc
+        def _boom(a=""):
+            raise RuntimeError("extractor boom")
+        ext = self._fake_extractor(start=_boom)
+        with mock.patch.object(bc, "_is_staging", return_value=False), \
+             mock.patch.object(bc, "_write_hud_state"), \
+             mock.patch.dict(sys.modules,
+                             {"skill_ambient_multimodal_extract": ext}):
+            # Must not raise even though the extractor blew up.
+            msg = bc._act_ambient_mode_set(True)
+        self.assertTrue(bc._ambient_mode_active[0])
+        self.assertIn("ambient mode", msg.lower())
+
+    def test_on_tolerates_missing_extractor_module(self):
+        bc = self.bc
+        # No skill_ambient_multimodal_extract in sys.modules → must still fire
+        # the mic daemon and not raise.
+        with mock.patch.object(bc, "_is_staging", return_value=False), \
+             mock.patch.object(bc, "_write_hud_state"), \
+             mock.patch.dict(sys.modules, {}, clear=False):
+            sys.modules.pop("skill_ambient_multimodal_extract", None)
+            msg = bc._act_ambient_mode_set(True)
+        self.assertEqual(self._listen_calls, [("start", "")])
+        self.assertIn("learning", msg.lower())
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  Wake-greeting selection: _pick_wake_variety + context_aware_greeting
 # ════════════════════════════════════════════════════════════════════════════
 class WakeVarietyTests(SectionFiveBase):

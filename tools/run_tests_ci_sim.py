@@ -38,8 +38,10 @@ import builtins
 import importlib
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 
 # Heavy / optional pip packages the CI runner does NOT install (everything
@@ -225,8 +227,47 @@ def _run_ci_gates(root: str) -> bool:
     return all_ok
 
 
+def _redirect_settings_to_throwaway(root: str) -> None:
+    """Point the WHOLE suite's settings reads/writes at a throwaway file so a
+    test exercising the real ``tools.settings_window.save_settings`` can NEVER
+    clobber the owner's live ``data/user_settings.json``.
+
+    Sets ``JARVIS_SETTINGS_PATH`` (honoured by settings_window.settings_path())
+    to a file in a fresh temp dir BEFORE any test is imported. Seeds it with a
+    copy of the real file when present (so load_settings sees realistic data),
+    else load_settings just returns defaults. Respects an existing override."""
+    if (os.environ.get("JARVIS_SETTINGS_PATH") or "").strip():
+        return
+    throwaway_dir = tempfile.mkdtemp(prefix="jarvis_test_settings_")
+    throwaway = os.path.join(throwaway_dir, "test_user_settings.json")
+    real = os.path.join(root, "data", "user_settings.json")
+    if os.path.exists(real):
+        try:
+            shutil.copyfile(real, throwaway)
+        except OSError:
+            pass
+    os.environ["JARVIS_SETTINGS_PATH"] = throwaway
+
+
+def _stop_lingering_daemons() -> None:
+    """Best-effort: stop any opt-in background daemon a test may have left alive
+    so it can't outlive the suite. Currently just the apple-music keep-alive
+    watchdog (a non-terminating loop). Never raises; a missing module is a
+    no-op."""
+    try:
+        mod = sys.modules.get("audio.apple_music_keeper")
+        if mod is not None and hasattr(mod, "stop_keeper"):
+            mod.stop_keeper(timeout=5.0)
+    except Exception:
+        pass
+
+
 def main() -> int:
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # Redirect settings I/O to a throwaway copy BEFORE discovery/import (and
+    # before the gate subprocesses, which inherit this env), so no test or gate
+    # can touch the real data/user_settings.json.
+    _redirect_settings_to_throwaway(root)
     # Mirror CI's non-test gates (syntax sweep, lint, PII) up front, before the
     # platform flip — these run in a normal environment on CI, so a clean
     # subprocess here is faithful and catches regressions the test run can't.
@@ -288,6 +329,11 @@ def main() -> int:
     suite = unittest.TestLoader().discover(
         os.path.join(root, "tests"), pattern="test_*.py", top_level_dir=root)
     res = unittest.TextTestRunner(verbosity=1).run(suite)
+    # Belt-and-suspenders: reap any lingering opt-in daemon a test left running
+    # (e.g. the apple-music keep-alive watchdog) so it can't bleed CPU into the
+    # next invocation. The real guard is per-test cleanup in the test modules;
+    # this is a harmless final sweep that never fails the run.
+    _stop_lingering_daemons()
     gate_note = "" if gates_ok else "  [+ CI GATE FAILURE above]"
     print(f"=== CI-SIM: {res.testsRun} run, {len(res.failures)} failed, "
           f"{len(res.errors)} errored, {len(res.skipped)} skipped{gate_note} ===")

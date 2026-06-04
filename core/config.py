@@ -103,15 +103,18 @@ CLAUDE_OPTIONAL = True
 # The LOCAL model is JARVIS's baseline — it serves every turn when Claude
 # is unavailable (no key, capped credits, rate-limit, network glitch, 5xx)
 # and the experience is meant to be good on its own. The workshop rig's
-# 3090 (24 GB VRAM) runs qwen2.5:14b q5_K_M at ~10 GB. For local calls the
-# giant Claude-tuned PC_CONTROL_PROMPT is swapped for a compact action
-# cheatsheet (see _local_cheatsheet) and the context is capped at 16k so
-# the model fits 100 % on the GPU. The runtime selector
+# 3090 (24 GB VRAM) now runs qwen2.5:32b-instruct q4_K_M (~19 GB) as the
+# baseline brain. That model fits 100 % on the GPU ONLY at num_ctx=12288
+# (~49 tok/s, stable); at 16k it spills ~5 % to CPU and drops to ~28 tok/s,
+# so the call path picks num_ctx per-model (see _local_num_ctx). For local
+# calls the giant Claude-tuned PC_CONTROL_PROMPT is swapped for a compact
+# action cheatsheet (see _local_cheatsheet). The runtime selector
 # `_get_local_llm_model()` consults JARVIS_LOCAL_LLM_MODEL first, then walks
-# a fallback chain (qwen2.5:14b → llama3.1:8b → first available tag). Vision
+# a fallback chain (qwen2.5:32b → qwen2.5:14b → llama3.1:8b → first available
+# tag), so a box without the 32B pulled cleanly drops to the 14B. Vision
 # queries prefer the cloud but fall back to the local qwen2.5vl:7b.
 LOCAL_LLM_FALLBACK = True
-LOCAL_LLM_MODEL    = "qwen2.5:14b-instruct-q5_K_M"
+LOCAL_LLM_MODEL    = "qwen2.5:32b-instruct-q4_K_M"
 LOCAL_LLM_BASE_URL = "http://localhost:11434"
 
 # When True, every ambient/background one-shot LLM call (memory extraction,
@@ -442,6 +445,99 @@ CAMERA_LOCK_PROCESSES = {
 }
 
 
+# ─── Xbox Kinect v2 sensor (opt-in; all default False) ─────────────────
+# The Kinect v2 adds true skeleton-based room presence, head-position gaze,
+# a 1080p color camera, plus depth + infrared (night-vision) streams. It is
+# OFF by default — it's a camera + microphone array pointed at the room, so
+# every Kinect capability is opt-in and privacy-conscious. The bridge
+# (audio/kinect_bridge.py) never opens the sensor unless KINECT_ENABLED is
+# True. Flip these here (or via the matching JARVIS_* env override) to use it.
+#
+# KINECT_ENABLED — master switch. When False the bridge short-circuits every
+#   accessor and never touches pykinect2 / the Kinect Runtime. Set True to let
+#   the bridge open the sensor (Color | Body | Depth | Infrared).
+KINECT_ENABLED = False
+# KINECT_AS_CAMERA — when True, the face-tracking loop uses the Kinect's 1080p
+#   color stream as a face-tracking camera (a KinectCapture stands in for
+#   cv2.VideoCapture). Leave False to keep using the configured USB webcams; an
+#   explicit CAMERAS entry with {"type": "kinect"} also opts a slot in.
+KINECT_AS_CAMERA = False
+# KINECT_PRESENCE_ENABLED — when True, the face-tracker skill merges real
+#   skeleton presence (body count + head-facing) from the Kinect into its
+#   gaze/presence state, beating the Haar-cascade guesswork when the sensor
+#   can see the room.
+KINECT_PRESENCE_ENABLED = False
+# KINECT_PRESENCE_STANDBY — when True (and presence is enabled), JARVIS drops
+#   to standby after the room has been empty for a sustained window. Off by
+#   default so the sensor never silences JARVIS unless you ask it to.
+KINECT_PRESENCE_STANDBY = False
+# KINECT_PRESENCE_WAKE — when True (and presence is enabled), JARVIS clears
+#   standby the moment a person reappears in the Kinect's view. Off by default.
+KINECT_PRESENCE_WAKE = False
+# KINECT_GESTURES_ENABLED — when True, a background poller reads the Kinect
+#   skeleton stream (~18 Hz) and maps discrete gestures to actions: WAVE wakes
+#   JARVIS from standby, RAISE_HAND confirms a pending confirmation (like saying
+#   "yes"), and a SWIPE dismisses/cancels (stop speech + clear the pending
+#   confirmation). Off by default; never runs in staging/test. See
+#   audio/kinect_gestures.py (recognizer) + skills/kinect_gestures.py (wiring).
+KINECT_GESTURES_ENABLED = False
+# KINECT_POINT_CONTROL_ENABLED — when True, "point-to-control": the owner points
+#   an arm at a real device (a desk lamp, a fan) and says "turn that on/off" and
+#   JARVIS controls the right smart-home device. First calibrate each device
+#   ("calibrate pointing for the desk lamp" while pointing at it) — the pointing
+#   DIRECTION is stored in a separate gitignored data/kinect_pointing.json
+#   (never user_settings.json) bound to the real device; then a pointed "turn
+#   that on" resolves the live arm ray to the closest calibrated target within
+#   ~18° and fires the EXISTING smart-home on/off path. Off by default; never
+#   drives a device in staging/test. See audio/kinect_pointing.py (geometry +
+#   store) + skills/kinect_pointing.py (wiring).
+KINECT_POINT_CONTROL_ENABLED = False
+# KINECT_GREET_ON_ENTRY — when True (and presence is enabled), JARVIS speaks a
+#   brief varied greeting when you enter a room that had been empty for a while.
+#   Hard rate-limited (≤ once/min) and skipped mid-conversation. Off by default.
+KINECT_GREET_ON_ENTRY = False
+# KINECT_POSTURE_NUDGE — when True (and presence is enabled), JARVIS estimates
+#   slouch from the Kinect spine joints and tracks seated time, emitting ONE
+#   gentle posture/stand nudge after a sustained hunch (~10 min) or long seated
+#   stretch (~45 min), then cooling down (~20 min). Off by default; never nags.
+KINECT_POSTURE_NUDGE = False
+# KINECT_GUARD_ENABLED — when True, the owner may ARM guard mode (the multi-angle
+#   security array in skills/guard_mode.py): an armed background daemon watches
+#   every camera (both webcams via frame differencing + the Kinect's skeleton
+#   presence) and, on detected motion/intrusion, snapshots the frame to a
+#   gitignored data/guard_snapshots/ folder and fires ONE rate-limited proactive
+#   alert (spoken + phone-push if configured). This flag only decides whether
+#   arming is ALLOWED — arming is always an explicit voice action ('guard the
+#   room' / 'stand down'), never automatic. Off by default.
+KINECT_GUARD_ENABLED = False
+
+
+# ─── Face recognition (identity, opt-in; all default off) ──────────────
+# JARVIS can recognise WHO is at the desk — pairing the Kinect's body COUNT
+# with an actual identity from the two monitor webcams (the cameras closest to
+# the user's face). It uses OpenCV's built-in face modules (YuNet detector +
+# SFace recognizer, ONNX) — no dlib, no extra pip dependency. The ~38 MB SFace
+# model and the ~232 KB YuNet model download once to a gitignored data/models/
+# folder; the engine never raises if the download fails, it just stays off.
+#
+# PRIVACY: this is FACE BIOMETRICS. It is OFF by default and fully opt-in. The
+# face embeddings live ONLY in a gitignored data/face_enroll.json (biometric
+# PII — never committed, never shipped) and never leave the machine. Nothing is
+# captured or stored unless you explicitly enroll ("learn my face").
+#
+# FACE_ID_ENABLED — master switch. When False (default) the face_id skill
+#   refuses every action with an honest line and no camera/model work happens;
+#   situational_awareness keeps its existing webcam+Kinect behaviour unchanged.
+#   Set True to allow enrollment + recognition from the monitor webcams.
+FACE_ID_ENABLED = False
+# FACE_ID_MATCH_THRESHOLD — SFace cosine-similarity floor for a positive match.
+#   rec.match(..., FR_COSINE) returns HIGHER for more-similar faces; OpenCV's
+#   own SFace reference uses 0.363 as the same-person cutoff (a feature whose
+#   best cosine vs an enrolled person is >= this is named, else "unknown").
+#   Raise it to be stricter (fewer false matches), lower it to be more lenient.
+FACE_ID_MATCH_THRESHOLD = 0.363
+
+
 # ─── Monitor layout ────────────────────────────────────────────────────
 # Friendly names for each monitor. Each entry is (x, y, w, h). JARVIS
 # uses this for "open Google on my left monitor"-style requests and for
@@ -508,6 +604,24 @@ BAMBU_SERIAL      = os.getenv("BAMBU_SERIAL",      "")   # env/.env only - never
 # module still calls _itunes_bridge.set_auto_launch(ITUNES_AUTO_LAUNCH)
 # right after the import so the bridge picks the live value at boot.
 ITUNES_AUTO_LAUNCH = False
+
+
+# ─── Apple Music app (UWP) autostart + keep-alive ──────────────────────
+# The Microsoft-Store Apple Music app (process AppleMusic.exe) has NO COM
+# automation surface and NO system tray of its own, so JARVIS hosts the
+# controls in ITS tray and drives playback only the LEGITIMATE way: launch
+# the app via its AUMID and send OS media keys. These two opt-in flags let
+# the user keep the app permanently running so those tray controls always
+# have something to talk to. The keeper (audio/apple_music_keeper.py) reads
+# them; it NEVER launches anything in staging/test. Both default False so a
+# fresh install never pops the app open uninvited.
+#
+# APPLE_MUSIC_AUTOSTART — launch the Apple Music app once when JARVIS starts.
+# APPLE_MUSIC_KEEP_OPEN — keep-alive: a background loop re-launches the app if
+#   it gets closed (only ever (re)launches when it is NOT already running, so
+#   it never steals focus on a tick where the app is already up).
+APPLE_MUSIC_AUTOSTART = False
+APPLE_MUSIC_KEEP_OPEN = False
 
 
 # ─── Overnight self-improvement engine ─────────────────────────────────
@@ -624,8 +738,19 @@ def _apply_user_settings() -> None:
         return
     if not isinstance(data, dict):
         return
+    # Back-compat aliases: a config constant that was RENAMED still has saved
+    # user_settings.json files (and Settings-GUI writes) carrying the OLD key.
+    # Map the legacy name onto the current one so the user's override still
+    # reaches the live constant instead of being silently dropped by the
+    # `key not in g` guard below. 2026-06: AMBIENT_LISTENING_ENABLED was renamed
+    # to AMBIENT_LISTEN_ENABLED in v1.20.0; the owner's file still had the old
+    # key, so the mic-ambient daemon never autostarted ("not even learning").
+    _LEGACY_KEY_ALIASES = {
+        "AMBIENT_LISTENING_ENABLED": "AMBIENT_LISTEN_ENABLED",
+    }
     g = globals()
     for key, val in data.items():
+        key = _LEGACY_KEY_ALIASES.get(key, key)
         if key.startswith("_") or key not in g:
             continue          # only override an existing public config constant
         cur = g[key]

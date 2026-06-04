@@ -12,14 +12,54 @@ Exit code 0 = all passed, 1 = failures/errors — so the pipeline can gate on it
 """
 from __future__ import annotations
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _TESTS_DIR = os.path.join(_PROJECT_ROOT, "tests")
 
 
+def _redirect_settings_to_throwaway() -> None:
+    """Point the WHOLE suite's settings reads/writes at a throwaway file so a
+    test that exercises the real ``tools.settings_window.save_settings`` can
+    NEVER clobber the owner's live ``data/user_settings.json``.
+
+    Sets ``JARVIS_SETTINGS_PATH`` (honoured by settings_window.settings_path())
+    to a file in a fresh temp dir BEFORE any test is imported. Seeds it with a
+    copy of the real file when present, so tests that ``load_settings`` still
+    see realistic data; if absent, load_settings just returns defaults. Respects
+    an externally-set override (does nothing if already set)."""
+    if (os.environ.get("JARVIS_SETTINGS_PATH") or "").strip():
+        return
+    throwaway_dir = tempfile.mkdtemp(prefix="jarvis_test_settings_")
+    throwaway = os.path.join(throwaway_dir, "test_user_settings.json")
+    real = os.path.join(_PROJECT_ROOT, "data", "user_settings.json")
+    if os.path.exists(real):
+        try:
+            shutil.copyfile(real, throwaway)
+        except OSError:
+            pass
+    os.environ["JARVIS_SETTINGS_PATH"] = throwaway
+
+
+def _stop_lingering_daemons() -> None:
+    """Best-effort: stop any opt-in background daemon a test may have left alive
+    (currently the apple-music keep-alive watchdog) so it can't outlive the
+    suite. Never raises; a never-imported module is a no-op."""
+    try:
+        mod = sys.modules.get("audio.apple_music_keeper")
+        if mod is not None and hasattr(mod, "stop_keeper"):
+            mod.stop_keeper(timeout=5.0)
+    except Exception:
+        pass
+
+
 def main(argv: list[str]) -> int:
+    # Redirect settings I/O to a throwaway copy BEFORE any test is imported, so
+    # a leaked real save_settings can't touch data/user_settings.json.
+    _redirect_settings_to_throwaway()
     if _PROJECT_ROOT not in sys.path:
         sys.path.insert(0, _PROJECT_ROOT)
 
@@ -39,6 +79,12 @@ def main(argv: list[str]) -> int:
 
     runner = unittest.TextTestRunner(verbosity=2 if verbose else 1)
     result = runner.run(suite)
+
+    # Belt-and-suspenders: reap any opt-in background daemon a test left running
+    # (e.g. the apple-music keep-alive watchdog, a non-terminating loop) so it
+    # can't outlive the suite. Per-test cleanup is the real guard; this never
+    # fails the run and is a no-op if the module was never imported.
+    _stop_lingering_daemons()
 
     total = result.testsRun
     fails = len(result.failures)

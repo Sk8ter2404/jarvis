@@ -52,6 +52,19 @@ def _bc():
     return _bc_mod
 
 
+def _apple_music_app():
+    """Late-bound reference to the audio.apple_music_app bridge — the lazy,
+    never-raises controller for the new UWP Apple Music app. Imported here
+    rather than at module top so a missing dep inside the bridge can never
+    break core.actions import. Returns None if the bridge can't be imported
+    at all (so callers degrade gracefully)."""
+    try:
+        from audio import apple_music_app as _amapp
+        return _amapp
+    except Exception:
+        return None
+
+
 # ─── Browser + search basics (zero-or-low bobert_companion deps) ───────
 
 def _act_open_url(url: str) -> str:
@@ -468,8 +481,29 @@ def _act_apple_music(query: str) -> str:
 
 # ─── App launching (Phase 4D) ──────────────────────────────────────────
 
+# Spoken names that should launch the new UWP Apple Music app via its AUMID
+# (explorer shell:AppsFolder) rather than a doomed exe / startfile lookup —
+# the Store app has no PATH-friendly executable.
+_APPLE_MUSIC_LAUNCH_ALIASES = frozenset({
+    "apple music", "apple music app", "music app", "applemusic",
+    "the apple music app",
+})
+
+
 def _act_launch_app(name: str) -> str:
     bc = _bc()
+    # 0) Apple Music (UWP) special-case — launch via AUMID. The Store app
+    #    isn't on PATH and os.startfile("apple music") fails, so route it
+    #    through the apple_music_app bridge before the generic resolution.
+    if re.sub(r"\s+", " ", (name or "").strip().lower()) in _APPLE_MUSIC_LAUNCH_ALIASES:
+        amapp = _apple_music_app()
+        if amapp is not None:
+            ok, err = amapp.launch()
+            if ok:
+                return "launched Apple Music"
+            return f"could not launch Apple Music: {err}"
+        # Bridge unimportable — fall through to the generic path below.
+
     # 1) Known-app table for things shutil.which / os.startfile can't resolve
     #    (e.g. Bambu Studio, which installs to Program Files without a
     #    PATH-friendly name).
@@ -495,42 +529,56 @@ def _act_launch_app(name: str) -> str:
         return f"could not launch {name}: {e}"
 
 
-# ─── iTunes music pause/resume/now-playing (Phase 4D) ──────────────────
+# ─── Music pause/resume/now-playing — media keys, COM is dead (Phase 4D) ─
+#
+# Classic iTunes is gone (iTunes.Application COM not registered, iTunes.exe
+# absent), so the old _get_itunes() / app.Pause() / app.Play() / CurrentTrack
+# paths are dead. Transport now drives whatever player is live with OS-level
+# MEDIA KEYS: the Apple Music web app (browser-active fast path) OR the new
+# UWP Apple Music app (apple_music_app.is_active_media_app()). Only when
+# NOTHING is playing/running do we return an honest line.
+
+_NOTHING_PLAYING_MSG = (
+    "Nothing seems to be playing, sir — open Apple Music and I'll take it "
+    "from there."
+)
+
 
 def _act_pause_music(_: str = "") -> str:
     bc = _bc()
+    # Browser Apple Music → media key (fast path, unchanged).
     if bc._apple_music_chrome_active():
         return _act_media_playpause()
-    app, err = bc._get_itunes()
-    if app is None:
-        return err
-    try:
-        app.Pause()
-        return "music paused"
-    except Exception as e:
-        return f"pause failed: {e}"
+    # New UWP Apple Music app running → media key. pause/resume both map to
+    # the single OS playpause toggle.
+    amapp = _apple_music_app()
+    if amapp is not None and amapp.is_active_media_app():
+        return _act_media_playpause()
+    return _NOTHING_PLAYING_MSG
 
 
 def _act_resume_music(_: str = "") -> str:
     bc = _bc()
     if bc._apple_music_chrome_active():
         return _act_media_playpause()
-    app, err = bc._get_itunes()
-    if app is None:
-        return err
-    try:
-        app.Play()
-        return "music resumed"
-    except Exception as e:
-        return f"resume failed: {e}"
+    amapp = _apple_music_app()
+    if amapp is not None and amapp.is_active_media_app():
+        return _act_media_playpause()
+    return _NOTHING_PLAYING_MSG
 
 
 def _act_now_playing(_: str = "") -> str:
-    # When Apple Music is the active browser-based player, "now playing"
-    # would otherwise call _get_itunes and (pre-fix) potentially spawn
-    # iTunes. The Apple Music tab title carries the song already, so just
-    # surface that instead of touching iTunes COM.
     bc = _bc()
+    # 1) New UWP Apple Music app — best-effort read of its window title.
+    amapp = _apple_music_app()
+    if amapp is not None:
+        try:
+            np = amapp.now_playing()
+        except Exception:
+            np = None
+        if np:
+            return f"Apple Music: {np}"
+    # 2) Browser Apple Music tab — the tab title carries the song.
     if bc._apple_music_chrome_active():
         try:
             import pygetwindow as gw
@@ -542,16 +590,49 @@ def _act_now_playing(_: str = "") -> str:
             pass
         return ("Apple Music is the active player — open the Apple Music "
                 "tab to see what's currently playing.")
-    app, err = bc._get_itunes()
-    if app is None:
-        return err
+    # 3) The app is running but its title gave us nothing useful.
+    if amapp is not None and amapp.is_active_media_app():
+        return ("Apple Music is open, sir, but it isn't telling me the track "
+                "name right now.")
+    return _NOTHING_PLAYING_MSG
+
+
+# ─── Open / status for the new UWP Apple Music app ─────────────────────────
+
+def _act_open_apple_music(_: str = "") -> str:
+    """Launch the new UWP Apple Music app via its AUMID. 'open Apple Music'."""
+    amapp = _apple_music_app()
+    if amapp is None:
+        return "the Apple Music bridge isn't available, sir."
+    if amapp.is_running():
+        return "Apple Music is already open, sir."
+    ok, err = amapp.launch()
+    if ok:
+        return "launched Apple Music"
+    return f"could not launch Apple Music: {err}"
+
+
+def _act_music_status(_: str = "") -> str:
+    """Report whether the Apple Music app is installed / running and what (if
+    anything) it's playing. 'is Apple Music open' / 'music status'."""
+    amapp = _apple_music_app()
+    if amapp is None:
+        return "the Apple Music bridge isn't available, sir."
+    running = amapp.is_running()
+    if not running:
+        # is_installed() is a best-effort PowerShell check; treat False as
+        # 'unknown' rather than a hard claim it's missing.
+        if amapp.is_installed():
+            return "Apple Music is installed but not running, sir."
+        return ("Apple Music doesn't appear to be running, sir — say 'open "
+                "Apple Music' and I'll start it.")
     try:
-        t = app.CurrentTrack
-        if t is None:
-            return "nothing currently playing"
-        return f"'{t.Name}' by {t.Artist} from {t.Album}"
-    except Exception as e:
-        return f"could not check: {e}"
+        np = amapp.now_playing()
+    except Exception:
+        np = None
+    if np:
+        return f"Apple Music is running, sir — now playing {np}."
+    return "Apple Music is running, sir, but nothing is playing right now."
 
 
 # ─── Task queue add (Phase 4D) ─────────────────────────────────────────
@@ -693,60 +774,25 @@ def _act_type(text: str) -> str:
 # ─── Music skip/back (Phase 4E) ────────────────────────────────────────
 
 def _act_next_song(_: str = "") -> str:
+    # COM is dead → media keys. Browser Apple Music or the new UWP app both
+    # respond to the OS nexttrack key.
     bc = _bc()
     if bc._apple_music_chrome_active():
         return _act_media_next()
-
-    # iTunes COM (NextTrack / CurrentTrack) on the voice thread can hang
-    # indefinitely if iTunes is Not Responding. Run it on a worker with a
-    # join-timeout; the worker acquires its own iTunes handle (no STA proxy
-    # across threads). Falls back to the bridge helper only when present so
-    # this stays safe if bobert_companion predates the wrapper.
-    def _work() -> str:
-        app, err = bc._get_itunes()
-        if app is None:
-            return err
-        try:
-            app.NextTrack()
-            try:
-                t = app.CurrentTrack
-                return f"now playing '{t.Name}' by {t.Artist}"
-            except Exception:
-                return "skipped to next track"
-        except Exception as e:
-            return f"skip failed: {e}"
-
-    runner = getattr(bc, "_run_itunes_com_timeout", None)
-    if runner is None:
-        return _work()
-    return runner(_work, timeout_msg="iTunes isn't responding, sir.")
+    amapp = _apple_music_app()
+    if amapp is not None and amapp.is_active_media_app():
+        return _act_media_next()
+    return _NOTHING_PLAYING_MSG
 
 
 def _act_previous_song(_: str = "") -> str:
     bc = _bc()
     if bc._apple_music_chrome_active():
         return _act_media_prev()
-
-    # Same wedged-iTunes guard as _act_next_song: run the COM calls on a
-    # worker with a join-timeout, acquiring the handle inside the worker.
-    def _work() -> str:
-        app, err = bc._get_itunes()
-        if app is None:
-            return err
-        try:
-            app.PreviousTrack()
-            try:
-                t = app.CurrentTrack
-                return f"now playing '{t.Name}' by {t.Artist}"
-            except Exception:
-                return "went back to previous track"
-        except Exception as e:
-            return f"previous failed: {e}"
-
-    runner = getattr(bc, "_run_itunes_com_timeout", None)
-    if runner is None:
-        return _work()
-    return runner(_work, timeout_msg="iTunes isn't responding, sir.")
+    amapp = _apple_music_app()
+    if amapp is not None and amapp.is_active_media_app():
+        return _act_media_prev()
+    return _NOTHING_PLAYING_MSG
 
 
 # ─── Task queue read (Phase 4E) ────────────────────────────────────────
@@ -777,7 +823,19 @@ def _act_ambient_mode_set(active: bool) -> str:
     """Force ambient (silent-learning) mode on or off. Mirrors the tray
     dispatcher's ambient_mode_toggle branch so voice and tray follow the
     same code path. Persists ambient_mode_active to hud_state so the
-    setting survives a JARVIS bounce."""
+    setting survives a JARVIS bounce.
+
+    "Ambient mode" is meant to LEARN from what it overhears, so turning it on
+    must do two things, not one:
+      1. start the passive mic-transcription daemon (ambient_listen_start),
+         which now SHARES the main loop's mic via the record_speech tap so the
+         wake word keeps working, and
+      2. start the multimodal fact-EXTRACTOR daemon, which is what actually
+         distils the rolling transcripts into bobert_memory.json. Without (2)
+         the mic captured audio but nothing was ever learned — the user's
+         "i don't think it's even learning" symptom. The extractor is the same
+         one _act_ambient_learning_set starts; we skip it in staging so test
+         injects never write real memory."""
     bc = _bc()
     bc._ambient_mode_active[0] = bool(active)
     bc._write_hud_state(ambient_mode_active=bool(bc._ambient_mode_active[0]))
@@ -788,8 +846,22 @@ def _act_ambient_mode_set(active: bool) -> str:
             fn("")
         except Exception as e:
             return f"ambient daemon refused: {e}"
+    # Start / stop the fact-extractor alongside the mic daemon so ambient mode
+    # genuinely folds overheard speech into long-term memory.
+    _staging = getattr(bc, "_is_staging", lambda: False)
+    if not _staging():
+        _ext = sys.modules.get("skill_ambient_multimodal_extract")
+        if _ext is not None:
+            _ext_action = ("ambient_extract_start" if bc._ambient_mode_active[0]
+                           else "ambient_extract_stop")
+            _ext_fn = getattr(_ext, _ext_action, None)
+            if callable(_ext_fn):
+                try:
+                    _ext_fn("")
+                except Exception:
+                    pass
     state_word = "active" if bc._ambient_mode_active[0] else "off"
-    return f"Ambient mode {state_word}, sir — Chappie is {'listening quietly' if bc._ambient_mode_active[0] else 'standing down'}."
+    return f"Ambient mode {state_word}, sir — Chappie is {'listening quietly and learning' if bc._ambient_mode_active[0] else 'standing down'}."
 
 
 # ─── Skills reload (Phase 4E) ──────────────────────────────────────────
@@ -1300,33 +1372,45 @@ def _act_latency_benchmark(_: str = "") -> str:
 # ─── Music: iTunes search-and-play with browser-Apple-Music routing (Phase 4H) ──
 
 def _act_play_music(args: str) -> str:
-    """Search the iTunes library and play the first match.
-    Examples:
-      play_music, Earth Song                  — search all fields
-      play_music, artist:Michael Jackson      — search by artist
-      play_music, song:Smooth Criminal        — search by song name
-      play_music, album:Thriller              — search by album
-      play_music, library:Earth Song          — force iTunes library even
-                                                if Apple Music is open
+    """Play a song / artist / album by name.
 
-    Routing: when Apple Music is already open in a browser tab/PWA, the
-    request is rerouted to the apple_music streaming pipeline instead of
-    iTunes COM — otherwise iTunes would steal focus + the audio session.
-    Prefix the query with `library:` to force the iTunes COM path.
+    The classic local iTunes library + COM is GONE on this machine, so a
+    "play <query>" request can no longer search a local library. It now
+    routes to the EXISTING browser ``apple_music`` action, which plays on
+    music.apple.com (already working). Field prefixes are handled gracefully:
+
+      play_music, Earth Song              → apple_music("Earth Song")
+      play_music, artist:Michael Jackson  → apple_music("Michael Jackson")
+      play_music, song:Smooth Criminal    → apple_music("Smooth Criminal")
+      play_music, album:Thriller          → apple_music("Thriller")
+      play_music, library:Earth Song      → honest note (local library gone)
+                                            + plays via Apple Music instead
+
+    The dead ``_play_music_core`` (iTunes COM search) is intentionally NOT
+    the primary path anymore — it only ever returns the COM-unavailable
+    error if hit.
     """
-    bc = _bc()
     stripped = args.strip()
+    if not stripped:
+        return "format: play_music, <song/artist/album name>"
+
+    # `library:` used to FORCE the local iTunes library. That library is gone,
+    # so say so honestly, strip the prefix, and stream it via Apple Music.
     m = re.match(r"^library:\s*(.+)$", stripped, re.IGNORECASE)
     if m:
-        # Explicit local-library request — bypass the Apple Music short-circuit
-        # in both the action wrapper here AND inside _get_itunes (the latter
-        # would otherwise still refuse when Apple Music is open in a tab).
-        _ok, msg = bc._play_music_core(m.group(1).strip(), force=True)
-        return msg
-    if bc._apple_music_chrome_active():
-        return _act_apple_music(stripped)
-    _ok, msg = bc._play_music_core(stripped)
-    return msg
+        query = m.group(1).strip()
+        am_reply = _act_apple_music(query)
+        return (
+            "Your local iTunes library is no longer available, sir — playing "
+            f"it via Apple Music instead. {am_reply}"
+        )
+
+    # Strip an artist/song/album/track field prefix (the browser action
+    # searches all fields anyway) and route to music.apple.com.
+    m = re.match(r"^(?:artist|song|album|track):\s*(.+)$", stripped,
+                 re.IGNORECASE)
+    query = m.group(1).strip() if m else stripped
+    return _act_apple_music(query)
 
 
 # ─── Webcam awareness (Phase 4H) ───────────────────────────────────────
@@ -2411,10 +2495,13 @@ __all__ = [
     "_act_find_on_screen",
     # Phase 4D — app launching
     "_act_launch_app",
-    # Phase 4D — iTunes pause/resume/now-playing
+    # Phase 4D — Apple Music transport (media keys; classic iTunes COM is dead)
     "_act_pause_music",
     "_act_resume_music",
     "_act_now_playing",
+    # New UWP Apple Music app — launch + status
+    "_act_open_apple_music",
+    "_act_music_status",
     # Phase 4D — task queue add
     "_act_queue_task",
     # Phase 4D — window management

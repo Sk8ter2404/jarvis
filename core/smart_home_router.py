@@ -696,12 +696,62 @@ def _dispatch_one(device: dict, action: dict) -> dict:
 
 
 # ── public API ──────────────────────────────────────────────────────
+# Reentrancy guard for the pointing hook: skills/kinect_pointing fires the
+# resolved command back through this same function ('turn on desk lamp'), and
+# that resolved utterance is never a pronoun so the hook below won't re-enter —
+# but a thread-local flag makes that guarantee explicit and cheap so a future
+# phrasing change can't introduce a loop.
+_pointing_hook_active = threading.local()
+
+
+def _try_pointing_resolution(utterance: str) -> str | None:
+    """Best-effort: when `utterance` is an ambiguous pronoun on/off command
+    ('turn that on', 'that one off') AND point-to-control is active and the user
+    is pointing at a calibrated device, execute it via pointing and return the
+    spoken result. Returns None otherwise so the caller's normal (named-device /
+    ask-which) path is completely unchanged. Never raises.
+
+    Imported lazily so the router has no hard dependency on the pointing skill,
+    and guarded against reentry from the skill's own call back into us."""
+    if getattr(_pointing_hook_active, "on", False):
+        return None
+    try:
+        kp = importlib.import_module("skills.kinect_pointing")
+    except Exception:
+        return None
+    checker = getattr(kp, "is_pronoun_device_command", None)
+    resolver = getattr(kp, "resolve_pointing_command", None)
+    if not callable(checker) or not callable(resolver):
+        return None
+    try:
+        if not checker(utterance):
+            return None
+    except Exception:
+        return None
+    _pointing_hook_active.on = True
+    try:
+        return resolver(utterance)
+    except Exception:
+        return None
+    finally:
+        _pointing_hook_active.on = False
+
+
 def smart_home_control(utterance: str = "") -> str:
     """Voice / LLM entry point. Parses `utterance`, finds the device(s),
     dispatches via the right brand skill (with Alexa fallback)."""
     if not utterance or not utterance.strip():
         return ("I need something to do, sir — try 'turn off the office "
                 "light' or 'set the bedroom to 65'.")
+
+    # Point-to-control hook: an ambiguous "turn that on" resolves via the Kinect
+    # pointing direction BEFORE we fall back to asking which device. Best-effort
+    # and non-breaking — only fires for bare pronoun commands when point-control
+    # is enabled and the point resolves to a calibrated target; otherwise None
+    # and the existing flow proceeds untouched.
+    pointed = _try_pointing_resolution(utterance)
+    if pointed is not None:
+        return pointed
 
     catalog = _ensure_catalog()
     if catalog is None or not catalog.get("devices"):

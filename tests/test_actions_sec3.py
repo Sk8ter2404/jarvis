@@ -641,17 +641,17 @@ class LatencyBenchmarkTests(unittest.TestCase):
 # _act_play_music
 # ===========================================================================
 class PlayMusicTests(unittest.TestCase):
-    def test_library_prefix_forces_local(self):
+    # The local iTunes library/COM is GONE: play_music now routes to the
+    # browser apple_music action (music.apple.com). The dead _play_music_core
+    # is never the primary path.
+    def test_empty_arg_prompts(self):
         bc = _base_bc()
-        bc._play_music_core.return_value = (True, "playing Earth Song")
         with _patch_bc(bc):
-            out = A._act_play_music("library: Earth Song")
-        self.assertEqual(out, "playing Earth Song")
-        bc._play_music_core.assert_called_once_with("Earth Song", force=True)
+            out = A._act_play_music("   ")
+        self.assertIn("format: play_music", out)
 
-    def test_reroutes_to_apple_music_when_chrome_active(self):
+    def test_routes_to_apple_music(self):
         bc = _base_bc()
-        bc._apple_music_chrome_active.return_value = True
         with _patch_bc(bc), \
                 mock.patch.object(A, "_act_apple_music",
                                   return_value="streamed via apple music") as am:
@@ -660,14 +660,41 @@ class PlayMusicTests(unittest.TestCase):
         am.assert_called_once_with("Smooth Criminal")
         bc._play_music_core.assert_not_called()
 
-    def test_default_path_uses_itunes_core(self):
+    def test_field_prefix_stripped_before_routing(self):
         bc = _base_bc()
-        bc._apple_music_chrome_active.return_value = False
-        bc._play_music_core.return_value = (False, "no tracks found")
-        with _patch_bc(bc):
-            out = A._act_play_music("Thriller")
-        self.assertEqual(out, "no tracks found")
-        bc._play_music_core.assert_called_once_with("Thriller")
+        with _patch_bc(bc), \
+                mock.patch.object(A, "_act_apple_music",
+                                  return_value="ok") as am:
+            A._act_play_music("artist: Michael Jackson")
+        am.assert_called_once_with("Michael Jackson")
+        bc._play_music_core.assert_not_called()
+
+    def test_song_prefix_stripped(self):
+        bc = _base_bc()
+        with _patch_bc(bc), \
+                mock.patch.object(A, "_act_apple_music", return_value="ok") as am:
+            A._act_play_music("song:Earth Song")
+        am.assert_called_once_with("Earth Song")
+
+    def test_library_prefix_honest_note_then_streams(self):
+        # `library:` used to force the dead local library; now it says so and
+        # streams via Apple Music instead. Must NOT call _play_music_core.
+        bc = _base_bc()
+        with _patch_bc(bc), \
+                mock.patch.object(A, "_act_apple_music",
+                                  return_value="Queueing Earth Song on Apple Music.") as am:
+            out = A._act_play_music("library: Earth Song")
+        am.assert_called_once_with("Earth Song")
+        self.assertIn("no longer available", out)
+        self.assertIn("Queueing Earth Song", out)
+        bc._play_music_core.assert_not_called()
+
+    def test_never_calls_dead_com_core(self):
+        bc = _base_bc()
+        with _patch_bc(bc), \
+                mock.patch.object(A, "_act_apple_music", return_value="ok"):
+            A._act_play_music("Thriller")
+        bc._play_music_core.assert_not_called()
 
 
 # ===========================================================================

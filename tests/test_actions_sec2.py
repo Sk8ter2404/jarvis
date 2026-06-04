@@ -126,6 +126,29 @@ class _BaseActTest(unittest.TestCase):
         m.getActiveWindow = mock.Mock(return_value=active)
         return m
 
+    def patch_apple_music_app(self, *, is_active=False, running=False,
+                              installed=False, now_playing=None):
+        """Patch A._apple_music_app() to return a configured Mock bridge for
+        the duration of the test. Returns the mock so callers can assert on it.
+        Pass None as a kwarg value's source to simulate the bridge being
+        unimportable (use patch_apple_music_app_none for that)."""
+        amapp = mock.Mock(name="apple_music_app")
+        amapp.is_active_media_app.return_value = is_active
+        amapp.is_running.return_value = running
+        amapp.is_installed.return_value = installed
+        amapp.now_playing.return_value = now_playing
+        amapp.launch.return_value = (True, None)
+        p = mock.patch.object(A, "_apple_music_app", return_value=amapp)
+        p.start()
+        self.addCleanup(p.stop)
+        return amapp
+
+    def patch_apple_music_app_none(self):
+        """Simulate the apple_music_app bridge being unimportable (returns None)."""
+        p = mock.patch.object(A, "_apple_music_app", return_value=None)
+        p.start()
+        self.addCleanup(p.stop)
+
 
 # ── _act_switch_llm_picker / _act_show_llm_stats ─────────────────────────────
 class LLMMenuTests(_BaseActTest):
@@ -239,6 +262,33 @@ class AppleMusicTests(_BaseActTest):
 
 # ── _act_launch_app ──────────────────────────────────────────────────────────
 class LaunchAppTests(_BaseActTest):
+    def test_apple_music_launches_via_bridge(self):
+        # "open apple music" routes to the UWP bridge's launch(), NOT a doomed
+        # exe / startfile lookup.
+        amapp = self.patch_apple_music_app()
+        amapp.launch.return_value = (True, None)
+        with mock.patch.object(A.subprocess, "Popen") as popen, \
+                mock.patch.object(A.os, "startfile", create=True) as startfile:
+            out = A._act_launch_app("Apple Music")
+        amapp.launch.assert_called_once_with()
+        self.assertEqual(out, "launched Apple Music")
+        popen.assert_not_called()
+        startfile.assert_not_called()
+        self.bc._resolve_known_app.assert_not_called()
+
+    def test_music_app_alias_launches_via_bridge(self):
+        amapp = self.patch_apple_music_app()
+        out = A._act_launch_app("music app")
+        amapp.launch.assert_called_once_with()
+        self.assertEqual(out, "launched Apple Music")
+
+    def test_apple_music_launch_failure_reported(self):
+        amapp = self.patch_apple_music_app()
+        amapp.launch.return_value = (False, "explorer denied")
+        out = A._act_launch_app("apple music")
+        self.assertIn("could not launch Apple Music", out)
+        self.assertIn("explorer denied", out)
+
     def test_known_app_launches(self):
         self.bc._resolve_known_app.return_value = r"C:\Apps\bambu.exe"
         with mock.patch.object(A.subprocess, "Popen") as popen:
@@ -288,6 +338,10 @@ class LaunchAppTests(_BaseActTest):
 
 
 # ── _act_pause_music / _act_resume_music ─────────────────────────────────────
+# Classic iTunes COM is DEAD: pause/resume now press the OS playpause media key
+# when the browser Apple Music tab OR the new UWP Apple Music app is live, and
+# return an honest "nothing's playing" line otherwise. Neither path touches
+# _get_itunes anymore.
 class PauseResumeMusicTests(_BaseActTest):
     def test_pause_routes_to_media_when_chrome_active(self):
         self.bc._apple_music_chrome_active.return_value = True
@@ -297,57 +351,68 @@ class PauseResumeMusicTests(_BaseActTest):
         self.bc._media_key_with_focus.assert_called_once()
         self.assertEqual(out, "media play/pause pressed")
 
-    def test_pause_itunes_unavailable_returns_err(self):
+    def test_pause_routes_to_media_when_uwp_app_active(self):
         self.bc._apple_music_chrome_active.return_value = False
-        self.bc._get_itunes.return_value = (None, "iTunes not installed")
-        self.assertEqual(A._act_pause_music(""), "iTunes not installed")
-
-    def test_pause_itunes_success(self):
-        self.bc._apple_music_chrome_active.return_value = False
-        app = mock.Mock()
-        self.bc._get_itunes.return_value = (app, None)
+        self.bc._media_key_with_focus.return_value = "media play/pause pressed"
+        self.patch_apple_music_app(is_active=True)
         out = A._act_pause_music("")
-        app.Pause.assert_called_once_with()
-        self.assertEqual(out, "music paused")
+        self.bc._media_key_with_focus.assert_called_once()
+        self.assertEqual(out, "media play/pause pressed")
 
-    def test_pause_itunes_exception(self):
+    def test_pause_nothing_playing_honest_message(self):
         self.bc._apple_music_chrome_active.return_value = False
-        app = mock.Mock()
-        app.Pause.side_effect = RuntimeError("COM down")
-        self.bc._get_itunes.return_value = (app, None)
+        self.patch_apple_music_app(is_active=False)
         out = A._act_pause_music("")
-        self.assertIn("pause failed", out)
-        self.assertIn("COM down", out)
+        self.assertIn("Nothing seems to be playing", out)
+        # Must NOT call the dead iTunes COM.
+        self.bc._get_itunes.assert_not_called()
 
-    def test_resume_itunes_success(self):
+    def test_pause_never_calls_dead_com(self):
         self.bc._apple_music_chrome_active.return_value = False
-        app = mock.Mock()
-        self.bc._get_itunes.return_value = (app, None)
+        self.patch_apple_music_app(is_active=True)
+        A._act_pause_music("")
+        self.bc._get_itunes.assert_not_called()
+
+    def test_pause_bridge_unimportable_honest_message(self):
+        self.bc._apple_music_chrome_active.return_value = False
+        self.patch_apple_music_app_none()
+        out = A._act_pause_music("")
+        self.assertIn("Nothing seems to be playing", out)
+
+    def test_resume_routes_to_media_when_uwp_app_active(self):
+        self.bc._apple_music_chrome_active.return_value = False
+        self.bc._media_key_with_focus.return_value = "media play/pause pressed"
+        self.patch_apple_music_app(is_active=True)
         out = A._act_resume_music("")
-        app.Play.assert_called_once_with()
-        self.assertEqual(out, "music resumed")
+        self.bc._media_key_with_focus.assert_called_once()
+        self.assertEqual(out, "media play/pause pressed")
 
     def test_resume_routes_to_media_when_chrome_active(self):
         self.bc._apple_music_chrome_active.return_value = True
         self.bc._media_key_with_focus.return_value = "media play/pause pressed"
         self.assertEqual(A._act_resume_music(""), "media play/pause pressed")
 
-    def test_resume_itunes_exception(self):
+    def test_resume_nothing_playing_honest_message(self):
         self.bc._apple_music_chrome_active.return_value = False
-        app = mock.Mock()
-        app.Play.side_effect = RuntimeError("nope")
-        self.bc._get_itunes.return_value = (app, None)
-        self.assertIn("resume failed", A._act_resume_music(""))
-
-    def test_resume_itunes_unavailable(self):
-        self.bc._apple_music_chrome_active.return_value = False
-        self.bc._get_itunes.return_value = (None, "no itunes")
-        self.assertEqual(A._act_resume_music(""), "no itunes")
+        self.patch_apple_music_app(is_active=False)
+        out = A._act_resume_music("")
+        self.assertIn("Nothing seems to be playing", out)
+        self.bc._get_itunes.assert_not_called()
 
 
 # ── _act_now_playing ─────────────────────────────────────────────────────────
+# COM is dead. now_playing tries the UWP app's window title first, then the
+# browser tab title, then an honest fallback. Never touches _get_itunes.
 class NowPlayingTests(_BaseActTest):
+    def test_uwp_app_now_playing_wins(self):
+        self.patch_apple_music_app(now_playing="Smooth Criminal")
+        # Even if chrome is also "active", the app's reading is preferred.
+        self.bc._apple_music_chrome_active.return_value = True
+        out = A._act_now_playing("")
+        self.assertEqual(out, "Apple Music: Smooth Criminal")
+
     def test_chrome_active_reads_window_title(self):
+        self.patch_apple_music_app(now_playing=None, is_active=False)
         self.bc._apple_music_chrome_active.return_value = True
         win = _FakeWindow(title="Bohemian Rhapsody - Apple Music")
         gw = self.make_pygetwindow(all_windows=[win])
@@ -356,6 +421,7 @@ class NowPlayingTests(_BaseActTest):
         self.assertEqual(out, "Apple Music: Bohemian Rhapsody - Apple Music")
 
     def test_chrome_active_no_matching_window(self):
+        self.patch_apple_music_app(now_playing=None, is_active=False)
         self.bc._apple_music_chrome_active.return_value = True
         gw = self.make_pygetwindow(all_windows=[_FakeWindow(title="Some Other App")])
         self.install_fake_module("pygetwindow", gw)
@@ -363,6 +429,7 @@ class NowPlayingTests(_BaseActTest):
         self.assertIn("Apple Music is the active player", out)
 
     def test_chrome_active_import_error_falls_back(self):
+        self.patch_apple_music_app(now_playing=None, is_active=False)
         self.bc._apple_music_chrome_active.return_value = True
         # Force the inner ``import pygetwindow`` to raise.
         bad = mock.Mock()
@@ -371,31 +438,79 @@ class NowPlayingTests(_BaseActTest):
         out = A._act_now_playing("")
         self.assertIn("Apple Music is the active player", out)
 
-    def test_itunes_current_track(self):
+    def test_app_running_but_no_title_honest(self):
+        # App is the live media app but its title gave no track → in-between line.
+        self.patch_apple_music_app(now_playing=None, is_active=True)
         self.bc._apple_music_chrome_active.return_value = False
-        track = mock.Mock(Name="Song", Artist="Artist", Album="Album")
-        app = mock.Mock(CurrentTrack=track)
-        self.bc._get_itunes.return_value = (app, None)
         out = A._act_now_playing("")
-        self.assertEqual(out, "'Song' by Artist from Album")
+        self.assertIn("isn't telling me the track name", out)
+        self.bc._get_itunes.assert_not_called()
 
-    def test_itunes_nothing_playing(self):
+    def test_nothing_playing_honest(self):
+        self.patch_apple_music_app(now_playing=None, is_active=False)
         self.bc._apple_music_chrome_active.return_value = False
-        app = mock.Mock(CurrentTrack=None)
-        self.bc._get_itunes.return_value = (app, None)
-        self.assertEqual(A._act_now_playing(""), "nothing currently playing")
+        out = A._act_now_playing("")
+        self.assertIn("Nothing seems to be playing", out)
+        self.bc._get_itunes.assert_not_called()
 
-    def test_itunes_unavailable(self):
+    def test_bridge_unimportable_falls_to_browser_then_honest(self):
+        self.patch_apple_music_app_none()
         self.bc._apple_music_chrome_active.return_value = False
-        self.bc._get_itunes.return_value = (None, "itunes missing")
-        self.assertEqual(A._act_now_playing(""), "itunes missing")
+        out = A._act_now_playing("")
+        self.assertIn("Nothing seems to be playing", out)
 
-    def test_itunes_exception(self):
-        self.bc._apple_music_chrome_active.return_value = False
-        app = mock.Mock()
-        type(app).CurrentTrack = mock.PropertyMock(side_effect=RuntimeError("x"))
-        self.bc._get_itunes.return_value = (app, None)
-        self.assertIn("could not check", A._act_now_playing(""))
+
+# ── _act_open_apple_music / _act_music_status ────────────────────────────────
+class OpenAppleMusicTests(_BaseActTest):
+    def test_already_running(self):
+        self.patch_apple_music_app(running=True)
+        self.assertIn("already open", A._act_open_apple_music(""))
+
+    def test_launches_when_not_running(self):
+        amapp = self.patch_apple_music_app(running=False)
+        amapp.launch.return_value = (True, None)
+        out = A._act_open_apple_music("")
+        amapp.launch.assert_called_once_with()
+        self.assertEqual(out, "launched Apple Music")
+
+    def test_launch_failure_reported(self):
+        amapp = self.patch_apple_music_app(running=False)
+        amapp.launch.return_value = (False, "no explorer")
+        out = A._act_open_apple_music("")
+        self.assertIn("could not launch Apple Music", out)
+        self.assertIn("no explorer", out)
+
+    def test_bridge_unavailable(self):
+        self.patch_apple_music_app_none()
+        self.assertIn("isn't available", A._act_open_apple_music(""))
+
+
+class MusicStatusTests(_BaseActTest):
+    def test_running_with_now_playing(self):
+        self.patch_apple_music_app(running=True, now_playing="Thriller")
+        out = A._act_music_status("")
+        self.assertIn("running", out)
+        self.assertIn("Thriller", out)
+
+    def test_running_nothing_playing(self):
+        self.patch_apple_music_app(running=True, now_playing=None)
+        out = A._act_music_status("")
+        self.assertIn("running", out)
+        self.assertIn("nothing is playing", out)
+
+    def test_installed_not_running(self):
+        self.patch_apple_music_app(running=False, installed=True)
+        out = A._act_music_status("")
+        self.assertIn("installed but not running", out)
+
+    def test_not_running_unknown_install(self):
+        self.patch_apple_music_app(running=False, installed=False)
+        out = A._act_music_status("")
+        self.assertIn("doesn't appear to be running", out)
+
+    def test_bridge_unavailable(self):
+        self.patch_apple_music_app_none()
+        self.assertIn("isn't available", A._act_music_status(""))
 
 
 # ── _act_queue_task ──────────────────────────────────────────────────────────
@@ -643,100 +758,53 @@ class TypeTests(_BaseActTest):
 
 # ── _act_next_song / _act_previous_song ──────────────────────────────────────
 class NextPrevSongTests(_BaseActTest):
+    # COM is dead → next/previous press the OS media key when the browser tab
+    # OR the UWP app is live, else an honest line. Never touches _get_itunes /
+    # _run_itunes_com_timeout.
     def test_next_chrome_active_routes_media(self):
         self.bc._apple_music_chrome_active.return_value = True
         self.bc._media_key_with_focus.return_value = "media next pressed"
         self.assertEqual(A._act_next_song(""), "media next pressed")
 
-    def test_next_no_timeout_runner_runs_work_inline(self):
+    def test_next_uwp_app_active_routes_media(self):
         self.bc._apple_music_chrome_active.return_value = False
-        self.bc._run_itunes_com_timeout = None  # getattr -> None -> inline
-        track = mock.Mock(Name="N", Artist="A")
-        app = mock.Mock(CurrentTrack=track)
-        self.bc._get_itunes.return_value = (app, None)
+        self.bc._media_key_with_focus.return_value = "media next pressed"
+        self.patch_apple_music_app(is_active=True)
         out = A._act_next_song("")
-        app.NextTrack.assert_called_once_with()
-        self.assertEqual(out, "now playing 'N' by A")
+        self.assertEqual(out, "media next pressed")
+        self.bc._get_itunes.assert_not_called()
 
-    def test_next_runner_present_is_invoked(self):
+    def test_next_nothing_playing_honest(self):
         self.bc._apple_music_chrome_active.return_value = False
-        self.bc._run_itunes_com_timeout = mock.Mock(return_value="timeout-or-result")
+        self.patch_apple_music_app(is_active=False)
         out = A._act_next_song("")
-        self.bc._run_itunes_com_timeout.assert_called_once()
-        # confirm timeout_msg kwarg is threaded through
-        _, kwargs = self.bc._run_itunes_com_timeout.call_args
-        self.assertIn("timeout_msg", kwargs)
-        self.assertEqual(out, "timeout-or-result")
+        self.assertIn("Nothing seems to be playing", out)
+        self.bc._get_itunes.assert_not_called()
 
-    def test_next_itunes_unavailable_inline(self):
+    def test_next_bridge_unimportable_honest(self):
         self.bc._apple_music_chrome_active.return_value = False
-        self.bc._run_itunes_com_timeout = None
-        self.bc._get_itunes.return_value = (None, "no itunes")
-        self.assertEqual(A._act_next_song(""), "no itunes")
-
-    def test_next_current_track_fails_after_skip(self):
-        self.bc._apple_music_chrome_active.return_value = False
-        self.bc._run_itunes_com_timeout = None
-        app = mock.Mock()
-        type(app).CurrentTrack = mock.PropertyMock(side_effect=RuntimeError("x"))
-        self.bc._get_itunes.return_value = (app, None)
-        out = A._act_next_song("")
-        app.NextTrack.assert_called_once_with()
-        self.assertEqual(out, "skipped to next track")
-
-    def test_next_skip_raises(self):
-        self.bc._apple_music_chrome_active.return_value = False
-        self.bc._run_itunes_com_timeout = None
-        app = mock.Mock()
-        app.NextTrack.side_effect = RuntimeError("boom")
-        self.bc._get_itunes.return_value = (app, None)
-        self.assertIn("skip failed", A._act_next_song(""))
+        self.patch_apple_music_app_none()
+        self.assertIn("Nothing seems to be playing", A._act_next_song(""))
 
     def test_prev_chrome_active_routes_media(self):
         self.bc._apple_music_chrome_active.return_value = True
         self.bc._media_key_with_focus.return_value = "media previous pressed"
         self.assertEqual(A._act_previous_song(""), "media previous pressed")
 
-    def test_prev_inline_success(self):
+    def test_prev_uwp_app_active_routes_media(self):
         self.bc._apple_music_chrome_active.return_value = False
-        self.bc._run_itunes_com_timeout = None
-        track = mock.Mock(Name="P", Artist="B")
-        app = mock.Mock(CurrentTrack=track)
-        self.bc._get_itunes.return_value = (app, None)
+        self.bc._media_key_with_focus.return_value = "media previous pressed"
+        self.patch_apple_music_app(is_active=True)
         out = A._act_previous_song("")
-        app.PreviousTrack.assert_called_once_with()
-        self.assertEqual(out, "now playing 'P' by B")
+        self.assertEqual(out, "media previous pressed")
+        self.bc._get_itunes.assert_not_called()
 
-    def test_prev_current_track_fails(self):
+    def test_prev_nothing_playing_honest(self):
         self.bc._apple_music_chrome_active.return_value = False
-        self.bc._run_itunes_com_timeout = None
-        app = mock.Mock()
-        type(app).CurrentTrack = mock.PropertyMock(side_effect=RuntimeError("x"))
-        self.bc._get_itunes.return_value = (app, None)
-        self.assertEqual(A._act_previous_song(""), "went back to previous track")
-
-    def test_prev_raises(self):
-        self.bc._apple_music_chrome_active.return_value = False
-        self.bc._run_itunes_com_timeout = None
-        app = mock.Mock()
-        app.PreviousTrack.side_effect = RuntimeError("boom")
-        self.bc._get_itunes.return_value = (app, None)
-        self.assertIn("previous failed", A._act_previous_song(""))
-
-    def test_prev_itunes_unavailable(self):
-        self.bc._apple_music_chrome_active.return_value = False
-        self.bc._run_itunes_com_timeout = None
-        self.bc._get_itunes.return_value = (None, "gone")
-        self.assertEqual(A._act_previous_song(""), "gone")
-
-    def test_prev_runner_present_is_invoked(self):
-        self.bc._apple_music_chrome_active.return_value = False
-        self.bc._run_itunes_com_timeout = mock.Mock(return_value="timeout-result")
+        self.patch_apple_music_app(is_active=False)
         out = A._act_previous_song("")
-        self.bc._run_itunes_com_timeout.assert_called_once()
-        _, kwargs = self.bc._run_itunes_com_timeout.call_args
-        self.assertIn("timeout_msg", kwargs)
-        self.assertEqual(out, "timeout-result")
+        self.assertIn("Nothing seems to be playing", out)
+        self.bc._get_itunes.assert_not_called()
 
 
 # ── _act_show_tasks ──────────────────────────────────────────────────────────
