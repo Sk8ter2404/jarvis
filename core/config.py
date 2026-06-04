@@ -474,6 +474,22 @@ KINECT_PRESENCE_STANDBY = False
 # KINECT_PRESENCE_WAKE — when True (and presence is enabled), JARVIS clears
 #   standby the moment a person reappears in the Kinect's view. Off by default.
 KINECT_PRESENCE_WAKE = False
+# KINECT_GESTURES_ENABLED — when True, a background poller reads the Kinect
+#   skeleton stream (~18 Hz) and maps discrete gestures to actions: WAVE wakes
+#   JARVIS from standby, RAISE_HAND confirms a pending confirmation (like saying
+#   "yes"), and a SWIPE dismisses/cancels (stop speech + clear the pending
+#   confirmation). Off by default; never runs in staging/test. See
+#   audio/kinect_gestures.py (recognizer) + skills/kinect_gestures.py (wiring).
+KINECT_GESTURES_ENABLED = False
+# KINECT_GREET_ON_ENTRY — when True (and presence is enabled), JARVIS speaks a
+#   brief varied greeting when you enter a room that had been empty for a while.
+#   Hard rate-limited (≤ once/min) and skipped mid-conversation. Off by default.
+KINECT_GREET_ON_ENTRY = False
+# KINECT_POSTURE_NUDGE — when True (and presence is enabled), JARVIS estimates
+#   slouch from the Kinect spine joints and tracks seated time, emitting ONE
+#   gentle posture/stand nudge after a sustained hunch (~10 min) or long seated
+#   stretch (~45 min), then cooling down (~20 min). Off by default; never nags.
+KINECT_POSTURE_NUDGE = False
 
 
 # ─── Monitor layout ────────────────────────────────────────────────────

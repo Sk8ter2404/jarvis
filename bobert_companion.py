@@ -5875,6 +5875,8 @@ def _local_cheatsheet() -> str:
         "  [ACTION: kinect_status]   'kinect status' / 'is the kinect working'   (Xbox Kinect; honest if it's off/absent)\n"
         "  [ACTION: who_is_here]   'who is in the room' / 'is anyone here'   [ACTION: scan_room]   (Kinect skeleton: body count + distance)\n"
         "  [ACTION: kinect_look, <question>]   'what do you see through the kinect' / 'look through the kinect'\n"
+        "  [ACTION: gesture_status]   'what gestures can you see' / 'is gesture control on'   (Kinect gesture control: wave=wake, raise hand=confirm, swipe=cancel)\n"
+        "  [ACTION: gestures_on]   'turn on gesture control' / 'enable gestures'   [ACTION: gestures_off]   'turn off gesture control'\n"
         "  [ACTION: web_search, <query>]   open a web search in the browser\n"
         "  [ACTION: open_url, <url>]   [ACTION: launch_app, <app name>]\n"
         "  [ACTION: open_on_monitor, <app or url> | <left|middle|right|top>]\n"

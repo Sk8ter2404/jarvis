@@ -10,12 +10,39 @@ Stdlib unittest + unittest.mock only (App-Control-safe; no pytest).
 """
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
 
 from skills import model_picker as M
+
+
+# ─── settings-file safety net ───────────────────────────────────────────────
+# The PersistReuseTests below patch tools.settings_window.load_settings/
+# save_settings at the source module, so the real data/user_settings.json is
+# never written. This module-level redirect is a second, independent layer:
+# JARVIS_SETTINGS_PATH points at a throwaway file for the whole module, so even
+# a future unmocked persistence test can't clobber the owner's real settings.
+_SAVED_SETTINGS_ENV: "str | None" = None
+_SETTINGS_TMPDIR: "str | None" = None
+
+
+def setUpModule() -> None:
+    global _SAVED_SETTINGS_ENV, _SETTINGS_TMPDIR
+    _SAVED_SETTINGS_ENV = os.environ.get("JARVIS_SETTINGS_PATH")
+    _SETTINGS_TMPDIR = tempfile.mkdtemp(prefix="jarvis_model_picker_test_")
+    os.environ["JARVIS_SETTINGS_PATH"] = os.path.join(
+        _SETTINGS_TMPDIR, "test_user_settings.json")
+
+
+def tearDownModule() -> None:
+    if _SAVED_SETTINGS_ENV is None:
+        os.environ.pop("JARVIS_SETTINGS_PATH", None)
+    else:
+        os.environ["JARVIS_SETTINGS_PATH"] = _SAVED_SETTINGS_ENV
 
 # The installed models on the dev box (per the task brief): three CHAT models,
 # one VISION model, one EMBEDDING model.

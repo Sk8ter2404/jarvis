@@ -56,6 +56,44 @@ INITIAL_DELAY_SECONDS = 5    # let the face-track thread come up first
 # dropout from flapping the state.
 KINECT_EMPTY_STANDBY_SECONDS = 180.0   # room empty this long → standby
 KINECT_PRESENCE_REREAD_SEC   = 0.0     # presence is read every poll tick
+
+# ─── Auto-greet on entry (KINECT_GREET_ON_ENTRY, default False) ──────────
+# When the room transitions empty→present after having been empty for at least
+# GREET_MIN_EMPTY_SECONDS, JARVIS speaks one short, varied greeting — but only
+# if it isn't mid-conversation / already speaking, and never more than once per
+# GREET_RATE_LIMIT_SECONDS. Hysteresis (GREET_PRESENT_CONFIRM_SECONDS of held
+# presence) keeps a brief body-track flicker from triggering a false greeting.
+GREET_MIN_EMPTY_SECONDS      = 30.0    # room must have been empty ≥ this first
+GREET_RATE_LIMIT_SECONDS     = 60.0    # at most one greeting per this window
+GREET_PRESENT_CONFIRM_SECONDS = 1.0    # presence must hold this long to count
+GREET_LINES = (
+    "Welcome back, sir.",
+    "There you are, sir.",
+    "Good to see you, sir.",
+    "Back at it, sir?",
+)
+
+# ─── Posture / stand nudge (KINECT_POSTURE_NUDGE, default False) ──────────
+# From the nearest body's spine (spine_base→spine_shoulder vs. vertical) we
+# estimate slouch; we also track continuous seated/in-view time. A single
+# gentle nudge fires when the user has been HUNCHED for POSTURE_HUNCH_SECONDS
+# or SEATED for POSTURE_SEATED_SECONDS, then a POSTURE_COOLDOWN_SECONDS cooldown
+# prevents nagging. "Hunched" = the spine leans more than POSTURE_LEAN_DEG from
+# vertical; the lean must persist (a momentary reach forward doesn't count).
+POSTURE_LEAN_DEG             = 28.0    # spine tilt from vertical to call it slouch
+POSTURE_HUNCH_SECONDS        = 10 * 60   # sustained hunch → nudge (10 min)
+POSTURE_SEATED_SECONDS       = 45 * 60   # sustained seated/in-view → stand nudge (45 min)
+POSTURE_COOLDOWN_SECONDS     = 20 * 60   # silence after a nudge (20 min)
+POSTURE_HUNCH_RESET_SECONDS  = 60.0   # this long upright resets the hunch timer
+POSTURE_ABSENT_RESET_SECONDS = 120.0  # this long out-of-view resets seated timer
+POSTURE_HUNCH_LINES = (
+    "You have been hunched for a while, sir — straighten up?",
+    "Posture check, sir — your spine would thank you for sitting tall.",
+)
+POSTURE_STAND_LINES = (
+    "You have been seated a good while, sir — a quick stand might help.",
+    "Three quarters of an hour at the desk, sir. A brief stretch, perhaps?",
+)
 # ─────────────────────────────────────────────────────────────────────────
 
 
@@ -75,7 +113,33 @@ _state = {
     "kinect_facing":   None,      # any body facing the sensor
     "kinect_at":       0.0,       # monotonic ts of last Kinect presence read
     "kinect_last_present_at": 0.0,   # last time a body WAS present
+    "kinect_last_absent_at":  0.0,   # last time the room WAS empty
 }
+
+# ─── Auto-greet bookkeeping (used only when KINECT_GREET_ON_ENTRY) ────────
+# _greet_empty_since: when the room first went empty (0.0 = occupied/unknown).
+# _greet_present_since: when the current present-run began (for the confirm
+# hysteresis). _greet_last_at: last greeting (monotonic) for the rate limit.
+# All list-wrapped so the poller mutates without `global`.
+_greet_empty_since   = [0.0]
+_greet_present_since = [0.0]
+_greet_last_at       = [0.0]
+_greet_last_line_idx = [-1]    # avoid back-to-back repeats of the same greeting
+
+# ─── Posture/stand bookkeeping (used only when KINECT_POSTURE_NUDGE) ──────
+# _posture_seated_since: start of the continuous seated/in-view run.
+# _posture_hunch_since: start of the current sustained-hunch run (0.0 = upright).
+# _posture_upright_since: how long the user has been upright (resets hunch run).
+# _posture_absent_since: how long out-of-view (resets seated run).
+# _posture_last_nudge_at: last posture nudge (cooldown).
+# _posture_last_hunch_line / _posture_last_stand_line: avoid back-to-back repeats.
+_posture_seated_since    = [0.0]
+_posture_hunch_since     = [0.0]
+_posture_upright_since   = [0.0]
+_posture_absent_since    = [0.0]
+_posture_last_nudge_at   = [0.0]
+_posture_last_hunch_line = [-1]
+_posture_last_stand_line = [-1]
 
 # Empty-room → standby bookkeeping. _kinect_empty_since records when the room
 # first went empty (0.0 = currently occupied / unknown); the standby fires only
@@ -233,6 +297,8 @@ def _merge_kinect_presence(presence: dict, now: float) -> None:
         if not _state["first_face_at"]:
             _state["first_face_at"] = now
         _state["last_face_at"] = now
+    else:
+        _state["kinect_last_absent_at"] = now
 
 
 def _bc():
@@ -324,6 +390,243 @@ def _kinect_clear_standby(bc) -> None:
         print(f"  [face-track] wake-on-presence failed: {e}")
 
 
+# ─── auto-greet on entry (opt-in: KINECT_GREET_ON_ENTRY) ─────────────────
+
+def _import_random():
+    import random
+    return random
+
+def _announce(bc, message: str, *, source: str) -> bool:
+    """Speak something unprompted via the monolith's proactive_announce queue
+    (the canonical, race-safe writer wellness/timers use). Best-effort: returns
+    False if the monolith isn't loaded or the enqueue failed."""
+    if bc is None:
+        bc = _bc()
+    if bc is None:
+        return False
+    fn = getattr(bc, "proactive_announce", None)
+    if not callable(fn):
+        return False
+    try:
+        return bool(fn(message, source=source))
+    except Exception:
+        return False
+
+
+def _jarvis_busy(bc) -> bool:
+    """True when JARVIS shouldn't volunteer a greeting: actively speaking,
+    listening to the user (mid-conversation), or dormant (sleep/standby — a
+    greeting would defeat the point of being quiet)."""
+    if bc is None:
+        return False
+    try:
+        if bool(getattr(bc, "_tts_playback_active", [False])[0]):
+            return True
+        if bool(getattr(bc, "_record_speech_active", [False])[0]):
+            return True
+        if bool(getattr(bc, "_sleep_mode", [False])[0]) or \
+           bool(getattr(bc, "_standby_mode", [False])[0]):
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _apply_greet_on_entry(present: bool, now: float, bc) -> None:
+    """Empty→present after a sustained-empty window → one short greeting.
+    Hard rate-limited + hysteresis-gated + skipped while JARVIS is busy. Opt-in
+    behind KINECT_GREET_ON_ENTRY; all bookkeeping resets cleanly when off so a
+    later enable starts fresh. Swallows every error."""
+    if not _cfg_flag("KINECT_GREET_ON_ENTRY"):
+        _greet_empty_since[0] = 0.0
+        _greet_present_since[0] = 0.0
+        return
+    if not present:
+        # Room empty: arm the empty timer (once) and forget any partial
+        # present-run so a flicker in doesn't count toward the confirm window.
+        if _greet_empty_since[0] == 0.0:
+            _greet_empty_since[0] = now
+        _greet_present_since[0] = 0.0
+        return
+
+    # Room occupied this tick.
+    if _greet_present_since[0] == 0.0:
+        _greet_present_since[0] = now
+
+    # Only consider greeting if the room had previously been empty long enough
+    # (this is the empty→present EDGE, not a continuously-occupied room).
+    empty_since = _greet_empty_since[0]
+    if empty_since == 0.0:
+        return  # never saw it empty → no entry edge to greet
+    empty_for = now - empty_since
+    # Clear the empty marker now that someone's here, so we greet the EDGE once.
+    # We keep evaluating below using the captured empty_for.
+    if empty_for < GREET_MIN_EMPTY_SECONDS:
+        # Too brief an absence (e.g. walked out of frame for a moment): don't
+        # treat the return as a fresh entry. Reset so the next real absence arms.
+        _greet_empty_since[0] = 0.0
+        return
+    # Require the presence to hold for the confirm window (hysteresis).
+    if (now - _greet_present_since[0]) < GREET_PRESENT_CONFIRM_SECONDS:
+        return
+    # Hard rate limit.
+    if _greet_last_at[0] and (now - _greet_last_at[0]) < GREET_RATE_LIMIT_SECONDS:
+        _greet_empty_since[0] = 0.0
+        return
+    if _jarvis_busy(bc):
+        # Don't talk over a conversation; consume the edge so we don't greet the
+        # instant the conversation ends either.
+        _greet_empty_since[0] = 0.0
+        return
+
+    line = _pick_line(GREET_LINES, [_greet_last_line_idx])
+    if _announce(bc, line, source="greet"):
+        _greet_last_at[0] = now
+        print(f"  [face-track] auto-greet on entry (empty {empty_for:.0f}s): {line}")
+    # Consume the edge regardless of enqueue success so we don't spin.
+    _greet_empty_since[0] = 0.0
+
+
+def _pick_line(lines: tuple, idx_holder_list) -> str:
+    """Pick a line avoiding a back-to-back repeat. idx_holder_list is a 1-list
+    [last_index] the caller owns; we may wrap a bare list-of-one for callers
+    that pass the holder directly."""
+    holder = idx_holder_list
+    if len(lines) == 1:
+        return lines[0]
+    rnd = _import_random()
+    while True:
+        i = rnd.randrange(len(lines))
+        if i != holder[0]:
+            holder[0] = i
+            return lines[i]
+
+
+# ─── posture / stand nudge (opt-in: KINECT_POSTURE_NUDGE) ────────────────
+
+def _spine_lean_degrees(joints: dict):
+    """Angle (degrees) of the spine_base→spine_shoulder vector away from
+    vertical, or None when those joints aren't reliably tracked. 0° = perfectly
+    upright; larger = more hunched/leaning. Uses the y (up) and z (depth) axes —
+    a forward hunch tips the torso in z — plus x for a sideways lean."""
+    import math
+    base = joints.get("spine_base")
+    top = joints.get("spine_shoulder") or joints.get("neck")
+    # Require tracked (state >= 2) endpoints; an inferred spine is too noisy.
+    def _ok(j):
+        return j is not None and len(j) >= 4 and int(j[3]) >= 2
+    if not _ok(base) or not _ok(top):
+        return None
+    dx = float(top[0]) - float(base[0])
+    dy = float(top[1]) - float(base[1])
+    dz = float(top[2]) - float(base[2])
+    # Vertical component is dy; the horizontal deviation is sqrt(dx²+dz²).
+    horiz = math.hypot(dx, dz)
+    if dy <= 0.0:
+        # Torso not pointing up at all (lying down / bad track) → treat as max.
+        return 90.0
+    return math.degrees(math.atan2(horiz, dy))
+
+
+def _nearest_body_joints():
+    """The nearest tracked body's joints via the bridge's get_bodies(), or None.
+    Mirrors the recognizer's nearest-body pick. NEVER raises."""
+    kb = _kinect_bridge()
+    if kb is None:
+        return None
+    try:
+        ok, _r = kb.available()
+        if not ok:
+            return None
+        bodies = kb.get_bodies() or []
+    except Exception:
+        return None
+    if not bodies:
+        return None
+    try:
+        ranked = sorted(
+            (b for b in bodies if isinstance(b, dict) and b.get("joints")),
+            key=lambda b: (b.get("distance_m")
+                           if isinstance(b.get("distance_m"), (int, float))
+                           and b.get("distance_m") > 0 else float("inf")))
+    except Exception:
+        return None
+    return ranked[0].get("joints") if ranked else None
+
+
+def _apply_posture_nudge(present: bool, now: float, bc) -> None:
+    """Track sustained hunch + seated time; emit ONE gentle nudge past the
+    threshold, then cool down. Opt-in behind KINECT_POSTURE_NUDGE; resets all
+    timers when off. Hunch is checked first (more actionable); a stand nudge
+    fires for long continuous seated/in-view time. Never nags — single fire per
+    cooldown, and skipped while JARVIS is busy/dormant. Swallows every error."""
+    if not _cfg_flag("KINECT_POSTURE_NUDGE"):
+        _posture_seated_since[0] = 0.0
+        _posture_hunch_since[0] = 0.0
+        _posture_upright_since[0] = 0.0
+        _posture_absent_since[0] = 0.0
+        return
+
+    if not present:
+        # Out of view: after a sustained absence, reset the seated run (the user
+        # actually got up). Brief gaps are tolerated.
+        if _posture_absent_since[0] == 0.0:
+            _posture_absent_since[0] = now
+        if (now - _posture_absent_since[0]) >= POSTURE_ABSENT_RESET_SECONDS:
+            _posture_seated_since[0] = 0.0
+            _posture_hunch_since[0] = 0.0
+            _posture_upright_since[0] = 0.0
+        return
+
+    # Present: clear the absence marker, start/continue the seated run.
+    _posture_absent_since[0] = 0.0
+    if _posture_seated_since[0] == 0.0:
+        _posture_seated_since[0] = now
+
+    # Slouch tracking from the nearest body's spine.
+    joints = _nearest_body_joints()
+    lean = _spine_lean_degrees(joints) if joints else None
+    if lean is not None:
+        if lean >= POSTURE_LEAN_DEG:
+            if _posture_hunch_since[0] == 0.0:
+                _posture_hunch_since[0] = now
+            _posture_upright_since[0] = 0.0
+        else:
+            # Upright: after a sustained upright stretch, reset the hunch run.
+            if _posture_upright_since[0] == 0.0:
+                _posture_upright_since[0] = now
+            if (now - _posture_upright_since[0]) >= POSTURE_HUNCH_RESET_SECONDS:
+                _posture_hunch_since[0] = 0.0
+
+    # Cooldown gate — at most one posture nudge per POSTURE_COOLDOWN_SECONDS.
+    last = _posture_last_nudge_at[0]
+    if last and (now - last) < POSTURE_COOLDOWN_SECONDS:
+        return
+    if _jarvis_busy(bc):
+        return
+
+    hunch_for = (now - _posture_hunch_since[0]) if _posture_hunch_since[0] else 0.0
+    seated_for = (now - _posture_seated_since[0]) if _posture_seated_since[0] else 0.0
+
+    line = None
+    kind = None
+    if hunch_for >= POSTURE_HUNCH_SECONDS:
+        line = _pick_line(POSTURE_HUNCH_LINES, _posture_last_hunch_line)
+        kind = f"hunched {hunch_for / 60:.0f}m"
+    elif seated_for >= POSTURE_SEATED_SECONDS:
+        line = _pick_line(POSTURE_STAND_LINES, _posture_last_stand_line)
+        kind = f"seated {seated_for / 60:.0f}m"
+    if line is None:
+        return
+
+    if _announce(bc, line, source="posture"):
+        _posture_last_nudge_at[0] = now
+        # After a hunch nudge, restart the hunch run so the next nudge needs a
+        # fresh sustained hunch (not just the cooldown lapsing).
+        _posture_hunch_since[0] = 0.0
+        print(f"  [face-track] posture nudge ({kind}): {line}")
+
+
 def _poll_once(bc) -> None:
     sides, _side_map = _classify_sides(bc)
     raw_monitor = _monitor_name_from_sides(bc, sides)
@@ -333,12 +636,23 @@ def _poll_once(bc) -> None:
     # the gaze state; then optionally drive wake/standby behind its own flags.
     kinect = _read_kinect_presence()
     if kinect is not None:
+        present = bool(kinect.get("present"))
         with _state_lock:
             _merge_kinect_presence(kinect, now)
         try:
-            _apply_kinect_presence_actions(bool(kinect.get("present")), now)
+            _apply_kinect_presence_actions(present, now)
         except Exception as e:   # pragma: no cover - defensive: never crash the poller
             print(f"  [face-track] kinect presence-action error: {e}")
+        # Presence AUTOMATIONS (each behind its own opt-in flag, each fully
+        # guarded so one failing never blocks the others or the poller).
+        try:
+            _apply_greet_on_entry(present, now, bc)
+        except Exception as e:   # pragma: no cover - defensive
+            print(f"  [face-track] auto-greet error: {e}")
+        try:
+            _apply_posture_nudge(present, now, bc)
+        except Exception as e:   # pragma: no cover - defensive
+            print(f"  [face-track] posture-nudge error: {e}")
 
     # Hysteresis: only commit when the same reading has held for N samples
     _pending_monitor.append(raw_monitor)

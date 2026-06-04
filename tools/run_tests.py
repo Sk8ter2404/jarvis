@@ -12,14 +12,42 @@ Exit code 0 = all passed, 1 = failures/errors — so the pipeline can gate on it
 """
 from __future__ import annotations
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _TESTS_DIR = os.path.join(_PROJECT_ROOT, "tests")
 
 
+def _redirect_settings_to_throwaway() -> None:
+    """Point the WHOLE suite's settings reads/writes at a throwaway file so a
+    test that exercises the real ``tools.settings_window.save_settings`` can
+    NEVER clobber the owner's live ``data/user_settings.json``.
+
+    Sets ``JARVIS_SETTINGS_PATH`` (honoured by settings_window.settings_path())
+    to a file in a fresh temp dir BEFORE any test is imported. Seeds it with a
+    copy of the real file when present, so tests that ``load_settings`` still
+    see realistic data; if absent, load_settings just returns defaults. Respects
+    an externally-set override (does nothing if already set)."""
+    if (os.environ.get("JARVIS_SETTINGS_PATH") or "").strip():
+        return
+    throwaway_dir = tempfile.mkdtemp(prefix="jarvis_test_settings_")
+    throwaway = os.path.join(throwaway_dir, "test_user_settings.json")
+    real = os.path.join(_PROJECT_ROOT, "data", "user_settings.json")
+    if os.path.exists(real):
+        try:
+            shutil.copyfile(real, throwaway)
+        except OSError:
+            pass
+    os.environ["JARVIS_SETTINGS_PATH"] = throwaway
+
+
 def main(argv: list[str]) -> int:
+    # Redirect settings I/O to a throwaway copy BEFORE any test is imported, so
+    # a leaked real save_settings can't touch data/user_settings.json.
+    _redirect_settings_to_throwaway()
     if _PROJECT_ROOT not in sys.path:
         sys.path.insert(0, _PROJECT_ROOT)
 

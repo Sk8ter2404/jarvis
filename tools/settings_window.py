@@ -44,9 +44,30 @@ import tempfile
 # tools/settings_window.py → project root is one level up.
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(PROJECT_DIR, "data")
+# Default on-disk location of the live settings document. The actual path used
+# by load/save is resolved at CALL time via ``settings_path()`` so a redirect
+# (the ``JARVIS_SETTINGS_PATH`` env override below) takes effect even after this
+# module is imported — e.g. the test runners point the whole suite at a
+# throwaway file so a leaked ``save_settings`` can NEVER clobber the real one.
 SETTINGS_PATH = os.path.join(DATA_DIR, "user_settings.json")
 # Shipped, tracked template (data/ is fully gitignored).
 EXAMPLE_PATH = os.path.join(PROJECT_DIR, "tools", "user_settings.example.json")
+
+# Env var that redirects BOTH load and save away from ``SETTINGS_PATH``. When
+# set and non-empty, every read/write (and the atomic temp file derived from it)
+# uses this path instead. Unset/blank → the default above, i.e. today's
+# behaviour exactly. Tests set this to a temp file; production never sets it.
+SETTINGS_PATH_ENV = "JARVIS_SETTINGS_PATH"
+
+
+def settings_path() -> str:
+    """Resolve the settings file path, honouring the ``JARVIS_SETTINGS_PATH``
+    override at call time. Returns that env var's value when set and non-empty,
+    otherwise the default ``data/user_settings.json``. Resolving here (rather
+    than binding a module-level default once at import) is what lets a redirect
+    set after import still take effect for both load and save."""
+    override = (os.environ.get(SETTINGS_PATH_ENV) or "").strip()
+    return override or SETTINGS_PATH
 
 # Theme — identical palette to the tray dialogs.
 BG = "#0d1117"
@@ -481,13 +502,17 @@ def coerce_value(spec: dict, raw):
         return default
 
 
-def load_settings(path: str = SETTINGS_PATH) -> dict:
+def load_settings(path: str | None = None) -> dict:
     """Load settings, layering the on-disk file over the defaults.
 
     Missing file or missing keys fall back to defaults; every value is coerced
     to its schema type. Unknown keys in the file are preserved untouched (so a
     newer JARVIS that wrote extra keys isn't clobbered by an older GUI).
+
+    ``path`` defaults to ``settings_path()`` (honours ``JARVIS_SETTINGS_PATH``).
     """
+    if path is None:
+        path = settings_path()
     merged = default_settings()
     raw: dict = {}
     if os.path.exists(path):
@@ -530,8 +555,15 @@ def atomic_write_json(path: str, data: dict) -> None:
         raise
 
 
-def save_settings(values: dict, path: str = SETTINGS_PATH) -> None:
-    """Persist `values` (coerced to schema types) to `path`, atomically."""
+def save_settings(values: dict, path: str | None = None) -> None:
+    """Persist `values` (coerced to schema types) to `path`, atomically.
+
+    ``path`` defaults to ``settings_path()`` so a ``JARVIS_SETTINGS_PATH``
+    redirect sends the write (and its atomic temp file, derived from this path's
+    directory) to the throwaway file instead of the real one.
+    """
+    if path is None:
+        path = settings_path()
     out = default_settings()
     for key, value in values.items():
         spec = SCHEMA.get(key)
@@ -539,12 +571,15 @@ def save_settings(values: dict, path: str = SETTINGS_PATH) -> None:
     atomic_write_json(path, out)
 
 
-def ensure_settings_file(path: str = SETTINGS_PATH) -> dict:
+def ensure_settings_file(path: str | None = None) -> dict:
     """Guarantee a valid settings file exists, creating it from defaults.
 
     Returns the loaded settings. Called on GUI launch so a fresh install lands
-    a complete data/user_settings.json on first open.
+    a complete data/user_settings.json on first open. ``path`` defaults to
+    ``settings_path()`` (honours ``JARVIS_SETTINGS_PATH``).
     """
+    if path is None:
+        path = settings_path()
     if not os.path.exists(path):
         try:
             atomic_write_json(path, default_settings())
@@ -858,10 +893,11 @@ def run_gui(start_tab: int = 0) -> int:
     def _open_json():
         try:
             ensure_settings_file()
+            target = settings_path()
             if hasattr(os, "startfile"):
-                os.startfile(SETTINGS_PATH)  # noqa: S606 (Windows-only)
+                os.startfile(target)  # noqa: S606 (Windows-only)
             else:
-                status_var.set(SETTINGS_PATH)
+                status_var.set(target)
         except Exception as exc:
             status_var.set(f"Open failed: {exc}")
 
