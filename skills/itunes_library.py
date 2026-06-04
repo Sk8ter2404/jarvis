@@ -5,11 +5,19 @@ Adds the library/playlist commands the existing music actions lacked:
   * list_playlists          — read back the playlists you have ("what playlists do I have")
   * shuffle_library         — shuffle-play your whole music library ("shuffle my music")
 
-play_playlist ALWAYS prefers the local iTunes COM route (instant, no fragile
-vision-clicking). When the requested name isn't in the local library — or iTunes
-itself is unreachable — it AUTOMATICALLY falls back to the monolith's browser
-`apple_music` action so an Apple-Music-curated playlist the user doesn't own can
-still stream. See `_apple_music_fallback`.
+NOTE (2026-06): classic iTunes is GONE on this machine — the
+``iTunes.Application`` COM server is no longer registered and iTunes.exe is
+absent, so ``itunes_bridge.get_client()`` now always returns ``(None, error)``.
+Every COM branch below is therefore the *fallback-not-taken* path in practice:
+  * play_playlist → AUTOMATICALLY streams via the browser `apple_music` action
+    (music.apple.com) on the COM-unreachable path. See `_apple_music_fallback`.
+  * list_playlists → routes the user to the new Apple Music app (no local
+    library to enumerate), never a COM error.
+  * shuffle_library → hands the shuffle to the browser `apple_music` action,
+    falling back to an honest spoken line.
+The COM code is retained (force=True still attempts it) so that if a real
+iTunes ever returns, these commands light back up — but it is no longer the
+primary route.
 
 Song / album / artist playback is already handled by the existing `play_music`
 action (it understands song:/album:/artist:/library: prefixes); this skill fills
@@ -160,9 +168,18 @@ def play_playlist(arg: str) -> str:
 
 
 def list_playlists(arg: str = "") -> str:
+    """Read back the user's playlists.
+
+    The classic iTunes COM is GONE (no local library to enumerate), so rather
+    than surface a COM error we route the user to the new Apple Music app:
+    their playlists live there now. If COM ever DID come back (force=True
+    still tries), we fall through to the live enumeration below."""
     app, err = itunes_bridge.get_client(force=True)
     if app is None:
-        return err or "iTunes isn't reachable right now, sir."
+        return (
+            "Your playlists live in the new Apple Music app now, sir — say "
+            "play, then the playlist name, and I'll start it on Apple Music."
+        )
     try:
         names = [n for _, n in _user_playlists(app)]
     except Exception as e:
@@ -178,10 +195,21 @@ def list_playlists(arg: str = "") -> str:
 
 
 def shuffle_library(arg: str = "") -> str:
-    """Shuffle-play the whole music library (the auto 'Music' playlist)."""
+    """Shuffle-play the whole music library.
+
+    The local iTunes library/COM is gone, so first try to hand the shuffle to
+    the browser ``apple_music`` action (music.apple.com). Only if that route
+    isn't reachable do we fall back to an honest spoken line. If COM ever DID
+    come back (force=True still tries), the live shuffle below runs instead."""
     app, err = itunes_bridge.get_client(force=True)
     if app is None:
-        return err or "iTunes isn't reachable right now, sir."
+        fb = _apple_music_fallback("shuffle")
+        if fb:
+            return fb
+        return (
+            "Your music lives in the new Apple Music app now, sir — open it "
+            "and I'll shuffle from there."
+        )
     try:
         target = None
         pls = app.LibrarySource.Playlists

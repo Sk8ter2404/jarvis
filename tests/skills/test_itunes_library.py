@@ -158,8 +158,21 @@ class PlayPlaylistTests(unittest.TestCase):
             out = M.play_playlist("nonexistent playlist")
         self.assertIn("couldn't find", out.lower())
 
-    def test_itunes_unreachable_returns_bridge_error(self):
-        with _patch_client(None, "iTunes isn't running, sir."):
+    def test_itunes_unreachable_falls_back_to_apple_music(self):
+        # COM is dead → get_client returns (None, err). play_playlist must NOT
+        # surface the bridge error; it falls back to the browser apple_music
+        # action (here mocked to return a streaming line).
+        with _patch_client(None, "iTunes isn't running, sir."), \
+                mock.patch.object(M, "_apple_music_fallback",
+                                  return_value="Playing it on Apple Music, sir."):
+            out = M.play_playlist("road trip")
+        self.assertEqual(out, "Playing it on Apple Music, sir.")
+
+    def test_itunes_unreachable_and_no_fallback_returns_bridge_error(self):
+        # If even the browser fallback is unreachable (None), the bridge error
+        # is the last resort.
+        with _patch_client(None, "iTunes isn't running, sir."), \
+                mock.patch.object(M, "_apple_music_fallback", return_value=None):
             out = M.play_playlist("road trip")
         self.assertIn("iTunes isn't running", out)
 
@@ -302,9 +315,13 @@ class ListPlaylistsTests(unittest.TestCase):
         self.assertIn("30 playlists", out)
         self.assertIn("10 more", out)
 
-    def test_unreachable(self):
+    def test_unreachable_routes_to_apple_music_app(self):
+        # COM dead → no local library to enumerate → point the user to the new
+        # Apple Music app instead of surfacing a COM error.
         with _patch_client(None, "iTunes isn't running, sir."):
-            self.assertIn("iTunes isn't running", M.list_playlists())
+            out = M.list_playlists()
+        self.assertIn("Apple Music app", out)
+        self.assertNotIn("iTunes isn't running", out)
 
 
 # ─── shuffle_library ───────────────────────────────────────────────────────
@@ -327,9 +344,20 @@ class ShuffleLibraryTests(unittest.TestCase):
             M.shuffle_library()
         self.assertTrue(lib.played)
 
-    def test_unreachable(self):
-        with _patch_client(None, "nope, sir."):
-            self.assertIn("nope", M.shuffle_library())
+    def test_unreachable_falls_back_to_apple_music(self):
+        # COM dead → hand the shuffle to the browser apple_music action.
+        with _patch_client(None, "nope, sir."), \
+                mock.patch.object(M, "_apple_music_fallback",
+                                  return_value="Shuffling on Apple Music, sir."):
+            out = M.shuffle_library()
+        self.assertEqual(out, "Shuffling on Apple Music, sir.")
+
+    def test_unreachable_no_fallback_honest_message(self):
+        with _patch_client(None, "nope, sir."), \
+                mock.patch.object(M, "_apple_music_fallback", return_value=None):
+            out = M.shuffle_library()
+        self.assertIn("Apple Music app", out)
+        self.assertNotIn("nope", out)
 
 
 # ─── register ──────────────────────────────────────────────────────────────

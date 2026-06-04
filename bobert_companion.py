@@ -5860,11 +5860,12 @@ def _local_cheatsheet() -> str:
         "token (plus at most a short lead-in like \"One moment, sir.\"). Do not\n"
         "invent a time, version number, temperature, or status — you will be\n"
         "wrong.\n\n"
-        "Most-used actions:\n"
-        "  [ACTION: play_music, <artist/song/playlist>]   play music in the browser\n"
-        "  [ACTION: play_playlist, <name>]   play ANY named playlist — prefers sir's local iTunes library, auto-falls back to Apple Music streaming if not owned ('shuffle ' prefix shuffles). Use this for every 'play my/the <name> playlist', NOT apple_music.\n"
-        "  [ACTION: list_playlists]   list sir's iTunes playlists   [ACTION: shuffle_library]   shuffle all music\n"
-        "  [ACTION: pause_music]  [ACTION: resume_music]  [ACTION: next_song]\n"
+        "Most-used actions (classic iTunes is GONE — the Apple Music app + music.apple.com are the player):\n"
+        "  [ACTION: play_music, <artist/song/album>]   play a song/artist/album on Apple Music (music.apple.com)\n"
+        "  [ACTION: play_playlist, <name>]   play ANY named playlist — streams it via Apple Music ('shuffle ' prefix shuffles). Use this for every 'play my/the <name> playlist', NOT apple_music.\n"
+        "  [ACTION: list_playlists]   (points sir to the Apple Music app)   [ACTION: shuffle_library]   shuffle music via Apple Music\n"
+        "  [ACTION: open_apple_music]   open the Apple Music app   [ACTION: music_status]   is Apple Music installed/running/what's playing\n"
+        "  [ACTION: pause_music]  [ACTION: resume_music]  [ACTION: next_song]  [ACTION: previous_song]  [ACTION: now_playing]   (media keys — work on the app OR browser)\n"
         "  [ACTION: media_playpause]  [ACTION: media_next]  [ACTION: media_prev]\n"
         "  [ACTION: volume_up]  [ACTION: volume_down]  [ACTION: volume_mute]\n"
         "  [ACTION: netflix, <title>]  [ACTION: youtube, <search>]  [ACTION: spotify, <query>]\n"
@@ -10705,6 +10706,9 @@ ACTIONS = {
     "next_song":       _act_next_song,
     "previous_song":   _act_previous_song,
     "now_playing":     _act_now_playing,
+    # New UWP Apple Music app — launch + status (classic iTunes COM is dead)
+    "open_apple_music": _act_open_apple_music,
+    "music_status":     _act_music_status,
     # Streaming services — open + auto-click first result + click play
     "apple_music":     _act_apple_music,
     "netflix":         _act_netflix,
@@ -11300,6 +11304,8 @@ INFORMATIVE_ACTIONS = {
     # Music actions: results contain "playing X by Y" or failure info that JARVIS
     # should report back to the user.
     "play_music", "pause_music", "resume_music", "next_song", "previous_song",
+    # music_status reports installed/running/now-playing the user asked about.
+    "music_status",
     # Task queue: show_tasks returns the list contents to read back
     "show_tasks", "queue_task",
     # Credits skill: balance reading is something the user explicitly asked for
@@ -11981,6 +11987,8 @@ _MISSION_NARRATION_CUES = {
     "next_song":        "Skipping ahead",
     "previous_song":    "Going back a track",
     "now_playing":      "Checking what's playing",
+    "open_apple_music": "Opening Apple Music",
+    "music_status":     "Checking Apple Music",
     "apple_music":      "Queueing {arg} on Apple Music",
     "netflix":          "Pulling up {arg} on Netflix",
     "prime_video":      "Pulling up {arg} on Prime Video",
