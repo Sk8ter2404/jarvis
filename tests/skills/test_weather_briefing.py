@@ -285,24 +285,65 @@ class WeatherBriefingTests(unittest.TestCase):
         # SAME module object the action came from is what matters. Reload to
         # get a paired (mod, actions).
         mod, actions = load_skill_isolated("weather_briefing")
-        with mock.patch.object(mod, "get_umbrella_alert", return_value="grab brolly"), \
+        # Mock current-conditions to '' so we test the alert branch in isolation
+        # (otherwise it hits the network and flakes on a box with connectivity).
+        with mock.patch.object(mod, "_current_conditions_line", return_value=""), \
+             mock.patch.object(mod, "get_umbrella_alert", return_value="grab brolly"), \
              mock.patch.object(mod, "get_two_hour_alert", return_value="ignored"):
             out = actions["weather_briefing"]("")
         self.assertEqual(out, "grab brolly")
 
     def test_action_falls_back_to_two_hour_alert(self):
         mod, actions = load_skill_isolated("weather_briefing")
-        with mock.patch.object(mod, "get_umbrella_alert", return_value=""), \
+        with mock.patch.object(mod, "_current_conditions_line", return_value=""), \
+             mock.patch.object(mod, "get_umbrella_alert", return_value=""), \
              mock.patch.object(mod, "get_two_hour_alert", return_value="storm soon"):
             out = actions["weather_briefing"]("")
         self.assertEqual(out, "storm soon")
 
     def test_action_unremarkable_when_quiet(self):
         mod, actions = load_skill_isolated("weather_briefing")
-        with mock.patch.object(mod, "get_umbrella_alert", return_value=""), \
+        with mock.patch.object(mod, "_current_conditions_line", return_value=""), \
+             mock.patch.object(mod, "get_umbrella_alert", return_value=""), \
              mock.patch.object(mod, "get_two_hour_alert", return_value=""):
             out = actions["weather_briefing"]("")
         self.assertIn("unremarkable", out.lower())
+
+    def test_action_leads_with_current_conditions(self):
+        # When nothing notable is incoming, report the ACTUAL current temp/sky
+        # instead of the vague "unremarkable" line (regression 2026-06-04).
+        mod, actions = load_skill_isolated("weather_briefing")
+        with mock.patch.object(mod, "_current_conditions_line",
+                               return_value="Currently 69 degrees and clear, sir."), \
+             mock.patch.object(mod, "get_umbrella_alert", return_value=""), \
+             mock.patch.object(mod, "get_two_hour_alert", return_value=""):
+            out = actions["weather_briefing"]("")
+        self.assertEqual(out, "Currently 69 degrees and clear, sir.")
+
+    def test_action_combines_current_and_alert(self):
+        mod, actions = load_skill_isolated("weather_briefing")
+        with mock.patch.object(mod, "_current_conditions_line",
+                               return_value="Currently 69 degrees and clear, sir."), \
+             mock.patch.object(mod, "get_umbrella_alert", return_value="Rain at 5 PM, sir."):
+            out = actions["weather_briefing"]("")
+        self.assertIn("69 degrees", out)
+        self.assertIn("Rain at 5 PM", out)
+
+    def test_current_conditions_line_fahrenheit(self):
+        # 20C -> 68F; description lower-cased into the spoken line.
+        mod, _ = load_skill_isolated("weather_briefing")
+        now = datetime(2026, 6, 4, 14, 0, 0)
+        h = _hour(now, temp=20.0)
+        h["desc"] = "Mainly clear"
+        with _frozen_now(mod, now), \
+             mock.patch.object(mod, "_fetch_hourly_forecast", return_value=[h]):
+            line = mod._current_conditions_line()
+        self.assertEqual(line, "Currently 68 degrees and mainly clear, sir.")
+
+    def test_current_conditions_line_empty_without_data(self):
+        mod, _ = load_skill_isolated("weather_briefing")
+        with mock.patch.object(mod, "_fetch_hourly_forecast", return_value=[]):
+            self.assertEqual(mod._current_conditions_line(), "")
 
     def test_action_handles_exception(self):
         mod, actions = load_skill_isolated("weather_briefing")

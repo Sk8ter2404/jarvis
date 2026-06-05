@@ -475,17 +475,42 @@ def _watch_loop() -> None:
             time.sleep(60)
 
 
+# ─── current conditions ──────────────────────────────────────────────────
+
+def _current_conditions_line() -> str:
+    """Current temperature (Fahrenheit, sir's preference) plus the sky
+    description from the nearest hourly sample. Returns '' on any failure so
+    the caller can fall back. This is what makes "what's the weather" answer
+    with the ACTUAL conditions instead of only flagging upcoming changes."""
+    hourly = _fetch_hourly_forecast()
+    if not hourly:
+        return ""
+    now = datetime.now()
+    past = [h for h in hourly if h["dt"] <= now]
+    cur = past[-1] if past else hourly[0]
+    temp_c = cur.get("temp_c")
+    if temp_c is None:
+        return ""
+    temp_f = round(temp_c * 9 / 5 + 32)
+    desc = (cur.get("desc") or "").strip().lower()
+    if desc:
+        return f"Currently {temp_f} degrees and {desc}, sir."
+    return f"Currently {temp_f} degrees, sir."
+
+
 # ─── action registration ─────────────────────────────────────────────────
 
 def register(actions):
     def weather_briefing(_: str = "") -> str:
         try:
-            umbrella = get_umbrella_alert("today")
-            if umbrella:
-                return umbrella
-            two_hour = get_two_hour_alert()
-            if two_hour:
-                return two_hour
+            # Lead with the ACTUAL current conditions (temp + sky), then append
+            # any notable upcoming change. Previously this only reported a
+            # change and said "unremarkable" when calm — never the real temp.
+            current = _current_conditions_line()
+            alert = get_umbrella_alert("today") or get_two_hour_alert()
+            parts = [p for p in (current, alert) if p]
+            if parts:
+                return " ".join(parts)
             return "Forecast looks unremarkable for the rest of the day, sir."
         except Exception as e:
             return f"weather briefing failed: {e}"
