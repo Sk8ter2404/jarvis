@@ -12099,6 +12099,10 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     "session_memory_recall", "rag_search", "search_files",
     "list_schedules", "list_timers", "current_model", "list_models",
     "whoami", "face_id_status",
+    # Audio output-device switching (skills/audio_autoswitch.py) — each returns
+    # a finished confirmation sentence.
+    "audio_autoswitch_status", "audio_autoswitch_on", "audio_autoswitch_off",
+    "use_headset", "use_speakers", "switch_to_headset", "switch_to_speakers",
 }
 
 # Actions whose runtime can plausibly exceed MID_TASK_STATUS_DELAY (~8 s).

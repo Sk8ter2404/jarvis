@@ -587,6 +587,21 @@ WORKSHOP_PRINT_MONITOR_AUTO_LAUNCH = False  # top-center Stark print panel
 BAMBU_OVERLAY_AUTO_WHILE_PRINTING = False   # top-right bambu corner overlay
 
 
+# ─── Auto-switch default audio on headset power (audio/audio_switch.py) ──
+# A USB-dongle wireless headset (e.g. a CORSAIR VOID ELITE) keeps its dongle
+# plugged in whether the headset is ON or off, so plug/unplug detection misses
+# the power state. Windows flips the headset's audio ENDPOINT Active<->NotPresent
+# instead; this watcher polls that and moves the SYSTEM default render device:
+#   headset ON  -> default = the headset   (remembers the prior default)
+#   headset OFF -> default = the prior default, else AUDIO_AUTOSWITCH_FALLBACK
+# Opt-in. HEADSET/FALLBACK are case-insensitive substrings of the Windows
+# device friendly name (see `python -m audio.audio_switch --list`).
+AUDIO_AUTOSWITCH_ENABLED  = os.getenv("JARVIS_AUDIO_AUTOSWITCH", "").lower() in ("1", "true", "yes", "on")
+AUDIO_AUTOSWITCH_HEADSET  = os.getenv("JARVIS_AUDIO_HEADSET", "")    # e.g. "CORSAIR VOID ELITE"
+AUDIO_AUTOSWITCH_FALLBACK = os.getenv("JARVIS_AUDIO_FALLBACK", "")   # e.g. "Realtek USB2.0 Audio"
+AUDIO_AUTOSWITCH_POLL_S   = float(os.getenv("JARVIS_AUDIO_POLL_S", "3.0"))
+
+
 # ─── Bambu H2D 3D printer credentials ──────────────────────────────────
 # Leave blank to disable monitoring. Pull from the printer's touchscreen
 # → LAN Only (IP + access code) and Bambu Handy → Firmware Version (SN).
