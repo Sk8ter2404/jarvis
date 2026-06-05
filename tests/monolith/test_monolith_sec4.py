@@ -3350,6 +3350,35 @@ class OpenUrlInBrowserTests(MonolithGlobalsTestCase):
         popen.assert_not_called()        # didn't need to shell out
         wbopen.assert_not_called()       # didn't fall back to default handler
 
+    def test_media_mode_closes_prior_and_uses_new_window(self):
+        # close_matching => media mode: close prior matching windows, SKIP the
+        # webbrowser controller, and open a dedicated --new-window so repeats
+        # reuse one tab instead of piling up.
+        bc = self.bc
+        with mock.patch.object(bc, "_close_browser_windows_matching",
+                               return_value=2) as closer, \
+             mock.patch.object(bc.webbrowser, "get") as wbget, \
+             mock.patch.object(bc, "_find_chrome", return_value=r"C:\chrome.exe"), \
+             mock.patch.object(bc.subprocess, "Popen") as popen, \
+             mock.patch.object(bc.time, "sleep"):
+            via = bc._open_url_in_browser("https://music.apple.com/x",
+                                          close_matching=["apple music", "web player"])
+        self.assertEqual(via, "chrome")
+        closer.assert_called_once_with(["apple music", "web player"])
+        wbget.assert_not_called()         # webbrowser controller skipped in media mode
+        popen.assert_called_once()
+        self.assertIn("--new-window", popen.call_args.args[0])
+
+    def test_no_close_matching_keeps_webbrowser_path(self):
+        # Without close_matching, behaviour is unchanged (webbrowser first).
+        bc = self.bc
+        fake_browser = mock.Mock(); fake_browser.open.return_value = True
+        with mock.patch.object(bc, "_close_browser_windows_matching") as closer, \
+             mock.patch.object(bc.webbrowser, "get", return_value=fake_browser):
+            via = bc._open_url_in_browser("https://music.apple.com/x")
+        self.assertEqual(via, "chrome:webbrowser")
+        closer.assert_not_called()
+
     def test_falls_back_to_chrome_exe_path(self):
         bc = self.bc
         # webbrowser.get("chrome") raises (no registered controller) → locate

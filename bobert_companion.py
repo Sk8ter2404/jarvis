@@ -8180,9 +8180,44 @@ def _find_edge() -> str | None:
     return _find_browser_exe("msedge.exe", _EDGE_PATHS)
 
 
-def _open_url_in_browser(url: str) -> str:
+def _close_browser_windows_matching(terms) -> int:
+    """Close existing BROWSER windows whose (normalized) title contains any of
+    `terms`. Used so a repeat media request reuses ONE window instead of
+    piling up tabs. Only browser windows are touched (title carries a browser
+    marker), and matching is on the dedicated media-window title (e.g. 'apple
+    music', 'youtube'), so an unrelated browsing window isn't closed. Returns
+    the count closed."""
+    if not terms:
+        return 0
+    try:
+        import pygetwindow as gw
+        wins = gw.getAllWindows()
+    except Exception:
+        return 0
+    closed = 0
+    for w in wins:
+        t = _strip_bidi_and_nbsp((getattr(w, "title", "") or "")).lower()
+        if not t or not any(m in t for m in _MUSIC_BROWSER_MARKERS):
+            continue
+        if any(term in t for term in terms):
+            try:
+                w.close()
+                closed += 1
+            except Exception:
+                pass
+    return closed
+
+
+def _open_url_in_browser(url: str, close_matching=None) -> str:
     """Open `url` in a REAL web browser, deliberately bypassing the default
     URL handler.
+
+    `close_matching` (a list of title substrings) puts this in MEDIA MODE:
+    first close any existing dedicated browser window for the same service so
+    repeats REUSE one window instead of stacking tabs, then open in a fresh
+    dedicated window (the webbrowser controller is skipped in this mode because
+    it may add a tab to the user's MAIN window, whose title we then can't match
+    to close next time).
 
     WHY: the user installed the UWP Apple Music *app*, which registered itself
     as the protocol handler for music.apple.com. A bare `webbrowser.open(url)`
@@ -8204,14 +8239,28 @@ def _open_url_in_browser(url: str) -> str:
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
+    media_mode = bool(close_matching)
+    if media_mode:
+        try:
+            n = _close_browser_windows_matching(close_matching)
+            if n:
+                print(f"  [open-url] closed {n} prior media window(s) — reusing one tab",
+                      flush=True)
+                time.sleep(0.35)
+        except Exception:
+            pass
+
     # 1) Python's own registered Chrome controller. Fast and dependency-free
-    #    when Chrome is registered; KeyError when it isn't.
-    try:
-        browser = webbrowser.get("chrome")
-        if browser.open(url):
-            return "chrome:webbrowser"
-    except Exception:
-        pass
+    #    when Chrome is registered; KeyError when it isn't. Skipped in media
+    #    mode so we get a dedicated, matchable --new-window (not a tab in the
+    #    user's main window).
+    if not media_mode:
+        try:
+            browser = webbrowser.get("chrome")
+            if browser.open(url):
+                return "chrome:webbrowser"
+        except Exception:
+            pass
 
     # 2) chrome.exe directly. --new-window keeps it off whatever Chrome window
     #    the user already has, matching _open_url_new_window's behaviour.
@@ -8608,6 +8657,7 @@ _STREAMING_SERVICES = {
         "name":             "Netflix",
         "home":             "https://www.netflix.com",
         "search_url":       "https://www.netflix.com/search?q={q}",
+        "tab_match":        ["netflix"],
         "load_wait":        5.0,
         "post_click":       3.5,
         "result_hint":      "the first show or movie thumbnail in the search results grid (not the search box, not a header link)",
@@ -8729,6 +8779,9 @@ _STREAMING_SERVICES = {
         # (see _apple_music_resolve_track). The detail page has the single
         # large Play button play_button targets.
         "resolve_itunes":   True,
+        # Reuse ONE Apple Music browser window: close a prior one before
+        # opening the next song instead of piling up tabs.
+        "tab_match":        ["apple music", "web player"],
         "verify_play":      True,
         "verify_first":     True,   # check before any play attempt — Enter on a song row may already be playing
         "verify_attempts":  3,
@@ -8782,6 +8835,7 @@ _STREAMING_SERVICES = {
         "name":             "YouTube",
         "home":             "https://www.youtube.com",
         "search_url":       "https://www.youtube.com/results?search_query={q}",
+        "tab_match":        ["youtube"],
         "load_wait":        3.5,
         "post_click":       0.0,
         "result_hint":      "the first video thumbnail in the YouTube search results (skip ads and 'Shorts' rows — pick a normal video result)",
@@ -9381,7 +9435,7 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
 
     # Empty query: just open the homepage and stop.
     if not q:
-        _open_url_in_browser(cfg["home"])
+        _open_url_in_browser(cfg["home"], close_matching=cfg.get("tab_match"))
         return f"opened {service_label}"
 
     # Step 1: choose the page to open and how to select the result.
@@ -9405,11 +9459,14 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
         # keeps it playing). Longer verify_wait covers the player's buffering.
         cfg = {
             **cfg,
-            # double-click -> wait+recheck (no re-click, so a buffering track
-            # confirms without restarting) -> double-click again only if still
-            # silent. Kills the "song restarts 2-3x" flicker.
-            "play_strategies": ["highlighted_row", "recheck", "highlighted_row"],
-            "verify_wait": 4.0,
+            # ONE double-click plays the track. The user saw it restart 3-4x
+            # because the loop re-double-clicked an already-playing song while
+            # the slow vision-confirm caught up. So: double-click ONCE, then
+            # just WAIT+recheck (no re-click) up to twice, and only re-click as
+            # a last resort if it never confirms. Kills the restart flicker.
+            "play_strategies": ["highlighted_row", "recheck", "recheck", "highlighted_row"],
+            "verify_attempts": 4,
+            "verify_wait": 3.5,
         }
         print(f"  [auto-play] resolved track via iTunes API -> {q}", flush=True)
     else:
@@ -9421,7 +9478,7 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
     # bare webbrowser.open would launch the app instead of the web player.
     # _open_url_in_browser forces Chrome/Edge so the SPACE / play-button +
     # tab-title pipeline has the actual web player to drive.
-    opened_via = _open_url_in_browser(url)
+    opened_via = _open_url_in_browser(url, close_matching=cfg.get("tab_match"))
     print(
         f"  [auto-play] opened {service_label} "
         f"{'track page' if resolved else 'search'} for '{q}' (via {opened_via})",
