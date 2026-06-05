@@ -12051,6 +12051,10 @@ INFORMATIVE_ACTIONS = {
     # Web actions: opening a URL or searching is preparatory — JARVIS should
     # follow up with see_screen to read what actually loaded rather than stopping.
     "open_url", "web_search",
+    # Network roll-call returns a long device LIST — let the follow-up LLM
+    # summarise it ("35 devices, including your phone and ...") rather than the
+    # verbatim path reading out 35 raw client names.
+    "who_is_on_wifi",
 }
 
 # Actions whose RESULT is already a finished, user-facing sentence that should
@@ -12084,6 +12088,17 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     # Single-sentence health/status aggregator (skills/system_pulse.py) and its
     # natural-phrasing aliases. Each returns one finished status sentence.
     "system_pulse", "check_system", "status_report",
+    # Status / info READ-OUTS — each returns a finished, user-facing sentence the
+    # user explicitly asked for. Without this they were logged but NEVER VOICED
+    # (only the generic "Of course, sir" preamble was spoken) — owner caught this
+    # live 2026-06-05: "you're not speaking for some actions still". All confirmed
+    # during the test sweep to return ONE spoken-ready sentence.
+    "camera_status", "kinect_status", "wellness_status", "music_taste",
+    "deco_topology", "network_status", "is_device_online",
+    "who_is_here", "where_am_i", "situational_awareness",
+    "session_memory_recall", "rag_search", "search_files",
+    "list_schedules", "list_timers", "current_model", "list_models",
+    "whoami", "face_id_status",
 }
 
 # Actions whose runtime can plausibly exceed MID_TASK_STATUS_DELAY (~8 s).
