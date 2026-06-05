@@ -82,5 +82,47 @@ class TickTransitionTests(unittest.TestCase):
         setd.assert_not_called()
 
 
+class StatusAndBatteryTests(unittest.TestCase):
+    def _sw(self, **kw):
+        return A.AudioAutoSwitch("VOID ELITE", "Realtek", announce=kw.get("announce", lambda m: None))
+
+    def test_status_includes_battery_when_on(self):
+        sw = self._sw()
+        with mock.patch.object(A, "find_active", return_value=("HS", "Headset")), \
+             mock.patch.object(sw, "battery_pct", return_value=72.0):
+            s = sw.status()
+        self.assertIn("ON", s)
+        self.assertIn("72% battery", s)
+
+    def test_status_off_omits_battery(self):
+        sw = self._sw()
+        with mock.patch.object(A, "find_active", return_value=None), \
+             mock.patch.object(sw, "battery_pct", return_value=None):
+            s = sw.status()
+        self.assertIn("off", s.lower())
+        self.assertNotIn("battery", s.lower())
+
+    def test_low_battery_warns_once_then_rearms_after_recharge(self):
+        msgs = []
+        sw = self._sw(announce=msgs.append)
+        with mock.patch.object(sw, "battery_pct", return_value=10.0):
+            sw._check_low_battery()
+            sw._check_low_battery()                 # still low -> only ONE warning
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("low", msgs[0].lower())
+        with mock.patch.object(sw, "battery_pct", return_value=80.0):
+            sw._check_low_battery()                 # recharged -> re-arm
+        with mock.patch.object(sw, "battery_pct", return_value=8.0):
+            sw._check_low_battery()                 # low again -> warns again
+        self.assertEqual(len(msgs), 2)
+
+    def test_low_battery_no_hwinfo_is_silent(self):
+        msgs = []
+        sw = self._sw(announce=msgs.append)
+        with mock.patch.object(sw, "battery_pct", return_value=None):
+            sw._check_low_battery()
+        self.assertEqual(msgs, [])
+
+
 if __name__ == "__main__":
     unittest.main()
