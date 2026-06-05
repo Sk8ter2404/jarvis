@@ -430,6 +430,8 @@ class NowPlayingTests(_BaseActTest):
         self.patch_apple_music_app(now_playing=None, is_active=False)
         self.bc._apple_music_chrome_active.return_value = True
         self.bc._apple_music_title_now_playing.return_value = None
+        # No track loaded in the web player either (page-title reporter).
+        self.bc._apple_music_loaded_track_from_title.return_value = None
         out = A._act_now_playing("")
         self.assertNotIn("Apple Music: Apple Music", out)
         self.assertIn("nothing seems to be playing", out.lower())
@@ -440,8 +442,21 @@ class NowPlayingTests(_BaseActTest):
         self.patch_apple_music_app(now_playing=None, is_active=False)
         self.bc._apple_music_chrome_active.return_value = True
         self.bc._apple_music_title_now_playing.side_effect = RuntimeError("boom")
+        self.bc._apple_music_loaded_track_from_title.return_value = None
         out = A._act_now_playing("")
         self.assertIn("nothing seems to be playing", out.lower())
+
+    def test_chrome_active_reports_loaded_track_from_page_title(self):
+        # The web player keeps a page title even while playing, so the strict
+        # now-playing helper returns None; the page-title reporter still names
+        # the loaded track instead of claiming nothing is playing.
+        self.patch_apple_music_app(now_playing=None, is_active=False)
+        self.bc._apple_music_chrome_active.return_value = True
+        self.bc._apple_music_title_now_playing.return_value = None
+        self.bc._apple_music_loaded_track_from_title.return_value = (
+            "Billie Jean by Michael Jackson")
+        out = A._act_now_playing("")
+        self.assertIn("Billie Jean by Michael Jackson", out)
 
     def test_app_running_but_no_title_honest(self):
         # App is the live media app but its title gave no track → in-between line.
