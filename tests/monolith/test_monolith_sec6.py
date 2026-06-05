@@ -848,6 +848,19 @@ class HandleAutocorrectDisambigTests(SectionSixBase):
             self.bc.handle_autocorrect_disambig_response("first one"))
         self.assertEqual(self.ran, [("alpha", "q")])
 
+    def test_destructive_pick_refused_not_run(self):
+        # A guessed disambig pick that resolves to a destructive wipe must be
+        # REFUSED (handled, but NOT executed) so a plain confirmation cannot
+        # erase memory/tasks. Guards reset_memory / forget_last_hour / clear_tasks.
+        bc = self.bc
+        acts = dict(bc.ACTIONS)
+        acts["reset_memory"] = lambda a: self.ran.append(("reset_memory", a)) or "wiped"
+        self._p(bc, "ACTIONS", acts)
+        self._queue(primary=("reset_memory", "x"), secondary=("beta", "q"))
+        self.assertTrue(
+            self.bc.handle_autocorrect_disambig_response("first one"))
+        self.assertEqual(self.ran, [])
+
     def test_explicit_second_keyword(self):
         self._queue()
         self.assertTrue(self.bc.handle_autocorrect_disambig_response("second"))

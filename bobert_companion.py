@@ -1556,6 +1556,9 @@ _DESTRUCTIVE_REPLAY_ACTIONS = frozenset({
     "upgrade",
     "start_overnight_upgrade",
     "run_shell",
+    "reset_memory",
+    "forget_last_hour",
+    "clear_tasks",
 })
 
 
@@ -13403,8 +13406,13 @@ def handle_autocorrect_disambig_response(user_text: str) -> bool:
     # applies. A destructive action surfaced via a fuzzy typo must not fire
     # without confirmation — refuse and make the user re-issue it explicitly
     # so it goes through the normal confirmation/pushback path (mirrors the
-    # replay_last_action destructive-action refusal).
-    if name in _DESTRUCTIVE_REPLAY_ACTIONS:
+    # replay_last_action destructive-action refusal). Also refuse anything the
+    # normal path would confirmation- or pushback-gate, so a guessed match
+    # can't slip a memory/task wipe (reset_memory, forget_last_hour, clear_tasks)
+    # or any confirm-gated action past with a plain "yes".
+    if (name in _DESTRUCTIVE_REPLAY_ACTIONS
+            or _needs_confirmation(name, arg)
+            or _jarvis_pushback(name, arg) is not None):
         print(f"  [autocorrect-disambig] refusing destructive pick {name!r} "
               "without confirmation")
         msg = (f"I won't run `{name}` from a guessed match, sir — "
