@@ -2936,6 +2936,30 @@ class AppleMusicTitleParseTests(MonolithGlobalsTestCase):
         self.assertIsNone(
             self.bc._parse_apple_music_track_title("Search - Apple Music"))
 
+    def test_web_player_landing_title_rejected(self):
+        # Regression (2026-06-04, live screenshot): the web-player idle tab
+        # title "Apple Music - Web Player" contains " - " and so was wrongly
+        # read as a "<Song> - <Artist>" track, making verify_first skip the
+        # real play step -> nothing played. Both the bare form and the real
+        # title (which carries a leading U+200E bidi mark + an NBSP) must be
+        # rejected, with and without the browser-chrome suffix.
+        for raw in (
+            "Apple Music - Web Player",
+            "‎Apple Music - Web Player",          # as the OS reports it
+            "‎Apple Music - Web Player - Google Chrome",
+            "Apple Music — Web Player",                # em-dash variant
+        ):
+            self.assertIsNone(
+                self.bc._parse_apple_music_track_title(raw),
+                f"should reject landing title: {raw!r}")
+
+    def test_bidi_mark_stripped_from_real_track(self):
+        # The same leading bidi mark / NBSP must NOT block a genuine track.
+        self.assertEqual(
+            self.bc._parse_apple_music_track_title(
+                "‎Billie Jean — Michael Jackson"),
+            "Billie Jean — Michael Jackson")
+
     def test_empty_and_too_short(self):
         self.assertIsNone(self.bc._parse_apple_music_track_title(""))
         self.assertIsNone(self.bc._parse_apple_music_track_title("a"))

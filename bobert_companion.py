@@ -8835,6 +8835,7 @@ def _streaming_find_with_retry(
 # bare service-name title so we don't mistake "Apple Music" for a track.
 _MUSIC_IDLE_TITLE_TOKENS = (
     "apple music",
+    "apple music - web player",
     "music.apple.com",
     "search",
     "new tab",
@@ -8845,6 +8846,37 @@ _MUSIC_IDLE_TITLE_TOKENS = (
     "home",
     "library",
 )
+
+# When a title DOES contain a "<left> — <right>" separator, these halves mark
+# it as a non-playing landing/idle page rather than a real "<Song> — <Artist>"
+# track. The web player's idle tab title is "Apple Music - Web Player", whose
+# left half is the service name and right half is a generic UI label — both
+# listed here so it can never be mistaken for a now-playing track.
+_MUSIC_TITLE_LHS_REJECT = frozenset({"apple music", "music.apple.com", "itunes"})
+_MUSIC_TITLE_RHS_REJECT = frozenset({"web player", "apple music", "music", "home"})
+
+# Invisible/bidi marks Apple Music (and some window managers) prepend to tab
+# titles — e.g. a leading U+200E LEFT-TO-RIGHT MARK on "‎Apple Music - Web
+# Player". Left in place they dodge exact idle-token matching and corrupt the
+# track string. NBSP (U+00A0) is folded to a normal space so separators match.
+_TITLE_INVISIBLE_MARKS = (
+    "‎", "‏",                      # LRM / RLM
+    "‪", "‫", "‬", "‭", "‮",  # bidi embeddings/overrides
+    "⁦", "⁧", "⁨", "⁩",  # bidi isolates
+    "​", "﻿",                      # zero-width space / BOM
+)
+
+
+def _strip_bidi_and_nbsp(s: str) -> str:
+    """Remove invisible bidi/zero-width marks and fold NBSP to a normal space
+    so window-title comparisons and separator detection are reliable."""
+    if not s:
+        return s
+    for mark in _TITLE_INVISIBLE_MARKS:
+        if mark in s:
+            s = s.replace(mark, "")
+    s = s.replace(" ", " ")  # NBSP -> space
+    return " ".join(s.split())    # collapse runs of whitespace
 
 # Browser-chrome suffixes Chromium/Edge/Firefox append to a tab title, e.g.
 # "Billie Jean — Michael Jackson - Google Chrome". Stripped before parsing.
@@ -8865,7 +8897,7 @@ def _clean_browser_title(raw: str) -> str:
     """Strip the trailing browser-name chrome a window manager appends to a
     tab title, returning just the page/track portion. Case-insensitive on
     the suffix; the returned text keeps its original casing."""
-    t = (raw or "").strip()
+    t = _strip_bidi_and_nbsp((raw or "").strip())
     low = t.lower()
     for suf in _BROWSER_CHROME_SUFFIXES:
         if low.endswith(suf):
@@ -8901,6 +8933,19 @@ def _parse_apple_music_track_title(raw: str) -> str | None:
     # that still contain a separator but describe a non-playing page.
     if low.endswith("on apple music") or low.startswith("search"):
         return None
+    # A real now-playing title is "<Song> — <Artist>". The idle/landing title
+    # "Apple Music - Web Player" ALSO contains " - ", so split on the FIRST
+    # separator and reject when the left half is the service name or the right
+    # half is a generic UI label — that's a page title, not a track. This is
+    # the check that stops "Apple Music - Web Player" from being read as a
+    # now-playing track (which made verify_first skip the real play step).
+    parts = re.split(r"\s+[—–-]\s+", t, maxsplit=1)
+    if len(parts) == 2:
+        left, right = parts[0].strip().lower(), parts[1].strip().lower()
+        if (not left or not right
+                or left in _MUSIC_TITLE_LHS_REJECT
+                or right in _MUSIC_TITLE_RHS_REJECT):
+            return None
     return t
 
 
