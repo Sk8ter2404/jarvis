@@ -19,7 +19,7 @@ def _reading(label, value, unit):
 
 def _block(*readings):
     rsize = 316
-    hdr = struct.pack("<IIIqIIIIII", int.from_bytes(b"SiWH", "little"),
+    hdr = struct.pack("<IIIqIIIIII", 0x53695748,   # real HWiNFO dwSignature -> LE bytes b"HWiS"
                       2, 0, 0, 44, 0, 0, 44, rsize, len(readings))
     return hdr + b"".join(readings)
 
@@ -35,6 +35,14 @@ class HwinfoParseTests(unittest.TestCase):
     def test_parse_bad_block_is_empty(self):
         self.assertEqual(hwinfo.parse_readings(b""), [])
         self.assertEqual(hwinfo.parse_readings(b"junk-not-SiWH"), [])
+
+    def test_wrong_byte_order_signature_rejected(self):
+        # Regression: the old bug checked for b"SiWH"; real HWiNFO memory leads
+        # with the DWORD 0x53695748 (LE bytes b"HWiS"). A block carrying the
+        # wrong-order signature must NOT parse (guards the byte-order fix).
+        wrong = struct.pack("<IIIqIIIIII", int.from_bytes(b"SiWH", "little"),
+                            2, 0, 0, 44, 0, 0, 44, 316, 0)
+        self.assertEqual(hwinfo.parse_readings(wrong), [])
 
     def test_battery_and_find_via_mock(self):
         raw = _block(_reading("CORSAIR VOID ELITE Wireless Battery", 72.0, "%"))
