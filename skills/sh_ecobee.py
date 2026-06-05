@@ -64,12 +64,14 @@ def is_available() -> bool:
 # ── service init ───────────────────────────────────────────────────
 def _save_tokens(service: Any) -> None:
     try:
-        with open(_TOKEN_PATH, "w", encoding="utf-8") as f:
-            json.dump({
-                "access_token":   getattr(service, "access_token", ""),
-                "refresh_token":  getattr(service, "refresh_token", ""),
-                "authorization_token": getattr(service, "authorization_token", ""),
-            }, f, indent=2)
+        # Atomic write so a crash/power-loss mid-refresh can't truncate the
+        # token file and force a full PIN re-authorization (matches sh_ring).
+        from core.atomic_io import _atomic_write_json
+        _atomic_write_json(_TOKEN_PATH, {
+            "access_token":   getattr(service, "access_token", ""),
+            "refresh_token":  getattr(service, "refresh_token", ""),
+            "authorization_token": getattr(service, "authorization_token", ""),
+        })
     except Exception as e:
         print(f"  [sh-ecobee] token save failed: {e}")
 
