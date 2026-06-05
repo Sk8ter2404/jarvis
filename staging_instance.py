@@ -188,10 +188,10 @@ def _publish_test_state_for_pid(pid: int, test_state: dict) -> None:
                 if isinstance(entry, dict):
                     entry["test_state"] = ts
                     entry["heartbeat_at"] = time.time()
-                    tmp = _bgm.INSTANCES_FILE + ".tmp"
-                    with open(tmp, "w", encoding="utf-8") as f:
-                        json.dump(data, f, indent=2, sort_keys=True)
-                    os.replace(tmp, _bgm.INSTANCES_FILE)
+                    # Route through the blue/green helper's unique-temp atomic
+                    # write -- never a fixed instances.json.tmp (blue + green both
+                    # write this file concurrently during an upgrade).
+                    _bgm._atomic_write_json(_bgm.INSTANCES_FILE, data)
     except (OSError, ValueError):
         pass
     # 2. data_staging/hud_state.json — the staging HUD reads from here.
