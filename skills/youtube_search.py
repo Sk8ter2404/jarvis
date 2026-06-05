@@ -157,6 +157,25 @@ def find_direct_url(query: str) -> str | None:
     return None
 
 
+def _close_prior_youtube_windows() -> None:
+    """Best-effort: close any existing YouTube browser window so a new video
+    REUSES one tab instead of piling up (the user wants a single video tab).
+    No-op without pygetwindow, and never raises."""
+    try:
+        import pygetwindow as gw
+        wins = gw.getAllWindows()
+    except Exception:
+        return
+    for w in wins:
+        t = (getattr(w, "title", "") or "").lower()
+        if "youtube" in t and any(b in t for b in
+                                  ("chrome", "edge", "firefox", "brave", "opera")):
+            try:
+                w.close()
+            except Exception:
+                pass
+
+
 def youtube_search_direct(query: str) -> str:
     """Action: resolve `query` to a YouTube watch URL and open it.
 
@@ -168,6 +187,10 @@ def youtube_search_direct(query: str) -> str:
     query = (query or "").strip()
     if not query:
         return "no query given, sir"
+
+    # Reuse one video tab: close any prior YouTube window before opening this
+    # one so videos don't pile up (mirrors the music single-tab behaviour).
+    _close_prior_youtube_windows()
 
     cmd = _probe_ytdlp()
     if not cmd:
