@@ -2875,5 +2875,298 @@ class SessionResumeReaderBranchTests(MonolithGlobalsTestCase):
             self.assertEqual(self.bc._last_queued_task_line(), "")
 
 
+# ─────────────────────────────────────────────────────────────────────────
+#  Apple Music web-player: vision-free play + title-based confirmation
+# ─────────────────────────────────────────────────────────────────────────
+#
+# The streaming auto-play pipeline opens the user's REAL browser via
+# webbrowser.open (no selenium/playwright DOM), so playback is triggered by
+# keyboard SPACE (music.apple.com's play/pause shortcut) and confirmed by the
+# browser TAB TITLE ("<Song> — <Artist>" while playing). Vision is demoted to a
+# last-resort fallback. These tests pin that behaviour deterministically,
+# patching the capability globals explicitly so they hold on any box.
+class _FakeWin:
+    """Minimal pygetwindow Window stand-in exposing only .title."""
+    def __init__(self, title=""):
+        self.title = title
+
+
+@requires_monolith
+class AppleMusicTitleParseTests(MonolithGlobalsTestCase):
+    """_parse_apple_music_track_title / _clean_browser_title — pure parsing."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_plain_track_title(self):
+        self.assertEqual(
+            self.bc._parse_apple_music_track_title("Billie Jean — Michael Jackson"),
+            "Billie Jean — Michael Jackson")
+
+    def test_strips_browser_chrome_suffix(self):
+        self.assertEqual(
+            self.bc._parse_apple_music_track_title("Africa — Toto - Google Chrome"),
+            "Africa — Toto")
+
+    def test_hyphen_separator_accepted(self):
+        self.assertEqual(
+            self.bc._parse_apple_music_track_title("Thriller - Michael Jackson"),
+            "Thriller - Michael Jackson")
+
+    def test_bare_service_title_is_not_a_track(self):
+        # Regression for "Apple Music: Apple Music".
+        self.assertIsNone(self.bc._parse_apple_music_track_title("Apple Music"))
+        self.assertIsNone(
+            self.bc._parse_apple_music_track_title("Apple Music - Google Chrome"))
+
+    def test_search_page_title_rejected(self):
+        self.assertIsNone(
+            self.bc._parse_apple_music_track_title("Michael Jackson on Apple Music"))
+        self.assertIsNone(
+            self.bc._parse_apple_music_track_title("Search - Apple Music"))
+
+    def test_empty_and_too_short(self):
+        self.assertIsNone(self.bc._parse_apple_music_track_title(""))
+        self.assertIsNone(self.bc._parse_apple_music_track_title("a"))
+
+
+@requires_monolith
+class AppleMusicTitleNowPlayingTests(MonolithGlobalsTestCase):
+    """_apple_music_title_now_playing — scan window titles for a live track."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def _install_pgw(self, windows):
+        gw = mock.Mock(name="pygetwindow")
+        gw.getAllWindows.return_value = list(windows)
+        p = mock.patch.dict(sys.modules, {"pygetwindow": gw})
+        p.start()
+        self.addCleanup(p.stop)
+        return gw
+
+    def test_returns_first_playing_track(self):
+        self._install_pgw([
+            _FakeWin("Some Editor"),
+            _FakeWin("Billie Jean — Michael Jackson - Google Chrome"),
+        ])
+        self.assertEqual(self.bc._apple_music_title_now_playing(),
+                         "Billie Jean — Michael Jackson")
+
+    def test_none_when_only_idle_titles(self):
+        self._install_pgw([_FakeWin("Apple Music"), _FakeWin("New Tab - Google Chrome")])
+        self.assertIsNone(self.bc._apple_music_title_now_playing())
+
+    def test_pygetwindow_absent_returns_none(self):
+        # Simulate import failure.
+        p = mock.patch.dict(sys.modules, {"pygetwindow": None})
+        p.start()
+        self.addCleanup(p.stop)
+        self.assertIsNone(self.bc._apple_music_title_now_playing())
+
+    def test_getallwindows_raises_returns_none(self):
+        gw = mock.Mock(name="pygetwindow")
+        gw.getAllWindows.side_effect = RuntimeError("boom")
+        p = mock.patch.dict(sys.modules, {"pygetwindow": gw})
+        p.start()
+        self.addCleanup(p.stop)
+        self.assertIsNone(self.bc._apple_music_title_now_playing())
+
+
+@requires_monolith
+class StreamingTitleConfirmTests(MonolithGlobalsTestCase):
+    """_streaming_title_confirms_playback — deterministic title gate."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_unsupported_service_returns_false(self):
+        ok, detail = self.bc._streaming_title_confirms_playback({})  # no title_confirm
+        self.assertFalse(ok)
+        self.assertIn("not supported", detail)
+
+    def test_track_present_confirms(self):
+        cfg = {"title_confirm": True}
+        with mock.patch.object(self.bc, "_apple_music_title_now_playing",
+                               return_value="Africa — Toto"):
+            ok, detail = self.bc._streaming_title_confirms_playback(cfg)
+        self.assertTrue(ok)
+        self.assertIn("Africa — Toto", detail)
+
+    def test_no_track_does_not_confirm(self):
+        cfg = {"title_confirm": True}
+        with mock.patch.object(self.bc, "_apple_music_title_now_playing",
+                               return_value=None):
+            ok, _ = self.bc._streaming_title_confirms_playback(cfg)
+        self.assertFalse(ok)
+
+
+@requires_monolith
+class StreamingConfirmPlaybackTests(MonolithGlobalsTestCase):
+    """_streaming_confirm_playback — title first, vision only as fallback."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_title_hit_skips_vision(self):
+        cfg = {"title_confirm": True}
+        with mock.patch.object(self.bc, "_apple_music_title_now_playing",
+                               return_value="Billie Jean — Michael Jackson"), \
+             mock.patch.object(self.bc, "_streaming_verify_playback") as vis:
+            ok, detail = self.bc._streaming_confirm_playback(cfg, "q?")
+        self.assertTrue(ok)
+        self.assertIn("now-playing track", detail)
+        vis.assert_not_called()          # vision NOT consulted when title confirms
+
+    def test_title_miss_uses_vision_when_available(self):
+        cfg = {"title_confirm": True}
+        with mock.patch.object(self.bc, "_apple_music_title_now_playing",
+                               return_value=None), \
+             mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
+             mock.patch.object(self.bc, "_streaming_verify_playback",
+                               return_value=(True, "YES playing")) as vis:
+            ok, detail = self.bc._streaming_confirm_playback(cfg, "q?")
+        self.assertTrue(ok)
+        self.assertIn("vision", detail)
+        vis.assert_called_once()
+
+    def test_title_miss_vision_off_degrades_gracefully(self):
+        # The key fix: no silent vision-timeout when vision is unavailable —
+        # an honest negative with a clear reason instead.
+        cfg = {"title_confirm": True}
+        with mock.patch.object(self.bc, "_apple_music_title_now_playing",
+                               return_value=None), \
+             mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", False), \
+             mock.patch.object(self.bc, "_streaming_verify_playback") as vis:
+            ok, detail = self.bc._streaming_confirm_playback(cfg, "q?")
+        self.assertFalse(ok)
+        self.assertIn("vision fallback unavailable", detail)
+        vis.assert_not_called()
+
+
+@requires_monolith
+class SpaceStrategyFocusTests(MonolithGlobalsTestCase):
+    """_streaming_apply_play_strategy('space') focuses the music window first."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_space_focuses_then_presses(self):
+        with mock.patch.object(self.bc, "_focus_music_window",
+                               return_value="Africa — Toto - Google Chrome") as fmw, \
+             mock.patch.object(self.bc, "ui_press") as up, \
+             mock.patch.object(self.bc.time, "sleep"):
+            attempted, desc = self.bc._streaming_apply_play_strategy("space", {}, None)
+        self.assertTrue(attempted)
+        fmw.assert_called_once()
+        up.assert_called_once_with("space")
+        self.assertIn("space", desc)
+
+    def test_space_still_presses_when_no_window_found(self):
+        with mock.patch.object(self.bc, "_focus_music_window", return_value=None), \
+             mock.patch.object(self.bc, "ui_press") as up, \
+             mock.patch.object(self.bc.time, "sleep"):
+            attempted, _ = self.bc._streaming_apply_play_strategy("space", {}, None)
+        self.assertTrue(attempted)
+        up.assert_called_once_with("space")
+
+
+@requires_monolith
+class AppleMusicStrategyOrderTests(MonolithGlobalsTestCase):
+    """The shipped Apple Music config puts SPACE first, vision (play_button)
+    as a fallback, and enables title-based confirmation."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_space_is_primary_strategy(self):
+        cfg = self.bc._STREAMING_SERVICES["apple_music"]
+        self.assertEqual(cfg["play_strategies"][0], "space")
+        self.assertIn("play_button", cfg["play_strategies"])  # kept as fallback
+        # SPACE must come before the first vision play_button.
+        self.assertLess(cfg["play_strategies"].index("space"),
+                        cfg["play_strategies"].index("play_button"))
+
+    def test_title_confirm_enabled(self):
+        self.assertTrue(self.bc._STREAMING_SERVICES["apple_music"].get("title_confirm"))
+
+
+@requires_monolith
+class AppleMusicAutoPlayNoVisionTests(MonolithGlobalsTestCase):
+    """_streaming_auto_play for Apple Music end-to-end with vision OFF —
+    keyboard-select + SPACE + title-confirm must still report playback, and
+    must NOT call vision (take_screenshot / find_click_target)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_plays_without_vision_via_title(self):
+        bc = self.bc
+        with mock.patch.object(bc.webbrowser, "open"), \
+             mock.patch.object(bc.time, "sleep"), \
+             mock.patch.object(bc, "SCREEN_VISION_ENABLED", False), \
+             mock.patch.object(bc, "UI_AUTOMATION_ENABLED", True), \
+             mock.patch.object(bc, "AI_BACKEND", "ollama"), \
+             mock.patch.object(bc, "_streaming_keyboard_select_first_result",
+                               return_value=True), \
+             mock.patch.object(bc, "_focus_music_window", return_value="win"), \
+             mock.patch.object(bc, "ui_press"), \
+             mock.patch.object(bc, "_streaming_go_fullscreen"), \
+             mock.patch.object(bc, "take_screenshot") as ts, \
+             mock.patch.object(bc, "find_click_target") as fct, \
+             mock.patch.object(bc, "_apple_music_title_now_playing",
+                               return_value="Billie Jean — Michael Jackson"):
+            out = bc._streaming_auto_play("apple_music", "Michael Jackson")
+        self.assertEqual(out, "playing 'Michael Jackson' on Apple Music")
+        ts.assert_not_called()           # no vision screenshot
+        fct.assert_not_called()          # no vision click-target search
+
+    def test_space_fires_when_enter_did_not_start(self):
+        # verify_first reports idle (title None), so the SPACE strategy runs;
+        # after SPACE the title shows a track and playback is confirmed.
+        bc = self.bc
+        titles = iter([None, "Africa — Toto"])
+
+        def _title(*_a, **_k):
+            try:
+                return next(titles)
+            except StopIteration:
+                return "Africa — Toto"
+
+        with mock.patch.object(bc.webbrowser, "open"), \
+             mock.patch.object(bc.time, "sleep"), \
+             mock.patch.object(bc, "SCREEN_VISION_ENABLED", False), \
+             mock.patch.object(bc, "UI_AUTOMATION_ENABLED", True), \
+             mock.patch.object(bc, "AI_BACKEND", "ollama"), \
+             mock.patch.object(bc, "_streaming_keyboard_select_first_result",
+                               return_value=True), \
+             mock.patch.object(bc, "_focus_music_window", return_value="win"), \
+             mock.patch.object(bc, "ui_press") as up, \
+             mock.patch.object(bc, "_streaming_go_fullscreen"), \
+             mock.patch.object(bc, "_apple_music_title_now_playing",
+                               side_effect=_title):
+            out = bc._streaming_auto_play("apple_music", "Africa by Toto")
+        self.assertEqual(out, "playing 'Africa by Toto' on Apple Music")
+        up.assert_any_call("space")      # SPACE was the trigger
+
+    def test_no_ui_automation_degrades_clearly(self):
+        # The honest message replaces the old silent vision-timeout.
+        bc = self.bc
+        with mock.patch.object(bc.webbrowser, "open"), \
+             mock.patch.object(bc.time, "sleep"), \
+             mock.patch.object(bc, "UI_AUTOMATION_ENABLED", False):
+            out = bc._streaming_auto_play("apple_music", "Thriller")
+        self.assertIn("UI automation", out)
+        self.assertIn("Thriller", out)
+
+
 if __name__ == "__main__":
     unittest.main()

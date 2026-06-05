@@ -8545,15 +8545,21 @@ _STREAMING_SERVICES = {
         "verify_first":     True,   # check before any play attempt — Enter on a song row may already be playing
         "verify_attempts":  3,
         "verify_wait":      2.5,
-        # Retry with a *different* strategy each attempt rather than
-        # blindly re-clicking the same play button. Order matters:
-        #   1. play_button — works for album/artist/playlist tiles that
-        #                    navigated to a detail page after Enter.
-        #   2. space       — works for a song row that received focus
-        #                    but Enter didn't start playback.
-        #   3. play_button — final fallback in case the detail page just
-        #                    finished loading.
-        "play_strategies":  ["play_button", "space", "play_button"],
+        # Confirm playback DETERMINISTICALLY from the browser tab title
+        # ("<Song> — <Artist>" while playing) instead of a vision screenshot
+        # that used to time out. See _streaming_confirm_playback.
+        "title_confirm":    True,
+        # Retry with a *different* strategy each attempt. SPACE is the
+        # primary, reliable trigger: music.apple.com toggles play/pause on
+        # Space and the first result is already keyboard-selected, so we
+        # focus the music window and press Space — no vision needed. Order:
+        #   1. space       — focus the Apple Music window + press Space
+        #                    (the deterministic, vision-free play trigger).
+        #   2. play_button — VISION FALLBACK ONLY: click the large detail-
+        #                    page Play button if Space didn't take (e.g. an
+        #                    album tile opened a detail page that ate focus).
+        #   3. space       — final retry in case the page just settled.
+        "play_strategies":  ["space", "play_button", "space"],
         "verify_question": (
             "Is music ACTIVELY playing right now on this Apple Music page? "
             "Answer YES only if at least one of these is clearly visible: "
@@ -8653,10 +8659,136 @@ def _streaming_find_with_retry(
     return None
 
 
+# ── deterministic, title-based playback confirmation ───────────────────
+# The streaming auto-play pipeline opens the user's REAL browser via
+# webbrowser.open (not a controlled selenium/playwright instance), so there
+# is no DOM to query. The next-best deterministic signal is the browser
+# window TITLE: while music.apple.com is actively playing a track the tab
+# title becomes "<Song> — <Artist>" (em dash) and the browser surfaces it
+# via Win32 GetWindowText. A paused / unstarted page (or the search page)
+# leaves the title as a bare "Apple Music" / "… on Apple Music" string.
+# Confirming via this title is instant and reliable, so it replaces the
+# slow vision screenshot+LLM check as the PRIMARY confirmation; vision is
+# kept only as a last-resort fallback when the title is inconclusive.
+
+# Strings a browser tab shows when NOTHING is playing — used to reject a
+# bare service-name title so we don't mistake "Apple Music" for a track.
+_MUSIC_IDLE_TITLE_TOKENS = (
+    "apple music",
+    "music.apple.com",
+    "search",
+    "new tab",
+    "sign in",
+    "listen now",
+    "browse",
+    "radio",
+    "home",
+    "library",
+)
+
+# Browser-chrome suffixes Chromium/Edge/Firefox append to a tab title, e.g.
+# "Billie Jean — Michael Jackson - Google Chrome". Stripped before parsing.
+_BROWSER_CHROME_SUFFIXES = (
+    " - google chrome",
+    " — google chrome",
+    " - chromium",
+    " - microsoft edge",
+    " — microsoft edge",
+    " - mozilla firefox",
+    " — mozilla firefox",
+    " - brave",
+    " - opera",
+)
+
+
+def _clean_browser_title(raw: str) -> str:
+    """Strip the trailing browser-name chrome a window manager appends to a
+    tab title, returning just the page/track portion. Case-insensitive on
+    the suffix; the returned text keeps its original casing."""
+    t = (raw or "").strip()
+    low = t.lower()
+    for suf in _BROWSER_CHROME_SUFFIXES:
+        if low.endswith(suf):
+            return t[: len(t) - len(suf)].strip()
+    return t
+
+
+def _parse_apple_music_track_title(raw: str) -> str | None:
+    """Given a browser window title, return the "<Song> — <Artist>" track
+    string when one is actively playing, else None.
+
+    music.apple.com sets the tab title to the playing track (e.g.
+    "Billie Jean — Michael Jackson") and reverts to a bare service name
+    ("Apple Music") when idle. We accept a title only if, after stripping
+    the browser chrome, it (a) contains a track/artist separator (em dash,
+    en dash, or " - ") and (b) is not merely one of the idle navigation
+    strings. This is what lets now_playing report the real song instead of
+    echoing the window title."""
+    t = _clean_browser_title(raw)
+    if not t:
+        return None
+    low = t.lower()
+    # A title that's exactly an idle navigation label (or trivially short)
+    # is not a track.
+    if low in _MUSIC_IDLE_TITLE_TOKENS or len(t) < 3:
+        return None
+    # Require a Song/Artist separator. Apple Music uses an em dash "—";
+    # tolerate en dash and the plain " - " hyphen form too.
+    has_sep = (" — " in t) or (" – " in t) or (" - " in t)
+    if not has_sep:
+        return None
+    # Reject the "<query> on Apple Music" / "Search results" style strings
+    # that still contain a separator but describe a non-playing page.
+    if low.endswith("on apple music") or low.startswith("search"):
+        return None
+    return t
+
+
+def _apple_music_title_now_playing() -> str | None:
+    """Scan open window titles for an actively-playing Apple Music track and
+    return its "<Song> — <Artist>" string, or None if nothing is clearly
+    playing. Deterministic (no vision, no screenshot) — used both by the
+    playback-confirmation path and by the now_playing action."""
+    try:
+        import pygetwindow as gw
+    except Exception:
+        return None
+    try:
+        windows = gw.getAllWindows()
+    except Exception:
+        return None
+    for w in windows:
+        title = (getattr(w, "title", "") or "").strip()
+        if not title:
+            continue
+        track = _parse_apple_music_track_title(title)
+        if track:
+            return track
+    return None
+
+
+def _streaming_title_confirms_playback(cfg: dict) -> tuple[bool, str]:
+    """Deterministic playback check via the browser window title. Returns
+    (is_playing, detail). Only meaningful for services whose tab title
+    carries the track (Apple Music — flagged with cfg['title_confirm']).
+    For other services returns (False, "...") so the caller falls through to
+    the vision check."""
+    if not cfg.get("title_confirm"):
+        return False, "title-confirm not supported for this service"
+    track = _apple_music_title_now_playing()
+    if track:
+        return True, f"tab title shows now-playing track: {track}"
+    return False, "no now-playing track in any window title yet"
+
+
 def _streaming_verify_playback(verify_question: str) -> tuple[bool, str]:
     """Take a fresh screenshot and ask vision whether playback is actually
     happening. Returns (is_playing, raw_answer). Vision-failures collapse
-    to (False, error_text) so the caller retries the play click."""
+    to (False, error_text) so the caller retries the play click.
+
+    NOTE: this is now the FALLBACK confirmation. The primary, deterministic
+    check is _streaming_title_confirms_playback (browser tab title); vision
+    is only consulted when the title is inconclusive."""
     png = take_screenshot()
     if png is None:
         return False, "could not capture screen"
@@ -8688,12 +8820,49 @@ def _streaming_apply_play_strategy(
         ui_double_click(result_coords[0], result_coords[1])
         return True, f"double-clicked first result at {result_coords}"
     if strategy == "space":
+        # music.apple.com toggles play/pause on SPACE. Focus the music
+        # window first so the keypress lands on the right browser window
+        # (Chrome ignores input meant for a background tab) and so we don't
+        # toggle play on whatever unrelated window happens to be foreground.
+        focused = _focus_music_window()
+        if focused:
+            time.sleep(0.15)
         ui_press("space")
-        return True, "pressed space (play/pause shortcut)"
+        where = f" (focused '{focused[:40]}')" if focused else ""
+        return True, f"pressed space (play/pause shortcut){where}"
     if strategy == "playpause":
         ui_press("playpause")
         return True, "pressed media play/pause key"
     return False, f"unknown play strategy '{strategy}'"
+
+
+def _streaming_confirm_playback(cfg: dict, verify_q: str) -> tuple[bool, str]:
+    """Confirm playback using the most reliable signal available.
+
+    PRIMARY: the browser window title (deterministic — see
+    _streaming_title_confirms_playback). For Apple Music this is instant and
+    accurate: a playing track puts "<Song> — <Artist>" in the tab title.
+
+    FALLBACK: only when the title is inconclusive AND vision is actually
+    available do we take a screenshot and ask the model. If vision is off we
+    DON'T silently fail — we say so, so callers surface an honest message
+    instead of the old vision-timeout.
+
+    Returns (is_playing, detail)."""
+    # 1) deterministic title check
+    ok, detail = _streaming_title_confirms_playback(cfg)
+    if ok:
+        return True, detail
+    title_detail = detail
+
+    # 2) vision fallback — only if the capability is present.
+    vision_ok = (SCREEN_VISION_ENABLED and AI_BACKEND == "claude")
+    if not vision_ok:
+        return False, f"{title_detail}; vision fallback unavailable"
+    is_playing, vision_answer = _streaming_verify_playback(verify_q)
+    snippet = (vision_answer or "").strip().splitlines()
+    snippet = snippet[0][:120] if snippet else "no answer"
+    return is_playing, f"vision: {snippet}"
 
 
 def _streaming_play_and_verify(
@@ -8702,16 +8871,22 @@ def _streaming_play_and_verify(
     q: str,
     result_coords: tuple[int, int] | None = None,
 ) -> str:
-    """Click play, then verify with vision that playback actually started.
-    Retries up to `verify_attempts` times, using a different strategy each
-    attempt (from cfg['play_strategies'], default ['play_button']) so we
-    don't blindly repeat a click that already failed. Used by services
-    with `verify_play: True` (Apple Music) so JARVIS doesn't silently
-    leave the user staring at a paused/unstarted page.
+    """Trigger playback, then confirm it actually started — deterministically
+    via the browser tab title first, vision only as a fallback. Retries up to
+    `verify_attempts` times, using a different strategy each attempt (from
+    cfg['play_strategies']) so we don't blindly repeat an action that already
+    failed. Used by services with `verify_play: True` (Apple Music) so JARVIS
+    doesn't silently leave the user staring at a paused/unstarted page.
 
-    `result_coords` is the screen position of the search result we
-    originally clicked — needed for the `double_click_result` fallback
-    that fixes Apple Music song rows (single-click only selects them)."""
+    For Apple Music the strategy order is keyboard-SPACE first (music.apple.com
+    toggles play on Space and the first result is already keyboard-selected),
+    then the vision-located detail-page play button as a fallback. Confirmation
+    reads the now-playing track out of the tab title rather than asking a
+    vision model that used to time out.
+
+    `result_coords` is the screen position of the search result we originally
+    clicked — needed for the `double_click_result` fallback that fixes Apple
+    Music song rows (single-click only selects them)."""
     attempts = max(1, int(cfg.get("verify_attempts", 3)))
     verify_wait = float(cfg.get("verify_wait", 2.5))
     verify_q = cfg.get("verify_question") or (
@@ -8722,21 +8897,19 @@ def _streaming_play_and_verify(
 
     # Optional pre-check: if the result-selection step (e.g. keyboard
     # Enter on a focused song row) already started playback, skip the
-    # play strategies entirely. Without this, we'd needlessly press the
-    # play button on an already-playing track and toggle it off.
+    # play strategies entirely. Without this, we'd needlessly toggle play
+    # on an already-playing track (turning it back OFF).
     if cfg.get("verify_first"):
         print(
             f"  [auto-play] checking whether playback already started on "
             f"{service_label}…",
             flush=True,
         )
-        is_playing, vision_answer = _streaming_verify_playback(verify_q)
+        is_playing, detail = _streaming_confirm_playback(cfg, verify_q)
         if is_playing:
-            snippet = (vision_answer or "").strip().splitlines()
-            snippet = snippet[0][:120] if snippet else "no answer"
             print(
                 f"  [auto-play] ✓ already playing — skipping play step "
-                f"({snippet})",
+                f"({detail})",
                 flush=True,
             )
             _streaming_go_fullscreen(cfg, service_label)
@@ -8767,35 +8940,33 @@ def _streaming_play_and_verify(
             continue
 
         print(
-            f"  [auto-play] {desc}; verifying playback in {verify_wait}s…",
+            f"  [auto-play] {desc}; confirming playback in {verify_wait}s…",
             flush=True,
         )
         time.sleep(verify_wait)
 
-        is_playing, vision_answer = _streaming_verify_playback(verify_q)
-        snippet = (vision_answer or "").strip().splitlines()
-        snippet = snippet[0][:120] if snippet else "no answer"
+        is_playing, detail = _streaming_confirm_playback(cfg, verify_q)
         if is_playing:
-            print(f"  [auto-play] ✓ vision confirms playback ({snippet})", flush=True)
+            print(f"  [auto-play] ✓ confirmed playback ({detail})", flush=True)
             _streaming_go_fullscreen(cfg, service_label)
             return f"playing '{q}' on {service_label}"
-        last_msg = snippet
+        last_msg = detail
         if attempt < attempts:
             print(
-                f"  [auto-play] ✗ vision says not playing yet: {snippet} — retrying",
+                f"  [auto-play] ✗ not playing yet: {detail} — retrying",
                 flush=True,
             )
         else:
             print(
-                f"  [auto-play] ✗ vision still not confirming after "
-                f"{attempts} attempts: {snippet}",
+                f"  [auto-play] ✗ still not confirming after "
+                f"{attempts} attempts: {detail}",
                 flush=True,
             )
 
     return (
         f"opened '{q}' on {service_label} and tried to start playback, but "
-        f"vision couldn't confirm it after {attempts} attempts — you may "
-        f"need to click play yourself ({last_msg})"
+        f"couldn't confirm it after {attempts} attempts — you may "
+        f"need to press play yourself ({last_msg})"
     )
 
 
@@ -8845,11 +9016,16 @@ def _streaming_keyboard_select_first_result(
 
 
 def _streaming_auto_play(service_key: str, query: str) -> str:
-    """Open a streaming service's search page for `query`, click (or
-    keyboard-activate) the first result, then click play. Services with
-    `verify_play: True` additionally confirm playback via vision and
-    retry the play step on failure (so JARVIS doesn't silently end at a
-    paused detail page)."""
+    """Open a streaming service's search page for `query`, activate the first
+    result, then start playback. Services with `verify_play: True` confirm
+    playback and retry the play step on failure (so JARVIS doesn't silently
+    end at a paused detail page).
+
+    Apple Music uses the vision-free path: keyboard-select the first result,
+    press SPACE to play (music.apple.com's play/pause shortcut), and confirm
+    via the browser tab title ("<Song> — <Artist>"). Vision is only a
+    last-resort fallback there. Other services still use vision click +
+    vision confirmation."""
     cfg = _STREAMING_SERVICES.get(service_key)
     if cfg is None:
         return (
@@ -8872,15 +9048,26 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
     print(f"  [auto-play] opened {service_label} search for '{q}'", flush=True)
     time.sleep(cfg["load_wait"])
 
-    # Vision-based click requires Claude vision + UI automation
-    if not (SCREEN_VISION_ENABLED and UI_AUTOMATION_ENABLED and AI_BACKEND == "claude"):
+    strict = bool(cfg.get("verify_play"))
+    select_method = cfg.get("select_method", "vision")
+
+    # Capability gate. Services that select the result by KEYBOARD and
+    # confirm playback by TAB TITLE (Apple Music) need only UI automation —
+    # they never call vision on the happy path, so requiring vision here
+    # would wrongly block reliable keyboard playback when SCREEN_VISION is
+    # off. Vision-based services still require the full vision + Claude set.
+    keyboard_only = (select_method == "keyboard" and bool(cfg.get("title_confirm")))
+    if keyboard_only:
+        if not UI_AUTOMATION_ENABLED:
+            return (
+                f"opened {service_label} search for '{q}' — auto-play needs "
+                f"UI automation (keyboard control) to start playback"
+            )
+    elif not (SCREEN_VISION_ENABLED and UI_AUTOMATION_ENABLED and AI_BACKEND == "claude"):
         return (
             f"opened {service_label} search for '{q}' — auto-click needs "
             f"SCREEN_VISION_ENABLED + UI_AUTOMATION_ENABLED + Claude backend"
         )
-
-    strict = bool(cfg.get("verify_play"))
-    select_method = cfg.get("select_method", "vision")
 
     # Step 2: activate the first result. Two paths:
     #   keyboard — Tab past the page chrome and press Enter. No coords are

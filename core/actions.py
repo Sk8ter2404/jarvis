@@ -578,18 +578,21 @@ def _act_now_playing(_: str = "") -> str:
             np = None
         if np:
             return f"Apple Music: {np}"
-    # 2) Browser Apple Music tab — the tab title carries the song.
+    # 2) Browser Apple Music tab — the tab title carries the song while a
+    #    track is playing ("<Song> — <Artist>"). Parse the REAL track out of
+    #    it rather than echoing the raw window title (which is a bare
+    #    "Apple Music" when idle, giving the useless "Apple Music: Apple
+    #    Music"). _apple_music_title_now_playing returns None when no track
+    #    title is present, so we fall through to an honest line.
     if bc._apple_music_chrome_active():
         try:
-            import pygetwindow as gw
-            for w in gw.getAllWindows():
-                title = (w.title or "").strip()
-                if title and "apple music" in title.lower():
-                    return f"Apple Music: {title}"
+            track = bc._apple_music_title_now_playing()
         except Exception:
-            pass
-        return ("Apple Music is the active player — open the Apple Music "
-                "tab to see what's currently playing.")
+            track = None
+        if track:
+            return f"Apple Music: {track}"
+        return ("Apple Music is the active player, sir, but nothing seems to "
+                "be playing right now — start a song and I'll read it back.")
     # 3) The app is running but its title gave us nothing useful.
     if amapp is not None and amapp.is_active_media_app():
         return ("Apple Music is open, sir, but it isn't telling me the track "

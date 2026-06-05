@@ -402,7 +402,10 @@ class PauseResumeMusicTests(_BaseActTest):
 
 # ── _act_now_playing ─────────────────────────────────────────────────────────
 # COM is dead. now_playing tries the UWP app's window title first, then the
-# browser tab title, then an honest fallback. Never touches _get_itunes.
+# browser tab title — parsing the REAL "<Song> — <Artist>" track out of it via
+# the monolith's _apple_music_title_now_playing (NOT echoing the raw window
+# title, which gave the useless "Apple Music: Apple Music") — then an honest
+# fallback. Never touches _get_itunes.
 class NowPlayingTests(_BaseActTest):
     def test_uwp_app_now_playing_wins(self):
         self.patch_apple_music_app(now_playing="Smooth Criminal")
@@ -411,32 +414,34 @@ class NowPlayingTests(_BaseActTest):
         out = A._act_now_playing("")
         self.assertEqual(out, "Apple Music: Smooth Criminal")
 
-    def test_chrome_active_reads_window_title(self):
+    def test_chrome_active_returns_parsed_track(self):
+        # The browser tab is playing — the monolith helper parses the real
+        # song/artist out of the tab title and now_playing reports THAT, not
+        # the raw window title.
         self.patch_apple_music_app(now_playing=None, is_active=False)
         self.bc._apple_music_chrome_active.return_value = True
-        win = _FakeWindow(title="Bohemian Rhapsody - Apple Music")
-        gw = self.make_pygetwindow(all_windows=[win])
-        self.install_fake_module("pygetwindow", gw)
+        self.bc._apple_music_title_now_playing.return_value = "Billie Jean — Michael Jackson"
         out = A._act_now_playing("")
-        self.assertEqual(out, "Apple Music: Bohemian Rhapsody - Apple Music")
+        self.assertEqual(out, "Apple Music: Billie Jean — Michael Jackson")
 
-    def test_chrome_active_no_matching_window(self):
+    def test_chrome_active_idle_title_is_honest_not_echoed(self):
+        # Regression for "Apple Music: Apple Music": when nothing is playing
+        # the helper returns None, so we must NOT echo a bare service title.
         self.patch_apple_music_app(now_playing=None, is_active=False)
         self.bc._apple_music_chrome_active.return_value = True
-        gw = self.make_pygetwindow(all_windows=[_FakeWindow(title="Some Other App")])
-        self.install_fake_module("pygetwindow", gw)
+        self.bc._apple_music_title_now_playing.return_value = None
         out = A._act_now_playing("")
-        self.assertIn("Apple Music is the active player", out)
+        self.assertNotIn("Apple Music: Apple Music", out)
+        self.assertIn("nothing seems to be playing", out.lower())
 
-    def test_chrome_active_import_error_falls_back(self):
+    def test_chrome_active_helper_raises_falls_back(self):
+        # If the title helper blows up, degrade to the honest line rather
+        # than crashing the action.
         self.patch_apple_music_app(now_playing=None, is_active=False)
         self.bc._apple_music_chrome_active.return_value = True
-        # Force the inner ``import pygetwindow`` to raise.
-        bad = mock.Mock()
-        bad.getAllWindows.side_effect = RuntimeError("boom")
-        self.install_fake_module("pygetwindow", bad)
+        self.bc._apple_music_title_now_playing.side_effect = RuntimeError("boom")
         out = A._act_now_playing("")
-        self.assertIn("Apple Music is the active player", out)
+        self.assertIn("nothing seems to be playing", out.lower())
 
     def test_app_running_but_no_title_honest(self):
         # App is the live media app but its title gave no track → in-between line.
