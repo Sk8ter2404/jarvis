@@ -8208,6 +8208,25 @@ def _close_browser_windows_matching(terms) -> int:
     return closed
 
 
+def _find_browser_window_matching(terms):
+    """Return the first BROWSER window whose normalized title contains any of
+    `terms` (and a browser marker), or None. Used to locate a streaming
+    service's just-opened window so vision-capture can be pinned to its
+    monitor. Mirrors _close_browser_windows_matching's matching."""
+    if not terms:
+        return None
+    try:
+        import pygetwindow as gw
+        wins = gw.getAllWindows()
+    except Exception:
+        return None
+    for w in wins:
+        t = _strip_bidi_and_nbsp((getattr(w, "title", "") or "")).lower()
+        if t and any(m in t for m in _MUSIC_BROWSER_MARKERS) and any(term in t for term in terms):
+            return w
+    return None
+
+
 def _open_url_in_browser(url: str, close_matching=None) -> str:
     """Open `url` in a REAL web browser, deliberately bypassing the default
     URL handler.
@@ -9430,6 +9449,9 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
             + ", ".join(sorted(_STREAMING_SERVICES.keys()))
         )
 
+    # Work on a COPY so per-call mutations (vision_monitor, etc.) never leak
+    # into the shared _STREAMING_SERVICES template.
+    cfg = dict(cfg)
     q = query.strip()
     service_label = cfg["name"]
 
@@ -9492,18 +9514,25 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
     )
     time.sleep(cfg["load_wait"])
 
-    # For the resolved Apple Music track page, bring the player window forward
-    # and pin vision-capture to the single monitor it occupies — otherwise
-    # find_click_target photographs the whole 4-monitor virtual screen and the
-    # player downscales too small to find the play controls (confirmed live).
-    if resolved:
-        if _focus_music_window():
-            time.sleep(0.2)
-        _mw = _find_music_window()
-        _mon = _monitor_name_for_window(_mw) if _mw else None
-        if _mon:
-            cfg["vision_monitor"] = _mon
-            print(f"  [auto-play] pinning vision to monitor '{_mon}'", flush=True)
+    # Pin vision-capture to the single monitor the player window occupies (ANY
+    # service, via its tab_match titles) — otherwise find_click_target
+    # photographs the whole multi-monitor virtual screen and downscales the
+    # controls too small to locate. This makes youtube_play / netflix vision
+    # clicks work on a multi-monitor rig, not just the resolved Apple Music path
+    # (the latter was confirmed live; youtube_play was failing the same way).
+    _vm_terms = cfg.get("tab_match")
+    if _vm_terms:
+        _vw = _find_browser_window_matching(_vm_terms)
+        if _vw is not None:
+            try:
+                _vw.activate()
+                time.sleep(0.2)
+            except Exception:
+                pass
+            _mon = _monitor_name_for_window(_vw)
+            if _mon:
+                cfg["vision_monitor"] = _mon
+                print(f"  [auto-play] pinning vision to monitor '{_mon}'", flush=True)
 
     strict = bool(cfg.get("verify_play"))
 
@@ -9559,12 +9588,13 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
             f"  [auto-play] looking for first result on {service_label}…",
             flush=True,
         )
+        _vm = cfg.get("vision_monitor")
         if strict:
             coords = _streaming_find_with_retry(
-                cfg["result_hint"], attempts=3, wait_between=2.0
+                cfg["result_hint"], attempts=3, wait_between=2.0, monitor=_vm
             )
         else:
-            coords = find_click_target(cfg["result_hint"])
+            coords = find_click_target(cfg["result_hint"], monitor=_vm)
         if coords is None:
             return (
                 f"opened {service_label} search for '{q}', but couldn't see the "

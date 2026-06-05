@@ -12,7 +12,7 @@ across conversations.
         persistent memory across conversations   + a self-diagnostic loop
 ```
 
-> **Status: `1.41.0`.** This is a personal project shared for
+> **Status: `1.42.0`.** This is a personal project shared for
 > others to try. It's Windows-focused, expects some setup (your own API keys,
 > optional hardware), and is provided as-is. Expect rough edges — and please
 > file issues.
