@@ -1282,6 +1282,36 @@ class StreamingApplyPlayStrategyTests(MonolithGlobalsTestCase):
         self.assertFalse(attempted)
         self.assertIn("unknown play strategy", desc)
 
+    def test_highlighted_row_double_clicks(self):
+        with mock.patch.object(self.bc, "_streaming_find_with_retry", return_value=(7, 8)), \
+             mock.patch.object(self.bc, "ui_double_click") as dc:
+            attempted, desc = self.bc._streaming_apply_play_strategy(
+                "highlighted_row", {"track_play_hint": "h"}, None)
+        self.assertTrue(attempted)
+        dc.assert_called_once_with(7, 8)
+        self.assertIn("(7, 8)", desc)
+
+    def test_highlighted_row_not_found_is_noop(self):
+        with mock.patch.object(self.bc, "_streaming_find_with_retry", return_value=None), \
+             mock.patch.object(self.bc, "ui_double_click") as dc:
+            attempted, _ = self.bc._streaming_apply_play_strategy(
+                "highlighted_row", {"track_play_hint": "h"}, None)
+        self.assertFalse(attempted)
+        dc.assert_not_called()
+
+    def test_recheck_is_noop_action_but_attempted(self):
+        # recheck does NO UI action but returns attempted=True so the caller
+        # waits + re-verifies without a re-click that would restart the track.
+        with mock.patch.object(self.bc, "ui_click") as click, \
+             mock.patch.object(self.bc, "ui_double_click") as dc, \
+             mock.patch.object(self.bc, "ui_press") as press:
+            attempted, desc = self.bc._streaming_apply_play_strategy("recheck", {}, None)
+        self.assertTrue(attempted)
+        click.assert_not_called()
+        dc.assert_not_called()
+        press.assert_not_called()
+        self.assertIn("re-check", desc.lower())
+
 
 @requires_monolith
 class StreamingGoFullscreenTests(MonolithGlobalsTestCase):
