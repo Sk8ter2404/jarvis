@@ -379,8 +379,14 @@ def _evaluate_conditions_once() -> None:
             _log.exception("malformed conditional trigger entry: %r", trig)
 
     if dropped_ids:
+        # Re-read under the lock and drop only the fired one-shots, so a trigger
+        # added concurrently during this (action-dispatching) sweep isn't
+        # clobbered by writing back this sweep's stale snapshot.
         try:
-            _write_conditions([t for t in triggers if t.get("id") not in dropped_ids])
+            with _lock:
+                current = _read_conditions()
+                _write_conditions([t for t in current
+                                   if t.get("id") not in dropped_ids])
         except Exception:
             pass
         # Drop fired one-shots from the edge-state too so it tracks the
@@ -656,19 +662,23 @@ def schedule_when(
             f"unknown condition '{condition}'. "
             f"Available: {', '.join(available_conditions())}"
         )
-    triggers = _read_conditions()
-    # Replace by id if it already exists, otherwise append.
-    triggers = [t for t in triggers if t.get("id") != name]
-    triggers.append({
-        "id":        name,
-        "condition": condition,
-        "action":    action,
-        "arg":       arg or "",
-        "chain":     list(chain) if chain else [],
-        "one_shot":  bool(one_shot),
-        "created":   time.time(),
-    })
-    _write_conditions(triggers)
+    # Hold _lock across the read-modify-write so a concurrent schedule_when /
+    # cancel_job pass can't interleave and clobber a just-added trigger (RLock,
+    # so the cond_state seed below re-enters safely).
+    with _lock:
+        triggers = _read_conditions()
+        # Replace by id if it already exists, otherwise append.
+        triggers = [t for t in triggers if t.get("id") != name]
+        triggers.append({
+            "id":        name,
+            "condition": condition,
+            "action":    action,
+            "arg":       arg or "",
+            "chain":     list(chain) if chain else [],
+            "one_shot":  bool(one_shot),
+            "created":   time.time(),
+        })
+        _write_conditions(triggers)
     # Seed cond_state so the trigger doesn't fire immediately on its
     # initial value (e.g. a printer already in FINISH state at bootstrap).
     with _lock:
@@ -759,14 +769,15 @@ def cancel_job(job_id: str) -> bool:
             # not in the APScheduler store — fall through to conditions
             pass
 
-    triggers = _read_conditions()
-    new_triggers = [t for t in triggers if t.get("id") != job_id]
-    if len(new_triggers) != len(triggers):
-        try:
-            _write_conditions(new_triggers)
-            removed = True
-        except Exception as e:
-            _log.warning("cancel_job: failed to rewrite conditions: %s", e)
+    with _lock:
+        triggers = _read_conditions()
+        new_triggers = [t for t in triggers if t.get("id") != job_id]
+        if len(new_triggers) != len(triggers):
+            try:
+                _write_conditions(new_triggers)
+                removed = True
+            except Exception as e:
+                _log.warning("cancel_job: failed to rewrite conditions: %s", e)
 
     with _lock:
         _state["cond_state"].pop(job_id, None)
