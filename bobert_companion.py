@@ -899,8 +899,15 @@ MUSIC_ACTION_NAMES = {
 }
 # Window-title fragments (lowercase) likely to host an active music session
 # that swallows global media keys unless focused. Ordered by priority — first
-# match wins. Chrome doesn't route VK_MEDIA_* to a background tab; focusing
-# the music window before the keypress makes media controls actually work.
+# match wins. Chrome doesn't route VK_MEDIA_* (or SPACE) to a background tab;
+# focusing the music window before the keypress makes media controls actually
+# work. "apple music" deliberately leads: the Apple Music WEB PLAYER (forced
+# into Chrome by _open_url_in_browser) carries "Apple Music" in its tab title
+# while on the search / idle page — which is exactly the moment the `space`
+# play strategy needs to focus it — so this matches the Chrome web-player
+# window, not just the UWP app. ("chrome"/"edge" are intentionally NOT hints:
+# we want the music TAB, and a bare browser-name match could grab an unrelated
+# window.)
 MUSIC_WINDOW_HINTS = (
     "apple music",
     "spotify",
@@ -8100,12 +8107,135 @@ _CHROME_PATHS = [
     os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
 ]
 
+# Common Edge install locations — the fallback browser when Chrome is absent.
+# Edge ships with Windows, so this almost always resolves on this fleet.
+_EDGE_PATHS = [
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe"),
+]
 
-def _find_chrome() -> str | None:
-    for p in _CHROME_PATHS:
+
+def _exe_from_app_paths(exe_name: str) -> str | None:
+    """Resolve a browser executable from the Windows 'App Paths' registry key
+    (HKCU first, then HKLM). This is the most reliable locator — it's what the
+    shell itself uses to resolve `start chrome` — and it survives non-default
+    install dirs. Returns the path if it exists on disk, else None. Never
+    raises (winreg missing on non-Windows, key absent, etc.)."""
+    try:
+        import winreg
+    except Exception:
+        return None
+    subkey = (
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\\" + exe_name
+    )
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(hive, subkey) as k:
+                # The default (unnamed) value holds the full exe path.
+                val, _ = winreg.QueryValueEx(k, None)
+                if val and os.path.exists(val):
+                    return val
+        except Exception:
+            continue
+    return None
+
+
+def _find_browser_exe(exe_name: str, fallback_paths: list[str]) -> str | None:
+    """Locate a browser executable by name. Order: App Paths registry → the
+    known fallback install dirs → PATH (shutil.which). Returns the first
+    existing path, or None. Total (never raises)."""
+    found = _exe_from_app_paths(exe_name)
+    if found:
+        return found
+    for p in fallback_paths:
         if p and os.path.exists(p):
             return p
-    return None
+    try:
+        which = shutil.which(exe_name)
+    except Exception:
+        which = None
+    return which
+
+
+def _find_chrome() -> str | None:
+    """Locate chrome.exe via the App Paths registry, the common install
+    dirs, then PATH. Returns the path or None."""
+    return _find_browser_exe("chrome.exe", _CHROME_PATHS)
+
+
+def _find_edge() -> str | None:
+    """Locate msedge.exe via the App Paths registry, the common install
+    dirs, then PATH. Returns the path or None."""
+    return _find_browser_exe("msedge.exe", _EDGE_PATHS)
+
+
+def _open_url_in_browser(url: str) -> str:
+    """Open `url` in a REAL web browser, deliberately bypassing the default
+    URL handler.
+
+    WHY: the user installed the UWP Apple Music *app*, which registered itself
+    as the protocol handler for music.apple.com. A bare `webbrowser.open(url)`
+    therefore launches the APP (not a browser), and JARVIS then tries to drive
+    the wrong, policy-restricted target. Opening the same URL in Chrome loads
+    the real WEB PLAYER, which the keyboard-SPACE + tab-title pipeline can
+    actually control.
+
+    Resolution order:
+      1. webbrowser.get("chrome") — uses Python's registered Chrome launcher.
+      2. chrome.exe located via registry / known paths → subprocess.Popen.
+      3. msedge.exe the same way (Edge ships with Windows).
+      4. last resort: webbrowser.open(url) (may be intercepted by the app —
+         we log a warning so the failure is explained, not silent).
+
+    Returns a short string naming which path opened it ("chrome",
+    "chrome:webbrowser", "edge", or "default") for logging/tests. NEVER raises.
+    """
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    # 1) Python's own registered Chrome controller. Fast and dependency-free
+    #    when Chrome is registered; KeyError when it isn't.
+    try:
+        browser = webbrowser.get("chrome")
+        if browser.open(url):
+            return "chrome:webbrowser"
+    except Exception:
+        pass
+
+    # 2) chrome.exe directly. --new-window keeps it off whatever Chrome window
+    #    the user already has, matching _open_url_new_window's behaviour.
+    chrome = _find_chrome()
+    if chrome:
+        try:
+            subprocess.Popen([chrome, "--new-window", url], close_fds=True)
+            return "chrome"
+        except Exception as e:
+            print(f"  [open-url] chrome.exe launch failed: {e}", flush=True)
+
+    # 3) Edge fallback — also a real browser that loads the web player.
+    edge = _find_edge()
+    if edge:
+        try:
+            subprocess.Popen([edge, "--new-window", url], close_fds=True)
+            return "edge"
+        except Exception as e:
+            print(f"  [open-url] msedge.exe launch failed: {e}", flush=True)
+
+    # 4) Last resort: the default handler. On this box that may be the UWP
+    #    Apple Music app rather than a browser, so warn — this explains why
+    #    auto-play might then act on the wrong target.
+    print(
+        "  [open-url] WARNING: no Chrome/Edge found; falling back to the "
+        "default URL handler — if the UWP Apple Music app is registered for "
+        "this link it may open the APP instead of the web player.",
+        flush=True,
+    )
+    try:
+        webbrowser.open(url)
+    except Exception as e:
+        print(f"  [open-url] default handler also failed: {e}", flush=True)
+    return "default"
 
 
 def _open_url_new_window(url: str) -> bool:
@@ -8440,6 +8570,29 @@ def _extract_youtube_url_from_search(query: str) -> str | None:
 #                   full-screen Now Playing view in the web player.
 #  fullscreen_wait: seconds to wait after the play click before pressing the
 #                   key — gives the player time to initialise and grab focus.
+# ── Apple Music web-player play-trigger TUNABLES ───────────────────────────
+# The web player opens on a SEARCH-RESULTS page with NO track auto-loaded, so
+# SPACE alone does nothing until a result is selected. The keyboard flow Tabs
+# past the page chrome and presses Enter to open/play the first result, then
+# SPACE acts as the play toggle / confirm. The exact numbers below are layout-
+# and machine-dependent and NEED ONE LIVE TUNING PASS (the parent will live-
+# tune via screenshots):
+#   * APPLE_MUSIC_WEB_LOAD_WAIT  — seconds to let the React web app render the
+#       results page before we touch the keyboard. The UWP-app handler used to
+#       intercept the URL; now that Chrome loads the real web player, it needs
+#       a beat longer to paint. Bump up if the first Tab lands before results.
+#   * APPLE_MUSIC_TAB_COUNT      — how many Tabs to reach the first real result
+#       (skips the nav/search chrome). If Enter opens the wrong thing, adjust.
+#   * APPLE_MUSIC_TAB_INTERVAL / *_PRE_WAIT / *_POST_WAIT — keypress pacing.
+# There are currently NO click COORDINATES to tune (the flow is keyboard-only +
+# a vision-located play button fallback); if a coordinate-based click is ever
+# added it should be a named constant here too.
+APPLE_MUSIC_WEB_LOAD_WAIT   = 4.0   # was folded into load_wait; widened for the web app to render
+APPLE_MUSIC_TAB_PRE_WAIT    = 1.2   # gap after load before first Tab (search input keeps focus briefly)
+APPLE_MUSIC_TAB_COUNT       = 6     # Tabs to reach the first result (LIVE-TUNE)
+APPLE_MUSIC_TAB_INTERVAL    = 0.18  # delay between Tabs
+APPLE_MUSIC_TAB_POST_WAIT   = 0.6   # gap after the last Tab before Enter
+
 _STREAMING_SERVICES = {
     "netflix": {
         "name":             "Netflix",
@@ -8500,19 +8653,26 @@ _STREAMING_SERVICES = {
         "name":             "Apple Music",
         "home":             "https://music.apple.com",
         "search_url":       "https://music.apple.com/us/search?term={q}",
-        "load_wait":        5.0,
+        # Now that the URL is forced into Chrome (the real web player) rather
+        # than the UWP app, give the React web app a longer beat to render the
+        # results page before the keyboard flow touches it. See the
+        # APPLE_MUSIC_WEB_* tunables above.
+        "load_wait":        APPLE_MUSIC_WEB_LOAD_WAIT,
         "post_click":       3.0,
         # Result selection: keyboard navigation (Tab + Enter) instead of
         # vision+click. find_on_screen coordinates were unreliable on Apple
         # Music's dense web layout (Top Result + tile grid + song rows),
         # and a single-click on a song row only selects it. Tabbing past
         # the page chrome and pressing Enter on the first focusable result
-        # works regardless of which result type appears first.
+        # works regardless of which result type appears first. The web player
+        # opens on a SEARCH page (no auto-loaded track), so this Tab+Enter to
+        # SELECT a result is what gives the later SPACE something to toggle.
+        # All four values are LIVE-TUNABLE module constants (above).
         "select_method":    "keyboard",
-        "keyboard_pre_wait":     1.0,
-        "keyboard_tab_count":    6,
-        "keyboard_tab_interval": 0.18,
-        "keyboard_post_wait":    0.6,
+        "keyboard_pre_wait":     APPLE_MUSIC_TAB_PRE_WAIT,
+        "keyboard_tab_count":    APPLE_MUSIC_TAB_COUNT,
+        "keyboard_tab_interval": APPLE_MUSIC_TAB_INTERVAL,
+        "keyboard_post_wait":    APPLE_MUSIC_TAB_POST_WAIT,
         "result_hint":      (
             "the 'Top Result' card OR the first album / artist tile in the "
             "Apple Music search results — strongly prefer the Top Result "
@@ -9038,14 +9198,22 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
 
     # Empty query: just open the homepage and stop.
     if not q:
-        webbrowser.open(cfg["home"])
+        _open_url_in_browser(cfg["home"])
         return f"opened {service_label}"
 
-    # Step 1: open the search URL. Browser focus is needed for the click
-    # steps to land on the right window.
+    # Step 1: open the search URL in a REAL browser (NOT the default handler).
+    # Critical for Apple Music: the UWP app registered itself for
+    # music.apple.com, so a bare webbrowser.open would launch the app instead
+    # of the web player. _open_url_in_browser forces Chrome/Edge so the
+    # keyboard-SPACE + tab-title pipeline has the actual web player to drive.
+    # Browser focus is needed for the click/keyboard steps to land right.
     url = cfg["search_url"].format(q=urllib.parse.quote(q))
-    webbrowser.open(url)
-    print(f"  [auto-play] opened {service_label} search for '{q}'", flush=True)
+    opened_via = _open_url_in_browser(url)
+    print(
+        f"  [auto-play] opened {service_label} search for '{q}' "
+        f"(via {opened_via})",
+        flush=True,
+    )
     time.sleep(cfg["load_wait"])
 
     strict = bool(cfg.get("verify_play"))
@@ -9216,7 +9384,7 @@ def _apple_music_play_playlist(name: str) -> str:
     # when possible; sidebar fallback covers the case where Apple Music
     # redirects (not signed in, first-load behaviour).
     library_url = "https://music.apple.com/library/playlists"
-    webbrowser.open(library_url)
+    _open_url_in_browser(library_url)
     print(
         f"  [auto-play] opened Apple Music Library > Playlists for '{name}'",
         flush=True,
