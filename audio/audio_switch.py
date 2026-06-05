@@ -147,6 +147,17 @@ class AudioAutoSwitch:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._prior_default: str | None = None
+        self._low_warned = False
+        self.low_pct = 15            # warn once when battery drops below this
+
+    def battery_pct(self) -> float | None:
+        """Headset battery % from HWiNFO shared memory, or None if HWiNFO /
+        Shared Memory Support isn't available."""
+        try:
+            from audio import hwinfo
+            return hwinfo.battery(self.headset)
+        except Exception:
+            return None
 
     def start(self) -> bool:
         if self._thread and self._thread.is_alive():
@@ -162,8 +173,22 @@ class AudioAutoSwitch:
     def status(self) -> str:
         on = find_active(self.headset) is not None
         running = bool(self._thread and self._thread.is_alive())
+        batt = self.battery_pct()
+        suffix = f" at {round(batt)}% battery" if (on and batt and batt > 0) else ""
         return (f"Audio auto-switch is {'running' if running else 'stopped'}, sir. "
-                f"The '{self.headset}' headset is {'ON' if on else 'off'}.")
+                f"The '{self.headset}' headset is {'ON' + suffix if on else 'off'}.")
+
+    def _check_low_battery(self) -> None:
+        """Announce once when the headset battery drops below low_pct; re-arm
+        when it recovers (recharged) so the next drain warns again."""
+        batt = self.battery_pct()
+        if batt is None or batt <= 0:
+            return
+        if batt < self.low_pct and not self._low_warned:
+            self._low_warned = True
+            self.announce(f"headset battery is low — {round(batt)} percent, sir")
+        elif batt >= self.low_pct + 5:
+            self._low_warned = False
 
     def _run(self) -> None:  # pragma: no cover - daemon loop, logic unit-tested via tick()
         if _HAS_COM:
@@ -179,6 +204,7 @@ class AudioAutoSwitch:
             try:
                 self.tick(was_on)
                 was_on = find_active(self.headset) is not None
+                self._check_low_battery()
             except Exception as e:
                 print(f"  [audio-switch] tick error: {e}", flush=True)
         if _HAS_COM:
