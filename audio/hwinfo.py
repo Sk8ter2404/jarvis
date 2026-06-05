@@ -58,7 +58,10 @@ def _read_raw() -> bytes | None:
             continue
         try:
             head = ctypes.string_at(ptr, _HDR_SIZE)
-            if head[0:4] != b"SiWH":
+            # HWiNFO dwSignature == 0x53695748; in little-endian memory those
+            # bytes read as b"HWiS" (NOT b"SiWH", the big-endian / C multi-char
+            # constant rendering, which never appears in the actual mapping).
+            if struct.unpack_from("<I", head, 0)[0] != 0x53695748:
                 continue
             _, _, _, _, _s_off, _s_sz, _s_n, r_off, r_sz, r_n = _HDR.unpack(head)
             total = r_off + r_sz * r_n
@@ -77,7 +80,7 @@ def _read_raw() -> bytes | None:
 def parse_readings(raw: bytes) -> list[tuple[str, float, str]]:
     """[(label, value, unit)] for each reading in a HWiNFO SM2 block. Pure —
     unit-testable against a synthesised block."""
-    if not raw or len(raw) < _HDR_SIZE or raw[0:4] != b"SiWH":
+    if not raw or len(raw) < _HDR_SIZE or struct.unpack_from("<I", raw, 0)[0] != 0x53695748:
         return []
     _, _, _, _, _s_off, _s_sz, _s_n, r_off, r_sz, r_n = _HDR.unpack(raw[:_HDR_SIZE])
     out = []
