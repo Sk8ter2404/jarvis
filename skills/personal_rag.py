@@ -263,6 +263,20 @@ def rag_open_top(_: str = "") -> str:
 
 
 # ── registration / autostart ─────────────────────────────────────────
+def _rag_enabled() -> bool:
+    """Master RAG switch from core.config.RAG_ENABLED (Settings GUI /
+    user_settings.json), defaulting to True when config can't be imported. When
+    False the skill registers its actions but never indexes / loads the embed
+    model, so it costs $0 and 0 VRAM — which is what the Settings VRAM-budget
+    bar predicts when the RAG toggle is off."""
+    try:
+        _ensure_core_on_path()
+        from core import config as _cfg
+        return bool(getattr(_cfg, "RAG_ENABLED", True))
+    except Exception:
+        return True
+
+
 def register(actions: dict) -> None:
     actions["rag_search"]        = rag_search
     actions["rag_search_quiet"]  = rag_search_quiet
@@ -271,6 +285,11 @@ def register(actions: dict) -> None:
     actions["rag_status"]        = rag_status
     actions["rag_configure"]     = rag_configure
     actions["rag_open_top"]      = rag_open_top
+
+    if not _rag_enabled():
+        print("  [personal-rag] disabled (RAG_ENABLED=False) — actions "
+              "registered, indexing/embeddings off (0 VRAM).")
+        return  # master switch off — no autostart, no embed-model load
 
     rag = _rag()
     if rag is None:

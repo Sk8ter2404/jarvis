@@ -249,7 +249,20 @@ SCHEMA: dict[str, dict] = {
     "LOCAL_VISION_FALLBACK": {
         "tab": "ai", "label": "Local vision fallback", "type": "bool",
         "default": True,
-        "help": "Retry vision on the local VLM when the cloud call fails.",
+        "help": "Retry vision on the local VLM when the cloud call fails. "
+                "Loads the ~7.3 GB VLM on-demand — see the VRAM budget above.",
+    },
+    "RAG_ENABLED": {
+        "tab": "ai", "label": "Personal RAG (document memory)", "type": "bool",
+        "default": True,
+        "help": "Index your documents for recall (local nomic-embed-text, "
+                "~0.3 GB VRAM). Counts toward the VRAM budget above.",
+    },
+    "KINECT_ENABLED": {
+        "tab": "ai", "label": "Kinect sensor (presence / gestures)",
+        "type": "bool", "default": False,
+        "help": "Use the Kinect v2 for presence, gestures and pointing. "
+                "Runs on CPU/USB — no extra VRAM.",
     },
     "ENABLE_ORCHESTRATOR": {
         "tab": "ai", "label": "Sub-agent orchestrator", "type": "bool",
@@ -614,6 +627,55 @@ def integration_status(spec: dict) -> tuple[bool, str]:
     return (present, "present" if present else "not set")
 
 
+# ──────────────────────────────────────────────────────────────────────────
+#  VRAM budget bridge  (import-safe: the engine is stdlib-only and never
+#  raises; the heavy work lives in core/vram_budget.py)
+# ──────────────────────────────────────────────────────────────────────────
+# Keys whose LIVE value feeds the VRAM budget — changing any of these re-runs
+# the prediction in the GUI. ``MODEL_ROUTING::vision`` is the flattened Tk var
+# name the routing combobox uses (see the routing widget + _collect()).
+VRAM_WATCH_KEYS = (
+    "LOCAL_LLM_MODEL",
+    "MODEL_ROUTING::vision",
+    "LOCAL_VISION_FALLBACK",
+    "SCREEN_VISION_ENABLED",
+    "RAG_ENABLED",
+    "KINECT_ENABLED",
+)
+
+
+def _load_vram_budget():
+    """Import core.vram_budget lazily, returning the module or None.
+
+    Kept out of module import so the test surface / a bare runner never needs
+    it, and so a missing/broken engine simply hides the budget panel rather than
+    breaking the whole Settings window."""
+    try:
+        from core import vram_budget  # lazy: GUI-only dependency
+        return vram_budget
+    except Exception:
+        return None
+
+
+def budget_from_live_values(values: dict, total_mb=None) -> dict | None:
+    """Run the VRAM prediction from a flat dict of CURRENT widget values.
+
+    This is the value→budget function the live GUI callback calls (and the one
+    the tests exercise — no Tk/pixels involved). ``values`` is the raw widget
+    state: ``LOCAL_LLM_MODEL`` (tag string), the bool toggles, and the
+    flattened ``MODEL_ROUTING::vision`` route. Bools may arrive as real bools or
+    as strings/ints (Tk ``StringVar``), which the engine coerces. Returns the
+    predict_budget() dict, or None when the engine is unavailable. Never raises."""
+    vb = _load_vram_budget()
+    if vb is None:
+        return None
+    settings = dict(values) if isinstance(values, dict) else {}
+    try:
+        return vb.predict_budget(settings, total_mb=total_mb)
+    except Exception:
+        return None
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     """Parse CLI args. `--tab <name>` selects the starting tab."""
     parser = argparse.ArgumentParser(
@@ -700,6 +762,149 @@ def run_gui(start_tab: int = 0) -> int:
     vars_by_key: dict = {}
     text_widgets: dict = {}
 
+    # VRAM budget panel — widgets populated when the AI tab is built; the engine
+    # is loaded lazily and may be absent (no nvidia-smi / import error), in which
+    # case the panel shows a muted note and never blocks the window.
+    vram = _load_vram_budget()
+    vram_widgets: dict = {}
+    # Total card VRAM, probed ONCE here so the live recompute doesn't shell out
+    # to nvidia-smi on every keystroke. Falls back to the 24 GB default inside
+    # the engine when the probe fails.
+    vram_total_mb = None
+    if vram is not None:
+        try:
+            vram_total_mb = vram.total_vram_mb()
+        except Exception:
+            vram_total_mb = None
+
+    def _vram_color(pct: float, over: bool) -> str:
+        """Bar colour by load: green <80%, amber 80–100%, red >100% (over)."""
+        if over or pct > 100.0:
+            return "#f85149"   # red
+        if pct >= 80.0:
+            return "#d29922"   # amber
+        return "#3fb950"       # green
+
+    def _live_vram_values() -> dict:
+        """Snapshot the CURRENT widget values the budget depends on, as a flat
+        dict for budget_from_live_values(). Reads the live Tk vars so the bar
+        reflects unsaved edits. Falls back to the loaded ``settings`` value for
+        any var not yet built (e.g. its tab isn't constructed)."""
+        out: dict = {}
+        for key in VRAM_WATCH_KEYS:
+            var = vars_by_key.get(key)
+            if var is not None:
+                try:
+                    out[key] = var.get()
+                    continue
+                except Exception:
+                    pass
+            # Fall back to the on-disk/default value (handle the routing subkey).
+            if "::" in key:
+                base, fn = key.split("::", 1)
+                cur = settings.get(base)
+                if isinstance(cur, dict):
+                    out[key] = cur.get(fn)
+            elif key in settings:
+                out[key] = settings.get(key)
+        return out
+
+    def update_budget(*_a) -> None:
+        """Recompute the prediction from live widget values and repaint the bar,
+        numeric readout, per-component breakdown and over-budget warning. Bound
+        to every VRAM_WATCH_KEYS var so any change updates it instantly. Never
+        raises — a failure just leaves the last drawn state."""
+        if not vram_widgets:
+            return
+        try:
+            b = budget_from_live_values(_live_vram_values(), total_mb=vram_total_mb)
+            if b is None:
+                return
+            pct = b["pct"]
+            color = _vram_color(pct, b["over"])
+            # Bar: redraw the filled rectangle to the clamped fraction.
+            canvas = vram_widgets.get("canvas")
+            if canvas is not None:
+                cw = max(1, int(canvas.winfo_width() or 0))
+                if cw <= 1:
+                    cw = 560  # not yet laid out — use the nominal width
+                frac = 0.0
+                if b["budget_mb"] > 0:
+                    frac = min(1.0, b["total_mb"] / b["budget_mb"])
+                canvas.coords(vram_widgets["bar_fill"], 0, 0, int(cw * frac), 18)
+                canvas.itemconfigure(vram_widgets["bar_fill"], fill=color)
+            # Numeric "20.6 / 24 GB peak (137%)".
+            used = b["total_mb"] / 1024.0
+            cap = b["total_card_mb"] / 1024.0
+            vram_widgets["num"].configure(
+                text=f"{used:.1f} / {cap:.0f} GB peak  ({pct:.0f}%)",
+                fg=color)
+            # Per-component breakdown: "32B 22 · vision 7.3 (on-demand) · …".
+            parts = []
+            for c in b["components"]:
+                gb = c["mb"] / 1024.0
+                gb_s = f"{int(round(gb))}" if abs(gb - round(gb)) < 0.05 else f"{gb:.1f}"
+                tag = " (on-demand)" if c.get("ondemand") else ""
+                parts.append(f"{c['label']} {gb_s}{tag}")
+            vram_widgets["parts"].configure(text=" · ".join(parts))
+            # Warning row — shown only when over budget.
+            warn = vram_widgets.get("warn")
+            if warn is not None:
+                if b["over"]:
+                    warn.configure(text=vram.over_warning(b))
+                    warn.grid()
+                else:
+                    warn.configure(text="")
+                    warn.grid_remove()
+        except Exception:
+            pass
+
+    def _build_vram_panel(parent, row: int) -> int:
+        """Build the 'GPU / VRAM budget' panel into ``parent`` at grid ``row``;
+        returns the next free row. When the engine is unavailable, drops a single
+        muted note instead so the rest of the tab still renders."""
+        head = ttk.Label(parent, text="GPU / VRAM budget", style="Head.TLabel")
+        head.grid(row=row, column=0, columnspan=2, sticky="w", padx=2,
+                  pady=(2, 2))
+        row += 1
+        if vram is None:
+            ttk.Label(parent,
+                      text="(VRAM estimate unavailable — core.vram_budget "
+                           "could not load.)",
+                      style="Help.TLabel", wraplength=560).grid(
+                row=row, column=0, columnspan=2, sticky="w", padx=2, pady=(0, 6))
+            return row + 1
+        # The bar — a thin Canvas with a background track + a coloured fill rect.
+        bar = tk.Canvas(parent, height=18, bg=FIELD_BG, highlightthickness=1,
+                        highlightbackground="#30363d", bd=0)
+        bar.grid(row=row, column=0, columnspan=2, sticky="we", padx=2, pady=(0, 2))
+        fill = bar.create_rectangle(0, 0, 0, 18, fill="#3fb950", width=0)
+        vram_widgets["canvas"] = bar
+        vram_widgets["bar_fill"] = fill
+        # Redraw the fill when the bar is first laid out / resized.
+        bar.bind("<Configure>", update_budget)
+        row += 1
+        # Numeric readout + per-component breakdown.
+        num = tk.Label(parent, text="", bg=BG, fg=FG, font=FONT, anchor="w")
+        num.grid(row=row, column=0, columnspan=2, sticky="w", padx=2, pady=(0, 0))
+        vram_widgets["num"] = num
+        row += 1
+        parts = tk.Label(parent, text="", bg=BG, fg=MUTED, font=FONT_SMALL,
+                         anchor="w", justify="left", wraplength=560)
+        parts.grid(row=row, column=0, columnspan=2, sticky="w", padx=2,
+                   pady=(0, 2))
+        vram_widgets["parts"] = parts
+        row += 1
+        # Over-budget warning (hidden until `over`).
+        warn = tk.Label(parent, text="", bg=BG, fg="#f85149", font=FONT_SMALL,
+                        anchor="w", justify="left", wraplength=560)
+        warn.grid(row=row, column=0, columnspan=2, sticky="w", padx=2,
+                  pady=(0, 6))
+        warn.grid_remove()
+        vram_widgets["warn"] = warn
+        row += 1
+        return row
+
     def _add_help(parent, spec, row):
         help_text = spec.get("help")
         if help_text:
@@ -729,6 +934,10 @@ def run_gui(start_tab: int = 0) -> int:
 
         row = 0
         inner.columnconfigure(1, weight=1)
+        # The VRAM budget panel lives at the top of the AI tab, beside the
+        # model dropdown — like a game's graphics-settings estimator.
+        if tab_key == "ai":
+            row = _build_vram_panel(inner, row)
         for key, spec in SCHEMA.items():
             if spec.get("tab") != tab_key:
                 continue
@@ -848,6 +1057,25 @@ def run_gui(start_tab: int = 0) -> int:
 
     for tab_key in TAB_ORDER:
         _build_tab(tab_key)
+
+    # Live recompute: every VRAM-budget input re-runs the prediction the moment
+    # it changes — exactly like a game's graphics menu updating its estimate as
+    # you toggle settings. Bound here (after ALL tabs are built) so vars from
+    # other tabs (e.g. SCREEN_VISION_ENABLED on Advanced) are already created.
+    if vram_widgets:
+        for key in VRAM_WATCH_KEYS:
+            var = vars_by_key.get(key)
+            if var is None:
+                continue
+            try:
+                var.trace_add("write", update_budget)
+            except Exception:
+                pass
+        # Draw the initial state (deferred so the bar Canvas has its real width).
+        try:
+            root.after(0, update_budget)
+        except Exception:
+            update_budget()
 
     try:
         notebook.select(start_tab)

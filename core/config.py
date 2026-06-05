@@ -647,8 +647,13 @@ UPDATE_CHECK_ENABLED       = True
 # Watched folders, embed, semantic search. Read by skills/personal_rag.py
 # at autostart. Every knob can be changed at runtime via the
 # rag_configure action ('paths=…', 'embed_model=…', etc).
+# RAG_ENABLED — master switch for the personal-RAG autostart. When False the
+# skill still registers its actions (rag_status etc.) but never indexes or
+# loads the embedding model, so it consumes no VRAM. Exposed in the Settings
+# GUI so the VRAM-budget bar can account for the ~0.3 GB nomic-embed-text load.
 # RAG_EMBED_MODEL — Ollama embedding model. 'nomic-embed-text' runs on
 # the 3090 at 200+ docs/sec.
+RAG_ENABLED         = True
 RAG_INDEX_PATHS = [
     os.path.join(os.path.expanduser("~"), "Documents"),
     os.path.join(os.path.expanduser("~"), "Desktop"),
