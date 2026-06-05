@@ -2960,6 +2960,20 @@ class AppleMusicTitleParseTests(MonolithGlobalsTestCase):
                 "‎Billie Jean — Michael Jackson"),
             "Billie Jean — Michael Jackson")
 
+    def test_track_and_album_detail_page_titles_rejected(self):
+        # Regression (2026-06-04, live): the iTunes-resolved play path lands on
+        # a track/album DETAIL page whose title is "<Song> - Song by <Artist> -
+        # Apple Music" — a PAGE title, not a now-playing track. verify_first
+        # must not treat it as one and skip the real play step.
+        for raw in (
+            "Billie Jean - Song by Michael Jackson - Apple Music",
+            "Billie Jean - Song by Michael Jackson - Apple Music - Google Chrome",
+            "Thriller by Michael Jackson - Apple Music",
+        ):
+            self.assertIsNone(
+                self.bc._parse_apple_music_track_title(raw),
+                f"should reject detail-page title: {raw!r}")
+
     def test_empty_and_too_short(self):
         self.assertIsNone(self.bc._parse_apple_music_track_title(""))
         self.assertIsNone(self.bc._parse_apple_music_track_title("a"))
@@ -3007,6 +3021,53 @@ class AppleMusicTitleNowPlayingTests(MonolithGlobalsTestCase):
         p.start()
         self.addCleanup(p.stop)
         self.assertIsNone(self.bc._apple_music_title_now_playing())
+
+
+@requires_monolith
+class FindMusicWindowTests(MonolithGlobalsTestCase):
+    """_find_music_window — must prefer the scriptable browser web-player tab
+    over the UWP tray app of the same name. Regression (2026-06-04, live):
+    APPLE_MUSIC_KEEP_OPEN parks an "Apple Music" UWP window in the tray, and
+    the `space` play strategy focused IT instead of the Chrome web player, so
+    Space went nowhere and nothing played."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    # The real Chrome tab title as Windows reports it: a leading U+200E bidi
+    # mark and an NBSP between "Apple" and "Music".
+    WEB_TITLE = "‎Apple\xa0Music - Web Player - Google Chrome"
+
+    def _install_pgw(self, windows):
+        gw = mock.Mock(name="pygetwindow")
+        gw.getAllWindows.return_value = list(windows)
+        p = mock.patch.dict(sys.modules, {"pygetwindow": gw})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_prefers_browser_web_player_over_tray_app(self):
+        tray = _FakeWin("Apple Music")          # UWP keeper app
+        web = _FakeWin(self.WEB_TITLE)
+        # Tray listed FIRST so a naive first-match would wrongly return it.
+        self._install_pgw([tray, web])
+        self.assertIs(self.bc._find_music_window(), web)
+
+    def test_nbsp_titled_web_player_is_matched(self):
+        # The NBSP between Apple and Music must not dodge the "apple music"
+        # hint once the title is normalized.
+        web = _FakeWin(self.WEB_TITLE)
+        self._install_pgw([_FakeWin("Some Editor"), web])
+        self.assertIs(self.bc._find_music_window(), web)
+
+    def test_falls_back_to_tray_app_when_no_browser(self):
+        tray = _FakeWin("Apple Music")
+        self._install_pgw([_FakeWin("Notepad"), tray])
+        self.assertIs(self.bc._find_music_window(), tray)
+
+    def test_none_when_no_music_window(self):
+        self._install_pgw([_FakeWin("Notepad"), _FakeWin("Some Editor")])
+        self.assertIsNone(self.bc._find_music_window())
 
 
 @requires_monolith

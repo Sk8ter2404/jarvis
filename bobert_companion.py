@@ -920,6 +920,16 @@ MUSIC_WINDOW_HINTS = (
     "deezer",
     "youtube",
 )
+# Title markers that identify a SCRIPTABLE browser web-player tab (Apple Music
+# / Spotify / YouTube Music running in Chrome/Edge/etc.) as opposed to a native
+# desktop app of the same name. When both exist — e.g. the Chrome Apple Music
+# web player AND the UWP Apple Music app that APPLE_MUSIC_KEEP_OPEN parks in the
+# tray — the `space` play strategy must focus the BROWSER tab; pressing Space on
+# the tray app plays nothing. See _find_music_window's ranking.
+_MUSIC_BROWSER_MARKERS = (
+    "web player", "google chrome", "chromium", "microsoft edge",
+    " - edge", " — edge", "mozilla firefox", "brave", "opera",
+)
 # How long (seconds) a recent JARVIS music action suppresses ambient-music
 # standby. 30 min is long enough that an ordinary playlist won't trip it; any
 # music transcribed after this window is treated as 'external' (radio, phone
@@ -8694,6 +8704,19 @@ _STREAMING_SERVICES = {
             "text label. If no such large detail-page Play/Shuffle button "
             "is clearly visible, return that no target was found."
         ),
+        # Used on the iTunes-resolved track page: the album opens with the
+        # requested song's row HIGHLIGHTED (tinted a different colour) via the
+        # ?i= anchor. Clicking that row's play control starts the SPECIFIC song
+        # — the large album Play button would start the album at track 1.
+        "track_play_hint":  (
+            "the single BRIGHT RED highlighted row in the album song list — "
+            "one row is filled solid red / a bold accent colour while every "
+            "other row is dark. That red row is the requested song. Return a "
+            "point in the MIDDLE of that red row (on the song title text), not "
+            "the tiny icons. Do NOT pick the large album Play button near the "
+            "artwork at the top, the sidebar, or any dark (non-red) row. If no "
+            "row is clearly red-highlighted, return that no target was found."
+        ),
         "fullscreen_key":   "f",
         "fullscreen_wait":  2.5,
         # Strict mode: after pressing Enter (or clicking play), verify
@@ -8701,6 +8724,11 @@ _STREAMING_SERVICES = {
         # didn't. Apple Music's detail pages occasionally swallow the
         # first action (especially on a fresh page-load) and JARVIS used
         # to silently leave the user staring at a paused album page.
+        # Resolve the query to an exact track via the iTunes Search API and
+        # open that track's detail page instead of the unreliable search page
+        # (see _apple_music_resolve_track). The detail page has the single
+        # large Play button play_button targets.
+        "resolve_itunes":   True,
         "verify_play":      True,
         "verify_first":     True,   # check before any play attempt — Enter on a song row may already be playing
         "verify_attempts":  3,
@@ -8719,7 +8747,11 @@ _STREAMING_SERVICES = {
         #                    page Play button if Space didn't take (e.g. an
         #                    album tile opened a detail page that ate focus).
         #   3. space       — final retry in case the page just settled.
-        "play_strategies":  ["space", "play_button", "space"],
+        # play_button first: the resolved iTunes track page reliably has the
+        # one large detail-page Play button. On the search-page fallback that
+        # button is absent, so the strategy is a no-op there and advances to
+        # SPACE — no harm. SPACE stays as the deterministic backup.
+        "play_strategies":  ["play_button", "space", "play_button"],
         "verify_question": (
             "Is music ACTIVELY playing right now on this Apple Music page? "
             "Answer YES only if at least one of these is clearly visible: "
@@ -8799,14 +8831,17 @@ def _vision_answer_is_yes(answer: str) -> bool:
 
 
 def _streaming_find_with_retry(
-    hint: str, attempts: int = 3, wait_between: float = 2.0
+    hint: str, attempts: int = 3, wait_between: float = 2.0,
+    monitor: str | None = None,
 ) -> tuple[int, int] | None:
     """Wrap find_click_target with retries — Apple Music's detail pages can
     finish painting after our initial load_wait elapsed, so a single miss
-    shouldn't mean we bail to 'click it yourself'. Returns None only if
-    every attempt fails."""
+    shouldn't mean we bail to 'click it yourself'. `monitor` pins the capture
+    to one display (see _monitor_name_for_window) so vision isn't fed a
+    downscaled 4-monitor screenshot. Returns None only if every attempt
+    fails."""
     for i in range(attempts):
-        coords = find_click_target(hint)
+        coords = find_click_target(hint, monitor=monitor)
         if coords is not None:
             return coords
         if i < attempts - 1:
@@ -8924,6 +8959,15 @@ def _parse_apple_music_track_title(raw: str) -> str | None:
     # is not a track.
     if low in _MUSIC_IDLE_TITLE_TOKENS or len(t) < 3:
         return None
+    # The literal site name only ever appears in PAGE titles ("Apple Music -
+    # Web Player", "Billie Jean - Song by Michael Jackson - Apple Music"), never
+    # in a now-playing title, which the web player renders as a bare
+    # "<Song> — <Artist>". So any title still carrying "apple music" / "itunes"
+    # is a page/idle title, not a playing track. This is the catch-all that
+    # stops verify_first from skipping the real play step on a freshly-loaded
+    # track/album detail page (regression found live 2026-06-04).
+    if "apple music" in low or "itunes" in low:
+        return None
     # Require a Song/Artist separator. Apple Music uses an em dash "—";
     # tolerate en dash and the plain " - " hyphen form too.
     has_sep = (" — " in t) or (" – " in t) or (" - " in t)
@@ -9011,9 +9055,24 @@ def _streaming_apply_play_strategy(
     (e.g. double_click_result with no remembered result coords); the
     caller should advance to the next strategy without verifying.
     UIFailsafeError propagates — caller surfaces it to the user."""
+    vm = cfg.get("vision_monitor")
+    if strategy == "highlighted_row":
+        # iTunes-resolved track page: click the play control on the song's
+        # highlighted row so the SPECIFIC track plays (not the album from
+        # track 1). Falls through to the next strategy if vision can't see it.
+        hint = cfg.get("track_play_hint") or cfg.get("play_hint")
+        row_coords = _streaming_find_with_retry(
+            hint, attempts=2, wait_between=1.5, monitor=vm
+        )
+        if row_coords is None:
+            return False, "vision couldn't locate the highlighted track row"
+        # Double-click the row: on the Apple Music web player a single click
+        # only selects a song row, a double-click starts it playing.
+        ui_double_click(row_coords[0], row_coords[1])
+        return True, f"double-clicked highlighted track row at {row_coords}"
     if strategy == "play_button":
         play_coords = _streaming_find_with_retry(
-            cfg["play_hint"], attempts=2, wait_between=1.5
+            cfg["play_hint"], attempts=2, wait_between=1.5, monitor=vm
         )
         if play_coords is None:
             return False, "vision couldn't locate a detail-page play button"
@@ -9220,6 +9279,49 @@ def _streaming_keyboard_select_first_result(
     return True
 
 
+def _apple_music_resolve_track(query: str) -> dict | None:
+    """Resolve a free-text music query to an EXACT Apple Music track via the
+    public iTunes Search API (no auth, no key). Returns
+    {"name", "artist", "track_id", "url"} for the top song match, or None on
+    any failure (network, no results, bad JSON) so the caller falls back to the
+    ordinary search-page flow.
+
+    Why this exists: the modern music.apple.com SEARCH page cannot be driven
+    reliably by keyboard — Tab+Enter lands on a song row's "..." overflow menu
+    and never starts playback (confirmed live, 2026-06-04). Opening the track's
+    own detail page (the API's trackViewUrl) instead lands on a page with the
+    single large Play button the play_button strategy already targets."""
+    q = (query or "").strip()
+    if not q:
+        return None
+    import urllib.request
+    api = ("https://itunes.apple.com/search?term="
+           + urllib.parse.quote(q)
+           + "&entity=song&limit=1&media=music")
+    try:
+        req = urllib.request.Request(api, headers={"User-Agent": "JARVIS/1.0"})
+        with urllib.request.urlopen(req, timeout=6.0) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as e:
+        print(f"  [auto-play] iTunes resolve failed for '{q}': {e}", flush=True)
+        return None
+    results = data.get("results") or []
+    if not results:
+        print(f"  [auto-play] iTunes resolve: no song match for '{q}'", flush=True)
+        return None
+    r = results[0]
+    url, name = r.get("trackViewUrl"), r.get("trackName")
+    if not url or not name:
+        return None
+    url = url.split("&uo=")[0]   # drop the affiliate tracking param
+    return {
+        "name": name,
+        "artist": r.get("artistName") or "",
+        "track_id": r.get("trackId"),
+        "url": url,
+    }
+
+
 def _streaming_auto_play(service_key: str, query: str) -> str:
     """Open a streaming service's search page for `query`, activate the first
     result, then start playback. Services with `verify_play: True` confirm
@@ -9246,35 +9348,77 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
         _open_url_in_browser(cfg["home"])
         return f"opened {service_label}"
 
-    # Step 1: open the search URL in a REAL browser (NOT the default handler).
-    # Critical for Apple Music: the UWP app registered itself for
-    # music.apple.com, so a bare webbrowser.open would launch the app instead
-    # of the web player. _open_url_in_browser forces Chrome/Edge so the
-    # keyboard-SPACE + tab-title pipeline has the actual web player to drive.
-    # Browser focus is needed for the click/keyboard steps to land right.
-    url = cfg["search_url"].format(q=urllib.parse.quote(q))
+    # Step 1: choose the page to open and how to select the result.
+    # For Apple Music, resolve the query to an EXACT track via the public
+    # iTunes Search API and open that track's detail page directly. The modern
+    # music.apple.com SEARCH page can't be driven by keyboard (Tab+Enter hits a
+    # song row's "..." menu, never playing — confirmed live 2026-06-04), but a
+    # track detail page has the single large Play button play_button targets.
+    # Fall back to the search page if resolution fails.
+    resolved = _apple_music_resolve_track(q) if cfg.get("resolve_itunes") else None
+    if resolved:
+        url = resolved["url"]
+        q = (f"{resolved['name']} by {resolved['artist']}"
+             if resolved["artist"] else resolved["name"])
+        select_method = "none"          # already on the track page; nothing to pick
+        # The track page opens with the requested song's row highlighted.
+        # Double-clicking that row starts the SPECIFIC track playing. SPACE is
+        # a play/pause TOGGLE — using it as a retry PAUSES a track the
+        # double-click already started (a toggle-war seen live 2026-06-04), so
+        # the ONLY retry is another double-click (re-triggering the same row
+        # keeps it playing). Longer verify_wait covers the player's buffering.
+        cfg = {
+            **cfg,
+            "play_strategies": ["highlighted_row", "highlighted_row"],
+            "verify_wait": 4.0,
+        }
+        print(f"  [auto-play] resolved track via iTunes API -> {q}", flush=True)
+    else:
+        url = cfg["search_url"].format(q=urllib.parse.quote(q))
+        select_method = cfg.get("select_method", "vision")
+
+    # Open the chosen URL in a REAL browser (NOT the default handler). Critical
+    # for Apple Music: the UWP app registered itself for music.apple.com, so a
+    # bare webbrowser.open would launch the app instead of the web player.
+    # _open_url_in_browser forces Chrome/Edge so the SPACE / play-button +
+    # tab-title pipeline has the actual web player to drive.
     opened_via = _open_url_in_browser(url)
     print(
-        f"  [auto-play] opened {service_label} search for '{q}' "
-        f"(via {opened_via})",
+        f"  [auto-play] opened {service_label} "
+        f"{'track page' if resolved else 'search'} for '{q}' (via {opened_via})",
         flush=True,
     )
     time.sleep(cfg["load_wait"])
 
-    strict = bool(cfg.get("verify_play"))
-    select_method = cfg.get("select_method", "vision")
+    # For the resolved Apple Music track page, bring the player window forward
+    # and pin vision-capture to the single monitor it occupies — otherwise
+    # find_click_target photographs the whole 4-monitor virtual screen and the
+    # player downscales too small to find the play controls (confirmed live).
+    if resolved:
+        if _focus_music_window():
+            time.sleep(0.2)
+        _mw = _find_music_window()
+        _mon = _monitor_name_for_window(_mw) if _mw else None
+        if _mon:
+            cfg["vision_monitor"] = _mon
+            print(f"  [auto-play] pinning vision to monitor '{_mon}'", flush=True)
 
-    # Capability gate. Services that select the result by KEYBOARD and
-    # confirm playback by TAB TITLE (Apple Music) need only UI automation —
-    # they never call vision on the happy path, so requiring vision here
-    # would wrongly block reliable keyboard playback when SCREEN_VISION is
-    # off. Vision-based services still require the full vision + Claude set.
-    keyboard_only = (select_method == "keyboard" and bool(cfg.get("title_confirm")))
-    if keyboard_only:
+    strict = bool(cfg.get("verify_play"))
+
+    # Capability gate. The KEYBOARD (Apple Music search) and resolved
+    # track-page ("none") paths drive playback with UI automation plus
+    # tab-title / vision confirmation, so they need UI automation but not
+    # vision on the happy path — requiring vision here would wrongly block
+    # them when SCREEN_VISION is off. Vision-click services still need the
+    # full vision + Claude set.
+    ui_only = (
+        bool(cfg.get("title_confirm")) and select_method in ("keyboard", "none")
+    )
+    if ui_only:
         if not UI_AUTOMATION_ENABLED:
             return (
-                f"opened {service_label} search for '{q}' — auto-play needs "
-                f"UI automation (keyboard control) to start playback"
+                f"opened {service_label} for '{q}' — auto-play needs UI "
+                f"automation (keyboard control) to start playback"
             )
     elif not (SCREEN_VISION_ENABLED and UI_AUTOMATION_ENABLED and AI_BACKEND == "claude"):
         return (
@@ -9282,14 +9426,22 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
             f"SCREEN_VISION_ENABLED + UI_AUTOMATION_ENABLED + Claude backend"
         )
 
-    # Step 2: activate the first result. Two paths:
+    # Step 2: activate the first result. Three paths:
+    #   none     — already on the resolved track's detail page (iTunes API);
+    #              nothing to select, fall straight through to the play step.
     #   keyboard — Tab past the page chrome and press Enter. No coords are
     #              produced (so double_click_result fallback is unavailable),
     #              but the existing verify-and-retry loop catches misses by
     #              trying play_button / space strategies next.
     #   vision   — original behaviour: find_click_target → ui_click.
     coords: tuple[int, int] | None = None
-    if select_method == "keyboard":
+    if select_method == "none":
+        print(
+            f"  [auto-play] on {service_label} track page — no result pick "
+            f"needed, going straight to play",
+            flush=True,
+        )
+    elif select_method == "keyboard":
         try:
             sent = _streaming_keyboard_select_first_result(cfg, service_label)
         except UIFailsafeError as e:
@@ -10178,21 +10330,41 @@ def _find_windows_by_title(query: str) -> list:
 def _find_music_window():
     """Return the highest-priority open window likely to host a music session.
 
-    Scans every visible window title for one of MUSIC_WINDOW_HINTS and returns
-    the first match in priority order, or None. Used by the media-key actions
-    so the keypress lands on the right window (Chrome won't honor VK_MEDIA_*
-    on a background tab).
+    Scans every visible window title for one of MUSIC_WINDOW_HINTS. When more
+    than one window matches (e.g. the Chrome Apple Music web player AND the UWP
+    Apple Music app that APPLE_MUSIC_KEEP_OPEN keeps in the tray) the BROWSER
+    web-player window wins — that's the one the keyboard `space` play strategy
+    can actually drive; Space on the tray app plays nothing, and Chrome won't
+    honor VK_MEDIA_* on a background tab either.
+
+    Titles are normalized (bidi/zero-width marks stripped, NBSP folded to a
+    space) before matching, because Apple Music's real tab title is
+    "<U+200E>Apple<NBSP>Music - Web Player - Google Chrome" — the NBSP between
+    "Apple" and "Music" would otherwise dodge the "apple music" substring and
+    hand the match to the bare UWP app instead.
     """
     try:
         import pygetwindow as gw
     except ImportError:
         return None
-    titles = [(w, (w.title or "").lower()) for w in gw.getAllWindows() if w.title]
-    for hint in MUSIC_WINDOW_HINTS:
-        for w, t in titles:
+    try:
+        windows = gw.getAllWindows()
+    except Exception:
+        return None
+    best = None
+    best_rank = None  # (hint_priority_index, 0 if browser else 1) — lower wins
+    for w in windows:
+        t = _strip_bidi_and_nbsp(w.title or "").lower()
+        if not t:
+            continue
+        for hi, hint in enumerate(MUSIC_WINDOW_HINTS):
             if hint in t:
-                return w
-    return None
+                is_browser = any(m in t for m in _MUSIC_BROWSER_MARKERS)
+                rank = (hi, 0 if is_browser else 1)
+                if best_rank is None or rank < best_rank:
+                    best_rank, best = rank, w
+                break  # first matching hint sets this window's priority
+    return best
 
 
 def _focus_music_window() -> str | None:
@@ -10218,6 +10390,34 @@ def _focus_music_window() -> str | None:
             return target.title
         except Exception:
             return None
+
+
+def _monitor_name_for_window(win) -> str | None:
+    """Return the MONITORS key whose rect contains the window's center, or None.
+
+    Used to pin streaming vision-capture to the single display the player lives
+    on. find_click_target's default (monitor=None) photographs the WHOLE
+    multi-monitor virtual screen and downscales it to ~1568px — on a 4-monitor
+    rig that shrinks the player window so small that vision can't resolve the
+    play controls (a track-row play triangle becomes a few pixels). Passing the
+    window's own monitor crops the capture to that display at full resolution."""
+    try:
+        cx = win.left + win.width / 2
+        cy = win.top + win.height / 2
+    except Exception:
+        return None
+    try:
+        items = list(MONITORS.items())
+    except Exception:
+        return None
+    for name, rect in items:
+        try:
+            mx, my, mw, mh = rect
+        except Exception:
+            continue
+        if mx <= cx < mx + mw and my <= cy < my + mh:
+            return name
+    return None
 
 
 def _flash_window_reticle(win, label: str = "focus"):
