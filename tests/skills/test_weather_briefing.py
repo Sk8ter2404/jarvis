@@ -347,7 +347,8 @@ class WeatherBriefingTests(unittest.TestCase):
 
     def test_action_handles_exception(self):
         mod, actions = load_skill_isolated("weather_briefing")
-        with mock.patch.object(mod, "get_umbrella_alert", side_effect=RuntimeError("boom")):
+        with mock.patch.object(mod, "_current_conditions_line", return_value=""), \
+             mock.patch.object(mod, "get_umbrella_alert", side_effect=RuntimeError("boom")):
             out = actions["weather_briefing"]("")
         self.assertIn("failed", out.lower())
 
@@ -1033,7 +1034,12 @@ class RegisterTests(unittest.TestCase):
         with mock.patch.object(self.mod, "_read_config",
                                return_value=self._cfg(enabled=False)):
             self.mod.register(actions)
-        with mock.patch.object(self.mod, "get_umbrella_alert", return_value="brolly time"):
+        # Mock current-conditions to '' so the action returns the alert alone
+        # and the test is deterministic (it otherwise hits the network and was
+        # network-flaky: passed locally when the fetch failed, FAILED on CI
+        # where it succeeded — the v1.37.0 CI breakage).
+        with mock.patch.object(self.mod, "_current_conditions_line", return_value=""), \
+             mock.patch.object(self.mod, "get_umbrella_alert", return_value="brolly time"):
             self.assertEqual(actions["weather_briefing"](""), "brolly time")
 
 
