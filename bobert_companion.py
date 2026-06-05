@@ -639,7 +639,7 @@ NEWS_BRIEFING_ENABLED         = True
 NEWS_BRIEFING_FEEDS           = [
     {"name": "technology", "url": "https://feeds.bbci.co.uk/news/technology/rss.xml"},
     {"name": "world",      "url": "https://feeds.bbci.co.uk/news/world/rss.xml"},
-    {"name": "weather",    "url": "https://alerts.weather.gov/cap/us.atom"},
+    {"name": "science",    "url": "https://feeds.bbci.co.uk/news/science_and_environment/rss.xml"},
 ]
 NEWS_BRIEFING_HEADLINE_COUNT  = 3     # total headlines across all feeds
 NEWS_BRIEFING_TIMEOUT         = 6.0   # per-feed HTTP timeout (seconds)

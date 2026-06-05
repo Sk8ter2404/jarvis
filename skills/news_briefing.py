@@ -60,7 +60,7 @@ from core.atomic_io import _atomic_write_json  # noqa: E402
 _DEFAULT_FEEDS: list[dict] = [
     {"name": "technology", "url": "https://feeds.bbci.co.uk/news/technology/rss.xml"},
     {"name": "world",      "url": "https://feeds.bbci.co.uk/news/world/rss.xml"},
-    {"name": "weather",    "url": "https://alerts.weather.gov/cap/us.atom"},
+    {"name": "science",    "url": "https://feeds.bbci.co.uk/news/science_and_environment/rss.xml"},
 ]
 
 _DEFAULT_HEADLINE_COUNT  = 3
