@@ -79,18 +79,35 @@ def _ensure_data_dir() -> None:
 
 
 def _atomic_write_json(path: str, payload: dict) -> bool:
-    """Write `payload` to `path` via tmp+replace. Returns True on success."""
+    """Write `payload` to `path` atomically. Returns True on success.
+
+    Uses a UNIQUE per-call temp (mkstemp), NOT a fixed `path + ".tmp"`: during a
+    blue/green upgrade the prod and staging JARVIS instances both heartbeat-write
+    instances.json concurrently (plus the smoke driver), and a shared temp name
+    lets one writer truncate another's half-written temp -> a 0-byte/garbled
+    instances.json that breaks role resolution. fsync for durability."""
+    import tempfile
+    d = os.path.dirname(path) or "."
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.makedirs(d, exist_ok=True)
     except OSError:
         pass
-    tmp = path + ".tmp"
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=d)
+    except OSError:
+        return False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
         return True
     except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
         return False
 
 
