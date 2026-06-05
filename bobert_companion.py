@@ -9086,6 +9086,12 @@ def _streaming_apply_play_strategy(
     caller should advance to the next strategy without verifying.
     UIFailsafeError propagates — caller surfaces it to the user."""
     vm = cfg.get("vision_monitor")
+    if strategy == "recheck":
+        # Do NOTHING but let the caller wait + re-verify. Used between two
+        # destructive play actions so a track that started but is still
+        # buffering (vision said "not playing" too early) gets a second look
+        # WITHOUT a re-click that would restart it (the play_music flicker).
+        return True, "waiting for the player to settle, then re-checking"
     if strategy == "highlighted_row":
         # iTunes-resolved track page: click the play control on the song's
         # highlighted row so the SPECIFIC track plays (not the album from
@@ -9399,7 +9405,10 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
         # keeps it playing). Longer verify_wait covers the player's buffering.
         cfg = {
             **cfg,
-            "play_strategies": ["highlighted_row", "highlighted_row"],
+            # double-click -> wait+recheck (no re-click, so a buffering track
+            # confirms without restarting) -> double-click again only if still
+            # silent. Kills the "song restarts 2-3x" flicker.
+            "play_strategies": ["highlighted_row", "recheck", "highlighted_row"],
             "verify_wait": 4.0,
         }
         print(f"  [auto-play] resolved track via iTunes API -> {q}", flush=True)
