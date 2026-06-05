@@ -9016,6 +9016,36 @@ def _apple_music_title_now_playing() -> str | None:
     return None
 
 
+def _apple_music_loaded_track_from_title() -> str | None:
+    """Report the track LOADED in the Apple Music WEB player by parsing its tab
+    PAGE title. The modern web player never sets a bare "<Song> — <Artist>"
+    title — it stays "<Song> - Song by <Artist> - Apple Music" whether playing
+    or paused. _apple_music_title_now_playing rejects that (a page title is not
+    proof of PLAYBACK), but the now_playing action still wants to SAY what's
+    loaded, so this parses the page-title forms. Returns "<Song> by <Artist>"
+    or None. Reports the LOADED/current track, NOT a play/pause state."""
+    try:
+        import pygetwindow as gw
+        windows = gw.getAllWindows()
+    except Exception:
+        return None
+    pats = (
+        # "<Song> - Song by <Artist> - Apple Music"  /  "... - Music Video by ..."
+        re.compile(r"^(.*?)\s+-\s+(?:song|music video)\s+by\s+(.*?)\s+-\s+apple music$", re.I),
+        # "<Album> by <Artist> - Apple Music"
+        re.compile(r"^(.*?)\s+by\s+(.*?)\s+-\s+apple music$", re.I),
+    )
+    for w in windows:
+        raw = _clean_browser_title((getattr(w, "title", "") or "").strip())
+        if "apple music" not in raw.lower():
+            continue
+        for pat in pats:
+            m = pat.match(raw)
+            if m and m.group(1).strip() and m.group(2).strip():
+                return f"{m.group(1).strip()} by {m.group(2).strip()}"
+    return None
+
+
 def _streaming_title_confirms_playback(cfg: dict) -> tuple[bool, str]:
     """Deterministic playback check via the browser window title. Returns
     (is_playing, detail). Only meaningful for services whose tab title

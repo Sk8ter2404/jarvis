@@ -591,6 +591,17 @@ def _act_now_playing(_: str = "") -> str:
             track = None
         if track:
             return f"Apple Music: {track}"
+        # The modern web player keeps a PAGE title ("<Song> - Song by <Artist>
+        # - Apple Music") even while playing, which the strict confirm parser
+        # rejects. Fall back to parsing that page title so we can still name
+        # the loaded/current track instead of claiming nothing is playing.
+        loaded = None
+        try:
+            loaded = bc._apple_music_loaded_track_from_title()
+        except Exception:
+            loaded = None
+        if loaded:
+            return f"Apple Music: {loaded}"
         return ("Apple Music is the active player, sir, but nothing seems to "
                 "be playing right now — start a song and I'll read it back.")
     # 3) The app is running but its title gave us nothing useful.

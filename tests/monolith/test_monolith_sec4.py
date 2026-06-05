@@ -3007,6 +3007,20 @@ class AppleMusicTitleNowPlayingTests(MonolithGlobalsTestCase):
         self._install_pgw([_FakeWin("Apple Music"), _FakeWin("New Tab - Google Chrome")])
         self.assertIsNone(self.bc._apple_music_title_now_playing())
 
+    def test_loaded_track_from_page_title(self):
+        # now_playing reporter: the web player's PAGE title names the loaded
+        # track even though the strict confirm parser rejects it (2026-06-04).
+        self._install_pgw([
+            _FakeWin("Some Editor"),
+            _FakeWin("Billie Jean - Song by Michael Jackson - Apple Music - Google Chrome"),
+        ])
+        self.assertEqual(self.bc._apple_music_loaded_track_from_title(),
+                         "Billie Jean by Michael Jackson")
+
+    def test_loaded_track_none_without_apple_music_tab(self):
+        self._install_pgw([_FakeWin("Some Editor"), _FakeWin("New Tab - Google Chrome")])
+        self.assertIsNone(self.bc._apple_music_loaded_track_from_title())
+
     def test_pygetwindow_absent_returns_none(self):
         # Simulate import failure.
         p = mock.patch.dict(sys.modules, {"pygetwindow": None})
