@@ -61,6 +61,9 @@ try:
     _HAS_PYQT6 = True
 except ImportError:
     _HAS_PYQT6 = False
+    class _QtMissing:  # stub: subclassable + callable so module-scope Qt refs (incl. the unguarded QColor(...) constants below) don't NameError without PyQt6; main() exits 2 before any real use
+        def __init__(self, *a, **k): pass
+    Qt = QTimer = QRectF = QPointF = QPainter = QColor = QPen = QBrush = QFont = QPainterPath = QRadialGradient = QLinearGradient = QApplication = QWidget = QGraphicsView = QGraphicsScene = QGraphicsDropShadowEffect = _QtMissing
 
 
 # ──────────────────────────────────────────────────────────────────────────

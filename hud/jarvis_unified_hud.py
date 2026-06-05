@@ -69,6 +69,9 @@ try:
     _HAS_PYQT6 = True
 except ImportError:
     _HAS_PYQT6 = False
+    class _QtMissing:  # stub: subclassable + callable so module-scope Qt refs don't NameError without PyQt6; main() exits 2 before any real use
+        def __init__(self, *a, **k): pass
+    Qt = QTimer = QRectF = QPointF = QPoint = QPainter = QColor = QPen = QBrush = QFont = QRadialGradient = QLinearGradient = QPainterPath = QApplication = QWidget = QSizeGrip = QPushButton = _QtMissing
 
 
 TICK_MS = 500                 # cheap data refresh + repaint cadence
