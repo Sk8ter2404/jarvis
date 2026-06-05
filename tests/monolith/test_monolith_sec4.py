@@ -1450,13 +1450,17 @@ class StreamingAutoPlayTests(MonolithGlobalsTestCase):
         self.assertIn("unknown streaming service", out)
 
     def test_empty_query_opens_home(self):
-        with mock.patch.object(self.bc.webbrowser, "open") as opn:
+        # Empty query opens the homepage — now via the force-a-real-browser
+        # helper (NOT bare webbrowser.open, which the UWP app can intercept).
+        with mock.patch.object(self.bc, "_open_url_in_browser",
+                               return_value="chrome") as opn:
             out = self.bc._streaming_auto_play("netflix", "   ")
         self.assertEqual(out, "opened Netflix")
         opn.assert_called_once_with(self.bc._STREAMING_SERVICES["netflix"]["home"])
 
     def test_capabilities_missing_returns_open_only(self):
-        with mock.patch.object(self.bc.webbrowser, "open"), \
+        with mock.patch.object(self.bc, "_open_url_in_browser",
+                               return_value="chrome"), \
              mock.patch.object(self.bc.time, "sleep"), \
              mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", False):
             out = self.bc._streaming_auto_play("netflix", "the matrix")
@@ -1465,7 +1469,8 @@ class StreamingAutoPlayTests(MonolithGlobalsTestCase):
     def test_youtube_no_play_hint_path(self):
         # YouTube has play_hint=None → after clicking the result it just
         # full-screens and reports playing.
-        with mock.patch.object(self.bc.webbrowser, "open"), \
+        with mock.patch.object(self.bc, "_open_url_in_browser",
+                               return_value="chrome"), \
              mock.patch.object(self.bc.time, "sleep"), \
              mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
              mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
@@ -1478,7 +1483,8 @@ class StreamingAutoPlayTests(MonolithGlobalsTestCase):
         fs.assert_called_once()
 
     def test_result_not_seen_returns_hint(self):
-        with mock.patch.object(self.bc.webbrowser, "open"), \
+        with mock.patch.object(self.bc, "_open_url_in_browser",
+                               return_value="chrome"), \
              mock.patch.object(self.bc.time, "sleep"), \
              mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
              mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
@@ -1489,7 +1495,8 @@ class StreamingAutoPlayTests(MonolithGlobalsTestCase):
 
     def test_default_play_click_path(self):
         # Netflix: vision select + separate play button, no verify.
-        with mock.patch.object(self.bc.webbrowser, "open"), \
+        with mock.patch.object(self.bc, "_open_url_in_browser",
+                               return_value="chrome"), \
              mock.patch.object(self.bc.time, "sleep"), \
              mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
              mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
@@ -1510,14 +1517,16 @@ class AppleMusicPlayPlaylistTests(MonolithGlobalsTestCase):
         cls.bc = load_monolith()
 
     def test_capabilities_missing(self):
-        with mock.patch.object(self.bc.webbrowser, "open"), \
+        with mock.patch.object(self.bc, "_open_url_in_browser",
+                               return_value="chrome"), \
              mock.patch.object(self.bc.time, "sleep"), \
              mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", False):
             out = self.bc._apple_music_play_playlist("chill")
         self.assertIn("auto-click needs", out)
 
     def test_playlist_not_found_after_sidebar_fallback(self):
-        with mock.patch.object(self.bc.webbrowser, "open"), \
+        with mock.patch.object(self.bc, "_open_url_in_browser",
+                               return_value="chrome"), \
              mock.patch.object(self.bc.time, "sleep"), \
              mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
              mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
@@ -1528,7 +1537,8 @@ class AppleMusicPlayPlaylistTests(MonolithGlobalsTestCase):
         self.assertIn("couldn't find a playlist named 'chill'", out)
 
     def test_playlist_found_delegates_to_play_and_verify(self):
-        with mock.patch.object(self.bc.webbrowser, "open"), \
+        with mock.patch.object(self.bc, "_open_url_in_browser",
+                               return_value="chrome"), \
              mock.patch.object(self.bc.time, "sleep"), \
              mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
              mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
@@ -3110,7 +3120,9 @@ class AppleMusicAutoPlayNoVisionTests(MonolithGlobalsTestCase):
 
     def test_plays_without_vision_via_title(self):
         bc = self.bc
-        with mock.patch.object(bc.webbrowser, "open"), \
+        with mock.patch.object(bc, "_open_url_in_browser",
+                               return_value="chrome") as oub, \
+             mock.patch.object(bc.webbrowser, "open") as wbo, \
              mock.patch.object(bc.time, "sleep"), \
              mock.patch.object(bc, "SCREEN_VISION_ENABLED", False), \
              mock.patch.object(bc, "UI_AUTOMATION_ENABLED", True), \
@@ -3126,6 +3138,11 @@ class AppleMusicAutoPlayNoVisionTests(MonolithGlobalsTestCase):
                                return_value="Billie Jean — Michael Jackson"):
             out = bc._streaming_auto_play("apple_music", "Michael Jackson")
         self.assertEqual(out, "playing 'Michael Jackson' on Apple Music")
+        # The search URL must be opened through the force-a-real-browser
+        # helper, NOT the default handler (which is the UWP app on this box).
+        oub.assert_called_once()
+        self.assertIn("music.apple.com", oub.call_args.args[0])
+        wbo.assert_not_called()
         ts.assert_not_called()           # no vision screenshot
         fct.assert_not_called()          # no vision click-target search
 
@@ -3141,7 +3158,8 @@ class AppleMusicAutoPlayNoVisionTests(MonolithGlobalsTestCase):
             except StopIteration:
                 return "Africa — Toto"
 
-        with mock.patch.object(bc.webbrowser, "open"), \
+        with mock.patch.object(bc, "_open_url_in_browser",
+                               return_value="chrome"), \
              mock.patch.object(bc.time, "sleep"), \
              mock.patch.object(bc, "SCREEN_VISION_ENABLED", False), \
              mock.patch.object(bc, "UI_AUTOMATION_ENABLED", True), \
@@ -3160,12 +3178,220 @@ class AppleMusicAutoPlayNoVisionTests(MonolithGlobalsTestCase):
     def test_no_ui_automation_degrades_clearly(self):
         # The honest message replaces the old silent vision-timeout.
         bc = self.bc
-        with mock.patch.object(bc.webbrowser, "open"), \
+        with mock.patch.object(bc, "_open_url_in_browser",
+                               return_value="chrome"), \
              mock.patch.object(bc.time, "sleep"), \
              mock.patch.object(bc, "UI_AUTOMATION_ENABLED", False):
             out = bc._streaming_auto_play("apple_music", "Thriller")
         self.assertIn("UI automation", out)
         self.assertIn("Thriller", out)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  Force-a-real-browser opener (fix/apple-music-force-chrome)
+# ─────────────────────────────────────────────────────────────────────────
+#
+# The UWP Apple Music app registered itself as the handler for
+# music.apple.com, so a bare webbrowser.open launches the APP, not a browser.
+# _open_url_in_browser forces Chrome (then Edge) so the real WEB PLAYER loads.
+# Every external boundary (webbrowser, subprocess.Popen, the App-Paths
+# registry, os.path.exists, shutil.which) is mocked — no real browser ever
+# launches.
+@requires_monolith
+class OpenUrlInBrowserTests(MonolithGlobalsTestCase):
+    """_open_url_in_browser prefers Chrome via webbrowser.get, then chrome.exe,
+    then Edge, then the default handler — and NEVER raises."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_prefers_webbrowser_get_chrome(self):
+        bc = self.bc
+        fake_browser = mock.Mock()
+        fake_browser.open.return_value = True
+        with mock.patch.object(bc.webbrowser, "get",
+                               return_value=fake_browser) as wbget, \
+             mock.patch.object(bc.subprocess, "Popen") as popen, \
+             mock.patch.object(bc.webbrowser, "open") as wbopen:
+            via = bc._open_url_in_browser("https://music.apple.com/us/search?term=x")
+        self.assertEqual(via, "chrome:webbrowser")
+        wbget.assert_called_once_with("chrome")
+        fake_browser.open.assert_called_once()
+        popen.assert_not_called()        # didn't need to shell out
+        wbopen.assert_not_called()       # didn't fall back to default handler
+
+    def test_falls_back_to_chrome_exe_path(self):
+        bc = self.bc
+        # webbrowser.get("chrome") raises (no registered controller) → locate
+        # chrome.exe and Popen it.
+        with mock.patch.object(bc.webbrowser, "get",
+                               side_effect=KeyError("chrome")), \
+             mock.patch.object(bc, "_find_chrome",
+                               return_value=r"C:\chrome.exe"), \
+             mock.patch.object(bc.subprocess, "Popen") as popen, \
+             mock.patch.object(bc.webbrowser, "open") as wbopen:
+            via = bc._open_url_in_browser("https://music.apple.com/x")
+        self.assertEqual(via, "chrome")
+        popen.assert_called_once()
+        # --new-window + the URL are passed to chrome.exe.
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[0], r"C:\chrome.exe")
+        self.assertIn("--new-window", argv)
+        self.assertIn("https://music.apple.com/x", argv)
+        wbopen.assert_not_called()
+
+    def test_falls_back_to_edge_when_no_chrome(self):
+        bc = self.bc
+        with mock.patch.object(bc.webbrowser, "get",
+                               side_effect=KeyError("chrome")), \
+             mock.patch.object(bc, "_find_chrome", return_value=None), \
+             mock.patch.object(bc, "_find_edge",
+                               return_value=r"C:\msedge.exe"), \
+             mock.patch.object(bc.subprocess, "Popen") as popen, \
+             mock.patch.object(bc.webbrowser, "open") as wbopen:
+            via = bc._open_url_in_browser("https://music.apple.com/x")
+        self.assertEqual(via, "edge")
+        self.assertEqual(popen.call_args.args[0][0], r"C:\msedge.exe")
+        wbopen.assert_not_called()
+
+    def test_last_resort_default_handler(self):
+        bc = self.bc
+        with mock.patch.object(bc.webbrowser, "get",
+                               side_effect=KeyError("chrome")), \
+             mock.patch.object(bc, "_find_chrome", return_value=None), \
+             mock.patch.object(bc, "_find_edge", return_value=None), \
+             mock.patch.object(bc.webbrowser, "open",
+                               return_value=True) as wbopen:
+            via = bc._open_url_in_browser("https://music.apple.com/x")
+        self.assertEqual(via, "default")
+        wbopen.assert_called_once_with("https://music.apple.com/x")
+
+    def test_prepends_https_scheme(self):
+        bc = self.bc
+        with mock.patch.object(bc.webbrowser, "get",
+                               side_effect=KeyError("chrome")), \
+             mock.patch.object(bc, "_find_chrome",
+                               return_value=r"C:\chrome.exe"), \
+             mock.patch.object(bc.subprocess, "Popen") as popen:
+            bc._open_url_in_browser("music.apple.com/x")
+        self.assertIn("https://music.apple.com/x", popen.call_args.args[0])
+
+    def test_never_raises_when_everything_fails(self):
+        bc = self.bc
+        # Popen blows up AND the default handler blows up — still returns,
+        # never propagates.
+        with mock.patch.object(bc.webbrowser, "get",
+                               side_effect=KeyError("chrome")), \
+             mock.patch.object(bc, "_find_chrome",
+                               return_value=r"C:\chrome.exe"), \
+             mock.patch.object(bc.subprocess, "Popen",
+                               side_effect=OSError("spawn failed")), \
+             mock.patch.object(bc, "_find_edge", return_value=None), \
+             mock.patch.object(bc.webbrowser, "open",
+                               side_effect=RuntimeError("no handler")):
+            via = bc._open_url_in_browser("https://music.apple.com/x")
+        self.assertEqual(via, "default")   # reached the last branch, no raise
+
+
+@requires_monolith
+class BrowserExeLocatorTests(MonolithGlobalsTestCase):
+    """_exe_from_app_paths / _find_chrome / _find_edge — registry-first
+    executable resolution with on-disk + PATH fallbacks."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_app_paths_registry_hit(self):
+        bc = self.bc
+        fake_winreg = mock.MagicMock()
+        fake_winreg.HKEY_CURRENT_USER = 1
+        fake_winreg.HKEY_LOCAL_MACHINE = 2
+        ctx = mock.MagicMock()
+        fake_winreg.OpenKey.return_value.__enter__.return_value = ctx
+        fake_winreg.QueryValueEx.return_value = (r"C:\reg\chrome.exe", 1)
+        with mock.patch.dict(sys.modules, {"winreg": fake_winreg}), \
+             mock.patch.object(bc.os.path, "exists", return_value=True):
+            got = bc._exe_from_app_paths("chrome.exe")
+        self.assertEqual(got, r"C:\reg\chrome.exe")
+
+    def test_app_paths_absent_returns_none(self):
+        bc = self.bc
+        fake_winreg = mock.MagicMock()
+        fake_winreg.HKEY_CURRENT_USER = 1
+        fake_winreg.HKEY_LOCAL_MACHINE = 2
+        fake_winreg.OpenKey.side_effect = FileNotFoundError("no key")
+        with mock.patch.dict(sys.modules, {"winreg": fake_winreg}):
+            self.assertIsNone(bc._exe_from_app_paths("chrome.exe"))
+
+    def test_find_chrome_uses_registry_first(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_exe_from_app_paths",
+                               return_value=r"C:\reg\chrome.exe") as eap:
+            self.assertEqual(bc._find_chrome(), r"C:\reg\chrome.exe")
+        eap.assert_called_once_with("chrome.exe")
+
+    def test_find_chrome_falls_back_to_known_path(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_exe_from_app_paths", return_value=None), \
+             mock.patch.object(bc.os.path, "exists",
+                               side_effect=lambda p: p == bc._CHROME_PATHS[0]), \
+             mock.patch.object(bc.shutil, "which", return_value=None):
+            self.assertEqual(bc._find_chrome(), bc._CHROME_PATHS[0])
+
+    def test_find_chrome_falls_back_to_path_which(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_exe_from_app_paths", return_value=None), \
+             mock.patch.object(bc.os.path, "exists", return_value=False), \
+             mock.patch.object(bc.shutil, "which",
+                               return_value=r"C:\path\chrome.exe"):
+            self.assertEqual(bc._find_chrome(), r"C:\path\chrome.exe")
+
+    def test_find_edge_resolves_msedge(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_exe_from_app_paths",
+                               return_value=r"C:\reg\msedge.exe") as eap:
+            self.assertEqual(bc._find_edge(), r"C:\reg\msedge.exe")
+        eap.assert_called_once_with("msedge.exe")
+
+
+@requires_monolith
+class MusicWindowRecognisesChromeWebPlayerTests(MonolithGlobalsTestCase):
+    """_find_music_window / _focus_music_window must recognise the Chrome
+    window whose tab title carries 'Apple Music' (the forced web player) so the
+    SPACE play keypress lands on the right window."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def _install_pgw(self, windows):
+        gw = mock.Mock(name="pygetwindow")
+        gw.getAllWindows.return_value = list(windows)
+        p = mock.patch.dict(sys.modules, {"pygetwindow": gw})
+        p.start()
+        self.addCleanup(p.stop)
+        return gw
+
+    def test_finds_chrome_apple_music_tab(self):
+        bc = self.bc
+        self._install_pgw([
+            _FakeWin("Visual Studio Code"),
+            _FakeWin("Michael Jackson - Apple Music - Google Chrome"),
+        ])
+        win = bc._find_music_window()
+        self.assertIsNotNone(win)
+        self.assertIn("Apple Music", win.title)
+
+    def test_focus_returns_chrome_apple_music_title(self):
+        bc = self.bc
+        target = _FakeWin("Search - Apple Music - Google Chrome")
+        target.activate = mock.Mock()
+        self._install_pgw([_FakeWin("Some Other Window"), target])
+        title = bc._focus_music_window()
+        self.assertEqual(title, "Search - Apple Music - Google Chrome")
+        target.activate.assert_called_once()
 
 
 if __name__ == "__main__":
