@@ -198,8 +198,11 @@ def _enqueue_speech(message: str) -> None:
             with open(queue_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         data.append({"ts": time.time(), "message": message})
-        with open(queue_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        # Atomic write (mkstemp+fsync+os.replace) so a concurrent reader never
+        # catches a half-written queue and deletes it as corrupt — matches the
+        # canonical proactive_announce / bambu_monitor writers.
+        from core.atomic_io import _atomic_write_json
+        _atomic_write_json(queue_path, data)
     except Exception as e:
         print(f"  [bambu_announcer] speech-queue write failed ({e}); "
               f"alert: {message}")

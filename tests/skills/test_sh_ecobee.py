@@ -198,16 +198,14 @@ class EcobeeIOTests(_EcobeeBase):
     def test_save_tokens_writes_three_fields(self):
         svc = types.SimpleNamespace(access_token="at", refresh_token="rt",
                                     authorization_token="auth")
-        written = io.StringIO()
-        m = mock.mock_open()
-        m.return_value.write.side_effect = written.write
-        with mock.patch("builtins.open", m):
+        captured = {}
+        def _cap(path, data, **kw):
+            captured["data"] = data
+        with mock.patch("core.atomic_io._atomic_write_json", side_effect=_cap):
             self.mod._save_tokens(svc)
-        import json
-        payload = json.loads(written.getvalue())
-        self.assertEqual(payload["access_token"], "at")
-        self.assertEqual(payload["refresh_token"], "rt")
-        self.assertEqual(payload["authorization_token"], "auth")
+        self.assertEqual(captured["data"]["access_token"], "at")
+        self.assertEqual(captured["data"]["refresh_token"], "rt")
+        self.assertEqual(captured["data"]["authorization_token"], "auth")
 
     def test_save_tokens_swallows_errors(self):
         svc = types.SimpleNamespace(access_token="at", refresh_token="rt",

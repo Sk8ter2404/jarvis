@@ -448,7 +448,7 @@ class AnnouncerHelperTests(AnnouncerLoadMixin, unittest.TestCase):
         fake._enqueue_speech = mock.MagicMock(side_effect=RuntimeError("x"))
         import contextlib
         import io
-        with mock.patch("builtins.open", side_effect=OSError("disk")), \
+        with mock.patch("core.atomic_io._atomic_write_json", side_effect=OSError("disk")), \
              mock.patch.object(mod.os.path, "exists", return_value=False):
             with contextlib.redirect_stdout(io.StringIO()) as buf:
                 mod._enqueue_speech("doomed")
