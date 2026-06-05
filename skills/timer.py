@@ -21,6 +21,7 @@ import re
 import sys
 import threading
 import time
+from datetime import datetime, timedelta
 
 _PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SPEECH_QUEUE = os.path.join(_PROJECT_DIR, "pending_speech.json")
@@ -95,6 +96,36 @@ def _word_to_num(tok: str) -> float | None:
         return _WORD_NUMBERS.get(tok)
 
 
+def _parse_clock_time(text: str) -> int | None:
+    """If `text` names an absolute CLOCK time ('8 pm', '7:30 am', '20:00'),
+    return seconds from now until the next occurrence of it (today, or tomorrow
+    if it has already passed). Else None.
+
+    Without this, 'remind me at 8 pm' fell through to the bare-number rule and
+    set an 8-MINUTE timer (the 'pm' was ignored) — a silent wrong result."""
+    t = (text or "").strip().lower()
+    hour = minute = None
+    m = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?\b", t)
+    if m:
+        hour = int(m.group(1)) % 12
+        if m.group(3) == "p":
+            hour += 12
+        minute = int(m.group(2) or 0)
+    else:
+        # 24-hour "20:00" / "07:30" — require the colon so a bare "8" isn't read
+        # as a time (that stays a duration).
+        m2 = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", t)
+        if m2:
+            hour, minute = int(m2.group(1)), int(m2.group(2))
+    if hour is None or not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    now = datetime.fromtimestamp(time.time())
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return int((target - now).total_seconds())
+
+
 def _parse_duration(text: str) -> int | None:
     """Parse a free-text duration → total seconds, or None if unparseable.
 
@@ -109,6 +140,13 @@ def _parse_duration(text: str) -> int | None:
     text = (text or "").strip().lower()
     if not text:
         return None
+
+    # An absolute clock time ('8 pm', '7:30 am', '20:00') wins over the
+    # duration rules below — otherwise '8 pm' loses its 'pm' and becomes an
+    # 8-MINUTE timer.
+    clock = _parse_clock_time(text)
+    if clock is not None:
+        return clock
 
     total = 0.0
     found = False

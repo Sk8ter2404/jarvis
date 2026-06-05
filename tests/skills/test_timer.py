@@ -57,6 +57,25 @@ class TimerSkillTests(unittest.TestCase):
         self.assertEqual(p("5"), 300)               # bare number → minutes
         self.assertEqual(p("set a timer for 5"), 300)  # 'for' noise stripped
 
+    def test_parse_duration_clock_times(self):
+        # Regression (2026-06-05, live): "set a reminder for 8 pm" fell through
+        # to the bare-number rule and became an 8-MINUTE timer (the 'pm' was
+        # dropped). A clock time must instead schedule for that ABSOLUTE time
+        # (seconds until it, today or tomorrow), never 8 minutes. Asserted as
+        # ranges (not exact) so it's timezone-independent across dev/CI.
+        p = self.mod._parse_duration
+        for clock in ("8 pm", "set a reminder for 8 pm to call mom",
+                      "remind me at 7:30 am", "at 20:00", "12 pm"):
+            r = p(clock)
+            self.assertIsNotNone(r, f"clock time should parse: {clock!r}")
+            self.assertGreater(r, 0)
+            self.assertLessEqual(r, 86400)               # within a day
+            self.assertNotEqual(r, 8 * 60, f"{clock!r} must not be an 8-min timer")
+        # Durations and bare numbers are UNAFFECTED (no am/pm, no HH:MM colon).
+        self.assertEqual(p("8"), 480)                    # bare 8 -> 8 minutes
+        self.assertEqual(p("5 minutes"), 300)
+        self.assertEqual(p("90 secs"), 90)
+
     def test_parse_duration_invalid(self):
         self.assertIsNone(self.mod._parse_duration("soon"))
         self.assertIsNone(self.mod._parse_duration(""))
