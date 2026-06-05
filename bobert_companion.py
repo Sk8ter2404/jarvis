@@ -9467,6 +9467,12 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
             "play_strategies": ["highlighted_row", "recheck", "recheck", "highlighted_row"],
             "verify_attempts": 4,
             "verify_wait": 3.5,
+            # We just opened a FRESH track page (the reuse-one-tab close+open),
+            # so it is NEVER already playing — disable the pre-play check. Its
+            # vision can false-positive ("already playing") on the big Play
+            # button + highlighted row and then SKIP the real play, leaving
+            # nothing playing (seen live 2026-06-04).
+            "verify_first": False,
         }
         print(f"  [auto-play] resolved track via iTunes API -> {q}", flush=True)
     else:
