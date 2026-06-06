@@ -107,6 +107,24 @@ class HwinfoSummaryTests(unittest.TestCase):
         self.assertEqual(s["cpu_temp_c"], 50.0)
         self.assertEqual(len(s["temps_c"]), 1)
 
+    def test_summary_fahrenheit_units_converted_to_celsius(self):
+        # If HWiNFO is set to display Fahrenheit globally, temps arrive as
+        # "F"/"°F"/"FAH" — they must still register as temps AND be converted to
+        # Celsius on ingest (c = (f - 32) / 1.8), keeping cpu/gpu_temp_c
+        # Celsius-canonical. Regression: F units used to drop ALL temps silently.
+        raw = _block(
+            _reading("CPU Package", 140.0, "°F"),      # -> 60.0 C
+            _reading("GPU Temperature", 122.0, "F"),   # -> 50.0 C
+            _reading("CPU CCD1 (Tdie)", 149.0, "FAH"), # -> 65.0 C
+        )
+        with mock.patch.object(hwinfo, "_read_raw", return_value=raw):
+            s = hwinfo.summary()
+        self.assertEqual(len(s["temps_c"]), 3)
+        self.assertAlmostEqual(s["cpu_temp_c"], 60.0)   # Package preferred, F->C
+        self.assertAlmostEqual(s["gpu_temp_c"], 50.0)
+        # All temps_c values are Celsius, not the raw Fahrenheit readings.
+        self.assertNotIn(140.0, [v for _, v in s["temps_c"]])
+
     def test_summary_ghz_clock_normalised_to_mhz(self):
         raw = _block(_reading("CPU Clock", 5.2, "GHz"))
         with mock.patch.object(hwinfo, "_read_raw", return_value=raw):
