@@ -61,6 +61,89 @@ class ApplyUserSettingsTests(unittest.TestCase):
              mock.patch("core.config.open", m, create=True):
             cfg._apply_user_settings()  # must not raise
 
+    def test_microphone_index_lives_in_config(self):
+        # The mic picker's blocker fix: MICROPHONE_INDEX (and the preferred-list)
+        # must be core/config.py constants so _apply_user_settings can override
+        # them. Before the move they were redeclared in bobert_companion.py AFTER
+        # `from core.config import *`, silently shadowing any saved value.
+        for k in ("MICROPHONE_INDEX", "SPEAKER_INDEX",
+                  "PREFERRED_INPUT_DEVICES", "PREFERRED_OUTPUT_DEVICES"):
+            self.assertTrue(hasattr(cfg, k), msg=f"{k} missing from core.config")
+        self.assertIsNone(cfg.MICROPHONE_INDEX)  # default = auto / preferred lookup
+
+    def _apply(self, fake: dict) -> None:
+        m = mock.mock_open(read_data=json.dumps(fake))
+        with mock.patch("core.config.os.path.exists", return_value=True), \
+             mock.patch("core.config.open", m, create=True):
+            cfg._apply_user_settings()
+
+    def test_microphone_index_int_round_trips(self):
+        # An int index written by the GUI must reach the runtime constant. This
+        # is the exact path that was broken: a None default carries no type, so
+        # the old coercion ladder skipped it and the saved value was dropped.
+        orig = cfg.MICROPHONE_INDEX
+        try:
+            cfg.MICROPHONE_INDEX = None
+            self._apply({"MICROPHONE_INDEX": 3})
+            self.assertEqual(cfg.MICROPHONE_INDEX, 3)
+        finally:
+            cfg.MICROPHONE_INDEX = orig
+
+    def test_microphone_index_numeric_string_coerces_to_int(self):
+        orig = cfg.MICROPHONE_INDEX
+        try:
+            cfg.MICROPHONE_INDEX = None
+            self._apply({"MICROPHONE_INDEX": "5"})
+            self.assertEqual(cfg.MICROPHONE_INDEX, 5)
+            self.assertIsInstance(cfg.MICROPHONE_INDEX, int)
+        finally:
+            cfg.MICROPHONE_INDEX = orig
+
+    def test_microphone_index_negative_hard_off_round_trips(self):
+        # A negative index is the "no mic / hard-off" contract the monolith
+        # honours (bobert_companion._mic_input_disabled). It must survive the
+        # override path so the GUI's "Off (no mic)" choice actually takes effect.
+        orig = cfg.MICROPHONE_INDEX
+        try:
+            cfg.MICROPHONE_INDEX = None
+            self._apply({"MICROPHONE_INDEX": -1})
+            self.assertEqual(cfg.MICROPHONE_INDEX, -1)
+        finally:
+            cfg.MICROPHONE_INDEX = orig
+
+    def test_microphone_index_null_and_blank_stay_none(self):
+        # null / "" => auto (None). The GUI persists null for "System default".
+        # At the real apply point the constant is its None default, so a null
+        # override must leave it None (not raise, not become some int).
+        orig = cfg.MICROPHONE_INDEX
+        try:
+            for val in (None, ""):
+                cfg.MICROPHONE_INDEX = None      # the real default at apply time
+                self._apply({"MICROPHONE_INDEX": val})
+                self.assertIsNone(cfg.MICROPHONE_INDEX,
+                                  msg=f"{val!r} should keep None (auto)")
+        finally:
+            cfg.MICROPHONE_INDEX = orig
+
+    def test_microphone_index_garbage_keeps_none_default(self):
+        # A non-numeric value must not raise and must leave the None default
+        # intact (never crashes the import on a hand-edited settings file).
+        orig = cfg.MICROPHONE_INDEX
+        try:
+            cfg.MICROPHONE_INDEX = None
+            self._apply({"MICROPHONE_INDEX": "not-a-number"})
+            self.assertIsNone(cfg.MICROPHONE_INDEX)
+        finally:
+            cfg.MICROPHONE_INDEX = orig
+
+    def test_preferred_input_devices_list_override(self):
+        orig = list(cfg.PREFERRED_INPUT_DEVICES)
+        try:
+            self._apply({"PREFERRED_INPUT_DEVICES": ["Yeti", "Realtek"]})
+            self.assertEqual(cfg.PREFERRED_INPUT_DEVICES, ["Yeti", "Realtek"])
+        finally:
+            cfg.PREFERRED_INPUT_DEVICES = orig
+
     def test_legacy_ambient_listening_key_aliases_to_new_name(self):
         # v1.20.0 renamed AMBIENT_LISTENING_ENABLED -> AMBIENT_LISTEN_ENABLED.
         # A saved user_settings.json carrying the OLD key must still flip the

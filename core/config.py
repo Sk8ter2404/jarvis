@@ -429,8 +429,8 @@ MIC_SILENT_WARN_SECONDS = 30.0
 # the robot should aim its eyes (0.0–1.0) when this camera is the only
 # one that can see your face. Ignored for primary.
 CAMERAS = [
-    {"index": 1, "label": "Left webcam (left monitor)",          "primary": False, "look_x": 0.15, "look_y": 0.5},
-    {"index": 0, "label": "Right webcam (top of right monitor)", "primary": True,  "look_x": 0.85, "look_y": 0.5},
+    {"index": 1, "label": "Left webcam (left monitor)",          "primary": True,  "look_x": 0.5,  "look_y": 0.5},
+    {"index": 0, "label": "Right webcam (top of right monitor)", "primary": False, "look_x": 0.85, "look_y": 0.5},
 ]
 
 # Camera probe — if CAMERAS fails to open, sweep indices 0..MAX-1 and
@@ -628,6 +628,31 @@ AUDIO_AUTOSWITCH_FALLBACK = os.getenv("JARVIS_AUDIO_FALLBACK", "")   # e.g. "Rea
 AUDIO_AUTOSWITCH_POLL_S   = float(os.getenv("JARVIS_AUDIO_POLL_S", "3.0"))
 
 
+# ─── Mic / speaker device selection (bobert_companion _refresh_devices) ─
+# These live HERE (not in bobert_companion.py) so the Settings GUI mic-device
+# picker -> data/user_settings.json -> _apply_user_settings() override path
+# reaches them; bobert_companion.py consumes them via `from core.config import *`.
+# Moved out of the monolith 2026-06 to fix the blocker where a written
+# MICROPHONE_INDEX never reached the runtime (it was redeclared in the monolith
+# AFTER the wildcard import, so the override was silently shadowed).
+#
+# PREFERRED_*_DEVICES — ordered lists of device-name substrings. Bobert picks
+# the first connected match and auto-switches as devices come/go. Seeded from
+# the JARVIS_PREFERRED_INPUT_DEVICES / _OUTPUT_DEVICES env vars (comma-separated
+# substrings); empty default => use whatever the OS reports as default.
+PREFERRED_INPUT_DEVICES  = [s.strip() for s in os.getenv("JARVIS_PREFERRED_INPUT_DEVICES", "").split(",") if s.strip()]
+PREFERRED_OUTPUT_DEVICES = [s.strip() for s in os.getenv("JARVIS_PREFERRED_OUTPUT_DEVICES", "").split(",") if s.strip()]
+
+# Manual overrides — set to an integer index to FORCE a specific device and
+# disable auto-switching. None = use the PREFERRED_*_DEVICES lookup above. A
+# NEGATIVE MICROPHONE_INDEX is the "hard-off / no mic" contract (staging green
+# candidate, or the GUI's "Off (no mic)" choice): _mic_input_disabled() reads it
+# so no capture stream is ever opened (it must NOT fall through to the system
+# default mic). The picker persists the int (or null) — see settings_window.py.
+MICROPHONE_INDEX = None
+SPEAKER_INDEX    = None
+
+
 # ─── Bambu H2D 3D printer credentials ──────────────────────────────────
 # Leave blank to disable monitoring. Pull from the printer's touchscreen
 # → LAN Only (IP + access code) and Bambu Handy → Firmware Version (SN).
@@ -800,11 +825,30 @@ def _apply_user_settings() -> None:
         if key.startswith("_") or key not in g:
             continue          # only override an existing public config constant
         cur = g[key]
+        # int|None knobs (current value None or a non-bool int) — e.g.
+        # MICROPHONE_INDEX / SPEAKER_INDEX — accept an explicit null/blank as
+        # "clear to None" (auto / system-default lookup). A None DEFAULT carries
+        # no type for the isinstance ladder below to match, so without this the
+        # saved value would be silently dropped: that was the MICROPHONE_INDEX
+        # picker blocker (an int index written to user_settings.json never
+        # reached the runtime). Numeric values coerce to int (a negative index
+        # is the GUI's "Off (no mic)" hard-off contract); a non-numeric value
+        # (e.g. "abc") raises and is skipped, leaving the default intact.
+        _is_int_or_none = cur is None or (isinstance(cur, int)
+                                          and not isinstance(cur, bool))
         try:
-            if isinstance(cur, bool):
+            if _is_int_or_none:
+                if val is None or (isinstance(val, str) and val.strip() == ""):
+                    # Only the genuinely-nullable knobs (None default) clear to
+                    # None; a real int knob keeps its value rather than becoming
+                    # None on a malformed null write.
+                    if cur is None:
+                        g[key] = None
+                    # else: leave the int knob untouched (no valid override).
+                else:
+                    g[key] = int(val)
+            elif isinstance(cur, bool):
                 g[key] = bool(val)
-            elif isinstance(cur, int) and not isinstance(cur, bool):
-                g[key] = int(val)
             elif isinstance(cur, float):
                 g[key] = float(val)
             elif isinstance(cur, str):

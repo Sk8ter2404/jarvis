@@ -15,6 +15,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 # Load the target module by file path so the test works whether or not
 # `tools` is an importable package on the runner.
@@ -121,6 +122,115 @@ class CoercionTests(unittest.TestCase):
         self.assertNotIn("nope", out2)                            # unknown fn dropped
         self.assertEqual(sw.coerce_value(spec, "garbage"),        # non-dict -> default
                          {"chat": "auto", "vision": "auto", "ambient": "auto"})
+
+
+class DeviceTypeTests(unittest.TestCase):
+    """The 'device' mic-picker type: coercion + label<->index translation."""
+
+    SPEC = {"type": "device", "default": None}
+
+    def test_device_coercion_int_and_numeric_string(self):
+        self.assertEqual(sw.coerce_value(self.SPEC, 3), 3)
+        self.assertEqual(sw.coerce_value(self.SPEC, "5"), 5)
+        self.assertIsInstance(sw.coerce_value(self.SPEC, "5"), int)
+
+    def test_device_coercion_negative_is_preserved(self):
+        # -1 is the GUI's "Off (no mic)" hard-off contract — must survive.
+        self.assertEqual(sw.coerce_value(self.SPEC, -1), -1)
+        self.assertEqual(sw.coerce_value(self.SPEC, "-1"), -1)
+
+    def test_device_coercion_none_and_blank_become_default(self):
+        self.assertIsNone(sw.coerce_value(self.SPEC, None))
+        self.assertIsNone(sw.coerce_value(self.SPEC, ""))
+        self.assertIsNone(sw.coerce_value(self.SPEC, "   "))
+
+    def test_device_coercion_bad_value_falls_back_to_default(self):
+        # Non-numeric string must NOT raise (a hand-edited file can't crash it).
+        self.assertIsNone(sw.coerce_value(self.SPEC, "garbage"))
+        # And a non-None default is honoured on bad input.
+        self.assertEqual(sw.coerce_value({"type": "device", "default": -1},
+                                         "garbage"), -1)
+
+    def test_device_coercion_bool_is_not_an_index(self):
+        # bool is an int subclass; True must not be persisted as index 1.
+        self.assertIsNone(sw.coerce_value(self.SPEC, True))
+
+    def test_mic_choices_always_offer_auto_and_off(self):
+        # With no live devices (mocked empty) the two synthetic choices remain.
+        with mock.patch.object(sw, "list_input_devices", return_value=[]):
+            choices = sw.mic_choices(saved_index=None)
+        labels = [lbl for lbl, _ in choices]
+        self.assertIn(sw.MIC_AUTO_LABEL, labels)
+        self.assertIn(sw.MIC_OFF_LABEL, labels)
+        self.assertEqual(dict((l, i) for l, i in choices)[sw.MIC_AUTO_LABEL],
+                         None)
+        self.assertEqual(dict((l, i) for l, i in choices)[sw.MIC_OFF_LABEL], -1)
+
+    def test_mic_choices_includes_live_devices(self):
+        live = [("[0] Mic A", 0), ("[2] Mic B", 2)]
+        with mock.patch.object(sw, "list_input_devices", return_value=live):
+            choices = sw.mic_choices(saved_index=None)
+        self.assertIn(("[0] Mic A", 0), choices)
+        self.assertIn(("[2] Mic B", 2), choices)
+
+    def test_mic_choices_preserves_saved_but_absent_index(self):
+        # A pinned USB mic that's currently unplugged must stay selectable so
+        # the saved index round-trips (mirrors the combo branch keeping an
+        # unknown Ollama tag visible).
+        live = [("[0] Mic A", 0)]
+        with mock.patch.object(sw, "list_input_devices", return_value=live):
+            choices = sw.mic_choices(saved_index=7)
+        idxs = [i for _, i in choices]
+        self.assertIn(7, idxs)
+
+    def test_mic_choices_does_not_duplicate_present_saved_index(self):
+        live = [("[0] Mic A", 0), ("[2] Mic B", 2)]
+        with mock.patch.object(sw, "list_input_devices", return_value=live):
+            choices = sw.mic_choices(saved_index=2)
+        self.assertEqual([i for _, i in choices].count(2), 1)
+
+    def test_mic_label_index_translation_round_trip(self):
+        live = [("[2] Mic B", 2)]
+        with mock.patch.object(sw, "list_input_devices", return_value=live):
+            choices = sw.mic_choices(saved_index=None)
+        # index -> label -> index for each kind of choice
+        for idx in (None, -1, 2):
+            label = sw.mic_index_to_label(idx, choices)
+            self.assertEqual(sw.mic_label_to_index(label, choices), idx)
+
+    def test_mic_label_to_index_unknown_label_defaults_to_auto(self):
+        choices = [(sw.MIC_AUTO_LABEL, None), (sw.MIC_OFF_LABEL, -1)]
+        self.assertIsNone(sw.mic_label_to_index("nonexistent label", choices))
+
+    def test_list_input_devices_is_import_safe_without_sounddevice(self):
+        # Simulate a runner with no sounddevice: must return [] not raise.
+        import builtins
+        real_import = builtins.__import__
+
+        def fake_import(name, *a, **k):
+            if name == "sounddevice" or name.startswith("sounddevice."):
+                raise ImportError("no sounddevice on this runner")
+            return real_import(name, *a, **k)
+
+        with mock.patch.object(builtins, "__import__", side_effect=fake_import):
+            self.assertEqual(sw.list_input_devices(), [])
+
+    def test_list_input_devices_filters_to_input_capable(self):
+        fake_devices = [
+            {"name": "Speakers", "max_input_channels": 0},
+            {"name": "Yeti", "max_input_channels": 2},
+            {"name": "Webcam Mic", "max_input_channels": 1},
+        ]
+        fake_sd = mock.MagicMock()
+        fake_sd.query_devices.return_value = fake_devices
+        with mock.patch.dict("sys.modules", {"sounddevice": fake_sd}):
+            devices = sw.list_input_devices()
+        self.assertEqual(devices, [("[1] Yeti", 1), ("[2] Webcam Mic", 2)])
+
+    def test_microphone_index_is_a_persisted_device_key(self):
+        self.assertEqual(sw.SCHEMA["MICROPHONE_INDEX"]["type"], "device")
+        self.assertIn("MICROPHONE_INDEX", sw.persisted_keys())
+        self.assertIsNone(sw.default_settings()["MICROPHONE_INDEX"])
 
 
 class RoundTripTests(unittest.TestCase):
@@ -318,6 +428,78 @@ class IntegrationStatusTests(unittest.TestCase):
             present, detail = sw.integration_status(spec)
             self.assertIsInstance(present, bool)
             self.assertIsInstance(detail, str)
+
+
+class ExampleTemplateTests(unittest.TestCase):
+    """The shipped tools/user_settings.example.json must mirror the schema
+    defaults exactly (minus the _README preamble). It had drifted — KINECT_-
+    ENABLED and MODEL_ROUTING (both wired keys) were missing, so anyone copying
+    the template silently lost real settings (B18). This locks the two together
+    so a future schema key can't ship without landing in the template too.
+    """
+
+    def _example(self) -> dict:
+        with open(sw.EXAMPLE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_example_is_valid_json(self):
+        self.assertIsInstance(self._example(), dict)
+
+    def test_example_has_readme_and_no_secrets_shape(self):
+        data = self._example()
+        self.assertIn("_README", data)
+        # No status (_status_*) rows and no secret-bearing keys leak in.
+        for key in data:
+            self.assertFalse(key.startswith("_status_"),
+                             msg=f"{key} status row must not be in the template")
+
+    def test_example_matches_default_settings(self):
+        data = self._example()
+        data.pop("_README", None)
+        self.assertEqual(
+            data, sw.default_settings(),
+            msg="tools/user_settings.example.json is out of sync with the "
+                "schema defaults. Regenerate it from default_settings() "
+                "(keep the _README key).")
+
+    def test_example_contains_the_previously_missing_wired_keys(self):
+        data = self._example()
+        for key in ("KINECT_ENABLED", "MODEL_ROUTING",
+                    "MICROPHONE_INDEX", "PREFERRED_INPUT_DEVICES"):
+            self.assertIn(key, data, msg=f"{key} missing from the template")
+
+
+class DeviceRoundTripTests(unittest.TestCase):
+    """A device index must survive save -> on-disk JSON -> load as the int."""
+
+    def test_microphone_index_persists_as_int(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "user_settings.json")
+            values = sw.default_settings()
+            values["MICROPHONE_INDEX"] = 4
+            sw.save_settings(values, path)
+            with open(path, "r", encoding="utf-8") as f:
+                on_disk = json.load(f)
+            self.assertEqual(on_disk["MICROPHONE_INDEX"], 4)
+            self.assertIsInstance(on_disk["MICROPHONE_INDEX"], int)
+            self.assertEqual(sw.load_settings(path)["MICROPHONE_INDEX"], 4)
+
+    def test_microphone_index_off_persists_negative(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "user_settings.json")
+            values = sw.default_settings()
+            values["MICROPHONE_INDEX"] = sw.MIC_OFF_INDEX  # "Off (no mic)"
+            sw.save_settings(values, path)
+            self.assertEqual(sw.load_settings(path)["MICROPHONE_INDEX"], -1)
+
+    def test_microphone_index_auto_persists_null(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "user_settings.json")
+            values = sw.default_settings()
+            values["MICROPHONE_INDEX"] = None  # "System default (auto)"
+            sw.save_settings(values, path)
+            with open(path, "r", encoding="utf-8") as f:
+                self.assertIsNone(json.load(f)["MICROPHONE_INDEX"])
 
 
 @unittest.skipUnless(_HAS_TK, "tkinter not available on this runner")
