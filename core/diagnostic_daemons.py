@@ -58,6 +58,8 @@ import time
 import traceback
 from typing import Any
 
+from core.atomic_io import _atomic_write_json
+
 # ──────────────────────────── module paths ───────────────────────────
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -230,12 +232,14 @@ def _read_state() -> dict[str, Any]:
 
 
 def _write_state(state: dict[str, Any]) -> None:
+    # Route through the shared atomic writer (unique mkstemp tempfile + fsync +
+    # a WinError-5/PermissionError retry on the final replace). The old fixed
+    # "<state>.json.tmp" name raced across the four daemon threads and fired
+    # live: "[diag-daemons] state write failed: [WinError 5] Access is denied:
+    # ...diagnostic_daemons.json.tmp -> ...json".
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
-        tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
-        os.replace(tmp, STATE_FILE)
+        _atomic_write_json(STATE_FILE, state, indent=2)
     except Exception as e:
         print(f"  [diag-daemons] state write failed: {e}")
 
