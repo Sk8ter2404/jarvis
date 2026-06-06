@@ -543,6 +543,17 @@ FACE_ID_ENABLED = False
 #   best cosine vs an enrolled person is >= this is named, else "unknown").
 #   Raise it to be stricter (fewer false matches), lower it to be more lenient.
 FACE_ID_MATCH_THRESHOLD = 0.363
+# GREET_NEW_PEOPLE_ENABLED — proactive "who are all these new people?" greeting.
+#   When True (and FACE_ID_ENABLED is on so the webcams can actually recognise
+#   faces), the face-tracker poller watches the primary webcam for MULTIPLE
+#   UNRECOGNISED faces (people NOT enrolled in face-ID) held for a few seconds
+#   and, once per gathering, fires ONE short varied proactive line — for when
+#   the owner has friends over. The owner's own enrolled face never counts as
+#   "new". Hard rate-limited (≤ once per ~10 min) and skipped mid-conversation,
+#   exactly like KINECT_GREET_ON_ENTRY. OFF by default: with it off NO extra
+#   recognition runs and behaviour is byte-identical to today. Flip on by voice
+#   ('notice when people arrive' / 'say hi to guests') or here.
+GREET_NEW_PEOPLE_ENABLED = False
 
 
 # ─── Monitor layout ────────────────────────────────────────────────────

@@ -104,6 +104,8 @@ class RegistrationTests(FaceIdSkillBase):
     def test_registers_all_actions(self):
         _mod, actions = self._load(bc=None, engine=None)
         for name in ("enroll_face", "learn_my_face", "remember_my_face",
+                     "learn_guest", "remember_their_face",
+                     "remember_this_person", "learn_their_face",
                      "whoami", "who_am_i", "recognize_face",
                      "do_you_recognize_me", "whos_at_the_desk",
                      "face_id_status", "forget_face", "list_enrolled_faces"):
@@ -187,6 +189,70 @@ class EnrollFaceTests(FaceIdSkillBase):
         _mod, actions = self._load(bc=bc, engine=eng)
         out = actions["enroll_face"]("")
         self.assertIn("clear look", out.lower())
+
+
+# ─── learn_guest (enroll a visible stranger under a spoken name) ─────────────
+class LearnGuestTests(FaceIdSkillBase):
+    def test_learn_guest_success(self):
+        bc = _fake_monolith(frames={0: _Frame("p")})
+        eng = _fake_engine(enroll_n=4)
+        _mod, actions = self._load(bc=bc, engine=eng)
+        out = actions["learn_guest"]("Sam")
+        self.assertIn("Sam", out)
+        self.assertIn("recognise", out.lower())
+        # The engine enrolled under the GUEST name, not the owner.
+        self.assertEqual(len(eng._enroll_calls), 1)
+        name, frames = eng._enroll_calls[0]
+        self.assertEqual(name, "Sam")
+        self.assertGreaterEqual(len(frames), 1)
+
+    def test_learn_guest_strips_lead_in_phrase(self):
+        bc = _fake_monolith(frames={0: _Frame("p")})
+        eng = _fake_engine(enroll_n=2)
+        _mod, actions = self._load(bc=bc, engine=eng)
+        # The router may pass the whole spoken tail through.
+        actions["remember_their_face"]("this is sam")
+        self.assertEqual(eng._enroll_calls[0][0], "Sam")   # cleaned + cased
+
+    def test_learn_guest_requires_a_name(self):
+        bc = _fake_monolith(frames={0: _Frame("p")})
+        eng = _fake_engine(enroll_n=3)
+        _mod, actions = self._load(bc=bc, engine=eng)
+        out = actions["learn_guest"]("")
+        self.assertIn("name", out.lower())
+        self.assertEqual(eng._enroll_calls, [])            # nothing enrolled
+
+    def test_learn_guest_rejects_placeholder_name(self):
+        bc = _fake_monolith(frames={0: _Frame("p")})
+        eng = _fake_engine(enroll_n=3)
+        _mod, actions = self._load(bc=bc, engine=eng)
+        out = actions["learn_guest"]("guest")
+        self.assertIn("real name", out.lower())
+        self.assertEqual(eng._enroll_calls, [])
+
+    def test_learn_guest_refuses_when_disabled(self):
+        bc = _fake_monolith(frames={0: _Frame("p")})
+        eng = _fake_engine()
+        _mod, actions = self._load(bc=bc, engine=eng, enabled=False)
+        out = actions["learn_guest"]("Sam")
+        self.assertIn("off", out.lower())
+        self.assertEqual(eng._enroll_calls, [])
+
+    def test_learn_guest_refuses_when_camera_dark(self):
+        bc = _fake_monolith(frames={})                     # no primary frame
+        eng = _fake_engine()
+        _mod, actions = self._load(bc=bc, engine=eng)
+        out = actions["learn_guest"]("Sam")
+        self.assertIn("webcam", out.lower())
+        self.assertEqual(eng._enroll_calls, [])
+
+    def test_learn_guest_no_clear_face(self):
+        bc = _fake_monolith(frames={0: _Frame("p")})
+        eng = _fake_engine(enroll_n=0)                     # no usable face
+        _mod, actions = self._load(bc=bc, engine=eng)
+        out = actions["learn_guest"]("Sam")
+        self.assertIn("clear look", out.lower())
+        self.assertIn("Sam", out)
 
 
 # ─── whoami ─────────────────────────────────────────────────────────────────

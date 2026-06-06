@@ -221,6 +221,76 @@ def enroll_face(arg: str = "") -> str:
             f"(Captured {n} good {'view' if n == 1 else 'views'}.)")
 
 
+# ─── action: learn_guest (enroll the visible stranger under a spoken name) ──
+
+def _clean_guest_name(arg: str) -> str:
+    """Pull a person's name out of the spoken argument. Strips common lead-ins
+    ('this is', 'their name is', 'remember', 'call them') and trailing filler so
+    'remember their face, this is Sam' enrolls 'Sam', not the whole sentence.
+    Returns '' when nothing usable is left."""
+    name = (arg or "").strip().strip(".!?,")
+    if not name:
+        return ""
+    low = name.lower()
+    # Strip a leading verb phrase if present (longest match first).
+    for lead in ("their name is", "his name is", "her name is",
+                 "the name is", "name is", "this is", "that is", "that's",
+                 "it is", "it's", "call them", "call him", "call her",
+                 "remember", "learn", "enroll", "enrol"):
+        if low.startswith(lead + " "):
+            name = name[len(lead):].strip()
+            low = name.lower()
+            break
+    # Drop a trailing "'s face" / "face" the user may tack on.
+    for tail in ("'s face", "s face", " face"):
+        if low.endswith(tail):
+            name = name[: len(name) - len(tail)].strip()
+            break
+    # Title-case a single bare word so "sam" enrolls as "Sam"; leave multi-word
+    # / already-capitalised names alone.
+    name = name.strip().strip(".!?,").strip()
+    if name and name.islower() and " " not in name:
+        name = name.capitalize()
+    return name
+
+
+def learn_guest(arg: str = "") -> str:
+    """Enroll the currently-visible UNKNOWN face under a spoken name — the
+    "remember their face" companion to enroll_face (which only ever learns the
+    owner). Reuses the SAME engine machinery (enroll(name, frames)); it just
+    supplies a friendly guest name instead of the owner's. Refuses honestly when
+    face-ID is off / staging / the webcam is dark, and asks for a name when the
+    user didn't give one."""
+    gate = _refuse_if_off()
+    if gate is not None:
+        return gate
+    name = _clean_guest_name(arg)
+    if not name:
+        return ("Happy to, sir — what's their name? Try 'remember their face, "
+                "this is Sam'.")
+    if name.strip().lower() in ("unknown", "guest", "someone", "stranger"):
+        return ("I'd rather use their real name, sir — say 'remember their "
+                "face, this is Sam'.")
+    idx = _primary_index()
+    if not _camera_available(idx):
+        return ("I can't see through the webcam right now, sir — make sure "
+                f"{name} is in front of it, then try again.")
+    eng = _engine()
+    frames = _grab_frames(idx, n=5, gap_s=0.4)
+    if not frames:
+        return ("I couldn't capture the webcam, sir — give it a moment and try "
+                "again.")
+    try:
+        n = eng.enroll(name, frames)
+    except Exception:   # pragma: no cover - engine swallows; belt-and-braces
+        n = 0
+    if n <= 0:
+        return (f"I couldn't get a clear look at {name}, sir — have them face "
+                "the webcam square on and try again.")
+    return (f"Got it, sir — I'll recognise {name} now. "
+            f"(Captured {n} good {'view' if n == 1 else 'views'}.)")
+
+
 # ─── action: whoami / recognize_face ───────────────────────────────────────
 
 def whoami(arg: str = "") -> str:
@@ -359,6 +429,10 @@ def register(actions):
     actions["enroll_face"]          = enroll_face
     actions["learn_my_face"]        = enroll_face
     actions["remember_my_face"]     = enroll_face
+    actions["learn_guest"]          = learn_guest
+    actions["remember_their_face"]  = learn_guest
+    actions["remember_this_person"] = learn_guest
+    actions["learn_their_face"]     = learn_guest
     actions["whoami"]               = whoami
     actions["who_am_i"]             = whoami
     actions["recognize_face"]       = whoami
@@ -368,5 +442,5 @@ def register(actions):
     actions["forget_face"]          = forget_face
     actions["list_enrolled_faces"]  = list_enrolled_faces
     print("  [face-id] face recognition actions registered "
-          "(enroll_face, whoami/recognize_face, face_id_status, forget_face, "
-          "list_enrolled_faces)")
+          "(enroll_face, learn_guest, whoami/recognize_face, face_id_status, "
+          "forget_face, list_enrolled_faces)")

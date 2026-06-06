@@ -19,6 +19,7 @@ stdlib unittest + mock.
 from __future__ import annotations
 
 import sys
+import threading
 import types
 import unittest
 from unittest import mock
@@ -256,6 +257,185 @@ class PostureTests(_Base):
         ft._apply_posture_nudge(
             present=True, now=back + ft.POSTURE_SEATED_SECONDS - 60, bc=bc)
         self.assertEqual(bc._announced, [])
+
+
+# ─── new-people greeting (GREET_NEW_PEOPLE_ENABLED) ─────────────────────────
+class NewPeopleTests(_Base):
+    """The proactive 'who are all these new people?' greeting. We drive the
+    firing logic by stubbing the module's _count_unknown_faces (so no cv2 /
+    models / real frames are needed); a final integration test instead injects a
+    fake audio.face_id engine + frame cache to prove the count flows through the
+    real recognise seam. present=True throughout (a body is in the room)."""
+
+    def _stub_count(self, ft, count):
+        """Make _count_unknown_faces always report `count` unknown faces."""
+        p = mock.patch.object(ft, "_count_unknown_faces", lambda bc: count)
+        p.start()
+        self.addCleanup(p.stop)
+
+    # Spread timestamps past the scan throttle + confirm window for clarity.
+    def _confirm(self, ft):
+        return ft.GREET_NEW_PEOPLE_CONFIRM_SECONDS
+
+    def test_no_greet_when_flag_off(self):
+        ft = self._load()
+        bc = _fake_bc()
+        self._stub_count(ft, 3)                      # plenty of strangers
+        self._patch_config(GREET_NEW_PEOPLE_ENABLED=False)
+        t0 = 1000.0
+        ft._apply_greet_new_people(present=True, now=t0, bc=bc)
+        ft._apply_greet_new_people(
+            present=True, now=t0 + self._confirm(ft) + 5, bc=bc)
+        self.assertEqual(bc._announced, [])
+
+    def test_greet_fires_once_on_two_unknowns(self):
+        ft = self._load()
+        bc = _fake_bc()
+        self._stub_count(ft, 2)                      # exactly the threshold
+        self._patch_config(GREET_NEW_PEOPLE_ENABLED=True)
+        t0 = 1000.0
+        # First sighting arms the sustained-crowd timer; confirm window not yet
+        # elapsed → no greeting on the first tick.
+        ft._apply_greet_new_people(present=True, now=t0, bc=bc)
+        self.assertEqual(bc._announced, [])
+        # Hold the crowd past the confirm window → exactly one greeting.
+        ft._apply_greet_new_people(
+            present=True, now=t0 + self._confirm(ft) + 0.5, bc=bc)
+        self.assertEqual(len(bc._announced), 1)
+        self.assertEqual(bc._announced[0][0], "new_people")
+        # The offer-to-enrol clause rides along on the same utterance.
+        self.assertIn("remember their face", bc._announced[0][1].lower())
+
+    def test_no_greet_for_single_unknown(self):
+        ft = self._load()
+        bc = _fake_bc()
+        self._stub_count(ft, 1)                      # only ONE stranger
+        self._patch_config(GREET_NEW_PEOPLE_ENABLED=True)
+        t0 = 1000.0
+        ft._apply_greet_new_people(present=True, now=t0, bc=bc)
+        ft._apply_greet_new_people(
+            present=True, now=t0 + self._confirm(ft) + 5, bc=bc)
+        self.assertEqual(bc._announced, [])
+
+    def test_no_greet_when_only_owner_present(self):
+        ft = self._load()
+        bc = _fake_bc()
+        # Owner recognised → ZERO unknown faces (the recognise pass names them).
+        self._stub_count(ft, 0)
+        self._patch_config(GREET_NEW_PEOPLE_ENABLED=True)
+        t0 = 1000.0
+        ft._apply_greet_new_people(present=True, now=t0, bc=bc)
+        ft._apply_greet_new_people(
+            present=True, now=t0 + self._confirm(ft) + 5, bc=bc)
+        self.assertEqual(bc._announced, [])
+
+    def test_no_greet_before_confirm_window(self):
+        ft = self._load()
+        bc = _fake_bc()
+        self._stub_count(ft, 3)
+        self._patch_config(GREET_NEW_PEOPLE_ENABLED=True)
+        t0 = 1000.0
+        ft._apply_greet_new_people(present=True, now=t0, bc=bc)
+        # Just BEFORE the confirm window elapses → still nothing.
+        ft._apply_greet_new_people(
+            present=True, now=t0 + self._confirm(ft) - 0.5, bc=bc)
+        self.assertEqual(bc._announced, [])
+
+    def test_greet_rate_limited_within_window(self):
+        ft = self._load()
+        bc = _fake_bc()
+        self._stub_count(ft, 2)
+        self._patch_config(GREET_NEW_PEOPLE_ENABLED=True)
+        t0 = 1000.0
+        ft._apply_greet_new_people(present=True, now=t0, bc=bc)
+        ft._apply_greet_new_people(
+            present=True, now=t0 + self._confirm(ft) + 0.5, bc=bc)
+        self.assertEqual(len(bc._announced), 1)
+        # The crowd stays in the room well past the confirm window but still
+        # inside the rate-limit window → the hard rate limit suppresses any
+        # second greeting (one announcement per gathering).
+        for extra in (10, 60, 120, ft.GREET_NEW_PEOPLE_RATE_LIMIT_SECONDS - 30):
+            ft._apply_greet_new_people(
+                present=True, now=t0 + self._confirm(ft) + extra, bc=bc)
+        self.assertEqual(len(bc._announced), 1)     # still just the one
+
+    def test_greet_again_after_rate_limit_window(self):
+        ft = self._load()
+        bc = _fake_bc()
+        self._stub_count(ft, 2)
+        self._patch_config(GREET_NEW_PEOPLE_ENABLED=True)
+        t0 = 1000.0
+        ft._apply_greet_new_people(present=True, now=t0, bc=bc)
+        ft._apply_greet_new_people(
+            present=True, now=t0 + self._confirm(ft) + 0.5, bc=bc)
+        self.assertEqual(len(bc._announced), 1)
+        # Long after the rate-limit window, a fresh sustained crowd greets again.
+        later = t0 + ft.GREET_NEW_PEOPLE_RATE_LIMIT_SECONDS + 100
+        ft._apply_greet_new_people(present=True, now=later, bc=bc)
+        ft._apply_greet_new_people(
+            present=True, now=later + self._confirm(ft) + 0.5, bc=bc)
+        self.assertEqual(len(bc._announced), 2)
+
+    def test_greet_skipped_when_busy(self):
+        ft = self._load()
+        bc = _fake_bc()
+        bc._record_speech_active = [True]            # mid-conversation
+        self._stub_count(ft, 3)
+        self._patch_config(GREET_NEW_PEOPLE_ENABLED=True)
+        t0 = 1000.0
+        ft._apply_greet_new_people(present=True, now=t0, bc=bc)
+        ft._apply_greet_new_people(
+            present=True, now=t0 + self._confirm(ft) + 0.5, bc=bc)
+        self.assertEqual(bc._announced, [])
+
+    def test_not_present_disarms(self):
+        ft = self._load()
+        bc = _fake_bc()
+        self._stub_count(ft, 3)
+        self._patch_config(GREET_NEW_PEOPLE_ENABLED=True)
+        t0 = 1000.0
+        # A crowd appears and the timer arms...
+        ft._apply_greet_new_people(present=True, now=t0, bc=bc)
+        self.assertNotEqual(ft._new_people_present_since[0], 0.0)
+        # ...then the room empties (presence false) before the confirm window →
+        # the sustained-crowd timer resets so no greeting fires on return.
+        ft._apply_greet_new_people(present=False, now=t0 + 1, bc=bc)
+        self.assertEqual(ft._new_people_present_since[0], 0.0)
+        self.assertEqual(bc._announced, [])
+
+    def test_integration_counts_unknowns_via_engine(self):
+        """End-to-end through the real _count_unknown_faces seam: a fake
+        audio.face_id engine returns two 'unknown' + one owner result, and a
+        fake bc serves a webcam frame — proving the owner is excluded and the
+        two strangers trigger the greeting."""
+        ft = self._load()
+        bc = _fake_bc()
+        # Webcam frame cache + primary camera, like the monolith exposes. The
+        # frame needs a .copy() (the grab helper copies it under the lock).
+        bc._camera_state_lock = threading.Lock()
+        bc.CAMERAS = [{"index": 0, "primary": True, "look_x": 0.85}]
+        frame = mock.MagicMock()
+        frame.copy.return_value = frame
+        bc._camera_latest_frame = {0: frame}
+
+        eng = types.ModuleType("audio.face_id")
+        eng.is_available = lambda: (True, "")
+        eng.recognize = lambda fr: [
+            {"name": "unknown", "score": 0.1, "bbox": [0, 0, 9, 9]},
+            {"name": "owner",   "score": 0.8, "bbox": [9, 0, 9, 9]},
+            {"name": "unknown", "score": 0.0, "bbox": [18, 0, 9, 9]},
+        ]
+        self._inject("audio.face_id", eng)
+        self._patch_config(GREET_NEW_PEOPLE_ENABLED=True)
+
+        t0 = 1000.0
+        ft._apply_greet_new_people(present=True, now=t0, bc=bc)
+        self.assertEqual(bc._announced, [])          # confirm window pending
+        ft._apply_greet_new_people(
+            present=True, now=t0 + ft.GREET_NEW_PEOPLE_CONFIRM_SECONDS + 0.5,
+            bc=bc)
+        self.assertEqual(len(bc._announced), 1)
+        self.assertEqual(bc._announced[0][0], "new_people")
 
 
 if __name__ == "__main__":
