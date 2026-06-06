@@ -73,6 +73,16 @@ class SafetyConstantTests(unittest.TestCase):
     def test_confirm_keywords_all_strings(self):
         self.assertTrue(all(isinstance(k, str) for k in config.CONFIRM_KEYWORDS))
 
+    def test_local_vision_fallback_defaults_off(self):
+        # Shipped default MUST be False: on a 24 GB card the resident ~21 GB
+        # 30B text model leaves no room to co-load the ~7 GB local VLM, so a
+        # Claude-vision error (incl. a transient API cap / network blip) that
+        # silently pulled the VLM would over-commit and brick the GPU. The
+        # safe-for-everyone default is OFF; a box with the VRAM headroom opts
+        # in via user_settings.json.
+        self.assertIsInstance(config.LOCAL_VISION_FALLBACK, bool)
+        self.assertFalse(config.LOCAL_VISION_FALLBACK)
+
 
 class StructuralInvariantTests(unittest.TestCase):
     def test_console_monitor_is_a_known_monitor(self):
