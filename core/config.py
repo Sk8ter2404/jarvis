@@ -429,8 +429,8 @@ MIC_SILENT_WARN_SECONDS = 30.0
 # the robot should aim its eyes (0.0–1.0) when this camera is the only
 # one that can see your face. Ignored for primary.
 CAMERAS = [
-    {"index": 1, "label": "Left webcam (left monitor)",          "primary": False, "look_x": 0.15, "look_y": 0.5},
-    {"index": 0, "label": "Right webcam (top of right monitor)", "primary": True,  "look_x": 0.85, "look_y": 0.5},
+    {"index": 1, "label": "Left webcam (left monitor)",          "primary": True,  "look_x": 0.5,  "look_y": 0.5},
+    {"index": 0, "label": "Right webcam (top of right monitor)", "primary": False, "look_x": 0.85, "look_y": 0.5},
 ]
 
 # Camera probe — if CAMERAS fails to open, sweep indices 0..MAX-1 and
