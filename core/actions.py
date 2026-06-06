@@ -569,6 +569,22 @@ def _act_resume_music(_: str = "") -> str:
 
 def _act_now_playing(_: str = "") -> str:
     bc = _bc()
+    # 0) The Windows media session (SMTC) — source-agnostic and reliable; names
+    #    the real track from Chrome / Spotify / the Apple Music app / YouTube
+    #    without scraping a window title. Falls through when nothing is playing.
+    try:
+        from core.media_now_playing import get_now_playing as _smtc_get
+        _snap = _smtc_get()
+    except Exception:
+        _snap = None
+    if _snap and _snap.get("title"):
+        _t = _snap["title"]
+        _a = _snap.get("artist") or ""
+        _src = _snap.get("app") or "your media player"
+        _verb = "playing" if _snap.get("playing") else "paused"
+        if _a:
+            return f"{_t} by {_a} — {_verb} in {_src}, sir."
+        return f"{_t} — {_verb} in {_src}, sir."
     # 1) New UWP Apple Music app — best-effort read of its window title.
     amapp = _apple_music_app()
     if amapp is not None:
