@@ -1076,11 +1076,18 @@ def _handle_notification(notification) -> None:
     if title or body:
         content_key = _content_dedupe_key(app, title, body)
         now_ts = _time.time()
+        # Read-check-write the content dedupe in ONE critical section. The split
+        # version (read under lock, RELEASE, test, re-acquire to write) let two
+        # listener threads processing the same backlog toast -- WinRT hands out
+        # fresh ids after a watchdog stall, so the id-set above misses it -- both
+        # observe prev_ts as stale, both pass the TTL test, and both announce.
+        # Holding _state_lock across get + test + set makes it atomic; the loser
+        # sees the winner's write and suppresses. (return exits the with-block,
+        # releasing the RLock.)
         with _state_lock:
             prev_ts = _content_dedupe.get(content_key, 0.0)
-        if now_ts - prev_ts < _CONTENT_DEDUPE_TTL_SEC:
-            return
-        with _state_lock:
+            if now_ts - prev_ts < _CONTENT_DEDUPE_TTL_SEC:
+                return
             _content_dedupe[content_key] = now_ts
         _save_content_dedupe()
 

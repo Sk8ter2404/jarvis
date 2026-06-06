@@ -610,6 +610,59 @@ class HandleNotificationTests(_IsolatedTriageBase):
                     _make_notification(nid=2, texts=("Sam", "dupbody")))
         self.assertEqual(len(self.mod._recent), n_before)
 
+    def test_content_dedupe_read_write_atomic_single_lock_hold(self):
+        # Regression: the content-dedupe get + set must happen within ONE
+        # _state_lock hold. The old split (read under lock, RELEASE, test,
+        # re-acquire to write) let two listener threads both observe a stale
+        # dedupe and double-announce the same backlog toast. Instrument the lock
+        # + the dedupe dict and assert the lock is never fully released between
+        # the dedupe read and the dedupe write.
+        import threading as _th
+        self.mod._rules = [{"id": "logger", "match": {}, "action": "log"}]
+        backing = _th.RLock()
+        depth = {"n": 0}
+        state = {"watching": False, "released_between": False}
+
+        class _DepthLock:
+            def __enter__(self_):
+                self_.acquire()
+                return self_
+
+            def __exit__(self_, *a):
+                self_.release()
+                return False
+
+            def acquire(self_, *a, **k):
+                r = backing.acquire(*a, **k)
+                depth["n"] += 1
+                return r
+
+            def release(self_):
+                depth["n"] -= 1
+                if state["watching"] and depth["n"] == 0:
+                    state["released_between"] = True
+                backing.release()
+
+        class _SpyDedupe(dict):
+            def get(self_, k, d=None):
+                state["watching"] = True          # window opens at the read
+                return dict.get(self_, k, d)
+
+            def __setitem__(self_, k, v):
+                state["watching"] = False          # window closes at the write
+                dict.__setitem__(self_, k, v)
+
+        with mock.patch.object(self.mod, "_state_lock", _DepthLock()), \
+             mock.patch.object(self.mod, "_content_dedupe", _SpyDedupe()), \
+             mock.patch.object(self.mod, "_persist_to_log"):
+            self.mod._handle_notification(
+                _make_notification(nid=1, texts=("Sam", "atomicbody")))
+
+        self.assertFalse(
+            state["released_between"],
+            "content-dedupe released _state_lock between its read and write — "
+            "two listener threads could pass the freshness test and double-announce")
+
     def test_classify_action_uses_llm_verdict(self):
         # No rule matches → classify → LLM says "urgent" → read_aloud.
         self.mod._rules = []
