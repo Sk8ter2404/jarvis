@@ -107,7 +107,7 @@ POSTURE_STAND_LINES = (
 # GREET_NEW_PEOPLE_CONFIRM_SECONDS, fires at most once per
 # GREET_NEW_PEOPLE_RATE_LIMIT_SECONDS, and is skipped while JARVIS is busy. The
 # owner's own enrolled face is recognised (named), so it never counts as "new".
-GREET_NEW_PEOPLE_MIN_FACES        = 2      # >= this many UNKNOWN faces to react
+GREET_NEW_PEOPLE_MIN_FACES        = 1      # >= this many UNKNOWN faces to react (single newcomer)
 GREET_NEW_PEOPLE_CONFIRM_SECONDS  = 4.0    # unknowns must hold this long first
 GREET_NEW_PEOPLE_RATE_LIMIT_SECONDS = 600.0  # at most one greeting per ~10 min
 # Re-reading the webcam every 0.5 s poll tick is wasteful (a recognise pass
