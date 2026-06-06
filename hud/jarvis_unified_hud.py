@@ -25,7 +25,7 @@ Data sources (all already published elsewhere — this is a *view*):
   • hud_state.json          — state, now_playing, transcript_history, mic/tts
                               amplitude, now_doing, alert flags (set_state()).
   • bambu_overlay_state.json — gcode_state + mc_percent + ETA (bambu_monitor).
-  • psutil + nvidia-smi      — CPU / RAM / NET locally; GPU temp cached.
+  • psutil + nvidia-smi      — CPU / RAM / NET locally; GPU util cached.
   • hud_card.py gatherers    — weather (wttr), 3-day forecast, calendar +
                               unread mail (Microsoft Graph). Reused, not
                               duplicated. Refreshed on a background thread.
@@ -76,7 +76,7 @@ except ImportError:
 
 TICK_MS = 500                 # cheap data refresh + repaint cadence
 SLOW_REFRESH_S = 600.0        # weather/calendar refresh cadence (background)
-GPU_CACHE_SECONDS = 4.0
+GPU_CACHE_SECONDS = 1.0       # utilization swings 0→100→0 fast; a long cache aliases it
 
 PROJECT_DIR      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HUD_STATE_FILE   = os.path.join(PROJECT_DIR, "hud_state.json")
@@ -106,7 +106,7 @@ if _HAS_PYQT6:
 # at the same point JARVIS would proactively comment).
 CPU_WARN, CPU_CRIT = 75.0, 90.0
 RAM_WARN, RAM_CRIT = 75.0, 90.0
-GPU_WARN, GPU_CRIT = 70.0, 82.0
+GPU_WARN, GPU_CRIT = 70.0, 90.0   # GPU utilization % (was 70/82 °C)
 NET_WARN, NET_CRIT = 10.0, 50.0
 NET_FULL_MBPS      = 100.0
 
@@ -254,7 +254,7 @@ class UnifiedHud(QWidget):
         self.unread_mail_count: int | None = None
         self.cpu = 0.0
         self.ram = 0.0
-        self.gpu_temp: float | None = None
+        self.gpu_util: float | None = None
         self.net_mbps = 0.0
         self.bambu_active = False
         self.bambu_pct = 0
@@ -311,28 +311,31 @@ class UnifiedHud(QWidget):
         self._reposition_chrome()
 
     # ── data refresh ────────────────────────────────────────────────────────
-    def _read_gpu_temp(self) -> float | None:
+    def _read_gpu_util(self) -> float | None:
         now = time.time()
         if (now - self._gpu_cached_at) < GPU_CACHE_SECONDS:
-            return self.gpu_temp
+            return self.gpu_util
         self._gpu_cached_at = now
         try:
             exe = shutil.which("nvidia-smi")
             if exe:
                 out = subprocess.run(
-                    [exe, "--query-gpu=temperature.gpu",
+                    [exe, "--query-gpu=utilization.gpu",
                      "--format=csv,noheader,nounits"],
                     capture_output=True, text=True, timeout=2.0,
                     creationflags=(subprocess.CREATE_NO_WINDOW
                                    if sys.platform == "win32" else 0),
                 )
-                temps = [int(v.strip()) for v in (out.stdout or "").splitlines()
+                utils = [int(v.strip()) for v in (out.stdout or "").splitlines()
                          if v.strip().isdigit()]
-                if temps:
-                    return float(max(temps))
+                if utils:
+                    return float(max(utils))
         except Exception:
             pass
-        # Fallback: parse "GPU 54C" out of the pulse_strip.
+        # Fallback: parse "GPU 54%" out of the pulse_strip (digit-scan stops at
+        # the first non-digit, so the trailing "%" terminates the number; the
+        # producer emits a "GPU 54C" temperature token only when it too had no
+        # utilization reading).
         strip = _read_json(HUD_STATE_FILE).get("pulse_strip") or ""
         if "GPU " in strip:
             num = ""
@@ -403,7 +406,7 @@ class UnifiedHud(QWidget):
             except Exception:
                 pass
         self.net_mbps = self._read_net_mbps()
-        self.gpu_temp = self._read_gpu_temp()
+        self.gpu_util = self._read_gpu_util()
 
         bambu = _read_json(BAMBU_STATE_FILE)
         gs = (bambu.get("gcode_state") or "").upper()
@@ -620,8 +623,8 @@ class UnifiedHud(QWidget):
         p.drawEllipse(outer)
 
         # Four metric arcs. Qt: 0°=3 o'clock, CCW+, angle in 1/16°.
-        gpu_v = self.gpu_temp if self.gpu_temp is not None else 0.0
-        gpu_frac = max(0.0, min(1.0, (gpu_v - 30.0) / 65.0))
+        gpu_v = self.gpu_util if self.gpu_util is not None else 0.0
+        gpu_frac = max(0.0, min(1.0, gpu_v / 100.0))   # 0-100% utilization → flat 0-1
         quads = [
             (min(1.0, self.cpu / 100.0), 90,
              self._metric_color(self.cpu, CPU_WARN, CPU_CRIT)),
@@ -629,7 +632,7 @@ class UnifiedHud(QWidget):
              self._metric_color(self.ram, RAM_WARN, RAM_CRIT)),
             (gpu_frac, 270,
              self._metric_color(gpu_v, GPU_WARN, GPU_CRIT)
-             if self.gpu_temp is not None else CYAN_DIM),
+             if self.gpu_util is not None else CYAN_DIM),
             (min(1.0, self.net_mbps / NET_FULL_MBPS), 180,
              self._metric_color(self.net_mbps, NET_WARN, NET_CRIT)),
         ]
@@ -707,9 +710,9 @@ class UnifiedHud(QWidget):
         cells = [
             ("CPU", f"{self.cpu:.0f}%", self._metric_color(self.cpu, CPU_WARN, CPU_CRIT)),
             ("RAM", f"{self.ram:.0f}%", self._metric_color(self.ram, RAM_WARN, RAM_CRIT)),
-            ("GPU", (f"{self.gpu_temp:.0f}°" if self.gpu_temp is not None else "—"),
-             self._metric_color(self.gpu_temp or 0, GPU_WARN, GPU_CRIT)
-             if self.gpu_temp is not None else DIM_FG),
+            ("GPU", (f"{self.gpu_util:.0f}%" if self.gpu_util is not None else "—"),
+             self._metric_color(self.gpu_util or 0, GPU_WARN, GPU_CRIT)
+             if self.gpu_util is not None else DIM_FG),
             ("NET", (f"{self.net_mbps:.1f}" if self.net_mbps >= 10 else f"{self.net_mbps:.2f}"),
              self._metric_color(self.net_mbps, NET_WARN, NET_CRIT)),
         ]

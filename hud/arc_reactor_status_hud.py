@@ -5,7 +5,7 @@ JARVIS arc-reactor status HUD — system_pulse data as a circular ring (PyQt6).
 Spec: jarvis_todo.md 2026-05-29 16:35 (overnight — arc-reactor-style HUD
 widget). Replaces the generic `status_panel_strip` text strip with
 something visually JARVIS-authentic: an arc-reactor disc whose outer
-ring is split into four quadrant arcs (CPU / RAM / GPU temp / network
+ring is split into four quadrant arcs (CPU / RAM / GPU util / network
 bandwidth) and whose inner ring tracks the current Bambu print progress
 when a print is active.
 
@@ -16,14 +16,14 @@ corner — stacking on the opposite edge avoids occlusion):
   • Outer ring split into four quadrant arcs:
       ▸ top   (12→3 o'clock)  CPU %      cyan → amber → red
       ▸ right ( 3→6 o'clock)  RAM %      cyan → amber → red
-      ▸ bottom( 6→9 o'clock)  GPU °C     cyan → amber → red
+      ▸ bottom( 6→9 o'clock)  GPU %      cyan → amber → red
       ▸ left  ( 9→12 o'clock) NET Mbps   cyan → amber → red
   • Inner ring (just inside the outer track) — Bambu print %, only
     drawn when a print is active (RUNNING / PAUSE / PREPARE).
   • Central core — pulsing solid hub with the current JARVIS state
     label (IDLE / LISTENING / THINKING / SPEAKING / STANDBY / SLEEP).
   • Four quadrant chip labels at the cardinals — `CPU 47%`, `RAM 62%`,
-    `GPU 71°`, `NET 0.4 MB/s` — so the user can read the numbers
+    `GPU 71%`, `NET 0.4 MB/s` — so the user can read the numbers
     without having to interpret the arc fill.
 
 Data sources:
@@ -33,9 +33,9 @@ Data sources:
   • psutil — CPU % / RAM % sampled locally on every tick; network
     bandwidth computed as a delta between consecutive ticks so we
     don't have to wait 15 s for the next system_pulse publish.
-  • nvidia-smi — GPU temperature, cached for several seconds because
-    spawning a subprocess each 500 ms tick would dominate this widget's
-    CPU footprint.
+  • nvidia-smi — GPU utilization, cached briefly because spawning a
+    subprocess each 500 ms tick would dominate this widget's CPU footprint
+    (but only ~1 s, since load swings fast and a long cache would alias it).
   • bambu_overlay_state.json — current print's mc_percent and
     gcode_state, written atomically by skills/bambu_monitor.py.
 
@@ -111,18 +111,18 @@ CPU_WARN_PCT      = 75.0
 CPU_CRIT_PCT      = 90.0
 RAM_WARN_PCT      = 75.0
 RAM_CRIT_PCT      = 90.0
-GPU_WARN_C        = 70.0
-GPU_CRIT_C        = 82.0
+GPU_WARN_PCT      = 70.0
+GPU_CRIT_PCT      = 90.0
 # Network in MB/s — saturating a 1 Gb link is ~125 MB/s. Anything past
 # the warn threshold reads as "doing something serious".
 NET_WARN_MBPS     = 10.0
 NET_CRIT_MBPS     = 50.0
 NET_SCALE_MBPS    = 100.0  # arc fills to 100 % at 100 MB/s sustained
 
-# GPU temp readings via nvidia-smi are slow (subprocess + parse). The
-# physical temperature can't change meaningfully in <2 s so we cache
-# aggressively to keep the 500 ms tick cheap.
-GPU_CACHE_SECONDS = 4.0
+# GPU utilization readings via nvidia-smi are slow (subprocess + parse), but
+# load swings 0→100→0 between ticks, so we cache only briefly — a long cache
+# would alias/freeze the displayed value while still sparing most ticks a spawn.
+GPU_CACHE_SECONDS = 1.0
 
 
 def _is_parent_alive(pid: int) -> bool:
@@ -172,7 +172,7 @@ class ArcReactorStatusScene(QGraphicsScene):
         # Live sample buffers.
         self.cpu_pct        = 0.0
         self.ram_pct        = 0.0
-        self.gpu_temp_c: float | None = None
+        self.gpu_util_pct: float | None = None
         self.net_mbps       = 0.0
         self.state          = "idle"
         self.tts_amp        = 0.0
@@ -219,33 +219,34 @@ class ArcReactorStatusScene(QGraphicsScene):
         self._recompute_layout()
 
     # ─── sensor reads ──────────────────────────────────────────────────
-    def _read_gpu_temp(self) -> float | None:
-        """Best-effort GPU temperature in Celsius. Caches the result for
+    def _read_gpu_util(self) -> float | None:
+        """Best-effort GPU utilization percent (0-100). Caches the result for
         GPU_CACHE_SECONDS so nvidia-smi isn't respawned every tick."""
         now = time.time()
         if (now - self._gpu_cached_at) < GPU_CACHE_SECONDS:
-            return self.gpu_temp_c
+            return self.gpu_util_pct
         self._gpu_cached_at = now
         try:
             exe = shutil.which("nvidia-smi")
             if exe:
                 out = subprocess.run(
-                    [exe, "--query-gpu=temperature.gpu",
+                    [exe, "--query-gpu=utilization.gpu",
                      "--format=csv,noheader,nounits"],
                     capture_output=True, text=True, timeout=2.0,
                     creationflags=(subprocess.CREATE_NO_WINDOW
                                    if sys.platform == "win32" else 0),
                 )
-                temps = []
+                utils = []
                 for v in (out.stdout or "").strip().splitlines():
                     v = v.strip()
                     if v.isdigit():
-                        temps.append(int(v))
-                if temps:
-                    return float(max(temps))
+                        utils.append(int(v))
+                if utils:
+                    return float(max(utils))
         except Exception:
             pass
-        # Fallback — parse the pulse_strip "GPU 33C" hint if present.
+        # Fallback — parse the pulse_strip "GPU 33%" hint if present (digit-scan
+        # stops at the first non-digit, so the trailing "%" terminates cleanly).
         hud = _read_json(HUD_STATE_FILE)
         strip = (hud.get("pulse_strip") or "")
         if "GPU " in strip:
@@ -313,7 +314,7 @@ class ArcReactorStatusScene(QGraphicsScene):
             except Exception:
                 pass
         self.net_mbps = self._read_net_mbps()
-        self.gpu_temp_c = self._read_gpu_temp()
+        self.gpu_util_pct = self._read_gpu_util()
 
         bambu = _read_json(BAMBU_STATE_FILE)
         gs = (bambu.get("gcode_state") or "").upper()
@@ -402,10 +403,9 @@ class ArcReactorStatusScene(QGraphicsScene):
         # portion shows a faint cyan "remaining" trace.
         cpu_frac = self._fraction(self.cpu_pct, 100.0)
         ram_frac = self._fraction(self.ram_pct, 100.0)
-        gpu_val  = self.gpu_temp_c if self.gpu_temp_c is not None else 0.0
-        # GPU mapped 30°C → 0 % up to 95°C → 100 % so a normal idle
-        # GPU still draws a visible nub instead of a blank wedge.
-        gpu_frac = max(0.0, min(1.0, (gpu_val - 30.0) / max(1.0, 95.0 - 30.0)))
+        gpu_val  = self.gpu_util_pct if self.gpu_util_pct is not None else 0.0
+        # GPU utilization maps 0 % → 0 up to 100 % → full, a flat 0-100 scale.
+        gpu_frac = max(0.0, min(1.0, gpu_val / 100.0))
         net_frac = self._fraction(self.net_mbps, NET_SCALE_MBPS)
 
         # Anchors (Qt: 0° = 3 o'clock, CCW positive). Each quadrant
@@ -415,8 +415,8 @@ class ArcReactorStatusScene(QGraphicsScene):
         # ▸ GPU  — bottom quadrant ( 6 o'clock → 9 o'clock)      : start 270°, span -90°
         # ▸ NET  — left quadrant ( 9 o'clock → 12 o'clock)       : start 180°, span -90°
         gpu_arc_color = (
-            self._color_for_metric(gpu_val, GPU_WARN_C, GPU_CRIT_C)
-            if self.gpu_temp_c is not None else CYAN_DIM
+            self._color_for_metric(gpu_val, GPU_WARN_PCT, GPU_CRIT_PCT)
+            if self.gpu_util_pct is not None else CYAN_DIM
         )
         quadrants = [
             ("CPU", (cpu_frac, 90,
@@ -549,14 +549,14 @@ class ArcReactorStatusScene(QGraphicsScene):
             f"RAM {self.ram_pct:>4.0f}%",
         )
         # GPU — bottom centre
-        if self.gpu_temp_c is not None:
+        if self.gpu_util_pct is not None:
             gpu_color = self._color_for_metric(
-                self.gpu_temp_c, GPU_WARN_C, GPU_CRIT_C,
+                self.gpu_util_pct, GPU_WARN_PCT, GPU_CRIT_PCT,
             )
-            gpu_text = f"GPU {self.gpu_temp_c:>3.0f}°C"
+            gpu_text = f"GPU {self.gpu_util_pct:>3.0f}%"
         else:
             gpu_color = DIM_TEXT
-            gpu_text = "GPU — °C"
+            gpu_text = "GPU — %"
         painter.setPen(QPen(gpu_color))
         painter.drawText(
             QRectF(cx - 60.0, min(self.h - 22.0, cy + self.R_OUTER + 6.0),

@@ -62,6 +62,7 @@ class PulseFormatTests(unittest.TestCase):
 
     # ── _format_report ───────────────────────────────────────────────────
     def test_format_report_default_opener_and_tail(self):
+        # No utilization reading present → GPU phrasing falls back to temperature.
         pulse = {"cpu_pct": 12.0, "ram_pct": 40.0, "gpu_temp_c": 55.0,
                  "disk_free_gb": 500.0, "active_apps": 8}
         out = self.mod._format_report(pulse)
@@ -70,6 +71,19 @@ class PulseFormatTests(unittest.TestCase):
         self.assertIn("GPU idling at 55 degrees", out)
         self.assertIn("8 windows open", out)
         self.assertTrue(out.endswith("Anything further?"))
+
+    def test_format_report_gpu_util_primary(self):
+        # When utilization is present it is the GPU surface — percent, not degrees.
+        pulse = {"cpu_pct": 12.0, "ram_pct": 40.0,
+                 "gpu_util_pct": 42.0, "gpu_temp_c": 55.0}
+        out = self.mod._format_report(pulse)
+        self.assertIn("GPU running at 42 percent", out)
+        self.assertNotIn("degrees", out)        # temp suppressed when util known
+
+    def test_format_report_gpu_util_busy_phrasing(self):
+        pulse = {"cpu_pct": 10.0, "ram_pct": 30.0, "gpu_util_pct": 98.0}
+        out = self.mod._format_report(pulse)
+        self.assertIn("GPU working hard at 98 percent", out)
 
     def test_format_report_folds_in_cpu_temp_from_hwinfo(self):
         # When the pulse carries a HWiNFO CPU temp, it folds into the CPU line.
@@ -106,12 +120,36 @@ class PulseFormatTests(unittest.TestCase):
         self.assertNotIn("battery at 55", self.mod._format_report(plugged))
 
     # ── _format_hud_strip ────────────────────────────────────────────────
-    def test_hud_strip_compact_metrics(self):
+    def test_hud_strip_gpu_util_token(self):
+        # The token both HUD fallback parsers read: "GPU 73%" when utilization
+        # is available (the producer/consumer contract — % not C).
+        pulse = {"gpu_util_pct": 73.0, "battery_pct": 80.0,
+                 "battery_plugged": True, "uptime_seconds": 3 * 3600 + 5 * 60,
+                 "active_apps": 12, "net_down_kbps": 0.0, "net_up_kbps": 0.0}
+        out = self.mod._format_hud_strip(pulse)
+        self.assertIn("GPU 73%", out)
+        self.assertNotIn("GPU 73C", out)
+        self.assertIn("BAT 80%+", out)   # plugged → "+"
+        self.assertIn("APPS 12", out)
+
+    def test_hud_strip_gpu_util_preferred_over_temp(self):
+        # Both readings present → utilization wins, temperature is NOT emitted.
+        pulse = {"gpu_util_pct": 40.0, "gpu_temp_c": 61.0}
+        out = self.mod._format_hud_strip(pulse)
+        self.assertIn("GPU 40%", out)
+        self.assertNotIn("61", out)
+        self.assertNotIn("C", out.replace("APPS", ""))   # no stray temp "C"
+
+    def test_hud_strip_temp_fallback_token(self):
+        # No utilization → the producer emits the legacy "GPU 60C" temp token so
+        # a temp-only host still shows *something*; the HUD colour scale treats a
+        # number it can't disambiguate as the displayed value either way.
         pulse = {"gpu_temp_c": 60.0, "battery_pct": 80.0,
                  "battery_plugged": True, "uptime_seconds": 3 * 3600 + 5 * 60,
                  "active_apps": 12, "net_down_kbps": 0.0, "net_up_kbps": 0.0}
         out = self.mod._format_hud_strip(pulse)
         self.assertIn("GPU 60C", out)
+        self.assertNotIn("GPU 60%", out)
         self.assertIn("BAT 80%+", out)   # plugged → "+"
         self.assertIn("APPS 12", out)
 
@@ -142,9 +180,29 @@ class PulseAbnormalReasonTests(unittest.TestCase):
         reasons = dict(self.mod._abnormal_reasons({"disk_free_gb": 0.0}))
         self.assertNotIn("disk", reasons)
 
-    def test_hot_gpu_flagged(self):
+    def test_busy_gpu_flagged_on_utilization(self):
+        # Utilization at/above GPU_UTIL_ABNORMAL_PCT (95%) is the primary signal.
+        reasons = dict(self.mod._abnormal_reasons({"gpu_util_pct": 97.0}))
+        self.assertIn("gpu", reasons)
+        self.assertIn("97 percent", reasons["gpu"])
+
+    def test_moderate_gpu_util_not_flagged(self):
+        # A busy-but-not-pinned GPU (85% load) is fine — no abnormal reason.
+        reasons = dict(self.mod._abnormal_reasons({"gpu_util_pct": 85.0}))
+        self.assertNotIn("gpu", reasons)
+
+    def test_hot_gpu_flagged_via_temp_fallback(self):
+        # Utilization unavailable → the hot-temperature fallback still fires.
         reasons = dict(self.mod._abnormal_reasons({"gpu_temp_c": 85.0}))
         self.assertIn("gpu", reasons)
+        self.assertIn("degrees", reasons["gpu"])
+
+    def test_temp_not_consulted_when_util_present(self):
+        # With a (non-busy) utilization reading, a hot temp does NOT trip the
+        # alert — the meaning of the GPU band is load now, not temperature.
+        reasons = dict(self.mod._abnormal_reasons(
+            {"gpu_util_pct": 30.0, "gpu_temp_c": 85.0}))
+        self.assertNotIn("gpu", reasons)
 
     def test_low_battery_only_when_unplugged(self):
         unplugged = {"battery_pct": 10.0, "battery_plugged": False}
@@ -403,7 +461,47 @@ class PulseCollectorTests(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# _read_gpu_temp_c — nvidia-smi + psutil-sensors fallback.
+# _read_gpu_util_pct — nvidia-smi utilization.gpu (the primary GPU surface).
+# No HWiNFO/psutil-sensor fallback: those report temperature, not load.
+# ─────────────────────────────────────────────────────────────────────────
+class PulseGpuUtilTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("system_pulse")
+
+    def test_nvidia_smi_busiest_gpu(self):
+        proc = types.SimpleNamespace(stdout="9\n88\n")
+        with mock.patch.object(self.mod.shutil, "which", return_value="nvidia-smi"), \
+             mock.patch.object(self.mod.subprocess, "run", return_value=proc) as run:
+            self.assertEqual(self.mod._read_gpu_util_pct(), 88.0)
+        argv = run.call_args.args[0]
+        self.assertIn("--query-gpu=utilization.gpu", argv)
+        self.assertNotIn("--query-gpu=temperature.gpu", argv)
+
+    def test_zero_util_is_zero_not_none(self):
+        proc = types.SimpleNamespace(stdout="0\n")
+        with mock.patch.object(self.mod.shutil, "which", return_value="nvidia-smi"), \
+             mock.patch.object(self.mod.subprocess, "run", return_value=proc):
+            self.assertEqual(self.mod._read_gpu_util_pct(), 0.0)
+
+    def test_no_nvidia_smi_returns_none(self):
+        with mock.patch.object(self.mod.shutil, "which", return_value=None):
+            self.assertIsNone(self.mod._read_gpu_util_pct())
+
+    def test_nondigit_lines_skipped(self):
+        proc = types.SimpleNamespace(stdout="N/A\n\n44\n")
+        with mock.patch.object(self.mod.shutil, "which", return_value="nvidia-smi"), \
+             mock.patch.object(self.mod.subprocess, "run", return_value=proc):
+            self.assertEqual(self.mod._read_gpu_util_pct(), 44.0)
+
+    def test_subprocess_exception_returns_none(self):
+        with mock.patch.object(self.mod.shutil, "which", return_value="nvidia-smi"), \
+             mock.patch.object(self.mod.subprocess, "run",
+                               side_effect=OSError("spawn failed")):
+            self.assertIsNone(self.mod._read_gpu_util_pct())
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# _read_gpu_temp_c — nvidia-smi + psutil-sensors fallback (temp fallback path).
 # ─────────────────────────────────────────────────────────────────────────
 class PulseGpuTempTests(unittest.TestCase):
     def setUp(self):
@@ -1174,7 +1272,8 @@ class PulseSingleHwinfoReadTests(unittest.TestCase):
         finally:
             for c in cms:
                 c.stop()
-        self.assertEqual(pulse["gpu_temp_c"], 73.0)   # from nvidia-smi
+        self.assertEqual(pulse["gpu_temp_c"], 73.0)   # from nvidia-smi (fallback field)
+        self.assertEqual(pulse["gpu_util_pct"], 73.0) # utilization populated (primary)
         self.assertEqual(pulse["cpu_temp_c"], 52.0)   # from prefetched HWiNFO
         fake_hw.summary.assert_called_once()
 
