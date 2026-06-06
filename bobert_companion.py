@@ -327,6 +327,15 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 import cv2
+# Disable OpenCV's GPU OpenCL (T-API) path once, process-wide. On a 24GB 3090
+# the OpenCL allocator fights the ~21GB Ollama model and throws a storm of
+# CL_OUT_OF_RESOURCES / CL_INVALID_COMMAND_QUEUE errors from the vision loop.
+# The Haar cascades run fine on CPU, so force CPU and skip the contention.
+# Guarded: some headless/contrib-less cv2 builds ship without the ocl module.
+try:
+    cv2.ocl.setUseOpenCL(False)
+except Exception:
+    pass
 import requests
 
 # Command-level pattern memory — separate from bobert_memory.json (long-term
@@ -3590,7 +3599,16 @@ def _face_tracking_thread():
                         _camera_last_read_error_at.pop(cam["index"], None)
                 if paused:
                     continue   # skip detection/eye-control while paused
-                face = _detect_face(frame)
+                try:
+                    face = _detect_face(frame)
+                except cv2.error:
+                    # An OpenCV-internal failure (e.g. an OpenCL/GPU hiccup, or a
+                    # malformed frame) used to unwind the whole tracking thread
+                    # with a traceback every iteration. Degrade to "no face this
+                    # frame" and back off briefly so we don't hot-loop the error.
+                    logging.exception("[face-track] _detect_face failed; skipping frame")
+                    time.sleep(0.5)
+                    continue
                 if not face:
                     continue
                 # Record that this specific camera just saw a face
@@ -5365,6 +5383,12 @@ _DEP_IMPORT_NAME = {
     "pillow":         "PIL",
     "pywin32":        "win32com",
     "paho-mqtt":      "paho.mqtt.client",
+    # The dashed pip name does NOT match the import path for these, so the
+    # default "-"→"_" fallback mis-resolves them and they were falsely reported
+    # MISSING (plus a bogus pip-install line) on every boot of a working install.
+    "winrt-Windows.Media.Control": "winrt.windows.media.control",
+    "nvidia-cublas-cu12":          "nvidia.cublas",
+    "nvidia-cudnn-cu12":           "nvidia.cudnn",
 }
 _DEP_FEATURE_NOTE = {
     "psutil":         "the system monitor is offline",
