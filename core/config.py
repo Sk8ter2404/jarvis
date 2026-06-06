@@ -624,6 +624,26 @@ WORKSHOP_HUD_AUTO_LAUNCH          = False   # top-right CPU/RAM/bambu widget
 WORKSHOP_PRINT_MONITOR_AUTO_LAUNCH = False  # top-center Stark print panel
 BAMBU_OVERLAY_AUTO_WHILE_PRINTING = False   # top-right bambu corner overlay
 
+# ── Bambu chamber-camera HUD (hud/bambu_camera_hud.py) ──────────────────
+# Master switch for the live printer-camera surface. When True, JARVIS can
+# show the H2D's built-in camera in a movable HUD panel (voice: "show the
+# printer camera"), and the frame grabber (core/bambu_camera.py) is allowed
+# to pull frames over the LAN. The camera is fetched via the printer's
+# authenticated LOCAL stream — RTSPS on port 322 for the H2D/X-class
+# (requires "LAN Only Liveview" enabled on the printer screen), with a
+# port-6000 JPEG-stills fallback for P1/A1-class printers. No Bambu Cloud
+# round-trip. Reuses the existing BAMBU_PRINTER_IP / BAMBU_ACCESS_CODE
+# credentials. Set False to disable the feature entirely (grabber + widget).
+# Unlike the retired overlays above this is NOT auto-launched at boot — it's
+# summoned on demand and (optionally) auto-shown while a print is active via
+# BAMBU_CAMERA_AUTO_WHILE_PRINTING below.
+HUD_BAMBU_CAMERA = True
+# When True (and HUD_BAMBU_CAMERA is on), the camera panel auto-shows while a
+# print is RUNNING/PAUSE/PREPARE and retires shortly after — same watcher
+# pattern as the retired bambu corner overlay. Default False so the camera is
+# opt-in / on-demand and never pops up unbidden.
+BAMBU_CAMERA_AUTO_WHILE_PRINTING = False
+
 
 # ─── Auto-switch default audio on headset power (audio/audio_switch.py) ──
 # A USB-dongle wireless headset (e.g. a CORSAIR VOID ELITE) keeps its dongle

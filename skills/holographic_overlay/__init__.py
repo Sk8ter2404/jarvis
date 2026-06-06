@@ -158,6 +158,31 @@ _BAMBU_WATCHER_STOP = threading.Event()
 # user can re-engage the auto mode at the next print).
 _BAMBU_OVERLAY_USER_OFF = False
 
+# Bambu chamber-camera HUD — a movable PyQt6 panel showing the printer's
+# built-in camera feed with a print-status footer. Spec: HUD Bambu-printer-
+# camera view (2026-06). The frame itself is pulled over the LAN by
+# core/bambu_camera.py (RTSPS port 322 for the H2D, port-6000 JPEG fallback
+# for P1/A1); this widget is a pure view of data/bambu_camera_frame.jpg.
+# Gated by the HUD_BAMBU_CAMERA config flag (default True).
+_BAMBU_CAMERA_HUD_PROCESS = None
+_BAMBU_CAMERA_HUD_LOCK = threading.Lock()
+_BAMBU_CAMERA_HUD_SCRIPT = os.path.join(_PROJECT_DIR, "hud", "bambu_camera_hud.py")
+_BAMBU_CAMERA_HUD_CONTROL_FILE = os.path.join(
+    _PROJECT_DIR, "bambu_camera_hud_state.json",
+)
+# A 4:3-ish panel large enough to read the build plate. Anchored top-right
+# of the top monitor, below the bambu corner overlay if that's also alive.
+_BAMBU_CAMERA_HUD_W = 360
+_BAMBU_CAMERA_HUD_H = 300
+_BAMBU_CAMERA_HUD_MARGIN = 20  # px gap from the top-right corner
+# Linger after a print finishes so the user catches the final frame.
+_BAMBU_CAMERA_HUD_LINGER_S = 30.0
+_BAMBU_CAMERA_WATCHER_STARTED = False
+_BAMBU_CAMERA_WATCHER_STOP = threading.Event()
+# Manual-off latch so `bambu_camera_off` sticks against the auto-show watcher;
+# cleared when the printer goes idle so the next print can re-arm auto-show.
+_BAMBU_CAMERA_USER_OFF = False
+
 # Workshop HUD — persistent top-right corner widget (arc reactor +
 # CPU/RAM bars + bambu progress + rotating "monitoring" status line).
 # Spec: jarvis_todo.md 2026-05-27 12:15 (workshop_hud).
@@ -752,6 +777,263 @@ def _act_bambu_overlay_status(_: str = "") -> str:
         return ("The print overlay is dismissed (manual), sir. "
                 "Say `bambu overlay on` to re-engage it.")
     return f"The print overlay is dormant, sir — printer state {gs}."
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Bambu chamber-camera HUD — movable PyQt6 panel showing the printer's
+#  built-in camera feed. The frame is pulled over the LAN by
+#  core/bambu_camera.py; this manager owns the widget subprocess + the
+#  background frame grabber's lifecycle.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _bambu_camera_enabled() -> bool:
+    """Master HUD_BAMBU_CAMERA flag (default True). Read lazily so the skill
+    imports cleanly before bobert_companion finishes initialising."""
+    try:
+        import bobert_companion as _bc
+        return bool(getattr(_bc, "HUD_BAMBU_CAMERA", True))
+    except Exception:
+        return True
+
+
+def _start_camera_grabber() -> None:
+    """Spin up the LAN frame grabber (core/bambu_camera.py) so the widget has
+    frames to render. Idempotent and best-effort — a missing module or import
+    error just means the widget shows its 'camera offline' placeholder."""
+    try:
+        import importlib
+        cam = importlib.import_module("core.bambu_camera")
+        cam.start_grabber()
+    except Exception as e:
+        print(f"  [bambu-camera] grabber start skipped: {e}")
+
+
+def _stop_camera_grabber() -> None:
+    """Stop the LAN frame grabber. Best-effort."""
+    try:
+        import importlib
+        cam = importlib.import_module("core.bambu_camera")
+        cam.stop_grabber()
+    except Exception:
+        pass
+
+
+def _bambu_camera_hud_is_alive() -> bool:
+    proc = _BAMBU_CAMERA_HUD_PROCESS
+    if proc is None:
+        return False
+    return proc.poll() is None
+
+
+def _write_bambu_camera_hud_control(**updates) -> None:
+    """Atomic-write the camera-HUD control file so the running widget polls a
+    mode change (e.g. retire) without us racing terminate()."""
+    try:
+        existing = {}
+        if os.path.exists(_BAMBU_CAMERA_HUD_CONTROL_FILE):
+            try:
+                with open(_BAMBU_CAMERA_HUD_CONTROL_FILE, "r",
+                          encoding="utf-8") as f:
+                    existing = json.load(f) or {}
+            except Exception:
+                existing = {}
+        existing.update(updates)
+        tmp = _BAMBU_CAMERA_HUD_CONTROL_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(existing, f)
+        os.replace(tmp, _BAMBU_CAMERA_HUD_CONTROL_FILE)
+    except Exception:
+        # Control file is a nice-to-have; terminate() is the fallback.
+        pass
+
+
+def _resolve_bambu_camera_hud_geometry() -> tuple[int, int, int, int]:
+    """Anchor the camera panel to the top-right of the top monitor. When the
+    bambu corner overlay is also alive it owns the very top-right, so slide
+    the camera panel below it so the two stack cleanly."""
+    mx, my, mw, _mh = _get_monitor_rect()
+    w = _BAMBU_CAMERA_HUD_W
+    h = _BAMBU_CAMERA_HUD_H
+    x = mx + mw - w - _BAMBU_CAMERA_HUD_MARGIN
+    y = my + _BAMBU_CAMERA_HUD_MARGIN
+    if _bambu_overlay_is_alive():
+        y += _BAMBU_OVERLAY_H + 12
+    return x, y, w, h
+
+
+def _launch_bambu_camera_hud() -> tuple[bool, str]:
+    """Spawn the camera HUD subprocess (and the frame grabber). Idempotent."""
+    global _BAMBU_CAMERA_HUD_PROCESS
+    if not _bambu_camera_enabled():
+        return False, ("The printer camera is disabled in settings, sir "
+                       "(HUD_BAMBU_CAMERA).")
+    with _BAMBU_CAMERA_HUD_LOCK:
+        if _bambu_camera_hud_is_alive():
+            _write_bambu_camera_hud_control(mode="on")
+            return True, "The printer camera is already on screen, sir."
+        if not os.path.exists(_BAMBU_CAMERA_HUD_SCRIPT):
+            return False, (f"I'm afraid the camera HUD script is "
+                           f"missing — {_BAMBU_CAMERA_HUD_SCRIPT}.")
+        # Start the LAN grabber first so a frame is on its way by the time
+        # the widget paints, then clear any stale 'off' control entry.
+        _start_camera_grabber()
+        _write_bambu_camera_hud_control(mode="on")
+        x, y, w, h = _resolve_bambu_camera_hud_geometry()
+        try:
+            _BAMBU_CAMERA_HUD_PROCESS = subprocess.Popen(
+                [sys.executable, _BAMBU_CAMERA_HUD_SCRIPT,
+                 "--x", str(x), "--y", str(y),
+                 "--width", str(w), "--height", str(h),
+                 "--parent-pid", str(os.getpid())],
+                creationflags=(subprocess.CREATE_NO_WINDOW
+                               if sys.platform == "win32" else 0),
+                close_fds=True,
+            )
+        except Exception as e:
+            _BAMBU_CAMERA_HUD_PROCESS = None
+            return False, f"I'm afraid the camera HUD failed to launch, sir — {e}."
+        return True, "Printer camera engaged, sir."
+
+
+def _shutdown_bambu_camera_hud(stop_grabber: bool = True) -> tuple[bool, str]:
+    """Terminate the camera HUD subprocess (and optionally the grabber)."""
+    global _BAMBU_CAMERA_HUD_PROCESS
+    with _BAMBU_CAMERA_HUD_LOCK:
+        _write_bambu_camera_hud_control(mode="off")
+        alive = _bambu_camera_hud_is_alive()
+        if not alive:
+            _BAMBU_CAMERA_HUD_PROCESS = None
+        else:
+            try:
+                _BAMBU_CAMERA_HUD_PROCESS.terminate()
+                try:
+                    _BAMBU_CAMERA_HUD_PROCESS.wait(timeout=2.0)
+                except Exception:
+                    # See _shutdown_overlay — kill() may race the process
+                    # exiting; wait() after kill() ensures handle release.
+                    try:
+                        _BAMBU_CAMERA_HUD_PROCESS.kill()
+                    except Exception:
+                        pass
+                    try:
+                        _BAMBU_CAMERA_HUD_PROCESS.wait(timeout=0.1)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            _BAMBU_CAMERA_HUD_PROCESS = None
+        # Stop pulling frames over the LAN once nothing's displaying them.
+        if stop_grabber:
+            _stop_camera_grabber()
+        if not alive:
+            return True, "The printer camera isn't currently on screen, sir."
+        return True, "Printer camera dismissed, sir."
+
+
+def _bambu_camera_watcher() -> None:
+    """Background thread: auto-show the camera while a print is active and
+    retire it after _BAMBU_CAMERA_HUD_LINGER_S of sustained idle/finish.
+    Mirrors _bambu_overlay_watcher. Only runs when
+    BAMBU_CAMERA_AUTO_WHILE_PRINTING is on."""
+    last_active_at = 0.0
+    saw_active_once = False
+    while not _BAMBU_CAMERA_WATCHER_STOP.wait(1.0):
+        try:
+            state = _read_bambu_overlay_state()
+            active = _bambu_is_active(state)
+            now = time.time()
+            if active:
+                last_active_at = now
+                saw_active_once = True
+                if (not _BAMBU_CAMERA_USER_OFF
+                        and not _bambu_camera_hud_is_alive()):
+                    _launch_bambu_camera_hud()
+            else:
+                if saw_active_once and _bambu_camera_hud_is_alive():
+                    if (now - last_active_at) >= _BAMBU_CAMERA_HUD_LINGER_S:
+                        _shutdown_bambu_camera_hud()
+                        saw_active_once = False
+                        _clear_camera_user_off()
+        except Exception:
+            logging.exception("bambu camera watcher iteration failed")
+
+
+def _clear_camera_user_off() -> None:
+    global _BAMBU_CAMERA_USER_OFF
+    _BAMBU_CAMERA_USER_OFF = False
+
+
+def _maybe_start_bambu_camera_watcher() -> None:
+    """Start the camera auto-show watcher exactly once. Respects both
+    HUD_BAMBU_CAMERA (master) and BAMBU_CAMERA_AUTO_WHILE_PRINTING (default
+    False — the camera is opt-in, never pops up unbidden)."""
+    global _BAMBU_CAMERA_WATCHER_STARTED
+    if _BAMBU_CAMERA_WATCHER_STARTED:
+        return
+    if not _bambu_camera_enabled():
+        return
+    auto = False
+    try:
+        import bobert_companion as _bc
+        auto = bool(getattr(_bc, "BAMBU_CAMERA_AUTO_WHILE_PRINTING", False))
+    except Exception:
+        pass
+    if not auto:
+        return
+    t = threading.Thread(
+        target=_bambu_camera_watcher,
+        name="BambuCameraWatcher",
+        daemon=True,
+    )
+    t.start()
+    _BAMBU_CAMERA_WATCHER_STARTED = True
+
+
+def _act_bambu_camera_on(_: str = "") -> str:
+    global _BAMBU_CAMERA_USER_OFF
+    _BAMBU_CAMERA_USER_OFF = False
+    ok, msg = _launch_bambu_camera_hud()
+    return msg if ok else f"REFUSED: {msg}"
+
+
+def _act_bambu_camera_off(_: str = "") -> str:
+    global _BAMBU_CAMERA_USER_OFF
+    _BAMBU_CAMERA_USER_OFF = True
+    ok, msg = _shutdown_bambu_camera_hud()
+    return msg if ok else f"REFUSED: {msg}"
+
+
+def _act_bambu_camera_toggle(_: str = "") -> str:
+    if _bambu_camera_hud_is_alive():
+        return _act_bambu_camera_off("")
+    return _act_bambu_camera_on("")
+
+
+def _act_bambu_camera_status(_: str = "") -> str:
+    if not _bambu_camera_enabled():
+        return ("The printer camera is disabled in settings, sir "
+                "(HUD_BAMBU_CAMERA).")
+    # Surface the grabber's view of the feed when we can read it.
+    feed = ""
+    try:
+        import importlib
+        cam = importlib.import_module("core.bambu_camera")
+        st = cam.get_status()
+        if st.get("ok"):
+            feed = f" Feed is live via the {st.get('path') or 'local'} path."
+        elif st.get("last_error"):
+            feed = f" Feed status: {st.get('last_error')}."
+    except Exception:
+        pass
+    if _bambu_camera_hud_is_alive():
+        x, y, w, h = _resolve_bambu_camera_hud_geometry()
+        return (f"The printer camera is on screen, sir — {w}x{h} at "
+                f"({x}, {y}).{feed}")
+    if _BAMBU_CAMERA_USER_OFF:
+        return ("The printer camera is dismissed (manual), sir. "
+                "Say `show the printer camera` to bring it back.")
+    return f"The printer camera is off, sir.{feed}"
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1612,6 +1894,29 @@ def register(actions: dict):
     actions["bambu_overlay_toggle"] = _act_bambu_overlay_toggle
     actions["bambu_overlay_status"] = _act_bambu_overlay_status
     _maybe_start_bambu_watcher()
+
+    # ── bambu chamber-camera HUD ──
+    # Spec (HUD Bambu-printer-camera view, 2026-06): a movable PyQt6 panel
+    # showing the printer's built-in camera feed (RTSPS for the H2D, JPEG
+    # fallback for P1/A1) with a print-status footer. Gated by the
+    # HUD_BAMBU_CAMERA config flag. On-demand by default; auto-shows while a
+    # print is active only when BAMBU_CAMERA_AUTO_WHILE_PRINTING is set.
+    actions["bambu_camera"]          = _act_bambu_camera_toggle
+    actions["bambu_camera_on"]       = _act_bambu_camera_on
+    actions["bambu_camera_off"]      = _act_bambu_camera_off
+    actions["bambu_camera_toggle"]   = _act_bambu_camera_toggle
+    actions["bambu_camera_status"]   = _act_bambu_camera_status
+    # Friendlier natural-language aliases — the LLM phrases this a dozen ways.
+    actions["printer_camera"]        = _act_bambu_camera_toggle
+    actions["show_printer_camera"]   = _act_bambu_camera_on
+    actions["show_bambu_camera"]     = _act_bambu_camera_on
+    actions["hide_printer_camera"]   = _act_bambu_camera_off
+    actions["hide_bambu_camera"]     = _act_bambu_camera_off
+    actions["print_camera"]          = _act_bambu_camera_toggle
+    actions["printer_cam"]           = _act_bambu_camera_toggle
+    actions["show_print_camera"]     = _act_bambu_camera_on
+    actions["camera_hud"]            = _act_bambu_camera_toggle
+    _maybe_start_bambu_camera_watcher()
 
     # ── workshop HUD (persistent corner widget) ──
     # Spec (2026-05-27 12:15 workshop_hud): a slim always-on-top widget

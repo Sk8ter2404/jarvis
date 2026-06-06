@@ -339,6 +339,27 @@ _INTERNAL_ONLY_ACTIONS |= {
     "workshop_print_monitor",
 }
 
+# 2026-06 — Bambu chamber-camera HUD actions (skills/holographic_overlay).
+# The user-facing voice action documented in PC_CONTROL_PROMPT is
+# show_printer_camera (verb-first reads most naturally); these are its
+# on/off/toggle/status + phrasing aliases, all wired to the same
+# _act_bambu_camera_* handlers. Same pattern as the bambu_overlay_* family.
+_INTERNAL_ONLY_ACTIONS |= {
+    "bambu_camera",          # short alias for bambu_camera_toggle
+    "bambu_camera_on",       # explicit force-on (canonical: show_printer_camera)
+    "bambu_camera_off",      # explicit force-off variant of the toggle
+    "bambu_camera_toggle",   # -_toggle suffix alias for bambu_camera
+    "bambu_camera_status",   # diagnostic status probe (feed path + geometry)
+    "printer_camera",        # natural alias for bambu_camera_toggle
+    "show_bambu_camera",     # verb-prefix alias for bambu_camera_on
+    "hide_printer_camera",   # verb-prefix alias for bambu_camera_off
+    "hide_bambu_camera",     # verb-prefix alias for bambu_camera_off
+    "print_camera",          # natural alias for bambu_camera_toggle
+    "printer_cam",           # short natural alias for bambu_camera_toggle
+    "show_print_camera",     # verb-prefix alias for bambu_camera_on
+    "camera_hud",            # surface-name alias for bambu_camera_toggle
+}
+
 
 # Internal actions belonging to gitignored personal skills load from a
 # gitignored tools/audit_local.py so this shipped auditor names none of them.
