@@ -195,7 +195,8 @@ def _read_uptime_seconds() -> float:
 def _read_gpu_temp_c() -> float | None:
     """Best-effort GPU temperature in Celsius.
     1) nvidia-smi if available (NVIDIA, most reliable)
-    2) psutil.sensors_temperatures() — Windows rarely supports this but try
+    2) HWiNFO shared memory (reliable on Windows when Shared Memory Support is on)
+    3) psutil.sensors_temperatures() — Windows rarely supports this but try
     Returns None if no GPU temp could be read."""
     try:
         exe = shutil.which("nvidia-smi")
@@ -218,11 +219,48 @@ def _read_gpu_temp_c() -> float | None:
     except Exception:
         pass
 
+    # 2) HWiNFO shared memory — reliable on Windows when Shared Memory Support is
+    #    on (psutil.sensors_temperatures rarely returns a GPU temp there).
+    try:
+        from audio import hwinfo
+        gt = hwinfo.summary().get("gpu_temp_c")
+        if gt is not None:
+            return float(gt)
+    except Exception:
+        pass
+
     if _HAS_PSUTIL:
         try:
             sensors = psutil.sensors_temperatures()  # type: ignore[attr-defined]
             for label, entries in (sensors or {}).items():
                 if any(k in label.lower() for k in ("gpu", "nvidia", "amd", "radeon")):
+                    temps = [e.current for e in entries if getattr(e, "current", None)]
+                    if temps:
+                        return float(max(temps))
+        except Exception:
+            pass
+    return None
+
+
+def _read_cpu_temp_c() -> float | None:
+    """Best-effort CPU package temperature in Celsius.
+    1) HWiNFO shared memory — effectively the only reliable CPU-temp source on
+       Windows (psutil has no coretemp there).
+    2) psutil.sensors_temperatures() coretemp/k10temp (Linux mostly).
+    Returns None if no CPU temp could be read."""
+    try:
+        from audio import hwinfo
+        ct = hwinfo.summary().get("cpu_temp_c")
+        if ct is not None:
+            return float(ct)
+    except Exception:
+        pass
+    if _HAS_PSUTIL:
+        try:
+            sensors = psutil.sensors_temperatures()  # type: ignore[attr-defined]
+            for label, entries in (sensors or {}).items():
+                if any(k in label.lower()
+                       for k in ("cpu", "core", "coretemp", "k10", "package", "tctl")):
                     temps = [e.current for e in entries if getattr(e, "current", None)]
                     if temps:
                         return float(max(temps))
@@ -330,6 +368,7 @@ def _gather_pulse() -> dict:
         "ram_used_gb":     ram_used,
         "disk_free_gb":    _read_disk_free_gb(),
         "gpu_temp_c":      _read_gpu_temp_c(),
+        "cpu_temp_c":      _read_cpu_temp_c(),
         "uptime_seconds":  _read_uptime_seconds(),
         "active_apps":     _read_active_app_count(),
         "bambu":           _read_bambu_status(),
@@ -394,8 +433,13 @@ def _format_report(pulse: dict, lead: str = "") -> str:
 
     opener = lead or "All systems nominal, sir."
 
+    cpu_temp = pulse.get("cpu_temp_c")
     parts: list[str] = []
-    parts.append(f"CPU {cpu:.0f} percent, memory {ram:.0f} percent")
+    if cpu_temp is not None:
+        parts.append(f"CPU {cpu:.0f} percent at {cpu_temp:.0f} degrees, "
+                     f"memory {ram:.0f} percent")
+    else:
+        parts.append(f"CPU {cpu:.0f} percent, memory {ram:.0f} percent")
     if gpu is not None:
         verb = "running hot at" if gpu >= GPU_TEMP_ABNORMAL_C else "idling at"
         parts.append(f"GPU {verb} {gpu:.0f} degrees")
@@ -422,6 +466,9 @@ def _format_hud_strip(pulse: dict) -> str:
     """Compact one-line view of the non-redundant metrics — CPU/RAM are
     already on the rings, so we surface GPU/battery/uptime/apps/net here."""
     bits: list[str] = []
+    cpu_temp = pulse.get("cpu_temp_c")
+    if cpu_temp is not None:
+        bits.append(f"CPU {cpu_temp:.0f}C")
     gpu = pulse.get("gpu_temp_c")
     if gpu is not None:
         bits.append(f"GPU {gpu:.0f}C")
