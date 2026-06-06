@@ -1348,21 +1348,71 @@ class CallToolTests(_StateIsolatedTest):
         self.assertIn("bad tool args", res["error"])
         self.assertIn("fs.read_file", res["error"])
 
-    def test_custom_timeout_is_passed_to_future_result(self):
+    def test_custom_timeout_enforced_by_wait_for_with_backstop(self):
+        # The real timeout is enforced by asyncio.wait_for (which actually
+        # cancels the coroutine); the outer future.result() waits a hair longer
+        # as a backstop against a dead/stalled loop.
         session = mock.MagicMock()
         m._state["loop"] = FakeLoop()
         m._state["sessions"]["fs"] = session
         session.call_tool.return_value = mock.MagicMock()
         captured = {}
 
+        def fake_wait_for(awaitable, timeout):
+            captured["wait_for_timeout"] = timeout
+            if hasattr(awaitable, "close"):
+                try:
+                    awaitable.close()
+                except Exception:
+                    pass
+            return mock.MagicMock()
+
         class CapFuture(FakeFuture):
             def result(self, timeout=None):
-                captured["timeout"] = timeout
+                captured["result_timeout"] = timeout
                 return FakeCallResult(content=[])
-        with mock.patch.object(m.asyncio, "run_coroutine_threadsafe",
+
+        with mock.patch.object(m.asyncio, "wait_for", new=fake_wait_for), \
+             mock.patch.object(m.asyncio, "run_coroutine_threadsafe",
                                return_value=CapFuture()):
             m.call_tool("fs", "read_file", {}, timeout=7.5)
-        self.assertEqual(captured["timeout"], 7.5)
+        self.assertEqual(captured["wait_for_timeout"], 7.5)
+        self.assertEqual(captured["result_timeout"], 7.5 + 5.0)
+
+    def test_real_timeout_actually_cancels_the_coroutine(self):
+        # End-to-end against a REAL bg loop: a hung tool call must time out AND
+        # the coroutine must actually be cancelled. The bug was that fut.cancel()
+        # on the concurrent.futures.Future no-ops once the asyncio task is
+        # running, leaking the coroutine forever; asyncio.wait_for fixes it.
+        import threading
+        import asyncio as _aio
+        loop = _aio.new_event_loop()
+        th = threading.Thread(target=loop.run_forever, daemon=True)
+        th.start()
+
+        def _stop():
+            loop.call_soon_threadsafe(loop.stop)
+            th.join(timeout=2.0)
+        self.addCleanup(_stop)
+
+        cancelled = threading.Event()
+
+        class _HangingSession:
+            async def call_tool(self, tool, args):
+                try:
+                    await _aio.sleep(30)
+                except _aio.CancelledError:
+                    cancelled.set()
+                    raise
+
+        m._state["loop"] = loop
+        m._state["sessions"]["fs"] = _HangingSession()
+        res = m.call_tool("fs", "read_file", {}, timeout=0.2)
+        self.assertFalse(res["ok"])
+        self.assertIn("timed out", res["error"])
+        self.assertTrue(
+            cancelled.wait(timeout=2.0),
+            "the hung session.call_tool coroutine was NOT cancelled on timeout")
 
 
 # ──────────────────────────────────────────────────────────────────────
