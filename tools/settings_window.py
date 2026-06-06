@@ -116,6 +116,83 @@ def installed_ollama_models(base_url: str = OLLAMA_BASE_URL) -> list[str]:
     except Exception:
         return list(OLLAMA_MODEL_FALLBACK)
 
+
+# Synthetic mic-picker choices that don't map to a real device index. They are
+# part of the MICROPHONE_INDEX contract the monolith already honours (None =
+# auto / PREFERRED_INPUT_DEVICES lookup; a NEGATIVE index = hard-off, no capture
+# stream is opened — see bobert_companion._mic_input_disabled). The label text
+# is what the user sees; the value is what persists to user_settings.json.
+MIC_AUTO_LABEL = "System default (auto)"
+MIC_OFF_LABEL = "Off (no mic)"
+MIC_AUTO_INDEX = None
+MIC_OFF_INDEX = -1
+
+
+def list_input_devices() -> list[tuple[str, int]]:
+    """Available audio INPUT devices as ``(label, index)`` tuples, e.g.
+    ``("[2] Microphone (Realtek)", 2)``.
+
+    Import-safe and never raises: ``sounddevice`` is imported lazily (it pulls
+    in PortAudio), so importing this module for the tests / schema never needs
+    it. Mirrors ``installed_ollama_models()``'s lazy-and-tolerant pattern — any
+    failure (no sounddevice, no PortAudio, headless CI) returns ``[]`` so the
+    picker still renders with only the synthetic auto/off choices.
+
+    Only the device NAME + its query index are read; no stream is opened.
+    """
+    out: list[tuple[str, int]] = []
+    try:
+        import sounddevice as sd  # lazy: PortAudio dependency, GUI-only
+        for idx, dev in enumerate(sd.query_devices()):
+            try:
+                if int(dev.get("max_input_channels", 0)) > 0:
+                    name = str(dev.get("name", "")).strip() or f"device {idx}"
+                    out.append((f"[{idx}] {name}", idx))
+            except (TypeError, ValueError, KeyError):
+                continue
+    except Exception:
+        return []
+    return out
+
+
+def mic_choices(saved_index=MIC_AUTO_INDEX) -> list[tuple[str, int]]:
+    """The full ordered ``(label, index)`` list for the mic picker combobox:
+    the two synthetic choices (auto / off) followed by every live input device.
+
+    If ``saved_index`` is a real device index that is NOT currently present
+    (e.g. a USB mic that's unplugged right now), a synthetic
+    ``"[idx] (saved device, not connected)"`` row is appended so the saved
+    selection stays visible and round-trips — mirroring how the ``combo`` branch
+    keeps an unknown saved Ollama tag visible rather than silently dropping it.
+    """
+    choices: list[tuple[str, int]] = [
+        (MIC_AUTO_LABEL, MIC_AUTO_INDEX),
+        (MIC_OFF_LABEL, MIC_OFF_INDEX),
+    ]
+    live = list_input_devices()
+    choices.extend(live)
+    if isinstance(saved_index, int) and saved_index >= 0 \
+            and saved_index not in [i for _, i in live]:
+        choices.append((f"[{saved_index}] (saved device, not connected)",
+                        saved_index))
+    return choices
+
+
+def mic_index_to_label(index, choices: list[tuple[str, int]]) -> str:
+    """Resolve a stored MICROPHONE_INDEX to the combobox label to preselect."""
+    for label, idx in choices:
+        if idx == index:
+            return label
+    return MIC_AUTO_LABEL
+
+
+def mic_label_to_index(label: str, choices: list[tuple[str, int]]):
+    """Translate a chosen combobox label back to the int (or None) to persist."""
+    for lbl, idx in choices:
+        if lbl == label:
+            return idx
+    return MIC_AUTO_INDEX
+
 # Order matters — drives both the Notebook tab order and `--tab` resolution.
 TAB_ORDER = ["voice", "ai", "privacy", "integrations", "advanced"]
 TAB_LABELS = {
@@ -172,6 +249,23 @@ SCHEMA: dict[str, dict] = {
         "help": "While music plays, only obey commands that start with 'JARVIS' "
                 "(stops replies to song lyrics). Turn OFF if it keeps cutting "
                 "you off while your own music is on.",
+    },
+    "MICROPHONE_INDEX": {
+        "tab": "voice", "label": "Microphone", "type": "device",
+        "default": None,
+        "help": "Which mic to use. 'System default (auto)' follows the "
+                "preferred-device list below and auto-switches as devices come "
+                "and go; pick a specific device to pin it; 'Off (no mic)' "
+                "disables capture entirely. The list is your live input devices "
+                "(probed when this window opens).",
+    },
+    "PREFERRED_INPUT_DEVICES": {
+        "tab": "voice", "label": "Preferred mic names (auto mode)",
+        "type": "text", "default": [],
+        "help": "One device-name substring per line, most-preferred first. In "
+                "'System default (auto)' mode JARVIS picks the first connected "
+                "match and auto-switches when you plug/unplug. Ignored when a "
+                "specific mic is pinned above. Empty = use the OS default.",
     },
     "TTS_VOICE": {
         "tab": "voice", "label": "TTS voice", "type": "str",
@@ -433,7 +527,8 @@ SCHEMA: dict[str, dict] = {
 
 # Field types whose key is a real persisted setting (everything except the
 # read-only "status" rows, whose keys start with "_status_").
-_PERSISTED_TYPES = {"bool", "enum", "str", "combo", "int", "float", "text", "routing"}
+_PERSISTED_TYPES = {"bool", "enum", "str", "combo", "int", "float", "text",
+                    "routing", "device"}
 
 
 def persisted_keys() -> list[str]:
@@ -488,6 +583,21 @@ def coerce_value(spec: dict, raw):
             # Free-form string with SUGGESTED choices: unlike enum, a value
             # outside `choices` is allowed (the user may type any Ollama tag).
             return str(raw)
+        if typ == "device":
+            # A device index: int | None, matching the MICROPHONE_INDEX
+            # contract (None = auto / preferred-list lookup, a negative index =
+            # hard-off). Persist the INT (or None), never the friendly label —
+            # so what lands in user_settings.json is exactly what
+            # core.config._apply_user_settings coerces back. null / "" / None ->
+            # the default (None); 3 / "3" / -1 -> int; a non-numeric value falls
+            # through to the default rather than raising.
+            if raw is None:
+                return default
+            if isinstance(raw, bool):           # guard: bool is an int subclass
+                return default
+            if isinstance(raw, str) and raw.strip() == "":
+                return default
+            return int(raw)
         if typ == "text":
             # Stored as a list of lines; accept a list or a newline string.
             if isinstance(raw, list):
@@ -761,6 +871,12 @@ def run_gui(start_tab: int = 0) -> int:
     # Tk variable per persisted key; widgets read/write these.
     vars_by_key: dict = {}
     text_widgets: dict = {}
+    # Mic-picker (type "device") widgets: key -> (StringVar of the chosen label,
+    # [(label, index)] choices). _collect() translates the label back to the int
+    # index to persist. Kept separate from vars_by_key because that path stores
+    # the var's raw string value, but a device must persist its int, not the
+    # friendly label.
+    device_widgets: dict = {}
 
     # VRAM budget panel — widgets populated when the AI tab is built; the engine
     # is loaded lazily and may be absent (no nvidia-smi / import error), in which
@@ -928,9 +1044,24 @@ def run_gui(start_tab: int = 0) -> int:
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
+        # Mouse-wheel scrolling, scoped to the canvas the pointer is over.
+        # `bind_all` is application-wide and was re-bound per tab, so the LAST
+        # tab built (Advanced) captured the wheel for EVERY tab — on the other
+        # tabs the wheel scrolled the hidden Advanced canvas (B17). Binding the
+        # global wheel only while the pointer is inside THIS canvas (and
+        # releasing it on leave) makes each tab scroll its own content.
         def _on_wheel(event):
             canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind_all("<MouseWheel>", _on_wheel)
+
+        def _bind_wheel(_event):
+            canvas.bind_all("<MouseWheel>", _on_wheel)
+
+        def _unbind_wheel(_event):
+            canvas.unbind_all("<MouseWheel>")
+
+        for w in (canvas, inner):
+            w.bind("<Enter>", _bind_wheel)
+            w.bind("<Leave>", _unbind_wheel)
 
         row = 0
         inner.columnconfigure(1, weight=1)
@@ -1034,6 +1165,29 @@ def run_gui(start_tab: int = 0) -> int:
                 row += 1
                 continue
 
+            if typ == "device":
+                # Readonly dropdown of live input devices + the synthetic
+                # auto/off choices. The combobox shows friendly LABELS; the int
+                # index (or None) is recovered in _collect() via device_widgets.
+                ttk.Label(inner, text=label).grid(
+                    row=row, column=0, sticky="w", padx=2, pady=(6, 2))
+                saved = settings.get(key, spec.get("default"))
+                try:
+                    saved = int(saved) if saved is not None else None
+                except (TypeError, ValueError):
+                    saved = None
+                choices = mic_choices(saved)
+                labels = [lbl for lbl, _ in choices]
+                var = tk.StringVar(value=mic_index_to_label(saved, choices))
+                device_widgets[key] = (var, choices)
+                ttk.Combobox(inner, textvariable=var, state="readonly",
+                             values=labels, width=28).grid(
+                    row=row, column=1, sticky="we", padx=2, pady=(6, 2))
+                row += 1
+                _add_help(inner, spec, row)
+                row += 1
+                continue
+
             # enum / str / int / float → label + control on one row.
             ttk.Label(inner, text=label).grid(
                 row=row, column=0, sticky="w", padx=2, pady=(6, 2))
@@ -1097,6 +1251,9 @@ def run_gui(start_tab: int = 0) -> int:
             out[key] = var.get()
         for key, widget in text_widgets.items():
             out[key] = widget.get("1.0", "end")
+        # Device pickers persist the int index, not the chosen friendly label.
+        for key, (var, choices) in device_widgets.items():
+            out[key] = mic_label_to_index(var.get(), choices)
         # Fold routing sub-keys ("MODEL_ROUTING::vision") into their nested dict.
         for compound in [c for c in list(out) if "::" in c]:
             base, fn = compound.split("::", 1)

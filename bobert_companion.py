@@ -715,20 +715,15 @@ from core.state import *  # noqa: F401,F403
 
 # Audio device auto-switching
 # ─────────────────────────────
-# Lists of preferred device-name substrings, in order. Bobert picks the
-# first one that's currently connected. When you plug/unplug your headset,
-# he switches automatically within a few seconds. Set MICROPHONE_INDEX /
-# SPEAKER_INDEX to a number to override and disable auto-switching.
-# Populated from the JARVIS_PREFERRED_INPUT_DEVICES / _OUTPUT_DEVICES env
-# vars (comma-separated substrings); default empty so a fresh clone simply
-# uses whatever the OS reports as default until the owner sets the hints.
-PREFERRED_INPUT_DEVICES  = [s.strip() for s in os.getenv("JARVIS_PREFERRED_INPUT_DEVICES", "").split(",") if s.strip()]
-PREFERRED_OUTPUT_DEVICES = [s.strip() for s in os.getenv("JARVIS_PREFERRED_OUTPUT_DEVICES", "").split(",") if s.strip()]
-
-# Manual overrides — set to an integer index to force a specific device and
-# disable auto-switching. None = use PREFERRED_*_DEVICES lookup.
-MICROPHONE_INDEX = None
-SPEAKER_INDEX    = None
+# PREFERRED_INPUT_DEVICES / PREFERRED_OUTPUT_DEVICES / MICROPHONE_INDEX /
+# SPEAKER_INDEX moved to core/config.py (2026-06) and arrive via the
+# `from core.config import *` above. They live there — NOT here — so the
+# Settings-GUI mic-device picker's user_settings.json override actually reaches
+# the runtime: a redeclaration here would run AFTER the wildcard import and
+# silently shadow any saved MICROPHONE_INDEX (the picker blocker). Do NOT
+# re-declare them in this file. The staging block below still rebinds
+# MICROPHONE_INDEX = -1 in this module's namespace for the no-mic green
+# candidate; that's an intentional per-process override, not a default.
 
 # How often to re-check what devices are connected (seconds)
 DEVICE_CHECK_INTERVAL = 4.0
