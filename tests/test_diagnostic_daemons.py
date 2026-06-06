@@ -333,8 +333,58 @@ class PersistenceTests(_Base):
         st = dd._read_state()
         self.assertTrue(st["paused"])
         self.assertEqual(st["marker"], 123)
-        # tmp file should have been replaced (not left behind).
+        # No stray tempfile left behind. The shared atomic writer uses a unique
+        # mkstemp name (not the old fixed "<state>.json.tmp"), so neither that
+        # legacy name nor any *.tmp sibling should survive a successful write.
         self.assertFalse(os.path.exists(dd.STATE_FILE + ".tmp"))
+        leftovers = [f for f in os.listdir(dd.DATA_DIR) if f.endswith(".tmp")]
+        self.assertEqual(leftovers, [], f"stray tempfiles: {leftovers}")
+
+    def test_write_state_routes_through_atomic_writer(self):
+        # The write MUST go through core.atomic_io._atomic_write_json (unique
+        # mkstemp tempfile + fsync + WinError-5 retry) rather than the old
+        # fixed-".tmp" + os.replace that raced across the four daemon threads
+        # and fired "[WinError 5] Access is denied: ...json.tmp -> ...json"
+        # live. Patch the symbol the module imported and assert it's invoked.
+        state = {"paused": True, "marker": 7}
+        with mock.patch.object(dd, "_atomic_write_json") as aw:
+            dd._write_state(state)
+        aw.assert_called_once_with(dd.STATE_FILE, state, indent=2)
+
+    def test_write_state_atomic_helper_roundtrips(self):
+        # End-to-end through the real atomic helper: bytes land on disk and
+        # read back intact, and no tempfile is orphaned.
+        dd._write_state({"deep_audit": {"runs": 3}, "paused": False})
+        on_disk = self._read_state_file()
+        self.assertEqual(on_disk["deep_audit"]["runs"], 3)
+        self.assertFalse(on_disk["paused"])
+        self.assertEqual(
+            [f for f in os.listdir(dd.DATA_DIR) if f.endswith(".tmp")], [])
+
+    def test_write_state_survives_winerror5_replace_retry(self):
+        # Simulate the live failure mode: the final os.replace inside the
+        # atomic writer hits PermissionError/WinError 5 once (a concurrent
+        # reader holds the destination open) and then succeeds on retry. The
+        # state must still round-trip and _write_state must not raise.
+        real_replace = os.replace
+        calls = {"n": 0}
+
+        def flaky_replace(src, dst):
+            if dst == dd.STATE_FILE and calls["n"] == 0:
+                calls["n"] += 1
+                raise PermissionError(5, "Access is denied")
+            return real_replace(src, dst)
+
+        with mock.patch.object(dd.os, "name", "nt"), \
+                mock.patch("core.atomic_io.os.replace", side_effect=flaky_replace), \
+                mock.patch("core.atomic_io.time.sleep"):
+            dd._write_state({"paused": True, "marker": 99})
+        self.assertGreaterEqual(calls["n"], 1)        # the retry actually fired
+        st = self._read_state_file()
+        self.assertTrue(st["paused"])
+        self.assertEqual(st["marker"], 99)
+        self.assertEqual(
+            [f for f in os.listdir(dd.DATA_DIR) if f.endswith(".tmp")], [])
 
     def test_write_state_handles_failure_gracefully(self):
         # makedirs raising must be swallowed (printed, not raised).
