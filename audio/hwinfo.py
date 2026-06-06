@@ -149,15 +149,26 @@ def summary() -> dict:
         "clocks_mhz": [], "voltages_v": [],
     }
 
-    def _is_temp(u: str) -> bool:
-        # HWiNFO temps come through as "C" or "°C" depending on encoding.
-        return u.replace("°", "").strip().upper() in ("C", "CEL")
+    def _temp_unit(u: str) -> str | None:
+        # HWiNFO temps come through as "C"/"°C" or, if HWiNFO is set to display
+        # Fahrenheit globally, "F"/"°F"/"FAH" depending on encoding. Returns
+        # "C", "F", or None (not a temperature unit).
+        bare = u.replace("°", "").strip().upper()
+        if bare in ("C", "CEL"):
+            return "C"
+        if bare in ("F", "FAH"):
+            return "F"
+        return None
 
     for label, value, unit in rs:
         low = label.lower()
         u = (unit or "").strip()
         uu = u.upper()
-        if _is_temp(u):
+        tu = _temp_unit(u)
+        if tu is not None:
+            # Keep cpu_temp_c/gpu_temp_c Celsius-canonical: convert °F on ingest.
+            if tu == "F":
+                value = (value - 32) / 1.8
             out["temps_c"].append((label, value))
         elif uu == "RPM":
             out["fans_rpm"].append((label, value))
