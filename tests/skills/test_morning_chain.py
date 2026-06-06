@@ -142,6 +142,32 @@ class MorningChainTests(unittest.TestCase):
              mock.patch("builtins.open", mock.mock_open(read_data="[1,2,3]")):
             self.assertFalse(self.mod._skill_already_fired_today("arrival"))
 
+    # ── _arrival_v2_fired_today (mirror suppression vs morning_arrival_v2) ─
+    def test_arrival_v2_fired_today_true_when_v2_briefed(self):
+        # morning_arrival_v2 is NOT in SKILL_NAMES; the chain must still see its
+        # same-day fire (via this helper) so the two can't double-brief.
+        fake_v2 = types.ModuleType("skill_morning_arrival_v2")
+        fake_v2._already_fired_today = lambda: True
+        with mock.patch.dict(sys.modules, {"skill_morning_arrival_v2": fake_v2}):
+            self.assertTrue(self.mod._arrival_v2_fired_today())
+
+    def test_arrival_v2_fired_today_false_when_v2_idle(self):
+        fake_v2 = types.ModuleType("skill_morning_arrival_v2")
+        fake_v2._already_fired_today = lambda: False
+        with mock.patch.dict(sys.modules, {"skill_morning_arrival_v2": fake_v2}):
+            self.assertFalse(self.mod._arrival_v2_fired_today())
+
+    def test_arrival_v2_fired_today_defensive_on_error(self):
+        # A broken v2 must never block a chain decision -> swallowed as False.
+        fake_v2 = types.ModuleType("skill_morning_arrival_v2")
+
+        def _boom():
+            raise RuntimeError("v2 broke")
+
+        fake_v2._already_fired_today = _boom
+        with mock.patch.dict(sys.modules, {"skill_morning_arrival_v2": fake_v2}):
+            self.assertFalse(self.mod._arrival_v2_fired_today())
+
 
 class MorningChainImportSkillTests(unittest.TestCase):
     def setUp(self):

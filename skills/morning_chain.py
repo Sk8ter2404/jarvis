@@ -169,6 +169,29 @@ def _skill_already_fired_today(short_name: str) -> bool:
         return False
 
 
+def _arrival_v2_fired_today() -> bool:
+    """True if skills/morning_arrival_v2's presence-watcher already briefed
+    today. v2 is NOT one of the chain's SKILL_NAMES (it runs its own watcher),
+    so without this the chain can't see a v2 fire and the two double-brief. This
+    is the mirror of v2's _chain_morning_briefing_fired_today(): v2 stands down
+    when the chain fires; the chain stands down when v2 fired. Resolved the same
+    way v2 resolves the chain (the loader registers skills as 'skill_<name>'),
+    and defensive -- returns False on any failure so it can never block a chain
+    decision."""
+    try:
+        import sys
+        import importlib as _il
+        v2 = sys.modules.get("skill_morning_arrival_v2")
+        if v2 is None:
+            try:
+                v2 = _il.import_module("skills.morning_arrival_v2")
+            except Exception:
+                v2 = _il.import_module("morning_arrival_v2")
+        return bool(v2._already_fired_today())
+    except Exception:
+        return False
+
+
 # ─── skill dispatch ──────────────────────────────────────────────────────
 
 def _import_skill(short_name: str):
@@ -254,12 +277,14 @@ def _watch_for_first_wake() -> None:
                     and CHAIN_START_HOUR <= hour < CHAIN_END_HOUR
                     and dispatched_for_date != today):
                 chosen = _choose_skill_for_today(hour)
-                if _skill_already_fired_today(chosen):
-                    # Manual trigger (or prior chain dispatch the same JARVIS
-                    # process can't remember after restart) already covered
-                    # today's pick — treat the day as handled and stop racing.
-                    print(f"  [morning-chain] '{chosen}' already fired today "
-                          f"— chain idle for {today}")
+                if _skill_already_fired_today(chosen) or _arrival_v2_fired_today():
+                    # Manual trigger, a prior chain dispatch (this JARVIS process
+                    # can't remember across a restart), OR morning_arrival_v2's
+                    # presence-watcher already covered today -- treat the day as
+                    # handled and stop racing. The v2 check mirrors v2's own
+                    # chain-suppression so the two can never double-brief.
+                    print(f"  [morning-chain] today already briefed "
+                          f"(pick was '{chosen}') -- chain idle for {today}")
                     dispatched_for_date = today
                 else:
                     print(f"  [morning-chain] wake @ {hour:02d}:xx, "
