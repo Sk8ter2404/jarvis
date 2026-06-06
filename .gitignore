@@ -102,6 +102,7 @@ injected_commands*.json
 
 # --- Per-user editor / agent settings (local, not shipped) -------------------
 .claude/settings.local.json
+.claude/worktrees/
 
 # --- All runtime data & learned memory (PII) — ship templates instead --------
 data/*
@@ -133,6 +134,14 @@ SETUP_GUIDE.md
 docs/CHAPPIE_MODE_SPEC.md
 _boot_jarvis.ps1
 _diag_loop.sh
+
+# --- Owner-local prose, notes & scratch transcripts (never shipped) ----------
+# Untracked, owner-authored files NOT caught by any class above (they live at
+# the repo root and end in .md/.txt/.ps1), so auto_publish's scoped stage — or a
+# stray `git add` — would sweep them into a PUBLIC PR. tools/auto_publish.py also
+# backstops these in _NEVER_STAGE_*. See REVIEW_FINDINGS_2.md P0-4.
+VOICE_COMMAND_TESTS.md
+_mine_*
 
 # --- Staging runtime ---------------------------------------------------------
 data_staging/

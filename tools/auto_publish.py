@@ -82,6 +82,13 @@ _NEVER_STAGE_DIRS = ("logs/", "logs_staging/", "data/", "data_staging/",
 _NEVER_STAGE_SUFFIXES = (".log",)
 # substrings that flag a transcript or a nested-repo / embedded-repo path
 _NEVER_STAGE_SUBSTRINGS = ("transcript", "/.git/", ".git/")
+# Owner-authored prose/scratch that none of the classes above catch (it lives at
+# the repo root and ends in .md/.txt/.ps1) yet must never reach a public PR.
+# Matched on the BASENAME so a "mine" substring elsewhere can't false-trip a
+# legitimate source file. .gitignore is the primary guard; this is the hard
+# backstop for a tree that has not (yet) ignored them. See REVIEW_FINDINGS_2 P0-4.
+_NEVER_STAGE_BASENAMES = ("voice_command_tests.md",)
+_NEVER_STAGE_BASENAME_PREFIXES = ("_mine_",)
 
 
 def _norm(path: str) -> str:
@@ -99,6 +106,9 @@ def _is_never_stage(path: str) -> bool:
     if low.endswith(_NEVER_STAGE_SUFFIXES):
         return True
     if any(seg in low for seg in _NEVER_STAGE_SUBSTRINGS):
+        return True
+    base = low.rsplit("/", 1)[-1]
+    if base in _NEVER_STAGE_BASENAMES or base.startswith(_NEVER_STAGE_BASENAME_PREFIXES):
         return True
     return any(p == d.rstrip("/") or p.startswith(d) for d in _NEVER_STAGE_DIRS)
 

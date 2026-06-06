@@ -200,6 +200,45 @@ class ScopedStageTests(unittest.TestCase):
                   "audio/itunes_bridge.py", "skills/face_id.py"):
             self.assertFalse(auto_publish._is_never_stage(p), p)
 
+    def test_is_never_stage_covers_owner_prose(self):
+        # P0-4 follow-up: owner-authored prose/scratch that the dir/suffix/
+        # substring classes miss (root-level .md/.txt/.ps1) must still be
+        # backstopped so it can't reach a public PR even if a tree forgets to
+        # gitignore it. Matched on the BASENAME (the `_mine_` prefix, or the
+        # exact VOICE_COMMAND_TESTS.md) at any depth.
+        for p in ("_mine_assistant.txt", "_mine_signal.ps1", "_mine_turns.ps1",
+                  "VOICE_COMMAND_TESTS.md", "sub/dir/_mine_notes.txt",
+                  "nested/VOICE_COMMAND_TESTS.md"):
+            self.assertTrue(auto_publish._is_never_stage(p), p)
+        # benign look-alikes — a "mine" substring (not the `_mine_` basename
+        # prefix) or a differently-named doc — must NOT be excluded.
+        for p in ("core/mine.py", "skills/determine_intent.py",
+                  "tools/examine_logs.py", "docs/VOICE_COMMANDS.md"):
+            self.assertFalse(auto_publish._is_never_stage(p), p)
+
+    def test_owner_prose_untracked_never_added(self):
+        # The exact gap P0-4 flagged: these untracked owner files sit at the
+        # repo root, are NOT under a never-stage dir, do not end in .log, and
+        # hold no "transcript" — yet must never be staged. check-ignore here
+        # defaults to "not ignored" (FakeRunner), so this proves the
+        # _NEVER_STAGE_* backstop excludes them independently of .gitignore.
+        porcelain = (
+            "?? _mine_assistant.txt\n"
+            "?? _mine_signal.ps1\n"
+            "?? _mine_turns.ps1\n"
+            "?? VOICE_COMMAND_TESTS.md\n"
+            "?? core/new_feature.py\n"      # the one legitimate new source file
+        )
+        r = FakeRunner({"status": (0, porcelain, ""),
+                        "diff": (0, "core/new_feature.py\n", "")})
+        ok, why = auto_publish._scoped_stage(r)
+        self.assertTrue(ok, why)
+        added = self._added_paths(r)
+        self.assertEqual(added, ["core/new_feature.py"])
+        for leak in ("_mine_assistant.txt", "_mine_signal.ps1",
+                     "_mine_turns.ps1", "VOICE_COMMAND_TESTS.md"):
+            self.assertNotIn(leak, added)
+
 
 class ScopedStageRealGitTests(unittest.TestCase):
     """End-to-end against REAL git in a throwaway repo: proves the actual fix
