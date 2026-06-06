@@ -1562,6 +1562,138 @@ class OptionalSkillBridgeTests(SectionFiveBase):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  Background-audio wake gate: _should_refuse_background_audio + wake-word mode
+# ════════════════════════════════════════════════════════════════════════════
+class BackgroundAudioGateTests(SectionFiveBase):
+    def setUp(self):
+        import core.config as _cfg
+        bc = self.bc
+        self._cfg = _cfg
+        # Save+restore BOTH the runtime mirror and the config constant so no
+        # state leaks into sibling tests (other classes read these globals).
+        self._orig_runtime = bc._require_wake_runtime
+        self._orig_cfg = _cfg.REQUIRE_WAKE_MODE
+        self.addCleanup(self._restore)
+        bc._require_wake_runtime = False
+        _cfg.REQUIRE_WAKE_MODE = False
+
+    def _restore(self):
+        self.bc._require_wake_runtime = self._orig_runtime
+        self._cfg.REQUIRE_WAKE_MODE = self._orig_cfg
+
+    def test_wake_prefix_always_passes(self):
+        bc = self.bc
+        # A clear leading "JARVIS ..." passes even with every gate demanding it.
+        bc._require_wake_runtime = True
+        with mock.patch.object(bc, "_smtc_media_playing", return_value=True):
+            refuse, why = bc._should_refuse_background_audio("jarvis pause")
+        self.assertFalse(refuse)
+        self.assertEqual(why, "")
+
+    def test_wake_mode_refuses_non_wake(self):
+        bc = self.bc
+        bc._require_wake_runtime = True
+        # Force the other auto-gates off so the reason is unambiguously the toggle.
+        with mock.patch.object(bc, "_smtc_media_playing", return_value=False), \
+             mock.patch.object(bc, "_audio_music_should_refuse_wake",
+                               return_value=False):
+            refuse, why = bc._should_refuse_background_audio("what time is it")
+        self.assertTrue(refuse)
+        self.assertEqual(why, "wake-word mode")
+
+    def test_smtc_playing_refuses_non_wake(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_smtc_media_playing", return_value=True), \
+             mock.patch.object(bc, "_audio_music_should_refuse_wake",
+                               return_value=False):
+            refuse, why = bc._should_refuse_background_audio("turn the lights on")
+        self.assertTrue(refuse)
+        self.assertEqual(why, "media playing")
+
+    def test_all_quiet_passes(self):
+        bc = self.bc
+        # Toggle off, no media, no room music → behaviour-preserving pass-through.
+        with mock.patch.object(bc, "_smtc_media_playing", return_value=False), \
+             mock.patch.object(bc, "_audio_music_should_refuse_wake",
+                               return_value=False):
+            refuse, why = bc._should_refuse_background_audio("turn the lights on")
+        self.assertFalse(refuse)
+        self.assertEqual(why, "")
+
+    def test_room_music_refuses_non_wake(self):
+        bc = self.bc
+        # Only the spectral room-music detector trips; SMTC silent, toggle off.
+        with mock.patch.object(bc, "_smtc_media_playing", return_value=False), \
+             mock.patch.object(bc, "_audio_music_should_refuse_wake",
+                               return_value=True):
+            refuse, why = bc._should_refuse_background_audio("some lyric line")
+        self.assertTrue(refuse)
+        self.assertEqual(why, "room music")
+
+    def test_gate_never_raises(self):
+        bc = self.bc
+        # Even if an underlying probe explodes, the gate fails OPEN (False, "").
+        def _boom(_t):
+            raise RuntimeError("probe down")
+        with mock.patch.object(bc, "_smtc_media_playing", side_effect=_boom):
+            refuse, why = bc._should_refuse_background_audio("hello there")
+        self.assertFalse(refuse)
+        self.assertEqual(why, "")
+
+
+class WakeWordModeActionTests(SectionFiveBase):
+    def setUp(self):
+        import core.config as _cfg
+        bc = self.bc
+        self._cfg = _cfg
+        self._orig_runtime = bc._require_wake_runtime
+        self._orig_cfg = _cfg.REQUIRE_WAKE_MODE
+        self.addCleanup(self._restore)
+        bc._require_wake_runtime = False
+        _cfg.REQUIRE_WAKE_MODE = False
+
+    def _restore(self):
+        self.bc._require_wake_runtime = self._orig_runtime
+        self._cfg.REQUIRE_WAKE_MODE = self._orig_cfg
+
+    def test_set_on_sets_both_flags(self):
+        bc = self.bc
+        msg = bc._act_wake_word_mode_set(True)
+        self.assertTrue(bc._require_wake_runtime)
+        self.assertTrue(self._cfg.REQUIRE_WAKE_MODE)
+        self.assertIn("wake-word mode on", msg.lower())
+
+    def test_set_off_clears_both_flags(self):
+        bc = self.bc
+        bc._require_wake_runtime = True
+        self._cfg.REQUIRE_WAKE_MODE = True
+        msg = bc._act_wake_word_mode_set(False)
+        self.assertFalse(bc._require_wake_runtime)
+        self.assertFalse(self._cfg.REQUIRE_WAKE_MODE)
+        self.assertIn("wake-word mode off", msg.lower())
+
+    def test_status_reports_on_and_media(self):
+        bc = self.bc
+        bc._require_wake_runtime = True
+        with mock.patch.object(bc, "_smtc_media_playing", return_value=True):
+            msg = bc._act_wake_word_mode_status()
+        low = msg.lower()
+        self.assertIn("on", low)
+        self.assertIn("playing", low)
+
+    def test_actions_registered(self):
+        bc = self.bc
+        for name in ("wake_word_mode_on", "wake_word_mode_off",
+                     "wake_word_mode_status"):
+            self.assertIn(name, bc.ACTIONS)
+        # The on/off lambdas drive the same setter and flip the runtime flag.
+        bc.ACTIONS["wake_word_mode_on"]("")
+        self.assertTrue(bc._require_wake_runtime)
+        bc.ACTIONS["wake_word_mode_off"]("")
+        self.assertFalse(bc._require_wake_runtime)
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  _ambient_learning_feed  (silent overheard-utterance persistence)
 # ════════════════════════════════════════════════════════════════════════════
 class AmbientLearningFeedTests(SectionFiveBase):

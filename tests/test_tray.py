@@ -2429,6 +2429,16 @@ class AppleMusicMenuTests(TrayTestBase):
     now-playing header, and wires each verb to the right command — even when the
     bridge is absent (the items still build; the label degrades)."""
 
+    def setUp(self):
+        super().setUp()
+        # The now-playing header consults SMTC (core.media_now_playing) first;
+        # pin it off so these menu tests deterministically exercise the
+        # window-title bridge path they assert on, regardless of whatever is
+        # actually playing on the test box.
+        _smtc_p = mock.patch("core.media_now_playing.now_playing_text", return_value=None)
+        _smtc_p.start()
+        self.addCleanup(_smtc_p.stop)
+
     def _build_menu(self):
         captured = {}
 

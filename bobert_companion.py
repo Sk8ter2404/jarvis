@@ -11415,6 +11415,39 @@ def _probe_via_selfdiag(name: str, probe_attr: str) -> str:
 # Phase 4G refactor: _act_latency_benchmark moved to core/actions.py.
 
 
+# ── wake-word mode (Alexa-style background-audio gate) ───────────────────
+# Manual companion to the SMTC/room-music auto-gates: the user flips this on by
+# voice when an external TV (which the OS media session can't see) is playing,
+# so JARVIS requires a leading "JARVIS" on every command until they turn it off.
+def _act_wake_word_mode_set(on: bool) -> str:
+    """Turn the manual wake-word gate on/off. Updates BOTH the live runtime
+    mirror (read by _should_refuse_background_audio) and the config constant
+    (so a status read / settings save reflects it). Returns a JARVIS line."""
+    global _require_wake_runtime
+    _require_wake_runtime = bool(on)
+    try:
+        import core.config as _cfg
+        _cfg.REQUIRE_WAKE_MODE = bool(on)
+    except Exception:
+        pass
+    if on:
+        return ("Wake-word mode on, sir — I'll only respond when you start "
+                "with 'JARVIS', until you turn it off.")
+    return "Wake-word mode off, sir — listening normally again."
+
+
+def _act_wake_word_mode_status() -> str:
+    """Report whether the manual wake-word gate is on, and whether the OS
+    media session currently reports something playing."""
+    on = bool(_require_wake_runtime)
+    playing = _smtc_media_playing()
+    mode = ("on — I'm only answering commands that start with 'JARVIS'"
+            if on else "off — I'm listening normally")
+    media = ("and media is playing right now"
+             if playing else "and nothing is playing on the media session")
+    return f"Wake-word mode is {mode}, sir, {media}."
+
+
 # Whitelist of actions Bobert is allowed to perform
 ACTIONS = {
     "open_url":        _act_open_url,
@@ -11485,6 +11518,11 @@ ACTIONS = {
     "start_eavesdropping":   lambda _="": _act_ambient_mode_set(True),
     "stop_eavesdropping":    lambda _="": _act_ambient_mode_set(False),
     "chappie_mode":          _act_ambient_mode_toggle,
+    # Manual wake-word mode (Alexa-style): require a leading "JARVIS" on every
+    # command while an external TV / unseeable audio plays. On/off/status.
+    "wake_word_mode_on":     lambda _="": _act_wake_word_mode_set(True),
+    "wake_word_mode_off":    lambda _="": _act_wake_word_mode_set(False),
+    "wake_word_mode_status": lambda _="": _act_wake_word_mode_status(),
     # Voice-triggered full shutdown (graceful — distinct from upgrade/restart).
     # Triggered by the SHUTDOWN_TRIGGER_PHRASES pre-router after the user
     # answers 'no' to the "overnight first?" prompt, or directly by the LLM
@@ -11772,6 +11810,74 @@ def _audio_music_should_refuse_wake(text: str) -> bool:
         return bool(mod.should_refuse_wake(text))
     except Exception:
         return False
+
+
+# ── background-audio wake gate (Alexa-style one-command-over-audio) ───────
+# When background audio is playing JARVIS requires a leading "JARVIS" on every
+# command and ignores everything else. THREE independent signals can demand the
+# wake word: the manual wake-word toggle (_require_wake_runtime, for an external
+# TV the OS can't see), the Windows media session (SMTC) reporting PLAYING
+# (covers Chrome/Spotify/Apple Music/YouTube), and the spectral room-music
+# detector. A clear leading "JARVIS …" ALWAYS passes — that's the one-command
+# path. Defaults are behaviour-preserving: toggle off + SMTC absent leaves the
+# gate identical to the legacy ambient-music check.
+#
+# Live mirror of config.REQUIRE_WAKE_MODE — seeded from the imported constant
+# (it arrives via `from core.config import *` above) and flipped at runtime by
+# the wake_word_mode_on/off voice actions.
+_require_wake_runtime = REQUIRE_WAKE_MODE
+
+
+def _text_has_wake_prefix(text: str) -> bool:
+    """True if ``text`` is a short utterance led by a wake word
+    ('jarvis'/'hey'/'ok'/'okay'). Mirrors skills/standby_audio_detect.
+    should_refuse_wake's wake detection so the gate agrees with it: a clear
+    leading wake word on a ≤6-word command is the one-command path that always
+    passes the background-audio gate."""
+    if not text:
+        return False
+    words = text.strip().lower().split()
+    if not words:
+        return False
+    if len(words) <= 6 and words[0].strip(",.!?") in {"jarvis", "hey", "ok", "okay"}:
+        return True
+    return False
+
+
+def _smtc_media_playing() -> bool:
+    """True if the Windows media session (SMTC) reports media PLAYING. Reads
+    core/media_now_playing.get_now_playing() (Chrome/Spotify/Apple Music/
+    YouTube/etc.). Never raises — any error / missing projection → False."""
+    try:
+        from core.media_now_playing import get_now_playing
+        snap = get_now_playing()
+        return bool(snap and snap.get("playing"))
+    except Exception:
+        return False
+
+
+def _should_refuse_background_audio(text: str) -> "tuple[bool, str]":
+    """Decide whether to ignore a non-wake utterance because background audio
+    is active. Returns ``(refuse, reason)``; reason is "" when not refusing.
+
+    A clear leading "JARVIS …" always passes (the one-command path). Otherwise
+    refuse when ANY of: the manual wake-word toggle is on, SMTC reports media
+    playing, or sustained room music is detected (when AMBIENT_MUSIC_REFUSE_WAKE
+    is set). Never raises — on any error it fails OPEN (returns (False, "")) so a
+    gate failure can never silence JARVIS."""
+    try:
+        if _text_has_wake_prefix(text):
+            return (False, "")
+        if _require_wake_runtime:
+            return (True, "wake-word mode")
+        if _smtc_media_playing():
+            return (True, "media playing")
+        from core.config import AMBIENT_MUSIC_REFUSE_WAKE as _r
+        if _r and _audio_music_should_refuse_wake(text):
+            return (True, "room music")
+        return (False, "")
+    except Exception:
+        return (False, "")
 
 
 # Standby auto-engage bridge. The background lyric-detection thread in
@@ -12331,6 +12437,31 @@ _PREEMPTIVE_HALLUCINATION_PATTERNS: list[tuple["re.Pattern", str | None, str]] =
         r"(?:mode|listening)?\b",
         re.IGNORECASE),
      "ambient_mode", "toggle ambient mode"),
+
+    # Wake-word mode (Alexa-style: require a leading "JARVIS" while a TV / other
+    # audio plays). STATUS first so "is wake word mode on" isn't eaten by the ON
+    # pattern. OFF before ON so "turn off wake word mode" doesn't match ON's
+    # "turning on" branch. These route the model's narration of the toggle to
+    # the explicit on/off/status setters (idempotent, mirrors ambient_mode_*).
+    (re.compile(
+        r"\b(?:is\s+wake[-\s]*word\s+mode\s+(?:on|active|enabled)|"
+        r"wake[-\s]*word\s+mode\s+status|am\s+i\s+in\s+wake[-\s]*word\s+mode)\b",
+        re.IGNORECASE),
+     "wake_word_mode_status", "wake-word mode status"),
+    (re.compile(
+        r"\b(?:turning\s+off|switching\s+off|disabling|exiting|leaving|"
+        r"ending)\s+wake[-\s]*word\s+mode\b"
+        r"|\b(?:normal\s+listening|always\s+listen(?:ing)?)\b",
+        re.IGNORECASE),
+     "wake_word_mode_off", "disable wake-word mode"),
+    (re.compile(
+        r"\b(?:enabling|turning\s+on|switching\s+(?:to|into|on)|entering|"
+        r"going\s+into|activating|requiring)\s+wake[-\s]*word(?:\s+mode)?\b"
+        r"|\b(?:only\s+(?:answer|respond|listen)\s+when\s+i\s+say\s+jarvis|"
+        r"require\s+(?:the\s+)?wake\s+word|i'?m\s+watching\s+(?:tv|television)|"
+        r"(?:going\s+into|entering|enabling|turning\s+on)\s+music\s+mode)\b",
+        re.IGNORECASE),
+     "wake_word_mode_on", "enable wake-word mode"),
 
     # Camera movement — no concrete action exists for physically panning the
     # webcams (they're fixed). When the LLM claims to move them, refuse and
@@ -16489,10 +16620,10 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
             # through — so quiet-room turns are unaffected and the user can
             # still command over music by prefixing the wake word. Anything
             # else while music plays is treated as overheard audio and dropped.
-            from core.config import AMBIENT_MUSIC_REFUSE_WAKE as _refuse_over_music
-            if _refuse_over_music and _audio_music_should_refuse_wake(text):
-                print(f"  [ambient-music] sustained room music active — "
-                      f"ignoring non-wake utterance: '{text[:40]}'")
+            _bg_gate, _bg_why = _should_refuse_background_audio(text)
+            if _bg_gate:
+                print(f"  [bg-audio] {_bg_why} — ignoring non-wake "
+                      f"utterance: '{text[:40]}'")
                 set_state("idle")
                 continue
 

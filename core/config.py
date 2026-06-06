@@ -307,6 +307,13 @@ START_IN_STANDBY = False
 # own music plays; you can then talk to it normally over the music.
 AMBIENT_MUSIC_REFUSE_WAKE = True
 
+# Manual "wake-word mode" (Alexa-style): when True, JARVIS ignores EVERY spoken
+# command that doesn't start with the wake word "JARVIS" — one utterance, one
+# command. Off by default; the user flips it on by voice (e.g. for an external
+# TV the OS media session can't see). _apply_user_settings() overrides this from
+# user_settings.json, and the voice action toggles it live at runtime.
+REQUIRE_WAKE_MODE = False
+
 
 # ─── Whisper STT (faster-whisper preferred, GPU when present) ──────────
 # `WHISPER_DEVICE = 'auto'` lets ctranslate2 + torch decide; 'cuda'
