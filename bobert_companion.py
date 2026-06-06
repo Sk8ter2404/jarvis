@@ -313,6 +313,15 @@ except Exception as _ebse:  # pragma: no cover - boot lockless-fallback on unexp
     print(f"  [early-singleton] check failed, proceeding without lock: {_ebse}")
 
 import asyncio, hashlib, io, json, logging, math, queue, random, re, tempfile, threading, time, traceback
+import warnings as _warnings
+# pycaw's audio-endpoint enumeration (the audio ducker + the wireless-headset
+# autoswitch poller) raises a COMError for every device property (PKEY 62-69) it
+# can't read on endpoints that don't expose them, which pycaw surfaces as a
+# UserWarning. The device objects are still returned and fully usable, but the
+# warning floods the session log dozens of times per poll cycle and burns CPU
+# formatting it. Silence ONLY this specific COMError-property warning, process-
+# wide (covers the ducker + autoswitch threads); all other warnings are kept.
+_warnings.filterwarnings("ignore", message=r".*COMError attempting to get property.*")
 from collections import deque
 import numpy as np
 import sounddevice as sd
@@ -717,7 +726,7 @@ DEVICE_CHECK_INTERVAL = 4.0
 
 # Barge-in: let user interrupt JARVIS while he's speaking. Only active when
 # wearing a headset (otherwise speaker output would feedback through the mic).
-BARGE_IN_ENABLED        = True
+BARGE_IN_ENABLED        = False   # disabled: barge-in InputStream teardown triggers a PortAudio use-after-free (0xc0000374) on a live mic
 BARGE_IN_THRESHOLD      = 0.015   # mic RMS to trigger interruption
 BARGE_IN_SUSTAIN_CHUNKS = 2       # consecutive loud chunks before aborting (~130ms)
 # Substrings used to detect headset output device (case-insensitive).
