@@ -77,6 +77,11 @@ _SERVER_READY_TIMEOUT = 30.0
 # Per-call budget for tool dispatch. Individual tools (GitHub PR diff,
 # Postgres query) can legitimately take 10s+.
 _DEFAULT_CALL_TIMEOUT = 30.0
+# How long a caller that arrives mid-bootstrap will wait for the in-progress
+# per-server bring-up to finish before returning whatever catalog is ready.
+# Generous enough to cover a typical multi-server bring-up; if exceeded the
+# caller just gets the partial catalog (which the next call completes).
+_BOOTSTRAP_WAIT_TIMEOUT = 90.0
 
 # Shared global state. Guarded by `_lock` except for the asyncio.Event
 # instances, which are created on (and only touched from) the loop thread.
@@ -92,6 +97,7 @@ _state: dict[str, Any] = {
     "shutdown_events": {},      # server_name → asyncio.Event (created on loop)
     "started_at":      None,
     "bootstrapped":    False,
+    "bootstrap_done":  None,    # threading.Event, set after bring-up completes
 }
 
 
@@ -364,9 +370,23 @@ def bootstrap() -> list[dict]:
 
     with _lock:
         if _state["bootstrapped"]:
-            return _build_catalog()
-        _state["bootstrapped"] = True
-        _state["started_at"]   = time.time()
+            # Someone already claimed the bootstrap. `bootstrapped` is set BELOW
+            # *before* the per-server bring-up runs (to claim the work and stop a
+            # second thread from re-spawning every server), so reading the catalog
+            # right here could hand back a half-connected one. Wait on the done
+            # event (created at claim time) so we return the COMPLETE catalog.
+            done_evt = _state["bootstrap_done"]
+            owns = False
+        else:
+            _state["bootstrapped"]   = True
+            _state["started_at"]     = time.time()
+            done_evt = _state["bootstrap_done"] = threading.Event()
+            owns = True
+
+    if not owns:
+        if done_evt is not None:
+            done_evt.wait(timeout=_BOOTSTRAP_WAIT_TIMEOUT)
+        return _build_catalog()
 
     loop = _start_loop_thread()
 
@@ -403,6 +423,11 @@ def bootstrap() -> list[dict]:
 
     catalog = _build_catalog()
     _log_bootstrap_summary(cfg, catalog)
+    # Bring-up done — release any callers that arrived mid-bootstrap and have
+    # been waiting on the complete catalog. (Set unconditionally so a partial /
+    # error bring-up still unblocks waiters rather than stranding them.)
+    if _state["bootstrap_done"] is not None:
+        _state["bootstrap_done"].set()
     return catalog
 
 
