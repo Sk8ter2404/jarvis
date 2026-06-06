@@ -3,7 +3,7 @@ System pulse skill for JARVIS — the wider sibling of system_monitor.
 
 Actions:
   system_pulse  — manually requested "status report" that gathers CPU, RAM,
-                  GPU temperature, disk free, network throughput, battery,
+                  GPU utilization, disk free, network throughput, battery,
                   system uptime, active-window count, Bambu print status, and
                   Anthropic credit balance, then renders a JARVIS-cadence
                   sentence ending with "Anything further?".
@@ -11,13 +11,13 @@ Actions:
 Proactive thread:
   Every PULSE_PROACTIVE_INTERVAL_SECONDS (default 15 min) the same readings
   are gathered silently. If anything looks abnormal — high CPU, high RAM,
-  low disk, hot GPU, low battery, failed Bambu print, low Anthropic credits
+  low disk, pinned GPU, low battery, failed Bambu print, low Anthropic credits
   — JARVIS speaks the pulse unprompted, leading with the abnormal item.
 
 HUD widget:
   Every PULSE_HUD_REFRESH_SECONDS (default 15 s) a compact strip of the
-  non-redundant metrics (GPU temp, battery, uptime, app count, network) is
-  written into hud_state.json under the key `pulse_strip`. The HUD overlay
+  non-redundant metrics (GPU utilization, battery, uptime, app count, network)
+  is written into hud_state.json under the key `pulse_strip`. The HUD overlay
   picks it up and renders it as an extra line below the existing ticker
   zone, so the data is visible without speaking.
 
@@ -54,7 +54,8 @@ except Exception:
 CPU_ABNORMAL_PCT          = 85.0
 RAM_ABNORMAL_PCT          = 88.0
 DISK_FREE_ABNORMAL_GB     = 20.0
-GPU_TEMP_ABNORMAL_C       = 80.0
+GPU_UTIL_ABNORMAL_PCT     = 95.0   # GPU pinned near 100% load is the abnormal signal now
+GPU_TEMP_ABNORMAL_C       = 80.0   # kept for the temperature fallback path only
 BATTERY_LOW_PCT           = 20.0
 CREDITS_LOW_DOLLARS       = 5.0
 NETWORK_HOT_KBPS          = 50_000   # ≥50 MB/s sustained is unusual on a desktop
@@ -190,6 +191,38 @@ def _read_uptime_seconds() -> float:
         return max(0.0, time.time() - psutil.boot_time())
     except Exception:
         return 0.0
+
+
+def _read_gpu_util_pct() -> float | None:
+    """Best-effort GPU utilization percent (0-100), via nvidia-smi.
+
+    Utilization is what the HUD now surfaces (temps are reliably fine on this
+    rig). nvidia-smi is the only source that exposes a load percentage —
+    HWiNFO/psutil sensor blocks report *temperature*, not utilization, so they
+    are deliberately NOT consulted here; the temperature fallback lives in the
+    separate `_read_gpu_temp_c`. Returns the busiest GPU's load, or None when
+    nvidia-smi is unavailable (caller then falls back to temperature)."""
+    try:
+        exe = shutil.which("nvidia-smi")
+        if exe:
+            out = subprocess.run(
+                [exe, "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=2.0,
+                creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
+            )
+            line = (out.stdout or "").strip().splitlines()
+            if line:
+                # Multiple GPUs → take the busiest.
+                utils = []
+                for v in line:
+                    v = v.strip()
+                    if v.isdigit():
+                        utils.append(int(v))
+                if utils:
+                    return float(max(utils))
+    except Exception:
+        pass
+    return None
 
 
 def _read_gpu_temp_c(hwinfo_gpu_temp_c: float | None = None) -> float | None:
@@ -397,7 +430,8 @@ def _gather_pulse() -> dict:
         "ram_pct":         ram_pct,
         "ram_used_gb":     ram_used,
         "disk_free_gb":    _read_disk_free_gb(),
-        "gpu_temp_c":      _read_gpu_temp_c(hwinfo_gpu_temp_c=hw.get("gpu_temp_c")),
+        "gpu_util_pct":    _read_gpu_util_pct(),
+        "gpu_temp_c":      _read_gpu_temp_c(hwinfo_gpu_temp_c=hw.get("gpu_temp_c")),  # fallback only
         "cpu_temp_c":      _read_cpu_temp_c(hwinfo_cpu_temp_c=hw.get("cpu_temp_c")),
         "uptime_seconds":  _read_uptime_seconds(),
         "active_apps":     _read_active_app_count(),
@@ -454,7 +488,8 @@ def _format_report(pulse: dict, lead: str = "") -> str:
     abnormality forced the proactive announcement)."""
     cpu = pulse.get("cpu_pct", 0.0)
     ram = pulse.get("ram_pct", 0.0)
-    gpu = pulse.get("gpu_temp_c")
+    gpu_util = pulse.get("gpu_util_pct")
+    gpu_temp = pulse.get("gpu_temp_c")
     disk = pulse.get("disk_free_gb", 0.0)
     apps = pulse.get("active_apps", 0)
     bambu_line = _fmt_bambu(pulse.get("bambu") or {})
@@ -470,9 +505,13 @@ def _format_report(pulse: dict, lead: str = "") -> str:
                      f"memory {ram:.0f} percent")
     else:
         parts.append(f"CPU {cpu:.0f} percent, memory {ram:.0f} percent")
-    if gpu is not None:
-        verb = "running hot at" if gpu >= GPU_TEMP_ABNORMAL_C else "idling at"
-        parts.append(f"GPU {verb} {gpu:.0f} degrees")
+    if gpu_util is not None:
+        verb = "working hard at" if gpu_util >= GPU_UTIL_ABNORMAL_PCT else "running at"
+        parts.append(f"GPU {verb} {gpu_util:.0f} percent")
+    elif gpu_temp is not None:
+        # No utilization reading available — fall back to temperature.
+        verb = "running hot at" if gpu_temp >= GPU_TEMP_ABNORMAL_C else "idling at"
+        parts.append(f"GPU {verb} {gpu_temp:.0f} degrees")
     if bat is not None and pulse.get("battery_plugged") is False:
         parts.append(f"battery at {bat:.0f} percent on battery power")
     if disk and disk < DISK_FREE_ABNORMAL_GB * 2:
@@ -499,9 +538,17 @@ def _format_hud_strip(pulse: dict) -> str:
     cpu_temp = pulse.get("cpu_temp_c")
     if cpu_temp is not None:
         bits.append(f"CPU {cpu_temp:.0f}C")
-    gpu = pulse.get("gpu_temp_c")
-    if gpu is not None:
-        bits.append(f"GPU {gpu:.0f}C")
+    # GPU utilization is the primary surface; both HUD fallback parsers split on
+    # "GPU " and read digits up to the first non-digit, so "%" terminates the
+    # number cleanly. The temperature token ("GPU 54C") is emitted ONLY when no
+    # utilization reading is available, so the consumers never feed a 0-100 load
+    # value into a 30-95°C colour band.
+    gpu_util = pulse.get("gpu_util_pct")
+    gpu_temp = pulse.get("gpu_temp_c")
+    if gpu_util is not None:
+        bits.append(f"GPU {gpu_util:.0f}%")
+    elif gpu_temp is not None:
+        bits.append(f"GPU {gpu_temp:.0f}C")
     bat = pulse.get("battery_pct")
     if bat is not None:
         suffix = "+" if pulse.get("battery_plugged") else ""
@@ -541,9 +588,13 @@ def _abnormal_reasons(pulse: dict) -> list[tuple[str, str]]:
         reasons.append(("ram", f"Memory at {pulse['ram_pct']:.0f} percent, sir — getting tight."))
     if 0 < pulse.get("disk_free_gb", 999.0) < DISK_FREE_ABNORMAL_GB:
         reasons.append(("disk", f"I'm afraid the C drive is down to {pulse['disk_free_gb']:.0f} gigs free."))
-    gpu = pulse.get("gpu_temp_c")
-    if gpu is not None and gpu >= GPU_TEMP_ABNORMAL_C:
-        reasons.append(("gpu", f"GPU running rather hot, sir — {gpu:.0f} degrees."))
+    gpu_util = pulse.get("gpu_util_pct")
+    gpu_temp = pulse.get("gpu_temp_c")
+    if gpu_util is not None and gpu_util >= GPU_UTIL_ABNORMAL_PCT:
+        reasons.append(("gpu", f"GPU pinned at {gpu_util:.0f} percent, sir."))
+    elif gpu_util is None and gpu_temp is not None and gpu_temp >= GPU_TEMP_ABNORMAL_C:
+        # Utilization unavailable — fall back to the hot-temperature signal.
+        reasons.append(("gpu", f"GPU running rather hot, sir — {gpu_temp:.0f} degrees."))
     bat = pulse.get("battery_pct")
     if (bat is not None
             and bat < BATTERY_LOW_PCT
