@@ -134,6 +134,57 @@ def battery(name_fragment: str) -> float | None:
     return None
 
 
+def summary() -> dict:
+    """Grouped snapshot of the most useful HWiNFO sensors for a spoken/HUD
+    read-out. Selects purely by unit + label fragment so it's robust to ANY
+    HWiNFO config (never a hard-coded sensor name). Returns ``available=False``
+    with empty lists when shared memory is off — never raises."""
+    rs = readings()
+    out: dict = {
+        "available": bool(rs),
+        "count": len(rs),
+        "cpu_temp_c": None, "gpu_temp_c": None,
+        "cpu_load_pct": None, "gpu_load_pct": None,
+        "temps_c": [], "fans_rpm": [], "power_w": [],
+        "clocks_mhz": [], "voltages_v": [],
+    }
+
+    def _is_temp(u: str) -> bool:
+        # HWiNFO temps come through as "C" or "°C" depending on encoding.
+        return u.replace("°", "").strip().upper() in ("C", "CEL")
+
+    for label, value, unit in rs:
+        low = label.lower()
+        u = (unit or "").strip()
+        uu = u.upper()
+        if _is_temp(u):
+            out["temps_c"].append((label, value))
+        elif uu == "RPM":
+            out["fans_rpm"].append((label, value))
+        elif uu == "W":
+            out["power_w"].append((label, value))
+        elif uu in ("MHZ", "GHZ"):
+            out["clocks_mhz"].append((label, value * (1000.0 if uu == "GHZ" else 1.0)))
+        elif uu == "V":
+            out["voltages_v"].append((label, value))
+        elif u == "%" and any(k in low for k in ("usage", "load", "total", "util")):
+            if "cpu" in low and out["cpu_load_pct"] is None:
+                out["cpu_load_pct"] = value
+            elif "gpu" in low and out["gpu_load_pct"] is None:
+                out["gpu_load_pct"] = value
+
+    def _pick_temp(frag: str, prefer: tuple[str, ...]):
+        cands = [(l, v) for l, v in out["temps_c"] if frag in l.lower()]
+        for l, v in cands:                      # prefer the canonical package/edge sensor
+            if any(p in l.lower() for p in prefer):
+                return v
+        return max((v for _, v in cands), default=None)   # else the hottest labelled one
+
+    out["cpu_temp_c"] = _pick_temp("cpu", ("package", "tctl", "tdie", "ccd"))
+    out["gpu_temp_c"] = _pick_temp("gpu", ("edge", "hot spot", "temperature", "core"))
+    return out
+
+
 def _main(argv) -> int:
     import argparse
     ap = argparse.ArgumentParser(description="Read HWiNFO shared-memory sensors.")
