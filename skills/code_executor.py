@@ -42,6 +42,7 @@ Config
 """
 from __future__ import annotations
 
+import atexit
 import os
 import re
 import subprocess
@@ -82,6 +83,7 @@ def _sandbox_env() -> dict[str, str]:
 _kernel_lock = threading.Lock()
 _kernel = None        # KernelManager
 _kernel_client = None # BlockingKernelClient
+_atexit_registered = False  # one-shot: register _shutdown_kernel on first start
 
 
 def _bobert():
@@ -269,7 +271,7 @@ def _run_subprocess(code: str, timeout: int) -> str:
 def _ensure_kernel():
     """Spin up (or reuse) the persistent IPython kernel. Returns the
     BlockingKernelClient, or None if jupyter_client isn't installed."""
-    global _kernel, _kernel_client
+    global _kernel, _kernel_client, _atexit_registered
     with _kernel_lock:
         if _kernel_client is not None:
             return _kernel_client
@@ -287,6 +289,13 @@ def _ensure_kernel():
             kc.wait_for_ready(timeout=10)
             _kernel = km
             _kernel_client = kc
+            # The kernel is a subprocess with zmq channel threads; reset_kernel
+            # is the only manual teardown, so a normal JARVIS exit would orphan
+            # them. Register the shutdown once (first start) so interpreter exit
+            # reaps the kernel cleanly.
+            if not _atexit_registered:
+                atexit.register(_shutdown_kernel)
+                _atexit_registered = True
             return kc
         except Exception as e:
             print(f"  [code-exec] jupyter kernel failed to start: {e}")

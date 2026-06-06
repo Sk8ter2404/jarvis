@@ -669,6 +669,7 @@ class _JupyterBase(unittest.TestCase):
     def _reset_kernel_globals(self):
         self.mod._kernel = None
         self.mod._kernel_client = None
+        self.mod._atexit_registered = False
 
 
 class EnsureKernelTests(_JupyterBase):
@@ -693,11 +694,51 @@ class EnsureKernelTests(_JupyterBase):
     def test_ensure_kernel_success_starts_and_caches(self):
         client = _FakeKernelClient()
         km = _FakeKernelManager(client=client)
-        with inject_modules(**make_jupyter_client_pkg(km)):
+        with inject_modules(**make_jupyter_client_pkg(km)), \
+             mock.patch.object(self.mod.atexit, "register"):
             kc = self.mod._ensure_kernel()
         self.assertIs(kc, client)
         self.assertTrue(client.channels_started)
         self.assertIs(self.mod._kernel_client, client)
+
+    def test_ensure_kernel_registers_atexit_cleanup_on_first_start(self):
+        # A normal JARVIS exit must reap the kernel subprocess + zmq threads, so
+        # the first successful start registers _shutdown_kernel via atexit. Mock
+        # atexit so nothing is actually wired into interpreter shutdown.
+        client = _FakeKernelClient()
+        km = _FakeKernelManager(client=client)
+        with inject_modules(**make_jupyter_client_pkg(km)), \
+             mock.patch.object(self.mod.atexit, "register") as reg:
+            self.mod._ensure_kernel()
+        reg.assert_called_once_with(self.mod._shutdown_kernel)
+        self.assertTrue(self.mod._atexit_registered)
+
+    def test_ensure_kernel_registers_atexit_only_once(self):
+        # After the first registration the kernel is cached; force a second real
+        # start (clear the client) and confirm atexit.register is NOT called
+        # again — the guard flag stays set across kernel restarts.
+        client = _FakeKernelClient()
+        km = _FakeKernelManager(client=client)
+        with inject_modules(**make_jupyter_client_pkg(km)), \
+             mock.patch.object(self.mod.atexit, "register") as reg:
+            self.mod._ensure_kernel()
+            # Simulate a teardown that drops the live client but leaves the
+            # already-registered atexit hook in place.
+            self.mod._kernel = None
+            self.mod._kernel_client = None
+            self.mod._ensure_kernel()
+        reg.assert_called_once()
+
+    def test_ensure_kernel_start_failure_does_not_register_atexit(self):
+        # If the kernel never starts there's nothing to reap, so no atexit hook
+        # is registered and the guard flag stays clear.
+        client = _FakeKernelClient()
+        km = _FakeKernelManager(client=client, start_raises=True)
+        with inject_modules(**make_jupyter_client_pkg(km)), \
+             mock.patch.object(self.mod.atexit, "register") as reg:
+            self.assertIsNone(self.mod._ensure_kernel())
+        reg.assert_not_called()
+        self.assertFalse(self.mod._atexit_registered)
 
     def test_ensure_kernel_start_failure_returns_none(self):
         client = _FakeKernelClient()
