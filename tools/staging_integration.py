@@ -14,7 +14,7 @@ hermetic for CI) — run it explicitly on a machine with ANTHROPIC_API_KEY set:
 Exit 0 = booted + every battery item answered with its expected marker; else 1.
 
 Non-fabrication is proven by markers the LLM cannot invent:
-  * version  -> "1.46.7" (only readable from the VERSION file via the
+  * version  -> "1.46.8" (only readable from the VERSION file via the
                  version_info action),
   * system   -> "cpu"        (system_pulse reads live psutil stats),
   * time     -> "it is"      (get_time formats the real clock).
@@ -36,7 +36,7 @@ LOG = os.path.join(PROJECT, "_staging_integration.log")
 # (utterance, [expected lowercase substrings — ALL must appear in the reply window])
 DEFAULT_BATTERY = [
     ("what time is it", ["current time is"]),       # get_time real-clock output
-    ("what version are you on", ["1.46.7"]),          # version_info reads VERSION file
+    ("what version are you on", ["1.46.8"]),          # version_info reads VERSION file
     ("give me a system status report", ["cpu"]),     # system_pulse live psutil stats
 ]
 
