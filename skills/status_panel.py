@@ -541,8 +541,13 @@ def register(actions):
     actions["suit_diagnostics"] = status_panel
 
     # HUD widget thread (no-op if psutil/pygetwindow are missing — strip will
-    # come out empty and we just don't publish)
-    threading.Thread(target=_hud_publish_loop, daemon=True).start()
+    # come out empty and we just don't publish). Guard against duplicate loops
+    # on skill reload (load_skills re-execs the module → fresh globals, so only
+    # an OS-thread name check survives).
+    if not any(t.name == "status-panel-hud" and t.is_alive()
+               for t in threading.enumerate()):
+        threading.Thread(target=_hud_publish_loop, daemon=True,
+                         name="status-panel-hud").start()
     print(
         f"  [status-panel] HUD strip refresh every {STATUS_PANEL_HUD_REFRESH_SECONDS}s; "
         f"actions: status_panel / system_status / suit_diagnostics"

@@ -1011,6 +1011,34 @@ class StatusLoopAndRegisterTests(unittest.TestCase):
             self.assertIn(name, actions)
         start.assert_called_once()
 
+    def test_register_names_the_hud_thread(self):
+        # The daemon is constructed with an explicit name so the reload dedup
+        # guard (name-based) can recognise an already-running loop. The name is
+        # read off the Thread at start() time (start is mocked → no real loop).
+        mod, _ = load_skill_isolated("status_panel")
+        names = []
+        with mock.patch.object(threading.Thread, "start", autospec=True,
+                               side_effect=lambda self: names.append(self.name)):
+            mod.register({})
+        self.assertEqual(names, ["status-panel-hud"])
+
+    def test_register_skips_duplicate_thread_when_already_running(self):
+        # A live status-panel-hud in threading.enumerate() → the name-based
+        # guard suppresses the duplicate spawn on reload.
+        mod, _ = load_skill_isolated("status_panel")
+
+        class _FakeThread:
+            name = "status-panel-hud"
+
+            def is_alive(self):
+                return True
+
+        with mock.patch.object(mod.threading, "enumerate",
+                               return_value=[_FakeThread()]), \
+             mock.patch.object(threading.Thread, "start", autospec=True) as start:
+            mod.register({})
+        start.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

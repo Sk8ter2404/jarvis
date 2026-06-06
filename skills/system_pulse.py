@@ -192,12 +192,17 @@ def _read_uptime_seconds() -> float:
         return 0.0
 
 
-def _read_gpu_temp_c() -> float | None:
+def _read_gpu_temp_c(hwinfo_gpu_temp_c: float | None = None) -> float | None:
     """Best-effort GPU temperature in Celsius.
     1) nvidia-smi if available (NVIDIA, most reliable)
     2) HWiNFO shared memory (reliable on Windows when Shared Memory Support is on)
     3) psutil.sensors_temperatures() — Windows rarely supports this but try
-    Returns None if no GPU temp could be read."""
+    Returns None if no GPU temp could be read.
+
+    `hwinfo_gpu_temp_c` is the pre-fetched HWiNFO `gpu_temp_c` (from a single
+    hwinfo.summary() in _gather_pulse). When the caller supplies it we skip the
+    in-function HWiNFO read so the shared-memory block is parsed once per pulse;
+    the nvidia-smi-first ordering is preserved either way."""
     try:
         exe = shutil.which("nvidia-smi")
         if exe:
@@ -220,10 +225,13 @@ def _read_gpu_temp_c() -> float | None:
         pass
 
     # 2) HWiNFO shared memory — reliable on Windows when Shared Memory Support is
-    #    on (psutil.sensors_temperatures rarely returns a GPU temp there).
+    #    on (psutil.sensors_temperatures rarely returns a GPU temp there). Use a
+    #    pre-fetched reading when given (single-read path); otherwise read here.
     try:
-        from audio import hwinfo
-        gt = hwinfo.summary().get("gpu_temp_c")
+        gt = hwinfo_gpu_temp_c
+        if gt is None:
+            from audio import hwinfo
+            gt = hwinfo.summary().get("gpu_temp_c")
         if gt is not None:
             return float(gt)
     except Exception:
@@ -242,15 +250,21 @@ def _read_gpu_temp_c() -> float | None:
     return None
 
 
-def _read_cpu_temp_c() -> float | None:
+def _read_cpu_temp_c(hwinfo_cpu_temp_c: float | None = None) -> float | None:
     """Best-effort CPU package temperature in Celsius.
     1) HWiNFO shared memory — effectively the only reliable CPU-temp source on
        Windows (psutil has no coretemp there).
     2) psutil.sensors_temperatures() coretemp/k10temp (Linux mostly).
-    Returns None if no CPU temp could be read."""
+    Returns None if no CPU temp could be read.
+
+    `hwinfo_cpu_temp_c` is the pre-fetched HWiNFO `cpu_temp_c` (from a single
+    hwinfo.summary() in _gather_pulse). When supplied we skip the in-function
+    HWiNFO read so the shared-memory block is parsed once per pulse."""
     try:
-        from audio import hwinfo
-        ct = hwinfo.summary().get("cpu_temp_c")
+        ct = hwinfo_cpu_temp_c
+        if ct is None:
+            from audio import hwinfo
+            ct = hwinfo.summary().get("cpu_temp_c")
         if ct is not None:
             return float(ct)
     except Exception:
@@ -360,15 +374,31 @@ def _read_credit_balance() -> float | None:
 
 # ─── pulse aggregation + formatting ──────────────────────────────────────
 
+def _read_hwinfo_summary() -> dict:
+    """Read the HWiNFO shared-memory block once, returning its summary dict
+    (or {} if HWiNFO/its shared memory is unavailable). Calling this once per
+    pulse lets _read_gpu_temp_c / _read_cpu_temp_c reuse the same parse instead
+    of each opening + parsing the shared-memory block independently."""
+    try:
+        from audio import hwinfo
+        return hwinfo.summary() or {}
+    except Exception:
+        return {}
+
+
 def _gather_pulse() -> dict:
     cpu, ram_pct, ram_used = _read_cpu_ram()
+    # Parse the HWiNFO shared-memory block ONCE and feed the CPU/GPU temps into
+    # the readers below — they fall back to nvidia-smi / psutil as before but no
+    # longer each re-open + re-parse the shared memory.
+    hw = _read_hwinfo_summary()
     pulse = {
         "cpu_pct":         cpu,
         "ram_pct":         ram_pct,
         "ram_used_gb":     ram_used,
         "disk_free_gb":    _read_disk_free_gb(),
-        "gpu_temp_c":      _read_gpu_temp_c(),
-        "cpu_temp_c":      _read_cpu_temp_c(),
+        "gpu_temp_c":      _read_gpu_temp_c(hwinfo_gpu_temp_c=hw.get("gpu_temp_c")),
+        "cpu_temp_c":      _read_cpu_temp_c(hwinfo_cpu_temp_c=hw.get("cpu_temp_c")),
         "uptime_seconds":  _read_uptime_seconds(),
         "active_apps":     _read_active_app_count(),
         "bambu":           _read_bambu_status(),
@@ -610,8 +640,16 @@ def register(actions):
               "pip install psutil to enable proactive + HUD widget.")
         return
 
-    threading.Thread(target=_hud_publish_loop, daemon=True).start()
-    threading.Thread(target=_proactive_loop, daemon=True).start()
+    # Guard against duplicate loops on skill reload (load_skills re-execs the
+    # module → fresh globals, so only an OS-thread name check survives).
+    if not any(t.name == "pulse-hud" and t.is_alive()
+               for t in threading.enumerate()):
+        threading.Thread(target=_hud_publish_loop, daemon=True,
+                         name="pulse-hud").start()
+    if not any(t.name == "pulse-proactive" and t.is_alive()
+               for t in threading.enumerate()):
+        threading.Thread(target=_proactive_loop, daemon=True,
+                         name="pulse-proactive").start()
     print(
         f"  [pulse] proactive every {PULSE_PROACTIVE_INTERVAL_SECONDS // 60} min; "
         f"HUD strip refresh every {PULSE_HUD_REFRESH_SECONDS}s"

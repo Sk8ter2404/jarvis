@@ -946,6 +946,69 @@ class FaceTrackingThreadTests(_MonolithSec2Base):
         with self.bc._camera_state_lock:
             self.assertIn(0, self.bc._camera_latest_frame)
 
+    def test_detect_face_cv2_error_degrades_gracefully(self):
+        # A cv2.error out of _detect_face (e.g. an OpenCL/GPU hiccup) must NOT
+        # unwind the tracking thread. The loop should swallow it, cache the
+        # frame for see_user, back off with time.sleep(0.5), and continue —
+        # then exit cleanly when _face_track_stop fires.
+        import logging
+        import numpy as np
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        cap = mock.Mock()
+        cap.isOpened.return_value = True
+        cap.get.return_value = 1280
+
+        stop = self.bc._face_track_stop
+        pause = self.bc._face_track_pause
+        stop.clear()
+        pause.clear()
+
+        def _read():
+            stop.set()          # end the loop after this single iteration
+            return True, frame
+        cap.read.side_effect = _read
+
+        cv2 = mock.Mock()
+        cv2.VideoCapture.return_value = cap
+        cv2.CAP_DSHOW = 700
+        # The source does `except cv2.error:` against the module-level cv2, so
+        # the mock's .error MUST be the real OpenCV exception class for the
+        # handler to resolve and catch.
+        cv2.error = self.bc.cv2.error
+
+        def _boom(_frame):
+            raise self.bc.cv2.error("CL_OUT_OF_RESOURCES")
+
+        sleeps = []
+        try:
+            with mock.patch.object(self.bc, "cv2", cv2), \
+                    mock.patch.object(self.bc, "CAMERAS",
+                                      [{"index": 0, "label": "X",
+                                        "primary": True,
+                                        "look_x": 0.5, "look_y": 0.5}]), \
+                    mock.patch.object(self.bc, "_detect_face",
+                                      side_effect=_boom), \
+                    mock.patch.object(self.bc, "_note_camera_read_attempt"), \
+                    mock.patch.object(self.bc, "send"), \
+                    mock.patch.object(self.bc.time, "sleep",
+                                      side_effect=lambda s: sleeps.append(s)):
+                # Must return normally — the cv2.error is swallowed, not raised.
+                # Silence the expected logging.exception traceback so the test
+                # log stays clean (the handler under test logs the swallow).
+                logging.disable(logging.CRITICAL)
+                try:
+                    self.bc._face_tracking_thread()
+                finally:
+                    logging.disable(logging.NOTSET)
+        finally:
+            stop.clear()
+            pause.clear()
+        # Frame was still cached despite the detection failure.
+        with self.bc._camera_state_lock:
+            self.assertIn(0, self.bc._camera_latest_frame)
+        # And we backed off by 0.5s after the failed detect.
+        self.assertIn(0.5, sleeps)
+
 
 # ───────────────────────────────────────────────────────────────────────────
 #  should_be_proactive / generate_proactive_comment

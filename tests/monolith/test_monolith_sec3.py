@@ -718,6 +718,50 @@ class CheckDependenciesTests(MonolithGlobalsTestCase):
         self.assertEqual(missing, ["somerandompkg"])
         speak.assert_not_called()
 
+    def test_dashed_pip_names_resolve_to_correct_import_modules(self):
+        # These three pip distributions have import paths that the default
+        # "-"→"_" fallback gets WRONG, so without explicit map entries they were
+        # falsely reported MISSING (+ a bogus pip-install line) on every boot of
+        # a working install. Assert the map resolves each to its real module.
+        cases = {
+            "winrt-Windows.Media.Control": "winrt.windows.media.control",
+            "nvidia-cublas-cu12":          "nvidia.cublas",
+            "nvidia-cudnn-cu12":           "nvidia.cudnn",
+        }
+        for pkg, expected_mod in cases.items():
+            with self.subTest(pkg=pkg):
+                # This mirrors the exact resolution check_dependencies() does.
+                resolved = self.bc._DEP_IMPORT_NAME.get(
+                    pkg, pkg.replace("-", "_"))
+                self.assertEqual(resolved, expected_mod)
+                # And the buggy fallback would NOT have produced the right name.
+                self.assertNotEqual(pkg.replace("-", "_"), expected_mod)
+
+    def test_mapped_dashed_names_not_reported_missing_when_importable(self):
+        # End-to-end: when the mapped import modules resolve (mocked present),
+        # check_dependencies() must NOT list these packages as missing.
+        import importlib
+        present = {
+            "winrt.windows.media.control": object(),
+            "nvidia.cublas":               object(),
+            "nvidia.cudnn":                object(),
+        }
+
+        def fake_import_module(name, *a, **k):
+            if name in present:
+                return present[name]
+            raise ImportError(f"unexpected import {name!r}")
+
+        with mock.patch.object(
+                self.bc, "_parse_requirements",
+                return_value=list(
+                    ["winrt-Windows.Media.Control",
+                     "nvidia-cublas-cu12", "nvidia-cudnn-cu12"])), \
+                mock.patch.object(importlib, "import_module",
+                                  side_effect=fake_import_module):
+            missing = self.bc.check_dependencies()
+        self.assertEqual(missing, [])
+
 
 # ===========================================================================
 # detect_tone / route_voice_emotion thin wrappers

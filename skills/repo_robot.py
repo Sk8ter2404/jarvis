@@ -37,6 +37,8 @@ import re
 import time
 from typing import Any
 
+from core.atomic_io import _atomic_write_json
+
 _PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _STATE_FILE  = os.path.join(_PROJECT_DIR, "data", "repo_robot_state.json")
 _TODO_FILE   = os.path.join(_PROJECT_DIR, "jarvis_todo.md")
@@ -78,10 +80,11 @@ def _save_state(state: dict[str, Any]) -> bool:
     state["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
     try:
         os.makedirs(os.path.dirname(_STATE_FILE), exist_ok=True)
-        tmp = _STATE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
-        os.replace(tmp, _STATE_FILE)
+        # Shared atomic writer (mkstemp + fsync + os.replace, with a
+        # Windows ERROR_ACCESS_DENIED retry) instead of a fixed
+        # "<state>.tmp" sibling, which a second concurrent _save_state
+        # could clobber mid-write. See core/atomic_io.py.
+        _atomic_write_json(_STATE_FILE, state, indent=2)
         return True
     except Exception as e:
         print(f"  [repo_robot] state write failed: {e}")

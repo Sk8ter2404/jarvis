@@ -1058,6 +1058,144 @@ class PulseRegisterTests(unittest.TestCase):
         self.assertIn("system_pulse", actions)
         self.assertEqual(start.call_count, 2)
 
+    def test_register_names_the_threads(self):
+        # Both daemons are constructed with explicit names so the reload dedup
+        # guard (name-based) can recognise an already-running loop. We record
+        # the name off each Thread at start() time (start is mocked so no real
+        # loop ever runs).
+        mod, _ = load_skill_isolated("system_pulse")
+        names = []
+        with mock.patch.object(mod, "_HAS_PSUTIL", True), \
+             mock.patch.object(threading.Thread, "start", autospec=True,
+                               side_effect=lambda self: names.append(self.name)):
+            mod.register({})
+        self.assertEqual(set(names), {"pulse-hud", "pulse-proactive"})
+
+    def test_register_skips_threads_already_running(self):
+        # A live pulse-hud + pulse-proactive in threading.enumerate() → the
+        # name-based guard suppresses BOTH duplicate spawns on reload.
+        mod, _ = load_skill_isolated("system_pulse")
+
+        class _FakeThread:
+            def __init__(self, name):
+                self.name = name
+
+            def is_alive(self):
+                return True
+
+        alive = [_FakeThread("pulse-hud"), _FakeThread("pulse-proactive")]
+        with mock.patch.object(mod, "_HAS_PSUTIL", True), \
+             mock.patch.object(mod.threading, "enumerate", return_value=alive), \
+             mock.patch.object(threading.Thread, "start", autospec=True) as start:
+            mod.register({})
+        start.assert_not_called()
+
+    def test_register_starts_only_missing_thread(self):
+        # Only pulse-hud is live → just the proactive loop is (re)started.
+        mod, _ = load_skill_isolated("system_pulse")
+
+        class _FakeThread:
+            name = "pulse-hud"
+
+            def is_alive(self):
+                return True
+
+        started_names = []
+        with mock.patch.object(mod, "_HAS_PSUTIL", True), \
+             mock.patch.object(mod.threading, "enumerate",
+                               return_value=[_FakeThread()]), \
+             mock.patch.object(
+                 threading.Thread, "start", autospec=True,
+                 side_effect=lambda self: started_names.append(self.name)):
+            mod.register({})
+        self.assertEqual(started_names, ["pulse-proactive"])
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# _gather_pulse single HWiNFO read — the shared-memory block is parsed ONCE
+# and its CPU/GPU temps fed into the readers (no double summary() per pulse).
+# ─────────────────────────────────────────────────────────────────────────
+class PulseSingleHwinfoReadTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("system_pulse")
+
+    def _stub_collectors(self):
+        # Stub everything _gather_pulse calls EXCEPT the temp readers + the
+        # hwinfo summary, so the test exercises the single-read wiring only.
+        return [
+            mock.patch.object(self.mod, "_read_cpu_ram", return_value=(1.0, 2.0, 3.0)),
+            mock.patch.object(self.mod, "_read_disk_free_gb", return_value=0.0),
+            mock.patch.object(self.mod, "_read_uptime_seconds", return_value=0.0),
+            mock.patch.object(self.mod, "_read_active_app_count", return_value=0),
+            mock.patch.object(self.mod, "_read_bambu_status", return_value={}),
+            mock.patch.object(self.mod, "_read_credit_balance", return_value=None),
+            mock.patch.object(self.mod, "_read_network_rates", return_value=(0.0, 0.0)),
+            mock.patch.object(self.mod, "_read_battery", return_value=None),
+        ]
+
+    def test_gather_reads_hwinfo_summary_once(self):
+        # hwinfo.summary() must be called exactly ONCE across a whole pulse,
+        # even though both temps come from HWiNFO (no nvidia-smi here).
+        fake_hw = mock.MagicMock()
+        fake_hw.summary.return_value = {"cpu_temp_c": 52.0, "gpu_temp_c": 61.0}
+        cms = self._stub_collectors()
+        for c in cms:
+            c.start()
+        try:
+            with mock.patch.object(self.mod.shutil, "which", return_value=None), \
+                 mock.patch.dict(sys.modules,
+                                 {"audio": mock.MagicMock(hwinfo=fake_hw),
+                                  "audio.hwinfo": fake_hw}):
+                pulse = self.mod._gather_pulse()
+        finally:
+            for c in cms:
+                c.stop()
+        self.assertEqual(pulse["cpu_temp_c"], 52.0)
+        self.assertEqual(pulse["gpu_temp_c"], 61.0)
+        fake_hw.summary.assert_called_once()
+
+    def test_gather_prefers_nvidia_smi_for_gpu_over_prefetched_hwinfo(self):
+        # nvidia-smi-first ordering for GPU temp is preserved: when nvidia-smi
+        # answers, the pre-fetched HWiNFO gpu_temp_c is NOT used (CPU still is).
+        fake_hw = mock.MagicMock()
+        fake_hw.summary.return_value = {"cpu_temp_c": 52.0, "gpu_temp_c": 61.0}
+        proc = types.SimpleNamespace(stdout="73\n")
+        cms = self._stub_collectors()
+        for c in cms:
+            c.start()
+        try:
+            with mock.patch.object(self.mod.shutil, "which",
+                                   return_value="nvidia-smi"), \
+                 mock.patch.object(self.mod.subprocess, "run", return_value=proc), \
+                 mock.patch.dict(sys.modules,
+                                 {"audio": mock.MagicMock(hwinfo=fake_hw),
+                                  "audio.hwinfo": fake_hw}):
+                pulse = self.mod._gather_pulse()
+        finally:
+            for c in cms:
+                c.stop()
+        self.assertEqual(pulse["gpu_temp_c"], 73.0)   # from nvidia-smi
+        self.assertEqual(pulse["cpu_temp_c"], 52.0)   # from prefetched HWiNFO
+        fake_hw.summary.assert_called_once()
+
+    def test_prefetched_gpu_temp_used_without_reimporting_hwinfo(self):
+        # _read_gpu_temp_c given a pre-fetched value must NOT import audio.hwinfo.
+        with mock.patch.object(self.mod.shutil, "which", return_value=None), \
+             mock.patch.dict(sys.modules, {"audio": None, "audio.hwinfo": None}):
+            self.assertEqual(
+                self.mod._read_gpu_temp_c(hwinfo_gpu_temp_c=66.0), 66.0)
+
+    def test_prefetched_cpu_temp_used_without_reimporting_hwinfo(self):
+        with mock.patch.object(self.mod, "_HAS_PSUTIL", False), \
+             mock.patch.dict(sys.modules, {"audio": None, "audio.hwinfo": None}):
+            self.assertEqual(
+                self.mod._read_cpu_temp_c(hwinfo_cpu_temp_c=58.0), 58.0)
+
+    def test_read_hwinfo_summary_swallows_missing_module(self):
+        # No audio.hwinfo importable → {} (so .get() on the result is safe).
+        with mock.patch.dict(sys.modules, {"audio": None, "audio.hwinfo": None}):
+            self.assertEqual(self.mod._read_hwinfo_summary(), {})
+
 
 if __name__ == "__main__":
     unittest.main()
