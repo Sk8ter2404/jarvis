@@ -24,6 +24,15 @@ from __future__ import annotations
 import sys
 import threading
 import time
+import warnings as _warnings
+
+# pycaw's GetAllDevices()/GetAllSessions() raise a COMError for each audio
+# endpoint property (PKEY 62-69) they can't read on devices that don't expose
+# them; pycaw surfaces it as a UserWarning. Non-fatal (the device list is still
+# returned), but it floods the headset-state poll loop. Silence just that
+# COMError-property warning so the poller stays quiet — this also covers running
+# `python -m audio.audio_switch` standalone.
+_warnings.filterwarnings("ignore", message=r".*COMError attempting to get property.*")
 
 # ── IPolicyConfigVista — the proven default-endpoint setter ──────────────────
 try:
