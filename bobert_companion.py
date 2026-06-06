@@ -3094,6 +3094,100 @@ _camera_last_seen: dict[int, float]    = {}            # index → timestamp
 _camera_latest_frame: dict[int, "np.ndarray"] = {}     # index → most recent frame
 _camera_state_lock = threading.Lock()
 
+# ── HUD live camera preview bridge ──────────────────────────────────────────
+# The unified HUD runs in a SEPARATE process and reads its data from small files
+# in the project root / data dir. To show a live mirror of what JARVIS sees we
+# write ONE overwriting, downscaled JPEG of the primary face-tracking frame here
+# and the HUD loads it. Privacy contract (see HUD_CAMERA_PREVIEW in config):
+#   • exactly one temp file, never a growing folder;
+#   • atomically replaced (write .tmp + os.replace) so the HUD never reads a
+#     half-written frame;
+#   • removed whenever the camera is off / face-tracking is paused, and the HUD
+#     also treats a stale file (older than _HUD_CAM_PREVIEW_STALE_S) as "off",
+#     so a single missed delete still can't leave the last frame on screen.
+# Gated entirely behind HUD_CAMERA_PREVIEW — when False nothing is ever written.
+_HUD_CAM_PREVIEW_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", ".hud_camera_preview.jpg")
+_HUD_CAM_PREVIEW_WIDTH    = 240     # downscaled preview width (px); height keeps aspect
+_HUD_CAM_PREVIEW_MIN_GAP  = 0.15    # min seconds between writes (~6-7 fps cap)
+_HUD_CAM_PREVIEW_JPEG_Q   = 70      # JPEG quality 0-100 (small file, good enough)
+_HUD_CAM_PREVIEW_STALE_S  = 2.0     # HUD treats a file older than this as "off"
+_hud_cam_preview_last_write = [0.0]  # list-box so the loop can mutate without `global`
+_hud_cam_preview_file_present = [False]  # have we written the file since last cleanup?
+
+
+def _hud_camera_preview_enabled() -> bool:
+    """True iff the live HUD camera preview is switched on. Read the flag via the
+    config module at call time (not the import-time copy) so tests / a runtime
+    settings flip can toggle it. Defaults True if the attr is somehow absent."""
+    try:
+        import core.config as _cfg
+        return bool(getattr(_cfg, "HUD_CAMERA_PREVIEW", True))
+    except Exception:
+        return True
+
+
+def _hud_camera_preview_remove() -> None:
+    """Delete the preview file so the HUD shows its 'camera off' placeholder.
+    Idempotent and best-effort — a missing file (already gone) is fine, and any
+    transient lock just leaves the stale-file guard in the HUD to do the job."""
+    if not _hud_cam_preview_file_present[0]:
+        return
+    try:
+        if os.path.exists(_HUD_CAM_PREVIEW_FILE):
+            os.remove(_HUD_CAM_PREVIEW_FILE)
+    except OSError:
+        pass
+    finally:
+        _hud_cam_preview_file_present[0] = False
+
+
+def _hud_camera_preview_downscale(frame: "np.ndarray", width: int) -> "np.ndarray":
+    """Return ``frame`` resized to ``width`` px wide, aspect preserved. Pure /
+    cv2-only and side-effect free so it is unit-testable without a camera. A
+    frame already narrow enough is returned unchanged."""
+    h, w = frame.shape[:2]
+    if w <= width or w == 0:
+        return frame
+    new_h = max(1, int(round(h * (width / float(w)))))
+    return cv2.resize(frame, (width, new_h), interpolation=cv2.INTER_AREA)
+
+
+def _hud_camera_preview_write(frame: "np.ndarray", now: float) -> bool:
+    """Encode ``frame`` (BGR, as cv2 hands it to us) to a small JPEG and atomically
+    replace the single preview file the HUD reads. Throttled to ~6-7 fps via
+    _HUD_CAM_PREVIEW_MIN_GAP. Returns True iff a frame was written this call.
+
+    Never raises into the face-tracking loop — any encode / disk error is
+    swallowed (the HUD's stale-file guard then shows the placeholder)."""
+    if frame is None:
+        return False
+    if (now - _hud_cam_preview_last_write[0]) < _HUD_CAM_PREVIEW_MIN_GAP:
+        return False
+    try:
+        small = _hud_camera_preview_downscale(frame, _HUD_CAM_PREVIEW_WIDTH)
+        ok, buf = cv2.imencode(
+            ".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), _HUD_CAM_PREVIEW_JPEG_Q])
+        if not ok:
+            return False
+        tmp = _HUD_CAM_PREVIEW_FILE + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(buf.tobytes())
+        os.replace(tmp, _HUD_CAM_PREVIEW_FILE)
+        _hud_cam_preview_last_write[0] = now
+        _hud_cam_preview_file_present[0] = True
+        return True
+    except Exception:
+        # Best-effort: clean up a dangling temp, then carry on tracking.
+        try:
+            _tmp = _HUD_CAM_PREVIEW_FILE + ".tmp"
+            if os.path.exists(_tmp):
+                os.remove(_tmp)
+        except OSError:
+            pass
+        return False
+
+
 # Webcam I/O health bookkeeping (self-diag 2026-05-28). When cv2's read()
 # returns no frame the face-tracking thread can't always tell the user what
 # went wrong — was the device just unplugged? Did Teams steal it mid-stream?
@@ -3434,6 +3528,7 @@ def _face_tracking_thread():
 
     if not caps:
         print(f"  [face-track] No cameras available. Try: --list-cameras")
+        _hud_camera_preview_remove()   # no camera → ensure no stale preview frame
         return
 
     primary_seen_recently = 0.0   # timestamp of last primary detection
@@ -3443,6 +3538,13 @@ def _face_tracking_thread():
             # Always read from cameras so the latest frames stay fresh for see_user,
             # even when the tracker is paused (e.g. during speaking/listening).
             paused = _face_track_pause.is_set()
+
+            # HUD camera preview: while paused (or with the feature off) stop
+            # mirroring frames and remove the temp file so the HUD shows its
+            # 'camera off' placeholder and nothing lingers on disk. The actual
+            # write happens per-frame for the primary camera below.
+            if paused or not _hud_camera_preview_enabled():
+                _hud_camera_preview_remove()
 
             # Read all cameras, run face detection on each
             primary_face = None
@@ -3618,6 +3720,14 @@ def _face_tracking_thread():
                     if cam["index"] in _camera_last_read_error:
                         _camera_last_read_error.pop(cam["index"], None)
                         _camera_last_read_error_at.pop(cam["index"], None)
+                # Mirror the PRIMARY camera's live frame to the HUD preview file
+                # (a small overwriting JPEG). Only while actively tracking — when
+                # paused (speaking/listening/standby) we stop writing and remove
+                # the file below so the HUD shows its 'camera off' placeholder and
+                # no frame lingers on disk. Gated by HUD_CAMERA_PREVIEW.
+                if (cam["primary"] and not paused
+                        and _hud_camera_preview_enabled()):
+                    _hud_camera_preview_write(frame, now_loop)
                 if paused:
                     continue   # skip detection/eye-control while paused
                 try:
@@ -3693,6 +3803,8 @@ def _face_tracking_thread():
                 c.release()
             except Exception:  # pragma: no cover - defensive: camera release during shutdown rarely raises
                 logging.exception("[face-track] release on shutdown")
+    # Camera is fully off now — drop the HUD preview frame so it doesn't linger.
+    _hud_camera_preview_remove()
     print("  [face-track] Stopped")
 
 

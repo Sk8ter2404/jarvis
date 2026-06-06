@@ -592,6 +592,18 @@ CONSOLE_MONITOR = "top"
 HUD_ENABLED = True                 # drives the unified HUD at boot
 HUD_MONITOR = "top"                # which monitor in MONITORS to anchor to
 
+# Live camera preview in the HUD — a small downscaled mirror of what JARVIS
+# actually sees (the primary face-tracking frame; with KINECT_AS_CAMERA this is
+# the Kinect 1080p color stream). The main process writes ONE overwriting,
+# downscaled (~240px) JPEG to data/.hud_camera_preview.jpg a few times a second
+# and the (separate-process) unified HUD loads + displays it in a corner.
+# Privacy: exactly one temp file (never a growing folder); the main process
+# STOPS writing it — and removes it — whenever the camera is off or face-
+# tracking is paused, so the HUD falls back to a "CAMERA OFF" placeholder and no
+# stale frame lingers on disk. Set False to disable the preview entirely (no
+# JPEG is ever written).
+HUD_CAMERA_PREVIEW = True
+
 # Full-virtual-screen translucent target reticle that flashes for ~2s wherever
 # JARVIS performs a UI-automation action. KEPT ON — it is click-feedback, not
 # an info widget, so it isn't part of the HUD clutter and is invisible except

@@ -61,7 +61,7 @@ try:
     from PyQt6.QtCore import Qt, QTimer, QRectF, QPointF, QPoint
     from PyQt6.QtGui import (
         QPainter, QColor, QPen, QBrush, QFont, QRadialGradient,
-        QLinearGradient, QPainterPath,
+        QLinearGradient, QPainterPath, QPixmap,
     )
     from PyQt6.QtWidgets import (
         QApplication, QWidget, QSizeGrip, QPushButton,
@@ -71,7 +71,7 @@ except ImportError:
     _HAS_PYQT6 = False
     class _QtMissing:  # stub: subclassable + callable so module-scope Qt refs don't NameError without PyQt6; main() exits 2 before any real use
         def __init__(self, *a, **k): pass
-    Qt = QTimer = QRectF = QPointF = QPoint = QPainter = QColor = QPen = QBrush = QFont = QRadialGradient = QLinearGradient = QPainterPath = QApplication = QWidget = QSizeGrip = QPushButton = _QtMissing
+    Qt = QTimer = QRectF = QPointF = QPoint = QPainter = QColor = QPen = QBrush = QFont = QRadialGradient = QLinearGradient = QPainterPath = QPixmap = QApplication = QWidget = QSizeGrip = QPushButton = _QtMissing
 
 
 TICK_MS = 500                 # cheap data refresh + repaint cadence
@@ -83,6 +83,15 @@ HUD_STATE_FILE   = os.path.join(PROJECT_DIR, "hud_state.json")
 BAMBU_STATE_FILE = os.path.join(PROJECT_DIR, "bambu_overlay_state.json")
 CONTROL_FILE     = os.path.join(PROJECT_DIR, "unified_hud_state.json")
 GEOMETRY_FILE    = os.path.join(PROJECT_DIR, "unified_hud_geometry.json")
+
+# Live camera preview: the main process (bobert_companion) writes a single,
+# overwriting, downscaled JPEG of the primary face-tracking frame here whenever
+# the camera is on + tracking. We show it in a corner. A file older than
+# CAMERA_PREVIEW_STALE_S is treated as "camera off" (placeholder) so a missed
+# delete on the writer side can't leave a frozen frame on screen. See the
+# HUD_CAMERA_PREVIEW config flag + _hud_camera_preview_* in bobert_companion.py.
+CAMERA_PREVIEW_FILE     = os.path.join(PROJECT_DIR, "data", ".hud_camera_preview.jpg")
+CAMERA_PREVIEW_STALE_S  = 2.5     # > writer's ~0.15s cadence; tolerates hitches
 
 MIN_W, MIN_H = 300, 380
 
@@ -139,6 +148,19 @@ def _is_parent_alive(pid: int) -> bool:
 
 def _control_says_off() -> bool:
     return (_read_json(CONTROL_FILE).get("mode") or "").lower() == "off"
+
+
+def _camera_preview_fresh_at(now: float) -> bool:
+    """True iff the live camera-preview JPEG exists and was written within the
+    last CAMERA_PREVIEW_STALE_S seconds. The writer removes the file when the
+    camera is off / tracking is paused; this staleness gate is the belt-and-
+    braces fallback for a missed delete, so the HUD shows the placeholder rather
+    than a frozen frame. Pure (stat + time only) so it is unit-testable without
+    Qt or a real camera. Any stat error → not fresh."""
+    try:
+        return (now - os.path.getmtime(CAMERA_PREVIEW_FILE)) <= CAMERA_PREVIEW_STALE_S
+    except OSError:
+        return False
 
 
 def _load_saved_geometry() -> dict | None:
@@ -263,6 +285,10 @@ class UnifiedHud(QWidget):
         self._last_net = None
         self._last_net_at = None
         self._gpu_cached_at = 0.0
+        # Live camera preview: cached QPixmap + the mtime it was loaded from, so
+        # we only re-decode the JPEG when the writer has produced a new frame.
+        self.cam_preview: "QPixmap | None" = None
+        self._cam_preview_mtime = 0.0
 
         if _HAS_PSUTIL:
             try:
@@ -368,6 +394,31 @@ class UnifiedHud(QWidget):
         except Exception:
             return 0.0
 
+    def _refresh_camera_preview(self) -> None:
+        """Load the live camera-preview JPEG into self.cam_preview, but only when
+        it is fresh AND newer than what we last decoded (so a static frame isn't
+        re-loaded every 500 ms tick). A stale/absent file clears the pixmap so
+        the corner falls back to the 'camera off' placeholder."""
+        now = time.time()
+        if not _camera_preview_fresh_at(now):
+            self.cam_preview = None
+            self._cam_preview_mtime = 0.0
+            return
+        try:
+            mtime = os.path.getmtime(CAMERA_PREVIEW_FILE)
+        except OSError:
+            self.cam_preview = None
+            return
+        if self.cam_preview is not None and mtime <= self._cam_preview_mtime:
+            return   # already showing this frame
+        pm = QPixmap(CAMERA_PREVIEW_FILE)
+        if pm.isNull():
+            # A half-written file (the writer uses atomic replace, so this is
+            # rare) — keep the previous frame and retry next tick.
+            return
+        self.cam_preview = pm
+        self._cam_preview_mtime = mtime
+
     def _refresh(self) -> bool:
         if not _is_parent_alive(self.parent_pid) or _control_says_off():
             return False
@@ -418,6 +469,7 @@ class UnifiedHud(QWidget):
                 setattr(self, attr, int(bambu.get(key) or 0))
             except (TypeError, ValueError):
                 setattr(self, attr, 0)
+        self._refresh_camera_preview()
         self.frame += 1
         return True
 
@@ -587,6 +639,10 @@ class UnifiedHud(QWidget):
         cy = reactor_top + reactor_size / 2.0
         self._draw_reactor(p, cx, cy, reactor_size * 0.42, accent, s)
 
+        # 3b. Live camera preview — picture-in-picture in the top-right corner,
+        # in the empty space beside the circular reactor, below the ✕ button.
+        self._draw_camera_preview(p, W, pad, title_h, reactor_top, reactor_size, s)
+
         y = reactor_top + reactor_size + 10 * s
 
         # 4. Vitals line (numbers, colour-coded to their arcs).
@@ -604,6 +660,66 @@ class UnifiedHud(QWidget):
         # 6. Transcript panel (fills remaining space down to the grip).
         self._draw_transcript(p, pad, y, W, H, s)
         p.end()
+
+    # ── live camera preview (picture-in-picture) ─────────────────────────────
+    def _draw_camera_preview(self, p, W, pad, title_h, reactor_top,
+                             reactor_size, s) -> None:
+        """Draw the small live camera preview (or an 'off' placeholder) pinned to
+        the top-right corner, in the empty space beside the round reactor. The
+        frame itself is supplied by self.cam_preview (a QPixmap or None); None →
+        the camera is off / paused / the file went stale, so we show the
+        placeholder. The frame is scaled to COVER the tile (aspect kept, centre-
+        cropped) so there are no letterbox bars and it never looks stretched."""
+        # Tile geometry: a 4:3-ish tile tucked under the ✕ button, right-aligned.
+        tile_w = max(72.0, min(118.0 * s, (W - 2 * pad) * 0.30))
+        tile_h = tile_w * 0.72
+        tx = W - pad - tile_w
+        ty = title_h + 14 * s            # just below the title divider
+        rect = QRectF(tx, ty, tile_w, tile_h)
+        rad = 6.0 * s
+
+        # Backdrop + cyan rim (always drawn, frame or placeholder).
+        clip = QPainterPath()
+        clip.addRoundedRect(rect, rad, rad)
+        p.fillPath(clip, QBrush(QColor(4, 10, 16, 235)))
+
+        live = self.cam_preview is not None and not self.cam_preview.isNull()
+        if live:
+            # Scale to COVER the tile (fill, center-crop) so there are no bars,
+            # then clip to the rounded rect.
+            pm = self.cam_preview.scaled(
+                int(tile_w), int(tile_h),
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation)
+            ox = tx - max(0.0, (pm.width() - tile_w) / 2.0)
+            oy = ty - max(0.0, (pm.height() - tile_h) / 2.0)
+            p.save()
+            p.setClipPath(clip)
+            p.drawPixmap(QPointF(ox, oy), pm)
+            p.restore()
+
+        # Rim.
+        p.setPen(QPen(PANEL_RIM, 1.4)); p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(rect, rad, rad)
+
+        if live:
+            # "● LIVE" badge, top-left of the tile.
+            fb = QFont("Consolas", 1); fb.setPixelSize(int(8 * s)); fb.setBold(True)
+            p.setFont(fb)
+            p.setPen(QPen(RED))
+            p.drawText(QRectF(tx + 4 * s, ty + 2 * s, tile_w, 11 * s),
+                       int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop),
+                       "● LIVE")
+        else:
+            # Placeholder: dim camera glyph + label, centered.
+            p.setPen(QPen(DIM_FG))
+            fg = QFont("Segoe UI", 1); fg.setPixelSize(int(15 * s))
+            p.setFont(fg)
+            p.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), "▣")
+            fl = QFont("Consolas", 1); fl.setPixelSize(int(7.5 * s)); fl.setBold(True)
+            p.setFont(fl)
+            p.drawText(QRectF(tx, ty + tile_h - 13 * s, tile_w, 11 * s),
+                       int(Qt.AlignmentFlag.AlignCenter), "CAMERA OFF")
 
     # ── reactor ───────────────────────────────────────────────────────────────
     def _draw_reactor(self, p, cx, cy, R, accent, s) -> None:
