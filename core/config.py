@@ -218,12 +218,20 @@ ORCHESTRATOR_MERGER_TIMEOUT_S   = 20.0
 # ─── Local vision fallback ─────────────────────────────────────────────
 # When the cloud Claude vision call fails or the Claude backend is off,
 # retry against the local VLM served by the same Ollama instance.
-# qwen2.5vl:7b uses ~8 GB VRAM with strong OCR + screenshot
-# understanding, fits comfortably on the 3090 alongside the 8B text
-# model (Ollama loads/unloads as needed). Set to "llava:13b" for
-# slightly better natural-image describe at ~10 GB VRAM, or "off" to
-# disable. Local-vision replies are prefixed `[local-vision] `.
-LOCAL_VISION_FALLBACK = True
+# Local-vision replies are prefixed `[local-vision] `.
+#
+# DEFAULT False (2026-06-06): on a 24 GB card the baseline 30B text model
+# is resident at ~21 GB, so co-loading the ~7 GB qwen2.5vl:7b VLM on a
+# Claude-vision error over-commits VRAM and bricks the GPU — and because
+# the fallback also fires on a transient Claude APIStatusError / network
+# blip (not just an explicit local request), an API cap alone could
+# trigger the brick with no runtime guard. Shipping it OFF is the safe
+# default for everyone; flip True (Settings GUI / user_settings.json)
+# only on a box with the VRAM headroom to hold both models at once.
+# qwen2.5vl:7b uses ~8 GB VRAM with strong OCR + screenshot understanding;
+# set LOCAL_VISION_MODEL to "llava:13b" for slightly better natural-image
+# describe at ~10 GB VRAM, or "off" to disable.
+LOCAL_VISION_FALLBACK = False
 LOCAL_VISION_MODEL    = "qwen2.5vl:7b"
 
 
