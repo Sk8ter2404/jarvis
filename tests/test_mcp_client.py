@@ -849,6 +849,39 @@ class BootstrapTests(_StateIsolatedTest):
         self.assertEqual(len(catalog), 1)
         self.assertEqual(catalog[0]["action_name"], "mcp_fs_read_file")
 
+    def test_caller_blocks_until_bootstrap_done_then_gets_full_catalog(self):
+        # Regression: a caller arriving mid-bootstrap must WAIT for the owner's
+        # per-server bring-up (signalled by the bootstrap_done event) and return
+        # the COMPLETE catalog -- not the half-connected one it would see if it
+        # read _build_catalog() immediately. bootstrapped is claimed BEFORE
+        # bring-up, so without the event the second caller races to a partial.
+        import threading
+        evt = threading.Event()
+        m._state["bootstrapped"]   = True          # owner already claimed
+        m._state["bootstrap_done"] = evt           # ...but bring-up not done yet
+        cfg = {"fs": {"command": "npx", "prefix": "fs"}}
+        returned = {}
+
+        def call():
+            with mock.patch.object(m, "_mcp_imports", return_value=_make_imports()), \
+                 mock.patch.object(m, "_read_config", return_value=cfg):
+                returned["catalog"] = m.bootstrap()
+
+        t = threading.Thread(target=call, daemon=True)
+        t.start()
+        t.join(timeout=0.3)
+        self.assertTrue(t.is_alive(),
+                        "caller returned a partial catalog instead of waiting")
+        self.assertNotIn("catalog", returned)
+
+        # Owner finishes bring-up: the tool appears, then the done event is set.
+        m._state["tools"]["fs"] = [FakeTool("read_file", "Read it.")]
+        evt.set()
+        t.join(timeout=2.0)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(len(returned["catalog"]), 1)
+        self.assertEqual(returned["catalog"][0]["action_name"], "mcp_fs_read_file")
+
     def test_full_bring_up_one_server(self):
         cfg = {"fs": {"command": "npx", "prefix": "fs"}}
         fake_loop = FakeLoop()
