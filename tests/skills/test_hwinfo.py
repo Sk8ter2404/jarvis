@@ -67,5 +67,60 @@ class HwinfoParseTests(unittest.TestCase):
             self.assertEqual(hwinfo.readings(), [])
 
 
+class HwinfoSummaryTests(unittest.TestCase):
+    def _full_block(self):
+        return _block(
+            _reading("CPU Package", 58.0, "C"),
+            _reading("CPU (Tctl/Tdie)", 61.0, "C"),
+            _reading("GPU Temperature", 49.0, "C"),
+            _reading("GPU Hot Spot", 70.0, "C"),
+            _reading("CPU Fan", 1100.0, "RPM"),
+            _reading("Chassis Fan #2", 900.0, "RPM"),
+            _reading("CPU Package Power", 95.0, "W"),
+            _reading("Total CPU Usage", 12.0, "%"),
+            _reading("GPU Utilization", 30.0, "%"),
+            _reading("Vcore", 1.25, "V"),
+            _reading("Core Clock", 5200.0, "MHz"),
+        )
+
+    def test_summary_groups_by_unit_and_label(self):
+        with mock.patch.object(hwinfo, "_read_raw", return_value=self._full_block()):
+            s = hwinfo.summary()
+        self.assertTrue(s["available"])
+        self.assertEqual(s["count"], 11)
+        # CPU temp prefers the Package sensor; GPU temp prefers edge/Temperature.
+        self.assertEqual(s["cpu_temp_c"], 58.0)
+        self.assertEqual(s["gpu_temp_c"], 49.0)
+        self.assertEqual(s["cpu_load_pct"], 12.0)
+        self.assertEqual(s["gpu_load_pct"], 30.0)   # "Utilization" counts as load
+        self.assertEqual(len(s["temps_c"]), 4)
+        self.assertEqual(len(s["fans_rpm"]), 2)
+        self.assertEqual(s["power_w"], [("CPU Package Power", 95.0)])
+        self.assertEqual(s["voltages_v"], [("Vcore", 1.25)])
+        self.assertEqual(s["clocks_mhz"], [("Core Clock", 5200.0)])
+
+    def test_summary_handles_degree_symbol_unit(self):
+        # HWiNFO may emit the unit as "°C" rather than "C"; both must count.
+        raw = _block(_reading("CPU Package", 50.0, "°C"))
+        with mock.patch.object(hwinfo, "_read_raw", return_value=raw):
+            s = hwinfo.summary()
+        self.assertEqual(s["cpu_temp_c"], 50.0)
+        self.assertEqual(len(s["temps_c"]), 1)
+
+    def test_summary_ghz_clock_normalised_to_mhz(self):
+        raw = _block(_reading("CPU Clock", 5.2, "GHz"))
+        with mock.patch.object(hwinfo, "_read_raw", return_value=raw):
+            s = hwinfo.summary()
+        self.assertEqual(s["clocks_mhz"], [("CPU Clock", 5200.0)])
+
+    def test_summary_unavailable(self):
+        with mock.patch.object(hwinfo, "_read_raw", return_value=None):
+            s = hwinfo.summary()
+        self.assertFalse(s["available"])
+        self.assertEqual(s["count"], 0)
+        self.assertIsNone(s["cpu_temp_c"])
+        self.assertEqual(s["fans_rpm"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
