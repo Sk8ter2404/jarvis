@@ -1451,6 +1451,17 @@ def _status_text_apple_music() -> str:
     'closed' when it isn't running (or the bridge/deps are unavailable). pystray
     re-evaluates this lambda on every right-click, so it always reflects current
     state. Never raises — any failure degrades to the closed label."""
+    # Prefer the OS media session (SMTC): source-agnostic and reliable, and it
+    # names the real track from Chrome / Spotify / the Apple Music app / YouTube
+    # instead of the window-title bridge's useless "Apple Music: Apple Music".
+    # Falls through to the bridge below when nothing is reporting to SMTC.
+    try:
+        from core.media_now_playing import now_playing_text as _smtc_np
+        _np = _smtc_np()
+        if _np:
+            return f"♪ {_np}"
+    except Exception:
+        pass
     amapp = _apple_music_app()
     if amapp is None:
         return "Apple Music: unavailable"

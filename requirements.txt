@@ -173,6 +173,13 @@ comtypes; sys_platform == "win32"
 # Uncomment to install:
 # winsdk; sys_platform == "win32"
 
+# Now-playing media reader (core/media_now_playing.py): reads the Windows media
+# session (SMTC) so the tray label + "what's playing" name the real track from
+# ANY player (Chrome / Spotify / Apple Music / YouTube), not a scraped window
+# title. Windows-only; the module degrades to no-now-playing without it. Pinned
+# to the installed winrt-runtime so the ABI matches.
+winrt-Windows.Media.Control==3.2.1; sys_platform == "win32"
+
 # Email triage extension (skills/email_triage.py + ms_graph write actions).
 # OPTIONAL. The skill unifies Outlook (via ms_graph + msal — already wired up
 # above) with Gmail (via google-api-python-client + google-auth-oauthlib).

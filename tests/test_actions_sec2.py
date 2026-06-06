@@ -407,6 +407,24 @@ class PauseResumeMusicTests(_BaseActTest):
 # title, which gave the useless "Apple Music: Apple Music") — then an honest
 # fallback. Never touches _get_itunes.
 class NowPlayingTests(_BaseActTest):
+    def setUp(self):
+        super().setUp()
+        # _act_now_playing consults the OS media session (SMTC) first; pin it
+        # off here so these cases exercise the Apple Music fallback they cover.
+        _p = mock.patch("core.media_now_playing.get_now_playing", return_value=None)
+        _p.start()
+        self.addCleanup(_p.stop)
+
+    def test_smtc_session_wins(self):
+        # When the OS media session reports a track, it is named first —
+        # source-agnostic, no window-title scraping.
+        with mock.patch("core.media_now_playing.get_now_playing", return_value={
+                "app": "Chrome", "title": "The Lady in My Life",
+                "artist": "Michael Jackson", "status": "playing", "playing": True}):
+            out = A._act_now_playing("")
+        self.assertEqual(
+            out, "The Lady in My Life by Michael Jackson — playing in Chrome, sir.")
+
     def test_uwp_app_now_playing_wins(self):
         self.patch_apple_music_app(now_playing="Smooth Criminal")
         # Even if chrome is also "active", the app's reading is preferred.

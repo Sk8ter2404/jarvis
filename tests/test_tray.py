@@ -2310,6 +2310,11 @@ class AppleMusicLabelTests(TrayTestBase):
         self._saved_am = tray.__dict__.get("_apple_music_app_mod")
         tray.__dict__.pop("_apple_music_app_mod", None)
         self.addCleanup(self._restore_am)
+        # The label consults SMTC first; pin it off so these cases exercise the
+        # window-title bridge below. A dedicated test covers the SMTC path.
+        _smtc_p = mock.patch("core.media_now_playing.now_playing_text", return_value=None)
+        _smtc_p.start()
+        self.addCleanup(_smtc_p.stop)
 
     def _restore_am(self):
         if self._saved_am is None:
@@ -2319,6 +2324,12 @@ class AppleMusicLabelTests(TrayTestBase):
 
     def _patch_bridge(self, bridge):
         return mock.patch.object(tray, "_apple_music_app", return_value=bridge)
+
+    def test_label_prefers_smtc_session(self):
+        with mock.patch("core.media_now_playing.now_playing_text",
+                        return_value="The Lady in My Life — Michael Jackson"):
+            self.assertEqual(tray._status_text_apple_music(),
+                             "♪ The Lady in My Life — Michael Jackson")
 
     def test_label_shows_now_playing_title(self):
         with self._patch_bridge(_FakeAppleMusicBridge(running=True,
