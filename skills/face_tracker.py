@@ -94,6 +94,38 @@ POSTURE_STAND_LINES = (
     "You have been seated a good while, sir — a quick stand might help.",
     "Three quarters of an hour at the desk, sir. A brief stretch, perhaps?",
 )
+
+# ─── New-people greeting (GREET_NEW_PEOPLE_ENABLED, default False) ─────────
+# When the owner has friends over, JARVIS notices MULTIPLE unfamiliar faces
+# (people NOT enrolled in face-ID) and reacts ONCE per gathering with a short
+# varied line, optionally offering to learn them. This REUSES the existing
+# face-recognition path (audio.face_id.recognize on the primary webcam frame —
+# the same engine whoami/recognize_face use) rather than opening a second camera
+# loop; the recognition call only happens when the flag is on, so default-off is
+# zero extra work. Gated like KINECT_GREET_ON_ENTRY: it needs at least
+# GREET_NEW_PEOPLE_MIN_FACES distinct unknown faces sustained for
+# GREET_NEW_PEOPLE_CONFIRM_SECONDS, fires at most once per
+# GREET_NEW_PEOPLE_RATE_LIMIT_SECONDS, and is skipped while JARVIS is busy. The
+# owner's own enrolled face is recognised (named), so it never counts as "new".
+GREET_NEW_PEOPLE_MIN_FACES        = 2      # >= this many UNKNOWN faces to react
+GREET_NEW_PEOPLE_CONFIRM_SECONDS  = 4.0    # unknowns must hold this long first
+GREET_NEW_PEOPLE_RATE_LIMIT_SECONDS = 600.0  # at most one greeting per ~10 min
+# Re-reading the webcam every 0.5 s poll tick is wasteful (a recognise pass
+# detect+embeds every visible face). Throttle it to roughly this cadence — fast
+# enough to catch a gathering forming, cheap enough to leave running.
+GREET_NEW_PEOPLE_SCAN_INTERVAL    = 2.0
+GREET_NEW_PEOPLE_LINES = (
+    "Whoa — who are all these new people, sir?",
+    "We have company, sir. I don't recognise these faces.",
+    "Some new faces in the room, sir. Friends of yours?",
+    "I'm seeing several people I don't know, sir — guests, I take it?",
+    "A few unfamiliar faces just turned up, sir.",
+)
+# Spoken once after the greeting line so the offer to enrol is discoverable but
+# not pushy. Kept on the SAME utterance to stay within one proactive announce.
+GREET_NEW_PEOPLE_OFFER = (
+    " Say 'remember their face' if you'd like me to learn someone."
+)
 # ─────────────────────────────────────────────────────────────────────────
 
 
@@ -140,6 +172,20 @@ _posture_absent_since    = [0.0]
 _posture_last_nudge_at   = [0.0]
 _posture_last_hunch_line = [-1]
 _posture_last_stand_line = [-1]
+
+# ─── New-people-greeting bookkeeping (used only when GREET_NEW_PEOPLE_ENABLED) ─
+# _new_people_present_since: start of the current run with >= MIN_FACES unknown
+# faces (0.0 = not currently seeing a crowd of strangers — the confirm window
+# arms off this). _new_people_last_at: last greeting (monotonic) for the rate
+# limit. _new_people_last_line_idx: avoid back-to-back repeats. _new_people_-
+# last_scan_at + _new_people_last_count: cache so we only run a recognise pass
+# every GREET_NEW_PEOPLE_SCAN_INTERVAL rather than every poll tick. All
+# list-wrapped so the poller mutates without `global`.
+_new_people_present_since = [0.0]
+_new_people_last_at       = [0.0]
+_new_people_last_line_idx = [-1]
+_new_people_last_scan_at  = [0.0]
+_new_people_last_count    = [0]
 
 # Empty-room → standby bookkeeping. _kinect_empty_since records when the room
 # first went empty (0.0 = currently occupied / unknown); the standby fires only
@@ -627,6 +673,158 @@ def _apply_posture_nudge(present: bool, now: float, bc) -> None:
         print(f"  [face-track] posture nudge ({kind}): {line}")
 
 
+# ─── new-people greeting (opt-in: GREET_NEW_PEOPLE_ENABLED) ──────────────
+
+def _face_id_engine():
+    """The audio.face_id recognition engine, or None. Prefer the instance the
+    monolith already imported; fall back to a direct import so the poller works
+    standalone (and in tests). Mirrors skills/face_id._engine(). NEVER raises."""
+    mod = sys.modules.get("audio.face_id")
+    if mod is not None:
+        return mod
+    try:
+        from audio import face_id as _fi
+        return _fi
+    except Exception:
+        return None
+
+
+def _primary_camera_index(bc) -> int:
+    """The configured primary webcam index (the camera at the screen, closest to
+    faces) — the same one skills/face_id recognises through. Falls back to 0.
+    Reads CAMERAS off the live monolith first, then core.config. NEVER raises."""
+    cameras = getattr(bc, "CAMERAS", None)
+    if not cameras:
+        try:
+            from core.config import CAMERAS as _cams
+            cameras = _cams
+        except Exception:
+            cameras = []
+    try:
+        for cam in cameras or []:
+            if cam.get("primary"):
+                return int(cam.get("index", 0))
+        if cameras:
+            return int(cameras[0].get("index", 0))
+    except Exception:
+        pass
+    return 0
+
+
+def _grab_primary_frame(bc):
+    """A copy of the most recent BGR frame for the primary webcam from the
+    monolith's shared _camera_latest_frame cache (copied under _camera_state_-
+    lock), or None. Mirrors skills/face_id._grab_frame. NEVER raises."""
+    if bc is None:
+        return None
+    latest = getattr(bc, "_camera_latest_frame", None)
+    if latest is None:
+        return None
+    idx = _primary_camera_index(bc)
+    lock = getattr(bc, "_camera_state_lock", None)
+    try:
+        if lock is not None:
+            with lock:
+                fr = latest.get(idx)
+                return fr.copy() if fr is not None else None
+        fr = latest.get(idx)
+        return fr.copy() if fr is not None else None
+    except Exception:
+        return None
+
+
+def _count_unknown_faces(bc) -> int | None:
+    """Run ONE recognition pass on the current primary-webcam frame and return
+    the count of DISTINCT UNRECOGNISED faces (engine result name in {None,
+    "unknown"}). Returns 0 when the engine sees only known/owner faces or no
+    face, and None when we can't tell (engine unavailable / not ready / no
+    frame) so the caller treats that as 'no reading' rather than 'zero
+    strangers'. REUSES audio.face_id.recognize — the same path whoami uses — so
+    there is no second camera loop. NEVER raises."""
+    eng = _face_id_engine()
+    if eng is None:
+        return None
+    try:
+        ok, _reason = eng.is_available()
+    except Exception:
+        return None
+    if not ok:
+        return None
+    frame = _grab_primary_frame(bc)
+    if frame is None:
+        return None
+    try:
+        results = eng.recognize(frame)
+    except Exception:
+        return None
+    if not results:
+        return 0
+    return sum(1 for r in results
+               if isinstance(r, dict) and r.get("name") in (None, "unknown"))
+
+
+def _apply_greet_new_people(present: bool, now: float, bc) -> None:
+    """When MULTIPLE unrecognised faces are sustained, fire ONE short proactive
+    greeting — for when the owner has friends over. Opt-in behind GREET_NEW_-
+    PEOPLE_ENABLED (and only meaningful when face-ID is on); all bookkeeping
+    resets cleanly when off so a later enable starts fresh. The recognise pass
+    is throttled to GREET_NEW_PEOPLE_SCAN_INTERVAL and only runs while a body is
+    present. Hard rate-limited + hysteresis-gated (the crowd must hold for the
+    confirm window) + skipped while JARVIS is busy. The owner's own enrolled
+    face is recognised, so it never counts toward the unknown total. Swallows
+    every error so a recognition glitch never crashes the poller."""
+    if not _cfg_flag("GREET_NEW_PEOPLE_ENABLED"):
+        _new_people_present_since[0] = 0.0
+        _new_people_last_scan_at[0] = 0.0
+        _new_people_last_count[0] = 0
+        return
+
+    # No body in the room (per the presence signal) → no crowd; disarm. This
+    # also spares a recognise pass when the room is empty. `present` defaults to
+    # True for callers without a presence reading (webcam-only installs), so the
+    # webcam recognise pass below still runs.
+    if not present:
+        _new_people_present_since[0] = 0.0
+        return
+
+    # Throttle the (relatively expensive) recognition pass: reuse the last count
+    # between scans so we still evaluate the confirm/rate-limit gates each tick.
+    if (now - _new_people_last_scan_at[0]) >= GREET_NEW_PEOPLE_SCAN_INTERVAL:
+        count = _count_unknown_faces(bc)
+        _new_people_last_scan_at[0] = now
+        if count is not None:
+            _new_people_last_count[0] = count
+    unknown = _new_people_last_count[0]
+
+    # Fewer than the threshold of strangers (or just the owner / nobody) → not a
+    # gathering; reset the sustained-crowd timer so the NEXT real crowd must hold
+    # the full confirm window before we react.
+    if unknown < GREET_NEW_PEOPLE_MIN_FACES:
+        _new_people_present_since[0] = 0.0
+        return
+
+    # A crowd of strangers this tick — start/continue the sustained run.
+    if _new_people_present_since[0] == 0.0:
+        _new_people_present_since[0] = now
+    # Require it to hold for the confirm window (hysteresis) so a one-frame
+    # mis-detection of two "unknown" blobs doesn't trigger a greeting.
+    if (now - _new_people_present_since[0]) < GREET_NEW_PEOPLE_CONFIRM_SECONDS:
+        return
+    # Hard rate limit — at most one greeting per gathering (~10 min).
+    if _new_people_last_at[0] and \
+       (now - _new_people_last_at[0]) < GREET_NEW_PEOPLE_RATE_LIMIT_SECONDS:
+        return
+    if _jarvis_busy(bc):
+        return
+
+    line = _pick_line(GREET_NEW_PEOPLE_LINES, _new_people_last_line_idx)
+    message = line + GREET_NEW_PEOPLE_OFFER
+    if _announce(bc, message, source="new_people"):
+        _new_people_last_at[0] = now
+        print(f"  [face-track] new-people greeting "
+              f"({unknown} unknown faces): {line}")
+
+
 def _poll_once(bc) -> None:
     sides, _side_map = _classify_sides(bc)
     raw_monitor = _monitor_name_from_sides(bc, sides)
@@ -653,6 +851,18 @@ def _poll_once(bc) -> None:
             _apply_posture_nudge(present, now, bc)
         except Exception as e:   # pragma: no cover - defensive
             print(f"  [face-track] posture-nudge error: {e}")
+
+    # New-people greeting (opt-in: GREET_NEW_PEOPLE_ENABLED). Runs every tick
+    # regardless of the Kinect block — it keys off the WEBCAM face-ID path, not
+    # the skeleton, so it works on webcam-only installs too. When the Kinect did
+    # give a presence reading we pass it through (an empty room short-circuits
+    # the recognise pass); otherwise we pass present=True and let the recognise
+    # pass itself decide (no frame / no face → no-op). Fully guarded.
+    try:
+        _np_present = bool(kinect.get("present")) if kinect is not None else True
+        _apply_greet_new_people(_np_present, now, bc)
+    except Exception as e:   # pragma: no cover - defensive
+        print(f"  [face-track] new-people greeting error: {e}")
 
     # Hysteresis: only commit when the same reading has held for N samples
     _pending_monitor.append(raw_monitor)

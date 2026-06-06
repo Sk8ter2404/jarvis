@@ -11542,6 +11542,14 @@ ACTIONS = {
     "start_eavesdropping":   lambda _="": _act_ambient_mode_set(True),
     "stop_eavesdropping":    lambda _="": _act_ambient_mode_set(False),
     "chappie_mode":          _act_ambient_mode_toggle,
+    # Proactive "who are all these new people?" greeting — live in-process flip
+    # of GREET_NEW_PEOPLE_ENABLED (the face_tracker poller watches for multiple
+    # unrecognised faces). On/off only; idempotent, mirrors ambient_mode_on/off.
+    # learn_guest ("remember their face") is registered by the face_id skill.
+    "greet_new_people_on":   lambda _="": _act_greet_new_people_set(True),
+    "greet_new_people_off":  lambda _="": _act_greet_new_people_set(False),
+    "notice_new_people":     lambda _="": _act_greet_new_people_set(True),
+    "stop_greeting_people":  lambda _="": _act_greet_new_people_set(False),
     # Manual wake-word mode (Alexa-style): require a leading "JARVIS" on every
     # command while an external TV / unseeable audio plays. On/off/status.
     "wake_word_mode_on":     lambda _="": _act_wake_word_mode_set(True),
@@ -12461,6 +12469,25 @@ _PREEMPTIVE_HALLUCINATION_PATTERNS: list[tuple["re.Pattern", str | None, str]] =
         r"(?:mode|listening)?\b",
         re.IGNORECASE),
      "ambient_mode", "toggle ambient mode"),
+
+    # New-people greeting — the model narrating that it'll watch for / greet
+    # guests should route to the idempotent on/off setter. OFF before ON so
+    # "stop greeting people" doesn't match ON's "greet". The action only flips a
+    # flag; the actual greeting is fired later by the face_tracker poller.
+    (re.compile(
+        r"\b(?:i'?ll\s+)?(?:stop|no\s+longer|won'?t)\s+"
+        r"(?:greet(?:ing)?|announc\w*|notic\w*|say(?:ing)?\s+h(?:i|ello)\s+to)\s+"
+        r"(?:new\s+people|guests|visitors|strangers|new\s+faces)\b",
+        re.IGNORECASE),
+     "greet_new_people_off", "disable new-people greeting"),
+    (re.compile(
+        r"\b(?:i'?ll\s+)?(?:greet(?:ing)?|say(?:ing)?\s+h(?:i|ello)\s+to|"
+        r"watch(?:ing)?\s+for|notic\w*|keep\s+an\s+eye\s+out\s+for|"
+        r"welcom\w*|announc\w*)\s+"
+        r"(?:any\s+|the\s+)?(?:new\s+people|guests|visitors|new\s+faces|"
+        r"new\s+arrivals|people\s+(?:who\s+)?(?:arrive|show\s+up))\b",
+        re.IGNORECASE),
+     "greet_new_people_on", "enable new-people greeting"),
 
     # Wake-word mode (Alexa-style: require a leading "JARVIS" while a TV / other
     # audio plays). STATUS first so "is wake word mode on" isn't eaten by the ON

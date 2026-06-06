@@ -894,6 +894,35 @@ def _act_ambient_mode_set(active: bool) -> str:
     return f"Ambient mode {state_word}, sir — Chappie is {'listening quietly and learning' if bc._ambient_mode_active[0] else 'standing down'}."
 
 
+def _act_greet_new_people_set(on: bool) -> str:
+    """Flip GREET_NEW_PEOPLE_ENABLED live, in-process — the proactive 'who are
+    all these new people?' greeting fired by skills/face_tracker when it sees
+    multiple UNRECOGNISED faces (friends over). Mirrors the ambient_mode_on/off
+    setter's idempotent live-toggle shape.
+
+    We set the flag on core.config so the face-tracker poller (which re-reads
+    core.config every tick) picks it up WITHOUT a restart. Deliberately NOT
+    persisted to user_settings.json — this is a live, session toggle (like the
+    wake-word-mode setter), so it cleanly reverts on the next boot to the
+    opt-in default. Honest about the face-ID dependency: the greeting needs the
+    webcams to actually recognise faces, so it nudges the user to enable
+    FACE_ID_ENABLED when that's still off."""
+    try:
+        import core.config as _cfg
+        _cfg.GREET_NEW_PEOPLE_ENABLED = bool(on)
+        face_id_on = bool(getattr(_cfg, "FACE_ID_ENABLED", False))
+    except Exception as e:   # pragma: no cover - core.config import never fails here
+        return f"I couldn't change the new-people greeting, sir — {e}."
+    if not on:
+        return "Noted, sir — I'll stop announcing new faces."
+    msg = ("Will do, sir — when a few unfamiliar faces turn up I'll say hello "
+           "once.")
+    if not face_id_on:
+        msg += (" Note face recognition is still off, so I won't actually spot "
+                "them until you enable it.")
+    return msg
+
+
 # ─── Skills reload (Phase 4E) ──────────────────────────────────────────
 
 def _act_reload_skills(_: str = "") -> str:
@@ -2548,6 +2577,8 @@ __all__ = [
     "_act_show_tasks",
     # Phase 4E — ambient mode setter (called by ambient_mode_toggle above)
     "_act_ambient_mode_set",
+    # New-people greeting live toggle (GREET_NEW_PEOPLE_ENABLED)
+    "_act_greet_new_people_set",
     # Phase 4E — skills reload
     "_act_reload_skills",
     # Phase 4E — memory introspection
