@@ -71,6 +71,14 @@ class PulseFormatTests(unittest.TestCase):
         self.assertIn("8 windows open", out)
         self.assertTrue(out.endswith("Anything further?"))
 
+    def test_format_report_folds_in_cpu_temp_from_hwinfo(self):
+        # When the pulse carries a HWiNFO CPU temp, it folds into the CPU line.
+        pulse = {"cpu_pct": 12.0, "ram_pct": 40.0, "cpu_temp_c": 52.0,
+                 "gpu_temp_c": 55.0, "active_apps": 8}
+        out = self.mod._format_report(pulse)
+        self.assertIn("CPU 12 percent at 52 degrees, memory 40 percent", out)
+        self.assertIn("GPU idling at 55 degrees", out)
+
     def test_format_report_lead_replaces_opener(self):
         pulse = {"cpu_pct": 90.0, "ram_pct": 50.0}
         out = self.mod._format_report(pulse, lead="Slight problem, sir — CPU at 90 percent.")
@@ -461,6 +469,48 @@ class PulseGpuTempTests(unittest.TestCase):
              mock.patch.object(self.mod, "_HAS_PSUTIL", True), \
              mock.patch.object(self.mod, "psutil", fake):
             self.assertIsNone(self.mod._read_gpu_temp_c())
+
+    def test_hwinfo_fallback_when_no_nvidia_smi(self):
+        # nvidia-smi absent -> HWiNFO shared memory supplies the GPU temp,
+        # before the psutil fallback.
+        fake = mock.MagicMock()
+        fake.summary.return_value = {"gpu_temp_c": 63.0}
+        with mock.patch.object(self.mod.shutil, "which", return_value=None), \
+             mock.patch.dict(sys.modules, {"audio": mock.MagicMock(hwinfo=fake),
+                                           "audio.hwinfo": fake}):
+            self.assertEqual(self.mod._read_gpu_temp_c(), 63.0)
+
+
+class PulseCpuTempTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("system_pulse")
+
+    def test_cpu_temp_from_hwinfo(self):
+        fake = mock.MagicMock()
+        fake.summary.return_value = {"cpu_temp_c": 58.0}
+        with mock.patch.dict(sys.modules, {"audio": mock.MagicMock(hwinfo=fake),
+                                           "audio.hwinfo": fake}):
+            self.assertEqual(self.mod._read_cpu_temp_c(), 58.0)
+
+    def test_cpu_temp_falls_back_to_psutil(self):
+        fake = mock.MagicMock()
+        fake.summary.return_value = {"cpu_temp_c": None}
+        entry = types.SimpleNamespace(current=49.0)
+        psu = mock.MagicMock()
+        psu.sensors_temperatures.return_value = {"coretemp": [entry]}
+        with mock.patch.dict(sys.modules, {"audio": mock.MagicMock(hwinfo=fake),
+                                           "audio.hwinfo": fake}), \
+             mock.patch.object(self.mod, "_HAS_PSUTIL", True), \
+             mock.patch.object(self.mod, "psutil", psu):
+            self.assertEqual(self.mod._read_cpu_temp_c(), 49.0)
+
+    def test_cpu_temp_none_when_no_source(self):
+        fake = mock.MagicMock()
+        fake.summary.return_value = {"cpu_temp_c": None}
+        with mock.patch.dict(sys.modules, {"audio": mock.MagicMock(hwinfo=fake),
+                                           "audio.hwinfo": fake}), \
+             mock.patch.object(self.mod, "_HAS_PSUTIL", False):
+            self.assertIsNone(self.mod._read_cpu_temp_c())
 
 
 # ─────────────────────────────────────────────────────────────────────────
