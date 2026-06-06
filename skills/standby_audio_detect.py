@@ -192,13 +192,17 @@ def should_refuse_wake(text: str) -> bool:
     words = text.strip().lower().split()
     if not words:
         return True
-    if len(words) <= NEAR_MISS_MAX_WORDS:
-        first = words[0].strip(",.!?")
-        # A clear wake looks like 'jarvis', 'hey jarvis', 'ok jarvis' — short,
-        # wake word at the front. Anything longer or buried mid-sentence
-        # while music is playing is treated as a lyric and refused.
-        if first in {"jarvis", "hey", "ok", "okay"}:
-            return False
+    first = words[0].strip(",.!?")
+    # A clear LEADING 'jarvis' is a real wake at ANY length — the user addressed
+    # JARVIS by name at the front, so wake even over music (don't discard a real
+    # "Jarvis, <full request>" as a lyric just because it runs past 3 words).
+    if first == "jarvis":
+        return False
+    # "hey/ok/okay JARVIS ..." also counts as a clear lead wake.
+    if first in {"hey", "ok", "okay"} and len(words) >= 2 and words[1].strip(",.!?") == "jarvis":
+        return False
+    # Otherwise (no wake word, or 'jarvis' buried mid-sentence) — over music,
+    # treat as a lyric near-miss and refuse.
     return True
 
 

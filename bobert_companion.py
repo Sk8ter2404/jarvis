@@ -11932,7 +11932,16 @@ def _text_has_wake_prefix(text: str) -> bool:
     words = text.strip().lower().split()
     if not words:
         return False
-    if len(words) <= 6 and words[0].strip(",.!?") in {"jarvis", "hey", "ok", "okay"}:
+    first = words[0].strip(",.!?")
+    # A clear leading "jarvis" means the user is addressing JARVIS directly — let
+    # it through at ANY length, so "Jarvis, <a whole sentence>" wakes/reaches him
+    # too, not just a <=6-word command (the old <=6 cap silently swallowed real
+    # requests like "Jarvis, are you positive that's the correct reading?").
+    if first == "jarvis":
+        return True
+    # "hey/ok/okay JARVIS ..." — require 'jarvis' as the 2nd token so ordinary
+    # speech that merely starts with "hey"/"ok" is not mistaken for a wake.
+    if first in {"hey", "ok", "okay"} and len(words) >= 2 and words[1].strip(",.!?") == "jarvis":
         return True
     return False
 
