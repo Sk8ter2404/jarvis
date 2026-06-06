@@ -306,16 +306,20 @@ class NewPeopleTests(_Base):
         # The offer-to-enrol clause rides along on the same utterance.
         self.assertIn("remember their face", bc._announced[0][1].lower())
 
-    def test_no_greet_for_single_unknown(self):
+    def test_greet_fires_on_single_unknown(self):
         ft = self._load()
         bc = _fake_bc()
-        self._stub_count(ft, 1)                      # only ONE stranger
+        self._stub_count(ft, 1)                      # a SINGLE stranger — threshold is now 1
         self._patch_config(GREET_NEW_PEOPLE_ENABLED=True)
         t0 = 1000.0
+        # First sighting arms the timer; confirm window not yet elapsed → no greet.
         ft._apply_greet_new_people(present=True, now=t0, bc=bc)
-        ft._apply_greet_new_people(
-            present=True, now=t0 + self._confirm(ft) + 5, bc=bc)
         self.assertEqual(bc._announced, [])
+        # Hold past the confirm window → exactly one greeting.
+        ft._apply_greet_new_people(
+            present=True, now=t0 + self._confirm(ft) + 0.5, bc=bc)
+        self.assertEqual(len(bc._announced), 1)
+        self.assertEqual(bc._announced[0][0], "new_people")
 
     def test_no_greet_when_only_owner_present(self):
         ft = self._load()
