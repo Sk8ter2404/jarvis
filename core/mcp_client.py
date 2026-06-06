@@ -535,12 +535,19 @@ def call_tool(
             msg += f" ({err})"
         return {"ok": False, "error": msg}
 
-    fut = asyncio.run_coroutine_threadsafe(session.call_tool(tool, args), loop)
+    # Enforce the timeout INSIDE the coroutine via asyncio.wait_for, not by
+    # cancelling the concurrent.futures.Future: fut.cancel() returns False once
+    # the wrapped task is running and never actually stops session.call_tool, so
+    # a hung tool call would keep running on the bg loop forever (leaking the
+    # session + blocking shutdown). wait_for cancels the awaited coroutine on
+    # timeout -- real asyncio cancellation. The outer fut.result() waits a hair
+    # longer so the inner timeout fires first; it's only a backstop for a
+    # dead/stalled loop, where we still best-effort cancel the wrapper.
+    fut = asyncio.run_coroutine_threadsafe(
+        asyncio.wait_for(session.call_tool(tool, args), timeout), loop)
     try:
-        result = fut.result(timeout=timeout)
+        result = fut.result(timeout=timeout + 5.0)
     except (concurrent.futures.TimeoutError, asyncio.TimeoutError):
-        # Cancel the future on the bg loop so the hung session.call_tool
-        # coroutine doesn't keep running forever after we've given up on it.
         try:
             loop.call_soon_threadsafe(fut.cancel)
         except Exception:
