@@ -2,7 +2,7 @@
 
 Targets the "suit diagnostics" readout assembly without touching real hardware:
   • _shorten_foreground_title — pull the app name out of a noisy window title.
-  • _gpu_phrase — telemetry-unavailable, hot, and holding wording.
+  • _gpu_phrase — telemetry-unavailable, busy, and loafing wording.
   • _read_credit_balance — staleness + missing-file degradation (temp file).
   • _read_bambu_percent — reads sibling skill state across sys.modules.
   • _build_readout — opener (nominal vs "slight problem") + the conditional
@@ -64,16 +64,18 @@ class StatusGpuPhraseTests(unittest.TestCase):
     def test_gpu_none_unavailable(self):
         self.assertIn("unavailable", self.mod._gpu_phrase(None).lower())
 
-    def test_gpu_hot_wording(self):
-        # >= GPU_TEMP_HOT_C must say "hot" in every variant.
-        outs = [self.mod._gpu_phrase(85.0) for _ in range(30)]
-        self.assertTrue(all("hot" in o for o in outs))
-        self.assertTrue(all("85" in o for o in outs))
+    def test_gpu_busy_wording(self):
+        # >= GPU_UTIL_BUSY_PCT must say "working hard" and report percent.
+        outs = [self.mod._gpu_phrase(97.0) for _ in range(30)]
+        self.assertTrue(all("working hard at" in o for o in outs))
+        self.assertTrue(all("97 percent" in o for o in outs))
+        self.assertFalse(any("degrees" in o for o in outs))
 
-    def test_gpu_holding_wording(self):
-        outs = [self.mod._gpu_phrase(50.0) for _ in range(30)]
-        self.assertTrue(all("holding at" in o for o in outs))
-        self.assertFalse(any("hot" in o for o in outs))
+    def test_gpu_loafing_wording(self):
+        outs = [self.mod._gpu_phrase(20.0) for _ in range(30)]
+        self.assertTrue(all("loafing at" in o for o in outs))
+        self.assertTrue(all("20 percent" in o for o in outs))
+        self.assertFalse(any("working hard" in o for o in outs))
 
 
 class StatusCollectorTests(unittest.TestCase):
@@ -164,7 +166,7 @@ class StatusReadoutTests(unittest.TestCase):
                    credits=None, bambu=None, foreground=None, music=None):
         return [
             mock.patch.object(self.mod, "_read_cpu_ram", return_value=(cpu, ram)),
-            mock.patch.object(self.mod, "_read_gpu_temp_c", return_value=gpu),
+            mock.patch.object(self.mod, "_read_gpu_util_pct", return_value=gpu),
             mock.patch.object(self.mod, "_read_ping_ms", return_value=ping),
             mock.patch.object(self.mod, "_read_credit_balance", return_value=credits),
             mock.patch.object(self.mod, "_read_bambu_percent", return_value=bambu),
@@ -334,70 +336,47 @@ class StatusCpuRamTests(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# _read_gpu_temp_c — nvidia-smi + psutil-sensors fallback.
+# _read_gpu_util_pct — nvidia-smi utilization.gpu (no psutil-sensor fallback,
+# since sensors report temperature, not load).
 # ─────────────────────────────────────────────────────────────────────────
-class StatusGpuTempTests(unittest.TestCase):
+class StatusGpuUtilTests(unittest.TestCase):
     def setUp(self):
         self.mod, self.actions = load_skill_isolated("status_panel")
 
-    def test_nvidia_smi_hottest(self):
-        proc = types.SimpleNamespace(stdout="55\n81\n")
+    def test_nvidia_smi_busiest(self):
+        proc = types.SimpleNamespace(stdout="12\n87\n")
+        with mock.patch.object(self.mod.shutil, "which", return_value="nvidia-smi"), \
+             mock.patch.object(self.mod.subprocess, "run", return_value=proc) as run:
+            self.assertEqual(self.mod._read_gpu_util_pct(), 87.0)   # max of the two
+        # Confirms the query asks for utilization, not temperature.
+        argv = run.call_args.args[0]
+        self.assertIn("--query-gpu=utilization.gpu", argv)
+        self.assertNotIn("--query-gpu=temperature.gpu", argv)
+
+    def test_zero_utilization_returned(self):
+        # An idle GPU legitimately reports 0% — must round-trip as 0.0, not None.
+        proc = types.SimpleNamespace(stdout="0\n")
         with mock.patch.object(self.mod.shutil, "which", return_value="nvidia-smi"), \
              mock.patch.object(self.mod.subprocess, "run", return_value=proc):
-            self.assertEqual(self.mod._read_gpu_temp_c(), 81.0)
+            self.assertEqual(self.mod._read_gpu_util_pct(), 0.0)
 
-    def test_no_smi_psutil_sensor_fallback(self):
-        entry = types.SimpleNamespace(current=66.0)
-        fake = mock.MagicMock()
-        fake.sensors_temperatures.return_value = {"radeon": [entry]}
-        with mock.patch.object(self.mod.shutil, "which", return_value=None), \
-             mock.patch.object(self.mod, "_HAS_PSUTIL", True), \
-             mock.patch.object(self.mod, "psutil", fake):
-            self.assertEqual(self.mod._read_gpu_temp_c(), 66.0)
-
-    def test_none_when_no_source(self):
-        with mock.patch.object(self.mod.shutil, "which", return_value=None), \
-             mock.patch.object(self.mod, "_HAS_PSUTIL", False):
-            self.assertIsNone(self.mod._read_gpu_temp_c())
+    def test_none_when_no_nvidia_smi(self):
+        with mock.patch.object(self.mod.shutil, "which", return_value=None):
+            self.assertIsNone(self.mod._read_gpu_util_pct())
 
     def test_smi_exception_swallowed(self):
         with mock.patch.object(self.mod.shutil, "which", return_value="nvidia-smi"), \
              mock.patch.object(self.mod.subprocess, "run",
-                               side_effect=OSError("spawn")), \
-             mock.patch.object(self.mod, "_HAS_PSUTIL", False):
-            self.assertIsNone(self.mod._read_gpu_temp_c())
+                               side_effect=OSError("spawn")):
+            self.assertIsNone(self.mod._read_gpu_util_pct())
 
-    def test_sensors_exception_swallowed(self):
-        fake = mock.MagicMock()
-        fake.sensors_temperatures.side_effect = RuntimeError("nope")
-        with mock.patch.object(self.mod.shutil, "which", return_value=None), \
-             mock.patch.object(self.mod, "_HAS_PSUTIL", True), \
-             mock.patch.object(self.mod, "psutil", fake):
-            self.assertIsNone(self.mod._read_gpu_temp_c())
-
-    def test_smi_no_digit_lines_falls_through_to_sensors(self):
-        # nvidia-smi present but emits no parseable temps → the `if temps`
-        # guard is False and execution falls through to the psutil sensors
-        # path (which here also finds nothing → None).
+    def test_smi_no_digit_lines_returns_none(self):
+        # nvidia-smi present but emits no parseable numbers → None (no sensor
+        # fallback for utilization).
         proc = types.SimpleNamespace(stdout="N/A\nERR\n")
         with mock.patch.object(self.mod.shutil, "which", return_value="nvidia-smi"), \
-             mock.patch.object(self.mod.subprocess, "run", return_value=proc), \
-             mock.patch.object(self.mod, "_HAS_PSUTIL", False):
-            self.assertIsNone(self.mod._read_gpu_temp_c())
-
-    def test_sensors_skips_non_gpu_and_empty_current(self):
-        # A non-GPU label (skipped by the substring guard) followed by a GPU
-        # label whose entries have no usable `current` → loop exhausts → None.
-        no_cur = types.SimpleNamespace(current=None)
-        fake = mock.MagicMock()
-        fake.sensors_temperatures.return_value = {
-            "coretemp": [types.SimpleNamespace(current=45.0)],  # non-gpu, skip
-            "nvidia": [no_cur],                                  # gpu, empty
-        }
-        with mock.patch.object(self.mod.shutil, "which", return_value=None), \
-             mock.patch.object(self.mod, "_HAS_PSUTIL", True), \
-             mock.patch.object(self.mod, "psutil", fake):
-            self.assertIsNone(self.mod._read_gpu_temp_c())
+             mock.patch.object(self.mod.subprocess, "run", return_value=proc):
+            self.assertIsNone(self.mod._read_gpu_util_pct())
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -666,7 +645,7 @@ class StatusReadoutBambuTests(unittest.TestCase):
         patches = [
             mock.patch.object(self.mod, "_read_cpu_ram",
                               return_value=(defaults["cpu"], defaults["ram"])),
-            mock.patch.object(self.mod, "_read_gpu_temp_c",
+            mock.patch.object(self.mod, "_read_gpu_util_pct",
                               return_value=defaults["gpu"]),
             mock.patch.object(self.mod, "_read_ping_ms",
                               return_value=defaults["ping"]),
@@ -702,9 +681,16 @@ class StatusReadoutBambuTests(unittest.TestCase):
         out = self._build(bambu=(0, "IDLE"))
         self.assertNotIn("Bambu", out)
 
-    def test_concerning_on_hot_gpu(self):
-        out = self._build(gpu=85.0)
+    def test_concerning_on_busy_gpu(self):
+        # GPU pinned at/above GPU_UTIL_BUSY_PCT (95%) trips the concerning opener.
+        out = self._build(gpu=97.0)
         self.assertTrue(out.startswith("Slight problem, sir."))
+
+    def test_not_concerning_on_moderate_gpu(self):
+        # A mid-range load (e.g. 85%) is NO LONGER concerning — the band is load,
+        # not temperature, so 85 sits comfortably below the 95% busy threshold.
+        out = self._build(gpu=85.0)
+        self.assertTrue(out.startswith("All systems nominal, sir."))
 
     def test_concerning_on_high_ram(self):
         out = self._build(ram=95.0)

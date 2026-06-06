@@ -9,9 +9,15 @@ untracked, un-pushed, un-PII-screened island that silently diverges from GitHub.
 This tool closes that gap by landing a run the SAME way a human change does:
 
     git checkout -b auto/overnight-<stamp>      # isolate the run's work
-    git add -A && git commit                    # the pre-commit PII guard runs HERE
+    git add (scoped) && git commit              # the pre-commit PII guard runs HERE
     git push -u origin auto/overnight-<stamp>
     -> open a pull request the owner reviews    # never auto-merged
+
+Staging is SCOPED, never `git add -A`: only tracked-file edits (`git add -u`) plus
+new files that git itself does not ignore are staged, and a post-stage guard
+refuses to commit if anything gitignored, a log/transcript, or an embedded git
+repo (gitlink) slipped into the index. So owner transcripts (logs/), runtime
+data (data/), and nested repo clones can never reach a PUBLIC PR.
 
 So autonomous work becomes tracked, PII-guarded, and visible on GitHub, while a
 human still approves what actually merges. The release VERSION bump stays a
@@ -67,17 +73,120 @@ def make_branch_name(stamp: str) -> str:
     return f"auto/overnight-{safe}"
 
 
+# Belt-and-braces guard list. `.gitignore` (consulted via `git check-ignore`) is
+# the PRIMARY source of truth — these patterns are a hard backstop for the
+# never-publish classes even if a path is not (yet) gitignored: owner
+# transcripts/logs, runtime data, and the embedded `.git` of a nested clone.
+_NEVER_STAGE_DIRS = ("logs/", "logs_staging/", "data/", "data_staging/",
+                     "memory/", "backups/", "_backups/")
+_NEVER_STAGE_SUFFIXES = (".log",)
+# substrings that flag a transcript or a nested-repo / embedded-repo path
+_NEVER_STAGE_SUBSTRINGS = ("transcript", "/.git/", ".git/")
+
+
+def _norm(path: str) -> str:
+    """Forward-slash, unquoted form of a git path (git may quote/backslash)."""
+    p = path.strip().strip('"')
+    return p.replace("\\", "/")
+
+
+def _is_never_stage(path: str) -> bool:
+    """True if `path` is in a class that must NEVER reach a public PR
+    (transcript/log, runtime data, or an embedded/nested git repo). This is the
+    backstop applied IN ADDITION to git's own .gitignore."""
+    p = _norm(path)
+    low = p.lower()
+    if low.endswith(_NEVER_STAGE_SUFFIXES):
+        return True
+    if any(seg in low for seg in _NEVER_STAGE_SUBSTRINGS):
+        return True
+    return any(p == d.rstrip("/") or p.startswith(d) for d in _NEVER_STAGE_DIRS)
+
+
+def _git_ignores(path: str, runner: Runner) -> bool:
+    """True if the repo's .gitignore (the real source of truth) ignores `path`.
+    `git check-ignore` exits 0 and echoes the path when it is ignored. Any git
+    error is treated as "ignored" (fail safe — refuse rather than leak)."""
+    try:
+        r = _git(["check-ignore", "-q", "--", path], runner)
+    except Exception:
+        return True
+    return r.returncode == 0
+
+
+def _untracked_to_add(runner: Runner) -> List[str]:
+    """New (untracked) paths that are SAFE to stage: `git status --porcelain`
+    already omits gitignored files, so this is the not-ignored new work. We then
+    drop the never-stage classes and any untracked *directory* (a trailing-slash
+    porcelain entry — an embedded repo shows up this way and `git add`-ing it
+    would create a gitlink). Returns [] on any git error."""
+    try:
+        r = _git(["status", "--porcelain", "--untracked-files=all"], runner)
+    except Exception:
+        return []
+    if r.returncode != 0:
+        return []
+    out: List[str] = []
+    for ln in r.stdout.splitlines():
+        if not ln.strip() or ln[:2] != "??":
+            continue
+        p = _norm(ln[3:])             # path after the "?? " status prefix
+        if p.endswith("/"):           # untracked dir (incl. embedded repos) — skip
+            continue
+        if _is_never_stage(p):
+            continue
+        out.append(p)
+    return out
+
+
+def _scoped_stage(runner: Runner) -> Tuple[bool, str]:
+    """Stage ONLY intended source changes, never `git add -A`.
+
+    1. `git add -u` stages edits/deletions to already-TRACKED files (never adds
+       a new untracked path, so logs/transcripts/embedded clones can't enter).
+    2. New, not-gitignored files are added explicitly, minus the never-stage
+       classes and untracked dirs (embedded-repo gitlinks).
+    3. A post-stage guard re-reads the index and ABORTS if anything gitignored,
+       a log/transcript, or an embedded `.git` path slipped in.
+
+    Returns (True, "") on a clean staged set, else (False, reason)."""
+    u = _git(["add", "-u"], runner)
+    if u.returncode != 0:
+        return False, "stage (tracked) failed: " + (u.stderr.strip() or "?")
+    for path in _untracked_to_add(runner):
+        # plain `git add --` honours .gitignore; -f is deliberately NOT used.
+        a = _git(["add", "--", path], runner)
+        if a.returncode != 0:
+            return False, f"stage failed for {path}: " + (a.stderr.strip() or "?")
+    # Guard: inspect what is actually staged and refuse never-publish paths.
+    g = _git(["diff", "--cached", "--name-only"], runner)
+    if g.returncode != 0:
+        return False, "could not inspect staged set: " + (g.stderr.strip() or "?")
+    staged = [ln for ln in g.stdout.splitlines() if ln.strip()]
+    bad = [s for s in staged if _is_never_stage(s) or _git_ignores(s, runner)]
+    if bad:
+        return False, ("refusing to commit — disallowed paths staged "
+                       "(logs/transcripts/data/ignored/embedded-repo): "
+                       + ", ".join(_norm(b) for b in bad[:8]))
+    if not staged:
+        return False, "nothing to stage after scoping"
+    return True, ""
+
+
 def commit_to_branch(branch: str, message: str, runner: Runner) -> Tuple[bool, str]:
-    """Create `branch`, stage everything, and commit. The pre-commit PII guard
-    runs at the commit step — a block (or any git error) returns (False, detail)
-    without raising, so a tainted autonomous run can never reach `push`."""
+    """Create `branch`, stage only the intended source changes (SCOPED — never
+    `git add -A`), and commit. Staging refuses owner transcripts/logs, runtime
+    data, gitignored paths, and embedded-repo gitlinks; the pre-commit PII guard
+    then runs at the commit step. A staging block, a guard block, or any git
+    error returns (False, detail) without raising, so a tainted autonomous run
+    can never reach `push`."""
     try:
         c = _git(["checkout", "-b", branch], runner)
         if c.returncode != 0:
             return False, "branch create failed: " + (c.stderr.strip() or "?")
-        a = _git(["add", "-A"], runner)
-        if a.returncode != 0:
-            return False, "stage failed: " + (a.stderr.strip() or "?")
+        staged_ok, why = _scoped_stage(runner)
+        if not staged_ok:
+            return False, why
         m = _git(["commit", "-m", message], runner)
         if m.returncode != 0:
             detail = (m.stdout.strip() + " " + m.stderr.strip()).strip() or "?"

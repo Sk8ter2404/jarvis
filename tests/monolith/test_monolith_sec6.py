@@ -2069,19 +2069,19 @@ class GetFollowupResponseExtraTests(SectionSixBase):
         self._p(bc, "_last_user_tone", [None])
 
     def test_ollama_backend_path(self):
-        # AI_BACKEND == 'ollama' -> the ollama.chat branch (11699-11705).
+        # AI_BACKEND == 'ollama' -> the bounded-ollama branch (P1-2). The call
+        # now flows through _ollama_chat_bounded so a wedged runner can't hang
+        # the follow-up turn forever.
         bc = self.bc
-        fake_ollama = types.ModuleType("ollama")
         captured = {}
 
-        def chat(model, messages):
+        def _bounded(model, messages):
             captured["model"] = model
             captured["messages"] = messages
             return {"message": {"content": "ollama follow-up"}}
 
-        fake_ollama.chat = chat
         with mock.patch.object(bc, "AI_BACKEND", "ollama"), \
-             mock.patch.dict(sys.modules, {"ollama": fake_ollama}):
+             mock.patch.object(bc, "_ollama_chat_bounded", side_effect=_bounded):
             out = bc.get_followup_response([("get_time", "noon")])
         self.assertEqual(out, "ollama follow-up")
         # The system prompt is the first message and the action summary the last.

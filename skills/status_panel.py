@@ -13,7 +13,7 @@ Actions registered:
 
 Data pulled (each item degrades gracefully if its source is unavailable):
   • CPU + RAM            via psutil
-  • GPU temperature      via nvidia-smi (fallback: psutil.sensors_temperatures)
+  • GPU utilization      via nvidia-smi
   • Network latency      via `ping 1.1.1.1` (single packet, 1500 ms budget)
   • Claude credit balance from credits_state.json (skipped if >24h stale)
   • Bambu print %         from sibling skill_bambu_monitor (sys.modules)
@@ -77,7 +77,7 @@ except Exception:
 # ─── cadences / thresholds ───────────────────────────────────────────────
 STATUS_PANEL_HUD_REFRESH_SECONDS = 20
 PING_TIMEOUT_MS                  = 1500
-GPU_TEMP_HOT_C                   = 80.0
+GPU_UTIL_BUSY_PCT                = 95.0
 CREDITS_LOW_DOLLARS              = 5.0
 CREDITS_STATE_MAX_AGE_SECONDS    = 24 * 3600
 
@@ -212,34 +212,27 @@ def _read_cpu_ram() -> tuple[float, float]:
         return 0.0, 0.0
 
 
-def _read_gpu_temp_c() -> float | None:
-    """Best-effort GPU temperature. NVIDIA via nvidia-smi (most reliable on
-    Windows), then psutil sensors as a longshot fallback."""
+def _read_gpu_util_pct() -> float | None:
+    """Best-effort GPU utilization percent (0-100), via nvidia-smi.
+
+    Utilization is what the diagnostics readout surfaces now (temps are reliably
+    fine on this rig). Only nvidia-smi exposes a load percentage — psutil sensor
+    blocks report *temperature*, not utilization, so they're not consulted here.
+    Returns the busiest GPU's load, or None when nvidia-smi is unavailable."""
     try:
         exe = shutil.which("nvidia-smi")
         if exe:
             out = subprocess.run(
-                [exe, "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
+                [exe, "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
                 capture_output=True, text=True, timeout=2.0,
                 creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
             )
             lines = (out.stdout or "").strip().splitlines()
-            temps = [int(v.strip()) for v in lines if v.strip().isdigit()]
-            if temps:
-                return float(max(temps))
+            utils = [int(v.strip()) for v in lines if v.strip().isdigit()]
+            if utils:
+                return float(max(utils))
     except Exception:
         pass
-
-    if _HAS_PSUTIL:
-        try:
-            sensors = psutil.sensors_temperatures()  # type: ignore[attr-defined]
-            for label, entries in (sensors or {}).items():
-                if any(k in label.lower() for k in ("gpu", "nvidia", "amd", "radeon")):
-                    temps = [e.current for e in entries if getattr(e, "current", None)]
-                    if temps:
-                        return float(max(temps))
-        except Exception:
-            pass
     return None
 
 
@@ -395,20 +388,20 @@ def _read_apple_music_track() -> str | None:
 
 # ─── readout formatter ───────────────────────────────────────────────────
 
-def _gpu_phrase(gpu_c: float | None) -> str:
-    if gpu_c is None:
+def _gpu_phrase(gpu_pct: float | None) -> str:
+    if gpu_pct is None:
         return "GPU telemetry unavailable, sir."
-    verb = "running hot at" if gpu_c >= GPU_TEMP_HOT_C else "holding at"
+    verb = "working hard at" if gpu_pct >= GPU_UTIL_BUSY_PCT else "loafing at"
     # Spec called out the "reactor — I mean, GPU" easter-egg phrasing.
     # Fire it occasionally (~1 in 5) so it lands as a quirk, not a tic.
     if random.random() < 0.20:
-        return f"reactor — I mean, GPU — {verb} {gpu_c:.0f} degrees."
-    return f"GPU {verb} {gpu_c:.0f} degrees."
+        return f"reactor — I mean, GPU — {verb} {gpu_pct:.0f} percent."
+    return f"GPU {verb} {gpu_pct:.0f} percent."
 
 
 def _build_readout() -> str:
     cpu, ram      = _read_cpu_ram()
-    gpu_c         = _read_gpu_temp_c()
+    gpu_pct       = _read_gpu_util_pct()
     ping_ms       = _read_ping_ms()
     credits       = _read_credit_balance()
     bambu         = _read_bambu_percent()
@@ -419,7 +412,7 @@ def _build_readout() -> str:
     concerning = (
         (cpu and cpu >= 90)
         or (ram and ram >= 90)
-        or (gpu_c is not None and gpu_c >= GPU_TEMP_HOT_C)
+        or (gpu_pct is not None and gpu_pct >= GPU_UTIL_BUSY_PCT)
         or (credits is not None and credits < CREDITS_LOW_DOLLARS)
         or (bambu is not None and bambu[1] == "FAILED")
     )
@@ -431,7 +424,7 @@ def _build_readout() -> str:
     lines.append(f"CPU at {cpu:.0f} percent, RAM at {ram:.0f} percent.")
 
     # GPU
-    lines.append(_gpu_phrase(gpu_c))
+    lines.append(_gpu_phrase(gpu_pct))
 
     # Network — graceful skip if ping failed entirely
     if ping_ms is not None:

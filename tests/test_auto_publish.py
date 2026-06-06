@@ -21,7 +21,9 @@ class FakeRunner:
     """Stand-in for subprocess.run keyed on the git sub-command.
 
     `results` maps a git sub-command (e.g. "status", "commit") to a
-    (returncode, stdout, stderr) tuple; anything unlisted succeeds empty.
+    (returncode, stdout, stderr) tuple; anything unlisted succeeds empty —
+    EXCEPT `check-ignore`, which defaults to rc 1 ("not ignored"), matching
+    real git's behaviour for an arbitrary path (rc 0 means the path IS ignored).
     """
 
     def __init__(self, results=None):
@@ -31,7 +33,8 @@ class FakeRunner:
     def __call__(self, cmd, **kw):
         self.calls.append(list(cmd))
         sub = cmd[1] if len(cmd) > 1 else ""
-        rc, out, err = self.results.get(sub, (0, "", ""))
+        default = (1, "", "") if sub == "check-ignore" else (0, "", "")
+        rc, out, err = self.results.get(sub, default)
         return subprocess.CompletedProcess(cmd, rc, out, err)
 
     def ran(self, sub):
@@ -77,24 +80,216 @@ class CommitTests(unittest.TestCase):
         self.assertIn("branch create failed", detail)
 
     def test_stage_failure(self):
+        # `git add -u` (tracked-only stage) erroring aborts before commit.
         r = FakeRunner({"add": (1, "", "permission denied")})
         ok, detail = auto_publish.commit_to_branch("b", "msg", r)
         self.assertFalse(ok)
-        self.assertIn("stage failed", detail)
+        self.assertIn("stage", detail)
+        self.assertFalse(r.ran("commit"))
 
     def test_commit_blocked_by_pii_guard(self):
-        # the pre-commit guard rejects -> non-zero commit with a message
-        r = FakeRunner({"commit": (1, "BLOCKED: possible secret", "")})
+        # the pre-commit guard rejects -> non-zero commit with a message. A
+        # non-empty staged set is faked so staging passes and we reach commit.
+        r = FakeRunner({"diff": (0, "core/x.py\n", ""),
+                        "commit": (1, "BLOCKED: possible secret", "")})
         ok, detail = auto_publish.commit_to_branch("b", "msg", r)
         self.assertFalse(ok)
         self.assertIn("commit blocked/failed", detail)
         self.assertIn("BLOCKED", detail)
 
     def test_success(self):
-        r = FakeRunner({"commit": (0, "1 file changed", "")})
+        # diff --cached reports one benign staged file -> guard passes, commit runs.
+        r = FakeRunner({"diff": (0, "core/x.py\n", ""),
+                        "commit": (0, "1 file changed", "")})
         ok, detail = auto_publish.commit_to_branch("b", "msg", r)
         self.assertTrue(ok)
         self.assertTrue(r.ran("checkout") and r.ran("add") and r.ran("commit"))
+        # never blanket-stages: no `git add -A` is ever issued
+        self.assertFalse(any(c[:3] == ["git", "add", "-A"] for c in r.calls))
+        # tracked stage uses `git add -u`
+        self.assertTrue(any(c[:3] == ["git", "add", "-u"] for c in r.calls))
+
+
+class ScopedStageTests(unittest.TestCase):
+    """The P0-4 fix: staging is scoped + guarded so owner transcripts (logs/),
+    runtime data, gitignored paths, and embedded-repo clones can NEVER be staged
+    into a public PR. Every git call is injected — no real repo touched."""
+
+    @staticmethod
+    def _added_paths(runner):
+        """Paths explicitly handed to `git add -- <path>` (excludes `add -u`)."""
+        out = []
+        for c in runner.calls:
+            if c[:3] == ["git", "add", "--"]:
+                out.append(c[3])
+        return out
+
+    def test_uses_add_u_not_add_all(self):
+        r = FakeRunner({"diff": (0, "src.py\n", "")})
+        ok, _ = auto_publish._scoped_stage(r)
+        self.assertTrue(ok)
+        self.assertTrue(any(c[:3] == ["git", "add", "-u"] for c in r.calls))
+        self.assertFalse(any(c[:3] == ["git", "add", "-A"] for c in r.calls))
+
+    def test_untracked_logs_transcripts_data_never_added(self):
+        porcelain = (
+            "?? logs/session_2026-06-06.log\n"
+            "?? logs/owner_transcript.txt\n"
+            "?? data/long_term_memory/facts.json\n"
+            "?? memory/notes.txt\n"
+            "?? conversation_transcript_2026.txt\n"
+            "?? debug.log\n"
+            "?? core/new_feature.py\n"      # the one legitimate new source file
+        )
+        r = FakeRunner({"status": (0, porcelain, ""),
+                        "diff": (0, "core/new_feature.py\n", "")})
+        ok, why = auto_publish._scoped_stage(r)
+        self.assertTrue(ok, why)
+        added = self._added_paths(r)
+        self.assertEqual(added, ["core/new_feature.py"])
+        for leak in ("logs/session_2026-06-06.log", "logs/owner_transcript.txt",
+                     "data/long_term_memory/facts.json", "memory/notes.txt",
+                     "conversation_transcript_2026.txt", "debug.log"):
+            self.assertNotIn(leak, added)
+
+    def test_embedded_repo_dir_is_skipped(self):
+        # an embedded clone surfaces as an untracked DIR (trailing slash); adding
+        # it would create a gitlink, so it must never be passed to `git add`.
+        porcelain = "?? vendor_clone/\n?? logs/\n?? skills/real.py\n"
+        r = FakeRunner({"status": (0, porcelain, ""),
+                        "diff": (0, "skills/real.py\n", "")})
+        ok, _ = auto_publish._scoped_stage(r)
+        self.assertTrue(ok)
+        self.assertEqual(self._added_paths(r), ["skills/real.py"])
+
+    def test_guard_aborts_if_logfile_lands_in_index(self):
+        # Defense in depth: even if a log somehow got staged, the post-stage
+        # `git diff --cached` guard refuses to commit.
+        r = FakeRunner({"diff": (0, "core/x.py\nlogs/session.log\n", "")})
+        ok, why = auto_publish._scoped_stage(r)
+        self.assertFalse(ok)
+        self.assertIn("refusing to commit", why)
+        self.assertIn("logs/session.log", why)
+
+    def test_guard_aborts_if_gitignored_path_in_index(self):
+        # A staged path git itself reports as ignored -> refuse (check-ignore rc 0).
+        r = FakeRunner({"diff": (0, "core/x.py\nsecret.env\n", ""),
+                        "check-ignore": (0, "secret.env\n", "")})
+        ok, why = auto_publish._scoped_stage(r)
+        self.assertFalse(ok)
+        self.assertIn("refusing to commit", why)
+
+    def test_guard_aborts_on_embedded_git_path(self):
+        r = FakeRunner({"diff": (0, "vendor/.git/config\n", "")})
+        ok, why = auto_publish._scoped_stage(r)
+        self.assertFalse(ok)
+        self.assertIn("refusing to commit", why)
+
+    def test_empty_staged_set_is_rejected(self):
+        r = FakeRunner({"diff": (0, "", "")})
+        ok, why = auto_publish._scoped_stage(r)
+        self.assertFalse(ok)
+        self.assertIn("nothing to stage", why)
+
+    def test_is_never_stage_classifier(self):
+        for p in ("logs/x.log", "logs/owner_transcript.txt", "data/mem.json",
+                  "memory/n.txt", "x.LOG", "a/b/transcript_2026.txt",
+                  "vendor/.git/config", "backups/old.zip"):
+            self.assertTrue(auto_publish._is_never_stage(p), p)
+        for p in ("core/x.py", "tools/auto_publish.py", "README.md",
+                  "audio/itunes_bridge.py", "skills/face_id.py"):
+            self.assertFalse(auto_publish._is_never_stage(p), p)
+
+
+class ScopedStageRealGitTests(unittest.TestCase):
+    """End-to-end against REAL git in a throwaway repo: proves the actual fix
+    keeps logs/transcripts/embedded clones out of the index (not just the fake).
+    Skipped if git is unavailable."""
+
+    def setUp(self):
+        import shutil
+        import tempfile
+        if shutil.which("git") is None:
+            self.skipTest("git not on PATH")
+        self.tmp = tempfile.mkdtemp(prefix="auto_pub_git_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+        def g(*args):
+            subprocess.run(["git", *args], cwd=self.tmp, check=True,
+                           capture_output=True, text=True)
+
+        g("init", "-q")
+        g("config", "user.email", "t@t.com")
+        g("config", "user.name", "t")
+        # .gitignore mirroring the repo's never-publish classes
+        with open(os.path.join(self.tmp, ".gitignore"), "w") as f:
+            f.write("logs/\n*.log\ndata/\n")
+        with open(os.path.join(self.tmp, "main.py"), "w") as f:
+            f.write("print('hi')\n")
+        g("add", ".gitignore", "main.py")
+        g("commit", "-qm", "init")
+        # now create exactly what the overnight run might leave behind:
+        os.makedirs(os.path.join(self.tmp, "logs"))
+        with open(os.path.join(self.tmp, "logs", "owner_transcript.txt"), "w") as f:
+            f.write("PRIVATE owner conversation\n")
+        with open(os.path.join(self.tmp, "session.log"), "w") as f:
+            f.write("log line\n")
+        os.makedirs(os.path.join(self.tmp, "data"))
+        with open(os.path.join(self.tmp, "data", "memory.json"), "w") as f:
+            f.write('{"pii": "x"}\n')
+        # an embedded clone (nested git repo) with a commit -> would become a gitlink
+        emb = os.path.join(self.tmp, "embedded_clone")
+        os.makedirs(emb)
+        subprocess.run(["git", "init", "-q"], cwd=emb, check=True,
+                       capture_output=True, text=True)
+        subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=emb,
+                       check=True, capture_output=True, text=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=emb, check=True,
+                       capture_output=True, text=True)
+        with open(os.path.join(emb, "inner.py"), "w") as f:
+            f.write("x = 1\n")
+        subprocess.run(["git", "add", "inner.py"], cwd=emb, check=True,
+                       capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-qm", "init"], cwd=emb, check=True,
+                       capture_output=True, text=True)
+        # a LEGITIMATE new source file that SHOULD be published
+        with open(os.path.join(self.tmp, "feature.py"), "w") as f:
+            f.write("VALUE = 42\n")
+        # and a tracked-file edit that SHOULD be published
+        with open(os.path.join(self.tmp, "main.py"), "w") as f:
+            f.write("print('updated')\n")
+
+    def _runner(self):
+        root = self.tmp
+
+        def runner(cmd, **kw):
+            kw.pop("cwd", None)  # force our temp repo regardless of module _ROOT
+            return subprocess.run(cmd, cwd=root, **kw)
+        return runner
+
+    def _staged(self):
+        r = subprocess.run(["git", "diff", "--cached", "--name-only"],
+                           cwd=self.tmp, capture_output=True, text=True)
+        return set(l.strip() for l in r.stdout.splitlines() if l.strip())
+
+    def test_scoped_stage_excludes_logs_data_embedded_keeps_source(self):
+        ok, why = auto_publish._scoped_stage(self._runner())
+        self.assertTrue(ok, why)
+        staged = self._staged()
+        # the intended source changes ARE staged
+        self.assertIn("feature.py", staged)
+        self.assertIn("main.py", staged)
+        # the never-publish classes are NOT staged
+        self.assertNotIn("logs/owner_transcript.txt", staged)
+        self.assertNotIn("session.log", staged)
+        self.assertNotIn("data/memory.json", staged)
+        self.assertNotIn("embedded_clone", staged)
+        # no path under logs/ or data/, nothing ending in .log, no transcript
+        for s in staged:
+            self.assertFalse(s.startswith("logs/"), s)
+            self.assertFalse(s.startswith("data/"), s)
+            self.assertFalse(s.endswith(".log"), s)
+            self.assertNotIn("transcript", s.lower())
 
 
 class PushTests(unittest.TestCase):
@@ -141,6 +336,7 @@ class RunOrchestrationTests(unittest.TestCase):
 
     def test_commit_failure_returns_1_and_never_pushes(self):
         r = FakeRunner({"status": (0, " M x.py\n", ""),
+                        "diff": (0, "x.py\n", ""),
                         "commit": (1, "BLOCKED", "")})
         code, text = self._run([], r)
         self.assertEqual(code, 1)
@@ -149,13 +345,15 @@ class RunOrchestrationTests(unittest.TestCase):
 
     def test_push_failure_returns_1(self):
         r = FakeRunner({"status": (0, " M x.py\n", ""),
+                        "diff": (0, "x.py\n", ""),
                         "push": (1, "", "rejected")})
         code, text = self._run([], r)
         self.assertEqual(code, 1)
         self.assertIn("Push failed", text)
 
     def test_success_opens_pr(self):
-        r = FakeRunner({"status": (0, " M x.py\n", "")})
+        r = FakeRunner({"status": (0, " M x.py\n", ""),
+                        "diff": (0, "x.py\n", "")})
         seen = {}
 
         def poster(branch, title, body):
@@ -168,13 +366,15 @@ class RunOrchestrationTests(unittest.TestCase):
         self.assertEqual(seen["branch"], "auto/overnight-t")
 
     def test_success_pr_open_failure_is_graceful(self):
-        r = FakeRunner({"status": (0, " M x.py\n", "")})
+        r = FakeRunner({"status": (0, " M x.py\n", ""),
+                        "diff": (0, "x.py\n", "")})
         code, text = self._run([], r, poster=lambda *a: None)
         self.assertEqual(code, 0)
         self.assertIn("Couldn't open the PR", text)
 
     def test_no_pr_flag_skips_pr(self):
-        r = FakeRunner({"status": (0, " M x.py\n", "")})
+        r = FakeRunner({"status": (0, " M x.py\n", ""),
+                        "diff": (0, "x.py\n", "")})
         poster_called = []
         code, text = self._run(["--no-pr"], r,
                                poster=lambda *a: poster_called.append(1))

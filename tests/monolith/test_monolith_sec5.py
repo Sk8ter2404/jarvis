@@ -1641,6 +1641,73 @@ class BackgroundAudioGateTests(SectionFiveBase):
         self.assertEqual(why, "")
 
 
+class AmbientLearnFromGatedTests(SectionFiveBase):
+    """Alexa-mode ambient learning: a gated (non-wake) utterance is DROPPED for
+    response purposes but, when ambient-listening is on, still fed to the
+    ambient-learning extractor (_ambient_learn_from_gated → learn_from_turn).
+    It must NEVER respond/speak and NEVER raise."""
+
+    def test_feeds_extractor_when_ambient_listen_enabled(self):
+        bc = self.bc
+        mem = {"facts": [], "projects": []}
+        with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
+             mock.patch.object(bc, "learn_from_turn") as lft:
+            bc._ambient_learn_from_gated("the wifi password is hunter2", mem)
+        lft.assert_called_once()
+        args, _ = lft.call_args
+        # text fed through; reply is EMPTY (overheard speech, not a JARVIS turn);
+        # the live memory dict is passed so the extractor dedupes against it.
+        self.assertEqual(args[0], "the wifi password is hunter2")
+        self.assertEqual(args[1], "")
+        self.assertIs(args[2], mem)
+
+    def test_no_feed_when_ambient_listen_disabled(self):
+        bc = self.bc
+        with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", False), \
+             mock.patch.object(bc, "learn_from_turn") as lft:
+            bc._ambient_learn_from_gated("some overheard chatter", {})
+        lft.assert_not_called()
+
+    def test_does_not_respond_or_speak(self):
+        bc = self.bc
+        # Even with the feed active, the gated path must produce NO spoken reply
+        # and NO follow-up dispatch — it only feeds the (background) extractor.
+        with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
+             mock.patch.object(bc, "learn_from_turn") as lft, \
+             mock.patch.object(bc, "_speak") as speak:
+            out = bc._ambient_learn_from_gated("hello there", {})
+        self.assertIsNone(out)            # returns nothing (no reply to voice)
+        speak.assert_not_called()         # never speaks
+        lft.assert_called_once()          # but DID learn
+
+    def test_never_raises_even_if_extractor_throws(self):
+        bc = self.bc
+        # A learning hiccup must not break the gate's drop-and-continue.
+        with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
+             mock.patch.object(bc, "learn_from_turn",
+                               side_effect=RuntimeError("extractor boom")):
+            # Must NOT propagate.
+            bc._ambient_learn_from_gated("anything", {})
+
+    def test_gate_site_wires_the_feed_before_continue(self):
+        # Wiring guard: the main-loop background-audio gate must feed the
+        # transcript to _ambient_learn_from_gated BEFORE it drops the turn, so a
+        # future refactor can't silently sever Alexa-mode ambient learning.
+        import inspect
+        src = inspect.getsource(self.bc.main)
+        # Locate the bg-audio gate's drop block and assert the feed precedes its
+        # `continue` (and the set_state("idle") that immediately precedes it).
+        marker = "_should_refuse_background_audio(text)"
+        self.assertIn(marker, src)
+        after = src[src.index(marker):]
+        feed_at = after.find("_ambient_learn_from_gated(")
+        cont_at = after.find("continue")
+        self.assertNotEqual(feed_at, -1, "gate never feeds the ambient learner")
+        self.assertNotEqual(cont_at, -1)
+        self.assertLess(feed_at, cont_at,
+                        "ambient-learn feed must run BEFORE the gate's continue")
+
+
 class WakeWordModeActionTests(SectionFiveBase):
     def setUp(self):
         import core.config as _cfg

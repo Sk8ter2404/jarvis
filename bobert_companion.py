@@ -1540,6 +1540,32 @@ def learn_from_turn(user_msg: str, ai_reply: str, memory: dict):
     threading.Thread(target=_worker, daemon=True).start()
 
 
+def _ambient_learn_from_gated(text: str, memory: dict) -> None:
+    """Alexa-mode ambient learning: keep PASSIVELY learning from gated speech.
+
+    The background-audio gate (_should_refuse_background_audio) drops a non-wake
+    utterance and `continue`s — so during wake-word / music / TV mode JARVIS was
+    learning NOTHING from what it overheard. The owner wants it to still learn
+    from gated speech while only RESPONDING to wake-prefixed commands. This feeds
+    the transcribed text into the SAME ambient-learning extractor a normal turn
+    uses (learn_from_turn), with an empty assistant reply so no fabricated
+    assistant context leaks in. learn_from_turn already runs its extraction on a
+    background daemon and only writes durable facts via merge_memory — it never
+    speaks or triggers a reply, so this is response-free by construction.
+
+    Gated ONLY on AMBIENT_LISTEN_ENABLED (the Settings ambient-listening knob);
+    a no-op when off. NEVER raises — a learning hiccup must not break the gate's
+    drop-and-continue. 2026-06-06 audit (Alexa-mode ambient learning)."""
+    if not AMBIENT_LISTEN_ENABLED:
+        return
+    try:
+        # Empty reply: this is overheard speech, not a JARVIS exchange. The
+        # extractor's STRICT rules already filter to explicit durable facts.
+        learn_from_turn(text, "", memory)
+    except Exception as _e:
+        print(f"  [ambient-learn] gated-feed skipped: {type(_e).__name__}: {_e}")
+
+
 # ──────────────────────────────────────────────────────────────────────────
 #  SESSION PATTERN MEMORY  — records when/how the user typically uses JARVIS
 #  so it can surface patterns proactively at startup ('it's Friday night,
@@ -5697,6 +5723,31 @@ _LOCAL_GENERATE_TIMEOUT = (5, 50)
 # attribute and raise "catching classes that do not inherit from BaseException".
 _RequestsTimeout = requests.Timeout
 
+# Wall-clock bound (seconds) for the two hot-path `ollama.chat` calls in
+# _call_llm / get_followup_response. The stock ollama-python client defaults to
+# timeout=None, so a wedged runner (model-load failure, GPU hang, SAC-blocked
+# generate) would block the voice thread FOREVER and JARVIS goes permanently
+# deaf — the watchdog only sets a flag at ~64 s, it can't unblock a native
+# call. These two calls carry the full (uncompacted) system prompt so they run
+# heavier than _call_local_llm's compact path; 60 s leaves comfortable headroom
+# for a warm generation yet still degrades gracefully (their `except` falls back
+# to the honest cloud/local message) instead of hanging. Matches the bounded
+# /api/chat read leg in _call_local_llm (_LOCAL_GENERATE_TIMEOUT).
+_OLLAMA_CHAT_TIMEOUT_S = 60.0
+
+
+def _ollama_chat_bounded(model, messages):
+    """`ollama.chat`, but bounded by a wall-clock timeout so a wedged runner
+    raises (httpx TimeoutException) instead of blocking the voice loop forever.
+
+    Routes through `ollama.Client(timeout=…)` (the host kwargs flow straight to
+    the underlying httpx client). Raises on timeout/transport error so the
+    caller's existing `except` degrades to its honest cloud/local fallback —
+    NEVER returns a partial/None silently here. 2026-06-06 audit (P1-2)."""
+    import ollama
+    client = ollama.Client(host=LOCAL_LLM_BASE_URL, timeout=_OLLAMA_CHAT_TIMEOUT_S)
+    return client.chat(model=model, messages=messages)
+
 
 def _ollama_alive() -> bool:
     try:
@@ -5708,16 +5759,30 @@ def _ollama_alive() -> bool:
 def _local_num_ctx(model: str) -> int:
     """Pick the Ollama num_ctx for a model so it fits 100 % on the 3090.
 
-    MEASURED on this box (RTX 3090, 24 GB): the 32B q4_K_M at num_ctx=16384
-    spills ~5 % to CPU and runs ~28 tok/s (fragile); at num_ctx=12288 it stays
-    100 % on the GPU and runs ~49 tok/s (stable). Smaller models (14B/8B) have
+    MEASURED on this box (RTX 3090, 24 GB): the 32B-class q4_K_M at
+    num_ctx=16384 spills ~5 % to CPU and runs ~28 tok/s (fragile); at
+    num_ctx=12288 it stays 100 % on the GPU and runs ~49 tok/s (stable). The
+    production tag is `qwen3:30b-a3b…` (a 30B-param MoE) — same ~21 GB resident
+    footprint, so it needs the tighter window too. Smaller models (14B/8B) have
     headroom to spare, so they keep the larger 16k window. Heuristic: any tag
     that looks like a 30B-class (or bigger) model gets the smaller 12k window.
     """
     tag = (model or "").lower()
-    # 32b / 34b / 65b / 70b / 72b … — the big ones that need the tighter window.
-    if any(b in tag for b in ("32b", "34b", "65b", "70b", "72b")):
+    # 30b / 32b / 34b / 65b / 70b / 72b … — the big ones that need the tighter
+    # window. `30b` covers the production qwen3:30b-a3b MoE (previously fell
+    # through to 16k → ~40 % slower + CPU spill every turn).
+    if any(b in tag for b in ("30b", "32b", "34b", "65b", "70b", "72b")):
         return 12288
+    # General param-parse so any FUTURE ≥30B tag also gets the tight window
+    # without a literal here. Match digit-runs immediately followed by `b`
+    # (e.g. the `30` in `30b`), but NOT the active-param `a3b` MoE suffix —
+    # the leading `a` is excluded so `qwen3:30b-a3b` parses as 30, not 3.
+    try:
+        sizes = [int(n) for n in re.findall(r"(?<![a-z0-9])(\d+)b\b", tag)]
+        if sizes and max(sizes) >= 30:
+            return 12288
+    except Exception:
+        pass
     return 16384
 
 
@@ -6580,10 +6645,11 @@ def _call_llm(user_text: str) -> str:
         # main loop only catches KeyboardInterrupt, so an unguarded raise here
         # would crash the whole conversation loop. 2026-05-30 audit.
         try:
-            import ollama
-            resp = ollama.chat(
-                model=OLLAMA_MODEL,
-                messages=[{"role": "system", "content": sys_prompt_now}] + conversation_history,
+            # Bounded (see _ollama_chat_bounded): a wedged runner raises rather
+            # than blocking the voice thread forever; the except below degrades.
+            resp = _ollama_chat_bounded(
+                OLLAMA_MODEL,
+                [{"role": "system", "content": sys_prompt_now}] + conversation_history,
             )
             reply = resp["message"]["content"]
         except Exception as _e:
@@ -13486,11 +13552,12 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
             )
             return msg.content[0].text
         elif AI_BACKEND == "ollama":
-            import ollama
             msgs = ([{"role": "system", "content": sys_prompt_now}]
                     + list(conversation_history)
                     + [{"role": "user", "content": extra}])
-            resp = ollama.chat(model=OLLAMA_MODEL, messages=msgs)
+            # Bounded (see _ollama_chat_bounded): a wedged runner raises into the
+            # `except` below, which already falls back to _call_local_llm / "".
+            resp = _ollama_chat_bounded(OLLAMA_MODEL, msgs)
             return resp["message"]["content"]
     except Exception as e:
         # Cloud unavailable (e.g. the monthly usage cap) — keep the action
@@ -16675,6 +16742,12 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
             if _bg_gate:
                 print(f"  [bg-audio] {_bg_why} — ignoring non-wake "
                       f"utterance: '{text[:40]}'")
+                # Alexa-mode ambient learning: we won't RESPOND to this gated
+                # (non-wake) utterance, but if ambient-listening is on we still
+                # passively LEARN from it — feed the transcript to the extractor
+                # BEFORE dropping the turn. No-op when AMBIENT_LISTEN_ENABLED is
+                # off; never raises; never speaks (see _ambient_learn_from_gated).
+                _ambient_learn_from_gated(text, memory)
                 set_state("idle")
                 continue
 

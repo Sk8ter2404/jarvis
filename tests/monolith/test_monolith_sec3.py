@@ -1273,11 +1273,12 @@ class CallLlmTests(MonolithGlobalsTestCase):
         self.assertIn("AI backend not configured", reply)
 
     def test_ollama_backend_failure_is_caught(self):
-        fake_ollama = mock.Mock()
-        fake_ollama.chat.side_effect = RuntimeError("ollama down")
+        # The ollama path now goes through the bounded helper; a wedged-runner
+        # timeout (or any error) raised by it must be caught, not propagated.
         with mock.patch.object(self.bc, "AI_BACKEND", "ollama"), \
                 mock.patch.object(self.bc, "OLLAMA_MODEL", "m"), \
-                mock.patch.dict(sys.modules, {"ollama": fake_ollama}), \
+                mock.patch.object(self.bc, "_ollama_chat_bounded",
+                                  side_effect=RuntimeError("ollama down")), \
                 mock.patch.object(self.bc, "_mcu_phrases", self._make_phrases()):
             reply = self.bc._call_llm("hi")
         self.assertIn("local model isn't responding", reply)
@@ -2626,16 +2627,15 @@ class CallLlmClassifierSideTripsTests(MonolithGlobalsTestCase):
         self.assertIn("Unexpected LLM error", lf.call_args[0][1])
 
     def test_ollama_backend_success(self):
-        # 6024: AI_BACKEND == "ollama" happy path through ollama.chat.
-        fake_ollama = mock.Mock()
-        fake_ollama.chat.return_value = {"message": {"content": "Local says hi."}}
+        # AI_BACKEND == "ollama" happy path now flows through the bounded helper.
         with mock.patch.object(self.bc, "AI_BACKEND", "ollama"), \
                 mock.patch.object(self.bc, "detect_tone", return_value=None), \
                 mock.patch.object(self.bc, "route_voice_emotion",
                                   return_value={"mood": "casual", "addendum": ""}), \
                 mock.patch.object(self.bc, "_voice_mood_response", None), \
                 mock.patch.object(self.bc, "_emotion_tracker", None), \
-                mock.patch.dict(sys.modules, {"ollama": fake_ollama}), \
+                mock.patch.object(self.bc, "_ollama_chat_bounded",
+                                  return_value={"message": {"content": "Local says hi."}}), \
                 mock.patch.object(self.bc, "_mcu_phrases", self._phrases()):
             reply = self.bc._call_llm("hi")
         self.assertEqual(reply, "Local says hi.")
@@ -4820,6 +4820,26 @@ class LocalNumCtxTests(MonolithGlobalsTestCase):
         for tag in ("llama3.1:70b", "qwen:72b-chat", "yi:34b", "foo:65b"):
             self.assertEqual(self.bc._local_num_ctx(tag), 12288, tag)
 
+    def test_production_qwen3_30b_moe_gets_12288(self):
+        # P0-1: the PRODUCTION tag is qwen3:30b-a3b… — a 30B MoE that was
+        # falling through to 16384 (the literal list only had 32b/34b/…),
+        # running ~40 % slower with a CPU spill every turn. It must now get
+        # the tight 12k window like the rest of the 30B-class.
+        for tag in ("qwen3:30b-a3b-q4_K_M", "qwen3:30b", "Qwen3:30B-A3B"):
+            self.assertEqual(self.bc._local_num_ctx(tag), 12288, tag)
+
+    def test_moe_active_param_suffix_not_misread_as_small(self):
+        # The `a3b` active-param suffix must NOT trick the param-parse into
+        # reading 3B and keeping 16k — the architecturally-relevant size is the
+        # 30B total. (Regression guard for the negative-lookbehind in the parse.)
+        self.assertEqual(self.bc._local_num_ctx("qwen3:30b-a3b"), 12288)
+
+    def test_future_large_tag_param_parse_12288(self):
+        # General ≥30B param-parse: a future tag with no literal in the list
+        # (e.g. a 40B / 110B / 235B) still gets the tight window.
+        for tag in ("foo:40b-instruct", "bar:110b", "baz:235b-a22b"):
+            self.assertEqual(self.bc._local_num_ctx(tag), 12288, tag)
+
     def test_14b_keeps_16384(self):
         self.assertEqual(
             self.bc._local_num_ctx("qwen2.5:14b-instruct-q5_K_M"), 16384)
@@ -4975,6 +4995,97 @@ class CallLocalLlmNumCtxAndTuningTests(MonolithGlobalsTestCase):
             for p in patches:
                 p.stop()
         self.assertIsNone(out)
+
+
+@requires_monolith
+class OllamaChatBoundedTests(MonolithGlobalsTestCase):
+    """P1-2: the two hot-path ollama.chat calls (_call_llm + get_followup_response)
+    must be wall-clock bounded so a wedged runner can't deaf-loop JARVIS forever.
+    _ollama_chat_bounded routes through ollama.Client(timeout=…) and raises on a
+    hang so each caller's existing `except` degrades (cloud/local fallback)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_builds_client_with_timeout_and_forwards_call(self):
+        captured = {}
+        fake_client = mock.Mock()
+        fake_client.chat.return_value = {"message": {"content": "ok"}}
+
+        def _ctor(*args, **kwargs):
+            captured["ctor_kwargs"] = kwargs
+            return fake_client
+        fake_ollama = mock.Mock()
+        fake_ollama.Client.side_effect = _ctor
+        with mock.patch.dict(sys.modules, {"ollama": fake_ollama}):
+            out = self.bc._ollama_chat_bounded(
+                "m:tag", [{"role": "user", "content": "hi"}])
+        # A real wall-clock timeout was passed to the client (NOT None).
+        self.assertEqual(captured["ctor_kwargs"].get("timeout"),
+                         self.bc._OLLAMA_CHAT_TIMEOUT_S)
+        self.assertIsInstance(self.bc._OLLAMA_CHAT_TIMEOUT_S, (int, float))
+        self.assertGreater(self.bc._OLLAMA_CHAT_TIMEOUT_S, 0)
+        # model + messages forwarded through to the client's .chat().
+        _, ckw = fake_client.chat.call_args
+        self.assertEqual(ckw["model"], "m:tag")
+        self.assertEqual(ckw["messages"], [{"role": "user", "content": "hi"}])
+        self.assertEqual(out, {"message": {"content": "ok"}})
+
+    def test_timeout_propagates_so_caller_can_fall_back(self):
+        # A hung runner -> the client raises -> _ollama_chat_bounded must RAISE
+        # (not swallow), so the caller's except fires its fallback. We use a
+        # stand-in exception that mimics httpx.TimeoutException.
+        class _Timeout(Exception):
+            pass
+        fake_client = mock.Mock()
+        fake_client.chat.side_effect = _Timeout("read timed out")
+        fake_ollama = mock.Mock()
+        fake_ollama.Client.return_value = fake_client
+        with mock.patch.dict(sys.modules, {"ollama": fake_ollama}):
+            with self.assertRaises(_Timeout):
+                self.bc._ollama_chat_bounded("m:tag", [])
+
+    def test_call_llm_ollama_timeout_degrades_not_hangs(self):
+        # End-to-end: a timeout in the bounded helper must surface the honest
+        # "local model isn't responding" line, never propagate or hang.
+        with mock.patch.object(self.bc, "AI_BACKEND", "ollama"), \
+                mock.patch.object(self.bc, "OLLAMA_MODEL", "m"), \
+                mock.patch.object(self.bc, "detect_tone", return_value=None), \
+                mock.patch.object(self.bc, "route_voice_emotion",
+                                  return_value={"mood": "casual", "addendum": ""}), \
+                mock.patch.object(self.bc, "_voice_mood_response", None), \
+                mock.patch.object(self.bc, "_emotion_tracker", None), \
+                mock.patch.object(self.bc, "_trim_conversation_history"), \
+                mock.patch.object(self.bc, "_system_prompt", "SYS"), \
+                mock.patch.object(self.bc, "_ollama_chat_bounded",
+                                  side_effect=TimeoutError("wedged")), \
+                mock.patch.object(self.bc, "_mcu_phrases", mock.Mock(
+                    **{"detect_phrases_in_reply.return_value": {}})):
+            saved = list(self.bc.conversation_history)
+            self.bc.conversation_history.clear()
+            try:
+                reply = self.bc._call_llm("hi")
+            finally:
+                self.bc.conversation_history[:] = saved
+        self.assertIn("local model isn't responding", reply)
+
+    def test_followup_ollama_timeout_falls_back_to_local(self):
+        # get_followup_response: a bounded-ollama timeout must drop into the
+        # _call_local_llm fallback (the existing except arm), not hang/raise.
+        with mock.patch.object(self.bc, "AI_BACKEND", "ollama"), \
+                mock.patch.object(self.bc, "OLLAMA_MODEL", "m"), \
+                mock.patch.object(self.bc, "_last_voice_route",
+                                  [{"addendum": ""}]), \
+                mock.patch.object(self.bc, "_last_user_tone", [None]), \
+                mock.patch.object(self.bc, "_system_prompt", "SYS"), \
+                mock.patch.object(self.bc, "_ollama_chat_bounded",
+                                  side_effect=TimeoutError("wedged")), \
+                mock.patch.object(self.bc, "_call_local_llm",
+                                  return_value="local saved the chain") as loc:
+            out = self.bc.get_followup_response([("get_time", "noon")])
+        self.assertEqual(out, "local saved the chain")
+        loc.assert_called_once()
 
 
 @requires_monolith
