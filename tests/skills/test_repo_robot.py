@@ -293,9 +293,27 @@ class StateIOTests(unittest.TestCase):
         self.assertEqual(reloaded["next_step"], "go")
         self.assertIn("updated_at", reloaded)
 
-    def test_save_state_write_failure_returns_false(self):
+    def test_save_state_delegates_to_atomic_io(self):
+        # The write goes through the shared core.atomic_io helper (mkstemp +
+        # os.replace) rather than a fixed "<state>.tmp" sibling, so two
+        # concurrent saves can't clobber each other's temp file.
         with mock.patch.object(self.mod.os, "makedirs", return_value=None), \
-             mock.patch("builtins.open", side_effect=OSError("read-only fs")):
+             mock.patch.object(self.mod, "_atomic_write_json") as aw:
+            ok = self.mod._save_state({"next_step": "go"})
+        self.assertTrue(ok)
+        aw.assert_called_once()
+        # Called with (_STATE_FILE, the stamped state dict).
+        args, _kwargs = aw.call_args
+        self.assertEqual(args[0], self.mod._STATE_FILE)
+        self.assertEqual(args[1]["next_step"], "go")
+        self.assertIn("updated_at", args[1])
+
+    def test_save_state_write_failure_returns_false(self):
+        # An atomic-writer failure (e.g. read-only fs, permission denied) is
+        # caught and reported as False rather than propagating.
+        with mock.patch.object(self.mod.os, "makedirs", return_value=None), \
+             mock.patch.object(self.mod, "_atomic_write_json",
+                               side_effect=OSError("read-only fs")):
             self.assertFalse(self.mod._save_state({"x": 1}))
 
 
