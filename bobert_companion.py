@@ -11007,15 +11007,31 @@ _screen_cache: list[dict] = []
 _screen_cache_lock = threading.Lock()
 
 # Per-intent see_screen budget. Caps how many vision captures a single
-# parse_and_run_actions dispatch may burn before _act_see_screen starts
-# refusing and pointing the LLM at recall_screen / cached context. Stops
-# the "sledgehammer" loop where JARVIS fires see_screen → scroll →
-# find_on_screen → see_screen … for minutes without finding the target.
-# Counter is per-thread (threading.local) so concurrent dispatches don't
-# collide, and is reset at the top of parse_and_run_actions so it never
-# leaks across unrelated user requests.
+# user/proactive turn may burn before _act_see_screen starts refusing and
+# pointing the LLM at recall_screen / cached context. Stops the "sledgehammer"
+# loop where JARVIS fires see_screen → scroll → find_on_screen → see_screen …
+# for minutes without finding the target. The cap covers the WHOLE turn,
+# including every follow-up depth — the reset lives at dispatch entry
+# (_reset_see_screen_budget, called from _run_llm_dispatch and the proactive
+# path), NOT inside parse_and_run_actions, which the follow-up loop re-invokes
+# per depth. Counter is per-thread (threading.local) so concurrent dispatches
+# don't collide, and resetting per dispatch keeps it from leaking across
+# unrelated user requests.
 SEE_SCREEN_BUDGET_PER_INTENT = 3
 _see_screen_budget_state = threading.local()
+
+
+def _reset_see_screen_budget() -> None:
+    """Zero the per-intent see_screen counter for the calling thread.
+
+    Called once at the top of a *dispatch* (a single user/proactive intent),
+    NOT inside parse_and_run_actions — the follow-up loop re-invokes
+    parse_and_run_actions for every depth iteration, so resetting there would
+    re-zero the budget on each follow-up and let see_screen fire unbounded
+    across the chain (3 captures × every follow-up depth). Keeping the reset
+    at dispatch entry makes the cap span the whole turn, follow-ups included.
+    """
+    _see_screen_budget_state.used = 0
 
 
 def _push_screen_context(
@@ -13505,9 +13521,12 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             print(f"  [preemptive_hallucination] refused — {_desc}")
             return "", [("_preemptive_hallucinated_claim", warn, True)]
 
-    # Reset the per-intent see_screen budget. Bounded per dispatch (not per
-    # session) so it never carries over between unrelated user requests.
-    _see_screen_budget_state.used = 0
+    # NOTE: the per-intent see_screen budget is intentionally NOT reset here.
+    # The follow-up loop in _run_llm_dispatch calls this function once per
+    # depth iteration, so resetting here would re-zero the counter on every
+    # follow-up and defeat the cap. The reset lives at dispatch entry instead
+    # (_run_llm_dispatch and the proactive path), so the budget spans the
+    # whole turn — follow-ups included. See _reset_see_screen_budget().
 
     results: list[tuple[str, str, bool]] = []
     # JARVIS-style objection lines accumulated during this dispatch. Any
@@ -14390,6 +14409,9 @@ def _do_proactive_turn(memory: dict):
     print(f"\n  [proactive]")
     print(f"  JARVIS: {text}")
     conversation_history.append({"role": "assistant", "content": text})
+    # Proactive comment is its own intent (no follow-up loop) — give it a fresh
+    # budget so the cap is enforced independently of the last voice turn.
+    _reset_see_screen_budget()
     spoken, _proactive_results = parse_and_run_actions(text)
     spoken = _apply_quip_layer(spoken, _proactive_results)
     _speak(spoken)
@@ -16160,6 +16182,11 @@ def _run_llm_dispatch(text: str) -> str:
     (inner `for depth` loop) — this never touches the main loop's flow.
     """
     print("  Thinking…")
+    # Reset the per-intent see_screen budget once for the WHOLE turn (initial
+    # reply + every follow-up depth). parse_and_run_actions deliberately does
+    # not reset it, so the cap of SEE_SCREEN_BUDGET_PER_INTENT spans the entire
+    # follow-up chain instead of refreshing on each iteration.
+    _reset_see_screen_budget()
     # Glance-response fast path: if the focused window changed in the
     # last few seconds AND the utterance is ambiguous ("what is
     # this?" / "should I worry?" / "wait, what?" / "explain"), grab

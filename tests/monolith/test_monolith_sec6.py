@@ -697,6 +697,118 @@ class ParseAndRunActionsTests(SectionSixBase):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  see_screen per-intent budget (P1-6 regression guard)
+#
+#  The budget cap only works if the counter is reset ONCE per dispatch and
+#  survives across the follow-up loop, which re-invokes parse_and_run_actions
+#  for every depth. These tests pin: (a) the reset helper zeroes the counter,
+#  (b) parse_and_run_actions does NOT reset it (so it can't be re-zeroed on
+#  each follow-up), and (c) a real see_screen run through dispatch increments
+#  the counter and then refuses past the cap, with exhaustion persisting into
+#  a second dispatch call (the follow-up iteration).
+# ════════════════════════════════════════════════════════════════════════════
+class SeeScreenBudgetResetTests(SectionSixBase):
+    # Mirror ParseAndRunActionsTests' quiet-dispatch setup (without subclassing
+    # it, so its 16 tests aren't re-run under this class).
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        self._p(bc, "_speak", lambda *a, **k: None)
+        self._p(bc, "_write_hud_state", lambda **k: None)
+        self._p(bc, "record_session_action", lambda *a, **k: None)
+        self._p(bc, "record_action_history", lambda *a, **k: None)
+        self._p(bc, "record_action_error", lambda *a, **k: None)
+        self._p(bc, "_cmd_autocorrect", None)
+        self._p(bc, "PC_CONTROL_ENABLED", True)
+        # Per-thread counter is mutated directly; snapshot + restore so a test
+        # can't leak budget state into the next.
+        self._prev_used = getattr(bc._see_screen_budget_state, "used", None)
+        def _restore_used():
+            if self._prev_used is None:
+                if hasattr(bc._see_screen_budget_state, "used"):
+                    del bc._see_screen_budget_state.used
+            else:
+                bc._see_screen_budget_state.used = self._prev_used
+        self.addCleanup(_restore_used)
+        self._p(bc, "SEE_SCREEN_BUDGET_PER_INTENT", 3)
+
+    def _with_action(self, name, fn, informative=False):
+        """Patch a `name`->fn entry into ACTIONS (+ INFORMATIVE_ACTIONS)."""
+        bc = self.bc
+        acts = dict(bc.ACTIONS)
+        acts[name] = fn
+        self._p(bc, "ACTIONS", acts)
+        if informative:
+            info = set(bc.INFORMATIVE_ACTIONS) | {name}
+            self._p(bc, "INFORMATIVE_ACTIONS", info)
+
+    def test_reset_helper_zeroes_counter(self):
+        bc = self.bc
+        bc._see_screen_budget_state.used = 2
+        bc._reset_see_screen_budget()
+        self.assertEqual(bc._see_screen_budget_state.used, 0)
+
+    def test_parse_and_run_actions_does_not_reset_budget(self):
+        # The core P1-6 fix: the reset must NOT live inside
+        # parse_and_run_actions, or the follow-up loop re-zeroes it every
+        # depth and the cap never bounds the turn. Pre-load a used budget,
+        # run an unrelated (non-vision) action dispatch, and assert the
+        # counter is untouched.
+        bc = self.bc
+        bc._see_screen_budget_state.used = 2
+        self._with_action("testecho", lambda a: f"R-{a}", informative=True)
+        with mock.patch.object(bc, "_needs_confirmation", lambda n, a: False), \
+             mock.patch.object(bc, "_jarvis_pushback", lambda n, a: None):
+            bc.parse_and_run_actions("Sure. [ACTION: testecho, hi]")
+        self.assertEqual(bc._see_screen_budget_state.used, 2)
+
+    def _wire_real_see_screen(self):
+        """Register the real core.actions._act_see_screen as `see_screen`,
+        with only its capture/vision internals mocked so it exercises the
+        real budget increment + refuse against the live bc counter."""
+        import core.actions as A
+        bc = self.bc
+        # _act_see_screen reads these off the late-bound monolith (self.bc):
+        self._p(bc, "screenshot_privacy_block_reason", lambda: None)
+        self._p(bc, "_parse_monitor_prefix", lambda q: (None, q))
+        self._p(bc, "take_all_monitor_screenshots", lambda: {"m": b"PNG"})
+        self._p(bc, "ask_vision_multi", lambda q, imgs: "a desktop")
+        self._p(bc, "_push_screen_context", lambda *a, **k: None)
+        self._with_action("see_screen", A._act_see_screen, informative=True)
+
+    def test_see_screen_increments_then_refuses_within_one_dispatch(self):
+        bc = self.bc
+        self._wire_real_see_screen()
+        bc._reset_see_screen_budget()
+        with mock.patch.object(bc, "_needs_confirmation", lambda n, a: False), \
+             mock.patch.object(bc, "_jarvis_pushback", lambda n, a: None):
+            # Three captures in one reply consume the whole budget (0 -> 3).
+            _, r3 = bc.parse_and_run_actions(
+                "[ACTION: see_screen, a] [ACTION: see_screen, b] "
+                "[ACTION: see_screen, c]")
+            self.assertEqual(bc._see_screen_budget_state.used, 3)
+            self.assertTrue(all("a desktop" in res for _, res, _ in r3), r3)
+            # A 4th capture in a *follow-up* dispatch (no reset between them)
+            # must be refused — the cap spans the turn, not the call.
+            _, r4 = bc.parse_and_run_actions("[ACTION: see_screen, d]")
+        self.assertEqual(bc._see_screen_budget_state.used, 3)
+        self.assertIn("budget for this intent is exhausted", r4[0][1])
+
+    def test_budget_does_not_carry_into_a_freshly_reset_dispatch(self):
+        # After a dispatch exhausts the budget, the NEXT turn calls the reset
+        # helper at its entry — proving the cap is per-intent, not permanent.
+        bc = self.bc
+        self._wire_real_see_screen()
+        bc._see_screen_budget_state.used = bc.SEE_SCREEN_BUDGET_PER_INTENT
+        bc._reset_see_screen_budget()   # what _run_llm_dispatch does per turn
+        with mock.patch.object(bc, "_needs_confirmation", lambda n, a: False), \
+             mock.patch.object(bc, "_jarvis_pushback", lambda n, a: None):
+            _, r = bc.parse_and_run_actions("[ACTION: see_screen, fresh]")
+        self.assertEqual(bc._see_screen_budget_state.used, 1)
+        self.assertIn("a desktop", r[0][1])
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  get_followup_response
 # ════════════════════════════════════════════════════════════════════════════
 class GetFollowupResponseTests(SectionSixBase):
