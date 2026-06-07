@@ -3552,5 +3552,272 @@ class MusicWindowRecognisesChromeWebPlayerTests(MonolithGlobalsTestCase):
         target.activate.assert_called_once()
 
 
+# ──────────────────────────────────────────────────────────────────────────
+#  VRAM-brick hardening (REVIEW_FINDINGS_2 P0-2 / P0-3)
+# ──────────────────────────────────────────────────────────────────────────
+GB = 1024 * 1024 * 1024
+
+
+def _fake_requests_with_ps(ps_models, ok=True):
+    """A stand-in `requests` whose .get('<base>/api/ps') returns a JSON body of
+    {'models': ps_models}. Any other GET returns an empty-models 200. Used to
+    drive _ollama_loaded_models / _ollama_big_model_resident deterministically
+    without a live Ollama."""
+    fake = mock.MagicMock(name="requests")
+
+    def _get(url, *a, **k):
+        resp = mock.MagicMock()
+        resp.ok = ok
+        if url.endswith("/api/ps"):
+            resp.json.return_value = {"models": ps_models}
+        else:
+            resp.json.return_value = {"models": []}
+        return resp
+
+    fake.get.side_effect = _get
+    return fake
+
+
+@requires_monolith
+class OllamaLoadedModelsTests(MonolithGlobalsTestCase):
+    """_ollama_loaded_models + _ollama_big_model_resident — the /api/ps
+    residency reads that back the VRAM co-load guard."""
+
+    def test_loaded_models_parses_ps(self):
+        bc = self.bc
+        fake = _fake_requests_with_ps([{"name": "qwen3:30b", "size_vram": 20 * GB}])
+        with mock.patch.object(bc, "requests", fake):
+            out = bc._ollama_loaded_models()
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["name"], "qwen3:30b")
+
+    def test_loaded_models_empty_on_http_error(self):
+        bc = self.bc
+        fake = _fake_requests_with_ps([], ok=False)
+        with mock.patch.object(bc, "requests", fake):
+            self.assertEqual(bc._ollama_loaded_models(), [])
+
+    def test_loaded_models_empty_on_exception(self):
+        bc = self.bc
+        fake = mock.MagicMock()
+        fake.get.side_effect = RuntimeError("server down")
+        with mock.patch.object(bc, "requests", fake):
+            self.assertEqual(bc._ollama_loaded_models(), [])
+
+    def test_big_model_resident_detects_30b(self):
+        bc = self.bc
+        fake = _fake_requests_with_ps([{"name": "qwen3:30b-a3b", "size_vram": 20 * GB}])
+        with mock.patch.object(bc, "requests", fake):
+            self.assertEqual(bc._ollama_big_model_resident(), "qwen3:30b-a3b")
+
+    def test_big_model_resident_ignores_small_vlm(self):
+        bc = self.bc
+        # A 7B VLM at ~7 GB is below the 12 GB 'big' threshold → not flagged.
+        fake = _fake_requests_with_ps([{"name": "qwen2.5vl:7b", "size_vram": 7 * GB}])
+        with mock.patch.object(bc, "requests", fake):
+            self.assertIsNone(bc._ollama_big_model_resident())
+
+    def test_big_model_resident_excludes_named_model(self):
+        bc = self.bc
+        # Even a 'big' tag is not counted against itself (re-use, not co-load).
+        fake = _fake_requests_with_ps([{"name": "qwen3:30b", "size_vram": 20 * GB}])
+        with mock.patch.object(bc, "requests", fake):
+            self.assertIsNone(bc._ollama_big_model_resident(exclude_model="qwen3:30b"))
+
+    def test_big_model_resident_handles_missing_vram_field(self):
+        bc = self.bc
+        fake = _fake_requests_with_ps([{"name": "mystery"}])  # no size_vram
+        with mock.patch.object(bc, "requests", fake):
+            self.assertIsNone(bc._ollama_big_model_resident())
+
+
+@requires_monolith
+class LocalVisionColoadGuardTests(MonolithGlobalsTestCase):
+    """_call_local_vision refuses to load the VLM while the 30B brain is
+    resident (the actual brick path), and proceeds otherwise / when overridden."""
+
+    def _common_patches(self, bc):
+        # Enable local vision and make Ollama look alive + VLM installed so the
+        # function reaches the co-load guard / POST.
+        return (
+            mock.patch.object(bc, "LOCAL_VISION_FALLBACK", True),
+            mock.patch.object(bc, "LOCAL_VISION_MODEL", "qwen2.5vl:7b"),
+            mock.patch.object(bc, "_ollama_alive", return_value=True),
+            mock.patch.object(bc, "_ollama_has_model", return_value=True),
+        )
+
+    def test_refuses_when_big_model_resident(self):
+        bc = self.bc
+        post = mock.MagicMock()
+        with mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch.object(bc, "_ollama_big_model_resident",
+                               return_value="qwen3:30b"), \
+             mock.patch.object(bc, "requests") as req:
+            os.environ.pop("JARVIS_ALLOW_VLM_COLOAD", None)
+            req.post = post
+            ps = self._common_patches(bc)
+            with ps[0], ps[1], ps[2], ps[3]:
+                out = bc._call_local_vision("what is this?", [b"PNG"])
+        # Refused → None, and crucially NO POST was made (no 2nd model load).
+        self.assertIsNone(out)
+        post.assert_not_called()
+
+    def test_proceeds_when_no_big_model_resident(self):
+        bc = self.bc
+        # Build a fake POST that returns a normal vision reply.
+        resp = mock.MagicMock()
+        resp.ok = True
+        resp.json.return_value = {"message": {"content": "a login screen"}}
+        with mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch.object(bc, "_ollama_big_model_resident", return_value=None), \
+             mock.patch.object(bc, "_log_gpu_state"), \
+             mock.patch.object(bc, "requests") as req:
+            os.environ.pop("JARVIS_ALLOW_VLM_COLOAD", None)
+            req.post.return_value = resp
+            ps = self._common_patches(bc)
+            with ps[0], ps[1], ps[2], ps[3]:
+                out = bc._call_local_vision("what is this?", [b"PNG"])
+        self.assertEqual(out, "a login screen")
+        req.post.assert_called_once()
+
+    def test_override_env_allows_coload(self):
+        bc = self.bc
+        resp = mock.MagicMock()
+        resp.ok = True
+        resp.json.return_value = {"message": {"content": "ok"}}
+        # With JARVIS_ALLOW_VLM_COLOAD=1 the guard is bypassed: even though a big
+        # model is resident, the POST fires. _ollama_big_model_resident must NOT
+        # be consulted at all in that case.
+        with mock.patch.dict(os.environ, {"JARVIS_ALLOW_VLM_COLOAD": "1"}), \
+             mock.patch.object(bc, "_ollama_big_model_resident",
+                               side_effect=AssertionError("guard must be skipped")), \
+             mock.patch.object(bc, "_log_gpu_state"), \
+             mock.patch.object(bc, "requests") as req:
+            req.post.return_value = resp
+            ps = self._common_patches(bc)
+            with ps[0], ps[1], ps[2], ps[3]:
+                out = bc._call_local_vision("q", [b"PNG"])
+        self.assertEqual(out, "ok")
+        req.post.assert_called_once()
+
+
+@requires_monolith
+class EnsureOllamaSingleModelEnvTests(MonolithGlobalsTestCase):
+    """_persist_user_env + _ensure_ollama_single_model_env — the OLLAMA_MAX_
+    LOADED_MODELS=1 cap that makes Ollama evict instead of co-load."""
+
+    def _fake_winreg(self, existing=None):
+        """A minimal in-memory winreg whose Environment 'key' holds `existing`
+        values and records SetValueEx writes into `.writes`."""
+        wr = mock.MagicMock(name="winreg")
+        wr.HKEY_CURRENT_USER = "HKCU"
+        wr.KEY_READ = 1
+        wr.KEY_SET_VALUE = 2
+        wr.REG_SZ = 1
+        wr.FileNotFoundError = FileNotFoundError
+        store = dict(existing or {})
+        wr.writes = []
+
+        class _Key:
+            def __enter__(self_):
+                return self_
+
+            def __exit__(self_, *a):
+                return False
+
+        wr.OpenKey.return_value = _Key()
+
+        def _query(_key, name):
+            if name in store:
+                return (store[name], wr.REG_SZ)
+            raise FileNotFoundError(name)
+
+        def _set(_key, name, _res, _typ, val):
+            store[name] = val
+            wr.writes.append((name, val))
+
+        wr.QueryValueEx.side_effect = _query
+        wr.SetValueEx.side_effect = _set
+        return wr
+
+    def test_persist_writes_when_absent(self):
+        bc = self.bc
+        wr = self._fake_winreg(existing={})
+        with mock.patch.dict(sys.modules, {"winreg": wr}):
+            status = bc._persist_user_env("OLLAMA_MAX_LOADED_MODELS", "1")
+        self.assertEqual(status, "set")
+        self.assertIn(("OLLAMA_MAX_LOADED_MODELS", "1"), wr.writes)
+
+    def test_persist_idempotent_when_already_set(self):
+        bc = self.bc
+        wr = self._fake_winreg(existing={"OLLAMA_MAX_LOADED_MODELS": "1"})
+        with mock.patch.dict(sys.modules, {"winreg": wr}):
+            status = bc._persist_user_env("OLLAMA_MAX_LOADED_MODELS", "1")
+        self.assertEqual(status, "already")
+        self.assertEqual(wr.writes, [])  # no write performed
+
+    def test_persist_overwrites_different_value(self):
+        bc = self.bc
+        wr = self._fake_winreg(existing={"OLLAMA_MAX_LOADED_MODELS": "3"})
+        with mock.patch.dict(sys.modules, {"winreg": wr}):
+            status = bc._persist_user_env("OLLAMA_MAX_LOADED_MODELS", "1")
+        self.assertEqual(status, "set")
+        self.assertIn(("OLLAMA_MAX_LOADED_MODELS", "1"), wr.writes)
+
+    def test_persist_noop_without_winreg(self):
+        bc = self.bc
+        # Simulate non-Windows: importing winreg raises.
+        real_import = __import__
+
+        def _imp(name, *a, **k):
+            if name == "winreg":
+                raise ModuleNotFoundError("no winreg")
+            return real_import(name, *a, **k)
+
+        with mock.patch("builtins.__import__", side_effect=_imp):
+            status = bc._persist_user_env("OLLAMA_MAX_LOADED_MODELS", "1")
+        self.assertEqual(status, "noop")
+
+    def test_ensure_sets_process_env_and_persists(self):
+        bc = self.bc
+        wr = self._fake_winreg(existing={})
+        # Clear the staging/test gate so the ensure actually runs, and start
+        # from an env without the var so setdefault takes effect.
+        with mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch.object(bc, "_ollama_loaded_models", return_value=[]), \
+             mock.patch.dict(sys.modules, {"winreg": wr}):
+            for k in ("JARVIS_STAGING", "JARVIS_TEST_MODE",
+                      "OLLAMA_MAX_LOADED_MODELS"):
+                os.environ.pop(k, None)
+            bc._ensure_ollama_single_model_env()
+            self.assertEqual(os.environ.get("OLLAMA_MAX_LOADED_MODELS"), "1")
+        self.assertIn(("OLLAMA_MAX_LOADED_MODELS", "1"), wr.writes)
+
+    def test_ensure_gated_off_in_test_mode(self):
+        bc = self.bc
+        wr = self._fake_winreg(existing={})
+        # With JARVIS_TEST_MODE=1 the ensure must short-circuit: no registry
+        # write, no os.environ mutation.
+        with mock.patch.dict(os.environ, {"JARVIS_TEST_MODE": "1"}), \
+             mock.patch.dict(sys.modules, {"winreg": wr}):
+            os.environ.pop("OLLAMA_MAX_LOADED_MODELS", None)
+            bc._ensure_ollama_single_model_env()
+            self.assertIsNone(os.environ.get("OLLAMA_MAX_LOADED_MODELS"))
+        self.assertEqual(wr.writes, [])
+
+    def test_ensure_does_not_clobber_operator_override(self):
+        bc = self.bc
+        wr = self._fake_winreg(existing={})
+        # An operator who deliberately set =2 in the process env keeps it
+        # (setdefault never overwrites an existing value).
+        with mock.patch.dict(os.environ, {"OLLAMA_MAX_LOADED_MODELS": "2"}), \
+             mock.patch.object(bc, "_ollama_loaded_models", return_value=[]), \
+             mock.patch.dict(sys.modules, {"winreg": wr}):
+            os.environ.pop("JARVIS_STAGING", None)
+            os.environ.pop("JARVIS_TEST_MODE", None)
+            bc._ensure_ollama_single_model_env()
+            self.assertEqual(os.environ.get("OLLAMA_MAX_LOADED_MODELS"), "2")
+
+
 if __name__ == "__main__":
     unittest.main()
