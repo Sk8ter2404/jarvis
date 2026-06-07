@@ -864,8 +864,9 @@ class ListCamerasTests(_MonolithSec2Base):
 # ───────────────────────────────────────────────────────────────────────────
 class FaceTrackingToggleTests(_MonolithSec2Base):
     def tearDown(self):
-        # Leave the pause event clear (its boot default).
+        # Leave both events clear (their boot defaults).
         self.bc._face_track_pause.clear()
+        self.bc._face_track_camera_off.clear()
 
     def test_pause_sets_event(self):
         self.bc._face_track_pause.clear()
@@ -876,6 +877,20 @@ class FaceTrackingToggleTests(_MonolithSec2Base):
         self.bc._face_track_pause.set()
         self.bc.resume_face_tracking()
         self.assertFalse(self.bc._face_track_pause.is_set())
+
+    def test_pause_does_not_set_camera_off(self):
+        # Pausing for voice must NOT flip the genuine camera-off flag — that is
+        # what keeps the camera visibly ON while JARVIS listens/speaks.
+        self.bc._face_track_camera_off.clear()
+        self.bc.pause_face_tracking()
+        self.assertFalse(self.bc._face_track_camera_off.is_set())
+
+    def test_set_clear_camera_off(self):
+        self.bc._face_track_camera_off.clear()
+        self.bc.set_face_tracking_camera_off()
+        self.assertTrue(self.bc._face_track_camera_off.is_set())
+        self.bc.clear_face_tracking_camera_off()
+        self.assertFalse(self.bc._face_track_camera_off.is_set())
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -945,6 +960,109 @@ class FaceTrackingThreadTests(_MonolithSec2Base):
         # The good frame was cached for see_user.
         with self.bc._camera_state_lock:
             self.assertIn(0, self.bc._camera_latest_frame)
+
+    # ── camera STAYS ON during listening/speaking (fix/camera-stays-on) ──────
+    def _drive_one_preview_iteration(self, *, paused, camera_off, standby):
+        """Run exactly one face-track loop iteration with the HUD-preview
+        writer/remover mocked, returning (write_mock, remove_mock, detect_mock)
+        so callers can assert whether the preview was written/removed and
+        whether the HEAVY detection ran. One good primary frame, then stop."""
+        import numpy as np
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        cap = mock.Mock()
+        cap.isOpened.return_value = True
+        cap.get.return_value = 1280
+
+        stop = self.bc._face_track_stop
+        pause = self.bc._face_track_pause
+        cam_off = self.bc._face_track_camera_off
+        stop.clear(); pause.clear(); cam_off.clear()
+        if paused:
+            pause.set()
+        if camera_off:
+            cam_off.set()
+
+        def _read():
+            stop.set()          # end the loop after this single iteration
+            return True, frame
+        cap.read.side_effect = _read
+
+        cv2 = mock.Mock()
+        cv2.VideoCapture.return_value = cap
+        cv2.CAP_DSHOW = 700
+
+        write_mock  = mock.Mock(return_value=True)
+        remove_mock = mock.Mock()
+        detect_mock = mock.Mock(return_value=(0.5, 0.5))
+        # _standby_mode is a list-of-one cell; set [0] for the standby case.
+        saved_standby = self.bc._standby_mode[0]
+        self.bc._standby_mode[0] = bool(standby)
+        try:
+            with mock.patch.object(self.bc, "cv2", cv2), \
+                    mock.patch.object(self.bc, "CAMERAS",
+                                      [{"index": 0, "label": "X",
+                                        "primary": True,
+                                        "look_x": 0.5, "look_y": 0.5}]), \
+                    mock.patch.object(self.bc, "_detect_face", detect_mock), \
+                    mock.patch.object(self.bc, "_hud_camera_preview_enabled",
+                                      return_value=True), \
+                    mock.patch.object(self.bc, "_hud_camera_preview_write",
+                                      write_mock), \
+                    mock.patch.object(self.bc, "_hud_camera_preview_remove",
+                                      remove_mock), \
+                    mock.patch.object(self.bc, "_note_camera_read_attempt"), \
+                    mock.patch.object(self.bc, "send"), \
+                    mock.patch.object(self.bc.time, "sleep"):
+                self.bc._face_tracking_thread()
+        finally:
+            self.bc._standby_mode[0] = saved_standby
+            stop.clear(); pause.clear(); cam_off.clear()
+        return write_mock, remove_mock, detect_mock
+
+    def test_paused_for_voice_keeps_preview_live(self):
+        # The core fix: while paused for voice (listening/thinking/speaking) the
+        # camera must STAY visibly ON — the primary frame is still mirrored to
+        # the HUD preview — while the HEAVY cv2 face detection is still skipped
+        # (the recognition cost the pause exists to save).
+        write_mock, remove_mock, detect_mock = self._drive_one_preview_iteration(
+            paused=True, camera_off=False, standby=False)
+        # Preview kept live → HUD never shows "CAMERA OFF" just for listening.
+        # (The thread's on-shutdown cleanup removes the file once after the loop
+        # ends — the single test iteration triggers that teardown — so the live
+        # signal is "write happened" + "no top-of-loop blank", i.e. remove was
+        # NOT called BEFORE the write. That ordering is asserted below.)
+        write_mock.assert_called_once()
+        # Mock records calls in order across distinct mocks via a shared parent
+        # only if attached; here we assert the in-loop blank never fired by
+        # checking remove was called at most once (the post-loop teardown) — a
+        # top-of-loop blank would make it 2 (blank + teardown), as the
+        # camera_off / standby tests confirm.
+        self.assertLessEqual(remove_mock.call_count, 1)
+        # Frame still cached so the air-mouse / gaze keep getting frames.
+        with self.bc._camera_state_lock:
+            self.assertIn(0, self.bc._camera_latest_frame)
+        # …but the expensive recognition pass was NOT run while paused.
+        detect_mock.assert_not_called()
+
+    def test_low_memory_camera_off_blanks_preview(self):
+        # The KINECT_REVIEW P0 low-memory guard sets _face_track_camera_off →
+        # the preview must blank (file removed, never written) so the HUD shows
+        # "CAMERA OFF" and we stop mirroring HD frames under memory pressure,
+        # even though the capture loop keeps running. Removed twice here: the
+        # top-of-loop blank AND the post-loop teardown.
+        write_mock, remove_mock, _ = self._drive_one_preview_iteration(
+            paused=False, camera_off=True, standby=False)
+        write_mock.assert_not_called()
+        self.assertGreaterEqual(remove_mock.call_count, 2)
+
+    def test_standby_blanks_preview(self):
+        # Standby / empty room (_standby_mode) must STILL blank the preview to
+        # the "CAMERA OFF" placeholder — only the listening/speaking case was
+        # changed to keep the camera on. Removed twice (top-of-loop + teardown).
+        write_mock, remove_mock, _ = self._drive_one_preview_iteration(
+            paused=False, camera_off=False, standby=True)
+        write_mock.assert_not_called()
+        self.assertGreaterEqual(remove_mock.call_count, 2)
 
     def test_detect_face_cv2_error_degrades_gracefully(self):
         # A cv2.error out of _detect_face (e.g. an OpenCL/GPU hiccup) must NOT
