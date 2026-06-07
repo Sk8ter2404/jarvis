@@ -13227,6 +13227,12 @@ _PY_DANGEROUS_ATTRS = frozenset({
     "replace", "renames", "truncate", "chmod", "chown", "makedirs",
     "mkdir", "symlink", "link", "write_text", "write_bytes",
     "unsetenv", "putenv",
+    # module-qualified file-write aliases (caught even if the module was
+    # imported under an alias the import-block above missed): io.open /
+    # codecs.open / gzip|bz2|lzma|tarfile.open / zipfile.ZipFile(...,'w') /
+    # dbm.open / shelve.open, plus logging.FileHandler. open is also a bare
+    # dangerous NAME; here it covers the `module.open(...)` Attribute form.
+    "open", "FileHandler", "ZipFile",
     # de-serialisation / dynamic import / native
     "loads", "load", "import_module", "exec_module", "dlopen",
     "CDLL", "WinDLL", "windll", "cdll",
@@ -13249,6 +13255,12 @@ _PY_DANGEROUS_MODULES = frozenset({
     "http", "ftplib", "smtplib", "telnetlib", "webbrowser", "glob",
     "pathlib", "tempfile", "builtins", "__builtin__", "platform",
     "psutil", "win32api", "win32com", "win32file", "win32process",
+    # file-write aliases that still hit the disk: io.open / codecs.open /
+    # the compression + archive .open()s (gzip/bz2/lzma/tarfile/zipfile) /
+    # fileinput(inplace=True) / dbm.open / logging.FileHandler. These are
+    # NOT pure compute, so an injected snippet using them must confirm.
+    "io", "codecs", "gzip", "bz2", "lzma", "tarfile", "zipfile",
+    "fileinput", "dbm", "logging",
 })
 
 

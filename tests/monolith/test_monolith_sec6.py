@@ -353,6 +353,42 @@ class RunPythonGateTests(SectionSixBase):
             self.bc._scan_python_for_danger("open('f.txt', 'w').write('x')"),
             "open")
 
+    def test_scan_open_write_aliases_flagged(self):
+        # Module-qualified open()s are file-write aliases that bare-open()
+        # blocking used to miss — io.open / codecs.open / gzip.open et al.
+        # still hit the disk, so an injected snippet using them must defer.
+        # The import of the (now-dangerous) module is what the scanner reaches
+        # first; both the import-block and the .open attribute leaf gate it.
+        for code in (
+                "import io\nio.open('f.txt', 'w').write('x')",
+                "import codecs\ncodecs.open('f.txt', 'w', 'utf-8').write('x')",
+                "import gzip\ngzip.open('f.gz', 'wb').write(b'x')",
+                "import bz2\nbz2.open('f.bz2', 'wb').write(b'x')",
+                "import lzma\nlzma.open('f.xz', 'wb').write(b'x')",
+                "import tarfile\ntarfile.open('a.tar', 'w').add('f')",
+                "import zipfile\nzipfile.ZipFile('a.zip', 'w').write('f')",
+                "import fileinput\nfor l in fileinput.input('f', inplace=True): pass",
+                "import dbm\ndbm.open('db', 'c')",
+                "import logging\nlogging.FileHandler('app.log')",
+                "import shelve\nshelve.open('sh')"):
+            self.assertIsNotNone(
+                self.bc._scan_python_for_danger(code),
+                f"expected write-alias to be gated: {code!r}")
+
+    def test_scan_module_qualified_open_attr_flagged(self):
+        # Defense-in-depth: even if the module slipped past the import-block
+        # (e.g. imported under an alias), the `<module>.open(...)` Attribute
+        # leaf and logging.FileHandler / zipfile.ZipFile are themselves gated.
+        self.assertEqual(
+            self.bc._scan_python_for_danger("buf = _m.open('f.txt', 'w')"),
+            "open")
+        self.assertEqual(
+            self.bc._scan_python_for_danger("h = _lg.FileHandler('a.log')"),
+            "FileHandler")
+        self.assertEqual(
+            self.bc._scan_python_for_danger("z = _zf.ZipFile('a.zip', 'w')"),
+            "ZipFile")
+
     def test_scan_dunder_import_flagged(self):
         # The whole expression is dangerous; the scanner returns whichever
         # dangerous token it reaches first in the AST walk (here .system or
@@ -404,6 +440,15 @@ class RunPythonGateTests(SectionSixBase):
         for nm in ("python", "eval_python", "compute"):
             self.assertIsNotNone(self.bc._jarvis_pushback(nm, payload),
                                  f"{nm} should defer a subprocess payload")
+
+    def test_pushback_file_write_alias_defers(self):
+        # End-to-end: an io.open write alias routes through _jarvis_pushback
+        # onto the confirm queue instead of auto-executing.
+        res = self.bc._jarvis_pushback(
+            "run_python", "import io\nio.open('f.txt', 'w').write('x')")
+        self.assertIsNotNone(res)
+        _, reason = res
+        self.assertIn("run_python dangerous construct", reason)
 
     def test_gate_fires_even_when_pushback_disabled(self):
         # Hard P0 control: the run_python AST gate must NOT be defeatable via
