@@ -166,6 +166,18 @@ class RealtimeVoicePipeline:
         # reads it to decide whether a fresh partial counts as barge-in.
         self._playing = threading.Event()
 
+        # Serialises the TTS stream's start/stop transitions so an interrupt
+        # (barge_in, on the STT thread) and a re-arm (feed_response_chunk, on
+        # the LLM-stream thread) can't interleave. Without it, barge_in()'s
+        # stop()+_playing.clear() can land between feed_response_chunk()'s
+        # is_playing()-check and its play_async(), re-arming the very response
+        # the user just interrupted. Held only across the stop/clear and the
+        # check/set/play critical sections — never across the on_barge_in
+        # callback or wait_for_playback's poll loop, so it can't deadlock the
+        # interrupt or block playback. Reentrant as cheap insurance against a
+        # future callback path re-entering a guarded method.
+        self._tts_lock = threading.RLock()
+
         # Track the last partial we saw so callers can poll for live captions
         # without having to wire a callback.
         self._last_partial: str = ""
@@ -250,17 +262,21 @@ class RealtimeVoicePipeline:
         s = self._tts_stream
         if s is None:
             return
+        # Hold _tts_lock across feed → is_playing()-check → play_async() so a
+        # concurrent barge_in() (stop()+_playing.clear()) can't slip between
+        # the check and the re-arm and resurrect an interrupted response.
         try:
-            s.feed(text)
-            if not s.is_playing():
-                self._playing.set()
-                # play_async() returns immediately; chunks stream from the
-                # engine into the playback ring buffer on a worker thread.
-                try:
-                    s.play_async(on_audio_chunk=self._on_audio_chunk)
-                except TypeError:
-                    # Older RealtimeTTS releases don't accept the hook kwargs.
-                    s.play_async()
+            with self._tts_lock:
+                s.feed(text)
+                if not s.is_playing():
+                    self._playing.set()
+                    # play_async() returns immediately; chunks stream from the
+                    # engine into the playback ring buffer on a worker thread.
+                    try:
+                        s.play_async(on_audio_chunk=self._on_audio_chunk)
+                    except TypeError:
+                        # Older RealtimeTTS releases don't accept the hook kwargs.
+                        s.play_async()
         except Exception as e:
             print(f"  [realtime-voice] feed failed: {e}")
             self._playing.clear()
@@ -305,13 +321,20 @@ class RealtimeVoicePipeline:
     def barge_in(self) -> None:
         """Stop TTS, flush the playback queue, fire on_barge_in callback."""
         self._last_barge_in_ts = time.time()
+        # Stop + clear under _tts_lock so the interrupt is atomic w.r.t.
+        # feed_response_chunk()'s re-arm — otherwise a chunk arriving mid-stop
+        # sees is_playing()==False and calls play_async() again, restarting the
+        # response we're cancelling. The on_barge_in callback runs OUTSIDE the
+        # lock: it re-enters the main loop (and could call back into the
+        # pipeline), so holding the lock across it risks a stall/deadlock.
         s = self._tts_stream
-        if s is not None:
-            try:
-                s.stop()
-            except Exception:
-                pass
-        self._playing.clear()
+        with self._tts_lock:
+            if s is not None:
+                try:
+                    s.stop()
+                except Exception:
+                    pass
+            self._playing.clear()
         cb = self.on_barge_in
         if cb is not None:
             try:

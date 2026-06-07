@@ -4901,37 +4901,61 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
         # exception-proof so it can't stall this callback.
         _fanout_record_frame(mono)
 
+    # Resolve the mic index BEFORE claiming ownership. get_input_device()
+    # → _refresh_devices() may run PortAudio's sd._terminate()/_initialize()
+    # reinit (USB hotplug pickup); that MUST happen while the ownership flag
+    # is still False, exactly as before — once we flip it True the reinit
+    # path correctly defers. Resolving here also keeps the reinit out of the
+    # window in which our own stream is live.
+    _in_dev = get_input_device()
+    # TOCTOU fix (0xc0000374): publish mic ownership BEFORE the InputStream is
+    # opened+started, not after. _refresh_devices() only skips the destructive
+    # sd._terminate()/_initialize() reinit while _record_speech_active is True;
+    # if we set the flag *after* start() (as before), a concurrent background
+    # caller (self_diagnostic / ambient_listen → get_input_device) could fire
+    # the reinit in the ~ms gap between our stream going live and the flag
+    # flipping, tearing PortAudio out from under the just-started callback and
+    # heap-corrupting the process. Setting it first closes that window. Any
+    # open/start failure below clears it again before returning so the flag is
+    # never left stuck True on a stream we don't actually hold.
+    _record_speech_sr[0] = SAMPLE_RATE
+    _record_speech_active[0] = True
+    _record_stream = None
     # Defense-in-depth against a stale cached mic index: even after
     # get_input_device() validates, the device can disappear between
     # that query and InputStream open. Catch PortAudioError and retry
     # once with device=None so we don't crash main().
-    try:  # pragma: no cover - opens a live PortAudio input stream (needs real mic)
-        _record_stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-            blocksize=CHUNK, device=get_input_device(),
-            callback=_audio_cb)
-    except sd.PortAudioError as e:  # pragma: no cover - live mic open-retry path (needs real device)
-        print(f"  [record_speech] InputStream open failed on cached mic ({e}); retrying with system default")
-        _device_cache["in"] = None
-        _device_cache["checked_at"] = 0.0
-        _record_stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-            blocksize=CHUNK, device=None,
-            callback=_audio_cb)
-    # 2026-05-29 silent-crash fix: don't use `with _record_stream:` — the
-    # implicit __exit__ calls sd close() unguarded, which SIGSEGV'd during
-    # watchdog-driven exits and early returns. Start the stream and route
-    # teardown through _safe_close_stream so close runs on a daemon thread.
-    try:  # pragma: no cover - starts the live mic stream (needs real mic)
+    try:  # pragma: no cover - opens+starts a live PortAudio input stream (needs real mic)
+        try:
+            _record_stream = sd.InputStream(
+                samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                blocksize=CHUNK, device=_in_dev,
+                callback=_audio_cb)
+        except sd.PortAudioError as e:  # pragma: no cover - live mic open-retry path (needs real device)
+            print(f"  [record_speech] InputStream open failed on cached mic ({e}); retrying with system default")
+            _device_cache["in"] = None
+            _device_cache["checked_at"] = 0.0
+            _record_stream = sd.InputStream(
+                samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                blocksize=CHUNK, device=None,
+                callback=_audio_cb)
+        # 2026-05-29 silent-crash fix: don't use `with _record_stream:` — the
+        # implicit __exit__ calls sd close() unguarded, which SIGSEGV'd during
+        # watchdog-driven exits and early returns. Start the stream and route
+        # teardown through _safe_close_stream so close runs on a daemon thread.
         _record_stream.start()
     except Exception:
-        logging.exception("[record_speech] InputStream.start failed")
-        _safe_close_stream(_record_stream)
+        # Open (incl. the system-default retry) or start() failed: we never
+        # got a live stream, so drop the ownership flag we optimistically set
+        # above before bailing, otherwise _refresh_devices would defer reinits
+        # forever against a stream that doesn't exist.
+        logging.exception("[record_speech] InputStream open/start failed")
+        _record_speech_active[0] = False
+        try:
+            _safe_close_stream(_record_stream)
+        except Exception:
+            pass
         return None
-    # Publish that we now own the mic so get_mic_buffer taps this stream
-    # instead of opening a competing one.
-    _record_speech_sr[0] = SAMPLE_RATE
-    _record_speech_active[0] = True
     record_start_ts = 0.0   # set when recording actually begins (VAD trip)
     try:  # pragma: no cover - live mic capture loop (blocks on real audio frames until utterance ends)
         while True:
