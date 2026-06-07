@@ -5989,6 +5989,65 @@ def _ollama_has_model(model: str) -> bool:
         return False
 
 
+# A model holding ≥ this many bytes of VRAM is treated as the "big" resident
+# brain (the qwen3:30b / qwen2.5:32b baseline sits at ~19–21 GB). Co-loading a
+# second model on top of it is what over-commits the 24 GB card and bricks the
+# GPU (REVIEW_FINDINGS_2 P0-2/P0-3). 12 GB cleanly separates the 30B-class brain
+# from a 7B VLM (~7–8 GB) so the guard never trips on the VLM alone.
+_OLLAMA_BIG_MODEL_VRAM_BYTES = 12 * 1024 * 1024 * 1024
+
+
+def _ollama_loaded_models() -> list[dict]:
+    """Models Ollama currently holds RESIDENT, via GET /api/ps.
+
+    Returns the raw `models` list (each dict carries at least `name`,
+    `model`, and `size_vram`), or [] on any failure (server down, old Ollama
+    without /api/ps, HTTP error, timeout, non-JSON). Never raises — callers
+    treat an empty list as 'residency unknown / nothing resident' and proceed
+    conservatively. This is the canonical runtime residency check; unlike
+    /api/tags (which lists INSTALLED models) /api/ps lists LOADED ones."""
+    try:
+        r = requests.get(f"{LOCAL_LLM_BASE_URL}/api/ps", timeout=2)
+        if not r.ok:
+            return []
+        models = r.json().get("models", [])
+        return models if isinstance(models, list) else []
+    except Exception:
+        return []
+
+
+def _ollama_big_model_resident(exclude_model: str | None = None) -> str | None:
+    """Name of a 'big' model (≥ _OLLAMA_BIG_MODEL_VRAM_BYTES of VRAM) Ollama
+    holds resident RIGHT NOW, other than `exclude_model`. Returns the tag, or
+    None if none qualifies (or residency can't be read).
+
+    This is the runtime safety check for the VRAM brick: before JARVIS triggers
+    a SECOND Ollama model load (e.g. the local VLM), it asks 'is the 30B brain
+    already pinned in VRAM?'. If so, co-loading would over-commit the 24 GB card
+    — the canonical fix is OLLAMA_MAX_LOADED_MODELS=1 on the SERVER (which makes
+    Ollama EVICT instead of co-load), but that env is read by the server at its
+    startup and can't be applied to an already-running server JARVIS didn't
+    spawn. This guard is the belt-and-suspenders that protects regardless."""
+    excl_base = (exclude_model or "").split(":", 1)[0]
+    for m in _ollama_loaded_models():
+        if not isinstance(m, dict):
+            continue
+        name = m.get("name") or m.get("model") or ""
+        if not name:
+            continue
+        # Don't count the model we're about to (re)use against itself — a tag
+        # that's already resident reuses its VRAM rather than co-loading.
+        if excl_base and name.split(":", 1)[0] == excl_base:
+            continue
+        try:
+            vram = int(m.get("size_vram") or 0)
+        except (TypeError, ValueError):
+            vram = 0
+        if vram >= _OLLAMA_BIG_MODEL_VRAM_BYTES:
+            return name
+    return None
+
+
 def _ollama_install_async() -> None:
     if _OLLAMA_INSTALL_TRIGGERED[0]:
         return
@@ -6567,6 +6626,94 @@ def _ollama_pull_vision_async(model: str) -> None:
     threading.Thread(target=_do, daemon=True).start()
 
 
+# Tag used in console output for the env-ensure step.
+_OLLAMA_MAX_LOADED_ENV = "OLLAMA_MAX_LOADED_MODELS"
+
+
+def _persist_user_env(name: str, value: str) -> str:
+    """Idempotently persist NAME=VALUE to the User-scope environment (HKCU\\
+    Environment) so a process the User launches LATER inherits it. Returns one
+    of: 'already' (already set to VALUE — no write), 'set' (written), 'noop'
+    (non-Windows / winreg unavailable), or 'error' (write failed). Never raises.
+
+    Why the registry and not just os.environ: the Ollama SERVER reads
+    OLLAMA_MAX_LOADED_MODELS at ITS OWN startup, and JARVIS does NOT spawn the
+    server (it's auto-started by Windows / the Ollama tray app). Setting it only
+    in JARVIS's process env would never reach that server. Persisting it at User
+    scope makes the server pick it up the next time it launches. (We do NOT
+    broadcast WM_SETTINGCHANGE — already-running processes, including the live
+    Ollama server, keep their old env until they restart; that one-time restart
+    is surfaced to the user by the boot caller.)"""
+    try:
+        import winreg
+    except Exception:
+        return "noop"
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0,
+                            winreg.KEY_READ | winreg.KEY_SET_VALUE) as k:
+            try:
+                cur, _ = winreg.QueryValueEx(k, name)
+            except FileNotFoundError:
+                cur = None
+            if isinstance(cur, str) and cur.strip() == value:
+                return "already"
+            winreg.SetValueEx(k, name, 0, winreg.REG_SZ, value)
+            return "set"
+    except Exception as _e:
+        print(f"  [ollama-env] could not persist {name}={value}: {_e}")
+        return "error"
+
+
+def _ensure_ollama_single_model_env() -> None:
+    """Cap Ollama at ONE resident model so a 2nd-model load EVICTS the first
+    instead of co-loading it — the canonical fix for the 24 GB VRAM brick
+    (REVIEW_FINDINGS_2 P0-2). Sets OLLAMA_MAX_LOADED_MODELS=1.
+
+    Two-pronged, because the Ollama server reads this env at ITS OWN startup and
+    JARVIS doesn't spawn the server:
+      1. os.environ — set it for THIS process (and anything JARVIS itself might
+         spawn), harmless and future-proof.
+      2. HKCU\\Environment — persist it so the NEXT Ollama server launch reads
+         the cap even though the currently-running server can't.
+    If the persistent value was newly written AND a server is already up holding
+    multiple models, the user must restart Ollama ONCE for the cap to bind on
+    the live server; we log exactly that. Best-effort and silent on non-Windows.
+    Gated OFF in staging/test so the import-harness never writes to the registry."""
+    if (os.environ.get("JARVIS_STAGING", "").strip() == "1"
+            or os.environ.get("JARVIS_TEST_MODE", "").strip() == "1"):
+        return
+    # 1) Current process. setdefault: never clobber an explicit operator override
+    #    (e.g. someone who deliberately set it to 2 for a multi-GPU box).
+    os.environ.setdefault(_OLLAMA_MAX_LOADED_ENV, "1")
+    # 2) Persist for the next server launch.
+    status = _persist_user_env(_OLLAMA_MAX_LOADED_ENV, "1")
+    if status == "already":
+        print(f"  [ollama-env] {_OLLAMA_MAX_LOADED_ENV}=1 already persisted "
+              f"(User env) — Ollama will evict, not co-load. Good.")
+    elif status == "set":
+        print(f"  [ollama-env] persisted {_OLLAMA_MAX_LOADED_ENV}=1 to User env "
+              f"so Ollama evicts instead of co-loading a 2nd model (VRAM-brick "
+              f"guard).")
+        # Only nag about a restart if a server is actually up AND already holding
+        # more than one model — otherwise nothing is at risk right now.
+        try:
+            loaded = _ollama_loaded_models()
+        except Exception:
+            loaded = []
+        if len(loaded) > 1:
+            names = ", ".join(
+                (m.get("name") or m.get("model") or "?")
+                for m in loaded if isinstance(m, dict))
+            print(f"  [ollama-env] NOTE: the RUNNING Ollama server still holds "
+                  f"{len(loaded)} models ({names}) and won't read the new cap "
+                  f"until restarted. Restart Ollama ONCE (quit the tray icon / "
+                  f"`Restart-Service ollama` / kill ollama.exe) to bind the cap "
+                  f"on the live server. JARVIS's runtime guard protects the GPU "
+                  f"until then.")
+    # status in ('noop','error'): nothing persisted — the runtime co-load guard
+    # in _call_local_vision is the sole protection; that's fine.
+
+
 def _call_local_vision(question: str, png_images: list[bytes],
                        max_tokens: int = 600) -> str | None:
     """POST a vision request to Ollama's /api/chat with one or more PNGs.
@@ -6585,6 +6732,28 @@ def _call_local_vision(question: str, png_images: list[bytes],
     if not _ollama_has_model(LOCAL_VISION_MODEL):
         _ollama_pull_vision_async(LOCAL_VISION_MODEL)
         return None
+    # VRAM brick guard (REVIEW_FINDINGS_2 P0-2/P0-3): if the big 30B-class brain
+    # is already pinned in VRAM, loading the VLM on top co-loads a 2nd model and
+    # over-commits the 24 GB card (CUDA-OOM bricks the GPU). The canonical fix is
+    # OLLAMA_MAX_LOADED_MODELS=1 on the SERVER (Ollama then EVICTS the brain
+    # instead of co-loading) — but that env is read by the server at ITS startup,
+    # so on a server JARVIS didn't spawn it may not be applied yet. This runtime
+    # guard protects regardless: refuse the local-vision load while the brain is
+    # resident and let the caller speak its honest 'couldn't see' message. The
+    # VLM tag itself is excluded, so a box where the VLM is ALREADY resident
+    # (steady-state local-vision use) is never blocked. Power users with the
+    # headroom to hold both can set JARVIS_ALLOW_VLM_COLOAD=1 to opt out.
+    _allow_coload = (os.environ.get("JARVIS_ALLOW_VLM_COLOAD", "").strip().lower()
+                     in ("1", "true", "yes", "on"))
+    if not _allow_coload:
+        _resident_big = _ollama_big_model_resident(exclude_model=LOCAL_VISION_MODEL)
+        if _resident_big:
+            print(f"  [local-vision] REFUSING co-load: big model "
+                  f"`{_resident_big}` is resident in VRAM — loading "
+                  f"{LOCAL_VISION_MODEL} on top would over-commit the GPU "
+                  f"(set OLLAMA_MAX_LOADED_MODELS=1 so Ollama evicts instead of "
+                  f"co-loading, or JARVIS_ALLOW_VLM_COLOAD=1 to override).")
+            return None
     _log_gpu_state(LOCAL_VISION_MODEL)
     try:
         b64_images = [base64.standard_b64encode(p).decode("utf-8") for p in png_images]
@@ -16323,6 +16492,15 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     # incident history. Camera + cublas results gate downstream behaviour
     # (CAMERAS may shrink; _force_whisper_cpu_int8 may flip).
     _startup_preflight()
+
+    # VRAM-brick guard (REVIEW_FINDINGS_2 P0-2): cap Ollama at one resident
+    # model so a 2nd-model load evicts the 30B instead of co-loading it. Runs
+    # BEFORE the warm-up so the cap is in this process's env before any load,
+    # and persists it for the next Ollama-server launch. Best-effort.
+    try:
+        _ensure_ollama_single_model_env()
+    except Exception as _e:
+        print(f"  [ollama-env] ensure-cap failed (non-fatal): {_e}")
 
     # Non-blocking: confirm the LOCAL brain actually generates (not just that
     # /api/tags answers) and warm it resident so the first fallback turn is
