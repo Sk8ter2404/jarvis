@@ -1248,6 +1248,7 @@ def merge_memory(new_facts=None, new_projects=None, new_topic=""):
         if new_topic:
             memory["topics"].append({
                 "date":     time.strftime("%Y-%m-%d"),
+                "ts":       time.time(),   # numeric epoch for last-hour forget
                 "location": LOCATION,
                 "topic":    new_topic,
             })
@@ -2127,6 +2128,7 @@ def save_session_to_memory(memory: dict):
         if summary:
             session_entry = {
                 "date":     time.strftime("%Y-%m-%d"),
+                "ts":       time.time(),   # numeric epoch for last-hour forget
                 "location": LOCATION,
                 "summary":  summary,
             }
