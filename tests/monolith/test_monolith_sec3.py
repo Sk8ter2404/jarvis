@@ -1027,6 +1027,23 @@ class LocalCheatsheetTests(MonolithGlobalsTestCase):
             second = self.bc._local_cheatsheet()
         self.assertEqual(first, second)
 
+    def test_calendar_query_routes_to_calendar_action_not_briefing(self):
+        # Regression: "what's on my calendar" used to mis-route to
+        # morning_briefing (the only action that mentioned "calendar"),
+        # which re-exposed a Celsius leak in the briefing's weather line.
+        # The cheatsheet must now give the local LLM an explicit
+        # calendar_today line carrying the calendar/schedule trigger phrasing,
+        # steering it away from morning_briefing.
+        with mock.patch.object(self.bc, "ACTIONS",
+                               {"calendar_today": 1, "morning_briefing": 2}):
+            out = self.bc._local_cheatsheet()
+        self.assertIn("[ACTION: calendar_today]", out)
+        # The calendar trigger phrase is attached to the calendar action's
+        # guidance line, not buried only under the briefing.
+        cal_idx = out.find("[ACTION: calendar_today]")
+        cal_line = out[cal_idx:out.find("\n", cal_idx)]
+        self.assertIn("calendar", cal_line.lower())
+
 
 # ===========================================================================
 # _call_local_llm — the gating ladder + payload

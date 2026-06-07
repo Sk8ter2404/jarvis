@@ -6210,6 +6210,7 @@ def _local_cheatsheet() -> str:
         "  [ACTION: check_system]   [ACTION: system_pulse]   [ACTION: check_print]\n"
         "  [ACTION: show_printer_camera]   'show me the printer camera' / 'pull up the H2D camera' / 'watch the print'   [ACTION: hide_printer_camera]   'close the printer camera'\n"
         "  [ACTION: weather_briefing]   [ACTION: news_briefing]   [ACTION: morning_briefing]\n"
+        "  [ACTION: calendar_today]   \"what's on my calendar\" / \"what's on my schedule\" / \"do I have any meetings\"   (read the calendar; arg = today/tomorrow/this week; NOT morning_briefing)\n"
         "  [ACTION: queue_task, <task for Claude Code>]   [ACTION: show_tasks]\n"
         "  [ACTION: smart_home_control, <plain request>]   [ACTION: make_picture, <prompt>]\n"
         "Choosing YOUR OWN local brain (which Ollama model runs you):\n"
