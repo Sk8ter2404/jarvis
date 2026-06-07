@@ -115,7 +115,10 @@ def _act_youtube(query: str) -> str:
 
 
 def _act_get_time(_: str = "") -> str:
-    return time.strftime("current time is %I:%M %p on %A")
+    # Include the real calendar date (month/day/year), not just the weekday, so
+    # "what's the date" is grounded in the system clock instead of an LLM guess
+    # (an ungrounded date freehands an off-by-one). Same single real-clock read.
+    return time.strftime("current time is %I:%M %p on %A, %B %d, %Y")
 
 
 # ─── Screenshot + media keys (single bobert_companion dep each) ────────
