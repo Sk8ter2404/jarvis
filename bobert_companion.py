@@ -7644,6 +7644,27 @@ def play_with_lipsync(audio: np.ndarray, sr: int):
     _tts_playback_active[0] = True
     out_dev = get_output_device()
 
+    def _play_audio_safe():
+        """sd.play(audio, sr, device=out_dev) with a one-shot fallback to the
+        system default. The autoswitch thread (audio/audio_switch.py) flips the
+        default render endpoint for all roles on a 3 s poll; when that swap lands
+        between get_output_device() resolving out_dev and PortAudio opening the
+        stream, the open fails with DirectSound -9999 and the utterance is
+        silently dropped. Mirror record_speech's input-side retry: invalidate the
+        cached index and re-open on device=None (the now-current default) so a
+        mid-playback endpoint change finishes the speech on the new endpoint
+        instead of swallowing it. If the fallback also fails, re-raise so the
+        outer handler logs it loudly rather than failing silent."""
+        try:
+            sd.play(audio, sr, device=out_dev)
+        except sd.PortAudioError as e:
+            # -9999 / endpoint vanished mid-open: drop to the live system default.
+            print(f"  [speak] playback open failed on device {out_dev} ({e}); "
+                  f"retrying on system default")
+            _device_cache["out"] = None
+            _device_cache["checked_at"] = 0.0
+            sd.play(audio, sr, device=None)
+
     # Start barge-in listener if conditions met
     barge_stream = None
     if BARGE_IN_ENABLED and is_using_headset():
@@ -7727,7 +7748,7 @@ def play_with_lipsync(audio: np.ndarray, sr: int):
             # under bursty boot speech (faulthandler trace caught it across
             # 7+ PIDs today). Wrap wait+close in a thread with a hard timeout
             # so a hung native close can't take down the whole process.
-            sd.play(audio, sr, device=out_dev)
+            _play_audio_safe()
             _done_evt = threading.Event()
             def _safe_wait():
                 try:
@@ -7768,7 +7789,7 @@ def play_with_lipsync(audio: np.ndarray, sr: int):
 
             t = threading.Thread(target=_sync, daemon=True)
             t.start()
-            sd.play(audio, sr, device=out_dev)
+            _play_audio_safe()
             # 2026-05-29 silent-crash fix: same hardening as the no-robot branch
             # above — sd.wait()/native close has SIGSEGV'd during boot speech.
             # Bound the wait so a hung close can't kill the process.
