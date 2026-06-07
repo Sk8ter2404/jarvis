@@ -300,6 +300,174 @@ class JarvisPushbackTests(SectionSixBase):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  run_python arbitrary-code gate (P0 RCE)
+# ════════════════════════════════════════════════════════════════════════════
+class RunPythonGateTests(SectionSixBase):
+    """run_python / eval_python / compute must not auto-exec dangerous code.
+
+    Safe pure-math/compute AST-scans clean and runs unprompted; anything that
+    can touch the filesystem / process table / network / sandbox internals is
+    deferred onto the confirm queue (returns a pushback tuple). The gate is a
+    hard security control, so it fires even with PUSHBACK_ENABLED off."""
+
+    # ── _scan_python_for_danger: safe snippets pass ──────────────────────────
+    def test_scan_pure_math_is_safe(self):
+        for code in ("2 + 2", "2**32", "print(sum(range(10)))",
+                     "x = [i*i for i in range(5)]\nmax(x)",
+                     "import math, statistics\nmath.sqrt(2)",
+                     "import numpy as np\nnp.arange(3).mean()",
+                     "from datetime import date\ndate(2026, 6, 7)",
+                     "import json\njson.dumps({'a': 1})"):
+            self.assertIsNone(self.bc._scan_python_for_danger(code),
+                              f"expected safe: {code!r}")
+
+    def test_scan_empty_is_safe(self):
+        self.assertIsNone(self.bc._scan_python_for_danger(""))
+        self.assertIsNone(self.bc._scan_python_for_danger("   \n  "))
+
+    # ── _scan_python_for_danger: dangerous snippets flagged ──────────────────
+    def test_scan_os_system_flagged(self):
+        self.assertEqual(
+            self.bc._scan_python_for_danger("import os\nos.system('calc')"),
+            "import os")
+
+    def test_scan_subprocess_flagged(self):
+        self.assertIsNotNone(
+            self.bc._scan_python_for_danger(
+                "import subprocess as s\ns.Popen(['x'])"))
+
+    def test_scan_shutil_rmtree_flagged(self):
+        self.assertIsNotNone(
+            self.bc._scan_python_for_danger(
+                "import shutil\nshutil.rmtree('C:/important')"))
+
+    def test_scan_socket_flagged(self):
+        self.assertIsNotNone(
+            self.bc._scan_python_for_danger(
+                "import socket\nsocket.socket()"))
+
+    def test_scan_open_write_flagged(self):
+        # Bare open() is treated as untrusted regardless of mode — a write to
+        # an arbitrary path from injected content is the threat.
+        self.assertEqual(
+            self.bc._scan_python_for_danger("open('f.txt', 'w').write('x')"),
+            "open")
+
+    def test_scan_open_write_aliases_flagged(self):
+        # Module-qualified open()s are file-write aliases that bare-open()
+        # blocking used to miss — io.open / codecs.open / gzip.open et al.
+        # still hit the disk, so an injected snippet using them must defer.
+        # The import of the (now-dangerous) module is what the scanner reaches
+        # first; both the import-block and the .open attribute leaf gate it.
+        for code in (
+                "import io\nio.open('f.txt', 'w').write('x')",
+                "import codecs\ncodecs.open('f.txt', 'w', 'utf-8').write('x')",
+                "import gzip\ngzip.open('f.gz', 'wb').write(b'x')",
+                "import bz2\nbz2.open('f.bz2', 'wb').write(b'x')",
+                "import lzma\nlzma.open('f.xz', 'wb').write(b'x')",
+                "import tarfile\ntarfile.open('a.tar', 'w').add('f')",
+                "import zipfile\nzipfile.ZipFile('a.zip', 'w').write('f')",
+                "import fileinput\nfor l in fileinput.input('f', inplace=True): pass",
+                "import dbm\ndbm.open('db', 'c')",
+                "import logging\nlogging.FileHandler('app.log')",
+                "import shelve\nshelve.open('sh')"):
+            self.assertIsNotNone(
+                self.bc._scan_python_for_danger(code),
+                f"expected write-alias to be gated: {code!r}")
+
+    def test_scan_module_qualified_open_attr_flagged(self):
+        # Defense-in-depth: even if the module slipped past the import-block
+        # (e.g. imported under an alias), the `<module>.open(...)` Attribute
+        # leaf and logging.FileHandler / zipfile.ZipFile are themselves gated.
+        self.assertEqual(
+            self.bc._scan_python_for_danger("buf = _m.open('f.txt', 'w')"),
+            "open")
+        self.assertEqual(
+            self.bc._scan_python_for_danger("h = _lg.FileHandler('a.log')"),
+            "FileHandler")
+        self.assertEqual(
+            self.bc._scan_python_for_danger("z = _zf.ZipFile('a.zip', 'w')"),
+            "ZipFile")
+
+    def test_scan_dunder_import_flagged(self):
+        # The whole expression is dangerous; the scanner returns whichever
+        # dangerous token it reaches first in the AST walk (here .system or
+        # __import__) — what matters is that it's non-None (deferred).
+        self.assertIn(
+            self.bc._scan_python_for_danger("__import__('os').system('x')"),
+            ("__import__", "system"))
+        # And __import__ on its own (no attribute chain) is flagged by name.
+        self.assertEqual(
+            self.bc._scan_python_for_danger("m = __import__('socket')"),
+            "__import__")
+
+    def test_scan_eval_exec_flagged(self):
+        self.assertEqual(self.bc._scan_python_for_danger("eval('1+1')"), "eval")
+        self.assertEqual(self.bc._scan_python_for_danger("exec('y=1')"), "exec")
+
+    def test_scan_from_import_dangerous_module(self):
+        self.assertEqual(
+            self.bc._scan_python_for_danger("from os import system"),
+            "from os import …")
+
+    def test_scan_sandbox_escape_subclasses_flagged(self):
+        # The classic ().__class__.__bases__[0].__subclasses__() ladder.
+        self.assertIsNotNone(
+            self.bc._scan_python_for_danger(
+                "().__class__.__bases__[0].__subclasses__()"))
+
+    def test_scan_unparseable_is_dangerous(self):
+        # Fail-safe: we'd rather ask than auto-run code we can't reason about.
+        self.assertIsNotNone(
+            self.bc._scan_python_for_danger("def (:::"))
+
+    # ── routing through _jarvis_pushback ─────────────────────────────────────
+    def test_pushback_safe_compute_runs(self):
+        for nm in ("run_python", "python", "eval_python", "compute"):
+            self.assertIsNone(self.bc._jarvis_pushback(nm, "2 + 2"),
+                              f"{nm} of safe math should not push back")
+
+    def test_pushback_dangerous_run_python_defers(self):
+        res = self.bc._jarvis_pushback("run_python", "import os\nos.system('x')")
+        self.assertIsNotNone(res)
+        phrase, reason = res
+        self.assertIn("execute it regardless", phrase)
+        self.assertIn("run_python dangerous construct", reason)
+        self.assertIn("os", reason)
+
+    def test_pushback_dangerous_aliases_defer(self):
+        payload = "import subprocess\nsubprocess.run(['x'])"
+        for nm in ("python", "eval_python", "compute"):
+            self.assertIsNotNone(self.bc._jarvis_pushback(nm, payload),
+                                 f"{nm} should defer a subprocess payload")
+
+    def test_pushback_file_write_alias_defers(self):
+        # End-to-end: an io.open write alias routes through _jarvis_pushback
+        # onto the confirm queue instead of auto-executing.
+        res = self.bc._jarvis_pushback(
+            "run_python", "import io\nio.open('f.txt', 'w').write('x')")
+        self.assertIsNotNone(res)
+        _, reason = res
+        self.assertIn("run_python dangerous construct", reason)
+
+    def test_gate_fires_even_when_pushback_disabled(self):
+        # Hard P0 control: the run_python AST gate must NOT be defeatable via
+        # the PUSHBACK_ENABLED config toggle (unlike the gray-zone pushbacks).
+        with mock.patch.object(self.bc, "PUSHBACK_ENABLED", False):
+            self.assertIsNotNone(
+                self.bc._jarvis_pushback("run_python",
+                                         "import os\nos.system('x')"))
+            # …while safe compute still passes through untouched.
+            self.assertIsNone(self.bc._jarvis_pushback("compute", "2 + 2"))
+
+    def test_run_python_family_in_destructive_replay_set(self):
+        # Defense-in-depth: "do that again" / fuzzy-typo disambiguation must
+        # not silently re-fire Python code.
+        for nm in ("run_python", "python", "eval_python", "compute"):
+            self.assertIn(nm, self.bc._DESTRUCTIVE_REPLAY_ACTIONS)
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  Mission narration
 # ════════════════════════════════════════════════════════════════════════════
 class MissionNarrationTests(SectionSixBase):
@@ -485,10 +653,34 @@ class ParseAndRunActionsTests(SectionSixBase):
                 "Okay. [ACTION: dangeract, foo]")
         # Deferred — NOT executed; queued on _pending_confirmation.
         self.assertEqual(ran, [])
-        self.assertEqual(cleaned, "Okay.")
         self.assertEqual(len(results), 1)
         self.assertIn("REQUIRES CONFIRMATION", results[0][1])
         self.assertIn(("dangeract", "foo"), list(bc._pending_confirmation))
+        # P1-5: the confirmation prompt must be SPOKEN (folded into `cleaned`,
+        # the main loop's TTS text) — not just printed/queued — otherwise
+        # JARVIS goes silent awaiting a "yes" the user never heard it ask for.
+        # The LLM's prose is preserved and the spoken request appended to it.
+        self.assertTrue(cleaned.startswith("Okay."))
+        self.assertIn("yes", cleaned.lower())
+        self.assertIn("cancel", cleaned.lower())
+
+    def test_confirmation_prompt_spoken_even_with_no_prose(self):
+        # P1-5 worst case: the LLM emits ONLY the [ACTION:] token (no
+        # surrounding prose), so the stripped `cleaned` would be empty and
+        # `_run_llm_dispatch`'s `if spoken_text:` guard would speak nothing —
+        # JARVIS silently waits on _pending_confirmation. The fix must still
+        # surface a spoken confirmation question in `cleaned`.
+        bc = self.bc
+        ran = []
+        self._with_action("dangeract", lambda a: ran.append(a) or "ran")
+        with mock.patch.object(bc, "_needs_confirmation",
+                               lambda n, a: n == "dangeract"):
+            cleaned, results = bc.parse_and_run_actions("[ACTION: dangeract, x]")
+        self.assertEqual(ran, [])  # deferred, not executed
+        self.assertIn(("dangeract", "x"), list(bc._pending_confirmation))
+        # Non-empty spoken text so the dispatch loop actually voices the ask.
+        self.assertTrue(cleaned.strip())
+        self.assertIn("yes", cleaned.lower())
 
     def test_pushback_replaces_prose_and_defers(self):
         bc = self.bc
@@ -694,6 +886,118 @@ class ParseAndRunActionsTests(SectionSixBase):
         self.assertEqual(cleaned, "")
         self.assertTrue(any("steps, sir." in c[0] for c in spoken))
         self.assertEqual(len(results), 3)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  see_screen per-intent budget (P1-6 regression guard)
+#
+#  The budget cap only works if the counter is reset ONCE per dispatch and
+#  survives across the follow-up loop, which re-invokes parse_and_run_actions
+#  for every depth. These tests pin: (a) the reset helper zeroes the counter,
+#  (b) parse_and_run_actions does NOT reset it (so it can't be re-zeroed on
+#  each follow-up), and (c) a real see_screen run through dispatch increments
+#  the counter and then refuses past the cap, with exhaustion persisting into
+#  a second dispatch call (the follow-up iteration).
+# ════════════════════════════════════════════════════════════════════════════
+class SeeScreenBudgetResetTests(SectionSixBase):
+    # Mirror ParseAndRunActionsTests' quiet-dispatch setup (without subclassing
+    # it, so its 16 tests aren't re-run under this class).
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        self._p(bc, "_speak", lambda *a, **k: None)
+        self._p(bc, "_write_hud_state", lambda **k: None)
+        self._p(bc, "record_session_action", lambda *a, **k: None)
+        self._p(bc, "record_action_history", lambda *a, **k: None)
+        self._p(bc, "record_action_error", lambda *a, **k: None)
+        self._p(bc, "_cmd_autocorrect", None)
+        self._p(bc, "PC_CONTROL_ENABLED", True)
+        # Per-thread counter is mutated directly; snapshot + restore so a test
+        # can't leak budget state into the next.
+        self._prev_used = getattr(bc._see_screen_budget_state, "used", None)
+        def _restore_used():
+            if self._prev_used is None:
+                if hasattr(bc._see_screen_budget_state, "used"):
+                    del bc._see_screen_budget_state.used
+            else:
+                bc._see_screen_budget_state.used = self._prev_used
+        self.addCleanup(_restore_used)
+        self._p(bc, "SEE_SCREEN_BUDGET_PER_INTENT", 3)
+
+    def _with_action(self, name, fn, informative=False):
+        """Patch a `name`->fn entry into ACTIONS (+ INFORMATIVE_ACTIONS)."""
+        bc = self.bc
+        acts = dict(bc.ACTIONS)
+        acts[name] = fn
+        self._p(bc, "ACTIONS", acts)
+        if informative:
+            info = set(bc.INFORMATIVE_ACTIONS) | {name}
+            self._p(bc, "INFORMATIVE_ACTIONS", info)
+
+    def test_reset_helper_zeroes_counter(self):
+        bc = self.bc
+        bc._see_screen_budget_state.used = 2
+        bc._reset_see_screen_budget()
+        self.assertEqual(bc._see_screen_budget_state.used, 0)
+
+    def test_parse_and_run_actions_does_not_reset_budget(self):
+        # The core P1-6 fix: the reset must NOT live inside
+        # parse_and_run_actions, or the follow-up loop re-zeroes it every
+        # depth and the cap never bounds the turn. Pre-load a used budget,
+        # run an unrelated (non-vision) action dispatch, and assert the
+        # counter is untouched.
+        bc = self.bc
+        bc._see_screen_budget_state.used = 2
+        self._with_action("testecho", lambda a: f"R-{a}", informative=True)
+        with mock.patch.object(bc, "_needs_confirmation", lambda n, a: False), \
+             mock.patch.object(bc, "_jarvis_pushback", lambda n, a: None):
+            bc.parse_and_run_actions("Sure. [ACTION: testecho, hi]")
+        self.assertEqual(bc._see_screen_budget_state.used, 2)
+
+    def _wire_real_see_screen(self):
+        """Register the real core.actions._act_see_screen as `see_screen`,
+        with only its capture/vision internals mocked so it exercises the
+        real budget increment + refuse against the live bc counter."""
+        import core.actions as A
+        bc = self.bc
+        # _act_see_screen reads these off the late-bound monolith (self.bc):
+        self._p(bc, "screenshot_privacy_block_reason", lambda: None)
+        self._p(bc, "_parse_monitor_prefix", lambda q: (None, q))
+        self._p(bc, "take_all_monitor_screenshots", lambda: {"m": b"PNG"})
+        self._p(bc, "ask_vision_multi", lambda q, imgs: "a desktop")
+        self._p(bc, "_push_screen_context", lambda *a, **k: None)
+        self._with_action("see_screen", A._act_see_screen, informative=True)
+
+    def test_see_screen_increments_then_refuses_within_one_dispatch(self):
+        bc = self.bc
+        self._wire_real_see_screen()
+        bc._reset_see_screen_budget()
+        with mock.patch.object(bc, "_needs_confirmation", lambda n, a: False), \
+             mock.patch.object(bc, "_jarvis_pushback", lambda n, a: None):
+            # Three captures in one reply consume the whole budget (0 -> 3).
+            _, r3 = bc.parse_and_run_actions(
+                "[ACTION: see_screen, a] [ACTION: see_screen, b] "
+                "[ACTION: see_screen, c]")
+            self.assertEqual(bc._see_screen_budget_state.used, 3)
+            self.assertTrue(all("a desktop" in res for _, res, _ in r3), r3)
+            # A 4th capture in a *follow-up* dispatch (no reset between them)
+            # must be refused — the cap spans the turn, not the call.
+            _, r4 = bc.parse_and_run_actions("[ACTION: see_screen, d]")
+        self.assertEqual(bc._see_screen_budget_state.used, 3)
+        self.assertIn("budget for this intent is exhausted", r4[0][1])
+
+    def test_budget_does_not_carry_into_a_freshly_reset_dispatch(self):
+        # After a dispatch exhausts the budget, the NEXT turn calls the reset
+        # helper at its entry — proving the cap is per-intent, not permanent.
+        bc = self.bc
+        self._wire_real_see_screen()
+        bc._see_screen_budget_state.used = bc.SEE_SCREEN_BUDGET_PER_INTENT
+        bc._reset_see_screen_budget()   # what _run_llm_dispatch does per turn
+        with mock.patch.object(bc, "_needs_confirmation", lambda n, a: False), \
+             mock.patch.object(bc, "_jarvis_pushback", lambda n, a: None):
+            _, r = bc.parse_and_run_actions("[ACTION: see_screen, fresh]")
+        self.assertEqual(bc._see_screen_budget_state.used, 1)
+        self.assertIn("a desktop", r[0][1])
 
 
 # ════════════════════════════════════════════════════════════════════════════

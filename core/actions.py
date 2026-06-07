@@ -115,7 +115,10 @@ def _act_youtube(query: str) -> str:
 
 
 def _act_get_time(_: str = "") -> str:
-    return time.strftime("current time is %I:%M %p on %A")
+    # Include the real calendar date (month/day/year), not just the weekday, so
+    # "what's the date" is grounded in the system clock instead of an LLM guess
+    # (an ungrounded date freehands an off-by-one). Same single real-clock read.
+    return time.strftime("current time is %I:%M %p on %A, %B %d, %Y")
 
 
 # ─── Screenshot + media keys (single bobert_companion dep each) ────────
@@ -310,8 +313,13 @@ def _act_toggle_hud(_: str = "") -> str:
     except Exception:
         currently_visible = True
     bc._write_hud_state(visible=not currently_visible)
-    return ("HUD hidden, sir." if currently_visible
-            else "HUD restored, sir.")
+    if currently_visible:
+        return "HUD hidden, sir."
+    # Toggling back to visible must also clear a ✕-button hide, exactly like
+    # _act_show_hud — otherwise the persisted 'hidden' latch keeps the window
+    # down and the toggle silently fails to bring it back.
+    _set_unified_hud_hidden(False)
+    return "HUD restored, sir."
 
 
 # ─── Self-diagnostic probes (Phase 4B) ─────────────────────────────────

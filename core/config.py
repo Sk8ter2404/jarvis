@@ -161,6 +161,14 @@ def model_route(function: str) -> str:
 AMBIENT_LISTEN_ENABLED = False
 AMBIENT_SCREEN_ENABLED = False
 
+# CHAPPIE_ENABLED — autostart the continuous self-learning daemon
+#   (skills/chappie_consciousness.py). False by default because the daemon
+#   spends Claude budget (up to DAILY_BUDGET_USD/day) the moment it runs.
+#   The skill's recall actions register regardless; only the spending
+#   background thread is gated by this flag. Flip via the Settings GUI /
+#   user_settings.json to opt in.
+CHAPPIE_ENABLED = False
+
 # ─── Screenshot privacy blocklist (vision capture guard) ───────────────
 # Case-insensitive substring patterns checked against the FOCUSED window
 # title before ANY screen capture for vision (see_screen / ask_vision) or

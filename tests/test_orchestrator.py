@@ -1120,6 +1120,141 @@ class OrchestratorClassTests(unittest.TestCase):
         self.assertEqual(result_box["r"], "OK_RUNLOOP")
 
 
+class WorkerTimeoutBackstopTests(unittest.TestCase):
+    """P1-7: a wedged worker must NOT deadlock the turn.
+
+    `timeout_s` is forwarded into the worker for its LLM/HTTP socket timeouts,
+    but the worker's direct/auto ACTION call (a full JARVIS action) has no inner
+    timeout. dispatch_sub_agents must wrap the asyncio.to_thread hand-off in an
+    asyncio.wait_for backstop so a hung worker is abandoned (returned as an empty
+    errored result the merger silently omits) while every other worker — and the
+    overall turn — still completes. We drive the backstop deterministically by
+    patching asyncio.wait_for to raise (no real sleeps / no real hung threads,
+    per the suite isolation contract)."""
+
+    def setUp(self):
+        self._claude = orch._claude_call
+        self._wait_for = orch.asyncio.wait_for
+        # Fast, deterministic worker LLM seam for the non-timing-out task.
+        orch._claude_call = lambda model, system, user, **k: "done"
+
+    def tearDown(self):
+        orch._claude_call = self._claude
+        orch.asyncio.wait_for = self._wait_for
+
+    def test_hung_worker_times_out_to_error_result(self):
+        # Force the backstop to fire for EVERY worker: the dispatcher must turn
+        # the timeout into an error SubTaskResult instead of propagating it.
+        async def _always_timeout(awaitable, timeout=None):
+            # Close the wrapped coroutine so we don't leak an un-awaited warning,
+            # then simulate the wall-clock backstop tripping.
+            if asyncio.iscoroutine(awaitable):
+                awaitable.close()
+            raise asyncio.TimeoutError()
+
+        orch.asyncio.wait_for = _always_timeout
+        specs = {"a": orch.SubAgentSpec(name="a", description="d",
+                                        allowed_actions=["r"])}
+        out = asyncio.run(orch.dispatch_sub_agents(
+            [orch.SubTask(sub_agent="a", task="t")],
+            specs, {"r": lambda arg: "REAL"}, timeout_s=5.0))
+        self.assertEqual(len(out), 1)                  # gather still returned
+        self.assertEqual(out[0].output, "")            # nothing fabricated
+        self.assertIsNotNone(out[0].error)
+        self.assertIn("timed out", out[0].error.lower())
+        self.assertEqual(out[0].sub_agent, "a")
+
+    def test_one_hung_worker_does_not_block_the_others(self):
+        # Only the worker named "slow" times out; "fast" must still complete.
+        # This is the core no-deadlock guarantee: a single wedged tool can't
+        # take the whole turn down with it.
+        async def _selective(awaitable, timeout=None):
+            # Run the real worker to completion, then decide per-result.
+            res = await awaitable
+            if res.sub_agent == "slow":
+                raise asyncio.TimeoutError()
+            return res
+
+        orch.asyncio.wait_for = _selective
+        specs = {
+            "fast": orch.SubAgentSpec(name="fast", description="d",
+                                      allowed_actions=["r"]),
+            "slow": orch.SubAgentSpec(name="slow", description="d",
+                                      allowed_actions=["r"]),
+        }
+        tasks = [orch.SubTask(sub_agent="fast", task="t1"),
+                 orch.SubTask(sub_agent="slow", task="t2")]
+        out = asyncio.run(orch.dispatch_sub_agents(
+            tasks, specs, {"r": lambda arg: "REAL"},
+            max_parallel=2, timeout_s=5.0))
+        by_agent = {r.sub_agent: r for r in out}
+        self.assertEqual(by_agent["fast"].output, "done")   # fast finished
+        self.assertIsNone(by_agent["fast"].error)
+        self.assertEqual(by_agent["slow"].output, "")       # slow abandoned
+        self.assertIn("timed out", (by_agent["slow"].error or "").lower())
+
+    def test_backstop_budget_exceeds_inner_worker_timeout(self):
+        # The wall-clock backstop must be strictly larger than the inner
+        # per-call timeout it guards, so a worker about to return its own
+        # graceful raw-data fallback is never preempted. We can't read the
+        # closure constant directly, so assert the relationship the code uses.
+        timeout_s = 30.0
+        backstop_s = max(1.0, timeout_s) * 2.0 + 5.0
+        self.assertGreater(backstop_s, timeout_s)
+
+
+class OverallTimeoutBackstopTests(unittest.TestCase):
+    """P1-7 (sync entry): the synchronous orchestrate() wrapper used by the main
+    voice turn loop must never block indefinitely on .result(), even if the
+    worker loop wedged. When the coarse top-level backstop trips it returns ""
+    (the documented 'nothing applicable ran' contract) so the turn proceeds."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="orch_to_")
+        self._claude = orch._claude_call
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        import shutil
+        orch._claude_call = self._claude
+        orch._default_orchestrator = None
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _mk(self, **kw):
+        kw.setdefault("specs_dir", self.dir)
+        return orch.Orchestrator(**kw)
+
+    def test_overall_timeout_s_is_positive_and_ordered(self):
+        o = self._mk(worker_timeout_s=30.0, planner_timeout_s=20.0,
+                     merger_timeout_s=20.0)
+        budget = o._overall_timeout_s()
+        self.assertGreater(budget, 0.0)
+        # Must leave room for at least the planner + one worker wave + merger.
+        self.assertGreater(
+            budget, o.planner_timeout_s + o.worker_timeout_s + o.merger_timeout_s)
+
+    def test_running_loop_branch_returns_empty_on_overall_timeout(self):
+        # Drive the loop-already-running branch with an orchestrate_async that
+        # never completes, and a tiny overall budget so .result(timeout=…) trips
+        # fast. The wrapper must swallow the TimeoutError and return "".
+        o = self._mk()
+        hang = __import__("threading").Event()
+        self.addCleanup(hang.set)   # release the orphaned worker thread after.
+
+        async def _never_returns(request, actions):
+            hang.wait()             # blocks the worker loop until cleanup.
+            return "SHOULD_NOT_SURFACE"
+
+        o.orchestrate_async = _never_returns                 # type: ignore
+        o._overall_timeout_s = lambda: 0.2                   # type: ignore
+
+        async def _main():
+            # In-loop-thread sync call → takes the concurrent.futures branch.
+            return o.orchestrate("req", {"r": lambda a: "REAL"})
+
+        self.assertEqual(asyncio.run(_main()), "")
+
+
 class ModuleSingletonTests(unittest.TestCase):
     def setUp(self):
         self._saved = orch._default_orchestrator

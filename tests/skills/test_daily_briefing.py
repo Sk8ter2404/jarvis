@@ -81,13 +81,13 @@ class DailyBriefingTests(unittest.TestCase):
 
     # ── _build_briefing assembly ─────────────────────────────────────────
     def test_build_briefing_with_all_extras(self):
-        with mock.patch.object(self.mod, "_fetch_weather", return_value="14 degrees and clear"), \
+        with mock.patch.object(self.mod, "_fetch_weather", return_value="57 degrees and clear"), \
              mock.patch.object(self.mod, "_first_meeting_today",
                                return_value="your first meeting today is at 9:30 AM"), \
              mock.patch.object(self.mod, "_bambu_status", return_value="the H2D is mid-print"):
             out = self.mod._build_briefing()
         self.assertIn("Good morning, sir", out)
-        self.assertIn("14 degrees and clear", out)
+        self.assertIn("57 degrees and clear", out)
         self.assertIn("9:30 AM", out)
         self.assertIn("mid-print", out)
         self.assertTrue(out.endswith("."))
@@ -99,20 +99,23 @@ class DailyBriefingTests(unittest.TestCase):
             out = self.mod._build_briefing()
         self.assertIn("nothing remarkable to report", out)
 
-    # ── _fetch_weather (over briefing_sources) ───────────────────────────
+    # ── _fetch_weather (over briefing_sources; store Celsius, speak F) ────
     def test_fetch_weather_phrase(self):
         bs = mock.MagicMock()
+        # 14 C stored → 57 F spoken (14*9/5+32 = 57.2 → 57), agreeing with
+        # morning_briefing / weather_briefing rather than voicing raw Celsius.
         bs.get_weather_data.return_value = {"temp_c": 14, "desc": "Overcast", "source": "wttr"}
         with mock.patch.object(self.mod, "_briefing_sources", return_value=bs):
             self.assertEqual(self.mod._fetch_weather(),
-                             "outside temperature is 14 degrees and overcast")
+                             "outside temperature is 57 degrees and overcast")
 
     def test_fetch_weather_cached_suffix(self):
         bs = mock.MagicMock()
+        # 9 C stored → 48 F spoken (9*9/5+32 = 48.2 → 48).
         bs.get_weather_data.return_value = {"temp_c": 9, "desc": "", "source": "cache", "stale": True}
         with mock.patch.object(self.mod, "_briefing_sources", return_value=bs):
             out = self.mod._fetch_weather()
-        self.assertIn("9 degrees", out)
+        self.assertIn("48 degrees", out)
         self.assertIn("(cached)", out)
 
     def test_fetch_weather_degrades_when_sources_missing(self):
@@ -425,11 +428,12 @@ class DailyWeatherMeetingEdgeTests(unittest.TestCase):
         self.mod, self.actions = load_skill_isolated("daily_briefing")
 
     def test_fetch_weather_no_desc(self):
+        # 20 C stored → 68 F spoken (20*9/5+32 = 68).
         bs = mock.MagicMock()
         bs.get_weather_data.return_value = {"temp_c": 20, "desc": "", "source": "wttr"}
         with mock.patch.object(self.mod, "_briefing_sources", return_value=bs):
             self.assertEqual(self.mod._fetch_weather(),
-                             "outside temperature is 20 degrees")
+                             "outside temperature is 68 degrees")
 
     def test_fetch_weather_no_data(self):
         bs = mock.MagicMock()

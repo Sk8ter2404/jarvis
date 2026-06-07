@@ -131,7 +131,10 @@ def _count_pending_tasks() -> int:
 
 
 def _fetch_weather() -> str:
-    """Return a short weather phrase like '18 degrees and overcast' or ''.
+    """Return a short weather phrase like '64 degrees and overcast' or ''.
+
+    Temperature is spoken in Fahrenheit (sir's preference): briefing_sources
+    stores Celsius, so it's converted here with the canonical c*9/5+32 formula.
 
     Routed through skills/briefing_sources.py so the morning briefing has the
     wttr → Open-Meteo → cached-last-known fallback chain instead of dropping
@@ -153,14 +156,19 @@ def _fetch_weather() -> str:
         temp_c = int(data["temp_c"])
     except (KeyError, TypeError, ValueError):
         return ""
+    # briefing_sources stores Celsius; sir wants Fahrenheit spoken. Convert with
+    # the project's canonical store-Celsius/speak-Fahrenheit formula so this line
+    # can never drift from weather_briefing's _current_conditions_line() or
+    # morning_arrival's _section_weather_phrase() (both: int(round(c*9/5+32))).
+    temp_f = int(round(temp_c * 9 / 5 + 32))
     desc = (data.get("desc") or "").strip().lower()
     suffix = ""
     if data.get("source") == "cache" and data.get("stale"):
         # Be honest if we're quoting an aging cached reading
         suffix = " (cached)"
     if not desc:
-        return f"{temp_c} degrees outside{suffix}"
-    return f"{temp_c} degrees and {desc} in your area{suffix}"
+        return f"{temp_f} degrees outside{suffix}"
+    return f"{temp_f} degrees and {desc} in your area{suffix}"
 
 
 def _outlook_summary_blocking() -> str:

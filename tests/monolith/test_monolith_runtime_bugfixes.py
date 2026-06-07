@@ -38,6 +38,23 @@
      and at .start(), (b) it's cleared if the open raises, and (c) the
      _refresh_devices guard actually defers the reinit while the flag is set.
 
+2026-06-07 (sd.play endpoint swap, REVIEW_FINDINGS_2 P1-9):
+
+  5. play_with_lipsync() resolved out_dev = get_output_device() and then opened
+     sd.play(audio, sr, device=out_dev). The autoswitch daemon
+     (audio/audio_switch.py) flips the default render endpoint for all roles on a
+     3 s poll, so a headset/speaker autoswitch landing between that resolve and
+     the PortAudio open made the open fail with DirectSound -9999 and the
+     utterance was silently dropped (no retry, unlike record_speech's input
+     side). The play call now runs through a _play_audio_safe() helper that, on
+     PortAudioError, invalidates the cached output index and retries once on
+     device=None (the now-current system default) so the speech finishes on the
+     new endpoint; if that also fails it re-raises into _speak's existing
+     device-hiccup handler (fails loud, never silent). Tests assert (a) a healthy
+     play is untouched (single call, original device), (b) a one-shot -9999 is
+     recovered by a device=None retry AND the stale cache is invalidated, and
+     (c) a persistent PortAudioError propagates rather than being swallowed.
+
 Monolith-tier (full-deps): run locally; skip on the light-deps CI runner.
     python -m unittest tests.monolith.test_monolith_runtime_bugfixes
 """
@@ -416,6 +433,100 @@ class RefreshDevicesReinitGuardTests(MonolithGlobalsTestCase):
         self.assertTrue(
             self._run_refresh(active=False),
             "sd._terminate() should run when no capture owns the mic")
+
+
+@requires_monolith
+class PlayWithLipsyncEndpointSwapTests(MonolithGlobalsTestCase):
+    """Bug 5 (REVIEW_FINDINGS_2 P1-9): a default-render endpoint swap landing
+    mid-open (DirectSound -9999) must NOT silently drop the utterance.
+    play_with_lipsync must retry the failed sd.play once on the system default,
+    and fail loud (propagate) only if that also fails.
+
+    These drive the no-robot, no-barge-in, non-muted branch of play_with_lipsync
+    with sd fully faked, so no real audio device is touched. A tiny zero buffer
+    keeps audio_secs ~0 so the bounded sd.wait() join returns immediately.
+    """
+
+    class _FakeSd:
+        """Stand-in for the sounddevice module: records every play(device=...)
+        and lets the test program a sequence of side effects (an exception type
+        raises, anything else is treated as a successful open)."""
+
+        class PortAudioError(Exception):
+            pass
+
+        def __init__(self, play_effects):
+            # play_effects: list, one entry consumed per play() call. An entry
+            # that is an Exception instance is raised; None means success.
+            self._effects = list(play_effects)
+            self.play_calls = []   # list of the `device` kwarg per call
+
+        def play(self, audio, sr, device=None):
+            self.play_calls.append(device)
+            effect = self._effects.pop(0) if self._effects else None
+            if isinstance(effect, BaseException):
+                raise effect
+
+        def wait(self):
+            pass
+
+        def stop(self):
+            pass
+
+    def _run_play(self, play_effects, *, out_dev=7):
+        """Run play_with_lipsync with sd faked + out_dev pinned. Returns the
+        _FakeSd so the test can inspect play_calls. Propagated exceptions are
+        left to the caller (we assert on them)."""
+        import numpy as np
+        bc = self.bc
+        fake_sd = self._FakeSd(play_effects)
+        audio = np.zeros(8, dtype=np.float32)
+
+        with mock.patch.object(bc, "sd", fake_sd), \
+                mock.patch.object(bc, "get_output_device", return_value=out_dev), \
+                mock.patch.object(bc, "ROBOT_ENABLED", False), \
+                mock.patch.object(bc, "BARGE_IN_ENABLED", False), \
+                mock.patch.object(bc, "_tts_layer", None), \
+                mock.patch.object(bc, "_feed_playback_reference"), \
+                mock.patch.object(bc, "_write_hud_state"), \
+                mock.patch.object(bc, "_audio_ducker"), \
+                mock.patch("builtins.print"):
+            bc.play_with_lipsync(audio, 16000)
+        return fake_sd
+
+    def test_healthy_play_uses_resolved_device_once(self):
+        # Control: no error -> exactly one play(), on the resolved device, no
+        # fallback. Proves the retry path doesn't fire on the happy path.
+        fake_sd = self._run_play([None], out_dev=7)
+        self.assertEqual(fake_sd.play_calls, [7],
+                         "healthy playback must open the resolved device exactly once")
+
+    def test_minus_9999_recovers_on_system_default(self):
+        # THE BUG: first open -9999s because the endpoint was swapped; the
+        # utterance must be retried on device=None (the new default), not dropped.
+        bc = self.bc
+        # Seed a stale cached output index so we can prove it gets invalidated.
+        bc._device_cache["out"] = 7
+        bc._device_cache["checked_at"] = 1.0e12
+        err = self._FakeSd.PortAudioError("DirectSound error [PaErrorCode -9999]")
+        fake_sd = self._run_play([err, None], out_dev=7)
+
+        self.assertEqual(
+            fake_sd.play_calls, [7, None],
+            "a -9999 on the resolved device must retry once on the system default")
+        # The stale index must be invalidated so the next turn re-resolves fresh.
+        self.assertIsNone(bc._device_cache["out"],
+                          "cached output index must be cleared after the -9999 fallback")
+        self.assertEqual(bc._device_cache["checked_at"], 0.0)
+
+    def test_persistent_portaudio_error_propagates(self):
+        # Fails loud, never silent: if BOTH the resolved device and the
+        # system-default retry raise, the error must surface to _speak's existing
+        # device-hiccup handler rather than being swallowed inside play.
+        err1 = self._FakeSd.PortAudioError("first -9999")
+        err2 = self._FakeSd.PortAudioError("default also gone")
+        with self.assertRaises(self._FakeSd.PortAudioError):
+            self._run_play([err1, err2], out_dev=7)
 
 
 if __name__ == "__main__":

@@ -92,6 +92,8 @@ class MorningBriefingTests(unittest.TestCase):
     # ── _fetch_weather (briefing_sources) ────────────────────────────────
     def test_fetch_weather_phrase(self):
         fake_bs = mock.MagicMock()
+        # 18 C is stored; the briefing must SPEAK Fahrenheit (18 C → 64 F),
+        # matching weather_briefing's standalone report — not the raw Celsius.
         fake_bs.get_weather_data.return_value = {"temp_c": 18, "desc": "Overcast", "source": "wttr"}
         import sys
         # _fetch_weather does `from . import briefing_sources` first; inject a
@@ -99,7 +101,9 @@ class MorningBriefingTests(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"skill_morning_briefing.briefing_sources": fake_bs,
                                            "briefing_sources": fake_bs}):
             out = self.mod._fetch_weather()
-        self.assertIn("18 degrees and overcast", out)
+        self.assertIn("64 degrees and overcast", out)
+        # Guard against regression: the raw Celsius value must never be spoken.
+        self.assertNotIn("18 degrees", out)
 
     def test_fetch_weather_degraded(self):
         fake_bs = mock.MagicMock()
@@ -108,6 +112,21 @@ class MorningBriefingTests(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"skill_morning_briefing.briefing_sources": fake_bs,
                                            "briefing_sources": fake_bs}):
             self.assertEqual(self.mod._fetch_weather(), "")
+
+    def test_fetch_weather_speaks_fahrenheit_not_celsius(self):
+        # Regression guard for the morning_briefing/weather_briefing unit
+        # disagreement: briefing_sources stores Celsius, but the briefing must
+        # SPEAK Fahrenheit (store-Celsius / speak-Fahrenheit). A known 24 C
+        # reading — the exact value that once leaked through unconverted —
+        # must voice as 75 F (24*9/5+32 = 75.2 → 75), never the raw "24".
+        fake_bs = mock.MagicMock()
+        fake_bs.get_weather_data.return_value = {"temp_c": 24, "desc": "clear", "source": "wttr"}
+        import sys
+        with mock.patch.dict(sys.modules, {"skill_morning_briefing.briefing_sources": fake_bs,
+                                           "briefing_sources": fake_bs}):
+            out = self.mod._fetch_weather()
+        self.assertIn("75 degrees", out)
+        self.assertNotIn("24 degrees", out)
 
     # ── _bed_remark ──────────────────────────────────────────────────────
     def test_bed_remark_late_night(self):
@@ -245,16 +264,18 @@ class FetchWeatherTests(unittest.TestCase):
                                  "briefing_sources": bs})
 
     def test_weather_no_desc_uses_outside_phrase(self):
+        # 7 C stored → 45 F spoken (7*9/5+32 = 44.6 → 45).
         bs = _fake_source(get_weather_data=lambda: {"temp_c": 7, "desc": "", "source": "wttr"})
         with self._with_bs(bs):
-            self.assertEqual(self.mod._fetch_weather(), "7 degrees outside")
+            self.assertEqual(self.mod._fetch_weather(), "45 degrees outside")
 
     def test_weather_stale_cache_adds_suffix(self):
+        # 4 C stored → 39 F spoken (4*9/5+32 = 39.2 → 39); cached suffix retained.
         bs = _fake_source(get_weather_data=lambda: {
             "temp_c": 4, "desc": "fog", "source": "cache", "stale": True})
         with self._with_bs(bs):
             out = self.mod._fetch_weather()
-        self.assertIn("4 degrees and fog in your area", out)
+        self.assertIn("39 degrees and fog in your area", out)
         self.assertIn("(cached)", out)
 
     def test_weather_bad_temp_returns_blank(self):

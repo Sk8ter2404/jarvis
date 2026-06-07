@@ -235,5 +235,58 @@ class WakeOnPresenceTests(_FaceTrackerKinectBase):
         self.assertFalse(bc._sleep_mode[0])
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# kinect_at staleness clock (P2 regression)
+# ─────────────────────────────────────────────────────────────────────────
+class KinectStalenessClockTests(_FaceTrackerKinectBase):
+    """Regression for P2: _kinect_presence_note compares kinect_at against
+    time.monotonic(), so _merge_kinect_presence MUST stamp kinect_at on the
+    monotonic clock — not the wall-clock `now` it's handed (which legitimately
+    drives the human-facing *_at fields). When it stamped wall-clock, the diff
+    was hugely negative, never exceeded 5.0, and 'the Kinect sees N people'
+    persisted forever after the room emptied."""
+
+    def test_merge_stamps_kinect_at_on_monotonic_clock(self):
+        ft = self._load()
+        # A small wall-clock `now` that could never be confused with a real
+        # time.monotonic() reading (seconds since boot is far larger).
+        wall_now = 1000.0
+        mono_before = __import__("time").monotonic()
+        with ft._state_lock:
+            ft._merge_kinect_presence(
+                {"present": True, "count": 1, "nearest_m": 1.5,
+                 "facing": True, "ts": 0.0}, wall_now)
+        mono_after = __import__("time").monotonic()
+        kinect_at = ft._state["kinect_at"]
+        # On the monotonic clock, bracketed by readings around the merge …
+        self.assertGreaterEqual(kinect_at, mono_before)
+        self.assertLessEqual(kinect_at, mono_after)
+        # … and emphatically NOT the wall-clock value it was handed.
+        self.assertNotEqual(kinect_at, wall_now)
+        # The wall-clock `now` still drives the human-facing sighting fields.
+        self.assertEqual(ft._state["last_face_at"], wall_now)
+
+    def test_fresh_merge_surfaces_note_then_goes_stale(self):
+        ft = self._load()
+        # Drive the REAL merge path (not a hand-set kinect_at): a body is seen.
+        with ft._state_lock:
+            ft._state["last_sample_at"] = 5.0
+            ft._state["current_monitor"] = "away"
+            ft._merge_kinect_presence(
+                {"present": True, "count": 1, "nearest_m": 1.8,
+                 "facing": True, "ts": 0.0}, 2000.0)
+        # Fresh reading → the note surfaces (under the old wall-clock bug this
+        # path could only ever surface, never expire).
+        fresh = ft.gaze_status("")
+        self.assertIn("Kinect", fresh)
+        self.assertIn("one person", fresh)
+        # Now age the monotonic stamp past the 5.0s staleness window. With the
+        # fix this expires; with the bug it never would.
+        with ft._state_lock:
+            ft._state["kinect_at"] = __import__("time").monotonic() - 30.0
+        stale = ft.gaze_status("")
+        self.assertNotIn("Kinect", stale)
+
+
 if __name__ == "__main__":
     unittest.main()

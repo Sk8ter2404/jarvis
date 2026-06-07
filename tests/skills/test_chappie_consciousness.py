@@ -14,7 +14,8 @@ deterministic core:
 
 Episode/fact/cursor files are redirected to a temp dir so nothing in data/ is
 touched. _llm is patched so no Ollama/Claude call happens. The background
-consciousness thread is neutered by the harness (Thread.start no-op).
+consciousness thread never starts on import (CHAPPIE_ENABLED defaults False and
+there is no module-load start), and the harness also neuters Thread.start.
 """
 from __future__ import annotations
 
@@ -1014,24 +1015,57 @@ class ChappieThreadStartTests(unittest.TestCase):
     def setUp(self):
         self.mod, self.actions = load_skill_isolated("chappie_consciousness")
 
-    def test_ensure_thread_started_idempotent(self):
-        # Already started by import (module-load fallback). A second call must
-        # not spawn another thread.
-        self.assertTrue(self.mod._thread_started[0])
-        with mock.patch.object(self.mod.threading, "Thread") as Thread:
+    def test_import_does_not_start_thread_by_default(self):
+        # CHAPPIE_ENABLED defaults False, and there is NO module-load start, so a
+        # bare import + register() must NOT have spun the spending daemon: the
+        # started-flag stays down. (Regression guard for the spend-on-import bug.)
+        self.assertFalse(self.mod.CHAPPIE_ENABLED)
+        self.assertFalse(self.mod._thread_started[0])
+
+    def test_ensure_thread_started_noop_when_disabled(self):
+        # The spend gate: with CHAPPIE_ENABLED False, the call never constructs a
+        # thread no matter the started-flag state.
+        self.mod._thread_started[0] = False
+        with mock.patch.object(self.mod, "CHAPPIE_ENABLED", False), \
+             mock.patch.object(self.mod.threading, "Thread") as Thread:
+            self.mod._ensure_thread_started()
+        Thread.assert_not_called()
+        self.assertFalse(self.mod._thread_started[0])
+
+    def test_ensure_thread_started_idempotent_when_enabled(self):
+        # Enabled + already started → a second call must not spawn another thread.
+        self.mod._thread_started[0] = True
+        with mock.patch.object(self.mod, "CHAPPIE_ENABLED", True), \
+             mock.patch.object(self.mod.threading, "Thread") as Thread:
             self.mod._ensure_thread_started()
         Thread.assert_not_called()
 
-    def test_ensure_thread_started_spawns_when_unstarted(self):
+    def test_ensure_thread_started_spawns_when_enabled_and_unstarted(self):
         self.mod._thread_started[0] = False
-        with mock.patch.object(self.mod.threading, "Thread") as Thread:
+        with mock.patch.object(self.mod, "CHAPPIE_ENABLED", True), \
+             mock.patch.object(self.mod.threading, "Thread") as Thread:
             self.mod._ensure_thread_started()
         Thread.assert_called_once()
         self.assertTrue(Thread.call_args.kwargs.get("daemon"))
         Thread.return_value.start.assert_called_once()
         self.assertTrue(self.mod._thread_started[0])
 
-    def test_register_wires_actions_and_starts_thread(self):
+    def test_register_does_not_spawn_thread_when_disabled(self):
+        # End-to-end through the real register(): with the gate off, the recall
+        # actions still wire up but no thread is constructed (no _ensure mock).
+        mod, _ = load_skill_isolated("chappie_consciousness", register=False)
+        mod._thread_started[0] = False
+        actions: dict = {}
+        with mock.patch.object(mod, "CHAPPIE_ENABLED", False), \
+             mock.patch.object(mod.threading, "Thread") as Thread:
+            mod.register(actions)
+        self.assertIn("chappie_recall_entity", actions)
+        self.assertIn("chappie_recall_today", actions)
+        self.assertIn("chappie_status", actions)
+        Thread.assert_not_called()
+        self.assertFalse(mod._thread_started[0])
+
+    def test_register_wires_actions_and_calls_ensure(self):
         mod, _ = load_skill_isolated("chappie_consciousness", register=False)
         actions: dict = {}
         with mock.patch.object(mod, "_ensure_thread_started") as ens:
