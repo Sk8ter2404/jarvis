@@ -1179,7 +1179,9 @@ _legacy_memory.configure(MEMORY_FILE, _memory_lock)
 # Write-time memory guards (credential redaction + internal-noise filter) moved
 # to core/memory_guards.py so the security-critical logic is unit-tested in
 # isolation. merge_memory (below) uses both via this re-export.
-from core.memory_guards import _is_secret_fact, _is_internal_noise_fact  # noqa: E402,F401
+from core.memory_guards import (  # noqa: E402,F401
+    _is_secret_fact, _is_internal_noise_fact, _clamp_fact_len, MAX_FACT_LEN,
+)
 
 # Canonical action-result failure markers, shared with core/dispatcher.py so the
 # follow-up-loop _is_failure() check below can't drift from the dispatcher's.
@@ -1211,8 +1213,10 @@ def merge_memory(new_facts=None, new_projects=None, new_topic=""):
         if _is_internal_noise_fact(_f):
             print(f"  [memory] dropped internal-noise candidate fact: {_f[:40]}…")
             continue
-        new_facts.append(_f)
-    new_projects = [p.strip() for p in (new_projects or [])
+        # Cap each fact before storage: it's re-injected into the cloud system
+        # prompt every turn, so one runaway fact is permanent token bloat.
+        new_facts.append(_clamp_fact_len(_f))
+    new_projects = [_clamp_fact_len(p.strip()) for p in (new_projects or [])
                     if isinstance(p, str) and p.strip()
                     and not _is_internal_noise_fact(p.strip())]
     new_topic = new_topic.strip() if isinstance(new_topic, str) else ""
@@ -1228,6 +1232,13 @@ def merge_memory(new_facts=None, new_projects=None, new_topic=""):
         memory.setdefault("facts", [])
         memory.setdefault("projects", [])
         memory.setdefault("topics", [])
+
+        # Clamp any pre-existing over-long facts/projects already on disk (e.g.
+        # stored before the cap existed) so legacy bloat is repaired in place.
+        memory["facts"]    = [_clamp_fact_len(f) if isinstance(f, str) else f
+                              for f in memory["facts"]]
+        memory["projects"] = [_clamp_fact_len(p) if isinstance(p, str) else p
+                              for p in memory["projects"]]
 
         existing_facts = {f.lower() for f in memory["facts"] if isinstance(f, str)}
         for f in new_facts:
