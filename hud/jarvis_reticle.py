@@ -102,8 +102,57 @@ def _read_reticles() -> list:
         return []
 
 
+def _primary_work_area_bottom():
+    """Bottom edge (virtual-desktop pixel y) of the primary monitor's work
+    area — i.e. the top of the Windows taskbar. Returns None when it can't be
+    determined (non-Windows, or the Win32 call fails) so the caller leaves the
+    full-screen geometry untouched. Best-effort and side-effect-free."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        SPI_GETWORKAREA = 0x0030
+        rect = wintypes.RECT()
+        ok = ctypes.windll.user32.SystemParametersInfoW(
+            SPI_GETWORKAREA, 0, ctypes.byref(rect), 0
+        )
+        if not ok:
+            return None
+        return int(rect.bottom)
+    except Exception:
+        return None
+
+
+def _clamp_to_work_area(x: int, y: int, w: int, h: int, work_bottom):
+    """Trim the overlay so its bottom edge stops at the taskbar instead of
+    extending behind it.
+
+    The overlay spans the full virtual desktop ``y .. y+h``. The Windows
+    taskbar is topmost too, so the band of our window that overlaps it is
+    occluded — a reticle for a click near the bottom edge would be sliced off.
+    When ``work_bottom`` (top of the taskbar) falls inside our window we shrink
+    the height to end there. We only ever shrink, never move the top or grow,
+    so reticles anywhere in the usable work area still render unchanged.
+
+    ``work_bottom`` None (couldn't be queried / non-Windows) returns the
+    geometry verbatim. Returns ``(x, y, w, h)``."""
+    if work_bottom is None:
+        return x, y, w, h
+    # Only act when the taskbar top sits within our vertical span; clamp so the
+    # window ends at the taskbar and keep at least a 1px-tall canvas.
+    if y < work_bottom < y + h:
+        h = max(1, work_bottom - y)
+    return x, y, w, h
+
+
 class ReticleOverlay:
     def __init__(self, x: int, y: int, w: int, h: int, parent_pid: int):
+        # Keep the overlay above the Windows taskbar so reticles near the
+        # bottom edge aren't sliced off behind it (the taskbar is topmost too).
+        x, y, w, h = _clamp_to_work_area(x, y, w, h, _primary_work_area_bottom())
+
         self.parent_pid = parent_pid
         self.origin_x   = x
         self.origin_y   = y
