@@ -515,6 +515,18 @@ KINECT_GESTURES_ENABLED = False
 #   drives a device in staging/test. See audio/kinect_pointing.py (geometry +
 #   store) + skills/kinect_pointing.py (wiring).
 KINECT_POINT_CONTROL_ENABLED = False
+# KINECT_AIR_MOUSE_ENABLED — when True, "air-mouse": point an OPEN hand at the
+#   screen to move the cursor, CLOSE the hand to RIGHT-click, and hold it closed
+#   to drag (close→open quickly = a right-click; close→move→open = a right-drag).
+#   A background poller (~30 Hz) maps the pointing hand's position within a
+#   calibrated reach-box onto the PRIMARY monitor, heavily EMA-smoothed to fight
+#   jitter, and drives the cursor via win32api (pyautogui fallback). A glowing
+#   JARVIS reticle (hud/jarvis_air_cursor.py) follows the cursor — cyan while
+#   tracking an open hand, gold-locked on grab/drag. Off by default; never runs
+#   in staging/test; a dead-man releases any held button the instant the hand
+#   isn't tracked. See audio/kinect_bridge.get_hand_states() (grip) +
+#   skills/kinect_air_mouse.py (wiring) + hud/jarvis_air_cursor.py (overlay).
+KINECT_AIR_MOUSE_ENABLED = False
 # KINECT_GREET_ON_ENTRY — when True (and presence is enabled), JARVIS speaks a
 #   brief varied greeting when you enter a room that had been empty for a while.
 #   Hard rate-limited (≤ once/min) and skipped mid-conversation. Off by default.

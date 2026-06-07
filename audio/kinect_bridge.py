@@ -140,6 +140,33 @@ _JOINT_NAMES = (
 _JOINT_COUNT = len(_JOINT_NAMES)   # 25
 
 
+# ─── hand-state map (PyKinectV2.HandState_* indices → friendly names) ──────
+# The Kinect v2 reports a discrete OPEN/CLOSED/LASSO grip per hand alongside the
+# skeleton (body.hand_right_state / hand_left_state — verified against the
+# installed PyKinectRuntime, which sets these ints on each KinectBody). Mapped
+# to lowercase strings here so callers (the air-mouse skill) read "open" /
+# "closed" without importing PyKinectV2 just for its enum. Index order matches
+# the SDK enum: 0 Unknown, 1 NotTracked, 2 Open, 3 Closed, 4 Lasso. We collapse
+# NotTracked → "unknown" since both mean "no reliable grip this frame".
+_HAND_STATE_NAMES = {
+    0: "unknown",   # HandState_Unknown
+    1: "unknown",   # HandState_NotTracked (no usable grip → treat as unknown)
+    2: "open",      # HandState_Open
+    3: "closed",    # HandState_Closed
+    4: "lasso",     # HandState_Lasso (two-finger "pointer"; not used by v1)
+}
+
+
+def _hand_state_name(raw: Any) -> str:
+    """Map a raw Kinect hand-state int to a friendly lowercase name. Anything
+    unexpected (None, out-of-range, non-int) degrades to "unknown" — this is a
+    pure helper that, like the rest of the bridge, never raises."""
+    try:
+        return _HAND_STATE_NAMES.get(int(raw), "unknown")
+    except (TypeError, ValueError):
+        return "unknown"
+
+
 # ─── singleton runtime (cached behind a lock) ─────────────────────────────
 # Module-list wrapping so the lock-guarded mutators can reassign without a
 # `global`. _runtime[0] is the live PyKinectRuntime (or None). _negative_until
@@ -365,8 +392,15 @@ def get_bodies() -> list[dict]:
          "joints": {name: (x, y, z, tracking_state), ...},  # metres
          "head": (x, y, z) | None,
          "distance_m": float | None,    # head/spine z
-         "facing": bool | None}
-    """
+         "facing": bool | None,
+         "hand_right": "open"|"closed"|"lasso"|"unknown",   # discrete grip
+         "hand_left":  "open"|"closed"|"lasso"|"unknown"}
+
+    The two hand-state keys mirror the Kinect's per-hand OPEN/CLOSED/LASSO grip
+    (body.hand_right_state / hand_left_state). They're additive — every existing
+    consumer (presence, gestures, pointing) ignores them — so adding them is
+    backward-compatible. A build that doesn't expose the attribute, or an
+    untracked hand, reads as "unknown" (the helper swallows it)."""
     rt, _ = get_runtime()
     if rt is None:
         return []
@@ -400,10 +434,49 @@ def get_bodies() -> list[dict]:
                 "head": (head[0], head[1], head[2]) if head else None,
                 "distance_m": _joint_distance(joints),
                 "facing": _body_is_facing(joints),
+                # getattr so an older build lacking these attrs degrades to
+                # "unknown" rather than KeyError-ing the whole body out.
+                "hand_right": _hand_state_name(getattr(body, "hand_right_state", None)),
+                "hand_left": _hand_state_name(getattr(body, "hand_left_state", None)),
             })
         return out
     except Exception:   # pragma: no cover - defensive: mid-stream body-frame glitch
         return []
+
+
+def get_hand_states() -> dict:
+    """Discrete hand grip for the NEAREST tracked body — the safe accessor the
+    air-mouse skill reads. NEVER raises; mirrors the joint accessors' graceful-
+    sentinel contract. Shape:
+        {"right": "open"|"closed"|"lasso"|"unknown",
+         "left":  "open"|"closed"|"lasso"|"unknown",
+         "tracked": bool,           # was any body in view this call
+         "ts": <monotonic>}
+    With no sensor / no body in view, returns both hands "unknown" and
+    tracked=False (so a missing Kinect degrades to "I can't see your hand" rather
+    than a crash). "Nearest" reuses the same distance_m ranking get_presence and
+    the gesture/pointing skills use, so the air-mouse follows the same body the
+    rest of JARVIS is tracking."""
+    base = {"right": "unknown", "left": "unknown",
+            "tracked": False, "ts": time.monotonic()}
+    try:
+        bodies = get_bodies()
+    except Exception:   # pragma: no cover - get_bodies already swallows; belt-and-braces
+        return base
+    if not bodies:
+        return base
+    # Nearest by distance_m (bodies without a range sort last), matching the
+    # _nearest_body helpers in the gesture / pointing modules.
+    def _key(b):
+        d = b.get("distance_m")
+        return d if isinstance(d, (int, float)) and d > 0 else float("inf")
+    nearest = min(bodies, key=_key)
+    return {
+        "right": nearest.get("hand_right", "unknown"),
+        "left": nearest.get("hand_left", "unknown"),
+        "tracked": True,
+        "ts": time.monotonic(),
+    }
 
 
 def get_presence() -> dict:
