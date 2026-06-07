@@ -55,6 +55,15 @@ try:
     from core.config import DAILY_BUDGET_USD as DAILY_BUDGET_USD
 except Exception:
     DAILY_BUDGET_USD = 1.0
+# CHAPPIE_ENABLED gates the spending background daemon. Default False so a bare
+# import (incl. a test) or the live skill loader registers the recall actions
+# WITHOUT spinning the Claude-spending thread. Sourced from core/config.py so
+# the Settings GUI / user_settings.json override takes effect; falls back to
+# False when core.config can't be imported (bare test import).
+try:
+    from core.config import CHAPPIE_ENABLED as CHAPPIE_ENABLED
+except Exception:
+    CHAPPIE_ENABLED = False
 APPROX_COST_PER_CALL = 0.0012    # Haiku ~$0.25/$1.25 per Mtok; 1k tokens ≈ this
 SLEEP_TICK_SEC       = 30        # main loop wakeup; cheap
 
@@ -502,6 +511,12 @@ def _chappie_loop():
 
 
 def _ensure_thread_started() -> None:
+    # Spend gate: the daemon makes Claude calls, so it only ever starts when the
+    # user has explicitly opted in via CHAPPIE_ENABLED (core/config.py, default
+    # False). Without this, merely registering the skill — or importing the
+    # module — would spin a live spending thread.
+    if not CHAPPIE_ENABLED:
+        return
     if _thread_started[0]:
         return
     _thread_started[0] = True
@@ -613,8 +628,8 @@ def chappie_status(_: str = "") -> str:
 # ─── skill registration hook ────────────────────────────────────────────
 
 def register(actions: dict) -> None:
-    """Called by the skill loader. Adds three silent recall actions and
-    starts the background consciousness thread.
+    """Called by the skill loader. Adds three silent recall actions and, only
+    when CHAPPIE_ENABLED is set, starts the background consciousness thread.
 
     NOTE: the loader only ever calls a hook named `register` — the old name
     `register_actions` meant these three actions were NEVER registered (dead
@@ -630,6 +645,6 @@ def register(actions: dict) -> None:
 register_actions = register
 
 
-# Module-load fallback: if the skill loader doesn't call register_actions
-# (e.g. someone imports this directly for testing), still start the thread.
-_ensure_thread_started()
+# NO module-load thread start. The Claude-spending daemon must never spin from a
+# bare import (e.g. a test importing this module). It starts only when the skill
+# loader calls register() AND CHAPPIE_ENABLED is set — see _ensure_thread_started.
