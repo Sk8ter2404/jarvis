@@ -485,10 +485,34 @@ class ParseAndRunActionsTests(SectionSixBase):
                 "Okay. [ACTION: dangeract, foo]")
         # Deferred — NOT executed; queued on _pending_confirmation.
         self.assertEqual(ran, [])
-        self.assertEqual(cleaned, "Okay.")
         self.assertEqual(len(results), 1)
         self.assertIn("REQUIRES CONFIRMATION", results[0][1])
         self.assertIn(("dangeract", "foo"), list(bc._pending_confirmation))
+        # P1-5: the confirmation prompt must be SPOKEN (folded into `cleaned`,
+        # the main loop's TTS text) — not just printed/queued — otherwise
+        # JARVIS goes silent awaiting a "yes" the user never heard it ask for.
+        # The LLM's prose is preserved and the spoken request appended to it.
+        self.assertTrue(cleaned.startswith("Okay."))
+        self.assertIn("yes", cleaned.lower())
+        self.assertIn("cancel", cleaned.lower())
+
+    def test_confirmation_prompt_spoken_even_with_no_prose(self):
+        # P1-5 worst case: the LLM emits ONLY the [ACTION:] token (no
+        # surrounding prose), so the stripped `cleaned` would be empty and
+        # `_run_llm_dispatch`'s `if spoken_text:` guard would speak nothing —
+        # JARVIS silently waits on _pending_confirmation. The fix must still
+        # surface a spoken confirmation question in `cleaned`.
+        bc = self.bc
+        ran = []
+        self._with_action("dangeract", lambda a: ran.append(a) or "ran")
+        with mock.patch.object(bc, "_needs_confirmation",
+                               lambda n, a: n == "dangeract"):
+            cleaned, results = bc.parse_and_run_actions("[ACTION: dangeract, x]")
+        self.assertEqual(ran, [])  # deferred, not executed
+        self.assertIn(("dangeract", "x"), list(bc._pending_confirmation))
+        # Non-empty spoken text so the dispatch loop actually voices the ask.
+        self.assertTrue(cleaned.strip())
+        self.assertIn("yes", cleaned.lower())
 
     def test_pushback_replaces_prose_and_defers(self):
         bc = self.bc
