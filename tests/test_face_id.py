@@ -344,6 +344,115 @@ class EnrollTests(FaceIdBase):
         self.assertEqual(fi._load_store(), {"people": []})
 
 
+# ─── enroll_unknown (guest path: capture only the nearest UNKNOWN face) ──────
+class _FakeRecPerFace:
+    """Like _FakeRec but maps EACH face (by its bbox x) to its own embedding, so
+    multiple faces in ONE frame embed to DIFFERENT vectors. alignCrop sees the
+    face array (recognize/enroll pass it through _as_face_array), so we key the
+    embedding off face[0] (the x coord). This lets a single frame hold a known
+    owner AND an unknown stranger at once — exactly the bug scenario."""
+    def __init__(self, by_x):
+        self._by_x = {float(k): np.asarray(v, dtype=np.float32)
+                      for k, v in by_x.items()}
+
+    def alignCrop(self, _bgr, face):
+        x = float(np.asarray(face, dtype=np.float32).reshape(-1)[0])
+        return ("aligned", x)
+
+    def feature(self, aligned):
+        emb = self._by_x.get(aligned[1])
+        if emb is None:
+            emb = np.zeros(4, dtype=np.float32)
+        return np.asarray(emb, dtype=np.float32).reshape(1, -1)
+
+
+class EnrollUnknownTests(FaceIdBase):
+    # Distinct, near-orthogonal embeddings so cosine cleanly separates them.
+    OWNER = [1.0, 0.0, 0.0, 0.0]
+    STRANGER = [0.0, 1.0, 0.0, 0.0]
+
+    def _seed_owner(self):
+        fi._save_store({"people": [{"name": "owner",
+                                    "embeddings": [list(self.OWNER)],
+                                    "ts": 0.0}]})
+
+    def test_owner_closest_plus_unknown_enrolls_the_unknown(self):
+        """THE regression: the owner is the LARGEST face in frame and a stranger
+        is a smaller face. learn_guest('Sam') must enrol the STRANGER, never the
+        owner — and Sam's stored embedding must be the stranger's, not the
+        owner's (so recognition isn't corrupted)."""
+        self._seed_owner()
+        # Owner big (x=0, 120x120) and closest; stranger smaller (x=200, 60x60).
+        owner_face = _face_row(0, 0, 120, 120)
+        stranger_face = _face_row(200, 0, 60, 60)
+        fi._detector[0] = _FakeDet(_faces(owner_face, stranger_face))
+        fi._recognizer[0] = _FakeRecPerFace({0.0: self.OWNER,
+                                             200.0: self.STRANGER})
+
+        res = fi.enroll_unknown("Sam", [_Frame(self.OWNER)])  # frame emb unused
+
+        self.assertEqual(res["added"], 1)
+        self.assertTrue(res["saw_face"])
+        self.assertTrue(res["saw_unknown"])
+        # Sam is now enrolled — owner untouched (still exactly one embedding).
+        names = {p["name"]: p for p in fi._load_store()["people"]}
+        self.assertIn("Sam", names)
+        self.assertEqual(len(names["owner"]["embeddings"]), 1)
+        # Sam's stored embedding is the STRANGER's, NOT the owner's.
+        sam_emb = names["Sam"]["embeddings"][0]
+        self.assertAlmostEqual(fi._numpy_cosine(sam_emb, self.STRANGER), 1.0,
+                               places=5)
+        self.assertLess(fi._numpy_cosine(sam_emb, self.OWNER), 0.5)
+
+    def test_only_owner_visible_enrolls_nothing(self):
+        """If the ONLY face is the (recognised) owner, enrol nobody and report
+        saw_face but not saw_unknown — the skill then says 'already known'
+        instead of mis-storing the owner as the guest."""
+        self._seed_owner()
+        fi._detector[0] = _FakeDet(_faces(_face_row(0, 0, 120, 120)))
+        fi._recognizer[0] = _FakeRecPerFace({0.0: self.OWNER})
+
+        res = fi.enroll_unknown("Sam", [_Frame(self.OWNER)])
+
+        self.assertEqual(res["added"], 0)
+        self.assertTrue(res["saw_face"])
+        self.assertFalse(res["saw_unknown"])
+        # Nobody named Sam was stored; owner left intact.
+        self.assertEqual(fi.list_enrolled(), [{"name": "owner", "count": 1}])
+
+    def test_no_face_reports_no_face(self):
+        fi._detector[0] = _FakeDet(None)  # detector sees nothing
+        fi._recognizer[0] = _FakeRecPerFace({})
+        res = fi.enroll_unknown("Sam", [_Frame(self.STRANGER)])
+        self.assertEqual(res, {"added": 0, "saw_face": False,
+                               "saw_unknown": False})
+
+    def test_blank_name_zero(self):
+        self.assertEqual(fi.enroll_unknown("  ", [_Frame(self.STRANGER)]),
+                         {"added": 0, "saw_face": False, "saw_unknown": False})
+
+    def test_largest_unknown_skips_known_picks_bigger_stranger(self):
+        """_largest_unknown_face ignores recognised faces and, among the
+        unknowns, returns the biggest (nearest) one."""
+        known = _face_row(0, 0, 200, 200)      # biggest overall, but KNOWN
+        small_unknown = _face_row(10, 10, 40, 40)
+        big_unknown = _face_row(300, 0, 90, 90)
+        faces = [known, small_unknown, big_unknown]
+        results = [{"name": "owner"}, {"name": "unknown"}, {"name": "unknown"}]
+        chosen = fi._largest_unknown_face(faces, results)
+        self.assertEqual(fi._face_area(chosen), 90 * 90)
+
+    def test_largest_unknown_all_known_is_none(self):
+        faces = [_face_row(0, 0, 80, 80), _face_row(90, 0, 60, 60)]
+        results = [{"name": "owner"}, {"name": "Tony"}]
+        self.assertIsNone(fi._largest_unknown_face(faces, results))
+
+    def test_largest_unknown_unpaired_result_treated_unknown(self):
+        # A face with no paired recognize() entry is treated as unknown.
+        faces = [_face_row(0, 0, 80, 80)]
+        self.assertIsNotNone(fi._largest_unknown_face(faces, []))
+
+
 # ─── model readiness (download mocked; never hits the network) ─────────────
 class ModelReadinessTests(FaceIdBase):
     def _write_fake_model(self, path, size=fi._MIN_MODEL_BYTES + 10):

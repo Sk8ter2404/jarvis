@@ -63,6 +63,41 @@ class LegacyMemoryTests(unittest.TestCase):
         self.assertIn("sessions", m)
         self.assertIn("last_used_phrase_by_intent", m)
 
+    def test_load_coerces_string_list_fields_to_empty_list(self):
+        # A corrupted store where a list field is a STRING must NOT survive as a
+        # char-iterable: build_system_prompt does `for f in mem["facts"]`, so a
+        # stray string would be iterated character-by-character into the cloud
+        # prompt (token bloat / garbage). load_memory resets it to [].
+        with open(self._path, "w", encoding="utf-8") as f:
+            json.dump({"facts": "User likes lofi",      # should have been a list
+                       "projects": "Building a robot",
+                       "topics": "weather"}, f)
+        m = lm.load_memory()
+        for k in ("facts", "projects", "topics"):
+            self.assertIsInstance(m[k], list, f"{k} not coerced to list")
+            self.assertEqual(m[k], [], f"{k} should reset to [], got {m[k]!r}")
+        # Specifically: NOT the char-by-char explosion of the original string.
+        self.assertNotIn("U", m["facts"])
+
+    def test_load_coerces_non_dict_phrase_map_to_empty_dict(self):
+        # last_used_phrase_by_intent feeds render_phrasebook_block(); a stray
+        # non-dict (e.g. a string) would break it, so coerce to {}.
+        with open(self._path, "w", encoding="utf-8") as f:
+            json.dump({"last_used_phrase_by_intent": "greeting"}, f)
+        m = lm.load_memory()
+        self.assertEqual(m["last_used_phrase_by_intent"], {})
+
+    def test_load_preserves_valid_list_fields(self):
+        # Coercion must not disturb already-valid data.
+        good = {"facts": ["a", "b"], "projects": ["p"],
+                "topics": [{"date": "2026-01-01", "topic": "t"}]}
+        with open(self._path, "w", encoding="utf-8") as f:
+            json.dump(good, f)
+        m = lm.load_memory()
+        self.assertEqual(m["facts"], ["a", "b"])
+        self.assertEqual(m["projects"], ["p"])
+        self.assertEqual(m["topics"], [{"date": "2026-01-01", "topic": "t"}])
+
     def test_save_failure_cleans_tempfile_and_reraises(self):
         # If serialisation fails mid-write, save_memory must (a) re-raise so the
         # caller sees the failure and (b) leave NO stray .mem_*.tmp behind — the

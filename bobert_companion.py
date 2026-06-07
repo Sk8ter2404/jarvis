@@ -1179,7 +1179,9 @@ _legacy_memory.configure(MEMORY_FILE, _memory_lock)
 # Write-time memory guards (credential redaction + internal-noise filter) moved
 # to core/memory_guards.py so the security-critical logic is unit-tested in
 # isolation. merge_memory (below) uses both via this re-export.
-from core.memory_guards import _is_secret_fact, _is_internal_noise_fact  # noqa: E402,F401
+from core.memory_guards import (  # noqa: E402,F401
+    _is_secret_fact, _is_internal_noise_fact, _clamp_fact_len, MAX_FACT_LEN,
+)
 
 # Canonical action-result failure markers, shared with core/dispatcher.py so the
 # follow-up-loop _is_failure() check below can't drift from the dispatcher's.
@@ -1211,8 +1213,10 @@ def merge_memory(new_facts=None, new_projects=None, new_topic=""):
         if _is_internal_noise_fact(_f):
             print(f"  [memory] dropped internal-noise candidate fact: {_f[:40]}…")
             continue
-        new_facts.append(_f)
-    new_projects = [p.strip() for p in (new_projects or [])
+        # Cap each fact before storage: it's re-injected into the cloud system
+        # prompt every turn, so one runaway fact is permanent token bloat.
+        new_facts.append(_clamp_fact_len(_f))
+    new_projects = [_clamp_fact_len(p.strip()) for p in (new_projects or [])
                     if isinstance(p, str) and p.strip()
                     and not _is_internal_noise_fact(p.strip())]
     new_topic = new_topic.strip() if isinstance(new_topic, str) else ""
@@ -1228,6 +1232,13 @@ def merge_memory(new_facts=None, new_projects=None, new_topic=""):
         memory.setdefault("facts", [])
         memory.setdefault("projects", [])
         memory.setdefault("topics", [])
+
+        # Clamp any pre-existing over-long facts/projects already on disk (e.g.
+        # stored before the cap existed) so legacy bloat is repaired in place.
+        memory["facts"]    = [_clamp_fact_len(f) if isinstance(f, str) else f
+                              for f in memory["facts"]]
+        memory["projects"] = [_clamp_fact_len(p) if isinstance(p, str) else p
+                              for p in memory["projects"]]
 
         existing_facts = {f.lower() for f in memory["facts"] if isinstance(f, str)}
         for f in new_facts:
@@ -1248,6 +1259,7 @@ def merge_memory(new_facts=None, new_projects=None, new_topic=""):
         if new_topic:
             memory["topics"].append({
                 "date":     time.strftime("%Y-%m-%d"),
+                "ts":       time.time(),   # numeric epoch for last-hour forget
                 "location": LOCATION,
                 "topic":    new_topic,
             })
@@ -1544,11 +1556,15 @@ _AMBIENT_LEARN_MIN_WORDS = 3
 
 
 def _ambient_media_is_playing() -> bool:
-    """True if EITHER the Windows media session (SMTC) reports media PLAYING or
-    the spectral room-music detector reports sustained music. Either signal
-    means the mic is hearing the TV/stereo, not the owner's conversation, so
-    ambient-learning must NOT ingest the transcript. Never raises — any error in
-    a probe is treated as 'not playing' so a probe glitch can't wedge the gate."""
+    """True if ANY independent signal says the mic is hearing the TV/stereo (not
+    the owner's conversation), so ambient-learning must NOT ingest the transcript:
+      • the Windows media session (SMTC) reports media PLAYING, OR
+      • the spectral room-music detector reports sustained music, OR
+      • the CAMERA-BASED TV detector sees a bright, flickering screen ON.
+    The camera signal is independent of audio — it catches a TV the audio gates
+    miss (a muted TV, an unrecognised stream, a show the content judge can't
+    place). Never raises — any error in a probe is treated as 'not playing' so a
+    probe glitch can't wedge the gate."""
     # SMTC (Chrome/Spotify/Apple Music/YouTube/etc.). Reuses the gate's helper.
     try:
         if _smtc_media_playing():
@@ -1560,6 +1576,17 @@ def _ambient_media_is_playing() -> bool:
     try:
         mod = sys.modules.get("skill_standby_audio_detect")
         if mod is not None and bool(mod.is_music_currently_playing()):
+            return True
+    except Exception:
+        pass
+    # Camera-based TV detector (opt-in, TV_DETECT_ENABLED): a bright + flickering
+    # screen in view is independent VISUAL evidence the room audio is the TV.
+    # is_tv_on() is fail-safe (False unless enabled AND it positively sees a TV).
+    try:
+        mod = sys.modules.get("skill_tv_detect")
+        if mod is not None and bool(mod.is_tv_on()):
+            print("  [ambient-learn] suppressing: camera sees a TV ON "
+                  "(bright + flickering screen) — not learning from room audio")
             return True
     except Exception:
         pass
@@ -2127,6 +2154,7 @@ def save_session_to_memory(memory: dict):
         if summary:
             session_entry = {
                 "date":     time.strftime("%Y-%m-%d"),
+                "ts":       time.time(),   # numeric epoch for last-hour forget
                 "location": LOCATION,
                 "summary":  summary,
             }

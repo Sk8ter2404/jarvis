@@ -46,8 +46,12 @@ def _fake_monolith(frames=None):
 
 
 def _fake_engine(*, available=(True, ""), recognize=None, enroll_n=1,
-                 enrolled=None):
-    """A stand-in audio.face_id engine module (only what the skill calls)."""
+                 enrolled=None, enroll_unknown_result=None):
+    """A stand-in audio.face_id engine module (only what the skill calls).
+
+    `enroll_n` drives the owner path (enroll()). The guest path (enroll_unknown)
+    returns `enroll_unknown_result` verbatim when given, else a success dict
+    derived from enroll_n so the legacy guest tests keep passing."""
     m = types.ModuleType("audio.face_id")
     m.is_available = lambda: available
     m.recognize = lambda frame: (recognize if recognize is not None else [])
@@ -57,6 +61,19 @@ def _fake_engine(*, available=(True, ""), recognize=None, enroll_n=1,
         m._enroll_calls.append((name, list(frames)))
         return enroll_n
     m.enroll = _enroll
+
+    # Guest enrollment: capture only the nearest UNKNOWN face. Records its calls
+    # separately and returns the rich {"added", "saw_face", "saw_unknown"} dict.
+    m._enroll_unknown_calls = []
+    _default_unknown = {"added": enroll_n,
+                        "saw_face": True,
+                        "saw_unknown": enroll_n > 0}
+
+    def _enroll_unknown(name, frames):
+        m._enroll_unknown_calls.append((name, list(frames)))
+        return (enroll_unknown_result if enroll_unknown_result is not None
+                else dict(_default_unknown))
+    m.enroll_unknown = _enroll_unknown
     m.list_enrolled = lambda: (enrolled if enrolled is not None else [])
     m._forget_calls = []
 
@@ -200,9 +217,11 @@ class LearnGuestTests(FaceIdSkillBase):
         out = actions["learn_guest"]("Sam")
         self.assertIn("Sam", out)
         self.assertIn("recognise", out.lower())
-        # The engine enrolled under the GUEST name, not the owner.
-        self.assertEqual(len(eng._enroll_calls), 1)
-        name, frames = eng._enroll_calls[0]
+        # The engine enrolled under the GUEST name via the UNKNOWN-only path
+        # (never the plain enroll(), which would grab the largest/owner face).
+        self.assertEqual(eng._enroll_calls, [])
+        self.assertEqual(len(eng._enroll_unknown_calls), 1)
+        name, frames = eng._enroll_unknown_calls[0]
         self.assertEqual(name, "Sam")
         self.assertGreaterEqual(len(frames), 1)
 
@@ -212,7 +231,7 @@ class LearnGuestTests(FaceIdSkillBase):
         _mod, actions = self._load(bc=bc, engine=eng)
         # The router may pass the whole spoken tail through.
         actions["remember_their_face"]("this is sam")
-        self.assertEqual(eng._enroll_calls[0][0], "Sam")   # cleaned + cased
+        self.assertEqual(eng._enroll_unknown_calls[0][0], "Sam")  # cleaned+cased
 
     def test_learn_guest_requires_a_name(self):
         bc = _fake_monolith(frames={0: _Frame("p")})
@@ -220,7 +239,7 @@ class LearnGuestTests(FaceIdSkillBase):
         _mod, actions = self._load(bc=bc, engine=eng)
         out = actions["learn_guest"]("")
         self.assertIn("name", out.lower())
-        self.assertEqual(eng._enroll_calls, [])            # nothing enrolled
+        self.assertEqual(eng._enroll_unknown_calls, [])    # nothing enrolled
 
     def test_learn_guest_rejects_placeholder_name(self):
         bc = _fake_monolith(frames={0: _Frame("p")})
@@ -228,7 +247,7 @@ class LearnGuestTests(FaceIdSkillBase):
         _mod, actions = self._load(bc=bc, engine=eng)
         out = actions["learn_guest"]("guest")
         self.assertIn("real name", out.lower())
-        self.assertEqual(eng._enroll_calls, [])
+        self.assertEqual(eng._enroll_unknown_calls, [])
 
     def test_learn_guest_refuses_when_disabled(self):
         bc = _fake_monolith(frames={0: _Frame("p")})
@@ -236,7 +255,7 @@ class LearnGuestTests(FaceIdSkillBase):
         _mod, actions = self._load(bc=bc, engine=eng, enabled=False)
         out = actions["learn_guest"]("Sam")
         self.assertIn("off", out.lower())
-        self.assertEqual(eng._enroll_calls, [])
+        self.assertEqual(eng._enroll_unknown_calls, [])
 
     def test_learn_guest_refuses_when_camera_dark(self):
         bc = _fake_monolith(frames={})                     # no primary frame
@@ -244,15 +263,31 @@ class LearnGuestTests(FaceIdSkillBase):
         _mod, actions = self._load(bc=bc, engine=eng)
         out = actions["learn_guest"]("Sam")
         self.assertIn("webcam", out.lower())
-        self.assertEqual(eng._enroll_calls, [])
+        self.assertEqual(eng._enroll_unknown_calls, [])
 
     def test_learn_guest_no_clear_face(self):
         bc = _fake_monolith(frames={0: _Frame("p")})
-        eng = _fake_engine(enroll_n=0)                     # no usable face
+        # No face at all in view → couldn't get a clear look.
+        eng = _fake_engine(enroll_unknown_result={
+            "added": 0, "saw_face": False, "saw_unknown": False})
         _mod, actions = self._load(bc=bc, engine=eng)
         out = actions["learn_guest"]("Sam")
         self.assertIn("clear look", out.lower())
         self.assertIn("Sam", out)
+
+    def test_learn_guest_all_visible_already_known(self):
+        """The owner is closest, but a face IS visible and it's already
+        recognised → JARVIS must NOT enrol the owner under the guest name. It
+        reports that everyone visible is already known rather than corrupting
+        recognition (the P2 'owner-closest gets stored as guest' bug)."""
+        bc = _fake_monolith(frames={0: _Frame("p")})
+        eng = _fake_engine(enroll_unknown_result={
+            "added": 0, "saw_face": True, "saw_unknown": False})
+        _mod, actions = self._load(bc=bc, engine=eng)
+        out = actions["learn_guest"]("Sam")
+        self.assertIn("already", out.lower())
+        self.assertIn("recognise", out.lower())
+        self.assertNotIn("clear look", out.lower())
 
 
 # ─── whoami ─────────────────────────────────────────────────────────────────

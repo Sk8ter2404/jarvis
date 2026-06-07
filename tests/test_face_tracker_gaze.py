@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from unittest import mock
@@ -383,6 +384,100 @@ class ToggleTests(_GazeBase):
             off = ft.gaze_tracking_off("")
             self.assertFalse(cfg.KINECT_GAZE_ENABLED)
             self.assertIn("off", off.lower())
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# gaze_stats reads _dwell_total UNDER _state_lock (P2 race regression guard)
+#
+# The background poller inserts into _dwell_total via _commit_state while
+# holding _state_lock. gaze_stats copies that dict to "close out" the current
+# run; if the copy is UNLOCKED, a concurrent insert during the dict() copy
+# raises "RuntimeError: dictionary changed size during iteration" on the
+# user-facing gaze_stats action.
+# ─────────────────────────────────────────────────────────────────────────
+class GazeStatsLockTests(_GazeBase):
+    def test_gaze_stats_copies_dwell_total_under_state_lock(self):
+        """Direct proof: at the instant dict(_dwell_total) runs, _state_lock is
+        held. A tripwire mapping samples the lock when copied — dict(mapping)
+        drives the generic keys() protocol (unlike a dict subclass, which takes
+        a C fast path that skips keys()). _state_lock is a non-reentrant
+        threading.Lock, so a same-thread acquire(blocking=False) returns False
+        *iff* gaze_stats already holds it. Fails against the pre-fix (unlocked)
+        copy; passes after."""
+        from collections.abc import MutableMapping
+        ft = self._load()
+        seen = {}
+
+        class _TripwireMapping(MutableMapping):
+            def __init__(self, d):
+                self._d = dict(d)
+
+            def _sample(self):
+                got = ft._state_lock.acquire(blocking=False)
+                if got:
+                    ft._state_lock.release()
+                seen["lock_held_during_copy"] = not got
+
+            def keys(self):           # dict(self) copies via keys()
+                self._sample()
+                return self._d.keys()
+
+            def __iter__(self):       # belt-and-braces if copy iterates instead
+                self._sample()
+                return iter(self._d)
+
+            def __getitem__(self, k): return self._d[k]
+            def __setitem__(self, k, v): self._d[k] = v
+            def __delitem__(self, k): del self._d[k]
+            def __len__(self): return len(self._d)
+
+        with ft._state_lock:
+            ft._dwell_total = _TripwireMapping({"left": 12.0, "right": 7.0})
+        # No current run open → gaze_stats only copies + formats the totals.
+        out = ft.gaze_stats("")
+        self.assertTrue(
+            seen.get("lock_held_during_copy"),
+            "gaze_stats copied _dwell_total WITHOUT holding _state_lock")
+        # And it still produced the expected breakdown (behaviour preserved).
+        self.assertIn("left", out)
+        self.assertIn("right", out)
+
+    def test_gaze_stats_survives_concurrent_poller_inserts(self):
+        """The actual race: a writer thread hammers _dwell_total[...] = ...
+        under _state_lock (exactly as _commit_state does) while we call
+        gaze_stats repeatedly. Unlocked, the dict() copy hits "dictionary
+        changed size during iteration"; locked, it never does."""
+        ft = self._load()
+        stop = threading.Event()
+        errors: list[BaseException] = []
+
+        def _writer():
+            i = 0
+            while not stop.is_set():
+                # Mutate the SIZE of the dict under the lock, like the poller.
+                with ft._state_lock:
+                    key = f"m{i % 64}"
+                    if key in ft._dwell_total:
+                        del ft._dwell_total[key]
+                    else:
+                        ft._dwell_total[key] = float(i)
+                i += 1
+
+        t = threading.Thread(target=_writer, daemon=True)
+        t.start()
+        try:
+            for _ in range(400):
+                try:
+                    ft.gaze_stats("")
+                except BaseException as exc:   # noqa: BLE001 — capture & fail
+                    errors.append(exc)
+                    break
+        finally:
+            stop.set()
+            t.join(timeout=5.0)
+        self.assertEqual(
+            errors, [],
+            f"gaze_stats raced a concurrent insert: {errors!r}")
 
 
 if __name__ == "__main__":

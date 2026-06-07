@@ -74,6 +74,24 @@ def load_memory() -> dict:
     for k, v in base.items():
         if k not in mem:
             mem[k] = v
+
+    # Type-coerce known keys to the schema's expected types. A corrupted store
+    # (hand-edit, half-merged write, bad sync) can leave e.g. facts as a STRING
+    # instead of a list — build_system_prompt then does `for f in mem["facts"]`,
+    # iterating it CHARACTER BY CHARACTER into the cloud system prompt (token
+    # bloat / garbage) or KeyErrors on the dict-valued topics/sessions. Reset
+    # any list field that isn't a list to [] so the prompt builder gets sane
+    # input; log once so the corruption isn't silently swallowed.
+    for k in ("facts", "projects", "topics", "sessions"):
+        if not isinstance(mem.get(k), list):
+            print(f"  [legacy_memory] '{k}' was {type(mem.get(k)).__name__}, "
+                  f"not list — resetting to [] (corrupt memory store)")
+            mem[k] = []
+    if not isinstance(mem.get("last_used_phrase_by_intent"), dict):
+        print("  [legacy_memory] 'last_used_phrase_by_intent' was "
+              f"{type(mem.get('last_used_phrase_by_intent')).__name__}, "
+              "not dict — resetting to {} (corrupt memory store)")
+        mem["last_used_phrase_by_intent"] = {}
     return mem
 
 

@@ -53,6 +53,31 @@ _HUD_DIR = os.path.join(
 )
 
 
+class _InlineThread:
+    """A ``threading.Thread`` stand-in whose ``start()`` runs the target
+    synchronously on the calling thread, so a test can drive the async GPU
+    sampler to completion deterministically (no real worker thread to join)."""
+
+    def __init__(self, *, target=None, daemon=None, **_kw):
+        self._target = target
+
+    def start(self):
+        if self._target is not None:
+            self._target()
+
+
+class _NoStartThread:
+    """A ``threading.Thread`` stand-in whose ``start()`` is a no-op — proves the
+    blocking sampler is *offloaded* (never run inline): the worker body, and
+    thus subprocess.run, is not reached on the calling/paint thread."""
+
+    def __init__(self, *, target=None, daemon=None, **_kw):
+        self._target = target
+
+    def start(self):
+        pass
+
+
 def _load_hud_no_pyqt(testcase, filename, mod_name):
     """Load a HUD source from hud/<filename> with PyQt6 import blocked, so the
     module takes its graceful-degrade path (``_HAS_PYQT6`` False, Qt names
@@ -114,16 +139,46 @@ class _HudParseBase(unittest.TestCase):
             json.dump({"pulse_strip": strip}, f)
 
     def _fake_self(self):
-        return types.SimpleNamespace(**{self.UTIL_FIELD: None,
-                                        "_gpu_cached_at": 0.0})
+        """A minimal stand-in for the scene. ``_read_gpu_util`` is now async —
+        on a cache miss it offloads the blocking sample to a worker thread — so
+        the stand-in must carry the ``_gpu_sampling`` guard plus the worker /
+        sampler methods (bound to this object) the read path delegates to."""
+        s = types.SimpleNamespace(**{self.UTIL_FIELD: None,
+                                     "_gpu_cached_at": 0.0,
+                                     "_gpu_sampling": False})
+        s._gpu_sample_worker = types.MethodType(self.cls._gpu_sample_worker, s)
+        s._sample_gpu_util = types.MethodType(self.cls._sample_gpu_util, s)
+        return s
 
     def _read(self, fresh_self=None):
-        """Call _read_gpu_util with nvidia-smi forced absent so the pulse_strip
-        fallback is exercised deterministically (not this box's real GPU)."""
+        """Drive _read_gpu_util with nvidia-smi forced absent (so the pulse_strip
+        fallback is exercised deterministically, not this box's real GPU) and the
+        spawned sampler thread run INLINE, then return the value the worker
+        publishes into the cached utilization field — the value the paint loop
+        reads. Exercises the real read -> spawn -> sample chain end to end."""
         s = fresh_self if fresh_self is not None else self._fake_self()
         with mock.patch.object(self.mod.shutil, "which", return_value=None), \
+                mock.patch.object(self.mod.threading, "Thread", _InlineThread), \
                 mock.patch.object(self.mod.time, "time", return_value=10_000.0):
-            return self.cls._read_gpu_util(s)
+            self.cls._read_gpu_util(s)
+        return getattr(s, self.UTIL_FIELD)
+
+    def test_paint_path_never_calls_nvidia_smi_directly(self):
+        # The core anti-freeze guarantee: a cache-miss read must offload the
+        # blocking nvidia-smi spawn to a background thread, NOT run it inline on
+        # the calling (GUI/paint) thread. With Thread.start a no-op the worker
+        # never runs, so subprocess.run must not be touched by _read_gpu_util.
+        s = self._fake_self()
+        with mock.patch.object(self.mod.time, "time", return_value=10_000.0), \
+                mock.patch.object(self.mod.threading, "Thread",
+                                  side_effect=_NoStartThread) as thread, \
+                mock.patch.object(self.mod.shutil, "which",
+                                  return_value="/usr/bin/nvidia-smi"), \
+                mock.patch.object(self.mod.subprocess, "run") as run:
+            ret = self.cls._read_gpu_util(s)
+        run.assert_not_called()          # never blocks the caller
+        thread.assert_called_once()      # sampling was offloaded to a thread
+        self.assertIsNone(ret)           # returns the (empty) cached value
 
     # ── the producer/consumer token contract ────────────────────────────────
     def test_parses_percent_token_from_pulse_strip(self):

@@ -58,6 +58,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 try:
@@ -187,6 +188,7 @@ class ArcReactorStatusScene(QGraphicsScene):
         self._last_net_at: float | None = None
         # GPU caching to keep nvidia-smi out of the hot path.
         self._gpu_cached_at = 0.0
+        self._gpu_sampling = False   # guards against overlapping sampler threads
 
         if _HAS_PSUTIL:
             try:
@@ -220,12 +222,34 @@ class ArcReactorStatusScene(QGraphicsScene):
 
     # ─── sensor reads ──────────────────────────────────────────────────
     def _read_gpu_util(self) -> float | None:
-        """Best-effort GPU utilization percent (0-100). Caches the result for
-        GPU_CACHE_SECONDS so nvidia-smi isn't respawned every tick."""
+        """Return the cached GPU utilization percent (0-100), never blocking.
+
+        nvidia-smi can stall for up to its 2 s timeout per spawn, so it must not
+        run on the Qt GUI/paint thread. On a cache miss we kick the actual
+        sampling onto a short-lived background thread and immediately return the
+        previously-cached value; the worker writes the fresh reading back when
+        it lands. The displayed value and GPU_CACHE_SECONDS TTL are unchanged —
+        _gpu_cached_at is stamped here (sample start) exactly as before so the
+        refresh cadence stays the same and overlapping spawns are avoided."""
         now = time.time()
         if (now - self._gpu_cached_at) < GPU_CACHE_SECONDS:
             return self.gpu_util_pct
         self._gpu_cached_at = now
+        if not self._gpu_sampling:
+            self._gpu_sampling = True
+            threading.Thread(target=self._gpu_sample_worker, daemon=True).start()
+        return self.gpu_util_pct
+
+    def _gpu_sample_worker(self) -> None:
+        """Background worker: do the blocking nvidia-smi sample and publish the
+        result back to the cached attribute the paint loop reads."""
+        try:
+            self.gpu_util_pct = self._sample_gpu_util()
+        finally:
+            self._gpu_sampling = False
+
+    def _sample_gpu_util(self) -> float | None:
+        """Blocking GPU-utilization sample (runs OFF the GUI thread)."""
         try:
             exe = shutil.which("nvidia-smi")
             if exe:
