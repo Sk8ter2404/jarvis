@@ -334,7 +334,13 @@ def _merge_kinect_presence(presence: dict, now: float) -> None:
     _state["kinect_count"]     = int(presence.get("count", 0) or 0)
     _state["kinect_nearest_m"] = presence.get("nearest_m")
     _state["kinect_facing"]    = presence.get("facing")
-    _state["kinect_at"]        = now
+    # kinect_at gates the 5.0s staleness check in _kinect_presence_note, which
+    # compares against time.monotonic(). `now` here is wall-clock (time.time()),
+    # so stamp this field on the monotonic clock to keep the diff meaningful —
+    # otherwise the diff is hugely negative, never expires, and "the Kinect sees
+    # N people" persists forever after the room empties (P2). The wall-clock
+    # `now` still drives the *_at fields below that feed human "X ago" phrasing.
+    _state["kinect_at"]        = time.monotonic()
     if present:
         _state["kinect_last_present_at"] = now
         # A real skeleton beats the Haar guess: count it as a face sighting so
