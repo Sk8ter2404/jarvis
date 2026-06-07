@@ -447,6 +447,8 @@ class EnsureWhisperTinyTests(unittest.TestCase):
         self.assertIs(self.mod._ensure_whisper_tiny(), sentinel)
 
     def test_faster_whisper_cuda_path(self):
+        # CUDA-first only happens when the GPU gate is opted in.
+        self.mod._loop_cfg["prefer_gpu"] = True
         fw = types.ModuleType("faster_whisper")
         model = object()
         fw.WhisperModel = mock.MagicMock(return_value=model)
@@ -458,6 +460,8 @@ class EnsureWhisperTinyTests(unittest.TestCase):
         self.assertEqual(kwargs.get("device"), "cuda")
 
     def test_faster_whisper_cpu_fallback(self):
+        # With the GPU gate on, a cuda failure falls back to cpu/int8.
+        self.mod._loop_cfg["prefer_gpu"] = True
         fw = types.ModuleType("faster_whisper")
         cpu_model = object()
         calls = {"n": 0}
@@ -472,6 +476,35 @@ class EnsureWhisperTinyTests(unittest.TestCase):
             got = self.mod._ensure_whisper_tiny()
         self.assertIs(got, cpu_model)
         self.assertEqual(calls["n"], 2)   # cuda failed → cpu succeeded
+
+    def test_faster_whisper_cpu_by_default_skips_cuda(self):
+        # The VRAM-stability default (STANDBY_WHISPER_PREFER_GPU False): the
+        # loop must NOT touch CUDA — it loads straight on cpu/int8 in ONE call
+        # so it never competes with the resident local LLM for the 24GB.
+        self.assertFalse(self.mod._loop_cfg.get("prefer_gpu", False))
+        fw = types.ModuleType("faster_whisper")
+        cpu_model = object()
+        calls = []
+
+        def _ctor(name, device=None, compute_type=None):
+            calls.append((device, compute_type))
+            return cpu_model
+        fw.WhisperModel = _ctor
+        with inject_modules(faster_whisper=fw):
+            got = self.mod._ensure_whisper_tiny()
+        self.assertIs(got, cpu_model)
+        self.assertEqual(len(calls), 1)            # no cuda probe at all
+        self.assertEqual(calls[0], ("cpu", "int8"))
+
+    def test_prefer_gpu_flag_restores_cuda_first(self):
+        # Flipping the gate True puts the cuda/float16 attempt back first.
+        self.mod._loop_cfg["prefer_gpu"] = True
+        fw = types.ModuleType("faster_whisper")
+        fw.WhisperModel = mock.MagicMock(return_value=object())
+        with inject_modules(faster_whisper=fw):
+            self.mod._ensure_whisper_tiny()
+        self.assertEqual(fw.WhisperModel.call_args_list[0].kwargs.get("device"),
+                         "cuda")
 
     def test_faster_whisper_both_fail_then_openai(self):
         fw = types.ModuleType("faster_whisper")

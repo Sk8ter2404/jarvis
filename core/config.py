@@ -497,6 +497,19 @@ KINECT_PRESENCE_STANDBY = False
 # KINECT_PRESENCE_WAKE — when True (and presence is enabled), JARVIS clears
 #   standby the moment a person reappears in the Kinect's view. Off by default.
 KINECT_PRESENCE_WAKE = False
+# KINECT_GAZE_ENABLED — when True, the Kinect becomes the PRIMARY "which monitor
+#   am I looking at" signal: the face-tracker skill reads the nearest body's
+#   head/shoulder facing YAW from the Kinect (audio.kinect_bridge.get_head_yaw)
+#   and maps it to a monitor via the MONITORS layout, so which-monitor works with
+#   BOTH WEBCAMS OFF. The legacy two-webcam look_x heuristic stays as a graceful
+#   FALLBACK for when the Kinect has no body in view. Independent of
+#   KINECT_PRESENCE_ENABLED (you can have gaze without the standby/wake
+#   automations), but like every Kinect feature it needs KINECT_ENABLED so the
+#   bridge actually opens the sensor. A sensible built-in yaw→monitor mapping
+#   ships by default; per-desk tuning is optional via the 'calibrate gaze' voice
+#   action (look at each monitor in turn), persisted to a SEPARATE gitignored
+#   data/kinect_gaze_calibration.json — never user_settings.json. Off by default.
+KINECT_GAZE_ENABLED = False
 # KINECT_GESTURES_ENABLED — when True, a background poller reads the Kinect
 #   skeleton stream (~18 Hz) and maps discrete gestures to actions: WAVE wakes
 #   JARVIS from standby, RAISE_HAND confirms a pending confirmation (like saying
@@ -515,6 +528,18 @@ KINECT_GESTURES_ENABLED = False
 #   drives a device in staging/test. See audio/kinect_pointing.py (geometry +
 #   store) + skills/kinect_pointing.py (wiring).
 KINECT_POINT_CONTROL_ENABLED = False
+# KINECT_AIR_MOUSE_ENABLED — when True, "air-mouse": point an OPEN hand at the
+#   screen to move the cursor, CLOSE the hand to RIGHT-click, and hold it closed
+#   to drag (close→open quickly = a right-click; close→move→open = a right-drag).
+#   A background poller (~30 Hz) maps the pointing hand's position within a
+#   calibrated reach-box onto the PRIMARY monitor, heavily EMA-smoothed to fight
+#   jitter, and drives the cursor via win32api (pyautogui fallback). A glowing
+#   JARVIS reticle (hud/jarvis_air_cursor.py) follows the cursor — cyan while
+#   tracking an open hand, gold-locked on grab/drag. Off by default; never runs
+#   in staging/test; a dead-man releases any held button the instant the hand
+#   isn't tracked. See audio/kinect_bridge.get_hand_states() (grip) +
+#   skills/kinect_air_mouse.py (wiring) + hud/jarvis_air_cursor.py (overlay).
+KINECT_AIR_MOUSE_ENABLED = False
 # KINECT_GREET_ON_ENTRY — when True (and presence is enabled), JARVIS speaks a
 #   brief varied greeting when you enter a room that had been empty for a while.
 #   Hard rate-limited (≤ once/min) and skipped mid-conversation. Off by default.
@@ -821,6 +846,14 @@ STANDBY_LOOP_MATCH_WINDOWS        = 3       # consecutive windows to trip (3 × 
 STANDBY_LOOP_ONSET_ENERGY_MIN     = 0.30    # librosa onset_strength mean ≥ this = musical
 STANDBY_LOOP_RHYME_RATIO_MIN      = 0.30    # share of word-pairs sharing 2-char suffix
 STANDBY_LOOP_WHISPER_MODEL        = "tiny"  # whisper model name (kept small for latency)
+# STANDBY_WHISPER_PREFER_GPU — load this loop's whisper-tiny on the GPU first.
+# CPU by default to preserve VRAM for the local LLM: the resident 30B fills
+# almost all of the 24GB, so a CUDA-resident whisper here competes for the last
+# few hundred MB and has contributed to an OOM crash. Left False, the loop loads
+# on CPU (int8 — whisper-tiny is cheap there). Set True only when there's VRAM
+# headroom to opt back into the faster CUDA-first path (float16, frees a CPU
+# core), which falls back to CPU/int8 if the GPU load fails.
+STANDBY_WHISPER_PREFER_GPU        = False
 
 
 # ─── User settings overrides (data/user_settings.json) ─────────────────

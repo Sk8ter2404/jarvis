@@ -66,6 +66,7 @@ _LOOP_DEFAULTS = {
     "onset_min":         0.30,
     "rhyme_min":         0.30,
     "whisper_model":     "tiny",
+    "prefer_gpu":        False,   # CPU by default — keep the 24GB VRAM for the local LLM
 }
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -252,27 +253,39 @@ def _ensure_whisper_tiny():
     Returns the model or None on failure.
 
     GPU: faster-whisper rides ctranslate2's OWN CUDA runtime (NOT torch), so
-    this loop can run on the 3090 even though the rest of the torch stack is
+    this loop CAN run on the 3090 even though the rest of the torch stack is
     CPU-only on Python 3.14. The cublas/cudnn DLLs are already added to PATH at
-    boot by bobert_companion._register_cuda_dll_dirs(). We try CUDA first
-    (float16, ~10x faster + frees a CPU core that face-tracking needs) and fall
-    back to CPU/int8 if the GPU path fails. Flipped from hardcoded CPU in the
-    2026-05-30 GPU audit.
+    boot by bobert_companion._register_cuda_dll_dirs().
+
+    CPU by default to preserve VRAM for the local LLM: the resident 30B already
+    fills almost all of the 24GB, so a CUDA-resident whisper here competes for
+    the last few hundred MB and has contributed to an OOM crash. So this loads
+    on CPU (int8 — light on the desk CPU, whisper-tiny is cheap) by DEFAULT.
+    Opt into the old CUDA-first behaviour (float16, ~10x faster + frees a CPU
+    core) only when there's headroom by setting STANDBY_WHISPER_PREFER_GPU =
+    True in core/config — then we try CUDA first and fall back to CPU/int8 if
+    the GPU path fails. (The 2026-05-30 GPU audit had flipped this to CUDA-first
+    unconditionally; gated back behind the flag after the VRAM-pressure crash.)
     """
     if _whisper_model[0] is not None:
         return _whisper_model[0]
     model_name = _loop_cfg.get("whisper_model", "tiny")
+    prefer_gpu = bool(_loop_cfg.get("prefer_gpu", False))
     try:
         from faster_whisper import WhisperModel as _FWM
-        # Try GPU first — same ctranslate2 CUDA path the main STT uses.
-        try:
-            _whisper_model[0] = _FWM(model_name, device="cuda", compute_type="float16")
-            print(f"  [standby-loop] faster-whisper '{model_name}' ready on cuda")
-            return _whisper_model[0]
-        except Exception as e_gpu:
-            print(f"  [standby-loop] faster-whisper cuda load failed "
-                  f"({type(e_gpu).__name__}); falling back to cpu/int8")
-        # CPU fallback — int8 keeps it light on the desk CPU.
+        # GPU only when explicitly opted in — otherwise skip straight to CPU so
+        # we never grab VRAM the local LLM needs (same ctranslate2 CUDA path the
+        # main STT uses).
+        if prefer_gpu:
+            try:
+                _whisper_model[0] = _FWM(model_name, device="cuda", compute_type="float16")
+                print(f"  [standby-loop] faster-whisper '{model_name}' ready on cuda")
+                return _whisper_model[0]
+            except Exception as e_gpu:
+                print(f"  [standby-loop] faster-whisper cuda load failed "
+                      f"({type(e_gpu).__name__}); falling back to cpu/int8")
+        # CPU path — int8 keeps it light on the desk CPU. This is the DEFAULT
+        # (STANDBY_WHISPER_PREFER_GPU is False) so VRAM stays free for the LLM.
         try:
             _whisper_model[0] = _FWM(model_name, device="cpu", compute_type="int8")
             print(f"  [standby-loop] faster-whisper '{model_name}' ready on cpu")
@@ -486,6 +499,7 @@ def _load_loop_cfg() -> None:
         "onset_min":      "STANDBY_LOOP_ONSET_ENERGY_MIN",
         "rhyme_min":      "STANDBY_LOOP_RHYME_RATIO_MIN",
         "whisper_model":  "STANDBY_LOOP_WHISPER_MODEL",
+        "prefer_gpu":     "STANDBY_WHISPER_PREFER_GPU",
     }
     for k, attr in mapping.items():
         if hasattr(_cfg, attr):

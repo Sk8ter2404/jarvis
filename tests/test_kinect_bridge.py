@@ -47,8 +47,14 @@ class _FakeJoint:
 
 
 class _FakeBody:
-    """A tracked/untracked body whose .joints is indexable 0.._JOINT_COUNT-1."""
-    def __init__(self, tracked, joints=None):
+    """A tracked/untracked body whose .joints is indexable 0.._JOINT_COUNT-1.
+
+    hand_right_state / hand_left_state mirror the Kinect ints the real
+    PyKinectRuntime sets on each body (0 Unknown,1 NotTracked,2 Open,3 Closed,
+    4 Lasso). Optional so existing tests (which don't set them) still get the
+    bridge's "unknown" degrade via getattr."""
+    def __init__(self, tracked, joints=None, hand_right_state=None,
+                 hand_left_state=None):
         self.is_tracked = tracked
         # Default: a plausible upright, facing skeleton ~2 m away.
         if joints is None:
@@ -65,6 +71,13 @@ class _FakeBody:
                 z = 2.0
             full.append(_FakeJoint(x, y, z))
         self.joints = full
+        # Only attach the hand-state attrs when explicitly provided, so the
+        # "absent attribute → unknown" degrade path is still exercised by the
+        # tests that omit them.
+        if hand_right_state is not None:
+            self.hand_right_state = hand_right_state
+        if hand_left_state is not None:
+            self.hand_left_state = hand_left_state
 
 
 class _FakeBodyFrame:
@@ -410,6 +423,156 @@ class PresenceTests(_BridgeBase):
         })
         _patch_loader(self, _FakeRuntime(bodies=[body]))
         self.assertFalse(kb.get_presence()["facing"])
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# hand states (the air-mouse keystone accessor)
+# ─────────────────────────────────────────────────────────────────────────
+class HandStateTests(_BridgeBase):
+    def test_state_name_maps_enum(self):
+        # 0/1 → unknown, 2 → open, 3 → closed, 4 → lasso; junk → unknown.
+        self.assertEqual(kb._hand_state_name(0), "unknown")
+        self.assertEqual(kb._hand_state_name(1), "unknown")  # NotTracked
+        self.assertEqual(kb._hand_state_name(2), "open")
+        self.assertEqual(kb._hand_state_name(3), "closed")
+        self.assertEqual(kb._hand_state_name(4), "lasso")
+        self.assertEqual(kb._hand_state_name(None), "unknown")
+        self.assertEqual(kb._hand_state_name("x"), "unknown")
+
+    def test_get_bodies_carries_hand_states(self):
+        body = _FakeBody(True, {"head": (0, 0.6, 1.8)},
+                         hand_right_state=3, hand_left_state=2)
+        _patch_loader(self, _FakeRuntime(bodies=[body]))
+        got = kb.get_bodies()
+        self.assertEqual(got[0]["hand_right"], "closed")
+        self.assertEqual(got[0]["hand_left"], "open")
+
+    def test_get_bodies_hand_state_defaults_unknown_when_absent(self):
+        # A body without the attrs (older build) degrades to "unknown".
+        body = _FakeBody(True, {"head": (0, 0.6, 1.8)})
+        _patch_loader(self, _FakeRuntime(bodies=[body]))
+        got = kb.get_bodies()
+        self.assertEqual(got[0]["hand_right"], "unknown")
+        self.assertEqual(got[0]["hand_left"], "unknown")
+
+    def test_get_hand_states_nearest_body(self):
+        # Two bodies at different depths; the nearer (1.5 m) wins.
+        near = _FakeBody(True, {"head": (0, 0.6, 1.5),
+                                "spine_shoulder": (0, 0.0, 1.5)},
+                         hand_right_state=2, hand_left_state=3)
+        far = _FakeBody(True, {"head": (0, 0.6, 3.0),
+                               "spine_shoulder": (0, 0.0, 3.0)},
+                        hand_right_state=3, hand_left_state=2)
+        _patch_loader(self, _FakeRuntime(bodies=[far, near]))
+        states = kb.get_hand_states()
+        self.assertTrue(states["tracked"])
+        self.assertEqual(states["right"], "open")    # the NEAR body's right
+        self.assertEqual(states["left"], "closed")
+        self.assertIn("ts", states)
+
+    def test_get_hand_states_unknown_when_no_sensor(self):
+        kb.set_enabled(False)
+        states = kb.get_hand_states()
+        self.assertFalse(states["tracked"])
+        self.assertEqual(states["right"], "unknown")
+        self.assertEqual(states["left"], "unknown")
+
+    def test_get_hand_states_unknown_when_no_body(self):
+        _patch_loader(self, _FakeRuntime(bodies=[_FakeBody(False)] * 6))
+        states = kb.get_hand_states()
+        self.assertFalse(states["tracked"])
+        self.assertEqual(states["right"], "unknown")
+
+    def test_get_hand_states_swallows_get_bodies_error(self):
+        _patch_loader(self, _FakeRuntime(bodies=[_FakeBody(True)]))
+        with mock.patch.object(kb, "get_bodies",
+                               side_effect=RuntimeError("frame glitch")):
+            states = kb.get_hand_states()
+        self.assertFalse(states["tracked"])
+        self.assertEqual(states["right"], "unknown")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# head-facing yaw (joint-derived gaze; the Kinect v2 Face API is absent on
+# this pykinect2 build, so facing is recovered from the shoulder line)
+# ─────────────────────────────────────────────────────────────────────────
+class HeadYawTests(_BridgeBase):
+    # Raw joints handed straight to _body_facing_yaw are (x, y, z, state) — the
+    # same shape get_bodies() produces — so the tracked-state gate (>=1) passes.
+    def _square(self):
+        return {"shoulder_left": (-0.2, 0.4, 2.0, 2), "shoulder_right": (0.2, 0.4, 2.0, 2),
+                "head": (0.0, 0.6, 2.0, 2)}
+
+    def _turn_sensor_right(self):
+        # Looking at a monitor on the sensor's RIGHT: LEFT shoulder forward
+        # (smaller z), RIGHT shoulder back (larger z), head shifted +x.
+        return {"shoulder_left": (-0.18, 0.4, 1.85, 2),
+                "shoulder_right": (0.18, 0.4, 2.15, 2), "head": (0.12, 0.6, 2.0, 2)}
+
+    def _turn_sensor_left(self):
+        return {"shoulder_left": (-0.18, 0.4, 2.15, 2),
+                "shoulder_right": (0.18, 0.4, 1.85, 2), "head": (-0.12, 0.6, 2.0, 2)}
+
+    def test_facing_yaw_zero_when_square(self):
+        yaw = kb._body_facing_yaw(self._square())
+        self.assertIsNotNone(yaw)
+        self.assertLess(abs(yaw), 3.0)   # ~0°
+
+    def test_facing_yaw_positive_when_turned_sensor_right(self):
+        self.assertGreater(kb._body_facing_yaw(self._turn_sensor_right()), 8.0)
+
+    def test_facing_yaw_negative_when_turned_sensor_left(self):
+        self.assertLess(kb._body_facing_yaw(self._turn_sensor_left()), -8.0)
+
+    def test_facing_yaw_none_without_shoulders(self):
+        # No shoulders and no head → can't estimate.
+        self.assertIsNone(kb._body_facing_yaw({"spine_mid": (0, 0, 2.0, 2)}))
+
+    def test_facing_yaw_ignores_untracked_shoulders(self):
+        # Shoulders present but NotTracked (state 0) → no shoulder yaw; with no
+        # other usable joint the estimate is None.
+        joints = {"shoulder_left": (-0.2, 0.4, 1.8, 0),
+                  "shoulder_right": (0.2, 0.4, 2.2, 0)}
+        self.assertIsNone(kb._body_facing_yaw(joints))
+
+    def test_get_presence_includes_nearest_head_yaw(self):
+        # Two bodies; the NEAREST (1.5 m, turned right) supplies head_yaw_deg.
+        near = _FakeBody(True, {
+            "head": (0.12, 0.6, 1.5), "spine_shoulder": (0, 0.0, 1.5),
+            "shoulder_left": (-0.18, 0.4, 1.42), "shoulder_right": (0.18, 0.4, 1.58)})
+        far = _FakeBody(True, {
+            "head": (0, 0.6, 3.0), "spine_shoulder": (0, 0.0, 3.0),
+            "shoulder_left": (-0.2, 0.4, 3.0), "shoulder_right": (0.2, 0.4, 3.0)})
+        _patch_loader(self, _FakeRuntime(bodies=[far, near, _FakeBody(False),
+                                                 _FakeBody(False), _FakeBody(False),
+                                                 _FakeBody(False)]))
+        pres = kb.get_presence()
+        self.assertEqual(pres["nearest_m"], 1.5)
+        self.assertIsNotNone(pres["head_yaw_deg"])
+        self.assertGreater(pres["head_yaw_deg"], 0.0)   # nearest is turned right
+
+    def test_get_head_yaw_returns_nearest(self):
+        body = _FakeBody(True, {
+            "head": (0.12, 0.6, 1.5), "spine_shoulder": (0, 0.0, 1.5),
+            "shoulder_left": (-0.18, 0.4, 1.42), "shoulder_right": (0.18, 0.4, 1.58)})
+        _patch_loader(self, _FakeRuntime(bodies=[body, _FakeBody(False),
+                                                 _FakeBody(False), _FakeBody(False),
+                                                 _FakeBody(False), _FakeBody(False)]))
+        yaw = kb.get_head_yaw()
+        self.assertIsNotNone(yaw)
+        self.assertGreater(yaw, 0.0)
+
+    def test_get_head_yaw_none_when_disabled(self):
+        kb.set_enabled(False)
+        self.assertIsNone(kb.get_head_yaw())
+
+    def test_get_head_yaw_none_when_no_body(self):
+        _patch_loader(self, _FakeRuntime(bodies=[_FakeBody(False)] * 6))
+        self.assertIsNone(kb.get_head_yaw())
+
+    def test_get_presence_head_yaw_none_when_no_body(self):
+        _patch_loader(self, _FakeRuntime(bodies=[_FakeBody(False)] * 6))
+        self.assertIsNone(kb.get_presence()["head_yaw_deg"])
 
 
 # ─────────────────────────────────────────────────────────────────────────

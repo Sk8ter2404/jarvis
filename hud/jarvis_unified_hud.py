@@ -75,6 +75,13 @@ except ImportError:
 
 
 TICK_MS = 500                 # cheap data refresh + repaint cadence
+# The camera-preview tile gets its OWN faster cadence, decoupled from the 500 ms
+# state poll, so the live mirror looks smooth instead of stepping at 2 fps. Only
+# the preview JPEG is re-read + the widget repainted on this tick (and only when
+# the frame actually changed — see _refresh_camera_preview's return value), so
+# the rest of the HUD state stays on the cheap TICK_MS loop. 75 ms ≈ 13.3 fps,
+# comfortably above the writer's ~0.15 s (~6-7 fps) cadence so we never starve it.
+CAMERA_TICK_MS = 75           # camera-preview-only refresh cadence (~13 fps)
 SLOW_REFRESH_S = 600.0        # weather/calendar refresh cadence (background)
 GPU_CACHE_SECONDS = 1.0       # utilization swings 0→100→0 fast; a long cache aliases it
 
@@ -334,6 +341,16 @@ class UnifiedHud(QWidget):
         self.timer.timeout.connect(self._on_tick)
         self.timer.start()
 
+        # Dedicated fast tick for JUST the camera-preview tile, so the live
+        # mirror is smooth without dragging the whole HUD up to 13 fps. It only
+        # re-reads the preview JPEG (decode skipped unless its mtime changed) and
+        # repaints when the frame actually changed — the rest of the HUD state
+        # stays on the cheap TICK_MS loop above.
+        self.cam_timer = QTimer(self)
+        self.cam_timer.setInterval(CAMERA_TICK_MS)
+        self.cam_timer.timeout.connect(self._on_camera_tick)
+        self.cam_timer.start()
+
         self._reposition_chrome()
 
     # ── data refresh ────────────────────────────────────────────────────────
@@ -394,30 +411,39 @@ class UnifiedHud(QWidget):
         except Exception:
             return 0.0
 
-    def _refresh_camera_preview(self) -> None:
+    def _refresh_camera_preview(self) -> bool:
         """Load the live camera-preview JPEG into self.cam_preview, but only when
         it is fresh AND newer than what we last decoded (so a static frame isn't
-        re-loaded every 500 ms tick). A stale/absent file clears the pixmap so
-        the corner falls back to the 'camera off' placeholder."""
+        re-decoded every camera tick). A stale/absent file clears the pixmap so
+        the corner falls back to the 'camera off' placeholder.
+
+        Returns True iff what the tile shows changed (a new frame was decoded, or
+        a previously-shown frame was cleared to the placeholder) — the fast
+        camera tick uses this to repaint ONLY when there is something new, so an
+        idle/off camera costs a stat() per tick and no repaint. The expensive
+        JPEG decode is skipped whenever the file's mtime is unchanged."""
         now = time.time()
         if not _camera_preview_fresh_at(now):
+            had = self.cam_preview is not None
             self.cam_preview = None
             self._cam_preview_mtime = 0.0
-            return
+            return had   # changed only if we were showing a frame before
         try:
             mtime = os.path.getmtime(CAMERA_PREVIEW_FILE)
         except OSError:
+            had = self.cam_preview is not None
             self.cam_preview = None
-            return
+            return had
         if self.cam_preview is not None and mtime <= self._cam_preview_mtime:
-            return   # already showing this frame
+            return False   # already showing this frame → skip decode + repaint
         pm = QPixmap(CAMERA_PREVIEW_FILE)
         if pm.isNull():
             # A half-written file (the writer uses atomic replace, so this is
             # rare) — keep the previous frame and retry next tick.
-            return
+            return False
         self.cam_preview = pm
         self._cam_preview_mtime = mtime
+        return True
 
     def _refresh(self) -> bool:
         if not _is_parent_alive(self.parent_pid) or _control_says_off():
@@ -490,6 +516,17 @@ class UnifiedHud(QWidget):
             self.hide()
             return
         if self.isVisible():
+            self.update()
+
+    def _on_camera_tick(self) -> None:
+        """Fast (~CAMERA_TICK_MS) tick for the camera-preview tile only. Re-reads
+        the preview JPEG (the decode is skipped unless its mtime changed) and
+        repaints ONLY when the displayed frame actually changed, so a live camera
+        animates smoothly while an idle/off one costs a single stat() per tick and
+        no repaint. Visibility is owned by _on_tick; we never show/hide here, and
+        we skip the repaint entirely while the HUD is hidden."""
+        changed = self._refresh_camera_preview()
+        if changed and self.isVisible():
             self.update()
 
     # ── colour helpers ───────────────────────────────────────────────────────
