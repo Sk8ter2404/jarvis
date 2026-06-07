@@ -80,7 +80,13 @@ def _is_parent_alive(pid: int) -> bool:
     if pid <= 0:
         return True
     if _HAS_PSUTIL:
-        return psutil.pid_exists(pid)
+        # pid_exists can raise on Windows for a transient handle/permission
+        # error; treat an unknowable parent as alive so a hiccup can't freeze
+        # the overlay (matches the PyQt HUDs' guard).
+        try:
+            return psutil.pid_exists(pid)
+        except Exception:
+            return True
     try:
         os.kill(pid, 0)
         return True
@@ -124,6 +130,7 @@ class WorkshopCanvas:
     def __init__(self, x: int, y: int, width: int, height: int,
                  parent_pid: int, mode: str = "on"):
         self.parent_pid = parent_pid
+        self._closing = False
         self.x, self.y = x, y
         self.w, self.h = width, height
         self.frame = 0
@@ -182,6 +189,7 @@ class WorkshopCanvas:
         self.tick()
 
     def _on_close(self):
+        self._closing = True
         try:
             self.root.destroy()
         except Exception:
@@ -262,6 +270,23 @@ class WorkshopCanvas:
 
     # ─── main paint ─────────────────────────────────────────────────────
     def tick(self):
+        # Wrapper: render in a guarded body and ALWAYS reschedule in finally
+        # (unless we're closing) so one bad value or transient error can't
+        # leave the overlay frozen on a stale frame.
+        if getattr(self, "_closing", False):
+            return
+        try:
+            self._tick_body()
+        except Exception:
+            pass
+        finally:
+            if not getattr(self, "_closing", False):
+                try:
+                    self.root.after(TICK_MS, self.tick)
+                except Exception:
+                    pass
+
+    def _tick_body(self):
         if not _is_parent_alive(self.parent_pid):
             self._on_close()
             return
@@ -279,8 +304,16 @@ class WorkshopCanvas:
             return
 
         jarvis_state = (state.get("state") or "Idle").lower()
-        tts_amp      = float(state.get("tts_amplitude", 0.0) or 0.0)
-        mic_level    = float(state.get("mic_level", 0.0) or 0.0)
+        # Guard the float parses so a non-numeric value can't escape this
+        # Tkinter callback and prevent the after() reschedule from running.
+        try:
+            tts_amp  = float(state.get("tts_amplitude", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            tts_amp = 0.0
+        try:
+            mic_level = float(state.get("mic_level", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            mic_level = 0.0
 
         # Smooth amp/mic so the pulse breathes instead of jittering.
         self.last_amp = 0.55 * self.last_amp + 0.45 * max(0.0, min(1.0, tts_amp))
@@ -401,9 +434,10 @@ class WorkshopCanvas:
             font=("Consolas", 8, "bold"),
         )
 
-        # ── schedule next frame ──
+        # ── advance frame counter ──
+        # Rescheduling is handled by the tick() wrapper's finally so it runs
+        # even if this body raised partway through the render.
         self.frame += 1
-        self.root.after(TICK_MS, self.tick)
 
     def run(self):
         try:

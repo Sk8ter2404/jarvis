@@ -91,6 +91,17 @@ PANEL_DARK   = QColor(4, 8, 13, 200)     # translucent
 
 PROJECT_DIR     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HUD_STATE_FILE  = os.path.join(PROJECT_DIR, "hud_state.json")
+# Dedicated control file (never hud_state.json — that's the main process's
+# canonical snapshot). The launcher / any skill can write {"mode":"off"} here
+# to dismiss this overlay. This is the escape hatch for a click-through,
+# frameless window that otherwise has no dismiss gesture.
+CONTROL_FILE    = os.path.join(PROJECT_DIR, "holographic_hud_v2_state.json")
+# When launched with no real parent (--parent-pid 0/absent) the overlay would
+# otherwise stay up forever (it's click-through, so the user can't even close
+# it). Self-exit after this many seconds with no parent so it can never become
+# an unkillable fullscreen layer. The launcher always passes a real PID, so a
+# correctly-supervised HUD is never affected by this cap.
+ORPHAN_MAX_LIFETIME_S = 1800.0  # 30 min
 
 
 def _is_parent_alive(pid: int) -> bool:
@@ -116,6 +127,16 @@ def _read_json(path: str) -> dict:
             return json.load(f)
     except Exception:
         return {}
+
+
+def _control_says_off() -> bool:
+    """True when the dedicated control file requests dismissal.
+
+    Reads a *separate* file (never hud_state.json) so a skill can hide this
+    overlay without racing the main process's continuous rewrites of the
+    canonical snapshot."""
+    data = _read_json(CONTROL_FILE)
+    return (data.get("mode") or "").lower() == "off"
 
 
 class ArcReactorScene(QGraphicsScene):
@@ -150,6 +171,7 @@ class ArcReactorScene(QGraphicsScene):
         self.intent_tag   = ""
         self.transcripts: deque[str] = deque(maxlen=5)
         self.last_spoken  = ""
+        self._started_at  = time.time()
 
         if _HAS_PSUTIL:
             try:
@@ -161,10 +183,20 @@ class ArcReactorScene(QGraphicsScene):
 
     # ─── data refresh (called by the QTimer) ────────────────────────────
     def refresh_data(self) -> bool:
-        """Pull the latest state + sensor readings. Returns False when
-        the parent JARVIS process has died so the timer can stop and the
-        window can close."""
+        """Pull the latest state + sensor readings. Returns False when the
+        overlay should close: the parent JARVIS process has died, the control
+        file asked it to hide, or an orphaned (no-parent) overlay has exceeded
+        its max lifetime. The timer stops and the window closes on False."""
         if not _is_parent_alive(self.parent_pid):
+            return False
+        # Dismissable even though the window is click-through: a skill can
+        # write {"mode":"off"} to the control file.
+        if _control_says_off():
+            return False
+        # Safety net for --parent-pid 0/absent: without a real parent to track,
+        # the overlay would otherwise be unkillable except via Task Manager.
+        if self.parent_pid <= 0 and (
+                time.time() - self._started_at) > ORPHAN_MAX_LIFETIME_S:
             return False
 
         state = _read_json(HUD_STATE_FILE)
@@ -172,8 +204,19 @@ class ArcReactorScene(QGraphicsScene):
         self.active_action = (state.get("active_action") or "").strip()
         self.recent_action = (state.get("recent_action") or "").strip()
         self.intent_tag    = (state.get("last_intent_tag") or "").strip()
-        self.tts_amp       = float(state.get("tts_amplitude") or 0.0)
-        self.mic_level     = float(state.get("mic_level") or 0.0)
+        # Guard the float parses — a non-numeric value in the shared state
+        # file must not raise inside the QTimer slot (an unhandled exception
+        # there can abort the Qt event loop and kill the overlay). Mirror the
+        # try/except used by the sibling PyQt HUDs; a bad value degrades to
+        # the last-known channel value rather than crashing.
+        try:
+            self.tts_amp   = float(state.get("tts_amplitude") or 0.0)
+        except (TypeError, ValueError):
+            pass
+        try:
+            self.mic_level = float(state.get("mic_level") or 0.0)
+        except (TypeError, ValueError):
+            pass
         self.last_spoken   = (state.get("last_spoken") or "").strip()
 
         history = state.get("transcript_history") or []
@@ -468,10 +511,32 @@ class HoloHUDV2Window(QWidget):
     def _on_tick(self) -> None:
         alive = self.scene.refresh_data()
         if not alive:
-            # Parent JARVIS died — close ourselves so the subprocess
-            # exits cleanly.
+            # Parent JARVIS died, the control file flipped to "off", or an
+            # orphaned overlay hit its lifetime cap — close ourselves so the
+            # subprocess exits cleanly.
+            self._quit()
+
+    def _quit(self) -> None:
+        try:
             self.timer.stop()
-            QApplication.instance().quit()
+        except Exception:
+            pass
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    def keyPressEvent(self, event) -> None:
+        # Keyboard escape hatch: the window is click-through (mouse events pass
+        # straight through), so a key is the only in-window dismiss gesture.
+        # Esc or Q closes the overlay if it ever holds focus.
+        try:
+            key = event.key()
+            if key in (Qt.Key.Key_Escape, Qt.Key.Key_Q):
+                self._quit()
+                return
+        except Exception:
+            pass
+        super().keyPressEvent(event)
 
 
 def _print_install_hint() -> None:

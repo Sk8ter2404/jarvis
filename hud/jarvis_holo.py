@@ -101,7 +101,13 @@ def _is_parent_alive(pid: int) -> bool:
     if pid <= 0:
         return True
     if _HAS_PSUTIL:
-        return psutil.pid_exists(pid)
+        # On Windows pid_exists can raise on a transient handle/permission
+        # error. Treat an unknowable parent as alive so a momentary hiccup
+        # never tears down the overlay (matches the PyQt HUDs' guard).
+        try:
+            return psutil.pid_exists(pid)
+        except Exception:
+            return True
     try:
         os.kill(pid, 0)
         return True
@@ -151,6 +157,7 @@ def _fmt_rate(bytes_per_sec: float) -> str:
 class HoloHUD:
     def __init__(self, x: int, y: int, width: int, height: int, parent_pid: int):
         self.parent_pid = parent_pid
+        self._closing   = False
         self.frame      = 0
         self.x, self.y = x, y
         self.w, self.h = width, height
@@ -228,6 +235,7 @@ class HoloHUD:
         self.tick()
 
     def _on_close(self):
+        self._closing = True
         try:
             self.root.destroy()
         except Exception:
@@ -333,6 +341,23 @@ class HoloHUD:
 
     # ─── main paint ─────────────────────────────────────────────────────
     def tick(self):
+        # Wrapper: render in a guarded body and ALWAYS reschedule in finally
+        # (unless we're closing) so a single bad value or transient error can
+        # never strand this full-screen overlay on a frozen frame.
+        if getattr(self, "_closing", False):
+            return
+        try:
+            self._tick_body()
+        except Exception:
+            pass
+        finally:
+            if not getattr(self, "_closing", False):
+                try:
+                    self.root.after(TICK_MS, self.tick)
+                except Exception:
+                    pass
+
+    def _tick_body(self):
         if not _is_parent_alive(self.parent_pid):
             self._on_close()
             return
@@ -345,14 +370,27 @@ class HoloHUD:
         now_doing       = state.get("now_doing", "") or ""
         last_transcript = state.get("last_transcript", "") or ""
         last_spoken     = state.get("last_spoken", "") or ""
-        mic_level       = float(state.get("mic_level", 0.0) or 0.0)
-        tts_amp         = float(state.get("tts_amplitude", 0.0) or 0.0)
+        # Guard the float parses: a non-numeric value in the shared state file
+        # must not raise out of this Tkinter callback. If it did, the
+        # `after()` reschedule at the end of tick() would never run and the
+        # full-screen overlay would freeze permanently. Bad value -> 0.0.
+        try:
+            mic_level   = float(state.get("mic_level", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            mic_level = 0.0
+        try:
+            tts_amp     = float(state.get("tts_amplitude", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            tts_amp = 0.0
 
         # Night-owl mode dims the overlay. 0.0 / missing == normal opacity;
         # any positive value < 1 dims the window. Applied to the root via
         # -alpha so the whole reactor (including the click-through keyed
         # pixels) softens past midnight. Only restated when it changes.
-        night_owl_dim = float(state.get("night_owl_dim", 0.0) or 0.0)
+        try:
+            night_owl_dim = float(state.get("night_owl_dim", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            night_owl_dim = 0.0
         if 0.0 < night_owl_dim < 1.0:
             target_alpha = night_owl_dim
         else:
@@ -660,9 +698,9 @@ class HoloHUD:
             color=DIM_TEXT, size=9,
         )
 
-        # Schedule next frame
+        # Advance the frame counter. Rescheduling is handled by the tick()
+        # wrapper's finally so it runs even if this body raised.
         self.frame += 1
-        self.root.after(TICK_MS, self.tick)
 
     def run(self):
         try:
