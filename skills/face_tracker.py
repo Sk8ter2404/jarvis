@@ -1311,8 +1311,12 @@ def gaze_stats(_: str = "") -> str:
     snap = _snapshot_state()
     now = time.time()
 
-    # Close out the current run so totals reflect "right now"
-    totals = dict(_dwell_total)
+    # Close out the current run so totals reflect "right now". Copy _dwell_total
+    # under _state_lock: the poller inserts into it (via _commit_state) while
+    # holding that lock, and an unlocked dict() copy racing a concurrent insert
+    # raises "RuntimeError: dictionary changed size during iteration" (P2).
+    with _state_lock:
+        totals = dict(_dwell_total)
     if snap["current_monitor"] and snap["current_monitor"] != "away" and snap["monitor_since"]:
         run = max(0.0, now - snap["monitor_since"])
         totals[snap["current_monitor"]] = totals.get(snap["current_monitor"], 0.0) + run
