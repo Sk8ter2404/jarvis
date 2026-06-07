@@ -546,27 +546,22 @@ class ForgetLastHourTests(unittest.TestCase):
         return bc
 
     def test_drops_recent_topics_and_sessions(self):
-        # Freeze time so the cutoff is deterministic. now = 2026-06-01 12:00.
-        fixed = 1_000_000.0
+        # Freeze "now"; entries carry a numeric ts (epoch). now = 1_000_000.0,
+        # so the last-hour window is (996400.0, now].
+        now = 1_000_000.0
         mem = {
             "topics": [
-                {"date": "2026-06-01 11:50"},   # within last hour -> dropped
-                {"date": "2026-01-01 09:00"},   # old -> kept
+                {"date": "2026-06-01", "ts": now - 1800},   # 30 min ago -> dropped
+                {"date": "2026-01-01", "ts": now - 86400},  # a day ago  -> kept
             ],
             "sessions": [
-                {"date": "2026-06-01 11:30"},   # dropped
+                {"date": "2026-06-01", "ts": now - 600},    # 10 min ago -> dropped
             ],
             "facts": ["durable"],
         }
         bc = self._bc(mem)
-        # cutoff string is strftime of now-3600; pin both.
         with _patch_bc(bc), \
-                mock.patch.object(A.time, "time", return_value=fixed), \
-                mock.patch.object(A.time, "localtime",
-                                  return_value=__import__("time").struct_time(
-                                      (2026, 6, 1, 11, 0, 0, 0, 152, -1))), \
-                mock.patch.object(A.time, "strftime",
-                                  return_value="2026-06-01 11:00"):
+                mock.patch.object(A.time, "time", return_value=now):
             out = A._act_forget_last_hour()
         self.assertEqual(out, "forgot 2 item(s) from the last hour")
         saved = bc.save_memory.call_args[0][0]
@@ -575,14 +570,47 @@ class ForgetLastHourTests(unittest.TestCase):
         # Facts untouched.
         self.assertEqual(saved["facts"], ["durable"])
 
-    def test_nothing_recent(self):
-        mem = {"topics": [{"date": "2020-01-01 00:00"}], "sessions": []}
+    def test_thirty_min_dropped_two_hours_kept(self):
+        # Regression for the date-only-vs-datetime lexical-compare bug: a
+        # same-day entry from 30 min ago MUST be forgotten, while one from 2 h
+        # ago MUST survive. The pre-fix code stored date-only ("%Y-%m-%d") and
+        # compared lexically against a datetime cutoff, so it could never drop
+        # a today entry.
+        now = 1_700_000_000.0
+        mem = {
+            "topics": [
+                {"date": "2026-06-07", "ts": now - 1800},   # 30 min ago -> forgotten
+                {"date": "2026-06-07", "ts": now - 7200},   # 2 h ago    -> kept
+            ],
+            "sessions": [],
+        }
         bc = self._bc(mem)
         with _patch_bc(bc), \
-                mock.patch.object(A.time, "strftime",
-                                  return_value="2026-06-01 11:00"), \
-                mock.patch.object(A.time, "localtime"), \
-                mock.patch.object(A.time, "time", return_value=0.0):
+                mock.patch.object(A.time, "time", return_value=now):
+            out = A._act_forget_last_hour()
+        self.assertEqual(out, "forgot 1 item(s) from the last hour")
+        saved = bc.save_memory.call_args[0][0]
+        self.assertEqual([t["ts"] for t in saved["topics"]], [now - 7200])
+
+    def test_legacy_entry_without_ts_is_kept(self):
+        # Entries written before the ts field default to ts=0.0 -> treated as
+        # old -> never force-forgotten. Non-destructive for pre-fix memory.
+        now = 1_700_000_000.0
+        mem = {"topics": [{"date": "2020-01-01"}], "sessions": []}
+        bc = self._bc(mem)
+        with _patch_bc(bc), \
+                mock.patch.object(A.time, "time", return_value=now):
+            out = A._act_forget_last_hour()
+        self.assertEqual(out, "nothing recent enough to forget")
+        bc.save_memory.assert_not_called()
+
+    def test_nothing_recent(self):
+        now = 1_700_000_000.0
+        mem = {"topics": [{"date": "2020-01-01", "ts": now - 99999}],
+               "sessions": []}
+        bc = self._bc(mem)
+        with _patch_bc(bc), \
+                mock.patch.object(A.time, "time", return_value=now):
             out = A._act_forget_last_hour()
         self.assertEqual(out, "nothing recent enough to forget")
         bc.save_memory.assert_not_called()

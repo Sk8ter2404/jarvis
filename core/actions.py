@@ -1381,6 +1381,16 @@ def _act_test_each_skill(_: str = "") -> str:
 
 # ─── Memory forget + LLM latency benchmark (Phase 4G) ──────────────────
 
+def _entry_ts(entry: dict) -> float:
+    """Numeric epoch ts of a topic/session entry, or 0.0 if absent/garbage.
+    Defaulting to 0.0 means legacy entries written before the ts field are
+    treated as old and thus survive a 'forget the last hour'."""
+    try:
+        return float(entry.get("ts", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _act_forget_last_hour(_: str = "") -> str:
     """Drop topics/sessions whose timestamp falls in the last hour.
     Facts/projects are intentionally NOT touched — those are durable
@@ -1388,16 +1398,21 @@ def _act_forget_last_hour(_: str = "") -> str:
     race with learn_from_turn."""
     bc = _bc()
     try:
-        cutoff_iso = time.strftime("%Y-%m-%d %H:%M",
-                                   time.localtime(time.time() - 3600))
+        # Numeric epoch cutoff. Entries carry a float ts=time.time() written
+        # at learn time; the old "%Y-%m-%d" date string compared lexically
+        # against a datetime cutoff and so could NEVER drop a same-day entry
+        # (a date-only prefix always sorts before "<date> HH:MM"). Keep only
+        # entries strictly OLDER than one hour; anything within the window is
+        # forgotten. Missing/legacy ts defaults to 0 -> treated as old -> kept.
+        cutoff = time.time() - 3600
         with bc._memory_lock:
             mem = bc.load_memory()
             old_topics  = list(mem.get("topics") or [])
             old_sessions = list(mem.get("sessions") or [])
             kept_topics  = [t for t in old_topics
-                            if str(t.get("date", "")) < cutoff_iso]
+                            if _entry_ts(t) < cutoff]
             kept_sessions = [s for s in old_sessions
-                             if str(s.get("date", "")) < cutoff_iso]
+                             if _entry_ts(s) < cutoff]
             removed = (len(old_topics) - len(kept_topics)
                        + len(old_sessions) - len(kept_sessions))
             if removed == 0:
