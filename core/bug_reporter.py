@@ -14,6 +14,14 @@ scrubber is deliberately conservative (it over-redacts rather than risk a leak):
 home-dir/usernames, emails, IPv4 addresses, API-key/token shapes, and
 env-style ``NAME = secret`` values all go before anything is persisted.
 
+It ALSO applies the very patterns the public-repo PII gate enforces
+(``tools/check_no_pii.py`` HARD+WARN, which on the owner's box load the
+gitignored ``tools/pii_local.py`` — real first-name, third-party names, device
+serials), so a report can't carry owner-identifying data the gate would reject
+and the footer's "scrubbed" claim stays true. One source of truth: the gate and
+the reporter redact by the same rules. If a HARD residue somehow survives,
+``api_submit_issue`` REFUSES to auto-submit and the report stays local.
+
 Nothing leaves the machine on its own: `browser_submit_url` returns a pre-filled
 GitHub issue link the user opens and clicks (no token, no auto-send). The
 autonomous API path + rate-limiting land in a later, consent-flagged increment.
@@ -108,14 +116,92 @@ _SCRUB_RULES: List[Tuple[Any, Any]] = [
 ]
 
 
+# A bare device-serial run (e.g. the Bambu printer serial): 15-17 chars of
+# UPPER-case alnum with no separators. Owner serials don't fit the keyed
+# NAME=value or hex rules above, so without this they survive into a report.
+# Added as a HARD finding so an un-redacted one also blocks auto-submit.
+_BARE_SERIAL = (re.compile(r"\b[0-9A-Z]{15,17}\b"), "<SERIAL>")
+
+
+def _gate_patterns() -> Tuple[List[Tuple[Any, str]], List[Any]]:
+    """The git gate's OWN (HARD, WARN) patterns, so the bug-reporter scrubs by the
+    SAME rules as ``tools/check_no_pii.py`` — one source of truth. On the owner's
+    box that gate loads ``tools/pii_local.py`` (real first-name, third-party
+    names, the Bambu serial); here we reuse exactly those compiled patterns plus
+    the bare-serial rule. Returns ``(hard_subs, hard_only)`` where ``hard_subs``
+    are (compiled, replacement) pairs to APPLY and ``hard_only`` are the compiled
+    HARD patterns to TEST for a post-scrub residue.
+
+    Total + cached: a failure to import the gate (e.g. a stripped deploy) must not
+    crash the reporter, so it degrades to the bare-serial rule alone — the
+    built-in ``_SCRUB_RULES`` still run regardless.
+    """
+    cached = getattr(_gate_patterns, "_cache", None)
+    if cached is not None:
+        return cached
+    hard_subs: List[Tuple[Any, str]] = []
+    hard_only: List[Any] = []
+    try:
+        from tools import check_no_pii as _cnp  # stdlib-only, import-light
+        # HARD findings carry no replacement in the gate (they're detectors), so
+        # redact each to a typed placeholder; the label hints at the category.
+        for label, rx in list(_cnp.HARD):
+            hard_subs.append((rx, f"<{str(label).upper().replace('-', '_')}>"))
+            hard_only.append(rx)
+        # WARN patterns (subnet, personal venue/trip, hardware) are advisory in
+        # the gate; redact them in a SHARED report too, but they don't block.
+        for label, rx in list(_cnp.WARN):
+            hard_subs.append((rx, f"<{str(label).upper().replace('-', '_')}>"))
+    except Exception:  # pragma: no cover - defensive; reporter must never raise
+        pass
+    hard_subs.append(_BARE_SERIAL)
+    hard_only.append(_BARE_SERIAL[0])
+    result = (hard_subs, hard_only)
+    _gate_patterns._cache = result  # type: ignore[attr-defined]
+    return result
+
+
 def scrub(text: str) -> str:
-    """Redact personal data/secrets from `text`. Conservative by design."""
+    """Redact personal data/secrets from `text`. Conservative by design.
+
+    Applies the built-in secret-shape rules AND the git gate's own PII patterns
+    (``tools/check_no_pii.py`` HARD+WARN, incl. the owner's gitignored
+    ``pii_local.py`` on the owner's box) so a report can't leak owner-identifying
+    data the public-repo gate would reject — the footer's "scrubbed" claim holds.
+    """
     if not text:
         return ""
     out = str(text)
     for pat, repl in _SCRUB_RULES:
         out = pat.sub(repl, out)
+    for pat, repl in _gate_patterns()[0]:
+        out = pat.sub(repl, out)
     return out
+
+
+def has_hard_pii(*texts: str) -> bool:
+    """True if any git-gate HARD pattern still matches `texts` AFTER scrubbing —
+    the residue check that lets a submission path refuse to auto-send. Total:
+    any internal failure returns False (don't block on a reporter bug)."""
+    try:
+        hard_only = _gate_patterns()[1]
+        for t in texts:
+            s = "" if t is None else str(t)
+            for rx in hard_only:
+                if rx.search(s):
+                    return True
+    except Exception:  # pragma: no cover - defensive
+        return False
+    return False
+
+
+def report_has_hard_pii(report: Dict[str, Any]) -> bool:
+    """True if a built (already-scrubbed) report still carries a HARD-PII residue
+    anywhere a GitHub issue would render it (summary/detail/traceback/context)."""
+    ctx = report.get("context") or {}
+    fields = [report.get("summary", ""), report.get("detail", ""),
+              report.get("traceback", ""), *[str(v) for v in ctx.values()]]
+    return has_hard_pii(*fields)
 
 
 def _version() -> str:
@@ -268,9 +354,17 @@ def api_submit_issue(report: Dict[str, Any], *, owner: str = _OWNER,
                      repo: str = _REPO, token: Optional[str] = None,
                      opener=None) -> Optional[str]:
     """POST `report` as a GitHub issue via the API; return the issue URL, or None
-    (no token / API error). Total. `opener` is injectable for tests."""
+    (no token / API error / unscrubbed PII). Total. `opener` is injectable for
+    tests.
+
+    Last-line privacy guard: if a HARD-PII residue survived scrubbing, REFUSE to
+    auto-submit (return None) — the report stays in the local outbox rather than
+    leak owner-identifying data into the public repo. The browser/consent path is
+    unaffected (a human reviews it before clicking submit)."""
     tok = token if token is not None else _issue_token()
     if not tok:
+        return None
+    if report_has_hard_pii(report):
         return None
     title, body = format_issue(report)
     payload = json.dumps({"title": title, "body": body,

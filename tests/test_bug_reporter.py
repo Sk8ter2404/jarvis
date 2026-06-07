@@ -157,6 +157,131 @@ class CardAndPhoneScrubTests(unittest.TestCase):
         self.assertFalse(bug_reporter._luhn("4111111111111112"))
 
 
+class GatePatternScrubTests(unittest.TestCase):
+    """v1.55.x — the bug-reporter scrubs by the SAME patterns the public-repo PII
+    gate enforces (tools/check_no_pii.py HARD+WARN, incl. the owner's gitignored
+    pii_local.py on the owner's box) so a report can't carry owner-identifying
+    data the gate would reject. These tests must NOT depend on pii_local.py being
+    present (it's absent in CI / a fresh clone), so they inject a throwaway HARD
+    pattern into check_no_pii and clear the reporter's pattern cache — mirroring
+    exactly how _load_local_patterns extends the gate on the owner's machine.
+
+    Secret-shaped fixtures are built by concatenation so this source never trips
+    the repo's own check_no_pii gate (same trick as the PEM/card fixtures)."""
+
+    def setUp(self):
+        import tools.check_no_pii as cnp
+        self.cnp = cnp
+        self._hard = list(cnp.HARD)
+        self._warn = list(cnp.WARN)
+        self._clear_cache()
+
+    def tearDown(self):
+        self.cnp.HARD[:] = self._hard
+        self.cnp.WARN[:] = self._warn
+        self._clear_cache()
+
+    def _clear_cache(self):
+        # Drop the reporter's memoised (HARD, WARN) snapshot so the next scrub
+        # re-reads the (mutated) gate lists.
+        if hasattr(bug_reporter._gate_patterns, "_cache"):
+            del bug_reporter._gate_patterns._cache
+
+    def test_bare_serial_redacted(self):
+        # A 15-char UPPER alnum serial (the Bambu shape) with no separators —
+        # the rule that exists even without pii_local.py.
+        serial = "0948CD" + "542300667"
+        out = bug_reporter.scrub("printer serial " + serial + " failed")
+        self.assertNotIn(serial, out)
+        self.assertIn("<SERIAL>", out)
+
+    def test_bare_serial_too_short_survives(self):
+        # 14 chars is below the {15,17} floor -> not a serial, must survive
+        # (avoids eating short uppercase tokens / commit-ish ids).
+        short = "ABCDEFGH" + "123456"   # 14 chars
+        self.assertIn(short, bug_reporter.scrub("ref " + short + " ok"))
+
+    def test_lowercase_run_not_serial(self):
+        # The serial rule is UPPER+digits only; a lowercase run isn't a device id.
+        low = "abcdefghij" + "12345"    # 15 chars but lowercase
+        self.assertIn(low, bug_reporter.scrub("token " + low))
+
+    def test_scrub_applies_gate_hard_pattern(self):
+        # Inject an owner-like HARD pattern the way pii_local.py would, then prove
+        # scrub() redacts it (single source of truth with the git gate).
+        self.cnp.HARD.append(("owner-codename", self.cnp._rx(r"(?i)\bzephyr\b")))
+        self._clear_cache()
+        out = bug_reporter.scrub("crash reported by Zephyr last night")
+        self.assertNotIn("Zephyr", out)
+        self.assertIn("<OWNER_CODENAME>", out)
+
+    def test_scrub_applies_gate_warn_pattern(self):
+        # WARN patterns are advisory in the gate but still redacted in a report.
+        self.cnp.WARN.append(("personal-venue", self.cnp._rx(r"(?i)\bbluenote\b")))
+        self._clear_cache()
+        out = bug_reporter.scrub("met at BlueNote downtown")
+        self.assertNotIn("BlueNote", out)
+
+    def test_has_hard_pii_true_on_gate_hard(self):
+        self.cnp.HARD.append(("owner-codename", self.cnp._rx(r"(?i)\bzephyr\b")))
+        self._clear_cache()
+        self.assertTrue(bug_reporter.has_hard_pii("hello Zephyr"))
+        self.assertFalse(bug_reporter.has_hard_pii("nothing identifying here"))
+
+    def test_report_fields_get_gate_scrub(self):
+        # Owner HARD pattern must be scrubbed from EVERY rendered field, not just
+        # the summary — detail, traceback, and context values too.
+        self.cnp.HARD.append(("owner-codename", self.cnp._rx(r"(?i)\bzephyr\b")))
+        self._clear_cache()
+        rep = bug_reporter.make_report(
+            "auto", "Zephyr hit a bug", detail="Zephyr saw it",
+            tb="at Zephyr's call", context={"who": "Zephyr"})
+        blob = json.dumps(rep)
+        self.assertNotIn("Zephyr", blob)
+        self.assertFalse(bug_reporter.report_has_hard_pii(rep))
+
+    def test_gate_import_failure_degrades_to_serial_only(self):
+        # If the gate can't be imported (stripped deploy), scrub must NOT raise
+        # and must still apply the built-in rules + the bare-serial rule.
+        self._clear_cache()
+        with mock.patch.dict(sys.modules, {"tools.check_no_pii": None}):
+            serial = "ZZZZZZ" + "AAAAA1234"   # 15 chars upper+digit
+            out = bug_reporter.scrub("serial " + serial + " and a@b.com")
+        self.assertNotIn(serial, out)
+        self.assertIn("<SERIAL>", out)
+        self.assertIn("<EMAIL>", out)   # built-in rule still ran
+
+
+class AutoSubmitRefusesOnResidueTests(unittest.TestCase):
+    """The last-line privacy guard: api_submit_issue REFUSES to auto-send when a
+    HARD-PII residue survived scrubbing, so it can't leak into the public repo."""
+
+    def test_residue_blocks_api_submit(self):
+        # A report whose detail still carries a bare serial (as if scrub missed
+        # it) must NOT be submitted, even with a valid token + working opener.
+        serial = "0948CD" + "542300667"
+        rep = {"kind": "auto", "summary": "crash", "detail": "left " + serial,
+               "traceback": "", "context": {}, "version": "x", "ts": 1.0}
+        self.assertTrue(bug_reporter.report_has_hard_pii(rep))
+        called = {"n": 0}
+
+        def opener(*a):
+            called["n"] += 1
+            return "https://github.com/o/r/issues/1"
+
+        out = bug_reporter.api_submit_issue(rep, token="tok", opener=opener)
+        self.assertIsNone(out)
+        self.assertEqual(called["n"], 0, "opener must not be called on residue")
+
+    def test_clean_report_still_submits(self):
+        # No residue -> normal submission proceeds (the guard doesn't over-block).
+        rep = bug_reporter.make_report("auto", "a clean crash", tb="TB")
+        self.assertFalse(bug_reporter.report_has_hard_pii(rep))
+        out = bug_reporter.api_submit_issue(
+            rep, token="tok", opener=lambda *a: "https://github.com/o/r/issues/2")
+        self.assertEqual(out, "https://github.com/o/r/issues/2")
+
+
 class MakeReportTests(unittest.TestCase):
     def test_kind_normalises(self):
         self.assertEqual(bug_reporter.make_report("auto", "x")["kind"], "auto")
