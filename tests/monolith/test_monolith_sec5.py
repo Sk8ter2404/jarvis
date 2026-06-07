@@ -1650,7 +1650,11 @@ class AmbientLearnFromGatedTests(SectionFiveBase):
     def test_feeds_extractor_when_ambient_listen_enabled(self):
         bc = self.bc
         mem = {"facts": [], "projects": []}
+        # Pin media OFF so this exercises the no-media ingest path regardless of
+        # whatever the host machine happens to be playing during the test run.
         with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
+             mock.patch.object(bc, "_ambient_media_is_playing", return_value=False), \
+             mock.patch.object(bc, "_call_local_llm", return_value="PERSON"), \
              mock.patch.object(bc, "learn_from_turn") as lft:
             bc._ambient_learn_from_gated("the wifi password is hunter2", mem)
         lft.assert_called_once()
@@ -1672,22 +1676,153 @@ class AmbientLearnFromGatedTests(SectionFiveBase):
         bc = self.bc
         # Even with the feed active, the gated path must produce NO spoken reply
         # and NO follow-up dispatch — it only feeds the (background) extractor.
+        # Use a content-rich phrase (>=3 words) and pin media OFF so the new
+        # owner-vs-TV gate ingests it deterministically; this test only asserts
+        # the no-speak/no-respond guarantee, not the gate's skip logic.
         with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
+             mock.patch.object(bc, "_ambient_media_is_playing", return_value=False), \
+             mock.patch.object(bc, "_call_local_llm", return_value="PERSON"), \
              mock.patch.object(bc, "learn_from_turn") as lft, \
              mock.patch.object(bc, "_speak") as speak:
-            out = bc._ambient_learn_from_gated("hello there", {})
+            out = bc._ambient_learn_from_gated("we should repaint the kitchen", {})
         self.assertIsNone(out)            # returns nothing (no reply to voice)
         speak.assert_not_called()         # never speaks
         lft.assert_called_once()          # but DID learn
 
     def test_never_raises_even_if_extractor_throws(self):
         bc = self.bc
-        # A learning hiccup must not break the gate's drop-and-continue.
+        # A learning hiccup must not break the gate's drop-and-continue. Pin
+        # media OFF and use a content-rich phrase so we actually REACH the
+        # extractor call (and thus the raising mock), then assert no propagation.
         with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
+             mock.patch.object(bc, "_ambient_media_is_playing", return_value=False), \
+             mock.patch.object(bc, "_call_local_llm", return_value="PERSON"), \
              mock.patch.object(bc, "learn_from_turn",
                                side_effect=RuntimeError("extractor boom")):
             # Must NOT propagate.
-            bc._ambient_learn_from_gated("anything", {})
+            bc._ambient_learn_from_gated("please remember the spare key location", {})
+
+    # ── owner-vs-TV gate (2026-06-07: "JARVIS learned the TV") ───────────────
+    # The three required behaviours: media playing -> skip; owner voice with no
+    # media -> ingest; unknown voice OR short fragment -> skip.
+
+    def test_skip_when_smtc_media_playing(self):
+        bc = self.bc
+        # SMTC reports media PLAYING -> the mic is hearing the TV, not the owner.
+        with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
+             mock.patch.object(bc, "_smtc_media_playing", return_value=True), \
+             mock.patch.object(bc, "learn_from_turn") as lft:
+            bc._ambient_learn_from_gated("tonight on the evening news", {})
+        lft.assert_not_called()
+
+    def test_skip_when_spectral_music_playing(self):
+        bc = self.bc
+        # Spectral room-music detector reports sustained music (external TV the
+        # OS can't see) -> skip, even though SMTC sees nothing.
+        fake_mod = mock.Mock()
+        fake_mod.is_music_currently_playing.return_value = True
+        with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
+             mock.patch.object(bc, "_smtc_media_playing", return_value=False), \
+             mock.patch.dict(sys.modules,
+                             {"skill_standby_audio_detect": fake_mod}), \
+             mock.patch.object(bc, "learn_from_turn") as lft:
+            bc._ambient_learn_from_gated("and now the weather forecast", {})
+        lft.assert_not_called()
+
+    def test_ingest_owner_voice_no_media(self):
+        bc = self.bc
+        import core.voice_id as vid
+        mem = {"facts": [], "projects": []}
+        audio = object()  # opaque buffer; identify_speaker is mocked below
+        # No media; voice-ID available + owner enrolled + THIS utterance matches.
+        with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
+             mock.patch.object(bc, "_ambient_media_is_playing", return_value=False), \
+             mock.patch.object(vid, "is_available", return_value=True), \
+             mock.patch.object(vid, "list_enrolled", return_value=["braden"]), \
+             mock.patch.object(vid, "identify_speaker",
+                               return_value=("Braden", 0.91)), \
+             mock.patch.object(bc, "_call_local_llm", return_value="PERSON"), \
+             mock.patch.object(bc, "learn_from_turn") as lft:
+            bc._ambient_learn_from_gated("remind me the trip is on the 14th",
+                                         mem, audio, 16000)
+        lft.assert_called_once()
+        args, _ = lft.call_args
+        self.assertEqual(args[0], "remind me the trip is on the 14th")
+        self.assertEqual(args[1], "")          # overheard speech, empty reply
+        self.assertIs(args[2], mem)
+
+    def test_skip_unknown_voice_even_with_no_media(self):
+        bc = self.bc
+        import core.voice_id as vid
+        audio = object()  # opaque buffer; identify_speaker is mocked below
+        # No media; voice-ID available + SOMEONE enrolled, but this utterance
+        # does NOT match the owner (identify_speaker -> (None, low score)). This
+        # is the TV or another person -> skip even though it's content-rich.
+        with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
+             mock.patch.object(bc, "_ambient_media_is_playing", return_value=False), \
+             mock.patch.object(vid, "is_available", return_value=True), \
+             mock.patch.object(vid, "list_enrolled", return_value=["braden"]), \
+             mock.patch.object(vid, "identify_speaker", return_value=(None, 0.20)), \
+             mock.patch.object(bc, "learn_from_turn") as lft:
+            bc._ambient_learn_from_gated("the defendant pleaded not guilty today",
+                                         {}, audio, 16000)
+        lft.assert_not_called()
+
+    def test_skip_short_fragment_when_voice_id_unavailable(self):
+        bc = self.bc
+        import core.voice_id as vid
+        # No media; voice-ID UNAVAILABLE -> fall back to content heuristic, which
+        # drops a stray low-information TV fragment ("oh no", 2 words).
+        with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
+             mock.patch.object(bc, "_ambient_media_is_playing", return_value=False), \
+             mock.patch.object(vid, "is_available", return_value=False), \
+             mock.patch.object(bc, "learn_from_turn") as lft:
+            bc._ambient_learn_from_gated("oh no", {})
+        lft.assert_not_called()
+
+    def test_ingest_rich_text_when_voice_id_unavailable(self):
+        bc = self.bc
+        import core.voice_id as vid
+        mem = {"facts": [], "projects": []}
+        # No media; voice-ID UNAVAILABLE; content-rich phrase passes the
+        # heuristic -> ingest (single-user fallback for users who never enroll).
+        with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
+             mock.patch.object(bc, "_ambient_media_is_playing", return_value=False), \
+             mock.patch.object(vid, "is_available", return_value=False), \
+             mock.patch.object(bc, "_call_local_llm", return_value="PERSON"), \
+             mock.patch.object(bc, "learn_from_turn") as lft:
+            bc._ambient_learn_from_gated("my dentist appointment is next tuesday",
+                                         mem)
+        lft.assert_called_once()
+
+    def test_skip_unknown_voice_when_nobody_enrolled_uses_heuristic(self):
+        bc = self.bc
+        import core.voice_id as vid
+        # voice-ID available but NOBODY enrolled -> can't tell owner from TV, so
+        # defer to the heuristic (NOT claim "unknown" and skip everything). A
+        # short fragment is still dropped by the heuristic.
+        with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
+             mock.patch.object(bc, "_ambient_media_is_playing", return_value=False), \
+             mock.patch.object(vid, "is_available", return_value=True), \
+             mock.patch.object(vid, "list_enrolled", return_value=[]), \
+             mock.patch.object(bc, "learn_from_turn") as lft:
+            bc._ambient_learn_from_gated("yeah", {})
+        lft.assert_not_called()
+
+    def test_capture_stashes_raw_audio_for_voice_id(self):
+        # Wiring guard: _capture_utterance must stash the RAW captured buffer in
+        # the module globals the gate passes to _ambient_learn_from_gated, and
+        # the gate must forward them — otherwise voice-ID silently goes blind.
+        import inspect
+        cap_src = inspect.getsource(self.bc._capture_utterance)
+        self.assertIn("_last_capture_audio = audio", cap_src)
+        main_src = inspect.getsource(self.bc.main)
+        # The gate dispatches _ambient_learn_from_gated on a daemon thread (so the
+        # local-LLM content judge can't block the main loop); the audio buffer is
+        # forwarded via the thread's args tuple.
+        self.assertIn("target=_ambient_learn_from_gated", main_src)
+        self.assertIn("args=(text, memory, _last_capture_audio, _last_capture_sr)",
+                      main_src)
 
     def test_gate_site_wires_the_feed_before_continue(self):
         # Wiring guard: the main-loop background-audio gate must feed the
@@ -1700,12 +1835,161 @@ class AmbientLearnFromGatedTests(SectionFiveBase):
         marker = "_should_refuse_background_audio(text)"
         self.assertIn(marker, src)
         after = src[src.index(marker):]
-        feed_at = after.find("_ambient_learn_from_gated(")
+        feed_at = after.find("_ambient_learn_from_gated")
         cont_at = after.find("continue")
         self.assertNotEqual(feed_at, -1, "gate never feeds the ambient learner")
         self.assertNotEqual(cont_at, -1)
         self.assertLess(feed_at, cont_at,
                         "ambient-learn feed must run BEFORE the gate's continue")
+
+    # ── content judge + speech-validity gate (2026-06-07: ambient-content-judge)
+    # The owner-requested CONTENT JUDGE catches a TV with no now-playing signal
+    # (the My Name Is Earl case) purely by content, and the same is_valid_speech
+    # confidence/RMS check normal turns use stops low-confidence hallucinations
+    # from ever being LEARNED (scan finding 8). The media-state + voice-ID gates
+    # above stay intact; these run as a FINAL gate before every ingest.
+
+    def test_content_judge_skips_media_line_no_media_no_voiceid(self):
+        bc = self.bc
+        import core.voice_id as vid
+        # No SMTC/spectral media, voice-ID unavailable, content-rich line that
+        # passes the length heuristic — but the LOCAL judge classifies it as a
+        # TV line, so it must be SKIPPED. _call_local_llm is mocked to "MEDIA".
+        with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
+             mock.patch.object(bc, "_ambient_media_is_playing", return_value=False), \
+             mock.patch.object(vid, "is_available", return_value=False), \
+             mock.patch.object(bc, "_call_local_llm", return_value="MEDIA"), \
+             mock.patch.object(bc, "learn_from_turn") as lft:
+            bc._ambient_learn_from_gated(
+                "did you steal a car to take me to the hospital", {})
+        lft.assert_not_called()
+
+    def test_content_judge_ingests_person_line(self):
+        bc = self.bc
+        import core.voice_id as vid
+        # Same path, but the judge says PERSON -> ingest. conf=None so the
+        # speech-validity confidence gate is skipped (only judge + length run).
+        with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
+             mock.patch.object(bc, "_ambient_media_is_playing", return_value=False), \
+             mock.patch.object(vid, "is_available", return_value=False), \
+             mock.patch.object(bc, "_call_local_llm", return_value="PERSON"), \
+             mock.patch.object(bc, "learn_from_turn") as lft:
+            bc._ambient_learn_from_gated("the plumber is coming on thursday", {})
+        lft.assert_called_once()
+
+    def test_content_judge_fails_open_when_local_llm_down(self):
+        bc = self.bc
+        import core.voice_id as vid
+        # Local judge unavailable (Ollama down / nothing pulled -> None). The
+        # judge must FAIL OPEN (treat as not-media) so real conversation is never
+        # silently dropped when the model can't run.
+        with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
+             mock.patch.object(bc, "_ambient_media_is_playing", return_value=False), \
+             mock.patch.object(vid, "is_available", return_value=False), \
+             mock.patch.object(bc, "_call_local_llm", return_value=None), \
+             mock.patch.object(bc, "learn_from_turn") as lft:
+            bc._ambient_learn_from_gated("the plumber is coming on thursday", {})
+        lft.assert_called_once()
+
+    def test_speech_validity_skips_low_confidence_hallucination(self):
+        bc = self.bc
+        import core.voice_id as vid
+        # conf is passed through: a low-confidence transcription that
+        # is_valid_speech would reject (and NOT for a missing wake word) must be
+        # skipped BEFORE learn_from_turn — a hallucination is never learned.
+        # Judge mocked to PERSON so the ONLY thing that can skip is the validity
+        # gate; is_valid_speech mocked to the realistic low-confidence verdict.
+        bad_conf = {"no_speech_prob": 0.99, "avg_logprob": -3.0}
+        with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
+             mock.patch.object(bc, "_ambient_media_is_playing", return_value=False), \
+             mock.patch.object(vid, "is_available", return_value=False), \
+             mock.patch.object(bc, "_call_local_llm", return_value="PERSON"), \
+             mock.patch.object(bc, "is_valid_speech",
+                               return_value=(False, "no_speech_prob=0.99")), \
+             mock.patch.object(bc, "learn_from_turn") as lft:
+            bc._ambient_learn_from_gated(
+                "thanks for watching everyone", {}, conf=bad_conf, peak_rms=0.001)
+        lft.assert_not_called()
+
+    def test_speech_validity_tolerates_missing_wake_word(self):
+        bc = self.bc
+        import core.voice_id as vid
+        # When WAKE_WORD is configured, is_valid_speech rejects non-wake text for
+        # "missing wake word". Ambient text is non-wake BY DEFINITION, so that
+        # one reason must be TOLERATED — the utterance still reaches the judge and
+        # (PERSON) gets ingested. Every OTHER invalid reason still suppresses
+        # (covered by the low-confidence test above).
+        good_conf = {"no_speech_prob": 0.0, "avg_logprob": -0.2}
+        with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
+             mock.patch.object(bc, "_ambient_media_is_playing", return_value=False), \
+             mock.patch.object(vid, "is_available", return_value=False), \
+             mock.patch.object(bc, "_call_local_llm", return_value="PERSON"), \
+             mock.patch.object(bc, "is_valid_speech",
+                               return_value=(False, "missing wake word 'jarvis'")), \
+             mock.patch.object(bc, "learn_from_turn") as lft:
+            bc._ambient_learn_from_gated(
+                "the rent is due on the first", {}, conf=good_conf, peak_rms=0.05)
+        lft.assert_called_once()
+
+    def test_owner_voice_path_also_runs_content_judge(self):
+        bc = self.bc
+        import core.voice_id as vid
+        # Even when voice-ID matches the OWNER, a media line the voiceprint
+        # spuriously matched (e.g. owner is also on TV) must be dropped by the
+        # judge. Confirms the existing voice-ID gate is INTACT but the new gate
+        # still runs on the owner path.
+        audio = object()
+        with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
+             mock.patch.object(bc, "_ambient_media_is_playing", return_value=False), \
+             mock.patch.object(vid, "is_available", return_value=True), \
+             mock.patch.object(vid, "list_enrolled", return_value=["braden"]), \
+             mock.patch.object(vid, "identify_speaker",
+                               return_value=("Braden", 0.93)), \
+             mock.patch.object(bc, "_call_local_llm", return_value="MEDIA"), \
+             mock.patch.object(bc, "learn_from_turn") as lft:
+            bc._ambient_learn_from_gated(
+                "previously on my name is earl", {}, audio, 16000)
+        lft.assert_not_called()
+
+    def test_content_judge_helper_parses_verdicts(self):
+        bc = self.bc
+        # Unit-level checks on the judge's verdict parsing: a bare/ wrapped MEDIA
+        # verdict -> True; PERSON (even alongside the word) and empty/None ->
+        # False (fail-open). Goes straight through _call_local_llm.
+        cases = [
+            ("MEDIA", True), ("media", True), ("MEDIA.", True),
+            ("Answer: MEDIA", True),
+            ("PERSON", False), ("person", False),
+            ("This sounds like a PERSON not media", False),
+            ("", False),
+        ]
+        for reply, expected in cases:
+            with mock.patch.object(bc, "_call_local_llm", return_value=reply):
+                self.assertEqual(
+                    bc._ambient_content_is_media("some overheard line"), expected,
+                    f"verdict {reply!r} -> expected {expected}")
+        # None (local model unavailable) -> fail open (not media).
+        with mock.patch.object(bc, "_call_local_llm", return_value=None):
+            self.assertFalse(bc._ambient_content_is_media("some overheard line"))
+        # Empty input never calls the model.
+        with mock.patch.object(bc, "_call_local_llm") as cll:
+            self.assertFalse(bc._ambient_content_is_media("   "))
+            cll.assert_not_called()
+
+    def test_call_site_forwards_conf_and_peak_rms(self):
+        # Wiring guard: the main-loop gate must forward this turn's Whisper conf
+        # and peak RMS (via the dispatch thread's kwargs) so the ambient learner
+        # can run the speech-validity check.
+        import inspect
+        src = inspect.getsource(self.bc.main)
+        marker = "target=_ambient_learn_from_gated"
+        self.assertIn(marker, src)
+        after = src[src.index(marker):]
+        # The kwargs dict carries conf + peak_rms; scan the dispatch call up to
+        # the .start() that closes it so multi-line formatting can't hide them.
+        window = after[:after.index(".start()") + len(".start()")]
+        self.assertIn('"conf": conf', window)
+        self.assertIn('"peak_rms": _last_recording_peak', window)
 
 
 class WakeWordModeActionTests(SectionFiveBase):
