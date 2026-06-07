@@ -2689,6 +2689,14 @@ def _dispatch_tray_command(cmd: str, entry: dict) -> None:
         _shutdown_hud()
         if not HUD_ENABLED:
             HUD_ENABLED = True
+        # Clear a persisted ✕-button hide first, exactly like _act_show_hud —
+        # otherwise the relaunched HUD reads the 'hidden' latch and re-hides
+        # itself immediately, so the tray "Open HUD" appears to do nothing.
+        try:
+            from core.actions import _set_unified_hud_hidden
+            _set_unified_hud_hidden(False)
+        except Exception:
+            pass
         _launch_hud()
         print("  [tray] open_hud — re-launched HUD subprocess")
     elif cmd == "restart":

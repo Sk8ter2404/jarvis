@@ -470,16 +470,23 @@ class ToggleHudTests(unittest.TestCase):
 
     def test_toggle_from_visible_hides(self):
         fake = self._fake_bc(True)
-        with _patch_bc(fake):
+        with _patch_bc(fake), \
+                mock.patch.object(A, "_set_unified_hud_hidden") as mclear:
             out = A._act_toggle_hud("")
         fake._write_hud_state.assert_called_once_with(visible=False)
+        # Hiding must NOT clear the ✕-button latch.
+        mclear.assert_not_called()
         self.assertIn("HUD hidden", out)
 
     def test_toggle_from_hidden_shows(self):
         fake = self._fake_bc(False)
-        with _patch_bc(fake):
+        with _patch_bc(fake), \
+                mock.patch.object(A, "_set_unified_hud_hidden") as mclear:
             out = A._act_toggle_hud("")
         fake._write_hud_state.assert_called_once_with(visible=True)
+        # Toggling back to visible must clear the ✕-button latch too, else the
+        # persisted 'hidden' flag keeps the window down (P1-hud reopen bug).
+        mclear.assert_called_once_with(False)
         self.assertIn("HUD restored", out)
 
     def test_toggle_defaults_visible_when_cache_read_raises(self):
