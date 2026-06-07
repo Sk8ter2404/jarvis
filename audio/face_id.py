@@ -472,6 +472,85 @@ def enroll(name: str, frames) -> int:
     return len(captured)
 
 
+def _is_unknown_name(name) -> bool:
+    """True if a recognize() result names nobody (unknown / blank / None)."""
+    return str(name or "").strip().lower() in ("", "unknown")
+
+
+def _largest_unknown_face(faces: list, results: list):
+    """The biggest face row whose recognise() verdict is UNKNOWN — i.e. the
+    nearest person we do NOT already know. `results` is recognize()'s output for
+    the SAME frame, in the SAME order as `faces` (both iterate detect_faces() in
+    order). A face with no paired result is treated as unknown (recognition fell
+    short, so it's certainly not someone we recognise). None when every visible
+    face is already someone we know (or there are no faces)."""
+    best = None
+    best_area = -1.0
+    for i, face in enumerate(faces):
+        name = results[i].get("name") if i < len(results) else None
+        if not _is_unknown_name(name):
+            continue   # skip a recognised person (owner or a known guest)
+        area = _face_area(face)
+        if area > best_area:
+            best_area = area
+            best = face
+    return best
+
+
+def enroll_unknown(name: str, frames) -> dict:
+    """Enroll `name` from an iterable of BGR frames, capturing only the largest
+    UNKNOWN face per frame — the nearest person we do NOT already recognise. This
+    is the guest path: it must NOT grab the owner (or any already-enrolled
+    person) just because they happen to be closest to the camera. Recognised
+    faces are skipped; among the rest the biggest is enrolled.
+
+    Returns {"added": int, "saw_face": bool, "saw_unknown": bool}:
+      * added       — good captures appended (>= 1 means success),
+      * saw_face    — at least one face was detected in some frame,
+      * saw_unknown — at least one UNKNOWN face was seen (vs. all recognised).
+    The caller uses saw_face/saw_unknown to tell "everyone here is already known"
+    apart from "I couldn't see a face". NEVER raises. Embeddings ACCUMULATE
+    across calls, like enroll()."""
+    name = (name or "").strip()
+    if not name or frames is None:
+        return {"added": 0, "saw_face": False, "saw_unknown": False}
+    captured: list[list] = []
+    saw_face = False
+    saw_unknown = False
+    for fr in frames:
+        if fr is None:
+            continue
+        faces = detect_faces(fr)
+        if faces:
+            saw_face = True
+        results = recognize(fr)
+        face = _largest_unknown_face(faces, results)
+        if face is None:
+            continue
+        saw_unknown = True
+        feat = embed(fr, face)
+        if feat is None:
+            continue
+        try:
+            captured.append([float(x) for x in feat])
+        except Exception:   # pragma: no cover - defensive
+            continue
+    if not captured:
+        return {"added": 0, "saw_face": saw_face, "saw_unknown": saw_unknown}
+    store = _load_store()
+    entry = _person_entry(store, name)
+    if entry is None:
+        entry = {"name": name, "embeddings": [], "ts": time.time()}
+        store.setdefault("people", []).append(entry)
+    entry.setdefault("embeddings", [])
+    entry["embeddings"].extend(captured)
+    entry["ts"] = time.time()
+    if not _save_store(store):
+        return {"added": 0, "saw_face": saw_face, "saw_unknown": saw_unknown}
+    return {"added": len(captured), "saw_face": saw_face,
+            "saw_unknown": saw_unknown}
+
+
 # ─── recognition ───────────────────────────────────────────────────────────
 
 def recognize(bgr) -> list:

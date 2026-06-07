@@ -280,11 +280,20 @@ def learn_guest(arg: str = "") -> str:
     if not frames:
         return ("I couldn't capture the webcam, sir — give it a moment and try "
                 "again.")
+    # Enroll only the nearest UNKNOWN face — never the owner (or an already-known
+    # guest) just because they happen to be closest to the camera.
     try:
-        n = eng.enroll(name, frames)
+        res = eng.enroll_unknown(name, frames)
     except Exception:   # pragma: no cover - engine swallows; belt-and-braces
-        n = 0
+        res = {}
+    n = int(res.get("added", 0) or 0)
     if n <= 0:
+        # All visible faces were already recognised → don't mis-enrol a known
+        # person; say so honestly. Otherwise we just couldn't get a clear look.
+        if res.get("saw_face") and not res.get("saw_unknown"):
+            return (f"Everyone I can see is already someone I recognise, sir — "
+                    f"so there's no new face to learn as {name}. Have them step "
+                    "into view and try again.")
         return (f"I couldn't get a clear look at {name}, sir — have them face "
                 "the webcam square on and try again.")
     return (f"Got it, sir — I'll recognise {name} now. "
