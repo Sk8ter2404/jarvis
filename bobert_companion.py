@@ -1832,6 +1832,14 @@ _DESTRUCTIVE_REPLAY_ACTIONS = frozenset({
     "reset_memory",
     "forget_last_hour",
     "clear_tasks",
+    # run_python family: arbitrary-code execution. Never silently re-fire via
+    # "do that again" or a fuzzy-typo disambiguation — force the user to
+    # re-issue it so it re-routes through the run_python AST gate in
+    # _jarvis_pushback (which defers dangerous snippets onto the confirm queue).
+    "run_python",
+    "python",
+    "eval_python",
+    "compute",
 })
 
 
@@ -13476,15 +13484,153 @@ def _looks_like_sketchy_url(url: str) -> bool:
     return False
 
 
+# run_python / eval_python / compute action names. run_python executes
+# arbitrary Python in a sandbox subprocess/kernel, so a hallucinated or
+# prompt-injected [ACTION: run_python, …] (e.g. from OCR'd / web / email
+# content the LLM ingested) could fire side-effecting code with no spoken
+# confirmation. We can't blanket-block it — "compute, 2**32" / pandas math
+# is a legitimate everyday use — so instead we AST-scan the code and only
+# defer onto the confirm queue when it contains a dangerous construct.
+_RUN_PYTHON_ACTIONS = frozenset({
+    "run_python", "python", "eval_python", "compute",
+})
+
+# Bare callables / names whose mere presence makes the snippet untrusted.
+_PY_DANGEROUS_NAMES = frozenset({
+    "eval", "exec", "compile", "__import__", "open", "input",
+    "breakpoint", "memoryview", "globals", "vars",
+})
+# Attribute accesses (matched on the trailing `.attr`, regardless of the
+# object expression) that signal filesystem / process / network / native
+# side effects or sandbox-escape primitives.
+_PY_DANGEROUS_ATTRS = frozenset({
+    # process / shell
+    "system", "popen", "spawn", "spawnl", "spawnv", "spawnve",
+    "execv", "execve", "execvp", "execvpe", "fork", "kill",
+    "Popen", "call", "run", "check_call", "check_output",
+    "getoutput", "getstatusoutput",
+    # filesystem mutation
+    "remove", "unlink", "rmdir", "removedirs", "rmtree", "rename",
+    "replace", "renames", "truncate", "chmod", "chown", "makedirs",
+    "mkdir", "symlink", "link", "write_text", "write_bytes",
+    "unsetenv", "putenv",
+    # module-qualified file-write aliases (caught even if the module was
+    # imported under an alias the import-block above missed): io.open /
+    # codecs.open / gzip|bz2|lzma|tarfile.open / zipfile.ZipFile(...,'w') /
+    # dbm.open / shelve.open, plus logging.FileHandler. open is also a bare
+    # dangerous NAME; here it covers the `module.open(...)` Attribute form.
+    "open", "FileHandler", "ZipFile",
+    # de-serialisation / dynamic import / native
+    "loads", "load", "import_module", "exec_module", "dlopen",
+    "CDLL", "WinDLL", "windll", "cdll",
+    # network sockets
+    "socket", "connect", "create_connection", "urlopen", "urlretrieve",
+    # sandbox-escape dunder ladders
+    "__import__", "__subclasses__", "__globals__", "__builtins__",
+    "__bases__", "__mro__", "__class__", "__getattribute__",
+    "__reduce__", "__reduce_ex__",
+})
+# Import targets that have no business in a "compute" snippet and are the
+# usual building blocks of an RCE payload. (math / statistics / numpy /
+# pandas / datetime / decimal / fractions / json / random etc. are NOT here
+# so ordinary number-crunching still runs unprompted.)
+_PY_DANGEROUS_MODULES = frozenset({
+    "os", "subprocess", "shutil", "socket", "ctypes", "sys", "signal",
+    "pty", "fcntl", "winreg", "_winreg", "mmap", "pickle", "cpickle",
+    "_pickle", "marshal", "shelve", "importlib", "runpy", "code",
+    "codeop", "multiprocessing", "asyncio", "requests", "urllib",
+    "http", "ftplib", "smtplib", "telnetlib", "webbrowser", "glob",
+    "pathlib", "tempfile", "builtins", "__builtin__", "platform",
+    "psutil", "win32api", "win32com", "win32file", "win32process",
+    # file-write aliases that still hit the disk: io.open / codecs.open /
+    # the compression + archive .open()s (gzip/bz2/lzma/tarfile/zipfile) /
+    # fileinput(inplace=True) / dbm.open / logging.FileHandler. These are
+    # NOT pure compute, so an injected snippet using them must confirm.
+    "io", "codecs", "gzip", "bz2", "lzma", "tarfile", "zipfile",
+    "fileinput", "dbm", "logging",
+})
+
+
+def _scan_python_for_danger(code: str) -> str | None:
+    """AST-scan a run_python snippet. Return a short human label for the first
+    dangerous construct found (so the caller can name it in the objection), or
+    None if the code looks like a safe pure computation.
+
+    Fail-safe: anything we can't parse (SyntaxError, recursion blowup, etc.)
+    is treated as dangerous, since we'd rather ask than auto-run code we can't
+    reason about. Behaviour-preserving for legitimate math/compute because the
+    name/attr/module blocklists deliberately exclude math, statistics, numpy,
+    pandas, datetime, json, random, decimal, fractions, itertools, …"""
+    src = (code or "").strip()
+    if not src:
+        return None
+    try:
+        import ast as _ast
+    except Exception:
+        return "code execution"
+    try:
+        tree = _ast.parse(src, mode="exec")
+    except SyntaxError:
+        # Re-try as a bare expression (run_python accepts e.g. "2+2").
+        try:
+            tree = _ast.parse(src, mode="eval")
+        except Exception:
+            return "unparseable code"
+    except Exception:
+        return "unparseable code"
+
+    for node in _ast.walk(tree):
+        # import os / import subprocess as sp / from os import system
+        if isinstance(node, _ast.Import):
+            for alias in node.names:
+                root = (alias.name or "").split(".")[0]
+                if root in _PY_DANGEROUS_MODULES:
+                    return f"import {root}"
+        elif isinstance(node, _ast.ImportFrom):
+            root = (node.module or "").split(".")[0]
+            if root in _PY_DANGEROUS_MODULES:
+                return f"from {root} import …"
+        # eval(...) / exec(...) / open(...) / __import__(...) as bare names
+        elif isinstance(node, _ast.Name):
+            if node.id in _PY_DANGEROUS_NAMES:
+                return node.id
+        # os.system / subprocess.Popen / shutil.rmtree / sock.connect /
+        # obj.__subclasses__ — match on the attribute leaf only.
+        elif isinstance(node, _ast.Attribute):
+            if node.attr in _PY_DANGEROUS_ATTRS:
+                return node.attr
+        # Dunder-name string literals ("__globals__" etc.) used to drive
+        # getattr()-based sandbox escapes.
+        elif isinstance(node, _ast.Constant) and isinstance(node.value, str):
+            v = node.value
+            if v.startswith("__") and v.endswith("__") and v in _PY_DANGEROUS_ATTRS:
+                return v
+    return None
+
+
 def _jarvis_pushback(name: str, arg: str) -> tuple[str, str] | None:
     """Return (objection_line, reason) if this action deserves an in-character
     objection before running. None means proceed without confirmation. The
     objection is meant to be SPOKEN to the user; the caller queues the
     action on _pending_confirmation and ordinary 'yes' / 'no' handling
     decides whether it actually fires."""
+    nm  = (name or "").lower()
+
+    # run_python / eval_python / compute: arbitrary-code execution. This is a
+    # hard P0 gate, NOT a gray-zone pushback, so it runs even when
+    # PUSHBACK_ENABLED is off — a hallucinated or prompt-injected snippet must
+    # never auto-exec dangerous code. Safe pure-math/compute (the common case)
+    # AST-scans clean and proceeds without a prompt.
+    if nm in _RUN_PYTHON_ACTIONS:
+        danger = _scan_python_for_danger(arg or "")
+        if danger:
+            phrase = ("That snippet wants to run code that could touch the "
+                      "system or network, sir. Shall I execute it regardless?")
+            return (phrase, f"run_python dangerous construct: {danger}")
+        return None
+
     if not PUSHBACK_ENABLED:
         return None
-    nm  = (name or "").lower()
     raw = (arg or "").strip()
     low = raw.lower()
 
