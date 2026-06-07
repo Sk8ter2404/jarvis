@@ -1603,8 +1603,106 @@ def _ambient_owner_voice(audio, sample_rate: int) -> "tuple[bool, str, float]":
         return (False, "unavailable", 0.0)
 
 
+def _ambient_content_is_media(snippet: str) -> bool:
+    """CONTENT JUDGE for ambient learning: ask the cheap LOCAL model whether
+    ``snippet`` is a line FROM media (a TV show / movie line, song lyric, or an
+    advertisement) rather than a real person's conversation.
+
+    This is the last line of defence for the case the media-state + voice-ID
+    gates miss: a TV the OS can't see (no SMTC now-playing) that isn't sustained
+    enough to trip the spectral detector, with voice-ID unavailable — e.g. an
+    episode of *My Name Is Earl* murmuring in the next room. Such audio looks
+    like ordinary content-rich speech to every other gate, so we judge it purely
+    on CONTENT.
+
+    Returns True ONLY when the model clearly answers that this is media → the
+    caller SKIPS ingestion. FAIL-OPEN by design: an empty/ambiguous answer, a
+    local model that's down (Smart App Control blocked it, nothing pulled), or
+    any error returns False so genuine conversation is never silently dropped
+    when the judge can't run. Goes straight to ``_call_local_llm`` (never the
+    cloud) so the judge is free and matches the ambient forced-local contract.
+    Never raises."""
+    try:
+        text = (snippet or "").strip()
+        if not text:
+            return False
+        system = (
+            "You are a strict binary classifier. Decide whether a short "
+            "overheard transcript is a line FROM media (a TV show or movie "
+            "line of dialogue, song lyrics, or an advertisement / commercial) "
+            "rather than a real person talking in the room. Answer with ONLY "
+            "one word: MEDIA or PERSON. No punctuation, no explanation."
+        )
+        user = f"Transcript: {text!r}\nAnswer (MEDIA or PERSON):"
+        out = _call_local_llm(
+            system, [{"role": "user", "content": user}], max_tokens=4)
+        if not out:
+            # Local judge unavailable/empty — fail open (treat as not-media so
+            # real conversation still learns). Logged by the caller's decision.
+            return False
+        verdict = out.strip().upper()
+        # Match the token anywhere in the reply so a chatty local model that
+        # wraps the word ("MEDIA.", "Answer: MEDIA") is still understood; only
+        # an explicit MEDIA verdict (and not a PERSON one) suppresses.
+        is_media = ("MEDIA" in verdict) and ("PERSON" not in verdict)
+        return bool(is_media)
+    except Exception as _e:
+        print(f"  [ambient-learn] content judge errored "
+              f"({type(_e).__name__}: {_e}) — failing open (not media)")
+        return False
+
+
+def _ambient_should_learn_text(snippet: str, conf=None,
+                               peak_rms: float = 0.0) -> bool:
+    """Final pre-ingest gate shared by BOTH ambient-learn ingest paths (owner
+    voice + voice-ID-unavailable heuristic). Returns True only if the snippet is
+    worth feeding to learn_from_turn. Logs the decision either way.
+
+    Two checks, in cheap-first order:
+      (1) SPEECH VALIDITY — run the SAME is_valid_speech() confidence + RMS +
+          hallucination filter normal turns use, so a low-confidence Whisper
+          hallucination is never *learned* (scan finding 8). The wake-word
+          requirement is the one part that does NOT apply here: ambient text is
+          non-wake BY DEFINITION (the background-audio gate dropped it precisely
+          because it lacked the wake word), so a "missing wake word" verdict is
+          tolerated; every other invalid reason suppresses ingestion.
+      (2) CONTENT JUDGE — the local-LLM media classifier above, to catch a TV
+          with no now-playing signal purely by content.
+
+    conf may be None (callers without per-turn Whisper metadata — e.g. the unit
+    tests and the _ambient_learning_feed sibling): in that case the confidence
+    gate is skipped and only the hallucination/length checks + content judge
+    run. Never raises (any error fails OPEN → True, so a gate hiccup can't
+    silently stop all learning)."""
+    try:
+        text = (snippet or "").strip()
+        # (1) speech-validity gate (skipped when we have no Whisper metadata).
+        if conf is not None:
+            try:
+                valid, reason = is_valid_speech(text, conf, peak_rms=peak_rms)
+                if not valid and not reason.startswith("missing wake word"):
+                    print("  [ambient-learn] skipped: failed speech validity "
+                          f"({reason})")
+                    return False
+            except Exception as _ve:
+                # A validity-check error must not block learning.
+                print(f"  [ambient-learn] speech-validity check errored "
+                      f"({type(_ve).__name__}: {_ve}) — failing open")
+        # (2) content judge (local-LLM): drop media lines (TV/movie/lyrics/ad).
+        if _ambient_content_is_media(text):
+            print("  [ambient-learn] skipped: content judge says MEDIA "
+                  "(TV/movie/lyrics/ad, not a real conversation)")
+            return False
+        return True
+    except Exception as _e:
+        print(f"  [ambient-learn] pre-ingest gate errored "
+              f"({type(_e).__name__}: {_e}) — failing open")
+        return True
+
+
 def _ambient_learn_from_gated(text: str, memory: dict,
-                              audio=None, sample_rate: int = 0) -> None:
+                              audio=None, sample_rate: int = 0,
+                              conf=None, peak_rms: float = 0.0) -> None:
     """Alexa-mode ambient learning: keep PASSIVELY learning from gated speech —
     but ONLY the owner's genuine conversation, NEVER the TV / music / strangers.
 
@@ -1627,6 +1725,16 @@ def _ambient_learn_from_gated(text: str, memory: dict,
       3. If voice-ID is unavailable / nobody enrolled / no audio buffer, fall back
          to (1) PLUS a content heuristic: SKIP very short / low-information
          transcripts (stray TV fragments), INGEST the rest.
+      4. FINAL gate before EVERY ingest (_ambient_should_learn_text): the same
+         is_valid_speech() confidence/RMS/hallucination filter normal turns use
+         (so a low-confidence Whisper hallucination is never *learned* — scan
+         finding 8; the wake-word part is skipped since ambient is non-wake by
+         definition), PLUS a cheap LOCAL-LLM CONTENT JUDGE that SKIPs a line of
+         TV/movie dialogue, song lyrics, or an advertisement. (4) is what catches
+         a TV the OS can't see, with no now-playing signal (the My Name Is Earl
+         case), purely by content — passing conf/peak_rms enables the speech
+         check; both default off (conf=None) so callers without Whisper metadata
+         still work.
 
     Every decision logs one concise line ([ambient-learn] ingested … / skipped …
     + reason) so the owner-vs-TV behaviour is observable in the session log.
@@ -1652,6 +1760,12 @@ def _ambient_learn_from_gated(text: str, memory: dict,
         gate_on_voice, vstatus, vscore = _ambient_owner_voice(audio, sample_rate)
         if gate_on_voice:
             if vstatus == "owner":
+                # Owner confirmed — still run the shared speech-validity +
+                # content judge before ingesting, so a low-confidence Whisper
+                # hallucination or a media line (even one a voiceprint spuriously
+                # matched) is never learned.
+                if not _ambient_should_learn_text(snippet, conf, peak_rms):
+                    return
                 learn_from_turn(snippet, "", memory)
                 print(f"  [ambient-learn] ingested gated text ({n} chars) "
                       f"— owner voice (score={vscore:.2f})")
@@ -1666,6 +1780,12 @@ def _ambient_learn_from_gated(text: str, memory: dict,
         if n < _AMBIENT_LEARN_MIN_CHARS or len(snippet.split()) < _AMBIENT_LEARN_MIN_WORDS:
             print("  [ambient-learn] skipped: low-information fragment "
                   f"(voice-ID unavailable) ({n} chars)")
+            return
+
+        # Final gate: speech-validity (confidence/RMS/hallucination) + the
+        # local-LLM content judge. This is the path that catches a TV with no
+        # now-playing signal (the My Name Is Earl case) purely by content.
+        if not _ambient_should_learn_text(snippet, conf, peak_rms):
             return
 
         learn_from_turn(snippet, "", memory)
@@ -17201,11 +17321,24 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 # (non-wake) utterance, but if ambient-listening is on we still
                 # passively LEARN from it — feed the transcript to the extractor
                 # BEFORE dropping the turn. Pass this turn's RAW audio so the
-                # learner can voice-ID the owner and refuse the TV/strangers.
+                # learner can voice-ID the owner and refuse the TV/strangers, and
+                # this turn's Whisper conf + peak RMS so the learner runs the same
+                # is_valid_speech() confidence/RMS gate normal turns use before
+                # learning (so a low-confidence hallucination is never ingested).
                 # No-op when AMBIENT_LISTEN_ENABLED is off; never raises; never
                 # speaks (see _ambient_learn_from_gated).
-                _ambient_learn_from_gated(text, memory,
-                                          _last_capture_audio, _last_capture_sr)
+                #
+                # Dispatch on a daemon thread: the new content-judge runs a local
+                # LLM synchronously, which takes seconds — we must NOT block the
+                # main listen loop on it. Snapshot this turn's audio/conf/peak
+                # into the thread args NOW (the module globals get overwritten by
+                # the next turn). _ambient_learn_from_gated never raises.
+                threading.Thread(
+                    target=_ambient_learn_from_gated,
+                    args=(text, memory, _last_capture_audio, _last_capture_sr),
+                    kwargs={"conf": conf, "peak_rms": _last_recording_peak},
+                    daemon=True,
+                ).start()
                 set_state("idle")
                 continue
 
