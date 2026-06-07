@@ -410,7 +410,12 @@ class ModuleImportTests(_HudBase):
         self.assertEqual(self.hud.TICK_MS, 500)
         self.assertEqual(self.hud.TRACK_REFRESH_TICKS, 12)
         self.assertEqual(self.hud.CALENDAR_REFRESH_TICKS, 240)
-        self.assertEqual(self.hud.GPU_CACHE_SECONDS, 4.0)
+        # GPU flipped temperature -> utilization %: the cache must be short
+        # (was 4 s for smooth temperature; util swings fast and aliases).
+        self.assertLessEqual(self.hud.GPU_CACHE_SECONDS, 1.0)
+        # Utilization thresholds (WARN 70 / CRIT 90 on a flat 0-100 scale).
+        self.assertEqual((self.hud.GPU_WARN_PCT, self.hud.GPU_CRIT_PCT),
+                         (70.0, 90.0))
 
     def test_pyqt6_absent_degrades_gracefully(self):
         # Re-exec the source with PyQt6 import blocked (and any cached PyQt6
@@ -867,19 +872,27 @@ class HelperTests(_HudBase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  _read_gpu_temp — cache, nvidia-smi parse, pulse_strip fallback
+#  _read_gpu_util — cache, nvidia-smi parse, pulse_strip fallback
+#
+#  GPU flipped temperature -> utilization %. The reader now queries
+#  utilization.gpu and the pulse_strip fallback reads the producer's "GPU 49%"
+#  token (digit-scan stops at the first non-digit, so "%" terminates the parse
+#  exactly where "C" used to). The legacy "GPU 54C" token still yields its
+#  number for a temp-only host.
 # ═══════════════════════════════════════════════════════════════════════════
-class GpuTempTests(_HudBase):
+class GpuUtilTests(_HudBase):
     def test_cache_returns_prev_within_window(self):
         s = self._new_scene()
-        s.gpu_temp_c = 55.0
+        s.gpu_util_pct = 55.0
         s._gpu_cached_at = 1000.0
-        with mock.patch.object(self.hud.time, "time", return_value=1001.0), \
+        with mock.patch.object(self.hud.time, "time", return_value=1000.5), \
                 mock.patch.object(self.hud.shutil, "which") as which:
-            self.assertEqual(s._read_gpu_temp(), 55.0)
-        which.assert_not_called()       # still inside the 4 s cache window
+            self.assertEqual(s._read_gpu_util(), 55.0)
+        which.assert_not_called()       # still inside the cache window
 
-    def test_nvidia_smi_parse_max_temp(self):
+    def test_nvidia_smi_queries_utilization(self):
+        # The nvidia-smi invocation must ask for utilization.gpu, not
+        # temperature.gpu — a temp query would feed °C into a 0-100 % scale.
         s = self._new_scene()
         s._gpu_cached_at = 0.0
         out = mock.MagicMock()
@@ -887,31 +900,45 @@ class GpuTempTests(_HudBase):
         with mock.patch.object(self.hud.time, "time", return_value=10_000.0), \
                 mock.patch.object(self.hud.shutil, "which",
                                   return_value="/usr/bin/nvidia-smi"), \
-                mock.patch.object(self.hud.subprocess, "run", return_value=out):
-            self.assertEqual(s._read_gpu_temp(), 67.0)   # max of the two
+                mock.patch.object(self.hud.subprocess, "run",
+                                  return_value=out) as run:
+            self.assertEqual(s._read_gpu_util(), 67.0)   # max of the two
+        argv = run.call_args.args[0]
+        self.assertIn("--query-gpu=utilization.gpu", argv)
+        self.assertNotIn("--query-gpu=temperature.gpu", argv)
 
     def test_nvidia_smi_absent_falls_back_to_pulse_strip(self):
         s = self._new_scene()
         s._gpu_cached_at = 0.0
-        self._write(self.hud_state, {"pulse_strip": "CPU 12% GPU 49C RAM 30%"})
+        self._write(self.hud_state, {"pulse_strip": "CPU 12% GPU 49% RAM 30%"})
         with mock.patch.object(self.hud.time, "time", return_value=20_000.0), \
                 mock.patch.object(self.hud.shutil, "which", return_value=None):
-            self.assertEqual(s._read_gpu_temp(), 49.0)
+            self.assertEqual(s._read_gpu_util(), 49.0)
 
-    def test_pulse_strip_decimal_temp(self):
+    def test_percent_sign_terminates_the_number(self):
+        # The "%" must stop the digit-scan exactly where "C" used to.
+        s = self._new_scene()
+        s._gpu_cached_at = 0.0
+        self._write(self.hud_state, {"pulse_strip": "GPU 7%"})
+        with mock.patch.object(self.hud.time, "time", return_value=21_500.0), \
+                mock.patch.object(self.hud.shutil, "which", return_value=None):
+            self.assertEqual(s._read_gpu_util(), 7.0)
+
+    def test_legacy_temp_token_still_parses_as_number(self):
+        # A temp-only host's fallback "GPU 48.5C" still yields its number.
         s = self._new_scene()
         s._gpu_cached_at = 0.0
         self._write(self.hud_state, {"pulse_strip": "GPU 48.5C"})
         with mock.patch.object(self.hud.time, "time", return_value=21_000.0), \
                 mock.patch.object(self.hud.shutil, "which", return_value=None):
-            self.assertEqual(s._read_gpu_temp(), 48.5)
+            self.assertEqual(s._read_gpu_util(), 48.5)
 
     def test_no_nvidia_no_strip_returns_none(self):
         s = self._new_scene()
         s._gpu_cached_at = 0.0
         with mock.patch.object(self.hud.time, "time", return_value=22_000.0), \
                 mock.patch.object(self.hud.shutil, "which", return_value=None):
-            self.assertIsNone(s._read_gpu_temp())
+            self.assertIsNone(s._read_gpu_util())
 
     def test_strip_without_gpu_token_returns_none(self):
         s = self._new_scene()
@@ -919,38 +946,38 @@ class GpuTempTests(_HudBase):
         self._write(self.hud_state, {"pulse_strip": "CPU 12% RAM 30%"})
         with mock.patch.object(self.hud.time, "time", return_value=23_000.0), \
                 mock.patch.object(self.hud.shutil, "which", return_value=None):
-            self.assertIsNone(s._read_gpu_temp())
+            self.assertIsNone(s._read_gpu_util())
 
     def test_nvidia_smi_empty_output_falls_through(self):
         s = self._new_scene()
         s._gpu_cached_at = 0.0
         out = mock.MagicMock()
         out.stdout = "\n  \n"          # no digit lines
-        self._write(self.hud_state, {"pulse_strip": "GPU 40C"})
+        self._write(self.hud_state, {"pulse_strip": "GPU 40%"})
         with mock.patch.object(self.hud.time, "time", return_value=24_000.0), \
                 mock.patch.object(self.hud.shutil, "which",
                                   return_value="nvidia-smi"), \
                 mock.patch.object(self.hud.subprocess, "run", return_value=out):
-            # No temps from nvidia-smi → pulse_strip fallback used.
-            self.assertEqual(s._read_gpu_temp(), 40.0)
+            # No values from nvidia-smi → pulse_strip fallback used.
+            self.assertEqual(s._read_gpu_util(), 40.0)
 
     def test_subprocess_exception_falls_through_to_strip(self):
         s = self._new_scene()
         s._gpu_cached_at = 0.0
-        self._write(self.hud_state, {"pulse_strip": "GPU 51C"})
+        self._write(self.hud_state, {"pulse_strip": "GPU 51%"})
         with mock.patch.object(self.hud.time, "time", return_value=25_000.0), \
                 mock.patch.object(self.hud.shutil, "which",
                                   return_value="nvidia-smi"), \
                 mock.patch.object(self.hud.subprocess, "run",
                                   side_effect=OSError("spawn failed")):
-            self.assertEqual(s._read_gpu_temp(), 51.0)
+            self.assertEqual(s._read_gpu_util(), 51.0)
 
     def test_updates_cache_timestamp(self):
         s = self._new_scene()
         s._gpu_cached_at = 0.0
         with mock.patch.object(self.hud.time, "time", return_value=30_000.0), \
                 mock.patch.object(self.hud.shutil, "which", return_value=None):
-            s._read_gpu_temp()
+            s._read_gpu_util()
         self.assertEqual(s._gpu_cached_at, 30_000.0)
 
     def test_malformed_strip_decimal_swallowed_returns_none(self):
@@ -959,10 +986,10 @@ class GpuTempTests(_HudBase):
         # swallows it and the function returns None.
         s = self._new_scene()
         s._gpu_cached_at = 0.0
-        self._write(self.hud_state, {"pulse_strip": "GPU 4.8.5C"})
+        self._write(self.hud_state, {"pulse_strip": "GPU 4.8.5%"})
         with mock.patch.object(self.hud.time, "time", return_value=26_000.0), \
                 mock.patch.object(self.hud.shutil, "which", return_value=None):
-            self.assertIsNone(s._read_gpu_temp())
+            self.assertIsNone(s._read_gpu_util())
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -995,7 +1022,7 @@ class RefreshDataTests(_HudBase):
                 mock.patch.object(self.hud, "_control_says_off",
                                   return_value=False), \
                 mock.patch.object(self.hud, "_HAS_PSUTIL", False), \
-                mock.patch.object(s, "_read_gpu_temp", return_value=None), \
+                mock.patch.object(s, "_read_gpu_util", return_value=None), \
                 mock.patch.object(self.hud, "_sample_now_playing_safe",
                                   return_value=None), \
                 mock.patch.object(self.hud, "_get_first_meeting_safe",
@@ -1013,7 +1040,7 @@ class RefreshDataTests(_HudBase):
                 mock.patch.object(self.hud, "_control_says_off",
                                   return_value=False), \
                 mock.patch.object(self.hud, "_HAS_PSUTIL", False), \
-                mock.patch.object(s, "_read_gpu_temp", return_value=None), \
+                mock.patch.object(s, "_read_gpu_util", return_value=None), \
                 mock.patch.object(self.hud, "_sample_now_playing_safe",
                                   return_value=None), \
                 mock.patch.object(self.hud, "_get_first_meeting_safe",
@@ -1030,7 +1057,7 @@ class RefreshDataTests(_HudBase):
                 mock.patch.object(self.hud, "_control_says_off",
                                   return_value=False), \
                 mock.patch.object(self.hud, "_HAS_PSUTIL", False), \
-                mock.patch.object(s, "_read_gpu_temp", return_value=None), \
+                mock.patch.object(s, "_read_gpu_util", return_value=None), \
                 mock.patch.object(self.hud, "_sample_now_playing_safe",
                                   return_value=None), \
                 mock.patch.object(self.hud, "_get_first_meeting_safe",
@@ -1048,7 +1075,7 @@ class RefreshDataTests(_HudBase):
                 mock.patch.object(self.hud.psutil, "cpu_percent",
                                   return_value=42.0), \
                 mock.patch.object(self.hud.psutil, "virtual_memory") as vm, \
-                mock.patch.object(s, "_read_gpu_temp", return_value=None), \
+                mock.patch.object(s, "_read_gpu_util", return_value=None), \
                 mock.patch.object(self.hud, "_sample_now_playing_safe",
                                   return_value=None), \
                 mock.patch.object(self.hud, "_get_first_meeting_safe",
@@ -1066,7 +1093,7 @@ class RefreshDataTests(_HudBase):
                 mock.patch.object(self.hud, "_HAS_PSUTIL", True), \
                 mock.patch.object(self.hud.psutil, "cpu_percent",
                                   side_effect=RuntimeError), \
-                mock.patch.object(s, "_read_gpu_temp", return_value=None), \
+                mock.patch.object(s, "_read_gpu_util", return_value=None), \
                 mock.patch.object(self.hud, "_sample_now_playing_safe",
                                   return_value=None), \
                 mock.patch.object(self.hud, "_get_first_meeting_safe",
@@ -1082,7 +1109,7 @@ class RefreshDataTests(_HudBase):
                 mock.patch.object(self.hud, "_control_says_off",
                                   return_value=False), \
                 mock.patch.object(self.hud, "_HAS_PSUTIL", False), \
-                mock.patch.object(s, "_read_gpu_temp", return_value=None), \
+                mock.patch.object(s, "_read_gpu_util", return_value=None), \
                 mock.patch.object(self.hud, "_sample_now_playing_safe",
                                   return_value=None), \
                 mock.patch.object(self.hud, "_get_first_meeting_safe",
@@ -1100,7 +1127,7 @@ class RefreshDataTests(_HudBase):
                 mock.patch.object(self.hud, "_control_says_off",
                                   return_value=False), \
                 mock.patch.object(self.hud, "_HAS_PSUTIL", False), \
-                mock.patch.object(s, "_read_gpu_temp", return_value=None), \
+                mock.patch.object(s, "_read_gpu_util", return_value=None), \
                 mock.patch.object(self.hud, "_sample_now_playing_safe",
                                   return_value=None), \
                 mock.patch.object(self.hud, "_get_first_meeting_safe",
@@ -1116,7 +1143,7 @@ class RefreshDataTests(_HudBase):
                 mock.patch.object(self.hud, "_control_says_off",
                                   return_value=False), \
                 mock.patch.object(self.hud, "_HAS_PSUTIL", False), \
-                mock.patch.object(s, "_read_gpu_temp", return_value=None), \
+                mock.patch.object(s, "_read_gpu_util", return_value=None), \
                 mock.patch.object(self.hud, "_sample_now_playing_safe",
                                   return_value={"title": " Song ",
                                                 "artist": " Band "}), \
@@ -1135,7 +1162,7 @@ class RefreshDataTests(_HudBase):
                 mock.patch.object(self.hud, "_control_says_off",
                                   return_value=False), \
                 mock.patch.object(self.hud, "_HAS_PSUTIL", False), \
-                mock.patch.object(s, "_read_gpu_temp", return_value=None), \
+                mock.patch.object(s, "_read_gpu_util", return_value=None), \
                 mock.patch.object(self.hud, "_sample_now_playing_safe",
                                   return_value=None), \
                 mock.patch.object(self.hud, "_get_first_meeting_safe",
@@ -1151,7 +1178,7 @@ class RefreshDataTests(_HudBase):
                 mock.patch.object(self.hud, "_control_says_off",
                                   return_value=False), \
                 mock.patch.object(self.hud, "_HAS_PSUTIL", False), \
-                mock.patch.object(s, "_read_gpu_temp", return_value=None), \
+                mock.patch.object(s, "_read_gpu_util", return_value=None), \
                 mock.patch.object(self.hud, "_sample_now_playing_safe") as nps, \
                 mock.patch.object(self.hud, "_get_first_meeting_safe",
                                   return_value=None):
@@ -1168,7 +1195,7 @@ class RefreshDataTests(_HudBase):
                 mock.patch.object(self.hud, "_control_says_off",
                                   return_value=False), \
                 mock.patch.object(self.hud, "_HAS_PSUTIL", False), \
-                mock.patch.object(s, "_read_gpu_temp", return_value=None), \
+                mock.patch.object(s, "_read_gpu_util", return_value=None), \
                 mock.patch.object(self.hud, "_sample_now_playing_safe",
                                   return_value=None), \
                 mock.patch.object(self.hud, "_get_first_meeting_safe",
@@ -1186,7 +1213,7 @@ class RefreshDataTests(_HudBase):
                 mock.patch.object(self.hud, "_control_says_off",
                                   return_value=False), \
                 mock.patch.object(self.hud, "_HAS_PSUTIL", False), \
-                mock.patch.object(s, "_read_gpu_temp", return_value=None), \
+                mock.patch.object(s, "_read_gpu_util", return_value=None), \
                 mock.patch.object(self.hud, "_sample_now_playing_safe",
                                   return_value=None), \
                 mock.patch.object(self.hud, "_get_first_meeting_safe") as gfm:
@@ -1235,16 +1262,16 @@ class DrawBackgroundTests(_HudBase):
         s.bambu_percent = 0
         self._paint(s)
 
-    def test_paints_with_gpu_temp_present(self):
+    def test_paints_with_gpu_util_present(self):
         s = self._new_scene()
-        s.gpu_temp_c = 78.0      # drives the hot-GPU chip + coloured arc
+        s.gpu_util_pct = 78.0    # drives the busy-GPU chip + coloured arc
         s.cpu_pct = 95.0         # crit → RED arc + chip
         s.ram_pct = 80.0         # warn → AMBER
         self._paint(s)
 
-    def test_paints_with_gpu_temp_absent(self):
+    def test_paints_with_gpu_util_absent(self):
         s = self._new_scene()
-        s.gpu_temp_c = None      # "GPU — °C" placeholder chip + dim arc
+        s.gpu_util_pct = None    # "GPU — %" placeholder chip + dim arc
         self._paint(s)
 
     def test_paints_with_track_full(self):
@@ -1302,7 +1329,7 @@ class DrawBackgroundTests(_HudBase):
         s.tts_amp = 0.9
         s.cpu_pct = 88.0
         s.ram_pct = 91.0
-        s.gpu_temp_c = 84.0
+        s.gpu_util_pct = 84.0
         s.bambu_active = True
         s.bambu_gcode = "RUNNING"
         s.bambu_percent = 99
@@ -1318,7 +1345,7 @@ class DrawBackgroundTests(_HudBase):
         # A very small scene forces the ``max(8.0, ...)`` / ``min(w-88, ...)``
         # chip-position clamps to bite.
         s = self._new_scene(120, 120)
-        s.gpu_temp_c = 60.0
+        s.gpu_util_pct = 60.0
         self._paint(s)
 
 

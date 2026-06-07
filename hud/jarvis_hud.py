@@ -133,23 +133,71 @@ VIOLET        = "#9b8cff"
 ALERT         = "#ff5b5b"
 ALERT_DIM     = "#5a1414"   # darker than before so the flash reads stronger
 
-STATE_FILE_NAME  = "hud_state.json"
-CONFIG_FILE_NAME = "hud_config.json"   # persisted position + scale
+STATE_FILE_NAME   = "hud_state.json"
+CONFIG_FILE_NAME  = "hud_config.json"    # persisted position + scale
+CONTROL_FILE_NAME = "jarvis_hud_control.json"  # user-driven hide flag (own file)
 PROJECT_DIR      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE_FILE       = os.path.join(PROJECT_DIR, STATE_FILE_NAME)
 CONFIG_FILE      = os.path.join(PROJECT_DIR, CONFIG_FILE_NAME)
+CONTROL_FILE     = os.path.join(PROJECT_DIR, CONTROL_FILE_NAME)
+
+# Shared atomic JSON writer. This HUD runs as a standalone subprocess, so
+# `core` may not be on the path yet — add PROJECT_DIR and fall back to a
+# local mkstemp+replace if the import still fails, so a missing module can
+# never crash the overlay.
+if PROJECT_DIR not in sys.path:
+    sys.path.insert(0, PROJECT_DIR)
+try:
+    from core.atomic_io import _atomic_write_json
+except Exception:  # pragma: no cover - exercised only without the core pkg
+    import tempfile
+
+    def _atomic_write_json(path, data, *, indent=2):
+        dir_ = os.path.dirname(os.path.abspath(path)) or "."
+        fd, tmp = tempfile.mkstemp(dir=dir_, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=indent)
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+            raise
 
 
 def _is_parent_alive(pid: int) -> bool:
     if pid <= 0:
         return True
     if _HAS_PSUTIL:
-        return psutil.pid_exists(pid)
+        # pid_exists can raise on Windows for a transient handle/permission
+        # error; treat an unknowable parent as alive so a hiccup can't freeze
+        # the render loop (matches the PyQt HUDs' guard).
+        try:
+            return psutil.pid_exists(pid)
+        except Exception:
+            return True
     try:
         os.kill(pid, 0)
         return True
     except (ProcessLookupError, PermissionError, OSError):
         return False
+
+
+def _sf(value, default: float = 0.0) -> float:
+    """Guarded float() — returns `default` on any non-numeric value.
+
+    The shared hud_state.json is written by another process; a malformed or
+    unexpectedly-typed field must never raise inside a Tkinter `after()`
+    callback, or the reschedule at the end of tick() would never run and the
+    overlay would freeze permanently."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _read_state() -> dict:
@@ -179,10 +227,34 @@ def _read_hud_config() -> dict:
 def _write_hud_config(data: dict) -> None:
     """Atomic temp+rename write so a partial flush can't corrupt the file."""
     try:
-        tmp = CONFIG_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        os.replace(tmp, CONFIG_FILE)
+        _atomic_write_json(CONFIG_FILE, data)
+    except Exception:
+        pass
+
+
+def _read_hud_control() -> dict:
+    """Load the dedicated HUD control file (user-driven hide flag).
+
+    Kept separate from hud_state.json — the main process rewrites that
+    canonical snapshot continuously, so a read-modify-write against it from
+    this subprocess both races the writer (torn write) and is instantly
+    overwritten on the next tick. The control file is owned by this HUD."""
+    if not os.path.exists(CONTROL_FILE):
+        return {}
+    try:
+        with open(CONTROL_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def _write_hud_control(data: dict) -> None:
+    """Atomic write of the HUD control file via the shared helper."""
+    try:
+        _atomic_write_json(CONTROL_FILE, data)
     except Exception:
         pass
 
@@ -363,10 +435,19 @@ class HUD:
         # click on the ring doesn't rewrite the same coords every time.
         self._drag_moved = False
 
-        # Hidden state — driven by `visible` field in hud_state.json so the
-        # main script can ask JARVIS to hide the HUD without killing the
-        # subprocess (cheap show/hide via withdraw/deiconify).
+        # Hidden state — driven by the `visible` field in hud_state.json (so
+        # the main script can ask JARVIS to hide the HUD without killing the
+        # subprocess) AND by the user-driven menu hide persisted in the
+        # dedicated control file. `_user_hidden` mirrors the control file so a
+        # menu hide survives ticks; it's cleared when JARVIS issues an
+        # explicit show (visible flips False->True). `_prev_state_visible`
+        # tracks that transition.
         self._hidden = False
+        self._user_hidden = bool(_read_hud_control().get("hidden"))
+        self._prev_state_visible = None
+        # Set by _on_close so the tick() wrapper stops rescheduling after the
+        # Tk root is destroyed (a post-destroy after() would raise).
+        self._closing = False
 
         # Load persisted geometry from hud_config.json. We read this BEFORE
         # creating the Tk window so the canvas comes up at the right size and
@@ -457,6 +538,7 @@ class HUD:
         self.tick()
 
     def _on_close(self):
+        self._closing = True
         try:
             self.root.destroy()
         except Exception:
@@ -565,24 +647,20 @@ class HUD:
             pass
 
     def _hide_via_menu(self):
-        # Local hide — writes to state file so the main script knows the HUD
-        # is hidden (and so that next tick we don't re-show ourselves).
+        # Local, user-driven hide. Persist the choice in this HUD's OWN
+        # control file — never hud_state.json, which the main process
+        # rewrites continuously. Writing the hide flag there used to (a) race
+        # the main writer (torn write of the canonical snapshot) and (b) get
+        # instantly overwritten on the next tick, so the hide was both unsafe
+        # and ineffective. The control file is read with precedence in tick()
+        # and is cleared when JARVIS issues an explicit show.
         self._hidden = True
+        self._user_hidden = True
         try:
             self.root.withdraw()
         except Exception:
             pass
-        # Persist the choice — write {"visible": false} into hud_state.json
-        # without clobbering the other fields the main script publishes.
-        try:
-            data = _read_state()
-            data["visible"] = False
-            tmp = STATE_FILE + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f)
-            os.replace(tmp, STATE_FILE)
-        except Exception:
-            pass
+        _write_hud_control({"hidden": True})
 
     def _poll_focused_window(self):
         """Refresh the cached focused-window title at most once per second."""
@@ -987,18 +1065,54 @@ class HUD:
 
     # ─── main paint ─────────────────────────────────────────────────────
     def tick(self):
+        # Wrapper: the entire render runs in a guarded body, and the after()
+        # reschedule lives in finally so a single bad value or transient error
+        # can NEVER strand this overlay on a frozen frame. The body returns the
+        # delay (ms) for the next tick, or None when it has closed the window.
+        if self._closing:
+            return
+        delay = TICK_MS
+        try:
+            d = self._tick_body()
+            if d is not None:
+                delay = d
+        except Exception:
+            # Swallow and keep the loop alive at the normal cadence.
+            pass
+        if not self._closing:
+            try:
+                self.root.after(delay, self.tick)
+            except Exception:
+                pass
+
+    def _tick_body(self):
         if not _is_parent_alive(self.parent_pid):
             self._on_close()
-            return
+            return None
 
         state              = _read_state()
 
         # ── visibility check ────────────────────────────────────────────
-        # The main script can set `visible: false` in hud_state.json to ask
-        # us to hide without killing the subprocess (e.g. via JARVIS action
-        # `hide_hud`). We withdraw the window but keep ticking at a slower
-        # cadence so we can react when `visible` flips back to true.
-        want_visible = state.get("visible", True)
+        # Two independent hide sources, combined:
+        #   1. The main script's `visible` field in hud_state.json (JARVIS
+        #      `hide_hud`/`show_hud`).
+        #   2. The user's menu "Hide HUD" persisted in our OWN control file
+        #      (read each tick so it survives, and never written into the
+        #      shared hud_state.json).
+        # An explicit JARVIS show — `visible` rising False->True — clears the
+        # user hide too, honouring the menu's "JARVIS will re-show it on
+        # request" promise.
+        state_visible = bool(state.get("visible", True))
+        if (self._prev_state_visible is False and state_visible
+                and self._user_hidden):
+            self._user_hidden = False
+            _write_hud_control({"hidden": False})
+        self._prev_state_visible = state_visible
+        # Re-read the control file so a hide issued by another process (or a
+        # show that just cleared it) is reflected promptly.
+        if not self._user_hidden:
+            self._user_hidden = bool(_read_hud_control().get("hidden"))
+        want_visible = state_visible and not self._user_hidden
         if not want_visible and not self._hidden:
             self._hidden = True
             try: self.root.withdraw()
@@ -1010,20 +1124,22 @@ class HUD:
         if self._hidden:
             # Slow tick rate while hidden — 500 ms is plenty to notice when
             # the user asks JARVIS to show the HUD again.
-            self.root.after(500, self.tick)
-            return
+            return 500
 
         jarvis_state       = state.get("state", "Idle")
         now_playing        = state.get("now_playing", "")
         timers             = state.get("timers", []) or []
         active_action      = state.get("active_action", "") or ""
         recent_action      = state.get("recent_action", "") or ""
-        recent_action_at   = float(state.get("recent_action_at", 0) or 0)
-        overnight_expiry   = float(state.get("overnight_expiry", 0) or 0)
-        mic_level_raw      = float(state.get("mic_level", 0.0) or 0.0)
-        tts_amp_raw        = float(state.get("tts_amplitude", 0.0) or 0.0)
+        # Every float parse below is guarded (via _sf) so a non-numeric value
+        # in the shared state file degrades to a sane fallback for this frame
+        # instead of raising out of the callback.
+        recent_action_at   = _sf(state.get("recent_action_at"), 0.0)
+        overnight_expiry   = _sf(state.get("overnight_expiry"), 0.0)
+        mic_level_raw      = _sf(state.get("mic_level"), 0.0)
+        tts_amp_raw        = _sf(state.get("tts_amplitude"), 0.0)
         last_transcript    = state.get("last_transcript", "") or ""
-        last_transcript_at = float(state.get("last_transcript_at", 0) or 0)
+        last_transcript_at = _sf(state.get("last_transcript_at"), 0.0)
         explicit_alert     = state.get("alert", "") or ""
 
         # ── boot-sequence override ──
@@ -1031,15 +1147,14 @@ class HUD:
         # canvas with the power-up animation. Self-clears 0.5s after the
         # advertised duration so a crashed parent can't strand the overlay.
         boot_phase       = state.get("boot_phase", "") or ""
-        boot_started_at  = float(state.get("boot_started_at", 0) or 0)
-        boot_duration    = float(state.get("boot_duration", 0) or 0)
+        boot_started_at  = _sf(state.get("boot_started_at"), 0.0)
+        boot_duration    = _sf(state.get("boot_duration"), 0.0)
         if (boot_phase == "powering" and boot_started_at > 0
                 and boot_duration > 0
                 and (time.time() - boot_started_at) <= (boot_duration + 0.5)):
             self._draw_boot_animation(boot_started_at, boot_duration)
             self.frame += 1
-            self.root.after(TICK_MS, self.tick)
-            return
+            return TICK_MS
 
         # CPU / RAM live from psutil; cache last value if read fails
         if _HAS_PSUTIL:
@@ -1320,9 +1435,10 @@ class HUD:
             ts = state.get("test_state") or {}
             self._draw_staging_overlay(ts if isinstance(ts, dict) else {})
 
-        # Schedule next frame
+        # Advance the frame counter. Rescheduling is handled by the tick()
+        # wrapper's finally-style tail so it runs even if this body raised.
         self.frame += 1
-        self.root.after(TICK_MS, self.tick)
+        return TICK_MS
 
     def run(self):
         try:
