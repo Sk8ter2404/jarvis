@@ -242,6 +242,31 @@ class _FakeQGraphicsDropShadowEffect(_AutoMock):
     pass
 
 
+class _InlineThread:
+    """A ``threading.Thread`` stand-in whose ``start()`` runs the target
+    synchronously on the calling thread. Lets a test drive the async GPU
+    sampler to completion deterministically (no real worker thread to join)."""
+
+    def __init__(self, *, target=None, daemon=None, **_kw):
+        self._target = target
+
+    def start(self):
+        if self._target is not None:
+            self._target()
+
+
+class _NoStartThread:
+    """A ``threading.Thread`` stand-in whose ``start()`` is a no-op — proves the
+    blocking sampler is *offloaded* (never run inline): the worker body, and
+    thus subprocess.run, is not reached on the calling/paint thread."""
+
+    def __init__(self, *, target=None, daemon=None, **_kw):
+        self._target = target
+
+    def start(self):
+        pass
+
+
 class _FakeQt:
     """The ``Qt`` namespace — only the enum groups hud_v2 references."""
     PenStyle = _EnumNS(NoPen=0, SolidLine=1)
@@ -872,23 +897,62 @@ class HelperTests(_HudBase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  _read_gpu_util — cache, nvidia-smi parse, pulse_strip fallback
+#  _read_gpu_util — async sampling, cache, nvidia-smi parse, pulse_strip fallback
 #
 #  GPU flipped temperature -> utilization %. The reader now queries
 #  utilization.gpu and the pulse_strip fallback reads the producer's "GPU 49%"
 #  token (digit-scan stops at the first non-digit, so "%" terminates the parse
 #  exactly where "C" used to). The legacy "GPU 54C" token still yields its
 #  number for a temp-only host.
+#
+#  nvidia-smi can stall for up to its 2 s timeout, so the blocking sample must
+#  NOT run on the Qt GUI/paint thread. ``_read_gpu_util`` is now non-blocking:
+#  on a cache miss it spawns ``_gpu_sample_worker`` on a background thread and
+#  returns the previously-cached value immediately; the worker publishes the
+#  fresh reading into ``gpu_util_pct``. The parse/fallback contract lives in
+#  ``_sample_gpu_util`` (the worker body), so these tests drive the read with
+#  the spawned thread run INLINE (``_drive_gpu_read``) and assert on the value
+#  the worker publishes — exercising the real read -> spawn -> sample chain.
 # ═══════════════════════════════════════════════════════════════════════════
 class GpuUtilTests(_HudBase):
+    def _drive_gpu_read(self, s):
+        """Call ``_read_gpu_util`` with ``threading.Thread`` patched so the
+        spawned sampler runs synchronously, then return the published
+        ``gpu_util_pct`` (what the paint loop reads). This lets the existing
+        parse/fallback assertions verify the sampler output deterministically
+        without racing a real worker thread."""
+        with mock.patch.object(self.hud.threading, "Thread", _InlineThread):
+            s._read_gpu_util()
+        return s.gpu_util_pct
+
+    def test_paint_path_never_calls_nvidia_smi_directly(self):
+        # The core anti-freeze guarantee: a cache-miss read must offload the
+        # blocking nvidia-smi spawn to a background thread, NOT run it inline on
+        # the calling (GUI/paint) thread. With Thread.start a no-op the worker
+        # never runs, so subprocess.run must not be touched by _read_gpu_util.
+        s = self._new_scene()
+        s._gpu_cached_at = 0.0
+        with mock.patch.object(self.hud.time, "time", return_value=10_000.0), \
+                mock.patch.object(self.hud.threading, "Thread",
+                                  side_effect=_NoStartThread) as thread, \
+                mock.patch.object(self.hud.shutil, "which",
+                                  return_value="/usr/bin/nvidia-smi"), \
+                mock.patch.object(self.hud.subprocess, "run") as run:
+            ret = s._read_gpu_util()
+        run.assert_not_called()          # never blocks the caller
+        thread.assert_called_once()      # sampling was offloaded to a thread
+        self.assertIsNone(ret)           # returns the (empty) cached value
+
     def test_cache_returns_prev_within_window(self):
         s = self._new_scene()
         s.gpu_util_pct = 55.0
         s._gpu_cached_at = 1000.0
         with mock.patch.object(self.hud.time, "time", return_value=1000.5), \
+                mock.patch.object(self.hud.threading, "Thread") as thread, \
                 mock.patch.object(self.hud.shutil, "which") as which:
             self.assertEqual(s._read_gpu_util(), 55.0)
         which.assert_not_called()       # still inside the cache window
+        thread.assert_not_called()      # no sample spawned inside the window
 
     def test_nvidia_smi_queries_utilization(self):
         # The nvidia-smi invocation must ask for utilization.gpu, not
@@ -902,7 +966,7 @@ class GpuUtilTests(_HudBase):
                                   return_value="/usr/bin/nvidia-smi"), \
                 mock.patch.object(self.hud.subprocess, "run",
                                   return_value=out) as run:
-            self.assertEqual(s._read_gpu_util(), 67.0)   # max of the two
+            self.assertEqual(self._drive_gpu_read(s), 67.0)   # max of the two
         argv = run.call_args.args[0]
         self.assertIn("--query-gpu=utilization.gpu", argv)
         self.assertNotIn("--query-gpu=temperature.gpu", argv)
@@ -913,7 +977,7 @@ class GpuUtilTests(_HudBase):
         self._write(self.hud_state, {"pulse_strip": "CPU 12% GPU 49% RAM 30%"})
         with mock.patch.object(self.hud.time, "time", return_value=20_000.0), \
                 mock.patch.object(self.hud.shutil, "which", return_value=None):
-            self.assertEqual(s._read_gpu_util(), 49.0)
+            self.assertEqual(self._drive_gpu_read(s), 49.0)
 
     def test_percent_sign_terminates_the_number(self):
         # The "%" must stop the digit-scan exactly where "C" used to.
@@ -922,7 +986,7 @@ class GpuUtilTests(_HudBase):
         self._write(self.hud_state, {"pulse_strip": "GPU 7%"})
         with mock.patch.object(self.hud.time, "time", return_value=21_500.0), \
                 mock.patch.object(self.hud.shutil, "which", return_value=None):
-            self.assertEqual(s._read_gpu_util(), 7.0)
+            self.assertEqual(self._drive_gpu_read(s), 7.0)
 
     def test_legacy_temp_token_still_parses_as_number(self):
         # A temp-only host's fallback "GPU 48.5C" still yields its number.
@@ -931,14 +995,14 @@ class GpuUtilTests(_HudBase):
         self._write(self.hud_state, {"pulse_strip": "GPU 48.5C"})
         with mock.patch.object(self.hud.time, "time", return_value=21_000.0), \
                 mock.patch.object(self.hud.shutil, "which", return_value=None):
-            self.assertEqual(s._read_gpu_util(), 48.5)
+            self.assertEqual(self._drive_gpu_read(s), 48.5)
 
     def test_no_nvidia_no_strip_returns_none(self):
         s = self._new_scene()
         s._gpu_cached_at = 0.0
         with mock.patch.object(self.hud.time, "time", return_value=22_000.0), \
                 mock.patch.object(self.hud.shutil, "which", return_value=None):
-            self.assertIsNone(s._read_gpu_util())
+            self.assertIsNone(self._drive_gpu_read(s))
 
     def test_strip_without_gpu_token_returns_none(self):
         s = self._new_scene()
@@ -946,7 +1010,7 @@ class GpuUtilTests(_HudBase):
         self._write(self.hud_state, {"pulse_strip": "CPU 12% RAM 30%"})
         with mock.patch.object(self.hud.time, "time", return_value=23_000.0), \
                 mock.patch.object(self.hud.shutil, "which", return_value=None):
-            self.assertIsNone(s._read_gpu_util())
+            self.assertIsNone(self._drive_gpu_read(s))
 
     def test_nvidia_smi_empty_output_falls_through(self):
         s = self._new_scene()
@@ -959,7 +1023,7 @@ class GpuUtilTests(_HudBase):
                                   return_value="nvidia-smi"), \
                 mock.patch.object(self.hud.subprocess, "run", return_value=out):
             # No values from nvidia-smi → pulse_strip fallback used.
-            self.assertEqual(s._read_gpu_util(), 40.0)
+            self.assertEqual(self._drive_gpu_read(s), 40.0)
 
     def test_subprocess_exception_falls_through_to_strip(self):
         s = self._new_scene()
@@ -970,12 +1034,13 @@ class GpuUtilTests(_HudBase):
                                   return_value="nvidia-smi"), \
                 mock.patch.object(self.hud.subprocess, "run",
                                   side_effect=OSError("spawn failed")):
-            self.assertEqual(s._read_gpu_util(), 51.0)
+            self.assertEqual(self._drive_gpu_read(s), 51.0)
 
     def test_updates_cache_timestamp(self):
         s = self._new_scene()
         s._gpu_cached_at = 0.0
         with mock.patch.object(self.hud.time, "time", return_value=30_000.0), \
+                mock.patch.object(self.hud.threading, "Thread", _NoStartThread), \
                 mock.patch.object(self.hud.shutil, "which", return_value=None):
             s._read_gpu_util()
         self.assertEqual(s._gpu_cached_at, 30_000.0)
@@ -989,7 +1054,7 @@ class GpuUtilTests(_HudBase):
         self._write(self.hud_state, {"pulse_strip": "GPU 4.8.5%"})
         with mock.patch.object(self.hud.time, "time", return_value=26_000.0), \
                 mock.patch.object(self.hud.shutil, "which", return_value=None):
-            self.assertIsNone(s._read_gpu_util())
+            self.assertIsNone(self._drive_gpu_read(s))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
