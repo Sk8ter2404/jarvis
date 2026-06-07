@@ -44,6 +44,7 @@ import importlib.util
 import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -171,6 +172,170 @@ class UnifiedHudCameraPreviewTests(unittest.TestCase):
         # falls back to the placeholder quickly — not a long-lived frozen frame.
         self.assertGreater(self.mod.CAMERA_PREVIEW_STALE_S, 0.0)
         self.assertLessEqual(self.mod.CAMERA_PREVIEW_STALE_S, 5.0)
+
+
+class _FakePixmap:
+    """Stand-in for QPixmap used only to exercise _refresh_camera_preview's
+    decode branch headlessly (the real QPixmap needs a Qt app). isNull() is
+    driven by the bytes actually on disk so a 'half-written' file still tests the
+    keep-previous-frame path."""
+
+    def __init__(self, path):
+        try:
+            with open(path, "rb") as f:
+                self._ok = f.read(2) == b"\xff\xd8"   # JPEG SOI marker
+        except OSError:
+            self._ok = False
+
+    def isNull(self):
+        return not self._ok
+
+
+class UnifiedHudCameraTickTests(unittest.TestCase):
+    """Cadence + change-detection contract for the dedicated fast camera tick.
+
+    The smoothness fix gives the preview tile its OWN ~13 fps timer, decoupled
+    from the 500 ms HUD state poll, and makes ``_refresh_camera_preview`` report
+    whether the displayed frame changed so that fast tick repaints ONLY on a new
+    frame (and skips the JPEG decode when the file's mtime is unchanged). These
+    tests pin that cadence and that change/skip contract.
+
+    ``_refresh_camera_preview`` only ever touches ``self.cam_preview`` and
+    ``self._cam_preview_mtime``, so we invoke it as an unbound method against a
+    tiny ``SimpleNamespace`` stand-in — no QWidget, no Qt loop — and patch the
+    module's ``QPixmap`` with a byte-driven fake for the decode branch.
+    """
+
+    MOD_NAME = "_ju_hud_camtick_under_test"
+
+    def setUp(self):
+        self.mod = _load_hud_no_pyqt(self, "jarvis_unified_hud.py", self.MOD_NAME)
+        self.tmp = tempfile.mkdtemp(prefix="hud_cam_tick_test_")
+        self.addCleanup(self._cleanup_tmp)
+        self.preview = os.path.join(self.tmp, ".hud_camera_preview.jpg")
+        self.mod.CAMERA_PREVIEW_FILE = self.preview
+
+    def _cleanup_tmp(self):
+        for fn in os.listdir(self.tmp):
+            try:
+                os.unlink(os.path.join(self.tmp, fn))
+            except OSError:
+                pass
+        try:
+            os.rmdir(self.tmp)
+        except OSError:
+            pass
+
+    def _write_preview(self, *, valid=True, mtime=None):
+        with open(self.preview, "wb") as f:
+            f.write(b"\xff\xd8\xff\xe0frame" if valid else b"xxhalf-written")
+        if mtime is not None:
+            os.utime(self.preview, (mtime, mtime))
+
+    def _new_state(self):
+        """A minimal stand-in for the widget: just the two attributes the method
+        reads/writes."""
+        import types
+        return types.SimpleNamespace(cam_preview=None, _cam_preview_mtime=0.0)
+
+    def _refresh(self, state):
+        """Call _refresh_camera_preview as an unbound method on the stand-in."""
+        return self.mod.UnifiedHud._refresh_camera_preview(state)
+
+    # ── cadence: a dedicated, faster, decoupled camera tick ──────────────────
+    def test_camera_tick_constant_exists_and_is_faster_than_state_poll(self):
+        # The fix must NOT bump the whole HUD: the camera cadence is its own knob
+        # and is strictly faster than the 500 ms state tick.
+        self.assertTrue(hasattr(self.mod, "CAMERA_TICK_MS"))
+        self.assertLess(self.mod.CAMERA_TICK_MS, self.mod.TICK_MS)
+
+    def test_camera_tick_is_in_the_target_12_to_15_fps_band(self):
+        # ~66-80 ms per the brief (12-15 fps). Pin the band so a future edit that
+        # quietly slows it back toward the 500 ms poll (choppy again) or spikes it
+        # to a wasteful rate is caught.
+        ms = self.mod.CAMERA_TICK_MS
+        self.assertGreaterEqual(ms, 66)
+        self.assertLessEqual(ms, 80)
+        fps = 1000.0 / ms
+        self.assertGreaterEqual(fps, 12.0)
+        self.assertLessEqual(fps, 15.2)
+
+    def test_state_poll_cadence_unchanged(self):
+        # The rest of the HUD stays on the cheap 500 ms loop — the smoothness fix
+        # is scoped to the camera image only.
+        self.assertEqual(self.mod.TICK_MS, 500)
+
+    # ── change-detection / mtime-skip contract ───────────────────────────────
+    def test_new_frame_reports_changed(self):
+        now = time.time()
+        self._write_preview(valid=True, mtime=now)
+        st = self._new_state()
+        with mock.patch.object(self.mod, "QPixmap", _FakePixmap):
+            self.assertTrue(self._refresh(st), "first fresh frame → changed")
+        self.assertIsNotNone(st.cam_preview)
+        self.assertEqual(st._cam_preview_mtime, now)
+
+    def test_same_mtime_skips_decode_and_reports_unchanged(self):
+        now = time.time()
+        self._write_preview(valid=True, mtime=now)
+        st = self._new_state()
+        pm = mock.MagicMock(side_effect=_FakePixmap)   # counts decodes
+        with mock.patch.object(self.mod, "QPixmap", pm):
+            self.assertTrue(self._refresh(st))      # initial load decodes once
+            self.assertEqual(pm.call_count, 1)
+            # Second tick, identical mtime → must NOT re-decode and must report
+            # "nothing new" so the fast tick won't repaint.
+            self.assertFalse(self._refresh(st))
+            self.assertEqual(pm.call_count, 1, "decode skipped when mtime unchanged")
+
+    def test_newer_mtime_redecodes_and_reports_changed(self):
+        now = time.time()
+        self._write_preview(valid=True, mtime=now)
+        st = self._new_state()
+        pm = mock.MagicMock(side_effect=_FakePixmap)
+        with mock.patch.object(self.mod, "QPixmap", pm):
+            self.assertTrue(self._refresh(st))
+            # Writer produced a new frame (mtime advanced) → decode again, changed.
+            self._write_preview(valid=True, mtime=now + 0.1)
+            self.assertTrue(self._refresh(st))
+            self.assertEqual(pm.call_count, 2)
+            self.assertEqual(st._cam_preview_mtime, now + 0.1)
+
+    def test_going_stale_clears_and_reports_changed_once_then_steady(self):
+        now = time.time()
+        # A live frame in hand…
+        self._write_preview(valid=True, mtime=now)
+        st = self._new_state()
+        with mock.patch.object(self.mod, "QPixmap", _FakePixmap):
+            self.assertTrue(self._refresh(st))
+        # …then the file goes stale (writer stopped). First post-stale tick must
+        # clear to the placeholder AND report changed (so the tile repaints once);
+        # subsequent ticks report no change (already off → no needless repaints).
+        os.utime(self.preview,
+                 (now - self.mod.CAMERA_PREVIEW_STALE_S - 5.0,) * 2)
+        self.assertTrue(self._refresh(st), "clearing a shown frame → changed once")
+        self.assertIsNone(st.cam_preview)
+        self.assertFalse(self._refresh(st), "already off → no repaint")
+
+    def test_absent_file_with_nothing_shown_reports_unchanged(self):
+        # Camera off and tile already showing the placeholder → steady-state off
+        # must not churn repaints.
+        st = self._new_state()
+        self.assertFalse(self._refresh(st))
+        self.assertIsNone(st.cam_preview)
+
+    def test_half_written_file_keeps_previous_frame_and_reports_unchanged(self):
+        now = time.time()
+        self._write_preview(valid=True, mtime=now)
+        st = self._new_state()
+        with mock.patch.object(self.mod, "QPixmap", _FakePixmap):
+            self.assertTrue(self._refresh(st))
+            prev = st.cam_preview
+            # A torn read (mtime advanced but bytes not a valid JPEG yet) → keep
+            # the last good frame, report unchanged, retry next tick.
+            self._write_preview(valid=False, mtime=now + 0.2)
+            self.assertFalse(self._refresh(st))
+            self.assertIs(st.cam_preview, prev)
 
 
 if __name__ == "__main__":
