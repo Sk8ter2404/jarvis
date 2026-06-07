@@ -623,16 +623,48 @@ async def dispatch_sub_agents(
                 error="unknown sub_agent",
             )
         async with sem:
-            return await asyncio.to_thread(
-                _run_worker_sync,
-                spec,
-                task,
-                actions,
-                worker_model,
-                local_model,
-                local_base_url,
-                timeout_s,
-            )
+            started = time.time()
+            # `timeout_s` is forwarded INTO the worker for its LLM/HTTP socket
+            # timeouts, but the worker's direct/auto ACTION call (a full JARVIS
+            # action — email/system_pulse/news/web) has no inner timeout. A
+            # wedged action would otherwise leave this coroutine pending forever,
+            # so `gather` never returns and the whole turn deadlocks. Wrap the
+            # thread hand-off in a wall-clock backstop generous enough that a
+            # worker about to return its own graceful raw-data fallback (which
+            # can legitimately take ~timeout_s, plus a one-shot ollama retry) is
+            # never preempted — this only fires on a genuinely hung worker.
+            # `to_thread` can't cancel the OS thread, but `wait_for` frees the
+            # event loop; the orphaned thread finishes harmlessly later while the
+            # turn proceeds. On timeout return an error result (never raise) so
+            # the merger silently omits this slot — preserving the
+            # no-fabrication contract instead of inventing a reply.
+            backstop_s = max(1.0, timeout_s) * 2.0 + 5.0
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _run_worker_sync,
+                        spec,
+                        task,
+                        actions,
+                        worker_model,
+                        local_model,
+                        local_base_url,
+                        timeout_s,
+                    ),
+                    timeout=backstop_s,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                _log.info(
+                    "orchestrator: worker %s timed out after %.1fs — abandoning "
+                    "so the turn can complete", task.sub_agent, backstop_s,
+                )
+                return SubTaskResult(
+                    sub_agent=task.sub_agent,
+                    task=task.task,
+                    output="",
+                    duration_s=time.time() - started,
+                    error=f"worker timed out after {backstop_s:.0f}s",
+                )
 
     return await asyncio.gather(*[_bounded(t) for t in sub_tasks])
 
@@ -799,6 +831,18 @@ class Orchestrator:
         results = await self.dispatch(sub_tasks, actions)
         return self.merge(request, results)
 
+    def _overall_timeout_s(self) -> float:
+        """Generous wall-clock ceiling for the whole pipeline, derived from the
+        stage budgets: planner + a couple of worker waves (each worker wait is
+        ~2x worker_timeout_s, see dispatch_sub_agents) + merger, plus slack.
+        Only meant to backstop a wedged loop, never to preempt normal runs."""
+        return (
+            self.planner_timeout_s
+            + (self.worker_timeout_s * 2.0 + 5.0) * 2.0
+            + self.merger_timeout_s
+            + 10.0
+        )
+
     def orchestrate(
         self,
         request: str,
@@ -825,8 +869,24 @@ class Orchestrator:
                 finally:
                     loop.close()
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                return ex.submit(_runner).result()
+            # Coarse top-level backstop. orchestrate_async is already bounded
+            # internally (planner + per-worker waits + merger each have their
+            # own timeouts), but this guarantees the synchronous caller — the
+            # main voice turn loop — can never block indefinitely on .result()
+            # even if the worker loop itself wedged. On timeout return "" (the
+            # documented "nothing applicable ran" contract) so the turn proceeds.
+            ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            try:
+                return ex.submit(_runner).result(timeout=self._overall_timeout_s())
+            except concurrent.futures.TimeoutError:
+                _log.warning(
+                    "orchestrator: overall pipeline exceeded %.0fs — abandoning",
+                    self._overall_timeout_s(),
+                )
+                return ""
+            finally:
+                # Don't block on a wedged worker thread during teardown.
+                ex.shutdown(wait=False)
 
         # No running loop in this thread. Always build a fresh one — never
         # touch asyncio.get_event_loop() (deprecated in 3.12+) or asyncio.run
