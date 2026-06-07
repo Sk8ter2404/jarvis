@@ -57,6 +57,32 @@ INITIAL_DELAY_SECONDS = 5    # let the face-track thread come up first
 KINECT_EMPTY_STANDBY_SECONDS = 180.0   # room empty this long → standby
 KINECT_PRESENCE_REREAD_SEC   = 0.0     # presence is read every poll tick
 
+# ─── Kinect GAZE (which-monitor from head yaw; KINECT_GAZE_ENABLED) ───────
+# When KINECT_GAZE_ENABLED, the nearest body's facing YAW (degrees, from
+# audio.kinect_bridge.get_head_yaw / the presence dict's head_yaw_deg) is the
+# PRIMARY which-monitor signal — 0≈square to the sensor, negative=turned toward
+# the sensor's LEFT (a left monitor), positive=toward the sensor's RIGHT. This
+# is why which-monitor keeps working with BOTH WEBCAMS OFF: it no longer needs a
+# camera to see the face. The legacy 2-camera look_x heuristic remains the
+# FALLBACK when the Kinect yields no yaw (no body in view / sensor off).
+#
+# Because Kinect yaw is BODY/shoulder facing (the torso turns less than the eyes
+# — see audio.kinect_bridge._body_facing_yaw), the default boundaries below are
+# DELIBERATELY MODEST: past ±GAZE_YAW_SIDE_DEG we call a side monitor; inside the
+# dead-zone it's the forward monitor (middle, or top if no middle). A learned
+# per-desk calibration (the 'calibrate gaze' action) overrides these with the
+# actual observed yaw band per monitor. GAZE_YAW_HYSTERESIS_DEG widens the band
+# you must cross to LEAVE a monitor, so a yaw hovering on a boundary doesn't flap.
+GAZE_YAW_SIDE_DEG        = 12.0   # |yaw| past this (no calibration) → a side monitor
+GAZE_YAW_HARD_SIDE_DEG   = 28.0   # |yaw| past this is unambiguously hard-left/right
+GAZE_YAW_HYSTERESIS_DEG  = 4.0    # extra degrees to cross before switching away
+GAZE_YAW_FRESH_SECONDS   = 5.0    # a Kinect yaw older than this isn't "current"
+# Calibration sampling: how long 'calibrate gaze' watches each monitor, and how
+# many usable yaw frames it needs before it trusts that monitor's band.
+GAZE_CALIBRATE_SECONDS       = 2.5
+GAZE_CALIBRATE_MIN_SAMPLES   = 6
+GAZE_CALIBRATE_PAD_DEG       = 6.0   # widen each learned [min,max] band by this
+
 # ─── Auto-greet on entry (KINECT_GREET_ON_ENTRY, default False) ──────────
 # When the room transitions empty→present after having been empty for at least
 # GREET_MIN_EMPTY_SECONDS, JARVIS speaks one short, varied greeting — but only
@@ -146,6 +172,12 @@ _state = {
     "kinect_at":       0.0,       # monotonic ts of last Kinect presence read
     "kinect_last_present_at": 0.0,   # last time a body WAS present
     "kinect_last_absent_at":  0.0,   # last time the room WAS empty
+    # Kinect GAZE (populated only when KINECT_GAZE_ENABLED). head_yaw_deg is the
+    # nearest body's facing yaw; kinect_monitor is the monitor that yaw maps to
+    # (the PRIMARY which-monitor signal); *_yaw_at marks freshness (monotonic).
+    "kinect_head_yaw": None,      # float | None — nearest body facing yaw (deg)
+    "kinect_monitor":  None,      # monitor name from yaw, or None
+    "kinect_yaw_at":   0.0,       # monotonic ts of last yaw reading
 }
 
 # ─── Auto-greet bookkeeping (used only when KINECT_GREET_ON_ENTRY) ────────
@@ -311,8 +343,14 @@ def _kinect_bridge():
 def _read_kinect_presence() -> dict | None:
     """Fetch get_presence() from the bridge, or None if Kinect presence is
     disabled / the bridge is unavailable / it isn't actually streaming.
-    NEVER raises."""
-    if not _cfg_flag("KINECT_PRESENCE_ENABLED"):
+    NEVER raises.
+
+    Fetched when EITHER KINECT_PRESENCE_ENABLED or KINECT_GAZE_ENABLED is on:
+    one get_presence() call carries both the body count (presence) and the
+    nearest body's head_yaw_deg (gaze), so the gaze layer needs no second
+    body-frame read. The individual automations still gate on their own flags
+    downstream, so enabling only gaze doesn't trigger standby/greet/posture."""
+    if not (_cfg_flag("KINECT_PRESENCE_ENABLED") or _cfg_flag("KINECT_GAZE_ENABLED")):
         return None
     kb = _kinect_bridge()
     if kb is None:
@@ -326,7 +364,7 @@ def _read_kinect_presence() -> dict | None:
         return None
 
 
-def _merge_kinect_presence(presence: dict, now: float) -> None:
+def _merge_kinect_presence(presence: dict, now: float, bc=None) -> None:
     """Fold a Kinect get_presence() reading into _state. Caller holds
     _state_lock."""
     present = bool(presence.get("present"))
@@ -345,6 +383,206 @@ def _merge_kinect_presence(presence: dict, now: float) -> None:
         _state["last_face_at"] = now
     else:
         _state["kinect_last_absent_at"] = now
+
+    # Kinect GAZE: fold the nearest body's facing yaw → a monitor (PRIMARY
+    # which-monitor signal). Only when gaze is enabled AND we actually got a yaw
+    # (a body in view); otherwise leave the prior reading to go stale on its own.
+    if _cfg_flag("KINECT_GAZE_ENABLED"):
+        yaw = presence.get("head_yaw_deg")
+        if isinstance(yaw, (int, float)):
+            _state["kinect_head_yaw"] = float(yaw)
+            _state["kinect_monitor"] = _yaw_to_monitor(
+                bc, float(yaw), _state.get("kinect_monitor"))
+            _state["kinect_yaw_at"] = now
+
+
+# ─── Kinect GAZE: yaw → monitor mapping + per-desk calibration ────────────
+# This is what makes "which monitor am I looking at" work with the WEBCAMS OFF:
+# the nearest body's facing yaw (audio.kinect_bridge.get_head_yaw, surfaced via
+# the presence dict's head_yaw_deg) maps to a monitor name in the MONITORS
+# layout. A built-in mapping ships by default; an optional learned calibration
+# (the 'calibrate gaze' action) overrides it per desk.
+
+def _gaze_calibration_path() -> str:
+    """data/kinect_gaze_calibration.json under the project root. Honours the
+    JARVIS_GAZE_CALIBRATION_PATH env override so tests (and a relocated install)
+    use a throwaway file WITHOUT touching the real one. The file is gitignored
+    (data/* ) — per-desk yaw bands never go near user_settings.json."""
+    import os
+    env = os.environ.get("JARVIS_GAZE_CALIBRATION_PATH")
+    if env:
+        return env
+    project = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(project, "data", "kinect_gaze_calibration.json")
+
+
+def _load_gaze_calibration() -> dict:
+    """The learned {monitor_name: [yaw_min, yaw_max]} map, or {} on any
+    miss/corruption. Best-effort — a first run with no file is just {}."""
+    import json
+    import os
+    path = _gaze_calibration_path()
+    try:
+        if not os.path.exists(path):
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        bands = data.get("bands")
+        if not isinstance(bands, dict):
+            return {}
+        out: dict[str, list[float]] = {}
+        for name, rng in bands.items():
+            if (isinstance(rng, (list, tuple)) and len(rng) == 2
+                    and all(isinstance(v, (int, float)) for v in rng)):
+                lo, hi = float(rng[0]), float(rng[1])
+                out[str(name)] = [min(lo, hi), max(lo, hi)]
+        return out
+    except Exception:
+        return {}
+
+
+def _save_gaze_calibration(bands: dict) -> bool:
+    """Atomically persist {monitor_name: [yaw_min, yaw_max]} to the gitignored
+    calibration json (temp file + os.replace, mirroring kinect_pointing). Returns
+    True on a durable save, False on any error (never raises)."""
+    import json
+    import os
+    import tempfile
+    path = _gaze_calibration_path()
+    payload = {"version": 1, "bands": {
+        str(k): [float(v[0]), float(v[1])]
+        for k, v in (bands or {}).items()
+        if isinstance(v, (list, tuple)) and len(v) == 2}}
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            os.replace(tmp, path)
+            return True
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+            return False
+    except Exception:
+        return False
+
+
+def _forward_monitor(monitors: dict) -> str:
+    """The monitor the user faces when squared up to the sensor (yaw≈0):
+    'middle' if present, else 'top', else 'right' (a single-screen-ahead desk),
+    else any one key. Used as the dead-zone target."""
+    for name in ("middle", "top"):
+        if name in monitors:
+            return name
+    if "right" in monitors:
+        return "right"
+    return next(iter(monitors), "middle")
+
+
+def _default_yaw_to_monitor(bc, yaw: float) -> str:
+    """Map a facing yaw (deg) → monitor name using the MONITORS geometry and the
+    default GAZE_YAW_* thresholds — NO calibration needed.
+
+    Convention (audio.kinect_bridge): negative yaw = turned toward the sensor's
+    LEFT (a monitor with x<0 in the layout), positive = toward the sensor's
+    RIGHT (x>0). Inside ±GAZE_YAW_SIDE_DEG the torso is essentially square → the
+    forward monitor (middle, or top). Past that, pick the configured side
+    monitor on the matching hand; if the layout has no monitor on that side,
+    fall back to the forward one rather than naming a screen that isn't there."""
+    monitors = getattr(bc, "MONITORS", {}) or {}
+    if not monitors:
+        return "middle"
+    forward = _forward_monitor(monitors)
+    if yaw <= -GAZE_YAW_SIDE_DEG:
+        if "left" in monitors:
+            return "left"
+        return forward
+    if yaw >= GAZE_YAW_SIDE_DEG:
+        if "right" in monitors:
+            return "right"
+        return forward
+    # Dead-zone: facing forward. Distinguish middle vs top only by magnitude is
+    # impossible from yaw alone (top is an UP tilt, not a turn), so the forward
+    # monitor is the honest answer; the camera fallback / a vision call handles
+    # the rarer middle-vs-top split when both webcams see the face.
+    return forward
+
+
+def _calibrated_yaw_to_monitor(yaw: float, bands: dict) -> str | None:
+    """Map yaw → monitor using LEARNED per-desk bands, or None if no band
+    contains the yaw. Closest-centre wins when bands overlap, so a yaw that
+    falls in two padded ranges resolves to the monitor whose learned centre is
+    nearest."""
+    best = None
+    best_dist = float("inf")
+    for name, rng in (bands or {}).items():
+        try:
+            lo, hi = float(rng[0]), float(rng[1])
+        except Exception:
+            continue
+        if lo <= yaw <= hi:
+            centre = (lo + hi) / 2.0
+            dist = abs(yaw - centre)
+            if dist < best_dist:
+                best_dist = dist
+                best = name
+    return best
+
+
+def _yaw_to_monitor(bc, yaw: float, current: str | None = None) -> str:
+    """Top-level yaw → monitor: a learned calibration band wins; otherwise the
+    geometry default. Applies GAZE_YAW_HYSTERESIS_DEG so a yaw hovering on a
+    boundary doesn't flap — if the new target differs from `current`, we only
+    switch once the yaw is past the boundary by the hysteresis margin (default
+    mapping only; calibrated bands are already padded)."""
+    bands = _load_gaze_calibration()
+    if bands:
+        cal = _calibrated_yaw_to_monitor(yaw, bands)
+        if cal is not None:
+            return cal
+        # Outside every learned band → fall through to the geometry default.
+
+    target = _default_yaw_to_monitor(bc, yaw)
+    if current is None or current == target or current == "away":
+        return target
+    # Hysteresis: require the yaw to be CLEARLY past the side boundary before we
+    # abandon the current monitor for a different one. Within the fuzzy margin we
+    # hold the prior reading.
+    if target in ("left", "right"):
+        boundary = GAZE_YAW_SIDE_DEG + GAZE_YAW_HYSTERESIS_DEG
+        if target == "left" and yaw > -boundary:
+            return current
+        if target == "right" and yaw < boundary:
+            return current
+    else:
+        # Leaving a side monitor for the forward one: require the yaw to have
+        # pulled back inside (side_deg - hysteresis) before recentring.
+        inner = GAZE_YAW_SIDE_DEG - GAZE_YAW_HYSTERESIS_DEG
+        if current == "left" and yaw <= -inner:
+            return current
+        if current == "right" and yaw >= inner:
+            return current
+    return target
+
+
+def _kinect_gaze_monitor(now: float, snap: dict | None = None) -> str | None:
+    """The fresh Kinect-derived monitor (the PRIMARY which-monitor signal), or
+    None when gaze is off / there's no recent yaw. Reads from the merged _state
+    so callers don't re-touch the sensor. `now` is monotonic-comparable to
+    kinect_yaw_at."""
+    if not _cfg_flag("KINECT_GAZE_ENABLED"):
+        return None
+    s = snap if snap is not None else _snapshot_state()
+    yaw_at = s.get("kinect_yaw_at") or 0.0
+    if not yaw_at or (now - yaw_at) > GAZE_YAW_FRESH_SECONDS:
+        return None
+    return s.get("kinect_monitor")
 
 
 def _bc():
@@ -827,7 +1065,8 @@ def _apply_greet_new_people(present: bool, now: float, bc) -> None:
 
 def _poll_once(bc) -> None:
     sides, _side_map = _classify_sides(bc)
-    raw_monitor = _monitor_name_from_sides(bc, sides)
+    # FALLBACK signal: which monitor the 2-webcam look_x heuristic infers.
+    camera_monitor = _monitor_name_from_sides(bc, sides)
     now = time.time()
 
     # Kinect skeleton presence (opt-in). Read it once per tick and fold it into
@@ -836,7 +1075,7 @@ def _poll_once(bc) -> None:
     if kinect is not None:
         present = bool(kinect.get("present"))
         with _state_lock:
-            _merge_kinect_presence(kinect, now)
+            _merge_kinect_presence(kinect, now, bc)
         try:
             _apply_kinect_presence_actions(present, now)
         except Exception as e:   # pragma: no cover - defensive: never crash the poller
@@ -864,6 +1103,16 @@ def _poll_once(bc) -> None:
     except Exception as e:   # pragma: no cover - defensive
         print(f"  [face-track] new-people greeting error: {e}")
 
+    # PRIMARY which-monitor signal: the Kinect head-yaw monitor (works with the
+    # webcams OFF). The 2-camera look_x classification is the FALLBACK, used only
+    # when gaze is disabled or the Kinect has no fresh yaw (no body in view). The
+    # fresh-yaw read is taken from the just-merged _state under the lock.
+    kinect_monitor = _kinect_gaze_monitor(now)
+    if kinect_monitor is not None:
+        raw_monitor = kinect_monitor
+    else:
+        raw_monitor = camera_monitor
+
     # Hysteresis: only commit when the same reading has held for N samples
     _pending_monitor.append(raw_monitor)
     if len(_pending_monitor) > HYSTERESIS_SAMPLES:
@@ -875,9 +1124,13 @@ def _poll_once(bc) -> None:
     )
 
     with _state_lock:
-        # Face-visible accounting — independent of hysteresis (uses raw signal)
+        # Face-visible accounting — independent of hysteresis (uses raw signal).
+        # "Visible" is webcam sides OR a fresh Kinect body/yaw, so with the
+        # webcams OFF a Kinect-tracked user still counts as in-view (and the
+        # in-view dwell total keeps accruing).
         was_visible = _state["face_visible"]
-        is_visible  = bool(sides)
+        is_visible  = bool(sides) or (kinect_monitor is not None
+                                      and kinect_monitor != "away")
         if is_visible:
             if not _state["first_face_at"]:
                 _state["first_face_at"] = now
@@ -1078,30 +1331,242 @@ def face_track_status(_: str = "") -> str:
     return gaze_status(_)
 
 
+# ─── Kinect gaze: enable toggle + calibration voice actions ───────────────
+
+def _persist_setting(key: str, value) -> bool:
+    """Persist one config override via the Settings writer (honours
+    JARVIS_SETTINGS_PATH so tests can't touch the real file). Mirrors
+    skills/kinect_pointing._persist_setting. Best-effort."""
+    try:
+        from tools import settings_window as sw
+    except Exception:
+        return False
+    try:
+        current = sw.load_settings()
+        if not isinstance(current, dict):
+            current = {}
+        current[key] = value
+        sw.save_settings(current)
+        return True
+    except Exception:
+        return False
+
+
+def _set_gaze_enabled(on: bool) -> bool:
+    """Flip KINECT_GAZE_ENABLED live (core.config) and persist it."""
+    try:
+        import core.config as _cfg
+        _cfg.KINECT_GAZE_ENABLED = bool(on)
+    except Exception:
+        pass
+    return _persist_setting("KINECT_GAZE_ENABLED", bool(on))
+
+
+def _sensor_yaw_ready() -> tuple[bool, str]:
+    """(True, "") when the bridge is available AND currently sees a body to read
+    a yaw from; else (False, reason). Used by the calibration actions to give an
+    honest 'I can't see you' instead of sampling nothing."""
+    kb = _kinect_bridge()
+    if kb is None:
+        return False, "the Kinect bridge isn't loaded"
+    try:
+        ok, why = kb.available()
+    except Exception:
+        return False, "the Kinect isn't responding"
+    if not ok:
+        return False, (why or "the Kinect is unavailable")
+    return True, ""
+
+
+def _sample_yaw(seconds: float = GAZE_CALIBRATE_SECONDS,
+                sleep_fn=time.sleep, now_fn=time.monotonic) -> list[float]:
+    """Read the live nearest-body facing yaw for ~`seconds` and return the list
+    of samples (degrees). Empty when no body / no sensor. NEVER raises. The
+    sleep/now functions are injectable so a test can drive it without real time
+    or a real sensor."""
+    kb = _kinect_bridge()
+    if kb is None:
+        return []
+    getter = getattr(kb, "get_head_yaw", None)
+    if not callable(getter):
+        return []
+    samples: list[float] = []
+    deadline = now_fn() + max(0.0, seconds)
+    while now_fn() < deadline:
+        try:
+            y = getter()
+        except Exception:
+            y = None
+        if isinstance(y, (int, float)):
+            samples.append(float(y))
+        sleep_fn(0.1)
+    return samples
+
+
+def _band_from_samples(samples: list[float]) -> list[float] | None:
+    """Turn yaw samples into a padded [min, max] band, or None when too few /
+    too unsteady. Drops the extreme 10% each end (so one twitch frame doesn't
+    blow the band wide) then pads by GAZE_CALIBRATE_PAD_DEG."""
+    if len(samples) < GAZE_CALIBRATE_MIN_SAMPLES:
+        return None
+    ordered = sorted(samples)
+    drop = max(0, int(len(ordered) * 0.1))
+    trimmed = ordered[drop: len(ordered) - drop] or ordered
+    lo = trimmed[0] - GAZE_CALIBRATE_PAD_DEG
+    hi = trimmed[-1] + GAZE_CALIBRATE_PAD_DEG
+    return [round(lo, 1), round(hi, 1)]
+
+
+def calibrate_gaze(arg: str = "") -> str:
+    """Learn the yaw band for ONE monitor: the owner looks at the named monitor
+    and JARVIS samples the head yaw for a couple of seconds, storing the
+    observed [min,max] (padded) bound to that monitor name. Per-desk tuning so
+    the default thresholds don't have to fit every setup.
+
+        'calibrate gaze left'      → learn the left monitor's yaw band
+        'calibrate gaze | middle'  → same (pipe or space separated)
+
+    The learned bands live in the gitignored data/kinect_gaze_calibration.json
+    (never user_settings.json). With NO calibration the built-in geometry
+    mapping is used, so this is entirely optional."""
+    name = (arg or "").replace("|", " ").strip().lower().split()
+    target = name[-1] if name else ""
+    monitors = _monitors_layout()
+    if not target:
+        opts = ", ".join(sorted(monitors)) or "left, middle, right, top"
+        return (f"Which monitor, sir? Look at one and say e.g. 'calibrate gaze "
+                f"left'. Configured monitors: {opts}.")
+    if monitors and target not in monitors:
+        opts = ", ".join(sorted(monitors))
+        return (f"I don't have a '{target}' monitor configured, sir. "
+                f"Known monitors: {opts}.")
+    if not _cfg_flag("KINECT_GAZE_ENABLED"):
+        return ("Kinect gaze is off, sir — say 'turn on gaze tracking' first, "
+                "then calibrate.")
+    ready, why = _sensor_yaw_ready()
+    if not ready:
+        return f"I can't calibrate gaze right now, sir — {why}."
+
+    samples = _sample_yaw()
+    band = _band_from_samples(samples)
+    if band is None:
+        return (f"I couldn't get a steady read for the {target} monitor, sir — "
+                f"look straight at it and hold still while I sample. "
+                f"({len(samples)} usable frames.)")
+    bands = _load_gaze_calibration()
+    bands[target] = band
+    saved = _save_gaze_calibration(bands)
+    msg = (f"Calibrated the {target} monitor, sir — head yaw {band[0]:.0f}° to "
+           f"{band[1]:.0f}°.")
+    if not saved:
+        msg += " (I couldn't save it, so it'll revert on restart.)"
+    return msg
+
+
+def gaze_calibration_status(_: str = "") -> str:
+    """Read back which monitors have a learned yaw band (vs. the built-in
+    geometry default)."""
+    bands = _load_gaze_calibration()
+    if not bands:
+        return ("No gaze calibration stored, sir — I'm using the built-in "
+                "head-direction mapping. Say 'calibrate gaze left' (etc.) to "
+                "tune it to this desk.")
+    parts = [f"{name} {rng[0]:.0f}°..{rng[1]:.0f}°"
+             for name, rng in sorted(bands.items())]
+    return "Calibrated gaze bands, sir: " + ", ".join(parts) + "."
+
+
+def forget_gaze_calibration(_: str = "") -> str:
+    """Drop ALL learned gaze bands (revert to the built-in mapping)."""
+    if not _load_gaze_calibration():
+        return "There's no gaze calibration to clear, sir."
+    saved = _save_gaze_calibration({})
+    return ("Cleared the gaze calibration, sir — back to the built-in "
+            "head-direction mapping." if saved
+            else "I tried to clear it but couldn't write the file, sir.")
+
+
+def gaze_tracking_on(_: str = "") -> str:
+    """Turn Kinect head-direction gaze on (live + persisted) so which-monitor
+    works without the webcams."""
+    already = _cfg_flag("KINECT_GAZE_ENABLED")
+    persisted = _set_gaze_enabled(True)
+    ready, why = _sensor_yaw_ready()
+    note = "" if ready else f" Note {why} — the webcam fallback stays in use until the Kinect can see you."
+    if already:
+        return "Kinect gaze tracking is already on, sir." + note
+    msg = ("Kinect gaze tracking on, sir — I'll read which monitor you face "
+           "from your head direction, so the webcams can be turned off.")
+    if not persisted:
+        msg += " (I couldn't save it, so it'll revert on restart.)"
+    return msg + note
+
+
+def gaze_tracking_off(_: str = "") -> str:
+    """Turn Kinect head-direction gaze off (live + persisted); which-monitor
+    reverts to the 2-webcam heuristic."""
+    if not _cfg_flag("KINECT_GAZE_ENABLED"):
+        return "Kinect gaze tracking is already off, sir."
+    persisted = _set_gaze_enabled(False)
+    msg = ("Kinect gaze tracking off, sir — which-monitor is back on the "
+           "webcam heuristic.")
+    if not persisted:
+        msg += " (I couldn't save it, so it'll revert on restart.)"
+    return msg
+
+
 # ─── wrappers around existing actions ────────────────────────────────────
+
+def _monitors_layout():
+    """MONITORS dict off the live monolith (or {} if it isn't loaded)."""
+    try:
+        bc = importlib.import_module("bobert_companion")
+        return getattr(bc, "MONITORS", {}) or {}
+    except Exception:
+        return {}
+
 
 def _build_which_monitor_wrapper(original):
     """Fast-path: if the cached gaze state is fresh and unambiguous, answer
-    from the cache. Fall through to the original action otherwise."""
+    from the cache. Fall through to the original action otherwise.
+
+    With KINECT_GAZE_ENABLED the cached current_monitor is the KINECT head-yaw
+    monitor (so this answers with the WEBCAMS OFF). When the Kinect is the live
+    source we answer for ANY monitor it names (left/right/middle/top) and never
+    delegate to the original camera+vision action — that original would say
+    'not visible to any camera' on a webcam-free box. The legacy behaviour is
+    unchanged when gaze is off: only left/right short-circuit, everything else
+    falls through to the original."""
     def wrapper(arg: str = "") -> str:
         snap = _snapshot_state()
         now  = time.time()
         fresh = snap["last_sample_at"] and (now - snap["last_sample_at"]) < GAZE_CACHE_FRESH
         monitor = snap["current_monitor"]
+
+        # Kinect gaze is the live source → answer from it directly for any named
+        # monitor (works webcam-free).
+        kinect_monitor = _kinect_gaze_monitor(now, snap)
+        if kinect_monitor is not None and kinect_monitor not in (None, "away"):
+            monitors = _monitors_layout()
+            name = kinect_monitor
+            suffix = f" ({name})" if name in monitors else ""
+            return f"facing {name.upper()} monitor{suffix} (Kinect head-direction)"
+
         if fresh and monitor in ("left", "right"):
             # Match _act_which_monitor: only append "(name)" when the side is
             # actually present in MONITORS.
-            try:
-                bc = importlib.import_module("bobert_companion")
-                monitors = getattr(bc, "MONITORS", {}) or {}
-            except Exception:
-                monitors = {}
+            monitors = _monitors_layout()
             suffix = f" ({monitor})" if monitor in monitors else ""
             return f"facing {monitor.upper()} monitor{suffix}"
         if fresh and monitor == "away":
+            # If gaze is on but the Kinect simply has no current body, say so
+            # honestly rather than blaming absent cameras.
+            if _cfg_flag("KINECT_GAZE_ENABLED"):
+                return ("no one in the Kinect's view — can't determine monitor "
+                        "from head direction")
             return "user is not visible to any camera — can't determine monitor"
         # "middle_or_top" or stale/None → delegate to the original (which can
-        # call vision to disambiguate top vs. middle).
+        # call vision to disambiguate top vs. middle when the webcams are on).
         return original(arg)
     return wrapper
 
@@ -1127,6 +1592,12 @@ def register(actions):
     actions["gaze_status"]       = gaze_status
     actions["gaze_stats"]        = gaze_stats
     actions["face_track_status"] = face_track_status
+    # Kinect head-direction gaze (which-monitor with the webcams off):
+    actions["calibrate_gaze"]            = calibrate_gaze
+    actions["gaze_calibration_status"]   = gaze_calibration_status
+    actions["forget_gaze_calibration"]   = forget_gaze_calibration
+    actions["gaze_tracking_on"]          = gaze_tracking_on
+    actions["gaze_tracking_off"]         = gaze_tracking_off
 
     if "which_monitor" in actions:
         # INTENTIONAL_WRAP: fast-path cached gaze state (jarvis_todo task #28).

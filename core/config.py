@@ -489,6 +489,19 @@ KINECT_PRESENCE_STANDBY = False
 # KINECT_PRESENCE_WAKE — when True (and presence is enabled), JARVIS clears
 #   standby the moment a person reappears in the Kinect's view. Off by default.
 KINECT_PRESENCE_WAKE = False
+# KINECT_GAZE_ENABLED — when True, the Kinect becomes the PRIMARY "which monitor
+#   am I looking at" signal: the face-tracker skill reads the nearest body's
+#   head/shoulder facing YAW from the Kinect (audio.kinect_bridge.get_head_yaw)
+#   and maps it to a monitor via the MONITORS layout, so which-monitor works with
+#   BOTH WEBCAMS OFF. The legacy two-webcam look_x heuristic stays as a graceful
+#   FALLBACK for when the Kinect has no body in view. Independent of
+#   KINECT_PRESENCE_ENABLED (you can have gaze without the standby/wake
+#   automations), but like every Kinect feature it needs KINECT_ENABLED so the
+#   bridge actually opens the sensor. A sensible built-in yaw→monitor mapping
+#   ships by default; per-desk tuning is optional via the 'calibrate gaze' voice
+#   action (look at each monitor in turn), persisted to a SEPARATE gitignored
+#   data/kinect_gaze_calibration.json — never user_settings.json. Off by default.
+KINECT_GAZE_ENABLED = False
 # KINECT_GESTURES_ENABLED — when True, a background poller reads the Kinect
 #   skeleton stream (~18 Hz) and maps discrete gestures to actions: WAVE wakes
 #   JARVIS from standby, RAISE_HAND confirms a pending confirmation (like saying

@@ -413,6 +413,89 @@ class PresenceTests(_BridgeBase):
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# head-facing yaw (joint-derived gaze; the Kinect v2 Face API is absent on
+# this pykinect2 build, so facing is recovered from the shoulder line)
+# ─────────────────────────────────────────────────────────────────────────
+class HeadYawTests(_BridgeBase):
+    # Raw joints handed straight to _body_facing_yaw are (x, y, z, state) — the
+    # same shape get_bodies() produces — so the tracked-state gate (>=1) passes.
+    def _square(self):
+        return {"shoulder_left": (-0.2, 0.4, 2.0, 2), "shoulder_right": (0.2, 0.4, 2.0, 2),
+                "head": (0.0, 0.6, 2.0, 2)}
+
+    def _turn_sensor_right(self):
+        # Looking at a monitor on the sensor's RIGHT: LEFT shoulder forward
+        # (smaller z), RIGHT shoulder back (larger z), head shifted +x.
+        return {"shoulder_left": (-0.18, 0.4, 1.85, 2),
+                "shoulder_right": (0.18, 0.4, 2.15, 2), "head": (0.12, 0.6, 2.0, 2)}
+
+    def _turn_sensor_left(self):
+        return {"shoulder_left": (-0.18, 0.4, 2.15, 2),
+                "shoulder_right": (0.18, 0.4, 1.85, 2), "head": (-0.12, 0.6, 2.0, 2)}
+
+    def test_facing_yaw_zero_when_square(self):
+        yaw = kb._body_facing_yaw(self._square())
+        self.assertIsNotNone(yaw)
+        self.assertLess(abs(yaw), 3.0)   # ~0°
+
+    def test_facing_yaw_positive_when_turned_sensor_right(self):
+        self.assertGreater(kb._body_facing_yaw(self._turn_sensor_right()), 8.0)
+
+    def test_facing_yaw_negative_when_turned_sensor_left(self):
+        self.assertLess(kb._body_facing_yaw(self._turn_sensor_left()), -8.0)
+
+    def test_facing_yaw_none_without_shoulders(self):
+        # No shoulders and no head → can't estimate.
+        self.assertIsNone(kb._body_facing_yaw({"spine_mid": (0, 0, 2.0, 2)}))
+
+    def test_facing_yaw_ignores_untracked_shoulders(self):
+        # Shoulders present but NotTracked (state 0) → no shoulder yaw; with no
+        # other usable joint the estimate is None.
+        joints = {"shoulder_left": (-0.2, 0.4, 1.8, 0),
+                  "shoulder_right": (0.2, 0.4, 2.2, 0)}
+        self.assertIsNone(kb._body_facing_yaw(joints))
+
+    def test_get_presence_includes_nearest_head_yaw(self):
+        # Two bodies; the NEAREST (1.5 m, turned right) supplies head_yaw_deg.
+        near = _FakeBody(True, {
+            "head": (0.12, 0.6, 1.5), "spine_shoulder": (0, 0.0, 1.5),
+            "shoulder_left": (-0.18, 0.4, 1.42), "shoulder_right": (0.18, 0.4, 1.58)})
+        far = _FakeBody(True, {
+            "head": (0, 0.6, 3.0), "spine_shoulder": (0, 0.0, 3.0),
+            "shoulder_left": (-0.2, 0.4, 3.0), "shoulder_right": (0.2, 0.4, 3.0)})
+        _patch_loader(self, _FakeRuntime(bodies=[far, near, _FakeBody(False),
+                                                 _FakeBody(False), _FakeBody(False),
+                                                 _FakeBody(False)]))
+        pres = kb.get_presence()
+        self.assertEqual(pres["nearest_m"], 1.5)
+        self.assertIsNotNone(pres["head_yaw_deg"])
+        self.assertGreater(pres["head_yaw_deg"], 0.0)   # nearest is turned right
+
+    def test_get_head_yaw_returns_nearest(self):
+        body = _FakeBody(True, {
+            "head": (0.12, 0.6, 1.5), "spine_shoulder": (0, 0.0, 1.5),
+            "shoulder_left": (-0.18, 0.4, 1.42), "shoulder_right": (0.18, 0.4, 1.58)})
+        _patch_loader(self, _FakeRuntime(bodies=[body, _FakeBody(False),
+                                                 _FakeBody(False), _FakeBody(False),
+                                                 _FakeBody(False), _FakeBody(False)]))
+        yaw = kb.get_head_yaw()
+        self.assertIsNotNone(yaw)
+        self.assertGreater(yaw, 0.0)
+
+    def test_get_head_yaw_none_when_disabled(self):
+        kb.set_enabled(False)
+        self.assertIsNone(kb.get_head_yaw())
+
+    def test_get_head_yaw_none_when_no_body(self):
+        _patch_loader(self, _FakeRuntime(bodies=[_FakeBody(False)] * 6))
+        self.assertIsNone(kb.get_head_yaw())
+
+    def test_get_presence_head_yaw_none_when_no_body(self):
+        _patch_loader(self, _FakeRuntime(bodies=[_FakeBody(False)] * 6))
+        self.assertIsNone(kb.get_presence()["head_yaw_deg"])
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # lifecycle
 # ─────────────────────────────────────────────────────────────────────────
 class CloseTests(_BridgeBase):

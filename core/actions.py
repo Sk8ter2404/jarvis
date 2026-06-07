@@ -1746,16 +1746,52 @@ def _act_see_user(camera_hint: str = "") -> str:
     return result
 
 
+def _kinect_gaze_which_monitor() -> str | None:
+    """If Kinect head-direction gaze (KINECT_GAZE_ENABLED) has a FRESH read of
+    which monitor the owner faces, return a 'facing X monitor' string; else
+    None. This is the PRIMARY which-monitor path — it works with the WEBCAMS OFF
+    because it reads the owner's head yaw from the Kinect skeleton, not a camera.
+
+    Delegates to the face_tracker skill (the single source of truth for the
+    yaw→monitor mapping + calibration + freshness window). NEVER raises — any
+    miss returns None so the caller falls back to the camera heuristic below."""
+    try:
+        ft = sys.modules.get("skill_face_tracker")
+        if ft is None:
+            return None
+        getter = getattr(ft, "_kinect_gaze_monitor", None)
+        if not callable(getter):
+            return None
+        monitor = getter(time.time())
+        if not monitor or monitor == "away":
+            return None
+        from core.config import MONITORS
+        suffix = f" ({monitor})" if monitor in (MONITORS or {}) else ""
+        return f"facing {monitor.upper()} monitor{suffix} (Kinect head-direction)"
+    except Exception:
+        return None
+
+
 def _act_which_monitor(_: str = "") -> str:
     """Determine which monitor the user is currently looking at.
     Strategy:
-      • If only the LEFT camera sees the face   -> "left" monitor
-      • If only the RIGHT camera sees the face  -> "right" monitor
-      • If BOTH cameras see the face            -> middle area, then use
-        Claude vision to check if the user is tilting their head UP toward
-        the top monitor or looking forward at the middle monitor.
-      • If NO camera sees the face              -> "user not visible"
+      • PRIMARY (KINECT_GAZE_ENABLED): the Kinect reads the owner's HEAD
+        DIRECTION (facing yaw) and maps it to a monitor — works with BOTH
+        WEBCAMS OFF. Used whenever it has a fresh reading.
+      • FALLBACK (webcam heuristic), used when gaze is off / the Kinect has no
+        body in view:
+          • If only the LEFT camera sees the face   -> "left" monitor
+          • If only the RIGHT camera sees the face  -> "right" monitor
+          • If BOTH cameras see the face            -> middle area, then use
+            Claude vision to check if the user is tilting their head UP toward
+            the top monitor or looking forward at the middle monitor.
+          • If NO camera sees the face              -> "user not visible"
     """
+    # PRIMARY: Kinect head-direction gaze (webcam-free).
+    gaze = _kinect_gaze_which_monitor()
+    if gaze is not None:
+        return gaze
+
     import cv2
     bc = _bc()
     from core.config import CAMERAS, MONITORS
