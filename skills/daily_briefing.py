@@ -162,7 +162,11 @@ def _briefing_sources():
 
 
 def _fetch_weather() -> str:
-    """Return a short weather phrase like '14 degrees and overcast' or ''.
+    """Return a short weather phrase like '57 degrees and overcast' or ''.
+
+    Temperature is spoken in Fahrenheit (sir's preference): briefing_sources
+    stores Celsius, converted here with the canonical c*9/5+32 formula so the
+    daily briefing agrees with morning_briefing / weather_briefing.
 
     Routed through skills/briefing_sources.py so the daily briefing has the
     wttr → Open-Meteo → cached-last-known fallback chain instead of dropping
@@ -177,13 +181,14 @@ def _fetch_weather() -> str:
         temp_c = int(data["temp_c"])
     except (KeyError, TypeError, ValueError):
         return ""
+    temp_f = int(round(temp_c * 9 / 5 + 32))
     desc = (data.get("desc") or "").strip().lower()
     suffix = ""
     if data.get("source") == "cache" and data.get("stale"):
         suffix = " (cached)"
     if desc:
-        return f"outside temperature is {temp_c} degrees and {desc}{suffix}"
-    return f"outside temperature is {temp_c} degrees{suffix}"
+        return f"outside temperature is {temp_f} degrees and {desc}{suffix}"
+    return f"outside temperature is {temp_f} degrees{suffix}"
 
 
 # ─── Outlook calendar (best-effort) ──────────────────────────────────────

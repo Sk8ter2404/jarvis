@@ -126,13 +126,14 @@ class MorningHandoffTests(unittest.TestCase):
         self.assertEqual(o(23), "23rd")
         self.assertEqual(o(30), "30th")
 
-    # ── _section_weather ─────────────────────────────────────────────────
+    # ── _section_weather (C→F: store Celsius, speak Fahrenheit) ──────────
     def test_section_weather(self):
         bs = mock.MagicMock()
+        # 18 C stored → 64 F spoken, matching morning_arrival/morning_briefing.
         bs.get_weather_data.return_value = {"temp_c": 18, "desc": "Overcast", "source": "wttr"}
         with mock.patch.object(self.mod, "_import_skill", return_value=bs):
             out = self.mod._section_weather()
-        self.assertEqual(out, "18 degrees and overcast in your area.")
+        self.assertEqual(out, "64 degrees and overcast in your area.")
 
     def test_section_weather_degraded(self):
         with mock.patch.object(self.mod, "_import_skill", return_value=None):
@@ -212,7 +213,7 @@ class MorningHandoffTests(unittest.TestCase):
 
     # ── _build_handoff stitch ────────────────────────────────────────────
     def test_build_handoff_chains_sections(self):
-        with mock.patch.object(self.mod, "_section_weather", return_value="18 degrees and clear."), \
+        with mock.patch.object(self.mod, "_section_weather", return_value="64 degrees and clear."), \
              mock.patch.object(self.mod, "_section_calendar", return_value="From Outlook: 1 unread email."), \
              mock.patch.object(self.mod, "_section_teams_vip", return_value=""), \
              mock.patch.object(self.mod, "_section_print", return_value=""), \
@@ -220,7 +221,7 @@ class MorningHandoffTests(unittest.TestCase):
             out = self.mod._build_handoff(setup_line="Workshop is yours, sir.")
         self.assertTrue(out.startswith("[intent:briefing] Good morning, sir."))
         self.assertIn("Workshop is yours, sir.", out)
-        self.assertIn("18 degrees and clear.", out)
+        self.assertIn("64 degrees and clear.", out)
         self.assertIn("From Outlook: 1 unread email.", out)
         self.assertIn("Anything else I should know, sir?", out)
 
@@ -363,24 +364,27 @@ class SectionWeatherTests(unittest.TestCase):
         return bs
 
     def test_no_desc_uses_short_form(self):
+        # 5 C → 41 F (5*9/5+32 = 41).
         bs = self._weather({"temp_c": 5, "desc": "", "source": "wttr"})
         with mock.patch.object(self.mod, "_import_skill", return_value=bs):
-            self.assertEqual(self.mod._section_weather(), "5 degrees outside.")
+            self.assertEqual(self.mod._section_weather(), "41 degrees outside.")
 
     def test_cached_stale_suffix_applied(self):
+        # 12 C → 54 F (12*9/5+32 = 53.6 → 54).
         bs = self._weather({"temp_c": 12, "desc": "Cloudy",
                             "source": "cache", "stale": True})
         with mock.patch.object(self.mod, "_import_skill", return_value=bs):
             out = self.mod._section_weather()
-        self.assertEqual(out, "12 degrees and cloudy in your area (cached).")
+        self.assertEqual(out, "54 degrees and cloudy in your area (cached).")
 
     def test_cache_not_stale_has_no_suffix(self):
+        # 9 C → 48 F (9*9/5+32 = 48.2 → 48).
         bs = self._weather({"temp_c": 9, "desc": "Sunny",
                             "source": "cache", "stale": False})
         with mock.patch.object(self.mod, "_import_skill", return_value=bs):
             out = self.mod._section_weather()
         self.assertNotIn("cached", out)
-        self.assertEqual(out, "9 degrees and sunny in your area.")
+        self.assertEqual(out, "48 degrees and sunny in your area.")
 
     def test_empty_data_returns_blank(self):
         bs = self._weather(None)
