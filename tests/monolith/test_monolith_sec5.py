@@ -1738,9 +1738,9 @@ class AmbientLearnFromGatedTests(SectionFiveBase):
         with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
              mock.patch.object(bc, "_ambient_media_is_playing", return_value=False), \
              mock.patch.object(vid, "is_available", return_value=True), \
-             mock.patch.object(vid, "list_enrolled", return_value=["braden"]), \
+             mock.patch.object(vid, "list_enrolled", return_value=["tony"]), \
              mock.patch.object(vid, "identify_speaker",
-                               return_value=("Braden", 0.91)), \
+                               return_value=("Tony", 0.91)), \
              mock.patch.object(bc, "_call_local_llm", return_value="PERSON"), \
              mock.patch.object(bc, "learn_from_turn") as lft:
             bc._ambient_learn_from_gated("remind me the trip is on the 14th",
@@ -1761,7 +1761,7 @@ class AmbientLearnFromGatedTests(SectionFiveBase):
         with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
              mock.patch.object(bc, "_ambient_media_is_playing", return_value=False), \
              mock.patch.object(vid, "is_available", return_value=True), \
-             mock.patch.object(vid, "list_enrolled", return_value=["braden"]), \
+             mock.patch.object(vid, "list_enrolled", return_value=["tony"]), \
              mock.patch.object(vid, "identify_speaker", return_value=(None, 0.20)), \
              mock.patch.object(bc, "learn_from_turn") as lft:
             bc._ambient_learn_from_gated("the defendant pleaded not guilty today",
@@ -1942,9 +1942,9 @@ class AmbientLearnFromGatedTests(SectionFiveBase):
         with mock.patch.object(bc, "AMBIENT_LISTEN_ENABLED", True), \
              mock.patch.object(bc, "_ambient_media_is_playing", return_value=False), \
              mock.patch.object(vid, "is_available", return_value=True), \
-             mock.patch.object(vid, "list_enrolled", return_value=["braden"]), \
+             mock.patch.object(vid, "list_enrolled", return_value=["tony"]), \
              mock.patch.object(vid, "identify_speaker",
-                               return_value=("Braden", 0.93)), \
+                               return_value=("Tony", 0.93)), \
              mock.patch.object(bc, "_call_local_llm", return_value="MEDIA"), \
              mock.patch.object(bc, "learn_from_turn") as lft:
             bc._ambient_learn_from_gated(
