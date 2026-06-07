@@ -148,7 +148,22 @@ class GetTimeTests(unittest.TestCase):
         with mock.patch.object(A.time, "strftime",
                                side_effect=lambda fmt: real_strftime(fmt, fixed)):
             out = A._act_get_time("")
-        self.assertEqual(out, "current time is 02:30 PM on Monday")
+        self.assertEqual(
+            out, "current time is 02:30 PM on Monday, June 01, 2026")
+
+    def test_includes_real_calendar_date(self):
+        # Regression: "what's today's date" routes to get_time, so the handler
+        # must surface the actual month/day/year from the system clock — not a
+        # bare weekday that forces the LLM to fabricate (off-by-one) the date.
+        import time as _t
+        real_strftime = _t.strftime
+        fixed = _t.struct_time((2026, 6, 7, 14, 30, 0, 6, 158, 0))  # Sun Jun 7
+        with mock.patch.object(A.time, "strftime",
+                               side_effect=lambda fmt: real_strftime(fmt, fixed)):
+            out = A._act_get_time("")
+        # The real date components are present and grounded in the clock.
+        self.assertIn("June 07, 2026", out)
+        self.assertIn("Sunday", out)
 
     def test_accepts_ignored_arg(self):
         with mock.patch.object(A.time, "strftime", return_value="frozen"):
