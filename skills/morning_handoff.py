@@ -182,7 +182,12 @@ def _import_skill(name: str):
 # ─── briefing sections ───────────────────────────────────────────────────
 
 def _section_weather() -> str:
-    """'18 degrees and overcast in your area.' Empty on failure."""
+    """'64 degrees and overcast in your area.' Empty on failure.
+
+    Temperature is spoken in Fahrenheit (sir's preference): briefing_sources
+    stores Celsius, converted here with the canonical c*9/5+32 formula so this
+    section stays in lockstep with morning_arrival / morning_briefing — the
+    other two skills morning_chain may pick for the same wake event."""
     bs = _import_skill("briefing_sources")
     if not bs:
         return ""
@@ -197,11 +202,12 @@ def _section_weather() -> str:
         temp_c = int(data["temp_c"])
     except (KeyError, TypeError, ValueError):
         return ""
+    temp_f = int(round(temp_c * 9 / 5 + 32))
     desc = (data.get("desc") or "").strip().lower()
     suffix = " (cached)" if (data.get("source") == "cache" and data.get("stale")) else ""
     if not desc:
-        return f"{temp_c} degrees outside{suffix}."
-    return f"{temp_c} degrees and {desc} in your area{suffix}."
+        return f"{temp_f} degrees outside{suffix}."
+    return f"{temp_f} degrees and {desc} in your area{suffix}."
 
 
 def _section_calendar() -> str:
