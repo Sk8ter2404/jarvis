@@ -48,6 +48,29 @@ class TrayCommandContractTests(MonolithGlobalsTestCase):
             f"tray.py sends commands with NO bobert handler (dead menu items): "
             f"{unhandled}")
 
+    def test_open_hud_clears_x_button_latch_before_relaunch(self):
+        """P1-hud reopen bug: after the unified HUD is hidden via its ✕, the
+        persisted 'hidden' latch must be cleared or the relaunched subprocess
+        re-hides itself immediately. The open_hud dispatch branch must call
+        _set_unified_hud_hidden(False) BEFORE _launch_hud()."""
+        with open(self.bc.__file__, "r", encoding="utf-8") as f:
+            src = f.read()
+        # Isolate the open_hud elif block (up to the next elif/else/def).
+        m = re.search(
+            r'elif cmd == ["\']open_hud["\']:(.*?)(?:\n    elif |\n    else:|\ndef )',
+            src, re.DOTALL)
+        self.assertIsNotNone(m, "could not locate the open_hud dispatch block")
+        block = m.group(1)
+        self.assertIn(
+            "_set_unified_hud_hidden(False)", block,
+            "open_hud must clear the ✕-button 'hidden' latch (P1-hud reopen bug)")
+        # Ordering: the latch clear must precede the relaunch, else the freshly
+        # launched HUD reads hidden=True and hides before the clear lands.
+        self.assertLess(
+            block.index("_set_unified_hud_hidden(False)"),
+            block.index("_launch_hud()"),
+            "open_hud must clear the latch BEFORE relaunching the HUD subprocess")
+
 
 @requires_monolith
 class TrayStateFieldContractTests(MonolithGlobalsTestCase):

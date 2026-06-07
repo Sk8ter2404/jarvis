@@ -310,8 +310,13 @@ def _act_toggle_hud(_: str = "") -> str:
     except Exception:
         currently_visible = True
     bc._write_hud_state(visible=not currently_visible)
-    return ("HUD hidden, sir." if currently_visible
-            else "HUD restored, sir.")
+    if currently_visible:
+        return "HUD hidden, sir."
+    # Toggling back to visible must also clear a ✕-button hide, exactly like
+    # _act_show_hud — otherwise the persisted 'hidden' latch keeps the window
+    # down and the toggle silently fails to bring it back.
+    _set_unified_hud_hidden(False)
+    return "HUD restored, sir."
 
 
 # ─── Self-diagnostic probes (Phase 4B) ─────────────────────────────────
