@@ -3326,7 +3326,23 @@ if _profile_cascade is not None and _profile_cascade.empty():  # pragma: no cove
     _profile_cascade = None
 
 # Shared state written by face-tracking thread, read by main thread control
-_face_track_pause = threading.Event()   # set = paused
+#
+# _face_track_pause — set during voice activity (listening / thinking /
+# speaking). It means "yield the eyes and skip the HEAVY face detection +
+# eye-control servo math", NOT "turn the camera off". The loop keeps grabbing
+# and caching frames while paused (see the read/cache block) so see_user, the
+# Kinect air-mouse and head-gaze keep getting fresh frames, and — as long as
+# the primary camera is actually producing frames — the HUD preview keeps
+# being written, so the camera tile stays visibly ON while JARVIS listens or
+# talks. Only the cv2 cascade recognition cost is skipped, not the camera.
+_face_track_pause = threading.Event()   # set = skip heavy detection (voice)
+# _face_track_camera_off — set ONLY for the genuinely camera-off states where
+# the HUD must blank to its 'CAMERA OFF' placeholder even though the capture
+# loop is alive: the low-memory guard (KINECT_REVIEW P0) and standby / empty
+# room. Distinct from _face_track_pause so the voice-time pause stops killing
+# the preview while these real pauses still do. When set, the loop removes the
+# preview file and skips writing it regardless of frame availability.
+_face_track_camera_off = threading.Event()   # set = blank HUD preview (low-mem/standby)
 _face_track_stop  = threading.Event()   # set = thread should exit
 
 _smooth_x = 0.5
@@ -3788,12 +3804,25 @@ def _face_tracking_thread():
             # Always read from cameras so the latest frames stay fresh for see_user,
             # even when the tracker is paused (e.g. during speaking/listening).
             paused = _face_track_pause.is_set()
+            # camera_off is the *separate* signal for genuinely-off states. The
+            # voice-time `paused` case deliberately does NOT set it — the camera
+            # stays visibly ON while JARVIS listens/talks; only heavy detection
+            # stops. It IS set for the real camera-off states the brief requires
+            # to keep blanking the preview:
+            #   • the explicit event (_face_track_camera_off) — the hook the
+            #     KINECT_REVIEW P0 low-memory guard sets when host RAM/VRAM is
+            #     exhausted, so we stop mirroring HD frames under memory pressure;
+            #   • standby / empty room (_standby_mode) — JARVIS is parked, so the
+            #     HUD shows its 'CAMERA OFF' placeholder rather than a live feed.
+            camera_off = (_face_track_camera_off.is_set()
+                          or bool(_standby_mode[0]))
 
-            # HUD camera preview: while paused (or with the feature off) stop
-            # mirroring frames and remove the temp file so the HUD shows its
-            # 'camera off' placeholder and nothing lingers on disk. The actual
-            # write happens per-frame for the primary camera below.
-            if paused or not _hud_camera_preview_enabled():
+            # HUD camera preview: blank it ONLY when the camera is genuinely off
+            # (camera_off) or the feature is disabled — NOT merely because we're
+            # paused for voice. Removing the temp file makes the HUD fall back to
+            # its 'camera off' placeholder and leaves nothing lingering on disk.
+            # The per-frame write for the primary camera happens below.
+            if camera_off or not _hud_camera_preview_enabled():
                 _hud_camera_preview_remove()
 
             # Read all cameras, run face detection on each
@@ -3971,15 +4000,23 @@ def _face_tracking_thread():
                         _camera_last_read_error.pop(cam["index"], None)
                         _camera_last_read_error_at.pop(cam["index"], None)
                 # Mirror the PRIMARY camera's live frame to the HUD preview file
-                # (a small overwriting JPEG). Only while actively tracking — when
-                # paused (speaking/listening/standby) we stop writing and remove
-                # the file below so the HUD shows its 'camera off' placeholder and
-                # no frame lingers on disk. Gated by HUD_CAMERA_PREVIEW.
-                if (cam["primary"] and not paused
+                # (a small overwriting JPEG). We write it whenever the primary
+                # camera is producing frames — INCLUDING while paused for voice
+                # (listening/thinking/speaking) — so the HUD camera tile stays
+                # visibly ON and the air-mouse/gaze keep getting frames. We only
+                # stop when the camera is genuinely off (low-memory/standby, via
+                # camera_off, handled above) or the feature is disabled. Gated by
+                # HUD_CAMERA_PREVIEW.
+                if (cam["primary"] and not camera_off
                         and _hud_camera_preview_enabled()):
                     _hud_camera_preview_write(frame, now_loop)
                 if paused:
-                    continue   # skip detection/eye-control while paused
+                    # Skip the HEAVY cv2 face detection + eye-control servo math
+                    # while paused for voice — that recognition cost is what the
+                    # pause exists to save. The camera/preview above already kept
+                    # the tile live, so the HUD never shows 'CAMERA OFF' merely
+                    # because JARVIS is listening or speaking.
+                    continue
                 try:
                     face = _detect_face(frame)
                 except cv2.error:
@@ -4684,10 +4721,32 @@ def list_cameras(max_check: int = CAMERA_PROBE_MAX):
 
 
 def pause_face_tracking():
+    """Pause the HEAVY face detection + eye-control during voice activity.
+
+    This yields the eyes (so the listening/thinking/speaking animations own
+    them) and skips the cv2 cascade recognition cost — but it does NOT turn the
+    camera off. The capture loop keeps grabbing/caching frames and keeps writing
+    the HUD preview, so the camera tile stays visibly ON and the air-mouse/gaze
+    keep getting frames while JARVIS listens or talks. To genuinely blank the
+    camera (low-memory guard / standby) use set_face_tracking_camera_off()."""
     _face_track_pause.set()
 
 def resume_face_tracking():
     _face_track_pause.clear()
+
+def set_face_tracking_camera_off():
+    """Force the HUD camera preview to its 'CAMERA OFF' placeholder while the
+    capture loop keeps running. For the genuinely camera-off states the brief
+    requires to STILL blank the preview — the KINECT_REVIEW P0 low-memory guard
+    (stop mirroring HD frames under RAM/VRAM exhaustion) and any explicit
+    'camera should appear off' need. Standby is detected directly from
+    _standby_mode in the loop and needs no call here."""
+    _face_track_camera_off.set()
+
+def clear_face_tracking_camera_off():
+    """Undo set_face_tracking_camera_off() — let the live preview resume once
+    the low-memory / camera-off condition clears."""
+    _face_track_camera_off.clear()
 
 
 # ──────────────────────────────────────────────────────────────────────────
