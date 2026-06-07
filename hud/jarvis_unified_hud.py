@@ -101,6 +101,11 @@ CAMERA_PREVIEW_FILE     = os.path.join(PROJECT_DIR, "data", ".hud_camera_preview
 CAMERA_PREVIEW_STALE_S  = 2.5     # > writer's ~0.15s cadence; tolerates hitches
 
 MIN_W, MIN_H = 300, 380
+# Upper bounds for the panel. Shared by BOTH the CLI-default clamp (a stray
+# full-monitor --width must never make a monster bar) and the saved-geometry
+# restore clamp, so a stale unified_hud_geometry.json from a since-removed huge
+# monitor can't resurrect an oversized HUD either.
+MAX_W, MAX_H = 900, 1100
 
 # Stark cyan palette — matches the retired HUDs so the look is continuous.
 if _HAS_PYQT6:
@@ -179,6 +184,86 @@ def _load_saved_geometry() -> dict | None:
     except Exception:
         pass
     return None
+
+
+def _rects_overlap(ax: int, ay: int, aw: int, ah: int,
+                   bx: int, by: int, bw: int, bh: int) -> bool:
+    """True iff the two (x, y, w, h) rectangles share any area. A shared edge
+    only (zero-area touch) does NOT count — the HUD must have real pixels on a
+    screen to be reachable."""
+    return (ax < bx + bw and bx < ax + aw and
+            ay < by + bh and by < ay + ah)
+
+
+def _validate_geometry(geo: dict, screens: list, default_xy: tuple) -> dict:
+    """Make a restored window rect safe to show, given the available screen
+    rects.
+
+    A frameless, no-taskbar HUD that restores a stale geometry can otherwise
+    strand fully OFF-screen after a monitor-layout change (the only recovery
+    being to hand-delete unified_hud_geometry.json). This guards both ways:
+
+      • the width/height are clamped to [MIN_*, MAX_*] (a since-removed huge
+        monitor can't resurrect a monster bar), and
+      • after clamping the size, if the rect overlaps NO available screen its
+        top-left is reset to ``default_xy`` (the CLI anchor) so it lands back
+        on-screen. A rect that still touches any screen is left where the user
+        put it — straddling a bezel is intentional and preserved.
+
+    Pure (arithmetic only) so it is unit-testable without Qt or a real display.
+    ``screens`` is a list of (x, y, w, h); an empty list (no screens known)
+    skips the on-screen test and only clamps the size.
+    """
+    x, y = int(geo["x"]), int(geo["y"])
+    w = min(max(MIN_W, int(geo["w"])), MAX_W)
+    h = min(max(MIN_H, int(geo["h"])), MAX_H)
+    if screens:
+        on_screen = any(
+            _rects_overlap(x, y, w, h, int(sx), int(sy), int(sw), int(sh))
+            for (sx, sy, sw, sh) in screens
+        )
+        if not on_screen:
+            x, y = int(default_xy[0]), int(default_xy[1])
+    return {"x": x, "y": y, "w": w, "h": h}
+
+
+def _available_screen_rects() -> list:
+    """Best-effort list of available (work-area) screen rects as (x, y, w, h).
+
+    Prefers Qt's own view of the screens (so it matches exactly where the HUD
+    can actually be placed) when a QApplication exists; otherwise falls back to
+    the project's MONITORS layout from core.config. Returns [] if neither is
+    available, in which case _validate_geometry only clamps the size."""
+    rects: list = []
+    if _HAS_PYQT6:
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                for sc in app.screens():
+                    r = sc.availableGeometry()
+                    rects.append((r.x(), r.y(), r.width(), r.height()))
+        except Exception:
+            rects = []
+    if rects:
+        return rects
+    # Fallback: the friendly MONITORS layout the rest of JARVIS uses. Imported
+    # lazily so this lightweight HUD subprocess doesn't drag in core.config
+    # unless it actually needs the fallback.
+    try:
+        if PROJECT_DIR not in sys.path:
+            sys.path.insert(0, PROJECT_DIR)
+        from core import config as _cfg  # type: ignore
+        mons = getattr(_cfg, "MONITORS", None)
+        if isinstance(mons, dict):
+            for v in mons.values():
+                try:
+                    x, y, w, h = v
+                    rects.append((int(x), int(y), int(w), int(h)))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return rects
 
 
 # ─── background data cache (weather / calendar — slow, networked) ────────────
@@ -1043,18 +1128,26 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
-    # Saved geometry (from a prior drag/resize) overrides the CLI default.
-    geo = _load_saved_geometry()
-    if geo:
-        x, y, w, h = geo["x"], geo["y"], geo["w"], geo["h"]
-    else:
-        # Clamp the launcher-provided default so a stray full-monitor width can
-        # never produce a monster bar. Saved geometry (above) is trusted as-is.
-        x, y = args.x, args.y
-        w = min(max(MIN_W, args.width), 900)
-        h = min(max(MIN_H, args.height), 1100)
+    # Clamp the launcher-provided default so a stray full-monitor width can
+    # never produce a monster bar.
+    default_x, default_y = args.x, args.y
+    w = min(max(MIN_W, args.width), MAX_W)
+    h = min(max(MIN_H, args.height), MAX_H)
+    x, y = default_x, default_y
 
     app = QApplication(sys.argv[:1])
+
+    # Saved geometry (from a prior drag/resize) overrides the CLI default, but
+    # must be validated FIRST: clamp its size and, if a monitor-layout change
+    # left it stranded off every screen, snap it back to the CLI anchor so a
+    # stale unified_hud_geometry.json can't hide the frameless HUD off-screen.
+    # Done after the QApplication exists so _available_screen_rects sees the
+    # real Qt screens (it falls back to MONITORS otherwise).
+    geo = _load_saved_geometry()
+    if geo:
+        valid = _validate_geometry(geo, _available_screen_rects(),
+                                   (default_x, default_y))
+        x, y, w, h = valid["x"], valid["y"], valid["w"], valid["h"]
     slow = _SlowData()
     slow.start()
     hud = UnifiedHud(args.parent_pid, slow)
