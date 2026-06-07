@@ -270,6 +270,30 @@ class MergeMemoryTests(_MonolithTestBase):
         # The 5 oldest should have been trimmed off the front.
         self.assertNotIn("old fact 0", self._store["facts"])
 
+    def test_overlong_fact_stored_truncated_normal_unchanged(self):
+        # An over-long garbage fact must be capped before it lands in the store
+        # (it's re-injected into the cloud system prompt every turn); a normal
+        # fact in the same call is stored byte-for-byte.
+        long_fact = "blah " * 200  # ~1000 chars
+        normal = "User enjoys hiking"
+        self.bc.merge_memory(new_facts=[long_fact, normal])
+        stored = self._store["facts"]
+        self.assertIn(normal, stored)                       # untouched
+        self.assertNotIn(long_fact, stored)                 # not stored raw
+        trimmed = [f for f in stored if f.startswith("blah")][0]
+        self.assertLessEqual(len(trimmed), self.bc.MAX_FACT_LEN + 1)
+        self.assertTrue(trimmed.endswith("…"))
+
+    def test_preexisting_overlong_fact_clamped_on_load(self):
+        # A bloated fact already on disk (stored before the cap existed) is
+        # repaired in place on the next merge, even when nothing new is added
+        # for it.
+        self._store["facts"] = ["junk " * 200]
+        self.bc.merge_memory(new_facts=["User likes tea"])
+        for f in self._store["facts"]:
+            self.assertLessEqual(len(f), self.bc.MAX_FACT_LEN + 1)
+        self.assertIn("User likes tea", self._store["facts"])
+
 
 # ──────────────────────────────────────────────────────────────────────────
 #  Standing rules + system prompt

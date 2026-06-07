@@ -14,6 +14,10 @@ Two pure guards run before a candidate fact/project is written:
                                  [overnight] task tags, placeholder "None") that
                                  the local fallback model otherwise learned as
                                  bogus "projects" (2026-05-30 live-watch fix).
+  _clamp_fact_len(text)        — truncates an over-long candidate to MAX_FACT_LEN
+                                 chars (on a word boundary when one is close) so
+                                 a single garbage-long "fact" can't bloat the
+                                 cloud system prompt on every turn (2026-06-07).
 
 Extracted from bobert_companion.py so this security-critical logic is unit
 tested in isolation. Pure stdlib (`re`); bobert_companion re-exports both
@@ -67,3 +71,33 @@ def _is_internal_noise_fact(text: str) -> bool:
     if t.lower() in {"none", "n/a", "na", "null", "unknown", ""}:
         return True
     return bool(_NOISE_FACT_PATTERNS.search(t))
+
+
+# Per-fact length cap. Each stored fact/project is concatenated into the system
+# prompt sent to the cloud LLM on EVERY turn, so one runaway "fact" (a pasted
+# log line, a rambling local-model hallucination) is permanent token bloat that
+# degrades the prompt until it's manually pruned. A real durable fact ("User's
+# name is Alex", "Building the REPO animatronic") fits comfortably in 300 chars.
+MAX_FACT_LEN = 300
+
+
+def _clamp_fact_len(text: str, cap: int = MAX_FACT_LEN) -> str:
+    """Truncate an over-long candidate fact/project to `cap` characters.
+
+    Cuts on a word boundary when a space falls in the back portion of the
+    window (so we don't slice a word in half), otherwise hard-cuts at `cap`
+    (an unbroken garbage token). A trailing '…' marks that truncation
+    happened. Short inputs are returned unchanged (no marker), so this is a
+    no-op for normal facts and is safe to apply on both insert and load.
+    """
+    if not isinstance(text, str):
+        return text
+    if len(text) <= cap:
+        return text
+    head = text[:cap]
+    cut = head.rfind(" ")
+    # Only honour the word boundary if it isn't chopping off most of the text
+    # (e.g. a 300-char unbroken token whose only space is at index 4).
+    if cut >= int(cap * 0.6):
+        head = head[:cut]
+    return head.rstrip() + "…"
