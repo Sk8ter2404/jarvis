@@ -300,6 +300,129 @@ class JarvisPushbackTests(SectionSixBase):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  run_python arbitrary-code gate (P0 RCE)
+# ════════════════════════════════════════════════════════════════════════════
+class RunPythonGateTests(SectionSixBase):
+    """run_python / eval_python / compute must not auto-exec dangerous code.
+
+    Safe pure-math/compute AST-scans clean and runs unprompted; anything that
+    can touch the filesystem / process table / network / sandbox internals is
+    deferred onto the confirm queue (returns a pushback tuple). The gate is a
+    hard security control, so it fires even with PUSHBACK_ENABLED off."""
+
+    # ── _scan_python_for_danger: safe snippets pass ──────────────────────────
+    def test_scan_pure_math_is_safe(self):
+        for code in ("2 + 2", "2**32", "print(sum(range(10)))",
+                     "x = [i*i for i in range(5)]\nmax(x)",
+                     "import math, statistics\nmath.sqrt(2)",
+                     "import numpy as np\nnp.arange(3).mean()",
+                     "from datetime import date\ndate(2026, 6, 7)",
+                     "import json\njson.dumps({'a': 1})"):
+            self.assertIsNone(self.bc._scan_python_for_danger(code),
+                              f"expected safe: {code!r}")
+
+    def test_scan_empty_is_safe(self):
+        self.assertIsNone(self.bc._scan_python_for_danger(""))
+        self.assertIsNone(self.bc._scan_python_for_danger("   \n  "))
+
+    # ── _scan_python_for_danger: dangerous snippets flagged ──────────────────
+    def test_scan_os_system_flagged(self):
+        self.assertEqual(
+            self.bc._scan_python_for_danger("import os\nos.system('calc')"),
+            "import os")
+
+    def test_scan_subprocess_flagged(self):
+        self.assertIsNotNone(
+            self.bc._scan_python_for_danger(
+                "import subprocess as s\ns.Popen(['x'])"))
+
+    def test_scan_shutil_rmtree_flagged(self):
+        self.assertIsNotNone(
+            self.bc._scan_python_for_danger(
+                "import shutil\nshutil.rmtree('C:/important')"))
+
+    def test_scan_socket_flagged(self):
+        self.assertIsNotNone(
+            self.bc._scan_python_for_danger(
+                "import socket\nsocket.socket()"))
+
+    def test_scan_open_write_flagged(self):
+        # Bare open() is treated as untrusted regardless of mode — a write to
+        # an arbitrary path from injected content is the threat.
+        self.assertEqual(
+            self.bc._scan_python_for_danger("open('f.txt', 'w').write('x')"),
+            "open")
+
+    def test_scan_dunder_import_flagged(self):
+        # The whole expression is dangerous; the scanner returns whichever
+        # dangerous token it reaches first in the AST walk (here .system or
+        # __import__) — what matters is that it's non-None (deferred).
+        self.assertIn(
+            self.bc._scan_python_for_danger("__import__('os').system('x')"),
+            ("__import__", "system"))
+        # And __import__ on its own (no attribute chain) is flagged by name.
+        self.assertEqual(
+            self.bc._scan_python_for_danger("m = __import__('socket')"),
+            "__import__")
+
+    def test_scan_eval_exec_flagged(self):
+        self.assertEqual(self.bc._scan_python_for_danger("eval('1+1')"), "eval")
+        self.assertEqual(self.bc._scan_python_for_danger("exec('y=1')"), "exec")
+
+    def test_scan_from_import_dangerous_module(self):
+        self.assertEqual(
+            self.bc._scan_python_for_danger("from os import system"),
+            "from os import …")
+
+    def test_scan_sandbox_escape_subclasses_flagged(self):
+        # The classic ().__class__.__bases__[0].__subclasses__() ladder.
+        self.assertIsNotNone(
+            self.bc._scan_python_for_danger(
+                "().__class__.__bases__[0].__subclasses__()"))
+
+    def test_scan_unparseable_is_dangerous(self):
+        # Fail-safe: we'd rather ask than auto-run code we can't reason about.
+        self.assertIsNotNone(
+            self.bc._scan_python_for_danger("def (:::"))
+
+    # ── routing through _jarvis_pushback ─────────────────────────────────────
+    def test_pushback_safe_compute_runs(self):
+        for nm in ("run_python", "python", "eval_python", "compute"):
+            self.assertIsNone(self.bc._jarvis_pushback(nm, "2 + 2"),
+                              f"{nm} of safe math should not push back")
+
+    def test_pushback_dangerous_run_python_defers(self):
+        res = self.bc._jarvis_pushback("run_python", "import os\nos.system('x')")
+        self.assertIsNotNone(res)
+        phrase, reason = res
+        self.assertIn("execute it regardless", phrase)
+        self.assertIn("run_python dangerous construct", reason)
+        self.assertIn("os", reason)
+
+    def test_pushback_dangerous_aliases_defer(self):
+        payload = "import subprocess\nsubprocess.run(['x'])"
+        for nm in ("python", "eval_python", "compute"):
+            self.assertIsNotNone(self.bc._jarvis_pushback(nm, payload),
+                                 f"{nm} should defer a subprocess payload")
+
+    def test_gate_fires_even_when_pushback_disabled(self):
+        # Hard P0 control: the run_python AST gate must NOT be defeatable via
+        # the PUSHBACK_ENABLED config toggle (unlike the gray-zone pushbacks).
+        with mock.patch.object(self.bc, "PUSHBACK_ENABLED", False):
+            self.assertIsNotNone(
+                self.bc._jarvis_pushback("run_python",
+                                         "import os\nos.system('x')"))
+            # …while safe compute still passes through untouched.
+            self.assertIsNone(self.bc._jarvis_pushback("compute", "2 + 2"))
+
+    def test_run_python_family_in_destructive_replay_set(self):
+        # Defense-in-depth: "do that again" / fuzzy-typo disambiguation must
+        # not silently re-fire Python code.
+        for nm in ("run_python", "python", "eval_python", "compute"):
+            self.assertIn(nm, self.bc._DESTRUCTIVE_REPLAY_ACTIONS)
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  Mission narration
 # ════════════════════════════════════════════════════════════════════════════
 class MissionNarrationTests(SectionSixBase):
