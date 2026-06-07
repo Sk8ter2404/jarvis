@@ -75,7 +75,14 @@ def _is_parent_alive(pid: int) -> bool:
     if pid <= 0:
         return True
     if _HAS_PSUTIL:
-        return psutil.pid_exists(pid)
+        # pid_exists can raise on Windows for a transient handle/permission
+        # error. The reticle spans the full virtual desktop, so a frozen
+        # frame here is the worst case — treat an unknowable parent as alive
+        # (matches the PyQt HUDs' guard) so a hiccup can't strand it.
+        try:
+            return psutil.pid_exists(pid)
+        except Exception:
+            return True
     try:
         os.kill(pid, 0)
         return True

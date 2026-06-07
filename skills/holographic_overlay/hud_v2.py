@@ -9,7 +9,7 @@ HUD with a proper Stark-style status ring. Draws every 500 ms:
   • Outer arc-reactor ring split into three quadrant arcs
       ▸ top-left   (9 o'clock → 12 o'clock)  CPU %     cyan → amber → red
       ▸ top-right  (12 o'clock → 3 o'clock)  RAM %     cyan → amber → red
-      ▸ bottom     (3 o'clock → 9 o'clock)   GPU °C    cyan → amber → red
+      ▸ bottom     (3 o'clock → 9 o'clock)   GPU %     cyan → amber → red
     so the four-quadrant layout of arc_reactor_status_hud.py is preserved
     but the bottom semicircle is reserved for the calendar/track text
     rows that sit underneath the disc.
@@ -29,14 +29,14 @@ HUD with a proper Stark-style status ring. Draws every 500 ms:
     (subject + relative time, e.g. "Standup in 14 min"). When no token
     is configured or Graph is unreachable, the slot stays blank — the
     spec calls for a silent degrade rather than an error banner.
-  • Stat chips at the cardinals — `CPU 47%`, `RAM 62%`, `GPU 71°` —
+  • Stat chips at the cardinals — `CPU 47%`, `RAM 62%`, `GPU 71%` —
     same number-readable affordance as arc_reactor_status_hud.
 
 Data sources:
   • hud_state.json (project root) — state, tts_amplitude, mic_level,
-    pulse_strip fallback for GPU temp when nvidia-smi is unavailable.
+    pulse_strip fallback for GPU utilization when nvidia-smi is unavailable.
   • psutil — CPU % / RAM % each tick.
-  • nvidia-smi — GPU temperature, cached 4 s.
+  • nvidia-smi — GPU utilization %, cached briefly.
   • skill_apple_music_intel._sample_now_playing — current track via the
     iTunes COM bridge with window-title fallback.
   • skill_ms_graph.get_first_meeting — next calendar event. Silent
@@ -120,7 +120,7 @@ TICK_MS = 500  # spec — 500 ms refresh cadence
 # iTunes COM bridge, so we don't want them on every frame.
 TRACK_REFRESH_TICKS    = 12     # ~6 s
 CALENDAR_REFRESH_TICKS = 240    # ~2 min
-GPU_CACHE_SECONDS      = 4.0
+GPU_CACHE_SECONDS      = 1.0   # utilization swings fast; a 4 s cache aliases it
 
 # Palette — kept in lockstep with arc_reactor_status_hud so the two
 # surfaces read as one system.
@@ -154,8 +154,8 @@ CPU_WARN_PCT      = 75.0
 CPU_CRIT_PCT      = 90.0
 RAM_WARN_PCT      = 75.0
 RAM_CRIT_PCT      = 90.0
-GPU_WARN_C        = 70.0
-GPU_CRIT_C        = 82.0
+GPU_WARN_PCT      = 70.0
+GPU_CRIT_PCT      = 90.0
 
 
 def _is_parent_alive(pid: int) -> bool:
@@ -279,7 +279,7 @@ class StarkStatusRingScene(_QtSceneBase):
         # Live sample buffers.
         self.cpu_pct        = 0.0
         self.ram_pct        = 0.0
-        self.gpu_temp_c: float | None = None
+        self.gpu_util_pct: float | None = None
         self.state          = "idle"
         self.tts_amp        = 0.0
         self.mic_level      = 0.0
@@ -324,33 +324,36 @@ class StarkStatusRingScene(_QtSceneBase):
         self._recompute_layout()
 
     # ─── sensor reads ──────────────────────────────────────────────────
-    def _read_gpu_temp(self) -> float | None:
-        """Best-effort GPU temperature in Celsius — cached 4 s so the
+    def _read_gpu_util(self) -> float | None:
+        """Best-effort GPU utilization percent (0–100) — cached briefly so the
         nvidia-smi subprocess doesn't dominate the renderer."""
         now = time.time()
         if (now - self._gpu_cached_at) < GPU_CACHE_SECONDS:
-            return self.gpu_temp_c
+            return self.gpu_util_pct
         self._gpu_cached_at = now
         try:
             exe = shutil.which("nvidia-smi")
             if exe:
                 out = subprocess.run(
-                    [exe, "--query-gpu=temperature.gpu",
+                    [exe, "--query-gpu=utilization.gpu",
                      "--format=csv,noheader,nounits"],
                     capture_output=True, text=True, timeout=2.0,
                     creationflags=(subprocess.CREATE_NO_WINDOW
                                    if sys.platform == "win32" else 0),
                 )
-                temps = []
+                utils = []
                 for v in (out.stdout or "").strip().splitlines():
                     v = v.strip()
                     if v.isdigit():
-                        temps.append(int(v))
-                if temps:
-                    return float(max(temps))
+                        utils.append(int(v))
+                if utils:
+                    return float(max(utils))
         except Exception:
             pass
-        # Fallback — parse the pulse_strip "GPU 33C" hint if present.
+        # Fallback — parse the pulse_strip "GPU 33%" hint if present. The
+        # producer (skills/system_pulse.py) emits utilization with a "%"
+        # suffix; the digit-scan below stops at the first non-digit so the
+        # trailing "%" terminates the parse cleanly.
         hud = _read_json(HUD_STATE_FILE)
         strip = (hud.get("pulse_strip") or "")
         if "GPU " in strip:
@@ -395,7 +398,7 @@ class StarkStatusRingScene(_QtSceneBase):
                 self.ram_pct = float(psutil.virtual_memory().percent)
             except Exception:
                 pass
-        self.gpu_temp_c = self._read_gpu_temp()
+        self.gpu_util_pct = self._read_gpu_util()
 
         bambu = _read_json(BAMBU_STATE_FILE)
         gs = (bambu.get("gcode_state") or "").upper()
@@ -504,11 +507,13 @@ class StarkStatusRingScene(_QtSceneBase):
         # the disc reads as Stark's three-rotor reactor.
         cpu_frac = self._fraction(self.cpu_pct, 100.0)
         ram_frac = self._fraction(self.ram_pct, 100.0)
-        gpu_val  = self.gpu_temp_c if self.gpu_temp_c is not None else 0.0
-        gpu_frac = max(0.0, min(1.0, (gpu_val - 30.0) / max(1.0, 95.0 - 30.0)))
+        # GPU utilization maps 0% -> empty up to 100% -> full (flat 0–100, no
+        # offset — unlike the old temperature band).
+        gpu_val  = self.gpu_util_pct if self.gpu_util_pct is not None else 0.0
+        gpu_frac = max(0.0, min(1.0, gpu_val / 100.0))
         gpu_arc_color = (
-            self._color_for_metric(gpu_val, GPU_WARN_C, GPU_CRIT_C)
-            if self.gpu_temp_c is not None else CYAN_DIM
+            self._color_for_metric(gpu_val, GPU_WARN_PCT, GPU_CRIT_PCT)
+            if self.gpu_util_pct is not None else CYAN_DIM
         )
 
         # Qt drawArc: 0° = 3 o'clock, CCW positive, angles in 1/16 °.
@@ -676,14 +681,14 @@ class StarkStatusRingScene(_QtSceneBase):
             f"RAM {self.ram_pct:>4.0f}%",
         )
         # GPU chip — right of the disc
-        if self.gpu_temp_c is not None:
+        if self.gpu_util_pct is not None:
             gpu_color = self._color_for_metric(
-                self.gpu_temp_c, GPU_WARN_C, GPU_CRIT_C,
+                self.gpu_util_pct, GPU_WARN_PCT, GPU_CRIT_PCT,
             )
-            gpu_text = f"GPU {self.gpu_temp_c:>3.0f}°C"
+            gpu_text = f"GPU {self.gpu_util_pct:>3.0f}%"
         else:
             gpu_color = DIM_TEXT
-            gpu_text = "GPU — °C"
+            gpu_text = "GPU — %"
         painter.setPen(QPen(gpu_color))
         gpu_x = min(self.w - 88.0, cx + self.R_OUTER + 10.0)
         painter.drawText(

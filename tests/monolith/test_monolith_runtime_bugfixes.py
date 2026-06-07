@@ -23,6 +23,21 @@
      + _speak_verbatim_results(), with dedup so an inlined answer isn't
      double-spoken and side-effect/failure results are left alone.
 
+2026-06-07 (mic-stream TOCTOU, REVIEW_FINDINGS_2 P1-4):
+
+  4. record_speech() opened+started its sd.InputStream BEFORE publishing mic
+     ownership via _record_speech_active[0]=True. _refresh_devices() only skips
+     the destructive sd._terminate()/sd._initialize() reinit while that flag is
+     True, so in the window between the live stream and the (late) flag flip a
+     concurrent background caller (self_diagnostic / ambient_listen ->
+     get_input_device -> _refresh_devices) could tear PortAudio out from under
+     the just-started callback and heap-corrupt the process (0xc0000374). The
+     flag is now set BEFORE the open, and cleared again on any open/start
+     failure, so the reinit guard can never observe a live-stream-but-flag-False
+     state. Tests assert (a) the flag is already True at InputStream construction
+     and at .start(), (b) it's cleared if the open raises, and (c) the
+     _refresh_devices guard actually defers the reinit while the flag is set.
+
 Monolith-tier (full-deps): run locally; skip on the light-deps CI runner.
     python -m unittest tests.monolith.test_monolith_runtime_bugfixes
 """
@@ -225,6 +240,182 @@ class VerbatimResultSpokenTests(MonolithGlobalsTestCase):
             {"play_music": lambda a="": "playing Take Five by Dave Brubeck"})
         self.assertFalse(any("Take Five" in s for s in spoken),
                          f"side-effect music result was verbatim-spoken: {spoken}")
+
+
+@requires_monolith
+class RecordSpeechOwnershipOrderingTests(MonolithGlobalsTestCase):
+    """Bug 4 (REVIEW_FINDINGS_2 P1-4): the mic-ownership flag must be published
+    BEFORE record_speech opens/starts its InputStream, and dropped again if the
+    open fails — so _refresh_devices' reinit guard can never tear PortAudio down
+    under a live-but-unflagged stream.
+
+    These drive record_speech without a real mic: sd.InputStream and
+    get_input_device are mocked, the watchdog reset signal is pre-set so the
+    capture loop bails on its first iteration (still running the finally that
+    closes the stream + clears the flag), and _safe_close_stream is stubbed.
+    """
+
+    def setUp(self):
+        bc = self.bc
+        # record_speech short-circuits to None when the mic is "disabled"
+        # (staging sets that), so force it live for these tests.
+        self._p_disabled = mock.patch.object(bc, "_mic_input_disabled",
+                                              return_value=False)
+        self._p_close = mock.patch.object(bc, "_safe_close_stream")
+        self._p_getdev = mock.patch.object(bc, "get_input_device", return_value=0)
+        self._p_disabled.start()
+        self._p_close.start()
+        self._p_getdev.start()
+        # The watchdog Event is module-global and NOT in the harness restore
+        # set, so clear it after each test regardless of how the body exits.
+        self.addCleanup(bc._watchdog_reset_signal.clear)
+        self.addCleanup(self._p_disabled.stop)
+        self.addCleanup(self._p_close.stop)
+        self.addCleanup(self._p_getdev.stop)
+
+    def test_flag_is_true_when_stream_opened_and_started(self):
+        bc = self.bc
+        seen = {"at_open": None, "at_start": None}
+
+        class FakeStream:
+            def __init__(_self, *a, **k):
+                # Ownership MUST already be published by the time PortAudio is
+                # handed a live callback — this is the TOCTOU window.
+                seen["at_open"] = bc._record_speech_active[0]
+
+            def start(_self):
+                seen["at_start"] = bc._record_speech_active[0]
+
+            def stop(_self):
+                pass
+
+            def close(_self):
+                pass
+
+        # Bail out of the capture loop immediately (first watchdog check) so we
+        # exercise open -> start -> flag-set -> finally without real audio.
+        bc._watchdog_reset_signal.set()
+        with mock.patch.object(bc.sd, "InputStream", FakeStream):
+            out = bc.record_speech(timeout=0.0)
+
+        self.assertIsNone(out)  # watchdog-bail returns None
+        self.assertIs(seen["at_open"], True,
+                      "flag must be True BEFORE sd.InputStream is constructed")
+        self.assertIs(seen["at_start"], True,
+                      "flag must be True BEFORE stream.start()")
+        # And the finally restored it so the next turn starts clean.
+        self.assertFalse(bc._record_speech_active[0])
+
+    def test_sample_rate_published_before_open(self):
+        bc = self.bc
+        seen = {"sr": None}
+
+        class FakeStream:
+            def __init__(_self, *a, **k):
+                seen["sr"] = bc._record_speech_sr[0]
+
+            def start(_self):
+                pass
+
+            def stop(_self):
+                pass
+
+            def close(_self):
+                pass
+
+        bc._watchdog_reset_signal.set()
+        with mock.patch.object(bc.sd, "InputStream", FakeStream):
+            bc.record_speech(timeout=0.0)
+        self.assertEqual(seen["sr"], bc.SAMPLE_RATE,
+                         "stream sample rate must be published before the open")
+
+    def test_flag_cleared_when_open_raises(self):
+        """If the InputStream open (incl. the system-default retry) fails, the
+        ownership flag must NOT be left stuck True — otherwise _refresh_devices
+        would defer the reinit forever against a stream that doesn't exist."""
+        bc = self.bc
+
+        # Both the first open and the device=None retry raise PortAudioError.
+        def boom(*a, **k):
+            raise bc.sd.PortAudioError("no such device")
+
+        with mock.patch.object(bc.sd, "InputStream", side_effect=boom), \
+                mock.patch("builtins.print"):
+            out = bc.record_speech(timeout=0.0)
+
+        self.assertIsNone(out)
+        self.assertFalse(bc._record_speech_active[0],
+                         "flag must be cleared after an open failure")
+
+    def test_flag_cleared_when_start_raises(self):
+        bc = self.bc
+
+        class FakeStream:
+            def __init__(_self, *a, **k):
+                pass
+
+            def start(_self):
+                raise RuntimeError("start boom")
+
+            def stop(_self):
+                pass
+
+            def close(_self):
+                pass
+
+        with mock.patch.object(bc.sd, "InputStream", FakeStream), \
+                mock.patch("builtins.print"):
+            out = bc.record_speech(timeout=0.0)
+
+        self.assertIsNone(out)
+        self.assertFalse(bc._record_speech_active[0],
+                         "flag must be cleared after a start() failure")
+
+
+@requires_monolith
+class RefreshDevicesReinitGuardTests(MonolithGlobalsTestCase):
+    """The other half of P1-4: _refresh_devices must DEFER the destructive
+    PortAudio reinit while record_speech owns the mic (flag True). Paired with
+    the ordering fix above, this is what makes a mid-capture teardown
+    impossible."""
+
+    def _run_refresh(self, *, active: bool):
+        bc = self.bc
+        terminated = {"called": False}
+
+        def fake_terminate():
+            terminated["called"] = True
+
+        prev = bc._record_speech_active[0]
+        bc._record_speech_active[0] = active
+        try:
+            with mock.patch.object(bc.sd, "_terminate", side_effect=fake_terminate), \
+                    mock.patch.object(bc.sd, "_initialize"), \
+                    mock.patch.object(bc.sd, "query_devices",
+                                      return_value={"name": "FakeMic"}), \
+                    mock.patch.object(bc, "_pick_device",
+                                      return_value=(0, "FakeMic")), \
+                    mock.patch.object(bc, "MICROPHONE_INDEX", None), \
+                    mock.patch.object(bc, "SPEAKER_INDEX", None), \
+                    mock.patch("builtins.print"):
+                # force=True bypasses the time/signature short-circuits so the
+                # flag guard is the only thing that can stop the reinit.
+                bc._refresh_devices(force=True)
+        finally:
+            bc._record_speech_active[0] = prev
+        return terminated["called"]
+
+    def test_reinit_deferred_while_record_speech_active(self):
+        self.assertFalse(
+            self._run_refresh(active=True),
+            "sd._terminate() must NOT run while record_speech owns the mic")
+
+    def test_reinit_runs_when_mic_idle(self):
+        # Control: with the flag clear, force=True DOES reinit — proving the
+        # deferral above is the flag's doing, not an unrelated short-circuit.
+        self.assertTrue(
+            self._run_refresh(active=False),
+            "sd._terminate() should run when no capture owns the mic")
 
 
 if __name__ == "__main__":

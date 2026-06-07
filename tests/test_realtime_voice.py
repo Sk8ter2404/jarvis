@@ -601,6 +601,122 @@ class BargeInTests(unittest.TestCase):
         with mock.patch("builtins.print"):
             p.barge_in()  # must not raise
 
+    def test_callback_runs_outside_the_lock(self):
+        """The on_barge_in callback re-enters the main loop and may call back
+        into the pipeline; it must NOT run while _tts_lock is held or a
+        re-entrant feed/barge would deadlock. Prove the lock is free when the
+        callback fires by acquiring it from inside the callback."""
+        acquired = []
+
+        def cb():
+            # Non-blocking acquire: succeeds only if barge_in already released.
+            got = p._tts_lock.acquire(blocking=False)
+            acquired.append(got)
+            if got:
+                p._tts_lock.release()
+
+        p = rtv.RealtimeVoicePipeline(on_barge_in=cb)
+        p._tts_stream = FakeTTSStream()
+        p.barge_in()
+        self.assertEqual(acquired, [True],
+                         "_tts_lock must be released before on_barge_in runs")
+
+
+class BargeInReArmRaceTests(unittest.TestCase):
+    """REVIEW_FINDINGS_2 P1-3: an interrupted response must not re-arm itself.
+
+    barge_in() (STT thread) does stop()+_playing.clear(); feed_response_chunk()
+    (LLM-stream thread) does is_playing()-check -> play_async(). Without a shared
+    lock, a chunk arriving mid-stop sees is_playing()==False and calls
+    play_async() again, resurrecting the very response the user interrupted.
+    These tests pin the exact interleaving with a stop() that blocks inside the
+    critical section and assert the lock serialises the two paths.
+    """
+
+    def _blocking_stop_stream(self):
+        """A fake stream whose stop() parks inside barge_in's critical section
+        (lock held) until the test releases it. play_async() records when it
+        runs so we can prove it never fired during the interrupt window."""
+        import threading as _t
+
+        events = {
+            "stop_entered": _t.Event(),
+            "release_stop": _t.Event(),
+            "play_async_during_block": [],
+        }
+
+        class BlockingStopStream:
+            def __init__(self):
+                self._playing = True
+                self.play_async_calls = 0
+                self.fed = []
+
+            def feed(self, text):
+                self.fed.append(text)
+
+            def is_playing(self):
+                return self._playing
+
+            def play_async(self, on_audio_chunk=None):
+                # If this ever runs while barge_in is still mid-stop (the race),
+                # record it — the assertion below fails if so.
+                if events["stop_entered"].is_set() and not events["release_stop"].is_set():
+                    events["play_async_during_block"].append(True)
+                self.play_async_calls += 1
+                self._playing = True
+
+            def stop(self):
+                events["stop_entered"].set()
+                # Hold the critical section open until the test says go.
+                events["release_stop"].wait(timeout=5.0)
+                self._playing = False
+
+        return BlockingStopStream(), events
+
+    def test_feed_cannot_rearm_between_stop_and_clear(self):
+        import threading as _t
+
+        s, ev = self._blocking_stop_stream()
+        p = rtv.RealtimeVoicePipeline()
+        p._tts_stream = s
+        p._playing.set()
+
+        t_barge = _t.Thread(target=p.barge_in, name="barge", daemon=True)
+        t_barge.start()
+        # Wait until barge_in is inside stop() (so it holds _tts_lock).
+        self.assertTrue(ev["stop_entered"].wait(timeout=5.0))
+
+        feed_returned = _t.Event()
+
+        def do_feed():
+            p.feed_response_chunk("resurrected response")
+            feed_returned.set()
+
+        t_feed = _t.Thread(target=do_feed, name="feed", daemon=True)
+        t_feed.start()
+
+        # The feed thread must BLOCK on _tts_lock (held by barge_in); it cannot
+        # have returned, and crucially cannot have re-armed playback yet.
+        self.assertFalse(feed_returned.wait(timeout=0.5),
+                         "feed_response_chunk re-armed while barge_in held the lock")
+        self.assertEqual(s.play_async_calls, 0,
+                         "playback re-armed mid-interrupt — the race is not fixed")
+
+        # Let barge_in finish: stop() returns, _playing.clear() runs, lock frees.
+        ev["release_stop"].set()
+        t_barge.join(timeout=5.0)
+        t_feed.join(timeout=5.0)
+        self.assertFalse(t_barge.is_alive())
+        self.assertFalse(t_feed.is_alive())
+
+        # play_async never fired DURING the stop critical section.
+        self.assertEqual(ev["play_async_during_block"], [],
+                         "play_async ran between stop() and the lock release")
+        # After the interrupt completed the feed proceeds as a fresh utterance
+        # (correct): it fed its text and started a new, post-barge playback.
+        self.assertEqual(s.fed, ["resurrected response"])
+        self.assertEqual(s.play_async_calls, 1)
+
 
 # ──────────────────────────────────────────────────────────────────────
 # _on_audio_chunk()  (uses REAL numpy; audio_processor is mocked)

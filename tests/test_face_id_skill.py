@@ -308,6 +308,66 @@ class WhoamiTests(FaceIdSkillBase):
         self.assertIn("don't see a face", out.lower())
 
 
+# ─── whoami GROUNDING: live frame is the source of truth, never memory ───────
+# Regression guard for the "ducked under the desk" bug (caught live): the owner
+# is enrolled/known, but when he is OUT OF FRAME whoami must report what the
+# CAMERA sees on the CURRENT frame ("no one"), not his remembered name. These
+# pin the contract the prompt now routes to: present -> name, empty -> no one,
+# read FRESH every call.
+class WhoamiGroundingTests(FaceIdSkillBase):
+    def test_present_reports_name_empty_reports_no_one(self):
+        """The recognizer drives the answer: a face -> 'you', nothing -> 'no
+        one' — never the enrolled identity when the frame is empty."""
+        bc = _fake_monolith(frames={0: _Frame()})
+
+        # present -> the owner is named
+        eng_present = _fake_engine(recognize=[{"name": "Tony", "score": 0.8,
+                                               "bbox": [0, 0, 80, 80]}])
+        _mod, actions = self._load(bc=bc, engine=eng_present, user_name="Tony")
+        self.assertEqual(actions["whoami"](""), "That's you, sir.")
+
+        # empty -> "no one", NOT "Tony" (even though Tony is the known owner)
+        eng_empty = _fake_engine(recognize=[])  # camera sees nobody right now
+        _mod, actions = self._load(bc=bc, engine=eng_empty, user_name="Tony")
+        out = actions["whoami"]("")
+        self.assertIn("don't see a face", out.lower())
+        self.assertNotIn("tony", out.lower())  # never leak the remembered name
+
+    def test_reads_a_fresh_frame_and_recognizes_it_every_call(self):
+        """whoami must grab a NEW frame and re-run recognition each call — no
+        cached verdict. We flip the live frame from owner-present to empty and
+        the answer must follow the current frame, not the prior one."""
+        bc = _fake_monolith(frames={0: _Frame("present")})
+        # The engine answers based on which frame it is handed RIGHT NOW, so a
+        # stale/cached result would be detectable as a wrong answer.
+        eng = _fake_engine()
+        grabbed = []
+
+        def _recognize(frame):
+            grabbed.append(frame)
+            # Owner is visible only while the live frame is the "present" one.
+            if getattr(frame, "tag", None) == "present":
+                return [{"name": "Tony", "score": 0.8, "bbox": [0, 0, 80, 80]}]
+            return []
+        eng.recognize = _recognize
+        _mod, actions = self._load(bc=bc, engine=eng, user_name="Tony")
+
+        # 1st call: owner in frame -> "you".
+        self.assertEqual(actions["whoami"](""), "That's you, sir.")
+
+        # Owner ducks out: the shared frame cache now holds an empty frame.
+        bc._camera_latest_frame[0] = _Frame("empty")
+        out = actions["whoami"]("")
+        self.assertIn("don't see a face", out.lower())
+        self.assertNotIn("tony", out.lower())
+
+        # Proof it re-read: recognize() was called once PER whoami, on the
+        # frame live at that moment (no cached verdict, no stale frame).
+        self.assertEqual(len(grabbed), 2)
+        self.assertEqual(getattr(grabbed[0], "tag", None), "present")
+        self.assertEqual(getattr(grabbed[1], "tag", None), "empty")
+
+
 # ─── status / list / forget ─────────────────────────────────────────────────
 class StatusListForgetTests(FaceIdSkillBase):
     def test_status_on_with_enrolled(self):
