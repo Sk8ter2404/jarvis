@@ -560,6 +560,27 @@ KINECT_POSTURE_NUDGE = False
 KINECT_GUARD_ENABLED = False
 
 
+# ─── Camera-based "is the TV on?" detector (ambient-suppression, opt-in) ─
+# TV_DETECT_ENABLED — when True, a lightweight background detector periodically
+#   samples the cached face-tracking camera frame and decides whether a TV/
+#   monitor screen is visibly ON — a bright, FLICKERING (high frame-to-frame
+#   temporal variance) rectangle — in a calibrated region (whole frame if not
+#   calibrated). When it sees a live screen it contributes ONE MORE veto signal
+#   to ambient-learning suppression: _ambient_media_is_playing() OR's it in, so a
+#   TV the AUDIO gates miss (a muted TV, an unrecognised stream, a show the
+#   content judge can't place) still stops JARVIS ingesting on-screen chatter as
+#   the owner's facts. It is PURELY a SUPPRESSION signal — it can only veto
+#   learning, never trigger anything — and reads a frame the face-tracker already
+#   captured (no extra camera open). Calibrate the rectangle once with "calibrate
+#   the tv region" (stored normalised in a SEPARATE gitignored data/tv_region.json
+#   via JARVIS_TV_REGION_PATH — never user_settings.json). OFF by default; with it
+#   off NO frame is read and ambient suppression is byte-identical to today.
+#   Staging-safe (never drives anything regardless). Voice: 'turn on/off tv
+#   detection', 'tv detection status', 'calibrate the tv region'. See
+#   audio/tv_detect.py (pure stats + region store) + skills/tv_detect.py (wiring).
+TV_DETECT_ENABLED = False
+
+
 # ─── Face recognition (identity, opt-in; all default off) ──────────────
 # JARVIS can recognise WHO is at the desk — pairing the Kinect's body COUNT
 # with an actual identity from the two monitor webcams (the cameras closest to

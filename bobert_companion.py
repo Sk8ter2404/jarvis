@@ -1556,11 +1556,15 @@ _AMBIENT_LEARN_MIN_WORDS = 3
 
 
 def _ambient_media_is_playing() -> bool:
-    """True if EITHER the Windows media session (SMTC) reports media PLAYING or
-    the spectral room-music detector reports sustained music. Either signal
-    means the mic is hearing the TV/stereo, not the owner's conversation, so
-    ambient-learning must NOT ingest the transcript. Never raises — any error in
-    a probe is treated as 'not playing' so a probe glitch can't wedge the gate."""
+    """True if ANY independent signal says the mic is hearing the TV/stereo (not
+    the owner's conversation), so ambient-learning must NOT ingest the transcript:
+      • the Windows media session (SMTC) reports media PLAYING, OR
+      • the spectral room-music detector reports sustained music, OR
+      • the CAMERA-BASED TV detector sees a bright, flickering screen ON.
+    The camera signal is independent of audio — it catches a TV the audio gates
+    miss (a muted TV, an unrecognised stream, a show the content judge can't
+    place). Never raises — any error in a probe is treated as 'not playing' so a
+    probe glitch can't wedge the gate."""
     # SMTC (Chrome/Spotify/Apple Music/YouTube/etc.). Reuses the gate's helper.
     try:
         if _smtc_media_playing():
@@ -1572,6 +1576,17 @@ def _ambient_media_is_playing() -> bool:
     try:
         mod = sys.modules.get("skill_standby_audio_detect")
         if mod is not None and bool(mod.is_music_currently_playing()):
+            return True
+    except Exception:
+        pass
+    # Camera-based TV detector (opt-in, TV_DETECT_ENABLED): a bright + flickering
+    # screen in view is independent VISUAL evidence the room audio is the TV.
+    # is_tv_on() is fail-safe (False unless enabled AND it positively sees a TV).
+    try:
+        mod = sys.modules.get("skill_tv_detect")
+        if mod is not None and bool(mod.is_tv_on()):
+            print("  [ambient-learn] suppressing: camera sees a TV ON "
+                  "(bright + flickering screen) — not learning from room audio")
             return True
     except Exception:
         pass
