@@ -13562,6 +13562,11 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
     # pushback that fired replaces the LLM's spoken prose so the user hears
     # the objection, not the original "I'll close them all, sir." prelude.
     _pushback_objections: list[str] = []
+    # Hard-confirmation prompts accumulated during this dispatch. A queued
+    # CONFIRM_KEYWORDS action must be *spoken* ("say yes to proceed") — like
+    # the pushback objections above — otherwise JARVIS goes silent awaiting a
+    # "yes" the user never heard it ask for.
+    _confirmation_prompts: list[str] = []
 
     # Mission narration — pre-scan to count [ACTION:] tokens. When the LLM
     # has chained 3+ actions in one reply, speak an opening line and emit a
@@ -13651,6 +13656,16 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             msg = f"⚠  REQUIRES CONFIRMATION: {name}({arg}) — say 'yes' to proceed"
             print(f"  [action] {msg}")
             results.append((name, msg, False))
+            # Speak the prompt. The raw msg above is a developer/log string
+            # (carries ⚠ + name(arg)); the user needs an in-character question
+            # that makes clear a verbal "yes" is now expected. Accumulated and
+            # voiced via `cleaned` below, mirroring the pushback path — without
+            # this, the action queues onto _pending_confirmation and JARVIS
+            # falls silent awaiting a confirmation it never asked for aloud.
+            _confirmation_prompts.append(
+                "That one needs your confirmation, sir — "
+                "say 'yes' to proceed, or 'no' to cancel."
+            )
             return ""
 
         # JARVIS-style pushback for gray-zone actions. Same deferred-execution
@@ -13834,6 +13849,16 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
     # _pending_confirmation queue; "yes" will run the deferred actions.
     if _pushback_objections:
         cleaned = " ".join(_pushback_objections)
+
+    # A hard-confirmation (CONFIRM_KEYWORDS) action was deferred onto
+    # _pending_confirmation. The prompt MUST be spoken so the user knows a
+    # verbal "yes" is expected — otherwise JARVIS stalls silently. Append to
+    # whatever is already queued (an LLM prelude, or a pushback objection from
+    # a sibling action in the same reply) so no spoken line is dropped, and
+    # de-dupe when a chain queues several confirmable actions at once.
+    if _confirmation_prompts:
+        _confirm_line = _confirmation_prompts[0]
+        cleaned = f"{cleaned} {_confirm_line}".strip() if cleaned else _confirm_line
 
     return cleaned, results
 
