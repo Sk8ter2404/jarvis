@@ -846,6 +846,14 @@ STANDBY_LOOP_MATCH_WINDOWS        = 3       # consecutive windows to trip (3 × 
 STANDBY_LOOP_ONSET_ENERGY_MIN     = 0.30    # librosa onset_strength mean ≥ this = musical
 STANDBY_LOOP_RHYME_RATIO_MIN      = 0.30    # share of word-pairs sharing 2-char suffix
 STANDBY_LOOP_WHISPER_MODEL        = "tiny"  # whisper model name (kept small for latency)
+# STANDBY_WHISPER_PREFER_GPU — load this loop's whisper-tiny on the GPU first.
+# CPU by default to preserve VRAM for the local LLM: the resident 30B fills
+# almost all of the 24GB, so a CUDA-resident whisper here competes for the last
+# few hundred MB and has contributed to an OOM crash. Left False, the loop loads
+# on CPU (int8 — whisper-tiny is cheap there). Set True only when there's VRAM
+# headroom to opt back into the faster CUDA-first path (float16, frees a CPU
+# core), which falls back to CPU/int8 if the GPU load fails.
+STANDBY_WHISPER_PREFER_GPU        = False
 
 
 # ─── User settings overrides (data/user_settings.json) ─────────────────
