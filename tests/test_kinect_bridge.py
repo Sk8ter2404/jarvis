@@ -47,8 +47,14 @@ class _FakeJoint:
 
 
 class _FakeBody:
-    """A tracked/untracked body whose .joints is indexable 0.._JOINT_COUNT-1."""
-    def __init__(self, tracked, joints=None):
+    """A tracked/untracked body whose .joints is indexable 0.._JOINT_COUNT-1.
+
+    hand_right_state / hand_left_state mirror the Kinect ints the real
+    PyKinectRuntime sets on each body (0 Unknown,1 NotTracked,2 Open,3 Closed,
+    4 Lasso). Optional so existing tests (which don't set them) still get the
+    bridge's "unknown" degrade via getattr."""
+    def __init__(self, tracked, joints=None, hand_right_state=None,
+                 hand_left_state=None):
         self.is_tracked = tracked
         # Default: a plausible upright, facing skeleton ~2 m away.
         if joints is None:
@@ -65,6 +71,13 @@ class _FakeBody:
                 z = 2.0
             full.append(_FakeJoint(x, y, z))
         self.joints = full
+        # Only attach the hand-state attrs when explicitly provided, so the
+        # "absent attribute → unknown" degrade path is still exercised by the
+        # tests that omit them.
+        if hand_right_state is not None:
+            self.hand_right_state = hand_right_state
+        if hand_left_state is not None:
+            self.hand_left_state = hand_left_state
 
 
 class _FakeBodyFrame:
@@ -410,6 +423,73 @@ class PresenceTests(_BridgeBase):
         })
         _patch_loader(self, _FakeRuntime(bodies=[body]))
         self.assertFalse(kb.get_presence()["facing"])
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# hand states (the air-mouse keystone accessor)
+# ─────────────────────────────────────────────────────────────────────────
+class HandStateTests(_BridgeBase):
+    def test_state_name_maps_enum(self):
+        # 0/1 → unknown, 2 → open, 3 → closed, 4 → lasso; junk → unknown.
+        self.assertEqual(kb._hand_state_name(0), "unknown")
+        self.assertEqual(kb._hand_state_name(1), "unknown")  # NotTracked
+        self.assertEqual(kb._hand_state_name(2), "open")
+        self.assertEqual(kb._hand_state_name(3), "closed")
+        self.assertEqual(kb._hand_state_name(4), "lasso")
+        self.assertEqual(kb._hand_state_name(None), "unknown")
+        self.assertEqual(kb._hand_state_name("x"), "unknown")
+
+    def test_get_bodies_carries_hand_states(self):
+        body = _FakeBody(True, {"head": (0, 0.6, 1.8)},
+                         hand_right_state=3, hand_left_state=2)
+        _patch_loader(self, _FakeRuntime(bodies=[body]))
+        got = kb.get_bodies()
+        self.assertEqual(got[0]["hand_right"], "closed")
+        self.assertEqual(got[0]["hand_left"], "open")
+
+    def test_get_bodies_hand_state_defaults_unknown_when_absent(self):
+        # A body without the attrs (older build) degrades to "unknown".
+        body = _FakeBody(True, {"head": (0, 0.6, 1.8)})
+        _patch_loader(self, _FakeRuntime(bodies=[body]))
+        got = kb.get_bodies()
+        self.assertEqual(got[0]["hand_right"], "unknown")
+        self.assertEqual(got[0]["hand_left"], "unknown")
+
+    def test_get_hand_states_nearest_body(self):
+        # Two bodies at different depths; the nearer (1.5 m) wins.
+        near = _FakeBody(True, {"head": (0, 0.6, 1.5),
+                                "spine_shoulder": (0, 0.0, 1.5)},
+                         hand_right_state=2, hand_left_state=3)
+        far = _FakeBody(True, {"head": (0, 0.6, 3.0),
+                               "spine_shoulder": (0, 0.0, 3.0)},
+                        hand_right_state=3, hand_left_state=2)
+        _patch_loader(self, _FakeRuntime(bodies=[far, near]))
+        states = kb.get_hand_states()
+        self.assertTrue(states["tracked"])
+        self.assertEqual(states["right"], "open")    # the NEAR body's right
+        self.assertEqual(states["left"], "closed")
+        self.assertIn("ts", states)
+
+    def test_get_hand_states_unknown_when_no_sensor(self):
+        kb.set_enabled(False)
+        states = kb.get_hand_states()
+        self.assertFalse(states["tracked"])
+        self.assertEqual(states["right"], "unknown")
+        self.assertEqual(states["left"], "unknown")
+
+    def test_get_hand_states_unknown_when_no_body(self):
+        _patch_loader(self, _FakeRuntime(bodies=[_FakeBody(False)] * 6))
+        states = kb.get_hand_states()
+        self.assertFalse(states["tracked"])
+        self.assertEqual(states["right"], "unknown")
+
+    def test_get_hand_states_swallows_get_bodies_error(self):
+        _patch_loader(self, _FakeRuntime(bodies=[_FakeBody(True)]))
+        with mock.patch.object(kb, "get_bodies",
+                               side_effect=RuntimeError("frame glitch")):
+            states = kb.get_hand_states()
+        self.assertFalse(states["tracked"])
+        self.assertEqual(states["right"], "unknown")
 
 
 # ─────────────────────────────────────────────────────────────────────────
