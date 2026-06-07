@@ -385,6 +385,86 @@ def _body_is_facing(joints: dict) -> Optional[bool]:
     return bool(upright)
 
 
+def _tracked(j) -> bool:
+    """True when a joint tuple (x, y, z, tracking_state) is at least INFERRED.
+    Kinect TrackingState: 0 = NotTracked, 1 = Inferred, 2 = Tracked. We accept
+    >= 1 here (a position the SDK is willing to report) and let callers that
+    need a firmer fix demand state >= 2 themselves."""
+    return j is not None and len(j) >= 4 and int(j[3]) >= 1
+
+
+def _body_facing_yaw(joints: dict) -> Optional[float]:
+    """Estimate the body's facing YAW in degrees from skeleton JOINT POSITIONS,
+    or None when the joints needed aren't tracked.
+
+    WHY POSITIONAL (not the Face API): this pykinect2 build exposes NO Kinect v2
+    Face API — there is no IFaceFrameSource / IHighDefinitionFaceFrameSource, no
+    FaceFrameFeatures_RotationOrientation, and PyKinectRuntime wires no face
+    reader (verified live: those symbols are absent). So we recover facing from
+    the geometry the body stream DOES give us reliably: the shoulder line.
+
+    GEOMETRY: in Kinect camera space x points to the sensor's right, z points
+    away from the sensor (depth, metres), y points up. The vector from the LEFT
+    shoulder to the RIGHT shoulder lies along the chest. When the user squarely
+    faces the sensor that vector runs along +x at constant depth (dz≈0). When
+    they rotate to look at a side monitor, the shoulder they turn toward moves
+    closer in z, so dz grows. The facing direction is the shoulder line rotated
+    -90° about the vertical, which works out to:
+
+        yaw = atan2(dz_LR, dx_LR)      # dx = xR - xL, dz = zR - zL
+
+    yielding 0° when squarely facing the sensor, NEGATIVE when the user turns to
+    THEIR right / the sensor's left (a left-hand monitor), POSITIVE when they
+    turn to THEIR left / the sensor's right (a right-hand monitor). (Sign chosen
+    so it matches a real desk: turning toward a monitor on your left reads
+    negative.) A secondary cue — the head's x-offset from the shoulder midpoint —
+    nudges the estimate the same direction when shoulders are nearly square but
+    the head has already turned, and is averaged in when both shoulders and head
+    are well tracked.
+
+    ACCURACY (be honest): this is BODY/shoulder facing, not eyeball gaze. It's a
+    coarse signal — roughly ±10-15° once smoothed, and only meaningful while the
+    torso actually turns with the head (which is the normal multi-monitor case:
+    you swivel your chair / torso toward the screen you work on). A pure
+    eyes-only flick with a locked torso will NOT register. It is plenty to tell a
+    hard left monitor from a centre from a hard right one; it is NOT a substitute
+    for an HD-face gaze vector. Calibration (skills/face_tracker) maps the
+    observed yaw band per monitor so the absolute offset of a given desk doesn't
+    matter."""
+    import math
+    sl = joints.get("shoulder_left")
+    sr = joints.get("shoulder_right")
+    yaw_shoulder: Optional[float] = None
+    if _tracked(sl) and _tracked(sr):
+        dx = float(sr[0]) - float(sl[0])
+        dz = float(sr[2]) - float(sl[2])
+        # Degenerate (both shoulders coincident / vertical) → no shoulder yaw.
+        if abs(dx) > 1e-4 or abs(dz) > 1e-4:
+            yaw_shoulder = math.degrees(math.atan2(dz, dx))
+
+    # Secondary cue: head displaced from the shoulder midpoint along x. Turning
+    # to look at a monitor on the sensor's RIGHT shifts the head toward +x of the
+    # shoulder centre (→ positive), toward the sensor's LEFT shifts it -x (→
+    # negative) — the SAME sign convention as the shoulder term, so the two
+    # average cleanly. Scaled to a gentle degrees nudge; only used when we have
+    # both a head and a shoulder span to normalise against.
+    yaw_head: Optional[float] = None
+    head = joints.get("head")
+    if _tracked(head) and _tracked(sl) and _tracked(sr):
+        mid_x = (float(sl[0]) + float(sr[0])) / 2.0
+        span = abs(float(sr[0]) - float(sl[0]))
+        if span > 0.05:   # a plausible shoulder width in metres
+            # offset in [-1, 1]-ish of half-span; map to ±~35° of head turn.
+            offset = (float(head[0]) - mid_x) / (span / 2.0)
+            offset = max(-1.5, min(1.5, offset))
+            yaw_head = offset * 35.0
+
+    vals = [v for v in (yaw_shoulder, yaw_head) if v is not None]
+    if not vals:
+        return None
+    return sum(vals) / len(vals)
+
+
 def get_bodies() -> list[dict]:
     """Tracked bodies as a list of dicts. Empty list if none tracked or the
     sensor is unavailable. Each entry:
@@ -393,8 +473,14 @@ def get_bodies() -> list[dict]:
          "head": (x, y, z) | None,
          "distance_m": float | None,    # head/spine z
          "facing": bool | None,
+         "facing_yaw_deg": float | None,   # 0=square to sensor, -=sensor-left, +=sensor-right
          "hand_right": "open"|"closed"|"lasso"|"unknown",   # discrete grip
          "hand_left":  "open"|"closed"|"lasso"|"unknown"}
+
+    facing_yaw_deg is the body's shoulder-derived facing yaw (see
+    _body_facing_yaw); the gaze layer reads it. 0≈square to the sensor,
+    negative=turned toward the sensor's left, positive=toward its right; None
+    when it can't be estimated.
 
     The two hand-state keys mirror the Kinect's per-hand OPEN/CLOSED/LASSO grip
     (body.hand_right_state / hand_left_state). They're additive — every existing
@@ -434,6 +520,7 @@ def get_bodies() -> list[dict]:
                 "head": (head[0], head[1], head[2]) if head else None,
                 "distance_m": _joint_distance(joints),
                 "facing": _body_is_facing(joints),
+                "facing_yaw_deg": _body_facing_yaw(joints),
                 # getattr so an older build lacking these attrs degrades to
                 # "unknown" rather than KeyError-ing the whole body out.
                 "hand_right": _hand_state_name(getattr(body, "hand_right_state", None)),
@@ -442,6 +529,20 @@ def get_bodies() -> list[dict]:
         return out
     except Exception:   # pragma: no cover - defensive: mid-stream body-frame glitch
         return []
+
+
+def _nearest_body(bodies: list[dict]) -> Optional[dict]:
+    """The closest tracked body (smallest positive distance_m), or the first
+    body when no distance is known, or None for an empty list. The user at the
+    desk is the nearest body, so head-yaw/gaze keys off this one."""
+    if not bodies:
+        return None
+    ranked = sorted(
+        bodies,
+        key=lambda b: (b.get("distance_m")
+                       if isinstance(b.get("distance_m"), (int, float))
+                       and b.get("distance_m") > 0 else float("inf")))
+    return ranked[0]
 
 
 def get_hand_states() -> dict:
@@ -455,22 +556,17 @@ def get_hand_states() -> dict:
     With no sensor / no body in view, returns both hands "unknown" and
     tracked=False (so a missing Kinect degrades to "I can't see your hand" rather
     than a crash). "Nearest" reuses the same distance_m ranking get_presence and
-    the gesture/pointing skills use, so the air-mouse follows the same body the
-    rest of JARVIS is tracking."""
+    the gesture/pointing skills use (the shared _nearest_body helper), so the
+    air-mouse follows the same body the rest of JARVIS is tracking."""
     base = {"right": "unknown", "left": "unknown",
             "tracked": False, "ts": time.monotonic()}
     try:
         bodies = get_bodies()
     except Exception:   # pragma: no cover - get_bodies already swallows; belt-and-braces
         return base
-    if not bodies:
+    nearest = _nearest_body(bodies)
+    if nearest is None:
         return base
-    # Nearest by distance_m (bodies without a range sort last), matching the
-    # _nearest_body helpers in the gesture / pointing modules.
-    def _key(b):
-        d = b.get("distance_m")
-        return d if isinstance(d, (int, float)) and d > 0 else float("inf")
-    nearest = min(bodies, key=_key)
     return {
         "right": nearest.get("hand_right", "unknown"),
         "left": nearest.get("hand_left", "unknown"),
@@ -483,10 +579,16 @@ def get_presence() -> dict:
     """Cheap room-presence summary. NEVER raises — any failure degrades to
     'no one present'. Shape:
         {"present": bool, "count": int, "nearest_m": float | None,
-         "facing": bool | None, "ts": <monotonic>}
-    `facing` is True if ANY tracked body looks like it's facing the sensor."""
+         "facing": bool | None, "head_yaw_deg": float | None,
+         "ts": <monotonic>}
+    `facing` is True if ANY tracked body looks like it's facing the sensor.
+    `head_yaw_deg` is the NEAREST body's facing yaw in degrees (the person at
+    the desk) — 0≈square to the sensor, negative=turned toward the sensor's
+    left, positive=toward the sensor's right; None when it can't be estimated.
+    Computed here (off the same body list the count uses) so the gaze poller
+    gets yaw without a second body-frame fetch."""
     base = {"present": False, "count": 0, "nearest_m": None,
-            "facing": None, "ts": time.monotonic()}
+            "facing": None, "head_yaw_deg": None, "ts": time.monotonic()}
     try:
         bodies = get_bodies()
     except Exception:   # pragma: no cover - get_bodies already swallows; belt-and-braces
@@ -495,13 +597,39 @@ def get_presence() -> dict:
         return base
     distances = [b["distance_m"] for b in bodies if b.get("distance_m")]
     facings = [b["facing"] for b in bodies if b.get("facing") is not None]
+    nearest = _nearest_body(bodies)
+    yaw = nearest.get("facing_yaw_deg") if nearest else None
     return {
         "present": True,
         "count": len(bodies),
         "nearest_m": round(min(distances), 2) if distances else None,
         "facing": (any(facings) if facings else None),
+        "head_yaw_deg": (round(float(yaw), 1) if isinstance(yaw, (int, float))
+                         else None),
         "ts": time.monotonic(),
     }
+
+
+def get_head_yaw() -> Optional[float]:
+    """The NEAREST tracked body's facing YAW in degrees, or None when there's no
+    body / the joints needed aren't tracked / the Kinect is disabled or absent.
+    NEVER raises — the canonical "head direction" accessor the gaze layer reads.
+
+    Convention: ~0° squarely facing the sensor, NEGATIVE when the user has
+    turned toward the sensor's LEFT (a left-hand monitor), POSITIVE toward the
+    sensor's RIGHT (a right-hand monitor). This is BODY/shoulder-derived facing
+    (see _body_facing_yaw for the geometry + honest accuracy notes), NOT an
+    HD-face gaze vector — the Kinect v2 Face API is not available on this
+    pykinect2 build."""
+    try:
+        bodies = get_bodies()
+    except Exception:   # pragma: no cover - get_bodies already swallows
+        return None
+    nearest = _nearest_body(bodies)
+    if nearest is None:
+        return None
+    yaw = nearest.get("facing_yaw_deg")
+    return float(yaw) if isinstance(yaw, (int, float)) else None
 
 
 # ─── lifecycle ────────────────────────────────────────────────────────────
