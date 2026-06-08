@@ -1417,6 +1417,75 @@ class WatchdogTests(_MonolithSec2Base):
 
 
 # ───────────────────────────────────────────────────────────────────────────
+#  Main-loop per-turn exception net  (_recover_from_main_loop_error + the
+#  `except Exception` wrap around the `while True:` body in main())
+#
+#  Regression guard for the P1 where the whole turn loop ran in one try whose
+#  ONLY handler was `except KeyboardInterrupt`: any exception escaping a callee
+#  (LLM dispatch, learn_from_turn, the prompt-rebuild Timer, …) propagated out
+#  of main() and killed the detached pythonw process with no auto-restart — one
+#  malformed turn took the assistant permanently offline. The watchdog only
+#  recovers a STALLED loop; it cannot relaunch a loop that threw and exited.
+# ───────────────────────────────────────────────────────────────────────────
+class MainLoopRecoveryTests(_MonolithSec2Base):
+    def test_recover_returns_to_idle(self):
+        # The recovery path must drop the HUD/avatar back to idle so a failed
+        # turn doesn't strand it in "thinking"/"listening".
+        with mock.patch.object(self.bc, "set_state") as set_state, \
+                mock.patch.object(self.bc, "logging") as log:
+            self.bc._recover_from_main_loop_error(RuntimeError("boom"))
+        set_state.assert_called_once_with("idle")
+        # And it logs the full traceback (logging.exception) for diagnosis.
+        self.assertTrue(log.exception.called)
+
+    def test_recover_never_raises_even_if_set_state_fails(self):
+        # The net must be bullet-proof: a failure inside recovery must NOT
+        # re-break the loop it is protecting (it runs in that loop's except arm).
+        with mock.patch.object(self.bc, "set_state",
+                               side_effect=RuntimeError("hud down")), \
+                mock.patch.object(self.bc, "logging") as log:
+            # No exception should escape.
+            self.bc._recover_from_main_loop_error(ValueError("turn blew up"))
+        # The turn failure is still logged even though set_state then failed.
+        self.assertTrue(log.exception.called)
+
+    def test_recover_does_not_swallow_keyboardinterrupt_semantics(self):
+        # The helper takes BaseException so it can log a KeyboardInterrupt if
+        # ever handed one, but it must return cleanly (it never re-raises).
+        with mock.patch.object(self.bc, "set_state"), \
+                mock.patch.object(self.bc, "logging"):
+            self.assertIsNone(
+                self.bc._recover_from_main_loop_error(KeyboardInterrupt()))
+
+    def test_main_loop_body_wrapped_in_exception_net(self):
+        # Wiring guard: the `while True:` turn body must sit inside an
+        # `except Exception` arm that recovers and continues — otherwise the
+        # per-turn net is gone and one bad turn kills JARVIS again. Asserting on
+        # main()'s source lets us guard this without running the boot sequence.
+        import inspect
+        src = inspect.getsource(self.bc.main)
+        # The loop body opens a try right under `while True:`.
+        self.assertRegex(src, r"while True:\s*\n\s*try:")
+        # …closed by an `except Exception` that dispatches to the recovery
+        # helper and then `continue`s back into the loop.
+        self.assertIn("except Exception as _loop_exc:", src)
+        after = src[src.index("except Exception as _loop_exc:"):]
+        recover_at = after.find("_recover_from_main_loop_error(_loop_exc)")
+        self.assertNotEqual(recover_at, -1,
+                            "per-turn except arm never calls the recovery helper")
+        # The actual `continue` statement (not the word in a comment) must come
+        # AFTER the recovery call so the loop resumes only once recovered.
+        cont_at = after.find("\n                continue", recover_at)
+        self.assertNotEqual(cont_at, -1,
+                            "per-turn except arm never continues the loop after "
+                            "recovery")
+        # The clean-shutdown handler for Ctrl-C must still be present and OUTSIDE
+        # the per-turn net (KeyboardInterrupt is not an Exception), so the inner
+        # net can never swallow a deliberate shutdown.
+        self.assertIn("except KeyboardInterrupt:", src)
+
+
+# ───────────────────────────────────────────────────────────────────────────
 #  HUD tray-state mirror + restore  (_publish_audio_state /
 #  _restore_tray_toggle_state) — real temp HUD state file
 # ───────────────────────────────────────────────────────────────────────────

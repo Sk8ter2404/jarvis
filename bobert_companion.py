@@ -5115,6 +5115,30 @@ def _main_loop_watchdog_thread():
             return
 
 
+def _recover_from_main_loop_error(exc: BaseException) -> None:
+    """Best-effort recovery after one main-loop turn raised an unexpected
+    exception. The main `while True:` body wraps each iteration in
+    `except Exception` and calls this, then `continue`s to the next turn, so
+    a single malformed turn (a callee raising — e.g. an LLM-dispatch fault)
+    can no longer propagate out of main() and take the assistant permanently
+    offline. The watchdog only recovers a STALLED loop (stale heartbeat); it
+    does nothing for a loop that threw and exited — there is no supervisor
+    relaunching the detached pythonw process, so the loop must self-heal here.
+
+    Logs the full traceback (matching the _thinking_loop / face-track per-
+    iteration nets) and returns the HUD/avatar to idle. Never raises — a
+    failure inside the recovery path must not re-break the loop it protects."""
+    try:
+        logging.exception("[main-loop] turn failed — recovering and "
+                          "continuing to next turn: %r", exc)
+    except Exception:
+        pass
+    try:
+        set_state("idle")
+    except Exception:
+        pass
+
+
 def _process_capture_chunk(chunk: np.ndarray,
                            sample_rate: int = SAMPLE_RATE) -> np.ndarray:
     """Run a single mic chunk through the noise-cancel-1 pipeline (AEC →
@@ -17628,231 +17652,243 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         # seconds, and we don't want a slow boot to look like a stall.
         _main_loop_heartbeat[0] = time.time()
         while True:
-            if _blue_green_loop_tick():
-                return
-            # Check for an injected command BEFORE we block on the mic. An
-            # external tester (Claude Code, tools/say_to_jarvis.py, smoke
-            # harness) can drop one in injected_commands.json to feed a
-            # voice-equivalent user turn into the loop. The handlers below
-            # branch on `_injected_text is not None` to skip record_speech
-            # + transcribe and synthesise safe pass-through metadata.
-            _injected_text = _drain_injected_command()
-
-            # ── SLEEP / STANDBY MODE — only listen for the wake phrase ────────
-            if _sleep_mode[0]:
-                _handle_sleep_standby(_injected_text)
-                continue
-            # ── NORMAL MODE ───────────────────────────────────────────────────
-
-            # Capture the next utterance (inject or mic->Whisper) and drain
-            # any queued speech; short-circuit the loop on a reminder /
-            # silence-timeout / too-short clip. See _capture_utterance.
-            _cap = _capture_utterance(_injected_text, memory)
-            if _cap is None:
-                continue
-            text, conf = _cap
-
-            # ── AMBIENT MUSIC DETECTION → auto-standby ────────────────────────
-            # Whisper emits markers like [Music] / ♪ when the mic picks up
-            # song audio it can't transcribe as words. If we see those AND
-            # JARVIS itself didn't recently kick off playback, count it
-            # toward an auto-standby trigger so we stop pestering the user
-            # with hallucinated transcriptions of overheard music.
-            if _handle_ambient_music(text):
-                continue
-
-            # ── Ambient-music gate (2026-05-30 runtime-log audit) ──────────
-            # The marker check above only catches Whisper's [Music]/♪ tags;
-            # CLEAN song lyrics transcribe as ordinary words and slipped past
-            # it, so JARVIS was replying to the user's music/TV/another person
-            # (~60% of "commands" in the logs — the user repeatedly told it to
-            # "stop listening"). Reuse the standby detector's TESTED state:
-            # `should_refuse_wake` returns False unless SUSTAINED (>15s) room
-            # music is active, and even then lets a clear leading "JARVIS"
-            # through — so quiet-room turns are unaffected and the user can
-            # still command over music by prefixing the wake word. Anything
-            # else while music plays is treated as overheard audio and dropped.
-            _bg_gate, _bg_why = _should_refuse_background_audio(text)
-            if _bg_gate:
-                print(f"  [bg-audio] {_bg_why} — ignoring non-wake "
-                      f"utterance: '{text[:40]}'")
-                # Alexa-mode ambient learning: we won't RESPOND to this gated
-                # (non-wake) utterance, but if ambient-listening is on we still
-                # passively LEARN from it — feed the transcript to the extractor
-                # BEFORE dropping the turn. Pass this turn's RAW audio so the
-                # learner can voice-ID the owner and refuse the TV/strangers, and
-                # this turn's Whisper conf + peak RMS so the learner runs the same
-                # is_valid_speech() confidence/RMS gate normal turns use before
-                # learning (so a low-confidence hallucination is never ingested).
-                # No-op when AMBIENT_LISTEN_ENABLED is off; never raises; never
-                # speaks (see _ambient_learn_from_gated).
-                #
-                # Dispatch on a daemon thread: the new content-judge runs a local
-                # LLM synchronously, which takes seconds — we must NOT block the
-                # main listen loop on it. Snapshot this turn's audio/conf/peak
-                # into the thread args NOW (the module globals get overwritten by
-                # the next turn). _ambient_learn_from_gated never raises.
-                threading.Thread(
-                    target=_ambient_learn_from_gated,
-                    args=(text, memory, _last_capture_audio, _last_capture_sr),
-                    kwargs={"conf": conf, "peak_rms": _last_recording_peak},
-                    daemon=True,
-                ).start()
-                set_state("idle")
-                continue
-
-            valid, reason = is_valid_speech(text, conf, peak_rms=_last_recording_peak)
-            if not valid:
-                # Show what got dropped so user can tune thresholds if needed
-                snippet = (text[:60] + "…") if len(text) > 60 else text
-                print(f"  [filter] dropped: '{snippet}' — {reason}")
-                set_state("idle")
-                continue
-
-            print(f"  You:    {text}")
-            # Rolling 5-line history feeds the holographic HUD v2
-            # scrolling transcript panel. Cap at 5 entries here so the
-            # JSON file stays small.
             try:
-                with _hud_state_lock:
-                    _hist = list(_hud_state_cache.get("transcript_history") or [])
-            except Exception:
-                _hist = []
-            _hist.append(text)
-            _hist = _hist[-5:]
-            _write_hud_state(last_transcript=text,
-                             last_transcript_at=time.time(),
-                             transcript_history=_hist)
+                if _blue_green_loop_tick():
+                    return
+                # Check for an injected command BEFORE we block on the mic. An
+                # external tester (Claude Code, tools/say_to_jarvis.py, smoke
+                # harness) can drop one in injected_commands.json to feed a
+                # voice-equivalent user turn into the loop. The handlers below
+                # branch on `_injected_text is not None` to skip record_speech
+                # + transcribe and synthesise safe pass-through metadata.
+                _injected_text = _drain_injected_command()
 
-            # ── BRIEFING CARD DISMISS — "thank you, JARVIS" closes a card ─────
-            # Doesn't consume the turn; the LLM still gets to respond to the
-            # thanks naturally. Fail closed if hud_card isn't importable.
-            try:
-                import hud_card as _hud_card  # noqa: WPS433 (lazy local import)
-                if _hud_card.is_card_active() and _hud_card.matches_dismiss_phrase(text):
-                    _hud_card.dismiss_card()
-                    print("  [hud_card] dismissed by phrase")
-            except Exception:
-                pass
+                # ── SLEEP / STANDBY MODE — only listen for the wake phrase ────────
+                if _sleep_mode[0]:
+                    _handle_sleep_standby(_injected_text)
+                    continue
+                # ── NORMAL MODE ───────────────────────────────────────────────────
 
-            # ── SLEEP TRIGGER — check before sending to LLM ───────────────────
-            # Two-gate check: (a) utterance must be short (≤ 6 words) AND
-            # (b) the phrase must match with word boundaries — so casual
-            # mentions like "if I say stop listening it should…" don't
-            # trigger sleep mid-explanation.
-            if _handle_sleep_triggers(text):
-                continue
+                # Capture the next utterance (inject or mic->Whisper) and drain
+                # any queued speech; short-circuit the loop on a reminder /
+                # silence-timeout / too-short clip. See _capture_utterance.
+                _cap = _capture_utterance(_injected_text, memory)
+                if _cap is None:
+                    continue
+                text, conf = _cap
 
-            # ── SHUTDOWN PROMPT — yes/no router for the overnight-protocol
-            #    prompt armed by a previous SHUTDOWN_TRIGGER_PHRASE. Runs FIRST
-            #    so a 'yes' answer doesn't get swallowed by any other handler.
-            #    Returns True only when the message was consumed (YES / NO /
-            #    reinforced-shutdown branches); an unrelated reply clears the
-            #    flag and returns False so the original utterance still routes
-            #    through normal LLM dispatch below.
-            if _handle_shutdown_prompt(text):
-                set_state("idle")
-                continue
+                # ── AMBIENT MUSIC DETECTION → auto-standby ────────────────────────
+                # Whisper emits markers like [Music] / ♪ when the mic picks up
+                # song audio it can't transcribe as words. If we see those AND
+                # JARVIS itself didn't recently kick off playback, count it
+                # toward an auto-standby trigger so we stop pestering the user
+                # with hallucinated transcriptions of overheard music.
+                if _handle_ambient_music(text):
+                    continue
 
-            # ── SHUTDOWN TRIGGER — arms the overnight-first prompt for any
-            #    of the ambiguous shutdown phrases ('shut down' / 'power off'
-            #    / 'go offline' / etc.). The NEXT utterance is then handled
-            #    by _handle_shutdown_prompt above. Unambiguous bedtime phrases
-            #    ('goodnight' / 'going to bed') are NOT in this list — they
-            #    still route directly to start_overnight_upgrade via the LLM.
-            if _check_and_arm_shutdown_prompt(text):
-                set_state("idle")
-                continue
+                # ── Ambient-music gate (2026-05-30 runtime-log audit) ──────────
+                # The marker check above only catches Whisper's [Music]/♪ tags;
+                # CLEAN song lyrics transcribe as ordinary words and slipped past
+                # it, so JARVIS was replying to the user's music/TV/another person
+                # (~60% of "commands" in the logs — the user repeatedly told it to
+                # "stop listening"). Reuse the standby detector's TESTED state:
+                # `should_refuse_wake` returns False unless SUSTAINED (>15s) room
+                # music is active, and even then lets a clear leading "JARVIS"
+                # through — so quiet-room turns are unaffected and the user can
+                # still command over music by prefixing the wake word. Anything
+                # else while music plays is treated as overheard audio and dropped.
+                _bg_gate, _bg_why = _should_refuse_background_audio(text)
+                if _bg_gate:
+                    print(f"  [bg-audio] {_bg_why} — ignoring non-wake "
+                          f"utterance: '{text[:40]}'")
+                    # Alexa-mode ambient learning: we won't RESPOND to this gated
+                    # (non-wake) utterance, but if ambient-listening is on we still
+                    # passively LEARN from it — feed the transcript to the extractor
+                    # BEFORE dropping the turn. Pass this turn's RAW audio so the
+                    # learner can voice-ID the owner and refuse the TV/strangers, and
+                    # this turn's Whisper conf + peak RMS so the learner runs the same
+                    # is_valid_speech() confidence/RMS gate normal turns use before
+                    # learning (so a low-confidence hallucination is never ingested).
+                    # No-op when AMBIENT_LISTEN_ENABLED is off; never raises; never
+                    # speaks (see _ambient_learn_from_gated).
+                    #
+                    # Dispatch on a daemon thread: the new content-judge runs a local
+                    # LLM synchronously, which takes seconds — we must NOT block the
+                    # main listen loop on it. Snapshot this turn's audio/conf/peak
+                    # into the thread args NOW (the module globals get overwritten by
+                    # the next turn). _ambient_learn_from_gated never raises.
+                    threading.Thread(
+                        target=_ambient_learn_from_gated,
+                        args=(text, memory, _last_capture_audio, _last_capture_sr),
+                        kwargs={"conf": conf, "peak_rms": _last_recording_peak},
+                        daemon=True,
+                    ).start()
+                    set_state("idle")
+                    continue
 
-            # If the autocorrect layer asked 'did you mean X or Y' on the
-            # previous turn, interpret this utterance as the user's pick.
-            # Runs BEFORE handle_confirmation_response because a disambig
-            # 'yes' is meaningfully different from a confirmation 'yes' —
-            # the disambig handler short-circuits to the picked action and
-            # clears its own queue; an unrelated reply returns False so the
-            # original utterance still falls through to normal dispatch.
-            if handle_autocorrect_disambig_response(text):
-                set_state("idle")
-                continue
+                valid, reason = is_valid_speech(text, conf, peak_rms=_last_recording_peak)
+                if not valid:
+                    # Show what got dropped so user can tune thresholds if needed
+                    snippet = (text[:60] + "…") if len(text) > 60 else text
+                    print(f"  [filter] dropped: '{snippet}' — {reason}")
+                    set_state("idle")
+                    continue
 
-            # If a high-risk action is pending, treat this utterance as the
-            # confirmation/cancellation rather than a new prompt.
-            if handle_confirmation_response(text):
-                set_state("idle")
-                continue
-
-            # Command-level pattern memory: log this utterance with day-of-week
-            # so get_patterns() can mine repeated targets (artist names, app
-            # names) at the same time-of-week. Logged AFTER the sleep / standby
-            # / confirmation guards so trigger phrases don't pollute the log.
-            try:
-                pattern_memory.record_voice_command(text)
-            except Exception as _e:
-                print(f"  [pattern_memory] record failed: {_e}")
-
-            # Late-night commentary (01:00–04:59). Either an in-character
-            # remark before complying, or an acknowledgement that the user
-            # has muted further remarks for the night.
-            _ln_remark = maybe_late_night_remark(text, memory)
-            if _ln_remark:
-                print(f"  [late-night] {_ln_remark}")
-                _speak(_ln_remark)
-                # Deliberately NOT appended to conversation_history. This
-                # remark is a spoken aside that PRECEDES the user's pending
-                # turn; appending it as an assistant message here — before
-                # _call_llm() appends the user message just below — produced
-                # two consecutive assistant turns and a Claude 400 "roles
-                # must alternate", swallowed into a silent downgrade-to-local
-                # on every 01:00–04:59 turn. 2026-05-30 audit.
-
-            # Explicit multi-agent briefing? Fan out to the sub-agent
-            # orchestrator (opt-in; default path untouched). See _maybe_orchestrate.
-            if _maybe_orchestrate(text):
-                continue
-
-            if _run_voice_shortcuts(text):
-                continue
-
-            reply = _run_llm_dispatch(text)
-
-            # Real-time learning: extract facts in background (non-blocking)
-            learn_from_turn(text, reply, memory)
-
-            # Ambient-learning 'answer_then_quiet': this normal-mode turn was the
-            # ONE reply granted after the wake word — now drop straight back to
-            # silent standby so the next interaction needs 'JARVIS' again. Only a
-            # fully-processed command turn reaches here (music / invalid-speech /
-            # silence-timeout paths all 'continue' earlier), so the user always
-            # gets their answer BEFORE JARVIS goes quiet. 'stay_talkative' never
-            # arms the flag, so it stays interactive until a sleep/standby phrase.
-            if _resume_to_ambient[0]:
-                _resume_to_ambient[0] = False
-                with _standby_auto_engage_lock:
-                    _sleep_mode[0]   = True
-                    _standby_mode[0] = True
+                print(f"  You:    {text}")
+                # Rolling 5-line history feeds the holographic HUD v2
+                # scrolling transcript panel. Cap at 5 entries here so the
+                # JSON file stays small.
                 try:
-                    _write_hud_state(sleep_mode=True, standby_mode=True)
+                    with _hud_state_lock:
+                        _hist = list(_hud_state_cache.get("transcript_history") or [])
+                except Exception:
+                    _hist = []
+                _hist.append(text)
+                _hist = _hist[-5:]
+                _write_hud_state(last_transcript=text,
+                                 last_transcript_at=time.time(),
+                                 transcript_history=_hist)
+
+                # ── BRIEFING CARD DISMISS — "thank you, JARVIS" closes a card ─────
+                # Doesn't consume the turn; the LLM still gets to respond to the
+                # thanks naturally. Fail closed if hud_card isn't importable.
+                try:
+                    import hud_card as _hud_card  # noqa: WPS433 (lazy local import)
+                    if _hud_card.is_card_active() and _hud_card.matches_dismiss_phrase(text):
+                        _hud_card.dismiss_card()
+                        print("  [hud_card] dismissed by phrase")
                 except Exception:
                     pass
-                print("  [ambient-learning] reply delivered — back to silent "
-                      "standby (say 'JARVIS' for more)")
 
-            # Rebuild prompt with any newly-learned facts after a short delay
-            # so the very next turn already has them. Daemon so Ctrl-C exits
-            # cleanly even if a Timer is pending. Reload memory FRESH from disk
-            # — learn_from_turn's background worker writes new facts via
-            # merge_memory() under _memory_lock, NOT into the main loop's
-            # stale `memory` local; building from that local meant this rebuild
-            # never actually saw the new facts (the whole point of the delay).
-            # 2026-05-30 deep audit.
-            _t = threading.Timer(2.0, lambda: globals().__setitem__(
-                "_system_prompt", build_system_prompt(load_memory())
-            ))
-            _t.daemon = True
-            _t.start()
+                # ── SLEEP TRIGGER — check before sending to LLM ───────────────────
+                # Two-gate check: (a) utterance must be short (≤ 6 words) AND
+                # (b) the phrase must match with word boundaries — so casual
+                # mentions like "if I say stop listening it should…" don't
+                # trigger sleep mid-explanation.
+                if _handle_sleep_triggers(text):
+                    continue
 
-            print()
+                # ── SHUTDOWN PROMPT — yes/no router for the overnight-protocol
+                #    prompt armed by a previous SHUTDOWN_TRIGGER_PHRASE. Runs FIRST
+                #    so a 'yes' answer doesn't get swallowed by any other handler.
+                #    Returns True only when the message was consumed (YES / NO /
+                #    reinforced-shutdown branches); an unrelated reply clears the
+                #    flag and returns False so the original utterance still routes
+                #    through normal LLM dispatch below.
+                if _handle_shutdown_prompt(text):
+                    set_state("idle")
+                    continue
 
+                # ── SHUTDOWN TRIGGER — arms the overnight-first prompt for any
+                #    of the ambiguous shutdown phrases ('shut down' / 'power off'
+                #    / 'go offline' / etc.). The NEXT utterance is then handled
+                #    by _handle_shutdown_prompt above. Unambiguous bedtime phrases
+                #    ('goodnight' / 'going to bed') are NOT in this list — they
+                #    still route directly to start_overnight_upgrade via the LLM.
+                if _check_and_arm_shutdown_prompt(text):
+                    set_state("idle")
+                    continue
+
+                # If the autocorrect layer asked 'did you mean X or Y' on the
+                # previous turn, interpret this utterance as the user's pick.
+                # Runs BEFORE handle_confirmation_response because a disambig
+                # 'yes' is meaningfully different from a confirmation 'yes' —
+                # the disambig handler short-circuits to the picked action and
+                # clears its own queue; an unrelated reply returns False so the
+                # original utterance still falls through to normal dispatch.
+                if handle_autocorrect_disambig_response(text):
+                    set_state("idle")
+                    continue
+
+                # If a high-risk action is pending, treat this utterance as the
+                # confirmation/cancellation rather than a new prompt.
+                if handle_confirmation_response(text):
+                    set_state("idle")
+                    continue
+
+                # Command-level pattern memory: log this utterance with day-of-week
+                # so get_patterns() can mine repeated targets (artist names, app
+                # names) at the same time-of-week. Logged AFTER the sleep / standby
+                # / confirmation guards so trigger phrases don't pollute the log.
+                try:
+                    pattern_memory.record_voice_command(text)
+                except Exception as _e:
+                    print(f"  [pattern_memory] record failed: {_e}")
+
+                # Late-night commentary (01:00–04:59). Either an in-character
+                # remark before complying, or an acknowledgement that the user
+                # has muted further remarks for the night.
+                _ln_remark = maybe_late_night_remark(text, memory)
+                if _ln_remark:
+                    print(f"  [late-night] {_ln_remark}")
+                    _speak(_ln_remark)
+                    # Deliberately NOT appended to conversation_history. This
+                    # remark is a spoken aside that PRECEDES the user's pending
+                    # turn; appending it as an assistant message here — before
+                    # _call_llm() appends the user message just below — produced
+                    # two consecutive assistant turns and a Claude 400 "roles
+                    # must alternate", swallowed into a silent downgrade-to-local
+                    # on every 01:00–04:59 turn. 2026-05-30 audit.
+
+                # Explicit multi-agent briefing? Fan out to the sub-agent
+                # orchestrator (opt-in; default path untouched). See _maybe_orchestrate.
+                if _maybe_orchestrate(text):
+                    continue
+
+                if _run_voice_shortcuts(text):
+                    continue
+
+                reply = _run_llm_dispatch(text)
+
+                # Real-time learning: extract facts in background (non-blocking)
+                learn_from_turn(text, reply, memory)
+
+                # Ambient-learning 'answer_then_quiet': this normal-mode turn was the
+                # ONE reply granted after the wake word — now drop straight back to
+                # silent standby so the next interaction needs 'JARVIS' again. Only a
+                # fully-processed command turn reaches here (music / invalid-speech /
+                # silence-timeout paths all 'continue' earlier), so the user always
+                # gets their answer BEFORE JARVIS goes quiet. 'stay_talkative' never
+                # arms the flag, so it stays interactive until a sleep/standby phrase.
+                if _resume_to_ambient[0]:
+                    _resume_to_ambient[0] = False
+                    with _standby_auto_engage_lock:
+                        _sleep_mode[0]   = True
+                        _standby_mode[0] = True
+                    try:
+                        _write_hud_state(sleep_mode=True, standby_mode=True)
+                    except Exception:
+                        pass
+                    print("  [ambient-learning] reply delivered — back to silent "
+                          "standby (say 'JARVIS' for more)")
+
+                # Rebuild prompt with any newly-learned facts after a short delay
+                # so the very next turn already has them. Daemon so Ctrl-C exits
+                # cleanly even if a Timer is pending. Reload memory FRESH from disk
+                # — learn_from_turn's background worker writes new facts via
+                # merge_memory() under _memory_lock, NOT into the main loop's
+                # stale `memory` local; building from that local meant this rebuild
+                # never actually saw the new facts (the whole point of the delay).
+                # 2026-05-30 deep audit.
+                _t = threading.Timer(2.0, lambda: globals().__setitem__(
+                    "_system_prompt", build_system_prompt(load_memory())
+                ))
+                _t.daemon = True
+                _t.start()
+
+                print()
+
+            except Exception as _loop_exc:
+                # Per-iteration safety net: any exception escaping a callee
+                # (LLM dispatch, learn_from_turn, voice shortcuts, the prompt-
+                # rebuild Timer, etc.) used to propagate out of the loop, out of
+                # main(), and kill the detached pythonw process with a raw
+                # traceback (no supervisor relaunches it). Log + return to idle +
+                # continue so one malformed turn can no longer take the assistant
+                # permanently offline. KeyboardInterrupt is NOT an Exception, so
+                # Ctrl-C still falls through to the clean-shutdown handler below.
+                _recover_from_main_loop_error(_loop_exc)
+                continue
     except KeyboardInterrupt:
         print("\nShutting down…")
         # Stop any audio that might be mid-play/wait so sd.wait() doesn't block
@@ -17915,4 +17951,16 @@ if __name__ == "__main__":  # pragma: no cover - boot entrypoint; only runs when
     if "--list-monitors" in sys.argv:
         list_monitors_cli()
         sys.exit(0)
-    main()
+    # Top-level fatal guard: the per-turn loop net inside main() handles
+    # exceptions thrown by a turn, but an exception escaping the BOOT path
+    # (before the loop's try) — or any other unexpected escape — would emit a
+    # raw traceback to the detached pythonw console and vanish. Log it as a
+    # fatal first. KeyboardInterrupt/SystemExit are intentionally NOT caught:
+    # main()'s own handler does the clean Ctrl-C shutdown, and sys.exit must
+    # still propagate.
+    try:
+        main()
+    except Exception:
+        logging.exception("[fatal] JARVIS main() terminated with an "
+                          "unhandled exception")
+        raise
