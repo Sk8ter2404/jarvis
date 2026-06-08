@@ -397,6 +397,72 @@ def get_depth():
 
 
 # ─── body / skeleton tracking ─────────────────────────────────────────────
+# SHARED BODY-FRAME CACHE (see get_bodies()): the body PUMP is the single reader
+# of the sensor's single-consumer body frame; it parses bodies ONCE per frame
+# into _body_cache with a monotonic stamp in _body_cache_at, and every consumer
+# reads the cache (no per-frame competition). _body_cache is None until the first
+# successful read; [] is a valid cached "no bodies tracked" value (distinct from
+# None = never populated). BODY_CACHE_FRESH_SEC bounds how old a cache entry may
+# be and still be served before a consumer falls back to a direct read.
+BODY_CACHE_FRESH_SEC = 0.30        # serve cache stamped within this window
+_body_cache: list[Any] = [None]    # last parsed bodies (None=cold, []=none tracked)
+_body_cache_at = [0.0]             # monotonic stamp of the last cache populate
+_body_cache_lock = threading.Lock()
+
+
+def _store_bodies_cache(bodies: list, now: Optional[float] = None) -> None:
+    """Publish a freshly-parsed body list to the shared cache with a monotonic
+    stamp. Holds a tiny lock so a consumer reading the two cells never sees a
+    torn (bodies, stamp) pair. NEVER raises."""
+    ts = time.monotonic() if now is None else now
+    with _body_cache_lock:
+        _body_cache[0] = bodies
+        _body_cache_at[0] = ts
+
+
+def _get_cached_bodies(now: Optional[float] = None) -> Optional[list]:
+    """Return the cached bodies if they were stamped within BODY_CACHE_FRESH_SEC,
+    else None (cold or stale → the caller does a one-shot read). Returns a SHALLOW
+    COPY of the list so a consumer can't mutate the shared cache; the per-body
+    dicts are read-only by contract. NEVER raises."""
+    n = time.monotonic() if now is None else now
+    with _body_cache_lock:
+        bodies = _body_cache[0]
+        ts = _body_cache_at[0]
+    if bodies is None:
+        return None
+    if (n - ts) > BODY_CACHE_FRESH_SEC:
+        return None
+    return list(bodies)
+
+
+def _read_and_cache_bodies() -> list[dict]:
+    """The SOLE sensor-frame reader. If a new body frame is pending, read it ONCE,
+    parse it, publish to the shared cache, and stamp the staleness clock; return
+    the freshly-parsed bodies. When no NEW frame is pending, return the last cached
+    bodies if still fresh (so a direct caller racing the pump still gets data),
+    else []. NEVER raises — used by the pump every tick AND by get_bodies() as the
+    cold/stale fallback, so all sensor-frame contact funnels through here."""
+    rt, _ = get_runtime()
+    if rt is None:
+        return []
+    try:
+        has_new = getattr(rt, "has_new_body_frame", None)
+        if not callable(has_new) or not has_new():
+            # No new frame to consume this tick — serve a still-fresh cache so two
+            # readers in the same frame don't see []; else nothing to report.
+            fresh = _get_cached_bodies()
+            return fresh if fresh is not None else []
+        # A real new body frame is arriving — stamp the staleness clock (PART B)
+        # so an actively-read, healthy stream never trips the stale-reset.
+        note_body_frame_seen()
+        frame = rt.get_last_body_frame()
+    except Exception:   # pragma: no cover - defensive: mid-stream readiness/getter glitch
+        return []
+    bodies = _parse_body_frame(frame)
+    _store_bodies_cache(bodies)
+    return bodies
+
 
 def _joint_distance(joints: dict) -> Optional[float]:
     """Best available z-distance for a body: prefer head, then spine_shoulder,
@@ -512,38 +578,22 @@ def _body_facing_yaw(joints: dict) -> Optional[float]:
     return sum(vals) / len(vals)
 
 
-def get_bodies() -> list[dict]:
-    """Tracked bodies as a list of dicts. Empty list if none tracked or the
-    sensor is unavailable. Each entry:
+def _parse_body_frame(frame) -> list[dict]:
+    """Parse ONE raw PyKinectRuntime body frame into the public list-of-dicts
+    shape get_bodies() returns. Pure (no sensor / runtime contact) so the PUMP
+    can call it once per frame to populate the shared cache and a unit test can
+    feed it a fabricated frame. NEVER raises — a malformed frame degrades to [].
+
+    Each emitted entry:
         {"id": int,
          "joints": {name: (x, y, z, tracking_state), ...},  # metres
          "head": (x, y, z) | None,
          "distance_m": float | None,    # head/spine z
          "facing": bool | None,
-         "facing_yaw_deg": float | None,   # 0=square to sensor, -=sensor-left, +=sensor-right
-         "hand_right": "open"|"closed"|"lasso"|"unknown",   # discrete grip
-         "hand_left":  "open"|"closed"|"lasso"|"unknown"}
-
-    facing_yaw_deg is the body's shoulder-derived facing yaw (see
-    _body_facing_yaw); the gaze layer reads it. 0≈square to the sensor,
-    negative=turned toward the sensor's left, positive=toward its right; None
-    when it can't be estimated.
-
-    The two hand-state keys mirror the Kinect's per-hand OPEN/CLOSED/LASSO grip
-    (body.hand_right_state / hand_left_state). They're additive — every existing
-    consumer (presence, gestures, pointing) ignores them — so adding them is
-    backward-compatible. A build that doesn't expose the attribute, or an
-    untracked hand, reads as "unknown" (the helper swallows it)."""
-    rt, _ = get_runtime()
-    if rt is None:
-        return []
+         "facing_yaw_deg": float | None,   # 0=square, -=sensor-left, +=sensor-right
+         "hand_right": "open"|"closed"|"lasso"|"unknown",
+         "hand_left":  "open"|"closed"|"lasso"|"unknown"}"""
     try:
-        if not rt.has_new_body_frame():
-            return []
-        # A real new body frame is arriving — stamp the staleness clock (PART B)
-        # so an actively-read, healthy stream never trips the stale-reset.
-        note_body_frame_seen()
-        frame = rt.get_last_body_frame()
         # NB: frame.bodies on real hardware is a length-6 numpy ndarray
         # (dtype=object) — NEVER apply bool()/`not` to it or numpy raises
         # ValueError("truth value of an array ... is ambiguous"), which the
@@ -599,6 +649,39 @@ def get_bodies() -> list[dict]:
         return out
     except Exception:   # pragma: no cover - defensive: mid-stream body-frame glitch
         return []
+
+
+def get_bodies() -> list[dict]:
+    """Tracked bodies as a list of dicts (shape per _parse_body_frame). Empty
+    list if none tracked or the sensor is unavailable.
+
+    SHARED-CACHE CONTRACT (the fix for gesture/air-mouse starvation)
+    ================================================================
+    The Kinect v2 body frame is SINGLE-CONSUMER: get_last_body_frame() clears the
+    has_new_body_frame() flag, so the FIRST reader each frame consumes it and
+    every other reader that tick sees no new frame. With several pollers competing
+    (skeleton renderer, the body pump, the ~18 Hz gesture poller, the ~30 Hz
+    air-mouse poller) whoever read first won the frame and the rest got [] — the
+    pollers starved and gestures/air-mouse never fired.
+
+    The cure: the always-on body PUMP (_read_and_cache_bodies, ~30 Hz) is now the
+    SOLE reader of the sensor frame. It parses the bodies ONCE and stores them in
+    a module cache with a monotonic timestamp. EVERY consumer (this accessor, and
+    thus get_hand_states/get_presence/get_head_yaw and the skeleton overlay) reads
+    that shared cache with NO competition — many calls between two sensor frames
+    all return the SAME parsed bodies instead of a spurious [].
+
+    Returns the cached bodies when FRESH (cache stamped < BODY_CACHE_FRESH_SEC
+    ago). When the cache is stale or empty (no pump running yet, or the pump just
+    reset a stale runtime) it falls back to a ONE-SHOT direct read so a lone
+    caller with no pump — or the very first call right after enable — still works.
+    NEVER raises; a missing sensor / down runtime returns []."""
+    cached = _get_cached_bodies()
+    if cached is not None:
+        return cached
+    # Cache cold/stale and no fresh frame to serve — do a single direct read so a
+    # lone consumer (or the first tick before the pump warms) isn't left blind.
+    return _read_and_cache_bodies()
 
 
 def get_color_space_mapper():
@@ -757,26 +840,35 @@ def get_head_yaw() -> Optional[float]:
 
 
 # ─── PART B: stale-runtime guard + always-on body-frame pump ────────────────
-# THE BUG: the runtime streams briefly at boot (a gesture can fire ~30 s in)
-# then the BODY frame stream goes QUIET for many minutes while the owner waves.
-# The Kinect's body pipe only keeps flowing while something READS it: once the
-# gesture poller's reads stop landing (or the runtime latches), has_new_body_-
-# frame() stays False forever and every body consumer (gestures, presence,
-# head-yaw, the skeleton overlay) goes dead even though the sensor is fine.
+# TWO BUGS this pump cures:
+#   (1) The runtime streams briefly at boot then the BODY frame stream goes QUIET
+#       for minutes while the owner waves: the Kinect body pipe only flows while
+#       something READS it, so once reads stop landing has_new_body_frame() stays
+#       False forever and every body consumer goes dead though the sensor is fine.
+#   (2) The body frame is SINGLE-CONSUMER: get_last_body_frame() clears the
+#       new-frame flag, so when several pollers compete (skeleton renderer, this
+#       pump, the ~18 Hz gesture poller, the ~30 Hz air-mouse poller) the FIRST
+#       reader each frame consumes it and the rest get [] — the pollers starve
+#       and gestures/air-mouse never fire even with body data clearly flowing.
 #
-# THE FIX (two layers):
-#   1. A lightweight ALWAYS-ON pump thread (started when KINECT_ENABLED) that
-#      ticks has_new_body_frame()/get_last_body_frame() a few times a second to
-#      keep the body pipe flowing — the cleanest cure for the "nothing reads it"
-#      root cause. Singleton-guarded (never two) with a stop event.
+# THE FIX (shared cache + two layers):
+#   1. The ALWAYS-ON pump (started when KINECT_ENABLED) is now the SOLE reader of
+#      the sensor frame. Each tick it reads at most one pending frame, parses the
+#      bodies ONCE, and publishes them to the shared _body_cache with a monotonic
+#      stamp. Run at ~30 Hz so the cache is at most ~33 ms stale — fresh enough
+#      for the 30 Hz air-mouse. EVERY consumer (get_bodies + the accessors on it,
+#      the skeleton overlay) reads that cache with NO competition, so many reads
+#      between two sensor frames all return the SAME bodies (never a spurious []).
+#      Singleton-guarded (never two) with a stop event; opens the runtime itself
+#      so the cache warms even before any consumer calls in.
 #   2. A STALENESS reset: whenever a real new body frame is observed we stamp a
 #      monotonic timestamp; if the runtime is open yet no new body frame has
 #      arrived for > BODY_STALE_RESET_SEC, reset _runtime[0]=None so the next
 #      get_runtime() RE-OPENS the sensor (re-binding a live stream). On builds
 #      whose open path verifies streaming before caching, that reopen also
 #      retries until frames actually arrive. The pump drives this check, and
-#      get_bodies() also stamps freshness so a healthy stream never trips it.
-BODY_PUMP_INTERVAL_SEC = 0.20      # ~5 Hz: enough to keep the body pipe warm
+#      _read_and_cache_bodies() stamps freshness so a healthy stream never trips it.
+BODY_PUMP_INTERVAL_SEC = 1.0 / 30.0   # ~30 Hz: cache ≤~33 ms stale (feeds air-mouse)
 BODY_STALE_RESET_SEC = 4.0         # no new body frame for this long → reset+reopen
 _last_body_frame_at = [0.0]        # monotonic of the last OBSERVED new body frame
 _body_pump_thread: list[Any] = [None]
@@ -839,25 +931,26 @@ def reset_if_body_stale(now: Optional[float] = None) -> bool:
 
 
 def _pump_tick() -> None:
-    """One body-pump tick: keep the body pipe flowing by consuming any pending
-    body frame, stamp freshness when one arrives, and reset the runtime if the
-    stream has gone stale. NEVER raises — a glitch just skips this tick. Factored
-    out of the loop so it is unit-testable without a thread."""
+    """One body-pump tick — the SOLE reader of the single-consumer body frame.
+    Reads any pending frame ONCE via _read_and_cache_bodies(), which parses the
+    bodies, publishes them to the shared cache, and stamps freshness; then resets
+    the runtime if the stream has gone stale. Every consumer (get_bodies and the
+    accessors built on it, the skeleton overlay) then reads that shared cache with
+    NO per-frame competition — the cure for the gesture/air-mouse starvation.
+
+    Because the pump now OWNS the read, it also OPENS the runtime when KINECT is
+    enabled (via get_runtime() inside _read_and_cache_bodies) so the cache stays
+    warm even when no consumer has called in yet. NEVER raises — a glitch just
+    skips this tick. Factored out of the loop so it is unit-testable without a
+    thread."""
     if not _ENABLED:
         return
-    rt = _runtime[0]
-    if rt is None:
-        # Nothing to pump; don't force an open here — opening is the consumers'
-        # job (available()/get_runtime). The pump only keeps an OPEN stream warm.
-        return
     try:
-        has_new = getattr(rt, "has_new_body_frame", None)
-        if callable(has_new) and has_new():
-            getter = getattr(rt, "get_last_body_frame", None)
-            if callable(getter):
-                getter()           # drain so the next frame can arrive
-            note_body_frame_seen()
-    except Exception:   # pragma: no cover - defensive: mid-stream pump glitch
+        # Sole frame read → parse → publish to the shared cache (+ stamp the
+        # staleness clock when a real frame arrived). This also lazily opens the
+        # runtime when enabled, so the body pipe is kept warm with no consumer.
+        _read_and_cache_bodies()
+    except Exception:   # pragma: no cover - defensive: _read_and_cache_bodies already swallows
         pass
     # Layer 2: reset a runtime whose body stream has gone quiet.
     try:
@@ -902,10 +995,17 @@ def start_body_pump() -> bool:
 
 def stop_body_pump() -> None:
     """Signal the body-frame pump to exit. Idempotent + safe when none ran.
-    Called from close()/set_enabled(False)."""
+    Called from close()/set_enabled(False). Also drops the shared body cache so a
+    closed/disabled sensor reports [] immediately rather than serving a stale body
+    list for up to BODY_CACHE_FRESH_SEC after the stream is gone."""
     _body_pump_stop.set()
     with _body_pump_lock:
         _body_pump_thread[0] = None
+    # Invalidate the cache: with no pump reading, a lingering entry must not be
+    # served. None (not []) so get_bodies() treats it as cold → one-shot read.
+    with _body_cache_lock:
+        _body_cache[0] = None
+        _body_cache_at[0] = 0.0
 
 
 # ─── lifecycle ────────────────────────────────────────────────────────────
