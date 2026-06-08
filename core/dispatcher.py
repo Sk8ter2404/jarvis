@@ -587,7 +587,14 @@ def resolve_and_dispatch(
     if result is None:
         return None
 
-    dispatched: list[ChainStep] = []
+    # Re-check action availability BEFORE executing anything. An action can be
+    # de-registered between resolve and dispatch (actions.get() -> None). If we
+    # discover that mid-execution and then bail with <2 survivors, the caller
+    # treats None as 'no chain' and re-runs the surviving command through the
+    # LLM path — double-executing it (timer started twice, volume applied
+    # twice). Resolving availability up front means that when we bail, NOTHING
+    # has run yet, so the LLM fall-through is safe.
+    runnable: list[tuple[ChainStep, Callable[[str], str]]] = []
     for step in result.steps:
         fn = actions.get(step.action)
         if fn is None:
@@ -595,6 +602,15 @@ def resolve_and_dispatch(
             # Demote to unknown.
             result.unknown.append(step.source)
             continue
+        runnable.append((step, fn))
+
+    if len(runnable) < 2:
+        # Too few survivors to be a chain. Bail BEFORE executing so the caller
+        # can safely fall through to the LLM with nothing double-dispatched.
+        return None
+
+    dispatched: list[ChainStep] = []
+    for step, fn in runnable:
         try:
             rv = fn(step.arg)
             if _is_failure_result(rv):
@@ -619,9 +635,9 @@ def resolve_and_dispatch(
                 source=step.source,
             ))
 
-    if len(dispatched) < 2:
-        # If we lost too many steps to availability/exceptions, fall
-        # through to the LLM rather than emit a one-item "chain".
-        return None
-
+    # Every runnable step appends exactly one entry above (success, failure
+    # marker, or caught exception all append), so len(dispatched) == len(runnable)
+    # >= 2 here. We must NOT return None once actions have executed: that would
+    # let the caller re-run them via the LLM. The <2 floor now lives in the
+    # pre-execution availability check above.
     return _format_consolidated(dispatched, result.unknown)
