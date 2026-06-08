@@ -1853,6 +1853,30 @@ class MergeMemoryEdgeTests(_MonolithTestBase):
         self.assertEqual(added_p, [])
         self.assertEqual(self._store["projects"], ["Building a treehouse"])
 
+    def test_secret_projects_are_redacted(self):
+        # A credential the local model misclassifies as a PROJECT must be
+        # dropped before write, exactly like a secret fact — otherwise it's
+        # rendered verbatim into the cloud system prompt every turn. The
+        # "api key" keyword trips _is_secret_fact (value is a placeholder so the
+        # check_no_pii leak gate doesn't fire on the test source itself).
+        added_f, added_p = self.bc.merge_memory(
+            new_projects=["rotate the api key <redacted-placeholder>"])
+        self.assertEqual(added_p, [])
+        self.assertEqual(self._store["projects"], [])
+        # A legitimate project in the same call still lands.
+        _, added_p2 = self.bc.merge_memory(new_projects=["Building a treehouse"])
+        self.assertEqual(added_p2, ["Building a treehouse"])
+
+    def test_preexisting_secret_project_pruned_on_load(self):
+        # A secret-shaped project that reached disk before projects were
+        # redacted at write time must be dropped during the in-place repair, so
+        # a fresh merge stops re-saving (and re-leaking) it — even when nothing
+        # new is added for projects.
+        self._store["projects"] = ["the admin password is <placeholder>",
+                                    "Building a treehouse"]
+        self.bc.merge_memory(new_facts=["User likes tea"])
+        self.assertEqual(self._store["projects"], ["Building a treehouse"])
+
 
 # ──────────────────────────────────────────────────────────────────────────
 #  _load_chappie_standing_rules — empty-list + all-filtered → ""

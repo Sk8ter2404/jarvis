@@ -1098,6 +1098,21 @@ def _trim_conversation_history(max_history: int = MAX_CONVERSATION_HISTORY) -> N
         if conversation_history and conversation_history[0]["role"] == "assistant":
             conversation_history.pop(0)
 
+
+def _append_turn(user: str, assistant: str) -> None:
+    """Append a user+assistant turn to conversation_history, then trim.
+
+    The fast-path voice shortcuts (_run_voice_shortcuts) each append a turn and
+    `return True`, short-circuiting the main loop before the full-LLM path's
+    trim ever runs — so a session driven mostly by shortcuts (replay, chains,
+    controlled/mode dispatch) would grow conversation_history without bound,
+    leaking RAM and inflating the cloud-prompt token cost every turn. Routing
+    every shortcut's append through this one helper makes the trim impossible to
+    forget — no fast path can drift out of bounds."""
+    conversation_history.append({"role": "user", "content": user})
+    conversation_history.append({"role": "assistant", "content": assistant})
+    _trim_conversation_history()
+
 # (_sleep_mode, _shutdown_prompt_pending, _standby_mode,
 # _jarvis_played_music_at, _ambient_music_hits, _ambient_music_last_hit,
 # _overnight_run_now, _wake_history, _last_wake_date moved to
@@ -1197,9 +1212,11 @@ def merge_memory(new_facts=None, new_projects=None, new_topic=""):
     facts and projects. Returns (added_facts, added_projects) — the
     items actually written, after dedupe.
 
-    Credential redaction: any candidate fact matching _SECRET_FACT_PATTERNS
-    is dropped before write (security audit 2026-05-30) so secrets can't
-    leak into the system prompt that's sent to the cloud every turn.
+    Credential redaction: any candidate fact OR project matching
+    _SECRET_FACT_PATTERNS is dropped before write (security audit 2026-05-30;
+    extended to projects 2026-06-07) so secrets can't leak into the system
+    prompt that's sent to the cloud every turn. Pre-existing secret-shaped
+    projects already on disk are also pruned during the in-place repair.
     """
     _raw_facts = [f.strip() for f in (new_facts or [])
                   if isinstance(f, str) and f.strip()]
@@ -1216,9 +1233,23 @@ def merge_memory(new_facts=None, new_projects=None, new_topic=""):
         # Cap each fact before storage: it's re-injected into the cloud system
         # prompt every turn, so one runaway fact is permanent token bloat.
         new_facts.append(_clamp_fact_len(_f))
-    new_projects = [_clamp_fact_len(p.strip()) for p in (new_projects or [])
-                    if isinstance(p, str) and p.strip()
-                    and not _is_internal_noise_fact(p.strip())]
+    # Projects are rendered verbatim into the cloud system prompt every turn
+    # too ("Projects they've mentioned:"), so they need the SAME credential
+    # redaction as facts — a candidate the local model classifies as a project
+    # ("rotate the API key sk-…", "router admin password is …") would otherwise
+    # leak the exact secret class _is_secret_fact was added to block.
+    _raw_projects = [p.strip() for p in (new_projects or [])
+                     if isinstance(p, str) and p.strip()]
+    new_projects = []
+    for _p in _raw_projects:
+        if _is_secret_fact(_p):
+            print(f"  [memory] redacted candidate project (looks like a secret): "
+                  f"{_p[:40]}…")
+            continue
+        if _is_internal_noise_fact(_p):
+            print(f"  [memory] dropped internal-noise candidate project: {_p[:40]}…")
+            continue
+        new_projects.append(_clamp_fact_len(_p))
     new_topic = new_topic.strip() if isinstance(new_topic, str) else ""
 
     added_facts: list[str] = []
@@ -1237,8 +1268,12 @@ def merge_memory(new_facts=None, new_projects=None, new_topic=""):
         # stored before the cap existed) so legacy bloat is repaired in place.
         memory["facts"]    = [_clamp_fact_len(f) if isinstance(f, str) else f
                               for f in memory["facts"]]
+        # Also drop any pre-existing secret-shaped project that landed on disk
+        # before projects were redacted at write time — otherwise the legacy
+        # repair would re-save (and keep leaking) it every turn.
         memory["projects"] = [_clamp_fact_len(p) if isinstance(p, str) else p
-                              for p in memory["projects"]]
+                              for p in memory["projects"]
+                              if not (isinstance(p, str) and _is_secret_fact(p))]
 
         existing_facts = {f.lower() for f in memory["facts"] if isinstance(f, str)}
         for f in new_facts:
@@ -4987,6 +5022,16 @@ def _thinking_loop(stop_evt: threading.Event):
             time.sleep(0.05)
 
 
+def _llm_error_reply() -> str:
+    """Honest, persona-consistent line spoken when the LLM turn itself raised
+    (not a backend-down path — those have their own messages — but an
+    unexpected exception escaping _call_llm's prologue or local route). Never
+    fabricates an answer to the user's question; just admits the turn failed so
+    the caller can return instead of propagating the crash to the main loop."""
+    return ("I'm afraid I ran into a problem forming that reply, sir — "
+            "please try again.")
+
+
 def get_response_with_animation(user_text: str) -> str:
     """Run the thinking eye animation concurrently while the LLM thinks."""
     pause_face_tracking()
@@ -4996,10 +5041,23 @@ def get_response_with_animation(user_text: str) -> str:
     anim      = threading.Thread(target=_thinking_loop, args=(stop_evt,), daemon=True)
     anim.start()
 
-    reply = _call_llm(user_text)
-
-    stop_evt.set()
-    anim.join()
+    # _call_llm is guarded internally on every backend branch, but its prologue
+    # (tone/route classifiers) and the local route's helpers can still raise.
+    # If anything escapes here, the try/finally MUST still stop+join the
+    # animation daemon: a leaked _thinking_loop keeps calling _heartbeat()
+    # forever, which falsifies the main-loop watchdog (it never sees a stale
+    # beat, so it can't recover the wedge). And the exception itself must not
+    # propagate — the outer main loop only catches KeyboardInterrupt, so an
+    # unguarded raise here crashes the whole conversation loop. Returning an
+    # honest fallback keeps the LLM branch non-propagating like the others.
+    try:
+        reply = _call_llm(user_text)
+    except Exception:
+        logging.exception("get_response_with_animation: _call_llm raised")
+        reply = _llm_error_reply()
+    finally:
+        stop_evt.set()
+        anim.join(timeout=2)
     return reply
 
 
@@ -5078,6 +5136,30 @@ def _main_loop_watchdog_thread():
         # Use Event.wait so tests can stop the thread promptly.
         if _watchdog_stop_event.wait(_MAIN_LOOP_WATCHDOG_INTERVAL):
             return
+
+
+def _recover_from_main_loop_error(exc: BaseException) -> None:
+    """Best-effort recovery after one main-loop turn raised an unexpected
+    exception. The main `while True:` body wraps each iteration in
+    `except Exception` and calls this, then `continue`s to the next turn, so
+    a single malformed turn (a callee raising — e.g. an LLM-dispatch fault)
+    can no longer propagate out of main() and take the assistant permanently
+    offline. The watchdog only recovers a STALLED loop (stale heartbeat); it
+    does nothing for a loop that threw and exited — there is no supervisor
+    relaunching the detached pythonw process, so the loop must self-heal here.
+
+    Logs the full traceback (matching the _thinking_loop / face-track per-
+    iteration nets) and returns the HUD/avatar to idle. Never raises — a
+    failure inside the recovery path must not re-break the loop it protects."""
+    try:
+        logging.exception("[main-loop] turn failed — recovering and "
+                          "continuing to next turn: %r", exc)
+    except Exception:
+        pass
+    try:
+        set_state("idle")
+    except Exception:
+        pass
 
 
 def _process_capture_chunk(chunk: np.ndarray,
@@ -6840,23 +6922,33 @@ def _local_then_cloud_or_honest(sys_prompt: str, messages: list,
 
     This is the 'local' route's counterpart to _call_llm's Claude-first path:
     there, Claude is tried first and local is the safety net; here local is
-    primary and Claude is the safety net."""
-    text = _call_local_llm(sys_prompt, messages, max_tokens=max_tokens)
-    if text:
-        t = text.lstrip()
-        if t.startswith("[local]"):
-            t = t[len("[local]"):].lstrip()
-        return t
-    # Local didn't answer. Prefer the cloud if we can reach it.
-    cloud = _claude_oneshot(sys_prompt, messages, max_tokens=max_tokens)
-    if cloud:
-        if _sac_blocked_local_recently():
-            print("  [local-llm] SAC blocked the local runner this boot — "
-                  "served this turn from the cloud instead")
-        else:
-            print("  [local-llm] local model unavailable — served this turn "
-                  "from the cloud instead")
-        return cloud
+    primary and Claude is the safety net.
+
+    The whole body is wrapped so an unexpected raise (from a helper's pre-try
+    guard, the SAC probe, etc.) degrades to the honest unavailability line
+    rather than propagating — giving the LOCAL route the same no-propagate
+    guarantee the Claude and Ollama branches of _call_llm already have."""
+    try:
+        text = _call_local_llm(sys_prompt, messages, max_tokens=max_tokens)
+        if text:
+            t = text.lstrip()
+            if t.startswith("[local]"):
+                t = t[len("[local]"):].lstrip()
+            return t
+        # Local didn't answer. Prefer the cloud if we can reach it.
+        cloud = _claude_oneshot(sys_prompt, messages, max_tokens=max_tokens)
+        if cloud:
+            if _sac_blocked_local_recently():
+                print("  [local-llm] SAC blocked the local runner this boot — "
+                      "served this turn from the cloud instead")
+            else:
+                print("  [local-llm] local model unavailable — served this turn "
+                      "from the cloud instead")
+            return cloud
+    except Exception as _e:
+        print(f"  [local-llm] local route raised ({type(_e).__name__}: {_e}) — "
+              "returning honest unavailability message (no fabrication)")
+        return _local_unavailable_message()
     # Neither local nor cloud. Be honest; never fabricate.
     print("  [local-llm] BOTH local and cloud unavailable — returning honest "
           "unavailability message (no fabrication)")
@@ -7146,7 +7238,15 @@ def _call_llm(user_text: str) -> str:
     # Classify mood from this utterance and (if non-default) extend the
     # system prompt for this single turn. Cache the label so the follow-up
     # call stays in the same register without re-running the detector.
-    tone = detect_tone(user_text)
+    # Guarded to a neutral default on any raise — like the voice-mood /
+    # emotion-tracker / mode-router adapters below — so a classifier glitch
+    # degrades the register for this turn instead of crashing the LLM turn
+    # (which the unguarded main loop would turn into a full crash).
+    try:
+        tone = detect_tone(user_text)
+    except Exception as _tone_err:
+        print(f"  [tone] classifier failed: {_tone_err}")
+        tone = None
     _last_user_tone[0] = tone
     _last_user_text[0] = user_text
     if tone:
@@ -7156,8 +7256,13 @@ def _call_llm(user_text: str) -> str:
     # mood label and emits a per-turn system-prompt addendum (reply length
     # + register). TTS prosody for the same mood is picked downstream by
     # synthesise() via _USER_TONE_TTS. Cached so the follow-up call stays
-    # in the same register without re-classifying.
-    route = route_voice_emotion(user_text)
+    # in the same register without re-classifying. Same neutral-default guard
+    # as the tone classifier above.
+    try:
+        route = route_voice_emotion(user_text)
+    except Exception as _route_err:
+        print(f"  [voice-mood] router failed: {_route_err}")
+        route = {"mood": "casual", "addendum": ""}
     _last_voice_route[0] = route
     if route["mood"] != "casual":
         print(f"  [voice-mood] {route['mood']}")
@@ -13584,10 +13689,22 @@ _RUN_PYTHON_ACTIONS = frozenset({
 })
 
 # Bare callables / names whose mere presence makes the snippet untrusted.
+# getattr/setattr/delattr/locals are here because they are the primitives an
+# injected snippet uses to reach dunders WITHOUT writing them literally (e.g.
+# getattr(obj, chr(95)*2+'class'+chr(95)*2)), which the literal-dunder checks
+# below can't see. They have no place in a pure-compute snippet.
 _PY_DANGEROUS_NAMES = frozenset({
     "eval", "exec", "compile", "__import__", "open", "input",
     "breakpoint", "memoryview", "globals", "vars",
+    "getattr", "setattr", "delattr", "locals",
 })
+# ANY dunder name (``__\w+__``) — not just the curated _PY_DANGEROUS_ATTRS set
+# — is suspicious as an attribute leaf or as a string literal, since dunder
+# ladders (__class__ → __bases__/__base__ → __subclasses__ → __globals__ → …)
+# are the backbone of every introspection-based sandbox escape and the curated
+# set inevitably misses members (e.g. the singular __base__). Pure-compute code
+# never references dunders, so this stays behaviour-preserving for legit math.
+_PY_DUNDER_RE = re.compile(r"^__\w+__$")
 # Attribute accesses (matched on the trailing `.attr`, regardless of the
 # object expression) that signal filesystem / process / network / native
 # side effects or sandbox-escape primitives.
@@ -13683,15 +13800,18 @@ def _scan_python_for_danger(code: str) -> str | None:
             if node.id in _PY_DANGEROUS_NAMES:
                 return node.id
         # os.system / subprocess.Popen / shutil.rmtree / sock.connect /
-        # obj.__subclasses__ — match on the attribute leaf only.
+        # obj.__subclasses__ — match on the attribute leaf only. Any dunder
+        # leaf is flagged (not just the curated set) so an escape ladder can't
+        # slip through on a member we forgot to enumerate (e.g. __base__).
         elif isinstance(node, _ast.Attribute):
-            if node.attr in _PY_DANGEROUS_ATTRS:
+            if node.attr in _PY_DANGEROUS_ATTRS or _PY_DUNDER_RE.match(node.attr):
                 return node.attr
-        # Dunder-name string literals ("__globals__" etc.) used to drive
-        # getattr()-based sandbox escapes.
+        # Dunder-name string literals ("__globals__", "__base__", …) used to
+        # drive getattr()-based sandbox escapes. Flag ANY dunder literal, since
+        # the curated set can't anticipate every rung of the ladder.
         elif isinstance(node, _ast.Constant) and isinstance(node.value, str):
             v = node.value
-            if v.startswith("__") and v.endswith("__") and v in _PY_DANGEROUS_ATTRS:
+            if v in _PY_DANGEROUS_ATTRS or _PY_DUNDER_RE.match(v):
                 return v
     return None
 
@@ -13716,6 +13836,21 @@ def _jarvis_pushback(name: str, arg: str) -> tuple[str, str] | None:
                       "system or network, sir. Shall I execute it regardless?")
             return (phrase, f"run_python dangerous construct: {danger}")
         return None
+
+    # run_shell: destructive-looking command that slipped past the hard
+    # _SHELL_FORBIDDEN_PATTERNS blocklist (rm -rf node_modules, Remove-Item
+    # -Recurse on a non-c:/d: drive, git reset --hard…). Like the run_python
+    # gate above this is a hard P0 confirmation, NOT a gray-zone pushback, so
+    # it MUST run even when PUSHBACK_ENABLED is off — otherwise a hallucinated
+    # or prompt-injected command that dodges the substring blocklist would
+    # auto-exec via `powershell -Command` with no confirmation. (Computes its
+    # own lowercase view since the shared `low` below lives past the early
+    # return.)
+    if nm == "run_shell":
+        sh_low = (arg or "").strip().lower()
+        if sh_low and _looks_like_destructive_shell(sh_low):
+            phrase = "That seems inadvisable, sir. Shall I proceed regardless?"
+            return (phrase, f"destructive shell pattern: {sh_low[:60]}")
 
     if not PUSHBACK_ENABLED:
         return None
@@ -13776,12 +13911,8 @@ def _jarvis_pushback(name: str, arg: str) -> tuple[str, str] | None:
                   "last hour. Are you certain?")
         return (phrase, "forget_last_hour wipes recent memory")
 
-    # run_shell: destructive-looking command that slipped past the hard
-    # blocklist (rm -rf node_modules, Remove-Item -Recurse, git reset --hard…).
-    if nm == "run_shell" and low:
-        if _looks_like_destructive_shell(low):
-            phrase = "That seems inadvisable, sir. Shall I proceed regardless?"
-            return (phrase, f"destructive shell pattern: {low[:60]}")
+    # (run_shell destructive-command gate handled above the PUSHBACK_ENABLED
+    # early return — it is a hard P0 control, not a gray-zone pushback.)
 
     # open_url: bare-IP / known shortener / sketchy TLD / tunnel host.
     if nm == "open_url" and low:
@@ -15923,9 +16054,7 @@ def _maybe_orchestrate(text: str) -> bool:
         print("  [orchestrator] empty result — falling through to normal turn")
         return False
     print(f"  [orchestrator] brief: {clean[:300]}")
-    conversation_history.append({"role": "user", "content": text})
-    conversation_history.append({"role": "assistant", "content": clean})
-    _trim_conversation_history()
+    _append_turn(text, clean)
     _speak(clean)
     set_state("idle")
     return True
@@ -15951,10 +16080,7 @@ def _run_voice_shortcuts(text: str) -> bool:
         _replay_reply = None
     if _replay_reply is not None:
         print(f"  [replay] {_replay_reply}")
-        conversation_history.append({"role": "user", "content": text})
-        conversation_history.append(
-            {"role": "assistant", "content": _replay_reply}
-        )
+        _append_turn(text, _replay_reply)
         _speak(_replay_reply)
         set_state("idle")
         return True
@@ -15972,10 +16098,7 @@ def _run_voice_shortcuts(text: str) -> bool:
         _backend_reply = None
     if _backend_reply is not None:
         print(f"  [tts-toggle] {_backend_reply}")
-        conversation_history.append({"role": "user", "content": text})
-        conversation_history.append(
-            {"role": "assistant", "content": _backend_reply}
-        )
+        _append_turn(text, _backend_reply)
         _speak(_backend_reply)
         set_state("idle")
         return True
@@ -16017,10 +16140,7 @@ def _run_voice_shortcuts(text: str) -> bool:
             _toggle_reply = None
         if _toggle_reply is not None:
             print(f"  [mode] {_toggle_reply}")
-            conversation_history.append({"role": "user", "content": text})
-            conversation_history.append(
-                {"role": "assistant", "content": _toggle_reply}
-            )
+            _append_turn(text, _toggle_reply)
             _speak(_toggle_reply)
             set_state("idle")
             return True
@@ -16037,10 +16157,7 @@ def _run_voice_shortcuts(text: str) -> bool:
                 )
             if _ctrl_reply is not None:
                 print(f"  [mode-controlled] {_ctrl_reply}")
-                conversation_history.append({"role": "user", "content": text})
-                conversation_history.append(
-                    {"role": "assistant", "content": _ctrl_reply}
-                )
+                _append_turn(text, _ctrl_reply)
                 _speak(_ctrl_reply)
                 set_state("idle")
                 return True
@@ -16059,10 +16176,7 @@ def _run_voice_shortcuts(text: str) -> bool:
         _chain_reply = None
     if _chain_reply is not None:
         print(f"  [chain] {_chain_reply}")
-        conversation_history.append({"role": "user", "content": text})
-        conversation_history.append(
-            {"role": "assistant", "content": _chain_reply}
-        )
+        _append_turn(text, _chain_reply)
         _speak(_chain_reply)
         set_state("idle")
         return True
@@ -17584,231 +17698,243 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         # seconds, and we don't want a slow boot to look like a stall.
         _main_loop_heartbeat[0] = time.time()
         while True:
-            if _blue_green_loop_tick():
-                return
-            # Check for an injected command BEFORE we block on the mic. An
-            # external tester (Claude Code, tools/say_to_jarvis.py, smoke
-            # harness) can drop one in injected_commands.json to feed a
-            # voice-equivalent user turn into the loop. The handlers below
-            # branch on `_injected_text is not None` to skip record_speech
-            # + transcribe and synthesise safe pass-through metadata.
-            _injected_text = _drain_injected_command()
-
-            # ── SLEEP / STANDBY MODE — only listen for the wake phrase ────────
-            if _sleep_mode[0]:
-                _handle_sleep_standby(_injected_text)
-                continue
-            # ── NORMAL MODE ───────────────────────────────────────────────────
-
-            # Capture the next utterance (inject or mic->Whisper) and drain
-            # any queued speech; short-circuit the loop on a reminder /
-            # silence-timeout / too-short clip. See _capture_utterance.
-            _cap = _capture_utterance(_injected_text, memory)
-            if _cap is None:
-                continue
-            text, conf = _cap
-
-            # ── AMBIENT MUSIC DETECTION → auto-standby ────────────────────────
-            # Whisper emits markers like [Music] / ♪ when the mic picks up
-            # song audio it can't transcribe as words. If we see those AND
-            # JARVIS itself didn't recently kick off playback, count it
-            # toward an auto-standby trigger so we stop pestering the user
-            # with hallucinated transcriptions of overheard music.
-            if _handle_ambient_music(text):
-                continue
-
-            # ── Ambient-music gate (2026-05-30 runtime-log audit) ──────────
-            # The marker check above only catches Whisper's [Music]/♪ tags;
-            # CLEAN song lyrics transcribe as ordinary words and slipped past
-            # it, so JARVIS was replying to the user's music/TV/another person
-            # (~60% of "commands" in the logs — the user repeatedly told it to
-            # "stop listening"). Reuse the standby detector's TESTED state:
-            # `should_refuse_wake` returns False unless SUSTAINED (>15s) room
-            # music is active, and even then lets a clear leading "JARVIS"
-            # through — so quiet-room turns are unaffected and the user can
-            # still command over music by prefixing the wake word. Anything
-            # else while music plays is treated as overheard audio and dropped.
-            _bg_gate, _bg_why = _should_refuse_background_audio(text)
-            if _bg_gate:
-                print(f"  [bg-audio] {_bg_why} — ignoring non-wake "
-                      f"utterance: '{text[:40]}'")
-                # Alexa-mode ambient learning: we won't RESPOND to this gated
-                # (non-wake) utterance, but if ambient-listening is on we still
-                # passively LEARN from it — feed the transcript to the extractor
-                # BEFORE dropping the turn. Pass this turn's RAW audio so the
-                # learner can voice-ID the owner and refuse the TV/strangers, and
-                # this turn's Whisper conf + peak RMS so the learner runs the same
-                # is_valid_speech() confidence/RMS gate normal turns use before
-                # learning (so a low-confidence hallucination is never ingested).
-                # No-op when AMBIENT_LISTEN_ENABLED is off; never raises; never
-                # speaks (see _ambient_learn_from_gated).
-                #
-                # Dispatch on a daemon thread: the new content-judge runs a local
-                # LLM synchronously, which takes seconds — we must NOT block the
-                # main listen loop on it. Snapshot this turn's audio/conf/peak
-                # into the thread args NOW (the module globals get overwritten by
-                # the next turn). _ambient_learn_from_gated never raises.
-                threading.Thread(
-                    target=_ambient_learn_from_gated,
-                    args=(text, memory, _last_capture_audio, _last_capture_sr),
-                    kwargs={"conf": conf, "peak_rms": _last_recording_peak},
-                    daemon=True,
-                ).start()
-                set_state("idle")
-                continue
-
-            valid, reason = is_valid_speech(text, conf, peak_rms=_last_recording_peak)
-            if not valid:
-                # Show what got dropped so user can tune thresholds if needed
-                snippet = (text[:60] + "…") if len(text) > 60 else text
-                print(f"  [filter] dropped: '{snippet}' — {reason}")
-                set_state("idle")
-                continue
-
-            print(f"  You:    {text}")
-            # Rolling 5-line history feeds the holographic HUD v2
-            # scrolling transcript panel. Cap at 5 entries here so the
-            # JSON file stays small.
             try:
-                with _hud_state_lock:
-                    _hist = list(_hud_state_cache.get("transcript_history") or [])
-            except Exception:
-                _hist = []
-            _hist.append(text)
-            _hist = _hist[-5:]
-            _write_hud_state(last_transcript=text,
-                             last_transcript_at=time.time(),
-                             transcript_history=_hist)
+                if _blue_green_loop_tick():
+                    return
+                # Check for an injected command BEFORE we block on the mic. An
+                # external tester (Claude Code, tools/say_to_jarvis.py, smoke
+                # harness) can drop one in injected_commands.json to feed a
+                # voice-equivalent user turn into the loop. The handlers below
+                # branch on `_injected_text is not None` to skip record_speech
+                # + transcribe and synthesise safe pass-through metadata.
+                _injected_text = _drain_injected_command()
 
-            # ── BRIEFING CARD DISMISS — "thank you, JARVIS" closes a card ─────
-            # Doesn't consume the turn; the LLM still gets to respond to the
-            # thanks naturally. Fail closed if hud_card isn't importable.
-            try:
-                import hud_card as _hud_card  # noqa: WPS433 (lazy local import)
-                if _hud_card.is_card_active() and _hud_card.matches_dismiss_phrase(text):
-                    _hud_card.dismiss_card()
-                    print("  [hud_card] dismissed by phrase")
-            except Exception:
-                pass
+                # ── SLEEP / STANDBY MODE — only listen for the wake phrase ────────
+                if _sleep_mode[0]:
+                    _handle_sleep_standby(_injected_text)
+                    continue
+                # ── NORMAL MODE ───────────────────────────────────────────────────
 
-            # ── SLEEP TRIGGER — check before sending to LLM ───────────────────
-            # Two-gate check: (a) utterance must be short (≤ 6 words) AND
-            # (b) the phrase must match with word boundaries — so casual
-            # mentions like "if I say stop listening it should…" don't
-            # trigger sleep mid-explanation.
-            if _handle_sleep_triggers(text):
-                continue
+                # Capture the next utterance (inject or mic->Whisper) and drain
+                # any queued speech; short-circuit the loop on a reminder /
+                # silence-timeout / too-short clip. See _capture_utterance.
+                _cap = _capture_utterance(_injected_text, memory)
+                if _cap is None:
+                    continue
+                text, conf = _cap
 
-            # ── SHUTDOWN PROMPT — yes/no router for the overnight-protocol
-            #    prompt armed by a previous SHUTDOWN_TRIGGER_PHRASE. Runs FIRST
-            #    so a 'yes' answer doesn't get swallowed by any other handler.
-            #    Returns True only when the message was consumed (YES / NO /
-            #    reinforced-shutdown branches); an unrelated reply clears the
-            #    flag and returns False so the original utterance still routes
-            #    through normal LLM dispatch below.
-            if _handle_shutdown_prompt(text):
-                set_state("idle")
-                continue
+                # ── AMBIENT MUSIC DETECTION → auto-standby ────────────────────────
+                # Whisper emits markers like [Music] / ♪ when the mic picks up
+                # song audio it can't transcribe as words. If we see those AND
+                # JARVIS itself didn't recently kick off playback, count it
+                # toward an auto-standby trigger so we stop pestering the user
+                # with hallucinated transcriptions of overheard music.
+                if _handle_ambient_music(text):
+                    continue
 
-            # ── SHUTDOWN TRIGGER — arms the overnight-first prompt for any
-            #    of the ambiguous shutdown phrases ('shut down' / 'power off'
-            #    / 'go offline' / etc.). The NEXT utterance is then handled
-            #    by _handle_shutdown_prompt above. Unambiguous bedtime phrases
-            #    ('goodnight' / 'going to bed') are NOT in this list — they
-            #    still route directly to start_overnight_upgrade via the LLM.
-            if _check_and_arm_shutdown_prompt(text):
-                set_state("idle")
-                continue
+                # ── Ambient-music gate (2026-05-30 runtime-log audit) ──────────
+                # The marker check above only catches Whisper's [Music]/♪ tags;
+                # CLEAN song lyrics transcribe as ordinary words and slipped past
+                # it, so JARVIS was replying to the user's music/TV/another person
+                # (~60% of "commands" in the logs — the user repeatedly told it to
+                # "stop listening"). Reuse the standby detector's TESTED state:
+                # `should_refuse_wake` returns False unless SUSTAINED (>15s) room
+                # music is active, and even then lets a clear leading "JARVIS"
+                # through — so quiet-room turns are unaffected and the user can
+                # still command over music by prefixing the wake word. Anything
+                # else while music plays is treated as overheard audio and dropped.
+                _bg_gate, _bg_why = _should_refuse_background_audio(text)
+                if _bg_gate:
+                    print(f"  [bg-audio] {_bg_why} — ignoring non-wake "
+                          f"utterance: '{text[:40]}'")
+                    # Alexa-mode ambient learning: we won't RESPOND to this gated
+                    # (non-wake) utterance, but if ambient-listening is on we still
+                    # passively LEARN from it — feed the transcript to the extractor
+                    # BEFORE dropping the turn. Pass this turn's RAW audio so the
+                    # learner can voice-ID the owner and refuse the TV/strangers, and
+                    # this turn's Whisper conf + peak RMS so the learner runs the same
+                    # is_valid_speech() confidence/RMS gate normal turns use before
+                    # learning (so a low-confidence hallucination is never ingested).
+                    # No-op when AMBIENT_LISTEN_ENABLED is off; never raises; never
+                    # speaks (see _ambient_learn_from_gated).
+                    #
+                    # Dispatch on a daemon thread: the new content-judge runs a local
+                    # LLM synchronously, which takes seconds — we must NOT block the
+                    # main listen loop on it. Snapshot this turn's audio/conf/peak
+                    # into the thread args NOW (the module globals get overwritten by
+                    # the next turn). _ambient_learn_from_gated never raises.
+                    threading.Thread(
+                        target=_ambient_learn_from_gated,
+                        args=(text, memory, _last_capture_audio, _last_capture_sr),
+                        kwargs={"conf": conf, "peak_rms": _last_recording_peak},
+                        daemon=True,
+                    ).start()
+                    set_state("idle")
+                    continue
 
-            # If the autocorrect layer asked 'did you mean X or Y' on the
-            # previous turn, interpret this utterance as the user's pick.
-            # Runs BEFORE handle_confirmation_response because a disambig
-            # 'yes' is meaningfully different from a confirmation 'yes' —
-            # the disambig handler short-circuits to the picked action and
-            # clears its own queue; an unrelated reply returns False so the
-            # original utterance still falls through to normal dispatch.
-            if handle_autocorrect_disambig_response(text):
-                set_state("idle")
-                continue
+                valid, reason = is_valid_speech(text, conf, peak_rms=_last_recording_peak)
+                if not valid:
+                    # Show what got dropped so user can tune thresholds if needed
+                    snippet = (text[:60] + "…") if len(text) > 60 else text
+                    print(f"  [filter] dropped: '{snippet}' — {reason}")
+                    set_state("idle")
+                    continue
 
-            # If a high-risk action is pending, treat this utterance as the
-            # confirmation/cancellation rather than a new prompt.
-            if handle_confirmation_response(text):
-                set_state("idle")
-                continue
-
-            # Command-level pattern memory: log this utterance with day-of-week
-            # so get_patterns() can mine repeated targets (artist names, app
-            # names) at the same time-of-week. Logged AFTER the sleep / standby
-            # / confirmation guards so trigger phrases don't pollute the log.
-            try:
-                pattern_memory.record_voice_command(text)
-            except Exception as _e:
-                print(f"  [pattern_memory] record failed: {_e}")
-
-            # Late-night commentary (01:00–04:59). Either an in-character
-            # remark before complying, or an acknowledgement that the user
-            # has muted further remarks for the night.
-            _ln_remark = maybe_late_night_remark(text, memory)
-            if _ln_remark:
-                print(f"  [late-night] {_ln_remark}")
-                _speak(_ln_remark)
-                # Deliberately NOT appended to conversation_history. This
-                # remark is a spoken aside that PRECEDES the user's pending
-                # turn; appending it as an assistant message here — before
-                # _call_llm() appends the user message just below — produced
-                # two consecutive assistant turns and a Claude 400 "roles
-                # must alternate", swallowed into a silent downgrade-to-local
-                # on every 01:00–04:59 turn. 2026-05-30 audit.
-
-            # Explicit multi-agent briefing? Fan out to the sub-agent
-            # orchestrator (opt-in; default path untouched). See _maybe_orchestrate.
-            if _maybe_orchestrate(text):
-                continue
-
-            if _run_voice_shortcuts(text):
-                continue
-
-            reply = _run_llm_dispatch(text)
-
-            # Real-time learning: extract facts in background (non-blocking)
-            learn_from_turn(text, reply, memory)
-
-            # Ambient-learning 'answer_then_quiet': this normal-mode turn was the
-            # ONE reply granted after the wake word — now drop straight back to
-            # silent standby so the next interaction needs 'JARVIS' again. Only a
-            # fully-processed command turn reaches here (music / invalid-speech /
-            # silence-timeout paths all 'continue' earlier), so the user always
-            # gets their answer BEFORE JARVIS goes quiet. 'stay_talkative' never
-            # arms the flag, so it stays interactive until a sleep/standby phrase.
-            if _resume_to_ambient[0]:
-                _resume_to_ambient[0] = False
-                with _standby_auto_engage_lock:
-                    _sleep_mode[0]   = True
-                    _standby_mode[0] = True
+                print(f"  You:    {text}")
+                # Rolling 5-line history feeds the holographic HUD v2
+                # scrolling transcript panel. Cap at 5 entries here so the
+                # JSON file stays small.
                 try:
-                    _write_hud_state(sleep_mode=True, standby_mode=True)
+                    with _hud_state_lock:
+                        _hist = list(_hud_state_cache.get("transcript_history") or [])
+                except Exception:
+                    _hist = []
+                _hist.append(text)
+                _hist = _hist[-5:]
+                _write_hud_state(last_transcript=text,
+                                 last_transcript_at=time.time(),
+                                 transcript_history=_hist)
+
+                # ── BRIEFING CARD DISMISS — "thank you, JARVIS" closes a card ─────
+                # Doesn't consume the turn; the LLM still gets to respond to the
+                # thanks naturally. Fail closed if hud_card isn't importable.
+                try:
+                    import hud_card as _hud_card  # noqa: WPS433 (lazy local import)
+                    if _hud_card.is_card_active() and _hud_card.matches_dismiss_phrase(text):
+                        _hud_card.dismiss_card()
+                        print("  [hud_card] dismissed by phrase")
                 except Exception:
                     pass
-                print("  [ambient-learning] reply delivered — back to silent "
-                      "standby (say 'JARVIS' for more)")
 
-            # Rebuild prompt with any newly-learned facts after a short delay
-            # so the very next turn already has them. Daemon so Ctrl-C exits
-            # cleanly even if a Timer is pending. Reload memory FRESH from disk
-            # — learn_from_turn's background worker writes new facts via
-            # merge_memory() under _memory_lock, NOT into the main loop's
-            # stale `memory` local; building from that local meant this rebuild
-            # never actually saw the new facts (the whole point of the delay).
-            # 2026-05-30 deep audit.
-            _t = threading.Timer(2.0, lambda: globals().__setitem__(
-                "_system_prompt", build_system_prompt(load_memory())
-            ))
-            _t.daemon = True
-            _t.start()
+                # ── SLEEP TRIGGER — check before sending to LLM ───────────────────
+                # Two-gate check: (a) utterance must be short (≤ 6 words) AND
+                # (b) the phrase must match with word boundaries — so casual
+                # mentions like "if I say stop listening it should…" don't
+                # trigger sleep mid-explanation.
+                if _handle_sleep_triggers(text):
+                    continue
 
-            print()
+                # ── SHUTDOWN PROMPT — yes/no router for the overnight-protocol
+                #    prompt armed by a previous SHUTDOWN_TRIGGER_PHRASE. Runs FIRST
+                #    so a 'yes' answer doesn't get swallowed by any other handler.
+                #    Returns True only when the message was consumed (YES / NO /
+                #    reinforced-shutdown branches); an unrelated reply clears the
+                #    flag and returns False so the original utterance still routes
+                #    through normal LLM dispatch below.
+                if _handle_shutdown_prompt(text):
+                    set_state("idle")
+                    continue
 
+                # ── SHUTDOWN TRIGGER — arms the overnight-first prompt for any
+                #    of the ambiguous shutdown phrases ('shut down' / 'power off'
+                #    / 'go offline' / etc.). The NEXT utterance is then handled
+                #    by _handle_shutdown_prompt above. Unambiguous bedtime phrases
+                #    ('goodnight' / 'going to bed') are NOT in this list — they
+                #    still route directly to start_overnight_upgrade via the LLM.
+                if _check_and_arm_shutdown_prompt(text):
+                    set_state("idle")
+                    continue
+
+                # If the autocorrect layer asked 'did you mean X or Y' on the
+                # previous turn, interpret this utterance as the user's pick.
+                # Runs BEFORE handle_confirmation_response because a disambig
+                # 'yes' is meaningfully different from a confirmation 'yes' —
+                # the disambig handler short-circuits to the picked action and
+                # clears its own queue; an unrelated reply returns False so the
+                # original utterance still falls through to normal dispatch.
+                if handle_autocorrect_disambig_response(text):
+                    set_state("idle")
+                    continue
+
+                # If a high-risk action is pending, treat this utterance as the
+                # confirmation/cancellation rather than a new prompt.
+                if handle_confirmation_response(text):
+                    set_state("idle")
+                    continue
+
+                # Command-level pattern memory: log this utterance with day-of-week
+                # so get_patterns() can mine repeated targets (artist names, app
+                # names) at the same time-of-week. Logged AFTER the sleep / standby
+                # / confirmation guards so trigger phrases don't pollute the log.
+                try:
+                    pattern_memory.record_voice_command(text)
+                except Exception as _e:
+                    print(f"  [pattern_memory] record failed: {_e}")
+
+                # Late-night commentary (01:00–04:59). Either an in-character
+                # remark before complying, or an acknowledgement that the user
+                # has muted further remarks for the night.
+                _ln_remark = maybe_late_night_remark(text, memory)
+                if _ln_remark:
+                    print(f"  [late-night] {_ln_remark}")
+                    _speak(_ln_remark)
+                    # Deliberately NOT appended to conversation_history. This
+                    # remark is a spoken aside that PRECEDES the user's pending
+                    # turn; appending it as an assistant message here — before
+                    # _call_llm() appends the user message just below — produced
+                    # two consecutive assistant turns and a Claude 400 "roles
+                    # must alternate", swallowed into a silent downgrade-to-local
+                    # on every 01:00–04:59 turn. 2026-05-30 audit.
+
+                # Explicit multi-agent briefing? Fan out to the sub-agent
+                # orchestrator (opt-in; default path untouched). See _maybe_orchestrate.
+                if _maybe_orchestrate(text):
+                    continue
+
+                if _run_voice_shortcuts(text):
+                    continue
+
+                reply = _run_llm_dispatch(text)
+
+                # Real-time learning: extract facts in background (non-blocking)
+                learn_from_turn(text, reply, memory)
+
+                # Ambient-learning 'answer_then_quiet': this normal-mode turn was the
+                # ONE reply granted after the wake word — now drop straight back to
+                # silent standby so the next interaction needs 'JARVIS' again. Only a
+                # fully-processed command turn reaches here (music / invalid-speech /
+                # silence-timeout paths all 'continue' earlier), so the user always
+                # gets their answer BEFORE JARVIS goes quiet. 'stay_talkative' never
+                # arms the flag, so it stays interactive until a sleep/standby phrase.
+                if _resume_to_ambient[0]:
+                    _resume_to_ambient[0] = False
+                    with _standby_auto_engage_lock:
+                        _sleep_mode[0]   = True
+                        _standby_mode[0] = True
+                    try:
+                        _write_hud_state(sleep_mode=True, standby_mode=True)
+                    except Exception:
+                        pass
+                    print("  [ambient-learning] reply delivered — back to silent "
+                          "standby (say 'JARVIS' for more)")
+
+                # Rebuild prompt with any newly-learned facts after a short delay
+                # so the very next turn already has them. Daemon so Ctrl-C exits
+                # cleanly even if a Timer is pending. Reload memory FRESH from disk
+                # — learn_from_turn's background worker writes new facts via
+                # merge_memory() under _memory_lock, NOT into the main loop's
+                # stale `memory` local; building from that local meant this rebuild
+                # never actually saw the new facts (the whole point of the delay).
+                # 2026-05-30 deep audit.
+                _t = threading.Timer(2.0, lambda: globals().__setitem__(
+                    "_system_prompt", build_system_prompt(load_memory())
+                ))
+                _t.daemon = True
+                _t.start()
+
+                print()
+
+            except Exception as _loop_exc:
+                # Per-iteration safety net: any exception escaping a callee
+                # (LLM dispatch, learn_from_turn, voice shortcuts, the prompt-
+                # rebuild Timer, etc.) used to propagate out of the loop, out of
+                # main(), and kill the detached pythonw process with a raw
+                # traceback (no supervisor relaunches it). Log + return to idle +
+                # continue so one malformed turn can no longer take the assistant
+                # permanently offline. KeyboardInterrupt is NOT an Exception, so
+                # Ctrl-C still falls through to the clean-shutdown handler below.
+                _recover_from_main_loop_error(_loop_exc)
+                continue
     except KeyboardInterrupt:
         print("\nShutting down…")
         # Stop any audio that might be mid-play/wait so sd.wait() doesn't block
@@ -17871,4 +17997,16 @@ if __name__ == "__main__":  # pragma: no cover - boot entrypoint; only runs when
     if "--list-monitors" in sys.argv:
         list_monitors_cli()
         sys.exit(0)
-    main()
+    # Top-level fatal guard: the per-turn loop net inside main() handles
+    # exceptions thrown by a turn, but an exception escaping the BOOT path
+    # (before the loop's try) — or any other unexpected escape — would emit a
+    # raw traceback to the detached pythonw console and vanish. Log it as a
+    # fatal first. KeyboardInterrupt/SystemExit are intentionally NOT caught:
+    # main()'s own handler does the clean Ctrl-C shutdown, and sys.exit must
+    # still propagate.
+    try:
+        main()
+    except Exception:
+        logging.exception("[fatal] JARVIS main() terminated with an "
+                          "unhandled exception")
+        raise
