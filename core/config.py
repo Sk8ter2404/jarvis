@@ -658,6 +658,23 @@ HUD_MONITOR = "top"                # which monitor in MONITORS to anchor to
 # JPEG is ever written).
 HUD_CAMERA_PREVIEW = True
 
+# Kinect SKELETON OVERLAY in the HUD camera preview (PART A). When True AND the
+# Kinect is enabled + streaming, the HUD camera tile shows the KINECT COLOR frame
+# with the LIVE tracked SKELETON drawn over it (bones between adjacent joints +
+# dots at joints), composited with two small webcam tiles ('Fullhan Webcam' =
+# left, 'USB 2.0 Camera' = right, resolved by name). This REPLACES the plain
+# primary-webcam mirror in the preview JPEG with the richer Kinect+skeleton view;
+# the same single .hud_camera_preview.jpg pipeline (atomic write + stale-file
+# guard) carries it, so the separate-process HUD needs no Kinect / pygrabber of
+# its own. It doubles as the owner's diagnostic that the body stream is live.
+#
+# Default False (staging-safe): with it off NOTHING changes — the preview stays
+# the plain primary-camera mirror and no Kinect color/body frame is read for the
+# HUD. Needs KINECT_ENABLED so the bridge actually opens the sensor; with the
+# Kinect off it silently degrades to the normal webcam preview. Flip True here
+# (or via the Settings GUI / user_settings.json) to see the skeleton.
+KINECT_SKELETON_OVERLAY_ENABLED = False
+
 # Full-virtual-screen translucent target reticle that flashes for ~2s wherever
 # JARVIS performs a UI-automation action. KEPT ON — it is click-feedback, not
 # an info widget, so it isn't part of the HUD clutter and is invisible except
