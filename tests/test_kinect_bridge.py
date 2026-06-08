@@ -80,9 +80,32 @@ class _FakeBody:
             self.hand_left_state = hand_left_state
 
 
+def _as_body_array(bodies):
+    """Wrap a sequence of fake bodies in the SAME container the real
+    PyKinectRuntime hands back: a numpy ``ndarray(dtype=object)`` (see
+    KinectBodyFrameData.bodies = numpy.ndarray((max_body_count), dtype=object)).
+
+    Faithfulness matters here: a plain Python list has a well-defined truth
+    value, so any guard that boolean-tests ``frame.bodies`` (e.g. the old
+    ``not frame.bodies``) passes on a list yet raises the ambiguous-truth
+    ValueError on the real ndarray — the exact production bug that killed every
+    gesture. Wrapping fixtures as an ndarray makes the harness exercise the real
+    type. Falls back to the original sequence when numpy isn't importable (CI
+    pre-imports numpy, so this practically always returns an ndarray)."""
+    try:
+        import numpy as np
+    except Exception:   # pragma: no cover - numpy is present on dev + CI
+        return bodies
+    arr = np.empty(len(bodies), dtype=object)
+    for i, b in enumerate(bodies):
+        arr[i] = b
+    return arr
+
+
 class _FakeBodyFrame:
     def __init__(self, bodies):
-        self.bodies = bodies
+        # Mirror hardware: real .bodies is an ndarray(dtype=object), not a list.
+        self.bodies = _as_body_array(bodies)
 
 
 class _FakeRuntime:
@@ -366,6 +389,26 @@ class PresenceTests(_BridgeBase):
         self.assertEqual(got[0]["head"], (0.0, 0.6, 1.8))
         # joint tuples are (x, y, z, tracking_state)
         self.assertEqual(len(got[0]["joints"]["head"]), 4)
+
+    def test_get_bodies_handles_real_ndarray_bodies(self):
+        # REGRESSION (gestures-completely-dead): the real PyKinectRuntime returns
+        # frame.bodies as a 6-long numpy ndarray(dtype=object) with the tracked
+        # body at an arbitrary, usually non-zero, slot — NOT a Python list. A
+        # guard that boolean-tests that array (the old `not frame.bodies`) raises
+        # ValueError "truth value of an array … is ambiguous", which get_bodies'
+        # blanket except swallows to [] — silently killing every body/gesture.
+        # Build bodies exactly as hardware does and assert the one tracked body
+        # survives. RED before the line-497 fix (raises→[]→len 0); GREEN after.
+        np = _require_numpy(self)
+        frame_bodies = np.array(
+            [_FakeBody(False)] * 4 + [_FakeBody(True, {"head": (0, 0.6, 2.0)})]
+            + [_FakeBody(False)], dtype=object)   # tracked at slot 4, mirrors live
+        self.assertEqual(frame_bodies.shape, (6,))   # exactly the hardware shape
+        _patch_loader(self, _FakeRuntime(bodies=frame_bodies))
+        got = kb.get_bodies()
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["id"], 4)            # preserves the real slot index
+        self.assertIn("head", got[0]["joints"])
 
     def test_get_presence_counts_two_and_picks_nearest(self):
         bodies = [

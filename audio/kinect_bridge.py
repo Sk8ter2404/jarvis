@@ -494,10 +494,25 @@ def get_bodies() -> list[dict]:
         if not rt.has_new_body_frame():
             return []
         frame = rt.get_last_body_frame()
-        if frame is None or not getattr(frame, "bodies", None):
+        if frame is None:
+            return []
+        bodies_raw = getattr(frame, "bodies", None)
+        # The real PyKinectRuntime returns ``frame.bodies`` as a numpy ndarray
+        # (dtype=object) of length max_body_count (6) — see KinectBodyFrameData.
+        # A bare ``not bodies_raw`` raises ValueError on a >1-element ndarray
+        # ("truth value … is ambiguous"), which the except below swallows to []
+        # — silently killing EVERY body/gesture in production. Test only for
+        # None and emptiness via len(), which is well-defined for both an
+        # ndarray and a plain list (and degrade to [] if it's neither).
+        if bodies_raw is None:
+            return []
+        try:
+            if len(bodies_raw) == 0:
+                return []
+        except TypeError:   # pragma: no cover - non-sized bodies attr (shouldn't happen)
             return []
         out: list[dict] = []
-        for i, body in enumerate(frame.bodies):
+        for i, body in enumerate(bodies_raw):
             if not getattr(body, "is_tracked", False):
                 continue
             joints_raw = getattr(body, "joints", None)
