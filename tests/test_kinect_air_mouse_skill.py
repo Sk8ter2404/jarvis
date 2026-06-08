@@ -1,18 +1,26 @@
 """Tests for skills/kinect_air_mouse — the Kinect air-mouse.
 
 Drives the PURE CORE (reach-box mapping, EMA smoothing, grip debounce, the
-open→move / closed→right-button / re-open→release state machine, the overlay
-colour mapping) directly, and the LIVE _poll_once path with a fake kinect_bridge
-+ the real mouse actuation mocked out — so NO sensor, NO real cursor, NO Qt is
-touched. Asserts the owner-facing contract:
+raise-to-engage dead-man gate, the open→move / closed→LEFT-button / re-open→
+release state machine, the overlay colour mapping) directly, and the LIVE
+_poll_once path with a fake kinect_bridge + the real mouse actuation mocked out —
+so NO sensor, NO real cursor, NO Qt is touched. Asserts the owner-facing
+contract:
 
   * the reach-box maps the hand NON-mirrored (hand RIGHT → larger cursor_x) and
     across the ENTIRE virtual desktop — every monitor, including one arranged
     LEFT of the primary (negative virtual-screen origin) — not just primary,
-  * OPEN hand            → the cursor MOVES (no button), overlay "track"/cyan,
-  * OPEN → CLOSED        → the RIGHT button goes DOWN once, overlay "grab"/gold,
-  * CLOSED held + move   → cursor still moves (a right-DRAG), button stays down,
-  * CLOSED → OPEN        → the RIGHT button goes UP once (close→open = a click),
+  * ENGAGE GATE (the headline dead-man fix): the cursor is driven ONLY while the
+    hand is RAISED above the body reference AND tracked. A LOWERED hand, a hand
+    with no reference, or a body/hand untracked beyond the ~0.3 s grace
+    DISENGAGES — cursor=None (so the live loop calls NO SetCursorPos and the
+    PHYSICAL mouse is free), any held button RELEASED, overlay hidden. Raise/drop
+    hysteresis stops threshold flicker; raising the hand re-engages.
+  * raised OPEN hand     → the cursor MOVES (no button), overlay "track"/cyan,
+  * OPEN → CLOSED        → the LEFT button goes DOWN once, overlay "grab"/gold,
+  * CLOSED held + move   → cursor still moves (a left-DRAG), button stays down,
+  * CLOSED → OPEN        → the LEFT button goes UP once (close→open = a click),
+  * the button is ALWAYS the LEFT/primary one, NEVER the right,
   * a single flickered CLOSED frame is DEBOUNCED (no stray button),
   * dead-man: hand untracked while held → button RELEASED, overlay hidden,
   * _poll_once no-ops the SIDE EFFECTS when KINECT_AIR_MOUSE_ENABLED is False,
@@ -69,16 +77,27 @@ def _fake_bridge(*, enabled=True, available=(True, ""), bodies=None,
 
 
 def _body(*, hand_x=0.0, hand_y=0.30, grip_right="open", grip_left="unknown",
-          distance=1.8, side="right"):
-    """A get_bodies()-shaped body dict with a hand joint + grip on `side`."""
+          distance=1.8, side="right", ref_y=0.0, with_ref=True):
+    """A get_bodies()-shaped body dict with a hand joint + grip on `side`, plus
+    the ENGAGE-reference joint (spine_mid) at `ref_y`. The default hand_y=0.30 is
+    well above the default ref_y=0.0 + the ~0.08 m engage threshold, so the hand
+    reads as RAISED (engaged) unless a test lowers hand_y toward/under ref_y.
+    with_ref=False omits ALL reference joints (spine + shoulders + elbow) so the
+    sample carries ref_y=None — the 'no reference → disengage' case."""
     joints = {
-        "head": (0.0, 0.6, distance, 2),
-        "spine_shoulder": (0.0, 0.0, distance, 2),
         f"hand_{side}": (hand_x, hand_y, distance, 2),
     }
+    if with_ref:
+        # spine_mid is the primary engage reference (_ENGAGE_REF_JOINTS[0]).
+        joints["spine_mid"] = (0.0, ref_y, distance, 2)
+        joints["spine_shoulder"] = (0.0, ref_y + 0.15, distance, 2)
+        joints["head"] = (0.0, ref_y + 0.6, distance, 2)
+        # An elbow below the hand, so the elbow fall-back also reads "raised".
+        joints[f"elbow_{side}"] = (hand_x, ref_y - 0.1, distance, 2)
     return {
         "id": 0, "joints": joints,
-        "head": (0.0, 0.6, distance), "distance_m": distance, "facing": True,
+        "head": (0.0, ref_y + 0.6, distance), "distance_m": distance,
+        "facing": True,
         "hand_right": grip_right, "hand_left": grip_left,
     }
 
@@ -335,52 +354,62 @@ class OverlayColorTests(_Base):
 
 
 class ControllerStateMachineTests(_Base):
-    """The open→move / closed→RMB-down / re-open→RMB-up contract, asserted on
-    AirMouseController decisions (the pure brain the live loop applies)."""
+    """The raised-open→move / closed→LMB-down / re-open→LMB-up contract, asserted
+    on AirMouseController decisions (the pure brain the live loop applies). Every
+    sample passes a reference (REF) well BELOW the hand y so the hand is RAISED
+    (engaged); the dead-man engage gate itself is exercised separately below."""
+
+    # An engage reference well below the hands used here (0.10 / 0.30), so all
+    # these samples count as RAISED. The hysteresis dead-band is ~2-8 cm, so a
+    # REF this far down keeps every frame comfortably engaged.
+    REF = -0.20
 
     def _ctrl(self, mod, debounce=1):
         # debounce=1 makes each grip change take effect immediately so the state
         # machine is easy to assert; the debounce itself is tested separately.
-        return mod.AirMouseController(mod.ReachBox(2560, 1440), debounce_frames=debounce)
+        # grace_sec=0 so an untracked frame releases IMMEDIATELY here (the
+        # tracking-loss GRACE window is exercised in its own test class).
+        return mod.AirMouseController(mod.ReachBox(2560, 1440),
+                                      debounce_frames=debounce, grace_sec=0.0)
 
     def test_open_hand_moves_no_button_cyan(self):
         mod = self._load()
         c = self._ctrl(mod)
-        d = c.update((0.1, 0.30), "open", True)
+        d = c.update((0.1, 0.30), "open", True, self.REF)
         self.assertIsNotNone(d.cursor)
         self.assertIsNone(d.button)
         self.assertEqual(d.overlay, "track")
         self.assertEqual(mod.overlay_color_for(d.overlay), "cyan")
 
-    def test_close_presses_right_down_once_gold(self):
+    def test_close_presses_left_down_once_gold(self):
         mod = self._load()
         c = self._ctrl(mod)
-        c.update((0.0, 0.30), "open", True)
-        d = c.update((0.0, 0.30), "closed", True)
+        c.update((0.0, 0.30), "open", True, self.REF)
+        d = c.update((0.0, 0.30), "closed", True, self.REF)
         self.assertEqual(d.button, "down")
         self.assertEqual(d.overlay, "grab")
         self.assertEqual(mod.overlay_color_for(d.overlay), "gold")
         # Held: a second closed frame does NOT re-press.
-        d2 = c.update((0.0, 0.30), "closed", True)
+        d2 = c.update((0.0, 0.30), "closed", True, self.REF)
         self.assertIsNone(d2.button)
         self.assertTrue(c.button_is_down)
 
     def test_closed_hand_still_moves_drag(self):
         mod = self._load()
         c = self._ctrl(mod)
-        c.update((0.0, 0.30), "open", True)
-        c.update((0.0, 0.30), "closed", True)
-        d = c.update((0.2, 0.10), "closed", True)   # move while closed
+        c.update((0.0, 0.30), "open", True, self.REF)
+        c.update((0.0, 0.30), "closed", True, self.REF)
+        d = c.update((0.2, 0.10), "closed", True, self.REF)   # move while closed
         self.assertIsNotNone(d.cursor)              # cursor still tracks → drag
         self.assertIsNone(d.button)                 # button stays down (no edge)
         self.assertEqual(d.overlay, "grab")
 
-    def test_reopen_releases_right_up_once(self):
+    def test_reopen_releases_left_up_once(self):
         mod = self._load()
         c = self._ctrl(mod)
-        c.update((0.0, 0.30), "open", True)
-        c.update((0.0, 0.30), "closed", True)       # down
-        d = c.update((0.0, 0.30), "open", True)     # re-open → up
+        c.update((0.0, 0.30), "open", True, self.REF)
+        c.update((0.0, 0.30), "closed", True, self.REF)       # down
+        d = c.update((0.0, 0.30), "open", True, self.REF)     # re-open → up
         self.assertEqual(d.button, "up")
         self.assertEqual(d.overlay, "track")
         self.assertFalse(c.button_is_down)
@@ -388,15 +417,17 @@ class ControllerStateMachineTests(_Base):
     def test_deadman_release_when_untracked_while_held(self):
         mod = self._load()
         c = self._ctrl(mod)
-        c.update((0.0, 0.30), "open", True)
-        c.update((0.0, 0.30), "closed", True)       # button down
-        d = c.update(None, "unknown", False)        # hand lost mid-grip
+        c.update((0.0, 0.30), "open", True, self.REF)
+        c.update((0.0, 0.30), "closed", True, self.REF)       # button down
+        # Hand lost mid-grip. This controller has grace_sec=0, so the loss
+        # releases IMMEDIATELY (the grace-window hold is a separate test).
+        d = c.update(None, "unknown", False, None)            # hand lost mid-grip
         self.assertEqual(d.button, "up")            # dead-man releases
         self.assertEqual(d.overlay, "hidden")
         self.assertIsNone(d.cursor)
         self.assertFalse(c.button_is_down)
         # Idempotent: a second lost frame keeps it hidden with no new edge.
-        d2 = c.update(None, "unknown", False)
+        d2 = c.update(None, "unknown", False, None)
         self.assertIsNone(d2.button)
         self.assertEqual(d2.overlay, "hidden")
 
@@ -404,12 +435,154 @@ class ControllerStateMachineTests(_Base):
         mod = self._load()
         # Real debounce (3 frames): a single closed flicker must NOT press.
         c = mod.AirMouseController(mod.ReachBox(2560, 1440), debounce_frames=3)
-        c.update((0.0, 0.30), "open", True)
-        d1 = c.update((0.0, 0.30), "closed", True)  # flicker frame 1
-        d2 = c.update((0.0, 0.30), "open", True)    # back to open
+        c.update((0.0, 0.30), "open", True, self.REF)
+        d1 = c.update((0.0, 0.30), "closed", True, self.REF)  # flicker frame 1
+        d2 = c.update((0.0, 0.30), "open", True, self.REF)    # back to open
         self.assertIsNone(d1.button)
         self.assertIsNone(d2.button)
         self.assertFalse(c.button_is_down)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  DEAD-MAN ENGAGE GATE (FIX 1) — pure core
+# ══════════════════════════════════════════════════════════════════════════
+class _FakeClock:
+    """A controllable monotonic clock for the grace-window tests."""
+    def __init__(self, t=0.0):
+        self.t = float(t)
+
+    def __call__(self):
+        return self.t
+
+    def advance(self, dt):
+        self.t += float(dt)
+
+
+class EngageGateTests(_Base):
+    """FIX 1 — the cursor is driven ONLY while the hand is RAISED above the body
+    reference AND tracked. Lowering the hand, losing tracking (beyond the grace),
+    or having no reference DISENGAGES: cursor=None (→ NO SetCursorPos, the
+    physical mouse is free), any held button RELEASED, overlay hidden. With
+    hysteresis so it doesn't flicker at the line."""
+
+    REF = 0.0   # reference at y=0; engage threshold ~+0.08, disengage ~+0.02.
+
+    def _ctrl(self, mod, **kw):
+        kw.setdefault("debounce_frames", 1)
+        return mod.AirMouseController(mod.ReachBox(2560, 1440), **kw)
+
+    # ── the headline guarantee: hand DOWN ⇒ disengaged ──────────────────────
+    def test_hand_below_reference_disengages_no_cursor(self):
+        mod = self._load()
+        c = self._ctrl(mod)
+        # Hand well BELOW the reference (resting at the side / in the lap).
+        d = c.update((0.1, self.REF - 0.20), "open", True, self.REF)
+        self.assertIsNone(d.cursor)          # NO SetCursorPos
+        self.assertEqual(d.overlay, "hidden")
+        self.assertIsNone(d.button)
+        self.assertFalse(c.engaged)
+
+    def test_hand_raised_engages_and_moves(self):
+        mod = self._load()
+        c = self._ctrl(mod)
+        d = c.update((0.1, self.REF + 0.20), "open", True, self.REF)  # clearly up
+        self.assertIsNotNone(d.cursor)       # cursor driven
+        self.assertEqual(d.overlay, "track")
+        self.assertTrue(c.engaged)
+
+    def test_lowering_hand_while_held_releases_button(self):
+        mod = self._load()
+        c = self._ctrl(mod)
+        c.update((0.0, self.REF + 0.20), "open", True, self.REF)     # engaged
+        c.update((0.0, self.REF + 0.20), "closed", True, self.REF)   # LMB down
+        self.assertTrue(c.button_is_down)
+        # Now DROP the hand below the reference mid-grip → disengage + release.
+        d = c.update((0.0, self.REF - 0.20), "closed", True, self.REF)
+        self.assertEqual(d.button, "up")     # held button RELEASED
+        self.assertIsNone(d.cursor)          # NO SetCursorPos
+        self.assertEqual(d.overlay, "hidden")
+        self.assertFalse(c.button_is_down)
+        self.assertFalse(c.engaged)
+
+    def test_no_reference_disengages(self):
+        mod = self._load()
+        c = self._ctrl(mod)
+        # ref_y=None (couldn't read a spine/elbow joint) → fail safe to released.
+        d = c.update((0.1, 0.50), "open", True, None)
+        self.assertIsNone(d.cursor)
+        self.assertEqual(d.overlay, "hidden")
+        self.assertFalse(c.engaged)
+
+    def test_hysteresis_no_flicker_at_threshold(self):
+        mod = self._load()
+        c = self._ctrl(mod, engage_raise_m=0.08, disengage_drop_m=0.02)
+        # Below the ENGAGE bar (ref+0.08) but above the DISENGAGE bar (ref+0.02):
+        # while DISENGAGED this stays disengaged (must clear the higher bar).
+        d0 = c.update((0.0, self.REF + 0.05), "open", True, self.REF)
+        self.assertFalse(c.engaged)
+        self.assertIsNone(d0.cursor)
+        # Rise above the engage bar → engage.
+        d1 = c.update((0.0, self.REF + 0.10), "open", True, self.REF)
+        self.assertTrue(c.engaged)
+        self.assertIsNotNone(d1.cursor)
+        # Sag back into the dead-band (ref+0.05): still above the DISENGAGE bar,
+        # so it STAYS engaged — no flicker.
+        d2 = c.update((0.0, self.REF + 0.05), "open", True, self.REF)
+        self.assertTrue(c.engaged)
+        self.assertIsNotNone(d2.cursor)
+        # Drop below the disengage bar → disengage.
+        d3 = c.update((0.0, self.REF + 0.01), "open", True, self.REF)
+        self.assertFalse(c.engaged)
+        self.assertIsNone(d3.cursor)
+
+    def test_reengage_after_lowering(self):
+        mod = self._load()
+        c = self._ctrl(mod)
+        c.update((0.0, self.REF + 0.20), "open", True, self.REF)     # engaged
+        c.update((0.0, self.REF - 0.20), "open", True, self.REF)     # lowered
+        self.assertFalse(c.engaged)
+        d = c.update((0.0, self.REF + 0.20), "open", True, self.REF)  # raised again
+        self.assertTrue(c.engaged)
+        self.assertIsNotNone(d.cursor)
+
+    # ── tracking-loss grace window (injected clock) ─────────────────────────
+    def test_brief_dropout_holds_then_releases_after_grace(self):
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = self._ctrl(mod, grace_sec=0.30, clock=clk)
+        c.update((0.0, self.REF + 0.20), "open", True, self.REF)     # engaged
+        c.update((0.0, self.REF + 0.20), "closed", True, self.REF)   # LMB down
+        self.assertTrue(c.button_is_down)
+        # A brief untracked dropout WITHIN the grace: hold — button stays down,
+        # no cursor motion (no sample), overlay keeps "grab".
+        clk.advance(0.10)
+        d_hold = c.update(None, "unknown", False, None)
+        self.assertIsNone(d_hold.button)         # NOT released yet
+        self.assertIsNone(d_hold.cursor)         # no SetCursorPos
+        self.assertEqual(d_hold.overlay, "grab")
+        self.assertTrue(c.button_is_down)
+        # Dropout persists PAST the grace → full dead-man release.
+        clk.advance(0.40)
+        d_rel = c.update(None, "unknown", False, None)
+        self.assertEqual(d_rel.button, "up")
+        self.assertEqual(d_rel.overlay, "hidden")
+        self.assertFalse(c.button_is_down)
+
+    def test_hand_down_means_zero_cursor_over_many_frames(self):
+        mod = self._load()
+        c = self._ctrl(mod)
+        # The owner's lockout scenario: hand resting low for a long run of frames
+        # must NEVER yield a cursor (so the live loop calls SetCursorPos zero
+        # times) and must never hold a button.
+        cursors = []
+        buttons = []
+        for _ in range(60):
+            d = c.update((0.2, self.REF - 0.25), "open", True, self.REF)
+            cursors.append(d.cursor)
+            buttons.append(d.button)
+        self.assertTrue(all(c0 is None for c0 in cursors))   # zero cursor moves
+        self.assertTrue(all(b is None for b in buttons))
+        self.assertFalse(c.engaged)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -417,7 +590,10 @@ class ControllerStateMachineTests(_Base):
 # ══════════════════════════════════════════════════════════════════════════
 class PollActsTests(_Base):
     def _ctrl(self, mod):
-        return mod.AirMouseController(mod.ReachBox(2560, 1440), debounce_frames=1)
+        # grace_sec=0 so a hand-loss frame releases at once (deterministic);
+        # the grace window is covered in EngageGateTests with an injected clock.
+        return mod.AirMouseController(mod.ReachBox(2560, 1440),
+                                      debounce_frames=1, grace_sec=0.0)
 
     def test_open_hand_moves_cursor(self):
         mod = self._load()
@@ -431,17 +607,19 @@ class PollActsTests(_Base):
         self.assertEqual(buttons, [])               # no button
         self.assertEqual(d.overlay, "track")
 
-    def test_close_then_open_clicks_right(self):
+    def test_close_then_open_clicks_left(self):
         mod = self._load()
         self._not_staging(mod)
         self._patch_flag(True)
         moves, buttons = self._capture_mouse(mod)
         ctrl = self._ctrl(mod)
-        # open → closed → open : a right-click (down then up).
+        # open → closed → open : a LEFT-click (down then up).
         mod._poll_once(ctrl, _fake_bridge(bodies=[_body(grip_right="open")]))
         mod._poll_once(ctrl, _fake_bridge(bodies=[_body(grip_right="closed")]))
         mod._poll_once(ctrl, _fake_bridge(bodies=[_body(grip_right="open")]))
         self.assertEqual(buttons, ["down", "up"])
+        # And it actuates the LEFT (primary) button, never the right.
+        self.assertEqual(mod.AIR_MOUSE_BUTTON, "left")
 
     def test_deadman_releases_when_hand_lost(self):
         mod = self._load()
@@ -459,7 +637,8 @@ class PollActsTests(_Base):
 
 class PollGateTests(_Base):
     def _ctrl(self, mod):
-        return mod.AirMouseController(mod.ReachBox(2560, 1440), debounce_frames=1)
+        return mod.AirMouseController(mod.ReachBox(2560, 1440),
+                                      debounce_frames=1, grace_sec=0.0)
 
     def test_noop_side_effects_when_flag_off(self):
         mod = self._load()
@@ -526,6 +705,113 @@ class PollGateTests(_Base):
         mod._poll_once(ctrl, _fake_bridge(available=(False, "no sensor"),
                                           bodies=[_body(grip_right="open")]))
         self.assertEqual(moves, [])
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  LIVE dead-man ENGAGE gate end-to-end (FIX 1) — _poll_once + mocked mouse
+# ══════════════════════════════════════════════════════════════════════════
+class PollEngageGateTests(_Base):
+    """The owner-facing guarantee through the LIVE path: a LOWERED (or
+    no-reference) hand drives ZERO _set_cursor_pos calls — releasing the real
+    mouse — while a RAISED hand moves it. Mouse actuation mocked; no real cursor
+    is touched."""
+
+    def _ctrl(self, mod):
+        return mod.AirMouseController(mod.ReachBox(2560, 1440),
+                                      debounce_frames=1, grace_sec=0.0)
+
+    def test_hand_down_makes_zero_setcursorpos_calls(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        moves, buttons = self._capture_mouse(mod)
+        ctrl = self._ctrl(mod)
+        # Hand resting BELOW the spine_mid reference (ref_y default 0.0) for a
+        # long run of frames — the owner's hand at rest. Confirm: ZERO cursor
+        # moves (the physical mouse is never fought) and never a button.
+        for _ in range(30):
+            mod._poll_once(ctrl, _fake_bridge(
+                bodies=[_body(grip_right="open", hand_y=-0.25, ref_y=0.0)]))
+        self.assertEqual(moves, [])                 # ZERO SetCursorPos
+        self.assertEqual(buttons, [])
+
+    def test_lowering_hand_mid_drag_releases_and_stops_cursor(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        moves, buttons = self._capture_mouse(mod)
+        ctrl = self._ctrl(mod)
+        # Raise + grab (engaged, LMB down), then DROP the hand → must release the
+        # button and stop moving the cursor.
+        mod._poll_once(ctrl, _fake_bridge(
+            bodies=[_body(grip_right="open", hand_y=0.30, ref_y=0.0)]))
+        mod._poll_once(ctrl, _fake_bridge(
+            bodies=[_body(grip_right="closed", hand_y=0.30, ref_y=0.0)]))
+        self.assertEqual(buttons, ["down"])
+        moves_before = len(moves)
+        # Hand drops low for several frames.
+        for _ in range(10):
+            mod._poll_once(ctrl, _fake_bridge(
+                bodies=[_body(grip_right="closed", hand_y=-0.25, ref_y=0.0)]))
+        self.assertEqual(buttons, ["down", "up"])   # released exactly once
+        self.assertEqual(len(moves), moves_before)  # no further cursor motion
+
+    def test_raised_hand_moves_cursor(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        moves, buttons = self._capture_mouse(mod)
+        ctrl = self._ctrl(mod)
+        mod._poll_once(ctrl, _fake_bridge(
+            bodies=[_body(grip_right="open", hand_y=0.30, ref_y=0.0)]))
+        self.assertEqual(len(moves), 1)             # raised → cursor driven
+
+    def test_no_reference_joint_makes_zero_setcursorpos(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        moves, buttons = self._capture_mouse(mod)
+        ctrl = self._ctrl(mod)
+        # Body tracked but NO spine/shoulder/elbow joints → ref_y=None → fail
+        # safe to disengaged → zero cursor moves.
+        for _ in range(10):
+            mod._poll_once(ctrl, _fake_bridge(
+                bodies=[_body(grip_right="open", hand_y=0.9, with_ref=False)]))
+        self.assertEqual(moves, [])
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  LEFT-button actuation (FIX 2) — the win32 flag mapping
+# ══════════════════════════════════════════════════════════════════════════
+class LeftButtonActuationTests(_Base):
+    """FIX 2 — the closed hand actuates the LEFT (primary) button. Asserts both
+    the config default and that _mouse_button() emits the LEFT win32 events,
+    NEVER the right ones."""
+
+    def test_button_is_left_by_default(self):
+        mod = self._load()
+        self.assertEqual(mod.AIR_MOUSE_BUTTON, "left")
+
+    def test_mouse_button_emits_left_win32_events_not_right(self):
+        mod = self._load()
+        # Fake win32api/win32con so _mouse_button takes the win32 path and we can
+        # capture which event flag it fires (no real mouse touched).
+        fired = []
+        fake_win32api = types.ModuleType("win32api")
+        fake_win32api.mouse_event = lambda flag, *a, **k: fired.append(flag)
+        fake_win32con = types.ModuleType("win32con")
+        fake_win32con.MOUSEEVENTF_LEFTDOWN = 0x0002
+        fake_win32con.MOUSEEVENTF_LEFTUP = 0x0004
+        fake_win32con.MOUSEEVENTF_RIGHTDOWN = 0x0008
+        fake_win32con.MOUSEEVENTF_RIGHTUP = 0x0010
+        with mock.patch.dict(sys.modules, {"win32api": fake_win32api,
+                                           "win32con": fake_win32con}):
+            self.assertTrue(mod._mouse_button("down"))
+            self.assertTrue(mod._mouse_button("up"))
+        # LEFT down then LEFT up — and NEITHER right flag ever fired.
+        self.assertEqual(fired, [0x0002, 0x0004])
+        self.assertNotIn(0x0008, fired)
+        self.assertNotIn(0x0010, fired)
 
 
 # ══════════════════════════════════════════════════════════════════════════
