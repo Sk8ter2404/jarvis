@@ -116,8 +116,15 @@ def set_enabled(enabled: bool) -> None:
     _ENABLED = bool(enabled)
     if not _ENABLED:
         # Opting out should also tear down a runtime opened by a prior
-        # enabled session so the sensor LED goes dark immediately.
+        # enabled session so the sensor LED goes dark immediately, and stop the
+        # always-on body-frame pump (PART B).
+        stop_body_pump()
         close()
+    else:
+        # Opting in starts the always-on body-frame pump (singleton-guarded) so
+        # the body stream can't go quiet once warmed (PART B). Safe to call
+        # repeatedly — it no-ops when a pump is already running.
+        start_body_pump()
 
 
 def get_enabled() -> bool:
@@ -533,6 +540,9 @@ def get_bodies() -> list[dict]:
     try:
         if not rt.has_new_body_frame():
             return []
+        # A real new body frame is arriving — stamp the staleness clock (PART B)
+        # so an actively-read, healthy stream never trips the stale-reset.
+        note_body_frame_seen()
         frame = rt.get_last_body_frame()
         # NB: frame.bodies on real hardware is a length-6 numpy ndarray
         # (dtype=object) — NEVER apply bool()/`not` to it or numpy raises
@@ -589,6 +599,60 @@ def get_bodies() -> list[dict]:
         return out
     except Exception:   # pragma: no cover - defensive: mid-stream body-frame glitch
         return []
+
+
+def get_color_space_mapper():
+    """Return a callable ``mapper(x, y, z) -> (px, py) | None`` that projects a
+    CAMERA-SPACE metre point to a COLOR-SPACE pixel on the 1920×1080 frame, or
+    None when the Kinect is off / absent. NEVER raises.
+
+    This is the seam PART A's skeleton overlay uses: audio/kinect_skeleton's
+    pure projector is handed this callable and maps every tracked joint with it
+    (so the projector itself stays pykinect2-free + unit-testable). All the
+    pykinect2 contact lives HERE.
+
+    WHY THE PER-POINT MAPPER (not PyKinectRuntime.body_joints_to_color_space):
+    that convenience method allocates ``numpy.ndarray(..., dtype=numpy.object)``
+    and ``numpy.object`` was REMOVED in numpy 1.24+, so it raises on this
+    machine's modern numpy — the same breakage class the bridge's patch-loader
+    fixes elsewhere. We instead build a ``CameraSpacePoint`` per call and invoke
+    the runtime's ``_mapper.MapCameraPointToColorSpace`` directly (the ICoordina-
+    teMapper COM method), which returns a ``ColorSpacePoint`` with float .x/.y.
+
+    Returns None if the runtime, its ``_mapper``, or the PyKinectV2 module
+    aren't available, so the caller cleanly skips the overlay and shows the
+    plain frame instead."""
+    rt, _ = get_runtime()
+    if rt is None:
+        return None
+    mapper = getattr(rt, "_mapper", None)
+    map_fn = getattr(mapper, "MapCameraPointToColorSpace", None) if mapper else None
+    if not callable(map_fn):
+        return None
+    # PyKinectV2 carries the CameraSpacePoint ctypes Structure we must pass by
+    # value. import_pykinect2 is idempotent (sys.modules-cached) and does no
+    # sensor contact, so this is cheap; bail gracefully if it can't load.
+    try:
+        pk2, _rt_mod = import_pykinect2()
+    except Exception:   # pragma: no cover - loader already proven at open time
+        return None
+    csp_type = (getattr(pk2, "CameraSpacePoint", None)
+                or getattr(pk2, "_CameraSpacePoint", None))
+    if csp_type is None:
+        return None
+
+    def _mapper(x: float, y: float, z: float):
+        try:
+            pt = csp_type()
+            pt.x = float(x)
+            pt.y = float(y)
+            pt.z = float(z)
+            cs = map_fn(pt)
+            return (float(cs.x), float(cs.y))
+        except Exception:   # pragma: no cover - per-joint COM/marshalling glitch
+            return None
+
+    return _mapper
 
 
 def _nearest_body(bodies: list[dict]) -> Optional[dict]:
@@ -692,11 +756,165 @@ def get_head_yaw() -> Optional[float]:
     return float(yaw) if isinstance(yaw, (int, float)) else None
 
 
+# ─── PART B: stale-runtime guard + always-on body-frame pump ────────────────
+# THE BUG: the runtime streams briefly at boot (a gesture can fire ~30 s in)
+# then the BODY frame stream goes QUIET for many minutes while the owner waves.
+# The Kinect's body pipe only keeps flowing while something READS it: once the
+# gesture poller's reads stop landing (or the runtime latches), has_new_body_-
+# frame() stays False forever and every body consumer (gestures, presence,
+# head-yaw, the skeleton overlay) goes dead even though the sensor is fine.
+#
+# THE FIX (two layers):
+#   1. A lightweight ALWAYS-ON pump thread (started when KINECT_ENABLED) that
+#      ticks has_new_body_frame()/get_last_body_frame() a few times a second to
+#      keep the body pipe flowing — the cleanest cure for the "nothing reads it"
+#      root cause. Singleton-guarded (never two) with a stop event.
+#   2. A STALENESS reset: whenever a real new body frame is observed we stamp a
+#      monotonic timestamp; if the runtime is open yet no new body frame has
+#      arrived for > BODY_STALE_RESET_SEC, reset _runtime[0]=None so the next
+#      get_runtime() RE-OPENS the sensor (re-binding a live stream). On builds
+#      whose open path verifies streaming before caching, that reopen also
+#      retries until frames actually arrive. The pump drives this check, and
+#      get_bodies() also stamps freshness so a healthy stream never trips it.
+BODY_PUMP_INTERVAL_SEC = 0.20      # ~5 Hz: enough to keep the body pipe warm
+BODY_STALE_RESET_SEC = 4.0         # no new body frame for this long → reset+reopen
+_last_body_frame_at = [0.0]        # monotonic of the last OBSERVED new body frame
+_body_pump_thread: list[Any] = [None]
+_body_pump_stop = threading.Event()
+_body_pump_lock = threading.Lock()
+
+
+def note_body_frame_seen(now: Optional[float] = None) -> None:
+    """Stamp the time a fresh body frame was observed (the staleness clock).
+    Called by get_bodies() on a real frame AND by the pump, so a healthy stream
+    keeps the clock current and never trips the stale-reset."""
+    _last_body_frame_at[0] = time.monotonic() if now is None else now
+
+
+def _body_frame_is_stale(now: Optional[float] = None) -> bool:
+    """True iff the runtime is OPEN but no new body frame has been observed for
+    longer than BODY_STALE_RESET_SEC. Pure (clock + the two module cells) so it
+    is unit-testable. False when no runtime is open (nothing to reset) or when a
+    frame has never yet been seen on a freshly-opened runtime within the window
+    (the timestamp is seeded at open time by reset_stale_runtime's callers /
+    available())."""
+    if _runtime[0] is None:
+        return False
+    last = _last_body_frame_at[0]
+    if last <= 0.0:
+        return False
+    now = time.monotonic() if now is None else now
+    return (now - last) > BODY_STALE_RESET_SEC
+
+
+def reset_if_body_stale(now: Optional[float] = None) -> bool:
+    """If the body stream has gone stale (see _body_frame_is_stale), drop the
+    cached runtime so the NEXT get_runtime() RE-OPENS the sensor (re-binding a
+    live stream; on a stream-verifying open path it also retries until frames
+    arrive). Returns True iff it performed a reset. Holds the same _lock the
+    open/close path uses so it can't race a concurrent reopen. NEVER raises."""
+    with _lock:
+        if not _body_frame_is_stale(now):
+            return False
+        rt = _runtime[0]
+        _runtime[0] = None
+        # Re-seed the clock so the freshly-reopened runtime gets a full window to
+        # start streaming before it could be judged stale again.
+        _last_body_frame_at[0] = time.monotonic() if now is None else now
+        print("  [kinect] body stream stale > "
+              f"{BODY_STALE_RESET_SEC:.0f}s - resetting runtime to reopen a live "
+              "stream")
+    # We already nulled the cached cell under the lock; explicitly release the
+    # old handle (outside the lock) so the sensor frees promptly before the next
+    # get_runtime() reopens it. Same best-effort close idiom close() uses; older
+    # builds without .close() rely on __del__.
+    if rt is not None:
+        closer = getattr(rt, "close", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception:   # pragma: no cover - defensive: close on a half-dead runtime
+                pass
+    return True
+
+
+def _pump_tick() -> None:
+    """One body-pump tick: keep the body pipe flowing by consuming any pending
+    body frame, stamp freshness when one arrives, and reset the runtime if the
+    stream has gone stale. NEVER raises — a glitch just skips this tick. Factored
+    out of the loop so it is unit-testable without a thread."""
+    if not _ENABLED:
+        return
+    rt = _runtime[0]
+    if rt is None:
+        # Nothing to pump; don't force an open here — opening is the consumers'
+        # job (available()/get_runtime). The pump only keeps an OPEN stream warm.
+        return
+    try:
+        has_new = getattr(rt, "has_new_body_frame", None)
+        if callable(has_new) and has_new():
+            getter = getattr(rt, "get_last_body_frame", None)
+            if callable(getter):
+                getter()           # drain so the next frame can arrive
+            note_body_frame_seen()
+    except Exception:   # pragma: no cover - defensive: mid-stream pump glitch
+        pass
+    # Layer 2: reset a runtime whose body stream has gone quiet.
+    try:
+        reset_if_body_stale()
+    except Exception:   # pragma: no cover - reset already swallows
+        pass
+
+
+def _body_pump_loop() -> None:  # pragma: no cover - non-terminating daemon; _pump_tick is unit-tested directly
+    """Always-on daemon: tick the body pump until the stop event is set or the
+    bridge is disabled. Cheap — a few getattr + a readiness poll per tick."""
+    while not _body_pump_stop.is_set():
+        try:
+            _pump_tick()
+        except Exception:
+            pass
+        _body_pump_stop.wait(BODY_PUMP_INTERVAL_SEC)
+
+
+def start_body_pump() -> bool:
+    """Start the always-on body-frame pump (singleton — never two). Called from
+    set_enabled(True). Returns True iff it started a NEW thread; False if one was
+    already running or the bridge is disabled. The thread self-exits when
+    _body_pump_stop is set (close/disable) and is a daemon so it never blocks
+    shutdown."""
+    with _body_pump_lock:
+        if not _ENABLED:
+            return False
+        t = _body_pump_thread[0]
+        if t is not None and getattr(t, "is_alive", lambda: False)():
+            return False
+        _body_pump_stop.clear()
+        # Seed the freshness clock so a just-enabled pump gives the stream a full
+        # window to come up before the stale-reset could fire.
+        _last_body_frame_at[0] = time.monotonic()
+        t = threading.Thread(target=_body_pump_loop, name="kinect-body-pump",
+                             daemon=True)
+        _body_pump_thread[0] = t
+        t.start()
+        return True
+
+
+def stop_body_pump() -> None:
+    """Signal the body-frame pump to exit. Idempotent + safe when none ran.
+    Called from close()/set_enabled(False)."""
+    _body_pump_stop.set()
+    with _body_pump_lock:
+        _body_pump_thread[0] = None
+
+
 # ─── lifecycle ────────────────────────────────────────────────────────────
 
 def close() -> None:
     """Release the runtime. Safe to call repeatedly (idempotent) and safe
-    when no runtime was ever opened."""
+    when no runtime was ever opened. Also signals the body-frame pump to stop
+    (PART B) so a closed sensor has no pump ticking against a dead runtime."""
+    stop_body_pump()
     with _lock:
         rt = _runtime[0]
         _runtime[0] = None

@@ -3517,6 +3517,226 @@ def _hud_camera_preview_write(frame: "np.ndarray", now: float) -> bool:
         return False
 
 
+# ── PART A: Kinect color + LIVE SKELETON overlay for the HUD preview ─────────
+# When KINECT_SKELETON_OVERLAY_ENABLED (config) is on AND the Kinect is enabled
+# + streaming, the HUD camera tile shows the KINECT COLOR frame with the tracked
+# skeleton drawn over it, composited beside two small webcam tiles. It is built
+# HERE, in the main process (which already has cv2 + the open webcam frames +
+# the Kinect bridge), then written through the SAME single-JPEG preview pipeline
+# the plain mirror uses — so the separate-process HUD needs no Kinect/pygrabber.
+# The skeleton doubles as the owner's body-stream-is-live diagnostic.
+
+# DirectShow friendly-name substrings for the two USB webcams (owner's rig).
+# Matched case-insensitively; the FIRST substring that appears in a device's
+# name claims that slot. Kept as config-adjacent constants near the compositor.
+_KINECT_PREVIEW_WEBCAM_NAMES = {
+    "left":  "fullhan webcam",     # 'Fullhan Webcam'  → LEFT monitor webcam
+    "right": "usb 2.0 camera",     # 'USB 2.0 Camera'  → RIGHT monitor webcam
+}
+# Cache the pygrabber name→index resolution so we don't re-enumerate DirectShow
+# devices every preview frame (enumeration is comparatively expensive + flickers
+# the device list). [0]=mapping dict, [1]=resolved-once flag.
+_kinect_preview_webcam_idx: dict[str, int] = {}
+_kinect_preview_webcam_resolved = [False]
+
+
+def _resolve_webcam_indices_by_name() -> dict[str, int]:
+    """Map 'left'/'right' → the DirectShow device INDEX whose friendly name
+    contains the configured substring, via pygrabber. Cached after the first
+    successful enumeration. Returns {} if pygrabber is unavailable or no name
+    matched (the compositor then falls back to the configured CAMERAS indices).
+
+    pygrabber's FilterGraph.get_input_devices() returns device friendly names in
+    the SAME order as their cv2/DirectShow index, so the list position IS the
+    index used by cv2.VideoCapture(idx, CAP_DSHOW)."""
+    if _kinect_preview_webcam_resolved[0]:
+        return _kinect_preview_webcam_idx
+    try:
+        from pygrabber.dshow_graph import FilterGraph
+        names = FilterGraph().get_input_devices()
+    except Exception:
+        # pygrabber missing / COM hiccup — mark resolved so we don't retry every
+        # frame; the caller falls back to the CAMERAS-config indices.
+        _kinect_preview_webcam_resolved[0] = True
+        return _kinect_preview_webcam_idx
+    lowered = [(i, (n or "").lower()) for i, n in enumerate(names)]
+    for slot, needle in _KINECT_PREVIEW_WEBCAM_NAMES.items():
+        for i, n in lowered:
+            if needle in n:
+                _kinect_preview_webcam_idx[slot] = i
+                break
+    _kinect_preview_webcam_resolved[0] = True
+    if _kinect_preview_webcam_idx:
+        print(f"  [kinect-preview] webcam tiles resolved by name: "
+              f"{_kinect_preview_webcam_idx}")
+    return _kinect_preview_webcam_idx
+
+
+def _hud_kinect_skeleton_overlay_enabled() -> bool:
+    """True iff the Kinect skeleton overlay should drive the HUD preview: the
+    KINECT_SKELETON_OVERLAY_ENABLED flag AND KINECT_ENABLED, read live from
+    core.config so a Settings flip takes effect with no restart. With the Kinect
+    off the overlay can't stream a frame, so we don't even try."""
+    try:
+        import core.config as _cfg
+        return bool(getattr(_cfg, "KINECT_SKELETON_OVERLAY_ENABLED", False)
+                    and getattr(_cfg, "KINECT_ENABLED", False))
+    except Exception:
+        return False
+
+
+def _draw_skeleton_on_color(color_bgr: "np.ndarray", bodies: list) -> int:
+    """Draw the tracked skeleton(s) over a Kinect COLOR frame IN PLACE: a line
+    along every bone whose endpoints projected, and a filled dot at every
+    projected joint. Returns the number of bodies actually drawn (>=1 means the
+    body stream is live — the owner's diagnostic).
+
+    Projection uses audio.kinect_skeleton.project_body_joints fed the bridge's
+    color-space mapper (kinect_bridge.get_color_space_mapper). All pykinect2
+    contact is inside the bridge; the geometry is the pure helper; this function
+    is only the cv2 stroking. NEVER raises into the caller — any failure draws
+    nothing and returns 0."""
+    try:
+        from audio import kinect_skeleton as _ks
+    except Exception:
+        return 0
+    mapper = _kinect_bridge.get_color_space_mapper()
+    if mapper is None or not bodies:
+        return 0
+    drawn = 0
+    # Stark cyan to match the HUD; joints a brighter accent; bones a touch thick
+    # so they read on a 240px-wide downscaled preview.
+    bone_col = (255, 201, 76)     # BGR of #4cc9ff-ish (cyan)
+    joint_col = (160, 231, 255)   # BGR brighter cyan/white
+    for body in bodies:
+        try:
+            joints = body.get("joints") if isinstance(body, dict) else None
+            if not joints:
+                continue
+            points = _ks.project_body_joints(joints, mapper)
+            if not points:
+                continue
+            for (x1, y1), (x2, y2) in _ks.iter_bone_segments(points):
+                cv2.line(color_bgr, (x1, y1), (x2, y2), bone_col, 4,
+                         lineType=cv2.LINE_AA)
+            for (px, py) in points.values():
+                cv2.circle(color_bgr, (px, py), 7, joint_col, -1,
+                           lineType=cv2.LINE_AA)
+            drawn += 1
+        except Exception:
+            continue
+    return drawn
+
+
+def _compose_kinect_preview(now: float) -> "np.ndarray | None":
+    """Build the composite preview image: the Kinect COLOR frame with the live
+    skeleton drawn over it, with the two webcam frames stacked as small tiles
+    down the right edge. Returns the BGR image to hand to the preview writer, or
+    None when no Kinect color frame is available (caller then leaves the plain
+    webcam mirror in place). NEVER raises.
+
+    Webcam tiles reuse frames the face-tracking loop ALREADY captured + cached in
+    _camera_latest_frame (so no extra device is opened); they're keyed by the
+    pygrabber name→index map, falling back to the configured CAMERAS indices."""
+    try:
+        base = _kinect_bridge.get_color_bgr(require_new=False)
+    except Exception:
+        base = None
+    if base is None:
+        return None
+    try:
+        base = base.copy()   # don't scribble on the bridge's frame buffer
+        bodies = []
+        try:
+            bodies = _kinect_bridge.get_bodies()
+        except Exception:
+            bodies = []
+        _draw_skeleton_on_color(base, bodies)
+
+        # Gather the two webcam frames (already-cached; name-resolved).
+        name_idx = _resolve_webcam_indices_by_name()
+        # Fall back to the configured CAMERAS indices when a name didn't resolve
+        # (e.g. pygrabber absent): primary entry → 'left', the first non-primary
+        # → 'right', mirroring the owner's left/right monitor webcams.
+        fallback = {}
+        try:
+            prim = [c["index"] for c in CAMERAS if c.get("primary")]
+            sides = [c["index"] for c in CAMERAS if not c.get("primary")]
+            if prim:
+                fallback["left"] = prim[0]
+            if sides:
+                fallback["right"] = sides[0]
+        except Exception:
+            fallback = {}
+        with _camera_state_lock:
+            cached = dict(_camera_latest_frame)
+        tiles = []
+        for slot in ("left", "right"):
+            idx = name_idx.get(slot, fallback.get(slot))
+            frame = cached.get(idx) if idx is not None else None
+            if frame is not None:
+                tiles.append(frame)
+        return _composite_preview_image(base, tiles)
+    except Exception:
+        return None
+
+
+def _composite_preview_image(base_bgr: "np.ndarray",
+                             tiles: list) -> "np.ndarray":
+    """Lay the webcam ``tiles`` down the RIGHT edge of ``base_bgr`` (the Kinect
+    color+skeleton image), each a small thumbnail, and return the composite.
+
+    Pure cv2/numpy + side-effect free (operates on a fresh canvas, never mutates
+    ``base_bgr``) so it is unit-testable with tiny fake frames. With no tiles the
+    base is returned unchanged. The tiles are scaled to a fixed fraction of the
+    base width and stacked top-to-bottom; if they'd overflow the height they're
+    simply clipped (the skeleton view is the priority, the tiles are context)."""
+    if not tiles:
+        return base_bgr
+    h, w = base_bgr.shape[:2]
+    tile_w = max(1, w // 5)                      # each tile ~20% of base width
+    canvas = base_bgr.copy()
+    y = 8
+    pad = 8
+    for frame in tiles:
+        try:
+            fh, fw = frame.shape[:2]
+            if fw == 0 or fh == 0:
+                continue
+            tile_h = max(1, int(round(fh * (tile_w / float(fw)))))
+            if y + tile_h > h:
+                break                             # would overflow → stop stacking
+            thumb = cv2.resize(frame, (tile_w, tile_h),
+                               interpolation=cv2.INTER_AREA)
+            x0 = w - tile_w - pad
+            canvas[y:y + tile_h, x0:x0 + tile_w] = thumb
+            # Thin cyan border so each tile reads as a distinct pane.
+            cv2.rectangle(canvas, (x0, y), (x0 + tile_w - 1, y + tile_h - 1),
+                          (255, 201, 76), 2)
+            y += tile_h + pad
+        except Exception:
+            continue
+    return canvas
+
+
+def _hud_kinect_preview_write(now: float) -> bool:
+    """If the Kinect skeleton overlay is enabled, build the Kinect color +
+    skeleton (+ webcam tiles) composite and write it to the SHARED HUD preview
+    JPEG, returning True iff it wrote. Returns False when the overlay is off or
+    no Kinect frame was available — the caller then falls back to writing the
+    plain primary-webcam mirror, so the HUD tile is never left blank.
+
+    This is the single entry point the face-tracking loop calls; it honours the
+    same throttle + atomic-write contract as _hud_camera_preview_write (it reuses
+    that writer with the composed frame)."""
+    if not _hud_kinect_skeleton_overlay_enabled():
+        return False
+    composed = _compose_kinect_preview(now)
+    if composed is None:
+        return False
+    return _hud_camera_preview_write(composed, now)
+
+
 # Webcam I/O health bookkeeping (self-diag 2026-05-28). When cv2's read()
 # returns no frame the face-tracking thread can't always tell the user what
 # went wrong — was the device just unplugged? Did Teams steal it mid-stream?
@@ -4072,7 +4292,13 @@ def _face_tracking_thread():
                 # HUD_CAMERA_PREVIEW.
                 if (cam["primary"] and not camera_off
                         and _hud_camera_preview_enabled()):
-                    _hud_camera_preview_write(frame, now_loop)
+                    # PART A: prefer the Kinect color + LIVE SKELETON composite
+                    # (incl. the two webcam tiles) when the overlay is enabled +
+                    # the Kinect is streaming; it returns False when off/no
+                    # frame, so we fall back to the plain primary-webcam mirror
+                    # and the HUD tile is never left blank.
+                    if not _hud_kinect_preview_write(now_loop):
+                        _hud_camera_preview_write(frame, now_loop)
                 if paused:
                     # Skip the HEAVY cv2 face detection + eye-control servo math
                     # while paused for voice — that recognition cost is what the
