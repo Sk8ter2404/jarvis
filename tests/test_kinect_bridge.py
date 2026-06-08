@@ -52,10 +52,17 @@ class _FakeBody:
     hand_right_state / hand_left_state mirror the Kinect ints the real
     PyKinectRuntime sets on each body (0 Unknown,1 NotTracked,2 Open,3 Closed,
     4 Lasso). Optional so existing tests (which don't set them) still get the
-    bridge's "unknown" degrade via getattr."""
+    bridge's "unknown" degrade via getattr.
+
+    tracking_id mirrors the stable per-person id the real PyKinectRuntime sets
+    from body.TrackingId (a large nonzero 64-bit int). Optional: when omitted,
+    the fake has no tracking_id attribute at all, so the bridge's getattr
+    fallback to the slot index is exercised — matching the list-based fakes."""
     def __init__(self, tracked, joints=None, hand_right_state=None,
-                 hand_left_state=None):
+                 hand_left_state=None, tracking_id=None):
         self.is_tracked = tracked
+        if tracking_id is not None:
+            self.tracking_id = tracking_id
         # Default: a plausible upright, facing skeleton ~2 m away.
         if joints is None:
             joints = {}
@@ -80,9 +87,32 @@ class _FakeBody:
             self.hand_left_state = hand_left_state
 
 
+def _as_body_array(bodies):
+    """Wrap a sequence of fake bodies in the SAME container the real
+    PyKinectRuntime hands back: a numpy ``ndarray(dtype=object)`` (see
+    KinectBodyFrameData.bodies = numpy.ndarray((max_body_count), dtype=object)).
+
+    Faithfulness matters here: a plain Python list has a well-defined truth
+    value, so any guard that boolean-tests ``frame.bodies`` (e.g. the old
+    ``not frame.bodies``) passes on a list yet raises the ambiguous-truth
+    ValueError on the real ndarray — the exact production bug that killed every
+    gesture. Wrapping fixtures as an ndarray makes the harness exercise the real
+    type. Falls back to the original sequence when numpy isn't importable (CI
+    pre-imports numpy, so this practically always returns an ndarray)."""
+    try:
+        import numpy as np
+    except Exception:   # pragma: no cover - numpy is present on dev + CI
+        return bodies
+    arr = np.empty(len(bodies), dtype=object)
+    for i, b in enumerate(bodies):
+        arr[i] = b
+    return arr
+
+
 class _FakeBodyFrame:
     def __init__(self, bodies):
-        self.bodies = bodies
+        # Mirror hardware: real .bodies is an ndarray(dtype=object), not a list.
+        self.bodies = _as_body_array(bodies)
 
 
 class _FakeRuntime:
@@ -366,6 +396,147 @@ class PresenceTests(_BridgeBase):
         self.assertEqual(got[0]["head"], (0.0, 0.6, 1.8))
         # joint tuples are (x, y, z, tracking_state)
         self.assertEqual(len(got[0]["joints"]["head"]), 4)
+
+    def test_get_bodies_handles_numpy_object_array(self):
+        # REGRESSION: on real hardware PyKinectRuntime.bodies is a length-6
+        # numpy ndarray(dtype=object), not a list. The old guard did
+        # `not getattr(frame, "bodies", None)` which calls bool() on that
+        # array → ValueError("truth value of an array ... is ambiguous"),
+        # swallowed by the broad except → get_bodies() returned [] on EVERY
+        # frame, silently killing gestures/presence/head-yaw/hand-states.
+        # This drives the exact ndarray shape to prove the guard no longer
+        # bool()s the array.
+        np = _require_numpy(self)
+        raw = np.empty(6, dtype=object)
+        raw[0] = _FakeBody(True, {"head": (0, 0.6, 1.8),
+                                  "spine_shoulder": (0, 0.0, 1.8)})
+        raw[1] = _FakeBody(False)
+        raw[2] = _FakeBody(True, {"head": (0, 0.6, 2.5),
+                                  "spine_shoulder": (0, 0.0, 2.5)})
+        for i in range(3, 6):
+            raw[i] = _FakeBody(False)
+        _patch_loader(self, _FakeRuntime(bodies=raw))
+        got = kb.get_bodies()
+        # 2 tracked of the 6 ndarray slots survive — proves we iterated the
+        # array (didn't bail to []) AND didn't raise on the truthiness check.
+        self.assertEqual(len(got), 2)
+        self.assertEqual(got[0]["head"], (0.0, 0.6, 1.8))
+
+    def test_get_presence_works_with_numpy_object_array(self):
+        # Downstream proof: presence (and thus gestures/head-yaw, which all
+        # consume get_bodies) sees the tracked bodies when the frame carries
+        # the real ndarray-of-object body buffer.
+        np = _require_numpy(self)
+        raw = np.empty(6, dtype=object)
+        raw[0] = _FakeBody(True, {"head": (0, 0.6, 1.8),
+                                  "spine_shoulder": (0, 0.0, 1.8)})
+        for i in range(1, 6):
+            raw[i] = _FakeBody(False)
+        _patch_loader(self, _FakeRuntime(bodies=raw))
+        pres = kb.get_presence()
+        self.assertTrue(pres["present"])
+        self.assertEqual(pres["count"], 1)
+        self.assertEqual(pres["nearest_m"], 1.8)
+
+    def test_get_bodies_handles_real_ndarray_bodies(self):
+        # REGRESSION (gestures-completely-dead): the real PyKinectRuntime returns
+        # frame.bodies as a 6-long numpy ndarray(dtype=object) with the tracked
+        # body at an arbitrary, usually non-zero, slot — NOT a Python list. A
+        # guard that boolean-tests that array (the old `not frame.bodies`) raises
+        # ValueError "truth value of an array … is ambiguous", which get_bodies'
+        # blanket except swallows to [] — silently killing every body/gesture.
+        # Build bodies exactly as hardware does and assert the one tracked body
+        # survives. RED before the line-497 fix (raises→[]→len 0); GREEN after.
+        np = _require_numpy(self)
+        frame_bodies = np.array(
+            [_FakeBody(False)] * 4 + [_FakeBody(True, {"head": (0, 0.6, 2.0)})]
+            + [_FakeBody(False)], dtype=object)   # tracked at slot 4, mirrors live
+        self.assertEqual(frame_bodies.shape, (6,))   # exactly the hardware shape
+        _patch_loader(self, _FakeRuntime(bodies=frame_bodies))
+        got = kb.get_bodies()
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["id"], 4)            # preserves the real slot index
+        self.assertIn("head", got[0]["joints"])
+
+    def test_get_bodies_id_uses_stable_tracking_id(self):
+        # The real Kinect carries a stable .tracking_id that follows a person
+        # across frames; a body can sit at ANY of the 6 slots (live: the lone
+        # tracked body was at slot 4). The emitted 'id' must be that stable
+        # tracking_id, NOT the volatile enumerate slot index.
+        bodies = [
+            _FakeBody(False), _FakeBody(False), _FakeBody(False),
+            _FakeBody(False),
+            _FakeBody(True, {"head": (0, 0.6, 1.8),
+                             "spine_shoulder": (0, 0.0, 1.8)},
+                      tracking_id=72057594037928001),  # slot 4
+            _FakeBody(False),
+        ]
+        _patch_loader(self, _FakeRuntime(bodies=bodies))
+        got = kb.get_bodies()
+        self.assertEqual(len(got), 1)
+        # id is the tracking_id, not the slot index 4.
+        self.assertEqual(got[0]["id"], 72057594037928001)
+
+    def test_get_bodies_id_is_stable_across_slot_migration(self):
+        # Same person (same tracking_id), two consecutive frames where the
+        # Kinect moved them from slot 1 to slot 3. The slot index churns but the
+        # emitted id must stay put — that's the whole point of the fix.
+        tid = 72057594037928123
+        frame_a = [
+            _FakeBody(False),
+            _FakeBody(True, {"head": (0, 0.6, 2.0),
+                             "spine_shoulder": (0, 0.0, 2.0)}, tracking_id=tid),
+            _FakeBody(False), _FakeBody(False), _FakeBody(False),
+            _FakeBody(False),
+        ]
+        frame_b = [
+            _FakeBody(False), _FakeBody(False), _FakeBody(False),
+            _FakeBody(True, {"head": (0, 0.6, 2.0),
+                             "spine_shoulder": (0, 0.0, 2.0)}, tracking_id=tid),
+            _FakeBody(False), _FakeBody(False),
+        ]
+        rt = _FakeRuntime(bodies=frame_a)
+        _patch_loader(self, rt)
+        id_a = kb.get_bodies()[0]["id"]
+        # Re-arm the runtime with the migrated frame.
+        rt._bodies = frame_b
+        rt._new["body"] = True
+        id_b = kb.get_bodies()[0]["id"]
+        self.assertEqual(id_a, tid)
+        self.assertEqual(id_b, tid)
+        self.assertEqual(id_a, id_b)   # identity survives the slot move
+
+    def test_get_bodies_id_falls_back_to_slot_when_no_tracking_id(self):
+        # List-based / older fakes that carry no tracking_id attribute must
+        # degrade to the enumerate slot index (here the 1st tracked body is at
+        # slot 2, the 2nd at slot 4 → ids 2 and 4).
+        bodies = [
+            _FakeBody(False), _FakeBody(False),
+            _FakeBody(True, {"head": (0, 0.6, 1.8),
+                             "spine_shoulder": (0, 0.0, 1.8)}),  # slot 2
+            _FakeBody(False),
+            _FakeBody(True, {"head": (0, 0.6, 2.5),
+                             "spine_shoulder": (0, 0.0, 2.5)}),  # slot 4
+            _FakeBody(False),
+        ]
+        _patch_loader(self, _FakeRuntime(bodies=bodies))
+        got = kb.get_bodies()
+        self.assertEqual([b["id"] for b in got], [2, 4])
+
+    def test_get_bodies_id_falsy_tracking_id_degrades_to_slot(self):
+        # A tracking_id of 0 (or any falsy value) is not a valid Kinect id for a
+        # tracked body; the guard must fall back to the slot index rather than
+        # emit a misleading 0. The lone tracked body sits at slot 1 → id 1.
+        bodies = [
+            _FakeBody(False),
+            _FakeBody(True, {"head": (0, 0.6, 1.8),
+                             "spine_shoulder": (0, 0.0, 1.8)}, tracking_id=0),
+            _FakeBody(False), _FakeBody(False), _FakeBody(False),
+            _FakeBody(False),
+        ]
+        _patch_loader(self, _FakeRuntime(bodies=bodies))
+        got = kb.get_bodies()
+        self.assertEqual(got[0]["id"], 1)   # slot index, not the falsy 0
 
     def test_get_presence_counts_two_and_picks_nearest(self):
         bodies = [

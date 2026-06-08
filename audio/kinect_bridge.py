@@ -494,10 +494,24 @@ def get_bodies() -> list[dict]:
         if not rt.has_new_body_frame():
             return []
         frame = rt.get_last_body_frame()
-        if frame is None or not getattr(frame, "bodies", None):
+        # NB: frame.bodies on real hardware is a length-6 numpy ndarray
+        # (dtype=object) — NEVER apply bool()/`not` to it or numpy raises
+        # ValueError("truth value of an array ... is ambiguous"), which the
+        # broad except below would swallow, returning [] on every frame and
+        # silently killing the entire body-data plane (gestures, presence,
+        # head-yaw, hand-states, point/guard). len()/`is None` are safe for
+        # both the ndarray and the list test-fakes; the len() is wrapped so a
+        # non-sized bodies attr degrades to [] instead of raising.
+        bodies = getattr(frame, "bodies", None) if frame is not None else None
+        if bodies is None:
+            return []
+        try:
+            if len(bodies) == 0:
+                return []
+        except TypeError:   # pragma: no cover - non-sized bodies attr (shouldn't happen)
             return []
         out: list[dict] = []
-        for i, body in enumerate(frame.bodies):
+        for i, body in enumerate(bodies):
             if not getattr(body, "is_tracked", False):
                 continue
             joints_raw = getattr(body, "joints", None)
@@ -515,7 +529,13 @@ def get_bodies() -> list[dict]:
                         continue
             head = joints.get("head")
             out.append({
-                "id": i,
+                # Prefer the Kinect's stable per-person tracking_id (set from
+                # body.TrackingId for every tracked body; PyKinectRuntime.py:406)
+                # so a body keeps the same 'id' as the person migrates between
+                # the fixed 6 slots. Fall back to the enumerate slot index for
+                # the list-based test fakes that carry no tracking_id, and guard
+                # the falsy default (-1/0/None) so it also degrades to the slot.
+                "id": int(getattr(body, "tracking_id", i) or i),
                 "joints": joints,
                 "head": (head[0], head[1], head[2]) if head else None,
                 "distance_m": _joint_distance(joints),
