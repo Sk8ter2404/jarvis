@@ -432,11 +432,46 @@ class ResolveAndDispatchTests(unittest.TestCase):
         # resolves with 2 steps) but maps to None, so actions.get() yields None
         # at dispatch → that step is demoted to unknown. Only 1 real step then
         # survives, which is below the 2-step chain floor → returns None.
+        #
+        # CRITICAL (regression guard): availability is re-checked BEFORE any
+        # action runs, so when the chain bails to None NOTHING has executed.
+        # Otherwise the caller (bobert_companion) treats None as 'no chain' and
+        # re-emits the surviving command through the LLM, double-executing it
+        # (timer started twice, volume applied twice).
         actions = {"play_music": self._action("play_music"), "screenshot": None}
         out = d.resolve_and_dispatch("play jazz, take a screenshot", actions)
         self.assertIsNone(out)
-        # The surviving action still ran; the None-mapped one was skipped.
-        self.assertEqual(self.calls, [("play_music", "jazz")])
+        # No action ran: the chain bailed before executing the survivor.
+        self.assertEqual(self.calls, [])
+
+    def test_partial_chain_does_not_execute_survivor_before_bailing(self):
+        # The double-execution regression, exercised regardless of which step is
+        # the surviving one. The first step's action vanished at dispatch
+        # (mapped to None); the survivor (set_timer) must NOT run, because the
+        # chain is about to return None and the LLM path will own it instead.
+        actions = {"play_music": None, "set_timer": self._action("set_timer")}
+        out = d.resolve_and_dispatch(
+            "play jazz, set a 10 minute timer", actions)
+        self.assertIsNone(out)
+        self.assertEqual(self.calls, [])
+
+    def test_two_survivors_still_dispatch_when_a_third_vanishes(self):
+        # The pre-execution availability check must not over-fire: with >=2
+        # runnable steps the chain still executes and summarises, and the
+        # vanished step is reported as unknown.
+        actions = {
+            "play_music": self._action("play_music"),
+            "screenshot": self._action("screenshot", "captured"),
+            "volume_up": None,  # de-registered between resolve and dispatch
+        }
+        out = d.resolve_and_dispatch(
+            "play jazz, take a screenshot, turn it up", actions)
+        self.assertEqual(self.calls,
+                         [("play_music", "jazz"), ("screenshot", "")])
+        self.assertEqual(
+            out,
+            "Two things, sir: music queued, screenshot captured."
+            " I didn't catch 'turn it up', though.")
 
     def test_one_real_step_falls_through_to_llm(self):
         # A resolved 2-step chain where one action is missing leaves a single
