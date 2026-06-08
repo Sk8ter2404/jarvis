@@ -912,6 +912,93 @@ class ConsumeBlueGreenHandoffTests(SectionSevenBase):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  get_response_with_animation  (the thinking-animation daemon must NOT leak on
+#  an _call_llm raise, and the raise must NOT propagate to the main loop)
+# ════════════════════════════════════════════════════════════════════════════
+class GetResponseWithAnimationTests(SectionSevenBase):
+    def setUp(self):
+        super().setUp()
+        self._p(self.bc, "pause_face_tracking")
+        self._p(self.bc, "set_state")
+        # send() is what the real _thinking_loop calls each tick; neutralise it
+        # so the REAL loop body can run against a real (short-lived) thread
+        # without driving the HUD.
+        self._p(self.bc, "send")
+        self._p(self.bc, "_heartbeat")
+
+    def test_happy_path_returns_reply_and_joins_thread(self):
+        captured = {}
+        real_thread = self.bc.threading.Thread
+
+        def _capture_thread(*a, **k):
+            t = real_thread(*a, **k)
+            captured["thread"] = t
+            return t
+        self._p(self.bc, "_call_llm", return_value="At your service, sir.")
+        with mock.patch.object(self.bc.threading, "Thread", _capture_thread):
+            reply = self.bc.get_response_with_animation("hi")
+        self.assertEqual(reply, "At your service, sir.")
+        # The animation daemon was stopped and joined — not left running.
+        self.assertFalse(captured["thread"].is_alive())
+
+    def test_call_llm_raise_does_not_propagate_and_returns_fallback(self):
+        # The crux of the finding (1): an exception out of _call_llm must NOT
+        # propagate — the outer main loop only catches KeyboardInterrupt, so a
+        # raise here would crash the whole conversation loop.
+        self._p(self.bc, "_call_llm", side_effect=RuntimeError("tone blew up"))
+        reply = self.bc.get_response_with_animation("hi")
+        self.assertEqual(reply, self.bc._llm_error_reply())
+
+    def test_call_llm_raise_still_stops_animation_daemon(self):
+        # The crux of the finding (2): even when _call_llm raises, the finally
+        # block must stop+join the REAL _thinking_loop daemon. A leaked loop
+        # keeps calling _heartbeat() forever, falsifying the main-loop watchdog
+        # so it can never see a stale beat and recover the wedge.
+        captured = {}
+        real_thread = self.bc.threading.Thread
+
+        def _capture_thread(*a, **k):
+            t = real_thread(*a, **k)
+            captured["thread"] = t
+            return t
+        self._p(self.bc, "_call_llm", side_effect=RuntimeError("local route blew up"))
+        with mock.patch.object(self.bc.threading, "Thread", _capture_thread):
+            self.bc.get_response_with_animation("hi")
+        # Daemon really terminated (stop_evt set + joined in the finally).
+        self.assertFalse(captured["thread"].is_alive())
+
+    def test_local_then_cloud_or_honest_never_propagates(self):
+        # The local route's no-propagate guarantee (finding fix 3): an
+        # unexpected raise from a helper degrades to the honest unavailability
+        # line instead of escaping into _call_llm / the main loop.
+        self._p(self.bc, "_call_local_llm",
+                side_effect=RuntimeError("ollama probe exploded"))
+        self._p(self.bc, "_local_unavailable_message",
+                return_value="HONEST UNAVAILABLE")
+        out = self.bc._local_then_cloud_or_honest("sys", [])
+        self.assertEqual(out, "HONEST UNAVAILABLE")
+
+    def test_call_llm_prologue_classifier_raise_is_neutralised(self):
+        # The prologue guard (finding fix 2): a detect_tone / route_voice_emotion
+        # raise must degrade to neutral defaults, not crash the turn. Drive the
+        # local route so we exercise _call_llm end-to-end without the network.
+        self._p(self.bc, "detect_tone", side_effect=RuntimeError("tone classifier down"))
+        self._p(self.bc, "route_voice_emotion", side_effect=RuntimeError("router down"))
+        self._p(self.bc, "_system_prompt", "SYS")
+        # Force the LOCAL route and have it answer so we reach the tail cleanly.
+        import core.config as _cfg
+        self._p(_cfg, "model_route", return_value="local")
+        self._p(self.bc, "_local_then_cloud_or_honest", return_value="Local reply, sir.")
+        self._p(self.bc, "_mcu_phrases",
+                mock.Mock(detect_phrases_in_reply=mock.Mock(return_value={})))
+        reply = self.bc._call_llm("what's up")
+        self.assertEqual(reply, "Local reply, sir.")
+        # Neutral defaults were cached despite both classifiers raising.
+        self.assertIsNone(self.bc._last_user_tone[0])
+        self.assertEqual(self.bc._last_voice_route[0], {"mood": "casual", "addendum": ""})
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  _do_proactive_turn
 # ════════════════════════════════════════════════════════════════════════════
 class DoProactiveTurnTests(SectionSevenBase):
