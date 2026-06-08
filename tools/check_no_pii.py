@@ -73,27 +73,66 @@ WARN = [
 ]
 
 
+def _local_pattern_candidates() -> list[str]:
+    """Ordered, de-duped (by realpath) paths to probe for pii_local.py.
+
+    The module-relative sibling is gitignored, so in a `git worktree add`
+    checkout or a CI runner it is absent. Without a fallback the owner HARD/WARN
+    patterns would silently never register and the gate would degrade to generic
+    key formats — a no-op precisely where it matters. So after the local probe
+    we fall back to the canonical owner checkout and an explicit override env var.
+    """
+    raw = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "pii_local.py"),
+        r"C:/JARVIS/tools/pii_local.py",
+        os.environ.get("JARVIS_PII_LOCAL", ""),
+    ]
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in raw:
+        if not p:
+            continue
+        try:
+            key = os.path.normcase(os.path.realpath(p))
+        except OSError:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
 def _load_local_patterns() -> None:
     """Extend HARD/WARN from a gitignored tools/pii_local.py if present.
 
     Keeps owner-identifying literals (name, email, device codes, contacts)
     OUT of this shipped, committed scanner. The local file is gitignored and
     skipped from scanning (see _SELF); absent on a fresh clone and in CI,
-    where there is no owner PII to match anyway.
+    where there is no owner PII to match anyway. We try several canonical
+    locations (see _local_pattern_candidates) so a worktree/CI checkout that
+    lacks the sibling still gets full owner coverage when the owner file is
+    reachable; if none is found we say so on stderr rather than passing
+    silently.
     """
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pii_local.py")
-    if not os.path.exists(path):
+    for path in _local_pattern_candidates():
+        if not os.path.exists(path):
+            continue
+        ns: dict = {}
+        try:
+            with open(path, encoding="utf-8") as fh:
+                exec(compile(fh.read(), path, "exec"), ns)
+        except Exception:
+            return
+        for lbl, pat in ns.get("HARD", []):
+            HARD.append((lbl, _rx(pat)))
+        for lbl, pat in ns.get("WARN", []):
+            WARN.append((lbl, _rx(pat)))
         return
-    ns: dict = {}
-    try:
-        with open(path, encoding="utf-8") as fh:
-            exec(compile(fh.read(), path, "exec"), ns)
-    except Exception:
-        return
-    for lbl, pat in ns.get("HARD", []):
-        HARD.append((lbl, _rx(pat)))
-    for lbl, pat in ns.get("WARN", []):
-        WARN.append((lbl, _rx(pat)))
+    sys.stderr.write(
+        "[check_no_pii] note: no pii_local.py found (owner-PII patterns "
+        "unavailable; running with generic key formats only)\n"
+    )
 
 
 _load_local_patterns()

@@ -417,6 +417,75 @@ class LoadLocalPatternsTests(unittest.TestCase):
         self.assertEqual(cnp.HARD, self._hard)
         self.assertEqual(cnp.WARN, self._warn)
 
+    # --- worktree / CI fallback coverage (regression: the gate used to provide
+    #     NO owner-PII coverage in a git worktree, where the gitignored sibling
+    #     pii_local.py is absent and the single-path probe returned early) ------
+
+    def test_candidates_include_canonical_and_env_fallbacks(self):
+        # Beyond the module-relative sibling, the canonical owner checkout and an
+        # explicit override env var must be probed so a worktree/CI checkout that
+        # lacks the sibling can still load owner patterns from a reachable copy.
+        with mock.patch.dict(cnp.os.environ,
+                             {"JARVIS_PII_LOCAL": r"D:/elsewhere/pii_local.py"}):
+            cands = cnp._local_pattern_candidates()
+        joined = [c.replace("\\", "/") for c in cands]
+        # sibling first (so a real local file still wins), then the fallbacks
+        self.assertTrue(joined[0].endswith("/pii_local.py"))
+        self.assertTrue(any(c.endswith("C:/JARVIS/tools/pii_local.py")
+                            for c in joined),
+                        f"canonical fallback missing from {joined}")
+        self.assertIn("D:/elsewhere/pii_local.py", joined)
+
+    def test_candidates_deduped_by_realpath(self):
+        # If the env override resolves to the same realpath as the sibling, it
+        # must appear only once (no double-loading of the same owner file).
+        sibling = os.path.join(
+            os.path.dirname(os.path.abspath(cnp.__file__)), "pii_local.py")
+        with mock.patch.dict(cnp.os.environ, {"JARVIS_PII_LOCAL": sibling}):
+            cands = cnp._local_pattern_candidates()
+        keys = [os.path.normcase(os.path.realpath(c)) for c in cands]
+        self.assertEqual(len(keys), len(set(keys)), f"dupe realpath in {cands}")
+
+    def test_empty_env_override_skipped(self):
+        # An unset/empty JARVIS_PII_LOCAL must not become a "" candidate.
+        with mock.patch.dict(cnp.os.environ, {"JARVIS_PII_LOCAL": ""}):
+            cands = cnp._local_pattern_candidates()
+        self.assertNotIn("", cands)
+
+    def test_fallback_loads_when_sibling_absent(self):
+        # The core regression: sibling missing (worktree/CI) but a fallback path
+        # exists -> owner patterns STILL register (gate is not a silent no-op).
+        src = "HARD = [('fb-hard', r'FALLBACKHIT_[0-9]+')]\n"
+        real_exists = os.path.exists
+        fb = os.path.join(tempfile.gettempdir(), "pii_local_fallback_probe.py")
+
+        def fake_exists(p):
+            # sibling (and anything else) absent; only our fallback path exists
+            return os.path.normcase(os.path.abspath(p)) == \
+                os.path.normcase(os.path.abspath(fb))
+
+        with mock.patch.object(cnp, "_local_pattern_candidates",
+                               return_value=["/nope/pii_local.py", fb]), \
+             mock.patch.object(cnp.os.path, "exists", side_effect=fake_exists), \
+             mock.patch("builtins.open", mock.mock_open(read_data=src)):
+            cnp._load_local_patterns()
+        self.assertIn("fb-hard", [l for l, _ in cnp.HARD])
+        # nothing earlier in the list silently shadowed the real fallback
+        self.assertFalse(real_exists("/nope/pii_local.py"))
+
+    def test_no_candidate_found_warns_on_stderr(self):
+        # When NO candidate exists, the gate must say so (visible degradation)
+        # instead of silently passing with generic-only patterns.
+        import io
+        buf = io.StringIO()
+        with mock.patch.object(cnp.os.path, "exists", return_value=False), \
+             mock.patch.object(cnp.sys, "stderr", buf):
+            cnp._load_local_patterns()
+        self.assertIn("no pii_local.py found", buf.getvalue())
+        # and it remained a no-op for the pattern lists
+        self.assertEqual(cnp.HARD, self._hard)
+        self.assertEqual(cnp.WARN, self._warn)
+
 
 class MainDirectoryScanTests(unittest.TestCase):
     """End-to-end main() over a directory, with HARD/WARN swapped for fixtures

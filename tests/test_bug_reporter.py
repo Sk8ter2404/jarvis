@@ -189,8 +189,12 @@ class GatePatternScrubTests(unittest.TestCase):
 
     def test_bare_serial_redacted(self):
         # A 15-char UPPER alnum serial (the Bambu shape) with no separators —
-        # the rule that exists even without pii_local.py.
-        serial = "0948CD" + "542300667"
+        # the generic bare-serial rule that exists even without pii_local.py.
+        # NB: use a synthetic serial, NOT the owner's real one — on a box where
+        # pii_local.py loads (now incl. worktrees, post fallback fix) the real
+        # serial is caught by its own owner HARD pattern first and redacted to
+        # <BAMBU_SERIAL>, never reaching this generic <SERIAL> rule.
+        serial = "Z9X8Y7" + "WV0123456"   # 15 chars upper+digit, not in pii_local
         out = bug_reporter.scrub("printer serial " + serial + " failed")
         self.assertNotIn(serial, out)
         self.assertIn("<SERIAL>", out)
