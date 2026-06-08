@@ -177,12 +177,41 @@ _runtime: list[Any] = [None]
 _open_error: list[Optional[str]] = [None]
 _negative_until = [0.0]            # monotonic; available() negative-cache expiry
 _NEGATIVE_CACHE_SEC = 30.0
+# A just-hard-killed prior instance can still hold the sensor when we reopen;
+# PyKinectRuntime() then returns a live object that never streams a frame.
+# Verify real frames arrive and retry so a restart can't latch a dead runtime.
+_OPEN_STREAM_RETRIES = 4
+_OPEN_STREAM_RETRY_SEC = 1.5
 
 
 def _frame_source_flags(pk2):
     """Color | Body | Depth | Infrared — the full set the bridge streams."""
     return (pk2.FrameSourceTypes_Color | pk2.FrameSourceTypes_Body
             | pk2.FrameSourceTypes_Depth | pk2.FrameSourceTypes_Infrared)
+
+
+def _runtime_streams(rt, timeout_sec: float = 2.5) -> bool:
+    """True if a freshly-opened runtime delivers a color/body frame within
+    timeout_sec. A sensor still held by a releasing prior instance opens but
+    never streams — catch that so we retry instead of caching a dead runtime."""
+    end = time.monotonic() + timeout_sec
+    while time.monotonic() < end:
+        try:
+            if rt.has_new_color_frame() or rt.has_new_body_frame():
+                return True
+        except Exception:
+            return False
+        time.sleep(0.05)
+    return False
+
+
+def _safe_close_runtime(rt) -> None:
+    try:
+        close = getattr(rt, "close", None)
+        if callable(close):
+            close()
+    except Exception:  # pragma: no cover - defensive: older builds lack close()
+        pass
 
 
 def _open_runtime_locked():
@@ -199,13 +228,24 @@ def _open_runtime_locked():
         return None, "pykinect2 not installed — pip install pykinect2"
     except Exception as e:   # pragma: no cover - patch-loader compile/exec failure
         return None, f"pykinect2 failed to load: {type(e).__name__}: {e}"
-    try:
-        rt = rt_mod.PyKinectRuntime(_frame_source_flags(pk2))
-    except Exception as e:
-        return None, f"could not open Kinect sensor: {type(e).__name__}: {e}"
-    _runtime[0] = rt
-    _open_error[0] = None
-    return rt, None
+    last = None
+    for _attempt in range(_OPEN_STREAM_RETRIES):
+        try:
+            rt = rt_mod.PyKinectRuntime(_frame_source_flags(pk2))
+        except Exception as e:
+            return None, f"could not open Kinect sensor: {type(e).__name__}: {e}"
+        if _runtime_streams(rt):
+            _runtime[0] = rt
+            _open_error[0] = None
+            if _attempt:
+                print(f"  [kinect] sensor live after {_attempt + 1} open attempts")
+            return rt, None
+        last = "opened but no frames streaming"
+        _safe_close_runtime(rt)
+        time.sleep(_OPEN_STREAM_RETRY_SEC)
+    return None, (f"Kinect opened but streamed no frames after "
+                  f"{_OPEN_STREAM_RETRIES} attempts ({last}); sensor may be "
+                  f"held by another process")
 
 
 def get_runtime() -> tuple[Any, Optional[str]]:
