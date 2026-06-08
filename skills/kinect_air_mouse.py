@@ -96,16 +96,31 @@ _THREAD_NAME = "kinect-air-mouse-skill"
 AIR_MOUSE_BUTTON = "left"
 
 # EMA smoothing factor for the cursor (0..1). LOWER = smoother but laggier;
-# HIGHER = snappier but jitterier. 0.35 is a comfortable middle that tames the
-# Kinect hand-joint jitter without feeling like the cursor is dragging through
-# molasses. Tunable; v2 may auto-adapt it to hand speed.
-AIR_MOUSE_EMA_ALPHA = 0.35
+# HIGHER = snappier but jitterier. Tunable; v2 may auto-adapt it to hand speed.
+#
+# TUNED 2026-06-08 (owner: "works but laggy, make it snappier"): 0.35 → 0.55.
+#   At the 30 Hz poll rate the EMA's response time-constant is ~1/alpha frames.
+#   0.35 → ≈2.9-frame constant (~95 ms to reach 63 % of a step) which read as a
+#   cursor "dragging behind" the hand. 0.55 → ≈1.8-frame constant (~60 ms): the
+#   cursor catches the hand markedly faster (≈35 ms less lag) while still
+#   averaging roughly two frames, so the Kinect hand-joint jitter is still tamed
+#   (a lone jittered sample only moves the cursor ~55 % of the way, not 100 %).
+#   Nudge back toward 0.4-0.45 if it feels twitchy; toward 0.6-0.7 for even less
+#   lag at the cost of more jitter.
+AIR_MOUSE_EMA_ALPHA = 0.55
 
 # How many CONSECUTIVE frames a new grip (open↔closed) must persist before the
-# state machine accepts it. At ~30 Hz, 3 frames ≈ 100 ms — long enough that a
-# single flickered Kinect hand-state frame can't fire a stray left-click, short
-# enough that an intentional close still feels instant.
-AIR_MOUSE_GRIP_DEBOUNCE_FRAMES = 3
+# state machine accepts it. This is the anti-stray-click guard: a single
+# flickered Kinect hand-state frame must never fire a click.
+#
+# TUNED 2026-06-08 (owner: "click should fire promptly"): 3 → 2.
+#   At 30 Hz, 3 frames ≈ 100 ms of latency before a close registers as a click;
+#   2 frames ≈ 67 ms — the click fires ~33 ms sooner so it feels prompt/instant.
+#   TWO consecutive frames still rejects a lone 1-frame flicker (the actual
+#   failure mode the Kinect produces), so accidental clicks are still prevented;
+#   we only gave up the third confirmation frame, which was belt-and-suspenders.
+#   Raise back to 3 if any stray clicks appear; 2 is the snappy-but-safe floor.
+AIR_MOUSE_GRIP_DEBOUNCE_FRAMES = 2
 
 # ─── dead-man ENGAGE gate (the hand must be RAISED to drive the cursor) ──────
 # The air-mouse only controls the cursor while the controlling hand is held UP,
@@ -137,10 +152,25 @@ AIR_MOUSE_DISENGAGE_GRACE_SEC = 0.30
 # shoulder height. These are the v1 defaults; v2 makes them per-user calibrated.
 #   half-width  → ±X metres from centre maps to the desktop's left/right edges
 #   half-height → ±Y metres from centre maps to the desktop's top/bottom edges
+#
+# TUNED 2026-06-08 (owner: "shouldn't need huge arm swings to cross the screen").
+#   The smaller the box, the LESS hand travel maps to the full desktop, i.e.
+#   higher sensitivity. The old ±0.35 m / ±0.22 m box demanded a ~70 cm-wide
+#   sweep edge-to-edge — a whole-arm shoulder swing. A natural pointing arc with
+#   the elbow tucked (forearm pivoting at the elbow/wrist) is only ~±25 cm
+#   horizontal / ~±15 cm vertical, so:
+#     REACH_HALF_W 0.35 → 0.26  (full desktop width  in a ~52 cm hand sweep)
+#     REACH_HALF_H 0.22 → 0.16  (full desktop height in a ~32 cm hand sweep)
+#   That maps a comfortable forearm arc to the whole virtual desktop — small
+#   hand moves now cover the screen. The ~1.6 W:H ratio is kept ≈16:9 so x and y
+#   sensitivity stay proportionate (no axis feels twitchier than the other).
+#   The EMA + debounce above keep this from feeling jittery despite the higher
+#   gain. Widen these (toward the old values) if it feels too sensitive; shrink
+#   further for even less travel.
 REACH_CENTER_X = 0.0      # metres (centred on the sensor's optical axis)
 REACH_CENTER_Y = 0.30     # metres above the sensor (≈ seated shoulder height)
-REACH_HALF_W = 0.35       # ±0.35 m horizontal reach → full desktop width
-REACH_HALF_H = 0.22       # ±0.22 m vertical reach → full desktop height
+REACH_HALF_W = 0.26       # ±0.26 m horizontal reach → full desktop width
+REACH_HALF_H = 0.16       # ±0.16 m vertical reach → full desktop height
 
 # Default geometry used only as a fallback when the real virtual-desktop bounds
 # can't be read (headless / win32 absent). The live bounds are resolved at
@@ -496,6 +526,68 @@ def overlay_color_for(overlay_state: str) -> str:
     Pure helper shared by the live publisher and the unit test so the colour
     contract is asserted against the same source the overlay reads."""
     return "gold" if overlay_state == "grab" else "cyan"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  PREVIEW FEEDBACK: hand-circle colour + thread-safe air-mouse state (B2)
+# ══════════════════════════════════════════════════════════════════════════
+# The HUD's Kinect skeleton preview (bobert_companion._compose_kinect_preview)
+# draws a translucent circle around the controlling hand joint, coloured by the
+# LIVE air-mouse state so the owner SEES when the cursor is active / clicking:
+#   • ENGAGED + open hand   → BLUE   (cursor active, tracking)
+#   • ENGAGED + closed hand → ORANGE (left-click / drag held)
+#   • disengaged / off      → faint GREY idle (or no circle)
+# The colour logic is a PURE helper (no cv2 / sensor) so the geometry module and
+# the unit test assert the exact same contract; the preview just calls it.
+
+# BGR triples (OpenCV order) for the three hand-circle states. Stark, saturated
+# colours that read on the small downscaled preview tile.
+HAND_CIRCLE_COLOR_ENGAGED = (255, 160, 32)   # BGR ≈ bright BLUE  (#20a0ff)
+HAND_CIRCLE_COLOR_CLOSED  = (32, 170, 255)   # BGR ≈ ORANGE/amber (#ffaa20)
+HAND_CIRCLE_COLOR_IDLE    = (150, 150, 150)  # dim GREY (disengaged idle hint)
+
+
+def hand_circle_color_for(engaged: bool, grip: str) -> "tuple[int, int, int] | None":
+    """The hand-circle BGR colour for the preview, by air-mouse state. PURE +
+    hardware-free so the preview and the test share one source of truth.
+
+      • engaged + grip "closed"        → ORANGE  (left-click / drag active)
+      • engaged + any other grip       → BLUE    (cursor engaged, tracking)
+      • not engaged                    → GREY    (faint idle hint)
+
+    Returns a (B, G, R) tuple. The caller decides idle→draw-faint-or-skip; we
+    return the idle grey so the colour mapping itself stays total + testable."""
+    if engaged:
+        if (grip or "").lower() == "closed":
+            return HAND_CIRCLE_COLOR_CLOSED
+        return HAND_CIRCLE_COLOR_ENGAGED
+    return HAND_CIRCLE_COLOR_IDLE
+
+
+# Thread-safe snapshot of the LIVE air-mouse engage state + current grip, written
+# by _poll_once each tick and read by the HUD preview compositor (a DIFFERENT
+# thread — the face-tracking loop). A tiny lock keeps the (engaged, grip, ts)
+# triple consistent. The preview reads it to decide the hand-circle colour and
+# whether to draw the circle at all; stale reads simply paint the last state.
+_air_mouse_state_lock = threading.Lock()
+_air_mouse_state: dict = {"engaged": False, "grip": "open", "ts": 0.0}
+
+
+def _set_air_mouse_state(engaged: bool, grip: str) -> None:
+    """Publish the live engage state + grip for the preview (thread-safe)."""
+    with _air_mouse_state_lock:
+        _air_mouse_state["engaged"] = bool(engaged)
+        _air_mouse_state["grip"] = (grip or "open")
+        _air_mouse_state["ts"] = time.time()
+
+
+def get_air_mouse_state() -> dict:
+    """Thread-safe snapshot {'engaged': bool, 'grip': str, 'ts': float} of the
+    air-mouse. Read by the HUD skeleton preview to colour the hand circle
+    (engaged→blue, closed→orange, off→grey). Returns a COPY so the caller can't
+    mutate the shared dict. Never raises."""
+    with _air_mouse_state_lock:
+        return dict(_air_mouse_state)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -956,12 +1048,23 @@ def _poll_once(ctrl: AirMouseController, bridge) -> Optional[AirMouseDecision]:
         if decision.button == "up":
             _mouse_button("up")
         _clear_overlay_state()
+        # Publish DISENGAGED to the preview: with the air-mouse off the HUD
+        # hand-circle must show idle/grey (or nothing), never a live blue/orange.
+        _set_air_mouse_state(False, "open")
         return decision
 
     # Enabled + not staging: act.
     _apply_decision(decision)
     visible = tracked and decision.overlay != "hidden"
     _publish_overlay_state(decision, visible)
+    # Publish the LIVE engage state + grip for the HUD skeleton preview's hand
+    # circle (B2): engaged→blue, closed→orange, disengaged→grey. Read off the
+    # controller (engaged) + the debounced decision (grip) so the preview colour
+    # matches what the cursor/reticle are actually doing this frame.
+    try:
+        _set_air_mouse_state(bool(ctrl.engaged), decision.grip)
+    except Exception:
+        pass
     # Keep the reticle overlay process alive while enabled.
     if visible and not _overlay_alive():
         _spawn_overlay()

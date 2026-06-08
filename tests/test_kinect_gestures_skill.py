@@ -371,5 +371,104 @@ class StatusTests(_Base):
         self.assertIn("unavailable", out.lower())
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  B3 — the gesture-pop badge: a fired gesture is published with a label + a
+#  timestamp, and the badge opacity FADES from 1.0 → 0.0 over ~1 s, then is
+#  gone. The pure label + fade helpers are what the HUD preview renders.
+# ══════════════════════════════════════════════════════════════════════════
+class GestureLabelTests(_Base):
+    def test_known_gestures_get_friendly_labels(self):
+        mod = self._load()
+        self.assertEqual(mod.gesture_label_for(kg.WAVE), "WAVE")
+        self.assertEqual(mod.gesture_label_for(kg.RAISE_HAND), "RAISE HAND")
+        # Both swipe directions read "SWIPE" (direction is irrelevant).
+        self.assertEqual(mod.gesture_label_for(kg.SWIPE_LEFT), "SWIPE")
+        self.assertEqual(mod.gesture_label_for(kg.SWIPE_RIGHT), "SWIPE")
+
+    def test_unknown_gesture_falls_back_to_upper(self):
+        mod = self._load()
+        self.assertEqual(mod.gesture_label_for("double_tap"), "DOUBLE TAP")
+        self.assertEqual(mod.gesture_label_for(""), "")
+
+
+class GesturePopAlphaTests(_Base):
+    def test_alpha_is_full_at_fire_then_fades_to_zero(self):
+        mod = self._load()
+        ttl = mod.GESTURE_POP_TTL_SECONDS
+        fired = 100.0
+        # Full opacity the instant it fires …
+        self.assertEqual(mod.gesture_pop_alpha(fired, fired, ttl), 1.0)
+        # … about half-faded at the midpoint …
+        self.assertAlmostEqual(
+            mod.gesture_pop_alpha(fired + ttl / 2.0, fired, ttl), 0.5, delta=0.05)
+        # … fully gone once the TTL has elapsed …
+        self.assertEqual(mod.gesture_pop_alpha(fired + ttl, fired, ttl), 0.0)
+        self.assertEqual(mod.gesture_pop_alpha(fired + ttl + 1.0, fired, ttl), 0.0)
+
+    def test_alpha_monotonically_decreases(self):
+        mod = self._load()
+        fired = 50.0           # positive (ts<=0 is the 'nothing fired' sentinel)
+        ttl = mod.GESTURE_POP_TTL_SECONDS
+        seq = [mod.gesture_pop_alpha(fired + t, fired, ttl)
+               for t in (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)]
+        self.assertEqual(seq, sorted(seq, reverse=True))   # never increases
+        self.assertEqual(seq[0], 1.0)
+        self.assertEqual(seq[-1], 0.0)
+
+    def test_no_fire_yet_is_zero(self):
+        mod = self._load()
+        # ts <= 0 (nothing fired) → draw nothing.
+        self.assertEqual(mod.gesture_pop_alpha(123.0, 0.0), 0.0)
+        self.assertEqual(mod.gesture_pop_alpha(123.0, -5.0), 0.0)
+
+
+class GesturePopStateTests(_Base):
+    def test_default_state_is_empty(self):
+        mod = self._load()
+        st = mod.get_last_gesture()
+        self.assertIsNone(st["gesture"])
+        self.assertEqual(st["ts"], 0.0)
+
+    def test_set_last_gesture_publishes_label_and_ts(self):
+        mod = self._load()
+        clock = [42.0]
+        mod._set_last_gesture(kg.WAVE, now_fn=lambda: clock[0])
+        st = mod.get_last_gesture()
+        self.assertEqual(st["gesture"], kg.WAVE)
+        self.assertEqual(st["label"], "WAVE")
+        self.assertEqual(st["ts"], 42.0)
+        # Copy semantics: mutating the snapshot can't corrupt shared state.
+        st["label"] = "TAMPERED"
+        self.assertEqual(mod.get_last_gesture()["label"], "WAVE")
+
+    def test_poll_publishes_fired_gesture_for_pop(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        bc = _fake_bc(standby=True, sleep=True)
+        self._inject("audio.kinect_bridge", _fake_bridge(bodies=[{"x": 1}]))
+        rec = _StubRec([kg.SWIPE_LEFT])
+        got = mod._poll_once(rec, bc)
+        self.assertEqual(got, kg.SWIPE_LEFT)
+        # The pop badge state now reflects the fired gesture, ready for the HUD.
+        st = mod.get_last_gesture()
+        self.assertEqual(st["gesture"], kg.SWIPE_LEFT)
+        self.assertEqual(st["label"], "SWIPE")
+        self.assertGreater(st["ts"], 0.0)
+        # And it's freshly visible (alpha > 0 right after firing).
+        self.assertGreater(mod.gesture_pop_alpha(st["ts"], st["ts"]), 0.0)
+
+    def test_poll_does_not_publish_when_gated_off(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(False)              # gestures OFF
+        bc = _fake_bc(standby=True, sleep=True)
+        self._inject("audio.kinect_bridge", _fake_bridge(bodies=[{"x": 1}]))
+        rec = _StubRec([kg.WAVE])
+        mod._poll_once(rec, bc)
+        # No badge should pop for a gesture that didn't dispatch.
+        self.assertIsNone(mod.get_last_gesture()["gesture"])
+
+
 if __name__ == "__main__":
     unittest.main()

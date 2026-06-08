@@ -115,31 +115,87 @@ class ComposeKinectPreviewTests(MonolithGlobalsTestCase):
                                return_value=None):
             self.assertIsNone(self.bc._compose_kinect_preview(now=123.0))
 
-    def test_composes_with_skeleton_and_cached_webcam_tiles(self):
+    def test_composes_with_skeleton_and_real_webcam_tiles(self):
+        # B1: the side tiles are the REAL webcams (captured directly), NOT the
+        # Kinect cache. Mock the direct reader to hand back two webcam frames.
         np = _np()
         color = np.zeros((1080, 1920, 3), dtype=np.uint8)
-        webcam = np.full((480, 640, 3), 123, dtype=np.uint8)
+        left = np.full((480, 640, 3), 90, dtype=np.uint8)
+        right = np.full((480, 640, 3), 200, dtype=np.uint8)
         bodies = [{"joints": {"head": (0.0, 1.0, 2.0, 2),
                               "neck": (0.0, 0.7, 2.0, 2)}}]
-        # Seed a cached webcam frame at index 0 and resolve 'left' → 0.
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
+                               return_value=color), \
+                mock.patch.object(self.bc._kinect_bridge, "get_bodies",
+                                  return_value=bodies), \
+                mock.patch.object(self.bc._kinect_bridge,
+                                  "get_color_space_mapper",
+                                  return_value=lambda x, y, z: (960, 540)), \
+                mock.patch.object(self.bc, "_read_side_tile_webcams",
+                                  return_value={"left": left, "right": right}):
+            out = self.bc._compose_kinect_preview(now=10.0)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.shape, color.shape)
+
+    def test_does_not_read_kinect_cache_for_tiles(self):
+        # The compose path must NOT pull side tiles from _camera_latest_frame
+        # (the Kinect frame on the owner's rig). Seed a GARISH all-255 frame in
+        # the cache; the real-webcam reader returns a distinct value (77). The
+        # composed right-edge tiles must show the WEBCAM (77), proving the Kinect
+        # cache was ignored — if the old code leaked, a solid 255 block would
+        # appear there instead.
+        np = _np()
+        color = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        webcam = np.full((480, 640, 3), 77, dtype=np.uint8)
+        kinect_marker = np.full((480, 640, 3), 255, dtype=np.uint8)  # would-be leak
         with self.bc._camera_state_lock:
-            self.bc._camera_latest_frame[0] = webcam
+            self.bc._camera_latest_frame[0] = kinect_marker
+            self.bc._camera_latest_frame[1] = kinect_marker
+        real_lock = self.bc._camera_state_lock
         try:
             with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
                                    return_value=color), \
                     mock.patch.object(self.bc._kinect_bridge, "get_bodies",
-                                      return_value=bodies), \
-                    mock.patch.object(self.bc._kinect_bridge,
-                                      "get_color_space_mapper",
-                                      return_value=lambda x, y, z: (960, 540)), \
-                    mock.patch.object(self.bc, "_resolve_webcam_indices_by_name",
-                                      return_value={"left": 0}):
+                                      return_value=[]), \
+                    mock.patch.object(self.bc, "_read_side_tile_webcams",
+                                      return_value={"left": webcam, "right": webcam}):
                 out = self.bc._compose_kinect_preview(now=10.0)
         finally:
-            with self.bc._camera_state_lock:
+            with real_lock:
                 self.bc._camera_latest_frame.pop(0, None)
+                self.bc._camera_latest_frame.pop(1, None)
         self.assertIsNotNone(out)
         self.assertEqual(out.shape, color.shape)
+        # Inspect the right-edge tile strip (where the side tiles are laid). The
+        # webcam value 77 must be present there; a solid 255 Kinect block must
+        # NOT be (the base outside the tiles is 0, so 255 could only come from a
+        # leaked Kinect cache frame).
+        right_strip = out[:, int(out.shape[1] * 0.78):, :]
+        self.assertTrue(bool((right_strip == 77).any()),
+                        "webcam tile (77) should appear on the right edge")
+        # No 3x3 solid-255 region anywhere in the strip (would be the Kinect leak).
+        self.assertFalse(bool((right_strip == 255).all(axis=2).any()),
+                         "a solid Kinect (255) tile must NOT appear")
+
+    def test_off_webcam_shows_placeholder_not_kinect(self):
+        # B1: a slot whose webcam won't open → a dim 'off' placeholder tile, NOT
+        # the Kinect frame. The reader returns None for that slot.
+        np = _np()
+        color = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
+                               return_value=color), \
+                mock.patch.object(self.bc._kinect_bridge, "get_bodies",
+                                  return_value=[]), \
+                mock.patch.object(self.bc, "_read_side_tile_webcams",
+                                  return_value={"left": None, "right": None}):
+            out = self.bc._compose_kinect_preview(now=10.0)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.shape, color.shape)
+        # The placeholder is a near-black panel (value 28) with grey text; it is
+        # NOT a bright Kinect-ish frame. Its max stays low (text grey ~140).
+        ph = self.bc._placeholder_tile("Left webcam")
+        self.assertLessEqual(int(ph.max()), 145)
+        self.assertGreaterEqual(int(ph.min()), 0)
 
     def test_does_not_mutate_bridge_frame_buffer(self):
         # The compose path must copy the bridge's color frame before drawing.
@@ -152,8 +208,8 @@ class ComposeKinectPreviewTests(MonolithGlobalsTestCase):
                                                             "neck": (0.0, 0.7, 2.0, 2)}}]), \
                 mock.patch.object(self.bc._kinect_bridge, "get_color_space_mapper",
                                   return_value=lambda x, y, z: (960, 540)), \
-                mock.patch.object(self.bc, "_resolve_webcam_indices_by_name",
-                                  return_value={}):
+                mock.patch.object(self.bc, "_read_side_tile_webcams",
+                                  return_value={"left": None, "right": None}):
             self.bc._compose_kinect_preview(now=10.0)
         # The original frame the bridge handed out is untouched.
         self.assertEqual(int(color.max()), 0)
@@ -279,6 +335,232 @@ class ResolveWebcamNamesTests(MonolithGlobalsTestCase):
             got = self.bc._resolve_webcam_indices_by_name()
         self.assertEqual(got, {})
         self.assertTrue(self.bc._kinect_preview_webcam_resolved[0])
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  B1 — the side tiles are the REAL WEBCAMS, captured directly (NOT the Kinect)
+# ══════════════════════════════════════════════════════════════════════════
+@requires_monolith
+class SideTileWebcamReadTests(MonolithGlobalsTestCase):
+    def setUp(self):
+        # Start every test with no held tile handles + fresh throttle clocks.
+        self.bc._release_side_tile_webcams()
+        self.addCleanup(self.bc._release_side_tile_webcams)
+
+    class _FakeCap:
+        """A stand-in cv2.VideoCapture: yields a solid frame per read()."""
+        def __init__(self, value):
+            self._np = __import__("numpy")
+            self._value = value
+            self.released = False
+
+        def read(self):
+            return True, self._np.full((480, 640, 3), self._value,
+                                       dtype=self._np.uint8)
+
+        def release(self):
+            self.released = True
+
+    def test_reads_the_named_webcam_indices_not_the_kinect(self):
+        # 'left'→idx 5, 'right'→idx 6 (resolved by DirectShow NAME). The reader
+        # must open EXACTLY those indices — the webcams, never the Kinect frame.
+        opened = []
+
+        def _fake_open(idx):
+            opened.append(idx)
+            return self._FakeCap(100 + idx)
+
+        with mock.patch.object(self.bc, "_resolve_webcam_indices_by_name",
+                               return_value={"left": 5, "right": 6}), \
+                mock.patch.object(self.bc, "_open_tile_capture", _fake_open):
+            out = self.bc._read_side_tile_webcams(now=1000.0)
+        self.assertEqual(sorted(opened), [5, 6])           # opened the webcams
+        self.assertIsNotNone(out["left"])
+        self.assertIsNotNone(out["right"])
+        # The frames are the webcam values (105 / 106), never a Kinect frame.
+        self.assertEqual(int(out["left"].mean()), 105)
+        self.assertEqual(int(out["right"].mean()), 106)
+
+    def test_unresolved_name_yields_none_for_placeholder(self):
+        # No 'right' webcam name resolved → that slot is None (→ placeholder), and
+        # NEVER falls back to the Kinect cache.
+        with mock.patch.object(self.bc, "_resolve_webcam_indices_by_name",
+                               return_value={"left": 5}), \
+                mock.patch.object(self.bc, "_open_tile_capture",
+                                  lambda idx: self._FakeCap(120)):
+            out = self.bc._read_side_tile_webcams(now=2000.0)
+        self.assertIsNotNone(out["left"])
+        self.assertIsNone(out["right"])                    # → placeholder
+
+    def test_open_failure_yields_none_for_placeholder(self):
+        # The webcam won't open (off / covered / locked) → None → placeholder.
+        with mock.patch.object(self.bc, "_resolve_webcam_indices_by_name",
+                               return_value={"left": 5, "right": 6}), \
+                mock.patch.object(self.bc, "_open_tile_capture",
+                                  lambda idx: None):
+            out = self.bc._read_side_tile_webcams(now=3000.0)
+        self.assertIsNone(out["left"])
+        self.assertIsNone(out["right"])
+
+    def test_throttle_reuses_cached_frame_between_reads(self):
+        # A second call within the read interval must NOT re-open the device —
+        # it returns the cached frame (low-rate capture).
+        calls = {"n": 0}
+
+        def _fake_open(idx):
+            calls["n"] += 1
+            return self._FakeCap(130)
+
+        with mock.patch.object(self.bc, "_resolve_webcam_indices_by_name",
+                               return_value={"left": 5}), \
+                mock.patch.object(self.bc, "_open_tile_capture", _fake_open):
+            self.bc._read_side_tile_webcams(now=4000.0)
+            opens_after_first = calls["n"]
+            # Immediately again (same now) → cached, no new open/read.
+            out = self.bc._read_side_tile_webcams(now=4000.0)
+        self.assertEqual(calls["n"], opens_after_first)    # no re-open
+        self.assertIsNotNone(out["left"])
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  B2 — the air-mouse hand circle: BLUE engaged / ORANGE closed / grey idle
+# ══════════════════════════════════════════════════════════════════════════
+@requires_monolith
+class HandCircleDrawTests(MonolithGlobalsTestCase):
+    def _inject_air_mouse_state(self, engaged, grip):
+        """Install a fake skill_kinect_air_mouse exposing the state getter +
+        colour helper the monolith reads."""
+        import sys
+        from skills import kinect_air_mouse as real  # the real pure helpers
+        sk = types.ModuleType("skill_kinect_air_mouse")
+        sk.get_air_mouse_state = lambda: {"engaged": engaged, "grip": grip}
+        sk.hand_circle_color_for = real.hand_circle_color_for
+        sk.HAND_CIRCLE_COLOR_ENGAGED = real.HAND_CIRCLE_COLOR_ENGAGED
+        sk.HAND_CIRCLE_COLOR_CLOSED = real.HAND_CIRCLE_COLOR_CLOSED
+        sk.HAND_CIRCLE_COLOR_IDLE = real.HAND_CIRCLE_COLOR_IDLE
+        old = sys.modules.get("skill_kinect_air_mouse")
+        sys.modules["skill_kinect_air_mouse"] = sk
+        self.addCleanup(
+            lambda: sys.modules.__setitem__("skill_kinect_air_mouse", old)
+            if old is not None else sys.modules.pop("skill_kinect_air_mouse", None))
+        return sk
+
+    def _dominant_circle_color(self, before, after):
+        """Return the BGR mean of the pixels that CHANGED between two frames —
+        i.e. the colour the circle painted."""
+        np = _np()
+        diff = np.any(after != before, axis=2)
+        if not diff.any():
+            return None
+        changed = after[diff]
+        return tuple(int(round(c)) for c in changed.mean(axis=0))  # (B, G, R)
+
+    def test_engaged_open_draws_blue_ring(self):
+        np = _np()
+        self._inject_air_mouse_state(engaged=True, grip="open")
+        color = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        points = {"hand_right": (960, 540)}
+        before = color.copy()
+        drew = self.bc._draw_hand_circle_on_color(color, points)
+        self.assertTrue(drew)
+        b, g, r = self._dominant_circle_color(before, color)
+        self.assertGreater(b, r)            # BGR blue: B channel dominates
+        self.assertGreater(b, g - 1)
+
+    def test_closed_draws_orange_ring(self):
+        np = _np()
+        self._inject_air_mouse_state(engaged=True, grip="closed")
+        color = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        points = {"hand_right": (960, 540)}
+        before = color.copy()
+        drew = self.bc._draw_hand_circle_on_color(color, points)
+        self.assertTrue(drew)
+        b, g, r = self._dominant_circle_color(before, color)
+        self.assertGreater(r, b)            # BGR orange/amber: R dominates B
+
+    def test_blue_and_orange_are_distinct(self):
+        np = _np()
+        pts = {"hand_right": (960, 540)}
+        c1 = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        self._inject_air_mouse_state(engaged=True, grip="open")
+        b1 = c1.copy(); self.bc._draw_hand_circle_on_color(c1, pts)
+        engaged_col = self._dominant_circle_color(b1, c1)
+        c2 = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        self._inject_air_mouse_state(engaged=True, grip="closed")
+        b2 = c2.copy(); self.bc._draw_hand_circle_on_color(c2, pts)
+        closed_col = self._dominant_circle_color(b2, c2)
+        self.assertNotEqual(engaged_col, closed_col)
+
+    def test_no_hand_point_draws_nothing(self):
+        np = _np()
+        self._inject_air_mouse_state(engaged=True, grip="open")
+        color = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        # No hand/wrist joint among the points → no circle.
+        drew = self.bc._draw_hand_circle_on_color(color, {"head": (10, 10)})
+        self.assertFalse(drew)
+        self.assertEqual(int(color.max()), 0)
+
+    def test_disengaged_still_draws_only_faint_grey(self):
+        np = _np()
+        self._inject_air_mouse_state(engaged=False, grip="open")
+        color = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        points = {"hand_right": (960, 540)}
+        before = color.copy()
+        drew = self.bc._draw_hand_circle_on_color(color, points)
+        # Idle hint is grey: roughly equal channels where it painted.
+        if drew:
+            b, g, r = self._dominant_circle_color(before, color)
+            self.assertAlmostEqual(b, r, delta=25)   # grey ≈ equal channels
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  B3 — the gesture pop badge: appears on a fresh gesture, gone once it fades
+# ══════════════════════════════════════════════════════════════════════════
+@requires_monolith
+class GesturePopDrawTests(MonolithGlobalsTestCase):
+    def _inject_gesture_state(self, gesture, label, ts):
+        import sys
+        from skills import kinect_gestures as real
+        sk = types.ModuleType("skill_kinect_gestures")
+        sk.get_last_gesture = lambda: {"gesture": gesture, "label": label,
+                                       "ts": ts}
+        sk.gesture_pop_alpha = real.gesture_pop_alpha
+        sk.GESTURE_POP_TTL_SECONDS = real.GESTURE_POP_TTL_SECONDS
+        old = sys.modules.get("skill_kinect_gestures")
+        sys.modules["skill_kinect_gestures"] = sk
+        self.addCleanup(
+            lambda: sys.modules.__setitem__("skill_kinect_gestures", old)
+            if old is not None else sys.modules.pop("skill_kinect_gestures", None))
+        return sk
+
+    def test_fresh_gesture_draws_a_badge(self):
+        import time as _t
+        np = _np()
+        # Fire 'just now' (monotonic) so the badge is at full opacity.
+        self._inject_gesture_state("wave", "WAVE", _t.monotonic())
+        color = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        drew = self.bc._draw_gesture_pop_on_color(color, now=_t.monotonic())
+        self.assertTrue(drew)
+        self.assertGreater(int(color.max()), 0)     # the amber badge was drawn
+
+    def test_stale_gesture_draws_nothing(self):
+        import time as _t
+        np = _np()
+        # Fired well beyond the TTL → fully faded → nothing drawn.
+        self._inject_gesture_state("wave", "WAVE", _t.monotonic() - 10.0)
+        color = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        drew = self.bc._draw_gesture_pop_on_color(color, now=_t.monotonic())
+        self.assertFalse(drew)
+        self.assertEqual(int(color.max()), 0)
+
+    def test_no_gesture_yet_draws_nothing(self):
+        import time as _t
+        np = _np()
+        self._inject_gesture_state(None, "", 0.0)
+        color = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        drew = self.bc._draw_gesture_pop_on_color(color, now=_t.monotonic())
+        self.assertFalse(drew)
+        self.assertEqual(int(color.max()), 0)
 
 
 if __name__ == "__main__":

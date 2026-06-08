@@ -3585,11 +3585,71 @@ def _hud_kinect_skeleton_overlay_enabled() -> bool:
         return False
 
 
+def _air_mouse_state_for_preview() -> dict:
+    """The live air-mouse {'engaged': bool, 'grip': str} from the loaded
+    air-mouse skill, for the preview hand circle (B2). Reads the skill's
+    thread-safe getter via sys.modules; returns a disengaged default when the
+    skill isn't loaded / readable. NEVER raises."""
+    try:
+        sk = sys.modules.get("skill_kinect_air_mouse")
+        getter = getattr(sk, "get_air_mouse_state", None) if sk else None
+        if callable(getter):
+            st = getter()
+            if isinstance(st, dict):
+                return st
+    except Exception:
+        pass
+    return {"engaged": False, "grip": "open"}
+
+
+def _draw_hand_circle_on_color(color_bgr: "np.ndarray",
+                               points: dict) -> bool:
+    """Draw the translucent air-mouse hand circle around the controlling hand
+    joint (B2), coloured by the LIVE air-mouse state: BLUE when engaged (cursor
+    active / open hand), ORANGE when the hand is closed (left-click/drag), faint
+    GREY when disengaged. Returns True iff a circle was drawn. NEVER raises.
+
+    Geometry + colour come from the pure helpers (audio.kinect_skeleton +
+    skills/kinect_air_mouse.hand_circle_color_for) so the preview and the unit
+    tests share one contract; this is only the cv2 alpha-blended stroking."""
+    try:
+        from audio import kinect_skeleton as _ks
+    except Exception:
+        return False
+    pt = _ks.controlling_hand_point(points)
+    if pt is None:
+        return False
+    state = _air_mouse_state_for_preview()
+    engaged = bool(state.get("engaged"))
+    grip = str(state.get("grip", "open"))
+    # Disengaged → only a faint idle hint; engaged → a bold blue/orange ring.
+    sk = sys.modules.get("skill_kinect_air_mouse")
+    color_fn = getattr(sk, "hand_circle_color_for", None) if sk else None
+    if callable(color_fn):
+        color = color_fn(engaged, grip)
+    else:   # pragma: no cover - skill always loaded in the live HUD
+        color = (255, 160, 32) if engaged else (150, 150, 150)
+    alpha = 0.55 if engaged else 0.22       # translucent; fainter when idle
+    radius = _ks.hand_circle_radius(color_bgr.shape[1])
+    try:
+        cx, cy = int(pt[0]), int(pt[1])
+        overlay = color_bgr.copy()
+        # Filled translucent disc + a crisper ring so it reads at thumbnail size.
+        cv2.circle(overlay, (cx, cy), radius, color, -1, lineType=cv2.LINE_AA)
+        cv2.addWeighted(overlay, alpha, color_bgr, 1.0 - alpha, 0.0, color_bgr)
+        cv2.circle(color_bgr, (cx, cy), radius, color,
+                   3 if engaged else 2, lineType=cv2.LINE_AA)
+    except Exception:
+        return False
+    return True
+
+
 def _draw_skeleton_on_color(color_bgr: "np.ndarray", bodies: list) -> int:
     """Draw the tracked skeleton(s) over a Kinect COLOR frame IN PLACE: a line
-    along every bone whose endpoints projected, and a filled dot at every
-    projected joint. Returns the number of bodies actually drawn (>=1 means the
-    body stream is live — the owner's diagnostic).
+    along every bone whose endpoints projected, a filled dot at every projected
+    joint, and (B2) the translucent air-mouse hand circle around the controlling
+    hand, coloured by the live air-mouse state. Returns the number of bodies
+    actually drawn (>=1 means the body stream is live — the owner's diagnostic).
 
     Projection uses audio.kinect_skeleton.project_body_joints fed the bridge's
     color-space mapper (kinect_bridge.get_color_space_mapper). All pykinect2
@@ -3608,6 +3668,7 @@ def _draw_skeleton_on_color(color_bgr: "np.ndarray", bodies: list) -> int:
     # so they read on a 240px-wide downscaled preview.
     bone_col = (255, 201, 76)     # BGR of #4cc9ff-ish (cyan)
     joint_col = (160, 231, 255)   # BGR brighter cyan/white
+    first_points = None
     for body in bodies:
         try:
             joints = body.get("joints") if isinstance(body, dict) else None
@@ -3616,6 +3677,8 @@ def _draw_skeleton_on_color(color_bgr: "np.ndarray", bodies: list) -> int:
             points = _ks.project_body_joints(joints, mapper)
             if not points:
                 continue
+            if first_points is None:
+                first_points = points     # hand circle tracks the nearest body
             for (x1, y1), (x2, y2) in _ks.iter_bone_segments(points):
                 cv2.line(color_bgr, (x1, y1), (x2, y2), bone_col, 4,
                          lineType=cv2.LINE_AA)
@@ -3625,19 +3688,260 @@ def _draw_skeleton_on_color(color_bgr: "np.ndarray", bodies: list) -> int:
             drawn += 1
         except Exception:
             continue
+    # B2: the air-mouse hand circle, on the FIRST (nearest) drawn body's hand.
+    if first_points is not None:
+        try:
+            _draw_hand_circle_on_color(color_bgr, first_points)
+        except Exception:
+            pass
     return drawn
+
+
+def _last_gesture_for_preview() -> dict:
+    """The last-fired-gesture {'gesture','label','ts'} from the loaded gesture
+    skill, for the preview pop badge (B3). Reads the skill's thread-safe getter
+    via sys.modules; returns an empty default when the skill isn't loaded.
+    NEVER raises."""
+    try:
+        sk = sys.modules.get("skill_kinect_gestures")
+        getter = getattr(sk, "get_last_gesture", None) if sk else None
+        if callable(getter):
+            st = getter()
+            if isinstance(st, dict):
+                return st
+    except Exception:
+        pass
+    return {"gesture": None, "label": "", "ts": 0.0}
+
+
+def _draw_gesture_pop_on_color(color_bgr: "np.ndarray", now: float) -> bool:
+    """Draw a brief glowing labelled badge near the top of the Kinect color frame
+    when a gesture just fired (B3), fading out over ~1 s. Returns True iff a badge
+    was drawn. NEVER raises.
+
+    The gesture name + fired-timestamp + the fade curve come from the gesture
+    skill's pure helpers (get_last_gesture / gesture_pop_alpha) so the preview and
+    the test share one fade contract. The badge timestamp is time.monotonic, so
+    `now` here MUST also be monotonic for the fade to be correct."""
+    try:
+        sk = sys.modules.get("skill_kinect_gestures")
+        if sk is None:
+            return False
+        state = _last_gesture_for_preview()
+        label = str(state.get("label") or "")
+        fired_at = float(state.get("ts") or 0.0)
+        if not label or fired_at <= 0.0:
+            return False
+        alpha_fn = getattr(sk, "gesture_pop_alpha", None)
+        if not callable(alpha_fn):
+            return False
+        # `now` is monotonic to match the skill's fired-at clock; if the caller
+        # passed a wall-clock `now` the fade still degrades gracefully (a stale
+        # badge just reads alpha 0 once it ages out).
+        alpha = float(alpha_fn(time.monotonic(), fired_at))
+        if alpha <= 0.0:
+            return False
+    except Exception:
+        return False
+    try:
+        from audio import kinect_skeleton as _ks
+        h, w = color_bgr.shape[:2]
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = max(0.8, w / 1280.0)            # scale text to the frame
+        thick = max(2, int(round(scale * 2)))
+        (tw, th), base_ln = cv2.getTextSize(label, font, scale, thick)
+        pad = int(round(12 * scale))
+        # Centred horizontally, near the top so it doesn't cover the torso.
+        bx = max(0, (w - tw) // 2 - pad)
+        by = max(0, int(round(h * 0.06)))
+        bw = tw + 2 * pad
+        bh = th + base_ln + 2 * pad
+        # A glowing amber badge: translucent dark plate + amber border + text,
+        # all alpha-scaled by the fade so it dissolves out.
+        plate = (20, 20, 20)
+        amber = (40, 200, 255)                  # BGR ≈ glowing amber/yellow
+        overlay = color_bgr.copy()
+        cv2.rectangle(overlay, (bx, by), (bx + bw, by + bh), plate, -1)
+        cv2.rectangle(overlay, (bx, by), (bx + bw, by + bh), amber,
+                      max(2, thick), lineType=cv2.LINE_AA)
+        cv2.putText(overlay, label, (bx + pad, by + pad + th), font, scale,
+                    amber, thick, lineType=cv2.LINE_AA)
+        cv2.addWeighted(overlay, alpha, color_bgr, 1.0 - alpha, 0.0, color_bgr)
+    except Exception:
+        return False
+    return True
+
+
+# ── B1: REAL side-tile webcams (own lightweight capture, NOT the Kinect) ─────
+# The two side tiles must show the actual USB WEBCAMS — 'Fullhan Webcam' (LEFT)
+# and 'USB 2.0 Camera' (RIGHT) — NOT a duplicate of the Kinect. The owner's rig
+# runs face-tracking ON the Kinect, so _camera_latest_frame is the KINECT frame;
+# reusing it (the old behaviour) made both side tiles mirror the Kinect. Instead
+# we open those two webcams DIRECTLY here at a low rate, cache the last good
+# frame per slot, and hand them to the compositor. If a webcam can't open (off /
+# covered / unplugged) the slot yields None and the compositor draws a dim
+# 'off' PLACEHOLDER — never the Kinect frame.
+#
+# Persistent VideoCapture handles (opened lazily, reused) read at ~4 Hz: that's
+# plenty for a context thumbnail and avoids DirectShow's expensive per-read
+# open/close churn. All open/read/release go through _camera_io_lock (the same
+# heap-corruption guard the face-tracker uses). Tiny labels resolve the tiles.
+_KINECT_PREVIEW_TILE_LABELS = {
+    "left":  "Left webcam",      # 'Fullhan Webcam'  → LEFT monitor
+    "right": "Right webcam",     # 'USB 2.0 Camera'  → RIGHT monitor
+}
+# How often a side-tile webcam is actually re-read (seconds). A thumbnail doesn't
+# need full frame-rate; ~4 Hz keeps the tiles live without loading the USB bus.
+_KINECT_PREVIEW_TILE_READ_INTERVAL = 0.25
+# Persistent per-slot capture handles + last good frame + last-read timestamps.
+# slot → cv2.VideoCapture | None ; slot → frame | None ; slot → ts.
+_kinect_tile_caps: dict = {"left": None, "right": None}
+_kinect_tile_frames: dict = {"left": None, "right": None}
+_kinect_tile_last_read: dict = {"left": 0.0, "right": 0.0}
+_kinect_tile_lock = threading.Lock()
+# Tracks whether the side-tile webcams are currently held open, so the preview
+# writer releases them exactly once on the overlay's on→off transition.
+_kinect_preview_tiles_open = [False]
+
+
+def _open_tile_capture(idx: int) -> "cv2.VideoCapture | None":
+    """Open a side-tile webcam at `idx` (DirectShow), modest 640×480 since it's
+    only a thumbnail. Returns an opened capture or None. Serialised on
+    _camera_io_lock (DirectShow heap-corrupts on overlapping open/release).
+    NEVER raises."""
+    try:
+        with _camera_io_lock:
+            cap = cv2.VideoCapture(int(idx), cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                return None
+            try:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+            return cap
+    except Exception:
+        return None
+
+
+def _read_side_tile_webcams(now: float) -> dict:
+    """Read the two named side-tile WEBCAMS directly (throttled + cached) and
+    return {'left': frame|None, 'right': frame|None}. A slot is None when its
+    webcam name didn't resolve, the device won't open, or a read failed — the
+    compositor then draws a dim placeholder for that slot (NEVER the Kinect).
+
+    Opens persistent handles lazily and re-reads each only every
+    _KINECT_PREVIEW_TILE_READ_INTERVAL seconds, returning the cached frame in
+    between. A handle that starts failing is released so the next call re-opens
+    it (so re-plugging / un-covering a webcam recovers without a restart).
+    NEVER raises."""
+    name_idx = _resolve_webcam_indices_by_name()
+    out: dict = {"left": None, "right": None}
+    with _kinect_tile_lock:
+        for slot in ("left", "right"):
+            idx = name_idx.get(slot)
+            if idx is None:
+                # No device of that name → no real webcam to show; drop any stale
+                # handle/frame so the slot becomes a placeholder.
+                cap = _kinect_tile_caps.get(slot)
+                if cap is not None:
+                    try:
+                        with _camera_io_lock:
+                            cap.release()
+                    except Exception:
+                        pass
+                    _kinect_tile_caps[slot] = None
+                _kinect_tile_frames[slot] = None
+                continue
+            # Throttle: reuse the cached frame between reads.
+            if (now - _kinect_tile_last_read.get(slot, 0.0)
+                    < _KINECT_PREVIEW_TILE_READ_INTERVAL):
+                out[slot] = _kinect_tile_frames.get(slot)
+                continue
+            cap = _kinect_tile_caps.get(slot)
+            if cap is None:
+                cap = _open_tile_capture(idx)
+                _kinect_tile_caps[slot] = cap
+            if cap is None:
+                _kinect_tile_frames[slot] = None      # → placeholder
+                _kinect_tile_last_read[slot] = now
+                continue
+            ret, frame = False, None
+            try:
+                with _camera_io_lock:
+                    ret, frame = cap.read()
+            except Exception:
+                ret, frame = False, None
+            _kinect_tile_last_read[slot] = now
+            if ret and frame is not None:
+                _kinect_tile_frames[slot] = frame
+                out[slot] = frame
+            else:
+                # Read failed — release so the next tick re-opens; placeholder now.
+                try:
+                    with _camera_io_lock:
+                        cap.release()
+                except Exception:
+                    pass
+                _kinect_tile_caps[slot] = None
+                _kinect_tile_frames[slot] = None
+    return out
+
+
+def _release_side_tile_webcams() -> None:
+    """Release both persistent side-tile capture handles (best-effort). Called
+    when the overlay turns off so the webcams aren't held open needlessly."""
+    with _kinect_tile_lock:
+        for slot in ("left", "right"):
+            cap = _kinect_tile_caps.get(slot)
+            if cap is not None:
+                try:
+                    with _camera_io_lock:
+                        cap.release()
+                except Exception:
+                    pass
+            _kinect_tile_caps[slot] = None
+            _kinect_tile_frames[slot] = None
+            _kinect_tile_last_read[slot] = 0.0
+
+
+def _placeholder_tile(label: str, w: int = 320, h: int = 240) -> "np.ndarray":
+    """A dim placeholder tile for a side webcam that's off/covered/unavailable —
+    a dark panel with a centred '<label> — off' caption. Drawn INSTEAD of the
+    Kinect frame so the off-state is honest. Pure cv2/numpy."""
+    tile = np.full((h, w, 3), 28, dtype=np.uint8)   # near-black panel
+    text = f"{label} - off"
+    try:
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.5
+        thick = 1
+        (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
+        tx = max(4, (w - tw) // 2)
+        ty = (h + th) // 2
+        cv2.putText(tile, text, (tx, ty), font, scale, (140, 140, 140), thick,
+                    lineType=cv2.LINE_AA)
+    except Exception:
+        pass
+    return tile
 
 
 def _compose_kinect_preview(now: float) -> "np.ndarray | None":
     """Build the composite preview image: the Kinect COLOR frame with the live
-    skeleton drawn over it, with the two webcam frames stacked as small tiles
-    down the right edge. Returns the BGR image to hand to the preview writer, or
-    None when no Kinect color frame is available (caller then leaves the plain
-    webcam mirror in place). NEVER raises.
+    skeleton + air-mouse hand circle + gesture pop drawn over it, with the two
+    real WEBCAM frames stacked as small tiles down the right edge. Returns the
+    BGR image to hand to the preview writer, or None when no Kinect color frame
+    is available (caller then leaves the plain webcam mirror in place). NEVER
+    raises.
 
-    Webcam tiles reuse frames the face-tracking loop ALREADY captured + cached in
-    _camera_latest_frame (so no extra device is opened); they're keyed by the
-    pygrabber name→index map, falling back to the configured CAMERAS indices."""
+    The side tiles are the actual USB webcams ('Fullhan Webcam' = LEFT, 'USB 2.0
+    Camera' = RIGHT), captured directly + throttled by _read_side_tile_webcams —
+    NOT a duplicate of the Kinect. A webcam that's off/covered shows a dim
+    placeholder tile, never the Kinect frame."""
     try:
         base = _kinect_bridge.get_color_bgr(require_new=False)
     except Exception:
@@ -3652,30 +3956,21 @@ def _compose_kinect_preview(now: float) -> "np.ndarray | None":
         except Exception:
             bodies = []
         _draw_skeleton_on_color(base, bodies)
+        # B3: a brief glowing gesture-name badge when a gesture just fired.
+        _draw_gesture_pop_on_color(base, now)
 
-        # Gather the two webcam frames (already-cached; name-resolved).
-        name_idx = _resolve_webcam_indices_by_name()
-        # Fall back to the configured CAMERAS indices when a name didn't resolve
-        # (e.g. pygrabber absent): primary entry → 'left', the first non-primary
-        # → 'right', mirroring the owner's left/right monitor webcams.
-        fallback = {}
-        try:
-            prim = [c["index"] for c in CAMERAS if c.get("primary")]
-            sides = [c["index"] for c in CAMERAS if not c.get("primary")]
-            if prim:
-                fallback["left"] = prim[0]
-            if sides:
-                fallback["right"] = sides[0]
-        except Exception:
-            fallback = {}
-        with _camera_state_lock:
-            cached = dict(_camera_latest_frame)
+        # B1: the two REAL side-tile webcams (own throttled capture; NOT the
+        # Kinect). A slot with no live frame → a dim 'off' placeholder, never the
+        # Kinect. Tiles are ordered LEFT then RIGHT down the right edge.
+        webcams = _read_side_tile_webcams(now)
         tiles = []
         for slot in ("left", "right"):
-            idx = name_idx.get(slot, fallback.get(slot))
-            frame = cached.get(idx) if idx is not None else None
+            frame = webcams.get(slot)
             if frame is not None:
                 tiles.append(frame)
+            else:
+                tiles.append(_placeholder_tile(
+                    _KINECT_PREVIEW_TILE_LABELS.get(slot, slot.title())))
         return _composite_preview_image(base, tiles)
     except Exception:
         return None
@@ -3730,10 +4025,17 @@ def _hud_kinect_preview_write(now: float) -> bool:
     same throttle + atomic-write contract as _hud_camera_preview_write (it reuses
     that writer with the composed frame)."""
     if not _hud_kinect_skeleton_overlay_enabled():
+        # Overlay just went off (or never on) — release the side-tile webcam
+        # handles so they're not held open while unused. Only acts on the
+        # on→off transition (the flag guards against repeated releases).
+        if _kinect_preview_tiles_open[0]:
+            _release_side_tile_webcams()
+            _kinect_preview_tiles_open[0] = False
         return False
     composed = _compose_kinect_preview(now)
     if composed is None:
         return False
+    _kinect_preview_tiles_open[0] = True
     return _hud_camera_preview_write(composed, now)
 
 

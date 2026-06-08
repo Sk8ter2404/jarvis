@@ -215,3 +215,63 @@ def iter_bone_segments(
         if pa is not None and pb is not None:
             segs.append((pa, pb))
     return segs
+
+
+# ── PREVIEW FEEDBACK geometry (B2 hand circle / B3 gesture pop) ───────────────
+# Pure, hardware-free helpers shared by bobert_companion's compositor and the
+# unit tests, so the geometry contract is asserted against the same source the
+# drawer uses. The cv2 stroking itself lives in the monolith; here we only pick
+# points / compute sizes + alpha-blended colours.
+
+# Joint-name priority for the air-mouse "controlling hand": the RIGHT hand drives
+# the cursor by default (skills/kinect_air_mouse._hand_sample), falling back to
+# the LEFT hand, then the wrists if a hand tip dropped to untracked.
+_CONTROLLING_HAND_JOINTS = ("hand_right", "hand_left", "wrist_right", "wrist_left")
+
+
+def controlling_hand_point(
+    points: dict[str, tuple[int, int]]
+) -> "tuple[int, int] | None":
+    """The projected pixel of the air-mouse controlling hand, or None.
+
+    Prefers ``hand_right`` (the default cursor hand), then ``hand_left``, then the
+    wrists — matching the air-mouse's own hand selection — returning the first
+    that projected this frame. The compositor draws the engaged/closed colour
+    circle here. Pure; None when no hand/wrist joint projected (→ no circle)."""
+    if not isinstance(points, dict):
+        return None
+    for name in _CONTROLLING_HAND_JOINTS:
+        pt = points.get(name)
+        if pt is not None:
+            return pt
+    return None
+
+
+def hand_circle_radius(width: int = COLOR_W) -> int:
+    """Radius (px) of the hand-feedback circle, scaled to the color-frame width so
+    it reads the same after the preview is downscaled. ~2.2 % of width (≈42 px on
+    1920), floored so it never vanishes. Pure."""
+    try:
+        return max(12, int(round(float(width) * 0.022)))
+    except (TypeError, ValueError):
+        return 42
+
+
+def blend_color(
+    base_bgr: tuple[int, int, int],
+    over_bgr: tuple[int, int, int],
+    alpha: float,
+) -> tuple[int, int, int]:
+    """Alpha-composite ``over_bgr`` onto ``base_bgr`` at ``alpha`` (0..1), the
+    translucent look the hand circle + gesture badge use. ``alpha`` 0 → base
+    unchanged, 1 → fully ``over``. Returns an int BGR triple, clamped 0..255.
+    Pure so the fade/translucency is unit-tested without cv2."""
+    try:
+        a = max(0.0, min(1.0, float(alpha)))
+    except (TypeError, ValueError):
+        a = 0.0
+    out = []
+    for b, o in zip(base_bgr, over_bgr):
+        v = int(round(float(b) * (1.0 - a) + float(o) * a))
+        out.append(max(0, min(255, v)))
+    return (out[0], out[1], out[2])

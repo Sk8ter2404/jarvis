@@ -176,5 +176,57 @@ class BoneSegmentTests(unittest.TestCase):
             seen.add(key)
 
 
+# ── B2 preview-feedback geometry: controlling-hand pick, radius, alpha blend ──
+class ControllingHandPointTests(unittest.TestCase):
+    def test_prefers_right_hand(self):
+        points = {"hand_right": (100, 200), "hand_left": (300, 400)}
+        self.assertEqual(ks.controlling_hand_point(points), (100, 200))
+
+    def test_falls_back_to_left_then_wrist(self):
+        # No right hand → left hand.
+        self.assertEqual(
+            ks.controlling_hand_point({"hand_left": (300, 400)}), (300, 400))
+        # No hand at all → a wrist (hand tip dropped to untracked).
+        self.assertEqual(
+            ks.controlling_hand_point({"wrist_right": (50, 60)}), (50, 60))
+
+    def test_none_when_no_hand_or_wrist_present(self):
+        # A body with only torso joints → no hand circle.
+        self.assertIsNone(ks.controlling_hand_point({"head": (10, 10),
+                                                     "spine_mid": (10, 50)}))
+        self.assertIsNone(ks.controlling_hand_point({}))
+        self.assertIsNone(ks.controlling_hand_point(None))
+
+
+class HandCircleRadiusTests(unittest.TestCase):
+    def test_scales_with_width_and_has_a_floor(self):
+        big = ks.hand_circle_radius(1920)
+        small = ks.hand_circle_radius(640)
+        self.assertGreater(big, small)            # scales with frame width
+        self.assertGreaterEqual(small, 12)        # never vanishes
+        # Bad input → the safe default, never a raise.
+        self.assertEqual(ks.hand_circle_radius("nope"), 42)
+
+
+class BlendColorTests(unittest.TestCase):
+    def test_alpha_zero_keeps_base(self):
+        self.assertEqual(ks.blend_color((10, 20, 30), (200, 200, 200), 0.0),
+                         (10, 20, 30))
+
+    def test_alpha_one_is_full_over(self):
+        self.assertEqual(ks.blend_color((10, 20, 30), (200, 100, 50), 1.0),
+                         (200, 100, 50))
+
+    def test_half_blend_is_midpoint(self):
+        out = ks.blend_color((0, 0, 0), (100, 200, 40), 0.5)
+        self.assertEqual(out, (50, 100, 20))
+
+    def test_clamps_and_tolerates_bad_alpha(self):
+        # Out-of-range alpha is clamped; channels stay within 0..255.
+        out = ks.blend_color((0, 0, 0), (300, 300, 300), 5.0)
+        for ch in out:
+            self.assertTrue(0 <= ch <= 255)
+
+
 if __name__ == "__main__":
     unittest.main()
