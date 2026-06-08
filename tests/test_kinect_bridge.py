@@ -766,6 +766,251 @@ class CloseTests(_BridgeBase):
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# PART B: stale-runtime guard (body stream can't go quiet once warmed)
+# ─────────────────────────────────────────────────────────────────────────
+class BodyStaleGuardTests(_BridgeBase):
+    def setUp(self):
+        super().setUp()
+        # Isolate the staleness clock between tests.
+        self._orig_last = kb._last_body_frame_at[0]
+        self.addCleanup(lambda: kb._last_body_frame_at.__setitem__(0, self._orig_last))
+
+    def test_not_stale_when_no_runtime_open(self):
+        kb._runtime[0] = None
+        kb._last_body_frame_at[0] = 0.0
+        # Nothing to reset when the runtime isn't even open.
+        self.assertFalse(kb._body_frame_is_stale(now=10_000.0))
+
+    def test_not_stale_before_window_elapses(self):
+        kb._runtime[0] = object()
+        kb._last_body_frame_at[0] = 100.0
+        # Within BODY_STALE_RESET_SEC → not stale.
+        self.assertFalse(
+            kb._body_frame_is_stale(now=100.0 + kb.BODY_STALE_RESET_SEC - 0.5))
+
+    def test_stale_after_window_elapses(self):
+        kb._runtime[0] = object()
+        kb._last_body_frame_at[0] = 100.0
+        self.assertTrue(
+            kb._body_frame_is_stale(now=100.0 + kb.BODY_STALE_RESET_SEC + 0.5))
+
+    def test_not_stale_when_clock_unseeded(self):
+        # A runtime open but no frame yet observed (clock 0) must NOT trip — the
+        # reopen window is seeded by the open path, not judged against epoch 0.
+        kb._runtime[0] = object()
+        kb._last_body_frame_at[0] = 0.0
+        self.assertFalse(kb._body_frame_is_stale(now=10_000.0))
+
+    def test_reset_if_body_stale_clears_runtime_and_closes_it(self):
+        rt = _FakeRuntime()
+        _patch_loader(self, rt)
+        self.assertIsNotNone(kb.get_runtime()[0])
+        # Force the clock far into the past so the stream looks stale.
+        kb._last_body_frame_at[0] = 1.0
+        did = kb.reset_if_body_stale(now=1.0 + kb.BODY_STALE_RESET_SEC + 1.0)
+        self.assertTrue(did)
+        self.assertIsNone(kb._runtime[0])   # next get_runtime() will reopen
+        self.assertTrue(rt.closed)          # old handle released
+
+    def test_reset_noop_when_not_stale(self):
+        rt = _FakeRuntime()
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        kb._last_body_frame_at[0] = 1000.0
+        did = kb.reset_if_body_stale(now=1000.5)   # fresh → no reset
+        self.assertFalse(did)
+        self.assertIsNotNone(kb._runtime[0])
+        self.assertFalse(rt.closed)
+
+    def test_reset_reopens_a_live_stream_on_next_get_runtime(self):
+        # End-to-end: a stale reset followed by get_runtime() must reopen (the
+        # whole point — the next open re-binds a live stream).
+        rt1 = _FakeRuntime()
+        _patch_loader(self, rt1)
+        first, _ = kb.get_runtime()
+        kb._last_body_frame_at[0] = 1.0
+        kb.reset_if_body_stale(now=1.0 + kb.BODY_STALE_RESET_SEC + 1.0)
+        self.assertIsNone(kb._runtime[0])
+        second, _ = kb.get_runtime()   # reopens via the patched loader
+        self.assertIsNotNone(second)
+
+    def test_get_bodies_stamps_freshness_on_new_frame(self):
+        # A real consumer read (get_bodies) must advance the staleness clock so a
+        # healthy, actively-read stream never trips the reset.
+        body = _FakeBody(True, {"head": (0, 0.6, 1.8)})
+        _patch_loader(self, _FakeRuntime(bodies=[body]))
+        kb._last_body_frame_at[0] = 0.0
+        kb.get_bodies()
+        self.assertGreater(kb._last_body_frame_at[0], 0.0)
+
+    def test_note_body_frame_seen_uses_injected_now(self):
+        kb.note_body_frame_seen(now=12345.0)
+        self.assertEqual(kb._last_body_frame_at[0], 12345.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# PART B: always-on body-frame pump (keeps the body pipe flowing)
+# ─────────────────────────────────────────────────────────────────────────
+class BodyPumpTests(_BridgeBase):
+    def setUp(self):
+        super().setUp()
+        self._orig_last = kb._last_body_frame_at[0]
+        self.addCleanup(lambda: kb._last_body_frame_at.__setitem__(0, self._orig_last))
+        self.addCleanup(kb.stop_body_pump)
+
+    def test_pump_tick_noop_when_disabled(self):
+        kb._ENABLED = False
+        kb._runtime[0] = object()
+        kb._last_body_frame_at[0] = 0.0
+        kb._pump_tick()   # disabled → does nothing, must not raise
+        self.assertEqual(kb._last_body_frame_at[0], 0.0)
+
+    def test_pump_tick_noop_when_no_runtime(self):
+        kb._runtime[0] = None
+        kb._last_body_frame_at[0] = 0.0
+        kb._pump_tick()   # no open runtime → nothing to pump
+        self.assertEqual(kb._last_body_frame_at[0], 0.0)
+
+    def test_pump_tick_drains_and_stamps_on_new_frame(self):
+        rt = _FakeRuntime(bodies=[_FakeBody(True, {"head": (0, 0.6, 1.8)})])
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        kb._last_body_frame_at[0] = 0.0
+        self.assertTrue(rt.has_new_body_frame())
+        kb._pump_tick()
+        # Pump consumed the frame (readiness cleared) + stamped freshness.
+        self.assertFalse(rt.has_new_body_frame())
+        self.assertGreater(kb._last_body_frame_at[0], 0.0)
+
+    def test_pump_tick_resets_when_stale(self):
+        rt = _FakeRuntime()   # no body frame ready → never re-stamps freshness
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        # Seed the clock in the deep past so the stale reset fires this tick.
+        kb._last_body_frame_at[0] = time_monotonic_minus(kb.BODY_STALE_RESET_SEC + 5.0)
+        kb._pump_tick()
+        self.assertIsNone(kb._runtime[0])   # stale → runtime dropped for reopen
+
+    def test_start_body_pump_singleton_no_double(self):
+        kb._ENABLED = True
+        # Don't actually run the loop thread — capture starts.
+        started = []
+
+        class _FakeThread:
+            def __init__(self, *a, **k):
+                started.append(k.get("name"))
+            def start(self):
+                pass
+            def is_alive(self):
+                return True   # pretend it's running so the 2nd call no-ops
+
+        with mock.patch.object(kb.threading, "Thread", _FakeThread):
+            first = kb.start_body_pump()
+            second = kb.start_body_pump()
+        self.assertTrue(first)         # started a new pump
+        self.assertFalse(second)       # singleton: no second thread
+        self.assertEqual(started, ["kinect-body-pump"])
+
+    def test_start_body_pump_noop_when_disabled(self):
+        kb._ENABLED = False
+        self.assertFalse(kb.start_body_pump())
+
+    def test_set_enabled_true_starts_pump(self):
+        _patch_loader(self, _FakeRuntime())
+        started = {"n": 0}
+        with mock.patch.object(kb, "start_body_pump",
+                               side_effect=lambda: started.__setitem__("n", started["n"] + 1)):
+            kb.set_enabled(True)
+        self.assertEqual(started["n"], 1)
+
+    def test_set_enabled_false_stops_pump(self):
+        stopped = {"n": 0}
+        with mock.patch.object(kb, "stop_body_pump",
+                               side_effect=lambda: stopped.__setitem__("n", stopped["n"] + 1)):
+            kb.set_enabled(False)
+        self.assertGreaterEqual(stopped["n"], 1)
+
+
+def time_monotonic_minus(seconds: float) -> float:
+    """A monotonic timestamp `seconds` in the past (for seeding the stale clock
+    in pump tests that call the real time.monotonic inside _pump_tick)."""
+    import time as _t
+    return _t.monotonic() - seconds
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# PART A: color-space mapper accessor (the skeleton-overlay projection seam)
+# ─────────────────────────────────────────────────────────────────────────
+class ColorSpaceMapperTests(_BridgeBase):
+    def test_mapper_none_when_runtime_absent(self):
+        kb.set_enabled(False)
+        self.assertIsNone(kb.get_color_space_mapper())
+
+    def test_mapper_none_when_runtime_lacks_mapper(self):
+        # A runtime without a ._mapper (an older/odd build) → None, not a crash.
+        rt = _FakeRuntime()   # no _mapper attribute
+        _patch_loader(self, rt)
+        self.assertIsNone(kb.get_color_space_mapper())
+
+    def test_mapper_projects_via_runtime_mapper(self):
+        # Wire a fake runtime ._mapper + a PyKinectV2 carrying a CameraSpacePoint
+        # so get_color_space_mapper returns a working (x,y,z)->(px,py) callable.
+        captured = {}
+
+        class _ColorPt:
+            def __init__(self, x, y):
+                self.x = x
+                self.y = y
+
+        class _FakeMapper:
+            def MapCameraPointToColorSpace(self, pt):
+                # Echo the camera point's x/y scaled, proving the point was built.
+                captured["pt"] = (pt.x, pt.y, pt.z)
+                return _ColorPt(pt.x * 2.0, pt.y * 3.0)
+
+        class _CamPt:
+            x = 0.0
+            y = 0.0
+            z = 0.0
+
+        rt = _FakeRuntime()
+        rt._mapper = _FakeMapper()
+        pk2 = _fake_pk2_module()
+        pk2.CameraSpacePoint = _CamPt
+        rt_mod = types.ModuleType("pykinect2.PyKinectRuntime")
+        rt_mod.PyKinectRuntime = lambda flags: rt
+        with mock.patch.object(kb, "import_pykinect2", lambda: (pk2, rt_mod)):
+            kb.get_runtime()
+            mapper = kb.get_color_space_mapper()
+            self.assertIsNotNone(mapper)
+            out = mapper(5.0, 7.0, 2.0)
+        self.assertEqual(out, (10.0, 21.0))         # x*2, y*3
+        self.assertEqual(captured["pt"], (5.0, 7.0, 2.0))
+
+    def test_mapper_callable_swallows_per_point_error(self):
+        class _FakeMapper:
+            def MapCameraPointToColorSpace(self, pt):
+                raise RuntimeError("COM glitch")
+
+        class _CamPt:
+            x = 0.0
+            y = 0.0
+            z = 0.0
+
+        rt = _FakeRuntime()
+        rt._mapper = _FakeMapper()
+        pk2 = _fake_pk2_module()
+        pk2.CameraSpacePoint = _CamPt
+        rt_mod = types.ModuleType("pykinect2.PyKinectRuntime")
+        rt_mod.PyKinectRuntime = lambda flags: rt
+        with mock.patch.object(kb, "import_pykinect2", lambda: (pk2, rt_mod)):
+            kb.get_runtime()
+            mapper = kb.get_color_space_mapper()
+            # A throwing COM call degrades to None for that point, never raises.
+            self.assertIsNone(mapper(1.0, 2.0, 3.0))
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # KinectCapture drop-in shim
 # ─────────────────────────────────────────────────────────────────────────
 class KinectCaptureTests(_BridgeBase):
