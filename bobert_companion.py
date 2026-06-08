@@ -13732,6 +13732,21 @@ def _jarvis_pushback(name: str, arg: str) -> tuple[str, str] | None:
             return (phrase, f"run_python dangerous construct: {danger}")
         return None
 
+    # run_shell: destructive-looking command that slipped past the hard
+    # _SHELL_FORBIDDEN_PATTERNS blocklist (rm -rf node_modules, Remove-Item
+    # -Recurse on a non-c:/d: drive, git reset --hard…). Like the run_python
+    # gate above this is a hard P0 confirmation, NOT a gray-zone pushback, so
+    # it MUST run even when PUSHBACK_ENABLED is off — otherwise a hallucinated
+    # or prompt-injected command that dodges the substring blocklist would
+    # auto-exec via `powershell -Command` with no confirmation. (Computes its
+    # own lowercase view since the shared `low` below lives past the early
+    # return.)
+    if nm == "run_shell":
+        sh_low = (arg or "").strip().lower()
+        if sh_low and _looks_like_destructive_shell(sh_low):
+            phrase = "That seems inadvisable, sir. Shall I proceed regardless?"
+            return (phrase, f"destructive shell pattern: {sh_low[:60]}")
+
     if not PUSHBACK_ENABLED:
         return None
     raw = (arg or "").strip()
@@ -13791,12 +13806,8 @@ def _jarvis_pushback(name: str, arg: str) -> tuple[str, str] | None:
                   "last hour. Are you certain?")
         return (phrase, "forget_last_hour wipes recent memory")
 
-    # run_shell: destructive-looking command that slipped past the hard
-    # blocklist (rm -rf node_modules, Remove-Item -Recurse, git reset --hard…).
-    if nm == "run_shell" and low:
-        if _looks_like_destructive_shell(low):
-            phrase = "That seems inadvisable, sir. Shall I proceed regardless?"
-            return (phrase, f"destructive shell pattern: {low[:60]}")
+    # (run_shell destructive-command gate handled above the PUSHBACK_ENABLED
+    # early return — it is a hard P0 control, not a gray-zone pushback.)
 
     # open_url: bare-IP / known shortener / sketchy TLD / tunnel host.
     if nm == "open_url" and low:

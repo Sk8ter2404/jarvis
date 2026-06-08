@@ -207,9 +207,17 @@ class JarvisPushbackTests(SectionSixBase):
         self._p(self.bc, "PUSHBACK_ENABLED", True)
 
     def test_disabled_returns_none(self):
+        # The gray-zone pushbacks (sketchy URL, bulk queue, many-window close…)
+        # are gated on PUSHBACK_ENABLED and go silent when it's off. NOTE the
+        # destructive run_shell + run_python gates are deliberately NOT covered
+        # here: they sit above the PUSHBACK_ENABLED early-return and fire even
+        # when disabled (see test_destructive_run_shell_gate_fires_when_pushback
+        # _disabled and the RunPythonGate tests).
         with mock.patch.object(self.bc, "PUSHBACK_ENABLED", False):
             self.assertIsNone(
-                self.bc._jarvis_pushback("run_shell", "rm -rf /"))
+                self.bc._jarvis_pushback("open_url", "http://evil.tk"))
+            self.assertIsNone(
+                self.bc._jarvis_pushback("run_shell", "ls -la"))
 
     def test_reset_memory_always_pushes_back(self):
         res = self.bc._jarvis_pushback("reset_memory", "")
@@ -231,6 +239,29 @@ class JarvisPushbackTests(SectionSixBase):
 
     def test_non_destructive_run_shell_passes(self):
         self.assertIsNone(self.bc._jarvis_pushback("run_shell", "ls -la"))
+
+    def test_destructive_run_shell_gate_fires_when_pushback_disabled(self):
+        # Hard P0 control: the run_shell destructive-command confirmation must
+        # NOT be defeatable via the PUSHBACK_ENABLED toggle (mirrors the
+        # run_python gate). A soft-destructive command that dodges the hard
+        # _SHELL_FORBIDDEN_PATTERNS blocklist (here a -Recurse -Force wipe of a
+        # non-c:/d: drive) would otherwise auto-exec via `powershell -Command`
+        # with no confirmation.
+        with mock.patch.object(self.bc, "PUSHBACK_ENABLED", False):
+            for cmd in ("rm -rf node_modules",
+                        "git reset --hard",
+                        r"Remove-Item -Recurse -Force E:\data"):
+                res = self.bc._jarvis_pushback("run_shell", cmd)
+                self.assertIsNotNone(
+                    res, f"destructive shell should gate even with pushback "
+                         f"off: {cmd!r}")
+                phrase, reason = res
+                self.assertIn("inadvisable", phrase)
+                self.assertIn("destructive shell pattern", reason)
+            # …while a benign command still passes straight through even with
+            # the gray-zone pushback layer disabled.
+            self.assertIsNone(
+                self.bc._jarvis_pushback("run_shell", "git status"))
 
     def test_sketchy_open_url(self):
         phrase, reason = self.bc._jarvis_pushback("open_url", "http://evil.tk")
