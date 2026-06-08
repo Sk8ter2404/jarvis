@@ -243,6 +243,139 @@ class RunVoiceShortcutsTests(SectionSevenBase):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  _run_voice_shortcuts — conversation_history stays bounded (RAM/token leak)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Regression guard for the unbounded-growth bug: every fast path in
+# _run_voice_shortcuts appended a user+assistant PAIR then `return True`,
+# short-circuiting the main loop before the full-LLM path's
+# _trim_conversation_history() ever ran. A session driven mostly by shortcuts
+# (replay, chains, controlled/mode dispatch, music routing) therefore grew
+# conversation_history without bound — a steady RAM leak AND an ever-growing
+# cloud-prompt token cost, since the whole list is dumped into the system
+# prompt every turn. Each path now routes through _append_turn (append-then-
+# trim), so none can drift past MAX_CONVERSATION_HISTORY.
+class RunVoiceShortcutsHistoryBoundedTests(SectionSevenBase):
+    def setUp(self):
+        super().setUp()
+        self._p(self.bc, "_speak")
+        self._p(self.bc, "set_state")
+        # Reset history to exactly the cap so a single fast-path turn would push
+        # it to cap+2 if the trim were missing. _restore_hist (base) restores
+        # the pristine list afterwards.
+        self.cap = self.bc.MAX_CONVERSATION_HISTORY
+        self.bc.conversation_history[:] = [
+            {"role": ("user" if i % 2 == 0 else "assistant"),
+             "content": f"seed {i}"}
+            for i in range(self.cap)
+        ]
+
+    def _assert_bounded_and_tailed(self, reply):
+        hist = self.bc.conversation_history
+        # The trim fired: never exceeds the cap (pre-fix this was cap + 2).
+        self.assertLessEqual(len(hist), self.cap)
+        # The new turn is still recorded at the tail, role-correct.
+        self.assertEqual(hist[-2]["role"], "user")
+        self.assertEqual(hist[-1]["role"], "assistant")
+        self.assertEqual(hist[-1]["content"], reply)
+        # Role alternation preserved (Claude API requires a 'user' first message).
+        self.assertEqual(hist[0]["role"], "user")
+
+    def test_replay_path_trims(self):
+        self._p(self.bc, "maybe_replay_last_action",
+                return_value="Done that again, sir.")
+        self.assertTrue(self.bc._run_voice_shortcuts("do that again"))
+        self._assert_bounded_and_tailed("Done that again, sir.")
+
+    def test_tts_toggle_path_trims(self):
+        self._p(self.bc, "maybe_replay_last_action", return_value=None)
+        self._p_dict({"skill_custom_voice": types.SimpleNamespace(
+            maybe_switch_backend=lambda _t: "Switched to the Edge voice, sir.")})
+        self.assertTrue(self.bc._run_voice_shortcuts("switch to edge voice"))
+        self._assert_bounded_and_tailed("Switched to the Edge voice, sir.")
+
+    def test_mode_toggle_path_trims(self):
+        self._p(self.bc, "maybe_replay_last_action", return_value=None)
+        self._p_dict({"skill_custom_voice":
+                      types.SimpleNamespace(maybe_switch_backend=lambda _t: None)})
+        fake_router = types.ModuleType("core.mode_router")
+        fake_router.maybe_handle_mode_toggle = lambda _t: "Controlled mode engaged, sir."
+        fake_router.controlled_dispatch = lambda _t, _a: None
+        fake_router.is_in_controlled_mode = lambda: False
+        self._p_dict({"core.mode_router": fake_router})
+        self.assertTrue(self.bc._run_voice_shortcuts("controlled mode"))
+        self._assert_bounded_and_tailed("Controlled mode engaged, sir.")
+
+    def test_controlled_dispatch_path_trims(self):
+        self._p(self.bc, "maybe_replay_last_action", return_value=None)
+        self._p_dict({"skill_custom_voice":
+                      types.SimpleNamespace(maybe_switch_backend=lambda _t: None)})
+        fake_router = types.ModuleType("core.mode_router")
+        fake_router.maybe_handle_mode_toggle = lambda _t: None
+        fake_router.controlled_dispatch = lambda _t, _a: "No skill for that, sir."
+        fake_router.is_in_controlled_mode = lambda: True
+        self._p_dict({"core.mode_router": fake_router})
+        self.assertTrue(self.bc._run_voice_shortcuts("do a barrel roll"))
+        self._assert_bounded_and_tailed("No skill for that, sir.")
+
+    def test_chain_resolver_path_trims(self):
+        self._p(self.bc, "maybe_replay_last_action", return_value=None)
+        self._p_dict({"skill_custom_voice":
+                      types.SimpleNamespace(maybe_switch_backend=lambda _t: None)})
+        fake_router = types.ModuleType("core.mode_router")
+        fake_router.maybe_handle_mode_toggle = lambda _t: None
+        fake_router.controlled_dispatch = lambda _t, _a: None
+        fake_router.is_in_controlled_mode = lambda: False
+        self._p_dict({"core.mode_router": fake_router})
+        fake_disp = types.ModuleType("core.dispatcher")
+        fake_disp.resolve_and_dispatch = (
+            lambda _t, _a: "Playing music and starting a timer, sir.")
+        self._p_dict({"core.dispatcher": fake_disp})
+        self.assertTrue(
+            self.bc._run_voice_shortcuts("play jazz and set a 5 minute timer"))
+        self._assert_bounded_and_tailed("Playing music and starting a timer, sir.")
+
+    def test_many_consecutive_fastpath_turns_stay_bounded(self):
+        # The core leak scenario: a long run of fast-path-only turns must NOT
+        # accumulate. Drive 50 replay turns and confirm history is still capped.
+        self._p(self.bc, "maybe_replay_last_action", return_value="Again, sir.")
+        for _ in range(50):
+            self.assertTrue(self.bc._run_voice_shortcuts("do that again"))
+        self.assertLessEqual(len(self.bc.conversation_history), self.cap)
+
+    def _p_dict(self, mapping):
+        patcher = mock.patch.dict(self.bc.sys.modules, mapping, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  _append_turn (centralised append-then-trim helper)
+# ════════════════════════════════════════════════════════════════════════════
+class AppendTurnTests(SectionSevenBase):
+    def test_appends_user_then_assistant(self):
+        before = len(self.bc.conversation_history)
+        self.bc._append_turn("hello", "hi there, sir")
+        hist = self.bc.conversation_history
+        self.assertEqual(len(hist), before + 2)
+        self.assertEqual(hist[-2], {"role": "user", "content": "hello"})
+        self.assertEqual(hist[-1], {"role": "assistant", "content": "hi there, sir"})
+
+    def test_trims_to_cap_in_pairs(self):
+        cap = self.bc.MAX_CONVERSATION_HISTORY
+        self.bc.conversation_history[:] = [
+            {"role": ("user" if i % 2 == 0 else "assistant"), "content": str(i)}
+            for i in range(cap)
+        ]
+        self.bc._append_turn("newest user", "newest assistant")
+        hist = self.bc.conversation_history
+        self.assertLessEqual(len(hist), cap)
+        # Oldest PAIR dropped from the front; first message stays 'user'.
+        self.assertEqual(hist[0]["role"], "user")
+        self.assertEqual(hist[-1]["content"], "newest assistant")
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  _capture_utterance
 # ════════════════════════════════════════════════════════════════════════════
 class CaptureUtteranceTests(SectionSevenBase):

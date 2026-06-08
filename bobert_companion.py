@@ -1098,6 +1098,21 @@ def _trim_conversation_history(max_history: int = MAX_CONVERSATION_HISTORY) -> N
         if conversation_history and conversation_history[0]["role"] == "assistant":
             conversation_history.pop(0)
 
+
+def _append_turn(user: str, assistant: str) -> None:
+    """Append a user+assistant turn to conversation_history, then trim.
+
+    The fast-path voice shortcuts (_run_voice_shortcuts) each append a turn and
+    `return True`, short-circuiting the main loop before the full-LLM path's
+    trim ever runs — so a session driven mostly by shortcuts (replay, chains,
+    controlled/mode dispatch) would grow conversation_history without bound,
+    leaking RAM and inflating the cloud-prompt token cost every turn. Routing
+    every shortcut's append through this one helper makes the trim impossible to
+    forget — no fast path can drift out of bounds."""
+    conversation_history.append({"role": "user", "content": user})
+    conversation_history.append({"role": "assistant", "content": assistant})
+    _trim_conversation_history()
+
 # (_sleep_mode, _shutdown_prompt_pending, _standby_mode,
 # _jarvis_played_music_at, _ambient_music_hits, _ambient_music_last_hit,
 # _overnight_run_now, _wake_history, _last_wake_date moved to
@@ -15969,9 +15984,7 @@ def _maybe_orchestrate(text: str) -> bool:
         print("  [orchestrator] empty result — falling through to normal turn")
         return False
     print(f"  [orchestrator] brief: {clean[:300]}")
-    conversation_history.append({"role": "user", "content": text})
-    conversation_history.append({"role": "assistant", "content": clean})
-    _trim_conversation_history()
+    _append_turn(text, clean)
     _speak(clean)
     set_state("idle")
     return True
@@ -15997,10 +16010,7 @@ def _run_voice_shortcuts(text: str) -> bool:
         _replay_reply = None
     if _replay_reply is not None:
         print(f"  [replay] {_replay_reply}")
-        conversation_history.append({"role": "user", "content": text})
-        conversation_history.append(
-            {"role": "assistant", "content": _replay_reply}
-        )
+        _append_turn(text, _replay_reply)
         _speak(_replay_reply)
         set_state("idle")
         return True
@@ -16018,10 +16028,7 @@ def _run_voice_shortcuts(text: str) -> bool:
         _backend_reply = None
     if _backend_reply is not None:
         print(f"  [tts-toggle] {_backend_reply}")
-        conversation_history.append({"role": "user", "content": text})
-        conversation_history.append(
-            {"role": "assistant", "content": _backend_reply}
-        )
+        _append_turn(text, _backend_reply)
         _speak(_backend_reply)
         set_state("idle")
         return True
@@ -16063,10 +16070,7 @@ def _run_voice_shortcuts(text: str) -> bool:
             _toggle_reply = None
         if _toggle_reply is not None:
             print(f"  [mode] {_toggle_reply}")
-            conversation_history.append({"role": "user", "content": text})
-            conversation_history.append(
-                {"role": "assistant", "content": _toggle_reply}
-            )
+            _append_turn(text, _toggle_reply)
             _speak(_toggle_reply)
             set_state("idle")
             return True
@@ -16083,10 +16087,7 @@ def _run_voice_shortcuts(text: str) -> bool:
                 )
             if _ctrl_reply is not None:
                 print(f"  [mode-controlled] {_ctrl_reply}")
-                conversation_history.append({"role": "user", "content": text})
-                conversation_history.append(
-                    {"role": "assistant", "content": _ctrl_reply}
-                )
+                _append_turn(text, _ctrl_reply)
                 _speak(_ctrl_reply)
                 set_state("idle")
                 return True
@@ -16105,10 +16106,7 @@ def _run_voice_shortcuts(text: str) -> bool:
         _chain_reply = None
     if _chain_reply is not None:
         print(f"  [chain] {_chain_reply}")
-        conversation_history.append({"role": "user", "content": text})
-        conversation_history.append(
-            {"role": "assistant", "content": _chain_reply}
-        )
+        _append_turn(text, _chain_reply)
         _speak(_chain_reply)
         set_state("idle")
         return True
