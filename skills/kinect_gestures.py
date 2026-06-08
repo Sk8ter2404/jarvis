@@ -231,6 +231,90 @@ def _dispatch(bc, gesture: str) -> None:
         _do_swipe(bc)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  PREVIEW FEEDBACK: last-gesture shared state for the HUD pop badge (B3)
+# ══════════════════════════════════════════════════════════════════════════
+# When a gesture FIRES the HUD's Kinect skeleton preview shows a brief (~1 s)
+# glowing labelled badge with the gesture name, then fades — so the owner SEES
+# gestures register. The poller publishes the last gesture name + the monotonic
+# timestamp it fired; the preview reads that, renders the badge, and fades it out
+# over GESTURE_POP_TTL_SECONDS. Thread-safe: the poller and the preview run on
+# different threads.
+
+# How long the gesture-pop badge stays up before it has fully faded. ~1 s per the
+# spec; the preview ramps the alpha from 1.0 → 0.0 across this window.
+GESTURE_POP_TTL_SECONDS = 1.0
+
+# Friendly UPPER-CASE labels for the badge, keyed by the recognizer's gesture
+# constants. Swipe-left/right both read "SWIPE" (direction is irrelevant to the
+# 'never mind' action they trigger). A pure dict so the preview + test agree.
+_GESTURE_LABELS = {
+    "wave": "WAVE",
+    "raise_hand": "RAISE HAND",
+    "swipe_left": "SWIPE",
+    "swipe_right": "SWIPE",
+}
+
+
+def gesture_label_for(gesture: str) -> str:
+    """Human-readable badge label for a recognizer gesture name. Unknown names
+    fall back to an upper-cased, underscores→spaces rendering so a NEW gesture
+    still shows something sensible. PURE + hardware-free (preview + test share
+    it)."""
+    g = (gesture or "").lower()
+    return _GESTURE_LABELS.get(g) or g.replace("_", " ").upper()
+
+
+def gesture_pop_alpha(now: float, fired_at: float,
+                      ttl: float = GESTURE_POP_TTL_SECONDS) -> float:
+    """The badge opacity (1.0 → 0.0) for a gesture that fired at `fired_at`, as
+    of `now`. 1.0 the instant it fires, linearly fading to 0.0 at `fired_at +
+    ttl`, then 0.0 (gone). PURE so the fade curve is unit-tested directly.
+
+    Returns 0.0 for a non-positive `fired_at` (nothing has fired yet) or any
+    non-finite / ttl<=0 input — i.e. 'draw nothing'."""
+    try:
+        if fired_at <= 0.0 or ttl <= 0.0:
+            return 0.0
+        elapsed = float(now) - float(fired_at)
+        if elapsed <= 0.0:
+            return 1.0
+        if elapsed >= ttl:
+            return 0.0
+        return 1.0 - (elapsed / ttl)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+# Thread-safe last-fired-gesture snapshot, written by _poll_once when a gesture
+# fires and read by the HUD preview compositor (the face-tracking thread). Uses
+# time.monotonic for the timestamp so the preview's fade math is immune to wall-
+# clock jumps. {'gesture': str|None, 'label': str, 'ts': float (monotonic)}.
+_gesture_pop_lock = threading.Lock()
+_gesture_pop_state: dict = {"gesture": None, "label": "", "ts": 0.0}
+
+
+def _set_last_gesture(gesture: str, *, now_fn=time.monotonic) -> None:
+    """Publish the last-fired gesture + its badge label + a monotonic timestamp
+    for the HUD preview pop (thread-safe). Best-effort; never raises."""
+    try:
+        with _gesture_pop_lock:
+            _gesture_pop_state["gesture"] = gesture
+            _gesture_pop_state["label"] = gesture_label_for(gesture)
+            _gesture_pop_state["ts"] = float(now_fn())
+    except Exception:
+        pass
+
+
+def get_last_gesture() -> dict:
+    """Thread-safe snapshot {'gesture': str|None, 'label': str, 'ts': float} of
+    the last gesture that FIRED (ts is time.monotonic). Read by the HUD skeleton
+    preview to render + fade the gesture-pop badge (see gesture_pop_alpha).
+    Returns a COPY. Never raises."""
+    with _gesture_pop_lock:
+        return dict(_gesture_pop_state)
+
+
 # ─── poll loop ─────────────────────────────────────────────────────────────
 
 def _poll_once(rec, bc) -> str | None:
@@ -261,6 +345,11 @@ def _poll_once(rec, bc) -> str | None:
     # actions instantly without leaving the recognizer in a stale state.
     if not _gestures_enabled():
         return None
+    # Publish the fired gesture for the HUD preview pop badge (B3). Done HERE —
+    # after the enabled gate — so the badge only pops for gestures that actually
+    # dispatched (matching what the owner experiences), and BEFORE dispatch so a
+    # slow handler can't delay the visual feedback.
+    _set_last_gesture(gesture)
     if bc is None:
         return gesture
     try:

@@ -353,6 +353,149 @@ class OverlayColorTests(_Base):
         self.assertEqual(mod.overlay_color_for("hidden"), "cyan")
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  PART A — the TUNED feel constants (snappier EMA / shorter debounce / higher
+#  sensitivity reach-box). These pin the owner's 2026-06-08 tuning so a later
+#  refactor can't silently revert the feel; the rationale lives in the module.
+# ══════════════════════════════════════════════════════════════════════════
+class TunedConstantsTests(_Base):
+    def test_ema_alpha_is_snappier(self):
+        mod = self._load()
+        # 0.35 → 0.55: less lag. Must be clearly snappier than the old 0.35 but
+        # still some smoothing (< 1.0, i.e. not raw passthrough).
+        self.assertEqual(mod.AIR_MOUSE_EMA_ALPHA, 0.55)
+        self.assertGreater(mod.AIR_MOUSE_EMA_ALPHA, 0.35)   # snappier than before
+        self.assertLess(mod.AIR_MOUSE_EMA_ALPHA, 1.0)       # still filtering
+
+    def test_grip_debounce_is_shorter_but_still_filters_flicker(self):
+        mod = self._load()
+        # 3 → 2 frames: a prompter click. Must still be >= 2 so a single flickered
+        # frame can't fire a stray click (the core anti-stray-click guarantee).
+        self.assertEqual(mod.AIR_MOUSE_GRIP_DEBOUNCE_FRAMES, 2)
+        self.assertGreaterEqual(mod.AIR_MOUSE_GRIP_DEBOUNCE_FRAMES, 2)
+        self.assertLess(mod.AIR_MOUSE_GRIP_DEBOUNCE_FRAMES, 3)
+
+    def test_reach_box_is_more_sensitive(self):
+        mod = self._load()
+        # Smaller box → less hand travel maps to the full desktop (higher
+        # sensitivity), so small hand moves cover the screen.
+        self.assertEqual(mod.REACH_HALF_W, 0.26)
+        self.assertEqual(mod.REACH_HALF_H, 0.16)
+        self.assertLess(mod.REACH_HALF_W, 0.35)   # tighter than the old box
+        self.assertLess(mod.REACH_HALF_H, 0.22)
+
+    def test_single_flicker_still_does_not_click_at_new_debounce(self):
+        mod = self._load()
+        # Behavioural proof the shorter debounce still rejects a 1-frame flicker:
+        # at the SHIPPED debounce, one closed frame then re-open fires no button.
+        c = mod.AirMouseController(
+            mod.ReachBox(2560, 1440),
+            debounce_frames=mod.AIR_MOUSE_GRIP_DEBOUNCE_FRAMES)
+        ref = -0.20
+        c.update((0.0, 0.30), "open", True, ref)
+        d1 = c.update((0.0, 0.30), "closed", True, ref)   # lone flicker
+        d2 = c.update((0.0, 0.30), "open", True, ref)     # back to open
+        self.assertIsNone(d1.button)
+        self.assertIsNone(d2.button)
+        self.assertFalse(c.button_is_down)
+
+    def test_two_frame_close_does_click_at_new_debounce(self):
+        mod = self._load()
+        # And a real close (2 consecutive frames) DOES register promptly.
+        c = mod.AirMouseController(
+            mod.ReachBox(2560, 1440),
+            debounce_frames=mod.AIR_MOUSE_GRIP_DEBOUNCE_FRAMES)
+        ref = -0.20
+        c.update((0.0, 0.30), "open", True, ref)
+        c.update((0.0, 0.30), "closed", True, ref)        # frame 1
+        d = c.update((0.0, 0.30), "closed", True, ref)    # frame 2 → fires
+        self.assertEqual(d.button, "down")
+        self.assertTrue(c.button_is_down)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  B2 — the preview hand-circle colour mapping + the thread-safe live state the
+#  HUD reads. ENGAGED→blue, CLOSED→orange, disengaged→grey.
+# ══════════════════════════════════════════════════════════════════════════
+class HandCircleColorTests(_Base):
+    def test_engaged_open_is_blue(self):
+        mod = self._load()
+        col = mod.hand_circle_color_for(engaged=True, grip="open")
+        self.assertEqual(col, mod.HAND_CIRCLE_COLOR_ENGAGED)
+        # BGR blue: the B channel dominates R (and is clearly blue-ish).
+        b, g, r = col
+        self.assertGreater(b, r)
+        self.assertGreater(b, 150)
+
+    def test_closed_is_orange(self):
+        mod = self._load()
+        col = mod.hand_circle_color_for(engaged=True, grip="closed")
+        self.assertEqual(col, mod.HAND_CIRCLE_COLOR_CLOSED)
+        # BGR orange/amber: the R channel dominates B.
+        b, g, r = col
+        self.assertGreater(r, b)
+        self.assertGreater(r, 150)
+
+    def test_engaged_blue_differs_from_closed_orange(self):
+        mod = self._load()
+        self.assertNotEqual(mod.hand_circle_color_for(True, "open"),
+                            mod.hand_circle_color_for(True, "closed"))
+
+    def test_disengaged_is_grey_idle(self):
+        mod = self._load()
+        col = mod.hand_circle_color_for(engaged=False, grip="open")
+        self.assertEqual(col, mod.HAND_CIRCLE_COLOR_IDLE)
+        # Grey: the three channels are roughly equal.
+        b, g, r = col
+        self.assertEqual(b, g)
+        self.assertEqual(g, r)
+
+    def test_closed_only_counts_when_engaged(self):
+        mod = self._load()
+        # A "closed" grip while DISENGAGED is still idle/grey (no live click ring
+        # when the air-mouse isn't driving).
+        self.assertEqual(mod.hand_circle_color_for(False, "closed"),
+                         mod.HAND_CIRCLE_COLOR_IDLE)
+
+
+class AirMouseStateGetterTests(_Base):
+    def test_default_state_is_disengaged(self):
+        mod = self._load()
+        st = mod.get_air_mouse_state()
+        self.assertFalse(st["engaged"])
+        self.assertIn("grip", st)
+
+    def test_setter_publishes_engaged_and_grip(self):
+        mod = self._load()
+        mod._set_air_mouse_state(True, "closed")
+        st = mod.get_air_mouse_state()
+        self.assertTrue(st["engaged"])
+        self.assertEqual(st["grip"], "closed")
+        # Getter returns a COPY — mutating it must not corrupt the shared state.
+        st["engaged"] = False
+        self.assertTrue(mod.get_air_mouse_state()["engaged"])
+
+    def test_poll_publishes_state_for_preview(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        self._capture_mouse(mod)
+        ctrl = mod.AirMouseController(mod.ReachBox(2560, 1440),
+                                      debounce_frames=1, grace_sec=0.0)
+        # A raised open hand → engaged, grip open → BLUE in the preview.
+        mod._poll_once(ctrl, _fake_bridge(
+            bodies=[_body(grip_right="open", hand_y=0.30, ref_y=0.0)]))
+        st = mod.get_air_mouse_state()
+        self.assertTrue(st["engaged"])
+        self.assertEqual(mod.hand_circle_color_for(st["engaged"], st["grip"]),
+                         mod.HAND_CIRCLE_COLOR_ENGAGED)
+        # Hand drops below the reference → disengaged → GREY (no live ring).
+        mod._poll_once(ctrl, _fake_bridge(
+            bodies=[_body(grip_right="open", hand_y=-0.25, ref_y=0.0)]))
+        st2 = mod.get_air_mouse_state()
+        self.assertFalse(st2["engaged"])
+
+
 class ControllerStateMachineTests(_Base):
     """The raised-open→move / closed→LMB-down / re-open→LMB-up contract, asserted
     on AirMouseController decisions (the pure brain the live loop applies). Every
