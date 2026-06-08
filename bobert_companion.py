@@ -4987,6 +4987,16 @@ def _thinking_loop(stop_evt: threading.Event):
             time.sleep(0.05)
 
 
+def _llm_error_reply() -> str:
+    """Honest, persona-consistent line spoken when the LLM turn itself raised
+    (not a backend-down path — those have their own messages — but an
+    unexpected exception escaping _call_llm's prologue or local route). Never
+    fabricates an answer to the user's question; just admits the turn failed so
+    the caller can return instead of propagating the crash to the main loop."""
+    return ("I'm afraid I ran into a problem forming that reply, sir — "
+            "please try again.")
+
+
 def get_response_with_animation(user_text: str) -> str:
     """Run the thinking eye animation concurrently while the LLM thinks."""
     pause_face_tracking()
@@ -4996,10 +5006,23 @@ def get_response_with_animation(user_text: str) -> str:
     anim      = threading.Thread(target=_thinking_loop, args=(stop_evt,), daemon=True)
     anim.start()
 
-    reply = _call_llm(user_text)
-
-    stop_evt.set()
-    anim.join()
+    # _call_llm is guarded internally on every backend branch, but its prologue
+    # (tone/route classifiers) and the local route's helpers can still raise.
+    # If anything escapes here, the try/finally MUST still stop+join the
+    # animation daemon: a leaked _thinking_loop keeps calling _heartbeat()
+    # forever, which falsifies the main-loop watchdog (it never sees a stale
+    # beat, so it can't recover the wedge). And the exception itself must not
+    # propagate — the outer main loop only catches KeyboardInterrupt, so an
+    # unguarded raise here crashes the whole conversation loop. Returning an
+    # honest fallback keeps the LLM branch non-propagating like the others.
+    try:
+        reply = _call_llm(user_text)
+    except Exception:
+        logging.exception("get_response_with_animation: _call_llm raised")
+        reply = _llm_error_reply()
+    finally:
+        stop_evt.set()
+        anim.join(timeout=2)
     return reply
 
 
@@ -6840,23 +6863,33 @@ def _local_then_cloud_or_honest(sys_prompt: str, messages: list,
 
     This is the 'local' route's counterpart to _call_llm's Claude-first path:
     there, Claude is tried first and local is the safety net; here local is
-    primary and Claude is the safety net."""
-    text = _call_local_llm(sys_prompt, messages, max_tokens=max_tokens)
-    if text:
-        t = text.lstrip()
-        if t.startswith("[local]"):
-            t = t[len("[local]"):].lstrip()
-        return t
-    # Local didn't answer. Prefer the cloud if we can reach it.
-    cloud = _claude_oneshot(sys_prompt, messages, max_tokens=max_tokens)
-    if cloud:
-        if _sac_blocked_local_recently():
-            print("  [local-llm] SAC blocked the local runner this boot — "
-                  "served this turn from the cloud instead")
-        else:
-            print("  [local-llm] local model unavailable — served this turn "
-                  "from the cloud instead")
-        return cloud
+    primary and Claude is the safety net.
+
+    The whole body is wrapped so an unexpected raise (from a helper's pre-try
+    guard, the SAC probe, etc.) degrades to the honest unavailability line
+    rather than propagating — giving the LOCAL route the same no-propagate
+    guarantee the Claude and Ollama branches of _call_llm already have."""
+    try:
+        text = _call_local_llm(sys_prompt, messages, max_tokens=max_tokens)
+        if text:
+            t = text.lstrip()
+            if t.startswith("[local]"):
+                t = t[len("[local]"):].lstrip()
+            return t
+        # Local didn't answer. Prefer the cloud if we can reach it.
+        cloud = _claude_oneshot(sys_prompt, messages, max_tokens=max_tokens)
+        if cloud:
+            if _sac_blocked_local_recently():
+                print("  [local-llm] SAC blocked the local runner this boot — "
+                      "served this turn from the cloud instead")
+            else:
+                print("  [local-llm] local model unavailable — served this turn "
+                      "from the cloud instead")
+            return cloud
+    except Exception as _e:
+        print(f"  [local-llm] local route raised ({type(_e).__name__}: {_e}) — "
+              "returning honest unavailability message (no fabrication)")
+        return _local_unavailable_message()
     # Neither local nor cloud. Be honest; never fabricate.
     print("  [local-llm] BOTH local and cloud unavailable — returning honest "
           "unavailability message (no fabrication)")
@@ -7146,7 +7179,15 @@ def _call_llm(user_text: str) -> str:
     # Classify mood from this utterance and (if non-default) extend the
     # system prompt for this single turn. Cache the label so the follow-up
     # call stays in the same register without re-running the detector.
-    tone = detect_tone(user_text)
+    # Guarded to a neutral default on any raise — like the voice-mood /
+    # emotion-tracker / mode-router adapters below — so a classifier glitch
+    # degrades the register for this turn instead of crashing the LLM turn
+    # (which the unguarded main loop would turn into a full crash).
+    try:
+        tone = detect_tone(user_text)
+    except Exception as _tone_err:
+        print(f"  [tone] classifier failed: {_tone_err}")
+        tone = None
     _last_user_tone[0] = tone
     _last_user_text[0] = user_text
     if tone:
@@ -7156,8 +7197,13 @@ def _call_llm(user_text: str) -> str:
     # mood label and emits a per-turn system-prompt addendum (reply length
     # + register). TTS prosody for the same mood is picked downstream by
     # synthesise() via _USER_TONE_TTS. Cached so the follow-up call stays
-    # in the same register without re-classifying.
-    route = route_voice_emotion(user_text)
+    # in the same register without re-classifying. Same neutral-default guard
+    # as the tone classifier above.
+    try:
+        route = route_voice_emotion(user_text)
+    except Exception as _route_err:
+        print(f"  [voice-mood] router failed: {_route_err}")
+        route = {"mood": "casual", "addendum": ""}
     _last_voice_route[0] = route
     if route["mood"] != "casual":
         print(f"  [voice-mood] {route['mood']}")
