@@ -500,9 +500,15 @@ def get_bodies() -> list[dict]:
         # broad except below would swallow, returning [] on every frame and
         # silently killing the entire body-data plane (gestures, presence,
         # head-yaw, hand-states, point/guard). len()/`is None` are safe for
-        # both the ndarray and the list test-fakes.
+        # both the ndarray and the list test-fakes; the len() is wrapped so a
+        # non-sized bodies attr degrades to [] instead of raising.
         bodies = getattr(frame, "bodies", None) if frame is not None else None
-        if bodies is None or len(bodies) == 0:
+        if bodies is None:
+            return []
+        try:
+            if len(bodies) == 0:
+                return []
+        except TypeError:   # pragma: no cover - non-sized bodies attr (shouldn't happen)
             return []
         out: list[dict] = []
         for i, body in enumerate(bodies):
