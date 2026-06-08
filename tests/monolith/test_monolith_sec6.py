@@ -416,6 +416,47 @@ class RunPythonGateTests(SectionSixBase):
             self.bc._scan_python_for_danger(
                 "().__class__.__bases__[0].__subclasses__()"))
 
+    def test_scan_getattr_dunder_escape_ladders_flagged(self):
+        # Regression for the getattr + dynamically-built-dunder-string bypass:
+        # none of these write a dangerous NAME or a literal dunder ATTRIBUTE,
+        # so the pre-fix scanner returned None (== silent auto-run / RCE).
+        # Each must now be flagged (non-None == deferred for spoken confirm).
+        escapes = (
+            # chr(95)*2 builds "__" at runtime; no literal dunder anywhere.
+            "u=chr(95)*2; cls=getattr((1),u+'class'+u); "
+            "base=getattr(cls,u+'base'+u); "
+            "popen=[c for c in getattr(base,u+'subclasses'+u)() "
+            "if c.__name__=='Popen'][0]; popen(['cmd','/c','echo PWNED'])",
+            # string-concatenation builds the dunder constant.
+            "getattr((1).__class__, '__sub' + 'classes__')",
+            # ''.join() assembles the dunder constant.
+            "getattr(object, ''.join(['__','subclasses','__']))",
+            # singular __base__ as a literal attribute leaf — absent from the
+            # curated _PY_DANGEROUS_ATTRS set, caught by the general dunder rule.
+            "(1).__class__.__base__",
+            # setattr / delattr / locals are escape primitives too.
+            "setattr(__builtins__, 'x', 1)",
+            "delattr(object, 'x')",
+            "locals()['__builtins__']",
+        )
+        for code in escapes:
+            self.assertIsNotNone(
+                self.bc._scan_python_for_danger(code),
+                f"escape ladder not flagged (would auto-run): {code!r}")
+
+    def test_pushback_getattr_dunder_escape_defers(self):
+        # End-to-end: the dynamic-dunder getattr payload routes through
+        # _jarvis_pushback onto the confirm queue instead of auto-executing,
+        # and does so even with PUSHBACK_ENABLED off (hard P0 gate).
+        payload = ("u=chr(95)*2; "
+                   "cls=getattr((1),u+'class'+u); "
+                   "getattr(cls,u+'base'+u)")
+        with mock.patch.object(self.bc, "PUSHBACK_ENABLED", False):
+            res = self.bc._jarvis_pushback("run_python", payload)
+        self.assertIsNotNone(res)
+        _, reason = res
+        self.assertIn("run_python dangerous construct", reason)
+
     def test_scan_unparseable_is_dangerous(self):
         # Fail-safe: we'd rather ask than auto-run code we can't reason about.
         self.assertIsNotNone(

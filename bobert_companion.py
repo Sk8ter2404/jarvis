@@ -13584,10 +13584,22 @@ _RUN_PYTHON_ACTIONS = frozenset({
 })
 
 # Bare callables / names whose mere presence makes the snippet untrusted.
+# getattr/setattr/delattr/locals are here because they are the primitives an
+# injected snippet uses to reach dunders WITHOUT writing them literally (e.g.
+# getattr(obj, chr(95)*2+'class'+chr(95)*2)), which the literal-dunder checks
+# below can't see. They have no place in a pure-compute snippet.
 _PY_DANGEROUS_NAMES = frozenset({
     "eval", "exec", "compile", "__import__", "open", "input",
     "breakpoint", "memoryview", "globals", "vars",
+    "getattr", "setattr", "delattr", "locals",
 })
+# ANY dunder name (``__\w+__``) — not just the curated _PY_DANGEROUS_ATTRS set
+# — is suspicious as an attribute leaf or as a string literal, since dunder
+# ladders (__class__ → __bases__/__base__ → __subclasses__ → __globals__ → …)
+# are the backbone of every introspection-based sandbox escape and the curated
+# set inevitably misses members (e.g. the singular __base__). Pure-compute code
+# never references dunders, so this stays behaviour-preserving for legit math.
+_PY_DUNDER_RE = re.compile(r"^__\w+__$")
 # Attribute accesses (matched on the trailing `.attr`, regardless of the
 # object expression) that signal filesystem / process / network / native
 # side effects or sandbox-escape primitives.
@@ -13683,15 +13695,18 @@ def _scan_python_for_danger(code: str) -> str | None:
             if node.id in _PY_DANGEROUS_NAMES:
                 return node.id
         # os.system / subprocess.Popen / shutil.rmtree / sock.connect /
-        # obj.__subclasses__ — match on the attribute leaf only.
+        # obj.__subclasses__ — match on the attribute leaf only. Any dunder
+        # leaf is flagged (not just the curated set) so an escape ladder can't
+        # slip through on a member we forgot to enumerate (e.g. __base__).
         elif isinstance(node, _ast.Attribute):
-            if node.attr in _PY_DANGEROUS_ATTRS:
+            if node.attr in _PY_DANGEROUS_ATTRS or _PY_DUNDER_RE.match(node.attr):
                 return node.attr
-        # Dunder-name string literals ("__globals__" etc.) used to drive
-        # getattr()-based sandbox escapes.
+        # Dunder-name string literals ("__globals__", "__base__", …) used to
+        # drive getattr()-based sandbox escapes. Flag ANY dunder literal, since
+        # the curated set can't anticipate every rung of the ladder.
         elif isinstance(node, _ast.Constant) and isinstance(node.value, str):
             v = node.value
-            if v.startswith("__") and v.endswith("__") and v in _PY_DANGEROUS_ATTRS:
+            if v in _PY_DANGEROUS_ATTRS or _PY_DUNDER_RE.match(v):
                 return v
     return None
 
