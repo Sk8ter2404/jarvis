@@ -184,6 +184,16 @@ class _BridgeBase(unittest.TestCase):
         kb._negative_until[0] = 0.0
         self._orig_enabled = kb._ENABLED
         kb._ENABLED = True   # most tests assume opted-in; disabled tests flip it
+        # The production open-path now polls rt.has_new_color/body_frame() for
+        # ~2.5s and only caches a runtime that actually STREAMS (rejecting a
+        # dead sensor handle from a release-race). These fakes don't model a
+        # live frame pump, so treat any opened fake runtime as streaming —
+        # otherwise get_runtime would reject it and return None. No test here
+        # exercises the rejection path, so this can't mask intended behaviour.
+        _streams = mock.patch.object(kb, "_runtime_streams",
+                                     lambda *a, **k: True)
+        _streams.start()
+        self.addCleanup(_streams.stop)
 
     def _reset(self):
         try:
