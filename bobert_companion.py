@@ -1197,9 +1197,11 @@ def merge_memory(new_facts=None, new_projects=None, new_topic=""):
     facts and projects. Returns (added_facts, added_projects) — the
     items actually written, after dedupe.
 
-    Credential redaction: any candidate fact matching _SECRET_FACT_PATTERNS
-    is dropped before write (security audit 2026-05-30) so secrets can't
-    leak into the system prompt that's sent to the cloud every turn.
+    Credential redaction: any candidate fact OR project matching
+    _SECRET_FACT_PATTERNS is dropped before write (security audit 2026-05-30;
+    extended to projects 2026-06-07) so secrets can't leak into the system
+    prompt that's sent to the cloud every turn. Pre-existing secret-shaped
+    projects already on disk are also pruned during the in-place repair.
     """
     _raw_facts = [f.strip() for f in (new_facts or [])
                   if isinstance(f, str) and f.strip()]
@@ -1216,9 +1218,23 @@ def merge_memory(new_facts=None, new_projects=None, new_topic=""):
         # Cap each fact before storage: it's re-injected into the cloud system
         # prompt every turn, so one runaway fact is permanent token bloat.
         new_facts.append(_clamp_fact_len(_f))
-    new_projects = [_clamp_fact_len(p.strip()) for p in (new_projects or [])
-                    if isinstance(p, str) and p.strip()
-                    and not _is_internal_noise_fact(p.strip())]
+    # Projects are rendered verbatim into the cloud system prompt every turn
+    # too ("Projects they've mentioned:"), so they need the SAME credential
+    # redaction as facts — a candidate the local model classifies as a project
+    # ("rotate the API key sk-…", "router admin password is …") would otherwise
+    # leak the exact secret class _is_secret_fact was added to block.
+    _raw_projects = [p.strip() for p in (new_projects or [])
+                     if isinstance(p, str) and p.strip()]
+    new_projects = []
+    for _p in _raw_projects:
+        if _is_secret_fact(_p):
+            print(f"  [memory] redacted candidate project (looks like a secret): "
+                  f"{_p[:40]}…")
+            continue
+        if _is_internal_noise_fact(_p):
+            print(f"  [memory] dropped internal-noise candidate project: {_p[:40]}…")
+            continue
+        new_projects.append(_clamp_fact_len(_p))
     new_topic = new_topic.strip() if isinstance(new_topic, str) else ""
 
     added_facts: list[str] = []
@@ -1237,8 +1253,12 @@ def merge_memory(new_facts=None, new_projects=None, new_topic=""):
         # stored before the cap existed) so legacy bloat is repaired in place.
         memory["facts"]    = [_clamp_fact_len(f) if isinstance(f, str) else f
                               for f in memory["facts"]]
+        # Also drop any pre-existing secret-shaped project that landed on disk
+        # before projects were redacted at write time — otherwise the legacy
+        # repair would re-save (and keep leaking) it every turn.
         memory["projects"] = [_clamp_fact_len(p) if isinstance(p, str) else p
-                              for p in memory["projects"]]
+                              for p in memory["projects"]
+                              if not (isinstance(p, str) and _is_secret_fact(p))]
 
         existing_facts = {f.lower() for f in memory["facts"] if isinstance(f, str)}
         for f in new_facts:
