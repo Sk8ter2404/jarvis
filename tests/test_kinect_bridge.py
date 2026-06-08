@@ -182,6 +182,11 @@ class _BridgeBase(unittest.TestCase):
         kb._runtime[0] = None
         kb._open_error[0] = None
         kb._negative_until[0] = 0.0
+        # Drop the shared body-frame cache so each test starts COLD: the first
+        # get_bodies() then does a direct read of the test's armed frame instead
+        # of being served a previous test's still-fresh cached bodies.
+        kb._body_cache[0] = None
+        kb._body_cache_at[0] = 0.0
         self._orig_enabled = kb._ENABLED
         kb._ENABLED = True   # most tests assume opted-in; disabled tests flip it
         # The production open-path now polls rt.has_new_color/body_frame() for
@@ -203,6 +208,8 @@ class _BridgeBase(unittest.TestCase):
         kb._runtime[0] = None
         kb._open_error[0] = None
         kb._negative_until[0] = 0.0
+        kb._body_cache[0] = None
+        kb._body_cache_at[0] = 0.0
         kb._ENABLED = self._orig_enabled
 
     def _inject(self, name, module):
@@ -875,11 +882,18 @@ class BodyPumpTests(_BridgeBase):
         kb._pump_tick()   # disabled → does nothing, must not raise
         self.assertEqual(kb._last_body_frame_at[0], 0.0)
 
-    def test_pump_tick_noop_when_no_runtime(self):
+    def test_pump_tick_no_stamp_when_runtime_cant_open(self):
+        # The pump now OWNS the open (so the cache warms with no consumer), but
+        # when the sensor can't be opened it must stamp nothing and not raise.
+        # Patch the loader to fail so this holds regardless of whether pykinect2
+        # happens to be installed on the host.
         kb._runtime[0] = None
         kb._last_body_frame_at[0] = 0.0
-        kb._pump_tick()   # no open runtime → nothing to pump
+        with mock.patch.object(kb, "import_pykinect2",
+                               side_effect=ImportError("pykinect2")):
+            kb._pump_tick()   # tries to open, can't → nothing to pump
         self.assertEqual(kb._last_body_frame_at[0], 0.0)
+        self.assertIsNone(kb._runtime[0])
 
     def test_pump_tick_drains_and_stamps_on_new_frame(self):
         rt = _FakeRuntime(bodies=[_FakeBody(True, {"head": (0, 0.6, 1.8)})])
@@ -939,6 +953,197 @@ class BodyPumpTests(_BridgeBase):
                                side_effect=lambda: stopped.__setitem__("n", stopped["n"] + 1)):
             kb.set_enabled(False)
         self.assertGreaterEqual(stopped["n"], 1)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# PART C: shared body-frame cache (the gesture/air-mouse starvation fix)
+# ─────────────────────────────────────────────────────────────────────────
+# THE BUG: the Kinect body frame is single-consumer — get_last_body_frame()
+# clears has_new_body_frame(), so the FIRST reader each frame consumes it and
+# every other reader that tick got []. With the skeleton renderer + pump +
+# gesture poller (18 Hz) + air-mouse poller (30 Hz) all calling get_bodies(),
+# the pollers starved → gestures/air-mouse never fired. THE FIX: the pump is the
+# sole frame reader; it parses once into a module cache and every consumer reads
+# the cache. These tests prove the contract WITHOUT a real sensor.
+class SharedBodyCacheTests(_BridgeBase):
+    def setUp(self):
+        super().setUp()
+        # Isolate the staleness clock too (some assertions touch it).
+        self._orig_last = kb._last_body_frame_at[0]
+        self.addCleanup(lambda: kb._last_body_frame_at.__setitem__(0, self._orig_last))
+
+    def _one_body_runtime(self):
+        return _FakeRuntime(bodies=[_FakeBody(
+            True, {"head": (0, 0.6, 1.8), "spine_shoulder": (0, 0.0, 1.8)})])
+
+    def test_many_get_bodies_between_frames_return_same_cache_never_empty(self):
+        # THE REGRESSION: the sensor has ONE new frame; the pump reads+caches it,
+        # then many get_bodies() calls arrive before the next sensor frame. Every
+        # one must return the SAME tracked body from the cache — NEVER a spurious
+        # [] (which is exactly what starved the gesture + air-mouse pollers).
+        rt = self._one_body_runtime()
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        # The pump performs the SOLE read, consuming the single new-frame flag.
+        kb._pump_tick()
+        self.assertFalse(rt.has_new_body_frame())   # flag consumed by the pump
+        # Now 50 consumer reads with NO new sensor frame in between.
+        results = [kb.get_bodies() for _ in range(50)]
+        self.assertTrue(all(len(r) == 1 for r in results),
+                        "a consumer read returned [] between sensor frames — "
+                        "the starvation bug")
+        for r in results:
+            self.assertEqual(r[0]["head"], (0.0, 0.6, 1.8))
+
+    def test_mixed_consumers_share_one_frame(self):
+        # get_bodies / get_hand_states / get_presence / get_head_yaw all read the
+        # SAME shared cache, so the gesture poller, air-mouse, and overlay reading
+        # in the same frame ALL see the body — no consumer loses the race.
+        near = _FakeBody(True,
+                         {"head": (0.12, 0.6, 1.5), "spine_shoulder": (0, 0.0, 1.5),
+                          "shoulder_left": (-0.18, 0.4, 1.42),
+                          "shoulder_right": (0.18, 0.4, 1.58)},
+                         hand_right_state=3, hand_left_state=2)
+        rt = _FakeRuntime(bodies=[near])
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        kb._pump_tick()                       # sole read → cache populated
+        self.assertFalse(rt.has_new_body_frame())
+        # Four different consumers, one shared frame, all see the body.
+        self.assertEqual(len(kb.get_bodies()), 1)
+        self.assertEqual(kb.get_hand_states()["right"], "closed")
+        self.assertTrue(kb.get_presence()["present"])
+        self.assertIsNotNone(kb.get_head_yaw())
+
+    def test_cache_refreshes_on_new_frame(self):
+        # When a NEW sensor frame arrives the pump re-reads and the cache reflects
+        # the new bodies — a 1-body frame, then re-armed to 2 bodies.
+        rt = _FakeRuntime(bodies=[_FakeBody(
+            True, {"head": (0, 0.6, 1.8), "spine_shoulder": (0, 0.0, 1.8)})])
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        kb._pump_tick()
+        self.assertEqual(len(kb.get_bodies()), 1)
+        # Re-arm the runtime with a 2-body frame (a new sensor frame).
+        rt._bodies = [
+            _FakeBody(True, {"head": (0, 0.6, 1.8), "spine_shoulder": (0, 0.0, 1.8)}),
+            _FakeBody(True, {"head": (0, 0.6, 2.5), "spine_shoulder": (0, 0.0, 2.5)}),
+        ]
+        rt._new["body"] = True
+        kb._pump_tick()                       # sole reader picks up the new frame
+        self.assertEqual(len(kb.get_bodies()), 2)
+
+    def test_stale_cache_returns_empty(self):
+        # A cache entry older than BODY_CACHE_FRESH_SEC must NOT be served: with no
+        # new sensor frame to fall back on, get_bodies() returns []. (In prod the
+        # 30 Hz pump keeps it fresh; this guards the staleness boundary.)
+        rt = _FakeRuntime()   # no new body frame pending
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        # Seed the cache with a body but stamp it well in the past.
+        kb._body_cache[0] = [{"id": 1, "joints": {}, "head": None}]
+        kb._body_cache_at[0] = kb.time.monotonic() - (kb.BODY_CACHE_FRESH_SEC + 1.0)
+        self.assertEqual(kb.get_bodies(), [])   # stale → not served, no new frame
+
+    def test_get_cached_bodies_fresh_vs_stale_boundary(self):
+        # _get_cached_bodies serves within the window, drops past it. Use injected
+        # `now` so the boundary is exact and host-clock-independent.
+        kb._body_cache[0] = [{"id": 7}]
+        kb._body_cache_at[0] = 100.0
+        fresh = kb._get_cached_bodies(now=100.0 + kb.BODY_CACHE_FRESH_SEC - 0.01)
+        self.assertIsNotNone(fresh)
+        self.assertEqual(fresh[0]["id"], 7)
+        stale = kb._get_cached_bodies(now=100.0 + kb.BODY_CACHE_FRESH_SEC + 0.01)
+        self.assertIsNone(stale)
+
+    def test_get_cached_bodies_none_when_cold(self):
+        kb._body_cache[0] = None      # never populated
+        kb._body_cache_at[0] = 1.0
+        self.assertIsNone(kb._get_cached_bodies(now=1.0))
+
+    def test_get_cached_bodies_returns_copy_not_shared_ref(self):
+        # Consumers get a shallow copy so they can't mutate the shared cache list.
+        kb._body_cache[0] = [{"id": 1}]
+        kb._body_cache_at[0] = 50.0
+        got = kb._get_cached_bodies(now=50.0)
+        self.assertIsNotNone(got)
+        got.append({"id": 999})
+        # The shared cache list is unchanged by the consumer's mutation.
+        self.assertEqual(len(kb._body_cache[0]), 1)
+
+    def test_empty_bodies_cached_as_list_not_none(self):
+        # A frame with NO tracked bodies caches [] (a real "no one in view"),
+        # distinct from None (cold). A consumer reads [] from the cache, and the
+        # cell is a list so it is served (fresh) rather than re-reading.
+        rt = _FakeRuntime(bodies=[_FakeBody(False)] * 6)
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        kb._pump_tick()
+        self.assertEqual(kb._body_cache[0], [])         # [] cached, not None
+        self.assertIsNotNone(kb._body_cache[0])
+        self.assertEqual(kb.get_bodies(), [])
+
+    def test_read_and_cache_serves_fresh_cache_when_no_new_frame(self):
+        # _read_and_cache_bodies called when NO new frame is pending returns the
+        # still-fresh cache (so a direct caller racing the pump in the same frame
+        # gets the body, not []).
+        kb._runtime[0] = _FakeRuntime()         # has_new_body_frame() False
+        kb._body_cache[0] = [{"id": 3, "joints": {}}]
+        kb._body_cache_at[0] = kb.time.monotonic()   # fresh
+        got = kb._read_and_cache_bodies()
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["id"], 3)
+
+    def test_read_and_cache_empty_when_no_frame_and_cold_cache(self):
+        kb._runtime[0] = _FakeRuntime()         # no new frame
+        kb._body_cache[0] = None                # cold
+        self.assertEqual(kb._read_and_cache_bodies(), [])
+
+    def test_read_and_cache_empty_when_runtime_down(self):
+        kb.set_enabled(False)
+        self.assertEqual(kb._read_and_cache_bodies(), [])
+
+    def test_pump_tick_populates_cache_with_no_consumer(self):
+        # The pump must warm the cache on its own (no consumer call needed) so the
+        # first gesture/air-mouse read after enable already has data.
+        rt = self._one_body_runtime()
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        kb._body_cache[0] = None
+        kb._pump_tick()                         # only the pump ran
+        self.assertIsNotNone(kb._body_cache[0])
+        self.assertEqual(len(kb._body_cache[0]), 1)
+
+    def test_stop_body_pump_clears_cache(self):
+        kb._body_cache[0] = [{"id": 1}]
+        kb._body_cache_at[0] = kb.time.monotonic()
+        kb.stop_body_pump()
+        self.assertIsNone(kb._body_cache[0])    # dropped so a closed sensor → []
+
+    def test_parse_body_frame_pure_parses_tracked(self):
+        # The extracted pure parser turns a raw frame into the public shape with
+        # no sensor/runtime contact (the pump feeds it the sole frame).
+        frame = _FakeBodyFrame([
+            _FakeBody(False),
+            _FakeBody(True, {"head": (0, 0.6, 2.0), "spine_shoulder": (0, 0.0, 2.0)}),
+        ])
+        out = kb._parse_body_frame(frame)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["head"], (0.0, 0.6, 2.0))
+
+    def test_parse_body_frame_empty_on_none(self):
+        self.assertEqual(kb._parse_body_frame(None), [])
+
+    def test_get_bodies_direct_read_when_no_pump(self):
+        # A lone consumer with the cache cold (no pump warmed it yet) still works:
+        # get_bodies() falls back to a one-shot direct read of the armed frame.
+        rt = self._one_body_runtime()
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        kb._body_cache[0] = None                # cold — no pump has run
+        got = kb.get_bodies()                   # must do the fallback direct read
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["head"], (0.0, 0.6, 1.8))
 
 
 def time_monotonic_minus(seconds: float) -> float:
