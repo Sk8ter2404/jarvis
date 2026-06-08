@@ -494,10 +494,18 @@ def get_bodies() -> list[dict]:
         if not rt.has_new_body_frame():
             return []
         frame = rt.get_last_body_frame()
-        if frame is None or not getattr(frame, "bodies", None):
+        # NB: frame.bodies on real hardware is a length-6 numpy ndarray
+        # (dtype=object) — NEVER apply bool()/`not` to it or numpy raises
+        # ValueError("truth value of an array ... is ambiguous"), which the
+        # broad except below would swallow, returning [] on every frame and
+        # silently killing the entire body-data plane (gestures, presence,
+        # head-yaw, hand-states, point/guard). len()/`is None` are safe for
+        # both the ndarray and the list test-fakes.
+        bodies = getattr(frame, "bodies", None) if frame is not None else None
+        if bodies is None or len(bodies) == 0:
             return []
         out: list[dict] = []
-        for i, body in enumerate(frame.bodies):
+        for i, body in enumerate(bodies):
             if not getattr(body, "is_tracked", False):
                 continue
             joints_raw = getattr(body, "joints", None)

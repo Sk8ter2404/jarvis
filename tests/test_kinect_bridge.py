@@ -367,6 +367,47 @@ class PresenceTests(_BridgeBase):
         # joint tuples are (x, y, z, tracking_state)
         self.assertEqual(len(got[0]["joints"]["head"]), 4)
 
+    def test_get_bodies_handles_numpy_object_array(self):
+        # REGRESSION: on real hardware PyKinectRuntime.bodies is a length-6
+        # numpy ndarray(dtype=object), not a list. The old guard did
+        # `not getattr(frame, "bodies", None)` which calls bool() on that
+        # array → ValueError("truth value of an array ... is ambiguous"),
+        # swallowed by the broad except → get_bodies() returned [] on EVERY
+        # frame, silently killing gestures/presence/head-yaw/hand-states.
+        # This drives the exact ndarray shape to prove the guard no longer
+        # bool()s the array.
+        np = _require_numpy(self)
+        raw = np.empty(6, dtype=object)
+        raw[0] = _FakeBody(True, {"head": (0, 0.6, 1.8),
+                                  "spine_shoulder": (0, 0.0, 1.8)})
+        raw[1] = _FakeBody(False)
+        raw[2] = _FakeBody(True, {"head": (0, 0.6, 2.5),
+                                  "spine_shoulder": (0, 0.0, 2.5)})
+        for i in range(3, 6):
+            raw[i] = _FakeBody(False)
+        _patch_loader(self, _FakeRuntime(bodies=raw))
+        got = kb.get_bodies()
+        # 2 tracked of the 6 ndarray slots survive — proves we iterated the
+        # array (didn't bail to []) AND didn't raise on the truthiness check.
+        self.assertEqual(len(got), 2)
+        self.assertEqual(got[0]["head"], (0.0, 0.6, 1.8))
+
+    def test_get_presence_works_with_numpy_object_array(self):
+        # Downstream proof: presence (and thus gestures/head-yaw, which all
+        # consume get_bodies) sees the tracked bodies when the frame carries
+        # the real ndarray-of-object body buffer.
+        np = _require_numpy(self)
+        raw = np.empty(6, dtype=object)
+        raw[0] = _FakeBody(True, {"head": (0, 0.6, 1.8),
+                                  "spine_shoulder": (0, 0.0, 1.8)})
+        for i in range(1, 6):
+            raw[i] = _FakeBody(False)
+        _patch_loader(self, _FakeRuntime(bodies=raw))
+        pres = kb.get_presence()
+        self.assertTrue(pres["present"])
+        self.assertEqual(pres["count"], 1)
+        self.assertEqual(pres["nearest_m"], 1.8)
+
     def test_get_presence_counts_two_and_picks_nearest(self):
         bodies = [
             _FakeBody(True, {"head": (0, 0.6, 1.8), "spine_shoulder": (0, 0.0, 1.8)}),
