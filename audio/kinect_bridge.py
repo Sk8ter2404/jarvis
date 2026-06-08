@@ -529,7 +529,13 @@ def get_bodies() -> list[dict]:
                         continue
             head = joints.get("head")
             out.append({
-                "id": i,
+                # Prefer the Kinect's stable per-person tracking_id (set from
+                # body.TrackingId for every tracked body; PyKinectRuntime.py:406)
+                # so a body keeps the same 'id' as the person migrates between
+                # the fixed 6 slots. Fall back to the enumerate slot index for
+                # the list-based test fakes that carry no tracking_id, and guard
+                # the falsy default (-1/0/None) so it also degrades to the slot.
+                "id": int(getattr(body, "tracking_id", i) or i),
                 "joints": joints,
                 "head": (head[0], head[1], head[2]) if head else None,
                 "distance_m": _joint_distance(joints),
