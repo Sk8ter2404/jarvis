@@ -52,10 +52,17 @@ class _FakeBody:
     hand_right_state / hand_left_state mirror the Kinect ints the real
     PyKinectRuntime sets on each body (0 Unknown,1 NotTracked,2 Open,3 Closed,
     4 Lasso). Optional so existing tests (which don't set them) still get the
-    bridge's "unknown" degrade via getattr."""
+    bridge's "unknown" degrade via getattr.
+
+    tracking_id mirrors the stable per-person id the real PyKinectRuntime sets
+    from body.TrackingId (a large nonzero 64-bit int). Optional: when omitted,
+    the fake has no tracking_id attribute at all, so the bridge's getattr
+    fallback to the slot index is exercised — matching the list-based fakes."""
     def __init__(self, tracked, joints=None, hand_right_state=None,
-                 hand_left_state=None):
+                 hand_left_state=None, tracking_id=None):
         self.is_tracked = tracked
+        if tracking_id is not None:
+            self.tracking_id = tracking_id
         # Default: a plausible upright, facing skeleton ~2 m away.
         if joints is None:
             joints = {}
@@ -366,6 +373,86 @@ class PresenceTests(_BridgeBase):
         self.assertEqual(got[0]["head"], (0.0, 0.6, 1.8))
         # joint tuples are (x, y, z, tracking_state)
         self.assertEqual(len(got[0]["joints"]["head"]), 4)
+
+    def test_get_bodies_id_uses_stable_tracking_id(self):
+        # The real Kinect carries a stable .tracking_id that follows a person
+        # across frames; a body can sit at ANY of the 6 slots (live: the lone
+        # tracked body was at slot 4). The emitted 'id' must be that stable
+        # tracking_id, NOT the volatile enumerate slot index.
+        bodies = [
+            _FakeBody(False), _FakeBody(False), _FakeBody(False),
+            _FakeBody(False),
+            _FakeBody(True, {"head": (0, 0.6, 1.8),
+                             "spine_shoulder": (0, 0.0, 1.8)},
+                      tracking_id=72057594037928001),  # slot 4
+            _FakeBody(False),
+        ]
+        _patch_loader(self, _FakeRuntime(bodies=bodies))
+        got = kb.get_bodies()
+        self.assertEqual(len(got), 1)
+        # id is the tracking_id, not the slot index 4.
+        self.assertEqual(got[0]["id"], 72057594037928001)
+
+    def test_get_bodies_id_is_stable_across_slot_migration(self):
+        # Same person (same tracking_id), two consecutive frames where the
+        # Kinect moved them from slot 1 to slot 3. The slot index churns but the
+        # emitted id must stay put — that's the whole point of the fix.
+        tid = 72057594037928123
+        frame_a = [
+            _FakeBody(False),
+            _FakeBody(True, {"head": (0, 0.6, 2.0),
+                             "spine_shoulder": (0, 0.0, 2.0)}, tracking_id=tid),
+            _FakeBody(False), _FakeBody(False), _FakeBody(False),
+            _FakeBody(False),
+        ]
+        frame_b = [
+            _FakeBody(False), _FakeBody(False), _FakeBody(False),
+            _FakeBody(True, {"head": (0, 0.6, 2.0),
+                             "spine_shoulder": (0, 0.0, 2.0)}, tracking_id=tid),
+            _FakeBody(False), _FakeBody(False),
+        ]
+        rt = _FakeRuntime(bodies=frame_a)
+        _patch_loader(self, rt)
+        id_a = kb.get_bodies()[0]["id"]
+        # Re-arm the runtime with the migrated frame.
+        rt._bodies = frame_b
+        rt._new["body"] = True
+        id_b = kb.get_bodies()[0]["id"]
+        self.assertEqual(id_a, tid)
+        self.assertEqual(id_b, tid)
+        self.assertEqual(id_a, id_b)   # identity survives the slot move
+
+    def test_get_bodies_id_falls_back_to_slot_when_no_tracking_id(self):
+        # List-based / older fakes that carry no tracking_id attribute must
+        # degrade to the enumerate slot index (here the 1st tracked body is at
+        # slot 2, the 2nd at slot 4 → ids 2 and 4).
+        bodies = [
+            _FakeBody(False), _FakeBody(False),
+            _FakeBody(True, {"head": (0, 0.6, 1.8),
+                             "spine_shoulder": (0, 0.0, 1.8)}),  # slot 2
+            _FakeBody(False),
+            _FakeBody(True, {"head": (0, 0.6, 2.5),
+                             "spine_shoulder": (0, 0.0, 2.5)}),  # slot 4
+            _FakeBody(False),
+        ]
+        _patch_loader(self, _FakeRuntime(bodies=bodies))
+        got = kb.get_bodies()
+        self.assertEqual([b["id"] for b in got], [2, 4])
+
+    def test_get_bodies_id_falsy_tracking_id_degrades_to_slot(self):
+        # A tracking_id of 0 (or any falsy value) is not a valid Kinect id for a
+        # tracked body; the guard must fall back to the slot index rather than
+        # emit a misleading 0. The lone tracked body sits at slot 1 → id 1.
+        bodies = [
+            _FakeBody(False),
+            _FakeBody(True, {"head": (0, 0.6, 1.8),
+                             "spine_shoulder": (0, 0.0, 1.8)}, tracking_id=0),
+            _FakeBody(False), _FakeBody(False), _FakeBody(False),
+            _FakeBody(False),
+        ]
+        _patch_loader(self, _FakeRuntime(bodies=bodies))
+        got = kb.get_bodies()
+        self.assertEqual(got[0]["id"], 1)   # slot index, not the falsy 0
 
     def test_get_presence_counts_two_and_picks_nearest(self):
         bodies = [
