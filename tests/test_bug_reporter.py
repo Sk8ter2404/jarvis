@@ -263,7 +263,7 @@ class AutoSubmitRefusesOnResidueTests(unittest.TestCase):
     def test_residue_blocks_api_submit(self):
         # A report whose detail still carries a bare serial (as if scrub missed
         # it) must NOT be submitted, even with a valid token + working opener.
-        serial = "0948CD" + "542300667"
+        serial = "ABCDE" + "1234567890"
         rep = {"kind": "auto", "summary": "crash", "detail": "left " + serial,
                "traceback": "", "context": {}, "version": "x", "ts": 1.0}
         self.assertTrue(bug_reporter.report_has_hard_pii(rep))
