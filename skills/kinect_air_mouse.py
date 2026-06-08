@@ -20,7 +20,8 @@ This module is the LIVE WIRING; the testable core is pure and lives right here
 alongside it (no sensor, no real mouse, no Qt needed to exercise it):
 
   • ReachBox + map_hand_to_cursor() — turn a hand position (camera-space metres)
-    into an absolute PRIMARY-monitor pixel, clamped to the screen.
+    into an absolute VIRTUAL-DESKTOP pixel (spanning ALL monitors), clamped to
+    the desktop bounds.
   • EMA — exponential smoothing to fight the Kinect's hand-joint jitter.
   • GripDebounter — the open/closed state machine: requires N consecutive frames
     of a new grip before it flips, so a single flickered frame never fires a
@@ -31,9 +32,11 @@ alongside it (no sensor, no real mouse, no Qt needed to exercise it):
 V1 MAPPING (deliberately simple + robust)
 =========================================
 The pointing hand's (x, y) is mapped from a CALIBRATED comfortable reach-box in
-front of the user onto the PRIMARY monitor. This is robust and needs no
-calibration ritual — it just maps "hand left↔right / up↔down within arm's reach"
-to "cursor left↔right / up↔down on the main screen". It is NOT ray-projection.
+front of the user onto the ENTIRE virtual desktop (every monitor, including any
+left of / above the primary, which have a negative virtual-screen origin). This
+is robust and needs no calibration ritual — it just maps "hand left↔right /
+up↔down within arm's reach" to "cursor left↔right / up↔down across all screens",
+NON-mirrored (hand right → cursor right). It is NOT ray-projection.
 
   v2 (deferred, noted here so it isn't lost): project the actual arm RAY
   (shoulder→hand, via audio/kinect_pointing.arm_direction) onto each monitor's
@@ -93,22 +96,27 @@ AIR_MOUSE_EMA_ALPHA = 0.35
 AIR_MOUSE_GRIP_DEBOUNCE_FRAMES = 3
 
 # The comfortable reach-box in front of the user, in camera-space METRES, that
-# maps onto the primary monitor. Centred roughly on where a seated user's hand
-# naturally sits when pointing at the screen. x: sensor-RIGHT is +; the box is
-# wider than tall to match a 16:9 screen. y: sensor-UP is +; centred near
+# maps onto the whole virtual desktop. Centred roughly on where a seated user's
+# hand naturally sits when pointing at the screen. x: sensor-RIGHT is +; the box
+# is wider than tall to match a 16:9 screen. y: sensor-UP is +; centred near
 # shoulder height. These are the v1 defaults; v2 makes them per-user calibrated.
-#   half-width  → ±X metres from centre maps to the screen's left/right edges
-#   half-height → ±Y metres from centre maps to the screen's top/bottom edges
+#   half-width  → ±X metres from centre maps to the desktop's left/right edges
+#   half-height → ±Y metres from centre maps to the desktop's top/bottom edges
 REACH_CENTER_X = 0.0      # metres (centred on the sensor's optical axis)
 REACH_CENTER_Y = 0.30     # metres above the sensor (≈ seated shoulder height)
-REACH_HALF_W = 0.35       # ±0.35 m horizontal reach → full screen width
-REACH_HALF_H = 0.22       # ±0.22 m vertical reach → full screen height
+REACH_HALF_W = 0.35       # ±0.35 m horizontal reach → full desktop width
+REACH_HALF_H = 0.22       # ±0.22 m vertical reach → full desktop height
 
-# Default primary-monitor geometry used only as a fallback when the real screen
-# size can't be read (headless / win32 absent). The live size is resolved at
-# runtime by _primary_screen_size().
+# Default geometry used only as a fallback when the real virtual-desktop bounds
+# can't be read (headless / win32 absent). The live bounds are resolved at
+# runtime by _virtual_screen_bounds().
 _DEFAULT_SCREEN_W = 2560
 _DEFAULT_SCREEN_H = 1440
+
+# How often the live poll loop re-reads the virtual-desktop bounds, so that
+# hot-plugging a monitor / changing the display layout is picked up without a
+# restart (the metrics are otherwise cached so we don't hit win32 every tick).
+VIRTUAL_BOUNDS_REFRESH_SECONDS = 5.0
 
 # Overlay state-file (sibling to bobert_companion.py — same convention the
 # reticle / holo-HUD use). The poller writes the live cursor + grip; the overlay
@@ -122,27 +130,39 @@ AIR_CURSOR_STATE_FILE = os.path.join(PROJECT_DIR, "air_cursor_state.json")
 # ══════════════════════════════════════════════════════════════════════════
 
 class ReachBox:
-    """The comfortable reach-box → primary-monitor mapping.
+    """The comfortable reach-box → VIRTUAL-DESKTOP mapping.
 
-    Maps a hand (x, y) in camera-space metres onto an absolute screen pixel.
-    The box is centred at (center_x, center_y) with the given half-extents; a
-    hand at the box centre lands at screen centre, the box edges land at the
-    screen edges, and anything beyond is CLAMPED to the screen (so a hand that
-    overshoots the box parks the cursor at the edge rather than flying off).
+    Maps a hand (x, y) in camera-space metres onto an absolute virtual-desktop
+    pixel that spans EVERY monitor. The desktop is described by its top-left
+    origin (origin_x, origin_y) and its (width, height); the origin is NEGATIVE
+    for monitors arranged left-of / above the primary, so a fully left monitor is
+    reachable too (SetCursorPos accepts these virtual coordinates directly). A
+    hand at the box centre lands at the desktop centre, the box edges land at the
+    desktop edges, and anything beyond is CLAMPED to the desktop bounds (so a hand
+    that overshoots the box parks the cursor at the edge rather than flying off).
 
-    Camera-space x increases to the sensor's RIGHT and the user faces the
-    sensor, so the user's hand moving to THEIR left moves +x... which would put
-    the cursor on the right. We MIRROR x so the cursor tracks the hand like a
-    real mirror (hand right → cursor right from the user's seat). y increases UP
-    in camera space but screen y increases DOWN, so y is inverted too."""
+    X is NON-mirrored: the Kinect color/body image is itself mirror-flipped
+    relative to the user, so the user's hand moving to THEIR right reads as +x and
+    we map +x straight to a larger cursor x — hand right → cursor right, hand left
+    → cursor left, natural and un-mirrored. y increases UP in camera space but
+    screen y increases DOWN, so y is inverted.
 
-    def __init__(self, screen_w: int, screen_h: int,
+    Back-compat: the 2-positional form ``ReachBox(width, height)`` keeps the old
+    primary-only behaviour with a (0, 0) origin; pass origin_x / origin_y to span
+    the whole virtual desktop."""
+
+    def __init__(self, width: int, height: int,
+                 origin_x: int = 0, origin_y: int = 0,
                  center_x: float = REACH_CENTER_X,
                  center_y: float = REACH_CENTER_Y,
                  half_w: float = REACH_HALF_W,
                  half_h: float = REACH_HALF_H):
-        self.screen_w = int(screen_w)
-        self.screen_h = int(screen_h)
+        # Kept named screen_w / screen_h for back-compat with existing callers;
+        # these are the virtual-desktop extents (all monitors), not just primary.
+        self.screen_w = int(width)
+        self.screen_h = int(height)
+        self.origin_x = int(origin_x)
+        self.origin_y = int(origin_y)
         self.center_x = float(center_x)
         self.center_y = float(center_y)
         # Guard against a zero/negative half-extent (divide-by-zero); floor it.
@@ -150,22 +170,22 @@ class ReachBox:
         self.half_h = max(1e-3, float(half_h))
 
     def map(self, hand_x: float, hand_y: float) -> tuple[int, int]:
-        """(hand_x, hand_y) metres → (px, py) absolute primary-monitor pixel,
-        clamped to the screen bounds."""
+        """(hand_x, hand_y) metres → (px, py) absolute VIRTUAL-DESKTOP pixel,
+        clamped to the desktop bounds (origin .. origin+extent-1)."""
         # Normalise to -1..+1 within the box.
         nx = (float(hand_x) - self.center_x) / self.half_w
         ny = (float(hand_y) - self.center_y) / self.half_h
-        # Mirror x (face-to-face), invert y (camera-up → screen-down).
-        nx = -nx
+        # X is NON-mirrored (the camera image is already mirror-flipped, so +x =
+        # hand-right = cursor-right). Invert y (camera-up → screen-down).
         ny = -ny
-        # -1..+1 → 0..1 → pixels.
+        # -1..+1 → 0..1 → absolute virtual-desktop pixel (origin + offset).
         fx = (nx + 1.0) * 0.5
         fy = (ny + 1.0) * 0.5
-        px = int(round(fx * (self.screen_w - 1)))
-        py = int(round(fy * (self.screen_h - 1)))
-        # Clamp to the screen so an overshoot parks at the edge.
-        px = max(0, min(self.screen_w - 1, px))
-        py = max(0, min(self.screen_h - 1, py))
+        px = self.origin_x + int(round(fx * (self.screen_w - 1)))
+        py = self.origin_y + int(round(fy * (self.screen_h - 1)))
+        # Clamp to the desktop so an overshoot parks at the edge.
+        px = max(self.origin_x, min(self.origin_x + self.screen_w - 1, px))
+        py = max(self.origin_y, min(self.origin_y + self.screen_h - 1, py))
         return px, py
 
 
@@ -613,9 +633,20 @@ def _shutdown_overlay() -> None:
         pass
 
 
+# Win32 GetSystemMetrics indices for the VIRTUAL desktop (all monitors). Used
+# both via win32con and, as a no-pywin32 fallback, via ctypes user32 directly.
+_SM_XVIRTUALSCREEN = 76     # left edge of the virtual desktop (NEGATIVE if a
+_SM_YVIRTUALSCREEN = 77     #   monitor sits left of / above the primary)
+_SM_CXVIRTUALSCREEN = 78    # full virtual-desktop width  (sum across monitors)
+_SM_CYVIRTUALSCREEN = 79    # full virtual-desktop height
+
+
 def _virtual_screen_bounds() -> tuple[int, int, int, int]:
-    """(x, y, w, h) of the whole virtual desktop. Prefer the monolith's helper
-    (single source of truth); fall back to win32, then the primary size."""
+    """(x, y, w, h) of the whole virtual desktop spanning ALL monitors. Prefer
+    the monolith's helper (single source of truth); fall back to win32, then to
+    ctypes user32.GetSystemMetrics, then to the primary size. x/y are NEGATIVE
+    when a monitor is arranged left-of / above the primary — SetCursorPos accepts
+    these directly, so the whole desktop is reachable."""
     bc = _bc()
     if bc is not None:
         fn = getattr(bc, "_virtual_screen_bounds", None)
@@ -635,8 +666,46 @@ def _virtual_screen_bounds() -> tuple[int, int, int, int]:
             return vx, vy, vw, vh
     except Exception:
         pass
+    # pywin32 absent but we may still be on real Windows: ask user32 directly.
+    try:
+        import ctypes
+        gsm = ctypes.windll.user32.GetSystemMetrics
+        vx = int(gsm(_SM_XVIRTUALSCREEN))
+        vy = int(gsm(_SM_YVIRTUALSCREEN))
+        vw = int(gsm(_SM_CXVIRTUALSCREEN))
+        vh = int(gsm(_SM_CYVIRTUALSCREEN))
+        if vw > 0 and vh > 0:
+            return vx, vy, vw, vh
+    except Exception:
+        pass
     w, h = _primary_screen_size()
     return 0, 0, w, h
+
+
+# Cached virtual-desktop bounds + the time we last refreshed them, so the live
+# loop doesn't hit win32 every tick but still notices a display-layout change.
+_VBOUNDS_CACHE: list = [None, 0.0]   # [(x, y, w, h) | None, last_refresh_ts]
+
+
+def _cached_virtual_bounds(refresh: bool = False) -> tuple[int, int, int, int]:
+    """The virtual-desktop bounds, cached. Re-reads when `refresh` is True, when
+    nothing is cached yet, or when VIRTUAL_BOUNDS_REFRESH_SECONDS have elapsed —
+    so hot-plugging a monitor is picked up without a restart."""
+    cached, last = _VBOUNDS_CACHE
+    now = time.time()
+    if (cached is None or refresh
+            or (now - last) >= VIRTUAL_BOUNDS_REFRESH_SECONDS):
+        cached = _virtual_screen_bounds()
+        _VBOUNDS_CACHE[0] = cached
+        _VBOUNDS_CACHE[1] = now
+    return cached
+
+
+def _reach_box_for_virtual_desktop(refresh: bool = False) -> "ReachBox":
+    """Build a ReachBox mapped across the WHOLE virtual desktop (all monitors),
+    using the cached virtual-screen bounds."""
+    vx, vy, vw, vh = _cached_virtual_bounds(refresh=refresh)
+    return ReachBox(vw, vh, origin_x=vx, origin_y=vy)
 
 
 # ─── the per-tick read → decide → act path (unit-tested via _poll_once) ────
@@ -753,19 +822,33 @@ def _poll_loop() -> None:  # pragma: no cover - non-terminating daemon; each tic
     if bridge is None:
         print("  [air-mouse] kinect_bridge unavailable — poller exiting")
         return
-    screen_w, screen_h = _primary_screen_size()
-    ctrl = AirMouseController(ReachBox(screen_w, screen_h))
+    # Map across the WHOLE virtual desktop (all monitors), not just primary.
+    ctrl = AirMouseController(_reach_box_for_virtual_desktop(refresh=True))
     was_enabled = False
+    last_bounds_refresh = time.time()
     while True:
         try:
             bridge = _bridge() or bridge
             enabled = _air_mouse_enabled()
+            now = time.time()
             if enabled and not was_enabled:
-                # Just turned on — re-read the screen size (the user may have
-                # changed displays) and start fresh so the first hand snaps.
-                screen_w, screen_h = _primary_screen_size()
-                ctrl.reach = ReachBox(screen_w, screen_h)
+                # Just turned on — re-read the virtual-desktop bounds (the user
+                # may have changed displays) and start fresh so the first hand
+                # snaps to where it's pointing.
+                ctrl.reach = _reach_box_for_virtual_desktop(refresh=True)
+                last_bounds_refresh = now
                 ctrl.reset()
+            elif enabled and (now - last_bounds_refresh) >= VIRTUAL_BOUNDS_REFRESH_SECONDS:
+                # Periodic refresh while running so a hot-plugged / rearranged
+                # monitor is picked up live. _cached_virtual_bounds() only hits
+                # win32 when the interval has actually elapsed, so this is cheap;
+                # the ReachBox is rebuilt only when the bounds changed.
+                vb = _cached_virtual_bounds(refresh=True)
+                last_bounds_refresh = now
+                cur = ctrl.reach
+                if (vb[0], vb[1], vb[2], vb[3]) != (
+                        cur.origin_x, cur.origin_y, cur.screen_w, cur.screen_h):
+                    ctrl.reach = ReachBox(vb[2], vb[3], origin_x=vb[0], origin_y=vb[1])
             if was_enabled and not enabled:
                 # Just turned off — tear the overlay down + clear its state.
                 _shutdown_overlay()

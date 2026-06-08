@@ -374,7 +374,12 @@ class AirCursorOverlay:
             except (TypeError, ValueError):
                 ax = ay = None
             if ax is not None:
-                # Virtual-desktop → canvas-local.
+                # Virtual-desktop → canvas-local. (x, y) is the SAME absolute
+                # virtual-desktop pixel the air-mouse hands to SetCursorPos, so
+                # the reticle tracks the real cursor 1:1 — the X un-mirror and the
+                # full-virtual-desktop scaling live in skills/kinect_air_mouse.py's
+                # ReachBox.map(); do NOT re-apply either here or the reticle would
+                # desync from the cursor it is meant to follow.
                 self.target_x = ax - self.origin_x
                 self.target_y = ay - self.origin_y
                 # Snap on (re)acquire so we don't sweep across the screen.

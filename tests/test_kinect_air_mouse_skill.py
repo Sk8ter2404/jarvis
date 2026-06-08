@@ -6,6 +6,9 @@ colour mapping) directly, and the LIVE _poll_once path with a fake kinect_bridge
 + the real mouse actuation mocked out — so NO sensor, NO real cursor, NO Qt is
 touched. Asserts the owner-facing contract:
 
+  * the reach-box maps the hand NON-mirrored (hand RIGHT → larger cursor_x) and
+    across the ENTIRE virtual desktop — every monitor, including one arranged
+    LEFT of the primary (negative virtual-screen origin) — not just primary,
   * OPEN hand            → the cursor MOVES (no button), overlay "track"/cyan,
   * OPEN → CLOSED        → the RIGHT button goes DOWN once, overlay "grab"/gold,
   * CLOSED held + move   → cursor still moves (a right-DRAG), button stays down,
@@ -129,21 +132,33 @@ class ReachBoxTests(_Base):
         self.assertAlmostEqual(px, (2560 - 1) // 2, delta=2)
         self.assertAlmostEqual(py, (1440 - 1) // 2, delta=2)
 
-    def test_x_is_mirrored(self):
+    def test_x_not_mirrored_hand_right_is_cursor_right(self):
         mod = self._load()
         rb = mod.ReachBox(2560, 1440)
-        # Hand to the sensor's RIGHT (+x) should map to the LEFT of the screen
-        # (mirror, so it tracks like a real mirror from the user's seat).
+        # FIX 1: the Kinect image is mirror-flipped relative to the user, so we
+        # do NOT negate x — hand to the sensor's RIGHT (+x) must map to the RIGHT
+        # of the screen (larger px), and hand LEFT to the LEFT (px 0). Natural,
+        # un-mirrored.
         right_px, _ = rb.map(mod.REACH_CENTER_X + mod.REACH_HALF_W, mod.REACH_CENTER_Y)
         left_px, _ = rb.map(mod.REACH_CENTER_X - mod.REACH_HALF_W, mod.REACH_CENTER_Y)
-        self.assertLess(right_px, left_px)
-        self.assertEqual(right_px, 0)
-        self.assertEqual(left_px, 2560 - 1)
+        self.assertGreater(right_px, left_px)       # hand-right → larger cursor_x
+        self.assertEqual(left_px, 0)
+        self.assertEqual(right_px, 2560 - 1)
+
+    def test_x_monotonic_left_to_right(self):
+        mod = self._load()
+        rb = mod.ReachBox(2560, 1440)
+        # Sweeping the hand left→right sweeps the cursor left→right (monotone up).
+        xs = [rb.map(mod.REACH_CENTER_X + f * mod.REACH_HALF_W,
+                     mod.REACH_CENTER_Y)[0]
+              for f in (-1.0, -0.5, 0.0, 0.5, 1.0)]
+        self.assertEqual(xs, sorted(xs))
+        self.assertLess(xs[0], xs[-1])
 
     def test_y_inverted_camera_up_is_screen_top(self):
         mod = self._load()
         rb = mod.ReachBox(2560, 1440)
-        # Hand UP (+y in camera space) → TOP of the screen (py small).
+        # Y axis UNCHANGED by the fix: hand UP (+y camera) → TOP of screen (small).
         _, up_py = rb.map(mod.REACH_CENTER_X, mod.REACH_CENTER_Y + mod.REACH_HALF_H)
         _, down_py = rb.map(mod.REACH_CENTER_X, mod.REACH_CENTER_Y - mod.REACH_HALF_H)
         self.assertEqual(up_py, 0)
@@ -155,6 +170,114 @@ class ReachBoxTests(_Base):
         px, py = rb.map(mod.REACH_CENTER_X + 99.0, mod.REACH_CENTER_Y - 99.0)
         self.assertTrue(0 <= px <= 2559)
         self.assertTrue(0 <= py <= 1439)
+
+
+class VirtualDesktopMappingTests(_Base):
+    """FIX 2: the hand maps across the ENTIRE virtual desktop (all monitors), not
+    just the primary — including a monitor LEFT of the primary, which has a
+    NEGATIVE virtual-screen origin. Modelled on the owner's 4-monitor rig: a
+    2560-wide primary at x=0 with another 2560-wide monitor to its LEFT
+    (origin_x = -2560) and one above (origin_y = -1440), giving a virtual desktop
+    of 7680×2880 anchored at (-2560, -1440)."""
+
+    # (origin_x, origin_y, width, height) — left + above the primary, so the
+    # origin is negative on both axes (the case a primary-only map can't reach).
+    VX, VY, VW, VH = -2560, -1440, 7680, 2880
+
+    def _rb(self, mod):
+        return mod.ReachBox(self.VW, self.VH, origin_x=self.VX, origin_y=self.VY)
+
+    def test_center_maps_to_virtual_desktop_center(self):
+        mod = self._load()
+        rb = self._rb(mod)
+        px, py = rb.map(mod.REACH_CENTER_X, mod.REACH_CENTER_Y)
+        self.assertAlmostEqual(px, self.VX + (self.VW - 1) // 2, delta=2)
+        self.assertAlmostEqual(py, self.VY + (self.VH - 1) // 2, delta=2)
+
+    def test_left_edge_reaches_negative_origin_monitor(self):
+        mod = self._load()
+        rb = self._rb(mod)
+        # Hand fully LEFT → the LEFT edge of the desktop, which is NEGATIVE
+        # (the monitor left of primary) — unreachable with a primary-only map.
+        left_px, _ = rb.map(mod.REACH_CENTER_X - mod.REACH_HALF_W, mod.REACH_CENTER_Y)
+        self.assertEqual(left_px, self.VX)          # == -2560
+        self.assertLess(left_px, 0)
+
+    def test_right_edge_reaches_far_monitor(self):
+        mod = self._load()
+        rb = self._rb(mod)
+        # Hand fully RIGHT → the RIGHT edge of the whole desktop (far monitor).
+        right_px, _ = rb.map(mod.REACH_CENTER_X + mod.REACH_HALF_W, mod.REACH_CENTER_Y)
+        self.assertEqual(right_px, self.VX + self.VW - 1)   # == 5119
+
+    def test_top_edge_reaches_negative_y_origin(self):
+        mod = self._load()
+        rb = self._rb(mod)
+        # Hand fully UP → the TOP edge of the desktop (monitor above primary),
+        # which is NEGATIVE on y.
+        _, top_py = rb.map(mod.REACH_CENTER_X, mod.REACH_CENTER_Y + mod.REACH_HALF_H)
+        self.assertEqual(top_py, self.VY)           # == -1440
+        self.assertLess(top_py, 0)
+
+    def test_un_mirrored_across_virtual_desktop(self):
+        mod = self._load()
+        rb = self._rb(mod)
+        # The headline contract: hand RIGHT → larger cursor_x, hand LEFT →
+        # smaller cursor_x, ACROSS the full multi-monitor desktop.
+        left_px, _ = rb.map(mod.REACH_CENTER_X - mod.REACH_HALF_W, mod.REACH_CENTER_Y)
+        right_px, _ = rb.map(mod.REACH_CENTER_X + mod.REACH_HALF_W, mod.REACH_CENTER_Y)
+        self.assertGreater(right_px, left_px)
+        self.assertEqual(left_px, self.VX)
+        self.assertEqual(right_px, self.VX + self.VW - 1)
+
+    def test_overshoot_clamps_to_virtual_bounds(self):
+        mod = self._load()
+        rb = self._rb(mod)
+        # A wild overshoot parks at the desktop edges, never outside them.
+        px_lo, py_lo = rb.map(mod.REACH_CENTER_X - 99.0, mod.REACH_CENTER_Y + 99.0)
+        px_hi, py_hi = rb.map(mod.REACH_CENTER_X + 99.0, mod.REACH_CENTER_Y - 99.0)
+        self.assertEqual((px_lo, py_lo), (self.VX, self.VY))
+        self.assertEqual((px_hi, py_hi),
+                         (self.VX + self.VW - 1, self.VY + self.VH - 1))
+
+    def test_reach_box_builder_uses_cached_virtual_bounds(self):
+        mod = self._load()
+        # _reach_box_for_virtual_desktop() must build a ReachBox spanning the
+        # bounds _virtual_screen_bounds() reports (here a negative-origin desk).
+        with mock.patch.object(mod, "_virtual_screen_bounds",
+                               lambda: (self.VX, self.VY, self.VW, self.VH)):
+            rb = mod._reach_box_for_virtual_desktop(refresh=True)
+        self.assertEqual((rb.origin_x, rb.origin_y, rb.screen_w, rb.screen_h),
+                         (self.VX, self.VY, self.VW, self.VH))
+        # And a hand-right maps to a larger cursor_x than hand-left on it.
+        left_px, _ = rb.map(mod.REACH_CENTER_X - mod.REACH_HALF_W, mod.REACH_CENTER_Y)
+        right_px, _ = rb.map(mod.REACH_CENTER_X + mod.REACH_HALF_W, mod.REACH_CENTER_Y)
+        self.assertGreater(right_px, left_px)
+
+    def test_cached_bounds_refresh_picks_up_layout_change(self):
+        mod = self._load()
+        # First read caches bounds; a later refresh=True picks up a new layout
+        # (monitor hot-plugged / rearranged) without a restart.
+        seq = [(0, 0, 2560, 1440), (self.VX, self.VY, self.VW, self.VH)]
+        calls = {"n": 0}
+
+        def _fake_bounds():
+            i = min(calls["n"], len(seq) - 1)
+            calls["n"] += 1
+            return seq[i]
+
+        # Reset the module-level cache so this test is order-independent.
+        mod._VBOUNDS_CACHE[0] = None
+        mod._VBOUNDS_CACHE[1] = 0.0
+        with mock.patch.object(mod, "_virtual_screen_bounds", _fake_bounds):
+            first = mod._cached_virtual_bounds(refresh=True)
+            self.assertEqual(first, (0, 0, 2560, 1440))
+            # Without refresh + within the interval, the cache holds (no re-read).
+            self.assertEqual(mod._cached_virtual_bounds(refresh=False),
+                             (0, 0, 2560, 1440))
+            # Forced refresh re-reads → the new layout.
+            self.assertEqual(mod._cached_virtual_bounds(refresh=True),
+                             (self.VX, self.VY, self.VW, self.VH))
 
 
 class EMATests(_Base):
