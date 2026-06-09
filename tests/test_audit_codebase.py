@@ -1715,6 +1715,38 @@ class CrashRecoveryTests(_AuditTestBase):
 #  CHECK H — leak test
 # ═════════════════════════════════════════════════════════════════════════
 
+def _psutil_leak_probe_unavailable() -> str | None:
+    """Return a skip reason if THIS host's psutil cannot introspect the current
+    process the way ``audit.check_leak`` requires, else ``None``.
+
+    ``check_leak`` is deliberately best-effort: it imports psutil and reads
+    ``Process().num_handles()`` / ``open_files()`` / ``memory_info()`` inside a
+    broad ``try`` and, on ANY failure, reports ``ran=False`` plus a ``skipped``
+    reason — a contract pinned by ``test_inner_exception_marks_skipped``. psutil
+    being merely IMPORTABLE is therefore necessary but NOT sufficient: on a
+    locked-down Windows host an EDR / security agent (or a sandbox) can block
+    handle enumeration, so ``Process().open_files()`` raises ``AccessDenied``
+    even though ``import psutil`` succeeds — and ``check_leak`` then correctly
+    skips with ``ran=False``. That is an environmental limitation, not a
+    regression. This probe mirrors check_leak's own calls so the live-psutil
+    smoke test below gates on exactly what the tool needs to actually run."""
+    if importlib.util.find_spec("psutil") is None:
+        return "psutil not installed"
+    try:
+        import psutil  # used immediately below, so pyflakes sees no unused import
+    except Exception as exc:  # find_spec found a spec but the import still failed
+        return f"psutil import failed: {type(exc).__name__}: {exc}"
+    try:
+        proc = psutil.Process()
+        if hasattr(proc, "num_handles"):
+            proc.num_handles()
+        proc.open_files()
+        proc.memory_info()
+    except Exception as exc:  # AccessDenied / OSError under EDR/sandbox, etc.
+        return f"psutil cannot introspect this process here ({type(exc).__name__}: {exc})"
+    return None
+
+
 class LeakTestTests(_AuditTestBase):
     def test_leak_skips_cleanly_without_psutil(self):
         # Force the optional psutil import to fail → graceful skip, no findings.
@@ -1731,11 +1763,18 @@ class LeakTestTests(_AuditTestBase):
         self.assertIn("psutil not available", summary.get("skipped", ""))
 
     def test_leak_runs_when_psutil_present(self):
-        # psutil IS in the CI/dev dep set; the 100-iter no-op loop must run and
-        # report no growth (well under the thresholds). Probe via find_spec so
-        # there's no unused bare import (pyflakes doesn't honour `# noqa`).
-        if importlib.util.find_spec("psutil") is None:
-            self.skipTest("psutil not installed")
+        # When this host's psutil can introspect the current process (the CI
+        # runner + a normal dev box), the 100-iter no-op loop must RUN and report
+        # no growth (well under the thresholds) — assert exactly that, so the real
+        # leak gate stands. When it can't (an EDR/sandbox host blocks handle
+        # enumeration, so check_leak takes its documented best-effort skip and
+        # reports ran=False), skip with a tracked reason rather than failing on an
+        # environmental limitation. The leak-detection LOGIC itself stays fully
+        # exercised by LeakDetectionBranchTests (fake psutil, env-independent), so
+        # this conditional never weakens the gate.
+        reason = _psutil_leak_probe_unavailable()
+        if reason:
+            self.skipTest(f"leak smoke needs live psutil introspection: {reason}")
         findings, summary = audit.check_leak()
         self.assertTrue(summary.get("ran"))
         # A trivial mkstemp/close/unlink loop must not leak >20 handles.
