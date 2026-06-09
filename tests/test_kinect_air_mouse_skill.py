@@ -456,6 +456,194 @@ class VirtualDesktopMappingTests(_Base):
                              (self.VX, self.VY, self.VW, self.VH))
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  FIX 1 — TABLET-FEEL mapping: aspect-matched (no stretch) + body-relative +
+#  absolute. The reach plane IS the monitors: hand corner → desktop corner, X/Y
+#  scale equally per the desktop aspect, and the plane is centred on the BODY so
+#  the same hand offset maps to the same cursor spot wherever the owner sits.
+# ══════════════════════════════════════════════════════════════════════════
+class TabletAspectMatchTests(_Base):
+    """The plane half-HEIGHT is DERIVED from the half-WIDTH × desktop aspect, so X
+    and Y scale EQUALLY (no stretch). A hand moved the same real distance H vs V
+    moves the cursor the same FRACTION of the screen."""
+
+    def test_half_h_derives_from_aspect(self):
+        mod = self._load()
+        # 2560×1440 (16:9): derived half_h = half_w × 1440/2560.
+        rb = mod.ReachBox(2560, 1440, half_w=0.26)
+        self.assertAlmostEqual(rb.half_w, 0.26, delta=1e-9)
+        self.assertAlmostEqual(rb.half_h, 0.26 * (1440.0 / 2560.0), delta=1e-6)
+
+    def test_half_h_tracks_a_taller_desktop(self):
+        mod = self._load()
+        # A 1:1 desktop → half_h == half_w (square plane, square screen).
+        rb = mod.ReachBox(2000, 2000, half_w=0.26)
+        self.assertAlmostEqual(rb.half_h, rb.half_w, delta=1e-6)
+        # A very WIDE desktop (3:1) → a much SHORTER plane (half_h = half_w/3).
+        rb2 = mod.ReachBox(6000, 2000, half_w=0.30)
+        self.assertAlmostEqual(rb2.half_h, 0.30 / 3.0, delta=1e-6)
+
+    def test_equal_hand_move_equal_screen_pixels(self):
+        mod = self._load()
+        # THE NO-STRETCH GUARANTEE: because half_h = half_w × (H/W), the same real
+        # hand delta in X and in Y moves the cursor the same number of PIXELS on
+        # screen (not the same fraction) — so neither axis feels faster/twitchier
+        # than the other. Body-relative, centred.
+        W, H = 2560, 1440
+        rb = mod.ReachBox(W, H, half_w=0.26)
+        cx, cy = rb.map(0.0, 0.40, body_x=0.0, body_y=0.40)
+        d = 0.05   # 5 cm hand move, same in both axes
+        x_moved = rb.map(d, 0.40, body_x=0.0, body_y=0.40)[0] - cx
+        y_moved = cy - rb.map(0.0, 0.40 + d, body_x=0.0, body_y=0.40)[1]  # up→ -py
+        # Equal PIXEL travel for an equal hand move (the aspect-match invariant).
+        self.assertGreater(x_moved, 0)
+        self.assertGreater(y_moved, 0)
+        self.assertAlmostEqual(x_moved, y_moved, delta=2)   # within rounding
+
+
+class TabletAbsoluteCornerTests(_Base):
+    """ABSOLUTE mapping: the hand at a plane CORNER maps to the matching desktop
+    CORNER (top-left→top-left, bottom-right→bottom-right), measured body-relative."""
+
+    def _rb(self, mod):
+        # An off-origin virtual desktop to prove the corners track the real bounds.
+        return mod.ReachBox(7680, 2160, origin_x=-1280, origin_y=-120, half_w=0.26)
+
+    def test_corners_map_to_desktop_corners(self):
+        mod = self._load()
+        rb = self._rb(mod)
+        bx, by = 0.10, 0.42       # arbitrary body centre — corners are relative to it
+        hw, hh = rb.half_w, rb.half_h
+        # plane top-LEFT  (hand left = bx-hw; hand UP = centreY + hh) → desktop TL.
+        tl = rb.map(bx - hw, (by + mod.REACH_CENTER_Y_OFFSET) + hh,
+                    body_x=bx, body_y=by)
+        # plane bottom-RIGHT (hand right = bx+hw; hand DOWN = centreY - hh) → BR.
+        br = rb.map(bx + hw, (by + mod.REACH_CENTER_Y_OFFSET) - hh,
+                    body_x=bx, body_y=by)
+        self.assertEqual(tl, (rb.origin_x, rb.origin_y))
+        self.assertEqual(br, (rb.origin_x + rb.screen_w - 1,
+                              rb.origin_y + rb.screen_h - 1))
+
+    def test_centre_maps_to_desktop_centre(self):
+        mod = self._load()
+        rb = self._rb(mod)
+        bx, by = -0.05, 0.33
+        # Hand at the plane centre (body X, shoulder Y + comfort offset) → desktop
+        # centre, regardless of where the body sits.
+        px, py = rb.map(bx, by + mod.REACH_CENTER_Y_OFFSET, body_x=bx, body_y=by)
+        self.assertAlmostEqual(px, rb.origin_x + (rb.screen_w - 1) // 2, delta=2)
+        self.assertAlmostEqual(py, rb.origin_y + (rb.screen_h - 1) // 2, delta=2)
+
+    def test_absolute_not_relative_same_hand_same_cursor(self):
+        mod = self._load()
+        rb = self._rb(mod)
+        bx, by = 0.0, 0.40
+        # ABSOLUTE: the SAME hand position always maps to the SAME pixel — not a
+        # velocity/relative accumulation. Two identical samples → identical cursor.
+        a = rb.map(0.12, 0.55, body_x=bx, body_y=by)
+        b = rb.map(0.12, 0.55, body_x=bx, body_y=by)
+        self.assertEqual(a, b)
+        # And up = up: a higher hand → a SMALLER py (closer to the top).
+        hi = rb.map(0.12, 0.60, body_x=bx, body_y=by)[1]
+        lo = rb.map(0.12, 0.50, body_x=bx, body_y=by)[1]
+        self.assertLess(hi, lo)
+
+
+class TabletBodyRelativeTests(_Base):
+    """BODY-RELATIVE centring: the SAME hand OFFSET from the body maps to the SAME
+    cursor spot no matter where the body is in the frame (owner sits/stands/shifts)."""
+
+    def test_same_offset_different_body_same_cursor(self):
+        mod = self._load()
+        rb = mod.ReachBox(2560, 1440, half_w=0.26)
+        off_x, off_y = 0.13, 0.06    # hand 13 cm right + 6 cm above the plane centre
+        cursors = []
+        for bx, by in ((0.0, 0.40), (0.5, 0.55), (-0.4, 0.25), (0.9, 0.70)):
+            cy_center = by + mod.REACH_CENTER_Y_OFFSET
+            cursors.append(rb.map(bx + off_x, cy_center + off_y,
+                                  body_x=bx, body_y=by))
+        # Every body position yields the SAME cursor pixel for the same hand offset.
+        self.assertEqual(len(set(cursors)), 1)
+
+    def test_body_shift_without_hand_offset_change_does_not_move_cursor(self):
+        mod = self._load()
+        rb = mod.ReachBox(2560, 1440, half_w=0.26)
+        # The owner slides 40 cm to the right but keeps the hand the SAME distance
+        # right-of-centre: the cursor must NOT move (it's body-relative, not absolute
+        # camera X). Both hand AND body shift by +0.40.
+        a = rb.map(0.10, 0.50, body_x=0.0, body_y=0.40)
+        b = rb.map(0.50, 0.50, body_x=0.40, body_y=0.40)
+        self.assertEqual(a, b)
+
+    def test_controller_maps_body_relative_via_extension(self):
+        mod = self._load()
+        c = mod.AirMouseController(mod.ReachBox(2560, 1440, half_w=0.26),
+                                   debounce_frames=1, grace_sec=0.0,
+                                   engage_debounce_frames=1)
+        # Two raised RIGHT-hand samples with the SAME hand-minus-body offset but the
+        # whole body shifted: the controller (which feeds body_center_x +
+        # shoulder_ref_y into the plane) must produce the SAME cursor for both.
+        def arm(body_x, hand_dx, shoulder_y=0.40):
+            return mod.ArmExtension(
+                "right", forward_m=0.0, straightness=None,
+                hand=(body_x + hand_dx, shoulder_y + 0.20, 1.8, 2),
+                lift_m=0.20, shoulder_ref_y=shoulder_y, body_center_x=body_x)
+        relaxed_l = mod.ArmExtension("left", forward_m=0.0, straightness=None,
+                                     hand=(-0.1, 0.0, 2.0, 2), lift_m=-0.40,
+                                     shoulder_ref_y=0.40, body_center_x=0.0)
+        d1 = c.update(relaxed_l, arm(0.0, 0.15), "open", "open", True)
+        c.reset()
+        d2 = c.update(relaxed_l, arm(0.6, 0.15), "open", "open", True)
+        self.assertIsNotNone(d1.cursor)
+        self.assertEqual(d1.cursor, d2.cursor)   # same offset → same cursor
+
+    def test_falls_back_to_fixed_centre_without_body(self):
+        mod = self._load()
+        rb = mod.ReachBox(2560, 1440, half_w=0.26)
+        # With NO body reference, map() centres on the fixed plane centre (legacy):
+        # the plane centre maps to the desktop centre.
+        px, py = rb.map(mod.REACH_CENTER_X, mod.REACH_CENTER_Y)
+        self.assertAlmostEqual(px, (2560 - 1) // 2, delta=2)
+        self.assertAlmostEqual(py, (1440 - 1) // 2, delta=2)
+
+
+class ReachHalfWidthEnvTests(_Base):
+    """KINECT_REACH_HALF_W tunes the plane half-WIDTH live (the height derives from
+    it via the desktop aspect); nx/ny are exposed for tuning."""
+
+    def test_env_overrides_half_width(self):
+        mod = self._load()
+        with mock.patch.dict(os.environ, {"KINECT_REACH_HALF_W": "0.40"}):
+            self.assertAlmostEqual(mod.reach_half_w(), 0.40, delta=1e-9)
+            rb = mod.ReachBox(2560, 1440)   # half_w None → reads the env
+            self.assertAlmostEqual(rb.half_w, 0.40, delta=1e-9)
+            # Height still derives from the (overridden) width × aspect.
+            self.assertAlmostEqual(rb.half_h, 0.40 * (1440.0 / 2560.0), delta=1e-6)
+
+    def test_env_unset_uses_default(self):
+        mod = self._load()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("KINECT_REACH_HALF_W", None)
+            self.assertAlmostEqual(mod.reach_half_w(), mod.REACH_HALF_W, delta=1e-9)
+
+    def test_env_garbage_falls_back(self):
+        mod = self._load()
+        with mock.patch.dict(os.environ, {"KINECT_REACH_HALF_W": "not-a-number"}):
+            self.assertAlmostEqual(mod.reach_half_w(), mod.REACH_HALF_W, delta=1e-9)
+
+    def test_normalize_reports_nx_ny_in_range(self):
+        mod = self._load()
+        rb = mod.ReachBox(2560, 1440, half_w=0.26)
+        bx, by = 0.0, 0.40
+        # Hand a quarter of the way right of centre → nx ≈ +0.25; a touch above the
+        # plane centre → ny negative (up). The debug line surfaces these.
+        nx, ny = rb.normalize(0.0 + 0.25 * rb.half_w,
+                              (by + mod.REACH_CENTER_Y_OFFSET) + 0.5 * rb.half_h,
+                              body_x=bx, body_y=by)
+        self.assertAlmostEqual(nx, 0.25, delta=1e-6)
+        self.assertAlmostEqual(ny, -0.5, delta=1e-6)   # up = negative ny
+
+
 class EMATests(_Base):
     def test_first_value_seeds(self):
         mod = self._load()
@@ -562,13 +750,30 @@ class TunedConstantsTests(_Base):
 
     def test_height_margins_are_sane(self):
         mod = self._load()
-        # Defaults per spec: engage at ~+5 cm above the shoulder, release at ~10 cm
-        # below it. up positive (must raise AT/above the shoulder to engage), down
-        # negative (a hand dropped below the shoulder releases).
-        self.assertAlmostEqual(mod.AIR_MOUSE_ENGAGE_UP_MARGIN_M, 0.05, delta=1e-9)
+        # Defaults per spec (FIX 3, raised 2026-06-09): engage at ~+7 cm above the
+        # shoulder (a clearer, deliberate reach — fewer false engages), release at
+        # ~10 cm below it. up positive (must raise clearly above the shoulder to
+        # engage), down negative (a hand dropped below the shoulder releases).
+        self.assertAlmostEqual(mod.AIR_MOUSE_ENGAGE_UP_MARGIN_M, 0.07, delta=1e-9)
         self.assertAlmostEqual(mod.AIR_MOUSE_ENGAGE_DOWN_MARGIN_M, -0.10, delta=1e-9)
         self.assertGreater(mod.AIR_MOUSE_ENGAGE_UP_MARGIN_M, 0.0)
         self.assertLess(mod.AIR_MOUSE_ENGAGE_DOWN_MARGIN_M, 0.0)
+
+    def test_engage_debounce_rejects_single_frame_spike(self):
+        mod = self._load()
+        # FIX 3: the engage debounce requires a SUSTAINED raise (>1 frame) so a
+        # 1-frame Kinect height spike can't grab the cursor. Must be ≥2 (a real
+        # debounce) but small enough that a genuine raise still feels prompt.
+        self.assertGreaterEqual(mod.AIR_MOUSE_ENGAGE_DEBOUNCE_FRAMES, 2)
+        self.assertLessEqual(mod.AIR_MOUSE_ENGAGE_DEBOUNCE_FRAMES, 5)
+
+    def test_controlling_hand_hysteresis_is_strong(self):
+        mod = self._load()
+        # FIX 2: with BOTH hands raised the cursor locks to ONE controller. The
+        # switch margin is a physical height (metres) the challenger must lead by,
+        # held for several frames — strong enough that two raised hands don't thrash.
+        self.assertAlmostEqual(mod.HAND_SWITCH_MARGIN, 0.08, delta=1e-9)
+        self.assertGreaterEqual(mod.HAND_SWITCH_FRAMES, 8)
 
     def test_forward_and_straightness_demoted_to_permissive(self):
         mod = self._load()
@@ -651,7 +856,8 @@ class AirMouseStateGetterTests(_Base):
         self._patch_flag(True)
         self._capture_mouse(mod)
         ctrl = mod.AirMouseController(mod.ReachBox(2560, 1440),
-                                      debounce_frames=1, grace_sec=0.0)
+                                      debounce_frames=1, grace_sec=0.0,
+                                      engage_debounce_frames=1)
         # LEFT arm extended, open hand → engaged, hand "left", grip open → BLUE.
         mod._poll_once(ctrl, _fake_bridge(
             bodies=[_body(reach_side="left", grip_left="open")]))
@@ -678,8 +884,11 @@ class ControllerStateMachineTests(_Base):
     def _ctrl(self, mod, debounce=1):
         # grace_sec=0 so an untracked frame releases IMMEDIATELY here (the
         # tracking-loss GRACE window is exercised in its own test class).
+        # engage_debounce_frames=1 → single-frame engage for these state-machine
+        # tests (the multi-frame engage DEBOUNCE has its own class).
         return mod.AirMouseController(mod.ReachBox(2560, 1440),
-                                      debounce_frames=debounce, grace_sec=0.0)
+                                      debounce_frames=debounce, grace_sec=0.0,
+                                      engage_debounce_frames=1)
 
     def _ext(self, mod, side, **kw):
         """An EXTENDED ArmExtension for `side` (engages), with a hand joint."""
@@ -833,7 +1042,7 @@ class ControllerStateMachineTests(_Base):
     def test_flicker_does_not_fire_button_with_real_debounce(self):
         mod = self._load()
         c = mod.AirMouseController(mod.ReachBox(2560, 1440), debounce_frames=2,
-                                   grace_sec=0.0)
+                                   grace_sec=0.0, engage_debounce_frames=1)
         c.update(self._relaxed(mod, "left"), self._ext(mod, "right"),
                  "open", "open", True)
         d1 = c.update(self._relaxed(mod, "left"), self._ext(mod, "right"),
@@ -870,6 +1079,9 @@ class ReachEngageGateTests(_Base):
     def _ctrl(self, mod, **kw):
         kw.setdefault("debounce_frames", 1)
         kw.setdefault("grace_sec", 0.0)
+        # engage_debounce_frames=1 so a single update() engages immediately in these
+        # state-machine tests (the multi-frame engage DEBOUNCE has its own class).
+        kw.setdefault("engage_debounce_frames", 1)
         return mod.AirMouseController(mod.ReachBox(2560, 1440), **kw)
 
     def _ext(self, mod, side, **kw):
@@ -1135,7 +1347,8 @@ class HeightGatePositionIndependenceTests(_Base):
         # Mirror OFF so reach_side='right' stays the right arm end-to-end.
         moves, buttons = self._capture_mouse(mod)
         ctrl = mod.AirMouseController(mod.ReachBox(2560, 1440),
-                                      debounce_frames=1, grace_sec=0.0)
+                                      debounce_frames=1, grace_sec=0.0,
+                                      engage_debounce_frames=1)
 
         def _body_at(scale, lift_frac):
             j = _scaled_body_joints("right", scale=scale, lift_frac=lift_frac)
@@ -1170,7 +1383,7 @@ class HeightGatePositionIndependenceTests(_Base):
         mod = self._load()
         th = mod._reach_thresholds()
         c = mod.AirMouseController(mod.ReachBox(2560, 1440), debounce_frames=1,
-                                   grace_sec=0.0)
+                                   grace_sec=0.0, engage_debounce_frames=1)
         lowered_left = mod.ArmExtension.from_bridge(
             mod._local_arm_extension(_relaxed_arm_joints("left"), "left"))
 
@@ -1198,7 +1411,8 @@ class HeightGatePositionIndependenceTests(_Base):
 class PollActsTests(_Base):
     def _ctrl(self, mod):
         return mod.AirMouseController(mod.ReachBox(2560, 1440),
-                                      debounce_frames=1, grace_sec=0.0)
+                                      debounce_frames=1, grace_sec=0.0,
+                                      engage_debounce_frames=1)
 
     def test_extended_open_hand_moves_cursor(self):
         mod = self._load()
@@ -1261,7 +1475,8 @@ class PollActsTests(_Base):
 class PollGateTests(_Base):
     def _ctrl(self, mod):
         return mod.AirMouseController(mod.ReachBox(2560, 1440),
-                                      debounce_frames=1, grace_sec=0.0)
+                                      debounce_frames=1, grace_sec=0.0,
+                                      engage_debounce_frames=1)
 
     def test_noop_side_effects_when_flag_off(self):
         mod = self._load()
@@ -1344,7 +1559,8 @@ class PollReachGateTests(_Base):
 
     def _ctrl(self, mod):
         return mod.AirMouseController(mod.ReachBox(2560, 1440),
-                                      debounce_frames=1, grace_sec=0.0)
+                                      debounce_frames=1, grace_sec=0.0,
+                                      engage_debounce_frames=1)
 
     def test_relaxed_arms_make_zero_setcursorpos_calls(self):
         mod = self._load()
@@ -1639,7 +1855,8 @@ class HandMirrorTests(_Base):
         # patch is the most-recent (it wins on lookup) — this test needs it on.
         self._mirror_on(mod)
         ctrl = mod.AirMouseController(mod.ReachBox(2560, 1440),
-                                      debounce_frames=1, grace_sec=0.0)
+                                      debounce_frames=1, grace_sec=0.0,
+                                      engage_debounce_frames=1)
         # Owner's REAL left hand = SDK right arm extended; owner closes their REAL
         # left hand = SDK hand_right closes. Model that as the SDK's RIGHT.
         mod._poll_once(ctrl, _fake_bridge(
@@ -1939,6 +2156,9 @@ class ControllingHandHysteresisTests(_Base):
     def _ctrl(self, mod, **kw):
         kw.setdefault("debounce_frames", 1)
         kw.setdefault("grace_sec", 0.0)
+        # engage_debounce_frames=1 so a single update() engages immediately in these
+        # state-machine tests (the multi-frame engage DEBOUNCE has its own class).
+        kw.setdefault("engage_debounce_frames", 1)
         return mod.AirMouseController(mod.ReachBox(2560, 1440), **kw)
 
     def _arm(self, mod, side, lift, straight):
@@ -2045,6 +2265,158 @@ class ControllingHandHysteresisTests(_Base):
         self.assertEqual(c._challenge_count, 0)
         self.assertIsNone(c._challenge_side)
 
+    def test_noncontrolling_hand_does_not_move_cursor(self):
+        """THE OWNER'S BUG (FIX 2): with both hands raised the cursor must follow
+        ONLY the controlling hand — the OTHER hand must NOT influence the cursor
+        POSITION at all (no 'both hands connect to the same spot' / averaging). Hold
+        the controlling (right) hand STILL while the idle (left) hand sweeps; the
+        cursor must NOT move."""
+        mod = self._load()
+        c = self._ctrl(mod)
+
+        def right_arm(hand_x):
+            # Controlling hand held at a FIXED body-relative position.
+            return mod.ArmExtension("right", forward_m=0.0, straightness=None,
+                                    hand=(hand_x, SHOULDER_Y + 0.30, 1.8, 2),
+                                    lift_m=0.30, shoulder_ref_y=SHOULDER_Y,
+                                    body_center_x=0.0)
+
+        def left_arm(hand_x, lift):
+            # Idle hand, lower (so it's never the controller), sweeping in X.
+            return mod.ArmExtension("left", forward_m=0.0, straightness=None,
+                                    hand=(hand_x, SHOULDER_Y + lift, 1.8, 2),
+                                    lift_m=lift, shoulder_ref_y=SHOULDER_Y,
+                                    body_center_x=0.0)
+
+        # Engage with the right hand controlling (higher).
+        c.update(left_arm(-0.1, 0.10), right_arm(0.10), "open", "open", True)
+        base = c.update(left_arm(-0.1, 0.10), right_arm(0.10),
+                        "open", "open", True).cursor
+        self.assertEqual(c.hand, "right")
+        # Sweep the LEFT (idle) hand wildly while the RIGHT hand stays put.
+        cursors = []
+        for lx in (-0.4, -0.2, 0.0, 0.2, 0.4):
+            d = c.update(left_arm(lx, 0.10), right_arm(0.10), "open", "open", True)
+            cursors.append(d.cursor)
+            self.assertEqual(d.hand, "right")     # controller never flips
+        # The cursor is unchanged by the idle hand's motion (within EMA settle).
+        self.assertTrue(all(cur == base for cur in cursors),
+                        f"idle hand moved the cursor: base={base} got={cursors}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  FIX 3 — ENGAGE DEBOUNCE: a raised hand must HOLD above the engage line for a
+#  few consecutive frames before the cursor is taken, so a 1-frame Kinect height
+#  spike can't grab it. DISENGAGE stays instant.
+# ══════════════════════════════════════════════════════════════════════════
+class EngageDebounceTests(_Base):
+    def _ctrl(self, mod, frames):
+        return mod.AirMouseController(mod.ReachBox(2560, 1440),
+                                      debounce_frames=1, grace_sec=0.0,
+                                      engage_debounce_frames=frames)
+
+    def _ext(self, mod, side, **kw):
+        j = _extended_arm_joints(side, **kw)
+        return mod.ArmExtension.from_bridge(mod._local_arm_extension(j, side))
+
+    def _relaxed(self, mod, side):
+        j = _relaxed_arm_joints(side)
+        return mod.ArmExtension.from_bridge(mod._local_arm_extension(j, side))
+
+    def test_single_frame_spike_does_not_engage(self):
+        mod = self._load()
+        c = self._ctrl(mod, frames=3)
+        # ONE frame with a raised hand (a spike), then the hand drops: must NEVER
+        # engage — the cursor was never taken.
+        d1 = c.update(self._relaxed(mod, "left"), self._ext(mod, "right"),
+                      "open", "open", True)
+        self.assertFalse(c.engaged)
+        self.assertIsNone(d1.cursor)            # held off — no SetCursorPos
+        self.assertEqual(d1.overlay, "hidden")
+        # Hand drops back below the line → streak resets, still disengaged.
+        d2 = c.update(self._relaxed(mod, "left"), self._relaxed(mod, "right"),
+                      "open", "open", True)
+        self.assertFalse(c.engaged)
+        self.assertIsNone(d2.cursor)
+
+    def test_sustained_raise_engages_after_debounce(self):
+        mod = self._load()
+        c = self._ctrl(mod, frames=3)
+        # Frames 1 & 2: building the streak, held off (no cursor yet).
+        for _ in range(2):
+            d = c.update(self._relaxed(mod, "left"), self._ext(mod, "right"),
+                         "open", "open", True)
+            self.assertFalse(c.engaged)
+            self.assertIsNone(d.cursor)
+        # Frame 3: the raise has held long enough → ENGAGE, cursor taken.
+        d3 = c.update(self._relaxed(mod, "left"), self._ext(mod, "right"),
+                      "open", "open", True)
+        self.assertTrue(c.engaged)
+        self.assertIsNotNone(d3.cursor)
+        self.assertEqual(d3.overlay, "track")
+
+    def test_spike_resets_streak_so_it_never_accumulates(self):
+        mod = self._load()
+        c = self._ctrl(mod, frames=3)
+        # Raise (streak 1), drop (reset), raise (streak 1 again) — must NOT have
+        # engaged from two non-consecutive raised frames.
+        c.update(self._relaxed(mod, "left"), self._ext(mod, "right"),
+                 "open", "open", True)
+        c.update(self._relaxed(mod, "left"), self._relaxed(mod, "right"),
+                 "open", "open", True)
+        d = c.update(self._relaxed(mod, "left"), self._ext(mod, "right"),
+                     "open", "open", True)
+        self.assertFalse(c.engaged)            # streak restarted, not yet met
+        self.assertIsNone(d.cursor)
+
+    def test_disengage_is_not_debounced(self):
+        mod = self._load()
+        c = self._ctrl(mod, frames=3)
+        # Engage (3 held frames), then drop in ONE frame → immediate release (no
+        # symmetric debounce on the way down).
+        for _ in range(3):
+            c.update(self._relaxed(mod, "left"), self._ext(mod, "right"),
+                     "open", "open", True)
+        self.assertTrue(c.engaged)
+        d = c.update(self._relaxed(mod, "left"), self._relaxed(mod, "right"),
+                     "open", "open", True)
+        self.assertFalse(c.engaged)            # released at once
+        self.assertIsNone(d.cursor)
+
+    def test_held_button_not_emitted_during_holdoff(self):
+        mod = self._load()
+        c = self._ctrl(mod, frames=3)
+        # During the engage hold-off, even a closed hand must not fire a click (we
+        # haven't engaged yet) — no spurious button edge before engagement.
+        d = c.update(self._relaxed(mod, "left"), self._ext(mod, "right"),
+                     "open", "closed", True)
+        self.assertFalse(c.engaged)
+        self.assertIsNone(d.right)
+        self.assertIsNone(d.left)
+        self.assertFalse(c.right_is_down)
+
+    def test_poll_holdoff_makes_zero_setcursorpos_then_engages(self):
+        """Through the LIVE _poll_once with the LIVE default debounce: a 1-frame
+        raise makes ZERO cursor moves; a sustained raise eventually moves it."""
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        moves, buttons = self._capture_mouse(mod)
+        # Use the module default engage debounce (the real policy) via a plain ctrl.
+        ctrl = mod.AirMouseController(mod.ReachBox(2560, 1440),
+                                      debounce_frames=1, grace_sec=0.0)
+        # One raised frame → held off, no move yet.
+        mod._poll_once(ctrl, _fake_bridge(
+            bodies=[_body(reach_side="right", grip_right="open")]))
+        self.assertFalse(ctrl.engaged)
+        self.assertEqual(moves, [])
+        # Keep raising until it engages (bounded by the debounce frames).
+        for _ in range(mod.AIR_MOUSE_ENGAGE_DEBOUNCE_FRAMES):
+            mod._poll_once(ctrl, _fake_bridge(
+                bodies=[_body(reach_side="right", grip_right="open")]))
+        self.assertTrue(ctrl.engaged)
+        self.assertGreaterEqual(len(moves), 1)
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  AUTO-YIELD to real input — the air-mouse never fights the real mouse.
@@ -2060,6 +2432,9 @@ class AutoYieldControllerTests(_Base):
     def _ctrl(self, mod, **kw):
         kw.setdefault("debounce_frames", 1)
         kw.setdefault("grace_sec", 0.0)
+        # engage_debounce_frames=1 so a single update() engages immediately in these
+        # state-machine tests (the multi-frame engage DEBOUNCE has its own class).
+        kw.setdefault("engage_debounce_frames", 1)
         return mod.AirMouseController(mod.ReachBox(2560, 1440), **kw)
 
     def _ext(self, mod, side, **kw):
@@ -2224,7 +2599,8 @@ class AutoYieldPollIntegrationTests(_Base):
 
     def _ctrl(self, mod):
         return mod.AirMouseController(mod.ReachBox(2560, 1440),
-                                      debounce_frames=1, grace_sec=0.0)
+                                      debounce_frames=1, grace_sec=0.0,
+                                      engage_debounce_frames=1)
 
     def test_poll_yields_to_recent_real_input(self):
         mod = self._load()

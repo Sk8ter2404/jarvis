@@ -223,13 +223,35 @@ AIR_MOUSE_GRIP_DEBOUNCE_FRAMES = 2
 # or hold the gate (its engage/disengage bars are made permissive below so they
 # cannot keep the air-mouse engaged); HEIGHT is the necessary + primary gate.
 #
-# DEFAULTS: a hand AT the shoulder (lift_m ≈ 0) sits at the engage line; raising it
-# a touch (≳ +5 cm) engages; dropping it ~10 cm below the shoulder releases.
-AIR_MOUSE_ENGAGE_UP_MARGIN_M = 0.05      # lift_m must exceed this to ENGAGE (hand
-#                                          at/just above the shoulder)
+# DEFAULTS: a hand AT the shoulder (lift_m ≈ 0) sits just under the engage line;
+# raising it a touch (≳ +7 cm) engages; dropping it ~10 cm below the shoulder
+# releases.
+#
+# TUNED 2026-06-09 (owner: "better about not triggering unless I reach but not
+#   perfect"): up-margin 0.05 → 0.07. A hand merely AT shoulder height (lift ≈ 0,
+#   e.g. resting an elbow / gesturing) sat only 5 cm under the old bar and
+#   occasionally tripped a false engage; +7 cm requires a clearer, deliberate LIFT
+#   to take the cursor while still being an easy reach. PAIRED with the engage
+#   DEBOUNCE below (the lift must HOLD above the bar for a few frames) so a 1-frame
+#   Kinect Y-spike can't engage. DISENGAGE stays responsive (immediate drop below
+#   the down-margin / on yield) — only ENGAGE is hardened.
+AIR_MOUSE_ENGAGE_UP_MARGIN_M = 0.07      # lift_m must exceed this to ENGAGE (hand
+#                                          clearly above the shoulder)
 AIR_MOUSE_ENGAGE_DOWN_MARGIN_M = -0.10   # drop below this (~10 cm under the
 #                                          shoulder) to DISENGAGE (hysteresis:
 #                                          DOWN < UP so the gate can't flap)
+
+# ENGAGE DEBOUNCE (FIX 3): how many CONSECUTIVE frames the lift must hold above the
+# engage (up) margin before the air-mouse actually ENGAGES. This rejects a 1-frame
+# Kinect height spike (a momentary hand-joint jump above the shoulder) so a brief
+# blip never grabs the cursor — only a SUSTAINED raise does. DISENGAGE is NOT
+# debounced (it stays instant on a drop below the down-margin or on auto-yield), so
+# the gate is hard to engage by accident but quick to release.
+#
+# At 30 Hz, 3 frames ≈ 100 ms — long enough to swallow a lone spike, short enough
+# that a real raise still feels immediate. Drop to 2 if engaging feels sluggish;
+# raise toward 4-5 if spikes still slip through.
+AIR_MOUSE_ENGAGE_DEBOUNCE_FRAMES = 3
 
 # ─── LEGACY forward-REACH cues (DEMOTED to permissive secondary) ─────────────
 # Forward reach is no longer the gate. These bars are kept ONLY so the old
@@ -312,42 +334,95 @@ AIR_MOUSE_DISENGAGE_GRACE_SEC = 0.30
 AIR_MOUSE_YIELD_WINDOW_SEC = 1.5
 
 # ─── controlling-hand HYSTERESIS (ISSUE 3: both-hands stability) ─────────────
-# With BOTH hands raised the cursor must NOT thrash between them frame-to-frame.
-# Once a hand is driving the cursor it STAYS the controlling hand until the OTHER
-# hand is BOTH clearly more extended (its reach_score leads by at least
-# HAND_SWITCH_MARGIN) AND has been so for HAND_SWITCH_FRAMES consecutive frames.
-# A brief wobble where the idle hand momentarily out-reaches by a hair can never
-# flip control. (The L/R clicks are tracked for BOTH hands regardless — only the
-# CURSOR-driving hand is sticky.)
-HAND_SWITCH_MARGIN = 0.25     # challenger must lead the holder's score by this
-HAND_SWITCH_FRAMES = 6        # …for this many consecutive frames before it wins
-
-# The comfortable reach-box in front of the user, in camera-space METRES, that
-# maps onto the whole virtual desktop. Centred roughly on where a seated user's
-# hand naturally sits when reaching at the screen. x: sensor-RIGHT is +; the box
-# is wider than tall to match a 16:9 screen. y: sensor-UP is +; centred near
-# shoulder height. These are the v1 defaults; v2 makes them per-user calibrated.
-#   half-width  → ±X metres from centre maps to the desktop's left/right edges
-#   half-height → ±Y metres from centre maps to the desktop's top/bottom edges
+# With BOTH hands raised the cursor must NOT thrash between them frame-to-frame /
+# connect both hands to the same spot. ONE hand controls the cursor POSITION — the
+# higher-raised one — and it STAYS the controller until the OTHER hand is BOTH
+# clearly higher (its reach_score — the hand HEIGHT above the shoulder, lift_m in
+# metres — leads the holder by at least HAND_SWITCH_MARGIN metres) AND has been so
+# for HAND_SWITCH_FRAMES consecutive frames. The NON-controlling hand does NOT
+# influence the cursor position AT ALL. A brief wobble where the idle hand
+# momentarily out-raises by a hair can never flip control → zero frame-to-frame
+# thrashing. (The per-hand L/R CLICKS are tracked for BOTH hands regardless — only
+# the cursor POSITION is locked to the one controller.)
 #
-# TUNED 2026-06-08 (owner: "shouldn't need huge arm swings to cross the screen").
-#   The smaller the box, the LESS hand travel maps to the full desktop, i.e.
-#   higher sensitivity. The old ±0.35 m / ±0.22 m box demanded a ~70 cm-wide
-#   sweep edge-to-edge — a whole-arm shoulder swing. A natural pointing arc with
-#   the elbow tucked (forearm pivoting at the elbow/wrist) is only ~±25 cm
-#   horizontal / ~±15 cm vertical, so:
-#     REACH_HALF_W 0.35 → 0.26  (full desktop width  in a ~52 cm hand sweep)
-#     REACH_HALF_H 0.22 → 0.16  (full desktop height in a ~32 cm hand sweep)
-#   That maps a comfortable forearm arc to the whole virtual desktop — small
-#   hand moves now cover the screen. The ~1.6 W:H ratio is kept ≈16:9 so x and y
-#   sensitivity stay proportionate (no axis feels twitchier than the other).
-#   The EMA + debounce above keep this from feeling jittery despite the higher
-#   gain. Widen these (toward the old values) if it feels too sensitive; shrink
-#   further for even less travel.
-REACH_CENTER_X = 0.0      # metres (centred on the sensor's optical axis)
-REACH_CENTER_Y = 0.30     # metres above the sensor (≈ seated shoulder height)
-REACH_HALF_W = 0.26       # ±0.26 m horizontal reach → full desktop width
-REACH_HALF_H = 0.16       # ±0.16 m vertical reach → full desktop height
+# TUNED 2026-06-09 (owner: "both hands connect both to the same spot — want it to
+#   behave like a tablet screen"): STRONGER hysteresis so two raised hands lock to
+#   ONE controller. reach_score() is the hand height above the shoulder in METRES,
+#   so HAND_SWITCH_MARGIN is now a physical 0.08 m (8 cm): the challenger hand must
+#   be a clear 8 cm HIGHER than the hand that's driving — AND hold that lead for 8
+#   straight frames (~0.27 s at 30 Hz) — before the cursor switches to it. Below
+#   that the holder keeps the cursor and the other hand is ignored for POSITION.
+HAND_SWITCH_MARGIN = 0.08     # challenger must lead the holder by 0.08 m (height)
+HAND_SWITCH_FRAMES = 8        # …for this many consecutive frames before it wins
+
+# ─── TABLET-FEEL reach plane (FIX 1: absolute, body-relative, aspect-matched) ──
+# The controlling hand maps like TOUCHING A GIANT INVISIBLE TOUCHSCREEN that IS the
+# monitors: the hand's position in a body-relative 2D reach plane in front of the
+# owner maps DIRECTLY / ABSOLUTELY onto the virtual desktop — hand at the plane's
+# top-left → cursor desktop top-left, hand at plane centre → desktop centre, hand
+# bottom-right → desktop bottom-right. It is ABSOLUTE (hand position → cursor
+# position), NOT relative/velocity, so the cursor IS wherever the hand is on the
+# plane, exactly like a finger on a tablet.
+#
+# THREE properties make it feel like a tablet (2026-06-09 owner: "behave like a
+# tablet screen"):
+#  (a) ASPECT-MATCHED — the plane's half-HEIGHT is derived from its half-WIDTH and
+#      the live virtual-desktop aspect: plane_half_h = plane_half_w · (desktopH /
+#      desktopW). So X and Y scale EQUALLY (no stretch): a hand moved the same real
+#      distance horizontally vs vertically moves the cursor proportionally on
+#      screen. The half-width is the single tunable (KINECT_REACH_HALF_W); the
+#      height follows the monitors.
+#  (b) BODY-RELATIVE — the plane is CENTRED on the body, not the sensor axis: hand
+#      X is taken relative to the body centre (spine_shoulder X), hand Y relative to
+#      a shoulder-line Y reference (shoulder_ref_y, +a small comfort offset above
+#      it). So the same hand offset maps to the same cursor spot no matter where
+#      the owner sits / stands / shifts in the frame.
+#  (c) ABSOLUTE + LIGHT EMA — a light exponential smooth (AIR_MOUSE_EMA_ALPHA) tames
+#      Kinect jitter without visibly lagging the hand; the smoothed body-relative
+#      (x, y) maps straight to the desktop pixel.
+#
+# REACH_HALF_W is the comfortable HALF-width of the plane in METRES — ±this much
+# hand travel from the body centre spans the desktop's left↔right edges. A natural
+# forearm arc (elbow tucked) is ~±25 cm, so ±0.26 m maps the whole virtual desktop
+# to a ~52 cm hand sweep — small moves cover the screen. The half-HEIGHT is NOT a
+# constant any more: it is computed per the desktop aspect (see ReachBox), so the
+# vertical sweep auto-fits the monitors with no axis twitchier than the other.
+# Override the width live via KINECT_REACH_HALF_W (height derived from it); widen
+# for less sensitivity, shrink for less hand travel.
+REACH_CENTER_X = 0.0      # legacy fallback centre (used only when no body centre is
+#                           available); the live plane is BODY-relative (spine X).
+REACH_CENTER_Y = 0.30     # legacy fallback centre Y (used only when no shoulder Y
+#                           reference is available); live plane keys off the shoulder.
+REACH_CENTER_Y_OFFSET = 0.10  # comfort offset: the plane centres this far ABOVE the
+#                               shoulder line (a relaxed pointing hand sits a touch
+#                               above the shoulder), so the desktop centre lands at a
+#                               natural mid-reach height rather than exactly at the
+#                               shoulder.
+REACH_HALF_W = 0.26       # ±0.26 m horizontal reach → full desktop width (tunable
+#                           via KINECT_REACH_HALF_W; the HEIGHT is derived per aspect)
+# Legacy constant kept ONLY for back-compat callers / the 2-arg ReachBox; the live
+# half-height is ALWAYS derived from the width × desktop aspect, never this value.
+REACH_HALF_H = 0.16
+
+
+def _env_float(name: str, default: float) -> float:
+    """A float from an environment variable, or `default` when unset/unparseable.
+    Lets the owner tune the reach plane live (KINECT_REACH_HALF_W) without editing
+    code. NEVER raises."""
+    try:
+        v = os.environ.get(name)
+        if v is None or v.strip() == "":
+            return float(default)
+        return float(v)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def reach_half_w() -> float:
+    """The live reach-plane HALF-WIDTH in metres — KINECT_REACH_HALF_W if the owner
+    set it, else REACH_HALF_W. The half-HEIGHT is derived from this × the desktop
+    aspect (ReachBox), so width is the only knob."""
+    return _env_float("KINECT_REACH_HALF_W", REACH_HALF_W)
 
 # Default geometry used only as a fallback when the real virtual-desktop bounds
 # can't be read (headless / win32 absent). The live bounds are resolved at
@@ -372,33 +447,52 @@ AIR_CURSOR_STATE_FILE = os.path.join(PROJECT_DIR, "air_cursor_state.json")
 # ══════════════════════════════════════════════════════════════════════════
 
 class ReachBox:
-    """The comfortable reach-box → VIRTUAL-DESKTOP mapping.
+    """The TABLET-FEEL reach plane → VIRTUAL-DESKTOP mapping (FIX 1).
 
-    Maps a hand (x, y) in camera-space metres onto an absolute virtual-desktop
-    pixel that spans EVERY monitor. The desktop is described by its top-left
-    origin (origin_x, origin_y) and its (width, height); the origin is NEGATIVE
-    for monitors arranged left-of / above the primary, so a fully left monitor is
-    reachable too (SetCursorPos accepts these virtual coordinates directly). A
-    hand at the box centre lands at the desktop centre, the box edges land at the
+    Maps the controlling hand's body-relative (x, y) onto an absolute virtual-
+    desktop pixel spanning EVERY monitor — like touching a giant invisible
+    touchscreen that IS the monitors. The desktop is described by its top-left
+    origin (origin_x, origin_y) and its (width, height); the origin is NEGATIVE for
+    monitors arranged left-of / above the primary, so a fully left monitor is
+    reachable too (SetCursorPos accepts these virtual coordinates directly). A hand
+    at the plane centre lands at the desktop centre, the plane edges land at the
     desktop edges, and anything beyond is CLAMPED to the desktop bounds (so a hand
-    that overshoots the box parks the cursor at the edge rather than flying off).
+    that overshoots the plane parks the cursor at the edge rather than flying off).
 
-    X is NON-mirrored: the Kinect color/body image is itself mirror-flipped
-    relative to the user, so the user's hand moving to THEIR right reads as +x and
-    we map +x straight to a larger cursor x — hand right → cursor right, hand left
-    → cursor left, natural and un-mirrored. y increases UP in camera space but
-    screen y increases DOWN, so y is inverted.
+    ABSOLUTE: the hand POSITION on the plane maps DIRECTLY to the cursor POSITION
+    (not relative / velocity) — hand top-left → cursor top-left, etc.
+
+    ASPECT-MATCHED (no stretch): unless an explicit half_h is given, the plane's
+    half-HEIGHT is DERIVED from its half-WIDTH and the desktop aspect —
+        half_h = half_w · (screen_h / screen_w)
+    so X and Y scale EQUALLY: a hand moved the same real distance horizontally vs
+    vertically moves the cursor proportionally on screen, with no axis twitchier
+    than the other.
+
+    BODY-RELATIVE: map() accepts an optional (body_x, body_y) — the body centre
+    (spine_shoulder X) and the shoulder-line Y reference. When given, the hand is
+    measured RELATIVE to the body (centred on body_x, and on body_y + a comfort
+    offset), so the same hand offset maps to the same cursor spot wherever the owner
+    sits / stands / shifts. When omitted it falls back to the fixed center_x /
+    center_y (legacy / tests).
+
+    X is NON-mirrored: the Kinect color/body image is itself mirror-flipped relative
+    to the user, so the user's hand moving to THEIR right reads as +x and we map +x
+    straight to a larger cursor x — hand right → cursor right. y increases UP in
+    camera space but screen y increases DOWN, so y is inverted (up = up).
 
     Back-compat: the 2-positional form ``ReachBox(width, height)`` keeps the old
-    primary-only behaviour with a (0, 0) origin; pass origin_x / origin_y to span
-    the whole virtual desktop."""
+    (0, 0)-origin behaviour; pass origin_x / origin_y to span the whole virtual
+    desktop. Passing half_h explicitly pins the height (the aspect derivation is
+    skipped) — used by a couple of legacy tests."""
 
     def __init__(self, width: int, height: int,
                  origin_x: int = 0, origin_y: int = 0,
                  center_x: float = REACH_CENTER_X,
                  center_y: float = REACH_CENTER_Y,
-                 half_w: float = REACH_HALF_W,
-                 half_h: float = REACH_HALF_H):
+                 half_w: "Optional[float]" = None,
+                 half_h: "Optional[float]" = None,
+                 center_y_offset: float = REACH_CENTER_Y_OFFSET):
         # Kept named screen_w / screen_h for back-compat with existing callers;
         # these are the virtual-desktop extents (all monitors), not just primary.
         self.screen_w = int(width)
@@ -407,19 +501,53 @@ class ReachBox:
         self.origin_y = int(origin_y)
         self.center_x = float(center_x)
         self.center_y = float(center_y)
-        # Guard against a zero/negative half-extent (divide-by-zero); floor it.
-        self.half_w = max(1e-3, float(half_w))
-        self.half_h = max(1e-3, float(half_h))
+        self.center_y_offset = float(center_y_offset)
+        # The half-WIDTH is the single knob (env-tunable default). Guard against a
+        # zero/negative extent (divide-by-zero); floor it.
+        hw = reach_half_w() if half_w is None else float(half_w)
+        self.half_w = max(1e-3, hw)
+        # ASPECT-MATCH the half-HEIGHT to the desktop unless one was pinned: derive
+        # it from the width × (desktopH / desktopW) so X and Y scale EQUALLY (no
+        # stretch). Fall back to the legacy REACH_HALF_H if the aspect is unusable.
+        if half_h is not None:
+            self.half_h = max(1e-3, float(half_h))
+        else:
+            self.half_h = max(1e-3, self._aspect_half_h())
 
-    def map(self, hand_x: float, hand_y: float) -> tuple[int, int]:
+    def _aspect_half_h(self) -> float:
+        """The aspect-matched half-height: half_w × (screen_h / screen_w). Falls
+        back to REACH_HALF_H when the desktop extents are unusable."""
+        try:
+            if self.screen_w > 0 and self.screen_h > 0:
+                return self.half_w * (float(self.screen_h) / float(self.screen_w))
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+        return REACH_HALF_H
+
+    def normalize(self, hand_x: float, hand_y: float,
+                  body_x: "Optional[float]" = None,
+                  body_y: "Optional[float]" = None) -> "tuple[float, float]":
+        """The hand's BODY-RELATIVE normalised position on the plane in -1..+1
+        (before clamping), with y already screen-oriented (up = up → smaller py).
+        The plane centre is (body_x, body_y + comfort offset) when a body reference
+        is given, else the fixed (center_x, center_y). Returned for the debug line
+        (nx/ny) so the owner can see exactly where on the plane the hand sits."""
+        cx = self.center_x if body_x is None else float(body_x)
+        cy = (self.center_y if body_y is None
+              else float(body_y) + self.center_y_offset)
+        nx = (float(hand_x) - cx) / self.half_w
+        ny = (float(hand_y) - cy) / self.half_h
+        # Invert y so camera-UP maps to screen-TOP (up = up); X stays non-mirrored.
+        return nx, -ny
+
+    def map(self, hand_x: float, hand_y: float,
+            body_x: "Optional[float]" = None,
+            body_y: "Optional[float]" = None) -> tuple[int, int]:
         """(hand_x, hand_y) metres → (px, py) absolute VIRTUAL-DESKTOP pixel,
-        clamped to the desktop bounds (origin .. origin+extent-1)."""
-        # Normalise to -1..+1 within the box.
-        nx = (float(hand_x) - self.center_x) / self.half_w
-        ny = (float(hand_y) - self.center_y) / self.half_h
-        # X is NON-mirrored (the camera image is already mirror-flipped, so +x =
-        # hand-right = cursor-right). Invert y (camera-up → screen-down).
-        ny = -ny
+        clamped to the desktop bounds (origin .. origin+extent-1). BODY-RELATIVE
+        when (body_x, body_y) are supplied (tablet-feel); otherwise centred on the
+        fixed plane centre (legacy)."""
+        nx, ny = self.normalize(hand_x, hand_y, body_x=body_x, body_y=body_y)
         # -1..+1 → 0..1 → absolute virtual-desktop pixel (origin + offset).
         fx = (nx + 1.0) * 0.5
         fy = (ny + 1.0) * 0.5
@@ -593,23 +721,29 @@ class ArmExtension:
     BELOW the shoulder (lift_m ≪ 0), so the height gate keeps it disengaged.
 
     BODY-RELATIVE: lift_m is hand height ABOVE the shoulder line, so engage/disengage
-    is invariant to rotation, chair position, and distance from the sensor."""
+    is invariant to rotation, chair position, and distance from the sensor.
+    shoulder_ref_y + body_center_x are the body REFERENCES the tablet-feel reach
+    plane is centred on (FIX 1): the controller measures the hand RELATIVE to
+    (body_center_x, shoulder_ref_y) so the cursor mapping is the same wherever the
+    owner sits / stands / shifts."""
 
     __slots__ = ("side", "forward_m", "reach_ratio", "straightness", "hand",
-                 "lift_m", "shoulder_ref_y")
+                 "lift_m", "shoulder_ref_y", "body_center_x")
 
     def __init__(self, side: str, forward_m: Optional[float],
                  straightness: Optional[float], hand=None,
                  reach_ratio: Optional[float] = None,
                  lift_m: Optional[float] = None,
-                 shoulder_ref_y: Optional[float] = None):
+                 shoulder_ref_y: Optional[float] = None,
+                 body_center_x: Optional[float] = None):
         self.side = side
         self.forward_m = forward_m
         self.reach_ratio = reach_ratio   # forward reach / body scale (secondary)
         self.straightness = straightness
         self.hand = hand   # (x, y, z, state) of the controlling hand, or None
         self.lift_m = lift_m            # hand_y - shoulder_ref_y (PRIMARY gate)
-        self.shoulder_ref_y = shoulder_ref_y
+        self.shoulder_ref_y = shoulder_ref_y    # shoulder-line Y (plane centre Y)
+        self.body_center_x = body_center_x      # spine_shoulder X (plane centre X)
 
     @classmethod
     def from_bridge(cls, ext: dict) -> "ArmExtension":
@@ -618,7 +752,8 @@ class ArmExtension:
                    ext.get("straightness"), ext.get("hand"),
                    reach_ratio=ext.get("reach_ratio"),
                    lift_m=ext.get("lift_m"),
-                   shoulder_ref_y=ext.get("shoulder_ref_y"))
+                   shoulder_ref_y=ext.get("shoulder_ref_y"),
+                   body_center_x=ext.get("body_center_x"))
 
     def is_extended(self, *, engaged: bool, thresholds: "Optional[dict]" = None,
                     up_margin: float = AIR_MOUSE_ENGAGE_UP_MARGIN_M,
@@ -829,7 +964,8 @@ class AirMouseController:
                  grace_sec: float = AIR_MOUSE_DISENGAGE_GRACE_SEC,
                  clock=time.monotonic,
                  switch_margin: float = HAND_SWITCH_MARGIN,
-                 switch_frames: int = HAND_SWITCH_FRAMES):
+                 switch_frames: int = HAND_SWITCH_FRAMES,
+                 engage_debounce_frames: int = AIR_MOUSE_ENGAGE_DEBOUNCE_FRAMES):
         self.reach = reach
         self._ema_x = EMA(alpha)
         self._ema_y = EMA(alpha)
@@ -845,6 +981,14 @@ class AirMouseController:
         self._engaged = False        # is the air-mouse currently driving the cursor
         self._hand: Optional[str] = None   # which hand is driving ("left"/"right")
         self._last_engaged_at = 0.0  # clock() of the last EXTENDED+tracked frame
+        # ENGAGE DEBOUNCE (FIX 3): a raised hand must persist above the engage line
+        # for this many CONSECUTIVE frames before the cursor is actually taken, so a
+        # 1-frame Kinect height spike can't grab it. DISENGAGE stays instant.
+        self._engage_debounce_frames = max(1, int(engage_debounce_frames))
+        self._engage_streak = 0      # consecutive frames a hand has cleared the line
+        # Last normalised plane position (nx, ny) for the ~2 Hz tuning debug line.
+        self._last_nx: Optional[float] = None
+        self._last_ny: Optional[float] = None
         # Controlling-hand HYSTERESIS (ISSUE 3): the challenger must out-reach the
         # holder by `switch_margin` for `switch_frames` consecutive frames before
         # the cursor switches hands, so two raised hands can't thrash the cursor.
@@ -868,6 +1012,9 @@ class AirMouseController:
         self._engaged = False
         self._hand = None
         self._last_engaged_at = 0.0
+        self._engage_streak = 0
+        self._last_nx = None
+        self._last_ny = None
         self._challenge_side = None
         self._challenge_count = 0
 
@@ -909,6 +1056,9 @@ class AirMouseController:
         self._right_down = False
         self._engaged = False
         self._hand = None
+        self._engage_streak = 0
+        self._last_nx = None
+        self._last_ny = None
         self._challenge_side = None
         self._challenge_count = 0
         self._ema_x.reset()
@@ -916,6 +1066,17 @@ class AirMouseController:
         self._grip_left.reset(initial="open")
         self._grip_right.reset(initial="open")
         return AirMouseDecision(cursor=None, left=left, right=right,
+                                overlay="hidden", hand=None, grip="open")
+
+    def _hold_off_decision(self) -> AirMouseDecision:
+        """The ENGAGE-DEBOUNCE 'not yet' decision (FIX 3): a hand is raised above the
+        engage line but hasn't held there long enough to take the cursor. Like a
+        disengaged frame — cursor=None (NO SetCursorPos, the physical mouse is free)
+        and the overlay hidden — but WITHOUT touching the grip debouncers / EMA (we
+        haven't engaged, so there's nothing to release and no edge to emit). The
+        engage streak (advanced by the caller) is preserved so the next frame can
+        cross the threshold."""
+        return AirMouseDecision(cursor=None, left=None, right=None,
                                 overlay="hidden", hand=None, grip="open")
 
     def _hand_button_edge(self, debouncer: GripDebouncer, raw_grip: str,
@@ -1033,20 +1194,47 @@ class AirMouseController:
         if arm is None:
             return self.release_decision()
 
+        # ── ENGAGE DEBOUNCE (FIX 3): a hand cleared the engage line, but if we're
+        #    not already engaged it must HOLD there for `_engage_debounce_frames`
+        #    consecutive frames before we take the cursor — so a 1-frame Kinect
+        #    height spike can't grab it. Build the streak; until it's met, hold off
+        #    (cursor=None, overlay hidden) and leave the real mouse alone. Once
+        #    ENGAGED this is bypassed — staying engaged uses the lower down-margin
+        #    hysteresis in is_extended(), and DISENGAGE is never debounced. ───────
+        if not self._engaged:
+            self._engage_streak += 1
+            if self._engage_streak < self._engage_debounce_frames:
+                return self._hold_off_decision()
+
         # ── ENGAGED. On the rising edge (was disengaged) snap the smoothing to
         #    the new hand position so the cursor doesn't sweep from a stale value.
         if not self._engaged:
             self._ema_x.reset()
             self._ema_y.reset()
         self._engaged = True
+        self._engage_streak = 0       # met the bar; clear so a later re-engage re-debounces
         self._hand = arm.side
         self._last_engaged_at = self._clock()
 
-        # Smooth the controlling hand's position, then map to a pixel.
+        # TABLET-FEEL mapping (FIX 1): smooth ONLY the controlling hand's position
+        # (a LIGHT EMA to tame Kinect jitter without visibly lagging the hand), then
+        # map it ABSOLUTELY onto the desktop measured RELATIVE to the body centre
+        # (spine_shoulder X) and the shoulder-line Y. So the cursor IS wherever the
+        # hand is on the body-relative plane, like a finger on a tablet, the same no
+        # matter where the owner sits/stands/shifts. The non-controlling hand is NOT
+        # consulted here at all — only this `arm` drives the cursor POSITION.
         hand = arm.hand
         sx = self._ema_x.update(float(hand[0]))
         sy = self._ema_y.update(float(hand[1]))
-        cursor = self.reach.map(sx, sy)
+        body_x = arm.body_center_x          # None → plane falls back to fixed centre
+        body_y = arm.shoulder_ref_y
+        cursor = self.reach.map(sx, sy, body_x=body_x, body_y=body_y)
+        # Stash the normalised plane position for the ~2 Hz debug line (nx/ny).
+        try:
+            self._last_nx, self._last_ny = self.reach.normalize(
+                sx, sy, body_x=body_x, body_y=body_y)
+        except Exception:
+            self._last_nx = self._last_ny = None
 
         # Per-hand clicks: evaluate BOTH hands every engaged frame so either hand
         # can click regardless of which drives the cursor. LEFT hand → LEFT
@@ -1577,7 +1765,7 @@ def _local_arm_extension(joints: dict, side: str) -> dict:
     out = {"side": side, "hand": None, "forward_reach_m": None,
            "reach_ratio": None, "body_scale_m": None,
            "straightness": None, "shoulder_hand_m": None, "arm_len_m": None,
-           "shoulder_ref_y": None, "lift_m": None}
+           "shoulder_ref_y": None, "lift_m": None, "body_center_x": None}
     try:
         shoulder = joints.get(f"shoulder_{side}")
         elbow = joints.get(f"elbow_{side}")
@@ -1593,6 +1781,12 @@ def _local_arm_extension(joints: dict, side: str) -> dict:
                 and hand and len(hand) >= 2):
             out["shoulder_ref_y"] = float(shoulder_ref[1])
             out["lift_m"] = float(hand[1]) - float(shoulder_ref[1])
+        # BODY CENTRE X (the tablet-feel reach plane's horizontal centre, FIX 1):
+        # the body's midline X. Prefer spine_shoulder X (the shoulder-line centre,
+        # the steadiest), fall back to the MIDPOINT of the two shoulders, then the
+        # same-side shoulder. The cursor X is measured RELATIVE to this so the
+        # mapping is the same wherever the owner sits/shifts.
+        out["body_center_x"] = _local_body_center_x(joints, shoulder)
         body_ref = None
         for name in ("spine_mid", "spine_shoulder", "spine_base"):
             j = joints.get(name)
@@ -1643,15 +1837,45 @@ def _local_body_scale(joints: dict) -> Optional[float]:
     return None
 
 
+def _local_body_center_x(joints: dict, shoulder=None) -> Optional[float]:
+    """The body MIDLINE X (the tablet-feel reach plane's horizontal centre, FIX 1).
+    Prefer spine_shoulder X (the steadiest midline), then the MIDPOINT of the two
+    shoulders, then the same-side shoulder X. Returns None when none is usable, in
+    which case the plane falls back to its fixed centre. NEVER raises."""
+    try:
+        sp = joints.get("spine_shoulder") or joints.get("spine_mid")
+        if sp and len(sp) >= 1:
+            return float(sp[0])
+        sl = joints.get("shoulder_left")
+        sr = joints.get("shoulder_right")
+        if sl and sr and len(sl) >= 1 and len(sr) >= 1:
+            return (float(sl[0]) + float(sr[0])) / 2.0
+        if shoulder and len(shoulder) >= 1:
+            return float(shoulder[0])
+    except (TypeError, ValueError, KeyError):
+        return None
+    return None
+
+
 def _arm_extension(bridge, joints: dict, side: str) -> "ArmExtension":
     """Build the ArmExtension for one side. Prefers the bridge's arm_extension()
     geometry helper (single source of truth for forward-reach + straightness);
     falls back to computing it locally so the air-mouse still works against an
-    older bridge build that lacks the helper. NEVER raises."""
+    older bridge build that lacks the helper. Enriches the result with the
+    body-centre X (FIX 1, for the tablet-feel plane) when the bridge dict doesn't
+    already carry it, so the body-relative mapping works against any bridge. NEVER
+    raises."""
     try:
         fn = getattr(bridge, "arm_extension", None)
         if callable(fn):
-            return ArmExtension.from_bridge(fn(joints, side))
+            ext = fn(joints, side) or {}
+            # Older bridges don't emit body_center_x — derive it locally so the
+            # tablet-feel plane still centres on the body.
+            if ext.get("body_center_x") is None:
+                ext = dict(ext)
+                ext["body_center_x"] = _local_body_center_x(
+                    joints, joints.get(f"shoulder_{side}"))
+            return ArmExtension.from_bridge(ext)
     except Exception:
         pass
     try:
@@ -1721,7 +1945,8 @@ def _relabel_arm_side(ext: "Optional[ArmExtension]",
         return None
     return ArmExtension(side, ext.forward_m, ext.straightness, ext.hand,
                         reach_ratio=ext.reach_ratio, lift_m=ext.lift_m,
-                        shoulder_ref_y=ext.shoulder_ref_y)
+                        shoulder_ref_y=ext.shoulder_ref_y,
+                        body_center_x=ext.body_center_x)
 
 
 # ─── ISSUE 2a: CALIBRATION capture ──────────────────────────────────────────
@@ -1804,12 +2029,14 @@ def _apply_decision(decision: AirMouseDecision) -> None:
 
 # ─── ISSUE 2b: live HEIGHT-gate DEBUG LOG (~2 Hz) ────────────────────────────
 # While the air-mouse is enabled, print the live numbers at ~2 Hz so the owner can
-# SEE what the gate sees and tune the margins, e.g.
-#   [air-mouse] lift=+0.07 hand=right engaged=True yield=False reach=0.18 straight=0.91
+# SEE what the gate sees and tune the margins + the tablet-feel plane, e.g.
+#   [air-mouse] lift=+0.07 hand=right engaged=True yield=False nx=+0.31 ny=-0.12 reach=0.18 straight=0.91
 # lift is the HEIGHT of the controlling hand above the shoulder (the PRIMARY gate);
-# yield is True while the air-mouse is suppressed by recent REAL input. The
-# highest-raised hand is logged (the one the gate is judging). reach/straight are
-# kept as the demoted secondary cues for context.
+# nx/ny are the controlling hand's BODY-RELATIVE position on the tablet-feel plane
+# in -1..+1 (FIX 1 — nx=-1 left edge .. +1 right edge; ny=-1 top .. +1 bottom; so
+# the owner can see exactly where the hand maps and tune KINECT_REACH_HALF_W); yield
+# is True while suppressed by recent REAL input. The highest-raised hand is logged.
+# reach/straight are the demoted secondary cues, kept for context.
 _AIR_MOUSE_DEBUG_INTERVAL = 0.5             # seconds between debug lines (~2 Hz)
 _air_mouse_debug_last = [0.0]               # module-list so the throttle persists
 
@@ -1818,8 +2045,9 @@ def _format_reach_debug(left_ext, right_ext, tracked: bool, ctrl,
                         yielding: "Optional[bool]" = None) -> str:
     """The ~2 Hz debug line. Leads with the HEIGHT delta (lift = hand_y minus the
     shoulder Y, the PRIMARY gate) for the highest-raised hand, the controlling
-    side, engaged, and the auto-YIELD state; then the demoted reach/straight cues
-    for context. PURE-ish (reads ctrl state); NEVER raises."""
+    side, engaged, the auto-YIELD state, and the tablet-feel plane position (nx/ny);
+    then the demoted reach/straight cues for context. PURE-ish (reads ctrl state);
+    NEVER raises."""
     try:
         if yielding is None:
             yielding = real_input_recent()
@@ -1834,12 +2062,19 @@ def _format_reach_debug(left_ext, right_ext, tracked: bool, ctrl,
             straight_s = ("%.2f" % arm.straightness
                           if arm.straightness is not None else "n/a")
             hand_s = arm.side or "?"
-        return ("  [air-mouse] lift=%s hand=%s engaged=%s yield=%s reach=%s "
-                "straight=%s tracked=%s"
+        # The tablet-feel plane position (nx/ny) of the controlling hand, stashed by
+        # the controller on the last engaged frame. "n/a" while disengaged.
+        nx = getattr(ctrl, "_last_nx", None)
+        ny = getattr(ctrl, "_last_ny", None)
+        nx_s = ("%+.2f" % nx) if isinstance(nx, (int, float)) else "n/a"
+        ny_s = ("%+.2f" % ny) if isinstance(ny, (int, float)) else "n/a"
+        return ("  [air-mouse] lift=%s hand=%s engaged=%s yield=%s nx=%s ny=%s "
+                "reach=%s straight=%s tracked=%s"
                 % (lift_s, hand_s, bool(ctrl.engaged), bool(yielding),
-                   reach_s, straight_s, bool(tracked)))
+                   nx_s, ny_s, reach_s, straight_s, bool(tracked)))
     except Exception:
-        return "  [air-mouse] lift=? hand=? engaged=? yield=? reach=? straight=?"
+        return ("  [air-mouse] lift=? hand=? engaged=? yield=? nx=? ny=? "
+                "reach=? straight=?")
 
 
 def _maybe_debug_log(left_ext, right_ext, tracked: bool, ctrl,
