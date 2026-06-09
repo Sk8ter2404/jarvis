@@ -540,6 +540,13 @@ KINECT_POINT_CONTROL_ENABLED = False
 #   isn't tracked. See audio/kinect_bridge.get_hand_states() (grip) +
 #   skills/kinect_air_mouse.py (wiring) + hud/jarvis_air_cursor.py (overlay).
 KINECT_AIR_MOUSE_ENABLED = False
+# KINECT_HAND_MIRROR — the Kinect color/skeleton stream is MIRRORED (selfie view),
+#   so the owner's REAL left hand appears on the RIGHT of the image. When True
+#   (the default) the air-mouse SWAPS the bridge's left↔right hands so the owner's
+#   REAL left hand = LEFT-click + left-side circle and their REAL right hand =
+#   RIGHT-click. Flip False only if a future build un-mirrors the stream. See
+#   skills/kinect_air_mouse.py (_hand_mirror_enabled / _mirror_sample).
+KINECT_HAND_MIRROR = True
 # KINECT_GREET_ON_ENTRY — when True (and presence is enabled), JARVIS speaks a
 #   brief varied greeting when you enter a room that had been empty for a while.
 #   Hard rate-limited (≤ once/min) and skipped mid-conversation. Off by default.

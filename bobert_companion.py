@@ -3933,6 +3933,29 @@ def _placeholder_tile(label: str, w: int = 320, h: int = 240) -> "np.ndarray":
     return tile
 
 
+# Throttled per-piece skip log for the Kinect preview (ISSUE 4). One failing
+# overlay piece must NOT spam the console at frame-rate, but the owner should SEE
+# that a piece was skipped (e.g. a webcam Teams has locked). We log each distinct
+# piece-name at most once per _KINECT_PREVIEW_SKIP_LOG_INTERVAL seconds.
+_KINECT_PREVIEW_SKIP_LOG_INTERVAL = 10.0
+_kinect_preview_skip_log_last: dict = {}
+
+
+def _kinect_preview_piece_skipped(piece: str) -> None:
+    """Log (throttled) that one optional preview piece was skipped after throwing,
+    so a locked webcam / overlay glitch is visible without blanking the preview or
+    spamming. NEVER raises."""
+    try:
+        now = time.monotonic()
+        last = _kinect_preview_skip_log_last.get(piece, 0.0)
+        if (now - last) >= _KINECT_PREVIEW_SKIP_LOG_INTERVAL:
+            _kinect_preview_skip_log_last[piece] = now
+            print(f"  [kinect-preview] skipped '{piece}' (it threw) — preview "
+                  "continues without it")
+    except Exception:
+        pass
+
+
 def _compose_kinect_preview(now: float) -> "np.ndarray | None":
     """Build the composite preview image: the Kinect COLOR frame with the live
     skeleton + air-mouse hand circle + gesture pop drawn over it, with the two
@@ -3944,39 +3967,75 @@ def _compose_kinect_preview(now: float) -> "np.ndarray | None":
     The side tiles are the actual USB webcams ('Fullhan Webcam' = LEFT, 'USB 2.0
     Camera' = RIGHT), captured directly + throttled by _read_side_tile_webcams —
     NOT a duplicate of the Kinect. A webcam that's off/covered shows a dim
-    placeholder tile, never the Kinect frame."""
+    placeholder tile, never the Kinect frame.
+
+    FAIL-SAFE (ISSUE 4): the Kinect COLOR + SKELETON are the priority and ALWAYS
+    render as long as a color frame exists. EVERY optional overlay — the gesture
+    pop, EACH side-tile webcam (one may be locked by Teams), and the tile
+    composite — is wrapped in its OWN try/except, so a single failing piece is
+    skipped (with a throttled log line) instead of blanking the whole preview. The
+    only None return is when there is no Kinect color frame at all (caller then
+    keeps the plain webcam mirror)."""
     try:
         base = _kinect_bridge.get_color_bgr(require_new=False)
     except Exception:
         base = None
     if base is None:
         return None
+    # From here the Kinect color frame EXISTS — we must return at least it. Each
+    # step below is independently guarded so no optional overlay can blank it.
     try:
         base = base.copy()   # don't scribble on the bridge's frame buffer
+    except Exception:
+        # Can't even copy the frame — hand back the original rather than nothing.
+        return base
+
+    # Skeleton (+ the air-mouse hand circle, itself guarded inside). Its own
+    # guard so a projection/mapper glitch can't blank the color frame.
+    try:
         bodies = []
         try:
             bodies = _kinect_bridge.get_bodies()
         except Exception:
             bodies = []
         _draw_skeleton_on_color(base, bodies)
-        # B3: a brief glowing gesture-name badge when a gesture just fired.
-        _draw_gesture_pop_on_color(base, now)
+    except Exception:
+        _kinect_preview_piece_skipped("skeleton")
 
-        # B1: the two REAL side-tile webcams (own throttled capture; NOT the
-        # Kinect). A slot with no live frame → a dim 'off' placeholder, never the
-        # Kinect. Tiles are ordered LEFT then RIGHT down the right edge.
+    # B3: a brief glowing gesture-name badge when a gesture just fired. Optional.
+    try:
+        _draw_gesture_pop_on_color(base, now)
+    except Exception:
+        _kinect_preview_piece_skipped("gesture-pop")
+
+    # B1: the two REAL side-tile webcams (own throttled capture; NOT the Kinect).
+    # The READ is guarded as a whole, and EACH slot is turned into a tile (real
+    # frame or dim placeholder) under its own guard so one locked/throwing webcam
+    # can't take down the other tile or the composite.
+    try:
         webcams = _read_side_tile_webcams(now)
-        tiles = []
-        for slot in ("left", "right"):
+    except Exception:
+        _kinect_preview_piece_skipped("webcam-read")
+        webcams = {}
+    tiles = []
+    for slot in ("left", "right"):
+        try:
             frame = webcams.get(slot)
             if frame is not None:
                 tiles.append(frame)
             else:
                 tiles.append(_placeholder_tile(
                     _KINECT_PREVIEW_TILE_LABELS.get(slot, slot.title())))
+        except Exception:
+            _kinect_preview_piece_skipped(f"webcam-tile-{slot}")
+
+    # Composite the tiles down the right edge. If THIS throws, fall back to the
+    # bare Kinect color+skeleton so the preview is never blank.
+    try:
         return _composite_preview_image(base, tiles)
     except Exception:
-        return None
+        _kinect_preview_piece_skipped("composite")
+        return base
 
 
 def _composite_preview_image(base_bgr: "np.ndarray",

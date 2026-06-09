@@ -216,6 +216,107 @@ class ComposeKinectPreviewTests(MonolithGlobalsTestCase):
 
 
 @requires_monolith
+class ComposePreviewFailSafeTests(MonolithGlobalsTestCase):
+    """ISSUE 4 — the Kinect COLOR + SKELETON must ALWAYS render even if every
+    optional overlay piece throws. Each piece (a side-tile webcam that won't open
+    because Teams locked it, the gesture pop, the tile composite) is independently
+    guarded, so one failure is skipped (logged) instead of blanking the preview.
+    The only None is when there's no Kinect color frame at all."""
+
+    def _color(self):
+        return _np().full((1080, 1920, 3), 5, dtype=_np().uint8)
+
+    def test_throwing_webcam_read_still_returns_kinect_color(self):
+        # A side-tile webcam read that raises (e.g. a device Teams has locked)
+        # must NOT blank the preview — the Kinect color+skeleton still comes back.
+        color = self._color()
+
+        def _boom(now):
+            raise RuntimeError("webcam locked by Teams")
+
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
+                               return_value=color), \
+                mock.patch.object(self.bc._kinect_bridge, "get_bodies",
+                                  return_value=[]), \
+                mock.patch.object(self.bc, "_read_side_tile_webcams", _boom):
+            out = self.bc._compose_kinect_preview(now=10.0)
+        self.assertIsNotNone(out)                  # NOT blanked
+        self.assertEqual(out.shape, color.shape)
+
+    def test_throwing_gesture_pop_still_returns_preview(self):
+        # A gesture-pop draw that raises must be skipped, not fatal.
+        color = self._color()
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
+                               return_value=color), \
+                mock.patch.object(self.bc._kinect_bridge, "get_bodies",
+                                  return_value=[]), \
+                mock.patch.object(self.bc, "_draw_gesture_pop_on_color",
+                                  side_effect=ValueError("pop boom")), \
+                mock.patch.object(self.bc, "_read_side_tile_webcams",
+                                  return_value={"left": None, "right": None}):
+            out = self.bc._compose_kinect_preview(now=10.0)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.shape, color.shape)
+
+    def test_throwing_skeleton_still_returns_color(self):
+        # A skeleton draw that raises must be skipped — bare color comes back.
+        color = self._color()
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
+                               return_value=color), \
+                mock.patch.object(self.bc._kinect_bridge, "get_bodies",
+                                  return_value=[]), \
+                mock.patch.object(self.bc, "_draw_skeleton_on_color",
+                                  side_effect=RuntimeError("skeleton boom")), \
+                mock.patch.object(self.bc, "_read_side_tile_webcams",
+                                  return_value={"left": None, "right": None}):
+            out = self.bc._compose_kinect_preview(now=10.0)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.shape, color.shape)
+
+    def test_throwing_composite_falls_back_to_bare_color(self):
+        # If the tile composite itself raises, the bare Kinect color+skeleton is
+        # returned rather than None (the skeleton view is the priority).
+        color = self._color()
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
+                               return_value=color), \
+                mock.patch.object(self.bc._kinect_bridge, "get_bodies",
+                                  return_value=[]), \
+                mock.patch.object(self.bc, "_read_side_tile_webcams",
+                                  return_value={"left": None, "right": None}), \
+                mock.patch.object(self.bc, "_composite_preview_image",
+                                  side_effect=RuntimeError("composite boom")):
+            out = self.bc._compose_kinect_preview(now=10.0)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.shape, color.shape)
+
+    def test_all_overlays_throwing_still_renders_color(self):
+        # Worst case: skeleton, gesture pop, webcam read, AND composite all throw.
+        # The Kinect color frame must still come back (never None / never blank).
+        color = self._color()
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
+                               return_value=color), \
+                mock.patch.object(self.bc._kinect_bridge, "get_bodies",
+                                  side_effect=RuntimeError("bodies boom")), \
+                mock.patch.object(self.bc, "_draw_skeleton_on_color",
+                                  side_effect=RuntimeError("sk boom")), \
+                mock.patch.object(self.bc, "_draw_gesture_pop_on_color",
+                                  side_effect=RuntimeError("pop boom")), \
+                mock.patch.object(self.bc, "_read_side_tile_webcams",
+                                  side_effect=RuntimeError("cam boom")), \
+                mock.patch.object(self.bc, "_composite_preview_image",
+                                  side_effect=RuntimeError("comp boom")):
+            out = self.bc._compose_kinect_preview(now=10.0)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.shape, color.shape)
+
+    def test_still_none_when_no_kinect_color_frame(self):
+        # The ONE legitimate None: no Kinect color frame at all.
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
+                               return_value=None):
+            self.assertIsNone(self.bc._compose_kinect_preview(now=10.0))
+
+
+@requires_monolith
 class HudKinectPreviewWriteTests(MonolithGlobalsTestCase):
     def test_off_when_overlay_flag_disabled(self):
         with mock.patch.object(self.bc, "_hud_kinect_skeleton_overlay_enabled",
