@@ -223,24 +223,36 @@ def iter_bone_segments(
 # drawer uses. The cv2 stroking itself lives in the monolith; here we only pick
 # points / compute sizes + alpha-blended colours.
 
-# Joint-name priority for the air-mouse "controlling hand": the RIGHT hand drives
-# the cursor by default (skills/kinect_air_mouse._hand_sample), falling back to
-# the LEFT hand, then the wrists if a hand tip dropped to untracked.
+# Joint-name priority for the air-mouse "controlling hand". The NEW reach-to-
+# engage model picks WHICHEVER arm is extended (skills/kinect_air_mouse
+# .choose_controlling_arm), so the compositor passes the live which-hand from the
+# air-mouse state and the circle follows that hand. With no preference (air-mouse
+# off / disengaged) it falls back to the right hand, then left, then the wrists if
+# a hand tip dropped to untracked.
 _CONTROLLING_HAND_JOINTS = ("hand_right", "hand_left", "wrist_right", "wrist_left")
 
 
 def controlling_hand_point(
-    points: dict[str, tuple[int, int]]
+    points: dict[str, tuple[int, int]],
+    prefer_side: "str | None" = None,
 ) -> "tuple[int, int] | None":
     """The projected pixel of the air-mouse controlling hand, or None.
 
-    Prefers ``hand_right`` (the default cursor hand), then ``hand_left``, then the
-    wrists — matching the air-mouse's own hand selection — returning the first
-    that projected this frame. The compositor draws the engaged/closed colour
-    circle here. Pure; None when no hand/wrist joint projected (→ no circle)."""
+    ``prefer_side`` ("left"/"right") is the hand the air-mouse is CURRENTLY driving
+    with (its live which-hand state) — when given, that side's hand (then wrist) is
+    tried FIRST so the circle follows the EXTENDED hand, even when it's the left.
+    Falls back to the default order (right hand, left hand, then wrists) so a
+    disengaged / preference-less call still draws something. The compositor draws
+    the engaged/closed colour circle at the returned point. Pure; None when no
+    hand/wrist joint projected (→ no circle)."""
     if not isinstance(points, dict):
         return None
-    for name in _CONTROLLING_HAND_JOINTS:
+    order = list(_CONTROLLING_HAND_JOINTS)
+    side = (prefer_side or "").lower()
+    if side in ("left", "right"):
+        # Try the preferred side's hand then wrist before the default order.
+        order = [f"hand_{side}", f"wrist_{side}"] + order
+    for name in order:
         pt = points.get(name)
         if pt is not None:
             return pt

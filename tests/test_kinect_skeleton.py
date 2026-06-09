@@ -197,6 +197,33 @@ class ControllingHandPointTests(unittest.TestCase):
         self.assertIsNone(ks.controlling_hand_point({}))
         self.assertIsNone(ks.controlling_hand_point(None))
 
+    def test_prefer_side_follows_extended_hand(self):
+        # The reach-to-engage air-mouse passes the live which-hand: with both
+        # hands projected, prefer_side="left" draws the circle on the LEFT hand
+        # (the extended one), overriding the default right-first order.
+        points = {"hand_right": (100, 200), "hand_left": (300, 400)}
+        self.assertEqual(
+            ks.controlling_hand_point(points, prefer_side="left"), (300, 400))
+        self.assertEqual(
+            ks.controlling_hand_point(points, prefer_side="right"), (100, 200))
+
+    def test_prefer_side_falls_back_to_wrist_then_default(self):
+        # Preferred side's hand absent → its wrist; then the default order.
+        self.assertEqual(
+            ks.controlling_hand_point({"wrist_left": (5, 6),
+                                       "hand_right": (100, 200)},
+                                      prefer_side="left"), (5, 6))
+        # Preferred side has nothing projected → default order (right hand).
+        self.assertEqual(
+            ks.controlling_hand_point({"hand_right": (100, 200)},
+                                      prefer_side="left"), (100, 200))
+
+    def test_prefer_side_none_keeps_default_order(self):
+        # prefer_side=None (disengaged) → the existing right-first behaviour.
+        points = {"hand_right": (100, 200), "hand_left": (300, 400)}
+        self.assertEqual(
+            ks.controlling_hand_point(points, prefer_side=None), (100, 200))
+
 
 class HandCircleRadiusTests(unittest.TestCase):
     def test_scales_with_width_and_has_a_floor(self):

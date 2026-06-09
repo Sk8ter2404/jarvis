@@ -1,24 +1,33 @@
 """
 kinect_air_mouse skill — a Kinect v2 "air-mouse" for JARVIS.
 
-THE FEATURE
-===========
-RAISE an OPEN hand toward the screen to move the cursor; CLOSE the hand to
-LEFT-click; hold it closed to drag; LOWER the hand to let go of the cursor.
-Concretely:
+THE FEATURE  (REACH-TO-ENGAGE model)
+====================================
+EXTEND an arm OUT toward the screen/Kinect — a deliberate REACH — to take the
+cursor; the cursor follows the EXTENDED hand. CLOSE a hand to click, and which
+hand clicks which button is HAND-SPECIFIC. When you RELAX the arm (pull the hand
+back toward your body / bend the elbow) the air-mouse DISENGAGES and gestures
+take over. A hand merely raised / visible does NOTHING — only a reach engages.
 
-  • hand RAISED, OPEN   → move the cursor (no button held).
-  • close → open fast   → a LEFT-click (button down then up, cursor parked).
-  • close, move, open   → a left-DRAG (button stays down while the hand is
-                          closed, releases on re-open).
-  • hand LOWERED / lost → DISENGAGE — the cursor is released so the PHYSICAL
-                          mouse works again, any held button is let go, and the
-                          reticle hides. Raise the hand to re-engage.
+  • arm EXTENDED out (hand pushed FORWARD in depth and/or the arm straightened)
+                          → ENGAGE: the cursor follows that hand.
+  • LEFT hand closes      → LEFT mouse button (down on close, up on open; hold-
+                            closed + move = a LEFT-drag).
+  • RIGHT hand closes     → RIGHT mouse button (right-click; hold = right-drag).
+                            Either hand can click regardless of which one is
+                            driving the cursor.
+  • arm RELAXED / lost    → DISENGAGE — the cursor is released so the PHYSICAL
+                            mouse works again, any held button is let go, the
+                            reticle hides, and GESTURES re-arm. Reach out again
+                            to re-engage.
+
+So: reach out = mouse (left/right hand = left/right click), relax = gestures,
+hand merely up = nothing.
 
 A glowing JARVIS targeting reticle (hud/jarvis_air_cursor.py, a separate
 click-THROUGH overlay process) follows the cursor — cyan + gently pulsing while
-TRACKING a raised open hand, snapping inward to a GOLD lock on grab/drag, and
-HIDDEN while disengaged — so the owner always sees where their hand is pointing.
+TRACKING the extended hand, snapping inward to a GOLD lock on a grab/drag, and
+HIDDEN while disengaged.
 
 This module is the LIVE WIRING; the testable core is pure and lives right here
 alongside it (no sensor, no real mouse, no Qt needed to exercise it):
@@ -27,15 +36,22 @@ alongside it (no sensor, no real mouse, no Qt needed to exercise it):
     into an absolute VIRTUAL-DESKTOP pixel (spanning ALL monitors), clamped to
     the desktop bounds.
   • EMA — exponential smoothing to fight the Kinect's hand-joint jitter.
-  • GripDebounter — the open/closed state machine: requires N consecutive frames
-    of a new grip before it flips, so a single flickered frame never fires a
-    stray right-click.
+  • GripDebouncer — the per-hand open/closed state machine: requires N
+    consecutive frames of a new grip before it flips, tolerates 1-frame Unknown
+    dropouts (carries the last confident grip), and treats Lasso as closed — so a
+    single flickered frame never fires a stray click and a fist reliably clicks /
+    an open hand reliably releases.
+  • ArmExtension thresholds — the REACH gate: forward-depth + arm-straightness,
+    with engage/disengage HYSTERESIS so a hand hovering at the threshold can't
+    flap, plus a short tracking-loss GRACE so a 1-frame dropout doesn't strand a
+    held button.
   • AirMouseController — ties those together into a per-frame decision:
-    (cursor_xy, button: "down"|"up"|None, overlay_state: "track"|"grab"|"hidden").
+    cursor_xy, per-hand button edges (left/right down|up), overlay state, the
+    controlling hand, and the per-hand grips — for the HUD preview hand-circle.
 
 V1 MAPPING (deliberately simple + robust)
 =========================================
-The pointing hand's (x, y) is mapped from a CALIBRATED comfortable reach-box in
+The EXTENDED hand's (x, y) is mapped from a CALIBRATED comfortable reach-box in
 front of the user onto the ENTIRE virtual desktop (every monitor, including any
 left of / above the primary, which have a negative virtual-screen origin). This
 is robust and needs no calibration ritual — it just maps "hand left↔right /
@@ -55,18 +71,15 @@ EVERYTHING is opt-in + safe (mirrors skills/kinect_gestures.py):
     bobert_companion._is_staging()) — the poll loop self-gates every tick.
   • All sensor contact is via audio/kinect_bridge (accessors never raise); a
     missing / disabled sensor degrades to a quiet no-op.
-  • DEAD-MAN / ENGAGE GATE: the cursor is driven ONLY while the controlling hand
-    is actively RAISED above a body reference (the spine-mid / chest, with a
-    fall-back to waist / elbow / shoulder) AND the body+hand are tracked. The
-    moment the owner LOWERS the hand below that reference — or the hand/body goes
-    untracked for more than DISENGAGE_GRACE_SEC (~0.3 s) — the air-mouse
-    DISENGAGES: it stops calling SetCursorPos entirely (releasing control so the
-    PHYSICAL mouse works again), releases any held button, and hides the reticle.
-    A raise/drop hysteresis band keeps it from flickering at the threshold, and a
-    closed hand that drops or leaves the frame can never strand the button down.
-
-LEFT vs RIGHT click: this is a ONE-LINE swap — change AIR_MOUSE_BUTTON below
-from "left" to "right". The owner wants the PRIMARY (LEFT) button.
+  • DEAD-MAN / ENGAGE GATE: the cursor is driven ONLY while an arm is EXTENDED
+    OUT toward the sensor (a deliberate reach — see ArmExtension below) AND the
+    body+hand are tracked. The moment the owner RELAXES the arm (pulls the hand
+    back / bends the elbow) — or the hand/body goes untracked for more than
+    DISENGAGE_GRACE_SEC (~0.3 s) — the air-mouse DISENGAGES: it stops calling
+    SetCursorPos entirely (releasing control so the PHYSICAL mouse works again),
+    releases any held button, and hides the reticle. Engage/disengage hysteresis
+    keeps it from flickering at the threshold, and a closed hand that drops or
+    leaves the frame can never strand the button down.
 
 Voice actions:
   air_mouse_on / air_mouse_off — toggle KINECT_AIR_MOUSE_ENABLED live, persisted
@@ -89,12 +102,6 @@ AIR_MOUSE_POLL_INTERVAL = 1.0 / AIR_MOUSE_POLL_HZ
 INITIAL_DELAY_SECONDS = 6.0                   # let the monolith + bridge come up
 _THREAD_NAME = "kinect-air-mouse-skill"
 
-# Which mouse button the closed-hand grab actuates. The owner wants the PRIMARY
-# (LEFT) button: a quick close→open is a normal left-CLICK, and close-move-open
-# is a left-DRAG. _mouse_button() maps this to MOUSEEVENTF_LEFTDOWN/LEFTUP (win32)
-# or pyautogui's left button. Swap to "right" here for a right-click air-mouse.
-AIR_MOUSE_BUTTON = "left"
-
 # EMA smoothing factor for the cursor (0..1). LOWER = smoother but laggier;
 # HIGHER = snappier but jitterier. Tunable; v2 may auto-adapt it to hand speed.
 #
@@ -110,7 +117,7 @@ AIR_MOUSE_BUTTON = "left"
 AIR_MOUSE_EMA_ALPHA = 0.55
 
 # How many CONSECUTIVE frames a new grip (open↔closed) must persist before the
-# state machine accepts it. This is the anti-stray-click guard: a single
+# per-hand state machine accepts it. This is the anti-stray-click guard: a single
 # flickered Kinect hand-state frame must never fire a click.
 #
 # TUNED 2026-06-08 (owner: "click should fire promptly"): 3 → 2.
@@ -122,21 +129,28 @@ AIR_MOUSE_EMA_ALPHA = 0.55
 #   Raise back to 3 if any stray clicks appear; 2 is the snappy-but-safe floor.
 AIR_MOUSE_GRIP_DEBOUNCE_FRAMES = 2
 
-# ─── dead-man ENGAGE gate (the hand must be RAISED to drive the cursor) ──────
-# The air-mouse only controls the cursor while the controlling hand is held UP,
-# above a body reference (the spine-mid / chest height by default, see
-# _engage_reference_y). Raising the hand ENGAGES; lowering it (or losing the
-# hand) DISENGAGES — releasing the OS cursor so the real mouse works again. Two
-# thresholds give HYSTERESIS so a hand hovering right at the line can't flap the
-# engage state on/off every frame:
-#   • to ENGAGE   the hand must rise to >= ref_y + ENGAGE_RAISE_M  (clearly up)
-#   • to STAY engaged it may sag only to  ref_y + DISENGAGE_DROP_M (a lower bar);
-#     dropping below that DISENGAGES.
-# Camera-space y increases UPWARD (metres), so "above the reference" = a LARGER
-# y. The gap between the two is the dead-band. Defaults: engage ~8 cm above the
-# chest reference, release once it sags to ~2 cm above it.
-AIR_MOUSE_ENGAGE_RAISE_M = 0.08     # rise this far above ref_y to ENGAGE
-AIR_MOUSE_DISENGAGE_DROP_M = 0.02   # sag below ref_y + this to DISENGAGE
+# ─── REACH-TO-ENGAGE gate (an arm EXTENDED OUT drives the cursor) ────────────
+# The air-mouse only controls the cursor while an arm is EXTENDED toward the
+# sensor — a deliberate reach, NOT a hand merely raised. Extension is judged on
+# TWO cues from the bridge's arm_extension() geometry (forward-depth +
+# straightness); EITHER cue clearing its threshold counts as extended (the owner
+# can reach by pushing forward OR by straightening the arm). Two threshold pairs
+# give HYSTERESIS so an arm hovering right at the line can't flap engage on/off:
+#   • to ENGAGE   the reach must clear the HIGHER bar (clearly extended)
+#   • to STAY engaged it may relax only to the LOWER bar; past it → DISENGAGE.
+#
+# FORWARD-DEPTH (forward_reach_m = torso_z - hand_z, metres; >0 = hand in front):
+#   engage at ~+0.20 m in front of the torso (a clear reach toward the screen),
+#   stay engaged until it falls back to ~+0.10 m. A relaxed hand at the side /
+#   resting on the desk sits at or behind the torso (≈0 or negative) → disengaged.
+AIR_MOUSE_EXTEND_FORWARD_ENGAGE_M = 0.20    # reach this far forward to ENGAGE
+AIR_MOUSE_EXTEND_FORWARD_DISENGAGE_M = 0.10  # relax below this to DISENGAGE
+#
+# ARM-STRAIGHTNESS (shoulder→hand chord / summed bone length; 0..1, 1 = straight):
+#   engage when the arm is ≥ ~0.85 straight (nearly extended), stay engaged until
+#   it bends back below ~0.72. A relaxed, elbow-bent arm folds well under this.
+AIR_MOUSE_EXTEND_STRAIGHT_ENGAGE = 0.85     # arm this straight to ENGAGE
+AIR_MOUSE_EXTEND_STRAIGHT_DISENGAGE = 0.72  # bend below this to DISENGAGE
 
 # Grace window for a TRACKING dropout. A single lost/ambiguous frame (the Kinect
 # briefly drops the body or hand joint) must NOT instantly disengage and re-snap
@@ -147,7 +161,7 @@ AIR_MOUSE_DISENGAGE_GRACE_SEC = 0.30
 
 # The comfortable reach-box in front of the user, in camera-space METRES, that
 # maps onto the whole virtual desktop. Centred roughly on where a seated user's
-# hand naturally sits when pointing at the screen. x: sensor-RIGHT is +; the box
+# hand naturally sits when reaching at the screen. x: sensor-RIGHT is +; the box
 # is wider than tall to match a 16:9 screen. y: sensor-UP is +; centred near
 # shoulder height. These are the v1 defaults; v2 makes them per-user calibrated.
 #   half-width  → ±X metres from centre maps to the desktop's left/right edges
@@ -281,14 +295,20 @@ class EMA:
 
 
 class GripDebouncer:
-    """Debounce the OPEN↔CLOSED hand transition.
+    """Debounce the OPEN↔CLOSED hand transition for ONE hand.
 
     Feed the raw grip string each frame ("open" / "closed" / "lasso" /
     "unknown"); the *stable* grip only changes after the new grip has been seen
-    for `frames` consecutive ticks. "unknown"/"lasso" never flip the stable
-    state (they're treated as "no new evidence") so a momentary tracking dropout
-    holds the last good grip rather than spuriously releasing a drag — the
-    dead-man (hand UNTRACKED) is what releases, not a single ambiguous frame.
+    for `frames` consecutive ticks. ROBUST-CLOSE rules:
+      • "lasso" (the two-finger pointer) is treated as CLOSED — a half-curled
+        fist often reads as Lasso, and the owner means it as a click.
+      • "unknown" / "nottracked" never flip the stable state (they're "no new
+        evidence"): a 1-frame grip dropout HOLDS the last confident grip rather
+        than spuriously releasing a drag. The dead-man (hand UNTRACKED) is what
+        releases a held button, not a single ambiguous frame.
+    Hysteresis falls out of the consecutive-frame requirement: a fist must be
+    seen `frames` times to latch CLOSED, and an open hand `frames` times to
+    latch OPEN, so neither flickers.
 
     `stable` starts at "open" so the first real close is a clean down-edge."""
 
@@ -303,33 +323,49 @@ class GripDebouncer:
     def stable(self) -> str:
         return self._stable
 
+    @property
+    def is_closed(self) -> bool:
+        return self._stable == "closed"
+
     def reset(self, initial: str = "open") -> None:
         self._stable = initial
         self._candidate = None
         self._count = 0
 
+    @staticmethod
+    def _canon(raw: str) -> Optional[str]:
+        """Canonicalise a raw bridge grip to "open"/"closed", or None for an
+        ambiguous frame that carries no vote. Lasso → closed (a half-fist the
+        owner means as a click); unknown / nottracked → None (hold)."""
+        g = (raw or "unknown").lower()
+        if g == "closed" or g == "lasso":
+            return "closed"
+        if g == "open":
+            return "open"
+        return None   # unknown / nottracked → no evidence this frame
+
     def update(self, raw: str) -> str:
         """Feed a raw grip; return the (possibly unchanged) stable grip."""
-        raw = (raw or "unknown").lower()
-        # Only OPEN/CLOSED carry a vote. Ambiguous frames hold the current
-        # stable grip and reset any in-flight candidate streak.
-        if raw not in ("open", "closed"):
+        vote = self._canon(raw)
+        # Ambiguous frames hold the current stable grip and reset any in-flight
+        # candidate streak (so a flicker mid-streak doesn't count toward a flip).
+        if vote is None:
             self._candidate = None
             self._count = 0
             return self._stable
-        if raw == self._stable:
+        if vote == self._stable:
             # Already stable here — clear any partial streak toward the other.
             self._candidate = None
             self._count = 0
             return self._stable
-        # raw differs from stable: build/extend the candidate streak.
-        if raw == self._candidate:
+        # vote differs from stable: build/extend the candidate streak.
+        if vote == self._candidate:
             self._count += 1
         else:
-            self._candidate = raw
+            self._candidate = vote
             self._count = 1
         if self._count >= self.frames:
-            self._stable = raw
+            self._stable = vote
             self._candidate = None
             self._count = 0
         return self._stable
@@ -340,155 +376,268 @@ class AirMouseDecision:
     """What the live loop should DO this frame.
 
       cursor:  (px, py) | None   — where to put the cursor (None = don't move)
-      button:  "down" | "up" | None — actuate the grab button (edge only; None
-               means no change this frame)
+      left:    "down" | "up" | None  — actuate the LEFT button (edge only; None
+               means no change). Fired by the LEFT hand closing/opening.
+      right:   "down" | "up" | None  — actuate the RIGHT button (edge only).
+               Fired by the RIGHT hand closing/opening.
       overlay: "track" | "grab" | "hidden" — the reticle state to publish
-               (cyan-track / gold-grab / hidden)
-      grip:    the debounced stable grip ("open"/"closed") — for diagnostics
+               (cyan-track / gold-grab / hidden). "grab" while EITHER button held.
+      hand:    "left" | "right" | None — which hand is driving the cursor (for
+               the preview hand-circle), None while disengaged.
+      grip:    the controlling hand's debounced stable grip ("open"/"closed") —
+               drives the preview circle colour + diagnostics.
     """
-    __slots__ = ("cursor", "button", "overlay", "grip")
+    __slots__ = ("cursor", "left", "right", "overlay", "hand", "grip")
 
-    def __init__(self, cursor, button, overlay, grip):
+    def __init__(self, cursor, left, right, overlay, hand, grip):
         self.cursor = cursor
-        self.button = button
+        self.left = left
+        self.right = right
         self.overlay = overlay
+        self.hand = hand
         self.grip = grip
 
+    @property
+    def button_edges(self):
+        """The (button, action) edges this frame, e.g. [("left","down")]. Order:
+        left then right. Used by the live loop to actuate the real mouse."""
+        out = []
+        if self.left in ("down", "up"):
+            out.append(("left", self.left))
+        if self.right in ("down", "up"):
+            out.append(("right", self.right))
+        return out
+
     def __repr__(self):   # pragma: no cover - debug aid
-        return (f"AirMouseDecision(cursor={self.cursor}, button={self.button!r}, "
-                f"overlay={self.overlay!r}, grip={self.grip!r})")
+        return (f"AirMouseDecision(cursor={self.cursor}, left={self.left!r}, "
+                f"right={self.right!r}, overlay={self.overlay!r}, "
+                f"hand={self.hand!r}, grip={self.grip!r})")
+
+
+class ArmExtension:
+    """One arm's extension cues + the engage hysteresis test. A thin value object
+    fed the bridge's arm_extension() dict (forward_reach_m + straightness) so the
+    controller can ask "is this arm reaching?" with the right (engage vs stay-
+    engaged) bar. PURE — no sensor. EITHER cue clearing its bar counts as
+    extended, so the owner can reach by pushing the hand forward OR by
+    straightening the arm."""
+
+    __slots__ = ("side", "forward_m", "straightness", "hand")
+
+    def __init__(self, side: str, forward_m: Optional[float],
+                 straightness: Optional[float], hand=None):
+        self.side = side
+        self.forward_m = forward_m
+        self.straightness = straightness
+        self.hand = hand   # (x, y, z, state) of the controlling hand, or None
+
+    @classmethod
+    def from_bridge(cls, ext: dict) -> "ArmExtension":
+        ext = ext or {}
+        return cls(ext.get("side", ""), ext.get("forward_reach_m"),
+                   ext.get("straightness"), ext.get("hand"))
+
+    def is_extended(self, *, engaged: bool,
+                    fwd_engage: float = AIR_MOUSE_EXTEND_FORWARD_ENGAGE_M,
+                    fwd_disengage: float = AIR_MOUSE_EXTEND_FORWARD_DISENGAGE_M,
+                    straight_engage: float = AIR_MOUSE_EXTEND_STRAIGHT_ENGAGE,
+                    straight_disengage: float = AIR_MOUSE_EXTEND_STRAIGHT_DISENGAGE
+                    ) -> bool:
+        """Is this arm EXTENDED enough to (stay) engaged? Applies HYSTERESIS:
+        when currently DISENGAGED the reach must clear the HIGHER engage bar;
+        once ENGAGED it only has to stay above the LOWER disengage bar. EITHER
+        the forward-depth OR the straightness cue clearing its bar suffices."""
+        fwd_bar = fwd_disengage if engaged else fwd_engage
+        straight_bar = straight_disengage if engaged else straight_engage
+        fwd_ok = (self.forward_m is not None and self.forward_m >= fwd_bar)
+        straight_ok = (self.straightness is not None
+                       and self.straightness >= straight_bar)
+        return bool(fwd_ok or straight_ok)
+
+    def reach_score(self) -> float:
+        """A scalar "how extended" used to pick the MORE-extended arm when both
+        are reaching. Combines normalised forward-depth + straightness; missing
+        cues contribute 0 so a partially-tracked arm still ranks. Higher = more
+        extended / more dominant."""
+        fwd = self.forward_m if self.forward_m is not None else 0.0
+        # Normalise forward metres against the engage bar so it's comparable to
+        # the 0..1 straightness; clamp negatives (hand behind body) to 0.
+        fwd_n = max(0.0, fwd / AIR_MOUSE_EXTEND_FORWARD_ENGAGE_M)
+        straight = self.straightness if self.straightness is not None else 0.0
+        return fwd_n + max(0.0, straight)
+
+
+def choose_controlling_arm(left: "ArmExtension", right: "ArmExtension",
+                           *, engaged: bool) -> "Optional[ArmExtension]":
+    """Pick which arm drives the cursor: among the arms that are EXTENDED (with
+    the engage/stay-engaged hysteresis), the MORE-extended (higher reach_score).
+    Returns None when neither arm is extended (→ disengage). PURE."""
+    candidates = [a for a in (left, right)
+                  if a is not None and a.hand is not None
+                  and a.is_extended(engaged=engaged)]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda a: a.reach_score())
 
 
 class AirMouseController:
-    """The pure per-frame brain. Holds the smoothing + debounce + ENGAGE state
-    and turns each (hand_pos, raw_grip, tracked, ref_y) sample into an
+    """The pure per-frame brain. Holds the smoothing, the PER-HAND grip
+    debouncers + button state, and the REACH engage state, turning each
+    (left_ext, right_ext, left_grip, right_grip, tracked) sample into an
     AirMouseDecision. NO I/O — the live loop applies the decision (move cursor,
-    press button, publish overlay state). Re-buildable cheaply; reset() on
+    press buttons, publish overlay state). Re-buildable cheaply; reset() on
     disable / hand-loss.
 
-    DEAD-MAN ENGAGE GATE (the cursor only moves while the hand is held UP):
-      The controller is ENGAGED only while the controlling hand is RAISED above
-      the body reference ref_y (chest/spine-mid by default) AND a body+hand are
-      tracked. A raise/drop hysteresis band (AIR_MOUSE_ENGAGE_RAISE_M /
-      AIR_MOUSE_DISENGAGE_DROP_M) stops it flapping at the line. While
-      DISENGAGED — hand lowered below the reference, OR untracked beyond the
-      ~0.3 s grace — the decision carries cursor=None (so the live loop calls NO
-      SetCursorPos and the PHYSICAL mouse is free), releases any held button, and
-      hides the overlay. Re-raising the hand re-engages and the EMA re-snaps.
+    REACH ENGAGE GATE (the cursor only moves while an arm is EXTENDED OUT):
+      The controller is ENGAGED only while at least one arm is extended toward the
+      sensor (forward-depth and/or arm-straightness clearing its bar, see
+      ArmExtension) AND a body+hand are tracked. Engage/stay-engage hysteresis
+      stops it flapping at the line. The cursor follows the MORE-extended arm
+      (choose_controlling_arm). While DISENGAGED — both arms relaxed, OR untracked
+      beyond the ~0.3 s grace — the decision carries cursor=None (so the live loop
+      calls NO SetCursorPos and the PHYSICAL mouse is free), releases any held
+      button, and hides the overlay. Re-extending an arm re-engages, EMA re-snaps.
 
-    Button semantics (LEFT by default), only while ENGAGED:
-      • stable grip OPEN  → cursor moves; overlay "track"; no button change.
-      • OPEN → CLOSED edge → emit button "down"; overlay flips to "grab".
-      • stays CLOSED       → cursor STILL moves (so a closed hand DRAGS); overlay
-                             holds "grab". (close→move→open = a left-DRAG.)
-      • CLOSED → OPEN edge  → emit button "up"; overlay back to "track".
-        (a quick close→open with no move = a left-CLICK.)
-    """
+    PER-HAND clicks (HAND-SPECIFIC), evaluated EVERY engaged frame for BOTH hands
+    regardless of which one drives the cursor:
+      • LEFT hand  OPEN→CLOSED → emit LEFT  "down"; CLOSED→OPEN → LEFT  "up".
+      • RIGHT hand OPEN→CLOSED → emit RIGHT "down"; CLOSED→OPEN → RIGHT "up".
+      A held-closed hand keeps its button down while the cursor moves (a drag);
+      a quick close→open with no move is a click. The overlay shows "grab" while
+      EITHER button is held."""
 
     def __init__(self, reach: ReachBox,
                  alpha: float = AIR_MOUSE_EMA_ALPHA,
                  debounce_frames: int = AIR_MOUSE_GRIP_DEBOUNCE_FRAMES,
-                 engage_raise_m: float = AIR_MOUSE_ENGAGE_RAISE_M,
-                 disengage_drop_m: float = AIR_MOUSE_DISENGAGE_DROP_M,
                  grace_sec: float = AIR_MOUSE_DISENGAGE_GRACE_SEC,
                  clock=time.monotonic):
         self.reach = reach
         self._ema_x = EMA(alpha)
         self._ema_y = EMA(alpha)
-        self._grip = GripDebouncer(debounce_frames, initial="open")
-        self._button_down = False
+        # One debouncer + one button-down flag PER HAND so each hand drives its
+        # own (left/right) mouse button independently.
+        self._grip_left = GripDebouncer(debounce_frames, initial="open")
+        self._grip_right = GripDebouncer(debounce_frames, initial="open")
+        self._left_down = False
+        self._right_down = False
         # Engage gate state.
-        self._engage_raise_m = float(engage_raise_m)
-        self._disengage_drop_m = float(disengage_drop_m)
         self._grace_sec = max(0.0, float(grace_sec))
         self._clock = clock          # injectable monotonic clock (tests)
         self._engaged = False        # is the air-mouse currently driving the cursor
-        self._last_engaged_at = 0.0  # clock() of the last RAISED+tracked frame
+        self._hand: Optional[str] = None   # which hand is driving ("left"/"right")
+        self._last_engaged_at = 0.0  # clock() of the last EXTENDED+tracked frame
 
     def reset(self) -> None:
         """Drop all smoothing + grip + engage state. Used by the dead-man and on
-        disable so the next hand starts clean (no cursor sweep from a stale
+        disable so the next reach starts clean (no cursor sweep from a stale
         value, no phantom button edge, freshly DISENGAGED)."""
         self._ema_x.reset()
         self._ema_y.reset()
-        self._grip.reset(initial="open")
+        self._grip_left.reset(initial="open")
+        self._grip_right.reset(initial="open")
         # NB: this does NOT itself emit a button-up — the caller (dead-man) is
-        # responsible for releasing a held button. We only clear our own view.
-        self._button_down = False
+        # responsible for releasing held buttons. We only clear our own view.
+        self._left_down = False
+        self._right_down = False
         self._engaged = False
+        self._hand = None
         self._last_engaged_at = 0.0
 
     @property
     def button_is_down(self) -> bool:
-        return self._button_down
+        """True while EITHER mouse button is held (left or right)."""
+        return self._left_down or self._right_down
+
+    @property
+    def left_is_down(self) -> bool:
+        return self._left_down
+
+    @property
+    def right_is_down(self) -> bool:
+        return self._right_down
 
     @property
     def engaged(self) -> bool:
-        """True while the air-mouse is actively driving the cursor (hand raised
-        + tracked). False while disengaged (hand lowered / lost) — in which state
-        update() returns cursor=None so the physical mouse is free."""
+        """True while the air-mouse is actively driving the cursor (an arm
+        extended + tracked). False while disengaged (arm relaxed / lost) — in
+        which state update() returns cursor=None so the physical mouse is free."""
         return self._engaged
 
-    def _is_raised(self, hand_y: float, ref_y: float) -> bool:
-        """Apply the raise/drop HYSTERESIS to decide if the hand counts as
-        'raised' this frame. When currently DISENGAGED the hand must clear the
-        higher ENGAGE bar (ref_y + engage_raise_m); once ENGAGED it only has to
-        stay above the lower DISENGAGE bar (ref_y + disengage_drop_m). Camera y
-        is UP-positive, so 'above' = greater-than. The gap between the two bars
-        is the dead-band that prevents threshold flicker."""
-        if self._engaged:
-            return hand_y >= (ref_y + self._disengage_drop_m)
-        return hand_y >= (ref_y + self._engage_raise_m)
+    @property
+    def hand(self) -> Optional[str]:
+        """Which hand is driving the cursor ("left"/"right"), or None while
+        disengaged. Read by the preview to draw the circle on the right hand."""
+        return self._hand
 
     def release_decision(self) -> AirMouseDecision:
         """The DEAD-MAN / disengaged decision: if a button was held, command it
-        UP; hide the overlay; clear smoothing + grip + engage so the next
-        acquisition snaps. cursor=None so the live loop issues NO SetCursorPos
-        and the physical mouse is free. Idempotent — once released, repeated
-        calls just keep the overlay hidden with no button edge."""
-        button = "up" if self._button_down else None
-        self._button_down = False
+        UP (per hand); hide the overlay; clear smoothing + grips + engage so the
+        next acquisition snaps. cursor=None so the live loop issues NO
+        SetCursorPos and the physical mouse is free. Idempotent — once released,
+        repeated calls just keep the overlay hidden with no button edge."""
+        left = "up" if self._left_down else None
+        right = "up" if self._right_down else None
+        self._left_down = False
+        self._right_down = False
         self._engaged = False
+        self._hand = None
         self._ema_x.reset()
         self._ema_y.reset()
-        self._grip.reset(initial="open")
-        return AirMouseDecision(cursor=None, button=button,
-                                overlay="hidden", grip="open")
+        self._grip_left.reset(initial="open")
+        self._grip_right.reset(initial="open")
+        return AirMouseDecision(cursor=None, left=left, right=right,
+                                overlay="hidden", hand=None, grip="open")
 
-    def update(self, hand_xy, raw_grip: str, tracked: bool,
-               ref_y: Optional[float] = None) -> AirMouseDecision:
+    def _hand_button_edge(self, debouncer: GripDebouncer, raw_grip: str,
+                          down_attr: str) -> Optional[str]:
+        """Advance ONE hand's debouncer and emit its button edge. `down_attr` is
+        the instance attribute name holding that hand's button-down flag
+        ("_left_down"/"_right_down"). Returns "down"/"up"/None."""
+        stable = debouncer.update(raw_grip)
+        held = getattr(self, down_attr)
+        want_down = (stable == "closed")
+        if want_down and not held:
+            setattr(self, down_attr, True)
+            return "down"
+        if not want_down and held:
+            setattr(self, down_attr, False)
+            return "up"
+        return None
+
+    def update(self, left_ext, right_ext, left_grip: str, right_grip: str,
+               tracked: bool) -> AirMouseDecision:
         """Advance one frame.
 
-        hand_xy: (x, y) camera-space metres, or None when no hand sample.
-        raw_grip: the raw bridge grip ("open"/"closed"/"lasso"/"unknown").
+        left_ext / right_ext: the per-arm ArmExtension (or None when that arm's
+            joints couldn't be read) describing forward-reach + straightness.
+        left_grip / right_grip: the raw bridge grips for each hand
+            ("open"/"closed"/"lasso"/"unknown").
         tracked: True when the bridge reported a tracked body this frame.
-        ref_y:   the body engage-reference height in camera-space metres (chest /
-                 spine-mid, see _engage_reference_y), or None when it couldn't be
-                 read. The hand must be RAISED above this (with hysteresis) to
-                 drive the cursor.
 
         DISENGAGES (returns cursor=None — no SetCursorPos — and releases any held
-        button) when the body/hand is NOT tracked, when there's no hand sample,
-        when no reference is available, or when the hand is LOWERED below the
-        reference. A brief tracking dropout while ENGAGED is tolerated for up to
-        the grace window (button held, cursor parked) before the full release."""
+        button) when the body/hand is NOT tracked, or when NEITHER arm is extended
+        (both relaxed). A brief tracking dropout while ENGAGED is tolerated for up
+        to the grace window (button held, cursor parked) before the full release.
+        The cursor follows the MORE-extended arm; per-hand close→click is
+        evaluated for BOTH hands every engaged frame."""
         # ── tracking-loss path, with a short grace so a 1-frame dropout doesn't
         #    disengage + re-snap (a held drag must survive a flicker). ──────────
-        if not tracked or hand_xy is None:
+        if not tracked:
             if (self._engaged and self._grace_sec > 0.0
                     and (self._clock() - self._last_engaged_at) <= self._grace_sec):
                 # Brief dropout: hold. No sample → no cursor motion; keep any held
                 # button and the current overlay. Do NOT refresh the engage clock,
                 # so a sustained dropout still ages out into a full release.
-                overlay = "grab" if self._button_down else "track"
-                return AirMouseDecision(cursor=None, button=None,
-                                        overlay=overlay, grip=self._grip.stable)
+                overlay = "grab" if self.button_is_down else "track"
+                return AirMouseDecision(cursor=None, left=None, right=None,
+                                        overlay=overlay, hand=self._hand,
+                                        grip=self._controlling_grip())
             return self.release_decision()
 
-        # ── engage gate: the hand must be RAISED above the body reference. No
-        #    reference (couldn't read a spine/elbow joint) → can't confirm a
-        #    raise → disengage (fail SAFE to releasing the real mouse). ─────────
-        if ref_y is None or not self._is_raised(float(hand_xy[1]), float(ref_y)):
+        # ── reach gate: pick the more-extended arm (with engage hysteresis). No
+        #    arm extended → disengage (fail SAFE to releasing the real mouse). ──
+        arm = choose_controlling_arm(left_ext, right_ext, engaged=self._engaged)
+        if arm is None:
             return self.release_decision()
 
         # ── ENGAGED. On the rising edge (was disengaged) snap the smoothing to
@@ -497,27 +646,34 @@ class AirMouseController:
             self._ema_x.reset()
             self._ema_y.reset()
         self._engaged = True
+        self._hand = arm.side
         self._last_engaged_at = self._clock()
 
-        # Smooth the position, then map to a pixel.
-        sx = self._ema_x.update(hand_xy[0])
-        sy = self._ema_y.update(hand_xy[1])
+        # Smooth the controlling hand's position, then map to a pixel.
+        hand = arm.hand
+        sx = self._ema_x.update(float(hand[0]))
+        sy = self._ema_y.update(float(hand[1]))
         cursor = self.reach.map(sx, sy)
 
-        # Debounce the grip; detect button edges off the STABLE grip.
-        stable = self._grip.update(raw_grip)
-        button = None
-        want_down = (stable == "closed")
-        if want_down and not self._button_down:
-            button = "down"
-            self._button_down = True
-        elif not want_down and self._button_down:
-            button = "up"
-            self._button_down = False
+        # Per-hand clicks: evaluate BOTH hands every engaged frame so either hand
+        # can click regardless of which drives the cursor. LEFT hand → LEFT
+        # button, RIGHT hand → RIGHT button.
+        left_edge = self._hand_button_edge(self._grip_left, left_grip, "_left_down")
+        right_edge = self._hand_button_edge(self._grip_right, right_grip, "_right_down")
 
-        overlay = "grab" if self._button_down else "track"
-        return AirMouseDecision(cursor=cursor, button=button,
-                                overlay=overlay, grip=stable)
+        overlay = "grab" if self.button_is_down else "track"
+        return AirMouseDecision(cursor=cursor, left=left_edge, right=right_edge,
+                                overlay=overlay, hand=arm.side,
+                                grip=self._controlling_grip())
+
+    def _controlling_grip(self) -> str:
+        """The stable grip of whichever hand is driving the cursor (for the
+        preview circle colour). Falls back to "open" when disengaged."""
+        if self._hand == "left":
+            return self._grip_left.stable
+        if self._hand == "right":
+            return self._grip_right.stable
+        return "open"
 
 
 def overlay_color_for(overlay_state: str) -> str:
@@ -532,10 +688,11 @@ def overlay_color_for(overlay_state: str) -> str:
 #  PREVIEW FEEDBACK: hand-circle colour + thread-safe air-mouse state (B2)
 # ══════════════════════════════════════════════════════════════════════════
 # The HUD's Kinect skeleton preview (bobert_companion._compose_kinect_preview)
-# draws a translucent circle around the controlling hand joint, coloured by the
-# LIVE air-mouse state so the owner SEES when the cursor is active / clicking:
+# draws a translucent circle around the controlling (extended) hand joint,
+# coloured by the LIVE air-mouse state so the owner SEES when the cursor is active
+# / clicking:
 #   • ENGAGED + open hand   → BLUE   (cursor active, tracking)
-#   • ENGAGED + closed hand → ORANGE (left-click / drag held)
+#   • ENGAGED + closed hand → ORANGE (click / drag held)
 #   • disengaged / off      → faint GREY idle (or no circle)
 # The colour logic is a PURE helper (no cv2 / sensor) so the geometry module and
 # the unit test assert the exact same contract; the preview just calls it.
@@ -551,7 +708,7 @@ def hand_circle_color_for(engaged: bool, grip: str) -> "tuple[int, int, int] | N
     """The hand-circle BGR colour for the preview, by air-mouse state. PURE +
     hardware-free so the preview and the test share one source of truth.
 
-      • engaged + grip "closed"        → ORANGE  (left-click / drag active)
+      • engaged + grip "closed"        → ORANGE  (click / drag active)
       • engaged + any other grip       → BLUE    (cursor engaged, tracking)
       • not engaged                    → GREY    (faint idle hint)
 
@@ -564,28 +721,33 @@ def hand_circle_color_for(engaged: bool, grip: str) -> "tuple[int, int, int] | N
     return HAND_CIRCLE_COLOR_IDLE
 
 
-# Thread-safe snapshot of the LIVE air-mouse engage state + current grip, written
-# by _poll_once each tick and read by the HUD preview compositor (a DIFFERENT
-# thread — the face-tracking loop). A tiny lock keeps the (engaged, grip, ts)
-# triple consistent. The preview reads it to decide the hand-circle colour and
-# whether to draw the circle at all; stale reads simply paint the last state.
+# Thread-safe snapshot of the LIVE air-mouse engage state + which hand + grip,
+# written by _poll_once each tick and read by the HUD preview compositor (a
+# DIFFERENT thread — the face-tracking loop). A tiny lock keeps the
+# (engaged, hand, grip, ts) tuple consistent. The preview reads it to decide the
+# hand-circle colour + which hand to draw it on; stale reads paint the last state.
 _air_mouse_state_lock = threading.Lock()
-_air_mouse_state: dict = {"engaged": False, "grip": "open", "ts": 0.0}
+_air_mouse_state: dict = {"engaged": False, "hand": None, "grip": "open",
+                          "ts": 0.0}
 
 
-def _set_air_mouse_state(engaged: bool, grip: str) -> None:
-    """Publish the live engage state + grip for the preview (thread-safe)."""
+def _set_air_mouse_state(engaged: bool, grip: str,
+                         hand: "str | None" = None) -> None:
+    """Publish the live engage state + which hand + grip for the preview
+    (thread-safe)."""
     with _air_mouse_state_lock:
         _air_mouse_state["engaged"] = bool(engaged)
+        _air_mouse_state["hand"] = hand
         _air_mouse_state["grip"] = (grip or "open")
         _air_mouse_state["ts"] = time.time()
 
 
 def get_air_mouse_state() -> dict:
-    """Thread-safe snapshot {'engaged': bool, 'grip': str, 'ts': float} of the
-    air-mouse. Read by the HUD skeleton preview to colour the hand circle
-    (engaged→blue, closed→orange, off→grey). Returns a COPY so the caller can't
-    mutate the shared dict. Never raises."""
+    """Thread-safe snapshot {'engaged': bool, 'hand': str|None, 'grip': str,
+    'ts': float} of the air-mouse. Read by the HUD skeleton preview to colour the
+    hand circle (engaged→blue, closed→orange, off→grey) and place it on the
+    controlling hand. Returns a COPY so the caller can't mutate the shared dict.
+    Never raises."""
     with _air_mouse_state_lock:
         return dict(_air_mouse_state)
 
@@ -697,21 +859,22 @@ def _set_cursor_pos(px: int, py: int) -> bool:
         return False
 
 
-def _mouse_button(action: str) -> bool:
-    """Press ('down') or release ('up') AIR_MOUSE_BUTTON at the current cursor
-    position. win32api SendInput-style events first, pyautogui fallback. Returns
-    True on success; never raises."""
-    button = AIR_MOUSE_BUTTON
+def _mouse_button(action: str, button: str = "left") -> bool:
+    """Press ('down') or release ('up') the LEFT or RIGHT mouse button at the
+    current cursor position. win32api mouse_event flags first, pyautogui fallback.
+    `button` ∈ {"left","right"} — the LEFT hand closing maps to "left", the RIGHT
+    hand to "right". Returns True on success; never raises."""
+    button = (button or "left").lower()
     # win32api path: event flags per button + up/down.
     try:
         import win32api
         import win32con
-        if button == "left":
-            flag = (win32con.MOUSEEVENTF_LEFTDOWN if action == "down"
-                    else win32con.MOUSEEVENTF_LEFTUP)
-        else:  # right
+        if button == "right":
             flag = (win32con.MOUSEEVENTF_RIGHTDOWN if action == "down"
                     else win32con.MOUSEEVENTF_RIGHTUP)
+        else:  # left (primary)
+            flag = (win32con.MOUSEEVENTF_LEFTDOWN if action == "down"
+                    else win32con.MOUSEEVENTF_LEFTUP)
         win32api.mouse_event(flag, 0, 0, 0, 0)
         return True
     except Exception:
@@ -719,10 +882,11 @@ def _mouse_button(action: str) -> bool:
     try:
         import pyautogui
         pyautogui.FAILSAFE = False
+        btn = "right" if button == "right" else "left"
         if action == "down":
-            pyautogui.mouseDown(button=button)
+            pyautogui.mouseDown(button=btn)
         else:
-            pyautogui.mouseUp(button=button)
+            pyautogui.mouseUp(button=btn)
         return True
     except Exception:
         return False
@@ -912,60 +1076,97 @@ def _reach_box_for_virtual_desktop(refresh: bool = False) -> "ReachBox":
 
 
 # ─── the per-tick read → decide → act path (unit-tested via _poll_once) ────
-# Joint names, in priority order, used as the ENGAGE REFERENCE the hand must be
-# raised ABOVE to drive the cursor. spine_mid (mid-chest) first so a resting hand
-# at the side / in the lap reads as DOWN while a hand lifted toward the screen
-# reads as UP; fall back through waist (spine_base) and the arm joints if the
-# torso isn't tracked, and finally the side-specific elbow. All are normally
-# present on a tracked Kinect skeleton; if none are, _hand_sample returns ref=None
-# and the controller fails safe to DISENGAGED.
-_ENGAGE_REF_JOINTS = ("spine_mid", "spine_base", "spine_shoulder",
-                      "shoulder_left", "shoulder_right")
-
-
-def _engage_reference_y(joints: dict, side: str) -> Optional[float]:
-    """The camera-space y (metres, UP-positive) the hand must clear to ENGAGE.
-    Prefers the chest/spine, then the controlling arm's elbow as a final
-    fall-back, reading the y component of whichever reference joint is present.
-    Returns None when no reference joint can be read (→ controller disengages).
-    NEVER raises."""
+def _dist3(a, b) -> Optional[float]:
+    """Euclidean 3D distance between two (x, y, z, ...) joints, or None. Local
+    mirror of the bridge helper, used only by the no-bridge-helper fallback."""
     try:
-        for name in _ENGAGE_REF_JOINTS:
-            j = joints.get(name)
-            if j and len(j) >= 2:
-                return float(j[1])
-        # Last resort: the elbow of the gripping arm (a low bar, but better than
-        # no reference at all — a hand below its own elbow is clearly lowered).
-        elbow = joints.get(f"elbow_{side}")
-        if elbow and len(elbow) >= 2:
-            return float(elbow[1])
-    except (TypeError, ValueError, IndexError):
+        if not a or not b or len(a) < 3 or len(b) < 3:
+            return None
+        dx = float(a[0]) - float(b[0])
+        dy = float(a[1]) - float(b[1])
+        dz = float(a[2]) - float(b[2])
+        return (dx * dx + dy * dy + dz * dz) ** 0.5
+    except (TypeError, ValueError):
         return None
-    return None
 
 
-def _hand_sample(bridge) -> tuple[Optional[tuple], str, bool, Optional[float]]:
-    """Read the pointing hand from the bridge:
-    (hand_xy, raw_grip, tracked, ref_y).
+def _local_arm_extension(joints: dict, side: str) -> dict:
+    """Local fallback for the bridge's arm_extension() — same forward-depth +
+    straightness math — used only if the loaded bridge lacks the helper (older
+    build). NEVER raises. (audio.kinect_bridge.arm_extension is the canonical
+    one; this keeps the air-mouse working against any bridge.)"""
+    out = {"side": side, "hand": None, "forward_reach_m": None,
+           "straightness": None, "shoulder_hand_m": None, "arm_len_m": None}
+    try:
+        shoulder = joints.get(f"shoulder_{side}")
+        elbow = joints.get(f"elbow_{side}")
+        hand = joints.get(f"hand_{side}") or joints.get(f"wrist_{side}")
+        out["hand"] = hand
+        body_ref = None
+        for name in ("spine_mid", "spine_shoulder", "spine_base"):
+            j = joints.get(name)
+            if j and len(j) >= 3 and float(j[2]) > 0:
+                body_ref = j
+                break
+        if body_ref is None and shoulder and len(shoulder) >= 3:
+            body_ref = shoulder
+        if (body_ref is not None and hand and len(hand) >= 3
+                and float(hand[2]) > 0 and float(body_ref[2]) > 0):
+            out["forward_reach_m"] = float(body_ref[2]) - float(hand[2])
+        chord = _dist3(shoulder, hand)
+        upper = _dist3(shoulder, elbow)
+        fore = _dist3(elbow, hand)
+        out["shoulder_hand_m"] = chord
+        if upper is not None and fore is not None:
+            arm_len = upper + fore
+            out["arm_len_m"] = arm_len
+            if chord is not None and arm_len > 1e-3:
+                out["straightness"] = min(1.0, chord / arm_len)
+    except (TypeError, ValueError, KeyError):
+        pass
+    return out
 
-    hand_xy is the nearest body's pointing-hand (x, y) in camera-space metres
-    (None when no body / no usable hand joint). raw_grip is that body's grip for
-    the SAME hand. tracked is whether a body was in view. ref_y is the engage
-    reference height (chest/spine, see _engage_reference_y) the hand must be
-    raised above to drive the cursor, or None when it can't be read. Never raises
-    — any failure degrades to (None, "unknown", False, None) which the controller
-    treats as a dead-man release."""
+
+def _arm_extension(bridge, joints: dict, side: str) -> "ArmExtension":
+    """Build the ArmExtension for one side. Prefers the bridge's arm_extension()
+    geometry helper (single source of truth for forward-reach + straightness);
+    falls back to computing it locally so the air-mouse still works against an
+    older bridge build that lacks the helper. NEVER raises."""
+    try:
+        fn = getattr(bridge, "arm_extension", None)
+        if callable(fn):
+            return ArmExtension.from_bridge(fn(joints, side))
+    except Exception:
+        pass
+    try:
+        return ArmExtension.from_bridge(_local_arm_extension(joints, side))
+    except Exception:
+        return ArmExtension(side, None, None, None)
+
+
+def _hand_sample(bridge) -> tuple["Optional[ArmExtension]", "Optional[ArmExtension]",
+                                  str, str, bool]:
+    """Read the per-arm extension + per-hand grips from the bridge:
+    (left_ext, right_ext, left_grip, right_grip, tracked).
+
+    left_ext / right_ext are the ArmExtension (forward-reach + straightness +
+    controlling-hand joint) for each arm of the NEAREST body, or None when that
+    arm's joints aren't usable. left_grip / right_grip are that body's raw grips.
+    tracked is whether a body was in view. NEVER raises — any failure degrades to
+    (None, None, "unknown", "unknown", False) which the controller treats as a
+    dead-man release (no arm extended / not tracked → disengaged)."""
+    none_result = (None, None, "unknown", "unknown", False)
     try:
         if not bridge.get_enabled():
-            return None, "unknown", False, None
+            return none_result
         ok, _reason = bridge.available()
         if not ok:
-            return None, "unknown", False, None
+            return none_result
         bodies = bridge.get_bodies()
     except Exception:
-        return None, "unknown", False, None
+        return none_result
     if not bodies:
-        return None, "unknown", False, None
+        return none_result
 
     # Nearest body (same ranking the rest of the stack uses).
     def _key(b):
@@ -974,64 +1175,42 @@ def _hand_sample(bridge) -> tuple[Optional[tuple], str, bool, Optional[float]]:
     try:
         body = min((b for b in bodies if isinstance(b, dict)), key=_key)
     except (TypeError, ValueError):
-        return None, "unknown", False, None
+        return none_result
 
     joints = body.get("joints") or {}
-    # Choose the pointing hand: prefer whichever hand's grip is most decisive
-    # (closed beats open beats unknown), else the right hand. We read the SAME
-    # side's hand joint so the cursor follows the hand we're gripping with.
-    right_grip = (body.get("hand_right") or "unknown").lower()
     left_grip = (body.get("hand_left") or "unknown").lower()
-
-    def _rank(g):
-        return {"closed": 2, "open": 1}.get(g, 0)
-    side = "right" if _rank(right_grip) >= _rank(left_grip) else "left"
-    grip = right_grip if side == "right" else left_grip
-
-    hand = joints.get(f"hand_{side}") or joints.get(f"wrist_{side}")
-    if not hand or len(hand) < 2:
-        # No usable hand joint on the chosen side — try the other side's joint.
-        other = "left" if side == "right" else "right"
-        hand2 = joints.get(f"hand_{other}") or joints.get(f"wrist_{other}")
-        if hand2 and len(hand2) >= 2:
-            hand = hand2
-            grip = left_grip if other == "left" else right_grip
-            side = other
-    # The engage reference is read off the SAME tracked body regardless of
-    # whether a hand joint was found, so a body in view with the hand lowered out
-    # of the joint set still disengages cleanly.
-    ref_y = _engage_reference_y(joints, side)
-    if not hand or len(hand) < 2:
-        return None, grip, True, ref_y   # body tracked but no hand joint
-    return (float(hand[0]), float(hand[1])), grip, True, ref_y
+    right_grip = (body.get("hand_right") or "unknown").lower()
+    left_ext = _arm_extension(bridge, joints, "left")
+    right_ext = _arm_extension(bridge, joints, "right")
+    return left_ext, right_ext, left_grip, right_grip, True
 
 
 def _apply_decision(decision: AirMouseDecision) -> None:
     """Perform the side effects of a decision: move the cursor and actuate the
-    button. Pure-core stays I/O-free; THIS is where the real mouse is touched.
-    Best-effort; never raises out to the loop."""
+    per-hand buttons. Pure-core stays I/O-free; THIS is where the real mouse is
+    touched. Best-effort; never raises out to the loop."""
     if decision.cursor is not None:
         _set_cursor_pos(decision.cursor[0], decision.cursor[1])
-    if decision.button in ("down", "up"):
-        _mouse_button(decision.button)
+    for button, action in decision.button_edges:
+        _mouse_button(action, button)
 
 
 def _poll_once(ctrl: AirMouseController, bridge) -> Optional[AirMouseDecision]:
-    """One air-mouse tick: read the hand, decide, and (only when enabled +
-    not staging) ACT — move the cursor, actuate the button, publish the overlay
-    state. Returns the decision (for tests) or None when the bridge is absent.
-    NEVER raises.
+    """One air-mouse tick: read the arms, decide, and (only when enabled +
+    not staging) ACT — move the cursor, actuate the per-hand buttons, publish the
+    overlay state. Returns the decision (for tests) or None when the bridge is
+    absent. NEVER raises.
 
     GATING: the controller is ALWAYS advanced (so its smoothing/grip state stays
     current and a re-enable doesn't see a huge gap), but the SIDE EFFECTS (mouse
-    move, button, visible overlay) only happen when KINECT_AIR_MOUSE_ENABLED is
+    move, buttons, visible overlay) only happen when KINECT_AIR_MOUSE_ENABLED is
     on AND not staging. Flipping the flag off therefore stops the cursor moving
     instantly and releases any held button via the dead-man path."""
     if bridge is None:
         return None
-    hand_xy, raw_grip, tracked, ref_y = _hand_sample(bridge)
+    left_ext, right_ext, left_grip, right_grip, tracked = _hand_sample(bridge)
     try:
-        decision = ctrl.update(hand_xy, raw_grip, tracked, ref_y)
+        decision = ctrl.update(left_ext, right_ext, left_grip, right_grip, tracked)
     except Exception:
         # A controller error must not strand a held button — force a release.
         try:
@@ -1043,26 +1222,28 @@ def _poll_once(ctrl: AirMouseController, bridge) -> Optional[AirMouseDecision]:
     if not enabled:
         # Gated OFF mid-session: make sure no button is left held and the
         # overlay is hidden. ctrl.update already returned a (possibly
-        # button-up) decision if it had been holding; honour a pending 'up'
-        # so a flag flip during a drag still releases, but never a 'down'.
-        if decision.button == "up":
-            _mouse_button("up")
+        # button-up) decision if it had been holding; honour pending 'up's
+        # (per hand) so a flag flip during a drag still releases, but never a
+        # 'down'.
+        for button, action in decision.button_edges:
+            if action == "up":
+                _mouse_button("up", button)
         _clear_overlay_state()
         # Publish DISENGAGED to the preview: with the air-mouse off the HUD
         # hand-circle must show idle/grey (or nothing), never a live blue/orange.
-        _set_air_mouse_state(False, "open")
+        _set_air_mouse_state(False, "open", None)
         return decision
 
     # Enabled + not staging: act.
     _apply_decision(decision)
     visible = tracked and decision.overlay != "hidden"
     _publish_overlay_state(decision, visible)
-    # Publish the LIVE engage state + grip for the HUD skeleton preview's hand
-    # circle (B2): engaged→blue, closed→orange, disengaged→grey. Read off the
-    # controller (engaged) + the debounced decision (grip) so the preview colour
-    # matches what the cursor/reticle are actually doing this frame.
+    # Publish the LIVE engage state + which hand + grip for the HUD skeleton
+    # preview's hand circle (B2): engaged→blue, closed→orange, disengaged→grey,
+    # drawn on the controlling hand. Read off the controller (engaged + hand) +
+    # the decision (grip) so the preview colour matches the cursor/reticle.
     try:
-        _set_air_mouse_state(bool(ctrl.engaged), decision.grip)
+        _set_air_mouse_state(bool(ctrl.engaged), decision.grip, ctrl.hand)
     except Exception:
         pass
     # Keep the reticle overlay process alive while enabled.
@@ -1088,7 +1269,7 @@ def _poll_loop() -> None:  # pragma: no cover - non-terminating daemon; each tic
             now = time.time()
             if enabled and not was_enabled:
                 # Just turned on — re-read the virtual-desktop bounds (the user
-                # may have changed displays) and start fresh so the first hand
+                # may have changed displays) and start fresh so the first reach
                 # snaps to where it's pointing.
                 ctrl.reach = _reach_box_for_virtual_desktop(refresh=True)
                 last_bounds_refresh = now
@@ -1196,9 +1377,10 @@ def air_mouse_on(_: str = "") -> str:
     sensor_note = "" if ready else f" Note {why} — enable the Kinect so I can see your hand."
     if already:
         return already + sensor_note
-    msg = ("Air-mouse on, sir — raise an open hand toward the screen to move the "
-           "cursor, close your hand to click, hold it closed to drag, and lower "
-           "your hand to release the cursor.")
+    msg = ("Air-mouse on, sir — reach an arm out toward the screen to take the "
+           "cursor, close your left hand to left-click or your right hand to "
+           "right-click, hold a hand closed to drag, and relax your arm to "
+           "release the cursor.")
     if not persisted:
         msg += " (I couldn't save it, so it'll revert on restart.)"
     return msg + sensor_note
@@ -1210,9 +1392,10 @@ def air_mouse_off(_: str = "") -> str:
     if not _cfg_flag("KINECT_AIR_MOUSE_ENABLED"):
         return "The air-mouse is already off, sir."
     persisted = _set_enabled(False)
-    # Make sure nothing is left held and the reticle is gone right away.
+    # Make sure nothing is left held (BOTH buttons) and the reticle is gone.
     try:
-        _mouse_button("up")
+        _mouse_button("up", "left")
+        _mouse_button("up", "right")
     except Exception:
         pass
     _shutdown_overlay()
@@ -1227,8 +1410,9 @@ def air_mouse_status(_: str = "") -> str:
     """Report whether the air-mouse is on + whether a hand is in view.
     'is the air-mouse on' / 'air-mouse status'."""
     enabled = _cfg_flag("KINECT_AIR_MOUSE_ENABLED")
-    how = ("raise an open hand to move the cursor, close to click, hold closed "
-           "to drag, and lower your hand to release the cursor")
+    how = ("reach an arm out to take the cursor, close your left hand to "
+           "left-click or your right hand to right-click, hold to drag, and "
+           "relax your arm to release the cursor")
     if not enabled:
         return (f"The air-mouse is off, sir — say 'turn on the air-mouse' to "
                 f"enable it. Once on, {how}.")
@@ -1239,7 +1423,7 @@ def air_mouse_status(_: str = "") -> str:
     if in_view:
         return f"The air-mouse is on and I can see your hand, sir — {how}."
     return ("The air-mouse is on, sir, but I don't see a hand in the Kinect's "
-            f"view at the moment. Raise an open hand toward the screen and {how}.")
+            f"view at the moment. Reach an arm out toward the screen and {how}.")
 
 
 # ─── registration ────────────────────────────────────────────────────────

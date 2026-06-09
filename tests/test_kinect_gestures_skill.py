@@ -216,14 +216,98 @@ class DispatchTests(_Base):
 
 # ─── _poll_once gating ──────────────────────────────────────────────────────
 class _StubRec:
-    """Recognizer stub: returns the queued gesture once per update call."""
+    """Recognizer stub: returns the queued gesture once per update call, and
+    records update()/reset() calls so the air-mouse-suppression gate (which
+    skips update() and calls reset() while engaged) can be asserted."""
     def __init__(self, gestures):
         self._g = list(gestures)
         self.updates = 0
+        self.resets = 0
 
     def update(self, bodies):
         self.updates += 1
         return self._g.pop(0) if self._g else None
+
+    def reset(self):
+        self.resets += 1
+
+
+class _FakeAirMouseSkill(types.ModuleType):
+    """A stand-in skills/kinect_air_mouse exposing only get_air_mouse_state, so
+    the gesture skill's _air_mouse_engaged() can read the engaged flag. Injected
+    as sys.modules['skill_kinect_air_mouse'] (the loader's module name)."""
+    def __init__(self, engaged=False):
+        super().__init__("skill_kinect_air_mouse")
+        self._engaged = bool(engaged)
+        self.get_air_mouse_state = lambda: {
+            "engaged": self._engaged, "hand": "right", "grip": "open", "ts": 0.0}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  AIR-MOUSE SUPPRESSION: gestures fire ONLY in the RELAXED state (no arm
+#  extended). While the air-mouse is ENGAGED (an arm reaching out) detection is
+#  SUPPRESSED — wave/swipe must not register, and the recognizer is RESET so the
+#  reach motion can't fire a gesture the instant the arm relaxes.
+# ══════════════════════════════════════════════════════════════════════════
+class AirMouseSuppressionTests(_Base):
+    def _set_air_mouse(self, engaged):
+        self._inject("skill_kinect_air_mouse", _FakeAirMouseSkill(engaged=engaged))
+
+    def test_engaged_helper_reads_air_mouse_state(self):
+        mod = self._load()
+        self._set_air_mouse(True)
+        self.assertTrue(mod._air_mouse_engaged())
+        self._set_air_mouse(False)
+        self.assertFalse(mod._air_mouse_engaged())
+
+    def test_engaged_helper_false_when_skill_absent(self):
+        mod = self._load()
+        # No air-mouse skill loaded → gestures still work (helper returns False).
+        self._inject("skill_kinect_air_mouse", None)
+        self.assertFalse(mod._air_mouse_engaged())
+
+    def test_gesture_suppressed_while_air_mouse_engaged(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        self._set_air_mouse(True)               # arm extended → air-mouse engaged
+        bc = _fake_bc(standby=True, sleep=True)
+        self._inject("audio.kinect_bridge", _fake_bridge(bodies=[{"x": 1}]))
+        rec = _StubRec([kg.WAVE])
+        got = mod._poll_once(rec, bc)
+        self.assertIsNone(got)                  # gesture SUPPRESSED
+        self.assertEqual(rec.updates, 0)        # detection skipped entirely
+        self.assertGreaterEqual(rec.resets, 1)  # recognizer reset while engaged
+        self.assertTrue(bc._standby_mode[0])    # NOT woken
+
+    def test_gesture_fires_when_relaxed(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        self._set_air_mouse(False)              # no arm extended → relaxed
+        bc = _fake_bc(standby=True, sleep=True)
+        self._inject("audio.kinect_bridge", _fake_bridge(bodies=[{"x": 1}]))
+        rec = _StubRec([kg.WAVE])
+        got = mod._poll_once(rec, bc)
+        self.assertEqual(got, kg.WAVE)          # fires only when relaxed
+        self.assertEqual(rec.updates, 1)
+        self.assertFalse(bc._standby_mode[0])   # woke
+
+    def test_engage_then_relax_resumes_detection(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        bc = _fake_bc(standby=True, sleep=True)
+        self._inject("audio.kinect_bridge", _fake_bridge(bodies=[{"x": 1}]))
+        # While engaged: suppressed + reset, queued gesture untouched.
+        self._set_air_mouse(True)
+        rec = _StubRec([kg.WAVE])
+        self.assertIsNone(mod._poll_once(rec, bc))
+        self.assertEqual(rec.updates, 0)
+        # Relax → the same queued gesture now fires (detection resumed).
+        self._set_air_mouse(False)
+        self.assertEqual(mod._poll_once(rec, bc), kg.WAVE)
+        self.assertTrue(rec.resets >= 1 and rec.updates == 1)
 
 
 class PollGateTests(_Base):

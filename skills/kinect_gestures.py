@@ -80,6 +80,27 @@ def _bc():
     return sys.modules.get("__main__") or sys.modules.get("bobert_companion")
 
 
+def _air_mouse_engaged() -> bool:
+    """True when the air-mouse currently has the cursor (an arm is EXTENDED OUT
+    toward the sensor). Gestures must be SUPPRESSED while engaged so wave/swipe
+    only register in the RELAXED state (no arm extended) and the air-mouse takes
+    over the instant the owner reaches out. Reads the air-mouse skill's
+    thread-safe get_air_mouse_state() via sys.modules (the loaded skill registers
+    itself as 'skill_kinect_air_mouse'); returns False when the skill isn't
+    loaded / readable so gestures still work if the air-mouse skill is absent.
+    NEVER raises."""
+    try:
+        sk = sys.modules.get("skill_kinect_air_mouse")
+        getter = getattr(sk, "get_air_mouse_state", None) if sk else None
+        if callable(getter):
+            st = getter()
+            if isinstance(st, dict):
+                return bool(st.get("engaged"))
+    except Exception:
+        pass
+    return False
+
+
 def _cfg_flag(name: str, default: bool = False) -> bool:
     """Read a live boolean from core.config, tolerating its absence. Read fresh
     each call so a Settings toggle takes effect without a restart."""
@@ -322,9 +343,25 @@ def _poll_once(rec, bc) -> str | None:
     dispatch any gesture. Returns the gesture name (for tests) or None. NEVER
     raises. Respects the live gate so toggling KINECT_GESTURES_ENABLED off
     stops dispatch mid-session (the recognizer is still fed so it doesn't see a
-    huge time gap when re-enabled — but nothing is dispatched)."""
+    huge time gap when re-enabled — but nothing is dispatched).
+
+    AIR-MOUSE SUPPRESSION: while the air-mouse is ENGAGED (an arm extended OUT,
+    driving the cursor) gesture detection is SUPPRESSED entirely — wave/swipe
+    must only register in the RELAXED state (no arm extended), and the air-mouse
+    takes over the instant the owner reaches out. We RESET the recognizer while
+    engaged so the reach motion can't accumulate in its history and spuriously
+    fire a gesture the instant the arm relaxes; detection re-arms cleanly once the
+    owner relaxes."""
     kb = _bridge()
     if kb is None:
+        return None
+    # Suppress gestures while the air-mouse owns the cursor (arm extended). Reset
+    # the recognizer so no stale reach-motion lingers to fire on disengage.
+    if _air_mouse_engaged():
+        try:
+            rec.reset()
+        except Exception:
+            pass
         return None
     try:
         if not kb.get_enabled():
