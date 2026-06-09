@@ -3604,10 +3604,22 @@ def _air_mouse_state_for_preview() -> dict:
 
 def _draw_hand_circle_on_color(color_bgr: "np.ndarray",
                                points: dict) -> bool:
-    """Draw the translucent air-mouse hand circle around the controlling hand
-    joint (B2), coloured by the LIVE air-mouse state: BLUE when engaged (cursor
-    active / open hand), ORANGE when the hand is closed (left-click/drag), faint
-    GREY when disengaged. Returns True iff a circle was drawn. NEVER raises.
+    """Draw the ONE bright air-mouse hand circle around the CONTROLLING (cursor)
+    hand joint (B2), coloured by the LIVE air-mouse state: BLUE when engaged
+    (cursor active / open hand), ORANGE when the hand is closed (left-click/drag).
+    Returns True iff a circle was drawn. NEVER raises.
+
+    TWO-HAND DISAMBIGUATION FIX: the bright ring is drawn ONLY when the air-mouse
+    is actually ENGAGED *and* publishes a real controlling side ("left"/"right"),
+    on THAT side's hand specifically (controlling_hand_point with fallback=False).
+    This removes the old grey idle ring that, when disengaged, fell back to the
+    default order and ALWAYS landed on the right hand — which made a disengaged /
+    frozen-preview state masquerade as "the right hand is still controlling", and
+    with both hands up read as two co-equal cursor circles. Disengaged ⇒ NO bright
+    ring at all (the non-controlling hand instead gets a faint subordinate dot,
+    drawn by _draw_skeleton_on_color). The faint marker on the OTHER hand lives in
+    the skeleton drawer so there is exactly one bright ring + one faint dot, never
+    two equal rings.
 
     Geometry + colour come from the pure helpers (audio.kinect_skeleton +
     skills/kinect_air_mouse.hand_circle_color_for) so the preview and the unit
@@ -3619,20 +3631,23 @@ def _draw_hand_circle_on_color(color_bgr: "np.ndarray",
     state = _air_mouse_state_for_preview()
     engaged = bool(state.get("engaged"))
     grip = str(state.get("grip", "open"))
-    # Draw the circle on whichever hand the air-mouse is CURRENTLY driving with
-    # (the reach-to-engage model picks the extended arm, left OR right); falls
-    # back to the default hand order when disengaged / no side reported.
-    pt = _ks.controlling_hand_point(points, prefer_side=state.get("hand"))
+    side = state.get("hand")
+    # ONE bright ring, ONLY while engaged with a real controlling side. Disengaged
+    # / no side → draw nothing here (no arbitrary idle ring on the right hand).
+    if not engaged or side not in ("left", "right"):
+        return False
+    # Require the controlling side's hand/wrist to project (fallback=False) — never
+    # ring an arbitrary hand if the controlling side didn't project this frame.
+    pt = _ks.controlling_hand_point(points, prefer_side=side, fallback=False)
     if pt is None:
         return False
-    # Disengaged → only a faint idle hint; engaged → a bold blue/orange ring.
     sk = sys.modules.get("skill_kinect_air_mouse")
     color_fn = getattr(sk, "hand_circle_color_for", None) if sk else None
     if callable(color_fn):
         color = color_fn(engaged, grip)
     else:   # pragma: no cover - skill always loaded in the live HUD
-        color = (255, 160, 32) if engaged else (150, 150, 150)
-    alpha = 0.55 if engaged else 0.22       # translucent; fainter when idle
+        color = (255, 160, 32)
+    alpha = 0.55                            # translucent bright ring
     radius = _ks.hand_circle_radius(color_bgr.shape[1])
     try:
         cx, cy = int(pt[0]), int(pt[1])
@@ -3640,8 +3655,7 @@ def _draw_hand_circle_on_color(color_bgr: "np.ndarray",
         # Filled translucent disc + a crisper ring so it reads at thumbnail size.
         cv2.circle(overlay, (cx, cy), radius, color, -1, lineType=cv2.LINE_AA)
         cv2.addWeighted(overlay, alpha, color_bgr, 1.0 - alpha, 0.0, color_bgr)
-        cv2.circle(color_bgr, (cx, cy), radius, color,
-                   3 if engaged else 2, lineType=cv2.LINE_AA)
+        cv2.circle(color_bgr, (cx, cy), radius, color, 3, lineType=cv2.LINE_AA)
     except Exception:
         return False
     return True
@@ -3671,6 +3685,19 @@ def _draw_skeleton_on_color(color_bgr: "np.ndarray", bodies: list) -> int:
     # so they read on a 240px-wide downscaled preview.
     bone_col = (255, 201, 76)     # BGR of #4cc9ff-ish (cyan)
     joint_col = (160, 231, 255)   # BGR brighter cyan/white
+    # TWO-HAND DISAMBIGUATION: when the air-mouse is engaged with a known
+    # controlling side, the NON-controlling hand joint is drawn as a smaller,
+    # dimmer dot (a thin hollow ring) instead of an equal filled cyan dot, so the
+    # owner sees ONE bright ring (the controlling hand, drawn by
+    # _draw_hand_circle_on_color) + ONE faint dot (the other hand) — never two
+    # equal circles. The controlling hand's own joint keeps the normal dot under
+    # the bright ring. Read the live which-hand once for this frame.
+    am_state = _air_mouse_state_for_preview()
+    am_engaged = bool(am_state.get("engaged"))
+    ctrl_side = am_state.get("hand") if am_engaged else None
+    other_hand_joint = (f"hand_{'left' if ctrl_side == 'right' else 'right'}"
+                        if ctrl_side in ("left", "right") else None)
+    other_dot_col = (150, 150, 150)   # desaturated/dim grey for the idle hand
     first_points = None
     for body in bodies:
         try:
@@ -3680,14 +3707,24 @@ def _draw_skeleton_on_color(color_bgr: "np.ndarray", bodies: list) -> int:
             points = _ks.project_body_joints(joints, mapper)
             if not points:
                 continue
-            if first_points is None:
+            is_first = first_points is None
+            if is_first:
                 first_points = points     # hand circle tracks the nearest body
             for (x1, y1), (x2, y2) in _ks.iter_bone_segments(points):
                 cv2.line(color_bgr, (x1, y1), (x2, y2), bone_col, 4,
                          lineType=cv2.LINE_AA)
-            for (px, py) in points.values():
-                cv2.circle(color_bgr, (px, py), 7, joint_col, -1,
-                           lineType=cv2.LINE_AA)
+            for name, (px, py) in points.items():
+                # Only the NEAREST (first) body's non-controlling hand is made
+                # subordinate (it's the one the air-mouse reasons about).
+                if (is_first and other_hand_joint is not None
+                        and name == other_hand_joint):
+                    # Smaller, dim, HOLLOW ring — visually subordinate to the
+                    # bright controlling ring so two hands up never read as equal.
+                    cv2.circle(color_bgr, (px, py), 5, other_dot_col, 1,
+                               lineType=cv2.LINE_AA)
+                else:
+                    cv2.circle(color_bgr, (px, py), 7, joint_col, -1,
+                               lineType=cv2.LINE_AA)
             drawn += 1
         except Exception:
             continue
@@ -3956,6 +3993,46 @@ def _kinect_preview_piece_skipped(piece: str) -> None:
         pass
 
 
+# Last Kinect COLOR frame the compositor itself saw, so a transient color gap (a
+# get_color_bgr(require_new=False) returning None right after a runtime reopen
+# before color re-primes) can re-serve the last image instead of blanking the
+# skeleton tile (the preview-keep-alive fix). Stored as a COPY so the bridge's
+# buffer can't mutate it under us. A throttled log makes the gap visible.
+_kinect_preview_last_color: list = [None]      # [np.ndarray | None]
+_kinect_preview_color_none_log_last = [0.0]
+
+
+def _last_cached_kinect_color() -> "np.ndarray | None":
+    """The last Kinect color frame the compositor saw (a fresh copy), or None if it
+    has never produced one. Used to keep the skeleton tile alive across a transient
+    color miss instead of returning None (which would blank the preview)."""
+    frame = _kinect_preview_last_color[0]
+    if frame is None:
+        return None
+    try:
+        return frame.copy()
+    except Exception:
+        return None
+
+
+def _kinect_preview_color_none_logged() -> None:
+    """Throttled log that the Kinect color frame came back None inside the
+    compositor (the exact intermittent the owner hit — skeleton 'rendered for a
+    while then stopped'). Logged so it's visible in the session log next time.
+    NEVER raises."""
+    try:
+        now = time.monotonic()
+        if (now - _kinect_preview_color_none_log_last[0]
+                ) >= _KINECT_PREVIEW_SKIP_LOG_INTERVAL:
+            _kinect_preview_color_none_log_last[0] = now
+            cached = _kinect_preview_last_color[0] is not None
+            print("  [kinect-preview] color frame was None — "
+                  + ("re-serving the last cached color frame"
+                     if cached else "no cached frame yet, preview falls back"))
+    except Exception:
+        pass
+
+
 def _compose_kinect_preview(now: float) -> "np.ndarray | None":
     """Build the composite preview image: the Kinect COLOR frame with the live
     skeleton + air-mouse hand circle + gesture pop drawn over it, with the two
@@ -3977,18 +4054,31 @@ def _compose_kinect_preview(now: float) -> "np.ndarray | None":
     only None return is when there is no Kinect color frame at all (caller then
     keeps the plain webcam mirror)."""
     try:
-        base = _kinect_bridge.get_color_bgr(require_new=False)
+        fresh = _kinect_bridge.get_color_bgr(require_new=False)
     except Exception:
-        base = None
-    if base is None:
-        return None
+        fresh = None
+    if fresh is not None:
+        # A real color frame — cache a copy so a later transient miss can re-serve
+        # it, and use a copy as our base (don't scribble on the bridge's buffer).
+        try:
+            base = fresh.copy()
+            _kinect_preview_last_color[0] = base
+        except Exception:
+            # Can't even copy the frame — hand back the original rather than
+            # nothing (and skip caching).
+            return fresh
+    else:
+        # Color came back None (a transient gap — e.g. just after a runtime
+        # reopen before color re-primes). Rather than blank the preview, fall back
+        # to the LAST cached Kinect color frame so the skeleton tile shows the last
+        # image instead of going dark. Log it (throttled) so this intermittent is
+        # visible in the session log. Only None if we have no cached frame either.
+        _kinect_preview_color_none_logged()
+        base = _last_cached_kinect_color()
+        if base is None:
+            return None
     # From here the Kinect color frame EXISTS — we must return at least it. Each
     # step below is independently guarded so no optional overlay can blank it.
-    try:
-        base = base.copy()   # don't scribble on the bridge's frame buffer
-    except Exception:
-        # Can't even copy the frame — hand back the original rather than nothing.
-        return base
 
     # Skeleton (+ the air-mouse hand circle, itself guarded inside). Its own
     # guard so a projection/mapper glitch can't blank the color frame.
@@ -4634,6 +4724,21 @@ def _face_tracking_thread():
                                 _camera_last_read_error_at[cam["index"]] = now_loop
                             print(f"  [face-track] {cam['label']} (index {cam['index']}) "
                                   f"dead after {entry['fails']} failed reads; will reopen in {REOPEN_BACKOFF_SEC:.1f}s")
+                        # PREVIEW-KEEP-ALIVE FIX: a Kinect read MISS must NOT skip
+                        # the skeleton preview write. The Kinect IS the primary
+                        # "camera" on the owner's rig, so a transient color miss
+                        # used to bare-`continue` past the preview write below,
+                        # freezing then blanking the skeleton tile. Instead, still
+                        # attempt the Kinect preview write for the primary camera
+                        # (its require_new=False / cached-color fallback re-serves
+                        # the last frame, keeping the tile alive) before continuing.
+                        if (cam["primary"] and not camera_off
+                                and _hud_camera_preview_enabled()):
+                            try:
+                                _hud_kinect_preview_write(now_loop)
+                            except Exception:
+                                logging.exception(
+                                    "[face-track] kinect preview write on read-miss failed")
                         continue
                 entry["fails"] = 0
                 _note_camera_read_attempt(cam["index"], ok=True)

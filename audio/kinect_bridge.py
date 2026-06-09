@@ -197,19 +197,36 @@ def _frame_source_flags(pk2):
             | pk2.FrameSourceTypes_Depth | pk2.FrameSourceTypes_Infrared)
 
 
-def _runtime_streams(rt, timeout_sec: float = 2.5) -> bool:
-    """True if a freshly-opened runtime delivers a color/body frame within
-    timeout_sec. A sensor still held by a releasing prior instance opens but
-    never streams — catch that so we retry instead of caching a dead runtime."""
+def _runtime_streams(rt, timeout_sec: float = 2.5,
+                     require_color: bool = True) -> bool:
+    """True if a freshly-opened runtime delivers the required frame(s) within
+    timeout_sec. A sensor still held by a releasing prior instance opens but never
+    streams — catch that so we retry instead of caching a dead runtime.
+
+    require_color (the preview-keep-alive fix): when True we require a COLOR frame
+    specifically (the preview is color-backed), so a reopen that yields BODY-but-no-
+    COLOR is REJECTED and retried rather than cached as "good" — which is exactly
+    how the old reopen left color cold (it accepted body-only) and the skeleton
+    stayed dark while gestures worked. We still also accept color when body lags, so
+    a color-live runtime always passes. require_color=False keeps the old
+    color-OR-body behaviour for callers that don't need the preview."""
     end = time.monotonic() + timeout_sec
+    saw_body = False
     while time.monotonic() < end:
         try:
-            if rt.has_new_color_frame() or rt.has_new_body_frame():
+            if rt.has_new_color_frame():
                 return True
+            # Track body so a no-color (require_color False) caller still passes.
+            if rt.has_new_body_frame():
+                saw_body = True
+                if not require_color:
+                    return True
         except Exception:
             return False
         time.sleep(0.05)
-    return False
+    # Timed out without a color frame. Only honour a body-only stream when the
+    # caller didn't require color (require_color True → reject so the open retries).
+    return saw_body and not require_color
 
 
 def _safe_close_runtime(rt) -> None:
@@ -244,6 +261,12 @@ def _open_runtime_locked():
         if _runtime_streams(rt):
             _runtime[0] = rt
             _open_error[0] = None
+            # Seed BOTH staleness clocks so the freshly-verified runtime gets a
+            # full window to stream before any stale-reset could fire (the verify
+            # above already confirmed a color frame, so color is live right now).
+            now0 = time.monotonic()
+            _last_body_frame_at[0] = now0
+            _last_color_frame_at[0] = now0
             if _attempt:
                 print(f"  [kinect] sensor live after {_attempt + 1} open attempts")
             return rt, None
@@ -314,6 +337,9 @@ def get_color_bgr(require_new: bool = True):
         if arr.size != 1920 * 1080 * 4:
             return None
         bgra = arr.reshape((1080, 1920, 4))
+        # Stamp the COLOR staleness clock: a real frame was delivered, so the
+        # stale-reset must NOT count color as quiet (the preview-keep-alive fix).
+        note_color_frame_seen()
         return bgra[:, :, :3]   # BGRA → BGR (drop alpha)
     except Exception:   # pragma: no cover - defensive: mid-stream frame glitch
         return None
@@ -512,6 +538,34 @@ def _dist3(a, b) -> Optional[float]:
         return None
 
 
+def _body_scale_m(joints: dict) -> Optional[float]:
+    """A BODY-SIZE reference distance in metres for normalising the forward reach
+    into a dimensionless, POSITION-INDEPENDENT ratio (the fix for "engage depended
+    on how far the owner sat / where the chair was").
+
+    Prefer the SHOULDER WIDTH (3D distance shoulder_left↔shoulder_right) — the most
+    stable horizontal body span and the one least affected by raising an arm — and
+    fall back to the TORSO HEIGHT (spine_base→spine_shoulder) when a shoulder is
+    untracked. Both scale with the SAME body, so forward_reach_m / body_scale is a
+    fraction of the owner's own frame: a relaxed hand sits near 0, a full reach near
+    ~1+, INDEPENDENT of the absolute metres (which shrink as the owner sits back).
+    Returns metres, or None when neither span is usable. Pure; never raises."""
+    try:
+        sl = joints.get("shoulder_left")
+        sr = joints.get("shoulder_right")
+        width = _dist3(sl, sr)
+        if width is not None and width > 0.10:   # a plausible shoulder span (m)
+            return width
+        base = joints.get("spine_base")
+        top = joints.get("spine_shoulder") or joints.get("spine_mid")
+        torso = _dist3(base, top)
+        if torso is not None and torso > 0.10:
+            return torso
+    except (TypeError, ValueError, KeyError):
+        return None
+    return None
+
+
 def arm_extension(joints: dict, side: str) -> dict:
     """Describe how EXTENDED one arm (`side` ∈ {"left","right"}) is, for the
     air-mouse reach-to-engage gate. Reads the shoulder / elbow / hand joints of
@@ -521,16 +575,25 @@ def arm_extension(joints: dict, side: str) -> dict:
         {"side": str,
          "hand": (x, y, z, state) | None,     # the controlling hand joint
          "forward_reach_m": float | None,     # body_z - hand_z (>0 = reaching)
+         "reach_ratio": float | None,         # forward_reach_m / body_scale (0..~1+)
+         "body_scale_m": float | None,        # shoulder width (or torso height) (m)
          "straightness": float | None,        # 0..~1; chord / summed-bone length
          "shoulder_hand_m": float | None,     # straight-line shoulder→hand (m)
          "arm_len_m": float | None}           # shoulder→elbow + elbow→hand (m)
 
     forward_reach_m is POSITIVE when the hand is pushed toward the sensor (in
-    front of the torso). straightness ≈ 1 when the arm is straightened out, and
-    drops toward ~0.5-0.7 when the elbow is bent and the hand pulled back. The
-    air-mouse engages when forward_reach_m and/or straightness clear its
-    thresholds, and disengages (with hysteresis) when the arm relaxes."""
+    front of the torso). reach_ratio NORMALISES that absolute reach by a body-size
+    span (shoulder width, fallback torso height) so it is POSITION-INDEPENDENT —
+    invariant to how far the owner sits / where the chair is — the headline fix:
+    the raw forward metres shrink as the owner sits back, but the ratio (a fraction
+    of their own body) does not, so the same reach engages from any distance.
+    straightness ≈ 1 when the arm is straightened out, and drops toward ~0.5-0.7
+    when the elbow is bent and the hand pulled back. The air-mouse engages when
+    reach_ratio and/or straightness clear its thresholds, and disengages (with
+    hysteresis) when the arm relaxes — and because reach_ratio is body-relative,
+    RELAXING always releases regardless of where the body is in the frustum."""
     out = {"side": side, "hand": None, "forward_reach_m": None,
+           "reach_ratio": None, "body_scale_m": None,
            "straightness": None, "shoulder_hand_m": None, "arm_len_m": None}
     try:
         shoulder = joints.get(f"shoulder_{side}")
@@ -550,6 +613,15 @@ def arm_extension(joints: dict, side: str) -> dict:
         if (body_ref is not None and hand and len(hand) >= 3
                 and float(hand[2]) > 0 and float(body_ref[2]) > 0):
             out["forward_reach_m"] = float(body_ref[2]) - float(hand[2])
+        # BODY-RELATIVE REACH RATIO (POSITION-INDEPENDENT): normalise the forward
+        # reach by a body-size span so the engage/disengage gate is invariant to
+        # the owner's distance from the sensor. shoulder width preferred, torso
+        # height fallback (see _body_scale_m).
+        scale = _body_scale_m(joints)
+        out["body_scale_m"] = scale
+        if (out["forward_reach_m"] is not None and scale is not None
+                and scale > 1e-3):
+            out["reach_ratio"] = out["forward_reach_m"] / scale
         # ARM-STRAIGHTNESS: shoulder→hand chord / (shoulder→elbow + elbow→hand).
         chord = _dist3(shoulder, hand)
         upper = _dist3(shoulder, elbow)
@@ -962,6 +1034,13 @@ def get_head_yaw() -> Optional[float]:
 BODY_PUMP_INTERVAL_SEC = 1.0 / 30.0   # ~30 Hz: cache ≤~33 ms stale (feeds air-mouse)
 BODY_STALE_RESET_SEC = 4.0         # no new body frame for this long → reset+reopen
 _last_body_frame_at = [0.0]        # monotonic of the last OBSERVED new body frame
+# Color is a FIRST-CLASS stream for the reset decision (the fix for "the skeleton
+# preview stopped after a while / on standing up"): a body-only dropout (the owner
+# leaving the frustum) must NOT tear down a runtime whose COLOR is still flowing,
+# or the preview (which is backed by color) goes dark while gestures keep working.
+# get_color_bgr stamps this whenever it delivers a real frame; the stale-reset only
+# fires when BOTH body AND color are quiet.
+_last_color_frame_at = [0.0]       # monotonic of the last DELIVERED color frame
 _body_pump_thread: list[Any] = [None]
 _body_pump_stop = threading.Event()
 _body_pump_lock = threading.Lock()
@@ -972,6 +1051,41 @@ def note_body_frame_seen(now: Optional[float] = None) -> None:
     Called by get_bodies() on a real frame AND by the pump, so a healthy stream
     keeps the clock current and never trips the stale-reset."""
     _last_body_frame_at[0] = time.monotonic() if now is None else now
+
+
+def note_color_frame_seen(now: Optional[float] = None) -> None:
+    """Stamp the time a real color frame was delivered (the COLOR staleness clock).
+    Called by get_color_bgr on every frame it returns AND by the color-priming pump
+    tick, so a healthy color stream keeps this current and the stale-reset can tell
+    "body quiet but color live" (a body dropout) from "the whole runtime is dead"."""
+    _last_color_frame_at[0] = time.monotonic() if now is None else now
+
+
+def _color_frame_is_stale(now: Optional[float] = None) -> bool:
+    """True iff the runtime is OPEN but no color frame has been delivered for longer
+    than BODY_STALE_RESET_SEC. Mirrors _body_frame_is_stale for the color stream so
+    the reset can require BOTH planes to be quiet. False when no runtime is open or
+    no color frame has yet been seen (the open path seeds the window)."""
+    if _runtime[0] is None:
+        return False
+    last = _last_color_frame_at[0]
+    if last <= 0.0:
+        return False
+    now = time.monotonic() if now is None else now
+    return (now - last) > BODY_STALE_RESET_SEC
+
+
+def _prime_color_frame() -> None:
+    """Pull the latest color frame (require_new=False) so the COLOR buffer stays
+    WARM independent of the face-track read — the durability net for the preview.
+    With this, color survives even if the face loop pauses, and a freshly-reopened
+    runtime gets color re-primed immediately instead of staying cold (which is what
+    made get_color_bgr(require_new=False) keep returning None after a reset). Cheap:
+    a buffer copy when a frame exists, a no-op when not. NEVER raises."""
+    try:
+        get_color_bgr(require_new=False)
+    except Exception:   # pragma: no cover - get_color_bgr already swallows
+        pass
 
 
 def _body_frame_is_stale(now: Optional[float] = None) -> bool:
@@ -991,20 +1105,33 @@ def _body_frame_is_stale(now: Optional[float] = None) -> bool:
 
 
 def reset_if_body_stale(now: Optional[float] = None) -> bool:
-    """If the body stream has gone stale (see _body_frame_is_stale), drop the
-    cached runtime so the NEXT get_runtime() RE-OPENS the sensor (re-binding a
-    live stream; on a stream-verifying open path it also retries until frames
-    arrive). Returns True iff it performed a reset. Holds the same _lock the
-    open/close path uses so it can't race a concurrent reopen. NEVER raises."""
+    """If BOTH the body AND the color streams have gone stale, drop the cached
+    runtime so the NEXT get_runtime() RE-OPENS the sensor (re-binding a live
+    stream; on a stream-verifying open path it also retries until frames arrive).
+    Returns True iff it performed a reset. Holds the same _lock the open/close path
+    uses so it can't race a concurrent reopen. NEVER raises.
+
+    COLOR IS NOW PART OF THE DECISION (the preview-keep-alive fix). The old code
+    reset on a BODY-only signal, which tore down the whole shared runtime — and the
+    color reader thread with it — whenever the tracked body briefly left the frustum
+    (e.g. the owner standing up + sitting back down). Gestures recovered (the body
+    pump re-primed body) but the preview's color often did not, so the skeleton
+    froze then went dark. Requiring BOTH planes quiet means a body dropout whose
+    color is still flowing NO LONGER kills the runtime, so the preview keeps
+    rendering; a genuinely dead sensor (no body AND no color) still resets."""
     with _lock:
-        if not _body_frame_is_stale(now):
+        body_stale = _body_frame_is_stale(now)
+        color_stale = _color_frame_is_stale(now)
+        if not (body_stale and color_stale):
             return False
         rt = _runtime[0]
         _runtime[0] = None
-        # Re-seed the clock so the freshly-reopened runtime gets a full window to
+        # Re-seed BOTH clocks so the freshly-reopened runtime gets a full window to
         # start streaming before it could be judged stale again.
-        _last_body_frame_at[0] = time.monotonic() if now is None else now
-        print("  [kinect] body stream stale > "
+        stamp = time.monotonic() if now is None else now
+        _last_body_frame_at[0] = stamp
+        _last_color_frame_at[0] = stamp
+        print("  [kinect] body AND color streams stale > "
               f"{BODY_STALE_RESET_SEC:.0f}s - resetting runtime to reopen a live "
               "stream")
     # We already nulled the cached cell under the lock; explicitly release the
@@ -1043,7 +1170,13 @@ def _pump_tick() -> None:
         _read_and_cache_bodies()
     except Exception:   # pragma: no cover - defensive: _read_and_cache_bodies already swallows
         pass
-    # Layer 2: reset a runtime whose body stream has gone quiet.
+    # Keep the COLOR buffer warm too (preview-keep-alive fix): pull the latest
+    # color frame so it stays primed independent of the face-track read, and so a
+    # reopened runtime gets color re-primed immediately rather than staying cold
+    # (which is what made get_color_bgr(require_new=False) keep returning None).
+    _prime_color_frame()
+    # Layer 2: reset a runtime ONLY when BOTH body AND color have gone quiet (a
+    # body-only dropout whose color is fine must not tear down the preview).
     try:
         reset_if_body_stale()
     except Exception:   # pragma: no cover - reset already swallows
@@ -1074,9 +1207,11 @@ def start_body_pump() -> bool:
         if t is not None and getattr(t, "is_alive", lambda: False)():
             return False
         _body_pump_stop.clear()
-        # Seed the freshness clock so a just-enabled pump gives the stream a full
-        # window to come up before the stale-reset could fire.
-        _last_body_frame_at[0] = time.monotonic()
+        # Seed BOTH freshness clocks so a just-enabled pump gives the streams a
+        # full window to come up before the stale-reset could fire.
+        now0 = time.monotonic()
+        _last_body_frame_at[0] = now0
+        _last_color_frame_at[0] = now0
         t = threading.Thread(target=_body_pump_loop, name="kinect-body-pump",
                              daemon=True)
         _body_pump_thread[0] = t

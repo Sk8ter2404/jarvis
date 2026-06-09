@@ -224,6 +224,30 @@ class ControllingHandPointTests(unittest.TestCase):
         self.assertEqual(
             ks.controlling_hand_point(points, prefer_side=None), (100, 200))
 
+    def test_fallback_false_requires_preferred_side(self):
+        # The "no controller → no ring" contract the bright engaged ring uses:
+        # with fallback=False the PREFERRED side must project, else None — never an
+        # arbitrary (e.g. always-right) fallback.
+        points = {"hand_right": (100, 200), "hand_left": (300, 400)}
+        # Preferred side projects → its point.
+        self.assertEqual(
+            ks.controlling_hand_point(points, prefer_side="left",
+                                      fallback=False), (300, 400))
+        # Preferred (left) side absent, only the right hand → None (no wrong-hand).
+        self.assertIsNone(
+            ks.controlling_hand_point({"hand_right": (100, 200)},
+                                      prefer_side="left", fallback=False))
+        # Preferred side's wrist still counts (hand tip dropped).
+        self.assertEqual(
+            ks.controlling_hand_point({"wrist_left": (5, 6)},
+                                      prefer_side="left", fallback=False), (5, 6))
+
+    def test_fallback_false_without_side_is_none(self):
+        # No prefer_side + fallback=False → nothing to prefer → None.
+        points = {"hand_right": (100, 200), "hand_left": (300, 400)}
+        self.assertIsNone(
+            ks.controlling_hand_point(points, prefer_side=None, fallback=False))
+
 
 class HandCircleRadiusTests(unittest.TestCase):
     def test_scales_with_width_and_has_a_floor(self):

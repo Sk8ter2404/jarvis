@@ -510,12 +510,24 @@ class TunedConstantsTests(_Base):
 
     def test_extension_thresholds_have_hysteresis(self):
         mod = self._load()
-        # The engage bar must be strictly higher than the disengage bar on BOTH
+        # The engage bar must be strictly higher than the disengage bar on ALL
         # cues, so an arm at the line can't flap engage on/off.
+        self.assertGreater(mod.AIR_MOUSE_EXTEND_REACH_RATIO_ENGAGE,
+                           mod.AIR_MOUSE_EXTEND_REACH_RATIO_DISENGAGE)
         self.assertGreater(mod.AIR_MOUSE_EXTEND_FORWARD_ENGAGE_M,
                            mod.AIR_MOUSE_EXTEND_FORWARD_DISENGAGE_M)
         self.assertGreater(mod.AIR_MOUSE_EXTEND_STRAIGHT_ENGAGE,
                            mod.AIR_MOUSE_EXTEND_STRAIGHT_DISENGAGE)
+
+    def test_reach_ratio_defaults_are_sane_position_independent(self):
+        mod = self._load()
+        # Body-relative bars: a clear reach ~1.6× shoulder width engages, holding
+        # to ~1.0×. Sane, usable WITHOUT calibration (the defaults must work).
+        self.assertEqual(mod.AIR_MOUSE_EXTEND_REACH_RATIO_ENGAGE, 1.6)
+        self.assertEqual(mod.AIR_MOUSE_EXTEND_REACH_RATIO_DISENGAGE, 1.0)
+        # A relaxed hand (ratio ~0) is well below the disengage bar → always
+        # releases; a full reach (>1.6) engages.
+        self.assertGreater(mod.AIR_MOUSE_EXTEND_REACH_RATIO_DISENGAGE, 0.0)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -953,6 +965,171 @@ class ReachEngageGateTests(_Base):
         self.assertTrue(all(b is None for b in lefts))
         self.assertTrue(all(b is None for b in rights))
         self.assertFalse(c.engaged)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  POSITION-INDEPENDENT REACH (the headline fix): engage/disengage is invariant
+#  to the owner's distance from the sensor — gated on a BODY-RELATIVE reach RATIO
+#  (forward reach / shoulder width), not absolute metres.
+# ══════════════════════════════════════════════════════════════════════════
+def _scaled_body_joints(side: str, *, scale: float, reach_frac: float,
+                        shoulder_half: float = 0.20):
+    """Build one arm's joints at an arbitrary BODY SCALE, with the hand reaching
+    `reach_frac` × shoulder-width forward. `scale` multiplies ALL absolute metres
+    (positions + depth offsets) to simulate the SAME body at a different distance:
+    a closer body reads larger spans + bigger absolute reach, a farther one
+    smaller — but the reach/shoulder-width RATIO is identical (= reach_frac). The
+    position-independent gate must treat them the same. Shoulders span
+    2*shoulder_half*scale; the forward reach is reach_frac*(shoulder width).
+
+    The elbow tracks the reach REALISTICALLY: a big reach (high reach_frac) gives a
+    near-straight arm (elbow on the shoulder→hand line); a small reach (relaxed)
+    folds the elbow back so straightness is LOW too — so a relaxed pose fails BOTH
+    the ratio and straightness cues, the same as a real relaxed arm."""
+    base_z = 2.0 * scale
+    sh = shoulder_half * scale
+    shoulder_width = 2.0 * sh
+    forward = reach_frac * shoulder_width          # reach as a fraction of span
+    sx = -sh if side == "left" else sh
+    other = sh if side == "left" else -sh
+    sy = 0.40 * scale
+    hx, hy, hz = (sx * 2.0), 0.30 * scale, base_z - forward
+    if reach_frac >= 1.0:
+        # Extended: straight arm — elbow on the midpoint of shoulder→hand.
+        ex, ey, ez = (sx + hx) / 2.0, (sy + hy) / 2.0, (base_z + hz) / 2.0
+    else:
+        # Relaxed: BENT elbow folded forward so the chord is well short of the
+        # summed bone length (low straightness), matching a real relaxed arm.
+        ex, ey, ez = sx, sy - 0.10 * scale, base_z - 0.30 * scale
+    return {
+        "spine_shoulder": (0.0, 0.15 * scale, base_z, 2),
+        "spine_mid": (0.0, 0.0, base_z, 2),
+        "spine_base": (0.0, -0.30 * scale, base_z, 2),
+        f"shoulder_{side}": (sx, sy, base_z, 2),
+        f"shoulder_{'right' if side == 'left' else 'left'}": (other, sy, base_z, 2),
+        f"elbow_{side}": (ex, ey, ez, 2),
+        f"hand_{side}": (hx, hy, hz, 2),
+    }
+
+
+class ReachRatioPositionIndependenceTests(_Base):
+    """The reach gate is BODY-RELATIVE, so a reach that engages up close also
+    engages far away (and a relax releases at any distance). Exercised both on the
+    geometry (reach_ratio) and through the engage decision."""
+
+    def _ext(self, mod, joints, side):
+        return mod.ArmExtension.from_bridge(mod._local_arm_extension(joints, side))
+
+    def test_local_extension_computes_body_relative_ratio(self):
+        mod = self._load()
+        # A 0.75-of-shoulder-width reach → reach_ratio ≈ 0.75, regardless of scale.
+        for scale in (0.6, 1.0, 1.7):
+            j = _scaled_body_joints("right", scale=scale, reach_frac=0.75)
+            ext = self._ext(mod, j, "right")
+            self.assertIsNotNone(ext.reach_ratio)
+            self.assertAlmostEqual(ext.reach_ratio, 0.75, delta=0.06)
+            # The ABSOLUTE forward metres DO scale with distance (proving the ratio
+            # is doing real work) — bigger scale, bigger absolute reach.
+            self.assertIsNotNone(ext.forward_m)
+
+    def test_absolute_metres_differ_but_ratio_constant_across_distance(self):
+        mod = self._load()
+        near = self._ext(mod, _scaled_body_joints("right", scale=1.6, reach_frac=1.8),
+                         "right")
+        far = self._ext(mod, _scaled_body_joints("right", scale=0.6, reach_frac=1.8),
+                        "right")
+        # Same gesture (1.8× shoulder width) at two distances: absolute metres very
+        # different, the body-relative ratio the SAME.
+        self.assertNotAlmostEqual(near.forward_m, far.forward_m, delta=0.05)
+        self.assertAlmostEqual(near.reach_ratio, far.reach_ratio, delta=0.05)
+
+    def test_engage_invariant_to_body_distance(self):
+        mod = self._load()
+        th = mod._reach_thresholds()   # position-independent ratio defaults
+        # A clear reach (ratio ~1.8 > the ~1.6 engage bar) must read EXTENDED at
+        # every distance; a relaxed reach (ratio ~0.3 < ~1.0) must NOT, anywhere.
+        for scale in (0.5, 1.0, 1.5, 2.2):
+            reach = self._ext(mod, _scaled_body_joints(
+                "right", scale=scale, reach_frac=1.8), "right")
+            relax = self._ext(mod, _scaled_body_joints(
+                "right", scale=scale, reach_frac=0.3), "right")
+            # Straightness is geometry-driven here; force the test onto the RATIO
+            # cue by checking is_extended with straightness neutralised.
+            reach_only_ratio = mod.ArmExtension(
+                "right", forward_m=reach.forward_m, straightness=None,
+                hand=reach.hand, reach_ratio=reach.reach_ratio)
+            relax_only_ratio = mod.ArmExtension(
+                "right", forward_m=relax.forward_m, straightness=None,
+                hand=relax.hand, reach_ratio=relax.reach_ratio)
+            self.assertTrue(
+                reach_only_ratio.is_extended(engaged=False, thresholds=th),
+                f"clear reach should engage at scale {scale}")
+            self.assertFalse(
+                relax_only_ratio.is_extended(engaged=False, thresholds=th),
+                f"relaxed arm should NOT engage at scale {scale}")
+
+    def test_controller_engages_far_and_near_via_poll(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        # Mirror OFF so reach_side='right' stays the right arm end-to-end.
+        moves, buttons = self._capture_mouse(mod)
+        ctrl = mod.AirMouseController(mod.ReachBox(2560, 1440),
+                                      debounce_frames=1, grace_sec=0.0)
+
+        def _body_at(scale, reach_frac):
+            j = _scaled_body_joints("right", scale=scale, reach_frac=reach_frac)
+            # Other (left) arm relaxed at the same scale so only the right reaches.
+            jl = _scaled_body_joints("left", scale=scale, reach_frac=0.2)
+            j["elbow_left"] = jl["elbow_left"]
+            j["hand_left"] = jl["hand_left"]
+            return {"id": 0, "joints": j,
+                    "head": (0.0, 0.6 * scale, 2.0 * scale),
+                    "distance_m": 2.0 * scale, "facing": True,
+                    "hand_right": "open", "hand_left": "open"}
+
+        # FAR (small scale): a clear reach must still move the cursor.
+        moves.clear()
+        mod._poll_once(ctrl, _fake_bridge(bodies=[_body_at(0.6, 1.9)]))
+        self.assertTrue(ctrl.engaged)
+        self.assertEqual(len(moves), 1)
+        # Relax at the SAME far distance → disengage (no further move).
+        mod._poll_once(ctrl, _fake_bridge(bodies=[_body_at(0.6, 0.25)]))
+        self.assertFalse(ctrl.engaged)
+        # NEAR (large scale): the same clear reach engages too.
+        moves.clear()
+        mod._poll_once(ctrl, _fake_bridge(bodies=[_body_at(1.8, 1.9)]))
+        self.assertTrue(ctrl.engaged)
+        self.assertEqual(len(moves), 1)
+
+    def test_relax_releases_regardless_of_body_position(self):
+        # The owner's exact bug: worked, then on standing up + sitting back it would
+        # NOT disengage. With the body-relative ratio, a relax at ANY distance drops
+        # below the disengage bar → release. Simulate: engage near, then "stand up +
+        # sit back" = relax at a DIFFERENT (far) scale → must disengage.
+        mod = self._load()
+        th = mod._reach_thresholds()
+        c = mod.AirMouseController(mod.ReachBox(2560, 1440), debounce_frames=1,
+                                   grace_sec=0.0)
+        relaxed_left = mod.ArmExtension.from_bridge(
+            mod._local_arm_extension(_relaxed_arm_joints("left"), "left"))
+
+        def _reach(scale, frac):
+            return mod.ArmExtension.from_bridge(mod._local_arm_extension(
+                _scaled_body_joints("right", scale=scale, reach_frac=frac), "right"))
+
+        # Engage with a clear reach up close.
+        c.update(relaxed_left, _reach(1.6, 1.9), "open", "open", True,
+                 thresholds=th)
+        self.assertTrue(c.engaged)
+        # Now relax — but the body is also farther away (smaller scale), exactly the
+        # stand-up→sit-back perturbation. Absolute forward metres shrink, yet the
+        # RATIO drops below the disengage bar → it MUST release.
+        d = c.update(relaxed_left, _reach(0.7, 0.25), "open", "open", True,
+                     thresholds=th)
+        self.assertFalse(c.engaged)
+        self.assertIsNone(d.cursor)
+        self.assertEqual(d.overlay, "hidden")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1417,14 +1594,21 @@ class HandMirrorTests(_Base):
 #  gate reads them (falling back to defaults); + the debug-log format.
 # ══════════════════════════════════════════════════════════════════════════
 class ComputeReachThresholdsTests(_Base):
+    """The fit now produces BODY-RELATIVE reach-RATIO bars (position-independent),
+    not absolute metres: the first pose pair is the relaxed/extended RATIO."""
+
     def test_bars_placed_between_relaxed_and_extended(self):
         mod = self._load()
-        # Relaxed forward 0.00 m, extended 0.40 m → engage ~60 % (0.24), disengage
-        # ~40 % (0.16); engage strictly above disengage (hysteresis).
-        th = mod.compute_reach_thresholds(0.0, 0.40, 0.50, 0.95)
-        self.assertAlmostEqual(th["fwd_engage"], 0.24, delta=0.01)
-        self.assertAlmostEqual(th["fwd_disengage"], 0.16, delta=0.01)
-        self.assertGreater(th["fwd_engage"], th["fwd_disengage"])
+        # Relaxed ratio 0.00, extended 2.00 → engage ~60 % (1.20), disengage ~40 %
+        # (0.80); engage strictly above disengage (hysteresis).
+        th = mod.compute_reach_thresholds(0.0, 2.0, 0.50, 0.95)
+        self.assertAlmostEqual(th["ratio_engage"], 1.20, delta=0.02)
+        self.assertAlmostEqual(th["ratio_disengage"], 0.80, delta=0.02)
+        self.assertGreater(th["ratio_engage"], th["ratio_disengage"])
+        # The absolute fwd_* fallback bars are always the module defaults.
+        self.assertEqual(th["fwd_engage"], mod.AIR_MOUSE_EXTEND_FORWARD_ENGAGE_M)
+        self.assertEqual(th["fwd_disengage"],
+                         mod.AIR_MOUSE_EXTEND_FORWARD_DISENGAGE_M)
         # Straightness 0.50→0.95 span: engage 0.50+0.6*0.45=0.77, disengage 0.68.
         self.assertAlmostEqual(th["straight_engage"], 0.77, delta=0.01)
         self.assertAlmostEqual(th["straight_disengage"], 0.68, delta=0.01)
@@ -1432,21 +1616,23 @@ class ComputeReachThresholdsTests(_Base):
 
     def test_missing_pose_falls_back_to_defaults(self):
         mod = self._load()
-        # No forward pair → forward bars keep the module defaults; straightness
-        # pair present → its bars are fitted.
+        # No ratio pair → ratio bars keep the module defaults; straightness pair
+        # present → its bars are fitted.
         th = mod.compute_reach_thresholds(None, None, 0.40, 0.96)
-        self.assertEqual(th["fwd_engage"], mod.AIR_MOUSE_EXTEND_FORWARD_ENGAGE_M)
-        self.assertEqual(th["fwd_disengage"],
-                         mod.AIR_MOUSE_EXTEND_FORWARD_DISENGAGE_M)
+        self.assertEqual(th["ratio_engage"],
+                         mod.AIR_MOUSE_EXTEND_REACH_RATIO_ENGAGE)
+        self.assertEqual(th["ratio_disengage"],
+                         mod.AIR_MOUSE_EXTEND_REACH_RATIO_DISENGAGE)
         self.assertNotEqual(th["straight_engage"],
                             mod.AIR_MOUSE_EXTEND_STRAIGHT_ENGAGE)
 
     def test_degenerate_span_keeps_defaults(self):
         mod = self._load()
-        # Extended barely above relaxed (no real span) → defaults, never an
-        # inverted/nonsense threshold from a flubbed capture.
-        th = mod.compute_reach_thresholds(0.20, 0.21, 0.80, 0.81)
-        self.assertEqual(th["fwd_engage"], mod.AIR_MOUSE_EXTEND_FORWARD_ENGAGE_M)
+        # Extended barely above relaxed (no real RATIO span ≥ 0.30) → defaults,
+        # never an inverted/nonsense threshold from a flubbed capture.
+        th = mod.compute_reach_thresholds(0.90, 1.00, 0.80, 0.81)
+        self.assertEqual(th["ratio_engage"],
+                         mod.AIR_MOUSE_EXTEND_REACH_RATIO_ENGAGE)
         self.assertEqual(th["straight_engage"],
                          mod.AIR_MOUSE_EXTEND_STRAIGHT_ENGAGE)
 
@@ -1471,29 +1657,32 @@ class ReachThresholdReadTests(_Base):
         mod = self._load()
         self._patch_settings(mod, {})
         th = mod._reach_thresholds()
-        self.assertEqual(th["fwd_engage"], mod.AIR_MOUSE_EXTEND_FORWARD_ENGAGE_M)
+        # The position-independent ratio defaults apply pre-calibration.
+        self.assertEqual(th["ratio_engage"],
+                         mod.AIR_MOUSE_EXTEND_REACH_RATIO_ENGAGE)
         self.assertEqual(th["straight_disengage"],
                          mod.AIR_MOUSE_EXTEND_STRAIGHT_DISENGAGE)
 
     def test_persisted_values_win(self):
         mod = self._load()
+        # KINECT_REACH_* now hold the body-relative REACH RATIO bars.
         self._patch_settings(mod, {
-            mod.SETTING_REACH_ENGAGE: 0.31,
-            mod.SETTING_REACH_DISENGAGE: 0.19,
+            mod.SETTING_REACH_ENGAGE: 1.7,
+            mod.SETTING_REACH_DISENGAGE: 1.1,
             mod.SETTING_STRAIGHT_ENGAGE: 0.82,
             mod.SETTING_STRAIGHT_DISENGAGE: 0.70,
         })
         th = mod._reach_thresholds()
-        self.assertAlmostEqual(th["fwd_engage"], 0.31)
-        self.assertAlmostEqual(th["fwd_disengage"], 0.19)
+        self.assertAlmostEqual(th["ratio_engage"], 1.7)
+        self.assertAlmostEqual(th["ratio_disengage"], 1.1)
         self.assertAlmostEqual(th["straight_engage"], 0.82)
         self.assertAlmostEqual(th["straight_disengage"], 0.70)
 
     def test_partial_persist_falls_back_per_field(self):
         mod = self._load()
-        self._patch_settings(mod, {mod.SETTING_REACH_ENGAGE: 0.33})
+        self._patch_settings(mod, {mod.SETTING_REACH_ENGAGE: 1.9})
         th = mod._reach_thresholds()
-        self.assertAlmostEqual(th["fwd_engage"], 0.33)             # persisted
+        self.assertAlmostEqual(th["ratio_engage"], 1.9)            # persisted
         self.assertEqual(th["straight_engage"],                    # defaulted
                          mod.AIR_MOUSE_EXTEND_STRAIGHT_ENGAGE)
 
@@ -1566,12 +1755,15 @@ class CalibrateActionTests(_Base):
         pb.start(); self.addCleanup(pb.stop)
         ps = mock.patch.object(mod, "_speak", lambda t: None)
         ps.start(); self.addCleanup(ps.stop)
+        # Captures are now relaxed/extended RATIO (extended 0.50, relaxed 0.10 →
+        # a clear ratio span ≥ 0.30, so the ratio bars fit + persist).
         self._stub_captures(mod, [(0.50, 0.98, 20), (0.10, 0.55, 20)])
         mod.calibrate_air_mouse("")
-        # _saved_settings reads the same mocked writer → the gate sees the fit.
+        # _saved_settings reads the same mocked writer → the gate sees the fit. The
+        # KINECT_REACH_ENGAGE key holds the body-relative ratio engage bar.
         th = mod._reach_thresholds()
-        self.assertAlmostEqual(th["fwd_engage"], saved[mod.SETTING_REACH_ENGAGE])
-        self.assertGreater(th["fwd_engage"], th["fwd_disengage"])
+        self.assertAlmostEqual(th["ratio_engage"], saved[mod.SETTING_REACH_ENGAGE])
+        self.assertGreater(th["ratio_engage"], th["ratio_disengage"])
 
     def test_calibration_honest_when_no_body_seen(self):
         mod = self._load()
@@ -1605,15 +1797,17 @@ class CalibrateActionTests(_Base):
         self.assertIn("kinect", out.lower())
 
     def test_capture_reach_medians_from_more_extended_arm(self):
-        # _capture_reach samples the more-extended arm's cues and medians them.
+        # _capture_reach samples the more-extended arm's body-relative reach RATIO
+        # + straightness and medians them. The fixture's shoulders span ~0.4 m, so
+        # a 0.30 m forward reach gives a ratio ≈ 0.75 (position-independent).
         mod = self._load()
         bridge = _fake_bridge(bodies=[_body(reach_side="right", forward=0.30)])
-        fwd, straight, n = mod._capture_reach(
+        ratio, straight, n = mod._capture_reach(
             bridge, seconds=0.05, sleep_fn=lambda s: None,
             now_fn=_StepClock(step=0.02))
         self.assertGreater(n, 0)
-        self.assertIsNotNone(fwd)
-        self.assertGreater(fwd, 0.20)           # the extended arm's forward reach
+        self.assertIsNotNone(ratio)
+        self.assertGreater(ratio, 0.4)          # the extended arm's reach ratio
         self.assertIsNotNone(straight)
 
 
