@@ -140,17 +140,51 @@ AIR_MOUSE_GRIP_DEBOUNCE_FRAMES = 2
 #   • to STAY engaged it may relax only to the LOWER bar; past it → DISENGAGE.
 #
 # FORWARD-DEPTH (forward_reach_m = torso_z - hand_z, metres; >0 = hand in front):
-#   engage at ~+0.20 m in front of the torso (a clear reach toward the screen),
-#   stay engaged until it falls back to ~+0.10 m. A relaxed hand at the side /
+#   engage at ~+0.12 m in front of the torso (a clear reach toward the screen),
+#   stay engaged until it falls back to ~+0.06 m. A relaxed hand at the side /
 #   resting on the desk sits at or behind the torso (≈0 or negative) → disengaged.
-AIR_MOUSE_EXTEND_FORWARD_ENGAGE_M = 0.20    # reach this far forward to ENGAGE
-AIR_MOUSE_EXTEND_FORWARD_DISENGAGE_M = 0.10  # relax below this to DISENGAGE
+#
+# LOOSENED 2026-06-08 (owner: "doesn't enable when the arm extends"): 0.20/0.10
+#   → 0.12/0.06, and straightness 0.85/0.72 → 0.78/0.66. The v1.68 bars were tuned
+#   at a different seating distance and never tripped for the owner's real reach,
+#   so the air-mouse would not engage at all. These looser bars engage more
+#   readily out of the box; the CALIBRATION routine ('calibrate air mouse',
+#   persisted as KINECT_REACH_* in user_settings.json and read each tick by
+#   _reach_thresholds()) then auto-fits the owner's actual relaxed→extended span
+#   so the gate matches their body precisely.
+AIR_MOUSE_EXTEND_FORWARD_ENGAGE_M = 0.12    # reach this far forward to ENGAGE
+AIR_MOUSE_EXTEND_FORWARD_DISENGAGE_M = 0.06  # relax below this to DISENGAGE
 #
 # ARM-STRAIGHTNESS (shoulder→hand chord / summed bone length; 0..1, 1 = straight):
-#   engage when the arm is ≥ ~0.85 straight (nearly extended), stay engaged until
-#   it bends back below ~0.72. A relaxed, elbow-bent arm folds well under this.
-AIR_MOUSE_EXTEND_STRAIGHT_ENGAGE = 0.85     # arm this straight to ENGAGE
-AIR_MOUSE_EXTEND_STRAIGHT_DISENGAGE = 0.72  # bend below this to DISENGAGE
+#   engage when the arm is ≥ ~0.78 straight (nearly extended), stay engaged until
+#   it bends back below ~0.66. A relaxed, elbow-bent arm folds well under this.
+AIR_MOUSE_EXTEND_STRAIGHT_ENGAGE = 0.78     # arm this straight to ENGAGE
+AIR_MOUSE_EXTEND_STRAIGHT_DISENGAGE = 0.66  # bend below this to DISENGAGE
+
+# ─── persisted per-body CALIBRATION (data/user_settings.json) ────────────────
+# 'calibrate air mouse' / 'calibrate reach' captures the owner's RELAXED +
+# EXTENDED forward-reach + straightness and writes the fitted thresholds under
+# these keys; the live gate reads them every tick (via _reach_thresholds()),
+# falling back to the looser defaults above when unset. The engage bar is placed
+# ~60 % of the way relaxed→extended and the disengage bar ~40 %, so the gate fits
+# the owner's actual range instead of a fixed guess (auto-fits their body).
+SETTING_REACH_ENGAGE = "KINECT_REACH_ENGAGE"              # forward engage (m)
+SETTING_REACH_DISENGAGE = "KINECT_REACH_DISENGAGE"        # forward disengage (m)
+SETTING_STRAIGHT_ENGAGE = "KINECT_STRAIGHT_ENGAGE"        # straightness engage
+SETTING_STRAIGHT_DISENGAGE = "KINECT_STRAIGHT_DISENGAGE"  # straightness disengage
+CALIB_ENGAGE_FRACTION = 0.60     # engage bar this far relaxed→extended
+CALIB_DISENGAGE_FRACTION = 0.40  # disengage bar this far relaxed→extended
+
+# ─── HAND MIRROR (selfie-view correction) ────────────────────────────────────
+# The Kinect color/skeleton stream the owner sees is MIRRORED (selfie view), so
+# the owner's REAL left hand appears on the RIGHT of the image and vice-versa.
+# The owner reported clicks + the controlling-hand circle landing on the WRONG
+# side. With KINECT_HAND_MIRROR True (the owner's default) the air-mouse SWAPS the
+# bridge's left↔right hands — BOTH the grip strings AND the per-arm extension/
+# joints — so the owner's REAL left hand → LEFT button + left-side circle and
+# their REAL right hand → RIGHT button + right-side circle. Flip this False
+# (Settings GUI / user_settings.json) if a future build un-mirrors the stream.
+KINECT_HAND_MIRROR_DEFAULT = True
 
 # Grace window for a TRACKING dropout. A single lost/ambiguous frame (the Kinect
 # briefly drops the body or hand joint) must NOT instantly disengage and re-snap
@@ -158,6 +192,17 @@ AIR_MOUSE_EXTEND_STRAIGHT_DISENGAGE = 0.72  # bend below this to DISENGAGE
 # is tolerated for up to this long (button stays held, no cursor motion since
 # there's no sample); past it the dead-man fully releases. ~0.3 s per the spec.
 AIR_MOUSE_DISENGAGE_GRACE_SEC = 0.30
+
+# ─── controlling-hand HYSTERESIS (ISSUE 3: both-hands stability) ─────────────
+# With BOTH hands raised the cursor must NOT thrash between them frame-to-frame.
+# Once a hand is driving the cursor it STAYS the controlling hand until the OTHER
+# hand is BOTH clearly more extended (its reach_score leads by at least
+# HAND_SWITCH_MARGIN) AND has been so for HAND_SWITCH_FRAMES consecutive frames.
+# A brief wobble where the idle hand momentarily out-reaches by a hair can never
+# flip control. (The L/R clicks are tracked for BOTH hands regardless — only the
+# CURSOR-driving hand is sticky.)
+HAND_SWITCH_MARGIN = 0.25     # challenger must lead the holder's score by this
+HAND_SWITCH_FRAMES = 6        # …for this many consecutive frames before it wins
 
 # The comfortable reach-box in front of the user, in camera-space METRES, that
 # maps onto the whole virtual desktop. Centred roughly on where a seated user's
@@ -437,7 +482,7 @@ class ArmExtension:
         return cls(ext.get("side", ""), ext.get("forward_reach_m"),
                    ext.get("straightness"), ext.get("hand"))
 
-    def is_extended(self, *, engaged: bool,
+    def is_extended(self, *, engaged: bool, thresholds: "Optional[dict]" = None,
                     fwd_engage: float = AIR_MOUSE_EXTEND_FORWARD_ENGAGE_M,
                     fwd_disengage: float = AIR_MOUSE_EXTEND_FORWARD_DISENGAGE_M,
                     straight_engage: float = AIR_MOUSE_EXTEND_STRAIGHT_ENGAGE,
@@ -446,7 +491,18 @@ class ArmExtension:
         """Is this arm EXTENDED enough to (stay) engaged? Applies HYSTERESIS:
         when currently DISENGAGED the reach must clear the HIGHER engage bar;
         once ENGAGED it only has to stay above the LOWER disengage bar. EITHER
-        the forward-depth OR the straightness cue clearing its bar suffices."""
+        the forward-depth OR the straightness cue clearing its bar suffices.
+
+        `thresholds` (the live CALIBRATED bars from _reach_thresholds(), keys
+        fwd_engage / fwd_disengage / straight_engage / straight_disengage) wins
+        over the keyword defaults when given, so the owner's calibration fits the
+        gate to their body without re-plumbing every caller."""
+        if thresholds:
+            fwd_engage = thresholds.get("fwd_engage", fwd_engage)
+            fwd_disengage = thresholds.get("fwd_disengage", fwd_disengage)
+            straight_engage = thresholds.get("straight_engage", straight_engage)
+            straight_disengage = thresholds.get("straight_disengage",
+                                                straight_disengage)
         fwd_bar = fwd_disengage if engaged else fwd_engage
         straight_bar = straight_disengage if engaged else straight_engage
         fwd_ok = (self.forward_m is not None and self.forward_m >= fwd_bar)
@@ -467,17 +523,94 @@ class ArmExtension:
         return fwd_n + max(0.0, straight)
 
 
+def extended_arms(left: "ArmExtension", right: "ArmExtension", *, engaged: bool,
+                  thresholds: "Optional[dict]" = None) -> "list[ArmExtension]":
+    """The arms currently EXTENDED enough to (stay) engaged — each with a usable
+    hand joint and clearing its reach bar (engage hysteresis). PURE."""
+    return [a for a in (left, right)
+            if a is not None and a.hand is not None
+            and a.is_extended(engaged=engaged, thresholds=thresholds)]
+
+
 def choose_controlling_arm(left: "ArmExtension", right: "ArmExtension",
-                           *, engaged: bool) -> "Optional[ArmExtension]":
-    """Pick which arm drives the cursor: among the arms that are EXTENDED (with
-    the engage/stay-engaged hysteresis), the MORE-extended (higher reach_score).
-    Returns None when neither arm is extended (→ disengage). PURE."""
-    candidates = [a for a in (left, right)
-                  if a is not None and a.hand is not None
-                  and a.is_extended(engaged=engaged)]
+                           *, engaged: bool, thresholds: "Optional[dict]" = None,
+                           current_side: "Optional[str]" = None,
+                           margin: float = HAND_SWITCH_MARGIN
+                           ) -> "Optional[ArmExtension]":
+    """Pick which arm drives the cursor: among the EXTENDED arms (engage / stay-
+    engage hysteresis), the MORE-extended (higher reach_score). Returns None when
+    neither is extended (→ disengage). PURE.
+
+    HAND-HYSTERESIS (ISSUE 3): when `current_side` (the hand already driving) is
+    still among the extended candidates, it is KEPT unless the other arm leads it
+    by at least `margin` — i.e. a tie / marginal lead never flips control. The
+    controller adds the multi-FRAME requirement on top; this gives the per-frame
+    stickiness (the holder wins ties)."""
+    candidates = extended_arms(left, right, engaged=engaged, thresholds=thresholds)
     if not candidates:
         return None
-    return max(candidates, key=lambda a: a.reach_score())
+    best = max(candidates, key=lambda a: a.reach_score())
+    if current_side is not None:
+        holder = next((a for a in candidates if a.side == current_side), None)
+        if holder is not None and holder is not best:
+            # The holder is still extended but isn't the top score: keep it unless
+            # the challenger leads by the margin (sticky tie-break).
+            if best.reach_score() - holder.reach_score() < margin:
+                return holder
+    return best
+
+
+def _median(values: "list[float]") -> "Optional[float]":
+    """Median of a list of floats, or None when empty. Pure; robust to the odd
+    outlier sample the Kinect throws (better than a mean for calibration)."""
+    xs = sorted(v for v in values if v is not None)
+    n = len(xs)
+    if n == 0:
+        return None
+    mid = n // 2
+    if n % 2:
+        return float(xs[mid])
+    return (float(xs[mid - 1]) + float(xs[mid])) / 2.0
+
+
+def compute_reach_thresholds(
+        relaxed_forward: "Optional[float]", extended_forward: "Optional[float]",
+        relaxed_straight: "Optional[float]", extended_straight: "Optional[float]",
+        *, engage_fraction: float = CALIB_ENGAGE_FRACTION,
+        disengage_fraction: float = CALIB_DISENGAGE_FRACTION) -> dict:
+    """Fit the reach-gate thresholds from a captured RELAXED + EXTENDED pose.
+
+    Each bar is placed a FRACTION of the way relaxed→extended: the engage bar
+    ~60 % (so a reach a little short of full extension still engages) and the
+    disengage bar ~40 % (so a small sag doesn't drop it) — engage strictly above
+    disengage, giving the hysteresis. Computed independently for the forward-reach
+    cue and the straightness cue. A cue whose pose pair is missing/degenerate
+    (None, or extended not clearly beyond relaxed) FALLS BACK to that cue's module
+    default, so a partial capture still yields a safe, usable gate. PURE — no
+    sensor; the live action feeds it the captured medians.
+
+    Returns {fwd_engage, fwd_disengage, straight_engage, straight_disengage}."""
+    ef = min(max(float(engage_fraction), 0.0), 1.0)
+    df = min(max(float(disengage_fraction), 0.0), 1.0)
+
+    def _bars(relaxed, extended, default_engage, default_disengage, min_span):
+        # Need both ends AND a real span (extended clearly beyond relaxed) to fit;
+        # otherwise keep the defaults rather than emit a nonsense (inverted/tiny)
+        # threshold from a flubbed capture.
+        if (relaxed is None or extended is None
+                or (extended - relaxed) < min_span):
+            return default_engage, default_disengage
+        span = extended - relaxed
+        return relaxed + ef * span, relaxed + df * span
+
+    fwd_e, fwd_d = _bars(relaxed_forward, extended_forward,
+                         AIR_MOUSE_EXTEND_FORWARD_ENGAGE_M,
+                         AIR_MOUSE_EXTEND_FORWARD_DISENGAGE_M, 0.05)
+    str_e, str_d = _bars(relaxed_straight, extended_straight,
+                         AIR_MOUSE_EXTEND_STRAIGHT_ENGAGE,
+                         AIR_MOUSE_EXTEND_STRAIGHT_DISENGAGE, 0.05)
+    return {"fwd_engage": fwd_e, "fwd_disengage": fwd_d,
+            "straight_engage": str_e, "straight_disengage": str_d}
 
 
 class AirMouseController:
@@ -510,7 +643,9 @@ class AirMouseController:
                  alpha: float = AIR_MOUSE_EMA_ALPHA,
                  debounce_frames: int = AIR_MOUSE_GRIP_DEBOUNCE_FRAMES,
                  grace_sec: float = AIR_MOUSE_DISENGAGE_GRACE_SEC,
-                 clock=time.monotonic):
+                 clock=time.monotonic,
+                 switch_margin: float = HAND_SWITCH_MARGIN,
+                 switch_frames: int = HAND_SWITCH_FRAMES):
         self.reach = reach
         self._ema_x = EMA(alpha)
         self._ema_y = EMA(alpha)
@@ -526,6 +661,13 @@ class AirMouseController:
         self._engaged = False        # is the air-mouse currently driving the cursor
         self._hand: Optional[str] = None   # which hand is driving ("left"/"right")
         self._last_engaged_at = 0.0  # clock() of the last EXTENDED+tracked frame
+        # Controlling-hand HYSTERESIS (ISSUE 3): the challenger must out-reach the
+        # holder by `switch_margin` for `switch_frames` consecutive frames before
+        # the cursor switches hands, so two raised hands can't thrash the cursor.
+        self._switch_margin = max(0.0, float(switch_margin))
+        self._switch_frames = max(1, int(switch_frames))
+        self._challenge_side: Optional[str] = None   # the side currently challenging
+        self._challenge_count = 0                    # its consecutive-lead streak
 
     def reset(self) -> None:
         """Drop all smoothing + grip + engage state. Used by the dead-man and on
@@ -542,6 +684,8 @@ class AirMouseController:
         self._engaged = False
         self._hand = None
         self._last_engaged_at = 0.0
+        self._challenge_side = None
+        self._challenge_count = 0
 
     @property
     def button_is_down(self) -> bool:
@@ -581,6 +725,8 @@ class AirMouseController:
         self._right_down = False
         self._engaged = False
         self._hand = None
+        self._challenge_side = None
+        self._challenge_count = 0
         self._ema_x.reset()
         self._ema_y.reset()
         self._grip_left.reset(initial="open")
@@ -604,8 +750,55 @@ class AirMouseController:
             return "up"
         return None
 
+    def _select_controlling_arm(self, left_ext, right_ext,
+                                thresholds: "Optional[dict]"):
+        """Pick the cursor-driving arm with HAND-HYSTERESIS (ISSUE 3). Keeps the
+        current controlling hand unless the OTHER arm out-reaches it by the margin
+        for `switch_frames` consecutive frames; a brief or marginal lead never
+        flips control. Updates the challenger streak as a side effect and returns
+        the chosen ArmExtension (or None when neither arm is extended)."""
+        candidates = extended_arms(left_ext, right_ext, engaged=self._engaged,
+                                   thresholds=thresholds)
+        if not candidates:
+            self._challenge_side = None
+            self._challenge_count = 0
+            return None
+        best = max(candidates, key=lambda a: a.reach_score())
+        # Is the hand currently driving still a live candidate?
+        holder = next((a for a in candidates if a.side == self._hand), None)
+        if holder is None:
+            # The driving hand relaxed/left (or we weren't engaged): take the most-
+            # extended arm outright and reset any challenge.
+            self._challenge_side = None
+            self._challenge_count = 0
+            return best
+        if best is holder:
+            # The holder is still the most extended — no challenge in progress.
+            self._challenge_side = None
+            self._challenge_count = 0
+            return holder
+        # A DIFFERENT arm out-scores the holder. Require a sustained, clear lead.
+        lead = best.reach_score() - holder.reach_score()
+        if lead >= self._switch_margin:
+            if self._challenge_side == best.side:
+                self._challenge_count += 1
+            else:
+                self._challenge_side = best.side
+                self._challenge_count = 1
+            if self._challenge_count >= self._switch_frames:
+                # Sustained clear lead → switch hands.
+                self._challenge_side = None
+                self._challenge_count = 0
+                return best
+        else:
+            # Lead too small this frame → challenge resets (no thrash).
+            self._challenge_side = None
+            self._challenge_count = 0
+        return holder
+
     def update(self, left_ext, right_ext, left_grip: str, right_grip: str,
-               tracked: bool) -> AirMouseDecision:
+               tracked: bool, thresholds: "Optional[dict]" = None
+               ) -> AirMouseDecision:
         """Advance one frame.
 
         left_ext / right_ext: the per-arm ArmExtension (or None when that arm's
@@ -613,13 +806,16 @@ class AirMouseController:
         left_grip / right_grip: the raw bridge grips for each hand
             ("open"/"closed"/"lasso"/"unknown").
         tracked: True when the bridge reported a tracked body this frame.
+        thresholds: the live reach-gate bars from _reach_thresholds() (the owner's
+            CALIBRATION, or the looser defaults). None → the module defaults.
 
         DISENGAGES (returns cursor=None — no SetCursorPos — and releases any held
         button) when the body/hand is NOT tracked, or when NEITHER arm is extended
         (both relaxed). A brief tracking dropout while ENGAGED is tolerated for up
         to the grace window (button held, cursor parked) before the full release.
-        The cursor follows the MORE-extended arm; per-hand close→click is
-        evaluated for BOTH hands every engaged frame."""
+        The cursor follows the more-extended arm with HAND-HYSTERESIS (no thrash
+        between two raised hands); per-hand close→click is evaluated for BOTH hands
+        every engaged frame regardless of which one drives the cursor."""
         # ── tracking-loss path, with a short grace so a 1-frame dropout doesn't
         #    disengage + re-snap (a held drag must survive a flicker). ──────────
         if not tracked:
@@ -634,9 +830,9 @@ class AirMouseController:
                                         grip=self._controlling_grip())
             return self.release_decision()
 
-        # ── reach gate: pick the more-extended arm (with engage hysteresis). No
-        #    arm extended → disengage (fail SAFE to releasing the real mouse). ──
-        arm = choose_controlling_arm(left_ext, right_ext, engaged=self._engaged)
+        # ── reach gate: pick the controlling arm (engage hysteresis + sticky
+        #    hand-hysteresis). No arm extended → disengage (fail SAFE). ─────────
+        arm = self._select_controlling_arm(left_ext, right_ext, thresholds)
         if arm is None:
             return self.release_decision()
 
@@ -774,6 +970,21 @@ def _bc():
     return sys.modules.get("__main__") or sys.modules.get("bobert_companion")
 
 
+def _speak(text: str) -> None:
+    """Speak a line mid-action (used by the calibration walk-through) via the
+    monolith's TTS. Best-effort + silent — mirrors kinect_gestures._speak. NEVER
+    raises; a headless/test instance just no-ops."""
+    bc = _bc()
+    if bc is None:
+        return
+    try:
+        fn = getattr(bc, "_speak", None) or getattr(bc, "speak", None)
+        if callable(fn):
+            fn(text)
+    except Exception:
+        pass
+
+
 def _cfg_flag(name: str, default: bool = False) -> bool:
     """Read a live boolean from core.config, tolerating its absence. Read fresh
     each call so a Settings toggle takes effect without a restart."""
@@ -782,6 +993,60 @@ def _cfg_flag(name: str, default: bool = False) -> bool:
         return bool(getattr(_cfg, name, default))
     except Exception:
         return default
+
+
+def _saved_settings() -> dict:
+    """The owner's persisted settings dict (data/user_settings.json) via the same
+    reader model_picker / kinect_gestures use — honours JARVIS_SETTINGS_PATH so a
+    test never touches the real file. Returns {} on any failure. NEVER raises."""
+    try:
+        from tools import settings_window as sw
+        cur = sw.load_settings()
+        return cur if isinstance(cur, dict) else {}
+    except Exception:
+        return {}
+
+
+def _saved_float(settings: dict, key: str) -> "Optional[float]":
+    """A persisted float by key, or None when absent / unparseable."""
+    try:
+        v = settings.get(key)
+        if v is None:
+            return None
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _reach_thresholds() -> dict:
+    """The LIVE reach-gate thresholds the engage test uses, read fresh each call:
+    persisted CALIBRATION values (KINECT_REACH_* in user_settings.json) when the
+    owner has calibrated, else the looser module defaults. Returns
+    {fwd_engage, fwd_disengage, straight_engage, straight_disengage}. A partially
+    written calibration (only some keys) falls back per-field to the default, so a
+    half-finished calibration can never strand the gate. NEVER raises."""
+    s = _saved_settings()
+    fwd_e = _saved_float(s, SETTING_REACH_ENGAGE)
+    fwd_d = _saved_float(s, SETTING_REACH_DISENGAGE)
+    str_e = _saved_float(s, SETTING_STRAIGHT_ENGAGE)
+    str_d = _saved_float(s, SETTING_STRAIGHT_DISENGAGE)
+    return {
+        "fwd_engage": fwd_e if fwd_e is not None
+        else AIR_MOUSE_EXTEND_FORWARD_ENGAGE_M,
+        "fwd_disengage": fwd_d if fwd_d is not None
+        else AIR_MOUSE_EXTEND_FORWARD_DISENGAGE_M,
+        "straight_engage": str_e if str_e is not None
+        else AIR_MOUSE_EXTEND_STRAIGHT_ENGAGE,
+        "straight_disengage": str_d if str_d is not None
+        else AIR_MOUSE_EXTEND_STRAIGHT_DISENGAGE,
+    }
+
+
+def _hand_mirror_enabled() -> bool:
+    """Whether to SWAP the bridge's left↔right hands (selfie-view correction, see
+    KINECT_HAND_MIRROR_DEFAULT). Read fresh each call from core.config (Settings
+    GUI override) so the owner can flip it live; defaults True."""
+    return _cfg_flag("KINECT_HAND_MIRROR", KINECT_HAND_MIRROR_DEFAULT)
 
 
 def _is_staging() -> bool:
@@ -1182,7 +1447,83 @@ def _hand_sample(bridge) -> tuple["Optional[ArmExtension]", "Optional[ArmExtensi
     right_grip = (body.get("hand_right") or "unknown").lower()
     left_ext = _arm_extension(bridge, joints, "left")
     right_ext = _arm_extension(bridge, joints, "right")
+    # ISSUE 1 — selfie-view correction: the Kinect stream is MIRRORED, so the
+    # owner's REAL left hand is what the SDK labels "right" (and vice-versa). When
+    # KINECT_HAND_MIRROR is on, SWAP the two hands here — BOTH the grips AND the
+    # per-arm extensions (relabelling each .side) — so everything downstream (the
+    # per-hand L/R clicks, choose_controlling_arm, the published which-hand, the
+    # preview circle's prefer_side) treats the owner's REAL left hand as LEFT.
+    if _hand_mirror_enabled():
+        left_ext, right_ext = (_relabel_arm_side(right_ext, "left"),
+                               _relabel_arm_side(left_ext, "right"))
+        left_grip, right_grip = right_grip, left_grip
     return left_ext, right_ext, left_grip, right_grip, True
+
+
+def _relabel_arm_side(ext: "Optional[ArmExtension]",
+                      side: str) -> "Optional[ArmExtension]":
+    """Return `ext` with its .side relabelled (used by the mirror swap so a
+    swapped arm reports the side it now drives). None passes through. The geometry
+    (forward-reach / straightness / hand joint) is unchanged — only the label, so
+    the published which-hand + preview circle land on the correct side."""
+    if ext is None:
+        return None
+    return ArmExtension(side, ext.forward_m, ext.straightness, ext.hand)
+
+
+# ─── ISSUE 2a: CALIBRATION capture ──────────────────────────────────────────
+CALIBRATE_CAPTURE_SECONDS = 3.0           # hold each pose this long
+CALIBRATE_POLL_HZ = 15.0                  # sample cadence while capturing
+CALIBRATE_POLL_INTERVAL = 1.0 / CALIBRATE_POLL_HZ
+CALIBRATE_MAX_SECONDS = 4.0               # hard wall-time cap per pose (slack)
+
+
+def _capture_reach(bridge, seconds: float = CALIBRATE_CAPTURE_SECONDS,
+                   sleep_fn=time.sleep, now_fn=time.monotonic
+                   ) -> "tuple[Optional[float], Optional[float], int]":
+    """Sample the MORE-extended arm's forward-reach + straightness for ~`seconds`
+    and return their MEDIANS plus the usable-frame count:
+    (median_forward_m, median_straightness, n_samples).
+
+    Reads the same _hand_sample() the live gate uses (so the mirror swap +
+    geometry are identical), taking, per frame, the more-extended arm's cues.
+    Median (not mean) shrugs off the odd Kinect outlier. A wedged sensor can't
+    hang the voice loop — capped at CALIBRATE_MAX_SECONDS. NEVER raises."""
+    fwd_samples: list = []
+    straight_samples: list = []
+    n = 0
+    try:
+        deadline = now_fn() + min(float(seconds), CALIBRATE_MAX_SECONDS)
+        while now_fn() < deadline:
+            left_ext, right_ext, _lg, _rg, tracked = _hand_sample(bridge)
+            if tracked:
+                arms = [a for a in (left_ext, right_ext) if a is not None]
+                arm = (max(arms, key=lambda a: a.reach_score())
+                       if arms else None)
+                if arm is not None:
+                    n += 1
+                    if arm.forward_m is not None:
+                        fwd_samples.append(float(arm.forward_m))
+                    if arm.straightness is not None:
+                        straight_samples.append(float(arm.straightness))
+            sleep_fn(CALIBRATE_POLL_INTERVAL)
+    except Exception:
+        pass
+    return _median(fwd_samples), _median(straight_samples), n
+
+
+def _persist_reach_thresholds(th: dict) -> bool:
+    """Write the four fitted reach thresholds to user_settings.json (KINECT_REACH_*
+    / KINECT_STRAIGHT_*) via the hardened settings writer. All-or-nothing-ish: each
+    key is written; returns True iff every write reported success. NEVER raises."""
+    ok = True
+    ok = _persist_setting(SETTING_REACH_ENGAGE, float(th["fwd_engage"])) and ok
+    ok = _persist_setting(SETTING_REACH_DISENGAGE, float(th["fwd_disengage"])) and ok
+    ok = _persist_setting(SETTING_STRAIGHT_ENGAGE,
+                          float(th["straight_engage"])) and ok
+    ok = _persist_setting(SETTING_STRAIGHT_DISENGAGE,
+                          float(th["straight_disengage"])) and ok
+    return ok
 
 
 def _apply_decision(decision: AirMouseDecision) -> None:
@@ -1193,6 +1534,50 @@ def _apply_decision(decision: AirMouseDecision) -> None:
         _set_cursor_pos(decision.cursor[0], decision.cursor[1])
     for button, action in decision.button_edges:
         _mouse_button(action, button)
+
+
+# ─── ISSUE 2b: live reach DEBUG LOG (~2 Hz) ─────────────────────────────────
+# While the air-mouse is enabled, print the live reach numbers at ~2 Hz so the
+# owner can SEE what the gate sees and tune / confirm a calibration, e.g.
+#   [air-mouse] reach=0.18 straight=0.91 hand=right engaged=False
+# The most-extended arm's cues are logged (that's the one the gate is judging).
+_AIR_MOUSE_DEBUG_INTERVAL = 0.5             # seconds between debug lines (~2 Hz)
+_air_mouse_debug_last = [0.0]               # module-list so the throttle persists
+
+
+def _format_reach_debug(left_ext, right_ext, tracked: bool, ctrl) -> str:
+    """The ~2 Hz debug line for the live reach values. Picks the more-extended
+    arm's forward-reach + straightness (the cue the gate is judging) and reports
+    the live which-hand + engaged. PURE-ish (reads ctrl state); NEVER raises."""
+    try:
+        arms = [a for a in (left_ext, right_ext) if a is not None]
+        arm = max(arms, key=lambda a: a.reach_score()) if arms else None
+        if arm is None:
+            reach_s, straight_s, hand_s = "n/a", "n/a", "none"
+        else:
+            reach_s = ("%.2f" % arm.forward_m) if arm.forward_m is not None else "n/a"
+            straight_s = ("%.2f" % arm.straightness
+                          if arm.straightness is not None else "n/a")
+            hand_s = arm.side or "?"
+        return ("  [air-mouse] reach=%s straight=%s hand=%s engaged=%s tracked=%s"
+                % (reach_s, straight_s, hand_s, bool(ctrl.engaged), bool(tracked)))
+    except Exception:
+        return "  [air-mouse] reach=? straight=? hand=? engaged=?"
+
+
+def _maybe_debug_log(left_ext, right_ext, tracked: bool, ctrl,
+                     now: "Optional[float]" = None) -> bool:
+    """Emit the reach debug line if the throttle window has elapsed. Returns True
+    iff a line was printed (for the test). NEVER raises."""
+    try:
+        t = time.monotonic() if now is None else float(now)
+        if (t - _air_mouse_debug_last[0]) < _AIR_MOUSE_DEBUG_INTERVAL:
+            return False
+        _air_mouse_debug_last[0] = t
+        print(_format_reach_debug(left_ext, right_ext, tracked, ctrl))
+        return True
+    except Exception:
+        return False
 
 
 def _poll_once(ctrl: AirMouseController, bridge) -> Optional[AirMouseDecision]:
@@ -1209,8 +1594,13 @@ def _poll_once(ctrl: AirMouseController, bridge) -> Optional[AirMouseDecision]:
     if bridge is None:
         return None
     left_ext, right_ext, left_grip, right_grip, tracked = _hand_sample(bridge)
+    # Live CALIBRATED reach bars (owner's persisted KINECT_REACH_* or the looser
+    # defaults), read fresh each tick so a re-calibration takes effect with no
+    # restart. The controller applies them in its engage hysteresis.
+    thresholds = _reach_thresholds()
     try:
-        decision = ctrl.update(left_ext, right_ext, left_grip, right_grip, tracked)
+        decision = ctrl.update(left_ext, right_ext, left_grip, right_grip,
+                               tracked, thresholds=thresholds)
     except Exception:
         # A controller error must not strand a held button — force a release.
         try:
@@ -1219,6 +1609,11 @@ def _poll_once(ctrl: AirMouseController, bridge) -> Optional[AirMouseDecision]:
             return None
 
     enabled = _air_mouse_enabled()
+    # ISSUE 2b: while enabled, surface the live reach numbers at ~2 Hz for tuning
+    # / confirming a calibration. Throttled + best-effort; only when enabled so a
+    # disabled poller stays quiet.
+    if enabled:
+        _maybe_debug_log(left_ext, right_ext, tracked, ctrl)
     if not enabled:
         # Gated OFF mid-session: make sure no button is left held and the
         # overlay is hidden. ctrl.update already returned a (possibly
@@ -1426,11 +1821,67 @@ def air_mouse_status(_: str = "") -> str:
             f"view at the moment. Reach an arm out toward the screen and {how}.")
 
 
+def calibrate_air_mouse(_: str = "") -> str:
+    """ISSUE 2a — the CALIBRATION walk-through ('calibrate air mouse' / 'calibrate
+    reach'). Speaks the owner through it: hold an arm EXTENDED for ~3 s (capture
+    forward-reach + straightness medians), then RELAX it down for ~3 s (capture
+    relaxed medians), fit the engage/disengage thresholds ~60 %/40 % of the way
+    relaxed→extended, and persist them (KINECT_REACH_* / KINECT_STRAIGHT_* in
+    user_settings.json) so the live gate auto-fits the owner's body. Honest on
+    every failure — never claims to have calibrated something it didn't capture.
+
+    Runs synchronously (like point_calibrate): it speaks each prompt, captures,
+    then returns the spoken summary."""
+    if _is_staging():
+        return "Not while I'm in staging, sir."
+    ready, why = _sensor_ready()
+    if not ready:
+        return (f"I can't calibrate the air-mouse, sir — {why}. Enable the "
+                "Kinect and try again.")
+    bridge = _bridge()
+    if bridge is None:
+        return "I can't calibrate the air-mouse, sir — the Kinect bridge isn't loaded."
+
+    # 1) EXTENDED pose.
+    _speak("Let's calibrate the air-mouse, sir. Extend your arm out toward the "
+           "screen and hold it there.")
+    ext_fwd, ext_straight, ext_n = _capture_reach(bridge)
+    if ext_n == 0:
+        return ("I couldn't see your arm while you reached, sir — make sure "
+                "you're in the Kinect's view and try calibrating again.")
+
+    # 2) RELAXED pose.
+    _speak("Got it. Now relax your arm down to your side.")
+    rel_fwd, rel_straight, rel_n = _capture_reach(bridge)
+    if rel_n == 0:
+        return ("I lost track of you while you relaxed, sir — please try "
+                "calibrating again.")
+
+    # 3) Fit + persist the thresholds.
+    th = compute_reach_thresholds(rel_fwd, ext_fwd, rel_straight, ext_straight)
+    persisted = _persist_reach_thresholds(th)
+    # Did we actually fit either cue from the capture (vs. fall back to defaults)?
+    fitted_fwd = (rel_fwd is not None and ext_fwd is not None
+                  and (ext_fwd - rel_fwd) >= 0.05)
+    fitted_straight = (rel_straight is not None and ext_straight is not None
+                       and (ext_straight - rel_straight) >= 0.05)
+    if not (fitted_fwd or fitted_straight):
+        return ("I couldn't tell your reach apart from your relax, sir — extend "
+                "fully then drop your arm all the way, and calibrate again.")
+    msg = ("Air-mouse calibrated, sir — reach out past about %.2f metres or "
+           "straighten your arm to take the cursor, and it releases when you "
+           "relax back." % th["fwd_engage"])
+    if not persisted:
+        msg += " (I couldn't save it, so it'll revert on restart.)"
+    return msg
+
+
 # ─── registration ────────────────────────────────────────────────────────
 def register(actions):
     actions["air_mouse_on"] = air_mouse_on
     actions["air_mouse_off"] = air_mouse_off
     actions["air_mouse_status"] = air_mouse_status
+    actions["calibrate_air_mouse"] = calibrate_air_mouse
 
     # Guard against duplicate pollers on skill reload (same OS-thread-name check
     # kinect_gestures / face_tracker use). The loop self-gates on

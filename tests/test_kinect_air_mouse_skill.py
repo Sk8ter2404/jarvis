@@ -182,7 +182,15 @@ class _Base(unittest.TestCase):
     def _capture_mouse(self, mod):
         """Replace the real mouse actuation with recorders. Returns (moves,
         buttons) lists that fill as the skill acts. `buttons` records
-        (action, button) tuples so per-hand left/right is asserted."""
+        (action, button) tuples so per-hand left/right is asserted.
+
+        Also pins the HAND MIRROR OFF: these _poll_once plumbing tests assert the
+        RAW SDK hand→button identity (reach_side='right' → RIGHT button), so the
+        selfie-view swap must be disabled here. The mirror's own swap is asserted
+        separately in HandMirrorTests (which turns it back ON)."""
+        pm = mock.patch.object(mod, "_hand_mirror_enabled", lambda: False)
+        pm.start()
+        self.addCleanup(pm.stop)
         moves: list = []
         buttons: list = []
         p1 = mock.patch.object(mod, "_set_cursor_pos",
@@ -1316,11 +1324,468 @@ class StatusTests(_Base):
         self.assertIn("unavailable", out.lower())
 
 
-# ─── registration wires the three actions ──────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+#  ISSUE 1 — HAND MIRROR (selfie-view): owner's REAL left hand → LEFT button +
+#  left-side circle. The bridge's left↔right are SWAPPED when KINECT_HAND_MIRROR.
+# ══════════════════════════════════════════════════════════════════════════
+class HandMirrorTests(_Base):
+    """The Kinect stream is mirrored, so the SDK's hand_left is the owner's REAL
+    right hand. With KINECT_HAND_MIRROR on, _hand_sample SWAPS the hands so the
+    owner's REAL left hand drives the LEFT button + the left-side circle."""
+
+    def _mirror_on(self, mod):
+        p = mock.patch.object(mod, "_hand_mirror_enabled", lambda: True)
+        p.start(); self.addCleanup(p.stop)
+
+    def _mirror_off(self, mod):
+        p = mock.patch.object(mod, "_hand_mirror_enabled", lambda: False)
+        p.start(); self.addCleanup(p.stop)
+
+    def test_default_mirror_flag_is_true_for_owner(self):
+        mod = self._load()
+        self.assertTrue(mod.KINECT_HAND_MIRROR_DEFAULT)
+
+    def test_sample_swaps_grips_when_mirrored(self):
+        mod = self._load()
+        self._mirror_on(mod)
+        # The Kinect SDK reports the grip on its hand_left as the owner's REAL
+        # right hand. Body: SDK hand_left="closed", hand_right="open". After the
+        # mirror swap the skill's left_grip must be the SDK's right ("open") and
+        # the skill's right_grip the SDK's left ("closed").
+        body = _body(reach_side="right", grip_left="closed", grip_right="open")
+        left_ext, right_ext, left_grip, right_grip, tracked = mod._hand_sample(
+            _fake_bridge(bodies=[body]))
+        self.assertTrue(tracked)
+        self.assertEqual(left_grip, "open")     # SDK right → skill left
+        self.assertEqual(right_grip, "closed")  # SDK left  → skill right
+
+    def test_sample_does_not_swap_when_mirror_off(self):
+        mod = self._load()
+        self._mirror_off(mod)
+        body = _body(reach_side="right", grip_left="closed", grip_right="open")
+        _le, _re, left_grip, right_grip, _t = mod._hand_sample(
+            _fake_bridge(bodies=[body]))
+        self.assertEqual(left_grip, "closed")   # unchanged
+        self.assertEqual(right_grip, "open")
+
+    def test_swapped_extension_sides_are_relabelled(self):
+        mod = self._load()
+        self._mirror_on(mod)
+        # The SDK's RIGHT arm is extended (reach_side="right"). After the mirror
+        # swap the EXTENDED arm must be reported on the skill's LEFT side, so the
+        # owner's REAL left hand drives the cursor.
+        body = _body(reach_side="right", grip_right="open")
+        left_ext, right_ext, _lg, _rg, _t = mod._hand_sample(
+            _fake_bridge(bodies=[body]))
+        # The skill-left arm now carries the extended geometry + side label "left".
+        self.assertEqual(left_ext.side, "left")
+        self.assertEqual(right_ext.side, "right")
+        self.assertTrue(left_ext.is_extended(engaged=False))    # the reach moved here
+        self.assertFalse(right_ext.is_extended(engaged=False))
+
+    def test_real_left_hand_drives_LEFT_button_and_left_circle(self):
+        """End-to-end through _poll_once: the owner reaches + clicks with their
+        REAL left hand (the SDK's RIGHT). With the mirror on, the LEFT button
+        fires and the published which-hand is 'left' (→ left-side circle)."""
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        moves, buttons = self._capture_mouse(mod)
+        # _capture_mouse pins the mirror OFF; turn it back ON AFTER so this
+        # patch is the most-recent (it wins on lookup) — this test needs it on.
+        self._mirror_on(mod)
+        ctrl = mod.AirMouseController(mod.ReachBox(2560, 1440),
+                                      debounce_frames=1, grace_sec=0.0)
+        # Owner's REAL left hand = SDK right arm extended; owner closes their REAL
+        # left hand = SDK hand_right closes. Model that as the SDK's RIGHT.
+        mod._poll_once(ctrl, _fake_bridge(
+            bodies=[_body(reach_side="right", grip_right="open")]))
+        st = mod.get_air_mouse_state()
+        self.assertTrue(st["engaged"])
+        self.assertEqual(st["hand"], "left")    # published as the owner's LEFT
+        # Now the owner closes their REAL left hand (SDK hand_right → closed).
+        mod._poll_once(ctrl, _fake_bridge(
+            bodies=[_body(reach_side="right", grip_right="closed")]))
+        mod._poll_once(ctrl, _fake_bridge(
+            bodies=[_body(reach_side="right", grip_right="open")]))
+        # The LEFT button (not right) fired — owner's real left hand = left-click.
+        self.assertEqual(buttons, [("down", "left"), ("up", "left")])
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  ISSUE 2 — CALIBRATION: fit thresholds from captured poses + persist; the live
+#  gate reads them (falling back to defaults); + the debug-log format.
+# ══════════════════════════════════════════════════════════════════════════
+class ComputeReachThresholdsTests(_Base):
+    def test_bars_placed_between_relaxed_and_extended(self):
+        mod = self._load()
+        # Relaxed forward 0.00 m, extended 0.40 m → engage ~60 % (0.24), disengage
+        # ~40 % (0.16); engage strictly above disengage (hysteresis).
+        th = mod.compute_reach_thresholds(0.0, 0.40, 0.50, 0.95)
+        self.assertAlmostEqual(th["fwd_engage"], 0.24, delta=0.01)
+        self.assertAlmostEqual(th["fwd_disengage"], 0.16, delta=0.01)
+        self.assertGreater(th["fwd_engage"], th["fwd_disengage"])
+        # Straightness 0.50→0.95 span: engage 0.50+0.6*0.45=0.77, disengage 0.68.
+        self.assertAlmostEqual(th["straight_engage"], 0.77, delta=0.01)
+        self.assertAlmostEqual(th["straight_disengage"], 0.68, delta=0.01)
+        self.assertGreater(th["straight_engage"], th["straight_disengage"])
+
+    def test_missing_pose_falls_back_to_defaults(self):
+        mod = self._load()
+        # No forward pair → forward bars keep the module defaults; straightness
+        # pair present → its bars are fitted.
+        th = mod.compute_reach_thresholds(None, None, 0.40, 0.96)
+        self.assertEqual(th["fwd_engage"], mod.AIR_MOUSE_EXTEND_FORWARD_ENGAGE_M)
+        self.assertEqual(th["fwd_disengage"],
+                         mod.AIR_MOUSE_EXTEND_FORWARD_DISENGAGE_M)
+        self.assertNotEqual(th["straight_engage"],
+                            mod.AIR_MOUSE_EXTEND_STRAIGHT_ENGAGE)
+
+    def test_degenerate_span_keeps_defaults(self):
+        mod = self._load()
+        # Extended barely above relaxed (no real span) → defaults, never an
+        # inverted/nonsense threshold from a flubbed capture.
+        th = mod.compute_reach_thresholds(0.20, 0.21, 0.80, 0.81)
+        self.assertEqual(th["fwd_engage"], mod.AIR_MOUSE_EXTEND_FORWARD_ENGAGE_M)
+        self.assertEqual(th["straight_engage"],
+                         mod.AIR_MOUSE_EXTEND_STRAIGHT_ENGAGE)
+
+
+class MedianTests(_Base):
+    def test_median_odd_even_and_empty(self):
+        mod = self._load()
+        self.assertEqual(mod._median([3.0, 1.0, 2.0]), 2.0)
+        self.assertEqual(mod._median([1.0, 2.0, 3.0, 4.0]), 2.5)
+        self.assertIsNone(mod._median([]))
+
+
+class ReachThresholdReadTests(_Base):
+    """The live gate reads the persisted KINECT_REACH_* (calibration), falling
+    back to the module defaults per-field when unset."""
+
+    def _patch_settings(self, mod, saved):
+        p = mock.patch.object(mod, "_saved_settings", lambda: dict(saved))
+        p.start(); self.addCleanup(p.stop)
+
+    def test_defaults_when_nothing_persisted(self):
+        mod = self._load()
+        self._patch_settings(mod, {})
+        th = mod._reach_thresholds()
+        self.assertEqual(th["fwd_engage"], mod.AIR_MOUSE_EXTEND_FORWARD_ENGAGE_M)
+        self.assertEqual(th["straight_disengage"],
+                         mod.AIR_MOUSE_EXTEND_STRAIGHT_DISENGAGE)
+
+    def test_persisted_values_win(self):
+        mod = self._load()
+        self._patch_settings(mod, {
+            mod.SETTING_REACH_ENGAGE: 0.31,
+            mod.SETTING_REACH_DISENGAGE: 0.19,
+            mod.SETTING_STRAIGHT_ENGAGE: 0.82,
+            mod.SETTING_STRAIGHT_DISENGAGE: 0.70,
+        })
+        th = mod._reach_thresholds()
+        self.assertAlmostEqual(th["fwd_engage"], 0.31)
+        self.assertAlmostEqual(th["fwd_disengage"], 0.19)
+        self.assertAlmostEqual(th["straight_engage"], 0.82)
+        self.assertAlmostEqual(th["straight_disengage"], 0.70)
+
+    def test_partial_persist_falls_back_per_field(self):
+        mod = self._load()
+        self._patch_settings(mod, {mod.SETTING_REACH_ENGAGE: 0.33})
+        th = mod._reach_thresholds()
+        self.assertAlmostEqual(th["fwd_engage"], 0.33)             # persisted
+        self.assertEqual(th["straight_engage"],                    # defaulted
+                         mod.AIR_MOUSE_EXTEND_STRAIGHT_ENGAGE)
+
+
+class CalibrateActionTests(_Base):
+    """'calibrate air mouse' walks the owner through two poses, fits the
+    thresholds from the captured medians, and persists them. Sensor + settings
+    writer mocked — no real Kinect, no real file."""
+
+    def _patch_settings_writer(self, mod, initial=None):
+        from tools import settings_window as sw
+        saved = dict(initial or {})
+        p1 = mock.patch.object(sw, "load_settings", lambda *a, **k: dict(saved))
+        p2 = mock.patch.object(sw, "save_settings",
+                               lambda d, *a, **k: saved.update(d))
+        p1.start(); p2.start()
+        self.addCleanup(p1.stop); self.addCleanup(p2.stop)
+        return saved
+
+    def _stub_captures(self, mod, sequence):
+        """Make _capture_reach return each (fwd, straight, n) in `sequence` on
+        successive calls (no real sampling / sleeping)."""
+        calls = {"i": 0}
+
+        def _fake(bridge, *a, **k):
+            i = min(calls["i"], len(sequence) - 1)
+            calls["i"] += 1
+            return sequence[i]
+        p = mock.patch.object(mod, "_capture_reach", _fake)
+        p.start(); self.addCleanup(p.stop)
+        return calls
+
+    def test_calibration_sets_thresholds_from_captured_poses(self):
+        mod = self._load()
+        self._not_staging(mod)
+        saved = self._patch_settings_writer(mod)
+        # Sensor ready + bridge present.
+        p = mock.patch.object(mod, "_sensor_ready", lambda: (True, ""))
+        p.start(); self.addCleanup(p.stop)
+        pb = mock.patch.object(mod, "_bridge", lambda: _fake_bridge())
+        pb.start(); self.addCleanup(pb.stop)
+        spoken: list = []
+        ps = mock.patch.object(mod, "_speak", lambda t: spoken.append(t))
+        ps.start(); self.addCleanup(ps.stop)
+        # First capture = EXTENDED pose (0.40 m, 0.95 straight); second = RELAXED
+        # (0.00 m, 0.50 straight), each with usable frames.
+        self._stub_captures(mod, [(0.40, 0.95, 20), (0.00, 0.50, 20)])
+        out = mod.calibrate_air_mouse("")
+        self.assertIn("calibrat", out.lower())
+        # Persisted the four fitted thresholds, engage above disengage.
+        self.assertIn(mod.SETTING_REACH_ENGAGE, saved)
+        self.assertIn(mod.SETTING_REACH_DISENGAGE, saved)
+        self.assertGreater(saved[mod.SETTING_REACH_ENGAGE],
+                           saved[mod.SETTING_REACH_DISENGAGE])
+        # The fitted forward-engage sits ~60 % between 0.00 and 0.40 (≈0.24).
+        self.assertAlmostEqual(saved[mod.SETTING_REACH_ENGAGE], 0.24, delta=0.02)
+        # It spoke BOTH prompts (extend, then relax).
+        self.assertTrue(any("extend" in s.lower() for s in spoken))
+        self.assertTrue(any("relax" in s.lower() for s in spoken))
+
+    def test_calibration_persisted_values_are_read_by_the_gate(self):
+        # After calibration the live _reach_thresholds() must reflect what was
+        # saved (end-to-end: capture → persist → read).
+        mod = self._load()
+        self._not_staging(mod)
+        saved = self._patch_settings_writer(mod)
+        p = mock.patch.object(mod, "_sensor_ready", lambda: (True, ""))
+        p.start(); self.addCleanup(p.stop)
+        pb = mock.patch.object(mod, "_bridge", lambda: _fake_bridge())
+        pb.start(); self.addCleanup(pb.stop)
+        ps = mock.patch.object(mod, "_speak", lambda t: None)
+        ps.start(); self.addCleanup(ps.stop)
+        self._stub_captures(mod, [(0.50, 0.98, 20), (0.10, 0.55, 20)])
+        mod.calibrate_air_mouse("")
+        # _saved_settings reads the same mocked writer → the gate sees the fit.
+        th = mod._reach_thresholds()
+        self.assertAlmostEqual(th["fwd_engage"], saved[mod.SETTING_REACH_ENGAGE])
+        self.assertGreater(th["fwd_engage"], th["fwd_disengage"])
+
+    def test_calibration_honest_when_no_body_seen(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_settings_writer(mod)
+        p = mock.patch.object(mod, "_sensor_ready", lambda: (True, ""))
+        p.start(); self.addCleanup(p.stop)
+        pb = mock.patch.object(mod, "_bridge", lambda: _fake_bridge())
+        pb.start(); self.addCleanup(pb.stop)
+        ps = mock.patch.object(mod, "_speak", lambda t: None)
+        ps.start(); self.addCleanup(ps.stop)
+        # Zero usable frames on the first (extended) capture → honest failure.
+        self._stub_captures(mod, [(None, None, 0)])
+        out = mod.calibrate_air_mouse("")
+        self.assertIn("couldn't see", out.lower())
+
+    def test_calibration_refuses_in_staging(self):
+        mod = self._load()
+        p = mock.patch.object(mod, "_is_staging", lambda: True)
+        p.start(); self.addCleanup(p.stop)
+        out = mod.calibrate_air_mouse("")
+        self.assertIn("staging", out.lower())
+
+    def test_calibration_honest_when_sensor_unavailable(self):
+        mod = self._load()
+        self._not_staging(mod)
+        p = mock.patch.object(mod, "_sensor_ready",
+                              lambda: (False, "the Kinect is switched off"))
+        p.start(); self.addCleanup(p.stop)
+        out = mod.calibrate_air_mouse("")
+        self.assertIn("kinect", out.lower())
+
+    def test_capture_reach_medians_from_more_extended_arm(self):
+        # _capture_reach samples the more-extended arm's cues and medians them.
+        mod = self._load()
+        bridge = _fake_bridge(bodies=[_body(reach_side="right", forward=0.30)])
+        fwd, straight, n = mod._capture_reach(
+            bridge, seconds=0.05, sleep_fn=lambda s: None,
+            now_fn=_StepClock(step=0.02))
+        self.assertGreater(n, 0)
+        self.assertIsNotNone(fwd)
+        self.assertGreater(fwd, 0.20)           # the extended arm's forward reach
+        self.assertIsNotNone(straight)
+
+
+class _StepClock:
+    """A monotonic-ish clock that advances by `step` each call so a capture loop
+    runs a bounded number of iterations without real sleeping."""
+    def __init__(self, start=0.0, step=0.02):
+        self.t = float(start)
+        self.step = float(step)
+
+    def __call__(self):
+        v = self.t
+        self.t += self.step
+        return v
+
+
+class DebugLogFormatTests(_Base):
+    """ISSUE 2b — the ~2 Hz live reach debug line shows the values for tuning."""
+
+    class _Ctrl:
+        engaged = False
+        hand = None
+
+    def test_debug_line_shape(self):
+        mod = self._load()
+        ext = mod.ArmExtension("right", forward_m=0.18, straightness=0.91,
+                               hand=(0.1, 0.3, 1.8, 2))
+        line = mod._format_reach_debug(None, ext, True, self._Ctrl())
+        self.assertIn("[air-mouse]", line)
+        self.assertIn("reach=0.18", line)
+        self.assertIn("straight=0.91", line)
+        self.assertIn("hand=right", line)
+        self.assertIn("engaged=False", line)
+
+    def test_debug_line_handles_missing_cues(self):
+        mod = self._load()
+        line = mod._format_reach_debug(None, None, False, self._Ctrl())
+        self.assertIn("reach=n/a", line)
+        self.assertIn("hand=none", line)
+
+    def test_debug_log_is_throttled(self):
+        mod = self._load()
+        ext = mod.ArmExtension("right", forward_m=0.2, straightness=0.9,
+                               hand=(0, 0.3, 1.8, 2))
+        mod._air_mouse_debug_last[0] = 0.0
+        # First call at t=100 prints; an immediate second call is throttled.
+        self.assertTrue(mod._maybe_debug_log(None, ext, True, self._Ctrl(),
+                                             now=100.0))
+        self.assertFalse(mod._maybe_debug_log(None, ext, True, self._Ctrl(),
+                                              now=100.1))
+        # Past the interval it prints again.
+        self.assertTrue(mod._maybe_debug_log(None, ext, True, self._Ctrl(),
+                                             now=100.0 + mod._AIR_MOUSE_DEBUG_INTERVAL))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  ISSUE 3 — controlling-hand HYSTERESIS: no thrash with BOTH hands raised.
+# ══════════════════════════════════════════════════════════════════════════
+class ControllingHandHysteresisTests(_Base):
+    def _ctrl(self, mod, **kw):
+        kw.setdefault("debounce_frames", 1)
+        kw.setdefault("grace_sec", 0.0)
+        return mod.AirMouseController(mod.ReachBox(2560, 1440), **kw)
+
+    def _arm(self, mod, side, forward, straight):
+        """An EXTENDED ArmExtension with a chosen reach (forward + straightness)
+        and a hand joint, for driving the hysteresis directly."""
+        return mod.ArmExtension(side, forward_m=forward, straightness=straight,
+                                hand=(0.1 if side == "right" else -0.1, 0.3,
+                                      TORSO_Z - forward, 2))
+
+    def test_holds_current_hand_when_other_barely_leads(self):
+        mod = self._load()
+        c = self._ctrl(mod)
+        # Engage on the RIGHT hand first (clearly extended).
+        c.update(self._arm(mod, "left", 0.10, 0.50),
+                 self._arm(mod, "right", 0.45, 0.98), "open", "open", True)
+        self.assertEqual(c.hand, "right")
+        # Now the LEFT hand creeps a HAIR more extended than the right, but under
+        # the switch margin: control must STAY on the right (no thrash).
+        for _ in range(20):
+            d = c.update(self._arm(mod, "left", 0.47, 0.99),
+                         self._arm(mod, "right", 0.45, 0.98),
+                         "open", "open", True)
+            self.assertEqual(d.hand, "right")
+        self.assertEqual(c.hand, "right")
+
+    def test_switches_only_after_sustained_clear_lead(self):
+        mod = self._load()
+        c = self._ctrl(mod, switch_frames=6, switch_margin=0.25)
+        c.update(self._arm(mod, "left", 0.10, 0.40),
+                 self._arm(mod, "right", 0.45, 0.98), "open", "open", True)
+        self.assertEqual(c.hand, "right")
+        # LEFT now leads by a CLEAR margin. It must take several frames to switch.
+        big_left = lambda: self._arm(mod, "left", 0.90, 1.0)
+        small_right = lambda: self._arm(mod, "right", 0.20, 0.80)
+        switched_at = None
+        for i in range(1, 12):
+            d = c.update(big_left(), small_right(), "open", "open", True)
+            if d.hand == "left":
+                switched_at = i
+                break
+        self.assertIsNotNone(switched_at)
+        self.assertGreaterEqual(switched_at, 6)   # not instant — sustained lead
+        self.assertEqual(c.hand, "left")
+
+    def test_brief_lead_then_back_does_not_switch(self):
+        mod = self._load()
+        c = self._ctrl(mod, switch_frames=6, switch_margin=0.25)
+        c.update(self._arm(mod, "left", 0.10, 0.40),
+                 self._arm(mod, "right", 0.45, 0.98), "open", "open", True)
+        # LEFT leads big for a FEW frames (< switch_frames) then drops back.
+        for _ in range(3):
+            d = c.update(self._arm(mod, "left", 0.90, 1.0),
+                         self._arm(mod, "right", 0.20, 0.80), "open", "open", True)
+            self.assertEqual(d.hand, "right")     # not yet switched
+        # Back to the right clearly leading → challenge resets, stays on right.
+        for _ in range(5):
+            d = c.update(self._arm(mod, "left", 0.20, 0.50),
+                         self._arm(mod, "right", 0.45, 0.98), "open", "open", True)
+        self.assertEqual(c.hand, "right")
+
+    def test_both_hands_grips_tracked_regardless_of_cursor_hand(self):
+        mod = self._load()
+        c = self._ctrl(mod)
+        # RIGHT drives the cursor; BOTH hands close → BOTH buttons fire (the L/R
+        # clicks are independent of which hand drives), and no thrash.
+        c.update(self._arm(mod, "left", 0.20, 0.55),
+                 self._arm(mod, "right", 0.45, 0.98), "open", "open", True)
+        d = c.update(self._arm(mod, "left", 0.20, 0.55),
+                     self._arm(mod, "right", 0.45, 0.98), "closed", "closed", True)
+        self.assertEqual(c.hand, "right")
+        self.assertEqual(d.left, "down")
+        self.assertEqual(d.right, "down")
+        self.assertTrue(c.left_is_down and c.right_is_down)
+
+    def test_no_flicker_with_both_hands_equally_extended(self):
+        mod = self._load()
+        c = self._ctrl(mod)
+        # BOTH hands raised + EQUALLY extended for many frames: the cursor hand
+        # must be STABLE (never flip back and forth frame-to-frame).
+        c.update(self._arm(mod, "left", 0.40, 0.95),
+                 self._arm(mod, "right", 0.40, 0.95), "open", "open", True)
+        first = c.hand
+        hands = []
+        for _ in range(40):
+            d = c.update(self._arm(mod, "left", 0.40, 0.95),
+                         self._arm(mod, "right", 0.40, 0.95), "open", "open", True)
+            hands.append(d.hand)
+        # Exactly one distinct controlling hand across all frames — no flicker.
+        self.assertEqual(set(hands), {first})
+
+    def test_switch_state_clears_on_disengage(self):
+        mod = self._load()
+        c = self._ctrl(mod)
+        c.update(self._arm(mod, "left", 0.10, 0.40),
+                 self._arm(mod, "right", 0.45, 0.98), "open", "open", True)
+        # Build a partial challenge, then fully disengage (both relaxed).
+        c.update(self._arm(mod, "left", 0.90, 1.0),
+                 self._arm(mod, "right", 0.20, 0.80), "open", "open", True)
+        c.update(None, None, "open", "open", True)     # no arms → release
+        self.assertFalse(c.engaged)
+        self.assertEqual(c._challenge_count, 0)
+        self.assertIsNone(c._challenge_side)
+
+
+# ─── registration wires the actions ─────────────────────────────────────────
 class RegisterTests(_Base):
     def test_register_adds_actions_without_starting_real_thread(self):
         mod, actions = load_skill_isolated("kinect_air_mouse", register=True)
-        for name in ("air_mouse_on", "air_mouse_off", "air_mouse_status"):
+        for name in ("air_mouse_on", "air_mouse_off", "air_mouse_status",
+                     "calibrate_air_mouse"):
             self.assertIn(name, actions)
             self.assertTrue(callable(actions[name]))
 
