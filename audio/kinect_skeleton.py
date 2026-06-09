@@ -235,20 +235,36 @@ _CONTROLLING_HAND_JOINTS = ("hand_right", "hand_left", "wrist_right", "wrist_lef
 def controlling_hand_point(
     points: dict[str, tuple[int, int]],
     prefer_side: "str | None" = None,
+    *,
+    fallback: bool = True,
 ) -> "tuple[int, int] | None":
     """The projected pixel of the air-mouse controlling hand, or None.
 
     ``prefer_side`` ("left"/"right") is the hand the air-mouse is CURRENTLY driving
     with (its live which-hand state) — when given, that side's hand (then wrist) is
     tried FIRST so the circle follows the EXTENDED hand, even when it's the left.
-    Falls back to the default order (right hand, left hand, then wrists) so a
-    disengaged / preference-less call still draws something. The compositor draws
-    the engaged/closed colour circle at the returned point. Pure; None when no
-    hand/wrist joint projected (→ no circle)."""
+
+    ``fallback`` (default True): when True a missing preferred side falls through to
+    the default order (right hand, left hand, then wrists) so a disengaged /
+    preference-less call still draws something. Set fallback=False to require the
+    PREFERRED side specifically and return None otherwise — the explicit
+    "no controller → no ring" contract the engaged bright ring uses, so it never
+    lands an arbitrary (e.g. always-right) ring when the controlling side didn't
+    project. With fallback=False and no prefer_side, returns None (nothing to
+    prefer). Pure; None when nothing matched (→ no circle)."""
     if not isinstance(points, dict):
         return None
-    order = list(_CONTROLLING_HAND_JOINTS)
     side = (prefer_side or "").lower()
+    if not fallback:
+        # Require the preferred side only — no arbitrary-hand fallback.
+        if side not in ("left", "right"):
+            return None
+        for name in (f"hand_{side}", f"wrist_{side}"):
+            pt = points.get(name)
+            if pt is not None:
+                return pt
+        return None
+    order = list(_CONTROLLING_HAND_JOINTS)
     if side in ("left", "right"):
         # Try the preferred side's hand then wrist before the default order.
         order = [f"hand_{side}", f"wrist_{side}"] + order

@@ -25,6 +25,11 @@ from unittest import mock
 
 from audio import kinect_bridge as kb
 
+# The unwrapped real _runtime_streams, captured before any test patches it to
+# always-True (see _BridgeBase.setUp) — used by the tests that exercise the real
+# color-requiring verify logic.
+_REAL_RUNTIME_STREAMS = kb._runtime_streams
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # fake pykinect2 modules + a fake runtime
@@ -778,6 +783,57 @@ class ArmExtensionGeometryTests(_BridgeBase):
         self.assertIsInstance(kb.arm_extension({"hand_right": None}, "right"), dict)
         self.assertIsInstance(kb.arm_extension({}, "right"), dict)
 
+    # ── BODY-RELATIVE reach ratio (POSITION-INDEPENDENT) ────────────────────
+    def _both_shoulders(self, side, forward=0.30, half=0.20):
+        """An extended arm with BOTH shoulders present so a shoulder-width body
+        scale (= 2*half) is measurable and reach_ratio computes."""
+        j = self._extended(side, forward=forward)
+        j["shoulder_left"] = (-half, 0.40, self.TORSO_Z, 2)
+        j["shoulder_right"] = (half, 0.40, self.TORSO_Z, 2)
+        return j
+
+    def test_body_scale_prefers_shoulder_width(self):
+        j = self._both_shoulders("right", half=0.22)
+        self.assertAlmostEqual(kb._body_scale_m(j), 0.44, delta=0.01)
+
+    def test_body_scale_falls_back_to_torso_height(self):
+        # No shoulders, but a spine_base→spine_shoulder span → torso height.
+        j = {"spine_base": (0.0, 0.0, 2.0, 2),
+             "spine_shoulder": (0.0, 0.55, 2.0, 2)}
+        self.assertAlmostEqual(kb._body_scale_m(j), 0.55, delta=0.01)
+
+    def test_body_scale_none_when_no_span(self):
+        self.assertIsNone(kb._body_scale_m({"head": (0, 0.6, 2.0, 2)}))
+
+    def test_reach_ratio_is_forward_over_body_scale(self):
+        # forward 0.30 m, shoulder width 0.40 m → ratio ≈ 0.75.
+        ext = kb.arm_extension(self._both_shoulders("right", forward=0.30,
+                                                    half=0.20), "right")
+        self.assertIsNotNone(ext["reach_ratio"])
+        self.assertAlmostEqual(ext["reach_ratio"], 0.75, delta=0.03)
+        self.assertAlmostEqual(ext["body_scale_m"], 0.40, delta=0.02)
+
+    def test_reach_ratio_position_independent(self):
+        # The SAME gesture at two distances (all metres scaled) gives DIFFERENT
+        # absolute forward metres but the SAME body-relative ratio — the headline
+        # position-independence property.
+        def scaled(scale):
+            half = 0.20 * scale
+            fwd = 0.30 * scale          # reach scales with the body
+            return kb.arm_extension(
+                self._both_shoulders("right", forward=fwd, half=half), "right")
+        near, far = scaled(1.5), scaled(0.6)
+        self.assertNotAlmostEqual(near["forward_reach_m"],
+                                  far["forward_reach_m"], delta=0.05)
+        self.assertAlmostEqual(near["reach_ratio"], far["reach_ratio"], delta=0.03)
+
+    def test_reach_ratio_none_without_body_scale(self):
+        # Forward reach measurable (via shoulder ref) but only ONE shoulder + no
+        # torso span → no body scale → reach_ratio None (gate falls back to metres).
+        ext = kb.arm_extension(self._extended("right", forward=0.30), "right")
+        self.assertIsNotNone(ext["forward_reach_m"])
+        self.assertIsNone(ext["reach_ratio"])
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # head-facing yaw (joint-derived gaze; the Kinect v2 Face API is absent on
@@ -887,9 +943,11 @@ class CloseTests(_BridgeBase):
 class BodyStaleGuardTests(_BridgeBase):
     def setUp(self):
         super().setUp()
-        # Isolate the staleness clock between tests.
+        # Isolate the staleness clocks (body AND color) between tests.
         self._orig_last = kb._last_body_frame_at[0]
+        self._orig_last_color = kb._last_color_frame_at[0]
         self.addCleanup(lambda: kb._last_body_frame_at.__setitem__(0, self._orig_last))
+        self.addCleanup(lambda: kb._last_color_frame_at.__setitem__(0, self._orig_last_color))
 
     def test_not_stale_when_no_runtime_open(self):
         kb._runtime[0] = None
@@ -921,30 +979,49 @@ class BodyStaleGuardTests(_BridgeBase):
         rt = _FakeRuntime()
         _patch_loader(self, rt)
         self.assertIsNotNone(kb.get_runtime()[0])
-        # Force the clock far into the past so the stream looks stale.
+        # Force BOTH clocks far into the past so the runtime looks fully stale (the
+        # reset now requires BOTH body AND color quiet — the preview-keep-alive fix).
         kb._last_body_frame_at[0] = 1.0
+        kb._last_color_frame_at[0] = 1.0
         did = kb.reset_if_body_stale(now=1.0 + kb.BODY_STALE_RESET_SEC + 1.0)
         self.assertTrue(did)
         self.assertIsNone(kb._runtime[0])   # next get_runtime() will reopen
         self.assertTrue(rt.closed)          # old handle released
+
+    def test_reset_noop_when_body_stale_but_color_live(self):
+        # The headline preview-keep-alive guarantee: a BODY-only dropout (the owner
+        # standing up + sitting back) whose COLOR is still flowing must NOT tear
+        # down the runtime — that's what used to kill the skeleton preview.
+        rt = _FakeRuntime()
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        kb._last_body_frame_at[0] = 1.0                       # body went quiet
+        kb._last_color_frame_at[0] = 1.0 + kb.BODY_STALE_RESET_SEC + 0.9  # color fresh
+        did = kb.reset_if_body_stale(now=1.0 + kb.BODY_STALE_RESET_SEC + 1.0)
+        self.assertFalse(did)               # color live → no reset
+        self.assertIsNotNone(kb._runtime[0])
+        self.assertFalse(rt.closed)
 
     def test_reset_noop_when_not_stale(self):
         rt = _FakeRuntime()
         _patch_loader(self, rt)
         kb.get_runtime()
         kb._last_body_frame_at[0] = 1000.0
+        kb._last_color_frame_at[0] = 1000.0
         did = kb.reset_if_body_stale(now=1000.5)   # fresh → no reset
         self.assertFalse(did)
         self.assertIsNotNone(kb._runtime[0])
         self.assertFalse(rt.closed)
 
     def test_reset_reopens_a_live_stream_on_next_get_runtime(self):
-        # End-to-end: a stale reset followed by get_runtime() must reopen (the
-        # whole point — the next open re-binds a live stream).
+        # End-to-end: a FULL stale reset (both planes quiet) followed by
+        # get_runtime() must reopen (the whole point — the next open re-binds a
+        # live stream).
         rt1 = _FakeRuntime()
         _patch_loader(self, rt1)
         first, _ = kb.get_runtime()
         kb._last_body_frame_at[0] = 1.0
+        kb._last_color_frame_at[0] = 1.0
         kb.reset_if_body_stale(now=1.0 + kb.BODY_STALE_RESET_SEC + 1.0)
         self.assertIsNone(kb._runtime[0])
         second, _ = kb.get_runtime()   # reopens via the patched loader
@@ -965,13 +1042,100 @@ class BodyStaleGuardTests(_BridgeBase):
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# PREVIEW KEEP-ALIVE: color is a first-class stream for the reset decision; the
+# stale-reset only fires when BOTH body AND color are quiet, the open/verify path
+# requires a COLOR frame, and get_color_bgr / the pump stamp the color clock.
+# ─────────────────────────────────────────────────────────────────────────
+class ColorStreamGuardTests(_BridgeBase):
+    def setUp(self):
+        super().setUp()
+        self._b = kb._last_body_frame_at[0]
+        self._c = kb._last_color_frame_at[0]
+        self.addCleanup(lambda: kb._last_body_frame_at.__setitem__(0, self._b))
+        self.addCleanup(lambda: kb._last_color_frame_at.__setitem__(0, self._c))
+        self.addCleanup(kb.stop_body_pump)
+
+    # ── color staleness clock ───────────────────────────────────────────────
+    def test_note_color_frame_seen_uses_injected_now(self):
+        kb.note_color_frame_seen(now=54321.0)
+        self.assertEqual(kb._last_color_frame_at[0], 54321.0)
+
+    def test_color_not_stale_when_no_runtime(self):
+        kb._runtime[0] = None
+        kb._last_color_frame_at[0] = 1.0
+        self.assertFalse(kb._color_frame_is_stale(now=10_000.0))
+
+    def test_color_stale_after_window(self):
+        kb._runtime[0] = object()
+        kb._last_color_frame_at[0] = 100.0
+        self.assertFalse(
+            kb._color_frame_is_stale(now=100.0 + kb.BODY_STALE_RESET_SEC - 0.5))
+        self.assertTrue(
+            kb._color_frame_is_stale(now=100.0 + kb.BODY_STALE_RESET_SEC + 0.5))
+
+    def test_color_not_stale_when_clock_unseeded(self):
+        kb._runtime[0] = object()
+        kb._last_color_frame_at[0] = 0.0
+        self.assertFalse(kb._color_frame_is_stale(now=10_000.0))
+
+    def test_get_color_bgr_stamps_color_clock(self):
+        # A delivered color frame stamps the color staleness clock so a healthy
+        # color stream never trips the reset. (Needs numpy for the reshape.)
+        np = _require_numpy(self)
+        flat = np.zeros(1920 * 1080 * 4, dtype=np.uint8)
+        _patch_loader(self, _FakeRuntime(color=flat))
+        kb.get_runtime()
+        kb._last_color_frame_at[0] = 0.0
+        out = kb.get_color_bgr(require_new=False)
+        self.assertIsNotNone(out)
+        self.assertGreater(kb._last_color_frame_at[0], 0.0)
+
+    # ── reopen/verify requires color ────────────────────────────────────────
+    # NB _BridgeBase.setUp patches _runtime_streams to always-True (so the fakes,
+    # which don't model a live pump, verify). These tests exercise the REAL
+    # function, so use the unwrapped reference captured at import time.
+    def test_runtime_streams_requires_color_by_default(self):
+        # A runtime streaming BODY but NO color must NOT verify when require_color
+        # (the default) — so a color-dead reopen is retried, not cached as good.
+        rt = _FakeRuntime(bodies=[_FakeBody(True, {"head": (0, 0.6, 1.8)})])
+        # No color armed → has_new_color_frame() False.
+        self.assertFalse(_REAL_RUNTIME_STREAMS(rt, timeout_sec=0.2))
+
+    def test_runtime_streams_passes_on_color(self):
+        # Only has_new_color_frame() is read here (no reshape) → a non-None
+        # sentinel is enough to arm the color-ready flag; no numpy needed.
+        rt = _FakeRuntime(color=object())
+        self.assertTrue(_REAL_RUNTIME_STREAMS(rt, timeout_sec=0.5))
+
+    def test_runtime_streams_body_only_ok_when_color_not_required(self):
+        rt = _FakeRuntime(bodies=[_FakeBody(True, {"head": (0, 0.6, 1.8)})])
+        self.assertTrue(
+            _REAL_RUNTIME_STREAMS(rt, timeout_sec=0.5, require_color=False))
+
+    # ── the integrated reset rule (body-only quiet does NOT reset) ───────────
+    def test_pump_tick_no_reset_when_color_live(self):
+        # The owner's stand-up case: body goes quiet but color stays live → the
+        # pump must NOT reset the runtime (preview keeps rendering).
+        rt = _FakeRuntime()
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        # Body deep in the past, color fresh.
+        kb._last_body_frame_at[0] = time_monotonic_minus(kb.BODY_STALE_RESET_SEC + 5.0)
+        kb._last_color_frame_at[0] = __import__("time").monotonic()
+        kb._pump_tick()
+        self.assertIsNotNone(kb._runtime[0])   # NOT reset — color was live
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # PART B: always-on body-frame pump (keeps the body pipe flowing)
 # ─────────────────────────────────────────────────────────────────────────
 class BodyPumpTests(_BridgeBase):
     def setUp(self):
         super().setUp()
         self._orig_last = kb._last_body_frame_at[0]
+        self._orig_last_color = kb._last_color_frame_at[0]
         self.addCleanup(lambda: kb._last_body_frame_at.__setitem__(0, self._orig_last))
+        self.addCleanup(lambda: kb._last_color_frame_at.__setitem__(0, self._orig_last_color))
         self.addCleanup(kb.stop_body_pump)
 
     def test_pump_tick_noop_when_disabled(self):
@@ -1006,13 +1170,16 @@ class BodyPumpTests(_BridgeBase):
         self.assertGreater(kb._last_body_frame_at[0], 0.0)
 
     def test_pump_tick_resets_when_stale(self):
-        rt = _FakeRuntime()   # no body frame ready → never re-stamps freshness
+        rt = _FakeRuntime()   # no body/color frame ready → never re-stamps freshness
         _patch_loader(self, rt)
         kb.get_runtime()
-        # Seed the clock in the deep past so the stale reset fires this tick.
-        kb._last_body_frame_at[0] = time_monotonic_minus(kb.BODY_STALE_RESET_SEC + 5.0)
+        # Seed BOTH clocks in the deep past so the stale reset fires this tick (the
+        # reset now requires BOTH body AND color stale, the preview-keep-alive fix).
+        past = time_monotonic_minus(kb.BODY_STALE_RESET_SEC + 5.0)
+        kb._last_body_frame_at[0] = past
+        kb._last_color_frame_at[0] = past
         kb._pump_tick()
-        self.assertIsNone(kb._runtime[0])   # stale → runtime dropped for reopen
+        self.assertIsNone(kb._runtime[0])   # both stale → runtime dropped for reopen
 
     def test_start_body_pump_singleton_no_double(self):
         kb._ENABLED = True

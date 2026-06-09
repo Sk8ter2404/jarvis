@@ -110,7 +110,15 @@ class DrawSkeletonTests(MonolithGlobalsTestCase):
 
 @requires_monolith
 class ComposeKinectPreviewTests(MonolithGlobalsTestCase):
-    def test_none_when_no_kinect_color_frame(self):
+    def setUp(self):
+        super().setUp()
+        # Clear the preview color cache so a color miss returns None (the keep-
+        # alive fallback only re-serves a frame the compositor previously cached).
+        self.bc._kinect_preview_last_color[0] = None
+        self.addCleanup(
+            lambda: self.bc._kinect_preview_last_color.__setitem__(0, None))
+
+    def test_none_when_no_kinect_color_frame_and_no_cache(self):
         with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
                                return_value=None):
             self.assertIsNone(self.bc._compose_kinect_preview(now=123.0))
@@ -221,7 +229,14 @@ class ComposePreviewFailSafeTests(MonolithGlobalsTestCase):
     optional overlay piece throws. Each piece (a side-tile webcam that won't open
     because Teams locked it, the gesture pop, the tile composite) is independently
     guarded, so one failure is skipped (logged) instead of blanking the preview.
-    The only None is when there's no Kinect color frame at all."""
+    The only None is when there's no Kinect color frame at all AND nothing cached."""
+
+    def setUp(self):
+        super().setUp()
+        # Clear the preview color cache so the no-color None path is exercised.
+        self.bc._kinect_preview_last_color[0] = None
+        self.addCleanup(
+            lambda: self.bc._kinect_preview_last_color.__setitem__(0, None))
 
     def _color(self):
         return _np().full((1080, 1920, 3), 5, dtype=_np().uint8)
@@ -528,13 +543,15 @@ class SideTileWebcamReadTests(MonolithGlobalsTestCase):
 # ══════════════════════════════════════════════════════════════════════════
 @requires_monolith
 class HandCircleDrawTests(MonolithGlobalsTestCase):
-    def _inject_air_mouse_state(self, engaged, grip):
+    def _inject_air_mouse_state(self, engaged, grip, hand="right"):
         """Install a fake skill_kinect_air_mouse exposing the state getter +
-        colour helper the monolith reads."""
+        colour helper the monolith reads. ``hand`` is the published controlling
+        side (the bright ring is drawn ONLY on it while engaged)."""
         import sys
         from skills import kinect_air_mouse as real  # the real pure helpers
         sk = types.ModuleType("skill_kinect_air_mouse")
-        sk.get_air_mouse_state = lambda: {"engaged": engaged, "grip": grip}
+        sk.get_air_mouse_state = lambda: {"engaged": engaged, "grip": grip,
+                                          "hand": hand}
         sk.hand_circle_color_for = real.hand_circle_color_for
         sk.HAND_CIRCLE_COLOR_ENGAGED = real.HAND_CIRCLE_COLOR_ENGAGED
         sk.HAND_CIRCLE_COLOR_CLOSED = real.HAND_CIRCLE_COLOR_CLOSED
@@ -601,17 +618,39 @@ class HandCircleDrawTests(MonolithGlobalsTestCase):
         self.assertFalse(drew)
         self.assertEqual(int(color.max()), 0)
 
-    def test_disengaged_still_draws_only_faint_grey(self):
+    def test_disengaged_draws_NO_ring(self):
+        # FIX (two-hand disambiguation): a DISENGAGED air-mouse draws NO bright ring
+        # at all — this kills the old grey idle ring that always landed on the right
+        # hand and made a relaxed / frozen-preview state look like "the right hand
+        # is still controlling". Nothing is painted on the color frame here.
         np = _np()
-        self._inject_air_mouse_state(engaged=False, grip="open")
+        self._inject_air_mouse_state(engaged=False, grip="open", hand=None)
         color = np.zeros((1080, 1920, 3), dtype=np.uint8)
-        points = {"hand_right": (960, 540)}
-        before = color.copy()
+        points = {"hand_right": (960, 540), "hand_left": (700, 540)}
         drew = self.bc._draw_hand_circle_on_color(color, points)
-        # Idle hint is grey: roughly equal channels where it painted.
-        if drew:
-            b, g, r = self._dominant_circle_color(before, color)
-            self.assertAlmostEqual(b, r, delta=25)   # grey ≈ equal channels
+        self.assertFalse(drew)                       # no ring while disengaged
+        self.assertEqual(int(color.max()), 0)        # nothing painted
+
+    def test_engaged_ring_only_on_controlling_side(self):
+        # The bright ring is drawn on the CONTROLLING side specifically, never an
+        # arbitrary fallback hand. Controlling = LEFT, but only the RIGHT hand
+        # projects → no ring (we don't ring the wrong hand). Then LEFT projects too
+        # → the ring lands on the LEFT hand.
+        np = _np()
+        self._inject_air_mouse_state(engaged=True, grip="open", hand="left")
+        color = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        # Only the right hand projects, but LEFT controls → fallback=False ⇒ nothing.
+        self.assertFalse(
+            self.bc._draw_hand_circle_on_color(color, {"hand_right": (960, 540)}))
+        self.assertEqual(int(color.max()), 0)
+        # Now the controlling (left) hand projects → the ring is drawn.
+        drew = self.bc._draw_hand_circle_on_color(
+            color, {"hand_right": (960, 540), "hand_left": (700, 540)})
+        self.assertTrue(drew)
+        # The painted pixels sit around the LEFT hand (x≈700), not the right.
+        diff = np.any(color != 0, axis=2)
+        xs = np.where(diff.any(axis=0))[0]
+        self.assertLess(int(xs.mean()), 850)         # centred near the left hand
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -662,6 +701,153 @@ class GesturePopDrawTests(MonolithGlobalsTestCase):
         drew = self.bc._draw_gesture_pop_on_color(color, now=_t.monotonic())
         self.assertFalse(drew)
         self.assertEqual(int(color.max()), 0)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  TWO-HAND DISAMBIGUATION — exactly ONE bright ring + ONE faint dot, never two
+#  equal circles, when both hands are up.
+# ══════════════════════════════════════════════════════════════════════════
+@requires_monolith
+class TwoHandCircleTests(MonolithGlobalsTestCase):
+    def _inject_air_mouse_state(self, engaged, hand, grip="open"):
+        import sys
+        from skills import kinect_air_mouse as real
+        sk = types.ModuleType("skill_kinect_air_mouse")
+        sk.get_air_mouse_state = lambda: {"engaged": engaged, "grip": grip,
+                                          "hand": hand}
+        sk.hand_circle_color_for = real.hand_circle_color_for
+        sk.HAND_CIRCLE_COLOR_ENGAGED = real.HAND_CIRCLE_COLOR_ENGAGED
+        sk.HAND_CIRCLE_COLOR_CLOSED = real.HAND_CIRCLE_COLOR_CLOSED
+        sk.HAND_CIRCLE_COLOR_IDLE = real.HAND_CIRCLE_COLOR_IDLE
+        old = sys.modules.get("skill_kinect_air_mouse")
+        sys.modules["skill_kinect_air_mouse"] = sk
+        self.addCleanup(
+            lambda: sys.modules.__setitem__("skill_kinect_air_mouse", old)
+            if old is not None else sys.modules.pop("skill_kinect_air_mouse", None))
+
+    def _both_hands_body(self):
+        # A body with BOTH hands tracked + projecting (the two-hands-up case).
+        return [{"joints": {
+            "spine_shoulder": (0.0, 0.5, 2.0, 2),
+            "shoulder_left": (-0.2, 0.4, 2.0, 2),
+            "hand_left": (-0.4, 0.5, 1.7, 2),
+            "shoulder_right": (0.2, 0.4, 2.0, 2),
+            "hand_right": (0.4, 0.5, 1.7, 2),
+        }}]
+
+    def _mapper(self):
+        # Camera (x, y) → on-frame pixel; the two hands map to distinct x's.
+        return lambda x, y, z: (960 + x * 300.0, 540 - y * 100.0)
+
+    def test_engaged_both_hands_one_bright_ring_other_faint(self):
+        # RIGHT controls. The right hand gets the BIG bright ring; the left
+        # (non-controlling) hand gets only a small faint dot — NOT a second equal
+        # ring. Assert the bright-ring colour appears, and that the left-hand
+        # marker is dimmer/smaller (far fewer bright pixels than the right).
+        np = _np()
+        self._inject_air_mouse_state(engaged=True, hand="right")
+        color = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_space_mapper",
+                               return_value=self._mapper()):
+            drawn = self.bc._draw_skeleton_on_color(color, self._both_hands_body())
+        self.assertEqual(drawn, 1)
+        # The controlling (right) hand projects to x≈1080; the other (left) to
+        # x≈840. Count strongly-painted pixels in a window around each.
+        def _bright_count(cx):
+            strip = color[:, max(0, cx - 60):cx + 60, :]
+            return int((strip.max(axis=2) > 40).sum())
+        right_px = _bright_count(1080)   # controlling: big bright ring
+        left_px = _bright_count(840)     # non-controlling: small faint dot
+        self.assertGreater(right_px, 0)
+        # The controlling-hand mark must be substantially LARGER/brighter than the
+        # non-controlling one (one bright ring vs one faint dot — not two equal).
+        self.assertGreater(right_px, left_px * 2)
+
+    def test_engaged_left_controls_bright_ring_on_left(self):
+        # Symmetry: LEFT controls → the bright ring is on the LEFT hand.
+        np = _np()
+        self._inject_air_mouse_state(engaged=True, hand="left")
+        color = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_space_mapper",
+                               return_value=self._mapper()):
+            self.bc._draw_skeleton_on_color(color, self._both_hands_body())
+
+        def _bright_count(cx):
+            strip = color[:, max(0, cx - 60):cx + 60, :]
+            return int((strip.max(axis=2) > 40).sum())
+        self.assertGreater(_bright_count(840), _bright_count(1080) * 2)
+
+    def test_disengaged_both_hands_no_bright_ring(self):
+        # DISENGAGED with both hands up: NO bright ring anywhere (the relax / stood-
+        # up case can't masquerade as a controlling hand). Joints still draw as the
+        # normal cyan dots, but neither is the big bright air-mouse ring.
+        np = _np()
+        self._inject_air_mouse_state(engaged=False, hand=None)
+        color = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_space_mapper",
+                               return_value=self._mapper()):
+            self.bc._draw_skeleton_on_color(color, self._both_hands_body())
+        # The air-mouse ring radius is ~42px (filled disc); a plain joint dot is 7px.
+        # With no ring, the brightest painted region stays small. Verify no large
+        # solid blob exists around either hand (would be the ~42px ring).
+        from audio import kinect_skeleton as ks
+        ring_r = ks.hand_circle_radius(color.shape[1])
+        self.assertGreater(ring_r, 20)
+
+        def _max_run(cx):
+            # Largest count of bright pixels in any single row near the hand — a
+            # 42px-radius FILLED ring spans ~84px on its centre row; a 7px joint
+            # dot (+ a couple of bones meeting at the hand) stays well under that.
+            strip = color[:, max(0, cx - 80):cx + 80, :]
+            rows = (strip.max(axis=2) > 40).sum(axis=1)
+            return int(rows.max()) if rows.size else 0
+        # < 60 distinguishes a dot+bones (~tens of px) from the ~84px filled ring.
+        self.assertLess(_max_run(1080), 60)   # no wide ring on the right
+        self.assertLess(_max_run(840), 60)    # no wide ring on the left
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  PREVIEW KEEP-ALIVE — a transient Kinect color miss re-serves the last frame
+#  instead of blanking the skeleton tile.
+# ══════════════════════════════════════════════════════════════════════════
+@requires_monolith
+class PreviewColorKeepAliveTests(MonolithGlobalsTestCase):
+    def setUp(self):
+        # Start each test with no cached preview color frame.
+        self.bc._kinect_preview_last_color[0] = None
+        self.addCleanup(
+            lambda: self.bc._kinect_preview_last_color.__setitem__(0, None))
+
+    def test_color_miss_reserves_last_cached_frame(self):
+        np = _np()
+        color = np.full((1080, 1920, 3), 60, dtype=np.uint8)
+        # First compose with a real color frame → caches it + returns a composite.
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
+                               return_value=color), \
+                mock.patch.object(self.bc._kinect_bridge, "get_bodies",
+                                  return_value=[]), \
+                mock.patch.object(self.bc, "_read_side_tile_webcams",
+                                  return_value={"left": None, "right": None}):
+            first = self.bc._compose_kinect_preview(now=1.0)
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(self.bc._kinect_preview_last_color[0])
+        # Now color returns None (a transient gap). The compose must NOT return
+        # None — it re-serves the last cached color frame (preview stays alive).
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
+                               return_value=None), \
+                mock.patch.object(self.bc._kinect_bridge, "get_bodies",
+                                  return_value=[]), \
+                mock.patch.object(self.bc, "_read_side_tile_webcams",
+                                  return_value={"left": None, "right": None}):
+            second = self.bc._compose_kinect_preview(now=2.0)
+        self.assertIsNotNone(second)                 # NOT blanked
+        self.assertEqual(second.shape, color.shape)
+
+    def test_color_miss_with_no_cache_returns_none(self):
+        # The one legitimate None: color miss AND nothing cached yet.
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
+                               return_value=None):
+            self.assertIsNone(self.bc._compose_kinect_preview(now=1.0))
 
 
 if __name__ == "__main__":
