@@ -476,6 +476,97 @@ def _joint_distance(joints: dict) -> Optional[float]:
     return None
 
 
+# ─── arm-extension / forward-reach geometry (the air-mouse engage signal) ───
+# The NEW air-mouse engages on a deliberate REACH — an arm extended OUT toward
+# the sensor — not on a hand merely raised. Two independent cues describe that
+# reach, both read off the SAME tracked skeleton the rest of the stack uses:
+#
+#   • FORWARD-DEPTH: the hand pushed forward of the torso in DEPTH. Kinect z
+#     increases AWAY from the sensor, so a hand reaching toward the sensor has a
+#     SMALLER z than the body. forward_reach = body_z - hand_z (positive when the
+#     hand is in front of the body); the body reference is the spine_mid / spine_
+#     shoulder, falling back to the same-side shoulder.
+#   • ARM-STRAIGHTNESS: the shoulder→hand straight-line 3D distance as a fraction
+#     of the arm's full length (shoulder→elbow + elbow→hand). A relaxed/bent arm
+#     folds the forearm back so the straight-line distance is well short of the
+#     summed bone length; a straightened reach makes them nearly equal (ratio →
+#     1). Using the RATIO (not an absolute metre distance) makes it body-size
+#     independent — it works for a long or short arm without per-user calibration.
+#
+# Both are returned per hand so the air-mouse controller can apply its own
+# engage/disengage hysteresis on whichever cue(s) it wants and pick the more-
+# extended arm to drive the cursor. This helper is PURE (joint dict in, numbers
+# out) and NEVER raises — a missing/untracked joint degrades that field to None.
+
+def _dist3(a, b) -> Optional[float]:
+    """Euclidean 3D distance between two (x, y, z, ...) joint tuples, or None if
+    either is missing / too short. Pure; never raises."""
+    try:
+        if not a or not b or len(a) < 3 or len(b) < 3:
+            return None
+        dx = float(a[0]) - float(b[0])
+        dy = float(a[1]) - float(b[1])
+        dz = float(a[2]) - float(b[2])
+        return (dx * dx + dy * dy + dz * dz) ** 0.5
+    except (TypeError, ValueError):
+        return None
+
+
+def arm_extension(joints: dict, side: str) -> dict:
+    """Describe how EXTENDED one arm (`side` ∈ {"left","right"}) is, for the
+    air-mouse reach-to-engage gate. Reads the shoulder / elbow / hand joints of
+    that side plus a torso depth reference off `joints` (the get_bodies() shape).
+    NEVER raises — any missing joint leaves its field None. Shape:
+
+        {"side": str,
+         "hand": (x, y, z, state) | None,     # the controlling hand joint
+         "forward_reach_m": float | None,     # body_z - hand_z (>0 = reaching)
+         "straightness": float | None,        # 0..~1; chord / summed-bone length
+         "shoulder_hand_m": float | None,     # straight-line shoulder→hand (m)
+         "arm_len_m": float | None}           # shoulder→elbow + elbow→hand (m)
+
+    forward_reach_m is POSITIVE when the hand is pushed toward the sensor (in
+    front of the torso). straightness ≈ 1 when the arm is straightened out, and
+    drops toward ~0.5-0.7 when the elbow is bent and the hand pulled back. The
+    air-mouse engages when forward_reach_m and/or straightness clear its
+    thresholds, and disengages (with hysteresis) when the arm relaxes."""
+    out = {"side": side, "hand": None, "forward_reach_m": None,
+           "straightness": None, "shoulder_hand_m": None, "arm_len_m": None}
+    try:
+        shoulder = joints.get(f"shoulder_{side}")
+        elbow = joints.get(f"elbow_{side}")
+        hand = joints.get(f"hand_{side}") or joints.get(f"wrist_{side}")
+        out["hand"] = hand
+        # FORWARD-DEPTH: hand z vs a torso depth reference (spine first, then the
+        # same-side shoulder). Positive = hand is in front of the body.
+        body_ref = None
+        for name in ("spine_mid", "spine_shoulder", "spine_base"):
+            j = joints.get(name)
+            if j and len(j) >= 3 and float(j[2]) > 0:
+                body_ref = j
+                break
+        if body_ref is None and shoulder and len(shoulder) >= 3:
+            body_ref = shoulder
+        if (body_ref is not None and hand and len(hand) >= 3
+                and float(hand[2]) > 0 and float(body_ref[2]) > 0):
+            out["forward_reach_m"] = float(body_ref[2]) - float(hand[2])
+        # ARM-STRAIGHTNESS: shoulder→hand chord / (shoulder→elbow + elbow→hand).
+        chord = _dist3(shoulder, hand)
+        upper = _dist3(shoulder, elbow)
+        fore = _dist3(elbow, hand)
+        out["shoulder_hand_m"] = chord
+        if upper is not None and fore is not None:
+            arm_len = upper + fore
+            out["arm_len_m"] = arm_len
+            if chord is not None and arm_len > 1e-3:
+                # Cap at 1.0: a near-straight arm can read marginally over 1 from
+                # joint noise; clamp so the ratio is a clean 0..1 straightness.
+                out["straightness"] = min(1.0, chord / arm_len)
+        return out
+    except (TypeError, ValueError, KeyError):
+        return out
+
+
 def _body_is_facing(joints: dict) -> Optional[bool]:
     """Rough 'is this body facing the sensor' heuristic, or None if we can't
     tell. We don't have HD-face orientation in scope, so approximate: the head

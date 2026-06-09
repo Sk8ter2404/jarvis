@@ -681,6 +681,105 @@ class HandStateTests(_BridgeBase):
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# arm-extension / forward-reach geometry (the air-mouse reach-to-engage signal)
+# ─────────────────────────────────────────────────────────────────────────
+# Camera space: x sensor-right, y up, z depth AWAY from the sensor (metres).
+# arm_extension(joints, side) returns forward_reach_m (torso_z - hand_z; >0 when
+# the hand is reaching toward the sensor) and straightness (shoulder→hand chord /
+# summed bone length; ~1 straight, lower when bent). Pure — joints are the
+# (x, y, z, state) tuples get_bodies() emits.
+class ArmExtensionGeometryTests(_BridgeBase):
+    TORSO_Z = 2.0
+
+    def _extended(self, side, forward=0.30):
+        """An EXTENDED arm: hand pushed `forward` m toward the sensor with the
+        elbow on the straight shoulder→hand line (straightness ≈ 1)."""
+        sx = -0.2 if side == "left" else 0.2
+        s = (sx, 0.40, self.TORSO_Z, 2)
+        h = (0.0, 0.30, self.TORSO_Z - forward, 2)
+        e = ((s[0] + h[0]) / 2.0, (s[1] + h[1]) / 2.0, (s[2] + h[2]) / 2.0, 2)
+        return {"spine_mid": (0.0, 0.0, self.TORSO_Z, 2),
+                f"shoulder_{side}": s, f"elbow_{side}": e, f"hand_{side}": h}
+
+    def _relaxed(self, side):
+        """A RELAXED arm: hand at torso depth (no forward reach) with a deeply
+        bent elbow (forearm folded forward) → low straightness."""
+        sx = -0.2 if side == "left" else 0.2
+        s = (sx, 0.40, self.TORSO_Z, 2)
+        h = (0.0, 0.30, self.TORSO_Z, 2)            # no forward reach
+        e = (sx, 0.35, self.TORSO_Z - 0.30, 2)      # elbow forward → big bend
+        return {"spine_mid": (0.0, 0.0, self.TORSO_Z, 2),
+                f"shoulder_{side}": s, f"elbow_{side}": e, f"hand_{side}": h}
+
+    def test_dist3_euclidean(self):
+        self.assertAlmostEqual(kb._dist3((0, 0, 0, 2), (3, 4, 0, 2)), 5.0)
+        self.assertAlmostEqual(kb._dist3((0, 0, 0), (0, 0, 2)), 2.0)
+
+    def test_dist3_none_on_missing_joint(self):
+        self.assertIsNone(kb._dist3(None, (1, 2, 3)))
+        self.assertIsNone(kb._dist3((1, 2), (3, 4)))   # too short
+
+    def test_extended_arm_forward_and_straight(self):
+        ext = kb.arm_extension(self._extended("right", forward=0.30), "right")
+        self.assertEqual(ext["side"], "right")
+        # Hand ~0.30 m in front of the torso, arm near-straight.
+        self.assertAlmostEqual(ext["forward_reach_m"], 0.30, delta=0.02)
+        self.assertGreater(ext["straightness"], 0.95)
+        self.assertIsNotNone(ext["hand"])
+
+    def test_relaxed_arm_not_forward_and_bent(self):
+        ext = kb.arm_extension(self._relaxed("right"), "right")
+        # No forward reach (~0) and clearly bent (straightness well under 1).
+        self.assertLess(ext["forward_reach_m"], 0.05)
+        self.assertLess(ext["straightness"], 0.85)
+
+    def test_straightness_capped_at_one(self):
+        # A perfectly straight arm can read marginally over 1 from rounding; the
+        # helper clamps to 1.0.
+        ext = kb.arm_extension(self._extended("right", forward=0.30), "right")
+        self.assertLessEqual(ext["straightness"], 1.0)
+
+    def test_forward_reach_negative_when_hand_behind_torso(self):
+        # Hand BEHIND the torso (larger z) → negative forward reach (not reaching).
+        joints = {"spine_mid": (0, 0, 2.0, 2),
+                  "shoulder_right": (0.2, 0.4, 2.0, 2),
+                  "elbow_right": (0.2, 0.2, 2.1, 2),
+                  "hand_right": (0.2, 0.1, 2.2, 2)}
+        ext = kb.arm_extension(joints, "right")
+        self.assertLess(ext["forward_reach_m"], 0.0)
+
+    def test_missing_joints_degrade_to_none_fields(self):
+        # No arm joints at all → every cue None, never raises.
+        ext = kb.arm_extension({"spine_mid": (0, 0, 2.0, 2)}, "right")
+        self.assertIsNone(ext["forward_reach_m"])
+        self.assertIsNone(ext["straightness"])
+        self.assertIsNone(ext["hand"])
+
+    def test_uses_shoulder_when_no_spine_reference(self):
+        # With no spine joints, the same-side shoulder is the depth reference.
+        joints = {"shoulder_right": (0.2, 0.4, 2.0, 2),
+                  "elbow_right": (0.1, 0.3, 1.85, 2),
+                  "hand_right": (0.0, 0.3, 1.7, 2)}
+        ext = kb.arm_extension(joints, "right")
+        self.assertIsNotNone(ext["forward_reach_m"])
+        self.assertGreater(ext["forward_reach_m"], 0.0)   # hand in front of shoulder
+
+    def test_left_and_right_are_independent(self):
+        joints = {}
+        joints.update(self._extended("right", forward=0.30))
+        joints.update(self._relaxed("left"))
+        right = kb.arm_extension(joints, "right")
+        left = kb.arm_extension(joints, "left")
+        self.assertGreater(right["forward_reach_m"], 0.20)   # right is reaching
+        self.assertLess(left["forward_reach_m"], 0.05)       # left is relaxed
+
+    def test_never_raises_on_garbage(self):
+        # Non-tuple joints / wrong shapes degrade, never raise.
+        self.assertIsInstance(kb.arm_extension({"hand_right": None}, "right"), dict)
+        self.assertIsInstance(kb.arm_extension({}, "right"), dict)
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # head-facing yaw (joint-derived gaze; the Kinect v2 Face API is absent on
 # this pykinect2 build, so facing is recovered from the shoulder line)
 # ─────────────────────────────────────────────────────────────────────────

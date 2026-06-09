@@ -3616,12 +3616,15 @@ def _draw_hand_circle_on_color(color_bgr: "np.ndarray",
         from audio import kinect_skeleton as _ks
     except Exception:
         return False
-    pt = _ks.controlling_hand_point(points)
-    if pt is None:
-        return False
     state = _air_mouse_state_for_preview()
     engaged = bool(state.get("engaged"))
     grip = str(state.get("grip", "open"))
+    # Draw the circle on whichever hand the air-mouse is CURRENTLY driving with
+    # (the reach-to-engage model picks the extended arm, left OR right); falls
+    # back to the default hand order when disengaged / no side reported.
+    pt = _ks.controlling_hand_point(points, prefer_side=state.get("hand"))
+    if pt is None:
+        return False
     # Disengaged → only a faint idle hint; engaged → a bold blue/orange ring.
     sk = sys.modules.get("skill_kinect_air_mouse")
     color_fn = getattr(sk, "hand_circle_color_for", None) if sk else None
