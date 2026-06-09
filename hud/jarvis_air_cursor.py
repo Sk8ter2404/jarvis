@@ -107,6 +107,17 @@ GOLD          = "#ffb347"
 GOLD_BRIGHT   = "#ffe0a0"
 GOLD_DIM      = "#7a5a23"
 
+# TWO-HAND reticles (Part 3): the owner wants to SEE two circle cursors, one per
+# hand, while both hands are engaged. BLUE normally; PURPLE while a window is being
+# actively grabbed/resized. (These are overlay-drawn circles — the real OS mouse
+# stays single; we just draw two reticles.)
+BLUE          = "#3aa0ff"
+BLUE_BRIGHT   = "#9fd0ff"
+BLUE_DIM      = "#1c4f80"
+PURPLE        = "#b06cff"
+PURPLE_BRIGHT = "#e0c0ff"
+PURPLE_DIM    = "#502080"
+
 TRAIL_COLOR   = "#2f7fa3"   # faint cyan for the motion trail
 
 # Geometry (pixels).
@@ -245,6 +256,22 @@ class AirCursorOverlay:
         self._win_x      = None      # last placed window top-left (to avoid
         self._win_y      = None      # redundant geometry() churn)
 
+        # TWO-HAND mode (Part 3): when both hands are engaged the air-mouse / two-
+        # hand skill publish two hand points; we draw TWO circle reticles (BLUE,
+        # PURPLE while resizing). The FIRST hand reuses this window; the SECOND uses
+        # a lazily-built identical small click-through window so the two reticles can
+        # sit far apart (even on different monitors) without ever painting a large
+        # surface (the full-desktop-blackout failure mode). One-hand mode keeps the
+        # single cyan reticle and hides the second window.
+        self.two_hand     = False        # both-hands mode active this frame
+        self.two_resizing = False        # a window is being actively resized → PURPLE
+        self.hand_pts     = None         # [(x, y), (x, y)] virtual-desktop px, or None
+        self.root2        = None         # the 2nd hand's window (lazy)
+        self.canvas2      = None
+        self._win2_x      = None
+        self._win2_y      = None
+        self._has_colorkey2 = False
+
         self.root = tk.Tk()
         self.root.title("JARVIS Air Cursor")
         self.root.configure(bg=BG_KEY)
@@ -288,20 +315,23 @@ class AirCursorOverlay:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.tick()
 
-    def _make_click_through_win32(self):
+    def _make_click_through_win32(self, win=None, has_colorkey=None):
+        win = self.root if win is None else win
+        if has_colorkey is None:
+            has_colorkey = self._has_colorkey
         try:
             if os.name != "nt":
                 return
             import ctypes
-            self.root.update_idletasks()
+            win.update_idletasks()
             # The real top-level window is the parent of the Tk toplevel's
             # window id (Tk wraps the toplevel in a frame on Win32). Walk up from
             # the TOPLEVEL — not the canvas — so we style the actual HWND Tk
             # colour-keyed; styling a child would leave the toplevel opaque.
             user32 = ctypes.windll.user32
-            hwnd = user32.GetParent(self.root.winfo_id())
+            hwnd = user32.GetParent(win.winfo_id())
             if not hwnd:
-                hwnd = self.root.winfo_id()
+                hwnd = win.winfo_id()
             cur = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
             user32.SetWindowLongW(
                 hwnd, GWL_EXSTYLE, _click_through_exstyle(cur))
@@ -311,7 +341,7 @@ class AirCursorOverlay:
             # SetLayeredWindowAttributes/UpdateLayeredWindow composites OPAQUE.
             # (When -transparentcolor was unavailable we skip the key and rely on
             # the -alpha fallback set above.)
-            if self._has_colorkey:
+            if has_colorkey:
                 user32.SetLayeredWindowAttributes(
                     hwnd, _colorref(BG_KEY), 0, LWA_COLORKEY)
         except Exception:
@@ -320,28 +350,89 @@ class AirCursorOverlay:
             pass
 
     def _on_close(self):
-        try:
-            self.root.destroy()
-        except Exception:
-            pass
+        for w in (getattr(self, "root2", None), getattr(self, "root", None)):
+            try:
+                if w is not None:
+                    w.destroy()
+            except Exception:
+                pass
+
+    def _clamp_window_xy(self, vx: float, vy: float) -> "tuple[int, int]":
+        """Top-left for a WINDOW_SIZE window centred at virtual-desktop (vx, vy),
+        clamped onto the desktop span (defensive against bogus state values)."""
+        wx = int(round(vx)) - WINDOW_HALF
+        wy = int(round(vy)) - WINDOW_HALF
+        min_x, min_y = self.origin_x, self.origin_y
+        max_x = self.origin_x + max(0, self.span_w - WINDOW_SIZE)
+        max_y = self.origin_y + max(0, self.span_h - WINDOW_SIZE)
+        return min(max(wx, min_x), max_x), min(max(wy, min_y), max_y)
 
     def _place_window(self, vx: float, vy: float):
         """Move the small window so its CENTRE sits at virtual-desktop (vx, vy),
         clamped to stay within the desktop span. No-op when it wouldn't move (so
         we don't thrash geometry() at 60fps when the cursor is still)."""
-        wx = int(round(vx)) - WINDOW_HALF
-        wy = int(round(vy)) - WINDOW_HALF
-        # Clamp the window onto the desktop span so it never drifts to a bogus
-        # coordinate (defensive against stale/garbage state values).
-        min_x, min_y = self.origin_x, self.origin_y
-        max_x = self.origin_x + max(0, self.span_w - WINDOW_SIZE)
-        max_y = self.origin_y + max(0, self.span_h - WINDOW_SIZE)
-        wx = min(max(wx, min_x), max_x)
-        wy = min(max(wy, min_y), max_y)
+        wx, wy = self._clamp_window_xy(vx, vy)
         if wx == self._win_x and wy == self._win_y:
             return
         self._win_x, self._win_y = wx, wy
         self.root.geometry(f"{WINDOW_SIZE}x{WINDOW_SIZE}+{wx}+{wy}")
+
+    # ── TWO-HAND second reticle window (Part 3) ────────────────────────────
+    def _ensure_second_window(self):
+        """Lazily build the SECOND hand's small click-through window (identical to
+        the first: WINDOW_SIZE, colour-keyed transparent, topmost, click-through).
+        Built only the first time two-hand mode is entered so single-hand mode pays
+        nothing. NEVER raises — a failure just means the 2nd reticle won't show."""
+        if self.root2 is not None:
+            return
+        try:
+            self.root2 = tk.Toplevel(self.root)
+            self.root2.title("JARVIS Air Cursor 2")
+            self.root2.configure(bg=BG_KEY)
+            self.root2.overrideredirect(True)
+            self.root2.attributes("-topmost", True)
+            self._has_colorkey2 = False
+            try:
+                self.root2.attributes("-transparentcolor", BG_KEY)
+                self._has_colorkey2 = True
+            except tk.TclError:
+                try:
+                    self.root2.attributes("-alpha", 0.78)
+                except Exception:
+                    pass
+            sx = self.origin_x + max(0, (self.span_w - WINDOW_SIZE) // 2)
+            sy = self.origin_y + max(0, (self.span_h - WINDOW_SIZE) // 2)
+            self.root2.geometry(f"{WINDOW_SIZE}x{WINDOW_SIZE}+{sx}+{sy}")
+            self._win2_x, self._win2_y = sx, sy
+            self.canvas2 = tk.Canvas(
+                self.root2, bg=BG_KEY, width=WINDOW_SIZE, height=WINDOW_SIZE,
+                highlightthickness=0, bd=0)
+            self.canvas2.pack(fill="both", expand=True)
+            self._make_click_through_win32(self.root2, self._has_colorkey2)
+        except Exception:
+            self.root2 = None
+            self.canvas2 = None
+
+    def _place_window2(self, vx: float, vy: float):
+        if self.root2 is None:
+            return
+        wx, wy = self._clamp_window_xy(vx, vy)
+        if wx == self._win2_x and wy == self._win2_y:
+            return
+        self._win2_x, self._win2_y = wx, wy
+        try:
+            self.root2.geometry(f"{WINDOW_SIZE}x{WINDOW_SIZE}+{wx}+{wy}")
+        except Exception:
+            pass
+
+    def _hide_second_window(self):
+        if self.root2 is None:
+            return
+        try:
+            if self.root2.state() != "withdrawn":
+                self.root2.withdraw()
+        except Exception:
+            pass
 
     # ── drawing ──────────────────────────────────────────────────────────
     def _palette(self):
@@ -349,6 +440,42 @@ class AirCursorOverlay:
         if self.state == "grab":
             return GOLD, GOLD_BRIGHT, GOLD, GOLD_BRIGHT
         return CYAN, CYAN_BRIGHT, CYAN, CYAN_BRIGHT
+
+    def _two_hand_palette(self):
+        """(outer, inner, dim) for a TWO-HAND reticle: PURPLE while actively
+        resizing a window, else BLUE."""
+        if self.two_resizing:
+            return PURPLE, PURPLE_BRIGHT, PURPLE_DIM
+        return BLUE, BLUE_BRIGHT, BLUE_DIM
+
+    def _draw_two_hand_circle(self, canvas, cx: float, cy: float):
+        """Draw ONE two-hand reticle circle (a clean concentric ring + crosshair +
+        centre dot) at the window-local (cx, cy). BLUE normally, PURPLE while
+        resizing. Drawn into whichever canvas (hand 1 or hand 2) is passed."""
+        outer, inner, dim = self._two_hand_palette()
+        pulse = 0.5 * (1.0 + math.sin(self.frame * PULSE_SPEED))
+        radius = RING_RADIUS_TRACK + 2.0 * pulse
+        # Soft dim glow ring.
+        glow_r = GLOW_RADIUS_TRACK
+        if glow_r > radius:
+            canvas.create_oval(cx - glow_r, cy - glow_r, cx + glow_r, cy + glow_r,
+                               outline=dim, width=1)
+        # Outer + inner ring.
+        canvas.create_oval(cx - radius, cy - radius, cx + radius, cy + radius,
+                           outline=outer, width=3)
+        inner_r = max(3, radius - INNER_OFFSET)
+        canvas.create_oval(cx - inner_r, cy - inner_r, cx + inner_r, cy + inner_r,
+                           outline=inner, width=1)
+        # Short crosshair ticks for a precise centre.
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            canvas.create_line(
+                cx + dx * (inner_r - 1), cy + dy * (inner_r - 1),
+                cx + dx * (inner_r - 1 - 7), cy + dy * (inner_r - 1 - 7),
+                fill=inner, width=1)
+        # Centre dot.
+        canvas.create_oval(cx - CENTER_DOT_R, cy - CENTER_DOT_R,
+                           cx + CENTER_DOT_R, cy + CENTER_DOT_R,
+                           fill=inner, outline="")
 
     def _draw_reticle(self, cx: float, cy: float):
         is_grab = (self.state == "grab")
@@ -445,6 +572,25 @@ class AirCursorOverlay:
                 outline="",
             )
 
+    @staticmethod
+    def _parse_hand_pts(raw):
+        """Parse the published two-hand points [{x,y},{x,y}] → [(x,y),(x,y)] in
+        virtual-desktop px, or None when malformed. Tolerant of bad data."""
+        try:
+            if not isinstance(raw, (list, tuple)) or len(raw) < 2:
+                return None
+            out = []
+            for h in raw[:2]:
+                if isinstance(h, dict):
+                    out.append((int(h.get("x", 0)), int(h.get("y", 0))))
+                elif isinstance(h, (list, tuple)) and len(h) >= 2:
+                    out.append((int(h[0]), int(h[1])))
+                else:
+                    return None
+            return out
+        except (TypeError, ValueError):
+            return None
+
     # ── per-frame update ──────────────────────────────────────────────────
     def _refresh_state(self):
         """Pull the latest published cursor state + decide visibility. Returns
@@ -478,6 +624,27 @@ class AirCursorOverlay:
         if state not in ("track", "grab"):
             want_visible = False
 
+        # ── TWO-HAND mode (Part 3): the air-mouse / two-hand skill publishes
+        #    {"two_hand": True, "hands": [{x,y},{x,y}], "resizing": bool}. Parse the
+        #    two hand points; we draw TWO circle reticles (BLUE, PURPLE while
+        #    resizing) instead of the single cyan reticle. A stale/false frame falls
+        #    back to single-hand. ───────────────────────────────────────────────
+        self.two_hand = False
+        self.two_resizing = False
+        self.hand_pts = None
+        if fresh and bool(data.get("two_hand")):
+            pts = self._parse_hand_pts(data.get("hands"))
+            if pts is not None:
+                self.two_hand = True
+                self.two_resizing = bool(data.get("resizing"))
+                self.hand_pts = pts
+                self.visible = True
+                # The single-hand reticle is suppressed while two-hand is active.
+                self.state = "hidden"
+                self.color_name = str(data.get("color", "blue") or "blue").lower()
+                self._was_grab = False
+                return True
+
         # Latch grab-flash on the rising edge into "grab".
         if state == "grab" and not self._was_grab:
             self._grab_flash = GRAB_FLASH_TICKS
@@ -510,6 +677,40 @@ class AirCursorOverlay:
                     self.trail = []
         return True
 
+    def _draw_two_hand_into(self, canvas):
+        """Repaint one two-hand window's canvas with a single reticle at its centre
+        (the window is moved to the hand; the reticle is always centred)."""
+        canvas.delete("all")
+        canvas.create_rectangle(0, 0, WINDOW_SIZE, WINDOW_SIZE,
+                                fill=BG_KEY, outline="")
+        self._draw_two_hand_circle(canvas, WINDOW_HALF, WINDOW_HALF)
+
+    def _tick_two_hand(self):
+        """Render the two hand reticles: window 1 (this overlay's existing window) at
+        hand 0, window 2 (the lazily-built companion) at hand 1. Each draws a single
+        BLUE (PURPLE while resizing) circle at its centre."""
+        (h0x, h0y), (h1x, h1y) = self.hand_pts[0], self.hand_pts[1]
+        # Hand 1 → the primary window.
+        try:
+            if self.root.state() == "withdrawn":
+                self.root.deiconify()
+                self.root.attributes("-topmost", True)
+        except Exception:
+            pass
+        self._place_window(h0x, h0y)
+        self._draw_two_hand_into(self.canvas)
+        # Hand 2 → the companion window (build on first use).
+        self._ensure_second_window()
+        if self.root2 is not None and self.canvas2 is not None:
+            try:
+                if self.root2.state() == "withdrawn":
+                    self.root2.deiconify()
+                    self.root2.attributes("-topmost", True)
+            except Exception:
+                pass
+            self._place_window2(h1x, h1y)
+            self._draw_two_hand_into(self.canvas2)
+
     def tick(self):
         if not self._refresh_state():
             self._on_close()
@@ -518,6 +719,19 @@ class AirCursorOverlay:
         self.frame += 1
         if self._grab_flash > 0:
             self._grab_flash -= 1
+
+        # ── TWO-HAND mode: draw TWO circle reticles (one per hand) and skip the
+        #    single-hand path. Each hand gets its own small click-through window so
+        #    the two circles can sit far apart (even on different monitors) without
+        #    ever painting a large surface. ────────────────────────────────────
+        if self.two_hand and self.hand_pts is not None:
+            self._tick_two_hand()
+            self._prev_visible = True
+            self.root.after(TICK_MS, self.tick)
+            return
+        # Left two-hand mode (or never in it): hide the 2nd window so a stale 2nd
+        # reticle can't linger.
+        self._hide_second_window()
 
         # Idle short-circuit: nothing visible now and nothing last frame either
         # → hide the window and back off to a slow poll. (A small window costs

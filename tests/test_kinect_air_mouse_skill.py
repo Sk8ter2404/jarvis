@@ -457,191 +457,82 @@ class VirtualDesktopMappingTests(_Base):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  FIX 1 — TABLET-FEEL mapping: aspect-matched (no stretch) + body-relative +
-#  absolute. The reach plane IS the monitors: hand corner → desktop corner, X/Y
-#  scale equally per the desktop aspect, and the plane is centred on the BODY so
-#  the same hand offset maps to the same cursor spot wherever the owner sits.
+#  REVERT (2026-06-09): the v1.73.0 "tablet-feel" mapping (aspect-match +
+#  body-relative + absolute remap + KINECT_REACH_HALF_W env knob + nx/ny) was
+#  JITTERY and unwanted. The single-hand cursor mapping is restored to v1.72.0
+#  (fixed-centre reach-box, plain 2-arg ReachBox.map). The four tablet test
+#  classes that pinned that behaviour are intentionally GONE; ReachBoxTests +
+#  VirtualDesktopMappingTests above assert the restored v1.72.0 mapping, and the
+#  SingleHandRevertedMappingTests below assert the controller drives the cursor
+#  through the plain fixed-centre box (NO body args).
 # ══════════════════════════════════════════════════════════════════════════
-class TabletAspectMatchTests(_Base):
-    """The plane half-HEIGHT is DERIVED from the half-WIDTH × desktop aspect, so X
-    and Y scale EQUALLY (no stretch). A hand moved the same real distance H vs V
-    moves the cursor the same FRACTION of the screen."""
+class SingleHandRevertedMappingTests(_Base):
+    """The reverted v1.72.0 single-hand mapping: the controller feeds the smoothed
+    hand (x, y) straight into ReachBox.map(sx, sy) with NO body centring / aspect
+    derivation. A raised hand engages and the cursor lands where the FIXED-centre
+    box maps it; sliding the body (without changing the absolute hand X) MOVES the
+    cursor (it is sensor-absolute again, not body-relative)."""
 
-    def test_half_h_derives_from_aspect(self):
+    def _ctrl(self, mod):
+        return mod.AirMouseController(mod.ReachBox(2560, 1440),
+                                      debounce_frames=1, grace_sec=0.0,
+                                      engage_debounce_frames=1)
+
+    def test_cursor_matches_fixed_centre_box_map(self):
         mod = self._load()
-        # 2560×1440 (16:9): derived half_h = half_w × 1440/2560.
-        rb = mod.ReachBox(2560, 1440, half_w=0.26)
-        self.assertAlmostEqual(rb.half_w, 0.26, delta=1e-9)
-        self.assertAlmostEqual(rb.half_h, 0.26 * (1440.0 / 2560.0), delta=1e-6)
+        c = self._ctrl(mod)
+        rb = mod.ReachBox(2560, 1440)
+        relaxed_l = mod.ArmExtension("left", forward_m=0.0, straightness=None,
+                                     hand=(-0.1, 0.0, 2.0, 2), lift_m=-0.40,
+                                     shoulder_ref_y=0.40)
+        # A raised RIGHT hand at a known camera (x, y). The cursor must equal the
+        # PLAIN fixed-centre box map of that same (x, y) — body refs are ignored.
+        hx, hy = 0.10, 0.55
+        arm = mod.ArmExtension("right", forward_m=0.0, straightness=None,
+                               hand=(hx, hy, 1.8, 2), lift_m=0.15,
+                               shoulder_ref_y=0.40)
+        d = c.update(relaxed_l, arm, "open", "open", True)
+        self.assertIsNotNone(d.cursor)
+        # EMA seeds to the first sample, so the mapped pixel is the box map of (hx, hy).
+        self.assertEqual(d.cursor, rb.map(hx, hy))
 
-    def test_half_h_tracks_a_taller_desktop(self):
+    def test_body_shift_moves_cursor_absolute_again(self):
         mod = self._load()
-        # A 1:1 desktop → half_h == half_w (square plane, square screen).
-        rb = mod.ReachBox(2000, 2000, half_w=0.26)
-        self.assertAlmostEqual(rb.half_h, rb.half_w, delta=1e-6)
-        # A very WIDE desktop (3:1) → a much SHORTER plane (half_h = half_w/3).
-        rb2 = mod.ReachBox(6000, 2000, half_w=0.30)
-        self.assertAlmostEqual(rb2.half_h, 0.30 / 3.0, delta=1e-6)
-
-    def test_equal_hand_move_equal_screen_pixels(self):
-        mod = self._load()
-        # THE NO-STRETCH GUARANTEE: because half_h = half_w × (H/W), the same real
-        # hand delta in X and in Y moves the cursor the same number of PIXELS on
-        # screen (not the same fraction) — so neither axis feels faster/twitchier
-        # than the other. Body-relative, centred.
-        W, H = 2560, 1440
-        rb = mod.ReachBox(W, H, half_w=0.26)
-        cx, cy = rb.map(0.0, 0.40, body_x=0.0, body_y=0.40)
-        d = 0.05   # 5 cm hand move, same in both axes
-        x_moved = rb.map(d, 0.40, body_x=0.0, body_y=0.40)[0] - cx
-        y_moved = cy - rb.map(0.0, 0.40 + d, body_x=0.0, body_y=0.40)[1]  # up→ -py
-        # Equal PIXEL travel for an equal hand move (the aspect-match invariant).
-        self.assertGreater(x_moved, 0)
-        self.assertGreater(y_moved, 0)
-        self.assertAlmostEqual(x_moved, y_moved, delta=2)   # within rounding
-
-
-class TabletAbsoluteCornerTests(_Base):
-    """ABSOLUTE mapping: the hand at a plane CORNER maps to the matching desktop
-    CORNER (top-left→top-left, bottom-right→bottom-right), measured body-relative."""
-
-    def _rb(self, mod):
-        # An off-origin virtual desktop to prove the corners track the real bounds.
-        return mod.ReachBox(7680, 2160, origin_x=-1280, origin_y=-120, half_w=0.26)
-
-    def test_corners_map_to_desktop_corners(self):
-        mod = self._load()
-        rb = self._rb(mod)
-        bx, by = 0.10, 0.42       # arbitrary body centre — corners are relative to it
-        hw, hh = rb.half_w, rb.half_h
-        # plane top-LEFT  (hand left = bx-hw; hand UP = centreY + hh) → desktop TL.
-        tl = rb.map(bx - hw, (by + mod.REACH_CENTER_Y_OFFSET) + hh,
-                    body_x=bx, body_y=by)
-        # plane bottom-RIGHT (hand right = bx+hw; hand DOWN = centreY - hh) → BR.
-        br = rb.map(bx + hw, (by + mod.REACH_CENTER_Y_OFFSET) - hh,
-                    body_x=bx, body_y=by)
-        self.assertEqual(tl, (rb.origin_x, rb.origin_y))
-        self.assertEqual(br, (rb.origin_x + rb.screen_w - 1,
-                              rb.origin_y + rb.screen_h - 1))
-
-    def test_centre_maps_to_desktop_centre(self):
-        mod = self._load()
-        rb = self._rb(mod)
-        bx, by = -0.05, 0.33
-        # Hand at the plane centre (body X, shoulder Y + comfort offset) → desktop
-        # centre, regardless of where the body sits.
-        px, py = rb.map(bx, by + mod.REACH_CENTER_Y_OFFSET, body_x=bx, body_y=by)
-        self.assertAlmostEqual(px, rb.origin_x + (rb.screen_w - 1) // 2, delta=2)
-        self.assertAlmostEqual(py, rb.origin_y + (rb.screen_h - 1) // 2, delta=2)
-
-    def test_absolute_not_relative_same_hand_same_cursor(self):
-        mod = self._load()
-        rb = self._rb(mod)
-        bx, by = 0.0, 0.40
-        # ABSOLUTE: the SAME hand position always maps to the SAME pixel — not a
-        # velocity/relative accumulation. Two identical samples → identical cursor.
-        a = rb.map(0.12, 0.55, body_x=bx, body_y=by)
-        b = rb.map(0.12, 0.55, body_x=bx, body_y=by)
-        self.assertEqual(a, b)
-        # And up = up: a higher hand → a SMALLER py (closer to the top).
-        hi = rb.map(0.12, 0.60, body_x=bx, body_y=by)[1]
-        lo = rb.map(0.12, 0.50, body_x=bx, body_y=by)[1]
-        self.assertLess(hi, lo)
-
-
-class TabletBodyRelativeTests(_Base):
-    """BODY-RELATIVE centring: the SAME hand OFFSET from the body maps to the SAME
-    cursor spot no matter where the body is in the frame (owner sits/stands/shifts)."""
-
-    def test_same_offset_different_body_same_cursor(self):
-        mod = self._load()
-        rb = mod.ReachBox(2560, 1440, half_w=0.26)
-        off_x, off_y = 0.13, 0.06    # hand 13 cm right + 6 cm above the plane centre
-        cursors = []
-        for bx, by in ((0.0, 0.40), (0.5, 0.55), (-0.4, 0.25), (0.9, 0.70)):
-            cy_center = by + mod.REACH_CENTER_Y_OFFSET
-            cursors.append(rb.map(bx + off_x, cy_center + off_y,
-                                  body_x=bx, body_y=by))
-        # Every body position yields the SAME cursor pixel for the same hand offset.
-        self.assertEqual(len(set(cursors)), 1)
-
-    def test_body_shift_without_hand_offset_change_does_not_move_cursor(self):
-        mod = self._load()
-        rb = mod.ReachBox(2560, 1440, half_w=0.26)
-        # The owner slides 40 cm to the right but keeps the hand the SAME distance
-        # right-of-centre: the cursor must NOT move (it's body-relative, not absolute
-        # camera X). Both hand AND body shift by +0.40.
-        a = rb.map(0.10, 0.50, body_x=0.0, body_y=0.40)
-        b = rb.map(0.50, 0.50, body_x=0.40, body_y=0.40)
-        self.assertEqual(a, b)
-
-    def test_controller_maps_body_relative_via_extension(self):
-        mod = self._load()
-        c = mod.AirMouseController(mod.ReachBox(2560, 1440, half_w=0.26),
-                                   debounce_frames=1, grace_sec=0.0,
-                                   engage_debounce_frames=1)
+        rb = mod.ReachBox(2560, 1440)
         # Two raised RIGHT-hand samples with the SAME hand-minus-body offset but the
-        # whole body shifted: the controller (which feeds body_center_x +
-        # shoulder_ref_y into the plane) must produce the SAME cursor for both.
+        # whole body shifted. Under the REVERTED (sensor-absolute) mapping the cursor
+        # follows the ABSOLUTE hand X, so the two map to DIFFERENT pixels (the v1.73.0
+        # body-relative behaviour, where both mapped to the same pixel, is gone).
+        relaxed_l = mod.ArmExtension("left", forward_m=0.0, straightness=None,
+                                     hand=(-0.1, 0.0, 2.0, 2), lift_m=-0.40,
+                                     shoulder_ref_y=0.40)
+
         def arm(body_x, hand_dx, shoulder_y=0.40):
             return mod.ArmExtension(
                 "right", forward_m=0.0, straightness=None,
                 hand=(body_x + hand_dx, shoulder_y + 0.20, 1.8, 2),
-                lift_m=0.20, shoulder_ref_y=shoulder_y, body_center_x=body_x)
-        relaxed_l = mod.ArmExtension("left", forward_m=0.0, straightness=None,
-                                     hand=(-0.1, 0.0, 2.0, 2), lift_m=-0.40,
-                                     shoulder_ref_y=0.40, body_center_x=0.0)
-        d1 = c.update(relaxed_l, arm(0.0, 0.15), "open", "open", True)
-        c.reset()
-        d2 = c.update(relaxed_l, arm(0.6, 0.15), "open", "open", True)
+                lift_m=0.20, shoulder_ref_y=shoulder_y)
+        c1 = self._ctrl(mod)
+        d1 = c1.update(relaxed_l, arm(0.0, 0.15), "open", "open", True)
+        c2 = self._ctrl(mod)
+        d2 = c2.update(relaxed_l, arm(0.6, 0.15), "open", "open", True)
         self.assertIsNotNone(d1.cursor)
-        self.assertEqual(d1.cursor, d2.cursor)   # same offset → same cursor
+        self.assertNotEqual(d1.cursor, d2.cursor)   # absolute hand X → different cursor
+        # And each equals the plain box map of its absolute hand position.
+        self.assertEqual(d1.cursor, rb.map(0.0 + 0.15, 0.40 + 0.20))
+        self.assertEqual(d2.cursor, rb.map(0.6 + 0.15, 0.40 + 0.20))
 
-    def test_falls_back_to_fixed_centre_without_body(self):
+    def test_map_takes_no_body_kwargs(self):
         mod = self._load()
-        rb = mod.ReachBox(2560, 1440, half_w=0.26)
-        # With NO body reference, map() centres on the fixed plane centre (legacy):
-        # the plane centre maps to the desktop centre.
-        px, py = rb.map(mod.REACH_CENTER_X, mod.REACH_CENTER_Y)
-        self.assertAlmostEqual(px, (2560 - 1) // 2, delta=2)
-        self.assertAlmostEqual(py, (1440 - 1) // 2, delta=2)
-
-
-class ReachHalfWidthEnvTests(_Base):
-    """KINECT_REACH_HALF_W tunes the plane half-WIDTH live (the height derives from
-    it via the desktop aspect); nx/ny are exposed for tuning."""
-
-    def test_env_overrides_half_width(self):
-        mod = self._load()
-        with mock.patch.dict(os.environ, {"KINECT_REACH_HALF_W": "0.40"}):
-            self.assertAlmostEqual(mod.reach_half_w(), 0.40, delta=1e-9)
-            rb = mod.ReachBox(2560, 1440)   # half_w None → reads the env
-            self.assertAlmostEqual(rb.half_w, 0.40, delta=1e-9)
-            # Height still derives from the (overridden) width × aspect.
-            self.assertAlmostEqual(rb.half_h, 0.40 * (1440.0 / 2560.0), delta=1e-6)
-
-    def test_env_unset_uses_default(self):
-        mod = self._load()
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("KINECT_REACH_HALF_W", None)
-            self.assertAlmostEqual(mod.reach_half_w(), mod.REACH_HALF_W, delta=1e-9)
-
-    def test_env_garbage_falls_back(self):
-        mod = self._load()
-        with mock.patch.dict(os.environ, {"KINECT_REACH_HALF_W": "not-a-number"}):
-            self.assertAlmostEqual(mod.reach_half_w(), mod.REACH_HALF_W, delta=1e-9)
-
-    def test_normalize_reports_nx_ny_in_range(self):
-        mod = self._load()
-        rb = mod.ReachBox(2560, 1440, half_w=0.26)
-        bx, by = 0.0, 0.40
-        # Hand a quarter of the way right of centre → nx ≈ +0.25; a touch above the
-        # plane centre → ny negative (up). The debug line surfaces these.
-        nx, ny = rb.normalize(0.0 + 0.25 * rb.half_w,
-                              (by + mod.REACH_CENTER_Y_OFFSET) + 0.5 * rb.half_h,
-                              body_x=bx, body_y=by)
-        self.assertAlmostEqual(nx, 0.25, delta=1e-6)
-        self.assertAlmostEqual(ny, -0.5, delta=1e-6)   # up = negative ny
+        rb = mod.ReachBox(2560, 1440)
+        # The reverted ReachBox.map is the plain 2-arg form — passing body_x/body_y
+        # (the v1.73.0 signature) must raise TypeError, proving the remap is gone.
+        with self.assertRaises(TypeError):
+            rb.map(0.0, 0.40, body_x=0.0, body_y=0.40)
+        # And the v1.73.0 helpers/attrs no longer exist.
+        self.assertFalse(hasattr(mod, "reach_half_w"))
+        self.assertFalse(hasattr(rb, "normalize"))
+        self.assertFalse(hasattr(rb, "center_y_offset"))
 
 
 class EMATests(_Base):
@@ -767,13 +658,14 @@ class TunedConstantsTests(_Base):
         self.assertGreaterEqual(mod.AIR_MOUSE_ENGAGE_DEBOUNCE_FRAMES, 2)
         self.assertLessEqual(mod.AIR_MOUSE_ENGAGE_DEBOUNCE_FRAMES, 5)
 
-    def test_controlling_hand_hysteresis_is_strong(self):
+    def test_controlling_hand_hysteresis_reverted_to_v172(self):
         mod = self._load()
-        # FIX 2: with BOTH hands raised the cursor locks to ONE controller. The
-        # switch margin is a physical height (metres) the challenger must lead by,
-        # held for several frames — strong enough that two raised hands don't thrash.
-        self.assertAlmostEqual(mod.HAND_SWITCH_MARGIN, 0.08, delta=1e-9)
-        self.assertGreaterEqual(mod.HAND_SWITCH_FRAMES, 8)
+        # REVERTED 2026-06-09: the v1.73.0 "both-hands lock" (0.08 m / 8 frames,
+        # which pinned two raised hands to ONE cursor) is undone — both hands raised
+        # now enters TWO-HAND mode instead of a locked single cursor. The single-hand
+        # hysteresis is back to the v1.72.0 values (0.25 / 6).
+        self.assertAlmostEqual(mod.HAND_SWITCH_MARGIN, 0.25, delta=1e-9)
+        self.assertEqual(mod.HAND_SWITCH_FRAMES, 6)
 
     def test_forward_and_straightness_demoted_to_permissive(self):
         mod = self._load()
@@ -2266,27 +2158,26 @@ class ControllingHandHysteresisTests(_Base):
         self.assertIsNone(c._challenge_side)
 
     def test_noncontrolling_hand_does_not_move_cursor(self):
-        """THE OWNER'S BUG (FIX 2): with both hands raised the cursor must follow
-        ONLY the controlling hand — the OTHER hand must NOT influence the cursor
-        POSITION at all (no 'both hands connect to the same spot' / averaging). Hold
-        the controlling (right) hand STILL while the idle (left) hand sweeps; the
-        cursor must NOT move."""
+        """With both hands raised the cursor must follow ONLY the controlling hand —
+        the OTHER hand must NOT influence the cursor POSITION at all (no 'both hands
+        connect to the same spot' / averaging). Hold the controlling (right) hand
+        STILL while the idle (left) hand sweeps; the cursor must NOT move. (This was
+        already true in v1.72.0 — the controller only maps the controlling arm's
+        hand — and remains true after the v1.73.0 tablet-mapping revert.)"""
         mod = self._load()
         c = self._ctrl(mod)
 
         def right_arm(hand_x):
-            # Controlling hand held at a FIXED body-relative position.
+            # Controlling hand held at a FIXED position.
             return mod.ArmExtension("right", forward_m=0.0, straightness=None,
                                     hand=(hand_x, SHOULDER_Y + 0.30, 1.8, 2),
-                                    lift_m=0.30, shoulder_ref_y=SHOULDER_Y,
-                                    body_center_x=0.0)
+                                    lift_m=0.30, shoulder_ref_y=SHOULDER_Y)
 
         def left_arm(hand_x, lift):
             # Idle hand, lower (so it's never the controller), sweeping in X.
             return mod.ArmExtension("left", forward_m=0.0, straightness=None,
                                     hand=(hand_x, SHOULDER_Y + lift, 1.8, 2),
-                                    lift_m=lift, shoulder_ref_y=SHOULDER_Y,
-                                    body_center_x=0.0)
+                                    lift_m=lift, shoulder_ref_y=SHOULDER_Y)
 
         # Engage with the right hand controlling (higher).
         c.update(left_arm(-0.1, 0.10), right_arm(0.10), "open", "open", True)
