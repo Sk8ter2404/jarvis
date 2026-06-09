@@ -131,34 +131,54 @@ AIR_MOUSE_GRIP_DEBOUNCE_FRAMES = 2
 
 # ─── REACH-TO-ENGAGE gate (an arm EXTENDED OUT drives the cursor) ────────────
 # The air-mouse only controls the cursor while an arm is EXTENDED toward the
-# sensor — a deliberate reach, NOT a hand merely raised. Extension is judged on
-# TWO cues from the bridge's arm_extension() geometry (a BODY-RELATIVE forward
-# REACH RATIO + arm straightness); EITHER cue clearing its threshold counts as
-# extended (the owner can reach by pushing forward OR by straightening the arm).
-# Two threshold pairs give HYSTERESIS so an arm hovering right at the line can't
-# flap engage on/off:
-#   • to ENGAGE   the reach must clear the HIGHER bar (clearly extended)
-#   • to STAY engaged it may relax only to the LOWER bar; past it → DISENGAGE.
+# sensor — a deliberate reach, NOT a hand merely raised, and NOT an arm that
+# merely happens to hang straight. The gate's PRIMARY and NECESSARY signal is the
+# BODY-RELATIVE forward REACH RATIO; arm straightness is only a SECONDARY VETO that
+# can REJECT a forward-but-bent arm — it can NEVER engage or hold the gate on its
+# own. Two ratio threshold pairs give HYSTERESIS so an arm hovering right at the
+# line can't flap engage on/off:
+#   • to ENGAGE       reach_ratio must clear the HIGHER engage bar (a clear reach)
+#                     AND the arm must be at least modestly straight (so a forward
+#                     but sharply-bent arm is rejected).
+#   • to STAY engaged reach_ratio may relax only to the LOWER disengage bar; the
+#                     instant it falls below that → DISENGAGE, REGARDLESS of how
+#                     straight the arm is. Straightness can NOT hold it engaged.
+#
+# WHY RATIO-ONLY (the 2026-06-08 "stuck in a dark room, couldn't disengage" fix):
+#   The OLD gate OR-combined the cues: `forward_ok OR straight_ok`. A straight arm
+#   (straightness ~0.9) — even one relaxed/hanging straight or resting on the
+#   desk — LATCHED the gate engaged forever, because straight_ok stayed True no
+#   matter how far the hand pulled back. The live log proved it: every frame read
+#   reach_ratio ~0.71-0.89 (BELOW the disengage bar) yet engaged stayed True
+#   because straightness ~0.90 held the OR-latch, and the owner could not release
+#   the cursor. Making the forward-reach RATIO primary + necessary means RELAXING
+#   the arm (hand returns toward the torso → ratio collapses toward 0) ALWAYS
+#   releases, and a straight-but-not-reaching arm can never engage.
 #
 # POSITION-INDEPENDENT REACH RATIO (reach_ratio = forward_reach_m / body_scale,
 # where body_scale is the owner's shoulder width — fallback torso height):
-#   This is the v1.69.1 fix for "it worked, then on standing up + sitting back it
-#   would not disengage". The OLD gate used the ABSOLUTE forward metres, which
-#   shrink as the owner sits farther from the sensor — so a relaxed arm at a new
-#   distance could still read above an absolute bar (never releasing), and a
-#   calibration done at one chair position didn't hold at another. Normalising the
-#   reach by a body-size span makes it a fraction of the owner's OWN frame, so the
-#   same gesture engages/releases from ANY seated/standing distance. A relaxed hand
-#   sits near 0; a clear reach lands near ~1.6× shoulder width.
-#     engage at reach_ratio ≥ ~1.6 (a clear reach), stay engaged until it falls
-#     back below ~1.0. A relaxed hand at the side / on the desk sits at or behind
-#     the torso (≈0 or negative ratio) → disengaged regardless of body position.
+#   This keeps the v1.69.1 distance-independence: the OLD absolute-metres gate
+#   shrank as the owner sat farther from the sensor, so a relaxed arm at a new
+#   distance could still read above an absolute bar. Normalising the reach by a
+#   body-size span makes it a fraction of the owner's OWN frame, so the same
+#   gesture engages/releases from ANY seated/standing distance. A relaxed hand sits
+#   near 0; a genuine reach lands near ~0.8-0.9× shoulder width.
+#
+# BARS TUNED TO THE OWNER'S REAL RANGE (the 2026-06-08 "reach maxes ~0.89 but the
+# engage bar was 1.6 (unreachable)" fix): the Kinect sits UNDER the monitor, so
+# reaching AT the screen only produces partial forward-depth — the owner's genuine
+# reach tops out around ratio ~0.8-0.9, never the old 1.6 engage bar (which could
+# only ever be cleared via the now-removed straightness latch). So:
+#     engage at reach_ratio ≥ 0.65 (a genuine reach ~0.8-0.9 clears it), stay
+#     engaged until it falls back below 0.40. A relaxed arm gives forward_reach→~0
+#     → ratio→~0 (well below 0.40) → disengaged, regardless of body position or
+#     how straight the arm hangs.
 #   The DEFAULTS are good enough to use WITHOUT calibration; the CALIBRATION
 #   routine ('calibrate air mouse', persisted as KINECT_REACH_* in
 #   user_settings.json and read each tick by _reach_thresholds()) then fits the
 #   owner's actual relaxed→extended RATIO span precisely.
-AIR_MOUSE_EXTEND_REACH_RATIO_ENGAGE = 1.6    # reach/shoulder-width to ENGAGE
-AIR_MOUSE_EXTEND_REACH_RATIO_DISENGAGE = 1.0  # relax below this to DISENGAGE
+AIR_MOUSE_EXTEND_REACH_RATIO_ENGAGE = 0.65    # reach/shoulder-width to ENGAGE
+AIR_MOUSE_EXTEND_REACH_RATIO_DISENGAGE = 0.40  # relax below this to DISENGAGE
 #
 # LEGACY ABSOLUTE forward-depth bars (metres) — kept ONLY as the fallback the
 # reach-ratio uses when a body_scale can't be measured (no shoulders/torso this
@@ -169,21 +189,32 @@ AIR_MOUSE_EXTEND_FORWARD_ENGAGE_M = 0.12    # reach this far forward to ENGAGE (
 AIR_MOUSE_EXTEND_FORWARD_DISENGAGE_M = 0.06  # relax below this to DISENGAGE (fallback)
 #
 # ARM-STRAIGHTNESS (shoulder→hand chord / summed bone length; 0..1, 1 = straight):
-#   engage when the arm is ≥ ~0.78 straight (nearly extended), stay engaged until
-#   it bends back below ~0.66. A relaxed, elbow-bent arm folds well under this.
-AIR_MOUSE_EXTEND_STRAIGHT_ENGAGE = 0.78     # arm this straight to ENGAGE
-AIR_MOUSE_EXTEND_STRAIGHT_DISENGAGE = 0.66  # bend below this to DISENGAGE
+#   This is now ONLY a SECONDARY VETO: a reach must additionally be at least
+#   STRAIGHT_MIN straight to ENGAGE, which rejects a hand shoved forward with a
+#   sharply-bent elbow. It is NOT an independent engage cue and CANNOT hold the
+#   gate engaged on its own — once engaged, only the reach ratio dropping below its
+#   disengage bar releases (straightness is not re-checked to STAY engaged). The
+#   bar is modest (~0.6) so a normal reach (straightness ~0.9-1.0) clears it easily
+#   while a folded-back relaxed arm (~0.5-0.6) would be rejected anyway via the
+#   ratio.  The legacy *_ENGAGE / *_DISENGAGE names are kept (back-compat with the
+#   persisted KINECT_STRAIGHT_* keys); the gate now uses straight_engage as the
+#   modest ENGAGE-time floor and no longer treats straightness as a stay-engaged
+#   latch.
+AIR_MOUSE_EXTEND_STRAIGHT_ENGAGE = 0.60     # min straightness to ALLOW an engage (veto)
+AIR_MOUSE_EXTEND_STRAIGHT_DISENGAGE = 0.50  # legacy floor (no longer latches engaged)
 
 # ─── persisted per-body CALIBRATION (data/user_settings.json) ────────────────
 # 'calibrate air mouse' / 'calibrate reach' captures the owner's RELAXED +
-# EXTENDED reach RATIO (body-relative) + straightness and writes the fitted
-# thresholds under these keys; the live gate reads them every tick (via
-# _reach_thresholds()), falling back to the (position-independent) defaults above
-# when unset. The engage bar is placed ~60 % of the way relaxed→extended and the
-# disengage bar ~40 %, so the gate fits the owner's actual range. Because the
-# stored value is the RELATIVE ratio (not absolute metres), a calibration done at
-# one seating distance holds at any other — and the defaults are good enough that
-# calibration is OPTIONAL.
+# EXTENDED reach RATIO (body-relative) and writes the fitted thresholds under
+# these keys; the live gate reads them every tick (via _reach_thresholds()),
+# falling back to the (position-independent) defaults above when unset. The
+# engage bar is placed ~60 % of the way relaxed→extended and the disengage bar
+# ~40 %, so the gate fits the owner's actual RATIO range (the calibrated cue).
+# Because the stored value is the RELATIVE ratio (not absolute metres), a
+# calibration done at one seating distance holds at any other — and the defaults
+# are good enough that calibration is OPTIONAL. Straightness is NOT calibrated as
+# an engage span any more (it is only the modest ENGAGE-time veto floor above), but
+# the KINECT_STRAIGHT_* keys are still read/written for back-compat.
 #
 # NB the key names are kept (KINECT_REACH_ENGAGE / _DISENGAGE) for back-compat with
 # any persisted settings, but they now hold the dimensionless REACH RATIO, not
@@ -484,12 +515,17 @@ class ArmExtension:
     fed the bridge's arm_extension() dict (a body-relative reach_ratio +
     straightness, with the absolute forward_reach_m kept as a fallback) so the
     controller can ask "is this arm reaching?" with the right (engage vs stay-
-    engaged) bar. PURE — no sensor. EITHER cue clearing its bar counts as
-    extended, so the owner can reach by pushing the hand forward OR by
-    straightening the arm.
+    engaged) bar. PURE — no sensor.
 
-    POSITION-INDEPENDENT: the primary forward cue is reach_ratio (forward reach /
-    body scale), so engage/disengage is invariant to the owner's distance from the
+    The FORWARD-REACH RATIO is the PRIMARY and NECESSARY signal: an arm is extended
+    only while its reach_ratio clears the bar. Straightness is a SECONDARY VETO — to
+    ENGAGE the arm must additionally be at least modestly straight (rejecting a
+    forward-but-sharply-bent arm) — but straightness can NEVER engage or hold the
+    gate on its own. This is the "couldn't disengage in a dark room" fix: a straight
+    arm that has pulled back (ratio collapsed) ALWAYS releases.
+
+    POSITION-INDEPENDENT: the forward cue is reach_ratio (forward reach / body
+    scale), so engage/disengage is invariant to the owner's distance from the
     sensor. forward_m (absolute metres) is only used when reach_ratio is absent
     (body scale unmeasurable this frame)."""
 
@@ -519,16 +555,26 @@ class ArmExtension:
                     straight_engage: float = AIR_MOUSE_EXTEND_STRAIGHT_ENGAGE,
                     straight_disengage: float = AIR_MOUSE_EXTEND_STRAIGHT_DISENGAGE
                     ) -> bool:
-        """Is this arm EXTENDED enough to (stay) engaged? Applies HYSTERESIS:
-        when currently DISENGAGED the reach must clear the HIGHER engage bar;
-        once ENGAGED it only has to stay above the LOWER disengage bar. EITHER
-        the forward-reach OR the straightness cue clearing its bar suffices.
+        """Is this arm EXTENDED enough to (stay) engaged? The FORWARD-REACH RATIO
+        is the PRIMARY and NECESSARY signal, with HYSTERESIS: when currently
+        DISENGAGED the ratio must clear the HIGHER engage bar; once ENGAGED it only
+        has to stay above the LOWER disengage bar, and the INSTANT it drops below
+        that bar the arm is no longer extended — REGARDLESS of straightness.
+
+        Straightness is a SECONDARY VETO only: to ENGAGE (rising edge) the arm must
+        ALSO be at least `straight_engage` straight, which rejects a hand shoved
+        forward with a sharply-bent elbow. Straightness is NOT re-checked to STAY
+        engaged (so a momentary straightness wobble can't drop a live reach) and it
+        can NEVER engage or hold the gate on its own. This is the "stuck engaged in
+        a dark room, couldn't disengage" fix: the OLD gate returned `fwd_ok OR
+        straight_ok`, so a straight arm latched engaged forever even as the hand
+        pulled back. Now RELAXING the arm (hand returns toward the torso → ratio
+        collapses below the disengage bar) ALWAYS releases.
 
         The forward cue is the BODY-RELATIVE reach_ratio whenever it's available
-        (position-independent — the headline fix), falling back to the absolute
-        forward metres only when reach_ratio is None (no body scale this frame).
-        This means RELAXING the arm always drops the ratio below the disengage bar
-        and releases, no matter where the owner is sitting/standing.
+        (position-independent), falling back to the absolute forward metres only
+        when reach_ratio is None (no body scale this frame). The straightness veto
+        is applied to BOTH the ratio path and the fallback metres path.
 
         `thresholds` (the live CALIBRATED bars from _reach_thresholds(), keys
         ratio_engage / ratio_disengage / fwd_engage / fwd_disengage /
@@ -543,18 +589,29 @@ class ArmExtension:
             straight_engage = thresholds.get("straight_engage", straight_engage)
             straight_disengage = thresholds.get("straight_disengage",
                                                 straight_disengage)
-        straight_bar = straight_disengage if engaged else straight_engage
-        # Forward cue: PREFER the body-relative ratio; fall back to absolute metres
-        # only when no ratio is available (body scale unmeasurable this frame).
+        # PRIMARY + NECESSARY forward-reach cue: PREFER the body-relative ratio;
+        # fall back to absolute metres only when no ratio is available (body scale
+        # unmeasurable this frame). This is the ONLY signal that can hold the gate
+        # engaged — straightness below can never substitute for it.
         if self.reach_ratio is not None:
             ratio_bar = ratio_disengage if engaged else ratio_engage
             fwd_ok = self.reach_ratio >= ratio_bar
         else:
             fwd_bar = fwd_disengage if engaged else fwd_engage
             fwd_ok = (self.forward_m is not None and self.forward_m >= fwd_bar)
-        straight_ok = (self.straightness is not None
-                       and self.straightness >= straight_bar)
-        return bool(fwd_ok or straight_ok)
+        if not fwd_ok:
+            # No forward reach → NOT extended, full stop. A straight arm can no
+            # longer latch the gate (the headline fix), so relaxing always releases.
+            return False
+        # SECONDARY VETO (rising edge only): require a modestly straight arm to
+        # ENGAGE so a forward-but-bent arm is rejected. Once already engaged we do
+        # NOT re-veto on straightness — only the ratio (above) keeps/releases the
+        # gate. A missing straightness reading does not veto (don't strand a reach
+        # when the joints couldn't be measured this frame).
+        if not engaged and self.straightness is not None:
+            if self.straightness < straight_engage:
+                return False
+        return True
 
     def reach_score(self) -> float:
         """A scalar "how extended" used to pick the MORE-extended arm when both
