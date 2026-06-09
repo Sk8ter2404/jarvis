@@ -547,6 +547,19 @@ KINECT_AIR_MOUSE_ENABLED = False
 #   RIGHT-click. Flip False only if a future build un-mirrors the stream. See
 #   skills/kinect_air_mouse.py (_hand_mirror_enabled / _mirror_sample).
 KINECT_HAND_MIRROR = True
+# KINECT_TWO_HAND_ENABLED — when True (the default), raising BOTH hands above the
+#   shoulder (the same raise-to-engage lift gate the air-mouse uses) enters TWO-HAND
+#   pinch-to-resize: GRAB the foreground window with both hands (held ~0.2 s), SPREAD
+#   to grow / PINCH to shrink it about its centre (proportional to the 3D hand-
+#   distance, EMA-smoothed), and move both hands together to translate it. Release a
+#   hand to finish. While two-hand mode is active the single-hand air-mouse cursor
+#   STANDS DOWN (so the two don't fight the cursor) and the HUD draws TWO reticle
+#   circles (blue, purple while resizing). Targets only a normal foreground window;
+#   the shell/desktop/taskbar are skipped. Never runs in staging/test. A ~30 Hz
+#   background poller self-gates on this flag each tick (cheap to leave running when
+#   off). See skills/kinect_two_hand.py (+ skills/kinect_air_mouse.set_two_hand_active
+#   / two_hand_active for the hand-off, hud/jarvis_air_cursor.py for the reticles).
+KINECT_TWO_HAND_ENABLED = True
 # KINECT_GREET_ON_ENTRY — when True (and presence is enabled), JARVIS speaks a
 #   brief varied greeting when you enter a room that had been empty for a while.
 #   Hard rate-limited (≤ once/min) and skipped mid-conversation. Off by default.

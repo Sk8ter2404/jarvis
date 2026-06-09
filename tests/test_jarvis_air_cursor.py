@@ -33,6 +33,7 @@ import importlib.util
 import os
 import sys
 import unittest
+from unittest import mock
 
 
 _HUD_DIR = os.path.join(
@@ -187,6 +188,214 @@ class PaintPathTests(unittest.TestCase):
         src = self._source()
         self.assertIn("SetLayeredWindowAttributes", src)
         self.assertIn("LWA_COLORKEY", src)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  TWO-HAND DUAL RETICLE (Part 3): two circle cursors — BLUE normally, PURPLE
+#  while actively resizing a window. Drawn as two small click-through windows.
+# ══════════════════════════════════════════════════════════════════════════
+class _FakeOverlay:
+    """An AirCursorOverlay instance with the Tk roots/canvases replaced by mocks,
+    built WITHOUT running __init__ (which needs a real display), so the two-hand
+    render path can be unit-tested headless."""
+
+    @staticmethod
+    def make(mod, *, resizing=False, hand_pts=((400, 300), (1800, 320))):
+        ov = object.__new__(mod.AirCursorOverlay)
+        ov.origin_x = 0
+        ov.origin_y = 0
+        ov.span_w = 2560
+        ov.span_h = 1440
+        ov.frame = 0
+        ov.two_hand = True
+        ov.two_resizing = resizing
+        ov.hand_pts = list(hand_pts)
+        # Mocked primary window + canvas.
+        ov.root = mock.MagicMock(name="root")
+        ov.root.state.return_value = "normal"
+        ov.canvas = mock.MagicMock(name="canvas")
+        ov._win_x = ov._win_y = None
+        # 2nd window starts absent (built lazily by _ensure_second_window).
+        ov.root2 = None
+        ov.canvas2 = None
+        ov._win2_x = ov._win2_y = None
+        ov._has_colorkey2 = False
+        return ov
+
+
+class TwoHandPaletteTests(unittest.TestCase):
+    def setUp(self):
+        self.mod = _load_air_cursor(self)
+
+    def test_blue_palette_when_not_resizing(self):
+        ov = _FakeOverlay.make(self.mod, resizing=False)
+        outer, inner, dim = ov._two_hand_palette()
+        self.assertEqual(outer, self.mod.BLUE)
+        self.assertEqual(inner, self.mod.BLUE_BRIGHT)
+
+    def test_purple_palette_while_resizing(self):
+        ov = _FakeOverlay.make(self.mod, resizing=True)
+        outer, inner, dim = ov._two_hand_palette()
+        self.assertEqual(outer, self.mod.PURPLE)
+        self.assertEqual(inner, self.mod.PURPLE_BRIGHT)
+
+    def test_blue_and_purple_are_distinct(self):
+        self.assertNotEqual(self.mod.BLUE, self.mod.PURPLE)
+
+
+class TwoHandParseTests(unittest.TestCase):
+    def setUp(self):
+        self.mod = _load_air_cursor(self)
+
+    def test_parses_dict_points(self):
+        P = self.mod.AirCursorOverlay._parse_hand_pts
+        self.assertEqual(P([{"x": 1, "y": 2}, {"x": 3, "y": 4}]),
+                         [(1, 2), (3, 4)])
+
+    def test_rejects_single_point(self):
+        P = self.mod.AirCursorOverlay._parse_hand_pts
+        self.assertIsNone(P([{"x": 1, "y": 2}]))
+
+    def test_rejects_garbage(self):
+        P = self.mod.AirCursorOverlay._parse_hand_pts
+        self.assertIsNone(P(None))
+        self.assertIsNone(P("nope"))
+        self.assertIsNone(P([1, 2]))
+
+
+class TwoHandRenderTests(unittest.TestCase):
+    """The two-hand tick draws a reticle into BOTH hand windows and positions each
+    window at its hand. Tk is mocked so this runs headless."""
+
+    def setUp(self):
+        self.mod = _load_air_cursor(self)
+
+    def test_draws_two_circles_one_per_hand(self):
+        ov = _FakeOverlay.make(self.mod,
+                               hand_pts=((400, 300), (1800, 320)))
+        # Stub the lazy 2nd-window builder so it installs a mock window+canvas
+        # (no real Tk). It must be CALLED (the 2nd reticle needs its own window).
+        built = {"n": 0}
+
+        def fake_build():
+            built["n"] += 1
+            ov.root2 = mock.MagicMock(name="root2")
+            ov.root2.state.return_value = "normal"
+            ov.canvas2 = mock.MagicMock(name="canvas2")
+        with mock.patch.object(ov, "_ensure_second_window",
+                               side_effect=fake_build):
+            ov._tick_two_hand()
+        # Both canvases were painted (a circle drawn into each).
+        self.assertTrue(ov.canvas.create_oval.called,
+                        "no reticle drawn for hand 1")
+        self.assertTrue(ov.canvas2.create_oval.called,
+                        "no reticle drawn for hand 2")
+        self.assertEqual(built["n"], 1)   # the 2nd window was ensured
+        # Each window was geometry()-placed (moved to its hand).
+        self.assertTrue(ov.root.geometry.called)
+        self.assertTrue(ov.root2.geometry.called)
+
+    def test_hand_windows_placed_at_distinct_positions(self):
+        # Hand 1 far left, hand 2 far right → the two windows get DIFFERENT
+        # geometry strings (the circles really are at two places, not one).
+        ov = _FakeOverlay.make(self.mod, hand_pts=((100, 300), (2400, 300)))
+
+        def fake_build():
+            ov.root2 = mock.MagicMock(name="root2")
+            ov.root2.state.return_value = "normal"
+            ov.canvas2 = mock.MagicMock(name="canvas2")
+        with mock.patch.object(ov, "_ensure_second_window",
+                               side_effect=fake_build):
+            ov._tick_two_hand()
+        g1 = ov.root.geometry.call_args[0][0]
+        g2 = ov.root2.geometry.call_args[0][0]
+        self.assertNotEqual(g1, g2)
+
+    def test_purple_drawn_while_resizing(self):
+        # While resizing, the reticle drawn into each canvas uses the PURPLE outline.
+        ov = _FakeOverlay.make(self.mod, resizing=True)
+
+        def fake_build():
+            ov.root2 = mock.MagicMock(name="root2")
+            ov.root2.state.return_value = "normal"
+            ov.canvas2 = mock.MagicMock(name="canvas2")
+        with mock.patch.object(ov, "_ensure_second_window",
+                               side_effect=fake_build):
+            ov._tick_two_hand()
+        # Collect every outline colour passed to create_oval on hand 1.
+        outlines = [kw.get("outline")
+                    for _a, kw in ov.canvas.create_oval.call_args_list]
+        self.assertIn(self.mod.PURPLE, outlines,
+                      f"purple ring not drawn while resizing; got {outlines}")
+        self.assertNotIn(self.mod.BLUE, outlines)
+
+    def test_blue_drawn_when_not_resizing(self):
+        ov = _FakeOverlay.make(self.mod, resizing=False)
+
+        def fake_build():
+            ov.root2 = mock.MagicMock(name="root2")
+            ov.root2.state.return_value = "normal"
+            ov.canvas2 = mock.MagicMock(name="canvas2")
+        with mock.patch.object(ov, "_ensure_second_window",
+                               side_effect=fake_build):
+            ov._tick_two_hand()
+        outlines = [kw.get("outline")
+                    for _a, kw in ov.canvas.create_oval.call_args_list]
+        self.assertIn(self.mod.BLUE, outlines)
+        self.assertNotIn(self.mod.PURPLE, outlines)
+
+
+class TwoHandRefreshStateTests(unittest.TestCase):
+    """_refresh_state parses the published two-hand frame into the render fields."""
+
+    def setUp(self):
+        self.mod = _load_air_cursor(self)
+
+    def _ov(self):
+        import time as _t
+        ov = object.__new__(self.mod.AirCursorOverlay)
+        ov.parent_pid = 12345          # a "real" parent so the orphan cap is skipped
+        ov._started_at = _t.time()
+        ov._last_state_ts = 0.0
+        ov._prev_visible = False
+        ov._was_grab = False
+        ov._grab_flash = 0
+        ov.cur_x = ov.cur_y = None
+        ov.target_x = ov.target_y = None
+        ov.trail = []
+        ov.two_hand = False
+        ov.two_resizing = False
+        ov.hand_pts = None
+        return ov
+
+    def test_two_hand_frame_sets_render_fields(self):
+        import time as _t
+        ov = self._ov()
+        frame = {"visible": True, "two_hand": True, "resizing": True,
+                 "color": "purple", "ts": _t.time(),
+                 "hands": [{"x": 200, "y": 300}, {"x": 1600, "y": 320}],
+                 "state": "grab", "x": 200, "y": 300}
+        with mock.patch.object(self.mod, "_is_parent_alive", lambda pid: True), \
+             mock.patch.object(self.mod, "_read_state", lambda: frame):
+            ok = ov._refresh_state()
+        self.assertTrue(ok)
+        self.assertTrue(ov.two_hand)
+        self.assertTrue(ov.two_resizing)
+        self.assertEqual(ov.hand_pts, [(200, 300), (1600, 320)])
+        # The single-hand reticle is suppressed while two-hand is active.
+        self.assertEqual(ov.state, "hidden")
+
+    def test_single_hand_frame_leaves_two_hand_off(self):
+        import time as _t
+        ov = self._ov()
+        frame = {"visible": True, "two_hand": False, "ts": _t.time(),
+                 "state": "track", "x": 500, "y": 500, "color": "cyan"}
+        with mock.patch.object(self.mod, "_is_parent_alive", lambda pid: True), \
+             mock.patch.object(self.mod, "_read_state", lambda: frame):
+            ov._refresh_state()
+        self.assertFalse(ov.two_hand)
+        self.assertIsNone(ov.hand_pts)
+        self.assertEqual(ov.state, "track")
 
 
 if __name__ == "__main__":
