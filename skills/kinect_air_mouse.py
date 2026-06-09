@@ -1,28 +1,32 @@
 """
 kinect_air_mouse skill — a Kinect v2 "air-mouse" for JARVIS.
 
-THE FEATURE  (REACH-TO-ENGAGE model)
-====================================
-EXTEND an arm OUT toward the screen/Kinect — a deliberate REACH — to take the
-cursor; the cursor follows the EXTENDED hand. CLOSE a hand to click, and which
-hand clicks which button is HAND-SPECIFIC. When you RELAX the arm (pull the hand
-back toward your body / bend the elbow) the air-mouse DISENGAGES and gestures
-take over. A hand merely raised / visible does NOTHING — only a reach engages.
+THE FEATURE  (RAISE-TO-ENGAGE model + AUTO-YIELD)
+=================================================
+RAISE a hand clearly ABOVE THE SHOULDER to take the cursor; the cursor follows
+that raised hand. CLOSE a hand to click, and which hand clicks which button is
+HAND-SPECIFIC. When you LOWER the hand back down (below the shoulder) the
+air-mouse DISENGAGES and gestures take over. A hand resting on the desk sits far
+below the shoulder, so it does NOTHING — only a raised hand engages. And the
+instant you touch your REAL mouse or keyboard the air-mouse YIELDS — it releases
+and stays out of the way until ~1.5 s after your last real input.
 
-  • arm EXTENDED out (hand pushed FORWARD in depth and/or the arm straightened)
+  • hand RAISED above the shoulder (camera-up Y delta clears the engage margin)
                           → ENGAGE: the cursor follows that hand.
   • LEFT hand closes      → LEFT mouse button (down on close, up on open; hold-
                             closed + move = a LEFT-drag).
   • RIGHT hand closes     → RIGHT mouse button (right-click; hold = right-drag).
                             Either hand can click regardless of which one is
                             driving the cursor.
-  • arm RELAXED / lost    → DISENGAGE — the cursor is released so the PHYSICAL
+  • hand LOWERED / lost   → DISENGAGE — the cursor is released so the PHYSICAL
                             mouse works again, any held button is let go, the
-                            reticle hides, and GESTURES re-arm. Reach out again
-                            to re-engage.
+                            reticle hides, and GESTURES re-arm. Raise again to
+                            re-engage.
+  • REAL mouse/keyboard   → AUTO-YIELD: force-disengage + stay suppressed until
+                            ~1.5 s after the most recent real hardware input.
 
-So: reach out = mouse (left/right hand = left/right click), relax = gestures,
-hand merely up = nothing.
+So: raise a hand = mouse (left/right hand = left/right click), lower = gestures,
+hand on the desk = nothing, touch the real mouse = instant yield.
 
 A glowing JARVIS targeting reticle (hud/jarvis_air_cursor.py, a separate
 click-THROUGH overlay process) follows the cursor — cyan + gently pulsing while
@@ -41,10 +45,14 @@ alongside it (no sensor, no real mouse, no Qt needed to exercise it):
     dropouts (carries the last confident grip), and treats Lasso as closed — so a
     single flickered frame never fires a stray click and a fist reliably clicks /
     an open hand reliably releases.
-  • ArmExtension thresholds — the REACH gate: forward-depth + arm-straightness,
-    with engage/disengage HYSTERESIS so a hand hovering at the threshold can't
-    flap, plus a short tracking-loss GRACE so a 1-frame dropout doesn't strand a
-    held button.
+  • ArmExtension lift gate — the HEIGHT gate: hand_y minus a shoulder-line Y
+    reference (lift_m), with up/down engage HYSTERESIS so a hand hovering at the
+    line can't flap, plus a short tracking-loss GRACE so a 1-frame dropout doesn't
+    strand a held button. forward-reach/straightness are demoted to non-gating.
+  • _air_mouse_yield — the AUTO-YIELD watcher: a low-level WH_MOUSE_LL /
+    WH_KEYBOARD_LL hook (dedicated thread + message pump) that timestamps the last
+    REAL (non-injected) hardware input, so the air-mouse force-disengages + stays
+    suppressed the instant the owner touches their real mouse/keyboard.
   • AirMouseController — ties those together into a per-frame decision:
     cursor_xy, per-hand button edges (left/right down|up), overlay state, the
     controlling hand, and the per-hand grips — for the HUD preview hand-circle.
@@ -71,15 +79,15 @@ EVERYTHING is opt-in + safe (mirrors skills/kinect_gestures.py):
     bobert_companion._is_staging()) — the poll loop self-gates every tick.
   • All sensor contact is via audio/kinect_bridge (accessors never raise); a
     missing / disabled sensor degrades to a quiet no-op.
-  • DEAD-MAN / ENGAGE GATE: the cursor is driven ONLY while an arm is EXTENDED
-    OUT toward the sensor (a deliberate reach — see ArmExtension below) AND the
-    body+hand are tracked. The moment the owner RELAXES the arm (pulls the hand
-    back / bends the elbow) — or the hand/body goes untracked for more than
-    DISENGAGE_GRACE_SEC (~0.3 s) — the air-mouse DISENGAGES: it stops calling
-    SetCursorPos entirely (releasing control so the PHYSICAL mouse works again),
-    releases any held button, and hides the reticle. Engage/disengage hysteresis
-    keeps it from flickering at the threshold, and a closed hand that drops or
-    leaves the frame can never strand the button down.
+  • DEAD-MAN / ENGAGE GATE: the cursor is driven ONLY while a hand is RAISED above
+    the shoulder (lift_m clears the engage margin — see ArmExtension below) AND the
+    body+hand are tracked AND no real input is recent. The moment the owner LOWERS
+    the hand below the shoulder — or the hand/body goes untracked for more than
+    DISENGAGE_GRACE_SEC (~0.3 s), or the owner touches their REAL mouse/keyboard —
+    the air-mouse DISENGAGES: it stops calling SetCursorPos entirely (releasing
+    control so the PHYSICAL mouse works again), releases any held button, and hides
+    the reticle. Up/down engage hysteresis keeps it from flickering at the line, and
+    a closed hand that drops or leaves the frame can never strand the button down.
 
 Voice actions:
   air_mouse_on / air_mouse_off — toggle KINECT_AIR_MOUSE_ENABLED live, persisted
@@ -94,6 +102,65 @@ import sys
 import threading
 import time
 from typing import Optional
+
+
+# ─── AUTO-YIELD bridge (skills/_air_mouse_yield) ─────────────────────────────
+# Thin, import-light wrappers around the low-level input watcher so the rest of
+# the module (and the tests) can ask "did the owner just touch their real
+# mouse/keyboard?" without importing ctypes here. The watcher is lazy: install()
+# is a no-op until first called from the live loop, and every accessor degrades to
+# a safe default if the helper can't load. NEVER raise.
+def _yield_mod():
+    try:
+        from skills import _air_mouse_yield as _y
+        return _y
+    except Exception:
+        try:
+            import _air_mouse_yield as _y   # isolated-skill import fallback
+            return _y
+        except Exception:
+            return None
+
+
+def _install_yield_watcher() -> bool:
+    """Lazily install the real-input hook (or its polling fallback). Idempotent;
+    safe to call every tick. Returns True iff the LL hook is active."""
+    y = _yield_mod()
+    if y is None:
+        return False
+    try:
+        return bool(y.install())
+    except Exception:
+        return False
+
+
+def real_input_recent(window: "Optional[float]" = None,
+                      now: "Optional[float]" = None) -> bool:
+    """True when REAL (non-injected) hardware input happened within `window`
+    seconds — the signal that the air-mouse must YIELD and stay SUPPRESSED.
+    Defaults to AIR_MOUSE_YIELD_WINDOW_SEC. Safe (False) when the watcher is
+    unavailable. NEVER raises."""
+    if window is None:
+        window = AIR_MOUSE_YIELD_WINDOW_SEC
+    y = _yield_mod()
+    if y is None:
+        return False
+    try:
+        return bool(y.real_input_recent(window, now))
+    except Exception:
+        return False
+
+
+def _mark_self_action() -> None:
+    """Tell the watcher the air-mouse just moved/clicked the cursor (so its polling
+    fallback won't mistake our own activity for the owner's). NEVER raises."""
+    y = _yield_mod()
+    if y is None:
+        return
+    try:
+        y.mark_self_action()
+    except Exception:
+        pass
 
 
 # ─── tunables ────────────────────────────────────────────────────────────
@@ -129,79 +196,64 @@ AIR_MOUSE_EMA_ALPHA = 0.55
 #   Raise back to 3 if any stray clicks appear; 2 is the snappy-but-safe floor.
 AIR_MOUSE_GRIP_DEBOUNCE_FRAMES = 2
 
-# ─── REACH-TO-ENGAGE gate (an arm EXTENDED OUT drives the cursor) ────────────
-# The air-mouse only controls the cursor while an arm is EXTENDED toward the
-# sensor — a deliberate reach, NOT a hand merely raised, and NOT an arm that
-# merely happens to hang straight. The gate's PRIMARY and NECESSARY signal is the
-# BODY-RELATIVE forward REACH RATIO; arm straightness is only a SECONDARY VETO that
-# can REJECT a forward-but-bent arm — it can NEVER engage or hold the gate on its
-# own. Two ratio threshold pairs give HYSTERESIS so an arm hovering right at the
-# line can't flap engage on/off:
-#   • to ENGAGE       reach_ratio must clear the HIGHER engage bar (a clear reach)
-#                     AND the arm must be at least modestly straight (so a forward
-#                     but sharply-bent arm is rejected).
-#   • to STAY engaged reach_ratio may relax only to the LOWER disengage bar; the
-#                     instant it falls below that → DISENGAGE, REGARDLESS of how
-#                     straight the arm is. Straightness can NOT hold it engaged.
+# ─── HEIGHT-TO-ENGAGE gate (RAISE a hand ABOVE THE SHOULDER to drive the cursor) ─
+# THE PRIMARY GATE (the 2026-06-09 "forward-reach is broken for a desk user" fix):
+#   The forward-reach model was PROVEN unusable at a desk — the live log showed
+#   hands RESTING on the desk reading forward_reach ~0.38 m / ratio ~1.0-1.25,
+#   INDISTINGUISHABLE from a deliberate reach (~0.60 m / ratio ~1.8), so the
+#   air-mouse stayed engaged 574/585 frames and the owner could not use their real
+#   mouse. The owner chose RAISE-HIGH to engage.
 #
-# WHY RATIO-ONLY (the 2026-06-08 "stuck in a dark room, couldn't disengage" fix):
-#   The OLD gate OR-combined the cues: `forward_ok OR straight_ok`. A straight arm
-#   (straightness ~0.9) — even one relaxed/hanging straight or resting on the
-#   desk — LATCHED the gate engaged forever, because straight_ok stayed True no
-#   matter how far the hand pulled back. The live log proved it: every frame read
-#   reach_ratio ~0.71-0.89 (BELOW the disengage bar) yet engaged stayed True
-#   because straightness ~0.90 held the OR-latch, and the owner could not release
-#   the cursor. Making the forward-reach RATIO primary + necessary means RELAXING
-#   the arm (hand returns toward the torso → ratio collapses toward 0) ALWAYS
-#   releases, and a straight-but-not-reaching arm can never engage.
+#   The air-mouse now engages ONLY while the controlling hand is raised clearly
+#   ABOVE THE SHOULDER. In Kinect camera space joint Y increases UPWARD, so we
+#   compare the hand-joint Y to a shoulder-line reference Y (spine_shoulder, or the
+#   same-side shoulder as a fallback) and gate on the HEIGHT delta lift_m =
+#   hand_y - shoulder_ref_y, with HYSTERESIS:
+#       • to ENGAGE       lift_m must clear the HIGHER bar  (hand at/above shoulder)
+#       • to STAY engaged lift_m may relax only to the LOWER bar; the instant it
+#                         drops below that → DISENGAGE.
+#   This is BODY-RELATIVE — invariant to rotation, chair position, and distance: a
+#   hand resting on the desk sits at WAIST level, far below the shoulder (lift_m
+#   strongly negative), so it NEVER engages; a hand raised to point at the screen
+#   sits at/above shoulder level (lift_m ≳ 0), so it does. The CONTROLLING hand is
+#   whichever hand is raised HIGHEST above the shoulder (sticky-hand hysteresis
+#   keeps it from thrashing); if neither hand is above the engage line, NOT engaged.
 #
-# POSITION-INDEPENDENT REACH RATIO (reach_ratio = forward_reach_m / body_scale,
-# where body_scale is the owner's shoulder width — fallback torso height):
-#   This keeps the v1.69.1 distance-independence: the OLD absolute-metres gate
-#   shrank as the owner sat farther from the sensor, so a relaxed arm at a new
-#   distance could still read above an absolute bar. Normalising the reach by a
-#   body-size span makes it a fraction of the owner's OWN frame, so the same
-#   gesture engages/releases from ANY seated/standing distance. A relaxed hand sits
-#   near 0; a genuine reach lands near ~0.8-0.9× shoulder width.
+# FORWARD-REACH IS DEMOTED to an optional weak secondary cue that can never engage
+# or hold the gate (its engage/disengage bars are made permissive below so they
+# cannot keep the air-mouse engaged); HEIGHT is the necessary + primary gate.
 #
-# BARS TUNED TO THE OWNER'S REAL RANGE (the 2026-06-08 "reach maxes ~0.89 but the
-# engage bar was 1.6 (unreachable)" fix): the Kinect sits UNDER the monitor, so
-# reaching AT the screen only produces partial forward-depth — the owner's genuine
-# reach tops out around ratio ~0.8-0.9, never the old 1.6 engage bar (which could
-# only ever be cleared via the now-removed straightness latch). So:
-#     engage at reach_ratio ≥ 0.65 (a genuine reach ~0.8-0.9 clears it), stay
-#     engaged until it falls back below 0.40. A relaxed arm gives forward_reach→~0
-#     → ratio→~0 (well below 0.40) → disengaged, regardless of body position or
-#     how straight the arm hangs.
-#   The DEFAULTS are good enough to use WITHOUT calibration; the CALIBRATION
-#   routine ('calibrate air mouse', persisted as KINECT_REACH_* in
-#   user_settings.json and read each tick by _reach_thresholds()) then fits the
-#   owner's actual relaxed→extended RATIO span precisely.
-AIR_MOUSE_EXTEND_REACH_RATIO_ENGAGE = 0.65    # reach/shoulder-width to ENGAGE
-AIR_MOUSE_EXTEND_REACH_RATIO_DISENGAGE = 0.40  # relax below this to DISENGAGE
+# DEFAULTS: a hand AT the shoulder (lift_m ≈ 0) sits at the engage line; raising it
+# a touch (≳ +5 cm) engages; dropping it ~10 cm below the shoulder releases.
+AIR_MOUSE_ENGAGE_UP_MARGIN_M = 0.05      # lift_m must exceed this to ENGAGE (hand
+#                                          at/just above the shoulder)
+AIR_MOUSE_ENGAGE_DOWN_MARGIN_M = -0.10   # drop below this (~10 cm under the
+#                                          shoulder) to DISENGAGE (hysteresis:
+#                                          DOWN < UP so the gate can't flap)
+
+# ─── LEGACY forward-REACH cues (DEMOTED to permissive secondary) ─────────────
+# Forward reach is no longer the gate. These bars are kept ONLY so the old
+# calibration keys / value-object plumbing keep working; they're set PERMISSIVE
+# (≈0) so a forward arm can never independently engage or HOLD the height gate.
+# PERMISSIVE (≈0) so forward reach can neither engage nor HOLD the gate — the
+# height gate above is the only thing that engages / holds. A relaxed hand on the
+# desk reads forward_reach ~0.38 m, INDISTINGUISHABLE from a real reach, which is
+# exactly why forward reach was abandoned as the gate; setting these to 0 makes the
+# forward cue always "satisfied" so it can't VETO a valid raise, while the height
+# delta does the real gating. (Kept as named constants for the calibration keys.)
+AIR_MOUSE_EXTEND_REACH_RATIO_ENGAGE = 0.0     # permissive: forward never gates
+AIR_MOUSE_EXTEND_REACH_RATIO_DISENGAGE = 0.0  # permissive: forward never gates
 #
-# LEGACY ABSOLUTE forward-depth bars (metres) — kept ONLY as the fallback the
-# reach-ratio uses when a body_scale can't be measured (no shoulders/torso this
-# frame), so a partially-tracked body still has a usable forward gate. The live
-# gate PREFERS the body-relative ratio above; these are a safety net, not the
-# primary signal. (forward_reach_m = torso_z - hand_z; >0 = hand in front.)
-AIR_MOUSE_EXTEND_FORWARD_ENGAGE_M = 0.12    # reach this far forward to ENGAGE (fallback)
-AIR_MOUSE_EXTEND_FORWARD_DISENGAGE_M = 0.06  # relax below this to DISENGAGE (fallback)
+# LEGACY ABSOLUTE forward-depth bars (metres) — also permissive now (the height
+# gate replaced them). Retained as named constants for back-compat plumbing.
+AIR_MOUSE_EXTEND_FORWARD_ENGAGE_M = 0.0     # permissive (height gate is primary)
+AIR_MOUSE_EXTEND_FORWARD_DISENGAGE_M = 0.0  # permissive (height gate is primary)
 #
-# ARM-STRAIGHTNESS (shoulder→hand chord / summed bone length; 0..1, 1 = straight):
-#   This is now ONLY a SECONDARY VETO: a reach must additionally be at least
-#   STRAIGHT_MIN straight to ENGAGE, which rejects a hand shoved forward with a
-#   sharply-bent elbow. It is NOT an independent engage cue and CANNOT hold the
-#   gate engaged on its own — once engaged, only the reach ratio dropping below its
-#   disengage bar releases (straightness is not re-checked to STAY engaged). The
-#   bar is modest (~0.6) so a normal reach (straightness ~0.9-1.0) clears it easily
-#   while a folded-back relaxed arm (~0.5-0.6) would be rejected anyway via the
-#   ratio.  The legacy *_ENGAGE / *_DISENGAGE names are kept (back-compat with the
-#   persisted KINECT_STRAIGHT_* keys); the gate now uses straight_engage as the
-#   modest ENGAGE-time floor and no longer treats straightness as a stay-engaged
-#   latch.
-AIR_MOUSE_EXTEND_STRAIGHT_ENGAGE = 0.60     # min straightness to ALLOW an engage (veto)
-AIR_MOUSE_EXTEND_STRAIGHT_DISENGAGE = 0.50  # legacy floor (no longer latches engaged)
+# ARM-STRAIGHTNESS — no longer a gate or a veto under the height model. Set to 0
+# (permissive) so a raised hand is never rejected for a bent elbow; kept as a named
+# constant only for the persisted KINECT_STRAIGHT_* keys / calibration plumbing.
+AIR_MOUSE_EXTEND_STRAIGHT_ENGAGE = 0.0      # permissive (height gate is primary)
+AIR_MOUSE_EXTEND_STRAIGHT_DISENGAGE = 0.0   # permissive (height gate is primary)
 
 # ─── persisted per-body CALIBRATION (data/user_settings.json) ────────────────
 # 'calibrate air mouse' / 'calibrate reach' captures the owner's RELAXED +
@@ -223,6 +275,10 @@ SETTING_REACH_ENGAGE = "KINECT_REACH_ENGAGE"              # reach-ratio engage
 SETTING_REACH_DISENGAGE = "KINECT_REACH_DISENGAGE"        # reach-ratio disengage
 SETTING_STRAIGHT_ENGAGE = "KINECT_STRAIGHT_ENGAGE"        # straightness engage
 SETTING_STRAIGHT_DISENGAGE = "KINECT_STRAIGHT_DISENGAGE"  # straightness disengage
+# HEIGHT-gate margins (the live PRIMARY gate). Optional persisted overrides so the
+# owner can tune the raise-to-engage line live; default to the module margins.
+SETTING_UP_MARGIN = "KINECT_LIFT_UP_MARGIN"              # lift to ENGAGE (m)
+SETTING_DOWN_MARGIN = "KINECT_LIFT_DOWN_MARGIN"          # lift to DISENGAGE (m)
 CALIB_ENGAGE_FRACTION = 0.60     # engage bar this far relaxed→extended
 CALIB_DISENGAGE_FRACTION = 0.40  # disengage bar this far relaxed→extended
 
@@ -243,6 +299,17 @@ KINECT_HAND_MIRROR_DEFAULT = True
 # is tolerated for up to this long (button stays held, no cursor motion since
 # there's no sample); past it the dead-man fully releases. ~0.3 s per the spec.
 AIR_MOUSE_DISENGAGE_GRACE_SEC = 0.30
+
+# ─── AUTO-YIELD to real input (the air-mouse never fights the real mouse) ─────
+# A low-level input hook (skills/_air_mouse_yield) timestamps the last REAL
+# (non-injected) hardware mouse/keyboard event. While real input happened within
+# this window the air-mouse YIELDS: it force-disengages (releasing any held
+# button + stopping SetCursorPos) and stays SUPPRESSED — it cannot re-engage —
+# until this long after the MOST RECENT real input. So the instant the owner
+# touches their real mouse or keyboard, the air-mouse releases and stays out of
+# the way. The air-mouse's OWN clicks are injected (LLMHF_INJECTED) and ignored by
+# the hook, so it never self-suppresses.
+AIR_MOUSE_YIELD_WINDOW_SEC = 1.5
 
 # ─── controlling-hand HYSTERESIS (ISSUE 3: both-hands stability) ─────────────
 # With BOTH hands raised the cursor must NOT thrash between them frame-to-frame.
@@ -511,43 +578,51 @@ class AirMouseDecision:
 
 
 class ArmExtension:
-    """One arm's extension cues + the engage hysteresis test. A thin value object
-    fed the bridge's arm_extension() dict (a body-relative reach_ratio +
-    straightness, with the absolute forward_reach_m kept as a fallback) so the
-    controller can ask "is this arm reaching?" with the right (engage vs stay-
-    engaged) bar. PURE — no sensor.
+    """One arm's engage cues + the HEIGHT engage-hysteresis test. A thin value
+    object fed the bridge's arm_extension() dict so the controller can ask "is this
+    hand raised above the shoulder?" with the right (engage vs stay-engaged) bar.
+    PURE — no sensor.
 
-    The FORWARD-REACH RATIO is the PRIMARY and NECESSARY signal: an arm is extended
-    only while its reach_ratio clears the bar. Straightness is a SECONDARY VETO — to
-    ENGAGE the arm must additionally be at least modestly straight (rejecting a
-    forward-but-sharply-bent arm) — but straightness can NEVER engage or hold the
-    gate on its own. This is the "couldn't disengage in a dark room" fix: a straight
-    arm that has pulled back (ratio collapsed) ALWAYS releases.
+    The HEIGHT delta lift_m (hand_y - shoulder_ref_y; camera-up) is the PRIMARY and
+    NECESSARY signal: a hand is "extended" (engaged) only while it is raised above
+    the shoulder by the margin. forward_m / reach_ratio / straightness are retained
+    for back-compat + the debug log but are DEMOTED to permissive secondary cues —
+    with their bars at ≈0 they can never engage, hold, or veto the gate (the height
+    delta does all the gating). This is the "forward-reach is broken for a desk
+    user" fix: a hand RESTING on the desk reads a big forward reach yet sits far
+    BELOW the shoulder (lift_m ≪ 0), so the height gate keeps it disengaged.
 
-    POSITION-INDEPENDENT: the forward cue is reach_ratio (forward reach / body
-    scale), so engage/disengage is invariant to the owner's distance from the
-    sensor. forward_m (absolute metres) is only used when reach_ratio is absent
-    (body scale unmeasurable this frame)."""
+    BODY-RELATIVE: lift_m is hand height ABOVE the shoulder line, so engage/disengage
+    is invariant to rotation, chair position, and distance from the sensor."""
 
-    __slots__ = ("side", "forward_m", "reach_ratio", "straightness", "hand")
+    __slots__ = ("side", "forward_m", "reach_ratio", "straightness", "hand",
+                 "lift_m", "shoulder_ref_y")
 
     def __init__(self, side: str, forward_m: Optional[float],
                  straightness: Optional[float], hand=None,
-                 reach_ratio: Optional[float] = None):
+                 reach_ratio: Optional[float] = None,
+                 lift_m: Optional[float] = None,
+                 shoulder_ref_y: Optional[float] = None):
         self.side = side
         self.forward_m = forward_m
-        self.reach_ratio = reach_ratio   # forward reach / body scale (preferred)
+        self.reach_ratio = reach_ratio   # forward reach / body scale (secondary)
         self.straightness = straightness
         self.hand = hand   # (x, y, z, state) of the controlling hand, or None
+        self.lift_m = lift_m            # hand_y - shoulder_ref_y (PRIMARY gate)
+        self.shoulder_ref_y = shoulder_ref_y
 
     @classmethod
     def from_bridge(cls, ext: dict) -> "ArmExtension":
         ext = ext or {}
         return cls(ext.get("side", ""), ext.get("forward_reach_m"),
                    ext.get("straightness"), ext.get("hand"),
-                   reach_ratio=ext.get("reach_ratio"))
+                   reach_ratio=ext.get("reach_ratio"),
+                   lift_m=ext.get("lift_m"),
+                   shoulder_ref_y=ext.get("shoulder_ref_y"))
 
     def is_extended(self, *, engaged: bool, thresholds: "Optional[dict]" = None,
+                    up_margin: float = AIR_MOUSE_ENGAGE_UP_MARGIN_M,
+                    down_margin: float = AIR_MOUSE_ENGAGE_DOWN_MARGIN_M,
                     ratio_engage: float = AIR_MOUSE_EXTEND_REACH_RATIO_ENGAGE,
                     ratio_disengage: float = AIR_MOUSE_EXTEND_REACH_RATIO_DISENGAGE,
                     fwd_engage: float = AIR_MOUSE_EXTEND_FORWARD_ENGAGE_M,
@@ -555,33 +630,25 @@ class ArmExtension:
                     straight_engage: float = AIR_MOUSE_EXTEND_STRAIGHT_ENGAGE,
                     straight_disengage: float = AIR_MOUSE_EXTEND_STRAIGHT_DISENGAGE
                     ) -> bool:
-        """Is this arm EXTENDED enough to (stay) engaged? The FORWARD-REACH RATIO
-        is the PRIMARY and NECESSARY signal, with HYSTERESIS: when currently
-        DISENGAGED the ratio must clear the HIGHER engage bar; once ENGAGED it only
-        has to stay above the LOWER disengage bar, and the INSTANT it drops below
-        that bar the arm is no longer extended — REGARDLESS of straightness.
+        """Is this hand raised enough ABOVE THE SHOULDER to (stay) engaged? The
+        HEIGHT delta lift_m is the PRIMARY and NECESSARY signal, with HYSTERESIS:
+        when currently DISENGAGED lift_m must clear the HIGHER up_margin (hand
+        at/above the shoulder); once ENGAGED it only has to stay above the LOWER
+        down_margin (~10 cm below the shoulder), and the INSTANT it drops below that
+        the hand is no longer extended → DISENGAGE. down_margin < up_margin gives
+        the hysteresis so a hand hovering at the line can't flap.
 
-        Straightness is a SECONDARY VETO only: to ENGAGE (rising edge) the arm must
-        ALSO be at least `straight_engage` straight, which rejects a hand shoved
-        forward with a sharply-bent elbow. Straightness is NOT re-checked to STAY
-        engaged (so a momentary straightness wobble can't drop a live reach) and it
-        can NEVER engage or hold the gate on its own. This is the "stuck engaged in
-        a dark room, couldn't disengage" fix: the OLD gate returned `fwd_ok OR
-        straight_ok`, so a straight arm latched engaged forever even as the hand
-        pulled back. Now RELAXING the arm (hand returns toward the torso → ratio
-        collapses below the disengage bar) ALWAYS releases.
+        A hand resting on the desk sits at WAIST level — lift_m strongly negative,
+        below down_margin — so it NEVER engages, which is the whole point. The
+        forward-reach / straightness cues are DEMOTED: with their bars permissive
+        (≈0) they never gate, so the only thing that engages/holds is the height.
 
-        The forward cue is the BODY-RELATIVE reach_ratio whenever it's available
-        (position-independent), falling back to the absolute forward metres only
-        when reach_ratio is None (no body scale this frame). The straightness veto
-        is applied to BOTH the ratio path and the fallback metres path.
-
-        `thresholds` (the live CALIBRATED bars from _reach_thresholds(), keys
-        ratio_engage / ratio_disengage / fwd_engage / fwd_disengage /
-        straight_engage / straight_disengage) wins over the keyword defaults when
-        given, so the owner's calibration fits the gate to their body without
-        re-plumbing every caller."""
+        `thresholds` (live CALIBRATED bars from _reach_thresholds(); may also carry
+        up_margin / down_margin) wins over the keyword defaults when given, so the
+        owner can tune the margins live without re-plumbing every caller."""
         if thresholds:
+            up_margin = thresholds.get("up_margin", up_margin)
+            down_margin = thresholds.get("down_margin", down_margin)
             ratio_engage = thresholds.get("ratio_engage", ratio_engage)
             ratio_disengage = thresholds.get("ratio_disengage", ratio_disengage)
             fwd_engage = thresholds.get("fwd_engage", fwd_engage)
@@ -589,46 +656,44 @@ class ArmExtension:
             straight_engage = thresholds.get("straight_engage", straight_engage)
             straight_disengage = thresholds.get("straight_disengage",
                                                 straight_disengage)
-        # PRIMARY + NECESSARY forward-reach cue: PREFER the body-relative ratio;
-        # fall back to absolute metres only when no ratio is available (body scale
-        # unmeasurable this frame). This is the ONLY signal that can hold the gate
-        # engaged — straightness below can never substitute for it.
-        if self.reach_ratio is not None:
-            ratio_bar = ratio_disengage if engaged else ratio_engage
-            fwd_ok = self.reach_ratio >= ratio_bar
-        else:
-            fwd_bar = fwd_disengage if engaged else fwd_engage
-            fwd_ok = (self.forward_m is not None and self.forward_m >= fwd_bar)
-        if not fwd_ok:
-            # No forward reach → NOT extended, full stop. A straight arm can no
-            # longer latch the gate (the headline fix), so relaxing always releases.
+        # PRIMARY + NECESSARY HEIGHT gate: the hand must be raised above the
+        # shoulder by the margin. Hysteresis: a higher bar to engage, a lower bar to
+        # stay engaged. A missing lift reading (shoulder/hand not measurable this
+        # frame) means we CANNOT confirm a raise → NOT extended (fail safe: the
+        # owner's real mouse is left alone unless we positively see a raised hand).
+        if self.lift_m is None:
             return False
-        # SECONDARY VETO (rising edge only): require a modestly straight arm to
-        # ENGAGE so a forward-but-bent arm is rejected. Once already engaged we do
-        # NOT re-veto on straightness — only the ratio (above) keeps/releases the
-        # gate. A missing straightness reading does not veto (don't strand a reach
-        # when the joints couldn't be measured this frame).
-        if not engaged and self.straightness is not None:
+        lift_bar = down_margin if engaged else up_margin
+        if self.lift_m < lift_bar:
+            return False
+        # SECONDARY (DEMOTED) forward-reach cue: permissive by default (bars ≈0) so
+        # it can neither hold nor veto the gate; only blocks if a non-trivial bar is
+        # configured (kept for the calibration plumbing). A relaxed-but-raised hand
+        # must still engage on height alone, so a None/zero forward cue never vetoes.
+        ratio_bar = ratio_disengage if engaged else ratio_engage
+        if ratio_bar > 0.0 and self.reach_ratio is not None:
+            if self.reach_ratio < ratio_bar:
+                return False
+        elif ratio_bar <= 0.0:
+            fwd_bar = fwd_disengage if engaged else fwd_engage
+            if fwd_bar > 0.0 and self.forward_m is not None:
+                if self.forward_m < fwd_bar:
+                    return False
+        # SECONDARY (DEMOTED) straightness veto: permissive by default (bar 0). Only
+        # rejects on the rising edge if a non-trivial bar is configured.
+        if not engaged and straight_engage > 0.0 and self.straightness is not None:
             if self.straightness < straight_engage:
                 return False
         return True
 
     def reach_score(self) -> float:
-        """A scalar "how extended" used to pick the MORE-extended arm when both
-        are reaching. Combines the body-relative forward reach + straightness;
-        missing cues contribute 0 so a partially-tracked arm still ranks. Higher =
-        more extended / more dominant. Body-relative so the comparison between the
-        two arms is fair regardless of distance."""
-        # Forward component, normalised to be ~comparable to 0..1 straightness:
-        # prefer reach_ratio scaled by its engage bar; fall back to absolute metres
-        # over the metre engage bar. Clamp negatives (hand behind body) to 0.
-        if self.reach_ratio is not None:
-            fwd_n = max(0.0, self.reach_ratio / AIR_MOUSE_EXTEND_REACH_RATIO_ENGAGE)
-        else:
-            fwd = self.forward_m if self.forward_m is not None else 0.0
-            fwd_n = max(0.0, fwd / AIR_MOUSE_EXTEND_FORWARD_ENGAGE_M)
-        straight = self.straightness if self.straightness is not None else 0.0
-        return fwd_n + max(0.0, straight)
+        """A scalar "how raised" used to pick the CONTROLLING hand — whichever hand
+        is raised HIGHEST above the shoulder. Ranks by lift_m (height above the
+        shoulder line); a missing lift sorts to the bottom. Body-relative so the
+        comparison between the two hands is fair regardless of distance/rotation."""
+        if self.lift_m is None:
+            return float("-inf")
+        return float(self.lift_m)
 
 
 def extended_arms(left: "ArmExtension", right: "ArmExtension", *, engaged: bool,
@@ -682,71 +747,73 @@ def _median(values: "list[float]") -> "Optional[float]":
 
 
 def compute_reach_thresholds(
-        relaxed_ratio: "Optional[float]", extended_ratio: "Optional[float]",
-        relaxed_straight: "Optional[float]", extended_straight: "Optional[float]",
+        lowered_lift: "Optional[float]", raised_lift: "Optional[float]",
+        lowered_straight: "Optional[float]", raised_straight: "Optional[float]",
         *, engage_fraction: float = CALIB_ENGAGE_FRACTION,
         disengage_fraction: float = CALIB_DISENGAGE_FRACTION) -> dict:
-    """Fit the reach-gate thresholds from a captured RELAXED + EXTENDED pose.
+    """Fit the HEIGHT-gate margins from a captured LOWERED + RAISED hand pose.
 
-    The forward cue is the BODY-RELATIVE reach RATIO (forward reach / shoulder
-    width) so the fitted bars are POSITION-INDEPENDENT — a calibration done at one
-    seating distance holds at any other. Each bar is placed a FRACTION of the way
-    relaxed→extended: the engage bar ~60 % (so a reach a little short of full
-    extension still engages) and the disengage bar ~40 % (so a small sag doesn't
-    drop it) — engage strictly above disengage, giving the hysteresis. Computed
-    independently for the reach-ratio cue and the straightness cue. A cue whose
-    pose pair is missing/degenerate (None, or extended not clearly beyond relaxed)
-    FALLS BACK to that cue's module default, so a partial capture still yields a
-    safe, usable gate. PURE — no sensor; the live action feeds it the captured
-    medians.
+    The cue is the BODY-RELATIVE hand HEIGHT above the shoulder (lift_m), so the
+    fitted margins are POSITION-INDEPENDENT — a calibration done at one distance
+    holds at any other. Each margin is placed a FRACTION of the way lowered→raised:
+    the up (engage) margin ~60 % (so a raise a little short of full still engages)
+    and the down (disengage) margin ~40 % (so a small sag doesn't drop it) — up
+    strictly above down, giving the hysteresis. A pose pair that's
+    missing/degenerate (None, or raised not clearly above lowered) FALLS BACK to
+    the module margins, so a partial capture still yields a safe, usable gate. PURE
+    — no sensor; the live action feeds it the captured medians.
 
-    Returns {ratio_engage, ratio_disengage, straight_engage, straight_disengage}
-    (plus the legacy absolute fwd_* bars left at their module defaults so the gate
-    still has a forward fallback when no body scale is measurable at runtime)."""
+    Returns {up_margin, down_margin, ...} (the forward/straightness bars are left
+    at their permissive module defaults — they no longer gate; straightness is
+    still fitted + returned for back-compat but does not affect the height gate)."""
     ef = min(max(float(engage_fraction), 0.0), 1.0)
     df = min(max(float(disengage_fraction), 0.0), 1.0)
 
-    def _bars(relaxed, extended, default_engage, default_disengage, min_span):
-        # Need both ends AND a real span (extended clearly beyond relaxed) to fit;
+    def _bars(lo, hi, default_engage, default_disengage, min_span):
+        # Need both ends AND a real span (raised clearly above lowered) to fit;
         # otherwise keep the defaults rather than emit a nonsense (inverted/tiny)
-        # threshold from a flubbed capture.
-        if (relaxed is None or extended is None
-                or (extended - relaxed) < min_span):
+        # margin from a flubbed capture.
+        if lo is None or hi is None or (hi - lo) < min_span:
             return default_engage, default_disengage
-        span = extended - relaxed
-        return relaxed + ef * span, relaxed + df * span
+        span = hi - lo
+        return lo + ef * span, lo + df * span
 
-    # Reach-ratio bars need a clear relative span (~0.3 of shoulder width) to fit.
-    ratio_e, ratio_d = _bars(relaxed_ratio, extended_ratio,
-                             AIR_MOUSE_EXTEND_REACH_RATIO_ENGAGE,
-                             AIR_MOUSE_EXTEND_REACH_RATIO_DISENGAGE, 0.30)
-    str_e, str_d = _bars(relaxed_straight, extended_straight,
+    # HEIGHT margins need a clear vertical span (~15 cm lower→raise) to fit.
+    up_m, down_m = _bars(lowered_lift, raised_lift,
+                         AIR_MOUSE_ENGAGE_UP_MARGIN_M,
+                         AIR_MOUSE_ENGAGE_DOWN_MARGIN_M, 0.15)
+    str_e, str_d = _bars(lowered_straight, raised_straight,
                          AIR_MOUSE_EXTEND_STRAIGHT_ENGAGE,
                          AIR_MOUSE_EXTEND_STRAIGHT_DISENGAGE, 0.05)
-    return {"ratio_engage": ratio_e, "ratio_disengage": ratio_d,
+    return {"up_margin": up_m, "down_margin": down_m,
             "straight_engage": str_e, "straight_disengage": str_d,
-            # Legacy absolute fallback bars, untouched by calibration.
+            # Forward/ratio bars stay permissive (height gate is primary).
+            "ratio_engage": AIR_MOUSE_EXTEND_REACH_RATIO_ENGAGE,
+            "ratio_disengage": AIR_MOUSE_EXTEND_REACH_RATIO_DISENGAGE,
             "fwd_engage": AIR_MOUSE_EXTEND_FORWARD_ENGAGE_M,
             "fwd_disengage": AIR_MOUSE_EXTEND_FORWARD_DISENGAGE_M}
 
 
 class AirMouseController:
     """The pure per-frame brain. Holds the smoothing, the PER-HAND grip
-    debouncers + button state, and the REACH engage state, turning each
-    (left_ext, right_ext, left_grip, right_grip, tracked) sample into an
-    AirMouseDecision. NO I/O — the live loop applies the decision (move cursor,
-    press buttons, publish overlay state). Re-buildable cheaply; reset() on
+    debouncers + button state, and the HEIGHT engage state, turning each
+    (left_ext, right_ext, left_grip, right_grip, tracked, real_input_recent) sample
+    into an AirMouseDecision. NO I/O — the live loop applies the decision (move
+    cursor, press buttons, publish overlay state). Re-buildable cheaply; reset() on
     disable / hand-loss.
 
-    REACH ENGAGE GATE (the cursor only moves while an arm is EXTENDED OUT):
-      The controller is ENGAGED only while at least one arm is extended toward the
-      sensor (forward-depth and/or arm-straightness clearing its bar, see
-      ArmExtension) AND a body+hand are tracked. Engage/stay-engage hysteresis
-      stops it flapping at the line. The cursor follows the MORE-extended arm
-      (choose_controlling_arm). While DISENGAGED — both arms relaxed, OR untracked
-      beyond the ~0.3 s grace — the decision carries cursor=None (so the live loop
-      calls NO SetCursorPos and the PHYSICAL mouse is free), releases any held
-      button, and hides the overlay. Re-extending an arm re-engages, EMA re-snaps.
+    HEIGHT ENGAGE GATE (RAISE a hand ABOVE THE SHOULDER to drive the cursor):
+      The controller is ENGAGED only while at least one hand is raised above the
+      shoulder line (its lift_m — the PRIMARY, NECESSARY cue — clears the engage
+      margin; forward-reach/straightness are demoted and never gate, see
+      ArmExtension) AND a body+hand are tracked AND the owner has NOT just touched
+      their real mouse/keyboard. Engage/stay-engage hysteresis (a higher up-margin
+      to engage, a lower down-margin to stay) stops it flapping at the line. The
+      cursor follows the HIGHEST-raised hand (sticky hand-hysteresis). While
+      DISENGAGED — both hands below the line, untracked beyond the ~0.3 s grace, OR
+      AUTO-YIELDING to recent real input — the decision carries cursor=None (so the
+      live loop calls NO SetCursorPos and the PHYSICAL mouse is free), releases any
+      held button, and hides the overlay. Re-raising a hand re-engages, EMA re-snaps.
 
     PER-HAND clicks (HAND-SPECIFIC), evaluated EVERY engaged frame for BOTH hands
     regardless of which one drives the cursor:
@@ -914,25 +981,37 @@ class AirMouseController:
         return holder
 
     def update(self, left_ext, right_ext, left_grip: str, right_grip: str,
-               tracked: bool, thresholds: "Optional[dict]" = None
+               tracked: bool, thresholds: "Optional[dict]" = None,
+               real_input_recent: bool = False
                ) -> AirMouseDecision:
         """Advance one frame.
 
         left_ext / right_ext: the per-arm ArmExtension (or None when that arm's
-            joints couldn't be read) describing forward-reach + straightness.
+            joints couldn't be read) describing the hand HEIGHT above the shoulder
+            (lift_m, the primary gate) + the demoted forward/straightness cues.
         left_grip / right_grip: the raw bridge grips for each hand
             ("open"/"closed"/"lasso"/"unknown").
         tracked: True when the bridge reported a tracked body this frame.
-        thresholds: the live reach-gate bars from _reach_thresholds() (the owner's
-            CALIBRATION, or the looser defaults). None → the module defaults.
+        thresholds: the live engage-gate bars from _reach_thresholds() (the owner's
+            margins / calibration, or the defaults). None → the module defaults.
+        real_input_recent: True when the owner touched their REAL mouse/keyboard
+            within the yield window — the air-mouse YIELDS: force-disengage, release
+            any held button, and stay SUPPRESSED (cannot re-engage) this frame.
 
         DISENGAGES (returns cursor=None — no SetCursorPos — and releases any held
-        button) when the body/hand is NOT tracked, or when NEITHER arm is extended
-        (both relaxed). A brief tracking dropout while ENGAGED is tolerated for up
-        to the grace window (button held, cursor parked) before the full release.
-        The cursor follows the more-extended arm with HAND-HYSTERESIS (no thrash
-        between two raised hands); per-hand close→click is evaluated for BOTH hands
-        every engaged frame regardless of which one drives the cursor."""
+        button) when real input is recent (AUTO-YIELD), when the body/hand is NOT
+        tracked, or when NEITHER hand is raised above the shoulder. A brief tracking
+        dropout while ENGAGED is tolerated for up to the grace window (button held,
+        cursor parked) before the full release. The cursor follows the
+        highest-raised hand with HAND-HYSTERESIS (no thrash between two raised
+        hands); per-hand close→click is evaluated for BOTH hands every engaged frame
+        regardless of which one drives the cursor."""
+        # ── AUTO-YIELD: the owner just touched their real mouse/keyboard. Release
+        #    everything and stay SUPPRESSED this frame — the real input always wins,
+        #    immediately, and the air-mouse cannot re-engage until the window
+        #    elapses. This is checked FIRST so it overrides a raised hand. ────────
+        if real_input_recent:
+            return self.release_decision()
         # ── tracking-loss path, with a short grace so a 1-frame dropout doesn't
         #    disengage + re-snap (a held drag must survive a flicker). ──────────
         if not tracked:
@@ -947,8 +1026,9 @@ class AirMouseController:
                                         grip=self._controlling_grip())
             return self.release_decision()
 
-        # ── reach gate: pick the controlling arm (engage hysteresis + sticky
-        #    hand-hysteresis). No arm extended → disengage (fail SAFE). ─────────
+        # ── HEIGHT gate: pick the controlling hand (highest above the shoulder,
+        #    engage hysteresis + sticky hand-hysteresis). No hand raised above the
+        #    line → disengage (fail SAFE, the real mouse is left alone). ─────────
         arm = self._select_controlling_arm(left_ext, right_ext, thresholds)
         if arm is None:
             return self.release_decision()
@@ -1149,17 +1229,24 @@ def _reach_thresholds() -> dict:
     back per-field to the default, so a half-finished calibration can never strand
     the gate. Defaults are good enough to skip calibration entirely. NEVER raises."""
     s = _saved_settings()
+    up_m = _saved_float(s, SETTING_UP_MARGIN)
+    down_m = _saved_float(s, SETTING_DOWN_MARGIN)
     ratio_e = _saved_float(s, SETTING_REACH_ENGAGE)
     ratio_d = _saved_float(s, SETTING_REACH_DISENGAGE)
     str_e = _saved_float(s, SETTING_STRAIGHT_ENGAGE)
     str_d = _saved_float(s, SETTING_STRAIGHT_DISENGAGE)
     return {
+        # The PRIMARY height-gate margins (persisted override or module default).
+        "up_margin": up_m if up_m is not None else AIR_MOUSE_ENGAGE_UP_MARGIN_M,
+        "down_margin": down_m if down_m is not None
+        else AIR_MOUSE_ENGAGE_DOWN_MARGIN_M,
+        # DEMOTED forward / straightness cues — permissive (≈0) by default so they
+        # never gate; only the persisted KINECT_REACH_* / KINECT_STRAIGHT_* keys (if
+        # the owner sets them) re-enable a secondary bar.
         "ratio_engage": ratio_e if ratio_e is not None
         else AIR_MOUSE_EXTEND_REACH_RATIO_ENGAGE,
         "ratio_disengage": ratio_d if ratio_d is not None
         else AIR_MOUSE_EXTEND_REACH_RATIO_DISENGAGE,
-        # Absolute fallback bars are always the module defaults (the ratio is the
-        # calibrated cue; these only fire when a body scale can't be measured).
         "fwd_engage": AIR_MOUSE_EXTEND_FORWARD_ENGAGE_M,
         "fwd_disengage": AIR_MOUSE_EXTEND_FORWARD_DISENGAGE_M,
         "straight_engage": str_e if str_e is not None
@@ -1489,12 +1576,23 @@ def _local_arm_extension(joints: dict, side: str) -> dict:
     one; this keeps the air-mouse working against any bridge.)"""
     out = {"side": side, "hand": None, "forward_reach_m": None,
            "reach_ratio": None, "body_scale_m": None,
-           "straightness": None, "shoulder_hand_m": None, "arm_len_m": None}
+           "straightness": None, "shoulder_hand_m": None, "arm_len_m": None,
+           "shoulder_ref_y": None, "lift_m": None}
     try:
         shoulder = joints.get(f"shoulder_{side}")
         elbow = joints.get(f"elbow_{side}")
         hand = joints.get(f"hand_{side}") or joints.get(f"wrist_{side}")
         out["hand"] = hand
+        # HEIGHT / LIFT (PRIMARY gate): hand Y above the shoulder line. Prefer
+        # spine_shoulder, fall back to the same-side shoulder. Camera y is UP, so
+        # lift_m > 0 = hand at/above the shoulder; a desk-resting hand is well below.
+        shoulder_ref = joints.get("spine_shoulder")
+        if not (shoulder_ref and len(shoulder_ref) >= 2):
+            shoulder_ref = shoulder
+        if (shoulder_ref is not None and len(shoulder_ref) >= 2
+                and hand and len(hand) >= 2):
+            out["shoulder_ref_y"] = float(shoulder_ref[1])
+            out["lift_m"] = float(hand[1]) - float(shoulder_ref[1])
         body_ref = None
         for name in ("spine_mid", "spine_shoulder", "spine_base"):
             j = joints.get(name)
@@ -1622,7 +1720,8 @@ def _relabel_arm_side(ext: "Optional[ArmExtension]",
     if ext is None:
         return None
     return ArmExtension(side, ext.forward_m, ext.straightness, ext.hand,
-                        reach_ratio=ext.reach_ratio)
+                        reach_ratio=ext.reach_ratio, lift_m=ext.lift_m,
+                        shoulder_ref_y=ext.shoulder_ref_y)
 
 
 # ─── ISSUE 2a: CALIBRATION capture ──────────────────────────────────────────
@@ -1635,18 +1734,17 @@ CALIBRATE_MAX_SECONDS = 4.0               # hard wall-time cap per pose (slack)
 def _capture_reach(bridge, seconds: float = CALIBRATE_CAPTURE_SECONDS,
                    sleep_fn=time.sleep, now_fn=time.monotonic
                    ) -> "tuple[Optional[float], Optional[float], int]":
-    """Sample the MORE-extended arm's body-relative reach RATIO + straightness for
-    ~`seconds` and return their MEDIANS plus the usable-frame count:
-    (median_reach_ratio, median_straightness, n_samples).
+    """Sample the HIGHEST-raised hand's HEIGHT (lift_m, the primary cue) for
+    ~`seconds` and return its MEDIAN plus the usable-frame count:
+    (median_lift_m, median_straightness, n_samples).
 
-    Captures the RATIO (forward reach / body scale), not absolute metres, so the
-    fitted thresholds are POSITION-INDEPENDENT — the owner can calibrate at any
-    comfortable distance. Reads the same _hand_sample() the live gate uses (so the
-    mirror swap + geometry are identical), taking, per frame, the more-extended
-    arm's cues. Median (not mean) shrugs off the odd Kinect outlier. A wedged
-    sensor can't hang the voice loop — capped at CALIBRATE_MAX_SECONDS. NEVER
-    raises."""
-    ratio_samples: list = []
+    Captures the HEIGHT of the hand above the shoulder line (body-relative, so the
+    fit is POSITION-INDEPENDENT — the owner can calibrate at any distance). Reads
+    the same _hand_sample() the live gate uses (so the mirror swap + geometry are
+    identical), taking, per frame, the highest-raised hand. Median (not mean)
+    shrugs off the odd Kinect outlier. A wedged sensor can't hang the voice loop —
+    capped at CALIBRATE_MAX_SECONDS. NEVER raises."""
+    lift_samples: list = []
     straight_samples: list = []
     n = 0
     try:
@@ -1659,26 +1757,26 @@ def _capture_reach(bridge, seconds: float = CALIBRATE_CAPTURE_SECONDS,
                        if arms else None)
                 if arm is not None:
                     n += 1
-                    if arm.reach_ratio is not None:
-                        ratio_samples.append(float(arm.reach_ratio))
+                    if arm.lift_m is not None:
+                        lift_samples.append(float(arm.lift_m))
                     if arm.straightness is not None:
                         straight_samples.append(float(arm.straightness))
             sleep_fn(CALIBRATE_POLL_INTERVAL)
     except Exception:
         pass
-    return _median(ratio_samples), _median(straight_samples), n
+    return _median(lift_samples), _median(straight_samples), n
 
 
 def _persist_reach_thresholds(th: dict) -> bool:
-    """Write the fitted reach thresholds to user_settings.json (KINECT_REACH_* /
-    KINECT_STRAIGHT_*) via the hardened settings writer. The KINECT_REACH_* keys
-    persist the body-relative REACH RATIO bars (position-independent), so the
-    calibration holds at any seating distance. All-or-nothing-ish: each key is
-    written; returns True iff every write reported success. NEVER raises."""
+    """Write the fitted HEIGHT-gate margins to user_settings.json (KINECT_LIFT_*),
+    plus the straightness keys for back-compat, via the hardened settings writer.
+    The KINECT_LIFT_* keys persist the body-relative raise/lower margins
+    (position-independent), so the calibration holds at any seating distance.
+    All-or-nothing-ish: each key is written; returns True iff every write reported
+    success. NEVER raises."""
     ok = True
-    ok = _persist_setting(SETTING_REACH_ENGAGE, float(th["ratio_engage"])) and ok
-    ok = _persist_setting(SETTING_REACH_DISENGAGE,
-                          float(th["ratio_disengage"])) and ok
+    ok = _persist_setting(SETTING_UP_MARGIN, float(th["up_margin"])) and ok
+    ok = _persist_setting(SETTING_DOWN_MARGIN, float(th["down_margin"])) and ok
     ok = _persist_setting(SETTING_STRAIGHT_ENGAGE,
                           float(th["straight_engage"])) and ok
     ok = _persist_setting(SETTING_STRAIGHT_DISENGAGE,
@@ -1690,57 +1788,72 @@ def _apply_decision(decision: AirMouseDecision) -> None:
     """Perform the side effects of a decision: move the cursor and actuate the
     per-hand buttons. Pure-core stays I/O-free; THIS is where the real mouse is
     touched. Best-effort; never raises out to the loop."""
+    acted = False
     if decision.cursor is not None:
         _set_cursor_pos(decision.cursor[0], decision.cursor[1])
+        acted = True
     for button, action in decision.button_edges:
         _mouse_button(action, button)
+        acted = True
+    # Stamp our own injected activity so the auto-yield polling fallback doesn't
+    # mistake the air-mouse's OWN cursor move / click for the owner's real input.
+    # (The LL-hook path already ignores injected events directly.)
+    if acted:
+        _mark_self_action()
 
 
-# ─── ISSUE 2b: live reach DEBUG LOG (~2 Hz) ─────────────────────────────────
-# While the air-mouse is enabled, print the live reach numbers at ~2 Hz so the
-# owner can SEE what the gate sees and tune / confirm a calibration, e.g.
-#   [air-mouse] reach=0.18 straight=0.91 hand=right engaged=False
-# The most-extended arm's cues are logged (that's the one the gate is judging).
+# ─── ISSUE 2b: live HEIGHT-gate DEBUG LOG (~2 Hz) ────────────────────────────
+# While the air-mouse is enabled, print the live numbers at ~2 Hz so the owner can
+# SEE what the gate sees and tune the margins, e.g.
+#   [air-mouse] lift=+0.07 hand=right engaged=True yield=False reach=0.18 straight=0.91
+# lift is the HEIGHT of the controlling hand above the shoulder (the PRIMARY gate);
+# yield is True while the air-mouse is suppressed by recent REAL input. The
+# highest-raised hand is logged (the one the gate is judging). reach/straight are
+# kept as the demoted secondary cues for context.
 _AIR_MOUSE_DEBUG_INTERVAL = 0.5             # seconds between debug lines (~2 Hz)
 _air_mouse_debug_last = [0.0]               # module-list so the throttle persists
 
 
-def _format_reach_debug(left_ext, right_ext, tracked: bool, ctrl) -> str:
-    """The ~2 Hz debug line for the live reach values. Picks the more-extended
-    arm's forward-reach (metres) + body-relative RATIO + straightness (the cue the
-    gate is judging) and reports the live which-hand + engaged. The ratio is what
-    the position-independent gate actually tests, so it's surfaced for tuning.
-    PURE-ish (reads ctrl state); NEVER raises."""
+def _format_reach_debug(left_ext, right_ext, tracked: bool, ctrl,
+                        yielding: "Optional[bool]" = None) -> str:
+    """The ~2 Hz debug line. Leads with the HEIGHT delta (lift = hand_y minus the
+    shoulder Y, the PRIMARY gate) for the highest-raised hand, the controlling
+    side, engaged, and the auto-YIELD state; then the demoted reach/straight cues
+    for context. PURE-ish (reads ctrl state); NEVER raises."""
     try:
+        if yielding is None:
+            yielding = real_input_recent()
         arms = [a for a in (left_ext, right_ext) if a is not None]
         arm = max(arms, key=lambda a: a.reach_score()) if arms else None
         if arm is None:
-            reach_s, ratio_s, straight_s, hand_s = "n/a", "n/a", "n/a", "none"
+            lift_s = "n/a"
+            reach_s, straight_s, hand_s = "n/a", "n/a", "none"
         else:
+            lift_s = ("%+.2f" % arm.lift_m) if arm.lift_m is not None else "n/a"
             reach_s = ("%.2f" % arm.forward_m) if arm.forward_m is not None else "n/a"
-            ratio_s = ("%.2f" % arm.reach_ratio
-                       if arm.reach_ratio is not None else "n/a")
             straight_s = ("%.2f" % arm.straightness
                           if arm.straightness is not None else "n/a")
             hand_s = arm.side or "?"
-        return ("  [air-mouse] reach=%s ratio=%s straight=%s hand=%s engaged=%s "
-                "tracked=%s"
-                % (reach_s, ratio_s, straight_s, hand_s, bool(ctrl.engaged),
-                   bool(tracked)))
+        return ("  [air-mouse] lift=%s hand=%s engaged=%s yield=%s reach=%s "
+                "straight=%s tracked=%s"
+                % (lift_s, hand_s, bool(ctrl.engaged), bool(yielding),
+                   reach_s, straight_s, bool(tracked)))
     except Exception:
-        return "  [air-mouse] reach=? ratio=? straight=? hand=? engaged=?"
+        return "  [air-mouse] lift=? hand=? engaged=? yield=? reach=? straight=?"
 
 
 def _maybe_debug_log(left_ext, right_ext, tracked: bool, ctrl,
-                     now: "Optional[float]" = None) -> bool:
-    """Emit the reach debug line if the throttle window has elapsed. Returns True
-    iff a line was printed (for the test). NEVER raises."""
+                     now: "Optional[float]" = None,
+                     yielding: "Optional[bool]" = None) -> bool:
+    """Emit the height-gate debug line if the throttle window has elapsed. Returns
+    True iff a line was printed (for the test). NEVER raises."""
     try:
         t = time.monotonic() if now is None else float(now)
         if (t - _air_mouse_debug_last[0]) < _AIR_MOUSE_DEBUG_INTERVAL:
             return False
         _air_mouse_debug_last[0] = t
-        print(_format_reach_debug(left_ext, right_ext, tracked, ctrl))
+        print(_format_reach_debug(left_ext, right_ext, tracked, ctrl,
+                                  yielding=yielding))
         return True
     except Exception:
         return False
@@ -1760,13 +1873,20 @@ def _poll_once(ctrl: AirMouseController, bridge) -> Optional[AirMouseDecision]:
     if bridge is None:
         return None
     left_ext, right_ext, left_grip, right_grip, tracked = _hand_sample(bridge)
-    # Live CALIBRATED reach bars (owner's persisted KINECT_REACH_* or the looser
-    # defaults), read fresh each tick so a re-calibration takes effect with no
-    # restart. The controller applies them in its engage hysteresis.
+    # Live engage bars (owner's persisted height margins / calibration or the
+    # defaults), read fresh each tick so a tweak takes effect with no restart. The
+    # controller applies them in its height engage hysteresis.
     thresholds = _reach_thresholds()
+    # AUTO-YIELD: has the owner touched their REAL mouse/keyboard recently? If so
+    # the controller force-disengages + stays suppressed this frame so the real
+    # input always wins. Lazily ensure the watcher is installed (the LL hook, or
+    # its polling fallback). Best-effort; never blocks the gate.
+    _install_yield_watcher()
+    yielding = real_input_recent()
     try:
         decision = ctrl.update(left_ext, right_ext, left_grip, right_grip,
-                               tracked, thresholds=thresholds)
+                               tracked, thresholds=thresholds,
+                               real_input_recent=yielding)
     except Exception:
         # A controller error must not strand a held button — force a release.
         try:
@@ -1775,11 +1895,11 @@ def _poll_once(ctrl: AirMouseController, bridge) -> Optional[AirMouseDecision]:
             return None
 
     enabled = _air_mouse_enabled()
-    # ISSUE 2b: while enabled, surface the live reach numbers at ~2 Hz for tuning
-    # / confirming a calibration. Throttled + best-effort; only when enabled so a
-    # disabled poller stays quiet.
+    # ISSUE 2b: while enabled, surface the live height/lift numbers + yield state
+    # at ~2 Hz for tuning. Throttled + best-effort; only when enabled so a disabled
+    # poller stays quiet.
     if enabled:
-        _maybe_debug_log(left_ext, right_ext, tracked, ctrl)
+        _maybe_debug_log(left_ext, right_ext, tracked, ctrl, yielding=yielding)
     if not enabled:
         # Gated OFF mid-session: make sure no button is left held and the
         # overlay is hidden. ctrl.update already returned a (possibly
@@ -1938,10 +2058,10 @@ def air_mouse_on(_: str = "") -> str:
     sensor_note = "" if ready else f" Note {why} — enable the Kinect so I can see your hand."
     if already:
         return already + sensor_note
-    msg = ("Air-mouse on, sir — reach an arm out toward the screen to take the "
+    msg = ("Air-mouse on, sir — raise a hand above your shoulder to take the "
            "cursor, close your left hand to left-click or your right hand to "
-           "right-click, hold a hand closed to drag, and relax your arm to "
-           "release the cursor.")
+           "right-click, hold a hand closed to drag, and lower your hand to "
+           "release the cursor. Touch your real mouse and I'll yield instantly.")
     if not persisted:
         msg += " (I couldn't save it, so it'll revert on restart.)"
     return msg + sensor_note
@@ -1971,9 +2091,9 @@ def air_mouse_status(_: str = "") -> str:
     """Report whether the air-mouse is on + whether a hand is in view.
     'is the air-mouse on' / 'air-mouse status'."""
     enabled = _cfg_flag("KINECT_AIR_MOUSE_ENABLED")
-    how = ("reach an arm out to take the cursor, close your left hand to "
-           "left-click or your right hand to right-click, hold to drag, and "
-           "relax your arm to release the cursor")
+    how = ("raise a hand above your shoulder to take the cursor, close your left "
+           "hand to left-click or your right hand to right-click, hold to drag, "
+           "and lower your hand to release the cursor")
     if not enabled:
         return (f"The air-mouse is off, sir — say 'turn on the air-mouse' to "
                 f"enable it. Once on, {how}.")
@@ -1984,15 +2104,15 @@ def air_mouse_status(_: str = "") -> str:
     if in_view:
         return f"The air-mouse is on and I can see your hand, sir — {how}."
     return ("The air-mouse is on, sir, but I don't see a hand in the Kinect's "
-            f"view at the moment. Reach an arm out toward the screen and {how}.")
+            f"view at the moment. Raise a hand above your shoulder and {how}.")
 
 
 def calibrate_air_mouse(_: str = "") -> str:
-    """ISSUE 2a — the CALIBRATION walk-through ('calibrate air mouse' / 'calibrate
-    reach'). Speaks the owner through it: hold an arm EXTENDED for ~3 s (capture
-    forward-reach + straightness medians), then RELAX it down for ~3 s (capture
-    relaxed medians), fit the engage/disengage thresholds ~60 %/40 % of the way
-    relaxed→extended, and persist them (KINECT_REACH_* / KINECT_STRAIGHT_* in
+    """The CALIBRATION walk-through ('calibrate air mouse' / 'calibrate reach').
+    Repurposed for the HEIGHT gate: speaks the owner through it — RAISE a hand
+    above the shoulder for ~3 s (capture the raised hand HEIGHT median), then LOWER
+    it to the desk for ~3 s (capture the lowered median), fit the up/down engage
+    margins ~60 %/40 % of the way lowered→raised, and persist them (KINECT_LIFT_* in
     user_settings.json) so the live gate auto-fits the owner's body. Honest on
     every failure — never claims to have calibrated something it didn't capture.
 
@@ -2008,34 +2128,34 @@ def calibrate_air_mouse(_: str = "") -> str:
     if bridge is None:
         return "I can't calibrate the air-mouse, sir — the Kinect bridge isn't loaded."
 
-    # 1) EXTENDED pose.
-    _speak("Let's calibrate the air-mouse, sir. Extend your arm out toward the "
-           "screen and hold it there.")
-    ext_ratio, ext_straight, ext_n = _capture_reach(bridge)
-    if ext_n == 0:
-        return ("I couldn't see your arm while you reached, sir — make sure "
+    # 1) RAISED pose (hand up above the shoulder).
+    _speak("Let's calibrate the air-mouse, sir. Raise one hand up above your "
+           "shoulder, like you're pointing at the screen, and hold it there.")
+    raised_lift, raised_straight, raised_n = _capture_reach(bridge)
+    if raised_n == 0:
+        return ("I couldn't see your hand while you raised it, sir — make sure "
                 "you're in the Kinect's view and try calibrating again.")
 
-    # 2) RELAXED pose.
-    _speak("Got it. Now relax your arm down to your side.")
-    rel_ratio, rel_straight, rel_n = _capture_reach(bridge)
-    if rel_n == 0:
-        return ("I lost track of you while you relaxed, sir — please try "
-                "calibrating again.")
+    # 2) LOWERED pose (hand down at the desk).
+    _speak("Got it. Now lower your hand down to the desk, by your side.")
+    lowered_lift, lowered_straight, lowered_n = _capture_reach(bridge)
+    if lowered_n == 0:
+        return ("I lost track of you while you lowered your hand, sir — please "
+                "try calibrating again.")
 
-    # 3) Fit + persist the thresholds (body-relative RATIO → position-independent).
-    th = compute_reach_thresholds(rel_ratio, ext_ratio, rel_straight, ext_straight)
+    # 3) Fit + persist the height margins (body-relative → position-independent).
+    th = compute_reach_thresholds(lowered_lift, raised_lift,
+                                  lowered_straight, raised_straight)
     persisted = _persist_reach_thresholds(th)
-    # Did we actually fit either cue from the capture (vs. fall back to defaults)?
-    fitted_ratio = (rel_ratio is not None and ext_ratio is not None
-                    and (ext_ratio - rel_ratio) >= 0.30)
-    fitted_straight = (rel_straight is not None and ext_straight is not None
-                       and (ext_straight - rel_straight) >= 0.05)
-    if not (fitted_ratio or fitted_straight):
-        return ("I couldn't tell your reach apart from your relax, sir — extend "
-                "fully then drop your arm all the way, and calibrate again.")
-    msg = ("Air-mouse calibrated, sir — reach an arm out or straighten it to "
-           "take the cursor, and it releases when you relax back. It now works "
+    # Did we actually fit the height margins from the capture (vs. default)?
+    fitted_lift = (lowered_lift is not None and raised_lift is not None
+                   and (raised_lift - lowered_lift) >= 0.15)
+    if not fitted_lift:
+        return ("I couldn't tell your raised hand apart from your lowered one, "
+                "sir — raise it well above your shoulder then drop it to the "
+                "desk, and calibrate again.")
+    msg = ("Air-mouse calibrated, sir — raise a hand above your shoulder to take "
+           "the cursor, and it releases when you lower your hand. It now works "
            "the same wherever you sit or stand.")
     if not persisted:
         msg += " (I couldn't save it, so it'll revert on restart.)"

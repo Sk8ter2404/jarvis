@@ -579,29 +579,52 @@ def arm_extension(joints: dict, side: str) -> dict:
          "body_scale_m": float | None,        # shoulder width (or torso height) (m)
          "straightness": float | None,        # 0..~1; chord / summed-bone length
          "shoulder_hand_m": float | None,     # straight-line shoulder→hand (m)
-         "arm_len_m": float | None}           # shoulder→elbow + elbow→hand (m)
+         "arm_len_m": float | None,           # shoulder→elbow + elbow→hand (m)
+         "shoulder_ref_y": float | None,      # shoulder-line Y reference (camera-up)
+         "lift_m": float | None}              # hand_y - shoulder_ref_y (>0 = raised)
 
     forward_reach_m is POSITIVE when the hand is pushed toward the sensor (in
     front of the torso). reach_ratio NORMALISES that absolute reach by a body-size
     span (shoulder width, fallback torso height) so it is POSITION-INDEPENDENT —
-    invariant to how far the owner sits / where the chair is — the headline fix:
-    the raw forward metres shrink as the owner sits back, but the ratio (a fraction
-    of their own body) does not, so the same reach engages from any distance.
+    invariant to how far the owner sits / where the chair is.
+
+    lift_m is the HEIGHT of the hand above the shoulder line (hand_y minus a
+    shoulder reference Y; Kinect camera-space y increases UPWARD). It is POSITIVE
+    when the hand is raised AT/ABOVE the shoulder, NEGATIVE (≈ -0.3..-0.5 m) when a
+    hand rests at desk/waist level. This is the air-mouse's PRIMARY engage gate
+    (RAISE-HIGH to engage): body-relative, so it is invariant to rotation, chair
+    position, and distance — a hand resting on the desk sits far below the shoulder
+    so it never engages, while a hand raised to point at the screen sits at/above
+    shoulder level so it does. The shoulder reference is spine_shoulder (the centre
+    of the shoulder line, most stable) with the same-side shoulder as the fallback.
+
     straightness ≈ 1 when the arm is straightened out, and drops toward ~0.5-0.7
-    when the elbow is bent and the hand pulled back. The air-mouse engages when
-    reach_ratio and/or straightness clear its thresholds, and disengages (with
-    hysteresis) when the arm relaxes — and because reach_ratio is body-relative,
-    RELAXING always releases regardless of where the body is in the frustum."""
+    when the elbow is bent and the hand pulled back; forward_reach_m / reach_ratio
+    are retained as weak SECONDARY cues only (the height gate is primary)."""
     out = {"side": side, "hand": None, "forward_reach_m": None,
            "reach_ratio": None, "body_scale_m": None,
-           "straightness": None, "shoulder_hand_m": None, "arm_len_m": None}
+           "straightness": None, "shoulder_hand_m": None, "arm_len_m": None,
+           "shoulder_ref_y": None, "lift_m": None}
     try:
         shoulder = joints.get(f"shoulder_{side}")
         elbow = joints.get(f"elbow_{side}")
         hand = joints.get(f"hand_{side}") or joints.get(f"wrist_{side}")
         out["hand"] = hand
-        # FORWARD-DEPTH: hand z vs a torso depth reference (spine first, then the
-        # same-side shoulder). Positive = hand is in front of the body.
+        # HEIGHT / LIFT (the PRIMARY gate): hand Y vs a shoulder-line Y reference.
+        # Prefer spine_shoulder (the shoulder-line centre, the steadiest reference
+        # and unaffected by raising either arm); fall back to the same-side
+        # shoulder. Kinect camera-space y increases UPWARD, so lift_m > 0 means the
+        # hand is at/above the shoulder (raised to point), and a hand resting on the
+        # desk sits well below the shoulder (lift_m strongly negative).
+        shoulder_ref = joints.get("spine_shoulder")
+        if not (shoulder_ref and len(shoulder_ref) >= 2):
+            shoulder_ref = shoulder
+        if (shoulder_ref is not None and len(shoulder_ref) >= 2
+                and hand and len(hand) >= 2):
+            out["shoulder_ref_y"] = float(shoulder_ref[1])
+            out["lift_m"] = float(hand[1]) - float(shoulder_ref[1])
+        # FORWARD-DEPTH (weak secondary cue): hand z vs a torso depth reference
+        # (spine first, then the same-side shoulder). Positive = hand in front.
         body_ref = None
         for name in ("spine_mid", "spine_shoulder", "spine_base"):
             j = joints.get(name)
