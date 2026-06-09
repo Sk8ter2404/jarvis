@@ -241,17 +241,75 @@ class ArmExtensionTests(_Base):
 
     def test_forward_cue_alone_engages(self):
         mod = self._load()
-        # Only the forward-depth cue present (no straightness), well past the bar.
+        # The forward-reach cue present (no straightness reading at all), well past
+        # the bar → extended. A missing straightness must NOT veto the engage (we
+        # don't strand a clear reach when the elbow joint couldn't be measured).
         ext = mod.ArmExtension("right", forward_m=0.30, straightness=None,
                                hand=(0, 0.3, 1.7, 2))
         self.assertTrue(ext.is_extended(engaged=False))
 
-    def test_straightness_cue_alone_engages(self):
+    def test_straightness_alone_does_NOT_engage(self):
+        """THE HEADLINE FIX: a straight arm with NO forward reach must NEVER engage.
+        The OLD gate (fwd_ok OR straight_ok) let a straight-but-not-reaching arm
+        latch the cursor — the 'stuck in a dark room, couldn't disengage' bug. The
+        forward-reach ratio is now PRIMARY + NECESSARY, so straightness alone fails.
+        """
         mod = self._load()
-        # Only straightness present (no forward), past the bar → still extended.
-        ext = mod.ArmExtension("right", forward_m=None, straightness=0.95,
-                               hand=(0, 0.3, 1.9, 2))
+        # Straight (0.95) but NO forward reach: ratio path → ratio 0.0 < engage bar;
+        # metres-fallback path → forward_m below the bar. Either way: NOT extended.
+        ratio_arm = mod.ArmExtension("right", forward_m=0.0, straightness=0.95,
+                                     hand=(0, 0.3, 2.0, 2), reach_ratio=0.0)
+        self.assertFalse(ratio_arm.is_extended(engaged=False))
+        # And it can't HOLD the gate either: even already-engaged, a collapsed ratio
+        # with a perfectly straight arm releases (straightness can't latch).
+        self.assertFalse(ratio_arm.is_extended(engaged=True))
+        # Same with the absolute-metres fallback (no body scale → reach_ratio None).
+        metres_arm = mod.ArmExtension("right", forward_m=0.0, straightness=0.95,
+                                      hand=(0, 0.3, 2.0, 2))
+        self.assertFalse(metres_arm.is_extended(engaged=False))
+        self.assertFalse(metres_arm.is_extended(engaged=True))
+
+    def test_straight_but_low_reach_arm_disengages_log_bug(self):
+        """The EXACT live-log failure: every frame reach_ratio is BELOW the
+        disengage bar while straightness ~0.90 is high. The OLD OR-latch kept it
+        engaged=True forever; the new ratio-primary gate DISENGAGES (returns
+        not-extended) the instant the ratio drops under the disengage bar,
+        regardless of straightness."""
+        mod = self._load()
+        # ratio well under the 0.40 disengage bar, straightness high (the latch).
+        ext = mod.ArmExtension("right", forward_m=0.40, straightness=0.90,
+                               hand=(0, 0.3, 1.6, 2), reach_ratio=0.30)
+        # Currently ENGAGED, yet the low ratio releases it (straightness can't hold).
+        self.assertFalse(ext.is_extended(engaged=True))
+
+    def test_forward_but_bent_arm_vetoed_on_engage(self):
+        """A hand shoved forward (clear reach ratio) with a SHARPLY BENT elbow
+        (low straightness) must NOT engage: straightness is a secondary veto on the
+        rising edge so a bent forward arm is rejected."""
+        mod = self._load()
+        ext = mod.ArmExtension("right", forward_m=0.40, straightness=0.45,
+                               hand=(0, 0.3, 1.6, 2), reach_ratio=0.85)
+        self.assertFalse(ext.is_extended(engaged=False))   # veto rejects the bend
+        # But the SAME bent arm, once already engaged, is NOT re-vetoed on
+        # straightness — only the ratio keeps/releases it (a momentary straightness
+        # wobble must not drop a live reach). Ratio 0.85 ≥ disengage → stays.
+        self.assertTrue(ext.is_extended(engaged=True))
+
+    def test_genuine_reach_engages_at_new_bars(self):
+        """A genuine reach at the owner's REAL range (ratio ~0.85, well under the
+        old unreachable 1.6 bar) engages at the new 0.65 engage bar."""
+        mod = self._load()
+        ext = mod.ArmExtension("right", forward_m=0.40, straightness=0.95,
+                               hand=(0, 0.3, 1.6, 2), reach_ratio=0.85)
         self.assertTrue(ext.is_extended(engaged=False))
+
+    def test_relaxed_ratio_zero_disengages(self):
+        """A fully relaxed arm gives forward_reach→~0 → ratio→~0, which is well
+        below the 0.40 disengage bar → DISENGAGED even while currently engaged."""
+        mod = self._load()
+        ext = mod.ArmExtension("right", forward_m=0.0, straightness=0.88,
+                               hand=(0, 0.3, 2.0, 2), reach_ratio=0.0)
+        self.assertFalse(ext.is_extended(engaged=True))
 
     def test_extension_hysteresis(self):
         mod = self._load()
@@ -521,13 +579,25 @@ class TunedConstantsTests(_Base):
 
     def test_reach_ratio_defaults_are_sane_position_independent(self):
         mod = self._load()
-        # Body-relative bars: a clear reach ~1.6× shoulder width engages, holding
-        # to ~1.0×. Sane, usable WITHOUT calibration (the defaults must work).
-        self.assertEqual(mod.AIR_MOUSE_EXTEND_REACH_RATIO_ENGAGE, 1.6)
-        self.assertEqual(mod.AIR_MOUSE_EXTEND_REACH_RATIO_DISENGAGE, 1.0)
+        # Body-relative bars TUNED TO THE OWNER'S REAL RANGE: the Kinect sits UNDER
+        # the monitor, so reaching at the screen tops out around ratio ~0.8-0.9 —
+        # the OLD 1.6 engage bar was unreachable (only the removed straightness latch
+        # could clear it). engage 0.65 (a genuine reach ~0.8-0.9 clears it), holding
+        # to 0.40. Sane + usable WITHOUT calibration.
+        self.assertEqual(mod.AIR_MOUSE_EXTEND_REACH_RATIO_ENGAGE, 0.65)
+        self.assertEqual(mod.AIR_MOUSE_EXTEND_REACH_RATIO_DISENGAGE, 0.40)
         # A relaxed hand (ratio ~0) is well below the disengage bar → always
-        # releases; a full reach (>1.6) engages.
+        # releases; a genuine reach (~0.8-0.9 > 0.65) engages.
         self.assertGreater(mod.AIR_MOUSE_EXTEND_REACH_RATIO_DISENGAGE, 0.0)
+        self.assertLess(mod.AIR_MOUSE_EXTEND_REACH_RATIO_ENGAGE, 0.90)
+
+    def test_straightness_is_only_a_modest_engage_veto(self):
+        mod = self._load()
+        # Straightness is no longer an independent engage cue: the engage-veto floor
+        # is modest (~0.6) so a normal reach (straightness ~0.9-1.0) clears it, and
+        # it can never latch the gate on its own (asserted in ArmExtension tests).
+        self.assertEqual(mod.AIR_MOUSE_EXTEND_STRAIGHT_ENGAGE, 0.60)
+        self.assertLessEqual(mod.AIR_MOUSE_EXTEND_STRAIGHT_ENGAGE, 0.7)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1046,8 +1116,8 @@ class ReachRatioPositionIndependenceTests(_Base):
     def test_engage_invariant_to_body_distance(self):
         mod = self._load()
         th = mod._reach_thresholds()   # position-independent ratio defaults
-        # A clear reach (ratio ~1.8 > the ~1.6 engage bar) must read EXTENDED at
-        # every distance; a relaxed reach (ratio ~0.3 < ~1.0) must NOT, anywhere.
+        # A clear reach (ratio ~1.8 > the 0.65 engage bar) must read EXTENDED at
+        # every distance; a relaxed reach (ratio ~0.3 < 0.40 disengage) must NOT.
         for scale in (0.5, 1.0, 1.5, 2.2):
             reach = self._ext(mod, _scaled_body_joints(
                 "right", scale=scale, reach_frac=1.8), "right")

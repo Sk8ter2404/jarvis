@@ -7,7 +7,12 @@ Covers the compositor wired into bobert_companion:
   * _draw_skeleton_on_color   — bones+joints stroked over the color frame via
                                 the bridge's color-space mapper (count returned);
   * _compose_kinect_preview   — None when no Kinect frame; composed otherwise,
-                                reusing already-cached webcam frames;
+                                reusing already-cached webcam frames; and the
+                                DARK-ROOM INFRARED fallback (dark/None color →
+                                night-vision IR base + skeleton + 'IR' badge);
+  * the IR helpers            — _frame_mean_brightness / _ir_gray_to_bgr_canvas
+                                (contrast-stretched + upscaled to color) /
+                                _draw_ir_badge / _compose_ir_preview_base;
   * _hud_kinect_preview_write — off when the flag is disabled; writes the
                                 composite via the shared preview writer when on;
   * _resolve_webcam_indices_by_name — pygrabber name→index map (mocked), cached,
@@ -119,8 +124,12 @@ class ComposeKinectPreviewTests(MonolithGlobalsTestCase):
             lambda: self.bc._kinect_preview_last_color.__setitem__(0, None))
 
     def test_none_when_no_kinect_color_frame_and_no_cache(self):
+        # No color AND no IR (pin IR off so this stays deterministic regardless of
+        # the build's IR support) AND no cache → the one legitimate None.
         with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
-                               return_value=None):
+                               return_value=None), \
+                mock.patch.object(self.bc._kinect_bridge, "get_infrared_gray",
+                                  return_value=None):
             self.assertIsNone(self.bc._compose_kinect_preview(now=123.0))
 
     def test_composes_with_skeleton_and_real_webcam_tiles(self):
@@ -325,10 +334,196 @@ class ComposePreviewFailSafeTests(MonolithGlobalsTestCase):
         self.assertEqual(out.shape, color.shape)
 
     def test_still_none_when_no_kinect_color_frame(self):
-        # The ONE legitimate None: no Kinect color frame at all.
+        # The ONE legitimate None: no Kinect color frame AND no IR frame at all.
         with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
-                               return_value=None):
+                               return_value=None), \
+                mock.patch.object(self.bc._kinect_bridge, "get_infrared_gray",
+                                  return_value=None):
             self.assertIsNone(self.bc._compose_kinect_preview(now=10.0))
+
+
+@requires_monolith
+class IrPreviewHelpersTests(MonolithGlobalsTestCase):
+    """The pure IR night-vision helpers: brightness measure, IR→BGR canvas
+    (contrast-stretched + upscaled to the color resolution), and the IR badge."""
+
+    def _mock_ir(self, *, bright_blob=True):
+        """A mock 8-bit IR frame (Kinect IR is 512×424): a faint low band with a
+        bright silhouette blob, like a person lit by the IR illuminator in a dark
+        room. Mimics what kinect_bridge.get_infrared_gray() returns."""
+        np = _np()
+        ir = np.full((424, 512), 24, dtype=np.uint8)   # faint background band
+        if bright_blob:
+            ir[150:300, 200:330] = 200                  # bright body silhouette
+        return ir
+
+    def test_mean_brightness_dark_vs_lit(self):
+        np = _np()
+        dark = np.full((1080, 1920, 3), 6, dtype=np.uint8)
+        lit = np.full((1080, 1920, 3), 90, dtype=np.uint8)
+        self.assertLess(self.bc._frame_mean_brightness(dark),
+                        self.bc._KINECT_PREVIEW_DARK_MEAN)
+        self.assertGreater(self.bc._frame_mean_brightness(lit),
+                           self.bc._KINECT_PREVIEW_DARK_MEAN)
+        # None / empty → 0.0 (never raises).
+        self.assertEqual(self.bc._frame_mean_brightness(None), 0.0)
+
+    def test_ir_canvas_is_visible_bgr_upscaled_to_color(self):
+        ir = self._mock_ir()
+        canvas = self.bc._ir_gray_to_bgr_canvas(ir, 1920, 1080)
+        self.assertIsNotNone(canvas)
+        # Upscaled from 512×424 to the COLOR canvas, 3-channel BGR.
+        self.assertEqual(canvas.shape, (1080, 1920, 3))
+        # VISIBLY non-black: the contrast stretch pushes the blob toward 255 and the
+        # mean well above pure black, so the owner actually sees a night-vision image.
+        self.assertGreater(int(canvas.max()), 200)
+        self.assertGreater(self.bc._frame_mean_brightness(canvas), 5.0)
+
+    def test_ir_canvas_none_for_bad_input(self):
+        self.assertIsNone(self.bc._ir_gray_to_bgr_canvas(None, 1920, 1080))
+        # A 3-D (already-colour) array is rejected (we expect a 2-D IR frame).
+        np = _np()
+        self.assertIsNone(self.bc._ir_gray_to_bgr_canvas(
+            np.zeros((10, 10, 3), dtype=np.uint8), 1920, 1080))
+
+    def test_ir_badge_draws_and_does_not_raise(self):
+        np = _np()
+        canvas = np.full((1080, 1920, 3), 30, dtype=np.uint8)
+        before = int(canvas.max())
+        self.assertTrue(self.bc._draw_ir_badge(canvas))
+        # The cyan badge brightens some pixels (the border/text > the flat base).
+        self.assertGreater(int(canvas.max()), before)
+
+    def test_compose_ir_base_none_when_no_ir(self):
+        with mock.patch.object(self.bc._kinect_bridge, "get_infrared_gray",
+                               return_value=None):
+            self.assertIsNone(self.bc._compose_ir_preview_base())
+
+    def test_compose_ir_base_builds_canvas(self):
+        ir = self._mock_ir()
+        with mock.patch.object(self.bc._kinect_bridge, "get_infrared_gray",
+                               return_value=ir):
+            base = self.bc._compose_ir_preview_base()
+        self.assertIsNotNone(base)
+        self.assertEqual(base.shape, (1080, 1920, 3))
+
+
+@requires_monolith
+class ComposeKinectPreviewIrFallbackTests(MonolithGlobalsTestCase):
+    """DARK-ROOM behaviour of _compose_kinect_preview: when the color frame is too
+    dark (or None) it builds the preview from the IR night-vision stream with the
+    skeleton drawn over it and an 'IR' badge, instead of a black tile. When the room
+    is lit it keeps the color path and never touches IR."""
+
+    def setUp(self):
+        super().setUp()
+        self.bc._kinect_preview_last_color[0] = None
+        self.addCleanup(
+            lambda: self.bc._kinect_preview_last_color.__setitem__(0, None))
+        # Reset the IR-fallback log throttle so each test's log path is exercisable.
+        self.bc._kinect_ir_fallback_log_last[0] = 0.0
+
+    def _mock_ir(self):
+        np = _np()
+        ir = np.full((424, 512), 24, dtype=np.uint8)
+        ir[150:300, 200:330] = 200
+        return ir
+
+    def _bodies(self):
+        return [{"joints": {"head": (0.0, 1.0, 2.0, 2),
+                            "neck": (0.0, 0.7, 2.0, 2),
+                            "hand_right": (0.3, 0.3, 1.7, 2)}}]
+
+    def test_dark_color_falls_back_to_ir_with_skeleton_and_badge(self):
+        # A DARK (near-black) color frame + an available IR frame → the base is the
+        # IR night-vision image (visibly non-black), the skeleton is drawn, and the
+        # 'IR' badge is stamped. This is the owner's "black preview in a dark room"
+        # fix: they now see an infrared skeleton instead of a black tile.
+        np = _np()
+        dark_color = np.full((1080, 1920, 3), 4, dtype=np.uint8)  # lights off
+        ir = self._mock_ir()
+        badge_called = {"n": 0}
+        real_badge = self.bc._draw_ir_badge
+
+        def _counting_badge(img):
+            badge_called["n"] += 1
+            return real_badge(img)
+
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
+                               return_value=dark_color), \
+                mock.patch.object(self.bc._kinect_bridge, "get_infrared_gray",
+                                  return_value=ir), \
+                mock.patch.object(self.bc._kinect_bridge, "get_bodies",
+                                  return_value=self._bodies()), \
+                mock.patch.object(self.bc._kinect_bridge, "get_color_space_mapper",
+                                  return_value=lambda x, y, z: (960, 540)), \
+                mock.patch.object(self.bc, "_draw_ir_badge", _counting_badge), \
+                mock.patch.object(self.bc, "_read_side_tile_webcams",
+                                  return_value={"left": None, "right": None}):
+            out = self.bc._compose_kinect_preview(now=10.0)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.shape, (1080, 1920, 3))
+        # The IR night-vision base is VISIBLE (the dark color frame would be ~4).
+        self.assertGreater(int(out.max()), 200)
+        self.assertGreater(self.bc._frame_mean_brightness(out), 5.0)
+        # The IR badge was drawn (night-vision mode signalled to the owner).
+        self.assertEqual(badge_called["n"], 1)
+
+    def test_color_none_falls_back_to_ir(self):
+        # No color frame at all, but IR is available → IR base (not None, not blank).
+        ir = self._mock_ir()
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
+                               return_value=None), \
+                mock.patch.object(self.bc._kinect_bridge, "get_infrared_gray",
+                                  return_value=ir), \
+                mock.patch.object(self.bc._kinect_bridge, "get_bodies",
+                                  return_value=[]), \
+                mock.patch.object(self.bc, "_read_side_tile_webcams",
+                                  return_value={"left": None, "right": None}):
+            out = self.bc._compose_kinect_preview(now=10.0)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.shape, (1080, 1920, 3))
+        self.assertGreater(int(out.max()), 200)        # visible IR, not black
+
+    def test_lit_color_keeps_color_path_and_skips_ir(self):
+        # A LIT color frame → the color path is used and the IR getter is NEVER
+        # called (no needless IR read / no badge when the room has light).
+        np = _np()
+        lit = np.full((1080, 1920, 3), 90, dtype=np.uint8)
+        ir_getter = mock.Mock(return_value=self._mock_ir())
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
+                               return_value=lit), \
+                mock.patch.object(self.bc._kinect_bridge, "get_infrared_gray",
+                                  ir_getter), \
+                mock.patch.object(self.bc._kinect_bridge, "get_bodies",
+                                  return_value=[]), \
+                mock.patch.object(self.bc, "_draw_ir_badge") as badge, \
+                mock.patch.object(self.bc, "_read_side_tile_webcams",
+                                  return_value={"left": None, "right": None}):
+            out = self.bc._compose_kinect_preview(now=10.0)
+        self.assertIsNotNone(out)
+        self.assertEqual(out.shape, lit.shape)
+        ir_getter.assert_not_called()                  # color path: no IR read
+        badge.assert_not_called()                      # no IR badge in a lit room
+
+    def test_dark_color_but_no_ir_degrades_to_color(self):
+        # DARK color but IR unavailable (e.g. this pykinect2 build doesn't wire up
+        # IR) → degrade to the dark color frame rather than blank the preview.
+        np = _np()
+        dark_color = np.full((1080, 1920, 3), 5, dtype=np.uint8)
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
+                               return_value=dark_color), \
+                mock.patch.object(self.bc._kinect_bridge, "get_infrared_gray",
+                                  return_value=None), \
+                mock.patch.object(self.bc._kinect_bridge, "get_bodies",
+                                  return_value=[]), \
+                mock.patch.object(self.bc, "_draw_ir_badge") as badge, \
+                mock.patch.object(self.bc, "_read_side_tile_webcams",
+                                  return_value={"left": None, "right": None}):
+            out = self.bc._compose_kinect_preview(now=10.0)
+        self.assertIsNotNone(out)                       # NOT blanked
+        self.assertEqual(out.shape, dark_color.shape)
+        badge.assert_not_called()                       # no IR → no badge
 
 
 @requires_monolith

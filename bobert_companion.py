@@ -4033,33 +4033,188 @@ def _kinect_preview_color_none_logged() -> None:
         pass
 
 
+# ── INFRARED (night-vision) preview fallback for a DARK room ──────────────────
+# The Kinect RGB camera needs ambient light, so in a dark room the COLOR preview
+# is black — but the Kinect v2 IR stream uses its own active illuminator and works
+# in TOTAL darkness (it's how the skeleton tracks). When the color frame is too
+# dark (mean brightness below this threshold) or color is None entirely, we build
+# the preview from the IR stream instead — contrast-stretched to a viewable BGR
+# canvas, upscaled to the color resolution so the EXISTING color-space skeleton
+# projection + hand circle are reused verbatim — and stamp a small "IR" badge so
+# the owner knows they're seeing night-vision. The color path is kept whenever the
+# room is lit; the switch is automatic on brightness.
+#
+# 8-bit mean-brightness floor under which the color frame is treated as "too dark
+# to use" and we fall back to IR. A lit room reads well above this; lights-off RGB
+# sits near 0-12. Generous so a dim-but-usable room still keeps color.
+_KINECT_PREVIEW_DARK_MEAN = 16.0
+
+
+def _frame_mean_brightness(bgr: "np.ndarray | None") -> float:
+    """Mean 8-bit brightness of a BGR (or grayscale) frame, or 0.0 for None/empty.
+    Used to decide whether the color preview is too dark to use (→ IR fallback).
+    Pure + cheap (np.mean over the whole frame); NEVER raises."""
+    try:
+        if bgr is None or getattr(bgr, "size", 0) == 0:
+            return 0.0
+        return float(np.mean(bgr))
+    except Exception:
+        return 0.0
+
+
+def _ir_gray_to_bgr_canvas(ir_gray: "np.ndarray", width: int,
+                           height: int) -> "np.ndarray | None":
+    """Turn an 8-bit IR grayscale frame (Kinect IR is 512×424) into a CONTRAST-
+    STRETCHED BGR canvas at the COLOR resolution (default 1920×1080), so the
+    existing color-space skeleton projection + hand circle can be drawn on it
+    UNCHANGED (we upscale the IR to the color canvas rather than re-projecting the
+    skeleton into IR space). Returns the BGR canvas, or None if the frame is
+    unusable. Pure cv2/numpy; NEVER raises.
+
+    The bridge already normalises the 16-bit IR to 8-bit by its peak; here we add a
+    percentile contrast STRETCH (clip the dim 2% / bright 1% tails and rescale to
+    0-255) so a dark-room IR frame — which often sits in a narrow low band — pops to
+    a clearly visible grayscale instead of a faint murk."""
+    try:
+        if ir_gray is None or getattr(ir_gray, "size", 0) == 0:
+            return None
+        gray = np.asarray(ir_gray)
+        if gray.ndim != 2:
+            return None
+        gray = gray.astype(np.uint8, copy=False)
+        # Percentile contrast stretch: map the [p_lo, p_hi] band to [0, 255]. This
+        # is what makes the IR readable in the dark (the raw band is narrow/low).
+        try:
+            lo = float(np.percentile(gray, 2.0))
+            hi = float(np.percentile(gray, 99.0))
+            if hi - lo >= 1.0:
+                stretched = (gray.astype(np.float32) - lo) * (255.0 / (hi - lo))
+                gray = np.clip(stretched, 0, 255).astype(np.uint8)
+        except Exception:
+            pass  # fall back to the (already peak-normalised) frame on any glitch
+        bgr_small = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        tw = max(1, int(width))
+        th = max(1, int(height))
+        if (bgr_small.shape[1], bgr_small.shape[0]) == (tw, th):
+            return bgr_small
+        # Upscale the small IR frame to the full color canvas so the SAME color-
+        # space joint projection lands correctly over it. INTER_NEAREST keeps the
+        # IR crisp (it's a low-res depth-illuminator image, not a photo).
+        return cv2.resize(bgr_small, (tw, th), interpolation=cv2.INTER_NEAREST)
+    except Exception:
+        return None
+
+
+def _draw_ir_badge(bgr: "np.ndarray") -> bool:
+    """Stamp a small glowing "IR" badge in the top-left of the preview so the owner
+    knows the night-vision (infrared) path is active rather than the color camera.
+    Returns True iff drawn. NEVER raises."""
+    try:
+        h, w = bgr.shape[:2]
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = max(0.6, w / 1600.0)
+        thick = max(2, int(round(scale * 2)))
+        label = "IR"
+        (tw, th), base_ln = cv2.getTextSize(label, font, scale, thick)
+        pad = int(round(8 * scale))
+        x0, y0 = pad, pad
+        bw, bh = tw + 2 * pad, th + base_ln + 2 * pad
+        # Translucent dark plate + a cyan border + cyan text (matches the HUD).
+        cyan = (255, 201, 76)        # BGR ≈ #4cc9ff
+        overlay = bgr.copy()
+        cv2.rectangle(overlay, (x0, y0), (x0 + bw, y0 + bh), (20, 20, 20), -1)
+        cv2.addWeighted(overlay, 0.55, bgr, 0.45, 0.0, bgr)
+        cv2.rectangle(bgr, (x0, y0), (x0 + bw, y0 + bh), cyan, max(2, thick // 1),
+                      lineType=cv2.LINE_AA)
+        cv2.putText(bgr, label, (x0 + pad, y0 + pad + th), font, scale, cyan,
+                    thick, lineType=cv2.LINE_AA)
+        return True
+    except Exception:
+        return False
+
+
+# Throttled log for IR-fallback activation so the owner sees in the session log
+# that the preview switched to night-vision (and why), without frame-rate spam.
+_kinect_ir_fallback_log_last = [0.0]
+
+
+def _kinect_ir_fallback_logged(reason: str) -> None:
+    """Throttled note that the preview fell back to the IR stream (dark room)."""
+    try:
+        now = time.monotonic()
+        if (now - _kinect_ir_fallback_log_last[0]) >= _KINECT_PREVIEW_SKIP_LOG_INTERVAL:
+            _kinect_ir_fallback_log_last[0] = now
+            print(f"  [kinect-preview] room is dark ({reason}) — using the "
+                  "infrared (night-vision) stream for the skeleton preview")
+    except Exception:
+        pass
+
+
+def _compose_ir_preview_base(width: int = 1920,
+                             height: int = 1080) -> "np.ndarray | None":
+    """Build the IR night-vision preview BASE (contrast-stretched IR upscaled to the
+    color canvas) for the dark-room fallback, or None when no IR frame is available
+    (e.g. the installed pykinect2 build doesn't wire up the IR stream). The skeleton
+    + hand circle are drawn by the caller on TOP of this base using the unchanged
+    color-space projection. NEVER raises."""
+    try:
+        ir = _kinect_bridge.get_infrared_gray()
+    except Exception:
+        ir = None
+    if ir is None:
+        return None
+    canvas = _ir_gray_to_bgr_canvas(ir, width, height)
+    if canvas is None:
+        return None
+    return canvas
+
+
 def _compose_kinect_preview(now: float) -> "np.ndarray | None":
     """Build the composite preview image: the Kinect COLOR frame with the live
     skeleton + air-mouse hand circle + gesture pop drawn over it, with the two
     real WEBCAM frames stacked as small tiles down the right edge. Returns the
-    BGR image to hand to the preview writer, or None when no Kinect color frame
+    BGR image to hand to the preview writer, or None when no Kinect frame at all
     is available (caller then leaves the plain webcam mirror in place). NEVER
     raises.
+
+    DARK-ROOM NIGHT VISION: when the color frame is too dark (mean brightness below
+    _KINECT_PREVIEW_DARK_MEAN) or color is None, the base is built from the Kinect
+    v2 INFRARED stream instead — which uses the sensor's active illuminator and so
+    works in TOTAL darkness (it's how the skeleton tracks). The IR frame (512×424)
+    is contrast-stretched and upscaled to the color canvas so the EXISTING color-
+    space skeleton projection + hand circle render over it unchanged, and a small
+    "IR" badge marks night-vision mode. The color path is kept whenever the room is
+    lit; the switch is automatic on brightness.
 
     The side tiles are the actual USB webcams ('Fullhan Webcam' = LEFT, 'USB 2.0
     Camera' = RIGHT), captured directly + throttled by _read_side_tile_webcams —
     NOT a duplicate of the Kinect. A webcam that's off/covered shows a dim
     placeholder tile, never the Kinect frame.
 
-    FAIL-SAFE (ISSUE 4): the Kinect COLOR + SKELETON are the priority and ALWAYS
-    render as long as a color frame exists. EVERY optional overlay — the gesture
-    pop, EACH side-tile webcam (one may be locked by Teams), and the tile
-    composite — is wrapped in its OWN try/except, so a single failing piece is
-    skipped (with a throttled log line) instead of blanking the whole preview. The
-    only None return is when there is no Kinect color frame at all (caller then
-    keeps the plain webcam mirror)."""
+    FAIL-SAFE (ISSUE 4): the Kinect base (COLOR or IR) + SKELETON are the priority
+    and ALWAYS render as long as a frame exists. EVERY optional overlay — the
+    gesture pop, the IR badge, EACH side-tile webcam (one may be locked by Teams),
+    and the tile composite — is wrapped in its OWN try/except, so a single failing
+    piece is skipped (with a throttled log line) instead of blanking the whole
+    preview. The only None return is when there is no Kinect color OR IR frame at
+    all (caller then keeps the plain webcam mirror)."""
     try:
         fresh = _kinect_bridge.get_color_bgr(require_new=False)
     except Exception:
         fresh = None
-    if fresh is not None:
-        # A real color frame — cache a copy so a later transient miss can re-serve
-        # it, and use a copy as our base (don't scribble on the bridge's buffer).
+    # DARK-ROOM IR FALLBACK: the RGB camera is black without ambient light, but the
+    # Kinect v2 IR stream (active illuminator) works in total darkness. If color is
+    # None OR too dark to be useful, build the base from the IR stream instead and
+    # flag IR mode so we stamp an "IR" badge. The skeleton is drawn the SAME way
+    # (color-space projection over an IR frame upscaled to the color canvas), so the
+    # owner gets a visible night-vision skeleton instead of a black tile.
+    ir_mode = False
+    color_too_dark = (fresh is not None
+                      and _frame_mean_brightness(fresh) < _KINECT_PREVIEW_DARK_MEAN)
+    if fresh is not None and not color_too_dark:
+        # A usable, lit color frame — cache a copy so a later transient miss can
+        # re-serve it, and use a copy as our base (don't scribble on the bridge's
+        # buffer).
         try:
             base = fresh.copy()
             _kinect_preview_last_color[0] = base
@@ -4068,20 +4223,39 @@ def _compose_kinect_preview(now: float) -> "np.ndarray | None":
             # nothing (and skip caching).
             return fresh
     else:
-        # Color came back None (a transient gap — e.g. just after a runtime
-        # reopen before color re-primes). Rather than blank the preview, fall back
-        # to the LAST cached Kinect color frame so the skeleton tile shows the last
-        # image instead of going dark. Log it (throttled) so this intermittent is
-        # visible in the session log. Only None if we have no cached frame either.
-        _kinect_preview_color_none_logged()
-        base = _last_cached_kinect_color()
-        if base is None:
-            return None
-    # From here the Kinect color frame EXISTS — we must return at least it. Each
-    # step below is independently guarded so no optional overlay can blank it.
+        # Either no color frame, or the room is too dark for color. Prefer the IR
+        # night-vision stream (works in the dark) for the base.
+        ir_base = _compose_ir_preview_base()
+        if ir_base is not None:
+            base = ir_base
+            ir_mode = True
+            _kinect_ir_fallback_logged("color is None" if fresh is None
+                                       else "color frame too dark")
+        elif fresh is not None:
+            # Dark color but NO IR available (e.g. this pykinect2 build doesn't wire
+            # up IR): use the dark color frame anyway (degrade to the old behaviour)
+            # rather than blank the preview. Cache it as the last color.
+            try:
+                base = fresh.copy()
+                _kinect_preview_last_color[0] = base
+            except Exception:
+                return fresh
+        else:
+            # Color came back None and no IR — fall back to the LAST cached color
+            # frame so the skeleton tile shows the last image instead of going dark.
+            # Log it (throttled). Only None if we have no cached frame either.
+            _kinect_preview_color_none_logged()
+            base = _last_cached_kinect_color()
+            if base is None:
+                return None
+    # From here a Kinect base frame (color or IR) EXISTS — we must return at least
+    # it. Each step below is independently guarded so no optional overlay can blank
+    # it.
 
     # Skeleton (+ the air-mouse hand circle, itself guarded inside). Its own
-    # guard so a projection/mapper glitch can't blank the color frame.
+    # guard so a projection/mapper glitch can't blank the base frame. The SAME
+    # color-space projection is used in IR mode (the IR base was upscaled to the
+    # color canvas), so the skeleton + hand circle land correctly either way.
     try:
         bodies = []
         try:
@@ -4091,6 +4265,14 @@ def _compose_kinect_preview(now: float) -> "np.ndarray | None":
         _draw_skeleton_on_color(base, bodies)
     except Exception:
         _kinect_preview_piece_skipped("skeleton")
+
+    # Night-vision badge: stamp "IR" so the owner knows they're seeing the infrared
+    # stream (dark room) rather than the color camera. Optional + guarded.
+    if ir_mode:
+        try:
+            _draw_ir_badge(base)
+        except Exception:
+            _kinect_preview_piece_skipped("ir-badge")
 
     # B3: a brief glowing gesture-name badge when a gesture just fired. Optional.
     try:
