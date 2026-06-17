@@ -15,8 +15,13 @@ touchscreen:
               so the window grows/shrinks in place.
   • MOVE    — slide both hands together (their MIDPOINT, screen-projected) → the
               window translates by the same screen delta.
-  • RELEASE — a hand drops below the engage line / opens / the body is lost → the
-              gesture finishes and the window is left where it is.
+  • RELEASE — EAGER: the instant we can no longer CONFIRM both hands are still
+              tracked AND engaged — either hand drops below the engage line, opens /
+              disengages, goes UNTRACKED / unknown-state, or vanishes from the body
+              frame — the gesture finishes and the window is left where it is. A
+              short ~0.3 s grace dead-man absorbs a 1-frame Kinect joint flicker, but
+              losing sight of ONE hand ALWAYS releases within it; we never wait to
+              cleanly "see" BOTH hands drop (that latched the grab on a lost hand).
 
 Both the smoothed hand-distance AND the resulting rect are EMA-smoothed, then the
 window is moved with a single Win32 SetWindowPos per tick. The rect is clamped to a
@@ -66,6 +71,20 @@ _THREAD_NAME = "kinect-two-hand-skill"
 # baseline distance, so a momentary two-hand raise (reaching past the sensor) does
 # not snatch the window. ~0.2 s ≈ 6 frames at 30 Hz.
 GRAB_HOLD_SEC = 0.20
+
+# RELEASE grace / dead-man: while a window is grabbed, the gesture is finished the
+# instant we can no longer CONFIRM both hands are still tracked AND engaged — a hand
+# dropping below the engage line, opening/disengaging, or going UNTRACKED / lost /
+# unknown-state / vanishing from the body frame all release immediately. This grace
+# is the SAFETY BACKSTOP for the ambiguous case the Kinect produces: a hand whose
+# joint flickers to "inferred"/stale can momentarily still read as engaged, so we
+# never trust a single confirmed frame to keep the grab latched. If "both hands
+# CONFIRMED tracked AND engaged" has not held within this window, the grab AUTO-
+# RELEASES — mirroring the single-hand air-mouse's dead-man (it auto-yields when no
+# tracked controlling hand for ~0.5 s; this is the symmetric two-hand path). Losing
+# sight of ONE hand MUST release; we do NOT wait to cleanly "see" both hands drop.
+# ~0.3 s ≈ 9 frames at 30 Hz, matching the air-mouse's tracking-loss grace.
+RELEASE_GRACE_SEC = 0.30
 
 # Distance + rect smoothing. The hand-distance EMA tames the Kinect's jittery hand
 # joints (the owner's complaint about the old behaviour); the rect EMA keeps the
@@ -241,13 +260,22 @@ class TwoHandController:
     baseline hand-distance + midpoint while grabbed, EMA-smooths the scale + rect,
     and emits the rect the window should have each tick.
 
-    Inject `clock` (monotonic) for the grab-hold timing in tests."""
+    RELEASE is EAGER + dead-man-backed: while grabbed, the gesture finishes the
+    instant we cannot CONFIRM both hands are still tracked AND engaged (a hand drops
+    below the engage line / opens / goes UNTRACKED / unknown-state / disappears), and
+    a `release_grace_sec` safety auto-release fires if that confirmation has not held
+    within the grace — so losing sight of ONE hand can never strand the grab on the
+    window (it does NOT wait to cleanly see BOTH hands drop). This mirrors the single-
+    hand air-mouse's tracking-loss dead-man so the two paths are symmetric.
+
+    Inject `clock` (monotonic) for the grab-hold + release-grace timing in tests."""
 
     def __init__(self, *, grab_hold_sec: float = GRAB_HOLD_SEC,
                  dist_alpha: float = DIST_EMA_ALPHA,
                  rect_alpha: float = RECT_EMA_ALPHA,
                  min_w: int = MIN_WINDOW_W, min_h: int = MIN_WINDOW_H,
                  keep_margin: int = KEEP_ON_SCREEN_MARGIN,
+                 release_grace_sec: float = RELEASE_GRACE_SEC,
                  clock=time.monotonic):
         self._grab_hold_sec = max(0.0, float(grab_hold_sec))
         self._dist_alpha = max(0.0, min(1.0, float(dist_alpha)))
@@ -255,6 +283,7 @@ class TwoHandController:
         self._min_w = int(min_w)
         self._min_h = int(min_h)
         self._keep_margin = int(keep_margin)
+        self._release_grace_sec = max(0.0, float(release_grace_sec))
         self._clock = clock
         self.reset()
 
@@ -262,6 +291,10 @@ class TwoHandController:
         """Drop all grab state (used on release / disable)."""
         self._phase = "idle"          # "idle" | "holding" | "grabbed"
         self._engaged_since: Optional[float] = None
+        # clock() of the LAST frame both hands were CONFIRMED tracked AND engaged —
+        # the dead-man anchor. A grab whose confirmation ages past _release_grace_sec
+        # auto-releases (so one untracked/lost hand can't strand the grab).
+        self._engaged_confirmed_at: Optional[float] = None
         self._grab_dist: Optional[float] = None     # baseline 3D hand-distance
         self._grab_rect: Optional[Rect] = None      # window rect at grab time
         self._grab_mid: Optional[tuple] = None      # midpoint screen-px at grab
@@ -311,13 +344,41 @@ class TwoHandController:
 
         Returns a TwoHandDecision: `rect` is the window rect to apply this tick (None
         when not actively resizing/moving), `resizing` True once grabbed."""
-        # ── RELEASE: a hand dropped / opened / body lost → finish the gesture. ──
-        if not both_engaged or hand_dist is None or midpoint is None:
+        now = self._clock()
+
+        # CONFIRMED = we POSITIVELY see BOTH hands this frame: both clear the engage
+        # lift gate AND we have a live hand-distance AND a midpoint (either being None
+        # means a hand is lost/untracked/unknown-state, so we cannot confirm it). This
+        # is the ONLY thing that keeps a grab alive — we never trust the absence of a
+        # negative signal. Any hand dropping below the line, opening/disengaging, or
+        # going untracked drops `both_engaged`/`hand_dist`/`midpoint` and so flips
+        # this False, which (below) releases — eagerly, with only the grace backstop.
+        confirmed = bool(both_engaged) and hand_dist is not None and midpoint is not None
+
+        # ── NOT CONFIRMED: a hand dropped / opened / went untracked / body lost. ──
+        if not confirmed:
+            # If we're holding a grab, allow a SHORT grace so a 1-frame Kinect joint
+            # flicker doesn't drop the resize mid-gesture — but apply NO window motion
+            # (no SetWindowPos: rect=None) while unconfirmed, and FORCE-RELEASE the
+            # instant the grace elapses since the last confirmed frame. This is the
+            # dead-man: losing sight of one hand releases within ~_release_grace_sec;
+            # we never wait to cleanly see BOTH hands drop. (Mirrors the air-mouse's
+            # tracking-loss grace: button held, cursor parked, then full release.)
+            if (self._phase == "grabbed" and self._release_grace_sec > 0.0
+                    and self._engaged_confirmed_at is not None
+                    and (now - self._engaged_confirmed_at) <= self._release_grace_sec):
+                # Within grace: keep the grab latched but emit NO rect (don't move the
+                # window on a half-seen frame) and DON'T refresh the confirm clock, so
+                # a sustained loss still ages out into the release below.
+                return TwoHandDecision(active=True, rect=None, resizing=True,
+                                       phase="grabbed", hands=hands)
+            # Past the grace (or never grabbed) → finish the gesture, ungrab fully.
             self.reset()
             return TwoHandDecision(active=False, rect=None, resizing=False,
                                    phase="idle", hands=hands)
 
-        now = self._clock()
+        # ── CONFIRMED both hands tracked + engaged this frame → refresh the dead-man.
+        self._engaged_confirmed_at = now
 
         # ── Both hands engaged. Start (or continue) the grab-hold timer. ────────
         if self._phase == "idle":

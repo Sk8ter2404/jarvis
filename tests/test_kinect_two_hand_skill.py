@@ -107,6 +107,34 @@ def _one_up_body(*, up_side="right"):
     }
 
 
+def _one_untracked_body(*, untracked_side="left"):
+    """A body with BOTH hands RAISED+engaged EXCEPT one side's hand joint is MISSING
+    (its hand_<side>/wrist_<side> absent) — i.e. that hand went UNTRACKED / unknown-
+    state / dropped out of the frame while the body is still seen. _arm_extension
+    yields .hand=None for that side, so _both_hands_engaged returns False even though
+    the body is tracked and the other hand is plainly up. This is the exact ambiguous
+    case that used to latch the grab."""
+    tracked_side = "right" if untracked_side == "left" else "left"
+    joints: dict = {
+        "spine_mid": (0.0, 0.0, TORSO_Z, 2),
+        "spine_shoulder": (0.0, SHOULDER_Y, TORSO_Z, 2),
+        "head": (0.0, SHOULDER_Y + 0.3, TORSO_Z, 2),
+    }
+    # The still-tracked, still-raised hand.
+    tx = 0.30 if tracked_side == "right" else -0.30
+    joints.update(_raised_arm_joints(tracked_side, hand_x=tx))
+    # The untracked side: keep the shoulder/elbow but DROP the hand joint entirely.
+    sx = -0.2 if untracked_side == "left" else 0.2
+    joints[f"shoulder_{untracked_side}"] = (sx, SHOULDER_Y, TORSO_Z, 2)
+    joints[f"elbow_{untracked_side}"] = (sx, SHOULDER_Y + 0.05, TORSO_Z - 0.15, 2)
+    # NB: no hand_<untracked_side> / wrist_<untracked_side> key → .hand is None.
+    return {
+        "id": 0, "joints": joints,
+        "head": (0.0, SHOULDER_Y + 0.3, TORSO_Z), "distance_m": TORSO_Z,
+        "facing": True, "hand_right": "open", "hand_left": "open",
+    }
+
+
 def _fake_bridge(*, bodies=None, enabled=True, available=(True, "")):
     m = types.ModuleType("audio.kinect_bridge")
     m.get_enabled = lambda: enabled
@@ -391,7 +419,15 @@ class TwoHandControllerTests(_Base):
         rect = mod.Rect(800, 400, 1600, 1000)
         self._grab(mod, c, clk, rect)
         self.assertTrue(c.is_grabbed)
-        # A hand drops → both_engaged False → RELEASE (idle, inactive, no rect).
+        # A hand drops → both_engaged False. The dead-man grace (default 0.30 s) holds
+        # the grab for the immediate frame WITHOUT moving the window (rect None), then
+        # FULLY RELEASES once the loss persists past the grace. (The grace bridging a
+        # 1-frame flicker + the per-cause eager release are exercised in detail by
+        # ReleaseDeadManTests.)
+        d = c.update(both_engaged=False, hand_dist=None, midpoint=None,
+                     focused_rect=None, bounds=self.BOUNDS, hands=None)
+        self.assertIsNone(d.rect)                 # never moves the window on a lost frame
+        clk.advance(0.35)                         # let the loss age past the 0.30 s grace
         d = c.update(both_engaged=False, hand_dist=None, midpoint=None,
                      focused_rect=None, bounds=self.BOUNDS, hands=None)
         self.assertEqual(d.phase, "idle")
@@ -459,6 +495,275 @@ class TwoHandControllerTests(_Base):
                      hands=((800, 700), (1600, 700)))
         self.assertTrue(d.rect.width > rect.width)           # grew a bit
         self.assertTrue(d.rect.width < int(rect.width * 1.18))   # but < the step cap
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  RELEASE DEAD-MAN — the grab MUST let go the instant it can't confirm BOTH
+#  hands are still tracked + engaged (one lost/dropped/opened hand releases
+#  within the grace); only "both confirmed" keeps resizing. This is the LIVE
+#  bug the owner hit: a half-seen hand used to latch the grab on the window.
+# ══════════════════════════════════════════════════════════════════════════
+class ReleaseDeadManTests(_Base):
+    BOUNDS = (0, 0, 2560, 1440)
+
+    def _ctrl(self, mod, clk, *, grace=0.30):
+        return mod.TwoHandController(clock=clk, dist_alpha=1.0, rect_alpha=1.0,
+                                     grab_hold_sec=0.20, release_grace_sec=grace)
+
+    def _grab(self, mod, c, clk, rect, *, dist=0.40, mid=(1200, 700)):
+        """Drive through the grab-hold so the controller is GRABBED on `rect`."""
+        c.update(both_engaged=True, hand_dist=dist, midpoint=mid,
+                 focused_rect=rect, bounds=self.BOUNDS,
+                 hands=((1000, 700), (1400, 700)))
+        clk.advance(0.25)   # past the hold
+        d = c.update(both_engaged=True, hand_dist=dist, midpoint=mid,
+                     focused_rect=rect, bounds=self.BOUNDS,
+                     hands=((1000, 700), (1400, 700)))
+        self.assertTrue(c.is_grabbed)
+        return d
+
+    # ── (a) one hand goes UNTRACKED → releases within the grace ──────────────
+    def test_one_hand_untracked_releases_within_grace_controller(self):
+        mod = self._load()
+        clk = _Clock()
+        c = self._ctrl(mod, clk, grace=0.30)
+        rect = mod.Rect(800, 400, 1600, 1000)
+        self._grab(mod, c, clk, rect)
+        # A hand goes untracked: the sensor layer can no longer compute the distance/
+        # midpoint (hand joint gone) → hand_dist/midpoint arrive None even though the
+        # other hand is still up. Within the grace the grab is HELD but applies NO
+        # window motion (rect None — we don't move the window on a half-seen frame).
+        clk.advance(0.10)   # < 0.30 grace
+        d = c.update(both_engaged=False, hand_dist=None, midpoint=None,
+                     focused_rect=None, bounds=self.BOUNDS, hands=None)
+        self.assertTrue(c.is_grabbed)          # still latched (within grace)
+        self.assertTrue(d.resizing)
+        self.assertIsNone(d.rect)              # but NO SetWindowPos this frame
+        # The loss persists past the grace → FORCE RELEASE.
+        clk.advance(0.25)   # total 0.35 > 0.30 grace
+        d = c.update(both_engaged=False, hand_dist=None, midpoint=None,
+                     focused_rect=None, bounds=self.BOUNDS, hands=None)
+        self.assertFalse(c.is_grabbed)
+        self.assertFalse(d.active)
+        self.assertFalse(d.resizing)
+        self.assertEqual(d.phase, "idle")
+
+    # ── (b) one hand DROPS below the engage line → releases ──────────────────
+    def test_one_hand_drops_below_line_releases(self):
+        mod = self._load()
+        clk = _Clock()
+        c = self._ctrl(mod, clk, grace=0.30)
+        rect = mod.Rect(800, 400, 1600, 1000)
+        self._grab(mod, c, clk, rect)
+        # A hand drops below the lift line → both_engaged goes False (the sensor still
+        # has a midpoint/dist for the instant of the drop, but the engage gate fails).
+        # Past the grace it must RELEASE; we step straight past the grace here.
+        clk.advance(0.35)   # > 0.30 grace
+        d = c.update(both_engaged=False, hand_dist=0.40, midpoint=(1200, 700),
+                     focused_rect=None, bounds=self.BOUNDS,
+                     hands=((1000, 700), (1400, 700)))
+        self.assertFalse(c.is_grabbed)
+        self.assertFalse(d.active)
+        self.assertIsNone(d.rect)
+
+    def test_one_hand_drops_below_line_releases_end_to_end(self):
+        # Same as (b) but through the REAL sensor plumbing: one hand on the desk →
+        # _both_hands_engaged False → _poll_once releases the grab (no more SetWindowPos).
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        calls, rect_box, fg, swp = PollWin32Tests._spy_win32(self)
+        rect_box[0] = mod.Rect(800, 400, 1600, 1000)
+        clk = _Clock()
+        ctrl = self._ctrl(mod, clk, grace=0.0)   # grace 0 → instant release on loss
+        # Grab with both hands up.
+        wide = _both_up_body(left_x=-0.30, right_x=0.30)
+        with mock.patch.object(self._am, "_bridge",
+                               lambda: _fake_bridge(bodies=[wide])), \
+             mock.patch.object(self._am, "_hand_mirror_enabled", lambda: False):
+            mod._poll_once(ctrl, foreground_target=fg, set_window_pos=swp)
+            clk.advance(0.25)
+            mod._poll_once(ctrl, foreground_target=fg, set_window_pos=swp)
+            self.assertTrue(ctrl.is_grabbed)
+        calls_before = len(calls)
+        # Now one hand drops to the desk → must release (no further window calls).
+        one = _one_up_body(up_side="right")
+        with mock.patch.object(self._am, "_bridge",
+                               lambda: _fake_bridge(bodies=[one])), \
+             mock.patch.object(self._am, "_hand_mirror_enabled", lambda: False):
+            for _ in range(5):
+                d = mod._poll_once(ctrl, foreground_target=fg, set_window_pos=swp)
+        self.assertFalse(ctrl.is_grabbed)
+        self.assertFalse(d.active)
+        # No window moves AFTER the drop (the grab let go).
+        self.assertEqual(len(calls), calls_before)
+
+    # ── (c) one hand OPENS / disengages → releases ───────────────────────────
+    def test_one_hand_opens_releases(self):
+        # Opening a hand is modelled as that hand no longer clearing the engage gate
+        # (the two-hand engage requires both hands raised+extended). The poll layer
+        # collapses any per-hand loss into both_engaged=False / no distance, so the
+        # controller releases once the grace lapses. Drive it past the grace.
+        mod = self._load()
+        clk = _Clock()
+        c = self._ctrl(mod, clk, grace=0.30)
+        rect = mod.Rect(800, 400, 1600, 1000)
+        self._grab(mod, c, clk, rect)
+        clk.advance(0.40)   # > grace
+        d = c.update(both_engaged=False, hand_dist=None, midpoint=None,
+                     focused_rect=None, bounds=self.BOUNDS, hands=None)
+        self.assertFalse(c.is_grabbed)
+        self.assertFalse(d.active)
+
+    # ── (d) BOTH hands stay tracked + engaged → stays grabbed AND keeps resizing
+    def test_both_tracked_engaged_stays_grabbed_and_resizes(self):
+        mod = self._load()
+        clk = _Clock()
+        c = self._ctrl(mod, clk, grace=0.30)
+        rect = mod.Rect(800, 400, 1600, 1000)     # 800x600, centre (1200,700)
+        self._grab(mod, c, clk, rect, dist=0.40)
+        # Both hands remain up + tracked the whole time, spreading apart → it must
+        # STAY grabbed and keep growing the window across many frames (clock advancing
+        # well past the grace each frame, proving the confirm clock keeps refreshing).
+        last = None
+        for _ in range(14):
+            clk.advance(0.05)   # 0.7 s total — far past the 0.30 grace
+            last = c.update(both_engaged=True, hand_dist=0.60, midpoint=(1200, 700),
+                            focused_rect=None, bounds=self.BOUNDS,
+                            hands=((900, 700), (1500, 700)))
+        self.assertTrue(c.is_grabbed)            # never released
+        self.assertTrue(last.resizing)
+        self.assertIsNotNone(last.rect)
+        self.assertEqual((last.rect.width, last.rect.height), (1200, 900))  # grew 1.5×
+        self.assertAlmostEqual(last.rect.cx, 1200.0, delta=2)               # centre held
+
+    def test_both_tracked_engaged_stays_grabbed_end_to_end(self):
+        # (d) through the REAL plumbing: both hands stay up and spread → SetWindowPos
+        # keeps firing with a GROWING rect (the grab is NOT dropped by the dead-man).
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        calls, rect_box, fg, swp = PollWin32Tests._spy_win32(self)
+        rect_box[0] = mod.Rect(800, 400, 1600, 1000)
+        clk = _Clock()
+        ctrl = self._ctrl(mod, clk, grace=0.30)
+        near = _both_up_body(left_x=-0.10, right_x=0.10)
+        with mock.patch.object(self._am, "_bridge",
+                               lambda: _fake_bridge(bodies=[near])), \
+             mock.patch.object(self._am, "_hand_mirror_enabled", lambda: False):
+            mod._poll_once(ctrl, foreground_target=fg, set_window_pos=swp)
+            clk.advance(0.25)
+            mod._poll_once(ctrl, foreground_target=fg, set_window_pos=swp)
+            self.assertTrue(ctrl.is_grabbed)
+        wide = _both_up_body(left_x=-0.30, right_x=0.30)
+        with mock.patch.object(self._am, "_bridge",
+                               lambda: _fake_bridge(bodies=[wide])), \
+             mock.patch.object(self._am, "_hand_mirror_enabled", lambda: False):
+            for _ in range(15):
+                clk.advance(0.05)
+                last = mod._poll_once(ctrl, foreground_target=fg, set_window_pos=swp)
+        self.assertTrue(ctrl.is_grabbed)         # stayed grabbed across the gesture
+        self.assertTrue(calls, "SetWindowPos never fired while both hands held")
+        self.assertGreater(calls[-1][1].width, 800)   # window grew
+        self.assertEqual(calls[-1][1], last.rect)
+
+    # ── (e) TOTAL body loss → releases ───────────────────────────────────────
+    def test_total_body_loss_releases_controller(self):
+        mod = self._load()
+        clk = _Clock()
+        c = self._ctrl(mod, clk, grace=0.30)
+        rect = mod.Rect(800, 400, 1600, 1000)
+        self._grab(mod, c, clk, rect)
+        # Body fully lost → nothing observed at all. Past the grace → RELEASE.
+        clk.advance(0.35)
+        d = c.update(both_engaged=False, hand_dist=None, midpoint=None,
+                     focused_rect=None, bounds=self.BOUNDS, hands=None)
+        self.assertFalse(c.is_grabbed)
+        self.assertFalse(d.active)
+        self.assertEqual(d.phase, "idle")
+
+    def test_total_body_loss_releases_end_to_end(self):
+        # (e) through the REAL plumbing: the bridge reports NO bodies → tracked False
+        # → _poll_once releases the grab and stops moving the window.
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        calls, rect_box, fg, swp = PollWin32Tests._spy_win32(self)
+        rect_box[0] = mod.Rect(800, 400, 1600, 1000)
+        clk = _Clock()
+        ctrl = self._ctrl(mod, clk, grace=0.0)   # instant release on total loss
+        wide = _both_up_body(left_x=-0.30, right_x=0.30)
+        with mock.patch.object(self._am, "_bridge",
+                               lambda: _fake_bridge(bodies=[wide])), \
+             mock.patch.object(self._am, "_hand_mirror_enabled", lambda: False):
+            mod._poll_once(ctrl, foreground_target=fg, set_window_pos=swp)
+            clk.advance(0.25)
+            mod._poll_once(ctrl, foreground_target=fg, set_window_pos=swp)
+            self.assertTrue(ctrl.is_grabbed)
+        calls_before = len(calls)
+        # Body vanishes entirely (no bodies) → release.
+        with mock.patch.object(self._am, "_bridge",
+                               lambda: _fake_bridge(bodies=[])), \
+             mock.patch.object(self._am, "_hand_mirror_enabled", lambda: False):
+            for _ in range(5):
+                d = mod._poll_once(ctrl, foreground_target=fg, set_window_pos=swp)
+        self.assertFalse(ctrl.is_grabbed)
+        self.assertFalse(d.active)
+        self.assertEqual(len(calls), calls_before)   # no window moves after the loss
+
+    # ── (a, end-to-end) one hand UNTRACKED via the sensor layer → releases ───
+    def test_one_hand_untracked_releases_end_to_end(self):
+        # The headline live bug, end-to-end: ONE hand's joint disappears (untracked)
+        # while the body + other hand are still seen. _both_hands_engaged sees a None
+        # hand → both=False → the grab releases (no further SetWindowPos).
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        calls, rect_box, fg, swp = PollWin32Tests._spy_win32(self)
+        rect_box[0] = mod.Rect(800, 400, 1600, 1000)
+        clk = _Clock()
+        ctrl = self._ctrl(mod, clk, grace=0.0)   # grace 0 → release the moment a hand is lost
+        wide = _both_up_body(left_x=-0.30, right_x=0.30)
+        with mock.patch.object(self._am, "_bridge",
+                               lambda: _fake_bridge(bodies=[wide])), \
+             mock.patch.object(self._am, "_hand_mirror_enabled", lambda: False):
+            mod._poll_once(ctrl, foreground_target=fg, set_window_pos=swp)
+            clk.advance(0.25)
+            mod._poll_once(ctrl, foreground_target=fg, set_window_pos=swp)
+            self.assertTrue(ctrl.is_grabbed)
+        calls_before = len(calls)
+        # One hand goes untracked (its hand joint vanishes) — body still tracked.
+        lost = _one_untracked_body(untracked_side="left")
+        with mock.patch.object(self._am, "_bridge",
+                               lambda: _fake_bridge(bodies=[lost])), \
+             mock.patch.object(self._am, "_hand_mirror_enabled", lambda: False):
+            for _ in range(5):
+                d = mod._poll_once(ctrl, foreground_target=fg, set_window_pos=swp)
+        self.assertFalse(ctrl.is_grabbed)         # the headline fix: it LET GO
+        self.assertFalse(d.active)
+        self.assertEqual(len(calls), calls_before)
+
+    # ── grace really does bridge a 1-frame flicker (doesn't over-release) ────
+    def test_single_frame_flicker_is_bridged_then_resumes(self):
+        mod = self._load()
+        clk = _Clock()
+        c = self._ctrl(mod, clk, grace=0.30)
+        rect = mod.Rect(800, 400, 1600, 1000)
+        self._grab(mod, c, clk, rect, dist=0.40)
+        # ONE bad frame (joint flicker) within the grace → HELD, no rect applied.
+        clk.advance(0.03)
+        d = c.update(both_engaged=False, hand_dist=None, midpoint=None,
+                     focused_rect=None, bounds=self.BOUNDS, hands=None)
+        self.assertTrue(c.is_grabbed)
+        self.assertIsNone(d.rect)
+        # Both hands re-confirmed next frame → resumes resizing (grab survived).
+        clk.advance(0.03)
+        d = c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
+                     focused_rect=None, bounds=self.BOUNDS,
+                     hands=((1000, 700), (1400, 700)))
+        self.assertTrue(c.is_grabbed)
+        self.assertTrue(d.resizing)
+        self.assertIsNotNone(d.rect)
 
 
 # ══════════════════════════════════════════════════════════════════════════
