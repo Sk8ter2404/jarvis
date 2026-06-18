@@ -67,6 +67,14 @@ _THREAD_NAME = "kinect-two-hand-skill"
 # not snatch the window. ~0.2 s ≈ 6 frames at 30 Hz.
 GRAB_HOLD_SEC = 0.20
 
+# TWO-HAND DEAD-MAN (FILTER 3): symmetric to the air-mouse's DISENGAGE_GRACE_SEC.
+# A grab may only LATCH on frames where BOTH hands are FULLY Tracked (TrackingState
+# >= 2). If no fully-tracked both-hands frame is seen within this window WHILE
+# grabbed — i.e. the grab is being held alive only by INFERRED/guessed hand joints —
+# the controller force-reset()s, releasing the window. So a grab can't keep resizing
+# on phantom hands the Kinect isn't actually seeing. ~0.30 s matches the air-mouse.
+GRAB_DEADMAN_SEC = 0.30
+
 # Distance + rect smoothing. The hand-distance EMA tames the Kinect's jittery hand
 # joints (the owner's complaint about the old behaviour); the rect EMA keeps the
 # window from twitching frame-to-frame. Higher = snappier / less smooth.
@@ -248,6 +256,7 @@ class TwoHandController:
                  rect_alpha: float = RECT_EMA_ALPHA,
                  min_w: int = MIN_WINDOW_W, min_h: int = MIN_WINDOW_H,
                  keep_margin: int = KEEP_ON_SCREEN_MARGIN,
+                 deadman_sec: float = GRAB_DEADMAN_SEC,
                  clock=time.monotonic):
         self._grab_hold_sec = max(0.0, float(grab_hold_sec))
         self._dist_alpha = max(0.0, min(1.0, float(dist_alpha)))
@@ -255,6 +264,7 @@ class TwoHandController:
         self._min_w = int(min_w)
         self._min_h = int(min_h)
         self._keep_margin = int(keep_margin)
+        self._deadman_sec = max(0.0, float(deadman_sec))
         self._clock = clock
         self.reset()
 
@@ -268,6 +278,13 @@ class TwoHandController:
         self._smoothed_dist: Optional[float] = None
         self._scale: float = 1.0                    # last applied scale
         self._smoothed_rect: Optional[Rect] = None
+        # FILTER 3 (dead-man): clock of the last frame where BOTH hands were FULLY
+        # Tracked. While grabbed, if this ages past _deadman_sec the grab is force-
+        # released (it's being held alive only by inferred/guessed hands).
+        self._last_confirmed_grab_at: Optional[float] = None
+        # FILTER 6 (body-id pin): the id of the body that took the grab; a change
+        # under us is treated as a loss (release) rather than a silent retarget.
+        self._grab_body_id = None
 
     @property
     def phase(self) -> str:
@@ -296,10 +313,12 @@ class TwoHandController:
     def update(self, *, both_engaged: bool, hand_dist: "Optional[float]",
                midpoint: "Optional[tuple]", focused_rect: "Optional[Rect]",
                bounds: "tuple[int, int, int, int]",
-               hands: "Optional[tuple]" = None) -> "TwoHandDecision":
+               hands: "Optional[tuple]" = None, body_id=None) -> "TwoHandDecision":
         """Advance one frame.
 
-        both_engaged: True when BOTH hands clear the raise-to-engage lift gate.
+        both_engaged: True when BOTH hands clear the raise-to-engage lift gate AND
+                      are FULLY Tracked (FILTER 2 — _both_hands_engaged now requires
+                      the TrackingState floor), i.e. a CONFIRMED both-hands frame.
         hand_dist:    the live 3D distance between the two hands (metres), or None.
         midpoint:     the two-hand midpoint projected to a screen pixel (x, y), or
                       None — used for the MOVE translation.
@@ -308,16 +327,55 @@ class TwoHandController:
         bounds:       (origin_x, origin_y, w, h) of the virtual desktop, for the
                       keep-on-screen clamp.
         hands:        the two hands' screen points for the reticles (passed through).
+        body_id:      the id of the controlling body (FILTER 6). Pinned on the grab
+                      edge; a change while grabbed releases (no silent retarget).
 
         Returns a TwoHandDecision: `rect` is the window rect to apply this tick (None
         when not actively resizing/moving), `resizing` True once grabbed."""
-        # ── RELEASE: a hand dropped / opened / body lost → finish the gesture. ──
-        if not both_engaged or hand_dist is None or midpoint is None:
+        now = self._clock()
+
+        # ── HARD RELEASE: the hands are GONE this tick (a hand dropped below the
+        #    line / opened, or the body was lost), so there's no hand data at all.
+        #    Finish the gesture immediately — a deliberate hand-drop releases the
+        #    window at once (no grace; the FILTER 3 grace below is ONLY for a brief
+        #    INFERRED flicker while the hands are still geometrically up). ─────────
+        if hand_dist is None or midpoint is None:
             self.reset()
             return TwoHandDecision(active=False, rect=None, resizing=False,
                                    phase="idle", hands=hands)
 
-        now = self._clock()
+        # ── DEAD-MAN GRACE (FILTER 3, symmetric to the air-mouse tracking grace):
+        #    the hands are still geometrically present but this frame is NOT a
+        #    CONFIRMED fully-tracked both-hands frame (one hand flickered to an
+        #    INFERRED joint, so _both_hands_engaged read False). While GRABBED, HOLD
+        #    the current rect rather than drop the window — but ONLY until
+        #    _deadman_sec since the last fully-tracked confirmation. Past that the
+        #    grab is being kept alive by phantom/inferred hands → force release. A
+        #    grab can therefore never LATCH or persist on inferred frames beyond the
+        #    dead-man window. (Holding pre-grab just stays idle/holding → release.)
+        if not both_engaged:
+            if (self._phase == "grabbed" and self._deadman_sec > 0.0
+                    and self._last_confirmed_grab_at is not None
+                    and (now - self._last_confirmed_grab_at) <= self._deadman_sec):
+                return TwoHandDecision(active=True, rect=self._smoothed_rect,
+                                       resizing=True, phase="grabbed", hands=hands)
+            self.reset()
+            return TwoHandDecision(active=False, rect=None, resizing=False,
+                                   phase="idle", hands=hands)
+
+        # CONFIRMED both-hands frame (both fully Tracked + raised): stamp it for the
+        # FILTER 3 dead-man so a later brief dropout is graced from HERE.
+        self._last_confirmed_grab_at = now
+
+        # ── BODY-ID PIN (FILTER 6): while grabbed, a change of the controlling body
+        #    id (a closer 2nd person took the nearest slot) is a tracking-loss —
+        #    release rather than seamlessly retarget the resize onto the interloper.
+        #    body_id None (caller didn't supply one) disables the pin. ─────────────
+        if (self._phase == "grabbed" and self._grab_body_id is not None
+                and body_id is not None and body_id != self._grab_body_id):
+            self.reset()
+            return TwoHandDecision(active=False, rect=None, resizing=False,
+                                   phase="idle", hands=hands)
 
         # ── Both hands engaged. Start (or continue) the grab-hold timer. ────────
         if self._phase == "idle":
@@ -349,6 +407,7 @@ class TwoHandController:
             self._grab_mid = (float(midpoint[0]), float(midpoint[1]))
             self._smoothed_rect = focused_rect
             self._scale = 1.0
+            self._grab_body_id = body_id   # FILTER 6: pin the controlling body
             # First grabbed frame: leave the window exactly where it is.
             return TwoHandDecision(active=True, rect=focused_rect, resizing=True,
                                    phase="grabbed", hands=hands)
@@ -475,17 +534,56 @@ def _both_hands_engaged(am, left_ext, right_ext, thresholds) -> bool:
     """True when BOTH arms clear the air-mouse's raise-to-engage lift gate (the same
     height hysteresis the single-hand cursor uses). `engaged=False` asks the strict
     ENGAGE bar (not the looser stay-engaged), so a deliberate two-hand RAISE is
-    required to enter the mode. NEVER raises."""
+    required to enter the mode.
+
+    HAND-STATE FLOOR (FILTER 2): BOTH hand joints must be sensor-TRACKED
+    (TrackingState >= 2 — finite, non-zero) before any grab / _dist3 / midpoint math
+    runs. An INFERRED (state 1) 2nd hand — the noisy guess the SDK emits for an
+    occluded / phantom hand — can NOT grab a window or feed a jittery distance: it
+    reads not-engaged. (The shoulder-ref tracking floor is covered transitively —
+    an untracked shoulder ref leaves lift_m None via the air-mouse FILTER 1, so
+    is_extended() already returns False.) NEVER raises."""
     try:
         if left_ext is None or right_ext is None:
             return False
         if left_ext.hand is None or right_ext.hand is None:
+            return False
+        if not (_joint_tracked(am, left_ext.hand)
+                and _joint_tracked(am, right_ext.hand)):
             return False
         return bool(
             left_ext.is_extended(engaged=False, thresholds=thresholds)
             and right_ext.is_extended(engaged=False, thresholds=thresholds))
     except Exception:
         return False
+
+
+def _joint_tracked(am, joint) -> bool:
+    """Whether `joint` is sensor-TRACKED, via the air-mouse's pure joint_well_tracked
+    helper (single source of truth — TrackingState >= 2, finite, non-zero). Falls
+    back to True if an older air-mouse build lacks the helper, so two-hand still
+    works against it (degrades to the prior behaviour). NEVER raises."""
+    try:
+        fn = getattr(am, "joint_well_tracked", None)
+        if callable(fn):
+            return bool(fn(joint))
+    except Exception:
+        pass
+    return True
+
+
+def _controlling_body_id(am):
+    """The id of the NEAREST body from the most recent am._hand_sample() (FILTER 6
+    body-id pin). Read off the air-mouse module's _last_body_id stash so the two
+    skills agree on which body is in control. None when unavailable / no body.
+    NEVER raises."""
+    try:
+        holder = getattr(am, "_last_body_id", None)
+        if isinstance(holder, list) and holder:
+            return holder[0]
+    except Exception:
+        pass
+    return None
 
 
 def _hand_distance(am, left_ext, right_ext) -> "Optional[float]":
@@ -737,8 +835,19 @@ def _poll_once(ctrl: "TwoHandController",
         thresholds = None
 
     both = bool(tracked) and _both_hands_engaged(am, left_ext, right_ext, thresholds)
+    # The controlling body's id (stashed by am._hand_sample above) for the FILTER 6
+    # pin — so a closer 2nd person can't steal the grab mid-resize. None if absent.
+    body_id = _controlling_body_id(am)
 
-    # Project both hands to screen + compute the distance/midpoint when both are up.
+    # Project both hands to screen + compute the distance/midpoint. We do this both
+    # when CONFIRMED (`both`) AND, while already GRABBED, whenever both hand joints
+    # are still geometrically PRESENT (even if this frame's tracking is inferred) —
+    # so the controller's FILTER 3 dead-man grace receives hand data during a brief
+    # inferred flicker (and can HOLD the rect), rather than seeing it as 'hands gone'
+    # and hard-releasing. If the hands are truly gone, hand_dist/mid stay None and
+    # the controller releases at once.
+    hands_present = (left_ext is not None and right_ext is not None
+                     and left_ext.hand is not None and right_ext.hand is not None)
     try:
         reach = am._reach_box_for_virtual_desktop()
     except Exception:
@@ -746,7 +855,7 @@ def _poll_once(ctrl: "TwoHandController",
     p_left = p_right = None
     hand_dist = None
     mid = None
-    if both and reach is not None:
+    if (both or (ctrl.is_grabbed and hands_present)) and reach is not None:
         p_left = _project_hand(reach, left_ext.hand)
         p_right = _project_hand(reach, right_ext.hand)
         hand_dist = _hand_distance(am, left_ext, right_ext)
@@ -783,7 +892,8 @@ def _poll_once(ctrl: "TwoHandController",
             _grab_hwnd[0] = hwnd
 
     decision = ctrl.update(both_engaged=both, hand_dist=hand_dist, midpoint=mid,
-                           focused_rect=focused_rect, bounds=bounds, hands=hands)
+                           focused_rect=focused_rect, bounds=bounds, hands=hands,
+                           body_id=body_id)
 
     # STAND DOWN the single-hand air-mouse whenever two-hand mode is active (incl.
     # the pre-grab hold) so the two never fight the cursor.

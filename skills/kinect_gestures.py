@@ -101,6 +101,26 @@ def _air_mouse_engaged() -> bool:
     return False
 
 
+def _two_hand_active() -> bool:
+    """True while TWO-HAND pinch-to-resize mode is driving (skills/kinect_two_hand).
+    Gestures must ALSO be SUPPRESSED here (FILTER 5): two-hand mode leaves the
+    air-mouse's `engaged` False (the single-hand cursor stands down), so without
+    this check a two-hand SPREAD could be mis-recognised as a SWIPE and fire a
+    'never mind' mid-resize. Reads the air-mouse skill's fresh-heartbeat-gated
+    two_hand_active() via sys.modules (a stale heartbeat reads False, so a dead
+    two-hand poller can never permanently suppress gestures). Returns False when
+    the skill isn't loaded / readable so gestures still work without it. NEVER
+    raises."""
+    try:
+        sk = sys.modules.get("skill_kinect_air_mouse")
+        getter = getattr(sk, "two_hand_active", None) if sk else None
+        if callable(getter):
+            return bool(getter())
+    except Exception:
+        pass
+    return False
+
+
 def _cfg_flag(name: str, default: bool = False) -> bool:
     """Read a live boolean from core.config, tolerating its absence. Read fresh
     each call so a Settings toggle takes effect without a restart."""
@@ -345,19 +365,23 @@ def _poll_once(rec, bc) -> str | None:
     stops dispatch mid-session (the recognizer is still fed so it doesn't see a
     huge time gap when re-enabled — but nothing is dispatched).
 
-    AIR-MOUSE SUPPRESSION: while the air-mouse is ENGAGED (an arm extended OUT,
-    driving the cursor) gesture detection is SUPPRESSED entirely — wave/swipe
-    must only register in the RELAXED state (no arm extended), and the air-mouse
-    takes over the instant the owner reaches out. We RESET the recognizer while
-    engaged so the reach motion can't accumulate in its history and spuriously
-    fire a gesture the instant the arm relaxes; detection re-arms cleanly once the
-    owner relaxes."""
+    AIR-MOUSE / TWO-HAND SUPPRESSION: while the air-mouse is ENGAGED (an arm
+    extended OUT, driving the cursor) OR two-hand pinch-to-resize mode is active
+    (skills/kinect_two_hand — FILTER 5), gesture detection is SUPPRESSED entirely —
+    wave/swipe must only register in the RELAXED state (no arm extended / both hands
+    down), and the cursor stack takes over the instant the owner reaches out. Two-
+    hand mode leaves the air-mouse `engaged` False, so without the two_hand_active()
+    check a two-hand SPREAD could fire a stray SWIPE mid-resize. We RESET the
+    recognizer while suppressed so the reach / resize motion can't accumulate in its
+    history and spuriously fire a gesture the instant the arms relax; detection
+    re-arms cleanly once the owner relaxes."""
     kb = _bridge()
     if kb is None:
         return None
-    # Suppress gestures while the air-mouse owns the cursor (arm extended). Reset
-    # the recognizer so no stale reach-motion lingers to fire on disengage.
-    if _air_mouse_engaged():
+    # Suppress gestures while the air-mouse owns the cursor (arm extended) OR while
+    # two-hand resize mode is driving. Reset the recognizer so no stale reach/resize
+    # motion lingers to fire on disengage.
+    if _air_mouse_engaged() or _two_hand_active():
         try:
             rec.reset()
         except Exception:
