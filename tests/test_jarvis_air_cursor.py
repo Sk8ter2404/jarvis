@@ -355,6 +355,7 @@ class TwoHandRefreshStateTests(unittest.TestCase):
         import time as _t
         ov = object.__new__(self.mod.AirCursorOverlay)
         ov.parent_pid = 12345          # a "real" parent so the orphan cap is skipped
+        ov.parent_start = None         # no --parent-start → PID-exists-only check
         ov._started_at = _t.time()
         ov._last_state_ts = 0.0
         ov._prev_visible = False
@@ -375,7 +376,7 @@ class TwoHandRefreshStateTests(unittest.TestCase):
                  "color": "purple", "ts": _t.time(),
                  "hands": [{"x": 200, "y": 300}, {"x": 1600, "y": 320}],
                  "state": "grab", "x": 200, "y": 300}
-        with mock.patch.object(self.mod, "_is_parent_alive", lambda pid: True), \
+        with mock.patch.object(self.mod, "_is_parent_alive", lambda pid, *a: True), \
              mock.patch.object(self.mod, "_read_state", lambda: frame):
             ok = ov._refresh_state()
         self.assertTrue(ok)
@@ -390,12 +391,91 @@ class TwoHandRefreshStateTests(unittest.TestCase):
         ov = self._ov()
         frame = {"visible": True, "two_hand": False, "ts": _t.time(),
                  "state": "track", "x": 500, "y": 500, "color": "cyan"}
-        with mock.patch.object(self.mod, "_is_parent_alive", lambda pid: True), \
+        with mock.patch.object(self.mod, "_is_parent_alive", lambda pid, *a: True), \
              mock.patch.object(self.mod, "_read_state", lambda: frame):
             ov._refresh_state()
         self.assertFalse(ov.two_hand)
         self.assertIsNone(ov.hand_pts)
         self.assertEqual(ov.state, "track")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  PID-RECYCLE GUARD (P0-2): _is_parent_alive must reject a RECYCLED parent PID
+#  when a --parent-start create_time was captured at spawn — a stranger handed
+#  our dead parent's PID reads as a DIFFERENT birth time and so reads as DEAD.
+# ══════════════════════════════════════════════════════════════════════════
+class _FakeProc:
+    def __init__(self, create_time):
+        self._ct = create_time
+
+    def create_time(self):
+        return self._ct
+
+
+class _FakePsutil:
+    """Minimal psutil stand-in: pid_exists + Process(pid).create_time()."""
+    def __init__(self, *, exists=True, create_time=1000.0, raise_on_process=False):
+        self._exists = exists
+        self._ct = create_time
+        self._raise = raise_on_process
+
+    def pid_exists(self, pid):
+        return self._exists
+
+    def Process(self, pid):
+        if self._raise:
+            raise RuntimeError("no such process")
+        return _FakeProc(self._ct)
+
+
+class ParentAliveRecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.mod = _load_air_cursor(self)
+
+    def _with_psutil(self, fake):
+        # Force the psutil-backed branch with our fake module.
+        self.addCleanup(setattr, self.mod, "psutil", getattr(self.mod, "psutil", None))
+        self.addCleanup(setattr, self.mod, "_HAS_PSUTIL", self.mod._HAS_PSUTIL)
+        self.mod.psutil = fake
+        self.mod._HAS_PSUTIL = True
+
+    def test_no_start_time_falls_back_to_pid_exists(self):
+        # Without --parent-start, behaviour is the historical PID-exists-only:
+        # a live PID reads alive even though its birth time is irrelevant.
+        self._with_psutil(_FakePsutil(exists=True, create_time=555.0))
+        self.assertTrue(self.mod._is_parent_alive(4242))            # no start_time
+        self._with_psutil(_FakePsutil(exists=False))
+        self.assertFalse(self.mod._is_parent_alive(4242))
+
+    def test_matching_start_time_is_alive(self):
+        self._with_psutil(_FakePsutil(exists=True, create_time=1234.5))
+        self.assertTrue(self.mod._is_parent_alive(4242, 1234.5))
+
+    def test_recycled_pid_different_start_time_is_dead(self):
+        # PID exists, but a DIFFERENT birth time → the PID was recycled to a
+        # stranger → DEAD, so the overlay self-closes instead of stranding.
+        self._with_psutil(_FakePsutil(exists=True, create_time=9999.0))
+        self.assertFalse(self.mod._is_parent_alive(4242, 1234.5))
+
+    def test_small_clock_skew_within_epsilon_is_alive(self):
+        # Sub-second jitter between the captured + live create_time must NOT read
+        # as a recycle (the guard allows a 1.0s epsilon).
+        self._with_psutil(_FakePsutil(exists=True, create_time=1000.4))
+        self.assertTrue(self.mod._is_parent_alive(4242, 1000.0))
+
+    def test_dead_pid_with_start_time_is_dead(self):
+        self._with_psutil(_FakePsutil(exists=False, create_time=1234.5))
+        self.assertFalse(self.mod._is_parent_alive(4242, 1234.5))
+
+    def test_unreadable_live_start_time_treated_as_alive(self):
+        # pid_exists True but Process() raises (gone mid-check / access denied) →
+        # treat as alive so a transient race can't strand the overlay.
+        self._with_psutil(_FakePsutil(exists=True, raise_on_process=True))
+        self.assertTrue(self.mod._is_parent_alive(4242, 1234.5))
+
+    def test_nonpositive_pid_is_always_alive(self):
+        self.assertTrue(self.mod._is_parent_alive(0, 1234.5))
+        self.assertTrue(self.mod._is_parent_alive(-1))
 
 
 if __name__ == "__main__":

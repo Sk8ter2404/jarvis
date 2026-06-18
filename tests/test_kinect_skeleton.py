@@ -96,6 +96,28 @@ class ProjectJointsTests(unittest.TestCase):
                                      lambda *a: (px, 540.0))
         self.assertEqual(pts["hand_right"], (px, 540))
 
+    def test_custom_width_height_bounds_projection(self):
+        # P2-6: the compositor passes the REAL canvas size (not the hardcoded
+        # 1920×1080). A point on-frame for 1920×1080 but FAR off a smaller 640×480
+        # canvas-plus-margin must be DROPPED when width/height say 640×480 — proving
+        # the bounds follow the passed shape, not the module default.
+        far = 640 + ks._OFF_FRAME_MARGIN + 50      # past the 640-wide frame+margin
+        joints = {"head": (0.0, 0.0, 2.0, TRACKED)}
+        # Default bounds (1920×1080): the point is comfortably on-frame → kept.
+        kept = ks.project_body_joints(joints, lambda *a: (far, 240.0))
+        self.assertIn("head", kept)
+        # Custom small bounds: the SAME point is now far off-frame → dropped.
+        dropped = ks.project_body_joints(joints, lambda *a: (far, 240.0),
+                                         width=640, height=480)
+        self.assertEqual(dropped, {})
+
+    def test_within_custom_small_frame_is_kept(self):
+        # A point inside a 640×480 canvas is kept under those bounds.
+        pts = ks.project_body_joints({"head": (0.0, 0.0, 2.0, TRACKED)},
+                                     lambda *a: (320.0, 240.0),
+                                     width=640, height=480)
+        self.assertEqual(pts["head"], (320, 240))
+
     def test_color_space_point_object_accepted(self):
         pts = ks.project_body_joints({"head": (0.0, 0.0, 2.0, TRACKED)},
                                      lambda *a: _CSP(640.4, 360.6))

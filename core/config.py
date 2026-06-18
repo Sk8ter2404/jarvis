@@ -436,9 +436,19 @@ MIC_SILENT_WARN_SECONDS = 30.0
 # monitor the robot's eyes turn with you. look_x / look_y are where
 # the robot should aim its eyes (0.0–1.0) when this camera is the only
 # one that can see your face. Ignored for primary.
+#
+# "name" (OPTIONAL) — a case-insensitive substring of the DirectShow device
+# friendly name (as `python bobert_companion.py --list-cameras` prints it).
+# When present, _open_capture resolves the LIVE index by that name at open time
+# (via pygrabber) and PREFERS it over the static "index" — so a USB
+# re-enumeration that shuffles the indices (the mic-shuffle bug class) can't
+# silently point the face tracker at the WRONG camera. The static "index" is the
+# FALLBACK used only when the name doesn't resolve (pygrabber missing / device
+# unplugged). Omit "name" to keep the historical pure-index behaviour. Set it to
+# the owner's two webcams so a re-plug keeps tracking the right one.
 CAMERAS = [
-    {"index": 1, "label": "Left webcam (left monitor)",          "primary": True,  "look_x": 0.5,  "look_y": 0.5},
-    {"index": 0, "label": "Right webcam (top of right monitor)", "primary": False, "look_x": 0.85, "look_y": 0.5},
+    {"index": 1, "label": "Left webcam (left monitor)",          "name": "fullhan webcam", "primary": True,  "look_x": 0.5,  "look_y": 0.5},
+    {"index": 0, "label": "Right webcam (top of right monitor)", "name": "usb 2.0 camera", "primary": False, "look_x": 0.85, "look_y": 0.5},
 ]
 
 # Camera probe — if CAMERAS fails to open, sweep indices 0..MAX-1 and
