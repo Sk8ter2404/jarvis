@@ -322,6 +322,24 @@ KINECT_HAND_MIRROR_DEFAULT = True
 # there's no sample); past it the dead-man fully releases. ~0.3 s per the spec.
 AIR_MOUSE_DISENGAGE_GRACE_SEC = 0.30
 
+# ABSOLUTE cumulative untracked-time CEILING per engagement (FILTER 7). The 0.30 s
+# grace above is renewed on every single Tracked frame, so a body FLICKERING
+# tracked/untracked (one good frame, then lost again) could renew the grace
+# forever and hold a button-down DRAG far longer than 0.30 s of real tracking. To
+# cap that, the controller also sums the time spent UNTRACKED across a single
+# engagement; once it exceeds this ceiling the dead-man force-releases regardless
+# of how recently a lone Tracked frame renewed the per-dropout grace. A run of
+# CONSECUTIVE Tracked frames (a genuinely re-acquired body) RESETS the accumulator
+# so a long, healthy session never trips it — only sustained flicker does. ~0.5 s
+# absolute, comfortably above the 0.30 s single-dropout grace.
+AIR_MOUSE_UNTRACKED_CEILING_SEC = 0.50
+
+# How many CONSECUTIVE fully-Tracked frames re-arm the untracked-time accumulator
+# (FILTER 7): a real re-acquisition (the body is solidly back) clears the summed
+# untracked time, while a lone 1-frame blip between dropouts does NOT. At 30 Hz, 3
+# frames ≈ 100 ms of solid tracking to declare the body re-acquired.
+AIR_MOUSE_RETRACK_FRAMES = 3
+
 # ─── AUTO-YIELD to real input (the air-mouse never fights the real mouse) ─────
 # A low-level input hook (skills/_air_mouse_yield) timestamps the last REAL
 # (non-injected) hardware mouse/keyboard event. While real input happened within
@@ -407,6 +425,40 @@ AIR_CURSOR_STATE_FILE = os.path.join(PROJECT_DIR, "air_cursor_state.json")
 # ══════════════════════════════════════════════════════════════════════════
 #  PURE CORE (no sensor, no mouse, no Qt — unit-tested directly)
 # ══════════════════════════════════════════════════════════════════════════
+
+# Kinect v2 TrackingState slot (the 4th element of a joint tuple): 0=NotTracked,
+# 1=Inferred (the SDK GUESSED the position — noisy + unreliable), 2=Tracked. The
+# interaction skills must act ONLY on joints the sensor actually SEES (state >= 2),
+# never on an inferred/guessed joint, so a phantom 2nd-hand / occluded joint can't
+# drive the cursor, grab a window, or fire a click. (FILTERS 1/2/4 — mirrors the
+# bridge arm_extension TrackingState fix on another branch.)
+JOINT_TRACKED_STATE = 2
+
+
+def joint_well_tracked(joint, *, min_state: int = JOINT_TRACKED_STATE) -> bool:
+    """True iff `joint` is a usable, sensor-TRACKED joint: it carries (x, y, z) +
+    a TrackingState slot [3] >= min_state, its coords are FINITE, and it is NOT
+    the exact-zero (0, 0, 0) origin sentinel the SDK emits for an unseen joint.
+    An INFERRED (state 1) or NOT-tracked (state 0) joint, a degenerate all-zero
+    joint, or a NaN/±inf coordinate all read FALSE so the gate / click / grab
+    code leaves them alone. PURE; NEVER raises (a malformed joint reads False)."""
+    try:
+        if not joint or len(joint) < 4:
+            return False
+        if int(joint[3]) < int(min_state):
+            return False
+        x, y, z = float(joint[0]), float(joint[1]), float(joint[2])
+        # Reject non-finite coords (NaN / ±inf) — they'd poison the lift/dist math.
+        for v in (x, y, z):
+            if v != v or v == float("inf") or v == float("-inf"):
+                return False
+        # Reject the exact-zero origin sentinel (an unseen joint reads (0, 0, 0)).
+        if x == 0.0 and y == 0.0 and z == 0.0:
+            return False
+        return True
+    except (TypeError, ValueError, IndexError):
+        return False
+
 
 class ReachBox:
     """The comfortable reach-box → VIRTUAL-DESKTOP mapping.
@@ -867,7 +919,9 @@ class AirMouseController:
                  clock=time.monotonic,
                  switch_margin: float = HAND_SWITCH_MARGIN,
                  switch_frames: int = HAND_SWITCH_FRAMES,
-                 engage_debounce_frames: int = AIR_MOUSE_ENGAGE_DEBOUNCE_FRAMES):
+                 engage_debounce_frames: int = AIR_MOUSE_ENGAGE_DEBOUNCE_FRAMES,
+                 untracked_ceiling_sec: float = AIR_MOUSE_UNTRACKED_CEILING_SEC,
+                 retrack_frames: int = AIR_MOUSE_RETRACK_FRAMES):
         self.reach = reach
         self._ema_x = EMA(alpha)
         self._ema_y = EMA(alpha)
@@ -895,6 +949,20 @@ class AirMouseController:
         self._switch_frames = max(1, int(switch_frames))
         self._challenge_side: Optional[str] = None   # the side currently challenging
         self._challenge_count = 0                    # its consecutive-lead streak
+        # BODY-ID PIN (FILTER 6): the id of the body that took control on the
+        # engage edge. While engaged the controller drives ONLY this body; if the
+        # nearest body's id CHANGES (a closer 2nd person) it is treated as a
+        # tracking-loss (dead-man release + EMA reset) rather than a seamless
+        # retarget, so a passer-by can't steal the cursor mid-drag.
+        self._locked_body_id = None
+        # GRACE CAP (FILTER 7): cumulative UNTRACKED time this engagement + the
+        # clock of the last frame (to integrate the gap), and a consecutive-Tracked
+        # streak that re-arms (zeroes) the accumulator on a solid re-acquisition.
+        self._untracked_ceiling_sec = max(0.0, float(untracked_ceiling_sec))
+        self._retrack_frames = max(1, int(retrack_frames))
+        self._untracked_accum = 0.0      # summed untracked seconds this engagement
+        self._retrack_streak = 0         # consecutive fully-Tracked frames
+        self._last_frame_at: Optional[float] = None   # clock() of the prior frame
 
     def reset(self) -> None:
         """Drop all smoothing + grip + engage state. Used by the dead-man and on
@@ -914,6 +982,10 @@ class AirMouseController:
         self._engage_streak = 0
         self._challenge_side = None
         self._challenge_count = 0
+        self._locked_body_id = None
+        self._untracked_accum = 0.0
+        self._retrack_streak = 0
+        self._last_frame_at = None
 
     @property
     def button_is_down(self) -> bool:
@@ -956,6 +1028,12 @@ class AirMouseController:
         self._engage_streak = 0
         self._challenge_side = None
         self._challenge_count = 0
+        # FILTER 6/7: drop the body-id pin + the grace-cap accumulators so the next
+        # engagement re-locks a body and starts a fresh untracked budget.
+        self._locked_body_id = None
+        self._untracked_accum = 0.0
+        self._retrack_streak = 0
+        self._last_frame_at = None
         self._ema_x.reset()
         self._ema_y.reset()
         self._grip_left.reset(initial="open")
@@ -973,6 +1051,18 @@ class AirMouseController:
         cross the threshold."""
         return AirMouseDecision(cursor=None, left=None, right=None,
                                 overlay="hidden", hand=None, grip="open")
+
+    @staticmethod
+    def _grip_if_tracked(ext, raw_grip: str) -> str:
+        """The grip to feed a hand's debouncer, gated on the hand's JOINT being
+        sensor-TRACKED (FILTER 4). Returns the raw grip ONLY when `ext` has a
+        well-tracked hand joint (TrackingState >= 2, finite, non-zero); otherwise
+        "unknown" — which GripDebouncer._canon treats as 'no evidence', so an
+        untracked / inferred / missing hand can never press a button (its
+        debouncer just holds). PURE."""
+        if ext is None or ext.hand is None or not joint_well_tracked(ext.hand):
+            return "unknown"
+        return raw_grip
 
     def _hand_button_edge(self, debouncer: GripDebouncer, raw_grip: str,
                           down_attr: str) -> Optional[str]:
@@ -1036,9 +1126,32 @@ class AirMouseController:
             self._challenge_count = 0
         return holder
 
+    @staticmethod
+    def _both_hands_raised(left_ext, right_ext,
+                           thresholds: "Optional[dict]") -> bool:
+        """True when the controller LOCALLY sees BOTH hands raised above the strict
+        ENGAGE line (FILTER 8 pre-empt). Mirrors kinect_two_hand._both_hands_engaged
+        exactly — both arms present, both with a sensor-tracked hand joint, both
+        clearing the engage (not the looser stay-engaged) bar — so the single-hand
+        cursor stands down the instant the owner raises a second hand, without
+        waiting for the cross-process two-hand heartbeat. PURE; NEVER raises."""
+        try:
+            if left_ext is None or right_ext is None:
+                return False
+            if left_ext.hand is None or right_ext.hand is None:
+                return False
+            if not (joint_well_tracked(left_ext.hand)
+                    and joint_well_tracked(right_ext.hand)):
+                return False
+            return bool(
+                left_ext.is_extended(engaged=False, thresholds=thresholds)
+                and right_ext.is_extended(engaged=False, thresholds=thresholds))
+        except Exception:
+            return False
+
     def update(self, left_ext, right_ext, left_grip: str, right_grip: str,
                tracked: bool, thresholds: "Optional[dict]" = None,
-               real_input_recent: bool = False
+               real_input_recent: bool = False, body_id=None
                ) -> AirMouseDecision:
         """Advance one frame.
 
@@ -1053,15 +1166,30 @@ class AirMouseController:
         real_input_recent: True when the owner touched their REAL mouse/keyboard
             within the yield window — the air-mouse YIELDS: force-disengage, release
             any held button, and stay SUPPRESSED (cannot re-engage) this frame.
+        body_id: the id of the NEAREST body this frame (or None). The controller
+            PINS the body that took control (FILTER 6): once engaged it drives ONLY
+            that id; if the nearest-body id CHANGES (a closer 2nd person) it is a
+            tracking-loss (release + EMA reset), never a seamless retarget.
 
         DISENGAGES (returns cursor=None — no SetCursorPos — and releases any held
         button) when real input is recent (AUTO-YIELD), when the body/hand is NOT
-        tracked, or when NEITHER hand is raised above the shoulder. A brief tracking
-        dropout while ENGAGED is tolerated for up to the grace window (button held,
-        cursor parked) before the full release. The cursor follows the
+        tracked, when the controlling BODY-ID changed under it, when BOTH hands are
+        raised (two-hand mode pre-empt), or when NEITHER hand is raised above the
+        shoulder. A brief tracking dropout while ENGAGED is tolerated for up to the
+        grace window (button held, cursor parked) before the full release — but
+        cumulative untracked time is capped per engagement so a FLICKERING body
+        can't renew the grace forever (FILTER 7). The cursor follows the
         highest-raised hand with HAND-HYSTERESIS (no thrash between two raised
         hands); per-hand close→click is evaluated for BOTH hands every engaged frame
         regardless of which one drives the cursor."""
+        # Integrate the inter-frame gap for the FILTER 7 untracked-time cap, then
+        # remember this frame's time for the next call. Done first so every return
+        # path below has an up-to-date clock baseline.
+        now = self._clock()
+        dt = 0.0
+        if self._last_frame_at is not None:
+            dt = max(0.0, now - self._last_frame_at)
+        self._last_frame_at = now
         # ── AUTO-YIELD: the owner just touched their real mouse/keyboard. Release
         #    everything and stay SUPPRESSED this frame — the real input always wins,
         #    immediately, and the air-mouse cannot re-engage until the window
@@ -1071,15 +1199,51 @@ class AirMouseController:
         # ── tracking-loss path, with a short grace so a 1-frame dropout doesn't
         #    disengage + re-snap (a held drag must survive a flicker). ──────────
         if not tracked:
-            if (self._engaged and self._grace_sec > 0.0
-                    and (self._clock() - self._last_engaged_at) <= self._grace_sec):
+            # FILTER 7: sum the untracked gap. A run of CONSECUTIVE Tracked frames
+            # (below) re-arms (zeroes) this; an untracked frame breaks the streak.
+            self._retrack_streak = 0
+            if self._engaged:
+                self._untracked_accum += dt
+            within_grace = (self._engaged and self._grace_sec > 0.0
+                            and (now - self._last_engaged_at) <= self._grace_sec)
+            within_ceiling = (self._untracked_ceiling_sec <= 0.0
+                              or self._untracked_accum <= self._untracked_ceiling_sec)
+            if within_grace and within_ceiling:
                 # Brief dropout: hold. No sample → no cursor motion; keep any held
                 # button and the current overlay. Do NOT refresh the engage clock,
-                # so a sustained dropout still ages out into a full release.
+                # so a sustained dropout still ages out into a full release. The
+                # cumulative cap above force-releases a body that keeps flickering
+                # back for a single frame to renew the per-dropout grace.
                 overlay = "grab" if self.button_is_down else "track"
                 return AirMouseDecision(cursor=None, left=None, right=None,
                                         overlay=overlay, hand=self._hand,
                                         grip=self._controlling_grip())
+            return self.release_decision()
+
+        # ── BODY-ID PIN (FILTER 6): while engaged we drive ONLY the body that took
+        #    control. If the nearest-body id changed under us (a closer 2nd person
+        #    stole the "nearest" slot), treat it as tracking-loss — full dead-man
+        #    release (which clears the EMA + pin) so the cursor does NOT seamlessly
+        #    jump onto the interloper mid-drag. Re-engage will re-lock the new body
+        #    cleanly. body_id None (caller didn't supply one) disables the pin. ───
+        if (self._engaged and self._locked_body_id is not None
+                and body_id is not None and body_id != self._locked_body_id):
+            return self.release_decision()
+
+        # FILTER 7: a fully-Tracked frame — advance the re-acquisition streak and,
+        # once solidly back (≥ retrack_frames in a row), zero the untracked budget
+        # so a long healthy session never trips the cap.
+        self._retrack_streak += 1
+        if self._retrack_streak >= self._retrack_frames:
+            self._untracked_accum = 0.0
+
+        # ── TWO-HAND PRE-EMPT (FILTER 8): if the controller LOCALLY observes BOTH
+        #    hands raised above the engage line, STAND DOWN immediately rather than
+        #    waiting for the cross-process two-hand heartbeat (which lags a frame).
+        #    This closes the 1-frame entry twitch where the single-hand cursor would
+        #    grab one hand on the very frame the owner raised the second. Computed
+        #    with the strict ENGAGE bar so it matches the two-hand poller's gate. ─
+        if self._both_hands_raised(left_ext, right_ext, thresholds):
             return self.release_decision()
 
         # ── HEIGHT gate: pick the controlling hand (highest above the shoulder,
@@ -1102,14 +1266,18 @@ class AirMouseController:
                 return self._hold_off_decision()
 
         # ── ENGAGED. On the rising edge (was disengaged) snap the smoothing to
-        #    the new hand position so the cursor doesn't sweep from a stale value.
+        #    the new hand position so the cursor doesn't sweep from a stale value,
+        #    and LOCK the controlling body's id (FILTER 6) so a later id change is
+        #    treated as tracking-loss rather than a silent retarget.
         if not self._engaged:
             self._ema_x.reset()
             self._ema_y.reset()
+            self._locked_body_id = body_id
+            self._untracked_accum = 0.0   # fresh untracked budget for this grab
         self._engaged = True
         self._engage_streak = 0       # met the bar; clear so a later re-engage re-debounces
         self._hand = arm.side
-        self._last_engaged_at = self._clock()
+        self._last_engaged_at = now
 
         # Smooth the controlling hand's position, then map to a pixel.
         # (REVERTED 2026-06-09: the v1.73.0 body-relative/absolute "tablet" remap was
@@ -1122,8 +1290,22 @@ class AirMouseController:
         # Per-hand clicks: evaluate BOTH hands every engaged frame so either hand
         # can click regardless of which drives the cursor. LEFT hand → LEFT
         # button, RIGHT hand → RIGHT button.
-        left_edge = self._hand_button_edge(self._grip_left, left_grip, "_left_down")
-        right_edge = self._hand_button_edge(self._grip_right, right_grip, "_right_down")
+        #
+        # CLICK TRACKING-STATE FLOOR (FILTER 4): only a hand the Kinect ACTUALLY
+        # SEES may press/hold a button. For each hand, if its JOINT isn't
+        # sensor-tracked (TrackingState >= 2 — i.e. it's an INFERRED / phantom 2nd
+        # hand, or its arm couldn't be read at all) feed the debouncer "unknown"
+        # instead of the raw grip. _canon maps "unknown" to "no evidence" → the
+        # debouncer HOLDS its current state (no down-edge on an untracked hand; a
+        # genuine in-progress drag isn't dropped by a 1-frame loss either — the
+        # dead-man owns release). So an inferred hand reading "closed" can never
+        # fire a click.
+        left_edge = self._hand_button_edge(
+            self._grip_left, self._grip_if_tracked(left_ext, left_grip),
+            "_left_down")
+        right_edge = self._hand_button_edge(
+            self._grip_right, self._grip_if_tracked(right_ext, right_grip),
+            "_right_down")
 
         overlay = "grab" if self.button_is_down else "track"
         return AirMouseDecision(cursor=cursor, left=left_edge, right=right_edge,
@@ -1698,11 +1880,20 @@ def _local_arm_extension(joints: dict, side: str) -> dict:
         # HEIGHT / LIFT (PRIMARY gate): hand Y above the shoulder line. Prefer
         # spine_shoulder, fall back to the same-side shoulder. Camera y is UP, so
         # lift_m > 0 = hand at/above the shoulder; a desk-resting hand is well below.
+        #
+        # TRACKING-STATE FLOOR (FILTER 1, mirrors the bridge arm_extension fix on
+        # another branch): compute lift_m ONLY when BOTH the hand joint AND the
+        # shoulder-ref joint are sensor-TRACKED (TrackingState slot [3] >= 2),
+        # finite, and not the exact-zero origin sentinel. An INFERRED (state 1) or
+        # not-tracked hand/ref — the noisy guess the SDK emits for an occluded or
+        # phantom 2nd-hand joint — leaves lift_m None, so the height gate cannot
+        # engage on a hand the Kinect doesn't actually see (fail safe: the real
+        # mouse is left alone). shoulder_ref_y is likewise only published when its
+        # joint is well-tracked, so a half-seen body never feeds the gate.
         shoulder_ref = joints.get("spine_shoulder")
-        if not (shoulder_ref and len(shoulder_ref) >= 2):
+        if not joint_well_tracked(shoulder_ref):
             shoulder_ref = shoulder
-        if (shoulder_ref is not None and len(shoulder_ref) >= 2
-                and hand and len(hand) >= 2):
+        if joint_well_tracked(shoulder_ref) and joint_well_tracked(hand):
             out["shoulder_ref_y"] = float(shoulder_ref[1])
             out["lift_m"] = float(hand[1]) - float(shoulder_ref[1])
         body_ref = None
@@ -1772,6 +1963,13 @@ def _arm_extension(bridge, joints: dict, side: str) -> "ArmExtension":
         return ArmExtension(side, None, None, None)
 
 
+# The NEAREST body's id from the most recent _hand_sample(), stashed here so
+# _poll_once can pass it to AirMouseController.update(body_id=...) WITHOUT changing
+# _hand_sample's 5-tuple return arity (FILTER 6 body-id pin). Module-list so it
+# survives across calls; None when no body was in view this tick.
+_last_body_id: list = [None]
+
+
 def _hand_sample(bridge) -> tuple["Optional[ArmExtension]", "Optional[ArmExtension]",
                                   str, str, bool]:
     """Read the per-arm extension + per-hand grips from the bridge:
@@ -1780,10 +1978,13 @@ def _hand_sample(bridge) -> tuple["Optional[ArmExtension]", "Optional[ArmExtensi
     left_ext / right_ext are the ArmExtension (forward-reach + straightness +
     controlling-hand joint) for each arm of the NEAREST body, or None when that
     arm's joints aren't usable. left_grip / right_grip are that body's raw grips.
-    tracked is whether a body was in view. NEVER raises — any failure degrades to
-    (None, None, "unknown", "unknown", False) which the controller treats as a
-    dead-man release (no arm extended / not tracked → disengaged)."""
+    tracked is whether a body was in view. As a side effect, stashes the nearest
+    body's id in _last_body_id[0] (FILTER 6) — None when no body. NEVER raises —
+    any failure degrades to (None, None, "unknown", "unknown", False) which the
+    controller treats as a dead-man release (no arm extended / not tracked →
+    disengaged)."""
     none_result = (None, None, "unknown", "unknown", False)
+    _last_body_id[0] = None
     try:
         if not bridge.get_enabled():
             return none_result
@@ -1804,6 +2005,12 @@ def _hand_sample(bridge) -> tuple["Optional[ArmExtension]", "Optional[ArmExtensi
         body = min((b for b in bodies if isinstance(b, dict)), key=_key)
     except (TypeError, ValueError):
         return none_result
+
+    # Stash the controlling body's id for the FILTER 6 pin (best-effort).
+    try:
+        _last_body_id[0] = body.get("id")
+    except Exception:
+        _last_body_id[0] = None
 
     joints = body.get("joints") or {}
     left_grip = (body.get("hand_left") or "unknown").lower()
@@ -2001,10 +2208,14 @@ def _poll_once(ctrl: AirMouseController, bridge) -> Optional[AirMouseDecision]:
     # held button, and stays suppressed this frame. (Fresh-heartbeat-gated, so a
     # dead two-hand poller can't strand the cursor.)
     yielding = real_input_recent() or two_hand_active()
+    # The nearest body's id this tick (stashed by _hand_sample) so the controller
+    # PINS the controlling body and releases — rather than silently retargets — if
+    # a closer 2nd person steals the "nearest" slot mid-drag (FILTER 6).
+    body_id = _last_body_id[0]
     try:
         decision = ctrl.update(left_ext, right_ext, left_grip, right_grip,
                                tracked, thresholds=thresholds,
-                               real_input_recent=yielding)
+                               real_input_recent=yielding, body_id=body_id)
     except Exception:
         # A controller error must not strand a held button — force a release.
         try:

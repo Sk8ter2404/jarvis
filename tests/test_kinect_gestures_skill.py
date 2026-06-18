@@ -233,14 +233,17 @@ class _StubRec:
 
 
 class _FakeAirMouseSkill(types.ModuleType):
-    """A stand-in skills/kinect_air_mouse exposing only get_air_mouse_state, so
-    the gesture skill's _air_mouse_engaged() can read the engaged flag. Injected
+    """A stand-in skills/kinect_air_mouse exposing get_air_mouse_state (the engaged
+    flag) AND two_hand_active() (FILTER 5 — two-hand pinch-resize heartbeat), so the
+    gesture skill's _air_mouse_engaged() / _two_hand_active() can read them. Injected
     as sys.modules['skill_kinect_air_mouse'] (the loader's module name)."""
-    def __init__(self, engaged=False):
+    def __init__(self, engaged=False, two_hand=False):
         super().__init__("skill_kinect_air_mouse")
         self._engaged = bool(engaged)
+        self._two_hand = bool(two_hand)
         self.get_air_mouse_state = lambda: {
             "engaged": self._engaged, "hand": "right", "grip": "open", "ts": 0.0}
+        self.two_hand_active = lambda: self._two_hand
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -306,6 +309,60 @@ class AirMouseSuppressionTests(_Base):
         self.assertEqual(rec.updates, 0)
         # Relax → the same queued gesture now fires (detection resumed).
         self._set_air_mouse(False)
+        self.assertEqual(mod._poll_once(rec, bc), kg.WAVE)
+        self.assertTrue(rec.resets >= 1 and rec.updates == 1)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  FILTER 5 — TWO-HAND SUPPRESSION: gestures are ALSO suppressed while two-hand
+#  pinch-to-resize mode is active (it leaves the air-mouse `engaged` False, so a
+#  two-hand SPREAD must not be mis-read as a SWIPE mid-resize).
+# ══════════════════════════════════════════════════════════════════════════
+class TwoHandSuppressionTests(_Base):
+    def _set_air_mouse(self, *, engaged=False, two_hand=False):
+        self._inject("skill_kinect_air_mouse",
+                     _FakeAirMouseSkill(engaged=engaged, two_hand=two_hand))
+
+    def test_two_hand_active_helper_reads_skill(self):
+        mod = self._load()
+        self._set_air_mouse(two_hand=True)
+        self.assertTrue(mod._two_hand_active())
+        self._set_air_mouse(two_hand=False)
+        self.assertFalse(mod._two_hand_active())
+
+    def test_two_hand_active_false_when_skill_absent(self):
+        mod = self._load()
+        self._inject("skill_kinect_air_mouse", None)
+        self.assertFalse(mod._two_hand_active())
+
+    def test_gesture_suppressed_while_two_hand_active(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        # air-mouse NOT engaged, but TWO-HAND mode IS active.
+        self._set_air_mouse(engaged=False, two_hand=True)
+        bc = _fake_bc(standby=True, sleep=True)
+        self._inject("audio.kinect_bridge", _fake_bridge(bodies=[{"x": 1}]))
+        rec = _StubRec([kg.SWIPE_LEFT])
+        got = mod._poll_once(rec, bc)
+        self.assertIsNone(got)                  # gesture SUPPRESSED
+        self.assertEqual(rec.updates, 0)        # detection skipped entirely
+        self.assertGreaterEqual(rec.resets, 1)  # recognizer reset while resizing
+        self.assertTrue(bc._standby_mode[0])    # NOT woken / no side effect
+
+    def test_gesture_fires_once_two_hand_releases(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        bc = _fake_bc(standby=True, sleep=True)
+        self._inject("audio.kinect_bridge", _fake_bridge(bodies=[{"x": 1}]))
+        # While two-hand active: suppressed.
+        self._set_air_mouse(two_hand=True)
+        rec = _StubRec([kg.WAVE])
+        self.assertIsNone(mod._poll_once(rec, bc))
+        self.assertEqual(rec.updates, 0)
+        # Two-hand releases → the same queued gesture fires.
+        self._set_air_mouse(two_hand=False)
         self.assertEqual(mod._poll_once(rec, bc), kg.WAVE)
         self.assertTrue(rec.resets >= 1 and rec.updates == 1)
 

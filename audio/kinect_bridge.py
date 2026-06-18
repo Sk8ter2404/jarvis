@@ -79,8 +79,19 @@ def _load_patched(name: str, subs):
     for pat, rep in subs:
         src = re.sub(pat, rep, src, flags=re.M)
     mod = importlib.util.module_from_spec(spec)
+    # Insert into sys.modules ONLY after a clean exec. The old code registered the
+    # half-built module BEFORE exec, so if exec raised (a patch that left the source
+    # un-runnable) the broken module stuck in sys.modules and EVERY later
+    # import_pykinect2() returned it via the cache short-circuit above — poisoning
+    # the whole bridge after one bad load. Register-after-exec; on failure drop any
+    # partial entry and re-raise as ImportError so the next call re-attempts cleanly.
+    try:
+        exec(compile(src, spec.origin, "exec"), mod.__dict__)
+    except Exception as e:
+        sys.modules.pop(name, None)
+        raise ImportError(f"{name}: patched exec failed: "
+                          f"{type(e).__name__}: {e}") from e
     sys.modules[name] = mod
-    exec(compile(src, spec.origin, "exec"), mod.__dict__)
     return mod
 
 
@@ -183,12 +194,30 @@ _lock = threading.RLock()
 _runtime: list[Any] = [None]
 _open_error: list[Optional[str]] = [None]
 _negative_until = [0.0]            # monotonic; available() negative-cache expiry
-_NEGATIVE_CACHE_SEC = 30.0
+# Shortened from 30s: the sensor re-arrival latency (the owner plugging the Kinect
+# back in / a prior holder releasing it) should be felt within a few seconds, not
+# blocked for half a minute. clear_negative_cache() lets a caller bypass it
+# outright when it knows the sensor just (re)appeared.
+_NEGATIVE_CACHE_SEC = 5.0
 # A just-hard-killed prior instance can still hold the sensor when we reopen;
 # PyKinectRuntime() then returns a live object that never streams a frame.
 # Verify real frames arrive and retry so a restart can't latch a dead runtime.
 _OPEN_STREAM_RETRIES = 4
 _OPEN_STREAM_RETRY_SEC = 1.5
+# Guards the UNLOCKED open/verify/retry work so two callers don't both pound the
+# (single-consumer) sensor with concurrent PyKinectRuntime() opens. The publish of
+# the winning runtime still happens under _lock; this only serialises the slow
+# verify so the loser waits for the winner instead of racing it (M2).
+_open_attempt_lock = threading.Lock()
+
+
+def clear_negative_cache() -> None:
+    """Forget any cached 'sensor unavailable' verdict so the very next available()/
+    get_runtime() re-probes the SDK immediately instead of waiting out the negative
+    cache. Call this when the sensor is known to have just (re)appeared. NEVER
+    raises."""
+    _negative_until[0] = 0.0
+    _open_error[0] = None
 
 
 def _frame_source_flags(pk2):
@@ -238,41 +267,87 @@ def _safe_close_runtime(rt) -> None:
         pass
 
 
-def _open_runtime_locked():
-    """Open (or return the cached) PyKinectRuntime. Caller holds _lock.
-    Returns (runtime, None) or (None, reason)."""
-    if _runtime[0] is not None:
-        return _runtime[0], None
-    if not _ENABLED:
-        return None, ("Kinect is disabled — set KINECT_ENABLED = True to "
-                      "enable (it's off by default for privacy).")
-    try:
-        pk2, rt_mod = import_pykinect2()
-    except ImportError:
-        return None, "pykinect2 not installed — pip install pykinect2"
-    except Exception as e:   # pragma: no cover - patch-loader compile/exec failure
-        return None, f"pykinect2 failed to load: {type(e).__name__}: {e}"
-    last = None
-    for _attempt in range(_OPEN_STREAM_RETRIES):
-        try:
-            rt = rt_mod.PyKinectRuntime(_frame_source_flags(pk2))
-        except Exception as e:
-            return None, f"could not open Kinect sensor: {type(e).__name__}: {e}"
-        if _runtime_streams(rt):
+def _publish_runtime(rt) -> Any:
+    """Adopt `rt` as the shared runtime under _lock, or — if another caller already
+    published one while we were verifying (the race a second accessor loses) — close
+    OUR loser and return the established winner. Returns the live runtime that is now
+    in _runtime[0]. Seeds both staleness clocks + starts the body pump on a genuine
+    fresh open (M1). NEVER raises."""
+    with _lock:
+        if _runtime[0] is not None and _runtime[0] is not rt:
+            winner = _runtime[0]
+            adopt_loser = True
+        else:
             _runtime[0] = rt
             _open_error[0] = None
-            # Seed BOTH staleness clocks so the freshly-verified runtime gets a
-            # full window to stream before any stale-reset could fire (the verify
-            # above already confirmed a color frame, so color is live right now).
+            # Seed BOTH staleness clocks so the freshly-verified runtime gets a full
+            # window to stream before any stale-reset could fire (the verify already
+            # confirmed a color frame, so color is live right now).
             now0 = time.monotonic()
             _last_body_frame_at[0] = now0
             _last_color_frame_at[0] = now0
-            if _attempt:
-                print(f"  [kinect] sensor live after {_attempt + 1} open attempts")
-            return rt, None
-        last = "opened but no frames streaming"
+            winner = rt
+            adopt_loser = False
+    if adopt_loser:
+        # A peer won the race; release our redundant handle so the sensor isn't
+        # held twice. Outside the lock — close() can block on a half-dead handle.
         _safe_close_runtime(rt)
-        time.sleep(_OPEN_STREAM_RETRY_SEC)
+    else:
+        # Fresh open → make sure the always-on body pump is running so the body pipe
+        # is kept warm (it only flows while something reads it). start_body_pump is
+        # singleton-guarded + no-ops when disabled, so this is safe to call here as
+        # well as from set_enabled(True) (M1).
+        _ensure_pump_alive()
+    return winner
+
+
+def _open_runtime_locked():
+    """Open (or return the cached) PyKinectRuntime. Returns (runtime, None) or
+    (None, reason).
+
+    Despite the name (kept for call-site stability) this NO LONGER does its slow
+    work under _lock (M2): the old version held _lock across up to 2.5 s of stream
+    verification × 4 attempts × 1.5 s sleeps (~16 s worst case), blocking EVERY
+    accessor and the voice loop on a single hiccup. Now the verify/retry/sleep runs
+    UNLOCKED (serialised only against other openers by _open_attempt_lock) and we
+    re-acquire _lock just to publish the winning runtime — so a concurrent
+    get_presence()/get_bodies() that finds _runtime[0] already set never waits on
+    the opener at all."""
+    # Fast path: already open. A plain read of the single-cell list is atomic under
+    # the GIL, so this common case needs no lock.
+    rt0 = _runtime[0]
+    if rt0 is not None:
+        return rt0, None
+    if not _ENABLED:
+        return None, ("Kinect is disabled — set KINECT_ENABLED = True to "
+                      "enable (it's off by default for privacy).")
+    # Serialise the slow open so two callers don't both hammer the single-consumer
+    # sensor with concurrent opens. Whoever loses the lock re-checks the cache on
+    # entry and rides the winner's published runtime.
+    with _open_attempt_lock:
+        rt0 = _runtime[0]
+        if rt0 is not None:
+            return rt0, None
+        try:
+            pk2, rt_mod = import_pykinect2()
+        except ImportError:
+            return None, "pykinect2 not installed — pip install pykinect2"
+        except Exception as e:   # pragma: no cover - patch-loader compile/exec failure
+            return None, f"pykinect2 failed to load: {type(e).__name__}: {e}"
+        last = None
+        for _attempt in range(_OPEN_STREAM_RETRIES):
+            try:
+                rt = rt_mod.PyKinectRuntime(_frame_source_flags(pk2))
+            except Exception as e:
+                return None, f"could not open Kinect sensor: {type(e).__name__}: {e}"
+            if _runtime_streams(rt):
+                winner = _publish_runtime(rt)
+                if _attempt:
+                    print(f"  [kinect] sensor live after {_attempt + 1} open attempts")
+                return winner, None
+            last = "opened but no frames streaming"
+            _safe_close_runtime(rt)
+            time.sleep(_OPEN_STREAM_RETRY_SEC)
     return None, (f"Kinect opened but streamed no frames after "
                   f"{_OPEN_STREAM_RETRIES} attempts ({last}); sensor may be "
                   f"held by another process")
@@ -280,9 +355,13 @@ def _open_runtime_locked():
 
 def get_runtime() -> tuple[Any, Optional[str]]:
     """Return (PyKinectRuntime, None) with Color|Body|Depth|Infrared open, or
-    (None, reason) if disabled / unavailable. Never raises."""
-    with _lock:
-        return _open_runtime_locked()
+    (None, reason) if disabled / unavailable. Never raises.
+
+    No longer wraps the open in _lock: _open_runtime_locked() now does its own fine-
+    grained locking (a brief publish under _lock, the slow verify under a separate
+    open-attempt lock) so this accessor no longer blocks every other caller for the
+    whole open (M2)."""
+    return _open_runtime_locked()
 
 
 def available() -> tuple[bool, str]:
@@ -291,18 +370,21 @@ def available() -> tuple[bool, str]:
     presence poller, kinect_status) don't re-probe the SDK every call when no
     sensor is attached. A positive result is NOT cached here — the live
     runtime in _runtime[0] is the cache."""
-    with _lock:
-        if _runtime[0] is not None:
-            return True, ""
-        now = time.monotonic()
-        if now < _negative_until[0] and _open_error[0]:
-            return False, _open_error[0]
-        rt, err = _open_runtime_locked()
-        if rt is not None:
-            return True, ""
-        _open_error[0] = err or "Kinect unavailable"
-        _negative_until[0] = now + _NEGATIVE_CACHE_SEC
+    if _runtime[0] is not None:
+        # Sensor is open. Make sure the body pump that keeps the body pipe warm is
+        # actually alive — if its thread died, restart it so we don't sit on an open
+        # runtime whose body stream silently quiesced with nothing reading it (H2).
+        _ensure_pump_alive()
+        return True, ""
+    now = time.monotonic()
+    if now < _negative_until[0] and _open_error[0]:
         return False, _open_error[0]
+    rt, err = _open_runtime_locked()
+    if rt is not None:
+        return True, ""
+    _open_error[0] = err or "Kinect unavailable"
+    _negative_until[0] = now + _NEGATIVE_CACHE_SEC
+    return False, _open_error[0]
 
 
 # ─── frame accessors ──────────────────────────────────────────────────────
@@ -328,7 +410,16 @@ def get_color_bgr(require_new: bool = True):
         return None
     try:
         import numpy as np
-        if require_new and not rt.has_new_color_frame():
+        # Capture whether a genuinely NEW color frame is pending BEFORE we read the
+        # buffer (H1). get_last_color_frame() re-serves the SAME buffer for a
+        # require_new=False peek even when nothing new arrived, so stamping the color
+        # clock on every byte-returning call (as the old code did) kept
+        # _last_color_frame_at fresh forever — including on the ~30 Hz pump's
+        # require_new=False prime — so "color is stale" could NEVER become true on a
+        # fully-dead sensor and the both-plane stale-reset never fired. Stamp ONLY
+        # when had_new; still SERVE the re-served buffer for require_new=False peeks.
+        had_new = rt.has_new_color_frame()
+        if require_new and not had_new:
             return None
         flat = rt.get_last_color_frame()
         if flat is None:
@@ -337,9 +428,11 @@ def get_color_bgr(require_new: bool = True):
         if arr.size != 1920 * 1080 * 4:
             return None
         bgra = arr.reshape((1080, 1920, 4))
-        # Stamp the COLOR staleness clock: a real frame was delivered, so the
-        # stale-reset must NOT count color as quiet (the preview-keep-alive fix).
-        note_color_frame_seen()
+        # Stamp the COLOR staleness clock ONLY on a real new frame (the preview-keep-
+        # alive fix): a re-served stale buffer must NOT count as the color stream
+        # being live, or the both-plane stale-reset can never fire (H1).
+        if had_new:
+            note_color_frame_seen()
         return bgra[:, :, :3]   # BGRA → BGR (drop alpha)
     except Exception:   # pragma: no cover - defensive: mid-stream frame glitch
         return None
@@ -377,11 +470,18 @@ def get_infrared_gray():
         return None
     try:
         import numpy as np
-        # Probe defensively: this build lacks get_last_infrared_frame entirely.
+        # Probe BOTH the readiness check AND the getter defensively (M4): this build
+        # lacks get_last_infrared_frame entirely, and a build that wires one but not
+        # the other would have made the old code (which probed only the getter but
+        # called has_new_infrared_frame directly) AttributeError into the broad
+        # except — indistinguishable from "no frame". Bail cleanly if EITHER is
+        # missing so a partial IR build degrades to None rather than a swallowed
+        # raise.
         getter = getattr(rt, "get_last_infrared_frame", None)
-        if not callable(getter):
+        has_new = getattr(rt, "has_new_infrared_frame", None)
+        if not callable(getter) or not callable(has_new):
             return None
-        if not rt.has_new_infrared_frame():
+        if not has_new():
             return None
         flat = getter()
         if flat is None:
@@ -462,25 +562,51 @@ def _get_cached_bodies(now: Optional[float] = None) -> Optional[list]:
     return list(bodies)
 
 
-def _read_and_cache_bodies() -> list[dict]:
-    """The SOLE sensor-frame reader. If a new body frame is pending, read it ONCE,
-    parse it, publish to the shared cache, and stamp the staleness clock; return
-    the freshly-parsed bodies. When no NEW frame is pending, return the last cached
-    bodies if still fresh (so a direct caller racing the pump still gets data),
-    else []. NEVER raises — used by the pump every tick AND by get_bodies() as the
-    cold/stale fallback, so all sensor-frame contact funnels through here."""
+def _read_and_cache_bodies(consume: bool = True) -> list[dict]:
+    """The body-frame reader. NEVER raises.
+
+    consume=True (the PUMP only): when a new body frame is pending, read it ONCE
+    (which CLEARS has_new_body_frame), parse it, publish to the shared cache, and
+    stamp the staleness clock; return the freshly-parsed bodies. This is the SOLE
+    path that actually consumes the sensor's single-consumer body frame.
+
+    consume=False (get_bodies()'s cold/stale FALLBACK): a non-pump consumer must NOT
+    steal the body frame from the pump + the other consumers (H3). The body frame is
+    single-consumer — get_last_body_frame() clears the new-frame flag — so a
+    consumer that consumed it here would blank the pump and every other poller that
+    tick. So when consume=False: if the PUMP is alive, NEVER clear the flag — serve
+    the cache (even marginally stale: the pump will refresh it within ~33 ms) and
+    leave the pending frame for the pump. Only when NO pump is alive (a lone consumer
+    with nothing else reading) does consume=False fall through to a real read, so a
+    pump-less caller still isn't left blind.
+
+    When no NEW frame is pending either way, return the last cached bodies if still
+    fresh (so a direct caller racing the pump still gets data), else []."""
     rt, _ = get_runtime()
     if rt is None:
         return []
     try:
         has_new = getattr(rt, "has_new_body_frame", None)
-        if not callable(has_new) or not has_new():
+        pending = callable(has_new) and has_new()
+        if not pending:
             # No new frame to consume this tick — serve a still-fresh cache so two
             # readers in the same frame don't see []; else nothing to report.
             fresh = _get_cached_bodies()
             return fresh if fresh is not None else []
-        # A real new body frame is arriving — stamp the staleness clock (PART B)
-        # so an actively-read, healthy stream never trips the stale-reset.
+        if not consume and _pump_is_alive():
+            # A new frame IS pending but we're a non-consuming fallback and the pump
+            # is alive: do NOT steal the frame. Serve the cache if we have anything
+            # at all (even past the freshness window — the pump refreshes it next
+            # tick); only fall to [] when the cache is genuinely cold. We deliberately
+            # peek the raw cache cell here (not _get_cached_bodies, which drops a
+            # stale entry) so a consumer racing one tick ahead of the pump still gets
+            # the last bodies instead of a spurious [].
+            with _body_cache_lock:
+                cached = _body_cache[0]
+            return list(cached) if cached is not None else []
+        # We ARE going to consume the frame (the pump, or a pump-less lone consumer).
+        # Stamp the staleness clock (PART B) so an actively-read, healthy stream
+        # never trips the stale-reset, then take the single frame (clears the flag).
         note_body_frame_seen()
         frame = rt.get_last_body_frame()
     except Exception:   # pragma: no cover - defensive: mid-stream readiness/getter glitch
@@ -600,7 +726,14 @@ def arm_extension(joints: dict, side: str) -> dict:
 
     straightness ≈ 1 when the arm is straightened out, and drops toward ~0.5-0.7
     when the elbow is bent and the hand pulled back; forward_reach_m / reach_ratio
-    are retained as weak SECONDARY cues only (the height gate is primary)."""
+    are retained as weak SECONDARY cues only (the height gate is primary).
+
+    TRACKING-STATE FLOOR: lift_m (the PRIMARY gate) is computed ONLY when BOTH the
+    controlling hand and the shoulder reference are FULLY TRACKED (TrackingState
+    >= 2) with real finite non-zero-fill coords — otherwise it stays None and the
+    gate fails safe (is_extended treats None as NOT extended). The demoted
+    forward/straightness cues are NOT floored this way (they can't engage on their
+    own), so they may still populate off inferred joints for the debug log."""
     out = {"side": side, "hand": None, "forward_reach_m": None,
            "reach_ratio": None, "body_scale_m": None,
            "straightness": None, "shoulder_hand_m": None, "arm_len_m": None,
@@ -611,16 +744,25 @@ def arm_extension(joints: dict, side: str) -> dict:
         hand = joints.get(f"hand_{side}") or joints.get(f"wrist_{side}")
         out["hand"] = hand
         # HEIGHT / LIFT (the PRIMARY gate): hand Y vs a shoulder-line Y reference.
-        # Prefer spine_shoulder (the shoulder-line centre, the steadiest reference
-        # and unaffected by raising either arm); fall back to the same-side
-        # shoulder. Kinect camera-space y increases UPWARD, so lift_m > 0 means the
-        # hand is at/above the shoulder (raised to point), and a hand resting on the
-        # desk sits well below the shoulder (lift_m strongly negative).
+        # Kinect camera-space y increases UPWARD, so lift_m > 0 means the hand is
+        # at/above the shoulder (raised to point), and a hand resting on the desk
+        # sits well below the shoulder (lift_m strongly negative).
+        # TRACKING-STATE FLOOR (item 9): the lift gate is the air-mouse's PRIMARY
+        # engage signal, so it must rest on RELIABLY-TRACKED joints only. Require
+        # BOTH the controlling hand AND the shoulder reference to be fully TRACKED
+        # (state >= 2) with real, non-zero-fill, finite coords before computing
+        # lift_m; otherwise leave it None. An Inferred (1) or NotTracked (0,
+        # zero-filled) joint is the SDK's guess and would fabricate a bogus "raised"
+        # lift from noise — engaging the cursor off a hand the sensor can't actually
+        # see. is_extended() already fails safe on lift_m is None (→ NOT extended),
+        # so leaving it None here simply declines to engage rather than guessing.
+        # Prefer spine_shoulder (the shoulder-line centre, steadiest + unaffected by
+        # raising either arm); fall back to the same-side shoulder only if IT is
+        # reliably tracked. Kinect camera-space y increases UPWARD.
         shoulder_ref = joints.get("spine_shoulder")
-        if not (shoulder_ref and len(shoulder_ref) >= 2):
-            shoulder_ref = shoulder
-        if (shoulder_ref is not None and len(shoulder_ref) >= 2
-                and hand and len(hand) >= 2):
+        if not _joint_reliable(shoulder_ref):
+            shoulder_ref = shoulder if _joint_reliable(shoulder) else None
+        if shoulder_ref is not None and _joint_reliable(hand):
             out["shoulder_ref_y"] = float(shoulder_ref[1])
             out["lift_m"] = float(hand[1]) - float(shoulder_ref[1])
         # FORWARD-DEPTH (weak secondary cue): hand z vs a torso depth reference
@@ -690,6 +832,42 @@ def _tracked(j) -> bool:
     >= 1 here (a position the SDK is willing to report) and let callers that
     need a firmer fix demand state >= 2 themselves."""
     return j is not None and len(j) >= 4 and int(j[3]) >= 1
+
+
+# A joint is RELIABLE for the gating geometry (the air-mouse lift gate) only when
+# its TrackingState is fully TRACKED (>= 2). Inferred (1) joints are the SDK's
+# best GUESS for an occluded joint and read as noisy/zero-filled positions — using
+# them for the engage gate let an inferred or NotTracked-zero-filled hand fabricate
+# a "raised" lift and engage the cursor. Mirrors kinect_pointing._joint_ok /
+# MIN_TRACKING_STATE = 2. Also rejects the SDK's NotTracked zero-fill (x==y==z==0.0)
+# and any non-finite coordinate, both of which read as a spurious position.
+_MIN_RELIABLE_TRACKING_STATE = 2
+
+
+def _joint_reliable(j) -> bool:
+    """True when a (x, y, z, tracking_state) joint is FULLY TRACKED (state >= 2)
+    AND carries a real, finite, non-zero-fill position. False for a missing /
+    too-short tuple, an Inferred/NotTracked joint, the NotTracked zero-fill
+    (x==y==z==0.0), or any NaN/Inf coordinate. Pure; never raises."""
+    try:
+        if not j or len(j) < 4:
+            return False
+        if int(j[3]) < _MIN_RELIABLE_TRACKING_STATE:
+            return False
+        x, y, z = float(j[0]), float(j[1]), float(j[2])
+        # NotTracked frames zero-fill the position; treat an exact (0,0,0) as
+        # untracked rather than a hand sitting precisely on the sensor origin.
+        if x == 0.0 and y == 0.0 and z == 0.0:
+            return False
+        # Reject non-finite coords (NaN/Inf) that would poison the lift arithmetic.
+        if not (x == x and y == y and z == z):   # NaN != itself
+            return False
+        if x in (float("inf"), float("-inf")) or y in (float("inf"), float("-inf")) \
+                or z in (float("inf"), float("-inf")):
+            return False
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 def _body_facing_yaw(joints: dict) -> Optional[float]:
@@ -865,9 +1043,15 @@ def get_bodies() -> list[dict]:
     cached = _get_cached_bodies()
     if cached is not None:
         return cached
-    # Cache cold/stale and no fresh frame to serve — do a single direct read so a
-    # lone consumer (or the first tick before the pump warms) isn't left blind.
-    return _read_and_cache_bodies()
+    # Cache cold/stale. If the pump SHOULD be running but its thread died, this is
+    # also where we notice (a consumer asking with a cold cache) — restart it so the
+    # body pipe self-heals instead of staying permanently blind (H2).
+    _ensure_pump_alive()
+    # Do a single NON-CONSUMING fallback read so a lone consumer (or the first tick
+    # before the pump warms) isn't left blind — but never steal the frame from the
+    # pump (H3): with a live pump this serves the cache and leaves the pending frame
+    # for the pump; only a genuinely pump-less caller reads the sensor directly.
+    return _read_and_cache_bodies(consume=False)
 
 
 def get_color_space_mapper():
@@ -1069,6 +1253,38 @@ _body_pump_stop = threading.Event()
 _body_pump_lock = threading.Lock()
 
 
+def _pump_is_alive() -> bool:
+    """True iff the body pump thread exists and is running. A cheap read used by
+    the non-consuming fallback (H3) to decide whether a consumer may read the
+    sensor directly (no pump → yes) or must leave the frame for the pump (pump
+    alive → serve the cache). NEVER raises."""
+    t = _body_pump_thread[0]
+    try:
+        return t is not None and t.is_alive()
+    except Exception:   # pragma: no cover - defensive: odd thread object
+        return False
+
+
+def _ensure_pump_alive() -> bool:
+    """Restart the always-on body pump if it SHOULD be running (KINECT enabled) but
+    its thread is dead or missing — the self-heal for "the pump thread died and
+    nothing restarted it, so the sensor went permanently blind" (H2). reset_if_body_
+    stale + the reopen run ONLY from the pump, so a dead pump means no stale-reset
+    ever fires again; this is called from get_bodies()'s cold/stale fallback,
+    available(), and reset_if_body_stale's re-seed so any of those notices + revives
+    it. start_body_pump() is singleton-guarded (no-ops when a pump is already alive
+    or when disabled), so this is safe to call freely. Returns True iff it (re)started
+    a pump. NEVER raises."""
+    if not _ENABLED:
+        return False
+    if _pump_is_alive():
+        return False
+    try:
+        return start_body_pump()
+    except Exception:   # pragma: no cover - defensive: start already guards
+        return False
+
+
 def note_body_frame_seen(now: Optional[float] = None) -> None:
     """Stamp the time a fresh body frame was observed (the staleness clock).
     Called by get_bodies() on a real frame AND by the pump, so a healthy stream
@@ -1168,6 +1384,10 @@ def reset_if_body_stale(now: Optional[float] = None) -> bool:
                 closer()
             except Exception:   # pragma: no cover - defensive: close on a half-dead runtime
                 pass
+    # The reopen is driven by the pump; if the pump thread has died, the reset we
+    # just performed would never be followed by a reopen and the sensor would stay
+    # dark. Make sure the pump is alive so the next tick reopens the live stream (L2).
+    _ensure_pump_alive()
     return True
 
 
@@ -1206,29 +1426,58 @@ def _pump_tick() -> None:
         pass
 
 
-def _body_pump_loop() -> None:  # pragma: no cover - non-terminating daemon; _pump_tick is unit-tested directly
-    """Always-on daemon: tick the body pump until the stop event is set or the
-    bridge is disabled. Cheap — a few getattr + a readiness poll per tick."""
-    while not _body_pump_stop.is_set():
+# PER-LOOP stop Event (M3). The old design shared one module-level Event that a
+# new start_body_pump() CLEARED — so a fast set_enabled(False)→(True) could clear
+# the stop before the OLD loop noticed it, leaving two pumps fighting over the
+# single-consumer body frame. Each loop now closes over its OWN Event and also
+# checks its thread identity, so a superseded loop exits promptly even if a newer
+# start re-cleared the shared event. _body_pump_stop_current holds the live loop's
+# Event so stop_body_pump() can signal exactly the running one; _body_pump_token
+# holds its unique identity for the supersede check.
+_body_pump_stop_current: list[Any] = [None]
+_body_pump_token: list[Any] = [None]
+
+
+def _body_pump_loop(stop: "threading.Event", token: object) -> None:  # pragma: no cover - non-terminating daemon; _pump_tick is unit-tested directly
+    """Always-on daemon: tick the body pump until told to exit. `stop` is THIS
+    loop's own Event (not the shared one) and `token` is this loop's unique
+    identity; the loop exits when its own stop is set, the shared stop is set, the
+    bridge is disabled, OR it has been SUPERSEDED (a newer start installed a
+    different token in _body_pump_token) — the identity check that guarantees a fast
+    disable→enable can't leave two pumps fighting the single-consumer body frame
+    (M3). Cheap — a few getattr + a readiness poll per tick."""
+    while not stop.is_set() and not _body_pump_stop.is_set():
+        # Superseded by a newer pump, or disabled → stand down so only the current
+        # pump reads the single-consumer body frame.
+        if _body_pump_token[0] is not token or not _ENABLED:
+            return
         try:
             _pump_tick()
         except Exception:
             pass
-        _body_pump_stop.wait(BODY_PUMP_INTERVAL_SEC)
+        stop.wait(BODY_PUMP_INTERVAL_SEC)
 
 
 def start_body_pump() -> bool:
     """Start the always-on body-frame pump (singleton — never two). Called from
     set_enabled(True). Returns True iff it started a NEW thread; False if one was
-    already running or the bridge is disabled. The thread self-exits when
-    _body_pump_stop is set (close/disable) and is a daemon so it never blocks
-    shutdown."""
+    already running or the bridge is disabled. The thread self-exits when its own
+    stop Event is set (close/disable) or it is superseded, and is a daemon so it
+    never blocks shutdown."""
     with _body_pump_lock:
         if not _ENABLED:
             return False
         t = _body_pump_thread[0]
         if t is not None and getattr(t, "is_alive", lambda: False)():
             return False
+        # Fresh PER-LOOP stop Event + identity token so a prior loop (whose Event we
+        # do NOT clear, and whose token we now supersede) stands down — the M3 fix.
+        # Clear the shared event too (legacy callers / belt-and-braces) without
+        # disturbing the old loop, which keys off its own Event + the token check.
+        stop = threading.Event()
+        token = object()
+        _body_pump_stop_current[0] = stop
+        _body_pump_token[0] = token
         _body_pump_stop.clear()
         # Seed BOTH freshness clocks so a just-enabled pump gives the streams a
         # full window to come up before the stale-reset could fire.
@@ -1236,7 +1485,7 @@ def start_body_pump() -> bool:
         _last_body_frame_at[0] = now0
         _last_color_frame_at[0] = now0
         t = threading.Thread(target=_body_pump_loop, name="kinect-body-pump",
-                             daemon=True)
+                             args=(stop, token), daemon=True)
         _body_pump_thread[0] = t
         t.start()
         return True
@@ -1247,9 +1496,19 @@ def stop_body_pump() -> None:
     Called from close()/set_enabled(False). Also drops the shared body cache so a
     closed/disabled sensor reports [] immediately rather than serving a stale body
     list for up to BODY_CACHE_FRESH_SEC after the stream is gone."""
+    # Signal BOTH the shared event (legacy) AND the live loop's own Event (M3) so
+    # the currently-running pump exits even though each loop now keys off its own.
     _body_pump_stop.set()
+    cur = _body_pump_stop_current[0]
+    if cur is not None:
+        try:
+            cur.set()
+        except Exception:   # pragma: no cover - defensive: odd event object
+            pass
     with _body_pump_lock:
         _body_pump_thread[0] = None
+        _body_pump_stop_current[0] = None
+        _body_pump_token[0] = None
     # Invalidate the cache: with no pump reading, a lingering entry must not be
     # served. None (not []) so get_bodies() treats it as cold → one-shot read.
     with _body_cache_lock:

@@ -194,7 +194,19 @@ def _colorref(hex_color: str) -> int:
     return (b << 16) | (g << 8) | r
 
 
-def _is_parent_alive(pid: int) -> bool:
+def _is_parent_alive(pid: int, start_time: "float | None" = None) -> bool:
+    """True while the spawning JARVIS is still alive.
+
+    PID-RECYCLE GUARD (P0-2): a bare pid_exists() can read TRUE for a STRANGER
+    that the OS handed our dead parent's recycled PID — leaving this click-through
+    overlay stranded on top of an unrelated process. When ``start_time`` (the
+    parent's psutil create_time() captured at spawn, passed via --parent-start) is
+    given, we additionally require the live process at ``pid`` to report the SAME
+    create_time (within a small epsilon): a recycled PID has a DIFFERENT start
+    time and so reads as DEAD. Without a start_time (e.g. the air-mouse spawn,
+    which doesn't pass one) we fall back to the historical PID-exists-only check.
+    A transient/unknowable lookup is treated as ALIVE so a hiccup can't strand the
+    overlay."""
     if pid <= 0:
         return True
     if _HAS_PSUTIL:
@@ -202,9 +214,21 @@ def _is_parent_alive(pid: int) -> bool:
         # error; treat an unknowable parent as alive (matches the other HUDs)
         # so a hiccup can't strand this click-through layer.
         try:
-            return psutil.pid_exists(pid)
+            if not psutil.pid_exists(pid):
+                return False
         except Exception:
             return True
+        if start_time is not None:
+            try:
+                # A recycled PID reads as DEAD: same number, different birth time.
+                if abs(psutil.Process(pid).create_time() - start_time) > 1.0:
+                    return False
+            except Exception:
+                # Can't read the live process's start time (gone between the
+                # exists-check and here, or access denied) — treat as alive so a
+                # transient race can't strand the overlay.
+                return True
+        return True
     try:
         os.kill(pid, 0)
         return True
@@ -228,8 +252,13 @@ def _lerp(a: float, b: float, t: float) -> float:
 
 
 class AirCursorOverlay:
-    def __init__(self, x: int, y: int, w: int, h: int, parent_pid: int):
+    def __init__(self, x: int, y: int, w: int, h: int, parent_pid: int,
+                 parent_start: "float | None" = None):
         self.parent_pid = parent_pid
+        # Parent's create_time() captured at spawn (--parent-start), for the
+        # PID-recycle guard in _is_parent_alive. None when the spawner didn't
+        # pass one (the air-mouse path) → PID-exists-only fallback.
+        self.parent_start = parent_start
         # The virtual-desktop span the air-mouse operates over. We don't paint a
         # window this big any more — we only use it to clamp the small follow-
         # window so its top-left stays a sane on-desktop coordinate.
@@ -597,7 +626,7 @@ class AirCursorOverlay:
         False when the overlay should CLOSE (parent dead / long stale / orphan
         cap)."""
         now = time.time()
-        if not _is_parent_alive(self.parent_pid):
+        if not _is_parent_alive(self.parent_pid, self.parent_start):
             return False
         # Orphan cap: no real parent and we've lived too long → exit.
         if self.parent_pid <= 0 and (now - self._started_at) > ORPHAN_MAX_LIFETIME_S:
@@ -802,10 +831,15 @@ def main():
     parser.add_argument("--width", type=int, default=2560)
     parser.add_argument("--height", type=int, default=1440)
     parser.add_argument("--parent-pid", type=int, default=0)
+    # Parent's psutil create_time() at spawn — enables the PID-recycle guard in
+    # _is_parent_alive. Optional (<=0 / absent → PID-exists-only fallback) so a
+    # spawner that doesn't pass it (the air-mouse) still works unchanged.
+    parser.add_argument("--parent-start", type=float, default=0.0)
     args = parser.parse_args()
 
     overlay = AirCursorOverlay(
         args.x, args.y, args.width, args.height, args.parent_pid,
+        parent_start=(args.parent_start if args.parent_start > 0 else None),
     )
     overlay.run()
 

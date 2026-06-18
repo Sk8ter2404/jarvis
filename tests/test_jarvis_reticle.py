@@ -32,6 +32,7 @@ import importlib.util
 import os
 import sys
 import unittest
+from unittest import mock
 
 
 _HUD_DIR = os.path.join(
@@ -110,6 +111,168 @@ class PrimaryWorkAreaBottomTests(unittest.TestCase):
         # "linux") the non-Windows guard fires and no ctypes.windll is touched.
         if sys.platform != "win32":
             self.assertIsNone(self.mod._primary_work_area_bottom())
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  BLACKOUT BACKSTOP (P2-7): the reticle now actively re-keys the colour-key via
+#  Win32 (like the air-cursor), and its degraded-alpha fallback is LOW (faint),
+#  not a near-opaque sheet over four monitors.
+# ══════════════════════════════════════════════════════════════════════════
+class ClickThroughBackstopTests(unittest.TestCase):
+    def setUp(self):
+        self.mod = _load_reticle(self)
+
+    def test_exstyle_ors_in_layered_and_transparent(self):
+        out = self.mod._click_through_exstyle(0)
+        self.assertTrue(out & self.mod.WS_EX_LAYERED)
+        self.assertTrue(out & self.mod.WS_EX_TRANSPARENT)
+        self.assertTrue(out & self.mod.WS_EX_NOACTIVATE)
+        self.assertTrue(out & self.mod.WS_EX_TOOLWINDOW)
+
+    def test_exstyle_preserves_existing_bits(self):
+        sentinel = 0x00000400
+        out = self.mod._click_through_exstyle(sentinel)
+        self.assertTrue(out & sentinel)
+        self.assertTrue(out & self.mod.WS_EX_LAYERED)
+
+    def test_colorref_byte_order(self):
+        # #4cc9ff → COLORREF 0x00ffc94c (0x00bbggrr).
+        self.assertEqual(self.mod._colorref("#4cc9ff"), 0xFFC94C)
+        self.assertEqual(self.mod._colorref("010101"), 0x010101)
+
+    def test_source_relayers_colorkey_after_exstyle(self):
+        # The root-cause fix: after SetWindowLongW touches WS_EX_LAYERED the code
+        # MUST re-establish the colour-key via SetLayeredWindowAttributes(COLORKEY)
+        # or the full-desktop layered window composites OPAQUE (the blackout).
+        path = os.path.join(_HUD_DIR, "jarvis_reticle.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("SetLayeredWindowAttributes", src)
+        self.assertIn("LWA_COLORKEY", src)
+        self.assertIn("_make_click_through_win32", src)
+
+    def test_degraded_alpha_fallback_is_faint_not_a_sheet(self):
+        # The no-colour-key fallback alpha must be LOW (~0.25) so a degraded
+        # reticle is faint, never a dim sheet over four monitors. Assert the
+        # source uses a low alpha and NOT the old 0.85.
+        path = os.path.join(_HUD_DIR, "jarvis_reticle.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn('"-alpha", 0.25', src)
+        self.assertNotIn('"-alpha", 0.85', src)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  PID-RECYCLE GUARD + STALE-STATE EXIT (P0-2)
+# ══════════════════════════════════════════════════════════════════════════
+class _FakeProc:
+    def __init__(self, create_time):
+        self._ct = create_time
+
+    def create_time(self):
+        return self._ct
+
+
+class _FakePsutil:
+    def __init__(self, *, exists=True, create_time=1000.0, raise_on_process=False):
+        self._exists = exists
+        self._ct = create_time
+        self._raise = raise_on_process
+
+    def pid_exists(self, pid):
+        return self._exists
+
+    def Process(self, pid):
+        if self._raise:
+            raise RuntimeError("no such process")
+        return _FakeProc(self._ct)
+
+
+class ParentAliveRecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.mod = _load_reticle(self)
+
+    def _with_psutil(self, fake):
+        self.addCleanup(setattr, self.mod, "psutil", getattr(self.mod, "psutil", None))
+        self.addCleanup(setattr, self.mod, "_HAS_PSUTIL", self.mod._HAS_PSUTIL)
+        self.mod.psutil = fake
+        self.mod._HAS_PSUTIL = True
+
+    def test_matching_start_time_is_alive(self):
+        self._with_psutil(_FakePsutil(exists=True, create_time=1234.5))
+        self.assertTrue(self.mod._is_parent_alive(4242, 1234.5))
+
+    def test_recycled_pid_is_dead(self):
+        self._with_psutil(_FakePsutil(exists=True, create_time=9999.0))
+        self.assertFalse(self.mod._is_parent_alive(4242, 1234.5))
+
+    def test_no_start_time_pid_exists_only(self):
+        self._with_psutil(_FakePsutil(exists=True, create_time=42.0))
+        self.assertTrue(self.mod._is_parent_alive(4242))
+        self._with_psutil(_FakePsutil(exists=False))
+        self.assertFalse(self.mod._is_parent_alive(4242))
+
+    def test_unreadable_live_start_time_is_alive(self):
+        self._with_psutil(_FakePsutil(exists=True, raise_on_process=True))
+        self.assertTrue(self.mod._is_parent_alive(4242, 1234.5))
+
+
+class StaleStateExitTests(unittest.TestCase):
+    """_should_exit closes the overlay when the host stops updating
+    hud_reticles.json (crashed without a clean shutdown). Built WITHOUT __init__
+    so no Tk root / real file is needed."""
+
+    def setUp(self):
+        self.mod = _load_reticle(self)
+
+    def _ov(self, *, parent_pid=4242, last_mtime=1000.0):
+        ov = object.__new__(self.mod.ReticleOverlay)
+        ov.parent_pid = parent_pid
+        ov.parent_start = None
+        ov._started_at = 0.0
+        ov._last_state_mtime = last_mtime
+        return ov
+
+    def test_exits_when_state_file_stale(self):
+        ov = self._ov(last_mtime=1000.0)
+        now = 1000.0 + self.mod.STATE_STALE_EXIT_S + 5.0
+        with mock.patch.object(self.mod, "_is_parent_alive", lambda *a: True), \
+             mock.patch.object(self.mod, "_state_file_mtime", lambda: 1000.0):
+            self.assertTrue(ov._should_exit(now))
+
+    def test_does_not_exit_while_state_fresh(self):
+        ov = self._ov(last_mtime=1000.0)
+        now = 1000.0 + 5.0
+        with mock.patch.object(self.mod, "_is_parent_alive", lambda *a: True), \
+             mock.patch.object(self.mod, "_state_file_mtime", lambda: now):
+            self.assertFalse(ov._should_exit(now))
+        # The freshest-seen mtime advanced (so a later check measures from it).
+        self.assertEqual(ov._last_state_mtime, now)
+
+    def test_exits_when_parent_dead(self):
+        ov = self._ov()
+        with mock.patch.object(self.mod, "_is_parent_alive", lambda *a: False), \
+             mock.patch.object(self.mod, "_state_file_mtime", lambda: 1e12):
+            self.assertTrue(ov._should_exit(2000.0))
+
+    def test_orphan_cap_exits_after_lifetime(self):
+        ov = self._ov(parent_pid=0)
+        ov._started_at = 0.0
+        now = self.mod.ORPHAN_MAX_LIFETIME_S + 10.0
+        with mock.patch.object(self.mod, "_is_parent_alive", lambda *a: True), \
+             mock.patch.object(self.mod, "_state_file_mtime", lambda: now):
+            self.assertTrue(ov._should_exit(now))
+
+    def test_state_file_mtime_missing_is_zero(self):
+        # A missing file yields 0.0 (no exception), and a 0 last-mtime never
+        # trips the stale exit (we only measure once the file has been seen).
+        with mock.patch.object(self.mod.os.path, "getmtime",
+                               side_effect=OSError("gone")):
+            self.assertEqual(self.mod._state_file_mtime(), 0.0)
+        ov = self._ov(last_mtime=0.0)
+        with mock.patch.object(self.mod, "_is_parent_alive", lambda *a: True), \
+             mock.patch.object(self.mod, "_state_file_mtime", lambda: 0.0):
+            self.assertFalse(ov._should_exit(1e9))
 
 
 if __name__ == "__main__":

@@ -919,17 +919,26 @@ class ControllerStateMachineTests(_Base):
         self.assertIsNone(d2.right)
         self.assertEqual(d2.overlay, "hidden")
 
-    def test_both_hands_can_be_down_at_once(self):
+    def test_both_hands_raised_stands_down_for_two_hand_mode(self):
+        """FILTER 8 (supersedes the old 'both buttons down at once'): when BOTH
+        hands are raised above the engage line the single-hand controller STANDS
+        DOWN locally (two-hand pinch-to-resize mode owns both hands), instead of
+        grabbing one hand / firing both buttons. cursor=None, overlay hidden,
+        disengaged — even with both hands closed. (Per-hand click independence with
+        ONE hand raised is covered by test_either_hand_clicks_regardless_of_which_
+        drives.)"""
         mod = self._load()
         c = self._ctrl(mod)
-        # Both arms extended, both hands closed → BOTH buttons down (independent).
         c.update(self._ext(mod, "left"), self._ext(mod, "right"),
                  "open", "open", True)
         d = c.update(self._ext(mod, "left"), self._ext(mod, "right"),
                      "closed", "closed", True)
-        self.assertEqual(d.left, "down")
-        self.assertEqual(d.right, "down")
-        self.assertTrue(c.left_is_down and c.right_is_down)
+        self.assertFalse(c.engaged)
+        self.assertIsNone(d.cursor)
+        self.assertEqual(d.overlay, "hidden")
+        self.assertIsNone(d.left)
+        self.assertIsNone(d.right)
+        self.assertFalse(c.left_is_down or c.right_is_down)
 
     def test_flicker_does_not_fire_button_with_real_debounce(self):
         mod = self._load()
@@ -2063,86 +2072,106 @@ class ControllingHandHysteresisTests(_Base):
                                       SHOULDER_Y + lift, TORSO_Z - 0.30, 2),
                                 lift_m=lift)
 
+    def _relaxed_low(self, mod, side):
+        """A LOWERED ArmExtension (hand below the engage line) so engaging on the
+        OTHER hand doesn't trip the FILTER-8 both-hands-raised stand-down."""
+        return mod.ArmExtension(side, forward_m=0.0, straightness=0.4,
+                                hand=(0.1 if side == "right" else -0.1,
+                                      SHOULDER_Y - 0.40, TORSO_Z, 2),
+                                lift_m=-0.40)
+
+    # NOTE (FILTER 8): with BOTH hands clearly raised above the engage line the
+    # single-hand controller now STANDS DOWN (two-hand mode owns both hands), so the
+    # controlling-hand switch HYSTERESIS can no longer be exercised through update()
+    # with two simultaneously-raised hands — update() pre-empts to a release first.
+    # The hysteresis machinery (_select_controlling_arm's per-frame margin + the
+    # multi-frame switch streak) is therefore tested DIRECTLY below (it is still live
+    # code: it picks the one raised hand, and would switch hands across frames where
+    # the hands come up one at a time). The pure per-frame tie-break is also covered
+    # by ArmExtensionTests.test_choose_highest_raised_hand / choose_controlling_arm.
+
     def test_holds_current_hand_when_other_barely_leads(self):
         mod = self._load()
         c = self._ctrl(mod)
-        # Engage on the RIGHT hand first (clearly extended).
-        c.update(self._arm(mod, "left", 0.10, 0.50),
+        # Engage on the RIGHT hand, then drive _select_controlling_arm DIRECTLY (so
+        # the FILTER-8 both-hands-raised stand-down in update() doesn't pre-empt the
+        # selection): the LEFT hand creeps a HAIR ahead but under the switch margin —
+        # control must STAY on the right (no thrash).
+        c.update(self._relaxed_low(mod, "left"),
                  self._arm(mod, "right", 0.45, 0.98), "open", "open", True)
         self.assertEqual(c.hand, "right")
-        # Now the LEFT hand creeps a HAIR more extended than the right, but under
-        # the switch margin: control must STAY on the right (no thrash).
         for _ in range(20):
-            d = c.update(self._arm(mod, "left", 0.47, 0.99),
-                         self._arm(mod, "right", 0.45, 0.98),
-                         "open", "open", True)
-            self.assertEqual(d.hand, "right")
-        self.assertEqual(c.hand, "right")
+            arm = c._select_controlling_arm(
+                self._arm(mod, "left", 0.47, 0.99),
+                self._arm(mod, "right", 0.45, 0.98), None)
+            self.assertEqual(arm.side, "right")
 
     def test_switches_only_after_sustained_clear_lead(self):
         mod = self._load()
         c = self._ctrl(mod, switch_frames=6, switch_margin=0.25)
-        c.update(self._arm(mod, "left", 0.10, 0.40),
+        c.update(self._relaxed_low(mod, "left"),
                  self._arm(mod, "right", 0.45, 0.98), "open", "open", True)
         self.assertEqual(c.hand, "right")
-        # LEFT now leads by a CLEAR margin. It must take several frames to switch.
-        big_left = lambda: self._arm(mod, "left", 0.90, 1.0)
-        small_right = lambda: self._arm(mod, "right", 0.20, 0.80)
+        # LEFT now leads by a CLEAR margin. Driving _select_controlling_arm directly
+        # (bypassing the FILTER-8 pre-empt), it must take several frames to switch.
         switched_at = None
         for i in range(1, 12):
-            d = c.update(big_left(), small_right(), "open", "open", True)
-            if d.hand == "left":
+            arm = c._select_controlling_arm(self._arm(mod, "left", 0.90, 1.0),
+                                            self._arm(mod, "right", 0.20, 0.80), None)
+            c._hand = arm.side
+            if arm.side == "left":
                 switched_at = i
                 break
         self.assertIsNotNone(switched_at)
         self.assertGreaterEqual(switched_at, 6)   # not instant — sustained lead
-        self.assertEqual(c.hand, "left")
 
     def test_brief_lead_then_back_does_not_switch(self):
         mod = self._load()
         c = self._ctrl(mod, switch_frames=6, switch_margin=0.25)
-        c.update(self._arm(mod, "left", 0.10, 0.40),
+        c.update(self._relaxed_low(mod, "left"),
                  self._arm(mod, "right", 0.45, 0.98), "open", "open", True)
-        # LEFT leads big for a FEW frames (< switch_frames) then drops back.
+        # LEFT leads big for a FEW frames (< switch_frames) then drops back. Direct
+        # selection (no FILTER-8 pre-empt): control must never leave the right.
         for _ in range(3):
-            d = c.update(self._arm(mod, "left", 0.90, 1.0),
-                         self._arm(mod, "right", 0.20, 0.80), "open", "open", True)
-            self.assertEqual(d.hand, "right")     # not yet switched
+            arm = c._select_controlling_arm(self._arm(mod, "left", 0.90, 1.0),
+                                            self._arm(mod, "right", 0.20, 0.80), None)
+            self.assertEqual(arm.side, "right")   # not yet switched
         # Back to the right clearly leading → challenge resets, stays on right.
         for _ in range(5):
-            d = c.update(self._arm(mod, "left", 0.20, 0.50),
-                         self._arm(mod, "right", 0.45, 0.98), "open", "open", True)
-        self.assertEqual(c.hand, "right")
+            arm = c._select_controlling_arm(self._arm(mod, "left", 0.20, 0.50),
+                                            self._arm(mod, "right", 0.45, 0.98), None)
+        self.assertEqual(arm.side, "right")
 
-    def test_both_hands_grips_tracked_regardless_of_cursor_hand(self):
+    def test_both_hands_raised_clicks_stand_down(self):
+        """FILTER 8: BOTH hands raised → the single-hand controller stands down (no
+        cursor, no buttons), superseding the old 'both grips tracked, both buttons
+        fire' behaviour — two-hand pinch-to-resize mode owns both raised hands."""
         mod = self._load()
         c = self._ctrl(mod)
-        # RIGHT drives the cursor; BOTH hands close → BOTH buttons fire (the L/R
-        # clicks are independent of which hand drives), and no thrash.
         c.update(self._arm(mod, "left", 0.20, 0.55),
                  self._arm(mod, "right", 0.45, 0.98), "open", "open", True)
         d = c.update(self._arm(mod, "left", 0.20, 0.55),
                      self._arm(mod, "right", 0.45, 0.98), "closed", "closed", True)
-        self.assertEqual(c.hand, "right")
-        self.assertEqual(d.left, "down")
-        self.assertEqual(d.right, "down")
-        self.assertTrue(c.left_is_down and c.right_is_down)
+        self.assertFalse(c.engaged)
+        self.assertIsNone(d.left)
+        self.assertIsNone(d.right)
+        self.assertFalse(c.left_is_down or c.right_is_down)
 
-    def test_no_flicker_with_both_hands_equally_extended(self):
+    def test_both_hands_equally_raised_stands_down_no_flicker(self):
+        """FILTER 8 (supersedes the old equal-extension tie-break): BOTH hands raised
+        + EQUALLY extended now STANDS DOWN every frame (two-hand mode owns them) — so
+        the cursor hand is None throughout (no flicker, and no single-cursor grab on
+        either hand). Stable disengaged, not a thrashing pick between the two."""
         mod = self._load()
         c = self._ctrl(mod)
-        # BOTH hands raised + EQUALLY extended for many frames: the cursor hand
-        # must be STABLE (never flip back and forth frame-to-frame).
-        c.update(self._arm(mod, "left", 0.40, 0.95),
-                 self._arm(mod, "right", 0.40, 0.95), "open", "open", True)
-        first = c.hand
         hands = []
         for _ in range(40):
             d = c.update(self._arm(mod, "left", 0.40, 0.95),
                          self._arm(mod, "right", 0.40, 0.95), "open", "open", True)
             hands.append(d.hand)
-        # Exactly one distinct controlling hand across all frames — no flicker.
-        self.assertEqual(set(hands), {first})
+            self.assertIsNone(d.cursor)
+        self.assertEqual(set(hands), {None})   # stood down every frame
+        self.assertFalse(c.engaged)
 
     def test_switch_state_clears_on_disengage(self):
         mod = self._load()
@@ -2158,36 +2187,37 @@ class ControllingHandHysteresisTests(_Base):
         self.assertIsNone(c._challenge_side)
 
     def test_noncontrolling_hand_does_not_move_cursor(self):
-        """With both hands raised the cursor must follow ONLY the controlling hand —
-        the OTHER hand must NOT influence the cursor POSITION at all (no 'both hands
-        connect to the same spot' / averaging). Hold the controlling (right) hand
-        STILL while the idle (left) hand sweeps; the cursor must NOT move. (This was
-        already true in v1.72.0 — the controller only maps the controlling arm's
-        hand — and remains true after the v1.73.0 tablet-mapping revert.)"""
+        """With ONE hand raised the cursor must follow ONLY the controlling hand —
+        the OTHER (LOWERED, below the engage line) hand must NOT influence the cursor
+        POSITION at all (no 'both hands connect to the same spot' / averaging). Hold
+        the controlling (right) hand STILL while the idle (left, low) hand sweeps;
+        the cursor must NOT move. The idle hand is kept BELOW the engage line so it
+        is neither the controller nor a FILTER-8 both-hands-raised trigger."""
         mod = self._load()
         c = self._ctrl(mod)
 
         def right_arm(hand_x):
-            # Controlling hand held at a FIXED position.
+            # Controlling hand held at a FIXED position, clearly raised.
             return mod.ArmExtension("right", forward_m=0.0, straightness=None,
                                     hand=(hand_x, SHOULDER_Y + 0.30, 1.8, 2),
                                     lift_m=0.30, shoulder_ref_y=SHOULDER_Y)
 
-        def left_arm(hand_x, lift):
-            # Idle hand, lower (so it's never the controller), sweeping in X.
+        def left_arm(hand_x):
+            # Idle hand LOWERED (below the engage line) so it's never the controller
+            # and never trips the both-hands-raised pre-empt, sweeping in X.
             return mod.ArmExtension("left", forward_m=0.0, straightness=None,
-                                    hand=(hand_x, SHOULDER_Y + lift, 1.8, 2),
-                                    lift_m=lift, shoulder_ref_y=SHOULDER_Y)
+                                    hand=(hand_x, SHOULDER_Y - 0.40, 1.8, 2),
+                                    lift_m=-0.40, shoulder_ref_y=SHOULDER_Y)
 
-        # Engage with the right hand controlling (higher).
-        c.update(left_arm(-0.1, 0.10), right_arm(0.10), "open", "open", True)
-        base = c.update(left_arm(-0.1, 0.10), right_arm(0.10),
+        # Engage with the right hand controlling (the only raised hand).
+        c.update(left_arm(-0.1), right_arm(0.10), "open", "open", True)
+        base = c.update(left_arm(-0.1), right_arm(0.10),
                         "open", "open", True).cursor
         self.assertEqual(c.hand, "right")
-        # Sweep the LEFT (idle) hand wildly while the RIGHT hand stays put.
+        # Sweep the LEFT (idle, low) hand wildly while the RIGHT hand stays put.
         cursors = []
         for lx in (-0.4, -0.2, 0.0, 0.2, 0.4):
-            d = c.update(left_arm(lx, 0.10), right_arm(0.10), "open", "open", True)
+            d = c.update(left_arm(lx), right_arm(0.10), "open", "open", True)
             cursors.append(d.cursor)
             self.assertEqual(d.hand, "right")     # controller never flips
         # The cursor is unchanged by the idle hand's motion (within EMA settle).
@@ -2513,6 +2543,400 @@ class AutoYieldPollIntegrationTests(_Base):
                 bodies=[_body(reach_side="right", grip_right="open")]))
         self.assertTrue(ctrl.engaged)
         self.assertEqual(len(moves), 1)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  ROBUSTNESS FILTERS (feat/kinect-harden-skills) — tracking-state floor, click
+#  tracking-state, body-id pin, grace cap, two-hand rising-edge pre-empt.
+# ══════════════════════════════════════════════════════════════════════════
+def _inferred_arm_joints(side: str, *, hand_x=0.0, hand_y=RAISED_HAND_Y,
+                         forward=0.30, hand_state=1, ref_state=2) -> dict:
+    """Joints for one RAISED arm but with the HAND joint INFERRED (TrackingState 1
+    by default) — the noisy guess the SDK emits for a hand it can't actually see.
+    `ref_state` sets the spine_shoulder reference's state. Geometry matches
+    _extended_arm_joints so only the tracking STATE differs."""
+    shoulder_x = -0.2 if side == "left" else 0.2
+    sx, sy, sz = shoulder_x, SHOULDER_Y, TORSO_Z
+    hx, hy, hz = hand_x, hand_y, TORSO_Z - forward
+    ex, ey, ez = (sx + hx) / 2.0, (sy + hy) / 2.0, (sz + hz) / 2.0
+    return {
+        "spine_shoulder": (0.0, SHOULDER_Y, TORSO_Z, ref_state),
+        "spine_mid": (0.0, 0.0, TORSO_Z, 2),
+        f"shoulder_{side}": (sx, sy, sz, 2),
+        f"elbow_{side}": (ex, ey, ez, 2),
+        f"hand_{side}": (hx, hy, hz, hand_state),   # INFERRED hand
+    }
+
+
+class JointWellTrackedTests(_Base):
+    """The pure TrackingState floor helper (FILTERS 1/2/4): only a sensor-TRACKED,
+    finite, non-zero joint passes."""
+
+    def test_tracked_joint_passes(self):
+        mod = self._load()
+        self.assertTrue(mod.joint_well_tracked((0.1, 0.5, 1.8, 2)))
+        self.assertTrue(mod.joint_well_tracked((0.1, 0.5, 1.8, 3)))   # >=2
+
+    def test_inferred_and_nottracked_fail(self):
+        mod = self._load()
+        self.assertFalse(mod.joint_well_tracked((0.1, 0.5, 1.8, 1)))  # inferred
+        self.assertFalse(mod.joint_well_tracked((0.1, 0.5, 1.8, 0)))  # not tracked
+
+    def test_zero_origin_sentinel_fails(self):
+        mod = self._load()
+        # The (0,0,0) origin sentinel an unseen joint reads — rejected even at state 2.
+        self.assertFalse(mod.joint_well_tracked((0.0, 0.0, 0.0, 2)))
+
+    def test_non_finite_coords_fail(self):
+        mod = self._load()
+        inf = float("inf")
+        nan = float("nan")
+        self.assertFalse(mod.joint_well_tracked((inf, 0.5, 1.8, 2)))
+        self.assertFalse(mod.joint_well_tracked((0.1, nan, 1.8, 2)))
+
+    def test_malformed_joint_fails_safely(self):
+        mod = self._load()
+        self.assertFalse(mod.joint_well_tracked(None))
+        self.assertFalse(mod.joint_well_tracked((0.1, 0.5, 1.8)))   # no state slot
+        self.assertFalse(mod.joint_well_tracked(()))
+
+
+class TrackingStateFloorTests(_Base):
+    """FILTER 1: _local_arm_extension computes lift_m ONLY when BOTH the hand joint
+    AND the shoulder-ref are sensor-tracked; an inferred hand leaves lift_m None →
+    the gate can't engage on a hand the Kinect doesn't actually see."""
+
+    def _ext(self, mod, joints, side):
+        return mod.ArmExtension.from_bridge(mod._local_arm_extension(joints, side))
+
+    def test_inferred_hand_leaves_lift_none(self):
+        mod = self._load()
+        ext = self._ext(mod, _inferred_arm_joints("right", hand_state=1), "right")
+        self.assertIsNone(ext.lift_m)            # not computed on an inferred hand
+        self.assertFalse(ext.is_extended(engaged=False))
+        self.assertFalse(ext.is_extended(engaged=True))
+
+    def test_tracked_hand_still_computes_lift(self):
+        mod = self._load()
+        ext = self._ext(mod, _inferred_arm_joints("right", hand_state=2), "right")
+        self.assertIsNotNone(ext.lift_m)         # fully-tracked hand → lift computed
+        self.assertGreater(ext.lift_m, mod.AIR_MOUSE_ENGAGE_UP_MARGIN_M)
+
+    def test_inferred_shoulder_ref_falls_back_then_floors(self):
+        mod = self._load()
+        # spine_shoulder INFERRED and NO same-side shoulder present → no usable ref
+        # → lift_m None (can't confirm a raise).
+        j = _inferred_arm_joints("right", hand_state=2, ref_state=1)
+        j.pop("shoulder_right", None)
+        ext = self._ext(mod, j, "right")
+        self.assertIsNone(ext.lift_m)
+
+    def test_zero_hand_joint_leaves_lift_none(self):
+        mod = self._load()
+        j = _extended_arm_joints("right")
+        j["hand_right"] = (0.0, 0.0, 0.0, 2)     # origin sentinel (unseen)
+        ext = self._ext(mod, j, "right")
+        self.assertIsNone(ext.lift_m)
+
+    def test_inferred_hand_makes_zero_setcursorpos_via_poll(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        moves, buttons = self._capture_mouse(mod)
+        ctrl = mod.AirMouseController(mod.ReachBox(2560, 1440),
+                                      debounce_frames=1, grace_sec=0.0,
+                                      engage_debounce_frames=1)
+
+        def inferred_body():
+            j = _inferred_arm_joints("right", hand_state=1)
+            jl = _relaxed_arm_joints("left")
+            j["elbow_left"] = jl["elbow_left"]
+            j["hand_left"] = jl["hand_left"]
+            j["shoulder_left"] = jl["shoulder_left"]
+            return {"id": 0, "joints": j, "head": (0.0, 0.7, TORSO_Z),
+                    "distance_m": TORSO_Z, "facing": True,
+                    "hand_right": "open", "hand_left": "open"}
+        for _ in range(10):
+            mod._poll_once(ctrl, _fake_bridge(bodies=[inferred_body()]))
+        self.assertEqual(moves, [])              # inferred hand never drives
+        self.assertFalse(ctrl.engaged)
+
+
+class ClickTrackingStateTests(_Base):
+    """FILTER 4: a hand whose JOINT isn't tracked is fed 'unknown' to its debouncer,
+    so it can never press/hold a button — only a hand the Kinect SEES can click."""
+
+    def _ctrl(self, mod):
+        return mod.AirMouseController(mod.ReachBox(2560, 1440), debounce_frames=1,
+                                      grace_sec=0.0, engage_debounce_frames=1)
+
+    def _ext(self, mod, side, *, hand_state=2, lift=0.20):
+        hx = 0.1 if side == "right" else -0.1
+        return mod.ArmExtension(side, forward_m=0.0, straightness=None,
+                                hand=(hx, SHOULDER_Y + lift, TORSO_Z - 0.30,
+                                      hand_state),
+                                lift_m=lift, shoulder_ref_y=SHOULDER_Y)
+
+    def _relaxed(self, mod, side):
+        j = _relaxed_arm_joints(side)
+        return mod.ArmExtension.from_bridge(mod._local_arm_extension(j, side))
+
+    def test_grip_if_tracked_passes_tracked_hand(self):
+        mod = self._load()
+        ext = self._ext(mod, "right", hand_state=2)
+        self.assertEqual(
+            mod.AirMouseController._grip_if_tracked(ext, "closed"), "closed")
+
+    def test_grip_if_tracked_suppresses_untracked_hand(self):
+        mod = self._load()
+        ext = self._ext(mod, "right", hand_state=1)   # inferred
+        self.assertEqual(
+            mod.AirMouseController._grip_if_tracked(ext, "closed"), "unknown")
+        # A None ext (arm unreadable) is likewise suppressed.
+        self.assertEqual(
+            mod.AirMouseController._grip_if_tracked(None, "closed"), "unknown")
+
+    def test_inferred_clicking_hand_does_not_press(self):
+        mod = self._load()
+        c = self._ctrl(mod)
+        # The cursor-driving hand is the LEFT (tracked, raised). The RIGHT hand is
+        # kept BELOW the engage line (so it isn't a FILTER-8 both-hands-raised
+        # trigger) and is INFERRED — even reading "closed" it must NOT press the
+        # right button (clicks are evaluated for both hands, but an untracked joint
+        # is fed 'unknown').
+        left = self._ext(mod, "left", hand_state=2, lift=0.30)
+        right_inf = self._ext(mod, "right", hand_state=1, lift=-0.40)
+        c.update(left, right_inf, "open", "open", True)
+        d = c.update(left, right_inf, "open", "closed", True)
+        self.assertEqual(c.hand, "left")          # left drives
+        self.assertIsNone(d.right)                # inferred right CANNOT press
+        self.assertFalse(c.right_is_down)
+        # The SAME low right hand, but TRACKED, does fire the click (proving it's the
+        # tracking STATE — not the height — that suppressed it above).
+        c2 = self._ctrl(mod)
+        right_ok = self._ext(mod, "right", hand_state=2, lift=-0.40)
+        c2.update(left, right_ok, "open", "open", True)
+        d2 = c2.update(left, right_ok, "open", "closed", True)
+        self.assertEqual(d2.right, "down")
+
+
+class BodyIdPinTests(_Base):
+    """FILTER 6: the controlling body id is latched on engage; if the nearest-body
+    id changes (a closer 2nd person) it's a tracking-loss (release + EMA reset), not
+    a seamless retarget."""
+
+    def _ctrl(self, mod):
+        return mod.AirMouseController(mod.ReachBox(2560, 1440), debounce_frames=1,
+                                      grace_sec=0.0, engage_debounce_frames=1)
+
+    def _ext(self, mod, side):
+        j = _extended_arm_joints(side)
+        return mod.ArmExtension.from_bridge(mod._local_arm_extension(j, side))
+
+    def _relaxed(self, mod, side):
+        j = _relaxed_arm_joints(side)
+        return mod.ArmExtension.from_bridge(mod._local_arm_extension(j, side))
+
+    def test_body_id_change_releases_mid_drag(self):
+        mod = self._load()
+        c = self._ctrl(mod)
+        right = self._ext(mod, "right")
+        left = self._relaxed(mod, "left")
+        # Engage + grab on body 7.
+        c.update(left, right, "open", "open", True, body_id=7)
+        c.update(left, right, "open", "closed", True, body_id=7)
+        self.assertTrue(c.engaged and c.right_is_down)
+        self.assertEqual(c._locked_body_id, 7)
+        # A CLOSER 2nd person (id 9) becomes the nearest body → release, NOT retarget.
+        d = c.update(left, right, "open", "closed", True, body_id=9)
+        self.assertFalse(c.engaged)
+        self.assertEqual(d.right, "up")           # held button released
+        self.assertIsNone(d.cursor)
+        self.assertEqual(d.overlay, "hidden")
+
+    def test_same_body_id_keeps_driving(self):
+        mod = self._load()
+        c = self._ctrl(mod)
+        right = self._ext(mod, "right")
+        left = self._relaxed(mod, "left")
+        c.update(left, right, "open", "open", True, body_id=3)
+        d = c.update(left, right, "open", "open", True, body_id=3)
+        self.assertTrue(c.engaged)
+        self.assertIsNotNone(d.cursor)            # same body → uninterrupted
+
+    def test_none_body_id_disables_pin(self):
+        mod = self._load()
+        c = self._ctrl(mod)
+        right = self._ext(mod, "right")
+        left = self._relaxed(mod, "left")
+        # No ids supplied (back-compat) → never releases on the (absent) id.
+        c.update(left, right, "open", "open", True)
+        d = c.update(left, right, "open", "open", True)
+        self.assertTrue(c.engaged)
+        self.assertIsNotNone(d.cursor)
+
+    def test_poll_passes_body_id_and_swap_releases(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        moves, buttons = self._capture_mouse(mod)
+        ctrl = mod.AirMouseController(mod.ReachBox(2560, 1440), debounce_frames=1,
+                                      grace_sec=0.0, engage_debounce_frames=1)
+        # Body id 1 engages + grabs (close the right hand for a drag).
+        mod._poll_once(ctrl, _fake_bridge(
+            bodies=[_body(reach_side="right", grip_right="open")]))
+        mod._poll_once(ctrl, _fake_bridge(
+            bodies=[_body(reach_side="right", grip_right="closed")]))
+        self.assertTrue(ctrl.engaged)
+        self.assertEqual(buttons, [("down", "right")])
+        # A DIFFERENT body id (a closer person) under the same raised-hand sample →
+        # the pin releases the drag instead of retargeting onto the interloper.
+        other = _body(reach_side="right", grip_right="closed")
+        other["id"] = 99
+        mod._poll_once(ctrl, _fake_bridge(bodies=[other]))
+        self.assertFalse(ctrl.engaged)
+        self.assertEqual(buttons, [("down", "right"), ("up", "right")])
+
+
+class GraceCapTests(_Base):
+    """FILTER 7: cumulative untracked time per engagement is CAPPED, so a flickering
+    body (one Tracked frame renews the per-dropout grace) can't hold a drag forever.
+    A solid run of Tracked frames re-arms (zeroes) the accumulator."""
+
+    def _ctrl(self, mod, clk):
+        # Grace 0.30 s, ceiling 0.50 s, re-arm after 3 solid Tracked frames.
+        return mod.AirMouseController(
+            mod.ReachBox(2560, 1440), debounce_frames=1, grace_sec=0.30,
+            engage_debounce_frames=1, untracked_ceiling_sec=0.50,
+            retrack_frames=3, clock=clk)
+
+    def _ext(self, mod, side):
+        j = _extended_arm_joints(side)
+        return mod.ArmExtension.from_bridge(mod._local_arm_extension(j, side))
+
+    def _relaxed(self, mod, side):
+        j = _relaxed_arm_joints(side)
+        return mod.ArmExtension.from_bridge(mod._local_arm_extension(j, side))
+
+    def test_flicker_cannot_renew_grace_past_ceiling(self):
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = self._ctrl(mod, clk)
+        right = self._ext(mod, "right")
+        left = self._relaxed(mod, "left")
+        c.update(left, right, "open", "open", True)          # engage
+        c.update(left, right, "open", "closed", True)        # RIGHT down (drag)
+        self.assertTrue(c.right_is_down)
+        # FLICKER: each cycle is one untracked frame (0.20 s, within the 0.30 s
+        # per-dropout grace) then one lone Tracked frame that renews the grace but is
+        # NOT a solid re-acquisition (< retrack_frames in a row). The cumulative
+        # untracked time climbs and must eventually trip the 0.50 s ceiling.
+        released = False
+        for _ in range(8):
+            clk.advance(0.20)
+            d = c.update(None, None, "unknown", "unknown", False)   # untracked
+            if d.right == "up" or not c.right_is_down:
+                released = True
+                break
+            # one lone Tracked frame (renews per-dropout grace, breaks no streak cap)
+            clk.advance(0.01)
+            c.update(left, right, "open", "closed", True)
+        self.assertTrue(released, "grace cap never force-released a flickering body")
+        self.assertFalse(c.right_is_down)
+
+    def test_solid_retrack_rearms_the_budget(self):
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = self._ctrl(mod, clk)
+        right = self._ext(mod, "right")
+        left = self._relaxed(mod, "left")
+        c.update(left, right, "open", "closed", True)        # engage + RIGHT down
+        # Spend some untracked budget (under the ceiling), then RE-ACQUIRE solidly
+        # for several consecutive Tracked frames → the accumulator zeroes.
+        clk.advance(0.20)
+        c.update(None, None, "unknown", "unknown", False)
+        self.assertGreater(c._untracked_accum, 0.0)
+        for _ in range(4):                                    # > retrack_frames
+            clk.advance(0.01)
+            c.update(left, right, "open", "closed", True)
+        self.assertEqual(c._untracked_accum, 0.0)            # re-armed
+        self.assertTrue(c.right_is_down)                     # drag survived
+
+    def test_single_brief_dropout_still_holds(self):
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = self._ctrl(mod, clk)
+        right = self._ext(mod, "right")
+        left = self._relaxed(mod, "left")
+        c.update(left, right, "open", "closed", True)        # engage + RIGHT down
+        # A single short dropout within both the grace AND the ceiling → still holds.
+        clk.advance(0.10)
+        d = c.update(None, None, "unknown", "unknown", False)
+        self.assertIsNone(d.right)                           # NOT released
+        self.assertTrue(c.right_is_down)
+        self.assertEqual(d.overlay, "grab")
+
+
+class TwoHandPreemptTests(_Base):
+    """FILTER 8: the controller stands down the instant it LOCALLY sees BOTH hands
+    raised (a two-hand-mode pre-empt) — closing the 1-frame entry twitch before the
+    cross-process two-hand heartbeat arrives."""
+
+    def _ctrl(self, mod):
+        return mod.AirMouseController(mod.ReachBox(2560, 1440), debounce_frames=1,
+                                      grace_sec=0.0, engage_debounce_frames=1)
+
+    def _ext(self, mod, side, *, hand_state=2):
+        j = _extended_arm_joints(side)
+        if hand_state != 2:
+            hx, hy, hz, _ = j[f"hand_{side}"]
+            j[f"hand_{side}"] = (hx, hy, hz, hand_state)
+        return mod.ArmExtension.from_bridge(mod._local_arm_extension(j, side))
+
+    def _relaxed(self, mod, side):
+        j = _relaxed_arm_joints(side)
+        return mod.ArmExtension.from_bridge(mod._local_arm_extension(j, side))
+
+    def test_helper_true_only_when_both_tracked_and_raised(self):
+        mod = self._load()
+        both_up = mod.AirMouseController._both_hands_raised(
+            self._ext(mod, "left"), self._ext(mod, "right"), None)
+        self.assertTrue(both_up)
+        # One hand lowered → not both raised.
+        self.assertFalse(mod.AirMouseController._both_hands_raised(
+            self._relaxed(mod, "left"), self._ext(mod, "right"), None))
+        # Both raised but one hand INFERRED → not a pre-empt (FILTER 2/8 tracking).
+        self.assertFalse(mod.AirMouseController._both_hands_raised(
+            self._ext(mod, "left", hand_state=1), self._ext(mod, "right"), None))
+
+    def test_rising_second_hand_preempts_engage(self):
+        mod = self._load()
+        c = self._ctrl(mod)
+        # One hand raised → engages.
+        c.update(self._relaxed(mod, "left"), self._ext(mod, "right"),
+                 "open", "open", True)
+        self.assertTrue(c.engaged)
+        # The SECOND hand comes up the very next frame → stand down at once (no twitch
+        # waiting for the two-hand heartbeat).
+        d = c.update(self._ext(mod, "left"), self._ext(mod, "right"),
+                     "open", "open", True)
+        self.assertFalse(c.engaged)
+        self.assertIsNone(d.cursor)
+        self.assertEqual(d.overlay, "hidden")
+
+    def test_preempt_releases_held_button(self):
+        mod = self._load()
+        c = self._ctrl(mod)
+        # Engage + grab with the right hand, then raise the left → release the drag.
+        c.update(self._relaxed(mod, "left"), self._ext(mod, "right"),
+                 "open", "open", True)
+        c.update(self._relaxed(mod, "left"), self._ext(mod, "right"),
+                 "open", "closed", True)
+        self.assertTrue(c.right_is_down)
+        d = c.update(self._ext(mod, "left"), self._ext(mod, "right"),
+                     "open", "closed", True)
+        self.assertEqual(d.right, "up")           # the held button is let go
+        self.assertFalse(c.engaged)
 
 
 # ─── registration wires the actions ─────────────────────────────────────────

@@ -66,12 +66,69 @@ CROSSHAIR_LEN     = 14
 TICK_MS           = 33      # ~30 fps animation
 LABEL_FONT        = ("Consolas", 9, "bold")
 
+# STALE-STATE EXIT (P0-2): mirrors jarvis_air_cursor's STATE_STALE_EXIT_S. If
+# hud_reticles.json hasn't been updated (newest mtime) for this long, the host
+# that publishes reticles is gone (crashed / killed without running the shutdown
+# handler) — exit so a full-virtual-desktop click-through layer can't strand over
+# all four monitors. The reticle file is touched on EVERY UI-automation action,
+# and the launcher rewrites it at boot, so a live JARVIS keeps it fresh well
+# inside this window even when no reticle is currently on screen.
+STATE_STALE_EXIT_S = 600.0   # 10 min of no state-file update → exit
+# Orphan guard (mirrors jarvis_air_cursor / holo HUD): with --parent-pid 0/absent
+# there's no parent to track, so self-exit after this long rather than linger
+# forever as a parentless click-through layer.
+ORPHAN_MAX_LIFETIME_S = 1800.0
+
+# Win32 extended-window-style bits for the click-through colour-key backstop
+# (P2-7) — same contract jarvis_air_cursor uses. Module-level so the transparency
+# / click-through math is unit-testable without constructing a Tk root.
+GWL_EXSTYLE       = -20
+WS_EX_LAYERED     = 0x00080000
+WS_EX_TRANSPARENT = 0x00000020   # makes the window click-through (hit-test pass)
+WS_EX_TOOLWINDOW  = 0x00000080   # keep it out of the alt-tab / taskbar list
+WS_EX_NOACTIVATE  = 0x08000000   # never steal focus from the app underneath
+LWA_COLORKEY      = 0x00000001   # SetLayeredWindowAttributes: key a colour out
+
 STATE_FILE_NAME = "hud_reticles.json"
 PROJECT_DIR     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE_FILE      = os.path.join(PROJECT_DIR, STATE_FILE_NAME)
 
 
-def _is_parent_alive(pid: int) -> bool:
+def _click_through_exstyle(cur: int) -> int:
+    """OR the click-through / layered / no-activate / tool-window bits onto an
+    existing GWL_EXSTYLE value. Pure (int in, int out) so the transparency +
+    click-through contract is unit-testable with no Tk root / no Win32. Mirrors
+    jarvis_air_cursor._click_through_exstyle exactly."""
+    return (cur
+            | WS_EX_LAYERED
+            | WS_EX_TRANSPARENT
+            | WS_EX_TOOLWINDOW
+            | WS_EX_NOACTIVATE)
+
+
+def _colorref(hex_color: str) -> int:
+    """``#rrggbb`` → Win32 COLORREF (0x00bbggrr), the colour-key passed to
+    SetLayeredWindowAttributes so the keyed background composites fully
+    transparent instead of as an opaque block. Pure; testable."""
+    h = hex_color.lstrip("#")
+    r = int(h[0:2], 16)
+    g = int(h[2:4], 16)
+    b = int(h[4:6], 16)
+    return (b << 16) | (g << 8) | r
+
+
+def _is_parent_alive(pid: int, start_time: "float | None" = None) -> bool:
+    """True while the spawning JARVIS is still alive.
+
+    PID-RECYCLE GUARD (P0-2): a bare pid_exists() can read TRUE for a STRANGER
+    that the OS handed our dead parent's recycled PID — leaving this full-virtual-
+    desktop click-through overlay stranded on top of an unrelated process. When
+    ``start_time`` (the parent's psutil create_time() captured at spawn, passed
+    via --parent-start) is given, we additionally require the live process at
+    ``pid`` to report the SAME create_time (within a small epsilon): a recycled
+    PID has a DIFFERENT start time and so reads as DEAD. Without a start_time we
+    fall back to the historical PID-exists-only check. A transient/unknowable
+    lookup is treated as ALIVE so a hiccup can't strand the overlay."""
     if pid <= 0:
         return True
     if _HAS_PSUTIL:
@@ -80,9 +137,20 @@ def _is_parent_alive(pid: int) -> bool:
         # frame here is the worst case — treat an unknowable parent as alive
         # (matches the PyQt HUDs' guard) so a hiccup can't strand it.
         try:
-            return psutil.pid_exists(pid)
+            if not psutil.pid_exists(pid):
+                return False
         except Exception:
             return True
+        if start_time is not None:
+            try:
+                # A recycled PID reads as DEAD: same number, different birth time.
+                if abs(psutil.Process(pid).create_time() - start_time) > 1.0:
+                    return False
+            except Exception:
+                # Can't read the live process's start time — treat as alive so a
+                # transient race can't strand the overlay.
+                return True
+        return True
     try:
         os.kill(pid, 0)
         return True
@@ -100,6 +168,17 @@ def _read_reticles() -> list:
         return out if isinstance(out, list) else []
     except Exception:
         return []
+
+
+def _state_file_mtime() -> float:
+    """Last-modified epoch of hud_reticles.json, or 0.0 when it's missing /
+    unreadable. The host rewrites this file at launch and re-touches it on EVERY
+    UI-automation action, so its mtime is the freshness signal the stale-state
+    exit timer (P0-2) watches. NEVER raises."""
+    try:
+        return os.path.getmtime(STATE_FILE)
+    except OSError:
+        return 0.0
 
 
 def _primary_work_area_bottom():
@@ -148,16 +227,25 @@ def _clamp_to_work_area(x: int, y: int, w: int, h: int, work_bottom):
 
 
 class ReticleOverlay:
-    def __init__(self, x: int, y: int, w: int, h: int, parent_pid: int):
+    def __init__(self, x: int, y: int, w: int, h: int, parent_pid: int,
+                 parent_start: "float | None" = None):
         # Keep the overlay above the Windows taskbar so reticles near the
         # bottom edge aren't sliced off behind it (the taskbar is topmost too).
         x, y, w, h = _clamp_to_work_area(x, y, w, h, _primary_work_area_bottom())
 
         self.parent_pid = parent_pid
+        # Parent's create_time() at spawn (--parent-start) for the PID-recycle
+        # guard; None → PID-exists-only fallback.
+        self.parent_start = parent_start
         self.origin_x   = x
         self.origin_y   = y
         self.width      = w
         self.height     = h
+        self._started_at = time.time()
+        # Freshest hud_reticles.json mtime we've seen — drives the stale-state
+        # exit timer (the host re-touches the file on every UI-automation action
+        # and at boot, so a live JARVIS keeps this advancing).
+        self._last_state_mtime = _state_file_mtime()
 
         self.root = tk.Tk()
         self.root.title("JARVIS Reticle")
@@ -168,13 +256,17 @@ class ReticleOverlay:
         # On Windows, -transparentcolor makes the keyed background fully
         # transparent AND click-through. Drawn ring pixels (cyan) remain
         # opaque, which is desired so the reticle is visible.
+        self._has_colorkey = False
         try:
             self.root.attributes("-transparentcolor", BG_KEY)
+            self._has_colorkey = True
         except tk.TclError:
-            # Fallback: plain alpha. Less ideal — entire window is
-            # semi-transparent — but better than nothing.
+            # Fallback: plain alpha. BLACKOUT BACKSTOP (P2-7): keep this LOW
+            # (~0.25) so a degraded reticle whose colour-key was lost reads as a
+            # FAINT wash, not a dim sheet over four monitors. The old 0.85 made a
+            # colour-key failure paint a near-opaque full-desktop block.
             try:
-                self.root.attributes("-alpha", 0.85)
+                self.root.attributes("-alpha", 0.25)
             except Exception:
                 pass
 
@@ -186,8 +278,48 @@ class ReticleOverlay:
         )
         self.canvas.pack(fill="both", expand=True)
 
+        # BLACKOUT BACKSTOP (P2-7): actively re-assert the colour-key via Win32
+        # SetLayeredWindowAttributes(LWA_COLORKEY) — the SAME mechanism
+        # jarvis_air_cursor uses — instead of merely trusting Tk's
+        # -transparentcolor to hold. A full-virtual-desktop layered window whose
+        # colour-key is lost composites FULLY OPAQUE (the four-monitor blackout),
+        # so we (re)key it ourselves after touching the ex-style.
+        self._make_click_through_win32()
+
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.tick()
+
+    def _make_click_through_win32(self):
+        """On Windows, set WS_EX_LAYERED | WS_EX_TRANSPARENT (+ NOACTIVATE +
+        TOOLWINDOW) on the real top-level HWND and RE-KEY the background
+        transparent via SetLayeredWindowAttributes(LWA_COLORKEY). Re-asserting
+        WS_EX_LAYERED without re-keying is exactly what turned the old full-
+        desktop overlay opaque, so the re-key is mandatory whenever we touch the
+        ex-style. NEVER raises — the colour-key already gives transparency +
+        click-through; this is a backstop."""
+        try:
+            if os.name != "nt":
+                return
+            import ctypes
+            self.root.update_idletasks()
+            user32 = ctypes.windll.user32
+            # Tk wraps the toplevel in a frame on Win32; walk up to the real HWND
+            # Tk colour-keyed, or styling a child leaves the toplevel opaque.
+            hwnd = user32.GetParent(self.root.winfo_id())
+            if not hwnd:
+                hwnd = self.root.winfo_id()
+            cur = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, _click_through_exstyle(cur))
+            # Re-assert the colour-key — a layered window with no
+            # SetLayeredWindowAttributes/UpdateLayeredWindow composites OPAQUE.
+            # Skip when -transparentcolor was unavailable (we rely on -alpha then).
+            if self._has_colorkey:
+                user32.SetLayeredWindowAttributes(
+                    hwnd, _colorref(BG_KEY), 0, LWA_COLORKEY)
+        except Exception:
+            # Worst case the keyed background is trusted to -transparentcolor (or
+            # the low -alpha fallback) — never a hard failure.
+            pass
 
     def _on_close(self):
         try:
@@ -250,12 +382,32 @@ class ReticleOverlay:
                 fill=text_color, font=LABEL_FONT, anchor="n",
             )
 
+    def _should_exit(self, now: float) -> bool:
+        """True when this overlay should CLOSE: parent dead (PID-recycle-aware),
+        an orphan (no real parent) that has outlived the cap, or the host has
+        stopped updating hud_reticles.json for STATE_STALE_EXIT_S (crashed
+        without a clean shutdown). Keeps a full-virtual-desktop click-through
+        layer from stranding over every monitor."""
+        if not _is_parent_alive(self.parent_pid, self.parent_start):
+            return True
+        # Orphan cap: no real parent to track and we've lived too long → exit.
+        if self.parent_pid <= 0 and (now - self._started_at) > ORPHAN_MAX_LIFETIME_S:
+            return True
+        # Stale-state exit: advance the freshest-seen mtime, and if the file
+        # hasn't been touched for STATE_STALE_EXIT_S the publisher is gone.
+        mtime = _state_file_mtime()
+        if mtime > self._last_state_mtime:
+            self._last_state_mtime = mtime
+        if self._last_state_mtime > 0 and (now - self._last_state_mtime) > STATE_STALE_EXIT_S:
+            return True
+        return False
+
     def tick(self):
-        if not _is_parent_alive(self.parent_pid):
+        now = time.time()
+        if self._should_exit(now):
             self._on_close()
             return
 
-        now = time.time()
         entries = _read_reticles()
 
         # Filter to live entries up-front so the idle path can short-circuit.
@@ -324,10 +476,14 @@ def main():
     parser.add_argument("--width", type=int, default=2560)
     parser.add_argument("--height", type=int, default=1440)
     parser.add_argument("--parent-pid", type=int, default=0)
+    # Parent's psutil create_time() at spawn — enables the PID-recycle guard in
+    # _is_parent_alive. Optional (<=0 / absent → PID-exists-only fallback).
+    parser.add_argument("--parent-start", type=float, default=0.0)
     args = parser.parse_args()
 
     overlay = ReticleOverlay(
         args.x, args.y, args.width, args.height, args.parent_pid,
+        parent_start=(args.parent_start if args.parent_start > 0 else None),
     )
     overlay.run()
 
