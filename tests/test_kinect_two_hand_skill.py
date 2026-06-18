@@ -754,5 +754,210 @@ class GateTests(_Base):
             self.assertFalse(mod._two_hand_enabled())
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  ROBUSTNESS FILTERS (feat/kinect-harden-skills): hand-state floor, the two-hand
+#  dead-man, and the body-id pin.
+# ══════════════════════════════════════════════════════════════════════════
+def _both_up_body_states(*, left_state=2, right_state=2, left_x=-0.30,
+                         right_x=0.30):
+    """A both-hands-raised body where each HAND joint's TrackingState can be set
+    (2=Tracked, 1=Inferred) to exercise the FILTER 2 hand-state floor."""
+    b = _both_up_body(left_x=left_x, right_x=right_x)
+    lj = b["joints"]["hand_left"]
+    rj = b["joints"]["hand_right"]
+    b["joints"]["hand_left"] = (lj[0], lj[1], lj[2], left_state)
+    b["joints"]["hand_right"] = (rj[0], rj[1], rj[2], right_state)
+    return b
+
+
+class HandStateFloorTests(_Base):
+    """FILTER 2: _both_hands_engaged requires BOTH hand joints sensor-TRACKED before
+    any grab / distance / midpoint math — an inferred 2nd hand can't engage."""
+
+    def _exts(self, mod, body):
+        # Build the per-arm ArmExtensions exactly as the live sample would (mirror
+        # off so left/right map straight through).
+        with mock.patch.object(self._am, "_hand_mirror_enabled", lambda: False):
+            le, re, _lg, _rg, _t = self._am._hand_sample(
+                _fake_bridge(bodies=[body]))
+        return le, re
+
+    def test_both_tracked_hands_engage(self):
+        mod = self._load()
+        le, re = self._exts(mod, _both_up_body_states(left_state=2, right_state=2))
+        th = self._am._reach_thresholds()
+        self.assertTrue(mod._both_hands_engaged(self._am, le, re, th))
+
+    def test_one_inferred_hand_does_not_engage(self):
+        mod = self._load()
+        le, re = self._exts(mod, _both_up_body_states(left_state=2, right_state=1))
+        th = self._am._reach_thresholds()
+        # Right hand inferred → not engaged (no grab / _dist3 on a phantom hand).
+        self.assertFalse(mod._both_hands_engaged(self._am, le, re, th))
+
+    def test_joint_tracked_helper_uses_air_mouse_floor(self):
+        mod = self._load()
+        self.assertTrue(mod._joint_tracked(self._am, (0.1, 0.5, 1.8, 2)))
+        self.assertFalse(mod._joint_tracked(self._am, (0.1, 0.5, 1.8, 1)))
+
+    def test_inferred_hand_makes_no_window_calls_via_poll(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        calls: list = []
+
+        def fg():
+            return (4242, mod.Rect(800, 400, 1600, 1000))
+
+        def swp(hwnd, rect):
+            calls.append((hwnd, rect))
+            return True
+        clk = _Clock()
+        ctrl = mod.TwoHandController(clock=clk, grab_hold_sec=0.20)
+        # Both hands up but the RIGHT hand INFERRED for many frames → never grabs.
+        inf = _both_up_body_states(left_state=2, right_state=1)
+        with mock.patch.object(self._am, "_bridge",
+                               lambda: _fake_bridge(bodies=[inf])), \
+             mock.patch.object(self._am, "_hand_mirror_enabled", lambda: False):
+            for _ in range(12):
+                clk.advance(0.05)
+                d = mod._poll_once(ctrl, foreground_target=fg, set_window_pos=swp)
+        self.assertFalse(d.active)
+        self.assertEqual(calls, [])
+
+
+class TwoHandDeadManTests(_Base):
+    """FILTER 3: a grab held alive only by INFERRED hands force-releases after the
+    dead-man window; a brief inferred flicker is graced (the window holds)."""
+
+    BOUNDS = (0, 0, 2560, 1440)
+
+    def _grab(self, mod, c, clk, rect):
+        c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
+                 focused_rect=rect, bounds=self.BOUNDS,
+                 hands=((1000, 700), (1400, 700)))
+        clk.advance(0.25)
+        return c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
+                        focused_rect=rect, bounds=self.BOUNDS,
+                        hands=((1000, 700), (1400, 700)))
+
+    def test_brief_inferred_flicker_holds_the_window(self):
+        mod = self._load()
+        clk = _Clock()
+        c = mod.TwoHandController(clock=clk, grab_hold_sec=0.20, deadman_sec=0.30,
+                                  dist_alpha=1.0, rect_alpha=1.0)
+        rect = mod.Rect(800, 400, 1600, 1000)
+        self._grab(mod, c, clk, rect)
+        self.assertTrue(c.is_grabbed)
+        # An UNCONFIRMED frame (hand inferred → both_engaged False) but the hands are
+        # still PRESENT (hand_dist/midpoint supplied) and within the dead-man window:
+        # HOLD the window (still grabbed/active), don't drop it.
+        clk.advance(0.10)
+        d = c.update(both_engaged=False, hand_dist=0.40, midpoint=(1200, 700),
+                     focused_rect=None, bounds=self.BOUNDS,
+                     hands=((1000, 700), (1400, 700)))
+        self.assertTrue(d.active)
+        self.assertTrue(d.resizing)
+        self.assertEqual(d.phase, "grabbed")
+        self.assertEqual(d.rect, rect)
+
+    def test_sustained_inferred_releases_after_deadman(self):
+        mod = self._load()
+        clk = _Clock()
+        c = mod.TwoHandController(clock=clk, grab_hold_sec=0.20, deadman_sec=0.30,
+                                  dist_alpha=1.0, rect_alpha=1.0)
+        rect = mod.Rect(800, 400, 1600, 1000)
+        self._grab(mod, c, clk, rect)
+        # Unconfirmed (inferred) frames keep coming; once past the 0.30 s dead-man it
+        # force-releases — a grab can't persist on phantom hands.
+        clk.advance(0.20)
+        d1 = c.update(both_engaged=False, hand_dist=0.40, midpoint=(1200, 700),
+                      focused_rect=None, bounds=self.BOUNDS,
+                      hands=((1000, 700), (1400, 700)))
+        self.assertTrue(d1.active)              # still within grace
+        clk.advance(0.20)                       # now > 0.30 s total
+        d2 = c.update(both_engaged=False, hand_dist=0.40, midpoint=(1200, 700),
+                      focused_rect=None, bounds=self.BOUNDS,
+                      hands=((1000, 700), (1400, 700)))
+        self.assertFalse(d2.active)             # dead-man fired
+        self.assertFalse(c.is_grabbed)
+
+    def test_hands_gone_releases_immediately_no_grace(self):
+        mod = self._load()
+        clk = _Clock()
+        c = mod.TwoHandController(clock=clk, grab_hold_sec=0.20, deadman_sec=0.30)
+        rect = mod.Rect(800, 400, 1600, 1000)
+        self._grab(mod, c, clk, rect)
+        # Hands TRULY gone (no hand_dist/midpoint) → immediate release (the dead-man
+        # grace is only for an inferred flicker while the hands are still present).
+        d = c.update(both_engaged=False, hand_dist=None, midpoint=None,
+                     focused_rect=None, bounds=self.BOUNDS, hands=None)
+        self.assertFalse(d.active)
+        self.assertEqual(d.phase, "idle")
+        self.assertFalse(c.is_grabbed)
+
+
+class TwoHandBodyIdPinTests(_Base):
+    """FILTER 6: the grab pins the controlling body id; a closer 2nd person (id
+    change) releases the resize rather than stealing it."""
+
+    BOUNDS = (0, 0, 2560, 1440)
+
+    def _grab(self, mod, c, clk, rect, *, body_id):
+        c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
+                 focused_rect=rect, bounds=self.BOUNDS,
+                 hands=((1000, 700), (1400, 700)), body_id=body_id)
+        clk.advance(0.25)
+        return c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
+                        focused_rect=rect, bounds=self.BOUNDS,
+                        hands=((1000, 700), (1400, 700)), body_id=body_id)
+
+    def test_id_change_releases_grab(self):
+        mod = self._load()
+        clk = _Clock()
+        c = mod.TwoHandController(clock=clk, grab_hold_sec=0.20)
+        rect = mod.Rect(800, 400, 1600, 1000)
+        self._grab(mod, c, clk, rect, body_id=5)
+        self.assertTrue(c.is_grabbed)
+        # A closer person (id 8) takes the nearest slot → release, not retarget.
+        d = c.update(both_engaged=True, hand_dist=0.55, midpoint=(1300, 700),
+                     focused_rect=None, bounds=self.BOUNDS,
+                     hands=((1000, 700), (1500, 700)), body_id=8)
+        self.assertFalse(d.active)
+        self.assertEqual(d.phase, "idle")
+        self.assertFalse(c.is_grabbed)
+
+    def test_same_id_keeps_resizing(self):
+        mod = self._load()
+        clk = _Clock()
+        c = mod.TwoHandController(clock=clk, grab_hold_sec=0.20, dist_alpha=1.0,
+                                  rect_alpha=1.0)
+        rect = mod.Rect(800, 400, 1600, 1000)
+        self._grab(mod, c, clk, rect, body_id=5)
+        d = c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
+                     focused_rect=None, bounds=self.BOUNDS,
+                     hands=((1000, 700), (1400, 700)), body_id=5)
+        self.assertTrue(d.resizing)             # same body → uninterrupted
+
+    def test_none_body_id_disables_pin(self):
+        mod = self._load()
+        clk = _Clock()
+        c = mod.TwoHandController(clock=clk, grab_hold_sec=0.20)
+        rect = mod.Rect(800, 400, 1600, 1000)
+        self._grab(mod, c, clk, rect, body_id=None)
+        d = c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
+                     focused_rect=None, bounds=self.BOUNDS,
+                     hands=((1000, 700), (1400, 700)), body_id=None)
+        self.assertTrue(d.resizing)             # no id pin → never releases on id
+
+    def test_controlling_body_id_reads_air_mouse_stash(self):
+        mod = self._load()
+        # _controlling_body_id reads the air-mouse module's _last_body_id stash.
+        self._am._last_body_id[0] = 17
+        self.assertEqual(mod._controlling_body_id(self._am), 17)
+        self._am._last_body_id[0] = None
+        self.assertIsNone(mod._controlling_body_id(self._am))
+
+
 if __name__ == "__main__":
     unittest.main()
