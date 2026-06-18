@@ -2729,6 +2729,107 @@ def _virtual_screen_bounds():
     return min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)
 
 
+def _own_process_start_time() -> float:
+    """This process's psutil create_time() (epoch seconds), or 0.0 when psutil is
+    unavailable / the lookup fails. Passed to overlay subprocesses as
+    --parent-start so their _is_parent_alive can reject a RECYCLED parent PID (a
+    stranger handed our dead PID reads as a different birth time). 0.0 → the
+    overlay falls back to PID-exists-only. NEVER raises."""
+    try:
+        import psutil
+        return float(psutil.Process(os.getpid()).create_time())
+    except Exception:
+        return 0.0
+
+
+# The overlay scripts a stale process would be running, keyed by basename so the
+# reaper matches regardless of how the path was spelled on the command line.
+_OVERLAY_SCRIPT_BASENAMES = ("jarvis_reticle.py", "jarvis_air_cursor.py")
+
+
+def _cmdline_parent_pid(cmdline: list) -> "int | None":
+    """The integer value of the ``--parent-pid`` argument in a process cmdline
+    list, or None when absent / unparseable. Pure; used by the overlay reaper to
+    tell OUR freshly-spawned overlays (parent-pid == our PID) from FOREIGN ones
+    left behind by a previous, now-dead JARVIS."""
+    try:
+        for i, tok in enumerate(cmdline):
+            if tok == "--parent-pid" and i + 1 < len(cmdline):
+                return int(cmdline[i + 1])
+            if isinstance(tok, str) and tok.startswith("--parent-pid="):
+                return int(tok.split("=", 1)[1])
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _cmdline_runs_overlay(cmdline: list) -> bool:
+    """True when this process cmdline launches one of our overlay scripts
+    (jarvis_reticle.py / jarvis_air_cursor.py), matched by basename so a full or
+    relative path both hit. Pure."""
+    try:
+        for tok in cmdline:
+            if not isinstance(tok, str):
+                continue
+            base = os.path.basename(tok.replace("\\", "/"))
+            if base in _OVERLAY_SCRIPT_BASENAMES:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _reap_stale_overlays() -> int:
+    """Kill leftover overlay subprocesses (jarvis_reticle.py / jarvis_air_cursor
+    .py) from a PREVIOUS JARVIS that exited without terminating them — the
+    5-stale-process pile-up. We target ONLY python/pythonw processes whose
+    cmdline runs one of those scripts AND whose ``--parent-pid`` is NOT our PID
+    (so we never touch the overlays THIS instance is about to spawn). Returns the
+    number terminated. NEVER raises — best-effort cleanup at boot.
+
+    Called once near the singleton enforcement in main(), so the reticle + air-
+    cursor windows from a crashed/replaced instance don't stack up as click-
+    through layers over every monitor."""
+    try:
+        import psutil
+    except Exception:
+        return 0
+    me = os.getpid()
+    reaped = 0
+    try:
+        for proc in psutil.process_iter(attrs=["pid", "name", "cmdline"]):
+            try:
+                if proc.info.get("pid") == me:
+                    continue
+                pname = (proc.info.get("name") or "").lower()
+                # Overlays run under the python/pythonw interpreter.
+                if "python" not in pname:
+                    continue
+                cmdline = proc.info.get("cmdline") or []
+                if not _cmdline_runs_overlay(cmdline):
+                    continue
+                # FOREIGN-PARENT ONLY: leave our own about-to-be / freshly-spawned
+                # overlays (parent-pid == me) alone; reap everything else (a dead
+                # parent, or no parent-pid at all → orphan).
+                ppid = _cmdline_parent_pid(cmdline)
+                if ppid == me:
+                    continue
+                proc.terminate()
+                reaped += 1
+                print(f"  [overlay-reaper] terminated stale overlay pid "
+                      f"{proc.info.get('pid')} (parent-pid {ppid})")
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            except Exception:
+                continue
+    except Exception:
+        return reaped
+    if reaped:
+        print(f"  [overlay-reaper] reaped {reaped} stale overlay process(es) "
+              f"from a previous JARVIS")
+    return reaped
+
+
 def _launch_reticle_overlay():
     """Spawn hud/jarvis_reticle.py as a subprocess sized to the virtual
     desktop. Silent on failure so a missing tkinter / unusual geometry
@@ -2756,7 +2857,9 @@ def _launch_reticle_overlay():
             [sys.executable, overlay_path,
              "--x", str(vx), "--y", str(vy),
              "--width", str(vw), "--height", str(vh),
-             "--parent-pid", str(os.getpid())],
+             "--parent-pid", str(os.getpid()),
+             # --parent-start lets the overlay reject a RECYCLED parent PID.
+             "--parent-start", repr(_own_process_start_time())],
             creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
             close_fds=True,
         )
@@ -3540,6 +3643,46 @@ _kinect_preview_webcam_idx: dict[str, int] = {}
 _kinect_preview_webcam_resolved = [False]
 
 
+def _enumerate_dshow_input_devices() -> "list[str] | None":
+    """The DirectShow VIDEO input-device friendly names, by INDEX (list position
+    == the index cv2.VideoCapture(idx, CAP_DSHOW) uses), via pygrabber. Returns
+    None when pygrabber is unavailable or the COM enumeration fails — callers
+    then fall back to a configured static index. NEVER raises.
+
+    This is the single place that touches pygrabber; both the per-frame preview
+    tile resolver and the face-track open-by-name path (_dshow_name_to_index)
+    funnel through it so there is ONE enumeration contract."""
+    try:
+        from pygrabber.dshow_graph import FilterGraph
+        names = FilterGraph().get_input_devices()
+    except Exception:
+        # pygrabber missing / COM hiccup.
+        return None
+    try:
+        return [str(n or "") for n in names]
+    except Exception:
+        return None
+
+
+def _dshow_name_to_index(substr: str) -> "int | None":
+    """The LIVE DirectShow index of the first input device whose friendly name
+    contains ``substr`` (case-insensitive), or None when pygrabber is
+    unavailable / nothing matched. Enumerates DEVICES FRESH on every call (it is
+    only called at camera open / reopen, not per frame), so it reflects the
+    CURRENT USB enumeration — the whole point of opening a camera by name is to
+    survive an index shuffle. Pure-ish (one COM read); NEVER raises."""
+    needle = (substr or "").strip().lower()
+    if not needle:
+        return None
+    names = _enumerate_dshow_input_devices()
+    if not names:
+        return None
+    for i, n in enumerate(names):
+        if needle in (n or "").lower():
+            return i
+    return None
+
+
 def _resolve_webcam_indices_by_name() -> dict[str, int]:
     """Map 'left'/'right' → the DirectShow device INDEX whose friendly name
     contains the configured substring, via pygrabber. Cached after the first
@@ -3551,10 +3694,8 @@ def _resolve_webcam_indices_by_name() -> dict[str, int]:
     index used by cv2.VideoCapture(idx, CAP_DSHOW)."""
     if _kinect_preview_webcam_resolved[0]:
         return _kinect_preview_webcam_idx
-    try:
-        from pygrabber.dshow_graph import FilterGraph
-        names = FilterGraph().get_input_devices()
-    except Exception:
+    names = _enumerate_dshow_input_devices()
+    if names is None:
         # pygrabber missing / COM hiccup — mark resolved so we don't retry every
         # frame; the caller falls back to the CAMERAS-config indices.
         _kinect_preview_webcam_resolved[0] = True
@@ -3681,6 +3822,15 @@ def _draw_skeleton_on_color(color_bgr: "np.ndarray", bodies: list) -> int:
     if mapper is None or not bodies:
         return 0
     drawn = 0
+    # P2-6: project against the ACTUAL canvas size, not the hardcoded 1920×1080
+    # in kinect_skeleton. The base may be an IR frame upscaled to a different size,
+    # or a resized color frame — passing base.shape gives project_body_joints the
+    # real on-frame bounds so its off-frame margin matches THIS canvas. numpy
+    # shape is (height, width); pass them through by keyword.
+    try:
+        canvas_h, canvas_w = color_bgr.shape[:2]
+    except Exception:
+        canvas_h, canvas_w = _ks.COLOR_H, _ks.COLOR_W
     # Stark cyan to match the HUD; joints a brighter accent; bones a touch thick
     # so they read on a 240px-wide downscaled preview.
     bone_col = (255, 201, 76)     # BGR of #4cc9ff-ish (cyan)
@@ -3704,7 +3854,8 @@ def _draw_skeleton_on_color(color_bgr: "np.ndarray", bodies: list) -> int:
             joints = body.get("joints") if isinstance(body, dict) else None
             if not joints:
                 continue
-            points = _ks.project_body_joints(joints, mapper)
+            points = _ks.project_body_joints(joints, mapper,
+                                             width=canvas_w, height=canvas_h)
             if not points:
                 continue
             is_first = first_points is None
@@ -3999,7 +4150,21 @@ def _kinect_preview_piece_skipped(piece: str) -> None:
 # skeleton tile (the preview-keep-alive fix). Stored as a COPY so the bridge's
 # buffer can't mutate it under us. A throttled log makes the gap visible.
 _kinect_preview_last_color: list = [None]      # [np.ndarray | None]
+# Wall-clock (time.time) when _kinect_preview_last_color was last refreshed with a
+# genuinely-new color frame. Drives the 'LAST FRAME' staleness badge (P1-4): when
+# the compositor re-serves this cached frame and it's older than
+# _KINECT_PREVIEW_STALE_BADGE_S, we stamp a dim badge so the owner can tell a
+# frozen tile from a live one.
+_kinect_preview_last_color_at = [0.0]
 _kinect_preview_color_none_log_last = [0.0]
+# How stale the re-served cached color must be (seconds) before the preview gets
+# the dim 'LAST FRAME' badge. ~1.5 s: longer than a normal frame interval so a
+# live feed never flickers the badge, short enough that a real freeze shows fast.
+_KINECT_PREVIEW_STALE_BADGE_S = 1.5
+# One-time log latch: True once we've warned that the installed pykinect2 build
+# exposes no IR stream (get_infrared_gray() is None) so a dark room degrades to a
+# dimmed color preview rather than night-vision.
+_kinect_ir_unavailable_logged = [False]
 
 
 def _last_cached_kinect_color() -> "np.ndarray | None":
@@ -4058,6 +4223,45 @@ def _frame_mean_brightness(bgr: "np.ndarray | None") -> float:
         if bgr is None or getattr(bgr, "size", 0) == 0:
             return 0.0
         return float(np.mean(bgr))
+    except Exception:
+        return 0.0
+
+
+def _frame_brightness_for_dark_check(bgr: "np.ndarray | None") -> float:
+    """Brightness score used by the dark-room IR switch (P2-5). A WHOLE-FRAME mean
+    mis-triggers IR fallback when a monitor-lit FACE sits on a mostly-dark wall:
+    the bright face is a small fraction of the frame, so the mean reads 'dark' and
+    we needlessly drop to night-vision. Instead we take the MAX of two signals so
+    a small bright region keeps COLOR mode:
+
+      • the mean of a CENTER CROP (the middle ~40%, where a seated face/torso
+        is), so a lit subject on a dark surround still scores bright; and
+      • a HIGH PERCENTILE (95th) of the whole frame, so any concentrated bright
+        region (a face lit by a monitor anywhere in frame) keeps color.
+
+    Returns 0.0 for None/empty. Pure + cheap; NEVER raises. Only the IR-switch
+    decision uses this; _frame_mean_brightness stays the plain whole-frame mean."""
+    try:
+        if bgr is None or getattr(bgr, "size", 0) == 0:
+            return 0.0
+        arr = np.asarray(bgr)
+        h = arr.shape[0]
+        w = arr.shape[1] if arr.ndim >= 2 else 0
+        if h <= 0 or w <= 0:
+            return float(np.mean(arr))
+        # Center crop: middle ~40% in each axis (at least 1px so tiny frames work).
+        y0 = int(h * 0.3)
+        y1 = max(y0 + 1, int(h * 0.7))
+        x0 = int(w * 0.3)
+        x1 = max(x0 + 1, int(w * 0.7))
+        center = arr[y0:y1, x0:x1]
+        center_mean = float(np.mean(center)) if center.size else 0.0
+        # 95th percentile over the whole frame catches a bright patch anywhere.
+        try:
+            hi_pct = float(np.percentile(arr, 95.0))
+        except Exception:
+            hi_pct = float(np.max(arr))
+        return max(center_mean, hi_pct)
     except Exception:
         return 0.0
 
@@ -4133,6 +4337,39 @@ def _draw_ir_badge(bgr: "np.ndarray") -> bool:
         return False
 
 
+def _draw_stale_badge(bgr: "np.ndarray") -> bool:
+    """Stamp a DIM 'LAST FRAME' badge top-left of the preview when we're re-
+    serving a CACHED color frame that's gone stale (P1-4) — so the owner can tell
+    a FROZEN skeleton tile from a live one. Reuses _draw_ir_badge's translucent
+    dark-plate look, but in a dim amber and at reduced opacity so it reads as a
+    quiet 'this is old' marker rather than the bright cyan 'IR' active-mode badge.
+    The cached-color path never co-occurs with IR mode, so the two badges never
+    overlap. Returns True iff drawn. NEVER raises."""
+    try:
+        h, w = bgr.shape[:2]
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = max(0.6, w / 1600.0)
+        thick = max(2, int(round(scale * 2)))
+        label = "LAST FRAME"
+        (tw, th), base_ln = cv2.getTextSize(label, font, scale, thick)
+        pad = int(round(8 * scale))
+        x0, y0 = pad, pad
+        bw, bh = tw + 2 * pad, th + base_ln + 2 * pad
+        # Same translucent dark plate as the IR badge, but dimmer + amber so it
+        # reads as a quiet staleness marker, not an active-mode badge.
+        amber = (90, 150, 200)       # BGR — a muted amber/grey
+        overlay = bgr.copy()
+        cv2.rectangle(overlay, (x0, y0), (x0 + bw, y0 + bh), (20, 20, 20), -1)
+        cv2.addWeighted(overlay, 0.45, bgr, 0.55, 0.0, bgr)
+        cv2.rectangle(bgr, (x0, y0), (x0 + bw, y0 + bh), amber, max(1, thick // 2),
+                      lineType=cv2.LINE_AA)
+        cv2.putText(bgr, label, (x0 + pad, y0 + pad + th), font, scale, amber,
+                    max(1, thick - 1), lineType=cv2.LINE_AA)
+        return True
+    except Exception:
+        return False
+
+
 # Throttled log for IR-fallback activation so the owner sees in the session log
 # that the preview switched to night-vision (and why), without frame-rate spam.
 _kinect_ir_fallback_log_last = [0.0]
@@ -4150,6 +4387,19 @@ def _kinect_ir_fallback_logged(reason: str) -> None:
         pass
 
 
+def _kinect_ir_unavailable_log_once() -> None:
+    """Log ONCE (first dark-trigger) that this pykinect2 build exposes no IR
+    stream, so the owner understands why a dark room shows a dimmed color preview
+    instead of night-vision. Latched so it never repeats. NEVER raises."""
+    try:
+        if not _kinect_ir_unavailable_logged[0]:
+            _kinect_ir_unavailable_logged[0] = True
+            print("  [kinect-preview] IR night-vision unavailable on this "
+                  "pykinect2 build — dark preview uses dimmed color")
+    except Exception:
+        pass
+
+
 def _compose_ir_preview_base(width: int = 1920,
                              height: int = 1080) -> "np.ndarray | None":
     """Build the IR night-vision preview BASE (contrast-stretched IR upscaled to the
@@ -4162,6 +4412,9 @@ def _compose_ir_preview_base(width: int = 1920,
     except Exception:
         ir = None
     if ir is None:
+        # First time the dark path finds no IR stream, log it once so the owner
+        # knows the dark preview will be dimmed color, not night-vision.
+        _kinect_ir_unavailable_log_once()
         return None
     canvas = _ir_gray_to_bgr_canvas(ir, width, height)
     if canvas is None:
@@ -4209,15 +4462,19 @@ def _compose_kinect_preview(now: float) -> "np.ndarray | None":
     # (color-space projection over an IR frame upscaled to the color canvas), so the
     # owner gets a visible night-vision skeleton instead of a black tile.
     ir_mode = False
+    serving_stale_color = False     # P1-4: re-serving an aged cached color frame
+    # P2-5: use the center-crop / high-percentile score (not the whole-frame mean)
+    # so a monitor-lit face on a dark wall keeps COLOR mode instead of misfiring IR.
     color_too_dark = (fresh is not None
-                      and _frame_mean_brightness(fresh) < _KINECT_PREVIEW_DARK_MEAN)
+                      and _frame_brightness_for_dark_check(fresh) < _KINECT_PREVIEW_DARK_MEAN)
     if fresh is not None and not color_too_dark:
-        # A usable, lit color frame — cache a copy so a later transient miss can
-        # re-serve it, and use a copy as our base (don't scribble on the bridge's
-        # buffer).
+        # A usable, lit color frame — cache a copy (with its capture time) so a
+        # later transient miss can re-serve it, and use a copy as our base (don't
+        # scribble on the bridge's buffer).
         try:
             base = fresh.copy()
             _kinect_preview_last_color[0] = base
+            _kinect_preview_last_color_at[0] = now
         except Exception:
             # Can't even copy the frame — hand back the original rather than
             # nothing (and skip caching).
@@ -4238,6 +4495,7 @@ def _compose_kinect_preview(now: float) -> "np.ndarray | None":
             try:
                 base = fresh.copy()
                 _kinect_preview_last_color[0] = base
+                _kinect_preview_last_color_at[0] = now
             except Exception:
                 return fresh
         else:
@@ -4248,6 +4506,13 @@ def _compose_kinect_preview(now: float) -> "np.ndarray | None":
             base = _last_cached_kinect_color()
             if base is None:
                 return None
+            # P1-4: this is a RE-SERVED cached frame, NOT a live one. If it's older
+            # than the staleness threshold, flag it so we stamp a dim 'LAST FRAME'
+            # badge below — the owner needs to tell a frozen tile from a live feed.
+            cached_age = now - _kinect_preview_last_color_at[0]
+            if (_kinect_preview_last_color_at[0] > 0
+                    and cached_age >= _KINECT_PREVIEW_STALE_BADGE_S):
+                serving_stale_color = True
     # From here a Kinect base frame (color or IR) EXISTS — we must return at least
     # it. Each step below is independently guarded so no optional overlay can blank
     # it.
@@ -4273,6 +4538,17 @@ def _compose_kinect_preview(now: float) -> "np.ndarray | None":
             _draw_ir_badge(base)
         except Exception:
             _kinect_preview_piece_skipped("ir-badge")
+
+    # P1-4 STALE-PREVIEW BADGE: when we're re-serving an AGED cached color frame
+    # (color came back None, no IR), stamp a dim 'LAST FRAME' badge so a frozen
+    # skeleton tile is obviously distinct from a live feed. Mutually exclusive
+    # with IR mode (cached re-serve only happens when there's no IR), so the two
+    # badges never overlap. Optional + guarded.
+    if serving_stale_color:
+        try:
+            _draw_stale_badge(base)
+        except Exception:
+            _kinect_preview_piece_skipped("stale-badge")
 
     # B3: a brief glowing gesture-name badge when a gesture just fired. Optional.
     try:
@@ -4631,6 +4907,13 @@ def _face_tracking_thread():
     # continuing to call .read() on a dead handle (heap-corrupting on Logitech).
     MAX_READ_FAILURES = 60
     REOPEN_BACKOFF_SEC = 2.0   # don't hammer reopen attempts
+    # LIVE CAMERA-CONTENTION YIELD (P1-3): when a camera is declared dead AND a
+    # known webcam-locking app (Teams / Zoom / OBS …) is running, the device
+    # isn't coming back until that app releases it — so widen THIS entry's reopen
+    # backoff to ~30 s instead of retrying every 2 s, to stop hammering
+    # DirectShow (each failed CAP_DSHOW open churns the driver) while it's locked.
+    # Reset to the normal backoff the moment the locker disappears.
+    CONTENTION_BACKOFF_SEC = 30.0
     # Self-diag 2026-05-29: bumped WAKE_AFTER from 10→25 and added a wall-
     # clock gate (WAKE_AFTER_SEC) after observing the right webcam log a
     # "read failure #1 → woke via release+reopen" burst roughly every 30 s.
@@ -4663,6 +4946,26 @@ def _face_tracking_thread():
         else:
             idx = cam
             want_kinect = KINECT_AS_CAMERA
+        # NAME-BASED RESOLUTION (P0-1, the mic-shuffle bug class): if the entry
+        # carries a "name", resolve the LIVE DirectShow index by that friendly-
+        # name substring at OPEN time and PREFER it over the static "index". A USB
+        # re-enumeration that shuffles indices would otherwise leave a wrong-but-
+        # working index silently tracking the WRONG camera. The static index is
+        # the FALLBACK, used only when the name doesn't resolve (pygrabber missing
+        # / device unplugged). Never applies to a Kinect slot (no DSHOW index).
+        cam_name = cam.get("name") if isinstance(cam, dict) else None
+        if cam_name and not want_kinect:
+            live_idx = _dshow_name_to_index(cam_name)
+            if live_idx is not None:
+                if live_idx != idx:
+                    print(f"  [face-track] '{cam_name}' resolved to LIVE index "
+                          f"{live_idx} (static was {idx}) — using live index "
+                          f"(USB re-enumeration shuffle detected)")
+                idx = live_idx
+            else:
+                print(f"  [face-track] '{cam_name}' did not resolve by name "
+                      f"(pygrabber missing or device absent) — falling back to "
+                      f"static index {idx}")
         if want_kinect:
             try:
                 kc = _kinect_bridge.KinectCapture()
@@ -4690,6 +4993,12 @@ def _face_tracking_thread():
                     c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 except Exception:  # pragma: no cover - defensive: some DirectShow drivers reject CAP_PROP_BUFFERSIZE
                     pass
+                # Read back the index we actually opened so a name→index shuffle
+                # is VISIBLE in the log (covers initial open AND every reopen /
+                # wake path, which the one-shot 'Opened …' line below does not).
+                _label = cam_name if cam_name else (
+                    cam.get("label") if isinstance(cam, dict) else f"index {idx}")
+                print(f"  [face-track] opened {_label} at index {idx}")
                 return c
             try:
                 c.release()
@@ -4704,7 +5013,11 @@ def _face_tracking_thread():
         c = _open_capture(cam)
         if c is not None:
             caps.append({"cam": cam, "cap": c, "fails": 0,
-                         "next_reopen_at": 0.0, "next_wake_at": 0.0})
+                         "next_reopen_at": 0.0, "next_wake_at": 0.0,
+                         # P1-3 camera-contention yield: True once we've logged
+                         # the actionable "a locker holds this cam" hint for this
+                         # entry, so it stays one-time until the locker clears.
+                         "contention_logged": False})
             w = int(c.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(c.get(cv2.CAP_PROP_FRAME_HEIGHT))
             print(f"  [face-track] Opened {cam['label']} (index {cam['index']}) at {w}x{h}")
@@ -4898,14 +5211,36 @@ def _face_tracking_thread():
                                     except Exception:
                                         logging.exception("[face-track] release after %d failed reads", entry["fails"])
                             entry["cap"] = None
-                            entry["next_reopen_at"] = now_loop + REOPEN_BACKOFF_SEC
+                            # LIVE CAMERA-CONTENTION YIELD (P1-3): a dead camera
+                            # with a known locker running (Teams/Zoom/OBS) won't
+                            # come back until that app releases it. Widen THIS
+                            # entry's reopen backoff to ~30 s so we stop hammering
+                            # DirectShow while it's locked, and emit ONE actionable
+                            # hint. Reset to the normal 2 s backoff (and re-arm the
+                            # one-time log) the instant the locker disappears.
+                            lockers = find_camera_locking_processes()
+                            if lockers:
+                                entry["next_reopen_at"] = now_loop + CONTENTION_BACKOFF_SEC
+                                if not entry.get("contention_logged"):
+                                    entry["contention_logged"] = True
+                                    print(f"  [face-track] {cam['label']} (index "
+                                          f"{cam['index']}) appears LOCKED by "
+                                          f"{', '.join(lockers)} — backing off reopen "
+                                          f"to {CONTENTION_BACKOFF_SEC:.0f}s. Close "
+                                          f"{lockers[0]} to free the camera.")
+                            else:
+                                entry["next_reopen_at"] = now_loop + REOPEN_BACKOFF_SEC
+                                entry["contention_logged"] = False
+                            _backoff = (CONTENTION_BACKOFF_SEC if lockers
+                                        else REOPEN_BACKOFF_SEC)
                             with _camera_state_lock:
                                 _camera_last_read_error[cam["index"]] = (
                                     f"capture wedged after {entry['fails']} read failures"
-                                    f" + {_camera_wake_attempts.get(cam['index'], 0)} wake attempts")
+                                    f" + {_camera_wake_attempts.get(cam['index'], 0)} wake attempts"
+                                    + (f" (locked by {', '.join(lockers)})" if lockers else ""))
                                 _camera_last_read_error_at[cam["index"]] = now_loop
                             print(f"  [face-track] {cam['label']} (index {cam['index']}) "
-                                  f"dead after {entry['fails']} failed reads; will reopen in {REOPEN_BACKOFF_SEC:.1f}s")
+                                  f"dead after {entry['fails']} failed reads; will reopen in {_backoff:.1f}s")
                         # PREVIEW-KEEP-ALIVE FIX: a Kinect read MISS must NOT skip
                         # the skeleton preview write. The Kinect IS the primary
                         # "camera" on the owner's rig, so a transient color miss
@@ -17960,6 +18295,18 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         # to crash silently in detached pythonw before writing one.
         print(f"  [singleton] check failed, proceeding without lock: {_se}")
     atexit.register(_release_singleton)
+
+    # OVERLAY REAPER (P0-2): now that we ARE the singleton, kill any reticle /
+    # air-cursor overlay subprocesses left behind by a PREVIOUS JARVIS that
+    # exited without terminating them (the 5-stale-process pile-up of click-
+    # through layers over every monitor). Foreign-parent only — our own overlays
+    # are spawned later in main(), so nothing we own is at risk. Skipped in
+    # staging so a smoke test can't reap the operator's live overlays.
+    if not _is_staging():
+        try:
+            _reap_stale_overlays()
+        except Exception as _re:
+            print(f"  [overlay-reaper] skipped: {_re}")
 
     # Post-lock verification: belt-and-suspenders. The early-boot lock and
     # _enforce_singleton both swallow some failure modes, so confirm the

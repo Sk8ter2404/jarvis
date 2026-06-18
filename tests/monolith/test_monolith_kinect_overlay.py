@@ -1045,5 +1045,416 @@ class PreviewColorKeepAliveTests(MonolithGlobalsTestCase):
             self.assertIsNone(self.bc._compose_kinect_preview(now=1.0))
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  P0-1 — NAME-BASED CAMERA RESOLUTION: _dshow_name_to_index resolves the LIVE
+#  DirectShow index by friendly-name substring (the mic-shuffle bug class), and
+#  falls back to None (→ static index) when pygrabber is absent / nothing matched.
+# ══════════════════════════════════════════════════════════════════════════
+@requires_monolith
+class DshowNameToIndexTests(MonolithGlobalsTestCase):
+    def _fake_pygrabber(self, names):
+        mod = types.ModuleType("pygrabber")
+        sub = types.ModuleType("pygrabber.dshow_graph")
+
+        class _FG:
+            def get_input_devices(self_inner):
+                return list(names)
+        sub.FilterGraph = _FG
+        mod.dshow_graph = sub
+        return mod, sub
+
+    def test_resolves_live_index_by_substring(self):
+        mod, sub = self._fake_pygrabber(
+            ["USB 2.0 Camera", "Kinect V2 Video Sensor", "Fullhan Webcam"])
+        with mock.patch.dict("sys.modules",
+                             {"pygrabber": mod, "pygrabber.dshow_graph": sub}):
+            # Case-insensitive substring → 'Fullhan Webcam' is at LIVE index 2.
+            self.assertEqual(self.bc._dshow_name_to_index("fullhan"), 2)
+            self.assertEqual(self.bc._dshow_name_to_index("USB 2.0"), 0)
+
+    def test_returns_none_when_no_match(self):
+        mod, sub = self._fake_pygrabber(["USB 2.0 Camera", "Fullhan Webcam"])
+        with mock.patch.dict("sys.modules",
+                             {"pygrabber": mod, "pygrabber.dshow_graph": sub}):
+            self.assertIsNone(self.bc._dshow_name_to_index("logitech brio"))
+
+    def test_returns_none_when_pygrabber_absent(self):
+        import builtins
+        real_import = builtins.__import__
+
+        def _boom(name, *a, **k):
+            if name.startswith("pygrabber"):
+                raise ImportError("no pygrabber")
+            return real_import(name, *a, **k)
+
+        with mock.patch.object(builtins, "__import__", _boom):
+            self.assertIsNone(self.bc._dshow_name_to_index("fullhan"))
+
+    def test_blank_substring_is_none(self):
+        # An empty / whitespace name never matches anything (avoids matching the
+        # first device by accident).
+        self.assertIsNone(self.bc._dshow_name_to_index(""))
+        self.assertIsNone(self.bc._dshow_name_to_index("   "))
+
+    def test_reflects_a_shuffle_live_each_call(self):
+        # The whole point: it enumerates FRESH each call, so a USB re-enumeration
+        # that moves the device to a new index is reflected immediately (no cache
+        # pinning it to the old index).
+        mod1, sub1 = self._fake_pygrabber(["Fullhan Webcam", "USB 2.0 Camera"])
+        with mock.patch.dict("sys.modules",
+                             {"pygrabber": mod1, "pygrabber.dshow_graph": sub1}):
+            self.assertEqual(self.bc._dshow_name_to_index("fullhan"), 0)
+        mod2, sub2 = self._fake_pygrabber(["USB 2.0 Camera", "Fullhan Webcam"])
+        with mock.patch.dict("sys.modules",
+                             {"pygrabber": mod2, "pygrabber.dshow_graph": sub2}):
+            self.assertEqual(self.bc._dshow_name_to_index("fullhan"), 1)
+
+
+@requires_monolith
+class OpenCaptureByNameTests(MonolithGlobalsTestCase):
+    """_open_capture (the nested closure in _face_tracking_thread) must PREFER the
+    name-resolved LIVE index over the static one, and fall back to static when the
+    name doesn't resolve. We exercise it through a tiny re-implementation harness
+    that asserts the SAME branch the source uses (the resolution helper is mocked).
+
+    The closure isn't directly reachable, so we assert the observable contract:
+    the index cv2.VideoCapture is opened with comes from the NAME when it resolves,
+    and from the static 'index' when it doesn't."""
+
+    def test_source_prefers_name_resolved_index(self):
+        # Guard the wiring: _open_capture calls _dshow_name_to_index on cam['name']
+        # and uses its result as the index (falling back to the static one).
+        import inspect
+        src = inspect.getsource(self.bc._face_tracking_thread)
+        self.assertIn("_dshow_name_to_index(cam_name)", src)
+        self.assertIn("opened", src)   # the read-back log line
+        # The read-back log uses the index variable we actually opened.
+        self.assertIn("opened {_label} at index {idx}", src)
+
+    def test_live_index_preferred_over_static(self):
+        # Simulate the resolution: name 'fullhan' resolves to LIVE index 7, static
+        # was 1 → the opener must use 7.
+        opened = {"idx": None}
+
+        class _Cap:
+            def __init__(self, idx, *a):
+                opened["idx"] = idx
+            def isOpened(self):
+                return True
+            def set(self, *a):
+                return True
+            def get(self, *a):
+                return 1280
+            def read(self):
+                np = _np()
+                return True, np.zeros((720, 1280, 3), dtype=np.uint8)
+            def release(self):
+                pass
+
+        # Minimal stand-in for the closure's logic (mirrors the source exactly):
+        def open_like_source(cam):
+            idx = cam["index"]
+            name = cam.get("name")
+            if name:
+                live = self.bc._dshow_name_to_index(name)
+                if live is not None:
+                    idx = live
+            return _Cap(idx, self.bc.cv2.CAP_DSHOW)
+
+        with mock.patch.object(self.bc, "_dshow_name_to_index", return_value=7):
+            open_like_source({"index": 1, "name": "fullhan"})
+        self.assertEqual(opened["idx"], 7)
+
+    def test_static_index_used_when_name_unresolved(self):
+        opened = {"idx": None}
+
+        def open_like_source(cam):
+            idx = cam["index"]
+            name = cam.get("name")
+            if name:
+                live = self.bc._dshow_name_to_index(name)
+                if live is not None:
+                    idx = live
+            opened["idx"] = idx
+            return idx
+
+        with mock.patch.object(self.bc, "_dshow_name_to_index", return_value=None):
+            open_like_source({"index": 3, "name": "ghost camera"})
+        self.assertEqual(opened["idx"], 3)   # fell back to the static index
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  P0-2 — OVERLAY REAPER: kills FOREIGN-parent reticle/air-cursor overlays left
+#  by a previous JARVIS, never our own (parent-pid == our PID).
+# ══════════════════════════════════════════════════════════════════════════
+@requires_monolith
+class OverlayReaperTests(MonolithGlobalsTestCase):
+    def test_cmdline_parent_pid_parsing(self):
+        f = self.bc._cmdline_parent_pid
+        self.assertEqual(f(["python", "x.py", "--parent-pid", "12345"]), 12345)
+        self.assertEqual(f(["python", "--parent-pid=999"]), 999)
+        self.assertIsNone(f(["python", "x.py"]))
+        self.assertIsNone(f(["python", "--parent-pid", "notanint"]))
+
+    def test_cmdline_runs_overlay_matches_by_basename(self):
+        f = self.bc._cmdline_runs_overlay
+        self.assertTrue(f(["python", r"C:\JARVIS\hud\jarvis_reticle.py", "--x", "0"]))
+        self.assertTrue(f(["pythonw", "hud/jarvis_air_cursor.py"]))
+        self.assertFalse(f(["python", "bobert_companion.py"]))
+        self.assertFalse(f(["python", "hud/jarvis_hud.py"]))
+
+    def _proc(self, pid, name, cmdline):
+        class _P:
+            def __init__(s):
+                s.info = {"pid": pid, "name": name, "cmdline": cmdline}
+                s.terminated = False
+            def terminate(s):
+                s.terminated = True
+        return _P()
+
+    def _run_reaper_with(self, procs):
+        """Run _reap_stale_overlays with a fake psutil.process_iter yielding
+        ``procs``. Returns (count, [terminated procs])."""
+        me = self.bc.os.getpid()
+        fake_psutil = types.ModuleType("psutil")
+        fake_psutil.process_iter = lambda attrs=None: list(procs)
+
+        class _NSP(Exception):
+            pass
+
+        class _AD(Exception):
+            pass
+        fake_psutil.NoSuchProcess = _NSP
+        fake_psutil.AccessDenied = _AD
+        with mock.patch.dict("sys.modules", {"psutil": fake_psutil}):
+            count = self.bc._reap_stale_overlays()
+        terminated = [p for p in procs if getattr(p, "terminated", False)]
+        return count, terminated, me
+
+    def test_reaps_only_foreign_parent_overlays(self):
+        me = self.bc.os.getpid()
+        ours = self._proc(111, "pythonw.exe",
+                          ["pythonw", "hud/jarvis_reticle.py",
+                           "--parent-pid", str(me)])
+        foreign = self._proc(222, "pythonw.exe",
+                             ["pythonw", "hud/jarvis_reticle.py",
+                              "--parent-pid", "999999"])
+        foreign_ac = self._proc(333, "python.exe",
+                                ["python", "hud/jarvis_air_cursor.py",
+                                 "--parent-pid", "888888"])
+        non_overlay = self._proc(444, "python.exe",
+                                 ["python", "bobert_companion.py",
+                                  "--parent-pid", "777"])
+        count, terminated, _ = self._run_reaper_with(
+            [ours, foreign, foreign_ac, non_overlay])
+        self.assertEqual(count, 2)
+        term_pids = sorted(p.info["pid"] for p in terminated)
+        self.assertEqual(term_pids, [222, 333])
+        self.assertFalse(ours.terminated)        # OUR overlay is spared
+        self.assertFalse(non_overlay.terminated)  # non-overlay untouched
+
+    def test_orphan_overlay_no_parent_pid_is_reaped(self):
+        # An overlay with NO --parent-pid at all is an orphan from a crash → reap.
+        orphan = self._proc(555, "pythonw.exe",
+                            ["pythonw", "hud/jarvis_air_cursor.py"])
+        count, terminated, _ = self._run_reaper_with([orphan])
+        self.assertEqual(count, 1)
+        self.assertTrue(orphan.terminated)
+
+    def test_skips_non_python_processes(self):
+        # A non-python process that happens to mention the script in its cmdline
+        # (e.g. an editor) is NOT a running overlay → never terminated.
+        editor = self._proc(666, "Code.exe",
+                            ["Code.exe", "hud/jarvis_reticle.py"])
+        count, terminated, _ = self._run_reaper_with([editor])
+        self.assertEqual(count, 0)
+        self.assertFalse(editor.terminated)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  P1-4 — STALE-PREVIEW BADGE: re-serving an AGED cached color frame stamps a dim
+#  'LAST FRAME' badge so a frozen tile is distinct from a live feed.
+# ══════════════════════════════════════════════════════════════════════════
+@requires_monolith
+class StalePreviewBadgeTests(MonolithGlobalsTestCase):
+    def setUp(self):
+        super().setUp()
+        self.bc._kinect_preview_last_color[0] = None
+        self.bc._kinect_preview_last_color_at[0] = 0.0
+        self.addCleanup(
+            lambda: self.bc._kinect_preview_last_color.__setitem__(0, None))
+        self.addCleanup(
+            lambda: self.bc._kinect_preview_last_color_at.__setitem__(0, 0.0))
+
+    def test_draw_stale_badge_brightens_and_never_raises(self):
+        np = _np()
+        canvas = np.full((1080, 1920, 3), 30, dtype=np.uint8)
+        before = int(canvas.max())
+        self.assertTrue(self.bc._draw_stale_badge(canvas))
+        self.assertGreater(int(canvas.max()), before)
+
+    def test_stale_cached_frame_gets_badge(self):
+        # First a LIT color frame caches at t=0; then color goes None + no IR at
+        # t well past the staleness threshold → the cached frame is re-served WITH
+        # the 'LAST FRAME' badge.
+        np = _np()
+        lit = np.full((1080, 1920, 3), 90, dtype=np.uint8)
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
+                               return_value=lit), \
+                mock.patch.object(self.bc._kinect_bridge, "get_bodies",
+                                  return_value=[]), \
+                mock.patch.object(self.bc, "_read_side_tile_webcams",
+                                  return_value={"left": None, "right": None}):
+            self.bc._compose_kinect_preview(now=100.0)   # caches at t=100
+        # Now a color miss + no IR, far enough later to be stale.
+        stale_badge = mock.Mock(wraps=self.bc._draw_stale_badge)
+        later = 100.0 + self.bc._KINECT_PREVIEW_STALE_BADGE_S + 2.0
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
+                               return_value=None), \
+                mock.patch.object(self.bc._kinect_bridge, "get_infrared_gray",
+                                  return_value=None), \
+                mock.patch.object(self.bc._kinect_bridge, "get_bodies",
+                                  return_value=[]), \
+                mock.patch.object(self.bc, "_draw_stale_badge", stale_badge), \
+                mock.patch.object(self.bc, "_read_side_tile_webcams",
+                                  return_value={"left": None, "right": None}):
+            out = self.bc._compose_kinect_preview(now=later)
+        self.assertIsNotNone(out)             # re-served, not blank
+        stale_badge.assert_called_once()      # the dim 'LAST FRAME' badge
+
+    def test_fresh_cached_frame_no_badge(self):
+        # A color miss only SLIGHTLY after the cache (within the threshold) re-
+        # serves WITHOUT the stale badge (it's effectively still live).
+        np = _np()
+        lit = np.full((1080, 1920, 3), 90, dtype=np.uint8)
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
+                               return_value=lit), \
+                mock.patch.object(self.bc._kinect_bridge, "get_bodies",
+                                  return_value=[]), \
+                mock.patch.object(self.bc, "_read_side_tile_webcams",
+                                  return_value={"left": None, "right": None}):
+            self.bc._compose_kinect_preview(now=200.0)
+        stale_badge = mock.Mock(wraps=self.bc._draw_stale_badge)
+        soon = 200.0 + (self.bc._KINECT_PREVIEW_STALE_BADGE_S * 0.5)
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
+                               return_value=None), \
+                mock.patch.object(self.bc._kinect_bridge, "get_infrared_gray",
+                                  return_value=None), \
+                mock.patch.object(self.bc._kinect_bridge, "get_bodies",
+                                  return_value=[]), \
+                mock.patch.object(self.bc, "_draw_stale_badge", stale_badge), \
+                mock.patch.object(self.bc, "_read_side_tile_webcams",
+                                  return_value={"left": None, "right": None}):
+            out = self.bc._compose_kinect_preview(now=soon)
+        self.assertIsNotNone(out)
+        stale_badge.assert_not_called()
+
+    def test_ir_unavailable_logged_once(self):
+        # The one-time 'IR unavailable' note latches: only the first dark-trigger
+        # with no IR logs it.
+        self.bc._kinect_ir_unavailable_logged[0] = False
+        self.addCleanup(
+            lambda: self.bc._kinect_ir_unavailable_logged.__setitem__(0, False))
+        with mock.patch("builtins.print") as p, \
+                mock.patch.object(self.bc._kinect_bridge, "get_infrared_gray",
+                                  return_value=None):
+            self.bc._compose_ir_preview_base()
+            self.bc._compose_ir_preview_base()
+        msgs = [str(c.args[0]) for c in p.call_args_list if c.args]
+        ir_logs = [m for m in msgs if "IR night-vision unavailable" in m]
+        self.assertEqual(len(ir_logs), 1)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  P2-5 — BRIGHTNESS CROP: a monitor-lit face on a dark wall must KEEP color mode
+#  (the center-crop / high-percentile score), not misfire the IR fallback.
+# ══════════════════════════════════════════════════════════════════════════
+@requires_monolith
+class BrightnessCropTests(MonolithGlobalsTestCase):
+    def test_dark_frame_scores_below_floor(self):
+        np = _np()
+        dark = np.full((1080, 1920, 3), 5, dtype=np.uint8)
+        self.assertLess(self.bc._frame_brightness_for_dark_check(dark),
+                        self.bc._KINECT_PREVIEW_DARK_MEAN)
+
+    def test_lit_frame_scores_above_floor(self):
+        np = _np()
+        lit = np.full((1080, 1920, 3), 90, dtype=np.uint8)
+        self.assertGreater(self.bc._frame_brightness_for_dark_check(lit),
+                           self.bc._KINECT_PREVIEW_DARK_MEAN)
+
+    def test_centered_bright_face_on_dark_wall_keeps_color(self):
+        # The mis-trigger case: a bright centered face/torso, mostly-dark surround.
+        # The WHOLE-FRAME mean reads 'dark' (mis-fires IR), but the center-crop /
+        # percentile score reads 'lit' so color mode is kept.
+        np = _np()
+        frame = np.full((1080, 1920, 3), 4, dtype=np.uint8)   # dark wall
+        frame[400:680, 800:1120] = 150                        # monitor-lit face
+        whole = self.bc._frame_mean_brightness(frame)
+        crop = self.bc._frame_brightness_for_dark_check(frame)
+        # The whole-frame mean is below the floor (would mis-fire IR)…
+        self.assertLess(whole, self.bc._KINECT_PREVIEW_DARK_MEAN)
+        # …but the crop/percentile score is above it (keeps color).
+        self.assertGreater(crop, self.bc._KINECT_PREVIEW_DARK_MEAN)
+
+    def test_none_and_empty_are_zero(self):
+        np = _np()
+        self.assertEqual(self.bc._frame_brightness_for_dark_check(None), 0.0)
+        self.assertEqual(
+            self.bc._frame_brightness_for_dark_check(
+                np.zeros((0, 0, 3), dtype=np.uint8)), 0.0)
+
+    def test_compose_keeps_color_for_centered_lit_face(self):
+        # End-to-end: a dark-wall/lit-face color frame must NOT trigger the IR
+        # read in _compose_kinect_preview (color path retained).
+        np = _np()
+        frame = np.full((1080, 1920, 3), 4, dtype=np.uint8)
+        frame[400:680, 800:1120] = 150
+        ir_getter = mock.Mock(return_value=np.zeros((424, 512), dtype=np.uint8))
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
+                               return_value=frame), \
+                mock.patch.object(self.bc._kinect_bridge, "get_infrared_gray",
+                                  ir_getter), \
+                mock.patch.object(self.bc._kinect_bridge, "get_bodies",
+                                  return_value=[]), \
+                mock.patch.object(self.bc, "_draw_ir_badge") as badge, \
+                mock.patch.object(self.bc, "_read_side_tile_webcams",
+                                  return_value={"left": None, "right": None}):
+            out = self.bc._compose_kinect_preview(now=10.0)
+        self.assertIsNotNone(out)
+        ir_getter.assert_not_called()   # color kept → no IR read
+        badge.assert_not_called()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  P2-6 — PROJECTION BOUNDS: _draw_skeleton_on_color passes the REAL canvas size
+#  into project_body_joints (decoupled from the hardcoded 1920×1080).
+# ══════════════════════════════════════════════════════════════════════════
+@requires_monolith
+class ProjectionUsesRealShapeTests(MonolithGlobalsTestCase):
+    def test_passes_base_shape_to_projector(self):
+        # A non-1920×1080 base (e.g. a resized canvas). The skeleton drawer must
+        # call project_body_joints with width/height == the ACTUAL base size, so a
+        # joint that projects just off THIS smaller frame is bounded correctly.
+        np = _np()
+        base = np.zeros((480, 640, 3), dtype=np.uint8)   # 640×480, not 1920×1080
+        bodies = [{"joints": {"head": (0.0, 1.0, 2.0, 2)}}]
+        seen = {}
+
+        def fake_project(joints, mapper, *, width=None, height=None,
+                         **kw):
+            seen["width"] = width
+            seen["height"] = height
+            return {"head": (320, 240)}
+
+        from audio import kinect_skeleton as ks
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_space_mapper",
+                               return_value=lambda x, y, z: (320, 240)), \
+                mock.patch.object(ks, "project_body_joints", fake_project):
+            self.bc._draw_skeleton_on_color(base, bodies)
+        self.assertEqual(seen.get("width"), 640)
+        self.assertEqual(seen.get("height"), 480)
+
+
 if __name__ == "__main__":
     unittest.main()
