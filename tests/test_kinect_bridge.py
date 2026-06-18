@@ -18,6 +18,7 @@ import) — verified by the import at module top. stdlib unittest + mock.
 """
 from __future__ import annotations
 
+import importlib.util
 import sys
 import types
 import unittest
@@ -29,6 +30,11 @@ from audio import kinect_bridge as kb
 # always-True (see _BridgeBase.setUp) — used by the tests that exercise the real
 # color-requiring verify logic.
 _REAL_RUNTIME_STREAMS = kb._runtime_streams
+# The real start_body_pump, captured before _BridgeBase.setUp stubs it to a no-op
+# (so a fresh runtime open in the frame tests doesn't spawn a competing pump
+# thread). The pump tests that exercise the real singleton/disable logic re-bind
+# this over the stub.
+_REAL_START_BODY_PUMP = kb.start_body_pump
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -204,6 +210,17 @@ class _BridgeBase(unittest.TestCase):
                                      lambda *a, **k: True)
         _streams.start()
         self.addCleanup(_streams.stop)
+        # A FRESH runtime open now self-heals the body pump (M1: _publish_runtime →
+        # _ensure_pump_alive → start_body_pump), which would spawn a REAL background
+        # thread that races the single-shot fake frames these tests arm (it would
+        # consume the one color/body frame before the test's own accessor call). Stub
+        # start_body_pump to a no-op by default so opening a fake runtime doesn't
+        # launch a competing reader. The pump-specific tests below drive _pump_tick()
+        # directly, and the few asserting on start_body_pump re-patch it themselves
+        # inside their own `with`, overriding this base stub.
+        _nopump = mock.patch.object(kb, "start_body_pump", lambda: False)
+        _nopump.start()
+        self.addCleanup(_nopump.stop)
 
     def _reset(self):
         try:
@@ -1194,7 +1211,10 @@ class BodyPumpTests(_BridgeBase):
             def is_alive(self):
                 return True   # pretend it's running so the 2nd call no-ops
 
-        with mock.patch.object(kb.threading, "Thread", _FakeThread):
+        # Restore the REAL start_body_pump over the base no-op stub — this test
+        # exercises the genuine singleton-guard + thread-construction logic.
+        with mock.patch.object(kb, "start_body_pump", _REAL_START_BODY_PUMP), \
+                mock.patch.object(kb.threading, "Thread", _FakeThread):
             first = kb.start_body_pump()
             second = kb.start_body_pump()
         self.assertTrue(first)         # started a new pump
@@ -1203,7 +1223,8 @@ class BodyPumpTests(_BridgeBase):
 
     def test_start_body_pump_noop_when_disabled(self):
         kb._ENABLED = False
-        self.assertFalse(kb.start_body_pump())
+        with mock.patch.object(kb, "start_body_pump", _REAL_START_BODY_PUMP):
+            self.assertFalse(kb.start_body_pump())
 
     def test_set_enabled_true_starts_pump(self):
         _patch_loader(self, _FakeRuntime())
@@ -1552,6 +1573,474 @@ class KinectCaptureTests(_BridgeBase):
         self.assertFalse(rt.closed)
         self.assertIsNotNone(kb._runtime[0])
         self.assertFalse(cap.isOpened())
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# HARDENING FILTERS (read-only audit follow-up): tracking-state floor on the
+# lift gate, pump self-heal, non-consuming fallback, color stale-stamp gating,
+# import-poison cleanup, per-thread pump stop. Each pins one robustness fix.
+# ─────────────────────────────────────────────────────────────────────────
+class TrackingStateFloorTests(_BridgeBase):
+    """item 9: arm_extension.lift_m (the air-mouse PRIMARY engage gate) must rest
+    on FULLY-TRACKED joints only. An Inferred/NotTracked/zero-filled hand or
+    shoulder-ref leaves lift_m None so is_extended fails safe and the cursor never
+    engages off a joint the sensor can't actually see."""
+
+    def _raised(self, hand_state=2, ref_state=2, hand_xyz=(0.0, 0.55, 1.9),
+                ref_xyz=(0.0, 0.40, 2.0)):
+        """A hand raised ABOVE the shoulder-ref (hand_y 0.55 > ref_y 0.40 → lift
+        ≈ +0.15). States are parameterised so a test can demote either joint."""
+        return {
+            "spine_shoulder": (ref_xyz[0], ref_xyz[1], ref_xyz[2], ref_state),
+            "shoulder_right": (0.2, ref_xyz[1], ref_xyz[2], ref_state),
+            "hand_right": (hand_xyz[0], hand_xyz[1], hand_xyz[2], hand_state),
+        }
+
+    def test_lift_computed_when_both_fully_tracked(self):
+        ext = kb.arm_extension(self._raised(hand_state=2, ref_state=2), "right")
+        self.assertIsNotNone(ext["lift_m"])
+        self.assertAlmostEqual(ext["lift_m"], 0.15, delta=0.001)
+        self.assertIsNotNone(ext["shoulder_ref_y"])
+
+    def test_lift_none_when_hand_only_inferred(self):
+        # Inferred (state 1) hand → not reliable → lift None (fail safe).
+        ext = kb.arm_extension(self._raised(hand_state=1, ref_state=2), "right")
+        self.assertIsNone(ext["lift_m"])
+
+    def test_lift_none_when_shoulder_ref_inferred_and_no_tracked_fallback(self):
+        # spine_shoulder Inferred AND same-side shoulder Inferred → no reliable
+        # reference at all → lift None.
+        j = self._raised(hand_state=2, ref_state=1)
+        ext = kb.arm_extension(j, "right")
+        self.assertIsNone(ext["lift_m"])
+
+    def test_lift_uses_same_side_shoulder_when_spine_shoulder_untracked(self):
+        # spine_shoulder NotTracked but the same-side shoulder is fully tracked →
+        # the fallback reference is reliable, so lift IS computed off it.
+        j = self._raised(hand_state=2, ref_state=2)
+        # Demote ONLY spine_shoulder; keep shoulder_right tracked.
+        j["spine_shoulder"] = (0.0, 0.40, 2.0, 0)
+        ext = kb.arm_extension(j, "right")
+        self.assertIsNotNone(ext["lift_m"])
+
+    def test_lift_none_when_hand_zero_filled(self):
+        # NotTracked frames zero-fill the position; an exact (0,0,0) hand even with
+        # a (bogus) tracked state must be treated as untracked → lift None.
+        j = self._raised(hand_state=2, ref_state=2)
+        j["hand_right"] = (0.0, 0.0, 0.0, 2)
+        ext = kb.arm_extension(j, "right")
+        self.assertIsNone(ext["lift_m"])
+
+    def test_lift_none_when_ref_zero_filled(self):
+        j = self._raised(hand_state=2, ref_state=2)
+        j["spine_shoulder"] = (0.0, 0.0, 0.0, 2)
+        j["shoulder_right"] = (0.0, 0.0, 0.0, 2)
+        ext = kb.arm_extension(j, "right")
+        self.assertIsNone(ext["lift_m"])
+
+    def test_lift_none_when_hand_non_finite(self):
+        j = self._raised(hand_state=2, ref_state=2)
+        j["hand_right"] = (0.0, float("nan"), 1.9, 2)
+        ext = kb.arm_extension(j, "right")
+        self.assertIsNone(ext["lift_m"])
+
+    def test_joint_reliable_predicate(self):
+        # Direct unit coverage of the floor predicate.
+        self.assertTrue(kb._joint_reliable((0.1, 0.5, 1.9, 2)))
+        self.assertFalse(kb._joint_reliable((0.1, 0.5, 1.9, 1)))   # inferred
+        self.assertFalse(kb._joint_reliable((0.1, 0.5, 1.9, 0)))   # not tracked
+        self.assertFalse(kb._joint_reliable((0.0, 0.0, 0.0, 2)))   # zero-fill
+        self.assertFalse(kb._joint_reliable((0.1, float("inf"), 1.9, 2)))
+        self.assertFalse(kb._joint_reliable(None))
+        self.assertFalse(kb._joint_reliable((0.1, 0.5, 1.9)))      # too short
+
+    def test_demoted_cues_still_populate_off_inferred(self):
+        # forward/straightness are NOT floored (they can't engage alone) so they
+        # still compute even when the joints are only inferred — proving we demoted
+        # ONLY the lift gate, not the secondary cues.
+        j = {"spine_mid": (0.0, 0.0, 2.0, 1),
+             "shoulder_right": (0.2, 0.4, 2.0, 1),
+             "elbow_right": (0.1, 0.3, 1.85, 1),
+             "hand_right": (0.0, 0.3, 1.7, 1)}
+        ext = kb.arm_extension(j, "right")
+        self.assertIsNone(ext["lift_m"])              # gate floored
+        self.assertIsNotNone(ext["forward_reach_m"])  # demoted cue survives
+
+
+class PumpSelfHealTests(_BridgeBase):
+    """H2/L2: reset_if_body_stale + reopen run only from the pump; if the pump
+    thread dies nothing restarts it → permanent blindness. _ensure_pump_alive
+    revives a dead pump, and it's called from get_bodies()'s fallback,
+    available(), and reset_if_body_stale's re-seed."""
+
+    def test_ensure_pump_alive_restarts_dead_pump(self):
+        kb._ENABLED = True
+        kb._body_pump_thread[0] = None         # pump is dead/never-started
+        calls = {"n": 0}
+        with mock.patch.object(kb, "start_body_pump",
+                               side_effect=lambda: calls.__setitem__("n", calls["n"] + 1) or True):
+            restarted = kb._ensure_pump_alive()
+        self.assertTrue(restarted)
+        self.assertEqual(calls["n"], 1)
+
+    def test_ensure_pump_alive_noop_when_pump_running(self):
+        kb._ENABLED = True
+
+        class _LiveThread:
+            def is_alive(self):
+                return True
+        kb._body_pump_thread[0] = _LiveThread()
+        with mock.patch.object(kb, "start_body_pump",
+                               side_effect=AssertionError("must not restart a live pump")):
+            self.assertFalse(kb._ensure_pump_alive())
+
+    def test_ensure_pump_alive_noop_when_disabled(self):
+        kb._ENABLED = False
+        kb._body_pump_thread[0] = None
+        with mock.patch.object(kb, "start_body_pump",
+                               side_effect=AssertionError("must not start when disabled")):
+            self.assertFalse(kb._ensure_pump_alive())
+
+    def test_get_bodies_cold_fallback_self_heals_pump(self):
+        # A consumer asking with a cold cache + a dead pump must trigger a restart.
+        rt = _FakeRuntime(bodies=[_FakeBody(True, {"head": (0, 0.6, 1.8)})])
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        kb._body_cache[0] = None               # cold
+        kb._body_pump_thread[0] = None         # dead pump
+        healed = {"n": 0}
+        with mock.patch.object(kb, "start_body_pump",
+                               side_effect=lambda: healed.__setitem__("n", healed["n"] + 1) or True):
+            kb.get_bodies()
+        self.assertEqual(healed["n"], 1)
+
+    def test_available_self_heals_pump_when_runtime_open(self):
+        rt = _FakeRuntime()
+        _patch_loader(self, rt)
+        kb.get_runtime()                       # runtime now open
+        kb._body_pump_thread[0] = None         # but the pump died
+        healed = {"n": 0}
+        with mock.patch.object(kb, "start_body_pump",
+                               side_effect=lambda: healed.__setitem__("n", healed["n"] + 1) or True):
+            ok, _ = kb.available()
+        self.assertTrue(ok)
+        self.assertEqual(healed["n"], 1)
+
+    def test_reset_if_body_stale_self_heals_pump(self):
+        # L2: a stale reset (both planes quiet) re-seeds the clocks AND revives the
+        # pump so the next tick actually reopens the runtime.
+        rt = _FakeRuntime()
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        kb._last_body_frame_at[0] = 1.0
+        kb._last_color_frame_at[0] = 1.0
+        kb._body_pump_thread[0] = None         # pump died
+        healed = {"n": 0}
+        with mock.patch.object(kb, "start_body_pump",
+                               side_effect=lambda: healed.__setitem__("n", healed["n"] + 1) or True):
+            did = kb.reset_if_body_stale(now=1.0 + kb.BODY_STALE_RESET_SEC + 1.0)
+        self.assertTrue(did)
+        self.assertEqual(healed["n"], 1)
+
+    def test_pump_is_alive_predicate(self):
+        kb._body_pump_thread[0] = None
+        self.assertFalse(kb._pump_is_alive())
+
+        class _LiveThread:
+            def is_alive(self):
+                return True
+        kb._body_pump_thread[0] = _LiveThread()
+        self.assertTrue(kb._pump_is_alive())
+
+
+class NonConsumingFallbackTests(_BridgeBase):
+    """H3: the get_bodies() cold/stale fallback must NOT consume the body frame
+    when the pump is alive (it would steal the single-consumer frame from the pump
+    + every other poller). consume=False + a live pump serves the cache and leaves
+    the new-frame flag set."""
+
+    def setUp(self):
+        super().setUp()
+        self._orig_last = kb._last_body_frame_at[0]
+        self.addCleanup(lambda: kb._last_body_frame_at.__setitem__(0, self._orig_last))
+
+    def test_fallback_does_not_consume_when_pump_alive(self):
+        rt = _FakeRuntime(bodies=[_FakeBody(True, {"head": (0, 0.6, 1.8)})])
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        self.assertTrue(rt.has_new_body_frame())
+        # Seed a cache the fallback can serve, and pretend the pump is alive.
+        kb._body_cache[0] = [{"id": 5, "joints": {}, "head": None}]
+        kb._body_cache_at[0] = 1.0             # stale stamp (past the fresh window)
+        with mock.patch.object(kb, "_pump_is_alive", lambda: True):
+            got = kb._read_and_cache_bodies(consume=False)
+        # The pending frame flag is UNTOUCHED (not stolen from the pump)…
+        self.assertTrue(rt.has_new_body_frame())
+        # …and the (even marginally-stale) cache is served rather than [].
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["id"], 5)
+
+    def test_fallback_reads_directly_when_no_pump(self):
+        # With NO pump alive, a lone consumer's consume=False fallback DOES read the
+        # sensor directly (so it isn't left blind) — consuming the frame is correct
+        # here because nothing else is reading it.
+        rt = _FakeRuntime(bodies=[_FakeBody(True, {"head": (0, 0.6, 1.8)})])
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        kb._body_cache[0] = None
+        with mock.patch.object(kb, "_pump_is_alive", lambda: False):
+            got = kb._read_and_cache_bodies(consume=False)
+        self.assertEqual(len(got), 1)
+        self.assertFalse(rt.has_new_body_frame())   # read consumed it (no pump)
+
+    def test_pump_consume_true_still_reads(self):
+        # The pump (consume=True) always reads + consumes regardless of liveness.
+        rt = _FakeRuntime(bodies=[_FakeBody(True, {"head": (0, 0.6, 1.8)})])
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        with mock.patch.object(kb, "_pump_is_alive", lambda: True):
+            got = kb._read_and_cache_bodies(consume=True)
+        self.assertEqual(len(got), 1)
+        self.assertFalse(rt.has_new_body_frame())   # pump consumed it
+
+    def test_fallback_empty_when_pump_alive_but_cache_cold(self):
+        # consume=False + live pump + a genuinely COLD cache → [] (don't read), so
+        # the frame is still left for the pump.
+        rt = _FakeRuntime(bodies=[_FakeBody(True, {"head": (0, 0.6, 1.8)})])
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        kb._body_cache[0] = None
+        with mock.patch.object(kb, "_pump_is_alive", lambda: True):
+            got = kb._read_and_cache_bodies(consume=False)
+        self.assertEqual(got, [])
+        self.assertTrue(rt.has_new_body_frame())    # frame preserved for the pump
+
+
+class ColorStaleStampGatingTests(_BridgeBase):
+    """H1: get_color_bgr must stamp the color staleness clock ONLY on a genuinely
+    NEW frame. A require_new=False peek that re-serves the same buffer (what the
+    ~30 Hz pump prime does) must NOT refresh the clock, or _color_frame_is_stale
+    can never fire on a dead sensor and the both-plane stale-reset is defeated."""
+
+    def setUp(self):
+        super().setUp()
+        self._c = kb._last_color_frame_at[0]
+        self.addCleanup(lambda: kb._last_color_frame_at.__setitem__(0, self._c))
+
+    def test_stamp_on_new_frame(self):
+        np = _require_numpy(self)
+        flat = np.zeros(1920 * 1080 * 4, dtype=np.uint8)
+        _patch_loader(self, _FakeRuntime(color=flat))
+        kb.get_runtime()
+        kb._last_color_frame_at[0] = 0.0
+        out = kb.get_color_bgr(require_new=False)   # first peek: a NEW frame exists
+        self.assertIsNotNone(out)
+        self.assertGreater(kb._last_color_frame_at[0], 0.0)
+
+    def test_no_stamp_on_reserved_buffer(self):
+        # The headline H1 fix: after the new frame is consumed, a require_new=False
+        # peek RE-SERVES the same buffer but must NOT re-stamp the color clock.
+        np = _require_numpy(self)
+        flat = np.zeros(1920 * 1080 * 4, dtype=np.uint8)
+        rt = _FakeRuntime(color=flat)
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        # Consume the one NEW frame (stamps the clock).
+        first = kb.get_color_bgr(require_new=False)
+        self.assertIsNotNone(first)
+        self.assertFalse(rt.has_new_color_frame())   # flag now cleared
+        # Freeze the clock to a known sentinel, then peek again (buffer re-served).
+        kb._last_color_frame_at[0] = 123.0
+        served = kb.get_color_bgr(require_new=False)
+        self.assertIsNotNone(served)                 # still SERVES the buffer
+        self.assertEqual(kb._last_color_frame_at[0], 123.0)  # but did NOT re-stamp
+
+    def test_reserved_peek_does_not_keep_color_fresh_forever(self):
+        # End-to-end: with only stale re-served peeks (no new frames), the color
+        # clock stays put so _color_frame_is_stale eventually fires — the property
+        # the old unconditional stamp destroyed.
+        np = _require_numpy(self)
+        flat = np.zeros(1920 * 1080 * 4, dtype=np.uint8)
+        rt = _FakeRuntime(color=flat)
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        kb.get_color_bgr(require_new=False)          # consume the only new frame
+        kb._last_color_frame_at[0] = 100.0           # pin the last real-frame time
+        # A flurry of re-served peeks (the pump prime) must not advance the clock…
+        for _ in range(10):
+            kb._prime_color_frame()
+        self.assertEqual(kb._last_color_frame_at[0], 100.0)
+        # …so color reads as stale once the window elapses.
+        self.assertTrue(
+            kb._color_frame_is_stale(now=100.0 + kb.BODY_STALE_RESET_SEC + 0.5))
+
+
+class ImportPoisonCleanupTests(unittest.TestCase):
+    """M5: _load_patched must register the module in sys.modules ONLY after a clean
+    exec. The old order (register BEFORE exec) left a broken half-module cached on
+    an exec failure, so every later import returned the poison."""
+
+    def test_failed_exec_does_not_poison_sys_modules(self):
+        name = "kb_test_fake_pkg_module_xyz"
+        # A spec whose source raises at exec time.
+        spec = importlib.util.spec_from_loader(name, loader=None)
+        spec.origin = "<kb-test>"
+        self.addCleanup(lambda: sys.modules.pop(name, None))
+        with mock.patch.object(kb.importlib.util, "find_spec", lambda n: spec), \
+                mock.patch("builtins.open", mock.mock_open(read_data="raise RuntimeError('boom')")):
+            with self.assertRaises(ImportError):
+                kb._load_patched(name, [])
+        # The failed module must NOT be cached (next import retries cleanly).
+        self.assertNotIn(name, sys.modules)
+
+    def test_successful_exec_caches_module(self):
+        name = "kb_test_fake_pkg_module_ok"
+        spec = importlib.util.spec_from_loader(name, loader=None)
+        spec.origin = "<kb-test>"
+        self.addCleanup(lambda: sys.modules.pop(name, None))
+        with mock.patch.object(kb.importlib.util, "find_spec", lambda n: spec), \
+                mock.patch("builtins.open", mock.mock_open(read_data="VALUE = 41")):
+            mod = kb._load_patched(name, [(r"41", "42")])
+        self.assertEqual(mod.VALUE, 42)               # substitution applied
+        self.assertIs(sys.modules.get(name), mod)     # cached after clean exec
+
+
+class PerThreadPumpStopTests(_BridgeBase):
+    """M3: each pump loop gets its OWN stop Event + identity token so a fast
+    set_enabled(False)→(True) can't leave the old loop running (the old shared
+    Event was cleared by the new start)."""
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(kb.stop_body_pump)
+
+    def test_each_start_gets_a_fresh_stop_event_and_token(self):
+        # Capture two starts (fake thread so no real loop runs) and assert the
+        # per-loop Event + token differ between generations.
+        seen = []
+
+        class _FakeThread:
+            def __init__(self, *a, **k):
+                seen.append(k.get("args"))
+            def start(self):
+                pass
+            def is_alive(self):
+                return False   # so the next start is allowed (not singleton-blocked)
+
+        with mock.patch.object(kb, "start_body_pump", _REAL_START_BODY_PUMP), \
+                mock.patch.object(kb.threading, "Thread", _FakeThread):
+            kb.start_body_pump()
+            ev1 = kb._body_pump_stop_current[0]
+            tok1 = kb._body_pump_token[0]
+            kb.start_body_pump()
+            ev2 = kb._body_pump_stop_current[0]
+            tok2 = kb._body_pump_token[0]
+        self.assertIsNot(ev1, ev2)     # a fresh Event per generation
+        self.assertIsNot(tok1, tok2)   # a fresh identity token per generation
+        # The loop args carried each generation's own (stop, token) pair.
+        self.assertEqual(seen[0], (ev1, tok1))
+        self.assertEqual(seen[1], (ev2, tok2))
+
+    def test_old_event_not_cleared_by_new_start(self):
+        # The crux of M3: starting a new pump must NOT clear the OLD loop's Event
+        # (which is how the old shared-Event design left two pumps running). The
+        # previous generation's Event stays set once stopped.
+        class _FakeThread:
+            def __init__(self, *a, **k):
+                pass
+            def start(self):
+                pass
+            def is_alive(self):
+                return False
+
+        with mock.patch.object(kb, "start_body_pump", _REAL_START_BODY_PUMP), \
+                mock.patch.object(kb.threading, "Thread", _FakeThread):
+            kb.start_body_pump()
+            old_ev = kb._body_pump_stop_current[0]
+            old_ev.set()                # simulate that loop being told to stop
+            kb.start_body_pump()        # a new generation starts
+        # The OLD Event is still set — the new start did not resurrect the old loop.
+        self.assertTrue(old_ev.is_set())
+        self.assertIsNot(kb._body_pump_stop_current[0], old_ev)
+
+    def test_stop_body_pump_sets_current_event(self):
+        # stop_body_pump must signal the live loop's OWN Event (not just the shared
+        # one) so the running pump actually exits under the per-loop design.
+        ev = kb.threading.Event()
+        kb._body_pump_stop_current[0] = ev
+        kb._body_pump_token[0] = object()
+        kb.stop_body_pump()
+        self.assertTrue(ev.is_set())
+        self.assertIsNone(kb._body_pump_stop_current[0])
+        self.assertIsNone(kb._body_pump_token[0])
+
+
+class UnlockedOpenTests(_BridgeBase):
+    """M2: the slow open/verify/retry no longer holds _lock, and a race loser
+    adopts the winner's runtime + closes its own."""
+
+    def test_publish_adopts_winner_and_closes_loser(self):
+        # Pre-publish a winner, then have _publish_runtime be handed a DIFFERENT
+        # runtime (the loser of the race) — it must keep the winner and close ours.
+        winner = _FakeRuntime()
+        loser = _FakeRuntime()
+        kb._runtime[0] = winner
+        with mock.patch.object(kb, "_ensure_pump_alive", lambda: False):
+            got = kb._publish_runtime(loser)
+        self.assertIs(got, winner)         # winner kept
+        self.assertIs(kb._runtime[0], winner)
+        self.assertTrue(loser.closed)      # our redundant handle released
+        self.assertFalse(winner.closed)
+
+    def test_publish_fresh_open_seeds_clocks_and_starts_pump(self):
+        rt = _FakeRuntime()
+        kb._runtime[0] = None
+        kb._last_body_frame_at[0] = 0.0
+        kb._last_color_frame_at[0] = 0.0
+        started = {"n": 0}
+        with mock.patch.object(kb, "_ensure_pump_alive",
+                               side_effect=lambda: started.__setitem__("n", started["n"] + 1)):
+            got = kb._publish_runtime(rt)
+        self.assertIs(got, rt)
+        self.assertIs(kb._runtime[0], rt)
+        self.assertGreater(kb._last_body_frame_at[0], 0.0)   # clocks seeded
+        self.assertGreater(kb._last_color_frame_at[0], 0.0)
+        self.assertEqual(started["n"], 1)                    # pump self-heal called
+
+    def test_clear_negative_cache_forces_reprobe(self):
+        # M1: a cached "unavailable" verdict can be cleared so the sensor's
+        # re-arrival is felt immediately rather than after the negative window.
+        kb._open_error[0] = "Kinect unavailable"
+        kb._negative_until[0] = kb.time.monotonic() + 999.0
+        kb.clear_negative_cache()
+        self.assertEqual(kb._negative_until[0], 0.0)
+        self.assertIsNone(kb._open_error[0])
+
+    def test_negative_cache_window_is_short(self):
+        # M1: the negative cache was shortened from 30s so a re-plugged sensor is
+        # noticed quickly.
+        self.assertLessEqual(kb._NEGATIVE_CACHE_SEC, 10.0)
+
+
+class InfraredProbeTests(_BridgeBase):
+    """M4: get_infrared_gray must probe BOTH has_new_infrared_frame AND the getter
+    via getattr; a build wiring one but not the other degrades to None (not a
+    swallowed AttributeError)."""
+
+    def test_none_when_readiness_probe_absent(self):
+        np = _require_numpy(self)
+        flat = np.full(512 * 424, 1000, dtype=np.uint16)
+        rt = _FakeRuntime(infrared=flat)            # has the getter…
+        rt.has_new_infrared_frame = None            # …but not the readiness check
+        _patch_loader(self, rt)
+        self.assertIsNone(kb.get_infrared_gray())   # bails cleanly, no raise
+
+    def test_none_when_getter_absent(self):
+        np = _require_numpy(self)
+        flat = np.full(512 * 424, 1000, dtype=np.uint16)
+        rt = _FakeRuntime(infrared=flat, has_infrared_getter=False)
+        _patch_loader(self, rt)
+        self.assertIsNone(kb.get_infrared_gray())
 
 
 # ─────────────────────────────────────────────────────────────────────────
