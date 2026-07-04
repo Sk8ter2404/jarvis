@@ -658,6 +658,17 @@ class PureHelperTests(SectionFiveBase):
             "open_on_monitor", "left | x", "")
         self.assertEqual(out, "left | x")
 
+    def test_substitute_monitor_numeric_target_unchanged(self):
+        # v1.84.0: a bare digit ("2") has no entry in MONITORS, so rather than
+        # splice it in (the downstream handler would reject "2" → silent no-op),
+        # leave the arg alone and let the replay fire on its original monitor.
+        out = self.bc._substitute_monitor_in_arg(
+            "open_on_monitor", "left | https://example.com", "2")
+        self.assertEqual(out, "left | https://example.com")
+        out2 = self.bc._substitute_monitor_in_arg(
+            "move_window_to_monitor", "Notepad | left", "3")
+        self.assertEqual(out2, "Notepad | left")
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Screen-context cache
@@ -2845,6 +2856,10 @@ class FabricatedInfoHallucinationTests(SectionFiveBase):
             "I found a bug in the timer, sir.",          # discussing, not filing
             "That's a known issue, sir.",                # no filing verb
             "I've logged you into the system.",          # 'logged' but no bug/issue
+            "Chrome version 120 is installed, sir.",     # third-party, not self
+            "You're on Python version 3.14, sir.",       # product before 'version'
+            "You are running Chrome version 120, sir.",  # 'running' but product between
+            "Postgres version 16 is available.",         # third-party
         ):
             out = self._detect_with_actions(
                 reply, extra=("weather_briefing", "report_bug"))
