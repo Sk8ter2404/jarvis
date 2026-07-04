@@ -11251,7 +11251,7 @@ def _parse_apple_music_track_title(raw: str) -> str | None:
 
 
 def _apple_music_title_now_playing() -> str | None:
-    """Scan open window titles for an actively-playing Apple Music track and
+    """Scan BROWSER window titles for an actively-playing Apple Music track and
     return its "<Song> — <Artist>" string, or None if nothing is clearly
     playing. Deterministic (no vision, no screenshot) — used both by the
     playback-confirmation path and by the now_playing action."""
@@ -11266,6 +11266,18 @@ def _apple_music_title_now_playing() -> str | None:
     for w in windows:
         title = (getattr(w, "title", "") or "").strip()
         if not title:
+            continue
+        # Positively identify a BROWSER web-player tab before trusting its title
+        # as playback proof. The Apple Music web player only runs in a browser, so
+        # a genuine now-playing title always carries a browser marker (e.g.
+        # "<Song> — <Artist> - Google Chrome"). Without this gate, ANY hyphenated
+        # top-level window title — "foo.py - Visual Studio Code", "Inbox (5) -
+        # user@gmail.com", "Documents - File Explorer", "Slack - general - Acme" —
+        # passes the loose parser and false-confirms playback, so verify_first
+        # skips the real play step (the 2026-07 audit's near-constant false "already
+        # playing").
+        norm = _strip_bidi_and_nbsp(title).lower()
+        if not any(m in norm for m in _MUSIC_BROWSER_MARKERS):
             continue
         track = _parse_apple_music_track_title(title)
         if track:
@@ -11894,7 +11906,13 @@ def _apple_music_play_playlist(name: str) -> str:
     playlist via vision, open it, click Play/Shuffle, and verify playback.
     Unlike the search-based flow, this jumps straight to the saved-playlists
     view so JARVIS never scrolls aimlessly through search results."""
-    cfg = _STREAMING_SERVICES["apple_music"]
+    # Work on a COPY (never mutate the shared _STREAMING_SERVICES template) and
+    # disable verify_first: we just navigated to a FRESH Library>Playlists view,
+    # so nothing is "already playing" here. Without this, a STALE Apple Music
+    # window left from a prior track satisfies the tab-title pre-check and
+    # _streaming_play_and_verify skips the real play step, reporting a false
+    # success. Mirrors the search flow's per-call cfg copy.
+    cfg = {**_STREAMING_SERVICES["apple_music"], "verify_first": False}
     service_label = "Apple Music"
 
     # Step 1: open Library > Playlists directly. Skips the sidebar clicks
@@ -13391,7 +13409,13 @@ def _substitute_monitor_in_arg(action_name: str, arg: str, monitor: str) -> str:
     still fire, just on its original monitor.
     """
     mon = (monitor or "").strip().lower()
-    if not mon or not arg or "|" not in arg:
+    # Only rewrite when the token is a KNOWN monitor NAME. A numeric or otherwise
+    # unknown target (e.g. "2") has no canonical name in MONITORS, so splicing it
+    # in would make the downstream handler reject it ("unknown monitor '2'") and
+    # the replay silently no-op. Leaving the arg alone fires the replay on its
+    # ORIGINAL monitor instead. Do NOT invent a digit->name layout here — it can't
+    # be verified and would silently target the wrong screen.
+    if not mon or mon not in MONITORS or not arg or "|" not in arg:
         return arg
     if action_name == "open_on_monitor":
         _, rest = arg.split("|", 1)
@@ -13406,8 +13430,10 @@ def _substitute_monitor_in_arg(action_name: str, arg: str, monitor: str) -> str:
 
 
 # Voice phrases that route directly to replay_last_action without an LLM
-# round-trip. The optional monitor capture matches names ('left', 'right',
-# 'top', 'middle') and bare digits ('2', '3') so users can say either.
+# round-trip. The optional monitor capture is permissive, but only NAMED
+# monitors ('left', 'right', 'top', 'middle') actually resolve — a bare digit
+# ('2') has no entry in MONITORS, so _substitute_monitor_in_arg leaves the arg
+# alone and the replay fires on its original monitor rather than a wrong screen.
 _REPLAY_VOICE_RE = re.compile(
     r"^(?:please\s+)?"
     r"(?:do|run|fire|execute|repeat|replay)\s+"
@@ -14824,11 +14850,19 @@ _PREEMPTIVE_HALLUCINATION_PATTERNS: list[tuple["re.Pattern", str | None, str]] =
         re.IGNORECASE),
      "get_time", "state the current time from memory"),
 
-    # Version claim: "version 1.20", "I'm on version 12.4", "running version
-    # 3", "I'm running 1.20.6". Requires the word 'version'/'running' next to a
-    # number so "version control" / "running late" don't match.
+    # Version claim about JARVIS ITSELF. Anchored so a THIRD-PARTY version
+    # mention no longer injects a bogus version_info: matches first-person
+    # ("I'm on/at/running/currently on version N", "my version is N") and the two
+    # subjectless self-report shapes JARVIS uses ("Running version N", a reply-
+    # initial "Version N"), while REJECTING claims that name a product before the
+    # number ("Chrome version 120", "Python version 3.14", "you are running Chrome
+    # version 120"). 'running version' requires 'version' immediately after
+    # 'running' so a product between them does not match.
     (re.compile(
-        r"\b(?:(?:on|running|at|i'?m\s+on|currently\s+on)\s+)?version\s+v?\d+(?:\.\d+)*\b",
+        r"\b(?:i'?m\s+(?:on|at|running|currently\s+on)|running|currently\s+running)"
+        r"\s+version\s+v?\d+(?:\.\d+)*\b"
+        r"|^version\s+v?\d+(?:\.\d+)*\b"
+        r"|\bmy\s+version\s+is\s+v?\d+(?:\.\d+)*\b",
         re.IGNORECASE),
      "version_info", "state the version from memory"),
     (re.compile(

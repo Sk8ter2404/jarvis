@@ -1580,6 +1580,13 @@ class AppleMusicPlayPlaylistTests(MonolithGlobalsTestCase):
             out = self.bc._apple_music_play_playlist("chill")
         self.assertEqual(out, "playing 'chill' on Apple Music")
         pv.assert_called_once()
+        # v1.84.0 [10]: the playlist flow passes a cfg COPY with verify_first
+        # disabled (a freshly-opened Library>Playlists view has nothing "already
+        # playing"), so _streaming_play_and_verify never skips the real play step;
+        # and it must not mutate the shared _STREAMING_SERVICES template.
+        cfg_arg = pv.call_args[0][0]
+        self.assertFalse(cfg_arg.get("verify_first"))
+        self.assertIsNot(cfg_arg, self.bc._STREAMING_SERVICES["apple_music"])
 
 
 @requires_monolith
@@ -3032,6 +3039,25 @@ class AppleMusicTitleNowPlayingTests(MonolithGlobalsTestCase):
         ])
         self.assertEqual(self.bc._apple_music_title_now_playing(),
                          "Billie Jean — Michael Jackson")
+
+    def test_non_browser_hyphenated_titles_rejected(self):
+        # v1.84.0: a hyphenated NON-browser window title must not be mistaken for
+        # a now-playing track. Previously any "X - Y" top-level title passed the
+        # loose parser and false-confirmed playback, so verify_first skipped the
+        # real play step.
+        self._install_pgw([
+            _FakeWin("bobert_companion.py - Visual Studio Code"),
+            _FakeWin("Inbox (5) - user@gmail.com"),
+            _FakeWin("Documents - File Explorer"),
+            _FakeWin("Slack - general - Acme"),
+        ])
+        self.assertIsNone(self.bc._apple_music_title_now_playing())
+
+    def test_playing_title_without_browser_marker_not_trusted(self):
+        # A bare "<Song> — <Artist>" with no browser suffix isn't a browser tab,
+        # so it is no longer trusted as playback proof.
+        self._install_pgw([_FakeWin("Billie Jean — Michael Jackson")])
+        self.assertIsNone(self.bc._apple_music_title_now_playing())
 
     def test_none_when_only_idle_titles(self):
         self._install_pgw([_FakeWin("Apple Music"), _FakeWin("New Tab - Google Chrome")])
