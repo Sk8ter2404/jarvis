@@ -394,20 +394,29 @@ class LoadLocalPatternsTests(unittest.TestCase):
         rx = dict((l, r) for l, r in cnp.HARD)["x-local-hard"]
         self.assertTrue(rx.search("LOCALHARD_42"))
 
-    def test_read_error_is_swallowed(self):
+    def test_present_but_unreadable_fails_closed(self):
+        # v1.81.0 FAIL-CLOSED: a pii_local.py that EXISTS but can't be read is a
+        # different, more dangerous case than "no file present" (the legit
+        # fail-open covered by test_absent_file_is_noop). The owner-PII patterns
+        # did not load, so rather than pass with a silently degraded scanner the
+        # gate exits non-zero to block the commit — the repo syncs via Nextcloud,
+        # so a leaked commit is effectively irreversible.
         with mock.patch.object(cnp.os.path, "exists", return_value=True), \
              mock.patch("builtins.open", side_effect=OSError("boom")):
-            cnp._load_local_patterns()  # must not raise
-        self.assertEqual(cnp.HARD, self._hard)
-        self.assertEqual(cnp.WARN, self._warn)
+            with self.assertRaises(SystemExit) as cm:
+                cnp._load_local_patterns()
+        self.assertEqual(cm.exception.code, 2)
+        # HARD/WARN are restored by tearDown regardless of the early exit.
 
-    def test_malformed_local_file_swallowed(self):
+    def test_present_but_malformed_fails_closed(self):
+        # A present pii_local.py that won't compile/exec must ALSO fail closed
+        # (exit non-zero), not silently degrade to generic-only key formats.
         with mock.patch.object(cnp.os.path, "exists", return_value=True), \
              mock.patch("builtins.open",
                         mock.mock_open(read_data="this is not valid python <<<")):
-            cnp._load_local_patterns()  # compile/exec error -> swallowed
-        self.assertEqual(cnp.HARD, self._hard)
-        self.assertEqual(cnp.WARN, self._warn)
+            with self.assertRaises(SystemExit) as cm:
+                cnp._load_local_patterns()
+        self.assertEqual(cm.exception.code, 2)
 
     def test_missing_keys_default_to_empty(self):
         # File defines neither HARD nor WARN -> .get(..., []) -> no change.

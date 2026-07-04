@@ -858,7 +858,10 @@ class CrashWatchLoopTests(_Base):
                                   side_effect=fake_scan), \
                 mock.patch.object(dd, "_latest_session_log_tail",
                                   return_value="tail-text"):
-            _drive_loop(dd._crash_watch_loop, [True])  # one body, then stop
+            # Seeding now lives INSIDE the loop (v1.81.0): iteration 1 seeds the
+            # baseline (last_seen 0 -> head 100), iteration 2 polls and detects
+            # the crash. Two bodies, then stop.
+            _drive_loop(dd._crash_watch_loop, [False, True])
 
         txt = self._todo_text()
         self.assertIn("[crash-watch] APPCRASH at 2026-06-01T00:00:00", txt)
@@ -867,6 +870,45 @@ class CrashWatchLoopTests(_Base):
         st = self._read_state_file()["crash_watch"]
         self.assertEqual(st["detections"], 1)
         self.assertEqual(st["last_seen_record_id"], 201)
+
+    def test_loop_failed_seed_does_not_replay_history(self):
+        # Regression (v1.81.0): a transient Event Log error / empty read at the
+        # seed instant makes _scan_event_log_for_crashes return head=0. The loop
+        # must NOT persist last_seen_record_id=0 and then poll with it — 0 is
+        # falsy, so the baseline filter never fires and every historical APPCRASH
+        # in the scan window would be queued as a brand-new task. Instead it must
+        # RE-SEED on the next tick. This transition was previously untested.
+        self._write_state_file({"crash_watch": {"last_seen_record_id": 0}})
+        historical = [{"ts": "2026-05-01T00:00:00", "app": "python.exe",
+                       "offset": "0xBEEF", "record_id": 101}]
+        scan_calls = {"n": 0}
+
+        def fake_scan(api, last_record_id):
+            scan_calls["n"] += 1
+            if scan_calls["n"] == 1:
+                return [], 0                    # failed/empty seed → head 0
+            # If the fix regressed and a POLL ran with last_seen==0, this call
+            # would arrive as last_record_id==0 and (per the real scanner) return
+            # the historical crashes. A correct fix always RE-SEEDS instead, i.e.
+            # calls with last_record_id==10**12, so we only surface history when
+            # wrongly polled on a 0 baseline.
+            return (historical if last_record_id == 0 else []), 500
+
+        with mock.patch.object(dd, "_import_win_event_api",
+                               return_value=FakeWin32EvtLog()), \
+                mock.patch.object(dd, "_scan_event_log_for_crashes",
+                                  side_effect=fake_scan), \
+                mock.patch.object(dd, "_latest_session_log_tail",
+                                  return_value="tail"):
+            _drive_loop(dd._crash_watch_loop, [False, True])  # two bodies
+
+        # The failed seed replayed NO historical crash…
+        self.assertNotIn("0xBEEF", self._todo_text())
+        st = self._read_state_file()["crash_watch"]
+        self.assertEqual(st.get("detections", 0), 0)
+        # …and the second tick re-seeded to the now-readable true head (500),
+        # never persisting the transient 0.
+        self.assertEqual(st.get("last_seen_record_id"), 500)
 
     def test_loop_skips_seed_when_already_seeded(self):
         self._write_state_file({

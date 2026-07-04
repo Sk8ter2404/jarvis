@@ -122,8 +122,22 @@ def _load_local_patterns() -> None:
         try:
             with open(path, encoding="utf-8") as fh:
                 exec(compile(fh.read(), path, "exec"), ns)
-        except Exception:
-            return
+        except Exception as e:
+            # FAIL CLOSED. A pii_local.py that EXISTS but won't parse/exec is a
+            # different, more dangerous case than "no file present" (the legit
+            # fail-open below): the owner-PII patterns did NOT load, so the
+            # scanner has silently degraded to generic key formats exactly when
+            # it is meant to catch owner literals (name, email, LAN subnet,
+            # device codes) — and this repo syncs through Nextcloud, so a leaked
+            # commit is effectively irreversible. Block the commit loudly rather
+            # than pass degraded and silent.
+            sys.stderr.write(
+                f"[check_no_pii] ERROR: {path} is present but failed to load "
+                f"({e.__class__.__name__}: {e}).\n  Owner-PII patterns did not "
+                f"load; refusing to run with a degraded scanner. Fix or remove "
+                f"the file.\n"
+            )
+            sys.exit(2)
         for lbl, pat in ns.get("HARD", []):
             HARD.append((lbl, _rx(pat)))
         for lbl, pat in ns.get("WARN", []):
