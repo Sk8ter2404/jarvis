@@ -179,7 +179,10 @@ class ListModelsTests(unittest.TestCase):
 # ─── current_model ───────────────────────────────────────────────────────────
 class CurrentModelTests(unittest.TestCase):
     def test_reports_resolved_cache(self):
-        with _MonolithCtx(_fake_monolith(resolved=CHAT_32B)):
+        # The resolved-cache tag is reported (short + full) when the chat route
+        # is local; on auto/cloud current_model leads with the active brain
+        # (see the route-specific tests below).
+        with _MonolithCtx(_fake_monolith(resolved=CHAT_32B, routing={"chat": "local"})):
             out = M.current_model()
         self.assertIn("qwen 32B", out)
         self.assertIn(CHAT_32B, out)
@@ -189,6 +192,31 @@ class CurrentModelTests(unittest.TestCase):
         bc = _fake_monolith(resolved=None, local_model=CHAT_8B)
         with _MonolithCtx(bc):
             out = M.current_model()
+        self.assertIn("llama 8B", out)
+
+    def test_reports_claude_when_chat_route_is_cloud(self):
+        # 2026-07-04 live-repro: after 'switch to the cloud model', current_model
+        # kept saying "qwen 14B locally". It must now reflect the live chat route
+        # (MODEL_ROUTING['chat'], the SAME source set_brain writes + _call_llm
+        # reads) rather than always naming the local model.
+        bc = _fake_monolith(resolved=CHAT_32B, routing={"chat": "cloud"})
+        with _MonolithCtx(bc):
+            out = M.current_model()
+        self.assertIn("Claude", out)
+        self.assertNotIn("locally", out.lower())
+
+    def test_reports_local_model_when_chat_route_is_local(self):
+        bc = _fake_monolith(resolved=CHAT_32B, routing={"chat": "local"})
+        with _MonolithCtx(bc):
+            out = M.current_model()
+        self.assertIn("qwen 32B", out)
+        self.assertIn("locally", out.lower())
+
+    def test_reports_auto_names_both_claude_and_local_fallback(self):
+        bc = _fake_monolith(resolved=CHAT_8B, routing={"chat": "auto"})
+        with _MonolithCtx(bc):
+            out = M.current_model()
+        self.assertIn("Claude", out)
         self.assertIn("llama 8B", out)
 
 
