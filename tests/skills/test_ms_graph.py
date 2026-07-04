@@ -1236,7 +1236,25 @@ class CalendarActionTests(_MsGraphBase):
              mock.patch.object(self.mod, "get_upcoming_events",
                                side_effect=RuntimeError("graph boom")):
             out = self.mod.action_calendar_today("today")
-        self.assertIn("Couldn't reach the calendar", out)
+        self.assertIn("could not reach the calendar", out.lower())
+
+    def test_graph_exception_line_matches_a_failure_marker(self):
+        # calendar_today is now in SPEAK_RESULT_VERBATIM_ACTIONS. Its exception
+        # line MUST contain a FAILURE_MARKERS substring so the speak path routes
+        # it through the failure follow-up (reporting the problem) instead of
+        # voicing it as a bogus success readout. Guards the v1.80.0 rephrase from
+        # regressing back to "Couldn't ..." (which matches no marker).
+        from core.failure_markers import FAILURE_MARKERS
+        with mock.patch.object(self.mod, "is_configured", return_value=True), \
+             mock.patch.object(self.mod, "get_upcoming_events",
+                               side_effect=RuntimeError("graph boom")):
+            out = self.mod.action_calendar_today("today")
+        low = out.lower()
+        self.assertTrue(
+            any(m in low for m in FAILURE_MARKERS),
+            f"calendar failure line {out!r} matches no FAILURE_MARKERS — it "
+            f"would be spoken as a bogus success",
+        )
 
     def test_is_configured_exception_treated_as_unconfigured(self):
         with mock.patch.object(self.mod, "is_configured",

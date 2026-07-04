@@ -219,6 +219,21 @@ class VerbatimResultSpokenTests(MonolithGlobalsTestCase):
             self.assertIn(name, self.bc.SPEAK_RESULT_VERBATIM_ACTIONS,
                           f"{name} returns a finished answer that must be spoken")
 
+    def test_readout_completeness_v180_stability_announcer_calendar(self):
+        # v1.80.0 continuation of the never-voiced readout sweep. Each RETURNS a
+        # finished user-facing sentence, does NOT self-speak, and was in neither
+        # speak set. stability-gate + announcer are single-path direct-turn
+        # readouts; the calendar aliases are ALSO orchestrator-dispatched, but
+        # the worker runs actions directly (core/orchestrator.py) — never through
+        # _speak_verbatim_results — so voicing them affects only the direct turn
+        # the user asked from, no double-speak. Regression guard: keep voiced.
+        for name in ("last_stability_gate", "last_stability_gate_result",
+                     "last_gate_result", "stability_gate_status", "gate_status",
+                     "proactive_announcer_status",
+                     "calendar_today", "calendar_next", "ms_graph_calendar"):
+            self.assertIn(name, self.bc.SPEAK_RESULT_VERBATIM_ACTIONS,
+                          f"{name} returns a finished answer that must be spoken")
+
     def test_verbatim_set_excludes_side_effect_actions(self):
         # TRUE side-effect actions must NEVER verbatim-speak their result (the
         # inline reply already confirms them, and the effect is the point) —
