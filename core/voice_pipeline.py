@@ -315,6 +315,34 @@ def make_wake_detector(
         return None
 
     if not autostart:
+        # Standby feeds captured frames via detector._on_frame() instead of
+        # letting the detector open its own mic stream (record_speech already
+        # owns the device — Windows WASAPI rejects a 2nd open). But _on_frame is
+        # a silent no-op until the engine backend is built, and that only
+        # happens inside start(), which the standby path never calls. Build just
+        # the engine here (NO _open_stream) so the frame-fed neural wake can
+        # actually fire; without this the standby neural path was dead — engines
+        # stayed None and JARVIS could never wake by wake-word from standby.
+        try:
+            if detector.engine == "openwakeword":
+                detector._init_openwakeword()
+            elif detector.engine == "porcupine":
+                detector._init_porcupine()
+            else:
+                _log(f"wake engine {detector.engine!r} has no frame-fed init; "
+                     "keeping Whisper standby path")
+                return None
+        except ImportError as e:
+            _log(f"wake engine {detector.engine!r} not installed ({e}); keeping Whisper standby path")
+            return None
+        except Exception as e:
+            _log(f"wake engine init failed ({e}); keeping Whisper standby path")
+            return None
+        if use_silero_vad:
+            try:
+                detector._init_silero_vad()  # best-effort, non-fatal (matches start())
+            except Exception:
+                pass
         return detector
 
     try:

@@ -5133,8 +5133,18 @@ def _face_tracking_thread():
                             woke_ret, woke_frame = False, None
                             time.sleep(0.15)
                             try:
-                                new_c = cv2.VideoCapture(cam["index"], cv2.CAP_DSHOW)
-                                if new_c.isOpened():
+                                # Use the shared name-resolving opener (the same
+                                # one the initial + recovery opens use) rather
+                                # than a raw cv2.VideoCapture on the STATIC
+                                # cam["index"]. A USB re-enumeration can move the
+                                # device to a new live index, so the static index
+                                # would silently wake the WRONG camera (or a
+                                # random webcam where the Kinect belongs),
+                                # bypassing _dshow_name_to_index and the Kinect
+                                # branch. This is exactly the mic/USB-shuffle
+                                # event the name resolution exists to survive.
+                                new_c = _open_capture(cam)
+                                if new_c is not None and new_c.isOpened():
                                     try: new_c.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
                                     except Exception: pass
                                     try: new_c.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
@@ -5151,8 +5161,9 @@ def _face_tracking_thread():
                                         pass
                                     woke_ret, woke_frame = new_c.read()
                                 else:
-                                    try: new_c.release()
-                                    except Exception: pass
+                                    if new_c is not None:
+                                        try: new_c.release()
+                                        except Exception: pass
                                     new_c = None
                             except Exception:
                                 # A DirectShow open/set/read on a half-init

@@ -725,9 +725,15 @@ class DualReticleTests(_Base):
     def test_inactive_clears_two_hand_reticle(self):
         mod = self._load()
         am = self._am
-        d = mod.TwoHandDecision(active=False, rect=None, resizing=False,
-                                phase="idle", hands=None)
-        mod._publish_two_hand_overlay(d)
+        # Go active first, then inactive: the cleared frame is published ONCE on
+        # the active->inactive edge (then nothing, so the air-mouse owns the
+        # file and the reticle stops strobing). See TwoHandOverlayFlickerTests.
+        mod._two_hand_overlay_was_active[0] = False
+        mod._publish_two_hand_overlay(mod.TwoHandDecision(
+            active=True, rect=None, resizing=False, phase="holding",
+            hands=((100, 100), (300, 100))))
+        mod._publish_two_hand_overlay(mod.TwoHandDecision(
+            active=False, rect=None, resizing=False, phase="idle", hands=None))
         st = self._read_state(am)
         self.assertFalse(st.get("two_hand"))
         self.assertFalse(st.get("visible"))
@@ -957,6 +963,50 @@ class TwoHandBodyIdPinTests(_Base):
         self.assertEqual(mod._controlling_body_id(self._am), 17)
         self._am._last_body_id[0] = None
         self.assertIsNone(mod._controlling_body_id(self._am))
+
+
+class TwoHandOverlayFlickerTests(_Base):
+    """Regression: the two-hand poller and the air-mouse poller both write
+    AIR_CURSOR_STATE_FILE at ~30 Hz. The inactive branch must clear the two-hand
+    keys exactly ONCE on the active->inactive edge, then write nothing, so it
+    stops fighting the air-mouse and strobing the reticle."""
+
+    def _wire_state_file(self, mod):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        p = mock.patch.object(self._am, "AIR_CURSOR_STATE_FILE", path)
+        p.start()
+        self.addCleanup(p.stop)
+        mod._two_hand_overlay_was_active[0] = False
+        return path
+
+    def _decision(self, mod, active, hands=None):
+        return mod.TwoHandDecision(active=active, rect=None, resizing=False,
+                                   phase="track", hands=hands)
+
+    def test_inactive_clears_once_then_writes_nothing(self):
+        mod = self._load()
+        path = self._wire_state_file(mod)
+        active = self._decision(mod, True, hands=[(100, 200), (300, 400)])
+        inactive = self._decision(mod, False, hands=None)
+
+        # active -> visible two-hand frame written
+        mod._publish_two_hand_overlay(active)
+        self.assertTrue(mod._two_hand_overlay_was_active[0])
+        self.assertTrue(json.load(open(path, encoding="utf-8"))["two_hand"])
+
+        # first inactive -> clears the two-hand keys ONCE (transition edge)
+        mod._publish_two_hand_overlay(inactive)
+        self.assertFalse(mod._two_hand_overlay_was_active[0])
+        self.assertFalse(json.load(open(path, encoding="utf-8"))["two_hand"])
+
+        # delete the file; a SECOND inactive must NOT re-create it (no per-tick
+        # write — that is the flicker the air-mouse owns the file for now).
+        os.remove(path)
+        mod._publish_two_hand_overlay(inactive)
+        self.assertFalse(os.path.exists(path),
+                         "inactive two-hand must not re-write the state file every tick")
 
 
 if __name__ == "__main__":

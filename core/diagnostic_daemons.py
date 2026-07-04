@@ -400,7 +400,15 @@ def _scan_event_log_for_crashes(win32evtlog, last_record_id: int) -> tuple[list[
     Returns (list_of_crash_dicts, max_record_id_seen).
     """
     hits: list[dict] = []
-    max_seen = last_record_id
+    # Track the TRUE max record id independently of the filter bound. Seeding
+    # max_seen from last_record_id was a permanent-blindness bug: the seed call
+    # passes last_record_id=10**12 to skip historical crashes, but because
+    # events are read newest-first the early-return below fires on the first
+    # event before max_seen can drop to the real head — so it returned 10**12,
+    # which _crash_watch_loop then persisted as last_seen_record_id. Every later
+    # poll (last_seen=10**12) filtered out every real event, so no APPCRASH was
+    # ever surfaced. Starting at 0 lets the newest real rec_id win.
+    max_seen = 0
     try:
         handle = win32evtlog.OpenEventLog(None, "Application")
     except Exception as e:
