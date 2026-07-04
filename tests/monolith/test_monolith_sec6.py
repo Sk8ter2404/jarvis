@@ -1221,6 +1221,15 @@ class HandleConfirmationResponseTests(SectionSixBase):
 #  v1.82.0 uncertain-finding fixes: UI failsafe marker + late-night data loss
 # ════════════════════════════════════════════════════════════════════════════
 class UncertainConfirmedFixTests(SectionSixBase):
+    def test_report_bug_family_voiced_verbatim(self):
+        # [3] report_bug's handler returns a finished "Logged it … opened a
+        # GitHub issue …" confirmation and does not self-speak, so it must be in
+        # SPEAK_RESULT_VERBATIM_ACTIONS or the user never hears whether the bug
+        # was actually filed.
+        for name in ("report_bug", "report_a_bug", "log_a_bug", "file_a_bug"):
+            self.assertIn(name, self.bc.SPEAK_RESULT_VERBATIM_ACTIONS,
+                          f"{name} confirmation must be voiced")
+
     def test_failsafe_msg_contains_a_failure_marker(self):
         # [12] _act_click / _act_type catch UIFailsafeError and `return str(e)`;
         # if _FAILSAFE_MSG carries no FAILURE_MARKERS substring the corner-abort

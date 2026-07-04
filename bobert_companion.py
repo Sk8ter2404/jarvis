@@ -2513,6 +2513,27 @@ _hud_state_cache: dict = {
     "alert_active": False,    # sustained CPU/RAM alert from skills/system_monitor
     "bambu_active": False,    # Bambu H2D mid-print (gcode_state == RUNNING)
 }
+# Seed the persisted tray-toggle cells from an existing hud_state.json at import,
+# BEFORE any _write_hud_state can run. _write_hud_state serialises
+# dict(_hud_state_cache) and os.replace-s the WHOLE file, and this literal omits
+# every toggle key — so a HUD write landing before _restore_tray_toggle_state()
+# would overwrite hud_state.json with a cache that never held them, wiping the
+# user's persisted standby/mute/ambient/paused/debug/audio state across a restart.
+# Seeding here makes those writes MERGE onto the toggles instead of dropping them.
+# Best-effort: a missing/corrupt file just leaves the in-literal defaults.
+try:
+    if os.path.exists(HUD_STATE_FILE):
+        with open(HUD_STATE_FILE, "r", encoding="utf-8") as _hud_seed_f:
+            _persisted_hud = json.load(_hud_seed_f)
+        if isinstance(_persisted_hud, dict):
+            for _hud_k in ("tts_muted", "mic_muted", "sleep_mode", "standby_mode",
+                           "ambient_mode_active", "daemons_paused", "debug_mode",
+                           "audio_processing_enabled", "echo_cancel_enabled",
+                           "noise_suppress_enabled", "agc_enabled"):
+                if _hud_k in _persisted_hud:
+                    _hud_state_cache[_hud_k] = _persisted_hud[_hud_k]
+except Exception:
+    pass
 _last_mic_hud_write = [0.0]  # throttle audio→HUD writes to ~10Hz
 
 
@@ -14499,6 +14520,11 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     #   the calendar_scanner orchestrator worker dispatches the same callable
     #   directly and folds it into a briefing, so no double-speak here.
     "calendar_today", "calendar_next", "ms_graph_calendar",
+    #   Bug-report confirmation (core.actions._act_report_bug + aliases). Returns
+    #   a finished "Logged it … opened a pre-filled GitHub issue …" sentence and
+    #   does NOT self-speak, so without this the user only heard "Of course, sir"
+    #   and had no idea whether the bug was actually filed.
+    "report_bug", "report_a_bug", "log_a_bug", "file_a_bug",
 }
 
 # Actions whose runtime can plausibly exceed MID_TASK_STATUS_DELAY (~8 s).
@@ -14809,6 +14835,17 @@ _PREEMPTIVE_HALLUCINATION_PATTERNS: list[tuple["re.Pattern", str | None, str]] =
         r"\bi'?m\s+running\s+v?\d+\.\d+(?:\.\d+)*\b",
         re.IGNORECASE),
      "version_info", "state the version from memory"),
+
+    # Bug-report claim: "I've logged that bug", "filed a GitHub issue",
+    # "reported the timer bug". Requires a FILING verb within a few words of a
+    # bug/issue/ticket noun so "I found a bug" / "that's a known issue" /
+    # "logged you in" don't match. Injecting report_bug (with no captured
+    # description) makes the empty-desc handler re-prompt "tell me what went
+    # wrong" instead of the LLM fabricating a filed-it success it never did.
+    (re.compile(
+        r"\b(?:logged|filed|reported|recorded|submitted)\b(?:\s+\w+){0,4}?\s+(?:bug|issue|ticket)\b",
+        re.IGNORECASE),
+     "report_bug", "file the bug the user described"),
 
     # Weather: "64 degrees Fahrenheit", "it's 72 and sunny", "currently 58
     # degrees and cloudy", "72°F outside". Requires a temperature TIED to a

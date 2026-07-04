@@ -220,8 +220,14 @@ def _invoke_skill(short_name: str, reason: str) -> bool:
               f"{_SKILL_CHAIN_ENTRY} — skipping (manual trigger still works)")
         return False
     try:
-        entry(reason)
-        return True
+        result = entry(reason)
+        # "" is the DOCUMENTED fall-back sentinel: morning_arrival / morning_handoff
+        # return it to DECLINE without firing (e.g. a silence gate) so the chain can
+        # try its next pick. None (fired with no return, or an already-done early
+        # return) and any truthy briefing text both mean the day is handled. Only ""
+        # must leave the day un-dispatched — returning True unconditionally here made
+        # a silence-gate decline mark the day done and skip the briefing entirely.
+        return result != ""
     except Exception as e:
         print(f"  [morning-chain] {_SKILL_MODULE_MAP[short_name]} fire failed: {e}")
         return False
