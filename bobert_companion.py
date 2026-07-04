@@ -7687,12 +7687,52 @@ def _ollama_big_model_resident(exclude_model: str | None = None) -> str | None:
     return None
 
 
+# Debounce before concluding "Ollama is not installed". A single failed 2s
+# /api/tags probe is NOT evidence of a missing install — 2026-07-02 live boot:
+# the probe flapped once (server busy loading a model) and winget re-ran a
+# full `Ollama.Ollama` install 17 seconds AFTER the same server had served
+# embedding requests. Patchable so tests don't sleep.
+_OLLAMA_INSTALL_RECHECK_S = 10.0
+
+
+def _ollama_binary_present() -> bool:
+    """True when an Ollama binary already exists on this box (PATH, the
+    per-user install dir, or Program Files). Used to distinguish "installed
+    but not responding" (never reinstall — that can rip the runtime out from
+    under a live-but-slow server) from "genuinely not installed"."""
+    try:
+        import shutil as _sh
+        if _sh.which("ollama"):
+            return True
+        candidates = [
+            os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                         "Programs", "Ollama", "ollama.exe"),
+            r"C:\Program Files\Ollama\ollama.exe",
+            r"C:\Program Files (x86)\Ollama\ollama.exe",
+        ]
+        return any(c and os.path.isfile(c) for c in candidates)
+    except Exception:
+        # Fail toward "present": skipping an install is recoverable (log tells
+        # the user), a spurious reinstall over a live server is not.
+        return True
+
+
 def _ollama_install_async() -> None:
     if _OLLAMA_INSTALL_TRIGGERED[0]:
         return
     _OLLAMA_INSTALL_TRIGGERED[0] = True
 
     def _do() -> None:
+        # Debounce the flapped-probe case: wait, then re-probe before touching
+        # winget. The caller decided Ollama was dead off ONE 2s probe.
+        time.sleep(_OLLAMA_INSTALL_RECHECK_S)
+        if _ollama_alive():
+            print("  [local-llm] Ollama responded on re-probe — install skipped (transient probe flap).")
+            return
+        if _ollama_binary_present():
+            print("  [local-llm] Ollama is installed but not responding — NOT reinstalling. "
+                  "Start the Ollama app/service manually if this persists (SAC can block ggml.dll).")
+            return
         print("  [local-llm] Ollama not detected — running `winget install Ollama.Ollama` in background…")
         try:
             import subprocess as _sp
@@ -13992,6 +14032,21 @@ def _should_refuse_background_audio(text: str) -> "tuple[bool, str]":
         return (False, "")
 
 
+def _bg_gate_for_turn(text: str, injected: bool) -> "tuple[bool, str]":
+    """Background-audio gate for ONE main-loop turn.
+
+    Injected commands (the driver / tools/say_to_jarvis.py / smoke harness /
+    tray channel) are explicit local input typed by an operator — they are by
+    definition NOT overheard room audio, which is the only thing the bg-audio
+    gate exists to drop. 2026-07-02 live-test: with wake-word mode latched on
+    (_require_wake_runtime), every driver inject without a literal "Jarvis"
+    prefix was silently dropped here, so the headless test path could not
+    drive the app. Real mic turns keep the full gate unchanged."""
+    if injected:
+        return (False, "")
+    return _should_refuse_background_audio(text)
+
+
 # Standby auto-engage bridge. The background lyric-detection thread in
 # skills/standby_audio_detect calls this when it's seen sustained vocal
 # music while the headset is the active output — flipping standby state
@@ -18992,7 +19047,8 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 # through — so quiet-room turns are unaffected and the user can
                 # still command over music by prefixing the wake word. Anything
                 # else while music plays is treated as overheard audio and dropped.
-                _bg_gate, _bg_why = _should_refuse_background_audio(text)
+                _bg_gate, _bg_why = _bg_gate_for_turn(
+                    text, _injected_text is not None)
                 if _bg_gate:
                     print(f"  [bg-audio] {_bg_why} — ignoring non-wake "
                           f"utterance: '{text[:40]}'")

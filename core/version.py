@@ -4,7 +4,7 @@ The public release/distribution version lives in the top-level ``VERSION``
 file and is read once here. This is intentionally SEPARATE from the
 self-upgrade pipeline's internal CHANGELOG counter (which bumps a patch
 number every pipeline run); ``__version__`` is the version JARVIS reports as
-its shareable build (e.g. "1.76.0").
+its shareable build (e.g. "1.77.0").
 
 Zero side effects at import beyond a single small file read, so this stays in
 the import-light tier and is safe to import anywhere (incl. bare CI).
@@ -33,5 +33,5 @@ VERSION = __version__
 
 
 def version_string() -> str:
-    """Human-facing release string, e.g. ``1.76.0``."""
+    """Human-facing release string, e.g. ``1.77.0``."""
     return __version__

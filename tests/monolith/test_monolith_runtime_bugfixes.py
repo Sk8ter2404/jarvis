@@ -550,5 +550,35 @@ class PlayWithLipsyncEndpointSwapTests(MonolithGlobalsTestCase):
             self._run_play([err1, err2], out_dev=7)
 
 
+@requires_monolith
+class InjectedTurnBypassesBgGateTests(MonolithGlobalsTestCase):
+    """2026-07-02 live-test: with wake-word mode latched (_require_wake_runtime,
+    e.g. after standby→tray force_wake, which deliberately does NOT clear it),
+    every driver-injected command without a literal "Jarvis" prefix was dropped
+    by the background-audio gate — the headless test/driver path could not
+    drive the app at all. Injected commands are explicit local operator input,
+    not overheard room audio, so the per-turn wrapper _bg_gate_for_turn must
+    bypass the gate for them and leave real mic turns fully gated."""
+
+    def test_injected_turn_never_gated(self):
+        # Even in the maximal-refusal state (gate would say True), an injected
+        # turn must pass. Make the underlying gate explode-if-called to prove
+        # the bypass short-circuits BEFORE any gate logic runs.
+        with mock.patch.object(
+                self.bc, "_should_refuse_background_audio",
+                side_effect=AssertionError("gate must not run for injects")):
+            self.assertEqual(self.bc._bg_gate_for_turn("set a timer", True),
+                             (False, ""))
+
+    def test_mic_turn_still_delegates_to_gate(self):
+        with mock.patch.object(
+                self.bc, "_should_refuse_background_audio",
+                return_value=(True, "wake-word mode")) as gate:
+            self.assertEqual(
+                self.bc._bg_gate_for_turn("set a timer", False),
+                (True, "wake-word mode"))
+        gate.assert_called_once_with("set a timer")
+
+
 if __name__ == "__main__":
     unittest.main()
