@@ -300,8 +300,17 @@ def _check_milestones() -> None:
     ams = state.get("ams_status")
 
     # Reset milestone bookkeeping when the print file changes — same trigger
-    # bambu_monitor uses. We also reset when gcode_state moves out of a
-    # terminal state into RUNNING, so a same-filename re-run isn't silenced.
+    # bambu_monitor uses.
+    #
+    # KNOWN LIMITATION (tracked follow-up): a same-filename REPRINT is NOT reset
+    # here, so re-running the exact same file keeps the populated _announced_*
+    # sets and its 10 %/95 %/layer/completion callouts are silenced until a
+    # different file is printed. A terminal->RUNNING reset would fix it, but the
+    # _armed_for_new_print / priming interaction below needs a deliberate rework
+    # first (that flag is set True on a filename change and on priming and is
+    # never cleared, so a naive reset risks re-enabling mid-print "blurting").
+    # Deferred rather than patched blind. (A previous version of this comment
+    # claimed the terminal->RUNNING reset already existed; it never did.)
     if fname and fname != _current_filename[0]:
         _current_filename[0] = fname
         _announced_pct.clear()

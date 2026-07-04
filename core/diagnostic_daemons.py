@@ -482,16 +482,6 @@ def _crash_watch_loop() -> None:
     if api is None:
         return
     print(f"  [diag-daemons] crash watcher online (interval={CRASH_POLL_INTERVAL_S}s)")
-    # On first run, seed last_seen_record_id to the current head so we don't
-    # spam the queue with historical crashes.
-    state = _read_state()
-    seed_id = int(state.get("crash_watch", {}).get("last_seen_record_id", 0))
-    if seed_id == 0:
-        _, head = _scan_event_log_for_crashes(api, last_record_id=10**12)
-        _update_state(lambda s: s["crash_watch"].update({
-            "last_seen_record_id": head,
-            "last_poll_ts": _now(),
-        }))
 
     while not _stop_event.is_set():
         try:
@@ -502,6 +492,31 @@ def _crash_watch_loop() -> None:
                     return
                 continue
             last_seen = int(state.get("crash_watch", {}).get("last_seen_record_id", 0))
+            # last_seen == 0 means we have never successfully seeded a baseline:
+            # first run, or a prior seed hit a transient Event Log error / empty
+            # read and returned head 0. RE-SEED here — capture the current head to
+            # skip historical crashes, and persist ONLY a real (non-zero) head.
+            # We must NOT fall through to a normal poll with last_seen == 0: the
+            # baseline filter (`if last_record_id and ...`) treats 0 as falsy and
+            # never fires, so the scan would replay every historical APPCRASH in
+            # the window as a brand-new task. Seeding lives inside the loop (not
+            # once before it) so a failed seed simply retries on the next tick
+            # instead of persisting 0 and spamming the queue. (Regression from the
+            # v1.79.0 blindness fix: seeding max_seen at 0 made a failed seed
+            # persist 0 rather than the old always-blind 10**12.)
+            if last_seen == 0:
+                try:
+                    _, head = _scan_event_log_for_crashes(api, last_record_id=10**12)
+                except Exception:
+                    head = 0
+                if head:
+                    _update_state(lambda s: s["crash_watch"].update({
+                        "last_seen_record_id": head,
+                        "last_poll_ts": _now(),
+                    }))
+                if _stop_event.wait(CRASH_POLL_INTERVAL_S):
+                    return
+                continue
             try:
                 crashes, new_head = _scan_event_log_for_crashes(api, last_seen)
             except Exception:
