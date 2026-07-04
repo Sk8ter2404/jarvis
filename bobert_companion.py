@@ -14458,6 +14458,22 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     "what_changed", "what_is_broken", "whats_broken", "whats_new",
     "who_am_i", "who_is_talking", "whos_at_the_desk", "whos_talking",
     "workshop_status",
+    # v1.80.0 — completing the never-voiced read-out sweep. Each returns a
+    # finished, user-facing status sentence with no self-speak, and none is
+    # dispatched only by the orchestrator worker (which runs actions directly,
+    # never through _speak_verbatim_results), so voicing them here affects only
+    # the direct-turn path the user actually asked from.
+    #   stability gate verdict (skills/stability_gate_status.py) — PASS/SKIP/
+    #   never-run readouts carry no FAILURE_MARKERS so they voice; a FAIL verdict
+    #   contains "failed" and correctly routes to the failure follow-up instead.
+    "last_stability_gate", "last_stability_gate_result", "last_gate_result",
+    "stability_gate_status", "gate_status",
+    #   proactive print-announcer suppression state (skills/bambu_print_announcer.py).
+    "proactive_announcer_status",
+    #   Microsoft Graph calendar agenda (skills/ms_graph.py). Direct-turn readout;
+    #   the calendar_scanner orchestrator worker dispatches the same callable
+    #   directly and folds it into a briefing, so no double-speak here.
+    "calendar_today", "calendar_next", "ms_graph_calendar",
 }
 
 # Actions whose runtime can plausibly exceed MID_TASK_STATUS_DELAY (~8 s).

@@ -814,8 +814,11 @@ def action_calendar_today(arg: str = "") -> str:
         events = get_upcoming_events(top_n=10, when=when)
     except Exception:
         # Any unexpected Graph/parse failure degrades to an honest line rather
-        # than bubbling an exception up into the worker.
-        return "Couldn't reach the calendar just now, sir."
+        # than bubbling an exception up into the worker. Phrased with "could not"
+        # so it matches FAILURE_MARKERS: a spoken calendar readout that failed
+        # then routes through the failure follow-up instead of being voiced as a
+        # bogus success (calendar_today is in SPEAK_RESULT_VERBATIM_ACTIONS).
+        return "I could not reach the calendar just now, sir."
     label = {"today": "today", "tomorrow": "tomorrow",
              "next_14_days": "the next two weeks"}[when]
     if not events:
