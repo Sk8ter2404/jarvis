@@ -95,6 +95,19 @@ class ExcitedTests(unittest.TestCase):
         self.assertEqual(et.classify_emotion("This is brilliant!", DAY).label,
                          "excited")
 
+    def test_two_exclamations_with_positive_phrase_is_excited(self):
+        # v1.82.0: 2+ '!' PLUS positive vocabulary now reaches the excited
+        # excl-branch. Previously the unconditional stressed `excl>=2` rule fired
+        # first and classified this as stressed, leaving the excited excl-branch
+        # unreachable dead code.
+        self.assertEqual(et.classify_emotion("This is amazing!!", DAY).label,
+                         "excited")
+
+    def test_two_exclamations_without_positive_phrase_stays_stressed(self):
+        # The other side of the guard: 2+ '!' with NO positive vocabulary must
+        # still resolve to stressed (the excited gate requires a positive phrase).
+        self.assertEqual(et.classify_emotion("Hurry up!!", DAY).label, "stressed")
+
     def test_loud_spike_plus_positive_phrase(self):
         p = ProsodyHints(rms=0.20, rms_baseline=0.02, hour=14)
         self.assertEqual(et.classify_emotion("awesome", p).label, "excited")

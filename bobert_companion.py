@@ -6159,11 +6159,26 @@ def _is_late_night_suppressed(memory: dict, now: float | None = None) -> bool:
 
 def _set_late_night_suppression(memory: dict) -> None:
     """Mute late-night remarks for the rest of this calendar night."""
-    memory["late_night_no_comments_until"] = _late_night_session_key()
+    key = _late_night_session_key()
+    # Persist against a FRESH locked load, NEVER the passed-in dict. The caller
+    # (maybe_late_night_remark) hands us the main loop's long-lived boot snapshot,
+    # and save_memory() is a whole-file json.dump + os.replace overwrite. Session
+    # facts are written to disk only by learn_from_turn -> merge_memory (its own
+    # fresh-locked load/merge/save) and never mirrored back into that snapshot, so
+    # saving the stale dict here would clobber bobert_memory.json and discard every
+    # fact/project/topic learned this session — the exact bug already fixed on the
+    # shutdown path and used by the phrase-rotation writer.
     try:
-        save_memory(memory)
+        with _memory_lock:
+            _fresh = load_memory()
+            _fresh["late_night_no_comments_until"] = key
+            save_memory(_fresh)
     except Exception as e:
         print(f"  [late-night] failed to persist suppression: {e}")
+    # Keep the in-session snapshot consistent so _is_late_night_suppressed() sees
+    # the suppression for the rest of this loop without a disk re-read.
+    if isinstance(memory, dict):
+        memory["late_night_no_comments_until"] = key
 
 
 def _matches_suppress_phrase(text: str) -> bool:
@@ -10089,7 +10104,13 @@ class UIFailsafeError(Exception):
 
 
 _FAILSAFE_MSG = (
-    "Your mouse was in a corner, sir — try again with the cursor elsewhere"
+    # Must contain a FAILURE_MARKERS substring ("failed") so that when _act_click
+    # / _act_type catch UIFailsafeError and `return str(e)`, the returned string is
+    # classified as a failure (core/failure_markers.py) and routed through the
+    # failure follow-up — otherwise a corner-triggered click/type abort is spoken
+    # as a bogus success.
+    "Click failed — your mouse was in a corner, sir; "
+    "try again with the cursor elsewhere"
 )
 
 
@@ -11766,7 +11787,11 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
 
     # Default path: single play click, no verification.
     print(f"  [auto-play] looking for play button on {service_label}…", flush=True)
-    play_coords = find_click_target(cfg["play_hint"])
+    # Pass the vision_monitor pin (as the result-click above and the strict path
+    # do) so find_click_target photographs just the pinned monitor — otherwise it
+    # captures the whole virtual desktop, downscales the play control past
+    # recognition, and the play click misses on a multi-monitor setup.
+    play_coords = find_click_target(cfg["play_hint"], monitor=cfg.get("vision_monitor"))
     if play_coords is None:
         return (
             f"opened '{q}' on {service_label}, but couldn't locate the play "
@@ -16057,6 +16082,8 @@ def handle_confirmation_response(user_text: str) -> bool:
         count = len(_pending_confirmation)
         print(f"  [confirm] User confirmed — executing {count} pending action(s)")
         executed = []
+        failures = []  # spoken-friendly reasons for actions that did NOT succeed
+        fail_markers = tuple(m.lower() for m in FAILURE_MARKERS)
         while _pending_confirmation:
             name, arg = _pending_confirmation.pop(0)
             fn = ACTIONS.get(name)
@@ -16064,13 +16091,30 @@ def handle_confirmation_response(user_text: str) -> bool:
                 continue
             try:
                 res = fn(arg)
-                executed.append(name)
                 print(f"  [action] {name}: {res}")
+                # A soft failure is signalled by a RETURNED marker substring, not
+                # by raising (core/failure_markers.py). Counting it as executed
+                # made JARVIS speak "Done." for an action that silently failed.
+                low = (res or "").strip().lower()
+                if low and any(m in low for m in fail_markers):
+                    failures.append(str(res).strip())
+                else:
+                    executed.append(name)
             except Exception as e:
                 print(f"  [action] {name} failed: {e}")
-        # Audible feedback so the user knows the action ran
-        feedback = "Done." if len(executed) == 1 else f"Done — ran {len(executed)} actions."
-        _speak(feedback)
+                failures.append(f"{name.replace('_', ' ')} ran into an error, sir")
+        # Honest audible feedback — don't say "Done" for actions that failed.
+        if executed and not failures:
+            _speak("Done." if len(executed) == 1 else f"Done — ran {len(executed)} actions.")
+        elif executed and failures:
+            done = "Done." if len(executed) == 1 else f"Done — ran {len(executed)} actions."
+            _speak(f"{done} But {len(failures)} didn't go through, sir.")
+        elif failures:
+            # Nothing succeeded — speak the first failure's own message (action
+            # failure strings are already finished sentences).
+            _speak(failures[0])
+        else:
+            _speak("Done.")
     else:
         count = len(_pending_confirmation)
         print(f"  [confirm] User declined — cancelling {count} pending action(s)")
