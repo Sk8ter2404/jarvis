@@ -385,6 +385,37 @@ class MorningChainWatcherTests(unittest.TestCase):
                 self.mod._watch_for_first_wake()
 
 
+class InvokeSkillDeclineTests(unittest.TestCase):
+    """v1.83.0: _invoke_skill must report a real fire vs the "" fall-back
+    sentinel, so a silence-gate decline no longer marks the day dispatched and
+    skips the briefing."""
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("morning_chain")
+
+    def _invoke_with_fire(self, fire_fn, short="arrival"):
+        fake = types.ModuleType("fake_chain_skill")
+        fake._fire_from_chain = fire_fn
+        with mock.patch.object(self.mod, "_import_skill", return_value=fake):
+            return self.mod._invoke_skill(short, "reason")
+
+    def test_empty_string_decline_returns_false(self):
+        # "" = documented fall-back sentinel (morning_arrival/handoff) → NOT
+        # dispatched, so the chain can try its next pick.
+        self.assertFalse(self._invoke_with_fire(lambda reason: ""))
+
+    def test_none_return_counts_as_handled(self):
+        # None = fired-with-no-return, or an already-done early return → handled.
+        self.assertTrue(self._invoke_with_fire(lambda reason: None, short="briefing"))
+
+    def test_truthy_text_counts_as_fired(self):
+        self.assertTrue(self._invoke_with_fire(lambda reason: "briefing text"))
+
+    def test_exception_returns_false(self):
+        def boom(reason):
+            raise RuntimeError("nope")
+        self.assertFalse(self._invoke_with_fire(boom))
+
+
 class MorningChainRegisterTests(unittest.TestCase):
     def test_register_adds_pick_action(self):
         mod, actions = load_skill_isolated("morning_chain")

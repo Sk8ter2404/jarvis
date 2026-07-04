@@ -2817,6 +2817,17 @@ class FabricatedInfoHallucinationTests(SectionFiveBase):
                       "Memory usage is 73%, sir."):
             self._assert_injects(reply, "system_pulse", extra=("system_pulse",))
 
+    # ── fabricated bug-filed claim → report_bug ──────────────────────────
+    def test_fabricated_bug_filed_injects_report_bug(self):
+        # v1.83.0: the LLM claiming it filed a bug WITHOUT a token is a
+        # fabricated success — inject report_bug so the empty-desc handler
+        # re-prompts instead of lying about a filed issue.
+        for reply in ("I've logged that bug for you, sir.",
+                      "Filed a GitHub issue for that, sir.",
+                      "I've reported the bug.",
+                      "Recorded that bug report, sir."):
+            self._assert_injects(reply, "report_bug", extra=("report_bug",))
+
     # ── conservative: ordinary prose must NOT trip ───────────────────────
     def test_no_false_positive_on_innocuous_prose(self):
         for reply in (
@@ -2831,9 +2842,12 @@ class FabricatedInfoHallucinationTests(SectionFiveBase):
             "There is a newer version available.",       # 'version' but no number
             "It will take about 5 minutes to finish.",
             "The weather looks pleasant today, sir.",
+            "I found a bug in the timer, sir.",          # discussing, not filing
+            "That's a known issue, sir.",                # no filing verb
+            "I've logged you into the system.",          # 'logged' but no bug/issue
         ):
             out = self._detect_with_actions(
-                reply, extra=("weather_briefing",))
+                reply, extra=("weather_briefing", "report_bug"))
             self.assertIsNone(out, f"false positive on: {reply!r}")
 
     # ── never overrides an explicit action token ─────────────────────────
