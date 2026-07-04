@@ -1180,6 +1180,75 @@ class HandleConfirmationResponseTests(SectionSixBase):
         self.assertTrue(consumed)
         self.assertEqual(list(bc._pending_confirmation), [])
 
+    def test_soft_failure_result_not_spoken_as_done(self):
+        # v1.82.0: an action that RETURNS a failure-marker string (a soft failure
+        # per core/failure_markers.py) was still counted as executed and spoken
+        # as "Done." It must now surface the failure instead.
+        bc = self.bc
+        spoken = []
+        acts = dict(bc.ACTIONS)
+        acts["softfail"] = lambda a: "could not reach the device, sir"
+        with mock.patch.object(bc, "ACTIONS", acts), \
+                mock.patch.object(bc, "_speak",
+                                  lambda *a, **k: spoken.append(a[0] if a else "")):
+            bc._pending_confirmation.clear()
+            bc._pending_confirmation.append(("softfail", "x"))
+            bc.handle_confirmation_response("yes")
+        said = " ".join(spoken).lower()
+        self.assertNotIn("done", said)                       # no bogus success
+        self.assertIn("could not reach the device", said)    # real failure voiced
+
+    def test_partial_failure_reports_honestly(self):
+        # One success + one soft failure → still "Done" for the success, plus an
+        # honest note that one action didn't go through.
+        bc = self.bc
+        spoken = []
+        acts = dict(bc.ACTIONS)
+        acts["okact"] = lambda a: "all set, sir"
+        acts["failact"] = lambda a: "failed to do it, sir"
+        with mock.patch.object(bc, "ACTIONS", acts), \
+                mock.patch.object(bc, "_speak",
+                                  lambda *a, **k: spoken.append(a[0] if a else "")):
+            bc._pending_confirmation.clear()
+            bc._pending_confirmation.append(("okact", "a"))
+            bc._pending_confirmation.append(("failact", "b"))
+            bc.handle_confirmation_response("yes")
+        said = " ".join(spoken).lower()
+        self.assertIn("didn't go through", said)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  v1.82.0 uncertain-finding fixes: UI failsafe marker + late-night data loss
+# ════════════════════════════════════════════════════════════════════════════
+class UncertainConfirmedFixTests(SectionSixBase):
+    def test_failsafe_msg_contains_a_failure_marker(self):
+        # [12] _act_click / _act_type catch UIFailsafeError and `return str(e)`;
+        # if _FAILSAFE_MSG carries no FAILURE_MARKERS substring the corner-abort
+        # is spoken as a bogus success. It must be classifiable as a failure.
+        from core.failure_markers import FAILURE_MARKERS
+        msg = self.bc._FAILSAFE_MSG.lower()
+        self.assertTrue(any(m in msg for m in FAILURE_MARKERS),
+                        f"_FAILSAFE_MSG {self.bc._FAILSAFE_MSG!r} matches no "
+                        f"FAILURE_MARKERS — a failed click reads as success")
+
+    def test_late_night_suppression_saves_fresh_not_stale_snapshot(self):
+        # [1] _set_late_night_suppression must persist against a FRESH load_memory,
+        # never the passed long-lived boot snapshot — save_memory is a full-file
+        # overwrite, so writing the stale dict drops every session-learned fact.
+        bc = self.bc
+        stale = {"facts": {}, "late_night_no_comments_until": ""}  # boot snapshot
+        saved = {}
+        with mock.patch.object(bc, "load_memory",
+                               lambda: {"facts": {"widget": "teal"}}), \
+                mock.patch.object(bc, "save_memory",
+                                  lambda m: saved.setdefault("mem", m)):
+            bc._set_late_night_suppression(stale)
+        # Saved the FRESH dict (session fact intact), not the stale snapshot.
+        self.assertEqual(saved["mem"].get("facts"), {"widget": "teal"})
+        self.assertTrue(saved["mem"].get("late_night_no_comments_until"))
+        # In-session snapshot key mirrored for consistency this loop.
+        self.assertTrue(stale.get("late_night_no_comments_until"))
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  handle_autocorrect_disambig_response

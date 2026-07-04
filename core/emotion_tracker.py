@@ -306,11 +306,18 @@ def classify_emotion(
             f"phrase={frust_phrase or swear_phrase!r} clipped={clipped}",
         )
 
+    # Positive/high-energy vocabulary — computed here (not further down) so the
+    # stressed gate can decline pure-exclamation utterances that are actually
+    # excited (2+ '!' with positive wording). Previously the unconditional
+    # `excl_count >= 2` term below classified ALL 2+ '!' as stressed, leaving the
+    # excited excl-branch (below) permanently unreachable.
+    exc_phrase = _has_any_phrase(clean, _EXCITEMENT_PHRASES)
+
     # ── stressed ──────────────────────────────────────────────────
     # Word-choice: profanity or stress vocabulary.
     # Sentence-length: clipped (≤3 words) with at least one exclamation.
     # Prosody: sudden volume spike or notably fast cadence.
-    if stress_phrase or excl_count >= 2 or (clipped and excl_count >= 1):
+    if stress_phrase or (excl_count >= 2 and not exc_phrase) or (clipped and excl_count >= 1):
         return _build(
             "stressed",
             f"phrase={stress_phrase!r} excl={excl_count} clipped={clipped}",
@@ -324,7 +331,7 @@ def classify_emotion(
     # Word-choice: positive high-energy markers WITHOUT swearing.
     # Sentence-length irrelevant — short or long can both be excited.
     # Prosody: loud spike paired with positive vocabulary.
-    exc_phrase = _has_any_phrase(clean, _EXCITEMENT_PHRASES)
+    # (exc_phrase computed above, before the stressed gate.)
     if exc_phrase and not stress_phrase and not clipped:
         return _build("excited", f"phrase={exc_phrase!r}")
     if excl_count >= 2 and not stress_phrase:
