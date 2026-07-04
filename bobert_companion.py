@@ -14413,6 +14413,40 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     "morning_briefing",
     "smart_home_control", "control_device", "control_smart_home",
     "smart_home_router_status",
+    # ── 2026-07-04 read-out completeness sweep ────────────────────────────
+    # Verified silent read-outs (a full-repo audit + live drive confirmed each
+    # RETURNS a finished, user-facing answer, does NOT self-speak, and was in
+    # NEITHER speak set — so the answer was logged and never voiced, the same
+    # "you're not speaking for some actions still" class as the version_info /
+    # weather_briefing fixes above). Status/list one-liners only; multi-item
+    # readers (list_unread, who_is_on_the_wifi…) and side-effect actions are
+    # deliberately excluded here (they belong in a later INFORMATIVE pass).
+    # _speak_verbatim_results still skips failures/empties/already-spoken, so
+    # these are safe. See docs/ACTION_INDEX.md for the full audit.
+    "air_mouse_status", "amazon_tracking_status", "ambient_extract_status", "ambient_listen_status",
+    "anticipation_briefing_status", "anticipation_status", "are_you_ok", "audio_music_status",
+    "banter_status", "bonnaroo_status", "cancel_promise", "chappie_recall_today",
+    "chappie_status", "check_budget", "deco_status", "diagnostic_daemon_status",
+    "diagnostic_history", "diagnostic_status", "do_you_recognize_me", "draft_preview_gate_status",
+    "email_triage_status", "face_track_status", "focus_mode_status", "gaze_calibration_status",
+    "gaze_stats", "gaze_status", "gesture_status", "guard_status",
+    "hardware_sensors", "is_printer_online", "last_diagnostic_run", "list_enrolled_faces",
+    "list_enrolled_voices", "list_notification_rules", "list_pending_drafts", "list_phone_backends",
+    "list_playlists", "list_point_targets", "list_promises", "list_smart_home_devices",
+    "list_tts_backends", "look_around", "mcp_status", "music_aggregate",
+    "music_history", "night_owl_status", "notification_triage_status", "outbound_gate_status",
+    "pattern_aggregate", "pattern_offer_now", "pattern_predictions", "pattern_stats",
+    "phone_bridge_status", "phone_status", "point_status", "predictive_morning_setup",
+    "print_companion_status", "print_status", "rag_status", "read_changelog",
+    "recognize_face", "robot_status", "run_diagnostic", "schedule_status",
+    "screen_watch_status", "search_my_files", "self_diagnostic", "show_changelog",
+    "show_last_diagnostic", "show_llm_stats", "show_recent_facts", "smart_home_catalog",
+    "status_panel", "suit_diagnostics", "system_status", "triage_status",
+    "tv_detect_status", "tv_status", "vip_intercept_status", "voice_id_status",
+    "wake_listener_status", "wayne_boss_mode_status", "weekly_digest", "weekly_digest_status",
+    "what_changed", "what_is_broken", "whats_broken", "whats_new",
+    "who_am_i", "who_is_talking", "whos_at_the_desk", "whos_talking",
+    "workshop_status",
 }
 
 # Actions whose runtime can plausibly exceed MID_TASK_STATUS_DELAY (~8 s).

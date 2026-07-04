@@ -359,8 +359,43 @@ def list_models(arg: str = "") -> str:
     return out
 
 
+def _chat_route() -> str:
+    """The active CHAT route — 'local' | 'cloud' | 'auto' — from
+    MODEL_ROUTING['chat'], the SAME source set_brain writes and _call_llm reads
+    (bobert_companion `model_route("chat")`). 'auto' = Claude when reachable,
+    local on failure. Falls back to the config default when the monolith isn't
+    reachable."""
+    bc = _monolith()
+    if bc is not None:
+        try:
+            routing = getattr(bc, "MODEL_ROUTING", None)
+            if isinstance(routing, dict) and routing.get("chat"):
+                return str(routing["chat"]).lower()
+        except Exception:
+            pass
+    try:
+        from core.config import MODEL_ROUTING as _mr
+        return str(_mr.get("chat", "auto")).lower()
+    except Exception:
+        return "auto"
+
+
 def current_model(arg: str = "") -> str:
+    """Report the brain the NEXT chat turn will actually use. Reads the live
+    chat route (MODEL_ROUTING['chat'], what set_brain sets) so a 'switch to
+    Claude' is reflected — previously this always named the local model even
+    when Claude was handling every turn (2026-07-04 live-repro: after 'switch
+    to the cloud model' it still said 'qwen 14B locally, sir')."""
+    route = _chat_route()
     active = _active_model()
+    if route == "cloud":
+        return "I'm running on Claude in the cloud, sir."
+    if route == "auto":
+        if active:
+            return (f"I'm on auto, sir — Claude when it's reachable, with "
+                    f"{_short_name(active)} locally as the fallback.")
+        return "I'm on auto, sir — Claude when reachable, local as the fallback."
+    # route == "local" (or anything unexpected): report the local model.
     if not active:
         return ("I'm not sure which local model is active, sir — I can't reach "
                 "the model selector right now.")
