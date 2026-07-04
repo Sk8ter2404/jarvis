@@ -162,11 +162,32 @@ class VerbatimResultSpokenTests(MonolithGlobalsTestCase):
         for name in ("system_pulse", "check_system", "status_report"):
             self.assertIn(name, self.bc.SPEAK_RESULT_VERBATIM_ACTIONS)
 
+    def test_readout_family_in_verbatim_set(self):
+        # Read-out actions whose result is a finished, user-facing sentence the
+        # user explicitly asked for. Each was in NEITHER speak set, so its answer
+        # was logged but NEVER voiced (only the "Of course, sir" preamble). This
+        # is the same "you're not speaking for some actions still" class as the
+        # version_info/system_pulse fixes above. Confirmed each returns a
+        # spoken-ready sentence and does not self-speak in its handler.
+        for name in ("weather_briefing", "weather_forecast",
+                     "wake_word_mode_status",
+                     "check_for_updates", "check_updates", "is_there_an_update",
+                     "model_costs", "llm_costs", "model_prices", "compare_models",
+                     "morning_briefing",
+                     "smart_home_control", "control_device", "control_smart_home",
+                     "smart_home_router_status"):
+            self.assertIn(name, self.bc.SPEAK_RESULT_VERBATIM_ACTIONS,
+                          f"{name} returns a finished answer that must be spoken")
+
     def test_verbatim_set_excludes_side_effect_actions(self):
-        # Side-effect actions must NEVER verbatim-speak their result (the inline
-        # reply already confirms them) — guards against a careless future add.
+        # TRUE side-effect actions must NEVER verbatim-speak their result (the
+        # inline reply already confirms them, and the effect is the point) —
+        # guards against a careless future add. NOTE: weather_briefing was
+        # previously (wrongly) listed here and thereby made SILENT — it has no
+        # side effect; its result IS the answer, so it moved to the verbatim set
+        # (see test_readout_family_in_verbatim_set).
         for name in ("play_music", "volume_up", "set_timer", "launch_app",
-                     "weather_briefing"):
+                     "pause_music", "next_song"):
             self.assertNotIn(name, self.bc.SPEAK_RESULT_VERBATIM_ACTIONS)
 
     # ── _speak_verbatim_results() unit behaviour ────────────────────────────

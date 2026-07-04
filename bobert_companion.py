@@ -14333,6 +14333,31 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     # a finished confirmation sentence.
     "audio_autoswitch_status", "audio_autoswitch_on", "audio_autoswitch_off",
     "use_headset", "use_speakers", "switch_to_headset", "switch_to_speakers",
+    # Read-out actions whose result is a finished, user-facing sentence the user
+    # explicitly asked for, but which were in NEITHER speak set — so the answer
+    # was logged and NEVER VOICED (only the "Of course, sir" preamble). Same
+    # 2026-06-05 "you're not speaking for some actions still" class as the
+    # version_info/system_pulse fixes above. Each was confirmed to return one
+    # spoken-ready sentence and to NOT self-speak in its handler:
+    #   * weather_briefing/weather_forecast → "Currently 96 degrees and mainly
+    #     clear, sir." (skills/weather_briefing.py) — "what's the weather" was silent.
+    #   * wake_word_mode_status → "Wake-word mode is off …, sir …".
+    #   * check_for_updates (+aliases) → core.update_checker.update_message(), always
+    #     a sentence; update-awareness was mute on success.
+    #   * model_costs (+aliases) → core.model_catalog.format_catalog() readout.
+    #   * morning_briefing → the built briefing text (the AUTO path _enqueue_speech()s
+    #     the same text; the MANUAL action returned it unspoken AND marked the day
+    #     fired, suppressing the auto-briefing — so it was doubly dropped).
+    #   * smart_home_control (+aliases) → "On, sir — <device>." one-line TTS summary
+    #     (failures carry a FAILURE_MARKER and still route through the failure
+    #     follow-up, so they are unaffected here). smart_home_router_status likewise.
+    "weather_briefing", "weather_forecast",
+    "wake_word_mode_status",
+    "check_for_updates", "check_updates", "is_there_an_update",
+    "model_costs", "llm_costs", "model_prices", "compare_models",
+    "morning_briefing",
+    "smart_home_control", "control_device", "control_smart_home",
+    "smart_home_router_status",
 }
 
 # Actions whose runtime can plausibly exceed MID_TASK_STATUS_DELAY (~8 s).
