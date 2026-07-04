@@ -942,11 +942,50 @@ class OllamaAsyncHelperTests(MonolithGlobalsTestCase):
     def test_install_async_runs_winget_once(self):
         fake_sp = mock.Mock()
         with mock.patch.object(self.bc.threading, "Thread", _ImmediateThread), \
+                mock.patch.object(self.bc, "_OLLAMA_INSTALL_RECHECK_S", 0), \
+                mock.patch.object(self.bc, "_ollama_alive", return_value=False), \
+                mock.patch.object(self.bc, "_ollama_binary_present",
+                                  return_value=False), \
                 mock.patch.dict(sys.modules, {"subprocess": fake_sp}):
             self.bc._ollama_install_async()
             self.bc._ollama_install_async()  # latched — second is a no-op
         fake_sp.run.assert_called_once()
         self.assertTrue(self.bc._OLLAMA_INSTALL_TRIGGERED[0])
+
+    def test_install_async_skips_when_alive_on_reprobe(self):
+        # 2026-07-02 live boot: ONE flapped 2s /api/tags probe fired a full
+        # winget reinstall 17s after the same server had served embeddings.
+        # The install body must re-probe after the debounce and bail.
+        fake_sp = mock.Mock()
+        with mock.patch.object(self.bc.threading, "Thread", _ImmediateThread), \
+                mock.patch.object(self.bc, "_OLLAMA_INSTALL_RECHECK_S", 0), \
+                mock.patch.object(self.bc, "_ollama_alive", return_value=True), \
+                mock.patch.dict(sys.modules, {"subprocess": fake_sp}):
+            self.bc._ollama_install_async()
+        fake_sp.run.assert_not_called()
+
+    def test_install_async_skips_when_binary_present(self):
+        # Installed-but-not-responding (SAC-blocked ggml.dll, service stopped)
+        # must NEVER reinstall over the existing binary — log and leave it.
+        fake_sp = mock.Mock()
+        with mock.patch.object(self.bc.threading, "Thread", _ImmediateThread), \
+                mock.patch.object(self.bc, "_OLLAMA_INSTALL_RECHECK_S", 0), \
+                mock.patch.object(self.bc, "_ollama_alive", return_value=False), \
+                mock.patch.object(self.bc, "_ollama_binary_present",
+                                  return_value=True), \
+                mock.patch.dict(sys.modules, {"subprocess": fake_sp}):
+            self.bc._ollama_install_async()
+        fake_sp.run.assert_not_called()
+
+    def test_ollama_binary_present_via_path(self):
+        with mock.patch("shutil.which", return_value=r"C:\x\ollama.exe"):
+            self.assertTrue(self.bc._ollama_binary_present())
+
+    def test_ollama_binary_absent(self):
+        with mock.patch("shutil.which", return_value=None), \
+                mock.patch.object(self.bc.os.path, "isfile",
+                                  return_value=False):
+            self.assertFalse(self.bc._ollama_binary_present())
 
     def test_pull_async_streams_once(self):
         fake_req = mock.Mock()
