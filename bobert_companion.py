@@ -943,6 +943,13 @@ _MUSIC_BROWSER_MARKERS = (
     "web player", "google chrome", "chromium", "microsoft edge",
     " - edge", " — edge", "mozilla firefox", "brave", "opera",
 )
+# Per-service native handle of the dedicated browser window JARVIS itself opened
+# for a streaming service. Media-mode reuse closes ONLY the window recorded here
+# — a window JARVIS actually opened — never a window merely matching a title
+# substring, which could be the user's OWN main browser window whose active-tab
+# title happens to contain "apple music"/"web player"/etc. Keyed by service_key
+# -> pygetwindow _hWnd (int). See _close_browser_windows_matching / _streaming_auto_play.
+_JARVIS_MEDIA_WINDOW_HWND: dict[str, int] = {}
 # How long (seconds) a recent JARVIS music action suppresses ambient-music
 # standby. 30 min is long enough that an ordinary playlist won't trip it; any
 # music transcribed after this window is treated as 'external' (radio, phone
@@ -10364,14 +10371,18 @@ def _find_edge() -> str | None:
     return _find_browser_exe("msedge.exe", _EDGE_PATHS)
 
 
-def _close_browser_windows_matching(terms) -> int:
-    """Close existing BROWSER windows whose (normalized) title contains any of
-    `terms`. Used so a repeat media request reuses ONE window instead of
-    piling up tabs. Only browser windows are touched (title carries a browser
-    marker), and matching is on the dedicated media-window title (e.g. 'apple
-    music', 'youtube'), so an unrelated browsing window isn't closed. Returns
-    the count closed."""
-    if not terms:
+def _close_browser_windows_matching(terms, only_hwnd=None) -> int:
+    """Close the dedicated media browser window JARVIS opened so a repeat media
+    request reuses ONE window instead of piling up tabs. Returns count closed.
+
+    SAFE mode (only_hwnd set): close ONLY the window whose native handle equals
+    only_hwnd — the exact window JARVIS opened last time — never a window merely
+    matching a title substring. This is what stops JARVIS from destroying the
+    user's own main browser window whose ACTIVE-TAB title happens to contain a
+    `terms` fragment (a Spotify "Web Player" tab, an article titled "…Apple
+    Music…", etc.). LEGACY mode (only_hwnd is None): the old title-substring
+    match, kept for callers with no recorded handle (e.g. the first-ever open)."""
+    if only_hwnd is None and not terms:
         return 0
     try:
         import pygetwindow as gw
@@ -10380,6 +10391,15 @@ def _close_browser_windows_matching(terms) -> int:
         return 0
     closed = 0
     for w in wins:
+        if only_hwnd is not None:
+            if getattr(w, "_hWnd", None) != only_hwnd:
+                continue
+            try:
+                w.close()
+                closed += 1
+            except Exception:
+                pass
+            continue
         t = _strip_bidi_and_nbsp((getattr(w, "title", "") or "")).lower()
         if not t or not any(m in t for m in _MUSIC_BROWSER_MARKERS):
             continue
@@ -10411,7 +10431,7 @@ def _find_browser_window_matching(terms):
     return None
 
 
-def _open_url_in_browser(url: str, close_matching=None) -> str:
+def _open_url_in_browser(url: str, close_matching=None, close_hwnd=None) -> str:
     """Open `url` in a REAL web browser, deliberately bypassing the default
     URL handler.
 
@@ -10442,10 +10462,10 @@ def _open_url_in_browser(url: str, close_matching=None) -> str:
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
-    media_mode = bool(close_matching)
+    media_mode = bool(close_matching) or close_hwnd is not None
     if media_mode:
         try:
-            n = _close_browser_windows_matching(close_matching)
+            n = _close_browser_windows_matching(close_matching, only_hwnd=close_hwnd)
             if n:
                 print(f"  [open-url] closed {n} prior media window(s) — reusing one tab",
                       flush=True)
@@ -10984,7 +11004,7 @@ _STREAMING_SERVICES = {
         "resolve_itunes":   True,
         # Reuse ONE Apple Music browser window: close a prior one before
         # opening the next song instead of piling up tabs.
-        "tab_match":        ["apple music", "web player"],
+        "tab_match":        ["apple music"],
         "verify_play":      True,
         "verify_first":     True,   # check before any play attempt — Enter on a song row may already be playing
         "verify_attempts":  3,
@@ -11702,7 +11722,10 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
     # bare webbrowser.open would launch the app instead of the web player.
     # _open_url_in_browser forces Chrome/Edge so the SPACE / play-button +
     # tab-title pipeline has the actual web player to drive.
-    opened_via = _open_url_in_browser(url, close_matching=cfg.get("tab_match"))
+    _prior_hwnd = _JARVIS_MEDIA_WINDOW_HWND.get(service_key)
+    opened_via = _open_url_in_browser(
+        url, close_matching=cfg.get("tab_match"), close_hwnd=_prior_hwnd
+    )
     print(
         f"  [auto-play] opened {service_label} "
         f"{'track page' if resolved else 'search'} for '{q}' (via {opened_via})",
@@ -11720,6 +11743,12 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
     if _vm_terms:
         _vw = _find_browser_window_matching(_vm_terms)
         if _vw is not None:
+            # Record the handle of the window JARVIS just opened so the NEXT
+            # media request closes exactly this window (see _JARVIS_MEDIA_WINDOW_HWND)
+            # instead of any title-substring match — never the user's own browser.
+            _hw = getattr(_vw, "_hWnd", None)
+            if _hw is not None:
+                _JARVIS_MEDIA_WINDOW_HWND[service_key] = _hw
             try:
                 _vw.activate()
                 time.sleep(0.2)

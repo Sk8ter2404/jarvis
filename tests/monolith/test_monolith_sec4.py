@@ -2939,6 +2939,61 @@ class _FakeWin:
 
 
 @requires_monolith
+class CloseBrowserByHandleTests(MonolithGlobalsTestCase):
+    """v1.85.0 finding #9: _close_browser_windows_matching(only_hwnd=...) closes
+    ONLY the window JARVIS opened (by native handle), never a title-substring
+    match that could be the user's own main browser window."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    class _HWin:
+        def __init__(self, hwnd, title):
+            self._hWnd = hwnd
+            self.title = title
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    def _install(self, wins):
+        gw = mock.Mock(name="pygetwindow")
+        gw.getAllWindows.return_value = list(wins)
+        p = mock.patch.dict(sys.modules, {"pygetwindow": gw})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_only_hwnd_closes_exact_window_not_title_match(self):
+        am = self._HWin(111, "Apple Music - Web Player - Google Chrome")
+        spot = self._HWin(222, "Spotify - Web Player: Music - Google Chrome")
+        self._install([am, spot])
+        # Handle beats title: close hWnd 222 even though the terms say "apple
+        # music"; the hWnd-111 Apple Music window is left alone.
+        n = self.bc._close_browser_windows_matching(["apple music"], only_hwnd=222)
+        self.assertEqual(n, 1)
+        self.assertTrue(spot.closed)
+        self.assertFalse(am.closed)
+
+    def test_only_hwnd_absent_closes_nothing(self):
+        # Stale / never-opened handle → inert (does NOT fall back to title match).
+        am = self._HWin(111, "Apple Music - Google Chrome")
+        self._install([am])
+        n = self.bc._close_browser_windows_matching(["apple music"], only_hwnd=999)
+        self.assertEqual(n, 0)
+        self.assertFalse(am.closed)
+
+    def test_legacy_substring_still_works_without_hwnd(self):
+        am = self._HWin(111, "Apple Music - Google Chrome")
+        other = self._HWin(222, "Some Doc - Google Chrome")
+        self._install([am, other])
+        n = self.bc._close_browser_windows_matching(["apple music"])
+        self.assertEqual(n, 1)
+        self.assertTrue(am.closed)
+        self.assertFalse(other.closed)
+
+
+@requires_monolith
 class AppleMusicTitleParseTests(MonolithGlobalsTestCase):
     """_parse_apple_music_track_title / _clean_browser_title — pure parsing."""
 
