@@ -660,12 +660,29 @@ class ScanEventLogTests(_Base):
         self.assertEqual(hits, [])
         self.assertEqual(max_seen, 0)
 
-    def test_empty_log_returns_baseline(self):
+    def test_empty_log_sees_nothing(self):
+        # max_seen now tracks the true max record id actually SEEN, independent
+        # of the filter bound (last_record_id). An empty log saw nothing → 0.
+        # The caller keeps its baseline (it only advances when new_head > last),
+        # so 0 never downgrades last_seen_record_id.
         fake = FakeWin32EvtLog(batches=[])    # ReadEventLog → []
         hits, max_seen = dd._scan_event_log_for_crashes(fake, 5)
         self.assertEqual(hits, [])
-        self.assertEqual(max_seen, 5)
+        self.assertEqual(max_seen, 0)
         self.assertTrue(fake.closed)
+
+    def test_seed_scan_returns_true_head_not_filter_bound(self):
+        # Regression for the permanent-blindness bug: the seed call passes
+        # last_record_id=10**12 to skip historical crashes. max_seen must come
+        # back as the real newest record id (so it can be persisted as the
+        # baseline), NOT the 10**12 filter bound — otherwise every later poll
+        # filtered out every event and the crash watcher went permanently blind.
+        newest = FakeEvent(record_id=987654, source="Application Error",
+                           strings=["python.exe", r"C:\JARVIS"])
+        fake = FakeWin32EvtLog(batches=[[newest]])
+        hits, max_seen = dd._scan_event_log_for_crashes(fake, last_record_id=10**12)
+        self.assertEqual(max_seen, 987654)
+        self.assertNotEqual(max_seen, 10**12)
 
     def test_read_error_breaks_cleanly(self):
         fake = FakeWin32EvtLog(read_raises=True)

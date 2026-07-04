@@ -321,6 +321,31 @@ class VerbatimResultSpokenTests(MonolithGlobalsTestCase):
 
 
 @requires_monolith
+class FaceTrackWakeReopenTests(MonolithGlobalsTestCase):
+    """2026-07-04: the face-track soft-wake reopened the camera with a raw
+    cv2.VideoCapture(cam["index"], CAP_DSHOW) on the STATIC index, bypassing
+    _open_capture's name-based live-index resolution and the Kinect path. A USB
+    re-enumeration could then silently wake the WRONG camera. The wake reopen
+    must go through the shared _open_capture(cam) opener, like the initial and
+    recovery opens. Source-level guard (the reopen lives in a camera hot-path
+    thread that is impractical to drive in a unit test)."""
+
+    def _face_track_source(self):
+        with open(self.bc.__file__, encoding="utf-8") as f:
+            src = f.read()
+        # The wake-reopen block is bounded by these two unique markers.
+        start = src.index("The old handle is now released")
+        end = src.index("woke via release+reopen")
+        return src[start:end]
+
+    def test_wake_reopen_uses_shared_opener_not_static_index(self):
+        block = self._face_track_source()
+        self.assertIn("_open_capture(cam)", block,
+                      "soft-wake must reopen via the name-resolving _open_capture")
+        self.assertNotIn('cv2.VideoCapture(cam["index"]', block,
+                         "soft-wake must not reopen on the raw STATIC cam index")
+
+
 class RecordSpeechOwnershipOrderingTests(MonolithGlobalsTestCase):
     """Bug 4 (REVIEW_FINDINGS_2 P1-4): the mic-ownership flag must be published
     BEFORE record_speech opens/starts its InputStream, and dropped again if the

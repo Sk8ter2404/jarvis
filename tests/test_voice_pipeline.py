@@ -147,7 +147,26 @@ class _FakeDetector:
         self.started = False
         self.start_result = True
         self.start_raises = False
+        # engine-init tracking (the frame-fed standby path builds the engine
+        # WITHOUT start()/a mic stream, so _on_frame is no longer a no-op).
+        self.oww_inited = False
+        self.porcupine_inited = False
+        self.silero_inited = False
+        self.engine_init_raises = False
         _FakeDetector.instances.append(self)
+
+    def _init_openwakeword(self):
+        if self.engine_init_raises:
+            raise RuntimeError("oww init boom")
+        self.oww_inited = True
+
+    def _init_porcupine(self):
+        if self.engine_init_raises:
+            raise RuntimeError("porcupine init boom")
+        self.porcupine_inited = True
+
+    def _init_silero_vad(self):
+        self.silero_inited = True
 
     def start(self):
         if self.start_raises:
@@ -462,6 +481,29 @@ class MakeWakeDetectorTests(unittest.TestCase):
         self.assertIsNotNone(det)
         self.assertFalse(det.started)               # idle (not started)
         self.assertEqual(det.kwargs["wake_words"], ["jarvis"])
+        # Regression: the standby path feeds frames via _on_frame WITHOUT
+        # starting a mic stream. _on_frame is a silent no-op until the engine
+        # backend is built — which used to happen only in start(). autostart=
+        # False must build the engine (but NOT open a stream) so the neural
+        # standby wake can actually fire.
+        self.assertTrue(det.oww_inited, "autostart=False must build the wake engine")
+        self.assertFalse(det.started, "autostart=False must NOT open a mic stream")
+
+    def test_autostart_false_engine_init_failure_falls_back(self):
+        # If the engine backend cannot be built, fall back to the Whisper
+        # standby path (return None) rather than a dead engine-less detector.
+        class _EngFail(_FakeDetector):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.engine_init_raises = True
+        fake_ww = _fake_wake_word_module(detector_cls=_EngFail)
+        with mock.patch.object(config, "WAKE_WORD_AUTOSTART", True), \
+                mock.patch.object(config, "WAKE_WORD_ENGINE", "openwakeword",
+                                  create=True):
+            _patch_specs(self, present=("openwakeword",))
+            _inject_module(self, "core.wake_word", fake_ww)
+            with mock.patch.object(vp, "_log"):
+                self.assertIsNone(vp.make_wake_detector(autostart=False))
 
     def test_autostart_true_starts_detector(self):
         fake_ww = _fake_wake_word_module()

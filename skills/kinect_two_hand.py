@@ -749,6 +749,14 @@ def _foreground_target_rect() -> "tuple[object, Optional[Rect]]":
 # ══════════════════════════════════════════════════════════════════════════
 #  DUAL-RETICLE state publishing (Part 3 — two circles, blue/purple)
 # ══════════════════════════════════════════════════════════════════════════
+# Module-list (lock-free GIL mutation, per house style): True while our last
+# published frame was an ACTIVE two-hand frame. Lets us clear the two-hand keys
+# exactly ONCE on the active→inactive edge instead of re-writing a hidden frame
+# every ~30 Hz tick — which fought the air-mouse poller (also ~30 Hz on the same
+# AIR_CURSOR_STATE_FILE) and strobed the reticle.
+_two_hand_overlay_was_active = [False]
+
+
 def _publish_two_hand_overlay(decision: "TwoHandDecision") -> None:
     """Publish the TWO hands' screen points + the resize state to the air-cursor
     overlay's state file so the HUD draws two reticle circles (BLUE while engaged,
@@ -770,13 +778,19 @@ def _publish_two_hand_overlay(decision: "TwoHandDecision") -> None:
         path = am.AIR_CURSOR_STATE_FILE
         hands = decision.hands
         if not decision.active or not hands or hands[0] is None or hands[1] is None:
-            # Not in two-hand mode → write nothing here (the air-mouse owns the file
-            # for the single-hand reticle; clearing it would fight that). Just clear
-            # our two-hand keys by publishing a hidden two-hand frame.
-            data = {"visible": False, "two_hand": False, "ts": time.time()}
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f)
+            # Not in two-hand mode → the air-mouse owns the file for the
+            # single-hand reticle. Clear our two-hand keys exactly ONCE on the
+            # active→inactive edge (a hidden two-hand frame); after that write
+            # nothing, so we don't fight the air-mouse's ~30 Hz writes and
+            # strobe the reticle. The air-mouse's next single-hand frame
+            # overwrites this cleared frame within a tick.
+            if _two_hand_overlay_was_active[0]:
+                data = {"visible": False, "two_hand": False, "ts": time.time()}
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+                _two_hand_overlay_was_active[0] = False
             return
+        _two_hand_overlay_was_active[0] = True
         (lx, ly), (rx, ry) = hands
         color = "purple" if decision.resizing else "blue"
         data = {
