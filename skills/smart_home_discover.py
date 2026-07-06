@@ -181,7 +181,44 @@ def _atomic_write_json(path: str, data: Any) -> None:
 
 
 # ── catalog read / write ────────────────────────────────────────────
+class CatalogWipeRefused(Exception):
+    """Raised when a save would erase a populated catalog with an empty one."""
+
+
 def _save_catalog(catalog: dict) -> None:
+    """Persist the catalog — but REFUSE to overwrite a populated catalog with an
+    empty one. A failed Alexa fetch (auth expiry, the 2026-07-04 LAN-DNS outage,
+    any transient) returns 0 devices; _fetch_devices_async swallows the error and
+    hands back an empty {echo:[],smarthome:[],groups:[]} dict, which _build_catalog
+    turns into a 0-device catalog. Without this guard the wizard saved that over a
+    good catalog and _merge_with_existing_catalog dropped every device — so voice
+    control went dead until a *successful* re-run (owner hit this live; the on-disk
+    catalog was wiped to device_count=0). We keep the last-known-good file instead
+    and raise so the caller can report the failure honestly."""
+    try:
+        n = int(catalog.get("device_count", 0) or 0)
+    except (TypeError, ValueError):
+        n = len(catalog.get("devices") or [])
+    if n <= 0:
+        existing = _load_catalog()
+        prev_n = 0
+        if isinstance(existing, dict):
+            try:
+                prev_n = int(existing.get("device_count", 0) or 0)
+            except (TypeError, ValueError):
+                prev_n = len(existing.get("devices") or [])
+        if prev_n > 0:
+            raise CatalogWipeRefused(
+                f"refused to overwrite {prev_n} known device(s) with an empty "
+                f"catalog — the device fetch came back empty (auth/network?)")
+    # Keep a one-deep backup of the prior good catalog before overwriting, so a
+    # bad save is recoverable even if this guard is ever bypassed.
+    try:
+        if n > 0 and os.path.exists(_CATALOG_PATH):
+            import shutil
+            shutil.copy2(_CATALOG_PATH, _CATALOG_PATH + ".bak")
+    except Exception:
+        pass
     _atomic_write_json(_CATALOG_PATH, catalog)
 
 
@@ -1106,7 +1143,15 @@ def smart_home_discover(arg: str = "") -> str:
         catalog = _build_catalog(devices, arp_table)
         if not force_refresh:
             catalog = _merge_with_existing_catalog(catalog)
-        _save_catalog(catalog)
+        try:
+            _save_catalog(catalog)
+        except CatalogWipeRefused as e:
+            print(f"  [sh-discover] {e}")
+            msg = ("The device fetch came back empty, sir — likely an Alexa "
+                   "sign-in or network hiccup. I've kept your existing catalog "
+                   "rather than wiping it. Try again once you're reconnected.")
+            _say(msg)
+            return msg
         queued = _queue_missing_skill_tasks(catalog)
         return _summarise_catalog(catalog, arp_table, queued, speak=True)
     finally:
@@ -1320,7 +1365,13 @@ def _run_wizard_interactive(arg: str = "") -> str:
         catalog = _build_catalog(devices, arp_table)
         if not force_refresh:
             catalog = _merge_with_existing_catalog(catalog)
-        _save_catalog(catalog)
+        try:
+            _save_catalog(catalog)
+        except CatalogWipeRefused as e:
+            print(f"  [sh-discover] {e}")
+            return ("The device fetch came back empty — I kept the existing "
+                    "catalog rather than overwriting it with nothing. Check the "
+                    "Alexa sign-in / network and re-run.")
         queued = _queue_missing_skill_tasks(catalog)
         return _summarise_catalog(catalog, arp_table, queued, speak=False)
     finally:

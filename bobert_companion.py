@@ -11172,6 +11172,16 @@ _MUSIC_IDLE_TITLE_TOKENS = (
 # track. The web player's idle tab title is "Apple Music - Web Player", whose
 # left half is the service name and right half is a generic UI label — both
 # listed here so it can never be mistaken for a now-playing track.
+# Tab-title tails that positively identify a NON-music browser tab. A real Apple
+# Music now-playing title ("<Song> — <Artist>") never ends in a site/app name, so
+# any hyphenated tab title ending in one of these is a search/docs/app page that
+# only reached the parser because it carried a browser marker.
+_NON_MUSIC_TAB_SUFFIXES = (
+    "google search", "youtube", "github", "gmail", "stack overflow",
+    "wikipedia", "outlook", "reddit", "twitter", "x", "facebook",
+    "linkedin", "visual studio code", "notion", "docs", "google docs",
+    "sheets", "slides", "amazon.com", "chatgpt", "claude", "perplexity",
+)
 _MUSIC_TITLE_LHS_REJECT = frozenset({"apple music", "music.apple.com", "itunes"})
 _MUSIC_TITLE_RHS_REJECT = frozenset({"web player", "apple music", "music", "home"})
 
@@ -11261,6 +11271,17 @@ def _parse_apple_music_track_title(raw: str) -> str | None:
     # Reject the "<query> on Apple Music" / "Search results" style strings
     # that still contain a separator but describe a non-playing page.
     if low.endswith("on apple music") or low.startswith("search"):
+        return None
+    # Reject NON-MUSIC browser tabs whose title merely happens to be hyphenated.
+    # _apple_music_title_now_playing only gates on a browser marker being present,
+    # so a Google-search / YouTube / GitHub / docs tab ("<query> - Google Search
+    # - Google Chrome") reaches here and — with a bare " - " separator — used to
+    # parse as a bogus "<query> - Google Search" track (owner hit this live
+    # 2026-07-06: now_playing said "Apple Music: tallest building in the world -
+    # Google Search"). A genuine Apple Music now-playing title is "<Song> —
+    # <Artist>" with an em/en dash, never a site suffix, so a title whose tail is
+    # a known site/app name is not a track.
+    if any(low.endswith(m) or (m + " ") in low for m in _NON_MUSIC_TAB_SUFFIXES):
         return None
     # A real now-playing title is "<Song> — <Artist>". The idle/landing title
     # "Apple Music - Web Player" ALSO contains " - ", so split on the FIRST

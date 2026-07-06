@@ -193,13 +193,16 @@ def _save_last_fired_date(iso_date: str) -> None:
 
 # --- weather (tomorrow) --------------------------------------------------
 
-def _phrase_tomorrow(max_c: int, min_c: int, desc: str) -> str:
+def _phrase_tomorrow(max_f: int, min_f: int, desc: str) -> str:
     """Compose the spec's 'tomorrow looks like a high of X, low of Y, and
-    DESC' phrasing shared by the wttr and Open-Meteo paths."""
+    DESC' phrasing shared by the wttr and Open-Meteo paths. Temperatures are
+    FAHRENHEIT — the project-wide spoken-weather convention (the morning
+    briefing says "96 degrees"); the evening path used to read Celsius, so
+    "a high of 18" was spoken on an 18°C / 64°F day (2026-07-06 audit)."""
     desc = (desc or "").strip().lower()
     if desc:
-        return f"tomorrow looks like a high of {max_c}, low of {min_c}, and {desc}"
-    return f"tomorrow looks like a high of {max_c} and a low of {min_c}"
+        return f"tomorrow looks like a high of {max_f}, low of {min_f}, and {desc}"
+    return f"tomorrow looks like a high of {max_f} and a low of {min_f}"
 
 
 def _tomorrow_weather_from_wttr() -> str:
@@ -220,8 +223,9 @@ def _tomorrow_weather_from_wttr() -> str:
     try:
         # weather[0] = today, weather[1] = tomorrow
         forecast = data["weather"][1]
-        max_c = int(float(forecast.get("maxtempC", "0")))
-        min_c = int(float(forecast.get("mintempC", "0")))
+        # Fahrenheit — the spoken-weather convention (was reading maxtempC).
+        max_f = int(float(forecast.get("maxtempF", "0")))
+        min_f = int(float(forecast.get("mintempF", "0")))
         # Hourly buckets: pick the noon entry for a representative condition
         hourly = forecast.get("hourly") or []
         desc = ""
@@ -235,7 +239,7 @@ def _tomorrow_weather_from_wttr() -> str:
                 # AttributeError guards a string-shaped weatherDesc (e.g.
                 # "Sunny"): [0] then yields 'S', whose .get() would raise.
                 desc = ""
-        return _phrase_tomorrow(max_c, min_c, desc)
+        return _phrase_tomorrow(max_f, min_f, desc)
     except (KeyError, IndexError, ValueError, TypeError, AttributeError):
         return ""
 
@@ -267,6 +271,7 @@ def _tomorrow_weather_from_open_meteo() -> str:
         "latitude":  f"{lat:.4f}",
         "longitude": f"{lon:.4f}",
         "daily":     "temperature_2m_max,temperature_2m_min,weather_code",
+        "temperature_unit": "fahrenheit",   # spoken-weather convention
         "timezone":  "auto",
         "forecast_days": "2",
     })
@@ -280,12 +285,13 @@ def _tomorrow_weather_from_open_meteo() -> str:
         return ""
     try:
         daily = data.get("daily") or {}
-        # index 0 = today, index 1 = tomorrow
-        max_c = int(round(float(daily["temperature_2m_max"][1])))
-        min_c = int(round(float(daily["temperature_2m_min"][1])))
+        # index 0 = today, index 1 = tomorrow (values now Fahrenheit via the
+        # temperature_unit=fahrenheit query param above).
+        max_f = int(round(float(daily["temperature_2m_max"][1])))
+        min_f = int(round(float(daily["temperature_2m_min"][1])))
         code = int(daily.get("weather_code", [None, -1])[1])
         desc = _WMO_DESCRIPTIONS.get(code, "")
-        return _phrase_tomorrow(max_c, min_c, desc)
+        return _phrase_tomorrow(max_f, min_f, desc)
     except (KeyError, IndexError, ValueError, TypeError):
         return ""
 

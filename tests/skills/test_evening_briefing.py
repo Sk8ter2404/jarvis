@@ -185,8 +185,8 @@ class EveningBriefingTests(unittest.TestCase):
     def test_tomorrow_weather_from_wttr_parses(self):
         payload = {
             "weather": [
-                {"maxtempC": "20", "mintempC": "10", "hourly": []},   # today
-                {"maxtempC": "18", "mintempC": "9",
+                {"maxtempC": "20", "mintempC": "10", "maxtempF": "20", "mintempF": "10", "hourly": []},   # today
+                {"maxtempC": "18", "mintempC": "9", "maxtempF": "18", "mintempF": "9",
                  "hourly": [{"time": "1200",
                              "weatherDesc": [{"value": "Sunny"}]}]},  # tomorrow
             ]
@@ -354,8 +354,8 @@ class WeatherParserTests(unittest.TestCase):
     def test_wttr_no_noon_bucket_uses_middle(self):
         # No 11/12/13:00 entry → falls back to the middle hourly bucket.
         payload = {"weather": [
-            {"maxtempC": "20", "mintempC": "10", "hourly": []},
-            {"maxtempC": "16", "mintempC": "7", "hourly": [
+            {"maxtempC": "20", "mintempC": "10", "maxtempF": "20", "mintempF": "10", "hourly": []},
+            {"maxtempC": "16", "mintempC": "7", "maxtempF": "16", "mintempF": "7", "hourly": [
                 {"time": "0300", "weatherDesc": [{"value": "Foggy"}]},
                 {"time": "0900", "weatherDesc": [{"value": "Cloudy"}]},
                 {"time": "1800", "weatherDesc": [{"value": "Clear"}]},
@@ -374,8 +374,8 @@ class WeatherParserTests(unittest.TestCase):
         # AttributeError instead; see test_wttr_string_weatherdesc_yields_no_desc
         # for that companion case, now also covered by the inner handler.)
         payload = {"weather": [
-            {"maxtempC": "20", "mintempC": "10", "hourly": []},
-            {"maxtempC": "14", "mintempC": "6",
+            {"maxtempC": "20", "mintempC": "10", "maxtempF": "20", "mintempF": "10", "hourly": []},
+            {"maxtempC": "14", "mintempC": "6", "maxtempF": "14", "mintempF": "6",
              "hourly": [{"time": "1200", "weatherDesc": []}]},
         ]}
         with mock.patch.object(self.mod.urllib.request, "urlopen",
@@ -391,8 +391,8 @@ class WeatherParserTests(unittest.TestCase):
         # → no-desc phrase, honouring the "'' on failure" contract instead of
         # propagating out of the weather builder.
         payload = {"weather": [
-            {"maxtempC": "20", "mintempC": "10", "hourly": []},
-            {"maxtempC": "14", "mintempC": "6",
+            {"maxtempC": "20", "mintempC": "10", "maxtempF": "20", "mintempF": "10", "hourly": []},
+            {"maxtempC": "14", "mintempC": "6", "maxtempF": "14", "mintempF": "6",
              "hourly": [{"time": "1200", "weatherDesc": "Sunny"}]},
         ]}
         with mock.patch.object(self.mod.urllib.request, "urlopen",
@@ -402,7 +402,7 @@ class WeatherParserTests(unittest.TestCase):
 
     def test_wttr_missing_tomorrow_block_returns_empty(self):
         # Only today's block → weather[1] raises IndexError → "".
-        payload = {"weather": [{"maxtempC": "20", "mintempC": "10", "hourly": []}]}
+        payload = {"weather": [{"maxtempC": "20", "mintempC": "10", "maxtempF": "20", "mintempF": "10", "hourly": []}]}
         with mock.patch.object(self.mod.urllib.request, "urlopen",
                                return_value=_resp(payload)):
             self.assertEqual(self.mod._tomorrow_weather_from_wttr(), "")
@@ -410,8 +410,8 @@ class WeatherParserTests(unittest.TestCase):
     def test_wttr_retry_then_success(self):
         # First urlopen attempt raises, the retry succeeds → phrase returned.
         payload = {"weather": [
-            {"maxtempC": "20", "mintempC": "10", "hourly": []},
-            {"maxtempC": "12", "mintempC": "4", "hourly": []},
+            {"maxtempC": "20", "mintempC": "10", "maxtempF": "20", "mintempF": "10", "hourly": []},
+            {"maxtempC": "12", "mintempC": "4", "maxtempF": "12", "mintempF": "4", "hourly": []},
         ]}
         seq = [OSError("transient 5xx"), _resp(payload)]
 
