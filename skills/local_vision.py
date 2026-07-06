@@ -216,8 +216,20 @@ def _find_click_target_local(description: str,
 
     full_png = b.take_screenshot(monitor=monitor, max_dim=10000)
     if full_png is None:
-        full_img = img1
-        full_w, full_h = w1, h1
+        # Pass-2 capture failed — img1 is the DOWNSCALED Pass-1 image
+        # (max_dim=1568), so its coords are NOT native screen pixels. Use
+        # the TRUE native size of the captured region so the Pass-1 coords
+        # scale to native below; treating the downscaled size as full-res
+        # produced off-by-hundreds clicks on any >1568px display. Mirrors
+        # the identical fix in bobert_companion.find_click_target.
+        full_img = None
+        nat = getattr(b, "_native_capture_size", None)
+        try:
+            nw, nh = nat(monitor) if callable(nat) else (0, 0)
+        except Exception:
+            nw, nh = 0, 0
+        full_w = nw or w1
+        full_h = nh or h1
     else:
         full_img = Image.open(io.BytesIO(full_png))
         full_w, full_h = full_img.size
@@ -229,7 +241,7 @@ def _find_click_target_local(description: str,
 
     refined_x, refined_y = cx_full, cy_full
 
-    if full_w > w1 or full_h > h1:
+    if full_img is not None and (full_w > w1 or full_h > h1):
         CROP = 500
         left   = max(0, cx_full - CROP // 2)
         top    = max(0, cy_full - CROP // 2)
@@ -247,10 +259,38 @@ def _find_click_target_local(description: str,
             refined_x = left + pass2[0]
             refined_y = top  + pass2[1]
 
+    # Translate full-res image coords → absolute LOGICAL screen coords, the
+    # space pyautogui clicks in. refined_x/y are native-pixel offsets from the
+    # captured region's top-left; scale them by (logical_extent/native_extent)
+    # so a >100%-DPI display doesn't overshoot, then add the region's logical
+    # origin (NEGATIVE for monitors left of / above the primary). Mirrors
+    # bobert_companion.find_click_target — the old code added the raw native
+    # offset with no DPI scale, and for monitor=None added NO origin at all,
+    # so on a negative-origin multi-monitor layout clicks could land on the
+    # wrong monitor entirely (the "can't click the bookmark bar" bug).
     MONITORS = getattr(b, "MONITORS", {})
     if monitor and monitor in MONITORS:
-        mx, my, _, _ = MONITORS[monitor]
-        return mx + refined_x, my + refined_y
+        mx, my, lw, lh = MONITORS[monitor]
+        sx = (lw / full_w) if full_w else 1.0
+        sy = (lh / full_h) if full_h else 1.0
+        if abs(sx - 1.0) > 0.01 or abs(sy - 1.0) > 0.01:
+            print(f"  [local-vision] DPI scale: monitor={monitor} "
+                  f"native={full_w}x{full_h} logical={lw}x{lh} "
+                  f"→ click x({sx:.3f},{sy:.3f})", flush=True)
+        return int(mx + refined_x * sx), int(my + refined_y * sy)
+    vsb = getattr(b, "_virtual_screen_bounds", None)
+    if callable(vsb):
+        try:
+            vx, vy, vw, vh = vsb()
+        except Exception:
+            return refined_x, refined_y
+        sx = (vw / full_w) if full_w else 1.0
+        sy = (vh / full_h) if full_h else 1.0
+        if abs(sx - 1.0) > 0.01 or abs(sy - 1.0) > 0.01:
+            print(f"  [local-vision] DPI scale: virtual "
+                  f"native={full_w}x{full_h} logical={vw}x{vh} "
+                  f"→ click x({sx:.3f},{sy:.3f})", flush=True)
+        return int(vx + refined_x * sx), int(vy + refined_y * sy)
     return refined_x, refined_y
 
 

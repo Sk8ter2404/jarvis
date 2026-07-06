@@ -315,10 +315,12 @@ SCHEMA: dict[str, dict] = {
     },
     "CLAUDE_MODEL": {
         "tab": "ai", "label": "Claude model", "type": "enum",
-        "choices": ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-6"],
-        "default": "claude-sonnet-4-6",
+        "choices": ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-sonnet-5",
+                    "claude-opus-4-6", "claude-opus-4-8"],
+        "default": "claude-sonnet-5",
         "help": "Cloud model + est. cost PER CONVERSATION: Haiku ~$0.02, "
-                "Sonnet ~$0.06, Opus ~$0.29. (Local Ollama is $0 — set the "
+                "Sonnet 5 ~$0.06 (default — near-Opus smarts at Sonnet price), "
+                "Opus 4.8 ~$0.10 (the ceiling). (Local Ollama is $0 — set the "
                 "backend above to ollama.)",
     },
     "LOCAL_LLM_MODEL": {

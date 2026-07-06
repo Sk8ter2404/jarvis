@@ -705,7 +705,8 @@ class RunLlmDispatchTests(SectionSevenBase):
         self._p(self.bc, "maybe_glance_response", return_value=None)
         self._p(self.bc, "get_response_with_animation",
                 return_value="[ACTION: click, missing]")
-        # Action keeps failing; loop must give it exactly one retry then break.
+        # Action keeps failing IDENTICALLY; loop must give it exactly one
+        # retry then break (same (action, result) = no progress).
         self._p(self.bc, "parse_and_run_actions", side_effect=[
             ("", [("click", "could not find target", False)]),
             ("", [("click", "could not find target", False)]),
@@ -716,9 +717,29 @@ class RunLlmDispatchTests(SectionSevenBase):
         # Exactly one follow-up round for the failing action (retry), then stop.
         self.assertEqual(gfr.call_count, 1)
 
-    def test_followup_depth_falls_back_to_5_on_import_error(self):
-        # If core.mode_router.followup_loop_depth import fails, depth defaults
-        # to 5 and the loop still terminates (no informative actions here).
+    def test_failed_action_different_result_keeps_chain_alive(self):
+        # A failing action retried with a DIFFERENT argument (→ different
+        # result text) is a new approach, not a stuck loop — the chain must
+        # continue until an identical (action, result) repeat shows up.
+        self._p(self.bc, "maybe_glance_response", return_value=None)
+        self._p(self.bc, "get_response_with_animation",
+                return_value="[ACTION: click, the bookmark]")
+        self._p(self.bc, "parse_and_run_actions", side_effect=[
+            ("", [("click", "could not locate 'the bookmark' on screen", False)]),
+            ("", [("click", "could not locate 'bookmarks toolbar item' on screen", False)]),
+            ("", [("click", "could not locate 'bookmarks toolbar item' on screen", False)]),
+            ("", [("click", "could not locate 'bookmarks toolbar item' on screen", False)]),
+        ])
+        gfr = self._p(self.bc, "get_followup_response", return_value="Trying another way, sir.")
+        self.bc._run_llm_dispatch("click my bookmark")
+        # Round 1: first failure → follow-up (new approach). Round 2: new
+        # result → follow-up again. Round 3: identical repeat → stop.
+        self.assertEqual(gfr.call_count, 2)
+
+    def test_followup_depth_falls_back_on_import_error(self):
+        # If core.mode_router.followup_loop_depth import fails, depth falls
+        # back to the built-in default (8) and the loop still terminates
+        # (no informative actions here).
         self._p(self.bc, "maybe_glance_response", return_value=None)
         self._p(self.bc, "get_response_with_animation", return_value="Done, sir.")
         self._p(self.bc, "parse_and_run_actions", return_value=("Done, sir.", []))

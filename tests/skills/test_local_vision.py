@@ -515,6 +515,57 @@ class FindClickTargetLocalTests(unittest.TestCase):
             coords = self.mod._find_click_target_local("x", monitor="left")
         self.assertEqual(coords, (40, 30))   # no offset applied
 
+    def test_find_monitor_dpi_scale_applied(self):
+        # Display at 200% DPI: native capture 3200x2400, logical monitor
+        # extent 1600x1200 → native offsets must be halved before the
+        # logical origin is added. The old code added raw native offsets
+        # (would return (160, 570) here) — off by 2x on every scaled
+        # display, which is why tiny targets like bookmark-bar items missed.
+        bc = mock.MagicMock()
+        bc.take_screenshot.side_effect = [b"low", b"full"]
+        bc.MONITORS = {"left": (0, 0, 1600, 1200)}
+        with _quiet(), self._pil([(800, 600), (3200, 2400)]), \
+             mock.patch.object(self.mod, "_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_local_query_coords",
+                               side_effect=[(100, 200), (10, 20)]):
+            coords = self.mod._find_click_target_local("btn", monitor="left")
+        # pass1 (100,200) ×4 → (400,800). CROP=500 → crop origin (150,550);
+        # pass2 (10,20) → refined native (160,570). ×0.5 DPI → (80,285).
+        self.assertEqual(coords, (80, 285))
+
+    def test_find_virtual_origin_added_for_no_monitor(self):
+        # monitor=None on a negative-origin virtual desktop: the virtual
+        # origin must be added or the click lands on the wrong monitor.
+        bc = mock.MagicMock()
+        bc.take_screenshot.side_effect = [b"low", b"full"]
+        bc.MONITORS = {}
+        bc._virtual_screen_bounds.return_value = (-2560, -1440, 7680, 2880)
+        with _quiet(), self._pil([(768, 288), (7680, 2880)]), \
+             mock.patch.object(self.mod, "_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_local_query_coords",
+                               side_effect=[(76, 28), None]):
+            coords = self.mod._find_click_target_local("btn", monitor=None)
+        # pass1 (76,28) ×10 → (760,280); pass2 None keeps it; virtual
+        # origin (-2560,-1440) added at 1:1 DPI → (-1800,-1160).
+        self.assertEqual(coords, (-1800, -1160))
+
+    def test_find_full_png_none_uses_native_size(self):
+        # Pass-2 capture failure must NOT treat the downscaled pass-1 size
+        # as native: with a native size available, pass-1 coords scale up
+        # and the logical translate scales them back.
+        bc = mock.MagicMock()
+        bc.take_screenshot.side_effect = [b"low", None]
+        bc.MONITORS = {"left": (100, 0, 1600, 1200)}
+        bc._native_capture_size.return_value = (3200, 2400)
+        with _quiet(), self._pil([(800, 600)]), \
+             mock.patch.object(self.mod, "_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_local_query_coords",
+                               return_value=(100, 200)):
+            coords = self.mod._find_click_target_local("btn", monitor="left")
+        # (100,200) ×4 to native (400,800), ×0.5 to logical + origin (100,0)
+        # → (300, 400).
+        self.assertEqual(coords, (300, 400))
+
     def test_click_happy_path_through_real_find(self):
         # End-to-end click: drive the REAL _find_click_target_local (not mocked)
         # so the action→finder→click chain is covered together.

@@ -18377,15 +18377,19 @@ def _run_llm_dispatch(text: str) -> str:
 
     current_results = action_results
     _chain_seen: set[str] = set()   # loop-break: actions already fired this chain
-    _failed_seen: set[str] = set()  # actions that already returned a failure once
+    # (action, result) pairs that already failed once this chain — see below.
+    _failed_seen: set[tuple[str, str]] = set()
     # Agent mode gets a deeper follow-up loop so autonomous tasks
     # have more room to plan → execute → critique → repeat. Smart
-    # and controlled modes keep the historical depth of 5.
+    # and controlled modes historically capped at 5, which combined with
+    # the failure-repeat break below made JARVIS "give up after 3 steps"
+    # on any task whose first approach missed; 8 gives real multi-step
+    # tasks room while the no-progress breaks still bound the worst case.
     try:
         from core.mode_router import followup_loop_depth as _followup_depth
-        _max_followup = _followup_depth(default=5)
+        _max_followup = _followup_depth(default=8)
     except Exception:
-        _max_followup = 5
+        _max_followup = 8
     for depth in range(_max_followup):
         informative = [
             (n, r) for (n, r, is_info) in current_results
@@ -18393,19 +18397,23 @@ def _run_llm_dispatch(text: str) -> str:
         ]
         if not informative:
             break
-        # Break the re-prompt loop when a FAILING action is repeating.
-        # Re-prompting the LLM on the same already-failed action
-        # (click / focus_window / launch_app, …) just burns 1–3 s LLM
-        # round-trips with no progress — and only _loop_actions were
-        # guarded below, so a stuck real action could re-loop the full
-        # depth (the 2026-05-30 audit's multi-second voice stall).
-        # Give each failing action exactly one retry, then stop; info
-        # actions still chain freely through the logic below.
-        _failing_now = {n for (n, r) in informative if _is_failure(r)}
+        # Break the re-prompt loop when a failing action is repeating WITH
+        # THE SAME RESULT. Re-prompting the LLM on an identically-failing
+        # action just burns 1–3 s LLM round-trips with no progress (the
+        # 2026-05-30 audit's multi-second voice stall). But keying this on
+        # the action NAME alone (the old behaviour) also killed the chain
+        # when the LLM tried a genuinely DIFFERENT approach with the same
+        # action — e.g. click 'bookmarks toolbar item' after click 'the
+        # bookmark' failed — which is why JARVIS gave up after ~3 steps on
+        # simple UI tasks. Key on (action, result): an identical repeat is
+        # no-progress → stop; a different argument/error is new information
+        # → let the chain keep working (still bounded by _max_followup).
+        _failing_now = {(n, r) for (n, r) in informative if _is_failure(r)}
         _failing_repeat = _failing_now & _failed_seen
         if _failing_repeat:
-            print(f"  [follow-up] action(s) failing repeatedly "
-                  f"({', '.join(sorted(_failing_repeat))}) — stopping")
+            print(f"  [follow-up] action(s) failing repeatedly with the same "
+                  f"result ({', '.join(sorted(n for n, _ in _failing_repeat))})"
+                  f" — stopping")
             break
         _failed_seen |= _failing_now
         # Loop detection: actions that should only fire ONCE per chain.

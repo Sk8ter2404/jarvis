@@ -48,7 +48,7 @@ PC_CONTROL_ENABLED = True
 # JARVIS can see and reason about what's on the screen via Claude's
 # vision-capable model.
 SCREEN_VISION_ENABLED = True
-SCREEN_VISION_MODEL   = "claude-sonnet-4-6"
+SCREEN_VISION_MODEL   = "claude-sonnet-5"
 
 
 # ─── UI automation ─────────────────────────────────────────────────────
@@ -87,7 +87,10 @@ PUSHBACK_MAX_CLEAR_PENDING    = 10   # >N pending tasks before clear_tasks asks
 # functional with NO Claude API key / NO credits at all. Claude is a BONUS
 # that sharpens replies when available, not a requirement (see CLAUDE_OPTIONAL).
 AI_BACKEND   = "claude"           # "claude" | "ollama"
-CLAUDE_MODEL = "claude-sonnet-4-6"
+# claude-sonnet-5: near-Opus intelligence at the same list price Sonnet 4.6 had
+# ($3/$15 per MTok) — the best default brain per dollar as of 2026-07. Users who
+# want the ceiling can pick claude-opus-4-8 ($5/$25) in the Settings GUI.
+CLAUDE_MODEL = "claude-sonnet-5"
 OLLAMA_MODEL = "llama3"
 
 # Claude API is an OPTIONAL ENHANCEMENT, never a hard dependency. When True
@@ -214,9 +217,9 @@ DEEP_AUDIT_BUDGET_USD = 5.0
 # each fired brief costs a planner + parallel-worker + merger LLM fan-out.
 # Set False (or it's also gateable via JARVIS_ENABLE_ORCHESTRATOR) to disable.
 ENABLE_ORCHESTRATOR             = True
-ORCHESTRATOR_PLANNER_MODEL      = "claude-sonnet-4-6"
+ORCHESTRATOR_PLANNER_MODEL      = "claude-sonnet-5"
 ORCHESTRATOR_WORKER_MODEL       = "claude-haiku-4-5"
-ORCHESTRATOR_MERGER_MODEL       = "claude-sonnet-4-6"
+ORCHESTRATOR_MERGER_MODEL       = "claude-sonnet-5"
 ORCHESTRATOR_MAX_PARALLEL       = 4
 ORCHESTRATOR_WORKER_TIMEOUT_S   = 30.0
 ORCHESTRATOR_PLANNER_TIMEOUT_S  = 20.0

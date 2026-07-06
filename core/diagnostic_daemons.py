@@ -92,9 +92,9 @@ try:
 except Exception:
     DEEP_AUDIT_DEFAULT_BUDGET_USD = 5.0
 DEEP_AUDIT_MODEL = os.environ.get(
-    "JARVIS_DEEP_AUDIT_MODEL", "claude-sonnet-4-6"
+    "JARVIS_DEEP_AUDIT_MODEL", "claude-sonnet-5"
 )
-# Sonnet 4.6: $3 in / $15 out per million. A typical audit run sends
+# Sonnet 5: $3 in / $15 out per million. A typical audit run sends
 # ~30 KB of code (~10k tokens) and gets back ~2 KB (~500 tokens) of JSON.
 # Estimated cost per run ≈ $0.04. We use this estimate for the budget
 # counter — actual usage may differ; the daily cap is a safety net not

@@ -72,7 +72,7 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(d["VOICE_MODE"], "turn_based")
         self.assertEqual(d["TTS_VOICE"], "en-GB-RyanNeural")
         self.assertEqual(d["AI_BACKEND"], "claude")
-        self.assertEqual(d["CLAUDE_MODEL"], "claude-sonnet-4-6")
+        self.assertEqual(d["CLAUDE_MODEL"], "claude-sonnet-5")
         self.assertIs(d["CLAUDE_OPTIONAL"], True)
         self.assertAlmostEqual(d["VAD_THRESHOLD"], 0.008)
 
