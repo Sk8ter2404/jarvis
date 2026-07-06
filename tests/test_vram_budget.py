@@ -237,6 +237,39 @@ class PredictBudgetTests(_CacheResetBase):
         b = vb.predict_budget(s, total_mb=_CARD_MB)
         self.assertIn("vision", [c["label"] for c in b["components"]])
 
+    def test_vision_shared_with_multimodal_chat_costs_zero(self):
+        # LOCAL_VISION_MODEL == LOCAL_LLM_MODEL (a multimodal brain like
+        # gemma4:26b-a4b): vision re-uses the resident chat model — the
+        # component shows as shared at 0 MB, so the co-load brick can't
+        # happen and the bar doesn't double-count 17 GB.
+        s = {"LOCAL_LLM_MODEL": "gemma4:26b-a4b-it-qat",
+             "LOCAL_VISION_MODEL": "gemma4:26b-a4b-it-qat",
+             "MODEL_ROUTING": {"vision": "local"}}
+        b = vb.predict_budget(s, total_mb=_CARD_MB)
+        comp = [c for c in b["components"] if c["label"].startswith("vision")]
+        self.assertEqual(len(comp), 1)
+        self.assertEqual(comp[0]["mb"], 0)
+        self.assertFalse(b["over"])   # 16 GB chat + 1.5 whisper fits 24 GB
+
+    def test_vision_model_off_excludes_component(self):
+        s = {"LOCAL_LLM_MODEL": "gemma4:26b-a4b-it-qat",
+             "LOCAL_VISION_MODEL": "off",
+             "MODEL_ROUTING": {"vision": "local"}}
+        b = vb.predict_budget(s, total_mb=_CARD_MB)
+        self.assertNotIn("vision",
+                         [c["label"] for c in b["components"]])
+
+    def test_vision_distinct_tag_estimated_not_flat(self):
+        # A DIFFERENT vision tag is a real co-load — estimated from the
+        # calibration table (qwen2.5vl:7b → the flat legacy allowance).
+        s = {"LOCAL_LLM_MODEL": "gemma4:26b-a4b-it-qat",
+             "LOCAL_VISION_MODEL": "qwen2.5vl:7b",
+             "MODEL_ROUTING": {"vision": "local"}}
+        b = vb.predict_budget(s, total_mb=_CARD_MB)
+        comp = [c for c in b["components"] if c["label"] == "vision"]
+        self.assertEqual(len(comp), 1)
+        self.assertEqual(comp[0]["mb"], vb.CALIBRATED_VRAM_MB["qwen2.5vl:7b"])
+
     def test_vision_included_when_fallback_on_even_if_cloud(self):
         # LOCAL_VISION_FALLBACK pulls the VLM in even when the route is cloud
         # (the cloud call can fail over to local → it can load).
@@ -280,11 +313,11 @@ class PredictBudgetTests(_CacheResetBase):
         self.assertEqual(b["components"][0]["mb"], 6 * 1024)
 
     def test_default_chat_model_when_unset(self):
-        # No LOCAL_LLM_MODEL → falls back to config's 32B default.
+        # No LOCAL_LLM_MODEL → falls back to config's gemma4 default (~16 GB).
         b = vb.predict_budget({"MODEL_ROUTING": {"vision": "cloud"},
                                "LOCAL_VISION_FALLBACK": False},
                               total_mb=_CARD_MB)
-        self.assertEqual(b["components"][0]["mb"], 22 * 1024)
+        self.assertEqual(b["components"][0]["mb"], 16 * 1024)
 
     def test_budget_is_card_minus_headroom(self):
         b = vb.predict_budget({"LOCAL_LLM_MODEL": "llama3.1:8b-instruct-q5_K_M",

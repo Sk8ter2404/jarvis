@@ -16,7 +16,7 @@
   "AUDIO_DUCKING_ENABLED": true,
   "AI_BACKEND": "claude",
   "CLAUDE_MODEL": "claude-sonnet-5",
-  "LOCAL_LLM_MODEL": "qwen2.5:14b-instruct-q5_K_M",
+  "LOCAL_LLM_MODEL": "gemma4:26b-a4b-it-qat",
   "CLAUDE_OPTIONAL": true,
   "LOCAL_LLM_FALLBACK": true,
   "LOCAL_VISION_FALLBACK": true,

@@ -7517,13 +7517,21 @@ def _log_gpu_state(model_name: str) -> None:
 _RESOLVED_LOCAL_LLM_MODEL: list[str | None] = [None]
 
 # Fallback chain for the local-LLM selector. First entry is the preferred
-# default (the 32B q4 — smartest on ambiguous voice intents, ~19 GB VRAM on
-# the 3090, fits 100 % on-GPU at num_ctx=12288 — see _local_num_ctx); the
-# rest are lower-VRAM fallbacks so a box that hasn't pulled the 32B cleanly
-# drops to the 14B, then the 8B. JARVIS_LOCAL_LLM_MODEL bypasses this list
-# entirely; the "first installed tag" step (below) catches anything off-list.
+# default: gemma4:26b-a4b-it-qat — a 26B MoE (4B active → fast, ~70 tok/s
+# class on the 3090) at 16 GB QAT, MULTIMODAL (text+image), 256K context.
+# Because it also does vision, pointing LOCAL_VISION_MODEL at the SAME tag
+# means the vision fallback re-uses the resident model instead of co-loading
+# a second ~7 GB VLM — the co-load that used to brick the 24 GB card.
+# Next: the qwen3 30B-A3B MoE (~18 GB q4, needs the 12k ctx window — see
+# _local_num_ctx), then the dense 14B/8B for lower-VRAM boxes. The dense
+# qwen2.5:32b was REMOVED from this chain 2026-07: ~22 GB resident left no
+# headroom for whisper + vision and repeatedly bricked the GPU (the reason
+# boots used to force the 14B via JARVIS_LOCAL_LLM_MODEL). That env var
+# still bypasses this list entirely; the "first installed tag" step (below)
+# catches anything off-list.
 _LOCAL_LLM_PREFERENCE = (
-    "qwen2.5:32b-instruct-q4_K_M",
+    "gemma4:26b-a4b-it-qat",
+    "qwen3:30b-a3b-instruct-2507-q4_K_M",
     "qwen2.5:14b-instruct-q5_K_M",
     "llama3.1:8b-instruct-q5_K_M",
 )
