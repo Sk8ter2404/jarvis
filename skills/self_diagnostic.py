@@ -2054,6 +2054,15 @@ def _save_history(history: list[dict]) -> None:
 _SELF_DIAG_LINE_RE = re.compile(
     r"^\-\s+\[\s+\]\s+\*\*([\d\-]+)\*\*\s+\[self-diag\]\s+\-\s+Fix:\s+(\S+)",
 )
+# whats_broken reads BOTH the [self-diag] sweep tasks AND the [self-heal]
+# pipeline tasks (repeated action failures, VAD stalls, camera errors — written
+# at ~2524/2548/2574). The dedup reader above stays self-diag-only (the
+# self-heal writers dedup themselves), but the user-facing "what's broken"
+# readout must surface every open repair task — before this it silently missed
+# every self-heal item (2026-07-06 audit tail).
+_ANY_REPAIR_LINE_RE = re.compile(
+    r"^\-\s+\[\s+\]\s+\*\*([\d\-]+)\*\*\s+\[(?:self-diag|self-heal)\]\s+\-\s+Fix:\s+(\S+)",
+)
 
 
 def _open_selfdiag_components() -> set[str]:
@@ -2770,14 +2779,15 @@ def diagnostic_status(_: str = "") -> str:
 
 
 def whats_broken(_: str = "") -> str:
-    """Read back any OPEN self-diag fix-it tasks from jarvis_todo.md."""
+    """Read back any OPEN repair tasks from jarvis_todo.md — BOTH the
+    [self-diag] sweep tasks and the [self-heal] pipeline tasks."""
     if not os.path.exists(_TODO_PATH):
         return "I can't find jarvis_todo.md, sir."
     try:
         components: list[tuple[str, str]] = []
         with open(_TODO_PATH, "r", encoding="utf-8") as f:
             for line in f:
-                m = _SELF_DIAG_LINE_RE.match(line)
+                m = _ANY_REPAIR_LINE_RE.match(line)
                 if m:
                     components.append((m.group(1), m.group(2)))
     except Exception as e:

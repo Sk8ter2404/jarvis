@@ -432,6 +432,19 @@ class SelfDiagFileTests(unittest.TestCase):
         self.assertIn("One open repair task", out)
         self.assertEqual(out.lower().count("microphone"), 1)
 
+    def test_whats_broken_includes_self_heal_tasks(self):
+        # 2026-07-06 audit tail: whats_broken only matched [self-diag] and
+        # silently missed the [self-heal] pipeline tasks its own sweep queues.
+        with open(self.todo, "w", encoding="utf-8") as f:
+            f.write("- [ ] **2026-05-30** [self-diag] - Fix: microphone reports x.\n")
+            f.write("- [ ] **2026-05-30** [self-heal] - Fix: VAD has not tripped in 40m.\n")
+            f.write("- [ ] **2026-05-30** [self-heal] - Fix: camera 0 hit a face_tracker error.\n")
+        out = self.actions["whats_broken"]("")
+        self.assertIn("3 open repair tasks", out)
+        self.assertIn("microphone", out)
+        self.assertIn("VAD", out)
+        self.assertIn("camera", out)
+
     # ── _open_selfdiag_components dedupe ──────────────────────────────────
     def test_open_components_parses_todo(self):
         with open(self.todo, "w", encoding="utf-8") as f:
