@@ -14481,6 +14481,19 @@ INFORMATIVE_ACTIONS = {
     # summarise it ("35 devices, including your phone and ...") rather than the
     # verbatim path reading out 35 raw client names.
     "who_is_on_wifi",
+    # Browser-agent answers (skills/browser_agent.py): browser_task and its
+    # aliases return the agent's FINAL ANSWER — often a multi-line summary
+    # ("The cheapest flight is $612 on…") the follow-up LLM should re-phrase for
+    # speech. Without this the happy-path answer (and the no-marker
+    # timeout/cap/offline lines) was logged but never voiced — only the inline
+    # preamble was heard (2026-07-06 audit tail). Hard failures already voice via
+    # the failure follow-up. See skills/browser_agent.py.
+    "browser_task", "browser_do", "browser_run", "browse_for",
+    "find_cheapest", "book_appointment", "fill_form",
+    # Per-brand smart-plug LIST actions (skills/sh_tuya.py): a multi-device
+    # roll-call the follow-up LLM should summarise, same rationale as
+    # who_is_on_wifi. The control surface routes via smart_home_control already.
+    "tuya_list", "tuya_list_devices", "smart_life_list",
 }
 
 # Actions whose RESULT is already a finished, user-facing sentence that should
@@ -14609,6 +14622,21 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     #   does NOT self-speak, so without this the user only heard "Of course, sir"
     #   and had no idea whether the bug was actually filed.
     "report_bug", "report_a_bug", "log_a_bug", "file_a_bug",
+    # ── 2026-07-06 audit TAIL: silent-result read-outs verified missing ──────
+    #   system_check — a run_diagnostic alias (prompts.py routes "run a system
+    #     check" here) whose siblings run_diagnostic/self_diagnostic/are_you_ok
+    #     are already verbatim; the diagnostic sentence was logged, never voiced.
+    "system_check",
+    #   repo_robot: robot_status was voiced but its siblings robot_blocker /
+    #     next_robot_step (both documented voice commands in prompts.py) were in
+    #     neither set — "what's blocking the robot" / "what's next on REPO"
+    #     returned a finished sentence that was dropped.
+    "robot_blocker", "next_robot_step",
+    #   MCP tool bridge (skills/mcp_tools.py): mcp_status was voiced but the
+    #     result-bearing mcp_list_tools / mcp_call / mcp_reload were not — each
+    #     returns one finished sentence and prepends a FAILURE_MARKER on error,
+    #     so success voices here and failures still route to the failure follow-up.
+    "mcp_list_tools", "mcp_call", "mcp_reload",
 }
 
 # Actions whose runtime can plausibly exceed MID_TASK_STATUS_DELAY (~8 s).
