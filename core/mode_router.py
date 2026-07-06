@@ -362,9 +362,12 @@ def followup_loop_depth(default: int = 5) -> int:
     """Recommended follow-up loop depth for the current mode.
 
     Smart/controlled return `default` (current behavior). Agent mode
-    boosts to 3x default, capped at 15, so an autonomous task has more
+    boosts to 3x default, capped at 24, so an autonomous task has more
     room to plan-execute-critique-repeat before the safety cap kicks in.
+    (Cap raised 15 → 24 alongside the monolith's smart-mode default going
+    5 → 8 — the give-up-too-early fix; the no-progress breaks in the
+    follow-up loop, not this cap, are the real runaway guard.)
     """
     if is_in_agent_mode():
-        return min(15, max(default, default * 3))
+        return min(24, max(default, default * 3))
     return default

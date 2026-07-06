@@ -16,7 +16,7 @@ import os
 from typing import List, Optional, Tuple
 
 #: The month these list-price tiers were recorded. They drift; treat as a guide.
-PRICING_AS_OF = "2026-06"
+PRICING_AS_OF = "2026-07"
 
 
 def _conv_tokens() -> Tuple[int, int]:
@@ -68,10 +68,14 @@ CATALOG: List[Model] = [
           "local / free", "smaller local model, also $0"),
     Model("claude-haiku-4-5", "Claude Haiku", "claude", 1.0, 5.0,
           "fastest / cheapest cloud", "snappy + inexpensive; great for everyday"),
-    Model("claude-sonnet-4-6", "Claude Sonnet", "claude", 3.0, 15.0,
-          "balanced (default)", "strong reasoning at a moderate cost"),
-    Model("claude-opus-4-6", "Claude Opus", "claude", 15.0, 75.0,
-          "smartest / priciest", "most capable; ~5x Sonnet's burn rate"),
+    Model("claude-sonnet-4-6", "Claude Sonnet 4.6", "claude", 3.0, 15.0,
+          "balanced (previous gen)", "strong reasoning at a moderate cost"),
+    Model("claude-sonnet-5", "Claude Sonnet 5", "claude", 3.0, 15.0,
+          "balanced (default)", "near-Opus smarts at the same Sonnet price"),
+    Model("claude-opus-4-6", "Claude Opus", "claude", 5.0, 25.0,
+          "smart / pricier", "previous-gen Opus"),
+    Model("claude-opus-4-8", "Claude Opus 4.8", "claude", 5.0, 25.0,
+          "smartest / priciest", "most capable; ~1.7x Sonnet's burn rate"),
 ]
 
 

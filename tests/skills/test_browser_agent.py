@@ -509,7 +509,7 @@ class ModelNameTests(_BrowserAgentTestBase):
     def test_default_when_no_env_no_companion(self):
         with mock.patch.dict(os.environ, {}, clear=True), \
                 _block_import("bobert_companion"):
-            self.assertEqual(self.mod._model_name(), "claude-sonnet-4-6")
+            self.assertEqual(self.mod._model_name(), "claude-sonnet-5")
 
     def test_from_bobert_companion(self):
         fake = types.ModuleType("bobert_companion")
@@ -522,7 +522,7 @@ class ModelNameTests(_BrowserAgentTestBase):
         fake = types.ModuleType("bobert_companion")  # no CLAUDE_MODEL
         with mock.patch.dict(os.environ, {}, clear=True), \
                 _inject_modules(bobert_companion=fake):
-            self.assertEqual(self.mod._model_name(), "claude-sonnet-4-6")
+            self.assertEqual(self.mod._model_name(), "claude-sonnet-5")
 
 
 class MakeBrowserTests(_BrowserAgentTestBase):

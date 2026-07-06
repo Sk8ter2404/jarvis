@@ -288,7 +288,7 @@ def _model_name() -> str:
             return str(m)
     except Exception:
         pass
-    return "claude-sonnet-4-6"
+    return "claude-sonnet-5"
 
 
 # ── bg loop ────────────────────────────────────────────────────────

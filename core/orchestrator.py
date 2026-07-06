@@ -65,9 +65,9 @@ from typing import Any, Callable, Iterable, Sequence
 _PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SUB_AGENTS_DIR = os.path.join(_PROJECT_DIR, "skills", "sub_agents")
 
-DEFAULT_PLANNER_MODEL = "claude-sonnet-4-6"
+DEFAULT_PLANNER_MODEL = "claude-sonnet-5"
 DEFAULT_WORKER_MODEL  = "claude-haiku-4-5"
-DEFAULT_MERGER_MODEL  = "claude-sonnet-4-6"
+DEFAULT_MERGER_MODEL  = "claude-sonnet-5"
 
 DEFAULT_MAX_PARALLEL  = 4
 DEFAULT_WORKER_TIMEOUT_S = 30.0

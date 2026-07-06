@@ -358,23 +358,76 @@ class AmbientListenStateTests(unittest.TestCase):
         self.assertEqual(len(self.mod._buffer), self.mod._HARD_ENTRY_CAP)
 
     # ── _maybe_nudge_wake ────────────────────────────────────────────────
-    def test_maybe_nudge_announces_on_match(self):
-        import re
+    def _make_bc(self, sleep=False, standby=False, tts=False):
         bc = mock.MagicMock()
-        bc._sleep_mode = [False]
+        bc._sleep_mode = [sleep]
+        bc._standby_mode = [standby]
+        bc._tts_playback_active = [tts]
+        return bc
+
+    def test_maybe_nudge_announces_in_standby(self):
+        import re
+        bc = self._make_bc(standby=True)
         self.mod._wake_pattern = re.compile(r"\bjarvis\b", re.I)
         self.mod._last_wake_at = 0.0
+        self.mod._tts_last_active[0] = 0.0
         with mock.patch.object(self.mod, "_get_bobert", return_value=bc):
             self.mod._maybe_nudge_wake("hey jarvis you there")
         bc.proactive_announce.assert_called_once()
         self.assertIn("heard my name", bc.proactive_announce.call_args[0][0])
 
+    def test_maybe_nudge_announces_in_sleep(self):
+        import re
+        bc = self._make_bc(sleep=True)
+        self.mod._wake_pattern = re.compile(r"\bjarvis\b", re.I)
+        self.mod._last_wake_at = 0.0
+        self.mod._tts_last_active[0] = 0.0
+        with mock.patch.object(self.mod, "_get_bobert", return_value=bc):
+            self.mod._maybe_nudge_wake("jarvis wake up")
+        bc.proactive_announce.assert_called_once()
+        self.assertIn("listening", bc.proactive_announce.call_args[0][0].lower())
+
+    def test_maybe_nudge_silent_when_awake(self):
+        # Awake (no sleep, no standby): the main loop already handles the
+        # utterance — the nudge must NOT announce "I heard my name" on top.
+        import re
+        bc = self._make_bc()
+        self.mod._wake_pattern = re.compile(r"\bjarvis\b", re.I)
+        self.mod._last_wake_at = 0.0
+        self.mod._tts_last_active[0] = 0.0
+        with mock.patch.object(self.mod, "_get_bobert", return_value=bc):
+            self.mod._maybe_nudge_wake("jarvis open my bookmarks")
+        bc.proactive_announce.assert_not_called()
+
+    def test_maybe_nudge_silent_during_own_tts(self):
+        # JARVIS's own voice echoing into the mic must not trip the nudge.
+        import re
+        bc = self._make_bc(standby=True, tts=True)
+        self.mod._wake_pattern = re.compile(r"\bjarvis\b", re.I)
+        self.mod._last_wake_at = 0.0
+        self.mod._tts_last_active[0] = 0.0
+        with mock.patch.object(self.mod, "_get_bobert", return_value=bc):
+            self.mod._maybe_nudge_wake("jarvis online at your service")
+        bc.proactive_announce.assert_not_called()
+
+    def test_maybe_nudge_silent_just_after_tts(self):
+        # Echo cooldown: playback ended a moment ago, the batched echo
+        # transcript lands late — still suppressed.
+        import re
+        bc = self._make_bc(standby=True)
+        self.mod._wake_pattern = re.compile(r"\bjarvis\b", re.I)
+        self.mod._last_wake_at = 0.0
+        self.mod._tts_last_active[0] = time.time() - 1.0
+        with mock.patch.object(self.mod, "_get_bobert", return_value=bc):
+            self.mod._maybe_nudge_wake("jarvis standing by")
+        bc.proactive_announce.assert_not_called()
+
     def test_maybe_nudge_debounces(self):
         import re
-        bc = mock.MagicMock()
-        bc._sleep_mode = [False]
+        bc = self._make_bc(standby=True)
         self.mod._wake_pattern = re.compile(r"\bjarvis\b", re.I)
         self.mod._last_wake_at = time.time()   # just fired → debounce
+        self.mod._tts_last_active[0] = 0.0
         with mock.patch.object(self.mod, "_get_bobert", return_value=bc):
             self.mod._maybe_nudge_wake("jarvis again")
         bc.proactive_announce.assert_not_called()
@@ -572,12 +625,15 @@ class MicWorkerLoopTests(_TmpDirMixin, unittest.TestCase):
     def test_worker_fires_wake_nudge(self):
         import re
         bc = _FakeBobert()
+        # Standby: the one state where the tap-fed nudge is the wake path.
         bc._sleep_mode = [False]
+        bc._standby_mode = [True]
         bc.proactive_announce = mock.MagicMock()
         bc.transcribe = mock.MagicMock(return_value=("hey jarvis", _good_conf()))
         bc.is_valid_speech = mock.MagicMock(return_value=(True, "ok"))
         self.mod._wake_pattern = re.compile(r"\bjarvis\b", re.I)
         self.mod._last_wake_at = 0.0
+        self.mod._tts_last_active[0] = 0.0
         block = np.ones(16000 * 3, dtype=np.float32) * 0.2
         self._run_worker(bc, feed_block=block, wait_returns=[True])
         bc.proactive_announce.assert_called_once()

@@ -75,6 +75,8 @@ class CatalogTests(unittest.TestCase):
 
     def test_by_id_exact(self):
         self.assertEqual(mc.by_id("claude-opus-4-6").label, "Claude Opus")
+        self.assertEqual(mc.by_id("claude-sonnet-5").label, "Claude Sonnet 5")
+        self.assertEqual(mc.by_id("claude-opus-4-8").label, "Claude Opus 4.8")
 
     def test_by_id_prefix(self):
         self.assertEqual(mc.by_id("qwen2.5:14b-instruct-q5_K_M").backend, "ollama")

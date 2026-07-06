@@ -100,6 +100,13 @@ _buffer: "deque[dict]" = deque()
 _last_wake_at: float = 0.0
 _last_error:  Optional[str] = None
 _wake_pattern: Optional[re.Pattern] = None
+# Wall-clock of the last tick on which JARVIS's own TTS playback was live.
+# The mic worker samples _tts_playback_active every loop iteration; the wake
+# nudge refuses to fire while playback is live or within _TTS_ECHO_COOLDOWN_S
+# of it ending, so JARVIS saying his own name ("JARVIS online", a quoted
+# reply) can't echo back through the mic and trip "I heard my name".
+_tts_last_active: list[float] = [0.0]
+_TTS_ECHO_COOLDOWN_S = 3.0
 
 # System-audio daemon
 _audio_thread: Optional[threading.Thread] = None
@@ -358,11 +365,37 @@ def _trim_buffer(now: float) -> None:
         _buffer.popleft()
 
 
+def _tts_recently_active(b) -> bool:
+    """True while JARVIS's own TTS playback is live, or within
+    _TTS_ECHO_COOLDOWN_S of the last tick it was seen live. Echo
+    cancellation is best-effort, so a transcript batch of JARVIS's own
+    voice can land shortly AFTER playback ends — the cooldown covers
+    the batching latency."""
+    try:
+        if bool(getattr(b, "_tts_playback_active", [False])[0]):
+            _tts_last_active[0] = time.time()
+            return True
+    except Exception:
+        pass
+    return (time.time() - _tts_last_active[0]) < _TTS_ECHO_COOLDOWN_S
+
+
 def _maybe_nudge_wake(text: str) -> None:
-    """If text contains a wake phrase, fire proactive_announce so the main
-    loop greets the user on its next turn boundary. We debounce on
-    _last_wake_at so a long monologue with multiple 'jarvis' mentions
-    doesn't queue ten greetings."""
+    """If text contains a wake phrase AND JARVIS is asleep / in standby,
+    fire proactive_announce so the main loop greets the user on its next
+    turn boundary. We debounce on _last_wake_at so a long monologue with
+    multiple 'jarvis' mentions doesn't queue ten greetings.
+
+    Two deliberate suppressions (2026-07-06 — the "he keeps saying I heard
+    my name" bug):
+      * AWAKE: when JARVIS is neither asleep nor in standby, the main
+        listen loop hears the SAME audio this daemon tapped and is already
+        handling the command — announcing "I heard my name" on top of that
+        is pure noise, once per utterance that contains 'jarvis' (i.e.
+        nearly every command). Log the match, say nothing.
+      * OWN VOICE: skip while TTS playback is live or just ended, so
+        JARVIS speaking his own name can't echo-trip the nudge.
+    """
     global _last_wake_at
     if not _wake_pattern or not text:
         return
@@ -371,13 +404,23 @@ def _maybe_nudge_wake(text: str) -> None:
     now = time.time()
     if now - _last_wake_at < 4.0:
         return
-    _last_wake_at = now
 
     b = _get_bobert()
     if b is None:
         return
+    if _tts_recently_active(b):
+        print(f"  [ambient-listen] wake match ignored (own TTS echo): {text!r}")
+        return
     sleep_mode_list = getattr(b, "_sleep_mode", None)
     in_sleep = bool(sleep_mode_list and sleep_mode_list[0])
+    standby_list = getattr(b, "_standby_mode", None)
+    in_standby = bool(standby_list and standby_list[0])
+    if not (in_sleep or in_standby):
+        # Awake — the main loop already owns this utterance.
+        print(f"  [ambient-listen] wake match (awake, no nudge): {text!r}")
+        return
+    _last_wake_at = now
+
     announce = getattr(b, "proactive_announce", None)
     msg = ("Yes, listening, sir." if in_sleep
            else "I heard my name, sir — go ahead.")
@@ -750,6 +793,10 @@ def _worker_loop() -> None:
 
     try:
         while not _stop_evt.is_set():
+            # Sample own-voice playback every tick (~0.1 s) so the wake
+            # nudge's echo cooldown window starts when playback ENDS, not
+            # when the (2.5 s-batched) echo transcript finally lands.
+            _tts_recently_active(b)
             # Daemon-pause guard: drop accumulated chunks so we don't
             # process a wall-of-audio surge when the user un-pauses.
             # Stream stays open to keep the audio device warm.

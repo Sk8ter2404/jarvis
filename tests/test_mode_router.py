@@ -33,9 +33,10 @@ class FollowupDepthTests(_ModePreserving):
 
     def test_agent_boosts_and_caps(self):
         mr.set_mode(mr.MODE_AGENT)
-        self.assertEqual(mr.followup_loop_depth(default=5), 15)   # 3x, capped 15
+        self.assertEqual(mr.followup_loop_depth(default=5), 15)   # 3x under cap
+        self.assertEqual(mr.followup_loop_depth(default=8), 24)   # 3x, at cap
         self.assertEqual(mr.followup_loop_depth(default=2), 6)    # 3x under cap
-        self.assertLessEqual(mr.followup_loop_depth(default=100), 15)
+        self.assertLessEqual(mr.followup_loop_depth(default=100), 24)
 
     def test_controlled_returns_default(self):
         mr.set_mode(mr.MODE_CONTROLLED)
