@@ -105,19 +105,22 @@ CLAUDE_OPTIONAL = True
 # ─── Local-LLM baseline (3090 Ollama is the always-on brain) ───────────
 # The LOCAL model is JARVIS's baseline — it serves every turn when Claude
 # is unavailable (no key, capped credits, rate-limit, network glitch, 5xx)
-# and the experience is meant to be good on its own. The workshop rig's
-# 3090 (24 GB VRAM) now runs qwen2.5:32b-instruct q4_K_M (~19 GB) as the
-# baseline brain. That model fits 100 % on the GPU ONLY at num_ctx=12288
-# (~49 tok/s, stable); at 16k it spills ~5 % to CPU and drops to ~28 tok/s,
-# so the call path picks num_ctx per-model (see _local_num_ctx). For local
+# and the experience is meant to be good on its own. The baseline brain is
+# gemma4:26b-a4b-it-qat (2026-07): a 26B MoE with 4B ACTIVE params, so it
+# generates at small-model speed with big-model quality, is MULTIMODAL
+# (text + image — the same resident model can serve local vision, no second
+# VLM co-load), and its 16 GB QAT quant leaves real headroom next to whisper
+# on a 24 GB card. The call path still picks num_ctx per-model (see
+# _local_num_ctx: 30B-class tags get 12k, everything else 16k). For local
 # calls the giant Claude-tuned PC_CONTROL_PROMPT is swapped for a compact
 # action cheatsheet (see _local_cheatsheet). The runtime selector
 # `_get_local_llm_model()` consults JARVIS_LOCAL_LLM_MODEL first, then walks
-# a fallback chain (qwen2.5:32b → qwen2.5:14b → llama3.1:8b → first available
-# tag), so a box without the 32B pulled cleanly drops to the 14B. Vision
-# queries prefer the cloud but fall back to the local qwen2.5vl:7b.
+# a fallback chain (gemma4:26b-a4b → qwen3:30b-a3b → qwen2.5:14b →
+# llama3.1:8b → first available tag). The old dense qwen2.5:32b default
+# (~22 GB resident) was retired — it left no headroom and bricked the GPU
+# whenever vision or whisper co-loaded.
 LOCAL_LLM_FALLBACK = True
-LOCAL_LLM_MODEL    = "qwen2.5:32b-instruct-q4_K_M"
+LOCAL_LLM_MODEL    = "gemma4:26b-a4b-it-qat"
 LOCAL_LLM_BASE_URL = "http://localhost:11434"
 
 # When True, every ambient/background one-shot LLM call (memory extraction,
@@ -231,19 +234,19 @@ ORCHESTRATOR_MERGER_TIMEOUT_S   = 20.0
 # retry against the local VLM served by the same Ollama instance.
 # Local-vision replies are prefixed `[local-vision] `.
 #
-# DEFAULT False (2026-06-06): on a 24 GB card the baseline 30B text model
-# is resident at ~21 GB, so co-loading the ~7 GB qwen2.5vl:7b VLM on a
-# Claude-vision error over-commits VRAM and bricks the GPU — and because
-# the fallback also fires on a transient Claude APIStatusError / network
-# blip (not just an explicit local request), an API cap alone could
-# trigger the brick with no runtime guard. Shipping it OFF is the safe
-# default for everyone; flip True (Settings GUI / user_settings.json)
-# only on a box with the VRAM headroom to hold both models at once.
-# qwen2.5vl:7b uses ~8 GB VRAM with strong OCR + screenshot understanding;
-# set LOCAL_VISION_MODEL to "llava:13b" for slightly better natural-image
-# describe at ~10 GB VRAM, or "off" to disable.
+# 2026-07: the default LOCAL_VISION_MODEL is now the SAME multimodal tag as
+# the chat baseline (gemma4:26b-a4b-it-qat handles text + images). When the
+# vision model equals the resident chat model, a vision fallback re-uses it
+# — no second model is loaded and the historical over-commit can't happen.
+# The flag still ships False (2026-06-06 rationale below) so a box whose
+# user PINNED a separate VLM (e.g. qwen2.5vl:7b next to a ~21 GB dense chat
+# model) can't brick on a transient Claude APIStatusError / network blip:
+# the fallback fires on those too, not just explicit local requests. Flip
+# True (Settings GUI / user_settings.json) when the vision tag matches the
+# chat tag, or when there is VRAM headroom for both models at once.
+# Set LOCAL_VISION_MODEL to "off" to disable local vision entirely.
 LOCAL_VISION_FALLBACK = False
-LOCAL_VISION_MODEL    = "qwen2.5vl:7b"
+LOCAL_VISION_MODEL    = "gemma4:26b-a4b-it-qat"
 
 
 # ─── Local image generation (skills/image_gen.py) ──────────────────────

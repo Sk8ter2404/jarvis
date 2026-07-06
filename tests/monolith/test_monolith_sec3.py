@@ -4932,24 +4932,42 @@ class GetLocalLlmModel32bTests(MonolithGlobalsTestCase):
         else:
             os.environ["JARVIS_LOCAL_LLM_MODEL"] = self._saved_env
 
-    def test_chain_lists_32b_first(self):
+    def test_chain_lists_gemma4_first(self):
+        # The multimodal gemma4 MoE is the preferred baseline (2026-07). The
+        # dense qwen2.5:32b was REMOVED from the chain — ~22 GB resident left
+        # no headroom for whisper/vision and bricked the 24 GB card.
         self.assertEqual(self.bc._LOCAL_LLM_PREFERENCE[0],
-                         "qwen2.5:32b-instruct-q4_K_M")
+                         "gemma4:26b-a4b-it-qat")
+        self.assertNotIn("qwen2.5:32b-instruct-q4_K_M",
+                         self.bc._LOCAL_LLM_PREFERENCE)
 
-    def test_picks_32b_when_tags_list_it(self):
+    def test_picks_gemma4_when_tags_list_it(self):
         fake_req = mock.Mock()
         fake_req.get.return_value = _FakeResp(ok=True, json_data={"models": [
-            {"name": "qwen2.5:32b-instruct-q4_K_M"},
+            {"name": "gemma4:26b-a4b-it-qat"},
+            {"name": "qwen3:30b-a3b-instruct-2507-q4_K_M"},
             {"name": "qwen2.5:14b-instruct-q5_K_M"},
             {"name": "llama3.1:8b-instruct-q5_K_M"},
         ]})
         with mock.patch.object(self.bc, "requests", fake_req), \
                 mock.patch.object(self.bc, "_log_gpu_state"):
             out = self.bc._get_local_llm_model()
-        self.assertEqual(out, "qwen2.5:32b-instruct-q4_K_M")
+        self.assertEqual(out, "gemma4:26b-a4b-it-qat")
+
+    def test_picks_qwen3_moe_when_no_gemma4(self):
+        # gemma4 not installed → next chain entry is the qwen3 30B MoE.
+        fake_req = mock.Mock()
+        fake_req.get.return_value = _FakeResp(ok=True, json_data={"models": [
+            {"name": "qwen3:30b-a3b-instruct-2507-q4_K_M"},
+            {"name": "qwen2.5:14b-instruct-q5_K_M"},
+        ]})
+        with mock.patch.object(self.bc, "requests", fake_req), \
+                mock.patch.object(self.bc, "_log_gpu_state"):
+            out = self.bc._get_local_llm_model()
+        self.assertEqual(out, "qwen3:30b-a3b-instruct-2507-q4_K_M")
 
     def test_falls_to_14b_when_only_14b_present(self):
-        # 32B not installed → cleanly drops to the next chain entry (14B).
+        # Neither MoE installed → cleanly drops to the next chain entry (14B).
         fake_req = mock.Mock()
         fake_req.get.return_value = _FakeResp(ok=True, json_data={"models": [
             {"name": "qwen2.5:14b-instruct-q5_K_M"},
@@ -4960,11 +4978,11 @@ class GetLocalLlmModel32bTests(MonolithGlobalsTestCase):
             out = self.bc._get_local_llm_model()
         self.assertEqual(out, "qwen2.5:14b-instruct-q5_K_M")
 
-    def test_env_override_beats_installed_32b(self):
+    def test_env_override_beats_installed_gemma4(self):
         os.environ["JARVIS_LOCAL_LLM_MODEL"] = "  my:custom  "
         fake_req = mock.Mock()
         fake_req.get.return_value = _FakeResp(ok=True, json_data={"models": [
-            {"name": "qwen2.5:32b-instruct-q4_K_M"}]})
+            {"name": "gemma4:26b-a4b-it-qat"}]})
         with mock.patch.object(self.bc, "requests", fake_req), \
                 mock.patch.object(self.bc, "_log_gpu_state"):
             out = self.bc._get_local_llm_model()
