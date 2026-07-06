@@ -3028,6 +3028,28 @@ class AppleMusicTitleParseTests(MonolithGlobalsTestCase):
         self.assertIsNone(
             self.bc._parse_apple_music_track_title("Search - Apple Music"))
 
+    def test_non_music_browser_tabs_rejected(self):
+        # Regression (2026-07-06, live): now_playing said "Apple Music: tallest
+        # building in the world - Google Search" — a Google-search Chrome tab
+        # reached the parser (browser marker present) and its bare " - " title
+        # parsed as a bogus track. Any hyphenated tab ending in a known site/app
+        # name is not an Apple Music now-playing title.
+        for bogus in (
+            "tallest building in the world - Google Search",
+            "how to center a div - Stack Overflow",
+            "anthropics/anthropic-sdk-python - GitHub",
+            "Inbox (5) - Gmail",
+            "some video - YouTube",
+            "bobert_companion.py - Visual Studio Code",
+        ):
+            self.assertIsNone(
+                self.bc._parse_apple_music_track_title(bogus),
+                msg=f"{bogus!r} should not parse as a track")
+        # A genuine em-dash track still parses even with a browser suffix.
+        self.assertEqual(
+            self.bc._parse_apple_music_track_title("Billie Jean — Michael Jackson - Google Chrome"),
+            "Billie Jean — Michael Jackson")
+
     def test_web_player_landing_title_rejected(self):
         # Regression (2026-06-04, live screenshot): the web-player idle tab
         # title "Apple Music - Web Player" contains " - " and so was wrongly

@@ -139,8 +139,12 @@ def play_playlist(arg: str) -> str:
         return "Which playlist would you like, sir?"
     app, err = itunes_bridge.get_client(force=True)
     if app is None:
-        # iTunes COM unreachable → try streaming the playlist on Apple Music.
-        fb = _apple_music_fallback(name_q + (" shuffle" if shuffle else ""))
+        # iTunes COM unreachable → stream the playlist on Apple Music. Include
+        # the word "playlist" so the browser search targets a PLAYLIST, not a
+        # song of the same name — without it, "play my workout playlist" made
+        # Apple Music search for a track called "workout" and play a random
+        # song (2026-07-06 audit).
+        fb = _apple_music_fallback(name_q + " playlist" + (" shuffle" if shuffle else ""))
         if fb:
             return fb
         return err or "iTunes isn't reachable right now, sir."
@@ -151,8 +155,9 @@ def play_playlist(arg: str) -> str:
     if pl is None:
         # Not one of the user's OWN playlists → fall through to Apple Music
         # streaming (e.g. a curated playlist they don't own). The apple_music
-        # action speaks its own sensible line, so return it as-is.
-        fb = _apple_music_fallback(name_q + (" shuffle" if shuffle else ""))
+        # action speaks its own sensible line, so return it as-is. Include
+        # "playlist" in the query so the search targets a playlist, not a song.
+        fb = _apple_music_fallback(name_q + " playlist" + (" shuffle" if shuffle else ""))
         if fb:
             return fb
         return f"I couldn't find a playlist called '{name_q}', sir."
@@ -204,12 +209,15 @@ def shuffle_library(arg: str = "") -> str:
     come back (force=True still tries), the live shuffle below runs instead."""
     app, err = itunes_bridge.get_client(force=True)
     if app is None:
-        fb = _apple_music_fallback("shuffle")
-        if fb:
-            return fb
+        # No local library to shuffle. Do NOT hand the bare word "shuffle" to
+        # the browser apple_music action — it searches music.apple.com and would
+        # play a random song literally titled "Shuffle" (2026-07-06 audit).
+        # There is no reliable browser path to shuffle the WHOLE library without
+        # a target, so give the honest guidance line instead.
         return (
             "Your music lives in the new Apple Music app now, sir — open it "
-            "and I'll shuffle from there."
+            "and I'll shuffle from there. Or name a playlist and I'll "
+            "shuffle-play that."
         )
     try:
         target = None

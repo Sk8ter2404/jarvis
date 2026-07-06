@@ -187,6 +187,16 @@ class PlayPlaylistTests(unittest.TestCase):
             out = M.play_playlist("road trip")
         self.assertEqual(out, "Playing it on Apple Music, sir.")
 
+    def test_fallback_query_includes_playlist_keyword(self):
+        # The Apple Music fallback must search for a PLAYLIST, not a song of the
+        # same name (2026-07-06 audit: the keyword was dropped, so a playlist
+        # request played a random track).
+        with _patch_client(None, "iTunes isn't running, sir."), \
+                mock.patch.object(M, "_apple_music_fallback",
+                                  return_value="ok, sir.") as fb:
+            M.play_playlist("workout")
+        self.assertIn("playlist", fb.call_args[0][0].lower())
+
     def test_itunes_unreachable_and_no_fallback_returns_bridge_error(self):
         # If even the browser fallback is unreachable (None), the bridge error
         # is the last resort.
@@ -363,18 +373,15 @@ class ShuffleLibraryTests(unittest.TestCase):
             M.shuffle_library()
         self.assertTrue(lib.played)
 
-    def test_unreachable_falls_back_to_apple_music(self):
-        # COM dead → hand the shuffle to the browser apple_music action.
+    def test_unreachable_gives_honest_line_not_random_song(self):
+        # COM dead → must NOT hand the bare word "shuffle" to the browser
+        # apple_music action (that plays a random song titled "Shuffle",
+        # 2026-07-06 audit). We give the honest guidance line and never invoke
+        # the search fallback with a meaningless query.
         with _patch_client(None, "nope, sir."), \
-                mock.patch.object(M, "_apple_music_fallback",
-                                  return_value="Shuffling on Apple Music, sir."):
+                mock.patch.object(M, "_apple_music_fallback") as fb:
             out = M.shuffle_library()
-        self.assertEqual(out, "Shuffling on Apple Music, sir.")
-
-    def test_unreachable_no_fallback_honest_message(self):
-        with _patch_client(None, "nope, sir."), \
-                mock.patch.object(M, "_apple_music_fallback", return_value=None):
-            out = M.shuffle_library()
+        fb.assert_not_called()          # no bogus "shuffle" search
         self.assertIn("Apple Music app", out)
         self.assertNotIn("nope", out)
 

@@ -162,6 +162,39 @@ class DiscoverArpAndCookieTests(unittest.TestCase):
         self.assertTrue(self.mod._cookie_is_stale({}))
 
 
+class DiscoverCatalogWipeGuardTests(unittest.TestCase):
+    """A failed/empty device fetch must NOT overwrite a populated catalog —
+    the 2026-07-06 audit found the live catalog wiped to device_count=0 after
+    the LAN-DNS outage returned an empty Alexa fetch."""
+
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("smart_home_discover")
+
+    def test_empty_save_over_populated_is_refused(self):
+        existing = {"device_count": 5, "devices": [{"alexa_entity_id": f"e{i}"} for i in range(5)]}
+        with mock.patch.object(self.mod, "_load_catalog", return_value=existing), \
+             mock.patch.object(self.mod, "_atomic_write_json") as write:
+            with self.assertRaises(self.mod.CatalogWipeRefused):
+                self.mod._save_catalog({"device_count": 0, "devices": []})
+            write.assert_not_called()   # the good file was NOT overwritten
+
+    def test_empty_save_allowed_on_first_run(self):
+        # No prior catalog → saving an empty one is fine (nothing to lose).
+        with mock.patch.object(self.mod, "_load_catalog", return_value=None), \
+             mock.patch.object(self.mod, "_atomic_write_json") as write:
+            self.mod._save_catalog({"device_count": 0, "devices": []})
+            write.assert_called_once()
+
+    def test_populated_save_always_allowed(self):
+        existing = {"device_count": 5, "devices": [{"alexa_entity_id": "e0"}]}
+        fresh = {"device_count": 3, "devices": [{"alexa_entity_id": "e0"}]}
+        with mock.patch.object(self.mod, "_load_catalog", return_value=existing), \
+             mock.patch.object(self.mod, "_atomic_write_json") as write, \
+             mock.patch("os.path.exists", return_value=False):
+            self.mod._save_catalog(fresh)
+            write.assert_called_once()
+
+
 class DiscoverCatalogActionTests(unittest.TestCase):
     def setUp(self):
         self.mod, self.actions = load_skill_isolated("smart_home_discover")
