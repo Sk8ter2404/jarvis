@@ -3225,6 +3225,36 @@ class StreamingTtsTests(_MonolithTestBase):
         self.assertEqual(buf.spoken_prefix,
                          "Good morning, sir. All systems nominal. ")
 
+    def test_flush_buffer_blocks_hallucinated_claims(self):
+        # A first sentence carrying a fabricated factual claim (version, clock
+        # time) must NEVER be early-spoken — the preemptive interceptor in
+        # parse_and_run_actions can only correct it AFTER the stream, so the
+        # buffer latches its permanent stop and the normal path handles it.
+        for bad in ("All nominal, running version 4.2.3 as of last check. ",
+                    "It's 1:47 AM right now, sir. "):
+            spoken = []
+            buf = self._make_buffer(spoken)
+            with mock.patch.object(self.bc, "threading",
+                                   self._inline_threading()):
+                buf.feed(bad)
+                buf.feed("And a perfectly safe follow-up sentence. ")
+            self.assertEqual(spoken, [], bad)      # nothing early-spoken
+            self.assertEqual(buf.spoken_prefix, "")
+            self.assertTrue(buf._stopped)          # latched permanently
+
+    def test_flush_buffer_pattern_scan_fails_closed(self):
+        # If the pattern table is broken (unlikely), the buffer must stop
+        # flushing rather than risk voicing an unscreened sentence.
+        spoken = []
+        buf = self._make_buffer(spoken)
+        with mock.patch.object(self.bc, "_PREEMPTIVE_HALLUCINATION_PATTERNS",
+                               [("not", "a", "tuple-of-regex")]), \
+             mock.patch.object(self.bc, "threading",
+                               self._inline_threading()):
+            buf.feed("A perfectly ordinary sentence, sir. ")
+        self.assertEqual(spoken, [])
+        self.assertTrue(buf._stopped)
+
     def test_flush_buffer_short_fragment_waits_for_next_boundary(self):
         spoken = []
         buf = self._make_buffer(spoken)
