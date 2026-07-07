@@ -1376,7 +1376,22 @@ def _load_chappie_standing_rules() -> str:
     )
 
 
+# Character offset of the stable-core / memory-section boundary inside the
+# most recent build_system_prompt() output. Single-element-list idiom so
+# closures/threads see updates without `global`. _cached_system_param uses it
+# to place a second cache breakpoint at the boundary; 0 means "no build yet"
+# and disables the split.
+_system_prompt_stable_len = [0]
+
+
 def build_system_prompt(memory: dict) -> str:
+    # STABLE CORE first, everything memory-derived second. The prompt is one
+    # concatenated string as always, but _system_prompt_stable_len records the
+    # boundary so _cached_system_param can give each half its OWN Anthropic
+    # cache breakpoint: fact-learning rebuilds (the ambient-learning timer
+    # calls build_system_prompt(load_memory()) after every learn) then only
+    # re-cache the small memory block instead of re-writing the whole ~43k
+    # cached prefix. Nothing memory-derived may sit above the boundary.
     prompt = BASE_SYSTEM_PROMPT
 
     # Standing rules from data/chappie_standing_rules.json. Injected before
@@ -1387,14 +1402,6 @@ def build_system_prompt(memory: dict) -> str:
     if rules_block:
         prompt += "\n\n" + rules_block
 
-    # Inject the canonical JARVIS phrasebook with per-intent rotation hints.
-    # The phrases themselves live in mcu_phrases.py so the prompt stays the
-    # single source of voice instruction while the lines stay editable in a
-    # dedicated module. last_used_by_intent may be absent on legacy memory
-    # files — load_memory() backfills via _empty_memory(), so .get() suffices.
-    last_used = memory.get("last_used_phrase_by_intent") or {}
-    prompt += "\n\n" + _mcu_phrases.render_phrasebook_block(last_used)
-
     if PC_CONTROL_ENABLED:
         prompt += PC_CONTROL_PROMPT
         # Routing examples contributed by loaded skills (gitignored personal
@@ -1402,6 +1409,23 @@ def build_system_prompt(memory: dict) -> str:
         # Empty until load_skills() has run — main() rebuilds the prompt once
         # after skill loading so these are always present in the live prompt.
         prompt += _skill_prompt_examples_block()
+
+    # ── stable/memory boundary ──────────────────────────────────────────────
+    # Everything above changes only on restart / rules edit / skill load;
+    # everything below is derived from `memory` and churns on ambient learning.
+    _system_prompt_stable_len[0] = len(prompt)
+
+    # Inject the canonical JARVIS phrasebook with per-intent rotation hints.
+    # The phrases themselves live in mcu_phrases.py so the prompt stays the
+    # single source of voice instruction while the lines stay editable in a
+    # dedicated module. last_used_by_intent may be absent on legacy memory
+    # files — load_memory() backfills via _empty_memory(), so .get() suffices.
+    # Lives in the MEMORY half because the rotation hints come from memory's
+    # last_used_phrase_by_intent — in the stable half every phrase rotation
+    # would invalidate the whole cached core. (The standing-rules comment only
+    # requires rules-before-phrasebook, which still holds.)
+    last_used = memory.get("last_used_phrase_by_intent") or {}
+    prompt += "\n\n" + _mcu_phrases.render_phrasebook_block(last_used)
 
     days_known = 0
     try:
@@ -8568,13 +8592,31 @@ def _cached_system_param(full_prompt: str):
     Without caching, Anthropic re-processes the whole thing at full input price
     and latency on EVERY turn. Splitting into
 
-        [ {stable prefix, cache_control: ephemeral}, {volatile tail} ]
+        [ {stable core,     cache_control: ephemeral},
+          {memory section,  cache_control: ephemeral},
+          {volatile tail} ]
 
     makes the prefix a cache hit on every turn after the first (~90% cheaper
     for those tokens, and a materially faster time-to-first-token). The cache
     is a strict prefix match, which is exactly why the volatile addenda MUST
     live in a separate trailing block — inside a single block they would
     invalidate the whole prefix whenever the tone/mode changed.
+
+    TWO breakpoints (not one) because `_system_prompt` itself has two churn
+    rates: the ambient-learning timer rebuilds it via
+    build_system_prompt(load_memory()) after every learn, and with a single
+    breakpoint a few hundred changed memory-fact tokens forced a full ~43k
+    cache RE-WRITE. build_system_prompt records the stable-core/memory-section
+    boundary in _system_prompt_stable_len; breaking there means fact-learning
+    rebuilds re-cache only the small memory block while the big core (base
+    prompt + standing rules + PC control + skill examples) stays a cache hit.
+    Anthropic allows up to 4 breakpoints, so two here is safe.
+
+    Defensive fallbacks: an unsane boundary (0, out of range, or a stable core
+    below the worth-caching floor) degrades to the previous single-breakpoint
+    split on the whole `_system_prompt`. Empty blocks are never emitted —
+    Anthropic rejects empty text blocks — so an empty memory section yields two
+    blocks and an empty tail is omitted, mirroring the old behavior.
 
     Returns the original string unchanged when it doesn't start with
     `_system_prompt` (defensive: a caller built something unusual) or when the
@@ -8586,8 +8628,23 @@ def _cached_system_param(full_prompt: str):
     base = _system_prompt
     if (isinstance(full_prompt, str) and isinstance(base, str)
             and len(base) >= 4000 and full_prompt.startswith(base)):
-        blocks = [{"type": "text", "text": base,
-                   "cache_control": {"type": "ephemeral"}}]
+        stable_len = _system_prompt_stable_len[0]
+        if isinstance(stable_len, int) and 4000 <= stable_len <= len(base):
+            # Two-breakpoint split: stable core and memory section each get
+            # their own cache entry so memory churn can't evict the core.
+            blocks = [{"type": "text", "text": base[:stable_len],
+                       "cache_control": {"type": "ephemeral"}}]
+            mem_section = base[stable_len:]
+            if mem_section:
+                blocks.append({"type": "text", "text": mem_section,
+                               "cache_control": {"type": "ephemeral"}})
+        else:
+            # Boundary unsane/stale (never recorded, or _system_prompt was
+            # reassigned around build_system_prompt — shouldn't happen, but a
+            # wrong slice would corrupt the prompt): fall back to the proven
+            # single-breakpoint split over the whole stable prompt.
+            blocks = [{"type": "text", "text": base,
+                       "cache_control": {"type": "ephemeral"}}]
         tail = full_prompt[len(base):]
         if tail:
             blocks.append({"type": "text", "text": tail})
