@@ -1038,6 +1038,39 @@ class ReflectWithEmbedderTests(_LtmBase):
         self.assertIn("new", ltm._facts)
         self.assertNotIn("old", ltm._facts)
 
+    def test_near_dup_no_cascade_over_delete(self):
+        # 2026-07-07 bug-hunt (LOW-MED): X is a near-dup of BOTH Y and Z, but Y
+        # and Z are NOT near-dups of each other. X is deleted in pair (X,Y);
+        # the OLD code kept comparing the now-doomed X against Z and deleted Z
+        # too (Z was only similar to the condemned X), AND counted 2 removals.
+        # After the fix, once X is condemned the inner loop breaks, so Z survives
+        # and the count reflects the single real deletion.
+        # ids order is by updated_at DESC → [X, Y, Z]; deletion picks the older
+        # created_at, so created_at Z(1) < X(2) < Y(3) makes X lose to Y and,
+        # under the old cascade, Z would lose to X.
+        ltm._facts = {
+            "X": {"id": "X", "text": "fact x", "source": "", "tags": [],
+                  "created_at": 2.0, "updated_at": 9.0},
+            "Y": {"id": "Y", "text": "fact y", "source": "", "tags": [],
+                  "created_at": 3.0, "updated_at": 8.0},
+            "Z": {"id": "Z", "text": "fact z", "source": "", "tags": [],
+                  "created_at": 1.0, "updated_at": 7.0},
+        }
+        # vecs aligned to the updated_at-desc order [X, Y, Z] = [[0],[1],[2]];
+        # sim is high whenever X (vector 0.0) is one of the pair, else 0.
+        with mock.patch.object(ltm, "_embed",
+                               return_value=[[0.0], [1.0], [2.0]]), \
+             mock.patch.object(ltm, "_cosine_sim",
+                               side_effect=lambda a, b: 1.0 if 0.0 in (a[0], b[0]) else 0.0), \
+             mock.patch.object(ltm, "_save_facts_locked"), \
+             mock.patch.object(ltm, "_rebuild_bm25_locked"), \
+             mock.patch.object(ltm, "_chroma_delete"):
+            summary = ltm.reflect_and_consolidate()
+        self.assertNotIn("X", ltm._facts)          # the genuine near-dup, removed
+        self.assertIn("Y", ltm._facts)             # kept
+        self.assertIn("Z", ltm._facts)             # NOT cascade-deleted
+        self.assertEqual(summary["duplicates_removed"], 1)  # not 2
+
     def test_pairwise_cap_applied(self):
         with mock.patch.object(ltm, "REFLECTOR_MAX_PAIRWISE", 3):
             self._seed([(f"id{i}", f"fact number {i}", float(i))

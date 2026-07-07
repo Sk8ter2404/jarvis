@@ -554,6 +554,25 @@ class BambuStateTests(_MemoryTestBase):
         memory._tick()
         announcer.assert_called_once()
 
+    def test_bed_cool_persists_finish_seen_latch(self):
+        # 2026-07-07 bug-hunt (LOW): arming _finish_seen (FINISH observed but bed
+        # still hot → the promise does NOT fire) must be WRITTEN TO DISK, else a
+        # restart in the FINISH→cool window reloads a promise with no latch and
+        # waits forever for a second FINISH that never comes (print's done).
+        self._install_bambu({"gcode_state": "FINISH",
+                             "last_update": time.time() + 5,
+                             "bed_temper": 60.0})    # hot → arms but won't fire
+        memory.make_promise("bed cooled", "bambu_bed_cool",
+                            params={"threshold_c": 40.0})
+        announcer = mock.MagicMock()
+        memory._announce_fn[0] = announcer
+        memory._tick()                    # arms _finish_seen; bed hot → no fire
+        announcer.assert_not_called()
+        # The latch must be on DISK (survives the next tick's _load_locked reload).
+        data = self._read_file()
+        self.assertTrue(data[0].get("params", {}).get("_finish_seen"),
+                        "_finish_seen must be persisted after the arming tick")
+
     def test_bed_cool_finish_seen_but_bed_none(self):
         self._install_bambu({"gcode_state": "FINISH",
                              "last_update": time.time() + 5,

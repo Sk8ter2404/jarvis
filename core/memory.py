@@ -122,6 +122,18 @@ _lock = threading.RLock()
 #   }
 _promises: list[dict] = []
 _next_id: list[int] = [1]
+# Set by a condition predicate that MUTATED a promise's params (e.g.
+# _cond_bambu_bed_cool latching "_finish_seen") without firing — so _tick knows
+# to persist the change even though nothing fired/expired this pass. Without it,
+# the mutation lived only in memory and the next tick's _load_locked() reloaded
+# the un-persisted promise from disk, wiping the latch (2026-07-07 bug-hunt).
+_promises_dirty: list[bool] = [False]
+
+
+def _mark_promises_dirty() -> None:
+    """Called by a predicate that changed a promise's stored params but did not
+    fire it, so _tick persists the change this pass."""
+    _promises_dirty[0] = True
 _loaded: list[bool] = [False]
 
 # Condition registry: name -> predicate(promise: dict) -> bool
@@ -273,6 +285,10 @@ def _cond_bambu_bed_cool(promise: dict) -> bool:
         if (st.get("gcode_state") or "").upper() == "FINISH" \
            and (st.get("last_update") or 0) >= promise.get("created_at", 0.0):
             promise["params"]["_finish_seen"] = True
+            # Persist the latch this tick — otherwise a restart in the
+            # FINISH→bed-cool window loses it and the promise waits forever for
+            # a second FINISH that never comes (the print already finished).
+            _mark_promises_dirty()
         else:
             return False
     bed = st.get("bed_temper")
@@ -452,6 +468,7 @@ def _tick() -> None:
     any_change = False
     with _lock:
         _load_locked()
+        _promises_dirty[0] = False   # predicates below may set it via _mark_promises_dirty
         for p in _promises:
             if p.get("status") != "pending":
                 continue
@@ -475,7 +492,7 @@ def _tick() -> None:
             if ready:
                 _fire_promise_locked(p)
                 any_change = True
-        if any_change:
+        if any_change or _promises_dirty[0]:
             _save_locked()
 
 
