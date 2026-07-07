@@ -12,10 +12,10 @@
 | Total registered actions (incl. aliases) | 487 |
 | — monolith `ACTIONS` dict | 118 |
 | — skill / core registered | 369 |
-| VERBATIM speak set | 153 |
-| INFORMATIVE speak set | 32 |
-| neither set | 302 |
-| no `prompts.py` example | 380 |
+| VERBATIM speak set | 188 |
+| INFORMATIVE speak set | 64 |
+| neither set | 235 |
+| no `prompts.py` example | 377 |
 | no test reference | 70 |
 
 A result in **neither** set is spoken only if the handler self-speaks; otherwise the answer
@@ -120,11 +120,12 @@ Aliases sharing a handler are collapsed. `ex?` = has a prompts.py `[ACTION: …]
 | `pause_diagnostics` | `core/diagnostic_daemons.py:1496` | neither | — | 0 |
 | `resume_diagnostics` | `core/diagnostic_daemons.py:1500` | neither | — | 0 |
 | `diagnostic_daemon_status`, `diagnostic_status` | `core/diagnostic_daemons.py:1504` | **VERBATIM** | — | 2 |
-| `ecobee_list_devices` | `?` | neither | — | 1 |
+| `ecobee_list_devices` | `?` | *INFORMATIVE* | — | 1 |
 | `gate_status`, `stability_gate_status` | `?` | **VERBATIM** | — | 2 |
-| `list_schedule`, `remove_schedule`, `run_schedule`, `schedule_cron`, `show_schedules`, `when_condition` | `?` | neither | — | 0 |
-| `nest_list_devices` | `?` | neither | — | 1 |
-| `ring_list_devices` | `?` | neither | — | 1 |
+| `list_schedule`, `show_schedules` | `?` | **VERBATIM** | — | 0 |
+| `nest_list_devices` | `?` | *INFORMATIVE* | — | 1 |
+| `remove_schedule`, `run_schedule`, `schedule_cron`, `when_condition` | `?` | neither | — | 0 |
+| `ring_list_devices` | `?` | *INFORMATIVE* | — | 1 |
 | `list_promises` | `core/memory.py:539` | **VERBATIM** | — | 2 |
 | `cancel_promise` | `core/memory.py:559` | **VERBATIM** | — | 2 |
 | `control_device`, `control_smart_home`, `smart_home_control` | `core/smart_home_router.py:740` | **VERBATIM** | yes | 4 |
@@ -134,8 +135,8 @@ Aliases sharing a handler are collapsed. `ex?` = has a prompts.py `[ACTION: …]
 | `refresh_smart_home_router` | `core/smart_home_router.py:870` | neither | — | 2 |
 | `morning_tabs` | `skills/_example_skill.py:13` | neither | — | 0 |
 | `vscode_command` | `skills/_example_skill.py:23` | neither | — | 0 |
-| `amazon_orders`, `check_amazon_orders`, `check_orders` | `skills/amazon_order_tracker.py:602` | neither | — | 1 |
-| `recent_deliveries`, `recent_delivery` | `skills/amazon_order_tracker.py:629` | neither | — | 1 |
+| `amazon_orders`, `check_amazon_orders`, `check_orders` | `skills/amazon_order_tracker.py:602` | *INFORMATIVE* | yes | 1 |
+| `recent_deliveries`, `recent_delivery` | `skills/amazon_order_tracker.py:629` | *INFORMATIVE* | — | 1 |
 | `amazon_tracking_status` | `skills/amazon_order_tracker.py:649` | **VERBATIM** | — | 2 |
 | `ambient_listen_start` | `skills/ambient_listen.py:1389` | neither | — | 5 |
 | `ambient_listen_stop` | `skills/ambient_listen.py:1418` | neither | — | 3 |
@@ -176,7 +177,7 @@ Aliases sharing a handler are collapsed. `ex?` = has a prompts.py `[ACTION: …]
 | `camera_status` | `skills/camera_system.py:402` | **VERBATIM** | — | 1 |
 | `situational_awareness`, `where_am_i` | `skills/camera_system.py:465` | **VERBATIM** | — | 1 |
 | `look_around` | `skills/camera_system.py:655` | **VERBATIM** | — | 2 |
-| `chappie_recall_entity` | `skills/chappie_consciousness.py:538` | neither | — | 1 |
+| `chappie_recall_entity` | `skills/chappie_consciousness.py:538` | **VERBATIM** | — | 1 |
 | `chappie_recall_today` | `skills/chappie_consciousness.py:567` | **VERBATIM** | — | 2 |
 | `chappie_status` | `skills/chappie_consciousness.py:609` | **VERBATIM** | — | 2 |
 | `compute`, `eval_python`, `python`, `run_python` | `skills/code_executor.py:395` | neither | yes | 4 |
@@ -193,23 +194,20 @@ Aliases sharing a handler are collapsed. `ex?` = has a prompts.py `[ACTION: …]
 | `focus_mode_status` | `skills/dnd_focus_mode.py:519` | **VERBATIM** | — | 2 |
 | `dossier`, `dossier_on`, `file_on`, `pull_up_dossier`, `pull_up_file`, `what_do_you_have_on`, `whats_on_file` | `skills/dossier.py:579` | neither | yes | 1 |
 | `draft_preview_gate_status`, `outbound_gate_status` | `skills/draft_preview_gate.py:227` | **VERBATIM** | — | 2 |
-| `list_emails`, `list_unread`, `unread_email`, `unread_emails` | `skills/email_triage.py:1034` | neither | — | 1 |
-| `read_email`, `read_message`, `read_thread` | `skills/email_triage.py:1057` | neither | — | 1 |
-| `compose_reply`, `draft_reply`, `pre_draft_reply` | `skills/email_triage.py:1078` | neither | — | 1 |
+| `list_emails`, `list_unread`, `unread_email`, `unread_emails` | `skills/email_triage.py:1034` | *INFORMATIVE* | — | 1 |
+| `read_email`, `read_message`, `read_thread` | `skills/email_triage.py:1057` | *INFORMATIVE* | — | 1 |
+| `compose_reply`, `draft_reply`, `pre_draft_reply` | `skills/email_triage.py:1078` | *INFORMATIVE* | — | 1 |
 | `confirm_pending_draft`, `send_draft`, `send_pending_draft` | `skills/email_triage.py:1127` | neither | — | 2 |
 | `discard_draft`, `scrap_pending_draft` | `skills/email_triage.py:1146` | neither | — | 1 |
-| `edit_pending_draft` | `skills/email_triage.py:1155` | neither | — | 1 |
-| `list_pending_drafts` | `skills/email_triage.py:1179` | **VERBATIM** | — | 2 |
-| `pending_drafts` | `skills/email_triage.py:1179` | neither | — | 0 |
+| `edit_pending_draft` | `skills/email_triage.py:1155` | **VERBATIM** | — | 1 |
+| `list_pending_drafts`, `pending_drafts` | `skills/email_triage.py:1179` | **VERBATIM** | — | 2 |
 | `archive_email`, `archive_message` | `skills/email_triage.py:1189` | neither | — | 1 |
-| `categorise_inbox`, `categorize_inbox`, `triage_inbox` | `skills/email_triage.py:1198` | neither | — | 1 |
-| `email_briefing`, `inbox_briefing` | `skills/email_triage.py:1228` | neither | — | 1 |
+| `categorise_inbox`, `categorize_inbox`, `triage_inbox` | `skills/email_triage.py:1198` | **VERBATIM** | — | 1 |
+| `email_briefing`, `inbox_briefing` | `skills/email_triage.py:1228` | **VERBATIM** | — | 1 |
 | `email_triage_status` | `skills/email_triage.py:1269` | **VERBATIM** | — | 2 |
 | `enroll_voice`, `learn_my_voice` | `skills/enroll_voice.py:240` | neither | yes | 1 |
-| `identify_speaker` | `skills/enroll_voice.py:265` | neither | — | 2 |
-| `who_is_talking`, `whos_talking` | `skills/enroll_voice.py:265` | **VERBATIM** | — | 2 |
-| `enrolled_voices` | `skills/enroll_voice.py:287` | neither | — | 1 |
-| `list_enrolled_voices` | `skills/enroll_voice.py:287` | **VERBATIM** | — | 2 |
+| `identify_speaker`, `who_is_talking`, `whos_talking` | `skills/enroll_voice.py:265` | **VERBATIM** | — | 3 |
+| `enrolled_voices`, `list_enrolled_voices` | `skills/enroll_voice.py:287` | **VERBATIM** | — | 2 |
 | `forget_voice` | `skills/enroll_voice.py:301` | neither | — | 1 |
 | `set_active_speaker` | `skills/enroll_voice.py:313` | neither | — | 1 |
 | `voice_id_status` | `skills/enroll_voice.py:326` | **VERBATIM** | — | 2 |
@@ -223,11 +221,11 @@ Aliases sharing a handler are collapsed. `ex?` = has a prompts.py `[ACTION: …]
 | `gaze_status` | `skills/face_tracker.py:1282` | **VERBATIM** | — | 2 |
 | `gaze_stats` | `skills/face_tracker.py:1310` | **VERBATIM** | — | 2 |
 | `face_track_status` | `skills/face_tracker.py:1340` | **VERBATIM** | — | 2 |
-| `calibrate_gaze` | `skills/face_tracker.py:1430` | neither | — | 0 |
+| `calibrate_gaze` | `skills/face_tracker.py:1430` | **VERBATIM** | — | 0 |
 | `gaze_calibration_status` | `skills/face_tracker.py:1476` | **VERBATIM** | — | 1 |
-| `forget_gaze_calibration` | `skills/face_tracker.py:1489` | neither | — | 0 |
-| `gaze_tracking_on` | `skills/face_tracker.py:1499` | neither | — | 0 |
-| `gaze_tracking_off` | `skills/face_tracker.py:1515` | neither | — | 0 |
+| `forget_gaze_calibration` | `skills/face_tracker.py:1489` | **VERBATIM** | — | 0 |
+| `gaze_tracking_on` | `skills/face_tracker.py:1499` | **VERBATIM** | yes | 0 |
+| `gaze_tracking_off` | `skills/face_tracker.py:1515` | **VERBATIM** | — | 0 |
 | `guard_on` | `skills/guard_mode.py:548` | neither | — | 1 |
 | `guard_off` | `skills/guard_mode.py:580` | neither | — | 1 |
 | `guard_status` | `skills/guard_mode.py:597` | **VERBATIM** | — | 2 |
@@ -242,24 +240,23 @@ Aliases sharing a handler are collapsed. `ex?` = has a prompts.py `[ACTION: …]
 | `air_mouse_on` | `skills/kinect_air_mouse.py:2379` | neither | — | 1 |
 | `air_mouse_off` | `skills/kinect_air_mouse.py:2399` | neither | — | 1 |
 | `air_mouse_status` | `skills/kinect_air_mouse.py:2419` | **VERBATIM** | — | 2 |
-| `calibrate_air_mouse` | `skills/kinect_air_mouse.py:2439` | neither | — | 1 |
+| `calibrate_air_mouse` | `skills/kinect_air_mouse.py:2439` | **VERBATIM** | — | 1 |
 | `gesture_status` | `skills/kinect_gestures.py:492` | **VERBATIM** | — | 1 |
 | `gestures_on` | `skills/kinect_gestures.py:511` | neither | — | 0 |
 | `gestures_off` | `skills/kinect_gestures.py:535` | neither | — | 0 |
-| `calibrate_pointing`, `point_calibrate` | `skills/kinect_pointing.py:352` | neither | — | 1 |
-| `list_point_targets` | `skills/kinect_pointing.py:397` | **VERBATIM** | — | 2 |
-| `point_targets` | `skills/kinect_pointing.py:397` | neither | — | 0 |
+| `calibrate_pointing`, `point_calibrate` | `skills/kinect_pointing.py:352` | **VERBATIM** | — | 1 |
+| `list_point_targets`, `point_targets` | `skills/kinect_pointing.py:397` | **VERBATIM** | — | 2 |
 | `forget_point_target` | `skills/kinect_pointing.py:420` | neither | — | 1 |
-| `point_at`, `point_control` | `skills/kinect_pointing.py:433` | neither | — | 1 |
+| `point_at`, `point_control` | `skills/kinect_pointing.py:433` | **VERBATIM** | — | 1 |
 | `point_status` | `skills/kinect_pointing.py:488` | **VERBATIM** | — | 2 |
 | `point_control_on` | `skills/kinect_pointing.py:515` | neither | — | 1 |
 | `point_control_off` | `skills/kinect_pointing.py:533` | neither | — | 1 |
 | `who_is_here` | `skills/kinect_vision.py:102` | **VERBATIM** | — | 1 |
-| `scan_room` | `skills/kinect_vision.py:133` | neither | — | 1 |
-| `kinect_look` | `skills/kinect_vision.py:137` | neither | — | 1 |
-| `what_do_you_see_kinect` | `skills/kinect_vision.py:179` | neither | — | 1 |
+| `scan_room` | `skills/kinect_vision.py:133` | **VERBATIM** | — | 1 |
+| `kinect_look` | `skills/kinect_vision.py:137` | *INFORMATIVE* | — | 1 |
+| `what_do_you_see_kinect` | `skills/kinect_vision.py:179` | *INFORMATIVE* | — | 1 |
 | `kinect_status` | `skills/kinect_vision.py:53` | **VERBATIM** | — | 1 |
-| `local_describe_screen` | `skills/local_vision.py:108` | neither | yes | 1 |
+| `local_describe_screen` | `skills/local_vision.py:108` | *INFORMATIVE* | yes | 1 |
 | `local_click_target_by_description` | `skills/local_vision.py:297` | neither | — | 1 |
 | `mcp_status` | `skills/mcp_tools.py:149` | **VERBATIM** | — | 2 |
 | `mcp_list_tools` | `skills/mcp_tools.py:166` | **VERBATIM** | — | 1 |
@@ -274,8 +271,7 @@ Aliases sharing a handler are collapsed. `ex?` = has a prompts.py `[ACTION: …]
 | `morning_briefing` | `skills/morning_briefing.py:453` | **VERBATIM** | yes | 8 |
 | `morning_chain_pick` | `skills/morning_chain.py:310` | neither | — | 1 |
 | `morning_handoff` | `skills/morning_handoff.py:736` | neither | yes | 2 |
-| `predictive_morning_setup` | `skills/morning_handoff.py:744` | **VERBATIM** | yes | 2 |
-| `setup_workspace`, `workspace_setup` | `skills/morning_handoff.py:744` | neither | — | 1 |
+| `predictive_morning_setup`, `setup_workspace`, `workspace_setup` | `skills/morning_handoff.py:744` | **VERBATIM** | yes | 2 |
 | `calendar_next`, `calendar_today`, `ms_graph_calendar` | `skills/ms_graph.py:794` | **VERBATIM** | yes | 4 |
 | `list_wifi_clients`, `network_clients`, `who_is_on_the_wifi` | `skills/network_deco.py:681` | neither | — | 1 |
 | `who_is_on_wifi` | `skills/network_deco.py:681` | *INFORMATIVE* | yes | 1 |
@@ -299,7 +295,7 @@ Aliases sharing a handler are collapsed. `ex?` = has a prompts.py `[ACTION: …]
 | `list_notification_rules` | `skills/notification_triage.py:1356` | **VERBATIM** | — | 2 |
 | `add_notification_rule` | `skills/notification_triage.py:1365` | neither | — | 1 |
 | `remove_notification_rule` | `skills/notification_triage.py:1387` | neither | — | 1 |
-| `list_recent_notifications`, `recent_notifications_summary` | `skills/notification_triage.py:1401` | neither | yes | 1 |
+| `list_recent_notifications`, `recent_notifications_summary` | `skills/notification_triage.py:1401` | *INFORMATIVE* | yes | 1 |
 | `pause_notification_triage` | `skills/notification_triage.py:1419` | neither | — | 1 |
 | `resume_notification_triage` | `skills/notification_triage.py:1423` | neither | — | 1 |
 | `obs_start_recording` | `skills/obs_control.py:104` | neither | — | 1 |
@@ -341,17 +337,17 @@ Aliases sharing a handler are collapsed. `ex?` = has a prompts.py `[ACTION: …]
 | `what_is_broken`, `whats_broken` | `skills/self_diagnostic.py:2781` | **VERBATIM** | — | 2 |
 | `diagnostic_history` | `skills/self_diagnostic.py:2816` | **VERBATIM** | — | 2 |
 | `last_diagnostic_run` | `skills/self_diagnostic.py:2841` | **VERBATIM** | — | 2 |
-| `ecobee_request_pin` | `skills/sh_ecobee.py:316` | neither | — | 1 |
+| `ecobee_request_pin` | `skills/sh_ecobee.py:316` | **VERBATIM** | — | 1 |
 | `ecobee_complete_setup` | `skills/sh_ecobee.py:331` | neither | — | 1 |
-| `ecobee_authorize` | `skills/sh_ecobee.py:369` | neither | — | 1 |
-| `govee_list`, `govee_list_devices` | `skills/sh_govee.py:380` | neither | — | 1 |
-| `hue_retry_connect` | `skills/sh_hue.py:233` | neither | — | 1 |
-| `hue_list`, `hue_list_devices` | `skills/sh_hue.py:404` | neither | yes | 1 |
+| `ecobee_authorize` | `skills/sh_ecobee.py:369` | **VERBATIM** | — | 1 |
+| `govee_list`, `govee_list_devices` | `skills/sh_govee.py:380` | *INFORMATIVE* | — | 1 |
+| `hue_retry_connect` | `skills/sh_hue.py:233` | **VERBATIM** | — | 1 |
+| `hue_list`, `hue_list_devices` | `skills/sh_hue.py:404` | *INFORMATIVE* | yes | 1 |
 | `hue_set_bridge_ip` | `skills/sh_hue.py:418` | neither | — | 1 |
-| `kasa_list`, `kasa_list_devices`, `tplink_list` | `skills/sh_kasa.py:311` | neither | — | 1 |
-| `lifx_list`, `lifx_list_devices` | `skills/sh_lifx.py:226` | neither | — | 1 |
-| `nest_authorize` | `skills/sh_nest.py:363` | neither | — | 1 |
-| `ring_authorize` | `skills/sh_ring.py:299` | neither | — | 1 |
+| `kasa_list`, `kasa_list_devices`, `tplink_list` | `skills/sh_kasa.py:311` | *INFORMATIVE* | — | 1 |
+| `lifx_list`, `lifx_list_devices` | `skills/sh_lifx.py:226` | *INFORMATIVE* | — | 1 |
+| `nest_authorize` | `skills/sh_nest.py:363` | **VERBATIM** | — | 1 |
+| `ring_authorize` | `skills/sh_ring.py:299` | **VERBATIM** | — | 1 |
 | `smart_life_list`, `tuya_list`, `tuya_list_devices` | `skills/sh_tuya.py:149` | *INFORMATIVE* | — | 1 |
 | `discover_smart_home`, `refresh_smart_home`, `smart_home_discover`, `smart_home_setup` | `skills/smart_home_discover.py:1112` | neither | — | 1 |
 | `list_smart_home_devices`, `smart_home_catalog` | `skills/smart_home_discover.py:1381` | **VERBATIM** | — | 2 |
@@ -362,14 +358,14 @@ Aliases sharing a handler are collapsed. `ex?` = has a prompts.py `[ACTION: …]
 | `suit_up`, `suit_up_sequence` | `skills/suit_up.py:361` | neither | yes | 1 |
 | `check_system` | `skills/system_monitor.py:249` | **VERBATIM** | yes | 3 |
 | `status_report`, `system_pulse` | `skills/system_pulse.py:666` | **VERBATIM** | yes | 5 |
-| `check_teams` | `skills/teams_nudge.py:203` | neither | yes | 3 |
+| `check_teams` | `skills/teams_nudge.py:203` | **VERBATIM** | yes | 3 |
 | `set_timer` | `skills/timer.py:364` | neither | yes | 9 |
 | `list_timers` | `skills/timer.py:401` | **VERBATIM** | — | 1 |
 | `cancel_timer` | `skills/timer.py:427` | neither | yes | 1 |
-| `calibrate_tv_region`, `tv_calibrate` | `skills/tv_detect.py:303` | neither | — | 1 |
+| `calibrate_tv_region`, `tv_calibrate` | `skills/tv_detect.py:303` | **VERBATIM** | — | 1 |
 | `tv_detect_status`, `tv_status` | `skills/tv_detect.py:348` | **VERBATIM** | — | 2 |
-| `tv_detect_on` | `skills/tv_detect.py:381` | neither | — | 1 |
-| `tv_detect_off` | `skills/tv_detect.py:399` | neither | — | 1 |
+| `tv_detect_on` | `skills/tv_detect.py:381` | **VERBATIM** | yes | 1 |
+| `tv_detect_off` | `skills/tv_detect.py:399` | **VERBATIM** | — | 1 |
 | `wake_listener_start` | `skills/wake_listener.py:379` | neither | — | 1 |
 | `wake_listener_stop` | `skills/wake_listener.py:396` | neither | — | 1 |
 | `wake_listener_status` | `skills/wake_listener.py:410` | **VERBATIM** | — | 2 |
