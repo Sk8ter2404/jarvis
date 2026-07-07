@@ -130,6 +130,19 @@ ARC_SWEEP_DEG     = 38      # angular length of each arc segment
 GLOW_RADIUS_TRACK = 40
 GLOW_RADIUS_GRAB  = 30
 
+# PRIMING RING (passive engage-dwell feedback). The air-mouse publishes a
+# `prime` float in [0,1] while the owner HOLDS the engage pose (open palm, brief
+# hold) before the cursor actually engages. We draw a ring that FILLS 0→360° as
+# prime rises 0→1 — the owner literally watches the air-mouse "charge up" to take
+# control, which also teaches the engage-pose timing. It sits a touch OUTSIDE the
+# normal ring so it reads as "priming", not as the reticle itself. At prime≈1.0
+# (or once the state flips to track/grab) the ring completes and snaps away to the
+# ordinary reticle, with a brief accent flash on the completing tick.
+PRIME_RING_RADIUS = RING_RADIUS_TRACK + 10  # sits just outside the tracking ring
+PRIME_RING_WIDTH  = 3       # arc line width (a hair heavier than the arc segments)
+PRIME_FULL_EPS    = 0.999   # prime at/above this reads as "engaged" → no ring
+PRIME_START_DEG   = 90.0    # 12-o'clock start; the arc sweeps clockwise as it fills
+
 # The small follow-window is large enough to hold the glow ring + the rotating
 # arcs (which sit a few px outside it) with a little breathing room. The reticle
 # is always drawn at the window's CENTRE; the WINDOW moves, not the drawing.
@@ -142,6 +155,7 @@ EASE              = 0.45    # cursor-follow easing (0..1); higher = snappier
 SPIN_SPEED        = 0.06    # radians/tick the arc segments rotate
 PULSE_SPEED       = 0.18    # breathing pulse rate
 GRAB_FLASH_TICKS  = 8       # how many ticks the gold flash brightens on grab
+PRIME_FLASH_TICKS = 6       # brief accent flash when the priming ring completes
 TRAIL_MAX         = 8       # number of trail dots retained
 TRAIL_MIN_MOVE    = 6       # only drop a new trail dot after moving this many px
 
@@ -251,6 +265,55 @@ def _lerp(a: float, b: float, t: float) -> float:
     return a + (b - a) * t
 
 
+def _parse_prime(data: dict) -> float:
+    """Extract the passive engage-dwell PROGRESS from a published state dict.
+
+    The `prime` key is a float in [0.0, 1.0]: 0.0 when idle or already engaged,
+    rising 0→1 while the owner holds the engage pose. It may be ABSENT on older /
+    other writers → a missing OR unparseable OR out-of-range value is treated as
+    0.0 (no ring) and a valid value is CLAMPED to [0,1]. Pure (dict in, float
+    out) so the parse + clamp contract is unit-testable with no Tk root."""
+    try:
+        p = float(data.get("prime", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+    if p != p:              # NaN (float("nan") parses but is never a real value)
+        return 0.0
+    if p < 0.0:
+        return 0.0
+    if p > 1.0:
+        return 1.0
+    return p
+
+
+def _priming_ring_extent(prime: float, shown: bool, state: str):
+    """Decide whether — and how far — to sweep the priming ring this tick.
+
+    PURE (no Tk / no self) so the draw decision is unit-testable headlessly.
+    ``shown`` is "is the overlay showing ANYTHING this frame" (the priming ring OR
+    the engaged reticle) — it is what the "no ring when hidden" rule keys off, NOT
+    the engaged-only visibility (which is False during the pre-engage hold, exactly
+    when the ring SHOULD show). Returns ``(should_draw: bool, extent_deg: float)``:
+      • a ring is drawn ONLY while the owner is mid-hold — 0 < prime < ~1 — and
+        the overlay is shown but NOT yet engaged (state is neither "track" nor
+        "grab"); ``extent_deg`` is then ``prime * 360`` (a fraction-of-a-circle
+        arc that grows as the hold progresses).
+      • otherwise ``(False, 0.0)`` — no ring: at prime 0 (idle), at prime ≈ 1 /
+        ≥1 (engaged; the ring has completed and hands off to the normal reticle),
+        when hidden, or once the state has already flipped to track/grab.
+    Clamps a stray out-of-range prime defensively (callers pass _parse_prime's
+    output, which is already clamped, but this stays correct if they don't)."""
+    if not shown:
+        return (False, 0.0)
+    if state in ("track", "grab"):
+        return (False, 0.0)
+    if prime <= 0.0 or prime >= PRIME_FULL_EPS:
+        return (False, 0.0)
+    if prime > 1.0:
+        prime = 1.0
+    return (True, prime * 360.0)
+
+
 class AirCursorOverlay:
     def __init__(self, x: int, y: int, w: int, h: int, parent_pid: int,
                  parent_start: "float | None" = None):
@@ -280,6 +343,20 @@ class AirCursorOverlay:
         self._last_state_ts = 0.0
         self._grab_flash = 0         # countdown of the gold-flash brighten
         self._was_grab   = False
+        # Passive engage-dwell progress in [0,1] (the priming ring's fill). 0.0
+        # when idle / engaged; rises while the owner holds the engage pose. A
+        # missing/garbage `prime` key parses to 0.0 (no ring). `_prime_flash`
+        # is a short countdown for the brief accent flash on the tick the ring
+        # completes (prime crosses to engaged), so the hand-off "pops".
+        self.prime       = 0.0
+        self._prime_flash = 0
+        self._was_priming = False
+        # True when the priming ring should be shown THIS frame: a fresh, on-desktop
+        # frame is mid-hold (0<prime<1) but the cursor has NOT yet engaged (state is
+        # not track/grab). It drives window visibility exactly like `visible` does
+        # for the engaged reticle, so the ring can appear during the pre-engage hold
+        # (when `visible` is still False) without stranding a withdrawn window.
+        self.priming_active = False
         self.trail       = []        # recent (vx, vy) virtual-desktop points
         self._prev_visible = False
         self._win_x      = None      # last placed window top-left (to avoid
@@ -601,6 +678,62 @@ class AirCursorOverlay:
                 outline="",
             )
 
+    def _draw_priming_ring(self, cx: float, cy: float):
+        """Draw the passive engage-dwell PRIMING RING at the window centre: an arc
+        that fills 0→360° as ``self.prime`` rises 0→1, sitting just OUTSIDE the
+        normal ring so the owner watches the air-mouse "charge up" to take control
+        (and learns the engage-pose timing). Uses the reticle's accent colour
+        (cyan while pre-engage). A faint full-circle track underneath shows how
+        far there is to go. NEVER raises — a bad draw must not kill the paint loop.
+
+        Drawn only when the pure ``_priming_ring_extent`` gate says so (0<prime<1,
+        visible, not yet engaged); at prime≈1 or once state flips to track/grab the
+        ring vanishes and the ordinary reticle takes over (with a short flash, see
+        ``_prime_flash``). ``create_arc`` matches the rotating arc-segment
+        primitive already used by ``_draw_reticle`` (cheap; one arc per tick)."""
+        # The `shown` flag = "is the overlay showing anything this frame" — the
+        # priming ring OR the engaged reticle. It is what the "no ring when hidden"
+        # rule keys off (a fully-hidden overlay is neither), NOT the engaged-only
+        # `visible` (which is False during the pre-engage hold, exactly when the
+        # ring SHOULD show).
+        shown = self.priming_active or self.visible
+        should_draw, extent = _priming_ring_extent(self.prime, shown, self.state)
+        if not should_draw:
+            return
+        try:
+            r = PRIME_RING_RADIUS
+            bbox = (cx - r, cy - r, cx + r, cy + r)
+            # Faint full-circle track (how far there is to go). Dim accent so it
+            # reads as an unfilled gauge, never competing with the fill.
+            self.canvas.create_oval(*bbox, outline=CYAN_DIM, width=1)
+            # The filling arc. Sweep CLOCKWISE from 12 o'clock: tkinter arc angles
+            # are counter-clockwise, so a NEGATIVE extent fills clockwise.
+            self.canvas.create_arc(
+                *bbox, start=PRIME_START_DEG, extent=-extent,
+                style="arc", outline=CYAN_BRIGHT, width=PRIME_RING_WIDTH,
+            )
+        except Exception:
+            # A paint hiccup must never bubble out of the animation loop.
+            pass
+
+    def _draw_prime_flash(self, cx: float, cy: float):
+        """A short, subtle completion flash for the priming→engaged hand-off: the
+        just-completed full circle drawn once more, bright, at the priming radius —
+        so the ring visibly "lands" as the reticle engages instead of blinking out.
+        Kept gentle (a single expanding ring, no strobe) to respect reduced-motion
+        sensibilities. NEVER raises out of the paint loop."""
+        try:
+            # 1→0 over the flash window; the ring grows slightly + the accent
+            # colour steps down as it fades (a soft, non-strobing "pop").
+            t = self._prime_flash / float(PRIME_FLASH_TICKS)
+            grow = self._palette()  # accent for the now-engaged state
+            outer = grow[1]         # the bright accent (cyan/gold BRIGHT)
+            r = PRIME_RING_RADIUS + int(6 * (1.0 - t))
+            self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                    outline=outer, width=2)
+        except Exception:
+            pass
+
     @staticmethod
     def _parse_hand_pts(raw):
         """Parse the published two-hand points [{x,y},{x,y}] → [(x,y),(x,y)] in
@@ -668,11 +801,28 @@ class AirCursorOverlay:
                 self.two_resizing = bool(data.get("resizing"))
                 self.hand_pts = pts
                 self.visible = True
-                # The single-hand reticle is suppressed while two-hand is active.
+                # The single-hand reticle is suppressed while two-hand is active,
+                # and so is the priming ring (both hands are already engaged).
                 self.state = "hidden"
+                self.prime = 0.0
+                self._was_priming = False
                 self.color_name = str(data.get("color", "blue") or "blue").lower()
                 self._was_grab = False
                 return True
+
+        # Passive engage-dwell progress for the priming ring. Parsed from the
+        # SAME frame; 0.0 (no ring) when the key is missing/garbage or when the
+        # frame is stale/hidden. Only meaningful while NOT yet engaged — the ring
+        # helper (_priming_ring_extent) additionally suppresses it once the state
+        # is track/grab, so a writer that leaves a stale prime>0 alongside an
+        # engaged state still draws no ring.
+        new_prime = _parse_prime(data) if fresh else 0.0
+        # Latch a brief completion flash on the tick the hold finishes: we were
+        # mid-prime last frame and prime has now reached full / handed off.
+        if self._was_priming and new_prime >= PRIME_FULL_EPS:
+            self._prime_flash = PRIME_FLASH_TICKS
+        self._was_priming = (0.0 < new_prime < PRIME_FULL_EPS)
+        self.prime = new_prime
 
         # Latch grab-flash on the rising edge into "grab".
         if state == "grab" and not self._was_grab:
@@ -681,9 +831,15 @@ class AirCursorOverlay:
 
         self.state = state if want_visible else "hidden"
         self.visible = want_visible
+        # Priming ring is active while the owner is mid-hold and NOT yet engaged.
+        # It is deliberately allowed even when `visible` is False (the engaged
+        # reticle's gate), so the ring can charge up during the pre-engage hold.
+        # The pure _priming_ring_extent gate re-checks 0<prime<1 & not-track/grab.
+        self.priming_active = (fresh and (not want_visible)
+                               and 0.0 < new_prime < PRIME_FULL_EPS)
         self.color_name = str(data.get("color", "cyan") or "cyan").lower()
 
-        if want_visible:
+        if want_visible or self.priming_active:
             try:
                 ax = int(data.get("x", 0))
                 ay = int(data.get("y", 0))
@@ -748,6 +904,13 @@ class AirCursorOverlay:
         self.frame += 1
         if self._grab_flash > 0:
             self._grab_flash -= 1
+        if self._prime_flash > 0:
+            self._prime_flash -= 1
+
+        # "Shown" this frame = the engaged reticle OR the pre-engage priming ring.
+        # Both need the small follow-window on-screen and positioned at the cursor;
+        # only the visibility of the DRAWN content differs (reticle vs ring).
+        shown = self.visible or self.priming_active
 
         # ── TWO-HAND mode: draw TWO circle reticles (one per hand) and skip the
         #    single-hand path. Each hand gets its own small click-through window so
@@ -762,11 +925,12 @@ class AirCursorOverlay:
         # reticle can't linger.
         self._hide_second_window()
 
-        # Idle short-circuit: nothing visible now and nothing last frame either
-        # → hide the window and back off to a slow poll. (A small window costs
-        # far less than the old full-desktop redraw, but withdrawing it while
-        # idle keeps it from sitting topmost over the desktop doing nothing.)
-        if not self.visible and not self._prev_visible:
+        # Idle short-circuit: nothing shown now (neither reticle nor priming ring)
+        # and nothing last frame either → hide the window and back off to a slow
+        # poll. (A small window costs far less than the old full-desktop redraw,
+        # but withdrawing it while idle keeps it from sitting topmost over the
+        # desktop doing nothing.)
+        if not shown and not self._prev_visible:
             self._prev_visible = False
             try:
                 if self.root.state() != "withdrawn":
@@ -777,7 +941,7 @@ class AirCursorOverlay:
             return
 
         # Ease the reticle toward the target (in virtual-desktop coords).
-        if self.visible and self.target_x is not None:
+        if shown and self.target_x is not None:
             if self.cur_x is None:
                 self.cur_x, self.cur_y = self.target_x, self.target_y
             else:
@@ -791,7 +955,7 @@ class AirCursorOverlay:
                 if len(self.trail) > TRAIL_MAX:
                     self.trail.pop(0)
 
-        if self.visible and self.cur_x is not None:
+        if shown and self.cur_x is not None:
             # Make sure the (possibly withdrawn) window is shown, then move it to
             # the cursor and draw the reticle at the window's centre.
             try:
@@ -811,10 +975,24 @@ class AirCursorOverlay:
             self.canvas.create_rectangle(
                 0, 0, WINDOW_SIZE, WINDOW_SIZE, fill=BG_KEY, outline="",
             )
-            self._draw_trail(WINDOW_HALF, WINDOW_HALF)
-            self._draw_reticle(WINDOW_HALF, WINDOW_HALF)
+            if self.visible:
+                # Engaged: the ordinary reticle (trail + rings + arcs + dot).
+                self._draw_trail(WINDOW_HALF, WINDOW_HALF)
+                self._draw_reticle(WINDOW_HALF, WINDOW_HALF)
+                # Brief completion flash on the priming→engaged hand-off: a fully
+                # closed bright ring that fades out over a few ticks, so the ring
+                # "snaps" into the reticle rather than just vanishing.
+                if self._prime_flash > 0:
+                    self._draw_prime_flash(WINDOW_HALF, WINDOW_HALF)
+            else:
+                # Pre-engage hold: only the priming ring charging up. (When it
+                # completes, `visible` flips true next frame and the reticle takes
+                # over — the _prime_flash brightening covers that hand-off.)
+                self._draw_priming_ring(WINDOW_HALF, WINDOW_HALF)
 
-        self._prev_visible = self.visible
+        # Track "shown last frame" (reticle OR ring) so the idle short-circuit and
+        # the on-acquire snap treat a priming→engaged hand-off as continuous.
+        self._prev_visible = shown
         self.root.after(TICK_MS, self.tick)
 
     def run(self):
