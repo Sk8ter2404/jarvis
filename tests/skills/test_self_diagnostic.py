@@ -445,6 +445,28 @@ class SelfDiagFileTests(unittest.TestCase):
         self.assertIn("VAD", out)
         self.assertIn("camera", out)
 
+    def test_whats_broken_distinguishes_multiple_self_heal_actions(self):
+        # 2026-07-07 bug-hunt (MED): two DIFFERENT failing actions used to both
+        # capture the bare word 'action' and collapse to ONE task named "action".
+        # The disambiguating quoted-name / index must keep them distinct.
+        with open(self.todo, "w", encoding="utf-8") as f:
+            f.write("- [ ] **2026-05-30** [self-heal] - Fix: action 'play_music' "
+                    "keeps raising ValueError.\n")
+            f.write("- [ ] **2026-05-30** [self-heal] - Fix: action 'set_timer' "
+                    "keeps raising KeyError.\n")
+            f.write("- [ ] **2026-05-30** [self-heal] - Fix: camera 0 hit a "
+                    "face_tracker error.\n")
+            f.write("- [ ] **2026-05-30** [self-heal] - Fix: camera 1 hit a "
+                    "face_tracker error.\n")
+        out = self.actions["whats_broken"]("")
+        # 4 genuinely distinct tasks — not collapsed to "action" + "camera".
+        # (Display converts '_' → ' ' for readability, so play_music → play music.)
+        self.assertIn("4 open repair tasks", out)
+        self.assertIn("play music", out)
+        self.assertIn("set timer", out)
+        self.assertIn("camera 0", out)
+        self.assertIn("camera 1", out)
+
     # ── _open_selfdiag_components dedupe ──────────────────────────────────
     def test_open_components_parses_todo(self):
         with open(self.todo, "w", encoding="utf-8") as f:

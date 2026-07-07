@@ -350,7 +350,15 @@ def smart_home_control(request: str = "") -> str:
         return "What would you like me to control, sir?"
     low = req.lower()
     # Intent — word-boundary so 'office' isn't read as 'off', 'nook' not 'on'.
-    if _re.search(r"\btoggle\b", low):
+    # INTERROGATIVE GUARD (2026-07-07 bug-hunt): a STATUS QUESTION like "are the
+    # lights on" contains the word "on" and would otherwise be read as an ON
+    # command that actually SWITCHES the plug. A leading question word or a
+    # trailing '?' → status query (intent=None), which reads live state below.
+    if (_re.match(r"^\s*(?:are|is|was|were|do|does|did|has|have|can|could|"
+                  r"what'?s|how'?s)\b", low)
+            or low.rstrip().endswith("?")):
+        intent = None
+    elif _re.search(r"\btoggle\b", low):
         intent = "toggle"
     elif _re.search(r"\b(off|shut)\b", low):
         intent = "off"

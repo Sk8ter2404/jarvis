@@ -2060,8 +2060,17 @@ _SELF_DIAG_LINE_RE = re.compile(
 # self-heal writers dedup themselves), but the user-facing "what's broken"
 # readout must surface every open repair task — before this it silently missed
 # every self-heal item (2026-07-06 audit tail).
+# 2026-07-07 bug-hunt (MED): capture ENOUGH after "Fix: " to tell distinct
+# self-heal tasks apart. The self-heal writers emit "Fix: action 'foo' …",
+# "Fix: camera 0 …", "Fix: VAD …" — a bare (\S+) grabbed only the generic word
+# ("action"/"camera"), so whats_broken deduped two different failing actions to
+# ONE and named it with a bare word. We now also pull the trailing quoted name
+# or numeric index when present, so "action 'foo'" and "action 'bar'" (or camera
+# 0 and camera 1) stay distinct; self-diag's "Fix: <component> reports …" keeps
+# capturing just the component (no quote/number follows).
 _ANY_REPAIR_LINE_RE = re.compile(
-    r"^\-\s+\[\s+\]\s+\*\*([\d\-]+)\*\*\s+\[(?:self-diag|self-heal)\]\s+\-\s+Fix:\s+(\S+)",
+    r"^\-\s+\[\s+\]\s+\*\*([\d\-]+)\*\*\s+\[(?:self-diag|self-heal)\]\s+\-\s+"
+    r"Fix:\s+(\S+(?:\s+'[^']+'|\s+\"[^\"]+\"|\s+\d+)?)",
 )
 
 
