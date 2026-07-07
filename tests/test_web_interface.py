@@ -19,6 +19,14 @@ Coverage:
   • SECURITY: create_server REFUSES a non-local bind with an empty token
     (InsecureBindError) and ALLOWS a local bind with no token.
   • build_status is graceful when hud_state / log / gpu are all absent.
+  • DASHBOARD ENHANCEMENTS (v2 web controls): the page carries the quick-action
+    button markup (QUICK_ACTIONS array + preset labels/commands) and the
+    auto-refresh toggle — with AND without a token set; POSTing a preset command
+    ("mouse control on") to /api/say still round-trips a stubbed reply.
+  • STATUS ENHANCEMENTS: /api/status always carries a JSON-valid ``uptime`` field
+    (None with no log, a float derived from the log's first timestamp otherwise);
+    ``air_mouse`` is present ONLY when the skill module is loaded in-process
+    (simulated via sys.modules) and OMITTED otherwise.
 
 stdlib unittest + urllib only; no pytest, no third-party HTTP client.
 """
@@ -114,9 +122,40 @@ class StatusEndpointTests(_ServerBase):
         self.assertIn("J.A.R.V.I.S", body)
         self.assertIn("/api/status", body)   # the page polls it
 
+    def test_dashboard_has_quick_action_buttons(self):
+        # The quick-action row is data-driven from a QUICK_ACTIONS JS array; assert
+        # both the array and a representative preset (label + the exact phrase it
+        # POSTs) are present so a broken f-string / renamed preset is caught.
+        code, body = _get_raw(self.base + "/")
+        self.assertEqual(code, 200)
+        self.assertIn("QUICK_ACTIONS", body)
+        self.assertIn('id="actions"', body)           # the container the buttons render into
+        self.assertIn("Arm mouse control", body)       # a preset label
+        self.assertIn("mouse control on", body)        # the phrase that preset POSTs
+        self.assertIn("system status", body)           # the "what's my status" preset phrase
+
+    def test_dashboard_has_autorefresh_toggle(self):
+        # The auto-refresh checkbox lets the user freeze polling; assert its element
+        # and the gating helper are in the page.
+        code, body = _get_raw(self.base + "/")
+        self.assertEqual(code, 200)
+        self.assertIn('id="autorefresh"', body)
+        self.assertIn("auto-refresh", body)
+
     def test_unknown_path_404(self):
         code, data = _post(self.base + "/api/nope", {})
         self.assertEqual(code, 404)
+
+    def test_status_carries_uptime_field(self):
+        # uptime is a first-class /api/status field — None with no log here, but the
+        # KEY must always be present + JSON-valid so the client can rely on it.
+        code, data = _get(self.base + "/api/status")
+        self.assertEqual(code, 200)
+        self.assertIn("uptime", data)
+        self.assertIsNone(data["uptime"])              # no session log in the temp dir
+        # air_mouse is OMITTED when the skill isn't loaded in-process (the default
+        # in headless CI) — its ABSENCE is meaningful, so assert it's not there.
+        self.assertNotIn("air_mouse", data)
 
 
 class LogTailTests(_ServerBase):
@@ -165,6 +204,19 @@ class SayInjectTests(_ServerBase):
         with open(self.inject_path, encoding="utf-8") as f:
             items = json.load(f)
         self.assertEqual([i["text"] for i in items], ["first", "second"])
+
+    def test_quick_action_preset_command_round_trips(self):
+        # A quick-action button POSTs a PRESET phrase to /api/say exactly as the
+        # typed form does. Drive the same endpoint with a preset ("mouse control
+        # on") and assert it injects in drain-shape and returns the stubbed reply —
+        # proving the button path (which shares sendCommand) still works.
+        code, data = _post(self.base + "/api/say", {"text": "mouse control on"})
+        self.assertEqual(code, 200)
+        self.assertTrue(data["accepted"])
+        self.assertIn("echo mouse control on", data["reply"])
+        with open(self.inject_path, encoding="utf-8") as f:
+            items = json.load(f)
+        self.assertEqual(items[-1]["text"], "mouse control on")
 
 
 class InjectHelperTests(unittest.TestCase):
@@ -308,6 +360,17 @@ class TokenAuthTests(_ServerBase):
         self.assertEqual(code, 200)
         self.assertIn("J.A.R.V.I.S", body)
 
+    def test_page_renders_enhancements_with_token_set(self):
+        # With a token configured the page still renders fully (and bakes the token
+        # into the JS). Assert the enhancements survive the token path: quick-action
+        # markup + the auto-refresh toggle are present, and the token is embedded.
+        code, body = _get_raw(self.base + "/")
+        self.assertEqual(code, 200)
+        self.assertIn("QUICK_ACTIONS", body)
+        self.assertIn("Arm mouse control", body)
+        self.assertIn('id="autorefresh"', body)
+        self.assertIn(self.token, body)                # token baked into the page JS
+
 
 class BuildStatusGracefulTests(unittest.TestCase):
     """build_status must never raise when every source is missing."""
@@ -359,6 +422,86 @@ class WaitForReplyTests(unittest.TestCase):
             res = wi.wait_for_reply("what time is it", log_dir, timeout=5.0)
             self.assertEqual(res["status"], "ok")
             self.assertTrue(any("noon" in ln for ln in res["lines"]))
+
+
+class UptimeTests(unittest.TestCase):
+    """_uptime_seconds derives a same-day delta from the log's first timestamp."""
+
+    def test_uptime_none_when_no_log(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(wi._uptime_seconds(os.path.join(d, "logs")))
+
+    def test_uptime_none_when_no_timestamp_in_head(self):
+        with tempfile.TemporaryDirectory() as d:
+            ld = os.path.join(d, "logs")
+            os.makedirs(ld)
+            lg = os.path.join(ld, "session_2026-07-07_00-00-00.log")
+            with open(lg, "w", encoding="utf-8") as f:
+                f.write("no timestamps here\njust plain lines\n")
+            self.assertIsNone(wi._uptime_seconds(ld))
+
+    def test_uptime_derived_from_first_timestamp(self):
+        # Seed a first line stamped ~2 minutes ago; uptime should be ~120s. We use
+        # the LOCAL clock (matching _uptime_seconds) so this holds regardless of TZ.
+        with tempfile.TemporaryDirectory() as d:
+            ld = os.path.join(d, "logs")
+            os.makedirs(ld)
+            t = time.localtime(time.time() - 120)
+            stamp = "[%02d:%02d:%02d]" % (t.tm_hour, t.tm_min, t.tm_sec)
+            lg = os.path.join(ld, "session_2026-07-07_00-00-00.log")
+            with open(lg, "w", encoding="utf-8") as f:
+                f.write("boot banner (no ts)\n")
+                f.write(stamp + " loop starting\n")
+            up = wi._uptime_seconds(ld)
+            self.assertIsNotNone(up)
+            # Allow a wide window for test-runner slowness / a midnight-rollover
+            # clamp (which would read 0.0); the point is it's a sane float, not None.
+            self.assertTrue(up == 0.0 or (100 <= up <= 140), f"unexpected uptime {up}")
+
+
+class AirMouseStatusTests(unittest.TestCase):
+    """_air_mouse_status reads the skill via sys.modules (no import) and OMITS the
+    field when the skill isn't loaded — mirroring bobert's preview reader."""
+
+    def tearDown(self):
+        import sys as _sys
+        _sys.modules.pop("skill_kinect_air_mouse", None)   # never leak the fake
+
+    def test_none_when_skill_not_loaded(self):
+        import sys as _sys
+        _sys.modules.pop("skill_kinect_air_mouse", None)
+        self.assertIsNone(wi._air_mouse_status())
+
+    def test_reads_armed_engaged_when_skill_loaded(self):
+        import sys as _sys
+        import types
+        fake = types.ModuleType("skill_kinect_air_mouse")
+        fake.get_air_mouse_state = lambda: {  # type: ignore[attr-defined]
+            "engaged": True, "armed": True, "grip": "open", "ts": 0.0}
+        _sys.modules["skill_kinect_air_mouse"] = fake
+        self.assertEqual(wi._air_mouse_status(), {"armed": True, "engaged": True})
+
+    def test_build_status_includes_air_mouse_when_loaded(self):
+        import sys as _sys
+        import types
+        fake = types.ModuleType("skill_kinect_air_mouse")
+        fake.get_air_mouse_state = lambda: {  # type: ignore[attr-defined]
+            "engaged": False, "armed": True}
+        _sys.modules["skill_kinect_air_mouse"] = fake
+        with tempfile.TemporaryDirectory() as d:
+            s = wi.build_status(os.path.join(d, "nope.json"),
+                                os.path.join(d, "logs"))
+            # JSON-valid and carries the trimmed air_mouse dict.
+            json.dumps(s)
+            self.assertEqual(s["air_mouse"], {"armed": True, "engaged": False})
+
+    def test_build_status_omits_air_mouse_when_not_loaded(self):
+        import sys as _sys
+        _sys.modules.pop("skill_kinect_air_mouse", None)
+        with tempfile.TemporaryDirectory() as d:
+            s = wi.build_status(os.path.join(d, "nope.json"),
+                                os.path.join(d, "logs"))
+            self.assertNotIn("air_mouse", s)
 
 
 if __name__ == "__main__":
