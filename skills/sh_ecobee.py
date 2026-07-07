@@ -263,7 +263,14 @@ def set_state(device: dict, **kwargs) -> dict:
         mode = "auto"
     if mode:
         try:
-            svc.set_hvac_mode(selection, mode)
+            # pyecobee (sfanous) has no set_hvac_mode; mode changes go
+            # through update_thermostats with a Thermostat(settings=...) diff.
+            Thermostat = getattr(pyecobee, "Thermostat")
+            Settings   = getattr(pyecobee, "Settings")
+            svc.update_thermostats(
+                selection,
+                thermostat=Thermostat(settings=Settings(hvac_mode=mode)),
+            )
             applied["mode"] = mode
         except Exception as e:
             return {"error": f"ecobee set_hvac_mode failed: {e}",
@@ -272,10 +279,11 @@ def set_state(device: dict, **kwargs) -> dict:
     # Temperature hold — apply as a manual hold targeting both setpoints.
     if "temperature" in kwargs and kwargs["temperature"] is not None:
         target = int(kwargs["temperature"])
-        # Ecobee API uses tenths of a degree F.
-        tenths = target * 10
         try:
-            svc.set_hold(selection, cool_hold_temp=tenths, heat_hold_temp=tenths)
+            # pyecobee set_hold takes whole degrees F (validated 45-120) and
+            # selection must be passed by keyword — temps are positional-first.
+            svc.set_hold(cool_hold_temp=target, heat_hold_temp=target,
+                         selection=selection)
             applied["temperature"] = target
         except Exception as e:
             return {"error": f"ecobee set_hold failed: {e}", "partial": applied}

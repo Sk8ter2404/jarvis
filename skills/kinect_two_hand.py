@@ -757,6 +757,31 @@ def _foreground_target_rect() -> "tuple[object, Optional[Rect]]":
 _two_hand_overlay_was_active = [False]
 
 
+def _ensure_overlay_alive() -> None:
+    """Make sure the air-cursor overlay SUBPROCESS (hud/jarvis_air_cursor.py) is
+    actually running. The air-mouse's own poll keeps it alive, but ONLY while
+    KINECT_AIR_MOUSE_ENABLED is on — and two-hand is ON by default while the
+    air-mouse is OFF, so in the shipped config nobody would ever spawn the window
+    that draws our dual reticles. Reuse the air-mouse's _overlay_alive /
+    _spawn_overlay (single source of truth for the spawn contract); skip silently
+    if the module or helpers are missing, and NEVER spawn on the staging/test
+    instance (same gate the air-mouse respects). NEVER raises."""
+    try:
+        if _is_staging():
+            return
+        am = _air_mouse_mod()
+        if am is None:
+            return
+        alive = getattr(am, "_overlay_alive", None)
+        spawn = getattr(am, "_spawn_overlay", None)
+        if not callable(alive) or not callable(spawn):
+            return
+        if not alive():
+            spawn()
+    except Exception:
+        pass
+
+
 def _publish_two_hand_overlay(decision: "TwoHandDecision") -> None:
     """Publish the TWO hands' screen points + the resize state to the air-cursor
     overlay's state file so the HUD draws two reticle circles (BLUE while engaged,
@@ -922,8 +947,12 @@ def _poll_once(ctrl: "TwoHandController",
     if not decision.resizing:
         _grab_hwnd[0] = 0
 
-    # Publish the dual reticle (two circles; purple while resizing).
+    # Publish the dual reticle (two circles; purple while resizing) — and make
+    # sure the overlay process that DRAWS it exists: with the air-mouse disabled
+    # (the shipped default) nothing else would ever spawn it.
     _publish_two_hand_overlay(decision)
+    if decision.active:
+        _ensure_overlay_alive()
     return decision
 
 

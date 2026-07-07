@@ -1371,6 +1371,15 @@ def relaunch_jarvis(with_handoff: bool = False):
     ps_inline = (
         f"$env:ANTHROPIC_API_KEY = "
         f"[System.Environment]::GetEnvironmentVariable('ANTHROPIC_API_KEY', 'User'); "
+        # Bambu credentials follow the same durable-secret pattern: the setup
+        # wizard (skills/bambu_setup.py) writes them to HKCU\Environment, and
+        # the relaunch pulls them forward for core/config.py's os.getenv().
+        f"$env:BAMBU_PRINTER_IP = "
+        f"[System.Environment]::GetEnvironmentVariable('BAMBU_PRINTER_IP', 'User'); "
+        f"$env:BAMBU_ACCESS_CODE = "
+        f"[System.Environment]::GetEnvironmentVariable('BAMBU_ACCESS_CODE', 'User'); "
+        f"$env:BAMBU_SERIAL = "
+        f"[System.Environment]::GetEnvironmentVariable('BAMBU_SERIAL', 'User'); "
         f"$env:JARVIS_AMBIENT_LEARNING = '{_ambient}'; "
         f"$env:JARVIS_WAKE_RESUME = '{_wake_resume}'; "
         f"cd '{PROJECT_DIR}'; python bobert_companion.py{extra_args}"

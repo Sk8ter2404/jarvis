@@ -13,8 +13,8 @@ flow. Coverage:
   * _match_thermostat by identifier and by name (+ miss),
   * get_state's tenths→degrees translation (+ not-found / not-initialised /
     read exception),
-  * set_state's on/off→auto/off mapping, tenths scaling, and the
-    set_hvac_mode / set_hold failure partials,
+  * set_state's on/off→auto/off mapping (via update_thermostats), whole-degree
+    keyword-only set_hold call shape, and the mode / hold failure partials,
   * the two-step PIN flow: _do_request_pin guards + happy path, request_pin
     action, complete_setup (no lib / no key / no pending token / success /
     failure), the authorize alias, and the interactive wizard,
@@ -126,8 +126,18 @@ def _fake_pyecobee(service=None, omit_service=False):
         REGISTERED = types.SimpleNamespace(value="registered")
         THERMOSTATS = types.SimpleNamespace(value="thermostats")
 
+    class _Settings:
+        def __init__(self, **k):
+            self.kw = k
+
+    class _Thermostat:
+        def __init__(self, **k):
+            self.kw = k
+
     mod.Selection = _Selection
     mod.SelectionType = _SelType
+    mod.Settings = _Settings
+    mod.Thermostat = _Thermostat
     mod._captured = captured
     return mod
 
@@ -491,7 +501,10 @@ class EcobeeSetStateTests(_EcobeeBase):
         with c1, c2, c3:
             res = self.mod.set_state({"name": "Main"}, on=False)
         self.assertEqual(res["applied"]["mode"], "off")
-        svc.set_hvac_mode.assert_called_once()
+        svc.update_thermostats.assert_called_once()
+        _args, kwargs = svc.update_thermostats.call_args
+        self.assertEqual(kwargs["thermostat"].kw["settings"].kw["hvac_mode"],
+                         "off")
 
     def test_on_maps_mode_auto(self):
         svc = mock.Mock()
@@ -509,20 +522,24 @@ class EcobeeSetStateTests(_EcobeeBase):
             res = self.mod.set_state({"name": "Main"}, mode="cool")
         self.assertEqual(res["applied"]["mode"], "cool")
 
-    def test_temperature_uses_tenths(self):
+    def test_temperature_uses_whole_degrees_keyword_selection(self):
         svc = mock.Mock()
         thermo = _FakeThermostat(identifier="abc123")
         c1, c2, c3 = self._ctx(svc, thermo)
         with c1, c2, c3:
             res = self.mod.set_state({"name": "Main"}, temperature=72)
         self.assertEqual(res["applied"]["temperature"], 72)
-        _args, kwargs = svc.set_hold.call_args
-        self.assertEqual(kwargs.get("cool_hold_temp"), 720)
-        self.assertEqual(kwargs.get("heat_hold_temp"), 720)
+        args, kwargs = svc.set_hold.call_args
+        # pyecobee set_hold: temps are whole degrees F (NOT tenths) and
+        # selection MUST be a keyword — positional lands in cool_hold_temp.
+        self.assertEqual(args, ())
+        self.assertEqual(kwargs.get("cool_hold_temp"), 72)
+        self.assertEqual(kwargs.get("heat_hold_temp"), 72)
+        self.assertIn("selection", kwargs)
 
     def test_set_hvac_mode_failure_returns_partial(self):
         svc = mock.Mock()
-        svc.set_hvac_mode.side_effect = RuntimeError("mode rejected")
+        svc.update_thermostats.side_effect = RuntimeError("mode rejected")
         thermo = _FakeThermostat(identifier="abc123")
         c1, c2, c3 = self._ctx(svc, thermo)
         with c1, c2, c3:
