@@ -2134,6 +2134,30 @@ def _mouse_button(action: str, button: str = "left") -> bool:
 
 
 # ─── overlay state publishing + spawn ──────────────────────────────────────
+def _atomic_write_state(data: dict) -> None:
+    """Write AIR_CURSOR_STATE_FILE via a temp file + os.replace so the 60 Hz
+    overlay reader never catches a half-written (torn) frame mid-json.dump. The
+    reader already tolerates a JSONDecodeError, but the 30 Hz truncate-in-place
+    writer violated the project's atomic-write contract (used by _write_hud_state)
+    and produced torn frames the overlay silently dropped. 2026-07-07 bug-hunt.
+    NEVER raises — a failed publish just leaves the last good frame."""
+    import json
+    import tempfile
+    d = os.path.dirname(AIR_CURSOR_STATE_FILE) or "."
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".aircur_", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, AIR_CURSOR_STATE_FILE)
+    except Exception:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
+
 def _publish_overlay_state(decision: AirMouseDecision, visible: bool,
                            prime_xy: "Optional[tuple]" = None) -> None:
     """Write the live cursor + reticle state to AIR_CURSOR_STATE_FILE for the
@@ -2175,8 +2199,7 @@ def _publish_overlay_state(decision: AirMouseDecision, visible: bool,
             "prime": max(0.0, min(1.0, float(prime))),
             "ts": time.time(),
         }
-        with open(AIR_CURSOR_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f)
+        _atomic_write_state(data)
     except Exception:
         pass
 
@@ -2186,11 +2209,9 @@ def _clear_overlay_state() -> None:
     the hand is lost) so the reticle disappears promptly. prime 0 — nothing to
     prime while cleared."""
     try:
-        import json
-        with open(AIR_CURSOR_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"x": -10000, "y": -10000, "state": "hidden",
-                       "color": "cyan", "visible": False, "prime": 0.0,
-                       "ts": time.time()}, f)
+        _atomic_write_state({"x": -10000, "y": -10000, "state": "hidden",
+                             "color": "cyan", "visible": False, "prime": 0.0,
+                             "ts": time.time()})
     except Exception:
         pass
 

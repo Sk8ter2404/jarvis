@@ -42,8 +42,16 @@ PUBLIC API
 
 from __future__ import annotations
 
+import os
 import subprocess
 from typing import Optional
+
+# JARVIS runs as a DETACHED pythonw (no console), so any child that would spawn
+# a console flashes a window over the user's work. CREATE_NO_WINDOW keeps these
+# helper subprocesses invisible — the rest of the codebase (itunes_bridge et al.)
+# already passes it; these three sites were the un-flagged gap that flashed a
+# PowerShell/Explorer window on every Apple-Music launch (2026-07-07 bug-hunt).
+_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 # The known AppUserModelID for the Microsoft-Store Apple Music app on this
 # machine. `aumid()` returns this unless a dynamic Get-StartApps lookup
@@ -76,6 +84,7 @@ def _resolve_aumid_via_startapps() -> Optional[str]:
             capture_output=True,
             text=True,
             timeout=10,
+            creationflags=_NO_WINDOW,
         )
     except Exception:
         return None
@@ -145,6 +154,7 @@ def is_installed() -> bool:
             capture_output=True,
             text=True,
             timeout=10,
+            creationflags=_NO_WINDOW,
         )
     except Exception:
         return False
@@ -165,6 +175,7 @@ def launch() -> tuple[bool, Optional[str]]:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             close_fds=True,
+            creationflags=_NO_WINDOW,
         )
         return True, None
     except Exception as e:
