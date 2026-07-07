@@ -449,6 +449,22 @@ MID_TASK_STATUS_ENABLED = True
 MID_TASK_STATUS_DELAY   = 8.0      # seconds before the dry status line fires
 
 
+# ─── Focus mode / do-not-disturb (skills/focus_mode.py) ────────────────
+# FOCUS_MODE_ENABLED — makes the do-not-disturb "focus mode" FEATURE available
+#   (the voice actions focus_mode_on / focus_mode_off / whats_missed and the
+#   proactive_announce gate that holds unsolicited announcements while focused).
+#   The FEATURE being available does NOT mean the mode is engaged: focus mode
+#   always starts OFF at boot and is only turned on by an explicit command
+#   ("focus mode on", "do not disturb", "quiet mode"). This knob is a global
+#   kill-switch — set False and the gate in bobert_companion.proactive_announce
+#   short-circuits to a no-op (announcements are never held) so a bad focus
+#   state can never silence JARVIS. When focus mode is active, ONLY unsolicited
+#   proactive speech is held; wake-word + direct command responses (which call
+#   _speak, not proactive_announce) are never affected. Overridable via
+#   data/user_settings.json like every other flag.
+FOCUS_MODE_ENABLED = True
+
+
 # ─── Audio capture (VAD + sample rate) ─────────────────────────────────
 # 2026-05-30 [self-heal]: lowered 0.010 → 0.008 so VAD still trips after
 # AEC's duck gain (now 0.7) shaves the input by ~30% during JARVIS's own

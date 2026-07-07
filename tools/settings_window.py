@@ -402,6 +402,15 @@ SCHEMA: dict[str, dict] = {
         "help": "Say the wake word while JARVIS is talking to cut him off "
                 "and be heard. His own voice can never trigger it.",
     },
+    "FOCUS_MODE_ENABLED": {
+        "tab": "voice", "label": "Focus mode / do-not-disturb available",
+        "type": "bool", "default": True,
+        "help": "Let you say 'focus mode' / 'do not disturb' to hold "
+                "unsolicited announcements (print, weather, Teams, timers) "
+                "until you resume, then hear a recap of what you missed. "
+                "Wake-word and command replies always work. This only makes "
+                "the feature available — focus mode always starts OFF.",
+    },
     "AIR_CONTROL_ENABLED": {
         "tab": "ai", "label": "Air control auto-start (Kinect hand-mouse)",
         "type": "bool", "default": False,

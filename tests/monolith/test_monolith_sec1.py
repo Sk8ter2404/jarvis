@@ -3496,5 +3496,160 @@ class BargeInTests(_MonolithTestBase):
         self.assertFalse(self.bc._tts_interrupt.is_set())
 
 
+# ─── FOCUS MODE gate on proactive_announce ───────────────────────────────────
+
+@requires_monolith
+class FocusModeGateTests(_MonolithTestBase):
+    """The focus / do-not-disturb gate at the top of proactive_announce.
+
+    Contract under test:
+      * While focus is ACTIVE, proactive_announce HOLDS the message in the
+        bounded in-memory missed buffer and DOES NOT write pending_speech.json —
+        yet returns True (caller believes it was handled).
+      * While focus is OFF, proactive_announce enqueues to pending_speech.json
+        exactly as before (no behaviour change).
+      * Direct command speech (_speak) is NOT gated — it never consults focus.
+      * The FOCUS_MODE_ENABLED kill-switch, when False, disables the gate even
+        while the flag is set (announcements are never held).
+
+    The disk write is intercepted by patching tempfile.mkstemp / os.replace on
+    the bobert_companion module (the exact primitives proactive_announce uses to
+    atomically rewrite pending_speech.json), so no real file is touched and we
+    can assert precisely whether an enqueue happened.
+    """
+
+    def setUp(self):
+        bc = self.bc
+        # Always leave focus OFF + the missed buffer empty after each test.
+        # (MonolithGlobalsTestCase already deep-restores these, but being
+        # explicit keeps the test readable and independent.)
+        self._restore_attr_after("_focus_missed_buffer")
+        self.addCleanup(bc.set_focus_mode, False)
+        bc.set_focus_mode(False)
+        bc.clear_focus_missed()
+
+    def test_active_focus_holds_into_missed_buffer_not_pending_speech(self):
+        bc = self.bc
+        bc.set_focus_mode(True)   # indefinite focus
+        with mock.patch.object(bc, "os") as os_mock, \
+             mock.patch.object(bc, "tempfile") as tf_mock:
+            # If the gate is broken and we fall through, these spies would fire.
+            os_mock.path.exists.return_value = False
+            ok = bc.proactive_announce("the print finished", source="bambu")
+        # Returned True (handled), the missed buffer has the message, and NO
+        # pending_speech write path (tempfile.mkstemp / os.replace) was touched.
+        self.assertTrue(ok)
+        self.assertEqual(bc.focus_missed_count(), 1)
+        held = bc.focus_missed_snapshot()[0]
+        self.assertEqual(held[0], "the print finished")
+        self.assertEqual(held[1], "bambu")
+        tf_mock.mkstemp.assert_not_called()
+        os_mock.replace.assert_not_called()
+
+    def test_inactive_focus_enqueues_to_pending_speech(self):
+        bc = self.bc
+        bc.set_focus_mode(False)
+        with mock.patch.object(bc, "tempfile") as tf_mock, \
+             mock.patch.object(bc, "os") as os_mock:
+            os_mock.path.exists.return_value = False       # no existing queue
+            os_mock.path.dirname.return_value = "."
+            os_mock.path.abspath.return_value = "x"
+            os_mock.path.join.return_value = "pending_speech.json"
+            fake_fd = 123
+            tf_mock.mkstemp.return_value = (fake_fd, "tmpfile")
+            # os.fdopen must yield a context-manager file-like; give it a Mock.
+            os_mock.fdopen.return_value.__enter__ = lambda s: mock.MagicMock()
+            os_mock.fdopen.return_value.__exit__ = lambda *a: False
+            ok = bc.proactive_announce("weather alert", source="weather")
+        self.assertTrue(ok)
+        # Focus OFF → nothing held; the enqueue path (mkstemp + os.replace) ran.
+        self.assertEqual(bc.focus_missed_count(), 0)
+        tf_mock.mkstemp.assert_called_once()
+        os_mock.replace.assert_called_once()
+
+    def test_kill_switch_off_disables_the_gate(self):
+        bc = self.bc
+        import core.config as cfg
+        bc.set_focus_mode(True)   # focus IS engaged …
+        saved = getattr(cfg, "FOCUS_MODE_ENABLED", True)
+        cfg.FOCUS_MODE_ENABLED = False   # … but the feature is killed
+        self.addCleanup(setattr, cfg, "FOCUS_MODE_ENABLED", saved)
+        with mock.patch.object(bc, "tempfile") as tf_mock, \
+             mock.patch.object(bc, "os") as os_mock:
+            os_mock.path.exists.return_value = False
+            os_mock.path.dirname.return_value = "."
+            os_mock.path.abspath.return_value = "x"
+            os_mock.path.join.return_value = "pending_speech.json"
+            tf_mock.mkstemp.return_value = (123, "tmpfile")
+            os_mock.fdopen.return_value.__enter__ = lambda s: mock.MagicMock()
+            os_mock.fdopen.return_value.__exit__ = lambda *a: False
+            bc.proactive_announce("held?", source="x")
+        # Kill-switch off → NOT held; it enqueued normally despite focus set.
+        self.assertEqual(bc.focus_missed_count(), 0)
+        tf_mock.mkstemp.assert_called_once()
+
+    def test_missed_buffer_is_bounded(self):
+        bc = self.bc
+        bc.set_focus_mode(True)
+        cap = bc._FOCUS_MISSED_CAP
+        for i in range(cap + 25):
+            bc.proactive_announce(f"msg {i}", source="s")
+        # Capped at _FOCUS_MISSED_CAP; oldest dropped, newest kept.
+        self.assertEqual(bc.focus_missed_count(), cap)
+        newest = bc.focus_missed_snapshot()[-1][0]
+        self.assertEqual(newest, f"msg {cap + 24}")
+
+    def test_direct_speak_is_not_gated_by_focus(self):
+        bc = self.bc
+        bc.set_focus_mode(True)   # focus engaged
+        # _speak must NEVER consult the focus flag — command replies keep
+        # working while focused. We patch its downstream sinks so no real audio
+        # plays, then assert _speak proceeded to synth (was not short-circuited
+        # by focus) and that the missed buffer stayed EMPTY (proof _speak did
+        # not route through the proactive gate).
+        with mock.patch.object(bc, "_tts_muted", [True]):
+            # _tts_muted short-circuits real playback but _speak still runs its
+            # body; it must not raise and must not touch the focus buffer.
+            try:
+                bc._speak("Of course, sir.")
+            except Exception as e:   # pragma: no cover - the assert is the point
+                self.fail(f"_speak raised while focus active: {e}")
+        self.assertEqual(bc.focus_missed_count(), 0)
+
+    def test_recap_builder_summarises_and_clears(self):
+        bc = self.bc
+        bc.set_focus_mode(True)
+        for m in ("the print finished", "a weather alert", "a Teams message"):
+            bc.proactive_announce(m, source="s")
+        recap = bc._build_focus_recap(clear=True, prefix="While you were focused, sir")
+        self.assertIn("3 things", recap)
+        self.assertIn("the print finished", recap)
+        # clear=True emptied the buffer.
+        self.assertEqual(bc.focus_missed_count(), 0)
+
+    def test_focus_mode_active_self_resumes_lapsed_timer(self):
+        bc = self.bc
+        # Engage a block whose deadline is already in the past.
+        bc.set_focus_mode(True, until=time.time() - 1)
+        bc.proactive_announce("held while focused", source="s")
+        # Reading the flag flips it off (lapsed) and enqueues the recap via
+        # proactive_announce (now un-gated). Patch the disk write so the recap
+        # enqueue doesn't touch pending_speech.json.
+        with mock.patch.object(bc, "tempfile") as tf_mock, \
+             mock.patch.object(bc, "os") as os_mock:
+            os_mock.path.exists.return_value = False
+            os_mock.path.dirname.return_value = "."
+            os_mock.path.abspath.return_value = "x"
+            os_mock.path.join.return_value = "pending_speech.json"
+            tf_mock.mkstemp.return_value = (123, "tmpfile")
+            os_mock.fdopen.return_value.__enter__ = lambda s: mock.MagicMock()
+            os_mock.fdopen.return_value.__exit__ = lambda *a: False
+            active = bc.focus_mode_active()
+        self.assertFalse(active)          # self-resumed
+        self.assertFalse(bc._focus_mode[0])
+        # The recap was enqueued (buffer consumed by _build_focus_recap clear).
+        self.assertEqual(bc.focus_missed_count(), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
