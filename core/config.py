@@ -68,6 +68,17 @@ SKILLS_ENABLED = True
 # blocks the voice loop). Overridable via data/user_settings.json.
 LTM_ENABLED = True
 
+# ─── Streaming TTS (sentence-flush) ────────────────────────────────────
+# Speak the first complete, action-free sentence(s) of a Claude reply WHILE
+# the rest is still streaming, instead of waiting for the full completion —
+# the perceived-latency win core/llm_client.stream_text() was built for.
+# Conservative by design (see bobert_companion._SentenceFlushBuffer): early
+# speech hard-stops at the first '[' (possible [ACTION:]/tag marker), is
+# capped at 2 sentences, and the downstream speaker skips whatever was
+# already voiced. When False, the Claude turn uses the blocking complete()
+# exactly as before. Overridable via data/user_settings.json.
+STREAMING_TTS_ENABLED = True
+
 
 # ─── Safety: hard confirmation keywords ────────────────────────────────
 # Actions matching these always require spoken confirmation ("yes" or
