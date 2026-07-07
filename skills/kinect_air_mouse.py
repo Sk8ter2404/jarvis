@@ -1667,11 +1667,27 @@ class AirMouseController:
         # elapsed. Credit each held frame a slice of the dwell so both the
         # frame-count policy and the time policy agree; the larger wins.
         if not self._engaged and not relaxed:
-            self._engage_streak += 1
-            frame_credit = (self._dwell_sec
-                            * (self._engage_streak / self._engage_debounce_frames)
-                            if self._engage_debounce_frames > 0 else self._dwell_sec)
-            dwell_elapsed = max(dwell_elapsed, frame_credit)
+            # 2026-07-07 review (MED-HIGH): only count a frame toward the dwell
+            # when the PASSIVE POSE actually holds THIS frame (open palm + facing
+            # + still). Previously the streak incremented on ANY above-the-line
+            # frame, so a raised-but-INVALID pose (closed fist / looking away /
+            # moving) held for a second pre-charged the frame-credit, and the
+            # first SINGLE valid frame then engaged instantly with prime=0.00 —
+            # zero dwell, no ring — re-opening the exact false-trigger the
+            # smart-engage rewrite set out to kill. Gate the increment on real
+            # pose validity; reset the streak on an invalid frame so a fresh,
+            # genuinely-held open-palm pose must fill the dwell.
+            if _pose_ok_passive(lift_ok=True, grip=ctrl_stable,
+                                facing_deg=facing_deg, hand_still=hand_still,
+                                require_open_palm=self._require_open_palm,
+                                facing_max_deg=self._facing_max_deg):
+                self._engage_streak += 1
+                frame_credit = (self._dwell_sec
+                                * (self._engage_streak / self._engage_debounce_frames)
+                                if self._engage_debounce_frames > 0 else self._dwell_sec)
+                dwell_elapsed = max(dwell_elapsed, frame_credit)
+            else:
+                self._engage_streak = 0
 
         verdict = engage_decision(
             lift_ok=True, currently_engaged=self._engaged, armed=bool(armed),
