@@ -9458,6 +9458,31 @@ def synthesise(text: str) -> tuple[np.ndarray, int]:
             mood_tag = f" mood={_last_mood[0]}" if _last_mood[0] else ""
             print(f"  [tts] preset={chosen}{tone_tag}{mood_tag} rate={rate} pitch={pitch} gain={gain:.2f}")
 
+        # LOCAL VOICE-CLONE (Chatterbox) takes precedence over EVERY backend
+        # below when the owner has opted in (VOICE_CLONE_ENABLED) and selected a
+        # consented profile and core.voice_clone.is_available() agrees the
+        # package + model + CUDA are all present. It returns a FULL waveform per
+        # sentence (so streaming-TTS / barge-in, which call synthesise() once
+        # per sentence, are unaffected). ANY None/exception falls straight
+        # through to the existing edge-tts → pyttsx3 → SAPI5 ladder UNCHANGED —
+        # a missing dep, a no-GPU box, or an unselected/unconsented profile must
+        # never silence JARVIS. Read live each utterance so a 'switch to my
+        # voice' toggle applies immediately. Gate is defensive: a broken import
+        # of the wrapper itself is swallowed and we proceed to the ladder.
+        try:
+            if globals().get("VOICE_CLONE_ENABLED", False):
+                from core import voice_clone as _voice_clone
+                if _voice_clone.is_available():
+                    clone = _voice_clone.synthesize(text)
+                    if clone is not None:
+                        audio, sr = clone
+                        if gain != 1.0:
+                            audio = np.clip(audio * gain, -1.0, 1.0).astype(np.float32)
+                        return audio, sr
+        except Exception as e:
+            print(f"  [tts] voice-clone unavailable ({type(e).__name__}: {e}); "
+                  f"using the normal TTS ladder")
+
         # Voice-clone backend takes precedence when the user has opted in
         # via TTS_BACKEND='xtts'. Any failure (deps missing, sample WAV
         # unreadable, render crash) falls straight through to edge-tts so
@@ -15593,6 +15618,16 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     # GPU / VRAM usage readout (skills/gpu_usage.py, 2026-07) — one finished
     # spoken sentence summarising loaded models + VRAM against the card.
     "gpu_usage", "vram_status", "show_vram", "gpu_status", "whats_loaded",
+    # LOCAL VOICE-CLONE control (skills/voice_clone.py, Chatterbox) — each
+    # returns ONE finished sentence ("Switched to the 'jarvis' voice, sir." /
+    # the status line / "Voice cloning off, sir.") and never self-speaks, so
+    # the list/set/status/disable read-outs must voice here or the user never
+    # hears whether the switch took. The graceful "engine isn't ready" / "I
+    # won't use that profile" lines carry no FAILURE_MARKER by design — honest,
+    # complete answers, not errors. Aliases share the same handlers.
+    "list_voice_profiles", "set_voice_profile", "voice_clone_status",
+    "disable_voice_clone", "use_voice_profile", "switch_voice_profile",
+    "stop_voice_clone", "voice_clone_off",
     # AIR CONTROL — movie-style Kinect hand-mouse (skills/air_control.py,
     # 2026-07). Each returns ONE finished sentence ("Air control on, sir —
     # reach a hand out…" / "…already off, sir." / the status line) and never

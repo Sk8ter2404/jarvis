@@ -49,6 +49,7 @@ import unittest
 _BLOCK = {
     # ML / audio / vision
     "torch", "cv2", "sounddevice", "soundfile", "scipy", "noisereduce",
+    "chatterbox",   # optional local voice-clone engine (core/voice_clone.py)
     "chromadb", "sentence_transformers", "faster_whisper", "whisper",
     "pyaudio", "pyttsx3", "edge_tts", "webrtc_audio_processing", "mediapipe",
     "dlib", "face_recognition",

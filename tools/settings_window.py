@@ -278,6 +278,26 @@ SCHEMA: dict[str, dict] = {
         "choices": ["edge", "pyttsx3", "xtts"], "default": "edge",
         "help": "edge = online neural; pyttsx3 = offline SAPI; xtts = clone.",
     },
+    "VOICE_CLONE_ENABLED": {
+        "tab": "voice", "label": "Local voice clone (Chatterbox)", "type": "bool",
+        "default": False,
+        "help": "Speak replies in a CLONED voice (Chatterbox on the 3090). "
+                "Needs 'chatterbox-tts' installed + CUDA + a consented profile "
+                "selected below. Falls back to the normal voice if anything's "
+                "missing — never silences JARVIS. Off by default.",
+    },
+    "VOICE_CLONE_PROFILE": {
+        "tab": "voice", "label": "Active voice-clone profile", "type": "str",
+        "default": "",
+        "help": "Name of a profile under data/voice_profiles/ (enrolled via "
+                "tools/enroll_voice.py with consent). Empty = none selected. "
+                "Only a profile with consent=true is used.",
+    },
+    "VOICE_CLONE_MODEL": {
+        "tab": "voice", "label": "Voice-clone engine", "type": "enum",
+        "choices": ["chatterbox"], "default": "chatterbox",
+        "help": "Local voice-cloning engine. Currently only 'chatterbox'.",
+    },
     "AUDIO_PROCESSING_ENABLED": {
         "tab": "voice", "label": "Audio processing (master)", "type": "bool",
         "default": True,

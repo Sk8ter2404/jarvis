@@ -57,6 +57,10 @@ data/*.pickle
 data/*cookie*
 # Voiceprints — biometric data + the privilege grants keyed to them.
 data/voiceprints/
+# Voice-clone profiles — reference WAVs + meta.json for the local Chatterbox
+# TTS clone (core/voice_clone.py). Contains the owner's OWN consented voice
+# audio; biometric + personal, NEVER commit. tools/enroll_voice.py writes here.
+data/voice_profiles/
 # Long-term memory + fact stores — PII (names, email, employer, financial
 # references) that must never be committed. The live prompt already gets
 # these; a git commit would publish them.

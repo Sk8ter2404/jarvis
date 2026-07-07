@@ -14,8 +14,8 @@ Status: ☐ todo · ◐ in progress · ☑ done.
 ## Where it stands today
 
 ~101K-LOC local-first Windows voice assistant. `mic → Whisper → Claude emits
-[ACTION: …] → ~150 handlers → edge-TTS`. Public `v1.99.6` (all releases kept,
-`v1.0.0-beta.1` → `v1.99.6`); the self-upgrade pipeline's internal CHANGELOG
+[ACTION: …] → ~150 handlers → edge-TTS`. Public `v1.99.7` (all releases kept,
+`v1.0.0-beta.1` → `v1.99.7`); the self-upgrade pipeline's internal CHANGELOG
 counter (~v1.0.17) is a SEPARATE axis. **100% unit-test coverage,
 CI-green.** Genuinely strong: mature voice stack, cloud-optional (full local
 fallback on a 3090), dual-store memory + personal-files RAG, a rich proactive
