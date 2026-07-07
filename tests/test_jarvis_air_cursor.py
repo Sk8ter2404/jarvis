@@ -367,6 +367,12 @@ class TwoHandRefreshStateTests(unittest.TestCase):
         ov.two_hand = False
         ov.two_resizing = False
         ov.hand_pts = None
+        # Priming-ring fields (added with the passive engage-dwell ring): the
+        # single/two-hand reader now parses `prime` and tracks these each frame.
+        ov.prime = 0.0
+        ov._prime_flash = 0
+        ov._was_priming = False
+        ov.priming_active = False
         return ov
 
     def test_two_hand_frame_sets_render_fields(self):
@@ -476,6 +482,273 @@ class ParentAliveRecycleTests(unittest.TestCase):
     def test_nonpositive_pid_is_always_alive(self):
         self.assertTrue(self.mod._is_parent_alive(0, 1234.5))
         self.assertTrue(self.mod._is_parent_alive(-1))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  PRIMING RING (passive engage-dwell): the air-mouse publishes a `prime` float
+#  in [0,1] while the owner HOLDS the engage pose before the cursor engages. The
+#  overlay draws a ring that FILLS 0→360° as prime rises 0→1, so the owner SEES
+#  the air-mouse "charge up" to take control. `prime` may be ABSENT on older /
+#  other writers → missing/garbage MUST read as 0.0 (no ring). Both the parse and
+#  the ring-geometry decision are PURE, so they're tested with no Tk root.
+# ══════════════════════════════════════════════════════════════════════════
+class ParsePrimeTests(unittest.TestCase):
+    """`_parse_prime` extracts + clamps the engage-dwell progress. A missing OR
+    garbage OR out-of-range value reads as 0.0 (no ring); a valid value clamps to
+    [0,1]. Tolerant of every ill-formed writer the contract permits."""
+
+    def setUp(self):
+        self.mod = _load_air_cursor(self)
+
+    def test_missing_prime_is_zero(self):
+        # The key is ABSENT on older / other writers → 0.0 (no ring), today's
+        # behaviour unchanged.
+        self.assertEqual(self.mod._parse_prime({}), 0.0)
+        self.assertEqual(self.mod._parse_prime({"x": 1, "y": 2}), 0.0)
+
+    def test_valid_prime_passes_through(self):
+        self.assertEqual(self.mod._parse_prime({"prime": 0.0}), 0.0)
+        self.assertEqual(self.mod._parse_prime({"prime": 0.5}), 0.5)
+        self.assertEqual(self.mod._parse_prime({"prime": 1.0}), 1.0)
+        # An int is accepted and coerced to float.
+        self.assertEqual(self.mod._parse_prime({"prime": 1}), 1.0)
+
+    def test_over_one_clamps_to_one(self):
+        self.assertEqual(self.mod._parse_prime({"prime": 1.7}), 1.0)
+        self.assertEqual(self.mod._parse_prime({"prime": 999}), 1.0)
+
+    def test_below_zero_clamps_to_zero(self):
+        self.assertEqual(self.mod._parse_prime({"prime": -0.3}), 0.0)
+        self.assertEqual(self.mod._parse_prime({"prime": -50}), 0.0)
+
+    def test_garbage_prime_is_zero(self):
+        # Unparseable → 0.0 (no ring), never an exception out of the reader.
+        self.assertEqual(self.mod._parse_prime({"prime": "nope"}), 0.0)
+        self.assertEqual(self.mod._parse_prime({"prime": None}), 0.0)
+        self.assertEqual(self.mod._parse_prime({"prime": [0.5]}), 0.0)
+        self.assertEqual(self.mod._parse_prime({"prime": {"v": 1}}), 0.0)
+
+    def test_nan_prime_is_zero(self):
+        # float("nan") parses but is never a real progress value → 0.0.
+        self.assertEqual(self.mod._parse_prime({"prime": float("nan")}), 0.0)
+
+    def test_result_always_in_unit_interval(self):
+        for raw in (-5, -0.001, 0, 0.01, 0.5, 0.999, 1, 1.0001, 42, "x", None):
+            p = self.mod._parse_prime({"prime": raw})
+            self.assertGreaterEqual(p, 0.0)
+            self.assertLessEqual(p, 1.0)
+
+
+class PrimingRingExtentTests(unittest.TestCase):
+    """`_priming_ring_extent` is the PURE ring-geometry helper: it decides whether
+    a ring is drawn this tick and, if so, the arc sweep in degrees. A ring appears
+    ONLY while mid-hold (0<prime<1), visible, and not yet engaged; otherwise no
+    ring. The extent grows linearly (prime*360) so the arc fills as the hold
+    progresses."""
+
+    def setUp(self):
+        self.mod = _load_air_cursor(self)
+
+    def test_draws_partial_arc_mid_hold(self):
+        # 0 < prime < 1 while visible & pre-engage → draw a prime*360° arc.
+        draw, ext = self.mod._priming_ring_extent(0.5, True, "hidden")
+        self.assertTrue(draw)
+        self.assertAlmostEqual(ext, 180.0)
+        draw, ext = self.mod._priming_ring_extent(0.25, True, "hidden")
+        self.assertTrue(draw)
+        self.assertAlmostEqual(ext, 90.0)
+
+    def test_extent_scales_linearly_with_prime(self):
+        # A larger prime → a larger sweep (monotone), always < a full turn.
+        _, e_small = self.mod._priming_ring_extent(0.1, True, "hidden")
+        _, e_big = self.mod._priming_ring_extent(0.9, True, "hidden")
+        self.assertLess(e_small, e_big)
+        self.assertAlmostEqual(e_small, 36.0)
+        self.assertLess(e_big, 360.0)
+
+    def test_no_ring_at_prime_zero(self):
+        # prime == 0.0 → idle → no ring (today's behaviour unchanged).
+        self.assertEqual(self.mod._priming_ring_extent(0.0, True, "hidden"),
+                         (False, 0.0))
+
+    def test_no_ring_at_prime_full(self):
+        # prime ≈ 1.0 / ≥1 → engaged / handed off → the ring completes & vanishes.
+        self.assertEqual(self.mod._priming_ring_extent(1.0, True, "hidden"),
+                         (False, 0.0))
+        self.assertEqual(self.mod._priming_ring_extent(1.5, True, "hidden"),
+                         (False, 0.0))
+
+    def test_no_ring_when_hidden(self):
+        # Respect the existing visible/hidden logic — never a ring when hidden.
+        self.assertEqual(self.mod._priming_ring_extent(0.5, False, "hidden"),
+                         (False, 0.0))
+
+    def test_no_ring_when_already_engaged(self):
+        # Once the cursor has engaged (track/grab) the ring is gone even if a
+        # writer leaves a stale prime>0 in the frame.
+        self.assertEqual(self.mod._priming_ring_extent(0.5, True, "track"),
+                         (False, 0.0))
+        self.assertEqual(self.mod._priming_ring_extent(0.5, True, "grab"),
+                         (False, 0.0))
+
+    def test_returns_should_draw_and_extent_pair(self):
+        # The contract shape: (bool should_draw, float extent_deg).
+        out = self.mod._priming_ring_extent(0.5, True, "hidden")
+        self.assertIsInstance(out, tuple)
+        self.assertEqual(len(out), 2)
+        self.assertIsInstance(out[0], bool)
+        self.assertIsInstance(out[1], float)
+
+
+class PrimingRefreshStateTests(unittest.TestCase):
+    """`_refresh_state` parses `prime` from the published frame into `self.prime`
+    and sets `priming_active` (mid-hold, pre-engage) — the flag that lets the ring
+    show while the engaged reticle's `visible` is still False. Tk-free (the reader
+    touches no window)."""
+
+    def setUp(self):
+        self.mod = _load_air_cursor(self)
+
+    def _ov(self):
+        import time as _t
+        ov = object.__new__(self.mod.AirCursorOverlay)
+        ov.parent_pid = 12345
+        ov.parent_start = None
+        ov._started_at = _t.time()
+        ov._last_state_ts = 0.0
+        ov._prev_visible = False
+        ov._was_grab = False
+        ov._grab_flash = 0
+        ov.cur_x = ov.cur_y = None
+        ov.target_x = ov.target_y = None
+        ov.trail = []
+        ov.two_hand = False
+        ov.two_resizing = False
+        ov.hand_pts = None
+        ov.prime = 0.0
+        ov._prime_flash = 0
+        ov._was_priming = False
+        ov.priming_active = False
+        return ov
+
+    def _refresh_with(self, ov, frame):
+        with mock.patch.object(self.mod, "_is_parent_alive", lambda pid, *a: True), \
+             mock.patch.object(self.mod, "_read_state", lambda: frame):
+            return ov._refresh_state()
+
+    def test_prime_parsed_into_field(self):
+        import time as _t
+        ov = self._ov()
+        # A pre-engage hold: not visible / not engaged yet, but prime is rising.
+        frame = {"visible": False, "state": "hidden", "prime": 0.4,
+                 "x": 400, "y": 300, "ts": _t.time()}
+        self.assertTrue(self._refresh_with(ov, frame))
+        self.assertAlmostEqual(ov.prime, 0.4)
+        self.assertTrue(ov.priming_active)
+
+    def test_missing_prime_defaults_zero_no_priming(self):
+        import time as _t
+        ov = self._ov()
+        frame = {"visible": True, "state": "track", "x": 5, "y": 5,
+                 "ts": _t.time()}   # no `prime` key at all
+        self.assertTrue(self._refresh_with(ov, frame))
+        self.assertEqual(ov.prime, 0.0)
+        self.assertFalse(ov.priming_active)
+
+    def test_garbage_prime_defaults_zero(self):
+        import time as _t
+        ov = self._ov()
+        frame = {"visible": False, "state": "hidden", "prime": "junk",
+                 "x": 1, "y": 1, "ts": _t.time()}
+        self.assertTrue(self._refresh_with(ov, frame))
+        self.assertEqual(ov.prime, 0.0)
+        self.assertFalse(ov.priming_active)
+
+    def test_engaged_frame_has_no_priming(self):
+        # Already engaged (track) → priming_active is False even if a stale prime
+        # rides along; the pure gate would suppress the ring regardless.
+        import time as _t
+        ov = self._ov()
+        frame = {"visible": True, "state": "track", "prime": 0.5,
+                 "x": 10, "y": 10, "ts": _t.time()}
+        self.assertTrue(self._refresh_with(ov, frame))
+        self.assertFalse(ov.priming_active)
+
+    def test_priming_positions_window_target(self):
+        # While priming (pre-engage) the window still needs a target so it can be
+        # placed at the cursor — the reader sets target/cur from x,y.
+        import time as _t
+        ov = self._ov()
+        frame = {"visible": False, "state": "hidden", "prime": 0.6,
+                 "x": 777, "y": 888, "ts": _t.time()}
+        self.assertTrue(self._refresh_with(ov, frame))
+        self.assertEqual(ov.target_x, 777)
+        self.assertEqual(ov.target_y, 888)
+
+    def test_completion_latches_prime_flash(self):
+        # Mid-hold one frame, then prime hits full the next → a brief completion
+        # flash is latched so the hand-off to the reticle "pops".
+        import time as _t
+        ov = self._ov()
+        self._refresh_with(ov, {"visible": False, "state": "hidden",
+                                "prime": 0.9, "x": 1, "y": 1, "ts": _t.time()})
+        self.assertTrue(ov._was_priming)
+        self.assertEqual(ov._prime_flash, 0)
+        self._refresh_with(ov, {"visible": True, "state": "track",
+                                "prime": 1.0, "x": 1, "y": 1, "ts": _t.time()})
+        self.assertGreater(ov._prime_flash, 0)
+
+
+class PrimingDrawGuardTests(unittest.TestCase):
+    """`_draw_priming_ring` renders the arc into the canvas via create_arc (the
+    same primitive the rotating arc segments use) and NEVER raises out of the
+    paint loop. Tk is mocked so this runs headless."""
+
+    def setUp(self):
+        self.mod = _load_air_cursor(self)
+
+    def _ov(self, *, prime, visible, state, priming_active=None):
+        ov = object.__new__(self.mod.AirCursorOverlay)
+        ov.prime = prime
+        ov.visible = visible
+        ov.state = state
+        # During the pre-engage hold the engaged `visible` is False but the ring
+        # shows via `priming_active`; default it to "mid-hold, pre-engage" so the
+        # helper's `shown` (priming_active OR visible) is truthy for the draw path.
+        ov.priming_active = (priming_active if priming_active is not None
+                             else (not visible))
+        ov.canvas = mock.MagicMock(name="canvas")
+        return ov
+
+    def test_draws_arc_when_mid_hold(self):
+        ov = self._ov(prime=0.5, visible=False, state="hidden")
+        ov._draw_priming_ring(self.mod.WINDOW_HALF, self.mod.WINDOW_HALF)
+        # An arc primitive was used for the filling ring.
+        self.assertTrue(ov.canvas.create_arc.called,
+                        "priming ring must be drawn with create_arc")
+        # The arc extent magnitude equals prime*360 (sign encodes sweep dir).
+        _a, kw = ov.canvas.create_arc.call_args
+        self.assertAlmostEqual(abs(kw["extent"]), 180.0)
+
+    def test_no_draw_at_prime_zero(self):
+        ov = self._ov(prime=0.0, visible=False, state="hidden")
+        ov._draw_priming_ring(self.mod.WINDOW_HALF, self.mod.WINDOW_HALF)
+        self.assertFalse(ov.canvas.create_arc.called)
+
+    def test_no_draw_when_engaged(self):
+        ov = self._ov(prime=0.5, visible=True, state="track")
+        ov._draw_priming_ring(self.mod.WINDOW_HALF, self.mod.WINDOW_HALF)
+        self.assertFalse(ov.canvas.create_arc.called)
+
+    def test_never_raises_on_bad_canvas(self):
+        # A canvas that throws on every draw must NOT bubble out of the paint loop.
+        ov = self._ov(prime=0.5, visible=False, state="hidden")
+        ov.canvas.create_oval.side_effect = RuntimeError("boom")
+        ov.canvas.create_arc.side_effect = RuntimeError("boom")
+        try:
+            ov._draw_priming_ring(self.mod.WINDOW_HALF, self.mod.WINDOW_HALF)
+        except Exception as exc:  # pragma: no cover - the guard failed
+            self.fail(f"_draw_priming_ring raised out of the paint loop: {exc!r}")
 
 
 if __name__ == "__main__":

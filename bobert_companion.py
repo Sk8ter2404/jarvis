@@ -15635,6 +15635,18 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     # logged. The graceful "Kinect isn't available, sir — …" phrasings carry
     # no FAILURE_MARKER by design — honest, complete answers, not errors.
     "air_control_on", "air_control_off", "air_control_status",
+    # AIR-MOUSE ARM / DISARM (skills/kinect_air_mouse.py, 2026-07 smart-engage) —
+    # the hybrid voice-arm mode. Each returns ONE finished sentence ("Mouse control
+    # armed, sir — …" / "Mouse control released, sir — …") and never self-speaks,
+    # so the verdict must voice here or the owner never hears whether it armed. The
+    # graceful "Note the Kinect is off — …" phrasing carries no FAILURE_MARKER by
+    # design (an honest note, not an error). Canonical names + their aliases (all
+    # share the same handler). Deliberately NOT in INFORMATIVE_ACTIONS (kept
+    # DISJOINT — INFORMATIVE fires a follow-up LLM turn instead of speaking the
+    # result verbatim).
+    "air_mouse_arm", "air_mouse_disarm",
+    "mouse_control_on", "take_the_cursor", "give_me_the_cursor", "hand_mouse_on",
+    "mouse_control_off", "release_the_cursor", "hand_mouse_off",
     # LIVE WEB INTERFACE — local-LAN dashboard + text command channel
     # (skills/web_interface.py, engine tools/web_interface.py, 2026-07). Each
     # returns ONE finished sentence: web_interface_on -> "Web interface online,
