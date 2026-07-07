@@ -27,6 +27,12 @@ Coverage:
     (None with no log, a float derived from the log's first timestamp otherwise);
     ``air_mouse`` is present ONLY when the skill module is loaded in-process
     (simulated via sys.modules) and OMITTED otherwise.
+  • SETTINGS CONTROL PANEL (web-settings-panel): GET /api/settings returns the
+    schema + current values (WAKE_WORD_AUTOSTART present with a value); POST a
+    bool + an enum persists to the TEMP user_settings.json (preserving other keys)
+    and round-trips; an unknown key or a bad enum value → 400; a settings write
+    requires the token when one is set (401 without); and the dashboard HTML
+    carries the Settings section + the prominent wake-word control.
 
 stdlib unittest + urllib only; no pytest, no third-party HTTP client.
 """
@@ -118,11 +124,18 @@ class _ServerBase(unittest.TestCase):
         self.inject_path = os.path.join(self.d, "injected_commands.json")
         self.log_dir = os.path.join(self.d, "logs")
         self.hud_path = os.path.join(self.d, "hud_state.json")
+        # POST /api/settings writes here — a THROWAWAY file so a settings write in
+        # a test can NEVER touch the real data/user_settings.json (the same safety
+        # contract as inject_path/log_dir/hud_state_path). It doesn't exist yet;
+        # _write_settings creates it on first write.
+        self.user_settings_path = os.path.join(self.d, "user_settings.json")
         os.makedirs(self.log_dir, exist_ok=True)
         self.httpd = wi.create_server(
             bind="127.0.0.1", port=0, token=self.token,
             inject_path=self.inject_path, log_dir=self.log_dir,
-            hud_state_path=self.hud_path, reply_reader=self.reply_reader,
+            hud_state_path=self.hud_path,
+            user_settings_path=self.user_settings_path,
+            reply_reader=self.reply_reader,
         )
         self.host, self.port = self.httpd.server_address[:2]
         self.base = f"http://127.0.0.1:{self.port}"
@@ -253,6 +266,197 @@ class SayInjectTests(_ServerBase):
         with open(self.inject_path, encoding="utf-8") as f:
             items = json.load(f)
         self.assertEqual(items[-1]["text"], "mouse control on")
+
+
+class SettingsEndpointTests(_ServerBase):
+    """The FULL settings control panel: GET the schema+values, POST changes that
+    persist to the temp user_settings.json and round-trip on the next GET, and the
+    validation 400s (unknown key / bad enum)."""
+
+    def test_get_returns_schema_with_wake_word_value(self):
+        # GET /api/settings serves every persisted knob with its current value.
+        # Assert a KNOWN key (WAKE_WORD_AUTOSTART — the wake-word toggle) is present
+        # with a value + type, and that the payload is grouped-able by tab.
+        code, data = _get(self.base + "/api/settings")
+        self.assertEqual(code, 200)
+        self.assertIn("settings", data)
+        self.assertIn("tabs", data)
+        self.assertIn("note", data)
+        by_name = {it["name"]: it for it in data["settings"]}
+        self.assertIn("WAKE_WORD_AUTOSTART", by_name)
+        wake = by_name["WAKE_WORD_AUTOSTART"]
+        self.assertEqual(wake["type"], "bool")
+        self.assertIn("value", wake)          # current effective value present
+        self.assertIn("default", wake)
+        self.assertEqual(wake["tab"], "voice")
+        # The Alexa-style wake-word-mode knob the banner switch drives is also here.
+        self.assertIn("START_IN_STANDBY", by_name)
+        # Read-only integration STATUS rows must NOT leak into a write panel.
+        self.assertFalse(any(n.startswith("_") for n in by_name))
+
+    def test_post_bool_persists_and_reflects_on_next_get(self):
+        # POST a bool (the wake-word toggle) → it lands in the temp file AND the
+        # next GET reports the new value.
+        code, data = _post(self.base + "/api/settings",
+                           {"name": "WAKE_WORD_AUTOSTART", "value": True})
+        self.assertEqual(code, 200)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["applied"]["WAKE_WORD_AUTOSTART"], True)
+        self.assertIn("note", data)           # the honest restart caveat
+        # Persisted to the (temp) file in the exact key the config reader expects.
+        with open(self.user_settings_path, encoding="utf-8") as f:
+            saved = json.load(f)
+        self.assertIs(saved["WAKE_WORD_AUTOSTART"], True)
+        # The next GET still serves the knob (the endpoint reads live each call).
+        # Its ``value`` comes from core.config (import-time) so it may lag the file
+        # until a restart — the FILE is the durable record, already asserted above —
+        # but the key must remain present + JSON-valid on every GET.
+        code, data = _get(self.base + "/api/settings")
+        self.assertEqual(code, 200)
+        by_name = {it["name"]: it for it in data["settings"]}
+        self.assertIn("WAKE_WORD_AUTOSTART", by_name)
+        # And the file round-trips a SECOND write too (toggle back off).
+        _post(self.base + "/api/settings",
+              {"name": "WAKE_WORD_AUTOSTART", "value": False})
+        with open(self.user_settings_path, encoding="utf-8") as f:
+            self.assertIs(json.load(f)["WAKE_WORD_AUTOSTART"], False)
+
+    def test_post_enum_persists(self):
+        # An enum value in-choices persists coerced.
+        code, data = _post(self.base + "/api/settings",
+                           {"name": "TTS_BACKEND", "value": "pyttsx3"})
+        self.assertEqual(code, 200)
+        self.assertTrue(data["ok"])
+        with open(self.user_settings_path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["TTS_BACKEND"], "pyttsx3")
+
+    def test_post_batch_settings_form(self):
+        # The {settings: {name: value, ...}} batch form applies all at once.
+        code, data = _post(self.base + "/api/settings",
+                           {"settings": {"WAKE_WORD_AUTOSTART": True,
+                                         "START_IN_STANDBY": True}})
+        self.assertEqual(code, 200)
+        self.assertEqual(set(data["applied"]),
+                         {"WAKE_WORD_AUTOSTART", "START_IN_STANDBY"})
+        with open(self.user_settings_path, encoding="utf-8") as f:
+            saved = json.load(f)
+        self.assertIs(saved["WAKE_WORD_AUTOSTART"], True)
+        self.assertIs(saved["START_IN_STANDBY"], True)
+
+    def test_post_preserves_other_keys(self):
+        # A pre-existing unrelated key in the file survives a targeted merge.
+        with open(self.user_settings_path, "w", encoding="utf-8") as f:
+            json.dump({"SOME_FUTURE_KEY": "keepme"}, f)
+        _post(self.base + "/api/settings",
+              {"name": "WAKE_WORD_AUTOSTART", "value": True})
+        with open(self.user_settings_path, encoding="utf-8") as f:
+            saved = json.load(f)
+        self.assertEqual(saved["SOME_FUTURE_KEY"], "keepme")   # untouched
+        self.assertIs(saved["WAKE_WORD_AUTOSTART"], True)
+
+    def test_post_unknown_key_400(self):
+        code, data = _post(self.base + "/api/settings",
+                           {"name": "NOT_A_REAL_KEY", "value": 1})
+        self.assertEqual(code, 400)
+        self.assertIn("unknown", data["error"].lower())
+
+    def test_post_bad_enum_value_400(self):
+        code, data = _post(self.base + "/api/settings",
+                           {"name": "TTS_BACKEND", "value": "definitely-not-a-backend"})
+        self.assertEqual(code, 400)
+        self.assertIn("not one of", data["error"].lower())
+        # A rejected write must NOT create/alter the file.
+        self.assertFalse(os.path.exists(self.user_settings_path))
+
+    def test_post_empty_body_400(self):
+        code, data = _post(self.base + "/api/settings", {})
+        self.assertEqual(code, 400)
+
+    def test_dashboard_has_settings_section_and_wake_control(self):
+        # The page must carry the Settings view markup + the prominent wake-word
+        # control so a broken f-string / renamed element is caught.
+        code, body = _get_raw(self.base + "/")
+        self.assertEqual(code, 200)
+        self.assertIn("viewSettings", body)          # the settings section
+        self.assertIn("navSettings", body)           # the nav toggle
+        self.assertIn('id="wakeToggle"', body)       # the prominent wake-word switch
+        self.assertIn("Wake-word mode", body)        # its label
+        self.assertIn("/api/settings", body)         # the page calls the endpoint
+        self.assertIn("START_IN_STANDBY", body)      # the knob the banner drives
+
+
+class SettingsTokenTests(_ServerBase):
+    """A settings write is POWERFUL, so it MUST require the token when one is set
+    (401 without it) — same auth contract as /api/say."""
+
+    token = "s3cr3t"
+
+    def test_get_settings_without_token_401(self):
+        code, _ = _get_raw(self.base + "/api/settings")
+        self.assertEqual(code, 401)
+
+    def test_post_settings_without_token_401(self):
+        code, _ = _post(self.base + "/api/settings",
+                        {"name": "WAKE_WORD_AUTOSTART", "value": True})
+        self.assertEqual(code, 401)
+        # And the write never happened.
+        self.assertFalse(os.path.exists(self.user_settings_path))
+
+    def test_post_settings_with_token_ok(self):
+        code, data = _post(self.base + "/api/settings",
+                           {"name": "WAKE_WORD_AUTOSTART", "value": True},
+                           headers={"X-Auth-Token": self.token})
+        self.assertEqual(code, 200)
+        self.assertTrue(data["ok"])
+        with open(self.user_settings_path, encoding="utf-8") as f:
+            self.assertIs(json.load(f)["WAKE_WORD_AUTOSTART"], True)
+
+
+class SettingsWriteHelperTests(unittest.TestCase):
+    """Unit-level: _write_settings merges + validates without a live server."""
+
+    def test_merge_preserves_and_validates(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "user_settings.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"KEEP": 1}, f)
+            applied = wi._write_settings({"WAKE_WORD_AUTOSTART": "yes"}, p)
+            # coerce_value maps "yes" → True for a bool knob.
+            self.assertIs(applied["WAKE_WORD_AUTOSTART"], True)
+            with open(p, encoding="utf-8") as f:
+                saved = json.load(f)
+            self.assertEqual(saved["KEEP"], 1)
+            self.assertIs(saved["WAKE_WORD_AUTOSTART"], True)
+
+    def test_unknown_key_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "user_settings.json")
+            with self.assertRaises(wi.SettingsWriteError):
+                wi._write_settings({"NOPE": 1}, p)
+            # No file created on a rejected write.
+            self.assertFalse(os.path.exists(p))
+
+    def test_secret_knob_value_is_redacted_in_get_payload(self):
+        # A configured web token must NEVER be echoed back in the settings
+        # snapshot — the row is present (so the owner can SET one) but its value
+        # is redacted to "" with secret/is_set flags. Patch _config_value so the
+        # "live" token is a known secret, then prove it does not appear anywhere.
+        orig = wi._config_value
+        wi._config_value = (lambda key, default:
+                            "REDACT-ME-TOKEN-123"
+                            if key == "WEB_INTERFACE_TOKEN" else orig(key, default))
+        try:
+            payload = wi.build_settings_schema()
+        finally:
+            wi._config_value = orig
+        by_name = {it["name"]: it for it in payload["settings"]}
+        self.assertIn("WEB_INTERFACE_TOKEN", by_name)
+        row = by_name["WEB_INTERFACE_TOKEN"]
+        self.assertEqual(row["value"], "")          # never the real token
+        self.assertTrue(row.get("secret"))
+        self.assertTrue(row.get("is_set"))          # but "a value is set" is known
+        # The secret does not leak into ANY field of ANY row.
+        self.assertNotIn("REDACT-ME-TOKEN-123", json.dumps(payload))
 
 
 class InjectHelperTests(unittest.TestCase):

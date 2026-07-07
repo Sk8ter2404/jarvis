@@ -439,13 +439,271 @@ def wait_for_reply(text: str, log_dir: str, timeout: float) -> dict:
     return {"status": "ok" if lines else "accepted", "lines": lines}
 
 
+# ── settings bridge (the FULL settings control panel) ───────────────────────
+#
+# WHY THIS EXISTS
+# ===============
+# The owner wants to "do it all from the web interface" — every user-facing
+# config knob, including the wake-word mode toggle. Rather than re-declare those
+# knobs here (they'd drift from the real config), we treat tools/settings_window's
+# ``SCHEMA`` as the SINGLE SOURCE OF TRUTH: it already enumerates every
+# user-facing knob keyed by name → {tab, label, type, default, help, choices}.
+# We import it, render every persisted key, READ the CURRENT effective value from
+# ``core.config`` (the constants _apply_user_settings() overrode at import), and
+# WRITE changes back to data/user_settings.json (the same file the Settings GUI
+# and _apply_user_settings() share).
+#
+# DEPENDENCY-LIGHT / GRACEFUL, like the rest of this module
+# ========================================================
+# Both imports are LAZY (inside the functions) and TOLERANT: a bare-CI import of
+# web_interface never needs settings_window or core.config, and if either can't
+# load we degrade (empty schema / schema-default value) instead of raising into a
+# request handler — mirroring how _read_version / _gpu_summary already probe
+# core.* lazily. settings_window's schema half is stdlib-only (the tkinter GUI is
+# below its "# ── GUI ──" divider and imported lazily there), so importing it for
+# SCHEMA/coerce_value costs nothing on a headless box.
+
+
+def _load_settings_schema():
+    """Import tools.settings_window and return ``(SCHEMA, coerce_value)``, or
+    ``({}, None)`` if it can't load. Lazy + tolerant: importing web_interface must
+    not require settings_window, and a broken/absent schema degrades to an empty
+    panel rather than breaking every request. Never raises."""
+    try:
+        from tools import settings_window as sw
+        return sw.SCHEMA, sw.coerce_value
+    except Exception:
+        return {}, None
+
+
+def _config_value(key: str, default):
+    """The CURRENT effective value of a config constant, read LIVE from
+    ``core.config`` (the value _apply_user_settings() left after merging
+    user_settings.json over the module defaults at import). Falls back to the
+    schema ``default`` when core.config can't be imported (bare CI) or the
+    constant is absent. Lazy import so a headless web process never drags the
+    monolith's config in unless a settings request actually asks for it.
+
+    NOTE: core.config is imported ONCE and then cached in sys.modules, so its
+    constants reflect the values as of THAT import — which is boot time in a live
+    JARVIS. A settings write does NOT mutate the running process's constants (see
+    the restart caveat in _write_settings), so what we report here is the
+    effective value the CURRENTLY-RUNNING loop is using, which is exactly the
+    truthful thing to show."""
+    try:
+        from core import config as _config
+        return getattr(_config, key, default)
+    except Exception:
+        return default
+
+
+# Knobs whose VALUE is a secret. We render a row for them (so the owner can SET
+# one from the panel) but we NEVER echo the current value back in the GET payload
+# — the settings snapshot returns "" + secret/is_set flags instead of the live
+# token. Reading /api/settings is already token-gated, so this isn't the only
+# barrier, but echoing a live secret into a visible text field (shoulder-surfing,
+# an accidental screen-share, a proxy log) is a footgun with no upside. The write
+# path is unaffected: a POST can still set a new token.
+_SECRET_SETTING_KEYS = frozenset({"WEB_INTERFACE_TOKEN"})
+
+
+def build_settings_schema() -> dict:
+    """Assemble the /api/settings GET payload: every PERSISTED schema knob with
+    its current effective value. Shape::
+
+        {"settings": [ {name, tab, label, type, choices, help, value, default,
+                        secret?, is_set?}, ... ],
+         "tabs": ["voice","ai","privacy","integrations","advanced"],
+         "note": "…applies on restart…"}
+
+    Read LIVE each call (no caching) so the panel always reflects the file/loop
+    state. Status-only rows (keys starting with "_status_", type "status") are
+    SKIPPED — they expose integration presence in the GUI but carry no persisted
+    value and (deliberately) never surface a secret, so they have no place in a
+    write-capable web panel. SECRET knobs (``_SECRET_SETTING_KEYS``) are rendered
+    but their value is REDACTED to "" (with ``secret: True`` and ``is_set``) so
+    the live token never leaves the process. Never raises: an unloadable schema
+    yields an empty list."""
+    schema, _coerce = _load_settings_schema()
+    items: list[dict] = []
+    tabs: list[str] = []
+    for name, spec in schema.items():
+        typ = spec.get("type")
+        # Only real persisted knobs — skip the read-only integration status rows.
+        if typ == "status" or name.startswith("_"):
+            continue
+        tab = spec.get("tab", "advanced")
+        if tab not in tabs:
+            tabs.append(tab)
+        default = spec.get("default")
+        row = {
+            "name": name,
+            "tab": tab,
+            "label": spec.get("label", name),
+            "type": typ,
+            # choices only present for enum/combo/routing — omit when absent so
+            # the client can rely on truthiness.
+            "choices": spec.get("choices"),
+            "help": spec.get("help", ""),
+            # The CURRENT effective value (live from core.config), falling back to
+            # the schema default when the constant isn't readable.
+            "value": _config_value(name, default),
+            "default": default,
+        }
+        if name in _SECRET_SETTING_KEYS:
+            # Redact: report only WHETHER a value is set, never the value itself.
+            # The client renders a password field and (on an empty save) leaves
+            # the existing secret untouched — see saveSetting.
+            live = row["value"]
+            row["is_set"] = bool(live and str(live).strip())
+            row["value"] = ""
+            row["default"] = ""
+            row["secret"] = True
+        items.append(row)
+    return {
+        "settings": items,
+        "tabs": tabs,
+        "note": SETTINGS_RESTART_NOTE,
+    }
+
+
+# The honest caveat we return on every write. _apply_user_settings() runs ONCE at
+# core.config import (boot), so a saved value overrides the module constant only
+# on the NEXT JARVIS start. We do NOT claim a live-apply we can't guarantee —
+# some knobs are re-read live by their consumers, but many are import-time, so the
+# safe, truthful blanket statement is "applies on restart".
+SETTINGS_RESTART_NOTE = ("Saved. Most settings take effect the next time JARVIS "
+                         "restarts.")
+
+
+class SettingsWriteError(ValueError):
+    """Raised by _coerce_setting/_write_settings on an unknown key or a value that
+    can't be coerced to the schema type. The POST handler turns it into a 400 with
+    this message — a clear, actionable error rather than a silent drop."""
+
+
+def _coerce_setting(name: str, value, schema: dict, coerce_value) -> object:
+    """Validate ``name`` against the schema and coerce ``value`` to its declared
+    type, raising ``SettingsWriteError`` on an unknown key or a bad value.
+
+    We reuse settings_window.coerce_value for the actual type conversion so the
+    web panel and the GUI apply IDENTICAL coercion rules (bool truthiness, enum
+    membership, int/float parsing, text→list, routing merge). But coerce_value is
+    deliberately LENIENT — it falls back to the default rather than raising — so a
+    web caller that fat-fingers an enum would silently write the default and think
+    it succeeded. That's wrong for an API, so we add a STRICT pre-check for the two
+    cases a user most wants an error on:
+      • unknown key                → 400 (typo / stale client)
+      • enum value not in choices  → 400 (invalid choice)
+    int/float that won't parse also 400 (coerce_value would swallow it to the
+    default). Everything else defers to coerce_value's tolerant conversion."""
+    spec = schema.get(name)
+    if spec is None or spec.get("type") == "status" or name.startswith("_"):
+        raise SettingsWriteError(f"unknown setting: {name!r}")
+    typ = spec.get("type")
+    # Enum: must be one of the declared choices — reject rather than default.
+    if typ == "enum":
+        choices = spec.get("choices") or []
+        if str(value) not in choices:
+            raise SettingsWriteError(
+                f"invalid value for {name!r}: {value!r} is not one of {choices}")
+    # int/float: coerce_value swallows a bad parse to the default, so pre-validate
+    # here to surface a real 400 instead of a silent wrong write.
+    if typ in ("int", "float"):
+        try:
+            (int if typ == "int" else float)(value)
+        except (TypeError, ValueError):
+            raise SettingsWriteError(
+                f"invalid {typ} value for {name!r}: {value!r}")
+    if coerce_value is None:                       # schema loaded but no coercer
+        raise SettingsWriteError("settings coercion unavailable")
+    return coerce_value(spec, value)
+
+
+def _write_settings(updates: dict, path: str) -> dict:
+    """MERGE ``updates`` (name→value) into the user_settings.json at ``path``,
+    atomically, preserving every other key already in the file.
+
+    Returns the ``{name: coerced_value, ...}`` actually applied. Raises
+    ``SettingsWriteError`` if ANY update is invalid (unknown key / bad type) —
+    validation happens for ALL updates BEFORE we touch disk, so a bad key in a
+    batch never leaves a half-applied file.
+
+    ATOMICITY / PRESERVATION
+    ========================
+    We read the existing file, overlay ONLY the validated keys, and write via a
+    fresh temp file + os.replace in the SAME directory — the identical crash-safe
+    pattern as inject_command() above and settings_window.atomic_write_json /
+    _apply_user_settings' reader. A concurrent reader (the Settings GUI, or JARVIS
+    booting) therefore never observes a half-written document, and any key we
+    didn't touch (including keys no schema knows about, e.g. a newer JARVIS's
+    extra knobs) is preserved verbatim. We do NOT rewrite the full default
+    template — a targeted merge is the whole contract ("preserve all other keys").
+
+    RESTART CAVEAT: this writes the FILE only. core.config's live constants were
+    set at import and are not mutated here, so the change reaches the running loop
+    on its next restart (see SETTINGS_RESTART_NOTE)."""
+    schema, coerce_value = _load_settings_schema()
+    if not schema:
+        raise SettingsWriteError("settings schema unavailable")
+    # 1) Validate + coerce EVERYTHING first (fail closed before any disk write).
+    applied: dict = {}
+    for name, value in updates.items():
+        applied[name] = _coerce_setting(name, value, schema, coerce_value)
+    # 2) Read the current file (tolerant: missing/corrupt → start from {}), so we
+    #    MERGE over it and preserve keys we don't manage.
+    current: dict = {}
+    try:
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                raw = f.read().strip()
+            if raw:
+                decoded = json.loads(raw)
+                if isinstance(decoded, dict):
+                    current = decoded
+    except Exception:
+        current = {}          # a corrupt file is overwritten with a valid merge
+    current.update(applied)
+    # 3) Atomic write (temp in the same dir + os.replace) — never a partial file.
+    _dir = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(_dir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=_dir, suffix=".tmp", prefix=".websettings_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(current, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        raise
+    return applied
+
+
+def _default_user_settings_path() -> str:
+    """The live user_settings.json path — resolved from settings_window so the web
+    panel writes the EXACT file the Settings GUI and core.config._apply_user_settings
+    read (data/user_settings.json under the project root, honouring the
+    JARVIS_SETTINGS_PATH redirect). Falls back to the known relative location if
+    settings_window can't be imported, so create_server always has a concrete
+    default. Never raises."""
+    try:
+        from tools import settings_window as sw
+        return sw.settings_path()
+    except Exception:
+        return os.path.join(PROJECT_DIR, "data", "user_settings.json")
+
+
 # ── the request handler ──────────────────────────────────────────────────────
 
 class _Handler(BaseHTTPRequestHandler):
-    """Routes: GET / (dashboard), GET /api/status, GET /api/log/tail, POST
-    /api/say. The owning server pins config onto the class instance via the
-    ``config`` attribute set in ``create_server`` (a small dict) so handlers are
-    stateless beyond it."""
+    """Routes: GET / (dashboard), GET /api/status, GET /api/log/tail, GET
+    /api/settings, POST /api/say, POST /api/settings. The owning server pins
+    config onto the class instance via the ``config`` attribute set in
+    ``create_server`` (a small dict) so handlers are stateless beyond it."""
 
     # Silence the default per-request stderr logging — it would spam the session
     # log we're tailing. (The base class calls this for every request.)
@@ -536,14 +794,49 @@ class _Handler(BaseHTTPRequestHandler):
                 n = 50
             return self._send_json(tail_log(cfg["log_dir"], n))
 
+        if path == "/api/settings":
+            # The FULL settings snapshot: every schema knob + its CURRENT effective
+            # value, read live. Gated the same as every other API route (token when
+            # one is set) — reading the config is less sensitive than writing it,
+            # but there's no reason to leak it token-free on an exposed bind.
+            if not self._authorized(query, is_page=False):
+                return self._unauthorized()
+            return self._send_json(build_settings_schema())
+
         return self._send_json({"error": "not found"}, code=404)
 
     # ── POST ─────────────────────────────────────────────────────────────────
+    def _read_body(self, cap: int = 64 * 1024) -> bytes:
+        """Read the request body up to ``cap`` bytes (never raises). Shared by the
+        /api/say and /api/settings handlers so the body-length parsing + size cap
+        live in ONE place."""
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0:
+            return b""
+        try:
+            return self.rfile.read(min(length, cap))
+        except Exception:
+            return b""
+
     def do_POST(self):  # noqa: N802 - http.server API
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         query = urllib.parse.parse_qs(parsed.query)
         cfg = self.server.config  # type: ignore[attr-defined]
+
+        # POST /api/settings — WRITE settings. A settings write is POWERFUL (it can
+        # flip WEB_INTERFACE_BIND/TOKEN, enable ambient listening, etc.), so it is
+        # gated by the SAME auth as every other route: when a token is configured it
+        # is REQUIRED here (a settings write is never allowed token-free on an
+        # exposed bind; on a local bind with no token there's no token to require,
+        # exactly like /api/say). See _handle_post_settings.
+        if path == "/api/settings":
+            if not self._authorized(query, is_page=False):
+                return self._unauthorized()
+            return self._handle_post_settings(cfg)
 
         if path != "/api/say":
             return self._send_json({"error": "not found"}, code=404)
@@ -551,16 +844,7 @@ class _Handler(BaseHTTPRequestHandler):
             return self._unauthorized()
 
         # Parse the JSON body {"text": "...", "timeout": <optional seconds>}.
-        try:
-            length = int(self.headers.get("Content-Length", "0") or "0")
-        except (TypeError, ValueError):
-            length = 0
-        raw = b""
-        if length > 0:
-            try:
-                raw = self.rfile.read(min(length, 64 * 1024))  # cap body size
-            except Exception:
-                raw = b""
+        raw = self._read_body()
         text = ""
         req_timeout = _REPLY_TIMEOUT_DEFAULT
         try:
@@ -594,6 +878,52 @@ class _Handler(BaseHTTPRequestHandler):
             "status": status,
             "reply": "\n".join(lines),
             "reply_lines": lines,
+        })
+
+    def _handle_post_settings(self, cfg: dict) -> None:
+        """Handle POST /api/settings — validate + merge one or more settings into
+        the user_settings.json file, atomically.
+
+        BODY SHAPE (both accepted):
+          • a single update:  {"name": "WAKE_WORD_AUTOSTART", "value": true}
+          • a batch:          {"settings": {"WAKE_WORD_AUTOSTART": true,
+                                            "TTS_BACKEND": "edge"}}
+        RESPONSES:
+          • 200 {"ok": true, "applied": {name: coerced_value, ...}, "note": "…"}
+          • 400 on empty body / unknown key / bad type (clear message)
+          • 500 if the atomic file write itself fails
+        The ``note`` is the honest restart caveat (SETTINGS_RESTART_NOTE) — we do
+        NOT claim a live-apply we can't guarantee."""
+        raw = self._read_body()
+        try:
+            data = json.loads(raw.decode("utf-8")) if raw else {}
+        except Exception:
+            return self._send_json({"error": "invalid JSON body"}, code=400)
+        if not isinstance(data, dict):
+            return self._send_json({"error": "body must be a JSON object"},
+                                   code=400)
+        # Normalise the two accepted shapes into one {name: value} dict.
+        updates: dict = {}
+        if isinstance(data.get("settings"), dict):
+            updates = dict(data["settings"])
+        elif "name" in data:
+            updates = {str(data["name"]): data.get("value")}
+        if not updates:
+            return self._send_json(
+                {"error": "no settings to apply — send {name, value} or "
+                          "{settings: {name: value, ...}}"}, code=400)
+        # Validate + merge (raises SettingsWriteError → 400 on a bad key/value).
+        try:
+            applied = _write_settings(updates, cfg["user_settings_path"])
+        except SettingsWriteError as e:
+            return self._send_json({"error": str(e)}, code=400)
+        except Exception as e:                      # a disk write failure etc.
+            return self._send_json({"error": f"settings write failed: {e}"},
+                                   code=500)
+        return self._send_json({
+            "ok": True,
+            "applied": applied,
+            "note": SETTINGS_RESTART_NOTE,
         })
 
 
@@ -662,24 +992,92 @@ def _dashboard_html(token: str) -> str:
   .toggle input {{ accent-color:var(--cyan); cursor:pointer; }}
   #reply {{ margin-top:10px; color:#eafcff; min-height:1.4em; }}
   .muted {{ color:var(--muted); }}
+  /* ── Settings panel ──────────────────────────────────────────────────────
+     A second "view" under the live dashboard. The nav toggles which of the two
+     sections (live / settings) is visible; only one shows at a time so the page
+     stays a single self-contained screen. Same dark arc-reactor-cyan palette. */
+  nav.views {{ display:flex; gap:8px; margin-left:18px; }}
+  nav.views button {{ padding:6px 14px; font-size:12.5px; border-radius:999px;
+            background:transparent; color:var(--cyan); }}
+  nav.views button.active {{ background:var(--cyan); color:#04222b; }}
+  .view[hidden] {{ display:none; }}
+  /* The prominent wake-word switch sits at the top of Settings so it's the first
+     thing the owner sees (the headline "do it all from the web" control). */
+  .wakebanner {{ background:linear-gradient(90deg, #0b1a26, var(--panel));
+            border:1px solid var(--cyan-dim); border-radius:10px;
+            padding:14px 16px; margin-bottom:16px; display:flex;
+            align-items:center; gap:14px; flex-wrap:wrap; }}
+  .wakebanner .lbl {{ color:var(--cyan); font-size:14px; letter-spacing:.06em; }}
+  .wakebanner .hint {{ color:var(--muted); font-size:12px; flex-basis:100%; }}
+  /* Each tab-group of settings is a titled card; rows stack inside it. */
+  .sgroup {{ background:var(--panel); border:1px solid var(--edge);
+            border-radius:10px; padding:6px 14px 12px; margin-bottom:14px; }}
+  .sgroup > h2 {{ font-size:12px; text-transform:uppercase; letter-spacing:.16em;
+            color:var(--muted); margin:12px 2px 8px; }}
+  .srow {{ display:flex; align-items:flex-start; gap:12px; padding:9px 2px;
+            border-top:1px solid #0c1a24; flex-wrap:wrap; }}
+  .srow:first-of-type {{ border-top:none; }}
+  .srow .meta {{ flex:1 1 260px; min-width:220px; }}
+  .srow .meta .name {{ color:var(--text); }}
+  .srow .meta .help {{ color:var(--muted); font-size:12px; margin-top:2px; }}
+  .srow .ctl {{ flex:0 0 auto; display:flex; align-items:center; gap:8px; }}
+  .srow .ctl input[type=text], .srow .ctl input[type=number], .srow .ctl select {{
+            background:#04070c; border:1px solid var(--edge); color:var(--text);
+            border-radius:8px; padding:8px 10px; font:inherit; min-width:160px; }}
+  .srow .ctl input:focus, .srow .ctl select:focus {{ outline:none;
+            border-color:var(--cyan); box-shadow:0 0 0 1px var(--cyan-dim); }}
+  .srow .ctl input[type=checkbox] {{ width:18px; height:18px;
+            accent-color:var(--cyan); cursor:pointer; }}
+  .srow .save {{ padding:7px 12px; font-size:12px; }}
+  .srow .saved {{ color:#2ee6a6; font-size:12px; min-width:1em; }}
+  #settingsNote {{ color:var(--muted); font-size:12px; margin:2px 2px 14px; }}
 </style></head><body>
 <header><div class="reactor"></div><h1>J.A.R.V.I.S.</h1>
+  <!-- View switcher: LIVE dashboard vs the full SETTINGS control panel. Only one
+       view is shown at a time so the page stays one self-contained screen. -->
+  <nav class="views">
+    <button id="navLive" class="active" type="button">Live</button>
+    <button id="navSettings" type="button">Settings</button>
+  </nav>
   <label class="toggle" style="margin-left:auto" title="Pause/resume live status + log polling">
     <input id="autorefresh" type="checkbox" checked> auto-refresh
   </label>
   <span id="conn" class="muted">connecting…</span>
 </header>
 <div class="wrap">
-  <div class="strip" id="strip"></div>
-  <!-- Quick-action buttons are injected here from the QUICK_ACTIONS array below,
-       so presets are edited in ONE data-driven place (no per-button markup). -->
-  <div class="actions" id="actions"></div>
-  <div id="log" class="muted">loading log…</div>
-  <form id="say">
-    <input id="text" type="text" autocomplete="off" placeholder="Type a command for JARVIS…" autofocus>
-    <button id="send" type="submit">Send</button>
-  </form>
-  <div id="reply"></div>
+  <!-- ── LIVE VIEW (unchanged dashboard: status strip / quick actions / log /
+       command box) ────────────────────────────────────────────────────────── -->
+  <section id="viewLive" class="view">
+    <div class="strip" id="strip"></div>
+    <!-- Quick-action buttons are injected here from the QUICK_ACTIONS array below,
+         so presets are edited in ONE data-driven place (no per-button markup). -->
+    <div class="actions" id="actions"></div>
+    <div id="log" class="muted">loading log…</div>
+    <form id="say">
+      <input id="text" type="text" autocomplete="off" placeholder="Type a command for JARVIS…" autofocus>
+      <button id="send" type="submit">Send</button>
+    </form>
+    <div id="reply"></div>
+  </section>
+
+  <!-- ── SETTINGS VIEW (the full control panel) ──────────────────────────────
+       The wake-word switch is pinned in the banner at the top; every other knob
+       is rendered from /api/settings, grouped by tab, into #settingsGroups. The
+       whole thing is built client-side from the schema so the panel never drifts
+       from settings_window.SCHEMA (the single source of truth). -->
+  <section id="viewSettings" class="view" hidden>
+    <div class="wakebanner">
+      <label class="toggle" style="color:var(--cyan)">
+        <input id="wakeToggle" type="checkbox"> <span class="lbl">Wake-word mode (start in standby)</span>
+      </label>
+      <button id="wakeSave" class="save" type="button">Save</button>
+      <span id="wakeSaved" class="saved"></span>
+      <span class="hint">Boot silent and wait for &ldquo;JARVIS&rdquo; instead of always-listening
+        (WAKE_WORD_AUTOSTART). Toggle the neural detector + full standby knobs below too.</span>
+    </div>
+    <div id="settingsNote" class="muted">loading settings…</div>
+    <div id="settingsGroups"></div>
+  </section>
 </div>
 <script>
 const TOKEN = "{tok}";
@@ -822,6 +1220,165 @@ const autoEl = document.getElementById('autorefresh');
 function autoOn() {{ return autoEl.checked; }}
 autoEl.addEventListener('change', () => {{ if (autoOn()) {{ refreshStatus(); refreshLog(); }} }});
 
+// ── SETTINGS CONTROL PANEL ─────────────────────────────────────────────────
+// The full "do it all from the web" panel. It's built ENTIRELY from /api/settings
+// (which serves settings_window.SCHEMA + live values), so it never drifts from the
+// real config. Each control saves INDEPENDENTLY via POST /api/settings {{name,value}}
+// and shows a per-row confirmation. A save writes the file; the effect lands on the
+// next JARVIS restart (the note the server returns says so).
+const navLive = document.getElementById('navLive');
+const navSettings = document.getElementById('navSettings');
+const viewLive = document.getElementById('viewLive');
+const viewSettings = document.getElementById('viewSettings');
+const settingsGroups = document.getElementById('settingsGroups');
+const settingsNote = document.getElementById('settingsNote');
+const wakeToggle = document.getElementById('wakeToggle');
+const wakeSave = document.getElementById('wakeSave');
+const wakeSaved = document.getElementById('wakeSaved');
+
+// Friendly tab titles for the group headings (fallback to the raw key).
+const TAB_TITLES = {{ voice:'Voice / Audio', ai:'AI / Models',
+  privacy:'Privacy / Ambient', integrations:'Integrations', advanced:'Advanced' }};
+// The wake-word knob the banner switch drives — the headline control the owner
+// asked for. START_IN_STANDBY is the "Alexa-style wake-word mode" toggle;
+// WAKE_WORD_AUTOSTART (the neural detector) is surfaced as a normal row below.
+const WAKE_KEY = 'START_IN_STANDBY';
+let settingsLoaded = false;
+
+function showView(which) {{
+  const live = (which === 'live');
+  viewLive.hidden = !live; viewSettings.hidden = live;
+  navLive.classList.toggle('active', live);
+  navSettings.classList.toggle('active', !live);
+  if (!live && !settingsLoaded) loadSettings();
+}}
+navLive.addEventListener('click', () => showView('live'));
+navSettings.addEventListener('click', () => showView('settings'));
+
+// Build ONE control for a schema item, returning {{el, read}} where read() yields
+// the value to POST. bool→checkbox, enum→select, combo→text+datalist, int/float→
+// number, everything else→text.
+function buildControl(it) {{
+  const t = it.type;
+  // Secret knobs (e.g. the web token) never receive the live value from the
+  // server — it's redacted. Render a password field; an EMPTY save means "keep
+  // the current secret" (the click handler skips the POST), so a blank field
+  // can't wipe an existing token. Type something to replace it.
+  if (it.secret) {{
+    const inp=document.createElement('input'); inp.type='password';
+    inp.autocomplete='new-password';
+    inp.placeholder = it.is_set ? '•••••• (set — type to replace)' : '(not set)';
+    return {{el:inp, read:()=>inp.value, secret:true}};
+  }}
+  if (t === 'bool') {{
+    const cb = document.createElement('input'); cb.type='checkbox';
+    cb.checked = !!it.value; return {{el:cb, read:()=>cb.checked}};
+  }}
+  if (t === 'enum') {{
+    const sel = document.createElement('select');
+    (it.choices||[]).forEach(c => {{ const o=document.createElement('option');
+      o.value=c; o.textContent=c; if (String(it.value)===String(c)) o.selected=true;
+      sel.appendChild(o); }});
+    return {{el:sel, read:()=>sel.value}};
+  }}
+  if (t === 'int' || t === 'float') {{
+    const inp=document.createElement('input'); inp.type='number';
+    if (t==='float') inp.step='any';
+    inp.value = (it.value==null?'':it.value);
+    return {{el:inp, read:()=> t==='int'?parseInt(inp.value,10):parseFloat(inp.value)}};
+  }}
+  // combo (free text + suggestions), str, device, text, routing → a text input.
+  // combo gets a datalist of its suggested choices; the user can still type any.
+  const inp=document.createElement('input'); inp.type='text';
+  let val = it.value;
+  if (val && typeof val === 'object') val = JSON.stringify(val);   // routing/list → shown as JSON
+  inp.value = (val==null?'':val);
+  if (t === 'combo' && (it.choices||[]).length) {{
+    const dl=document.createElement('datalist'); const id='dl_'+it.name;
+    dl.id=id; (it.choices||[]).forEach(c=>{{const o=document.createElement('option');
+      o.value=c; dl.appendChild(o);}}); inp.setAttribute('list', id);
+    const frag=document.createDocumentFragment(); frag.appendChild(inp); frag.appendChild(dl);
+    return {{el:frag, read:()=>inp.value, focusEl:inp}};
+  }}
+  return {{el:inp, read:()=>inp.value}};
+}}
+
+// POST a single {{name,value}} and reflect the outcome in `saved` (a small span).
+async function saveSetting(name, value, saved) {{
+  saved.textContent='…'; saved.style.color='var(--muted)';
+  try {{
+    const r = await fetch(q('/api/settings'), {{method:'POST', headers:hdr(),
+      body: JSON.stringify({{name, value}})}});
+    const d = await r.json();
+    if (r.ok && d.ok) {{ saved.textContent='saved ✓'; saved.style.color='#2ee6a6';
+      if (d.note) settingsNote.textContent = d.note; }}
+    else {{ saved.textContent = (d.error||'error'); saved.style.color='#f85149'; }}
+  }} catch(e) {{ saved.textContent='failed'; saved.style.color='#f85149'; }}
+}}
+
+// Render the whole panel from an /api/settings payload: group by tab, one card per
+// tab, one row per knob (meta + control + per-row Save button + confirmation).
+function renderSettings(payload) {{
+  settingsGroups.innerHTML='';
+  const items = payload.settings || [];
+  settingsNote.textContent = payload.note || '';
+  const tabs = payload.tabs && payload.tabs.length ? payload.tabs
+    : Array.from(new Set(items.map(i=>i.tab)));
+  tabs.forEach(tab => {{
+    const inTab = items.filter(i => i.tab === tab);
+    if (!inTab.length) return;
+    const group=document.createElement('div'); group.className='sgroup';
+    const h=document.createElement('h2'); h.textContent = TAB_TITLES[tab]||tab;
+    group.appendChild(h);
+    inTab.forEach(it => {{
+      const row=document.createElement('div'); row.className='srow';
+      const meta=document.createElement('div'); meta.className='meta';
+      meta.innerHTML = '<div class="name"></div>'+(it.help?'<div class="help"></div>':'');
+      meta.querySelector('.name').textContent = it.label + '  ('+it.name+')';
+      if (it.help) meta.querySelector('.help').textContent = it.help;
+      const ctl=document.createElement('div'); ctl.className='ctl';
+      const c = buildControl(it);
+      ctl.appendChild(c.el);
+      const saveBtn=document.createElement('button'); saveBtn.className='save';
+      saveBtn.type='button'; saveBtn.textContent='Save';
+      const saved=document.createElement('span'); saved.className='saved';
+      saveBtn.addEventListener('click', () => {{
+        const v = c.read();
+        // Empty save on a secret = "keep the current value" — never POST "" and
+        // wipe an existing token by accident.
+        if (c.secret && (v===''||v==null)) {{
+          saved.textContent='unchanged'; saved.style.color='var(--muted)'; return;
+        }}
+        saveSetting(it.name, v, saved);
+      }});
+      ctl.appendChild(saveBtn); ctl.appendChild(saved);
+      row.appendChild(meta); row.appendChild(ctl);
+      group.appendChild(row);
+      // Mirror the wake-word row into the top banner switch so the headline
+      // toggle and its row stay in sync (the banner is the prominent shortcut).
+      if (it.name === WAKE_KEY) wakeToggle.checked = !!it.value;
+    }});
+    settingsGroups.appendChild(group);
+  }});
+}}
+
+async function loadSettings() {{
+  try {{
+    const r = await fetch(q('/api/settings'), {{headers:hdr()}});
+    if (r.status===401) {{ settingsNote.textContent='unauthorized — token required'; return; }}
+    const d = await r.json();
+    renderSettings(d);
+    settingsLoaded = true;
+  }} catch(e) {{ settingsNote.textContent='could not load settings'; }}
+}}
+
+// The prominent banner switch: saves START_IN_STANDBY directly, then reloads the
+// panel so every mirrored row reflects the new value.
+wakeSave.addEventListener('click', async () => {{
+  await saveSetting(WAKE_KEY, wakeToggle.checked, wakeSaved);
+  settingsLoaded = false; loadSettings();
+}});
+
 refreshStatus(); refreshLog();
 setInterval(() => {{ if (autoOn()) refreshStatus(); }}, 1500);
 setInterval(() => {{ if (autoOn()) refreshLog(); }}, 1000);
@@ -851,6 +1408,7 @@ def create_server(*, bind: str, port: int, token: str = "",
                   inject_path: str = DEFAULT_INJECT_PATH,
                   log_dir: str = DEFAULT_LOG_DIR,
                   hud_state_path: str = DEFAULT_HUD_STATE_PATH,
+                  user_settings_path: str | None = None,
                   reply_reader=None) -> ThreadingHTTPServer:
     """Build (but do not serve) a ThreadingHTTPServer for the web interface.
 
@@ -860,7 +1418,13 @@ def create_server(*, bind: str, port: int, token: str = "",
 
     ``reply_reader`` lets a test stub the log-tail reply wait (default:
     ``wait_for_reply``). All paths default to the live project files but are
-    injectable so a test can point them at a temp dir and bind 127.0.0.1:0."""
+    injectable so a test can point them at a temp dir and bind 127.0.0.1:0.
+
+    ``user_settings_path`` is where POST /api/settings MERGES its writes; it
+    defaults (when None) to the live data/user_settings.json resolved from
+    settings_window — the same file the Settings GUI and core.config read — but a
+    test points it at a throwaway file so a settings write can never clobber the
+    real one (mirroring inject_path/log_dir/hud_state_path)."""
     bind = (bind or "127.0.0.1").strip()
     local = is_local_bind(bind)
     if not local and not (token or "").strip():
@@ -892,12 +1456,16 @@ def create_server(*, bind: str, port: int, token: str = "",
         )
     httpd = ThreadingHTTPServer((bind, int(port)), _Handler)
     # Pin per-server config onto the instance so the stateless handler reads it.
+    # user_settings_path resolves to the live data/user_settings.json when the
+    # caller didn't override it — done HERE (not as a def-time default) so the
+    # JARVIS_SETTINGS_PATH redirect is honoured at server-construction time.
     httpd.config = {  # type: ignore[attr-defined]
         "token": (token or "").strip(),
         "local_bind": local,
         "inject_path": inject_path,
         "log_dir": log_dir,
         "hud_state_path": hud_state_path,
+        "user_settings_path": user_settings_path or _default_user_settings_path(),
         "reply_reader": reply_reader,
     }
     return httpd
