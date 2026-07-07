@@ -214,6 +214,18 @@ class IsRunningTests(_BridgeBase):
         self._inject("psutil", pmod)
         self.assertTrue(ib.is_running())   # the good iTunes proc still matches
 
+    def test_process_iter_itself_raising_degrades_to_false(self):
+        # 2026-07-07 bug-hunt: process_iter() itself can raise (ZombieProcess /
+        # OS errors under load), not just per-item — the "cheap gate" must
+        # degrade to False, never propagate into get_client()/the poll thread.
+        pmod = _fake_psutil([])
+
+        def _boom(_a):
+            raise RuntimeError("psutil iterator exploded")
+        pmod.process_iter = _boom
+        self._inject("psutil", pmod)
+        self.assertFalse(ib.is_running())
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # launch

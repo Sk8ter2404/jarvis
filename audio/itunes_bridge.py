@@ -121,12 +121,20 @@ def is_running() -> bool:
         import psutil
     except ImportError:
         return False
-    for proc in psutil.process_iter(["name"]):
-        try:
-            if (proc.info.get("name") or "").lower() == "itunes.exe":
-                return True
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
+    # process_iter() itself can raise (ZombieProcess, OS errors under load), not
+    # just per-item NoSuchProcess/AccessDenied. This is the "cheap gate that never
+    # touches COM" called from get_client() + the 12s poll loop, so an iterator
+    # error must degrade to False, not propagate into the caller/thread (matches
+    # apple_music_app.is_running's outer guard). 2026-07-07 bug-hunt.
+    try:
+        for proc in psutil.process_iter(["name"]):
+            try:
+                if (proc.info.get("name") or "").lower() == "itunes.exe":
+                    return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception:
+        return False
     return False
 
 

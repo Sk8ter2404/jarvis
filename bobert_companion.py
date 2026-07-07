@@ -6968,32 +6968,49 @@ def get_mic_buffer(seconds: float,
         mono = indata[:, 0] if indata.ndim > 1 else indata
         q_local.put(mono.astype(np.float32, copy=False).copy())
 
-    # 2026-05-29 silent-crash fix: avoid `with sd.InputStream(...)`. Open the
-    # stream explicitly and tear it down via _safe_close_stream so the close
-    # path can't SIGSEGV the interpreter during exceptional exits.
+    # MIC-OWNERSHIP GUARD (2026-07-07 bug-hunt, MED). Publish that a mic stream
+    # is LIVE before opening this Path-B InputStream, so a concurrent
+    # _refresh_devices can't run sd._terminate()/sd._initialize() and tear
+    # PortAudio out from under this stream's callback → heap corruption
+    # (0xc0000374). record_speech guards its own open exactly this way; Path B
+    # was the un-guarded twin (reached when record_speech isn't holding the mic
+    # at target_sr — e.g. standby audio / voice enrollment / speaker-ID). We SAVE
+    # + RESTORE (not merely clear) so an already-running record_speech at another
+    # sample rate keeps its ownership after Path B closes.
+    _prev_active = _record_speech_active[0]
+    _prev_sr = _record_speech_sr[0]
+    _record_speech_sr[0] = target_sr
+    _record_speech_active[0] = True
     try:
-        stream = sd.InputStream(samplerate=target_sr, channels=1,
-                                dtype="float32", blocksize=1024,
-                                device=get_input_device(), callback=_cb)
-    except Exception as e:
-        print(f"  [get_mic_buffer] InputStream open failed: {e}")
-        return None
-    try:
-        stream.start()
-        captured = 0
-        deadline = time.time() + seconds + 1.0
-        while captured < need and time.time() < deadline:
-            try:
-                frame = q_local.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            chunks2.append(frame)
-            captured += int(frame.size)
-    except Exception as e:
-        print(f"  [get_mic_buffer] InputStream failed: {e}")
-        return None
+        # 2026-05-29 silent-crash fix: avoid `with sd.InputStream(...)`. Open the
+        # stream explicitly and tear it down via _safe_close_stream so the close
+        # path can't SIGSEGV the interpreter during exceptional exits.
+        try:
+            stream = sd.InputStream(samplerate=target_sr, channels=1,
+                                    dtype="float32", blocksize=1024,
+                                    device=get_input_device(), callback=_cb)
+        except Exception as e:
+            print(f"  [get_mic_buffer] InputStream open failed: {e}")
+            return None
+        try:
+            stream.start()
+            captured = 0
+            deadline = time.time() + seconds + 1.0
+            while captured < need and time.time() < deadline:
+                try:
+                    frame = q_local.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                chunks2.append(frame)
+                captured += int(frame.size)
+        except Exception as e:
+            print(f"  [get_mic_buffer] InputStream failed: {e}")
+            return None
+        finally:
+            _safe_close_stream(stream)
     finally:
-        _safe_close_stream(stream)
+        _record_speech_active[0] = _prev_active
+        _record_speech_sr[0] = _prev_sr
     if not chunks2:
         return None
     out2 = np.concatenate(chunks2).astype(np.float32, copy=False)
@@ -8907,6 +8924,15 @@ class _SentenceFlushBuffer:
             try:
                 if prev is not None:
                     prev.join(timeout=60)
+                # If the user BARGED IN (a wake-word hit cut the prior sentence
+                # via sd.stop(), which unblocks prev.join above), do NOT speak the
+                # next chained early sentence — honour the interrupt instead of
+                # blurting one more line the user talked over. 2026-07-07 bug-hunt.
+                try:
+                    if _tts_interrupt.is_set():
+                        return
+                except Exception:
+                    pass
                 fn = speak_fn if speak_fn is not None else _speak
                 fn(sentence)
             except Exception:
