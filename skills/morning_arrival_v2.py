@@ -625,6 +625,11 @@ def _fire_arrival(reason: str, *, force: bool = False) -> str:
     if not force and _chain_morning_briefing_fired_today():
         print(f"  [arrival_v2] suppressing ({reason}) — morning_chain already "
               f"briefed today")
+        # Mark v2's own state as covered for the day: without this the
+        # presence watcher's _already_fired_today() gate stays False and it
+        # re-enters here every WATCH_POLL_SECONDS for the rest of the morning
+        # window — hours of once-per-second state-file reads and log spam.
+        _mark_fired(f"suppressed ({reason}) — morning_chain briefed")
         return ""
     try:
         text = _build_briefing()

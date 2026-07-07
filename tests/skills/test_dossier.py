@@ -739,11 +739,32 @@ class DossierRendererProcTests(unittest.TestCase):
             self.assertFalse(self.mod._renderer_alive())
 
     # ── _ensure_renderer_running ─────────────────────────────────────────
-    def test_ensure_skips_spawn_when_already_alive(self):
-        with mock.patch.object(self.mod, "_renderer_alive", return_value=True), \
+    def test_ensure_kills_stale_renderer_and_respawns(self):
+        # Regression: a live renderer built its labels once from the OLD state,
+        # so 'dossier on A' then 'dossier on B' left A's content on screen. The
+        # fix terminates the stale renderer and spawns a fresh one that rebuilds
+        # from the just-written state.
+        with open(self.pid, "w", encoding="utf-8") as f:
+            f.write("777")
+        with mock.patch.object(self.mod, "_pid_alive", return_value=True), \
+             mock.patch.object(self.mod.os, "kill") as kill, \
              mock.patch.object(self.mod.subprocess, "Popen") as popen:
             self.mod._ensure_renderer_running()
-        popen.assert_not_called()
+        kill.assert_called_once_with(777, self.mod.signal.SIGTERM)
+        popen.assert_called_once()
+        # Stale PID file is cleared so the new renderer's write wins.
+        self.assertFalse(os.path.exists(self.pid))
+
+    def test_ensure_kill_failure_swallowed_still_spawns(self):
+        with open(self.pid, "w", encoding="utf-8") as f:
+            f.write("777")
+        with mock.patch.object(self.mod, "_pid_alive", return_value=True), \
+             mock.patch.object(self.mod.os, "kill",
+                               side_effect=OSError("gone")), \
+             mock.patch.object(self.mod.subprocess, "Popen") as popen:
+            # Must not raise, and the fresh renderer still spawns.
+            self.mod._ensure_renderer_running()
+        popen.assert_called_once()
 
     def test_ensure_spawns_when_not_alive(self):
         with mock.patch.object(self.mod, "_renderer_alive", return_value=False), \

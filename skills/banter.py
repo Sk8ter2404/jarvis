@@ -119,7 +119,23 @@ _speech_lock = threading.Lock()
 # ─── speech queue ────────────────────────────────────────────────────────
 
 def _enqueue_speech(message: str) -> None:
-    """Append a spoken alert to pending_speech.json for the main loop."""
+    """Append a spoken alert to pending_speech.json for the main loop.
+
+    Routes through bobert_companion.proactive_announce() so this skill shares
+    one write path with every other pending_speech.json co-writer (timer,
+    wellness, night_owl_mode, dnd_focus_mode, …) and they don't race each
+    other. Falls back to a local atomic write only when the parent module
+    isn't loaded yet (import-time registration / unit tests) or the announcer
+    call fails — so a broken parent import can't silence a zinger."""
+    try:
+        bc = importlib.import_module("bobert_companion")
+        announcer = getattr(bc, "proactive_announce", None)
+        if callable(announcer):
+            announcer(message, source="banter")
+            return
+    except Exception:
+        pass
+
     with _speech_lock:
         data = []
         if os.path.exists(_SPEECH_QUEUE):

@@ -706,28 +706,39 @@ class AnticipationEnvironmentTests(_EngineTestBase):
 
     # ── _try_pattern_offer bridge ────────────────────────────────────────
     def test_try_pattern_offer_returns_line(self):
-        pm = types.ModuleType("pattern_memory")
+        pm = types.ModuleType("memory")
         pm.maybe_pattern_offer = lambda: "Shall I start your Monday routine, sir?"
-        with inject_modules(pattern_memory=pm):
+        with inject_modules(memory=pm):
             self.assertIn("Monday", self.mod._try_pattern_offer())
 
+    def test_try_pattern_offer_uses_real_memory_module_name(self):
+        # Regression: the engine used to import the non-existent module
+        # "pattern_memory" (only ever a local alias in bobert_companion),
+        # so the pattern trigger could never fire. It must import the real
+        # top-level "memory" module — and NOT need "pattern_memory".
+        pm = types.ModuleType("memory")
+        pm.maybe_pattern_offer = lambda: "Time for the Tuesday sweep, sir?"
+        with inject_modules(memory=pm, pattern_memory=None):
+            self.assertEqual(self.mod._try_pattern_offer(),
+                             "Time for the Tuesday sweep, sir?")
+
     def test_try_pattern_offer_empty_when_none(self):
-        pm = types.ModuleType("pattern_memory")
+        pm = types.ModuleType("memory")
         pm.maybe_pattern_offer = lambda: None
-        with inject_modules(pattern_memory=pm):
+        with inject_modules(memory=pm):
             self.assertEqual(self.mod._try_pattern_offer(), "")
 
     def test_try_pattern_offer_import_failure(self):
         with mock.patch.object(self.mod.importlib, "import_module",
-                               side_effect=ImportError("no pattern_memory")):
+                               side_effect=ImportError("no memory module")):
             self.assertEqual(self.mod._try_pattern_offer(), "")
 
     def test_try_pattern_offer_callable_raises(self):
-        pm = types.ModuleType("pattern_memory")
+        pm = types.ModuleType("memory")
         def _boom():
             raise RuntimeError("offer exploded")
         pm.maybe_pattern_offer = _boom
-        with inject_modules(pattern_memory=pm):
+        with inject_modules(memory=pm):
             self.assertEqual(self.mod._try_pattern_offer(), "")
 
 

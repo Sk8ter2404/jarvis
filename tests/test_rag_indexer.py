@@ -1795,6 +1795,30 @@ class ConfigTests(_RagBase):
         rag.configure(RAG_DEVICE="cuda")
         self.assertEqual(rag.RAG_DEVICE, "cuda")
 
+    def test_configure_invalidates_cached_embedder(self):
+        # A cached embedder built with the OLD model must be dropped when the
+        # model changes, so the next _get_embedder() rebuilds with the new one.
+        rag._embed_model = rag._OllamaEmbedder(model="old", endpoint="e")
+        rag.configure(rag_embed_model="new-model")
+        self.assertIsNone(rag._embed_model)
+        emb = rag._get_embedder()
+        self.assertEqual(emb.model, "new-model")
+
+    def test_configure_invalidates_cached_reranker_and_collection(self):
+        rag._reranker = object()
+        rag._collection = object()
+        rag.configure(rag_reranker_model="other-reranker",
+                      rag_collection="other_collection")
+        self.assertIsNone(rag._reranker)
+        self.assertIsNone(rag._collection)
+
+    def test_configure_same_value_keeps_cached_singletons(self):
+        # Re-asserting the current value must NOT throw away warm singletons.
+        sentinel = object()
+        rag._embed_model = sentinel
+        rag.configure(rag_embed_model=rag.RAG_EMBED_MODEL)
+        self.assertIs(rag._embed_model, sentinel)
+
     def test_current_config_shape(self):
         cfg = rag.current_config()
         for key in ("RAG_INDEX_PATHS", "RAG_EMBED_MODEL", "RAG_CHUNK_CHARS",

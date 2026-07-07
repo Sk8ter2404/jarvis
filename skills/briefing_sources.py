@@ -367,9 +367,13 @@ def _meeting_from_graph(when: str) -> dict | None:
         return None
 
     start_dt, end_dt = _meeting_window(when)
+    # Window is local-naive but the Prefer header pins Graph to UTC, so
+    # convert local -> UTC before sending or the window skews by the offset.
+    start_utc = start_dt.astimezone(datetime.timezone.utc)
+    end_utc = end_dt.astimezone(datetime.timezone.utc)
     qs = urllib.parse.urlencode({
-        "startDateTime": start_dt.isoformat(),
-        "endDateTime":   end_dt.isoformat(),
+        "startDateTime": start_utc.isoformat(),
+        "endDateTime":   end_utc.isoformat(),
         "$orderby":      "start/dateTime",
         "$top":          "1",
         "$select":       "subject,start,organizer",

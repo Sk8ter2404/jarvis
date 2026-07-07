@@ -921,8 +921,16 @@ def search(query: str, k: int = 5, candidates: int = 25,
 
 
 # ── config helpers ───────────────────────────────────────────────────
+# Keys whose cached singleton must be rebuilt when the value changes.
+_EMBEDDER_KEYS = {"RAG_EMBED_MODEL", "RAG_OLLAMA_ENDPOINT",
+                  "RAG_EMBED_BATCH", "RAG_EMBED_TIMEOUT"}
+_RERANKER_KEYS = {"RAG_RERANKER_MODEL", "RAG_DEVICE"}
+_COLLECTION_KEYS = {"RAG_COLLECTION"}
+
+
 def configure(**kwargs) -> dict:
     """Update tunables at runtime. Returns the new effective config."""
+    global _embed_model, _reranker, _collection
     g = globals()
     for key, value in kwargs.items():
         upper = key.upper()
@@ -932,7 +940,21 @@ def configure(**kwargs) -> dict:
             "RAG_RERANKER_MODEL", "RAG_MAX_FILE_BYTES", "RAG_CHUNK_CHARS",
             "RAG_CHUNK_OVERLAP", "RAG_DEVICE", "RAG_COLLECTION",
         }:
+            changed = g[upper] != value
             g[upper] = value
+            # Invalidate cached singletons so the new value actually takes
+            # effect — otherwise _get_embedder()/_get_reranker()/
+            # _get_collection() keep returning objects built with the old
+            # config and the confirmation to the user is a lie.
+            if changed and upper in _EMBEDDER_KEYS:
+                with _embedder_init_lock:
+                    _embed_model = None
+            if changed and upper in _RERANKER_KEYS:
+                with _reranker_init_lock:
+                    _reranker = None
+            if changed and upper in _COLLECTION_KEYS:
+                with _collection_init_lock:
+                    _collection = None
     return current_config()
 
 

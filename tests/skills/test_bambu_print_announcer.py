@@ -135,6 +135,50 @@ class AnnouncerMilestoneTests(AnnouncerLoadMixin, unittest.TestCase):
         self.assertIn(95, mod._announced_pct)
         self.assertTrue(mod._armed_for_new_print[0])
 
+    def test_cold_boot_midflight_discovery_does_not_blurt(self):
+        # Regression: real cold boot — _current_filename is None, so the
+        # first populated poll takes the filename-change branch. That branch
+        # must NOT arm (first observation), so the priming branch runs in the
+        # same pass: past milestones get pre-marked, nothing is spoken, and
+        # _saw_running stays False so a later FINISH isn't celebrated.
+        mod, _a, _f = self._load()
+        self.assertIsNone(mod._current_filename[0])
+        state = {"last_update": time.time(), "gcode_state": "RUNNING",
+                 "filename": "big.3mf", "mc_percent": 80, "layer_num": 250,
+                 "total_layer": 300, "mc_remaining": 20}
+        with mock.patch.object(mod, "_read_state", return_value=state), \
+             mock.patch.object(mod, "_proactive_announce") as ann:
+            mod._check_milestones()
+        ann.assert_not_called()
+        self.assertIn(10, mod._announced_pct)
+        self.assertNotIn(95, mod._announced_pct)  # 95 % hasn't passed yet
+        self.assertIn(5, mod._announced_layers)
+        self.assertIn(10, mod._announced_layers)
+        self.assertTrue(mod._armed_for_new_print[0])
+        self.assertFalse(mod._saw_running_this_print[0])
+        # A later FINISH poll must not fire the celebratory line either.
+        with mock.patch.object(mod, "_proactive_announce") as ann:
+            mod._check_celebratory_completion("FINISH")
+        ann.assert_not_called()
+
+    def test_cold_boot_fresh_print_still_announces(self):
+        # First observation of a print that genuinely just started: priming
+        # at ~0 % marks nothing, and the next poll announces 10 % normally.
+        mod, _a, _f = self._load()
+        base = {"last_update": time.time(), "gcode_state": "RUNNING",
+                "filename": "cube.3mf", "mc_percent": 0, "layer_num": 1,
+                "total_layer": 300, "mc_remaining": 200}
+        with mock.patch.object(mod, "_read_state", return_value=base), \
+             mock.patch.object(mod, "_proactive_announce") as ann:
+            mod._check_milestones()  # first poll: primes, speaks nothing
+        ann.assert_not_called()
+        later = dict(base, mc_percent=12, layer_num=30, mc_remaining=150)
+        with mock.patch.object(mod, "_read_state", return_value=later), \
+             mock.patch.object(mod, "_proactive_announce",
+                               return_value=True) as ann:
+            mod._check_milestones()
+        self.assertTrue(any("10%" in c.args[0] for c in ann.call_args_list))
+
     def test_early_layer_checkpoint_fires(self):
         mod, _a, _f = self._load()
         mod._armed_for_new_print[0] = True

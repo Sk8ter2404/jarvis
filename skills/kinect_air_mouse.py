@@ -1707,6 +1707,13 @@ def _clear_overlay_state() -> None:
 
 _overlay_process = [None]   # module-list so the loop can (re)assign without global
 
+# Edge flag for the DISABLED poll path: once the hidden overlay state + the
+# DISENGAGED preview state have been published, don't rewrite them every ~33 ms
+# tick — that's pointless file churn and it clobbers the two-hand poller's
+# frames. Reset when the enabled path runs (mirrors kinect_two_hand.py's
+# _two_hand_overlay_was_active write-once-on-edge flag).
+_disabled_state_published = [False]
+
 
 def _overlay_alive() -> bool:
     proc = _overlay_process[0]
@@ -2207,7 +2214,8 @@ def _poll_once(ctrl: AirMouseController, bridge) -> Optional[AirMouseDecision]:
     # signal as recent real input — the controller force-disengages, releases any
     # held button, and stays suppressed this frame. (Fresh-heartbeat-gated, so a
     # dead two-hand poller can't strand the cursor.)
-    yielding = real_input_recent() or two_hand_active()
+    two_hand = two_hand_active()
+    yielding = real_input_recent() or two_hand
     # The nearest body's id this tick (stashed by _hand_sample) so the controller
     # PINS the controlling body and releases — rather than silently retargets — if
     # a closer 2nd person steals the "nearest" slot mid-drag (FILTER 6).
@@ -2238,16 +2246,28 @@ def _poll_once(ctrl: AirMouseController, bridge) -> Optional[AirMouseDecision]:
         for button, action in decision.button_edges:
             if action == "up":
                 _mouse_button("up", button)
-        _clear_overlay_state()
-        # Publish DISENGAGED to the preview: with the air-mouse off the HUD
-        # hand-circle must show idle/grey (or nothing), never a live blue/orange.
-        _set_air_mouse_state(False, "open", None)
+        # Write-once-on-edge: publish the hidden overlay + DISENGAGED preview
+        # state (grey hand-circle, never live blue/orange) exactly once per
+        # disable, not on every ~33 ms tick — the poller runs even when the
+        # feature is off, and a per-tick rewrite is SSD churn that also fights
+        # the two-hand poller for AIR_CURSOR_STATE_FILE.
+        if not _disabled_state_published[0]:
+            _clear_overlay_state()
+            _set_air_mouse_state(False, "open", None)
+            _disabled_state_published[0] = True
         return decision
 
     # Enabled + not staging: act.
+    _disabled_state_published[0] = False
     _apply_decision(decision)
     visible = tracked and decision.overlay != "hidden"
-    _publish_overlay_state(decision, visible)
+    # STAND DOWN on the overlay file too: while two-hand mode is active its
+    # poller owns AIR_CURSOR_STATE_FILE (dual reticles). Publishing our hidden
+    # frames at ~30 Hz alongside it makes the overlay strobe between dual-
+    # reticle and hidden depending on which writer landed last — so stay quiet;
+    # the two-hand skill edge-clears the file itself when its mode ends.
+    if not two_hand:
+        _publish_overlay_state(decision, visible)
     # Publish the LIVE engage state + which hand + grip for the HUD skeleton
     # preview's hand circle (B2): engaged→blue, closed→orange, disengaged→grey,
     # drawn on the controlling hand. Read off the controller (engaged + hand) +

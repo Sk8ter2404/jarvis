@@ -797,6 +797,7 @@ def _act_skip_track(_: str = "") -> str:
             "complete": False,
             "user_skip": True,
         }
+        _append_jsonl(_HISTORY_FILE, entry)
         _append_jsonl(_SKIPS_FILE, entry)
 
     # Issue the actual skip — try iTunes COM first, fall back to media key.

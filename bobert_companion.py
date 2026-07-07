@@ -10903,6 +10903,7 @@ _STREAMING_SERVICES = {
     },
     "prime_video": {
         "name":             "Prime Video",
+        "tab_match":        ["prime video"],
         "home":             "https://www.primevideo.com",
         "search_url":       "https://www.primevideo.com/search/ref=atv_nb_sr?phrase={q}&ie=UTF8",
         "load_wait":        5.0,
@@ -10914,6 +10915,7 @@ _STREAMING_SERVICES = {
     },
     "disney_plus": {
         "name":             "Disney+",
+        "tab_match":        ["disney+", "disneyplus"],
         "home":             "https://www.disneyplus.com",
         "search_url":       "https://www.disneyplus.com/search?q={q}",
         "load_wait":        5.0,
@@ -10925,6 +10927,7 @@ _STREAMING_SERVICES = {
     },
     "hulu": {
         "name":             "Hulu",
+        "tab_match":        ["hulu"],
         "home":             "https://www.hulu.com",
         "search_url":       "https://www.hulu.com/search?q={q}",
         "load_wait":        5.0,
@@ -10936,6 +10939,9 @@ _STREAMING_SERVICES = {
     },
     "max": {
         "name":             "Max",
+        # "max" alone is a dangerously generic substring; require forms only
+        # the real Max tab title produces.
+        "tab_match":        ["hbo max", "max |", "play.max"],
         "home":             "https://play.max.com",
         "search_url":       "https://play.max.com/search?q={q}",
         "load_wait":        5.0,
@@ -11058,6 +11064,7 @@ _STREAMING_SERVICES = {
     },
     "spotify": {
         "name":             "Spotify",
+        "tab_match":        ["spotify"],
         "home":             "https://open.spotify.com",
         "search_url":       "https://open.spotify.com/search/{q}",
         "load_wait":        4.0,
@@ -11705,9 +11712,31 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
     q = query.strip()
     service_label = cfg["name"]
 
-    # Empty query: just open the homepage and stop.
+    # Empty query: just open the homepage and stop. Reuse-close goes through
+    # the SAME safe-handle contract as the query path: close ONLY the window
+    # JARVIS itself opened last time (recorded hwnd). When no handle is
+    # recorded, close NOTHING — the legacy title-substring close could match
+    # the user's own main browser window whose active-tab title happens to
+    # contain a term ("apple music", "youtube"...), which is exactly the
+    # destroy-the-user's-window bug the v1.85.0 hwnd contract fixed for the
+    # query path (2026-07-06 audit: this branch was left on legacy mode).
     if not q:
-        _open_url_in_browser(cfg["home"], close_matching=cfg.get("tab_match"))
+        _prior_hwnd = _JARVIS_MEDIA_WINDOW_HWND.get(service_key)
+        _open_url_in_browser(
+            cfg["home"],
+            close_matching=cfg.get("tab_match") if _prior_hwnd is not None else None,
+            close_hwnd=_prior_hwnd,
+        )
+        # Record the homepage window's handle so the NEXT media request for
+        # this service can reuse/close it safely (previously never recorded,
+        # so the follow-up request couldn't engage safe mode either).
+        _hp_terms = cfg.get("tab_match")
+        if _hp_terms:
+            time.sleep(min(2.0, float(cfg.get("load_wait", 2.0))))
+            _hp_win = _find_browser_window_matching(_hp_terms)
+            _hp_hwnd = getattr(_hp_win, "_hWnd", None) if _hp_win is not None else None
+            if _hp_hwnd is not None:
+                _JARVIS_MEDIA_WINDOW_HWND[service_key] = _hp_hwnd
         return f"opened {service_label}"
 
     # Step 1: choose the page to open and how to select the result.

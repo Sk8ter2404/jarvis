@@ -653,6 +653,7 @@ class NightOwlWatchLoopTests(unittest.TestCase):
         self.mod, _ = load_skill_isolated("night_owl_mode")
         self.mod._night_owl_active[0] = False
         self.mod._trigger[0] = ""
+        self.mod._engaged_in_window[0] = False
 
     @contextlib.contextmanager
     def _one_iteration(self):
@@ -694,6 +695,7 @@ class NightOwlWatchLoopTests(unittest.TestCase):
         # Manual engagement that the clock rolled past 06:00 → still released.
         self.mod._night_owl_active[0] = True
         self.mod._trigger[0] = "manual"
+        self.mod._engaged_in_window[0] = True   # the window covered it
         with mock.patch.object(self.mod, "_in_night_window", return_value=False), \
              mock.patch.object(self.mod, "is_night_owl_active", return_value=True), \
              mock.patch.object(self.mod, "_exit_night_owl") as ext, \
@@ -701,6 +703,23 @@ class NightOwlWatchLoopTests(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 self.mod._watch_loop()
         ext.assert_called_once_with(trigger="auto_morning")
+
+    def test_pre_window_manual_engagement_not_reverted(self):
+        # Regression: "night owl mode" at e.g. 21:30 — manual engage BEFORE
+        # the 23:00 window opens. The watcher must NOT auto-revert it with a
+        # spurious 'Good morning' on the next tick.
+        self.mod._night_owl_active[0] = True
+        self.mod._trigger[0] = "manual"
+        self.mod._engaged_in_window[0] = False  # window never covered it yet
+        with mock.patch.object(self.mod, "_in_night_window", return_value=False), \
+             mock.patch.object(self.mod, "is_night_owl_active", return_value=True), \
+             mock.patch.object(self.mod, "_enter_night_owl") as ent, \
+             mock.patch.object(self.mod, "_exit_night_owl") as ext, \
+             self._one_iteration():
+            with self.assertRaises(KeyboardInterrupt):
+                self.mod._watch_loop()
+        ent.assert_not_called()
+        ext.assert_not_called()
 
     def test_no_transition_when_inside_window_already_active(self):
         self.mod._night_owl_active[0] = True
@@ -714,6 +733,9 @@ class NightOwlWatchLoopTests(unittest.TestCase):
                 self.mod._watch_loop()
         ent.assert_not_called()
         ext.assert_not_called()
+        # An in-window tick marks the session as window-covered, so a later
+        # pre-window manual engage still rolls over come morning.
+        self.assertTrue(self.mod._engaged_in_window[0])
 
     def test_iteration_exception_is_logged_and_loop_continues(self):
         # First tick: _in_night_window raises → caught, logged, recovery sleep.

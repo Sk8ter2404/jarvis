@@ -78,7 +78,8 @@ def inject_modules(**mods):
 def _neutered_side_effects(mod):
     """Patch every external side effect of enter/exit so only the state
     machine runs."""
-    with mock.patch.object(mod, "_set_focus_assist", return_value=True), \
+    with mock.patch.object(mod, "_query_toast_enabled", return_value=1), \
+         mock.patch.object(mod, "_set_focus_assist", return_value=True), \
          mock.patch.object(mod, "_set_teams_presence", return_value=True), \
          mock.patch.object(mod, "_install_nudge_suppressors"), \
          mock.patch.object(mod, "_restore_nudge_suppressors"), \
@@ -198,7 +199,9 @@ class FocusStateMachineTests(unittest.TestCase):
     def test_enter_invokes_side_effects_and_records_results(self):
         # Verify the enter path actually calls each side effect and stores the
         # focus_assist / teams success flags it gets back.
-        with mock.patch.object(self.mod, "_set_focus_assist",
+        with mock.patch.object(self.mod, "_query_toast_enabled",
+                               return_value=1) as qte, \
+             mock.patch.object(self.mod, "_set_focus_assist",
                                return_value=True) as fa, \
              mock.patch.object(self.mod, "_set_teams_presence",
                                return_value=True) as tp, \
@@ -207,6 +210,7 @@ class FocusStateMachineTests(unittest.TestCase):
              mock.patch.object(self.mod, "_start_expiry_thread") as expt, \
              mock.patch.object(self.mod, "_enqueue_speech") as enq:
             self.mod._enter_focus_mode(600, trigger="voice")
+        qte.assert_called_once()
         fa.assert_called_once_with(enable_dnd=True)
         tp.assert_called_once_with("DoNotDisturb")
         ins.assert_called_once()
@@ -249,6 +253,30 @@ class FocusStateMachineTests(unittest.TestCase):
         tp.assert_called_once_with("Available")
         self.assertFalse(self.mod._focus_assist_was_set[0])
         self.assertFalse(self.mod._teams_was_set[0])
+
+    def test_exit_does_not_reenable_toasts_user_kept_disabled(self):
+        # Regression: if the user had ToastEnabled=0 before focus mode, exit
+        # must not force toasts back on — restore means "leave as found".
+        with mock.patch.object(self.mod, "_query_toast_enabled",
+                               return_value=0), \
+             mock.patch.object(self.mod, "_set_focus_assist",
+                               return_value=True), \
+             mock.patch.object(self.mod, "_set_teams_presence",
+                               return_value=True), \
+             mock.patch.object(self.mod, "_install_nudge_suppressors"), \
+             mock.patch.object(self.mod, "_apply_prompt_addendum"), \
+             mock.patch.object(self.mod, "_start_expiry_thread"), \
+             mock.patch.object(self.mod, "_enqueue_speech"):
+            self.mod._enter_focus_mode(600, trigger="voice")
+        with mock.patch.object(self.mod, "_set_focus_assist") as fa, \
+             mock.patch.object(self.mod, "_set_teams_presence",
+                               return_value=True), \
+             mock.patch.object(self.mod, "_restore_nudge_suppressors"), \
+             mock.patch.object(self.mod, "_restore_prompt_addendum"), \
+             mock.patch.object(self.mod, "_enqueue_speech"):
+            self.mod._exit_focus_mode(reason="manual")
+        fa.assert_not_called()
+        self.assertFalse(self.mod._focus_assist_was_set[0])
 
 
 class FocusActionTests(unittest.TestCase):

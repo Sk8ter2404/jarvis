@@ -359,10 +359,11 @@ def _format_clock(now: time.struct_time) -> str:
 
 
 def _try_pattern_offer() -> str:
-    """Surface a strong day-of-week / time-of-day habit from pattern_memory.
+    """Surface a strong day-of-week / time-of-day habit from the pattern
+    memory (top-level ``memory`` module).
     maybe_pattern_offer() self-throttles to once-per-day per pattern key."""
     try:
-        pm = importlib.import_module("pattern_memory")
+        pm = importlib.import_module("memory")
     except Exception:
         return ""
     try:

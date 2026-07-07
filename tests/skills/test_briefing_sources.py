@@ -330,6 +330,31 @@ class BriefingSourcesTests(unittest.TestCase):
                                return_value={"access_token": "x", "expires_at": 1.0}):
             self.assertIsNone(self.mod._meeting_from_graph("today"))
 
+    def test_graph_window_sent_in_utc_to_match_prefer_header(self):
+        # The Prefer header pins Graph to UTC, so the local-naive window must
+        # be converted local -> UTC before it goes on the query string.
+        start_local = datetime.datetime(2026, 6, 1, 12, 0, 0)
+        end_local = datetime.datetime(2026, 6, 1, 23, 59, 59)
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            return _fake_response({"value": []})
+
+        with mock.patch.object(self.mod, "_safe_load_json",
+                               return_value={"access_token": "x"}), \
+             mock.patch.object(self.mod, "_meeting_window",
+                               return_value=(start_local, end_local)), \
+             mock.patch.object(self.mod.urllib.request, "urlopen", fake_urlopen):
+            self.assertIsNone(self.mod._meeting_from_graph("today"))
+
+        import urllib.parse as _up
+        params = dict(_up.parse_qsl(_up.urlsplit(captured["url"]).query))
+        expected_start = start_local.astimezone(datetime.timezone.utc).isoformat()
+        expected_end = end_local.astimezone(datetime.timezone.utc).isoformat()
+        self.assertEqual(params["startDateTime"], expected_start)
+        self.assertEqual(params["endDateTime"], expected_end)
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # Config + small-IO helpers

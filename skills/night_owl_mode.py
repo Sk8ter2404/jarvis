@@ -88,6 +88,7 @@ _mode_lock         = threading.Lock()
 _night_owl_active  = [False]
 _started_at        = [0.0]
 _trigger           = [""]          # "auto" | "manual" | "phrase"
+_engaged_in_window = [False]       # True once the night window has covered this session
 
 _saved_resolve_preset: list = [None]
 _saved_enqueues: dict[str, object] = {}
@@ -335,6 +336,7 @@ def _enter_night_owl(trigger: str = "manual", *, announce: bool = True) -> str:
         _night_owl_active[0] = True
         _started_at[0]       = time.time()
         _trigger[0]          = trigger
+        _engaged_in_window[0] = _in_night_window()
 
     # Install side effects outside the lock — none of them block long, but
     # status queries shouldn't have to wait on them.
@@ -369,6 +371,7 @@ def _exit_night_owl(trigger: str = "manual", *, announce: bool = True) -> str:
         prev_trigger = _trigger[0]
         _trigger[0] = ""
         _started_at[0] = 0.0
+        _engaged_in_window[0] = False
 
     _restore_tts_modifier()
     _restore_nudge_suppressors()
@@ -401,15 +404,23 @@ def _watch_loop():
             active = is_night_owl_active()
             if in_window and not active:
                 _enter_night_owl(trigger="auto")
+            elif in_window and active:
+                # The window has caught up with a pre-window manual
+                # engagement — from here on the morning rollover applies.
+                _engaged_in_window[0] = True
             elif not in_window and active and _trigger[0] == "auto":
                 # Only auto-disengage automatically-engaged sessions —
                 # manual engagements stay until the user says so or the
                 # window naturally lapses.
                 _exit_night_owl(trigger="auto_morning")
-            elif not in_window and active and _trigger[0] != "auto":
+            elif not in_window and active and _trigger[0] != "auto" \
+                    and _engaged_in_window[0]:
                 # Manual engagement that the clock has rolled past 06:00:
                 # still auto-disengage so the user isn't stuck in dimmed
                 # mode all day from a forgotten previous-night command.
+                # A manual engage BEFORE 23:00 hasn't hit the window yet
+                # (_engaged_in_window is False), so it stays put instead
+                # of being reverted with a spurious 'Good morning'.
                 _exit_night_owl(trigger="auto_morning")
             time.sleep(WATCH_INTERVAL_SECONDS)
         except Exception:

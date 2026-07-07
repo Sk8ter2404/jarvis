@@ -345,12 +345,14 @@ class PushToPhoneTests(unittest.TestCase):
         # draft_confirm is None → with confirm=True the push is dropped.
         with mock.patch.object(self.mod, "draft_confirm", None):
             out = self.mod.push_to_phone("secret message", confirm=True)
-        self.assertEqual(out, {})
+        self.assertIsNone(out)
 
     def test_confirm_denied_drops(self):
+        # Denial returns None (not {}) so callers can tell a deliberate
+        # user drop apart from "no backend fired".
         with mock.patch.object(self.mod, "draft_confirm", return_value=False):
             out = self.mod.push_to_phone("msg", confirm=True)
-        self.assertEqual(out, {})
+        self.assertIsNone(out)
 
     def test_fans_out_to_configured_backends(self):
         with mock.patch.dict(os.environ,
@@ -498,6 +500,16 @@ class ActionTests(unittest.TestCase):
                                return_value={"ntfy": False}):
             out = self.actions["notify_phone"]("msg")
         self.assertIn("Send failed on every configured backend", out)
+
+    def test_notify_phone_denied_confirmation_is_not_a_failure(self):
+        # push_to_phone returns None when the user says 'no' to the
+        # read-back; notify_phone must not misreport that as a backend
+        # failure (the word 'failed' also trips the failure follow-up).
+        with mock.patch.dict(os.environ, {"NTFY_TOPIC": "t"}, clear=True), \
+             mock.patch.object(self.mod, "push_to_phone", return_value=None):
+            out = self.actions["notify_phone"]("msg")
+        self.assertNotIn("failed", out.lower())
+        self.assertIn("unsent", out)
 
     def test_notify_phone_strips_priority_shorthand(self):
         # The '!urgent ' prefix is consumed; the remaining body is forwarded.
@@ -915,8 +927,18 @@ class HandleSlashExtraTests(unittest.TestCase):
     def test_pause_routes(self):
         with mock.patch.object(self.mod, "pause_phone_bridge",
                                return_value="paused-string") as p:
-            self.assertEqual(self.mod._handle_slash("/pause"), "paused-string")
+            out = self.mod._handle_slash("/pause")
+        self.assertIn("paused-string", out)
+        # /pause kills the very loop that would receive /resume — the reply
+        # must tell the user to resume from the desk instead.
+        self.assertIn("resume phone bridge", out)
         p.assert_called_once()
+
+    def test_help_says_resume_is_desk_only(self):
+        # Regression: /resume was advertised as if it worked over Telegram,
+        # but /pause stops inbound polling so it can never be received.
+        out = self.mod._help_text()
+        self.assertIn("desk", out)
 
     def test_resume_routes(self):
         with mock.patch.object(self.mod, "resume_phone_bridge",

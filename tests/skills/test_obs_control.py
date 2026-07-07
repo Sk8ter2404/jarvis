@@ -24,9 +24,12 @@ from tests._skill_harness import load_skill_isolated
 
 
 class _Resp:
-    """Stand-in for an obs-websocket-py response: only `.datain` is read."""
-    def __init__(self, datain=None):
+    """Stand-in for an obs-websocket-py response: `.datain` plus `.status`
+    (obs-websocket-py never raises on a failed request — it returns normally
+    with status=False and the reason in datain['comment'])."""
+    def __init__(self, datain=None, status=True):
         self.datain = datain or {}
+        self.status = status
 
 
 class _FakeWS:
@@ -351,6 +354,102 @@ class ObsErrorBranchTests(unittest.TestCase):
                                  obs_requests=_fake_requests()):
             out = self.actions["obs_start_recording"]("")
         self.assertEqual(out, "Recording, sir.")
+
+
+class ObsFailedRequestStatusTests(unittest.TestCase):
+    """Regression: obs-websocket-py returns normally on a failed request with
+    .status=False — it does NOT raise. The old handlers only caught exceptions,
+    so every OBS refusal was reported as success ('Recording, sir.' while
+    nothing recorded). These assert the .status check catches the failure."""
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("obs_control")
+        self.mod._HAS_OBSWS = True
+
+    def _ws(self, responses):
+        ws = _FakeWS(responses=responses)
+        return ws, mock.patch.multiple(
+            self.mod, obsws=mock.MagicMock(return_value=ws),
+            obs_requests=_fake_requests())
+
+    def test_start_failed_already_active_is_friendly_noop(self):
+        _ws, patch = self._ws({"StartRecord": _Resp(
+            {"comment": "The output is already active."}, status=False)})
+        with patch:
+            out = self.actions["obs_start_recording"]("")
+        self.assertEqual(out, "OBS is already recording, sir.")
+
+    def test_start_failed_generic_reports_comment_not_success(self):
+        _ws, patch = self._ws({"StartRecord": _Resp(
+            {"comment": "No output configured."}, status=False)})
+        with patch:
+            out = self.actions["obs_start_recording"]("")
+        self.assertIn("refused to start recording", out)
+        self.assertIn("No output configured.", out)
+
+    def test_start_failed_without_comment_still_not_success(self):
+        _ws, patch = self._ws({"StartRecord": _Resp({}, status=False)})
+        with patch:
+            out = self.actions["obs_start_recording"]("")
+        self.assertNotEqual(out, "Recording, sir.")
+        self.assertIn("refused to start recording", out)
+
+    def test_stop_failed_not_active_is_friendly_noop(self):
+        _ws, patch = self._ws({"StopRecord": _Resp(
+            {"comment": "The output is not active."}, status=False)})
+        with patch:
+            out = self.actions["obs_stop_recording"]("")
+        self.assertEqual(out, "OBS isn't currently recording, sir.")
+
+    def test_pause_toggle_failed_status(self):
+        _ws, patch = self._ws({
+            "GetRecordStatus": _Resp({"outputActive": True, "outputPaused": False}),
+            "PauseRecord": _Resp({"comment": "Pause unsupported."}, status=False)})
+        with patch:
+            out = self.actions["obs_pause_recording"]("")
+        self.assertIn("refused to toggle pause", out)
+        self.assertNotIn("paused, sir", out)
+
+    def test_get_record_status_failed_status(self):
+        _ws, patch = self._ws({"GetRecordStatus": _Resp(
+            {"comment": "Not ready."}, status=False)})
+        with patch:
+            out = self.actions["obs_pause_recording"]("")
+        self.assertIn("didn't answer about recording state", out)
+
+    def test_switch_scene_set_failed_status_not_reported_as_switched(self):
+        _ws, patch = self._ws({
+            "GetSceneList": _Resp({"scenes": [{"sceneName": "Gameplay"}]}),
+            "SetCurrentProgramScene": _Resp({"comment": "ResourceNotFound"},
+                                            status=False)})
+        with patch:
+            out = self.actions["obs_switch_scene"]("gameplay")
+        self.assertIn("refused to switch scene", out)
+        self.assertNotIn("Scene switched", out)
+
+    def test_get_scene_list_failed_status(self):
+        _ws, patch = self._ws({"GetSceneList": _Resp(
+            {"comment": "Not ready."}, status=False)})
+        with patch:
+            out = self.actions["obs_switch_scene"]("gameplay")
+        self.assertIn("didn't return its scene list", out)
+
+    def test_toggle_mute_failed_status_not_reported_as_toggled(self):
+        _ws, patch = self._ws({
+            "GetInputList": _Resp({"inputs": [{"inputName": "Mic/Aux"}]}),
+            "ToggleInputMute": _Resp({"comment": "ResourceNotFound"},
+                                     status=False)})
+        with patch:
+            out = self.actions["obs_toggle_mute"]("mic")
+        self.assertIn("refused to toggle mute", out)
+        self.assertNotIn("muted, sir", out)
+
+    def test_get_input_list_failed_status(self):
+        _ws, patch = self._ws({"GetInputList": _Resp(
+            {"comment": "Not ready."}, status=False)})
+        with patch:
+            out = self.actions["obs_toggle_mute"]("mic")
+        self.assertIn("didn't return its input list", out)
 
 
 class ObsImportFallbackTests(unittest.TestCase):

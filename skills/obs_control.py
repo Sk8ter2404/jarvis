@@ -70,6 +70,21 @@ def _missing_dep_msg() -> str:
             f"pip install obs-websocket-py to enable OBS control{hint}")
 
 
+def _req_failed(resp) -> bool:
+    """True when an OBS request came back with requestStatus.result=false.
+    obs-websocket-py does NOT raise on a failed request — call() returns
+    normally and just sets `.status = False` on the response object, so
+    every handler must check this explicitly (the only exception the
+    library ever raises is MessageTimeout)."""
+    return getattr(resp, "status", True) is False
+
+
+def _req_reason(resp) -> str:
+    """OBS's human-readable error for a failed request (requestStatus.comment)."""
+    comment = (getattr(resp, "datain", None) or {}).get("comment")
+    return str(comment) if comment else "OBS declined the request"
+
+
 def _with_ws(fn):
     """Open a short-lived WebSocket connection to OBS, run `fn(ws)`, and
     return its result. Translates connection / auth failures into a tidy
@@ -104,13 +119,18 @@ def _with_ws(fn):
 def obs_start_recording(_: str = "") -> str:
     def _go(ws):
         try:
-            ws.call(obs_requests.StartRecord())
+            resp = ws.call(obs_requests.StartRecord())
         except Exception as e:
-            # OBS replies with a typed error if recording is already running;
-            # treat that as a friendly no-op rather than a failure.
             if "already" in str(e).lower():
                 return "OBS is already recording, sir."
             return f"OBS refused to start recording: {e}"
+        if _req_failed(resp):
+            # OBS replies with a typed error if recording is already running;
+            # treat that as a friendly no-op rather than a failure.
+            reason = _req_reason(resp)
+            if "already" in reason.lower():
+                return "OBS is already recording, sir."
+            return f"OBS refused to start recording: {reason}"
         return "Recording, sir."
     return _with_ws(_go)
 
@@ -118,11 +138,16 @@ def obs_start_recording(_: str = "") -> str:
 def obs_stop_recording(_: str = "") -> str:
     def _go(ws):
         try:
-            ws.call(obs_requests.StopRecord())
+            resp = ws.call(obs_requests.StopRecord())
         except Exception as e:
             if "not" in str(e).lower() and "record" in str(e).lower():
                 return "OBS isn't currently recording, sir."
             return f"OBS refused to stop recording: {e}"
+        if _req_failed(resp):
+            reason = _req_reason(resp)
+            if "not" in reason.lower():
+                return "OBS isn't currently recording, sir."
+            return f"OBS refused to stop recording: {reason}"
         return "Recording stopped, sir."
     return _with_ws(_go)
 
@@ -137,6 +162,8 @@ def obs_pause_recording(_: str = "") -> str:
             status = ws.call(obs_requests.GetRecordStatus())
         except Exception as e:
             return f"OBS didn't answer about recording state: {e}"
+        if _req_failed(status):
+            return f"OBS didn't answer about recording state: {_req_reason(status)}"
         # obs-websocket-py exposes response fields via .datain — the v5
         # GetRecordStatus reply carries outputActive + outputPaused.
         data = getattr(status, "datain", None) or {}
@@ -146,9 +173,13 @@ def obs_pause_recording(_: str = "") -> str:
             return "OBS isn't recording right now, sir."
         try:
             if paused:
-                ws.call(obs_requests.ResumeRecord())
+                resp = ws.call(obs_requests.ResumeRecord())
+                if _req_failed(resp):
+                    return f"OBS refused to toggle pause: {_req_reason(resp)}"
                 return "Recording resumed, sir."
-            ws.call(obs_requests.PauseRecord())
+            resp = ws.call(obs_requests.PauseRecord())
+            if _req_failed(resp):
+                return f"OBS refused to toggle pause: {_req_reason(resp)}"
             return "Recording paused, sir."
         except Exception as e:
             return f"OBS refused to toggle pause: {e}"
@@ -166,6 +197,8 @@ def obs_switch_scene(name: str = "") -> str:
             scenes_resp = ws.call(obs_requests.GetSceneList())
         except Exception as e:
             return f"OBS didn't return its scene list: {e}"
+        if _req_failed(scenes_resp):
+            return f"OBS didn't return its scene list: {_req_reason(scenes_resp)}"
         data = getattr(scenes_resp, "datain", None) or {}
         scene_names = [s.get("sceneName", "") for s in data.get("scenes", [])]
         # Case-insensitive resolution — voice transcripts won't preserve
@@ -185,9 +218,11 @@ def obs_switch_scene(name: str = "") -> str:
             return (f"No scene called '{name}', sir. Available: {preview}"
                     + ("..." if len(scene_names) > 6 else ""))
         try:
-            ws.call(obs_requests.SetCurrentProgramScene(sceneName=match))
+            resp = ws.call(obs_requests.SetCurrentProgramScene(sceneName=match))
         except Exception as e:
             return f"OBS refused to switch scene: {e}"
+        if _req_failed(resp):
+            return f"OBS refused to switch scene: {_req_reason(resp)}"
         return f"Scene switched to '{match}', sir."
     return _with_ws(_go)
 
@@ -203,6 +238,8 @@ def obs_toggle_mute(source: str = "") -> str:
             inputs_resp = ws.call(obs_requests.GetInputList())
         except Exception as e:
             return f"OBS didn't return its input list: {e}"
+        if _req_failed(inputs_resp):
+            return f"OBS didn't return its input list: {_req_reason(inputs_resp)}"
         data = getattr(inputs_resp, "datain", None) or {}
         input_names = [i.get("inputName", "") for i in data.get("inputs", [])]
         match = next((n for n in input_names if n.lower() == source.lower()), None)
@@ -222,6 +259,8 @@ def obs_toggle_mute(source: str = "") -> str:
             resp = ws.call(obs_requests.ToggleInputMute(inputName=match))
         except Exception as e:
             return f"OBS refused to toggle mute: {e}"
+        if _req_failed(resp):
+            return f"OBS refused to toggle mute: {_req_reason(resp)}"
         # Report the new state if OBS told us; otherwise just confirm the
         # toggle landed.
         new_muted = (getattr(resp, "datain", None) or {}).get("inputMuted")

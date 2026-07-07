@@ -506,14 +506,18 @@ class BedRemarkTests(unittest.TestCase):
     def setUp(self):
         self.mod, _ = load_skill_isolated("morning_briefing")
 
-    def test_no_memory_file_blank(self):
-        with mock.patch.object(self.mod.os.path, "exists", return_value=False):
-            self.assertEqual(self.mod._bed_remark(), "")
-
-    def test_memory_unreadable_blank(self):
-        with mock.patch.object(self.mod.os.path, "exists", return_value=True), \
-             mock.patch("builtins.open", side_effect=OSError("locked")):
-            self.assertEqual(self.mod._bed_remark(), "")
+    def test_remark_without_memory_file(self):
+        # Regression: bobert_memory.json is NOT required — the signal is the
+        # newest log mtime, so a fresh install without a memory file still
+        # gets the late-night remark.
+        late = time.mktime(time.struct_time((2026, 6, 1, 3, 15, 0, 0, 152, -1)))
+        with mock.patch.object(self.mod.os.path, "exists", return_value=False), \
+             mock.patch.object(self.mod.os.path, "isdir", return_value=True), \
+             mock.patch.object(self.mod.os, "listdir", return_value=["s.log"]), \
+             mock.patch.object(self.mod.os.path, "getmtime", return_value=late):
+            out = self.mod._bed_remark()
+        self.assertIn("3:15 AM", out)
+        self.assertIn("pace yourself", out)
 
     def test_no_logs_dir_blank(self):
         with mock.patch.object(self.mod.os.path, "exists", return_value=True), \
@@ -638,6 +642,18 @@ class BuildAndFireTests(unittest.TestCase):
         self.assertIn("Bring an umbrella, sir.", out)
         self.assertIn("The part shipped.", out)
         self.assertFalse(out.startswith("[intent:briefing]"))
+
+    def test_build_bed_remark_appended_to_empty_queue(self):
+        # Regression: the remark must survive even when there are no tasks —
+        # it used to be dropped outside the pending>1 branch.
+        with self._all_sources(_count_pending_tasks=0, _bed_remark=" — pace yourself"):
+            out = self.mod._build_briefing()
+        self.assertIn("mercifully empty — pace yourself.", out)
+
+    def test_build_bed_remark_appended_to_single_task(self):
+        with self._all_sources(_count_pending_tasks=1, _bed_remark=" — pace yourself"):
+            out = self.mod._build_briefing()
+        self.assertIn("one task queued — pace yourself.", out)
 
     def test_build_bed_remark_appended_to_multi_task(self):
         with self._all_sources(_count_pending_tasks=5, _bed_remark=" — pace yourself"):

@@ -417,13 +417,14 @@ def push_to_phone(message: str,
                   title: str = "",
                   backends: list[str] | None = None,
                   confirm: bool = True,
-                  recipient: str = "your phone") -> dict[str, bool]:
+                  recipient: str = "your phone") -> dict[str, bool] | None:
     """Broadcast a message to every configured phone backend.
 
     Returns a dict of {backend_name: success_bool}. Backends that aren't
     configured don't appear in the dict (vs. False, which means
     "configured but the send failed"). A denied / timed-out confirmation
-    returns ``{}`` — no backend was attempted, the message was dropped.
+    returns ``None`` — no backend was attempted, the message was dropped
+    deliberately, which callers must NOT report as a send failure.
 
     `priority` is one of: low | normal | high | urgent.
       - ntfy maps it to its 5-level scale.
@@ -468,11 +469,11 @@ def push_to_phone(message: str,
             # passing confirm=False once the underlying issue is fixed.
             print(f"  [phone/{source}] confirmation gate unavailable; "
                   f"dropping message: {message}")
-            return {}
+            return None
         if not draft_confirm(message, recipient=recipient):
             print(f"  [phone/{source}] push denied / unconfirmed — "
                   f"dropped: {message}")
-            return {}
+            return None
 
     title = title or "JARVIS"
     requested = set(backends or [])
@@ -663,8 +664,10 @@ def _help_text() -> str:
         "Slash commands:\n"
         "  /help    — this message\n"
         "  /status  — backend health summary\n"
-        "  /pause   — pause inbound polling\n"
-        "  /resume  — resume inbound polling\n"
+        "  /pause   — pause inbound polling (stops this bot listening, so "
+        "resume from the desk: 'resume phone bridge')\n"
+        "  /resume  — resume inbound polling (desk voice only — /pause "
+        "stops me reading Telegram)\n"
         "  /mode    — show current conversation mode\n\n"
         "Backends configured: " + (", ".join(backends_present) or "(none)") + "."
     )
@@ -685,7 +688,12 @@ def _handle_slash(text: str) -> str:
         return phone_bridge_status("")
 
     if cmd == "pause":
-        return pause_phone_bridge("")
+        # Pausing stops the long-poll worker itself, so a later /resume
+        # can never arrive over Telegram — be explicit about that here
+        # rather than letting the user discover the bridge is deaf.
+        return (pause_phone_bridge("") + " Note: I've stopped reading "
+                "Telegram, so /resume won't reach me — say 'resume phone "
+                "bridge' at the desk to re-enable.")
 
     if cmd == "resume":
         return resume_phone_bridge("")
@@ -887,6 +895,10 @@ def notify_phone(arg: str) -> str:
                 "TELEGRAM_USER_ID, or NTFY_TOPIC, or PUSHOVER_TOKEN + "
                 "PUSHOVER_USER, then reload.")
     results = push_to_phone(message, priority=priority, source="voice")
+    if results is None:
+        # The read-back was denied (or never confirmed) — a deliberate
+        # drop, not a backend failure, so don't say "failed" here.
+        return "Understood, sir — I've dropped that message unsent."
     sent = [b for b, ok in results.items() if ok]
     failed = [b for b, ok in results.items() if not ok]
     if sent and not failed:

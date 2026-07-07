@@ -746,14 +746,27 @@ def _act_network_usage(_: str = "") -> str:
             return float(d.get("up_total") or 0) + float(d.get("down_total") or 0)
         except Exception:
             return 0.0
+    def speed(d: dict) -> float:
+        try:
+            return float(d.get("up_speed") or 0) + float(d.get("down_speed") or 0)
+        except Exception:
+            return 0.0
     ranked = sorted(snap.get("devices", []), key=total, reverse=True)
     ranked = [d for d in ranked if total(d) > 0]
+    if ranked:
+        top = ranked[:5]
+        parts = [f"{_device_name(d)} ({_fmt_bytes(total(d))})" for d in top]
+        return "Top bandwidth users, sir: " + "; ".join(parts) + "."
+    # No byte totals on this firmware — fall back to instantaneous
+    # up/down speeds, which the Deco does report per client.
+    ranked = sorted(snap.get("devices", []), key=speed, reverse=True)
+    ranked = [d for d in ranked if speed(d) > 0]
     if not ranked:
         return ("The Deco isn't reporting per-client byte totals on this "
                 "firmware, sir. Topology and online state only.")
     top = ranked[:5]
-    parts = [f"{_device_name(d)} ({_fmt_bytes(total(d))})" for d in top]
-    return "Top bandwidth users, sir: " + "; ".join(parts) + "."
+    parts = [f"{_device_name(d)} ({_fmt_bytes(speed(d))}/s)" for d in top]
+    return "Top bandwidth users right now, sir: " + "; ".join(parts) + "."
 
 
 def _set_guest_network(enabled: bool) -> str:

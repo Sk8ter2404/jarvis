@@ -278,6 +278,28 @@ class GetUpcomingEventsTests(unittest.TestCase):
         self.assertEqual(events[0]["organizer"], "Alice")
         self.assertIsInstance(events[0]["start"], datetime.datetime)
 
+    def test_window_params_carry_local_utc_offset(self):
+        # Graph reads offset-less datetimes as UTC, which would skew the
+        # query window by the machine's UTC offset. The params must carry
+        # an explicit offset that still represents the local wall time.
+        captured = {}
+
+        def fake_get(path, params=None):
+            captured.update(params or {})
+            return {"value": []}
+
+        with mock.patch.object(self.mod, "_graph_get", side_effect=fake_get):
+            self.mod.get_upcoming_events(top_n=3, when="today")
+
+        start_local, end_local = self.mod._meeting_window("today")
+        for key, naive_local in (("startDateTime", start_local),
+                                 ("endDateTime", end_local)):
+            sent = datetime.datetime.fromisoformat(captured[key])
+            self.assertIsNotNone(sent.tzinfo, key)  # old code sent no offset
+            # Same local wall time (allow a little clock drift for 'now').
+            drift = abs((sent.replace(tzinfo=None) - naive_local).total_seconds())
+            self.assertLess(drift, 5, key)
+
 
 class TeamsUnreadTests(unittest.TestCase):
     def setUp(self):

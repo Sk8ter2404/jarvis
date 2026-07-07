@@ -691,12 +691,20 @@ def _handle_state_change() -> None:
     if gcode_state == "FAILED":
         key = "failed"
         if key not in _announced_error_codes:
+            # Durable per-print dedup — like FINISH / err — so a JARVIS bounce
+            # while the printer still shows FAILED doesn't replay the failure
+            # announcement on every boot.
+            rstate = _load_reminder_persistence()
+            failed_key = f"failed:{fname or '_anon_'}"
             _announced_error_codes.add(key)
-            layer_str = f" at layer {layer}" if layer else ""
-            _enqueue_speech(
-                f"I'm afraid the print has failed{layer_str}, sir. "
-                "You'll want to check the printer."
-            )
+            if not rstate.get(failed_key):
+                layer_str = f" at layer {layer}" if layer else ""
+                _enqueue_speech(
+                    f"I'm afraid the print has failed{layer_str}, sir. "
+                    "You'll want to check the printer."
+                )
+                rstate[failed_key] = {"ts": time.time(), "fname": fname}
+                _save_reminder_persistence(rstate)
 
     # Fan out to companion modules (proactive_print_companion, etc.).
     # Hook errors are swallowed inside _fire_state_change_hooks so a buggy
