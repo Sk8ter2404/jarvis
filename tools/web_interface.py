@@ -740,6 +740,74 @@ class _Handler(BaseHTTPRequestHandler):
             return True
         return self._request_token(query) == token
 
+    # ── anti-CSRF / anti-DNS-rebinding for state-changing POSTs ──────────────
+    @staticmethod
+    def _host_of(value: str) -> str:
+        """Bare lowercase hostname from a Host/Origin/Referer header value —
+        scheme, path and port stripped, IPv6 brackets kept (``[::1]``).
+        ``"http://localhost:8766/x"`` → ``"localhost"``; ``"127.0.0.1:8766"`` →
+        ``"127.0.0.1"``; ``"[::1]:8766"`` → ``"[::1]"``. Empty on junk."""
+        if not value:
+            return ""
+        v = value.strip()
+        if "://" in v:
+            v = v.split("://", 1)[1]
+        v = v.split("/", 1)[0]            # drop any path
+        if v.startswith("["):            # IPv6 literal: keep the [..] intact
+            return v.split("]", 1)[0].lower() + "]"
+        if ":" in v:                     # strip :port on a plain host/IPv4
+            v = v.rsplit(":", 1)[0]
+        return v.lower()
+
+    def _served_hosts(self) -> set:
+        """Hostnames this server legitimately answers to: loopback plus the
+        configured bind. A request whose Host/Origin is outside this set is either
+        a DNS-rebinding attempt (foreign Host resolved to us) or a cross-site POST
+        (foreign Origin)."""
+        hosts = {"localhost", "127.0.0.1", "[::1]", "::1"}
+        bind = str(self.server.config.get("bind", "127.0.0.1")).strip().lower()  # type: ignore[attr-defined]
+        if bind and bind not in ("0.0.0.0", "::"):
+            hosts.add(bind)
+        return hosts
+
+    def _state_change_allowed(self) -> tuple:
+        """Guard for state-changing POSTs (/api/say, /api/settings) on the
+        token-FREE local bind. Blocks the two browser-driven attacks that the
+        token would otherwise have covered:
+
+          * DNS rebinding — a page on evil.com rebinds it to 127.0.0.1 and POSTs
+            same-origin; caught because the Host header is ``evil.com``, not ours.
+          * Cross-site POST (CSRF) — a page on evil.com fetch()es our localhost
+            URL; caught because the Origin/Referer host is ``evil.com``.
+
+        Non-browser clients (curl, PowerShell, the driver) send no Origin and a
+        loopback Host, so they pass untouched. When a TOKEN is configured we skip
+        this entirely: the token is already an unforgeable boundary an attacker
+        can't satisfy, and the owner may legitimately reach an exposed bind by LAN
+        IP or hostname (which this allowlist would otherwise reject).
+
+        Returns ``(ok, reason)``."""
+        if self._token():
+            return True, ""                       # token IS the boundary
+        served = self._served_hosts()
+        host = self._host_of(self.headers.get("Host", ""))
+        if host and host not in served:           # foreign Host → rebinding
+            return False, "host"
+        origin = self.headers.get("Origin", "")
+        if origin:
+            if self._host_of(origin) not in served:
+                return False, "origin"
+        else:
+            # Some browsers omit Origin on same-origin POST; fall back to Referer.
+            ref = self.headers.get("Referer", "")
+            if ref and self._host_of(ref) not in served:
+                return False, "referer"
+        return True, ""
+
+    def _forbidden(self, reason: str) -> None:
+        self._send_json({"error": f"cross-origin request refused ({reason})"},
+                        code=403)
+
     # ── tiny response helpers ────────────────────────────────────────────────
     def _send_json(self, obj: dict, code: int = 200) -> None:
         body = json.dumps(obj).encode("utf-8")
@@ -826,6 +894,16 @@ class _Handler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/") or "/"
         query = urllib.parse.parse_qs(parsed.query)
         cfg = self.server.config  # type: ignore[attr-defined]
+
+        # Both POST routes below change state (run a command / write config). On a
+        # token-free local bind, refuse a browser-driven cross-origin or rebound
+        # request BEFORE doing anything — closes the localhost-CSRF / DNS-rebinding
+        # hole the token would otherwise cover. No-op when a token is set or the
+        # caller isn't a browser. Applied to /api/say and /api/settings alike.
+        if path in ("/api/settings", "/api/say"):
+            ok, why = self._state_change_allowed()
+            if not ok:
+                return self._forbidden(why)
 
         # POST /api/settings — WRITE settings. A settings write is POWERFUL (it can
         # flip WEB_INTERFACE_BIND/TOKEN, enable ambient listening, etc.), so it is
@@ -1461,6 +1539,7 @@ def create_server(*, bind: str, port: int, token: str = "",
     # JARVIS_SETTINGS_PATH redirect is honoured at server-construction time.
     httpd.config = {  # type: ignore[attr-defined]
         "token": (token or "").strip(),
+        "bind": bind,          # for the anti-CSRF/rebinding Host+Origin allowlist
         "local_bind": local,
         "inject_path": inject_path,
         "log_dir": log_dir,
