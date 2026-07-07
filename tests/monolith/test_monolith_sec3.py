@@ -4095,6 +4095,45 @@ class GetMicBufferPathBTests(MonolithGlobalsTestCase):
         self.assertEqual(out.dtype, np.float32)
         scs.assert_called_once()
 
+    def test_path_b_holds_mic_ownership_then_restores(self):
+        # 2026-07-07 bug-hunt (MED): Path B must publish _record_speech_active
+        # True (+ sr = target) BEFORE opening the stream so a concurrent
+        # _refresh_devices can't sd._terminate()/_initialize() PortAudio out from
+        # under it (heap corruption), and RESTORE the prior values afterward.
+        self.bc._record_speech_active[0] = False
+        self._saved_sr = list(self.bc._record_speech_sr)
+        self.addCleanup(lambda: self.bc._record_speech_sr.__setitem__(
+            slice(None), self._saved_sr))
+        self.bc._record_speech_sr[0] = 44100     # a prior value that must return
+        seen = {}
+
+        class _FakeStream:
+            def __init__(_s, *a, **k):
+                _s._cb = k["callback"]
+
+            def start(_s):
+                # Sampled WHILE the stream is live → ownership must read True and
+                # the published sr must reflect THIS stream, not the old 44100.
+                seen["active"] = self.bc._record_speech_active[0]
+                seen["sr"] = self.bc._record_speech_sr[0]
+                _s._cb(np.ones(16000, dtype=np.float32).reshape(-1, 1),
+                       16000, None, None)
+
+        fake_sd = mock.Mock()
+        fake_sd.InputStream.side_effect = _FakeStream
+        with mock.patch.object(self.bc, "_mic_input_disabled",
+                               return_value=False), \
+                mock.patch.object(self.bc, "sd", fake_sd), \
+                mock.patch.object(self.bc, "get_input_device", return_value=3), \
+                mock.patch.object(self.bc, "_safe_close_stream"), \
+                mock.patch.object(self.bc.time, "sleep"):
+            out = self.bc.get_mic_buffer(0.5, sample_rate=16000)
+        self.assertIsNotNone(out)
+        self.assertTrue(seen["active"])          # ownership held during capture
+        self.assertEqual(seen["sr"], 16000)      # sr reflects the live stream
+        self.assertFalse(self.bc._record_speech_active[0])  # restored
+        self.assertEqual(self.bc._record_speech_sr[0], 44100)  # restored
+
     def test_path_b_no_frames_returns_none(self):
         # 4898-4899: stream starts but never delivers → deadline → None.
         self.bc._record_speech_active[0] = False

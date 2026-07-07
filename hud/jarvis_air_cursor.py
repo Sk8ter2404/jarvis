@@ -918,7 +918,14 @@ class AirCursorOverlay:
         #    ever painting a large surface. ────────────────────────────────────
         if self.two_hand and self.hand_pts is not None:
             self._tick_two_hand()
-            self._prev_visible = True
+            # Leave _prev_visible FALSE so the single-hand path re-SNAPS on the
+            # first frame after we drop back to one hand (its snap gate at
+            # ~L859 keys on `not self._prev_visible`). Previously this was True,
+            # so exiting two-hand mode toward a hand on another monitor made the
+            # single reticle LERP across the whole desktop — a visible streak.
+            # The two-hand reticles use cur_x (untouched here), not _prev_visible,
+            # so this is safe. 2026-07-07 bug-hunt (cosmetic).
+            self._prev_visible = False
             self.root.after(TICK_MS, self.tick)
             return
         # Left two-hand mode (or never in it): hide the 2nd window so a stale 2nd
