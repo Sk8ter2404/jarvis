@@ -64,6 +64,7 @@ def complete(
     if system is not None:
         kwargs["system"] = system
     msg = _client(timeout).messages.create(**kwargs)
+    _log_cache_usage(getattr(msg, "usage", None))
     return _first_text(msg)
 
 
@@ -99,7 +100,35 @@ def stream_text(
                     on_delta(chunk)
                 except Exception:
                     pass
+        try:
+            _log_cache_usage(getattr(stream.get_final_message(), "usage", None))
+        except Exception:
+            pass   # telemetry only — never let it taint a successful stream
     return "".join(parts)
+
+
+# Rolling cache-hit telemetry. One short line per cloud call so the session
+# log shows whether the prompt-cache split (_cached_system_param) is actually
+# landing: `cache_read` tokens are billed at 10% — a healthy steady state is
+# a large constant cache_read with a small volatile `input` remainder.
+# Kept module-global (not per-call) so a tail of the log tells the story.
+last_usage: dict = {}
+
+
+def _log_cache_usage(usage: Any) -> None:
+    if usage is None:
+        return
+    try:
+        read = getattr(usage, "cache_read_input_tokens", None) or 0
+        made = getattr(usage, "cache_creation_input_tokens", None) or 0
+        raw = getattr(usage, "input_tokens", None) or 0
+        out = getattr(usage, "output_tokens", None) or 0
+        last_usage.update(cache_read=read, cache_creation=made,
+                          input=raw, output=out)
+        print(f"  [llm] tokens in={raw} out={out} "
+              f"cache_read={read} cache_write={made}")
+    except Exception:
+        pass
 
 
 def _first_text(msg: Any) -> str:
