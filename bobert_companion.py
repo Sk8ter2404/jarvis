@@ -19868,6 +19868,15 @@ def _run_llm_dispatch(text: str) -> str:
         # LLM chains system_pulse). Voice its result here too, deduped against
         # the follow-up prose just spoken.
         _spoke_verbatim |= _speak_verbatim_results(current_results, f_spoken)
+    # TRIM after the follow-up chain (2026-07-07 bug-hunt, MED). Each depth
+    # iteration appends an assistant message but _call_llm only trims ONCE,
+    # BEFORE this loop runs — so a multi-step chain (depth cap 8, agent mode 24)
+    # left up to N extra assistant turns on conversation_history, blowing past
+    # MAX_CONVERSATION_HISTORY and re-sending those tokens on EVERY later turn
+    # until the pair-trim slowly walked them off the front. Trimming here bounds
+    # the history the moment the chain ends, so the per-turn cloud-prompt cost
+    # can't creep with chain depth.
+    _trim_conversation_history()
     return reply
 
 
