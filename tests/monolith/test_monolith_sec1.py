@@ -3528,6 +3528,25 @@ class FocusModeGateTests(_MonolithTestBase):
         bc.set_focus_mode(False)
         bc.clear_focus_missed()
 
+    def test_timed_expiry_resume_recap_announced_exactly_once(self):
+        # 2026-07-07 review (LOW): the resume LATCH. focus_mode_active() is called
+        # from many daemon threads; when a timed block lapses, only the FIRST
+        # caller may flip focus off + announce the recap. A second (concurrent)
+        # caller must see it already resumed and announce NOTHING — no spurious
+        # "nothing came up". Sequential calls here simulate the two racing threads.
+        import time as _time
+        bc = self.bc
+        bc.set_focus_mode(True, until=_time.time() - 1.0)   # already expired
+        with bc._focus_missed_lock:
+            bc._focus_missed_buffer.append(("the print finished", "bambu", 0.0))
+        with mock.patch.object(bc, "proactive_announce") as pa:
+            r1 = bc.focus_mode_active()      # first thread: resumes + recaps
+            r2 = bc.focus_mode_active()      # second thread: already resumed
+        self.assertFalse(r1)
+        self.assertFalse(r2)
+        self.assertEqual(pa.call_count, 1, "recap must be announced exactly once")
+        self.assertIn("print finished", pa.call_args_list[0].args[0])
+
     def test_active_focus_holds_into_missed_buffer_not_pending_speech(self):
         bc = self.bc
         bc.set_focus_mode(True)   # indefinite focus
