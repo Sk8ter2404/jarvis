@@ -223,5 +223,58 @@ class TestFailsafe(AirControlSkillTest):
             self.assertIn("already off", out)
 
 
+class TestAutoYield(AirControlSkillTest):
+    def test_real_input_suppresses_ops_and_releases_drag(self):
+        # Owner touches the real mouse mid-run: the loop must stop applying
+        # ops (no moveTo while suppressed) and release a held drag.
+        mod, actions = self._load(_fake_bridge())
+        fake_yield = mock.Mock()
+        fake_yield.install.return_value = True
+        fake_yield.real_input_recent.return_value = True
+        fake_yield.mark_self_action.return_value = None
+        with mock.patch.object(mod, "_yield_mod", return_value=fake_yield):
+            actions["air_control_on"]()
+            self.assertTrue(self._wait(
+                lambda: fake_yield.real_input_recent.called))
+            # Simulate a drag in progress so release() returns an OP_UP.
+            eng = mod._engine
+            if eng is not None:
+                eng._button_down = True
+            self.assertTrue(self._wait(lambda: self.pg.mouseUp.called))
+            self.pg.moveTo.assert_not_called()   # never drove the cursor
+            actions["air_control_off"]()
+
+    def test_missing_yield_helper_is_old_behavior(self):
+        # No _air_mouse_yield module → accessors degrade: no suppression, no
+        # raise; the loop runs exactly as before.
+        mod, actions = self._load(_fake_bridge())
+        with mock.patch.object(mod, "_yield_mod", return_value=None):
+            self.assertFalse(mod._real_input_recent())
+            mod._install_yield_watcher()          # must not raise
+            mod._mark_self_action()               # must not raise
+            actions["air_control_on"]()
+            self.assertTrue(self._wait(lambda: mod._loop_running()))
+            actions["air_control_off"]()
+
+    def test_self_actions_marked_after_real_op(self):
+        # When the engine emits a real op, the loop must tell the watcher it
+        # was self-injected (so the polling fallback can't mistake it for the
+        # owner's hand on the mouse).
+        from core.air_control import AirOp, OP_MOVE
+        mod, actions = self._load(_fake_bridge())
+        fake_yield = mock.Mock()
+        fake_yield.install.return_value = True
+        fake_yield.real_input_recent.return_value = False
+        with mock.patch.object(mod, "_yield_mod", return_value=fake_yield):
+            actions["air_control_on"]()
+            self.assertTrue(self._wait(lambda: mod._loop_running()))
+            with mock.patch.object(
+                    mod._engine, "update",
+                    return_value=AirOp(OP_MOVE, x=10, y=10, engaged=True)):
+                self.assertTrue(self._wait(
+                    lambda: fake_yield.mark_self_action.called))
+            actions["air_control_off"]()
+
+
 if __name__ == "__main__":
     unittest.main()
