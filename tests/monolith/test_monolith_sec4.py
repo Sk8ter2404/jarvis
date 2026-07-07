@@ -1349,6 +1349,221 @@ class StreamingGoFullscreenTests(MonolithGlobalsTestCase):
                 {"fullscreen_key": ("ctrl", "f"), "fullscreen_wait": 0}, "Svc")
         hk.assert_called_once_with("ctrl", "f")
 
+    def test_master_switch_off_is_noop(self):
+        # STREAMING_AUTO_FULLSCREEN off ⇒ no key sent even with a valid key +
+        # UI automation on. The master switch is read LIVE from core.config.
+        import core.config as _cfg
+        with mock.patch.object(self.bc, "ui_press") as press, \
+             mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
+             mock.patch.object(_cfg, "STREAMING_AUTO_FULLSCREEN", False), \
+             mock.patch.object(self.bc.time, "sleep"):
+            self.bc._streaming_go_fullscreen(
+                {"fullscreen_key": "f", "fullscreen_wait": 0}, "Svc")
+        press.assert_not_called()
+
+    def test_master_switch_on_sends_key(self):
+        import core.config as _cfg
+        with mock.patch.object(self.bc, "ui_press") as press, \
+             mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
+             mock.patch.object(_cfg, "STREAMING_AUTO_FULLSCREEN", True), \
+             mock.patch.object(self.bc.time, "sleep"):
+            self.bc._streaming_go_fullscreen(
+                {"fullscreen_key": "f", "fullscreen_wait": 0}, "Svc")
+        press.assert_called_once_with("f")
+
+    def test_focuses_recorded_hwnd_before_pressing(self):
+        # When the service has a recorded media-window handle, the fullscreen
+        # step focuses EXACTLY that window before the keypress so 'f' lands on
+        # the player, never on a random foreground window.
+        import core.config as _cfg
+        cfg = {"fullscreen_key": "f", "fullscreen_wait": 0,
+               "service_key": "netflix"}
+        with mock.patch.object(self.bc, "ui_press") as press, \
+             mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
+             mock.patch.object(_cfg, "STREAMING_AUTO_FULLSCREEN", True), \
+             mock.patch.object(self.bc, "_focus_window_hwnd",
+                               return_value=True) as focus, \
+             mock.patch.dict(self.bc._JARVIS_MEDIA_WINDOW_HWND,
+                             {"netflix": 4242}, clear=True), \
+             mock.patch.object(self.bc.time, "sleep"):
+            self.bc._streaming_go_fullscreen(cfg, "Netflix")
+        focus.assert_called_once_with(4242)
+        press.assert_called_once_with("f")
+
+    def test_no_recorded_hwnd_still_presses_on_foreground(self):
+        # No recorded handle ⇒ don't try to focus; fall back to pressing on the
+        # current foreground (the just-activated player).
+        import core.config as _cfg
+        cfg = {"fullscreen_key": "f", "fullscreen_wait": 0,
+               "service_key": "netflix"}
+        with mock.patch.object(self.bc, "ui_press") as press, \
+             mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
+             mock.patch.object(_cfg, "STREAMING_AUTO_FULLSCREEN", True), \
+             mock.patch.object(self.bc, "_focus_window_hwnd") as focus, \
+             mock.patch.dict(self.bc._JARVIS_MEDIA_WINDOW_HWND, {}, clear=True), \
+             mock.patch.object(self.bc.time, "sleep"):
+            self.bc._streaming_go_fullscreen(cfg, "Netflix")
+        focus.assert_not_called()
+        press.assert_called_once_with("f")
+
+
+@requires_monolith
+class EnsureWindowVisibleMaximizedTests(MonolithGlobalsTestCase):
+    """_ensure_window_visible_maximized — pull a media window fully on-screen and
+    maximize it ("windowed full screen"). All Win32 is mocked."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def _win32(self, rect, is_window=True, work=(0, 0, 2560, 1440)):
+        """Build a mock win32gui + win32con + win32api trio. `rect` is the
+        (left, top, right, bot) GetWindowRect returns; `work` is the monitor
+        work area GetMonitorInfo returns."""
+        w32 = mock.MagicMock(name="win32gui")
+        w32.IsWindow.return_value = is_window
+        w32.GetWindowRect.return_value = rect
+        con = mock.MagicMock(name="win32con")
+        con.SW_RESTORE = 9
+        con.SW_MAXIMIZE = 3
+        api = mock.MagicMock(name="win32api")
+        api.MonitorFromWindow.return_value = 111
+        api.GetMonitorInfo.return_value = {"Work": work}
+        return w32, con, api
+
+    def test_zero_hwnd_is_noop(self):
+        # 0 handle ⇒ False, and Win32 is never touched.
+        w32, con, api = self._win32((0, 0, 100, 100))
+        with mock.patch.dict(sys.modules,
+                             {"win32gui": w32, "win32con": con, "win32api": api}):
+            self.assertFalse(self.bc._ensure_window_visible_maximized(0))
+        w32.SetWindowPos.assert_not_called()
+        w32.ShowWindow.assert_not_called()
+
+    def test_bad_hwnd_is_noop(self):
+        # A non-int / None handle ⇒ False without raising.
+        self.assertFalse(self.bc._ensure_window_visible_maximized(None))
+        self.assertFalse(self.bc._ensure_window_visible_maximized("nope"))
+
+    def test_dead_handle_is_noop(self):
+        # IsWindow False ⇒ no move/maximize (recycled handle guard).
+        w32, con, api = self._win32((0, 0, 100, 100), is_window=False)
+        with mock.patch.dict(sys.modules,
+                             {"win32gui": w32, "win32con": con, "win32api": api}):
+            self.assertFalse(self.bc._ensure_window_visible_maximized(555))
+        w32.SetWindowPos.assert_not_called()
+
+    def test_off_top_edge_is_clamped_then_maximized(self):
+        # THE reported bug: title bar above the monitor top (top = -80, work
+        # area starts at y=0). Must SetWindowPos to bring it back onto the work
+        # area, then SW_MAXIMIZE.
+        w32, con, api = self._win32((100, -80, 1300, 720),
+                                    work=(0, 0, 2560, 1440))
+        with mock.patch.dict(sys.modules,
+                             {"win32gui": w32, "win32con": con, "win32api": api}):
+            self.assertTrue(self.bc._ensure_window_visible_maximized(4242))
+        # Moved fully back on-screen: new top must be >= work-area top (0).
+        w32.SetWindowPos.assert_called_once()
+        pos_args = w32.SetWindowPos.call_args.args
+        # SetWindowPos(hwnd, insertAfter, x, y, cx, cy, flags)
+        new_top = pos_args[3]
+        self.assertGreaterEqual(new_top, 0)
+        # And it was maximized (SW_MAXIMIZE == 3) as the final step.
+        show_modes = [c.args[1] for c in w32.ShowWindow.call_args_list]
+        self.assertIn(con.SW_MAXIMIZE, show_modes)
+        self.assertEqual(show_modes[-1], con.SW_MAXIMIZE)
+
+    def test_on_screen_window_only_maximized_not_moved(self):
+        # A window already fully inside the work area ⇒ no SetWindowPos, just
+        # restore + maximize.
+        w32, con, api = self._win32((100, 100, 1300, 900),
+                                    work=(0, 0, 2560, 1440))
+        with mock.patch.dict(sys.modules,
+                             {"win32gui": w32, "win32con": con, "win32api": api}):
+            self.assertTrue(self.bc._ensure_window_visible_maximized(4242))
+        w32.SetWindowPos.assert_not_called()
+        show_modes = [c.args[1] for c in w32.ShowWindow.call_args_list]
+        self.assertEqual(show_modes[-1], con.SW_MAXIMIZE)
+
+    def test_negative_origin_monitor_top_edge(self):
+        # Rig's real 'top' monitor sits at y=-1440..0. A window whose title bar
+        # is above THAT monitor's top (top=-1500, work area top=-1440) is off-
+        # screen and must be clamped down to >= -1440.
+        w32, con, api = self._win32((10, -1500, 1210, -780),
+                                    work=(0, -1440, 2560, 0))
+        with mock.patch.dict(sys.modules,
+                             {"win32gui": w32, "win32con": con, "win32api": api}):
+            self.assertTrue(self.bc._ensure_window_visible_maximized(4242))
+        pos_args = w32.SetWindowPos.call_args.args
+        self.assertGreaterEqual(pos_args[3], -1440)  # new top >= work-area top
+
+    def test_no_pywin32_uses_pgw_fallback(self):
+        # win32gui import fails ⇒ route through the pygetwindow fallback.
+        with mock.patch.dict(sys.modules, {"win32gui": None}), \
+             mock.patch.object(self.bc, "_ensure_window_visible_maximized_pgw",
+                               return_value=True) as pgw:
+            self.assertTrue(self.bc._ensure_window_visible_maximized(4242))
+        pgw.assert_called_once_with(4242)
+
+    def test_getrect_failure_falls_back_to_bare_maximize(self):
+        # GetWindowRect raising ⇒ still attempt a bare SW_MAXIMIZE (better than
+        # nothing) and report success.
+        w32, con, api = self._win32((0, 0, 0, 0))
+        w32.GetWindowRect.side_effect = RuntimeError("no rect")
+        with mock.patch.dict(sys.modules,
+                             {"win32gui": w32, "win32con": con, "win32api": api}):
+            self.assertTrue(self.bc._ensure_window_visible_maximized(4242))
+        show_modes = [c.args[1] for c in w32.ShowWindow.call_args_list]
+        self.assertIn(con.SW_MAXIMIZE, show_modes)
+
+    def test_never_raises_on_setwindowpos_error(self):
+        # A SetWindowPos blow-up must be swallowed (never abort the media flow).
+        w32, con, api = self._win32((100, -80, 1300, 720))
+        w32.SetWindowPos.side_effect = RuntimeError("win32 boom")
+        with mock.patch.dict(sys.modules,
+                             {"win32gui": w32, "win32con": con, "win32api": api}):
+            self.assertFalse(self.bc._ensure_window_visible_maximized(4242))
+
+
+@requires_monolith
+class FocusWindowHwndTests(MonolithGlobalsTestCase):
+    """_focus_window_hwnd — bring a specific hwnd to the foreground."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_zero_hwnd_is_false(self):
+        self.assertFalse(self.bc._focus_window_hwnd(0))
+
+    def test_bad_hwnd_is_false(self):
+        self.assertFalse(self.bc._focus_window_hwnd(None))
+        self.assertFalse(self.bc._focus_window_hwnd("x"))
+
+    def test_activates_matching_window(self):
+        win = mock.MagicMock(_hWnd=4242)
+        gw = mock.MagicMock()
+        gw.getAllWindows.return_value = [mock.MagicMock(_hWnd=1), win]
+        with mock.patch.dict(sys.modules, {"pygetwindow": gw}):
+            self.assertTrue(self.bc._focus_window_hwnd(4242))
+        win.activate.assert_called_once()
+
+    def test_handle_not_found_is_false(self):
+        gw = mock.MagicMock()
+        gw.getAllWindows.return_value = [mock.MagicMock(_hWnd=1)]
+        with mock.patch.dict(sys.modules, {"pygetwindow": gw}):
+            self.assertFalse(self.bc._focus_window_hwnd(4242))
+
+    def test_benign_win32_success_error_treated_as_ok(self):
+        # activate() sometimes raises the "operation completed successfully"
+        # pseudo-error — treated as success (mirrors _focus_music_window).
+        win = mock.MagicMock(_hWnd=4242)
+        win.activate.side_effect = Exception("Error code from Windows: 0")
+        gw = mock.MagicMock()
+        gw.getAllWindows.return_value = [win]
+        with mock.patch.dict(sys.modules, {"pygetwindow": gw}):
+            self.assertTrue(self.bc._focus_window_hwnd(4242))
+
 
 @requires_monolith
 class StreamingKeyboardSelectTests(MonolithGlobalsTestCase):
@@ -1573,6 +1788,112 @@ class StreamingAutoPlayTests(MonolithGlobalsTestCase):
              mock.patch.object(self.bc, "_streaming_go_fullscreen"):
             out = self.bc._streaming_auto_play("netflix", "the matrix")
         self.assertEqual(out, "playing 'the matrix' on Netflix")
+
+    def test_new_media_window_is_placed_on_screen(self):
+        # ISSUE A: after JARVIS opens the media window (recorded hwnd), it must
+        # call _ensure_window_visible_maximized on EXACTLY that handle so the
+        # window can't land with its title bar off the top of the monitor.
+        new_win = mock.MagicMock(_hWnd=909)
+        with mock.patch.object(self.bc, "_open_url_in_browser",
+                               return_value="chrome"), \
+             mock.patch.object(self.bc.time, "sleep"), \
+             mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
+             mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
+             mock.patch.object(self.bc, "_find_browser_window_matching",
+                               return_value=new_win), \
+             mock.patch.object(self.bc, "_monitor_name_for_window",
+                               return_value="middle"), \
+             mock.patch.object(self.bc, "find_click_target", return_value=(50, 60)), \
+             mock.patch.object(self.bc, "ui_click"), \
+             mock.patch.object(self.bc, "_streaming_go_fullscreen"), \
+             mock.patch.object(self.bc, "_ensure_window_visible_maximized") as place, \
+             mock.patch.dict(self.bc._JARVIS_MEDIA_WINDOW_HWND, {}, clear=True):
+            self.bc._streaming_auto_play("netflix", "the matrix")
+            # Capture inside the patch.dict scope (it restores on exit).
+            recorded = self.bc._JARVIS_MEDIA_WINDOW_HWND.get("netflix")
+        place.assert_called_once_with(909)
+        # And the handle was recorded for safe reuse/close next time.
+        self.assertEqual(recorded, 909)
+
+    def test_fullscreen_key_only_after_confirmed_playback(self):
+        # ISSUE B end-to-end (strict service, verify_play): the fullscreen key
+        # is sent ONLY once playback is confirmed, and only to the recorded
+        # hwnd. Drive a strict service through _streaming_play_and_verify with a
+        # confirmed play and assert ui_press('f') fired on the recorded window.
+        cfg = {
+            "name": "Netflix", "fullscreen_key": "f", "fullscreen_wait": 0,
+            "service_key": "netflix",
+            "play_strategies": ["play_button"], "verify_attempts": 1,
+            "verify_wait": 0,
+        }
+        import core.config as _cfg
+        with mock.patch.object(self.bc, "_streaming_apply_play_strategy",
+                               return_value=(True, "clicked play")), \
+             mock.patch.object(self.bc, "_streaming_verify_playback",
+                               return_value=(True, "YES")), \
+             mock.patch.object(_cfg, "STREAMING_AUTO_FULLSCREEN", True), \
+             mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
+             mock.patch.object(self.bc, "_focus_window_hwnd",
+                               return_value=True) as focus, \
+             mock.patch.object(self.bc, "ui_press") as press, \
+             mock.patch.dict(self.bc._JARVIS_MEDIA_WINDOW_HWND,
+                             {"netflix": 909}, clear=True), \
+             mock.patch.object(self.bc.time, "sleep"):
+            out = self.bc._streaming_play_and_verify(cfg, "Netflix", "the matrix")
+        self.assertEqual(out, "playing 'the matrix' on Netflix")
+        focus.assert_called_once_with(909)
+        press.assert_called_once_with("f")
+
+    def test_no_fullscreen_key_when_playback_never_confirms(self):
+        # If playback never confirms, the flow returns the could-not-confirm
+        # message and the fullscreen key is NEVER sent (nothing is playing).
+        cfg = {
+            "name": "Netflix", "fullscreen_key": "f", "fullscreen_wait": 0,
+            "service_key": "netflix",
+            "play_strategies": ["play_button"], "verify_attempts": 1,
+            "verify_wait": 0,
+        }
+        import core.config as _cfg
+        with mock.patch.object(self.bc, "_streaming_apply_play_strategy",
+                               return_value=(True, "clicked play")), \
+             mock.patch.object(self.bc, "_streaming_verify_playback",
+                               return_value=(False, "NO paused")), \
+             mock.patch.object(_cfg, "STREAMING_AUTO_FULLSCREEN", True), \
+             mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
+             mock.patch.object(self.bc, "ui_press") as press, \
+             mock.patch.dict(self.bc._JARVIS_MEDIA_WINDOW_HWND,
+                             {"netflix": 909}, clear=True), \
+             mock.patch.object(self.bc.time, "sleep"):
+            out = self.bc._streaming_play_and_verify(cfg, "Netflix", "the matrix")
+        self.assertIn("couldn't confirm", out)
+        press.assert_not_called()
+
+    def test_knob_off_no_fullscreen_key_even_after_confirm(self):
+        # ISSUE B master switch: STREAMING_AUTO_FULLSCREEN off ⇒ playback still
+        # confirmed + reported, but NO fullscreen key is sent.
+        cfg = {
+            "name": "Netflix", "fullscreen_key": "f", "fullscreen_wait": 0,
+            "service_key": "netflix",
+            "play_strategies": ["play_button"], "verify_attempts": 1,
+            "verify_wait": 0,
+        }
+        import core.config as _cfg
+        with mock.patch.object(self.bc, "_streaming_apply_play_strategy",
+                               return_value=(True, "clicked play")), \
+             mock.patch.object(self.bc, "_streaming_verify_playback",
+                               return_value=(True, "YES")), \
+             mock.patch.object(_cfg, "STREAMING_AUTO_FULLSCREEN", False), \
+             mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
+             mock.patch.object(self.bc, "_focus_window_hwnd") as focus, \
+             mock.patch.object(self.bc, "ui_press") as press, \
+             mock.patch.dict(self.bc._JARVIS_MEDIA_WINDOW_HWND,
+                             {"netflix": 909}, clear=True), \
+             mock.patch.object(self.bc.time, "sleep"):
+            out = self.bc._streaming_play_and_verify(cfg, "Netflix", "the matrix")
+        self.assertEqual(out, "playing 'the matrix' on Netflix")
+        focus.assert_not_called()
+        press.assert_not_called()
 
 
 @requires_monolith

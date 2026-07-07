@@ -79,6 +79,20 @@ LTM_ENABLED = True
 # exactly as before. Overridable via data/user_settings.json.
 STREAMING_TTS_ENABLED = True
 
+# ─── Streaming auto-fullscreen ─────────────────────────────────────────
+# After JARVIS starts a TV show / movie stream and playback is CONFIRMED
+# started, send the player fullscreen ('f' works on YouTube / Netflix /
+# Disney+ / Prime / Hulu / Max) so the show fills the screen without the user
+# reaching for the keyboard. The per-service key lives in the streaming config
+# (bobert_companion._STREAMING_SERVICES[…]["fullscreen_key"], default 'f',
+# None disables for that one service); THIS flag is the master switch across
+# every service. When False, JARVIS starts playback and leaves the player
+# windowed. Read live at play time (mirrors the STREAMING_TTS_ENABLED fresh-
+# import pattern in bobert_companion._streaming_go_fullscreen) so a Settings-
+# GUI / user_settings.json flip takes effect without a restart.
+# Overridable via data/user_settings.json.
+STREAMING_AUTO_FULLSCREEN = True
+
 # ─── Barge-in (wake-word interrupt during TTS) ─────────────────────────
 # When True, a wake-word ENGINE hit (openwakeword/porcupine via
 # skills/wake_listener.py — NOT loose transcript matching) that lands while

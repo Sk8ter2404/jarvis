@@ -23,6 +23,7 @@
   "RAG_ENABLED": true,
   "LTM_ENABLED": true,
   "STREAMING_TTS_ENABLED": true,
+  "STREAMING_AUTO_FULLSCREEN": true,
   "BARGE_IN_ENABLED": true,
   "AIR_CONTROL_ENABLED": false,
   "KINECT_ENABLED": false,
