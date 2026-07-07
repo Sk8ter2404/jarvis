@@ -1269,6 +1269,16 @@ class AirMouseController:
         # went CLOSED while engaged (None when open); a sustained close past
         # _fist_release_sec force-disengages when _fist_releases is on.
         self._fist_closed_at: Optional[float] = None
+        # FIST-RELEASE LATCH: True after a sustained fist LET GO of the cursor, until
+        # the raised hand OPENS again. While latched the engage gate is suppressed —
+        # otherwise ARMED mode (which re-engages on HEIGHT alone) would instantly
+        # re-grab a still-raised fist, fire the fist-release again, and OSCILLATE the
+        # cursor on/off while the owner merely holds a closed hand up (2026-07-07
+        # owner report: "jittery when hand closed — turns on and off"). _latch_open_streak
+        # counts consecutive RAW-open frames toward clearing the latch (a debounce so a
+        # 1-frame open flicker on a held fist doesn't drop it).
+        self._fist_release_latched = False
+        self._latch_open_streak = 0
 
     def reset(self) -> None:
         """Drop all smoothing + grip + engage state. Used by the dead-man and on
@@ -1300,6 +1310,12 @@ class AirMouseController:
         self._pose_anchor_xy = None
         self._pose_travel = 0.0
         self._fist_closed_at = None
+        # A full dead-man (tracking wholly lost / air-mouse disabled) is a clean
+        # slate — drop the fist-release latch too. NB: release_decision() (the
+        # per-frame disengage the fist-release itself calls) deliberately does NOT,
+        # so a still-held fist stays latched instead of instantly re-grabbing.
+        self._fist_release_latched = False
+        self._latch_open_streak = 0
 
     @property
     def button_is_down(self) -> bool:
@@ -1326,6 +1342,12 @@ class AirMouseController:
         """Which hand is driving the cursor ("left"/"right"), or None while
         disengaged. Read by the preview to draw the circle on the right hand."""
         return self._hand
+
+    @property
+    def fist_release_latched(self) -> bool:
+        """True while a fist-release is holding re-engagement OFF until the hand
+        opens. Exposed for the debug telemetry so a jitter repro is diagnosable."""
+        return self._fist_release_latched
 
     def release_decision(self) -> AirMouseDecision:
         """The DEAD-MAN / disengaged decision: if a button was held, command it
@@ -1621,6 +1643,32 @@ class AirMouseController:
             self._grip_if_tracked(right_ext, right_grip))
         ctrl_stable = left_stable if arm.side == "left" else right_stable
 
+        # ── FIST-RELEASE LATCH GATE: after a sustained fist LET GO of the cursor,
+        #    refuse to re-engage until the raised hand OPENS again. Checked on the
+        #    RAW controlling grip (release_decision already reset the debounced
+        #    stable grip to "open", so the stable value can't be trusted here), and
+        #    debounced by _latch_open_streak so a 1-frame open flicker on a held fist
+        #    doesn't drop the latch. Only meaningful while DISENGAGED (the latch is
+        #    always set together with a release). Without this the ARMED gate (height
+        #    only) re-grabs a still-raised fist → fist-release → re-grab → on/off. ──
+        if self._fist_release_latched and not self._engaged:
+            raw_ctrl = left_grip if arm.side == "left" else right_grip
+            if GripDebouncer._canon(raw_ctrl) == "open":
+                self._latch_open_streak += 1
+                if self._latch_open_streak >= self._grip_left.frames:
+                    self._fist_release_latched = False
+                    self._latch_open_streak = 0
+            else:
+                self._latch_open_streak = 0
+            if self._fist_release_latched:
+                # Still latched → keep priming state clear and stand disengaged.
+                self._pose_started_at = None
+                self._arm_pose_started_at = None
+                self._pose_anchor_xy = None
+                self._pose_travel = 0.0
+                self._prime = 0.0
+                return self._hold_off_decision(prime=0.0)
+
         # ── HYBRID SMART-ENGAGE GATE (the pure engage_decision decides). While
         #    DISENGAGED we measure the PASSIVE dwell + stillness (or the ARMED short
         #    hold) that engage_decision needs; once engaged, height alone holds it.
@@ -1756,7 +1804,12 @@ class AirMouseController:
                 if self._fist_closed_at is None:
                     self._fist_closed_at = now
                 elif (now - self._fist_closed_at) >= self._fist_release_sec:
-                    # Held a fist long enough → release everything, stand down.
+                    # Held a fist long enough → release everything, stand down, and
+                    # LATCH so the still-closed hand can't instantly re-grab (which
+                    # would oscillate in ARMED height-only mode). The latch clears
+                    # only when the hand OPENS again (see the gate above).
+                    self._fist_release_latched = True
+                    self._latch_open_streak = 0
                     return self.release_decision()
             else:
                 self._fist_closed_at = None
@@ -2825,10 +2878,17 @@ def _format_reach_debug(left_ext, right_ext, tracked: bool, ctrl,
             straight_s = ("%.2f" % arm.straightness
                           if arm.straightness is not None else "n/a")
             hand_s = arm.side or "?"
-        return ("  [air-mouse] lift=%s hand=%s engaged=%s yield=%s reach=%s "
-                "straight=%s tracked=%s"
-                % (lift_s, hand_s, bool(ctrl.engaged), bool(yielding),
-                   reach_s, straight_s, bool(tracked)))
+        # Grip + fist-latch: the two signals that explain a "jittery when closed"
+        # repro (grip flicker open↔closed, or the latch holding re-engage off).
+        try:
+            grip_s = ctrl._controlling_grip()
+        except Exception:
+            grip_s = "?"
+        latch_s = bool(getattr(ctrl, "fist_release_latched", False))
+        return ("  [air-mouse] lift=%s hand=%s grip=%s engaged=%s latch=%s "
+                "yield=%s reach=%s straight=%s tracked=%s"
+                % (lift_s, hand_s, grip_s, bool(ctrl.engaged), latch_s,
+                   bool(yielding), reach_s, straight_s, bool(tracked)))
     except Exception:
         return "  [air-mouse] lift=? hand=? engaged=? yield=? reach=? straight=?"
 
