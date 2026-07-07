@@ -79,6 +79,28 @@ LTM_ENABLED = True
 # exactly as before. Overridable via data/user_settings.json.
 STREAMING_TTS_ENABLED = True
 
+# ─── Barge-in (wake-word interrupt during TTS) ─────────────────────────
+# When True, a wake-word ENGINE hit (openwakeword/porcupine via
+# skills/wake_listener.py — NOT loose transcript matching) that lands while
+# JARVIS is actively speaking cuts TTS playback immediately so the user never
+# has to wait out a long reply. The wake announcement is swallowed on a
+# barge-in: JARVIS simply goes quiet and listens. Echo-safety lives in
+# bobert_companion.request_tts_interrupt(): if the sentence currently being
+# spoken contains "jarvis" the interrupt is refused, so the speakers saying
+# his own name can never self-interrupt through the mic.
+#
+# NOTE: this is intentionally a SEPARATE knob from the legacy module-level
+# BARGE_IN_ENABLED constant inside bobert_companion.py (the RMS/headset
+# InputStream path, hard-disabled there after the 0xc0000374 PortAudio
+# use-after-free). This knob only gates the new wake-word interrupt path,
+# which opens NO extra stream — the wake listener already owns its own mic.
+# Read live via `core.config` at interrupt time (mirrors the
+# STREAMING_TTS_ENABLED fresh-import pattern) so a Settings-GUI /
+# user_settings.json flip takes effect without a restart. When False the
+# behaviour is byte-identical to pre-barge-in builds.
+# Overridable via data/user_settings.json.
+BARGE_IN_ENABLED = True
+
 
 # ─── Safety: hard confirmation keywords ────────────────────────────────
 # Actions matching these always require spoken confirmation ("yes" or

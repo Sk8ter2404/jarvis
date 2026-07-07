@@ -166,6 +166,12 @@ _MONOLITH_RESTORE_NAMES = (
     "_tts_layer", "_last_wry", "_last_intent_override", "_last_mood",
     "_last_user_text", "_last_emotion", "_last_voice_route", "_last_user_tone",
     "_tts_loop", "_tts_loop_thread", "_barge_in_interrupted",
+    # ── wake-word barge-in (feat/barge-in) ─────────────────────────────────
+    # _tts_current_text is the single-element echo-gate cell published by
+    # _speak(); restored in place. (_tts_interrupt is a threading.Event —
+    # identity-restored only, so tests that set() it must clear() it in
+    # their own cleanup.)
+    "_tts_current_text",
     # ── subprocess handles + logging ───────────────────────────────────────
     "_hud_process", "_tray_process", "_reticle_process",
     "_log_file_handle", "_log_file_path",
