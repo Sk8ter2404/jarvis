@@ -5611,6 +5611,149 @@ def _mark_speech_spoken(message: str) -> None:
 _pending_speech_lock = threading.Lock()
 
 
+# ─── FOCUS MODE / do-not-disturb state (skills/focus_mode.py drives it) ──────
+#
+# WHY THIS LIVES HERE (in the monolith, not the skill): proactive_announce is
+# the single chokepoint for ALL unsolicited speech (print milestones, weather,
+# Teams nudges, timer reminders, self-diag…). The one clean place to HOLD that
+# speech while the owner is heads-down is the top of proactive_announce — so the
+# focus flag + the "missed" buffer must be readable from here without importing
+# the skill (which may not have loaded, and which we must never hard-depend on).
+# The skill flips these via the setters below; the gate reads them. Direct
+# command responses call _speak() (not proactive_announce), so this gate
+# suppresses ONLY unsolicited output — wake-word + command replies keep working.
+#
+# Single-element-list idiom (GIL-atomic read/write, no lock needed for a simple
+# bool/float cell) matches the monolith's other runtime latches (_sleep_mode,
+# _standby_mode, …). NEVER-RAISES is the contract: every helper below swallows
+# its own errors and degrades to "focus off" so a bad focus state can never
+# silence JARVIS or crash a daemon that announces.
+_focus_mode  = [False]    # True while the owner is in a focus / DND block
+_focus_until = [0.0]      # 0.0 = indefinite; else an epoch auto-resume time
+
+# Bounded buffer of announcements suppressed WHILE focused, newest last. Each
+# entry is a (message, source, ts) tuple. Capped so a chatty skill during a long
+# focus block can't grow it unbounded; oldest dropped first. In-memory only:
+# a crash mid-focus loses the recap, which is an acceptable tradeoff for zero
+# extra disk churn on the hot proactive path (persistence is optional and left
+# out on purpose — the recap is a nicety, not a durable record).
+_FOCUS_MISSED_CAP = 50
+_focus_missed_buffer: list = []
+_focus_missed_lock = threading.Lock()
+
+
+def focus_mode_active() -> bool:
+    """True while a focus / do-not-disturb block is engaged.
+
+    ALSO self-heals a TIMED block: if _focus_until has passed, this flips focus
+    OFF and fires the resume-recap (so the owner hears what they missed even if
+    the auto-resume Timer never ran — e.g. it was cancelled at shutdown, or the
+    process was asleep). The recap-on-expiry is best-effort and guarded so this
+    predicate — called on the hot proactive path — never raises.
+
+    Kept lock-free for the common read (a plain bool/float cell); the expiry
+    transition takes the missed-buffer lock only when it actually fires."""
+    try:
+        if not _focus_mode[0]:
+            return False
+        until = _focus_until[0]
+        if until and time.time() >= until:
+            # Timed block elapsed — resume now and announce the recap. Clearing
+            # the flag BEFORE building the recap is deliberate: proactive_announce
+            # is now un-gated, so the recap enqueues normally instead of being
+            # swallowed back into the missed buffer.
+            _focus_mode[0]  = False
+            _focus_until[0] = 0.0
+            try:
+                recap = _build_focus_recap(clear=True, prefix="Focus time's up, sir")
+                if recap:
+                    proactive_announce(recap, source="focus_mode")
+            except Exception:
+                pass
+            return False
+        return True
+    except Exception:
+        # Any unexpected error → behave as if focus is OFF (fail open: better to
+        # let an announcement through than to strand the owner in silence).
+        return False
+
+
+def set_focus_mode(on: bool, *, until: float = 0.0) -> None:
+    """Setter used by skills/focus_mode.py. `until` is an epoch auto-resume time
+    (0.0 = indefinite). NEVER raises."""
+    try:
+        _focus_mode[0]  = bool(on)
+        _focus_until[0] = float(until) if on else 0.0
+    except Exception:
+        pass
+
+
+def focus_missed_count() -> int:
+    """How many announcements are currently held. NEVER raises."""
+    try:
+        with _focus_missed_lock:
+            return len(_focus_missed_buffer)
+    except Exception:
+        return 0
+
+
+def focus_missed_snapshot() -> list:
+    """A COPY of the held-announcement buffer (does NOT clear). NEVER raises."""
+    try:
+        with _focus_missed_lock:
+            return list(_focus_missed_buffer)
+    except Exception:
+        return []
+
+
+def clear_focus_missed() -> None:
+    """Drop all held announcements. NEVER raises."""
+    try:
+        with _focus_missed_lock:
+            _focus_missed_buffer.clear()
+    except Exception:
+        pass
+
+
+def _build_focus_recap(*, clear: bool, prefix: str = "While you were focused, sir") -> str:
+    """Summarise the missed buffer into one spoken sentence, e.g.
+    "While you were focused, sir: 3 things — the print finished, a weather
+    alert, and a Teams message." Caps the spoken length by naming only the first
+    few and folding the remainder into a count. Optionally clears the buffer
+    (the recap consumers pass clear=True so a second 'resume' doesn't repeat).
+    Returns "" when nothing was missed. NEVER raises."""
+    try:
+        with _focus_missed_lock:
+            items = list(_focus_missed_buffer)
+            if clear:
+                _focus_missed_buffer.clear()
+    except Exception:
+        items = []
+    n = len(items)
+    if n == 0:
+        return f"{prefix} — nothing came up while you were focused."
+    # Name the first few messages; trim each so the sentence stays speakable.
+    NAMED = 3
+    fragments = []
+    for msg, _src, _ts in items[:NAMED]:
+        frag = (msg or "").strip().rstrip(".")
+        if len(frag) > 80:
+            frag = frag[:77].rstrip() + "…"
+        fragments.append(frag)
+    noun = "thing" if n == 1 else "things"
+    head = f"{prefix}: {n} {noun}"
+    if not fragments:
+        return head + "."
+    remainder = n - len(fragments)
+    if len(fragments) == 1:
+        listed = fragments[0]
+    else:
+        listed = ", ".join(fragments[:-1]) + ", and " + fragments[-1]
+    if remainder > 0:
+        listed += f", plus {remainder} more"
+    return f"{head} — {listed}."
+
+
 def proactive_announce(message: str, source: str = "skill",
                        *, mood: str | None = None,
                        volume_scale: float = 1.0) -> bool:
@@ -5629,6 +5772,36 @@ def proactive_announce(message: str, source: str = "skill",
     matching preset (urgent_clipped for VIP alerts, concerned_soft for
     self-diagnostic problems, etc.).
     """
+    # ── FOCUS MODE GATE ──────────────────────────────────────────────────────
+    # This is the whole point of focus / do-not-disturb: while the owner is
+    # heads-down, DO NOT enqueue unsolicited speech. Instead HOLD it in the
+    # bounded missed buffer so 'resume' / auto-resume can recap what he missed.
+    # We return True so the caller believes it was handled (it was — deferred,
+    # not dropped). Because this ONLY gates proactive_announce, direct command
+    # responses (which call _speak) are untouched — wake-word + commands still
+    # speak normally while focused. Gated on the config kill-switch so a bad
+    # focus state can never permanently silence JARVIS: if the feature is off we
+    # never even consult the flag. Wrapped so a bug here can never break the
+    # (very hot) announce path — on any error we fall through and enqueue as
+    # normal.
+    try:
+        # Read the flag FRESH from core.config (not the star-imported copy) so a
+        # Settings toggle / user_settings.json override takes effect without a
+        # restart — same live-read pattern the skills use.
+        _focus_enabled = True
+        try:
+            import core.config as _cfg
+            _focus_enabled = bool(getattr(_cfg, "FOCUS_MODE_ENABLED", True))
+        except Exception:
+            _focus_enabled = True
+        if _focus_enabled and focus_mode_active():
+            with _focus_missed_lock:
+                _focus_missed_buffer.append((message, source, time.time()))
+                if len(_focus_missed_buffer) > _FOCUS_MISSED_CAP:
+                    del _focus_missed_buffer[:-_FOCUS_MISSED_CAP]
+            return True
+    except Exception:
+        pass  # fail open — never let the focus gate break a real announcement
     # Serialise the whole read-modify-write. proactive_announce is called from
     # many daemon threads (timers, promises, Teams/weather/device-flap nudges);
     # without this two concurrent enqueues both read state N, both append, and
@@ -15584,6 +15757,16 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     "morning_briefing",
     "smart_home_control", "control_device", "control_smart_home",
     "smart_home_router_status",
+    # Focus mode / do-not-disturb (skills/focus_mode.py). Each returns a finished,
+    # user-facing one-liner — the on/off confirmations, the resume RECAP, and the
+    # whats_missed / focus_mode_status queries — so they're spoken verbatim rather
+    # than re-summarised by a follow-up LLM (which could drop the "3 things missed"
+    # counts or garble the recap). focus_mode_status is already listed in the
+    # 2026-07-04 sweep block below; the rest are added here. Kept OUT of
+    # INFORMATIVE_ACTIONS (the two sets must stay disjoint — see
+    # test_speak_sets_are_disjoint).
+    "focus_mode_on", "do_not_disturb", "quiet_mode",
+    "focus_mode_off", "resume", "whats_missed",
     # ── 2026-07-04 read-out completeness sweep ────────────────────────────
     # Verified silent read-outs (a full-repo audit + live drive confirmed each
     # RETURNS a finished, user-facing answer, does NOT self-speak, and was in

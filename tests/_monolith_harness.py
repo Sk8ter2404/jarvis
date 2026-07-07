@@ -133,6 +133,10 @@ _MONOLITH_RESTORE_NAMES = (
     "conversation_history",
     # ── wake / greeting bookkeeping (re-exported from core.state) ──────────
     "_last_wake_date", "_wake_history", "_pre_wake_silence_seconds",
+    # ── focus mode / do-not-disturb (skills/focus_mode.py drives these) ─────
+    # Single-element-list flag cells + the bounded missed buffer. A test that
+    # engages focus (or appends to the buffer) must not leak it into the next.
+    "_focus_mode", "_focus_until", "_focus_missed_buffer",
     # ── single-element runtime state slots (core.state) ────────────────────
     "_sleep_mode", "_standby_mode", "_tts_muted", "_ambient_mode_active",
     "_daemons_paused", "_debug_mode", "_audio_master_enabled",
