@@ -1480,13 +1480,50 @@ class StreamingAutoPlayTests(MonolithGlobalsTestCase):
         self.assertIn("unknown streaming service", out)
 
     def test_empty_query_opens_home(self):
-        # Empty query opens the homepage — now via the force-a-real-browser
-        # helper (NOT bare webbrowser.open, which the UWP app can intercept).
+        # Empty query opens the homepage via the force-a-real-browser helper.
+        # 2026-07-06 audit fix: with NO recorded media-window handle it must
+        # pass close_matching=None (legacy title-substring close could destroy
+        # the user's own browser window) and close_hwnd=None.
         with mock.patch.object(self.bc, "_open_url_in_browser",
-                               return_value="chrome") as opn:
+                               return_value="chrome") as opn, \
+             mock.patch.object(self.bc.time, "sleep"), \
+             mock.patch.object(self.bc, "_find_browser_window_matching",
+                               return_value=None), \
+             mock.patch.dict(self.bc._JARVIS_MEDIA_WINDOW_HWND, {}, clear=True):
             out = self.bc._streaming_auto_play("netflix", "   ")
         self.assertEqual(out, "opened Netflix")
-        opn.assert_called_once_with(self.bc._STREAMING_SERVICES["netflix"]["home"])
+        opn.assert_called_once_with(
+            self.bc._STREAMING_SERVICES["netflix"]["home"],
+            close_matching=None, close_hwnd=None)
+
+    def test_empty_query_reuses_recorded_handle(self):
+        # With a recorded handle, the homepage open closes ONLY that window
+        # (safe hwnd mode) — and records the NEW homepage window's handle so
+        # the next request can also engage safe mode.
+        new_win = mock.MagicMock(_hWnd=777)
+        with mock.patch.object(self.bc, "_open_url_in_browser",
+                               return_value="chrome") as opn, \
+             mock.patch.object(self.bc.time, "sleep"), \
+             mock.patch.object(self.bc, "_find_browser_window_matching",
+                               return_value=new_win), \
+             mock.patch.dict(self.bc._JARVIS_MEDIA_WINDOW_HWND,
+                             {"netflix": 555}, clear=True):
+            out = self.bc._streaming_auto_play("netflix", "")
+            self.assertEqual(self.bc._JARVIS_MEDIA_WINDOW_HWND["netflix"], 777)
+        self.assertEqual(out, "opened Netflix")
+        opn.assert_called_once_with(
+            self.bc._STREAMING_SERVICES["netflix"]["home"],
+            close_matching=["netflix"], close_hwnd=555)
+
+    def test_all_vision_services_have_tab_match(self):
+        # 2026-07-06 audit: spotify/prime_video/disney_plus/hulu/max had no
+        # tab_match → no window reuse AND no vision-monitor pinning, so
+        # find_click_target photographed the whole virtual screen and missed
+        # the play controls. Every vision-select service must define one.
+        for key, cfg in self.bc._STREAMING_SERVICES.items():
+            if cfg.get("select_method", "vision") == "vision":
+                self.assertTrue(cfg.get("tab_match"),
+                                msg=f"{key} is a vision service with no tab_match")
 
     def test_capabilities_missing_returns_open_only(self):
         with mock.patch.object(self.bc, "_open_url_in_browser",

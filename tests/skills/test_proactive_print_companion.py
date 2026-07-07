@@ -173,6 +173,38 @@ class PrintCompanionCompletionOfferTests(PrintCompanionMixin, unittest.TestCase)
         self.assertIn("Print complete", out)
         self.assertNotIn("Shall I", out)
 
+    def test_offer_drops_duplicate_head_when_bambu_loaded(self):
+        # bambu_monitor always speaks its own "Print complete" line on
+        # FINISH — the companion must trail with just the offer, never
+        # repeat the head (regression: triple-stacked completion lines).
+        mod, _a = self._load(bambu_state={"last_update": 0.0})
+        with mock.patch.object(mod, "_light_skill_available", return_value=True), \
+             mock.patch.object(mod, "_timer_skill_available", return_value=True):
+            out = mod._completion_offer_line("cube")
+        self.assertNotIn("Print complete", out)
+        self.assertIn("dim the workshop lights", out)
+        self.assertIn("queue a cooldown timer", out)
+        self.assertIn("sir", out)
+
+    def test_offer_silent_when_bambu_loaded_and_nothing_to_offer(self):
+        mod, _a = self._load(bambu_state={"last_update": 0.0})
+        with mock.patch.object(mod, "_light_skill_available", return_value=False), \
+             mock.patch.object(mod, "_timer_skill_available", return_value=False):
+            out = mod._completion_offer_line("cube")
+        self.assertEqual(out, "")
+
+    def test_offer_empty_line_never_enqueued_but_still_records(self):
+        mod, _a = self._load(bambu_state={"last_update": 0.0})
+        mod._saw_running_this_print[0] = True
+        mod._announced_completion_offer[0] = False
+        with mock.patch.object(mod, "_completion_offer_line", return_value=""), \
+             mock.patch.object(mod, "_enqueue_speech") as enq, \
+             mock.patch.object(mod, "_record_print_outcome") as rec:
+            mod._maybe_announce_completion_offer({"filename": "x_PLA.3mf"})
+        enq.assert_not_called()
+        rec.assert_called_once()
+        self.assertTrue(mod._announced_completion_offer[0])
+
     def test_offer_empty_filename_generic_head(self):
         mod, _a = self._load()
         with mock.patch.object(mod, "_light_skill_available", return_value=True), \

@@ -780,6 +780,14 @@ def _scheduler_loop() -> None:
 
             wait_seconds = max(0, cfg["wait_min"]) * 60
             present = _wait_for_presence(wait_seconds) if wait_seconds > 0 else False
+            # Re-check the same-day flag after the (potentially long) presence
+            # wait — a manual evening_briefing invocation or a second instance
+            # may have fired during the window (TOCTOU, matches
+            # morning_briefing's pre-check -> delay -> re-check pattern).
+            if _load_last_fired_date() == today_iso:
+                print("  [evening] suppressing — briefing already fired during presence wait")
+                time.sleep(POLL_INTERVAL_SECONDS)
+                continue
             _fire_briefing("user-present" if present else "timed-out")
 
         except Exception:

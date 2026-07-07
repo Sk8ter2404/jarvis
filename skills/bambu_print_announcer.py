@@ -312,10 +312,20 @@ def _check_milestones() -> None:
     # Deferred rather than patched blind. (A previous version of this comment
     # claimed the terminal->RUNNING reset already existed; it never did.)
     if fname and fname != _current_filename[0]:
+        # On the very first populated poll after a (re)start the previous
+        # filename is None, so we can't tell a fresh print from one already
+        # mid-flight — leave the arm flag DOWN and let the mid-flight priming
+        # branch below pre-mark passed milestones (priming a genuinely fresh
+        # 0 % print marks nothing, so this is safe either way). Arming here
+        # unconditionally made the priming branch unreachable on a real cold
+        # boot: JARVIS would blurt the stale 10 %/95 % lines and 'first layer
+        # adhesion' for an 80 %-done print, and later celebrate a finish it
+        # never actually watched.
+        first_observation = _current_filename[0] is None
         _current_filename[0] = fname
         _announced_pct.clear()
         _announced_layers.clear()
-        _armed_for_new_print[0] = True
+        _armed_for_new_print[0] = not first_observation
         _saw_running_this_print[0] = False
         _announced_runout[0] = False
         _announced_ams_fault[0] = False

@@ -31,7 +31,6 @@ silently no-ops so JARVIS still loads cleanly. Install hint::
 from __future__ import annotations
 
 import json
-import shlex
 import threading
 from typing import Any, Callable
 
@@ -193,14 +192,11 @@ def _make_call_action(mcp_client: Any) -> Callable[[str], str]:
         raw = (arg or "").strip()
         if not raw:
             return "Format: mcp_call <server> <tool> [json_args]"
+        # Whitespace split (max 3 fields) keeps the JSON blob verbatim —
+        # shlex would strip the JSON's quotes and fragment it on spaces.
+        parts = raw.split(None, 2)
         # Allow comma-separated input too: "filesystem, read_file, {...}".
-        # Try shlex first for the natural shell-like form, then fall back
-        # to comma split if shlex didn't yield ≥2 tokens.
-        try:
-            parts = shlex.split(raw, posix=True)
-        except ValueError:
-            parts = []
-        if len(parts) < 2:
+        if len(parts) < 2 or parts[0].endswith(","):
             parts = [p.strip() for p in raw.split(",", 2)]
         if len(parts) < 2:
             return "Format: mcp_call <server> <tool> [json_args]"

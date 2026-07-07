@@ -1136,6 +1136,33 @@ class NetworkUsageActionTests(_DecoBase):
         self.assertLess(out.index("Hog"), out.index("Light"))
         self.assertNotIn("Idle", out)
 
+    def test_falls_back_to_speeds_when_no_totals(self):
+        # Real Deco firmware never sends up_total/down_total — only
+        # up_speed/down_speed. The action must rank by speed instead of
+        # giving the no-totals excuse.
+        self._set_snapshot({"devices": [
+            {"name": "Streamer", "up_speed": 100, "down_speed": 9000},
+            {"name": "Browser", "up_speed": 5, "down_speed": 50},
+            {"name": "Idle", "up_speed": 0, "down_speed": 0},
+        ]})
+        out = self.actions["network_usage"]("")
+        self.assertIn("Top bandwidth users", out)
+        self.assertIn("Streamer", out)
+        self.assertLess(out.index("Streamer"), out.index("Browser"))
+        self.assertNotIn("Idle", out)
+        self.assertIn("/s", out)
+        self.assertNotIn("isn't reporting", out)
+
+    def test_totals_preferred_over_speeds(self):
+        self._set_snapshot({"devices": [
+            {"name": "Historic", "up_total": 100, "down_total": 900,
+             "up_speed": 0, "down_speed": 0},
+            {"name": "Fast", "up_speed": 9999, "down_speed": 9999},
+        ]})
+        out = self.actions["network_usage"]("")
+        self.assertIn("Historic", out)
+        self.assertNotIn("Fast", out)
+
     def test_unparseable_totals_treated_as_zero(self):
         self._set_snapshot({"devices": [
             {"name": "Bad", "up_total": "xx", "down_total": None}]})

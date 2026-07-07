@@ -86,6 +86,7 @@ _saved_enqueues: dict[str, object] = {}     # skill_name → original callable
 _saved_system_prompt: list = [None]
 _teams_was_set       = [False]
 _focus_assist_was_set = [False]
+_focus_assist_prev   = [1]       # ToastEnabled value seen before we suppressed
 _expiry_thread       = [None]
 
 _speech_lock = threading.Lock()
@@ -175,6 +176,26 @@ def _format_minutes(seconds: int) -> str:
 # materially affects whether interruptions hit the screen.
 _FA_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\PushNotifications"
 _FA_VAL = "ToastEnabled"
+
+
+def _query_toast_enabled() -> int:
+    """Read the current ToastEnabled value via reg.exe so exit can restore
+    the user's pre-focus setting instead of force-enabling toasts. A missing
+    value means toasts are enabled (Windows default), so any failure
+    returns 1."""
+    try:
+        result = subprocess.run(
+            ["reg.exe", "query", _FA_KEY, "/v", _FA_VAL],
+            capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if result.returncode == 0:
+            m = re.search(r"REG_DWORD\s+0x([0-9a-fA-F]+)", result.stdout or "")
+            if m:
+                return int(m.group(1), 16)
+    except Exception as e:
+        print(f"  [focus] reg.exe query error: {e}")
+    return 1
 
 
 def _set_focus_assist(enable_dnd: bool) -> bool:
@@ -394,6 +415,7 @@ def _enter_focus_mode(duration_seconds: int, trigger: str) -> tuple[bool, str]:
     # hold up status queries.
     _install_nudge_suppressors()
     _apply_prompt_addendum()
+    _focus_assist_prev[0]    = _query_toast_enabled()
     _focus_assist_was_set[0] = _set_focus_assist(enable_dnd=True)
     _teams_was_set[0]        = _set_teams_presence("DoNotDisturb")
     _start_expiry_thread()
@@ -423,7 +445,10 @@ def _exit_focus_mode(reason: str = "manual") -> str:
     _restore_nudge_suppressors()
     _restore_prompt_addendum()
     if _focus_assist_was_set[0]:
-        _set_focus_assist(enable_dnd=False)
+        # Only re-enable toasts if the user had them on before focus mode —
+        # otherwise we'd silently flip a setting they keep disabled.
+        if _focus_assist_prev[0] != 0:
+            _set_focus_assist(enable_dnd=False)
         _focus_assist_was_set[0] = False
     if _teams_was_set[0]:
         _set_teams_presence("Available")

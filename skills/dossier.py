@@ -36,6 +36,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -350,22 +351,35 @@ def _pid_alive(pid: int) -> bool:
             return False
 
 
-def _renderer_alive() -> bool:
+def _read_renderer_pid() -> int:
     if not os.path.exists(_PID_FILE):
-        return False
+        return 0
     try:
         with open(_PID_FILE, "r", encoding="utf-8") as f:
-            pid = int((f.read() or "0").strip() or "0")
+            return int((f.read() or "0").strip() or "0")
     except Exception:
-        return False
-    return _pid_alive(pid)
+        return 0
+
+
+def _renderer_alive() -> bool:
+    return _pid_alive(_read_renderer_pid())
 
 
 def _ensure_renderer_running() -> None:
-    if _renderer_alive():
-        # Already up — the existing renderer will pick up the new state on
-        # its next 250 ms poll.
-        return
+    old_pid = _read_renderer_pid()
+    if _pid_alive(old_pid):
+        # A card is already up, but the renderer builds all its labels ONCE
+        # at startup — its 250 ms tick only re-reads dismissed/expiry, so it
+        # would keep showing the PREVIOUS subject's content. Terminate it and
+        # spawn a fresh renderer that rebuilds from the state just written.
+        try:
+            os.kill(old_pid, signal.SIGTERM)
+        except Exception as e:
+            print(f"  [dossier] couldn't stop stale card renderer: {e}")
+        try:
+            os.remove(_PID_FILE)
+        except Exception:
+            pass
     try:
         parent_pid = os.getpid()
         creationflags = 0

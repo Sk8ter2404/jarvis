@@ -250,18 +250,11 @@ def _outlook_summary() -> str:
 
 def _bed_remark() -> str:
     """If the previous session ended very late (after midnight, before 5 AM),
-    add a dry remark. Falls back to '' if we can't tell."""
-    if not os.path.exists(_MEMORY_FILE):
-        return ""
-    try:
-        with open(_MEMORY_FILE, "r", encoding="utf-8") as f:
-            mem = json.load(f)
-    except Exception:
-        return ""
+    add a dry remark. Falls back to '' if we can't tell.
 
-    # Look at the most recent topic timestamp written today or yesterday.
-    # The memory file doesn't currently store hour granularity, so we instead
-    # check the most recent log file's mtime as a proxy for "last activity".
+    Note: bobert_memory.json doesn't store hour granularity, so the signal is
+    the most recent log file's mtime as a proxy for "last activity" — the
+    memory file itself is deliberately NOT required."""
     logs_dir = os.path.join(_PROJECT_DIR, "logs")
     if not os.path.isdir(logs_dir):
         return ""
@@ -361,10 +354,12 @@ def _build_briefing() -> str:
         parts.append(f"{weather}")
     sentence_one = ", ".join(parts) + "."
 
+    # The bed remark rides along regardless of task count — the docstring
+    # promises it whenever the last session ran past midnight.
     if pending == 0:
-        sentence_two = "Your task queue is, for once, mercifully empty."
+        sentence_two = f"Your task queue is, for once, mercifully empty{bed}."
     elif pending == 1:
-        sentence_two = "You have one task queued."
+        sentence_two = f"You have one task queued{bed}."
     else:
         sentence_two = f"You have {pending} tasks queued{bed}."
 

@@ -851,6 +851,37 @@ class BanterConfigStateTests(_BanterTestBase):
 
 # ─── speech queue ──────────────────────────────────────────────────────────
 class BanterSpeechQueueTests(_BanterTestBase):
+    def test_enqueue_routes_through_proactive_announce(self):
+        # When the parent exposes proactive_announce, banter must use it (the
+        # shared serialised pending_speech.json write path) and NOT write the
+        # queue file itself.
+        bc = _benign_bc()
+        bc.proactive_announce = mock.MagicMock()
+        with inject_modules(bobert_companion=bc), \
+             mock.patch.object(self.mod, "_atomic_write_json") as writer:
+            self.mod._enqueue_speech("routed line, sir.")
+        bc.proactive_announce.assert_called_once_with(
+            "routed line, sir.", source="banter")
+        writer.assert_not_called()
+
+    def test_enqueue_announcer_failure_falls_back_to_file(self):
+        # proactive_announce raising must not drop the line — fallback writes it.
+        bc = _benign_bc()
+        bc.proactive_announce = mock.MagicMock(side_effect=RuntimeError("boom"))
+        fd, qp = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        os.unlink(qp)
+        try:
+            with inject_modules(bobert_companion=bc), \
+                 mock.patch.object(self.mod, "_SPEECH_QUEUE", qp):
+                self.mod._enqueue_speech("fallback line")
+            with open(qp, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertEqual(data[-1]["message"], "fallback line")
+        finally:
+            if os.path.exists(qp):
+                os.unlink(qp)
+
     def test_enqueue_speech_writes_to_temp_queue(self):
         fd, qp = tempfile.mkstemp(suffix=".json")
         os.close(fd)

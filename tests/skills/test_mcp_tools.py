@@ -216,7 +216,7 @@ class CallActionTests(unittest.TestCase):
         out = self.mod._make_call_action(client)("")
         self.assertIn("Format: mcp_call", out)
 
-    def test_shlex_parse_server_tool(self):
+    def test_whitespace_parse_server_tool(self):
         client = mock.MagicMock()
         client.call_tool.return_value = {"ok": True, "text": "done"}
         out = self.mod._make_call_action(client)("filesystem read_file")
@@ -224,8 +224,9 @@ class CallActionTests(unittest.TestCase):
         client.call_tool.assert_called_once_with("filesystem", "read_file", {})
 
     def test_comma_separated_with_json_args(self):
-        # No spaces → shlex yields a single token, so the skill falls back to
-        # comma-splitting (maxsplit 2) which preserves the JSON arg blob.
+        # No spaces → whitespace split yields a single token, so the skill
+        # falls back to comma-splitting (maxsplit 2) which preserves the JSON
+        # arg blob.
         client = mock.MagicMock()
         client.call_tool.return_value = {"ok": True, "text": "ok"}
         self.mod._make_call_action(client)('fs,read_file,{"path":"/tmp/x"}')
@@ -242,9 +243,9 @@ class CallActionTests(unittest.TestCase):
         out = self.mod._make_call_action(client)("fs read_file [1,2,3]")
         self.assertIn("must be a JSON object", out)
 
-    def test_unbalanced_quotes_falls_back_to_comma_split(self):
-        # An unterminated quote makes shlex.split raise ValueError; the skill
-        # then comma-splits. Use commas so the fallback yields 2 tokens.
+    def test_comma_form_with_trailing_comma_on_server(self):
+        # "fs, tool" → whitespace split leaves a trailing comma on the server
+        # token, which flips the parse to the comma-separated form.
         client = mock.MagicMock()
         client.call_tool.return_value = {"ok": True, "text": "done"}
         out = self.mod._make_call_action(client)('fs, read_"file')
@@ -252,11 +253,43 @@ class CallActionTests(unittest.TestCase):
         client.call_tool.assert_called_once_with("fs", 'read_"file', {})
 
     def test_single_token_after_split_format_hint(self):
-        # One bare word → neither shlex nor comma split yields 2 tokens.
+        # One bare word → neither whitespace nor comma split yields 2 tokens.
         client = mock.MagicMock()
         out = self.mod._make_call_action(client)("onlyserver")
         self.assertIn("Format: mcp_call", out)
         client.call_tool.assert_not_called()
+
+    def test_json_args_quotes_preserved(self):
+        # Regression: shlex used to strip the JSON's double quotes, so the
+        # documented form `mcp_call filesystem read_file {"path":"..."}`
+        # always failed to parse. The JSON tail must reach json.loads verbatim.
+        client = mock.MagicMock()
+        client.call_tool.return_value = {"ok": True, "text": "contents"}
+        out = self.mod._make_call_action(client)(
+            'filesystem read_file {"path":"C:/temp/x.txt"}')
+        self.assertEqual(out, "contents")
+        client.call_tool.assert_called_once_with(
+            "filesystem", "read_file", {"path": "C:/temp/x.txt"})
+
+    def test_json_args_with_spaces_kept_whole(self):
+        # Regression: shlex used to fragment JSON containing spaces across
+        # multiple tokens, parsing only the first fragment.
+        client = mock.MagicMock()
+        client.call_tool.return_value = {"ok": True, "text": "ok"}
+        self.mod._make_call_action(client)('srv tool {"a": 1, "b": "two words"}')
+        client.call_tool.assert_called_once_with(
+            "srv", "tool", {"a": 1, "b": "two words"})
+
+    def test_comma_form_with_spaces_and_json_args(self):
+        # Regression: "filesystem, read_file, {...}" (spaces after commas)
+        # used to mis-parse — shlex yielded >=2 tokens with trailing commas,
+        # so the comma-split branch never ran and the server name was wrong.
+        client = mock.MagicMock()
+        client.call_tool.return_value = {"ok": True, "text": "ok"}
+        self.mod._make_call_action(client)(
+            'filesystem, read_file, {"path": "/tmp/x"}')
+        client.call_tool.assert_called_once_with(
+            "filesystem", "read_file", {"path": "/tmp/x"})
 
     def test_failed_call_without_error_uses_generic_message(self):
         client = mock.MagicMock()

@@ -1339,6 +1339,23 @@ class SchedulerTests(unittest.TestCase):
             _fire_briefing=fire)
         fire.assert_called_once_with("user-present")
 
+    def test_loop_recheck_after_wait_suppresses_double_fire(self):
+        # TOCTOU regression: the manual action (or a second instance) fires the
+        # briefing DURING the presence wait. The post-wait re-check of the
+        # same-day flag must suppress the scheduler's fire.
+        now = datetime.datetime.now().replace(hour=22, minute=5, second=0, microsecond=0)
+        today = now.date().isoformat()
+        reads = iter(["", today])  # pre-check clean, post-wait already fired
+        fire = mock.MagicMock()
+        self._run_one_iteration(
+            now=now,
+            _read_config=mock.MagicMock(return_value={"enabled": True, "hour": 22,
+                                                      "minute": 0, "wait_min": 30}),
+            _load_last_fired_date=mock.MagicMock(side_effect=lambda: next(reads, today)),
+            _wait_for_presence=mock.MagicMock(return_value=True),
+            _fire_briefing=fire)
+        fire.assert_not_called()
+
     def test_loop_fires_timed_out_when_no_presence(self):
         now = datetime.datetime.now().replace(hour=22, minute=5, second=0, microsecond=0)
         fire = mock.MagicMock()

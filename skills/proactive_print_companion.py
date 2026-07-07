@@ -325,15 +325,15 @@ def _completion_offer_line(pretty_filename: str) -> str:
     """Compose the FINISH offer based on which downstream skills are live.
 
     Degrades silently per-feature: no light skill loaded → no dim mention;
-    no timer skill loaded → no cooldown mention. When neither is available
-    we fall back to bambu_monitor's plain "Print complete" phrasing so the
-    user still hears the completion announcement.
-    """
-    if pretty_filename:
-        head = f"Print complete, sir — '{pretty_filename}' is finished."
-    else:
-        head = "Print complete, sir."
+    no timer skill loaded → no cooldown mention.
 
+    bambu_monitor ALWAYS speaks its own "Print complete, sir — 'X' is
+    finished." line on FINISH, so when it's loaded we must not repeat that
+    head — we trail with just the offer (mirroring the milestone
+    trail-behind), and return "" when there's nothing to offer so the user
+    doesn't hear the same completion announced twice. Only when
+    bambu_monitor is absent do we own the full announcement ourselves.
+    """
     has_lights = _light_skill_available()
     has_timer  = _timer_skill_available()
     offers: list[str] = []
@@ -341,12 +341,20 @@ def _completion_offer_line(pretty_filename: str) -> str:
         offers.append("dim the workshop lights")
     if has_timer:
         offers.append("queue a cooldown timer")
+
+    bambu_announces = _get_bambu_module() is not None
+    if bambu_announces:
+        if not offers:
+            return ""
+        return f"Shall I {' and '.join(offers)} for you, sir?"
+
+    if pretty_filename:
+        head = f"Print complete, sir — '{pretty_filename}' is finished."
+    else:
+        head = "Print complete, sir."
     if not offers:
         return head
-    if len(offers) == 1:
-        tail = f"Shall I {offers[0]} for you?"
-    else:
-        tail = f"Shall I {' and '.join(offers)} for you?"
+    tail = f"Shall I {' and '.join(offers)} for you?"
     return f"{head} {tail}"
 
 
@@ -530,7 +538,11 @@ def _maybe_announce_completion_offer(state: dict) -> None:
         return
     fname  = state.get("filename") or _current_filename[0] or ""
     pretty = _strip_filename(fname)
-    _enqueue_speech(_completion_offer_line(pretty))
+    line = _completion_offer_line(pretty)
+    # Empty line means bambu_monitor already owns the completion
+    # announcement and we have no offer to trail it with — stay quiet.
+    if line:
+        _enqueue_speech(line)
     _announced_completion_offer[0] = True
     _record_print_outcome("success", state)
 

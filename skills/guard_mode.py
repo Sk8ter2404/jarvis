@@ -70,6 +70,11 @@ MOTION_DEBOUNCE_FRAMES = 3
 # person moving around for a minute produces ONE alert, not a stream.
 GUARD_ALERT_COOLDOWN_SEC = 30.0
 
+# Snapshots/events are ALSO rate-limited, per camera: a continuous presence must
+# not write a PNG + bump the event count every 0.25 s tick (~14k files/hour) —
+# one trigger per camera per this window is plenty of evidence.
+GUARD_TRIGGER_COOLDOWN_SEC = 5.0
+
 # Snapshots land here (gitignored — data/* is ignored). Tests patch this to a
 # tmp dir so a test run NEVER writes into the real data/ tree.
 _PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -88,11 +93,19 @@ _last_alert_at = [0.0]          # wall-clock ts of the last SPOKEN/PUSHED alert
 _monitor_thread = [None]       # type: ignore[var-annotated]
 
 # Per-camera bookkeeping for the loop (keyed by a stable camera label):
-#   _prev_frames[label]    -> the previous downscaled grayscale ndarray
-#   _motion_streak[label]  -> consecutive ticks of motion seen so far
+#   _prev_frames[label]     -> the previous downscaled grayscale ndarray
+#   _motion_streak[label]   -> consecutive ticks of motion seen so far
+#   _last_trigger_at[label] -> wall-clock ts of the last snapshot/event trigger
 # Reset on every arm so a new session starts clean. Guarded by _guard_lock.
 _prev_frames: dict = {}
 _motion_streak: dict = {}
+_last_trigger_at: dict = {}
+
+# Monotonic arm-generation counter: each guard_on bumps it and hands the value
+# to its monitor thread; a thread whose generation is stale exits on its next
+# tick. Closes the off→on rearm race where a winding-down thread could be
+# mistaken for a live poller. Guarded by _guard_lock.
+_monitor_gen = [0]
 
 
 # ─── seams to the rest of JARVIS ─────────────────────────────────────────
@@ -415,6 +428,19 @@ def _fire_alert(camera_label: str, kind: str, now: float,
 
 # ─── the single monitor tick (driven directly by tests; no sleeping) ──────
 
+def _claim_trigger(camera_label: str, now: float) -> bool:
+    """True if `camera_label` may trigger (snapshot + event) at `now`, claiming
+    the per-camera trigger-cooldown slot; False while the camera is still inside
+    GUARD_TRIGGER_COOLDOWN_SEC of its last trigger. Keeps a continuous presence
+    from writing a snapshot + bumping the event count on every single tick."""
+    with _guard_lock:
+        last = _last_trigger_at.get(camera_label, 0.0)
+        if last and (now - last) < GUARD_TRIGGER_COOLDOWN_SEC:
+            return False
+        _last_trigger_at[camera_label] = now
+        return True
+
+
 def _guard_tick(frames, kinect, ts_label: str, now: float) -> dict:
     """Process ONE poll of the array. Pure-ish: all sensor reads are handed in.
 
@@ -438,8 +464,11 @@ def _guard_tick(frames, kinect, ts_label: str, now: float) -> dict:
     alerted = False
 
     # 1) Kinect intrusion — the strong signal. A tracked body fires immediately
-    #    (no pixel-debounce needed: the skeleton tracker already debounces).
-    if kinect and kinect.get("present"):
+    #    (no pixel-debounce needed: the skeleton tracker already debounces), but
+    #    a CONTINUOUS presence re-triggers at most once per trigger cooldown —
+    #    otherwise every 0.25 s tick would write a full-res snapshot and bump
+    #    the event count (~14k PNGs/hour for one visitor).
+    if kinect and kinect.get("present") and _claim_trigger("the Kinect", now):
         label = "the Kinect"
         triggered.append(label)
         # Snapshot the Kinect's own colour frame if we were handed one.
@@ -479,7 +508,9 @@ def _guard_tick(frames, kinect, ts_label: str, now: float) -> dict:
                 # Reset the streak so a continuous mover re-arms cleanly after
                 # the alert cooldown rather than firing every single tick.
                 _motion_streak[label] = 0
-        if not fired:
+        # Trigger-cooldown gate: a continuous mover re-fires the debounce every
+        # few ticks; cap snapshots + events to one per camera per window.
+        if not fired or not _claim_trigger(label, now):
             continue
         triggered.append(label)
         path = _save_snapshot(frame, label, ts_label)
@@ -508,18 +539,18 @@ def _record_event(camera_label: str, kind: str, now: float,
 
 # ─── the monitor daemon (only works while armed) ─────────────────────────
 
-def _monitor_loop() -> None:  # pragma: no cover - non-terminating daemon; each tick delegates to _guard_tick, which is unit-tested directly
-    """Background poller. Sleeps briefly so the face-track thread comes up, then
-    polls every GUARD_POLL_INTERVAL — but only does real work while armed. When
-    disarmed it just idles (cheap) so a re-arm reuses the same thread. Exits when
-    armed flips False AND we want the thread gone (guard_off joins it)."""
+def _monitor_loop(gen: int) -> None:  # pragma: no cover - non-terminating daemon; each tick delegates to _guard_tick, which is unit-tested directly
+    """Background poller for arm-generation `gen`. Sleeps briefly so the
+    face-track thread comes up, then polls every GUARD_POLL_INTERVAL. Exits when
+    disarmed OR when a newer arming session has started its own thread (stale
+    generation) — so an off→on rearm never leaves two pollers running."""
     time.sleep(INITIAL_DELAY_SECONDS)
     while True:
         try:
             with _guard_lock:
-                armed = _armed[0]
+                armed = _armed[0] and _monitor_gen[0] == gen
             if not armed:
-                # Disarmed: this thread is being wound down by guard_off.
+                # Disarmed (or superseded by a newer arm): wind down.
                 return
             frames = _collect_frames()
             kinect = _kinect_intrusion()
@@ -541,6 +572,7 @@ def _reset_session() -> None:
         _last_alert_at[0] = 0.0
         _prev_frames.clear()
         _motion_streak.clear()
+        _last_trigger_at.clear()
 
 
 # ─── actions ─────────────────────────────────────────────────────────────
@@ -560,15 +592,17 @@ def guard_on(_: str = "") -> str:
     with _guard_lock:
         _armed[0] = True
         _armed_since[0] = time.time()
-
-    # Start (or reuse) the daemon. A prior session's thread may still be alive
-    # mid-wind-down; only start a fresh one if none is running.
-    if not any(th.name == "guard-mode-monitor" and th.is_alive()
-               for th in threading.enumerate()):
-        t = threading.Thread(target=_monitor_loop, daemon=True,
-                             name="guard-mode-monitor")
-        t.start()
-        _monitor_thread[0] = t
+        # Bump the arm generation and ALWAYS start a fresh thread for it. A
+        # prior session's thread may still be alive mid-wind-down — its stale
+        # generation makes it exit on its next tick, so there's no aliveness
+        # check to race against (the old TOCTOU could leave guard armed with
+        # no poller at all).
+        _monitor_gen[0] += 1
+        gen = _monitor_gen[0]
+    t = threading.Thread(target=_monitor_loop, args=(gen,), daemon=True,
+                         name="guard-mode-monitor")
+    t.start()
+    _monitor_thread[0] = t
 
     # Name the cameras we'll be watching so the confirmation is concrete.
     n = _available_camera_count()

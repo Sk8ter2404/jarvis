@@ -431,8 +431,10 @@ def get_upcoming_events(top_n: int = 3, when: str = "next_14_days") -> list[dict
     """
     start_dt, end_dt = _meeting_window(when)
     body = _graph_get("/me/calendarView", {
-        "startDateTime": start_dt.isoformat(),
-        "endDateTime":   end_dt.isoformat(),
+        # astimezone() attaches the local UTC offset — offset-less values
+        # would be read as UTC by Graph, skewing the window.
+        "startDateTime": start_dt.astimezone().isoformat(),
+        "endDateTime":   end_dt.astimezone().isoformat(),
         "$orderby":      "start/dateTime",
         "$top":          str(max(1, int(top_n))),
         "$select":       "subject,start,organizer",

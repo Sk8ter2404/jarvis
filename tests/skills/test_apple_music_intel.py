@@ -1017,6 +1017,21 @@ class AppleMusicDataTests(unittest.TestCase):
         skips = self.mod._read_jsonl(self.mod._SKIPS_FILE)
         self.assertTrue(any(s.get("user_skip") for s in skips))
 
+    def test_skip_track_synthetic_event_reaches_history_and_taste_model(self):
+        # Regression: the synthetic user-skip event must land in _HISTORY_FILE
+        # (which aggregate() reads), not just the write-only _SKIPS_FILE.
+        bc = mock.MagicMock()
+        del bc._act_next_song
+        with mock.patch.object(self.mod, "_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_sample_now_playing",
+                               return_value={"artist": "Foo", "title": "Bar",
+                                             "source": "web_apple"}):
+            self.actions["skip_track"]("")
+        hist = self.mod._read_jsonl(self.mod._HISTORY_FILE)
+        self.assertTrue(any(e.get("user_skip") for e in hist))
+        snap = self.mod.aggregate()
+        self.assertEqual(snap["by_artist"]["Foo"]["skips"], 1)
+
     def test_skip_track_uses_itunes_next_when_source_itunes(self):
         # _current is an iTunes track → _act_next_song path (via iTunes).
         self.mod._current = {"key": "mj|beat it", "artist": "MJ", "title": "Beat It",

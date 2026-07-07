@@ -314,6 +314,35 @@ class BambuStateChangeTests(unittest.TestCase):
         self.assertTrue(hit)
         self.assertIn("layer 88", hit[0])
 
+    def test_failed_announcement_persisted_durably(self):
+        # First FAILED pass must write a durable failed:{fname} key so a
+        # JARVIS bounce doesn't replay the failure on every boot.
+        self.mod._last_gcode_state[0] = "RUNNING"
+        self.mod._current_print_filename[0] = "cube"
+        self.mod._announced_start[0] = True
+        self._set(gcode_state="FAILED", filename="cube.3mf", layer_num=88)
+        msgs = self._run()
+        self.assertTrue(any("failed" in m.lower() for m in msgs))
+        save_mock = self.mod._save_reminder_persistence
+        self.assertTrue(save_mock.called)
+        persisted = save_mock.call_args.args[0]
+        self.assertIn("failed:cube", persisted)  # fname is extension-stripped
+
+    def test_failed_not_reannounced_after_restart(self):
+        # Simulate a restart: in-memory dedup set is empty but the durable
+        # state already contains this print's failed key — stay silent.
+        self.mod._last_gcode_state[0] = "FAILED"
+        self.mod._current_print_filename[0] = "cube"
+        self.mod._announced_error_codes.clear()
+        self._rload.stop()
+        self._rload = mock.patch.object(
+            self.mod, "_load_reminder_persistence",
+            return_value={"failed:cube": {"ts": 1.0, "fname": "cube"}})
+        self._rload.start()
+        self._set(gcode_state="FAILED", filename="cube.3mf", layer_num=88)
+        msgs = self._run()
+        self.assertFalse(any("failed" in m.lower() for m in msgs))
+
     def test_finish_announces_and_arms_bed_watch(self):
         self.mod._last_gcode_state[0] = "RUNNING"
         self.mod._current_print_filename[0] = "cube"

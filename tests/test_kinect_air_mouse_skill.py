@@ -2939,6 +2939,88 @@ class TwoHandPreemptTests(_Base):
         self.assertFalse(c.engaged)
 
 
+# ─── overlay-state file ownership: two-hand stand-down + disabled edge gate ─
+class OverlayStateWriteGateTests(_Base):
+    """AIR_CURSOR_STATE_FILE has TWO writers (this skill + kinect_two_hand's
+    poller). These tests pin the write discipline that stops them fighting:
+
+      * while two_hand_active() the enabled poll path must NOT publish its
+        hidden frames (the two-hand poller owns the file; interleaved 30 Hz
+        hidden writes strobed the dual reticles), and
+      * the DISABLED poll path clears the file / preview state ONCE per
+        disable edge, not on every ~33 ms tick (SSD churn + the same fight)."""
+
+    def _ctrl(self, mod):
+        return mod.AirMouseController(mod.ReachBox(2560, 1440),
+                                      debounce_frames=1, grace_sec=0.0,
+                                      engage_debounce_frames=1)
+
+    def test_two_hand_mode_suppresses_overlay_publish(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        self._capture_mouse(mod)
+        publishes = []
+        p = mock.patch.object(mod, "_publish_overlay_state",
+                              lambda d, v: publishes.append((d.overlay, v)))
+        p.start()
+        self.addCleanup(p.stop)
+        ctrl = self._ctrl(mod)
+        body = _body(reach_side="right", grip_right="open")
+        # Two-hand mode active → the air-mouse yields AND stays off the file.
+        with mock.patch.object(mod, "two_hand_active", lambda: True):
+            mod._poll_once(ctrl, _fake_bridge(bodies=[body]))
+            mod._poll_once(ctrl, _fake_bridge(bodies=[body]))
+        self.assertEqual(publishes, [])
+        # Two-hand mode ends → publishing resumes.
+        mod._poll_once(ctrl, _fake_bridge(bodies=[body]))
+        self.assertEqual(len(publishes), 1)
+
+    def test_disabled_poller_clears_overlay_state_once_not_every_tick(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(False)
+        self._capture_mouse(mod)
+        clears, states = [], []
+        p1 = mock.patch.object(mod, "_clear_overlay_state",
+                               lambda: clears.append(True))
+        p2 = mock.patch.object(mod, "_set_air_mouse_state",
+                               lambda *a, **k: states.append(a))
+        for p in (p1, p2):
+            p.start()
+            self.addCleanup(p.stop)
+        ctrl = self._ctrl(mod)
+        for _ in range(5):
+            mod._poll_once(ctrl, _fake_bridge(bodies=[]))
+        # ONE clear + ONE disengaged-preview write on the disable edge, then quiet.
+        self.assertEqual(len(clears), 1)
+        self.assertEqual(len(states), 1)
+
+    def test_disabled_clear_rearms_after_an_enabled_tick(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._capture_mouse(mod)
+        clears = []
+        p = mock.patch.object(mod, "_clear_overlay_state",
+                              lambda: clears.append(True))
+        p.start()
+        self.addCleanup(p.stop)
+        ctrl = self._ctrl(mod)
+        from core import config as cfg
+        with mock.patch.object(cfg, "KINECT_AIR_MOUSE_ENABLED", False, create=True):
+            mod._poll_once(ctrl, _fake_bridge(bodies=[]))
+            mod._poll_once(ctrl, _fake_bridge(bodies=[]))
+        self.assertEqual(len(clears), 1)
+        # Enabled tick resets the edge gate…
+        with mock.patch.object(cfg, "KINECT_AIR_MOUSE_ENABLED", True, create=True):
+            mod._poll_once(ctrl, _fake_bridge(bodies=[]))
+        # …so the next disable clears exactly once more.
+        with mock.patch.object(cfg, "KINECT_AIR_MOUSE_ENABLED", False, create=True):
+            mod._poll_once(ctrl, _fake_bridge(bodies=[]))
+            mod._poll_once(ctrl, _fake_bridge(bodies=[]))
+        self.assertEqual(len(clears), 2)
+
+
 # ─── registration wires the actions ─────────────────────────────────────────
 class RegisterTests(_Base):
     def test_register_adds_actions_without_starting_real_thread(self):

@@ -208,6 +208,21 @@ class MorningArrivalV2Tests(unittest.TestCase):
         self.assertEqual(out, "")
         build.assert_not_called()
 
+    def test_chain_suppression_marks_fired_so_watcher_stops(self):
+        """Regression: when the chain already briefed, the suppressed path
+        must still mark v2's own same-day state, otherwise the presence
+        watcher re-invokes _fire_arrival every poll for the rest of the
+        morning window."""
+        with mock.patch.object(self.mod, "_already_fired_today", return_value=False), \
+             mock.patch.object(self.mod, "_chain_morning_briefing_fired_today", return_value=True), \
+             mock.patch.object(self.mod, "_enqueue_speech") as enq, \
+             mock.patch.object(self.mod, "_mark_fired") as mark:
+            out = self.mod._fire_arrival("auto", force=False)
+        self.assertEqual(out, "")
+        enq.assert_not_called()
+        mark.assert_called_once()
+        self.assertIn("morning_chain", mark.call_args[0][0])
+
     def test_fire_arrival_force_bypasses_suppression(self):
         with mock.patch.object(self.mod, "_already_fired_today", return_value=True), \
              mock.patch.object(self.mod, "_build_briefing", return_value="[intent:briefing] hi"), \

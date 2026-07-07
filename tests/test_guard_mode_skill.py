@@ -295,10 +295,12 @@ class AlertRateLimitTests(GuardBase):
         bc = _fake_monolith()
         mod, _a = self._load(bc=bc, kinect_enabled=True)
         kin = {"present": True, "count": 1, "nearest_m": 1.5}
-        # Three detections 1s apart — well inside the 30s cooldown.
+        # Three detections spaced past the per-camera trigger cooldown (so each
+        # counts as an event) but well inside the 30s alert cooldown.
+        step = mod.GUARD_TRIGGER_COOLDOWN_SEC + 1
         mod._guard_tick([], kin, "t1", now=100.0)
-        mod._guard_tick([], kin, "t2", now=101.0)
-        mod._guard_tick([], kin, "t3", now=102.0)
+        mod._guard_tick([], kin, "t2", now=100.0 + step)
+        mod._guard_tick([], kin, "t3", now=100.0 + 2 * step)
         # ONE spoken alert despite three detections.
         self.assertEqual(len(bc.announced), 1)
         # But all three count toward the event tally.
@@ -426,10 +428,11 @@ class ArmDisarmStatusTests(GuardBase):
         with mock.patch.object(threading.Thread, "start", lambda self: None):
             mod, actions = self._load(guard_enabled=True, kinect_enabled=True)
             actions["guard_on"]("")
-            # Fabricate a couple of events.
+            # Fabricate a couple of events (spaced past the trigger cooldown).
             kin = {"present": True, "count": 1, "nearest_m": 1.0}
             mod._guard_tick([], kin, "t1", now=1.0)
-            mod._guard_tick([], kin, "t2", now=2.0)
+            mod._guard_tick([], kin, "t2",
+                            now=1.0 + mod.GUARD_TRIGGER_COOLDOWN_SEC + 1)
             out = actions["guard_off"]("")
             self.assertIn("2", out)
             self.assertIn("movement", out.lower())
@@ -513,6 +516,97 @@ class RealThreadLifecycleTests(GuardBase):
         # The loop sees armed=False on its next tick (<=~poll interval) and exits.
         t.join(timeout=3.0)
         self.assertFalse(t.is_alive(), "monitor thread should stop after disarm")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# per-camera trigger cooldown (snapshot/event spam cap — v1.88 audit)
+# ─────────────────────────────────────────────────────────────────────────
+@unittest.skipUnless(_HAVE_CV, "numpy/cv2 not installed on this runner")
+class TriggerCooldownTests(GuardBase):
+    def test_sustained_kinect_presence_one_snapshot_one_event(self):
+        # A person standing in the room for ~3s of 0.25s ticks must produce ONE
+        # snapshot + ONE event, not one per tick (~4 PNGs/second unbounded).
+        bc = _fake_monolith()
+        mod, _a = self._load(bc=bc, kinect_enabled=True)
+        kin = {"present": True, "count": 1, "nearest_m": 2.0}
+        frames = [("the Kinect", _with_block(frac=0.5))]
+        for i in range(12):
+            mod._guard_tick(frames, kin, f"t{i:02d}", now=100.0 + i * 0.25)
+        self.assertEqual(len(os.listdir(self._snapshot_dir)), 1)
+        with mod._guard_lock:
+            self.assertEqual(mod._event_count[0], 1)
+
+    def test_kinect_retriggers_after_trigger_cooldown(self):
+        mod, _a = self._load(kinect_enabled=True)
+        kin = {"present": True, "count": 1, "nearest_m": 2.0}
+        mod._guard_tick([], kin, "t1", now=100.0)
+        # Still inside the trigger cooldown → suppressed.
+        out = mod._guard_tick([], kin, "t2", now=100.0 + 1.0)
+        self.assertEqual(out["triggered"], [])
+        # Past the trigger cooldown → a fresh trigger (event #2).
+        out = mod._guard_tick([], kin, "t3",
+                              now=100.0 + mod.GUARD_TRIGGER_COOLDOWN_SEC + 1)
+        self.assertEqual(out["triggered"], ["the Kinect"])
+        with mod._guard_lock:
+            self.assertEqual(mod._event_count[0], 2)
+
+    def test_continuous_webcam_mover_capped_by_trigger_cooldown(self):
+        # A continuous mover re-fires the debounce every 3 ticks; the trigger
+        # cooldown must cap snapshots/events to one per window, not one/0.75s.
+        mod, _a = self._load()
+        label = "the left monitor camera"
+        # Keep the frames CHANGING every tick so the streak keeps building.
+        variants = [_with_block(base=0, block=60 + 15 * i, frac=0.4 + 0.04 * i)
+                    for i in range(9)]
+        mod._guard_tick([(label, _blank())], None, "seed", now=10.0)
+        for i, fr in enumerate(variants):
+            mod._guard_tick([(label, fr)], None, f"m{i}", now=10.25 + i * 0.25)
+        # 9 motion ticks = three full debounce cycles, but ONE trigger.
+        self.assertEqual(len(os.listdir(self._snapshot_dir)), 1)
+        with mod._guard_lock:
+            self.assertEqual(mod._event_count[0], 1)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# rearm race (guard_off → guard_on while the old thread winds down)
+# ─────────────────────────────────────────────────────────────────────────
+@unittest.skipUnless(_HAVE_CV, "numpy/cv2 not installed on this runner")
+class RearmRaceTests(GuardBase):
+    def test_rearm_starts_new_thread_even_if_old_one_still_alive(self):
+        # Simulate the TOCTOU window: an old monitor thread that has read
+        # armed=False but not yet returned still shows up alive in
+        # threading.enumerate(). guard_on must NOT skip starting a replacement.
+        mod, actions = self._load(guard_enabled=True)
+        stop = threading.Event()
+        old = threading.Thread(target=stop.wait, daemon=True,
+                               name="guard-mode-monitor")
+        old.start()
+        self.addCleanup(stop.set)
+
+        started = []
+        with mock.patch.object(threading.Thread, "start",
+                               lambda self: started.append(self.name)):
+            actions["guard_on"]("")
+        stop.set()
+        self.assertIn("guard-mode-monitor", started,
+                      "guard_on must start a fresh monitor thread even while "
+                      "an old one is winding down")
+
+    def test_stale_generation_loop_exits_while_armed(self):
+        # A thread from a PREVIOUS arming session must exit as soon as it sees
+        # its generation is stale, even though guard is (re)armed.
+        mod, _a = self._load(guard_enabled=True)
+        mod.INITIAL_DELAY_SECONDS = 0.0
+        with mod._guard_lock:
+            mod._armed[0] = True
+            mod._monitor_gen[0] = 7
+        # Runs to completion immediately (would loop forever on the old code
+        # only gated by armed) — a direct call returning proves the exit.
+        t = threading.Thread(target=mod._monitor_loop, args=(6,), daemon=True)
+        t.start()
+        t.join(timeout=3.0)
+        self.assertFalse(t.is_alive(),
+                         "stale-generation monitor loop must exit while armed")
 
 
 if __name__ == "__main__":
