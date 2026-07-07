@@ -43,11 +43,16 @@ def complete(
     *,
     model: str,
     messages: Sequence[dict],
-    system: Optional[str] = None,
+    system: Optional[str | list] = None,
     max_tokens: int = 500,
     timeout: float = DEFAULT_TIMEOUT_S,
 ) -> str:
     """Blocking completion. Returns the first text block of the reply.
+
+    ``system`` accepts either a plain string OR a list of Anthropic content
+    blocks (the prompt-caching form: a stable block carrying
+    ``cache_control={"type": "ephemeral"}`` plus an optional volatile tail —
+    see bobert_companion._cached_system_param). Both are forwarded verbatim.
 
     Raises the underlying anthropic.* exception on failure (the caller decides
     how to degrade) — identical semantics to the previous inlined call."""
@@ -66,7 +71,7 @@ def stream_text(
     *,
     model: str,
     messages: Sequence[dict],
-    system: Optional[str] = None,
+    system: Optional[str | list] = None,
     max_tokens: int = 500,
     timeout: float = DEFAULT_TIMEOUT_S,
     on_delta: Optional[Callable[[str], None]] = None,

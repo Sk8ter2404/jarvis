@@ -8551,8 +8551,171 @@ def _call_local_vision(question: str, png_images: list[bytes],
         return None
 
 
+def _cached_system_param(full_prompt: str):
+    """Split a per-turn system prompt into Anthropic content blocks so the big
+    STABLE prefix is served from the prompt cache.
+
+    Every conversation turn sends `_system_prompt` (the ~18-22k-token base +
+    phrasebook + PC_CONTROL_PROMPT + memory build) plus a few hundred tokens of
+    VOLATILE per-turn addenda (tone / voice-mood route / emotion / agent-mode).
+    Without caching, Anthropic re-processes the whole thing at full input price
+    and latency on EVERY turn. Splitting into
+
+        [ {stable prefix, cache_control: ephemeral}, {volatile tail} ]
+
+    makes the prefix a cache hit on every turn after the first (~90% cheaper
+    for those tokens, and a materially faster time-to-first-token). The cache
+    is a strict prefix match, which is exactly why the volatile addenda MUST
+    live in a separate trailing block — inside a single block they would
+    invalidate the whole prefix whenever the tone/mode changed.
+
+    Returns the original string unchanged when it doesn't start with
+    `_system_prompt` (defensive: a caller built something unusual) or when the
+    prefix is too short to be worth a cache write (Anthropic silently ignores
+    sub-minimum prefixes anyway, so the guard just avoids pointless structure).
+    Callers on the OLLAMA/local path must keep using the plain string — this is
+    Anthropic-API structure only.
+    """
+    base = _system_prompt
+    if (isinstance(full_prompt, str) and isinstance(base, str)
+            and len(base) >= 4000 and full_prompt.startswith(base)):
+        blocks = [{"type": "text", "text": base,
+                   "cache_control": {"type": "ephemeral"}}]
+        tail = full_prompt[len(base):]
+        if tail:
+            blocks.append({"type": "text", "text": tail})
+        return blocks
+    return full_prompt
+
+
+# ── Tiered long-term memory bridge (core/long_term_memory.py) ──────────────
+# The LTM module (working / semantic / episodic tiers + reflector) was built
+# and unit-tested in full but had ZERO production callers (2026-07-06 audit) —
+# no turn was ever recorded and the tray's memory viewer read a file nothing
+# wrote. This bridge wires it in with two rules:
+#   * NEVER on the voice thread's critical path: recording goes through a
+#     background queue worker; retrieval runs under a hard time budget and
+#     simply contributes nothing when slow/cold.
+#   * NEVER breaks prompt caching: retrieved facts are appended to the
+#     VOLATILE system-prompt tail (see _cached_system_param), not the cached
+#     stable prefix.
+# Kill switch: LTM_ENABLED in core/config.py (user_settings.json overridable),
+# plus the staging guard (test injects must not pollute real memory).
+_ltm_queue: "queue.Queue[tuple[str, str]] | None" = None
+_ltm_worker_started = [False]
+_LTM_RETRIEVE_BUDGET_S = 0.6   # max wall-clock a turn will wait on recall
+_LTM_RETRIEVE_K = 6
+
+
+def _ltm_enabled() -> bool:
+    try:
+        from core.config import LTM_ENABLED as _flag
+    except Exception:
+        _flag = True
+    if not _flag:
+        return False
+    return os.environ.get("JARVIS_STAGING", "").strip() != "1"
+
+
+def _ltm_module():
+    """Lazy import of core.long_term_memory. None when unavailable."""
+    try:
+        from core import long_term_memory as _ltm
+        return _ltm
+    except Exception:
+        return None
+
+
+def _ltm_boot_warm() -> None:
+    """Warm the LTM store off the boot path: first-boot migration + index
+    load can take seconds, so it runs on a daemon thread."""
+    if not _ltm_enabled():
+        return
+
+    def _warm():
+        ltm = _ltm_module()
+        if ltm is None:
+            return
+        try:
+            ltm.ensure_loaded()
+            print("  [ltm] long-term memory loaded "
+                  f"({len(ltm.list_facts() or [])} semantic fact(s))")
+        except Exception as e:
+            print(f"  [ltm] warm-up failed: {e}")
+
+    threading.Thread(target=_warm, name="ltm-warm", daemon=True).start()
+
+
+def _ltm_worker_loop() -> None:
+    while True:
+        try:
+            role, text = _ltm_queue.get()
+        except Exception:
+            return
+        ltm = _ltm_module()
+        if ltm is None:
+            continue
+        try:
+            ltm.record_turn(role, text)
+        except Exception as e:
+            print(f"  [ltm] record_turn failed: {e}")
+
+
+def _ltm_enqueue(role: str, text: str) -> None:
+    """Queue one turn for background recording. Non-blocking, never raises."""
+    global _ltm_queue
+    if not _ltm_enabled() or not text or not text.strip():
+        return
+    try:
+        if _ltm_queue is None:
+            _ltm_queue = queue.Queue(maxsize=512)
+        if not _ltm_worker_started[0]:
+            _ltm_worker_started[0] = True
+            threading.Thread(target=_ltm_worker_loop, name="ltm-writer",
+                             daemon=True).start()
+        _ltm_queue.put_nowait((role, text))
+    except Exception:
+        pass
+
+
+def _ltm_context(user_text: str) -> str:
+    """Top-k semantic facts relevant to this utterance, formatted as a
+    system-prompt addendum — or '' when disabled, cold, or slow. The hard
+    time budget means a cold embedder simply skips a turn or two while it
+    loads in the background instead of stalling the voice loop."""
+    if not _ltm_enabled() or not user_text or not user_text.strip():
+        return ""
+    ltm = _ltm_module()
+    if ltm is None:
+        return ""
+    result: list = []
+    done = threading.Event()
+
+    def _fetch():
+        try:
+            result.extend(ltm.retrieve_facts(user_text, k=_LTM_RETRIEVE_K) or [])
+        except Exception as e:
+            print(f"  [ltm] retrieve failed: {e}")
+        finally:
+            done.set()
+
+    threading.Thread(target=_fetch, name="ltm-recall", daemon=True).start()
+    if not done.wait(timeout=_LTM_RETRIEVE_BUDGET_S):
+        return ""
+    lines = []
+    for f in result[:_LTM_RETRIEVE_K]:
+        t = (f.get("text") or "").strip() if isinstance(f, dict) else ""
+        if t:
+            lines.append(f"- {t[:300]}")
+    if not lines:
+        return ""
+    return ("\n\n# RELEVANT LONG-TERM MEMORY (retrieved for this turn; use "
+            "when helpful, ignore when not)\n" + "\n".join(lines))
+
+
 def _call_llm(user_text: str) -> str:
     conversation_history.append({"role": "user", "content": user_text})
+    _ltm_enqueue("user", user_text)
 
     # Classify mood from this utterance and (if non-default) extend the
     # system prompt for this single turn. Cache the label so the follow-up
@@ -8646,6 +8809,10 @@ def _call_llm(user_text: str) -> str:
         + emotion_addendum
         + mode_addendum
         + voice_mood_addendum
+        # Per-turn semantic recall from tiered long-term memory. Lives in the
+        # VOLATILE tail so it never invalidates the cached stable prefix
+        # (see _cached_system_param); '' when disabled / cold / slow.
+        + _ltm_context(user_text)
     )
 
     from core.config import model_route
@@ -8658,16 +8825,19 @@ def _call_llm(user_text: str) -> str:
     elif AI_BACKEND == "claude":
         import anthropic
         try:
+            # Cache-split system param: stable prefix cached, per-turn addenda
+            # in a trailing uncached block. See _cached_system_param.
+            _sys_param = _cached_system_param(sys_prompt_now)
             if _llm_client is not None:
                 reply = _llm_client.complete(
                     model=CLAUDE_MODEL, max_tokens=500,
-                    system=sys_prompt_now, messages=conversation_history,
+                    system=_sys_param, messages=conversation_history,
                     timeout=_ANTHROPIC_TIMEOUT_S,
                 )
             else:
                 msg = anthropic.Anthropic(timeout=_ANTHROPIC_TIMEOUT_S).messages.create(
                     model=CLAUDE_MODEL, max_tokens=500,
-                    system=sys_prompt_now,
+                    system=_sys_param,
                     messages=conversation_history,
                 )
                 reply = msg.content[0].text
@@ -8736,6 +8906,7 @@ def _call_llm(user_text: str) -> str:
         reply = "AI backend not configured. Check AI_BACKEND in the script."
 
     conversation_history.append({"role": "assistant", "content": reply})
+    _ltm_enqueue("assistant", reply)
 
     # Update phrasebook rotation state — scan the reply for any canonical MCU
     # lines and record them in memory so the next turn's system prompt asks
@@ -14732,6 +14903,9 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     #     returns one finished sentence and prepends a FAILURE_MARKER on error,
     #     so success voices here and failures still route to the failure follow-up.
     "mcp_list_tools", "mcp_call", "mcp_reload",
+    # GPU / VRAM usage readout (skills/gpu_usage.py, 2026-07) — one finished
+    # spoken sentence summarising loaded models + VRAM against the card.
+    "gpu_usage", "vram_status", "show_vram", "gpu_status", "whats_loaded",
     # ── 2026-07-06 overnight sweep: remaining one-line read-outs ─────────────
     # Smart-home SETUP read-outs — the PIN / auth instructions the user must
     # HEAR to finish setup (audit: ecobee_request_pin's PIN was only ever
@@ -16193,15 +16367,19 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
         if AI_BACKEND == "claude":
             import anthropic
             msgs = list(conversation_history) + [{"role": "user", "content": extra}]
+            # Cache-split system param — the follow-up loop can run several
+            # LLM rounds per user turn, so the cached stable prefix pays for
+            # itself immediately. See _cached_system_param.
+            _sys_param = _cached_system_param(sys_prompt_now)
             if _llm_client is not None:
                 return _llm_client.complete(
                     model=CLAUDE_MODEL, max_tokens=400,
-                    system=sys_prompt_now, messages=msgs,
+                    system=_sys_param, messages=msgs,
                     timeout=_ANTHROPIC_TIMEOUT_S,
                 )
             msg = anthropic.Anthropic(timeout=_ANTHROPIC_TIMEOUT_S).messages.create(
                 model=CLAUDE_MODEL, max_tokens=400,
-                system=sys_prompt_now, messages=msgs,
+                system=_sys_param, messages=msgs,
             )
             return msg.content[0].text
         elif AI_BACKEND == "ollama":
@@ -18939,6 +19117,11 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     # unroutable for the whole session.
     if _SKILL_PROMPT_EXAMPLES:
         _system_prompt = build_system_prompt(memory)
+
+    # Warm the tiered long-term memory store off the boot path (daemon
+    # thread) — first load may migrate legacy facts + load the embedder,
+    # which can take seconds; a cold store just skips recall for a turn.
+    _ltm_boot_warm()
 
     # Spin up the three always-on diagnostic daemons (self-diag, crash
     # watcher, deep auditor). Wired in after load_skills so the self-diag
