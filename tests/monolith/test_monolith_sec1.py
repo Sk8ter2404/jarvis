@@ -3065,5 +3065,201 @@ class DispatchTrayCommandEdgeTests(_MonolithTestBase):
         fn.assert_called_once_with("")
 
 
+# ──────────────────────────────────────────────────────────────────────────
+#  Sentence-flush streaming TTS (_SentenceFlushBuffer + _call_llm wiring)
+# ──────────────────────────────────────────────────────────────────────────
+class StreamingTtsTests(_MonolithTestBase):
+    """Covers the sentence-flush buffer rules (complete-sentence flush,
+    ≥2-word fragment guard, hard stop on '[', 2-sentence cap), the
+    downstream prefix-strip, the STREAMING_TTS_ENABLED knob, and the
+    stream→complete() fallback inside _call_llm's claude branch."""
+
+    # -- helpers ---------------------------------------------------------
+    def _inline_threading(self):
+        import types as _types
+        return _types.SimpleNamespace(Thread=_InlineThread)
+
+    def _make_buffer(self, spoken):
+        # speak_fn recorder + inline threads → deterministic, no real TTS.
+        return self.bc._SentenceFlushBuffer(speak_fn=spoken.append)
+
+    def _fake_llm_client(self, chunks=None, stream_exc=None,
+                         complete_reply="fallback reply, sir."):
+        import types as _types
+        calls = {"stream": 0, "complete": 0}
+
+        def stream_text(*, on_delta=None, **_kw):
+            calls["stream"] += 1
+            if stream_exc is not None:
+                raise stream_exc
+            for c in (chunks or []):
+                if on_delta is not None:
+                    try:
+                        on_delta(c)
+                    except Exception:
+                        pass
+            return "".join(chunks or [])
+
+        def complete(**_kw):
+            calls["complete"] += 1
+            return complete_reply
+
+        return _types.SimpleNamespace(stream_text=stream_text,
+                                      complete=complete), calls
+
+    def _run_call_llm(self, client, spoken, extra_patches=()):
+        import contextlib
+        for name in ("conversation_history", "_stream_spoken_prefix",
+                     "_last_user_tone", "_last_user_text",
+                     "_last_voice_route", "_last_emotion"):
+            self._restore_attr_after(name)
+        with contextlib.ExitStack() as st:
+            p = st.enter_context
+            p(mock.patch.object(self.bc, "detect_tone", return_value=None))
+            p(mock.patch.object(self.bc, "route_voice_emotion",
+                                return_value={"mood": "casual", "addendum": ""}))
+            p(mock.patch.object(self.bc, "_voice_mood_response", None))
+            p(mock.patch.object(self.bc, "_emotion_tracker", None))
+            p(mock.patch.object(self.bc, "_ltm_enqueue", lambda *a, **k: None))
+            p(mock.patch.object(self.bc, "_ltm_context", return_value=""))
+            p(mock.patch("core.config.model_route", return_value="cloud"))
+            p(mock.patch.object(self.bc, "AI_BACKEND", "claude"))
+            p(mock.patch.object(self.bc, "_llm_client", client))
+            p(mock.patch.object(self.bc._mcu_phrases,
+                                "detect_phrases_in_reply", return_value={}))
+            p(mock.patch.object(self.bc, "_speak",
+                                lambda t, **k: spoken.append(t)))
+            p(mock.patch.object(self.bc, "threading",
+                                self._inline_threading()))
+            for extra in extra_patches:
+                p(extra)
+            return self.bc._call_llm("status report please")
+
+    # -- _SentenceFlushBuffer rules ---------------------------------------
+    def test_flush_buffer_speaks_leading_sentences_and_caps_at_two(self):
+        spoken = []
+        buf = self._make_buffer(spoken)
+        with mock.patch.object(self.bc, "threading", self._inline_threading()):
+            for c in ("Good ", "morning, sir. ", "All systems nominal. ",
+                      "A third sentence never flushes early. tail"):
+                buf.feed(c)
+        self.assertEqual(spoken, ["Good morning, sir.",
+                                  "All systems nominal."])
+        # spoken_prefix is the EXACT raw text consumed (trailing space kept)
+        self.assertEqual(buf.spoken_prefix,
+                         "Good morning, sir. All systems nominal. ")
+
+    def test_flush_buffer_short_fragment_waits_for_next_boundary(self):
+        spoken = []
+        buf = self._make_buffer(spoken)
+        with mock.patch.object(self.bc, "threading", self._inline_threading()):
+            buf.feed("Sir. ")                       # 1 word — must NOT flush
+            self.assertEqual(spoken, [])
+            buf.feed("As you wish, it is done. ")   # rides along as one piece
+        self.assertEqual(spoken, ["Sir. As you wish, it is done."])
+
+    def test_flush_buffer_hard_stops_on_bracket_same_chunk(self):
+        # '[' arrives in the same chunk as the sentence — nothing is spoken.
+        spoken = []
+        buf = self._make_buffer(spoken)
+        with mock.patch.object(self.bc, "threading", self._inline_threading()):
+            buf.feed("Right away. [ACTION: open_url example.com]")
+        self.assertEqual(spoken, [])
+        self.assertEqual(buf.spoken_prefix, "")
+
+    def test_flush_buffer_hard_stop_is_permanent(self):
+        # A sentence flushed BEFORE the '[' stands; everything after — even
+        # bracket-free complete sentences — is never early-spoken.
+        spoken = []
+        buf = self._make_buffer(spoken)
+        with mock.patch.object(self.bc, "threading", self._inline_threading()):
+            buf.feed("Right away, sir. ")
+            buf.feed("[ACTION: open_url example.com] ")
+            buf.feed("Done now. Plenty more words here. ")
+        self.assertEqual(spoken, ["Right away, sir."])
+        self.assertEqual(buf.spoken_prefix, "Right away, sir. ")
+
+    def test_flush_buffer_feed_swallows_speak_exceptions(self):
+        def _boom(_):
+            raise RuntimeError("tts down")
+        buf = self.bc._SentenceFlushBuffer(speak_fn=_boom)
+        with mock.patch.object(self.bc, "threading", self._inline_threading()):
+            buf.feed("All good here, sir. And more text. ")  # must not raise
+        # both sentences were still consumed onto the ledger
+        self.assertEqual(buf.spoken_prefix,
+                         "All good here, sir. And more text. ")
+
+    # -- downstream prefix-strip ------------------------------------------
+    def test_strip_stream_spoken_prefix_variants(self):
+        self._restore_attr_after("_stream_spoken_prefix")
+        self.bc._stream_spoken_prefix[0] = "Good morning, sir. "
+        # exact-prefix match → remainder only
+        self.assertEqual(
+            self.bc._strip_stream_spoken_prefix(
+                "Good morning, sir. The workshop is at twenty degrees."),
+            "The workshop is at twenty degrees.")
+        # rstrip'd-prefix match (downstream trimmed trailing whitespace)
+        self.assertEqual(
+            self.bc._strip_stream_spoken_prefix("Good morning, sir."), "")
+        # non-matching reply (e.g. fallback regenerated) → untouched
+        self.assertEqual(
+            self.bc._strip_stream_spoken_prefix("Something else entirely."),
+            "Something else entirely.")
+        # empty ledger → untouched
+        self.bc._stream_spoken_prefix[0] = ""
+        self.assertEqual(
+            self.bc._strip_stream_spoken_prefix("Good morning, sir. Hi."),
+            "Good morning, sir. Hi.")
+
+    # -- config knob -------------------------------------------------------
+    def test_streaming_tts_enabled_reads_config_flag(self):
+        with mock.patch("core.config.STREAMING_TTS_ENABLED", False):
+            self.assertFalse(self.bc._streaming_tts_enabled())
+        with mock.patch("core.config.STREAMING_TTS_ENABLED", True):
+            self.assertTrue(self.bc._streaming_tts_enabled())
+
+    # -- _call_llm wiring ---------------------------------------------------
+    def test_call_llm_streams_speaks_early_and_sets_prefix(self):
+        spoken = []
+        client, calls = self._fake_llm_client(chunks=[
+            "Understood, sir. ", "Opening it now. ",
+            "[ACTION: open_url example.com]",
+        ])
+        reply = self._run_call_llm(client, spoken)
+        self.assertEqual(calls, {"stream": 1, "complete": 0})
+        self.assertEqual(spoken, ["Understood, sir.", "Opening it now."])
+        self.assertEqual(self.bc._stream_spoken_prefix[0],
+                         "Understood, sir. Opening it now. ")
+        self.assertEqual(
+            reply,
+            "Understood, sir. Opening it now. [ACTION: open_url example.com]")
+        self.assertEqual(self.bc.conversation_history[-1]["content"], reply)
+
+    def test_call_llm_disabled_knob_uses_complete(self):
+        spoken = []
+        client, calls = self._fake_llm_client(
+            chunks=["never streamed. "], complete_reply="Via complete, sir.")
+        reply = self._run_call_llm(
+            client, spoken,
+            extra_patches=[mock.patch.object(
+                self.bc, "_streaming_tts_enabled", return_value=False)])
+        self.assertEqual(calls, {"stream": 0, "complete": 1})
+        self.assertEqual(spoken, [])            # nothing early-spoken
+        self.assertEqual(self.bc._stream_spoken_prefix[0], "")
+        self.assertEqual(reply, "Via complete, sir.")
+
+    def test_call_llm_stream_failure_falls_back_to_complete_once(self):
+        spoken = []
+        client, calls = self._fake_llm_client(
+            stream_exc=RuntimeError("wire dropped"),
+            complete_reply="Recovered via the blocking path, sir.")
+        reply = self._run_call_llm(client, spoken)
+        self.assertEqual(calls, {"stream": 1, "complete": 1})
+        self.assertEqual(reply, "Recovered via the blocking path, sir.")
+        # nothing was flushed before the failure → empty ledger, so the
+        # downstream speaker voices the fallback reply in full
+        self.assertEqual(self.bc._stream_spoken_prefix[0], "")
+
+
 if __name__ == "__main__":
     unittest.main()

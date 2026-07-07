@@ -8713,7 +8713,161 @@ def _ltm_context(user_text: str) -> str:
             "when helpful, ignore when not)\n" + "\n".join(lines))
 
 
+# ── Sentence-flush streaming TTS ────────────────────────────────────────────
+# Perceived-latency win: instead of sitting silent for the whole Claude
+# completion, speak the FIRST complete, action-free sentence(s) as they
+# stream (core/llm_client.stream_text was built with exactly this seam).
+# Deliberately conservative rules, because early speech can't be un-said:
+#   * only COMPLETE sentences flush ('.'/'!'/'?' followed by whitespace),
+#     and a sentence must have ≥2 words — a bare "Sir." waits and rides
+#     along with the next sentence instead of being voiced as a fragment;
+#   * HARD STOP at the first '[': it may open an [ACTION:]/[intent:]/[wry]
+#     marker, and only text STRICTLY BEFORE the first '[' is ever eligible
+#     — the moment a '[' appears in the unflushed buffer, early speech is
+#     over for this reply (the tail goes through the normal speak path,
+#     which parses/strips those markers properly);
+#   * at most 2 sentences flush early — the rest is one coherent utterance
+#     via the normal path, so prosody isn't chopped into single lines.
+# Kill switch: STREAMING_TTS_ENABLED in core/config.py (user_settings.json
+# overridable). Everything in here is best-effort: a raise inside feed()
+# is swallowed (stream_text also guards on_delta) so a TTS hiccup can
+# never abort the stream.
+
+# Exact text already sent to TTS by the flush buffer for the CURRENT reply.
+# Reset at the top of every _call_llm; read by the downstream speaker
+# (_strip_stream_spoken_prefix) so the already-voiced sentences aren't
+# spoken twice. Single-element-list global, matching the _last_user_tone /
+# _last_recording_peak idiom.
+_stream_spoken_prefix = [""]
+
+# Sentence boundary: terminal punctuation followed by whitespace. The
+# trailing whitespace requirement means "3.5 GHz" or a mid-decimal '.'
+# never splits, and an end-of-stream sentence with no trailing space
+# simply doesn't flush early (the normal path speaks it — safe default).
+_SENTENCE_BOUNDARY_RE = re.compile(r"[.!?](?:\s+)")
+
+
+def _streaming_tts_enabled() -> bool:
+    try:
+        from core.config import STREAMING_TTS_ENABLED as _flag
+    except Exception:
+        _flag = True
+    return bool(_flag)
+
+
+class _SentenceFlushBuffer:
+    """Accumulates streamed text chunks and speaks complete leading
+    sentences early, per the rules in the section comment above.
+
+    feed() is the stream_text on_delta callback — it must be cheap and must
+    never raise, so the actual _speak() call is dispatched onto a daemon
+    thread (chained: each flush thread joins its predecessor first, so two
+    early sentences can never race each other out of order). join() lets
+    _call_llm wait for the early speech to finish before the downstream
+    path speaks the tail, keeping the whole reply in order."""
+
+    MAX_EARLY_SENTENCES = 2   # flush cap — the tail rides the normal path
+
+    def __init__(self, speak_fn=None):
+        # None → resolve the monolith's _speak at dispatch time (it's
+        # defined further down the file); tests inject a recorder.
+        self._speak_fn = speak_fn
+        self._buf = ""              # streamed text not yet flushed
+        self._stopped = False       # latched on first '[' — never unlatched
+        self._flushed = 0           # sentences flushed so far
+        self._thread = None         # tail of the chained speak threads
+        self.spoken_prefix = ""     # exact raw text handed to TTS so far
+
+    def feed(self, chunk: str) -> None:
+        """on_delta callback. Best-effort by contract — never raises."""
+        try:
+            if self._stopped or not chunk:
+                return
+            self._buf += chunk
+            # Hard stop: a '[' anywhere in the unflushed buffer may be the
+            # start of an action/prosody marker. Nothing at or after it is
+            # eligible, and to keep the rule dead-simple nothing further
+            # flushes at all once one is seen (already-flushed text stands).
+            if "[" in self._buf:
+                self._stopped = True
+                return
+            self._try_flush()
+        except Exception:
+            pass   # defensive belt on top of stream_text's own guard
+
+    def _try_flush(self) -> None:
+        while not self._stopped and self._flushed < self.MAX_EARLY_SENTENCES:
+            end = None
+            for m in _SENTENCE_BOUNDARY_RE.finditer(self._buf):
+                # Require ≥2 words up to this boundary; a short fragment
+                # ("Sir. ") waits and flushes together with the next
+                # sentence as one piece.
+                if len(self._buf[:m.end()].split()) >= 2:
+                    end = m.end()
+                    break
+            if end is None:
+                return
+            piece, self._buf = self._buf[:end], self._buf[end:]
+            self.spoken_prefix += piece
+            self._flushed += 1
+            self._dispatch(piece.strip())
+
+    def _dispatch(self, sentence: str) -> None:
+        """Speak one flushed sentence off-thread. Chained on the previous
+        flush thread so playback order matches text order."""
+        if not sentence:
+            return
+        prev = self._thread
+        speak_fn = self._speak_fn
+
+        def _run():
+            try:
+                if prev is not None:
+                    prev.join(timeout=60)
+                fn = speak_fn if speak_fn is not None else _speak
+                fn(sentence)
+            except Exception:
+                pass   # early speech is a bonus — never let it propagate
+
+        t = threading.Thread(target=_run, name="stream-tts-flush", daemon=True)
+        self._thread = t
+        t.start()
+
+    def join(self, timeout: float = 60.0) -> None:
+        """Wait for the chained speak threads to drain (bounded), so the
+        downstream tail speech can't start mid-early-sentence."""
+        t = self._thread
+        if t is not None:
+            try:
+                t.join(timeout=timeout)
+            except Exception:
+                pass
+
+
+def _strip_stream_spoken_prefix(text: str) -> str:
+    """Remove the early-spoken prefix (this reply's flush-buffer output)
+    from the downstream spoken text, so those sentences aren't voiced twice.
+    Also tries the rstrip'd prefix because parse_and_run_actions may have
+    trimmed trailing whitespace. A non-matching prefix (e.g. the stream
+    failed over to complete() and produced different text) leaves the text
+    untouched — worst case is a rare repeat, never a dropped sentence."""
+    try:
+        prefix = _stream_spoken_prefix[0]
+        if not prefix or not text:
+            return text
+        for p in (prefix, prefix.rstrip()):
+            if p and text.startswith(p):
+                return text[len(p):].lstrip()
+        return text
+    except Exception:
+        return text
+
+
 def _call_llm(user_text: str) -> str:
+    # New reply, new early-speech ledger: whatever the flush buffer voiced
+    # last turn was already consumed by the downstream speaker, and a stale
+    # prefix must never strip text from THIS turn's reply.
+    _stream_spoken_prefix[0] = ""
     conversation_history.append({"role": "user", "content": user_text})
     _ltm_enqueue("user", user_text)
 
@@ -8829,11 +8983,50 @@ def _call_llm(user_text: str) -> str:
             # in a trailing uncached block. See _cached_system_param.
             _sys_param = _cached_system_param(sys_prompt_now)
             if _llm_client is not None:
-                reply = _llm_client.complete(
-                    model=CLAUDE_MODEL, max_tokens=500,
-                    system=_sys_param, messages=conversation_history,
-                    timeout=_ANTHROPIC_TIMEOUT_S,
-                )
+                if _streaming_tts_enabled():
+                    # Sentence-flush streaming TTS: speak the first complete,
+                    # action-free sentence(s) while the rest still streams
+                    # (see _SentenceFlushBuffer). The downstream speaker
+                    # strips _stream_spoken_prefix so nothing is said twice.
+                    _flush_buf = _SentenceFlushBuffer()
+                    try:
+                        reply = _llm_client.stream_text(
+                            model=CLAUDE_MODEL, max_tokens=500,
+                            system=_sys_param, messages=conversation_history,
+                            timeout=_ANTHROPIC_TIMEOUT_S,
+                            on_delta=_flush_buf.feed,
+                        )
+                    except Exception as _stream_err:
+                        # Stream failed mid-flight (network blip, SDK quirk).
+                        # Fall back to the blocking call ONCE — its anthropic.*
+                        # exceptions propagate to the handlers below with the
+                        # exact same semantics as before this feature. Any
+                        # sentences already voiced stay on the ledger so the
+                        # prefix-strip can still dedupe if the retry happens
+                        # to produce the same opening (a mismatch just means
+                        # a rare repeat, never a dropped sentence).
+                        print(f"  [stream-tts] stream failed, falling back "
+                              f"to complete(): {_stream_err}")
+                        _flush_buf.join()
+                        _stream_spoken_prefix[0] = _flush_buf.spoken_prefix
+                        reply = _llm_client.complete(
+                            model=CLAUDE_MODEL, max_tokens=500,
+                            system=_sys_param, messages=conversation_history,
+                            timeout=_ANTHROPIC_TIMEOUT_S,
+                        )
+                    else:
+                        # Let the early sentences finish before the caller
+                        # speaks the tail — keeps the reply in order (the
+                        # chained flush threads serialise among themselves;
+                        # this serialises them against the downstream path).
+                        _flush_buf.join()
+                        _stream_spoken_prefix[0] = _flush_buf.spoken_prefix
+                else:
+                    reply = _llm_client.complete(
+                        model=CLAUDE_MODEL, max_tokens=500,
+                        system=_sys_param, messages=conversation_history,
+                        timeout=_ANTHROPIC_TIMEOUT_S,
+                    )
             else:
                 msg = anthropic.Anthropic(timeout=_ANTHROPIC_TIMEOUT_S).messages.create(
                     model=CLAUDE_MODEL, max_tokens=500,
@@ -18712,6 +18905,12 @@ def _run_llm_dispatch(text: str) -> str:
 
     # Execute any [ACTION: ...] tokens, get the cleaned text for TTS
     spoken_text, action_results = parse_and_run_actions(reply)
+    # Sentence-flush streaming TTS: the leading sentence(s) may already have
+    # been voiced while the reply streamed (_call_llm's flush buffer). Strip
+    # exactly that prefix so they aren't spoken twice; if the whole reply was
+    # early-spoken the remainder is empty and the _speak below is skipped.
+    # Applied BEFORE the quip layer so a quip attaches to the unspoken tail.
+    spoken_text = _strip_stream_spoken_prefix(spoken_text)
     spoken_text = _apply_quip_layer(spoken_text, action_results)
     if spoken_text:
         _speak(spoken_text)
