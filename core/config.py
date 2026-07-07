@@ -335,6 +335,25 @@ XTTS_VOICE_SAMPLE = ""           # absolute path to a ~10 s WAV (mono, 24 kHz)
 XTTS_LANGUAGE     = "en"         # ISO-639-1 hint for XTTS-v2
 
 
+# ─── Local voice-cloning backend (Chatterbox) ──────────────────────────
+# A SEPARATE, opt-in path from the XTTS backend above: Resemble AI's
+# Chatterbox (MIT) clones a voice from a ~5 s consented reference clip and
+# renders on the RTX 3090. core.voice_clone.is_available() gates it and it
+# ALWAYS falls back to the edge-tts → pyttsx3 → SAPI5 ladder on any failure —
+# a missing dep / no-GPU box / unselected profile never silences JARVIS.
+#
+# ETHICS: only the owner's OWN consented voice or a JARVIS in-character
+# (non-celebrity) voice — enrollment requires an explicit consent flag and
+# profiles/audio live under a gitignored dir (never committed). See
+# core/voice_clone.py's module docstring.
+#
+# Read live by synthesise() every utterance so a 'switch to my voice' voice
+# action / a user_settings.json flip takes effect immediately. Default OFF.
+VOICE_CLONE_ENABLED = False      # master switch (OFF by default)
+VOICE_CLONE_PROFILE = ""         # active profile name under data/voice_profiles/
+VOICE_CLONE_MODEL   = "chatterbox"   # engine id (currently only "chatterbox")
+
+
 # ─── Voice pipeline selector ───────────────────────────────────────────
 # Picks which speech loop drives the main UX.
 #   'turn_based' → record_speech() → transcribe() → synthesise() → play
