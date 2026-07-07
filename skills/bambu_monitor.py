@@ -101,6 +101,11 @@ PROGRESS_MILESTONES = [
 # *currently* being printed, so layer_num >= 2 means layer 1 finished.)
 LAYER_ONE_ADHESION_LAYER = 2
 
+# A genuine print START sits near 0%. If the FIRST time we see a print RUNNING it
+# is already past this percent, we joined mid-flight (e.g. a JARVIS restart), so
+# the 0% "Print started" line is suppressed (we didn't witness the start).
+STARTED_PCT_CEILING = 5.0
+
 # After a print finishes JARVIS offers to call out when the bed has cooled.
 # Below this temperature the printed part is safe to handle.
 BED_COOL_THRESHOLD_C = 40.0
@@ -563,18 +568,34 @@ def _handle_state_change() -> None:
     # only fire after the bookkeeping reset above; the prev_gcode check
     # (set to True in the cold-start branch) keeps us quiet for prints
     # discovered mid-flight.
+    #
+    # 2026-07-07 bug-hunt (MED): the prev_gcode==None cold-start suppressor only
+    # catches the case where the VERY FIRST push we see is already RUNNING. On a
+    # restart mid-print the first push can be PREPARE (prev_gcode becomes PREPARE,
+    # not None), so the following RUNNING push slipped past the suppressor and
+    # blurted "Print started, sir" at whatever % the print was really at (e.g.
+    # 40%). A genuine start is near 0%; catching RUNNING already well past that
+    # means we JOINED mid-flight. Gate the spoken line on a near-zero percent so
+    # we mark the print started (+ pre-mark passed milestones) WITHOUT the false
+    # "started" announcement.
     if gcode_state == "RUNNING" and not _announced_start[0]:
+        joined_midflight = pct is not None and pct > STARTED_PCT_CEILING
         _announced_start[0] = True
         _print_start_ts[0] = time.time()
         try:
             _print_initial_estimate_min[0] = int(remaining) if remaining else None
         except (TypeError, ValueError):
             _print_initial_estimate_min[0] = None
-        remaining_str = _format_minutes(remaining) if remaining else ""
-        if remaining_str:
-            _enqueue_speech(f"Print started, sir — estimated {remaining_str}.")
+        if joined_midflight:
+            for threshold, _template in PROGRESS_MILESTONES:
+                if pct >= threshold:
+                    _announced_milestones.add(threshold)
         else:
-            _enqueue_speech("Print started, sir.")
+            remaining_str = _format_minutes(remaining) if remaining else ""
+            if remaining_str:
+                _enqueue_speech(f"Print started, sir — estimated {remaining_str}.")
+            else:
+                _enqueue_speech("Print started, sir.")
 
     # Progress milestones (only while running). Each milestone announcement
     # is sent through proactive_announce() (via _enqueue_speech) so the main
