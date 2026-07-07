@@ -155,5 +155,41 @@ class ClientFactoryTests(unittest.TestCase):
         self.assertEqual(captured["timeout"], 12.5)
 
 
+class LogCacheUsageTests(unittest.TestCase):
+    def test_logs_and_records_usage_fields(self):
+        class _U:
+            input_tokens = 42
+            output_tokens = 7
+            cache_read_input_tokens = 19000
+            cache_creation_input_tokens = 0
+        llm.last_usage.clear()
+        llm._log_cache_usage(_U())
+        self.assertEqual(llm.last_usage,
+                         {"cache_read": 19000, "cache_creation": 0,
+                          "input": 42, "output": 7})
+
+    def test_none_and_malformed_usage_are_harmless(self):
+        llm.last_usage.clear()
+        llm._log_cache_usage(None)          # no-op
+        self.assertEqual(llm.last_usage, {})
+
+        class _Weird:
+            # attribute access raising must not escape (telemetry only)
+            def __getattr__(self, name):
+                raise RuntimeError("boom")
+        llm._log_cache_usage(_Weird())
+        self.assertEqual(llm.last_usage, {})
+
+    def test_missing_cache_fields_default_to_zero(self):
+        class _U:
+            input_tokens = 5
+            output_tokens = 3
+            # no cache_* attrs at all (older SDK shapes)
+        llm.last_usage.clear()
+        llm._log_cache_usage(_U())
+        self.assertEqual(llm.last_usage["cache_read"], 0)
+        self.assertEqual(llm.last_usage["cache_creation"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
