@@ -336,6 +336,102 @@ class VerbatimResultSpokenTests(MonolithGlobalsTestCase):
 
 
 @requires_monolith
+class SpeakContractBugHunt20260707Tests(MonolithGlobalsTestCase):
+    """2026-07-07 bug-hunt: ~18 actions whose finished user-facing result was
+    SILENTLY DROPPED because the registered name was in NEITHER INFORMATIVE_ACTIONS
+    nor SPEAK_RESULT_VERBATIM_ACTIONS — the follow-up loop only voices results for
+    actions in one of those sets. The one-line confirmations went to the verbatim
+    set; the multi-line/queryable results went to INFORMATIVE. The two sets MUST
+    stay DISJOINT (see test_speak_sets_are_disjoint). Regression guard: keep them
+    routed and keep the sets disjoint.
+    """
+
+    # Names added to SPEAK_RESULT_VERBATIM_ACTIONS (finished one-liners). Each was
+    # verified to be a real register()ed action in its named skill and to have
+    # been in NEITHER speak set before this fix.
+    _VERBATIM_ADDS = (
+        # email_triage.py
+        "confirm_pending_draft", "send_draft", "send_pending_draft",
+        "archive_email", "archive_message", "scrap_pending_draft", "discard_draft",
+        # phone_bridge.py
+        "notify_phone", "text_my_phone", "push_to_phone",
+        # face_id.py
+        "enroll_face", "learn_my_face", "remember_this_person", "forget_face",
+        # guard_mode.py
+        "guard_on", "guard_off",
+        # enroll_voice.py
+        "enroll_voice", "learn_my_voice", "forget_voice", "set_active_speaker",
+        # kinect_gestures.py
+        "gestures_on", "gestures_off",
+        # kinect_pointing.py
+        "point_control_on", "point_control_off", "forget_point_target",
+        # image_gen.py
+        "generate_image", "make_picture",
+        # obs_control.py
+        "obs_toggle_mute", "obs_switch_scene", "obs_start_recording",
+        "obs_stop_recording", "obs_pause_recording",
+        # schedule_manager.py
+        "schedule_once", "schedule_recurring", "schedule_cron", "schedule_when",
+        "when_condition", "cancel_schedule", "remove_schedule", "fire_schedule",
+        "run_schedule",
+        # model_picker.py
+        "set_model", "set_brain",
+        # night_owl_mode.py
+        "good_morning",
+        # personal_rag.py
+        "rag_reindex", "rag_configure", "rag_open_top",
+        # sh_ecobee.py
+        "ecobee_complete_setup",
+        # notification_triage.py
+        "add_notification_rule", "remove_notification_rule",
+        "pause_notification_triage", "resume_notification_triage",
+        # network_deco.py one-line-status aliases
+        "printer_online", "device_online", "network_usage", "bandwidth_hogs",
+        "whats_using_bandwidth", "deco_refresh", "refresh_network",
+        # media fallbacks
+        "play_unheard", "play_vibe", "skip_track",
+        "play_playlist", "shuffle_library",
+        "keep_music_open", "stop_keeping_music_open",
+        "youtube_search_direct", "youtube_direct", "yt_direct",
+    )
+
+    # Names added to INFORMATIVE_ACTIONS (multi-line / re-summarised).
+    _INFORMATIVE_ADDS = (
+        # code_executor.py — output carries tracebacks / a "format:" hint the
+        # verbatim guard would swallow, so INFORMATIVE (LLM re-summarises) is right.
+        "run_python", "python", "eval_python", "compute",
+        # network_deco.py roll-call aliases — multi-device client LIST.
+        "who_is_on_the_wifi", "network_clients", "list_wifi_clients",
+        "network_topology",
+    )
+
+    def test_verbatim_additions_present(self):
+        for name in self._VERBATIM_ADDS:
+            self.assertIn(name, self.bc.SPEAK_RESULT_VERBATIM_ACTIONS,
+                          f"{name} must speak its finished one-liner result")
+
+    def test_informative_additions_present(self):
+        for name in self._INFORMATIVE_ADDS:
+            self.assertIn(name, self.bc.INFORMATIVE_ACTIONS,
+                          f"{name} must be informative so its result is re-summarised")
+
+    def test_code_executor_not_verbatim(self):
+        # run_python et al. carry tracebacks / "format:" hints — they must be
+        # INFORMATIVE, never verbatim (the verbatim guard would swallow them).
+        for name in ("run_python", "python", "eval_python", "compute"):
+            self.assertNotIn(name, self.bc.SPEAK_RESULT_VERBATIM_ACTIONS)
+
+    def test_speak_sets_are_disjoint(self):
+        # The follow-up loop routes INFORMATIVE (re-summarise) and the main loop
+        # speaks VERBATIM directly; an action in both would be double-handled.
+        overlap = (set(self.bc.INFORMATIVE_ACTIONS)
+                   & set(self.bc.SPEAK_RESULT_VERBATIM_ACTIONS))
+        self.assertEqual(overlap, set(),
+                         f"INFORMATIVE_ACTIONS and SPEAK_RESULT_VERBATIM_ACTIONS "
+                         f"must stay disjoint; overlap: {sorted(overlap)}")
+
+
+@requires_monolith
 class FaceTrackWakeReopenTests(MonolithGlobalsTestCase):
     """2026-07-04: the face-track soft-wake reopened the camera with a raw
     cv2.VideoCapture(cam["index"], CAP_DSHOW) on the STATIC index, bypassing

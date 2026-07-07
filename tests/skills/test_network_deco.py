@@ -347,7 +347,22 @@ class DeviceNameAndOnlineTests(_DecoBase):
         self.assertEqual(n({"hostname": "H"}), "H")
         self.assertEqual(n({"ip": "1.2.3.4"}), "1.2.3.4")
         self.assertEqual(n({"mac": "AA:BB"}), "AA:BB")
-        self.assertEqual(n({}), "unknown")
+        # 2026-07-07 bug-hunt: the fully-unlabelled fallback must be "an unnamed
+        # device", NOT the literal "unknown" — the old value collided with the
+        # "unknown " FAILURE_MARKER, so a legit "<name> is online, sir." success
+        # was read as a failure and swallowed.
+        self.assertEqual(n({}), "an unnamed device")
+
+    def test_unlabelled_device_name_carries_no_failure_marker(self):
+        # Guard the fix directly: the fallback + an "is online" success line must
+        # NOT trip the shared failure classifier.
+        from core.dispatcher import _is_failure_result
+        name = self.mod._device_name({})
+        self.assertFalse(_is_failure_result(name),
+                         f"unlabelled device name must not read as a failure: {name!r}")
+        self.assertFalse(
+            _is_failure_result(f"{name} is online, sir."),
+            "an 'online' success for an unlabelled device must not read as a failure")
 
     def test_is_online_variants(self):
         io_ = self.mod._is_online

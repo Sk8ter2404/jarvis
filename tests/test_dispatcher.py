@@ -303,6 +303,11 @@ class CanonicalFailureMarkersTests(unittest.TestCase):
     _EXPECTED = {
         "could not", "failed", "refused", "no tracks found",
         "no window matching", "unknown ", "format:",
+        # 2026-07-07 bug-hunt: contraction forms so failures phrased with
+        # "couldn't"/"can't"/"didn't"/"wouldn't" are detected (they previously
+        # matched no marker and were doubly dropped). "won't" is deliberately
+        # NOT here — it appears in by-design honest, non-error refusals.
+        "couldn't", "can't", "didn't", "wouldn't",
     }
 
     def test_canonical_contents(self):
@@ -330,6 +335,11 @@ class CanonicalFailureMarkersTests(unittest.TestCase):
             "no window matching": "no window matching 'Spotify'",
             "unknown ": "unknown command foo",
             "format:": "bad format: expected HH:MM",
+            # 2026-07-07 contraction markers.
+            "couldn't": "I couldn't reach the printer to pause it, sir.",
+            "can't": "I can't see through the webcam right now, sir.",
+            "didn't": "OBS didn't answer about recording state.",
+            "wouldn't": "the engine wouldn't start, sir.",
         }
         for marker, text in samples.items():
             self.assertTrue(d._is_failure_result(text),
@@ -341,6 +351,44 @@ class CanonicalFailureMarkersTests(unittest.TestCase):
         for ok in ("all good", "music queued", "screenshot captured",
                    "done, sir", "playing your focus mix"):
             self.assertFalse(d._is_failure_result(ok), ok)
+
+    # ── 2026-07-07 bug-hunt: contraction failure markers ─────────────────────
+    def test_contraction_markers_present(self):
+        # The contraction forms skills actually emit must be in the canonical
+        # tuple, so a "couldn't/can't/didn't" failure line is detected (before
+        # this fix such lines matched NO marker and were doubly dropped — neither
+        # spoken verbatim nor routed to the failure follow-up).
+        from core.failure_markers import FAILURE_MARKERS
+        for m in ("couldn't", "can't", "didn't", "wouldn't"):
+            self.assertIn(m, FAILURE_MARKERS,
+                          f"contraction marker {m!r} must be canonical")
+
+    def test_contraction_failure_lines_now_detected(self):
+        # Realistic result lines that previously slipped through undetected.
+        for text in (
+            "I couldn't reach the printer to pause it, sir.",
+            "I can't see through the webcam right now, sir.",
+            "The engine didn't load, sir.",
+            "OBS didn't return its scene list.",
+            "the calibration wouldn't converge, sir.",
+        ):
+            self.assertTrue(d._is_failure_result(text),
+                            f"contraction failure should be detected: {text!r}")
+
+    def test_wont_deliberately_not_a_marker(self):
+        # "won't" is EXCLUDED on purpose: it appears in by-design honest,
+        # non-error refusals the verbatim speak-set intentionally voices. Adding
+        # it as a marker would swallow those legitimate answers and misroute them
+        # to the failure follow-up. Guard the exclusion.
+        from core.failure_markers import FAILURE_MARKERS
+        self.assertNotIn("won't", FAILURE_MARKERS)
+        for honest in (
+            "I won't use the 'stranger' profile, sir — it isn't marked as safe.",
+            "I won't expose the web interface without a token, sir.",
+            "I won't browse to internal/private addresses, sir.",
+        ):
+            self.assertFalse(d._is_failure_result(honest),
+                             f"honest refusal must NOT read as a failure: {honest!r}")
 
 
 # ── _format_consolidated ─────────────────────────────────────────────────────

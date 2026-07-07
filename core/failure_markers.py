@@ -33,4 +33,21 @@ FAILURE_MARKERS: tuple[str, ...] = (
     "no window matching",
     "unknown ",
     "format:",
+    # ── 2026-07-07 bug-hunt: contraction forms of the "could not"/"cannot" that
+    # skills actually emit. Before this, a result phrased "I couldn't reach the
+    # printer" / "I can't see the webcam" / "OBS didn't answer" matched NO marker,
+    # so it was neither spoken verbatim (the guard didn't flag it) NOR routed to
+    # the failure follow-up — the failure line was doubly dropped. These are
+    # matched as plain lowercased substrings (see core/dispatcher._is_failure_result
+    # and bobert_companion._is_failure), so each must be a form that only appears
+    # in genuine failure phrasings. "couldn't"/"can't"/"didn't"/"wouldn't" clear
+    # that bar (a full-repo scan of returned result strings found only real
+    # failures). "won't" is DELIBERATELY EXCLUDED: it appears in by-design honest,
+    # non-error refusals ("I won't use the '<x>' profile, sir", "I won't expose the
+    # web interface without a token, sir", the browser SSRF refusal) that the
+    # verbatim speak-set intentionally voices — flagging it would swallow those.
+    "couldn't",
+    "can't",
+    "didn't",
+    "wouldn't",
 )
