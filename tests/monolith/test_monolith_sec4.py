@@ -2899,7 +2899,13 @@ class StreamingAutoPlayBranchTests(MonolithGlobalsTestCase):
     def test_keyboard_select_failsafe_returns_message(self):
         # Apple Music uses select_method=keyboard; the keyboard select raising
         # UIFailsafeError surfaces a friendly message. (lines 8233-8236)
+        # resolve->None forces the SEARCH-PAGE (select_method="keyboard") path:
+        # v1.35.0 (#56) added resolve_itunes, whose live iTunes call otherwise
+        # switches to the resolved-track-page ("none") path and bypasses the
+        # keyboard branch this test exercises.
         with self._caps()[0], self._caps()[1], \
+             mock.patch.object(self.bc, "_apple_music_resolve_track",
+                               return_value=None), \
              mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
              mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
              mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
@@ -2911,7 +2917,11 @@ class StreamingAutoPlayBranchTests(MonolithGlobalsTestCase):
     def test_keyboard_select_not_sent_returns_hint(self):
         # keyboard select returns False (UI automation unavailable) → hint.
         # (lines 8237-8242)
+        # resolve->None forces the search-page keyboard path (see above /
+        # v1.35.0 resolve_itunes note).
         with self._caps()[0], self._caps()[1], \
+             mock.patch.object(self.bc, "_apple_music_resolve_track",
+                               return_value=None), \
              mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
              mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
              mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
@@ -3679,20 +3689,30 @@ class SpaceStrategyFocusTests(MonolithGlobalsTestCase):
 
 @requires_monolith
 class AppleMusicStrategyOrderTests(MonolithGlobalsTestCase):
-    """The shipped Apple Music config puts SPACE first, vision (play_button)
-    as a fallback, and enables title-based confirmation."""
+    """The shipped Apple Music config puts the vision-located detail-page
+    play_button FIRST, SPACE as the deterministic backup, and enables
+    title-based confirmation.
+
+    NOTE (expectation updated): v1.31.0 briefly ordered these SPACE-first, but
+    v1.35.0 (#56) reverted to play_button-first after live testing showed SPACE
+    is a play/PAUSE toggle that pauses a track an earlier action already
+    started ("never use SPACE as a retry"). The resolved iTunes track page
+    reliably carries the one large Play button, so play_button leads; on the
+    search-page fallback that button is absent (a no-op) and the strategy
+    advances to SPACE. Current shipped order: ["play_button","space","play_button"]."""
 
     @classmethod
     def setUpClass(cls):
         cls.bc = load_monolith()
 
-    def test_space_is_primary_strategy(self):
+    def test_play_button_is_primary_strategy(self):
         cfg = self.bc._STREAMING_SERVICES["apple_music"]
-        self.assertEqual(cfg["play_strategies"][0], "space")
-        self.assertIn("play_button", cfg["play_strategies"])  # kept as fallback
-        # SPACE must come before the first vision play_button.
-        self.assertLess(cfg["play_strategies"].index("space"),
-                        cfg["play_strategies"].index("play_button"))
+        self.assertEqual(cfg["play_strategies"][0], "play_button")
+        self.assertIn("space", cfg["play_strategies"])  # kept as the backup
+        # play_button must come before the first SPACE (vision-confirmed button
+        # leads; SPACE is the deterministic fallback if the button isn't there).
+        self.assertLess(cfg["play_strategies"].index("play_button"),
+                        cfg["play_strategies"].index("space"))
 
     def test_title_confirm_enabled(self):
         self.assertTrue(self.bc._STREAMING_SERVICES["apple_music"].get("title_confirm"))
@@ -3702,7 +3722,16 @@ class AppleMusicStrategyOrderTests(MonolithGlobalsTestCase):
 class AppleMusicAutoPlayNoVisionTests(MonolithGlobalsTestCase):
     """_streaming_auto_play for Apple Music end-to-end with vision OFF —
     keyboard-select + SPACE + title-confirm must still report playback, and
-    must NOT call vision (take_screenshot / find_click_target)."""
+    must NOT call vision (take_screenshot / find_click_target).
+
+    NOTE (expectation updated): v1.35.0 (#56) added resolve_itunes, which makes
+    _apple_music_resolve_track hit the live iTunes Search API and, on success,
+    switches to the resolved-track-page path (select_method='none',
+    highlighted_row double-click, query rewritten to '<track> by <artist>').
+    That live call made these tests non-deterministic and bypassed the
+    keyboard/SPACE path they were written to exercise. We pin the resolve to
+    None so the tests deterministically drive the SEARCH-PAGE fallback — the
+    exact vision-free keyboard-select + SPACE + tab-title contract under test."""
 
     @classmethod
     def setUpClass(cls):
@@ -3710,7 +3739,9 @@ class AppleMusicAutoPlayNoVisionTests(MonolithGlobalsTestCase):
 
     def test_plays_without_vision_via_title(self):
         bc = self.bc
-        with mock.patch.object(bc, "_open_url_in_browser",
+        with mock.patch.object(bc, "_apple_music_resolve_track",
+                               return_value=None), \
+             mock.patch.object(bc, "_open_url_in_browser",
                                return_value="chrome") as oub, \
              mock.patch.object(bc.webbrowser, "open") as wbo, \
              mock.patch.object(bc.time, "sleep"), \
@@ -3748,7 +3779,12 @@ class AppleMusicAutoPlayNoVisionTests(MonolithGlobalsTestCase):
             except StopIteration:
                 return "Africa — Toto"
 
-        with mock.patch.object(bc, "_open_url_in_browser",
+        # resolve->None forces the search-page fallback so the play_strategies
+        # loop runs; play_button (attempt 1) is a vision no-op with vision OFF,
+        # so it advances to SPACE (attempt 2). See class note (v1.35.0).
+        with mock.patch.object(bc, "_apple_music_resolve_track",
+                               return_value=None), \
+             mock.patch.object(bc, "_open_url_in_browser",
                                return_value="chrome"), \
              mock.patch.object(bc.time, "sleep"), \
              mock.patch.object(bc, "SCREEN_VISION_ENABLED", False), \
@@ -3825,7 +3861,12 @@ class OpenUrlInBrowserTests(MonolithGlobalsTestCase):
             via = bc._open_url_in_browser("https://music.apple.com/x",
                                           close_matching=["apple music", "web player"])
         self.assertEqual(via, "chrome")
-        closer.assert_called_once_with(["apple music", "web player"])
+        # Expectation updated for v1.85.0 (#120): _open_url_in_browser now threads
+        # a close_hwnd through to _close_browser_windows_matching(..., only_hwnd=...)
+        # so it closes ONLY the exact window JARVIS opened, never a title match
+        # that could hit the user's own browser. With no close_hwnd passed here,
+        # only_hwnd defaults to None (legacy title-substring mode).
+        closer.assert_called_once_with(["apple music", "web player"], only_hwnd=None)
         wbget.assert_not_called()         # webbrowser controller skipped in media mode
         popen.assert_called_once()
         self.assertIn("--new-window", popen.call_args.args[0])

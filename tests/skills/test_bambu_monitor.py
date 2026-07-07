@@ -260,6 +260,37 @@ class BambuStateChangeTests(unittest.TestCase):
         self.assertIn(25, self.mod._announced_milestones)
         self.assertIn(50, self.mod._announced_milestones)
 
+    def test_restart_prepare_then_running_midflight_suppresses_start(self):
+        # 2026-07-07 bug-hunt (MED): on a JARVIS restart mid-print the first push
+        # can be PREPARE (new-to-us filename → new_print resets _announced_start),
+        # so prev_gcode becomes PREPARE (not None) and the cold-start suppressor
+        # is skipped. The FOLLOWING RUNNING push must NOT blurt "Print started"
+        # at 40% — we joined mid-flight and never witnessed the start.
+        self.mod._last_gcode_state[0] = None
+        # Push 1: PREPARE, already deep into the print, new filename.
+        self._set(gcode_state="PREPARE", filename="big.3mf", mc_percent=40,
+                  layer_num=150, mc_remaining=90)
+        first = self._run()
+        self.assertFalse(any("Print started" in m for m in first))
+        # Push 2: RUNNING at the same 40% — the real trap.
+        self._set(gcode_state="RUNNING", filename="big.3mf", mc_percent=40,
+                  layer_num=150, mc_remaining=88)
+        second = self._run()
+        self.assertFalse(any("Print started" in m for m in second),
+                         "must not announce a start we joined mid-flight")
+        self.assertTrue(self.mod._announced_start[0])
+        # Passed milestones pre-marked so 25 doesn't blurt next.
+        self.assertIn(25, self.mod._announced_milestones)
+
+    def test_genuine_prepare_to_running_at_zero_still_announces(self):
+        # A REAL new print (PREPARE→RUNNING near 0%) must still announce start.
+        self.mod._last_gcode_state[0] = "PREPARE"
+        self.mod._current_print_filename[0] = "cube.3mf"   # already known
+        self._set(gcode_state="RUNNING", filename="cube.3mf", mc_percent=0,
+                  layer_num=1, mc_remaining=240)
+        msgs = self._run()
+        self.assertTrue(any("Print started" in m for m in msgs))
+
     def test_milestone_25_announced_once(self):
         # Already past the start; cross 25%.
         self.mod._last_gcode_state[0] = "RUNNING"
@@ -446,9 +477,13 @@ class BambuOfflineAndSummaryTests(unittest.TestCase):
         self.mod._mqtt_connected_ok[0] = False
 
     def test_offline_false_when_unconfigured(self):
-        # _read_config returns ("","","") with bobert_companion mocked → not
-        # "offline", just inactive.
-        self.assertFalse(self.mod.is_printer_offline())
+        # _read_config returns ("","","") → not "offline", just inactive.
+        # Explicitly mocked so the owner's LIVE BAMBU_* env vars (persisted since
+        # v1.92.0) can't leak in and make the printer look configured — a test-
+        # isolation fix (2026-07-07): previously failed on the owner's machine.
+        with mock.patch.object(self.mod, "_read_config",
+                               return_value=("", "", "")):
+            self.assertFalse(self.mod.is_printer_offline())
 
     def test_offline_true_when_configured_but_silent(self):
         with mock.patch.object(self.mod, "_read_config",

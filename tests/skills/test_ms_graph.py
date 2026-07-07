@@ -1213,7 +1213,10 @@ class CalendarActionTests(_MsGraphBase):
         with mock.patch.object(self.mod, "is_configured", return_value=False):
             out = self.mod.action_calendar_today("today")
         self.assertIn("isn't set up", out)
-        self.assertIn("--auth", out)
+        # Voiced verbatim → must NOT read a raw shell command aloud
+        # (2026-07-07 fix: '--auth' moved to a console log, not speech).
+        self.assertNotIn("--auth", out)
+        self.assertNotIn("python -m", out)
 
     def test_configured_empty_window_says_nothing_scheduled(self):
         with mock.patch.object(self.mod, "is_configured", return_value=True), \
