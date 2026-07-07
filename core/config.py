@@ -61,6 +61,13 @@ UI_AUTOMATION_ENABLED = True
 # new tasks. Loaded at startup by load_skills().
 SKILLS_ENABLED = True
 
+# ─── Tiered long-term memory ───────────────────────────────────────────
+# Wires core/long_term_memory.py into the conversation loop: every turn is
+# recorded on a background thread and the top-k relevant semantic facts are
+# injected into the volatile system-prompt tail (budget-bounded, never
+# blocks the voice loop). Overridable via data/user_settings.json.
+LTM_ENABLED = True
+
 
 # ─── Safety: hard confirmation keywords ────────────────────────────────
 # Actions matching these always require spoken confirmation ("yes" or

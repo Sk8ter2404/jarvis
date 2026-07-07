@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from collections import deque
@@ -403,6 +404,119 @@ class SystemPromptTests(_MonolithTestBase):
              mock.patch.dict(self.bc._SKILL_PROMPT_EXAMPLES, {}, clear=True):
             prompt = self.bc.build_system_prompt(mem)
         self.assertNotIn("ADDITIONAL SKILL ACTIONS", prompt)
+
+    # ── _cached_system_param (Anthropic prompt-cache split) ─────────────────
+    def test_cached_system_param_splits_stable_and_volatile(self):
+        stable = "S" * 5000
+        with mock.patch.object(self.bc, "_system_prompt", stable):
+            blocks = self.bc._cached_system_param(stable + "TONE-ADDENDUM")
+        self.assertIsInstance(blocks, list)
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[0]["text"], stable)
+        self.assertEqual(blocks[0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(blocks[1]["text"], "TONE-ADDENDUM")
+        self.assertNotIn("cache_control", blocks[1])
+
+    def test_cached_system_param_no_tail(self):
+        stable = "S" * 5000
+        with mock.patch.object(self.bc, "_system_prompt", stable):
+            blocks = self.bc._cached_system_param(stable)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["cache_control"], {"type": "ephemeral"})
+
+    def test_cached_system_param_passthrough_when_not_prefix(self):
+        # A prompt that doesn't start with _system_prompt (unusual caller)
+        # passes through unchanged as a plain string.
+        with mock.patch.object(self.bc, "_system_prompt", "S" * 5000):
+            out = self.bc._cached_system_param("something else entirely")
+        self.assertEqual(out, "something else entirely")
+
+    def test_cached_system_param_passthrough_when_short(self):
+        # Below the worth-caching guard the string is returned unchanged.
+        with mock.patch.object(self.bc, "_system_prompt", "short base"):
+            out = self.bc._cached_system_param("short base + tail")
+        self.assertEqual(out, "short base + tail")
+
+    # ── long-term-memory bridge (_ltm_* helpers) ─────────────────────────────
+    def test_ltm_context_formats_facts(self):
+        import types as _types
+        fake = _types.ModuleType("core.long_term_memory")
+        fake.retrieve_facts = lambda q, k=8: [
+            {"text": "The workshop printer is a Bambu X1C"},
+            {"text": "Prefers metric units"},
+            {"text": ""},               # blank text skipped
+            "not-a-dict",               # non-dict skipped
+        ]
+        with mock.patch.object(self.bc, "_ltm_enabled", return_value=True), \
+             mock.patch.object(self.bc, "_ltm_module", return_value=fake):
+            out = self.bc._ltm_context("what printer do I have")
+        self.assertIn("RELEVANT LONG-TERM MEMORY", out)
+        self.assertIn("- The workshop printer is a Bambu X1C", out)
+        self.assertIn("- Prefers metric units", out)
+        self.assertNotIn("not-a-dict", out)
+
+    def test_ltm_context_empty_when_disabled_or_no_facts(self):
+        with mock.patch.object(self.bc, "_ltm_enabled", return_value=False):
+            self.assertEqual(self.bc._ltm_context("anything"), "")
+        import types as _types
+        fake = _types.ModuleType("core.long_term_memory")
+        fake.retrieve_facts = lambda q, k=8: []
+        with mock.patch.object(self.bc, "_ltm_enabled", return_value=True), \
+             mock.patch.object(self.bc, "_ltm_module", return_value=fake):
+            self.assertEqual(self.bc._ltm_context("anything"), "")
+        # blank utterance short-circuits before any module import
+        with mock.patch.object(self.bc, "_ltm_enabled", return_value=True):
+            self.assertEqual(self.bc._ltm_context("   "), "")
+
+    def test_ltm_context_times_out_slow_retrieval(self):
+        import types as _types
+        fake = _types.ModuleType("core.long_term_memory")
+
+        def _slow(q, k=8):
+            time.sleep(5)
+            return [{"text": "too late"}]
+        fake.retrieve_facts = _slow
+        with mock.patch.object(self.bc, "_ltm_enabled", return_value=True), \
+             mock.patch.object(self.bc, "_ltm_module", return_value=fake), \
+             mock.patch.object(self.bc, "_LTM_RETRIEVE_BUDGET_S", 0.05):
+            t0 = time.monotonic()
+            out = self.bc._ltm_context("query")
+            elapsed = time.monotonic() - t0
+        self.assertEqual(out, "")
+        self.assertLess(elapsed, 1.0)   # budget honoured, no 5s stall
+
+    def test_ltm_enqueue_records_via_worker(self):
+        import types as _types
+        recorded = []
+        done = threading.Event()
+        fake = _types.ModuleType("core.long_term_memory")
+
+        def _rec(role, text):
+            recorded.append((role, text))
+            done.set()
+        fake.record_turn = _rec
+        # Force a fresh queue/worker pair so this test owns the drain.
+        with mock.patch.object(self.bc, "_ltm_enabled", return_value=True), \
+             mock.patch.object(self.bc, "_ltm_module", return_value=fake), \
+             mock.patch.object(self.bc, "_ltm_queue", None), \
+             mock.patch.object(self.bc, "_ltm_worker_started", [False]):
+            self.bc._ltm_enqueue("user", "remember the milk")
+            self.assertTrue(done.wait(timeout=5))
+        self.assertEqual(recorded, [("user", "remember the milk")])
+
+    def test_ltm_enqueue_noops_when_disabled_or_blank(self):
+        with mock.patch.object(self.bc, "_ltm_enabled", return_value=False), \
+             mock.patch.object(self.bc, "_ltm_queue", None):
+            self.bc._ltm_enqueue("user", "hello")
+            self.assertIsNone(self.bc._ltm_queue)
+        with mock.patch.object(self.bc, "_ltm_enabled", return_value=True), \
+             mock.patch.object(self.bc, "_ltm_queue", None):
+            self.bc._ltm_enqueue("user", "   ")
+            self.assertIsNone(self.bc._ltm_queue)
+
+    def test_ltm_enabled_respects_staging_env(self):
+        with mock.patch.dict(os.environ, {"JARVIS_STAGING": "1"}):
+            self.assertFalse(self.bc._ltm_enabled())
 
     def test_collect_skill_prompt_examples(self):
         import types as _types
