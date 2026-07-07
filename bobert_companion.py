@@ -5640,6 +5640,11 @@ _focus_until = [0.0]      # 0.0 = indefinite; else an epoch auto-resume time
 _FOCUS_MISSED_CAP = 50
 _focus_missed_buffer: list = []
 _focus_missed_lock = threading.Lock()
+# Serialises the timed-block True→False expiry transition so concurrent daemon
+# callers of focus_mode_active() can't double-build/double-announce the recap
+# (2026-07-07 review). Distinct from _focus_missed_lock, which _build_focus_recap
+# re-takes — sharing it would deadlock.
+_focus_resume_lock = threading.Lock()
 
 
 def focus_mode_active() -> bool:
@@ -5662,14 +5667,33 @@ def focus_mode_active() -> bool:
             # the flag BEFORE building the recap is deliberate: proactive_announce
             # is now un-gated, so the recap enqueues normally instead of being
             # swallowed back into the missed buffer.
-            _focus_mode[0]  = False
-            _focus_until[0] = 0.0
-            try:
-                recap = _build_focus_recap(clear=True, prefix="Focus time's up, sir")
-                if recap:
+            #
+            # RESUME LATCH (2026-07-07 review, LOW): proactive_announce (hence this
+            # predicate) is called from dozens of daemon timers/watchers, so two
+            # threads can pass the expiry check at the same instant. Without a
+            # latch BOTH flip the flag and BOTH build the recap — the missed-buffer
+            # lock lets one drain it (the real recap) and hands the other an empty
+            # buffer → a spurious "nothing came up" spoken alongside the real one
+            # (or, racing a manual resume, the real recap lost). Serialise the
+            # True→False transition on a dedicated lock (NOT _focus_missed_lock,
+            # which _build_focus_recap re-takes — that would deadlock) so only the
+            # thread that actually flips it builds + announces the recap.
+            recap = None
+            with _focus_resume_lock:
+                if not _focus_mode[0]:
+                    return False            # another thread already resumed
+                _focus_mode[0]  = False
+                _focus_until[0] = 0.0
+                try:
+                    recap = _build_focus_recap(clear=True,
+                                               prefix="Focus time's up, sir")
+                except Exception:
+                    recap = None
+            if recap:
+                try:
                     proactive_announce(recap, source="focus_mode")
-            except Exception:
-                pass
+                except Exception:
+                    pass
             return False
         return True
     except Exception:
@@ -9639,6 +9663,13 @@ def _render_xtts_or_raise(text: str, rate: str, pitch: str) -> tuple[np.ndarray,
     return mod.render(text, rate, pitch)
 
 
+# Hard wall-clock cap on a voice-clone render (see the clone block in synthesise).
+# Generous enough for Chatterbox's first-run cold start (model download + CUDA
+# load), then we abandon it and fall through to the edge-tts ladder so a hang can
+# never leave JARVIS mute. 2026-07-07 review.
+_VOICE_CLONE_TIMEOUT_S = 20.0
+
+
 def synthesise(text: str) -> tuple[np.ndarray, int]:
     # Voice-mood router output wins over raw detect_tone() output here:
     # the router fuses tone with time-of-day, so its label is the one
@@ -9672,12 +9703,44 @@ def synthesise(text: str) -> tuple[np.ndarray, int]:
             if globals().get("VOICE_CLONE_ENABLED", False):
                 from core import voice_clone as _voice_clone
                 if _voice_clone.is_available():
-                    clone = _voice_clone.synthesize(text)
-                    if clone is not None:
-                        audio, sr = clone
-                        if gain != 1.0:
-                            audio = np.clip(audio * gain, -1.0, 1.0).astype(np.float32)
-                        return audio, sr
+                    # WALL-CLOCK CAP (2026-07-07 review, MED): run the clone on a
+                    # DAEMON worker with a hard join timeout. Chatterbox pays a
+                    # multi-second cold start (first-run model download + CUDA
+                    # load) and can stall on the GPU — a HANG (not a raise/None)
+                    # would otherwise freeze the whole voice turn indefinitely,
+                    # unlike every other backend (edge-tts caps at 30s). On
+                    # timeout/failure we abandon it and fall through to the ladder
+                    # so JARVIS is NEVER left mute. Daemon → a hung worker can't
+                    # block process exit and dies with it.
+                    _clone_box: dict = {}
+
+                    def _clone_worker():
+                        try:
+                            _clone_box["v"] = _voice_clone.synthesize(text)
+                        except Exception as _ce:      # noqa: BLE001
+                            _clone_box["err"] = _ce
+
+                    _ct = threading.Thread(target=_clone_worker,
+                                           name="voice-clone-synth", daemon=True)
+                    _ct.start()
+                    _ct.join(timeout=_VOICE_CLONE_TIMEOUT_S)
+                    if _ct.is_alive():
+                        print(f"  [tts] voice-clone timed out "
+                              f"(>{_VOICE_CLONE_TIMEOUT_S:.0f}s) — using the normal "
+                              f"TTS ladder")
+                    elif "err" in _clone_box:
+                        _e = _clone_box["err"]
+                        print(f"  [tts] voice-clone failed "
+                              f"({type(_e).__name__}: {_e}); using the normal "
+                              f"TTS ladder")
+                    else:
+                        clone = _clone_box.get("v")
+                        if clone is not None:
+                            audio, sr = clone
+                            if gain != 1.0:
+                                audio = np.clip(audio * gain, -1.0,
+                                                1.0).astype(np.float32)
+                            return audio, sr
         except Exception as e:
             print(f"  [tts] voice-clone unavailable ({type(e).__name__}: {e}); "
                   f"using the normal TTS ladder")

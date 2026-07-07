@@ -112,6 +112,29 @@ class SynthesiseVoiceCloneTests(MonolithGlobalsTestCase):
         self.assertEqual(sr, 24000)
         self.assertTrue(np.allclose(audio, 0.25))
 
+    # ── a HANGING clone (cold-start / GPU stall) times out → falls back ──────
+    def test_clone_hang_times_out_and_falls_back(self):
+        # 2026-07-07 review (MED): a clone that HANGS (not raises/None) must not
+        # freeze the voice turn — the daemon-worker join timeout abandons it and
+        # falls through to the edge-tts ladder within the cap.
+        import time as _time
+        bc = self.bc
+
+        def _hang(_text):
+            _time.sleep(2.0)                       # >> the (mocked) timeout
+            return (np.ones(100, dtype=np.float32), 24000)
+
+        with mock.patch.object(bc, "VOICE_CLONE_ENABLED", True), \
+             mock.patch.object(bc, "_VOICE_CLONE_TIMEOUT_S", 0.15), \
+             mock.patch.object(vc, "is_available", return_value=True), \
+             mock.patch.object(vc, "synthesize", side_effect=_hang):
+            t0 = _time.monotonic()
+            audio, sr = bc.synthesise("hello sir")
+            elapsed = _time.monotonic() - t0
+        self.assertEqual(sr, 24000)
+        self.assertTrue(np.allclose(audio, 0.25))  # edge-tts fallback, not clone's 1.0
+        self.assertLess(elapsed, 1.5)              # did NOT wait out the 2s hang
+
 
 if __name__ == "__main__":
     unittest.main()
