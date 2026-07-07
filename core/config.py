@@ -596,6 +596,21 @@ KINECT_POINT_CONTROL_ENABLED = False
 #   isn't tracked. See audio/kinect_bridge.get_hand_states() (grip) +
 #   skills/kinect_air_mouse.py (wiring) + hud/jarvis_air_cursor.py (overlay).
 KINECT_AIR_MOUSE_ENABLED = False
+# AIR_CONTROL_ENABLED — movie-style AIR CONTROL (skills/air_control.py, engine
+#   core/air_control.py): reach a hand OUT toward the sensor + above the waist
+#   to take the cursor across the WHOLE virtual desktop; a closed FIST grabs and
+#   drags, a quick close→open is a click, a LASSO (pointing) hand scrolls, and
+#   dropping/retracting the hand releases everything. Distinct from the
+#   raise-above-shoulder KINECT_AIR_MOUSE above (different engagement model +
+#   grab/scroll semantics); don't run both at once.
+#   SAFETY — DEFAULT False: a Kinect hand-state glitch must NEVER drive the real
+#   mouse uninvited, so nothing moves at boot. The SKILL still LOADS when this is
+#   False (so the voice actions exist); the knob only controls whether the
+#   control LOOP auto-starts at load. "Air control on" starts the loop
+#   explicitly at runtime regardless of the knob (an explicit voice command IS
+#   the owner's consent); "air control off" stops it and releases any held
+#   button. Overridable via data/user_settings.json like every other flag.
+AIR_CONTROL_ENABLED = False
 # KINECT_HAND_MIRROR — the Kinect color/skeleton stream is MIRRORED (selfie view),
 #   so the owner's REAL left hand appears on the RIGHT of the image. When True
 #   (the default) the air-mouse SWAPS the bridge's left↔right hands so the owner's

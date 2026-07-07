@@ -15285,6 +15285,13 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     # GPU / VRAM usage readout (skills/gpu_usage.py, 2026-07) — one finished
     # spoken sentence summarising loaded models + VRAM against the card.
     "gpu_usage", "vram_status", "show_vram", "gpu_status", "whats_loaded",
+    # AIR CONTROL — movie-style Kinect hand-mouse (skills/air_control.py,
+    # 2026-07). Each returns ONE finished sentence ("Air control on, sir —
+    # reach a hand out…" / "…already off, sir." / the status line) and never
+    # self-speaks; without this the on/off/status verdicts would only be
+    # logged. The graceful "Kinect isn't available, sir — …" phrasings carry
+    # no FAILURE_MARKER by design — honest, complete answers, not errors.
+    "air_control_on", "air_control_off", "air_control_status",
     # ── 2026-07-06 overnight sweep: remaining one-line read-outs ─────────────
     # Smart-home SETUP read-outs — the PIN / auth instructions the user must
     # HEAR to finish setup (audit: ecobee_request_pin's PIN was only ever
