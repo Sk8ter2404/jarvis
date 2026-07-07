@@ -18694,6 +18694,19 @@ def _preflight_cameras(timeout_sec: float = 2.0) -> None:
         # indices fail, leave CAMERAS untouched so probe_cameras_and_
         # update_config can do its sweep-and-rewrite step.
         CAMERAS[:] = [c for c in CAMERAS if c.get("index") not in bad]
+        # PROMOTE a survivor to PRIMARY if the configured primary was among the
+        # dropped (2026-07-07 owner report: "camera preview broken again"). The
+        # HUD camera-preview WRITE and the primary-face tracking are BOTH gated on
+        # `cam["primary"]`; with a static config whose primary is the Left webcam
+        # (index 1), the moment that camera is unplugged/asleep/bad the preflight
+        # drops it and every survivor reads primary=False — so the preview file is
+        # never written and the HUD tile goes dark. Promoting the first survivor
+        # keeps the preview + tracking working on whatever camera is present.
+        if CAMERAS and not any(c.get("primary") for c in CAMERAS):
+            CAMERAS[0]["primary"] = True
+            print(f"  [preflight] configured primary camera was dropped — "
+                  f"promoted {CAMERAS[0].get('label')} "
+                  f"(index {CAMERAS[0].get('index')}) to primary")
         print(f"  [preflight] dropped {len(bad)} bad camera index/es; "
               f"{len(CAMERAS)} remain")
 

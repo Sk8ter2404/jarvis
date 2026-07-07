@@ -1320,6 +1320,34 @@ class PreflightCamerasTests(SectionSevenBase):
         self.bc._preflight_cameras(timeout_sec=0.1)
         self.assertEqual(len(self.bc.CAMERAS), 2)
 
+    def test_dropped_primary_promotes_survivor(self):
+        # 2026-07-07 owner fix ("camera preview broken again"): the config PRIMARY
+        # is index 1 (Left webcam); it fails and is dropped, leaving only index 0
+        # (primary=False). The survivor MUST be promoted to primary — otherwise
+        # the HUD preview write + primary-face tracking (both gated on
+        # cam["primary"]) never fire and the camera tile goes dark.
+        self._p(self.bc, "CAMERAS",
+                [{"index": 0, "label": "Right", "primary": False},
+                 {"index": 1, "label": "Left", "primary": True}])
+        self._p(self.bc, "_probe_camera_index",
+                side_effect=lambda i, timeout_sec=2.0: i == 0)   # only 0 opens
+        self.bc._preflight_cameras(timeout_sec=0.1)
+        self.assertEqual([c["index"] for c in self.bc.CAMERAS], [0])
+        self.assertTrue(self.bc.CAMERAS[0]["primary"],
+                        "surviving camera must be promoted to primary")
+
+    def test_surviving_primary_not_disturbed(self):
+        # When the primary survives, promotion is a no-op (exactly one primary).
+        self._p(self.bc, "CAMERAS",
+                [{"index": 0, "label": "Left", "primary": True},
+                 {"index": 1, "label": "Right", "primary": False}])
+        self._p(self.bc, "_probe_camera_index",
+                side_effect=lambda i, timeout_sec=2.0: i == 0)   # index 1 dropped
+        self.bc._preflight_cameras(timeout_sec=0.1)
+        self.assertEqual([c["index"] for c in self.bc.CAMERAS], [0])
+        self.assertEqual(sum(1 for c in self.bc.CAMERAS if c["primary"]), 1)
+        self.assertTrue(self.bc.CAMERAS[0]["primary"])
+
     def test_probe_exception_treated_as_bad(self):
         # A probe raising must be caught (treated as a failed open), not escape.
         def _raise(i, timeout_sec=2.0):
