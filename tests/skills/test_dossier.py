@@ -664,6 +664,158 @@ class DossierStateIoTests(unittest.TestCase):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# NEW: speak-time expiry refresh (2026-07-06 audit finding [31])
+# ──────────────────────────────────────────────────────────────────────────
+class DossierExpiryRefreshTests(unittest.TestCase):
+    """The parent-side watcher must hold the card's countdown while TTS is
+    speaking, fall back to the old fixed countdown when the host flag is
+    absent, and stop cleanly on dismissal / replacement."""
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("dossier")
+        self.tmpdir = tempfile.mkdtemp(prefix="dossier_expiry_")
+        self.addCleanup(self._cleanup)
+        self.state = os.path.join(self.tmpdir, "dossier_state.json")
+        mock.patch.object(self.mod, "_STATE_FILE", self.state).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def _cleanup(self):
+        for fn in os.listdir(self.tmpdir):
+            try:
+                os.unlink(os.path.join(self.tmpdir, fn))
+            except OSError:
+                pass
+        try:
+            os.rmdir(self.tmpdir)
+        except OSError:
+            pass
+
+    def _seed_state(self, shown_at, expiry_ts, dismissed=False):
+        self.mod._write_state({
+            "topic": "sam", "shown_at": shown_at,
+            "expiry_ts": expiry_ts, "dismissed": dismissed,
+        })
+
+    # ── _tts_playback_active_flag ────────────────────────────────────────
+    def test_flag_true_when_host_speaking(self):
+        bc = types.ModuleType("bobert_companion")
+        bc._tts_playback_active = [True]
+        with inject_modules(bobert_companion=bc):
+            self.assertTrue(self.mod._tts_playback_active_flag())
+
+    def test_flag_false_when_host_idle(self):
+        bc = types.ModuleType("bobert_companion")
+        bc._tts_playback_active = [False]
+        with inject_modules(bobert_companion=bc):
+            self.assertFalse(self.mod._tts_playback_active_flag())
+
+    def test_flag_missing_attribute_falls_back_false(self):
+        # Older host without the v1.96.0 flag -> old behavior exactly.
+        bc = types.ModuleType("bobert_companion")
+        with inject_modules(bobert_companion=bc):
+            self.assertFalse(self.mod._tts_playback_active_flag())
+
+    def test_flag_missing_module_falls_back_false(self):
+        with inject_modules(bobert_companion=None):
+            self.assertFalse(self.mod._tts_playback_active_flag())
+
+    def test_flag_wrong_shape_falls_back_false(self):
+        # Not a non-empty list/tuple -> defensively False.
+        bc = types.ModuleType("bobert_companion")
+        bc._tts_playback_active = True
+        with inject_modules(bobert_companion=bc):
+            self.assertFalse(self.mod._tts_playback_active_flag())
+
+    # ── _refresh_expiry_if_speaking ──────────────────────────────────────
+    def test_refresh_pushes_expiry_while_tts_active(self):
+        shown = 1000.0
+        self._seed_state(shown, expiry_ts=1010.0)
+        with mock.patch.object(self.mod, "_tts_playback_active_flag",
+                               return_value=True), \
+             mock.patch.object(self.mod.time, "time", return_value=1009.0):
+            self.assertTrue(self.mod._refresh_expiry_if_speaking(shown))
+        cur = self.mod._load_state_safe()
+        self.assertEqual(cur["expiry_ts"],
+                         1009.0 + self.mod.CARD_DURATION_SECONDS)
+
+    def test_no_refresh_when_idle_and_keeps_polling_until_expiry(self):
+        shown = 1000.0
+        self._seed_state(shown, expiry_ts=1010.0)
+        with mock.patch.object(self.mod, "_tts_playback_active_flag",
+                               return_value=False), \
+             mock.patch.object(self.mod.time, "time", return_value=1005.0):
+            self.assertTrue(self.mod._refresh_expiry_if_speaking(shown))
+        # expiry_ts untouched -> normal countdown when idle.
+        self.assertEqual(self.mod._load_state_safe()["expiry_ts"], 1010.0)
+
+    def test_stops_after_expiry_when_idle(self):
+        shown = 1000.0
+        self._seed_state(shown, expiry_ts=1010.0)
+        with mock.patch.object(self.mod, "_tts_playback_active_flag",
+                               return_value=False), \
+             mock.patch.object(self.mod.time, "time", return_value=1011.0):
+            self.assertFalse(self.mod._refresh_expiry_if_speaking(shown))
+
+    def test_stops_when_dismissed(self):
+        shown = 1000.0
+        self._seed_state(shown, expiry_ts=9e9, dismissed=True)
+        with mock.patch.object(self.mod, "_tts_playback_active_flag",
+                               return_value=True):
+            self.assertFalse(self.mod._refresh_expiry_if_speaking(shown))
+
+    def test_stops_when_state_missing(self):
+        self.assertFalse(self.mod._refresh_expiry_if_speaking(1000.0))
+
+    def test_stops_when_newer_card_owns_state(self):
+        # A fresh dossier replaced ours -> our watcher must not touch it.
+        self._seed_state(shown_at=2000.0, expiry_ts=9e9)
+        with mock.patch.object(self.mod, "_tts_playback_active_flag",
+                               return_value=True):
+            self.assertFalse(self.mod._refresh_expiry_if_speaking(1000.0))
+        self.assertEqual(self.mod._load_state_safe()["expiry_ts"], 9e9)
+
+    def test_refresh_write_failure_swallowed_keeps_polling(self):
+        shown = 1000.0
+        self._seed_state(shown, expiry_ts=1010.0)
+        with mock.patch.object(self.mod, "_tts_playback_active_flag",
+                               return_value=True), \
+             mock.patch.object(self.mod, "_write_state",
+                               side_effect=OSError("disk full")):
+            self.assertTrue(self.mod._refresh_expiry_if_speaking(shown))
+
+    # ── watcher thread + wiring ──────────────────────────────────────────
+    def test_watcher_thread_loops_until_step_false(self):
+        calls = []
+
+        def _step(shown_at):
+            calls.append(shown_at)
+            return len(calls) < 3
+
+        with mock.patch.object(self.mod, "_refresh_expiry_if_speaking",
+                               side_effect=_step), \
+             mock.patch.object(self.mod, "EXPIRY_REFRESH_POLL_SECONDS", 0.0):
+            t = self.mod._start_expiry_refresh_watcher(1000.0)
+            t.join(timeout=5.0)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(calls, [1000.0, 1000.0, 1000.0])
+        self.assertTrue(t.daemon)
+
+    def test_act_dossier_starts_watcher_with_shown_at(self):
+        with mock.patch.object(self.mod, "_gather_memory", return_value=[]), \
+             mock.patch.object(self.mod, "_gather_tasks", return_value=[]), \
+             mock.patch.object(self.mod, "_gather_logs", return_value=[]), \
+             mock.patch.object(self.mod, "_gather_web", return_value=""), \
+             mock.patch.object(self.mod, "_write_state"), \
+             mock.patch.object(self.mod, "_ensure_renderer_running"), \
+             mock.patch.object(self.mod, "_top_monitor_geometry",
+                               return_value=(0, 0, 1920, 1080)), \
+             mock.patch.object(self.mod, "_start_expiry_refresh_watcher") as w:
+            self.actions["dossier"]("Sam")
+        w.assert_called_once()
+        self.assertIsInstance(w.call_args[0][0], float)
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # NEW: PID / renderer liveness + spawn guard
 # ──────────────────────────────────────────────────────────────────────────
 class DossierRendererProcTests(unittest.TestCase):
