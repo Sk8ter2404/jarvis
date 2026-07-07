@@ -435,6 +435,38 @@ class VirtualDesktopMappingTests(_Base):
         self.assertEqual((rb.origin_x, rb.origin_y, rb.screen_w, rb.screen_h),
                          (self.VX, self.VY, self.VW, self.VH))
 
+    def test_reach_box_uses_persisted_calibration_geometry(self):
+        # The calibration wizard writes KINECT_REACH_* to user_settings; the
+        # reach-box must pick them up so the map fits the owner's arm span.
+        mod = self._load()
+        saved = {mod.SETTING_REACH_CENTER_X: 0.05,
+                 mod.SETTING_REACH_CENTER_Y: 0.42,
+                 mod.SETTING_REACH_HALF_W: 0.31,
+                 mod.SETTING_REACH_HALF_H: 0.19}
+        with mock.patch.object(mod, "_virtual_screen_bounds",
+                               lambda: (self.VX, self.VY, self.VW, self.VH)), \
+             mock.patch.object(mod, "_saved_settings", lambda: dict(saved)):
+            rb = mod._reach_box_for_virtual_desktop(refresh=True)
+        self.assertAlmostEqual(rb.center_x, 0.05)
+        self.assertAlmostEqual(rb.center_y, 0.42)
+        self.assertAlmostEqual(rb.half_w, 0.31)
+        self.assertAlmostEqual(rb.half_h, 0.19)
+
+    def test_reach_box_falls_back_per_field_on_partial_or_bad_calibration(self):
+        # A partial (only one key) and a degenerate (half_w <= 0) calibration
+        # must fall back to the module defaults per-field, never collapse the map.
+        mod = self._load()
+        saved = {mod.SETTING_REACH_CENTER_Y: 0.50,   # only one good key
+                 mod.SETTING_REACH_HALF_W: 0.0}       # degenerate → default
+        with mock.patch.object(mod, "_virtual_screen_bounds",
+                               lambda: (self.VX, self.VY, self.VW, self.VH)), \
+             mock.patch.object(mod, "_saved_settings", lambda: dict(saved)):
+            rb = mod._reach_box_for_virtual_desktop(refresh=True)
+        self.assertAlmostEqual(rb.center_y, 0.50)             # persisted
+        self.assertAlmostEqual(rb.center_x, mod.REACH_CENTER_X)  # default
+        self.assertAlmostEqual(rb.half_w, mod.REACH_HALF_W)      # default (was 0)
+        self.assertAlmostEqual(rb.half_h, mod.REACH_HALF_H)      # default (absent)
+
     def test_cached_bounds_refresh_picks_up_layout_change(self):
         mod = self._load()
         seq = [(0, 0, 2560, 1440), (self.VX, self.VY, self.VW, self.VH)]

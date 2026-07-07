@@ -301,6 +301,15 @@ SETTING_STRAIGHT_DISENGAGE = "KINECT_STRAIGHT_DISENGAGE"  # straightness disenga
 # owner can tune the raise-to-engage line live; default to the module margins.
 SETTING_UP_MARGIN = "KINECT_LIFT_UP_MARGIN"              # lift to ENGAGE (m)
 SETTING_DOWN_MARGIN = "KINECT_LIFT_DOWN_MARGIN"          # lift to DISENGAGE (m)
+# REACH-BOX geometry (the comfortable hand-sweep region mapped to the whole
+# virtual desktop). Persisted per-user by the calibration wizard
+# (tools/calibrate_air_mouse.py) so the reach maps to THIS owner's arm span +
+# seated posture; each missing key falls back to the module default, so a
+# partial/absent calibration is always safe. See _reach_box_for_virtual_desktop.
+SETTING_REACH_CENTER_X = "KINECT_REACH_CENTER_X"        # metres (optical axis)
+SETTING_REACH_CENTER_Y = "KINECT_REACH_CENTER_Y"        # metres above sensor
+SETTING_REACH_HALF_W = "KINECT_REACH_HALF_W"            # ± horizontal reach (m)
+SETTING_REACH_HALF_H = "KINECT_REACH_HALF_H"            # ± vertical reach (m)
 CALIB_ENGAGE_FRACTION = 0.60     # engage bar this far relaxed→extended
 CALIB_DISENGAGE_FRACTION = 0.40  # disengage bar this far relaxed→extended
 
@@ -2331,9 +2340,28 @@ def _cached_virtual_bounds(refresh: bool = False) -> tuple[int, int, int, int]:
 
 def _reach_box_for_virtual_desktop(refresh: bool = False) -> "ReachBox":
     """Build a ReachBox mapped across the WHOLE virtual desktop (all monitors),
-    using the cached virtual-screen bounds."""
+    using the cached virtual-screen bounds — and the PER-USER reach geometry the
+    calibration wizard persisted (KINECT_REACH_CENTER_X/Y, KINECT_REACH_HALF_W/H
+    in user_settings.json), read fresh each call. Each key falls back to the
+    module default individually, so an absent/partial calibration keeps the
+    tried-and-true defaults and can never strand the mapping. NEVER raises."""
     vx, vy, vw, vh = _cached_virtual_bounds(refresh=refresh)
-    return ReachBox(vw, vh, origin_x=vx, origin_y=vy)
+    cx, cy, hw, hh = REACH_CENTER_X, REACH_CENTER_Y, REACH_HALF_W, REACH_HALF_H
+    try:
+        s = _saved_settings()
+        cx = _saved_float(s, SETTING_REACH_CENTER_X)
+        cx = cx if cx is not None else REACH_CENTER_X
+        cy = _saved_float(s, SETTING_REACH_CENTER_Y)
+        cy = cy if cy is not None else REACH_CENTER_Y
+        hw = _saved_float(s, SETTING_REACH_HALF_W)
+        # A degenerate (≤0) half-extent would collapse the mapping — reject it.
+        hw = hw if (hw is not None and hw > 0.0) else REACH_HALF_W
+        hh = _saved_float(s, SETTING_REACH_HALF_H)
+        hh = hh if (hh is not None and hh > 0.0) else REACH_HALF_H
+    except Exception:
+        cx, cy, hw, hh = REACH_CENTER_X, REACH_CENTER_Y, REACH_HALF_W, REACH_HALF_H
+    return ReachBox(vw, vh, origin_x=vx, origin_y=vy,
+                    center_x=cx, center_y=cy, half_w=hw, half_h=hh)
 
 
 # ─── the per-tick read → decide → act path (unit-tested via _poll_once) ────
