@@ -3266,6 +3266,40 @@ class SmartEngageControllerTests(_Base):
             c.update(left, right, "open", "open", True, facing_deg=80.0)  # turned away
         self.assertFalse(c.engaged)
 
+    def test_invalid_pose_does_not_precharge_dwell_at_live_default(self):
+        # 2026-07-07 review (MED-HIGH): at the LIVE default engage_debounce_frames
+        # =3 (every other controller test pins 999, which masks the frame-credit),
+        # a raised OPEN palm held while LOOKING AWAY (an invalid passive pose) used
+        # to pre-charge the engage streak via the frame-credit — so the first frame
+        # the owner FACED the sensor engaged INSTANTLY with zero dwell and no ring,
+        # re-opening the false-trigger the rewrite killed. The streak must count
+        # only VALID frames; the first valid frame after an invalid hold must PRIME,
+        # not engage.
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = mod.AirMouseController(mod.ReachBox(2560, 1440), debounce_frames=1,
+                                   grace_sec=0.0, clock=clk, dwell_sec=0.30,
+                                   engage_debounce_frames=3, require_open_palm=True,
+                                   facing_max_deg=40.0, arm_relaxes_gate=True)
+        left = self._relaxed(mod, "left")
+        right = self._ext(mod, "right")
+        # Open palm raised + still, but LOOKING AWAY for ~1 s → invalid pose the
+        # whole time (would pre-charge the streak to ~20 with the old bug).
+        for _ in range(20):
+            clk.advance(0.05)
+            c.update(left, right, "open", "open", True, facing_deg=170.0, armed=False)
+            self.assertFalse(c.engaged)
+        # First frame FACING the sensor → must PRIME, never engage instantly.
+        clk.advance(0.05)
+        d = c.update(left, right, "open", "open", True, facing_deg=0.0, armed=False)
+        self.assertFalse(c.engaged,
+                         "invalid-pose pre-charge engaged on the first valid frame")
+        self.assertLess(d.prime, 1.0)
+        # A genuinely-held valid pose still engages after the real dwell.
+        clk.advance(0.31)
+        c.update(left, right, "open", "open", True, facing_deg=0.0, armed=False)
+        self.assertTrue(c.engaged)
+
     def test_moving_hand_breaks_the_dwell(self):
         mod = self._load()
         clk = _FakeClock(100.0)
