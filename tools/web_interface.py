@@ -636,6 +636,23 @@ setInterval(refreshLog, 1000);
 
 # ── server factory + lifecycle ───────────────────────────────────────────────
 
+def _port_actively_served(host: str, port: int, timeout: float = 0.35) -> bool:
+    """True when something is ALREADY accepting connections on host:port — the
+    signal that binding here would co-bind a live listener (see the SO_REUSEADDR
+    note in create_server). A quick loopback connect: it succeeds only against an
+    ACTIVE listener, so a free port or a TIME_WAIT socket from our own restart
+    both read False (safe to bind). Probes the loopback even for a wildcard bind
+    (0.0.0.0), since a wildcard listener still answers on 127.0.0.1. Never raises."""
+    probe_host = "127.0.0.1" if host in ("0.0.0.0", "", "::") else host
+    try:
+        import socket as _socket
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            return s.connect_ex((probe_host, int(port))) == 0
+    except Exception:
+        return False
+
+
 def create_server(*, bind: str, port: int, token: str = "",
                   inject_path: str = DEFAULT_INJECT_PATH,
                   log_dir: str = DEFAULT_LOG_DIR,
@@ -657,6 +674,27 @@ def create_server(*, bind: str, port: int, token: str = "",
             f"refusing to start the web interface: bind={bind!r} is not loopback "
             f"but WEB_INTERFACE_TOKEN is empty. Set a token to expose it on the "
             f"LAN, or bind 127.0.0.1 for localhost-only (no token needed)."
+        )
+    # PRE-BIND PROBE (Windows SO_REUSEADDR footgun): ThreadingHTTPServer sets
+    # allow_reuse_address=True, and on Windows that lets a *second* socket bind
+    # a port another process is ALREADY actively LISTENing on. The two sockets
+    # then split incoming connections non-deterministically — so if a stale
+    # instance (or a leaked test process) is squatting the port, JARVIS binds
+    # "successfully" but half the requests land on the dead socket and hang
+    # (observed live 2026-07-07: a leftover `-m unittest` process held 8766 and
+    # the dashboard was unreachable). We can't tell that apart from a healthy
+    # bind after the fact, so REFUSE up front when the port is already being
+    # served: a real port>0 that answers a loopback connect is in use. We only
+    # probe a concrete port (port 0 = ephemeral, always free) and only treat an
+    # ACTIVE listener as a conflict — a TIME_WAIT socket from our own recent
+    # restart doesn't answer connect(), so a normal reboot still rebinds. The
+    # skill's _start() turns the resulting OSError into an honest spoken
+    # "port in use" instead of a silent half-broken server.
+    if int(port) > 0 and _port_actively_served(bind, int(port)):
+        raise OSError(
+            f"web interface port {port} on {bind} is already being served by "
+            f"another process (a stale JARVIS or a leaked test server) — refusing "
+            f"to co-bind it. Free the port (stop the other process) and retry."
         )
     httpd = ThreadingHTTPServer((bind, int(port)), _Handler)
     # Pin per-server config onto the instance so the stateless handler reads it.

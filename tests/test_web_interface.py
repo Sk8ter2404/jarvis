@@ -227,6 +227,40 @@ class SecurityBindTests(unittest.TestCase):
         finally:
             httpd.server_close()
 
+    def test_refuses_to_cobind_an_actively_served_port(self):
+        # The Windows SO_REUSEADDR footgun guard: if a server is already LISTENing
+        # on the port, create_server must refuse (OSError) rather than silently
+        # co-bind and split connections into a hang.
+        first = wi.create_server(bind="127.0.0.1", port=0, token="")
+        thread = wi.serve_in_thread(first)
+        try:
+            port = first.server_address[1]        # the real ephemeral port
+            with self.assertRaises(OSError):
+                wi.create_server(bind="127.0.0.1", port=port, token="")
+        finally:
+            first.shutdown()
+            first.server_close()
+            thread.join(timeout=2)
+
+    def test_free_port_probe_is_false(self):
+        # A concrete port with no listener probes False → bind proceeds. Uses a
+        # port we bind+immediately release so it's almost certainly free.
+        tmp = wi.create_server(bind="127.0.0.1", port=0, token="")
+        port = tmp.server_address[1]
+        tmp.server_close()                        # release it (no listener now)
+        self.assertFalse(wi._port_actively_served("127.0.0.1", port))
+
+    def test_ephemeral_port_zero_skips_the_probe(self):
+        # port 0 must never be probed (it's "pick any free port") — two ephemeral
+        # servers coexist fine.
+        a = wi.create_server(bind="127.0.0.1", port=0, token="")
+        b = wi.create_server(bind="127.0.0.1", port=0, token="")
+        try:
+            self.assertNotEqual(a.server_address[1], b.server_address[1])
+        finally:
+            a.server_close()
+            b.server_close()
+
     def test_is_local_bind_classification(self):
         self.assertTrue(wi.is_local_bind("127.0.0.1"))
         self.assertTrue(wi.is_local_bind("localhost"))
