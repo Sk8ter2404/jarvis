@@ -808,6 +808,33 @@ RETICLE_OVERLAY_ENABLED = True
 # System-tray applet (tray.py at project root, pystray + Pillow).
 TRAY_ENABLED = True
 
+# ─── Live web interface (tools/web_interface.py + skills/web_interface.py) ──
+# A local-LAN web dashboard to SEE what JARVIS is doing (live session-log tail,
+# version / awake state / model routing / VRAM) and to TALK TO HIM BY TEXT — a
+# typed command is fed through the EXACT SAME file-based inject channel a spoken
+# command uses (injected_commands.json), so it behaves identically to voice.
+#
+# Default OFF: the server never binds a socket unless the owner opts in, so a
+# fresh install exposes no new attack surface. When True, skills/web_interface.py
+# auto-starts a daemon-thread http.server at boot on WEB_INTERFACE_BIND:PORT.
+#
+# SECURITY — LAN-EXPOSURE RISK. This endpoint can INJECT COMMANDS JARVIS EXECUTES
+# (open apps, control the smart home, read the screen). Anyone who can reach the
+# bound socket can drive JARVIS. Therefore:
+#   • WEB_INTERFACE_BIND defaults to 127.0.0.1 (localhost only — nothing off-box
+#     can reach it, no token needed).
+#   • To expose it on the LAN (bind 0.0.0.0 or a LAN IP) you MUST set a non-empty
+#     WEB_INTERFACE_TOKEN. The server REFUSES TO START on a non-local bind with an
+#     empty token (it logs a clear reason and stays down), and when a token is set
+#     it is required on EVERY request (Authorization: Bearer <token>, an
+#     X-Auth-Token header, or ?token=… on the URL). Treat the token like a
+#     password; anyone with it can command JARVIS from any device on your network.
+# All four knobs are overridable via data/user_settings.json (the Settings GUI).
+WEB_INTERFACE_ENABLED = False       # master switch — server only starts when True
+WEB_INTERFACE_PORT    = 8766        # TCP port (8443 is the AirTag tracker — do NOT reuse)
+WEB_INTERFACE_BIND    = "127.0.0.1" # bind address; non-local REQUIRES a token
+WEB_INTERFACE_TOKEN   = ""          # shared secret; MANDATORY for a non-local bind
+
 # ── Retired overlays (all superseded by the unified HUD) ────────────────
 # Each of these used to auto-spawn its own frameless, non-movable widget.
 # Their data (system vitals, JARVIS state reactor, Bambu print progress) now

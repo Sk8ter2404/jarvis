@@ -15635,6 +15635,17 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     # logged. The graceful "Kinect isn't available, sir — …" phrasings carry
     # no FAILURE_MARKER by design — honest, complete answers, not errors.
     "air_control_on", "air_control_off", "air_control_status",
+    # LIVE WEB INTERFACE — local-LAN dashboard + text command channel
+    # (skills/web_interface.py, engine tools/web_interface.py, 2026-07). Each
+    # returns ONE finished sentence: web_interface_on -> "Web interface online,
+    # sir - open http://..." (or the security refusal when a non-local bind lacks
+    # a token, which is an honest answer, NOT an error, so it carries no
+    # FAILURE_MARKER), web_interface_off -> "Web interface off, sir.", and
+    # web_interface_status -> the running/where line. Without this the verdicts
+    # would only be logged. Deliberately NOT in INFORMATIVE_ACTIONS (kept DISJOINT
+    # - an INFORMATIVE action fires a follow-up LLM turn instead of speaking the
+    # result verbatim).
+    "web_interface_on", "web_interface_off", "web_interface_status",
     # ── 2026-07-06 overnight sweep: remaining one-line read-outs ─────────────
     # Smart-home SETUP read-outs — the PIN / auth instructions the user must
     # HEAR to finish setup (audit: ecobee_request_pin's PIN was only ever

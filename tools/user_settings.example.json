@@ -1,5 +1,5 @@
 {
-  "_README": "JARVIS user settings template. The live file lives at data/user_settings.json (gitignored); tools/settings_window.py creates it from these defaults on first run, and the tray Settings menu edits it. You may copy this to data/user_settings.json and hand-edit, but the GUI is the supported path. NEVER put secrets (API keys, passwords) here or in data/user_settings.json \u2014 secrets belong in your .env / OS environment. The _status_* integration rows in the GUI only check whether those env vars are PRESENT; they never read or store the values. Defaults below mirror core/config.py.",
+  "_README": "JARVIS user settings template. The live file lives at data/user_settings.json (gitignored); tools/settings_window.py creates it from these defaults on first run, and the tray Settings menu edits it. You may copy this to data/user_settings.json and hand-edit, but the GUI is the supported path. NEVER put secrets (API keys, passwords) here or in data/user_settings.json — secrets belong in your .env / OS environment. The _status_* integration rows in the GUI only check whether those env vars are PRESENT; they never read or store the values. Defaults below mirror core/config.py.",
   "VOICE_MODE": "turn_based",
   "WAKE_WORD_AUTOSTART": false,
   "START_IN_STANDBY": false,
@@ -54,5 +54,9 @@
   "OVERNIGHT_UPGRADE_ENABLED": false,
   "VAD_DEBUG": true,
   "SCREEN_VISION_ENABLED": true,
-  "PC_CONTROL_ENABLED": true
+  "PC_CONTROL_ENABLED": true,
+  "WEB_INTERFACE_ENABLED": false,
+  "WEB_INTERFACE_PORT": 8766,
+  "WEB_INTERFACE_BIND": "127.0.0.1",
+  "WEB_INTERFACE_TOKEN": ""
 }

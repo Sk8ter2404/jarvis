@@ -580,6 +580,39 @@ SCHEMA: dict[str, dict] = {
         "default": True,
         "help": "Allow launching apps, opening URLs, etc.",
     },
+    # ── Live web interface (tools/web_interface.py) ─────────────────────
+    # A local-LAN dashboard to watch JARVIS and type commands to him. The
+    # typed command runs through the SAME inject channel as a spoken one, so
+    # anyone who can reach the bound socket can DRIVE JARVIS — hence the token
+    # requirement on a non-local bind, spelled out in the help text below.
+    "WEB_INTERFACE_ENABLED": {
+        "tab": "advanced", "label": "Live web interface", "type": "bool",
+        "default": False,
+        "help": "Serve a local web dashboard at boot to watch JARVIS and type "
+                "commands. Off (default) still allows 'start the web interface' "
+                "by voice. SECURITY: a typed command runs like a spoken one, so "
+                "keep the bind on localhost unless you set a token below.",
+    },
+    "WEB_INTERFACE_PORT": {
+        "tab": "advanced", "label": "Web interface port", "type": "int",
+        "default": 8766,
+        "help": "TCP port for the dashboard (do not use 8443 — that's the "
+                "AirTag tracker).",
+    },
+    "WEB_INTERFACE_BIND": {
+        "tab": "advanced", "label": "Web interface bind address", "type": "str",
+        "default": "127.0.0.1",
+        "help": "127.0.0.1 = localhost only (safe, nothing off-box can reach "
+                "it). 0.0.0.0 or a LAN IP EXPOSES it to your whole network and "
+                "REQUIRES a token below — the server refuses to start otherwise.",
+    },
+    "WEB_INTERFACE_TOKEN": {
+        "tab": "advanced", "label": "Web interface token", "type": "str",
+        "default": "",
+        "help": "Shared secret required on every request when set (and MANDATORY "
+                "for a non-localhost bind). Treat it like a password — anyone "
+                "with it can command JARVIS from any device on your LAN.",
+    },
 }
 
 # Field types whose key is a real persisted setting (everything except the
