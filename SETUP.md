@@ -62,7 +62,7 @@ It loads Whisper + all skills, then reaches a listening standby. Try:
 | Say | Expect |
 |---|---|
 | "JARVIS, what time is it" | the current time |
-| "JARVIS, what version are you on" | `1.99.1` |
+| "JARVIS, what version are you on" | `1.99.2` |
 | "JARVIS, give me a system status report" | live CPU/RAM/GPU stats |
 
 Prefer to try it **without** using your mic/speakers? Boot the muted, mic-less

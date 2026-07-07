@@ -110,6 +110,61 @@ def _bc():
     return sys.modules.get("__main__") or sys.modules.get("bobert_companion")
 
 
+# ─── AUTO-YIELD bridge (skills/_air_mouse_yield, shared with air-mouse) ────
+# "Touch the real mouse and air control instantly lets go." Same low-level
+# real-input watcher kinect_air_mouse uses; every accessor degrades to a safe
+# default (no yield suppression) when the helper can't load. NEVER raises.
+AIR_CONTROL_YIELD_WINDOW_SEC = 1.0   # stay suppressed this long after real input
+
+
+def _yield_mod():
+    try:
+        from skills import _air_mouse_yield as _y
+        return _y
+    except Exception:
+        try:
+            import _air_mouse_yield as _y   # isolated-skill import fallback
+            return _y
+        except Exception:
+            return None
+
+
+def _install_yield_watcher() -> None:
+    """Lazily install the real-input hook (idempotent, safe every start)."""
+    y = _yield_mod()
+    if y is None:
+        return
+    try:
+        y.install()
+    except Exception:
+        pass
+
+
+def _real_input_recent() -> bool:
+    """True when REAL (non-injected) hardware input happened within the yield
+    window — air control must release and stay suppressed. False when the
+    watcher is unavailable."""
+    y = _yield_mod()
+    if y is None:
+        return False
+    try:
+        return bool(y.real_input_recent(AIR_CONTROL_YIELD_WINDOW_SEC))
+    except Exception:
+        return False
+
+
+def _mark_self_action() -> None:
+    """Tell the watcher our own injected mouse ops aren't the owner's input
+    (so its polling fallback can't mistake us for a real hand on the mouse)."""
+    y = _yield_mod()
+    if y is None:
+        return
+    try:
+        y.mark_self_action()
+    except Exception:
+        pass
+
+
 def _cfg_flag(name: str, default: bool = False) -> bool:
     """Read a live boolean from core.config, tolerating its absence. Read fresh
     each call so a Settings toggle takes effect without a restart."""
@@ -251,11 +306,26 @@ def _loop() -> None:
     global _last_stop_reason
     engine = _engine
     try:
+        _install_yield_watcher()
         while not _stop_event.is_set():
+            # AUTO-YIELD: the owner touching the real mouse/keyboard wins
+            # instantly — release any held drag, discard this tick's op, and
+            # stay hands-off until the yield window passes. The engine still
+            # runs (so its state stays coherent); we just don't apply ops.
+            if _real_input_recent():
+                try:
+                    if engine is not None and engine.release() is not None:
+                        _release_mouse()
+                except Exception:
+                    _release_mouse()
+                time.sleep(AIR_CONTROL_POLL_INTERVAL)
+                continue
             kb = _bridge()
             bodies = kb.get_bodies() if kb is not None else []
             op = engine.update(bodies, _virtual_bounds()) if engine else None
             _apply_op(op)
+            if op is not None and op.kind != OP_IDLE:
+                _mark_self_action()
             time.sleep(AIR_CONTROL_POLL_INTERVAL)
         _last_stop_reason = "stopped by request"
     except Exception as e:
