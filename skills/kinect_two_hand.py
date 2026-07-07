@@ -96,6 +96,18 @@ KEEP_ON_SCREEN_MARGIN = 32      # at least this much of the window stays on-desk
 # explode the window; the EMA already tames this, this is a hard backstop.
 MAX_SCALE_STEP = 0.18           # ≤ ±18 % size change per tick
 
+# OPEN-HANDS RELEASE debounce. The module docstring always promised "a hand …
+# opens → release", but the per-hand grips _hand_sample already reads were
+# thrown away (the poller's `_lg, _rg`), so the ONLY way to let go was to drop
+# both arms below the engage line or lose tracking — the owner's "two-hand still
+# doesn't like to unlatch" complaint. Now opening BOTH hands releases, but only
+# a CONFIDENT sustained double-OPEN counts: a grip must read "open" on BOTH hands
+# continuously for this long before the grab drops. "closed"/"lasso" and the
+# flaky "unknown" the SDK emits for an occluded hand never force a release, and a
+# 1–2 frame OPEN flicker mid-resize is swallowed — so this can only END a grab
+# the owner is deliberately opening out of, never drop one they mean to hold.
+OPEN_RELEASE_SEC = 0.15         # ~4–5 frames at 30 Hz
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  PURE GEOMETRY (no Win32, no sensor — unit-tested directly)
@@ -257,6 +269,7 @@ class TwoHandController:
                  min_w: int = MIN_WINDOW_W, min_h: int = MIN_WINDOW_H,
                  keep_margin: int = KEEP_ON_SCREEN_MARGIN,
                  deadman_sec: float = GRAB_DEADMAN_SEC,
+                 open_release_sec: float = OPEN_RELEASE_SEC,
                  clock=time.monotonic):
         self._grab_hold_sec = max(0.0, float(grab_hold_sec))
         self._dist_alpha = max(0.0, min(1.0, float(dist_alpha)))
@@ -265,6 +278,7 @@ class TwoHandController:
         self._min_h = int(min_h)
         self._keep_margin = int(keep_margin)
         self._deadman_sec = max(0.0, float(deadman_sec))
+        self._open_release_sec = max(0.0, float(open_release_sec))
         self._clock = clock
         self.reset()
 
@@ -285,6 +299,10 @@ class TwoHandController:
         # FILTER 6 (body-id pin): the id of the body that took the grab; a change
         # under us is treated as a loss (release) rather than a silent retarget.
         self._grab_body_id = None
+        # OPEN-HANDS RELEASE: clock of the first frame in the current run of
+        # BOTH-hands-open while grabbed. None whenever the hands aren't both
+        # confidently open; when it ages past _open_release_sec the grab drops.
+        self._both_open_since: Optional[float] = None
 
     @property
     def phase(self) -> str:
@@ -313,7 +331,9 @@ class TwoHandController:
     def update(self, *, both_engaged: bool, hand_dist: "Optional[float]",
                midpoint: "Optional[tuple]", focused_rect: "Optional[Rect]",
                bounds: "tuple[int, int, int, int]",
-               hands: "Optional[tuple]" = None, body_id=None) -> "TwoHandDecision":
+               hands: "Optional[tuple]" = None, body_id=None,
+               left_grip: str = "unknown",
+               right_grip: str = "unknown") -> "TwoHandDecision":
         """Advance one frame.
 
         both_engaged: True when BOTH hands clear the raise-to-engage lift gate AND
@@ -329,10 +349,35 @@ class TwoHandController:
         hands:        the two hands' screen points for the reticles (passed through).
         body_id:      the id of the controlling body (FILTER 6). Pinned on the grab
                       edge; a change while grabbed releases (no silent retarget).
+        left_grip/right_grip: the per-hand grips ("open"/"closed"/"lasso"/"unknown",
+                      lower-case). Opening BOTH hands releases the grab (debounced by
+                      OPEN_RELEASE_SEC); a both-open frame also refuses to LATCH a new
+                      grab, so you grab with fists and let go by opening your palms.
+                      Default "unknown" preserves the pre-grip behaviour for callers
+                      (and tests) that don't pass grips.
 
         Returns a TwoHandDecision: `rect` is the window rect to apply this tick (None
         when not actively resizing/moving), `resizing` True once grabbed."""
         now = self._clock()
+
+        # ── OPEN-HANDS RELEASE (highest priority while grabbed). Opening BOTH
+        #    hands is the natural "drop the giant photo" gesture. Only a CONFIDENT
+        #    sustained double-OPEN counts: "closed"/"lasso"/"unknown" never trip it,
+        #    and the _open_release_sec debounce swallows a 1–2 frame OPEN flicker
+        #    mid-resize — so a deliberate hold is never dropped, only a deliberate
+        #    release. Checked before the geometry paths so an opening hand wins even
+        #    while it is still geometrically up and feeding a distance. ────────────
+        both_open = (str(left_grip).lower() == "open"
+                     and str(right_grip).lower() == "open")
+        if self._phase == "grabbed" and both_open:
+            if self._both_open_since is None:
+                self._both_open_since = now
+            elif (now - self._both_open_since) >= self._open_release_sec:
+                self.reset()
+                return TwoHandDecision(active=False, rect=None, resizing=False,
+                                       phase="idle", hands=hands)
+        else:
+            self._both_open_since = None
 
         # ── HARD RELEASE: the hands are GONE this tick (a hand dropped below the
         #    line / opened, or the body was lost), so there's no hand data at all.
@@ -399,6 +444,15 @@ class TwoHandController:
             if focused_rect is None:
                 # No grabbable window under the hands — stay "holding" (active, so
                 # the air-mouse still stands down) but grab nothing.
+                return TwoHandDecision(active=True, rect=None, resizing=False,
+                                       phase="holding", hands=hands)
+            if both_open:
+                # You grab with FISTS, not open palms: a both-open frame parks in
+                # "holding" instead of snatching the window. This keeps the
+                # open-hands RELEASE above unambiguous (no grab→instant-release
+                # oscillation when the owner raises open hands) — close the fists
+                # to latch. "unknown"/one-open still grabs, so nothing regresses
+                # for callers that don't report grips.
                 return TwoHandDecision(active=True, rect=None, resizing=False,
                                        phase="holding", hands=hands)
             self._phase = "grabbed"
@@ -865,6 +919,7 @@ def _poll_once(ctrl: "TwoHandController",
         left_ext, right_ext, _lg, _rg, tracked = am._hand_sample(bridge)
     except Exception:
         left_ext = right_ext = None
+        _lg = _rg = "unknown"
         tracked = False
 
     thresholds = None
@@ -932,7 +987,7 @@ def _poll_once(ctrl: "TwoHandController",
 
     decision = ctrl.update(both_engaged=both, hand_dist=hand_dist, midpoint=mid,
                            focused_rect=focused_rect, bounds=bounds, hands=hands,
-                           body_id=body_id)
+                           body_id=body_id, left_grip=_lg, right_grip=_rg)
 
     # STAND DOWN the single-hand air-mouse whenever two-hand mode is active (incl.
     # the pre-grab hold) so the two never fight the cursor.
