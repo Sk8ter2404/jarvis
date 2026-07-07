@@ -348,9 +348,14 @@ class FaceTrackWakeReopenTests(MonolithGlobalsTestCase):
     def _face_track_source(self):
         with open(self.bc.__file__, encoding="utf-8") as f:
             src = f.read()
-        # The wake-reopen block is bounded by these two unique markers.
+        # The wake-reopen block is bounded by these two markers. The END marker
+        # phrase ALSO appears earlier in a comment (the "read failure #1 → woke
+        # via release+reopen" note ~line 4983), which is BEFORE `start`; searching
+        # from 0 would pick that occurrence and slice an empty/backwards string
+        # (the whole reason this test spuriously failed). Search for the end
+        # marker starting AT `start` so we bound the real reopen block.
         start = src.index("The old handle is now released")
-        end = src.index("woke via release+reopen")
+        end = src.index("woke via release+reopen", start)
         return src[start:end]
 
     def test_wake_reopen_uses_shared_opener_not_static_index(self):

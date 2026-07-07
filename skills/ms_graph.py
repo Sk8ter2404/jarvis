@@ -810,8 +810,13 @@ def action_calendar_today(arg: str = "") -> str:
     except Exception:
         configured = False
     if not configured:
-        return ("Calendar isn't set up, sir — run `python -m skills.ms_graph "
-                "--auth` to connect Microsoft Graph.")
+        # Spoken-friendly: this result is voiced verbatim, so a raw shell command
+        # here reads aloud as "python dash m skills dot ms underscore graph…".
+        # Log the exact command for the console; speak a plain sentence.
+        print("  [ms_graph] calendar not connected — run "
+              "`python -m skills.ms_graph --auth` to authorise Microsoft Graph.")
+        return ("Calendar isn't set up yet, sir — I'll need you to connect "
+                "Microsoft Graph before I can read it.")
     try:
         events = get_upcoming_events(top_n=10, when=when)
     except Exception:

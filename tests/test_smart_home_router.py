@@ -448,6 +448,45 @@ class ClassifyExtraTests(_RouterTestBase):
         self.assertEqual(a["verb"], "on")
         self.assertEqual(a["descriptor"], "the office lamp")
 
+    def test_compound_spoken_number_sets_full_value(self):
+        # 2026-07-07 MED bug: 'sixty five' must resolve to 65, not 60.
+        a = router._classify_action("set the bedroom to sixty five")
+        self.assertEqual(a["verb"], "set")
+        self.assertEqual(a["temperature"], 65)   # 40..110 → temperature
+        b = router._classify_action("set the lamp to seventy two")
+        self.assertEqual(b["temperature"], 72)
+        # brightness range (<40) compound
+        c = router._classify_action("set the lamp to thirty five")
+        self.assertEqual(c["brightness"], 35)
+
+    def test_spoken_number_helper(self):
+        self.assertEqual(router._parse_spoken_number("sixty five"), 65)
+        self.assertEqual(router._parse_spoken_number("one hundred"), 100)
+        self.assertEqual(router._parse_spoken_number("hundred"), 100)
+        self.assertEqual(router._parse_spoken_number("seventy"), 70)
+        self.assertEqual(router._parse_spoken_number("72"), 72)
+        self.assertIsNone(router._parse_spoken_number(""))
+        self.assertIsNone(router._parse_spoken_number("warm"))
+
+    def test_status_question_is_a_query_not_a_command(self):
+        # 2026-07-07 HIGH bug: "are the lights on" must NOT turn the lights on.
+        for utt, dev in (("are the lights on", "lights"),
+                         ("is the office light on", "office light"),
+                         ("are the lights on?", "lights"),
+                         ("is the front door locked", "front door"),
+                         ("what's the bedroom light", "bedroom light")):
+            a = router._classify_action(utt)
+            self.assertEqual(a["verb"], "query", utt)
+            self.assertNotIn(a["verb"], ("on", "off", "lock"), utt)
+            self.assertEqual(a["descriptor"], dev, utt)
+
+    def test_plain_command_still_parses_after_query_guard(self):
+        # The guard must not swallow real commands that happen to contain 'on'.
+        a = router._classify_action("turn on the office lamp")
+        self.assertEqual(a["verb"], "on")
+        b = router._classify_action("office lamp on")
+        self.assertEqual(b["verb"], "on")
+
     def test_dim_carries_color_temperature(self):
         a = router._classify_action("dim the office to 40% warm 2700K")
         self.assertEqual(a["verb"], "set")

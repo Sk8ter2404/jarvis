@@ -267,6 +267,32 @@ def _parse_number(token: str) -> int | None:
     return _NUMBER_WORDS.get(t)
 
 
+def _parse_spoken_number(value: str) -> int | None:
+    """Parse a possibly-COMPOUND spoken number: '65', 'sixty five' → 65,
+    'seventy two' → 72, 'one hundred' / 'a hundred' / 'hundred' → 100.
+
+    2026-07-07 bug-hunt (MED): the bare-number branch parsed only value.split()[0],
+    so a spelled-out compound like 'set the bedroom to sixty five' collapsed to 60
+    (a thermostat/brightness set to the WRONG value — spelled-out numbers are the
+    norm from a voice front-end). Folds tens+ones and the 'hundred' multiplier;
+    stops at the first non-number token so trailing units don't corrupt it. Returns
+    None when no leading number word is present."""
+    if not value:
+        return None
+    current = 0
+    saw = False
+    for tok in value.strip().lower().split():
+        n = _parse_number(tok)
+        if n is None:
+            break                      # 'sixty five foo' → 65 (stop at 'foo')
+        saw = True
+        if n == 100:
+            current = max(current, 1) * 100   # 'one hundred' → 100; 'hundred' → 100
+        else:
+            current += n               # 'sixty' then 'five' → 65
+    return current if saw else None
+
+
 def _extract_percent(text: str) -> int | None:
     """Find a percent expression: '30%', '30 percent', 'thirty percent'."""
     # `\b` must guard ONLY the word 'percent'. A literal '%' is itself a
@@ -351,6 +377,26 @@ def _classify_action(utterance: str) -> dict[str, Any]:
 
     out: dict[str, Any] = {"verb": None, "descriptor": raw}
 
+    # INTERROGATIVE GUARD (2026-07-07 bug-hunt, HIGH). A STATUS QUESTION —
+    # "are the lights on", "is the office light on" — must NEVER be parsed as an
+    # on/off COMMAND. The bare "(.+?)\s+(on|off)$" suffix pattern below otherwise
+    # matches "are the lights on" → verb='on' and ACTUALLY SWITCHES THE DEVICE ON
+    # when the user only ASKED. (_strip_filler removes "the/please/…" prefixes but
+    # not "are/is", so the interrogative survived to the suffix match; voice
+    # transcription frequently drops the trailing '?', so the punctuation-less
+    # form is the common one.) A leading question word or a trailing '?' marks a
+    # query → verb='query', so smart_home_control reports rather than toggling.
+    q = re.match(r"^(?:are|is|was|were|do|does|did|has|have|can|could|"
+                 r"what'?s|what\s+is|how'?s|how\s+is|whats)\b\s*(.*)$", raw)
+    if q is not None or raw.endswith("?"):
+        rest = (q.group(1) if q is not None else raw).rstrip("?").strip()
+        # Drop a trailing state word ("… lights on?") + re-strip filler so the
+        # descriptor is just the device/room to match against the catalog.
+        rest = re.sub(r"\s+(on|off|locked|unlocked|open|closed)$", "", rest)
+        out["verb"] = "query"
+        out["descriptor"] = _strip_filler(rest)
+        return out
+
     # Lock first (so 'lock the front door' doesn't get reduced to 'on').
     if re.match(r"^(?:lock)\b", raw):
         out["verb"] = "lock"
@@ -426,8 +472,9 @@ def _classify_action(utterance: str) -> dict[str, Any]:
         if temp is not None:
             out["temperature"] = temp
             return out
-        # Bare number → could be temperature (>=40) or brightness (<=100)
-        n = _parse_number(value.split()[0]) if value else None
+        # Bare number → could be temperature (>=40) or brightness (<=100).
+        # Compound-aware so 'sixty five' → 65 (not 60 from the first token).
+        n = _parse_spoken_number(value)
         if n is not None:
             if 40 <= n <= 110:
                 out["temperature"] = n
@@ -759,6 +806,21 @@ def smart_home_control(utterance: str = "") -> str:
                 "Say 'discover smart home devices' to run the wizard.")
 
     action = _classify_action(utterance)
+
+    # STATUS QUERY ("are the lights on?"): never toggle — resolve the device and
+    # answer honestly. The router has no live state-read path across brands yet,
+    # so we confirm we found the device and offer to act, rather than switching
+    # it (the 2026-07-07 HIGH bug was answering this question by turning it ON).
+    if action.get("verb") == "query":
+        descriptor = action.get("descriptor") or ""
+        devices = _resolve_devices(descriptor, catalog)
+        if not devices:
+            return (f"I don't see anything in the catalog matching "
+                    f"'{descriptor}', sir.")
+        name = devices[0].get("name") or descriptor or "that device"
+        return (f"I found {name}, sir, but I can't read its live state from "
+                f"here yet — I can turn it on or off if you'd like.")
+
     if not action.get("verb"):
         return f"I couldn't parse that as a smart-home command, sir: '{utterance}'"
 
