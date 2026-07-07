@@ -350,6 +350,29 @@ class ChainingTests(unittest.TestCase):
         self.assertIn("Windows DND is on", out)   # prior text preserved
         self.assertIn("focus mode is on", out.lower())  # ours appended
 
+    def test_shared_focus_mode_engage_chains_prior_and_engages_our_state(self):
+        # 2026-07-07 fix: the phrase "focus mode" routes to the SHARED `focus_mode`
+        # (dnd's engage). Our override must chain dnd's OS-level engage AND turn on
+        # OUR announcement-holding, so notifications are actually held and status
+        # is consistent (the live bug was: dnd on, our gate off).
+        prior_called = []
+
+        def prior_engage(_=""):
+            prior_called.append(True)
+            return "Windows Focus Assist on, sir."     # dnd_focus_mode's engage line
+
+        actions = {"focus_mode": prior_engage}
+        mod, actions = load_skill_isolated("focus_mode", actions=actions)
+        with mock.patch.object(mod, "_arm_resume_timer"):
+            out = actions["focus_mode"]("")            # the phrase "focus mode"
+            # dnd's OS engage ran …
+            self.assertTrue(prior_called)
+            # … and OUR gate is now ON, so a proactive announcement is HELD.
+            self.assertTrue(self.fake_bc._focus_mode[0])
+            self.fake_bc.proactive_announce("a weather alert", source="skill")
+            self.assertEqual(self.fake_bc.focus_missed_count(), 1)
+        self.assertIn("hold notifications", out.lower())  # our confirmation spoken
+
 
 if __name__ == "__main__":
     unittest.main()
