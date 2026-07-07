@@ -3425,6 +3425,66 @@ class FistReleaseTests(_Base):
         c.update(left, right, "open", "closed", True, armed=True)
         self.assertTrue(c.engaged)          # knob off → a long fist stays a drag
 
+    def test_fist_release_latches_no_reengage_oscillation(self):
+        """The 2026-07-07 owner report ("jittery when hand closed — turns on and
+        off"): in ARMED mode (height-only re-engage), a sustained fist would
+        release, then the still-raised fist would instantly re-grab, re-release,
+        and OSCILLATE. The fist-release LATCH must hold re-engagement OFF while the
+        hand stays closed — stable disengaged, no flicker."""
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = self._ctrl(mod, clk, fist_release_sec=0.60, fist_releases=True)
+        left = self._relaxed(mod, "left")
+        right = self._ext(mod, "right")
+        c.update(left, right, "open", "open", True, armed=True)    # engage
+        c.update(left, right, "open", "closed", True, armed=True)  # fist down
+        self.assertTrue(c.engaged)
+        clk.advance(0.70)
+        c.update(left, right, "open", "closed", True, armed=True)  # fist-release fires
+        self.assertFalse(c.engaged)
+        self.assertTrue(c.fist_release_latched)
+        # Hold the fist CLOSED + raised for many frames — it must NOT re-engage.
+        for _ in range(12):
+            clk.advance(0.05)
+            d = c.update(left, right, "open", "closed", True, armed=True)
+            self.assertFalse(c.engaged)          # stays released (no on/off)
+            self.assertIsNone(d.cursor)
+        self.assertTrue(c.fist_release_latched)   # never opened → still latched
+
+    def test_open_hand_clears_fist_latch_and_reengages(self):
+        """Opening the hand is the ONLY thing that clears the fist-release latch —
+        then a normal armed engage resumes."""
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = self._ctrl(mod, clk, fist_release_sec=0.60, fist_releases=True)
+        left = self._relaxed(mod, "left")
+        right = self._ext(mod, "right")
+        c.update(left, right, "open", "open", True, armed=True)
+        c.update(left, right, "open", "closed", True, armed=True)
+        clk.advance(0.70)
+        c.update(left, right, "open", "closed", True, armed=True)   # latch
+        self.assertTrue(c.fist_release_latched and not c.engaged)
+        # Open the raised hand → latch clears (debounce_frames=1) → re-engages.
+        clk.advance(0.05)
+        c.update(left, right, "open", "open", True, armed=True)
+        self.assertFalse(c.fist_release_latched)
+        self.assertTrue(c.engaged)
+
+    def test_short_fist_does_not_latch(self):
+        """A quick close→open (a click / short drag) is UNDER the release window, so
+        it never latches — normal clicking is unaffected."""
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = self._ctrl(mod, clk, fist_release_sec=0.60, fist_releases=True)
+        left = self._relaxed(mod, "left")
+        right = self._ext(mod, "right")
+        c.update(left, right, "open", "open", True, armed=True)
+        c.update(left, right, "open", "closed", True, armed=True)   # down
+        clk.advance(0.20)                                           # brief
+        c.update(left, right, "open", "open", True, armed=True)     # opened (click)
+        self.assertTrue(c.engaged)
+        self.assertFalse(c.fist_release_latched)
+
 
 class AppDisableMatchTests(_Base):
     """The PURE per-app disable matcher app_is_disabled() + _body_facing_deg."""
