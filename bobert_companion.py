@@ -8871,7 +8871,26 @@ class _SentenceFlushBuffer:
                     break
             if end is None:
                 return
-            piece, self._buf = self._buf[:end], self._buf[end:]
+            piece = self._buf[:end]
+            # Hallucinated-claim gate: parse_and_run_actions' preemptive
+            # interceptor (_detect_preemptive_hallucination) runs AFTER the
+            # stream completes — but by then an early-flushed sentence has
+            # already been SPOKEN. A fabricated "running version 4.2.3" /
+            # "it's 1:47 AM" in the opening sentence would be voiced before
+            # the corrective [ACTION:] injection could replace it (live
+            # near-miss 2026-07-07, saved only by a leading [intent:] tag).
+            # So: any flush candidate matching a preemptive pattern latches
+            # the same permanent stop as '[' — the whole reply rides the
+            # normal path, where the interceptor speaks the TRUE value.
+            try:
+                if any(rx.search(piece) for rx, _a, _d
+                       in _PREEMPTIVE_HALLUCINATION_PATTERNS):
+                    self._stopped = True
+                    return
+            except Exception:
+                self._stopped = True   # fail closed: don't early-speak
+                return
+            self._buf = self._buf[end:]
             self.spoken_prefix += piece
             self._flushed += 1
             self._dispatch(piece.strip())
