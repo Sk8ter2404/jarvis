@@ -279,6 +279,7 @@ def register(actions):
     # dnd_focus_mode BEFORE we overwrite them (see module docstring).
     _prior_end    = _chain_prior(actions, "end_focus_mode")
     _prior_status = _chain_prior(actions, "focus_mode_status")
+    _prior_engage = _chain_prior(actions, "focus_mode")
 
     def focus_mode_on(args: str = "") -> str:
         secs = _parse_duration_seconds(args) if args else None
@@ -309,6 +310,22 @@ def register(actions):
     def resume(args: str = "") -> str:
         # 'resume' / 'I'm back' / 'what did I miss' → same as focus_mode_off.
         return focus_mode_off(args)
+
+    def engage(args: str = "") -> str:
+        # 2026-07-07 fix: the phrase "focus mode" routes to the SHARED name
+        # `focus_mode` (dnd_focus_mode's engage), NOT our `focus_mode_on`. Before
+        # this, saying "focus mode" turned on dnd's OS-level Focus Assist but left
+        # OUR announcement-holding gate OFF — so notifications were NOT actually
+        # held and `focus_mode_status` reported a contradiction (dnd engaged / us
+        # off). Chain dnd's engage (Focus Assist / Teams presence) for side
+        # effects, then engage our state too, so one command does both and status
+        # stays consistent. We return OUR message (dnd's return is discarded).
+        if _prior_engage is not None:
+            try:
+                _prior_engage(args)
+            except Exception:
+                pass
+        return focus_mode_on(args)
 
     def end_focus_mode(args: str = "") -> str:
         # Chain the pre-existing dnd_focus_mode teardown (Focus Assist / Teams)
@@ -367,6 +384,7 @@ def register(actions):
     actions["resume"]         = resume
     actions["whats_missed"]   = whats_missed
     # Shared names — chained to preserve dnd_focus_mode's OS-level behaviour.
+    actions["focus_mode"]        = engage
     actions["end_focus_mode"]    = end_focus_mode
     actions["focus_mode_status"] = focus_mode_status
 
