@@ -4,9 +4,20 @@ WHAT THIS IS
 ============
 A tiny, dependency-light HTTP server that lets the owner (1) SEE what JARVIS is
 doing from a browser — a live tail of the session log, plus a status strip
-(version / awake state / model routing / VRAM) — and (2) TALK TO HIM BY TEXT: a
-typed command is fed through the *exact same* file-based inject channel a spoken
-command uses, so a typed "what time is it" behaves identically to the spoken one.
+(online dot / version / awake state / uptime / model routing / VRAM / air-mouse
+armed) — and (2) TALK TO HIM BY TEXT: a typed command is fed through the *exact
+same* file-based inject channel a spoken command uses, so a typed "what time is
+it" behaves identically to the spoken one. The page also carries QUICK-ACTION
+BUTTONS (preset commands POSTed to /api/say) and an AUTO-REFRESH toggle that
+freezes the 1s status/log polling so the view can be read without it scrolling.
+
+STATUS FIELDS (build_status)
+============================
+version / state / running / routing / vram (gpu_lines+gpu_bar) / now_playing /
+last_spoken / last_transcript / model, plus ``uptime`` (seconds since the newest
+log's first timestamp, or None when not derivable) and ``air_mouse`` (a
+``{"armed": bool, "engaged": bool}`` dict — present ONLY when the air-mouse skill
+is loaded in THIS process, omitted entirely otherwise so its presence is truthful).
 
 WHY STDLIB http.server (not Flask)
 ==================================
@@ -61,6 +72,8 @@ import glob
 import html
 import json
 import os
+import re
+import sys
 import tempfile
 import threading
 import time
@@ -213,7 +226,7 @@ def build_status(hud_state_path: str, log_dir: str) -> dict:
         except Exception:
             running = False
     gpu = _gpu_summary()
-    return {
+    status = {
         "version": _read_version(),
         "state": _awake_state(hud),
         "running": running,
@@ -224,8 +237,19 @@ def build_status(hud_state_path: str, log_dir: str) -> dict:
         "last_transcript": hud.get("last_transcript", ""),
         "gpu_lines": gpu["lines"],
         "gpu_bar": gpu["bar"],
+        # Uptime is None (→ omitted client-side) when no timestamped log exists; a
+        # float of seconds otherwise. Kept as raw seconds so the client formats it.
+        "uptime": _uptime_seconds(log_dir),
         "ts": time.time(),
     }
+    # air-mouse ARMED/ENGAGED is only present when the skill is loaded in THIS
+    # process (see _air_mouse_status). Add the field ONLY when reachable so a bare
+    # web process / headless CI simply omits it — the strip renders nothing for it
+    # rather than a misleading "disarmed". This keeps the field's PRESENCE meaningful.
+    am = _air_mouse_status()
+    if am is not None:
+        status["air_mouse"] = am
+    return status
 
 
 def _gpu_summary_routing(gpu: dict) -> str:
@@ -236,6 +260,88 @@ def _gpu_summary_routing(gpu: dict) -> str:
         if "→" in ln:
             return ln
     return ""
+
+
+def _air_mouse_status() -> dict | None:
+    """The live air-mouse ARMED/ENGAGED flags, or None when not cheaply reachable.
+
+    WHY sys.modules (no new import)
+    ===============================
+    The web interface runs IN-PROCESS with the JARVIS main loop (skills/web_interface
+    imports tools.web_interface and calls create_server() inside the running process),
+    so the air-mouse skill — when loaded — already lives in ``sys.modules`` under the
+    key ``skill_kinect_air_mouse``. We therefore read its thread-safe getter the
+    EXACT way bobert_companion._air_mouse_state_for_preview() does: fetch the module
+    object from sys.modules (never import it — importing the skill standalone is
+    heavy and would drag Kinect/pyautogui deps into a bare-CI web process) and call
+    its ``get_air_mouse_state()`` if present. That getter returns a COPY of
+    ``{'engaged': bool, 'armed': bool, 'hand': str|None, 'grip': str, ...}``.
+
+    Returns a trimmed ``{"armed": bool, "engaged": bool}`` when the skill is loaded
+    and readable, or ``None`` when it isn't — headless CI, a cloud-only box with no
+    Kinect, or simply the air-mouse skill not being part of this build. ``None`` lets
+    build_status OMIT the field entirely (the strip then shows nothing for it) rather
+    than lying with a fabricated "disarmed", which would be indistinguishable from a
+    genuinely-disarmed air-mouse. NEVER raises — every failure path degrades to None.
+    """
+    try:
+        sk = sys.modules.get("skill_kinect_air_mouse")
+        getter = getattr(sk, "get_air_mouse_state", None) if sk else None
+        if callable(getter):
+            st = getter()
+            if isinstance(st, dict):
+                return {"armed": bool(st.get("armed")),
+                        "engaged": bool(st.get("engaged"))}
+    except Exception:
+        pass
+    return None
+
+
+# The main loop timestamps each log line "[HH:MM:SS] …" (see _capture_utterance /
+# the loop's print wrapper). The FIRST line of a session log is written at boot, so
+# its clock time is the boot time. We can't recover the date cheaply (the filename
+# carries it, but a wall-clock delta is enough for an "up 2h13m" chip), so we treat
+# the first timestamp as today-relative and compute a same-day delta, clamping a
+# negative delta (crossed midnight) to 0 rather than reporting a bogus ~24h uptime.
+_LOG_TS_RE = re.compile(r"\[(\d{2}):(\d{2}):(\d{2})\]")
+
+
+def _uptime_seconds(log_dir: str) -> float | None:
+    """Best-effort session uptime in seconds, derived from the newest log's first
+    timestamped line, or None when not derivable.
+
+    We parse the "[HH:MM:SS]" prefix of the first line that HAS one (the loop's
+    banner lines may precede the first timestamp) and subtract it from the current
+    wall clock's H:M:S. This is intentionally cheap and approximate — it's a status
+    nicety, not a billing meter. Returns None (→ field omitted) when there is no log,
+    no parseable timestamp, or anything at all goes wrong. NEVER raises."""
+    lg = _newest_log(log_dir)
+    if not lg:
+        return None
+    try:
+        first_hms = None
+        with open(lg, encoding="utf-8", errors="replace") as f:
+            # Only scan a bounded head of the file — the boot timestamp is in the
+            # first handful of lines; we never want to read a multi-MB log to find it.
+            for _ in range(200):
+                line = f.readline()
+                if not line:
+                    break
+                m = _LOG_TS_RE.search(line)
+                if m:
+                    first_hms = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                    break
+        if first_hms is None:
+            return None
+        now = time.localtime()
+        boot_s = first_hms[0] * 3600 + first_hms[1] * 60 + first_hms[2]
+        now_s = now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec
+        delta = now_s - boot_s
+        # Crossed midnight (or a clock skew) → negative; clamp to 0 rather than
+        # reporting a spurious ~day of uptime. A same-day session reads correctly.
+        return float(delta) if delta >= 0 else 0.0
+    except Exception:
+        return None
 
 
 # ── inject channel (append with the SAME atomic pattern the loop drains) ─────
@@ -543,14 +649,31 @@ def _dashboard_html(token: str) -> str:
             border-radius:8px; padding:0 18px; font:inherit; cursor:pointer; }}
   button:hover {{ background:var(--cyan); color:#04222b; }}
   button:disabled {{ opacity:.5; cursor:default; }}
+  /* Quick-action row: a horizontal, wrapping strip of preset-command buttons.
+     They reuse the base button look but are smaller/pill-shaped and ghosted
+     (transparent fill) so the primary Send button stays the visual anchor. */
+  .actions {{ display:flex; flex-wrap:wrap; gap:8px; margin:4px 0 6px; }}
+  .actions button {{ padding:7px 13px; font-size:12.5px; border-radius:999px;
+            background:transparent; color:var(--cyan); }}
+  .actions button:hover {{ background:var(--cyan); color:#04222b; }}
+  /* Auto-refresh toggle in the header — a small inline checkbox + label. */
+  .toggle {{ display:inline-flex; align-items:center; gap:6px; color:var(--muted);
+            font-size:12px; cursor:pointer; user-select:none; }}
+  .toggle input {{ accent-color:var(--cyan); cursor:pointer; }}
   #reply {{ margin-top:10px; color:#eafcff; min-height:1.4em; }}
   .muted {{ color:var(--muted); }}
 </style></head><body>
 <header><div class="reactor"></div><h1>J.A.R.V.I.S.</h1>
-  <span id="conn" class="muted" style="margin-left:auto">connecting…</span>
+  <label class="toggle" style="margin-left:auto" title="Pause/resume live status + log polling">
+    <input id="autorefresh" type="checkbox" checked> auto-refresh
+  </label>
+  <span id="conn" class="muted">connecting…</span>
 </header>
 <div class="wrap">
   <div class="strip" id="strip"></div>
+  <!-- Quick-action buttons are injected here from the QUICK_ACTIONS array below,
+       so presets are edited in ONE data-driven place (no per-button markup). -->
+  <div class="actions" id="actions"></div>
   <div id="log" class="muted">loading log…</div>
   <form id="say">
     <input id="text" type="text" autocomplete="off" placeholder="Type a command for JARVIS…" autofocus>
@@ -570,19 +693,47 @@ function chip(k, v) {{ const d=document.createElement('div'); d.className='chip'
   d.innerHTML = '<div class="k">'+k+'</div><div class="v"></div>';
   d.querySelector('.v').textContent = (v===''||v==null) ? '—' : v; return d; }}
 
+// Format a raw uptime-in-seconds float into a compact "2h13m" / "4m" / "45s".
+function fmtUptime(secs) {{
+  if (secs==null || isNaN(secs)) return '';
+  secs = Math.max(0, Math.floor(secs));
+  const h = Math.floor(secs/3600), m = Math.floor((secs%3600)/60), s = secs%60;
+  if (h) return h+'h'+String(m).padStart(2,'0')+'m';
+  if (m) return m+'m'+String(s).padStart(2,'0')+'s';
+  return s+'s';
+}}
+
 async function refreshStatus() {{
   try {{
     const r = await fetch(q('/api/status'), {{headers:hdr()}});
     if (r.status===401) {{ conn.textContent='unauthorized — token required'; return; }}
     const s = await r.json();
+    // Clearer online/offline indicator: a coloured dot + explicit word. The dot
+    // is green (glowing) when the loop is live, grey when offline.
     conn.textContent = ''; conn.innerHTML =
       '<span class="dot '+(s.running?'on':'')+'"></span>'+(s.running?'live':'offline');
     strip.innerHTML='';
+    // A leading status chip whose whole value is the online/offline dot, so the
+    // strip itself carries a clear liveness signal (not just the header corner).
+    const st = chip('online', s.running?'live':'offline');
+    st.querySelector('.v').innerHTML =
+      '<span class="dot '+(s.running?'on':'')+'"></span>'+(s.running?'live':'offline');
+    strip.appendChild(st);
     strip.appendChild(chip('version', s.version));
     strip.appendChild(chip('state', s.state));
+    // Uptime — only when the server could derive it (field present + non-null).
+    if (s.uptime!=null) strip.appendChild(chip('uptime', fmtUptime(s.uptime)));
     strip.appendChild(chip('model / routing', s.routing || s.model));
     const g = (s.gpu_lines&&s.gpu_lines.length) ? s.gpu_lines[s.gpu_lines.length- (s.routing?2:1)] : '';
     strip.appendChild(chip('vram', (s.gpu_bar||'') + (g? '  '+g : '')));
+    // Air-mouse chip — ONLY present when build_status could read the skill in-process
+    // (s.air_mouse is omitted otherwise). Shows ARMED (+engaged) vs disarmed.
+    if (s.air_mouse) {{
+      const am = s.air_mouse.armed
+        ? ('armed' + (s.air_mouse.engaged ? ' · engaged' : ''))
+        : 'disarmed';
+      strip.appendChild(chip('air-mouse', am));
+    }}
     if (s.now_playing) strip.appendChild(chip('now playing', s.now_playing));
     if (s.last_spoken) strip.appendChild(chip('last said', s.last_spoken));
   }} catch(e) {{ conn.textContent = 'connection lost'; }}
@@ -611,10 +762,30 @@ const form = document.getElementById('say');
 const textIn = document.getElementById('text');
 const sendBtn = document.getElementById('send');
 const replyEl = document.getElementById('reply');
-form.addEventListener('submit', async (ev) => {{
-  ev.preventDefault();
-  const text = textIn.value.trim(); if (!text) return;
-  sendBtn.disabled = true; replyEl.textContent = '…';
+const actionsEl = document.getElementById('actions');
+
+// ── QUICK-ACTION PRESETS ──────────────────────────────────────────────────
+// Data-driven so presets are trivial to edit HERE (one array) without touching
+// markup or handlers. `label` is the button text; `cmd` is the exact phrase POSTed
+// to /api/say — the SAME inject channel a spoken command uses, so "mouse control on"
+// behaves identically typed, clicked, or spoken.
+const QUICK_ACTIONS = [
+  {{label:'Arm mouse control', cmd:'mouse control on'}},
+  {{label:'Release mouse',     cmd:'mouse control off'}},
+  {{label:"What's my status",  cmd:'system status'}},
+  {{label:'Go to sleep',       cmd:'go to sleep'}},
+  {{label:'Wake up',           cmd:'wake up'}},
+];
+
+// The ONE code path every command goes through — the typed form and every quick
+// button both call this. Disables the sender, shows a pending marker, POSTs the
+// phrase, renders the reply (or a queued/accepted note), and nudges the log.
+async function sendCommand(text, opts) {{
+  text = (text||'').trim(); if (!text) return;
+  opts = opts || {{}};
+  const btn = opts.button || null;
+  sendBtn.disabled = true; if (btn) btn.disabled = true;
+  replyEl.textContent = '…';
   try {{
     const r = await fetch(q('/api/say'), {{method:'POST', headers:hdr(),
       body: JSON.stringify({{text}})}});
@@ -623,14 +794,37 @@ form.addEventListener('submit', async (ev) => {{
     else if (d.reply) replyEl.textContent = d.reply;
     else if (d.status==='no_log') replyEl.innerHTML = '<span class="muted">queued — JARVIS is not running; it will run on next boot.</span>';
     else replyEl.innerHTML = '<span class="muted">accepted (no spoken reply captured).</span>';
-    textIn.value='';
   }} catch(e) {{ replyEl.textContent = 'send failed'; }}
-  finally {{ sendBtn.disabled=false; textIn.focus(); refreshLog(); }}
+  finally {{ sendBtn.disabled=false; if (btn) btn.disabled=false; refreshLog(); }}
+}}
+
+// Render the quick-action buttons from QUICK_ACTIONS. Each POSTs its preset phrase
+// via the shared sendCommand(); the returned reply lands in the existing #reply area.
+QUICK_ACTIONS.forEach(a => {{
+  const b = document.createElement('button');
+  b.type = 'button'; b.textContent = a.label;
+  b.addEventListener('click', () => sendCommand(a.cmd, {{button:b}}));
+  actionsEl.appendChild(b);
 }});
 
+form.addEventListener('submit', async (ev) => {{
+  ev.preventDefault();
+  await sendCommand(textIn.value);
+  textIn.value=''; textIn.focus();
+}});
+
+// ── AUTO-REFRESH TOGGLE ────────────────────────────────────────────────────
+// The checkbox (default ON) gates the 1s/1.5s polls so the user can FREEZE the
+// view to read the log/status. We keep the intervals running but make each tick a
+// no-op while paused (cheaper + simpler than clearing/re-creating timers), and do
+// one immediate refresh when it's switched back on so the view catches up at once.
+const autoEl = document.getElementById('autorefresh');
+function autoOn() {{ return autoEl.checked; }}
+autoEl.addEventListener('change', () => {{ if (autoOn()) {{ refreshStatus(); refreshLog(); }} }});
+
 refreshStatus(); refreshLog();
-setInterval(refreshStatus, 1500);
-setInterval(refreshLog, 1000);
+setInterval(() => {{ if (autoOn()) refreshStatus(); }}, 1500);
+setInterval(() => {{ if (autoOn()) refreshLog(); }}, 1000);
 </script></body></html>"""
 
 
