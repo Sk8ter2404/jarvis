@@ -2755,6 +2755,32 @@ class PreemptiveHallucinationTests(SectionFiveBase):
             "The weather looks pleasant today, sir.")
         self.assertIsNone(out)
 
+    def test_catches_fabricated_version_behind_leading_intent_tag(self):
+        # 2026-07-07 (live): a reply-initial fabricated version anchors with ^
+        # ("^version …"), but a LEADING [intent:xxx]/[mood:xxx] tag defeated the
+        # anchor, so "[intent:confirmation] Version 4.2.3, sir" was spoken as fact
+        # un-corrected. Leading tags are now stripped before the pattern scan.
+        bc = self.bc
+        out = bc._detect_preemptive_hallucination(
+            "[intent:confirmation] Version 4.2.3, sir, per the last diagnostic.")
+        self.assertIsNotNone(out)
+        verb, name, _desc = out
+        self.assertEqual(verb, "inject")
+        self.assertEqual(name, "version_info")
+        # Stacked tags are stripped too; a fabricated clock time is caught.
+        out2 = bc._detect_preemptive_hallucination(
+            "[intent:casual] [mood:dry] It's 1:47 AM, sir.")
+        self.assertIsNotNone(out2)
+        self.assertEqual(out2[1], "get_time")
+
+    def test_leading_tag_strip_no_false_positive_on_thirdparty_version(self):
+        # Stripping the tag must NOT make a THIRD-PARTY version match the
+        # self-anchored pattern ("Chrome version 120" isn't reply-initial "version N").
+        bc = self.bc
+        out = bc._detect_preemptive_hallucination(
+            "[intent:confirmation] Chrome version 120 is installed, sir.")
+        self.assertIsNone(out)
+
     def test_inject_skipped_when_action_not_registered(self):
         bc = self.bc
         # If the mapped action is somehow absent from ACTIONS, the matching

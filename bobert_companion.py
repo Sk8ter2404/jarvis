@@ -16400,6 +16400,12 @@ _PREEMPTIVE_HALLUCINATION_PATTERNS: list[tuple["re.Pattern", str | None, str]] =
 ]
 
 
+# Matches one or more LEADING bracket metadata tags — [intent:confirmation],
+# [mood:dry], [wry], etc. — so the hallucination interceptor can scan the actual
+# PROSE (its patterns anchor to the prose start with ^).
+_LEADING_TAGS_RE = re.compile(r"^(?:\s*\[[^\]]*\]\s*)+")
+
+
 def _detect_preemptive_hallucination(
     reply: str,
 ) -> tuple[str, str | None, str] | None:
@@ -16416,8 +16422,18 @@ def _detect_preemptive_hallucination(
     """
     if _ACTION_RE.search(reply):
         return None
+    # Strip any LEADING metadata tags ([intent:xxx], [mood:xxx], [wry], …) before
+    # the pattern scan. Several patterns anchor to the PROSE start — e.g. a reply-
+    # initial "Version 4.2.3" — and a leading tag defeats the ^ anchor, so a
+    # fabricated version/time/etc. sitting behind an [intent:] tag slipped through
+    # UN-intercepted and was spoken as fact (observed live 2026-07-07:
+    # "[intent:confirmation] Version 4.2.3, sir" — a made-up version — went out
+    # un-corrected). Only leading bracket groups are stripped; a mid-string
+    # [ACTION:] is already handled by the guard above, and third-party version
+    # mentions ("Chrome version 120") still don't match the self-anchored pattern.
+    scan = _LEADING_TAGS_RE.sub("", reply).lstrip() if reply else reply
     for regex, action_name, desc in _PREEMPTIVE_HALLUCINATION_PATTERNS:
-        if not regex.search(reply):
+        if not regex.search(scan):
             continue
         if action_name and action_name in ACTIONS:
             return ("inject", action_name, desc)
