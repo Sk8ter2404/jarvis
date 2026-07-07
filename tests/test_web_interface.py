@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import tempfile
 import time
 import unittest
@@ -43,9 +44,43 @@ import urllib.request
 from tools import web_interface as wi
 
 
+def _urlopen_retry(req, timeout=5, attempts=6):
+    """urlopen that RETRIES a connection-level failure but NOT an HTTPError.
+
+    A freshly-started 127.0.0.1:0 ThreadingHTTPServer can reset the very first
+    connect if its serve_forever thread hasn't reached accept() yet — on Windows
+    this surfaces as WinError 10053/10054 (ConnectionAborted/Reset) wrapped in a
+    URLError, and flaked test_unknown_path_404 ~1 run in 4. An HTTPError, by
+    contrast, IS a real HTTP response (e.g. a 404) and must propagate unchanged.
+    2026-07-07 flaky-test fix."""
+    last = None
+    for i in range(attempts):
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError:
+            raise                                  # real status → caller handles
+        except (urllib.error.URLError, ConnectionError, OSError) as e:
+            last = e
+            time.sleep(0.05 * (i + 1))
+    raise last
+
+
+def _wait_server_ready(host, port, timeout=3.0):
+    """Block until the server ACCEPTS a TCP connect (or timeout) so no request
+    fires before serve_forever is live. Belt-and-braces with _urlopen_retry."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.25):
+                return True
+        except OSError:
+            time.sleep(0.02)
+    return False
+
+
 def _get(url, headers=None):
     req = urllib.request.Request(url, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=5) as r:
+    with _urlopen_retry(req, timeout=5) as r:
         return r.status, json.loads(r.read().decode("utf-8"))
 
 
@@ -53,7 +88,7 @@ def _get_raw(url, headers=None):
     """GET returning (status, body_text) even on a 4xx (urllib raises on those)."""
     req = urllib.request.Request(url, headers=headers or {})
     try:
-        with urllib.request.urlopen(req, timeout=5) as r:
+        with _urlopen_retry(req, timeout=5) as r:
             return r.status, r.read().decode("utf-8")
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode("utf-8")
@@ -65,7 +100,7 @@ def _post(url, obj, headers=None):
     h.update(headers or {})
     req = urllib.request.Request(url, data=body, headers=h, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=5) as r:
+        with _urlopen_retry(req, timeout=5) as r:
             return r.status, json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read().decode("utf-8"))
@@ -92,6 +127,7 @@ class _ServerBase(unittest.TestCase):
         self.host, self.port = self.httpd.server_address[:2]
         self.base = f"http://127.0.0.1:{self.port}"
         self.thread = wi.serve_in_thread(self.httpd)
+        _wait_server_ready(self.host, self.port)   # no request before accept() is live
 
     def tearDown(self):
         try:
