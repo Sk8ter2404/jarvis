@@ -355,6 +355,33 @@ SCHEMA: dict[str, dict] = {
         "help": "Index your documents for recall (local nomic-embed-text, "
                 "~0.3 GB VRAM). Counts toward the VRAM budget above.",
     },
+    "LTM_ENABLED": {
+        "tab": "ai", "label": "Long-term memory", "type": "bool",
+        "default": True,
+        "help": "Record every conversation turn and recall relevant facts "
+                "each turn (local embedder, ~0.2 GB VRAM). Off = JARVIS "
+                "remembers nothing new between sessions.",
+    },
+    "STREAMING_TTS_ENABLED": {
+        "tab": "voice", "label": "Speak while replies stream", "type": "bool",
+        "default": True,
+        "help": "Start speaking the first sentence of a cloud reply while "
+                "the rest is still generating (faster feel; action commands "
+                "are never voiced early).",
+    },
+    "BARGE_IN_ENABLED": {
+        "tab": "voice", "label": "Barge-in (interrupt him by voice)",
+        "type": "bool", "default": True,
+        "help": "Say the wake word while JARVIS is talking to cut him off "
+                "and be heard. His own voice can never trigger it.",
+    },
+    "AIR_CONTROL_ENABLED": {
+        "tab": "ai", "label": "Air control auto-start (Kinect hand-mouse)",
+        "type": "bool", "default": False,
+        "help": "Start the Kinect hand-mouse automatically at boot. Off "
+                "(default) still allows 'air control on' by voice — this "
+                "only controls unattended auto-start.",
+    },
     "KINECT_ENABLED": {
         "tab": "ai", "label": "Kinect sensor (presence / gestures)",
         "type": "bool", "default": False,
