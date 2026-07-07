@@ -2850,7 +2850,10 @@ class GraceCapTests(_Base):
         c = self._ctrl(mod, clk)
         right = self._ext(mod, "right")
         left = self._relaxed(mod, "left")
-        c.update(left, right, "open", "closed", True)        # engage + RIGHT down
+        # SMART-ENGAGE: engage with an OPEN palm first (the passive gate requires
+        # it), THEN close the right hand for the drag.
+        c.update(left, right, "open", "open", True)          # engage (open palm)
+        c.update(left, right, "open", "closed", True)        # RIGHT down (drag)
         # Spend some untracked budget (under the ceiling), then RE-ACQUIRE solidly
         # for several consecutive Tracked frames → the accumulator zeroes.
         clk.advance(0.20)
@@ -2868,7 +2871,9 @@ class GraceCapTests(_Base):
         c = self._ctrl(mod, clk)
         right = self._ext(mod, "right")
         left = self._relaxed(mod, "left")
-        c.update(left, right, "open", "closed", True)        # engage + RIGHT down
+        # SMART-ENGAGE: engage with an OPEN palm first, THEN close for the drag.
+        c.update(left, right, "open", "open", True)          # engage (open palm)
+        c.update(left, right, "open", "closed", True)        # RIGHT down (drag)
         # A single short dropout within both the grace AND the ceiling → still holds.
         clk.advance(0.10)
         d = c.update(None, None, "unknown", "unknown", False)
@@ -2962,7 +2967,7 @@ class OverlayStateWriteGateTests(_Base):
         self._capture_mouse(mod)
         publishes = []
         p = mock.patch.object(mod, "_publish_overlay_state",
-                              lambda d, v: publishes.append((d.overlay, v)))
+                              lambda d, v, **k: publishes.append((d.overlay, v)))
         p.start()
         self.addCleanup(p.stop)
         ctrl = self._ctrl(mod)
@@ -3021,14 +3026,583 @@ class OverlayStateWriteGateTests(_Base):
         self.assertEqual(len(clears), 2)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  SMART-ENGAGE (2026-07, feat/smart-engage) — the HYBRID engage model.
+#  A. the PURE engage_decision() gate (no sensor/clock): armed relaxes to
+#     height-only; passive needs open+facing+still+dwell; a fast reach (dwell not
+#     met) never engages; closed/low/look-away don't engage passively; missing
+#     facing doesn't block; prime progresses 0→1 over the dwell.
+#  B. the controller wiring (dwell timing via injected clock, stillness, fist
+#     release), the per-app disable, facing extraction, arm/disarm actions, and the
+#     overlay `prime` publish.
+# ══════════════════════════════════════════════════════════════════════════
+class EngageDecisionPureTests(_Base):
+    """The PURE smart-engage gate engage_decision() — every knob is an argument so
+    no sensor / clock / config is touched."""
+
+    def _dec(self, mod, **kw):
+        # Sensible passive defaults for the pure gate; each test overrides.
+        kw.setdefault("require_open_palm", True)
+        kw.setdefault("facing_max_deg", 40.0)
+        kw.setdefault("dwell_sec", 0.30)
+        kw.setdefault("arm_debounce_sec", 0.15)
+        kw.setdefault("arm_relaxes_gate", True)
+        return mod.engage_decision(**kw)
+
+    # ── ARMED relaxes to height-only + a short hold ─────────────────────────
+    def test_armed_engages_on_height_after_short_hold(self):
+        mod = self._load()
+        # Armed: a raised hand held past the arm debounce engages — even with a
+        # CLOSED grip, no facing, and moving (grip/facing/still not required).
+        v = self._dec(mod, lift_ok=True, currently_engaged=False, armed=True,
+                      grip="closed", facing_deg=170.0, hand_still=False,
+                      arm_debounce_elapsed=0.20)
+        self.assertTrue(v.engaged)
+        self.assertEqual(v.prime, 0.0)          # no priming ring in armed mode
+
+    def test_armed_holds_off_until_short_debounce(self):
+        mod = self._load()
+        v = self._dec(mod, lift_ok=True, currently_engaged=False, armed=True,
+                      arm_debounce_elapsed=0.05)   # under 0.15 s
+        self.assertFalse(v.engaged)
+
+    def test_armed_no_lift_does_not_engage(self):
+        mod = self._load()
+        v = self._dec(mod, lift_ok=False, currently_engaged=False, armed=True,
+                      arm_debounce_elapsed=1.0)
+        self.assertFalse(v.engaged)
+
+    # ── PASSIVE needs open + facing + still + dwell ─────────────────────────
+    def test_passive_full_pose_engages_after_dwell(self):
+        mod = self._load()
+        v = self._dec(mod, lift_ok=True, currently_engaged=False, armed=False,
+                      grip="open", facing_deg=10.0, hand_still=True,
+                      dwell_elapsed=0.30)
+        self.assertTrue(v.engaged)
+
+    def test_passive_closed_hand_never_engages(self):
+        mod = self._load()
+        v = self._dec(mod, lift_ok=True, currently_engaged=False, armed=False,
+                      grip="closed", facing_deg=0.0, hand_still=True,
+                      dwell_elapsed=1.0)
+        self.assertFalse(v.engaged)
+        self.assertFalse(v.priming)
+
+    def test_passive_look_away_never_engages(self):
+        mod = self._load()
+        # Facing 60° > the 40° bar → not facing → never engages.
+        v = self._dec(mod, lift_ok=True, currently_engaged=False, armed=False,
+                      grip="open", facing_deg=60.0, hand_still=True,
+                      dwell_elapsed=1.0)
+        self.assertFalse(v.engaged)
+        self.assertFalse(v.priming)
+
+    def test_passive_low_hand_never_engages(self):
+        mod = self._load()
+        # lift_ok False (hand below the shoulder) → never engages regardless.
+        v = self._dec(mod, lift_ok=False, currently_engaged=False, armed=False,
+                      grip="open", facing_deg=0.0, hand_still=True,
+                      dwell_elapsed=1.0)
+        self.assertFalse(v.engaged)
+
+    def test_passive_moving_hand_never_engages(self):
+        mod = self._load()
+        v = self._dec(mod, lift_ok=True, currently_engaged=False, armed=False,
+                      grip="open", facing_deg=0.0, hand_still=False,
+                      dwell_elapsed=1.0)
+        self.assertFalse(v.engaged)
+        self.assertFalse(v.priming)
+
+    def test_fast_reach_never_engages_dwell_not_met(self):
+        mod = self._load()
+        # A natural fast reach: a valid pose but only a fraction of the dwell held
+        # → priming, not engaged (it would leave the zone before the dwell).
+        v = self._dec(mod, lift_ok=True, currently_engaged=False, armed=False,
+                      grip="open", facing_deg=0.0, hand_still=True,
+                      dwell_elapsed=0.10)          # < 0.30 s
+        self.assertFalse(v.engaged)
+        self.assertTrue(v.priming)
+
+    def test_missing_facing_does_not_block(self):
+        mod = self._load()
+        # facing_deg None (bridge didn't provide it) → treated as facing OK.
+        v = self._dec(mod, lift_ok=True, currently_engaged=False, armed=False,
+                      grip="open", facing_deg=None, hand_still=True,
+                      dwell_elapsed=0.30)
+        self.assertTrue(v.engaged)
+
+    def test_prime_progresses_zero_to_one_over_dwell(self):
+        mod = self._load()
+        primes = []
+        for t in (0.0, 0.075, 0.15, 0.225, 0.29):
+            v = self._dec(mod, lift_ok=True, currently_engaged=False, armed=False,
+                          grip="open", facing_deg=0.0, hand_still=True,
+                          dwell_elapsed=t)
+            self.assertTrue(v.priming)
+            primes.append(v.prime)
+        # Monotonic 0→~1 as the dwell fills.
+        self.assertEqual(primes, sorted(primes))
+        self.assertAlmostEqual(primes[0], 0.0, delta=0.01)
+        self.assertGreater(primes[-1], 0.9)
+        # At/after the dwell → engaged, prime resets to 0 (nothing to prime).
+        v_done = self._dec(mod, lift_ok=True, currently_engaged=False, armed=False,
+                           grip="open", facing_deg=0.0, hand_still=True,
+                           dwell_elapsed=0.30)
+        self.assertTrue(v_done.engaged)
+        self.assertEqual(v_done.prime, 0.0)
+
+    def test_staying_engaged_needs_only_height(self):
+        mod = self._load()
+        # Already engaged: height alone keeps it (pose/dwell only guard ACQUIRING).
+        # A closed, look-away, moving hand STAYS engaged as long as lift holds.
+        v = self._dec(mod, lift_ok=True, currently_engaged=True, armed=False,
+                      grip="closed", facing_deg=170.0, hand_still=False)
+        self.assertTrue(v.engaged)
+        # Lift lost → not engaged (the controller then releases).
+        v2 = self._dec(mod, lift_ok=False, currently_engaged=True, armed=False,
+                       grip="open", facing_deg=0.0, hand_still=True)
+        self.assertFalse(v2.engaged)
+
+    def test_open_palm_not_required_when_knob_off(self):
+        mod = self._load()
+        # With require_open_palm False a closed hand can pass the passive pose.
+        v = self._dec(mod, lift_ok=True, currently_engaged=False, armed=False,
+                      grip="closed", facing_deg=0.0, hand_still=True,
+                      dwell_elapsed=0.30, require_open_palm=False)
+        self.assertTrue(v.engaged)
+
+
+class SmartEngageControllerTests(_Base):
+    """The controller wiring: the PASSIVE dwell (timed via the injected clock), the
+    stillness accumulator, and the ARMED relaxed gate — end-to-end through
+    update()."""
+
+    def _ext(self, mod, side, **kw):
+        j = _extended_arm_joints(side, **kw)
+        return mod.ArmExtension.from_bridge(mod._local_arm_extension(j, side))
+
+    def _relaxed(self, mod, side):
+        j = _relaxed_arm_joints(side)
+        return mod.ArmExtension.from_bridge(mod._local_arm_extension(j, side))
+
+    def test_passive_open_palm_hold_engages_after_dwell(self):
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        # A real dwell-timed controller (NOT the frame-debounce shortcut): dwell
+        # 0.30 s, a large engage_debounce_frames so only the CLOCK crosses it.
+        c = mod.AirMouseController(mod.ReachBox(2560, 1440), debounce_frames=1,
+                                   grace_sec=0.0, clock=clk, dwell_sec=0.30,
+                                   engage_debounce_frames=999, require_open_palm=True,
+                                   facing_max_deg=40.0, arm_relaxes_gate=True)
+        left = self._relaxed(mod, "left")
+        right = self._ext(mod, "right")
+        # Open palm raised, still, facing → primes but doesn't engage until dwell.
+        d0 = c.update(left, right, "open", "open", True, facing_deg=0.0, armed=False)
+        self.assertFalse(c.engaged)
+        self.assertTrue(d0.prime > 0.0)          # priming ring filling
+        # Hold past the dwell → engage.
+        clk.advance(0.31)
+        d1 = c.update(left, right, "open", "open", True, facing_deg=0.0, armed=False)
+        self.assertTrue(c.engaged)
+        self.assertIsNotNone(d1.cursor)
+        self.assertEqual(d1.prime, 0.0)          # engaged → nothing to prime
+
+    def test_passive_closed_hand_never_primes(self):
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = mod.AirMouseController(mod.ReachBox(2560, 1440), debounce_frames=1,
+                                   grace_sec=0.0, clock=clk, dwell_sec=0.30,
+                                   engage_debounce_frames=999, require_open_palm=True)
+        left = self._relaxed(mod, "left")
+        right = self._ext(mod, "right")
+        for _ in range(10):
+            clk.advance(0.05)
+            d = c.update(left, right, "open", "closed", True, facing_deg=0.0)
+            self.assertFalse(c.engaged)
+            self.assertEqual(d.prime, 0.0)       # closed hand → no priming
+
+    def test_passive_look_away_never_engages(self):
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = mod.AirMouseController(mod.ReachBox(2560, 1440), debounce_frames=1,
+                                   grace_sec=0.0, clock=clk, dwell_sec=0.30,
+                                   engage_debounce_frames=999, facing_max_deg=40.0)
+        left = self._relaxed(mod, "left")
+        right = self._ext(mod, "right")
+        for _ in range(10):
+            clk.advance(0.05)
+            c.update(left, right, "open", "open", True, facing_deg=80.0)  # turned away
+        self.assertFalse(c.engaged)
+
+    def test_moving_hand_breaks_the_dwell(self):
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = mod.AirMouseController(mod.ReachBox(2560, 1440), debounce_frames=1,
+                                   grace_sec=0.0, clock=clk, dwell_sec=0.30,
+                                   engage_debounce_frames=999, still_m=0.06)
+        left = self._relaxed(mod, "left")
+        # Sweep the hand far in X each frame → travel exceeds the still bar → the
+        # dwell keeps resetting / never engages.
+        for i in range(12):
+            clk.advance(0.05)
+            right = self._ext(mod, "right", hand_x=0.02 * i)   # 2 cm per frame
+            c.update(left, right, "open", "open", True, facing_deg=0.0)
+        self.assertFalse(c.engaged)
+
+    def test_armed_engages_fast_height_only(self):
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = mod.AirMouseController(mod.ReachBox(2560, 1440), debounce_frames=1,
+                                   grace_sec=0.0, clock=clk,
+                                   arm_debounce_sec=0.15, engage_debounce_frames=999,
+                                   require_open_palm=True, arm_relaxes_gate=True)
+        left = self._relaxed(mod, "left")
+        right = self._ext(mod, "right")
+        # ARMED: even a CLOSED-grip, look-away raised hand engages after the short
+        # arm debounce (the relaxed gate ignores grip/facing/still/long-dwell).
+        c.update(left, right, "open", "closed", True, facing_deg=170.0, armed=True)
+        self.assertFalse(c.engaged)              # under the 0.15 s hold
+        clk.advance(0.20)
+        c.update(left, right, "open", "closed", True, facing_deg=170.0, armed=True)
+        self.assertTrue(c.engaged)
+
+    def test_per_app_disabled_stands_down(self):
+        mod = self._load()
+        c = mod.AirMouseController(mod.ReachBox(2560, 1440), debounce_frames=1,
+                                   grace_sec=0.0, engage_debounce_frames=1,
+                                   arm_relaxes_gate=True)
+        left = self._relaxed(mod, "left")
+        right = self._ext(mod, "right")
+        # Armed (would engage immediately) BUT the foreground app is disabled →
+        # stand down: no engage, cursor None, overlay hidden.
+        d = c.update(left, right, "open", "open", True, armed=True,
+                     per_app_disabled=True)
+        self.assertFalse(c.engaged)
+        self.assertIsNone(d.cursor)
+        self.assertEqual(d.overlay, "hidden")
+
+    def test_per_app_disable_force_releases_engaged(self):
+        mod = self._load()
+        c = mod.AirMouseController(mod.ReachBox(2560, 1440), debounce_frames=1,
+                                   grace_sec=0.0, engage_debounce_frames=1,
+                                   arm_relaxes_gate=True, arm_debounce_sec=0.0)
+        left = self._relaxed(mod, "left")
+        right = self._ext(mod, "right")
+        c.update(left, right, "open", "open", True, armed=True)   # engage
+        c.update(left, right, "open", "closed", True, armed=True)  # right down
+        self.assertTrue(c.right_is_down)
+        # A disabled app comes to the foreground → release the held button + stand down.
+        d = c.update(left, right, "open", "closed", True, armed=True,
+                     per_app_disabled=True)
+        self.assertEqual(d.right, "up")
+        self.assertFalse(c.engaged)
+
+
+class FistReleaseTests(_Base):
+    """A SUSTAINED closed fist while engaged force-disengages (AIR_MOUSE_FIST_-
+    RELEASES); a normal click / short drag never trips it."""
+
+    def _ext(self, mod, side, **kw):
+        j = _extended_arm_joints(side, **kw)
+        return mod.ArmExtension.from_bridge(mod._local_arm_extension(j, side))
+
+    def _relaxed(self, mod, side):
+        j = _relaxed_arm_joints(side)
+        return mod.ArmExtension.from_bridge(mod._local_arm_extension(j, side))
+
+    def _ctrl(self, mod, clk, **kw):
+        kw.setdefault("debounce_frames", 1)
+        kw.setdefault("grace_sec", 0.0)
+        kw.setdefault("engage_debounce_frames", 1)
+        kw.setdefault("arm_relaxes_gate", True)
+        kw.setdefault("arm_debounce_sec", 0.0)   # engage on the first armed frame
+        return mod.AirMouseController(mod.ReachBox(2560, 1440), clock=clk, **kw)
+
+    def test_sustained_fist_releases(self):
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = self._ctrl(mod, clk, fist_release_sec=0.60, fist_releases=True)
+        left = self._relaxed(mod, "left")
+        right = self._ext(mod, "right")
+        c.update(left, right, "open", "open", True, armed=True)   # engage
+        c.update(left, right, "open", "closed", True, armed=True)  # right down
+        self.assertTrue(c.engaged and c.right_is_down)
+        # Hold the fist closed past the release window → force-disengage + release.
+        clk.advance(0.70)
+        d = c.update(left, right, "open", "closed", True, armed=True)
+        self.assertFalse(c.engaged)
+        self.assertEqual(d.right, "up")
+        self.assertIsNone(d.cursor)
+
+    def test_short_close_does_not_release(self):
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = self._ctrl(mod, clk, fist_release_sec=0.60, fist_releases=True)
+        left = self._relaxed(mod, "left")
+        right = self._ext(mod, "right")
+        c.update(left, right, "open", "open", True, armed=True)
+        c.update(left, right, "open", "closed", True, armed=True)  # right down
+        clk.advance(0.20)                                          # brief close
+        d = c.update(left, right, "open", "closed", True, armed=True)
+        self.assertTrue(c.engaged)          # not released — a short close is a drag
+        self.assertIsNone(d.right)          # no button edge
+
+    def test_fist_release_off_when_knob_false(self):
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = self._ctrl(mod, clk, fist_release_sec=0.60, fist_releases=False)
+        left = self._relaxed(mod, "left")
+        right = self._ext(mod, "right")
+        c.update(left, right, "open", "open", True, armed=True)
+        c.update(left, right, "open", "closed", True, armed=True)
+        clk.advance(1.0)
+        c.update(left, right, "open", "closed", True, armed=True)
+        self.assertTrue(c.engaged)          # knob off → a long fist stays a drag
+
+
+class AppDisableMatchTests(_Base):
+    """The PURE per-app disable matcher app_is_disabled() + _body_facing_deg."""
+
+    def test_matches_title_substring(self):
+        mod = self._load()
+        self.assertTrue(mod.app_is_disabled("Netflix — Watching", "Chrome_WidgetWin",
+                                            hints=["netflix"]))
+
+    def test_matches_class_substring(self):
+        mod = self._load()
+        self.assertTrue(mod.app_is_disabled("Some Game", "UnrealWindow",
+                                            hints=["unrealwindow"]))
+
+    def test_no_match_returns_false(self):
+        mod = self._load()
+        self.assertFalse(mod.app_is_disabled("Notepad", "Notepad",
+                                             hints=["netflix", "vlc"]))
+
+    def test_empty_window_is_not_disabled(self):
+        mod = self._load()
+        self.assertFalse(mod.app_is_disabled("", "", hints=["netflix"]))
+
+    def test_case_insensitive(self):
+        mod = self._load()
+        self.assertTrue(mod.app_is_disabled("YOUTUBE - Foo", "", hints=["youtube - "]))
+
+    def test_default_hints_used_when_none(self):
+        mod = self._load()
+        # None hints → the live AIR_MOUSE_DISABLED_APP_HINTS (which include vlc).
+        self.assertTrue(mod.app_is_disabled("VLC media player", ""))
+
+    def test_body_facing_deg_prefers_yaw(self):
+        mod = self._load()
+        self.assertEqual(mod._body_facing_deg({"facing_yaw_deg": -25.0}), 25.0)
+        self.assertEqual(mod._body_facing_deg({"facing_yaw_deg": 10.0}), 10.0)
+
+    def test_body_facing_deg_bool_fallback(self):
+        mod = self._load()
+        self.assertEqual(mod._body_facing_deg({"facing": True}), 0.0)
+        self.assertEqual(mod._body_facing_deg({"facing": False}), 180.0)
+
+    def test_body_facing_deg_missing_is_none(self):
+        mod = self._load()
+        self.assertIsNone(mod._body_facing_deg({}))
+
+
+class ArmStateTests(_Base):
+    """The module ARMED flag + arm/disarm actions."""
+
+    def setUp(self):
+        # Reset the shared armed flag around each test so they don't bleed.
+        self._mod = self._load()
+        self._mod.air_mouse_disarm()
+        self.addCleanup(self._mod.air_mouse_disarm)
+
+    def test_arm_and_disarm_flip_the_flag(self):
+        mod = self._mod
+        self.assertFalse(mod.air_mouse_is_armed())
+        mod.air_mouse_arm()
+        self.assertTrue(mod.air_mouse_is_armed())
+        mod.air_mouse_disarm()
+        self.assertFalse(mod.air_mouse_is_armed())
+
+    def test_update_reads_module_armed_flag_when_arg_none(self):
+        mod = self._mod
+        c = mod.AirMouseController(mod.ReachBox(2560, 1440), debounce_frames=1,
+                                   grace_sec=0.0, engage_debounce_frames=1,
+                                   arm_relaxes_gate=True, require_open_palm=True,
+                                   arm_debounce_sec=0.0)   # engage on first armed frame
+        j = _extended_arm_joints("right")
+        right = mod.ArmExtension.from_bridge(mod._local_arm_extension(j, "right"))
+        jl = _relaxed_arm_joints("left")
+        left = mod.ArmExtension.from_bridge(mod._local_arm_extension(jl, "left"))
+        # Not armed + closed hand → passive gate rejects (armed=None reads the flag).
+        c.update(left, right, "open", "closed", True)
+        self.assertFalse(c.engaged)
+        # Arm via the module flag → the same closed-hand raise engages (relaxed).
+        mod.air_mouse_arm()
+        c.update(left, right, "open", "closed", True)
+        self.assertTrue(c.engaged)
+
+    def test_arm_action_arms_and_enables(self):
+        mod = self._mod
+        self._patch_flag(False)
+        from tools import settings_window as sw
+        saved = {}
+        p1 = mock.patch.object(sw, "load_settings", lambda *a, **k: dict(saved))
+        p2 = mock.patch.object(sw, "save_settings",
+                               lambda d, *a, **k: saved.update(d))
+        p3 = mock.patch.object(mod, "_sensor_ready", lambda: (True, ""))
+        for p in (p1, p2, p3):
+            p.start(); self.addCleanup(p.stop)
+        out = mod.air_mouse_arm_action("")
+        self.assertTrue(mod.air_mouse_is_armed())
+        self.assertIn("armed", out.lower())
+        self.assertTrue(saved.get("KINECT_AIR_MOUSE_ENABLED"))   # enabled it too
+
+    def test_disarm_action_disarms_and_releases(self):
+        mod = self._mod
+        mod.air_mouse_arm()
+        released = []
+        with mock.patch.object(mod, "_mouse_button",
+                               lambda a, b="left": released.append((a, b))), \
+                mock.patch.object(mod, "_clear_overlay_state", lambda: None):
+            out = mod.air_mouse_disarm_action("")
+        self.assertFalse(mod.air_mouse_is_armed())
+        self.assertIn("released", out.lower())
+        # Both buttons let go so disarm can't strand one down.
+        self.assertIn(("up", "left"), released)
+        self.assertIn(("up", "right"), released)
+
+
+class OverlayPrimePublishTests(_Base):
+    """The overlay `prime` key (shared HUD contract): published in the state file,
+    exposed via get_air_mouse_state()/get_air_mouse_prime()."""
+
+    def test_publish_writes_prime_key(self):
+        mod = self._load()
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "air_cursor_state.json")
+            with mock.patch.object(mod, "AIR_CURSOR_STATE_FILE", path):
+                # A priming decision (cursor None, prime>0) → state "prime", visible,
+                # positioned at prime_xy, prime carried through.
+                dec = mod.AirMouseDecision(cursor=None, left=None, right=None,
+                                           overlay="hidden", hand=None, grip="open",
+                                           prime=0.5)
+                mod._publish_overlay_state(dec, visible=True, prime_xy=(640, 360))
+                data = json.load(open(path, encoding="utf-8"))
+        self.assertIn("prime", data)
+        self.assertAlmostEqual(data["prime"], 0.5)
+        self.assertEqual(data["state"], "prime")
+        self.assertTrue(data["visible"])
+        self.assertEqual((data["x"], data["y"]), (640, 360))
+
+    def test_engaged_publish_has_zero_prime(self):
+        mod = self._load()
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "air_cursor_state.json")
+            with mock.patch.object(mod, "AIR_CURSOR_STATE_FILE", path):
+                dec = mod.AirMouseDecision(cursor=(100, 200), left=None, right=None,
+                                           overlay="track", hand="right", grip="open")
+                mod._publish_overlay_state(dec, visible=True)
+                data = json.load(open(path, encoding="utf-8"))
+        self.assertEqual(data["prime"], 0.0)
+        self.assertEqual(data["state"], "track")
+
+    def test_state_getter_exposes_prime(self):
+        mod = self._load()
+        mod._set_air_mouse_state(False, "open", None, prime=0.7)
+        st = mod.get_air_mouse_state()
+        self.assertAlmostEqual(st["prime"], 0.7)
+        self.assertAlmostEqual(mod.get_air_mouse_prime(), 0.7)
+        # Engaged clears prime.
+        mod._set_air_mouse_state(True, "open", "right", prime=0.0)
+        self.assertEqual(mod.get_air_mouse_prime(), 0.0)
+
+
+class PollSmartEngageTests(_Base):
+    """End-to-end through _poll_once: passive dwell primes then engages; the poll
+    passes facing + armed + per-app-disable into the controller."""
+
+    def _ctrl(self, mod, clk, **kw):
+        kw.setdefault("debounce_frames", 1)
+        kw.setdefault("grace_sec", 0.0)
+        kw.setdefault("engage_debounce_frames", 999)   # clock-timed only
+        kw.setdefault("dwell_sec", 0.30)
+        kw.setdefault("require_open_palm", True)
+        kw.setdefault("arm_relaxes_gate", True)
+        return mod.AirMouseController(mod.ReachBox(2560, 1440), clock=clk, **kw)
+
+    def test_passive_poll_primes_then_engages(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        mod.air_mouse_disarm()
+        self.addCleanup(mod.air_mouse_disarm)
+        moves, buttons = self._capture_mouse(mod)
+        clk = _FakeClock(100.0)
+        ctrl = self._ctrl(mod, clk)
+        body = _body(reach_side="right", grip_right="open")   # facing True in fixture
+        # Frame 1: valid pose but dwell not met → priming, no cursor move.
+        mod._poll_once(ctrl, _fake_bridge(bodies=[body]))
+        self.assertFalse(ctrl.engaged)
+        self.assertEqual(moves, [])
+        self.assertGreater(mod.get_air_mouse_prime(), 0.0)     # ring filling
+        # Hold past the dwell → engage + move.
+        clk.advance(0.35)
+        mod._poll_once(ctrl, _fake_bridge(bodies=[body]))
+        self.assertTrue(ctrl.engaged)
+        self.assertEqual(len(moves), 1)
+        self.assertEqual(mod.get_air_mouse_prime(), 0.0)       # engaged → no ring
+
+    def test_armed_poll_engages_immediately_via_module_flag(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        moves, buttons = self._capture_mouse(mod)
+        clk = _FakeClock(100.0)
+        ctrl = self._ctrl(mod, clk, arm_debounce_sec=0.0)   # no armed hold
+        mod.air_mouse_arm()
+        self.addCleanup(mod.air_mouse_disarm)
+        # Armed + a raised hand → engages on the first poll (relaxed gate).
+        mod._poll_once(ctrl, _fake_bridge(
+            bodies=[_body(reach_side="right", grip_right="open")]))
+        self.assertTrue(ctrl.engaged)
+        self.assertEqual(len(moves), 1)
+
+    def test_poll_stands_down_over_disabled_app(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        moves, buttons = self._capture_mouse(mod)
+        clk = _FakeClock(100.0)
+        ctrl = self._ctrl(mod, clk, arm_debounce_sec=0.0)
+        mod.air_mouse_arm()
+        self.addCleanup(mod.air_mouse_disarm)
+        # Foreground app is disabled → the poll passes per_app_disabled True → no move.
+        with mock.patch.object(mod, "_per_app_disabled", lambda: True):
+            for _ in range(5):
+                mod._poll_once(ctrl, _fake_bridge(
+                    bodies=[_body(reach_side="right", grip_right="open")]))
+        self.assertEqual(moves, [])
+        self.assertFalse(ctrl.engaged)
+
+
 # ─── registration wires the actions ─────────────────────────────────────────
 class RegisterTests(_Base):
     def test_register_adds_actions_without_starting_real_thread(self):
         mod, actions = load_skill_isolated("kinect_air_mouse", register=True)
         for name in ("air_mouse_on", "air_mouse_off", "air_mouse_status",
-                     "calibrate_air_mouse"):
+                     "calibrate_air_mouse", "air_mouse_arm", "air_mouse_disarm"):
             self.assertIn(name, actions)
             self.assertTrue(callable(actions[name]))
+
+    def test_register_wires_arm_disarm_aliases(self):
+        mod, actions = load_skill_isolated("kinect_air_mouse", register=True)
+        for alias in ("mouse_control_on", "take_the_cursor", "give_me_the_cursor",
+                      "hand_mouse_on"):
+            self.assertIs(actions[alias], actions["air_mouse_arm"])
+        for alias in ("mouse_control_off", "release_the_cursor", "hand_mouse_off"):
+            self.assertIs(actions[alias], actions["air_mouse_disarm"])
 
 
 if __name__ == "__main__":

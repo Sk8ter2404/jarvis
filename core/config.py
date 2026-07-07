@@ -629,6 +629,80 @@ KINECT_POINT_CONTROL_ENABLED = False
 #   isn't tracked. See audio/kinect_bridge.get_hand_states() (grip) +
 #   skills/kinect_air_mouse.py (wiring) + hud/jarvis_air_cursor.py (overlay).
 KINECT_AIR_MOUSE_ENABLED = False
+# ─── AIR-MOUSE SMART-ENGAGE knobs (2026-07, feat/smart-engage) ───────────────
+#   The owner's complaint: "hand tracking triggers when it shouldn't; I need a
+#   foolproof way to make it trigger every time I want it but with FEWER false
+#   triggers." The fix is a HYBRID engage model with two modes (skills/
+#   kinect_air_mouse.py :: engage_decision):
+#     • PASSIVE (default): a STRICT smart-pose gate — the cursor is taken only on
+#       an OPEN PALM, raised above the shoulder, FACING the sensor, held STILL for
+#       a brief DWELL (~0.30 s). A natural fast reach passes through the zone
+#       quicker than the dwell and never engages, so gesturing/stretching/reaching
+#       no longer grabs the cursor.
+#     • ARMED (opt-in via voice: "mouse control on" / "take the cursor"): a RELAXED
+#       gate — height-only, held for a short debounce; grip/facing/stillness are
+#       NOT required, because the owner explicitly asked for control so it should
+#       be responsive. "mouse control off" disarms back to PASSIVE (it does NOT
+#       disable the feature — KINECT_AIR_MOUSE_ENABLED above is the real master off).
+#   DISENGAGE stays snappy in BOTH modes (drop below the down-margin, a sustained
+#   closed fist while engaged, tracking-loss grace, real-input yield, or voice
+#   disarm) — never harder to release than before.
+# AIR_MOUSE_REQUIRE_OPEN_PALM — PASSIVE mode requires the debounced-stable grip to
+#   be OPEN ("open palm") to engage. This is the headline false-trigger fix: a
+#   closed/pointing hand reaching or gesturing no longer takes the cursor. True.
+AIR_MOUSE_REQUIRE_OPEN_PALM = True
+# AIR_MOUSE_ENGAGE_DWELL_SEC — the PASSIVE "brief hold": the full smart pose
+#   (raised + open + facing + still) must be SUSTAINED this long before the cursor
+#   is taken. A fast natural reach crosses the zone quicker than this and never
+#   engages; a deliberate hold-to-grab does. ~0.30 s. The HUD priming ring fills
+#   0→1 over this window (see the overlay `prime` key).
+AIR_MOUSE_ENGAGE_DWELL_SEC = 0.30
+# AIR_MOUSE_ENGAGE_STILL_M — the PASSIVE stillness bar: total hand travel (summed
+#   3D displacement) across the dwell window must stay UNDER this to keep priming.
+#   A hand that is still mid-reach (settling to point) primes; a hand sweeping
+#   past does not. ~6 cm.
+AIR_MOUSE_ENGAGE_STILL_M = 0.06
+# AIR_MOUSE_FACING_MAX_DEG — the PASSIVE facing bar: the body must face the sensor
+#   within this many degrees of square (|facing_yaw_deg| <= this) to engage. If the
+#   bridge doesn't provide facing (older build / not measurable) this signal is
+#   skipped GRACEFULLY — missing facing is treated as "facing OK" so it never
+#   becomes an un-passable gate. ~40°.
+AIR_MOUSE_FACING_MAX_DEG = 40.0
+# AIR_MOUSE_ARM_RELAXES_GATE — when ARMED, use the RELAXED height-only gate (a
+#   short debounce, no grip/facing/stillness/dwell). The owner said "be responsive
+#   when I explicitly ask for control." True. Set False to keep the full smart
+#   pose even when armed (armed then only skips the dwell-hold vs passive).
+AIR_MOUSE_ARM_RELAXES_GATE = True
+# AIR_MOUSE_ARM_ENGAGE_DEBOUNCE_SEC — the short hold the ARMED (relaxed) gate uses
+#   before engaging, so a 1-frame height spike still can't grab it while a quick
+#   deliberate raise engages almost instantly. ~0.15 s.
+AIR_MOUSE_ARM_ENGAGE_DEBOUNCE_SEC = 0.15
+# AIR_MOUSE_FIST_RELEASES — a SUSTAINED closed fist while engaged force-disengages
+#   (an extra, optional snappy release the owner can use to "let go" without
+#   lowering the hand). Behind this knob so it can be turned off if it fights the
+#   drag gesture. True. See AIR_MOUSE_FIST_RELEASE_SEC.
+AIR_MOUSE_FIST_RELEASES = True
+# AIR_MOUSE_FIST_RELEASE_SEC — how long the fist must stay closed (while engaged)
+#   before it counts as a release, so a normal click/drag (close→open, or a short
+#   held drag) never trips it — only a deliberate sustained fist. ~0.60 s.
+AIR_MOUSE_FIST_RELEASE_SEC = 0.60
+# AIR_MOUSE_PER_APP_DISABLE — when True, the air-mouse STANDS DOWN (and force-
+#   disengages if already engaged) whenever the FOREGROUND window's title/class
+#   matches any AIR_MOUSE_DISABLED_APP_HINTS substring — e.g. a fullscreen game or
+#   video where a stray cursor grab would be disruptive. Defensive: any win32
+#   failure is treated as "not disabled" so it never accidentally kills the mouse.
+AIR_MOUSE_PER_APP_DISABLE = True
+# AIR_MOUSE_DISABLED_APP_HINTS — lower-case substrings matched against the
+#   foreground window TITLE and CLASS name. Sensible defaults: common fullscreen
+#   games / video players where the air-mouse should stay out of the way. Editable
+#   in data/user_settings.json.
+AIR_MOUSE_DISABLED_APP_HINTS = [
+    "full screen", "fullscreen",           # generic fullscreen markers
+    "netflix", "youtube - ", "prime video",  # streaming players
+    "vlc media player", "mpc-hc", "kodi",  # desktop video players
+    "steam big picture", "moonlight",      # game launchers / streaming
+    "unrealwindow", "unitywndclass",       # common game engine window classes
+]
 # AIR_CONTROL_ENABLED — movie-style AIR CONTROL (skills/air_control.py, engine
 #   core/air_control.py): reach a hand OUT toward the sensor + above the waist
 #   to take the cursor across the WHOLE virtual desktop; a closed FIST grabs and

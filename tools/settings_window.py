@@ -415,6 +415,34 @@ SCHEMA: dict[str, dict] = {
         "help": "Use the Kinect v2 for presence, gestures and pointing. "
                 "Runs on CPU/USB — no extra VRAM.",
     },
+    "AIR_MOUSE_REQUIRE_OPEN_PALM": {
+        "tab": "ai", "label": "Air-mouse: require an open palm to engage",
+        "type": "bool", "default": True,
+        "help": "Passive mode only takes the cursor on an OPEN palm raised + held "
+                "briefly (fewer false triggers from a closed/pointing hand "
+                "reaching or gesturing). Off = height alone can engage.",
+    },
+    "AIR_MOUSE_ARM_RELAXES_GATE": {
+        "tab": "ai", "label": "Air-mouse: 'take the cursor' relaxes the gate",
+        "type": "bool", "default": True,
+        "help": "When you say 'take the cursor' / 'mouse control on' the strict "
+                "smart-pose gate relaxes to height-only so a raised hand engages "
+                "right away. Off = still needs the full open-palm hold even armed.",
+    },
+    "AIR_MOUSE_FIST_RELEASES": {
+        "tab": "ai", "label": "Air-mouse: a held fist releases the cursor",
+        "type": "bool", "default": True,
+        "help": "While the air-mouse is engaged, holding a closed fist for ~0.6 s "
+                "lets go of the cursor without lowering your hand. Off if it "
+                "fights your drag gesture.",
+    },
+    "AIR_MOUSE_PER_APP_DISABLE": {
+        "tab": "ai", "label": "Air-mouse: stand down over fullscreen games/video",
+        "type": "bool", "default": True,
+        "help": "Automatically disable the air-mouse when a fullscreen game or "
+                "video player is in the foreground (edit the app list in "
+                "data/user_settings.json → AIR_MOUSE_DISABLED_APP_HINTS).",
+    },
     "ENABLE_ORCHESTRATOR": {
         "tab": "ai", "label": "Sub-agent orchestrator", "type": "bool",
         "default": True,

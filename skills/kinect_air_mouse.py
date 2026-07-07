@@ -340,6 +340,241 @@ AIR_MOUSE_UNTRACKED_CEILING_SEC = 0.50
 # frames ≈ 100 ms of solid tracking to declare the body re-acquired.
 AIR_MOUSE_RETRACK_FRAMES = 3
 
+# ─── SMART-ENGAGE (2026-07, feat/smart-engage) ───────────────────────────────
+# The owner: "hand tracking triggers when it shouldn't; I need a foolproof way to
+# make it trigger every time I want it but with FEWER false triggers." The old
+# gate rode on ONE signal — hand HEIGHT above the shoulder — so ANY raised hand
+# (reaching, stretching, gesturing) engaged, and it wasn't reliable when wanted.
+#
+# The fix is a HYBRID engage model with TWO modes (all decided by the PURE
+# engage_decision() below, so it is unit-testable with no sensor):
+#
+#   • PASSIVE (default, the strict smart-pose gate): the cursor is taken only when
+#     ALL of these hold and are SUSTAINED for a brief DWELL —
+#       – lift_m clears the up-margin (hand raised above the shoulder),
+#       – grip is OPEN (an open palm) when AIR_MOUSE_REQUIRE_OPEN_PALM,
+#       – the body FACES the sensor within AIR_MOUSE_FACING_MAX_DEG (missing facing
+#         is treated as OK so it never becomes an un-passable gate), and
+#       – the hand is held STILL (total travel < AIR_MOUSE_ENGAGE_STILL_M over the
+#         dwell window).
+#     A natural FAST reach passes through the zone quicker than the dwell and never
+#     engages; a deliberate OPEN-PALM + BRIEF HOLD does. This is the false-trigger
+#     fix — gesturing / reaching / a closed or pointing hand no longer grabs it.
+#
+#   • ARMED (opt-in by voice — the owner explicitly asked for control, so be
+#     responsive): with AIR_MOUSE_ARM_RELAXES_GATE the gate RELAXES to height-only
+#     held for a SHORT debounce (grip / facing / stillness / long dwell NOT
+#     required). air_mouse_arm() / air_mouse_disarm() flip the module-level armed
+#     flag; disarm returns to PASSIVE (it does NOT disable the feature — the
+#     KINECT_AIR_MOUSE_ENABLED master flag is the real off).
+#
+# DISENGAGE stays snappy in BOTH modes (drop below the down-margin, a sustained
+# closed fist while engaged behind AIR_MOUSE_FIST_RELEASES, tracking-loss grace,
+# real-input auto-yield, per-app disable, or voice disarm) — never harder than
+# before. The passive DWELL PROGRESS (0→1) is published for the HUD priming ring.
+
+def _cfg(name: str, default):
+    """Live read of a core.config value (float/bool/list), fresh each call so a
+    Settings tweak takes effect with no restart. Returns `default` on any failure.
+    NEVER raises. (Booleans use _cfg_flag; this is the general typed reader.)"""
+    try:
+        from core import config as _c
+        return getattr(_c, name, default)
+    except Exception:
+        return default
+
+
+def _cfg_float(name: str, default: float) -> float:
+    try:
+        return float(_cfg(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+# PASSIVE smart-pose defaults (mirrors of the core.config knobs — read live at run
+# time via _cfg_float, but named here so the pure decision + the tests share one
+# source of truth and the module still works if core.config is absent).
+AIR_MOUSE_REQUIRE_OPEN_PALM = True       # PASSIVE: require an OPEN palm to engage
+AIR_MOUSE_ENGAGE_DWELL_SEC = 0.30        # PASSIVE: hold the full pose this long
+AIR_MOUSE_ENGAGE_STILL_M = 0.06          # PASSIVE: max hand travel over the dwell
+AIR_MOUSE_FACING_MAX_DEG = 40.0          # PASSIVE: face the sensor within this
+AIR_MOUSE_ARM_RELAXES_GATE = True        # ARMED: relax to height-only + short hold
+AIR_MOUSE_ARM_ENGAGE_DEBOUNCE_SEC = 0.15  # ARMED: short engage hold (relaxed gate)
+AIR_MOUSE_FIST_RELEASES = True           # a sustained fist while engaged releases
+AIR_MOUSE_FIST_RELEASE_SEC = 0.60        # …held closed this long counts as release
+AIR_MOUSE_PER_APP_DISABLE = True         # stand down over disabled-app windows
+AIR_MOUSE_DISABLED_APP_HINTS = [         # lower-case title/class substrings
+    "full screen", "fullscreen",
+    "netflix", "youtube - ", "prime video",
+    "vlc media player", "mpc-hc", "kodi",
+    "steam big picture", "moonlight",
+    "unrealwindow", "unitywndclass",
+]
+
+
+# ── module-level ARMED flag (single-element-list idiom, per house style) ──────
+# _air_mouse_armed[0] True → the owner explicitly asked for the cursor ("mouse
+# control on"), so the PASSIVE strict gate relaxes to the responsive armed gate.
+# Default False (PASSIVE). Flipped by air_mouse_arm() / air_mouse_disarm(); read
+# by the live loop each tick. NB this is orthogonal to KINECT_AIR_MOUSE_ENABLED
+# (the master on/off) — disarming returns to passive, it does NOT disable.
+_air_mouse_armed = [False]
+
+
+def air_mouse_arm() -> None:
+    """ARM the air-mouse: relax the PASSIVE gate to the responsive armed gate (the
+    owner explicitly asked for the cursor). Idempotent. NEVER raises."""
+    _air_mouse_armed[0] = True
+
+
+def air_mouse_disarm() -> None:
+    """DISARM the air-mouse: return to the PASSIVE strict smart-pose gate. Does NOT
+    disable the feature (KINECT_AIR_MOUSE_ENABLED is the master off). Idempotent."""
+    _air_mouse_armed[0] = False
+
+
+def air_mouse_is_armed() -> bool:
+    """True while the air-mouse is ARMED (relaxed gate). NEVER raises."""
+    return bool(_air_mouse_armed[0])
+
+
+# What the pure engage gate decides each frame.
+class EngageVerdict:
+    """The PURE smart-engage decision for one frame.
+
+      engaged:  bool  — the gate says the cursor should be (or stay) taken.
+      priming:  bool  — a valid PASSIVE pose is being HELD toward engage but the
+                        dwell hasn't completed yet (drives the HUD priming ring).
+      prime:    float — dwell PROGRESS in [0.0, 1.0]: 0 at pose-start, 1 at engage,
+                        0.0 when idle or already engaged (nothing to prime).
+    """
+    __slots__ = ("engaged", "priming", "prime")
+
+    def __init__(self, engaged: bool, priming: bool, prime: float):
+        self.engaged = bool(engaged)
+        self.priming = bool(priming)
+        self.prime = max(0.0, min(1.0, float(prime)))
+
+    def __repr__(self):   # pragma: no cover - debug aid
+        return (f"EngageVerdict(engaged={self.engaged}, priming={self.priming}, "
+                f"prime={self.prime:.2f})")
+
+
+def _pose_ok_passive(*, lift_ok: bool, grip: "Optional[str]", facing_deg,
+                     hand_still: bool, require_open_palm: bool,
+                     facing_max_deg: float) -> bool:
+    """Does the PASSIVE smart pose hold THIS frame (before the dwell test)? All of:
+    the hand raised (lift_ok), an OPEN palm (when required — the DEBOUNCED stable
+    grip so a 1-frame flicker doesn't matter), FACING the sensor within
+    facing_max_deg (missing facing → treated as OK, never an un-passable gate), and
+    the hand held STILL. PURE; NEVER raises."""
+    if not lift_ok:
+        return False
+    if require_open_palm and (grip or "").lower() != "open":
+        return False
+    # FACING — skip gracefully when the bridge didn't provide it (facing_deg None):
+    # a missing signal must never block engagement (treat as facing OK).
+    if facing_deg is not None:
+        try:
+            if abs(float(facing_deg)) > float(facing_max_deg):
+                return False
+        except (TypeError, ValueError):
+            pass   # unparseable facing → treat as OK, don't gate on garbage
+    if not hand_still:
+        return False
+    return True
+
+
+def engage_decision(*, lift_ok: bool, currently_engaged: bool, armed: bool,
+                    grip: "Optional[str]" = None, facing_deg=None,
+                    hand_still: bool = True, dwell_elapsed: float = 0.0,
+                    arm_debounce_elapsed: float = 0.0,
+                    require_open_palm: "Optional[bool]" = None,
+                    facing_max_deg: "Optional[float]" = None,
+                    dwell_sec: "Optional[float]" = None,
+                    arm_debounce_sec: "Optional[float]" = None,
+                    arm_relaxes_gate: "Optional[bool]" = None) -> "EngageVerdict":
+    """THE PURE SMART-ENGAGE GATE — decide engage / priming / prime-progress from
+    the per-frame signals, with NO sensor, mouse, clock, or config I/O (every knob
+    is an argument, defaulting to the live core.config value). Unit-testable
+    directly; the controller feeds it the measured signals + elapsed timers.
+
+    Inputs:
+      lift_ok            — the HEIGHT gate already passed (hand raised above the
+                           shoulder past the engage/stay-engage margin with the
+                           existing hysteresis). This wraps the existing lift line.
+      currently_engaged  — was the air-mouse engaged last frame (staying engaged
+                           only needs lift_ok — the pose/dwell are for ACQUIRING).
+      armed              — the module ARMED flag (owner explicitly asked for the
+                           cursor).
+      grip               — the DEBOUNCED stable grip of the controlling hand
+                           ("open"/"closed"/…); the open-palm test uses it.
+      facing_deg         — |body yaw| from square, or None when unavailable (None →
+                           facing treated as OK, never blocks).
+      hand_still         — True when total hand travel over the dwell window is
+                           under the stillness bar.
+      dwell_elapsed      — seconds the PASSIVE pose has been continuously held.
+      arm_debounce_elapsed — seconds the ARMED height-only pose has been held.
+
+    Returns an EngageVerdict(engaged, priming, prime):
+      • ARMED + arm_relaxes_gate: RELAXED gate — engage on lift_ok held for
+        arm_debounce_sec (grip/facing/stillness/long-dwell NOT required). No
+        priming ring (engagement is near-instant); prime stays 0.
+      • PASSIVE (or armed with arm_relaxes_gate False): the STRICT smart pose must
+        hold for dwell_sec. While the pose holds but the dwell isn't met →
+        priming=True, prime = dwell_elapsed / dwell_sec (0→1). The instant it
+        completes → engaged=True.
+      • STAYING engaged: once engaged, lift_ok alone keeps it (the pose/dwell gate
+        only guards ACQUISITION); prime 0, priming False. DISENGAGE (lift lost,
+        fist, yield, per-app, disarm) is handled by the controller, not here.
+
+    A fast reach never engages passively: it clears lift for fewer frames than the
+    dwell, so the dwell never completes and the pose resets on the way out."""
+    # Resolve knobs (arg overrides win; else live config; else module default).
+    if require_open_palm is None:
+        require_open_palm = bool(_cfg_flag("AIR_MOUSE_REQUIRE_OPEN_PALM",
+                                           AIR_MOUSE_REQUIRE_OPEN_PALM))
+    if facing_max_deg is None:
+        facing_max_deg = _cfg_float("AIR_MOUSE_FACING_MAX_DEG",
+                                    AIR_MOUSE_FACING_MAX_DEG)
+    if dwell_sec is None:
+        dwell_sec = _cfg_float("AIR_MOUSE_ENGAGE_DWELL_SEC",
+                               AIR_MOUSE_ENGAGE_DWELL_SEC)
+    if arm_debounce_sec is None:
+        arm_debounce_sec = _cfg_float("AIR_MOUSE_ARM_ENGAGE_DEBOUNCE_SEC",
+                                      AIR_MOUSE_ARM_ENGAGE_DEBOUNCE_SEC)
+    if arm_relaxes_gate is None:
+        arm_relaxes_gate = bool(_cfg_flag("AIR_MOUSE_ARM_RELAXES_GATE",
+                                          AIR_MOUSE_ARM_RELAXES_GATE))
+
+    # ── STAY-ENGAGED: once engaged, height alone holds it (the pose/dwell gate is
+    #    only for ACQUIRING). Snappy disengage lives in the controller. ──────────
+    if currently_engaged:
+        return EngageVerdict(engaged=lift_ok, priming=False, prime=0.0)
+
+    # ── ARMED (relaxed): height-only, held for a short debounce. Responsive by
+    #    design — the owner explicitly asked for the cursor. No priming ring. ────
+    if armed and arm_relaxes_gate:
+        if not lift_ok:
+            return EngageVerdict(engaged=False, priming=False, prime=0.0)
+        engaged = arm_debounce_elapsed >= max(0.0, float(arm_debounce_sec))
+        return EngageVerdict(engaged=engaged, priming=False, prime=0.0)
+
+    # ── PASSIVE strict smart pose (also armed-but-not-relaxed): the full pose must
+    #    hold for the dwell. Publish the dwell PROGRESS while priming. ───────────
+    pose_ok = _pose_ok_passive(
+        lift_ok=lift_ok, grip=grip, facing_deg=facing_deg,
+        hand_still=hand_still, require_open_palm=require_open_palm,
+        facing_max_deg=facing_max_deg)
+    if not pose_ok:
+        return EngageVerdict(engaged=False, priming=False, prime=0.0)
+    d = max(1e-6, float(dwell_sec))
+    prog = max(0.0, min(1.0, float(dwell_elapsed) / d))
+    if dwell_elapsed >= float(dwell_sec):
+        return EngageVerdict(engaged=True, priming=False, prime=0.0)
+    return EngageVerdict(engaged=False, priming=True, prime=prog)
+
+
 # ─── AUTO-YIELD to real input (the air-mouse never fights the real mouse) ─────
 # A low-level input hook (skills/_air_mouse_yield) timestamps the last REAL
 # (non-injected) hardware mouse/keyboard event. While real input happened within
@@ -638,16 +873,21 @@ class AirMouseDecision:
                the preview hand-circle), None while disengaged.
       grip:    the controlling hand's debounced stable grip ("open"/"closed") —
                drives the preview circle colour + diagnostics.
+      prime:   float in [0.0, 1.0] — the PASSIVE engage-dwell PROGRESS while the
+               smart pose is being HELD toward engage (0 at pose-start → 1 at
+               engage); 0.0 when idle or already engaged. Published in the overlay
+               state so the HUD can draw a filling priming ring.
     """
-    __slots__ = ("cursor", "left", "right", "overlay", "hand", "grip")
+    __slots__ = ("cursor", "left", "right", "overlay", "hand", "grip", "prime")
 
-    def __init__(self, cursor, left, right, overlay, hand, grip):
+    def __init__(self, cursor, left, right, overlay, hand, grip, prime=0.0):
         self.cursor = cursor
         self.left = left
         self.right = right
         self.overlay = overlay
         self.hand = hand
         self.grip = grip
+        self.prime = max(0.0, min(1.0, float(prime)))
 
     @property
     def button_edges(self):
@@ -663,7 +903,7 @@ class AirMouseDecision:
     def __repr__(self):   # pragma: no cover - debug aid
         return (f"AirMouseDecision(cursor={self.cursor}, left={self.left!r}, "
                 f"right={self.right!r}, overlay={self.overlay!r}, "
-                f"hand={self.hand!r}, grip={self.grip!r})")
+                f"hand={self.hand!r}, grip={self.grip!r}, prime={self.prime:.2f})")
 
 
 class ArmExtension:
@@ -921,7 +1161,15 @@ class AirMouseController:
                  switch_frames: int = HAND_SWITCH_FRAMES,
                  engage_debounce_frames: int = AIR_MOUSE_ENGAGE_DEBOUNCE_FRAMES,
                  untracked_ceiling_sec: float = AIR_MOUSE_UNTRACKED_CEILING_SEC,
-                 retrack_frames: int = AIR_MOUSE_RETRACK_FRAMES):
+                 retrack_frames: int = AIR_MOUSE_RETRACK_FRAMES,
+                 dwell_sec: "Optional[float]" = None,
+                 still_m: "Optional[float]" = None,
+                 arm_debounce_sec: "Optional[float]" = None,
+                 fist_release_sec: "Optional[float]" = None,
+                 require_open_palm: "Optional[bool]" = None,
+                 facing_max_deg: "Optional[float]" = None,
+                 arm_relaxes_gate: "Optional[bool]" = None,
+                 fist_releases: "Optional[bool]" = None):
         self.reach = reach
         self._ema_x = EMA(alpha)
         self._ema_y = EMA(alpha)
@@ -964,6 +1212,55 @@ class AirMouseController:
         self._retrack_streak = 0         # consecutive fully-Tracked frames
         self._last_frame_at: Optional[float] = None   # clock() of the prior frame
 
+        # ── SMART-ENGAGE (2026-07): the PASSIVE strict smart-pose gate + the ARMED
+        #    relaxed gate + the fist-release timer. Knobs default to the live
+        #    core.config values (resolved once at construction; None → default), so
+        #    a plainly-constructed controller uses the shipped policy and a test can
+        #    pin any of them. The pure engage_decision() does the actual gate math;
+        #    the controller only measures the timers + stillness it needs. ─────────
+        self._dwell_sec = (float(dwell_sec) if dwell_sec is not None
+                           else _cfg_float("AIR_MOUSE_ENGAGE_DWELL_SEC",
+                                           AIR_MOUSE_ENGAGE_DWELL_SEC))
+        self._still_m = (float(still_m) if still_m is not None
+                         else _cfg_float("AIR_MOUSE_ENGAGE_STILL_M",
+                                         AIR_MOUSE_ENGAGE_STILL_M))
+        self._arm_debounce_sec = (
+            float(arm_debounce_sec) if arm_debounce_sec is not None
+            else _cfg_float("AIR_MOUSE_ARM_ENGAGE_DEBOUNCE_SEC",
+                            AIR_MOUSE_ARM_ENGAGE_DEBOUNCE_SEC))
+        self._fist_release_sec = (
+            float(fist_release_sec) if fist_release_sec is not None
+            else _cfg_float("AIR_MOUSE_FIST_RELEASE_SEC",
+                            AIR_MOUSE_FIST_RELEASE_SEC))
+        self._require_open_palm = (
+            bool(require_open_palm) if require_open_palm is not None
+            else bool(_cfg_flag("AIR_MOUSE_REQUIRE_OPEN_PALM",
+                                AIR_MOUSE_REQUIRE_OPEN_PALM)))
+        self._facing_max_deg = (
+            float(facing_max_deg) if facing_max_deg is not None
+            else _cfg_float("AIR_MOUSE_FACING_MAX_DEG", AIR_MOUSE_FACING_MAX_DEG))
+        self._arm_relaxes_gate = (
+            bool(arm_relaxes_gate) if arm_relaxes_gate is not None
+            else bool(_cfg_flag("AIR_MOUSE_ARM_RELAXES_GATE",
+                                AIR_MOUSE_ARM_RELAXES_GATE)))
+        self._fist_releases = (
+            bool(fist_releases) if fist_releases is not None
+            else bool(_cfg_flag("AIR_MOUSE_FIST_RELEASES", AIR_MOUSE_FIST_RELEASES)))
+        # Priming state (the smart-pose dwell). _pose_started_at is the clock() when
+        # the CURRENT continuous valid pose began (None when no pose held); the dwell
+        # elapsed = now - that. _prime is the last progress published (0..1).
+        self._pose_started_at: Optional[float] = None
+        self._arm_pose_started_at: Optional[float] = None  # ARMED height-hold start
+        self._prime = 0.0
+        # Stillness: the hand position at pose-start + the max travel seen since, so
+        # a hand that drifts past the still bar during the dwell breaks priming.
+        self._pose_anchor_xy: Optional[tuple] = None
+        self._pose_travel = 0.0
+        # FIST-RELEASE timer: clock() when the controlling hand's stable grip first
+        # went CLOSED while engaged (None when open); a sustained close past
+        # _fist_release_sec force-disengages when _fist_releases is on.
+        self._fist_closed_at: Optional[float] = None
+
     def reset(self) -> None:
         """Drop all smoothing + grip + engage state. Used by the dead-man and on
         disable so the next reach starts clean (no cursor sweep from a stale
@@ -986,6 +1283,14 @@ class AirMouseController:
         self._untracked_accum = 0.0
         self._retrack_streak = 0
         self._last_frame_at = None
+        # SMART-ENGAGE: drop the priming dwell + stillness + fist-release timers so
+        # the next acquisition starts a fresh pose/dwell.
+        self._pose_started_at = None
+        self._arm_pose_started_at = None
+        self._prime = 0.0
+        self._pose_anchor_xy = None
+        self._pose_travel = 0.0
+        self._fist_closed_at = None
 
     @property
     def button_is_down(self) -> bool:
@@ -1034,23 +1339,32 @@ class AirMouseController:
         self._untracked_accum = 0.0
         self._retrack_streak = 0
         self._last_frame_at = None
+        # SMART-ENGAGE: a full release also drops the priming dwell + fist timer so
+        # the next acquisition re-primes from scratch (no stale progress ring).
+        self._pose_started_at = None
+        self._arm_pose_started_at = None
+        self._prime = 0.0
+        self._pose_anchor_xy = None
+        self._pose_travel = 0.0
+        self._fist_closed_at = None
         self._ema_x.reset()
         self._ema_y.reset()
         self._grip_left.reset(initial="open")
         self._grip_right.reset(initial="open")
         return AirMouseDecision(cursor=None, left=left, right=right,
-                                overlay="hidden", hand=None, grip="open")
+                                overlay="hidden", hand=None, grip="open", prime=0.0)
 
-    def _hold_off_decision(self) -> AirMouseDecision:
-        """The ENGAGE-DEBOUNCE 'not yet' decision (FIX 3): a hand is raised above the
-        engage line but hasn't held there long enough to take the cursor. Like a
-        disengaged frame — cursor=None (NO SetCursorPos, the physical mouse is free)
-        and the overlay hidden — but WITHOUT touching the grip debouncers / EMA (we
-        haven't engaged, so there's nothing to release and no edge to emit). The
-        engage streak (advanced by the caller) is preserved so the next frame can
-        cross the threshold."""
+    def _hold_off_decision(self, prime: float = 0.0) -> AirMouseDecision:
+        """The ENGAGE hold-off 'not yet' decision: a hand is in a valid engage pose
+        but hasn't held long enough (the ARMED short debounce or the PASSIVE dwell)
+        to take the cursor. Like a disengaged frame — cursor=None (NO SetCursorPos,
+        the physical mouse is free) and the overlay hidden — but WITHOUT touching the
+        grip debouncers / EMA (we haven't engaged, so there's nothing to release and
+        no edge to emit). `prime` (0..1) is the PASSIVE dwell progress so the HUD can
+        draw a filling priming ring while the pose is being held."""
         return AirMouseDecision(cursor=None, left=None, right=None,
-                                overlay="hidden", hand=None, grip="open")
+                                overlay="hidden", hand=None, grip="open",
+                                prime=max(0.0, min(1.0, float(prime))))
 
     @staticmethod
     def _grip_if_tracked(ext, raw_grip: str) -> str:
@@ -1070,6 +1384,14 @@ class AirMouseController:
         the instance attribute name holding that hand's button-down flag
         ("_left_down"/"_right_down"). Returns "down"/"up"/None."""
         stable = debouncer.update(raw_grip)
+        return self._button_edge_from_stable(stable, down_attr)
+
+    def _button_edge_from_stable(self, stable: str,
+                                 down_attr: str) -> Optional[str]:
+        """Emit a hand's button edge from an ALREADY-ADVANCED stable grip (no
+        debouncer mutation). Used when the debouncer was advanced earlier this frame
+        (during priming, to read the pose grip) so the engaged frame doesn't
+        double-advance it. Returns "down"/"up"/None."""
         held = getattr(self, down_attr)
         want_down = (stable == "closed")
         if want_down and not held:
@@ -1151,7 +1473,9 @@ class AirMouseController:
 
     def update(self, left_ext, right_ext, left_grip: str, right_grip: str,
                tracked: bool, thresholds: "Optional[dict]" = None,
-               real_input_recent: bool = False, body_id=None
+               real_input_recent: bool = False, body_id=None,
+               facing_deg=None, armed: "Optional[bool]" = None,
+               per_app_disabled: bool = False
                ) -> AirMouseDecision:
         """Advance one frame.
 
@@ -1170,18 +1494,33 @@ class AirMouseController:
             PINS the body that took control (FILTER 6): once engaged it drives ONLY
             that id; if the nearest-body id CHANGES (a closer 2nd person) it is a
             tracking-loss (release + EMA reset), never a seamless retarget.
+        facing_deg: the body's yaw from square (degrees; None when unavailable) —
+            the PASSIVE gate requires |facing_deg| within the facing bar to engage;
+            None (bridge didn't provide it) is treated as facing OK.
+        armed: the ARMED flag (owner explicitly asked for the cursor → the relaxed
+            gate). None → read the module _air_mouse_armed flag live.
+        per_app_disabled: True when the FOREGROUND app matches a disabled-app hint —
+            the air-mouse STANDS DOWN (force-disengage + no engage) this frame.
 
         DISENGAGES (returns cursor=None — no SetCursorPos — and releases any held
-        button) when real input is recent (AUTO-YIELD), when the body/hand is NOT
-        tracked, when the controlling BODY-ID changed under it, when BOTH hands are
-        raised (two-hand mode pre-empt), or when NEITHER hand is raised above the
-        shoulder. A brief tracking dropout while ENGAGED is tolerated for up to the
-        grace window (button held, cursor parked) before the full release — but
-        cumulative untracked time is capped per engagement so a FLICKERING body
-        can't renew the grace forever (FILTER 7). The cursor follows the
-        highest-raised hand with HAND-HYSTERESIS (no thrash between two raised
-        hands); per-hand close→click is evaluated for BOTH hands every engaged frame
-        regardless of which one drives the cursor."""
+        button) when real input is recent (AUTO-YIELD), when the foreground app is
+        on the disabled list (per_app_disabled), when the body/hand is NOT tracked,
+        when the controlling BODY-ID changed under it, when BOTH hands are raised
+        (two-hand mode pre-empt), when a SUSTAINED closed fist while engaged fires
+        the fist-release, or when the smart-engage gate says not-engaged. A brief
+        tracking dropout while ENGAGED is tolerated for up to the grace window
+        (button held, cursor parked) before the full release — but cumulative
+        untracked time is capped per engagement so a FLICKERING body can't renew the
+        grace forever (FILTER 7).
+
+        ENGAGE is HYBRID (the pure engage_decision() decides): ARMED relaxes to a
+        height-only short-hold gate (responsive — the owner asked for it); PASSIVE
+        requires the full smart pose (raised + OPEN palm + FACING + STILL) HELD for
+        the dwell, publishing the dwell PROGRESS as `prime` for the HUD ring. The
+        cursor follows the highest-raised hand with HAND-HYSTERESIS; per-hand
+        close→click is evaluated for BOTH hands every engaged frame."""
+        if armed is None:
+            armed = air_mouse_is_armed()
         # Integrate the inter-frame gap for the FILTER 7 untracked-time cap, then
         # remember this frame's time for the next call. Done first so every return
         # path below has an up-to-date clock baseline.
@@ -1195,6 +1534,14 @@ class AirMouseController:
         #    immediately, and the air-mouse cannot re-engage until the window
         #    elapses. This is checked FIRST so it overrides a raised hand. ────────
         if real_input_recent:
+            return self.release_decision()
+        # ── PER-APP DISABLE: the foreground app is on the disabled-app list (a
+        #    fullscreen game/video, say). STAND DOWN — release + no engage, exactly
+        #    like a yield — so a stray cursor grab can't disrupt it. Defensive: the
+        #    caller already treats any win32 failure as "not disabled", so this only
+        #    fires on a positive match. Checked before the pose gate so it overrides
+        #    a valid pose. ─────────────────────────────────────────────────────────
+        if per_app_disabled:
             return self.release_decision()
         # ── tracking-loss path, with a short grace so a 1-frame dropout doesn't
         #    disengage + re-snap (a held drag must survive a flicker). ──────────
@@ -1253,17 +1600,109 @@ class AirMouseController:
         if arm is None:
             return self.release_decision()
 
-        # ── ENGAGE DEBOUNCE (FIX 3): a hand cleared the engage line, but if we're
-        #    not already engaged it must HOLD there for `_engage_debounce_frames`
-        #    consecutive frames before we take the cursor — so a 1-frame Kinect
-        #    height spike can't grab it. Build the streak; until it's met, hold off
-        #    (cursor=None, overlay hidden) and leave the real mouse alone. Once
-        #    ENGAGED this is bypassed — staying engaged uses the lower down-margin
-        #    hysteresis in is_extended(), and DISENGAGE is never debounced. ───────
+        # ── ADVANCE the grip debouncers ONCE per tracked frame (FILTER 4: an
+        #    untracked/inferred hand is fed "unknown" so it can never latch a click).
+        #    Done here — before the gate — so the PASSIVE open-palm test can read the
+        #    controlling hand's DEBOUNCED stable grip (a 1-frame flicker doesn't
+        #    matter), and so we never double-advance on the engage frame. Button
+        #    EDGES are emitted only when ENGAGED (below), from these stable grips. ──
+        left_stable = self._grip_left.update(
+            self._grip_if_tracked(left_ext, left_grip))
+        right_stable = self._grip_right.update(
+            self._grip_if_tracked(right_ext, right_grip))
+        ctrl_stable = left_stable if arm.side == "left" else right_stable
+
+        # ── HYBRID SMART-ENGAGE GATE (the pure engage_decision decides). While
+        #    DISENGAGED we measure the PASSIVE dwell + stillness (or the ARMED short
+        #    hold) that engage_decision needs; once engaged, height alone holds it.
+        relaxed = bool(armed and self._arm_relaxes_gate)
+        hand = arm.hand
+        hand_xy = (float(hand[0]), float(hand[1]), float(hand[2])
+                   if len(hand) > 2 else 0.0)
         if not self._engaged:
+            if relaxed:
+                # ARMED (relaxed): a short height-only hold. Track the hold start.
+                if self._arm_pose_started_at is None:
+                    self._arm_pose_started_at = now
+                arm_elapsed = now - self._arm_pose_started_at
+                dwell_elapsed = 0.0
+                hand_still = True
+            else:
+                # PASSIVE: the smart pose must be HELD. Anchor the pose on its first
+                # frame; each frame accumulate hand TRAVEL from the anchor and hold
+                # STILL only while the summed travel is under the still bar.
+                if self._pose_started_at is None:
+                    self._pose_started_at = now
+                    self._pose_anchor_xy = hand_xy
+                    self._pose_travel = 0.0
+                else:
+                    prev = self._pose_anchor_xy or hand_xy
+                    step = ((hand_xy[0] - prev[0]) ** 2
+                            + (hand_xy[1] - prev[1]) ** 2
+                            + (hand_xy[2] - prev[2]) ** 2) ** 0.5
+                    self._pose_travel += step
+                    self._pose_anchor_xy = hand_xy
+                arm_elapsed = 0.0
+                dwell_elapsed = now - self._pose_started_at
+                hand_still = self._pose_travel <= self._still_m
+        else:
+            arm_elapsed = 0.0
+            dwell_elapsed = 0.0
+            hand_still = True
+
+        # The lift already passed _select_controlling_arm (that IS the height gate
+        # with hysteresis), so lift_ok is True here; the pure gate adds pose/dwell.
+        # LEGACY FRAME DEBOUNCE bridge: a controller built the old way (with
+        # engage_debounce_frames) — or a test that never advances a clock — engages
+        # after that many valid-pose frames even if the wall-clock dwell hasn't
+        # elapsed. Credit each held frame a slice of the dwell so both the
+        # frame-count policy and the time policy agree; the larger wins.
+        if not self._engaged and not relaxed:
             self._engage_streak += 1
-            if self._engage_streak < self._engage_debounce_frames:
-                return self._hold_off_decision()
+            frame_credit = (self._dwell_sec
+                            * (self._engage_streak / self._engage_debounce_frames)
+                            if self._engage_debounce_frames > 0 else self._dwell_sec)
+            dwell_elapsed = max(dwell_elapsed, frame_credit)
+
+        verdict = engage_decision(
+            lift_ok=True, currently_engaged=self._engaged, armed=bool(armed),
+            grip=ctrl_stable, facing_deg=facing_deg, hand_still=hand_still,
+            dwell_elapsed=dwell_elapsed, arm_debounce_elapsed=arm_elapsed,
+            require_open_palm=self._require_open_palm,
+            facing_max_deg=self._facing_max_deg, dwell_sec=self._dwell_sec,
+            arm_debounce_sec=self._arm_debounce_sec,
+            arm_relaxes_gate=self._arm_relaxes_gate)
+
+        if not verdict.engaged:
+            # Not (yet) engaged this frame. Three cases:
+            #   1) PASSIVE priming — a valid pose filling toward the dwell: hold off
+            #      and publish the dwell PROGRESS for the HUD ring.
+            #   2) ARMED valid-hold — lift is up (arm selected) and the relaxed gate
+            #      is just waiting out its SHORT debounce: hold off WITHOUT resetting
+            #      the arm timer, so the next frame can cross it.
+            #   3) INVALID pose (wrong grip / not facing / moving, or passive with no
+            #      hold started): reset the dwell + arm timers so a fresh hold must
+            #      start, and stand down (releasing if we had been engaged).
+            if verdict.priming:
+                self._prime = verdict.prime
+                return self._hold_off_decision(prime=verdict.prime)
+            if relaxed and not self._engaged:
+                # ARMED, lift up, waiting for the short debounce — keep the timer.
+                self._prime = 0.0
+                self._pose_started_at = None
+                self._pose_anchor_xy = None
+                self._pose_travel = 0.0
+                return self._hold_off_decision(prime=0.0)
+            # Invalid pose → drop all priming state (a new hold restarts the dwell).
+            self._pose_started_at = None
+            self._arm_pose_started_at = None
+            self._pose_anchor_xy = None
+            self._pose_travel = 0.0
+            self._prime = 0.0
+            if self._engaged:
+                # Was engaged but the (armed) gate dropped lift → full release.
+                return self.release_decision()
+            return self._hold_off_decision(prime=0.0)
 
         # ── ENGAGED. On the rising edge (was disengaged) snap the smoothing to
         #    the new hand position so the cursor doesn't sweep from a stale value,
@@ -1274,43 +1713,48 @@ class AirMouseController:
             self._ema_y.reset()
             self._locked_body_id = body_id
             self._untracked_accum = 0.0   # fresh untracked budget for this grab
+            self._fist_closed_at = None   # fresh fist-release timer this grab
         self._engaged = True
         self._engage_streak = 0       # met the bar; clear so a later re-engage re-debounces
+        self._prime = 0.0             # engaged → nothing to prime
+        self._pose_started_at = None
+        self._arm_pose_started_at = None
         self._hand = arm.side
         self._last_engaged_at = now
+
+        # ── FIST-RELEASE (AIR_MOUSE_FIST_RELEASES): a SUSTAINED closed fist on the
+        #    controlling hand while engaged is an explicit "let go" — force-disengage
+        #    without lowering the hand. Timed (AIR_MOUSE_FIST_RELEASE_SEC) so a normal
+        #    click / short drag never trips it. Uses the DEBOUNCED stable grip. ──────
+        if self._fist_releases:
+            if ctrl_stable == "closed":
+                if self._fist_closed_at is None:
+                    self._fist_closed_at = now
+                elif (now - self._fist_closed_at) >= self._fist_release_sec:
+                    # Held a fist long enough → release everything, stand down.
+                    return self.release_decision()
+            else:
+                self._fist_closed_at = None
 
         # Smooth the controlling hand's position, then map to a pixel.
         # (REVERTED 2026-06-09: the v1.73.0 body-relative/absolute "tablet" remap was
         # jittery + unwanted — back to the plain fixed-reach-box map(sx, sy).)
-        hand = arm.hand
         sx = self._ema_x.update(float(hand[0]))
         sy = self._ema_y.update(float(hand[1]))
         cursor = self.reach.map(sx, sy)
 
         # Per-hand clicks: evaluate BOTH hands every engaged frame so either hand
         # can click regardless of which drives the cursor. LEFT hand → LEFT
-        # button, RIGHT hand → RIGHT button.
-        #
-        # CLICK TRACKING-STATE FLOOR (FILTER 4): only a hand the Kinect ACTUALLY
-        # SEES may press/hold a button. For each hand, if its JOINT isn't
-        # sensor-tracked (TrackingState >= 2 — i.e. it's an INFERRED / phantom 2nd
-        # hand, or its arm couldn't be read at all) feed the debouncer "unknown"
-        # instead of the raw grip. _canon maps "unknown" to "no evidence" → the
-        # debouncer HOLDS its current state (no down-edge on an untracked hand; a
-        # genuine in-progress drag isn't dropped by a 1-frame loss either — the
-        # dead-man owns release). So an inferred hand reading "closed" can never
-        # fire a click.
-        left_edge = self._hand_button_edge(
-            self._grip_left, self._grip_if_tracked(left_ext, left_grip),
-            "_left_down")
-        right_edge = self._hand_button_edge(
-            self._grip_right, self._grip_if_tracked(right_ext, right_grip),
-            "_right_down")
+        # button, RIGHT hand → RIGHT button. The debouncers were ALREADY advanced
+        # this frame (above), so emit edges from their stable grips WITHOUT
+        # re-advancing (no double-advance).
+        left_edge = self._button_edge_from_stable(left_stable, "_left_down")
+        right_edge = self._button_edge_from_stable(right_stable, "_right_down")
 
         overlay = "grab" if self.button_is_down else "track"
         return AirMouseDecision(cursor=cursor, left=left_edge, right=right_edge,
                                 overlay=overlay, hand=arm.side,
-                                grip=self._controlling_grip())
+                                grip=self._controlling_grip(), prime=0.0)
 
     def _controlling_grip(self) -> str:
         """The stable grip of whichever hand is driving the cursor (for the
@@ -1374,28 +1818,43 @@ def hand_circle_color_for(engaged: bool, grip: str) -> "tuple[int, int, int] | N
 # hand-circle colour + which hand to draw it on; stale reads paint the last state.
 _air_mouse_state_lock = threading.Lock()
 _air_mouse_state: dict = {"engaged": False, "hand": None, "grip": "open",
-                          "ts": 0.0}
+                          "prime": 0.0, "armed": False, "ts": 0.0}
 
 
 def _set_air_mouse_state(engaged: bool, grip: str,
-                         hand: "str | None" = None) -> None:
-    """Publish the live engage state + which hand + grip for the preview
-    (thread-safe)."""
+                         hand: "str | None" = None,
+                         prime: float = 0.0) -> None:
+    """Publish the live engage state + which hand + grip + PRIME (the passive
+    engage-dwell progress, 0..1) + armed flag for the preview (thread-safe)."""
     with _air_mouse_state_lock:
         _air_mouse_state["engaged"] = bool(engaged)
         _air_mouse_state["hand"] = hand
         _air_mouse_state["grip"] = (grip or "open")
+        _air_mouse_state["prime"] = max(0.0, min(1.0, float(prime)))
+        _air_mouse_state["armed"] = air_mouse_is_armed()
         _air_mouse_state["ts"] = time.time()
 
 
 def get_air_mouse_state() -> dict:
     """Thread-safe snapshot {'engaged': bool, 'hand': str|None, 'grip': str,
-    'ts': float} of the air-mouse. Read by the HUD skeleton preview to colour the
-    hand circle (engaged→blue, closed→orange, off→grey) and place it on the
-    controlling hand. Returns a COPY so the caller can't mutate the shared dict.
-    Never raises."""
+    'prime': float, 'armed': bool, 'ts': float} of the air-mouse. Read by the HUD
+    skeleton preview to colour the hand circle (engaged→blue, closed→orange,
+    off→grey), place it on the controlling hand, and (via `prime`) draw the passive
+    engage-dwell priming ring (0 at pose-start → 1 at engage; 0 when idle/engaged).
+    Returns a COPY so the caller can't mutate the shared dict. Never raises."""
     with _air_mouse_state_lock:
         return dict(_air_mouse_state)
+
+
+def get_air_mouse_prime() -> float:
+    """The current PASSIVE engage-dwell PROGRESS (0.0..1.0) — 0 when idle or already
+    engaged, filling toward 1 while a valid smart pose is being held. Cheap
+    thread-safe read for the HUD priming ring. NEVER raises."""
+    try:
+        with _air_mouse_state_lock:
+            return float(_air_mouse_state.get("prime", 0.0) or 0.0)
+    except Exception:
+        return 0.0
 
 
 # ── TWO-HAND mode hand-off (skills/kinect_two_hand.py) ──────────────────────
@@ -1666,25 +2125,45 @@ def _mouse_button(action: str, button: str = "left") -> bool:
 
 
 # ─── overlay state publishing + spawn ──────────────────────────────────────
-def _publish_overlay_state(decision: AirMouseDecision, visible: bool) -> None:
+def _publish_overlay_state(decision: AirMouseDecision, visible: bool,
+                           prime_xy: "Optional[tuple]" = None) -> None:
     """Write the live cursor + reticle state to AIR_CURSOR_STATE_FILE for the
     overlay process. Atomic-ish (write then it's a tiny file); best-effort and
     silent on failure — the overlay just renders the last good frame.
 
-    Shape: {"x": int, "y": int, "state": "track"|"grab"|"hidden",
-            "color": "cyan"|"gold", "ts": <epoch>, "visible": bool}"""
+    Shape: {"x": int, "y": int, "state": "track"|"grab"|"hidden"|"prime",
+            "color": "cyan"|"gold", "ts": <epoch>, "visible": bool,
+            "prime": float in [0,1]}
+
+    SHARED CONTRACT (2026-07): `prime` is the PASSIVE engage-dwell PROGRESS — 0 at
+    pose-start → 1 at engage while priming, 0.0 when idle or already engaged — so
+    the overlay can draw a FILLING priming ring. While priming the cursor isn't
+    moved (decision.cursor is None), but `prime_xy` (the projected hand pixel) lets
+    the overlay position the ring at the hand; the state is "prime" and visible so
+    the ring shows without a solid reticle."""
     try:
         import json
+        prime = getattr(decision, "prime", 0.0) or 0.0
+        priming = prime > 0.0 and decision.cursor is None
         if decision.cursor is not None:
             x, y = decision.cursor
+        elif priming and prime_xy is not None:
+            x, y = prime_xy   # position the priming ring at the hand
         else:
             x, y = -10000, -10000   # off-screen sentinel; overlay hides anyway
-        state = decision.overlay if visible else "hidden"
+        if priming:
+            # PRIMING: show the filling ring at the hand, but no solid reticle.
+            state = "prime"
+            vis = bool(visible)
+        else:
+            state = decision.overlay if visible else "hidden"
+            vis = bool(visible and state != "hidden")
         data = {
             "x": int(x), "y": int(y),
             "state": state,
             "color": overlay_color_for(state),
-            "visible": bool(visible and state != "hidden"),
+            "visible": vis,
+            "prime": max(0.0, min(1.0, float(prime))),
             "ts": time.time(),
         }
         with open(AIR_CURSOR_STATE_FILE, "w", encoding="utf-8") as f:
@@ -1695,12 +2174,14 @@ def _publish_overlay_state(decision: AirMouseDecision, visible: bool) -> None:
 
 def _clear_overlay_state() -> None:
     """Publish a hidden/blank overlay state (used when the air-mouse turns off or
-    the hand is lost) so the reticle disappears promptly."""
+    the hand is lost) so the reticle disappears promptly. prime 0 — nothing to
+    prime while cleared."""
     try:
         import json
         with open(AIR_CURSOR_STATE_FILE, "w", encoding="utf-8") as f:
             json.dump({"x": -10000, "y": -10000, "state": "hidden",
-                       "color": "cyan", "visible": False, "ts": time.time()}, f)
+                       "color": "cyan", "visible": False, "prime": 0.0,
+                       "ts": time.time()}, f)
     except Exception:
         pass
 
@@ -1976,6 +2457,33 @@ def _arm_extension(bridge, joints: dict, side: str) -> "ArmExtension":
 # survives across calls; None when no body was in view this tick.
 _last_body_id: list = [None]
 
+# The NEAREST body's FACING yaw (|degrees from square|) from the most recent
+# _hand_sample(), stashed like _last_body_id so _poll_once can feed the PASSIVE
+# smart-engage facing gate WITHOUT changing _hand_sample's return arity. None when
+# the bridge didn't provide facing (older build / not measurable) — the gate treats
+# a None facing as "facing OK" so it never becomes an un-passable gate.
+_last_facing_deg: list = [None]
+
+
+def _body_facing_deg(body: dict) -> "Optional[float]":
+    """|facing yaw| in degrees from square for a bridge body dict, or None when
+    unavailable. Prefers the numeric "facing_yaw_deg" (0=square, ±=left/right);
+    falls back to the boolean "facing" (True → 0° i.e. squarely facing, so it
+    passes the gate; False → a large angle so it fails). None when neither is
+    present. PURE; NEVER raises."""
+    try:
+        yaw = body.get("facing_yaw_deg")
+        if isinstance(yaw, (int, float)):
+            return abs(float(yaw))
+        facing = body.get("facing")
+        if facing is True:
+            return 0.0            # squarely facing → passes the facing gate
+        if facing is False:
+            return 180.0          # turned away → fails any sane facing bar
+    except Exception:
+        return None
+    return None
+
 
 def _hand_sample(bridge) -> tuple["Optional[ArmExtension]", "Optional[ArmExtension]",
                                   str, str, bool]:
@@ -1992,6 +2500,7 @@ def _hand_sample(bridge) -> tuple["Optional[ArmExtension]", "Optional[ArmExtensi
     disengaged)."""
     none_result = (None, None, "unknown", "unknown", False)
     _last_body_id[0] = None
+    _last_facing_deg[0] = None
     try:
         if not bridge.get_enabled():
             return none_result
@@ -2018,6 +2527,12 @@ def _hand_sample(bridge) -> tuple["Optional[ArmExtension]", "Optional[ArmExtensi
         _last_body_id[0] = body.get("id")
     except Exception:
         _last_body_id[0] = None
+    # Stash the body's FACING yaw for the PASSIVE smart-engage facing gate (None
+    # when unavailable → treated as facing OK downstream).
+    try:
+        _last_facing_deg[0] = _body_facing_deg(body)
+    except Exception:
+        _last_facing_deg[0] = None
 
     joints = body.get("joints") or {}
     left_grip = (body.get("hand_left") or "unknown").lower()
@@ -2108,6 +2623,91 @@ def _persist_reach_thresholds(th: dict) -> bool:
     ok = _persist_setting(SETTING_STRAIGHT_DISENGAGE,
                           float(th["straight_disengage"])) and ok
     return ok
+
+
+# ─── PER-APP AUTO-DISABLE (stand down over fullscreen games / video) ─────────
+# The air-mouse STANDS DOWN whenever the FOREGROUND window's title/class matches a
+# disabled-app hint (AIR_MOUSE_DISABLED_APP_HINTS) — e.g. a fullscreen game or
+# video where a stray cursor grab would be disruptive. The MATCH is a pure,
+# unit-testable function; the live read reuses kinect_two_hand's foreground
+# helpers (single source of truth for the win32 GetForegroundWindow / class /
+# title wrappers). Defensive: any win32 failure is treated as NOT disabled, so a
+# glitch never accidentally kills the mouse.
+
+def app_is_disabled(title: str, class_name: str,
+                    hints: "Optional[list]" = None) -> bool:
+    """PURE: does the foreground window's TITLE or CLASS contain any disabled-app
+    hint (case-insensitive substring)? `hints` defaults to the live
+    AIR_MOUSE_DISABLED_APP_HINTS. Empty/whitespace title+class → False (nothing to
+    match). NEVER raises (a non-string degrades to empty)."""
+    try:
+        if hints is None:
+            hints = _cfg("AIR_MOUSE_DISABLED_APP_HINTS",
+                         AIR_MOUSE_DISABLED_APP_HINTS)
+        hay = ((str(title or "") + " " + str(class_name or "")).lower())
+        if not hay.strip():
+            return False
+        for h in (hints or []):
+            h = (str(h or "")).strip().lower()
+            if h and h in hay:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _foreground_title_class() -> "tuple[str, str]":
+    """(title, class_name) of the current FOREGROUND window, reusing
+    kinect_two_hand's win32 helpers (the codebase's foreground helper). ("", "") on
+    any failure / off Windows. NEVER raises."""
+    try:
+        from skills import kinect_two_hand as _kt
+    except Exception:
+        try:
+            import kinect_two_hand as _kt   # isolated-skill import fallback
+        except Exception:
+            return "", ""
+    try:
+        hwnd = _kt._get_foreground_hwnd()
+        if not hwnd:
+            return "", ""
+        title = _kt._window_title(hwnd) or ""
+        cls = _kt._window_class_name(hwnd) or ""
+        return title, cls
+    except Exception:
+        return "", ""
+
+
+def _per_app_disabled() -> bool:
+    """True when the air-mouse should STAND DOWN because the foreground app matches
+    a disabled-app hint. Gated on AIR_MOUSE_PER_APP_DISABLE (read live). DEFENSIVE:
+    any win32/read failure → False (never accidentally kills the mouse). NEVER
+    raises."""
+    try:
+        if not _cfg_flag("AIR_MOUSE_PER_APP_DISABLE", AIR_MOUSE_PER_APP_DISABLE):
+            return False
+        title, cls = _foreground_title_class()
+        return app_is_disabled(title, cls)
+    except Exception:
+        return False
+
+
+def _priming_cursor(ctrl: "AirMouseController", left_ext, right_ext
+                    ) -> "Optional[tuple]":
+    """The projected cursor pixel for the PRIMING ring — the highest-raised arm's
+    hand mapped through the reach box (WITHOUT moving the real cursor). Best-effort;
+    None when no usable arm. The overlay draws the filling ring here so it sits on
+    the hand the owner is priming with. NEVER raises."""
+    try:
+        arms = [a for a in (left_ext, right_ext)
+                if a is not None and a.hand is not None]
+        if not arms:
+            return None
+        arm = max(arms, key=lambda a: a.reach_score())
+        h = arm.hand
+        return ctrl.reach.map(float(h[0]), float(h[1]))
+    except Exception:
+        return None
 
 
 def _apply_decision(decision: AirMouseDecision) -> None:
@@ -2220,10 +2820,18 @@ def _poll_once(ctrl: AirMouseController, bridge) -> Optional[AirMouseDecision]:
     # PINS the controlling body and releases — rather than silently retargets — if
     # a closer 2nd person steals the "nearest" slot mid-drag (FILTER 6).
     body_id = _last_body_id[0]
+    # The body's FACING yaw (|deg from square|, or None) for the PASSIVE smart-pose
+    # facing gate; the module ARMED flag (relaxed gate when the owner asked for the
+    # cursor); and the PER-APP disable (stand down over a fullscreen game/video).
+    facing_deg = _last_facing_deg[0]
+    armed = air_mouse_is_armed()
+    per_app_disabled = _per_app_disabled()
     try:
         decision = ctrl.update(left_ext, right_ext, left_grip, right_grip,
                                tracked, thresholds=thresholds,
-                               real_input_recent=yielding, body_id=body_id)
+                               real_input_recent=yielding, body_id=body_id,
+                               facing_deg=facing_deg, armed=armed,
+                               per_app_disabled=per_app_disabled)
     except Exception:
         # A controller error must not strand a held button — force a release.
         try:
@@ -2260,20 +2868,27 @@ def _poll_once(ctrl: AirMouseController, bridge) -> Optional[AirMouseDecision]:
     # Enabled + not staging: act.
     _disabled_state_published[0] = False
     _apply_decision(decision)
-    visible = tracked and decision.overlay != "hidden"
+    priming = getattr(decision, "prime", 0.0) > 0.0 and decision.cursor is None
+    # While PRIMING the reticle isn't shown (no cursor move), but the overlay draws
+    # a filling ring at the hand — so it's "visible" for the ring even though the
+    # decision overlay is hidden. Project the priming hand to a pixel for the ring.
+    visible = (tracked and (decision.overlay != "hidden" or priming))
+    prime_xy = _priming_cursor(ctrl, left_ext, right_ext) if priming else None
     # STAND DOWN on the overlay file too: while two-hand mode is active its
     # poller owns AIR_CURSOR_STATE_FILE (dual reticles). Publishing our hidden
     # frames at ~30 Hz alongside it makes the overlay strobe between dual-
     # reticle and hidden depending on which writer landed last — so stay quiet;
     # the two-hand skill edge-clears the file itself when its mode ends.
     if not two_hand:
-        _publish_overlay_state(decision, visible)
-    # Publish the LIVE engage state + which hand + grip for the HUD skeleton
+        _publish_overlay_state(decision, visible, prime_xy=prime_xy)
+    # Publish the LIVE engage state + which hand + grip + PRIME for the HUD skeleton
     # preview's hand circle (B2): engaged→blue, closed→orange, disengaged→grey,
-    # drawn on the controlling hand. Read off the controller (engaged + hand) +
-    # the decision (grip) so the preview colour matches the cursor/reticle.
+    # drawn on the controlling hand; the passive dwell PROGRESS drives the priming
+    # ring. Read off the controller (engaged + hand) + the decision (grip + prime)
+    # so the preview colour + ring match the cursor/reticle.
     try:
-        _set_air_mouse_state(bool(ctrl.engaged), decision.grip, ctrl.hand)
+        _set_air_mouse_state(bool(ctrl.engaged), decision.grip, ctrl.hand,
+                             prime=getattr(decision, "prime", 0.0))
     except Exception:
         pass
     # Keep the reticle overlay process alive while enabled.
@@ -2456,6 +3071,56 @@ def air_mouse_status(_: str = "") -> str:
             f"view at the moment. Raise a hand above your shoulder and {how}.")
 
 
+# ─── ARM / DISARM (the hybrid voice-arm mode) ────────────────────────────────
+def air_mouse_arm_action(_: str = "") -> str:
+    """ARM the air-mouse — the owner explicitly asked for the cursor, so relax the
+    strict PASSIVE smart-pose gate to the RESPONSIVE armed gate (height-only + a
+    short hold; no open-palm/facing/still/dwell required). Also ensures the feature
+    is ON (an explicit "take the cursor" IS consent) so a raised hand actually
+    drives. 'mouse control on' / 'take the cursor' / 'give me the cursor' /
+    'hand mouse on'. NEVER raises out."""
+    air_mouse_arm()
+    # Arming implies wanting control now — make sure the master flag is on so a
+    # raised hand actually moves the cursor (mirrors air_control_on's consent
+    # model). If it was already on this is a harmless re-persist.
+    was_on = _cfg_flag("KINECT_AIR_MOUSE_ENABLED")
+    persisted = True
+    if not was_on:
+        persisted = _set_enabled(True)
+    ready, why = _sensor_ready()
+    sensor_note = ("" if ready
+                   else f" Note {why} — enable the Kinect so I can see your hand.")
+    msg = ("Mouse control armed, sir — raise a hand above your shoulder and I'll "
+           "take the cursor right away; close your left hand to left-click, your "
+           "right to right-click, and touch your real mouse to yield.")
+    if not persisted:
+        msg += " (I couldn't save the enable, so it'll revert on restart.)"
+    return msg + sensor_note
+
+
+def air_mouse_disarm_action(_: str = "") -> str:
+    """DISARM the air-mouse — return to the PASSIVE strict smart-pose gate (open
+    palm + facing + brief hold), so a casual raised/reaching hand no longer grabs
+    the cursor. This does NOT turn the feature off (that's 'air-mouse off'); it
+    just makes engaging deliberate again. Also releases any held button + clears
+    the reticle so nothing is stranded. 'mouse control off' / 'release the cursor' /
+    'hand mouse off'. NEVER raises out."""
+    air_mouse_disarm()
+    # Let go of anything currently held so disarming can't strand a button, and
+    # hide the reticle promptly.
+    try:
+        _mouse_button("up", "left")
+        _mouse_button("up", "right")
+    except Exception:
+        pass
+    try:
+        _clear_overlay_state()
+    except Exception:
+        pass
+    return ("Mouse control released, sir — I'll only take the cursor now on a "
+            "deliberate open-palm hold. Say 'air-mouse off' to disable it entirely.")
+
+
 def calibrate_air_mouse(_: str = "") -> str:
     """The CALIBRATION walk-through ('calibrate air mouse' / 'calibrate reach').
     Repurposed for the HEIGHT gate: speaks the owner through it — RAISE a hand
@@ -2517,6 +3182,17 @@ def register(actions):
     actions["air_mouse_off"] = air_mouse_off
     actions["air_mouse_status"] = air_mouse_status
     actions["calibrate_air_mouse"] = calibrate_air_mouse
+    # ARM / DISARM (hybrid voice-arm + smart pose). Canonical names + natural-
+    # language aliases sharing the same handler, so whichever token the LLM emits
+    # from "mouse control on / take the cursor / give me the cursor / hand mouse on"
+    # (and the off variants) resolves to arm/disarm.
+    actions["air_mouse_arm"] = air_mouse_arm_action
+    actions["air_mouse_disarm"] = air_mouse_disarm_action
+    for alias in ("mouse_control_on", "take_the_cursor", "give_me_the_cursor",
+                  "hand_mouse_on"):
+        actions[alias] = air_mouse_arm_action
+    for alias in ("mouse_control_off", "release_the_cursor", "hand_mouse_off"):
+        actions[alias] = air_mouse_disarm_action
 
     # Guard against duplicate pollers on skill reload (same OS-thread-name check
     # kinect_gestures / face_tracker use). The loop self-gates on
