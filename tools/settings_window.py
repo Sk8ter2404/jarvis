@@ -369,6 +369,13 @@ SCHEMA: dict[str, dict] = {
                 "the rest is still generating (faster feel; action commands "
                 "are never voiced early).",
     },
+    "STREAMING_AUTO_FULLSCREEN": {
+        "tab": "ai", "label": "Auto-fullscreen TV shows & movies", "type": "bool",
+        "default": True,
+        "help": "After a show or movie actually starts playing, send the "
+                "player fullscreen ('f' on YouTube / Netflix / Disney+ / "
+                "Prime / Hulu / Max). Off = playback starts windowed.",
+    },
     "BARGE_IN_ENABLED": {
         "tab": "voice", "label": "Barge-in (interrupt him by voice)",
         "type": "bool", "default": True,

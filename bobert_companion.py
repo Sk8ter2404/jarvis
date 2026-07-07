@@ -12276,8 +12276,11 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
         )
 
     # Work on a COPY so per-call mutations (vision_monitor, etc.) never leak
-    # into the shared _STREAMING_SERVICES template.
+    # into the shared _STREAMING_SERVICES template. Stamp the service_key onto
+    # the copy so the fullscreen step can look up THIS service's recorded media
+    # window (_JARVIS_MEDIA_WINDOW_HWND) and send 'f' to exactly that window.
     cfg = dict(cfg)
+    cfg["service_key"] = service_key
     q = query.strip()
     service_label = cfg["name"]
 
@@ -12306,6 +12309,10 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
             _hp_hwnd = getattr(_hp_win, "_hWnd", None) if _hp_win is not None else None
             if _hp_hwnd is not None:
                 _JARVIS_MEDIA_WINDOW_HWND[service_key] = _hp_hwnd
+                # Same on-screen-maximize as the query path: the homepage window
+                # JARVIS just opened must not land with its title bar off the
+                # top of a negative-origin monitor. Only the recorded handle.
+                _ensure_window_visible_maximized(_hp_hwnd)
         return f"opened {service_label}"
 
     # Step 1: choose the page to open and how to select the result.
@@ -12386,6 +12393,19 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
                 time.sleep(0.2)
             except Exception:
                 pass
+            # Pull the window JARVIS JUST OPENED fully on-screen and maximize it
+            # ("windowed full screen"). Chrome's `--new-window` restores to its
+            # last remembered position, which on this rig's negative-origin
+            # monitors (top y=-1440 / left x=-2560) can be a few pixels ABOVE a
+            # monitor's top edge — title bar off-screen, unreachable. We only
+            # ever touch the RECORDED handle (never a title match), so a pre-
+            # existing user window is never moved. No-op / never raises on a bad
+            # handle. The 0.2s activate-sleep above already gave the window a
+            # beat to finish spawning before we read its rect. Maximize keeps
+            # the window on the SAME monitor, so the vision-monitor pin below
+            # (read AFTER this) stays correct.
+            if _hw is not None:
+                _ensure_window_visible_maximized(_hw)
             _mon = _monitor_name_for_window(_vw)
             if _mon:
                 cfg["vision_monitor"] = _mon
@@ -12502,17 +12522,53 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
     return f"playing '{q}' on {service_label}"
 
 
+def _streaming_auto_fullscreen_enabled() -> bool:
+    """Master switch (STREAMING_AUTO_FULLSCREEN in core/config.py, user_settings
+    .json-overridable). Read LIVE — fresh-imported each call, mirroring
+    _streaming_tts_enabled — so a Settings-GUI flip takes effect without a
+    restart. Defaults True if the constant is somehow unavailable."""
+    try:
+        from core.config import STREAMING_AUTO_FULLSCREEN as _flag
+    except Exception:
+        _flag = True
+    return bool(_flag)
+
+
 def _streaming_go_fullscreen(cfg: dict, service_label: str) -> None:
-    """Best-effort full-screen step after a streaming service starts playing.
-    Waits for the player to initialise, then sends the configured key (or
-    hotkey tuple). Silent no-op if the service has no shortcut or if
-    UI automation is unavailable."""
+    """Best-effort full-screen step AFTER a streaming service's playback is
+    confirmed started (the two call sites in _streaming_play_and_verify and the
+    non-strict play paths all reach here only once play has begun). Waits for
+    the player to initialise, FOCUSES the exact window JARVIS opened, then sends
+    the configured key (or hotkey tuple). Silent no-op if:
+      * the master switch STREAMING_AUTO_FULLSCREEN is off,
+      * the service has no `fullscreen_key` (None disables per-service), or
+      * UI automation is unavailable.
+
+    WHY FOCUS THE RECORDED HWND FIRST
+    ---------------------------------
+    ui_press/ui_hotkey send to whatever window is FOREGROUND. Between confirming
+    playback and this step the foreground can drift (a vision capture, the
+    user alt-tabbing), so we first pull the SPECIFIC media window JARVIS opened
+    — recorded in _JARVIS_MEDIA_WINDOW_HWND[cfg['service_key']] — to the front.
+    That guarantees the 'f' lands on the player and NEVER on some random focused
+    window. If no handle is recorded (e.g. a path that didn't capture one) we
+    fall back to the pre-existing behaviour of pressing on the current
+    foreground, which for the streaming flow is the just-activated player."""
+    if not _streaming_auto_fullscreen_enabled():
+        return
     fs_key = cfg.get("fullscreen_key")
     if not fs_key or not UI_AUTOMATION_ENABLED:
         return
     wait = float(cfg.get("fullscreen_wait", 2.5))
     try:
         time.sleep(wait)
+        # Focus ONLY the window JARVIS opened for this service (safe-handle
+        # contract — never a title match), so the fullscreen key lands on the
+        # player and not on whatever happens to be foreground.
+        _fs_hwnd = _JARVIS_MEDIA_WINDOW_HWND.get(cfg.get("service_key"))
+        if _fs_hwnd:
+            if _focus_window_hwnd(_fs_hwnd):
+                time.sleep(0.15)
         if isinstance(fs_key, (list, tuple)):
             ui_hotkey(*fs_key)
             pressed = "+".join(fs_key)
@@ -12573,7 +12629,8 @@ def _apple_music_play_playlist(name: str) -> str:
     # window left from a prior track satisfies the tab-title pre-check and
     # _streaming_play_and_verify skips the real play step, reporting a false
     # success. Mirrors the search flow's per-call cfg copy.
-    cfg = {**_STREAMING_SERVICES["apple_music"], "verify_first": False}
+    cfg = {**_STREAMING_SERVICES["apple_music"], "verify_first": False,
+           "service_key": "apple_music"}
     service_label = "Apple Music"
 
     # Step 1: open Library > Playlists directly. Skips the sidebar clicks
@@ -13417,6 +13474,238 @@ def _monitor_name_for_window(win) -> str | None:
         if mx <= cx < mx + mw and my <= cy < my + mh:
             return name
     return None
+
+
+def _focus_window_hwnd(hwnd) -> bool:
+    """Bring the window `hwnd` to the foreground so a subsequent keypress lands
+    on it. Returns True if focus was attempted on a real window, False on a
+    bad/0 handle or when no windowing backend is available. NEVER raises.
+
+    Used before the streaming fullscreen keypress so 'f' hits the exact media
+    window JARVIS opened (recorded hwnd) instead of whatever is foreground. Uses
+    pygetwindow's activate() to match _focus_music_window, tolerating the
+    benign 'operation completed successfully' pseudo-error Win32 sometimes
+    surfaces from SetForegroundWindow."""
+    try:
+        h = int(hwnd)
+    except (TypeError, ValueError):
+        return False
+    if h == 0:
+        return False
+    try:
+        import pygetwindow as gw
+    except Exception:
+        return False
+    try:
+        target = None
+        for w in gw.getAllWindows():
+            if getattr(w, "_hWnd", None) == h:
+                target = w
+                break
+        if target is None:
+            return False
+        try:
+            target.activate()
+            return True
+        except Exception as e:
+            msg = str(e).lower()
+            if ("operation completed successfully" in msg
+                    or "error code from windows: 0" in msg):
+                return True
+            # Last-ditch: a minimize→restore cycle forces the foreground on some
+            # window managers where activate() alone is refused.
+            try:
+                target.minimize()
+                target.restore()
+                return True
+            except Exception:
+                return False
+    except Exception:
+        return False
+
+
+def _ensure_window_visible_maximized(hwnd, settle: float = 0.0) -> bool:
+    """Pull the window `hwnd` fully on-screen, then MAXIMIZE it — "windowed
+    full screen" on whatever monitor it lands on. Returns True if we issued the
+    place/maximize, False on a no-op (bad handle / no win32 / not a real
+    window).
+
+    WHY THIS EXISTS
+    ---------------
+    When JARVIS opens a NEW browser window for media/URLs it uses
+    ``chrome --new-window`` with no ``--window-position``. Chrome then RESTORES
+    the window to wherever its last session left it. On this rig the monitor
+    layout has NEGATIVE virtual-desktop origins — ``top`` is at y=-1440 and
+    ``left`` at x=-2560 (see MONITORS) — so a window whose remembered top-left
+    is a few pixels above a monitor's top edge opens with its TITLE BAR above
+    the visible area, where the user can't grab or even see it ("chrome windows
+    may still be opening off top side of monitor"). The fix: after we spawn the
+    window, snap it back onto the work area and maximize so it always ends up
+    fully visible and filling the screen.
+
+    Mechanism MATCHES the existing window-mover (core.actions
+    ._act_move_window_to_monitor): win32 ``ShowWindow(SW_RESTORE)`` →
+    ``SetWindowPos`` (reposition, NOZORDER|NOACTIVATE so we never steal the
+    user's focus/z-order) → ``ShowWindow(SW_MAXIMIZE)``. We only touch the
+    handle we were GIVEN — the exact window JARVIS just opened (recorded in
+    _JARVIS_MEDIA_WINDOW_HWND) — never a title-substring match, so a pre-existing
+    user window is never moved (same safe-handle contract as the v1.85 media-
+    window-reuse close).
+
+    Placement target: the WORK AREA of the monitor the window currently
+    overlaps most (MonitorFromWindow + GetMonitorInfo). Maximize alone would
+    honour Chrome's remembered monitor, but if the restored rect is entirely
+    off every monitor Windows can pick oddly — so we first move the top-left
+    inside a real work area, THEN maximize (maximize snaps to that monitor).
+
+    DEFENSIVE: a 0 / None / non-existent hwnd, missing pywin32, or any Win32
+    error is a silent no-op that returns False. NEVER raises — a placement
+    hiccup must not abort the media flow that opened the window.
+    """
+    try:
+        h = int(hwnd)
+    except (TypeError, ValueError):
+        return False
+    if h == 0:
+        return False
+
+    if settle:
+        try:
+            time.sleep(settle)
+        except Exception:
+            pass
+
+    try:
+        import win32gui
+        import win32con
+    except Exception:
+        # pywin32 absent — fall back to pygetwindow's higher-level API so the
+        # placement still happens where possible (headless CI has neither, and
+        # returns False cleanly).
+        return _ensure_window_visible_maximized_pgw(h)
+
+    # Reject a dead / non-window handle up front so we don't SetWindowPos on a
+    # recycled HWND.
+    try:
+        if not win32gui.IsWindow(h):
+            return False
+    except Exception:
+        return False
+
+    # Resolve the target work area: the monitor this window sits on, minus the
+    # taskbar (rcWork). MONITOR_DEFAULTTONEAREST (2) so an off-screen window
+    # still maps to the closest real monitor rather than a null handle.
+    # MonitorFromWindow / GetMonitorInfo live in win32api in most pywin32 builds
+    # (win32gui lacks them on this box), so resolve from win32api and fall back
+    # to the virtual-screen bounding box when they're unavailable.
+    wa_left = wa_top = wa_right = wa_bot = None
+    try:
+        import win32api
+        mon = win32api.MonitorFromWindow(h, 2)  # MONITOR_DEFAULTTONEAREST
+        info = win32api.GetMonitorInfo(mon)
+        wa_left, wa_top, wa_right, wa_bot = info["Work"]
+    except Exception:
+        # Fall back to the whole virtual-screen bounding box from MONITORS.
+        try:
+            vx, vy, vw, vh = _virtual_screen_bounds()
+            wa_left, wa_top, wa_right, wa_bot = vx, vy, vx + vw, vy + vh
+        except Exception:
+            return False
+
+    try:
+        left, top, right, bot = win32gui.GetWindowRect(h)
+        w, h_px = right - left, bot - top
+    except Exception:
+        # Can't read the rect — still try a bare maximize (better than nothing).
+        try:
+            win32gui.ShowWindow(h, win32con.SW_MAXIMIZE)
+            return True
+        except Exception:
+            return False
+
+    # Degenerate size (minimized windows report a zero/negative rect): don't
+    # trust the coordinates for the off-screen test; just restore + maximize.
+    if w <= 0 or h_px <= 0:
+        try:
+            win32gui.ShowWindow(h, win32con.SW_RESTORE)
+            win32gui.ShowWindow(h, win32con.SW_MAXIMIZE)
+            return True
+        except Exception:
+            return False
+
+    # Off the work area? The load-bearing case the owner reported is top < work-
+    # area top (title bar above the monitor), but we clamp all four edges so a
+    # window pushed off ANY side comes fully back. A small tolerance avoids
+    # re-nudging a window that is already effectively on-screen.
+    tol = 2
+    off = (
+        top < wa_top - tol
+        or left < wa_left - tol
+        or right > wa_right + tol
+        or bot > wa_bot + tol
+    )
+
+    try:
+        # Restore first so a maximized/rolled-up window has a real restore rect
+        # to move (SetWindowPos on a maximized window is ignored by Windows).
+        win32gui.ShowWindow(h, win32con.SW_RESTORE)
+        if off:
+            # Clamp the top-left so the WHOLE window fits inside the work area
+            # where possible (don't upsize past the work area). Keep the current
+            # size; the maximize below fills the screen anyway, but a sane
+            # intermediate rect guarantees the title bar is grabbable even if
+            # the maximize is somehow refused.
+            new_w = min(w, wa_right - wa_left)
+            new_h = min(h_px, wa_bot - wa_top)
+            new_left = min(max(left, wa_left), wa_right - new_w)
+            new_top = min(max(top, wa_top), wa_bot - new_h)
+            flags = 0x0004 | 0x0010  # SWP_NOZORDER | SWP_NOACTIVATE
+            win32gui.SetWindowPos(
+                h, 0, int(new_left), int(new_top), int(new_w), int(new_h), flags
+            )
+        # "Windowed full screen": fill the monitor. Maximize snaps to the
+        # monitor the (now on-screen) window overlaps.
+        win32gui.ShowWindow(h, win32con.SW_MAXIMIZE)
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_window_visible_maximized_pgw(hwnd) -> bool:
+    """pywin32-free fallback for _ensure_window_visible_maximized: drive the
+    move/maximize through pygetwindow by matching the handle. Best-effort;
+    returns False if pygetwindow is absent or the handle isn't found.
+    Mirrors the pygetwindow fallback in core.actions._act_move_window_to_monitor.
+    """
+    try:
+        import pygetwindow as gw
+    except Exception:
+        return False
+    try:
+        target = None
+        for w in gw.getAllWindows():
+            if getattr(w, "_hWnd", None) == hwnd:
+                target = w
+                break
+        if target is None:
+            return False
+        try:
+            vx, vy, vw, vh = _virtual_screen_bounds()
+        except Exception:
+            vx, vy, vw, vh = 0, 0, 2560, 1440
+        # Clamp the top-left inside the virtual desktop, then maximize.
+        try:
+            if getattr(target, "isMaximized", False):
+                target.restore()
+            new_left = min(max(int(target.left), vx), vx + vw - 1)
+            new_top = min(max(int(target.top), vy), vy + vh - 1)
+            target.moveTo(new_left, new_top)
+        except Exception:
+            pass
+        target.maximize()
+        return True
+    except Exception:
+        return False
 
 
 def _flash_window_reticle(win, label: str = "focus"):
