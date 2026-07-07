@@ -69,9 +69,15 @@ def _raised_arm_joints(side: str, *, hand_x: float, hand_y: float = RAISED_HAND_
 
 def _both_up_body(*, left_x=-0.30, right_x=0.30, left_y=RAISED_HAND_Y,
                   right_y=RAISED_HAND_Y, left_z=TORSO_Z - 0.30,
-                  right_z=TORSO_Z - 0.30, distance=TORSO_Z):
+                  right_z=TORSO_Z - 0.30, distance=TORSO_Z,
+                  hand_right="closed", hand_left="closed"):
     """A get_bodies() body with BOTH hands raised at chosen positions (so two-hand
-    mode engages). The hand X separation drives the pinch distance."""
+    mode engages). The hand X separation drives the pinch distance.
+
+    Grips default to "closed" (FISTS) — the grab posture: you grab with closed
+    hands and let go by opening both palms, so a fixture that drives a GRAB must
+    report fists. Pass hand_right/hand_left="open" to exercise the open-hands
+    release / no-latch paths."""
     joints: dict = {
         "spine_mid": (0.0, 0.0, distance, 2),
         "spine_shoulder": (0.0, SHOULDER_Y, distance, 2),
@@ -84,7 +90,7 @@ def _both_up_body(*, left_x=-0.30, right_x=0.30, left_y=RAISED_HAND_Y,
     return {
         "id": 0, "joints": joints,
         "head": (0.0, SHOULDER_Y + 0.3, distance), "distance_m": distance,
-        "facing": True, "hand_right": "open", "hand_left": "open",
+        "facing": True, "hand_right": hand_right, "hand_left": hand_left,
     }
 
 
@@ -407,6 +413,108 @@ class TwoHandControllerTests(_Base):
         self.assertFalse(d.resizing)
         self.assertIsNone(d.rect)
         self.assertFalse(c.is_grabbed)
+
+    def test_open_both_hands_releases_grab(self):
+        # The owner's complaint: opening the hands should let go. A sustained
+        # both-open (past OPEN_RELEASE_SEC) releases even while the hands are
+        # still geometrically up (both_engaged True, distance present).
+        mod = self._load()
+        clk = _Clock()
+        c = self._ctrl(mod, clk)
+        rect = mod.Rect(800, 400, 1600, 1000)
+        self._grab(mod, c, clk, rect)
+        self.assertTrue(c.is_grabbed)
+        # First open frame arms the debounce but does NOT yet release.
+        d = c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
+                     focused_rect=None, bounds=self.BOUNDS,
+                     hands=((1000, 700), (1400, 700)),
+                     left_grip="open", right_grip="open")
+        self.assertTrue(d.resizing)          # still grabbed within the debounce
+        clk.advance(0.20)                    # past OPEN_RELEASE_SEC (0.15)
+        d = c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
+                     focused_rect=None, bounds=self.BOUNDS,
+                     hands=((1000, 700), (1400, 700)),
+                     left_grip="open", right_grip="open")
+        self.assertEqual(d.phase, "idle")
+        self.assertFalse(c.is_grabbed)
+
+    def test_open_flicker_does_not_release(self):
+        # A single-frame OPEN blip mid-resize must NOT drop the grab (the flaky
+        # Kinect grip stream would otherwise make the window impossible to hold).
+        mod = self._load()
+        clk = _Clock()
+        c = self._ctrl(mod, clk)
+        rect = mod.Rect(800, 400, 1600, 1000)
+        self._grab(mod, c, clk, rect)
+        # One open frame...
+        c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
+                 focused_rect=None, bounds=self.BOUNDS,
+                 hands=((1000, 700), (1400, 700)),
+                 left_grip="open", right_grip="open")
+        clk.advance(0.05)                    # under the 0.15 debounce
+        # ...then hands read closed again → the debounce resets, grab held.
+        d = c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
+                     focused_rect=None, bounds=self.BOUNDS,
+                     hands=((1000, 700), (1400, 700)),
+                     left_grip="closed", right_grip="closed")
+        self.assertTrue(c.is_grabbed)
+        self.assertTrue(d.resizing)
+
+    def test_one_hand_open_does_not_release(self):
+        # Only BOTH hands open releases; one open + one closed keeps the grab.
+        mod = self._load()
+        clk = _Clock()
+        c = self._ctrl(mod, clk)
+        rect = mod.Rect(800, 400, 1600, 1000)
+        self._grab(mod, c, clk, rect)
+        clk.advance(0.30)
+        d = c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
+                     focused_rect=None, bounds=self.BOUNDS,
+                     hands=((1000, 700), (1400, 700)),
+                     left_grip="open", right_grip="closed")
+        self.assertTrue(c.is_grabbed)
+        self.assertTrue(d.resizing)
+
+    def test_unknown_grip_never_releases(self):
+        # "unknown" (the SDK's occluded-hand value) must never force a release —
+        # otherwise a hand the sensor briefly loses would drop the window.
+        mod = self._load()
+        clk = _Clock()
+        c = self._ctrl(mod, clk)
+        rect = mod.Rect(800, 400, 1600, 1000)
+        self._grab(mod, c, clk, rect)
+        clk.advance(0.50)
+        c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
+                 focused_rect=None, bounds=self.BOUNDS,
+                 hands=((1000, 700), (1400, 700)),
+                 left_grip="unknown", right_grip="unknown")
+        self.assertTrue(c.is_grabbed)
+
+    def test_open_palms_do_not_latch_a_grab(self):
+        # You grab with fists: raising both hands OPEN parks in "holding" and never
+        # snatches the window (which would then instantly open-release → oscillate).
+        mod = self._load()
+        clk = _Clock()
+        c = self._ctrl(mod, clk)
+        rect = mod.Rect(800, 400, 1600, 1000)
+        c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
+                 focused_rect=rect, bounds=self.BOUNDS,
+                 hands=((1000, 700), (1400, 700)),
+                 left_grip="open", right_grip="open")
+        clk.advance(0.25)                    # past the hold
+        d = c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
+                     focused_rect=rect, bounds=self.BOUNDS,
+                     hands=((1000, 700), (1400, 700)),
+                     left_grip="open", right_grip="open")
+        self.assertEqual(d.phase, "holding")
+        self.assertFalse(c.is_grabbed)
+        # Close the fists → the grab latches on the next confirmed frame.
+        d = c.update(both_engaged=True, hand_dist=0.40, midpoint=(1200, 700),
+                     focused_rect=rect, bounds=self.BOUNDS,
+                     hands=((1000, 700), (1400, 700)),
+                     left_grip="closed", right_grip="closed")
+        self.assertEqual(d.phase, "grabbed")
+        self.assertTrue(c.is_grabbed)
 
     def test_short_two_hand_blip_does_not_grab(self):
         mod = self._load()
