@@ -411,6 +411,109 @@ class SettingsTokenTests(_ServerBase):
         with open(self.user_settings_path, encoding="utf-8") as f:
             self.assertIs(json.load(f)["WAKE_WORD_AUTOSTART"], True)
 
+    def test_cross_origin_allowed_when_token_valid(self):
+        # With a token configured, the token IS the boundary — a cross-origin
+        # Origin header does NOT block a request that carries the valid token (the
+        # owner may legitimately reach an exposed bind from another origin/app).
+        code, data = _post(self.base + "/api/settings",
+                           {"name": "WAKE_WORD_AUTOSTART", "value": True},
+                           headers={"X-Auth-Token": self.token,
+                                    "Origin": "http://some-app.example"})
+        self.assertEqual(code, 200)
+        self.assertTrue(data["ok"])
+
+
+def _raw_post_status(host, port, path, body_obj, extra_headers=None):
+    """Send a raw HTTP/1.1 POST so a test can set an arbitrary Host header (which
+    urllib fixes to the URL host), and return just the numeric status code. Used to
+    exercise the anti-DNS-rebinding Host check deterministically."""
+    extra_headers = extra_headers or {}
+    body = json.dumps(body_obj).encode("utf-8")
+    host_hdr = extra_headers.get("Host", f"{host}:{port}")
+    lines = [f"POST {path} HTTP/1.1", f"Host: {host_hdr}",
+             "Content-Type: application/json", f"Content-Length: {len(body)}",
+             "Connection: close"]
+    for k, v in extra_headers.items():
+        if k.lower() != "host":
+            lines.append(f"{k}: {v}")
+    raw = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8") + body
+    with socket.create_connection((host, port), timeout=5) as sock:
+        sock.sendall(raw)
+        buf = b""
+        while b"\r\n" not in buf:
+            chunk = sock.recv(256)
+            if not chunk:
+                break
+            buf += chunk
+    head = buf.split(b"\r\n", 1)[0].decode("latin-1").split()
+    return int(head[1]) if len(head) > 1 and head[1].isdigit() else 0
+
+
+class CrossOriginGuardTests(_ServerBase):
+    """On a token-FREE local bind, state-changing POSTs must refuse a browser-driven
+    cross-origin (CSRF) or foreign-Host (DNS-rebinding) request, while leaving
+    same-origin and non-browser (no-Origin, loopback-Host) callers untouched."""
+
+    token = ""
+
+    def test_cross_origin_settings_403(self):
+        code, data = _post(self.base + "/api/settings",
+                           {"name": "WAKE_WORD_AUTOSTART", "value": True},
+                           headers={"Origin": "http://evil.example"})
+        self.assertEqual(code, 403)
+        # The write was refused BEFORE touching disk.
+        self.assertFalse(os.path.exists(self.user_settings_path))
+
+    def test_cross_origin_say_403(self):
+        code, _ = _post(self.base + "/api/say", {"text": "hello"},
+                        headers={"Origin": "http://evil.example"})
+        self.assertEqual(code, 403)
+        # Refused before injecting the command.
+        self.assertFalse(os.path.exists(self.inject_path))
+
+    def test_same_origin_settings_ok(self):
+        # Origin == the server's own origin (the real dashboard) is allowed.
+        code, data = _post(self.base + "/api/settings",
+                           {"name": "WAKE_WORD_AUTOSTART", "value": True},
+                           headers={"Origin": self.base})
+        self.assertEqual(code, 200)
+        self.assertTrue(data["ok"])
+
+    def test_no_origin_still_ok(self):
+        # A non-browser client (curl / PowerShell / the driver) sends no Origin and
+        # a loopback Host — unaffected by the guard.
+        code, data = _post(self.base + "/api/settings",
+                           {"name": "WAKE_WORD_AUTOSTART", "value": True})
+        self.assertEqual(code, 200)
+        self.assertTrue(data["ok"])
+
+    def test_foreign_host_403_rebinding(self):
+        # A rebound request (Host resolves to us but names an attacker host) is
+        # refused even without an Origin header.
+        code = _raw_post_status(self.host, self.port, "/api/settings",
+                                {"name": "WAKE_WORD_AUTOSTART", "value": True},
+                                extra_headers={"Host": "evil.example"})
+        self.assertEqual(code, 403)
+
+    def test_loopback_host_ok(self):
+        # Same raw path, but a legitimate loopback Host → allowed.
+        code = _raw_post_status(self.host, self.port, "/api/settings",
+                                {"name": "WAKE_WORD_AUTOSTART", "value": True},
+                                extra_headers={"Host": f"127.0.0.1:{self.port}"})
+        self.assertEqual(code, 200)
+
+
+class HostOfHelperTests(unittest.TestCase):
+    """Unit-level: _host_of normalises Host/Origin/Referer header values."""
+
+    def test_host_extraction(self):
+        f = wi._Handler._host_of
+        self.assertEqual(f("http://localhost:8766/x"), "localhost")
+        self.assertEqual(f("127.0.0.1:8766"), "127.0.0.1")
+        self.assertEqual(f("https://Evil.Example"), "evil.example")
+        self.assertEqual(f("[::1]:8766"), "[::1]")
+        self.assertEqual(f(""), "")
+
 
 class SettingsWriteHelperTests(unittest.TestCase):
     """Unit-level: _write_settings merges + validates without a live server."""
