@@ -15472,6 +15472,19 @@ INFORMATIVE_ACTIONS = {
     # Amazon order tracker: order/delivery lists.
     "check_orders", "check_amazon_orders", "amazon_orders",
     "recent_delivery", "recent_deliveries",
+    # ── 2026-07-07 bug-hunt: results whose finished text was SILENTLY DROPPED
+    # (name in NEITHER speak set). These belong in INFORMATIVE (re-summarised by
+    # the follow-up LLM), NOT verbatim, because their result is multi-line or
+    # would trip the verbatim guard:
+    #   code_executor.py — run_python/eval output carries tracebacks and a
+    #   "format:" usage hint the verbatim FAILURE_MARKER guard would swallow, so
+    #   INFORMATIVE (LLM reads/summarises the value) is correct here.
+    "run_python", "python", "eval_python", "compute",
+    #   network_deco.py roll-call aliases — a multi-device client LIST the
+    #   follow-up LLM should summarise, same rationale as who_is_on_wifi above.
+    #   (The one-line status aliases went to SPEAK_RESULT_VERBATIM_ACTIONS.)
+    "who_is_on_the_wifi", "network_clients", "list_wifi_clients",
+    "network_topology",
 }
 
 # Actions whose RESULT is already a finished, user-facing sentence that should
@@ -15687,6 +15700,59 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     "tv_detect_on", "tv_detect_off", "calibrate_tv_region", "tv_calibrate",
     "gaze_tracking_on", "gaze_tracking_off", "calibrate_gaze",
     "forget_gaze_calibration",
+    # ── 2026-07-07 bug-hunt: ~18 actions whose finished one-line result was
+    # SILENTLY DROPPED because the registered name was in NEITHER speak set
+    # (the follow-up loop only voices results for actions in one of them).
+    # Each below RETURNS a finished, user-facing sentence, does NOT self-speak,
+    # and its failure/format paths carry a FAILURE_MARKER so they still route to
+    # the failure follow-up rather than reading a raw error. Names verified
+    # against each skill's register() before adding; kept DISJOINT from
+    # INFORMATIVE_ACTIONS (there is a disjointness test).
+    #   email_triage.py — draft send / archive / scrap confirmations.
+    "confirm_pending_draft", "send_draft", "send_pending_draft",
+    "archive_email", "archive_message", "scrap_pending_draft", "discard_draft",
+    #   phone_bridge.py — push confirmations ("Sent to your phone, sir.").
+    "notify_phone", "text_my_phone", "push_to_phone",
+    #   face_id.py — enrol / forget confirmations.
+    "enroll_face", "learn_my_face", "remember_this_person", "forget_face",
+    #   guard_mode.py — on/off confirmations.
+    "guard_on", "guard_off",
+    #   enroll_voice.py — enrol / forget / active-speaker confirmations.
+    "enroll_voice", "learn_my_voice", "forget_voice", "set_active_speaker",
+    #   kinect_gestures.py — on/off confirmations.
+    "gestures_on", "gestures_off",
+    #   kinect_pointing.py — control on/off + forget-target confirmations.
+    "point_control_on", "point_control_off", "forget_point_target",
+    #   image_gen.py — "image saved to … , sir." (the empty-prompt path returns a
+    #   "format:" line and the off/error paths carry markers, so they skip here).
+    "generate_image", "make_picture",
+    #   obs_control.py — mute / scene / recording confirmations.
+    "obs_toggle_mute", "obs_switch_scene", "obs_start_recording",
+    "obs_stop_recording", "obs_pause_recording",
+    #   schedule_manager.py — schedule set / cancel / fire confirmations.
+    "schedule_once", "schedule_recurring", "schedule_cron", "schedule_when",
+    "when_condition", "cancel_schedule", "remove_schedule", "fire_schedule",
+    "run_schedule",
+    #   model_picker.py — "Switched to …, sir." confirmations.
+    "set_model", "set_brain",
+    #   night_owl_mode.py — good-morning wake confirmation.
+    "good_morning",
+    #   personal_rag.py — reindex / configure / open-top confirmations.
+    "rag_reindex", "rag_configure", "rag_open_top",
+    #   sh_ecobee.py — setup-complete confirmation.
+    "ecobee_complete_setup",
+    #   notification_triage.py — rule add/remove + pause/resume confirmations.
+    "add_notification_rule", "remove_notification_rule",
+    "pause_notification_triage", "resume_notification_triage",
+    #   network_deco.py — one-line status aliases ("X is online, sir." /
+    #   bandwidth summary). The multi-item roll-call aliases go to INFORMATIVE.
+    "printer_online", "device_online", "network_usage", "bandwidth_hogs",
+    "whats_using_bandwidth", "deco_refresh", "refresh_network",
+    #   media fallbacks — one-line "playing X" / "opened …" confirmations.
+    "play_unheard", "play_vibe", "skip_track",                 # apple_music_intel.py
+    "play_playlist", "shuffle_library",                        # itunes_library.py
+    "keep_music_open", "stop_keeping_music_open",              # itunes_library.py
+    "youtube_search_direct", "youtube_direct", "yt_direct",    # youtube_search.py
 }
 
 # Actions whose runtime can plausibly exceed MID_TASK_STATUS_DELAY (~8 s).

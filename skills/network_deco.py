@@ -654,8 +654,12 @@ def _start_monitor() -> bool:
 
 # ── action helpers ────────────────────────────────────────────────
 def _device_name(d: dict) -> str:
+    # 2026-07-07 bug-hunt: the old literal "unknown" fallback for a fully
+    # unlabelled device collided with the "unknown " FAILURE_MARKER, so a legit
+    # "<name> is online, sir." success was read as a failure and swallowed.
+    # "an unnamed device" carries no marker and still reads naturally.
     return (d.get("name") or d.get("hostname") or d.get("alias")
-            or d.get("ip") or d.get("mac") or "unknown")
+            or d.get("ip") or d.get("mac") or "an unnamed device")
 
 
 def _is_online(d: dict) -> bool:
