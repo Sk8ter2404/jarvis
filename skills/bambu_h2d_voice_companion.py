@@ -78,6 +78,17 @@ _announced_ams_error: list   = [False]
 _announced_failed: list      = [False]
 _hook_registered: list       = [False]
 
+# Late-registration retry. Skills load in sorted() filename order, so
+# this module loads BEFORE bambu_monitor and the first hook attempt in
+# register() always fails. The retry thread (started only on that
+# failure) re-attempts every RETRY_INTERVAL_SECONDS until the hook
+# attaches or RETRY_DEADLINE_SECONDS elapses — mirrors the 15s poll-loop
+# fallback in proactive_print_companion.
+RETRY_INTERVAL_SECONDS = 15.0
+RETRY_DEADLINE_SECONDS = 300.0
+_retry_stop_evt          = threading.Event()
+_retry_thread: list      = [None]
+
 
 # ── bambu_monitor bridge ─────────────────────────────────────────────
 def _get_bambu_module():
@@ -367,6 +378,46 @@ def _register_bambu_hook() -> bool:
         return False
 
 
+def _hook_retry_loop() -> None:
+    """Daemon-thread body: re-attempt hook registration every
+    RETRY_INTERVAL_SECONDS until it succeeds or the deadline passes.
+    Exits immediately when _retry_stop_evt is set (tests, hot-reload)."""
+    try:
+        deadline = time.time() + RETRY_DEADLINE_SECONDS
+        while time.time() < deadline:
+            if _retry_stop_evt.wait(RETRY_INTERVAL_SECONDS):
+                return
+            if _hook_registered[0] or _register_bambu_hook():
+                return
+        print("  [bambu_voice] gave up wiring the bambu hook — "
+              "bambu_monitor never appeared. print_status still works.")
+    except Exception as e:  # never let the retry thread die loudly
+        print(f"  [bambu_voice] hook retry loop crashed: {e}")
+    finally:
+        _retry_thread[0] = None
+
+
+def _start_hook_retry_thread() -> None:
+    """Idempotent — a second register() while a retry thread is alive
+    (or after the hook attached) must not stack threads."""
+    if _hook_registered[0]:
+        return
+    t = _retry_thread[0]
+    if t is not None and t.is_alive():
+        return
+    _retry_stop_evt.clear()
+    t = threading.Thread(target=_hook_retry_loop, daemon=True,
+                         name="bambu_voice_hook_retry")
+    _retry_thread[0] = t
+    t.start()
+
+
+def _stop_hook_retry() -> None:
+    """Tear down the retry thread — exposed for tests / hot-reload."""
+    _retry_stop_evt.set()
+    _retry_thread[0] = None
+
+
 # ── action ───────────────────────────────────────────────────────────
 def _build_print_status_line() -> str:
     """Compose a single-line JARVIS-style status reply, modelled on
@@ -430,7 +481,11 @@ def register(actions: dict) -> None:
 
     actions["print_status"] = print_status
 
-    # Wire into bambu_monitor's state-change dispatch. Failure is fine
-    # — the skill still exposes `print_status` as a polled status query
-    # even when no proactive announcements are wired up.
-    _register_bambu_hook()
+    # Wire into bambu_monitor's state-change dispatch. The first attempt
+    # always fails in production — skills load in sorted() order and this
+    # file sorts before bambu_monitor — so on failure a daemon thread
+    # retries every RETRY_INTERVAL_SECONDS for up to
+    # RETRY_DEADLINE_SECONDS. Even if that gives up, the skill still
+    # exposes `print_status` as a polled status query.
+    if not _register_bambu_hook():
+        _start_hook_retry_thread()

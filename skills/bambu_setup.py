@@ -14,9 +14,14 @@ Triggered by voice with phrases like 'JARVIS, set up the printer' /
      screen by voice (digit-extraction tolerant of "one ninety two ... ").
   4. Asks the user to read out the 8-digit LAN Access Code (Settings →
      General → LAN). Repeats back what it heard and confirms.
-  5. Writes BAMBU_PRINTER_IP / BAMBU_ACCESS_CODE / BAMBU_SERIAL into both
-     the live `bobert_companion` module attributes AND the source file
-     (regex-anchored on the variable name) so the config persists.
+  5. Persists BAMBU_PRINTER_IP / BAMBU_ACCESS_CODE / BAMBU_SERIAL as
+     User-level environment variables (HKCU\\Environment via winreg, with a
+     WM_SETTINGCHANGE broadcast so new shells see them) — the same durable-
+     secret pattern the boot script uses for ANTHROPIC_API_KEY. The live
+     process gets them too: os.environ plus the loaded `bobert_companion`
+     and `core.config` module attributes are patched in place, so the
+     monitor restart below works without a JARVIS restart. core/config.py
+     re-reads the env vars on the next launch.
   6. Hot-restarts the bambu_monitor poller via its start_monitor() helper —
      no JARVIS restart required to start receiving print status.
 
@@ -33,16 +38,15 @@ monitor just can't poll until the dep is added. If multicast discovery
 isn't available on the host (some VPN setups eat 2021) the wizard
 gracefully falls back to voice-prompting for the IP.
 """
+import ctypes
 import importlib
 import os
 import re
 import socket
 import struct
+import sys
 import threading
 import time
-
-_PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_CONFIG_PATH = os.path.join(_PROJECT_DIR, "bobert_companion.py")
 
 # Bambu's discovery multicast — matches the SSDP convention but on the
 # non-standard port 2021 to avoid colliding with Windows' UPnP service.
@@ -277,17 +281,70 @@ def _humanise_printer(p: dict) -> str:
 
 
 # ── credential persistence ──────────────────────────────────────────────
-def _persist_credentials(ip: str, access: str, serial: str) -> bool:
-    """Patch bobert_companion's runtime attributes AND rewrite the three
-    `BAMBU_*` lines in the source file so the config survives restart.
-    Returns True on success.
+# The three env-var names core/config.py reads at startup (os.getenv).
+_ENV_VARS = ("BAMBU_PRINTER_IP", "BAMBU_ACCESS_CODE", "BAMBU_SERIAL")
 
-    Match is regex-anchored on the variable name + '=' so cosmetic
-    formatting (spacing, trailing comments) doesn't break the rewrite.
-    A trailing inline comment is preserved if present."""
-    # Live module attrs — affects this process immediately so the monitor
-    # restart below picks up the new credentials via _read_config().
+
+def _broadcast_env_change() -> None:
+    """Tell running Windows apps the environment changed (WM_SETTINGCHANGE)
+    so shells opened after the wizard pick up the new User-level vars
+    without a logoff. Best-effort — a failed broadcast just means new
+    shells wait for the next login."""
     try:
+        HWND_BROADCAST   = 0xFFFF
+        WM_SETTINGCHANGE = 0x001A
+        SMTO_ABORTIFHUNG = 0x0002
+        result = ctypes.c_ulong()
+        ctypes.windll.user32.SendMessageTimeoutW(
+            HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment",
+            SMTO_ABORTIFHUNG, 5000, ctypes.byref(result))
+    except Exception as e:
+        print(f"  [bambu-setup] WM_SETTINGCHANGE broadcast failed: {e}")
+
+
+def _write_user_env(pairs: list[tuple[str, str]]) -> bool:
+    """Write name/value pairs as User-level environment variables
+    (HKCU\\Environment) — the box pattern for durable secrets (same place
+    the boot script reads ANTHROPIC_API_KEY from). Returns True when the
+    registry write succeeded. Values are never printed."""
+    try:
+        import winreg
+    except ImportError:
+        print("  [bambu-setup] winreg unavailable (non-Windows host) - "
+              "cannot persist to user environment")
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0,
+                            winreg.KEY_SET_VALUE) as key:
+            for name, value in pairs:
+                winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
+    except Exception as e:
+        print(f"  [bambu-setup] could not write user env vars: {e}")
+        return False
+    _broadcast_env_change()
+    return True
+
+
+def _persist_credentials(ip: str, access: str, serial: str) -> bool:
+    """Persist the credentials the way core/config.py actually reads them:
+    User-level environment variables. Three layers, most-durable first:
+
+      1. HKCU\\Environment (winreg) + WM_SETTINGCHANGE — survives restarts;
+         core/config.py's os.getenv() picks them up on every future launch.
+      2. os.environ — this process and any child it spawns (including the
+         relaunch pipeline) see them immediately.
+      3. Live module attributes on bobert_companion and core.config — the
+         monitor hot-restart below reads config in-process.
+
+    Returns True when the current session is configured; a failed registry
+    write degrades to session-only with a console warning (never fatal).
+    The access code is never printed or logged."""
+    # Live env + module attrs — affects this process immediately so the
+    # monitor restart below picks up the new credentials via _read_config().
+    try:
+        os.environ["BAMBU_PRINTER_IP"]  = ip
+        os.environ["BAMBU_ACCESS_CODE"] = access
+        os.environ["BAMBU_SERIAL"]      = serial
         bc = _bc()
         bc.BAMBU_PRINTER_IP  = ip
         bc.BAMBU_ACCESS_CODE = access
@@ -295,64 +352,21 @@ def _persist_credentials(ip: str, access: str, serial: str) -> bool:
     except Exception as e:
         print(f"  [bambu-setup] could not patch live module attrs: {e}")
         return False
-
-    # Source rewrite for persistence.
+    # core.config holds the canonical copies since the 2026-05 refactor;
+    # patch it too if it's loaded (best-effort — bobert_companion mirrors).
     try:
-        with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
-            src = f.read()
+        cfg = sys.modules.get("core.config")
+        if cfg is not None:
+            cfg.BAMBU_PRINTER_IP  = ip
+            cfg.BAMBU_ACCESS_CODE = access
+            cfg.BAMBU_SERIAL      = serial
     except Exception as e:
-        print(f"  [bambu-setup] could not read config source: {e}")
-        return False
+        print(f"  [bambu-setup] could not patch core.config attrs: {e}")
 
-    def _replace(src_text: str, var: str, value: str) -> str:
-        # Capture the leading var-name+= and any trailing inline comment so
-        # we keep the existing # comments. Match a double- or single-quoted
-        # literal; we always re-emit double-quoted for file-style consistency.
-        pattern = re.compile(
-            r"^(?P<lead>" + re.escape(var) + r"\s*=\s*)"
-            r"(?P<quote>[\"'])(?P<old>[^\"']*)(?P=quote)"
-            r"(?P<tail>.*)$",
-            re.MULTILINE,
-        )
-        # Use a callable replacer so re doesn't try to interpret backslashes
-        # in the value (a string replacer eats `\\` and turns `\"` into a
-        # literal backslash-quote, which corrupted the rewritten lines).
-        # Escape any embedded backslash or double-quote so the rewritten
-        # literal stays syntactically valid even on unusual access codes.
-        safe = value.replace("\\", "\\\\").replace("\"", "\\\"")
-
-        def _do(m: re.Match) -> str:
-            return f'{m.group("lead")}"{safe}"{m.group("tail")}'
-
-        new_text, n = pattern.subn(_do, src_text, count=1)
-        if n == 0:
-            print(f"  [bambu-setup] could not locate '{var}' line — skipping persist")
-            return src_text
-        return new_text
-
-    new_src = src
-    new_src = _replace(new_src, "BAMBU_PRINTER_IP",  ip)
-    new_src = _replace(new_src, "BAMBU_ACCESS_CODE", access)
-    new_src = _replace(new_src, "BAMBU_SERIAL",      serial)
-
-    if new_src == src:
-        # No lines matched — the file structure has changed since this
-        # skill was written. Live attrs are still patched so the user
-        # gets a working session, but warn them to re-run after restart.
-        print("  [bambu-setup] source file unchanged — credentials live "
+    # Durable persistence: User-level env vars in the registry.
+    if not _write_user_env(list(zip(_ENV_VARS, (ip, access, serial)))):
+        print("  [bambu-setup] user-env persist failed - credentials live "
               "for this session only")
-        return True
-
-    try:
-        # Atomic-ish write: same-dir tempfile + replace.
-        dir_ = os.path.dirname(_CONFIG_PATH)
-        tmp = _CONFIG_PATH + ".bambusetup.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(new_src)
-        os.replace(tmp, _CONFIG_PATH)
-    except Exception as e:
-        print(f"  [bambu-setup] could not write config source: {e}")
-        return False
     return True
 
 

@@ -5,10 +5,11 @@ Wraps the optional `ring_doorbell` library. Coverage:
   * _ring_doorbell import (present via injected fake / absent),
   * _read_token / _read_config (present / absent / malformed) and _save_token
     (delegates to core.atomic_io, swallows errors),
-  * _run_with_timeout ok / error / timed-out branches,
-  * _get_ring client construction + cache, the update_data timeout + error
-    paths, and the missing-Auth/Ring guard,
-  * _enumerate flattening + enum failure, list_devices' capability derivation
+  * _run_async ok / error / timed-out branches (private-loop coroutine runner),
+  * _get_ring client construction + cache, the async_update_data timeout +
+    error paths, and the missing-Auth/Ring guard,
+  * _enumerate flattening (dict AND RingDevices-style category-indexable
+    objects) + enum failure, list_devices' capability derivation
     (camera / chime / on_off / siren),
   * _match by native_id and by case-insensitive name,
   * get_state attribute read (+ not-found / not-authorized),
@@ -20,7 +21,9 @@ Wraps the optional `ring_doorbell` library. Coverage:
   * register wiring.
 
 `ring_doorbell` is NOT a CI dependency, so it is ALWAYS injected as a fake —
-never imported for real — keeping the suite deterministic and offline. Module
+never imported for real — keeping the suite deterministic and offline. The
+fakes mirror the async-only 0.9.x API (async_fetch_token / async_update_data)
+so the tests exercise the real _run_async code path. Module
 globals (_state) are reset in tearDown.
 """
 from __future__ import annotations
@@ -116,7 +119,7 @@ def _fake_ring_doorbell(auth_factory=None, ring_factory=None,
             if auth_factory:
                 auth_factory(self)
 
-        def fetch_token(self, email, password, code=None):
+        async def async_fetch_token(self, email, password, code=None):
             return {"refresh_token": "rt"}
 
     class _Ring:
@@ -126,7 +129,7 @@ def _fake_ring_doorbell(auth_factory=None, ring_factory=None,
             if ring_factory:
                 ring_factory(self)
 
-        def update_data(self):
+        async def async_update_data(self):
             return None
 
         def devices(self):
@@ -226,18 +229,21 @@ class RingTokenConfigIOTests(_RingBase):
             self.mod._save_token({"x": 1})   # no exception
 
 
-# ─── _run_with_timeout ───────────────────────────────────────────────────
-class RingRunWithTimeoutTests(_RingBase):
-    def test_ok_branch(self):
-        res = self.mod._run_with_timeout(lambda: None, timeout=2.0)
+# ─── _run_async ──────────────────────────────────────────────────────────
+class RingRunAsyncTests(_RingBase):
+    def test_ok_branch_returns_value(self):
+        async def _ok():
+            return 42
+        res = self.mod._run_async(_ok, timeout=2.0)
         self.assertTrue(res["ok"])
+        self.assertEqual(res["value"], 42)
         self.assertIsNone(res["error"])
         self.assertFalse(res["timed_out"])
 
     def test_error_branch(self):
-        def _boom():
+        async def _boom():
             raise RuntimeError("update failed")
-        res = self.mod._run_with_timeout(_boom, timeout=2.0)
+        res = self.mod._run_async(_boom, timeout=2.0)
         self.assertFalse(res["ok"])
         self.assertIsInstance(res["error"], RuntimeError)
 
@@ -247,10 +253,10 @@ class RingRunWithTimeoutTests(_RingBase):
         # afterward so the daemon exits cleanly.
         gate = threading.Event()
 
-        def _block():
+        async def _block():
             gate.wait(5.0)
         try:
-            res = self.mod._run_with_timeout(_block, timeout=0.1)
+            res = self.mod._run_async(_block, timeout=0.1)
             self.assertTrue(res["timed_out"])
             self.assertFalse(res["ok"])
         finally:
@@ -298,8 +304,9 @@ class RingGetRingTests(_RingBase):
         with mock.patch.object(self.mod, "_ring_doorbell", return_value=fake), \
              mock.patch.object(self.mod, "_read_token",
                                return_value={"refresh_token": "rt"}), \
-             mock.patch.object(self.mod, "_run_with_timeout",
-                               return_value={"ok": False, "error": None,
+             mock.patch.object(self.mod, "_run_async",
+                               return_value={"ok": False, "value": None,
+                                             "error": None,
                                              "timed_out": True}), \
              contextlib.redirect_stdout(io.StringIO()):
             self.assertIsNone(self.mod._get_ring())
@@ -310,8 +317,8 @@ class RingGetRingTests(_RingBase):
         with mock.patch.object(self.mod, "_ring_doorbell", return_value=fake), \
              mock.patch.object(self.mod, "_read_token",
                                return_value={"refresh_token": "rt"}), \
-             mock.patch.object(self.mod, "_run_with_timeout",
-                               return_value={"ok": False,
+             mock.patch.object(self.mod, "_run_async",
+                               return_value={"ok": False, "value": None,
                                              "error": RuntimeError("boom"),
                                              "timed_out": False}), \
              contextlib.redirect_stdout(io.StringIO()):
@@ -347,10 +354,28 @@ class RingEnumerationTests(_RingBase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(self.mod._enumerate(fake_ring), {})
 
-    def test_enumerate_non_dict_returns_empty(self):
+    def test_enumerate_non_dict_non_indexable_returns_empty(self):
         fake_ring = mock.Mock()
-        fake_ring.devices.return_value = ["not", "a", "dict"]
+        fake_ring.devices.return_value = object()
         self.assertEqual(self.mod._enumerate(fake_ring), {})
+
+    def test_enumerate_ring_devices_style_object(self):
+        # ring_doorbell >= 0.9 returns a RingDevices object indexable by
+        # category name instead of a plain dict.
+        d1 = _FakeRingDevice(name="Front Door", did="a")
+        d2 = _FakeRingDevice(name="Indoor Chime", did="c", family="chimes")
+
+        class _RingDevices:
+            def __getitem__(self, kind):
+                if kind == "doorbots":
+                    return [d1]
+                if kind == "chimes":
+                    return [d2]
+                raise KeyError(kind)
+        fake_ring = mock.Mock()
+        fake_ring.devices.return_value = _RingDevices()
+        out = self.mod._enumerate(fake_ring)
+        self.assertEqual(set(out.keys()), {"a", "c"})
 
     def test_enumerate_skips_item_whose_id_access_raises(self):
         # A device inside a category list whose `.id` attribute access raises is
@@ -635,19 +660,33 @@ class RingDoFetchTokenTests(_RingBase):
 
     def test_2fa_required_when_fetch_raises_without_code(self):
         fake = _fake_ring_doorbell()
-        fake.Auth.fetch_token = lambda self, *a, **k: (_ for _ in ()).throw(
-            RuntimeError("Need 2FA"))
+
+        async def _boom(self, *a, **k):
+            raise RuntimeError("Need 2FA")
+        fake.Auth.async_fetch_token = _boom
         with mock.patch.object(self.mod, "_ring_doorbell", return_value=fake):
             out = self.mod._do_fetch_token("a@b.com", "pw")
         self.assertTrue(out.startswith("2FA_REQUIRED:"))
 
     def test_failure_with_code(self):
         fake = _fake_ring_doorbell()
-        fake.Auth.fetch_token = lambda self, *a, **k: (_ for _ in ()).throw(
-            RuntimeError("bad code"))
+
+        async def _boom(self, *a, **k):
+            raise RuntimeError("bad code")
+        fake.Auth.async_fetch_token = _boom
         with mock.patch.object(self.mod, "_ring_doorbell", return_value=fake):
             out = self.mod._do_fetch_token("a@b.com", "pw", "000000")
         self.assertIn("sign-in failed", out)
+
+    def test_timeout_reports_failure(self):
+        with mock.patch.object(self.mod, "_ring_doorbell",
+                               return_value=_fake_ring_doorbell()), \
+             mock.patch.object(self.mod, "_run_async",
+                               return_value={"ok": False, "value": None,
+                                             "error": None,
+                                             "timed_out": True}):
+            out = self.mod._do_fetch_token("a@b.com", "pw")
+        self.assertIn("timed out", out)
 
 
 # ─── ring_authorize ──────────────────────────────────────────────────────

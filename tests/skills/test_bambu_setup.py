@@ -16,9 +16,12 @@ inline-args entry point and a multicast-discovery + voice flow. We cover:
   • _wizard_pick_printer  — single / multi / index / model-name selection + misses
   • _wizard_prompt_ip / _wizard_prompt_access_code / _wizard_prompt_serial —
                             the re-prompt state machines (3-attempt loops).
-  • _persist_credentials  — live-attr patch + source rewrite, every branch, with
-                            a FAKE bobert_companion module and a TEMP config file
-                            so NO real bobert_companion.py source is ever rewritten.
+  • _persist_credentials  — os.environ + live-attr patch + HKCU\\Environment
+                            user-level env vars, every branch, with a FAKE
+                            bobert_companion module and a FAKE winreg so the
+                            real registry is never touched (and Linux CI,
+                            which has no winreg, still runs them).
+  • _broadcast_env_change — WM_SETTINGCHANGE broadcast (ctypes.windll faked).
   • _restart_monitor      — skill_bambu_monitor.start_monitor hot-restart paths.
   • setup_printer         — inline-args + the "already running" lock + the full
                             discovery/voice flow (every terminal branch).
@@ -32,7 +35,6 @@ from __future__ import annotations
 import os
 import socket
 import sys
-import tempfile
 import types
 import unittest
 from unittest import mock
@@ -679,15 +681,37 @@ class WizardPromptSerialTests(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# _persist_credentials — live-attr patch + source rewrite, FAKE bc + TEMP file.
+# _persist_credentials — os.environ + live-attr patch + User-level env vars
+# via a FULLY FAKED winreg (works on any CI host; the real registry is
+# never touched) and a mocked WM_SETTINGCHANGE broadcast.
 # ─────────────────────────────────────────────────────────────────────────
-_SAMPLE_CONFIG = (
-    "# bobert_companion config\n"
-    'BAMBU_PRINTER_IP  = "192.168.1.1"  # printer on LAN\n'
-    'BAMBU_ACCESS_CODE = "00000000"\n'
-    "BAMBU_SERIAL      = 'OLDSERIAL01'\n"
-    "OTHER = 1\n"
-)
+class _FakeWinregKey:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _FakeWinreg(types.ModuleType):
+    """Stand-in winreg module recording OpenKey / SetValueEx calls."""
+
+    HKEY_CURRENT_USER = object()
+    KEY_SET_VALUE = 0x0002
+    REG_SZ = 1
+
+    def __init__(self):
+        super().__init__("winreg")
+        self.opened = []
+        self.set_calls = []
+        self._key = _FakeWinregKey()
+
+    def OpenKey(self, root, sub, reserved, access):
+        self.opened.append((root, sub, reserved, access))
+        return self._key
+
+    def SetValueEx(self, key, name, reserved, kind, value):
+        self.set_calls.append((name, kind, value))
 
 
 class PersistCredentialsTests(unittest.TestCase):
@@ -695,82 +719,118 @@ class PersistCredentialsTests(unittest.TestCase):
         self.mod, self.actions = load_skill_isolated("bambu_setup")
         self.bc = _FakeBC()
         _inject_module(self, "bobert_companion", self.bc)
-        # Redirect the source-rewrite target at a throwaway temp file so the
-        # real bobert_companion.py is NEVER touched.
-        self.tmpdir = tempfile.mkdtemp(prefix="bambu_persist_")
-        self.cfg = os.path.join(self.tmpdir, "bobert_companion.py")
-        with open(self.cfg, "w", encoding="utf-8") as f:
-            f.write(_SAMPLE_CONFIG)
-        mock.patch.object(self.mod, "_CONFIG_PATH", self.cfg).start()
+        self.winreg = _inject_module(self, "winreg", _FakeWinreg())
+        # Restore the process env afterwards and start each test clean.
+        mock.patch.dict(os.environ, {}, clear=False).start()
         self.addCleanup(mock.patch.stopall)
-        self.addCleanup(self._cleanup)
+        for v in self.mod._ENV_VARS:
+            os.environ.pop(v, None)
+        # Never fire a real WM_SETTINGCHANGE from tests.
+        self.broadcast = mock.patch.object(
+            self.mod, "_broadcast_env_change").start()
 
-    def _cleanup(self):
-        for fn in os.listdir(self.tmpdir):
-            try:
-                os.unlink(os.path.join(self.tmpdir, fn))
-            except OSError:
-                pass
-        try:
-            os.rmdir(self.tmpdir)
-        except OSError:
-            pass
-
-    def test_happy_path_patches_attrs_and_rewrites_source(self):
+    def test_happy_path_env_attrs_and_registry(self):
         ok = self.mod._persist_credentials("192.168.1.77", "12345678",
                                            "01P00A0001")
         self.assertTrue(ok)
+        # Current-process env set — children inherit; core/config.py's
+        # os.getenv() reads these on the next launch via the user registry.
+        self.assertEqual(os.environ["BAMBU_PRINTER_IP"], "192.168.1.77")
+        self.assertEqual(os.environ["BAMBU_ACCESS_CODE"], "12345678")
+        self.assertEqual(os.environ["BAMBU_SERIAL"], "01P00A0001")
         # Live attrs updated.
         self.assertEqual(self.bc.BAMBU_PRINTER_IP, "192.168.1.77")
         self.assertEqual(self.bc.BAMBU_ACCESS_CODE, "12345678")
         self.assertEqual(self.bc.BAMBU_SERIAL, "01P00A0001")
-        # Source rewritten — all three, double-quoted, comment preserved.
-        with open(self.cfg, encoding="utf-8") as f:
-            body = f.read()
-        self.assertIn('BAMBU_PRINTER_IP  = "192.168.1.77"  # printer on LAN', body)
-        self.assertIn('BAMBU_ACCESS_CODE = "12345678"', body)
-        self.assertIn('BAMBU_SERIAL      = "01P00A0001"', body)
-        self.assertNotIn("OLDSERIAL01", body)
+        # Registry: HKCU\Environment opened for write, all three as REG_SZ.
+        self.assertEqual(self.winreg.opened,
+                         [(self.winreg.HKEY_CURRENT_USER, "Environment", 0,
+                           self.winreg.KEY_SET_VALUE)])
+        self.assertEqual(self.winreg.set_calls, [
+            ("BAMBU_PRINTER_IP", self.winreg.REG_SZ, "192.168.1.77"),
+            ("BAMBU_ACCESS_CODE", self.winreg.REG_SZ, "12345678"),
+            ("BAMBU_SERIAL", self.winreg.REG_SZ, "01P00A0001"),
+        ])
+        # New shells notified of the environment change.
+        self.broadcast.assert_called_once_with()
+
+    def test_core_config_module_patched_when_loaded(self):
+        cfg = types.ModuleType("core.config")
+        cfg.BAMBU_PRINTER_IP = ""
+        cfg.BAMBU_ACCESS_CODE = ""
+        cfg.BAMBU_SERIAL = ""
+        _inject_module(self, "core.config", cfg)
+        self.assertTrue(
+            self.mod._persist_credentials("192.168.1.12", "12345678", "S2"))
+        self.assertEqual(cfg.BAMBU_PRINTER_IP, "192.168.1.12")
+        self.assertEqual(cfg.BAMBU_ACCESS_CODE, "12345678")
+        self.assertEqual(cfg.BAMBU_SERIAL, "S2")
 
     def test_live_attr_patch_failure_returns_false(self):
-        # _bc() raising → can't patch live attrs → False, no file write.
+        # _bc() raising → can't patch live attrs → False, no registry write.
         with mock.patch.object(self.mod, "_bc",
                                side_effect=RuntimeError("import boom")):
             self.assertFalse(
                 self.mod._persist_credentials("192.168.1.5", "12345678", ""))
+        self.assertEqual(self.winreg.set_calls, [])
 
-    def test_config_read_failure_returns_false(self):
-        # Live attrs patch fine, but the source read explodes → False.
-        with mock.patch("builtins.open", side_effect=OSError("no read")):
-            self.assertFalse(
-                self.mod._persist_credentials("192.168.1.6", "12345678", ""))
-
-    def test_unmatched_vars_keep_session_live_only(self):
-        # A config file with NONE of the BAMBU_* lines → no rewrite happens
-        # but live attrs are still patched → returns True (session-only).
-        with open(self.cfg, "w", encoding="utf-8") as f:
-            f.write("NOTHING_HERE = 1\n")
+    def test_winreg_unavailable_degrades_to_session_only(self):
+        # Non-Windows host: `import winreg` raises → session-only, still True.
+        # (None in sys.modules forces the ImportError even on Windows.)
+        sys.modules["winreg"] = None
+        self.addCleanup(sys.modules.pop, "winreg", None)
         ok = self.mod._persist_credentials("192.168.1.8", "12345678", "S1")
         self.assertTrue(ok)
         self.assertEqual(self.bc.BAMBU_PRINTER_IP, "192.168.1.8")
-        with open(self.cfg, encoding="utf-8") as f:
-            self.assertNotIn("192.168.1.8", f.read())
+        self.assertEqual(os.environ["BAMBU_ACCESS_CODE"], "12345678")
+        self.broadcast.assert_not_called()
 
-    def test_backslash_and_quote_in_value_escaped(self):
-        # An access code with a backslash/quote stays syntactically valid.
-        ok = self.mod._persist_credentials('192.168.1.9', r'12\3"4', "S")
-        self.assertTrue(ok)
-        with open(self.cfg, encoding="utf-8") as f:
-            body = f.read()
-        self.assertIn(r'\\', body)
-        self.assertIn(r'\"', body)
+    def test_registry_write_failure_degrades_to_session_only(self):
+        def _boom(*a, **k):
+            raise OSError("registry denied")
+        self.winreg.SetValueEx = _boom
+        ok = self.mod._persist_credentials("192.168.1.11", "12345678", "S")
+        self.assertTrue(ok)          # the session is still configured
+        self.assertEqual(self.bc.BAMBU_PRINTER_IP, "192.168.1.11")
+        self.broadcast.assert_not_called()  # no broadcast on a failed write
 
-    def test_source_write_failure_returns_false(self):
-        # Read succeeds and lines match, but the tempfile write/replace fails.
-        with mock.patch.object(self.mod.os, "replace",
-                               side_effect=OSError("disk full")):
-            self.assertFalse(
-                self.mod._persist_credentials("192.168.1.11", "12345678", "S"))
+    def test_old_file_rewrite_path_is_gone(self):
+        # The pre-refactor persistence rewrote bobert_companion.py source
+        # lines that no longer exist (BAMBU_* moved to core/config.py as
+        # os.getenv). That silent-no-op path must stay deleted.
+        self.assertFalse(hasattr(self.mod, "_CONFIG_PATH"))
+        import inspect
+        src = inspect.getsource(self.mod._persist_credentials)
+        self.assertNotIn("_CONFIG_PATH", src)
+        self.assertNotIn("os.replace", src)
+
+
+class BroadcastEnvChangeTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("bambu_setup")
+
+    def test_broadcast_failure_is_swallowed(self):
+        # A raising / absent user32 must not break the wizard (Linux CI has
+        # no ctypes.windll at all — same except path).
+        fake_user32 = types.SimpleNamespace(
+            SendMessageTimeoutW=mock.Mock(side_effect=OSError("no user32")))
+        fake_windll = types.SimpleNamespace(user32=fake_user32)
+        with mock.patch.object(self.mod.ctypes, "windll", fake_windll,
+                               create=True):
+            self.mod._broadcast_env_change()  # must not raise
+        fake_user32.SendMessageTimeoutW.assert_called_once()
+
+    def test_broadcast_sends_wm_settingchange(self):
+        recorder = mock.Mock(return_value=1)
+        fake_windll = types.SimpleNamespace(
+            user32=types.SimpleNamespace(SendMessageTimeoutW=recorder))
+        with mock.patch.object(self.mod.ctypes, "windll", fake_windll,
+                               create=True):
+            self.mod._broadcast_env_change()
+        args = recorder.call_args[0]
+        self.assertEqual(args[0], 0xFFFF)   # HWND_BROADCAST
+        self.assertEqual(args[1], 0x001A)   # WM_SETTINGCHANGE
+        self.assertEqual(args[3], "Environment")
 
 
 # ─────────────────────────────────────────────────────────────────────────

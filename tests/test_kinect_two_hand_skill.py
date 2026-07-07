@@ -136,6 +136,14 @@ class _Base(unittest.TestCase):
         # resolves it from sys.modules (the same way the live loader wires them).
         am, _ = load_skill_isolated("kinect_air_mouse", register=False)
         self._am = am
+        # Safety net: NEVER launch the real overlay subprocess from a test —
+        # the two-hand poll now ensures the overlay is alive on engage
+        # (_ensure_overlay_alive), which would Popen hud/jarvis_air_cursor.py.
+        # Mirrors the air-mouse test's own _spawn_overlay patch. The overlay-
+        # spawn tests below re-patch these with recording mocks.
+        p_spawn = mock.patch.object(am, "_spawn_overlay", lambda *a, **k: None)
+        p_spawn.start()
+        self.addCleanup(p_spawn.stop)
         mod, _actions = load_skill_isolated("kinect_two_hand", register=False)
         return mod
 
@@ -1007,6 +1015,67 @@ class TwoHandOverlayFlickerTests(_Base):
         mod._publish_two_hand_overlay(inactive)
         self.assertFalse(os.path.exists(path),
                          "inactive two-hand must not re-write the state file every tick")
+
+
+class OverlaySpawnTests(_Base):
+    """The two-hand poll must ENSURE the reticle overlay subprocess exists the
+    moment it starts publishing active frames — the air-mouse only spawns it
+    while KINECT_AIR_MOUSE_ENABLED is on, and the shipped default is two-hand
+    ON / air-mouse OFF, so without this nobody ever launches the window that
+    draws the dual reticles."""
+
+    def _engaged_poll(self, mod):
+        """Run one _poll_once with both hands raised (engaged, no grabbable
+        window) and return the decision."""
+        def fg():
+            return (1, None)
+
+        def swp(hwnd, rect):
+            return True
+        clk = _Clock()
+        ctrl = mod.TwoHandController(clock=clk, grab_hold_sec=0.20)
+        wide = _both_up_body(left_x=-0.30, right_x=0.30)
+        with mock.patch.object(self._am, "_bridge",
+                               lambda: _fake_bridge(bodies=[wide])), \
+             mock.patch.object(self._am, "_hand_mirror_enabled", lambda: False):
+            return mod._poll_once(ctrl, foreground_target=fg, set_window_pos=swp)
+
+    def test_engage_spawns_overlay_when_not_alive(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        spawn = mock.MagicMock()
+        with mock.patch.object(self._am, "_overlay_alive", lambda: False), \
+             mock.patch.object(self._am, "_spawn_overlay", spawn):
+            d = self._engaged_poll(mod)
+        self.assertTrue(d.active)
+        spawn.assert_called_once()
+
+    def test_engage_does_not_respawn_when_overlay_alive(self):
+        mod = self._load()
+        self._not_staging(mod)
+        self._patch_flag(True)
+        spawn = mock.MagicMock()
+        with mock.patch.object(self._am, "_overlay_alive", lambda: True), \
+             mock.patch.object(self._am, "_spawn_overlay", spawn):
+            d = self._engaged_poll(mod)
+        self.assertTrue(d.active)
+        spawn.assert_not_called()
+
+    def test_silent_noop_when_air_mouse_module_absent(self):
+        mod = self._load()
+        self._not_staging(mod)
+        with mock.patch.object(mod, "_air_mouse_mod", lambda: None):
+            mod._ensure_overlay_alive()   # must not raise
+
+    def test_never_spawns_on_staging(self):
+        mod = self._load()
+        spawn = mock.MagicMock()
+        with mock.patch.object(mod, "_is_staging", lambda: True), \
+             mock.patch.object(self._am, "_overlay_alive", lambda: False), \
+             mock.patch.object(self._am, "_spawn_overlay", spawn):
+            mod._ensure_overlay_alive()
+        spawn.assert_not_called()
 
 
 if __name__ == "__main__":

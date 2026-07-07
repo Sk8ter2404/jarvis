@@ -64,6 +64,9 @@ class VoiceCompanionMixin:
         for p in patches:
             self.addCleanup(p.stop)
         mod, actions = load_skill_isolated("bambu_h2d_voice_companion")
+        # register() starts a hook-retry thread when bambu is absent at
+        # load time; always tear it down so tests never leak threads.
+        self.addCleanup(mod._stop_hook_retry)
         # Reset per-print bookkeeping.
         mod._current_filename[0] = None
         mod._announced_milestones.clear()
@@ -267,6 +270,94 @@ class VoiceCompanionHookTests(VoiceCompanionMixin, unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as buf:
             self.assertFalse(mod._register_bambu_hook())
         self.assertIn("hook registration failed", buf.getvalue())
+
+
+class VoiceCompanionHookRetryTests(VoiceCompanionMixin, unittest.TestCase):
+    """Skills load in sorted() order, so this module loads before
+    bambu_monitor and register()'s first hook attempt fails. The retry
+    thread must pick up the hook once bambu_monitor appears."""
+
+    def _wait_for(self, cond, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if cond():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_no_retry_thread_when_hook_succeeds_immediately(self):
+        # bambu present at load → register() attaches the hook directly
+        # and never spins up a retry thread.
+        mod, _a = self._load(bambu_state={"last_update": 0.0})
+        self.assertTrue(mod._hook_registered[0])
+        self.assertIsNone(mod._retry_thread[0])
+
+    def test_retry_thread_started_when_bambu_absent_at_load(self):
+        # The harness neuters Thread.start during load, so we only see
+        # the constructed (unstarted) thread object here — proof that
+        # register() took the retry path when the first attempt failed.
+        mod, _a = self._load()  # bambu absent → first attempt fails
+        self.assertFalse(mod._hook_registered[0])
+        t = mod._retry_thread[0]
+        self.assertIsNotNone(t)
+        self.assertTrue(t.daemon)
+
+    def test_hook_registers_late_when_bambu_appears(self):
+        mod, _a = self._load()  # bambu absent at load
+        mod._stop_hook_retry()  # replace the slow 15s thread
+        fake = _fake_bambu()
+        with mock.patch.dict(sys.modules, {"skill_bambu_monitor": fake}), \
+             mock.patch.object(mod, "RETRY_INTERVAL_SECONDS", 0.01):
+            mod._start_hook_retry_thread()
+            self.assertTrue(
+                self._wait_for(lambda: mod._hook_registered[0]),
+                "retry thread never registered the hook")
+        fake.register_state_change_hook.assert_called_once_with(
+            mod._on_bambu_state_change)
+
+    def test_retry_thread_stops_after_success(self):
+        mod, _a = self._load()
+        mod._stop_hook_retry()
+        fake = _fake_bambu()
+        with mock.patch.dict(sys.modules, {"skill_bambu_monitor": fake}), \
+             mock.patch.object(mod, "RETRY_INTERVAL_SECONDS", 0.01):
+            mod._start_hook_retry_thread()
+            t = mod._retry_thread[0]
+            self.assertIsNotNone(t)
+            t.join(timeout=5.0)
+            self.assertFalse(t.is_alive(),
+                             "retry thread kept running after success")
+        self.assertTrue(mod._hook_registered[0])
+        self.assertIsNone(mod._retry_thread[0])
+
+    def test_start_is_idempotent_while_thread_alive(self):
+        mod, _a = self._load()  # bambu absent
+        mod._stop_hook_retry()
+        mod._start_hook_retry_thread()  # really started (post-load)
+        first = mod._retry_thread[0]
+        self.assertIsNotNone(first)
+        self.assertTrue(first.is_alive())
+        mod._start_hook_retry_thread()  # re-register() must not stack
+        self.assertIs(mod._retry_thread[0], first)
+
+    def test_start_is_noop_once_hook_registered(self):
+        mod, _a = self._load(bambu_state={"last_update": 0.0})
+        self.assertTrue(mod._hook_registered[0])
+        mod._start_hook_retry_thread()
+        self.assertIsNone(mod._retry_thread[0])
+
+    def test_retry_gives_up_after_deadline(self):
+        mod, _a = self._load()  # bambu absent
+        mod._stop_hook_retry()
+        with mock.patch.object(mod, "RETRY_INTERVAL_SECONDS", 0.01), \
+             mock.patch.object(mod, "RETRY_DEADLINE_SECONDS", 0.05), \
+             contextlib.redirect_stdout(io.StringIO()) as buf:
+            mod._start_hook_retry_thread()
+            t = mod._retry_thread[0]
+            t.join(timeout=5.0)
+            self.assertFalse(t.is_alive())
+        self.assertFalse(mod._hook_registered[0])
+        self.assertIn("gave up wiring the bambu hook", buf.getvalue())
 
 
 class VoiceCompanionDelegationTests(VoiceCompanionMixin, unittest.TestCase):

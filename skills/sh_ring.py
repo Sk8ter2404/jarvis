@@ -21,6 +21,7 @@ that actually landed.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import threading
@@ -80,23 +81,27 @@ def is_available() -> bool:
     return _ring_doorbell() is not None and bool(_read_token())
 
 
-def _run_with_timeout(fn, timeout: float = 8.0) -> dict:
-    """Run a blocking callable in a daemon thread with a hard timeout.
+def _run_async(coro_fn, timeout: float = 8.0) -> dict:
+    """Run an async callable (a zero-arg callable returning a coroutine) on a
+    private event loop in a daemon thread, with a hard timeout.
 
-    Returns {"ok", "error", "timed_out"}. `ring.update_data()` is a blocking
-    HTTPS fetch with no timeout of its own; on the voice dispatch thread a
-    stalled request would hang the turn, so we cap it. A timed-out worker is
+    ring_doorbell >= 0.9 is async-only (async_update_data / async_fetch_token);
+    the coroutine is CREATED inside the worker thread so its aiohttp session
+    binds to the same loop asyncio.run() spins up there. Returns
+    {"ok", "value", "error", "timed_out"}. On the voice dispatch thread a
+    stalled request would hang the turn, so we cap it; a timed-out worker is
     left as a daemon thread and the caller retries on the next call."""
-    result: dict[str, Any] = {"ok": False, "error": None, "timed_out": False}
+    result: dict[str, Any] = {"ok": False, "value": None, "error": None,
+                              "timed_out": False}
 
     def _worker() -> None:
         try:
-            fn()
+            result["value"] = asyncio.run(coro_fn())
             result["ok"] = True
         except Exception as e:
             result["error"] = e
 
-    t = threading.Thread(target=_worker, name="sh_ring-update", daemon=True)
+    t = threading.Thread(target=_worker, name="sh_ring-async", daemon=True)
     t.start()
     t.join(timeout)
     if t.is_alive():
@@ -123,7 +128,7 @@ def _get_ring() -> Any:
             return None
         auth = Auth("JARVIS/1.0", token, _save_token)
         ring = Ring(auth)
-        res = _run_with_timeout(ring.update_data, timeout=8.0)
+        res = _run_async(ring.async_update_data, timeout=8.0)
         if res["timed_out"]:
             print("  [sh-ring] update_data timed out after 8s — "
                   "not caching; will retry next call.")
@@ -153,6 +158,20 @@ def _enumerate(ring: Any) -> dict[str, Any]:
         return out
     if isinstance(devices, dict):
         for kind, items in devices.items():
+            for it in items or []:
+                try:
+                    out[str(getattr(it, "id", id(it)))] = it
+                except Exception:
+                    pass
+    else:
+        # ring_doorbell >= 0.9 returns a RingDevices object (indexable by
+        # category) instead of a plain dict.
+        for kind in ("doorbots", "authorized_doorbots", "stickup_cams",
+                     "chimes", "other"):
+            try:
+                items = devices[kind]
+            except Exception:
+                continue
             for it in items or []:
                 try:
                     out[str(getattr(it, "id", id(it)))] = it
@@ -284,12 +303,18 @@ def _do_fetch_token(email: str, password: str, code: str = "") -> str:
         auth = Auth("JARVIS/1.0", None, _save_token)
     except Exception as e:
         return f"Ring auth construction failed: {e}"
-    try:
-        if code:
-            auth.fetch_token(email, password, code)
-        else:
-            auth.fetch_token(email, password)
-    except Exception as e:
+    # ring_doorbell >= 0.9 only exposes async_fetch_token; run it on a
+    # private event loop so this stays callable from sync voice context.
+    if code:
+        res = _run_async(lambda: auth.async_fetch_token(email, password, code),
+                         timeout=20.0)
+    else:
+        res = _run_async(lambda: auth.async_fetch_token(email, password),
+                         timeout=20.0)
+    if res["timed_out"]:
+        return "Ring sign-in failed: timed out talking to Ring — please try again."
+    if res["error"] is not None:
+        e = res["error"]
         if code:
             return f"Ring sign-in failed: {e}"
         return ("2FA_REQUIRED: " + str(e))
