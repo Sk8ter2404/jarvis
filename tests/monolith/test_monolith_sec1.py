@@ -368,6 +368,33 @@ class SystemPromptTests(_MonolithTestBase):
         self.assertIn(self.bc.LOCATION, prompt)
         self.assertIn("7 conversations", prompt)
 
+    def test_build_system_prompt_records_stable_boundary(self):
+        # The stable-core/memory-section boundary feeds the second prompt-cache
+        # breakpoint: everything memory-derived (phrasebook rotation, facts,
+        # context line) must land AFTER it; the stable half must be a clean
+        # prefix ending exactly at the recorded offset.
+        mem = self.bc._empty_memory()
+        mem["facts"] = ["User drinks tea"]
+        with mock.patch.object(self.bc, "_load_chappie_standing_rules",
+                               return_value="RULESBLOCK"), \
+             mock.patch.object(self.bc._mcu_phrases, "render_phrasebook_block",
+                               return_value="PHRASEBOOK"), \
+             mock.patch.object(self.bc, "PC_CONTROL_ENABLED", True):
+            prompt = self.bc.build_system_prompt(mem)
+        n = self.bc._system_prompt_stable_len[0]
+        self.assertGreater(n, 0)
+        self.assertLessEqual(n, len(prompt))
+        stable, mem_sec = prompt[:n], prompt[n:]
+        # Stable half: base + rules + PC control; nothing memory-derived.
+        self.assertIn("RULESBLOCK", stable)
+        self.assertIn(self.bc.PC_CONTROL_PROMPT.strip()[:40], stable)
+        self.assertNotIn("PHRASEBOOK", stable)
+        self.assertNotIn("User drinks tea", stable)
+        # Memory half: phrasebook + context line + facts.
+        self.assertIn("PHRASEBOOK", mem_sec)
+        self.assertIn("User drinks tea", mem_sec)
+        self.assertIn("conversations", mem_sec)
+
     def test_build_system_prompt_omits_rules_block_when_empty(self):
         mem = self.bc._empty_memory()
         with mock.patch.object(self.bc, "_load_chappie_standing_rules",
@@ -405,36 +432,85 @@ class SystemPromptTests(_MonolithTestBase):
             prompt = self.bc.build_system_prompt(mem)
         self.assertNotIn("ADDITIONAL SKILL ACTIONS", prompt)
 
-    # ── _cached_system_param (Anthropic prompt-cache split) ─────────────────
-    def test_cached_system_param_splits_stable_and_volatile(self):
-        stable = "S" * 5000
-        with mock.patch.object(self.bc, "_system_prompt", stable):
-            blocks = self.bc._cached_system_param(stable + "TONE-ADDENDUM")
+    # ── _cached_system_param (Anthropic two-breakpoint prompt-cache split) ──
+    def _cached_param(self, full, base, stable_len):
+        """Call _cached_system_param with a controlled prompt + boundary."""
+        with mock.patch.object(self.bc, "_system_prompt", base), \
+             mock.patch.object(self.bc, "_system_prompt_stable_len",
+                               [stable_len]):
+            return self.bc._cached_system_param(full)
+
+    def test_cached_system_param_three_block_split(self):
+        core, mem_sec = "S" * 5000, "M" * 300
+        base = core + mem_sec
+        blocks = self._cached_param(base + "TONE-ADDENDUM", base, len(core))
         self.assertIsInstance(blocks, list)
-        self.assertEqual(len(blocks), 2)
-        self.assertEqual(blocks[0]["text"], stable)
+        self.assertEqual(len(blocks), 3)
+        self.assertEqual(blocks[0]["text"], core)
         self.assertEqual(blocks[0]["cache_control"], {"type": "ephemeral"})
-        self.assertEqual(blocks[1]["text"], "TONE-ADDENDUM")
+        self.assertEqual(blocks[1]["text"], mem_sec)
+        self.assertEqual(blocks[1]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(blocks[2]["text"], "TONE-ADDENDUM")
+        self.assertNotIn("cache_control", blocks[2])
+
+    def test_cached_system_param_empty_memory_section_two_blocks(self):
+        # Boundary at the very end of _system_prompt: no empty memory block
+        # may be emitted (Anthropic rejects empty text blocks).
+        base = "S" * 5000
+        blocks = self._cached_param(base + "TAIL", base, len(base))
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[0]["text"], base)
+        self.assertEqual(blocks[0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(blocks[1]["text"], "TAIL")
         self.assertNotIn("cache_control", blocks[1])
 
     def test_cached_system_param_no_tail(self):
-        stable = "S" * 5000
-        with mock.patch.object(self.bc, "_system_prompt", stable):
-            blocks = self.bc._cached_system_param(stable)
-        self.assertEqual(len(blocks), 1)
+        core, mem_sec = "S" * 5000, "M" * 300
+        base = core + mem_sec
+        blocks = self._cached_param(base, base, len(core))
+        self.assertEqual(len(blocks), 2)
         self.assertEqual(blocks[0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(blocks[1]["cache_control"], {"type": "ephemeral"})
+
+    def test_cached_system_param_unsane_boundary_falls_back(self):
+        # Boundary of 0 (never recorded), beyond len(_system_prompt), or below
+        # the worth-caching floor -> proven single-breakpoint split.
+        base = "S" * 5000 + "M" * 300
+        for bad in (0, len(base) + 1, 100, "oops"):
+            blocks = self._cached_param(base + "TAIL", base, bad)
+            self.assertEqual(len(blocks), 2, f"stable_len={bad!r}")
+            self.assertEqual(blocks[0]["text"], base)
+            self.assertEqual(blocks[0]["cache_control"], {"type": "ephemeral"})
+            self.assertEqual(blocks[1]["text"], "TAIL")
+            self.assertNotIn("cache_control", blocks[1])
+
+    def test_cached_system_param_memory_only_invalidation_shape(self):
+        # The point of the second breakpoint: the phrasebook (memory-derived)
+        # must land in block 2, never block 1, so a fact-learning rebuild only
+        # re-caches the small memory block.
+        mem = self.bc._empty_memory()
+        mem["facts"] = ["User drinks tea"]
+        with mock.patch.object(self.bc, "_load_chappie_standing_rules",
+                               return_value=""), \
+             mock.patch.object(self.bc._mcu_phrases, "render_phrasebook_block",
+                               return_value="PHRASEBOOK-MARKER"):
+            prompt = self.bc.build_system_prompt(mem)
+        blocks = self._cached_param(
+            prompt + "TAIL", prompt, self.bc._system_prompt_stable_len[0])
+        self.assertEqual(len(blocks), 3)
+        self.assertNotIn("PHRASEBOOK-MARKER", blocks[0]["text"])
+        self.assertIn("PHRASEBOOK-MARKER", blocks[1]["text"])
+        self.assertIn("User drinks tea", blocks[1]["text"])
 
     def test_cached_system_param_passthrough_when_not_prefix(self):
         # A prompt that doesn't start with _system_prompt (unusual caller)
         # passes through unchanged as a plain string.
-        with mock.patch.object(self.bc, "_system_prompt", "S" * 5000):
-            out = self.bc._cached_system_param("something else entirely")
+        out = self._cached_param("something else entirely", "S" * 5000, 5000)
         self.assertEqual(out, "something else entirely")
 
     def test_cached_system_param_passthrough_when_short(self):
         # Below the worth-caching guard the string is returned unchanged.
-        with mock.patch.object(self.bc, "_system_prompt", "short base"):
-            out = self.bc._cached_system_param("short base + tail")
+        out = self._cached_param("short base + tail", "short base", 10)
         self.assertEqual(out, "short base + tail")
 
     # ── long-term-memory bridge (_ltm_* helpers) ─────────────────────────────
