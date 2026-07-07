@@ -15739,6 +15739,12 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     "archive_email", "archive_message", "scrap_pending_draft", "discard_draft",
     #   phone_bridge.py — push confirmations ("Sent to your phone, sir.").
     "notify_phone", "text_my_phone", "push_to_phone",
+    #   Personal gitignored skills (vip_intercept / teams_screener) — send /
+    #   screen / answer / decline outcomes are the ONLY signal the keystroke
+    #   send happened ("Sent the reply, sir."); names verified against the live
+    #   skills' register() (generic identifiers, no PII). 2026-07-07 bug-hunt.
+    "send_vip_reply", "scrap_vip_reply",
+    "screen_teams_calls", "answer_call", "decline_call",
     #   face_id.py — enrol / forget confirmations.
     "enroll_face", "learn_my_face", "remember_this_person", "forget_face",
     #   guard_mode.py — on/off confirmations.
