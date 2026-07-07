@@ -72,6 +72,9 @@ LOG_LINE_MAX_LEN      = 140
 LOG_TAIL_BYTES        = 262144  # 256 KB
 WEB_TIMEOUT_SECONDS   = 4.0
 SLIDE_DURATION_MS     = 380     # slide-in animation length
+# 2026-07-06 audit finding [31]: how often the parent-side watcher polls the
+# TTS flag while deciding whether to push the card's expiry forward.
+EXPIRY_REFRESH_POLL_SECONDS = 0.5
 
 DDG_INSTANT_ANSWER_URL = (
     "https://api.duckduckgo.com/?q={q}&format=json&no_redirect=1&no_html=1"
@@ -333,6 +336,63 @@ def _load_state_safe() -> Optional[dict]:
             return json.load(f)
     except Exception:
         return None
+
+
+# ─── speak-time expiry refresh (2026-07-06 audit finding [31]) ───────────
+#
+# The HUD card's countdown used to start the moment the card was published,
+# so a long TTS read of the dossier could outlive the card — it expired while
+# JARVIS was still mid-sentence. The renderer is a subprocess (it can't see
+# bobert_companion's globals), but its 250 ms tick re-reads expiry_ts from the
+# state file every pass. So the fix lives here in the parent: a small daemon
+# watcher polls bobert_companion._tts_playback_active and, while speech is
+# active, keeps pushing expiry_ts forward — the countdown effectively starts
+# when JARVIS finishes speaking. If the flag is missing (older host, tests,
+# standalone --demo) the watcher never refreshes and behavior is exactly the
+# old fixed-duration countdown. Dismissal is untouched.
+
+def _tts_playback_active_flag() -> bool:
+    """Defensively read bobert_companion's single-element-list TTS flag
+    (added v1.96.0). Any missing module/attribute/shape → False."""
+    bc = sys.modules.get("bobert_companion")
+    try:
+        flag = getattr(bc, "_tts_playback_active", None) if bc else None
+        if isinstance(flag, (list, tuple)) and flag:
+            return bool(flag[0])
+    except Exception:
+        pass
+    return False
+
+
+def _refresh_expiry_if_speaking(shown_at: float) -> bool:
+    """One watcher step. Returns True while the watcher should keep polling:
+      • state gone / dismissed / replaced by a newer card → stop (False)
+      • TTS active → push expiry_ts forward, keep polling (True)
+      • TTS idle → keep polling only until the (untouched) expiry passes."""
+    cur = _load_state_safe()
+    if not cur or cur.get("dismissed"):
+        return False
+    if float(cur.get("shown_at", 0.0)) != shown_at:
+        return False    # a newer dossier card owns the state file now
+    now = time.time()
+    if _tts_playback_active_flag():
+        cur["expiry_ts"] = now + CARD_DURATION_SECONDS
+        try:
+            _write_state(cur)
+        except Exception as e:
+            print(f"  [dossier] expiry refresh write failed: {e}")
+        return True
+    return now < float(cur.get("expiry_ts", 0.0))
+
+
+def _start_expiry_refresh_watcher(shown_at: float) -> threading.Thread:
+    """Spawn the daemon watcher for the card published at shown_at."""
+    def _run() -> None:
+        while _refresh_expiry_if_speaking(shown_at):
+            time.sleep(EXPIRY_REFRESH_POLL_SECONDS)
+    t = threading.Thread(target=_run, name="dossier-expiry-refresh", daemon=True)
+    t.start()
+    return t
 
 
 # ─── renderer subprocess management ───────────────────────────────────────
@@ -613,6 +673,9 @@ def _act_dossier(arg: str) -> str:
         }
         _write_state(state)
         _ensure_renderer_running()
+        # 2026-07-06 audit finding [31]: hold the countdown while JARVIS is
+        # speaking the dossier so the card can't expire mid-sentence.
+        _start_expiry_refresh_watcher(state["shown_at"])
     except Exception as e:
         print(f"  [dossier] card render failed: {e}")
 
