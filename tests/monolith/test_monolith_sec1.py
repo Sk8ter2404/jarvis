@@ -377,6 +377,50 @@ class SystemPromptTests(_MonolithTestBase):
         self.assertNotIn("STANDING RULES", prompt)
         self.assertIn("PB", prompt)
 
+    # ── skill-contributed PROMPT_EXAMPLES (gitignored personal skills) ──────
+    def test_build_system_prompt_includes_skill_examples(self):
+        mem = self.bc._empty_memory()
+        with mock.patch.object(self.bc, "_load_chappie_standing_rules",
+                               return_value=""), \
+             mock.patch.object(self.bc._mcu_phrases, "render_phrasebook_block",
+                               return_value="PB"), \
+             mock.patch.object(self.bc, "PC_CONTROL_ENABLED", True), \
+             mock.patch.dict(self.bc._SKILL_PROMPT_EXAMPLES,
+                             {"my_personal_skill":
+                              "  my_action — does the thing\n"
+                              "    Example: [ACTION: my_action]"},
+                             clear=True):
+            prompt = self.bc.build_system_prompt(mem)
+        self.assertIn("ADDITIONAL SKILL ACTIONS", prompt)
+        self.assertIn("[ACTION: my_action]", prompt)
+
+    def test_build_system_prompt_no_skill_block_when_empty(self):
+        mem = self.bc._empty_memory()
+        with mock.patch.object(self.bc, "_load_chappie_standing_rules",
+                               return_value=""), \
+             mock.patch.object(self.bc._mcu_phrases, "render_phrasebook_block",
+                               return_value="PB"), \
+             mock.patch.dict(self.bc._SKILL_PROMPT_EXAMPLES, {}, clear=True):
+            prompt = self.bc.build_system_prompt(mem)
+        self.assertNotIn("ADDITIONAL SKILL ACTIONS", prompt)
+
+    def test_collect_skill_prompt_examples(self):
+        import types as _types
+        mod = _types.ModuleType("skill_fake")
+        mod.PROMPT_EXAMPLES = "  fake_action — x\n    Example: [ACTION: fake_action]"
+        bad = _types.ModuleType("skill_bad")
+        bad.PROMPT_EXAMPLES = 12345          # non-string → ignored, never fatal
+        empty = _types.ModuleType("skill_empty")   # no attribute at all
+        with mock.patch.dict(self.bc._SKILL_PROMPT_EXAMPLES, {}, clear=True):
+            self.bc._collect_skill_prompt_examples(mod, "fake")
+            self.bc._collect_skill_prompt_examples(bad, "bad")
+            self.bc._collect_skill_prompt_examples(empty, "empty")
+            self.assertEqual(set(self.bc._SKILL_PROMPT_EXAMPLES), {"fake"})
+            # Re-collect (hot reload) replaces, not duplicates.
+            mod.PROMPT_EXAMPLES = "  fake_action v2"
+            self.bc._collect_skill_prompt_examples(mod, "fake")
+            self.assertEqual(self.bc._SKILL_PROMPT_EXAMPLES["fake"], "fake_action v2")
+
 
 # ──────────────────────────────────────────────────────────────────────────
 #  _llm_quick / _parse_json_array

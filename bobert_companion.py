@@ -1390,6 +1390,11 @@ def build_system_prompt(memory: dict) -> str:
 
     if PC_CONTROL_ENABLED:
         prompt += PC_CONTROL_PROMPT
+        # Routing examples contributed by loaded skills (gitignored personal
+        # skills whose trigger phrases can't live in the tracked prompts.py).
+        # Empty until load_skills() has run — main() rebuilds the prompt once
+        # after skill loading so these are always present in the live prompt.
+        prompt += _skill_prompt_examples_block()
 
     days_known = 0
     try:
@@ -13956,6 +13961,43 @@ except Exception as _svc_exc:  # pragma: no cover - defensive: core.services is 
 
 _loaded_skill_names: set[str] = set()   # skills load_skills() has loaded
 
+# Routing examples contributed by skills at load time. A skill may define a
+# module-level ``PROMPT_EXAMPLES`` string (action names + trigger phrases +
+# an [ACTION: ...] example, same style as core/prompts.py); the loader
+# collects them here and build_system_prompt() appends them after
+# PC_CONTROL_PROMPT. This exists for GITIGNORED personal skills
+# (trip_planner, vip_intercept, ...) whose trigger phrases contain PII and
+# therefore must never be committed to the tracked core/prompts.py — without
+# it their actions are registered but the LLM has no example mapping and
+# mis-routes them (the 2026-07-06 audit's unroutable-action class). Tracked
+# skills should keep their examples in core/prompts.py as before.
+# Keyed by skill name so a hot-reload replaces rather than duplicates.
+_SKILL_PROMPT_EXAMPLES: dict[str, str] = {}
+
+
+def _collect_skill_prompt_examples(mod, name: str) -> None:
+    """Pick up an optional module-level PROMPT_EXAMPLES string from a
+    just-loaded skill. Best-effort — a malformed value is ignored, never
+    fatal to skill loading."""
+    try:
+        pe = getattr(mod, "PROMPT_EXAMPLES", None)
+        if isinstance(pe, str) and pe.strip():
+            _SKILL_PROMPT_EXAMPLES[name] = pe.strip()
+            print(f"  [skill] {name}: registered prompt examples "
+                  f"({len(pe.strip().splitlines())} line(s))")
+    except Exception:
+        pass
+
+
+def _skill_prompt_examples_block() -> str:
+    """The system-prompt block for skill-contributed routing examples, or ''
+    when no skill registered any."""
+    if not _SKILL_PROMPT_EXAMPLES:
+        return ""
+    parts = [_SKILL_PROMPT_EXAMPLES[k] for k in sorted(_SKILL_PROMPT_EXAMPLES)]
+    return ("\n\nADDITIONAL SKILL ACTIONS (locally-installed skills — same "
+            "[ACTION: ...] contract as above):\n" + "\n".join(parts))
+
 
 def load_skills():
     """Import every .py file and every package directory in ./skills/ and
@@ -14039,6 +14081,7 @@ def load_skills():
                     print(f"  [skill] {name}: added actions: {', '.join(sorted(added))}")
                 else:
                     print(f"  [skill] {name}: loaded (no new actions)")
+            _collect_skill_prompt_examples(mod, name)
             _loaded_skill_names.add(name)   # mark loaded only after success
         except Exception as e:
             print(f"  [skill] {name}: failed to load — {e}")
@@ -14494,6 +14537,29 @@ INFORMATIVE_ACTIONS = {
     # roll-call the follow-up LLM should summarise, same rationale as
     # who_is_on_wifi. The control surface routes via smart_home_control already.
     "tuya_list", "tuya_list_devices", "smart_life_list",
+    # ── 2026-07-06 overnight sweep: remaining multi-item / body read-outs ────
+    # Per-brand smart-home device lists (audit: "all per-brand device-list
+    # actions are silent — including the prompt's own example"). Same
+    # multi-device-summary rationale as who_is_on_wifi / tuya_list above.
+    "hue_list", "hue_list_devices", "govee_list", "govee_list_devices",
+    "lifx_list", "lifx_list_devices", "kasa_list", "kasa_list_devices",
+    "tplink_list", "ecobee_list_devices", "nest_list_devices",
+    "ring_list_devices",
+    # email_triage read-outs (skills/email_triage.py): the inbox roll-call,
+    # a message body, and a drafted reply are exactly the multi-item/body
+    # class the old 14541 comment deferred "to a later INFORMATIVE pass" —
+    # this is that pass. The follow-up LLM reads/summarises them for speech.
+    "list_unread", "unread_email", "unread_emails", "list_emails",
+    "read_thread", "read_email", "read_message",
+    "draft_reply", "pre_draft_reply", "compose_reply",
+    # notification_triage: "what did I miss" returns N recent notifications.
+    "recent_notifications_summary", "list_recent_notifications",
+    # Vision descriptions: same class as see_screen (already here) — the
+    # LLM should answer the user's question from the description.
+    "local_describe_screen", "kinect_look", "what_do_you_see_kinect",
+    # Amazon order tracker: order/delivery lists.
+    "check_orders", "check_amazon_orders", "amazon_orders",
+    "recent_delivery", "recent_deliveries",
 }
 
 # Actions whose RESULT is already a finished, user-facing sentence that should
@@ -14637,6 +14703,35 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     #     returns one finished sentence and prepends a FAILURE_MARKER on error,
     #     so success voices here and failures still route to the failure follow-up.
     "mcp_list_tools", "mcp_call", "mcp_reload",
+    # ── 2026-07-06 overnight sweep: remaining one-line read-outs ─────────────
+    # Smart-home SETUP read-outs — the PIN / auth instructions the user must
+    # HEAR to finish setup (audit: ecobee_request_pin's PIN was only ever
+    # printed to the console).
+    "ecobee_request_pin", "ecobee_authorize", "ring_authorize",
+    "nest_authorize", "hue_retry_connect",
+    # Aliases of already-voiced actions — same handler, other token dropped
+    # the answer depending on which name the LLM happened to emit.
+    "setup_workspace", "workspace_setup",        # = predictive_morning_setup
+    "scan_room",                                  # = who_is_here
+    "identify_speaker", "enrolled_voices",        # = whos_talking / list_enrolled_voices
+    "show_schedules", "list_schedule",            # = list_schedules
+    "pending_drafts", "edit_pending_draft",       # = list_pending_drafts (+ draft echo)
+    "point_targets",                              # = list_point_targets
+    "categorise_inbox",                           # = categorize_inbox (UK spelling)
+    # On-demand verdicts / confirmations that return one finished sentence:
+    "check_teams",
+    "categorize_inbox", "triage_inbox",
+    "email_briefing", "inbox_briefing",
+    "chappie_recall_entity",
+    # Kinect pointing / air-mouse outcomes ("On, sir — desk lamp." /
+    # calibration verdicts incl. honest-miss lines that carry no FAILURE_MARKER).
+    "point_control", "point_at", "point_calibrate", "calibrate_pointing",
+    "calibrate_air_mouse",
+    # TV-detect + Kinect-gaze toggles/calibration — status-bearing
+    # confirmations, same class as audio_autoswitch_on/off above.
+    "tv_detect_on", "tv_detect_off", "calibrate_tv_region", "tv_calibrate",
+    "gaze_tracking_on", "gaze_tracking_off", "calibrate_gaze",
+    "forget_gaze_calibration",
 }
 
 # Actions whose runtime can plausibly exceed MID_TASK_STATUS_DELAY (~8 s).
@@ -18808,6 +18903,13 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
 
     # Load any installed skills now so their actions are available
     load_skills()
+
+    # Skills may have contributed PROMPT_EXAMPLES (gitignored personal skills'
+    # routing lines). The system prompt was built BEFORE load_skills, so
+    # rebuild it once now to fold them in — otherwise those actions stay
+    # unroutable for the whole session.
+    if _SKILL_PROMPT_EXAMPLES:
+        _system_prompt = build_system_prompt(memory)
 
     # Spin up the three always-on diagnostic daemons (self-diag, crash
     # watcher, deep auditor). Wired in after load_skills so the self-diag
