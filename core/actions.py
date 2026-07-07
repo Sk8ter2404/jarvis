@@ -1223,12 +1223,29 @@ def _act_version_info(_: str = "") -> str:
         ver = release_ver  # single-source release version (core/version.py),
         #                    not the self-upgrade pipeline's internal counter
         ts_iso = data.get("last_upgrade_at") or ""
-        if not ts_iso:
-            return f"I'm on version {ver}, sir — no upgrade timestamp on file."
+        # last_upgrade_at is written ONLY by the self-upgrade pipeline —
+        # releases deployed via git checkout never touch version.json, so
+        # the reported date went stale (live bug: v1.99.0 announced as
+        # "last updated on May 30"). The VERSION file's mtime IS the deploy
+        # moment (checkout rewrites it on every release), so use whichever
+        # of the two is newer.
+        ts = None
         try:
-            ts = _dt.fromisoformat(ts_iso)
+            ts = _dt.fromisoformat(ts_iso) if ts_iso else None
         except Exception:
-            return f"I'm on version {ver}, last updated {ts_iso}."
+            ts = None
+        try:
+            _version_file = os.path.join(
+                os.path.dirname(os.path.abspath(bc.__file__)), "VERSION")
+            _mtime = _dt.fromtimestamp(os.path.getmtime(_version_file))
+            if ts is None or _mtime > ts:
+                ts = _mtime
+        except Exception:
+            pass
+        if ts is None:
+            if ts_iso:
+                return f"I'm on version {ver}, last updated {ts_iso}."
+            return f"I'm on version {ver}, sir — no upgrade timestamp on file."
         now = _dt.now()
         same_day = (ts.date() == now.date())
         yesterday = ((now.date() - ts.date()).days == 1)

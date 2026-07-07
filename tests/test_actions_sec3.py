@@ -271,6 +271,44 @@ class VersionInfoTests(unittest.TestCase):
                 out = A._act_version_info()
             self.assertIn("last updated not-a-date", out)
 
+    def test_version_file_mtime_overrides_stale_pipeline_date(self):
+        # last_upgrade_at is written only by the self-upgrade pipeline; a
+        # git-checkout release rewrites VERSION but not version.json, so the
+        # spoken date went stale (live bug: v1.99.0 announced as "last
+        # updated on May 30"). A VERSION file whose mtime is NEWER than
+        # last_upgrade_at must win.
+        with tempfile.TemporaryDirectory() as td:
+            self._write_version(td, {"last_upgrade_at": "2026-05-30T07:03:19"})
+            with open(os.path.join(td, "VERSION"), "w",
+                      encoding="utf-8") as f:
+                f.write("9.9.9\n")   # freshly written → mtime = now
+            bc = _base_bc(td)
+            with _patch_bc(bc):
+                out = A._act_version_info()
+            self.assertNotIn("May 30", out)     # stale date replaced
+            self.assertIn("this ", out)          # same-day phrasing from mtime
+
+    def test_stale_version_file_keeps_newer_pipeline_date(self):
+        # When last_upgrade_at is NEWER than the VERSION mtime (a genuine
+        # self-upgrade after the last release deploy), the pipeline date wins.
+        from datetime import datetime, timedelta
+        with tempfile.TemporaryDirectory() as td:
+            future = (datetime.now() + timedelta(days=1)).replace(microsecond=0)
+            self._write_version(td, {"last_upgrade_at": future.isoformat()})
+            with open(os.path.join(td, "VERSION"), "w",
+                      encoding="utf-8") as f:
+                f.write("9.9.9\n")
+            bc = _base_bc(td)
+            with _patch_bc(bc):
+                out = A._act_version_info()
+            self.assertIn("I'm on version", out)
+            # tomorrow's date renders via the >now branch — just pin that the
+            # mtime did NOT displace it back to "this ..." same-day phrasing
+            # relative to the file write moment ("this" would only appear if
+            # mtime won and now==mtime day; future date yields days_ago<0 →
+            # weekday phrasing).
+            self.assertNotIn("no upgrade timestamp", out)
+
     def test_same_day_morning_phrasing(self):
         # Freeze "now" and use a timestamp earlier the same day at 08:43.
         from datetime import datetime
