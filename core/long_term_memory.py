@@ -874,6 +874,13 @@ def reflect_and_consolidate(
         if ids[i] in to_delete:
             continue
         for j in range(i + 1, n):
+            # 2026-07-07 bug-hunt (LOW-MED): once ids[i] itself has been marked
+            # for deletion (by an earlier j in this same inner loop), STOP — a
+            # doomed fact must not keep matching and dragging OTHER facts into
+            # to_delete just because they're similar to it (cascade over-delete
+            # of a fact that's only a near-dup of the already-condemned one).
+            if ids[i] in to_delete:
+                break
             if ids[j] in to_delete:
                 continue
             sim = _cosine_sim(vecs[i], vecs[j])
@@ -881,13 +888,17 @@ def reflect_and_consolidate(
             if sim >= REFLECTOR_DUP_SIM:
                 # near-dup: drop the older one
                 a, b = ids[i], ids[j]
+                _before = len(to_delete)
                 with _lock:
                     if (_facts.get(a, {}).get("created_at", 0) <=
                             _facts.get(b, {}).get("created_at", 0)):
                         to_delete.add(a)
                     else:
                         to_delete.add(b)
-                summary["duplicates_removed"] += 1
+                # Count ACTUAL new deletions, not qualifying pairs — a fact
+                # already condemned must not inflate the tally.
+                if len(to_delete) > _before:
+                    summary["duplicates_removed"] += 1
                 continue
             if 0.6 <= sim < REFLECTOR_DUP_SIM and llm_call is not None:
                 a_text = texts[i]
