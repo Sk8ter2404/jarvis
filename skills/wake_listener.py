@@ -322,6 +322,30 @@ def _gate_and_announce(evt: dict) -> None:
               f"(voice_score={voice_score:.2f})")
 
     bobert = sys.modules.get("bobert_companion") or sys.modules.get("__main__")
+
+    # ── Barge-in: wake hit while JARVIS is speaking ──────────────────────
+    # request_tts_interrupt() is the monolith's barge-in entry point (see
+    # bobert_companion, feat/barge-in). It returns True ONLY when the
+    # core.config.BARGE_IN_ENABLED knob is on, TTS playback is actually
+    # live, AND the sentence currently being voiced does not itself contain
+    # "jarvis" (the echo gate — the mic hears the speakers). On acceptance
+    # we return WITHOUT announcing: JARVIS cuts his reply and goes quiet to
+    # listen; speaking "Yes, sir?" over the aborted tail would be noise.
+    # On False (knob off / not speaking / echo-gated) the legacy wake path
+    # below runs completely unchanged. This hook sits AFTER the biometric
+    # gate on purpose: an enrolled voiceprint further hardens the echo
+    # story, since JARVIS's TTS voice won't match the owner's embedding.
+    interrupt = getattr(bobert, "request_tts_interrupt", None)
+    if callable(interrupt):
+        try:
+            if interrupt(source="wake-listener"):
+                print(f"  [wake-listener] barge-in on '{phrase}' — "
+                      f"TTS cut, staying quiet to listen")
+                return
+        except Exception as e:
+            # Barge-in is best-effort; never let it break the wake path.
+            print(f"  [wake-listener] request_tts_interrupt failed: {e}")
+
     # `_sleep_mode` is a 1-element list ([False]/[True]) in bobert_companion,
     # accessed as _sleep_mode[0] (see self_diagnostic.py ~1041). A non-empty
     # list is always truthy, so the old bool read treated JARVIS as perpetually

@@ -728,8 +728,15 @@ from core.state import *  # noqa: F401,F403
 # How often to re-check what devices are connected (seconds)
 DEVICE_CHECK_INTERVAL = 4.0
 
-# Barge-in: let user interrupt JARVIS while he's speaking. Only active when
-# wearing a headset (otherwise speaker output would feedback through the mic).
+# Barge-in (LEGACY RMS/headset path): let user interrupt JARVIS while he's
+# speaking by talking loudly into a headset mic. Only active when wearing a
+# headset (otherwise speaker output would feedback through the mic).
+# NOTE: the SUPPORTED barge-in is now the wake-word path — see
+# core.config.BARGE_IN_ENABLED + request_tts_interrupt() below, which opens
+# no extra InputStream and therefore avoids the crash that killed this one.
+# This module-level constant deliberately shadows the config knob of the same
+# name (the wildcard import above brings it in, this rebind pins the legacy
+# path OFF); the wake-word path reads core.config live and is unaffected.
 BARGE_IN_ENABLED        = False   # disabled: barge-in InputStream teardown triggers a PortAudio use-after-free (0xc0000374) on a live mic
 BARGE_IN_THRESHOLD      = 0.015   # mic RMS to trigger interruption
 BARGE_IN_SUSTAIN_CHUNKS = 2       # consecutive loud chunks before aborting (~130ms)
@@ -9510,8 +9517,84 @@ def is_using_headset() -> bool:
         return False
 
 
-# Barge-in shared state
+# Barge-in shared state (legacy RMS/headset path — see BARGE_IN_ENABLED above)
 _barge_in_interrupted = False
+
+# ── Wake-word barge-in (v1.95.x, feat/barge-in) ───────────────────────────
+# A wake-word ENGINE hit (openwakeword/porcupine via skills/wake_listener.py)
+# that lands while play_with_lipsync is live can cut playback so the user
+# never waits out a long reply. This path is deliberately separate from the
+# legacy RMS listener above: it opens NO extra InputStream (the wake listener
+# already owns its own mic), so the 0xc0000374 PortAudio use-after-free that
+# killed the RMS path cannot recur here. sd.stop() is only ever called from
+# play_with_lipsync's sliced playback wait (_wait_done_or_barge) on the
+# caller's own thread — never from a PortAudio callback, never from the wake
+# listener's thread — mirroring the safe teardown contract documented on
+# _start_barge_in_listener().
+#
+# _tts_interrupt        — set by request_tts_interrupt(); polled every 50 ms
+#                         by the sliced playback wait in play_with_lipsync
+#                         (_wait_done_or_barge — worst-case abort latency well
+#                         under the 300 ms budget).
+# _tts_current_text     — single-element-list cell (the monolith's shared-
+#                         mutable idiom) holding the LOWERCASED text currently
+#                         in playback, published by _speak() right before
+#                         play_with_lipsync and cleared in its finally. This
+#                         is the airtight echo gate: the mic hears the
+#                         speakers, so when JARVIS himself is saying "jarvis"
+#                         a wake hit during that sentence is almost certainly
+#                         his own voice — refuse the interrupt.
+_tts_interrupt = threading.Event()
+_tts_current_text: list[str] = [""]
+
+
+def _barge_in_wake_enabled() -> bool:
+    """Live read of core.config.BARGE_IN_ENABLED (the NEW wake-word knob —
+    NOT this module's legacy BARGE_IN_ENABLED constant, which stays False
+    for the crashy RMS path). Fresh import per call mirrors the
+    STREAMING_TTS_ENABLED pattern so a Settings-GUI / user_settings.json
+    flip reaches the runtime without a restart. Any failure → False, i.e.
+    zero behaviour change."""
+    try:
+        from core import config as _cfg
+        return bool(getattr(_cfg, "BARGE_IN_ENABLED", False))
+    except Exception:
+        return False
+
+
+def request_tts_interrupt(source: str = "wake-word") -> bool:
+    """Barge-in entry point, called from skills/wake_listener.py when the
+    wake-word ENGINE fires while JARVIS is speaking. Returns True when the
+    interrupt was ACCEPTED — the caller must then swallow its wake
+    announcement (JARVIS just goes quiet and listens; no "yes sir?" spoken
+    over the tail of the aborted reply). Returns False when:
+
+      * the core.config.BARGE_IN_ENABLED knob is off (zero behaviour change),
+      * TTS playback isn't actually live (nothing to interrupt — the normal
+        wake path should proceed unchanged), or
+      * the sentence currently being spoken contains "jarvis" — the
+        echo-safety gate. The mic hears the speakers, so an engine hit
+        during a self-referential sentence is treated as JARVIS's own voice
+        and ignored. Cheap and airtight; deliberately conservative (a real
+        user barging in during such a sentence loses this one race, and the
+        wake path still handles them the moment playback ends).
+
+    Only sets the event — the actual sd.stop() runs inside
+    play_with_lipsync's sliced playback wait (_wait_done_or_barge), on the
+    caller thread that already owns the utterance: a plain non-callback
+    thread, the documented safe context for stopping PortAudio streams in
+    this codebase."""
+    if not _barge_in_wake_enabled():
+        return False
+    if not _tts_playback_active[0]:
+        return False
+    if "jarvis" in (_tts_current_text[0] or ""):
+        print(f"  [barge-in] wake hit ignored (own TTS says 'jarvis'), "
+              f"source={source}")
+        return False
+    print(f"  [barge-in] wake-word interrupt accepted, source={source}")
+    _tts_interrupt.set()
+    return True
 
 
 def _start_barge_in_listener():
@@ -9768,6 +9851,11 @@ def play_with_lipsync(audio: np.ndarray, sr: int):
     # guard — a device refresh firing here otherwise frees PortAudio state
     # under the live barge-in stream (0xc0000374). Reset in the finally below.
     _tts_playback_active[0] = True
+    # A stale interrupt from a previous utterance (e.g. one that raced the
+    # end of playback and set the event after that utterance's wait loop
+    # exited) must not kill THIS utterance at its first chunk — start every
+    # playback with a clean slate.
+    _tts_interrupt.clear()
     out_dev = get_output_device()
 
     def _play_audio_safe():
@@ -9814,6 +9902,34 @@ def play_with_lipsync(audio: np.ndarray, sr: int):
                     return
         barge_watch_thread = threading.Thread(target=_barge_watch, daemon=True)
         barge_watch_thread.start()
+
+    # Wake-word barge-in wait: request_tts_interrupt() (fired from
+    # skills/wake_listener.py on an engine hit) only SETS _tts_interrupt;
+    # sd.stop() must run from a safe context. Deliberately NOT a watch thread
+    # (the legacy _barge_watch pattern): play_with_lipsync's caller thread is
+    # already parked on a bounded _done_evt.wait() during playback, so we
+    # slice that same wait into 50 ms polls and issue sd.stop() right here —
+    # a plain (non-callback) thread, the same context the timeout-recovery
+    # sd.stop() below already uses. Zero extra threads, and abort latency is
+    # one poll slice (≤50 ms), comfortably inside the 300 ms budget. After
+    # sd.stop() the native stream closes, sd.wait() returns, _done_evt sets,
+    # and the function falls through its normal finally — state flags are
+    # cleaned up exactly as if the reply had finished on its own.
+    def _wait_done_or_barge(done_evt: threading.Event, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        stop_issued = False
+        while not done_evt.wait(timeout=0.05):
+            if time.monotonic() >= deadline:
+                return   # timed out — caller's force-stop recovery takes over
+            if not stop_issued and _tts_interrupt.is_set():
+                # Set only via request_tts_interrupt(), which already gated
+                # on the config knob + the "own TTS says jarvis" echo rule.
+                print("  [barge-in] cutting TTS playback (wake word)")
+                try:
+                    sd.stop()
+                except Exception:
+                    pass
+                stop_issued = True   # keep waiting for the stream to close
 
     # Duck Chrome / Spotify / Apple Music / Edge so JARVIS sits cleanly
     # over whatever's already playing. Fades down in the background so
@@ -9865,9 +9981,12 @@ def play_with_lipsync(audio: np.ndarray, sr: int):
 
     try:
         if _muted:
-            # Replace the device write with a plain sleep — keeps the
-            # surrounding amp_thread + barge-in watchdog logic identical.
-            time.sleep(min(audio_secs, 30.0))
+            # Replace the device write with a sleep — keeps the surrounding
+            # amp_thread + barge-in watchdog logic identical. Waiting on
+            # _tts_interrupt (instead of time.sleep) keeps the muted path
+            # barge-in-responsive too: an accepted interrupt ends the
+            # simulated playback immediately, same as sd.stop() would.
+            _tts_interrupt.wait(timeout=min(audio_secs, 30.0))
         elif not ROBOT_ENABLED:
             # 2026-05-29 silent-crash fix: sd.wait() blocks until the stream
             # closes natively, and sounddevice's close() at C-level SIGSEGVs
@@ -9887,7 +10006,9 @@ def play_with_lipsync(audio: np.ndarray, sr: int):
             _t.start()
             # Bound the wait at audio length + 2s grace; if it stalls past
             # that, force-stop the stream and move on. Process stays alive.
-            _done_evt.wait(timeout=max(audio_secs + 2.0, 5.0))
+            # Sliced into 50 ms polls so a wake-word barge-in can cut
+            # playback mid-wait (see _wait_done_or_barge above).
+            _wait_done_or_barge(_done_evt, max(audio_secs + 2.0, 5.0))
             if not _done_evt.is_set():
                 try: sd.stop()  # pragma: no cover - timeout-recovery: only runs if a live sd.wait() hangs past the grace window
                 except Exception: pass  # pragma: no cover - timeout-recovery: only runs if a live sd.wait() hangs past the grace window
@@ -9929,7 +10050,9 @@ def play_with_lipsync(audio: np.ndarray, sr: int):
                     _done_evt.set()
             _t = threading.Thread(target=_safe_wait_robot, daemon=True)
             _t.start()
-            _done_evt.wait(timeout=max(audio_secs + 2.0, 5.0))
+            # Same sliced wait as the no-robot branch — barge-in works with
+            # the robot connected too.
+            _wait_done_or_barge(_done_evt, max(audio_secs + 2.0, 5.0))
             if not _done_evt.is_set():
                 try: sd.stop()  # pragma: no cover - timeout-recovery: only runs if a live sd.wait() hangs past the grace window (robot arm)
                 except Exception: pass  # pragma: no cover - timeout-recovery: only runs if a live sd.wait() hangs past the grace window (robot arm)
@@ -9952,6 +10075,12 @@ def play_with_lipsync(audio: np.ndarray, sr: int):
                 barge_watch_thread.join(timeout=0.2)
             except Exception:
                 pass
+        # Wake-word barge-in cleanup: clear the interrupt so the flag can't
+        # leak into the next utterance (belt AND the clear-at-start braces
+        # above). Runs whether playback finished naturally or was cut short —
+        # after this point the system is in exactly the state a completed
+        # reply would leave it in.
+        _tts_interrupt.clear()
         # Ensure HUD doesn't show stale amplitude after playback
         _write_hud_state(tts_amplitude=0.0)
         if barge_stream is not None:
@@ -17065,6 +17194,14 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
             _last_wry[0] = wry_flag
             _last_mood[0] = chosen_mood
             set_state("speaking")
+            # Publish the sentence about to be voiced for the wake-word
+            # barge-in echo gate (request_tts_interrupt refuses to interrupt
+            # while this text contains "jarvis" — the mic hears the speakers,
+            # so an engine hit during that sentence is JARVIS's own voice).
+            # Lowercased once here so the hot interrupt path is a plain `in`.
+            # Set inside _SPEAK_LOCK, so it always describes THE utterance
+            # currently owning the audio device; cleared in the finally.
+            _tts_current_text[0] = (spoken_text or "").lower()
             audio_out, sr = synthesise(spoken_text)
             if volume_scale != 1.0:
                 try:
@@ -17097,6 +17234,13 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
             # session. _speak is the sole caller and nothing is playing once it
             # returns, so force the guard back to False here.
             _tts_playback_active[0] = False
+            # Wake-word barge-in bookkeeping: no utterance owns the speakers
+            # any more, so clear the echo-gate text (a stale sentence
+            # containing "jarvis" would otherwise suppress legitimate
+            # barge-ins on the NEXT reply) and drop any interrupt that raced
+            # the end of playback so it can't leak into the next utterance.
+            _tts_current_text[0] = ""
+            _tts_interrupt.clear()
 
 
 def _do_proactive_turn(memory: dict):

@@ -3261,5 +3261,134 @@ class StreamingTtsTests(_MonolithTestBase):
         self.assertEqual(self.bc._stream_spoken_prefix[0], "")
 
 
+# ──────────────────────────────────────────────────────────────────────────
+#  Wake-word barge-in (feat/barge-in): request_tts_interrupt + the
+#  interruptible playback path.
+# ──────────────────────────────────────────────────────────────────────────
+class BargeInTests(_MonolithTestBase):
+    """request_tts_interrupt() gating logic + the muted-playback abort path.
+
+    The knob lives in core.config (read live via _barge_in_wake_enabled), so
+    tests patch ``core.config.BARGE_IN_ENABLED`` — NOT the monolith's legacy
+    module-level constant of the same name (that one pins the crashy RMS path
+    off and must stay untouched). ``_tts_interrupt`` is a threading.Event the
+    harness identity-restores only, so every test that could set it clears it
+    in addCleanup."""
+
+    def setUp(self):
+        super().setUp()
+        import core.config as _cfg
+        self.cfg = _cfg
+        # Never leak a set interrupt or a stale echo-gate sentence.
+        self.addCleanup(self.bc._tts_interrupt.clear)
+        self.addCleanup(lambda: self.bc._tts_current_text.__setitem__(0, ""))
+        self.addCleanup(lambda: self.bc._tts_playback_active.__setitem__(0, False))
+
+    # -- request_tts_interrupt gating ------------------------------------
+
+    def test_knob_off_refuses_interrupt(self):
+        self.bc._tts_playback_active[0] = True
+        self.bc._tts_current_text[0] = "the weather is clear, sir."
+        with mock.patch.object(self.cfg, "BARGE_IN_ENABLED", False):
+            self.assertFalse(self.bc.request_tts_interrupt())
+        self.assertFalse(self.bc._tts_interrupt.is_set())
+
+    def test_not_speaking_refuses_interrupt(self):
+        self.bc._tts_playback_active[0] = False
+        with mock.patch.object(self.cfg, "BARGE_IN_ENABLED", True):
+            self.assertFalse(self.bc.request_tts_interrupt())
+        self.assertFalse(self.bc._tts_interrupt.is_set())
+
+    def test_echo_gate_blocks_when_tts_says_jarvis(self):
+        # JARVIS's own voice saying "jarvis" through the speakers must not
+        # self-interrupt: the currently-spoken sentence contains the wake
+        # word, so the hit is presumed to be echo and refused.
+        self.bc._tts_playback_active[0] = True
+        self.bc._tts_current_text[0] = "jarvis online and at your service."
+        with mock.patch.object(self.cfg, "BARGE_IN_ENABLED", True):
+            self.assertFalse(self.bc.request_tts_interrupt())
+        self.assertFalse(self.bc._tts_interrupt.is_set())
+
+    def test_clean_wake_hit_during_playback_sets_interrupt(self):
+        self.bc._tts_playback_active[0] = True
+        self.bc._tts_current_text[0] = "the print is at forty percent, sir."
+        with mock.patch.object(self.cfg, "BARGE_IN_ENABLED", True):
+            self.assertTrue(self.bc.request_tts_interrupt(source="test"))
+        self.assertTrue(self.bc._tts_interrupt.is_set())
+
+    def test_helper_fails_closed_when_knob_missing(self):
+        # An older core/config.py without the knob (or a botched override)
+        # must read as DISABLED — barge-in fails closed, never open.
+        had = hasattr(self.cfg, "BARGE_IN_ENABLED")
+        saved = getattr(self.cfg, "BARGE_IN_ENABLED", None)
+        try:
+            if had:
+                delattr(self.cfg, "BARGE_IN_ENABLED")
+            self.assertFalse(self.bc._barge_in_wake_enabled())
+        finally:
+            if had:
+                setattr(self.cfg, "BARGE_IN_ENABLED", saved)
+
+    # -- playback abort + state cleanup ----------------------------------
+
+    def _run_muted_playback(self, secs: float, knob: bool,
+                            interrupt_after: float | None = None) -> float:
+        """Run play_with_lipsync down its MUTE_TTS branch (no audio device is
+        opened) with the heavy side-effects stubbed, optionally firing a
+        wake-word interrupt mid-playback. Returns the elapsed wall time."""
+        bc = self.bc
+        import numpy as np
+        audio = np.zeros(int(16000 * secs), dtype=np.float32)
+        muted_layer = mock.MagicMock()
+        muted_layer.is_muted.return_value = True
+        timer = None
+        if interrupt_after is not None:
+            def _fire():
+                bc.request_tts_interrupt(source="test-timer")
+            timer = threading.Timer(interrupt_after, _fire)
+        with mock.patch.object(self.cfg, "BARGE_IN_ENABLED", knob), \
+             mock.patch.object(bc, "_tts_layer", muted_layer), \
+             mock.patch.object(bc, "_audio_ducker", mock.MagicMock()), \
+             mock.patch.object(bc, "_feed_playback_reference", mock.MagicMock()), \
+             mock.patch.object(bc, "_write_hud_state", mock.MagicMock()), \
+             mock.patch.object(bc, "get_output_device", return_value=None):
+            start = time.monotonic()
+            if timer is not None:
+                timer.start()
+            try:
+                bc.play_with_lipsync(audio, 16000)
+            finally:
+                if timer is not None:
+                    timer.cancel()
+            return time.monotonic() - start
+
+    def test_interrupt_aborts_playback_promptly(self):
+        # 5 s of (muted) audio, interrupted at ~0.1 s → the playback wait
+        # must end almost immediately, not ride out the full clip. The 2 s
+        # ceiling is deliberately generous for a loaded CI box; the real
+        # budget (<300 ms after the interrupt) is comfortably inside it.
+        elapsed = self._run_muted_playback(5.0, knob=True, interrupt_after=0.1)
+        self.assertLess(elapsed, 2.0)
+        # State cleanup: playback flag dropped, interrupt consumed — the
+        # system is back to the exact posture a finished reply leaves.
+        self.assertFalse(self.bc._tts_playback_active[0])
+        self.assertFalse(self.bc._tts_interrupt.is_set())
+
+    def test_knob_off_playback_runs_to_completion(self):
+        # With the knob off the interrupt request is refused, so playback
+        # rides out the full (short) clip — zero behaviour change.
+        elapsed = self._run_muted_playback(0.6, knob=False, interrupt_after=0.05)
+        self.assertGreaterEqual(elapsed, 0.5)
+        self.assertFalse(self.bc._tts_interrupt.is_set())
+
+    def test_stale_interrupt_cleared_at_playback_start(self):
+        # An interrupt that raced the END of a previous utterance must not
+        # kill the next one: play_with_lipsync clears the event on entry.
+        self.bc._tts_interrupt.set()
+        elapsed = self._run_muted_playback(0.6, knob=True)
+        self.assertGreaterEqual(elapsed, 0.5)
+        self.assertFalse(self.bc._tts_interrupt.is_set())
+
+
 if __name__ == "__main__":
     unittest.main()

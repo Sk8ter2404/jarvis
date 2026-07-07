@@ -716,6 +716,78 @@ class GateAndAnnounceTests(unittest.TestCase):
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Wake-word barge-in hook in _gate_and_announce (feat/barge-in):
+# an ENGINE wake hit while JARVIS is speaking calls
+# bobert_companion.request_tts_interrupt(); on acceptance the wake
+# announcement is SWALLOWED (JARVIS goes quiet and listens), on refusal
+# the legacy announce path runs unchanged.
+# ──────────────────────────────────────────────────────────────────────
+class BargeInHookTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, _ = load_listener()
+        self.addCleanup(lambda: sys.modules.pop("bobert_companion", None))
+
+    def _bc(self, interrupt, asleep=True):
+        bc = types.ModuleType("bobert_companion")
+        bc._sleep_mode = [asleep]
+        bc.proactive_announce = mock.MagicMock()
+        if interrupt is not None:
+            bc.request_tts_interrupt = interrupt
+        return bc
+
+    def test_accepted_interrupt_swallows_announcement(self):
+        # Barge-in accepted → TTS was cut; even though JARVIS is "asleep"
+        # (announce would normally fire) we must stay quiet and listen.
+        interrupt = mock.MagicMock(return_value=True)
+        bc = self._bc(interrupt, asleep=True)
+        with mock.patch.object(self.mod, "_gate_is_strict", return_value=False), \
+             inject_modules(bobert_companion=bc):
+            self.mod._gate_and_announce({"phrase": "jarvis"})
+        interrupt.assert_called_once_with(source="wake-listener")
+        bc.proactive_announce.assert_not_called()
+
+    def test_refused_interrupt_falls_through_to_announce(self):
+        # request_tts_interrupt returns False (knob off / not speaking /
+        # echo-gated) → the legacy wake path runs completely unchanged.
+        interrupt = mock.MagicMock(return_value=False)
+        bc = self._bc(interrupt, asleep=True)
+        with mock.patch.object(self.mod, "_gate_is_strict", return_value=False), \
+             inject_modules(bobert_companion=bc):
+            self.mod._gate_and_announce({"phrase": "jarvis"})
+        bc.proactive_announce.assert_called_once()
+
+    def test_interrupt_exception_never_breaks_wake_path(self):
+        # Barge-in is best-effort — a raising hook must not swallow the wake.
+        interrupt = mock.MagicMock(side_effect=RuntimeError("boom"))
+        bc = self._bc(interrupt, asleep=True)
+        with mock.patch.object(self.mod, "_gate_is_strict", return_value=False), \
+             inject_modules(bobert_companion=bc):
+            self.mod._gate_and_announce({"phrase": "jarvis"})  # no raise
+        bc.proactive_announce.assert_called_once()
+
+    def test_missing_hook_keeps_legacy_behaviour(self):
+        # Older monolith without request_tts_interrupt → identical to before.
+        bc = self._bc(None, asleep=True)
+        with mock.patch.object(self.mod, "_gate_is_strict", return_value=False), \
+             inject_modules(bobert_companion=bc):
+            self.mod._gate_and_announce({"phrase": "jarvis"})
+        bc.proactive_announce.assert_called_once()
+
+    def test_biometric_rejection_still_blocks_barge_in(self):
+        # The voiceprint gate runs BEFORE the barge-in hook: an unverified
+        # speaker can neither wake JARVIS nor cut his speech.
+        interrupt = mock.MagicMock(return_value=True)
+        bc = self._bc(interrupt, asleep=True)
+        with mock.patch.object(self.mod, "_gate_is_strict", return_value=True), \
+             mock.patch.object(self.mod, "_identify_recent_speaker",
+                               return_value=(None, 0.2)), \
+             inject_modules(bobert_companion=bc):
+            self.mod._gate_and_announce({"phrase": "jarvis"})
+        interrupt.assert_not_called()
+        bc.proactive_announce.assert_not_called()
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Voice-tap lifecycle: _start_voice_tap / _drain_voice_tap / _stop_voice_tap
 # ──────────────────────────────────────────────────────────────────────
 class VoiceTapTests(unittest.TestCase):
