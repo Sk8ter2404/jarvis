@@ -585,6 +585,39 @@ class HudKinectPreviewWriteTests(MonolithGlobalsTestCase):
                                   return_value=None):
             self.assertFalse(self.bc._hud_kinect_preview_write(now=3.0))
 
+    def test_throttle_skips_compose_when_not_due(self):
+        # Finding #15 (2026-07-08): the MIN_GAP throttle must be checked BEFORE
+        # building the (expensive) composite, not after — otherwise ~2/3 of
+        # composites are built then discarded by _hud_camera_preview_write.
+        bc = self.bc
+        compose = mock.Mock(return_value=None)
+        with mock.patch.object(bc, "_hud_kinect_skeleton_overlay_enabled",
+                               return_value=True), \
+                mock.patch.object(bc, "_compose_kinect_preview", compose), \
+                mock.patch.object(bc, "_hud_cam_preview_last_write", [100.0]):
+            # now is only 0.01s after the last write — well under MIN_GAP (0.15s).
+            ok = bc._hud_kinect_preview_write(now=100.0 + 0.01)
+        self.assertFalse(ok)
+        compose.assert_not_called()      # the composite was NOT built
+
+    def test_composes_when_write_is_due(self):
+        # Companion to the throttle test: once enough time has elapsed the
+        # composite IS built and handed to the writer.
+        np = _np()
+        composed = np.full((8, 8, 3), 5, dtype=np.uint8)
+        bc = self.bc
+        compose = mock.Mock(return_value=composed)
+        write = mock.Mock(return_value=True)
+        with mock.patch.object(bc, "_hud_kinect_skeleton_overlay_enabled",
+                               return_value=True), \
+                mock.patch.object(bc, "_compose_kinect_preview", compose), \
+                mock.patch.object(bc, "_hud_camera_preview_write", write), \
+                mock.patch.object(bc, "_hud_cam_preview_last_write", [0.0]):
+            ok = bc._hud_kinect_preview_write(now=1000.0)   # far past → due
+        self.assertTrue(ok)
+        compose.assert_called_once()
+        self.assertIs(write.call_args.args[0], composed)
+
 
 @requires_monolith
 class OverlayEnabledFlagTests(MonolithGlobalsTestCase):
@@ -758,6 +791,40 @@ class SideTileWebcamReadTests(MonolithGlobalsTestCase):
             out = self.bc._read_side_tile_webcams(now=4000.0)
         self.assertEqual(calls["n"], opens_after_first)    # no re-open
         self.assertIsNotNone(out["left"])
+
+    def test_release_if_open_frees_handles_and_clears_flag(self):
+        # Finding #7 (2026-07-08): entering a composite-stopping state (camera_off
+        # / preview-disabled) must release the side-tile handles, not just the
+        # overlay on→off edge. The extracted helper does exactly that, once.
+        bc = self.bc
+        cap_l = self._FakeCap(10)
+        cap_r = self._FakeCap(20)
+        bc._kinect_tile_caps["left"] = cap_l
+        bc._kinect_tile_caps["right"] = cap_r
+        bc._kinect_preview_tiles_open[0] = True
+        try:
+            bc._release_side_tile_webcams_if_open()
+            self.assertTrue(cap_l.released)
+            self.assertTrue(cap_r.released)
+            self.assertFalse(bc._kinect_preview_tiles_open[0])
+            self.assertIsNone(bc._kinect_tile_caps["left"])
+            self.assertIsNone(bc._kinect_tile_caps["right"])
+        finally:
+            bc._kinect_preview_tiles_open[0] = False
+
+    def test_release_if_open_is_noop_when_flag_false(self):
+        # Idempotency guard: when the tiles-open flag is False the helper must NOT
+        # touch the handle (release fires once per open→closed edge, not every
+        # frame while parked in the camera-off state).
+        bc = self.bc
+        cap_l = self._FakeCap(10)
+        bc._kinect_tile_caps["left"] = cap_l
+        bc._kinect_preview_tiles_open[0] = False
+        try:
+            bc._release_side_tile_webcams_if_open()
+            self.assertFalse(cap_l.released)   # untouched — no edge to act on
+        finally:
+            bc._release_side_tile_webcams()    # clean up the fake handle
 
 
 # ══════════════════════════════════════════════════════════════════════════

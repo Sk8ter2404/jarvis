@@ -564,6 +564,19 @@ class HandleNotificationTests(_IsolatedTriageBase):
         self.mod._handle_notification(_make_notification(nid=5, texts=("x", "y")))
         self.assertLessEqual(len(self.mod._seen_ids), 4000 + 1)
 
+    def test_snooze_dict_pruned_of_stale_stamps(self):
+        # _snooze must not grow unbounded: stamps older than SNOOZE_SECONDS can
+        # never suppress again, so _prune_snooze evicts them. Seed an old stamp +
+        # a fresh one, prune at 'now', and confirm only the fresh one survives.
+        now = 1_000_000.0
+        with self.mod._state_lock:
+            self.mod._snooze.clear()
+            self.mod._snooze["app|old"] = now - self.mod.SNOOZE_SECONDS - 1  # expired
+            self.mod._snooze["app|fresh"] = now - 1                          # still live
+        self.mod._prune_snooze(now)
+        self.assertNotIn("app|old", self.mod._snooze)
+        self.assertIn("app|fresh", self.mod._snooze)
+
     def test_drop_action_not_logged(self):
         self.mod._rules = self._drop_all_rule()
         with mock.patch.object(self.mod, "_persist_to_log") as plog:

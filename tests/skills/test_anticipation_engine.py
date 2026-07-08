@@ -865,6 +865,50 @@ class AnticipationStatusAndQueueTests(_EngineTestBase):
                                side_effect=OSError("read-only fs")):
             self.mod._enqueue_speech("dropped line")   # must not raise
 
+    def test_enqueue_speech_routes_through_proactive_announce(self):
+        # #12: when bobert_companion exposes proactive_announce, the line must go
+        # through that serialized / focus-gated writer and NOT a bare local queue
+        # write — so it can't race the other co-writers or leak past focus/DND.
+        calls = []
+        bc = types.ModuleType("bobert_companion")
+
+        def _announce(message, source="skill", **kw):
+            calls.append((message, source))
+            return True
+        bc.proactive_announce = _announce
+        fd, qp = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        os.unlink(qp)   # no file present, so any local fallback write would create it
+        try:
+            with inject_modules(bobert_companion=bc), \
+                 mock.patch.object(self.mod, "_SPEECH_QUEUE", qp):
+                self.mod._enqueue_speech("Shall I begin, sir?")
+            self.assertEqual(calls, [("Shall I begin, sir?", "anticipation")])
+            # Announce handled it → no local fallback file written.
+            self.assertFalse(os.path.exists(qp))
+        finally:
+            if os.path.exists(qp):
+                os.unlink(qp)
+
+    def test_enqueue_speech_falls_back_when_announce_returns_falsy(self):
+        # #12: a falsy proactive_announce (e.g. transiently unavailable) must NOT
+        # be treated as handled — the line falls back to the local atomic write so
+        # it is never silently lost.
+        bc = types.ModuleType("bobert_companion")
+        bc.proactive_announce = lambda message, source="skill", **kw: False
+        fd, qp = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        try:
+            with inject_modules(bobert_companion=bc), \
+                 mock.patch.object(self.mod, "_SPEECH_QUEUE", qp):
+                self.mod._enqueue_speech("fallback line")
+            with open(qp, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertEqual(len(data), 1)
+            self.assertEqual(data[0]["message"], "fallback line")
+        finally:
+            os.unlink(qp)
+
 
 # ─── full scheduler-loop drive ────────────────────────────────────────────
 class AnticipationSchedulerLoopTests(_EngineTestBase):

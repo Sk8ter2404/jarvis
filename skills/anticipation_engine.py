@@ -132,7 +132,23 @@ _dwell_state: dict = {
 # ─── speech queue ────────────────────────────────────────────────────────
 
 def _enqueue_speech(message: str) -> None:
-    """Append a spoken alert to pending_speech.json for the main loop."""
+    """Route a proactive line through bobert_companion.proactive_announce()
+    — the canonical, serialized writer for pending_speech.json — and only fall
+    back to a direct atomic write when the parent module isn't importable yet
+    (import-time / unit tests). Going through proactive_announce restores the
+    shared-lock serialization, the focus / DND gate, and the 50-entry cap that a
+    bare local write silently bypasses. Mirrors the exact pattern in
+    skills/wellness.py and skills/daily_recap.py so every co-writer of
+    pending_speech.json funnels through the same path. 2026-07-08.
+    """
+    try:
+        bc = importlib.import_module("bobert_companion")
+        announcer = getattr(bc, "proactive_announce", None)
+        if callable(announcer) and announcer(message, source="anticipation"):
+            return
+    except Exception:
+        pass
+
     with _speech_lock:
         data = []
         if os.path.exists(_SPEECH_QUEUE):

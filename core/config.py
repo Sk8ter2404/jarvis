@@ -1219,7 +1219,15 @@ def _apply_user_settings() -> None:
                 else:
                     g[key] = int(val)
             elif isinstance(cur, bool):
-                g[key] = bool(val)
+                # A JSON *string* boolean ("true"/"false") — which the Settings
+                # GUI's coerce_value accepts and can write — would be mis-read by
+                # a bare bool(val): bool("false") is True. Parse string truthiness
+                # the same way settings_window.coerce_value does so the runtime
+                # constant and the GUI never disagree. 2026-07-08.
+                if isinstance(val, str):
+                    g[key] = val.strip().lower() in ("1", "true", "yes", "on", "y")
+                else:
+                    g[key] = bool(val)
             elif isinstance(cur, float):
                 g[key] = float(val)
             elif isinstance(cur, str):

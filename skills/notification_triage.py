@@ -273,7 +273,8 @@ def _save_dedupe_state() -> None:
             payload = {
                 "ts":       _time.time(),
                 "seen_ids": list(_seen_ids)[-2000:],   # cap at 2000 ids
-                "snooze":   dict(_snooze),
+                # cap at the 2000 most-recent stamps (already pruned to <=5min old)
+                "snooze":   dict(sorted(_snooze.items(), key=lambda kv: kv[1])[-2000:]),
             }
         fd, tmp = _tempfile.mkstemp(dir=d, prefix=".notif_", suffix=".tmp")
         try:
@@ -541,6 +542,22 @@ def _prune_announce_dedup(now: float | None = None) -> None:
         stale = [k for k, ts in _announce_dedup.items() if ts < cutoff]
         for k in stale:
             _announce_dedup.pop(k, None)
+
+
+def _prune_snooze(now: float | None = None) -> None:
+    """Drop snooze stamps older than SNOOZE_SECONDS. Once a stamp is that old the
+    gate `now - last < SNOOZE_SECONDS` can never suppress again, so keeping it
+    only grows _snooze (and the persisted file) without bound. This is the pruner
+    the four sibling dedupe dicts already have; _snooze was the one missed — its
+    key is `app|title[:80]`, so highly-variable notification titles accumulate one
+    permanent entry each over a long-running session. 2026-07-08."""
+    if now is None:
+        now = _time.time()
+    cutoff = now - SNOOZE_SECONDS
+    with _state_lock:
+        stale = [k for k, ts in _snooze.items() if ts < cutoff]
+        for k in stale:
+            _snooze.pop(k, None)
 
 
 def _load_announce_dedup() -> None:
@@ -1139,6 +1156,7 @@ def _handle_notification(notification) -> None:
             last = _snooze.get(dedupe_key, 0.0)
         if now - last < SNOOZE_SECONDS:
             return
+        _prune_snooze(now)   # evict expired stamps so _snooze can't grow unbounded
         with _state_lock:
             _snooze[dedupe_key] = now
         # Persist the snooze stamp before we announce so a bounce mid-TTS
