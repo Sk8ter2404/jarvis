@@ -3425,6 +3425,28 @@ class FistReleaseTests(_Base):
         c.update(left, right, "open", "closed", True, armed=True)
         self.assertTrue(c.engaged)          # knob off → a long fist stays a drag
 
+    def test_fist_releases_off_by_default(self):
+        """DEFAULT is now OFF (2026-07-07 owner fix: fist-release fought the click/
+        drag gesture and STOPPED tracking when the hand closed). A controller built
+        from the live defaults must keep tracking through a sustained closed fist —
+        closing the hand clicks/drags; you let go by LOWERING the hand."""
+        mod = self._load()
+        self.assertIs(mod.AIR_MOUSE_FIST_RELEASES, False)
+        clk = _FakeClock(100.0)
+        # No fist_releases override → uses the (now False) config default.
+        c = mod.AirMouseController(mod.ReachBox(2560, 1440), clock=clk,
+                                   debounce_frames=1, grace_sec=0.0,
+                                   engage_debounce_frames=1, arm_relaxes_gate=True,
+                                   arm_debounce_sec=0.0)
+        left = self._relaxed(mod, "left")
+        right = self._ext(mod, "right")
+        c.update(left, right, "open", "open", True, armed=True)
+        c.update(left, right, "open", "closed", True, armed=True)   # fist down
+        clk.advance(2.0)                                            # long, sustained
+        c.update(left, right, "open", "closed", True, armed=True)
+        self.assertTrue(c.engaged)              # still tracking — no fist-release
+        self.assertFalse(c.fist_release_latched)
+
     def test_fist_release_latches_no_reengage_oscillation(self):
         """The 2026-07-07 owner report ("jittery when hand closed — turns on and
         off"): in ARMED mode (height-only re-engage), a sustained fist would

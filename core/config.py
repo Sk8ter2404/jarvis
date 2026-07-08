@@ -694,10 +694,13 @@ AIR_MOUSE_ARM_RELAXES_GATE = True
 #   deliberate raise engages almost instantly. ~0.15 s.
 AIR_MOUSE_ARM_ENGAGE_DEBOUNCE_SEC = 0.15
 # AIR_MOUSE_FIST_RELEASES — a SUSTAINED closed fist while engaged force-disengages
-#   (an extra, optional snappy release the owner can use to "let go" without
-#   lowering the hand). Behind this knob so it can be turned off if it fights the
-#   drag gesture. True. See AIR_MOUSE_FIST_RELEASE_SEC.
-AIR_MOUSE_FIST_RELEASES = True
+#   (an extra, optional snappy release to "let go" without lowering the hand).
+#   DEFAULT OFF (2026-07-07 owner report): it FOUGHT the click/drag gesture — a
+#   normal close to click/drag, held ~0.6 s, tripped the release and STOPPED
+#   tracking ("when I close my hand it stops tracking"). With it off, closing the
+#   hand clicks/drags and the cursor keeps tracking; you let go by LOWERING your
+#   hand. Re-enable via the Settings panel if you want fist-to-release back.
+AIR_MOUSE_FIST_RELEASES = False
 # AIR_MOUSE_FIST_RELEASE_SEC — how long the fist must stay closed (while engaged)
 #   before it counts as a release, so a normal click/drag (close→open, or a short
 #   held drag) never trips it — only a deliberate sustained fist. ~0.60 s.
