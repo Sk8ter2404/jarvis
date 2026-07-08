@@ -1320,6 +1320,27 @@ class PreflightCamerasTests(SectionSevenBase):
         self.bc._preflight_cameras(timeout_sec=0.1)
         self.assertEqual(len(self.bc.CAMERAS), 2)
 
+    def test_slow_camera_kept_via_retry(self):
+        # A camera that fails the FIRST quick probe but opens on the retry (the
+        # USB-bus-contention-at-boot case: Kinect init starves the USB 2.0 cam)
+        # must be KEPT, not dropped. 2026-07-08.
+        calls = {}
+
+        def _probe(i, timeout_sec=2.0):
+            calls[i] = calls.get(i, 0) + 1
+            if i == 0:
+                return True                    # fast cam opens immediately
+            # cam 1 fails the first probe, succeeds on the retry (2nd call)
+            return calls[i] >= 2
+        self._p(self.bc, "_probe_camera_index", side_effect=_probe)
+        # No real device, so make sure the name-rescue path can't interfere.
+        self._p(self.bc, "_camera_rescued_by_name", return_value=False)
+        self.bc._preflight_cameras(timeout_sec=0.1)
+        remaining = sorted(c["index"] for c in self.bc.CAMERAS)
+        self.assertEqual(remaining, [0, 1],
+                         "a camera that opens on retry must not be dropped")
+        self.assertGreaterEqual(calls.get(1, 0), 2, "retry probe should have run")
+
     def test_dropped_primary_promotes_survivor(self):
         # 2026-07-07 owner fix ("camera preview broken again"): the config PRIMARY
         # is index 1 (Left webcam); it fails and is dropped, leaving only index 0
