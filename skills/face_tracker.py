@@ -1275,7 +1275,8 @@ def _kinect_presence_note(snap: dict, now: float) -> str:
     nearest = snap.get("kinect_nearest_m")
     who = "one person" if count == 1 else f"{count} people"
     if nearest:
-        return f" The Kinect sees {who} about {nearest:.1f} metres away."
+        from core.units import meters_to_imperial_phrase
+        return f" The Kinect sees {who} about {meters_to_imperial_phrase(nearest)} away."
     return f" The Kinect sees {who} in the room."
 
 

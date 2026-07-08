@@ -1051,6 +1051,32 @@ class ProcessPorcupineTests(unittest.TestCase):
         d._process_porcupine(np.zeros(300, dtype=np.float32))
         self.assertEqual(called["n"], 0)
 
+    def test_leftover_carried_across_blocks_no_drop(self):
+        # 1280-sample blocks / 512-sample frames leave a 256-sample remainder;
+        # it must be carried into the next block, not dropped (finding #31).
+        d = self._detector(frame_len=512)
+        calls = {"n": 0}
+        d._porcupine = types.SimpleNamespace(
+            process=lambda pcm: (calls.__setitem__("n", calls["n"] + 1) or -1))
+        block = np.zeros(1280, dtype=np.float32)
+        d._process_porcupine(block)
+        self.assertEqual(calls["n"], 2)                 # 1280 → 2 frames
+        self.assertEqual(d._porcupine_leftover.size, 256)  # remainder kept
+        self.assertEqual(d._porcupine_leftover.dtype, np.int16)
+        d._process_porcupine(block)
+        # 256 leftover + 1280 = 1536 → 3 more frames; total 5, none dropped.
+        self.assertEqual(calls["n"], 5)
+        self.assertEqual(d._porcupine_leftover.size, 0)
+
+    def test_short_frame_leftover_accumulates(self):
+        # A sub-frame block processes nothing but must not discard its samples.
+        d = self._detector(frame_len=512)
+        d._porcupine = types.SimpleNamespace(process=lambda pcm: -1)
+        d._process_porcupine(np.zeros(300, dtype=np.float32))
+        self.assertEqual(d._porcupine_leftover.size, 300)
+        d._process_porcupine(np.zeros(300, dtype=np.float32))  # 600 ≥ 512
+        self.assertEqual(d._porcupine_leftover.size, 600 - 512)
+
 
 # ──────────────────────────────────────────────────────────────────────
 # _fire — cooldown, events queue, callback
@@ -1114,6 +1140,17 @@ class FireTests(unittest.TestCase):
                                side_effect=queue.Full):
             d._fire("jarvis", 0.9)  # put fails, swallowed; callback still runs
         self.assertEqual(len(got), 1)
+
+    def test_events_queue_is_bounded_and_drops_oldest(self):
+        # Nobody drains events (the real caller uses on_detect) — the queue must
+        # stay capped rather than grow without limit (finding #32).
+        d = ww.WakeWordDetector(engine="openwakeword", cooldown_secs=0.0)
+        n = ww.EVENTS_QUEUE_MAX
+        for i in range(n + 5):
+            d._fire(f"p{i}", 0.9)
+        self.assertEqual(d.events.qsize(), n)   # capped, not n+5
+        # The five oldest were evicted; the front is now p5, not p0.
+        self.assertEqual(d.events.get_nowait()["phrase"], "p5")
 
 
 # ──────────────────────────────────────────────────────────────────────

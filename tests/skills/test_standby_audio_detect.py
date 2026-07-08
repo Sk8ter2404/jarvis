@@ -447,32 +447,38 @@ class EnsureWhisperTinyTests(unittest.TestCase):
         self.assertIs(self.mod._ensure_whisper_tiny(), sentinel)
 
     def test_faster_whisper_cuda_path(self):
-        # CUDA-first only happens when the GPU gate is opted in.
+        # CUDA-first only happens when the GPU gate is opted in AND a free-VRAM
+        # preflight passes; the load is int8 on device_index 0, never bare-cuda
+        # float16 (the crash-avoidance fix for this always-on loop). 2026-07-08.
         self.mod._loop_cfg["prefer_gpu"] = True
         fw = types.ModuleType("faster_whisper")
         model = object()
         fw.WhisperModel = mock.MagicMock(return_value=model)
-        with inject_modules(faster_whisper=fw):
+        with inject_modules(faster_whisper=fw), \
+                mock.patch.object(self.mod, "_cuda_free_vram_mb", return_value=8000.0):
             got = self.mod._ensure_whisper_tiny()
         self.assertIs(got, model)
-        # First attempt is the cuda/float16 path.
         _args, kwargs = fw.WhisperModel.call_args
         self.assertEqual(kwargs.get("device"), "cuda")
+        self.assertEqual(kwargs.get("compute_type"), "int8")
+        self.assertEqual(kwargs.get("device_index"), 0)
 
     def test_faster_whisper_cpu_fallback(self):
-        # With the GPU gate on, a cuda failure falls back to cpu/int8.
+        # With the GPU gate on AND VRAM free, a cuda load failure falls back to
+        # cpu/int8 (two ctor calls). The ctor now also takes device_index. 2026-07-08.
         self.mod._loop_cfg["prefer_gpu"] = True
         fw = types.ModuleType("faster_whisper")
         cpu_model = object()
         calls = {"n": 0}
 
-        def _ctor(name, device=None, compute_type=None):
+        def _ctor(name, device=None, compute_type=None, device_index=None):
             calls["n"] += 1
             if device == "cuda":
                 raise RuntimeError("no cuda")
             return cpu_model
         fw.WhisperModel = _ctor
-        with inject_modules(faster_whisper=fw):
+        with inject_modules(faster_whisper=fw), \
+                mock.patch.object(self.mod, "_cuda_free_vram_mb", return_value=8000.0):
             got = self.mod._ensure_whisper_tiny()
         self.assertIs(got, cpu_model)
         self.assertEqual(calls["n"], 2)   # cuda failed → cpu succeeded
@@ -497,11 +503,13 @@ class EnsureWhisperTinyTests(unittest.TestCase):
         self.assertEqual(calls[0], ("cpu", "int8"))
 
     def test_prefer_gpu_flag_restores_cuda_first(self):
-        # Flipping the gate True puts the cuda/float16 attempt back first.
+        # Flipping the gate True (with VRAM free) puts the cuda attempt back
+        # first — now int8 on device_index 0, not bare-cuda float16. 2026-07-08.
         self.mod._loop_cfg["prefer_gpu"] = True
         fw = types.ModuleType("faster_whisper")
         fw.WhisperModel = mock.MagicMock(return_value=object())
-        with inject_modules(faster_whisper=fw):
+        with inject_modules(faster_whisper=fw), \
+                mock.patch.object(self.mod, "_cuda_free_vram_mb", return_value=8000.0):
             self.mod._ensure_whisper_tiny()
         self.assertEqual(fw.WhisperModel.call_args_list[0].kwargs.get("device"),
                          "cuda")

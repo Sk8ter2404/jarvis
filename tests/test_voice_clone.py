@@ -327,5 +327,79 @@ class EngineCacheTests(unittest.TestCase):
         fake_cls.from_pretrained.assert_called_once()
 
 
+class DeviceSelectionTests(unittest.TestCase):
+    """VOICE_CLONE_DEVICE knob + free-VRAM gating (finding #17). Unset knob must
+    reproduce the old cuda/cpu pick with no gating; a chosen CUDA device is
+    honoured and VRAM-checked, degrading to None when too full."""
+
+    def test_unset_knob_uses_cuda_when_available(self):
+        with mock.patch.object(vc, "_cfg_device", return_value=""), \
+             mock.patch.object(vc, "_cuda_available", return_value=True):
+            self.assertEqual(vc._resolve_device(), "cuda")
+
+    def test_unset_knob_uses_cpu_when_no_cuda(self):
+        with mock.patch.object(vc, "_cfg_device", return_value=""), \
+             mock.patch.object(vc, "_cuda_available", return_value=False):
+            self.assertEqual(vc._resolve_device(), "cpu")
+
+    def test_cpu_override_always_passes(self):
+        with mock.patch.object(vc, "_cfg_device", return_value="cpu"), \
+             mock.patch.object(vc, "_cuda_available", return_value=False):
+            self.assertEqual(vc._resolve_device(), "cpu")
+
+    def test_cuda_override_with_free_vram_is_honoured(self):
+        with mock.patch.object(vc, "_cfg_device", return_value="cuda:1"), \
+             mock.patch.object(vc, "_cuda_available", return_value=True), \
+             mock.patch.object(vc, "_free_vram_ok", return_value=True):
+            self.assertEqual(vc._resolve_device(), "cuda:1")
+
+    def test_cuda_override_low_vram_degrades_to_none(self):
+        with mock.patch.object(vc, "_cfg_device", return_value="cuda:1"), \
+             mock.patch.object(vc, "_cuda_available", return_value=True), \
+             mock.patch.object(vc, "_free_vram_ok", return_value=False):
+            self.assertIsNone(vc._resolve_device())
+
+    def test_cuda_override_without_cuda_degrades_to_none(self):
+        with mock.patch.object(vc, "_cfg_device", return_value="cuda:0"), \
+             mock.patch.object(vc, "_cuda_available", return_value=False):
+            self.assertIsNone(vc._resolve_device())
+
+    def test_device_index_parsing(self):
+        self.assertEqual(vc._device_index("cuda"), 0)
+        self.assertEqual(vc._device_index("cuda:1"), 1)
+        self.assertEqual(vc._device_index("cuda:bogus"), 0)  # fails safe to 0
+
+    def test_free_vram_ok_fails_open_without_torch(self):
+        # No torch on the CI box → probe unavailable → attempt the load (True).
+        with mock.patch.dict(sys.modules, {"torch": None}):
+            self.assertTrue(vc._free_vram_ok("cuda:0"))
+
+    def test_load_engine_threads_chosen_device_into_from_pretrained(self):
+        fake_model = mock.MagicMock()
+        fake_cls = mock.MagicMock()
+        fake_cls.from_pretrained.return_value = fake_model
+        fake_mod = mock.MagicMock()
+        fake_mod.ChatterboxTTS = fake_cls
+        self.addCleanup(vc._reset_engine_cache)
+        with mock.patch.dict(sys.modules, {"chatterbox": mock.MagicMock(),
+                                           "chatterbox.tts": fake_mod}), \
+             mock.patch.object(vc, "_resolve_device", return_value="cuda:1"):
+            vc._load_engine({"name": "me"})
+        fake_cls.from_pretrained.assert_called_once_with(device="cuda:1")
+
+    def test_load_engine_raises_when_device_unusable(self):
+        # _resolve_device None (device too full) → _load_engine raises so
+        # synthesize() converts it to a clean None fallback (no OOM contention).
+        fake_mod = mock.MagicMock()
+        fake_mod.ChatterboxTTS = mock.MagicMock()
+        self.addCleanup(vc._reset_engine_cache)
+        with mock.patch.dict(sys.modules, {"chatterbox": mock.MagicMock(),
+                                           "chatterbox.tts": fake_mod}), \
+             mock.patch.object(vc, "_resolve_device", return_value=None):
+            with self.assertRaises(RuntimeError):
+                vc._load_engine({"name": "me"})
+        fake_mod.ChatterboxTTS.from_pretrained.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

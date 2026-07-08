@@ -1539,15 +1539,30 @@ def _llm_quick(system: str, user: str, max_tokens: int = 200) -> str:
                   f"({type(e).__name__}: {e})")
             return ""
     elif AI_BACKEND == "ollama":
-        import ollama
-        resp = ollama.chat(
-            model=OLLAMA_MODEL,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user",   "content": user},
-            ],
-        )
-        return resp["message"]["content"]
+        # Route through the bounded wrapper (wall-clock timeout) inside a
+        # try/except so a wedged runner raises instead of blocking this
+        # background one-shot FOREVER — matches _call_llm's hot path and the
+        # claude branch above, degrading to the local fallback then "" rather
+        # than the old unbounded ollama.chat that could hang the caller. 2026-07-08.
+        try:
+            resp = _ollama_chat_bounded(
+                OLLAMA_MODEL,
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user},
+                ],
+            )
+            return resp["message"]["content"]
+        except Exception as e:
+            local = _call_local_llm(
+                system, [{"role": "user", "content": user}],
+                max_tokens=max_tokens,
+            )
+            if local:
+                return local
+            print(f"  [llm_quick] ollama failed and no local fallback "
+                  f"({type(e).__name__}: {e})")
+            return ""
     return ""
 
 
@@ -3743,8 +3758,8 @@ def _hud_camera_preview_write(frame: "np.ndarray", now: float) -> bool:
 # Matched case-insensitively; the FIRST substring that appears in a device's
 # name claims that slot. Kept as config-adjacent constants near the compositor.
 _KINECT_PREVIEW_WEBCAM_NAMES = {
-    "left":  "fullhan webcam",     # 'Fullhan Webcam'  → LEFT monitor webcam
-    "right": "usb 2.0 camera",     # 'USB 2.0 Camera'  → RIGHT monitor webcam
+    "left":  "logi c270",          # 'Logi C270 HD WebCam' → LEFT monitor webcam
+    "right": "usb 2.0 camera",     # 'USB 2.0 Camera'      → RIGHT monitor webcam
 }
 # Cache the pygrabber name→index resolution so we don't re-enumerate DirectShow
 # devices every preview frame (enumeration is comparatively expensive + flickers
@@ -7591,6 +7606,15 @@ def _register_cuda_dll_dirs() -> None:
 # CUDA load → DLL-error → CPU-fallback dance that bloats boot time.
 _force_whisper_cpu_int8 = False
 
+# Count of consecutive transcribe() CUDA/OOM failures. The recovery path drops
+# _stt and reloads, but on a card that OOMs mid-decode the reload picks the SAME
+# over-budget GPU config → load→OOM→drop→reload livelock. After 2 consecutive
+# CUDA failures we flip _force_whisper_cpu_int8 so _ensure_whisper() reloads on
+# CPU int8 (slower but crash-proof) instead of retrying the doomed GPU load. A
+# single clean transcribe resets the counter. 2026-07-08.
+_consecutive_whisper_cuda_failures = 0
+_WHISPER_CUDA_FAILURE_LIMIT = 2
+
 
 def _whisper_cuda_plan(dev_index: int):
     """Decide HOW (and WHETHER) to load Whisper on cuda:{dev_index} without
@@ -7885,7 +7909,7 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
     Abstracts over faster-whisper (preferred, GPU-accelerated on 3090) and
     openai-whisper (legacy fallback). Both produce the same return shape.
     MUST be called with _stt_lock held (via transcribe())."""
-    global _stt
+    global _stt, _consecutive_whisper_cuda_failures, _force_whisper_cpu_int8
     try:
         _ensure_whisper()
         if _stt_engine == "faster_whisper":
@@ -7914,6 +7938,10 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
                     beam_size=5,
                 )
                 segments = list(segments_gen)
+            # Native decode completed without a CUDA fault — clear the
+            # consecutive-failure counter so one transient OOM never sticks us
+            # on CPU int8. 2026-07-08.
+            _consecutive_whisper_cuda_failures = 0
             text = " ".join((s.text or "").strip() for s in segments).strip()
             if not segments:
                 # info still carries some signal even on empty transcription
@@ -7930,6 +7958,9 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
         # removed the fp16= kwarg — precision is now derived from the dtype
         # the model was loaded with, so passing it raises TypeError.
         result = _stt.transcribe(audio, language="en")
+        # Clean decode — reset the consecutive CUDA-failure counter (see the
+        # faster-whisper branch above). 2026-07-08.
+        _consecutive_whisper_cuda_failures = 0
         text = result["text"].strip()
         segments = result.get("segments", [])
         if not segments:
@@ -7956,6 +7987,18 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
             except Exception:
                 pass
             _stt = None
+            # Track consecutive CUDA faults. Dropping + reloading the SAME
+            # over-budget GPU config just re-OOMs (load→OOM→drop→reload
+            # livelock), so after _WHISPER_CUDA_FAILURE_LIMIT flip the sticky
+            # flag _ensure_whisper() reads → next reload lands on CPU int8
+            # (crash-proof) instead of the doomed GPU load. 2026-07-08.
+            _consecutive_whisper_cuda_failures += 1
+            if (_consecutive_whisper_cuda_failures >= _WHISPER_CUDA_FAILURE_LIMIT
+                    and not _force_whisper_cpu_int8):
+                _force_whisper_cpu_int8 = True
+                print(f"  [transcribe] {_consecutive_whisper_cuda_failures} "
+                      f"consecutive CUDA failures — forcing CPU int8 on reload "
+                      f"to break the OOM→reload livelock")
             print("  [transcribe] dropped GPU model after CUDA error — "
                   "reloading on next utterance")
         return "", {"no_speech_prob": 1.0, "avg_logprob": -10.0}
@@ -8299,6 +8342,45 @@ def _ollama_big_model_resident(exclude_model: str | None = None) -> str | None:
             vram = 0
         if vram >= _OLLAMA_BIG_MODEL_VRAM_BYTES:
             return name
+    return None
+
+
+# Rough VRAM the local VLM needs to load safely (7B-class q4 weights + KV/decode
+# workspace) plus a cushion so a load never lands right at the ceiling and OOMs
+# mid-decode. Feeds the true-free-VRAM co-load gate in _call_local_vision.
+_VLM_COLOAD_NEEDED_MB = 6000
+_VLM_COLOAD_HEADROOM_MB = 1500
+
+
+def _cuda0_free_vram_mb() -> int | None:
+    """Best-effort FREE VRAM (MB) on cuda:0 across ALL frameworks — torch,
+    faster-whisper/CTranslate2, chatterbox, Ollama, everything.
+
+    Unlike _ollama_big_model_resident (which only sees what the OLLAMA server
+    reports), this reads the DRIVER's own free-memory counter, so whisper +
+    chatterbox (~6 GB the Ollama API is blind to) are correctly counted against
+    the budget before a VLM co-load. Prefers torch.cuda.mem_get_info(0); falls
+    back to `nvidia-smi`. Returns None when neither is available — the caller
+    then relies on the Ollama residency check alone. 2026-07-08."""
+    try:
+        import torch
+        free, _total = torch.cuda.mem_get_info(0)
+        return int(free // (1024 * 1024))
+    except Exception:
+        pass
+    try:
+        import subprocess as _sp
+        out = _sp.run(
+            ["nvidia-smi", "--query-gpu=memory.free",
+             "--format=csv,noheader,nounits", "-i", "0"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if out.returncode == 0:
+            lines = (out.stdout or "").strip().splitlines()
+            if lines:
+                return int(lines[0].strip())
+    except Exception:
+        pass
     return None
 
 
@@ -9059,6 +9141,21 @@ def _call_local_vision(question: str, png_images: list[bytes],
                   f"(set OLLAMA_MAX_LOADED_MODELS=1 so Ollama evicts instead of "
                   f"co-loading, or JARVIS_ALLOW_VLM_COLOAD=1 to override).")
             return None
+        # True-free-VRAM gate (2026-07-08): the Ollama residency check above is
+        # blind to the ~6 GB of whisper + chatterbox pinned on cuda:0 by OTHER
+        # frameworks, so on a 24 GB card it can green-light a VLM co-load that
+        # over-commits. Read the DRIVER's real free counter and refuse whenever
+        # it can't fit the VLM + headroom — regardless of which framework holds
+        # the memory. None (probe unavailable) leaves the Ollama check as the
+        # sole guard, preserving prior behaviour on non-NVIDIA / no-torch boxes.
+        _free_mb = _cuda0_free_vram_mb()
+        _need_mb = _VLM_COLOAD_NEEDED_MB + _VLM_COLOAD_HEADROOM_MB
+        if _free_mb is not None and _free_mb < _need_mb:
+            print(f"  [local-vision] REFUSING co-load: only {_free_mb} MB free "
+                  f"on cuda:0 < {_need_mb} MB needed for {LOCAL_VISION_MODEL} "
+                  f"(+headroom) — whisper/chatterbox/other frameworks hold the "
+                  f"rest. Set JARVIS_ALLOW_VLM_COLOAD=1 to override.")
+            return None
     _log_gpu_state(LOCAL_VISION_MODEL)
     try:
         b64_images = [base64.standard_b64encode(p).decode("utf-8") for p in png_images]
@@ -9501,6 +9598,13 @@ def _call_llm(user_text: str) -> str:
     # prefix must never strip text from THIS turn's reply.
     _stream_spoken_prefix[0] = ""
     conversation_history.append({"role": "user", "content": user_text})
+    # Trim BEFORE the API request, not just after (line ~9750). A boot-time /
+    # follow-up-loop assistant-only append can leave conversation_history
+    # LEADING with an 'assistant' message; sending that to Claude 400s ('first
+    # message must use the user role') and the whole first turn degrades to
+    # local. _trim_conversation_history drops leading non-'user' messages, so
+    # running it here guarantees the very first request is well-formed. 2026-07-08.
+    _trim_conversation_history()
     _ltm_enqueue("user", user_text)
 
     # Classify mood from this utterance and (if non-default) extend the

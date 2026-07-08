@@ -25,6 +25,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -1179,6 +1180,48 @@ class BambuRegisterPromptTests(unittest.TestCase):
                 "bambu_monitor", utils=make_fake_skill_utils())
         self.assertIn("check_print", actions)
         self.assertIn("how_is_the_print", actions)
+
+
+class BambuMonitorLifecycleTests(unittest.TestCase):
+    """stop_monitor must not strand the previous poll thread (finding #33)."""
+
+    def setUp(self):
+        self.mod, _ = _load_bambu()
+
+    def test_stop_monitor_joins_old_poll_thread(self):
+        mod = self.mod
+        evt = threading.Event()
+        exited = {"v": False}
+
+        def _worker(stop_evt):
+            # Mirror the real poll loop: block on the passed Event, exit on set.
+            while not stop_evt.wait(0.01):
+                pass
+            exited["v"] = True
+
+        t = threading.Thread(target=_worker, args=(evt,), daemon=True)
+        t.start()
+        # Wire the module state as start_monitor would have left it.
+        mod._monitor_stop_evt[0] = evt
+        mod._poll_thread[0] = t
+        mod._mqtt_client[0] = mock.MagicMock()
+        with mock.patch.object(mod, "_write_overlay_state", lambda: None):
+            mod.stop_monitor()
+        # Joined (not left looping against the torn-down client) and cleared.
+        self.assertFalse(t.is_alive())
+        self.assertTrue(exited["v"])
+        self.assertTrue(evt.is_set())
+        self.assertIsNone(mod._poll_thread[0])
+        self.assertIsNone(mod._mqtt_client[0])
+
+    def test_stop_event_is_a_single_slot_holder(self):
+        # The fix stores the CURRENT thread's Event in a 1-slot list so each
+        # spawn gets its own — a fresh Event is never .clear()'d out from under
+        # a lagging predecessor.
+        mod = self.mod
+        self.assertIsInstance(mod._monitor_stop_evt, list)
+        self.assertEqual(len(mod._monitor_stop_evt), 1)
+        self.assertIsInstance(mod._monitor_stop_evt[0], threading.Event)
 
 
 if __name__ == "__main__":

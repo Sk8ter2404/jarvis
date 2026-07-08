@@ -61,6 +61,7 @@ Monolith-tier (full-deps): run locally; skip on the light-deps CI runner.
 from __future__ import annotations
 
 import io
+import os
 import unittest
 from unittest import mock
 
@@ -824,6 +825,219 @@ class InjectedTurnBypassesBgGateTests(MonolithGlobalsTestCase):
                 self.bc._bg_gate_for_turn("set a timer", False),
                 (True, "wake-word mode"))
         gate.assert_called_once_with("set a timer")
+
+
+@requires_monolith
+class TranscribeCudaLivelockTests(MonolithGlobalsTestCase):
+    """2026-07-08 (finding #6): transcribe()'s CUDA/OOM recovery dropped _stt and
+    reloaded the SAME over-budget GPU config → load→OOM→drop→reload livelock. A
+    module counter now flips the sticky _force_whisper_cpu_int8 after 2 CONSECUTIVE
+    CUDA failures so the next reload lands on crash-proof CPU int8; a clean
+    transcribe resets the counter."""
+
+    def setUp(self):
+        # These two globals aren't in the harness restore set — snapshot + restore
+        # them ourselves so this class can't leak the sticky CPU flag.
+        bc = self.bc
+        self._saved_fail = bc._consecutive_whisper_cuda_failures
+        self._saved_flag = bc._force_whisper_cpu_int8
+        bc._consecutive_whisper_cuda_failures = 0
+        bc._force_whisper_cpu_int8 = False
+
+        def _restore():
+            bc._consecutive_whisper_cuda_failures = self._saved_fail
+            bc._force_whisper_cpu_int8 = self._saved_flag
+        self.addCleanup(_restore)
+
+    @staticmethod
+    def _audio():
+        import numpy as np
+        return np.zeros(16000, dtype=np.float32)
+
+    def test_two_consecutive_cuda_failures_force_cpu_int8(self):
+        bc = self.bc
+
+        def _reload_failing():
+            # _ensure_whisper normally repopulates _stt; simulate a reload that
+            # produces a model which OOMs the moment it decodes.
+            m = mock.Mock()
+            m.transcribe.side_effect = RuntimeError("CUDA out of memory")
+            bc._stt = m
+
+        with mock.patch.object(bc, "_stt_engine", "faster_whisper"), \
+             mock.patch.object(bc, "_ensure_whisper", side_effect=_reload_failing):
+            bc.transcribe(self._audio())
+            self.assertEqual(bc._consecutive_whisper_cuda_failures, 1)
+            self.assertFalse(bc._force_whisper_cpu_int8,
+                             "one failure must NOT yet force CPU")
+            bc.transcribe(self._audio())
+            self.assertGreaterEqual(bc._consecutive_whisper_cuda_failures, 2)
+            self.assertTrue(bc._force_whisper_cpu_int8,
+                            "2nd consecutive CUDA failure must flip the sticky "
+                            "CPU-int8 flag to break the reload livelock")
+
+    def test_clean_transcribe_resets_counter(self):
+        bc = self.bc
+        bc._consecutive_whisper_cuda_failures = 5   # pretend we'd been failing
+
+        seg = mock.Mock(text="hello", no_speech_prob=0.1, avg_logprob=-0.2)
+        info = mock.Mock(no_speech_prob=0.1)
+        good = mock.Mock()
+        good.transcribe.return_value = (iter([seg]), info)
+
+        def _reload_good():
+            bc._stt = good
+
+        with mock.patch.object(bc, "_stt_engine", "faster_whisper"), \
+             mock.patch.object(bc, "_ensure_whisper", side_effect=_reload_good):
+            text, _conf = bc.transcribe(self._audio())
+
+        self.assertEqual(text, "hello")
+        self.assertEqual(bc._consecutive_whisper_cuda_failures, 0,
+                         "a clean decode must reset the CUDA-failure counter")
+
+
+@requires_monolith
+class VlmCoLoadTrueFreeVramTests(MonolithGlobalsTestCase):
+    """2026-07-08 (finding #7): the VLM co-load guard counted only Ollama-resident
+    models and was blind to ~6 GB of whisper+chatterbox on cuda:0, so it could
+    green-light a co-load that over-commits. The guard now ALSO consults true free
+    VRAM (torch.cuda.mem_get_info / nvidia-smi) and refuses when free < needed +
+    headroom, regardless of framework."""
+
+    def _patch_vision_ready(self, free_mb):
+        """Common patches: local-vision enabled + reachable + model present, and
+        NO big Ollama model resident, with a stubbed free-VRAM probe."""
+        bc = self.bc
+        return [
+            mock.patch.object(bc, "LOCAL_VISION_FALLBACK", True),
+            mock.patch.object(bc, "LOCAL_VISION_MODEL", "llava:7b"),
+            mock.patch.object(bc, "_ollama_alive", return_value=True),
+            mock.patch.object(bc, "_ollama_has_model", return_value=True),
+            mock.patch.object(bc, "_ollama_big_model_resident", return_value=None),
+            mock.patch.object(bc, "_cuda0_free_vram_mb", return_value=free_mb),
+            mock.patch.dict(os.environ, {}, clear=False),
+        ]
+
+    def test_low_free_vram_refuses_even_without_resident_ollama_model(self):
+        bc = self.bc
+        os.environ.pop("JARVIS_ALLOW_VLM_COLOAD", None)
+        patches = self._patch_vision_ready(free_mb=3000)  # far below need+headroom
+        with mock.patch.object(bc, "requests") as req, \
+             patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patches[5], patches[6]:
+            out = bc._call_local_vision("what's on screen?", [b"\x89PNG..."])
+        self.assertIsNone(out, "must refuse when cuda:0 lacks true free VRAM")
+        req.post.assert_not_called()
+
+    def test_ample_free_vram_allows_coload(self):
+        bc = self.bc
+        os.environ.pop("JARVIS_ALLOW_VLM_COLOAD", None)
+        resp = mock.Mock()
+        resp.ok = True
+        resp.json.return_value = {"message": {"content": "a tidy desk"}}
+        patches = self._patch_vision_ready(free_mb=20000)  # plenty of headroom
+        with mock.patch.object(bc, "requests") as req, \
+             patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patches[5], patches[6]:
+            req.post.return_value = resp
+            req.RequestException = Exception
+            out = bc._call_local_vision("what's on screen?", [b"\x89PNG..."])
+        self.assertEqual(out, "a tidy desk")
+        req.post.assert_called_once()
+
+    def test_probe_unavailable_falls_back_to_ollama_check(self):
+        # None (no torch, no nvidia-smi) must NOT block — preserves prior
+        # behaviour on non-NVIDIA / no-torch boxes; the Ollama check is sole guard.
+        bc = self.bc
+        os.environ.pop("JARVIS_ALLOW_VLM_COLOAD", None)
+        resp = mock.Mock()
+        resp.ok = True
+        resp.json.return_value = {"message": {"content": "a plant"}}
+        patches = self._patch_vision_ready(free_mb=None)
+        with mock.patch.object(bc, "requests") as req, \
+             patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patches[5], patches[6]:
+            req.post.return_value = resp
+            req.RequestException = Exception
+            out = bc._call_local_vision("what's on screen?", [b"\x89PNG..."])
+        self.assertEqual(out, "a plant")
+        req.post.assert_called_once()
+
+    def test_cuda0_free_vram_mb_never_raises(self):
+        # Best-effort probe: torch absent AND nvidia-smi absent → returns None,
+        # never raises.
+        bc = self.bc
+        with mock.patch.dict("sys.modules", {"torch": None}):
+            val = bc._cuda0_free_vram_mb()
+        self.assertTrue(val is None or isinstance(val, int))
+
+
+@requires_monolith
+class CallLlmTrimsLeadingAssistantTests(MonolithGlobalsTestCase):
+    """2026-07-08 (finding #11): the first post-boot turn could send a history that
+    LEADS with an assistant message (boot-time / follow-up appends) → Claude 400 →
+    the whole first turn degrades to local. _call_llm now runs
+    _trim_conversation_history() right after appending the user turn, BEFORE the
+    dispatch, so the request is always well-formed."""
+
+    def test_leading_assistant_trimmed_before_dispatch(self):
+        import core.config as cfg
+        bc = self.bc
+        bc.conversation_history[:] = [
+            {"role": "assistant", "content": "Systems online, sir."},   # boot line
+            {"role": "user", "content": "earlier question"},
+            {"role": "assistant", "content": "earlier reply"},
+        ]
+        captured = {}
+
+        def _spy(_sys_prompt, hist):
+            captured["first_role"] = hist[0]["role"] if hist else None
+            return "acknowledged"
+
+        with mock.patch.object(cfg, "model_route", return_value="local"), \
+             mock.patch.object(bc, "_local_then_cloud_or_honest", side_effect=_spy):
+            bc._call_llm("hello there")
+
+        self.assertEqual(captured.get("first_role"), "user",
+                         "history sent to the model must NOT lead with assistant")
+
+
+@requires_monolith
+class LlmQuickOllamaBoundedTests(MonolithGlobalsTestCase):
+    """2026-07-08 (finding #12): _llm_quick's ollama branch called ollama.chat with
+    no timeout/try-except, so a wedged runner blocked the background one-shot
+    forever. It now routes through _ollama_chat_bounded inside try/except and
+    degrades to the local fallback (then "") like the claude branch."""
+
+    def test_ollama_branch_uses_bounded_wrapper(self):
+        bc = self.bc
+        with mock.patch.object(bc, "AI_BACKEND", "ollama"), \
+             mock.patch.object(bc, "_ollama_chat_bounded",
+                               return_value={"message": {"content": "bounded ok"}}) as b:
+            out = bc._llm_quick("sys", "user")
+        self.assertEqual(out, "bounded ok")
+        b.assert_called_once()
+
+    def test_wedged_ollama_degrades_to_local_fallback(self):
+        bc = self.bc
+        with mock.patch.object(bc, "AI_BACKEND", "ollama"), \
+             mock.patch.object(bc, "_ollama_chat_bounded",
+                               side_effect=Exception("read timed out")), \
+             mock.patch.object(bc, "_call_local_llm",
+                               return_value="local fallback") as loc:
+            out = bc._llm_quick("sys", "user")
+        self.assertEqual(out, "local fallback")
+        loc.assert_called_once()
+
+    def test_wedged_ollama_and_no_local_returns_empty(self):
+        bc = self.bc
+        with mock.patch.object(bc, "AI_BACKEND", "ollama"), \
+             mock.patch.object(bc, "_ollama_chat_bounded",
+                               side_effect=Exception("read timed out")), \
+             mock.patch.object(bc, "_call_local_llm", return_value=""):
+            out = bc._llm_quick("sys", "user")
+        self.assertEqual(out, "")
 
 
 if __name__ == "__main__":

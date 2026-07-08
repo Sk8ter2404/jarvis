@@ -248,7 +248,8 @@ class SituationalAwarenessTests(CameraSystemBase):
                            "face_visible": True, "source": "face_tracker"})
         out = actions["where_am_i"]("")
         self.assertIn("desk", out.lower())
-        self.assertIn("0.7", out)
+        # 0.7 m is spoken in imperial now (feet), not metres.
+        self.assertIn("2 feet", out)
         self.assertIn("right monitor", out.lower())
         self.assertIn("alone", out.lower())
         # Names the sources it used.

@@ -326,6 +326,27 @@ SCHEMA: dict[str, dict] = {
         "default": True,
         "help": "Lower other apps' volume while JARVIS talks (Windows).",
     },
+    # 2026-07-08: surface the Whisper STT device/model so the v2.0.23 crash-
+    # workaround is settable AND persisted — previously they lived only in
+    # core/config.py, so a Settings save (which rewrites user_settings.json from
+    # the schema) dropped any hand-set WHISPER_DEVICE. Default stays 'auto'
+    # (v2.0.23 made auto crash-safe via the VRAM plan); this is persistence
+    # plumbing only and does not touch the runtime whisper code.
+    "WHISPER_DEVICE": {
+        "tab": "voice", "label": "Whisper STT device", "type": "enum",
+        "choices": ["auto", "cuda", "cuda:0", "cuda:1", "cpu"],
+        "default": "auto",
+        "help": "Where speech-to-text runs. auto = let ctranslate2/torch decide "
+                "(crash-safe VRAM plan); cuda / cuda:N pin a GPU (e.g. cuda:1 to "
+                "keep the primary card free); cpu forces the legacy path.",
+    },
+    "WHISPER_MODEL_CUDA": {
+        "tab": "voice", "label": "Whisper GPU model", "type": "str",
+        "default": "large-v3-turbo",
+        "help": "faster-whisper model used on the GPU (~3.1 GB VRAM). "
+                "large-v3-turbo is ~8x faster than large-v3 at near-identical "
+                "accuracy.",
+    },
 
     # ── AI / Models ────────────────────────────────────────────────────
     "AI_BACKEND": {
@@ -364,8 +385,13 @@ SCHEMA: dict[str, dict] = {
         "help": "Serve turns on the local model when Claude is unavailable.",
     },
     "LOCAL_VISION_FALLBACK": {
+        # 2026-07-08: default MUST mirror core/config.py (False). Was True here,
+        # so fresh installs silently enabled the on-demand VLM the config
+        # default deliberately leaves off. Kept in lockstep by the AST test in
+        # test_settings_window.py that compares every SCHEMA default to the
+        # core.config literal.
         "tab": "ai", "label": "Local vision fallback", "type": "bool",
-        "default": True,
+        "default": False,
         "help": "Retry vision on the local VLM when the cloud call fails. "
                 "Loads the ~7.3 GB VLM on-demand — see the VRAM budget above.",
     },

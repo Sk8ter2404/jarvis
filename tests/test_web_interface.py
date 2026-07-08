@@ -1098,5 +1098,100 @@ class SystemInfoHelperTests(unittest.TestCase):
             self.assertIsInstance(s["disks"], list)
 
 
+class WebInterfaceBugfix20260708Tests(unittest.TestCase):
+    """Unit-level regression tests for the 2026-07-08 bug-fix batch (findings
+    #21/#22/#23/#37/#38/#39). Each is standalone — no live server needed."""
+
+    # #38 — _read_hud_state must return a DICT even for valid-but-non-object JSON.
+    def test_hud_state_non_object_json_returns_empty_dict(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "hud_state.json")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("[1, 2, 3]")          # valid JSON, but a list not a dict
+            out = wi._read_hud_state(p)
+            self.assertEqual(out, {})
+            # And a real object still comes back intact.
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"state": "Idle"}, f)
+            self.assertEqual(wi._read_hud_state(p)["state"], "Idle")
+
+    # #23 — tail_log seeks a bounded window instead of reading the whole file.
+    def test_tail_log_bounded_window_returns_last_lines(self):
+        with tempfile.TemporaryDirectory() as d:
+            lg = os.path.join(d, "session_2026-07-08_00-00-00.log")
+            # Write far more than the 256KB window so the head is guaranteed to
+            # fall outside it; the tail must still be exact.
+            with open(lg, "w", encoding="utf-8") as f:
+                f.write("".join(f"padding line {i} ................\n"
+                                 for i in range(40000)))
+            out = wi.tail_log(d, 5)
+            self.assertEqual(out["lines"],
+                             [f"padding line {i} ................"
+                              for i in range(39995, 40000)])
+
+    # #37 — a non-numeric MICROPHONE_INDEX (device type) must 400, not coerce to None.
+    def test_device_setting_bad_value_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "user_settings.json")
+            with self.assertRaises(wi.SettingsWriteError):
+                wi._write_settings({"MICROPHONE_INDEX": "not-a-number"}, p)
+            self.assertFalse(os.path.exists(p))     # rejected before any write
+            # A real index and the 'auto' sentinels remain accepted.
+            self.assertEqual(
+                wi._write_settings({"MICROPHONE_INDEX": "3"}, p)["MICROPHONE_INDEX"], 3)
+            self.assertIsNone(
+                wi._write_settings({"MICROPHONE_INDEX": ""}, p)["MICROPHONE_INDEX"])
+
+    # #21 — concurrent _write_settings calls must not drop each other's update.
+    def test_concurrent_settings_writes_do_not_lose_updates(self):
+        import threading as _t
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "user_settings.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"KEEP": 1}, f)
+            barrier = _t.Barrier(2)
+
+            def _writer(val):
+                barrier.wait()                       # maximise write overlap
+                wi._write_settings({"WAKE_WORD_AUTOSTART": val}, p)
+
+            a = _t.Thread(target=_writer, args=("yes",))
+            b = _t.Thread(target=_writer, args=("no",))
+            a.start(); b.start(); a.join(); b.join()
+            with open(p, encoding="utf-8") as f:
+                saved = json.load(f)
+            # The pre-existing key must survive both writers (no lost merge).
+            self.assertEqual(saved["KEEP"], 1)
+            self.assertIn("WAKE_WORD_AUTOSTART", saved)
+
+    # #22 — the handler carries a per-request socket timeout so an under-delivered
+    # Content-Length can't hang a worker thread forever.
+    def test_handler_has_request_timeout(self):
+        self.assertIsNotNone(wi._Handler.timeout)
+        self.assertLessEqual(wi._Handler.timeout, 30)
+
+    # #39 — nvidia-smi is TTL-cached: within the TTL the probe is not re-run.
+    def test_nvidia_smi_is_ttl_cached(self):
+        orig_uncached = wi._nvidia_smi_gpus_uncached
+        orig_cache = dict(wi._nvidia_smi_cache)
+        calls = {"n": 0}
+
+        def _counting():
+            calls["n"] += 1
+            return [{"index": 0, "name": "stub"}]
+
+        wi._nvidia_smi_gpus_uncached = _counting
+        wi._nvidia_smi_cache["ts"] = 0.0             # force a cold first read
+        wi._nvidia_smi_cache["gpus"] = []
+        try:
+            first = wi._nvidia_smi_gpus()
+            second = wi._nvidia_smi_gpus()           # served from cache
+            self.assertEqual(first, second)
+            self.assertEqual(calls["n"], 1)          # probe ran exactly once
+        finally:
+            wi._nvidia_smi_gpus_uncached = orig_uncached
+            wi._nvidia_smi_cache.update(orig_cache)
+
+
 if __name__ == "__main__":
     unittest.main()

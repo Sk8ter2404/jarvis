@@ -115,6 +115,14 @@ _CAMERA_PREVIEW_STALE_S = 5.0
 _REPLY_TIMEOUT_DEFAULT = 30.0
 _REPLY_TIMEOUT_MAX = 120.0
 _LOG_TAIL_MAX_LINES = 2000        # hard cap on ?lines= so a request can't slurp a huge log
+_LOG_TAIL_WINDOW_BYTES = 256 * 1024  # bytes read from the log's END for a tail (2026-07-08)
+
+# Serialises the read-merge-replace in _write_settings. ThreadingHTTPServer runs
+# every POST on its own thread, so two concurrent /api/settings writes could each
+# read the file, merge over their OWN stale copy, and replace — the second losing
+# the first's update. This lock makes the whole read+merge+write atomic across
+# threads (2026-07-08 finding).
+_SETTINGS_WRITE_LOCK = threading.Lock()
 
 
 class InsecureBindError(RuntimeError):
@@ -160,8 +168,18 @@ def tail_log(log_dir: str, lines: int) -> dict:
     if not lg:
         return {"log": "", "lines": [], "running": False}
     try:
-        with open(lg, encoding="utf-8", errors="replace") as f:
-            tail = f.readlines()[-lines:]
+        # Don't readlines() the ENTIRE (ever-growing) session log every 1s poll —
+        # seek to a bounded tail window and split only that. 256KB comfortably
+        # holds far more than _LOG_TAIL_MAX_LINES of normal log lines
+        # (2026-07-08 finding). A line straddling the window boundary is dropped
+        # via [-lines:] anyway, so a possibly-partial first line never surfaces.
+        with open(lg, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - _LOG_TAIL_WINDOW_BYTES))
+            chunk = f.read()
+        text = chunk.decode("utf-8", errors="replace")
+        tail = text.splitlines()[-lines:]
     except Exception:
         return {"log": os.path.basename(lg), "lines": [], "running": False}
     try:
@@ -180,7 +198,11 @@ def _read_hud_state(hud_state_path: str) -> dict:
     tray._read_hud_state — the same file the tray + HUD consume."""
     try:
         with open(hud_state_path, encoding="utf-8") as f:
-            return json.load(f) or {}
+            data = json.load(f)
+        # Valid-but-non-object JSON (a list/number/string top level) would sail
+        # past ``or {}`` and then .get() would AttributeError on every /api/status
+        # poll — coerce anything that isn't a dict to {} (2026-07-08 finding).
+        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
@@ -624,6 +646,18 @@ def _coerce_setting(name: str, value, schema: dict, coerce_value) -> object:
         except (TypeError, ValueError):
             raise SettingsWriteError(
                 f"invalid {typ} value for {name!r}: {value!r}")
+    # device (e.g. MICROPHONE_INDEX): coerce_value swallows a bad index to the
+    # default (None) and the API would falsely report success. Pre-validate the
+    # same way int/float do — but None / "" are LEGAL here (they mean 'auto'), so
+    # only a present, non-empty value must parse as int (2026-07-08 finding).
+    if typ == "device":
+        empty = value is None or (isinstance(value, str) and value.strip() == "")
+        if not empty:
+            try:
+                int(value)
+            except (TypeError, ValueError):
+                raise SettingsWriteError(
+                    f"invalid device value for {name!r}: {value!r}")
     if coerce_value is None:                       # schema loaded but no coercer
         raise SettingsWriteError("settings coercion unavailable")
     # List/dict-valued settings ('routing', or a 'text'/list knob): the web panel
@@ -679,36 +713,41 @@ def _write_settings(updates: dict, path: str) -> dict:
     applied: dict = {}
     for name, value in updates.items():
         applied[name] = _coerce_setting(name, value, schema, coerce_value)
-    # 2) Read the current file (tolerant: missing/corrupt → start from {}), so we
-    #    MERGE over it and preserve keys we don't manage.
-    current: dict = {}
-    try:
-        if os.path.exists(path):
-            with open(path, encoding="utf-8") as f:
-                raw = f.read().strip()
-            if raw:
-                decoded = json.loads(raw)
-                if isinstance(decoded, dict):
-                    current = decoded
-    except Exception:
-        current = {}          # a corrupt file is overwritten with a valid merge
-    current.update(applied)
-    # 3) Atomic write (temp in the same dir + os.replace) — never a partial file.
-    _dir = os.path.dirname(os.path.abspath(path)) or "."
-    os.makedirs(_dir, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=_dir, suffix=".tmp", prefix=".websettings_")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(current, f, indent=2, sort_keys=True)
-            f.write("\n")
-        os.replace(tmp, path)
-    except Exception:
+    # 2+3) Read → merge → atomic-replace, serialised across threads so two
+    #      concurrent writers can't each merge over a stale copy and drop the
+    #      other's update (2026-07-08 finding). Validation above is pure and stays
+    #      outside the lock to keep the critical section short.
+    with _SETTINGS_WRITE_LOCK:
+        # 2) Read the current file (tolerant: missing/corrupt → start from {}), so
+        #    we MERGE over it and preserve keys we don't manage.
+        current: dict = {}
         try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as f:
+                    raw = f.read().strip()
+                if raw:
+                    decoded = json.loads(raw)
+                    if isinstance(decoded, dict):
+                        current = decoded
         except Exception:
-            pass
-        raise
+            current = {}      # a corrupt file is overwritten with a valid merge
+        current.update(applied)
+        # 3) Atomic write (temp in the same dir + os.replace) — never a partial file.
+        _dir = os.path.dirname(os.path.abspath(path)) or "."
+        os.makedirs(_dir, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=_dir, suffix=".tmp", prefix=".websettings_")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(current, f, indent=2, sort_keys=True)
+                f.write("\n")
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            raise
     return applied
 
 
@@ -749,11 +788,33 @@ def _smi_num(v):
         return None
 
 
+_NVIDIA_SMI_TTL = 2.0             # seconds a nvidia-smi snapshot is reused for
+_nvidia_smi_cache: dict = {"ts": 0.0, "gpus": []}
+_nvidia_smi_lock = threading.Lock()
+
+
 def _nvidia_smi_gpus() -> list:
     """Per-GPU stats via a single nvidia-smi CSV query, or ``[]`` on ANY failure
     (no GPU, no driver, cloud-only box, command missing/timeout). Never raises.
     Uses CREATE_NO_WINDOW on Windows (read via getattr so the CI Linux-sim, which
-    deletes that attribute, doesn't trip an AttributeError)."""
+    deletes that attribute, doesn't trip an AttributeError).
+
+    TTL-CACHED (2026-07-08 finding): /api/system polls every ~2s and each call
+    used to spawn a fresh nvidia-smi subprocess. We now reuse the last result for
+    _NVIDIA_SMI_TTL seconds so a fast poller can't fork a subprocess per request."""
+    now = time.time()
+    with _nvidia_smi_lock:
+        if (now - _nvidia_smi_cache["ts"]) < _NVIDIA_SMI_TTL:
+            return _nvidia_smi_cache["gpus"]
+    gpus = _nvidia_smi_gpus_uncached()
+    with _nvidia_smi_lock:
+        _nvidia_smi_cache["ts"] = time.time()
+        _nvidia_smi_cache["gpus"] = gpus
+    return gpus
+
+
+def _nvidia_smi_gpus_uncached() -> list:
+    """The actual nvidia-smi probe (see _nvidia_smi_gpus for the cached wrapper)."""
     import subprocess
     no_window = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
                  if sys.platform == "win32" else 0)
@@ -1032,6 +1093,12 @@ class _Handler(BaseHTTPRequestHandler):
     /api/settings, POST /api/say, POST /api/settings. The owning server pins
     config onto the class instance via the ``config`` attribute set in
     ``create_server`` (a small dict) so handlers are stateless beyond it."""
+
+    # Per-request socket timeout (seconds). StreamRequestHandler.setup() applies
+    # this to the connection, so an under-delivered Content-Length (a client that
+    # promises N bytes then stalls) raises socket.timeout inside rfile.read()
+    # instead of hanging this worker thread forever (2026-07-08 finding).
+    timeout = 10
 
     # Silence the default per-request stderr logging — it would spam the session
     # log we're tailing. (The base class calls this for every request.)

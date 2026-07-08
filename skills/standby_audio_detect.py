@@ -68,6 +68,11 @@ _LOOP_DEFAULTS = {
     "whisper_model":     "tiny",
     "prefer_gpu":        False,   # CPU by default — keep the 24GB VRAM for the local LLM
 }
+# Minimum verifiably-free VRAM (MiB) before the opt-in GPU whisper path is even
+# attempted. tiny/int8 is small, but the ctranslate2 CUDA runtime + cublas
+# workspace still bites a few hundred MB; keep a safety margin so we never crowd
+# the resident 30B into a native OOM. (2026-07-08)
+_GPU_MIN_FREE_VRAM_MB = 1500.0
 # ─────────────────────────────────────────────────────────────────────────
 
 
@@ -247,6 +252,24 @@ def _try_import_librosa():
         return None
 
 
+def _cuda_free_vram_mb() -> "float | None":
+    """Best-effort free-VRAM probe for the opt-in GPU whisper path. Returns free
+    MiB, or None when it can't be determined — the caller treats None as 'no
+    headroom' and stays on CPU (fail-safe). torch here is CPU-only, so we go
+    straight to NVML rather than torch.cuda.mem_get_info. (2026-07-08)"""
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        try:
+            h = pynvml.nvmlDeviceGetHandleByIndex(0)
+            info = pynvml.nvmlDeviceGetMemoryInfo(h)
+            return info.free / (1024 * 1024)
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:
+        return None
+
+
 def _ensure_whisper_tiny():
     """Lazy-load whisper-tiny ONCE for use by the background loop. Prefers
     faster-whisper (already a JARVIS dep) and falls back to openai-whisper.
@@ -277,13 +300,28 @@ def _ensure_whisper_tiny():
         # we never grab VRAM the local LLM needs (same ctranslate2 CUDA path the
         # main STT uses).
         if prefer_gpu:
-            try:
-                _whisper_model[0] = _FWM(model_name, device="cuda", compute_type="float16")
-                print(f"  [standby-loop] faster-whisper '{model_name}' ready on cuda")
-                return _whisper_model[0]
-            except Exception as e_gpu:
-                print(f"  [standby-loop] faster-whisper cuda load failed "
-                      f"({type(e_gpu).__name__}); falling back to cpu/int8")
+            # 2026-07-08: NEVER bare device='cuda'/float16 here. This always-on
+            # lyric detector shares the 3090 with the resident 30B LLM, and a
+            # native ctranslate2 OOM on the worker thread takes down ALL of
+            # JARVIS (sibling of the main-STT crash). Gate the opt-in GPU path
+            # behind a free-VRAM preflight and pin device_index + int8 (tiny
+            # model, not latency-critical) so the memory bite stays minimal.
+            free_mb = _cuda_free_vram_mb()
+            if free_mb is not None and free_mb >= _GPU_MIN_FREE_VRAM_MB:
+                try:
+                    _whisper_model[0] = _FWM(model_name, device="cuda",
+                                             device_index=0, compute_type="int8")
+                    print(f"  [standby-loop] faster-whisper '{model_name}' ready "
+                          f"on cuda:0 int8 ({int(free_mb)} MiB free)")
+                    return _whisper_model[0]
+                except Exception as e_gpu:
+                    print(f"  [standby-loop] faster-whisper cuda load failed "
+                          f"({type(e_gpu).__name__}); falling back to cpu/int8")
+            else:
+                got = "unknown" if free_mb is None else f"{int(free_mb)} MiB"
+                print(f"  [standby-loop] skipping GPU whisper — insufficient free "
+                      f"VRAM ({got} < {int(_GPU_MIN_FREE_VRAM_MB)} MiB); "
+                      "using cpu/int8")
         # CPU path — int8 keeps it light on the desk CPU. This is the DEFAULT
         # (STANDBY_WHISPER_PREFER_GPU is False) so VRAM stays free for the LLM.
         try:

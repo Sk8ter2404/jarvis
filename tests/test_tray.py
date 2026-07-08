@@ -30,6 +30,7 @@ import inspect
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -1394,42 +1395,42 @@ class ThreadedCallbackTests(TrayTestBase):
 
     def test_show_dossier_spawns_thread_and_runs_subprocess(self):
         with mock.patch.object(tray.threading, "Thread") as T, \
-             mock.patch.object(tray.subprocess, "run") as run:
+             mock.patch.object(tray, "_tracked_dialog_run") as run:
             tray._on_show_dossier(mock.Mock(), mock.Mock())
             self._run_thread_target(T)
         run.assert_called_once()
 
     def test_about_spawns_thread_and_runs_subprocess(self):
         with mock.patch.object(tray.threading, "Thread") as T, \
-             mock.patch.object(tray.subprocess, "run") as run:
+             mock.patch.object(tray, "_tracked_dialog_run") as run:
             tray._on_about(mock.Mock(), mock.Mock())
             self._run_thread_target(T)
         run.assert_called_once()
 
     def test_summary_spawns_thread_and_runs_subprocess(self):
         with mock.patch.object(tray.threading, "Thread") as T, \
-             mock.patch.object(tray.subprocess, "run") as run:
+             mock.patch.object(tray, "_tracked_dialog_run") as run:
             tray._on_show_today_summary(mock.Mock(), mock.Mock())
             self._run_thread_target(T)
         run.assert_called_once()
 
     def test_dossier_subprocess_error_swallowed(self):
         with mock.patch.object(tray.threading, "Thread") as T, \
-             mock.patch.object(tray.subprocess, "run",
+             mock.patch.object(tray, "_tracked_dialog_run",
                                side_effect=OSError("spawn fail")):
             tray._on_show_dossier(mock.Mock(), mock.Mock())
             self._run_thread_target(T)  # must not raise
 
     def test_about_subprocess_error_swallowed(self):
         with mock.patch.object(tray.threading, "Thread") as T, \
-             mock.patch.object(tray.subprocess, "run",
+             mock.patch.object(tray, "_tracked_dialog_run",
                                side_effect=OSError("spawn fail")):
             tray._on_about(mock.Mock(), mock.Mock())
             self._run_thread_target(T)  # must not raise
 
     def test_summary_subprocess_error_swallowed(self):
         with mock.patch.object(tray.threading, "Thread") as T, \
-             mock.patch.object(tray.subprocess, "run",
+             mock.patch.object(tray, "_tracked_dialog_run",
                                side_effect=OSError("spawn fail")):
             tray._on_show_today_summary(mock.Mock(), mock.Mock())
             self._run_thread_target(T)  # must not raise
@@ -1438,7 +1439,7 @@ class ThreadedCallbackTests(TrayTestBase):
         proc = mock.Mock()
         proc.stdout = "do the dishes"
         with mock.patch.object(tray.threading, "Thread") as T, \
-             mock.patch.object(tray.subprocess, "run", return_value=proc):
+             mock.patch.object(tray, "_tracked_dialog_run", return_value=proc):
             tray._on_queue_task(mock.Mock(), mock.Mock())
             self._run_thread_target(T)
         with open(tray.TODO_FILE, encoding="utf-8") as f:
@@ -1448,14 +1449,14 @@ class ThreadedCallbackTests(TrayTestBase):
         proc = mock.Mock()
         proc.stdout = "   "
         with mock.patch.object(tray.threading, "Thread") as T, \
-             mock.patch.object(tray.subprocess, "run", return_value=proc):
+             mock.patch.object(tray, "_tracked_dialog_run", return_value=proc):
             tray._on_queue_task(mock.Mock(), mock.Mock())
             self._run_thread_target(T)
         self.assertFalse(os.path.exists(tray.TODO_FILE))
 
     def test_queue_task_subprocess_error_swallowed(self):
         with mock.patch.object(tray.threading, "Thread") as T, \
-             mock.patch.object(tray.subprocess, "run",
+             mock.patch.object(tray, "_tracked_dialog_run",
                                side_effect=OSError("spawn fail")):
             tray._on_queue_task(mock.Mock(), mock.Mock())
             self._run_thread_target(T)
@@ -2519,6 +2520,111 @@ class AppleMusicMenuTests(TrayTestBase):
             # Transport verbs still present + invokable (no-op send is fine).
             texts = [getattr(it, "text", None) for it in am_item.submenu.items]
             self.assertIn("Play / Pause", texts)
+
+
+class SpawnedDialogTrackingTests(TrayTestBase):
+    """Finding #40: modal dialog subprocesses must be tracked and reaped on
+    quit / parent-death so they don't outlive JARVIS."""
+
+    def test_tracked_dialog_run_registers_then_cleans_up(self):
+        self.addCleanup(tray._dialog_procs.clear)
+
+        class _FakePopen:
+            def __init__(self, args, stdout=None, stderr=None, text=False,
+                         creationflags=0):
+                self.returncode = 0
+                self.in_list_mid_call = None
+
+            def communicate(self, timeout=None):
+                # The child must be registered for the duration of the call.
+                self.in_list_mid_call = any(p is self for p in tray._dialog_procs)
+                return ("queued text", "")
+
+            def poll(self):
+                return self.returncode
+
+        captured = {}
+
+        def _make(*a, **k):
+            p = _FakePopen(*a, **k)
+            captured["p"] = p
+            return p
+
+        with mock.patch.object(tray.subprocess, "Popen", side_effect=_make):
+            res = tray._tracked_dialog_run(["x"], capture_output=True,
+                                           text=True, timeout=5)
+        self.assertEqual(res.stdout, "queued text")
+        self.assertEqual(res.returncode, 0)
+        self.assertTrue(captured["p"].in_list_mid_call)     # tracked during call
+        self.assertNotIn(captured["p"], tray._dialog_procs)  # cleaned up after
+
+    def test_tracked_dialog_run_kills_child_on_timeout(self):
+        self.addCleanup(tray._dialog_procs.clear)
+
+        class _WedgedPopen:
+            def __init__(self, *a, **k):
+                self.killed = False
+                self._first = True
+
+            def communicate(self, timeout=None):
+                if self._first:
+                    self._first = False
+                    raise subprocess.TimeoutExpired(cmd="x", timeout=timeout)
+                return ("", "")
+
+            def kill(self):
+                self.killed = True
+
+            def poll(self):
+                return None
+
+        holder = {}
+
+        def _make(*a, **k):
+            holder["p"] = _WedgedPopen(*a, **k)
+            return holder["p"]
+
+        with mock.patch.object(tray.subprocess, "Popen", side_effect=_make):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                tray._tracked_dialog_run(["x"], timeout=1)
+        self.assertTrue(holder["p"].killed)                 # orphan killed
+        self.assertNotIn(holder["p"], tray._dialog_procs)   # unregistered
+
+    def test_terminate_dialog_procs_kills_live_only_and_clears(self):
+        live = mock.Mock(); live.poll.return_value = None    # still running
+        dead = mock.Mock(); dead.poll.return_value = 0       # already exited
+        tray._dialog_procs[:] = [live, dead]
+        self.addCleanup(tray._dialog_procs.clear)
+        tray._terminate_dialog_procs()
+        live.terminate.assert_called_once()
+        dead.terminate.assert_not_called()
+        self.assertEqual(tray._dialog_procs, [])
+
+    def test_terminate_swallows_terminate_errors(self):
+        proc = mock.Mock(); proc.poll.return_value = None
+        proc.terminate.side_effect = OSError("gone")
+        tray._dialog_procs[:] = [proc]
+        self.addCleanup(tray._dialog_procs.clear)
+        tray._terminate_dialog_procs()   # must not raise
+        self.assertEqual(tray._dialog_procs, [])
+
+    def test_quit_reaps_open_dialogs(self):
+        proc = mock.Mock(); proc.poll.return_value = None
+        tray._dialog_procs[:] = [proc]
+        self.addCleanup(tray._dialog_procs.clear)
+        tray._on_quit(mock.Mock(), mock.Mock())
+        proc.terminate.assert_called_once()
+        self.assertEqual(tray._dialog_procs, [])
+
+    def test_parent_death_reaps_open_dialogs(self):
+        proc = mock.Mock(); proc.poll.return_value = None
+        tray._dialog_procs[:] = [proc]
+        self.addCleanup(tray._dialog_procs.clear)
+        icon = mock.Mock()
+        with mock.patch.object(tray, "_parent_alive", return_value=False):
+            tray._animate(icon)
+        proc.terminate.assert_called_once()
+        icon.stop.assert_called_once()
 
 
 if __name__ == "__main__":

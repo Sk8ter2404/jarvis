@@ -234,9 +234,74 @@ def _cfg_model() -> str:
     return str(getattr(cfg, "VOICE_CLONE_MODEL", "chatterbox") or "chatterbox") if cfg else "chatterbox"
 
 
+def _cfg_device() -> str:
+    """Optional torch device override for the clone engine. "" (default/unset)
+    preserves the historical behaviour of ``"cuda"`` (device 0) when CUDA is
+    present else ``"cpu"``. Set e.g. ``"cuda:1"`` to run the clone on a second,
+    idle GPU instead of hard-pinning cuda:0 and fighting gemma for its last
+    ~1GB. 2026-07-08."""
+    cfg = _config()
+    return str(getattr(cfg, "VOICE_CLONE_DEVICE", "") or "") if cfg else ""
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # HEAVY SEAM  (the ONLY place chatterbox / torch / CUDA are touched)
 # ═══════════════════════════════════════════════════════════════════════════
+
+# Minimum free VRAM we require on an EXPLICITLY chosen CUDA device before we
+# load Chatterbox onto it. Below this we degrade to the normal TTS ladder rather
+# than OOM-contend for gemma's headroom. ~2GB gives the model room to load. Only
+# consulted when VOICE_CLONE_DEVICE names a cuda device (unset knob = old path,
+# no gating). 2026-07-08.
+_MIN_FREE_VRAM_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def _device_index(device: str) -> int:
+    """Parse a torch CUDA device string ("cuda" | "cuda:1") to the integer index
+    ``torch.cuda.mem_get_info`` wants. Bare "cuda" → 0. Never raises."""
+    try:
+        if ":" in device:
+            return int(device.split(":", 1)[1])
+    except Exception:
+        pass
+    return 0
+
+
+def _free_vram_ok(device: str) -> bool:
+    """True if ``device`` reports at least ``_MIN_FREE_VRAM_BYTES`` free VRAM via
+    ``torch.cuda.mem_get_info``. Fails OPEN (returns True) on any probe failure —
+    a torch build without mem_get_info must not wrongly suppress the feature; a
+    real OOM at load is still caught downstream and falls back cleanly."""
+    try:
+        import torch  # type: ignore
+    except Exception:
+        return True
+    try:
+        free, _total = torch.cuda.mem_get_info(_device_index(device))
+        return int(free) >= _MIN_FREE_VRAM_BYTES
+    except Exception:
+        return True
+
+
+def _resolve_device() -> Optional[str]:
+    """Decide which torch device to load Chatterbox onto.
+
+    Unset ``VOICE_CLONE_DEVICE`` → exactly the previous behaviour ("cuda" when
+    available else "cpu") with NO VRAM gating, so the happy path is unchanged.
+    A knob that names a CUDA device is honoured AND free-VRAM checked; if that
+    device is too full (or CUDA isn't available) we return ``None`` so the
+    caller degrades to the normal ladder instead of OOM-contending. A "cpu"
+    override always passes. 2026-07-08."""
+    want = _cfg_device().strip()
+    if not want:
+        return "cuda" if _cuda_available() else "cpu"
+    if want.lower().startswith("cpu"):
+        return want
+    if not _cuda_available():
+        return None
+    if not _free_vram_ok(want):
+        return None
+    return want
 
 def _cuda_available() -> bool:
     """True only if torch is importable AND reports a CUDA device. Defensive:
@@ -288,7 +353,14 @@ def _load_engine(profile: dict):
     # cheap and the pure-logic tests never need chatterbox on the path.
     from chatterbox.tts import ChatterboxTTS  # type: ignore
 
-    device = "cuda" if _cuda_available() else "cpu"
+    # Device selection honours the optional VOICE_CLONE_DEVICE knob (+ a
+    # free-VRAM check on an explicitly chosen CUDA device) so we don't hard-pin
+    # cuda:0. None → the device is too full / unusable: raise so synthesize()
+    # converts it into a clean None fallback rather than OOM-contending. Unset
+    # knob keeps the historical "cuda"/"cpu" pick. 2026-07-08.
+    device = _resolve_device()
+    if device is None:
+        raise RuntimeError("voice-clone: chosen CUDA device lacks free VRAM")
     model = ChatterboxTTS.from_pretrained(device=device)
 
     _engine_cache[0] = model

@@ -76,6 +76,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 
 try:
     import pystray
@@ -667,6 +668,60 @@ def _append_queued_task(text: str) -> None:
         print(f"[tray] queue task failed: {e}")
 
 
+# ─── Spawned-dialog lifecycle tracking ──────────────────────────────────────
+# Modal dialogs (queue-task, dossier, about, summary) run in short-lived Python
+# subprocesses. Before v2.0.23 only the tray icon was stopped on shutdown, so a
+# dialog left open orphaned its subprocess — it outlived JARVIS. Track every
+# live dialog Popen here and reap them on quit / parent-death. 2026-07-08.
+_dialog_procs: "list[subprocess.Popen]" = []
+_dialog_procs_lock = threading.Lock()
+
+
+def _terminate_dialog_procs() -> None:
+    """Terminate every still-open spawned dialog subprocess so a modal dialog
+    left on screen can't outlive JARVIS. Called on tray quit and when the parent
+    JARVIS process is first seen gone. Never raises. 2026-07-08."""
+    with _dialog_procs_lock:
+        procs = list(_dialog_procs)
+        _dialog_procs.clear()
+    for proc in procs:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
+
+
+def _tracked_dialog_run(args, *, capture_output=False, text=False,
+                        timeout=None, creationflags=0):
+    """``subprocess.run`` work-alike that registers the child in
+    ``_dialog_procs`` for the life of the call, so a shutdown mid-dialog can
+    reap the orphan. Returns an object exposing ``.stdout`` / ``.returncode``
+    like ``subprocess.run``. On timeout the child is killed (mirrors run's
+    contract) before the TimeoutExpired propagates. 2026-07-08."""
+    pipe = subprocess.PIPE if capture_output else None
+    proc = subprocess.Popen(args, stdout=pipe, stderr=pipe, text=text,
+                            creationflags=creationflags)
+    with _dialog_procs_lock:
+        _dialog_procs.append(proc)
+    try:
+        out, _err = proc.communicate(timeout=timeout)
+    except Exception:
+        try:
+            proc.kill()
+            proc.communicate()
+        except Exception:
+            pass
+        raise
+    finally:
+        with _dialog_procs_lock:
+            try:
+                _dialog_procs.remove(proc)
+            except ValueError:
+                pass
+    return types.SimpleNamespace(stdout=out, returncode=proc.returncode)
+
+
 def _run_queue_task_dialog() -> int:
     """Subprocess entry point: run the tkinter input dialog on THIS
     process's main thread, then print the entered text to stdout.
@@ -709,7 +764,7 @@ def _on_queue_task(icon, item):
             creationflags = 0
             if sys.platform == "win32":
                 creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            proc = subprocess.run(
+            proc = _tracked_dialog_run(
                 [sys.executable, os.path.abspath(__file__),
                  "--queue-task-dialog"],
                 capture_output=True, text=True, timeout=600,
@@ -849,7 +904,7 @@ def _on_show_dossier(icon, item):
             creationflags = 0
             if sys.platform == "win32":
                 creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            subprocess.run(
+            _tracked_dialog_run(
                 [sys.executable, os.path.abspath(__file__), "--dossier-dialog"],
                 timeout=1800,
                 creationflags=creationflags,
@@ -1069,7 +1124,7 @@ def _on_about(icon, item):
             creationflags = 0
             if sys.platform == "win32":
                 creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            subprocess.run(
+            _tracked_dialog_run(
                 [sys.executable, os.path.abspath(__file__), "--about-dialog"],
                 timeout=1800,
                 creationflags=creationflags,
@@ -1291,7 +1346,7 @@ def _on_show_today_summary(icon, item):
             creationflags = 0
             if sys.platform == "win32":
                 creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            subprocess.run(
+            _tracked_dialog_run(
                 [sys.executable, os.path.abspath(__file__),
                  "--summary-dialog"],
                 timeout=1800,
@@ -1305,6 +1360,7 @@ def _on_show_today_summary(icon, item):
 
 def _on_quit(icon, item):
     _stop_event.set()
+    _terminate_dialog_procs()   # reap any open modal dialog before we go. 2026-07-08
     try: icon.stop()
     except Exception: pass
 
@@ -1317,6 +1373,7 @@ def _animate(icon: "pystray.Icon") -> None:
         try:
             if not _parent_alive():
                 print("[tray] parent JARVIS process exited — closing tray")
+                _terminate_dialog_procs()   # don't orphan an open dialog. 2026-07-08
                 try: icon.stop()
                 except Exception: pass
                 return

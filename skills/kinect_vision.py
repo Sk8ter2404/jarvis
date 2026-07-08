@@ -7,7 +7,7 @@ infrared) to the voice loop via four spoken-friendly actions:
   kinect_status            — is the Kinect connected, which streams are live,
                              how many people are in view.
   scan_room / who_is_here  — body count + nearest distance ("one person about
-                             1.8 metres away, sir").
+                             6 feet away, sir").
   kinect_look /
   what_do_you_see_kinect   — grab the Kinect color frame and route it through
                              ask_vision ("Looking through the Kinect, sir — …").
@@ -40,12 +40,13 @@ def _bc():
 
 
 def _distance_phrase(metres) -> str:
-    """'about 1.8 metres away' / '' when unknown. The user prefers imperial
-    generally but metric for measurements like this reads naturally and matches
-    the Kinect's native units."""
+    """'about 6 feet away' / '' when unknown. The owner uses US imperial for
+    everyday distances (feet/yards) — metric is reserved for 3D printing — so
+    convert the Kinect's native metres before speaking. 2026-07-08."""
     if not metres:
         return ""
-    return f" about {float(metres):.1f} metres away"
+    from core.units import meters_to_imperial_phrase
+    return f" about {meters_to_imperial_phrase(metres)} away"
 
 
 # ─── actions ─────────────────────────────────────────────────────────────

@@ -769,7 +769,11 @@ def _call_anthropic_auditor(prompt: str) -> str | None:
         print("  [diag-daemons] ANTHROPIC_API_KEY missing — skipping audit")
         return None
     try:
-        client = anthropic.Anthropic()
+        # Explicit request timeout so a wedged HTTPS connection can't hang this
+        # daemon thread for the SDK's ~10min default and stall graceful
+        # shutdown — cap the whole call at 60s and fall through to None on
+        # timeout. 2026-07-08.
+        client = anthropic.Anthropic(timeout=60)
         resp = client.messages.create(
             model=DEEP_AUDIT_MODEL,
             max_tokens=2048,

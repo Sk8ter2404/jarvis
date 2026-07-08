@@ -360,8 +360,9 @@ def _alert_text(camera_label: str, kind: str, distance_m=None) -> str:
     tracked person) or 'motion' (webcam pixel motion)."""
     if kind == "kinect":
         if distance_m:
+            from core.units import meters_to_imperial_phrase
             return (f"Someone is in the room, sir — the Kinect sees a person "
-                    f"about {float(distance_m):.1f} metres out.")
+                    f"about {meters_to_imperial_phrase(distance_m)} out.")
         return "Someone is in the room, sir — the Kinect sees a person."
     return f"Movement detected on {camera_label}, sir."
 
