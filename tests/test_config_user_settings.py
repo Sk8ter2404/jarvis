@@ -144,6 +144,37 @@ class ApplyUserSettingsTests(unittest.TestCase):
         finally:
             cfg.PREFERRED_INPUT_DEVICES = orig
 
+    def test_string_bool_is_parsed_not_bare_bool(self):
+        # #18: a JSON *string* boolean the Settings GUI accepts ("true"/"false")
+        # must be parsed the same way settings_window.coerce_value does. A bare
+        # bool("false") is True, which would flip the runtime constant OPPOSITE
+        # to the GUI's intent (runtime and GUI silently disagree).
+        orig = cfg.CLAUDE_OPTIONAL
+        try:
+            cfg.CLAUDE_OPTIONAL = True
+            self._apply({"CLAUDE_OPTIONAL": "false"})
+            self.assertIs(cfg.CLAUDE_OPTIONAL, False)   # NOT True
+
+            cfg.CLAUDE_OPTIONAL = False
+            self._apply({"CLAUDE_OPTIONAL": "true"})
+            self.assertIs(cfg.CLAUDE_OPTIONAL, True)
+
+            # The wider truthy vocabulary coerce_value honours also applies.
+            cfg.CLAUDE_OPTIONAL = True
+            self._apply({"CLAUDE_OPTIONAL": "off"})
+            self.assertIs(cfg.CLAUDE_OPTIONAL, False)
+
+            cfg.CLAUDE_OPTIONAL = False
+            self._apply({"CLAUDE_OPTIONAL": "yes"})
+            self.assertIs(cfg.CLAUDE_OPTIONAL, True)
+
+            # A real JSON bool still round-trips unchanged.
+            cfg.CLAUDE_OPTIONAL = True
+            self._apply({"CLAUDE_OPTIONAL": False})
+            self.assertIs(cfg.CLAUDE_OPTIONAL, False)
+        finally:
+            cfg.CLAUDE_OPTIONAL = orig
+
     def test_legacy_ambient_listening_key_aliases_to_new_name(self):
         # v1.20.0 renamed AMBIENT_LISTENING_ENABLED -> AMBIENT_LISTEN_ENABLED.
         # A saved user_settings.json carrying the OLD key must still flip the

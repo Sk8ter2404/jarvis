@@ -848,6 +848,24 @@ def save_settings(values: dict, path: str | None = None) -> None:
     atomic_write_json(path, out)
 
 
+def _current_settings_base(snapshot: dict, path: str | None = None) -> dict:
+    """Return the base document the GUI's Save should overlay its fields onto.
+
+    Re-reads the CURRENT on-disk settings rather than reusing the window-OPEN
+    snapshot, so a key that a runtime action (e.g. a voice command toggling a
+    setting) persisted while the Settings window was open survives Save instead
+    of being silently reverted to its open-time value. The GUI's own field
+    values are layered on top by the caller, so any key the user actually edits
+    still wins. Falls back to a copy of the open-time snapshot if the re-read
+    fails, so Save is never worse than the previous whole-snapshot behaviour.
+    2026-07-08.
+    """
+    try:
+        return dict(load_settings(path))
+    except Exception:
+        return dict(snapshot)
+
+
 def ensure_settings_file(path: str | None = None) -> dict:
     """Guarantee a valid settings file exists, creating it from defaults.
 
@@ -1400,7 +1418,11 @@ def run_gui(start_tab: int = 0) -> int:
         side="left", padx=10)
 
     def _collect() -> dict:
-        out: dict = dict(settings)  # keep unknown/passthrough keys
+        # Seed from the CURRENT on-disk document (not the window-open snapshot)
+        # so a key a runtime action persisted while this window was open is kept
+        # rather than reverted; the GUI's own field values are layered on below.
+        # 2026-07-08.
+        out: dict = _current_settings_base(settings)  # keep unknown/passthrough keys
         for key, var in vars_by_key.items():
             out[key] = var.get()
         for key, widget in text_widgets.items():

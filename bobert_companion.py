@@ -4235,6 +4235,21 @@ def _release_side_tile_webcams() -> None:
             _kinect_tile_last_read[slot] = 0.0
 
 
+def _release_side_tile_webcams_if_open() -> None:
+    """Release the persistent side-tile webcam handles IFF they're currently
+    marked open, then clear the open flag. Idempotent by design: it is safe to
+    call every frame while in a composite-stopping state (camera_off /
+    HUD-preview-disabled / overlay-off), because the flag guard makes the real
+    release fire exactly once per open→closed edge. Extracted so BOTH the
+    overlay-off edge in _hud_kinect_preview_write AND the camera-off / preview-
+    disabled branch of the face-track loop release the tiles the same way —
+    previously only the overlay edge did, so standby/low-mem leaked the handles.
+    2026-07-08."""
+    if _kinect_preview_tiles_open[0]:
+        _release_side_tile_webcams()
+        _kinect_preview_tiles_open[0] = False
+
+
 def _placeholder_tile(label: str, w: int = 320, h: int = 240) -> "np.ndarray":
     """A dim placeholder tile for a side webcam that's off/covered/unavailable —
     a dark panel with a centred '<label> — off' caption. Drawn INSTEAD of the
@@ -4780,9 +4795,14 @@ def _hud_kinect_preview_write(now: float) -> bool:
         # Overlay just went off (or never on) — release the side-tile webcam
         # handles so they're not held open while unused. Only acts on the
         # on→off transition (the flag guards against repeated releases).
-        if _kinect_preview_tiles_open[0]:
-            _release_side_tile_webcams()
-            _kinect_preview_tiles_open[0] = False
+        _release_side_tile_webcams_if_open()
+        return False
+    # Throttle BEFORE composing (2026-07-08). _hud_camera_preview_write applies
+    # the same _HUD_CAM_PREVIEW_MIN_GAP but only AFTER we hand it a frame, so at
+    # the face-track loop's ~20 Hz cadence roughly 2/3 of the (expensive) Kinect
+    # composites were built and then discarded by that throttle. Bail early when
+    # a write isn't due so the composite is built only at the ~6.7 Hz emit rate.
+    if (now - _hud_cam_preview_last_write[0]) < _HUD_CAM_PREVIEW_MIN_GAP:
         return False
     composed = _compose_kinect_preview(now)
     if composed is None:
@@ -5252,6 +5272,15 @@ def _face_tracking_thread():
             # The per-frame write for the primary camera happens below.
             if camera_off or not _hud_camera_preview_enabled():
                 _hud_camera_preview_remove()
+                # SIDE-TILE LEAK FIX (2026-07-08): the composite's persistent
+                # side-tile webcam handles are released by _hud_kinect_preview_
+                # write ONLY on the skeleton-overlay on→off edge. Entering
+                # camera_off (low-mem/standby) or HUD-preview-disabled ALSO stops
+                # the composite, but _hud_kinect_preview_write is no longer called
+                # in this state, so the tiles would stay open and leak. Release
+                # them here on entry to ANY composite-stopping state; the helper's
+                # flag guard makes it fire once, not every frame.
+                _release_side_tile_webcams_if_open()
 
             # Read all cameras, run face detection on each
             primary_face = None
@@ -6906,14 +6935,17 @@ _record_speech_sr     = [SAMPLE_RATE]    # sample rate of the live stream
 # now writes ONLY its own flag; _refresh_devices defers its destructive PortAudio
 # reinit while EITHER is set.
 _pathb_mic_active     = [False]
-# True while skills/ambient_listen holds a live dedicated InputStream — either its
-# WASAPI system-audio loopback stream or its mic-fallback stream. Those daemons run
-# for minutes and (unlike record_speech) set NONE of the other ownership flags, so
-# _refresh_devices could sd._terminate()/_initialize() PortAudio out from under a
-# live loopback callback thread → 0xc0000374 heap corruption (HIGH, 2026-07-08).
-# ambient_listen sets this True around its stream lifetime; _refresh_devices defers
-# its destructive reinit while it's set.
-_ambient_stream_active = [False]
+# REFCOUNT of live dedicated InputStreams held by skills/ambient_listen — its
+# WASAPI system-audio loopback stream and/or its mic-fallback stream. Those daemons
+# run for minutes and (unlike record_speech) set NONE of the other ownership flags,
+# so _refresh_devices could sd._terminate()/_initialize() PortAudio out from under a
+# live callback thread → 0xc0000374 heap corruption (HIGH, 2026-07-08).
+# It is a COUNT, not a boolean: the mic worker and the loopback worker are separate
+# skills that can run CONCURRENTLY, so a shared boolean let whichever exited first
+# clear the guard while the other's stream was still live (bug-hunt 2026-07-08).
+# ambient_listen increments on each stream open and decrements on close (under
+# _mic_lock); _refresh_devices defers its destructive reinit while the count is > 0.
+_ambient_stream_active = [0]
 _mic_lock = threading.Lock()             # serialises Path-B mic-ownership flag writes
 _record_speech_taps: "list[queue.Queue]" = []
 _record_speech_taps_lock = threading.Lock()
@@ -17525,10 +17557,33 @@ def _detect_dropped_steps(reply_text: str,
     marker_ends = [m.end() for m in _FUTURE_MARKER_RE.finditer(prose)]
     if not marker_ends:
         return []
+    # ALIAS-AWARE satisfaction (2026-07-08): the LLM may back a promised step
+    # with a REGISTERED ALIAS of the canonical action — a different name bound
+    # to the SAME handler fn in ACTIONS (e.g. 'grab_screen' aliasing
+    # 'see_screen'). Keying satisfaction on the exact canonical name alone
+    # false-positives, flagging a step as dropped that actually ran under its
+    # alias. Build a reverse handler→names map so ANY name sharing the expected
+    # action's handler counts as satisfied. id(fn) keys keep this robust for
+    # bound methods / partials that may not hash by value.
+    _fn_to_names: dict = {}
+    try:
+        for _n, _f in ACTIONS.items():
+            _fn_to_names.setdefault(id(_f), set()).add(_n)
+    except Exception:
+        _fn_to_names = {}
+
+    def _satisfied(action_name: str) -> bool:
+        if action_name in emitted_actions:
+            return True
+        _fn = ACTIONS.get(action_name)
+        if _fn is None:
+            return False
+        return bool(_fn_to_names.get(id(_fn), set()) & emitted_actions)
+
     dropped: list[tuple[str, str]] = []
     seen: set[str] = set()
     for target_re, action_name, desc in _CONTINUATION_INTENTS:
-        if action_name in emitted_actions or action_name in seen:
+        if _satisfied(action_name) or action_name in seen:
             continue
         if action_name not in ACTIONS:
             continue
@@ -17948,6 +18003,25 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
         + _mode_add
     )
 
+    # LOCAL-routed turn: keep the whole action chain on the same brain as the
+    # primary turn. Mirror _call_llm's local-first idiom — when model_route
+    # ("chat")=="local" the follow-up must go local-first (_local_then_cloud_
+    # or_honest) BEFORE the AI_BACKEND cloud branches, otherwise a local-only
+    # deployment would silently punch out to the cloud on every follow-up round
+    # and break the local route for the rest of the chain. 2026-07-08.
+    try:
+        from core.config import model_route
+        if model_route("chat") == "local":
+            return _local_then_cloud_or_honest(
+                sys_prompt_now,
+                list(conversation_history) + [{"role": "user", "content": extra}],
+                max_tokens=400,
+            )
+    except Exception:
+        # Route lookup failed — fall through to the existing backend branches
+        # (same degrade-to-cloud posture the primary turn would take).
+        pass
+
     try:
         if AI_BACKEND == "claude":
             import anthropic
@@ -18127,6 +18201,12 @@ def handle_confirmation_response(user_text: str) -> bool:
         print(f"  [confirm] User confirmed — executing {count} pending action(s)")
         executed = []
         failures = []  # spoken-friendly reasons for actions that did NOT succeed
+        # Successful INFORMATIVE / VERBATIM results whose ANSWER the user is
+        # waiting on — the confirmation path used to drop these and speak a
+        # blanket "Done.", so e.g. a confirmed see_screen / check_print never
+        # voiced what it found. Collected here and spoken below. 2026-07-08.
+        informative_results: list[tuple[str, str]] = []
+        verbatim_results: list[tuple[str, str, bool]] = []
         fail_markers = tuple(m.lower() for m in FAILURE_MARKERS)
         while _pending_confirmation:
             name, arg = _pending_confirmation.pop(0)
@@ -18144,15 +18224,42 @@ def handle_confirmation_response(user_text: str) -> bool:
                     failures.append(str(res).strip())
                 else:
                     executed.append(name)
+                    # Route the ANSWER, not a blanket "Done.": INFORMATIVE
+                    # actions get an LLM restatement via the follow-up loop;
+                    # VERBATIM actions are already finished sentences.
+                    if name in INFORMATIVE_ACTIONS:
+                        informative_results.append((name, res))
+                    elif name.lower() in SPEAK_RESULT_VERBATIM_ACTIONS:
+                        verbatim_results.append((name, res, False))
             except Exception as e:
                 print(f"  [action] {name} failed: {e}")
                 failures.append(f"{name.replace('_', ' ')} ran into an error, sir")
-        # Honest audible feedback — don't say "Done" for actions that failed.
+        # Speak the actual answer for informative / verbatim actions BEFORE the
+        # generic Done/failure feedback so a confirmed question ("read me the
+        # print status") is answered instead of getting a bare "Done." 2026-07-08.
+        spoke_answer = False
+        if informative_results:
+            try:
+                _fu = get_followup_response(informative_results)
+            except Exception as _e:
+                print(f"  [confirm] informative follow-up failed: {_e}")
+                _fu = ""
+            if _fu:
+                _speak(_fu)
+                spoke_answer = True
+        if verbatim_results and _speak_verbatim_results(verbatim_results):
+            spoke_answer = True
+        # Honest audible feedback — don't say "Done" for actions that failed,
+        # and don't tack a redundant "Done." onto an answer we just spoke.
         if executed and not failures:
-            _speak("Done." if len(executed) == 1 else f"Done — ran {len(executed)} actions.")
+            if not spoke_answer:
+                _speak("Done." if len(executed) == 1 else f"Done — ran {len(executed)} actions.")
         elif executed and failures:
-            done = "Done." if len(executed) == 1 else f"Done — ran {len(executed)} actions."
-            _speak(f"{done} But {len(failures)} didn't go through, sir.")
+            if spoke_answer:
+                _speak(f"But {len(failures)} didn't go through, sir.")
+            else:
+                done = "Done." if len(executed) == 1 else f"Done — ran {len(executed)} actions."
+                _speak(f"{done} But {len(failures)} didn't go through, sir.")
         elif failures:
             # Nothing succeeded — speak the first failure's own message (action
             # failure strings are already finished sentences).
@@ -18280,25 +18387,41 @@ _MARKDOWN_FOR_SPEECH_RE_HRULE  = re.compile(r"^[-=_]{3,}\s*$", re.MULTILINE)
 # Currency amounts → spoken words so edge-tts doesn't read "$8.18" as the clock
 # time "eight eighteen" (the Claude-balance bug). Matches $8, $8.18, and
 # comma-grouped thousands like $1,234.56, with an optional space after the sign.
-_CURRENCY_FOR_SPEECH_RE = re.compile(r"\$\s?(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d{1,2}))?")
+# Trailing ([kmb]) magnitude shorthand ("$100k", "$5M") plus a closing \b so a
+# stray suffix letter can't glue onto "dollars" ("100 dollarsk"). The \b also
+# anchors the plain case so "$100kg" (not money) isn't mangled. 2026-07-08.
+_CURRENCY_FOR_SPEECH_RE = re.compile(
+    r"\$\s?(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d{1,2}))?([kKmMbB])?\b")
+
+# Suffix letter → spoken magnitude word.
+_CURRENCY_MAGNITUDE = {"k": "thousand", "m": "million", "b": "billion"}
 
 
 def _currency_to_words(text: str) -> str:
     """Convert '$8.18' → '8 dollars and 18 cents' so TTS speaks a money amount
     as money, not as the clock time 'eight eighteen' (the reported Claude-balance
     bug — a balance of $8.18 was read like the time 8:18). Handles $N, $N.CC,
-    comma-grouped thousands, singular/plural, and cents-only amounts ($0.50 →
-    '50 cents'). Non-currency numbers are left untouched."""
+    comma-grouped thousands, singular/plural, cents-only amounts ($0.50 →
+    '50 cents'), and magnitude shorthand ($100k → '100 thousand dollars',
+    $5M → '5 million dollars'). Non-currency numbers are left untouched."""
     if not text or "$" not in text:
         return text
 
     def _repl(m):
         whole = m.group(1).replace(",", "")
+        cents = m.group(2)
+        suffix = m.group(3)
+        # Magnitude shorthand ($100k / $5M / $2.5B): expand the suffix into a
+        # spoken word and keep any decimal component ($2.5M → '2.5 million
+        # dollars') rather than reading digits then a glued letter.
+        if suffix:
+            magnitude = _CURRENCY_MAGNITUDE[suffix.lower()]
+            num = whole if not cents else f"{whole}.{cents}"
+            return f"{num} {magnitude} dollars"
         try:
             dollars = int(whole)
         except ValueError:
             return m.group(0)
-        cents = m.group(2)
         # ".5" is 50 cents, ".05" is 5 cents — pad a single digit on the right.
         cents_val = int((cents + "0")[:2]) if cents else 0
         parts = []
@@ -19260,6 +19383,35 @@ def _preflight_cameras(timeout_sec: float = 2.0) -> None:
               f"{len(CAMERAS)} remain")
 
 
+def _reap_stale_temp_files() -> None:
+    """Delete orphaned atomic-write temp files stranded in the project root when
+    the process was hard-killed (watchdog bounce, blue/green swap, crash) in the
+    window between mkstemp and os.replace. Every writer removes its OWN temp on
+    its error path, so a CLEAN session leaks nothing — but a hard-kill mid-write
+    strands a `.hud_*/.mem_*/.uhud_*/tray_*.tmp`, and the ~30 Hz HUD-state writer
+    makes `.hud_*` the common one. Nothing reaped these across the many bounces a
+    long-lived deploy sees, so they piled up in the repo root (bug-hunt 2026-07-08).
+    Only removes temps older than 2 minutes so a temp a CONCURRENT live writer is
+    mid-write on is never touched. Best-effort — never raises."""
+    import glob
+    try:
+        root = os.path.dirname(os.path.abspath(__file__))
+        cutoff = time.time() - 120.0
+        n = 0
+        for pat in (".hud_*.tmp", ".mem_*.tmp", ".uhud_*.tmp", "tray_*.tmp"):
+            for p in glob.glob(os.path.join(root, pat)):
+                try:
+                    if os.path.getmtime(p) < cutoff:
+                        os.remove(p)
+                        n += 1
+                except OSError:
+                    continue
+        if n:
+            print(f"  [preflight] reaped {n} stale temp file(s) from the project root")
+    except Exception as e:
+        print(f"  [preflight] temp-reap skipped: {type(e).__name__}: {e}")
+
+
 def _startup_preflight() -> None:
     """Three self-heal checks the orchestrator runs right after logging
     starts and before any of the heavy boot work (whisper, daemons,
@@ -19333,6 +19485,9 @@ def _startup_preflight() -> None:
     except Exception as e:
         print(f"  [preflight] camera check raised "
               f"{type(e).__name__}: {e} — leaving CAMERAS untouched")
+
+    # (4) Reap orphaned atomic-write temps left by a prior hard-kill.
+    _reap_stale_temp_files()
 
     print("Preflight complete.")
     print("─" * 60)
@@ -20386,6 +20541,17 @@ def _run_llm_dispatch(text: str) -> str:
     # not reset it, so the cap of SEE_SCREEN_BUDGET_PER_INTENT spans the entire
     # follow-up chain instead of refreshing on each iteration.
     _reset_see_screen_budget()
+    # Snapshot the accepted-barge counter at reply start. A wake-word barge-in
+    # accepted DURING streamed early speech (get_response_with_animation ->
+    # _call_llm's _SentenceFlushBuffer) advances this counter; the flush threads
+    # already honour it (see _barge_seq0), but the DOWNSTREAM tail / verbatim /
+    # follow-up speech below did not — so a barged reply still blurted its whole
+    # tail. Gate every remaining speak on the seq being unchanged so an accepted
+    # barge silences the rest of this turn. Mirrors _barge_seq0. 2026-07-08.
+    try:
+        _barge_seq0 = _tts_interrupt_seq[0]
+    except Exception:
+        _barge_seq0 = 0
     # Glance-response fast path: if the focused window changed in the
     # last few seconds AND the utterance is ambiguous ("what is
     # this?" / "should I worry?" / "wait, what?" / "explain"), grab
@@ -20408,7 +20574,14 @@ def _run_llm_dispatch(text: str) -> str:
     # Applied BEFORE the quip layer so a quip attaches to the unspoken tail.
     spoken_text = _strip_stream_spoken_prefix(spoken_text)
     spoken_text = _apply_quip_layer(spoken_text, action_results)
-    if spoken_text:
+    # Barge gate: if a wake-word barge was accepted while the reply streamed,
+    # the seq advanced — honour the interrupt and don't speak the tail. 2026-07-08.
+    _barged = False
+    try:
+        _barged = _tts_interrupt_seq[0] != _barge_seq0
+    except Exception:
+        _barged = False
+    if spoken_text and not _barged:
         _speak(spoken_text)
 
     # Speak verbatim-result actions (version_info, system_pulse, …) directly.
@@ -20416,7 +20589,11 @@ def _run_llm_dispatch(text: str) -> str:
     # in INFORMATIVE_ACTIONS, so the follow-up loop below never voices them —
     # without this the answer is logged but never spoken (the 2026-06-03
     # "you didn't speak it" bug). Deduped against the inline reply just spoken.
-    _spoke_verbatim = _speak_verbatim_results(action_results, spoken_text)
+    # Skipped when barged so the interrupt silences the verbatim answer too.
+    _spoke_verbatim = (
+        _speak_verbatim_results(action_results, spoken_text)
+        if not _barged else False
+    )
 
     # If any informational actions ran (see_screen, etc.), feed the
     # results back so Bobert can actually report what he found.
@@ -20433,6 +20610,11 @@ def _run_llm_dispatch(text: str) -> str:
     _chain_seen: set[str] = set()   # loop-break: actions already fired this chain
     # (action, result) pairs that already failed once this chain — see below.
     _failed_seen: set[tuple[str, str]] = set()
+    # Every informative (name, result) pair seen this chain — successes too.
+    # Mirrors _failed_seen so a chain that keeps re-reporting the SAME
+    # successful result (no new pair in a whole round) breaks instead of
+    # looping to the depth cap. 2026-07-08.
+    _info_seen: set[tuple[str, str]] = set()
     # Agent mode gets a deeper follow-up loop so autonomous tasks
     # have more room to plan → execute → critique → repeat. Smart
     # and controlled modes historically capped at 5, which combined with
@@ -20470,6 +20652,18 @@ def _run_llm_dispatch(text: str) -> str:
                   f" — stopping")
             break
         _failed_seen |= _failing_now
+        # SUCCESS-repeat break (mirror of the failure-repeat break above): if a
+        # whole round adds NO new informative (name, result) pair — every result
+        # this round was already seen earlier in the chain — the chain is going
+        # in circles re-reporting the same successful info, so stop. Only fires
+        # once at least one round has been recorded, so the first round always
+        # runs. 2026-07-08.
+        _info_now = set(informative)
+        if _info_seen and not (_info_now - _info_seen):
+            print("  [follow-up] informative result(s) repeating with no new "
+                  "progress — stopping")
+            break
+        _info_seen |= _info_now
         # Loop detection: actions that should only fire ONCE per chain.
         # check_credits opens an offscreen browser, reads the balance,
         # and closes it — emitting it twice means JARVIS is going in
@@ -20503,12 +20697,20 @@ def _run_llm_dispatch(text: str) -> str:
         f_spoken = _apply_quip_layer(f_spoken, current_results)
         # Append follow-up to history so context carries forward
         conversation_history.append({"role": "assistant", "content": followup})
-        if f_spoken:
+        # Re-check the barge gate each round — an accepted wake-word barge (here
+        # or during an earlier speak) advances the seq; once barged, stay silent
+        # for the rest of the chain. 2026-07-08.
+        try:
+            _barged = _tts_interrupt_seq[0] != _barge_seq0
+        except Exception:
+            pass
+        if f_spoken and not _barged:
             _speak(f_spoken)
         # A follow-up reply can itself emit a verbatim-result action (e.g. the
         # LLM chains system_pulse). Voice its result here too, deduped against
         # the follow-up prose just spoken.
-        _spoke_verbatim |= _speak_verbatim_results(current_results, f_spoken)
+        if not _barged:
+            _spoke_verbatim |= _speak_verbatim_results(current_results, f_spoken)
     # TRIM after the follow-up chain (2026-07-07 bug-hunt, MED). Each depth
     # iteration appends an assistant message but _call_llm only trims ONCE,
     # BEFORE this loop runs — so a multi-step chain (depth cap 8, agent mode 24)

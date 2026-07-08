@@ -761,6 +761,62 @@ class RunLlmDispatchTests(SectionSevenBase):
         self.bc._run_llm_dispatch("mute")
         self._speak.assert_not_called()
 
+    def test_barge_in_during_stream_suppresses_tail_speak(self):
+        # Finding #6 (2026-07-08): a wake-word barge accepted while the reply
+        # streamed (the interrupt seq advances) must silence the tail — the
+        # downstream _speak used to blurt the whole reply anyway.
+        bc = self.bc
+        # Isolate the interrupt counter so the side effect below is clean.
+        self._p(bc, "_tts_interrupt_seq", [0])
+        self._p(bc, "maybe_glance_response", return_value=None)
+
+        def _gra(_t):
+            # Simulate an accepted barge mid-stream: advance the counter exactly
+            # as _tts_interrupt() does when a wake word cuts early speech.
+            bc._tts_interrupt_seq[0] += 1
+            return "Here is the long answer, sir."
+
+        self._p(bc, "get_response_with_animation", side_effect=_gra)
+        self._p(bc, "parse_and_run_actions",
+                return_value=("Here is the long answer, sir.", []))
+        self.bc._run_llm_dispatch("tell me everything")
+        # The tail was gated on the (now-advanced) seq — nothing spoken.
+        self._speak.assert_not_called()
+
+    def test_no_barge_still_speaks_tail(self):
+        # Companion to the barge test: when the seq is UNCHANGED (no barge), the
+        # tail speaks as before (happy path preserved).
+        bc = self.bc
+        self._p(bc, "_tts_interrupt_seq", [0])
+        self._p(bc, "maybe_glance_response", return_value=None)
+        self._p(bc, "get_response_with_animation",
+                return_value="Here is the answer, sir.")
+        self._p(bc, "parse_and_run_actions",
+                return_value=("Here is the answer, sir.", []))
+        self.bc._run_llm_dispatch("tell me")
+        self._speak.assert_called_once_with("Here is the answer, sir.")
+
+    def test_repeated_successful_info_stops_chain(self):
+        # Finding #9 (2026-07-08): a chain that keeps re-reporting the SAME
+        # successful informative (name, result) must break (mirror of the
+        # failure-repeat break), not loop to the depth cap.
+        bc = self.bc
+        self._p(bc, "maybe_glance_response", return_value=None)
+        self._p(bc, "get_response_with_animation",
+                return_value="[ACTION: see_screen]")
+        # Every round returns the IDENTICAL successful informative result.
+        self._p(bc, "parse_and_run_actions", side_effect=[
+            ("", [("see_screen", "A code editor is open", True)]),
+            ("", [("see_screen", "A code editor is open", True)]),
+            ("", [("see_screen", "A code editor is open", True)]),
+            ("", [("see_screen", "A code editor is open", True)]),
+        ])
+        gfr = self._p(bc, "get_followup_response", return_value="Your editor, sir.")
+        self.bc._run_llm_dispatch("what's on screen")
+        # Round 1: first sighting → one follow-up. Round 2: no new (name,result)
+        # pair → stop. Exactly one follow-up round.
+        self.assertEqual(gfr.call_count, 1)
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  _blue_green_loop_tick  /  _consume_blue_green_handoff
@@ -1340,6 +1396,32 @@ class PreflightCamerasTests(SectionSevenBase):
         self.assertEqual(remaining, [0, 1],
                          "a camera that opens on retry must not be dropped")
         self.assertGreaterEqual(calls.get(1, 0), 2, "retry probe should have run")
+
+    def test_reap_removes_stale_temps_only(self):
+        # _reap_stale_temp_files deletes ONLY the orphaned atomic-write temps a
+        # prior hard-kill stranded (older than the 2-min cutoff); a fresh temp a
+        # live writer may be mid-write on, and any non-temp file, are left alone.
+        import tempfile as _tf
+        import shutil as _sh
+        import time as _time
+        d = _tf.mkdtemp()
+        try:
+            stale = os.path.join(d, ".hud_abc.tmp")
+            fresh = os.path.join(d, ".uhud_xyz.tmp")
+            other = os.path.join(d, "keepme.txt")
+            for p in (stale, fresh, other):
+                with open(p, "w"):
+                    pass
+            old = _time.time() - 300           # past the 120s cutoff
+            os.utime(stale, (old, old))
+            with mock.patch.object(self.bc, "__file__",
+                                   os.path.join(d, "bobert_companion.py")):
+                self.bc._reap_stale_temp_files()
+            self.assertFalse(os.path.exists(stale), "stale temp must be reaped")
+            self.assertTrue(os.path.exists(fresh), "fresh temp must be kept")
+            self.assertTrue(os.path.exists(other), "non-temp file must be untouched")
+        finally:
+            _sh.rmtree(d, ignore_errors=True)
 
     def test_dropped_primary_promotes_survivor(self):
         # 2026-07-07 owner fix ("camera preview broken again"): the config PRIMARY

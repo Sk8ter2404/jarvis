@@ -229,21 +229,35 @@ def _get_bobert():
             or sys.modules.get("__main__"))
 
 
-def _set_ambient_stream_active(active: bool) -> None:
-    """Publish 'a dedicated ambient InputStream is live' onto bobert_companion's
-    _ambient_stream_active ownership flag so _refresh_devices defers its
-    destructive PortAudio sd._terminate()/_initialize() while our loopback / mic
-    stream is open — otherwise a USB device plug/unplug mid-capture tears
-    PortAudio down under the live callback thread → 0xc0000374 heap corruption
-    (HIGH, 2026-07-08). Best-effort: a missing module/flag (unit tests) is a
-    no-op, exactly like the other cross-module ownership signals here."""
+def _set_ambient_stream_active(claim: bool) -> None:
+    """Refcount bobert_companion._ambient_stream_active: +1 when this worker's
+    dedicated ambient InputStream opens, -1 when it closes. _refresh_devices
+    defers its destructive PortAudio sd._terminate()/_initialize() while the
+    count is > 0, so a USB plug/unplug mid-capture can't tear PortAudio down
+    under a live callback thread → 0xc0000374 heap corruption (HIGH, 2026-07-08).
+
+    It MUST be a refcount, not a boolean: the mic worker and the WASAPI loopback
+    worker are independent skills that can run CONCURRENTLY (room mic + system
+    audio). With a shared boolean, whichever exits first cleared the guard while
+    the other's stream was still live — re-opening the exact crash window this
+    guards (bug-hunt 2026-07-08). Callers MUST pair every True with exactly one
+    False (only on the code path that actually opened a stream). Guarded by
+    bobert's _mic_lock so the ++/-- is atomic across workers. Best-effort: a
+    missing module/flag/lock (unit tests) still adjusts the count when present."""
     bc = _get_bobert()
     if bc is None:
         return
     try:
         flag = getattr(bc, "_ambient_stream_active", None)
-        if isinstance(flag, list) and flag:
-            flag[0] = bool(active)
+        if not isinstance(flag, list) or not flag:
+            return
+        lock = getattr(bc, "_mic_lock", None)
+        delta = 1 if claim else -1
+        if lock is not None:
+            with lock:
+                flag[0] = max(0, int(flag[0]) + delta)
+        else:
+            flag[0] = max(0, int(flag[0]) + delta)
     except Exception:
         pass
 
@@ -742,6 +756,7 @@ def _worker_loop() -> None:
     add_tap = getattr(b, "add_record_tap", None)
     remove_tap = getattr(b, "remove_record_tap", None)
     stream = None
+    claimed_ambient = False   # True only once THIS worker refcounts the ambient guard
     if callable(add_tap) and callable(remove_tap):
         import queue as _queue
         tap_q = _queue.Queue()
@@ -803,8 +818,12 @@ def _worker_loop() -> None:
             _safe_close_stream(stream)
             return
         # Claim device ownership so _refresh_devices defers its PortAudio reinit
-        # while this dedicated mic stream is live. Cleared in the finally below.
+        # while this dedicated mic stream is live. Decremented in the finally, but
+        # ONLY if we claimed here (the tap path never claims — decrementing there
+        # would under-count and drop the guard while the loopback worker's stream
+        # is still live). 2026-07-08.
         _set_ambient_stream_active(True)
+        claimed_ambient = True
 
         print(f"  [ambient-listen] stream open on device={device}, "
               f"sample_rate={sample_rate}, chunk={chunk_secs:.2f}s")
@@ -922,8 +941,11 @@ def _worker_loop() -> None:
                 pass
         if stream is not None:
             _safe_close_stream(stream)
-        # Release device ownership (no-op on the tap path, which never set it).
-        _set_ambient_stream_active(False)
+        # Release device ownership ONLY if we claimed it (the tap path never did).
+        # Close the stream FIRST so the refcount never drops while our own stream
+        # is still tearing down.
+        if claimed_ambient:
+            _set_ambient_stream_active(False)
         print("  [ambient-listen] mic worker exiting")
 
 
@@ -1185,8 +1207,13 @@ def _audio_worker_loop() -> None:
         _audio_last_error = f"audio worker crashed: {e}"
         print(f"  [ambient-audio] {_audio_last_error}")
     finally:
-        _set_ambient_stream_active(False)
+        # Close the loopback stream BEFORE releasing the refcount, so the guard
+        # never drops (allowing a PortAudio reinit) while our own stream is still
+        # tearing down — matches the mic worker's close-then-release order. The
+        # loopback worker always claims (unconditional set above), so it always
+        # releases. 2026-07-08.
         _safe_close_stream(stream)
+        _set_ambient_stream_active(False)
         print("  [ambient-audio] worker exiting")
 
 

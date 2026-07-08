@@ -260,6 +260,25 @@ class AmbientListenHelperTests(unittest.TestCase):
         # The defaults still compiled even though the extra one was bad.
         self.assertTrue(any(p.search("1password") for p in bl))
 
+    # ── _set_ambient_stream_active refcount (0xc0000374 guard) ───────────
+    def test_ambient_stream_refcount_survives_concurrent_owners(self):
+        # The mic worker and the loopback worker can be live at once; a shared
+        # boolean let one's teardown clear the PortAudio-reinit guard while the
+        # other's InputStream was still live (0xc0000374). The refcount must stay
+        # > 0 until BOTH release, and never go negative on a stray release.
+        bc = types.SimpleNamespace(_ambient_stream_active=[0],
+                                   _mic_lock=threading.Lock())
+        with mock.patch.object(self.mod, "_get_bobert", return_value=bc):
+            self.mod._set_ambient_stream_active(True)    # loopback claims
+            self.mod._set_ambient_stream_active(True)    # mic claims
+            self.assertEqual(bc._ambient_stream_active[0], 2)
+            self.mod._set_ambient_stream_active(False)   # one exits
+            self.assertEqual(bc._ambient_stream_active[0], 1)   # guard STILL active
+            self.mod._set_ambient_stream_active(False)   # the other exits
+            self.assertEqual(bc._ambient_stream_active[0], 0)
+            self.mod._set_ambient_stream_active(False)   # stray release
+            self.assertEqual(bc._ambient_stream_active[0], 0)   # never negative
+
     # ── _hamming / _phash64 ──────────────────────────────────────────────
     def test_hamming_distance(self):
         self.assertEqual(self.mod._hamming(0b1010, 0b1010), 0)

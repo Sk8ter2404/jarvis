@@ -300,6 +300,46 @@ class RoundTripTests(unittest.TestCase):
             self.assertAlmostEqual(loaded["VAD_THRESHOLD"], 0.05)
 
 
+class SaveBaseRereadTests(unittest.TestCase):
+    """#13: the GUI Save must overlay its fields onto the CURRENT on-disk
+    document, not the window-OPEN snapshot, so a key a runtime action (e.g. a
+    voice command) persisted while the window was open isn't silently reverted.
+    _current_settings_base is the seam that re-reads disk for _collect()."""
+
+    def test_base_rereads_disk_not_snapshot(self):
+        # A runtime action flipped AMBIENT_LISTEN_ENABLED and wrote a passthrough
+        # key AFTER the window opened; the base must reflect disk, not snapshot.
+        snapshot = {"WAKE_WORD": "jarvis", "AMBIENT_LISTEN_ENABLED": False}
+        disk = {"WAKE_WORD": "jarvis", "AMBIENT_LISTEN_ENABLED": True,
+                "RUNTIME_ONLY_KEY": "written-by-voice"}
+        with mock.patch.object(sw, "load_settings", return_value=dict(disk)):
+            base = sw._current_settings_base(snapshot)
+        self.assertIs(base["AMBIENT_LISTEN_ENABLED"], True)       # runtime write kept
+        self.assertEqual(base["RUNTIME_ONLY_KEY"], "written-by-voice")
+
+    def test_base_falls_back_to_snapshot_copy_on_reread_error(self):
+        # If the re-read fails, Save must be no worse than before: use a COPY of
+        # the open-time snapshot (never the same object, so the caller's later
+        # mutations can't corrupt the snapshot).
+        snapshot = {"WAKE_WORD": "jarvis", "VOICE_MODE": "turn_based"}
+        with mock.patch.object(sw, "load_settings",
+                               side_effect=OSError("disk gone")):
+            base = sw._current_settings_base(snapshot)
+        self.assertEqual(base, snapshot)
+        self.assertIsNot(base, snapshot)
+
+    def test_base_roundtrips_real_disk_file(self):
+        # End-to-end through the real load_settings: a value only on disk (not in
+        # the stale snapshot) is what the base carries.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "user_settings.json")
+            sw.save_settings({**sw.default_settings(),
+                              "VOICE_MODE": "realtime"}, path)
+            stale_snapshot = {**sw.default_settings(), "VOICE_MODE": "turn_based"}
+            base = sw._current_settings_base(stale_snapshot, path)
+            self.assertEqual(base["VOICE_MODE"], "realtime")   # disk wins over snapshot
+
+
 class AtomicWriteTests(unittest.TestCase):
     def test_atomic_write_creates_parent_dir(self):
         with tempfile.TemporaryDirectory() as d:

@@ -639,6 +639,23 @@ class StripMarkdownTests(SectionSixBase):
         self.assertEqual(bc._currency_to_words("version 2.0.23"), "version 2.0.23")
         self.assertEqual(bc._currency_to_words("no money here"), "no money here")
 
+    def test_currency_magnitude_suffix_expanded(self):
+        # Finding #14 (2026-07-08): "$100k"/"$5M" must expand the magnitude suffix
+        # instead of gluing the letter onto "dollars" ("100 dollarsk").
+        bc = self.bc
+        self.assertEqual(bc._currency_to_words("$100k"), "100 thousand dollars")
+        self.assertEqual(bc._currency_to_words("$5M"), "5 million dollars")
+        self.assertEqual(bc._currency_to_words("$2B"), "2 billion dollars")
+        # Case-insensitive suffix + preserved decimal component.
+        self.assertEqual(bc._currency_to_words("$2.5m"), "2.5 million dollars")
+        # No stray letter survives glued to "dollars".
+        self.assertNotIn("dollarsk", bc._currency_to_words("I saved $100k"))
+        self.assertEqual(bc._currency_to_words("I saved $100k this year"),
+                         "I saved 100 thousand dollars this year")
+        # Plain amounts (no suffix) are unchanged by the new trailing boundary.
+        self.assertEqual(bc._currency_to_words("$8.18"), "8 dollars and 18 cents")
+        self.assertEqual(bc._currency_to_words("$1"), "1 dollar")
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  _detect_dropped_steps
@@ -682,6 +699,28 @@ class DetectDroppedStepsTests(SectionSixBase):
         filler = "x " * 120
         text = f"I'll do something. {filler} and read it to you."
         self.assertEqual(bc._detect_dropped_steps(text, set()), [])
+
+    def test_alias_of_expected_action_counts_as_satisfied(self):
+        # Finding #16 (2026-07-08): a promised step backed by a REGISTERED ALIAS
+        # of the canonical action (a different name bound to the SAME handler fn)
+        # must NOT be flagged as dropped.
+        bc = self.bc
+        self.assertIn("see_screen", bc.ACTIONS)
+        see_fn = bc.ACTIONS["see_screen"]
+        acts = dict(bc.ACTIONS)
+        acts["grab_screen"] = see_fn   # alias: identical handler object
+        with mock.patch.object(bc, "ACTIONS", acts):
+            # The alias token was emitted, so the "read it" promise is satisfied.
+            self.assertEqual(
+                bc._detect_dropped_steps(
+                    "I'll open the page and then read it to you.",
+                    {"grab_screen"}),
+                [])
+            # Control: with NOTHING emitted, the same reply IS flagged (canonical).
+            self.assertEqual(
+                bc._detect_dropped_steps(
+                    "I'll open the page and then read it to you.", set()),
+                [("see_screen", "read what's on screen")])
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1152,6 +1191,51 @@ class GetFollowupResponseTests(SectionSixBase):
             out = bc.get_followup_response([("x", "y")])
         self.assertEqual(out, "")
 
+    def test_local_route_stays_local_not_cloud(self):
+        # Finding #1 (2026-07-08): when model_route("chat")=="local" the follow-up
+        # must go local-first (mirroring _call_llm), NOT punch out to the cloud —
+        # otherwise a local-only deployment breaks the whole action chain's route.
+        bc = self.bc
+        import core.config as cfg
+
+        class ExplodingClient:
+            def complete(self, **kwargs):
+                raise AssertionError("cloud path taken on a local-routed follow-up")
+
+        captured = {}
+
+        def _fake_local(sys_prompt, messages, max_tokens=400):
+            captured["msgs"] = messages
+            captured["max_tokens"] = max_tokens
+            return "Local follow-up, sir."
+
+        with mock.patch.object(cfg, "model_route", lambda _fn: "local"), \
+             mock.patch.object(bc, "AI_BACKEND", "claude"), \
+             mock.patch.object(bc, "_llm_client", ExplodingClient()), \
+             mock.patch.object(bc, "_local_then_cloud_or_honest", _fake_local):
+            out = bc.get_followup_response([("get_time", "3pm")])
+        self.assertEqual(out, "Local follow-up, sir.")
+        # The local path received the action-summary user message and the 400 cap.
+        self.assertIn("get_time", captured["msgs"][-1]["content"])
+        self.assertEqual(captured["max_tokens"], 400)
+
+    def test_route_lookup_failure_falls_through_to_cloud(self):
+        # If the model_route import/lookup raises, the follow-up degrades to the
+        # existing backend branches rather than crashing (same posture as _call_llm).
+        bc = self.bc
+        import core.config as cfg
+
+        class FakeClient:
+            def complete(self, **kwargs):
+                return "cloud follow-up, sir."
+
+        with mock.patch.object(cfg, "model_route",
+                               side_effect=RuntimeError("route table gone")), \
+             mock.patch.object(bc, "AI_BACKEND", "claude"), \
+             mock.patch.object(bc, "_llm_client", FakeClient()):
+            out = bc.get_followup_response([("x", "y")])
+        self.assertEqual(out, "cloud follow-up, sir.")
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  handle_confirmation_response
@@ -1241,6 +1325,60 @@ class HandleConfirmationResponseTests(SectionSixBase):
             bc.handle_confirmation_response("yes")
         said = " ".join(spoken).lower()
         self.assertIn("didn't go through", said)
+
+    def test_informative_action_speaks_answer_not_done(self):
+        # Finding #8 (2026-07-08): a confirmed INFORMATIVE action must speak its
+        # ANSWER (via the follow-up LLM), not a blanket "Done."
+        bc = self.bc
+        spoken = []
+        acts = dict(bc.ACTIONS)
+        acts["see_screen"] = lambda a: "A code editor is open"
+        info = set(bc.INFORMATIVE_ACTIONS) | {"see_screen"}
+        with mock.patch.object(bc, "ACTIONS", acts), \
+                mock.patch.object(bc, "INFORMATIVE_ACTIONS", info), \
+                mock.patch.object(bc, "get_followup_response",
+                                  return_value="Looks like your editor, sir."), \
+                mock.patch.object(bc, "_speak",
+                                  lambda *a, **k: spoken.append(a[0] if a else "")):
+            bc._pending_confirmation.clear()
+            bc._pending_confirmation.append(("see_screen", "x"))
+            bc.handle_confirmation_response("yes")
+        said = " ".join(spoken).lower()
+        self.assertIn("looks like your editor", said)   # the real answer voiced
+        self.assertNotIn("done", said)                  # not a blanket "Done."
+
+    def test_verbatim_action_result_spoken_on_confirm(self):
+        # Finding #8 (2026-07-08): a confirmed SPEAK_RESULT_VERBATIM action must
+        # read back its finished-sentence result, not just say "Done."
+        bc = self.bc
+        self.assertIn("version_info", bc.SPEAK_RESULT_VERBATIM_ACTIONS)
+        spoken = []
+        acts = dict(bc.ACTIONS)
+        acts["version_info"] = lambda a: "I'm on version 2.0.27, sir."
+        with mock.patch.object(bc, "ACTIONS", acts), \
+                mock.patch.object(bc, "_speak",
+                                  lambda *a, **k: spoken.append(a[0] if a else "")):
+            bc._pending_confirmation.clear()
+            bc._pending_confirmation.append(("version_info", ""))
+            bc.handle_confirmation_response("yes")
+        said = " ".join(spoken).lower()
+        self.assertIn("version 2.0.27", said)
+        self.assertNotIn("done", said)
+
+    def test_plain_action_still_says_done(self):
+        # Regression guard for finding #8: a NON-informative, non-verbatim action
+        # keeps the original "Done." feedback (happy path unchanged).
+        bc = self.bc
+        spoken = []
+        acts = dict(bc.ACTIONS)
+        acts["sideact"] = lambda a: "ok"
+        with mock.patch.object(bc, "ACTIONS", acts), \
+                mock.patch.object(bc, "_speak",
+                                  lambda *a, **k: spoken.append(a[0] if a else "")):
+            bc._pending_confirmation.clear()
+            bc._pending_confirmation.append(("sideact", "x"))
+            bc.handle_confirmation_response("yes")
+        self.assertEqual([s.lower() for s in spoken], ["done."])
 
 
 # ════════════════════════════════════════════════════════════════════════════
