@@ -72,6 +72,25 @@ class SynthesiseVoiceCloneTests(MonolithGlobalsTestCase):
         self.assertEqual(sr, 24000)
         self.assertTrue(np.allclose(audio, 0.25))
 
+    def test_single_flight_skips_clone_while_worker_inflight(self):
+        # 2026-07-08 fix: if a prior clone worker was abandoned on timeout and is
+        # STILL running (its Chatterbox load/generate hasn't returned), the next
+        # utterance must NOT spawn a second worker (which would run a concurrent
+        # CUDA load / unsafe concurrent generate). It skips the clone and uses the
+        # edge-tts ladder. Simulate an in-flight worker via the guard flag.
+        bc = self.bc
+        bc._voice_clone_inflight[0] = True
+        with mock.patch.object(bc, "VOICE_CLONE_ENABLED", True), \
+             mock.patch.object(vc, "is_available", return_value=True), \
+             mock.patch.object(vc, "synthesize",
+                               side_effect=AssertionError("must not spawn a 2nd worker")):
+            audio, sr = bc.synthesise("hello sir")
+        self.assertEqual(sr, 24000)
+        self.assertTrue(np.allclose(audio, 0.25))   # edge-tts fallback ran
+        # the guard flag was NOT cleared by this skipped call (only the owning
+        # worker's finally clears it).
+        self.assertTrue(bc._voice_clone_inflight[0])
+
     # ── clone wins when available + renders ──────────────────────────────────
     def test_uses_clone_waveform_when_available(self):
         bc = self.bc

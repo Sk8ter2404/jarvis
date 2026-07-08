@@ -526,6 +526,27 @@ def _handle_state_change() -> None:
         _bed_cool_announced[0] = False
         _print_start_ts[0] = 0.0
         _print_initial_estimate_min[0] = None
+        # Clear THIS filename's durable FINISH/bed-cool dedup keys. Those keys exist
+        # so a process bounce mid-print can't replay a completion (pruned only after
+        # 7 days) — but a genuine REPRINT of the same file is a NEW print, not a
+        # replay, and new_print here means a real filename change or a fresh RUNNING
+        # transition. Without this, reprinting the same-named file within 7 days had
+        # its "Print complete" AND "bed has cooled" announcements suppressed
+        # (already_announced / bedcool key still set from the first run). During an
+        # ongoing print these keys don't exist yet, so a spurious flicker that trips
+        # new_print just no-ops here. 2026-07-08.
+        try:
+            _rk = fname or "_anon_"
+            _rstate_np = _load_reminder_persistence()
+            _np_dirty = False
+            for _dedup_key in (f"finish:{_rk}", f"bedcool:{_rk}"):
+                if _dedup_key in _rstate_np:
+                    del _rstate_np[_dedup_key]
+                    _np_dirty = True
+            if _np_dirty:
+                _save_reminder_persistence(_rstate_np)
+        except Exception:
+            pass
 
     # Coerce percent to a float once so all comparisons agree.
     try:
@@ -582,6 +603,19 @@ def _handle_state_change() -> None:
         joined_midflight = pct is not None and pct > STARTED_PCT_CEILING
         _announced_start[0] = True
         _print_start_ts[0] = time.time()
+        # Pre-arm the layer-1 adhesion announcement when we're only NOW starting to
+        # track a print that's ALREADY past the first layer — i.e. we joined it
+        # mid-flight and never witnessed layer 1. The cold-start branch (prev_gcode
+        # is None) already does this, but a restart whose first MQTT push was
+        # PREPARE reaches HERE with prev_gcode=PREPARE, so without this the layer-1
+        # block below would blurt "Layer 1 adhesion looks nominal" for a print
+        # hundreds of layers deep. A genuine fresh start sits at layer 0/1, so this
+        # never suppresses a real layer-1 report. 2026-07-08.
+        try:
+            if layer is not None and int(layer) >= LAYER_ONE_ADHESION_LAYER:
+                _announced_layer1[0] = True
+        except (TypeError, ValueError):
+            pass
         try:
             _print_initial_estimate_min[0] = int(remaining) if remaining else None
         except (TypeError, ValueError):

@@ -393,12 +393,21 @@ class ReticleOverlay:
         # Orphan cap: no real parent to track and we've lived too long → exit.
         if self.parent_pid <= 0 and (now - self._started_at) > ORPHAN_MAX_LIFETIME_S:
             return True
-        # Stale-state exit: advance the freshest-seen mtime, and if the file
-        # hasn't been touched for STATE_STALE_EXIT_S the publisher is gone.
+        # Stale-state exit: advance the freshest-seen mtime for bookkeeping, but
+        # only ACT on staleness for an ORPHAN (no real parent to trust). When we
+        # DO have a live real parent (checked above via _is_parent_alive, which is
+        # PID-recycle-aware), a stale hud_reticles.json is NOT a crash signal: a
+        # healthy JARVIS only rewrites that file on a UI-automation action, so any
+        # voice-only / idle stretch longer than STATE_STALE_EXIT_S (10 min) would
+        # otherwise self-exit this overlay for good — nothing re-spawns it, so
+        # click/type reticles silently stopped for the rest of the session. A
+        # crashed real parent is already caught above; trust that and keep the
+        # stale-exit only where there's no parent liveness to rely on. 2026-07-08.
         mtime = _state_file_mtime()
         if mtime > self._last_state_mtime:
             self._last_state_mtime = mtime
-        if self._last_state_mtime > 0 and (now - self._last_state_mtime) > STATE_STALE_EXIT_S:
+        if (self.parent_pid <= 0 and self._last_state_mtime > 0
+                and (now - self._last_state_mtime) > STATE_STALE_EXIT_S):
             return True
         return False
 

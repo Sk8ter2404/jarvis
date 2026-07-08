@@ -3753,5 +3753,104 @@ class RegisterTests(_Base):
             self.assertIs(actions[alias], actions["air_mouse_disarm"])
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  2026-07-08 fixes: ARMED phantom button-down + calibration-preserving refresh
+# ══════════════════════════════════════════════════════════════════════════
+class ArmedEngagePhantomButtonTests(_Base):
+    """ARMED (relaxed, height-only) engagement with an already-CLOSED hand must
+    NOT fire a phantom mouse button-down on the engage frame. The engage edge now
+    seeds _left_down/_right_down from the current stable grips so no spurious
+    'down' edge is emitted (which would start an unintended grab/drag)."""
+
+    def _ext(self, mod, side, **kw):
+        j = _extended_arm_joints(side, **kw)
+        return mod.ArmExtension.from_bridge(mod._local_arm_extension(j, side))
+
+    def _relaxed(self, mod, side):
+        j = _relaxed_arm_joints(side)
+        return mod.ArmExtension.from_bridge(mod._local_arm_extension(j, side))
+
+    def test_armed_engage_with_closed_hand_fires_no_phantom_down(self):
+        mod = self._load()
+        clock = [0.0]
+        c = mod.AirMouseController(
+            mod.ReachBox(2560, 1440),
+            debounce_frames=2, grace_sec=0.0, engage_debounce_frames=1,
+            clock=lambda: clock[0],
+            arm_relaxes_gate=True, arm_debounce_sec=0.15)
+        left = self._relaxed(mod, "left")
+        # RIGHT arm raised (height gate ok) but hand CLOSED, ARMED. The grip
+        # debouncer reaches 'closed' during the ~0.15s ARMED hold, while still
+        # DISENGAGED.
+        c.update(left, self._ext(mod, "right"), "open", "closed", True, armed=True)
+        clock[0] = 0.10
+        c.update(left, self._ext(mod, "right"), "open", "closed", True, armed=True)
+        clock[0] = 0.20   # ARMED debounce (0.15s) elapsed → engage on this frame
+        d = c.update(left, self._ext(mod, "right"), "open", "closed", True,
+                     armed=True)
+        self.assertIn(d.overlay, ("track", "grab"))          # engaged
+        self.assertIsNone(d.right,
+                          "closed-hand engage must not emit a phantom RIGHT down")
+        self.assertIsNone(d.left)
+        # The held-flag is SEEDED to match the grip (so a later OPEN releases it
+        # cleanly with a single up), not left False (which re-fires a down).
+        self.assertTrue(c.right_is_down)
+        # Opening the hand releases cleanly: the 2-frame grip debouncer flips to
+        # 'open' on the second open frame, which emits exactly one 'up'.
+        c.update(left, self._ext(mod, "right"), "open", "open", True, armed=True)
+        d2 = c.update(left, self._ext(mod, "right"), "open", "open", True,
+                      armed=True)
+        self.assertEqual(d2.right, "up")
+        self.assertFalse(c.right_is_down)
+
+
+class PeriodicBoundsRefreshCalibrationTests(_Base):
+    """The periodic virtual-desktop bounds refresh in _poll_loop must rebuild the
+    ReachBox via _reach_box_for_virtual_desktop (which re-reads the persisted
+    KINECT_REACH_* calibration), NOT via a bare ReachBox(vb...) that discards it.
+    2026-07-08 fix."""
+
+    def test_periodic_refresh_rebuilds_via_calibration_builder(self):
+        mod = self._load()
+
+        def _calibrated_box(refresh=False):
+            return mod.ReachBox(7680, 2880, origin_x=-2560, origin_y=-1440,
+                                center_x=0.0, center_y=0.30,
+                                half_w=0.18, half_h=0.16)
+        spy = mock.Mock(side_effect=_calibrated_box)
+
+        class _StopLoop(Exception):
+            pass
+
+        sleeps = {"n": 0}
+
+        def _sleep(_sec):
+            sleeps["n"] += 1
+            if sleeps["n"] >= 3:   # INITIAL_DELAY + iter1 + iter2 → break out
+                raise _StopLoop
+        # time.time(): loop-entry, iter1 now, iter2 now (jumped past REFRESH).
+        times = iter([100.0, 100.0,
+                      100.0 + mod.VIRTUAL_BOUNDS_REFRESH_SECONDS + 1.0,
+                      1e9, 1e9, 1e9])
+        fake_time = mock.Mock()
+        fake_time.time.side_effect = lambda: next(times)
+        fake_time.sleep.side_effect = _sleep
+        fake_time.monotonic.side_effect = lambda: 0.0
+        # iter2 bounds differ from the calibrated box's, so the change-guard fires.
+        with mock.patch.object(mod, "_bridge", return_value=object()), \
+                mock.patch.object(mod, "_air_mouse_enabled", return_value=True), \
+                mock.patch.object(mod, "_reach_box_for_virtual_desktop", spy), \
+                mock.patch.object(mod, "_cached_virtual_bounds",
+                                  return_value=(0, 0, 2560, 1440)), \
+                mock.patch.object(mod, "_poll_once"), \
+                mock.patch.object(mod, "time", fake_time):
+            with self.assertRaises(_StopLoop):
+                mod._poll_loop()
+        # construct (1) + on-enable rebuild (2) + periodic-refresh rebuild (3):
+        # the bare-ReachBox bug would make only 2 calls (no periodic builder call).
+        self.assertEqual(spy.call_count, 3)
+        self.assertEqual(spy.call_args_list[-1], mock.call(refresh=False))
+
+
 if __name__ == "__main__":
     unittest.main()

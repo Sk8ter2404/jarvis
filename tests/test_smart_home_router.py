@@ -1394,5 +1394,31 @@ class LogMissingBrandIOErrorTests(_RouterTestBase):
             router._log_missing_brand("Wyze")   # must not raise
 
 
+class QueryReplyNoFailureMarkerTests(unittest.TestCase):
+    """2026-07-08: the status-query SUCCESS reply ("are the lights on?") must not
+    contain any core.failure_markers.FAILURE_MARKER substring. It is spoken via
+    the verbatim path and classified by _is_failure on those substrings, so a
+    marker (the old "can't read its live state") suppressed the honest answer AND
+    misclassified the query as a failed action (extra LLM round-trip)."""
+
+    def test_query_reply_contains_no_failure_marker(self):
+        from core import failure_markers
+        cat = {"devices": [{"name": "office lights", "brand": "hue"}]}
+        with mock.patch.object(router, "_try_pointing_resolution",
+                               return_value=None), \
+                mock.patch.object(router, "_ensure_catalog", return_value=cat), \
+                mock.patch.object(router, "_classify_action",
+                                  return_value={"verb": "query",
+                                                "descriptor": "office lights"}), \
+                mock.patch.object(router, "_resolve_devices",
+                                  return_value=[{"name": "office lights"}]):
+            reply = router.smart_home_control("are the office lights on")
+        low = reply.lower()
+        hits = [m for m in failure_markers.FAILURE_MARKERS if m in low]
+        self.assertEqual(hits, [],
+                         f"query reply matched failure markers {hits}: {reply!r}")
+        self.assertIn("office lights", reply)   # it IS the honest status answer
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -157,7 +157,13 @@ _MONOLITH_RESTORE_NAMES = (
     "_session_action_counts", "_session_app_names",
     # ── audio / device / capture state ─────────────────────────────────────
     "_device_cache", "_recent_spoken_messages", "_record_speech_taps",
-    "_record_speech_active", "_tts_playback_active", "_camera_failure_summary",
+    "_record_speech_active", "_pathb_mic_active", "_tts_playback_active",
+    "_camera_failure_summary",
+    # ── single-flight / barge-in counter cells (2026-07-08 bug-hunt) ────────
+    # New single-element-list cells: reset in place so a test that abandons a
+    # clone worker (leaving _voice_clone_inflight True) or accepts a barge-in
+    # (bumping _tts_interrupt_seq) can't poison the next test.
+    "_voice_clone_inflight", "_tts_interrupt_seq",
     "_hud_state_cache", "_focused_window_state", "CAMERAS",
     "last_speech_time", "last_face_seen", "_apple_music_last_seen",
     # ── STT / whisper model handles ────────────────────────────────────────

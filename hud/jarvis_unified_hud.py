@@ -534,6 +534,15 @@ class UnifiedHud(QWidget):
         camera tick uses this to repaint ONLY when there is something new, so an
         idle/off camera costs a stat() per tick and no repaint. The expensive
         JPEG decode is skipped whenever the file's mtime is unchanged."""
+        # Skip ALL work (stat + decode) while the HUD is hidden. Both callers
+        # (_on_camera_tick's ~75ms tick and _refresh's ~500ms tick) run regardless
+        # of visibility, and the preview writer keeps producing frames based on
+        # camera state — not HUD visibility — so a hidden HUD would otherwise keep
+        # decoding each new ~6-7fps JPEG only to discard it (the repaint is already
+        # visibility-gated). When the HUD is shown again the next tick decodes the
+        # current frame. 2026-07-08.
+        if not self.isVisible():
+            return False
         now = time.time()
         if not _camera_preview_fresh_at(now):
             had = self.cam_preview is not None

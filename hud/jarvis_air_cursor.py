@@ -817,9 +817,15 @@ class AirCursorOverlay:
         # is track/grab, so a writer that leaves a stale prime>0 alongside an
         # engaged state still draws no ring.
         new_prime = _parse_prime(data) if fresh else 0.0
-        # Latch a brief completion flash on the tick the hold finishes: we were
-        # mid-prime last frame and prime has now reached full / handed off.
-        if self._was_priming and new_prime >= PRIME_FULL_EPS:
+        # Latch a brief completion flash on the tick the pre-engage hold FINISHES:
+        # we were mid-prime last frame and the writer has now handed off to the
+        # ENGAGED state. The old `new_prime >= PRIME_FULL_EPS` latch was dead code —
+        # the air-mouse never publishes a priming-frame prime at/above
+        # PRIME_FULL_EPS (0.999); it jumps straight from <1.0 in state 'prime' to
+        # 0.0 in state 'track'/'grab' on engage — so detect the priming→engaged
+        # handoff directly instead of waiting for prime to reach 1.0. 2026-07-08.
+        engaged_now = state in ("track", "grab")
+        if self._was_priming and engaged_now:
             self._prime_flash = PRIME_FLASH_TICKS
         self._was_priming = (0.0 < new_prime < PRIME_FULL_EPS)
         self.prime = new_prime

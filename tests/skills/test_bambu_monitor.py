@@ -314,6 +314,45 @@ class BambuStateChangeTests(unittest.TestCase):
         self.assertTrue(any("Layer 1 adhesion" in m for m in msgs))
         self.assertTrue(self.mod._announced_layer1[0])
 
+    def test_restart_midflight_suppresses_layer1_adhesion(self):
+        # 2026-07-08 fix: a restart that joins a print mid-flight (first push
+        # PREPARE at layer 150, then RUNNING) must NOT blurt "Layer 1 adhesion
+        # looks nominal" — we never witnessed layer 1. The cold-start branch only
+        # pre-arms _announced_layer1 for prev_gcode-None; the start block now also
+        # pre-arms it for a PREPARE→RUNNING mid-flight join.
+        self.mod._last_gcode_state[0] = None
+        self._set(gcode_state="PREPARE", filename="big.3mf", mc_percent=40,
+                  layer_num=150, mc_remaining=90)
+        self._run()   # prev_gcode becomes PREPARE (not None)
+        self._set(gcode_state="RUNNING", filename="big.3mf", mc_percent=40,
+                  layer_num=150, mc_remaining=88)
+        msgs = self._run()
+        self.assertFalse(any("Layer 1 adhesion" in m for m in msgs),
+                         "must not announce layer-1 for a print joined at layer 150")
+        self.assertTrue(self.mod._announced_layer1[0])
+
+    def test_reprint_same_file_clears_durable_dedup_keys(self):
+        # 2026-07-08 fix: reprinting the same-named file within 7 days is a NEW
+        # print, not a replay — new_print must clear the durable finish:/bedcool:
+        # dedup keys so the reprint's "Print complete" + bed-cooled announcements
+        # aren't suppressed. Simulate the durable state already holding this file's
+        # keys from the first print.
+        rstate = {"finish:widget": {"ts": time.time(), "fname": "widget"},
+                  "bedcool:widget": {"ts": time.time(), "fname": "widget"},
+                  "finish:other": {"ts": time.time(), "fname": "other"}}
+        with mock.patch.object(self.mod, "_load_reminder_persistence",
+                               return_value=rstate), \
+             mock.patch.object(self.mod, "_save_reminder_persistence") as save:
+            self.mod._last_gcode_state[0] = "FINISH"
+            self.mod._current_print_filename[0] = "widget"
+            self._set(gcode_state="RUNNING", filename="widget.3mf", mc_percent=0,
+                      layer_num=1, mc_remaining=100)
+            self._run()
+        self.assertNotIn("finish:widget", rstate)   # this file's keys cleared
+        self.assertNotIn("bedcool:widget", rstate)
+        self.assertIn("finish:other", rstate)        # other files untouched
+        save.assert_called()
+
     def test_inflight_error_announced_with_layer(self):
         self.mod._last_gcode_state[0] = "RUNNING"
         self.mod._current_print_filename[0] = "cube"
