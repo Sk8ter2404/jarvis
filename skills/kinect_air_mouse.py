@@ -2904,6 +2904,13 @@ def _apply_decision(decision: AirMouseDecision) -> None:
 # kept as the demoted secondary cues for context.
 _AIR_MOUSE_DEBUG_INTERVAL = 0.5             # seconds between debug lines (~2 Hz)
 _air_mouse_debug_last = [0.0]               # module-list so the throttle persists
+# When the air-mouse is IDLE (no hand tracked, not engaged, no fist-latch) and
+# nothing has changed, the ~2 Hz line is pure noise that floods the session log
+# and the web Live view. Suppress it in that case, emitting only a slow heartbeat
+# so a still, empty room doesn't drown out real activity. Interesting frames (a
+# hand up, engaged, latched, or ANY state change) still log at the full 2 Hz.
+_air_mouse_debug_last_sig = [None]          # last-logged (hand, engaged, latch, tracked)
+_AIR_MOUSE_IDLE_HEARTBEAT_S = 30.0          # idle+unchanged: at most one line / 30 s
 
 
 def _format_reach_debug(left_ext, right_ext, tracked: bool, ctrl,
@@ -2953,12 +2960,29 @@ def _maybe_debug_log(left_ext, right_ext, tracked: bool, ctrl,
                      now: "Optional[float]" = None,
                      yielding: "Optional[bool]" = None) -> bool:
     """Emit the height-gate debug line if the throttle window has elapsed. Returns
-    True iff a line was printed (for the test). NEVER raises."""
+    True iff a line was printed (for the test). Suppresses the line when the
+    air-mouse is IDLE and unchanged (empty room), keeping only a slow heartbeat,
+    so it doesn't flood the log / web Live view at 2 Hz. NEVER raises."""
     try:
         t = time.monotonic() if now is None else float(now)
         if (t - _air_mouse_debug_last[0]) < _AIR_MOUSE_DEBUG_INTERVAL:
             return False
+        # Classify the frame. IDLE = no controlling hand, not engaged, no
+        # fist-latch, nothing tracked. Only suppress when idle AND the meaningful
+        # signature is unchanged from the last logged line.
+        arms = [a for a in (left_ext, right_ext) if a is not None]
+        arm = max(arms, key=lambda a: a.reach_score()) if arms else None
+        hand = arm.side if arm is not None else None
+        engaged = bool(getattr(ctrl, "engaged", False))
+        latch = bool(getattr(ctrl, "fist_release_latched", False))
+        idle = (arm is None) and (not engaged) and (not latch) and (not tracked)
+        sig = (hand, engaged, latch, bool(tracked))
+        if idle and sig == _air_mouse_debug_last_sig[0]:
+            # Nothing meaningful changed — emit at most a slow heartbeat.
+            if (t - _air_mouse_debug_last[0]) < _AIR_MOUSE_IDLE_HEARTBEAT_S:
+                return False
         _air_mouse_debug_last[0] = t
+        _air_mouse_debug_last_sig[0] = sig
         print(_format_reach_debug(left_ext, right_ext, tracked, ctrl,
                                   yielding=yielding))
         return True

@@ -2082,6 +2082,44 @@ class DebugLogFormatTests(_Base):
             None, ext, True, self._Ctrl(),
             now=100.0 + mod._AIR_MOUSE_DEBUG_INTERVAL, yielding=False))
 
+    def test_idle_unchanged_is_suppressed(self):
+        # An empty room (no hand, not engaged, not tracked) must NOT spam the log
+        # at 2 Hz — after the first idle line, unchanged idle frames are dropped.
+        mod = self._load()
+        mod._air_mouse_debug_last[0] = 0.0
+        mod._air_mouse_debug_last_sig[0] = None
+        self.assertTrue(mod._maybe_debug_log(None, None, False, self._Ctrl(),
+                                             now=100.0, yielding=False))
+        self.assertFalse(mod._maybe_debug_log(None, None, False, self._Ctrl(),
+                                              now=101.0, yielding=False))
+        self.assertFalse(mod._maybe_debug_log(None, None, False, self._Ctrl(),
+                                              now=110.0, yielding=False))
+
+    def test_idle_heartbeat_after_interval(self):
+        # Idle+unchanged still emits a slow heartbeat so the loop's liveness is
+        # visible, just not at 2 Hz.
+        mod = self._load()
+        mod._air_mouse_debug_last[0] = 0.0
+        mod._air_mouse_debug_last_sig[0] = None
+        self.assertTrue(mod._maybe_debug_log(None, None, False, self._Ctrl(),
+                                             now=100.0, yielding=False))
+        self.assertTrue(mod._maybe_debug_log(
+            None, None, False, self._Ctrl(),
+            now=100.0 + mod._AIR_MOUSE_IDLE_HEARTBEAT_S + 0.1, yielding=False))
+
+    def test_state_change_from_idle_logs_immediately(self):
+        # When a hand appears after idle, the very next past-gate frame logs (a
+        # meaningful change is never suppressed).
+        mod = self._load()
+        mod._air_mouse_debug_last[0] = 0.0
+        mod._air_mouse_debug_last_sig[0] = None
+        self.assertTrue(mod._maybe_debug_log(None, None, False, self._Ctrl(),
+                                             now=100.0, yielding=False))
+        ext = mod.ArmExtension("right", forward_m=0.2, straightness=0.9,
+                               hand=(0, 0.55, 1.8, 2), lift_m=0.1)
+        self.assertTrue(mod._maybe_debug_log(None, ext, True, self._Ctrl(),
+                                             now=100.6, yielding=False))
+
 
 # ══════════════════════════════════════════════════════════════════════════
 #  ISSUE 3 — controlling-hand HYSTERESIS: no thrash with BOTH hands raised.
