@@ -88,8 +88,11 @@ STREAMING_TTS_ENABLED = True
 # None disables for that one service); THIS flag is the master switch across
 # every service. When False, JARVIS starts playback and leaves the player
 # windowed. Read live at play time (mirrors the STREAMING_TTS_ENABLED fresh-
-# import pattern in bobert_companion._streaming_go_fullscreen) so a Settings-
-# GUI / user_settings.json flip takes effect without a restart.
+# import pattern in bobert_companion._streaming_go_fullscreen) so the current
+# value is honoured at each play. 2026-07-08: corrected an overpromise — a
+# Settings-GUI / user_settings.json flip takes effect on the NEXT start, not
+# live: _apply_user_settings() runs once at import, and a fresh `import
+# core.config` returns the already-cached module without re-reading the file.
 # Overridable via data/user_settings.json.
 STREAMING_AUTO_FULLSCREEN = True
 
@@ -109,8 +112,11 @@ STREAMING_AUTO_FULLSCREEN = True
 # use-after-free). This knob only gates the new wake-word interrupt path,
 # which opens NO extra stream — the wake listener already owns its own mic.
 # Read live via `core.config` at interrupt time (mirrors the
-# STREAMING_TTS_ENABLED fresh-import pattern) so a Settings-GUI /
-# user_settings.json flip takes effect without a restart. When False the
+# STREAMING_TTS_ENABLED fresh-import pattern) so the current value is honoured
+# at each interrupt. 2026-07-08: corrected an overpromise — a Settings-GUI /
+# user_settings.json flip takes effect on the NEXT start, not live:
+# _apply_user_settings() runs once at import and a fresh `import core.config`
+# returns the already-cached module without re-reading the file. When False the
 # behaviour is byte-identical to pre-barge-in builds.
 # Overridable via data/user_settings.json.
 BARGE_IN_ENABLED = True
@@ -544,7 +550,11 @@ MIC_SILENT_WARN_SECONDS = 30.0
 # unplugged). Omit "name" to keep the historical pure-index behaviour. Set it to
 # the owner's two webcams so a re-plug keeps tracking the right one.
 CAMERAS = [
-    {"index": 1, "label": "Left webcam (left monitor)",          "name": "fullhan webcam", "primary": True,  "look_x": 0.5,  "look_y": 0.5},
+    # 2026-07-08: owner's actual webcams are a Logi C270 on the LEFT monitor and a
+    # generic "USB 2.0 Camera" on the RIGHT (the old "fullhan webcam" is gone — its
+    # slot was never resolving, so only 2 of the 3 cameras were used). Kinect sits
+    # under the centre monitor and is handled separately (KINECT_AS_CAMERA).
+    {"index": 1, "label": "Left webcam (left monitor)",          "name": "logi c270",     "primary": True,  "look_x": 0.5,  "look_y": 0.5},
     {"index": 0, "label": "Right webcam (top of right monitor)", "name": "usb 2.0 camera", "primary": False, "look_x": 0.85, "look_y": 0.5},
 ]
 

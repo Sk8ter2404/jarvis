@@ -193,7 +193,11 @@ def _save_reminder_persistence(state: dict) -> None:
 # the user runs the first-time setup wizard.
 _mqtt_client = [None]
 _poll_thread = [None]
-_monitor_stop_evt = threading.Event()
+# 2026-07-08: hold the CURRENT poll thread's stop Event in a 1-slot list and
+# hand each thread its own fresh Event at spawn. Previously a single reused
+# Event meant start_monitor's clear() could re-arm before a just-stopped thread
+# noticed the set(), stranding it looping against a torn-down MQTT client.
+_monitor_stop_evt = [threading.Event()]
 # Set to True in the on_connect callback when paho reports rc=0, flipped back
 # in on_disconnect. Drives is_printer_offline() — with connect_async() the
 # client object exists immediately, so we can't infer reachability from its
@@ -911,7 +915,10 @@ def is_printer_offline() -> bool:
 def stop_monitor() -> None:
     """Tear down the running MQTT client + poll thread so a fresh start
     after credential changes doesn't leave a zombie session behind."""
-    _monitor_stop_evt.set()
+    _monitor_stop_evt[0].set()
+    # Capture the outgoing poll thread so we can join it below — otherwise a
+    # rapid restart leaves the old thread looping against the torn-down client.
+    old_thread = _poll_thread[0]
     client = _mqtt_client[0]
     if client is not None:
         try:
@@ -925,6 +932,10 @@ def stop_monitor() -> None:
     _mqtt_client[0] = None
     _poll_thread[0] = None
     _mqtt_connected_ok[0] = False
+    # Join the old thread (short timeout — it's blocked on stop_evt.wait, which
+    # the set() above already released) so it can't outlive its MQTT client.
+    if old_thread is not None and old_thread is not threading.current_thread():
+        old_thread.join(timeout=2.0)
     # Reset state so a stale snapshot from the old session doesn't fool
     # check_print into reporting against the wrong printer.
     with _state_lock:
@@ -956,8 +967,11 @@ def start_monitor() -> bool:
     client = _start_mqtt(ip, access, serial)
     if client is None:
         return False
-    _monitor_stop_evt.clear()
-    t = threading.Thread(target=_poll_loop, args=(client, _monitor_stop_evt),
+    # Fresh Event per thread (not clear() on a shared one) so this thread's
+    # stop signal can never be re-armed out from under a lagging predecessor.
+    stop_evt = threading.Event()
+    _monitor_stop_evt[0] = stop_evt
+    t = threading.Thread(target=_poll_loop, args=(client, stop_evt),
                          daemon=True)
     t.start()
     _mqtt_client[0] = client

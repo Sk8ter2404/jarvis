@@ -123,6 +123,12 @@ class FakeChromaCollectionQueryRaises(FakeChromaCollection):
         raise RuntimeError("query boom")
 
 
+class FakeChromaCollectionWithGet(FakeChromaCollection):
+    """Adds the .get() used by _reconcile_chroma_locked() to list stored ids."""
+    def get(self, *, include=None, ids=None):
+        return {"ids": list(self.store.keys())}
+
+
 class FakeBM25:
     """Minimal rank_bm25.BM25Okapi stand-in. get_scores() returns a token-overlap
     count per corpus doc — deterministic and good enough to drive the sparse
@@ -1655,6 +1661,170 @@ class EndToEndTests(_LtmBase):
         self.assertEqual(ltm.status()["facts"], 1)
         self.assertTrue(ltm.delete_fact(fid))
         self.assertEqual(ltm.list_facts(), [])
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  2026-07-08 bug-fix batch: encode-lock / no-embed-under-_lock / OOM recovery /
+#  migration flag gating + reconcile / boot-time episode rotation
+# ──────────────────────────────────────────────────────────────────────────
+
+class EncodeLockAndOomTests(_LtmBase):
+    """#15/#28 — every encode runs under _encode_lock; #27 — a CUDA/OOM encode
+    failure drops the wedged model, frees VRAM and arms the reload cooldown."""
+
+    def test_embed_holds_encode_lock_during_encode(self):
+        # #28: the forward pass must be serialised behind _encode_lock, and the
+        # lock must be released again afterwards.
+        held = {}
+
+        class LockSpyEmbedder:
+            def encode(self, texts, **k):
+                held["locked"] = ltm._encode_lock.locked()
+                return FakeEncoded(_vec_for(t) for t in texts)
+
+        with mock.patch.object(ltm, "_try_import_embedder",
+                               lambda: LockSpyEmbedder()):
+            out = ltm._embed(["x"])
+        self.assertIsNotNone(out)
+        self.assertTrue(held.get("locked"))          # held during encode
+        self.assertFalse(ltm._encode_lock.locked())  # released after
+
+    def test_embed_cuda_oom_resets_embedder_and_arms_cooldown(self):
+        # #27: an OOM-looking encode error drops _embedder, best-effort frees
+        # VRAM, and arms _embedder_failed_until so a later call rebuilds it.
+        class OOMEmbedder:
+            def encode(self, texts, **k):
+                raise RuntimeError("CUDA out of memory")
+
+        ltm._embedder = OOMEmbedder()
+        ltm._embedder_failed_until = 0.0
+        calls = {"empty": 0}
+        fake_torch = types.ModuleType("torch")
+        fake_torch.cuda = types.SimpleNamespace(
+            empty_cache=lambda: calls.__setitem__("empty", calls["empty"] + 1))
+        with mock.patch.object(ltm, "_try_import_embedder",
+                               lambda: ltm._embedder), \
+             mock.patch.dict(sys.modules, {"torch": fake_torch}):
+            self.assertIsNone(ltm._embed(["x"]))
+        self.assertIsNone(ltm._embedder)                     # wedged handle dropped
+        self.assertGreater(ltm._embedder_failed_until, 0.0)  # cooldown armed
+        self.assertEqual(calls["empty"], 1)                  # VRAM freed best-effort
+
+    def test_embed_non_cuda_error_does_not_reset(self):
+        # A plain encode error (no cuda/oom signal) is swallowed WITHOUT nuking
+        # the embedder — only genuine OOM warrants a rebuild.
+        sentinel = FakeEmbedderRaises()          # raises "encode boom"
+        ltm._embedder = sentinel
+        ltm._embedder_failed_until = 0.0
+        with mock.patch.object(ltm, "_try_import_embedder", lambda: sentinel):
+            self.assertIsNone(ltm._embed(["x"]))
+        self.assertIs(ltm._embedder, sentinel)               # NOT dropped
+        self.assertEqual(ltm._embedder_failed_until, 0.0)    # no cooldown
+
+
+class RetrieveLockDisciplineTests(_LtmBase):
+    """#15/#29 — the query embed (a possibly multi-second cold load) must run
+    OUTSIDE _lock so it can't stall record_turn and other callers."""
+    def setUp(self):
+        super().setUp()
+        self.emb = self._install_fake_embedder()
+        self.coll = self._install_fake_chroma()
+        self._install_fake_bm25()
+        ltm.ensure_loaded()
+
+    def test_retrieve_does_not_embed_while_holding_lock(self):
+        ltm.add_fact("some fact about cats")
+        observed = {}
+        real_embed = ltm._embed
+
+        def spy(texts):
+            # RLock._is_owned() → True only if THIS thread holds _lock.
+            observed["lock_held"] = ltm._lock._is_owned()
+            return real_embed(texts)
+
+        with mock.patch.object(ltm, "_embed", side_effect=spy):
+            ltm.retrieve_facts("cats", k=3)
+        self.assertIn("lock_held", observed)     # embed actually ran
+        self.assertFalse(observed["lock_held"])  # …but not under _lock
+
+
+class MigrationFlagGatingTests(_LtmBase):
+    """#16 — the migrated.flag is only written once every fact is confirmed into
+    Chroma; a reconcile back-fill repairs facts missing from the dense index."""
+
+    def test_migration_defers_flag_when_chroma_upsert_fails(self):
+        # Chroma present but every upsert fails → flag NOT written (so a later
+        # boot retries) while the JSON mirror is still populated.
+        self._install_fake_chroma()                   # chroma_avail = True
+        with open(ltm._LEGACY_BOBERT_MEMORY, "w", encoding="utf-8") as f:
+            json.dump({"facts": ["legacy one", "legacy two"]}, f)
+        with mock.patch.object(ltm, "_chroma_upsert", return_value=False):
+            ltm.ensure_loaded()
+        self.assertFalse(os.path.exists(ltm._MIGRATE_FLAG))   # deferred
+        self.assertEqual(len(ltm._facts), 2)                  # mirror populated
+
+    def test_migration_writes_flag_when_chroma_absent(self):
+        # Chroma unavailable → JSON mirror is authoritative, so a failed upsert
+        # must NOT block the flag (else we'd re-import every boot forever).
+        self._force_no_deps()
+        with open(ltm._LEGACY_BOBERT_MEMORY, "w", encoding="utf-8") as f:
+            json.dump({"facts": ["legacy one"]}, f)
+        ltm.ensure_loaded()
+        self.assertTrue(os.path.exists(ltm._MIGRATE_FLAG))
+        self.assertEqual(len(ltm._facts), 1)
+
+    def test_reconcile_backfills_missing_chroma_facts(self):
+        coll = FakeChromaCollectionWithGet()
+        self._install_fake_embedder()
+        self._install_fake_chroma(coll)
+        ltm.ensure_loaded()
+        # A fact that reached the mirror but never made it into Chroma.
+        ltm._facts["m1"] = {"id": "m1", "text": "missing fact", "source": "",
+                            "tags": [], "created_at": 1.0, "updated_at": 1.0}
+        self.assertNotIn("m1", coll.store)
+        with ltm._lock:
+            n = ltm._reconcile_chroma_locked()
+        self.assertEqual(n, 1)
+        self.assertIn("m1", coll.store)             # back-filled into dense index
+
+    def test_reconcile_noop_without_chroma(self):
+        self._force_no_deps()
+        ltm.ensure_loaded()
+        ltm._facts["x"] = {"id": "x", "text": "t", "source": "", "tags": [],
+                           "created_at": 1.0, "updated_at": 1.0}
+        with ltm._lock:
+            self.assertEqual(ltm._reconcile_chroma_locked(), 0)   # no chroma → 0
+
+
+class BootTimeEpisodeRotationTests(_LtmBase):
+    """#30 — rotation trims on ACTUAL line count at boot, so a box that restarts
+    before the per-process append counter trips can't grow the log unbounded."""
+    def setUp(self):
+        super().setUp()
+        self._force_no_deps()
+        ltm.ensure_loaded()
+
+    def test_boot_time_rotation_trims_oversized_log(self):
+        os.makedirs(ltm._DATA_DIR, exist_ok=True)
+        with mock.patch.object(ltm, "EPISODE_MAX_LINES", 5):
+            with open(ltm._EPISODE_LOG, "w", encoding="utf-8") as f:
+                for i in range(20):
+                    f.write(json.dumps({"i": i}) + "\n")
+            # Simulate a fresh boot: counter is 0, far below CHECK_EVERY, so the
+            # in-append gate would NEVER fire — only the boot trim saves us.
+            ltm._loaded = False
+            ltm._writes_since_rotate = 0
+            ltm.ensure_loaded()
+        with open(ltm._EPISODE_LOG, encoding="utf-8") as f:
+            lines = [json.loads(x) for x in f if x.strip()]
+        self.assertEqual(len(lines), 5)
+        self.assertEqual([e["i"] for e in lines], [15, 16, 17, 18, 19])
+
+    def test_rotate_episodes_locked_missing_file_is_noop(self):
+        # No episode log yet → must not raise.
+        with ltm._lock:
+            ltm._rotate_episodes_locked()
+        self.assertFalse(os.path.exists(ltm._EPISODE_LOG))
 
 
 if __name__ == "__main__":

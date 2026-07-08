@@ -445,7 +445,8 @@ def camera_status(_: str = "") -> str:
                 parts.append("the Kinect is up — no one in its view")
             else:
                 near = kin.get("nearest_m")
-                near_txt = f" about {float(near):.1f} metres out" if near else ""
+                from core.units import meters_to_imperial_phrase
+                near_txt = f" about {meters_to_imperial_phrase(near)} out" if near else ""
                 parts.append(f"the Kinect sees {_people_word(count)}{near_txt}")
         else:
             parts.append(f"the Kinect is dark ({kin.get('reason')})")
@@ -486,7 +487,8 @@ def where_am_i(_: str = "") -> str:
 
     dist = s["distance_m"]
     if dist:
-        clauses.append(f"about {float(dist):.1f} metres back")
+        from core.units import meters_to_imperial_phrase
+        clauses.append(f"about {meters_to_imperial_phrase(dist)} back")
 
     if s["facing_monitor"]:
         clauses.append(f"facing {_monitor_word(s['facing_monitor'])}")

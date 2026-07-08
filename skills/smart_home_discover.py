@@ -70,6 +70,12 @@ _TODO_PATH          = os.path.join(_PROJECT_DIR, "jarvis_todo.md")
 # session mid-command.
 _COOKIE_SUGGEST_REFRESH_DAYS = 300
 
+# 2026-07-08: hard ceiling for a voice-context catalog refresh. The alexapy /
+# aiohttp fetch runs on the assistant dispatch thread; a stalled Amazon endpoint
+# with no timeout would wedge the whole voice loop. 45s is generous for a warm
+# cookie fetch yet bounded enough to fail fast and speak a timeout notice.
+_DISCOVERY_TIMEOUT_SEC = 45.0
+
 # Brand string → controller skill name. alexapy returns free-form
 # manufacturer strings ('Philips Hue', 'Signify Netherlands B.V.',
 # 'TP-Link', 'tp-link Tapo'); _controller_skill() does substring
@@ -417,27 +423,42 @@ def _capability_tags(raw_caps: Any) -> list[str]:
 
 
 # ── async runner ────────────────────────────────────────────────────
-def _run_async(coro):
+def _run_async(coro, timeout: float | None = None):
     """Run a coroutine to completion regardless of whether the current
     thread already owns an event loop. If we're inside one we delegate
-    to a worker thread so we don't deadlock."""
+    to a worker thread so we don't deadlock.
+
+    When `timeout` is set the coroutine is bounded by asyncio.wait_for and, on
+    the worker-thread path, the join is bounded too — so a stalled Amazon /
+    Playwright endpoint can't hang the caller (e.g. the voice dispatch thread)
+    forever. A TimeoutError is raised in that case. (2026-07-08)"""
+    async def _bounded():
+        if timeout is None:
+            return await coro
+        return await asyncio.wait_for(coro, timeout)
+
     try:
         asyncio.get_running_loop()
         running = True
     except RuntimeError:
         running = False
     if not running:
-        return asyncio.run(coro)
+        return asyncio.run(_bounded())
 
     box: dict = {}
     def _go() -> None:
         try:
-            box["v"] = asyncio.run(coro)
+            box["v"] = asyncio.run(_bounded())
         except Exception as e:
             box["err"] = e
     t = threading.Thread(target=_go, daemon=True)
     t.start()
-    t.join()
+    # Bound the join to the coroutine's own budget plus a small grace margin so
+    # a coro that ignores cancellation (blocked in a native call) still can't
+    # wedge the dispatch thread indefinitely. (2026-07-08)
+    t.join(None if timeout is None else timeout + 5.0)
+    if t.is_alive():
+        raise TimeoutError("discovery timed out")
     if "err" in box:
         raise box["err"]
     return box.get("v")
@@ -1131,7 +1152,15 @@ def smart_home_discover(arg: str = "") -> str:
     try:
         _say("One moment, sir — refreshing the smart home catalog.")
         try:
-            devices = _run_async(_restore_and_fetch_async())
+            devices = _run_async(_restore_and_fetch_async(),
+                                 timeout=_DISCOVERY_TIMEOUT_SEC)
+        except TimeoutError:
+            # 2026-07-08: a stalled Amazon endpoint must not wedge the voice
+            # dispatch thread — bail with a spoken notice, catalog untouched.
+            msg = ("Smart-home discovery timed out talking to Amazon, sir — "
+                   "the catalog is unchanged. Try again in a moment.")
+            _say(msg)
+            return msg
         except Exception as e:
             print(f"  [sh-discover] fetch traceback:\n{traceback.format_exc()}")
             return f"Catalog refresh failed during device fetch: {e}"

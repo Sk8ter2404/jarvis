@@ -70,6 +70,9 @@ DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_FRAME_MS = 80               # openwakeword expects 80 ms frames
 DEFAULT_THRESHOLD = 0.5             # openwakeword score (0..1)
 COOLDOWN_SECS = 1.5                 # min gap between two wake events
+EVENTS_QUEUE_MAX = 64               # bound on the events queue; the real
+                                    # caller drains via on_detect, so this
+                                    # only guards a polling caller that lags
 MAX_BUFFER_FRAMES = 50              # hard cap on _buf size (in frames) to
                                     # avoid unbounded growth if _on_frame
                                     # raises and the drain loop exits early
@@ -157,7 +160,9 @@ class WakeWordDetector:
         self.on_detect = on_detect
         self.use_silero_vad = bool(use_silero_vad)
 
-        self.events: "queue.Queue[dict]" = queue.Queue()
+        # 2026-07-08: bound the events queue so a caller that only uses
+        # on_detect (the real path) can't let this grow without limit.
+        self.events: "queue.Queue[dict]" = queue.Queue(maxsize=EVENTS_QUEUE_MAX)
         self._stream = None
         self._thread: Optional[threading.Thread] = None
         self._stop_flag = threading.Event()
@@ -170,6 +175,11 @@ class WakeWordDetector:
         self._oww = None
         self._porcupine = None
         self._silero = None
+
+        # 2026-07-08: int16 leftover carried between porcupine blocks so the
+        # 256-sample remainder of each 1280-sample block is not discarded
+        # (porcupine consumes fixed frame_length frames; ~20% was dropped).
+        self._porcupine_leftover = np.zeros(0, dtype=np.int16)
 
         # Ring buffer of float32 mono samples; openwakeword consumes
         # 80 ms (1280 sample @ 16 kHz) chunks at a time.
@@ -474,6 +484,12 @@ class WakeWordDetector:
 
     def _process_porcupine(self, frame: np.ndarray) -> None:
         pcm = np.clip(frame * 32767.0, -32768, 32767).astype(np.int16)
+        # 2026-07-08: prepend any leftover from the previous block so
+        # porcupine sees a contiguous stream; blocks (e.g. 1280) that are
+        # not a multiple of frame_length (e.g. 512) otherwise drop the
+        # trailing remainder each call and break frame continuity.
+        if self._porcupine_leftover.size:
+            pcm = np.concatenate((self._porcupine_leftover, pcm))
         # Porcupine wants exactly self._porcupine_frame samples.
         n = self._porcupine_frame
         i = 0
@@ -485,6 +501,8 @@ class WakeWordDetector:
                       else "unknown")
                 self._fire(kw, 1.0)
             i += n
+        # Carry the unconsumed tail into the next block.
+        self._porcupine_leftover = pcm[i:].copy()
 
     def _fire(self, phrase: str, score: float) -> None:
         now = time.time()
@@ -492,8 +510,19 @@ class WakeWordDetector:
             return
         self._last_fire_ts = now
         evt = {"phrase": str(phrase), "score": float(score), "ts": now}
+        # 2026-07-08: drop-oldest so a full queue (nobody draining events
+        # because the caller uses on_detect) can't block or grow unbounded.
         try:
             self.events.put_nowait(evt)
+        except queue.Full:
+            try:
+                self.events.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.events.put_nowait(evt)
+            except queue.Full:
+                pass
         except Exception:
             pass
         cb = self.on_detect

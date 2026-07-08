@@ -102,6 +102,8 @@ _log = logging.getLogger(__name__)
 # ─── Config ──────────────────────────────────────────────────────────────
 POLL_INTERVAL_SECONDS = 4.0          # how often we sweep UserNotificationListener
 INITIAL_DELAY_SECONDS = 20.0         # let the rest of JARVIS settle before listening
+ASYNC_OP_TIMEOUT_SECONDS = 5.0       # ceiling for the manual IAsyncOperation poll — a
+                                     # wedged WinRT op must not spin the daemon forever
 SNOOZE_SECONDS        = 300          # don't re-speak / re-classify identical toast within 5 min
 MAX_NOTIFICATION_LOG  = 250          # recent_notifications ring buffer size in memory
 MAX_SPOKEN_BODY_CHARS = 220          # truncate long bodies before TTS
@@ -1192,7 +1194,13 @@ def _request_access(listener) -> str:
         # winsdk awaitable -> use the asyncio integration via .get_results()
         # after waiting. Fall through to a manual poll.
         try:
+            # 2026-07-08: bound the manual poll with a deadline — an op that
+            # never flips .completed would otherwise busy-wait forever.
+            _deadline = time.monotonic() + ASYNC_OP_TIMEOUT_SECONDS
             while not op.completed:
+                if time.monotonic() >= _deadline:
+                    raise TimeoutError("RequestAccessAsync did not complete in "
+                                       f"{ASYNC_OP_TIMEOUT_SECONDS:.0f}s")
                 time.sleep(0.05)
             result = op.get_results()
         except Exception as e:
@@ -1215,7 +1223,14 @@ def _get_notifications(listener):
         return op.get()
     except Exception:
         try:
+            # 2026-07-08: bound the manual poll with a deadline so a wedged
+            # WinRT op can't spin the triage daemon forever — the loop's except
+            # recovers on the next poll cycle.
+            _deadline = time.monotonic() + ASYNC_OP_TIMEOUT_SECONDS
             while not op.completed:
+                if time.monotonic() >= _deadline:
+                    raise TimeoutError("GetNotificationsAsync did not complete "
+                                       f"in {ASYNC_OP_TIMEOUT_SECONDS:.0f}s")
                 time.sleep(0.05)
             return op.get_results()
         except Exception as e:

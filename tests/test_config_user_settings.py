@@ -188,5 +188,34 @@ class ModelRoutingTests(unittest.TestCase):
             cfg.MODEL_ROUTING = orig
 
 
+class DocstringHonestyTests(unittest.TestCase):
+    """_apply_user_settings() runs ONCE at import, so a user_settings.json flip
+    only takes effect on the next start — a fresh `import core.config` returns
+    the already-cached module without re-reading the file. The STREAMING_AUTO_-
+    FULLSCREEN / BARGE_IN_ENABLED comments used to overpromise 'takes effect
+    without a restart'; this guards the corrected wording so the docs can't
+    silently drift back to the false claim.
+    """
+
+    @staticmethod
+    def _source() -> str:
+        import os
+        cfg_path = os.path.join(os.path.dirname(cfg.__file__), "config.py")
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    def test_no_without_a_restart_overpromise(self):
+        self.assertNotIn(
+            "without a restart", self._source(),
+            msg="core/config.py claims a live flip 'without a restart' but "
+                "_apply_user_settings() runs once at import — correct the "
+                "comment to 'on the next start'.")
+
+    def test_apply_user_settings_runs_at_import_time(self):
+        # The behavioural fact the docs must match: the loader is a module-level
+        # call, not re-run per read.
+        self.assertIn("_apply_user_settings()", self._source())
+
+
 if __name__ == "__main__":
     unittest.main()

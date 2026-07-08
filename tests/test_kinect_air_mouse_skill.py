@@ -37,6 +37,7 @@ stdlib unittest + mock; App-Control-safe; CI-sim clean (no win32/pyautogui/Qt).
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import sys
 import tempfile
@@ -3850,6 +3851,57 @@ class PeriodicBoundsRefreshCalibrationTests(_Base):
         # the bare-ReachBox bug would make only 2 calls (no periodic builder call).
         self.assertEqual(spy.call_count, 3)
         self.assertEqual(spy.call_args_list[-1], mock.call(refresh=False))
+
+
+class SavedSettingsCacheTests(_Base):
+    """_saved_settings caches on the file's (path, mtime, size) + TTL so the
+    ~30 Hz poll loop re-parses user_settings.json only when it changes, not
+    every tick even while the air-mouse is DISABLED (finding #34)."""
+
+    def _write(self, path, obj):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+
+    def test_repeated_reads_parse_once_until_file_changes(self):
+        mod = self._load()
+        from tools import settings_window as sw
+        path = sw.settings_path()
+        self._write(path, {"KINECT_REACH_ENGAGE": 0.5})
+        # Start from a clean cache so a prior test can't mask the behaviour.
+        mod._settings_cache["key"] = None
+
+        calls = {"n": 0}
+        real = sw.load_settings
+
+        def _counting(*a, **k):
+            calls["n"] += 1
+            return real(*a, **k)
+
+        with mock.patch.object(sw, "load_settings", _counting):
+            a = mod._saved_settings()
+            b = mod._saved_settings()
+            self.assertEqual(a.get("KINECT_REACH_ENGAGE"), 0.5)
+            self.assertEqual(b.get("KINECT_REACH_ENGAGE"), 0.5)
+            self.assertEqual(calls["n"], 1)  # second call served from cache
+
+            # Change the file (different size + mtime) → cache invalidated.
+            time.sleep(0.01)
+            self._write(path, {"KINECT_REACH_ENGAGE": 0.9, "EXTRA": 1234567})
+            c = mod._saved_settings()
+            self.assertEqual(c.get("KINECT_REACH_ENGAGE"), 0.9)
+            self.assertEqual(calls["n"], 2)  # re-parsed on change
+
+    def test_missing_file_does_not_raise(self):
+        mod = self._load()
+        from tools import settings_window as sw
+        path = sw.settings_path()
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        mod._settings_cache["key"] = None
+        # No file → os.stat raises, key falls back; must return a dict, not raise.
+        self.assertIsInstance(mod._saved_settings(), dict)
 
 
 if __name__ == "__main__":

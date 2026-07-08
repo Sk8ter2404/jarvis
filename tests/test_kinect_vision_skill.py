@@ -97,7 +97,8 @@ class WhoIsHereTests(KinectSkillBase):
         actions = self._load(bridge)
         out = actions["who_is_here"]("")
         self.assertIn("one person", out)
-        self.assertIn("1.8", out)
+        # 1.8 m spoken in imperial (feet), not metres.
+        self.assertIn("6 feet", out)
         self.assertIn("facing", out)
 
     def test_no_one_present(self):
@@ -112,7 +113,8 @@ class WhoIsHereTests(KinectSkillBase):
         actions = self._load(bridge)
         out = actions["who_is_here"]("")
         self.assertIn("3 people", out)
-        self.assertIn("2.4", out)
+        # 2.4 m spoken in imperial (feet), not metres.
+        self.assertIn("8 feet", out)
 
     def test_scan_room_is_alias(self):
         bridge = _fake_bridge(

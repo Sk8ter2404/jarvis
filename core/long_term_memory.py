@@ -110,6 +110,12 @@ _lock = threading.RLock()
 # SentenceTransformer (~6 GB transient RAM) and race on _embedder=.
 _embedder_lock = threading.Lock()
 _chroma_lock   = threading.Lock()
+# Serialises every emb.encode() forward pass. Retrieval, upsert and the
+# reflector all embed through _embed(); without this two concurrent callers
+# ran overlapping torch forward passes on the shared model (extra transient
+# VRAM + contention). Held only around the encode itself, never a lazy load.
+# (2026-07-08 #15/#28)
+_encode_lock   = threading.Lock()
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -372,19 +378,42 @@ def _rebuild_bm25_locked() -> None:
 
 def _embed(texts: list[str]):
     """Encode `texts`; returns numpy array or None if no embedder."""
+    global _embedder, _embedder_failed_until
     emb = _try_import_embedder()
     if emb is None:
         return None
-    try:
-        return emb.encode(
-            texts,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
-    except Exception as e:
-        print(f"  [ltm] embed failed: {e}")
-        return None
+    # 2026-07-08 (#28): serialise the forward pass so retrieval / upsert / the
+    # reflector never run two concurrent encodes on the shared model. Doing this
+    # inside _embed makes the discipline automatic — every encode goes through
+    # here. The lazy load already happened above, so only the encode is held.
+    with _encode_lock:
+        try:
+            return emb.encode(
+                texts,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+        except Exception as e:
+            print(f"  [ltm] embed failed: {e}")
+            # 2026-07-08 (#27): a transient CUDA/OOM during encode used to be
+            # swallowed while leaving the (possibly wedged) model resident, so
+            # every later encode failed the same way — recall stayed dead for the
+            # whole session. Drop the handle, free VRAM best-effort and arm the
+            # reload cooldown so a subsequent call rebuilds a fresh embedder.
+            msg = str(e).lower()
+            # Match CUDA/OOM signals precisely — a bare "oom" substring would
+            # also fire on unrelated words like "boom", so require it as a token.
+            if "cuda" in msg or "out of memory" in msg or re.search(r"\boom\b", msg):
+                with _embedder_lock:
+                    _embedder = None
+                    _embedder_failed_until = time.time() + _EMBEDDER_RETRY_COOLDOWN_S
+                try:
+                    import torch
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            return None
 
 
 def _chroma_upsert(fid: str, text: str, meta: dict) -> bool:
@@ -451,6 +480,11 @@ def _migrate_legacy_locked() -> int:
         print(f"  [ltm] legacy load failed: {e}")
         return 0
     migrated = 0
+    upsert_failures = 0
+    # Only Chroma-available runs can (or need) confirm dense indexing. When
+    # Chroma is absent the JSON mirror + BM25 are authoritative, so a failed
+    # upsert is expected and must NOT block the flag.
+    chroma_avail = _try_import_chroma() is not None
     for raw in data.get("facts", []):
         if not isinstance(raw, str):
             continue
@@ -471,11 +505,22 @@ def _migrate_legacy_locked() -> int:
             "updated_at": time.time(),
         }
         _facts[fid] = entry
-        _chroma_upsert(fid, text, entry)
+        if not _chroma_upsert(fid, text, entry) and chroma_avail:
+            upsert_failures += 1
         migrated += 1
     if migrated:
         _save_facts_locked()
         _rebuild_bm25_locked()
+    # 2026-07-08 (#16): only claim migration complete once every fact is
+    # confirmed into Chroma. If Chroma is up but some upserts failed (transient
+    # embedder/CUDA hiccup), DON'T drop the flag — a later boot re-runs (the
+    # exact-text skip above makes re-import idempotent) and _reconcile_chroma_locked
+    # back-fills the missing dense vectors. Previously the flag was written
+    # unconditionally, permanently dropping those facts from the dense index.
+    if upsert_failures:
+        print(f"  [ltm] migration deferred: {upsert_failures} chroma upsert(s) "
+              f"failed; will retry on next boot")
+        return migrated
     try:
         with open(_MIGRATE_FLAG, "w", encoding="utf-8") as f:
             f.write(f"migrated={migrated} ts={int(time.time())}\n")
@@ -483,6 +528,32 @@ def _migrate_legacy_locked() -> int:
         pass
     print(f"  [ltm] migrated {migrated} legacy fact(s) from bobert_memory.json")
     return migrated
+
+
+def _reconcile_chroma_locked() -> int:
+    """Re-upsert any _facts missing from the Chroma collection. Caller holds
+    _lock. Runs at boot so facts that only reached the JSON mirror (e.g. a
+    migration where Chroma/embedder was transiently down) get their dense
+    vectors back-filled once Chroma is available again. Cheap no-op on a healthy
+    store (every id already present) and a no-op without Chroma. (2026-07-08 #16)"""
+    coll = _try_import_chroma()
+    if coll is None or not _facts:
+        return 0
+    try:
+        existing = coll.get(include=[])
+        have = set((existing or {}).get("ids") or [])
+    except Exception as e:
+        print(f"  [ltm] chroma reconcile skipped: {e}")
+        return 0
+    backfilled = 0
+    for fid, entry in list(_facts.items()):
+        if fid in have:
+            continue
+        if _chroma_upsert(fid, entry.get("text", ""), entry):
+            backfilled += 1
+    if backfilled:
+        print(f"  [ltm] chroma back-filled {backfilled} missing fact(s)")
+    return backfilled
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -502,6 +573,15 @@ def ensure_loaded() -> None:
         # mirror + BM25 path still benefits from the imported facts.
         _migrate_legacy_locked()
         _rebuild_bm25_locked()
+        # 2026-07-08 (#16): back-fill any facts present in the JSON mirror but
+        # missing from Chroma (e.g. a prior boot's migration/upsert failed).
+        _reconcile_chroma_locked()
+        # 2026-07-08 (#30): rotate episodes.jsonl at boot based on ACTUAL line
+        # count. The per-process _writes_since_rotate counter resets every boot,
+        # so on a frequently-restarted box the in-append check may never reach its
+        # threshold and the log would grow unbounded across restarts. A boot-time
+        # trim bounds the file regardless of how often the process restarts.
+        _rotate_episodes_locked()
         _loaded = True
 
 
@@ -600,29 +680,41 @@ def retrieve_facts(query: str, k: int = RETRIEVE_K) -> list[dict]:
     if not query or not query.strip():
         return list_facts(limit=k)
     q = query.strip()
+
+    # Cheap emptiness gate + a fact-count snapshot, then release the lock.
     with _lock:
         if not _facts:
             return []
+        n_facts = len(_facts)
 
-        # ── dense
-        dense_scores: dict[str, float] = {}
-        coll = _try_import_chroma()
-        if coll is not None:
-            vec = _embed([q])
-            if vec is not None:
-                try:
-                    res = coll.query(
-                        query_embeddings=[vec[0].tolist()],
-                        n_results=min(max(k * 3, 10), max(1, len(_facts))),
-                        include=["distances", "metadatas"],
-                    )
-                    ids = (res.get("ids") or [[]])[0]
-                    dists = (res.get("distances") or [[]])[0]
-                    for fid, dist in zip(ids, dists):
-                        # cosine distance → similarity, clipped to [0,1]
-                        dense_scores[str(fid)] = max(0.0, 1.0 - float(dist))
-                except Exception as e:
-                    print(f"  [ltm] chroma query failed: {e}")
+    # 2026-07-08 (#15/#29): prime the heavyweight chroma/embedder singletons and
+    # embed the query OUTSIDE _lock. A cold SentenceTransformer load + encode can
+    # take several seconds; doing it under _lock stalled record_turn and every
+    # other caller behind the whole cold load. The dense chroma query hits its own
+    # store and needs no _lock either. Only the brief bm25 / _facts reads + the
+    # score blend below run under _lock.
+    dense_scores: dict[str, float] = {}
+    coll = _try_import_chroma()
+    if coll is not None:
+        vec = _embed([q])
+        if vec is not None:
+            try:
+                res = coll.query(
+                    query_embeddings=[vec[0].tolist()],
+                    n_results=min(max(k * 3, 10), max(1, n_facts)),
+                    include=["distances", "metadatas"],
+                )
+                ids = (res.get("ids") or [[]])[0]
+                dists = (res.get("distances") or [[]])[0]
+                for fid, dist in zip(ids, dists):
+                    # cosine distance → similarity, clipped to [0,1]
+                    dense_scores[str(fid)] = max(0.0, 1.0 - float(dist))
+            except Exception as e:
+                print(f"  [ltm] chroma query failed: {e}")
+
+    with _lock:
+        if not _facts:
+            return []
 
         # ── sparse (bm25)
         sparse_scores: dict[str, float] = {}
@@ -678,6 +770,27 @@ def get_working_window(n: int = WORKING_WINDOW) -> list[dict]:
         return [dict(t) for t in _working[-n:]]
 
 
+def _rotate_episodes_locked() -> None:
+    """Trim episodes.jsonl to the most-recent EPISODE_MAX_LINES lines when it
+    exceeds that bound. Caller must hold _lock. Cheap no-op when the file is
+    absent or under the bound. Shared by the per-append check AND the boot-time
+    trim in ensure_loaded so the log stays bounded even on a box that restarts
+    before the in-process append counter ever trips. (2026-07-08 #30)"""
+    try:
+        if not os.path.exists(_EPISODE_LOG):
+            return
+        with open(_EPISODE_LOG, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        if len(lines) > EPISODE_MAX_LINES:
+            keep = lines[-EPISODE_MAX_LINES:]
+            tmp = _EPISODE_LOG + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.writelines(keep)
+            os.replace(tmp, _EPISODE_LOG)
+    except Exception:
+        pass
+
+
 def _append_episode_locked(entry: dict) -> None:
     """Persist one turn to the episodic jsonl. Caller must hold _lock."""
     global _writes_since_rotate
@@ -691,22 +804,13 @@ def _append_episode_locked(entry: dict) -> None:
         return
     # Light rotation — count appends and only every Nth write do we pay for the
     # line-count + trim. (The old gate, int(ts) % 97 == 0, could stay false
-    # forever, letting episodes.jsonl grow without bound.) Respects the
-    # EPISODE_MAX_LINES bound: keep only the most recent N lines.
+    # forever, letting episodes.jsonl grow without bound.) The same trim also
+    # runs once at boot (#30) so a frequently-restarted box can't outrun this
+    # per-process counter. Respects EPISODE_MAX_LINES: keep only the most recent.
     _writes_since_rotate += 1
     if _writes_since_rotate >= EPISODE_ROTATE_CHECK_EVERY:
         _writes_since_rotate = 0
-        try:
-            with open(_EPISODE_LOG, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-            if len(lines) > EPISODE_MAX_LINES:
-                keep = lines[-EPISODE_MAX_LINES:]
-                tmp = _EPISODE_LOG + ".tmp"
-                with open(tmp, "w", encoding="utf-8") as f:
-                    f.writelines(keep)
-                os.replace(tmp, _EPISODE_LOG)
-        except Exception:
-            pass
+        _rotate_episodes_locked()
 
 
 def record_turn(role: str, text: str, *, ts: Optional[float] = None) -> None:

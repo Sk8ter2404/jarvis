@@ -2043,14 +2043,42 @@ def _cfg_flag(name: str, default: bool = False) -> bool:
         return default
 
 
+# 2026-07-08: cache the parsed settings dict keyed on the file's (path, mtime,
+# size) with a short TTL so the ~30 Hz poll loop (which reads settings every
+# tick, even while the air-mouse is DISABLED — the default) re-parses
+# user_settings.json only when it actually changes instead of 30x/second. A
+# per-tick os.stat is cheap; the open+read+json.parse it replaces is not.
+_SETTINGS_CACHE_TTL = 1.0  # seconds; also bounds pickup lag on coarse-mtime FS
+_settings_cache = {"key": None, "at": 0.0, "data": {}}
+_settings_cache_lock = threading.Lock()
+
+
 def _saved_settings() -> dict:
     """The owner's persisted settings dict (data/user_settings.json) via the same
     reader model_picker / kinect_gestures use — honours JARVIS_SETTINGS_PATH so a
-    test never touches the real file. Returns {} on any failure. NEVER raises."""
+    test never touches the real file. Cached on file (path, mtime, size) + TTL so
+    the hot poll loop doesn't re-parse each tick. Returns {} on any failure.
+    NEVER raises."""
     try:
         from tools import settings_window as sw
+        path = sw.settings_path()
+        try:
+            st = os.stat(path)
+            key = (path, st.st_mtime_ns, st.st_size)
+        except OSError:
+            key = (path, None, None)
+        now = time.time()
+        with _settings_cache_lock:
+            if _settings_cache["key"] == key and \
+                    (now - _settings_cache["at"]) < _SETTINGS_CACHE_TTL:
+                return _settings_cache["data"]
         cur = sw.load_settings()
-        return cur if isinstance(cur, dict) else {}
+        data = cur if isinstance(cur, dict) else {}
+        with _settings_cache_lock:
+            _settings_cache["key"] = key
+            _settings_cache["at"] = now
+            _settings_cache["data"] = data
+        return data
     except Exception:
         return {}
 

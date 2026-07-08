@@ -162,6 +162,7 @@ class FakeAnthropicModule:
         self._text = text
         self._raises = raises
         self.created_kwargs = None
+        self.client_init_kwargs = None   # kwargs passed to anthropic.Anthropic(...)
 
         outer = self
 
@@ -185,6 +186,7 @@ class FakeAnthropicModule:
 
         class _Client:
             def __init__(self, *a, **k):
+                outer.client_init_kwargs = k
                 self.messages = _Messages()
 
         self.Anthropic = _Client
@@ -1311,6 +1313,18 @@ class CallAnthropicAuditorTests(_Base):
         self.assertEqual(fake.created_kwargs["model"], dd.DEEP_AUDIT_MODEL)
         self.assertEqual(fake.created_kwargs["messages"][0]["content"],
                          "the-prompt")
+
+    def test_client_constructed_with_explicit_timeout(self):
+        # Finding #14: the client must carry an explicit timeout so a wedged
+        # HTTPS connection can't hang the daemon for the SDK's ~10min default.
+        fake = FakeAnthropicModule(text="ok")
+        with mock.patch.dict(sys.modules, {"anthropic": fake}), \
+                mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test"}):
+            dd._call_anthropic_auditor("the-prompt")
+        self.assertIsNotNone(fake.client_init_kwargs)
+        self.assertIn("timeout", fake.client_init_kwargs)
+        self.assertLessEqual(fake.client_init_kwargs["timeout"], 120)
+        self.assertGreater(fake.client_init_kwargs["timeout"], 0)
 
     def test_empty_content_returns_none(self):
         fake = FakeAnthropicModule(text=None)   # no content blocks

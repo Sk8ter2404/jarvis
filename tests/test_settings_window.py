@@ -469,6 +469,86 @@ class ExampleTemplateTests(unittest.TestCase):
             self.assertIn(key, data, msg=f"{key} missing from the template")
 
 
+class SchemaMatchesConfigLiteralTests(unittest.TestCase):
+    """Every scalar SCHEMA default must equal the core/config.py literal it
+    mirrors. Parses config.py via AST (no import of the monolith / no GPU) so a
+    drift like LOCAL_VISION_FALLBACK defaulting True here while config.py had it
+    False (fresh installs silently enabling the VLM) can never ship again.
+    """
+
+    @staticmethod
+    def _config_literals() -> dict:
+        import ast
+        cfg_path = os.path.join(_PROJECT, "core", "config.py")
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        lits: dict = {}
+        for node in tree.body:  # module-level assignments only
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)):
+                try:
+                    lits[node.targets[0].id] = ast.literal_eval(node.value)
+                except Exception:
+                    pass  # non-literal (computed) constant — skipped
+        return lits
+
+    def test_every_scalar_default_matches_config_literal(self):
+        scalar = (bool, int, float, str, type(None))
+        lits = self._config_literals()
+        checked = 0
+        for key in sw.persisted_keys():
+            default = sw.SCHEMA[key]["default"]
+            if key not in lits:
+                continue  # GUI-only hint or non-literal config value
+            cfg_val = lits[key]
+            if isinstance(default, scalar) and isinstance(cfg_val, scalar):
+                checked += 1
+                self.assertEqual(
+                    type(default), type(cfg_val),
+                    msg=f"{key}: schema default type {type(default).__name__} "
+                        f"!= config {type(cfg_val).__name__}")
+                self.assertEqual(
+                    default, cfg_val,
+                    msg=f"{key}: schema default {default!r} != core/config.py "
+                        f"literal {cfg_val!r} — the two must stay in lockstep.")
+        # Guard the guard: it must actually be comparing something.
+        self.assertGreater(checked, 10)
+
+    def test_local_vision_fallback_default_is_false(self):
+        # Regression: schema had True while config.py had False.
+        self.assertIs(sw.SCHEMA["LOCAL_VISION_FALLBACK"]["default"], False)
+        self.assertIs(sw.default_settings()["LOCAL_VISION_FALLBACK"], False)
+
+
+class WhisperSchemaTests(unittest.TestCase):
+    """The Whisper STT device/model crash-workaround knobs must be settable and
+    persisted through the Settings schema (previously config-only, so a Settings
+    save dropped a hand-set WHISPER_DEVICE)."""
+
+    def test_whisper_device_is_a_persisted_enum(self):
+        spec = sw.SCHEMA["WHISPER_DEVICE"]
+        self.assertEqual(spec["type"], "enum")
+        self.assertEqual(spec["default"], "auto")
+        for choice in ("auto", "cuda", "cuda:0", "cuda:1", "cpu"):
+            self.assertIn(choice, spec["choices"])
+        self.assertIn("WHISPER_DEVICE", sw.persisted_keys())
+        self.assertEqual(sw.default_settings()["WHISPER_DEVICE"], "auto")
+
+    def test_whisper_model_cuda_is_persisted(self):
+        spec = sw.SCHEMA["WHISPER_MODEL_CUDA"]
+        self.assertEqual(spec["type"], "str")
+        self.assertEqual(spec["default"], "large-v3-turbo")
+        self.assertIn("WHISPER_MODEL_CUDA", sw.persisted_keys())
+        self.assertEqual(sw.default_settings()["WHISPER_MODEL_CUDA"],
+                         "large-v3-turbo")
+
+    def test_whisper_keys_in_example_template(self):
+        with open(sw.EXAMPLE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["WHISPER_DEVICE"], "auto")
+        self.assertEqual(data["WHISPER_MODEL_CUDA"], "large-v3-turbo")
+
+
 class DeviceRoundTripTests(unittest.TestCase):
     """A device index must survive save -> on-disk JSON -> load as the int."""
 
