@@ -409,7 +409,9 @@ AIR_MOUSE_ENGAGE_STILL_M = 0.06          # PASSIVE: max hand travel over the dwe
 AIR_MOUSE_FACING_MAX_DEG = 40.0          # PASSIVE: face the sensor within this
 AIR_MOUSE_ARM_RELAXES_GATE = True        # ARMED: relax to height-only + short hold
 AIR_MOUSE_ARM_ENGAGE_DEBOUNCE_SEC = 0.15  # ARMED: short engage hold (relaxed gate)
-AIR_MOUSE_FIST_RELEASES = True           # a sustained fist while engaged releases
+AIR_MOUSE_FIST_RELEASES = False          # OFF by default (fought click/drag — a
+#                                          normal close stopped tracking); close =
+#                                          click/drag, lower the hand to let go
 AIR_MOUSE_FIST_RELEASE_SEC = 0.60        # …held closed this long counts as release
 AIR_MOUSE_PER_APP_DISABLE = True         # stand down over disabled-app windows
 AIR_MOUSE_DISABLED_APP_HINTS = [         # lower-case title/class substrings
@@ -1629,6 +1631,12 @@ class AirMouseController:
         #    line → disengage (fail SAFE, the real mouse is left alone). ─────────
         arm = self._select_controlling_arm(left_ext, right_ext, thresholds)
         if arm is None:
+            # Hand LOWERED (below the engage line). Clear the fist-release latch so
+            # it can never get stuck: the latch's job is only to stop a re-grab
+            # while a fist is held UP; lowering the hand is a clean, deliberate
+            # "done" that resets it (the next raise starts fresh).
+            self._fist_release_latched = False
+            self._latch_open_streak = 0
             return self.release_decision()
 
         # ── ADVANCE the grip debouncers ONCE per tracked frame (FILTER 4: an
@@ -2880,8 +2888,16 @@ def _format_reach_debug(left_ext, right_ext, tracked: bool, ctrl,
             hand_s = arm.side or "?"
         # Grip + fist-latch: the two signals that explain a "jittery when closed"
         # repro (grip flicker open↔closed, or the latch holding re-engage off).
+        # Read the HIGHEST-RAISED hand's DEBOUNCED grip directly — not
+        # _controlling_grip(), which returns "open" while disengaged and so hid the
+        # real hand state in the diagnostic log (2026-07-07).
         try:
-            grip_s = ctrl._controlling_grip()
+            if arm is not None and arm.side == "left":
+                grip_s = ctrl._grip_left.stable
+            elif arm is not None and arm.side == "right":
+                grip_s = ctrl._grip_right.stable
+            else:
+                grip_s = ctrl._controlling_grip()
         except Exception:
             grip_s = "?"
         latch_s = bool(getattr(ctrl, "fist_release_latched", False))

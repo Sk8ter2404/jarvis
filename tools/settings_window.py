@@ -440,10 +440,11 @@ SCHEMA: dict[str, dict] = {
     },
     "AIR_MOUSE_FIST_RELEASES": {
         "tab": "ai", "label": "Air-mouse: a held fist releases the cursor",
-        "type": "bool", "default": True,
-        "help": "While the air-mouse is engaged, holding a closed fist for ~0.6 s "
-                "lets go of the cursor without lowering your hand. Off if it "
-                "fights your drag gesture.",
+        "type": "bool", "default": False,
+        "help": "When ON, holding a closed fist for ~0.6 s lets go of the cursor "
+                "without lowering your hand. OFF by default because it fights the "
+                "click/drag gesture (a normal close stopped tracking). With it off, "
+                "close to click/drag and lower your hand to let go.",
     },
     "AIR_MOUSE_PER_APP_DISABLE": {
         "tab": "ai", "label": "Air-mouse: stand down over fullscreen games/video",
