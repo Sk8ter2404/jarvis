@@ -121,6 +121,12 @@ _chroma_lock   = threading.Lock()
 _chroma_client = None
 _collection    = None
 _embedder      = None
+# After a FAILED embedder load, stand down until this wall-clock time before
+# retrying. Without it, a persistent load failure (e.g. the 2026-07-07
+# stdout-isatty regression) re-attempted the full ~200-weight model load on EVERY
+# embed call — 174 loads in one session, hammering CPU/disk. 0.0 = no cooldown.
+_embedder_failed_until = 0.0
+_EMBEDDER_RETRY_COOLDOWN_S = 300.0
 _bm25_index    = None
 _bm25_corpus_ids: list[str] = []
 _bm25_corpus:    list[list[str]] = []
@@ -179,11 +185,17 @@ def _try_import_chroma():
 
 
 def _try_import_embedder():
-    global _embedder
+    global _embedder, _embedder_failed_until
     # Fast path: already loaded. Avoids serialising every embed call behind
     # the construction lock.
     if _embedder is not None:
         return _embedder
+    import time as _t
+    # Backoff: a recent load failure stands down instead of hot-retrying the full
+    # model load on every embed call (the churn that stressed the box on
+    # 2026-07-07). Cleared implicitly when the cooldown elapses.
+    if _embedder_failed_until and _t.time() < _embedder_failed_until:
+        return None
     with _embedder_lock:
         # Re-check inside the lock — another thread may have just built the
         # model while we were waiting. Without this guard two concurrent
@@ -191,9 +203,12 @@ def _try_import_embedder():
         # RAM each) and race on the assignment below.
         if _embedder is not None:
             return _embedder
+        if _embedder_failed_until and _t.time() < _embedder_failed_until:
+            return None
         try:
             from sentence_transformers import SentenceTransformer
         except Exception:
+            _embedder_failed_until = _t.time() + _EMBEDDER_RETRY_COOLDOWN_S
             return None
         try:
             dev = "cpu"
@@ -218,8 +233,10 @@ def _try_import_embedder():
                     return _embedder
                 except Exception as e2:
                     print(f"  [ltm] CPU embedder load also failed: {e2}")
+                    _embedder_failed_until = _t.time() + _EMBEDDER_RETRY_COOLDOWN_S
                     return None
             print(f"  [ltm] embedder load failed: {e}")
+            _embedder_failed_until = _t.time() + _EMBEDDER_RETRY_COOLDOWN_S
             return None
 
 
