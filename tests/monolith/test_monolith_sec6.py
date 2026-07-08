@@ -613,6 +613,32 @@ class StripMarkdownTests(SectionSixBase):
         self.assertEqual(self.bc._strip_markdown_for_speech(""), "")
         self.assertIsNone(self.bc._strip_markdown_for_speech(None))
 
+    def test_currency_spoken_as_money_not_time(self):
+        # The Claude-balance bug: "$8.18" must speak as money, not "8:18".
+        bc = self.bc
+        self.assertEqual(
+            bc._strip_markdown_for_speech("Claude credit balance: $8.18 remaining"),
+            "Claude credit balance: 8 dollars and 18 cents remaining")
+        self.assertEqual(bc._currency_to_words("$8.18"), "8 dollars and 18 cents")
+        self.assertEqual(bc._currency_to_words("$5"), "5 dollars")
+        self.assertEqual(bc._currency_to_words("$5.00"), "5 dollars")
+        self.assertEqual(bc._currency_to_words("$1"), "1 dollar")
+        self.assertEqual(bc._currency_to_words("$1.01"), "1 dollar and 1 cent")
+        self.assertEqual(bc._currency_to_words("$0.50"), "50 cents")
+        self.assertEqual(bc._currency_to_words("$0.05"), "5 cents")
+        self.assertEqual(bc._currency_to_words("$1,234.56"),
+                         "1234 dollars and 56 cents")
+        # single-digit cents pad on the right: ".5" == 50 cents
+        self.assertEqual(bc._currency_to_words("$8.5"), "8 dollars and 50 cents")
+
+    def test_currency_leaves_non_money_numbers_alone(self):
+        bc = self.bc
+        # No dollar sign → untouched (a real clock time, a version, a plain int).
+        self.assertEqual(bc._currency_to_words("meet at 8.18 today"),
+                         "meet at 8.18 today")
+        self.assertEqual(bc._currency_to_words("version 2.0.23"), "version 2.0.23")
+        self.assertEqual(bc._currency_to_words("no money here"), "no money here")
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  _detect_dropped_steps

@@ -229,6 +229,25 @@ def _get_bobert():
             or sys.modules.get("__main__"))
 
 
+def _set_ambient_stream_active(active: bool) -> None:
+    """Publish 'a dedicated ambient InputStream is live' onto bobert_companion's
+    _ambient_stream_active ownership flag so _refresh_devices defers its
+    destructive PortAudio sd._terminate()/_initialize() while our loopback / mic
+    stream is open — otherwise a USB device plug/unplug mid-capture tears
+    PortAudio down under the live callback thread → 0xc0000374 heap corruption
+    (HIGH, 2026-07-08). Best-effort: a missing module/flag (unit tests) is a
+    no-op, exactly like the other cross-module ownership signals here."""
+    bc = _get_bobert()
+    if bc is None:
+        return
+    try:
+        flag = getattr(bc, "_ambient_stream_active", None)
+        if isinstance(flag, list) and flag:
+            flag[0] = bool(active)
+    except Exception:
+        pass
+
+
 def _safe_close_stream(stream) -> None:
     """Tear down a sounddevice InputStream via bobert_companion._safe_close_stream
     when available, falling back to a daemon-thread close() pattern when bobert
@@ -783,6 +802,9 @@ def _worker_loop() -> None:
             print(f"  [ambient-listen] {_last_error}")
             _safe_close_stream(stream)
             return
+        # Claim device ownership so _refresh_devices defers its PortAudio reinit
+        # while this dedicated mic stream is live. Cleared in the finally below.
+        _set_ambient_stream_active(True)
 
         print(f"  [ambient-listen] stream open on device={device}, "
               f"sample_rate={sample_rate}, chunk={chunk_secs:.2f}s")
@@ -900,6 +922,8 @@ def _worker_loop() -> None:
                 pass
         if stream is not None:
             _safe_close_stream(stream)
+        # Release device ownership (no-op on the tap path, which never set it).
+        _set_ambient_stream_active(False)
         print("  [ambient-listen] mic worker exiting")
 
 
@@ -1048,6 +1072,9 @@ def _audio_worker_loop() -> None:
         print(f"  [ambient-audio] {_audio_last_error}")
         _safe_close_stream(stream)
         return
+    # Claim device ownership so _refresh_devices won't tear down PortAudio under
+    # this live loopback callback (0xc0000374). Cleared in the finally below.
+    _set_ambient_stream_active(True)
 
     print(f"  [ambient-audio] loopback open on device #{device_idx} "
           f"({dev_info.get('name', '?')}), native_sr={dev_sr}, "
@@ -1158,6 +1185,7 @@ def _audio_worker_loop() -> None:
         _audio_last_error = f"audio worker crashed: {e}"
         print(f"  [ambient-audio] {_audio_last_error}")
     finally:
+        _set_ambient_stream_active(False)
         _safe_close_stream(stream)
         print("  [ambient-audio] worker exiting")
 

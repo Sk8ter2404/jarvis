@@ -190,7 +190,7 @@ def _check_and_maybe_alert():
             if (now - _last_alert_at[0]) > ALERT_COOLDOWN_SECONDS:
                 _enqueue_speech(
                     f"Heads up, sir — your Claude credits are getting low. "
-                    f"Only {dollars:.2f} dollars remaining."
+                    f"Only ${dollars:.2f} remaining."
                 )
                 _last_alert_at[0] = now
     finally:

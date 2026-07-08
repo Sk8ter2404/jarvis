@@ -4085,8 +4085,10 @@ def _draw_gesture_pop_on_color(color_bgr: "np.ndarray", now: float) -> bool:
 #
 # Persistent VideoCapture handles (opened lazily, reused) read at ~4 Hz: that's
 # plenty for a context thumbnail and avoids DirectShow's expensive per-read
-# open/close churn. All open/read/release go through _camera_io_lock (the same
-# heap-corruption guard the face-tracker uses). Tiny labels resolve the tiles.
+# open/close churn. open/release go through _camera_io_lock (the same
+# heap-corruption guard the face-tracker uses); the per-handle READ is
+# deliberately lock-free so a wedged webcam can't stall all camera I/O — see
+# _read_side_tile_webcams. Tiny labels resolve the tiles.
 _KINECT_PREVIEW_TILE_LABELS = {
     "left":  "Left webcam",      # 'Fullhan Webcam'  → LEFT monitor
     "right": "Right webcam",     # 'USB 2.0 Camera'  → RIGHT monitor
@@ -4174,8 +4176,15 @@ def _read_side_tile_webcams(now: float) -> dict:
                 continue
             ret, frame = False, None
             try:
-                with _camera_io_lock:
-                    ret, frame = cap.read()
+                # Read on this slot's OWN handle — deliberately NOT under
+                # _camera_io_lock. That lock exists to stop overlapping DirectShow
+                # open/release (which heap-corrupt); a read neither opens nor
+                # releases, and _kinect_tile_lock (held across this whole function)
+                # already excludes a concurrent release of THIS handle. Holding
+                # _camera_io_lock across a blocking cap.read() let one wedged webcam
+                # stall every camera open/release across all threads — a
+                # whole-subsystem hang (HIGH, 2026-07-08).
+                ret, frame = cap.read()
             except Exception:
                 ret, frame = False, None
             _kinect_tile_last_read[slot] = now
@@ -6149,10 +6158,10 @@ def _refresh_devices(force: bool = False):
             # re-pick from the existing enumeration. The drift (mic plugged/
             # unplugged) gets picked up on the next refresh once record_speech
             # is briefly idle — which happens every utterance / 20s timeout.
-            if _record_speech_active[0] or _pathb_mic_active[0]:
-                print("  [audio] device drift detected but a mic stream is "
-                      "live (record_speech or get_mic_buffer Path B) — "
-                      "deferring PortAudio reinit to avoid a mid-capture "
+            if _record_speech_active[0] or _pathb_mic_active[0] or _ambient_stream_active[0]:
+                print("  [audio] device drift detected but a mic/audio stream is "
+                      "live (record_speech, get_mic_buffer Path B, or ambient "
+                      "listen) — deferring PortAudio reinit to avoid a mid-capture "
                       "teardown (0xc0000374).")
             elif _tts_playback_active[0]:
                 print("  [audio] device drift detected but TTS playback is "
@@ -6882,6 +6891,14 @@ _record_speech_sr     = [SAMPLE_RATE]    # sample rate of the live stream
 # now writes ONLY its own flag; _refresh_devices defers its destructive PortAudio
 # reinit while EITHER is set.
 _pathb_mic_active     = [False]
+# True while skills/ambient_listen holds a live dedicated InputStream — either its
+# WASAPI system-audio loopback stream or its mic-fallback stream. Those daemons run
+# for minutes and (unlike record_speech) set NONE of the other ownership flags, so
+# _refresh_devices could sd._terminate()/_initialize() PortAudio out from under a
+# live loopback callback thread → 0xc0000374 heap corruption (HIGH, 2026-07-08).
+# ambient_listen sets this True around its stream lifetime; _refresh_devices defers
+# its destructive reinit while it's set.
+_ambient_stream_active = [False]
 _mic_lock = threading.Lock()             # serialises Path-B mic-ownership flag writes
 _record_speech_taps: "list[queue.Queue]" = []
 _record_speech_taps_lock = threading.Lock()
@@ -6986,6 +7003,17 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
     # never left stuck True on a stream we don't actually hold.
     _record_speech_sr[0] = SAMPLE_RATE
     _record_speech_active[0] = True
+    # If get_mic_buffer Path B is mid-capture on this same device, we've just
+    # signalled it to bail (Path B re-checks _record_speech_active every 0.2s and
+    # breaks). Wait a BOUNDED moment for it to tear its temporary InputStream down
+    # before we open ours, so two InputStreams never sit open together on one
+    # WASAPI device — the ~70s double-open capture stall the tap path exists to
+    # avoid (HIGH, 2026-07-08). Only waits when Path B is actually live (rare:
+    # standby-audio / enrolment / speaker-ID); bounded so a stuck flag can never
+    # delay live speech capture by more than ~0.6s.
+    _pathb_wait_deadline = time.time() + 0.6
+    while _pathb_mic_active[0] and time.time() < _pathb_wait_deadline:
+        time.sleep(0.02)
     _record_stream = None
     # Defense-in-depth against a stale cached mic index: even after
     # get_input_device() validates, the device can disappear between
@@ -7324,6 +7352,14 @@ def get_mic_buffer(seconds: float,
     # longer touches _record_speech_active/_record_speech_sr at all, so it can
     # never clobber record_speech's ownership.
     with _mic_lock:
+        if _record_speech_active[0]:
+            # record_speech owns (or just grabbed) the mic. Path A2 above only
+            # taps it when the sample rates MATCH; when they differ we land here,
+            # and opening a SECOND InputStream on the same WASAPI device would
+            # re-introduce the ~70s double-open capture stall (HIGH, 2026-07-08).
+            # Yield the device: return None so the caller re-invokes and either
+            # taps (A2) or skips this cycle — never double-opens.
+            return None
         _pathb_mic_active[0] = True
     try:
         # 2026-05-29 silent-crash fix: avoid `with sd.InputStream(...)`. Open the
@@ -7341,6 +7377,11 @@ def get_mic_buffer(seconds: float,
             captured = 0
             deadline = time.time() + seconds + 1.0
             while captured < need and time.time() < deadline:
+                if _record_speech_active[0]:
+                    # record_speech just grabbed the mic — yield immediately so we
+                    # don't sit as a second open stream on the same device. The
+                    # finally below closes our stream and clears _pathb_mic_active.
+                    break
                 try:
                     frame = q_local.get(timeout=0.2)
                 except queue.Empty:
@@ -7369,6 +7410,15 @@ _stt = None  # lazy-loaded on first transcribe() call
 _stt_device = None      # resolved at load time: "cuda" or "cpu"
 _stt_model_name = None  # resolved at load time: actual model loaded
 _stt_engine = None      # "faster_whisper" or "openai_whisper"
+# Serialises BOTH the lazy model load AND every transcribe() call. CTranslate2
+# (faster-whisper's backend) is NOT safe for concurrent .transcribe() on one
+# model instance — two threads transcribing at once corrupts native state and
+# raises a C++ exception on a worker thread, which is UNCATCHABLE in Python and
+# terminates the whole process (0xc0000409). One lock across load+inference
+# guarantees single-threaded access to _stt. RLock (not Lock) so transcribe()
+# can hold it across the whole call while the nested _ensure_whisper() re-enters
+# it on the same thread without deadlocking. 2026-07-08.
+_stt_lock = threading.RLock()
 
 
 # Patterns in the stringified exception that indicate the CUDA runtime DLLs
@@ -7542,16 +7592,66 @@ def _register_cuda_dll_dirs() -> None:
 _force_whisper_cpu_int8 = False
 
 
+def _whisper_cuda_plan(dev_index: int):
+    """Decide HOW (and WHETHER) to load Whisper on cuda:{dev_index} without
+    OOM-ing. Returns (compute_type, fallback_to_cpu, reason).
+
+    Root cause of the 0xc0000409 crash: a 4 GB card (e.g. GTX 1650 SUPER)
+    cannot hold large-v3-turbo in float16 (~3.1 GB weights) PLUS the CTranslate2
+    transcribe workspace (~1-1.5 GB). The overflow raises a CUDA-OOM on a
+    CTranslate2 worker thread mid-transcribe — UNCATCHABLE in Python — which
+    calls std::terminate and kills the whole process. So:
+      * on a small card (< ~8 GB total) pick int8 (~1.6 GB weights, half the
+        footprint) instead of float16, and
+      * preflight FREE VRAM — if there isn't comfortable headroom for the chosen
+        precision + workspace, fall back to CPU int8 (slower but crash-proof)
+        rather than attempting a load that will OOM.
+    Uses torch.cuda.mem_get_info when available; if it isn't, returns a
+    conservative int8 plan and skips the free-VRAM gate (best effort). int8 is
+    only marginally less accurate than float16 for large-v3-turbo. 2026-07-08."""
+    try:
+        import torch
+        free, total = torch.cuda.mem_get_info(dev_index)
+        free_mb = int(free // (1024 * 1024))
+        total_mb = int(total // (1024 * 1024))
+    except Exception as e:
+        return "int8", False, (f"VRAM probe unavailable ({type(e).__name__}); "
+                               f"defaulting to int8")
+    # Small cards can't afford float16 + workspace — force int8.
+    compute_type = "int8" if total_mb < 8192 else "float16"
+    need_mb = 4800 if compute_type == "float16" else 3000
+    if free_mb < need_mb:
+        return compute_type, True, (
+            f"cuda:{dev_index} has {free_mb} MB free < {need_mb} MB needed for "
+            f"{compute_type}; using CPU int8 to avoid an OOM crash")
+    return compute_type, False, (
+        f"cuda:{dev_index}: {free_mb} MB free / {total_mb} MB total → {compute_type}")
+
+
 def _ensure_whisper():
-    """Load the Whisper model the first time it's actually needed.
-    Prefers `faster-whisper` (CTranslate2-based, 2-4x faster on CPU AND
-    GPU than openai-whisper, and ships CUDA runtime for Py 3.14 where
-    torch's cu124 wheel doesn't exist yet). Falls back to openai-whisper
-    if faster-whisper isn't installed.
-    Picks `WHISPER_MODEL_CUDA` on GPU, `WHISPER_MODEL_CPU` on CPU."""
-    global _stt, _stt_device, _stt_model_name, _stt_engine
+    """Load the Whisper model the first time it's actually needed. Thin
+    thread-safe wrapper: double-checks _stt and serialises the actual build
+    under _stt_lock so two threads hitting a cold model can't both spin up a
+    CTranslate2 instance at once (concurrent native init is the same race that
+    crashes concurrent transcribe). The heavy lifting is in
+    _ensure_whisper_locked()."""
+    global _stt
     if _stt is not None:
         return
+    with _stt_lock:
+        if _stt is not None:      # another thread loaded it while we waited
+            return
+        _ensure_whisper_locked()
+
+
+def _ensure_whisper_locked():
+    """Actual Whisper load — ALWAYS invoked with _stt_lock held (via
+    _ensure_whisper). Prefers `faster-whisper` (CTranslate2-based, 2-4x faster
+    on CPU AND GPU than openai-whisper, and ships CUDA runtime for Py 3.14 where
+    torch's cu124 wheel doesn't exist yet). Falls back to openai-whisper if
+    faster-whisper isn't installed.
+    Picks `WHISPER_MODEL_CUDA` on GPU, `WHISPER_MODEL_CPU` on CPU."""
+    global _stt, _stt_device, _stt_model_name, _stt_engine
     _register_cuda_dll_dirs()
     device = _resolve_whisper_device()          # 'cuda' | 'cuda:N' | 'cpu'
     # Split into (base, index) for faster-whisper's device_index. 'cuda:1' pins
@@ -7571,13 +7671,22 @@ def _ensure_whisper():
         print(f"  [whisper] preflight flagged cublas64_12.dll missing — "
               f"forcing CPU + int8 (skipping CUDA load attempt)")
         base_dev, dev_index = "cpu", 0
+    # VRAM-aware plan for CUDA — choose a compute_type that FITS the target card
+    # and bail to CPU when it lacks headroom, so we never trigger the uncatchable
+    # worker-thread OOM that terminates the process (the 0xc0000409 crash).
+    cuda_compute = "float16"
+    if base_dev == "cuda":
+        cuda_compute, _cpu_fallback, _plan_reason = _whisper_cuda_plan(dev_index)
+        print(f"  [whisper] VRAM plan — {_plan_reason}")
+        if _cpu_fallback:
+            base_dev, dev_index = "cpu", 0
     model  = WHISPER_MODEL_CUDA if base_dev == "cuda" else WHISPER_MODEL_CPU
     dev_label = f"{base_dev}:{dev_index}" if base_dev == "cuda" else base_dev
 
     # ── Engine 1: faster-whisper (preferred for GPU speed + Py 3.14 CUDA) ──
     try:
         from faster_whisper import WhisperModel as _FWM
-        compute_type = "float16" if base_dev == "cuda" else "int8"
+        compute_type = cuda_compute if base_dev == "cuda" else "int8"
         print(f"Loading faster-whisper '{model}' on {dev_label} "
               f"(compute_type={compute_type})…")
         try:
@@ -7760,9 +7869,22 @@ def check_dependencies() -> list[str]:
 
 
 def transcribe(audio: np.ndarray) -> tuple[str, dict]:
+    """Thread-safe entry point: holds _stt_lock across the ENTIRE call so no two
+    threads ever touch the CTranslate2 model at once — not the .transcribe()
+    call, not the lazy generator draining (list(segments_gen)) where the native
+    decode actually happens. _stt_lock is an RLock, so the nested
+    _ensure_whisper() re-acquires it on this thread without deadlocking. This is
+    what makes concurrent transcription safe; a race here corrupts native state
+    and terminates the process (0xc0000409)."""
+    with _stt_lock:
+        return _transcribe_impl(audio)
+
+
+def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
     """Returns (text, confidence) where confidence has no_speech_prob and avg_logprob.
     Abstracts over faster-whisper (preferred, GPU-accelerated on 3090) and
-    openai-whisper (legacy fallback). Both produce the same return shape."""
+    openai-whisper (legacy fallback). Both produce the same return shape.
+    MUST be called with _stt_lock held (via transcribe())."""
     global _stt
     try:
         _ensure_whisper()
@@ -18051,6 +18173,38 @@ _MARKDOWN_FOR_SPEECH_RE_LINK   = re.compile(r"\[([^\]]+?)\]\([^)]+\)")
 _MARKDOWN_FOR_SPEECH_RE_HEAD   = re.compile(r"^#{1,6}\s+", re.MULTILINE)
 _MARKDOWN_FOR_SPEECH_RE_BULLET = re.compile(r"^\s*[-*+]\s+", re.MULTILINE)
 _MARKDOWN_FOR_SPEECH_RE_HRULE  = re.compile(r"^[-=_]{3,}\s*$", re.MULTILINE)
+# Currency amounts → spoken words so edge-tts doesn't read "$8.18" as the clock
+# time "eight eighteen" (the Claude-balance bug). Matches $8, $8.18, and
+# comma-grouped thousands like $1,234.56, with an optional space after the sign.
+_CURRENCY_FOR_SPEECH_RE = re.compile(r"\$\s?(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d{1,2}))?")
+
+
+def _currency_to_words(text: str) -> str:
+    """Convert '$8.18' → '8 dollars and 18 cents' so TTS speaks a money amount
+    as money, not as the clock time 'eight eighteen' (the reported Claude-balance
+    bug — a balance of $8.18 was read like the time 8:18). Handles $N, $N.CC,
+    comma-grouped thousands, singular/plural, and cents-only amounts ($0.50 →
+    '50 cents'). Non-currency numbers are left untouched."""
+    if not text or "$" not in text:
+        return text
+
+    def _repl(m):
+        whole = m.group(1).replace(",", "")
+        try:
+            dollars = int(whole)
+        except ValueError:
+            return m.group(0)
+        cents = m.group(2)
+        # ".5" is 50 cents, ".05" is 5 cents — pad a single digit on the right.
+        cents_val = int((cents + "0")[:2]) if cents else 0
+        parts = []
+        if dollars or cents_val == 0:
+            parts.append(f"{dollars} {'dollar' if dollars == 1 else 'dollars'}")
+        if cents_val:
+            parts.append(f"{cents_val} {'cent' if cents_val == 1 else 'cents'}")
+        return " and ".join(parts)
+
+    return _CURRENCY_FOR_SPEECH_RE.sub(_repl, text)
 
 
 def _strip_markdown_for_speech(text: str) -> str:
@@ -18058,9 +18212,13 @@ def _strip_markdown_for_speech(text: str) -> str:
     asterisk' or 'underscore' aloud. Targets the formatting JARVIS commonly
     emits when reading back task descriptions, upgrade summaries, or other
     file content — NOT the [intent:xxx] / [wry] markers, which are handled
-    separately before this runs."""
+    separately before this runs. Also normalises currency amounts to spoken
+    words so '$8.18' isn't read as a clock time."""
     if not text:
         return text
+    # Currency → spoken money BEFORE other subs so "$8.18" becomes
+    # "8 dollars and 18 cents" and never reaches TTS as the time "eight eighteen".
+    text = _currency_to_words(text)
     # **bold**  →  bold
     text = _MARKDOWN_FOR_SPEECH_RE_BOLD.sub(r"\1", text)
     # *italic*  →  italic   (only when surrounded by non-word — protects

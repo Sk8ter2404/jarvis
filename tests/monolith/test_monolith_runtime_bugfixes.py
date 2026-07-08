@@ -636,6 +636,71 @@ class RefreshDevicesReinitGuardTests(MonolithGlobalsTestCase):
             self._run_refresh(active=False),
             "sd._terminate() should run when no capture owns the mic")
 
+    def test_reinit_deferred_while_ambient_stream_active(self):
+        # ambient_listen's loopback/mic daemon holds a dedicated InputStream but
+        # sets NONE of the record_speech/Path-B flags; _refresh_devices must defer
+        # its destructive PortAudio reinit on the ambient ownership flag too, or it
+        # tears PortAudio down under the live loopback callback (0xc0000374 heap
+        # corruption, HIGH 2026-07-08).
+        bc = self.bc
+        terminated = {"called": False}
+        prev = bc._ambient_stream_active[0]
+        bc._ambient_stream_active[0] = True
+        try:
+            with mock.patch.object(bc.sd, "_terminate",
+                                   side_effect=lambda: terminated.__setitem__("called", True)), \
+                    mock.patch.object(bc.sd, "_initialize"), \
+                    mock.patch.object(bc.sd, "query_devices",
+                                      return_value={"name": "FakeMic"}), \
+                    mock.patch.object(bc, "_pick_device", return_value=(0, "FakeMic")), \
+                    mock.patch.object(bc, "MICROPHONE_INDEX", None), \
+                    mock.patch.object(bc, "SPEAKER_INDEX", None), \
+                    mock.patch("builtins.print"):
+                bc._refresh_devices(force=True)
+        finally:
+            bc._ambient_stream_active[0] = prev
+        self.assertFalse(
+            terminated["called"],
+            "sd._terminate() must NOT run while an ambient stream is live")
+
+
+@requires_monolith
+class GetMicBufferPathBExclusionTests(MonolithGlobalsTestCase):
+    """get_mic_buffer Path B must NOT open a second InputStream on a device
+    record_speech already owns (HIGH double-open capture stall, 2026-07-08).
+    Path A2 only taps record_speech when the sample rates match; when they differ
+    the code lands in Path B, which must yield the device instead of double-open."""
+
+    def test_pathb_aborts_when_record_speech_active_at_other_rate(self):
+        bc = self.bc
+        opened = {"called": False}
+
+        def _fake_stream(*a, **k):
+            opened["called"] = True
+            raise AssertionError("Path B opened a second InputStream over record_speech")
+
+        prev_active = bc._record_speech_active[0]
+        prev_sr = bc._record_speech_sr[0]
+        # record_speech owns the mic at 48 kHz; caller wants 16 kHz → sr mismatch
+        # skips the A2 tap and lands in Path B, which must bail.
+        bc._record_speech_active[0] = True
+        bc._record_speech_sr[0] = 48000
+        try:
+            with mock.patch.object(bc, "_mic_input_disabled", return_value=False), \
+                    mock.patch.dict(bc.sys.modules, {}, clear=False), \
+                    mock.patch.object(bc.sd, "InputStream", side_effect=_fake_stream), \
+                    mock.patch.object(bc, "get_input_device", return_value=0), \
+                    mock.patch("builtins.print"):
+                # Ensure no wake-word detector tap is available (Path A1 skip).
+                bc.sys.modules.pop("skill_wake_listener", None)
+                out = bc.get_mic_buffer(0.1, sample_rate=16000)
+        finally:
+            bc._record_speech_active[0] = prev_active
+            bc._record_speech_sr[0] = prev_sr
+        self.assertIsNone(out)
+        self.assertFalse(opened["called"],
+                         "Path B must not open a stream while record_speech holds the mic")
+
 
 @requires_monolith
 class PlayWithLipsyncEndpointSwapTests(MonolithGlobalsTestCase):

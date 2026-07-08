@@ -158,6 +158,7 @@ _MONOLITH_RESTORE_NAMES = (
     # ── audio / device / capture state ─────────────────────────────────────
     "_device_cache", "_recent_spoken_messages", "_record_speech_taps",
     "_record_speech_active", "_pathb_mic_active", "_tts_playback_active",
+    "_ambient_stream_active",
     "_camera_failure_summary",
     # ── single-flight / barge-in counter cells (2026-07-08 bug-hunt) ────────
     # New single-element-list cells: reset in place so a test that abandons a
