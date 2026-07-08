@@ -106,7 +106,10 @@ class CreditsAlertTests(unittest.TestCase):
              mock.patch.object(self.mod, "_enqueue_speech") as enq:
             self.mod._check_and_maybe_alert()
         enq.assert_called_once()
-        self.assertIn("2.00 dollars", enq.call_args.args[0])
+        # Emit the "$X.XX" form so bobert_companion's central speech normalizer
+        # (_currency_to_words) speaks it as money ("2 dollars"), not as a bare
+        # decimal the TTS reads like a clock time. The raw queued string keeps $.
+        self.assertIn("$2.00", enq.call_args.args[0])
 
     def test_healthy_balance_no_alert(self):
         with mock.patch.object(self.mod, "_read_credits_via_vision",

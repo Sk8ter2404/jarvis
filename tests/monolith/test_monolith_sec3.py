@@ -536,8 +536,8 @@ class EnsureWhisperTests(MonolithGlobalsTestCase):
         self.assertEqual(self.bc._stt_device, "cpu")
 
     def test_loads_faster_whisper_on_cuda_index(self):
-        # 'cuda:1' must load faster-whisper on GPU 1 (device='cuda',
-        # device_index=1, float16) and record the device label 'cuda:1'.
+        # 'cuda:1' with a roomy-card plan must load faster-whisper on GPU 1
+        # (device='cuda', device_index=1, float16) and record label 'cuda:1'.
         fake_wm = mock.Mock(return_value=object())
         fake_fw_module = mock.Mock()
         fake_fw_module.WhisperModel = fake_wm
@@ -545,6 +545,8 @@ class EnsureWhisperTests(MonolithGlobalsTestCase):
                 mock.patch.object(self.bc, "_resolve_whisper_device",
                                   return_value="cuda:1"), \
                 mock.patch.object(self.bc, "_force_whisper_cpu_int8", False), \
+                mock.patch.object(self.bc, "_whisper_cuda_plan",
+                                  return_value=("float16", False, "roomy")), \
                 mock.patch.object(self.bc, "WHISPER_MODEL_CUDA", "large-v3-turbo"), \
                 mock.patch.dict(sys.modules, {"faster_whisper": fake_fw_module}):
             self.bc._ensure_whisper()
@@ -553,6 +555,85 @@ class EnsureWhisperTests(MonolithGlobalsTestCase):
         self.assertEqual(kwargs.get("device_index"), 1)
         self.assertEqual(kwargs.get("compute_type"), "float16")
         self.assertEqual(self.bc._stt_device, "cuda:1")
+
+    def test_cuda_plan_int8_loads_int8_on_gpu(self):
+        # A small card's plan returns int8/no-fallback → the model loads on the
+        # GPU but in int8 (the crash-avoidance path for the 4 GB 1650 SUPER).
+        fake_wm = mock.Mock(return_value=object())
+        fake_fw_module = mock.Mock()
+        fake_fw_module.WhisperModel = fake_wm
+        with mock.patch.object(self.bc, "_register_cuda_dll_dirs"), \
+                mock.patch.object(self.bc, "_resolve_whisper_device",
+                                  return_value="cuda:1"), \
+                mock.patch.object(self.bc, "_force_whisper_cpu_int8", False), \
+                mock.patch.object(self.bc, "_whisper_cuda_plan",
+                                  return_value=("int8", False, "small card")), \
+                mock.patch.object(self.bc, "WHISPER_MODEL_CUDA", "large-v3-turbo"), \
+                mock.patch.dict(sys.modules, {"faster_whisper": fake_fw_module}):
+            self.bc._ensure_whisper()
+        _, kwargs = fake_wm.call_args
+        self.assertEqual(kwargs.get("device"), "cuda")
+        self.assertEqual(kwargs.get("device_index"), 1)
+        self.assertEqual(kwargs.get("compute_type"), "int8")
+        self.assertEqual(self.bc._stt_device, "cuda:1")
+
+    def test_cuda_plan_fallback_forces_cpu_int8(self):
+        # Plan says fallback (card lacks free VRAM) → load on CPU int8 instead of
+        # attempting a CUDA load that would OOM-crash the process.
+        fake_wm = mock.Mock(return_value=object())
+        fake_fw_module = mock.Mock()
+        fake_fw_module.WhisperModel = fake_wm
+        with mock.patch.object(self.bc, "_register_cuda_dll_dirs"), \
+                mock.patch.object(self.bc, "_resolve_whisper_device",
+                                  return_value="cuda:1"), \
+                mock.patch.object(self.bc, "_force_whisper_cpu_int8", False), \
+                mock.patch.object(self.bc, "_whisper_cuda_plan",
+                                  return_value=("int8", True, "no headroom")), \
+                mock.patch.object(self.bc, "WHISPER_MODEL_CPU", "small"), \
+                mock.patch.dict(sys.modules, {"faster_whisper": fake_fw_module}):
+            self.bc._ensure_whisper()
+        _, kwargs = fake_wm.call_args
+        self.assertEqual(kwargs.get("device"), "cpu")
+        self.assertEqual(kwargs.get("compute_type"), "int8")
+        self.assertEqual(self.bc._stt_device, "cpu")
+
+    def test_whisper_cuda_plan_small_card_int8(self):
+        # 4 GB total, plenty free → int8, no fallback.
+        fake_torch = mock.Mock()
+        fake_torch.cuda.mem_get_info.return_value = (3500 * 1024 * 1024,
+                                                     4096 * 1024 * 1024)
+        with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+            compute, fb, _reason = self.bc._whisper_cuda_plan(1)
+        self.assertEqual(compute, "int8")
+        self.assertFalse(fb)
+
+    def test_whisper_cuda_plan_big_card_float16(self):
+        # 24 GB total, plenty free → float16, no fallback.
+        fake_torch = mock.Mock()
+        fake_torch.cuda.mem_get_info.return_value = (20000 * 1024 * 1024,
+                                                     24576 * 1024 * 1024)
+        with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+            compute, fb, _reason = self.bc._whisper_cuda_plan(0)
+        self.assertEqual(compute, "float16")
+        self.assertFalse(fb)
+
+    def test_whisper_cuda_plan_low_free_falls_back(self):
+        # 4 GB total but only ~1 GB free (another consumer resident) → fallback.
+        fake_torch = mock.Mock()
+        fake_torch.cuda.mem_get_info.return_value = (1000 * 1024 * 1024,
+                                                     4096 * 1024 * 1024)
+        with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+            compute, fb, _reason = self.bc._whisper_cuda_plan(1)
+        self.assertTrue(fb)
+
+    def test_whisper_cuda_plan_probe_unavailable_defaults_int8(self):
+        # torch/mem_get_info unavailable → conservative int8, no fallback gate.
+        fake_torch = mock.Mock()
+        fake_torch.cuda.mem_get_info.side_effect = RuntimeError("no CUDA")
+        with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+            compute, fb, _reason = self.bc._whisper_cuda_plan(0)
+        self.assertEqual(compute, "int8")
+        self.assertFalse(fb)
 
 
 # ===========================================================================
@@ -642,6 +723,33 @@ class TranscribeTests(MonolithGlobalsTestCase):
             self.assertIs(self.bc._stt, sentinel)
         self.assertEqual(text, "")
         self.assertEqual(conf["no_speech_prob"], 1.0)
+
+    def test_transcribe_serialises_via_stt_lock(self):
+        # transcribe() must hold _stt_lock across the whole call so no OTHER
+        # thread can touch the CTranslate2 model concurrently (the native race
+        # that terminates the process). Prove it: while _transcribe_impl runs
+        # under transcribe()'s hold, a DIFFERENT thread cannot acquire the lock.
+        import threading
+        observed = {}
+
+        def _probe(audio):
+            res = {}
+
+            def _try():
+                got = self.bc._stt_lock.acquire(blocking=False)
+                res["got"] = got
+                if got:
+                    self.bc._stt_lock.release()
+
+            t = threading.Thread(target=_try)
+            t.start()
+            t.join()
+            observed["other_thread_blocked"] = (res.get("got") is False)
+            return ("", {"no_speech_prob": 1.0, "avg_logprob": -10.0})
+
+        with mock.patch.object(self.bc, "_transcribe_impl", side_effect=_probe):
+            self.bc.transcribe(np.zeros(4, dtype=np.float32))
+        self.assertTrue(observed.get("other_thread_blocked"))
 
 
 # ===========================================================================
