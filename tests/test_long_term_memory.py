@@ -148,7 +148,8 @@ class FakeBM25Raises(FakeBM25):
 # state we must reset so tests don't bleed into each other.
 _PATH_ATTRS = ("_DATA_DIR", "_CHROMA_DIR", "_FACTS_JSON", "_EPISODE_LOG",
                "_MIGRATE_FLAG", "_LEGACY_BOBERT_MEMORY")
-_STATE_ATTRS = ("_chroma_client", "_collection", "_embedder", "_bm25_index",
+_STATE_ATTRS = ("_chroma_client", "_collection", "_embedder",
+                "_embedder_failed_until", "_bm25_index",
                 "_bm25_corpus_ids", "_bm25_corpus", "_facts", "_working",
                 "_loaded", "_turns_since_reflect", "_writes_since_rotate")
 
@@ -173,6 +174,7 @@ class _LtmBase(unittest.TestCase):
         ltm._chroma_client = None
         ltm._collection = None
         ltm._embedder = None
+        ltm._embedder_failed_until = 0.0
         ltm._bm25_index = None
         ltm._bm25_corpus_ids = []
         ltm._bm25_corpus = []
@@ -1357,6 +1359,42 @@ class LazyImportProbeTests(_LtmBase):
         with mock.patch.dict(sys.modules, {"sentence_transformers": fake_st,
                                            "torch": fake_torch}):
             self.assertIsNone(ltm._try_import_embedder())
+
+    def test_try_import_embedder_backoff_blocks_hot_retry(self):
+        # 2026-07-07 regression guard: a FAILED load must arm a cooldown so the
+        # next embed call does NOT re-attempt the full model load (that hot-retry
+        # loaded the model 174x in one session and stressed the box).
+        ltm._embedder = None
+        ltm._embedder_failed_until = 0.0
+        attempts = {"n": 0}
+
+        class Fails:
+            def __init__(self, model, device=None):
+                attempts["n"] += 1
+                raise RuntimeError(f"fail on {device}")
+
+        fake_torch = types.ModuleType("torch")
+        fake_torch.cuda = types.SimpleNamespace(is_available=lambda: True)
+        fail_st = types.ModuleType("sentence_transformers")
+        fail_st.SentenceTransformer = Fails
+        with mock.patch.dict(sys.modules, {"sentence_transformers": fail_st,
+                                           "torch": fake_torch}):
+            self.assertIsNone(ltm._try_import_embedder())
+        first = attempts["n"]
+        self.assertGreater(first, 0)                          # it did try
+        self.assertGreater(ltm._embedder_failed_until, 0.0)   # cooldown armed
+
+        # With a WORKING embedder now available, the cooldown STILL blocks — no
+        # new construction happens until the cooldown elapses.
+        ok_st = types.ModuleType("sentence_transformers")
+        ok_st.SentenceTransformer = FakeEmbedder
+        with mock.patch.dict(sys.modules, {"sentence_transformers": ok_st,
+                                           "torch": fake_torch}):
+            self.assertIsNone(ltm._try_import_embedder())     # blocked by cooldown
+            self.assertEqual(attempts["n"], first)            # NO re-attempt
+            ltm._embedder_failed_until = 0.0                  # cooldown elapsed
+            emb = ltm._try_import_embedder()
+        self.assertIsInstance(emb, FakeEmbedder)              # now it loads
 
     def test_try_import_embedder_torch_absent_defaults_cpu(self):
         ltm._embedder = None

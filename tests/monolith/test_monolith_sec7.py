@@ -2327,5 +2327,56 @@ class AnnounceUpgradeSummaryTests(SectionSevenBase):
         self.assertTrue(os.path.exists(self._sig_path))
 
 
+class TimestampedTeeStreamProtocolTests(SectionSevenBase):
+    """The stdout tee must satisfy the stream-probe protocol libraries expect.
+    2026-07-07 regression: after the transformers 5.9->5.2 downgrade (chatterbox
+    install), the LTM embedder's loader called sys.stdout.isatty() and the tee
+    had no isatty(), so the bge-small load AttributeError-ed and hot-retried in a
+    tight loop (174 loads / 58 isatty fails in one session) — a stressed PC."""
+
+    class _FakeConsole:
+        def __init__(self, fd=7):
+            self._fd = fd
+            self.encoding = "utf-8"
+            self.written = []
+        def write(self, m): self.written.append(m); return len(m)
+        def flush(self): pass
+        def fileno(self): return self._fd
+        def isatty(self): return True
+
+    def _tee(self, console):
+        import io
+        return self.bc._TimestampedTee(console, io.StringIO())
+
+    def test_isatty_is_false(self):
+        # A tee-to-logfile is never an interactive terminal.
+        self.assertIs(self._tee(self._FakeConsole()).isatty(), False)
+        self.assertIs(self._tee(None).isatty(), False)   # pythonw: console=None
+
+    def test_fileno_delegates_or_raises(self):
+        self.assertEqual(self._tee(self._FakeConsole(fd=9)).fileno(), 9)
+        # console=None (pythonw): a probe must get OSError, not AttributeError.
+        with self.assertRaises(OSError):
+            self._tee(None).fileno()
+
+    def test_getattr_delegates_to_console_else_raises(self):
+        self.assertEqual(self._tee(self._FakeConsole()).encoding, "utf-8")
+        with self.assertRaises(AttributeError):
+            _ = self._tee(None).encoding
+
+    def test_isatty_probe_after_wrapping_stdout(self):
+        # The exact live shape: replace sys.stdout with the tee, then a library
+        # probing sys.stdout.isatty() must succeed (not AttributeError).
+        import sys
+        tee = self._tee(self._FakeConsole())
+        orig = sys.stdout
+        sys.stdout = tee
+        try:
+            self.assertIs(sys.stdout.isatty(), False)
+            sys.stdout.write("x")            # still tees without error
+        finally:
+            sys.stdout = orig
+
+
 if __name__ == "__main__":
     unittest.main()

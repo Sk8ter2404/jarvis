@@ -2359,6 +2359,41 @@ class _TimestampedTee:
         try: self.log_file.flush()
         except Exception: pass
 
+    def isatty(self):
+        # A tee-to-logfile is NOT an interactive terminal. Report False so any
+        # library that probes stdout for terminal-ness degrades to plain output.
+        # 2026-07-07: the LTM embedder (sentence-transformers -> huggingface_hub /
+        # tqdm, after the chatterbox-driven transformers 5.9->5.2 downgrade) calls
+        # sys.stdout.isatty() while loading; without this method it AttributeError-ed,
+        # the bge-small load failed, and the LTM loader hot-retried it in a tight
+        # loop (observed: 174 model loads / 58 isatty failures in one session) —
+        # hammering CPU + disk. Returning False loads the model cleanly, once.
+        return False
+
+    def fileno(self):
+        # Delegate to the real console fd when there is one (a live terminal);
+        # under pythonw the console is None, so signal "no underlying fd" the
+        # standard way (OSError, which well-behaved libs catch) rather than
+        # AttributeError-ing on a probe.
+        if self.console is not None:
+            try:
+                return self.console.fileno()
+            except Exception:
+                pass
+        raise OSError("fileno is not supported on _TimestampedTee")
+
+    def __getattr__(self, name):
+        # A stdout replacement can be probed for arbitrary stream attributes by
+        # third-party libs (encoding, buffer, closed, ...). Delegate anything we
+        # don't implement to the underlying console when present; otherwise raise
+        # AttributeError normally so hasattr()-style probes fall back gracefully.
+        # NB: only called for attributes NOT found the normal way, so the real
+        # write/flush/isatty/fileno above and the __dict__ fields are unaffected.
+        console = self.__dict__.get("console")
+        if console is not None:
+            return getattr(console, name)
+        raise AttributeError(name)
+
 
 _log_file_handle = None
 _log_file_path   = None
