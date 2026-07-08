@@ -553,8 +553,12 @@ CAMERAS = [
     # 2026-07-08: owner's actual webcams are a Logi C270 on the LEFT monitor and a
     # generic "USB 2.0 Camera" on the RIGHT (the old "fullhan webcam" is gone — its
     # slot was never resolving, so only 2 of the 3 cameras were used). Kinect sits
-    # under the centre monitor and is handled separately (KINECT_AS_CAMERA).
-    {"index": 1, "label": "Left webcam (left monitor)",          "name": "logi c270",     "primary": True,  "look_x": 0.5,  "look_y": 0.5},
+    # under the centre monitor and is handled separately (KINECT_AS_CAMERA/presence).
+    # VERIFIED live DirectShow order (pygrabber): 0=USB 2.0 Camera, 1=Kinect V2
+    # Video Sensor, 2=Logi C270. So the LEFT webcam is index 2 (NOT 1 — index 1 is
+    # the Kinect colour stream, which face-track must never grab as a webcam). The
+    # "name" still drives live resolution; these indices are the correct fallback.
+    {"index": 2, "label": "Left webcam (left monitor)",          "name": "logi c270",     "primary": True,  "look_x": 0.5,  "look_y": 0.5},
     {"index": 0, "label": "Right webcam (top of right monitor)", "name": "usb 2.0 camera", "primary": False, "look_x": 0.85, "look_y": 0.5},
 ]
 
