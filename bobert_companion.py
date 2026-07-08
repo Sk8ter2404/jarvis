@@ -19187,6 +19187,42 @@ def _preflight_cameras(timeout_sec: float = 2.0) -> None:
     for t in threads:
         t.join(timeout=timeout_sec + 0.5)
 
+    # RETRY PASS — a camera can fail the first quick probe not because it is
+    # absent but because a bandwidth-heavy neighbour transiently starved it: at
+    # boot the Kinect V2 is initialising on the USB bus, which can keep the
+    # owner's cheap 'USB 2.0 Camera' (right-monitor cam) from opening within the
+    # short first-pass window even though it opens instantly on its own. Re-probe
+    # ONLY the failures once, after a short settle (so Kinect init has advanced)
+    # and with a longer timeout, before condemning them. 2026-07-08.
+    retry_idx = [cam.get("index") for cam in list(CAMERAS)
+                 if cam.get("index") is not None
+                 and not results.get(cam.get("index"), False)]
+    if retry_idx:
+        try:
+            # Scale the settle with the probe budget so unit tests (tiny
+            # timeout_sec) stay fast while a real boot (2s) gets a full ~1s settle.
+            time.sleep(min(1.0, timeout_sec))
+        except Exception:
+            pass
+        retry_timeout = max(timeout_sec * 2.5, 5.0)
+
+        def _recheck(i: int):
+            try:
+                if _probe_camera_index(i, timeout_sec=retry_timeout):
+                    results[i] = True
+                    print(f"  [preflight] camera index {i}: opened on retry "
+                          f"({retry_timeout:.1f}s, bus settled) — keeping")
+            except Exception:
+                pass
+
+        rthreads: list[threading.Thread] = []
+        for i in retry_idx:
+            rt = threading.Thread(target=_recheck, args=(i,), daemon=True)
+            rt.start()
+            rthreads.append(rt)
+        for rt in rthreads:
+            rt.join(timeout=retry_timeout + 0.5)
+
     bad: list[int] = []
     for cam in list(CAMERAS):
         idx = cam.get("index")
