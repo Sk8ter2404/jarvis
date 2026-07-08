@@ -98,6 +98,15 @@ PROJECT_DIR = os.path.dirname(_THIS_DIR)          # tools/ -> project root
 DEFAULT_INJECT_PATH = os.path.join(PROJECT_DIR, "injected_commands.json")
 DEFAULT_LOG_DIR = os.path.join(PROJECT_DIR, "logs")
 DEFAULT_HUD_STATE_PATH = os.path.join(PROJECT_DIR, "hud_state.json")
+# The full-control-panel data sources: the live camera preview frame (written a
+# few times a second by the main loop while the camera is on) and the machine-
+# generated action inventory. Overridable per-instance so a test points them at a
+# temp dir (mirroring inject_path/log_dir/hud_state_path).
+DEFAULT_CAMERA_PREVIEW_PATH = os.path.join(PROJECT_DIR, "data", ".hud_camera_preview.jpg")
+DEFAULT_ACTION_INDEX_PATH = os.path.join(PROJECT_DIR, "docs", "ACTION_INDEX.md")
+# A preview frame older than this is treated as "camera off" (stale) and served
+# as a 404 so the panel shows its placeholder rather than a frozen last frame.
+_CAMERA_PREVIEW_STALE_S = 5.0
 
 # Reply-wait bounds. The main loop can take a while on a cloud LLM turn, so we
 # allow a generous ceiling but poll cheaply. A caller (the POST handler) passes a
@@ -617,6 +626,26 @@ def _coerce_setting(name: str, value, schema: dict, coerce_value) -> object:
                 f"invalid {typ} value for {name!r}: {value!r}")
     if coerce_value is None:                       # schema loaded but no coercer
         raise SettingsWriteError("settings coercion unavailable")
+    # List/dict-valued settings ('routing', or a 'text'/list knob): the web panel
+    # renders them as a single text input holding a JSON string. coerce_value's
+    # 'text' branch would splitlines() that JSON into a bogus 1-element list, and
+    # its 'routing' branch would reset a non-dict to the default — silently
+    # corrupting the save (2026-07-08 finding). Parse the JSON back to the real
+    # container FIRST so coerce_value gets the list/dict it accepts. Non-JSON
+    # strings (a genuine newline-separated 'text' list) fall through untouched.
+    if isinstance(value, str):
+        default = spec.get("default")
+        wants_list = typ == "text" or isinstance(default, list)
+        wants_dict = typ == "routing" or isinstance(default, dict)
+        s = value.strip()
+        if (wants_list and s.startswith("[")) or (wants_dict and s.startswith("{")):
+            try:
+                parsed = json.loads(s)
+                if (isinstance(parsed, list) and wants_list) or \
+                   (isinstance(parsed, dict) and wants_dict):
+                    value = parsed
+            except (ValueError, TypeError):
+                pass
     return coerce_value(spec, value)
 
 
@@ -697,6 +726,305 @@ def _default_user_settings_path() -> str:
         return os.path.join(PROJECT_DIR, "data", "user_settings.json")
 
 
+# ── control-panel data sources (System / Actions / Voice / Camera / Memory) ──
+#
+# Every function here is READ-ONLY and GRACEFUL — the exact contract the rest of
+# this module honours: a missing tool / module / file degrades to an empty-but-
+# valid payload, never an exception into a request handler. The GET endpoints
+# that call them (do_GET) each add their own try/except belt on top. All heavy
+# imports (psutil, core.voice_clone, core.long_term_memory) are LAZY so importing
+# web_interface stays dependency-light and a bare-CI/cloud box just degrades.
+
+
+def _smi_num(v):
+    """Parse an nvidia-smi CSV cell to a number, or None. '[N/A]'/'' → None. A
+    value containing a dot becomes a float (power.draw is fractional); otherwise
+    an int. Never raises."""
+    try:
+        s = str(v).strip()
+        if not s or s.lower().startswith("[n/a") or s.lower() == "n/a":
+            return None
+        return float(s) if "." in s else int(s)
+    except Exception:
+        return None
+
+
+def _nvidia_smi_gpus() -> list:
+    """Per-GPU stats via a single nvidia-smi CSV query, or ``[]`` on ANY failure
+    (no GPU, no driver, cloud-only box, command missing/timeout). Never raises.
+    Uses CREATE_NO_WINDOW on Windows (read via getattr so the CI Linux-sim, which
+    deletes that attribute, doesn't trip an AttributeError)."""
+    import subprocess
+    no_window = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                 if sys.platform == "win32" else 0)
+    try:
+        r = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=index,name,memory.used,memory.total,"
+             "utilization.gpu,temperature.gpu,power.draw",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=4.0,
+            creationflags=no_window,
+        )
+    except Exception:
+        return []
+    if r.returncode != 0:
+        return []
+    gpus: list = []
+    for line in (r.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 7:
+            continue
+        idx = _smi_num(parts[0])
+        gpus.append({
+            "index":        idx if idx is not None else 0,
+            "name":         parts[1],
+            "mem_used_mb":  _smi_num(parts[2]),
+            "mem_total_mb": _smi_num(parts[3]),
+            "util_pct":     _smi_num(parts[4]),
+            "temp_c":       _smi_num(parts[5]),
+            "power_w":      _smi_num(parts[6]),
+        })
+    return gpus
+
+
+def _disks_info() -> list:
+    """Free/total (GB) per mounted disk. Prefers psutil (every real partition);
+    falls back to shutil.disk_usage on the project's own drive when psutil is
+    absent (e.g. the Linux-CI sim, which BLOCKS psutil). Never raises."""
+    disks: list = []
+    try:
+        import psutil
+        for part in psutil.disk_partitions(all=False):
+            try:
+                u = psutil.disk_usage(part.mountpoint)
+            except Exception:
+                continue           # empty CD drive / permission → skip
+            disks.append({
+                "drive":    part.mountpoint,
+                "free_gb":  round(u.free / 1e9, 1),
+                "total_gb": round(u.total / 1e9, 1),
+            })
+        return disks
+    except Exception:
+        pass
+    # Degraded fallback: just the drive JARVIS lives on.
+    try:
+        import shutil
+        u = shutil.disk_usage(PROJECT_DIR)
+        drive = os.path.splitdrive(PROJECT_DIR)[0] or os.path.abspath(os.sep)
+        disks.append({"drive": drive or "/",
+                      "free_gb": round(u.free / 1e9, 1),
+                      "total_gb": round(u.total / 1e9, 1)})
+    except Exception:
+        pass
+    return disks
+
+
+def _system_info(hud_state_path: str, log_dir: str) -> dict:
+    """The /api/system payload: GPUs (nvidia-smi), CPU/RAM (psutil), disks, plus
+    version/uptime/routing reused from the status sources. EVERY field is always
+    present with a safe default (None / []) so the client can rely on the shape
+    even when a source is unavailable. Read-only; never raises."""
+    cpu_pct = ram_used = ram_total = None
+    try:
+        import psutil
+        cpu_pct = psutil.cpu_percent(interval=None)   # rolling avg between polls
+        vm = psutil.virtual_memory()
+        ram_used = round((vm.total - vm.available) / 1e9, 1)
+        ram_total = round(vm.total / 1e9, 1)
+    except Exception:
+        pass
+    return {
+        "gpus":         _nvidia_smi_gpus(),
+        "cpu_pct":      cpu_pct,
+        "ram_used_gb":  ram_used,
+        "ram_total_gb": ram_total,
+        "disks":        _disks_info(),
+        "version":      _read_version(),
+        "uptime":       _uptime_seconds(log_dir),
+        "routing":      _gpu_summary_routing(_gpu_summary()),
+    }
+
+
+def _norm_speak(cell: str) -> str:
+    """Normalise a speak-class table cell ('**VERBATIM**' / '*INFORMATIVE*' /
+    'neither') to a bare token: 'VERBATIM' | 'INFORMATIVE' | 'neither'."""
+    up = (cell or "").replace("*", "").strip().upper()
+    if up == "VERBATIM":
+        return "VERBATIM"
+    if up == "INFORMATIVE":
+        return "INFORMATIVE"
+    return "neither"
+
+
+def _parse_action_index(path: str) -> dict:
+    """Parse docs/ACTION_INDEX.md's 'Full index' table into
+    ``{"actions": [{"name", "spoken"}], "count": N}``. Aliases sharing a handler
+    (a comma-separated first cell) are EXPANDED so every dispatchable name is its
+    own sendable row. Unreadable/absent file → ``{"actions": [], "count": 0}``.
+    Never raises.
+
+    Row shape:  ``| `name1`, `name2` | `handler:line` | **VERBATIM** | ex? | tests |``
+    We keep only rows whose first cell wraps its name(s) in backticks — that skips
+    the header ('action(s)'), the ``|---|`` separator, and the Summary table
+    (prose first cell, no backticks)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except Exception:
+        return {"actions": [], "count": 0}
+    actions: list = []
+    seen: set = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if len(cells) < 3:
+            continue
+        name_cell = cells[0]
+        if "`" not in name_cell:
+            continue
+        spoken = _norm_speak(cells[2])
+        for nm in name_cell.split(","):
+            nm = nm.strip().strip("`").strip()
+            if nm and nm not in seen:
+                seen.add(nm)
+                actions.append({"name": nm, "spoken": spoken})
+    return {"actions": actions, "count": len(actions)}
+
+
+def _voices_info() -> dict:
+    """The /api/voices payload: enrolled voice-clone profiles (name/source and a
+    ``usable`` flag straight from the consent gate) plus the active profile, the
+    master switch, and the base TTS backend/voice — read live from core. Degrades
+    to empty/defaults on any import failure (bare CI). READ-ONLY: it lists profile
+    metadata only and never loads the cloning model."""
+    profiles: list = []
+    active = ""
+    enabled = False
+    tts_backend = ""
+    tts_voice = ""
+    try:
+        from core import voice_clone
+        for meta in voice_clone.list_profiles():
+            try:
+                usable = bool(voice_clone.profile_is_usable(meta))
+            except Exception:
+                usable = False
+            profiles.append({
+                "name":   meta.get("name", ""),
+                "source": meta.get("source", ""),
+                "usable": usable,
+            })
+    except Exception:
+        profiles = []
+    try:
+        from core import config as _config
+        active = getattr(_config, "VOICE_CLONE_PROFILE", "") or ""
+        enabled = bool(getattr(_config, "VOICE_CLONE_ENABLED", False))
+        tts_backend = getattr(_config, "TTS_BACKEND", "") or ""
+        tts_voice = getattr(_config, "TTS_VOICE", "") or ""
+    except Exception:
+        pass
+    return {
+        "profiles":    profiles,
+        "active":      active,
+        "enabled":     enabled,
+        "tts_backend": tts_backend,
+        "tts_voice":   tts_voice,
+    }
+
+
+def _read_json_list(path: str) -> list:
+    """Read a JSON file expected to hold a list; ``[]`` on any error. Cheap; no
+    deps; never raises."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _read_memory() -> dict:
+    """The /api/memory payload: long-term semantic FACTS + recent EPISODES with
+    counts. Deliberately READ-ONLY and CHEAP — we NEVER call the module's
+    ensure_loaded() (which would rebuild the BM25 index / run first-boot
+    migration) and never touch the embedder. Instead we read the already-loaded
+    in-memory facts when a live JARVIS has them (instant, zero side effect) and
+    otherwise read the JSON mirror + episode JSONL straight off disk. Degrades to
+    empty on any failure. Shape::
+
+        {"facts": [{text, source, tags, updated_at}],
+         "episodes": [{text, role, iso}],  # newest-first, capped
+         "counts": {"facts": N, "episodes": M}}
+    """
+    facts: list = []
+    episodes: list = []
+    try:
+        from core import long_term_memory as ltm
+    except Exception:
+        return {"facts": [], "episodes": [],
+                "counts": {"facts": 0, "episodes": 0}}
+    # FACTS — prefer the loaded in-memory dict (a live JARVIS has it), else the
+    # on-disk mirror. Both are pure reads; neither triggers a load/rebuild.
+    try:
+        raw_facts = None
+        if getattr(ltm, "_loaded", False):
+            lock = getattr(ltm, "_lock", None)
+            if lock is not None:
+                with lock:
+                    raw_facts = list(getattr(ltm, "_facts", {}).values())
+            else:
+                raw_facts = list(getattr(ltm, "_facts", {}).values())
+        if raw_facts is None:
+            raw_facts = _read_json_list(getattr(ltm, "_FACTS_JSON", ""))
+        for fentry in raw_facts:
+            if isinstance(fentry, dict) and str(fentry.get("text", "")).strip():
+                facts.append({
+                    "text":       str(fentry.get("text", "")),
+                    "source":     fentry.get("source", ""),
+                    "tags":       fentry.get("tags", []),
+                    "updated_at": fentry.get("updated_at"),
+                })
+    except Exception:
+        facts = []
+    # EPISODES — tail the JSONL log directly (read-only). Count all lines; keep
+    # only the most recent 50 (newest-first) for display so a long history stays a
+    # cheap payload.
+    ep_count = 0
+    try:
+        ep_path = getattr(ltm, "_EPISODE_LOG", "")
+        raw_lines: list = []
+        if ep_path and os.path.exists(ep_path):
+            with open(ep_path, encoding="utf-8", errors="replace") as f:
+                raw_lines = [ln for ln in f.read().splitlines() if ln.strip()]
+        ep_count = len(raw_lines)
+        for ln in reversed(raw_lines[-50:]):
+            try:
+                e = json.loads(ln)
+            except Exception:
+                continue
+            if isinstance(e, dict) and str(e.get("text", "")).strip():
+                episodes.append({
+                    "text": str(e.get("text", "")),
+                    "role": e.get("role", ""),
+                    "iso":  e.get("iso", ""),
+                })
+    except Exception:
+        episodes = []
+    return {
+        "facts":    facts,
+        "episodes": episodes,
+        "counts":   {"facts": len(facts), "episodes": ep_count},
+    }
+
+
 # ── the request handler ──────────────────────────────────────────────────────
 
 class _Handler(BaseHTTPRequestHandler):
@@ -771,34 +1099,42 @@ class _Handler(BaseHTTPRequestHandler):
         return hosts
 
     def _state_change_allowed(self) -> tuple:
-        """Guard for state-changing POSTs (/api/say, /api/settings) on the
-        token-FREE local bind. Blocks the two browser-driven attacks that the
-        token would otherwise have covered:
+        """Anti-DNS-rebinding + anti-CSRF guard, applied to EVERY request (GET and
+        POST). Blocks two browser-driven attacks:
 
-          * DNS rebinding — a page on evil.com rebinds it to 127.0.0.1 and POSTs
-            same-origin; caught because the Host header is ``evil.com``, not ours.
-          * Cross-site POST (CSRF) — a page on evil.com fetch()es our localhost
-            URL; caught because the Origin/Referer host is ``evil.com``.
+          * DNS rebinding — a page on evil.com rebinds it to 127.0.0.1; caught
+            because the Host header is ``evil.com``, not a host we answer to.
+          * Cross-site request (CSRF) — a page on evil.com fetch()es our URL;
+            caught because the Origin/Referer host is ``evil.com``.
+
+        On a LOCAL (loopback) bind the ONLY host we legitimately answer to is
+        loopback, so this is enforced regardless of any token. Crucially it does
+        NOT short-circuit when a token is set: on a local bind the dashboard page
+        is served token-free and bakes the token into its JS, so a rebinding page
+        could read the token and then present it — the token cannot be the
+        rebinding boundary here (2026-07-08 finding). It also now covers GET, so a
+        rebinding page can't read the token-baked page, the session log, or the
+        settings/system/memory snapshots.
+
+        On a NON-local (exposed) bind a token is mandatory + unforgeable (enforced
+        by _authorized) and the owner may legitimately reach the server by LAN IP /
+        hostname, which the loopback allowlist would reject — so there the token is
+        the boundary and we do not Host-restrict.
 
         Non-browser clients (curl, PowerShell, the driver) send no Origin and a
-        loopback Host, so they pass untouched. When a TOKEN is configured we skip
-        this entirely: the token is already an unforgeable boundary an attacker
-        can't satisfy, and the owner may legitimately reach an exposed bind by LAN
-        IP or hostname (which this allowlist would otherwise reject).
-
-        Returns ``(ok, reason)``."""
-        if self._token():
-            return True, ""                       # token IS the boundary
+        loopback Host, so they pass untouched. Returns ``(ok, reason)``."""
+        if not self.server.config.get("local_bind", True):  # type: ignore[attr-defined]
+            return True, ""                       # exposed bind: token is the boundary
         served = self._served_hosts()
         host = self._host_of(self.headers.get("Host", ""))
-        if host and host not in served:           # foreign Host → rebinding
+        if host and host not in served:           # foreign Host → DNS rebinding
             return False, "host"
         origin = self.headers.get("Origin", "")
         if origin:
             if self._host_of(origin) not in served:
                 return False, "origin"
         else:
-            # Some browsers omit Origin on same-origin POST; fall back to Referer.
+            # Some browsers omit Origin on same-origin GET/POST; fall back to Referer.
             ref = self.headers.get("Referer", "")
             if ref and self._host_of(ref) not in served:
                 return False, "referer"
@@ -833,6 +1169,20 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
+    def _send_bytes(self, data: bytes, content_type: str, code: int = 200) -> None:
+        """Send a raw binary body (e.g. the camera preview JPEG). Mirrors
+        _send_html/_send_json but for arbitrary bytes, with no-store caching so a
+        stale frame is never served from a browser cache."""
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except Exception:
+            pass
+
     def _unauthorized(self) -> None:
         self._send_json({"error": "unauthorized"}, code=401)
 
@@ -842,6 +1192,14 @@ class _Handler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/") or "/"
         query = urllib.parse.parse_qs(parsed.query)
         cfg = self.server.config  # type: ignore[attr-defined]
+
+        # Anti-rebinding/CSRF guard on GET too — a foreign Host on a local bind is
+        # a DNS-rebinding page that would otherwise read the token-baked dashboard,
+        # the session log, or the settings/system/memory snapshots. No-op for
+        # non-browser clients and on an exposed (token-protected) bind.
+        ok, why = self._state_change_allowed()
+        if not ok:
+            return self._forbidden(why)
 
         if path == "/":
             if not self._authorized(query, is_page=True):
@@ -871,6 +1229,71 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._unauthorized()
             return self._send_json(build_settings_schema())
 
+        # ── control-panel endpoints (System / Actions / Voice / Memory + the
+        #    camera preview image). Each is auth-gated exactly like /api/status,
+        #    read-only, and wraps its data source in try/except so a source
+        #    failure becomes a safe JSON error rather than a 500 traceback. ──
+        if path == "/api/system":
+            if not self._authorized(query, is_page=False):
+                return self._unauthorized()
+            try:
+                return self._send_json(
+                    _system_info(cfg["hud_state_path"], cfg["log_dir"]))
+            except Exception as e:
+                return self._send_json({"error": f"system read failed: {e}",
+                                        "gpus": [], "disks": []}, code=500)
+
+        if path == "/api/actions":
+            if not self._authorized(query, is_page=False):
+                return self._unauthorized()
+            try:
+                return self._send_json(
+                    _parse_action_index(cfg["action_index_path"]))
+            except Exception as e:
+                return self._send_json({"error": f"actions read failed: {e}",
+                                        "actions": [], "count": 0}, code=500)
+
+        if path == "/api/voices":
+            if not self._authorized(query, is_page=False):
+                return self._unauthorized()
+            try:
+                return self._send_json(_voices_info())
+            except Exception as e:
+                return self._send_json({"error": f"voices read failed: {e}",
+                                        "profiles": []}, code=500)
+
+        if path == "/api/memory":
+            if not self._authorized(query, is_page=False):
+                return self._unauthorized()
+            try:
+                return self._send_json(_read_memory())
+            except Exception as e:
+                return self._send_json({"error": f"memory read failed: {e}",
+                                        "facts": [], "episodes": [],
+                                        "counts": {"facts": 0, "episodes": 0}},
+                                       code=500)
+
+        if path == "/api/camera-preview":
+            if not self._authorized(query, is_page=False):
+                return self._unauthorized()
+            # Serve the live preview JPEG, or 404 when it's missing OR stale
+            # (older than ~5 s = camera off). No side effects; never raises.
+            try:
+                p = cfg.get("camera_preview_path", "")
+                if not p or not os.path.exists(p):
+                    return self._send_json({"error": "no preview"}, code=404)
+                try:
+                    age = time.time() - os.path.getmtime(p)
+                except Exception:
+                    age = 1e9
+                if age > _CAMERA_PREVIEW_STALE_S:
+                    return self._send_json({"error": "no preview"}, code=404)
+                with open(p, "rb") as f:
+                    data = f.read()
+                return self._send_bytes(data, "image/jpeg")
+            except Exception:
+                return self._send_json({"error": "no preview"}, code=404)
+
         return self._send_json({"error": "not found"}, code=404)
 
     # ── POST ─────────────────────────────────────────────────────────────────
@@ -896,14 +1319,11 @@ class _Handler(BaseHTTPRequestHandler):
         cfg = self.server.config  # type: ignore[attr-defined]
 
         # Both POST routes below change state (run a command / write config). On a
-        # token-free local bind, refuse a browser-driven cross-origin or rebound
-        # request BEFORE doing anything — closes the localhost-CSRF / DNS-rebinding
-        # hole the token would otherwise cover. No-op when a token is set or the
-        # caller isn't a browser. Applied to /api/say and /api/settings alike.
-        if path in ("/api/settings", "/api/say"):
-            ok, why = self._state_change_allowed()
-            if not ok:
-                return self._forbidden(why)
+        # local bind, refuse a browser-driven cross-origin or DNS-rebound request
+        # BEFORE doing anything. Applied unconditionally (any POST path).
+        ok, why = self._state_change_allowed()
+        if not ok:
+            return self._forbidden(why)
 
         # POST /api/settings — WRITE settings. A settings write is POWERFUL (it can
         # flip WEB_INTERFACE_BIND/TOKEN, enable ambient listening, etc.), so it is
@@ -927,12 +1347,17 @@ class _Handler(BaseHTTPRequestHandler):
         req_timeout = _REPLY_TIMEOUT_DEFAULT
         try:
             data = json.loads(raw.decode("utf-8")) if raw else {}
-            if isinstance(data, dict):
-                text = str(data.get("text", "")).strip()
-                if "timeout" in data:
-                    req_timeout = float(data["timeout"])
         except Exception:
-            text = ""
+            data = {}
+        if isinstance(data, dict):
+            text = str(data.get("text", "")).strip()
+            # Parse timeout SEPARATELY — a non-numeric timeout must fall back to the
+            # default, NEVER discard an otherwise-valid command (2026-07-08 finding).
+            if "timeout" in data:
+                try:
+                    req_timeout = float(data["timeout"])
+                except (TypeError, ValueError):
+                    req_timeout = _REPLY_TIMEOUT_DEFAULT
         if not text:
             return self._send_json({"error": "empty text"}, code=400)
 
@@ -1109,12 +1534,71 @@ def _dashboard_html(token: str) -> str:
   .srow .save {{ padding:7px 12px; font-size:12px; }}
   .srow .saved {{ color:#2ee6a6; font-size:12px; min-width:1em; }}
   #settingsNote {{ color:var(--muted); font-size:12px; margin:2px 2px 14px; }}
+  /* ── Control-panel tabs (System / Actions / Voice / Camera / Memory) ───────
+     All reuse the shared palette + the .view[hidden] show/hide mechanic. */
+  /* System: a responsive grid of GPU cards + a stat row. */
+  .cards {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr));
+            gap:12px; margin-bottom:14px; }}
+  .card {{ background:var(--panel); border:1px solid var(--edge);
+           border-radius:10px; padding:12px 14px; }}
+  .card h3 {{ font-size:13px; margin:0 0 8px; color:var(--cyan);
+             word-break:break-word; }}
+  .card .kv {{ display:flex; justify-content:space-between; gap:10px;
+              font-size:12.5px; padding:2px 0; color:#a9c7d1; }}
+  .card .kv b {{ color:var(--text); font-weight:normal; }}
+  /* A thin VRAM/usage bar: a filled inner track sized by percentage. */
+  .bar {{ height:8px; border-radius:6px; background:#04070c;
+          border:1px solid var(--edge); overflow:hidden; margin:6px 0 8px; }}
+  .bar > i {{ display:block; height:100%; background:linear-gradient(90deg,
+          var(--cyan-dim), var(--cyan)); }}
+  /* A shared search box for the Actions + Memory lists. */
+  .search {{ width:100%; background:#04070c; border:1px solid var(--edge);
+          color:var(--text); border-radius:8px; padding:10px 12px; font:inherit;
+          margin-bottom:10px; }}
+  .search:focus {{ outline:none; border-color:var(--cyan);
+          box-shadow:0 0 0 1px var(--cyan-dim); }}
+  /* A scrollable list panel (Actions / Memory facts / episodes). */
+  .listbox {{ background:#04070c; border:1px solid var(--edge); border-radius:8px;
+          max-height:56vh; overflow:auto; }}
+  .lrow {{ display:flex; align-items:center; gap:10px; padding:8px 12px;
+          border-top:1px solid #0c1a24; }}
+  .lrow:first-child {{ border-top:none; }}
+  .lrow .nm {{ flex:1; color:var(--text); word-break:break-word; cursor:pointer; }}
+  .lrow .nm:hover {{ color:var(--cyan); }}
+  .lrow .txt {{ flex:1; color:#a9c7d1; word-break:break-word; }}
+  /* A small speak-class chip on each action row. */
+  .schip {{ font-size:10.5px; letter-spacing:.06em; padding:2px 8px;
+          border-radius:999px; border:1px solid var(--edge); color:var(--muted);
+          white-space:nowrap; }}
+  .schip.verbatim {{ color:#2ee6a6; border-color:#12604a; }}
+  .schip.informative {{ color:var(--cyan); border-color:var(--cyan-dim); }}
+  .lrow .send {{ padding:5px 12px; font-size:12px; border-radius:999px;
+          background:transparent; color:var(--cyan); }}
+  .lrow .send:hover {{ background:var(--cyan); color:#04222b; }}
+  .count {{ color:var(--muted); font-size:12px; margin:2px 2px 10px; }}
+  /* Voice: a wrapping row of profile buttons + an info strip. */
+  .voicebtns {{ display:flex; flex-wrap:wrap; gap:8px; margin:10px 0; }}
+  .voicebtns button {{ padding:8px 14px; font-size:12.5px; border-radius:999px;
+          background:transparent; color:var(--cyan); }}
+  .voicebtns button:hover {{ background:var(--cyan); color:#04222b; }}
+  .voicebtns button.off {{ color:#f0a; border-color:#a05; }}
+  /* Camera: the preview image + an off placeholder. */
+  #camImg {{ max-width:100%; border:1px solid var(--edge); border-radius:10px;
+          background:#04070c; display:none; }}
+  #camOff {{ background:var(--panel); border:1px dashed var(--cyan-dim);
+          border-radius:10px; padding:40px 16px; text-align:center;
+          color:var(--muted); }}
 </style></head><body>
 <header><div class="reactor"></div><h1>J.A.R.V.I.S.</h1>
   <!-- View switcher: LIVE dashboard vs the full SETTINGS control panel. Only one
        view is shown at a time so the page stays one self-contained screen. -->
   <nav class="views">
     <button id="navLive" class="active" type="button">Live</button>
+    <button id="navSystem" type="button">System</button>
+    <button id="navActions" type="button">Actions</button>
+    <button id="navVoice" type="button">Voice</button>
+    <button id="navCamera" type="button">Camera</button>
+    <button id="navMemory" type="button">Memory</button>
     <button id="navSettings" type="button">Settings</button>
   </nav>
   <label class="toggle" style="margin-left:auto" title="Pause/resume live status + log polling">
@@ -1155,6 +1639,49 @@ def _dashboard_html(token: str) -> str:
     </div>
     <div id="settingsNote" class="muted">loading settings…</div>
     <div id="settingsGroups"></div>
+  </section>
+
+  <!-- ── SYSTEM VIEW (live hardware: GPUs / CPU / RAM / disks) ──────────────
+       Auto-refreshes on a ~2s interval while visible (see showView/systemTimer). -->
+  <section id="viewSystem" class="view" hidden>
+    <div id="sysMeta" class="count">loading system…</div>
+    <div class="cards" id="sysGpus"></div>
+    <div class="cards" id="sysHost"></div>
+  </section>
+
+  <!-- ── ACTIONS VIEW (the "access everything" tab) ────────────────────────
+       A search box filters the full ~500-action inventory; each row can be Sent
+       straight to /api/say, or its name clicked to drop into the Live command box. -->
+  <section id="viewActions" class="view" hidden>
+    <div id="actionsCount" class="count">loading actions…</div>
+    <input id="actionsSearch" class="search" type="text" autocomplete="off"
+           placeholder="Search actions… (name)">
+    <div id="actionsList" class="listbox"></div>
+  </section>
+
+  <!-- ── VOICE VIEW (active voice + one button per usable clone profile) ────
+       Read-then-command: each button POSTs a spoken phrase to /api/say (no new
+       write endpoint), so switching a voice goes through the same channel. -->
+  <section id="viewVoice" class="view" hidden>
+    <div id="voiceInfo" class="count">loading voices…</div>
+    <div id="voiceBtns" class="voicebtns"></div>
+  </section>
+
+  <!-- ── CAMERA VIEW (live preview frame, refreshed ~1s while visible) ──────
+       The img points at /api/camera-preview; on error (missing/stale = camera
+       off) the placeholder is shown instead. -->
+  <section id="viewCamera" class="view" hidden>
+    <div class="count">Live camera preview (updates while the camera is on).</div>
+    <img id="camImg" alt="camera preview">
+    <div id="camOff">camera off / no preview</div>
+  </section>
+
+  <!-- ── MEMORY VIEW (long-term facts + recent episodes, searchable) ───────── -->
+  <section id="viewMemory" class="view" hidden>
+    <div id="memCount" class="count">loading memory…</div>
+    <input id="memSearch" class="search" type="text" autocomplete="off"
+           placeholder="Search facts…">
+    <div id="memFacts" class="listbox"></div>
   </section>
 </div>
 <script>
@@ -1323,14 +1850,69 @@ const TAB_TITLES = {{ voice:'Voice / Audio', ai:'AI / Models',
 const WAKE_KEY = 'START_IN_STANDBY';
 let settingsLoaded = false;
 
+// Element refs for the five control-panel tabs.
+const navSystem  = document.getElementById('navSystem');
+const navActions = document.getElementById('navActions');
+const navVoice   = document.getElementById('navVoice');
+const navCamera  = document.getElementById('navCamera');
+const navMemory  = document.getElementById('navMemory');
+const viewSystem  = document.getElementById('viewSystem');
+const viewActions = document.getElementById('viewActions');
+const viewVoice   = document.getElementById('viewVoice');
+const viewCamera  = document.getElementById('viewCamera');
+const viewMemory  = document.getElementById('viewMemory');
+
+// One registry drives show/hide + nav-active for EVERY view. Settings keeps its
+// own settingsLoaded flag (the wake-word save resets it to force a reload), so it
+// is dispatched specially below; the other lazy tabs use per-tab loaded flags.
+// System + Camera additionally run a while-visible refresh timer (stopped on
+// leave) so their live data updates without touching the other tabs.
+const VIEWS = {{
+  live:     {{nav:navLive,     view:viewLive}},
+  system:   {{nav:navSystem,   view:viewSystem}},
+  actions:  {{nav:navActions,  view:viewActions}},
+  voice:    {{nav:navVoice,    view:viewVoice}},
+  camera:   {{nav:navCamera,   view:viewCamera}},
+  memory:   {{nav:navMemory,   view:viewMemory}},
+  settings: {{nav:navSettings, view:viewSettings}},
+}};
+let currentView = 'live';
+let systemTimer = null, cameraTimer = null;
+let actionsLoaded = false, voiceLoaded = false, memoryLoaded = false;
+
+function stopViewTimers() {{
+  if (systemTimer) {{ clearInterval(systemTimer); systemTimer = null; }}
+  if (cameraTimer) {{ clearInterval(cameraTimer); cameraTimer = null; }}
+}}
+
 function showView(which) {{
-  const live = (which === 'live');
-  viewLive.hidden = !live; viewSettings.hidden = live;
-  navLive.classList.toggle('active', live);
-  navSettings.classList.toggle('active', !live);
-  if (!live && !settingsLoaded) loadSettings();
+  if (!VIEWS[which]) which = 'live';
+  currentView = which;
+  Object.keys(VIEWS).forEach(k => {{
+    const on = (k === which);
+    VIEWS[k].view.hidden = !on;
+    VIEWS[k].nav.classList.toggle('active', on);
+  }});
+  stopViewTimers();
+  if (which === 'settings') {{ if (!settingsLoaded) loadSettings(); }}
+  else if (which === 'system') {{
+    loadSystem();
+    systemTimer = setInterval(() => {{ if (autoOn()) loadSystem(); }}, 2000);
+  }}
+  else if (which === 'actions') {{ if (!actionsLoaded) {{ loadActions(); actionsLoaded = true; }} }}
+  else if (which === 'voice')   {{ if (!voiceLoaded)   {{ loadVoices();  voiceLoaded  = true; }} }}
+  else if (which === 'memory')  {{ if (!memoryLoaded)  {{ loadMemory();  memoryLoaded = true; }} }}
+  else if (which === 'camera')  {{
+    refreshCamera();
+    cameraTimer = setInterval(() => {{ if (autoOn()) refreshCamera(); }}, 1000);
+  }}
 }}
 navLive.addEventListener('click', () => showView('live'));
+navSystem.addEventListener('click', () => showView('system'));
+navActions.addEventListener('click', () => showView('actions'));
+navVoice.addEventListener('click', () => showView('voice'));
+navCamera.addEventListener('click', () => showView('camera'));
+navMemory.addEventListener('click', () => showView('memory'));
 navSettings.addEventListener('click', () => showView('settings'));
 
 // Build ONE control for a schema item, returning {{el, read}} where read() yields
@@ -1457,6 +2039,202 @@ wakeSave.addEventListener('click', async () => {{
   settingsLoaded = false; loadSettings();
 }});
 
+// ── SYSTEM TAB ──────────────────────────────────────────────────────────────
+// Live hardware view: a card per GPU (VRAM bar + temp/util/power), a CPU/RAM
+// card, and a card per disk. Auto-refreshed ~2s while visible (showView).
+const sysMeta = document.getElementById('sysMeta');
+const sysGpus = document.getElementById('sysGpus');
+const sysHost = document.getElementById('sysHost');
+function pctOf(u, t) {{ return (u!=null && t) ? Math.max(0, Math.min(100, Math.round(100*u/t))) : 0; }}
+function kvRow(k, v) {{ const d=document.createElement('div'); d.className='kv';
+  d.innerHTML='<span></span><b></b>';
+  d.querySelector('span').textContent=k; d.querySelector('b').textContent=v; return d; }}
+function renderSystem(s) {{
+  sysMeta.textContent = 'version ' + (s.version||'?')
+    + (s.uptime!=null ? '  ·  up ' + fmtUptime(s.uptime) : '')
+    + (s.routing ? '  ·  ' + s.routing : '');
+  sysGpus.innerHTML='';
+  (s.gpus||[]).forEach(g => {{
+    const c=document.createElement('div'); c.className='card';
+    const p=pctOf(g.mem_used_mb, g.mem_total_mb);
+    const h=document.createElement('h3');
+    h.textContent='GPU ' + g.index + ' · ' + (g.name||''); c.appendChild(h);
+    const bar=document.createElement('div'); bar.className='bar';
+    const fill=document.createElement('i'); fill.style.width=p+'%'; bar.appendChild(fill);
+    c.appendChild(bar);
+    c.appendChild(kvRow('VRAM', (g.mem_used_mb!=null?g.mem_used_mb:'?') + ' / '
+      + (g.mem_total_mb!=null?g.mem_total_mb:'?') + ' MB (' + p + '%)'));
+    c.appendChild(kvRow('Util', g.util_pct!=null ? g.util_pct + '%' : 'n/a'));
+    c.appendChild(kvRow('Temp', g.temp_c!=null ? g.temp_c + '°C' : 'n/a'));
+    c.appendChild(kvRow('Power', g.power_w!=null ? g.power_w + ' W' : 'n/a'));
+    sysGpus.appendChild(c);
+  }});
+  if (!(s.gpus||[]).length) {{
+    const c=document.createElement('div'); c.className='card';
+    const h=document.createElement('h3'); h.textContent='GPU'; c.appendChild(h);
+    c.appendChild(kvRow('status', 'no nvidia-smi / no GPU')); sysGpus.appendChild(c);
+  }}
+  sysHost.innerHTML='';
+  const hc=document.createElement('div'); hc.className='card';
+  const hh=document.createElement('h3'); hh.textContent='CPU / Memory'; hc.appendChild(hh);
+  hc.appendChild(kvRow('CPU', s.cpu_pct!=null ? s.cpu_pct + '%' : 'n/a'));
+  hc.appendChild(kvRow('RAM', (s.ram_used_gb!=null && s.ram_total_gb!=null)
+    ? s.ram_used_gb + ' / ' + s.ram_total_gb + ' GB' : 'n/a'));
+  sysHost.appendChild(hc);
+  (s.disks||[]).forEach(dk => {{
+    const c=document.createElement('div'); c.className='card';
+    const h=document.createElement('h3'); h.textContent='Disk ' + (dk.drive||''); c.appendChild(h);
+    const used=(dk.total_gb!=null && dk.free_gb!=null) ? (dk.total_gb - dk.free_gb) : null;
+    const p=pctOf(used, dk.total_gb);
+    const bar=document.createElement('div'); bar.className='bar';
+    const fill=document.createElement('i'); fill.style.width=p+'%'; bar.appendChild(fill);
+    c.appendChild(bar);
+    c.appendChild(kvRow('free', (dk.free_gb!=null?dk.free_gb:'?') + ' / '
+      + (dk.total_gb!=null?dk.total_gb:'?') + ' GB'));
+    sysHost.appendChild(c);
+  }});
+}}
+async function loadSystem() {{
+  try {{
+    const r = await fetch(q('/api/system'), {{headers:hdr()}});
+    if (r.status===401) {{ sysMeta.textContent='unauthorized — token required'; return; }}
+    renderSystem(await r.json());
+  }} catch(e) {{ sysMeta.textContent='could not load system info'; }}
+}}
+
+// ── ACTIONS TAB ─────────────────────────────────────────────────────────────
+// The "access everything" list: search filters the full ~500-action inventory.
+// Each row's name → drops into the Live command box (edit before send); its Send
+// button POSTs the action name straight to /api/say via the shared sendCommand.
+const actionsCount = document.getElementById('actionsCount');
+const actionsSearch = document.getElementById('actionsSearch');
+const actionsList = document.getElementById('actionsList');
+let ALL_ACTIONS = [];
+function speakChipClass(sp) {{
+  const s=(sp||'').toUpperCase();
+  if (s==='VERBATIM') return 'schip verbatim';
+  if (s==='INFORMATIVE') return 'schip informative';
+  return 'schip';
+}}
+function renderActions(filter) {{
+  const f=(filter||'').trim().toLowerCase();
+  actionsList.innerHTML=''; let shown=0;
+  const frag=document.createDocumentFragment();
+  for (const a of ALL_ACTIONS) {{
+    if (f && a.name.toLowerCase().indexOf(f)===-1) continue;
+    if (shown>=400) break;   // cap the DOM; refine the search to see more
+    const row=document.createElement('div'); row.className='lrow';
+    const nm=document.createElement('div'); nm.className='nm'; nm.textContent=a.name;
+    nm.title='Click to edit in the Live command box';
+    nm.addEventListener('click', () => {{ textIn.value=a.name; showView('live'); textIn.focus(); }});
+    const chip=document.createElement('span'); chip.className=speakChipClass(a.spoken);
+    chip.textContent=a.spoken;
+    const send=document.createElement('button'); send.type='button';
+    send.className='send'; send.textContent='Send';
+    send.addEventListener('click', () => sendCommand(a.name, {{button:send}}));
+    row.appendChild(nm); row.appendChild(chip); row.appendChild(send);
+    frag.appendChild(row); shown++;
+  }}
+  actionsList.appendChild(frag);
+  actionsCount.textContent = ALL_ACTIONS.length + ' actions'
+    + (f ? '  ·  ' + shown + ' shown' : '');
+}}
+actionsSearch.addEventListener('input', () => renderActions(actionsSearch.value));
+async function loadActions() {{
+  try {{
+    const r = await fetch(q('/api/actions'), {{headers:hdr()}});
+    if (r.status===401) {{ actionsCount.textContent='unauthorized — token required'; return; }}
+    const d = await r.json();
+    ALL_ACTIONS = (d.actions||[]).slice().sort((a,b)=>a.name.localeCompare(b.name));
+    renderActions('');
+  }} catch(e) {{ actionsCount.textContent='could not load actions'; }}
+}}
+
+// ── VOICE TAB ───────────────────────────────────────────────────────────────
+// Read-then-command: shows the active voice + a button per USABLE clone profile
+// (POSTs "switch to the <name> voice") and a "normal voice" button (POSTs "voice
+// cloning off"), all through the same /api/say inject channel.
+const voiceInfo = document.getElementById('voiceInfo');
+const voiceBtns = document.getElementById('voiceBtns');
+function renderVoices(d) {{
+  const usable=(d.profiles||[]).filter(p=>p.usable);
+  const active = (d.enabled && d.active) ? d.active
+    : ('normal (' + (d.tts_voice||d.tts_backend||'default') + ')');
+  voiceInfo.textContent = 'Active voice: ' + active
+    + '  ·  backend ' + (d.tts_backend||'?')
+    + '  ·  ' + usable.length + ' usable profile(s)';
+  voiceBtns.innerHTML='';
+  usable.forEach(p => {{
+    const b=document.createElement('button'); b.type='button';
+    b.textContent='Use ' + p.name + (p.source? ' ('+p.source+')':'');
+    b.addEventListener('click', () => sendCommand('switch to the ' + p.name + ' voice', {{button:b}}));
+    voiceBtns.appendChild(b);
+  }});
+  if (!usable.length) {{
+    const note=document.createElement('span'); note.className='muted';
+    note.style.alignSelf='center'; note.textContent='No usable clone profiles enrolled.  ';
+    voiceBtns.appendChild(note);
+  }}
+  const off=document.createElement('button'); off.type='button'; off.className='off';
+  off.textContent='Normal voice (cloning off)';
+  off.addEventListener('click', () => sendCommand('voice cloning off', {{button:off}}));
+  voiceBtns.appendChild(off);
+}}
+async function loadVoices() {{
+  try {{
+    const r = await fetch(q('/api/voices'), {{headers:hdr()}});
+    if (r.status===401) {{ voiceInfo.textContent='unauthorized — token required'; return; }}
+    renderVoices(await r.json());
+  }} catch(e) {{ voiceInfo.textContent='could not load voices'; }}
+}}
+
+// ── CAMERA TAB ──────────────────────────────────────────────────────────────
+// The <img> points at /api/camera-preview (cache-busted each poll). On load it
+// shows; on error (404 = missing/stale = camera off) the placeholder shows.
+const camImg = document.getElementById('camImg');
+const camOff = document.getElementById('camOff');
+camImg.addEventListener('load',  () => {{ camImg.style.display='block'; camOff.style.display='none'; }});
+camImg.addEventListener('error', () => {{ camImg.style.display='none';  camOff.style.display='block'; }});
+function refreshCamera() {{ camImg.src = q('/api/camera-preview?t=' + Date.now()); }}
+
+// ── MEMORY TAB ──────────────────────────────────────────────────────────────
+// Fact + episode counts and a searchable, scrollable list of long-term facts.
+const memCount = document.getElementById('memCount');
+const memSearch = document.getElementById('memSearch');
+const memFacts = document.getElementById('memFacts');
+let ALL_FACTS = [];
+function renderFacts(filter) {{
+  const f=(filter||'').trim().toLowerCase();
+  memFacts.innerHTML=''; let shown=0;
+  const frag=document.createDocumentFragment();
+  for (const fact of ALL_FACTS) {{
+    if (f && (fact.text||'').toLowerCase().indexOf(f)===-1) continue;
+    if (shown>=400) break;
+    const row=document.createElement('div'); row.className='lrow';
+    const txt=document.createElement('div'); txt.className='txt'; txt.textContent=fact.text;
+    row.appendChild(txt);
+    if (fact.source) {{ const chip=document.createElement('span'); chip.className='schip';
+      chip.textContent=fact.source; row.appendChild(chip); }}
+    frag.appendChild(row); shown++;
+  }}
+  memFacts.appendChild(frag);
+  if (!ALL_FACTS.length) memFacts.innerHTML=
+    '<div class="lrow"><span class="muted">no facts stored</span></div>';
+}}
+memSearch.addEventListener('input', () => renderFacts(memSearch.value));
+async function loadMemory() {{
+  try {{
+    const r = await fetch(q('/api/memory'), {{headers:hdr()}});
+    if (r.status===401) {{ memCount.textContent='unauthorized — token required'; return; }}
+    const d = await r.json();
+    ALL_FACTS = d.facts||[];
+    const c = d.counts||{{}};
+    memCount.textContent = (c.facts!=null?c.facts:ALL_FACTS.length) + ' facts · '
+      + (c.episodes!=null?c.episodes:0) + ' episodes';
+    renderFacts('');
+  }} catch(e) {{ memCount.textContent='could not load memory'; }}
+}}
+
 refreshStatus(); refreshLog();
 setInterval(() => {{ if (autoOn()) refreshStatus(); }}, 1500);
 setInterval(() => {{ if (autoOn()) refreshLog(); }}, 1000);
@@ -1487,6 +2265,8 @@ def create_server(*, bind: str, port: int, token: str = "",
                   log_dir: str = DEFAULT_LOG_DIR,
                   hud_state_path: str = DEFAULT_HUD_STATE_PATH,
                   user_settings_path: str | None = None,
+                  camera_preview_path: str = DEFAULT_CAMERA_PREVIEW_PATH,
+                  action_index_path: str = DEFAULT_ACTION_INDEX_PATH,
                   reply_reader=None) -> ThreadingHTTPServer:
     """Build (but do not serve) a ThreadingHTTPServer for the web interface.
 
@@ -1545,6 +2325,11 @@ def create_server(*, bind: str, port: int, token: str = "",
         "log_dir": log_dir,
         "hud_state_path": hud_state_path,
         "user_settings_path": user_settings_path or _default_user_settings_path(),
+        # Full-control-panel sources: the live camera preview frame and the
+        # machine-generated action inventory. Injectable so a test points them at
+        # a temp path (mirroring inject_path/log_dir/hud_state_path).
+        "camera_preview_path": camera_preview_path or DEFAULT_CAMERA_PREVIEW_PATH,
+        "action_index_path": action_index_path or DEFAULT_ACTION_INDEX_PATH,
         "reply_reader": reply_reader,
     }
     return httpd

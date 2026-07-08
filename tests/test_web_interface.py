@@ -129,12 +129,19 @@ class _ServerBase(unittest.TestCase):
         # contract as inject_path/log_dir/hud_state_path). It doesn't exist yet;
         # _write_settings creates it on first write.
         self.user_settings_path = os.path.join(self.d, "user_settings.json")
+        # The control-panel sources are ALSO pointed at throwaway temp paths so a
+        # test can never read the real camera frame / action index and the 404
+        # camera-preview case is deterministic (the file simply doesn't exist).
+        self.camera_preview_path = os.path.join(self.d, ".hud_camera_preview.jpg")
+        self.action_index_path = os.path.join(self.d, "ACTION_INDEX.md")
         os.makedirs(self.log_dir, exist_ok=True)
         self.httpd = wi.create_server(
             bind="127.0.0.1", port=0, token=self.token,
             inject_path=self.inject_path, log_dir=self.log_dir,
             hud_state_path=self.hud_path,
             user_settings_path=self.user_settings_path,
+            camera_preview_path=self.camera_preview_path,
+            action_index_path=self.action_index_path,
             reply_reader=self.reply_reader,
         )
         self.host, self.port = self.httpd.server_address[:2]
@@ -411,14 +418,24 @@ class SettingsTokenTests(_ServerBase):
         with open(self.user_settings_path, encoding="utf-8") as f:
             self.assertIs(json.load(f)["WAKE_WORD_AUTOSTART"], True)
 
-    def test_cross_origin_allowed_when_token_valid(self):
-        # With a token configured, the token IS the boundary — a cross-origin
-        # Origin header does NOT block a request that carries the valid token (the
-        # owner may legitimately reach an exposed bind from another origin/app).
+    def test_cross_origin_refused_even_with_token_on_local_bind(self):
+        # 2026-07-08 security fix: on a LOCAL bind the token is NOT the boundary —
+        # it's served token-free in the dashboard page and baked into its JS, so a
+        # DNS-rebinding page could read it. Therefore a foreign Origin is refused
+        # even WITH a valid token; the loopback-Host allowlist is the real boundary
+        # on a local bind. (On an exposed bind, _authorized requires the token and
+        # the guard steps aside — covered by TokenAuthTests.)
+        code, _ = _post(self.base + "/api/settings",
+                        {"name": "WAKE_WORD_AUTOSTART", "value": True},
+                        headers={"X-Auth-Token": self.token,
+                                 "Origin": "http://some-app.example"})
+        self.assertEqual(code, 403)
+
+    def test_same_origin_with_token_still_ok(self):
+        # A same-origin request carrying the token still works (the real dashboard).
         code, data = _post(self.base + "/api/settings",
                            {"name": "WAKE_WORD_AUTOSTART", "value": True},
-                           headers={"X-Auth-Token": self.token,
-                                    "Origin": "http://some-app.example"})
+                           headers={"X-Auth-Token": self.token, "Origin": self.base})
         self.assertEqual(code, 200)
         self.assertTrue(data["ok"])
 
@@ -437,6 +454,28 @@ def _raw_post_status(host, port, path, body_obj, extra_headers=None):
         if k.lower() != "host":
             lines.append(f"{k}: {v}")
     raw = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8") + body
+    with socket.create_connection((host, port), timeout=5) as sock:
+        sock.sendall(raw)
+        buf = b""
+        while b"\r\n" not in buf:
+            chunk = sock.recv(256)
+            if not chunk:
+                break
+            buf += chunk
+    head = buf.split(b"\r\n", 1)[0].decode("latin-1").split()
+    return int(head[1]) if len(head) > 1 and head[1].isdigit() else 0
+
+
+def _raw_get_status(host, port, path, extra_headers=None):
+    """Send a raw HTTP/1.1 GET with an arbitrary Host header; return the status
+    code. Exercises the anti-rebinding Host check on GET routes deterministically."""
+    extra_headers = extra_headers or {}
+    host_hdr = extra_headers.get("Host", f"{host}:{port}")
+    lines = [f"GET {path} HTTP/1.1", f"Host: {host_hdr}", "Connection: close"]
+    for k, v in extra_headers.items():
+        if k.lower() != "host":
+            lines.append(f"{k}: {v}")
+    raw = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8")
     with socket.create_connection((host, port), timeout=5) as sock:
         sock.sendall(raw)
         buf = b""
@@ -501,6 +540,61 @@ class CrossOriginGuardTests(_ServerBase):
                                 {"name": "WAKE_WORD_AUTOSTART", "value": True},
                                 extra_headers={"Host": f"127.0.0.1:{self.port}"})
         self.assertEqual(code, 200)
+
+    # ── GET routes are host-guarded too (2026-07-08 fix for the read-leak) ──
+    def test_get_status_cross_origin_403(self):
+        # A rebinding page must not be able to READ /api/status (or the log /
+        # settings / system / memory snapshots) via a foreign Origin.
+        code, _ = _get_raw(self.base + "/api/status",
+                           headers={"Origin": "http://evil.example"})
+        self.assertEqual(code, 403)
+
+    def test_get_foreign_host_403_rebinding(self):
+        code = _raw_get_status(self.host, self.port, "/api/status",
+                               extra_headers={"Host": "evil.example"})
+        self.assertEqual(code, 403)
+
+    def test_get_loopback_host_ok(self):
+        code = _raw_get_status(self.host, self.port, "/api/status",
+                               extra_headers={"Host": f"127.0.0.1:{self.port}"})
+        self.assertEqual(code, 200)
+
+
+class WebSettingsSaveFixTests(_ServerBase):
+    """2026-07-08 fixes to the settings write path + /api/say body parsing."""
+
+    # Stub the reply-wait so /api/say returns immediately (no 30s log-tail).
+    reply_reader = staticmethod(
+        lambda text, log_dir, timeout: {"status": "ok", "lines": []})
+
+    def test_list_setting_saved_as_real_list_not_json_blob(self):
+        # The panel POSTs a list setting as a JSON-array STRING; it must round-trip
+        # to a real multi-element list, not a 1-element list holding the raw JSON.
+        val = ["1password", "bitwarden", "banking"]
+        code, data = _post(self.base + "/api/settings",
+                           {"name": "SCREENSHOT_PRIVACY_BLOCKLIST",
+                            "value": json.dumps(val)})
+        self.assertEqual(code, 200)
+        self.assertTrue(data["ok"])
+        with open(self.user_settings_path, encoding="utf-8") as f:
+            saved = json.load(f)["SCREENSHOT_PRIVACY_BLOCKLIST"]
+        self.assertEqual(saved, val)                 # NOT ['["1password",...]']
+
+    def test_routing_setting_saved_as_dict_not_reset(self):
+        code, data = _post(self.base + "/api/settings",
+                           {"name": "MODEL_ROUTING",
+                            "value": json.dumps({"chat": "local"})})
+        self.assertEqual(code, 200)
+        with open(self.user_settings_path, encoding="utf-8") as f:
+            saved = json.load(f)["MODEL_ROUTING"]
+        self.assertEqual(saved.get("chat"), "local")  # merged, not reset to default
+
+    def test_say_keeps_command_when_timeout_unparseable(self):
+        # A non-numeric timeout must NOT drop the valid command as 'empty text'.
+        code, data = _post(self.base + "/api/say",
+                           {"text": "hello there", "timeout": "soon"})
+        self.assertNotEqual(code, 400)               # command was NOT discarded
+        self.assertTrue(os.path.exists(self.inject_path))  # it was injected
 
 
 class HostOfHelperTests(unittest.TestCase):
@@ -845,6 +939,163 @@ class AirMouseStatusTests(unittest.TestCase):
             s = wi.build_status(os.path.join(d, "nope.json"),
                                 os.path.join(d, "logs"))
             self.assertNotIn("air_mouse", s)
+
+
+class ControlPanelEndpointTests(_ServerBase):
+    """The five new control-panel tabs + their GET endpoints (System / Actions /
+    Voice / Camera / Memory). Each is auth-gated like /api/status, read-only, and
+    returns a stable JSON shape (or the camera JPEG / 404) even when its live
+    source is absent in headless CI."""
+
+    def test_system_returns_expected_keys(self):
+        code, data = _get(self.base + "/api/system")
+        self.assertEqual(code, 200)
+        for key in ("gpus", "cpu_pct", "ram_used_gb", "ram_total_gb",
+                    "disks", "version", "uptime", "routing"):
+            self.assertIn(key, data)
+        self.assertIsInstance(data["gpus"], list)
+        self.assertIsInstance(data["disks"], list)
+
+    def test_actions_returns_expected_keys(self):
+        # No action index file in the temp dir → graceful empty inventory.
+        code, data = _get(self.base + "/api/actions")
+        self.assertEqual(code, 200)
+        self.assertIn("actions", data)
+        self.assertIn("count", data)
+        self.assertEqual(data["actions"], [])
+        self.assertEqual(data["count"], 0)
+
+    def test_actions_parses_index_table(self):
+        # Drop a small ACTION_INDEX.md fixture and prove the parser expands
+        # aliases + reads the speak class (VERBATIM / INFORMATIVE / neither).
+        with open(self.action_index_path, "w", encoding="utf-8") as f:
+            f.write(
+                "## Full index\n\n"
+                "| action(s) | handler | speak | ex? | tests |\n"
+                "|---|---|:--:|:--:|\n"
+                "| `get_time` | `core/actions.py:117` | *INFORMATIVE* | | 4 |\n"
+                "| `version_info`, `what_version` | `core/actions.py:1206` | **VERBATIM** | | 2 |\n"
+                "| `click` | `core/actions.py:1058` | neither | yes | 4 |\n"
+            )
+        code, data = _get(self.base + "/api/actions")
+        self.assertEqual(code, 200)
+        self.assertEqual(data["count"], 4)               # aliases expanded
+        by_name = {a["name"]: a["spoken"] for a in data["actions"]}
+        self.assertEqual(by_name["get_time"], "INFORMATIVE")
+        self.assertEqual(by_name["version_info"], "VERBATIM")
+        self.assertEqual(by_name["what_version"], "VERBATIM")
+        self.assertEqual(by_name["click"], "neither")
+
+    def test_voices_returns_expected_keys(self):
+        code, data = _get(self.base + "/api/voices")
+        self.assertEqual(code, 200)
+        for key in ("profiles", "active", "enabled", "tts_backend", "tts_voice"):
+            self.assertIn(key, data)
+        self.assertIsInstance(data["profiles"], list)
+
+    def test_memory_returns_expected_keys(self):
+        code, data = _get(self.base + "/api/memory")
+        self.assertEqual(code, 200)
+        for key in ("facts", "episodes", "counts"):
+            self.assertIn(key, data)
+        self.assertIsInstance(data["facts"], list)
+        self.assertIsInstance(data["episodes"], list)
+        self.assertIn("facts", data["counts"])
+        self.assertIn("episodes", data["counts"])
+
+    def test_camera_preview_404_when_missing(self):
+        # No preview file in the temp dir → 404 JSON, not a 500.
+        code, body = _get_raw(self.base + "/api/camera-preview")
+        self.assertEqual(code, 404)
+        self.assertIn("no preview", body)
+
+    def test_camera_preview_serves_fresh_jpeg(self):
+        # A freshly-written file is served as image/jpeg with its exact bytes.
+        with open(self.camera_preview_path, "wb") as f:
+            f.write(b"\xff\xd8\xff\xe0JPEGDATA")
+        req = urllib.request.Request(self.base + "/api/camera-preview")
+        with _urlopen_retry(req, timeout=5) as r:
+            self.assertEqual(r.status, 200)
+            self.assertEqual(r.headers.get("Content-Type"), "image/jpeg")
+            self.assertEqual(r.read(), b"\xff\xd8\xff\xe0JPEGDATA")
+
+    def test_camera_preview_404_when_stale(self):
+        # A file older than the stale window is treated as "camera off" → 404.
+        with open(self.camera_preview_path, "wb") as f:
+            f.write(b"old-frame")
+        old = time.time() - (wi._CAMERA_PREVIEW_STALE_S + 5)
+        os.utime(self.camera_preview_path, (old, old))
+        code, _ = _get_raw(self.base + "/api/camera-preview")
+        self.assertEqual(code, 404)
+
+    def test_dashboard_has_new_nav_ids(self):
+        # The five new nav buttons + their view sections + endpoint wiring.
+        code, body = _get_raw(self.base + "/")
+        self.assertEqual(code, 200)
+        for nid in ("navSystem", "navActions", "navVoice", "navCamera", "navMemory"):
+            self.assertIn('id="' + nid + '"', body)
+        for vid in ("viewSystem", "viewActions", "viewVoice", "viewCamera", "viewMemory"):
+            self.assertIn('id="' + vid + '"', body)
+        for ep in ("/api/system", "/api/actions", "/api/voices",
+                   "/api/camera-preview", "/api/memory"):
+            self.assertIn(ep, body)
+
+
+class ControlPanelTokenTests(_ServerBase):
+    """The new GET endpoints honour the token gate exactly like /api/status."""
+
+    token = "s3cr3t"
+
+    def test_new_endpoints_without_token_401(self):
+        for ep in ("/api/system", "/api/actions", "/api/voices",
+                   "/api/memory", "/api/camera-preview"):
+            code, _ = _get_raw(self.base + ep)
+            self.assertEqual(code, 401, ep)
+
+    def test_new_endpoints_with_token_ok(self):
+        h = {"X-Auth-Token": self.token}
+        for ep in ("/api/system", "/api/actions", "/api/voices", "/api/memory"):
+            code, _ = _get(self.base + ep, headers=h)
+            self.assertEqual(code, 200, ep)
+        # camera-preview: authorized but no file → 404 (NOT 401).
+        code, _ = _get_raw(self.base + "/api/camera-preview", headers=h)
+        self.assertEqual(code, 404)
+
+
+class ActionIndexParseTests(unittest.TestCase):
+    """Unit-level: _parse_action_index expands aliases + skips junk rows."""
+
+    def test_parse_and_alias_expansion(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "ACTION_INDEX.md")
+            with open(p, "w", encoding="utf-8") as f:
+                # Includes a Summary-style row (no backticks) that must be skipped.
+                f.write("| Total registered actions | 508 |\n"
+                        "| `a`, `b` | `h:1` | **VERBATIM** | | 1 |\n"
+                        "| `c` | `h:2` | neither | | 0 |\n")
+            out = wi._parse_action_index(p)
+            self.assertEqual(out["count"], 3)
+            self.assertEqual({a["name"] for a in out["actions"]}, {"a", "b", "c"})
+
+    def test_missing_file_is_empty(self):
+        out = wi._parse_action_index(os.path.join("nope", "ACTION_INDEX.md"))
+        self.assertEqual(out, {"actions": [], "count": 0})
+
+
+class SystemInfoHelperTests(unittest.TestCase):
+    """Unit-level: _system_info is always JSON-valid with the full key set even
+    when every hardware source is unavailable (the CI degrade path)."""
+
+    def test_shape_is_stable(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = wi._system_info(os.path.join(d, "nope.json"),
+                                os.path.join(d, "logs"))
+            json.dumps(s)                     # must be JSON-serialisable
+            for key in ("gpus", "cpu_pct", "ram_used_gb", "ram_total_gb",
+                        "disks", "version", "uptime", "routing"):
+                self.assertIn(key, s)
+            self.assertIsInstance(s["gpus"], list)
+            self.assertIsInstance(s["disks"], list)
 
 
 if __name__ == "__main__":
