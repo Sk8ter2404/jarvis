@@ -7300,7 +7300,8 @@ def _cuda_dll_remediation_note() -> str:
 
 def _resolve_whisper_device() -> str:
     """Honour WHISPER_DEVICE, falling back to CPU when CUDA isn't actually
-    available. Returns 'cuda' or 'cpu'. Prefers ctranslate2's CUDA check
+    available. Returns 'cuda', 'cuda:N' (a specific GPU index), or 'cpu'.
+    Prefers ctranslate2's CUDA check
     (faster-whisper backend) over torch.cuda because Py 3.14 + the cu124
     torch wheel doesn't ship yet — but faster-whisper / ctranslate2 has
     its own CUDA runtime and can see the 3090 just fine.
@@ -7312,8 +7313,10 @@ def _resolve_whisper_device() -> str:
     pref = (WHISPER_DEVICE or "auto").lower()
     if pref == "cpu":
         return "cpu"
-    if pref == "cuda":
-        return "cuda"
+    if pref == "cuda" or pref.startswith("cuda:"):
+        # "cuda" (default GPU) or "cuda:N" (pin STT to a specific GPU — e.g.
+        # "cuda:1" to run Whisper on a second card and keep the primary free).
+        return pref
     # auto — try ctranslate2 first (covers faster-whisper), then torch
     try:
         import ctranslate2 as _ct2
@@ -7438,31 +7441,43 @@ def _ensure_whisper():
     if _stt is not None:
         return
     _register_cuda_dll_dirs()
-    device = _resolve_whisper_device()
+    device = _resolve_whisper_device()          # 'cuda' | 'cuda:N' | 'cpu'
+    # Split into (base, index) for faster-whisper's device_index. 'cuda:1' pins
+    # STT to a specific GPU (e.g. a second card) so it never competes with the
+    # primary card's resident models. A bad/missing index degrades to GPU 0.
+    base_dev = "cuda" if device.startswith("cuda") else "cpu"
+    dev_index = 0
+    if base_dev == "cuda" and ":" in device:
+        try:
+            dev_index = int(device.split(":", 1)[1])
+        except (ValueError, IndexError):
+            dev_index = 0
     # Preflight already verified cublas64_12.dll is missing — short-circuit
     # straight to CPU so we don't waste 5-10s on the CUDA load attempt that
     # the existing inner try/except would have caught anyway.
-    if _force_whisper_cpu_int8 and device == "cuda":
+    if _force_whisper_cpu_int8 and base_dev == "cuda":
         print(f"  [whisper] preflight flagged cublas64_12.dll missing — "
               f"forcing CPU + int8 (skipping CUDA load attempt)")
-        device = "cpu"
-    model  = WHISPER_MODEL_CUDA if device == "cuda" else WHISPER_MODEL_CPU
+        base_dev, dev_index = "cpu", 0
+    model  = WHISPER_MODEL_CUDA if base_dev == "cuda" else WHISPER_MODEL_CPU
+    dev_label = f"{base_dev}:{dev_index}" if base_dev == "cuda" else base_dev
 
     # ── Engine 1: faster-whisper (preferred for GPU speed + Py 3.14 CUDA) ──
     try:
         from faster_whisper import WhisperModel as _FWM
-        compute_type = "float16" if device == "cuda" else "int8"
-        print(f"Loading faster-whisper '{model}' on {device} "
+        compute_type = "float16" if base_dev == "cuda" else "int8"
+        print(f"Loading faster-whisper '{model}' on {dev_label} "
               f"(compute_type={compute_type})…")
         try:
-            _stt = _FWM(model, device=device, compute_type=compute_type)
+            _stt = _FWM(model, device=base_dev, device_index=dev_index,
+                        compute_type=compute_type)
             _stt_engine = "faster_whisper"
-            _stt_device = device
+            _stt_device = dev_label
             _stt_model_name = model
-            print(f"faster-whisper '{model}' ready on {device}.\n")
+            print(f"faster-whisper '{model}' ready on {dev_label}.\n")
             return
         except Exception as e:
-            if device == "cuda":
+            if base_dev == "cuda":
                 if _is_cuda_dll_error(e):
                     note = _cuda_dll_remediation_note()
                     print(f"  [whisper] faster-whisper CUDA load failed (CUDA DLL "

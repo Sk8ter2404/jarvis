@@ -398,6 +398,12 @@ class ResolveWhisperDeviceTests(MonolithGlobalsTestCase):
         with mock.patch.object(self.bc, "WHISPER_DEVICE", "cuda"):
             self.assertEqual(self.bc._resolve_whisper_device(), "cuda")
 
+    def test_explicit_cuda_index_honoured_verbatim(self):
+        # 'cuda:1' pins STT to a specific GPU (e.g. a second card) and is passed
+        # through verbatim for _ensure_whisper to split into device_index.
+        with mock.patch.object(self.bc, "WHISPER_DEVICE", "cuda:1"):
+            self.assertEqual(self.bc._resolve_whisper_device(), "cuda:1")
+
     def test_none_defaults_to_auto_and_falls_back_cpu(self):
         # auto with both ctranslate2 + torch reporting no GPU → cpu.
         fake_ct2 = mock.Mock()
@@ -528,6 +534,25 @@ class EnsureWhisperTests(MonolithGlobalsTestCase):
         _, kwargs = fake_wm.call_args
         self.assertEqual(kwargs.get("device"), "cpu")
         self.assertEqual(self.bc._stt_device, "cpu")
+
+    def test_loads_faster_whisper_on_cuda_index(self):
+        # 'cuda:1' must load faster-whisper on GPU 1 (device='cuda',
+        # device_index=1, float16) and record the device label 'cuda:1'.
+        fake_wm = mock.Mock(return_value=object())
+        fake_fw_module = mock.Mock()
+        fake_fw_module.WhisperModel = fake_wm
+        with mock.patch.object(self.bc, "_register_cuda_dll_dirs"), \
+                mock.patch.object(self.bc, "_resolve_whisper_device",
+                                  return_value="cuda:1"), \
+                mock.patch.object(self.bc, "_force_whisper_cpu_int8", False), \
+                mock.patch.object(self.bc, "WHISPER_MODEL_CUDA", "large-v3-turbo"), \
+                mock.patch.dict(sys.modules, {"faster_whisper": fake_fw_module}):
+            self.bc._ensure_whisper()
+        _, kwargs = fake_wm.call_args
+        self.assertEqual(kwargs.get("device"), "cuda")
+        self.assertEqual(kwargs.get("device_index"), 1)
+        self.assertEqual(kwargs.get("compute_type"), "float16")
+        self.assertEqual(self.bc._stt_device, "cuda:1")
 
 
 # ===========================================================================

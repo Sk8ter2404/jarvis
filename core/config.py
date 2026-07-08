@@ -412,9 +412,11 @@ REQUIRE_WAKE_MODE = False
 
 # ─── Whisper STT (faster-whisper preferred, GPU when present) ──────────
 # `WHISPER_DEVICE = 'auto'` lets ctranslate2 + torch decide; 'cuda'
-# forces GPU; 'cpu' forces the legacy path. large-v3-turbo on the 3090
-# runs ~15× real-time at near-identical accuracy to large-v3.
-WHISPER_DEVICE      = "auto"            # "auto" | "cuda" | "cpu"
+# forces GPU 0; 'cuda:N' pins STT to a specific GPU (e.g. 'cuda:1' to run
+# Whisper on a second card and keep the primary free for the LLM/voice);
+# 'cpu' forces the legacy path. large-v3-turbo on the 3090 runs ~15× real-time
+# at near-identical accuracy to large-v3.
+WHISPER_DEVICE      = "auto"            # "auto" | "cuda" | "cuda:N" | "cpu"
 WHISPER_MODEL_CUDA  = "large-v3-turbo"  # ~3.1 GB VRAM, 8x faster than large-v3
 WHISPER_MODEL_CPU   = "small"           # CPU-friendly default when no GPU
 
