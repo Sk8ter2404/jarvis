@@ -818,8 +818,16 @@ def smart_home_control(utterance: str = "") -> str:
             return (f"I don't see anything in the catalog matching "
                     f"'{descriptor}', sir.")
         name = devices[0].get("name") or descriptor or "that device"
-        return (f"I found {name}, sir, but I can't read its live state from "
-                f"here yet — I can turn it on or off if you'd like.")
+        # Phrasing deliberately AVOIDS the failure-marker substrings in
+        # core/failure_markers.FAILURE_MARKERS ("can't"/"couldn't"/…). This is a
+        # SUCCESS reply (an honest status answer), but it is spoken via the
+        # verbatim path and classified by _is_failure/_is_failure_result on
+        # those substrings; "can't read its live state" used to match "can't",
+        # so the honest answer was suppressed AND misclassified as a failed
+        # action (extra LLM round-trip). "I'm not able to" says the same thing
+        # with no marker. 2026-07-08.
+        return (f"I found {name}, sir, but I'm not able to read its live state "
+                f"from here yet — I can turn it on or off if you'd like.")
 
     if not action.get("verb"):
         return f"I couldn't parse that as a smart-home command, sir: '{utterance}'"

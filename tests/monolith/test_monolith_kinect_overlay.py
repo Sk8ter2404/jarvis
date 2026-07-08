@@ -154,6 +154,33 @@ class ComposeKinectPreviewTests(MonolithGlobalsTestCase):
         self.assertIsNotNone(out)
         self.assertEqual(out.shape, color.shape)
 
+    def test_last_color_cache_is_pristine_not_skeleton_polluted(self):
+        # 2026-07-08 fix: _kinect_preview_last_color must cache a PRISTINE copy of
+        # the color frame taken BEFORE the in-place skeleton/badge overlays, so a
+        # later color-miss re-serve doesn't show a baked-in (ghosted) skeleton.
+        np = _np()
+        color = np.full((1080, 1920, 3), 200, dtype=np.uint8)  # bright → good-color path
+
+        def _draw(frame, bodies):
+            frame[0, 0] = (255, 0, 0)     # simulate an in-place skeleton stroke
+            return 1
+        with mock.patch.object(self.bc._kinect_bridge, "get_color_bgr",
+                               return_value=color), \
+                mock.patch.object(self.bc._kinect_bridge, "get_bodies",
+                                  return_value=[{"joints": {}}]), \
+                mock.patch.object(self.bc, "_draw_skeleton_on_color",
+                                  side_effect=_draw), \
+                mock.patch.object(self.bc, "_read_side_tile_webcams",
+                                  return_value={}):
+            out = self.bc._compose_kinect_preview(now=10.0)
+        self.assertIsNotNone(out)
+        cached = self.bc._kinect_preview_last_color[0]
+        self.assertIsNotNone(cached)
+        # A SEPARATE object with NO skeleton baked in (pixel [0,0] stays 200),
+        # not an alias of the base that the overlays mutated.
+        self.assertEqual(tuple(int(v) for v in cached[0, 0]), (200, 200, 200))
+        self.assertIsNot(cached, out)
+
     def test_does_not_read_kinect_cache_for_tiles(self):
         # The compose path must NOT pull side tiles from _camera_latest_frame
         # (the Kinect frame on the owner's rig). Seed a GARISH all-255 frame in

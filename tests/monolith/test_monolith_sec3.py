@@ -2128,12 +2128,15 @@ class EnsureWhisperFallbackTests(MonolithGlobalsTestCase):
 
     def test_cuda_dll_failure_retries_on_cpu(self):
         # First WhisperModel(... device="cuda") raises a CUDA-DLL error; the
-        # loader must retry with device="cpu"/int8 and succeed.
+        # loader must retry with device="cpu"/int8 AND downgrade the model to
+        # WHISPER_MODEL_CPU (not keep the heavy CUDA model on CPU int8, which
+        # runs at a fraction of realtime). 2026-07-08 fix. (The fake accepts
+        # device_index= to match the real _FWM signature added in v2.0.20.)
         good = object()
         calls = []
 
-        def _wm(model, device=None, compute_type=None):
-            calls.append((device, compute_type))
+        def _wm(model, device=None, device_index=0, compute_type=None):
+            calls.append((model, device, compute_type))
             if device == "cuda":
                 raise RuntimeError("Library cublas64_12.dll is not found")
             return good
@@ -2144,13 +2147,17 @@ class EnsureWhisperFallbackTests(MonolithGlobalsTestCase):
                                   return_value="cuda"), \
                 mock.patch.object(self.bc, "_force_whisper_cpu_int8", False), \
                 mock.patch.object(self.bc, "WHISPER_MODEL_CUDA", "large-v3"), \
+                mock.patch.object(self.bc, "WHISPER_MODEL_CPU", "small"), \
                 mock.patch.dict(sys.modules, {"faster_whisper": fake_fw}):
             self.bc._ensure_whisper()
         self.assertIs(self.bc._stt, good)
         self.assertEqual(self.bc._stt_device, "cpu")
-        # retried on cpu after the cuda attempt
-        self.assertIn(("cuda", "float16"), calls)
-        self.assertIn(("cpu", "int8"), calls)
+        # retried on cpu after the cuda attempt, with the DOWNGRADED small model
+        self.assertIn(("large-v3", "cuda", "float16"), calls)
+        self.assertIn(("small", "cpu", "int8"), calls)
+        # the heavy CUDA model must NOT be loaded on CPU
+        self.assertNotIn(("large-v3", "cpu", "int8"), calls)
+        self.assertEqual(self.bc._stt_model_name, "small")
 
     def test_openai_whisper_used_when_faster_absent(self):
         # faster_whisper import fails → fall through to openai-whisper.
@@ -4120,16 +4127,21 @@ class GetMicBufferPathBTests(MonolithGlobalsTestCase):
         self.assertEqual(out.dtype, np.float32)
         scs.assert_called_once()
 
-    def test_path_b_holds_mic_ownership_then_restores(self):
-        # 2026-07-07 bug-hunt (MED): Path B must publish _record_speech_active
-        # True (+ sr = target) BEFORE opening the stream so a concurrent
-        # _refresh_devices can't sd._terminate()/_initialize() PortAudio out from
-        # under it (heap corruption), and RESTORE the prior values afterward.
+    def test_path_b_publishes_own_flag_not_record_speech(self):
+        # 2026-07-08 race fix (HIGH): Path B must publish its OWN _pathb_mic_active
+        # flag (so a concurrent _refresh_devices defers its destructive PortAudio
+        # reinit) WITHOUT touching _record_speech_active / _record_speech_sr. The
+        # old save+restore of those cells is what clobbered a concurrently-set
+        # record_speech ownership True → the ~70s WASAPI stall + 0xc0000374 window.
         self.bc._record_speech_active[0] = False
+        self._saved_pathb = list(self.bc._pathb_mic_active)
         self._saved_sr = list(self.bc._record_speech_sr)
+        self.addCleanup(lambda: self.bc._pathb_mic_active.__setitem__(
+            slice(None), self._saved_pathb))
         self.addCleanup(lambda: self.bc._record_speech_sr.__setitem__(
             slice(None), self._saved_sr))
-        self.bc._record_speech_sr[0] = 44100     # a prior value that must return
+        self.bc._pathb_mic_active[0] = False
+        self.bc._record_speech_sr[0] = 44100     # record_speech's sr — untouched
         seen = {}
 
         class _FakeStream:
@@ -4137,10 +4149,10 @@ class GetMicBufferPathBTests(MonolithGlobalsTestCase):
                 _s._cb = k["callback"]
 
             def start(_s):
-                # Sampled WHILE the stream is live → ownership must read True and
-                # the published sr must reflect THIS stream, not the old 44100.
-                seen["active"] = self.bc._record_speech_active[0]
-                seen["sr"] = self.bc._record_speech_sr[0]
+                # Sampled WHILE the Path-B stream is live.
+                seen["pathb"] = self.bc._pathb_mic_active[0]
+                seen["rec_active"] = self.bc._record_speech_active[0]
+                seen["rec_sr"] = self.bc._record_speech_sr[0]
                 _s._cb(np.ones(16000, dtype=np.float32).reshape(-1, 1),
                        16000, None, None)
 
@@ -4154,10 +4166,47 @@ class GetMicBufferPathBTests(MonolithGlobalsTestCase):
                 mock.patch.object(self.bc.time, "sleep"):
             out = self.bc.get_mic_buffer(0.5, sample_rate=16000)
         self.assertIsNotNone(out)
-        self.assertTrue(seen["active"])          # ownership held during capture
-        self.assertEqual(seen["sr"], 16000)      # sr reflects the live stream
-        self.assertFalse(self.bc._record_speech_active[0])  # restored
-        self.assertEqual(self.bc._record_speech_sr[0], 44100)  # restored
+        self.assertTrue(seen["pathb"])            # Path B's own flag held live
+        self.assertFalse(seen["rec_active"])      # record_speech flag NOT set by Path B
+        self.assertEqual(seen["rec_sr"], 44100)   # record_speech sr NOT overwritten
+        self.assertFalse(self.bc._pathb_mic_active[0])       # released afterward
+        self.assertFalse(self.bc._record_speech_active[0])   # still untouched
+        self.assertEqual(self.bc._record_speech_sr[0], 44100)  # still untouched
+
+    def test_path_b_does_not_clobber_concurrent_record_speech(self):
+        # 2026-07-08 race fix (HIGH): if record_speech begins (sets
+        # _record_speech_active True) DURING a Path-B capture, Path B's teardown
+        # must NOT stomp that flag back to False — the old save+restore did,
+        # re-opening the ~70s WASAPI stall + 0xc0000374 reinit-under-live-callback
+        # window the flag exists to close.
+        self.bc._record_speech_active[0] = False
+        self._saved_pathb = list(self.bc._pathb_mic_active)
+        self.addCleanup(lambda: self.bc._pathb_mic_active.__setitem__(
+            slice(None), self._saved_pathb))
+        self.bc._pathb_mic_active[0] = False
+
+        class _FakeStream:
+            def __init__(_s, *a, **k):
+                _s._cb = k["callback"]
+
+            def start(_s):
+                # record_speech starts mid-capture and claims the mic.
+                self.bc._record_speech_active[0] = True
+                _s._cb(np.ones(16000, dtype=np.float32).reshape(-1, 1),
+                       16000, None, None)
+
+        fake_sd = mock.Mock()
+        fake_sd.InputStream.side_effect = _FakeStream
+        with mock.patch.object(self.bc, "_mic_input_disabled",
+                               return_value=False), \
+                mock.patch.object(self.bc, "sd", fake_sd), \
+                mock.patch.object(self.bc, "get_input_device", return_value=3), \
+                mock.patch.object(self.bc, "_safe_close_stream"), \
+                mock.patch.object(self.bc.time, "sleep"):
+            out = self.bc.get_mic_buffer(0.5, sample_rate=16000)
+        self.assertIsNotNone(out)
+        # record_speech's genuine ownership survives Path B's teardown.
+        self.assertTrue(self.bc._record_speech_active[0])
 
     def test_path_b_no_frames_returns_none(self):
         # 4898-4899: stream starts but never delivers → deadline → None.
@@ -4534,20 +4583,29 @@ class EnsureWhisperRaiseArmTests(MonolithGlobalsTestCase):
         (self.bc._stt, self.bc._stt_device,
          self.bc._stt_model_name, self.bc._stt_engine) = self._saved
 
-    def test_faster_whisper_cpu_load_failure_propagates(self):
-        # device resolves to cpu; the faster-whisper load raises → 5132 `raise`
-        # (no CPU retry since we're already on CPU). The outer caller sees it.
+    def test_faster_whisper_cpu_load_failure_falls_through_to_openai(self):
+        # 2026-07-08 fix: a faster-whisper model-LOAD failure (non-ImportError)
+        # must NOT propagate out of _ensure_whisper and abort boot — it should
+        # fall through to the openai-whisper engine (a cached / alternately-
+        # installed model can still bring STT up), mirroring the not-installed
+        # fall-through. Previously the outer handler caught ONLY ImportError, so
+        # this RuntimeError escaped and killed boot without trying Engine 2.
         fake_fw = mock.Mock()
         fake_fw.WhisperModel = mock.Mock(side_effect=RuntimeError("cpu load boom"))
+        good = object()
+        fake_whisper = mock.Mock()
+        fake_whisper.load_model.return_value = good
         with mock.patch.object(self.bc, "_register_cuda_dll_dirs"), \
                 mock.patch.object(self.bc, "_resolve_whisper_device",
                                   return_value="cpu"), \
                 mock.patch.object(self.bc, "_force_whisper_cpu_int8", False), \
                 mock.patch.object(self.bc, "WHISPER_MODEL_CPU", "base"), \
-                mock.patch.dict(sys.modules, {"faster_whisper": fake_fw}):
-            with self.assertRaises(RuntimeError):
-                self.bc._ensure_whisper()
-        self.assertIsNone(self.bc._stt)
+                mock.patch.dict(sys.modules, {"faster_whisper": fake_fw,
+                                              "whisper": fake_whisper}):
+            self.bc._ensure_whisper()
+        self.assertIs(self.bc._stt, good)
+        self.assertEqual(self.bc._stt_engine, "openai_whisper")
+        fake_whisper.load_model.assert_called_with("base", device="cpu")
 
     def test_openai_whisper_cpu_load_failure_propagates(self):
         # faster-whisper absent → openai path; cpu load_model raises → 5155.
@@ -5445,6 +5503,106 @@ class SacBlockedLocalRecentlyTests(MonolithGlobalsTestCase):
         self.assertTrue(first)
         self.assertTrue(second)            # cached result reused
         fake_sp.run.assert_called_once()   # NOT re-forked within the TTL window
+
+
+@requires_monolith
+class ScanBatch20260708Tests(MonolithGlobalsTestCase):
+    """2026-07-08 bug-hunt fixes: history-trim user-first invariant, focus-mode
+    proactive suppression, the streaming barge-in guard, and the camera-probe
+    primary-survivor promotion."""
+
+    def test_trim_leaves_user_first_after_consecutive_assistant_run(self):
+        # A follow-up loop appends assistant-only turns → consecutive-assistant
+        # runs. When one lands at the front, the pop-in-pairs trim could leave a
+        # LEADING 'assistant' message (Claude 400 "first message must use the
+        # user role"). The trim now normalises to a user-first history.
+        bc = self.bc
+        bc.conversation_history[:] = [
+            {"role": "assistant", "content": "orphan followup"},
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "content": "a2"},
+        ]
+        bc._trim_conversation_history(max_history=100)   # no pair-pop; just normalise
+        self.assertTrue(bc.conversation_history)
+        self.assertEqual(bc.conversation_history[0]["role"], "user")
+        self.assertEqual(bc.conversation_history[0]["content"], "u2")
+
+    def test_focus_mode_suppresses_spontaneous_proactive(self):
+        # should_be_proactive() → _do_proactive_turn() → _speak() bypasses
+        # proactive_announce's focus gate, so a focus block was interrupted by
+        # unprompted observations. should_be_proactive now consults focus.
+        bc = self.bc
+        bc._focus_until[0] = 1e12          # far-future expiry → block is engaged
+        with mock.patch.object(bc, "PROACTIVE_ENABLED", True), \
+                mock.patch.object(bc, "PROACTIVE_REQUIRE_FACE", False), \
+                mock.patch.object(bc, "_voice_mood_response", None), \
+                mock.patch.object(bc, "last_speech_time", 0.0), \
+                mock.patch("random.random", return_value=0.0):
+            # Same otherwise-firing conditions: without focus it CAN fire...
+            bc._focus_mode[0] = False
+            self.assertTrue(bc.should_be_proactive())
+            # ...but a focus / do-not-disturb block suppresses it.
+            bc._focus_mode[0] = True
+            self.assertFalse(bc.should_be_proactive())
+
+    def test_streaming_barge_in_skips_next_early_sentence(self):
+        # The chained flush thread's barge-in guard must actually fire. It now
+        # compares a monotonic accepted-barge counter to a snapshot taken at
+        # reply start (the _tts_interrupt Event was always cleared before the
+        # guard ran → dead code). Sentence 1's speak_fn simulates an accepted
+        # barge-in; sentence 2's thread must then skip.
+        bc = self.bc
+        spoken = []
+
+        def _speak_fn(s):
+            spoken.append(s)
+            if len(spoken) == 1:
+                bc._tts_interrupt_seq[0] += 1   # a barge-in accepted mid-sentence-1
+        buf = bc._SentenceFlushBuffer(speak_fn=_speak_fn)
+        buf.feed("First sentence here. Second sentence here. ")
+        buf.join()
+        self.assertEqual(spoken, ["First sentence here."])
+        # The skipped sentence is NOT recorded as spoken → it isn't stripped from
+        # the downstream tail and silently dropped.
+        self.assertEqual(buf.spoken_prefix, "First sentence here. ")
+
+    def test_probe_promotes_survivor_to_primary(self):
+        # probe_cameras_and_update_config rebuilt CAMERAS to only probe-surviving
+        # indices with no primary-survivor promotion — a config with zero primary
+        # left the HUD tile dark + no precise tracking. It now promotes a survivor.
+        bc = self.bc
+        bc.CAMERAS[:] = [{"index": 1, "primary": True, "label": "Left"},
+                         {"index": 0, "primary": False, "label": "Right"}]
+
+        def _probe(idx, timeout_sec=None):
+            return idx == 0       # configured primary (idx1) fails; idx0 survives
+        with mock.patch.object(bc, "CAMERA_PROBE_ENABLED", True), \
+                mock.patch.object(bc, "_probe_camera_index", side_effect=_probe):
+            bc.probe_cameras_and_update_config()
+        self.assertEqual([c["index"] for c in bc.CAMERAS], [0])
+        self.assertTrue(any(c.get("primary") for c in bc.CAMERAS),
+                        "a survivor must be promoted to primary")
+
+    def test_camera_name_resolution_rescue(self):
+        # A configured camera whose STATIC index fails to probe but whose NAME
+        # resolves to a different, openable LIVE index (USB shuffle) must be
+        # rescued (kept), mirroring _open_capture's name-resolution — not dropped
+        # by the static-index-only boot probe.
+        bc = self.bc
+        cam = {"index": 1, "name": "fullhan webcam", "primary": True}
+        with mock.patch.object(bc, "KINECT_AS_CAMERA", False), \
+                mock.patch.object(bc, "_dshow_name_to_index", return_value=2), \
+                mock.patch.object(bc, "_probe_camera_index", return_value=True):
+            self.assertTrue(bc._camera_rescued_by_name(cam, 1))
+        # No 'name' field → no rescue (nothing to resolve).
+        with mock.patch.object(bc, "_dshow_name_to_index", return_value=2), \
+                mock.patch.object(bc, "_probe_camera_index", return_value=True):
+            self.assertFalse(bc._camera_rescued_by_name({"index": 1}, 1))
+        # Name resolves back to the SAME already-failed index → no rescue.
+        with mock.patch.object(bc, "KINECT_AS_CAMERA", False), \
+                mock.patch.object(bc, "_dshow_name_to_index", return_value=1), \
+                mock.patch.object(bc, "_probe_camera_index", return_value=True):
+            self.assertFalse(bc._camera_rescued_by_name(cam, 1))
 
 
 if __name__ == "__main__":

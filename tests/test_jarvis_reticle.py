@@ -233,8 +233,25 @@ class StaleStateExitTests(unittest.TestCase):
         ov._last_state_mtime = last_mtime
         return ov
 
-    def test_exits_when_state_file_stale(self):
+    def test_live_parent_does_not_exit_on_stale_state(self):
+        # 2026-07-08 fix: a live REAL parent must NOT self-exit just because
+        # hud_reticles.json went stale. A healthy JARVIS only rewrites that file
+        # on a UI-automation action, so a voice-only / idle stretch >
+        # STATE_STALE_EXIT_S is normal, not a crash — and nothing re-spawns a
+        # self-exited overlay, so click/type reticles would silently stop for the
+        # rest of the session. Trust the parent-liveness check for a real parent.
         ov = self._ov(last_mtime=1000.0)
+        now = 1000.0 + self.mod.STATE_STALE_EXIT_S + 5.0
+        with mock.patch.object(self.mod, "_is_parent_alive", lambda *a: True), \
+             mock.patch.object(self.mod, "_state_file_mtime", lambda: 1000.0):
+            self.assertFalse(ov._should_exit(now))
+
+    def test_orphan_exits_when_state_file_stale(self):
+        # An ORPHAN (no real parent to trust) still exits on a stale state file.
+        # started_at within ORPHAN_MAX_LIFETIME_S of now so the orphan-cap path
+        # doesn't pre-empt — this asserts the stale path specifically. 2026-07-08.
+        ov = self._ov(parent_pid=0, last_mtime=1000.0)
+        ov._started_at = 1000.0
         now = 1000.0 + self.mod.STATE_STALE_EXIT_S + 5.0
         with mock.patch.object(self.mod, "_is_parent_alive", lambda *a: True), \
              mock.patch.object(self.mod, "_state_file_mtime", lambda: 1000.0):

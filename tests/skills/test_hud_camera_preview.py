@@ -232,11 +232,13 @@ class UnifiedHudCameraTickTests(unittest.TestCase):
         if mtime is not None:
             os.utime(self.preview, (mtime, mtime))
 
-    def _new_state(self):
-        """A minimal stand-in for the widget: just the two attributes the method
-        reads/writes."""
+    def _new_state(self, visible=True):
+        """A minimal stand-in for the widget: the two attributes the method
+        reads/writes, plus isVisible() (the 2026-07-08 fix short-circuits the
+        decode while the HUD is hidden)."""
         import types
-        return types.SimpleNamespace(cam_preview=None, _cam_preview_mtime=0.0)
+        return types.SimpleNamespace(cam_preview=None, _cam_preview_mtime=0.0,
+                                     isVisible=lambda: visible)
 
     def _refresh(self, state):
         """Call _refresh_camera_preview as an unbound method on the stand-in."""
@@ -274,6 +276,21 @@ class UnifiedHudCameraTickTests(unittest.TestCase):
             self.assertTrue(self._refresh(st), "first fresh frame → changed")
         self.assertIsNotNone(st.cam_preview)
         self.assertEqual(st._cam_preview_mtime, now)
+
+    def test_hidden_hud_skips_decode_entirely(self):
+        # 2026-07-08 fix: while the HUD is hidden, _refresh_camera_preview must
+        # skip the JPEG decode entirely — the preview writer keeps producing
+        # frames based on camera state (not HUD visibility), so a hidden HUD was
+        # decoding each new ~6-7fps frame only to discard it (repaint was already
+        # visibility-gated). A fresh frame on disk must NOT be decoded when hidden.
+        now = time.time()
+        self._write_preview(valid=True, mtime=now)
+        st = self._new_state(visible=False)
+        pix = mock.Mock(side_effect=AssertionError("must not decode while hidden"))
+        with mock.patch.object(self.mod, "QPixmap", pix):
+            self.assertFalse(self._refresh(st))   # no change reported
+        pix.assert_not_called()                   # decode skipped
+        self.assertIsNone(st.cam_preview)
 
     def test_same_mtime_skips_decode_and_reports_unchanged(self):
         now = time.time()

@@ -751,5 +751,62 @@ class PrimingDrawGuardTests(unittest.TestCase):
             self.fail(f"_draw_priming_ring raised out of the paint loop: {exc!r}")
 
 
+class PrimeFlashCompletionTests(unittest.TestCase):
+    """2026-07-08 fix: the priming-ring completion flash must latch on the
+    priming→engaged HANDOFF (was_priming last frame AND state now track/grab),
+    not on the published prime reaching PRIME_FULL_EPS (0.999) — the air-mouse
+    never publishes a priming-frame prime that high (it jumps from <1.0 in state
+    'prime' straight to 0.0 in state 'track'/'grab'), so the old latch was dead
+    code and the completion 'pop' never played. Driven on a bare instance (no Tk
+    root), mirroring the pure-helper tests above."""
+
+    def setUp(self):
+        self.mod = _load_air_cursor(self)
+
+    def _overlay(self):
+        ov = object.__new__(self.mod.AirCursorOverlay)
+        ov.parent_pid = 4242
+        ov.parent_start = None
+        ov._started_at = 0.0
+        ov._last_state_ts = 0.0
+        ov.state = "hidden"
+        ov.prime = 0.0
+        ov._prime_flash = 0
+        ov._was_priming = False
+        ov._was_grab = False
+        ov.two_hand = False
+        ov.two_resizing = False
+        ov.hand_pts = None
+        ov.visible = False
+        ov._prev_visible = False
+        ov.color_name = "cyan"
+        ov.priming_active = False
+        ov.target_x = ov.target_y = None
+        ov.cur_x = ov.cur_y = None
+        ov.trail = []
+        return ov
+
+    def test_flash_latches_on_priming_to_engaged_handoff(self):
+        mod = self.mod
+        ov = self._overlay()
+        with mock.patch.object(mod, "_is_parent_alive", lambda *a: True):
+            # Frame 1: priming (ring charging, prime ~0.6, not yet engaged).
+            with mock.patch.object(mod, "_read_state",
+                                   return_value={"ts": mod.time.time(),
+                                                 "state": "prime", "prime": 0.6,
+                                                 "visible": False}):
+                ov._refresh_state()
+            self.assertTrue(ov._was_priming)
+            self.assertEqual(ov._prime_flash, 0)      # not yet — still priming
+            # Frame 2: engaged — the writer publishes prime=0.0, state='track'.
+            with mock.patch.object(mod, "_read_state",
+                                   return_value={"ts": mod.time.time(),
+                                                 "state": "track", "visible": True,
+                                                 "x": 10, "y": 10}):
+                ov._refresh_state()
+        # The completion flash latched on the priming→engaged handoff.
+        self.assertEqual(ov._prime_flash, mod.PRIME_FLASH_TICKS)
+
+
 if __name__ == "__main__":
     unittest.main()

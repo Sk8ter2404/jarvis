@@ -1795,6 +1795,18 @@ class AirMouseController:
             self._locked_body_id = body_id
             self._untracked_accum = 0.0   # fresh untracked budget for this grab
             self._fist_closed_at = None   # fresh fist-release timer this grab
+            # Seed the per-hand button-down flags from the CURRENT stable grips so
+            # the engage frame doesn't fire a PHANTOM button-down. In ARMED relaxed
+            # mode the engage gate is height-only (no open-palm requirement), so the
+            # grip debouncer can already read "closed" at the instant we engage;
+            # release_decision reset both flags to False on the prior disengage, so
+            # without this seed _button_edge_from_stable (below) would see
+            # want_down=True, held=False and emit a spurious mouse-DOWN — an
+            # unintended grab/drag the owner never gestured. Seeding held=want_down
+            # suppresses that edge; a real click still fires on the next
+            # open→close. 2026-07-08.
+            self._left_down = (left_stable == "closed")
+            self._right_down = (right_stable == "closed")
         self._engaged = True
         self._engage_streak = 0       # met the bar; clear so a later re-engage re-debounces
         self._prime = 0.0             # engaged → nothing to prime
@@ -3070,7 +3082,16 @@ def _poll_loop() -> None:  # pragma: no cover - non-terminating daemon; each tic
                 cur = ctrl.reach
                 if (vb[0], vb[1], vb[2], vb[3]) != (
                         cur.origin_x, cur.origin_y, cur.screen_w, cur.screen_h):
-                    ctrl.reach = ReachBox(vb[2], vb[3], origin_x=vb[0], origin_y=vb[1])
+                    # Rebuild via _reach_box_for_virtual_desktop (as the on-enable
+                    # path at line 3060) so the owner's persisted reach-box
+                    # calibration (KINECT_REACH_CENTER_X/Y, KINECT_REACH_HALF_W/H)
+                    # is re-applied. The bare ReachBox(vb…) here passed no
+                    # center/half args, so a monitor hot-plug/rearrange silently
+                    # reverted the reach box to module DEFAULTS — discarding the
+                    # calibration until the owner toggled the air-mouse off/on.
+                    # refresh=False reuses the bounds already fetched at line 3068.
+                    # 2026-07-08.
+                    ctrl.reach = _reach_box_for_virtual_desktop(refresh=False)
             if was_enabled and not enabled:
                 # Just turned off — tear the overlay down + clear its state.
                 _shutdown_overlay()

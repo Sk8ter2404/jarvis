@@ -1106,11 +1106,22 @@ MAX_CONVERSATION_HISTORY = 20
 
 def _trim_conversation_history(max_history: int = MAX_CONVERSATION_HISTORY) -> None:
     """Trim conversation_history to at most `max_history` messages, removing the
-    oldest user+assistant PAIR from the front so role alternation is preserved."""
+    oldest user+assistant PAIR from the front so role alternation is preserved.
+
+    The pop-in-pairs scheme only keeps the history 'user'-first when roles
+    strictly alternate. The follow-up loop (and boot-time appends) can append
+    assistant-only turns with no interleaving user message, producing
+    consecutive-assistant runs; when such a run lands at the front a pair-trim
+    can leave a LEADING 'assistant' message, which the Claude API rejects with
+    400 'first message must use the user role'. After trimming, drop any leading
+    non-'user' messages so the history always begins with a user turn (or is
+    empty). 2026-07-08."""
     while len(conversation_history) > max_history:
         conversation_history.pop(0)
         if conversation_history and conversation_history[0]["role"] == "assistant":
             conversation_history.pop(0)
+    while conversation_history and conversation_history[0].get("role") != "user":
+        conversation_history.pop(0)
 
 
 def _append_turn(user: str, assistant: str) -> None:
@@ -4572,7 +4583,13 @@ def _compose_kinect_preview(now: float) -> "np.ndarray | None":
         # scribble on the bridge's buffer).
         try:
             base = fresh.copy()
-            _kinect_preview_last_color[0] = base
+            # Cache a SEPARATE pristine copy, NOT `base`: the skeleton, IR/stale
+            # badges and gesture-pop are drawn IN-PLACE on `base` below, so
+            # aliasing the cache to `base` baked those overlays into the "last
+            # color" frame — a later color-miss re-serve then drew the CURRENT
+            # skeleton over a stale baked-in one (ghosted/double skeleton). Keep
+            # the cache clean. 2026-07-08.
+            _kinect_preview_last_color[0] = fresh.copy()
             _kinect_preview_last_color_at[0] = now
         except Exception:
             # Can't even copy the frame — hand back the original rather than
@@ -4593,7 +4610,9 @@ def _compose_kinect_preview(now: float) -> "np.ndarray | None":
             # rather than blank the preview. Cache it as the last color.
             try:
                 base = fresh.copy()
-                _kinect_preview_last_color[0] = base
+                # Pristine cache copy, separate from `base` (drawn on in-place
+                # below) — see the aliasing note on the lit-color branch. 2026-07-08.
+                _kinect_preview_last_color[0] = fresh.copy()
                 _kinect_preview_last_color_at[0] = now
             except Exception:
                 return fresh
@@ -4862,6 +4881,38 @@ def _probe_camera_index(idx: int, timeout_sec: float = CAMERA_PROBE_TIMEOUT_SEC)
     return result["ok"]
 
 
+def _camera_rescued_by_name(cam: dict, static_idx: int,
+                            timeout_sec: float = CAMERA_PROBE_TIMEOUT_SEC) -> bool:
+    """A configured camera whose STATIC index failed to probe may simply have
+    shuffled to a different LIVE DirectShow index (USB re-enumeration). The
+    face-track opener (_open_capture) already resolves the entry's 'name' to the
+    live index at OPEN time and prefers it over the static index — but the boot
+    probes only test the static index, so a present-but-shuffled camera was
+    wrongly marked bad and dropped from CAMERAS before the opener ever got to
+    name-resolve it. Mirror _open_capture here: if the entry carries a 'name',
+    resolve it to a live index and probe THAT. Returns True when the name
+    resolves to a DIFFERENT, openable live index (camera is present → keep it;
+    _open_capture will resolve it by name at open). Never raises. 2026-07-08."""
+    try:
+        if not isinstance(cam, dict):
+            return False
+        name = cam.get("name")
+        want_kinect = (cam.get("type") == "kinect") or KINECT_AS_CAMERA
+        if not name or want_kinect:
+            return False
+        live = _dshow_name_to_index(name)
+        if live is None or live == static_idx:
+            return False
+        if _probe_camera_index(live, timeout_sec=timeout_sec):
+            print(f"  [cam-probe] '{name}' failed at static index {static_idx} "
+                  f"but opened at LIVE index {live} (USB re-enumeration shuffle) "
+                  f"— keeping it (opener resolves by name)")
+            return True
+        return False
+    except Exception:
+        return False
+
+
 def find_camera_locking_processes() -> list[str]:
     """Return display names of currently-running processes known to grab
     exclusive webcam locks (Teams, Zoom, OBS, etc.). Empty list if psutil
@@ -4927,12 +4978,34 @@ def probe_cameras_and_update_config() -> tuple[list[int], list[int]]:
             working_configured.append(idx)
             print(f"  [cam-probe] index {idx}: working ✓")
         else:
-            print(f"  [cam-probe] index {idx}: failed to open")
+            # NAME-RESOLUTION RESCUE (2026-07-08): the static index may be stale
+            # after a USB shuffle. If the camera's name resolves to a different
+            # openable live index, keep the entry (its static index stays in
+            # working_configured so Step 2 preserves it; _open_capture re-resolves
+            # by name at open) rather than dropping a present camera.
+            cam = next((c for c in CAMERAS if c.get("index") == idx), None)
+            if cam is not None and _camera_rescued_by_name(cam, idx):
+                working_configured.append(idx)
+            else:
+                print(f"  [cam-probe] index {idx}: failed to open")
 
     # Step 2: if any configured cameras worked, keep the original config
     if working_configured:
         good = [cam for cam in CAMERAS if cam["index"] in working_configured]
         CAMERAS[:] = good
+        # PROMOTE a survivor to PRIMARY if the configured primary failed its
+        # probe here. Mirrors the _preflight_cameras guard: the HUD preview WRITE
+        # and precise primary-face tracking are BOTH gated on cam["primary"], so
+        # a rebuilt CAMERAS with zero primary leaves the HUD tile dark and the
+        # eyes on side-snap/drift for the whole session. This function runs AFTER
+        # preflight, so a camera that passed preflight but stalled on THIS ~3s
+        # probe (USB blip / an app grabbed it) could otherwise strip the only
+        # primary. 2026-07-08.
+        if CAMERAS and not any(c.get("primary") for c in CAMERAS):
+            CAMERAS[0]["primary"] = True
+            print(f"  [cam-probe] configured primary camera was dropped — "
+                  f"promoted {CAMERAS[0].get('label')} "
+                  f"(index {CAMERAS[0].get('index')}) to primary")
         return working_configured, [i for i in configured if i not in working_configured]
 
     # Step 3: short-circuit — if a known webcam-locking app (Teams / Zoom /
@@ -6076,10 +6149,11 @@ def _refresh_devices(force: bool = False):
             # re-pick from the existing enumeration. The drift (mic plugged/
             # unplugged) gets picked up on the next refresh once record_speech
             # is briefly idle — which happens every utterance / 20s timeout.
-            if _record_speech_active[0]:
-                print("  [audio] device drift detected but record_speech is "
-                      "live — deferring PortAudio reinit to avoid a mid-"
-                      "capture teardown (0xc0000374).")
+            if _record_speech_active[0] or _pathb_mic_active[0]:
+                print("  [audio] device drift detected but a mic stream is "
+                      "live (record_speech or get_mic_buffer Path B) — "
+                      "deferring PortAudio reinit to avoid a mid-capture "
+                      "teardown (0xc0000374).")
             elif _tts_playback_active[0]:
                 print("  [audio] device drift detected but TTS playback is "
                       "live — deferring PortAudio reinit to avoid tearing down "
@@ -6339,6 +6413,26 @@ def should_be_proactive() -> bool:
     """Decide whether to fire a proactive comment right now."""
     if not PROACTIVE_ENABLED:
         return False
+
+    # FOCUS / DO-NOT-DISTURB gate. Spontaneous proactive comments take the
+    # should_be_proactive() → _do_proactive_turn() → _speak() path, which
+    # BYPASSES proactive_announce's focus gate (the only place focus was
+    # consulted). Without this check a focus block is still interrupted by
+    # unprompted observations — the exact intrusion DND exists to prevent.
+    # Mirror the proactive_announce gate: live-read the FOCUS_MODE_ENABLED
+    # kill-switch so a Settings toggle applies without a restart, and fail OPEN
+    # so a bug here can never permanently silence proactive comments. 2026-07-08.
+    try:
+        _focus_on = True
+        try:
+            import core.config as _cfg
+            _focus_on = bool(getattr(_cfg, "FOCUS_MODE_ENABLED", True))
+        except Exception:
+            _focus_on = True
+        if _focus_on and focus_mode_active():
+            return False
+    except Exception:
+        pass
 
     silence = time.time() - last_speech_time
     if silence < PROACTIVE_MIN_SILENCE:
@@ -6778,6 +6872,17 @@ def _safe_close_stream(stream, timeout_sec: float = 2.0) -> None:
 _record_speech_active = [False]          # True while record_speech holds the mic
 _tts_playback_active  = [False]          # True while play_with_lipsync owns the speakers + barge-in stream
 _record_speech_sr     = [SAMPLE_RATE]    # sample rate of the live stream
+# True while a get_mic_buffer Path-B temporary InputStream is live. SEPARATE from
+# _record_speech_active (which record_speech owns exclusively) so Path B never has
+# to save+restore record_speech's flag — the old save+restore was a lost-update
+# race (HIGH, 2026-07-08): if record_speech began after Path B snapshotted the flag
+# False but before Path B's finally, the finally stomped record_speech's genuine
+# True back to False while its stream was live, re-opening the ~70s WASAPI stall +
+# 0xc0000374 reinit-under-live-callback window the flag exists to close. Each owner
+# now writes ONLY its own flag; _refresh_devices defers its destructive PortAudio
+# reinit while EITHER is set.
+_pathb_mic_active     = [False]
+_mic_lock = threading.Lock()             # serialises Path-B mic-ownership flag writes
 _record_speech_taps: "list[queue.Queue]" = []
 _record_speech_taps_lock = threading.Lock()
 
@@ -7200,19 +7305,26 @@ def get_mic_buffer(seconds: float,
         mono = indata[:, 0] if indata.ndim > 1 else indata
         q_local.put(mono.astype(np.float32, copy=False).copy())
 
-    # MIC-OWNERSHIP GUARD (2026-07-07 bug-hunt, MED). Publish that a mic stream
-    # is LIVE before opening this Path-B InputStream, so a concurrent
-    # _refresh_devices can't run sd._terminate()/sd._initialize() and tear
-    # PortAudio out from under this stream's callback → heap corruption
-    # (0xc0000374). record_speech guards its own open exactly this way; Path B
-    # was the un-guarded twin (reached when record_speech isn't holding the mic
-    # at target_sr — e.g. standby audio / voice enrollment / speaker-ID). We SAVE
-    # + RESTORE (not merely clear) so an already-running record_speech at another
-    # sample rate keeps its ownership after Path B closes.
-    _prev_active = _record_speech_active[0]
-    _prev_sr = _record_speech_sr[0]
-    _record_speech_sr[0] = target_sr
-    _record_speech_active[0] = True
+    # MIC-OWNERSHIP GUARD (2026-07-07 bug-hunt, MED; 2026-07-08 race fix, HIGH).
+    # Publish that a mic stream is LIVE before opening this Path-B InputStream, so
+    # a concurrent _refresh_devices can't run sd._terminate()/sd._initialize() and
+    # tear PortAudio out from under this stream's callback → heap corruption
+    # (0xc0000374). record_speech guards its own open exactly this way; Path B was
+    # the un-guarded twin (reached when record_speech isn't holding the mic at
+    # target_sr — e.g. standby audio / voice enrollment / speaker-ID).
+    #
+    # Use a DEDICATED _pathb_mic_active flag rather than save+restore of
+    # _record_speech_active. The old save+restore was a lost-update race: if
+    # record_speech started after Path B snapshotted _record_speech_active=False
+    # but before this finally ran, the finally stomped record_speech's genuine
+    # True back to False while its InputStream was live — re-opening the exact
+    # ~70s WASAPI-contention stall and 0xc0000374 window the flag exists to close.
+    # record_speech owns _record_speech_active exclusively; Path B owns
+    # _pathb_mic_active exclusively; _refresh_devices defers on EITHER. Path B no
+    # longer touches _record_speech_active/_record_speech_sr at all, so it can
+    # never clobber record_speech's ownership.
+    with _mic_lock:
+        _pathb_mic_active[0] = True
     try:
         # 2026-05-29 silent-crash fix: avoid `with sd.InputStream(...)`. Open the
         # stream explicitly and tear it down via _safe_close_stream so the close
@@ -7241,8 +7353,8 @@ def get_mic_buffer(seconds: float,
         finally:
             _safe_close_stream(stream)
     finally:
-        _record_speech_active[0] = _prev_active
-        _record_speech_sr[0] = _prev_sr
+        with _mic_lock:
+            _pathb_mic_active[0] = False
     if not chunks2:
         return None
     out2 = np.concatenate(chunks2).astype(np.float32, copy=False)
@@ -7485,7 +7597,13 @@ def _ensure_whisper():
                     print(f"  [whisper] {note}")
                 else:
                     print(f"  [whisper] faster-whisper CUDA load failed: {e}")
-                print(f"  [whisper] retrying on CPU with int8…")
+                # DOWNGRADE the model for the CPU retry: the CUDA path picked
+                # WHISPER_MODEL_CUDA (large-v3-turbo), which on CPU int8 runs at
+                # a small fraction of realtime and makes STT effectively
+                # unusable. Mirror the openai-whisper fallback below (which sets
+                # model = WHISPER_MODEL_CPU) and load the small CPU model. 2026-07-08.
+                model = WHISPER_MODEL_CPU
+                print(f"  [whisper] retrying on CPU with int8 using '{model}'…")
                 _stt = _FWM(model, device="cpu", compute_type="int8")
                 _stt_engine = "faster_whisper"
                 _stt_device = "cpu"
@@ -7495,6 +7613,19 @@ def _ensure_whisper():
             raise
     except ImportError:
         pass  # faster-whisper not installed — fall through to openai-whisper
+    except Exception as _fw_err:
+        # faster-whisper IS installed but its model LOAD failed (non-ImportError):
+        # first-run HF Hub download failure (network/disk), a corrupt CTranslate2
+        # cache, a CPU-feature mismatch, or a CUDA error whose CPU retry above also
+        # raised. The outer handler used to catch ONLY ImportError, so such a
+        # failure escaped _ensure_whisper() entirely and — since it's called at
+        # boot with no surrounding guard — aborted boot, WITHOUT ever attempting
+        # the openai-whisper engine. Fall through to Engine 2 instead so a cached
+        # or alternately-installed model can still bring STT up. 2026-07-08.
+        _stt = None
+        print(f"  [whisper] faster-whisper load failed "
+              f"({type(_fw_err).__name__}: {_fw_err}); falling back to "
+              f"openai-whisper.")
 
     # ── Engine 2: openai-whisper (legacy fallback) ─────────────────────────
     print(f"Loading openai-whisper '{model}' on {device}… "
@@ -9104,7 +9235,16 @@ class _SentenceFlushBuffer:
         self._stopped = False       # latched on first '[' — never unlatched
         self._flushed = 0           # sentences flushed so far
         self._thread = None         # tail of the chained speak threads
-        self.spoken_prefix = ""     # exact raw text handed to TTS so far
+        self.spoken_prefix = ""     # exact raw text ACTUALLY handed to TTS so far
+        # Snapshot the accepted-barge counter at reply start. A later increment
+        # means a wake-word barge-in was accepted DURING this reply, so the
+        # chained flush threads skip their remaining early sentences (see
+        # _dispatch). Snapshotted here rather than read live because the
+        # _tts_interrupt Event is cleared before prev.join() returns. 2026-07-08.
+        try:
+            self._barge_seq0 = _tts_interrupt_seq[0]
+        except Exception:
+            self._barge_seq0 = 0
 
     def feed(self, chunk: str) -> None:
         """on_delta callback. Best-effort by contract — never raises."""
@@ -9155,17 +9295,21 @@ class _SentenceFlushBuffer:
                 self._stopped = True   # fail closed: don't early-speak
                 return
             self._buf = self._buf[end:]
-            self.spoken_prefix += piece
             self._flushed += 1
-            self._dispatch(piece.strip())
+            # Pass the RAW piece (not .strip()) so spoken_prefix — accumulated in
+            # _dispatch only for sentences actually voiced — stays an exact
+            # leading substring of the reply for _strip_stream_spoken_prefix.
+            self._dispatch(piece)
 
-    def _dispatch(self, sentence: str) -> None:
+    def _dispatch(self, piece: str) -> None:
         """Speak one flushed sentence off-thread. Chained on the previous
         flush thread so playback order matches text order."""
+        sentence = piece.strip()
         if not sentence:
             return
         prev = self._thread
         speak_fn = self._speak_fn
+        seq0 = self._barge_seq0
 
         def _run():
             try:
@@ -9174,14 +9318,24 @@ class _SentenceFlushBuffer:
                 # If the user BARGED IN (a wake-word hit cut the prior sentence
                 # via sd.stop(), which unblocks prev.join above), do NOT speak the
                 # next chained early sentence — honour the interrupt instead of
-                # blurting one more line the user talked over. 2026-07-07 bug-hunt.
+                # blurting one more line the user talked over. Compare the
+                # monotonic accepted-barge counter to the snapshot taken at reply
+                # start: _tts_interrupt.is_set() was ALWAYS False here (the Event
+                # is cleared by the cut sentence's _speak/play_with_lipsync finally
+                # BEFORE prev.join() returns), which made the old guard dead code.
+                # 2026-07-07 intent; 2026-07-08 made functional.
                 try:
-                    if _tts_interrupt.is_set():
+                    if _tts_interrupt_seq[0] != seq0:
                         return
                 except Exception:
                     pass
                 fn = speak_fn if speak_fn is not None else _speak
                 fn(sentence)
+                # Record as spoken ONLY after actually dispatching to TTS: a
+                # skipped (barged-in) or TTS-failed sentence must NOT be stripped
+                # from the downstream tail (which would silently DROP it) — it
+                # rides the normal speak path instead. 2026-07-08.
+                self.spoken_prefix += piece
             except Exception:
                 pass   # early speech is a bonus — never let it propagate
 
@@ -9718,6 +9872,17 @@ def _render_xtts_or_raise(text: str, rate: str, pitch: str) -> tuple[np.ndarray,
 # load), then we abandon it and fall through to the edge-tts ladder so a hang can
 # never leave JARVIS mute. 2026-07-07 review.
 _VOICE_CLONE_TIMEOUT_S = 20.0
+# SINGLE-FLIGHT GUARD (2026-07-08, MED). On a clone TIMEOUT we ABANDON the daemon
+# worker but it keeps running its Chatterbox model load / generate. core.voice_clone
+# has NO internal lock, so a second worker spawned by the next utterance would run a
+# CONCURRENT ChatterboxTTS.from_pretrained (N× VRAM cold-loads during a multi-minute
+# cold start) or a concurrent model.generate on the shared cached model (unsafe CUDA
+# forward pass). True while ANY clone worker is in flight (incl. an abandoned one);
+# the worker's finally clears it when it actually finishes, so a fresh worker can
+# start once the previous one truly returns. While set, the clone is skipped and the
+# utterance uses the normal edge-tts ladder (JARVIS still speaks).
+_voice_clone_inflight = [False]
+_voice_clone_inflight_lock = threading.Lock()
 
 
 def synthesise(text: str) -> tuple[np.ndarray, int]:
@@ -9762,35 +9927,56 @@ def synthesise(text: str) -> tuple[np.ndarray, int]:
                     # timeout/failure we abandon it and fall through to the ladder
                     # so JARVIS is NEVER left mute. Daemon → a hung worker can't
                     # block process exit and dies with it.
-                    _clone_box: dict = {}
-
-                    def _clone_worker():
-                        try:
-                            _clone_box["v"] = _voice_clone.synthesize(text)
-                        except Exception as _ce:      # noqa: BLE001
-                            _clone_box["err"] = _ce
-
-                    _ct = threading.Thread(target=_clone_worker,
-                                           name="voice-clone-synth", daemon=True)
-                    _ct.start()
-                    _ct.join(timeout=_VOICE_CLONE_TIMEOUT_S)
-                    if _ct.is_alive():
-                        print(f"  [tts] voice-clone timed out "
-                              f"(>{_VOICE_CLONE_TIMEOUT_S:.0f}s) — using the normal "
-                              f"TTS ladder")
-                    elif "err" in _clone_box:
-                        _e = _clone_box["err"]
-                        print(f"  [tts] voice-clone failed "
-                              f"({type(_e).__name__}: {_e}); using the normal "
-                              f"TTS ladder")
+                    #
+                    # SINGLE-FLIGHT: if a prior worker was abandoned on timeout and
+                    # is STILL running (its model load/generate hasn't returned),
+                    # do NOT spawn a second — that would pile up concurrent CUDA
+                    # loads / an unsafe concurrent generate. Skip the clone this
+                    # utterance and use the ladder.
+                    with _voice_clone_inflight_lock:
+                        _clone_busy = _voice_clone_inflight[0]
+                        if not _clone_busy:
+                            _voice_clone_inflight[0] = True
+                    if _clone_busy:
+                        print("  [tts] voice-clone worker still in flight from a "
+                              "prior timeout — using the normal TTS ladder")
                     else:
-                        clone = _clone_box.get("v")
-                        if clone is not None:
-                            audio, sr = clone
-                            if gain != 1.0:
-                                audio = np.clip(audio * gain, -1.0,
-                                                1.0).astype(np.float32)
-                            return audio, sr
+                        _clone_box: dict = {}
+
+                        def _clone_worker():
+                            try:
+                                _clone_box["v"] = _voice_clone.synthesize(text)
+                            except Exception as _ce:      # noqa: BLE001
+                                _clone_box["err"] = _ce
+                            finally:
+                                # Release the single-flight guard whenever this
+                                # worker actually finishes — even long after we
+                                # abandoned it on timeout — so the next utterance
+                                # may try the clone again.
+                                with _voice_clone_inflight_lock:
+                                    _voice_clone_inflight[0] = False
+
+                        _ct = threading.Thread(target=_clone_worker,
+                                               name="voice-clone-synth", daemon=True)
+                        _ct.start()
+                        _ct.join(timeout=_VOICE_CLONE_TIMEOUT_S)
+                        if _ct.is_alive():
+                            print(f"  [tts] voice-clone timed out "
+                                  f"(>{_VOICE_CLONE_TIMEOUT_S:.0f}s) — using the normal "
+                                  f"TTS ladder")
+                        elif "err" in _clone_box:
+                            _e = _clone_box["err"]
+                            print(f"  [tts] voice-clone failed "
+                                  f"({type(_e).__name__}: {_e}); using the normal "
+                                  f"TTS ladder")
+                        else:
+                            clone = _clone_box.get("v")
+                            if clone is not None:
+                                audio, sr = clone
+                                if gain != 1.0:
+                                    audio = np.clip(audio * gain, -1.0,
+                                                    1.0).astype(np.float32)
+                                return audio, sr
         except Exception as e:
             print(f"  [tts] voice-clone unavailable ({type(e).__name__}: {e}); "
                   f"using the normal TTS ladder")
@@ -9958,6 +10144,13 @@ _barge_in_interrupted = False
 #                         a wake hit during that sentence is almost certainly
 #                         his own voice — refuse the interrupt.
 _tts_interrupt = threading.Event()
+# Monotonic count of ACCEPTED barge-ins. Unlike the _tts_interrupt Event (which
+# _speak's / play_with_lipsync's finally CLEARS before a chained flush thread's
+# prev.join() returns — making an `_tts_interrupt.is_set()` check there dead
+# code), this counter is never reset, so a flush thread can detect "a barge-in
+# happened during this reply" by comparing it to a snapshot taken when the
+# reply's flush buffer was created. 2026-07-08.
+_tts_interrupt_seq: list[int] = [0]
 _tts_current_text: list[str] = [""]
 
 
@@ -10007,6 +10200,10 @@ def request_tts_interrupt(source: str = "wake-word") -> bool:
         return False
     print(f"  [barge-in] wake-word interrupt accepted, source={source}")
     _tts_interrupt.set()
+    # Bump the monotonic accepted-barge counter so a streaming-TTS flush thread
+    # can see the barge-in even after _tts_interrupt is cleared by the finally
+    # of the sentence it cut. 2026-07-08.
+    _tts_interrupt_seq[0] += 1
     return True
 
 
@@ -18735,6 +18932,10 @@ def _preflight_cameras(timeout_sec: float = 2.0) -> None:
             continue
         if results.get(idx, False):
             print(f"  [preflight] camera index {idx}: opens cleanly ✓")
+        elif _camera_rescued_by_name(cam, idx, timeout_sec=timeout_sec):
+            # Present at a shuffled live index (name-resolved) — keep it, don't
+            # mark bad. 2026-07-08.
+            pass
         else:
             print(f"  [preflight] camera index {idx}: failed to open in "
                   f"{timeout_sec:.1f}s — marking bad")

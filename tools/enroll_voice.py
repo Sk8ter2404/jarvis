@@ -165,13 +165,27 @@ def enroll(
     if not from_wav and not record:
         raise ValueError("provide either --from-wav <path> or --record.")
 
-    os.makedirs(_profile_dir(name), exist_ok=True)
-    if from_wav:
-        _copy_reference_wav(name, from_wav)
-    else:
-        _record_reference_wav(name, record_seconds)
-    _write_meta(name, source, model)
-    return _profile_dir(name)
+    _dir = _profile_dir(name)
+    _preexisting = os.path.isdir(_dir)
+    os.makedirs(_dir, exist_ok=True)
+    try:
+        if from_wav:
+            _copy_reference_wav(name, from_wav)
+        else:
+            _record_reference_wav(name, record_seconds)
+        _write_meta(name, source, model)
+    except Exception:
+        # A failed reference-wav copy/record (missing / empty / undecodable wav,
+        # mic error, …) must NOT leave a half-written profile dir behind — an
+        # empty dir with no meta.json/reference.wav would still show up in --list
+        # as an enrolled profile, contradicting the docstring's promise. Remove
+        # the dir ONLY if we just created it (never wipe a pre-existing profile on
+        # a failed RE-enroll), then re-raise so the caller still reports the error.
+        # 2026-07-08.
+        if not _preexisting:
+            shutil.rmtree(_dir, ignore_errors=True)
+        raise
+    return _dir
 
 
 def list_profiles() -> list[str]:
