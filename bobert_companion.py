@@ -5038,11 +5038,20 @@ def _camera_rescued_by_name(cam: dict, static_idx: int,
         if not isinstance(cam, dict):
             return False
         name = cam.get("name")
-        want_kinect = (cam.get("type") == "kinect") or KINECT_AS_CAMERA
+        # Same rule as _open_capture (v2.0.39): KINECT_AS_CAMERA only applies
+        # to kinect-typed/UNNAMED entries — this stale copy of the old
+        # condition made the rescue return False INSTANTLY for every named
+        # webcam while the flag was on, so a shuffled camera could never be
+        # rescued (live 2026-07-10: the Logi sat healthy at its new index
+        # through three boots while this line vetoed every rescue attempt).
+        want_kinect = (cam.get("type") == "kinect"
+                       or (KINECT_AS_CAMERA and not name))
         if not name or want_kinect:
             return False
         live = _dshow_name_to_index(name)
         if live is None or live == static_idx:
+            print(f"  [cam-probe] '{name}' rescue: name resolved to "
+                  f"{live!r} (static {static_idx}) — cannot rescue")
             return False
         if _probe_camera_index(live, timeout_sec=timeout_sec):
             print(f"  [cam-probe] '{name}' failed at static index {static_idx} "
