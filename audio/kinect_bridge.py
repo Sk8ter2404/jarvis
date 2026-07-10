@@ -204,6 +204,14 @@ _NEGATIVE_CACHE_SEC = 5.0
 # Verify real frames arrive and retry so a restart can't latch a dead runtime.
 _OPEN_STREAM_RETRIES = 4
 _OPEN_STREAM_RETRY_SEC = 1.5
+# Longer negative cache specifically for a WEDGED sensor (opened but streamed
+# no frames through the full retry gauntlet — e.g. held by KStudioHostService
+# or a USB-stalled stack). The full gauntlet costs tens of seconds; live
+# 2026-07-10 it ran on the VOICE loop for camera_status/air_mouse_on and
+# tripped the main-loop watchdog THREE times (~60-70s stalls each). Once it
+# has failed completely, fail FAST for this long before trying again.
+# clear_negative_cache() still bypasses it (device-refresh / replug paths).
+_WEDGED_CACHE_SEC = 90.0
 # Guards the UNLOCKED open/verify/retry work so two callers don't both pound the
 # (single-consumer) sensor with concurrent PyKinectRuntime() opens. The publish of
 # the winning runtime still happens under _lock; this only serialises the slow
@@ -360,8 +368,31 @@ def get_runtime() -> tuple[Any, Optional[str]]:
     No longer wraps the open in _lock: _open_runtime_locked() now does its own fine-
     grained locking (a brief publish under _lock, the slow verify under a separate
     open-attempt lock) so this accessor no longer blocks every other caller for the
-    whole open (M2)."""
-    return _open_runtime_locked()
+    whole open (M2).
+
+    NEGATIVE-CACHED (2026-07-10): available() already failed fast after a bad
+    open, but get_runtime() — what the ACTION handlers call — re-ran the full
+    open/verify/retry gauntlet on every call. With a wedged sensor (held by
+    KStudioHostService / USB-stalled: opens but never streams) that put tens of
+    seconds on the VOICE loop per kinect-touching action and tripped the
+    main-loop watchdog repeatedly. Now a completed-but-failed open is remembered
+    for _WEDGED_CACHE_SEC and callers get the honest failure instantly."""
+    rt0 = _runtime[0]
+    if rt0 is not None:
+        return rt0, None
+    now = time.monotonic()
+    if now < _negative_until[0] and _open_error[0]:
+        return None, _open_error[0]
+    rt, err = _open_runtime_locked()
+    if rt is None and err:
+        _open_error[0] = err
+        # Disabled-by-config is cheap to re-check; only a REAL failed open
+        # (import error / open error / wedged no-frames verify) earns the
+        # long cooldown — the no-frames case is the expensive one.
+        cool = _WEDGED_CACHE_SEC if "no frames" in err else _NEGATIVE_CACHE_SEC
+        if "disabled" not in err:
+            _negative_until[0] = time.monotonic() + cool
+    return rt, err
 
 
 def available() -> tuple[bool, str]:

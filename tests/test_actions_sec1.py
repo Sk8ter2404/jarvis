@@ -25,6 +25,7 @@ Bugs found are documented in NOTE comments, not fixed.
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -318,6 +319,34 @@ class VolumeTests(unittest.TestCase):
             out = A._act_volume_mute("")
         pag.press.assert_called_once_with("volumemute")
         self.assertEqual(out, "mute toggled")
+
+    def test_set_volume_rejects_unparseable_and_out_of_range(self):
+        fake = mock.Mock()
+        fake._parse_spoken_number.return_value = None
+        with _patch_bc(fake):
+            self.assertIn("couldn't parse", A._act_set_volume("loudish"))
+            self.assertIn("couldn't parse", A._act_set_volume("150"))
+            self.assertIn("couldn't parse", A._act_set_volume(""))
+
+    def test_set_volume_spoken_number_falls_back_to_parser(self):
+        # "thirty" → the monolith's _parse_spoken_number → 30; pycaw mocked
+        # via sys.modules so no real COM endpoint is touched.
+        fake = mock.Mock()
+        fake._parse_spoken_number.return_value = 30
+        fake_vol = mock.MagicMock()
+        fake_pycaw = mock.MagicMock()
+        fake_ct = mock.MagicMock()
+        fake_ct.cast.return_value = fake_vol
+        with _patch_bc(fake), \
+                mock.patch.dict(sys.modules, {
+                    "comtypes": mock.MagicMock(),
+                    "pycaw": mock.MagicMock(),
+                    "pycaw.pycaw": fake_pycaw,
+                    "ctypes": fake_ct,
+                }):
+            out = A._act_set_volume("thirty")
+        self.assertEqual(out, "volume set to 30 percent, sir")
+        fake_vol.SetMasterVolumeLevelScalar.assert_called_once_with(0.3, None)
 
     def test_volume_up_unavailable(self):
         with _patch_bc(self._bc_no_pag()):

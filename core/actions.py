@@ -218,6 +218,42 @@ def _act_volume_mute(_: str = "") -> str:
     return "pyautogui unavailable"
 
 
+def _act_set_volume(arg: str = "") -> str:
+    """Set the MASTER system volume to an absolute percent (0-100).
+
+    Added 2026-07-10: "set the volume to 30 percent" had NO matching action
+    (only volume_up/down/mute existed), so the local model routed it to a
+    single volume_down nudge. Accepts digits ("30", "30%") or spoken numbers
+    ("thirty") via the monolith's _parse_spoken_number. Uses pycaw (already a
+    JARVIS dependency — audio ducking uses it) on the default render device."""
+    bc = _bc()
+    raw = (arg or "").strip().rstrip("%").strip()
+    n = None
+    try:
+        n = int(float(raw))
+    except (TypeError, ValueError):
+        try:
+            n = bc._parse_spoken_number(raw)      # "thirty" → 30
+        except Exception:
+            n = None
+    if n is None or not (0 <= n <= 100):
+        return (f"couldn't parse a volume percent from {arg!r} — "
+                "give a number from 0 to 100")
+    try:
+        from ctypes import POINTER, cast
+
+        from comtypes import CLSCTX_ALL
+        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+
+        dev = AudioUtilities.GetSpeakers()
+        iface = dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        vol = cast(iface, POINTER(IAudioEndpointVolume))
+        vol.SetMasterVolumeLevelScalar(n / 100.0, None)
+        return f"volume set to {n} percent, sir"
+    except Exception as e:
+        return f"couldn't set the volume ({type(e).__name__}: {e})"
+
+
 # ─── Streaming auto-play (Phase 4B) ────────────────────────────────────
 # Each is a one-liner delegating to bc._streaming_auto_play(service, q).
 
@@ -2608,6 +2644,7 @@ __all__ = [
     "_act_volume_up",
     "_act_volume_down",
     "_act_volume_mute",
+    "_act_set_volume",
     # Phase 4B — streaming
     "_act_netflix",
     "_act_prime_video",

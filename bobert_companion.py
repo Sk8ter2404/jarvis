@@ -8786,6 +8786,7 @@ def _local_cheatsheet() -> str:
         "  [ACTION: pause_music]  [ACTION: resume_music]  [ACTION: next_song]  [ACTION: previous_song]  [ACTION: now_playing]   (media keys — work on the app OR browser)\n"
         "  [ACTION: media_playpause]  [ACTION: media_next]  [ACTION: media_prev]\n"
         "  [ACTION: volume_up]  [ACTION: volume_down]  [ACTION: volume_mute]\n"
+        "  [ACTION: set_volume, 30]   <- absolute: 'set the volume to 30 percent'\n"
         "  [ACTION: netflix, <title>]  [ACTION: youtube, <search>]  [ACTION: spotify, <query>]\n"
         "  [ACTION: apple_music, <query>]  [ACTION: disney_plus, <title>]  [ACTION: hulu, <title>]\n"
         "  [ACTION: set_timer, 5 minutes]   (or '5 minutes for tea')   [ACTION: list_timers]   [ACTION: cancel_timer]  (no arg cancels the running one)\n"
@@ -15767,6 +15768,9 @@ ACTIONS = {
     "volume_up":       _act_volume_up,
     "volume_down":     _act_volume_down,
     "volume_mute":     _act_volume_mute,
+    # Absolute volume ("set the volume to 30 percent") — up/down alone made
+    # the local model nudge volume_down for set-to-value requests. 2026-07-10.
+    "set_volume":      _act_set_volume,
     # Replay the most recent non-destructive action ('do that again', etc.)
     "replay_last_action": _act_replay_last_action,
     # Changelog + version info ('what's new', 'show changelog', 'what version are you on')
