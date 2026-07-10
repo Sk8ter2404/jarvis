@@ -31,6 +31,7 @@ light-deps CI runner via ``@requires_monolith``.
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import os
 import queue
@@ -1048,6 +1049,137 @@ class GetLocalLlmModelTests(MonolithGlobalsTestCase):
         self.assertEqual(out, "default:model")
         # NOT cached — a later finished pull should still be picked up
         self.assertIsNone(self.bc._RESOLVED_LOCAL_LLM_MODEL[0])
+
+
+# ===========================================================================
+# _next_local_llm_fallback — best installed model to fail over to (skips the
+# broken/excluded one). Added 2026-07-09 so one bad quant can't mute the brain.
+# ===========================================================================
+@requires_monolith
+class NextLocalLlmFallbackTests(MonolithGlobalsTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def _req_with_tags(self, names):
+        fake_req = mock.Mock()
+        fake_req.get.return_value = _FakeResp(
+            ok=True, json_data={"models": [{"name": n} for n in names]})
+        return fake_req
+
+    def test_skips_excluded_base_and_picks_next_preference(self):
+        bc = self.bc
+        pref = bc._LOCAL_LLM_PREFERENCE          # best-first tuple
+        installed = [pref[0], pref[2]]           # excluded primary + a valid alt
+        with mock.patch.object(bc, "requests", self._req_with_tags(installed)):
+            alt = bc._next_local_llm_fallback(exclude=pref[0])
+        self.assertEqual(alt, pref[2])
+        self.assertNotEqual(alt.split(":", 1)[0], pref[0].split(":", 1)[0])
+
+    def test_returns_none_when_only_excluded_installed(self):
+        bc = self.bc
+        pref0 = bc._LOCAL_LLM_PREFERENCE[0]
+        with mock.patch.object(bc, "requests", self._req_with_tags([pref0])):
+            self.assertIsNone(bc._next_local_llm_fallback(exclude=pref0))
+
+    def test_offlist_installed_used_as_last_resort(self):
+        bc = self.bc
+        pref0 = bc._LOCAL_LLM_PREFERENCE[0]
+        with mock.patch.object(bc, "requests",
+                               self._req_with_tags([pref0, "mistral:7b"])):
+            self.assertEqual(bc._next_local_llm_fallback(exclude=pref0), "mistral:7b")
+
+    def test_none_when_nothing_installed(self):
+        bc = self.bc
+        with mock.patch.object(bc, "requests", self._req_with_tags([])):
+            self.assertIsNone(bc._next_local_llm_fallback(exclude="whatever:x"))
+
+
+# ===========================================================================
+# _call_local_llm — 200-OK-but-EMPTY reply (broken-quant fingerprint) fails
+# over ONCE to a different installed model instead of reporting "down".
+# ===========================================================================
+@requires_monolith
+class LocalLlmEmptyFailoverTests(MonolithGlobalsTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def setUp(self):
+        self._saved_cache = list(self.bc._RESOLVED_LOCAL_LLM_MODEL)
+        self.bc._RESOLVED_LOCAL_LLM_MODEL[0] = None
+
+    def tearDown(self):
+        self.bc._RESOLVED_LOCAL_LLM_MODEL[:] = self._saved_cache
+
+    def _post_side_effect(self, empty_models, good_text="Hello sir."):
+        """requests.post stub: models in `empty_models` reply 200-empty,
+        everything else replies 200 with `good_text`."""
+        def _post(url, json=None, timeout=None, **kw):
+            model = (json or {}).get("model")
+            content = "" if model in empty_models else good_text
+            return _FakeResp(ok=True, status_code=200,
+                             json_data={"message": {"content": content}})
+        return _post
+
+    def _patches(self, bc, fake_req, primary, alt):
+        return (
+            mock.patch.object(bc, "LOCAL_LLM_FALLBACK", True),
+            mock.patch.object(bc, "_ollama_alive", return_value=True),
+            mock.patch.object(bc, "_ollama_has_model", return_value=True),
+            mock.patch.object(bc, "_get_local_llm_model", return_value=primary),
+            mock.patch.object(bc, "_next_local_llm_fallback", return_value=alt),
+            mock.patch.object(bc, "requests", fake_req),
+        )
+
+    def _run(self, primary, alt, empty_models):
+        bc = self.bc
+        fake_req = mock.Mock()
+        fake_req.post.side_effect = self._post_side_effect(empty_models)
+        with contextlib.ExitStack() as stack:
+            for p in self._patches(bc, fake_req, primary, alt):
+                stack.enter_context(p)
+            out = bc._call_local_llm("sys", [{"role": "user", "content": "hi"}])
+        return out, fake_req
+
+    def test_empty_primary_fails_over_to_alt(self):
+        out, req = self._run("broken:model", "good:model", {"broken:model"})
+        self.assertEqual(out, "Hello sir.")
+        # Sticky: the working model is pinned for the rest of the session.
+        self.assertEqual(self.bc._RESOLVED_LOCAL_LLM_MODEL[0], "good:model")
+        self.assertEqual(req.post.call_count, 2)   # primary + one alt
+
+    def test_empty_primary_no_alt_returns_none(self):
+        out, req = self._run("broken:model", None, {"broken:model"})
+        self.assertIsNone(out)
+        self.assertEqual(req.post.call_count, 1)    # no alt to try
+
+    def test_empty_both_returns_none_no_loop(self):
+        out, req = self._run("broken:model", "alsobad:model",
+                             {"broken:model", "alsobad:model"})
+        self.assertIsNone(out)
+        self.assertEqual(req.post.call_count, 2)    # exactly one retry, no loop
+
+    def test_good_primary_never_consults_fallback(self):
+        bc = self.bc
+        fake_req = mock.Mock()
+        fake_req.post.side_effect = self._post_side_effect(set())
+        seen = {"fb": 0}
+
+        def _fb(exclude):
+            seen["fb"] += 1
+            return "unused:model"
+
+        with mock.patch.object(bc, "LOCAL_LLM_FALLBACK", True), \
+                mock.patch.object(bc, "_ollama_alive", return_value=True), \
+                mock.patch.object(bc, "_ollama_has_model", return_value=True), \
+                mock.patch.object(bc, "_get_local_llm_model", return_value="good:model"), \
+                mock.patch.object(bc, "_next_local_llm_fallback", side_effect=_fb), \
+                mock.patch.object(bc, "requests", fake_req):
+            out = bc._call_local_llm("sys", [{"role": "user", "content": "hi"}])
+        self.assertEqual(out, "Hello sir.")
+        self.assertEqual(seen["fb"], 0)             # fallback untouched on success
+        self.assertEqual(fake_req.post.call_count, 1)
 
 
 # ===========================================================================

@@ -8157,10 +8157,17 @@ _RESOLVED_LOCAL_LLM_MODEL: list[str | None] = [None]
 # boots used to force the 14B via JARVIS_LOCAL_LLM_MODEL). That env var
 # still bypasses this list entirely; the "first installed tag" step (below)
 # catches anything off-list.
+# Ordered best-first. `qwen2.5:14b-instruct-q5_K_M` leads because it is the best
+# model that RELIABLY works AND fits the 3090 beside chatterbox+whisper: pure
+# instruct (no Qwen3 thinking-mode latency), verified correct output. NOTE:
+# `gemma4:26b-a4b-it-qat` was REMOVED (2026-07-09) — its Q4_0 build is a broken
+# quant that generates tokens but returns an EMPTY string, which muted the local
+# brain for a full outage. It must never be auto-selected; if it's the only model
+# installed, _get_local_llm_model's "first available" path still falls back to it
+# (better than nothing), but it is no longer PREFERRED over a working model.
 _LOCAL_LLM_PREFERENCE = (
-    "gemma4:26b-a4b-it-qat",
-    "qwen3:30b-a3b-instruct-2507-q4_K_M",
     "qwen2.5:14b-instruct-q5_K_M",
+    "qwen3:30b-a3b-instruct-2507-q4_K_M",
     "llama3.1:8b-instruct-q5_K_M",
 )
 
@@ -8360,6 +8367,39 @@ def _get_local_llm_model() -> str:
         return pick
 
     return LOCAL_LLM_MODEL
+
+
+def _next_local_llm_fallback(exclude: str) -> str | None:
+    """Best INSTALLED Ollama model to fail over to when `exclude` produced no
+    usable output (e.g. a broken quant that returns an empty string). Walks
+    _LOCAL_LLM_PREFERENCE skipping the excluded model's BASE name, then any
+    other installed tag. Returns None if nothing else is installed. Mirrors
+    _get_local_llm_model's base-name matching so a `:latest` variant counts.
+    2026-07-09 — added so one bad quant can't mute the local brain."""
+    try:
+        r = requests.get(f"{LOCAL_LLM_BASE_URL}/api/tags", timeout=2)
+        installed = [m.get("name", "") for m in r.json().get("models", [])] if r.ok else []
+    except Exception:
+        installed = []
+    installed = [n for n in installed if n]
+    if not installed:
+        return None
+    excl_base = (exclude or "").split(":", 1)[0]
+    installed_set = set(installed)
+    for pref in _LOCAL_LLM_PREFERENCE:
+        if pref.split(":", 1)[0] == excl_base:
+            continue
+        if pref in installed_set:
+            return pref
+        base = pref.split(":", 1)[0]
+        alt = next((n for n in installed if n.split(":", 1)[0] == base), None)
+        if alt:
+            return alt
+    # Off-list: any other installed model that isn't the excluded base.
+    for n in installed:
+        if n.split(":", 1)[0] != excl_base:
+            return n
+    return None
 
 
 def _ollama_has_model(model: str) -> bool:
@@ -8764,9 +8804,16 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
     # position — addresses the hallucinated-execution / verbose / moralising
     # replies the giant Claude prompt produced on a 14B model.
     sys_prompt = sys_prompt + _LOCAL_MODE_DIRECTIVE
-    try:
+    def _generate(model_tag: str) -> tuple[str | None, str]:
+        """One /api/chat round-trip. Returns (text, kind):
+          'ok'    → text is the non-empty reply
+          'empty' → HTTP 200 but the model emitted an EMPTY string. This is the
+                    broken-quant fingerprint — the model RAN (tokens generated)
+                    yet produced no content (exactly what gemma4:26b-a4b-it-qat's
+                    Q4_0 build did, muting the local brain on 2026-07-09).
+          'fail'  → HTTP error, read timeout, or exception (treat as down)."""
         payload = {
-            "model": model,
+            "model": model_tag,
             "messages": [{"role": "system", "content": sys_prompt}] + messages,
             "stream": False,
             "options": {
@@ -8778,7 +8825,7 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
                 # much faster). Model-aware because the 32B needs the tighter
                 # window: MEASURED on the 3090, 32B@12k = 100% GPU / ~49 tok/s,
                 # but 32B@16k spills ~5% to CPU / ~28 tok/s. 14B/8B keep 16k.
-                "num_ctx": _local_num_ctx(model),
+                "num_ctx": _local_num_ctx(model_tag),
                 # Lower than Ollama's 0.8 default → more focused, less rambly,
                 # better at emitting the exact action-token grammar.
                 "temperature": 0.4,
@@ -8795,28 +8842,55 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
             # the ~3-5s reload each time (it competes with whisper on reload).
             "keep_alive": "20m",
         }
-        r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat", json=payload,
-                          timeout=_LOCAL_GENERATE_TIMEOUT)
-        if not r.ok:
-            print(f"  [local-llm] HTTP {r.status_code}: {r.text[:200]}")
-            return None
-        text = ((r.json().get("message") or {}).get("content") or "").strip()
-        if not text:
-            return None
+        try:
+            r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat", json=payload,
+                              timeout=_LOCAL_GENERATE_TIMEOUT)
+            if not r.ok:
+                print(f"  [local-llm] HTTP {r.status_code}: {r.text[:200]}")
+                return (None, "fail")
+            text = ((r.json().get("message") or {}).get("content") or "").strip()
+            if not text:
+                return (None, "empty")
+            return (text, "ok")
+        except _RequestsTimeout as _e:
+            # The runner accepted the POST but never produced a reply within the
+            # read budget — almost always a blocked/wedged runner (e.g. SAC).
+            # (Uses the import-time class, not requests.Timeout, so a mocked-out
+            # `requests` global can't turn this except into a TypeError.)
+            print(f"  [local-llm] generate timed out ({_e}) — runner up but not "
+                  f"responding (blocked/wedged?); treating local as unavailable")
+            return (None, "fail")
+        except Exception as _e:
+            print(f"  [local-llm] call failed: {_e}")
+            return (None, "fail")
+
+    text, kind = _generate(model)
+    if kind == "ok":
         print(f"  [local-llm] served via {model}")
         return text
-    except _RequestsTimeout as _e:
-        # The runner accepted the POST but never produced a reply within the
-        # read budget — almost always a blocked/wedged runner (e.g. SAC). Note
-        # it so the caller can offer the SAC-specific message, then fall back.
-        # (Uses the import-time class, not requests.Timeout, so a mocked-out
-        # `requests` global can't turn this except into a TypeError.)
-        print(f"  [local-llm] generate timed out ({_e}) — runner up but not "
-              f"responding (blocked/wedged?); treating local as unavailable")
-        return None
-    except Exception as _e:
-        print(f"  [local-llm] call failed: {_e}")
-        return None
+    if kind == "empty":
+        # 200-OK-but-EMPTY = the model ran but a broken quant / template
+        # mismatch produced nothing. Do NOT report "down" (which muted JARVIS
+        # for a full outage on 2026-07-09) — fail over ONCE to the best
+        # DIFFERENT installed model so one bad quant can't take out the local
+        # brain. Only the empty case retries; a timeout ('fail') already spent
+        # the read budget, so retrying a wedged runner would just double the
+        # wait for nothing.
+        alt = _next_local_llm_fallback(exclude=model)
+        print(f"  [local-llm] `{model}` returned EMPTY (likely a broken quant)"
+              + (f" — failing over to `{alt}`" if alt
+                 else " — no alternate model to fail over to"))
+        if alt:
+            text2, kind2 = _generate(alt)
+            if kind2 == "ok":
+                # Sticky: pin the working model for the rest of the session so
+                # every later turn skips the broken one (no repeated empty+retry).
+                _RESOLVED_LOCAL_LLM_MODEL[0] = alt
+                print(f"  [local-llm] served via {alt} (failed over from {model})")
+                return text2
+            print(f"  [local-llm] failover model `{alt}` returned {kind2} too "
+                  f"— treating local as unavailable")
+    return None
 
 
 def _local_fallback_or(sys_prompt: str, default_reply: str) -> str:
