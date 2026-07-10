@@ -180,7 +180,11 @@ CLAUDE_OPTIONAL = True
 # (~22 GB resident) was retired — it left no headroom and bricked the GPU
 # whenever vision or whisper co-loaded.
 LOCAL_LLM_FALLBACK = True
-LOCAL_LLM_MODEL    = "gemma4:26b-a4b-it-qat"
+# 2026-07-09: gemma4:26b-a4b Q4_0 returns EMPTY output (broken quant) AND at
+# ~15-18GB it OOMs the 3090 once chatterbox+whisper+vision co-load. The 14B both
+# WORKS and fits with headroom. Override per-box via JARVIS_LOCAL_LLM_MODEL or
+# user_settings when more VRAM is free.
+LOCAL_LLM_MODEL    = "qwen2.5:14b-instruct-q5_K_M"
 LOCAL_LLM_BASE_URL = "http://localhost:11434"
 
 # When True, every ambient/background one-shot LLM call (memory extraction,
@@ -306,7 +310,7 @@ ORCHESTRATOR_MERGER_TIMEOUT_S   = 20.0
 # chat tag, or when there is VRAM headroom for both models at once.
 # Set LOCAL_VISION_MODEL to "off" to disable local vision entirely.
 LOCAL_VISION_FALLBACK = False
-LOCAL_VISION_MODEL    = "gemma4:26b-a4b-it-qat"
+LOCAL_VISION_MODEL    = "qwen2.5vl:7b"   # dedicated working VLM (6GB); gemma4:26b was broken + too big
 
 
 # ─── Local image generation (skills/image_gen.py) ──────────────────────

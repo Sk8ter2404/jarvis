@@ -8216,6 +8216,59 @@ def _ollama_alive() -> bool:
         return False
 
 
+def _ensure_ollama_running(timeout_sec: float = 30.0) -> bool:
+    """Self-heal: if the local Ollama server (the local-model brain) isn't
+    answering, START it and wait for it to come up. Ollama being DOWN — after a
+    reboot that didn't relaunch its desktop app, a crash, or a manual quit — is
+    the single worst local-brain outage: JARVIS then has no local model AND, if
+    the Claude cap is also hit, no thinking backend at all ("my local model
+    isn't responding, sir"). JARVIS already knows where ollama.exe lives, so it
+    can relaunch the server headlessly. Returns True if Ollama is reachable after
+    the attempt. Best-effort; never raises. 2026-07-09."""
+    if _ollama_alive():
+        return True
+    exe = None
+    try:
+        import shutil as _sh
+        exe = _sh.which("ollama")
+        if not exe:
+            for c in (os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                                   "Programs", "Ollama", "ollama.exe"),
+                      r"C:\Program Files\Ollama\ollama.exe",
+                      r"C:\Program Files (x86)\Ollama\ollama.exe"):
+                if c and os.path.isfile(c):
+                    exe = c
+                    break
+    except Exception:
+        exe = None
+    if not exe:
+        print("  [ollama] server is down and ollama.exe wasn't found — the local "
+              "model is unavailable until Ollama is started.")
+        return False
+    print(f"  [ollama] server is down — starting it headlessly ({exe} serve)…")
+    try:
+        flags = 0
+        if os.name == "nt":
+            flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+                     | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        subprocess.Popen([exe, "serve"], creationflags=flags,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         close_fds=True)
+    except Exception as e:
+        print(f"  [ollama] failed to start server: {type(e).__name__}: {e}")
+        return False
+    # First start takes ~20-25s (GPU discovery) before /api/tags answers.
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        if _ollama_alive():
+            print("  [ollama] server is up.")
+            return True
+        time.sleep(1.0)
+    print(f"  [ollama] server didn't answer within {timeout_sec:.0f}s — the local "
+          "model may be unavailable this session.")
+    return False
+
+
 def _local_num_ctx(model: str) -> int:
     """Pick the Ollama num_ctx for a model so it fits 100 % on the 3090.
 
@@ -19426,6 +19479,14 @@ def _startup_preflight() -> None:
     open kicked off a read-failure / reopen loop in the face tracker."""
     print("─" * 60)
     print("Startup preflight…")
+
+    # (0) Ollama server up? It's the local brain. If it's DOWN and the Claude cap
+    # is also hit, JARVIS has no thinking backend at all — so start it before
+    # anything else and give it time to come up. 2026-07-09.
+    try:
+        _ensure_ollama_running()
+    except Exception as e:
+        print(f"  [preflight] ollama self-heal raised {type(e).__name__}: {e}")
 
     # (1) ANTHROPIC_API_KEY + 1-token Claude ping.
     try:
