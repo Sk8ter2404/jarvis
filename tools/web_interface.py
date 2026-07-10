@@ -1356,8 +1356,18 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._unauthorized()
             # Serve the live preview JPEG, or 404 when it's missing OR stale
             # (older than ~5 s = camera off). No side effects; never raises.
+            # ?cam=left|right|kinect selects an INDIVIDUAL camera's tile (the
+            # monolith publishes one file per camera, 2026-07-10); no param =
+            # the historical primary/composite preview, so the HUD and old
+            # bookmarks are unaffected.
             try:
                 p = cfg.get("camera_preview_path", "")
+                cam = (query.get("cam", [""])[0] or "").strip().lower()
+                if cam:
+                    if cam not in ("left", "right", "kinect"):
+                        return self._send_json({"error": "unknown cam"}, code=404)
+                    base = os.path.dirname(p) if p else os.path.join(PROJECT_DIR, "data")
+                    p = os.path.join(base, f".hud_camera_preview_{cam}.jpg")
                 if not p or not os.path.exists(p):
                     return self._send_json({"error": "no preview"}, code=404)
                 try:
@@ -1670,6 +1680,19 @@ def _dashboard_html(token: str) -> str:
   #camOff {{ background:var(--panel); border:1px dashed var(--cyan-dim);
           border-radius:10px; padding:40px 16px; text-align:center;
           color:var(--muted); }}
+  /* Per-camera 3-up grid: each tile independent (one dead cam never blanks
+     the row); wraps to a column on narrow windows. */
+  .camgrid {{ display:flex; gap:12px; flex-wrap:wrap; }}
+  .camtile {{ flex:1 1 220px; min-width:180px; margin:0;
+          background:var(--panel); border:1px solid var(--edge);
+          border-radius:10px; padding:8px; }}
+  .camtile img {{ width:100%; border-radius:6px; background:#04070c;
+          display:none; }}
+  .camtile .camoff {{ border:1px dashed var(--cyan-dim); border-radius:6px;
+          padding:28px 8px; text-align:center; color:var(--muted);
+          font-size:12px; }}
+  .camtile figcaption {{ color:var(--muted); font-size:12px; margin-top:6px;
+          letter-spacing:.08em; text-transform:uppercase; }}
 </style></head><body>
 <header><div class="reactor"></div><h1>J.A.R.V.I.S.</h1>
   <!-- View switcher: LIVE dashboard vs the full SETTINGS control panel. Only one
@@ -1756,6 +1779,28 @@ def _dashboard_html(token: str) -> str:
     <div class="count">Live camera preview (updates while the camera is on).</div>
     <img id="camImg" alt="camera preview">
     <div id="camOff">camera off / no preview</div>
+    <!-- Per-camera tiles (2026-07-10): every camera streams individually —
+         left/right webcams + Kinect (skeleton-annotated). Each tile shows a
+         dim placeholder when that camera is off/stale, independent of the
+         others, so one dead camera never blanks the row. -->
+    <div class="count" style="margin-top:14px;">Individual cameras</div>
+    <div class="camgrid">
+      <figure class="camtile">
+        <img id="camLeft" data-cam="left" alt="left webcam">
+        <div class="camoff" id="camLeftOff">off</div>
+        <figcaption>Left webcam</figcaption>
+      </figure>
+      <figure class="camtile">
+        <img id="camRight" data-cam="right" alt="right webcam">
+        <div class="camoff" id="camRightOff">off</div>
+        <figcaption>Right webcam</figcaption>
+      </figure>
+      <figure class="camtile">
+        <img id="camKinect" data-cam="kinect" alt="kinect">
+        <div class="camoff" id="camKinectOff">off</div>
+        <figcaption>Kinect (skeleton)</figcaption>
+      </figure>
+    </div>
   </section>
 
   <!-- ── MEMORY VIEW (long-term facts + recent episodes, searchable) ───────── -->
@@ -2277,7 +2322,23 @@ const camImg = document.getElementById('camImg');
 const camOff = document.getElementById('camOff');
 camImg.addEventListener('load',  () => {{ camImg.style.display='block'; camOff.style.display='none'; }});
 camImg.addEventListener('error', () => {{ camImg.style.display='none';  camOff.style.display='block'; }});
-function refreshCamera() {{ camImg.src = q('/api/camera-preview?t=' + Date.now()); }}
+// Per-camera tiles: same load/error toggle per tile, each polling its own
+// ?cam= stream so one dead camera never blanks the others (2026-07-10).
+const camTiles = [
+  ['camLeft', 'camLeftOff'], ['camRight', 'camRightOff'],
+  ['camKinect', 'camKinectOff'],
+].map(([imgId, offId]) => {{
+  const img = document.getElementById(imgId);
+  const off = document.getElementById(offId);
+  img.addEventListener('load',  () => {{ img.style.display='block'; off.style.display='none'; }});
+  img.addEventListener('error', () => {{ img.style.display='none';  off.style.display='block'; }});
+  return img;
+}});
+function refreshCamera() {{
+  camImg.src = q('/api/camera-preview?t=' + Date.now());
+  for (const img of camTiles)
+    img.src = q('/api/camera-preview?cam=' + img.dataset.cam + '&t=' + Date.now());
+}}
 
 // ── MEMORY TAB ──────────────────────────────────────────────────────────────
 // Fact + episode counts and a searchable, scrollable list of long-term facts.

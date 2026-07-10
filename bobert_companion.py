@@ -3724,6 +3724,65 @@ def _hud_camera_preview_downscale(frame: "np.ndarray", width: int) -> "np.ndarra
     return cv2.resize(frame, (width, new_h), interpolation=cv2.INTER_AREA)
 
 
+# Per-camera preview files (2026-07-10, owner request: "keep all cameras live
+# … see each camera individually on web"). The face-track loop already holds
+# EVERY webcam open continuously and caches each frame in
+# _camera_latest_frame — but only the PRIMARY was published. These write one
+# small JPEG per camera, same downscale/throttle/atomic contract as the main
+# preview, keyed by the camera's SIDE ("left"/"right") plus "kinect". The web
+# Camera tab requests /api/camera-preview?cam=<key>.
+_HUD_PERCAM_PREVIEW_KEYS = ("left", "right", "kinect")
+_hud_percam_last_write: dict[str, float] = {}
+
+
+def _hud_percam_preview_file(key: str) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "data", f".hud_camera_preview_{key}.jpg")
+
+
+def _percam_side(cam: dict) -> str:
+    """Stable per-camera preview key from the config entry. Label first
+    ("Left webcam (left monitor)"), look_x fallback with 0.5 counting as left
+    (same rule as skills/camera_system — look_x<0.5 misclassified the live
+    LEFT cam whose look_x is exactly 0.5)."""
+    lbl = str(cam.get("label", "")).lower()
+    if "left" in lbl:
+        return "left"
+    if "right" in lbl:
+        return "right"
+    return "left" if cam.get("look_x", 0.5) <= 0.5 else "right"
+
+
+def _hud_percam_preview_write(key: str, frame: "np.ndarray", now: float) -> bool:
+    """Per-camera sibling of _hud_camera_preview_write: same downscale, JPEG
+    quality, atomic replace and ~6-7 fps throttle, but each key has its OWN
+    throttle clock so three cameras never starve each other. Never raises."""
+    if frame is None or key not in _HUD_PERCAM_PREVIEW_KEYS:
+        return False
+    if (now - _hud_percam_last_write.get(key, 0.0)) < _HUD_CAM_PREVIEW_MIN_GAP:
+        return False
+    path = _hud_percam_preview_file(key)
+    try:
+        small = _hud_camera_preview_downscale(frame, _HUD_CAM_PREVIEW_WIDTH)
+        ok, buf = cv2.imencode(
+            ".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), _HUD_CAM_PREVIEW_JPEG_Q])
+        if not ok:
+            return False
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(buf.tobytes())
+        os.replace(tmp, path)
+        _hud_percam_last_write[key] = now
+        return True
+    except Exception:
+        try:
+            if os.path.exists(path + ".tmp"):
+                os.remove(path + ".tmp")
+        except OSError:
+            pass
+        return False
+
+
 def _hud_camera_preview_write(frame: "np.ndarray", now: float) -> bool:
     """Encode ``frame`` (BGR, as cv2 hands it to us) to a small JPEG and atomically
     replace the single preview file the HUD reads. Throttled to ~6-7 fps via
@@ -4748,6 +4807,14 @@ def _compose_kinect_preview(now: float) -> "np.ndarray | None":
         except Exception:
             _kinect_preview_piece_skipped(f"webcam-tile-{slot}")
 
+    # Per-camera Kinect tile: publish the SKELETON-ANNOTATED base (before the
+    # webcam side tiles are laid on) as the standalone "kinect" preview the web
+    # Camera tab shows individually. Own try/except per the fail-safe contract.
+    try:
+        _hud_percam_preview_write("kinect", base, now)
+    except Exception:
+        _kinect_preview_piece_skipped("percam-kinect")
+
     # Composite the tiles down the right edge. If THIS throws, fall back to the
     # bare Kinect color+skeleton so the preview is never blank.
     try:
@@ -5518,6 +5585,12 @@ def _face_tracking_thread():
                     if cam["index"] in _camera_last_read_error:
                         _camera_last_read_error.pop(cam["index"], None)
                         _camera_last_read_error_at.pop(cam["index"], None)
+                # Per-camera preview: EVERY webcam publishes its own tile (the
+                # web Camera tab shows each eye individually); the primary-only
+                # composite below is unchanged. Same enable gate + throttle
+                # family as the main preview. 2026-07-10.
+                if not camera_off and _hud_camera_preview_enabled():
+                    _hud_percam_preview_write(_percam_side(cam), frame, now_loop)
                 # Mirror the PRIMARY camera's live frame to the HUD preview file
                 # (a small overwriting JPEG). We write it whenever the primary
                 # camera is producing frames — INCLUDING while paused for voice

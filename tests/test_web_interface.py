@@ -1028,6 +1028,30 @@ class ControlPanelEndpointTests(_ServerBase):
         code, _ = _get_raw(self.base + "/api/camera-preview")
         self.assertEqual(code, 404)
 
+    def test_camera_preview_per_cam_param(self):
+        # ?cam=left|right|kinect serves the per-camera tile file next to the
+        # main preview; unknown cams 404; a missing per-cam file 404s while
+        # OTHER cams still serve (independent tiles). 2026-07-10.
+        left = os.path.join(os.path.dirname(self.camera_preview_path),
+                            ".hud_camera_preview_left.jpg")
+        with open(left, "wb") as f:
+            f.write(b"\xff\xd8LEFT")
+        req = urllib.request.Request(self.base + "/api/camera-preview?cam=left")
+        with _urlopen_retry(req, timeout=5) as r:
+            self.assertEqual(r.status, 200)
+            self.assertEqual(r.read(), b"\xff\xd8LEFT")
+        code, _ = _get_raw(self.base + "/api/camera-preview?cam=kinect")
+        self.assertEqual(code, 404)     # no kinect file written
+        code, body = _get_raw(self.base + "/api/camera-preview?cam=bogus")
+        self.assertEqual(code, 404)
+        self.assertIn("unknown cam", body)
+
+    def test_dashboard_has_percam_tiles(self):
+        code, body = _get_raw(self.base + "/")
+        self.assertEqual(code, 200)
+        for tid in ("camLeft", "camRight", "camKinect", "camgrid"):
+            self.assertIn(tid, body)
+
     def test_dashboard_has_new_nav_ids(self):
         # The five new nav buttons + their view sections + endpoint wiring.
         code, body = _get_raw(self.base + "/")
