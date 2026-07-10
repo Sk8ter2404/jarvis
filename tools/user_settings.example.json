@@ -21,7 +21,7 @@
   "WHISPER_MODEL_CUDA": "large-v3-turbo",
   "AI_BACKEND": "claude",
   "CLAUDE_MODEL": "claude-sonnet-5",
-  "LOCAL_LLM_MODEL": "qwen2.5:14b-instruct-q5_K_M",
+  "LOCAL_LLM_MODEL": "gemma4:12b",
   "CLAUDE_OPTIONAL": true,
   "LOCAL_LLM_FALLBACK": true,
   "LOCAL_VISION_FALLBACK": false,

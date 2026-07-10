@@ -8157,17 +8157,20 @@ _RESOLVED_LOCAL_LLM_MODEL: list[str | None] = [None]
 # boots used to force the 14B via JARVIS_LOCAL_LLM_MODEL). That env var
 # still bypasses this list entirely; the "first installed tag" step (below)
 # catches anything off-list.
-# Ordered best-first. `qwen2.5:14b-instruct-q5_K_M` leads because it is the best
-# model that RELIABLY works AND fits the 3090 beside chatterbox+whisper: pure
-# instruct (no Qwen3 thinking-mode latency), verified correct output. NOTE:
-# `gemma4:26b-a4b-it-qat` was REMOVED (2026-07-09) — its Q4_0 build is a broken
-# quant that generates tokens but returns an EMPTY string, which muted the local
-# brain for a full outage. It must never be auto-selected; if it's the only model
-# installed, _get_local_llm_model's "first available" path still falls back to it
-# (better than nothing), but it is no longer PREFERRED over a working model.
+# Ordered best-first. `gemma4:12b` leads after the 2026-07-10 on-box bake-off:
+# 7/7 on the REAL ~10k-token prod prompt (action grammar, honesty, reasoning),
+# 0.6s warm turns, zero empty replies, 8.4GB fully resident @16k ctx, and
+# MULTIMODAL (chat+vision share one resident model → no swap thrash).
+# `qwen2.5:14b` is the proven failover (6/7, 13.5GB). NOTES: the qwen3:30b MoE
+# was DROPPED — it redlines the 24GB card to <0.3GB free beside the voice clone
+# (the OOM-brick zone); `gemma4:26b-a4b-it-qat` stays REMOVED (2026-07-09) —
+# broken quant returning EMPTY output (ollama #15428/#16456). Neither must be
+# auto-selected; "first available" can still pick them as an absolute last
+# resort, and the empty-response failover self-heals if that happens.
 _LOCAL_LLM_PREFERENCE = (
+    "gemma4:12b",
     "qwen2.5:14b-instruct-q5_K_M",
-    "qwen3:30b-a3b-instruct-2507-q4_K_M",
+    "qwen3:14b",
     "llama3.1:8b-instruct-q5_K_M",
 )
 
@@ -8223,6 +8226,75 @@ def _ollama_alive() -> bool:
         return False
 
 
+# Runtime self-heal throttle: at most one relaunch attempt per cooldown, and
+# never two concurrently. (Single-element-list/dict globals per house style.)
+_OLLAMA_HEAL_STATE = {"last": 0.0, "active": False}
+_OLLAMA_HEAL_COOLDOWN_S = 120.0
+
+
+def _ollama_selfheal_async() -> None:
+    """MID-SESSION self-heal: relaunch a dead Ollama server on a daemon thread.
+
+    Boot preflight calls _ensure_ollama_running() synchronously, but until now
+    NOTHING healed a mid-session death — live outage 2026-07-10 09:13: ollama's
+    llama-server wedged during a chat<->vision model swap ("GPU discovery
+    watchdog timed out" + "Load failed"), and every later local turn just said
+    unavailable until the next reboot. This fires the same restart logic in the
+    background so the CURRENT turn still fails fast (honest fallback message)
+    but the NEXT turn finds the server back up. Throttled to one attempt per
+    _OLLAMA_HEAL_COOLDOWN_S and never concurrent. Never raises."""
+    try:
+        now = time.time()
+        if (_OLLAMA_HEAL_STATE["active"]
+                or now - _OLLAMA_HEAL_STATE["last"] < _OLLAMA_HEAL_COOLDOWN_S):
+            return
+        _OLLAMA_HEAL_STATE["last"] = now
+        _OLLAMA_HEAL_STATE["active"] = True
+
+        def _do():
+            try:
+                print("  [ollama] server unreachable at RUNTIME — self-heal "
+                      "restart attempt (background)…")
+                _ensure_ollama_running()
+            except Exception as e:
+                print(f"  [ollama] runtime self-heal raised {type(e).__name__}: {e}")
+            finally:
+                _OLLAMA_HEAL_STATE["active"] = False
+
+        threading.Thread(target=_do, daemon=True, name="ollama-selfheal").start()
+    except Exception:
+        pass
+
+
+def _reap_wedged_ollama() -> None:
+    """Kill a WEDGED ollama stack before relaunching it.
+
+    The API being unreachable while ollama.exe still has a process means the
+    server is hung (live case 2026-07-10 09:13 — llama-server "GPU discovery
+    watchdog timed out" mid model-swap and the server never answered again). A
+    second `ollama serve` can't bind :11434 next to a wedged one, so kill BOTH
+    ollama.exe AND llama-server.exe — killing only ollama ORPHANS its
+    llama-server child, which keeps ~13.5GB of VRAM resident (learned
+    2026-07-09). Only call when the API is unreachable: any such process is by
+    definition not serving. Separate function so tests can mock it (a live
+    taskkill during ci_sim would murder the REAL server). Never raises."""
+    if os.name != "nt":
+        return
+    for _img in ("ollama.exe", "llama-server.exe", "ollama app.exe"):
+        try:
+            subprocess.run(
+                ["taskkill", "/IM", _img, "/F", "/T"],
+                capture_output=True, text=True, timeout=10,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception:
+            pass
+    try:
+        time.sleep(2.0)   # let the GPU driver release the dead procs' VRAM
+    except Exception:
+        pass
+
+
 def _ensure_ollama_running(timeout_sec: float = 90.0) -> bool:
     """Self-heal: if the local Ollama server (the local-model brain) isn't
     answering, START it and wait for it to come up. Ollama being DOWN — after a
@@ -8252,6 +8324,9 @@ def _ensure_ollama_running(timeout_sec: float = 90.0) -> bool:
         print("  [ollama] server is down and ollama.exe wasn't found — the local "
               "model is unavailable until Ollama is started.")
         return False
+    # WEDGED-server reap (see _reap_wedged_ollama): a hung ollama would block
+    # the fresh `ollama serve` from binding :11434, so clear it first.
+    _reap_wedged_ollama()
     print(f"  [ollama] server is down — starting it headlessly ({exe} serve)…")
     try:
         flags = 0
@@ -8308,6 +8383,30 @@ def _local_num_ctx(model: str) -> int:
     except Exception:
         pass
     return 16384
+
+
+def _local_think_param(model: str):
+    """Ollama `think` parameter for thinking-capable model families.
+
+    Voice latency: a thinking block adds SECONDS before the first spoken word
+    and leaks reasoning prose into TTS, so thinking must be off/minimal for the
+    local voice brain. The API param is the ONLY correct mechanism — the
+    `/no_think` prompt hack returned an EMPTY reply on qwen3:14b (2026-07-09),
+    while `think:false` works (bench-verified 2026-07-10).
+
+    Returns: False  → disable thinking (Qwen3/3.x, Gemma4 hybrids)
+             "low"  → minimal reasoning (gpt-oss can't fully disable, only dial)
+             None   → OMIT the param (pure-instruct models like qwen2.5 /
+                      llama3.x — sending `think` to a non-thinking model is a
+                      400 from Ollama)."""
+    tag = (model or "").lower()
+    if tag.startswith("gpt-oss"):
+        return "low"
+    for fam in ("qwen3", "gemma4", "deepseek-r1", "magistral"):
+        # qwen3 prefix also covers qwen3.5 / qwen3.6 tags.
+        if tag.startswith(fam):
+            return False
+    return None
 
 
 def _get_local_llm_model() -> str:
@@ -8759,7 +8858,8 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
     if not LOCAL_LLM_FALLBACK:
         return None
     if not _ollama_alive():
-        _ollama_install_async()
+        _ollama_selfheal_async()   # mid-session death: restart in background
+        _ollama_install_async()    # (no-op when the binary is present+installed)
         return None
     model = _get_local_llm_model()
     if not _ollama_has_model(model):
@@ -8844,6 +8944,12 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
             # the ~3-5s reload each time (it competes with whisper on reload).
             "keep_alive": "20m",
         }
+        # Thinking models MUST have thinking disabled/minimised for voice —
+        # computed per model_tag because the empty-response failover can land
+        # on a different family than the primary. None = omit (pure instruct).
+        _think = _local_think_param(model_tag)
+        if _think is not None:
+            payload["think"] = _think
         try:
             r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat", json=payload,
                               timeout=_LOCAL_GENERATE_TIMEOUT)
@@ -9280,6 +9386,7 @@ def _call_local_vision(question: str, png_images: list[bytes],
     if not png_images:
         return None
     if not _ollama_alive():
+        _ollama_selfheal_async()   # mid-session death: restart in background
         _ollama_install_async()
         return None
     if not _ollama_has_model(LOCAL_VISION_MODEL):
@@ -9335,6 +9442,12 @@ def _call_local_vision(question: str, png_images: list[bytes],
             "stream": False,
             "options": {"num_predict": max_tokens},
         }
+        # Thinking-capable multimodal models (qwen3.x / gemma4) must not spend
+        # seconds reasoning before describing a screen; pure VLMs (qwen2.5vl)
+        # get no think param at all (400 otherwise).
+        _think = _local_think_param(LOCAL_VISION_MODEL)
+        if _think is not None:
+            payload["think"] = _think
         # Vision calls on a 7B VLM take ~2-6 s on the 3090; allow generous
         # headroom for the first call after a model swap (Ollama lazily
         # loads weights into VRAM on first hit).

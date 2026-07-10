@@ -217,13 +217,23 @@ def _try_import_embedder():
             _embedder_failed_until = _t.time() + _EMBEDDER_RETRY_COOLDOWN_S
             return None
         try:
-            dev = "cpu"
+            # Honour the LTM_EMBED_DEVICE knob (config/user_settings); "" keeps
+            # the historical auto-pick (cuda if present). "cpu" frees ~0.4GB of
+            # VRAM for the local LLM at a negligible latency cost. 2026-07-10.
+            dev = ""
             try:
-                import torch
-                if torch.cuda.is_available():
-                    dev = "cuda"
+                from core import config as _cfg
+                dev = (getattr(_cfg, "LTM_EMBED_DEVICE", "") or "").strip().lower()
             except Exception:
-                pass
+                dev = ""
+            if not dev:
+                dev = "cpu"
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        dev = "cuda"
+                except Exception:
+                    pass
             print(f"  [ltm] loading embedder {LTM_EMBED_MODEL} on {dev}")
             _embedder = SentenceTransformer(LTM_EMBED_MODEL, device=dev)
             return _embedder

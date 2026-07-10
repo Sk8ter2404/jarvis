@@ -4221,6 +4221,7 @@ class EnsureOllamaRunningTests(MonolithGlobalsTestCase):
         alive = iter([False, True])
         with mock.patch.object(bc, "_ollama_alive", side_effect=lambda: next(alive)), \
                 mock.patch("shutil.which", return_value=r"C:\ollama.exe"), \
+                mock.patch.object(bc, "_reap_wedged_ollama") as reap, \
                 mock.patch.object(bc.subprocess, "Popen") as popen:
             ok = bc._ensure_ollama_running(timeout_sec=5.0)
         self.assertTrue(ok)
@@ -4228,6 +4229,8 @@ class EnsureOllamaRunningTests(MonolithGlobalsTestCase):
         # launched the serve subcommand
         args = popen.call_args.args[0]
         self.assertEqual(args[-1], "serve")
+        # cleared any wedged stack before relaunching
+        reap.assert_called_once()
 
     def test_returns_false_when_exe_missing(self):
         bc = self.bc
@@ -4237,6 +4240,75 @@ class EnsureOllamaRunningTests(MonolithGlobalsTestCase):
                 mock.patch.object(bc.subprocess, "Popen") as popen:
             self.assertFalse(bc._ensure_ollama_running(timeout_sec=1.0))
         popen.assert_not_called()
+
+
+@requires_monolith
+class OllamaRuntimeSelfHealTests(MonolithGlobalsTestCase):
+    """_ollama_selfheal_async — MID-SESSION restart of a dead Ollama (live
+    outage 2026-07-10 09:13: llama-server wedged during a model swap and the
+    local brain stayed dead until reboot). 2026-07-10."""
+
+    def setUp(self):
+        self._saved = dict(self.bc._OLLAMA_HEAL_STATE)
+        self.bc._OLLAMA_HEAL_STATE.update({"last": 0.0, "active": False})
+
+    def tearDown(self):
+        self.bc._OLLAMA_HEAL_STATE.update(self._saved)
+
+    def _drain(self):
+        # the heal runs on a daemon thread; wait for it to finish
+        import time as _t
+        deadline = _t.time() + 3.0
+        while self.bc._OLLAMA_HEAL_STATE["active"] and _t.time() < deadline:
+            _t.sleep(0.02)
+
+    def test_fires_ensure_on_daemon_thread(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_ensure_ollama_running") as ens:
+            bc._ollama_selfheal_async()
+            self._drain()
+        ens.assert_called_once()
+        self.assertFalse(bc._OLLAMA_HEAL_STATE["active"])
+
+    def test_throttled_within_cooldown(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_ensure_ollama_running") as ens:
+            bc._ollama_selfheal_async()
+            self._drain()
+            bc._ollama_selfheal_async()   # inside cooldown — must be a no-op
+            self._drain()
+        self.assertEqual(ens.call_count, 1)
+
+    def test_never_concurrent(self):
+        bc = self.bc
+        import threading as _th
+        release = _th.Event()
+        with mock.patch.object(bc, "_ensure_ollama_running",
+                               side_effect=lambda: release.wait(2.0)) as ens:
+            bc._OLLAMA_HEAL_STATE["last"] = 0.0
+            bc._ollama_selfheal_async()          # starts, blocks in ensure
+            bc._OLLAMA_HEAL_STATE["last"] = 0.0  # defeat the time throttle
+            bc._ollama_selfheal_async()          # active=True — must not start
+            release.set()
+            self._drain()
+        self.assertEqual(ens.call_count, 1)
+
+    def test_reap_is_windows_only_and_never_raises(self):
+        bc = self.bc
+        with mock.patch.object(bc.subprocess, "run",
+                               side_effect=OSError("boom")), \
+                mock.patch.object(bc.time, "sleep"):
+            bc._reap_wedged_ollama()   # must swallow the error
+
+    def test_call_local_llm_down_branch_fires_selfheal(self):
+        bc = self.bc
+        with mock.patch.object(bc, "LOCAL_LLM_FALLBACK", True), \
+                mock.patch.object(bc, "_ollama_alive", return_value=False), \
+                mock.patch.object(bc, "_ollama_selfheal_async") as heal, \
+                mock.patch.object(bc, "_ollama_install_async"):
+            out = bc._call_local_llm("sys", [{"role": "user", "content": "hi"}])
+        self.assertIsNone(out)
+        heal.assert_called_once()
 
 
 @requires_monolith

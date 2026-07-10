@@ -67,6 +67,12 @@ SKILLS_ENABLED = True
 # injected into the volatile system-prompt tail (budget-bounded, never
 # blocks the voice loop). Overridable via data/user_settings.json.
 LTM_ENABLED = True
+# Torch device for the LTM sentence-transformer embedder (bge-small, ~0.4GB).
+# "" = historical default (cuda if available, else cpu). Set "cpu" to keep the
+# embedder OFF the GPU — encoding a short utterance on a modern CPU is a few ms
+# (well inside the 0.6s recall budget), and the freed VRAM goes to the local
+# LLM, which is the tenant that actually needs it. 2026-07-10.
+LTM_EMBED_DEVICE = ""
 
 # ─── Streaming TTS (sentence-flush) ────────────────────────────────────
 # Speak the first complete, action-free sentence(s) of a Claude reply WHILE
@@ -180,11 +186,19 @@ CLAUDE_OPTIONAL = True
 # (~22 GB resident) was retired — it left no headroom and bricked the GPU
 # whenever vision or whisper co-loaded.
 LOCAL_LLM_FALLBACK = True
-# 2026-07-09: gemma4:26b-a4b Q4_0 returns EMPTY output (broken quant) AND at
-# ~15-18GB it OOMs the 3090 once chatterbox+whisper+vision co-load. The 14B both
-# WORKS and fits with headroom. Override per-box via JARVIS_LOCAL_LLM_MODEL or
-# user_settings when more VRAM is free.
-LOCAL_LLM_MODEL    = "qwen2.5:14b-instruct-q5_K_M"
+# 2026-07-10: gemma4:12b won the on-box bake-off on the REAL ~10k-token prod
+# prompt — 7/7 (action grammar, honesty, reasoning), 0.6s warm turns, ZERO empty
+# replies, 8.4GB fully GPU-resident @16k ctx (vs qwen2.5:14b 6/7 @13.5GB), and
+# it is MULTIMODAL so chat+vision share ONE resident model (no more chat<->VLM
+# swap thrash — the swaps were wedging ollama's llama-server mid-eviction).
+# Benchmarks: ~77 MMLU-Pro, clearly above Qwen2.5-14B. Thinking disabled via
+# the API `think:false` param (_local_think_param). NOT the 26b-a4b MoE — that
+# quant returns EMPTY output (known ollama bugs #15428/#16456). Disqualified on
+# this 24GB box: qwen3:30b/qwen3.6 (redline the card to <0.3GB free beside the
+# voice clone; qwen3.6 cold turn measured 286s offloaded), gpt-oss:20b (2/7
+# EMPTY replies — Harmony-format quirk). Override per-box via
+# JARVIS_LOCAL_LLM_MODEL or user_settings when more VRAM is free.
+LOCAL_LLM_MODEL    = "gemma4:12b"
 LOCAL_LLM_BASE_URL = "http://localhost:11434"
 
 # When True, every ambient/background one-shot LLM call (memory extraction,
@@ -310,7 +324,11 @@ ORCHESTRATOR_MERGER_TIMEOUT_S   = 20.0
 # chat tag, or when there is VRAM headroom for both models at once.
 # Set LOCAL_VISION_MODEL to "off" to disable local vision entirely.
 LOCAL_VISION_FALLBACK = False
-LOCAL_VISION_MODEL    = "qwen2.5vl:7b"   # dedicated working VLM (6GB); gemma4:26b was broken + too big
+# Same tag as LOCAL_LLM_MODEL: gemma4:12b is multimodal, so vision re-uses the
+# RESIDENT chat model — no eviction/swap, no over-commit (the chat<->VLM swap
+# was wedging llama-server mid-eviction, live outage 2026-07-10 09:13). Vision
+# verified on-box: read synthetic screen text correctly with think:false.
+LOCAL_VISION_MODEL    = "gemma4:12b"
 
 
 # ─── Local image generation (skills/image_gen.py) ──────────────────────

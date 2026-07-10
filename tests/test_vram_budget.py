@@ -313,11 +313,12 @@ class PredictBudgetTests(_CacheResetBase):
         self.assertEqual(b["components"][0]["mb"], 6 * 1024)
 
     def test_default_chat_model_when_unset(self):
-        # No LOCAL_LLM_MODEL → falls back to config's gemma4 default (~16 GB).
+        # No LOCAL_LLM_MODEL → falls back to config's gemma4:12b default
+        # (~9 GB calibrated — 8.4 GB measured @16k ctx, 2026-07-10 bake-off).
         b = vb.predict_budget({"MODEL_ROUTING": {"vision": "cloud"},
                                "LOCAL_VISION_FALLBACK": False},
                               total_mb=_CARD_MB)
-        self.assertEqual(b["components"][0]["mb"], 16 * 1024)
+        self.assertEqual(b["components"][0]["mb"], 9 * 1024)
 
     def test_budget_is_card_minus_headroom(self):
         b = vb.predict_budget({"LOCAL_LLM_MODEL": "llama3.1:8b-instruct-q5_K_M",

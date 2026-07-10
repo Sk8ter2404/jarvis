@@ -96,10 +96,11 @@ def boot(timeout: float = 45.0) -> bool:
     print("[driver] booting JARVIS via _boot_jarvis.ps1 ...", file=sys.stderr)
     env = dict(os.environ)
     # Big local models brick a 24GB GPU once chatterbox + whisper + vision also
-    # load; and the gemma4:26b-a4b Q4_0 build returns EMPTY output (broken quant,
-    # 2026-07-09). Force the 14B that both WORKS and fits with headroom. Harmless
-    # on a box with more VRAM / cloud routing.
-    env.setdefault("JARVIS_LOCAL_LLM_MODEL", "qwen2.5:14b-instruct-q5_K_M")
+    # load; the gemma4:26b-a4b Q4_0 build returns EMPTY output (broken quant,
+    # 2026-07-09). gemma4:12b won the 2026-07-10 on-box bake-off (7/7 on the
+    # real prod prompt, 8.4GB resident, multimodal so vision shares the same
+    # model). Harmless on a box with more VRAM / cloud routing.
+    env.setdefault("JARVIS_LOCAL_LLM_MODEL", "gemma4:12b")
     try:
         subprocess.run(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", BOOT],

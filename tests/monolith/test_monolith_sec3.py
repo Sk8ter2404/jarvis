@@ -1096,6 +1096,32 @@ class NextLocalLlmFallbackTests(MonolithGlobalsTestCase):
 
 
 # ===========================================================================
+# _local_think_param — thinking-family detection for the Ollama `think` param
+# (voice needs thinking OFF; the /no_think prompt hack returned EMPTY on
+# qwen3:14b, the API param is the correct mechanism). 2026-07-10.
+# ===========================================================================
+@requires_monolith
+class LocalThinkParamTests(MonolithGlobalsTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_qwen3_families_disable_thinking(self):
+        for tag in ("qwen3:14b", "qwen3:30b-a3b-instruct-2507-q4_K_M",
+                    "qwen3.6:latest", "qwen3.6:27b", "gemma4:latest",
+                    "deepseek-r1:14b"):
+            self.assertIs(self.bc._local_think_param(tag), False, tag)
+
+    def test_gpt_oss_gets_low(self):
+        self.assertEqual(self.bc._local_think_param("gpt-oss:20b"), "low")
+
+    def test_pure_instruct_models_omit_param(self):
+        for tag in ("qwen2.5:14b-instruct-q5_K_M", "llama3.1:8b-instruct-q5_K_M",
+                    "qwen2.5vl:7b", "mistral-small3.2:latest", "", None):
+            self.assertIsNone(self.bc._local_think_param(tag), tag)
+
+
+# ===========================================================================
 # _call_local_llm — 200-OK-but-EMPTY reply (broken-quant fingerprint) fails
 # over ONCE to a different installed model instead of reporting "down".
 # ===========================================================================

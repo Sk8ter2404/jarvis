@@ -1327,6 +1327,29 @@ class LazyImportProbeTests(_LtmBase):
             emb = ltm._try_import_embedder()
         self.assertIsInstance(emb, FakeEmbedder)
 
+    def test_ltm_embed_device_knob_forces_cpu_even_with_cuda(self):
+        # LTM_EMBED_DEVICE="cpu" (config/user_settings) must win over the
+        # cuda auto-pick — frees ~0.4GB VRAM for the local LLM. 2026-07-10.
+        ltm._embedder = None
+        seen = {}
+
+        class RecordingEmbedder(FakeEmbedder):
+            def __init__(self, model, device=None, **k):
+                super().__init__()
+                seen["device"] = device
+
+        fake_st = types.ModuleType("sentence_transformers")
+        fake_st.SentenceTransformer = RecordingEmbedder
+        fake_torch = types.ModuleType("torch")
+        fake_torch.cuda = types.SimpleNamespace(is_available=lambda: True)
+        import core.config as _cfg
+        with mock.patch.dict(sys.modules, {"sentence_transformers": fake_st,
+                                           "torch": fake_torch}), \
+                mock.patch.object(_cfg, "LTM_EMBED_DEVICE", "cpu", create=True):
+            emb = ltm._try_import_embedder()
+        self.assertIsInstance(emb, FakeEmbedder)
+        self.assertEqual(seen.get("device"), "cpu")
+
     def test_try_import_embedder_cuda_load_fail_falls_back_to_cpu(self):
         ltm._embedder = None
         # First construction (cuda) raises; the CPU retry succeeds.
@@ -1345,8 +1368,13 @@ class LazyImportProbeTests(_LtmBase):
         fake_st.SentenceTransformer = CudaFailsThenCpu
         fake_torch = types.ModuleType("torch")
         fake_torch.cuda = types.SimpleNamespace(is_available=lambda: True)
+        # Pin the device knob to auto ("") — the LIVE user_settings.json may
+        # set LTM_EMBED_DEVICE="cpu", which would skip the cuda attempt this
+        # test exists to exercise.
+        import core.config as _cfg
         with mock.patch.dict(sys.modules, {"sentence_transformers": fake_st,
-                                           "torch": fake_torch}):
+                                           "torch": fake_torch}), \
+                mock.patch.object(_cfg, "LTM_EMBED_DEVICE", "", create=True):
             emb = ltm._try_import_embedder()
         self.assertIsInstance(emb, CudaFailsThenCpu)
         self.assertEqual(state["calls"], 2)      # cuda attempt + cpu retry

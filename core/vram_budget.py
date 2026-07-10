@@ -47,12 +47,19 @@ from typing import Optional
 _GB = 1024  # MB per GB (binary, to line up with nvidia-smi's MiB)
 
 CALIBRATED_VRAM_MB: dict[str, int] = {
+    "gemma4:12b":                  9 * _GB,     # 8.4 GB measured @16k ctx
+                                                # (2026-07-10 bake-off) + margin;
+                                                # multimodal — vision re-uses it
+    "gemma4:latest":               4 * _GB,     # E4B ~3.4 GB measured @8k ctx
     "gemma4:26b-a4b-it-qat":       16 * _GB,    # ~15 GB measured @16k ctx (2026-07,
                                                 # +~0.4 GB during a vision call —
                                                 # 16 keeps a little margin); multimodal
+                                                # (BROKEN quant — returns empty; kept
+                                                # only so the estimator prices it)
     "qwen3:30b-a3b-instruct-2507-q4_K_M": 21 * _GB,  # ~21 GB (MoE, 12k ctx window)
     "qwen2.5:32b-instruct-q4_K_M": 22 * _GB,    # ~22.0 GB
     "qwen2.5:14b-instruct-q5_K_M": 13 * _GB,    # ~13.0 GB
+    "qwen3:14b":                   12 * _GB,    # 11.8 GB measured @16k ctx
     "llama3.1:8b-instruct-q5_K_M": 6 * _GB,     # ~6.0 GB
     "qwen2.5vl:7b":                int(7.3 * _GB),  # ~7.3 GB (vision, on-demand)
     "large-v3-turbo":              int(1.5 * _GB),  # ~1.5 GB (Whisper, always)
@@ -71,7 +78,7 @@ DEFAULT_TOTAL_MB = 24576            # 24 GB (24576 MiB), the calibration card
 HEADROOM_MB = int(1.5 * _GB)       # ~1.5 GB reserve
 
 # Default chat model when settings don't name one (matches core/config.py).
-_DEFAULT_CHAT_MODEL = "gemma4:26b-a4b-it-qat"
+_DEFAULT_CHAT_MODEL = "gemma4:12b"
 
 # KV-cache / context allowance added to a disk-size estimate for an UNKNOWN
 # chat tag (the on-disk blob is weights only; the live load also holds the KV
