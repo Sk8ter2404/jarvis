@@ -4984,8 +4984,22 @@ def _probe_camera_index(idx: int, timeout_sec: float = CAMERA_PROBE_TIMEOUT_SEC)
             try:
                 cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
                 if cap.isOpened():
-                    ret, _ = cap.read()
-                    result["ok"] = bool(ret)
+                    # RETRY reads until the probe deadline — a WARMING camera
+                    # opens instantly but returns False frames for its first
+                    # ~2s (the Logi measured exactly that), so the old single
+                    # immediate read() failed healthy devices and the by-name
+                    # shuffled-index rescue could never succeed. The deadline
+                    # scales with timeout_sec so tiny-timeout unit tests stay
+                    # fast. 2026-07-10.
+                    deadline = time.monotonic() + max(0.05, timeout_sec - 0.2)
+                    while True:
+                        ret, _ = cap.read()
+                        if ret:
+                            result["ok"] = True
+                            break
+                        if time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.25)
             except Exception:
                 pass
             finally:
@@ -4997,7 +5011,9 @@ def _probe_camera_index(idx: int, timeout_sec: float = CAMERA_PROBE_TIMEOUT_SEC)
 
     t = threading.Thread(target=_open, daemon=True)
     t.start()
-    t.join(timeout=timeout_sec)
+    # +0.5s over the worker's own read deadline so a worker that succeeds at
+    # the buzzer isn't misread as wedged by a same-instant join expiry.
+    t.join(timeout=timeout_sec + 0.5)
     if t.is_alive():
         # Wedged in the C-level open call. Abandon the worker and report
         # failure — the underlying handle will be released when the worker
