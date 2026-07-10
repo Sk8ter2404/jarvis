@@ -657,6 +657,7 @@ def _generate_ideas(memory_summary: str, features: str, logs: str) -> list[str]:
                     _cli_cmd,
                     capture_output=True, text=True, timeout=300,
                     encoding="utf-8", cwd=PROJECT_DIR, env=_env,
+                    creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
                 )
             except subprocess.TimeoutExpired:
                 _log(f"  [ideas] CLI timed out on attempt {_attempt+1} — retrying")

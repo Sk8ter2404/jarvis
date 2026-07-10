@@ -155,7 +155,11 @@ def _act_screenshot(_: str = "") -> str:
             "$g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size); "
             f"$bmp.Save('{path}')"
         )
-        subprocess.run(["powershell", "-Command", ps], capture_output=True, timeout=60)
+        # getattr (not subprocess.CREATE_NO_WINDOW directly): the flag is a
+        # Windows-only attribute, and reading it survives a test that has left
+        # `subprocess` mocked — never AttributeErrors, real 0x08000000 on Win.
+        subprocess.run(["powershell", "-Command", ps], capture_output=True, timeout=60,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return f"screenshot saved to {path}"
     return "screenshot not supported (install Pillow + mss: pip install pillow mss)"
 
@@ -387,9 +391,19 @@ def _act_restart(_: str = "") -> str:
     def _do_restart():
         time.sleep(1.5)
         try:
+            # Detached + WINDOWLESS relaunch. CREATE_NEW_CONSOLE (the old value)
+            # forced a visible console window on the relaunched instance even
+            # though JARVIS runs as pythonw (GUI, no console) — a "ghost window"
+            # on every restart. DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP keeps
+            # the new process alive after this one os._exit()s, with no window
+            # (mirrors _ensure_ollama_running's detached spawn). 2026-07-10.
+            _flags = 0
+            if sys.platform == "win32":
+                _flags = (subprocess.DETACHED_PROCESS
+                          | subprocess.CREATE_NEW_PROCESS_GROUP)
             subprocess.Popen(
                 [sys.executable, script],
-                creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0,
+                creationflags=_flags,
                 close_fds=True,
             )
         except Exception as e:

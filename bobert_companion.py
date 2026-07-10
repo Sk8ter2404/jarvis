@@ -8503,6 +8503,7 @@ def _cuda0_free_vram_mb() -> int | None:
             ["nvidia-smi", "--query-gpu=memory.free",
              "--format=csv,noheader,nounits", "-i", "0"],
             capture_output=True, text=True, timeout=3,
+            creationflags=(_sp.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
         )
         if out.returncode == 0:
             lines = (out.stdout or "").strip().splitlines()
@@ -8566,6 +8567,7 @@ def _ollama_install_async() -> None:
                 ["winget", "install", "--id", "Ollama.Ollama",
                  "--silent", "--accept-package-agreements", "--accept-source-agreements"],
                 capture_output=True, text=True, timeout=600,
+                creationflags=(_sp.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
             )
             print(f"  [local-llm] winget install finished. Once Ollama is up, model `{LOCAL_LLM_MODEL}` will pull automatically.")
         except Exception as _e:
@@ -8956,6 +8958,7 @@ def _sac_blocked_local_recently() -> bool:
             out = subprocess.run(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
                 capture_output=True, text=True, timeout=4,
+                creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
             )
             blob = ((out.stdout or "") + (out.stderr or "")).lower()
             if "ollama" in blob or "ggml" in blob:
@@ -18862,6 +18865,7 @@ def _enforce_singleton():
                     r = subprocess.run(
                         ["tasklist", "/FI", f"PID eq {old_pid}", "/FO", "CSV", "/NH"],
                         capture_output=True, text=True, timeout=5,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
                     )
                     still_running = (str(old_pid) in r.stdout and "python" in r.stdout.lower())
                 except subprocess.TimeoutExpired:
@@ -19168,6 +19172,7 @@ def _get_active_power_plan_guid() -> str | None:
         out = subprocess.check_output(
             ["powercfg", "/getactivescheme"],
             stderr=subprocess.STDOUT, text=True, timeout=5,
+            creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
         )
     except Exception:
         return None
@@ -19182,6 +19187,7 @@ def _set_power_plan(guid: str) -> bool:
         subprocess.run(
             ["powercfg", "/setactive", guid],
             check=True, capture_output=True, text=True, timeout=5,
+            creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
         )
         return True
     except Exception:
