@@ -362,6 +362,12 @@ XTTS_LANGUAGE     = "en"         # ISO-639-1 hint for XTTS-v2
 VOICE_CLONE_ENABLED = False      # master switch (OFF by default)
 VOICE_CLONE_PROFILE = ""         # active profile name under data/voice_profiles/
 VOICE_CLONE_MODEL   = "chatterbox"   # engine id (currently only "chatterbox")
+# Torch device for the clone engine. "" = historical default (cuda:0 if present
+# else cpu). Set "cuda:1" to run chatterbox on a SECOND, idle GPU so it stops
+# eating the primary card's VRAM (frees ~3GB on the 3090 for the LLM). Gated by
+# a free-VRAM check in core/voice_clone (degrades to the edge-tts ladder if the
+# chosen device lacks room), so a bad value never OOMs. 2026-07-09.
+VOICE_CLONE_DEVICE  = ""
 
 
 # ─── Voice pipeline selector ───────────────────────────────────────────

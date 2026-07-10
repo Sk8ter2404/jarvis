@@ -144,3 +144,14 @@ logs_staging/
 
 # --- 3D-print binary assets (large; distributed separately if at all) --------
 Robot Project/
+_audit_v188_findings.json
+_audit_final_findings.json
+
+# --- Voice-clone reference & scratch audio (PERSONAL voice data — this repo is
+#     PUBLIC; consented-friend clone refs, the owner's own samples, and TTS
+#     scratch must NEVER be published). Root-level underscore audio only, so
+#     bundled asset audio elsewhere in the tree is unaffected. 2026-07-09. ------
+/_*.wav
+/_*.mp3
+/_*.flac
+/_*.ogg

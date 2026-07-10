@@ -8216,7 +8216,7 @@ def _ollama_alive() -> bool:
         return False
 
 
-def _ensure_ollama_running(timeout_sec: float = 30.0) -> bool:
+def _ensure_ollama_running(timeout_sec: float = 90.0) -> bool:
     """Self-heal: if the local Ollama server (the local-model brain) isn't
     answering, START it and wait for it to come up. Ollama being DOWN — after a
     reboot that didn't relaunch its desktop app, a crash, or a manual quit — is
@@ -8257,7 +8257,11 @@ def _ensure_ollama_running(timeout_sec: float = 30.0) -> bool:
     except Exception as e:
         print(f"  [ollama] failed to start server: {type(e).__name__}: {e}")
         return False
-    # First start takes ~20-25s (GPU discovery) before /api/tags answers.
+    # First start is SLOW: on a loaded multi-GPU box (3090 + 1650S) the CUDA
+    # discovery + runner spin-up measured ~60s before /api/tags first answered
+    # 200 (2026-07-09). A 30s wait gave up mid-discovery and logged a false
+    # "may be unavailable", even though the model was reachable moments later —
+    # so budget 90s here. It's a one-time boot cost; steady-state probes are ms.
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         if _ollama_alive():
