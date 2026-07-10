@@ -216,11 +216,20 @@ def _webcam_health() -> list[dict]:
             last_at = frame_at.get(idx, 0.0) or 0.0
             age = (now - last_at) if last_at else None
             face_at = seen_at.get(idx, 0.0) or 0.0
+            # Side comes from the LABEL first ("Left webcam (left monitor)")
+            # — look_x alone misclassified the LEFT cam, whose look_x is
+            # exactly 0.5, as "right" ("the right and right monitor webcams
+            # are both live", live 2026-07-10). look_x stays as the fallback
+            # for label-less entries, with 0.5 counting as left.
+            _lbl = str(cam.get("label", "")).lower()
+            _side = ("left" if "left" in _lbl else
+                     "right" if "right" in _lbl else
+                     ("left" if cam.get("look_x", 0.5) <= 0.5 else "right"))
             out.append({
                 "index": idx,
                 "label": cam.get("label", f"camera {idx}"),
                 "primary": bool(cam.get("primary")),
-                "side": ("left" if cam.get("look_x", 0.5) < 0.5 else "right"),
+                "side": _side,
                 "live": bool(last_at and age is not None
                              and age <= _WEBCAM_LIVE_SECONDS),
                 "age": (round(age, 1) if age is not None else None),

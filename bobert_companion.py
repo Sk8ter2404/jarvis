@@ -1348,6 +1348,20 @@ from core.prompts import PC_CONTROL_PROMPT  # noqa: F401
 # late-bind doesn't fire until an action is actually dispatched.
 from core.actions import *  # noqa: F401,F403
 
+# CREATE_NO_WINDOW safety net (2026-07-10): the ghost-window class came BACK
+# hours after v2.0.32 fixed the 9 audited spawn sites — the HUD's ~3s
+# nvidia-smi poll and this module's GPU-temp/ping helpers were unaudited
+# sites, and the default-terminal delegation registry doesn't hold on this
+# Windows build. Per-site fixes lose to entropy (any future bare
+# subprocess.run() reintroduces the leak), so patch Popen once: spawns with
+# no creationflags AND no startupinfo get CREATE_NO_WINDOW; explicit flags
+# (DETACHED_PROCESS, CREATE_NEW_CONSOLE, custom startupinfo) pass untouched.
+try:
+    from core.no_window_subprocess import install as _install_no_window
+    _install_no_window()
+except Exception:
+    pass
+
 
 _CHAPPIE_STANDING_RULES_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "data", "chappie_standing_rules.json"
@@ -21115,6 +21129,29 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         # to crash silently in detached pythonw before writing one.
         print(f"  [singleton] check failed, proceeding without lock: {_se}")
     atexit.register(_release_singleton)
+
+    # Watchdog handshake (2026-07-10): tools/jarvis_watchdog.ps1 resurrects
+    # JARVIS after an UNINTENDED death (live case: an iCUE reinstall swapped
+    # the audio stack under our WASAPI streams and killed the process with no
+    # trace). A CLEAN exit (voice shutdown / tray quit / sys.exit) runs atexit
+    # and leaves the flag so the watchdog stays put; a hard kill never reaches
+    # atexit → no flag → watchdog reboots us. Delete the flag NOW so a crash
+    # after a prior clean shutdown is still resurrected.
+    _clean_flag = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "data", "clean_shutdown.flag")
+    try:
+        if os.path.exists(_clean_flag):
+            os.unlink(_clean_flag)
+    except Exception:
+        pass
+
+    def _mark_clean_shutdown(path=_clean_flag):
+        try:
+            with open(path, "w", encoding="utf-8") as _f:
+                _f.write(str(time.time()))
+        except Exception:
+            pass
+    atexit.register(_mark_clean_shutdown)
 
     # OVERLAY REAPER (P0-2): now that we ARE the singleton, kill any reticle /
     # air-cursor overlay subprocesses left behind by a PREVIOUS JARVIS that

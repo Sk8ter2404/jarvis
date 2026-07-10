@@ -51,6 +51,19 @@ import sys
 import threading
 import time
 
+# CREATE_NO_WINDOW safety net: this overlay's ~3s nvidia-smi utilization poll
+# was popping a Windows Terminal ghost window PER POLL (~38 windows in 30 min,
+# live 2026-07-10) — the overlay runs as pythonw with no console, so every
+# unflagged console spawn allocates a visible one. hud/ isn't a package root,
+# hence the parent-dir insert. Fail-open: a missing core module must never
+# stop the HUD.
+try:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from core.no_window_subprocess import install as _install_no_window
+    _install_no_window()
+except Exception:
+    pass
+
 try:
     import psutil
     _HAS_PSUTIL = True

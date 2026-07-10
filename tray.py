@@ -78,6 +78,14 @@ import threading
 import time
 import types
 
+# CREATE_NO_WINDOW safety net — the tray runs as pythonw; any console helper
+# it spawns without a flag pops a visible ghost window (2026-07-10).
+try:
+    from core.no_window_subprocess import install as _install_no_window
+    _install_no_window()
+except Exception:
+    pass
+
 try:
     import pystray
     from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont

@@ -155,6 +155,17 @@ def _newest_log(log_dir: str) -> str | None:
         return None
 
 
+# ANSI escape sequences leak into the session log from libraries that emit
+# styled console output (ctranslate2/whisper notes print ESC[3m italics); the
+# browser log panel rendered them as tofu ("⯑[3mNotes:"). Strip CSI sequences
+# and any stray ESC before serving. (Audit finding 2026-07-10.)
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _strip_ansi(line: str) -> str:
+    return _ANSI_ESCAPE_RE.sub("", line).replace("\x1b", "")
+
+
 def tail_log(log_dir: str, lines: int) -> dict:
     """Return the last ``lines`` lines of the newest session log as a dict::
 
@@ -179,7 +190,7 @@ def tail_log(log_dir: str, lines: int) -> dict:
             f.seek(max(0, size - _LOG_TAIL_WINDOW_BYTES))
             chunk = f.read()
         text = chunk.decode("utf-8", errors="replace")
-        tail = text.splitlines()[-lines:]
+        tail = [_strip_ansi(l) for l in text.splitlines()[-lines:]]
     except Exception:
         return {"log": os.path.basename(lg), "lines": [], "running": False}
     try:
@@ -1520,9 +1531,13 @@ def _dashboard_html(token: str) -> str:
   * {{ box-sizing:border-box; }}
   body {{ margin:0; background:radial-gradient(1200px 600px at 50% -10%, #0a1a26 0%, var(--bg) 60%);
           color:var(--text); font:14px/1.5 ui-monospace,Menlo,Consolas,monospace; }}
+  /* flex-wrap: at <~780px the 7 nav tabs used to run off-screen with no
+     wrap or scroll — Settings/Memory were unreachable on narrow windows
+     (audit finding 2026-07-10). */
   header {{ display:flex; align-items:center; gap:14px; padding:14px 18px;
             border-bottom:1px solid var(--edge); position:sticky; top:0;
-            background:rgba(5,8,13,.9); backdrop-filter:blur(6px); }}
+            background:rgba(5,8,13,.9); backdrop-filter:blur(6px);
+            flex-wrap:wrap; }}
   .reactor {{ width:22px; height:22px; border-radius:50%;
               background:radial-gradient(circle at 50% 50%, #eafcff, var(--cyan) 45%, var(--cyan-dim) 70%, #04222b 100%);
               box-shadow:0 0 12px var(--cyan), 0 0 28px var(--cyan-dim); }}

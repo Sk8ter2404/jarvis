@@ -166,6 +166,24 @@ class CameraStatusTests(CameraSystemBase):
         self.assertIn("left", out.lower())
         self.assertIn("right", out.lower())
 
+    def test_side_from_label_wins_over_midpoint_look_x(self):
+        # Regression (live 2026-07-10): the REAL config's left cam has
+        # look_x=0.5 exactly, and side was derived as `look_x < 0.5` → both
+        # cams said "right" ("the right and right monitor webcams are both
+        # live"). The label names the side — it must win.
+        live_shape = [
+            {"index": 2, "label": "Left webcam (left monitor)",
+             "primary": True, "look_x": 0.5, "look_y": 0.5},
+            {"index": 0, "label": "Right webcam (top of right monitor)",
+             "primary": False, "look_x": 0.85, "look_y": 0.5},
+        ]
+        bc = _fake_monolith(frame_ages={0: 0.2, 2: 0.5})
+        bridge = _fake_bridge(available=(False, "no sensor"))
+        _mod, actions = self._load(bc=bc, bridge=bridge, cameras=live_shape)
+        out = actions["camera_status"]("")
+        self.assertIn("left and right", out.lower())
+        self.assertNotIn("right and right", out.lower())
+
     def test_stale_webcam_reported_dark(self):
         # idx0 fresh (live), idx1 stale (30s old → dark).
         bc = _fake_monolith(frame_ages={0: 0.2, 1: 30.0},

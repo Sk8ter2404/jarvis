@@ -28,6 +28,15 @@ import sys
 import time
 import tkinter as tk
 
+# CREATE_NO_WINDOW safety net for any console helper this overlay spawns —
+# pythonw + unflagged console spawn = visible ghost window (2026-07-10).
+try:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from core.no_window_subprocess import install as _install_no_window
+    _install_no_window()
+except Exception:
+    pass
+
 try:
     import psutil
     _HAS_PSUTIL = True
