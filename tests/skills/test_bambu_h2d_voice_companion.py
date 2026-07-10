@@ -185,6 +185,58 @@ class VoiceCompanionSnapshotTests(VoiceCompanionMixin, unittest.TestCase):
         self.assertIn("layer 142", hit[0])
         self.assertTrue(mod._announced_failed[0])
 
+    def test_midflight_discovery_premarks_passed_milestones(self):
+        # JARVIS restarts while a print is at 80%: the FIRST observed
+        # snapshot (previous filename None) must pre-mark 25/50/75 rather
+        # than blurting "Print at 25%, sir" for a print it never watched.
+        mod, _a = self._load()  # _load resets _current_filename[0] = None
+        snap = {"filename": "cube.3mf", "mc_percent": 80, "mc_remaining": 40}
+        with mock.patch.object(mod, "_gated_announce") as gated, \
+             mock.patch.object(mod, "_direct_enqueue") as direct:
+            with mod._state_lock:
+                mod._process_snapshot(snap, "RUNNING")
+        gated.assert_not_called()
+        direct.assert_not_called()
+        self.assertEqual({25, 50, 75}, mod._announced_milestones)
+        # The milestone actually reached AFTER discovery still announces.
+        snap2 = {"filename": "cube.3mf", "mc_percent": 100}
+        with mock.patch.object(mod, "_gated_announce") as gated2:
+            with mod._state_lock:
+                mod._process_snapshot(snap2, "RUNNING")
+        self.assertTrue(any("Print at 100%" in c.args[0]
+                            for c in gated2.call_args_list))
+
+    def test_fresh_print_first_observation_announces_normally(self):
+        # First observation of a print at 0% pre-marks nothing — the 25%
+        # line fires when the print actually gets there.
+        mod, _a = self._load()
+        with mock.patch.object(mod, "_gated_announce") as gated:
+            with mod._state_lock:
+                mod._process_snapshot(
+                    {"filename": "cube.3mf", "mc_percent": 0}, "RUNNING")
+        gated.assert_not_called()
+        self.assertEqual(set(), mod._announced_milestones)
+        with mock.patch.object(mod, "_gated_announce") as gated2:
+            with mod._state_lock:
+                mod._process_snapshot(
+                    {"filename": "cube.3mf", "mc_percent": 25}, "RUNNING")
+        self.assertTrue(any("Print at 25%" in c.args[0]
+                            for c in gated2.call_args_list))
+
+    def test_subsequent_filename_change_does_not_premark(self):
+        # A filename CHANGE mid-session (old -> new) is a real new print:
+        # milestones reset and are NOT pre-marked even if the first
+        # snapshot of the new file reports a nonzero percent.
+        mod, _a = self._load()
+        mod._current_filename[0] = "old"
+        snap = {"filename": "new_part.3mf", "mc_percent": 30}
+        with mock.patch.object(mod, "_gated_announce") as gated:
+            with mod._state_lock:
+                mod._process_snapshot(snap, "RUNNING")
+        # 25 announces (crossed after the reset) rather than being primed.
+        self.assertTrue(any("Print at 25%" in c.args[0]
+                            for c in gated.call_args_list))
+
     def test_new_filename_resets_bookkeeping(self):
         mod, _a = self._load()
         mod._current_filename[0] = "old"

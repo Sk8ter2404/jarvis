@@ -298,12 +298,29 @@ def _process_snapshot(snapshot: dict, gcode_state: str) -> None:
     # because bambu_monitor already does that and double-resetting our
     # bookkeeping mid-print would cause repeated announcements.
     if fname and fname != _current_filename[0]:
+        # On the very first populated snapshot after a (re)start the
+        # previous filename is None, so a print already mid-flight is
+        # indistinguishable from a fresh one — pre-mark the milestones it
+        # has already passed rather than blurting "Print at 25%, sir" the
+        # moment we discover an 80%-done print (mirrors
+        # bambu_print_announcer's mid-flight priming; a genuinely fresh
+        # print sits at ~0%, so nothing gets pre-marked).
+        first_observation = _current_filename[0] is None
         _current_filename[0] = fname
         _announced_milestones.clear()
         _announced_error_codes.clear()
         _announced_layer_shift[0] = False
         _announced_ams_error[0]   = False
         _announced_failed[0]      = False
+        if first_observation:
+            try:
+                cur_pct = float(pct) if pct is not None else None
+            except (TypeError, ValueError):
+                cur_pct = None
+            if cur_pct is not None:
+                for threshold in _MILESTONES:
+                    if cur_pct >= threshold:
+                        _announced_milestones.add(threshold)
 
     # Coerce pct once.
     try:
