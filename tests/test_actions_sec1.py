@@ -330,21 +330,36 @@ class VolumeTests(unittest.TestCase):
 
     def test_set_volume_spoken_number_falls_back_to_parser(self):
         # "thirty" → the monolith's _parse_spoken_number → 30; pycaw mocked
-        # via sys.modules so no real COM endpoint is touched.
+        # via sys.modules so no real COM endpoint is touched. Uses the modern
+        # AudioDevice.EndpointVolume shape (verified on-box 2026-07-10).
         fake = mock.Mock()
         fake._parse_spoken_number.return_value = 30
         fake_vol = mock.MagicMock()
+        fake_dev = mock.Mock()
+        fake_dev.EndpointVolume = fake_vol
         fake_pycaw = mock.MagicMock()
-        fake_ct = mock.MagicMock()
-        fake_ct.cast.return_value = fake_vol
+        fake_pycaw.AudioUtilities.GetSpeakers.return_value = fake_dev
         with _patch_bc(fake), \
                 mock.patch.dict(sys.modules, {
-                    "comtypes": mock.MagicMock(),
                     "pycaw": mock.MagicMock(),
                     "pycaw.pycaw": fake_pycaw,
-                    "ctypes": fake_ct,
                 }):
             out = A._act_set_volume("thirty")
+        self.assertEqual(out, "volume set to 30 percent, sir")
+        fake_vol.SetMasterVolumeLevelScalar.assert_called_once_with(0.3, None)
+
+    def test_set_volume_digits_direct(self):
+        fake_vol = mock.MagicMock()
+        fake_dev = mock.Mock()
+        fake_dev.EndpointVolume = fake_vol
+        fake_pycaw = mock.MagicMock()
+        fake_pycaw.AudioUtilities.GetSpeakers.return_value = fake_dev
+        with _patch_bc(mock.Mock()), \
+                mock.patch.dict(sys.modules, {
+                    "pycaw": mock.MagicMock(),
+                    "pycaw.pycaw": fake_pycaw,
+                }):
+            out = A._act_set_volume("30%")
         self.assertEqual(out, "volume set to 30 percent, sir")
         fake_vol.SetMasterVolumeLevelScalar.assert_called_once_with(0.3, None)
 

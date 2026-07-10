@@ -240,14 +240,21 @@ def _act_set_volume(arg: str = "") -> str:
         return (f"couldn't parse a volume percent from {arg!r} — "
                 "give a number from 0 to 100")
     try:
-        from ctypes import POINTER, cast
-
-        from comtypes import CLSCTX_ALL
-        from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+        from pycaw.pycaw import AudioUtilities
 
         dev = AudioUtilities.GetSpeakers()
-        iface = dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        vol = cast(iface, POINTER(IAudioEndpointVolume))
+        # Modern pycaw returns an AudioDevice wrapper with a ready-made
+        # EndpointVolume property (verified on-box 2026-07-10); older releases
+        # return the raw COM device needing the Activate+cast dance.
+        vol = getattr(dev, "EndpointVolume", None)
+        if vol is None:
+            from ctypes import POINTER, cast
+
+            from comtypes import CLSCTX_ALL
+            from pycaw.pycaw import IAudioEndpointVolume
+
+            iface = dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+            vol = cast(iface, POINTER(IAudioEndpointVolume))
         vol.SetMasterVolumeLevelScalar(n / 100.0, None)
         return f"volume set to {n} percent, sir"
     except Exception as e:
