@@ -4204,6 +4204,42 @@ class LocalVisionColoadGuardTests(MonolithGlobalsTestCase):
 
 
 @requires_monolith
+class EnsureOllamaRunningTests(MonolithGlobalsTestCase):
+    """_ensure_ollama_running — self-heal that starts the Ollama server when it's
+    down (the local brain). 2026-07-09."""
+
+    def test_noop_when_already_alive(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_ollama_alive", return_value=True), \
+                mock.patch.object(bc.subprocess, "Popen") as popen:
+            self.assertTrue(bc._ensure_ollama_running(timeout_sec=1.0))
+        popen.assert_not_called()   # never launch when it's already up
+
+    def test_starts_server_when_down_then_comes_up(self):
+        bc = self.bc
+        # down on the first check, up after we "start" it.
+        alive = iter([False, True])
+        with mock.patch.object(bc, "_ollama_alive", side_effect=lambda: next(alive)), \
+                mock.patch("shutil.which", return_value=r"C:\ollama.exe"), \
+                mock.patch.object(bc.subprocess, "Popen") as popen:
+            ok = bc._ensure_ollama_running(timeout_sec=5.0)
+        self.assertTrue(ok)
+        popen.assert_called_once()
+        # launched the serve subcommand
+        args = popen.call_args.args[0]
+        self.assertEqual(args[-1], "serve")
+
+    def test_returns_false_when_exe_missing(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_ollama_alive", return_value=False), \
+                mock.patch("shutil.which", return_value=None), \
+                mock.patch("os.path.isfile", return_value=False), \
+                mock.patch.object(bc.subprocess, "Popen") as popen:
+            self.assertFalse(bc._ensure_ollama_running(timeout_sec=1.0))
+        popen.assert_not_called()
+
+
+@requires_monolith
 class EnsureOllamaSingleModelEnvTests(MonolithGlobalsTestCase):
     """_persist_user_env + _ensure_ollama_single_model_env — the OLLAMA_MAX_
     LOADED_MODELS=1 cap that makes Ollama evict instead of co-load."""

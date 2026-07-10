@@ -87,9 +87,9 @@ RESTART_NOTE = "Some changes apply on the next restart."
 # probed by `installed_ollama_models()`.
 OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_MODEL_FALLBACK = [
-    "gemma4:26b-a4b-it-qat",
-    "qwen3:30b-a3b-instruct-2507-q4_K_M",
-    "qwen2.5:14b-instruct-q5_K_M",
+    "qwen2.5:14b-instruct-q5_K_M",          # default: works + fits with headroom
+    "qwen3:30b-a3b-instruct-2507-q4_K_M",   # smartest, but needs freed VRAM (~19GB)
+    "gemma4:latest",                        # small 8B fallback
     "llama3.1:8b-instruct-q5_K_M",
 ]
 # Tag substrings that are NOT chat models (embedding / vision) — excluded from
@@ -367,7 +367,7 @@ SCHEMA: dict[str, dict] = {
     },
     "LOCAL_LLM_MODEL": {
         "tab": "ai", "label": "Local LLM model (Ollama, $0)", "type": "combo",
-        "default": "gemma4:26b-a4b-it-qat",
+        "default": "qwen2.5:14b-instruct-q5_K_M",
         "choices": OLLAMA_MODEL_FALLBACK,
         "help": "Ollama tag for the always-on local brain — $0 per conversation. "
                 "The list is your installed Ollama chat models (probed when this "
