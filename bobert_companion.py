@@ -19703,9 +19703,15 @@ def _preflight_cameras(timeout_sec: float = 2.0) -> None:
             continue
         if results.get(idx, False):
             print(f"  [preflight] camera index {idx}: opens cleanly ✓")
-        elif _camera_rescued_by_name(cam, idx, timeout_sec=timeout_sec):
+        elif _camera_rescued_by_name(
+                cam, idx, timeout_sec=max(timeout_sec * 2.5, 5.0)):
             # Present at a shuffled live index (name-resolved) — keep it, don't
-            # mark bad. 2026-07-08.
+            # mark bad. 2026-07-08. The rescue probe gets the RETRY-pass budget
+            # (not the quick first-pass one): the Logi's first frame measured
+            # 2.0s on a shuffled index — exactly the old 2.0s cutoff, so the
+            # rescue kept missing by a hair and the LEFT camera was dropped
+            # every boot after the Kinect fell off the DirectShow list and
+            # re-enumerated everything (live 2026-07-10).
             pass
         else:
             print(f"  [preflight] camera index {idx}: failed to open in "
