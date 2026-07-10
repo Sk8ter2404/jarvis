@@ -5239,9 +5239,19 @@ def _face_tracking_thread():
         # shared singleton, so this never collides with cv2's DirectShow heap.
         if isinstance(cam, dict):
             idx = cam["index"]
-            want_kinect = (cam.get("type") == "kinect") or KINECT_AS_CAMERA
+            cam_name = cam.get("name")
+            # KINECT_AS_CAMERA must not HIJACK a NAMED webcam entry: with the
+            # flag on and a HEALTHY Kinect, BOTH webcam slots silently became
+            # Kinect color streams and the real webcams went unread (live
+            # 2026-07-10 — every "individual" camera tile showed the same
+            # Kinect view; masked for weeks because a wedged Kinect fell back
+            # to the webcams anyway). The flag now only lets kinect-typed or
+            # UNNAMED entries use the sensor.
+            want_kinect = (cam.get("type") == "kinect"
+                           or (KINECT_AS_CAMERA and not cam_name))
         else:
             idx = cam
+            cam_name = None
             want_kinect = KINECT_AS_CAMERA
         # NAME-BASED RESOLUTION (P0-1, the mic-shuffle bug class): if the entry
         # carries a "name", resolve the LIVE DirectShow index by that friendly-
@@ -5250,7 +5260,6 @@ def _face_tracking_thread():
         # working index silently tracking the WRONG camera. The static index is
         # the FALLBACK, used only when the name doesn't resolve (pygrabber missing
         # / device unplugged). Never applies to a Kinect slot (no DSHOW index).
-        cam_name = cam.get("name") if isinstance(cam, dict) else None
         if cam_name and not want_kinect:
             live_idx = _dshow_name_to_index(cam_name)
             if live_idx is not None:
