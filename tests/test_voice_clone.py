@@ -401,5 +401,66 @@ class DeviceSelectionTests(unittest.TestCase):
         fake_mod.ChatterboxTTS.from_pretrained.assert_not_called()
 
 
+class NormalizeNumbersForSpeechTests(unittest.TestCase):
+    """_normalize_numbers_for_speech — chatterbox has NO text normaliser, so
+    times/decimals/versions/percents must be pre-spelled (owner heard '20.07'
+    as 'two thousand seven', 2026-07-10)."""
+
+    def _n(self, s):
+        return vc._normalize_numbers_for_speech(s)
+
+    def test_clock_time_with_meridiem(self):
+        self.assertEqual(self._n("It will conclude at 2:07 PM."),
+                         "It will conclude at two oh seven p m.")
+
+    def test_24h_time(self):
+        self.assertEqual(self._n("It is 14:07."), "It is fourteen oh seven.")
+
+    def test_on_the_hour(self):
+        self.assertEqual(self._n("Meet at 10:00 AM."), "Meet at ten a m.")
+        self.assertEqual(self._n("at 10:00 sharp"), "at ten o'clock sharp")
+
+    def test_decimal_reported_bug(self):
+        self.assertEqual(self._n("The reading is 20.07 today."),
+                         "The reading is twenty point zero seven today.")
+
+    def test_version_triplet(self):
+        self.assertEqual(self._n("version 2.0.33, sir"),
+                         "version two point zero point thirty three, sir")
+
+    def test_percent(self):
+        self.assertEqual(self._n("GPU at 87% now"),
+                         "GPU at eighty seven percent now")
+        self.assertEqual(self._n("CPU 20.5%"),
+                         "CPU twenty point five percent")
+
+    def test_non_times_left_alone(self):
+        for s in ("ratio 3:2 in the score", "It is 25:99 not a time",
+                  "That costs 1234 dollars.", "call 911 now"):
+            self.assertEqual(self._n(s), s)
+
+    def test_plain_integers_untouched(self):
+        self.assertEqual(self._n("Open bay 42, sir."), "Open bay 42, sir.")
+
+    def test_never_raises_and_returns_original_on_junk(self):
+        self.assertEqual(self._n(""), "")
+        self.assertIsNone(vc._normalize_numbers_for_speech(None))
+
+    def test_synthesize_feeds_normalized_text_to_engine(self):
+        # End-to-end through synthesize(): the engine must receive the
+        # SPOKEN form, not the raw digits.
+        fake_model = mock.MagicMock()
+        fake_model.generate.return_value = None   # abort after generate
+        prof = {"name": "me", "consent": True, "source": "owner",
+                "reference_wav": "x.wav"}
+        with mock.patch.object(vc, "profile_is_usable", return_value=True), \
+             mock.patch.object(vc, "_chatterbox_importable", return_value=True), \
+             mock.patch.object(vc, "_cuda_available", return_value=True), \
+             mock.patch.object(vc, "_load_engine", return_value=fake_model):
+            vc.synthesize("Done at 2:07 PM.", profile=prof)
+        sent = fake_model.generate.call_args.args[0]
+        self.assertEqual(sent, "Done at two oh seven p m.")
+
+
 if __name__ == "__main__":
     unittest.main()

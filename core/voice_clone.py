@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Optional, Tuple
 
@@ -403,6 +404,109 @@ def is_available() -> bool:
         return False
 
 
+# ─── Spoken-number normalisation (chatterbox has NO text normaliser) ────────
+#
+# edge-tts runs Microsoft's text normalisation, so "2:07 PM" / "20.07" / "87%"
+# read correctly there. Chatterbox (the clone engine) reads raw tokens — the
+# owner heard "20.07" spoken as "two thousand seven" and clock times mangled
+# (reported 2026-07-10). Convert times/decimals/versions/percents into
+# unambiguous spoken words BEFORE the clone renders. Integers are left alone
+# (chatterbox reads plain integers acceptably); only the ambiguous shapes are
+# rewritten. Pure + unit-testable.
+
+_ONES = ("zero one two three four five six seven eight nine ten eleven twelve "
+         "thirteen fourteen fifteen sixteen seventeen eighteen nineteen").split()
+_TENS = ("", "", "twenty", "thirty", "forty", "fifty",
+         "sixty", "seventy", "eighty", "ninety")
+
+
+def _int_to_words(n: int) -> str:
+    """0..999_999 → English words (enough for hours/minutes/decimal wholes;
+    larger values fall back to digit-by-digit which chatterbox reads fine)."""
+    if n < 0:
+        return "minus " + _int_to_words(-n)
+    if n < 20:
+        return _ONES[n]
+    if n < 100:
+        t, o = divmod(n, 10)
+        return _TENS[t] + (f" {_ONES[o]}" if o else "")
+    if n < 1000:
+        h, r = divmod(n, 100)
+        return f"{_ONES[h]} hundred" + (f" {_int_to_words(r)}" if r else "")
+    if n < 1_000_000:
+        th, r = divmod(n, 1000)
+        return f"{_int_to_words(th)} thousand" + (f" {_int_to_words(r)}" if r else "")
+    return " ".join(_ONES[int(d)] for d in str(n))
+
+
+def _digits_to_words(digits: str) -> str:
+    """'07' → 'zero seven' — decimal fractions are read digit-by-digit."""
+    return " ".join(_ONES[int(d)] for d in digits)
+
+
+# NB: the am/pm group must NOT consume a sentence-final dot ("2:07 PM." keeps
+# its full stop for TTS pausing) — hence `m\b` with no trailing `\.?`. The
+# whitespace lives INSIDE the optional group so a bare "10:00 sharp" doesn't
+# lose the space after the time.
+_TIME_RE = re.compile(
+    r"\b(\d{1,2}):(\d{2})(?::\d{2})?(?:\s*((?:a|p)\.?m\b))?(?![\d:])",
+    re.IGNORECASE)
+_VERSION_RE = re.compile(r"\b(\d+)\.(\d+)\.(\d+)\b")
+_DECIMAL_RE = re.compile(r"\b(\d{1,6})\.(\d{1,4})\b")
+_PERCENT_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*%")
+
+
+def _normalize_numbers_for_speech(text: str) -> str:
+    """Times / decimals / versions / percents → spoken words for chatterbox.
+
+    '2:07 PM'  → 'two oh seven p m'      '14:07' → 'fourteen oh seven'
+    '20.07'    → 'twenty point zero seven'
+    '2.0.33'   → 'two point zero point thirty three'
+    '87%'      → 'eighty seven percent'
+    Never raises — on any surprise the original text is returned unchanged."""
+    if not text:
+        return text
+    try:
+        out = str(text)
+
+        def _pct(m):
+            num = m.group(1)
+            if "." in num:
+                w, f = num.split(".", 1)
+                return f"{_int_to_words(int(w))} point {_digits_to_words(f)} percent"
+            return f"{_int_to_words(int(num))} percent"
+        out = _PERCENT_RE.sub(_pct, out)
+
+        def _time(m):
+            hour, minute, ampm = int(m.group(1)), m.group(2), m.group(3)
+            if not (0 <= hour <= 23) or not (0 <= int(minute) <= 59):
+                return m.group(0)          # not a real clock time — leave it
+            h = _int_to_words(hour)
+            mi = int(minute)
+            if mi == 0:
+                spoken = h if ampm else f"{h} o'clock"
+            elif mi < 10:
+                spoken = f"{h} oh {_ONES[mi]}"
+            else:
+                spoken = f"{h} {_int_to_words(mi)}"
+            if ampm:
+                spoken += " p m" if ampm.lower().startswith("p") else " a m"
+            return spoken
+        out = _TIME_RE.sub(_time, out)
+
+        def _ver(m):
+            return " point ".join(_int_to_words(int(g)) for g in m.groups())
+        out = _VERSION_RE.sub(_ver, out)
+
+        def _dec(m):
+            return f"{_int_to_words(int(m.group(1)))} point {_digits_to_words(m.group(2))}"
+        out = _DECIMAL_RE.sub(_dec, out)
+
+        return out
+    except Exception:
+        return text
+
+
 def synthesize(text: str, profile: Optional[dict] = None) -> Optional[Tuple["np.ndarray", int]]:
     """Render ``text`` through the cloned voice and return
     ``(np.ndarray float32 mono, sample_rate)``, or ``None`` on ANY failure so
@@ -432,7 +536,10 @@ def synthesize(text: str, profile: Optional[dict] = None) -> Optional[Tuple["np.
         # Chatterbox: generate a waveform conditioned on the reference clip.
         # Return shape is a torch tensor / array-like; normalise to a mono
         # float32 numpy buffer + its sample rate. Wrapped thin + mocked in CI.
-        wav = model.generate(str(text), audio_prompt_path=ref_wav)
+        # Numbers FIRST: chatterbox has no text normaliser, so times/decimals
+        # must be pre-spelled ("20.07" was heard as "two thousand seven").
+        wav = model.generate(_normalize_numbers_for_speech(str(text)),
+                             audio_prompt_path=ref_wav)
         audio, sr = _to_mono_float32(wav, model)
         if audio is None or sr <= 0 or getattr(audio, "size", 0) == 0:
             return None
