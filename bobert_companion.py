@@ -13219,8 +13219,11 @@ def _streaming_confirm_playback(cfg: dict, verify_q: str) -> tuple[bool, str]:
         return True, detail
     title_detail = detail
 
-    # 2) vision fallback — only if the capability is present.
-    vision_ok = (SCREEN_VISION_ENABLED and AI_BACKEND == "claude")
+    # 2) vision fallback — only if the capability is present. Same rule as
+    # the auto-play gate: Claude OR the local VLM (ask_vision routes to it),
+    # not Claude-only — the stale Claude-only check left local-route playback
+    # forever "unconfirmed" (2026-07-10).
+    vision_ok = (SCREEN_VISION_ENABLED and _vision_click_backend_available())
     if not vision_ok:
         return False, f"{title_detail}; vision fallback unavailable"
     is_playing, vision_answer = _streaming_verify_playback(verify_q)
@@ -13422,6 +13425,30 @@ def _apple_music_resolve_track(query: str) -> dict | None:
     }
 
 
+def _vision_click_backend_available() -> bool:
+    """True when SOME vision backend can serve find_click_target: the Claude
+    backend, OR the local VLM (ask_vision falls through to it — that path has
+    worked since the local_vision skill landed). The auto-play capability
+    gate used to require `AI_BACKEND == "claude"` outright, so on a
+    local-only box (Claude capped, chat/vision routed local) every
+    vision-click service opened the search page and then STOPPED — the
+    owner's "play skrillex — pulled it up on youtube then stopped"
+    (2026-07-10). Uses the same MODULE globals as the rest of the auto-play
+    gate (kept in sync by the settings apply, and what the tests patch)."""
+    if AI_BACKEND == "claude":
+        return True
+    vm = str(LOCAL_VISION_MODEL or "").strip().lower()
+    if not vm or vm == "off":
+        return False
+    if LOCAL_VISION_FALLBACK:
+        return True
+    try:
+        import core.config as _cfg
+        return _cfg.model_route("vision") == "local"
+    except Exception:
+        return False
+
+
 def _streaming_auto_play(service_key: str, query: str) -> str:
     """Open a streaming service's search page for `query`, activate the first
     result, then start playback. Services with `verify_play: True` confirm
@@ -13593,10 +13620,12 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
                 f"opened {service_label} for '{q}' — auto-play needs UI "
                 f"automation (keyboard control) to start playback"
             )
-    elif not (SCREEN_VISION_ENABLED and UI_AUTOMATION_ENABLED and AI_BACKEND == "claude"):
+    elif not (SCREEN_VISION_ENABLED and UI_AUTOMATION_ENABLED
+              and _vision_click_backend_available()):
         return (
             f"opened {service_label} search for '{q}' — auto-click needs "
-            f"SCREEN_VISION_ENABLED + UI_AUTOMATION_ENABLED + Claude backend"
+            f"SCREEN_VISION_ENABLED + UI_AUTOMATION_ENABLED + a vision "
+            f"backend (Claude or a local vision model)"
         )
 
     # Step 2: activate the first result. Three paths:
@@ -13809,10 +13838,12 @@ def _apple_music_play_playlist(name: str) -> str:
     )
     time.sleep(cfg["load_wait"])
 
-    if not (SCREEN_VISION_ENABLED and UI_AUTOMATION_ENABLED and AI_BACKEND == "claude"):
+    if not (SCREEN_VISION_ENABLED and UI_AUTOMATION_ENABLED
+            and _vision_click_backend_available()):
         return (
             f"opened Apple Music Library > Playlists — auto-click needs "
-            f"SCREEN_VISION_ENABLED + UI_AUTOMATION_ENABLED + Claude backend"
+            f"SCREEN_VISION_ENABLED + UI_AUTOMATION_ENABLED + a vision "
+            f"backend (Claude or a local vision model)"
         )
 
     # Step 2: locate the named playlist tile. If the direct URL didn't land
