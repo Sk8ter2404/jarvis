@@ -633,5 +633,41 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertTrue(callable(sw.main))
 
 
+class SettingsPathRoleTests(unittest.TestCase):
+    """settings_path() resolution order: explicit JARVIS_SETTINGS_PATH env >
+    staging role (JARVIS_STAGING=1 / --staging) > live default. The staging
+    branch is the 2026-07-11 fix for the sweep-pollution incident: a staging
+    harness's toggle actions persisted through this writer STRAIGHT into the
+    live prod file (twice), because only the env override redirected it."""
+
+    def _path_with(self, env):
+        with mock.patch.dict(os.environ, env, clear=False):
+            for absent in ("JARVIS_SETTINGS_PATH", "JARVIS_STAGING"):
+                if absent not in env:
+                    os.environ.pop(absent, None)
+            return sw.settings_path()
+
+    def test_default_is_live_file(self):
+        p = self._path_with({})
+        self.assertEqual(p, sw.SETTINGS_PATH)
+        self.assertIn(os.path.join("data", "user_settings.json"), p)
+
+    def test_staging_env_redirects_to_staging_copy(self):
+        p = self._path_with({"JARVIS_STAGING": "1"})
+        self.assertIn(os.path.join("data_staging", "user_settings.json"), p)
+        self.assertNotEqual(p, sw.SETTINGS_PATH)
+
+    def test_explicit_override_beats_staging(self):
+        p = self._path_with({"JARVIS_STAGING": "1",
+                             "JARVIS_SETTINGS_PATH": r"C:\tmp\override.json"})
+        self.assertEqual(p, r"C:\tmp\override.json")
+
+    def test_staging_argv_redirects(self):
+        import sys as _sys
+        with mock.patch.object(_sys, "argv", ["prog", "--staging"]):
+            p = self._path_with({})
+        self.assertIn(os.path.join("data_staging", "user_settings.json"), p)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -4429,5 +4429,144 @@ class EnsureOllamaSingleModelEnvTests(MonolithGlobalsTestCase):
             self.assertEqual(os.environ.get("OLLAMA_MAX_LOADED_MODELS"), "2")
 
 
+@requires_monolith
+class VisionClickBackendAvailableTests(MonolithGlobalsTestCase):
+    """_vision_click_backend_available — the auto-play capability gate must
+    accept the LOCAL vision route, not just Claude (the stale Claude-only
+    check stranded local-route playback on the search page, 2026-07-10)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_claude_backend_is_enough(self):
+        with mock.patch.object(self.bc, "AI_BACKEND", "claude"):
+            self.assertTrue(self.bc._vision_click_backend_available())
+
+    def test_local_backend_without_vision_model(self):
+        with mock.patch.object(self.bc, "AI_BACKEND", "ollama"), \
+             mock.patch.object(self.bc, "LOCAL_VISION_MODEL", ""):
+            self.assertFalse(self.bc._vision_click_backend_available())
+
+    def test_local_backend_vision_model_off(self):
+        with mock.patch.object(self.bc, "AI_BACKEND", "ollama"), \
+             mock.patch.object(self.bc, "LOCAL_VISION_MODEL", "off"):
+            self.assertFalse(self.bc._vision_click_backend_available())
+
+    def test_local_backend_with_fallback_enabled(self):
+        with mock.patch.object(self.bc, "AI_BACKEND", "ollama"), \
+             mock.patch.object(self.bc, "LOCAL_VISION_MODEL", "gemma4:12b"), \
+             mock.patch.object(self.bc, "LOCAL_VISION_FALLBACK", True):
+            self.assertTrue(self.bc._vision_click_backend_available())
+
+    def test_local_backend_via_model_route(self):
+        import core.config as _cc
+        with mock.patch.object(self.bc, "AI_BACKEND", "ollama"), \
+             mock.patch.object(self.bc, "LOCAL_VISION_MODEL", "gemma4:12b"), \
+             mock.patch.object(self.bc, "LOCAL_VISION_FALLBACK", False), \
+             mock.patch.object(_cc, "model_route", return_value="local"):
+            self.assertTrue(self.bc._vision_click_backend_available())
+
+
+@requires_monolith
+class YoutubeResolveVideoTests(MonolithGlobalsTestCase):
+    """_youtube_resolve_video — first ORGANIC videoId from results HTML."""
+
+    # Ad slot first (no videoRenderer inside), then the organic row: the
+    # first "videoRenderer" match must be the organic one.
+    _HTML = (
+        '{"adSlotRenderer":{"promoted":true}}'
+        '{"videoRenderer":{"videoId":"dQw4w9WgXcQ","thumbnail":{},'
+        '"title":{"runs":[{"text":"Darude - Sandstorm"}]}}}'
+        '{"videoRenderer":{"videoId":"aaaaaaaaaaa"}}'
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def _resp(self, ok=True, text=""):
+        r = mock.Mock()
+        r.ok = ok
+        r.text = text
+        return r
+
+    def test_resolves_first_organic_video(self):
+        with mock.patch.object(self.bc.requests, "get",
+                               return_value=self._resp(text=self._HTML)):
+            out = self.bc._youtube_resolve_video("sandstorm")
+        self.assertEqual(out["video_id"], "dQw4w9WgXcQ")
+        self.assertEqual(out["url"],
+                         "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        self.assertEqual(out["title"], "Darude - Sandstorm")
+
+    def test_no_video_renderer_returns_none(self):
+        with mock.patch.object(self.bc.requests, "get",
+                               return_value=self._resp(text="<html>nope</html>")):
+            self.assertIsNone(self.bc._youtube_resolve_video("q"))
+
+    def test_http_error_returns_none(self):
+        with mock.patch.object(self.bc.requests, "get",
+                               return_value=self._resp(ok=False)):
+            self.assertIsNone(self.bc._youtube_resolve_video("q"))
+
+    def test_network_exception_returns_none(self):
+        with mock.patch.object(self.bc.requests, "get",
+                               side_effect=OSError("offline")):
+            self.assertIsNone(self.bc._youtube_resolve_video("q"))
+
+
+@requires_monolith
+class AutoPlayYoutubeResolvedPathTests(MonolithGlobalsTestCase):
+    """_streaming_auto_play('youtube', …) wiring (review 2026-07-11):
+    1. the resolved watch-URL path (select_method 'none') must pass the
+       capability gate WITHOUT a vision backend — no click is needed, and
+    2. verify_play services with play_hint=None must reach the strict
+       verify loop instead of returning an unverified "playing" (the old
+       early-return made every youtube verify_* key dead config)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def _drive(self, resolved):
+        bc = self.bc
+        verify = mock.Mock(return_value="VERIFY-PATH")
+        with mock.patch.object(bc, "_youtube_resolve_video",
+                               return_value=resolved), \
+             mock.patch.object(bc, "_open_url_in_browser",
+                               return_value="chrome") as opener, \
+             mock.patch.object(bc, "_find_browser_window_matching",
+                               return_value=None), \
+             mock.patch.object(bc, "_streaming_play_and_verify", verify), \
+             mock.patch.object(bc, "_streaming_go_fullscreen"), \
+             mock.patch.object(bc.time, "sleep"), \
+             mock.patch.object(bc, "SCREEN_VISION_ENABLED", False), \
+             mock.patch.object(bc, "UI_AUTOMATION_ENABLED", True):
+            out = bc._streaming_auto_play("youtube", "sandstorm")
+        return out, verify, opener
+
+    def test_resolved_path_verifies_even_without_vision(self):
+        resolved = {"url": "https://www.youtube.com/watch?v=abc123def45",
+                    "video_id": "abc123def45", "title": "Sandstorm"}
+        out, verify, opener = self._drive(resolved)
+        # Gate must NOT bail (no click needed), and the result must come from
+        # the strict verify loop — never an assumed "playing".
+        self.assertEqual(out, "VERIFY-PATH")
+        verify.assert_called_once()
+        # The watch URL itself was opened, not the search page.
+        opened_url = opener.call_args[0][0]
+        self.assertIn("/watch?v=abc123def45", opened_url)
+
+    def test_unresolved_without_vision_reports_gate_honestly(self):
+        # Resolver fails → vision-click path → with no vision backend the
+        # gate must return the honest capability message, not "playing".
+        out, verify, opener = self._drive(None)
+        self.assertIn("auto-click needs", out)
+        verify.assert_not_called()
+        opened_url = opener.call_args[0][0]
+        self.assertIn("results?search_query=", opened_url)
+
+
 if __name__ == "__main__":
     unittest.main()

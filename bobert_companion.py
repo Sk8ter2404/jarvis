@@ -13689,13 +13689,17 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
     strict = bool(cfg.get("verify_play"))
 
     # Capability gate. The KEYBOARD (Apple Music search) and resolved
-    # track-page ("none") paths drive playback with UI automation plus
+    # detail/watch-page ("none") paths drive playback with UI automation plus
     # tab-title / vision confirmation, so they need UI automation but not
     # vision on the happy path — requiring vision here would wrongly block
     # them when SCREEN_VISION is off. Vision-click services still need the
-    # full vision + Claude set.
-    ui_only = (
-        bool(cfg.get("title_confirm")) and select_method in ("keyboard", "none")
+    # full vision set. "none" qualifies on its OWN, not only with
+    # title_confirm: the resolved-YouTube path (no title_confirm) needs zero
+    # clicks — the old `title_confirm and …` shape sent it into the vision
+    # gate, the same stale-gate class that broke local-route auto-play twice
+    # before (2026-07-11).
+    ui_only = select_method == "none" or (
+        bool(cfg.get("title_confirm")) and select_method == "keyboard"
     )
     if ui_only:
         if not UI_AUTOMATION_ENABLED:
@@ -13763,8 +13767,18 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
     # Step 3: click the play button (services that have a separate detail
     # page after the result click).
     if not cfg.get("play_hint"):
-        # No explicit play step (e.g., YouTube — clicking the thumbnail
-        # navigates straight into autoplay). Still try to full-screen.
+        # No explicit play step (e.g., YouTube — the watch page / clicked
+        # thumbnail autoplays). verify_play services MUST still confirm:
+        # this branch used to return "playing" unconditionally, which made
+        # every youtube verify_* key dead config and reintroduced the
+        # click-and-ASSUME false "playing" the eyes-on watch caught
+        # (review 2026-07-11). _streaming_play_and_verify handles the
+        # no-button case via verify_first + recheck/playpause strategies —
+        # nothing in youtube's strategy list dereferences play_hint.
+        if strict:
+            return _streaming_play_and_verify(
+                cfg, service_label, q, result_coords=coords
+            )
         _streaming_go_fullscreen(cfg, service_label)
         return f"playing '{q}' on {service_label}"
 

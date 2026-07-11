@@ -33,6 +33,16 @@ sys.path.insert(0, ".")
 # settings, data files, logs) is rerouted to the *_staging equivalents, so a
 # sweep can execute settings-toggling actions without mutating the real box.
 os.environ.setdefault("JARVIS_STAGING", "1")
+# …and it happened AGAIN on 2026-07-11: JARVIS_STAGING only rerouted the
+# monolith's own module-level paths — settings_window.settings_path() (the
+# writer every settings-toggling SKILL action uses) honoured only
+# JARVIS_SETTINGS_PATH, so the second sweep also wrote the live file.
+# settings_path() is staging-aware now; this explicit redirect is the
+# belt-and-suspenders so the sweep is safe even if that logic regresses.
+os.environ.setdefault(
+    "JARVIS_SETTINGS_PATH",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 "data_staging", "user_settings.json"))
 
 # Handlers that must NOT be invoked from a sweep: process control, state
 # wipes, spawning long-lived subprocesses/threads that outlive the harness,

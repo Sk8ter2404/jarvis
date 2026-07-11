@@ -63,11 +63,25 @@ SETTINGS_PATH_ENV = "JARVIS_SETTINGS_PATH"
 def settings_path() -> str:
     """Resolve the settings file path, honouring the ``JARVIS_SETTINGS_PATH``
     override at call time. Returns that env var's value when set and non-empty,
-    otherwise the default ``data/user_settings.json``. Resolving here (rather
-    than binding a module-level default once at import) is what lets a redirect
-    set after import still take effect for both load and save."""
+    otherwise the staging copy for a STAGING-role process, otherwise the
+    default ``data/user_settings.json``. Resolving here (rather than binding a
+    module-level default once at import) is what lets a redirect set after
+    import still take effect for both load and save.
+
+    STAGING (2026-07-11): every settings-persisting action routes through this
+    writer, but only JARVIS_SETTINGS_PATH used to redirect it — JARVIS_STAGING
+    meant nothing here, so a staging harness (tools/action_smoke.py) that
+    executed toggle actions wrote KINECT_GAZE_ENABLED / VOICE_CLONE_ENABLED
+    straight into the LIVE prod file TWICE (2026-07-10 and again 2026-07-11,
+    turning the face-tracker ci_sim gates red both times). A staging-role
+    process now writes blue_green_manager's seeded copy in data_staging/."""
     override = (os.environ.get(SETTINGS_PATH_ENV) or "").strip()
-    return override or SETTINGS_PATH
+    if override:
+        return override
+    if (os.environ.get("JARVIS_STAGING", "").strip() == "1"
+            or "--staging" in sys.argv):
+        return os.path.join(PROJECT_DIR, "data_staging", "user_settings.json")
+    return SETTINGS_PATH
 
 # Theme — identical palette to the tray dialogs.
 BG = "#0d1117"

@@ -180,25 +180,23 @@ class VoiceCloneSkillTests(unittest.TestCase):
 
 
 class PersistenceTests(unittest.TestCase):
-    """The real _persist writes JSON to data/user_settings.json — verify it
-    writes the expected keys and never raises. The write is redirected to a
-    tempdir (os.makedirs + open patched on the skill module) so the real
-    data/user_settings.json is never touched."""
+    """_persist routes through the shared Settings writer
+    (settings_window.load/save_settings) since 2026-07-11 — the old hand-built
+    data/user_settings.json path was the ONE writer that ignored the
+    JARVIS_SETTINGS_PATH / staging redirects, which is how a staging action
+    sweep flipped VOICE_CLONE_ENABLED in the LIVE prod file. Verify the
+    expected keys land at settings_path() and that failures never raise."""
 
     def test_persist_writes_expected_keys(self):
         mod, _ = load_skill_isolated("voice_clone")
 
-        # Redirect the skill's project root at __file__ so root→data→file lands
-        # in a tempdir; capture the JSON the writer emits, without touching the
-        # real data/user_settings.json.
+        # Redirect the shared writer with its own env override — exactly the
+        # isolation contract _persist must now honour.
         with tempfile.TemporaryDirectory() as d:
-            # Skill derives root = dirname(dirname(abspath(__file__))); make
-            # abspath return a path two levels under our tempdir so data/ lands
-            # inside it.
-            fake_file = os.path.join(d, "skills", "voice_clone.py")
-            with mock.patch.object(mod.os.path, "abspath", return_value=fake_file):
+            target = os.path.join(d, "user_settings.json")
+            with mock.patch.dict(os.environ,
+                                 {"JARVIS_SETTINGS_PATH": target}):
                 mod._persist(enabled=True, profile="me")
-            target = os.path.join(d, "data", "user_settings.json")
             self.assertTrue(os.path.isfile(target),
                             "persist should have written the settings file")
             import json as _json
@@ -208,9 +206,11 @@ class PersistenceTests(unittest.TestCase):
         self.assertTrue(written.get("VOICE_CLONE_ENABLED"))
         self.assertEqual(written.get("VOICE_CLONE_PROFILE"), "me")
 
-    def test_persist_never_raises_on_bad_path(self):
+    def test_persist_never_raises_on_write_failure(self):
         mod, _ = load_skill_isolated("voice_clone")
-        with mock.patch.object(mod.os, "makedirs", side_effect=OSError("read-only")):
+        from tools import settings_window as sw
+        with mock.patch.object(sw, "save_settings",
+                               side_effect=OSError("read-only")):
             # Must swallow and return quietly (persistence is best-effort).
             mod._persist(enabled=False)
 

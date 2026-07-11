@@ -92,34 +92,29 @@ def _apply_runtime(enabled: Optional[bool] = None, profile: Optional[str] = None
 
 
 def _persist(enabled: Optional[bool] = None, profile: Optional[str] = None) -> None:
-    """Best-effort write-through to data/user_settings.json so the selection
-    survives a restart (mirrors how the Settings GUI persists these knobs).
-    Never raises — a read-only / missing data dir just means the choice is
-    runtime-only, exactly like the existing TTS-backend voice toggle.
+    """Best-effort write-through so the selection survives a restart, via the
+    Settings writer (settings_window.load/save_settings — honours the
+    JARVIS_SETTINGS_PATH and staging redirects, atomic, merge-not-clobber),
+    same as every other settings-persisting skill. This used to build the
+    data/user_settings.json path BY HAND — the only writer in the tree that
+    did — so a staging harness executing the voice-clone toggle actions wrote
+    VOICE_CLONE_ENABLED=false into the LIVE prod file and silently killed the
+    clone voice the owner then reported dead (2026-07-10, again 2026-07-11).
+    Never raises — persistence is a nicety; the runtime globals are already
+    set.
     """
     try:
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        data_dir = os.path.join(root, "data")
-        path = os.path.join(data_dir, "user_settings.json")
-        current: dict = {}
-        if os.path.isfile(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    loaded = json.load(f)
-                if isinstance(loaded, dict):
-                    current = loaded
-            except Exception:
-                current = {}
+        from tools import settings_window as sw
+        current = sw.load_settings()
+        if not isinstance(current, dict):
+            current = {}
         if enabled is not None:
             current["VOICE_CLONE_ENABLED"] = bool(enabled)
         if profile is not None:
             current["VOICE_CLONE_PROFILE"] = str(profile)
-        os.makedirs(data_dir, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(current, f, indent=2)
+        sw.save_settings(current)
     except Exception:
-        # Persistence is a nicety, not a requirement — the runtime globals are
-        # already set. Swallow so a locked/absent file never breaks the action.
+        # Swallow so a locked/absent file never breaks the action.
         pass
 
 
