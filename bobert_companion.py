@@ -12824,10 +12824,36 @@ _STREAMING_SERVICES = {
         "tab_match":        ["youtube"],
         "load_wait":        3.5,
         "post_click":       0.0,
-        "result_hint":      "the first video thumbnail in the YouTube search results (skip ads and 'Shorts' rows — pick a normal video result)",
+        "result_hint":      "the LARGE rectangular video THUMBNAIL IMAGE of "
+                            "the first video in the YouTube search results — "
+                            "the centre of the picture itself, NOT the title "
+                            "text, NOT the channel row, NOT the left sidebar "
+                            "(skip ads and 'Shorts' rows — pick a normal "
+                            "video result)",
         "play_hint":        None,   # YouTube auto-plays once a video is opened
         "fullscreen_key":   "f",
         "fullscreen_wait":  4.0,    # let the watch page + player finish loading
+        # RESOLVE + VERIFY (2026-07-10): youtube used to be click-and-ASSUME —
+        # the result said "playing '<q>'" even when the vision click landed in
+        # the gutter and the SEARCH page was still on screen (caught red-handed
+        # by an eyes-on screenshot watch; the owner heard "playing" while
+        # looking at un-clicked results). Primary path is now DETERMINISTIC:
+        # resolve the first organic videoId from the results HTML and open the
+        # watch URL directly (autoplay; no click at all). Vision click remains
+        # the fallback when resolution fails, and playback is ALWAYS
+        # vision-confirmed now instead of assumed.
+        "resolve_youtube":  True,
+        "verify_play":      True,
+        "verify_first":     True,   # watch page autoplays — often already going
+        "verify_attempts":  3,
+        "verify_wait":      3.0,
+        "play_strategies":  ["recheck", "playpause", "recheck"],
+        "verify_question": (
+            "Look at this screenshot. Is a single YouTube VIDEO actively "
+            "open in the watch view (one large video player filling most of "
+            "the page or fullscreen)? A GRID OR LIST of search results with "
+            "many thumbnails means NO. Answer strictly yes or no."
+        ),
     },
 }
 
@@ -13458,6 +13484,40 @@ def _vision_click_backend_available() -> bool:
         return False
 
 
+def _youtube_resolve_video(query: str) -> dict | None:
+    """First ORGANIC video for `query` from the YouTube results HTML (no API
+    key). ytInitialData embeds `"videoRenderer":{"videoId":"…"}` for organic
+    rows only — ads use promoted/adSlot renderers and Shorts use
+    reelItemRenderer, so the first videoRenderer id IS the first normal
+    result. Returns {"url","video_id","title"} or None; never raises. Added
+    2026-07-10 so youtube_play activates DETERMINISTICALLY (open the watch
+    URL) instead of vision-clicking a thumbnail."""
+    try:
+        u = ("https://www.youtube.com/results?search_query="
+             + urllib.parse.quote(query))
+        r = requests.get(u, timeout=10, headers={
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36"),
+            "Accept-Language": "en-US,en;q=0.8",
+        })
+        if not r.ok:
+            return None
+        m = re.search(r'"videoRenderer":\{"videoId":"([A-Za-z0-9_-]{11})"',
+                      r.text)
+        if not m:
+            return None
+        vid = m.group(1)
+        tm = re.search(
+            r'"videoRenderer":\{"videoId":"' + re.escape(vid)
+            + r'".{0,3000}?"title":\{"runs":\[\{"text":"(.*?)"',
+            r.text, re.S)
+        title = tm.group(1) if tm else ""
+        return {"url": f"https://www.youtube.com/watch?v={vid}",
+                "video_id": vid, "title": title}
+    except Exception:
+        return None
+
+
 def _streaming_auto_play(service_key: str, query: str) -> str:
     """Open a streaming service's search page for `query`, activate the first
     result, then start playback. Services with `verify_play: True` confirm
@@ -13524,6 +13584,17 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
     # track detail page has the single large Play button play_button targets.
     # Fall back to the search page if resolution fails.
     resolved = _apple_music_resolve_track(q) if cfg.get("resolve_itunes") else None
+    yt_resolved = None
+    if not resolved and cfg.get("resolve_youtube"):
+        # Deterministic YouTube activation: first organic videoId from the
+        # results HTML → open the watch URL directly. No vision click needed;
+        # verify_play still confirms honestly. Falls through to the vision
+        # click path when resolution fails (offline / markup change).
+        yt_resolved = _youtube_resolve_video(q)
+        if yt_resolved:
+            print(f"  [auto-play] resolved YouTube video -> "
+                  f"{(yt_resolved.get('title') or yt_resolved['video_id'])[:70]}",
+                  flush=True)
     if resolved:
         url = resolved["url"]
         q = (f"{resolved['name']} by {resolved['artist']}"
@@ -13553,6 +13624,9 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
             "verify_first": False,
         }
         print(f"  [auto-play] resolved track via iTunes API -> {q}", flush=True)
+    elif yt_resolved:
+        url = yt_resolved["url"]
+        select_method = "none"      # opening the watch page IS the activation
     else:
         url = cfg["search_url"].format(q=urllib.parse.quote(q))
         select_method = cfg.get("select_method", "vision")
