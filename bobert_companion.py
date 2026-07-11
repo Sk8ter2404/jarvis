@@ -8450,9 +8450,18 @@ def _ensure_ollama_running(timeout_sec: float = 90.0) -> bool:
     _reap_wedged_ollama()
     print(f"  [ollama] server is down — starting it headlessly ({exe} serve)…")
     try:
+        # CREATE_NO_WINDOW, deliberately NOT DETACHED_PROCESS (2026-07-10):
+        # detached gives ollama NO console, so every llama-server runner it
+        # spawns (one per model load/swap) must ALLOCATE one — and with the
+        # default-terminal delegation stuck on Windows Terminal, that popped a
+        # visible WT window PER MODEL EVENT (the owner's "ghost windows that
+        # disappear... something about AppData" — the titles were
+        # AppData\...\Ollama\ollama.EXE / llama-server.exe). A HIDDEN console
+        # is INHERITED by every child instead: zero windows, ever. Lifetime is
+        # unaffected — the server still outlives JARVIS.
         flags = 0
         if os.name == "nt":
-            flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
+            flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
                      | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
         subprocess.Popen([exe, "serve"], creationflags=flags,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
