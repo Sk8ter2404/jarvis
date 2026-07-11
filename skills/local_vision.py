@@ -40,9 +40,22 @@ import re
 
 def _bobert():
     """Lazily resolve the bobert_companion module so this skill can be
-    imported without forcing a circular reference at load time."""
+    imported without forcing a circular reference at load time.
+
+    Prefer whichever candidate actually LOOKS like the monolith:
+    `__main__` always exists, so the old `get("__main__") or
+    get("bobert_companion")` never fell through — correct in the live
+    process (where the monolith IS __main__) but in any other host
+    (test harness, action sweep, a driver script) it returned the
+    host's own module and the unguarded `b.take_screenshot(...)` call
+    sites crashed with AttributeError (caught by the 660-action sweep
+    2026-07-11)."""
     import sys
-    return sys.modules.get("__main__") or sys.modules.get("bobert_companion")
+    for name in ("__main__", "bobert_companion"):
+        m = sys.modules.get(name)
+        if m is not None and hasattr(m, "take_screenshot"):
+            return m
+    return sys.modules.get("bobert_companion")
 
 
 def _parse_monitor_prefix(text: str) -> tuple[str | None, str]:

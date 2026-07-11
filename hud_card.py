@@ -64,6 +64,20 @@ def show_card(card_type: str,
     card_type: 'morning' | 'evening' | 'status' (controls only the title).
     """
     try:
+        # STAGING/harness processes must never pop a renderer window on the
+        # live desktop — JARVIS_STAGING reroutes state files, but the SCREEN
+        # is shared. Six skills (briefings, dossier, calendar, status panel)
+        # all funnel through this one entry point, so the guard lives here
+        # rather than in each caller (the 2026-07-11 action sweep rendered a
+        # card on the owner's monitor through exactly this path).
+        try:
+            from core import is_staging
+            if is_staging():
+                print(f"  [hud_card] staging role — suppressing '{card_type}' "
+                      f"card render")
+                return
+        except Exception:
+            pass
         state = _build_card_state(card_type, duration_seconds)
         _write_state(state)
         _ensure_renderer_running()

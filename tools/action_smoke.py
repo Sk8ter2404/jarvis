@@ -69,6 +69,31 @@ _DENYLIST_NAMES = {
     "run_shell", "launch_app",
 }
 
+# Skills whose SPAWNING actions pop real overlay windows on the live desktop —
+# JARVIS_STAGING isolates state paths, but the SCREEN is not staged: the
+# 2026-07-11 sweep walked these alphabetically and stacked NINE HUDs on the
+# owner's monitors (holo canvas, hud_v2, print monitor, bambu camera/overlay,
+# workshop, arc reactor, full-screen jarvis_holo via suit_up; dossier's card
+# left hud_card.pid in the repo root). Module-based so all ~100 aliases are
+# covered without a name list; hide_*/dismiss_*/*_off/*_status stay swept —
+# they only close/query windows.
+_DENYLIST_MODULES = ("holographic_overlay", "dossier", "suit_up",
+                     "night_owl_mode",
+                     # morning_handoff's workspace actions ARRANGE REAL
+                     # WINDOWS via win32 (launch apps, move/minimize,
+                     # volume) — the 2026-07-11 sweep minimized the live
+                     # JARVIS HUD through this path.
+                     "morning_handoff")
+
+
+def _spawns_desktop_windows(name: str, fn) -> bool:
+    mod = getattr(fn, "__module__", "") or ""
+    if not any(m in mod for m in _DENYLIST_MODULES):
+        return False
+    safe = (name.endswith("_off") or name.endswith("_status")
+            or name.startswith(("hide_", "dismiss_")))
+    return not safe
+
 def main() -> int:
     from tests._monolith_harness import load_monolith
     bc = load_monolith()
@@ -91,7 +116,8 @@ def main() -> int:
     t_start = time.time()
     for name in sorted(actions):
         fn = actions[name]
-        if name in _DENYLIST_NAMES or id(fn) in deny_fns:
+        if (name in _DENYLIST_NAMES or id(fn) in deny_fns
+                or _spawns_desktop_windows(name, fn)):
             results["skipped"].append(name)
             continue
         try:

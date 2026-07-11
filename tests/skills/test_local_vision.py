@@ -65,6 +65,30 @@ class LocalVisionHelperTests(unittest.TestCase):
     def setUp(self):
         self.mod, self.actions = load_skill_isolated("local_vision")
 
+    # ── _bobert resolution (2026-07-11 sweep crash) ───────────────────────
+    def test_bobert_skips_foreign_main(self):
+        # In any host that isn't the monolith (harness, sweep, driver),
+        # __main__ exists but has no take_screenshot — _bobert must fall
+        # through to the imported bobert_companion module instead of
+        # returning the host's own module (the old `get("__main__") or ...`
+        # short-circuited on __main__ ALWAYS, so unguarded
+        # b.take_screenshot(...) call sites crashed with AttributeError).
+        import sys, types
+        fake_main = types.ModuleType("__main__")          # no take_screenshot
+        fake_bc = types.ModuleType("bobert_companion")
+        fake_bc.take_screenshot = lambda **kw: b"png"
+        with mock.patch.dict(sys.modules, {"__main__": fake_main,
+                                           "bobert_companion": fake_bc}):
+            self.assertIs(self.mod._bobert(), fake_bc)
+
+    def test_bobert_prefers_monolith_main(self):
+        # Live process: the monolith IS __main__ — it must win.
+        import sys, types
+        fake_main = types.ModuleType("__main__")
+        fake_main.take_screenshot = lambda **kw: b"png"
+        with mock.patch.dict(sys.modules, {"__main__": fake_main}):
+            self.assertIs(self.mod._bobert(), fake_main)
+
     # ── _parse_monitor_prefix (local fallback when bc has no parser) ──────
     def test_parse_monitor_prefix_present(self):
         with mock.patch.object(self.mod, "_bobert", return_value=None):
@@ -238,13 +262,24 @@ class ResolverHelperTests(unittest.TestCase):
                 if saved_bc is not None:
                     sys.modules["bobert_companion"] = saved_bc
 
-    def test_bobert_prefers_main_then_bobert(self):
+    def test_bobert_prefers_monolith_looking_module(self):
+        # 2026-07-11: resolution is by CAPABILITY, not name order. A bare
+        # __main__ (a harness/driver host, no take_screenshot) must NOT win
+        # over the imported monolith — the old name-order preference made
+        # unguarded b.take_screenshot(...) call sites crash in any non-live
+        # host. When neither candidate looks like the monolith, fall back to
+        # bobert_companion (the named import beats an arbitrary host script).
         fake_main = types.ModuleType("__main__")
         fake_bc = types.ModuleType("bobert_companion")
         with mock.patch.dict(sys.modules, {"__main__": fake_main,
                                            "bobert_companion": fake_bc}):
+            self.assertIs(self.mod._bobert(), fake_bc)
+        # Live shape: the monolith IS __main__ (has take_screenshot) — wins.
+        fake_main.take_screenshot = lambda **kw: b"png"
+        with mock.patch.dict(sys.modules, {"__main__": fake_main,
+                                           "bobert_companion": fake_bc}):
             self.assertIs(self.mod._bobert(), fake_main)
-        # With __main__ removed, falls through to bobert_companion.
+        # With __main__ removed entirely, falls through to bobert_companion.
         with mock.patch.dict(sys.modules, {"bobert_companion": fake_bc}):
             saved = sys.modules.pop("__main__", None)
             try:
