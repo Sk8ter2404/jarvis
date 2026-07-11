@@ -64,6 +64,12 @@ _DENYLIST_NAMES = {
     "disney_plus", "hulu", "max", "spotify", "play_streaming", "apple_music",
     "open_apple_music", "play_music", "play_vibe", "play_unheard",
     "web_search", "search",
+    # 2026-07-11 sweep leaks: the youtube_search skill's aliases each opened
+    # a REAL browser tab (3 tabs of the yt-dlp resolution of "test"), and
+    # keep_music_open launches/pins the Apple Music app + a keep-alive
+    # daemon.
+    "youtube_direct", "youtube_search_direct", "yt_direct",
+    "keep_music_open",
     # input injection on the live desktop
     "click", "press", "hotkey", "type", "scroll", "screenshot",
     "run_shell", "launch_app",
@@ -83,7 +89,9 @@ _DENYLIST_MODULES = ("holographic_overlay", "dossier", "suit_up",
                      # WINDOWS via win32 (launch apps, move/minimize,
                      # volume) — the 2026-07-11 sweep minimized the live
                      # JARVIS HUD through this path.
-                     "morning_handoff")
+                     "morning_handoff",
+                     # every youtube_search action opens a real browser tab
+                     "youtube_search")
 
 
 def _spawns_desktop_windows(name: str, fn) -> bool:
