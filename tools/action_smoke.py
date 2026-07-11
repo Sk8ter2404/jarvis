@@ -19,10 +19,20 @@ Exit 0 when nothing crashed; 1 when any handler raised.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 
 sys.path.insert(0, ".")
+
+# STATE ISOLATION — set BEFORE anything imports the monolith. The first full
+# sweep ran against the LIVE state: an action persisted KINECT_GAZE_ENABLED
+# into data/user_settings.json, which then leaked into unrelated face-tracker
+# unit tests and turned two ci_sim gates red (2026-07-10). JARVIS_STAGING=1
+# flips the blue/green isolation: every module-level state path (locks,
+# settings, data files, logs) is rerouted to the *_staging equivalents, so a
+# sweep can execute settings-toggling actions without mutating the real box.
+os.environ.setdefault("JARVIS_STAGING", "1")
 
 # Handlers that must NOT be invoked from a sweep: process control, state
 # wipes, spawning long-lived subprocesses/threads that outlive the harness,
