@@ -437,6 +437,15 @@ class _FakePsutil:
 class ParentAliveRecycleTests(unittest.TestCase):
     def setUp(self):
         self.mod = _load_air_cursor(self)
+        # 2026-07-12: _is_parent_alive consults the AUTHORITATIVE
+        # core.parent_watch layer first (real Win32 syscalls — it correctly
+        # reads the fake pid 4242 as dead). Stub it inconclusive-alive here
+        # so these tests keep exercising the psutil fallback + recycle-guard
+        # semantics beneath it; parent_watch has its own suite.
+        import core.parent_watch as _pw
+        p = mock.patch.object(_pw, "parent_is_alive", return_value=True)
+        p.start()
+        self.addCleanup(p.stop)
 
     def _with_psutil(self, fake):
         # Force the psutil-backed branch with our fake module.

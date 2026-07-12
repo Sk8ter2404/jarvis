@@ -4568,5 +4568,56 @@ class AutoPlayYoutubeResolvedPathTests(MonolithGlobalsTestCase):
         self.assertIn("results?search_query=", opened_url)
 
 
+@requires_monolith
+class HardExitTests(MonolithGlobalsTestCase):
+    """_hard_exit / _write_clean_shutdown_flag (2026-07-12): the
+    un-deadlockable exit. os._exit → ExitProcess hangs on the loader lock
+    when a thread is wedged in a CUDA/driver DLL (the 22h zombie), and it
+    skips atexit so the watchdog clean-flag handshake never fired on voice
+    shutdowns — the flag must be written EXPLICITLY before terminating."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_clean_writes_flag_then_terminates(self):
+        bc = self.bc
+        calls = []
+        with tempfile.TemporaryDirectory() as d:
+            flag = os.path.join(d, "clean_shutdown.flag")
+            with mock.patch.object(bc, "_CLEAN_SHUTDOWN_FLAG", flag), \
+                 mock.patch.object(bc, "_is_staging", return_value=False), \
+                 mock.patch.object(bc, "_terminate_process_now",
+                                   side_effect=lambda c: calls.append(c)):
+                bc._hard_exit(0, clean=True)
+            self.assertTrue(os.path.isfile(flag),
+                            "clean exit must leave the watchdog flag")
+        self.assertEqual(calls, [0])
+
+    def test_unclean_exit_skips_flag(self):
+        bc = self.bc
+        calls = []
+        with tempfile.TemporaryDirectory() as d:
+            flag = os.path.join(d, "clean_shutdown.flag")
+            with mock.patch.object(bc, "_CLEAN_SHUTDOWN_FLAG", flag), \
+                 mock.patch.object(bc, "_terminate_process_now",
+                                   side_effect=lambda c: calls.append(c)):
+                bc._hard_exit(3, clean=False)
+            self.assertFalse(os.path.exists(flag),
+                             "restart/crash paths must NOT leave the flag "
+                             "(the watchdog is their backstop)")
+        self.assertEqual(calls, [3])
+
+    def test_staging_process_never_touches_prod_flag(self):
+        bc = self.bc
+        with tempfile.TemporaryDirectory() as d:
+            flag = os.path.join(d, "clean_shutdown.flag")
+            with mock.patch.object(bc, "_CLEAN_SHUTDOWN_FLAG", flag), \
+                 mock.patch.object(bc, "_is_staging", return_value=True), \
+                 mock.patch.object(bc, "_terminate_process_now"):
+                bc._hard_exit(0, clean=True)
+            self.assertFalse(os.path.exists(flag))
+
+
 if __name__ == "__main__":
     unittest.main()

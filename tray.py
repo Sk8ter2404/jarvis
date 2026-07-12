@@ -578,6 +578,15 @@ def _parent_alive() -> bool:
     pid = _parent_pid[0]
     if not pid:
         return True
+    # AUTHORITATIVE check first (2026-07-12): psutil.pid_exists reads TRUE
+    # for a DEAD-but-unreaped Windows process — this tray outlived its
+    # terminated parent by 25 minutes (duplicate tray icon). See
+    # core.parent_watch (WaitForSingleObject, signaled on termination).
+    try:
+        from core.parent_watch import parent_is_alive
+        return parent_is_alive(pid)
+    except Exception:
+        pass
     if _HAS_PSUTIL:
         try:
             return psutil.pid_exists(pid)

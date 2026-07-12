@@ -433,12 +433,28 @@ def _act_restart(_: str = "") -> str:
 
     def _do_restart():
         time.sleep(1.5)
+        # FAILSAFE: if anything below wedges, die anyway — a lingering old
+        # instance is exactly what turned the 2026-07-12 restart into a
+        # zombie + a singleton-suicided replacement (nothing left running).
+        # NO clean flag: if the relaunch failed too, the watchdog SHOULD
+        # resurrect us within its 5-minute poll.
+        _fs = threading.Timer(20.0, _hard_exit_via_bc, args=(bc, 0, False))
+        _fs.daemon = True
+        _fs.start()
+        # Release the singleton BEFORE spawning: the replacement boots in
+        # ~1s and its singleton check must not see this (possibly wedged,
+        # not-yet-dead) process and suicide — live failure mode 2026-07-12:
+        # old hung in ExitProcess, new exited via singleton, JARVIS gone.
+        try:
+            bc._release_singleton()
+        except Exception as e:
+            print(f"  [restart] singleton release failed: {e}")
         try:
             # Detached + WINDOWLESS relaunch. CREATE_NEW_CONSOLE (the old value)
             # forced a visible console window on the relaunched instance even
             # though JARVIS runs as pythonw (GUI, no console) — a "ghost window"
             # on every restart. DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP keeps
-            # the new process alive after this one os._exit()s, with no window
+            # the new process alive after this one exits, with no window
             # (mirrors _ensure_ollama_running's detached spawn). 2026-07-10.
             _flags = 0
             if sys.platform == "win32":
@@ -451,7 +467,7 @@ def _act_restart(_: str = "") -> str:
             )
         except Exception as e:
             print(f"  [restart] relaunch failed: {e}")
-        os._exit(0)
+        _hard_exit_via_bc(bc, 0, clean=False)
     threading.Thread(target=_do_restart, daemon=True).start()
     return "Restarting now, sir."
 
@@ -2484,10 +2500,29 @@ def _act_upgrade(_: str = "") -> str:
 
 # ─── Graceful shutdown (Phase 4K) ──────────────────────────────────────
 
+def _hard_exit_via_bc(bc, code: int = 0, clean: bool = False) -> None:
+    """Un-deadlockable exit via the monolith's _hard_exit (TerminateProcess).
+    os._exit → ExitProcess walks DLL_PROCESS_DETACH under the LOADER LOCK —
+    a thread wedged in a CUDA/driver DLL holds it and the process becomes an
+    immortal zombie (pid 14608 lived 22h past its 'Session ended' banner;
+    the very next restart reproduced it — 2026-07-12 py-spy dumps). Falls
+    back to os._exit if the helper is absent (older monolith)."""
+    fn = getattr(bc, "_hard_exit", None)
+    if fn is not None:
+        try:
+            fn(code, clean=clean)
+            # The real helper never returns; a test double does — don't
+            # fall through and kill the TEST process.
+            return
+        except Exception:
+            pass
+    os._exit(code)
+
+
 def _act_shutdown_jarvis(_: str = "") -> str:
     """Graceful full shutdown — speak goodbye, terminate every JARVIS
     subprocess we spawned, flush state, release the singleton lock, then
-    os._exit(0)."""
+    hard-exit (TerminateProcess — see _hard_exit_via_bc)."""
     import random
     import threading
     bc = _bc()
@@ -2500,6 +2535,14 @@ def _act_shutdown_jarvis(_: str = "") -> str:
         print(f"  [shutdown_jarvis] goodbye TTS failed: {_e}")
 
     def _do_shutdown():
+        # FAILSAFE: the teardown steps below are not time-bounded (sd.stop /
+        # HUD kills can block in native code forever) — arm an independent
+        # hard kill so a wedged step can never strand a half-shut-down
+        # immortal process. clean=True: this path only runs on an
+        # INTENTIONAL stop, so the watchdog must not resurrect.
+        _fs = threading.Timer(25.0, _hard_exit_via_bc, args=(bc, 0, True))
+        _fs.daemon = True
+        _fs.start()
         try:
             time.sleep(2.0)
             print("  [shutdown_jarvis] beginning graceful teardown")
@@ -2543,9 +2586,9 @@ def _act_shutdown_jarvis(_: str = "") -> str:
                 print(f"  [shutdown_jarvis] _release_singleton failed: {_e}")
             try: bc.close_log()
             except Exception: pass
-            print("  [shutdown_jarvis] clean exit complete — calling os._exit(0)")
+            print("  [shutdown_jarvis] clean exit complete — hard-exiting")
         finally:
-            os._exit(0)
+            _hard_exit_via_bc(bc, 0, clean=True)
 
     threading.Thread(target=_do_shutdown, daemon=True).start()
     return "Going dark, sir."

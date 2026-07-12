@@ -710,12 +710,21 @@ class RestartTests(unittest.TestCase):
 
     def test_inner_restart_relaunches_and_exits(self):
         """Drive the inner _do_restart closure by capturing the target and
-        invoking it with subprocess/os._exit/time.sleep all mocked."""
+        invoking it with subprocess/time.sleep/Timer mocked. 2026-07-12: the
+        closure now (a) arms a failsafe Timer, (b) releases the singleton
+        BEFORE Popen (the replacement must not singleton-suicide against a
+        lingering old process), and (c) exits via bc._hard_exit(0,
+        clean=False) — the un-deadlockable TerminateProcess path — instead
+        of a raw os._exit that can hang in ExitProcess forever."""
         fake = mock.Mock()
         script_path = os.path.join(tempfile.gettempdir(), "bc_restart.py")
         fake.__file__ = script_path
+        fake._hard_exit.side_effect = SystemExit
         import threading
         captured = {}
+        order = []
+        fake._release_singleton.side_effect = \
+            lambda *a, **k: order.append("singleton")
 
         def capture_thread(target=None, daemon=None):
             captured["target"] = target
@@ -728,17 +737,26 @@ class RestartTests(unittest.TestCase):
 
         # Now run the captured target with all side effects mocked.
         with _no_sleep(), \
-                mock.patch.object(A.subprocess, "Popen") as mpopen, \
-                mock.patch.object(A.os, "_exit",
-                                  side_effect=SystemExit) as mexit:
+                mock.patch("threading.Timer") as mtimer, \
+                mock.patch.object(
+                    A.subprocess, "Popen",
+                    side_effect=lambda *a, **k: order.append("popen")
+                ) as mpopen:
             with self.assertRaises(SystemExit):
                 captured["target"]()
         mpopen.assert_called_once()
+        # singleton released BEFORE the replacement was spawned
+        self.assertEqual(order, ["singleton", "popen"])
+        # failsafe timer armed pointing at the un-deadlockable helper
+        mtimer.assert_called_once()
+        self.assertIs(mtimer.call_args[0][1], A._hard_exit_via_bc)
         # launched with the python executable + script path
         argv = mpopen.call_args[0][0]
         self.assertEqual(argv[0], A.sys.executable)
         self.assertEqual(argv[1], os.path.abspath(script_path))
-        mexit.assert_called_once_with(0)
+        # exited via the helper; a restart is NOT a clean stop (watchdog
+        # must resurrect if the relaunch also failed)
+        fake._hard_exit.assert_called_once_with(0, clean=False)
 
     def test_inner_restart_handles_popen_failure(self):
         """If Popen raises, the closure prints and still calls os._exit."""
@@ -756,17 +774,18 @@ class RestartTests(unittest.TestCase):
                                   side_effect=capture_thread):
             A._act_restart("")
 
+        fake._hard_exit.side_effect = SystemExit
         with _no_sleep(), \
+                mock.patch("threading.Timer"), \
                 mock.patch.object(A.subprocess, "Popen",
                                   side_effect=OSError("spawn fail")), \
-                mock.patch("builtins.print") as mprint, \
-                mock.patch.object(A.os, "_exit",
-                                  side_effect=SystemExit):
+                mock.patch("builtins.print") as mprint:
             with self.assertRaises(SystemExit):
                 captured["target"]()
-        # error was logged
+        # error was logged, and the closure still hard-exited
         self.assertTrue(
             any("relaunch failed" in str(c) for c in mprint.call_args_list))
+        fake._hard_exit.assert_called_once_with(0, clean=False)
 
 
 if __name__ == "__main__":

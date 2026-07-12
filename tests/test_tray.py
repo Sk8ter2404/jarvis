@@ -856,6 +856,19 @@ class GetFontTests(TrayTestBase):
 # Parent watchdog
 # --------------------------------------------------------------------------- #
 class ParentAliveTests(TrayTestBase):
+    def setUp(self):
+        super().setUp()
+        # 2026-07-12: _parent_alive consults the AUTHORITATIVE
+        # core.parent_watch layer first (real Win32 syscalls — fake pids
+        # 4321/99 read dead for real). Make it RAISE so these tests keep
+        # exercising the psutil / os.kill fallbacks beneath it;
+        # parent_watch has its own suite.
+        import core.parent_watch as _pw
+        p = mock.patch.object(_pw, "parent_is_alive",
+                              side_effect=RuntimeError("stubbed out"))
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_no_pid_is_alive(self):
         tray._parent_pid[0] = 0
         self.assertTrue(tray._parent_alive())

@@ -102,20 +102,65 @@ class WebInterfaceSkillTest(unittest.TestCase):
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def _load(self, *, engine=None, cfg=None):
-        """Load the skill with a fake engine + fake config pinned. Returns
-        (mod, actions)."""
+        """Load the skill with a fake engine + fake config pinned, THEN run
+        register(). Returns (mod, actions).
+
+        register() is deferred (register=False) until the engine + config are
+        pinned: letting it run at load time made the whole suite depend on
+        the OWNER'S LIVE STATE — with WEB_INTERFACE_ENABLED true in the real
+        settings and port 8766 momentarily free, every load auto-started a
+        REAL ThreadingHTTPServer whose harness-neutered serve thread then
+        wedged shutdown() FOREVER (the 2026-07-12 ci_sim freeze; the suite
+        had only ever passed because the live JARVIS normally keeps 8766
+        occupied and the autostart failed cleanly)."""
         if engine is not None:
             sys.modules["tools.web_interface"] = engine
-        mod, actions = load_skill_isolated("web_interface")
-        # The skill reads config fresh via `from core import config`. Patch the
-        # engine + config lookups on the loaded module for deterministic tests.
+        mod, _ = load_skill_isolated("web_interface", register=False)
         if engine is not None:
             mod._engine = engine
             mod._HAS_ENGINE = True
-        if cfg is not None:
-            mod._cfg = lambda name, default, _c=cfg: _c.get(name, default)
+        pinned = dict(cfg) if cfg is not None else {}
+        # Never let a test's register() consult the live config knob.
+        pinned.setdefault("WEB_INTERFACE_ENABLED", False)
+        mod._cfg = lambda name, default, _c=pinned: _c.get(name, default)
+        actions: dict = {}
+        mod.register(actions)
         self.mod = mod
         return mod, actions
+
+    # ── _stop timebox (2026-07-12) ───────────────────────────────────────────
+    def test_stop_survives_wedged_shutdown(self):
+        # socketserver.shutdown() waits on an event only serve_forever() sets
+        # on exit — a serve thread that never started (spawn race) or already
+        # died made shutdown() block FOREVER and froze an entire ci_sim run
+        # mid-suite. A wedged shutdown() must not hang _stop, and
+        # server_close() must still free the port.
+        import threading as _t
+        import time as _time
+        eng = _fake_engine()
+        mod, _actions = self._load(engine=eng,
+                                   cfg={"WEB_INTERFACE_ENABLED": False})
+
+        never = _t.Event()                    # never set → blocks forever
+        httpd = mock.Mock()
+        httpd.shutdown.side_effect = lambda: never.wait()
+        closed = _t.Event()
+        httpd.server_close.side_effect = closed.set
+        mod._httpd = httpd
+        mod._serve_thread = None
+        mod._bound = ("127.0.0.1", 1)
+
+        t0 = _time.monotonic()
+        with mock.patch("builtins.print"):
+            ok, msg = mod._stop()
+        dt = _time.monotonic() - t0
+        self.assertTrue(ok)
+        self.assertIn("off", msg.lower())
+        # returned promptly (5s shutdown box + slack), socket still closed
+        self.assertLess(dt, 12.0)
+        self.assertTrue(closed.is_set(),
+                        "server_close must run even when shutdown() wedges")
+        never.set()                           # release the daemon worker
 
     # ── registration + off-by-default ────────────────────────────────────────
     def test_actions_registered(self):
@@ -127,38 +172,24 @@ class WebInterfaceSkillTest(unittest.TestCase):
             self.assertIn(name, actions)
 
     def test_off_by_default_starts_nothing(self):
-        # With the fake engine pinned AFTER load, register() has already run with
-        # the real (default-False) config, so no server should have auto-started.
-        # Re-load with the fake + knob False and assert _httpd is None.
+        # register() with the knob False must start NO server — no LAN socket
+        # opens uninvited at boot. (_load pins the knob False and defers
+        # register until the fake engine is in place, so this is deterministic
+        # regardless of the owner's live settings or port state.)
         eng = _fake_engine()
-        sys.modules["tools.web_interface"] = eng
-        # Patch config so the module's fresh read sees the knob False.
-        with mock.patch.dict("os.environ", {}, clear=False):
-            mod, _actions = load_skill_isolated("web_interface")
-            self.mod = mod
-            mod._engine = eng
-            mod._HAS_ENGINE = True
-            # register already ran during load with real config; ensure nothing
-            # is running regardless.
-            self.assertIsNone(mod._httpd)
+        mod, _actions = self._load(engine=eng,
+                                   cfg={"WEB_INTERFACE_ENABLED": False})
+        self.assertIsNone(mod._httpd)
 
     def test_knob_true_auto_starts(self):
-        # Auto-start is the ENABLED-True branch of register(). We exercise it
-        # deterministically by loading the skill (register runs with the shipped
-        # default False → nothing starts), then pinning the FAKE engine + a
-        # True-knob config onto the module and re-running register(). This avoids
-        # depending on load-time `from tools import web_interface` binding (the
-        # `tools` package may already hold the real submodule from a prior test).
+        # Auto-start is the ENABLED-True branch of register(). _load defers
+        # register() until the FAKE engine + True-knob config are pinned, so
+        # the auto-start exercises the fake — never a real socket.
         eng = _fake_engine()
         mod, actions = self._load(
             engine=eng,
             cfg={"WEB_INTERFACE_ENABLED": True, "WEB_INTERFACE_BIND": "127.0.0.1",
                  "WEB_INTERFACE_PORT": 8766, "WEB_INTERFACE_TOKEN": ""})
-        # After _load, register already ran once at load time; nothing is running
-        # yet (that load saw the real default-False knob). Re-run register with
-        # the fake engine + True knob now pinned.
-        fresh_actions: dict = {}
-        mod.register(fresh_actions)
         self.assertIsNotNone(mod._httpd)
         self.assertEqual(mod._bound, ("127.0.0.1", 8766))
 
@@ -244,10 +275,15 @@ class WebInterfaceSkillTest(unittest.TestCase):
 
     # ── engine-absent graceful path ──────────────────────────────────────────
     def test_engine_absent_actions_reply_gracefully(self):
-        mod, actions = load_skill_isolated("web_interface")
+        # Deferred register (no live-config autostart), THEN break the engine.
+        mod, _ = load_skill_isolated("web_interface", register=False)
         self.mod = mod
         mod._HAS_ENGINE = False
         mod._engine = None
+        mod._cfg = lambda name, default: {"WEB_INTERFACE_ENABLED": False
+                                          }.get(name, default)
+        actions: dict = {}
+        mod.register(actions)
         on_msg = actions["web_interface_on"]("")
         status_msg = actions["web_interface_status"]("")
         self.assertIn("didn't load", on_msg.lower())
@@ -262,13 +298,17 @@ class WebInterfaceVerbatimContractTest(unittest.TestCase):
         eng = _fake_engine()
         sys.modules["tools.web_interface"] = eng
         try:
-            mod, actions = load_skill_isolated("web_interface")
+            # Deferred register: pin the fake engine + config FIRST so the
+            # load can never auto-start a real server off the live settings.
+            mod, _ = load_skill_isolated("web_interface", register=False)
             mod._engine = eng
             mod._HAS_ENGINE = True
             mod._cfg = lambda name, default: {
                 "WEB_INTERFACE_BIND": "127.0.0.1", "WEB_INTERFACE_PORT": 8766,
                 "WEB_INTERFACE_TOKEN": "", "WEB_INTERFACE_ENABLED": False,
             }.get(name, default)
+            actions: dict = {}
+            mod.register(actions)
             for name in ("web_interface_status", "web_interface_on",
                          "web_interface_off"):
                 out = actions[name]("")

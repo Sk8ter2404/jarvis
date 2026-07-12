@@ -21390,13 +21390,12 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     except Exception:
         pass
 
-    def _mark_clean_shutdown(path=_clean_flag):
-        try:
-            with open(path, "w", encoding="utf-8") as _f:
-                _f.write(str(time.time()))
-        except Exception:
-            pass
-    atexit.register(_mark_clean_shutdown)
+    # atexit still covers plain sys.exit / normal interpreter exit; the
+    # os._exit / TerminateProcess paths call _write_clean_shutdown_flag
+    # EXPLICITLY via _hard_exit(clean=True) — atexit never fires there
+    # (that gap silently broke the handshake for every voice shutdown
+    # until 2026-07-12).
+    atexit.register(_write_clean_shutdown_flag)
 
     # OVERLAY REAPER (P0-2): now that we ARE the singleton, kill any reticle /
     # air-cursor overlay subprocesses left behind by a PREVIOUS JARVIS that
@@ -22277,6 +22276,14 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     except KeyboardInterrupt:
         print("\nShutting down…")
         # Stop any audio that might be mid-play/wait so sd.wait() doesn't block
+        # FAILSAFE (2026-07-12): none of the teardown steps below are
+        # time-bounded (sd.stop / HUD kills can block in native code
+        # forever) — arm an independent hard-kill so this path can NEVER
+        # produce an immortal half-shut-down process. clean=True: reaching
+        # this path at all means the stop was intentional.
+        _t = threading.Timer(25.0, _hard_exit, kwargs={"clean": True})
+        _t.daemon = True
+        _t.start()
         try: sd.stop()
         except Exception: pass
         # Signal background threads
@@ -22307,8 +22314,61 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         except Exception:
             pass
         close_log()
-        # Force exit even if any thread is wedged in a C-level blocking call
-        os._exit(0)
+        # Un-deadlockable exit. os._exit was NOT enough here: ExitProcess
+        # walks DLL_PROCESS_DETACH under the loader lock, and a thread wedged
+        # in a CUDA/driver DLL deadlocks it (the 22-hour zombie, 2026-07-12).
+        _hard_exit(0, clean=True)
+
+
+_CLEAN_SHUTDOWN_FLAG = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", "clean_shutdown.flag")
+
+
+def _write_clean_shutdown_flag() -> None:
+    """Leave the watchdog handshake flag so an INTENTIONAL stop isn't
+    resurrected. Must be callable EXPLICITLY: os._exit / TerminateProcess
+    both skip atexit, so the atexit registration alone never fired on a
+    voice shutdown — the watchdog would have rebooted JARVIS five minutes
+    after the owner said 'shut down' (masked for weeks by the zombie bug
+    below, found 2026-07-12). Staging processes never touch the prod flag."""
+    try:
+        if _is_staging():
+            return
+    except Exception:
+        pass
+    try:
+        with open(_CLEAN_SHUTDOWN_FLAG, "w", encoding="utf-8") as _f:
+            _f.write(str(time.time()))
+    except Exception:
+        pass
+
+
+def _terminate_process_now(code: int) -> None:
+    """Raw, un-deadlockable process kill — split out so tests can patch it."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            _k32 = ctypes.windll.kernel32
+            _k32.TerminateProcess(_k32.GetCurrentProcess(), code)
+        except Exception:
+            pass
+    os._exit(code)
+
+
+def _hard_exit(code: int = 0, *, clean: bool = False) -> None:
+    """Exit that CANNOT deadlock. os._exit → CRT _exit → ExitProcess, which
+    walks every loaded DLL's DLL_PROCESS_DETACH under the LOADER LOCK — a
+    worker thread wedged inside a CUDA/driver DLL holds it and the process
+    becomes an immortal zombie. Proven live TWICE: pid 14608 survived 22
+    HOURS past its own '=== Session ended ===' banner (still transcribing,
+    holding mic+GPU against the replacement instance), and pid 36364
+    reproduced it on the very next restart (2026-07-12, py-spy dumps).
+    TerminateProcess skips DLL notification entirely — it cannot block.
+    `clean=True` writes the watchdog handshake flag first (nothing after
+    this call runs, atexit included)."""
+    if clean:
+        _write_clean_shutdown_flag()
+    _terminate_process_now(code)
 
 
 if __name__ == "__main__":  # pragma: no cover - boot entrypoint; only runs when executed as a script, never under the import-based test harness

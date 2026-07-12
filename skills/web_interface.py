@@ -148,11 +148,25 @@ def _stop() -> tuple[bool, str]:
         _serve_thread = None
         _bound = ("", 0)
     # Do the (potentially blocking) shutdown OUTSIDE the lock so a status call
-    # can't deadlock behind it.
-    try:
-        httpd.shutdown()
-    except Exception:
-        pass
+    # can't deadlock behind it — and TIME-BOX it: socketserver.shutdown()
+    # waits on an event that ONLY serve_forever() sets when it exits, so if
+    # the serve thread never started (spawn race) or already died, shutdown()
+    # blocks FOREVER. Live 2026-07-12: that wait froze an entire ci_sim run
+    # mid-suite (py-spy: tearDown → _stop → shutdown → Event.wait). A bounded
+    # daemon worker keeps _stop honest; server_close() below still frees the
+    # port either way.
+    def _shutdown():
+        try:
+            httpd.shutdown()
+        except Exception:
+            pass
+    _sd = threading.Thread(target=_shutdown, daemon=True,
+                           name="web-interface-shutdown")
+    _sd.start()
+    _sd.join(timeout=5.0)
+    if _sd.is_alive():
+        print("  [web-interface] shutdown() wedged (serve loop not running?) "
+              "— closing the socket anyway")
     try:
         httpd.server_close()
     except Exception:

@@ -159,6 +159,16 @@ def _read_json(path: str) -> dict:
 def _is_parent_alive(pid: int) -> bool:
     if pid <= 0:
         return True
+    # AUTHORITATIVE check first (2026-07-12): psutil.pid_exists reads TRUE
+    # for a DEAD-but-unreaped Windows process (any open handle keeps the row)
+    # — this HUD outlived its terminated parent by 25 minutes and the owner
+    # saw two of everything. core.parent_watch uses WaitForSingleObject on a
+    # SYNCHRONIZE handle, which is signaled the instant the parent dies.
+    try:
+        from core.parent_watch import parent_is_alive
+        return parent_is_alive(pid)
+    except Exception:
+        pass
     if _HAS_PSUTIL:
         try:
             return psutil.pid_exists(pid)

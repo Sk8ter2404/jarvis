@@ -140,6 +140,18 @@ def _is_parent_alive(pid: int, start_time: "float | None" = None) -> bool:
     lookup is treated as ALIVE so a hiccup can't strand the overlay."""
     if pid <= 0:
         return True
+    # AUTHORITATIVE liveness first (2026-07-12): pid_exists reads TRUE for a
+    # DEAD-but-unreaped Windows process (any open handle keeps the row) — the
+    # sibling overlays outlived their terminated parent by 25 minutes.
+    # core.parent_watch's WaitForSingleObject check is signaled the instant
+    # the parent dies; the recycle guard below still covers the stranger-PID
+    # case when a start_time was provided.
+    try:
+        from core.parent_watch import parent_is_alive
+        if not parent_is_alive(pid):
+            return False
+    except Exception:
+        pass
     if _HAS_PSUTIL:
         # pid_exists can raise on Windows for a transient handle/permission
         # error. The reticle spans the full virtual desktop, so a frozen

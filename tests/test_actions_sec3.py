@@ -2320,6 +2320,7 @@ class ShutdownJarvisTests(unittest.TestCase):
     def _capture_target(self, bc):
         """Run _act_shutdown_jarvis with threading.Thread stubbed, returning
         the captured _do_shutdown closure WITHOUT executing it."""
+        self._target_bc = bc          # _run_closure asserts on its _hard_exit
         captured = {}
 
         def capture_thread(target=None, daemon=None, **k):
@@ -2373,14 +2374,21 @@ class ShutdownJarvisTests(unittest.TestCase):
         setattr(core_pkg, "diagnostic_daemons", diag_module)
         self.addCleanup(restore_diag)
 
+        # 2026-07-12: the closure's finally exits via bc._hard_exit(0,
+        # clean=True) — the un-deadlockable TerminateProcess helper — not a
+        # raw os._exit (which hung in ExitProcess and left a 22h zombie).
+        # SystemExit is raised by the helper double; the failsafe Timer the
+        # closure arms first is stubbed so no real 25s thread outlives us.
+        self._target_bc._hard_exit.side_effect = SystemExit
         with mock.patch.object(A.time, "sleep"), \
+                mock.patch("threading.Timer"), \
                 mock.patch("threading.Thread", side_effect=inner_thread), \
                 mock.patch("builtins.print",
                            side_effect=lambda *a, **k: printed.append(
-                               " ".join(str(x) for x in a))), \
-                mock.patch.object(A.os, "_exit", side_effect=SystemExit):
+                               " ".join(str(x) for x in a))):
             with self.assertRaises(SystemExit):
                 target()
+        self._target_bc._hard_exit.assert_called_with(0, clean=True)
         return printed
 
     def test_do_shutdown_closure_runs_full_teardown(self):
