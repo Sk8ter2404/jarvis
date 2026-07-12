@@ -5864,11 +5864,21 @@ class ScanBatch20260708Tests(MonolithGlobalsTestCase):
         with mock.patch.object(bc, "_dshow_name_to_index", return_value=2), \
                 mock.patch.object(bc, "_probe_camera_index", return_value=True):
             self.assertFalse(bc._camera_rescued_by_name({"index": 1}, 1))
-        # Name resolves back to the SAME already-failed index → no rescue.
+        # Name resolves back to the SAME index (2026-07-12): the quick 2.0s
+        # first-pass probe drops a healthy slow-warming camera (the Logi's
+        # first frame measures ~2.0s whenever the Kinect rejoins the bus), so
+        # same-index now RE-PROBES at the rescue budget — a passing retry
+        # rescues, a failing retry does not.
         with mock.patch.object(bc, "KINECT_AS_CAMERA", False), \
                 mock.patch.object(bc, "_dshow_name_to_index", return_value=1), \
                 mock.patch.object(bc, "_probe_camera_index", return_value=True):
-            self.assertFalse(bc._camera_rescued_by_name(cam, 1))
+            self.assertTrue(bc._camera_rescued_by_name(cam, 1),
+                            "slow warm-up at its own index must be rescued")
+        with mock.patch.object(bc, "KINECT_AS_CAMERA", False), \
+                mock.patch.object(bc, "_dshow_name_to_index", return_value=1), \
+                mock.patch.object(bc, "_probe_camera_index", return_value=False):
+            self.assertFalse(bc._camera_rescued_by_name(cam, 1),
+                             "still frameless after the retry budget → drop")
 
 
 if __name__ == "__main__":

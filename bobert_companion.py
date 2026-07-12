@@ -5049,9 +5049,26 @@ def _camera_rescued_by_name(cam: dict, static_idx: int,
         if not name or want_kinect:
             return False
         live = _dshow_name_to_index(name)
-        if live is None or live == static_idx:
-            print(f"  [cam-probe] '{name}' rescue: name resolved to "
-                  f"{live!r} (static {static_idx}) — cannot rescue")
+        if live is None:
+            print(f"  [cam-probe] '{name}' rescue: name did not resolve "
+                  f"(static {static_idx}) — cannot rescue")
+            return False
+        if live == static_idx:
+            # SAME index — not a shuffle, but the FIRST-PASS probe runs on the
+            # quick 2.0s budget and the Logi's first frame measures ~2.0s
+            # whenever the Kinect (re)joins the DirectShow bus. Live
+            # 2026-07-12 (Kinect power-brick fix brought the sensor BACK):
+            # 'name resolved to 2 (static 2) — cannot rescue' + 'failed to
+            # open in 2.0s' dropped a healthy LEFT cam sitting at its own
+            # index. Re-probe HERE at the rescue budget before giving up —
+            # a slow warm-up is not a dead device.
+            if _probe_camera_index(live, timeout_sec=timeout_sec):
+                print(f"  [cam-probe] '{name}' at its own index {live} passed "
+                      f"the retry-budget probe ({timeout_sec:.1f}s) — keeping "
+                      f"it (slow warm-up, not a dead device)")
+                return True
+            print(f"  [cam-probe] '{name}' rescue: still no frames at its own "
+                  f"index {live} after {timeout_sec:.1f}s — cannot rescue")
             return False
         if _probe_camera_index(live, timeout_sec=timeout_sec):
             print(f"  [cam-probe] '{name}' failed at static index {static_idx} "
@@ -12847,12 +12864,18 @@ _STREAMING_SERVICES = {
         "verify_first":     True,   # watch page autoplays — often already going
         "verify_attempts":  3,
         "verify_wait":      3.0,
-        "play_strategies":  ["recheck", "playpause", "recheck"],
+        # Toggle only as a LAST resort: playpause is a blind media-key toggle,
+        # and a verify FALSE NEGATIVE at attempt 1 used to PAUSE a video that
+        # autoplay had already started (live 2026-07-12).
+        "play_strategies":  ["recheck", "recheck", "playpause"],
         "verify_question": (
-            "Look at this screenshot. Is a single YouTube VIDEO actively "
-            "open in the watch view (one large video player filling most of "
-            "the page or fullscreen)? A GRID OR LIST of search results with "
-            "many thumbnails means NO. Answer strictly yes or no."
+            "Look at this screenshot of a YouTube page. Is it the WATCH view "
+            "— ONE large video player occupying the main/left area of the "
+            "page (or fullscreen)? IGNORE the sidebar column of related-"
+            "video thumbnails on the right — that sidebar is a normal part "
+            "of the watch view and does NOT mean no. Answer NO only if the "
+            "MAIN area itself is a grid of search-result thumbnails instead "
+            "of one large player. Answer strictly yes or no."
         ),
     },
 }
@@ -22284,6 +22307,15 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         _t = threading.Timer(25.0, _hard_exit, kwargs={"clean": True})
         _t.daemon = True
         _t.start()
+        # Release the web dashboard's socket gracefully — a kernel-stuck
+        # terminating process keeps its handles, and the NEXT boot's
+        # autostart refuses to co-bind a corpse-held port (2026-07-12).
+        try:
+            _wi = sys.modules.get("skill_web_interface")
+            if _wi is not None and getattr(_wi, "_httpd", None) is not None:
+                _wi._stop()
+        except Exception:
+            pass
         try: sd.stop()
         except Exception: pass
         # Signal background threads

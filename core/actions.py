@@ -441,6 +441,10 @@ def _act_restart(_: str = "") -> str:
         _fs = threading.Timer(20.0, _hard_exit_via_bc, args=(bc, 0, False))
         _fs.daemon = True
         _fs.start()
+        # Release the web socket BEFORE spawning: a kernel-stuck corpse keeps
+        # its handles, and the replacement's dashboard autostart refuses to
+        # co-bind a port a dead process still holds (live 2026-07-12).
+        _stop_web_interface_quietly()
         # Release the singleton BEFORE spawning: the replacement boots in
         # ~1s and its singleton check must not see this (possibly wedged,
         # not-yet-dead) process and suicide — live failure mode 2026-07-12:
@@ -2519,6 +2523,22 @@ def _hard_exit_via_bc(bc, code: int = 0, clean: bool = False) -> None:
     os._exit(code)
 
 
+def _stop_web_interface_quietly() -> None:
+    """Release the web dashboard's listening socket BEFORE process exit.
+    A kernel-stuck terminating process keeps its HANDLES open — live
+    2026-07-12: a restarted-away instance held :8766 as a corpse, the
+    replacement's autostart refused to co-bind, and the dashboard stayed
+    dead until reboot. skills.web_interface._stop() is time-boxed (5s) so
+    this can never stall a teardown. Best-effort, never raises."""
+    try:
+        mod = sys.modules.get("skill_web_interface")
+        if mod is not None and getattr(mod, "_httpd", None) is not None:
+            mod._stop()
+            print("  [shutdown] web-interface socket released")
+    except Exception:
+        pass
+
+
 def _act_shutdown_jarvis(_: str = "") -> str:
     """Graceful full shutdown — speak goodbye, terminate every JARVIS
     subprocess we spawned, flush state, release the singleton lock, then
@@ -2546,6 +2566,7 @@ def _act_shutdown_jarvis(_: str = "") -> str:
         try:
             time.sleep(2.0)
             print("  [shutdown_jarvis] beginning graceful teardown")
+            _stop_web_interface_quietly()
             try: bc.sd.stop()
             except Exception: pass
             try: bc._face_track_stop.set()
