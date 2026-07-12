@@ -6982,12 +6982,19 @@ def _recover_from_main_loop_error(exc: BaseException) -> None:
 
 
 def _process_capture_chunk(chunk: np.ndarray,
-                           sample_rate: int = SAMPLE_RATE) -> np.ndarray:
+                           sample_rate: int = SAMPLE_RATE,
+                           skip_ns: bool = False) -> np.ndarray:
     """Run a single mic chunk through the noise-cancel-1 pipeline (AEC →
     noise suppression → AGC). Falls through to the raw chunk when the
     processor module isn't available or any stage errors — VAD is run on
     the RAW signal by the caller so processing failures can never affect
-    speech endpointing."""
+    speech endpointing.
+
+    skip_ns: drop ONLY the noise-suppression stage for this chunk. NS
+    (noisereduce spectral gating) costs 1-2s of CPU per ~2.6s chunk — the
+    caller passes True for clearly-silent idle chunks so the main loop
+    isn't pinned processing guaranteed-discard audio (AEC/AGC still run so
+    their adaptive state stays warm across the silence)."""
     if not _audio_master_enabled[0] or _audio_processor is None:
         return chunk
     try:
@@ -6995,7 +7002,7 @@ def _process_capture_chunk(chunk: np.ndarray,
         return proc.process(
             chunk,
             enable_aec=bool(_audio_aec_enabled[0]),
-            enable_ns=bool(_audio_ns_enabled[0]),
+            enable_ns=bool(_audio_ns_enabled[0]) and not skip_ns,
             enable_agc=bool(_audio_agc_enabled[0]),
         )
     except Exception as e:
@@ -7335,7 +7342,17 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
             # VAD decision uses the RAW RMS so existing VAD_THRESHOLD
             # tuning is unaffected by the processor's gain stage. We
             # only swap in the processed chunk when we *keep* it.
-            processed = _process_capture_chunk(data, SAMPLE_RATE)
+            # skip_ns: while idle with the raw RMS clearly under the
+            # threshold, the chunk is headed for the pre-ring/discard —
+            # running noisereduce's spectral gating on it (1-2s CPU per
+            # 2.6s chunk) PINNED the main loop for minutes whenever room
+            # noise hovered just below the threshold (py-spy 2026-07-12:
+            # MainThread in spectral_gating_stationary, injected commands
+            # starved 5+ min). AEC/AGC still run to keep their state warm;
+            # full NS resumes the moment recording starts or rms rises.
+            processed = _process_capture_chunk(
+                data, SAMPLE_RATE,
+                skip_ns=(not recording and rms < VAD_THRESHOLD * 0.75))
             if rms > VAD_THRESHOLD:
                 if not recording:
                     recording = True

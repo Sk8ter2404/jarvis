@@ -4619,5 +4619,49 @@ class HardExitTests(MonolithGlobalsTestCase):
             self.assertFalse(os.path.exists(flag))
 
 
+@requires_monolith
+class ProcessCaptureChunkSkipNsTests(MonolithGlobalsTestCase):
+    """_process_capture_chunk(skip_ns=) — the idle-silence CPU guard
+    (2026-07-12): noisereduce spectral gating costs 1-2s CPU per 2.6s chunk,
+    and running it on chunks the raw-RMS VAD was about to discard pinned the
+    main loop for minutes while room noise hovered under the threshold.
+    skip_ns must drop ONLY the NS stage; AEC/AGC flags pass through."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def _run(self, skip_ns):
+        bc = self.bc
+        import numpy as np
+        calls = {}
+
+        class _Proc:
+            def process(self, chunk, enable_aec, enable_ns, enable_agc):
+                calls.update(aec=enable_aec, ns=enable_ns, agc=enable_agc)
+                return chunk
+
+        fake = mock.Mock()
+        fake.get_processor.return_value = _Proc()
+        with mock.patch.object(bc, "_audio_processor", fake), \
+             mock.patch.object(bc, "_audio_master_enabled", [True]), \
+             mock.patch.object(bc, "_audio_aec_enabled", [True]), \
+             mock.patch.object(bc, "_audio_ns_enabled", [True]), \
+             mock.patch.object(bc, "_audio_agc_enabled", [True]):
+            bc._process_capture_chunk(np.zeros(160, dtype=np.float32),
+                                      16000, skip_ns=skip_ns)
+        return calls
+
+    def test_skip_ns_drops_only_ns(self):
+        calls = self._run(skip_ns=True)
+        self.assertFalse(calls["ns"])
+        self.assertTrue(calls["aec"], "AEC must stay on (adaptive state)")
+        self.assertTrue(calls["agc"], "AGC must stay on")
+
+    def test_default_keeps_ns(self):
+        calls = self._run(skip_ns=False)
+        self.assertTrue(calls["ns"])
+
+
 if __name__ == "__main__":
     unittest.main()
