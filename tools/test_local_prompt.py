@@ -10,7 +10,7 @@ replicates a REPRESENTATIVE condensed system prompt + the new Ollama options
 """
 import time, json, requests
 
-BASE = "http://localhost:11434"
+BASE = "http://127.0.0.1:11434"
 MODEL = "qwen2.5:14b-instruct-q5_K_M"
 
 # A representative condensed prompt — persona + compact cheatsheet + directive,

@@ -99,7 +99,7 @@ RESTART_NOTE = "Some changes apply on the next restart."
 # seed the "Local LLM model" dropdown when Ollama is unreachable at GUI-open
 # time (so the field still offers sensible choices offline). The live list is
 # probed by `installed_ollama_models()`.
-OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 OLLAMA_MODEL_FALLBACK = [
     "gemma4:12b",                           # default: 7/7 bake-off, 8.4GB, multimodal
     "qwen2.5:14b-instruct-q5_K_M",          # proven failover: works + fits

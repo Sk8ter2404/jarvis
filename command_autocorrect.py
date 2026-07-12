@@ -54,7 +54,7 @@ _FILLER_TOKENS = frozenset({
 # endpoint fails we mark it dead for a cool-off so subsequent dispatches
 # fall through to the Levenshtein-only path immediately.
 
-EMBED_ENDPOINT = "http://localhost:11434/api/embeddings"
+EMBED_ENDPOINT = "http://127.0.0.1:11434/api/embeddings"
 EMBED_MODEL    = "nomic-embed-text"
 EMBED_TIMEOUT  = 1.5     # seconds — keep dispatch latency capped
 EMBED_COOLDOWN = 60.0    # seconds — how long we treat Ollama as dead

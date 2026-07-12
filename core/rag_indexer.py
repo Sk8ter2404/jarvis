@@ -97,7 +97,7 @@ RAG_EXCLUDE_GLOBS: list[str] = [
     "*.tmp", "*.lock", "*.cache",
 ]
 RAG_EMBED_MODEL: str = "nomic-embed-text"
-RAG_OLLAMA_ENDPOINT: str = "http://localhost:11434/api/embeddings"
+RAG_OLLAMA_ENDPOINT: str = "http://127.0.0.1:11434/api/embeddings"
 RAG_EMBED_BATCH: int = 16  # parallel POSTs per encode() call
 RAG_EMBED_TIMEOUT: float = 30.0
 RAG_RERANKER_MODEL: str = "BAAI/bge-reranker-base"

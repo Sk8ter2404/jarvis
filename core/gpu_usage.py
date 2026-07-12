@@ -50,7 +50,7 @@ except Exception:  # pragma: no cover - defensive; core.config is in-tree
 
 
 # ─── tunables ────────────────────────────────────────────────────────────
-_OLLAMA_PS_URL = "http://localhost:11434/api/ps"
+_OLLAMA_PS_URL = "http://127.0.0.1:11434/api/ps"
 _HTTP_TIMEOUT  = 1.5     # /api/ps is local; a slow reply means a busy daemon
 _SMI_TIMEOUT   = 2.0     # nvidia-smi cold-start can be ~1 s on Windows
 _PS_TIMEOUT    = 2.0     # `ollama ps` subprocess fallback

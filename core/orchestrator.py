@@ -223,7 +223,7 @@ def _ollama_call(
     model: str,
     system: str,
     user: str,
-    base_url: str = "http://localhost:11434",
+    base_url: str = "http://127.0.0.1:11434",
     timeout_s: float = 30.0,
 ) -> str:
     """One-shot Ollama /api/chat. Returns assistant text or raises."""
@@ -248,7 +248,7 @@ def _ollama_call(
     return str(data.get("message", {}).get("content", "")).strip()
 
 
-def _ollama_reachable(base_url: str = "http://localhost:11434", timeout_s: float = 2.0) -> bool:
+def _ollama_reachable(base_url: str = "http://127.0.0.1:11434", timeout_s: float = 2.0) -> bool:
     """True if the local Ollama daemon answers /api/tags. Used to gate the
     Claude→Ollama fallback so we only attempt it when a local model could
     actually serve the request."""
@@ -366,7 +366,7 @@ def plan_decomposition(
     planner_model: str = DEFAULT_PLANNER_MODEL,
     timeout_s: float = DEFAULT_PLANNER_TIMEOUT_S,
     local_model: str | None = None,
-    local_base_url: str = "http://localhost:11434",
+    local_base_url: str = "http://127.0.0.1:11434",
 ) -> list[SubTask]:
     """Ask the planner LLM to decompose `request` into parallel sub_tasks.
 
@@ -602,7 +602,7 @@ async def dispatch_sub_agents(
     actions: dict[str, Callable[[str], str]],
     worker_model: str = DEFAULT_WORKER_MODEL,
     local_model: str | None = None,
-    local_base_url: str = "http://localhost:11434",
+    local_base_url: str = "http://127.0.0.1:11434",
     max_parallel: int = DEFAULT_MAX_PARALLEL,
     timeout_s: float = DEFAULT_WORKER_TIMEOUT_S,
 ) -> list[SubTaskResult]:
@@ -687,7 +687,7 @@ def merge_results(
     merger_model: str = DEFAULT_MERGER_MODEL,
     timeout_s: float = DEFAULT_MERGER_TIMEOUT_S,
     local_model: str | None = None,
-    local_base_url: str = "http://localhost:11434",
+    local_base_url: str = "http://127.0.0.1:11434",
 ) -> str:
     """Synthesise sub-agent outputs into a single TTS-ready reply.
 
@@ -757,7 +757,7 @@ class Orchestrator:
         worker_model: str = DEFAULT_WORKER_MODEL,
         merger_model: str = DEFAULT_MERGER_MODEL,
         local_model: str | None = None,
-        local_base_url: str = "http://localhost:11434",
+        local_base_url: str = "http://127.0.0.1:11434",
         max_parallel: int = DEFAULT_MAX_PARALLEL,
         worker_timeout_s: float = DEFAULT_WORKER_TIMEOUT_S,
         planner_timeout_s: float = DEFAULT_PLANNER_TIMEOUT_S,

@@ -199,7 +199,14 @@ LOCAL_LLM_FALLBACK = True
 # EMPTY replies — Harmony-format quirk). Override per-box via
 # JARVIS_LOCAL_LLM_MODEL or user_settings when more VRAM is free.
 LOCAL_LLM_MODEL    = "gemma4:12b"
-LOCAL_LLM_BASE_URL = "http://localhost:11434"
+# 127.0.0.1, NEVER "localhost" (2026-07-12): Windows resolves localhost to
+# ::1 first, and when Ollama listens only on IPv4 the ::1 attempt eats a
+# measured, rock-steady ~2.05s before falling back — pushing every request
+# just past _ollama_alive()'s 2s probe. Result: Ollama up and healthy while
+# EVERY availability check said dead ("local vision unavailable"), and the
+# self-heal kept restarting a server that was never down. Same pin applied
+# to every other 11434 reference in the tree.
+LOCAL_LLM_BASE_URL = "http://127.0.0.1:11434"
 
 # When True, every ambient/background one-shot LLM call (memory extraction,
 # proactive comments, the ambient extractor — everything routed through
@@ -1117,7 +1124,7 @@ RAG_INDEX_PATHS = [
     os.path.join(os.path.expanduser("~"), "OneDrive"),
 ]
 RAG_EMBED_MODEL     = "nomic-embed-text"
-RAG_OLLAMA_ENDPOINT = "http://localhost:11434/api/embeddings"
+RAG_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/embeddings"
 RAG_RERANKER_MODEL  = "BAAI/bge-reranker-base"
 
 

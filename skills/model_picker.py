@@ -56,7 +56,7 @@ import requests
 try:
     from core.config import LOCAL_LLM_BASE_URL as _BASE_URL
 except Exception:  # pragma: no cover - config always importable in practice
-    _BASE_URL = "http://localhost:11434"
+    _BASE_URL = "http://127.0.0.1:11434"
 
 # Substrings that mark a tag as NOT a chat model. The embedding model can't
 # chat at all; the VL (vision-language) model is reserved for the vision slot
