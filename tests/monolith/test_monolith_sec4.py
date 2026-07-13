@@ -125,6 +125,17 @@ class VisionAnswerParseTests(MonolithGlobalsTestCase):
         # "Maybe yes" — only a leading YES counts.
         self.assertFalse(self.bc._vision_answer_is_yes("Maybe yes"))
 
+    def test_local_vision_tag_is_stripped(self):
+        # 2026-07-13: ask_vision prefixes local answers with
+        # '[local-vision] ' — the tag became the "first word" and EVERY
+        # local YES parsed as NO (three straight ✗ while the video
+        # demonstrably played). Bracketed lead tags must be transparent.
+        self.assertTrue(self.bc._vision_answer_is_yes("[local-vision] YES"))
+        self.assertTrue(self.bc._vision_answer_is_yes(
+            "[local-vision] Yes — one large player is visible."))
+        self.assertFalse(self.bc._vision_answer_is_yes("[local-vision] NO"))
+        self.assertFalse(self.bc._vision_answer_is_yes("[local-vision]"))
+
 
 @requires_monolith
 class NormalizeServiceTests(MonolithGlobalsTestCase):

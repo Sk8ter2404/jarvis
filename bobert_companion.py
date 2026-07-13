@@ -12929,10 +12929,21 @@ def _vision_answer_is_yes(answer: str) -> bool:
     """Strict YES/NO parser for the verify-playback prompt. Returns True only
     when the first word of the answer is YES (case-insensitive). Anything
     ambiguous — including vision-failure stubs like '(vision failed: …)' —
-    counts as NO so the caller retries instead of declaring victory."""
+    counts as NO so the caller retries instead of declaring victory.
+
+    Bracketed LEAD TAGS are stripped first: the local route prefixes every
+    answer with `[local-vision] ` (so the user knows the offline eye
+    answered), which made the tag itself the "first word" — EVERY local YES
+    parsed as NO (live 2026-07-13: 'vision: [local-vision] YES' logged as
+    ✗ not-playing three times straight while the video demonstrably played,
+    and the resulting blind playpause toggled a healthy player). Cloud
+    answers were unaffected, which is why the bug only bit the local route."""
     if not answer:
         return False
-    first = answer.strip().split(maxsplit=1)[0] if answer.strip() else ""
+    text = answer.strip()
+    while text.startswith("[") and "]" in text:
+        text = text.split("]", 1)[1].strip()
+    first = text.split(maxsplit=1)[0] if text else ""
     return first.rstrip(".,:;!?").upper() == "YES"
 
 
