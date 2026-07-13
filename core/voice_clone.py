@@ -586,3 +586,27 @@ def _to_mono_float32(wav, model) -> Tuple[Optional["np.ndarray"], int]:
     except Exception:
         sr = 24000
     return arr, sr
+
+
+def unload() -> None:
+    """Best-effort GPU release for the shutdown/restart teardown. Drops the
+    cached Chatterbox model and empties the CUDA cache so no thread is left
+    holding a live CUDA context at process termination — TerminateProcess
+    cannot reap a thread parked in the GPU driver, and a terminated-away
+    instance with an active CUDA allocation becomes a kernel-stuck
+    'terminating forever' corpse that PINS its VRAM until Windows reboots
+    (live 2026-07-13: two same-day restarts left two corpses holding ~11GB
+    of the 3090, starving the local brain into 50s timeouts). Never raises;
+    the next synthesize() simply reloads the model."""
+    try:
+        _engine_cache[0] = None
+        _engine_key[0] = None
+    except Exception:
+        pass
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    except Exception:
+        pass

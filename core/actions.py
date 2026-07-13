@@ -445,6 +445,11 @@ def _act_restart(_: str = "") -> str:
         # its handles, and the replacement's dashboard autostart refuses to
         # co-bind a port a dead process still holds (live 2026-07-12).
         _stop_web_interface_quietly()
+        # Release CUDA/Kinect/WASAPI/cameras BEFORE terminating so this
+        # instance can actually die instead of corpse-ing with ~5GB of VRAM
+        # pinned (2026-07-13 — every prior restart leaked until reboot).
+        _release_native_resources(bc)
+        time.sleep(2.0)                   # let camera caps + streams close
         # Release the singleton BEFORE spawning: the replacement boots in
         # ~1s and its singleton check must not see this (possibly wedged,
         # not-yet-dead) process and suicide — live failure mode 2026-07-12:
@@ -2523,6 +2528,37 @@ def _hard_exit_via_bc(bc, code: int = 0, clean: bool = False) -> None:
     os._exit(code)
 
 
+def _release_native_resources(bc) -> None:
+    """Best-effort release of every native/driver resource BEFORE process
+    termination. TerminateProcess (v2.0.51) prevents the ExitProcess
+    loader-lock deadlock, but a thread parked in an uncompletable DRIVER
+    call (CUDA / WASAPI / Kinect) still can't be reaped — the process
+    becomes a kernel-stuck 'terminating forever' corpse that pins its VRAM
+    and handles until Windows reboots. Live 2026-07-13: two same-day
+    restarts left two such corpses holding ~11GB of the 3090, starving the
+    local brain into 50s generate timeouts. Releasing the drivers first
+    gives termination nothing to snag on. Every step is guarded; the
+    caller's failsafe Timer still guarantees death regardless."""
+    try:
+        from core import voice_clone as _vc
+        _vc.unload()                      # chatterbox CUDA context
+    except Exception:
+        pass
+    try:
+        from audio import kinect_bridge as _kb
+        _kb.close()                       # Kinect runtime + body pump
+    except Exception:
+        pass
+    try:
+        bc.sd.stop()                      # WASAPI streams
+    except Exception:
+        pass
+    try:
+        bc._face_track_stop.set()         # camera caps (thread releases them)
+    except Exception:
+        pass
+
+
 def _stop_web_interface_quietly() -> None:
     """Release the web dashboard's listening socket BEFORE process exit.
     A kernel-stuck terminating process keeps its HANDLES open — live
@@ -2567,6 +2603,9 @@ def _act_shutdown_jarvis(_: str = "") -> str:
             time.sleep(2.0)
             print("  [shutdown_jarvis] beginning graceful teardown")
             _stop_web_interface_quietly()
+            # CUDA/Kinect first — a thread parked in a driver at terminate
+            # time corpse-pins the VRAM until reboot (2026-07-13).
+            _release_native_resources(bc)
             try: bc.sd.stop()
             except Exception: pass
             try: bc._face_track_stop.set()

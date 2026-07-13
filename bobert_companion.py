@@ -22344,6 +22344,19 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 _wi._stop()
         except Exception:
             pass
+        # Release CUDA/Kinect BEFORE terminating: a thread parked in a
+        # driver at terminate time corpse-pins the VRAM until Windows
+        # reboots (2026-07-13 — every restart leaked ~5GB per corpse).
+        try:
+            from core import voice_clone as _vc_teardown
+            _vc_teardown.unload()
+        except Exception:
+            pass
+        try:
+            from audio import kinect_bridge as _kb_teardown
+            _kb_teardown.close()
+        except Exception:
+            pass
         try: sd.stop()
         except Exception: pass
         # Signal background threads
