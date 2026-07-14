@@ -556,9 +556,22 @@ def _attempt_camera_wake(idx: int, timeout_s: float = 2.5) -> tuple[bool, str]:
 
     def _do_wake():
         cap = None
+        acquired = False
         try:
             if io_lock is not None:
-                io_lock.acquire()
+                # BOUNDED ACQUIRE (2026-07-14 audit). This was a plain
+                # io_lock.acquire() with no timeout. Only the CALLER's join is
+                # bounded (line ~601); the worker itself would block forever
+                # waiting for the tracker to release the lock. Worse, when it
+                # finally won the lock — long after the caller had given up and
+                # moved on — it would open the camera anyway, stealing the
+                # device from whatever the caller did next. Bound the worker's
+                # own wait to the same budget; if it can't get the lock in time,
+                # report contention and do NOT touch the device.
+                acquired = io_lock.acquire(timeout=timeout_s)
+                if not acquired:
+                    box["note"] = "wake skipped — camera lock held by tracker"
+                    return
             try:
                 # First release any prior handle the face-tracker had open
                 # by opening a fresh one — DirectShow refuses to hand out
@@ -588,7 +601,7 @@ def _attempt_camera_wake(idx: int, timeout_s: float = 2.5) -> tuple[bool, str]:
                 except Exception:  # pragma: no cover - defensive: cv2 VideoCapture.release() failing during wake teardown (live-camera I/O, cv2 absent on CI)
                     pass
         finally:
-            if io_lock is not None:
+            if io_lock is not None and acquired:
                 try:
                     io_lock.release()
                 except Exception:
@@ -596,7 +609,11 @@ def _attempt_camera_wake(idx: int, timeout_s: float = 2.5) -> tuple[bool, str]:
 
     t = threading.Thread(target=_do_wake, name=f"diag-wake-{idx}", daemon=True)
     t.start()
-    t.join(timeout=timeout_s)
+    # Join with a small margin OVER the worker's own lock budget (timeout_s) so
+    # that on contention the worker's specific verdict ("lock held by tracker")
+    # is observed, rather than this join firing at the same instant and
+    # reporting the generic "timed out". 2026-07-14 audit.
+    t.join(timeout=timeout_s + 0.5)
     if t.is_alive():
         return False, f"wake attempt timed out after {timeout_s:.1f}s"
     return bool(box["ok"]), str(box["note"] or "unknown wake outcome")

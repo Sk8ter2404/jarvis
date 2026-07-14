@@ -53,6 +53,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import threading
 import shutil
 import sys
 import time
@@ -128,7 +129,28 @@ def _record_reference_wav(name: str, seconds: float) -> str:
     print(f"  [enroll] recording {seconds:.0f}s from the default mic — speak now…")
     frames = int(seconds * RECORD_SAMPLE_RATE)
     audio = sd.rec(frames, samplerate=RECORD_SAMPLE_RATE, channels=1, dtype="float32")
-    sd.wait()
+    # BOUNDED WAIT (2026-07-14 audit). This is the SECOND copy of the bare
+    # sd.wait() — the audit flagged skills/enroll_voice.py:137, and a
+    # grep-every-copy pass (this codebase's #1 lesson) found the same
+    # unbounded wait here. A mic that opens but never streams would block
+    # enrolment forever. Bound it to the recording length plus a grace margin.
+    _done = threading.Event()
+
+    def _await():
+        try:
+            sd.wait()
+        finally:
+            _done.set()
+
+    threading.Thread(target=_await, daemon=True).start()
+    if not _done.wait(timeout=seconds + 2.0):
+        try:
+            sd.stop()
+        except Exception:
+            pass
+        raise TimeoutError(
+            f"mic did not deliver {seconds:.0f}s of audio within "
+            f"{seconds + 2.0:.0f}s — device stalled")
     dst = os.path.join(_profile_dir(name), REFERENCE_WAV_NAME)
     sf.write(dst, audio, RECORD_SAMPLE_RATE)
     print(f"  [enroll] saved {dst}")

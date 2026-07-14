@@ -11859,8 +11859,23 @@ def ask_vision(question: str, png_bytes: bytes | None = None) -> str:
             return f"[local-vision] {local}"
         return "(screen vision requires Claude backend or a local VLM via Ollama)"
 
+    # Import the SDK OUTSIDE the try below. If `import anthropic` fails there,
+    # Python still has to EVALUATE the `except anthropic.APIStatusError` header to
+    # decide whether it matches — and `anthropic` is unbound, so that evaluation
+    # raises NameError, which propagates straight out of the try/except and
+    # crashes the vision action, bypassing the whole local-VLM fallback. (The old
+    # catch-all's comment claimed it handled a failed import; it never could —
+    # an exception raised while matching an EARLIER except clause never reaches a
+    # LATER one.) A missing SDK is exactly the local-fallback case. 2026-07-14.
     try:
         import anthropic
+    except Exception:
+        local = _call_local_vision(question, [png_bytes])
+        if local:
+            return f"[local-vision] {local}"
+        return "(screen vision requires the anthropic SDK or a local VLM via Ollama)"
+
+    try:
         b64 = base64.standard_b64encode(png_bytes).decode("utf-8")
         msg = _anthropic_client().messages.create(
             model=SCREEN_VISION_MODEL, max_tokens=500,
@@ -11964,9 +11979,18 @@ def ask_vision_multi(question: str, images: dict[str, bytes]) -> str:
             return local
         return "(screen vision requires Claude backend or a local VLM via Ollama)"
 
+    # Hoisted for the same reason as ask_vision: a failed `import anthropic`
+    # inside the try would crash while EVALUATING the `except anthropic.*`
+    # headers (unbound name → NameError), bypassing the local fallback. A
+    # missing SDK is the local-fallback case. 2026-07-14 audit.
     try:
         import anthropic
+    except Exception:
+        local = _local_multi_fallback()
+        return local if local else (
+            "(screen vision requires the anthropic SDK or a local VLM via Ollama)")
 
+    try:
         intro = (
             f"You are looking at {len(images)} monitors at once. Each image "
             f"below is labelled with which monitor it is. When answering, "

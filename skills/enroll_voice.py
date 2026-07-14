@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 from typing import Optional
 
@@ -134,7 +135,31 @@ def _record_seconds(seconds: float) -> Optional[np.ndarray]:
             dtype="float32",
             device=device,
         )
-        sd.wait()
+        # BOUNDED WAIT (2026-07-14 audit). sd.wait() blocks until the recording
+        # finishes — but this runs on the MAIN VOICE THREAD, and a stalled mic
+        # (a device that opens but never delivers its frames) makes it block
+        # FOREVER: JARVIS goes deaf and mute mid-enrolment. Wait on a daemon
+        # instead, bounded to the recording length plus a grace margin; on
+        # overrun, stop the stream and fall through to the InputStream path
+        # below (which the except-branch already handles). The bound is
+        # recording-length-relative so a legitimately long enrolment isn't cut.
+        _done = threading.Event()
+
+        def _await_rec():
+            try:
+                sd.wait()
+            finally:
+                _done.set()
+
+        threading.Thread(target=_await_rec, daemon=True).start()
+        if not _done.wait(timeout=seconds + 2.0):
+            try:
+                sd.stop()
+            except Exception:
+                pass
+            raise TimeoutError(
+                f"sd.rec did not finish within {seconds + 2.0:.0f}s "
+                f"(mic stalled)")
         if rec is not None and rec.size > 0:
             arr = rec[:, 0] if rec.ndim > 1 else rec
             return np.asarray(arr, dtype=np.float32)

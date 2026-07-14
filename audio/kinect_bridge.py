@@ -332,7 +332,24 @@ def _open_runtime_locked():
     # Serialise the slow open so two callers don't both hammer the single-consumer
     # sensor with concurrent opens. Whoever loses the lock re-checks the cache on
     # entry and rides the winner's published runtime.
-    with _open_attempt_lock:
+    #
+    # BOUNDED ACQUIRE (2026-07-14 audit). This was a plain `with
+    # _open_attempt_lock:`. The locked body runs a retry gauntlet —
+    # _OPEN_STREAM_RETRIES (4) attempts, each a 2.5 s stream-verify plus a 1.5 s
+    # sleep — so a WEDGED sensor holds the lock for up to ~16 s. The always-on
+    # 30 Hz body pump calls get_runtime() and enters that gauntlet; when the
+    # owner then says "camera status" the VOICE THREAD's get_runtime() blocked on
+    # this acquire for the rest of the gauntlet, because the negative cache that
+    # would fast-fail it isn't published until the FIRST failed open completes.
+    # A second caller now fails fast instead: the pump will publish the runtime
+    # (or the negative verdict) shortly, and the next call rides it.
+    got = _open_attempt_lock.acquire(timeout=0.5)
+    if not got:
+        rt0 = _runtime[0]
+        if rt0 is not None:
+            return rt0, None
+        return None, (_open_error[0] or "Kinect open already in progress")
+    try:
         rt0 = _runtime[0]
         if rt0 is not None:
             return rt0, None
@@ -356,9 +373,11 @@ def _open_runtime_locked():
             last = "opened but no frames streaming"
             _safe_close_runtime(rt)
             time.sleep(_OPEN_STREAM_RETRY_SEC)
-    return None, (f"Kinect opened but streamed no frames after "
-                  f"{_OPEN_STREAM_RETRIES} attempts ({last}); sensor may be "
-                  f"held by another process")
+        return None, (f"Kinect opened but streamed no frames after "
+                      f"{_OPEN_STREAM_RETRIES} attempts ({last}); sensor may be "
+                      f"held by another process")
+    finally:
+        _open_attempt_lock.release()
 
 
 def get_runtime() -> tuple[Any, Optional[str]]:

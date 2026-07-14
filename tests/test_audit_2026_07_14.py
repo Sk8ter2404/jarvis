@@ -1041,5 +1041,188 @@ class StreamingFailuresAreSpokenTests(unittest.TestCase):
                          "the pre-fix wording should be the silent case")
 
 
+@requires_monolith
+class AskVisionImportFallbackTests(unittest.TestCase):
+    """Finding #42. `import anthropic` lived INSIDE the try whose except headers
+    say `except anthropic.APIStatusError`. If the import fails, Python still has
+    to EVALUATE that header to see if it matches — and `anthropic` is unbound, so
+    that raises NameError, which propagates straight out (an exception raised
+    while matching an EARLIER except never reaches a LATER `except Exception`).
+    The catch-all's own comment CLAIMED it handled a failed import; it never
+    could. A missing SDK must degrade to the local VLM, not crash the action."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_missing_sdk_falls_back_to_local_not_crash(self):
+        bc = self.bc
+        with mock.patch.object(bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(bc, "AI_BACKEND", "claude"), \
+             mock.patch("core.config.model_route", return_value="auto"), \
+             mock.patch.object(bc, "_call_local_vision", return_value="a terminal"), \
+             mock.patch.dict(sys.modules, {"anthropic": None}):
+            # sys.modules["anthropic"] = None makes `import anthropic` raise
+            # ImportError — the exact condition that used to crash the header.
+            out = bc.ask_vision("what's on screen?", b"pngbytes")
+        self.assertEqual(out, "[local-vision] a terminal",
+                         "a missing anthropic SDK must degrade to the local VLM")
+
+    def test_missing_sdk_and_no_local_returns_honest_string(self):
+        bc = self.bc
+        with mock.patch.object(bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(bc, "AI_BACKEND", "claude"), \
+             mock.patch("core.config.model_route", return_value="auto"), \
+             mock.patch.object(bc, "_call_local_vision", return_value=None), \
+             mock.patch.dict(sys.modules, {"anthropic": None}):
+            out = bc.ask_vision("q", b"png")
+        self.assertIsInstance(out, str)
+        self.assertIn("anthropic SDK", out)   # honest, not an exception
+
+
+@requires_monolith
+class KinectBoundedAcquireTests(unittest.TestCase):
+    """Finding #32. _open_runtime_locked used a plain `with _open_attempt_lock:`.
+    The locked body runs a retry gauntlet (up to ~16s on a wedged sensor), and
+    the negative cache that would fast-fail a second caller isn't published until
+    that gauntlet finishes — so the VOICE THREAD's get_runtime() blocked for the
+    whole gauntlet. The acquire must be bounded so a second caller fails fast."""
+
+    def setUp(self):
+        from audio import kinect_bridge as kb
+        self.kb = kb
+        self._orig_enabled = kb._ENABLED
+        self._orig_rt = kb._runtime[0]
+        self._orig_err = kb._open_error[0]
+        kb._ENABLED = True
+        kb._runtime[0] = None
+        kb._open_error[0] = None
+
+    def tearDown(self):
+        kb = self.kb
+        kb._ENABLED = self._orig_enabled
+        kb._runtime[0] = self._orig_rt
+        kb._open_error[0] = self._orig_err
+
+    def test_second_caller_fails_fast_when_lock_held(self):
+        import threading, time as _t
+        kb = self.kb
+        held = threading.Event()
+        release = threading.Event()
+
+        def _hog():
+            with kb._open_attempt_lock:
+                held.set()
+                release.wait(timeout=5)
+
+        hog = threading.Thread(target=_hog, daemon=True)
+        hog.start()
+        self.assertTrue(held.wait(timeout=2), "hog must own the lock")
+        try:
+            t0 = _t.monotonic()
+            rt, err = kb._open_runtime_locked()
+            dt = _t.monotonic() - t0
+        finally:
+            release.set()
+        # THE observable that pins the fix: it returns FAST while the lock is
+        # held, instead of blocking on the up-to-16s open gauntlet (old bug) or
+        # until the hog releases at 5s. It returns either an honest "in progress"
+        # error (contended, nothing cached) or a cached runtime — never a hang.
+        self.assertLess(dt, 2.0,
+                        "a second caller must fail fast (~0.5s), not block on "
+                        "the open gauntlet")
+        if rt is None:
+            self.assertIsNotNone(err, "no runtime → must give an honest reason")
+
+
+class SelfDiagnosticCameraWakeBoundedTests(unittest.TestCase):
+    """Finding #44. _do_wake's `io_lock.acquire()` had no timeout. Only the
+    caller's join was bounded, so the worker blocked forever waiting for the
+    tracker's lock — and when it finally won, LONG after the caller gave up, it
+    opened the camera anyway, stealing the device. The worker must bound its own
+    wait and touch nothing if it can't get the lock in time."""
+
+    def test_worker_reports_contention_instead_of_stealing_the_device(self):
+        import threading
+        import types as _types
+        import skills.self_diagnostic as sd
+
+        lock = threading.Lock()
+        lock.acquire()   # simulate the face-tracker holding the camera
+        fake_bc = mock.Mock()
+        fake_bc._camera_io_lock = lock
+        # A minimal fake cv2 so the function gets past its own import; its
+        # VideoCapture must NEVER be called when the lock is contended.
+        fake_cv2 = _types.SimpleNamespace(
+            CAP_DSHOW=0,
+            VideoCapture=mock.Mock(side_effect=AssertionError(
+                "device opened despite the lock being held — the exact "
+                "device-steal this fix prevents")))
+        try:
+            with mock.patch.object(sd, "_bc", return_value=fake_bc), \
+                 mock.patch.dict(sys.modules, {"cv2": fake_cv2}):
+                ok, note = sd._attempt_camera_wake(3, timeout_s=0.4)
+        finally:
+            lock.release()
+        self.assertFalse(ok)
+        self.assertIn("lock held", note.lower(),
+                      "a contended wake must report contention, not open the cam")
+
+
+class EnrollVoiceBoundedWaitTests(unittest.TestCase):
+    """Finding #37. Both enrollment recorders called a bare sd.wait() on the
+    voice thread — a mic that opens but never streams blocks it FOREVER. The
+    audit cited skills/enroll_voice.py; a grep-every-copy pass (this codebase's
+    #1 lesson) found the same unbounded wait in tools/enroll_voice.py."""
+
+    def test_tools_recorder_times_out_on_a_stalled_mic(self):
+        import threading
+        import types as _types
+        import numpy as np
+        from tools import enroll_voice as ev
+
+        fake_sd = _types.SimpleNamespace(
+            rec=lambda *a, **k: np.zeros((10, 1), dtype="float32"),
+            wait=lambda: threading.Event().wait(),   # never returns — stalled mic
+            stop=lambda: None,
+        )
+        # soundfile is imported at the top of _record_reference_wav and is
+        # BLOCKED in the CI-sim tier; fake it so the test exercises the wait, not
+        # the import. (It must not be reached anyway — the TimeoutError fires
+        # first — but the import itself would raise before we get there.)
+        fake_sf = _types.SimpleNamespace(write=lambda *a, **k: None)
+        done = {}
+
+        def _run():
+            try:
+                ev._record_reference_wav("unit-test-profile", 0.1)
+            except BaseException as e:      # noqa: BLE001 — capture for assert
+                done["exc"] = e
+
+        with mock.patch.dict(sys.modules,
+                             {"sounddevice": fake_sd, "soundfile": fake_sf}):
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            t.join(timeout=6)
+        self.assertFalse(t.is_alive(),
+                         "a stalled mic must NOT block enrolment forever")
+        self.assertIsInstance(done.get("exc"), TimeoutError)
+
+    def test_neither_copy_has_an_unbounded_bare_wait(self):
+        import re
+        for rel in ("skills/enroll_voice.py", "tools/enroll_voice.py"):
+            with open(os.path.join(_PROJECT, rel), encoding="utf-8") as fh:
+                lines = fh.readlines()
+            # Every sd.wait() must sit inside a bounded wrapper: the same file
+            # must also contain a `_done`/`_await` Event bound near it. Cheap
+            # structural guard against a future copy regressing.
+            has_wait = any(re.search(r"\bsd\.wait\(\)", ln) for ln in lines)
+            has_bound = any("wait(timeout=" in ln for ln in lines)
+            self.assertTrue(has_wait, f"{rel}: expected an sd.wait somewhere")
+            self.assertTrue(has_bound,
+                            f"{rel}: sd.wait must be guarded by a bounded "
+                            f"Event.wait(timeout=...) — unbounded wait regressed")
+
+
 if __name__ == "__main__":
     unittest.main()
