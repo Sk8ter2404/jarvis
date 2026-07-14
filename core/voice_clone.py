@@ -606,7 +606,19 @@ def unload() -> None:
     try:
         import torch
         if torch.cuda.is_available():
-            torch.cuda.synchronize()
+            # synchronize() drains work ALREADY QUEUED. It cannot help with a
+            # model still STREAMING WEIGHTS to the GPU on another thread — that
+            # thread keeps issuing new work and stays parked in the driver, and
+            # TerminateProcess then corpses the process (live 2026-07-14: a
+            # restart 83s into boot, mid-chatterbox-warm, corpsed even with this
+            # release; a settled instance released 4.5GB cleanly). The caller
+            # (core.actions._release_native_resources) therefore WAITS for the
+            # voice-clone single-flight guard to clear before calling us. Bound
+            # our own wait too, so a wedged driver can't hang the teardown.
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
             torch.cuda.empty_cache()
     except Exception:
         pass

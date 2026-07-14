@@ -2574,6 +2574,32 @@ def _release_native_resources(bc) -> None:
     local brain into 50s generate timeouts. Releasing the drivers first
     gives termination nothing to snag on. Every step is guarded; the
     caller's failsafe Timer still guarantees death regardless."""
+    # WAIT FOR IN-FLIGHT GPU WORK FIRST (2026-07-14). unload() drops the cached
+    # model and empties the CUDA cache — but it cannot release a model that is
+    # still LOADING. TerminateProcess then lands while a thread sits inside the
+    # CUDA driver (from_pretrained streaming weights to the GPU, or a generate
+    # mid-flight) and that thread cannot be reaped: the process becomes the
+    # kernel-stuck corpse this whole teardown exists to prevent.
+    #
+    # Live proof: a restart issued 83 SECONDS after boot — while chatterbox was
+    # still warming — corpsed the instance even WITH the v2.0.57 release,
+    # whereas a restart of a settled instance released 4.5GB and left nothing.
+    # The voice-clone single-flight guard already tracks exactly this state, so
+    # wait for it (bounded — the caller's failsafe timer still guarantees death).
+    try:
+        inflight = getattr(bc, "_voice_clone_inflight", None)
+        if inflight is not None:
+            deadline = time.time() + 20.0
+            waited = False
+            while inflight[0] and time.time() < deadline:
+                waited = True
+                time.sleep(0.25)
+            if waited:
+                state = "finished" if not inflight[0] else "STILL RUNNING"
+                print(f"  [teardown] waited for the voice-clone GPU worker "
+                      f"({state})")
+    except Exception:
+        pass
     try:
         from core import voice_clone as _vc
         _vc.unload()                      # chatterbox CUDA context

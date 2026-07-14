@@ -72,6 +72,45 @@ class ReleaseNativeResourcesTests(unittest.TestCase):
         bc.sd.stop.assert_called_once()
         bc._face_track_stop.set.assert_called_once()
 
+    def test_release_waits_for_the_in_flight_gpu_worker(self):
+        # 2026-07-14: unload() cannot release a model that is still LOADING.
+        # A restart 83s into boot (chatterbox mid-warm) corpsed the process
+        # even WITH the v2.0.57 release, because TerminateProcess landed while
+        # a thread was parked inside the CUDA driver. The teardown must wait
+        # for the voice-clone single-flight guard to clear first.
+        bc = mock.Mock()
+        bc._voice_clone_inflight = [True]
+        calls = []
+
+        def _sleep(_):
+            calls.append(1)
+            if len(calls) >= 3:
+                bc._voice_clone_inflight[0] = False   # worker finishes
+
+        with mock.patch.object(kb, "close"), \
+             mock.patch("core.voice_clone.unload") as unload, \
+             mock.patch.object(A.time, "sleep", side_effect=_sleep), \
+             mock.patch("builtins.print"):
+            A._release_native_resources(bc)
+        self.assertGreaterEqual(len(calls), 3, "it waited for the GPU worker")
+        unload.assert_called_once()      # and only unloaded AFTER the wait
+
+    def test_release_does_not_hang_on_a_stuck_worker(self):
+        # A worker that never finishes must not hang the teardown — the wait is
+        # bounded (the caller's failsafe timer is the final backstop).
+        bc = mock.Mock()
+        bc._voice_clone_inflight = [True]          # never clears
+        t = {"now": 0.0}
+        with mock.patch.object(kb, "close"), \
+             mock.patch("core.voice_clone.unload") as unload, \
+             mock.patch.object(A.time, "time", side_effect=lambda: t["now"]), \
+             mock.patch.object(A.time, "sleep",
+                               side_effect=lambda s: t.__setitem__("now",
+                                                                   t["now"] + s)), \
+             mock.patch("builtins.print"):
+            A._release_native_resources(bc)
+        unload.assert_called_once()      # gave up waiting and pressed on
+
     def test_release_falls_back_when_bridge_lacks_the_kwarg(self):
         # An older bridge without close(final=) must still be disabled, not
         # left enabled with a live pump.
