@@ -4674,5 +4674,74 @@ class ProcessCaptureChunkSkipNsTests(MonolithGlobalsTestCase):
         self.assertTrue(calls["ns"])
 
 
+@requires_monolith
+class VisionWedgeDetectorTests(MonolithGlobalsTestCase):
+    """The vision-wedge detector (2026-07-14). A wedged MULTIMODAL runner is
+    INVISIBLE to _ollama_alive() — the server answers /api/tags and text chat
+    in ~1s while every image request hangs. The old self-heal called
+    _ensure_ollama_running(), a no-op in that state, so the wedge survived
+    until a human killed ollama by hand (twice: 2026-07-12, 2026-07-13).
+    Consecutive vision TIMEOUTS now escalate to a full stack reap."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def setUp(self):
+        self.bc._VISION_WEDGE_STATE["timeouts"] = 0
+        self.bc._VISION_WEDGE_STATE["last_reap"] = 0.0
+
+    def _thread_runner(self):
+        """Run the daemon thread body inline so the reap is observable."""
+        def _fake_thread(target=None, name=None, daemon=None):
+            t = mock.Mock()
+            t.start = target          # calling .start() runs the body inline
+            return t
+        return mock.patch.object(self.bc.threading, "Thread",
+                                 side_effect=_fake_thread)
+
+    def test_single_timeout_does_not_reap(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_reap_wedged_ollama") as reap, \
+             mock.patch.object(bc, "_ensure_ollama_running") as ensure, \
+             mock.patch("builtins.print"):
+            bc._vision_wedge_note_timeout()
+        reap.assert_not_called()
+        ensure.assert_not_called()
+        self.assertEqual(bc._VISION_WEDGE_STATE["timeouts"], 1)
+
+    def test_threshold_timeouts_reap_and_restart(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_reap_wedged_ollama") as reap, \
+             mock.patch.object(bc, "_ensure_ollama_running") as ensure, \
+             self._thread_runner(), mock.patch("builtins.print"):
+            bc._vision_wedge_note_timeout()
+            bc._vision_wedge_note_timeout()
+        reap.assert_called_once()
+        ensure.assert_called_once()
+        # counter reset so the next wedge starts clean
+        self.assertEqual(bc._VISION_WEDGE_STATE["timeouts"], 0)
+
+    def test_success_clears_the_counter(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_reap_wedged_ollama") as reap, \
+             mock.patch("builtins.print"):
+            bc._vision_wedge_note_timeout()
+            bc._vision_wedge_note_ok()          # a good call in between
+            bc._vision_wedge_note_timeout()     # this is now only #1 again
+        reap.assert_not_called()
+
+    def test_cooldown_prevents_reap_thrash(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_reap_wedged_ollama") as reap, \
+             mock.patch.object(bc, "_ensure_ollama_running"), \
+             self._thread_runner(), mock.patch("builtins.print"):
+            bc._vision_wedge_note_timeout()
+            bc._vision_wedge_note_timeout()     # reap #1
+            bc._vision_wedge_note_timeout()
+            bc._vision_wedge_note_timeout()     # inside cooldown → no reap
+        reap.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

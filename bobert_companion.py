@@ -9638,10 +9638,71 @@ def _call_local_vision(question: str, png_images: list[bytes],
             print(f"  [local-vision] empty content; done_reason={body.get('done_reason')!r}")
             return None
         print(f"  [local-vision] served via {LOCAL_VISION_MODEL}")
+        _vision_wedge_note_ok()
         return text
     except requests.RequestException as _e:
         print(f"  [local-vision] HTTP call failed: {_e}")
+        # A TIMEOUT here (not a connection refusal) is the signature of a
+        # VISION-WEDGED runner: the server still answers /api/tags and text
+        # chat in ~1s while the multimodal path never returns. _ollama_alive()
+        # therefore reads HEALTHY, so _ollama_selfheal_async's
+        # _ensure_ollama_running() no-ops and nothing ever reaps the wedge —
+        # it survived until a human killed ollama.exe by hand, TWICE
+        # (2026-07-12 and 2026-07-13). Count consecutive timeouts and escalate
+        # to a full reap+restart once the pattern is unmistakable.
+        if isinstance(_e, requests.Timeout):
+            _vision_wedge_note_timeout()
         return None
+
+
+# ── vision-wedge detector (2026-07-14) ──────────────────────────────────────
+# A wedged MULTIMODAL runner is invisible to _ollama_alive() (which only probes
+# /api/tags). Track consecutive vision timeouts; at the threshold, reap the
+# whole ollama stack (server + llama-server children) and let the existing
+# self-heal bring it back — the manual fix that worked both times it happened.
+_VISION_WEDGE_STATE = {"timeouts": 0, "last_reap": 0.0}
+_VISION_WEDGE_THRESHOLD = 2          # two consecutive timeouts = wedged
+_VISION_WEDGE_REAP_COOLDOWN_S = 300.0
+
+
+def _vision_wedge_note_ok() -> None:
+    """A successful vision call clears the wedge counter."""
+    _VISION_WEDGE_STATE["timeouts"] = 0
+
+
+def _vision_wedge_note_timeout() -> None:
+    """Count a vision-path timeout; reap the ollama stack at the threshold.
+
+    Escalates to _reap_wedged_ollama() (kill ollama.exe + llama-server.exe)
+    rather than _ensure_ollama_running(), which is a NO-OP while the server
+    still answers /api/tags — exactly the state a vision wedge presents."""
+    _VISION_WEDGE_STATE["timeouts"] += 1
+    n = _VISION_WEDGE_STATE["timeouts"]
+    if n < _VISION_WEDGE_THRESHOLD:
+        print(f"  [local-vision] timeout {n}/{_VISION_WEDGE_THRESHOLD} — "
+              f"watching for a wedged multimodal runner")
+        return
+    now = time.time()
+    if now - _VISION_WEDGE_STATE["last_reap"] < _VISION_WEDGE_REAP_COOLDOWN_S:
+        print("  [local-vision] wedge suspected but a reap ran recently — "
+              "not thrashing the server")
+        return
+    _VISION_WEDGE_STATE["last_reap"] = now
+    _VISION_WEDGE_STATE["timeouts"] = 0
+
+    def _do():
+        try:
+            print(f"  [local-vision] VISION WEDGE: {n} consecutive timeouts "
+                  f"while the server answers /api/tags — reaping the ollama "
+                  f"stack and restarting it")
+            _reap_wedged_ollama()
+            _ensure_ollama_running()
+            print("  [local-vision] ollama stack restarted after vision wedge")
+        except Exception as _re:
+            print(f"  [local-vision] wedge reap raised "
+                  f"{type(_re).__name__}: {_re}")
+
+    threading.Thread(target=_do, name="vision-wedge-reap", daemon=True).start()
 
 
 def _cached_system_param(full_prompt: str):
