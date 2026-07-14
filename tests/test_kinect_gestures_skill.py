@@ -76,6 +76,20 @@ def _fake_bc(*, standby=False, sleep=False, pending=None, speaking=False):
     bc._pending_confirmation = list(pending or [])
     bc._tts_playback_active = [bool(speaking)]
     bc._barge_in_interrupted = False
+
+    # Mirrors the real request_tts_interrupt: refuses when nothing is playing;
+    # a non-acoustic source (a hand in front of the Kinect) skips the mic-facing
+    # echo / wake-word gates, which exist only because the mic hears the
+    # speakers. Records what it accepted. 2026-07-14 audit.
+    bc._tts_interrupts = []
+
+    def _request_tts_interrupt(source="wake-word", acoustic=True):
+        if not bc._tts_playback_active[0]:
+            return False
+        bc._tts_interrupts.append((source, acoustic))
+        return True
+
+    bc.request_tts_interrupt = _request_tts_interrupt
     bc._hud_writes = []
     bc._write_hud_state = lambda **kw: bc._hud_writes.append(kw)
     bc._spoken = []
@@ -172,10 +186,16 @@ class RaiseHandMappingTests(_Base):
 # ─── SWIPE → stop speech + clear pending ───────────────────────────────────
 class SwipeMappingTests(_Base):
     def test_swipe_interrupts_speech(self):
+        """Asserted `_barge_in_interrupted` until the 2026-07-14 audit — which
+        was green-by-mock: that flag's only speaker-stopping reader is the
+        `_barge_watch` thread, and play_with_lipsync only starts that thread
+        when a barge-in mic stream exists (BARGE_IN_ENABLED *and* a headset).
+        On speakers nobody read it, so the gesture did nothing while this test
+        stayed green. Pin the mechanism that actually stops the audio."""
         mod = self._load()
         bc = _fake_bc(speaking=True)
         mod._do_swipe(bc)
-        self.assertTrue(bc._barge_in_interrupted)
+        self.assertEqual(bc._tts_interrupts, [("kinect-swipe", False)])
 
     def test_swipe_clears_pending(self):
         mod = self._load()
@@ -187,9 +207,9 @@ class SwipeMappingTests(_Base):
     def test_swipe_noop_when_idle(self):
         mod = self._load()
         bc = _fake_bc(speaking=False, pending=[])
-        # Should not raise, should not set barge-in (nothing playing).
+        # Should not raise, should not interrupt (nothing is playing).
         mod._do_swipe(bc)
-        self.assertFalse(bc._barge_in_interrupted)
+        self.assertEqual(bc._tts_interrupts, [])
 
 
 # ─── _dispatch routes each gesture to its handler ──────────────────────────

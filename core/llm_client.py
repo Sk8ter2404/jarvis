@@ -31,12 +31,22 @@ from typing import Any, Callable, Optional, Sequence
 # lives with the client; callers may override per-call.
 DEFAULT_TIMEOUT_S: float = 30.0
 
+# `timeout` in the Anthropic SDK is PER ATTEMPT, and the SDK's own default is
+# max_retries=2 — i.e. up to THREE attempts plus exponential backoff between
+# them. So a "30 second timeout" was really a ~92 s worst case, and these calls
+# run on the MAIN VOICE THREAD: JARVIS would go silent and deaf for a minute and
+# a half while the SDK quietly retried behind his back. Nobody chose 92 s; it was
+# inherited. Pin it. One retry still absorbs the transient 429/529/socket blips
+# retries exist for, while the worst case a caller can actually feel becomes
+# 2 x timeout + backoff (~62 s at the default) instead of 3 x. 2026-07-14 audit.
+DEFAULT_MAX_RETRIES: int = 1
 
-def _client(timeout: float):
+
+def _client(timeout: float, max_retries: int = DEFAULT_MAX_RETRIES):
     """Construct an Anthropic client. Lazy import so `anthropic` stays an
     optional dependency until a cloud call is actually made."""
     import anthropic  # noqa: WPS433 — intentional lazy import
-    return anthropic.Anthropic(timeout=timeout)
+    return anthropic.Anthropic(timeout=timeout, max_retries=max_retries)
 
 
 def complete(

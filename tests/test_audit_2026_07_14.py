@@ -467,5 +467,314 @@ class LlmIndependentControlPlaneTests(unittest.TestCase):
         shutdown.assert_not_called()
 
 
+@requires_monolith
+class VlmResidentExemptionTests(unittest.TestCase):
+    """Finding #23. Since the v2.0.33 overhaul chat and vision are the SAME
+    multimodal model, so a vision call usually needs ZERO new VRAM — the weights
+    are already on the card. The co-load gates couldn't tell 'load a 9 GB model'
+    from 'reuse the 9 GB model sitting right there', saw a nearly-full 24 GB
+    card, and refused. Watched live in the sweep log: "REFUSING co-load: only
+    3976 MB free ... for gemma4:12b" — with gemma4:12b resident."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def _ps(self, *names):
+        return [{"name": n, "size_vram": 9_000_000_000} for n in names]
+
+    def test_resident_vlm_is_detected(self):
+        bc = self.bc
+        with mock.patch.object(bc, "LOCAL_VISION_MODEL", "gemma4:12b"), \
+             mock.patch.object(bc, "_ollama_loaded_models",
+                               return_value=self._ps("gemma4:12b")):
+            self.assertTrue(bc._local_vision_model_already_resident())
+
+    def test_resident_match_is_on_the_base_tag(self):
+        bc = self.bc
+        with mock.patch.object(bc, "LOCAL_VISION_MODEL", "gemma4:12b"), \
+             mock.patch.object(bc, "_ollama_loaded_models",
+                               return_value=self._ps("gemma4:12b-it-q4")):
+            self.assertTrue(bc._local_vision_model_already_resident())
+
+    def test_other_model_resident_is_not_the_vlm(self):
+        bc = self.bc
+        with mock.patch.object(bc, "LOCAL_VISION_MODEL", "gemma4:12b"), \
+             mock.patch.object(bc, "_ollama_loaded_models",
+                               return_value=self._ps("qwen2.5:14b")):
+            self.assertFalse(bc._local_vision_model_already_resident())
+
+    def test_full_card_does_not_refuse_an_already_resident_vlm(self):
+        """THE BUG: 3976 MB free < 7500 MB needed, yet the model is loaded. The
+        call must go through — there is nothing to co-load."""
+        bc = self.bc
+        posted = {}
+
+        def _fake_post(url, json=None, timeout=None):
+            posted["timeout"] = timeout
+            r = mock.Mock()
+            r.ok = True
+            r.json.return_value = {"message": {"content": "I see a terminal."}}
+            return r
+
+        with mock.patch.object(bc, "LOCAL_VISION_MODEL", "gemma4:12b"), \
+             mock.patch.object(bc, "_local_vision_usable", return_value=True), \
+             mock.patch.object(bc, "_ollama_alive", return_value=True), \
+             mock.patch.object(bc, "_ollama_has_model", return_value=True), \
+             mock.patch.object(bc, "_ollama_loaded_models",
+                               return_value=self._ps("gemma4:12b")), \
+             mock.patch.object(bc, "_cuda0_free_vram_mb", return_value=3976), \
+             mock.patch.object(bc.requests, "post", side_effect=_fake_post):
+            out = bc._call_local_vision("what is on screen?", [b"png"])
+        self.assertEqual(out, "I see a terminal.",
+                         "an ALREADY-RESIDENT VLM must not be refused for lack "
+                         "of free VRAM — it needs none")
+
+    def test_full_card_still_refuses_a_cold_vlm(self):
+        """The guard must NOT be gutted: a model that is genuinely not loaded
+        still gets refused on a full card. That was the whole point of it."""
+        bc = self.bc
+        with mock.patch.object(bc, "LOCAL_VISION_MODEL", "gemma4:12b"), \
+             mock.patch.object(bc, "_local_vision_usable", return_value=True), \
+             mock.patch.object(bc, "_ollama_alive", return_value=True), \
+             mock.patch.object(bc, "_ollama_has_model", return_value=True), \
+             mock.patch.object(bc, "_ollama_loaded_models", return_value=[]), \
+             mock.patch.object(bc, "_cuda0_free_vram_mb", return_value=3976), \
+             mock.patch.object(bc.requests, "post") as post:
+            out = bc._call_local_vision("what is on screen?", [b"png"])
+        self.assertIsNone(out)
+        post.assert_not_called()
+
+
+@requires_monolith
+class LocalVisionTimeoutTests(unittest.TestCase):
+    """Finding #14. ask_vision runs on the MAIN VOICE THREAD for every caller
+    but _glance, and the local-VLM POST used a flat timeout=180 — so a wedged
+    runner could leave JARVIS deaf and mute for three solid minutes. The 180 s
+    only ever existed to cover a COLD weight load; a warm call needs a bound
+    sized to decode."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def _run_with(self, loaded):
+        bc = self.bc
+        seen = {}
+
+        def _fake_post(url, json=None, timeout=None):
+            seen["timeout"] = timeout
+            r = mock.Mock()
+            r.ok = True
+            r.json.return_value = {"message": {"content": "ok"}}
+            return r
+
+        models = ([{"name": "gemma4:12b", "size_vram": 9_000_000_000}]
+                  if loaded else [])
+        with mock.patch.object(bc, "LOCAL_VISION_MODEL", "gemma4:12b"), \
+             mock.patch.object(bc, "_local_vision_usable", return_value=True), \
+             mock.patch.object(bc, "_ollama_alive", return_value=True), \
+             mock.patch.object(bc, "_ollama_has_model", return_value=True), \
+             mock.patch.object(bc, "_ollama_loaded_models", return_value=models), \
+             mock.patch.object(bc, "_cuda0_free_vram_mb", return_value=24000), \
+             mock.patch.object(bc.requests, "post", side_effect=_fake_post):
+            bc._call_local_vision("q", [b"png"])
+        return seen["timeout"]
+
+    def test_warm_call_gets_the_voice_safe_bound(self):
+        self.assertEqual(self._run_with(loaded=True),
+                         self.bc._LOCAL_VISION_TIMEOUT_WARM_S)
+
+    def test_cold_load_still_gets_the_long_rope(self):
+        self.assertEqual(self._run_with(loaded=False),
+                         self.bc._LOCAL_VISION_TIMEOUT_COLD_S)
+
+    def test_warm_bound_cannot_silence_jarvis_for_minutes(self):
+        bc = self.bc
+        self.assertLessEqual(bc._LOCAL_VISION_TIMEOUT_WARM_S, 60,
+                             "the steady-state bound is how long JARVIS can go "
+                             "deaf on a wedged runner — keep it short")
+        self.assertLess(bc._LOCAL_VISION_TIMEOUT_WARM_S,
+                        bc._LOCAL_VISION_TIMEOUT_COLD_S)
+
+
+@requires_monolith
+class AnthropicRetryBoundTests(unittest.TestCase):
+    """Finding #22. `timeout` in the Anthropic SDK is PER ATTEMPT and the SDK
+    default is max_retries=2 — so the documented "30 s" bound on the voice
+    thread was really ~92 s. The 2026-05-30 pass even NAMED the multiplier in
+    its comment ("× 2 retries") and then pinned only the timeout."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_client_pins_max_retries(self):
+        bc = self.bc
+        fake = mock.Mock()
+        with mock.patch.dict(sys.modules, {"anthropic": fake}):
+            bc._anthropic_client()
+        _args, kwargs = fake.Anthropic.call_args
+        self.assertEqual(kwargs["timeout"], bc._ANTHROPIC_TIMEOUT_S)
+        self.assertEqual(kwargs["max_retries"], bc._ANTHROPIC_MAX_RETRIES)
+
+    def test_retry_budget_is_small(self):
+        self.assertLessEqual(self.bc._ANTHROPIC_MAX_RETRIES, 1)
+
+    def test_no_bare_anthropic_constructions_remain(self):
+        """The retry multiplier survived a pass that had already spotted it
+        because the construction was duplicated eight times. Keep it funnelled:
+        the ONLY anthropic.Anthropic( in the monolith is the factory's own."""
+        import ast
+        with open(os.path.join(_PROJECT, "bobert_companion.py"),
+                  encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        # AST, not grep: a text scan also matches the factory's own docstring,
+        # which talks ABOUT anthropic.Anthropic(...). Count real Call nodes.
+        hits = [n.lineno for n in ast.walk(tree)
+                if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "Anthropic"]
+        self.assertEqual(len(hits), 1,
+                         f"expected only the _anthropic_client() factory to "
+                         f"construct a client; found constructions at lines "
+                         f"{hits}")
+
+    def test_llm_client_module_pins_retries_too(self):
+        from core import llm_client
+        fake = mock.Mock()
+        with mock.patch.dict(sys.modules, {"anthropic": fake}):
+            llm_client._client(12.0)
+        _args, kwargs = fake.Anthropic.call_args
+        self.assertEqual(kwargs["max_retries"], llm_client.DEFAULT_MAX_RETRIES)
+        self.assertLessEqual(llm_client.DEFAULT_MAX_RETRIES, 1)
+
+
+class LiveBackendReportingTests(unittest.TestCase):
+    """Finding #8. show_llm_stats / latency_benchmark imported AI_BACKEND and
+    OLLAMA_MODEL from core.config AT CALL TIME — i.e. the BOOT values. switch_llm
+    deliberately mutates only the monolith's globals (its own docstring says
+    "nothing reads from core.config at runtime"; these two did). And
+    core.config.OLLAMA_MODEL is still the shipped default "llama3" — a tag
+    RETIRED from this box — so on the local backend they didn't merely name the
+    wrong model, they named one that isn't installed."""
+
+    def _bc(self, backend, live_local="gemma4:12b"):
+        bc = mock.Mock()
+        bc.AI_BACKEND = backend
+        bc.CLAUDE_MODEL = "claude-sonnet-5"
+        bc.OLLAMA_MODEL = "llama3"          # the frozen boot landmine
+        bc._get_local_llm_model.return_value = live_local
+        return bc
+
+    def test_reports_the_live_backend_after_a_switch(self):
+        with mock.patch.object(A, "_bc", return_value=self._bc("ollama")):
+            backend, model = A._live_backend_and_model()
+        self.assertEqual(backend, "ollama")
+        self.assertEqual(model, "gemma4:12b")
+        self.assertNotEqual(model, "llama3", "must not report the retired tag")
+
+    def test_claude_backend_reports_the_claude_model(self):
+        with mock.patch.object(A, "_bc", return_value=self._bc("claude")):
+            backend, model = A._live_backend_and_model()
+        self.assertEqual((backend, model), ("claude", "claude-sonnet-5"))
+
+    def test_show_llm_stats_names_the_live_local_model(self):
+        with mock.patch.object(A, "_bc", return_value=self._bc("ollama")):
+            out = A._act_show_llm_stats("")
+        self.assertIn("backend=ollama", out)
+        self.assertIn("gemma4:12b", out)
+        self.assertNotIn("llama3", out)
+
+    def test_benchmark_resolves_the_backend_after_the_call_not_at_dispatch(self):
+        """The old closure captured the backend at DISPATCH while _llm_quick
+        picks it LIVE — so a local round-trip could be timed and then labelled
+        "claude/...". Flip the backend mid-call; the label must follow."""
+        bc = self._bc("claude")
+        state = {"backend": "claude"}
+        bc.AI_BACKEND = "claude"
+
+        def _quick(**_kw):
+            state["backend"] = "ollama"
+            bc.AI_BACKEND = "ollama"        # a switch landed while we were out
+            return "pong"
+
+        bc._llm_quick.side_effect = _quick
+        captured = {}
+        bc._tray_async.side_effect = lambda _n, fn: captured.update(out=fn())
+        with mock.patch.object(A, "_bc", return_value=bc):
+            A._act_latency_benchmark("")
+        self.assertIn("ollama/gemma4:12b", captured["out"],
+                      "the benchmark must name the brain it ACTUALLY timed")
+
+
+@requires_monolith
+class GestureInterruptIsNotAcousticTests(unittest.TestCase):
+    """Finding #20. The SWIPE gesture set `_barge_in_interrupted`, whose only
+    speaker-stopping reader (_barge_watch) is started ONLY when a barge-in mic
+    stream exists — i.e. BARGE_IN_ENABLED *and* a HEADSET. On speakers the
+    gesture set a flag nobody would ever read. And it can't simply call
+    request_tts_interrupt() either: both of that function's gates exist because
+    the MIC HEARS THE SPEAKERS, and a hand in front of a depth sensor cannot be
+    an acoustic echo."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_non_acoustic_interrupt_bypasses_the_echo_gate(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_tts_playback_active", [True]), \
+             mock.patch.object(bc, "_tts_current_text",
+                               ["certainly sir, jarvis here"]), \
+             mock.patch.object(bc, "_tts_interrupt") as ev, \
+             mock.patch.object(bc, "_tts_interrupt_seq", [0]):
+            ok = bc.request_tts_interrupt(source="kinect-swipe", acoustic=False)
+        self.assertTrue(ok, "a hand swipe is not an echo of our own speakers")
+        ev.set.assert_called_once()
+
+    def test_non_acoustic_interrupt_ignores_the_wake_word_knob(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_barge_in_wake_enabled", return_value=False), \
+             mock.patch.object(bc, "_tts_playback_active", [True]), \
+             mock.patch.object(bc, "_tts_current_text", ["hello"]), \
+             mock.patch.object(bc, "_tts_interrupt") as ev, \
+             mock.patch.object(bc, "_tts_interrupt_seq", [0]):
+            ok = bc.request_tts_interrupt(source="kinect-swipe", acoustic=False)
+        self.assertTrue(ok, "BARGE_IN_ENABLED is the WAKE-WORD knob; it must "
+                            "not silently disable hand gestures")
+        ev.set.assert_called_once()
+
+    def test_acoustic_wake_path_is_unchanged(self):
+        """The mic-facing gates must survive intact for the wake word."""
+        bc = self.bc
+        with mock.patch.object(bc, "_barge_in_wake_enabled", return_value=True), \
+             mock.patch.object(bc, "_tts_playback_active", [True]), \
+             mock.patch.object(bc, "_tts_current_text", ["yes, jarvis here"]), \
+             mock.patch.object(bc, "_tts_interrupt") as ev:
+            self.assertFalse(bc.request_tts_interrupt(source="wake-word"))
+        ev.set.assert_not_called()
+
+    def test_nothing_playing_is_still_refused(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_tts_playback_active", [False]), \
+             mock.patch.object(bc, "_tts_interrupt") as ev:
+            self.assertFalse(
+                bc.request_tts_interrupt(source="kinect-swipe", acoustic=False))
+        ev.set.assert_not_called()
+
+    def test_swipe_routes_through_the_live_mechanism(self):
+        """The gesture must call request_tts_interrupt, NOT poke the dead flag."""
+        kg, _actions = load_skill_isolated("kinect_gestures")
+        bc = mock.Mock()
+        bc.request_tts_interrupt.return_value = True
+        bc._pending_confirmation = None
+        kg._do_swipe(bc)
+        bc.request_tts_interrupt.assert_called_once()
+        _a, kwargs = bc.request_tts_interrupt.call_args
+        self.assertFalse(kwargs["acoustic"],
+                         "a depth-sensor swipe is not an acoustic barge-in")
+
+
 if __name__ == "__main__":
     unittest.main()

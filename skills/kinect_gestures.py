@@ -208,16 +208,25 @@ def _do_raise_hand(bc) -> None:
         print(f"  [gestures] raise-hand confirm failed: {e}")
 
 
-def _do_swipe(bc) -> None:
+def _do_swipe(bc) -> bool:
     """SWIPE → 'never mind': interrupt current TTS AND clear a pending
-    confirmation. Setting _barge_in_interrupted is the same flag the mic
-    barge-in uses; the play_with_lipsync watch thread sees it and stops
-    playback. Clearing _pending_confirmation cancels a queued action."""
+    confirmation. Clearing _pending_confirmation cancels a queued action.
+
+    The TTS half used to set `bc._barge_in_interrupted = True` and call it done.
+    That flag has exactly ONE reader that can actually stop the speakers — the
+    `_barge_watch` thread inside play_with_lipsync — and that thread is only
+    started when a barge-in mic stream exists, i.e. when BARGE_IN_ENABLED *and*
+    the user is on a HEADSET. On speakers there is no watch thread, so the swipe
+    set a flag that nobody in the process was ever going to read: the gesture
+    silently did nothing, which is precisely how it survived so long unnoticed.
+    request_tts_interrupt() is the live mechanism — its event is polled by
+    play_with_lipsync's own playback wait on every utterance, headset or not.
+    acoustic=False because a hand in front of a depth sensor can't be an echo of
+    our own speakers, so the mic-oriented gates must not apply. 2026-07-14."""
     stopped_something = False
     # Interrupt any in-flight speech.
     try:
-        if bool(getattr(bc, "_tts_playback_active", [False])[0]):
-            bc._barge_in_interrupted = True
+        if bc.request_tts_interrupt(source="kinect-swipe", acoustic=False):
             stopped_something = True
             print("  [gestures] SWIPE -> interrupted speech")
     except Exception as e:

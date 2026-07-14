@@ -517,19 +517,55 @@ def _act_model_costs(_: str = "") -> str:
     return model_catalog.format_catalog()
 
 
+def _live_backend_and_model() -> tuple[str, str]:
+    """The backend and model JARVIS is ACTUALLY using this second.
+
+    Both reporting actions used to answer this by importing AI_BACKEND /
+    OLLAMA_MODEL from core.config at call time, which is wrong twice over:
+
+      * core.config holds the BOOT values. `switch_llm` mutates the monolith's
+        wildcard-copied globals (`bc.AI_BACKEND`) and deliberately leaves
+        core.config alone — _act_switch_llm's own docstring says so. So after a
+        switch, both actions kept cheerfully reporting the old brain.
+      * core.config.OLLAMA_MODEL is still the shipped default `"llama3"` — a tag
+        that was RETIRED from this box. The live tag comes from the monolith's
+        resolver. So on the local backend these didn't merely name the wrong
+        model, they named a model that isn't installed.
+
+    Read both off the live monolith, which is the authority. core.config is kept
+    as a fallback for the one case where there IS no live value to read — the
+    monolith isn't importable — because a status readout should degrade to the
+    boot defaults, not raise in the user's face. 2026-07-14 audit."""
+    from core import config as cfg
+    try:
+        bc = _bc()
+    except Exception:
+        return cfg.AI_BACKEND, (cfg.CLAUDE_MODEL if cfg.AI_BACKEND == "claude"
+                                else cfg.OLLAMA_MODEL)
+    backend = getattr(bc, "AI_BACKEND", None) or cfg.AI_BACKEND
+    if backend == "claude":
+        return backend, (getattr(bc, "CLAUDE_MODEL", None) or cfg.CLAUDE_MODEL)
+    resolver = getattr(bc, "_get_local_llm_model", None)
+    if callable(resolver):
+        try:
+            return backend, resolver()
+        except Exception:
+            pass
+    return backend, (getattr(bc, "OLLAMA_MODEL", None) or cfg.OLLAMA_MODEL)
+
+
 def _act_show_llm_stats(_: str = "") -> str:
     """The active backend + model, with an estimated cost per conversation for
     the current model (from core.model_catalog)."""
-    from core.config import AI_BACKEND, CLAUDE_MODEL, OLLAMA_MODEL
     from core import model_catalog
-    model = CLAUDE_MODEL if AI_BACKEND == "claude" else OLLAMA_MODEL
+    backend, model = _live_backend_and_model()
     entry = model_catalog.by_id(model)
     if entry is not None:
         c = entry.cost_per_conversation()
         cost = "$0 (local)" if c <= 0 else f"~${c:.2f}/conv"
-        return (f"backend={AI_BACKEND}  model={model}  est. {cost} ({entry.tier})."
+        return (f"backend={backend}  model={model}  est. {cost} ({entry.tier})."
                 f" Say 'model costs' to compare the options.")
-    return (f"backend={AI_BACKEND}  model={model}  "
+    return (f"backend={backend}  model={model}  "
             f"(not in the cost catalog — say 'model costs' for priced options).")
 
 
@@ -1545,10 +1581,14 @@ def _act_latency_benchmark(_: str = "") -> str:
     the user a feel for current backend latency. Async — Claude
     typically replies in ~1s but Ollama on a cold model can take 5-30s."""
     bc = _bc()
-    from core.config import AI_BACKEND, CLAUDE_MODEL, OLLAMA_MODEL
 
     def _do():
         try:
+            # Resolve the backend label INSIDE the worker, not at dispatch. The
+            # old code closed over core.config's boot values, while _llm_quick
+            # picks its backend live — so a local round-trip could be timed and
+            # then labelled "claude/claude-sonnet-5". A benchmark that misnames
+            # what it just measured is worse than no benchmark.
             t0 = time.time()
             reply = bc._llm_quick(
                 system="Reply with exactly the word 'pong' and nothing else.",
@@ -1556,8 +1596,7 @@ def _act_latency_benchmark(_: str = "") -> str:
                 max_tokens=8,
             )
             ms = (time.time() - t0) * 1000
-            backend = AI_BACKEND
-            model = CLAUDE_MODEL if backend == "claude" else OLLAMA_MODEL
+            backend, model = _live_backend_and_model()
             head = (reply or "").strip().splitlines()[0] if reply else "(no reply)"
             return f"{backend}/{model}: {ms:.0f}ms — reply={head[:40]!r}"
         except Exception as e:

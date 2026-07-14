@@ -118,11 +118,17 @@ class ModelActionTests(unittest.TestCase):
         self.assertIn("Claude Haiku", out)
         self.assertIn("switch to", out)
 
+    # These exercise the CATALOG (does it price the model right?), using
+    # show_llm_stats as the vehicle. They used to patch core.config — but as of
+    # the 2026-07-14 audit the action reads the LIVE backend off the monolith,
+    # with core.config only as a no-monolith fallback. Patching config here
+    # would therefore pass in the light CI tier (no monolith importable → the
+    # fallback runs) and FAIL on a dev box (monolith imports → live values win):
+    # green-by-environment. Patch the resolver these tests actually depend on.
     def test_show_llm_stats_known_cloud_model(self):
         import core.actions as A
-        import core.config as cfg
-        with mock.patch.object(cfg, "AI_BACKEND", "claude"), \
-             mock.patch.object(cfg, "CLAUDE_MODEL", "claude-sonnet-4-6"):
+        with mock.patch.object(A, "_live_backend_and_model",
+                               return_value=("claude", "claude-sonnet-4-6")):
             out = A._act_show_llm_stats()
         self.assertIn("est.", out)
         self.assertIn("claude-sonnet-4-6", out)
@@ -130,17 +136,15 @@ class ModelActionTests(unittest.TestCase):
 
     def test_show_llm_stats_local_is_free(self):
         import core.actions as A
-        import core.config as cfg
-        with mock.patch.object(cfg, "AI_BACKEND", "ollama"), \
-             mock.patch.object(cfg, "OLLAMA_MODEL", "qwen2.5:14b-instruct"):
+        with mock.patch.object(A, "_live_backend_and_model",
+                               return_value=("ollama", "qwen2.5:14b-instruct")):
             out = A._act_show_llm_stats()
         self.assertIn("$0 (local)", out)
 
     def test_show_llm_stats_unknown_model(self):
         import core.actions as A
-        import core.config as cfg
-        with mock.patch.object(cfg, "AI_BACKEND", "claude"), \
-             mock.patch.object(cfg, "CLAUDE_MODEL", "some-unlisted-model"):
+        with mock.patch.object(A, "_live_backend_and_model",
+                               return_value=("claude", "some-unlisted-model")):
             out = A._act_show_llm_stats()
         self.assertIn("not in the cost catalog", out)
 

@@ -144,8 +144,9 @@ class ClientFactoryTests(unittest.TestCase):
         captured = {}
 
         class FakeAnthropic:
-            def __init__(self, timeout=None):
+            def __init__(self, timeout=None, max_retries=None):
                 captured["timeout"] = timeout
+                captured["max_retries"] = max_retries
 
         fake_mod = types.ModuleType("anthropic")
         fake_mod.Anthropic = FakeAnthropic
@@ -153,6 +154,13 @@ class ClientFactoryTests(unittest.TestCase):
             client = llm._client(12.5)
         self.assertIsInstance(client, FakeAnthropic)
         self.assertEqual(captured["timeout"], 12.5)
+        # `timeout` is PER ATTEMPT and the SDK retries twice by default, so an
+        # unpinned client turns a 30 s bound into a ~92 s one on the voice
+        # thread. Pin it explicitly. 2026-07-14 audit.
+        self.assertEqual(captured["max_retries"], llm.DEFAULT_MAX_RETRIES)
+
+    def test_client_retry_budget_is_pinned_small(self):
+        self.assertLessEqual(llm.DEFAULT_MAX_RETRIES, 1)
 
 
 class LogCacheUsageTests(unittest.TestCase):

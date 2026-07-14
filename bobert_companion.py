@@ -1501,6 +1501,30 @@ def build_system_prompt(memory: dict) -> str:
 # surrounding code falls back to the local model. 2026-05-30 deep audit.
 _ANTHROPIC_TIMEOUT_S = 30.0
 
+# ...and the OTHER half of that multiplier, which the 2026-05-30 pass named in
+# its own comment ("× 2 retries") but never actually pinned. `timeout` is PER
+# ATTEMPT; the SDK keeps retrying underneath it, so the 30 s bound above was
+# really a ~92 s one (3 attempts + exponential backoff) on the voice thread.
+# One retry still absorbs the transient 429/529/socket blips retries are for.
+# Every anthropic.Anthropic() in this file goes through _anthropic_client().
+# 2026-07-14 audit.
+_ANTHROPIC_MAX_RETRIES = 1
+
+
+def _anthropic_client(timeout: float | None = None,
+                      max_retries: int | None = None):
+    """The ONE place this file constructs an Anthropic client.
+
+    There were eight separate hand-rolled `anthropic.Anthropic(...)`
+    constructions scattered through the monolith — which is exactly how the retry
+    multiplier survived a pass that had already spotted it: fixing one copy left
+    seven. Funnelling them here means the next policy change lands once."""
+    import anthropic
+    return anthropic.Anthropic(
+        timeout=_ANTHROPIC_TIMEOUT_S if timeout is None else timeout,
+        max_retries=_ANTHROPIC_MAX_RETRIES if max_retries is None else max_retries,
+    )
+
 
 def _llm_quick(system: str, user: str, max_tokens: int = 200) -> str:
     """One-shot LLM call for memory extraction / proactive comments.
@@ -1534,7 +1558,7 @@ def _llm_quick(system: str, user: str, max_tokens: int = 200) -> str:
     if AI_BACKEND == "claude":
         import anthropic
         try:
-            msg = anthropic.Anthropic(timeout=_ANTHROPIC_TIMEOUT_S).messages.create(
+            msg = _anthropic_client().messages.create(
                 model=CLAUDE_MODEL, max_tokens=max_tokens,
                 system=system,
                 messages=[{"role": "user", "content": user}],
@@ -8837,11 +8861,47 @@ def _ollama_big_model_resident(exclude_model: str | None = None) -> str | None:
     return None
 
 
+def _local_vision_model_already_resident() -> bool:
+    """True when the local VLM tag is ALREADY loaded in VRAM right now.
+
+    The two co-load gates in _call_local_vision exist to stop a SECOND model
+    being pulled onto a card that's already holding the brain. Neither gate can
+    tell 'load a 9 GB model' apart from 'reuse the 9 GB model that is sitting
+    right there' — and since the v2.0.33 overhaul the shipped default is
+    chat == vision == gemma4:12b (ONE multimodal model serving both), so the
+    common case is precisely the second one: a vision call that needs ZERO new
+    VRAM. The free-VRAM gate saw a nearly-full 24 GB card (whisper + chatterbox
+    + the resident brain) and refused, and JARVIS said 'I couldn't see the
+    screen' while the model it needed was already loaded. Asking /api/ps
+    directly settles it. Matches on the base tag (before ':'), like every other
+    residency check here, so gemma4:12b matches gemma4:12b-it-q4 etc."""
+    base = (LOCAL_VISION_MODEL or "").split(":", 1)[0]
+    if not base:
+        return False
+    for m in _ollama_loaded_models():
+        if not isinstance(m, dict):
+            continue
+        name = m.get("name") or m.get("model") or ""
+        if name and name.split(":", 1)[0] == base:
+            return True
+    return False
+
+
 # Rough VRAM the local VLM needs to load safely (7B-class q4 weights + KV/decode
 # workspace) plus a cushion so a load never lands right at the ceiling and OOMs
 # mid-decode. Feeds the true-free-VRAM co-load gate in _call_local_vision.
 _VLM_COLOAD_NEEDED_MB = 6000
 _VLM_COLOAD_HEADROOM_MB = 1500
+
+# How long a local-vision HTTP call may hold the caller. ask_vision runs on the
+# MAIN VOICE THREAD for every caller except _glance, so this doubles as 'how long
+# JARVIS may go deaf'. WARM = the model is already resident, so we're only paying
+# for decode (measured 2-11 s for a 12B VLM on the 3090 — 60 s is ~5x headroom).
+# COLD = Ollama still has to pull the weights off disk, which nothing can hurry.
+# Two consecutive timeouts on either bound trip the wedge detector, which reaps
+# the stuck runner. 2026-07-14 audit.
+_LOCAL_VISION_TIMEOUT_WARM_S = 60
+_LOCAL_VISION_TIMEOUT_COLD_S = 180
 
 
 def _cuda0_free_vram_mb() -> int | None:
@@ -9388,8 +9448,7 @@ def _claude_oneshot(system: str, messages: list, max_tokens: int = 500) -> str |
                 system=system, messages=messages,
                 timeout=_ANTHROPIC_TIMEOUT_S,
             )
-        import anthropic as _anthropic
-        msg = _anthropic.Anthropic(timeout=_ANTHROPIC_TIMEOUT_S).messages.create(
+        msg = _anthropic_client().messages.create(
             model=CLAUDE_MODEL, max_tokens=max_tokens,
             system=system, messages=messages,
         )
@@ -9706,6 +9765,22 @@ def _call_local_vision(question: str, png_images: list[bytes],
     # headroom to hold both can set JARVIS_ALLOW_VLM_COLOAD=1 to opt out.
     _allow_coload = (os.environ.get("JARVIS_ALLOW_VLM_COLOAD", "").strip().lower()
                      in ("1", "true", "yes", "on"))
+    # ALREADY-RESIDENT EXEMPTION (2026-07-14 audit). Both gates below exist to
+    # stop a SECOND model being co-loaded on top of the brain. But since the
+    # v2.0.33 overhaul the shipped default is chat == vision == gemma4:12b — ONE
+    # multimodal model serving both — so a vision call needs ZERO new VRAM: the
+    # weights are already on the card. The free-VRAM gate does not know that; it
+    # just sees a nearly-full 24GB card (whisper + chatterbox + the brain) and
+    # refuses, so JARVIS says "I couldn't see the screen" while the very model it
+    # needs is sitting loaded in front of it. Observed live in the 660-action
+    # sweep: "REFUSING co-load: only 3976 MB free … for gemma4:12b" — with
+    # gemma4:12b resident. If the VLM tag is already loaded, there is nothing to
+    # co-load and nothing to guard against.
+    _resident = _local_vision_model_already_resident()
+    if not _allow_coload and _resident:
+        _allow_coload = True
+        print(f"  [local-vision] {LOCAL_VISION_MODEL} is ALREADY resident — no "
+              f"co-load needed, VRAM gates skipped")
     if not _allow_coload:
         _resident_big = _ollama_big_model_resident(exclude_model=LOCAL_VISION_MODEL)
         if _resident_big:
@@ -9749,10 +9824,21 @@ def _call_local_vision(question: str, png_images: list[bytes],
         _think = _local_think_param(LOCAL_VISION_MODEL)
         if _think is not None:
             payload["think"] = _think
-        # Vision calls on a 7B VLM take ~2-6 s on the 3090; allow generous
-        # headroom for the first call after a model swap (Ollama lazily
-        # loads weights into VRAM on first hit).
-        r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat", json=payload, timeout=180)
+        # RESIDENCY-ADAPTIVE TIMEOUT (2026-07-14 audit). This was a flat
+        # timeout=180 — and ask_vision runs on the MAIN VOICE THREAD for every
+        # caller but _glance (which wraps it in its own 12 s bounded join). So a
+        # wedged runner could mute JARVIS for three solid minutes: he'd stop
+        # answering, stop hearing, and look dead. The 180 s only ever existed to
+        # cover a COLD weight load (Ollama pulls the weights off disk on first
+        # hit). Now that we can ask /api/ps whether the model is already loaded,
+        # a warm call — the steady-state case — gets a bound sized to what a warm
+        # 12B VLM actually costs (2-11 s measured on the 3090), with 5x headroom.
+        # A cold load still gets the long rope, because there is nothing to do
+        # but wait for the disk.
+        _vis_timeout = (_LOCAL_VISION_TIMEOUT_WARM_S if _resident
+                        else _LOCAL_VISION_TIMEOUT_COLD_S)
+        r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat", json=payload,
+                          timeout=_vis_timeout)
         if not r.ok:
             print(f"  [local-vision] HTTP {r.status_code}: {r.text[:200]}")
             return None
@@ -10439,7 +10525,7 @@ def _call_llm(user_text: str) -> str:
                         timeout=_ANTHROPIC_TIMEOUT_S,
                     )
             else:
-                msg = anthropic.Anthropic(timeout=_ANTHROPIC_TIMEOUT_S).messages.create(
+                msg = _anthropic_client().messages.create(
                     model=CLAUDE_MODEL, max_tokens=500,
                     system=_sys_param,
                     messages=conversation_history,
@@ -11075,7 +11161,8 @@ def _barge_in_wake_enabled() -> bool:
         return False
 
 
-def request_tts_interrupt(source: str = "wake-word") -> bool:
+def request_tts_interrupt(source: str = "wake-word",
+                          acoustic: bool = True) -> bool:
     """Barge-in entry point, called from skills/wake_listener.py when the
     wake-word ENGINE fires while JARVIS is speaking. Returns True when the
     interrupt was ACCEPTED — the caller must then swallow its wake
@@ -11092,20 +11179,31 @@ def request_tts_interrupt(source: str = "wake-word") -> bool:
         user barging in during such a sentence loses this one race, and the
         wake path still handles them the moment playback ends).
 
+    `acoustic=False` marks an interrupt that did NOT arrive through the
+    microphone — a Kinect hand-swipe, a web-UI stop button, a tray click. Both
+    guarded gates above exist purely because the mic hears the speakers:
+    BARGE_IN_ENABLED is the *wake-word* knob, and the "jarvis" echo gate is
+    there to stop JARVIS's own voice retriggering him. Neither can apply to a
+    hand waved in front of a depth sensor, and applying them anyway just makes
+    the gesture mysteriously dead whenever he happens to be saying his own
+    name. Non-acoustic sources still require live playback — there must be
+    something to actually stop. 2026-07-14 audit.
+
     Only sets the event — the actual sd.stop() runs inside
     play_with_lipsync's sliced playback wait (_wait_done_or_barge), on the
     caller thread that already owns the utterance: a plain non-callback
     thread, the documented safe context for stopping PortAudio streams in
     this codebase."""
-    if not _barge_in_wake_enabled():
+    if acoustic and not _barge_in_wake_enabled():
         return False
     if not _tts_playback_active[0]:
         return False
-    if "jarvis" in (_tts_current_text[0] or ""):
+    if acoustic and "jarvis" in (_tts_current_text[0] or ""):
         print(f"  [barge-in] wake hit ignored (own TTS says 'jarvis'), "
               f"source={source}")
         return False
-    print(f"  [barge-in] wake-word interrupt accepted, source={source}")
+    print(f"  [barge-in] TTS interrupt accepted, source={source}"
+          f"{'' if acoustic else ' (non-acoustic)'}")
     _tts_interrupt.set()
     # Bump the monotonic accepted-barge counter so a streaming-TTS flush thread
     # can see the barge-in even after _tts_interrupt is cleared by the finally
@@ -11764,7 +11862,7 @@ def ask_vision(question: str, png_bytes: bytes | None = None) -> str:
     try:
         import anthropic
         b64 = base64.standard_b64encode(png_bytes).decode("utf-8")
-        msg = anthropic.Anthropic(timeout=_ANTHROPIC_TIMEOUT_S).messages.create(
+        msg = _anthropic_client().messages.create(
             model=SCREEN_VISION_MODEL, max_tokens=500,
             messages=[{
                 "role": "user",
@@ -11887,7 +11985,7 @@ def ask_vision_multi(question: str, images: dict[str, bytes]) -> str:
             })
         content.append({"type": "text", "text": question})
 
-        msg = anthropic.Anthropic(timeout=_ANTHROPIC_TIMEOUT_S).messages.create(
+        msg = _anthropic_client().messages.create(
             model=SCREEN_VISION_MODEL, max_tokens=800,
             messages=[{"role": "user", "content": content}],
         )
@@ -18867,7 +18965,7 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
                     system=_sys_param, messages=msgs,
                     timeout=_ANTHROPIC_TIMEOUT_S,
                 )
-            msg = anthropic.Anthropic(timeout=_ANTHROPIC_TIMEOUT_S).messages.create(
+            msg = _anthropic_client().messages.create(
                 model=CLAUDE_MODEL, max_tokens=400,
                 system=_sys_param, messages=msgs,
             )
@@ -20041,7 +20139,9 @@ def _preflight_api_key(timeout_sec: float = 10.0) -> tuple[bool, str]:
 
     def _ping():
         try:
-            client = anthropic.Anthropic(timeout=timeout_sec)
+            # max_retries=0: this is a REACHABILITY probe. Retrying it just makes
+            # "is Claude up?" take three times longer to answer "no".
+            client = _anthropic_client(timeout=timeout_sec, max_retries=0)
             client.messages.create(
                 model=CLAUDE_MODEL,
                 max_tokens=1,

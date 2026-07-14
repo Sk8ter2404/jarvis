@@ -160,22 +160,40 @@ class LLMMenuTests(_BaseActTest):
         self.assertIn("/conv", out)        # cost-per-conversation shown
         self.assertIn("switch to", out)
 
+    # NOTE (2026-07-14 audit): these used to patch core.config and assert the
+    # action read from THERE. That was pinning the bug. core.config holds the
+    # BOOT values; `switch_llm` mutates the monolith's globals and deliberately
+    # leaves core.config alone (see _act_switch_llm's docstring), so a
+    # config-reading stats action reports the pre-switch brain forever. The
+    # authority is the live monolith — so that is what these now set.
     def test_show_llm_stats_claude_backend(self):
-        with mock.patch("core.config.AI_BACKEND", "claude"), \
-             mock.patch("core.config.CLAUDE_MODEL", "claude-test-model"), \
-             mock.patch("core.config.OLLAMA_MODEL", "llama-x"):
-            out = A._act_show_llm_stats("")
+        self.bc.AI_BACKEND = "claude"
+        self.bc.CLAUDE_MODEL = "claude-test-model"
+        self.bc.OLLAMA_MODEL = "llama-x"
+        out = A._act_show_llm_stats("")
         self.assertIn("backend=claude", out)
         self.assertIn("model=claude-test-model", out)
 
-    def test_show_llm_stats_ollama_backend_uses_ollama_model(self):
-        with mock.patch("core.config.AI_BACKEND", "ollama"), \
-             mock.patch("core.config.CLAUDE_MODEL", "claude-x"), \
-             mock.patch("core.config.OLLAMA_MODEL", "llama-test-model"):
-            out = A._act_show_llm_stats("")
+    def test_show_llm_stats_ollama_backend_uses_the_live_local_model(self):
+        self.bc.AI_BACKEND = "ollama"
+        self.bc.CLAUDE_MODEL = "claude-x"
+        self.bc.OLLAMA_MODEL = "llama-x"
+        self.bc._get_local_llm_model.return_value = "llama-test-model"
+        out = A._act_show_llm_stats("")
         self.assertIn("backend=ollama", out)
         self.assertIn("model=llama-test-model", out)
         self.assertNotIn("claude-x", out)
+
+    def test_show_llm_stats_prefers_the_live_backend_over_boot_config(self):
+        """The whole point: after `switch_llm ollama`, core.config still says
+        "claude". The readout must follow the LIVE brain, not the boot one."""
+        self.bc.AI_BACKEND = "ollama"
+        self.bc._get_local_llm_model.return_value = "gemma4:12b"
+        with mock.patch("core.config.AI_BACKEND", "claude"), \
+             mock.patch("core.config.CLAUDE_MODEL", "claude-boot-model"):
+            out = A._act_show_llm_stats("")
+        self.assertIn("backend=ollama", out)
+        self.assertNotIn("claude-boot-model", out)
 
 
 # ── _act_press / _act_scroll ─────────────────────────────────────────────────
