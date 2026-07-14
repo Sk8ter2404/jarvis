@@ -13749,7 +13749,7 @@ def _streaming_play_and_verify(
                 strategy, cfg, result_coords
             )
         except UIFailsafeError as e:
-            return f"play attempt on {service_label} aborted: {e}"
+            return f"play attempt on {service_label} failed: {e}"
 
         if not attempted:
             last_msg = desc
@@ -14128,16 +14128,22 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
     )
     if ui_only:
         if not UI_AUTOMATION_ENABLED:
+            # Must carry a canonical FAILURE_MARKER ("couldn't"). These
+            # capability-gate returns are failure-shaped but used to match NO
+            # marker and sit in neither speak-set, so the user heard only the
+            # inline "Of course, sir", stared at a search page, and was never
+            # told why nothing played. 2026-07-14 audit.
             return (
-                f"opened {service_label} for '{q}' — auto-play needs UI "
-                f"automation (keyboard control) to start playback"
+                f"opened {service_label} for '{q}', but I couldn't start "
+                f"playback — auto-play needs UI automation (keyboard control)"
             )
     elif not (SCREEN_VISION_ENABLED and UI_AUTOMATION_ENABLED
               and _vision_click_backend_available()):
         return (
-            f"opened {service_label} search for '{q}' — auto-click needs "
-            f"SCREEN_VISION_ENABLED + UI_AUTOMATION_ENABLED + a vision "
-            f"backend (Claude or a local vision model)"
+            f"opened {service_label} search for '{q}', but I couldn't select "
+            f"the first result — auto-click needs SCREEN_VISION_ENABLED + "
+            f"UI_AUTOMATION_ENABLED + a vision backend (Claude or a local "
+            f"vision model)"
         )
 
     # Step 2: activate the first result. Three paths:
@@ -14159,12 +14165,13 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
         try:
             sent = _streaming_keyboard_select_first_result(cfg, service_label)
         except UIFailsafeError as e:
-            return f"opened {service_label} search for '{q}' but {e}"
+            return (f"opened {service_label} search for '{q}', but I couldn't "
+                    f"continue — {e}")
         if not sent:
             return (
-                f"opened {service_label} search for '{q}' but UI "
-                f"automation is unavailable — you may need to click the "
-                f"first result yourself"
+                f"opened {service_label} search for '{q}', but I couldn't "
+                f"select the first result — UI automation is unavailable; you "
+                f"may need to click it yourself"
             )
     else:
         print(
@@ -14186,7 +14193,8 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
         try:
             ui_click(coords[0], coords[1])
         except UIFailsafeError as e:
-            return f"opened {service_label} search for '{q}' but {e}"
+            return (f"opened {service_label} search for '{q}', but I couldn't "
+                    f"continue — {e}")
         print(f"  [auto-play] clicked first result at {coords}", flush=True)
 
     # Step 3: click the play button (services that have a separate detail
@@ -14363,9 +14371,10 @@ def _apple_music_play_playlist(name: str) -> str:
     if not (SCREEN_VISION_ENABLED and UI_AUTOMATION_ENABLED
             and _vision_click_backend_available()):
         return (
-            f"opened Apple Music Library > Playlists — auto-click needs "
-            f"SCREEN_VISION_ENABLED + UI_AUTOMATION_ENABLED + a vision "
-            f"backend (Claude or a local vision model)"
+            f"opened Apple Music Library > Playlists, but I couldn't start the "
+            f"playlist — auto-click needs SCREEN_VISION_ENABLED + "
+            f"UI_AUTOMATION_ENABLED + a vision backend (Claude or a local "
+            f"vision model)"
         )
 
     # Step 2: locate the named playlist tile. If the direct URL didn't land

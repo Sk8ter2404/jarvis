@@ -41,7 +41,7 @@ import os
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 _PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -89,6 +89,7 @@ _night_owl_active  = [False]
 _started_at        = [0.0]
 _trigger           = [""]          # "auto" | "manual" | "phrase"
 _engaged_in_window = [False]       # True once the night window has covered this session
+_opted_out_night   = [""]          # night-key the user MANUALLY switched off in (see _opted_out_of_this_night)
 
 _saved_resolve_preset: list = [None]
 _saved_enqueues: dict[str, object] = {}
@@ -152,6 +153,31 @@ def _in_night_window(now: datetime | None = None) -> bool:
         return NIGHT_OWL_START_HOUR <= h < NIGHT_OWL_END_HOUR
     # Wrap-around case (the usual one): 23–24 OR 0–6.
     return h >= NIGHT_OWL_START_HOUR or h < NIGHT_OWL_END_HOUR
+
+
+def _night_key(now: datetime | None = None) -> str:
+    """An identifier for the CURRENT night window, stable across midnight.
+
+    The window wraps (23:00 → 06:00), so the calendar date is not a usable key:
+    23:30 on the 14th and 00:30 on the 15th are the SAME night. Key on the date
+    the evening began — the small hours borrow the previous day's key."""
+    n = now or datetime.now()
+    if NIGHT_OWL_START_HOUR > NIGHT_OWL_END_HOUR and n.hour < NIGHT_OWL_END_HOUR:
+        n = n - timedelta(days=1)      # we're in the small hours: last night's key
+    return n.strftime("%Y-%m-%d")
+
+
+def _opted_out_of_this_night(now: datetime | None = None) -> bool:
+    """True when the user has MANUALLY turned night-owl off during the window
+    we are currently in — so the watcher must not re-engage it.
+
+    Without this the mode was impossible to switch off between 23:00 and 06:00:
+    _exit_night_owl only cleared the active flag, recording nothing, so the very
+    next watcher tick (≤60 s later) saw `in_window and not active`, re-engaged,
+    re-dimmed everything and re-announced "It's past 11, sir." The user's
+    decision survived less than a minute, every time. The opt-out is scoped to
+    the night it was made in, so tomorrow engages normally. 2026-07-14 audit."""
+    return bool(_opted_out_night[0]) and _opted_out_night[0] == _night_key(now)
 
 
 def is_night_owl_active() -> bool:
@@ -337,6 +363,9 @@ def _enter_night_owl(trigger: str = "manual", *, announce: bool = True) -> str:
         _started_at[0]       = time.time()
         _trigger[0]          = trigger
         _engaged_in_window[0] = _in_night_window()
+        # Turning it back ON retracts any opt-out for tonight — otherwise the
+        # state would say "the user doesn't want this tonight" while it runs.
+        _opted_out_night[0] = ""
 
     # Install side effects outside the lock — none of them block long, but
     # status queries shouldn't have to wait on them.
@@ -372,6 +401,15 @@ def _exit_night_owl(trigger: str = "manual", *, announce: bool = True) -> str:
         _trigger[0] = ""
         _started_at[0] = 0.0
         _engaged_in_window[0] = False
+        # Remember that the USER chose this, so the watcher doesn't undo it 60 s
+        # later. Only a deliberate switch-off counts: the automatic 06:00
+        # release ("auto_morning") is the window ENDING, not an opt-out, and
+        # must not suppress tomorrow night. 2026-07-14 audit.
+        if not trigger.startswith("auto") and _in_night_window():
+            _opted_out_night[0] = _night_key()
+            print(f"  [night_owl] user opted out for tonight "
+                  f"({_opted_out_night[0]}) — auto-engage suppressed until "
+                  f"the window ends")
 
     _restore_tts_modifier()
     _restore_nudge_suppressors()
@@ -402,7 +440,7 @@ def _watch_loop():
         try:
             in_window = _in_night_window()
             active = is_night_owl_active()
-            if in_window and not active:
+            if in_window and not active and not _opted_out_of_this_night():
                 _enter_night_owl(trigger="auto")
             elif in_window and active:
                 # The window has caught up with a pre-window manual

@@ -903,5 +903,143 @@ class ClaudeOptionalIsWiredTests(unittest.TestCase):
         self.assertTrue(body, "CLAUDE_OPTIONAL is dead config again")
 
 
+class NightOwlManualOffSticksTests(unittest.TestCase):
+    """Finding #30. Between 23:00 and 06:00 night-owl mode could NOT be turned
+    off. _exit_night_owl cleared the active flag and recorded nothing, so the
+    next watcher tick (<=60 s) saw `in_window and not active`, re-engaged,
+    re-dimmed TTS + overlay, re-installed the nudge suppressors and re-announced
+    "It's past 11, sir." The user's decision survived less than a minute, every
+    single time. A reconciliation loop needs somewhere to record "the user
+    overrode me"; this one had nowhere."""
+
+    def setUp(self):
+        self.mod, _actions = load_skill_isolated("night_owl_mode")
+        self.mod._opted_out_night[0] = ""
+        self.mod._night_owl_active[0] = False
+
+    def test_night_key_is_stable_across_midnight(self):
+        from datetime import datetime as dt
+        m = self.mod
+        evening = m._night_key(dt(2026, 7, 14, 23, 30))
+        small_hours = m._night_key(dt(2026, 7, 15, 0, 30))
+        self.assertEqual(evening, small_hours,
+                         "23:30 and 00:30 are the SAME night — the calendar "
+                         "date is not a usable key for a wrapping window")
+
+    def test_manual_off_inside_the_window_suppresses_auto_reengage(self):
+        from datetime import datetime as dt
+        m = self.mod
+        inside = dt(2026, 7, 15, 0, 30)     # small hours, inside the window
+        with mock.patch.object(m, "_in_night_window", return_value=True), \
+             mock.patch.object(m, "_night_key", return_value="2026-07-14"), \
+             mock.patch.object(m, "_restore_tts_modifier"), \
+             mock.patch.object(m, "_restore_nudge_suppressors"), \
+             mock.patch.object(m, "_restore_prompt_addendum"), \
+             mock.patch.object(m, "_set_overlay_dim"), \
+             mock.patch.object(m, "_enqueue_speech"):
+            m._night_owl_active[0] = True
+            m._exit_night_owl(trigger="manual")
+            self.assertFalse(m.is_night_owl_active())
+            self.assertTrue(m._opted_out_of_this_night(inside),
+                            "a manual off inside the window must be REMEMBERED "
+                            "or the watcher undoes it within 60 seconds")
+
+    def test_auto_morning_release_is_not_an_optout(self):
+        """The 06:00 release is the window ENDING, not the user opting out —
+        it must not suppress tomorrow night."""
+        m = self.mod
+        with mock.patch.object(m, "_in_night_window", return_value=True), \
+             mock.patch.object(m, "_restore_tts_modifier"), \
+             mock.patch.object(m, "_restore_nudge_suppressors"), \
+             mock.patch.object(m, "_restore_prompt_addendum"), \
+             mock.patch.object(m, "_set_overlay_dim"), \
+             mock.patch.object(m, "_enqueue_speech"):
+            m._night_owl_active[0] = True
+            m._exit_night_owl(trigger="auto_morning")
+        self.assertEqual(m._opted_out_night[0], "")
+
+    def test_optout_expires_with_the_night(self):
+        from datetime import datetime as dt
+        m = self.mod
+        m._opted_out_night[0] = "2026-07-14"
+        self.assertTrue(m._opted_out_of_this_night(dt(2026, 7, 15, 2, 0)))
+        # Next evening is a NEW night — auto-engage must work again.
+        self.assertFalse(m._opted_out_of_this_night(dt(2026, 7, 15, 23, 30)))
+
+    def test_turning_it_back_on_retracts_the_optout(self):
+        m = self.mod
+        m._opted_out_night[0] = "2026-07-14"
+        with mock.patch.object(m, "_install_tts_modifier"), \
+             mock.patch.object(m, "_install_nudge_suppressors"), \
+             mock.patch.object(m, "_apply_prompt_addendum"), \
+             mock.patch.object(m, "_set_overlay_dim"), \
+             mock.patch.object(m, "_enqueue_speech"), \
+             mock.patch.object(m, "_in_night_window", return_value=True):
+            m._enter_night_owl(trigger="manual")
+        self.assertEqual(m._opted_out_night[0], "")
+
+
+class StreamingFailuresAreSpokenTests(unittest.TestCase):
+    """Finding #24. The streaming capability-gate returns are failure-SHAPED but
+    carried no canonical FAILURE_MARKER, and the streaming actions sit in
+    neither INFORMATIVE_ACTIONS nor SPEAK_RESULT_VERBATIM_ACTIONS. So with
+    SCREEN_VISION_ENABLED off (a supported config — the gate exists for it), the
+    user heard only the inline "Of course, sir", stared at a Netflix search page,
+    and was NEVER told why nothing played. Sibling strings that DO carry a marker
+    ("couldn't see the first result") prove the intended mechanism."""
+
+    def _is_failure(self, result: str) -> bool:
+        from core.failure_markers import FAILURE_MARKERS
+        low = (result or "").lower()
+        return any(m in low for m in FAILURE_MARKERS)
+
+    def test_every_streaming_gate_return_is_failure_classified(self):
+        """The ASSEMBLED strings, as the user's ears would receive them. (Not a
+        source grep — these are built from split f-string literals, so no single
+        fragment appears contiguously in the file.)"""
+        assembled = [
+            "opened Netflix for 'Stranger Things', but I couldn't start "
+            "playback — auto-play needs UI automation (keyboard control)",
+            "opened Netflix search for 'x', but I couldn't select the first "
+            "result — auto-click needs SCREEN_VISION_ENABLED + "
+            "UI_AUTOMATION_ENABLED + a vision backend",
+            "opened Spotify search for 'x', but I couldn't select the first "
+            "result — UI automation is unavailable; you may need to click it "
+            "yourself",
+            "opened Apple Music Library > Playlists, but I couldn't start the "
+            "playlist — auto-click needs SCREEN_VISION_ENABLED",
+            "opened YouTube search for 'x', but I couldn't continue — failsafe",
+            "play attempt on Netflix failed: boom",
+        ]
+        for s in assembled:
+            self.assertTrue(self._is_failure(s),
+                            f"matches no FAILURE_MARKER, so it reaches neither "
+                            f"the follow-up loop nor the verbatim speak-set — "
+                            f"the user would hear nothing: {s[:60]!r}")
+
+    def test_the_old_silent_phrasings_are_gone(self):
+        with open(os.path.join(_PROJECT, "bobert_companion.py"),
+                  encoding="utf-8") as fh:
+            src = fh.read()
+        # The OLD, marker-free constructions, as they appeared verbatim in the
+        # source. (Deliberately anchored on the leading `'{q}' —` / `but {e}`
+        # shape: the REPLACEMENTS legitimately still mention "auto-play needs
+        # UI automation" as the explanation — what changed is that they now lead
+        # with "but I couldn't …", which is what carries the marker.)
+        for dead in ("'{q}' — auto-play needs UI ",
+                     "aborted: {e}",
+                     "search for '{q}' but {e}"):
+            self.assertNotIn(dead, src,
+                             f"unmarked failure phrasing came back: {dead!r}")
+
+    def test_a_marker_free_phrasing_would_actually_fail_this_guard(self):
+        """Keep the guard honest — the OLD wording must classify as non-failure,
+        proving these assertions aren't vacuously true."""
+        old = ("opened Netflix for 'x' — auto-play needs UI automation "
+               "(keyboard control) to start playback")
+        self.assertFalse(self._is_failure(old),
+                         "the pre-fix wording should be the silent case")
+
+
 if __name__ == "__main__":
     unittest.main()
