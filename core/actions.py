@@ -2508,12 +2508,31 @@ def _act_upgrade(_: str = "") -> str:
         return f"failed to spawn upgrade: {e}"
 
     def _self_exit():
+        # The LAST os._exit in the tree (2026-07-14 audit). Everything else was
+        # converted in v2.0.51/57: os._exit → ExitProcess walks
+        # DLL_PROCESS_DETACH under the loader lock, a thread parked in the CUDA
+        # driver holds it, and the process becomes a kernel-stuck "terminating
+        # forever" corpse that pins ~5GB of VRAM and its handles until Windows
+        # reboots. This path ALSO skipped the native release, the web socket,
+        # and the singleton — so the upgrade's relaunched JARVIS would boot into
+        # a held :8766 and a held singleton. Same hardened sequence the restart
+        # uses. clean=True: upgrade_jarvis.py relaunches JARVIS itself, so the
+        # watchdog must NOT also resurrect us (that would double-boot).
         try:
             time.sleep(3.0)
-            os._exit(0)
+            _fs = threading.Timer(30.0, _hard_exit_via_bc, args=(bc, 0, True))
+            _fs.daemon = True
+            _fs.start()
+            _stop_web_interface_quietly()
+            try:
+                bc._release_singleton()
+            except Exception as e:
+                print(f"  [upgrade] singleton release failed: {e}")
+            _release_native_resources(bc)
+            time.sleep(1.0)
         except Exception:
-            logging.exception("_self_exit failed")
-            os._exit(0)
+            logging.exception("_self_exit teardown failed")
+        _hard_exit_via_bc(bc, 0, clean=True)
     threading.Thread(target=_self_exit, daemon=True).start()
 
     return (
@@ -2562,7 +2581,15 @@ def _release_native_resources(bc) -> None:
         pass
     try:
         from audio import kinect_bridge as _kb
-        _kb.close()                       # Kinect runtime + body pump
+        # final=True: clear the enable flag FIRST so an in-flight 30 Hz pump
+        # tick can't re-open the sensor (and spawn a fresh pump) microseconds
+        # before TerminateProcess — a thread holding a live Kinect driver
+        # handle at termination is exactly what corpses the process.
+        # 2026-07-14 audit.
+        try:
+            _kb.close(final=True)
+        except TypeError:                 # older bridge without the kwarg
+            _kb.set_enabled(False)
     except Exception:
         pass
     try:

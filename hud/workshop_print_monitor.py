@@ -38,6 +38,13 @@ import os
 import sys
 import tkinter as tk
 
+# hud/ is not a package root — put the project dir on sys.path so
+# `from core.parent_watch import ...` resolves (2026-07-14).
+try:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+except Exception:
+    pass
+
 try:
     import psutil
     _HAS_PSUTIL = True
@@ -68,6 +75,18 @@ CONTROL_FILE   = os.path.join(PROJECT_DIR, "workshop_print_monitor_state.json")
 def _is_parent_alive(pid: int) -> bool:
     if pid <= 0:
         return True
+    # AUTHORITATIVE liveness first (2026-07-14, audit finding): psutil.pid_exists
+    # reads TRUE for a DEAD-but-unreaped Windows process — a kernel-stuck
+    # "terminating forever" row keeps its PID until reboot — so an overlay that
+    # trusts it outlives its dead parent (a HUD + tray once survived by 25
+    # minutes). core.parent_watch asks the kernel (GetExitCodeProcess +
+    # WaitForSingleObject). Fail-open: if the helper is unavailable we fall
+    # through to the historical checks below rather than tearing the overlay down.
+    try:
+        from core.parent_watch import parent_is_alive
+        return parent_is_alive(pid)
+    except Exception:
+        pass
     if _HAS_PSUTIL:
         try:
             return psutil.pid_exists(pid)

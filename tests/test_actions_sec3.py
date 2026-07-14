@@ -2218,16 +2218,30 @@ class UpgradeTests(unittest.TestCase):
                     mock.patch.object(A.subprocess, "Popen"), \
                     mock.patch("threading.Thread", side_effect=capture_thread):
                 A._act_upgrade()
-            # Now exercise the captured _self_exit body.
+            # Now exercise the captured _self_exit body. 2026-07-14: this path
+            # used to call a raw os._exit — the LAST one in the tree, and the
+            # exact immortal-zombie route v2.0.51/57 removed everywhere else
+            # (ExitProcess deadlocks on the loader lock behind a CUDA-parked
+            # thread; the process corpses with ~5GB VRAM pinned until reboot).
+            # It also skipped the native release, the web socket and the
+            # singleton, so the upgrade's relaunched JARVIS met a held :8766
+            # and a held singleton. It now runs the hardened teardown.
+            bc._hard_exit.side_effect = SystemExit
             with mock.patch.object(A.time, "sleep"), \
-                    mock.patch.object(A.os, "_exit",
-                                      side_effect=SystemExit) as mexit:
+                    mock.patch("threading.Timer"), \
+                    mock.patch.object(A, "_release_native_resources") as rel, \
+                    mock.patch.object(A, "_stop_web_interface_quietly") as web:
                 with self.assertRaises(SystemExit):
                     captured["target"]()
-            mexit.assert_called_once_with(0)
+            web.assert_called_once()
+            rel.assert_called_once()
+            bc._release_singleton.assert_called_once()
+            # clean=True — upgrade_jarvis.py relaunches JARVIS itself, so the
+            # watchdog must NOT also resurrect it (that would double-boot).
+            bc._hard_exit.assert_called_once_with(0, clean=True)
 
-    def test_self_exit_closure_exits_even_on_sleep_error(self):
-        # If time.sleep raises inside _self_exit, the except still calls _exit.
+    def test_self_exit_closure_exits_even_on_teardown_error(self):
+        # If anything in the teardown raises, the closure STILL hard-exits.
         with tempfile.TemporaryDirectory() as td:
             with open(os.path.join(td, "upgrade_jarvis.py"), "w",
                       encoding="utf-8") as f:
@@ -2248,13 +2262,14 @@ class UpgradeTests(unittest.TestCase):
                     mock.patch.object(A.subprocess, "Popen"), \
                     mock.patch("threading.Thread", side_effect=capture_thread):
                 A._act_upgrade()
+            bc._hard_exit.side_effect = SystemExit
             with mock.patch.object(A.time, "sleep",
                                    side_effect=RuntimeError("clock boom")), \
-                    mock.patch.object(A.os, "_exit",
-                                      side_effect=SystemExit) as mexit:
+                    mock.patch("threading.Timer"), \
+                    mock.patch("builtins.print"):
                 with self.assertRaises(SystemExit):
                     captured["target"]()
-            mexit.assert_called_once_with(0)
+            bc._hard_exit.assert_called_once_with(0, clean=True)
 
     def test_upward_search_stops_at_filesystem_root(self):
         # When upgrade_jarvis.py is nowhere up the tree, the loop walks up

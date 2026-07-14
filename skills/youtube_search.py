@@ -158,9 +158,19 @@ def find_direct_url(query: str) -> str | None:
 
 
 def _close_prior_youtube_windows() -> None:
-    """Best-effort: close any existing YouTube browser window so a new video
-    REUSES one tab instead of piling up (the user wants a single video tab).
-    No-op without pygetwindow, and never raises."""
+    """Best-effort: close a prior YouTube TAB so a new video REUSES one tab
+    instead of piling up. No-op without pygetwindow, and never raises.
+
+    PER-TAB, NOT PER-WINDOW (2026-07-14 audit — this destroyed user data).
+    A Windows browser window's TITLE is the title of its ACTIVE TAB, so the
+    old `w.close()` sent WM_CLOSE to the whole top-level window: an owner
+    sitting on a YouTube tab in a 12-tab Chrome window lost ALL TWELVE tabs
+    every time they said "play X on youtube". The intent was always a
+    per-tab operation. Activate the window and send Ctrl+W, which closes
+    exactly the YouTube tab that made the title match and leaves the rest of
+    the window (and every other window) alone. If we cannot activate it, we
+    close NOTHING — an extra tab is infinitely cheaper than lost tabs.
+    """
     try:
         import pygetwindow as gw
         wins = gw.getAllWindows()
@@ -171,8 +181,14 @@ def _close_prior_youtube_windows() -> None:
         if "youtube" in t and any(b in t for b in
                                   ("chrome", "edge", "firefox", "brave", "opera")):
             try:
-                w.close()
+                w.activate()
+                time.sleep(0.25)
+                import pyautogui
+                pyautogui.hotkey("ctrl", "w")
+                time.sleep(0.15)
             except Exception:
+                # Could not focus / no pyautogui — leave the user's window
+                # completely untouched rather than closing it wholesale.
                 pass
 
 

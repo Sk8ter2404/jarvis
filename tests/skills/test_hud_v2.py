@@ -492,6 +492,19 @@ class ModuleImportTests(_HudBase):
 #  _is_parent_alive
 # ═══════════════════════════════════════════════════════════════════════════
 class ParentAliveTests(_HudBase):
+    def setUp(self):
+        super().setUp()
+        # 2026-07-14: _is_parent_alive now consults the AUTHORITATIVE
+        # core.parent_watch layer first (real Win32 syscalls — the fake pids
+        # below read DEAD for real). Make it raise so these tests keep
+        # exercising the psutil / os.kill fallbacks beneath it; parent_watch
+        # has its own suite.
+        import core.parent_watch as _pw
+        p = mock.patch.object(_pw, "parent_is_alive",
+                              side_effect=RuntimeError("stubbed out"))
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_nonpositive_pid_always_alive(self):
         # pid <= 0 means "no parent supplied" → treat as alive.
         self.assertTrue(self.hud._is_parent_alive(0))

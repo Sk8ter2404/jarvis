@@ -1549,10 +1549,23 @@ def stop_body_pump() -> None:
 
 # ─── lifecycle ────────────────────────────────────────────────────────────
 
-def close() -> None:
+def close(final: bool = False) -> None:
     """Release the runtime. Safe to call repeatedly (idempotent) and safe
     when no runtime was ever opened. Also signals the body-frame pump to stop
-    (PART B) so a closed sensor has no pump ticking against a dead runtime."""
+    (PART B) so a closed sensor has no pump ticking against a dead runtime.
+
+    final=True makes the close STICK: it clears _ENABLED first so nothing can
+    re-open the sensor behind us. Without it, close() was RESURRECTABLE — the
+    body pump ticks at 30 Hz, so a tick already past its stop-check calls
+    get_runtime(), finds _runtime[0] None but _ENABLED still True, opens a
+    FRESH PyKinectRuntime, and _publish_runtime even starts a NEW pump thread.
+    On the exit path that means a thread is holding a live Kinect driver handle
+    microseconds before TerminateProcess — precisely the "driver-parked thread
+    can't be reaped" corpse class v2.0.57 exists to prevent (and a plausible
+    cause of the sensor staying wedged across restarts). 2026-07-14 audit."""
+    global _ENABLED
+    if final:
+        _ENABLED = False
     stop_body_pump()
     with _lock:
         rt = _runtime[0]

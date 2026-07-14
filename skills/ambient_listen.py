@@ -793,11 +793,26 @@ def _worker_loop() -> None:
               f"chunk={chunk_secs:.2f}s")
     else:
         # ── FALLBACK PATH: dedicated InputStream (host has no tap API) ──────
+        # TOCTOU FIX (2026-07-14 audit, 0xc0000374): publish mic ownership
+        # BEFORE the stream is opened+started, never after. The old order
+        # (start() → _set_ambient_stream_active(True)) left a window in which
+        # the callback thread was ALREADY LIVE while the guard still read 0 —
+        # and _refresh_devices only defers on that flag. A concurrent
+        # get_input_device() in that gap runs sd._terminate()/sd._initialize(),
+        # freeing PortAudio out from under the live callback and heap-corrupting
+        # the process (a silent, traceless kill). This is the exact ordering
+        # bug already fixed for record_speech in bobert_companion; both ambient
+        # workers still had the pre-fix order. Claim first, and release on
+        # EVERY failure path so a failed open can't strand the refcount.
+        _set_ambient_stream_active(True)
+        claimed_ambient = True
         try:
             stream = sd.InputStream(
                 samplerate=sample_rate, channels=1, dtype="float32",
                 blocksize=blocksize, device=device, callback=_audio_cb)
         except Exception as e:
+            _set_ambient_stream_active(False)
+            claimed_ambient = False
             if _wake_listener_active():
                 _last_error = ("mic locked by wake-word listener — stop "
                                "the wake-word listener first")
@@ -816,14 +831,12 @@ def _worker_loop() -> None:
             _last_error = f"InputStream.start failed: {e}"
             print(f"  [ambient-listen] {_last_error}")
             _safe_close_stream(stream)
+            _set_ambient_stream_active(False)
+            claimed_ambient = False
             return
-        # Claim device ownership so _refresh_devices defers its PortAudio reinit
-        # while this dedicated mic stream is live. Decremented in the finally, but
-        # ONLY if we claimed here (the tap path never claims — decrementing there
-        # would under-count and drop the guard while the loopback worker's stream
-        # is still live). 2026-07-08.
-        _set_ambient_stream_active(True)
-        claimed_ambient = True
+        # (ownership was claimed BEFORE the open — see the TOCTOU note above;
+        # the finally still decrements it, but only when claimed_ambient is
+        # True, so the tap path never under-counts.)
 
         print(f"  [ambient-listen] stream open on device={device}, "
               f"sample_rate={sample_rate}, chunk={chunk_secs:.2f}s")
@@ -1067,6 +1080,14 @@ def _audio_worker_loop() -> None:
         with q_lock:
             audio_q.append(chunk)
 
+    # TOCTOU FIX (2026-07-14 audit, 0xc0000374): claim device ownership BEFORE
+    # the stream is opened+started. The old order set the flag AFTER start(),
+    # leaving a window where the WASAPI loopback callback was already live while
+    # _refresh_devices' guard still read 0 — a concurrent device refresh in that
+    # gap runs sd._terminate()/sd._initialize() under the live callback and
+    # heap-corrupts the process. Same bug record_speech was fixed for; both
+    # ambient workers still had the pre-fix order. Released on every failure path.
+    _set_ambient_stream_active(True)
     try:
         stream = sd.InputStream(
             samplerate=dev_sr,
@@ -1078,6 +1099,7 @@ def _audio_worker_loop() -> None:
             extra_settings=extra_settings,
         )
     except Exception as e:
+        _set_ambient_stream_active(False)
         _audio_last_error = f"loopback open failed: {e}"
         print(f"  [ambient-audio] {_audio_last_error}")
         return
@@ -1093,10 +1115,10 @@ def _audio_worker_loop() -> None:
         _audio_last_error = f"loopback start failed: {e}"
         print(f"  [ambient-audio] {_audio_last_error}")
         _safe_close_stream(stream)
+        _set_ambient_stream_active(False)
         return
-    # Claim device ownership so _refresh_devices won't tear down PortAudio under
-    # this live loopback callback (0xc0000374). Cleared in the finally below.
-    _set_ambient_stream_active(True)
+    # (ownership was claimed BEFORE the open — see the TOCTOU note above; the
+    # finally below still clears it.)
 
     print(f"  [ambient-audio] loopback open on device #{device_idx} "
           f"({dev_info.get('name', '?')}), native_sr={dev_sr}, "
