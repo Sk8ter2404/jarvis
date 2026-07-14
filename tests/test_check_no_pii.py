@@ -365,10 +365,14 @@ class LoadLocalPatternsTests(unittest.TestCase):
     def setUp(self):
         self._hard = list(cnp.HARD)
         self._warn = list(cnp.WARN)
+        self._load_err = cnp._LOAD_ERROR
 
     def tearDown(self):
         cnp.HARD[:] = self._hard
         cnp.WARN[:] = self._warn
+        # Restore the degraded-scanner flag — the fail-closed tests set it, and a
+        # leaked value would make every later main() return 2 (2026-07-14 audit).
+        cnp._LOAD_ERROR = self._load_err
 
     def test_absent_file_is_noop(self):
         with mock.patch.object(cnp.os.path, "exists", return_value=False):
@@ -395,28 +399,30 @@ class LoadLocalPatternsTests(unittest.TestCase):
         self.assertTrue(rx.search("LOCALHARD_42"))
 
     def test_present_but_unreadable_fails_closed(self):
-        # v1.81.0 FAIL-CLOSED: a pii_local.py that EXISTS but can't be read is a
-        # different, more dangerous case than "no file present" (the legit
-        # fail-open covered by test_absent_file_is_noop). The owner-PII patterns
-        # did not load, so rather than pass with a silently degraded scanner the
-        # gate exits non-zero to block the commit — the repo syncs via Nextcloud,
-        # so a leaked commit is effectively irreversible.
+        # FAIL-CLOSED, but WITHOUT exiting at import (2026-07-14 audit). A
+        # pii_local.py that EXISTS but can't be read is more dangerous than "no
+        # file present": the owner-PII patterns did not load, so the gate must
+        # refuse. But this module is imported by core/bug_reporter, so the loader
+        # must RECORD the degraded state (not sys.exit — that would kill the
+        # importer's interpreter); main() turns it into exit 2.
+        cnp._LOAD_ERROR = None
         with mock.patch.object(cnp.os.path, "exists", return_value=True), \
              mock.patch("builtins.open", side_effect=OSError("boom")):
-            with self.assertRaises(SystemExit) as cm:
-                cnp._load_local_patterns()
-        self.assertEqual(cm.exception.code, 2)
-        # HARD/WARN are restored by tearDown regardless of the early exit.
+            cnp._load_local_patterns()          # must NOT raise SystemExit
+        self.assertIsNotNone(cnp._LOAD_ERROR)   # degraded state recorded
+        self.assertEqual(cnp.main([]), 2)       # gate still fails closed
 
     def test_present_but_malformed_fails_closed(self):
-        # A present pii_local.py that won't compile/exec must ALSO fail closed
-        # (exit non-zero), not silently degrade to generic-only key formats.
+        # A present pii_local.py that won't compile/exec must ALSO fail closed —
+        # recorded as degraded, surfaced as exit 2 by main(), never a bare exit
+        # at import time.
+        cnp._LOAD_ERROR = None
         with mock.patch.object(cnp.os.path, "exists", return_value=True), \
              mock.patch("builtins.open",
                         mock.mock_open(read_data="this is not valid python <<<")):
-            with self.assertRaises(SystemExit) as cm:
-                cnp._load_local_patterns()
-        self.assertEqual(cm.exception.code, 2)
+            cnp._load_local_patterns()
+        self.assertIsNotNone(cnp._LOAD_ERROR)
+        self.assertEqual(cnp.main([]), 2)
 
     def test_missing_keys_default_to_empty(self):
         # File defines neither HARD nor WARN -> .get(..., []) -> no change.
@@ -508,6 +514,10 @@ class MainDirectoryScanTests(unittest.TestCase):
         self._warn = list(cnp.WARN)
         self._root_attr = cnp._PROJECT_ROOT
         cnp._PROJECT_ROOT = self.root
+        # main() short-circuits to exit 2 if the degraded-scanner flag is set;
+        # keep these scan tests isolated from any leaked flag. 2026-07-14 audit.
+        self._load_err = cnp._LOAD_ERROR
+        cnp._LOAD_ERROR = None
         # deterministic, local-pattern-independent rule set
         cnp.HARD[:] = [("fx-hard", cnp._rx(r"HARDHIT_[0-9]+"))]
         cnp.WARN[:] = [("fx-warn", cnp._rx(r"WARNHIT_[0-9]+"))]
@@ -516,6 +526,7 @@ class MainDirectoryScanTests(unittest.TestCase):
         cnp.HARD[:] = self._hard
         cnp.WARN[:] = self._warn
         cnp._PROJECT_ROOT = self._root_attr
+        cnp._LOAD_ERROR = self._load_err
         self._tmp.cleanup()
 
     def _write(self, name, body):
@@ -582,6 +593,8 @@ class MainTrackedScanTests(unittest.TestCase):
         self._warn = list(cnp.WARN)
         self._root_attr = cnp._PROJECT_ROOT
         cnp._PROJECT_ROOT = self.root
+        self._load_err = cnp._LOAD_ERROR
+        cnp._LOAD_ERROR = None            # isolate from any leaked degraded flag
         cnp.HARD[:] = [("fx-hard", cnp._rx(r"HARDHIT_[0-9]+"))]
         cnp.WARN[:] = [("fx-warn", cnp._rx(r"WARNHIT_[0-9]+"))]
 
@@ -589,6 +602,7 @@ class MainTrackedScanTests(unittest.TestCase):
         cnp.HARD[:] = self._hard
         cnp.WARN[:] = self._warn
         cnp._PROJECT_ROOT = self._root_attr
+        cnp._LOAD_ERROR = self._load_err
         self._tmp.cleanup()
 
     def _write(self, name, body):

@@ -282,6 +282,30 @@ def main() -> int:
         if _shim_should_block(name):
             raise ModuleNotFoundError(f"[ci-sim] {name!r} is not on the CI runner",
                                       name=name)
+        # FROMLIST FORM (2026-07-14 audit, #36). `from ctypes import wintypes`
+        # calls __import__("ctypes", ..., ["wintypes"]) — name is the importable
+        # PACKAGE ("ctypes"), so the head check above passes and the win-only
+        # submodule `ctypes.wintypes` leaked straight through, defeating the very
+        # thing _WIN_ONLY lists it for.
+        #
+        # Scope this NARROWLY to _WIN_ONLY dotted entries only. A fromlist item is
+        # usually an ATTRIBUTE (a class/function), not a submodule — `from
+        # mcp.client import ClientSession` requests the class ClientSession, and
+        # `mcp.client.ClientSession` is not a module. Keying off the broad
+        # _blocked() (head-in-_BLOCK) would wrongly reject every attribute import
+        # from a faked-but-present package, which is exactly how an over-eager
+        # first cut of this fix broke ~50 import-fallback tests. Only a name that
+        # is ITSELF a listed win-only submodule (ctypes.wintypes) qualifies.
+        fromlist = a[2] if len(a) >= 3 else k.get("fromlist")
+        if fromlist:
+            for f in fromlist:
+                if not isinstance(f, str) or f == "*":
+                    continue
+                dotted = f"{name}.{f}"
+                if dotted in _WIN_ONLY and dotted not in sys.modules:
+                    raise ModuleNotFoundError(
+                        f"[ci-sim] {dotted!r} is not on the CI runner",
+                        name=dotted)
         return real_import(name, *a, **k)
 
     def _find_spec(name, package=None):

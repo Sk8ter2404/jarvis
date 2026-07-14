@@ -64,15 +64,48 @@ informative = extract_set("INFORMATIVE_ACTIONS")
 verbatim = extract_set("SPEAK_RESULT_VERBATIM_ACTIONS")
 
 # ---- 2. skill/core-registered actions ----
+# PACKAGE SKILLS (2026-07-14 audit). `skills/*.py` misses PACKAGE skills whose
+# registration lives in skills/<name>/__init__.py (e.g. holographic_overlay) — a
+# whole package's actions rendered with `?` locations. Add the package inits.
+_SKILL_SOURCES = (
+    glob.glob(os.path.join(ROOT, "skills", "*.py"))
+    + glob.glob(os.path.join(ROOT, "skills", "*", "__init__.py"))
+    + glob.glob(os.path.join(ROOT, "core", "*.py"))
+)
 skill_actions = {}
-for p in glob.glob(os.path.join(ROOT, "skills", "*.py")) + glob.glob(os.path.join(ROOT, "core", "*.py")):
+_alias_pairs = []   # (alias, target) from `actions["a"] = actions["b"]` lines
+for p in _SKILL_SOURCES:
     base = os.path.relpath(p, ROOT).replace("\\", "/")
-    for m in re.finditer(r'actions\[\s*[\'"]([a-zA-Z_0-9]+)[\'"]\s*\]\s*=\s*([A-Za-z_][A-Za-z0-9_\.]*)', read(p)):
+    text = read(p)
+    for m in re.finditer(r'actions\[\s*[\'"]([a-zA-Z_0-9]+)[\'"]\s*\]\s*=\s*([A-Za-z_][A-Za-z0-9_\.]*)', text):
         skill_actions[m.group(1)] = (base, m.group(2))
+    # ALIAS FORM (2026-07-14 audit, #45): `actions["x"] = actions["y"]`. The
+    # capture above stops its RHS at the `[`, so it records the bare symbol
+    # "actions" — a non-existent handler that renders as `?`. Collect the real
+    # (alias -> target) pairs so we can resolve them to the target's factory.
+    for m in re.finditer(
+            r'actions\[\s*[\'"]([a-zA-Z_0-9]+)[\'"]\s*\]\s*=\s*'
+            r'actions\[\s*[\'"]([a-zA-Z_0-9]+)[\'"]\s*\]', text):
+        _alias_pairs.append((m.group(1), m.group(2)))
+
+# Resolve aliases to a fixed point so chained aliases (a=b, b=c) land on the
+# real factory symbol. An alias whose target is itself unknown is left as-is.
+for _ in range(len(_alias_pairs) + 1):
+    changed = False
+    for alias, target in _alias_pairs:
+        tgt = skill_actions.get(target)
+        if tgt is not None and skill_actions.get(alias) != tgt:
+            skill_actions[alias] = tgt
+            changed = True
+    if not changed:
+        break
 
 # ---- 3. handler def locations ----
 def_index = {}
-for p in [MONO] + glob.glob(os.path.join(ROOT, "core", "*.py")) + glob.glob(os.path.join(ROOT, "skills", "*.py")):
+for p in ([MONO]
+          + glob.glob(os.path.join(ROOT, "core", "*.py"))
+          + glob.glob(os.path.join(ROOT, "skills", "*.py"))
+          + glob.glob(os.path.join(ROOT, "skills", "*", "__init__.py"))):
     base = os.path.relpath(p, ROOT).replace("\\", "/")
     for ln, line in enumerate(read(p).splitlines(), 1):
         dm = re.match(r'\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(', line)

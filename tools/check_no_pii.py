@@ -103,6 +103,12 @@ def _local_pattern_candidates() -> list[str]:
     return out
 
 
+# Set by _load_local_patterns() when a pii_local.py EXISTS but fails to load —
+# the "degraded scanner" case. main() turns a non-None value into exit 2 so the
+# git gate fails closed, WITHOUT importing this module ever exiting the process.
+_LOAD_ERROR: str | None = None
+
+
 def _load_local_patterns() -> None:
     """Extend HARD/WARN from a gitignored tools/pii_local.py if present.
 
@@ -123,21 +129,27 @@ def _load_local_patterns() -> None:
             with open(path, encoding="utf-8") as fh:
                 exec(compile(fh.read(), path, "exec"), ns)
         except Exception as e:
-            # FAIL CLOSED. A pii_local.py that EXISTS but won't parse/exec is a
-            # different, more dangerous case than "no file present" (the legit
-            # fail-open below): the owner-PII patterns did NOT load, so the
+            # FAIL CLOSED — but NOT by exiting at IMPORT time (2026-07-14 audit).
+            # A pii_local.py that EXISTS but won't parse/exec is more dangerous
+            # than "no file present": the owner-PII patterns did NOT load, so the
             # scanner has silently degraded to generic key formats exactly when
-            # it is meant to catch owner literals (name, email, LAN subnet,
-            # device codes) — and this repo syncs through Nextcloud, so a leaked
-            # commit is effectively irreversible. Block the commit loudly rather
-            # than pass degraded and silent.
-            sys.stderr.write(
-                f"[check_no_pii] ERROR: {path} is present but failed to load "
-                f"({e.__class__.__name__}: {e}).\n  Owner-PII patterns did not "
+            # it is meant to catch owner literals — and this repo syncs through
+            # Nextcloud, so a leaked commit is effectively irreversible. The gate
+            # must still refuse. But this module is ALSO imported by
+            # core/bug_reporter (to scrub by the same rules), and a bare
+            # sys.exit(2) at module scope would terminate the interpreter of
+            # whatever imported it — bug_reporter's whole contract is "never
+            # crash the host". So RECORD the degraded state and let main() (the
+            # gate/hook entry) turn it into exit 2; importers stay alive with the
+            # generic patterns they managed to load.
+            global _LOAD_ERROR
+            _LOAD_ERROR = (
+                f"{path} is present but failed to load "
+                f"({e.__class__.__name__}: {e}). Owner-PII patterns did not "
                 f"load; refusing to run with a degraded scanner. Fix or remove "
-                f"the file.\n"
-            )
-            sys.exit(2)
+                f"the file.")
+            sys.stderr.write(f"[check_no_pii] ERROR: {_LOAD_ERROR}\n")
+            return
         for lbl, pat in ns.get("HARD", []):
             HARD.append((lbl, _rx(pat)))
         for lbl, pat in ns.get("WARN", []):
@@ -215,6 +227,14 @@ def _scan_file(path: str, rules: list) -> list[tuple]:
 
 
 def main(argv: list[str]) -> int:
+    # Honor the fail-closed degraded-scanner state HERE (the gate/hook entry),
+    # not at import. Returning 2 → the __main__ wrapper exits 2, so the git hook
+    # still blocks a commit when owner patterns couldn't load — while `import
+    # tools.check_no_pii` from bug_reporter never terminates its host. 2026-07-14.
+    if _LOAD_ERROR is not None:
+        sys.stderr.write(f"[check_no_pii] refusing to scan: {_LOAD_ERROR}\n")
+        return 2
+
     strict = "--strict" in argv
     positional = [a for a in argv if not a.startswith("-")]
 

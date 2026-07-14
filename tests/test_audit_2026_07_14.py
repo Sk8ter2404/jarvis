@@ -1400,5 +1400,153 @@ class ApplePlaylistMediaWindowContractTests(unittest.TestCase):
                          "confirm + fullscreen target it, not a stale sibling")
 
 
+class CheckNoPiiImportIsSafeTests(unittest.TestCase):
+    """Finding #41. check_no_pii ran _load_local_patterns() at MODULE scope, and
+    that loader could sys.exit(2) on a degraded pii_local.py — so merely
+    `import tools.check_no_pii` (as core/bug_reporter does to scrub by the same
+    rules) could TERMINATE the interpreter, violating bug_reporter's "never
+    crash the host" contract. The gate must still fail closed; importing must
+    not exit."""
+
+    def setUp(self):
+        import tools.check_no_pii as cnp
+        self.cnp = cnp
+        self._orig_err = cnp._LOAD_ERROR
+        self._orig_cands = cnp._local_pattern_candidates
+
+    def tearDown(self):
+        self.cnp._LOAD_ERROR = self._orig_err
+        self.cnp._local_pattern_candidates = self._orig_cands
+
+    def test_degraded_local_file_does_not_exit_the_interpreter(self):
+        import tempfile
+        cnp = self.cnp
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = os.path.join(tmp, "pii_local.py")
+            with open(bad, "w", encoding="utf-8") as fh:
+                fh.write("this is not valid python !!! def (\n")
+            cnp._LOAD_ERROR = None
+            cnp._local_pattern_candidates = lambda: [bad]
+            try:
+                cnp._load_local_patterns()   # must NOT raise SystemExit
+            except SystemExit as e:           # pragma: no cover - the bug
+                self.fail(f"importing/loading exited the interpreter: {e}")
+        self.assertIsNotNone(cnp._LOAD_ERROR,
+                             "a broken pii_local.py must be recorded as degraded")
+
+    def test_gate_still_fails_closed_when_degraded(self):
+        cnp = self.cnp
+        cnp._LOAD_ERROR = "simulated degraded scanner"
+        try:
+            rc = cnp.main([])
+        except SystemExit as e:               # pragma: no cover
+            self.fail(f"main() should RETURN 2, not exit: {e}")
+        self.assertEqual(rc, 2, "the git gate must fail closed on a degraded "
+                                "scanner (return 2), just not by exiting at import")
+
+    def test_loader_makes_no_real_sys_exit_call(self):
+        """The bare `_load_local_patterns()` at module scope stays — it must
+        populate HARD/WARN for importers — but it must NOT be able to exit. Use
+        AST (not a text grep, which would match this fix's OWN comment that
+        discusses sys.exit): assert the loader contains no Call to sys.exit."""
+        import ast
+        with open(os.path.join(_PROJECT, "tools", "check_no_pii.py"),
+                  encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        loader = next((n for n in ast.walk(tree)
+                       if isinstance(n, ast.FunctionDef)
+                       and n.name == "_load_local_patterns"), None)
+        self.assertIsNotNone(loader)
+        exits = [n for n in ast.walk(loader)
+                 if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Attribute)
+                 and n.func.attr == "exit"]
+        self.assertEqual(exits, [],
+                         "the pattern loader must never call sys.exit — it is "
+                         "imported by bug_reporter; record _LOAD_ERROR instead")
+
+
+class CiSimBlocksWinOnlyFromlistTests(unittest.TestCase):
+    """Finding #36. The ci-sim import shim inspected only the module NAME. `from
+    ctypes import wintypes` calls __import__("ctypes", ..., ["wintypes"]) — the
+    package `ctypes` is importable, so the win-only child `ctypes.wintypes`
+    leaked through, and `from ctypes import wintypes` at module top passed the
+    sim while it would ModuleNotFoundError on the real Linux runner."""
+
+    def test_blocked_recognises_the_winonly_submodule(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_ci_sim_probe",
+            os.path.join(_PROJECT, "tools", "run_tests_ci_sim.py"))
+        mod = importlib.util.module_from_spec(spec)
+        # Importing run_tests_ci_sim runs only defs at module top (its work is
+        # under `if __name__ == "__main__"`), so this is cheap and side-effect
+        # free — we just want its _blocked predicate.
+        spec.loader.exec_module(mod)
+        self.assertTrue(mod._blocked("ctypes.wintypes"),
+                        "ctypes.wintypes is win-only and must be blocked")
+        self.assertFalse(mod._blocked("ctypes"),
+                         "plain ctypes is Linux-safe and must NOT be blocked — "
+                         "so the fromlist check is the ONLY thing that can catch "
+                         "the submodule")
+
+    def test_imp_inspects_the_fromlist(self):
+        """Structural guard: the shim's real-import hook must examine fromlist,
+        otherwise a win-only child re-leaks through the package head."""
+        with open(os.path.join(_PROJECT, "tools", "run_tests_ci_sim.py"),
+                  encoding="utf-8") as fh:
+            body = fh.read()
+        imp = body.split("def _imp(")[1].split("\n    def ")[0]
+        self.assertIn("fromlist", imp,
+                      "_imp must inspect fromlist to block win-only submodules")
+
+
+class GenActionIndexCoversPackagesAndAliasesTests(unittest.TestCase):
+    """Findings #34 + #45. gen_action_index globbed only skills/*.py (missing
+    PACKAGE skills' __init__.py → whole packages rendered with `?`), and its
+    RHS capture stopped at `[`, so `actions["a"] = actions["b"]` recorded the
+    bare symbol `actions` (a non-existent handler → `?`)."""
+
+    def _src(self):
+        with open(os.path.join(_PROJECT, "tools", "gen_action_index.py"),
+                  encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_globs_include_package_inits(self):
+        src = self._src()
+        self.assertIn('"skills", "*", "__init__.py"', src,
+                      "must glob package skills' __init__.py, not only *.py")
+
+    def test_alias_form_regex_captures_both_names(self):
+        import re
+        # The exact alias-resolution pattern the fix added; prove it captures
+        # (alias, target) from a real registration line, where the old single
+        # regex captured RHS == "actions".
+        pat = re.compile(
+            r'actions\[\s*[\'"]([a-zA-Z_0-9]+)[\'"]\s*\]\s*=\s*'
+            r'actions\[\s*[\'"]([a-zA-Z_0-9]+)[\'"]\s*\]')
+        m = pat.search('    actions["schedule_cron"] = actions["schedule_recurring"]')
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), "schedule_cron")
+        self.assertEqual(m.group(2), "schedule_recurring")
+
+    def test_generated_index_resolves_a_known_alias(self):
+        """End-to-end: the committed ACTION_INDEX (regenerated by this fix) must
+        show schedule_cron sharing schedule_recurring's real location, not `?`.
+        The alias source lives in skills/schedule_manager.py."""
+        idx_path = os.path.join(_PROJECT, "docs", "ACTION_INDEX.md")
+        if not os.path.exists(idx_path):
+            self.skipTest("ACTION_INDEX.md not present in this checkout")
+        with open(idx_path, encoding="utf-8") as fh:
+            idx = fh.read()
+        # Find the row mentioning schedule_cron and assert it carries a real
+        # schedule_manager location rather than a bare '?'.
+        rows = [ln for ln in idx.splitlines() if "schedule_cron" in ln]
+        self.assertTrue(rows, "schedule_cron should appear in the index")
+        self.assertTrue(any("schedule_manager.py:" in ln for ln in rows),
+                        f"schedule_cron alias must resolve to a real location, "
+                        f"not '?': {rows}")
+
+
 if __name__ == "__main__":
     unittest.main()
