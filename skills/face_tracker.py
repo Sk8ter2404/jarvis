@@ -241,10 +241,32 @@ def _classify_sides(bc) -> tuple[frozenset[str], dict[int, str]]:
     side ∈ {"left", "right"} based on each camera's look_x preset (matches
     the heuristic _act_which_monitor already uses)."""
     cameras = getattr(bc, "CAMERAS", []) or []
-    side_for_idx = {
-        cam["index"]: ("left" if cam.get("look_x", 0.5) < 0.5 else "right")
-        for cam in cameras
-    }
+    # SIDE RULE: label first, then look_x with 0.5 counting as LEFT. The naive
+    # `look_x < 0.5` here classified the owner's LEFT webcam (look_x is exactly
+    # 0.5 on this rig) as 'right' — so this map could never yield "left" and the
+    # webcam gaze fallback silently reported the wrong monitor. The rule was
+    # fixed in bobert_companion._percam_side but THREE copies of the naive
+    # expression survived (2026-07-14 audit). Delegate to the shared helper.
+    side_fn = getattr(bc, "_percam_side", None)
+
+    def _side(cam):
+        if callable(side_fn):
+            try:
+                got = side_fn(cam)
+                # Only trust a real answer — a stubbed/duck-typed host (or a
+                # test double) can hand back anything.
+                if got in ("left", "right"):
+                    return got
+            except Exception:
+                pass
+        lbl = str(cam.get("label", "")).lower()
+        if "left" in lbl:
+            return "left"
+        if "right" in lbl:
+            return "right"
+        return "left" if cam.get("look_x", 0.5) <= 0.5 else "right"
+
+    side_for_idx = {cam["index"]: _side(cam) for cam in cameras}
     now = time.time()
     seen_dict = getattr(bc, "_camera_last_seen", {}) or {}
     lock = getattr(bc, "_camera_state_lock", None)

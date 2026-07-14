@@ -20,6 +20,8 @@ if _PROJECT not in sys.path:
 import core.actions as A                       # noqa: E402
 from audio import kinect_bridge as kb          # noqa: E402
 from tests._skill_harness import load_skill_isolated  # noqa: E402
+from tests._monolith_harness import (                  # noqa: E402
+    load_monolith, requires_monolith)
 
 
 class KinectCloseIsFinalTests(unittest.TestCase):
@@ -178,6 +180,109 @@ class AmbientListenClaimsBeforeOpenTests(unittest.TestCase):
                             "ownership must be claimed BEFORE sd.InputStream()")
         # And every failure path must give it back (no stranded refcount).
         self.assertGreaterEqual(src.count("_set_ambient_stream_active(False)"), 3)
+
+
+@requires_monolith
+class CameraProbeBudgetTests(unittest.TestCase):
+    """Finding #2 (the two-day camera mystery). Callers probe "in parallel",
+    but EVERY worker serializes on _camera_io_lock — and the joiner's clock
+    started at THREAD start, not at lock acquisition. So the 2nd/3rd worker
+    could burn its whole budget merely QUEUED and be reported "wedged" without
+    ever calling cv2.VideoCapture: healthy cameras marked bad ("failed to open
+    in 2.0s"). The budget must start when the work does."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_queued_worker_is_not_charged_for_lock_wait(self):
+        import threading
+        import time as _t
+        bc = self.bc
+        # Hold the camera I/O lock for longer than one probe budget, then free
+        # it. The probe must WAIT (not fail) and then succeed on its own clock.
+        released = threading.Event()
+
+        def _hog():
+            with bc._camera_io_lock:
+                released.wait(timeout=5)
+
+        hog = threading.Thread(target=_hog, daemon=True)
+        hog.start()
+        _t.sleep(0.2)                     # ensure the hog owns the lock
+
+        fake_cap = mock.Mock()
+        fake_cap.isOpened.return_value = True
+        fake_cap.read.return_value = (True, "frame")
+        with mock.patch.object(bc.cv2, "VideoCapture", return_value=fake_cap):
+            t0 = _t.monotonic()
+            # Free the lock shortly AFTER the probe's own (short) budget would
+            # have expired if the queue time had been charged against it.
+            threading.Timer(0.6, released.set).start()
+            ok = bc._probe_camera_index(7, timeout_sec=0.4)
+            dt = _t.monotonic() - t0
+        self.assertTrue(ok, "a healthy camera queued behind the lock must NOT "
+                            "be reported dead")
+        self.assertGreater(dt, 0.5, "it really did wait for the lock")
+
+    def test_unavailable_lock_reports_honestly(self):
+        import threading
+        import time as _t
+        bc = self.bc
+        forever = threading.Event()
+
+        def _hog():
+            with bc._camera_io_lock:
+                forever.wait(timeout=30)
+
+        hog = threading.Thread(target=_hog, daemon=True)
+        hog.start()
+        _t.sleep(0.2)
+        try:
+            with mock.patch.object(bc, "CAMERA_PROBE_MAX", 1), \
+                 mock.patch("builtins.print"):
+                # lock_budget = max(2.0, ...) → ~2s, then an honest False.
+                ok = bc._probe_camera_index(7, timeout_sec=0.1)
+            self.assertFalse(ok)
+        finally:
+            forever.set()
+
+
+@requires_monolith
+class SideTileNamesFollowConfigTests(unittest.TestCase):
+    """Finding #3: the HUD composite pinned the LEFT tile to 'logi c270'. When
+    the owner swapped that camera out, the tile drew a dim 'off' placeholder
+    forever while the camera was open and streaming — a healthy camera reported
+    as dead, silently. The needles must come from CAMERAS, the single source of
+    truth."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_names_are_derived_from_cameras(self):
+        bc = self.bc
+        cams = [
+            {"index": 2, "label": "Left webcam (left monitor)",
+             "name": "emeet c960", "look_x": 0.5},
+            {"index": 0, "label": "Right webcam (top of right monitor)",
+             "name": "usb 2.0 camera", "look_x": 0.85},
+        ]
+        with mock.patch.object(bc, "CAMERAS", cams):
+            names = bc._kinect_preview_webcam_names()
+        self.assertEqual(names, {"left": "emeet c960",
+                                 "right": "usb 2.0 camera"})
+
+    def test_every_needle_matches_a_real_configured_camera(self):
+        # The live rig's roster must always be self-consistent — this is the
+        # assertion that would have caught the C270→C960 swap.
+        bc = self.bc
+        names = bc._kinect_preview_webcam_names()
+        configured = {str(c.get("name") or "").lower() for c in bc.CAMERAS}
+        for slot, needle in names.items():
+            self.assertIn(needle, configured,
+                          f"the {slot} tile looks for a camera that is not in "
+                          f"CAMERAS — the C270→C960 rot class")
 
 
 if __name__ == "__main__":

@@ -1559,8 +1559,10 @@ def _llm_quick(system: str, user: str, max_tokens: int = 200) -> str:
         # claude branch above, degrading to the local fallback then "" rather
         # than the old unbounded ollama.chat that could hang the caller. 2026-07-08.
         try:
+            # Resolve the model — the raw OLLAMA_MODEL default is the retired
+            # "llama3" tag (2026-07-14 audit).
             resp = _ollama_chat_bounded(
-                OLLAMA_MODEL,
+                _get_local_llm_model(),
                 [
                     {"role": "system", "content": system},
                     {"role": "user",   "content": user},
@@ -3827,18 +3829,38 @@ def _hud_camera_preview_write(frame: "np.ndarray", now: float) -> bool:
 # the plain mirror uses — so the separate-process HUD needs no Kinect/pygrabber.
 # The skeleton doubles as the owner's body-stream-is-live diagnostic.
 
-# DirectShow friendly-name substrings for the two USB webcams (owner's rig).
-# Matched case-insensitively; the FIRST substring that appears in a device's
-# name claims that slot. Kept as config-adjacent constants near the compositor.
-_KINECT_PREVIEW_WEBCAM_NAMES = {
-    "left":  "logi c270",          # 'Logi C270 HD WebCam' → LEFT monitor webcam
-    "right": "usb 2.0 camera",     # 'USB 2.0 Camera'      → RIGHT monitor webcam
-}
+def _kinect_preview_webcam_names() -> dict[str, str]:
+    """DirectShow friendly-name substrings for the two side-tile webcams,
+    DERIVED FROM `CAMERAS` — the single source of truth — not hardcoded.
+
+    This used to be a literal dict pinned to `"left": "logi c270"`. When the
+    owner retired the C270 for an eMeet C960 (v2.0.56 updated core.config), the
+    composite kept looking for a device that no longer exists, silently failed
+    to resolve the slot, and drew the LEFT tile as a dim "off" placeholder
+    forever — while the camera was open and streaming. The HUD reported a
+    healthy camera as dead, with nothing in the log. Classic stale-duplicate:
+    the identity lived in two places and only one got updated (2026-07-14
+    audit). Now a camera swap only has to be edited in core/config.py.
+    """
+    names: dict[str, str] = {}
+    try:
+        for cam in CAMERAS:
+            nm = str(cam.get("name") or "").strip().lower()
+            if nm:
+                names.setdefault(_percam_side(cam), nm)
+    except Exception:
+        pass
+    return names
 # Cache the pygrabber name→index resolution so we don't re-enumerate DirectShow
 # devices every preview frame (enumeration is comparatively expensive + flickers
 # the device list). [0]=mapping dict, [1]=resolved-once flag.
 _kinect_preview_webcam_idx: dict[str, int] = {}
 _kinect_preview_webcam_resolved = [False]
+_kinect_preview_webcam_resolved_at = [0.0]
+# Re-resolve the name→index map this often. DirectShow indices reshuffle when a
+# device joins/leaves the bus, so a permanently-cached index eventually points
+# at the WRONG camera (2026-07-14 audit).
+_WEBCAM_IDX_TTL_SEC = 10.0
 
 
 def _enumerate_dshow_input_devices() -> "list[str] | None":
@@ -3889,26 +3911,55 @@ def _resolve_webcam_indices_by_name() -> dict[str, int]:
 
     pygrabber's FilterGraph.get_input_devices() returns device friendly names in
     the SAME order as their cv2/DirectShow index, so the list position IS the
-    index used by cv2.VideoCapture(idx, CAP_DSHOW)."""
-    if _kinect_preview_webcam_resolved[0]:
+    index used by cv2.VideoCapture(idx, CAP_DSHOW).
+
+    TTL, NOT FOREVER (2026-07-14 audit): the mapping used to be resolved once
+    and cached for the whole process lifetime. DirectShow indices RE-SHUFFLE
+    whenever a device joins or leaves the bus (the Kinect dropping off has
+    reshuffled this rig repeatedly), so a permanently-cached index later points
+    at a DIFFERENT device — the tile would happily open and display the Kinect's
+    colour stream under the 'left webcam' label, with no error anywhere. Re-
+    resolve every _WEBCAM_IDX_TTL_SEC, and let a failed tile read invalidate the
+    cache immediately (see _invalidate_side_tile_indices)."""
+    now = time.time()
+    if (_kinect_preview_webcam_resolved[0]
+            and (now - _kinect_preview_webcam_resolved_at[0]) < _WEBCAM_IDX_TTL_SEC):
         return _kinect_preview_webcam_idx
     names = _enumerate_dshow_input_devices()
     if names is None:
         # pygrabber missing / COM hiccup — mark resolved so we don't retry every
         # frame; the caller falls back to the CAMERAS-config indices.
         _kinect_preview_webcam_resolved[0] = True
+        _kinect_preview_webcam_resolved_at[0] = now
         return _kinect_preview_webcam_idx
     lowered = [(i, (n or "").lower()) for i, n in enumerate(names)]
-    for slot, needle in _KINECT_PREVIEW_WEBCAM_NAMES.items():
+    resolved: dict[str, int] = {}
+    for slot, needle in _kinect_preview_webcam_names().items():
         for i, n in lowered:
             if needle in n:
-                _kinect_preview_webcam_idx[slot] = i
+                resolved[slot] = i
                 break
+    changed = resolved != _kinect_preview_webcam_idx
+    _kinect_preview_webcam_idx.clear()
+    _kinect_preview_webcam_idx.update(resolved)
     _kinect_preview_webcam_resolved[0] = True
-    if _kinect_preview_webcam_idx:
+    _kinect_preview_webcam_resolved_at[0] = now
+    if _kinect_preview_webcam_idx and changed:
         print(f"  [kinect-preview] webcam tiles resolved by name: "
               f"{_kinect_preview_webcam_idx}")
     return _kinect_preview_webcam_idx
+
+
+def _invalidate_side_tile_indices() -> None:
+    """Force the next _resolve_webcam_indices_by_name() to re-enumerate.
+    Called when a side-tile read fails: the most likely cause is a bus
+    re-enumeration that moved the device, and re-resolving by NAME is exactly
+    how we find it again. Never raises."""
+    try:
+        _kinect_preview_webcam_resolved[0] = False
+        _kinect_preview_webcam_resolved_at[0] = 0.0
+    except Exception:
+        pass
 
 
 def _hud_kinect_skeleton_overlay_enabled() -> bool:
@@ -4288,6 +4339,11 @@ def _read_side_tile_webcams(now: float) -> dict:
                     pass
                 _kinect_tile_caps[slot] = None
                 _kinect_tile_frames[slot] = None
+                # A failing read is the classic symptom of a bus re-enumeration
+                # that MOVED the device. Invalidate the name→index memo so the
+                # next tick re-resolves by NAME instead of re-opening whatever
+                # now sits at the stale index (2026-07-14 audit).
+                _invalidate_side_tile_indices()
     return out
 
 
@@ -4971,6 +5027,8 @@ def _probe_camera_index(idx: int, timeout_sec: float = CAMERA_PROBE_TIMEOUT_SEC)
     Returns True only if the camera opened AND yielded a real frame in time.
     """
     result = {"ok": False}
+    started = threading.Event()      # set the instant the worker OWNS the lock
+
     def _open():
         # Hold the camera I/O lock across the whole open+release so an
         # abandoned worker (one whose main-thread joiner timed out) can't
@@ -4980,6 +5038,18 @@ def _probe_camera_index(idx: int, timeout_sec: float = CAMERA_PROBE_TIMEOUT_SEC)
         # subsequent camera ops will simply wait for the wedge to clear
         # before re-using DirectShow plumbing.
         with _camera_io_lock:
+            # THE BUDGET STARTS HERE, NOT AT THREAD START (2026-07-14 audit).
+            # Callers fan out "in parallel" (probe_cameras_and_update_config
+            # sweeps 12 indices at once; _preflight_cameras one thread per
+            # camera) — but EVERY worker serializes on this lock, and each dead
+            # index holds it for its full budget. The joiner's clock, however,
+            # started when the THREAD started, so the 2nd worker in the queue
+            # could burn its entire allowance just WAITING and be reported
+            # "wedged" without ever calling cv2.VideoCapture. That is why
+            # healthy cameras were being marked bad ("failed to open in 2.0s")
+            # and why the by-name rescue — a SERIAL re-probe — appeared to
+            # "fix" them: it wasn't the name, it was finally getting the lock.
+            started.set()
             cap = None
             try:
                 cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
@@ -5011,6 +5081,17 @@ def _probe_camera_index(idx: int, timeout_sec: float = CAMERA_PROBE_TIMEOUT_SEC)
 
     t = threading.Thread(target=_open, daemon=True)
     t.start()
+    # PHASE 1 — wait for the worker to actually OWN _camera_io_lock. Time spent
+    # queued behind a sibling probe is NOT this camera's fault and must not eat
+    # its budget. Bounded generously (siblings can legitimately hold the lock
+    # for their own full budget), and a timeout here is reported honestly as a
+    # contention failure rather than a dead camera.
+    lock_budget = max(2.0, (timeout_sec + 0.5) * max(1, CAMERA_PROBE_MAX))
+    if not started.wait(timeout=lock_budget):
+        print(f"  [cam-probe] index {idx}: still queued for the camera lock "
+              f"after {lock_budget:.1f}s — treating as unavailable")
+        return False
+    # PHASE 2 — now the worker is doing real work; give it its full budget.
     # +0.5s over the worker's own read deadline so a worker that succeeds at
     # the buzzer isn't misread as wedged by a same-instant join expiry.
     t.join(timeout=timeout_sec + 0.5)
@@ -9128,6 +9209,7 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
             text = ((r.json().get("message") or {}).get("content") or "").strip()
             if not text:
                 return (None, "empty")
+            _text_wedge_note_ok()
             return (text, "ok")
         except _RequestsTimeout as _e:
             # The runner accepted the POST but never produced a reply within the
@@ -9136,6 +9218,13 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
             # `requests` global can't turn this except into a TypeError.)
             print(f"  [local-llm] generate timed out ({_e}) — runner up but not "
                   f"responding (blocked/wedged?); treating local as unavailable")
+            # A TEXT-path wedge is as invisible to _ollama_alive() as the vision
+            # one was: /api/tags keeps answering in ms while every generate
+            # hangs, so _ensure_ollama_running() no-ops and nothing ever reaps
+            # it — the brain stays "not responding" until a human kills
+            # ollama.exe. The vision path got a detector in v2.0.58; the chat
+            # path (the one that answers EVERY turn) had none. 2026-07-14 audit.
+            _text_wedge_note_timeout()
             return (None, "fail")
         except Exception as _e:
             print(f"  [local-llm] call failed: {_e}")
@@ -9542,6 +9631,30 @@ def _ensure_ollama_single_model_env() -> None:
     # in _call_local_vision is the sole protection; that's fine.
 
 
+def _local_vision_usable() -> bool:
+    """True when the local VLM may serve a vision request.
+
+    ONE predicate, used by BOTH the caller's capability gate and the callee's
+    guard — they used to DISAGREE (2026-07-14 audit). _call_local_vision
+    early-returned unless LOCAL_VISION_FALLBACK was on, but
+    _vision_click_backend_available() (the gate) also accepts
+    `model_route("vision") == "local"`. So an owner who set MODEL_ROUTING
+    vision:"local" and left the FALLBACK knob at its default False got a
+    capability gate that said YES and a vision call that silently returned
+    None — every screen question answered "I couldn't see the screen", with
+    nothing in the log. A route that explicitly SELECTS local vision is at
+    least as strong a consent signal as the fallback flag."""
+    if not LOCAL_VISION_MODEL or str(LOCAL_VISION_MODEL).strip().lower() == "off":
+        return False
+    if LOCAL_VISION_FALLBACK:
+        return True
+    try:
+        import core.config as _cfg
+        return _cfg.model_route("vision") == "local"
+    except Exception:
+        return False
+
+
 def _call_local_vision(question: str, png_images: list[bytes],
                        max_tokens: int = 600) -> str | None:
     """POST a vision request to Ollama's /api/chat with one or more PNGs.
@@ -9550,7 +9663,7 @@ def _call_local_vision(question: str, png_images: list[bytes],
     disabled, Ollama isn't reachable, the VLM isn't pulled (a background
     pull is kicked off in that case), or the HTTP call fails. The caller
     is responsible for prepending the `[local-vision]` tag on success."""
-    if not LOCAL_VISION_FALLBACK or not LOCAL_VISION_MODEL:
+    if not _local_vision_usable():
         return None
     if not png_images:
         return None
@@ -9655,54 +9768,88 @@ def _call_local_vision(question: str, png_images: list[bytes],
         return None
 
 
-# ── vision-wedge detector (2026-07-14) ──────────────────────────────────────
-# A wedged MULTIMODAL runner is invisible to _ollama_alive() (which only probes
-# /api/tags). Track consecutive vision timeouts; at the threshold, reap the
-# whole ollama stack (server + llama-server children) and let the existing
-# self-heal bring it back — the manual fix that worked both times it happened.
-_VISION_WEDGE_STATE = {"timeouts": 0, "last_reap": 0.0}
-_VISION_WEDGE_THRESHOLD = 2          # two consecutive timeouts = wedged
-_VISION_WEDGE_REAP_COOLDOWN_S = 300.0
+# ── ollama wedge detector (2026-07-14) ──────────────────────────────────────
+# A wedged runner is INVISIBLE to _ollama_alive(): the server keeps answering
+# /api/tags in milliseconds while every generate on the wedged path hangs, so
+# _ensure_ollama_running() is a no-op and nothing ever reaps it — the failure
+# survived until a human killed ollama.exe by hand, twice. Count consecutive
+# timeouts PER PATH ("vision" | "text"); at the threshold, reap the whole stack
+# (server + llama-server children) and let the self-heal bring it back — the
+# manual fix that worked both times.
+#
+# ONE implementation, two paths (the text path had NO detector at all, and the
+# chat route answers EVERY turn — the higher-impact of the two).
+_WEDGE_STATE: dict[str, dict] = {
+    "vision": {"timeouts": 0, "last_reap": 0.0},
+    "text":   {"timeouts": 0, "last_reap": 0.0},
+}
+_WEDGE_THRESHOLD = 2                 # two consecutive timeouts = wedged
+_WEDGE_REAP_COOLDOWN_S = 300.0
 
 
-def _vision_wedge_note_ok() -> None:
-    """A successful vision call clears the wedge counter."""
-    _VISION_WEDGE_STATE["timeouts"] = 0
+def _wedge_note_ok(path: str) -> None:
+    """A successful call on `path` clears its wedge counter."""
+    st = _WEDGE_STATE.get(path)
+    if st is not None:
+        st["timeouts"] = 0
 
 
-def _vision_wedge_note_timeout() -> None:
-    """Count a vision-path timeout; reap the ollama stack at the threshold.
+def _wedge_note_timeout(path: str) -> None:
+    """Count a timeout on `path`; reap the ollama stack at the threshold.
 
     Escalates to _reap_wedged_ollama() (kill ollama.exe + llama-server.exe)
     rather than _ensure_ollama_running(), which is a NO-OP while the server
-    still answers /api/tags — exactly the state a vision wedge presents."""
-    _VISION_WEDGE_STATE["timeouts"] += 1
-    n = _VISION_WEDGE_STATE["timeouts"]
-    if n < _VISION_WEDGE_THRESHOLD:
-        print(f"  [local-vision] timeout {n}/{_VISION_WEDGE_THRESHOLD} — "
-              f"watching for a wedged multimodal runner")
+    still answers /api/tags — exactly the state a wedge presents."""
+    st = _WEDGE_STATE.get(path)
+    if st is None:
+        return
+    st["timeouts"] += 1
+    n = st["timeouts"]
+    tag = "local-vision" if path == "vision" else "local-llm"
+    if n < _WEDGE_THRESHOLD:
+        print(f"  [{tag}] timeout {n}/{_WEDGE_THRESHOLD} — watching for a "
+              f"wedged {path} runner")
         return
     now = time.time()
-    if now - _VISION_WEDGE_STATE["last_reap"] < _VISION_WEDGE_REAP_COOLDOWN_S:
-        print("  [local-vision] wedge suspected but a reap ran recently — "
-              "not thrashing the server")
+    if now - st["last_reap"] < _WEDGE_REAP_COOLDOWN_S:
+        print(f"  [{tag}] wedge suspected but a reap ran recently — not "
+              f"thrashing the server")
         return
-    _VISION_WEDGE_STATE["last_reap"] = now
-    _VISION_WEDGE_STATE["timeouts"] = 0
+    st["last_reap"] = now
+    st["timeouts"] = 0
 
     def _do():
         try:
-            print(f"  [local-vision] VISION WEDGE: {n} consecutive timeouts "
+            print(f"  [{tag}] {path.upper()} WEDGE: {n} consecutive timeouts "
                   f"while the server answers /api/tags — reaping the ollama "
                   f"stack and restarting it")
             _reap_wedged_ollama()
             _ensure_ollama_running()
-            print("  [local-vision] ollama stack restarted after vision wedge")
+            # A reap kills BOTH runners, so neither path is still wedged.
+            for other in _WEDGE_STATE.values():
+                other["timeouts"] = 0
+            print(f"  [{tag}] ollama stack restarted after the wedge")
         except Exception as _re:
-            print(f"  [local-vision] wedge reap raised "
-                  f"{type(_re).__name__}: {_re}")
+            print(f"  [{tag}] wedge reap raised {type(_re).__name__}: {_re}")
 
-    threading.Thread(target=_do, name="vision-wedge-reap", daemon=True).start()
+    threading.Thread(target=_do, name=f"{path}-wedge-reap", daemon=True).start()
+
+
+# Thin per-path aliases so call sites read clearly.
+def _vision_wedge_note_ok() -> None:
+    _wedge_note_ok("vision")
+
+
+def _vision_wedge_note_timeout() -> None:
+    _wedge_note_timeout("vision")
+
+
+def _text_wedge_note_ok() -> None:
+    _wedge_note_ok("text")
+
+
+def _text_wedge_note_timeout() -> None:
+    _wedge_note_timeout("text")
 
 
 def _cached_system_param(full_prompt: str):
@@ -10330,8 +10477,14 @@ def _call_llm(user_text: str) -> str:
         try:
             # Bounded (see _ollama_chat_bounded): a wedged runner raises rather
             # than blocking the voice thread forever; the except below degrades.
+            # RESOLVE the model, never trust the raw OLLAMA_MODEL constant: its
+            # shipped default is still the retired "llama3" tag, so an owner who
+            # picks "Primary AI backend = ollama" got a 404 on EVERY turn while
+            # every OTHER local call (_call_local_llm) correctly resolved
+            # gemma4:12b. The local-only backend was dead on arrival
+            # (2026-07-14 audit). _get_local_llm_model() is the single resolver.
             resp = _ollama_chat_bounded(
-                OLLAMA_MODEL,
+                _get_local_llm_model(),
                 [{"role": "system", "content": sys_prompt_now}] + conversation_history,
             )
             reply = resp["message"]["content"]
@@ -13584,16 +13737,10 @@ def _vision_click_backend_available() -> bool:
     gate (kept in sync by the settings apply, and what the tests patch)."""
     if AI_BACKEND == "claude":
         return True
-    vm = str(LOCAL_VISION_MODEL or "").strip().lower()
-    if not vm or vm == "off":
-        return False
-    if LOCAL_VISION_FALLBACK:
-        return True
-    try:
-        import core.config as _cfg
-        return _cfg.model_route("vision") == "local"
-    except Exception:
-        return False
+    # ONE predicate shared with _call_local_vision's own guard — they used to
+    # be separate copies and DIVERGED, so the gate could say "local vision is
+    # available" while the call silently refused to run (2026-07-14 audit).
+    return _local_vision_usable()
 
 
 def _youtube_resolve_video(query: str) -> dict | None:
@@ -13748,9 +13895,21 @@ def _streaming_auto_play(service_key: str, query: str) -> str:
     # bare webbrowser.open would launch the app instead of the web player.
     # _open_url_in_browser forces Chrome/Edge so the SPACE / play-button +
     # tab-title pipeline has the actual web player to drive.
+    # SAFE-HANDLE CLOSE ONLY (2026-07-14 audit). close_matching with NO
+    # close_hwnd engages _close_browser_windows_matching's LEGACY
+    # title-substring mode, which closes ANY top-level browser window whose
+    # ACTIVE TAB title contains a tab_match term — i.e. the owner's own
+    # 12-tab Chrome window, because a window's title IS its active tab's.
+    # _JARVIS_MEDIA_WINDOW_HWND is in-memory, so it is EMPTY on every fresh
+    # boot: the FIRST media request of every session was running in legacy
+    # mode. The empty-query branch above was repaired for exactly this on
+    # 2026-07-06; the query branch (the one that actually runs) was missed.
+    # Close ONLY the window JARVIS itself opened last time, or nothing.
     _prior_hwnd = _JARVIS_MEDIA_WINDOW_HWND.get(service_key)
     opened_via = _open_url_in_browser(
-        url, close_matching=cfg.get("tab_match"), close_hwnd=_prior_hwnd
+        url,
+        close_matching=cfg.get("tab_match") if _prior_hwnd is not None else None,
+        close_hwnd=_prior_hwnd,
     )
     print(
         f"  [auto-play] opened {service_label} "
@@ -18663,7 +18822,8 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
                     + [{"role": "user", "content": extra}])
             # Bounded (see _ollama_chat_bounded): a wedged runner raises into the
             # `except` below, which already falls back to _call_local_llm / "".
-            resp = _ollama_chat_bounded(OLLAMA_MODEL, msgs)
+            # Resolve, don't trust the retired OLLAMA_MODEL default (see above).
+            resp = _ollama_chat_bounded(_get_local_llm_model(), msgs)
             return resp["message"]["content"]
     except Exception as e:
         # Cloud unavailable (e.g. the monthly usage cap) — keep the action

@@ -53,6 +53,38 @@ import time
 
 # ─── seams to the rest of JARVIS ─────────────────────────────────────────
 
+def _cam_side(cam: dict) -> str:
+    """Which monitor a camera watches: LABEL first, then look_x with 0.5
+    counting as LEFT.
+
+    THE ONE COPY (2026-07-14 audit). The naive `look_x < 0.5` rule
+    misclassified the owner's LEFT webcam — its look_x is exactly 0.5 — as
+    "right", producing "the right and right monitor webcams are both live".
+    That was fixed once, in _webcam_health… and THREE other copies of the naive
+    expression survived (two in look_around here, one in face_tracker), so
+    look_around still announced both vantages as "the right monitor webcam".
+    Every caller now goes through this function; prefer the monolith's
+    _percam_side when it is importable so the rule lives in exactly one place.
+    """
+    bc = sys.modules.get("__main__") or sys.modules.get("bobert_companion")
+    fn = getattr(bc, "_percam_side", None) if bc is not None else None
+    if callable(fn):
+        try:
+            got = fn(cam)
+            # Only trust a real answer — a stubbed host (or a test double)
+            # can hand back anything.
+            if got in ("left", "right"):
+                return got
+        except Exception:
+            pass
+    lbl = str(cam.get("label", "")).lower()
+    if "left" in lbl:
+        return "left"
+    if "right" in lbl:
+        return "right"
+    return "left" if cam.get("look_x", 0.5) <= 0.5 else "right"
+
+
 def _bc():
     """The live monolith module (main or by-name), or None. Mirrors the lookup
     every other camera-aware skill uses."""
@@ -216,15 +248,7 @@ def _webcam_health() -> list[dict]:
             last_at = frame_at.get(idx, 0.0) or 0.0
             age = (now - last_at) if last_at else None
             face_at = seen_at.get(idx, 0.0) or 0.0
-            # Side comes from the LABEL first ("Left webcam (left monitor)")
-            # — look_x alone misclassified the LEFT cam, whose look_x is
-            # exactly 0.5, as "right" ("the right and right monitor webcams
-            # are both live", live 2026-07-10). look_x stays as the fallback
-            # for label-less entries, with 0.5 counting as left.
-            _lbl = str(cam.get("label", "")).lower()
-            _side = ("left" if "left" in _lbl else
-                     "right" if "right" in _lbl else
-                     ("left" if cam.get("look_x", 0.5) <= 0.5 else "right"))
+            _side = _cam_side(cam)
             out.append({
                 "index": idx,
                 "label": cam.get("label", f"camera {idx}"),
@@ -626,15 +650,14 @@ def _collect_frames() -> list[tuple[str, bytes]]:
                         idx = cam.get("index")
                         fr = latest.get(idx)
                         if fr is not None:
-                            side = ("left" if cam.get("look_x", 0.5) < 0.5
-                                    else "right")
+                            side = _cam_side(cam)
                             raw.append((f"the {side} monitor webcam", fr.copy()))
             else:
                 for cam in CAMERAS:
                     idx = cam.get("index")
                     fr = latest.get(idx)
                     if fr is not None:
-                        side = ("left" if cam.get("look_x", 0.5) < 0.5 else "right")
+                        side = _cam_side(cam)
                         raw.append((f"the {side} monitor webcam", fr))
         except Exception:
             raw = []
