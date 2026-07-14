@@ -3229,6 +3229,25 @@ def _dispatch_tray_command(cmd: str, entry: dict) -> None:
         try: _speak("At your service, sir.")
         except Exception: pass
         print("  [tray] force_wake — cleared sleep/standby")
+    elif cmd in ("restart", "shutdown"):
+        # LLM-INDEPENDENT CONTROL PLANE (2026-07-14). Restart and shutdown were
+        # reachable ONLY as voice/inject ACTIONS — which means they first pass
+        # through intent classification, i.e. through the LOCAL BRAIN. So when
+        # the brain is starved or wedged (VRAM pressure, a hung runner), the one
+        # command that would FIX it — "restart yourself" — is exactly the command
+        # you cannot issue: JARVIS answers "my local model isn't responding" and
+        # stays broken. A control-plane operation must never depend on the thing
+        # it is meant to repair. This channel is drained by the main loop before
+        # any LLM call, so it works while the brain is face-down.
+        print(f"  [tray] {cmd} — running the hardened teardown (no LLM involved)")
+        try:
+            from core.actions import _act_restart, _act_shutdown_jarvis
+            if cmd == "restart":
+                _act_restart("")
+            else:
+                _act_shutdown_jarvis("")
+        except Exception as _e:
+            print(f"  [tray] {cmd} failed: {type(_e).__name__}: {_e}")
     elif cmd == "open_hud":
         # Terminate the existing HUD (if any) then re-launch so a hidden /
         # crashed window comes back. _launch_hud is a no-op if HUD_ENABLED

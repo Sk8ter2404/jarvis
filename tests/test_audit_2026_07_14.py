@@ -428,5 +428,44 @@ class BlindToggleTests(unittest.TestCase):
                       "with a working verify, the toggle is safe and useful")
 
 
+@requires_monolith
+class LlmIndependentControlPlaneTests(unittest.TestCase):
+    """2026-07-14, found by hitting it live: restart/shutdown were reachable
+    ONLY as ACTIONS, which pass through intent classification — i.e. through
+    the LOCAL BRAIN. So when the brain is starved (VRAM pressure) or wedged,
+    the one command that would FIX it ("restart yourself") is precisely the
+    command you cannot issue: JARVIS replies "my local model isn't responding"
+    and stays broken. A control-plane operation must never depend on the thing
+    it repairs. The tray channel is drained by a 2 Hz thread, so it works even
+    while the main loop is blocked."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def _dispatch(self, cmd):
+        bc = self.bc
+        with mock.patch("core.actions._act_restart") as restart, \
+             mock.patch("core.actions._act_shutdown_jarvis") as shutdown, \
+             mock.patch("builtins.print"):
+            bc._dispatch_tray_command(cmd, {})
+        return restart, shutdown
+
+    def test_restart_runs_without_the_llm(self):
+        restart, shutdown = self._dispatch("restart")
+        restart.assert_called_once()
+        shutdown.assert_not_called()
+
+    def test_shutdown_runs_without_the_llm(self):
+        restart, shutdown = self._dispatch("shutdown")
+        shutdown.assert_called_once()
+        restart.assert_not_called()
+
+    def test_unknown_command_is_ignored(self):
+        restart, shutdown = self._dispatch("definitely_not_a_command")
+        restart.assert_not_called()
+        shutdown.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
