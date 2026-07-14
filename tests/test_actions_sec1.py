@@ -737,7 +737,12 @@ class RestartTests(unittest.TestCase):
 
         # Now run the captured target with all side effects mocked.
         with _no_sleep(), \
-                mock.patch("threading.Timer") as mtimer, \
+                mock.patch("threading.Timer",
+                           side_effect=lambda *a, **k: (order.append("timer"),
+                                                        mock.Mock())[1]) as mtimer, \
+                mock.patch.object(
+                    A, "_release_native_resources",
+                    side_effect=lambda *a, **k: order.append("release")), \
                 mock.patch.object(
                     A.subprocess, "Popen",
                     side_effect=lambda *a, **k: order.append("popen")
@@ -745,9 +750,12 @@ class RestartTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 captured["target"]()
         mpopen.assert_called_once()
-        # singleton released BEFORE the replacement was spawned
-        self.assertEqual(order, ["singleton", "popen"])
-        # failsafe timer armed pointing at the un-deadlockable helper
+        # LOAD-BEARING ORDER (2026-07-14): singleton freed → successor SPAWNED
+        # → failsafe armed → natives released. Releasing the natives first
+        # blocked in torch.cuda.synchronize() on the in-flight farewell TTS,
+        # the 20s failsafe fired, and the Popen never ran: JARVIS vanished.
+        self.assertEqual(order, ["singleton", "popen", "timer", "release"])
+        # failsafe armed AFTER the spawn, pointing at the un-deadlockable helper
         mtimer.assert_called_once()
         self.assertIs(mtimer.call_args[0][1], A._hard_exit_via_bc)
         # launched with the python executable + script path

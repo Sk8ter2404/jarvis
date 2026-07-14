@@ -46,20 +46,43 @@ def _note(msg: str) -> None:
 
 
 def _jarvis_running() -> bool:
-    """True when a pythonw/python process is running bobert_companion.
-    tasklist would need per-process command lines, so use PowerShell's CIM
-    query — spawned WITHOUT a window via the safety net."""
+    """True when a bobert_companion process is GENUINELY EXECUTING.
+
+    CORPSE BLINDNESS (fixed 2026-07-14): this used to COUNT the CIM rows and
+    call any count > 0 alive. But a kernel-stuck 'terminating forever'
+    process — a thread parked in a CUDA/audio driver at exit — keeps its row
+    enumerable FOREVER (until Windows reboots), with its command line intact.
+    So a single corpse permanently convinced the watchdog that JARVIS was
+    running, and the resurrection net silently stopped resurrecting: JARVIS
+    died at 10:49 today and the 5-minute ticks all no-opped against two
+    corpses from yesterday. Ask each PID whether it is really alive
+    (core.parent_watch: GetExitCodeProcess + WaitForSingleObject) instead of
+    trusting the row's existence."""
     try:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
-             "(Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe' OR "
+             "Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe' OR "
              "Name='python.exe'\" | Where-Object { $_.CommandLine -match "
-             "'bobert_companion' } | Measure-Object).Count"],
+             "'bobert_companion' } | ForEach-Object { $_.ProcessId }"],
             capture_output=True, text=True, timeout=30,
         )
-        return int((out.stdout or "0").strip() or 0) > 0
+        pids = [int(p) for p in (out.stdout or "").split() if p.strip().isdigit()]
     except Exception:
         return True     # fail SAFE: never double-boot on an uncertain read
+    if not pids:
+        return False
+    try:
+        from core.parent_watch import parent_is_alive
+    except Exception:
+        # Helper unavailable — fall back to the historical (corpse-blind)
+        # behaviour rather than risking a double boot.
+        return True
+    live = [p for p in pids if parent_is_alive(p)]
+    corpses = [p for p in pids if p not in live]
+    if corpses and not live:
+        _note(f"only CORPSE pids present {corpses} — treating JARVIS as DEAD "
+              f"(kernel-stuck rows never disappear until reboot)")
+    return bool(live)
 
 
 def main() -> int:

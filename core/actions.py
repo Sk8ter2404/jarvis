@@ -433,31 +433,31 @@ def _act_restart(_: str = "") -> str:
 
     def _do_restart():
         time.sleep(1.5)
-        # FAILSAFE: if anything below wedges, die anyway — a lingering old
-        # instance is exactly what turned the 2026-07-12 restart into a
-        # zombie + a singleton-suicided replacement (nothing left running).
-        # NO clean flag: if the relaunch failed too, the watchdog SHOULD
-        # resurrect us within its 5-minute poll.
-        _fs = threading.Timer(20.0, _hard_exit_via_bc, args=(bc, 0, False))
-        _fs.daemon = True
-        _fs.start()
-        # Release the web socket BEFORE spawning: a kernel-stuck corpse keeps
-        # its handles, and the replacement's dashboard autostart refuses to
-        # co-bind a port a dead process still holds (live 2026-07-12).
-        _stop_web_interface_quietly()
-        # Release CUDA/Kinect/WASAPI/cameras BEFORE terminating so this
-        # instance can actually die instead of corpse-ing with ~5GB of VRAM
-        # pinned (2026-07-13 — every prior restart leaked until reboot).
-        _release_native_resources(bc)
-        time.sleep(2.0)                   # let camera caps + streams close
-        # Release the singleton BEFORE spawning: the replacement boots in
-        # ~1s and its singleton check must not see this (possibly wedged,
-        # not-yet-dead) process and suicide — live failure mode 2026-07-12:
-        # old hung in ExitProcess, new exited via singleton, JARVIS gone.
+        # ORDER IS LOAD-BEARING (rewritten 2026-07-14 after a live failure).
+        #
+        # The replacement MUST be spawned before anything that can block, and
+        # the failsafe timer must be armed only AFTER it exists. Previously
+        # this released the natives FIRST: voice_clone.unload() calls
+        # torch.cuda.synchronize(), which waits for in-flight CUDA work — and
+        # the "Restarting now, sir" line was STILL BEING SYNTHESISED on the
+        # GPU (chatterbox, ~1000 sampling steps). The release outlasted the
+        # 20s failsafe, the failsafe hard-exited the process, and the Popen
+        # below NEVER RAN: old dead, no replacement, JARVIS simply gone
+        # (live 2026-07-14 10:49). The natives still get released — just
+        # after the successor is already booting, which is safe: it needs
+        # ~60s of skill/model loading before it touches the mic or cameras.
+        #
+        # 1) free the singleton + port so the successor can boot and bind
+        try:
+            _stop_web_interface_quietly()
+        except Exception as e:
+            print(f"  [restart] web release failed: {e}")
         try:
             bc._release_singleton()
         except Exception as e:
             print(f"  [restart] singleton release failed: {e}")
+        # 2) SPAWN THE SUCCESSOR — nothing above this line may block on a GPU
+        spawned = False
         try:
             # Detached + WINDOWLESS relaunch. CREATE_NEW_CONSOLE (the old value)
             # forced a visible console window on the relaunched instance even
@@ -474,8 +474,24 @@ def _act_restart(_: str = "") -> str:
                 creationflags=_flags,
                 close_fds=True,
             )
+            spawned = True
+            print("  [restart] successor spawned; releasing native resources")
         except Exception as e:
             print(f"  [restart] relaunch failed: {e}")
+        # 3) NOW arm the failsafe — the successor is already coming up, so a
+        #    hard kill here can no longer orphan the machine. No clean flag:
+        #    if the spawn failed, the watchdog SHOULD resurrect us.
+        _fs = threading.Timer(45.0, _hard_exit_via_bc, args=(bc, 0, False))
+        _fs.daemon = True
+        _fs.start()
+        # 4) release CUDA/Kinect/WASAPI/cameras so THIS process can actually
+        #    die instead of corpse-ing with ~5GB of VRAM pinned (v2.0.57 —
+        #    proven live: exit released 4.5GB and left no corpse).
+        _release_native_resources(bc)
+        time.sleep(2.0)                   # let camera caps + streams close
+        if not spawned:
+            print("  [restart] NO successor was spawned — exiting unclean so "
+                  "the watchdog resurrects us")
         _hard_exit_via_bc(bc, 0, clean=False)
     threading.Thread(target=_do_restart, daemon=True).start()
     return "Restarting now, sir."
