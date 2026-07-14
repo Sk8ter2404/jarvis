@@ -2406,8 +2406,17 @@ def _act_create_skill(args: str) -> str:
     ./pending_skills/<name>.py and asks the user to move + restart.
     """
     bc = _bc()
-    from core.config import SKILLS_ENABLED, AI_BACKEND
-    if not SKILLS_ENABLED or AI_BACKEND != "claude":
+    # SKILLS_ENABLED is genuinely boot-time, so core.config is the right source
+    # for it. The BACKEND is not: switch_llm only ever writes bc.AI_BACKEND, so
+    # reading core.config here got it wrong in BOTH directions — after "switch to
+    # local" the frozen "claude" let this through and it went on spending Claude
+    # credits authoring the skill (the exact thing the switch was meant to
+    # prevent), and a box whose user_settings pin "ollama" could never create a
+    # skill even with Claude live. Same stale-gate class as the vision gates.
+    # 2026-07-14 audit.
+    from core.config import SKILLS_ENABLED
+    backend, _model = _live_backend_and_model()
+    if not SKILLS_ENABLED or backend != "claude":
         return "skill creation requires SKILLS_ENABLED + Claude backend"
 
     if "|" not in args:

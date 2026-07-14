@@ -77,6 +77,17 @@ def _base_bc(tmpdir=None):
     # privacy refusal. Default it to "not blocked" so handlers run normally —
     # the dedicated privacy tests override this.
     bc.screenshot_privacy_block_reason.return_value = None
+    # Same trap, for the LLM backend: handlers that gate on the live brain read
+    # bc.AI_BACKEND, and a bare Mock hands back a truthy Mock that equals
+    # nothing — so a "requires Claude" gate would refuse even under
+    # @mock.patch("core.config.AI_BACKEND", "claude"). Default the fake monolith
+    # to the same shipped defaults the real one boots with; tests that care
+    # override them. (Actions read the LIVE backend, not core.config's boot
+    # value, as of the 2026-07-14 audit — switch_llm only mutates the monolith.)
+    bc.AI_BACKEND = "claude"
+    bc.CLAUDE_MODEL = "claude-sonnet-5"
+    bc.OLLAMA_MODEL = "gemma4:12b"
+    bc._get_local_llm_model.return_value = "gemma4:12b"
     return bc
 
 

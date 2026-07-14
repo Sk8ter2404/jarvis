@@ -15751,7 +15751,16 @@ def maybe_glance_response(user_text: str) -> str | None:
         return None
     if not _focus_changed_recently():
         return None
-    if AI_BACKEND != "claude" or not SCREEN_VISION_ENABLED:
+    # Was `AI_BACKEND != "claude"` — the LAST surviving copy of the stale gate
+    # that _vision_click_backend_available() was written to kill. Every other
+    # vision call site migrated to the predicate; this one didn't, so on a
+    # local-only box (AI_BACKEND="ollama" — the Settings GUI's $0 mode) the
+    # glance fast-path was silently, permanently dead: the turn fell through to
+    # the LLM with NO screenshot and JARVIS confidently answered about nothing.
+    # The irony is that ask_vision — the very function this is about to call —
+    # handles the non-Claude backend itself and would have answered from the
+    # local VLM. Same predicate as the other three sites. 2026-07-14 audit.
+    if not (SCREEN_VISION_ENABLED and _vision_click_backend_available()):
         return None
     png = _capture_focused_window_png()
     if png is None:
@@ -20396,6 +20405,26 @@ def _startup_preflight() -> None:
             _local_ok = bool(_ollama_alive())
         except Exception:
             _local_ok = False
+        # CLAUDE_OPTIONAL was DEAD CONFIG until the 2026-07-14 audit: a
+        # documented, user-facing Settings/web toggle ("Claude is optional —
+        # never required") that persisted to user_settings.json and that NO
+        # production code read. Unticking it — the owner explicitly saying "I
+        # want JARVIS to insist on a working Claude key" — changed precisely
+        # nothing, because the everything-below hard-coded the True behaviour.
+        # Honour it: a False means a Claude failure IS fatal, local brain or no.
+        if not CLAUDE_OPTIONAL:
+            print(f"\n[FATAL] Claude is unavailable and CLAUDE_OPTIONAL is off: "
+                  f"{reason}")
+            print("  [preflight] You have configured JARVIS to REQUIRE a working "
+                  "Claude key (Settings ▸ AI ▸ 'Claude is optional'). Fix the key "
+                  "or re-tick that box to fall back to the local brain.")
+            try:
+                _speak("Sir, Claude is unavailable and you've configured me to "
+                       "require it. Please check the API key.")
+            except Exception as _spk_err:
+                print(f"  [preflight] could not speak the error: {_spk_err}")
+            close_log()
+            sys.exit(1)
         if _local_ok:
             _why = reason.split(" - ", 1)[0] if " - " in reason else reason
             print(f"  [preflight] Claude enhancement not active ({_why[:80]}).")

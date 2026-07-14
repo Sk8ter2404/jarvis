@@ -776,5 +776,132 @@ class GestureInterruptIsNotAcousticTests(unittest.TestCase):
                          "a depth-sensor swipe is not an acoustic barge-in")
 
 
+@requires_monolith
+class GlanceGateIsNotClaudeOnlyTests(unittest.TestCase):
+    """Finding #38. `_vision_click_backend_available()` was written specifically
+    to kill the `AI_BACKEND == "claude"` gate shape, and every vision call site
+    migrated to it — except this one. So on a local-only box the glance
+    fast-path was silently, permanently dead: the turn fell through to the LLM
+    with NO screenshot and JARVIS answered about nothing. The irony is that
+    ask_vision — the function this gate guards — handles the local backend
+    itself and would have answered from the VLM."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_glance_runs_on_a_local_only_box(self):
+        bc = self.bc
+        with mock.patch.object(bc, "AI_BACKEND", "ollama"), \
+             mock.patch.object(bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(bc, "_vision_click_backend_available",
+                               return_value=True), \
+             mock.patch.object(bc, "_is_glance_ambiguous_question",
+                               return_value=True), \
+             mock.patch.object(bc, "_focus_changed_recently", return_value=True), \
+             mock.patch.object(bc, "_capture_focused_window_png",
+                               return_value=None) as cap:
+            bc.maybe_glance_response("what's this?")
+        cap.assert_called_once()   # got PAST the gate; used to return None here
+
+    def test_glance_still_refused_when_no_vision_backend(self):
+        bc = self.bc
+        with mock.patch.object(bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(bc, "_vision_click_backend_available",
+                               return_value=False), \
+             mock.patch.object(bc, "_is_glance_ambiguous_question",
+                               return_value=True), \
+             mock.patch.object(bc, "_focus_changed_recently", return_value=True), \
+             mock.patch.object(bc, "_capture_focused_window_png") as cap:
+            self.assertIsNone(bc.maybe_glance_response("what's this?"))
+        cap.assert_not_called()
+
+    def test_no_claude_only_vision_gate_survives(self):
+        """The whole point of the predicate is that this shape stops recurring."""
+        with open(os.path.join(_PROJECT, "bobert_companion.py"),
+                  encoding="utf-8") as fh:
+            offenders = [
+                (i, ln.strip()) for i, ln in enumerate(fh, 1)
+                if 'AI_BACKEND != "claude"' in ln
+                and "SCREEN_VISION_ENABLED" in ln
+                and not ln.lstrip().startswith("#")
+            ]
+        self.assertEqual(offenders, [],
+                         f"a Claude-only vision gate came back: {offenders}")
+
+
+class CreateSkillGatesOnLiveBackendTests(unittest.TestCase):
+    """Finding #26 — the same stale read as #8, with teeth. switch_llm only
+    writes bc.AI_BACKEND, so reading core.config here was wrong in BOTH
+    directions: after "switch to local" the frozen "claude" let the handler
+    through and it went on spending Claude credits authoring the skill — exactly
+    what the switch was meant to prevent — while a box whose user_settings pin
+    "ollama" could never create a skill even with Claude live."""
+
+    def _bc(self, backend):
+        bc = mock.Mock()
+        bc.AI_BACKEND = backend
+        bc.CLAUDE_MODEL = "claude-sonnet-5"
+        bc.OLLAMA_MODEL = "llama3"
+        bc._get_local_llm_model.return_value = "gemma4:12b"
+        return bc
+
+    def test_refuses_after_a_switch_to_local(self):
+        """core.config still says "claude"; the live brain is ollama. Refuse —
+        and, critically, do not spend a single cloud token."""
+        with mock.patch.object(A, "_bc", return_value=self._bc("ollama")), \
+             mock.patch("core.config.SKILLS_ENABLED", True), \
+             mock.patch("core.config.AI_BACKEND", "claude"):
+            out = A._act_create_skill("thing | do a thing")
+        self.assertIn("Claude backend", out)
+
+    def test_allows_when_claude_is_live_despite_a_frozen_ollama_config(self):
+        bc = self._bc("claude")
+        with mock.patch.object(A, "_bc", return_value=bc), \
+             mock.patch("core.config.SKILLS_ENABLED", True), \
+             mock.patch("core.config.AI_BACKEND", "ollama"):
+            out = A._act_create_skill("no-pipe-so-it-stops-early")
+        self.assertNotIn("requires SKILLS_ENABLED", out,
+                         "Claude IS live; the frozen boot config must not veto")
+
+
+class VolumeGrammarTests(unittest.TestCase):
+    """Finding #27. set_volume is real, registered, and was written BECAUSE
+    "set the volume to 30 percent" had no matching action. But it was only ever
+    taught to the LOCAL cheatsheet — the default Claude backend's action grammar
+    never listed it, so on the default brain that phrase still degraded to a
+    single volume_down nudge: the exact bug the action was added to fix."""
+
+    def test_claude_grammar_offers_absolute_volume(self):
+        from core import prompts
+        p = prompts.PC_CONTROL_PROMPT
+        self.assertIn("set_volume", p,
+                      "the default backend's action grammar must list set_volume")
+        self.assertIn("[ACTION: set_volume, 30]", p,
+                      "and show an absolute-volume example")
+
+
+@requires_monolith
+class ClaudeOptionalIsWiredTests(unittest.TestCase):
+    """Finding #35/#39. CLAUDE_OPTIONAL shipped as a documented Settings toggle
+    ("Claude is optional — never required"), persisted to user_settings.json,
+    and was read by NOTHING: the preflight hard-coded the True behaviour. So
+    unticking it — the owner explicitly asking JARVIS to insist on a working
+    key — changed absolutely nothing."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_constant_has_a_real_consumer(self):
+        import re
+        with open(os.path.join(_PROJECT, "bobert_companion.py"),
+                  encoding="utf-8") as fh:
+            body = [ln for ln in fh
+                    if re.search(r"\bCLAUDE_OPTIONAL\b", ln)
+                    and not ln.lstrip().startswith("#")]
+        self.assertTrue(body, "CLAUDE_OPTIONAL is dead config again")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -74,6 +74,69 @@ class SchemaWiringTests(unittest.TestCase):
             ),
         )
 
+    def test_every_persisted_key_has_a_real_consumer(self):
+        """A constant that EXISTS but that nothing READS is still a dead toggle.
+
+        test_every_persisted_key_maps_to_a_config_constant claims to enforce "no
+        persisted schema key may be a dead toggle", but it only asserts
+        hasattr(cfg, key) — which a constant with zero consumers passes happily.
+        That is exactly how CLAUDE_OPTIONAL survived: shipped in the Settings
+        GUI, documented in core/config.py with a paragraph describing behaviour
+        it did not have, persisted to user_settings.json, and read by NOTHING.
+        Unticking it changed nothing at all.
+
+        So: every persisted key must be referenced at least once OUTSIDE the
+        three files that merely declare/persist/test it. That's the difference
+        between a constant and a feature. 2026-07-14 audit.
+        """
+        import re
+        roots = ("bobert_companion.py", "core", "skills", "hud", "audio",
+                 "tools", "web")
+        declare_only = {
+            os.path.normcase(os.path.join(_PROJECT, "core", "config.py")),
+            os.path.normcase(os.path.join(_PROJECT, "tools",
+                                          "settings_window.py")),
+        }
+        sources: list[tuple[str, str]] = []
+        for root in roots:
+            path = os.path.join(_PROJECT, root)
+            if os.path.isfile(path):
+                files = [path]
+            else:
+                files = [os.path.join(d, f)
+                         for d, _dirs, fs in os.walk(path)
+                         for f in fs if f.endswith(".py")]
+            for fp in files:
+                norm = os.path.normcase(fp)
+                if norm in declare_only:
+                    continue
+                if "__pycache__" in norm or f"{os.sep}backups{os.sep}" in norm:
+                    continue
+                try:
+                    with open(fp, encoding="utf-8", errors="replace") as fh:
+                        sources.append((fp, fh.read()))
+                except OSError:
+                    continue
+
+        dead = []
+        for key in sw.persisted_keys():
+            if key in _GUI_ONLY_ALLOWLIST:
+                continue
+            pat = re.compile(rf"\b{re.escape(key)}\b")
+            if not any(pat.search(text) for _fp, text in sources):
+                dead.append(key)
+        self.assertEqual(
+            dead, [],
+            msg=(
+                "These persisted Settings keys have a core/config.py constant "
+                "but NO consumer anywhere in the runtime — flipping them in the "
+                "Settings GUI or the web panel does nothing, which is the dead-"
+                f"toggle bug this suite exists to prevent: {dead}. Either wire "
+                "the constant into the code path its documentation promises, or "
+                "delete both the constant and the schema row."
+            ),
+        )
+
     def test_allowlist_entries_are_actually_persisted_and_unwired(self):
         """Keep the allowlist honest: every entry must still be a persisted
         key AND still lack a config constant. If one gains a config constant
