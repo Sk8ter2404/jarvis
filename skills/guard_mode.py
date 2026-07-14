@@ -166,6 +166,35 @@ def _is_staging() -> bool:
 
 # ─── frame collection (reuses the shared caches + the Kinect bridge) ──────
 
+def _cam_side(cam: dict) -> str:
+    """Which monitor a camera watches — LABEL first, then look_x with 0.5
+    counting as LEFT. Delegates to the monolith's _percam_side so the rule lives
+    in ONE place. The naive `look_x < 0.5` copy that used to live here (the
+    FOURTH surviving copy of a rule fixed once) classified BOTH of this rig's
+    cameras as "right" — the left webcam's look_x is exactly 0.5 — so they
+    produced the SAME label. That label is also the KEY for per-camera
+    previous-frame/debounce bookkeeping, so the two cameras' motion state
+    collapsed into one entry: each camera's frame was diffed against the OTHER's,
+    producing phantom motion (false intrusion alerts) or masking real motion.
+    Guard mode was structurally unable to work on a two-camera rig.
+    2026-07-14 audit."""
+    bc = _bc()
+    fn = getattr(bc, "_percam_side", None) if bc is not None else None
+    if callable(fn):
+        try:
+            got = fn(cam)
+            if got in ("left", "right"):
+                return got
+        except Exception:
+            pass
+    lbl = str(cam.get("label", "")).lower()
+    if "left" in lbl:
+        return "left"
+    if "right" in lbl:
+        return "right"
+    return "left" if cam.get("look_x", 0.5) <= 0.5 else "right"
+
+
 def _collect_frames() -> list[tuple[str, object]]:
     """Grab the most recent BGR frame from EACH available source as a list of
     (camera_label, bgr_ndarray). Webcams come from the monolith's shared
@@ -193,8 +222,13 @@ def _collect_frames() -> list[tuple[str, object]]:
                     fr = latest.get(idx)
                     if fr is None:
                         continue
-                    side = "left" if cam.get("look_x", 0.5) < 0.5 else "right"
+                    side = _cam_side(cam)
                     label = f"the {side} monitor camera"
+                    # The label doubles as the per-camera bookkeeping KEY, so
+                    # two cameras must never yield the same one. Disambiguate
+                    # defensively (a mis-labelled config could still collide).
+                    if any(lbl == label for lbl, _f in frames):
+                        label = f"{label} ({idx})"
                     try:
                         frames.append((label, fr.copy()))
                     except Exception:

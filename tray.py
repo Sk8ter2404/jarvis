@@ -1691,10 +1691,22 @@ def _open_live_log_viewer() -> None:
         return
     try:
         # New visible PowerShell window so the user actually sees the log.
+        #
+        # EXPLICIT creationflags are LOAD-BEARING (2026-07-14 audit). This
+        # process installs core.no_window_subprocess, which patches
+        # Popen.__init__ to inject CREATE_NO_WINDOW whenever a caller passes
+        # NEITHER creationflags NOR startupinfo — the net that killed the ghost
+        # windows. This call passed neither, so the net hid the very window the
+        # feature exists to show: clicking "Live log" did nothing visible and
+        # left a HIDDEN -NoExit PowerShell running forever (a new orphan per
+        # click). Passing an explicit flag opts out of the patch.
+        _flags = (subprocess.CREATE_NEW_CONSOLE
+                  if sys.platform == "win32" else 0)
         subprocess.Popen(
             ["powershell.exe", "-NoExit",
              "-ExecutionPolicy", "Bypass",
              "-File", SHOW_LOG_PS1],
+            creationflags=_flags,
             close_fds=True,
         )
     except Exception as e:

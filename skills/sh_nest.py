@@ -33,6 +33,7 @@ import json
 import os
 import threading
 import time
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Any
 
 
@@ -124,10 +125,24 @@ def _start_loop_thread() -> asyncio.AbstractEventLoop:
     return new_loop
 
 
-def _run_async(coro):
+def _run_async(coro, timeout: float = 10.0):
+    """Run `coro` on the shared loop thread and wait — BOUNDED.
+
+    fut.result() with NO timeout froze the VOICE LOOP indefinitely whenever the
+    Nest cloud hung (a 5xx that never closes, a dead TCP connection): these
+    actions run ON the voice thread, so JARVIS simply stopped responding until
+    the process was killed. Every sibling smart-home skill (sh_hue, sh_ecobee, …)
+    already bounds this — sh_nest was the only one that did not (2026-07-14
+    audit). On timeout: cancel the future and raise TimeoutError, which the
+    callers already degrade into an honest "couldn't reach Nest" reply."""
     loop = _start_loop_thread()
     fut = asyncio.run_coroutine_threadsafe(coro, loop)
-    return fut.result()
+    try:
+        return fut.result(timeout=timeout)
+    except FuturesTimeoutError:
+        fut.cancel()
+        raise TimeoutError(
+            f"Nest did not respond within {timeout:.0f}s") from None
 
 
 # ── client ─────────────────────────────────────────────────────────

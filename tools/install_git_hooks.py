@@ -32,12 +32,30 @@ PRE_COMMIT_HOOK = """#!/bin/sh
 # Blocks commits that introduce HARD PII/secret findings. On the owner's machine
 # this also loads tools/pii_local.py so real personal data is caught here.
 # Bypass a genuine false positive with: git commit --no-verify
+#
+# FAIL CLOSED (2026-07-14 audit). This used to block ONLY on exit 1 — but
+# check_no_pii deliberately exits 2 when it CANNOT SCAN SAFELY (a present-but-
+# broken pii_local.py: the fail-closed path added on 2026-07-04 precisely so a
+# degraded scanner can't wave secrets through). exit 2 fell into the `exit 0`
+# tail, so the hook that exists to protect a PUBLIC repo silently PASSED the
+# commit in exactly the situation it was designed to catch. Any nonzero status
+# now blocks, except 127 (python missing entirely — degrade to a warning rather
+# than bricking every commit on a machine without the interpreter).
 python tools/check_no_pii.py
 code=$?
-if [ "$code" -eq 1 ]; then
+if [ "$code" -eq 127 ]; then
+  echo "[pre-commit] WARNING: python not found — PII scan SKIPPED." 1>&2
+  exit 0
+fi
+if [ "$code" -ne 0 ]; then
   echo "" 1>&2
-  echo "[pre-commit] BLOCKED: check_no_pii found HARD PII/secret finding(s) above." 1>&2
-  echo "[pre-commit] Move the value to .env or a gitignored file, then re-commit." 1>&2
+  if [ "$code" -eq 1 ]; then
+    echo "[pre-commit] BLOCKED: check_no_pii found HARD PII/secret finding(s) above." 1>&2
+    echo "[pre-commit] Move the value to .env or a gitignored file, then re-commit." 1>&2
+  else
+    echo "[pre-commit] BLOCKED: check_no_pii could not scan safely (exit $code)." 1>&2
+    echo "[pre-commit] Refusing to commit to a PUBLIC repo with a degraded scanner." 1>&2
+  fi
   echo "[pre-commit] (Genuine false positive? re-run with: git commit --no-verify)" 1>&2
   exit 1
 fi

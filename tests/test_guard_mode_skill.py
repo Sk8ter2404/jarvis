@@ -268,11 +268,20 @@ class KinectIntrusionTests(GuardBase):
         out = mod._guard_tick([], kin, "ts1", now=50.0)
         self.assertIn("the Kinect", out["triggered"])
         self.assertTrue(out["alerted"])
-        # The spoken line mentions a person and the distance.
+        # The spoken line mentions a person and the distance. GREEN-BY-
+        # ENVIRONMENT (2026-07-14): this asserted the raw metric "2.0", which
+        # only holds where core.units is UNIMPORTABLE — i.e. the light CI tier.
+        # On the owner's box (and in production) v2.0.24 converts distances to
+        # IMPERIAL for speech, so the real line is "about 7 feet out" and this
+        # test failed on the dev box while passing CI. Accept the shipped
+        # behaviour on either tier.
         self.assertTrue(bc.announced)
         msg = bc.announced[0][0]
         self.assertIn("room", msg.lower())
-        self.assertIn("2.0", msg)
+        self.assertTrue(
+            ("7 feet" in msg) or ("2.0" in msg),
+            f"distance must be spoken (imperial on the dev box, metric where "
+            f"core.units is absent); got: {msg!r}")
         # Urgent mood was requested.
         self.assertEqual(bc.announced[0][2], "urgent_clipped")
 

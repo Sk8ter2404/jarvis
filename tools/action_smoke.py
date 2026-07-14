@@ -105,6 +105,19 @@ def _spawns_desktop_windows(name: str, fn) -> bool:
 def main() -> int:
     from tests._monolith_harness import load_monolith
     bc = load_monolith()
+    # MIRROR THE BOOT ALIAS (2026-07-14 audit, finding #13). At boot the
+    # monolith does `sys.modules["bobert_companion"] = sys.modules["__main__"]`,
+    # so ~18 skills bridge back to it with
+    #     sys.modules.get("__main__") or sys.modules.get("bobert_companion")
+    # which is CORRECT in production. But `__main__` ALWAYS exists, so that `or`
+    # never falls through: in THIS process it resolves to the sweep runner, and
+    # every one of those skills silently takes its dead "monolith unreachable"
+    # branch — the sweep reports them "OK" while exercising nothing (and
+    # local_vision, whose call sites were unguarded, actually CRASHED). Alias
+    # __main__ to the monolith so the sweep drives the REAL code paths, exactly
+    # as the live app does.
+    sys.modules["_smoke_runner_main"] = sys.modules["__main__"]
+    sys.modules["__main__"] = bc
     # Register the SKILL actions too — the core dict alone is ~135 of the
     # ~529 total. Skill register() functions may start daemon pollers; this
     # is a one-shot process, so they die with it.

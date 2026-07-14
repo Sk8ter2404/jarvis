@@ -13532,6 +13532,24 @@ def _streaming_confirm_playback(cfg: dict, verify_q: str) -> tuple[bool, str]:
     return is_playing, f"vision: {snippet}"
 
 
+def _streaming_confirmation_possible(cfg: dict) -> bool:
+    """Can playback actually be CONFIRMED for this service, right now?
+
+    Two independent confirmations exist: the browser tab TITLE (deterministic,
+    only for services that set `title_confirm`) and VISION (needs
+    SCREEN_VISION_ENABLED plus a usable backend). When NEITHER is available,
+    _streaming_confirm_playback can only ever return False ("vision fallback
+    unavailable") — so every verify reads NOT-PLAYING and the retry loop fires
+    blind media-key TOGGLES at a player that may already be running, pausing it.
+    Callers use this to drop those destructive strategies. 2026-07-14 audit."""
+    if cfg.get("title_confirm"):
+        return True
+    try:
+        return bool(SCREEN_VISION_ENABLED and _vision_click_backend_available())
+    except Exception:
+        return False
+
+
 def _streaming_play_and_verify(
     cfg: dict,
     service_label: str,
@@ -13561,6 +13579,25 @@ def _streaming_play_and_verify(
         "YES or NO on the first line, then a brief reason."
     )
     strategies = list(cfg.get("play_strategies") or ["play_button"])
+
+    # NEVER TOGGLE BLIND (2026-07-14 audit). "playpause" and "space" are
+    # media-key TOGGLES: firing one at a video that is ALREADY PLAYING PAUSES
+    # it. They are only safe because a verify step is supposed to tell us the
+    # state first. When confirmation is STRUCTURALLY unavailable — no
+    # title_confirm and no usable vision backend, so _streaming_confirm_playback
+    # can only ever answer "vision fallback unavailable" — every verify reads
+    # NOT-PLAYING, and the retry loop happily presses the toggle at a video that
+    # YouTube's watch page already autoplayed. The owner watched exactly this
+    # happen: the video was playing, vision could not confirm it, and JARVIS
+    # paused it and then reported failure. With no way to see, the honest move
+    # is to leave a possibly-playing player alone.
+    if not _streaming_confirmation_possible(cfg):
+        safe = [s for s in strategies if s not in ("playpause", "space")]
+        if safe != strategies:
+            print("  [auto-play] playback confirmation is unavailable — "
+                  "dropping blind toggle strategies (they would PAUSE a video "
+                  "that is already playing)", flush=True)
+        strategies = safe or ["recheck"]
 
     # Optional pre-check: if the result-selection step (e.g. keyboard
     # Enter on a focused song row) already started playback, skip the

@@ -324,5 +324,109 @@ class SideTileNamesFollowConfigTests(unittest.TestCase):
                           f"CAMERAS — the C270→C960 rot class")
 
 
+class PiiHookFailsClosedTests(unittest.TestCase):
+    """Finding #19 (public repo!): check_no_pii deliberately exits 2 when it
+    CANNOT SCAN SAFELY (a present-but-broken pii_local.py — the fail-closed
+    path added precisely so a degraded scanner can't wave secrets through).
+    The pre-commit hook only blocked on exit 1, so exit 2 fell into `exit 0`:
+    the guard protecting a PUBLIC repo silently PASSED the commit in exactly
+    the case it exists to catch."""
+
+    def _hook_text(self):
+        import tools.install_git_hooks as igh
+        return igh.PRE_COMMIT_HOOK
+
+    def test_blocks_on_any_nonzero_status(self):
+        hook = self._hook_text()
+        self.assertIn('-ne 0', hook,
+                      "the hook must block on ANY nonzero status, not just 1")
+
+    def test_still_degrades_when_python_is_absent(self):
+        # 127 = command not found. Bricking every commit on a machine without
+        # python would be worse than the warning; CI is the backstop there.
+        self.assertIn('-eq 127', self._hook_text())
+
+    def test_installed_hook_matches_the_template(self):
+        import tools.install_git_hooks as igh
+        path = os.path.join(igh.hooks_dir(), "pre-commit")
+        if not os.path.exists(path):
+            self.skipTest("no pre-commit hook installed in this checkout")
+        live = open(path, encoding="utf-8").read()
+        self.assertIn('-ne 0', live,
+                      "the INSTALLED hook is stale — re-run "
+                      "tools/install_git_hooks.py")
+
+
+@requires_monolith
+class BlindToggleTests(unittest.TestCase):
+    """Finding #6: "playpause"/"space" are media-key TOGGLES — firing one at a
+    video that is ALREADY PLAYING pauses it. They are only safe because a
+    verify step reports the state first. When confirmation is STRUCTURALLY
+    impossible (no title_confirm, no usable vision backend), every verify reads
+    NOT-PLAYING and the retry loop presses the toggle at a player YouTube
+    already autoplayed — the owner watched JARVIS pause the video it had just
+    started, then report failure."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_confirmation_possible_with_title_confirm(self):
+        self.assertTrue(
+            self.bc._streaming_confirmation_possible({"title_confirm": True}))
+
+    def test_confirmation_possible_with_vision(self):
+        bc = self.bc
+        with mock.patch.object(bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(bc, "_vision_click_backend_available",
+                               return_value=True):
+            self.assertTrue(bc._streaming_confirmation_possible({}))
+
+    def test_confirmation_impossible_without_either(self):
+        bc = self.bc
+        with mock.patch.object(bc, "SCREEN_VISION_ENABLED", False):
+            self.assertFalse(bc._streaming_confirmation_possible({}))
+
+    def test_blind_toggles_are_dropped_when_unconfirmable(self):
+        bc = self.bc
+        cfg = {"play_strategies": ["recheck", "playpause", "space"],
+               "verify_attempts": 1, "verify_wait": 0.0,
+               "play_hint": None, "service_key": "youtube"}
+        pressed = []
+        with mock.patch.object(bc, "_streaming_confirmation_possible",
+                               return_value=False), \
+             mock.patch.object(bc, "_streaming_confirm_playback",
+                               return_value=(False, "vision unavailable")), \
+             mock.patch.object(bc, "_streaming_apply_play_strategy",
+                               side_effect=lambda s, c, r: (pressed.append(s),
+                                                            (True, s))[1]), \
+             mock.patch.object(bc, "_streaming_go_fullscreen"), \
+             mock.patch.object(bc.time, "sleep"), \
+             mock.patch("builtins.print"):
+            bc._streaming_play_and_verify(cfg, "YouTube", "q")
+        self.assertNotIn("playpause", pressed,
+                         "a blind toggle would PAUSE the playing video")
+        self.assertNotIn("space", pressed)
+
+    def test_toggles_are_kept_when_confirmation_works(self):
+        bc = self.bc
+        cfg = {"play_strategies": ["playpause"], "verify_attempts": 1,
+               "verify_wait": 0.0, "play_hint": None, "service_key": "youtube"}
+        pressed = []
+        with mock.patch.object(bc, "_streaming_confirmation_possible",
+                               return_value=True), \
+             mock.patch.object(bc, "_streaming_confirm_playback",
+                               return_value=(False, "not yet")), \
+             mock.patch.object(bc, "_streaming_apply_play_strategy",
+                               side_effect=lambda s, c, r: (pressed.append(s),
+                                                            (True, s))[1]), \
+             mock.patch.object(bc, "_streaming_go_fullscreen"), \
+             mock.patch.object(bc.time, "sleep"), \
+             mock.patch("builtins.print"):
+            bc._streaming_play_and_verify(cfg, "YouTube", "q")
+        self.assertIn("playpause", pressed,
+                      "with a working verify, the toggle is safe and useful")
+
+
 if __name__ == "__main__":
     unittest.main()
