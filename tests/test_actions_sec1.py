@@ -216,11 +216,17 @@ class ScreenshotTests(unittest.TestCase):
 
     def test_powershell_fallback_on_win32(self):
         # take_screenshot returns None -> fallback path. Force win32.
+        # 2026-07-14 audit: the fallback now VERIFIES the CompletedProcess
+        # (exit code) and that a file actually landed before claiming success,
+        # so give it a clean exit + an existing file.
         self.fake.take_screenshot.return_value = None
+        ok = mock.Mock(returncode=0, stderr=b"")
         with _patch_bc(self.fake), \
                 mock.patch.object(A.sys, "platform", "win32"), \
                 mock.patch.object(A.time, "strftime", return_value="s.png"), \
-                mock.patch.object(A.subprocess, "run") as mrun:
+                mock.patch.object(A.subprocess, "run", return_value=ok) as mrun, \
+                mock.patch.object(A.os.path, "exists", return_value=True), \
+                mock.patch.object(A.os.path, "getsize", return_value=2048):
             out = A._act_screenshot("")
         mrun.assert_called_once()
         # invoked powershell with a -Command

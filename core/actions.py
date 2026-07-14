@@ -158,9 +158,28 @@ def _act_screenshot(_: str = "") -> str:
         # getattr (not subprocess.CREATE_NO_WINDOW directly): the flag is a
         # Windows-only attribute, and reading it survives a test that has left
         # `subprocess` mocked — never AttributeErrors, real 0x08000000 on Win.
-        subprocess.run(["powershell", "-Command", ps], capture_output=True, timeout=60,
-                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        return f"screenshot saved to {path}"
+        #
+        # VERIFY BEFORE CLAIMING SUCCESS (2026-07-14 audit). This used to return
+        # "screenshot saved" unconditionally: capture_output=True threw stderr
+        # away, check= wasn't passed, and the CompletedProcess was discarded —
+        # so a PowerShell error (assembly load failure, a locked/at-capacity
+        # disk, an invalid path) reported success while no file existed, and any
+        # downstream vision step then read a stale or missing image. Inspect the
+        # exit code AND confirm the file actually landed.
+        try:
+            r = subprocess.run(
+                ["powershell", "-Command", ps], capture_output=True, timeout=60,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except subprocess.TimeoutExpired:
+            return (f"screenshot failed: PowerShell timed out after 60s; "
+                    f"no file written to {path}")
+        if r.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 0:
+            return f"screenshot saved to {path}"
+        _err = (r.stderr or b"")
+        if isinstance(_err, bytes):
+            _err = _err.decode(errors="replace")
+        return (f"screenshot failed (powershell exit {r.returncode}): "
+                f"{_err.strip()[:200] or 'no file was written to ' + path}")
     return "screenshot not supported (install Pillow + mss: pip install pillow mss)"
 
 

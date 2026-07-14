@@ -1224,5 +1224,181 @@ class EnrollVoiceBoundedWaitTests(unittest.TestCase):
                             f"Event.wait(timeout=...) — unbounded wait regressed")
 
 
+class ScreenshotVerifiesBeforeClaimingTests(unittest.TestCase):
+    """Findings #40/#43 (same defect). _act_screenshot's PowerShell fallback
+    returned "screenshot saved" UNCONDITIONALLY — capture_output threw stderr
+    away, check= wasn't passed, the CompletedProcess was discarded. So a
+    PowerShell error (assembly load failure, locked disk, bad path) reported
+    success while no file existed, and a downstream vision step then read a
+    stale/absent image."""
+
+    def _fake_bc(self, tmp):
+        bc = mock.Mock()
+        bc.__file__ = os.path.join(tmp, "bobert_companion.py")
+        bc.screenshot_privacy_block_reason.return_value = None
+        bc.take_screenshot.return_value = None   # force the PowerShell fallback
+        return bc
+
+    def test_powershell_failure_is_reported_not_claimed(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            bc = self._fake_bc(tmp)
+            fail = mock.Mock(returncode=1, stderr=b"Save failed: path locked")
+            with mock.patch.object(A, "_bc", return_value=bc), \
+                 mock.patch.object(sys, "platform", "win32"), \
+                 mock.patch.object(A.subprocess, "run", return_value=fail):
+                out = A._act_screenshot("")
+        low = out.lower()
+        self.assertTrue("fail" in low or "error" in low,
+                        f"a failed screenshot must not claim success: {out!r}")
+        self.assertNotIn("screenshot saved", low)
+
+    def test_powershell_success_requires_a_real_file(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            bc = self._fake_bc(tmp)
+            ok = mock.Mock(returncode=0, stderr=b"")
+            # returncode 0 but NO file on disk → still a failure, not "saved".
+            with mock.patch.object(A, "_bc", return_value=bc), \
+                 mock.patch.object(sys, "platform", "win32"), \
+                 mock.patch.object(A.subprocess, "run", return_value=ok), \
+                 mock.patch.object(A.os.path, "exists", return_value=False):
+                out = A._act_screenshot("")
+        self.assertNotIn("screenshot saved", out.lower(),
+                         "exit 0 with no file on disk is still a failure")
+
+    def test_powershell_real_success_reports_saved(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            bc = self._fake_bc(tmp)
+            ok = mock.Mock(returncode=0, stderr=b"")
+            with mock.patch.object(A, "_bc", return_value=bc), \
+                 mock.patch.object(sys, "platform", "win32"), \
+                 mock.patch.object(A.subprocess, "run", return_value=ok), \
+                 mock.patch.object(A.os.path, "exists", return_value=True), \
+                 mock.patch.object(A.os.path, "getsize", return_value=4096):
+                out = A._act_screenshot("")
+        self.assertIn("screenshot saved", out.lower())
+
+
+class HudCardTemperatureIsFahrenheitTests(unittest.TestCase):
+    """Finding #33. hud_card stored and rendered raw Celsius while every other
+    surface (unified HUD) converts to Fahrenheit — the transient card showed
+    "21°C" beside the HUD's "70°F" for the same reading, unusable for a US owner
+    (this project's units rule)."""
+
+    def test_current_weather_carries_fahrenheit(self):
+        import hud_card
+        fake = {"current_condition": [
+            {"temp_C": "21", "weatherDesc": [{"value": "Sunny"}]}]}
+        with mock.patch.object(hud_card, "_fetch_wttr", return_value=fake):
+            w = hud_card._gather_weather_now()
+        self.assertIsNotNone(w)
+        self.assertEqual(w["temp_f"], round(21 * 9 / 5 + 32))   # 70
+        self.assertEqual(w["temp_f"], 70)
+
+    def test_forecast_carries_fahrenheit(self):
+        import hud_card
+        fake = {"weather": [
+            {"maxtempC": "25", "mintempC": "10", "date": "2026-07-14",
+             "hourly": [{"time": "1200", "weatherDesc": [{"value": "Clear"}]}]}]}
+        with mock.patch.object(hud_card, "_fetch_wttr", return_value=fake):
+            days = hud_card._gather_forecast()
+        self.assertTrue(days)
+        self.assertEqual(days[0]["high_f"], 77)   # 25C
+        self.assertEqual(days[0]["low_f"], 50)    # 10C
+
+    def test_renderer_uses_fahrenheit_keys(self):
+        with open(os.path.join(_PROJECT, "hud_card.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("temp_f", src)
+        self.assertNotIn("temp_c', '?')}°C", src,
+                         "the big headline number must not render raw Celsius")
+
+
+class TeamsNoDeclineAfterOutOfBandAnswerTests(unittest.TestCase):
+    """Finding #31. The auto-decline grace thread gated only on the in-memory
+    armed flag, which is cleared ONLY by JARVIS's own voice actions. If the user
+    answered in the Teams UI (or the caller hung up) the flag stayed armed, and
+    at t+grace the thread fired Ctrl+Shift+D into a call the user had already
+    taken, plus a focus steal. It must re-check live window state first."""
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("teams_screener")
+        self.mod.PRIORITY_AUTO_DECLINE_SECONDS = 0    # no real wait in the test
+
+    def test_grace_thread_does_not_decline_an_ended_call(self):
+        import time as _t
+        mod = self.mod
+        vip = {"name": "Wayne", "priority": True}
+        sent = mock.Mock(return_value=True)
+        with mock.patch.object(mod, "_send_teams_hotkey", sent), \
+             mock.patch.object(mod, "_pause_music_via_main", return_value=True), \
+             mock.patch.object(mod, "_enqueue_speech"), \
+             mock.patch.object(mod, "_detect", return_value=("none", None, "")):
+            mod._arm_call(vip)
+            mod._vip_priority_handler(vip)     # spawns the grace thread
+            _t.sleep(0.5)                       # let it run (grace=0)
+        sent.assert_not_called()               # NO decline hotkey fired
+        self.assertIsNone(mod._active_call,
+                          "an ended call must clear our arming, not decline")
+
+    def test_grace_thread_still_declines_a_genuinely_unanswered_call(self):
+        import time as _t
+        mod = self.mod
+        vip = {"name": "Wayne", "priority": True}
+        sent = mock.Mock(return_value=True)
+        with mock.patch.object(mod, "_send_teams_hotkey", sent), \
+             mock.patch.object(mod, "_pause_music_via_main", return_value=True), \
+             mock.patch.object(mod, "_enqueue_speech"), \
+             mock.patch.object(mod, "_detect",
+                               return_value=("call", vip, "Wayne | Microsoft Teams")):
+            mod._arm_call(vip)
+            mod._vip_priority_handler(vip)
+            _t.sleep(0.5)
+        sent.assert_called()   # still ringing after grace → decline as designed
+
+
+@requires_monolith
+class ApplePlaylistMediaWindowContractTests(unittest.TestCase):
+    """Finding #25. _apple_music_play_playlist opened Library>Playlists with a
+    bare _open_url_in_browser — no close_hwnd, and it never recorded the new
+    window. So the prior track's window lingered (its still-playing title could
+    satisfy the confirm scan → false "playing") and the fullscreen key hit the
+    stale hwnd. It must use the same media-window contract as the search flow."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_playlist_open_closes_prior_and_records_new_hwnd(self):
+        bc = self.bc
+        opened = {}
+
+        def _fake_open(url, close_matching=None, close_hwnd=None):
+            opened["url"] = url
+            opened["close_hwnd"] = close_hwnd
+            return "chrome"
+
+        fake_win = mock.Mock()
+        fake_win._hWnd = 4242
+        bc._JARVIS_MEDIA_WINDOW_HWND["apple_music"] = 111   # a prior window
+
+        with mock.patch.object(bc, "_open_url_in_browser", side_effect=_fake_open), \
+             mock.patch.object(bc, "_find_browser_window_matching", return_value=fake_win), \
+             mock.patch.object(bc, "_ensure_window_visible_maximized", return_value=True), \
+             mock.patch.object(bc, "SCREEN_VISION_ENABLED", False), \
+             mock.patch("time.sleep"):
+            # SCREEN_VISION_ENABLED False makes it return right after the open +
+            # record block — which is all this test needs to observe.
+            bc._apple_music_play_playlist("workout")
+
+        self.assertEqual(opened.get("close_hwnd"), 111,
+                         "must close the window JARVIS opened last time")
+        self.assertEqual(bc._JARVIS_MEDIA_WINDOW_HWND.get("apple_music"), 4242,
+                         "must record the freshly-opened window's hwnd so the "
+                         "confirm + fullscreen target it, not a stale sibling")
+
+
 if __name__ == "__main__":
     unittest.main()

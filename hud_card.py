@@ -237,6 +237,12 @@ def _gather_weather_now() -> Optional[dict]:
         desc = (current.get("weatherDesc", [{}])[0].get("value", "") or "").strip()
         return {
             "temp_c": temp_c,
+            # temp_f converted the SAME way jarvis_unified_hud.py does, so the
+            # transient card and the always-on HUD show an identical number. The
+            # card used to render temp_c raw ("21°C") while the HUD beside it
+            # read "70°F" for the same reading — unusable for a US/imperial owner
+            # (this project's own units rule). 2026-07-14 audit.
+            "temp_f": int(round(temp_c * 9 / 5 + 32)),
             "desc": desc,
             "emoji": _emoji_for_desc(desc),
         }
@@ -281,6 +287,10 @@ def _gather_forecast() -> list:
                 "label":  label,
                 "high_c": max_c,
                 "low_c":  min_c,
+                # Fahrenheit alongside Celsius so the forecast labels match the
+                # imperial current-temp headline (2026-07-14 audit).
+                "high_f": int(round(max_c * 9 / 5 + 32)),
+                "low_f":  int(round(min_c * 9 / 5 + 32)),
                 "desc":   desc,
                 "emoji":  _emoji_for_desc(desc),
             })
@@ -551,7 +561,7 @@ def _renderer_main(parent_pid: int) -> int:
         tcol = tk.Frame(big, bg=BG)
         tcol.pack(side="left", padx=(18, 0), anchor="s")
         tk.Label(
-            tcol, text=f"{weather.get('temp_c', '?')}°C",
+            tcol, text=f"{weather.get('temp_f', '?')}°F",
             font=("Segoe UI", 44, "bold"), fg=TEXT_FG, bg=BG,
         ).pack(anchor="w")
         tk.Label(
@@ -586,7 +596,7 @@ def _renderer_main(parent_pid: int) -> int:
                 width=10, anchor="w",
             ).pack(side="left")
             tk.Label(
-                row, text=f"{f.get('high_c', '?')}° / {f.get('low_c', '?')}°",
+                row, text=f"{f.get('high_f', '?')}° / {f.get('low_f', '?')}°",
                 font=("Segoe UI", 14), fg=TEXT_FG, bg=BG, width=10, anchor="w",
             ).pack(side="left")
             tk.Label(

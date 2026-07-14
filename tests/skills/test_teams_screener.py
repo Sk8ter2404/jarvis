@@ -47,9 +47,14 @@ class PriorityGraceWindowTests(unittest.TestCase):
         vip = self.mod.VIPS[0]
         self.mod._arm_call(vip)
         sleeps = []
+        # 2026-07-14 audit: the grace thread now re-checks live window state
+        # before declining, so the "still unanswered" case this test pins
+        # requires _detect to report the call is STILL ringing.
         with mock.patch.object(self.mod, "_pause_music_via_main",
                                return_value=True), \
              mock.patch.object(self.mod, "_enqueue_speech"), \
+             mock.patch.object(self.mod, "_detect",
+                               return_value=("call", vip, "caller | Microsoft Teams")), \
              mock.patch.object(self.mod, "_act_decline_call",
                                return_value="") as decline, \
              mock.patch.object(self.mod.time, "sleep",

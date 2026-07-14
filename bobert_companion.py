@@ -14384,13 +14384,40 @@ def _apple_music_play_playlist(name: str) -> str:
     # Step 1: open Library > Playlists directly. Skips the sidebar clicks
     # when possible; sidebar fallback covers the case where Apple Music
     # redirects (not signed in, first-load behaviour).
+    #
+    # MEDIA-WINDOW CONTRACT (2026-07-14 audit). This used to be a bare
+    # _open_url_in_browser(library_url) — no close_matching, no close_hwnd, and
+    # it never recorded the new window's hwnd. Two failures followed: (a) the
+    # prior track's Apple Music window was left open, so the title-confirm scan
+    # (which reads EVERY window) could see the OLD 'Thriller' tab still playing
+    # and report "playing 'workout playlist'" while the playlist never started;
+    # (b) _streaming_go_fullscreen focused the STALE recorded hwnd and pressed
+    # 'f' into the wrong window. Mirror the search flow: close only the window
+    # JARVIS opened last time, then record the freshly-opened one.
     library_url = "https://music.apple.com/library/playlists"
-    _open_url_in_browser(library_url)
+    service_key = cfg["service_key"]
+    _prior_hwnd = _JARVIS_MEDIA_WINDOW_HWND.get(service_key)
+    _open_url_in_browser(
+        library_url,
+        close_matching=cfg.get("tab_match") if _prior_hwnd is not None else None,
+        close_hwnd=_prior_hwnd,
+    )
     print(
         f"  [auto-play] opened Apple Music Library > Playlists for '{name}'",
         flush=True,
     )
     time.sleep(cfg["load_wait"])
+
+    # Record the handle of the window we just opened so the title-confirm is
+    # scoped to it and the fullscreen key lands on it — not a stale sibling.
+    _vm_terms = cfg.get("tab_match")
+    if _vm_terms:
+        _vw = _find_browser_window_matching(_vm_terms)
+        if _vw is not None:
+            _hw = getattr(_vw, "_hWnd", None)
+            if _hw is not None:
+                _JARVIS_MEDIA_WINDOW_HWND[service_key] = _hw
+                _ensure_window_visible_maximized(_hw)
 
     if not (SCREEN_VISION_ENABLED and UI_AUTOMATION_ENABLED
             and _vision_click_backend_available()):
