@@ -79,7 +79,7 @@ import numpy as np
 #  without editing source.
 # ──────────────────────────────────────────────────────────────────────────
 
-_VALID_BACKENDS = ("edge", "pyttsx3", "xtts")
+_VALID_BACKENDS = ("edge", "pyttsx3", "xtts", "kokoro")
 
 
 def _bobert():
@@ -455,7 +455,8 @@ def set_backend(name: str) -> str:
         threading.Thread(target=_warm, daemon=True).start()
     _set_backend_on_bobert(n)
     pretty = {"edge": "edge-tts", "pyttsx3": "the offline fallback voice",
-              "xtts": "your cloned voice"}[n]
+              "xtts": "your cloned voice",
+              "kokoro": "my local Kokoro voice"}[n]
     return f"Switched to {pretty}, sir."
 
 
@@ -473,7 +474,7 @@ _BACKEND_VOICE_RE = re.compile(
         r"(?:use|switch\s+(?:to|back\s+to)|enable|turn\s+on|activate)\s+"
         r"(?:the\s+)?(edge(?:[-\s]tts)?|default|original|microsoft)\s+voice"  # group2: edge
         r"|"
-        r"(?:use|switch\s+to|enable)\s+(?:the\s+)?(pyttsx3|offline)\s+voice"  # group3: pyttsx3
+        r"(?:use|switch\s+to|enable)\s+(?:the\s+)?(pyttsx3|offline|kokoro|local)\s+voice"  # group3: pyttsx3/kokoro
     r")"
     r"[.!?]*\s*$",
     re.IGNORECASE,
@@ -495,6 +496,8 @@ def maybe_switch_backend(utterance: str) -> Optional[str]:
         return set_backend("xtts")
     if any(p in text_low for p in ("edge", "default voice", "original voice", "microsoft voice")):
         return set_backend("edge")
+    if "kokoro" in text_low or "local voice" in text_low:
+        return set_backend("kokoro")
     if "pyttsx" in text_low or "offline voice" in text_low:
         return set_backend("pyttsx3")
     return None

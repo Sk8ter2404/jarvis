@@ -155,3 +155,6 @@ _audit_final_findings.json
 /_*.mp3
 /_*.flac
 /_*.ogg
+
+# Kokoro TTS model weights (large binaries, fetched from official release)
+models/kokoro/

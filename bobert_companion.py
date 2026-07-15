@@ -11116,6 +11116,25 @@ def synthesise(text: str) -> tuple[np.ndarray, int]:
             except Exception as e:
                 print(f"  [tts] pyttsx3 render failed ({e}); falling back to edge-tts")
 
+        if backend == "kokoro":
+            # CPU Kokoro (frees the 3090). Reached only when NO on-demand clone is
+            # armed (the clone is Axis 1, handled above), so an explicit clone
+            # request still wins. synthesize() is fail-closed (never raises,
+            # returns None) so a missing/corrupt model or a wedged engine falls
+            # straight through to the edge → pyttsx3 → SAPI5 → silence ladder and
+            # never mutes JARVIS. See core/kokoro_tts.py. (2026-07-15, P2.)
+            try:
+                from core import kokoro_tts as _kokoro
+                res = _kokoro.synthesize(text) if _kokoro.is_available() else None
+                if res is not None:
+                    audio, sr = res
+                    if gain != 1.0:
+                        audio = np.clip(audio * gain, -1.0, 1.0).astype(np.float32)
+                    return audio, sr
+            except Exception as e:
+                print(f"  [tts] kokoro render failed ({type(e).__name__}: {e}); "
+                      f"falling back to edge-tts")
+
         try:
             # Wry deliveries get a brief beat spliced in before the final clause
             # so the punchline actually lands. core.tts.split_for_wry_pause()
