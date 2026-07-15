@@ -1934,5 +1934,52 @@ class SpeakReportsPlaybackOutcomeTests(unittest.TestCase):
         self.assertIs(out, True)
 
 
+class CameraProbeManyBudgetTests(unittest.TestCase):
+    """Bug-hunt #3. _probe_many joined each runner with a flat 3.5s timeout, but
+    _probe_camera_index internally allows ~42s for the camera-lock QUEUE (a dead
+    index holds the lock 20-30s per cv2.VideoCapture). So a runner abandoned at
+    3.5s never wrote results[i] and a PRESENT camera queued behind a ghost was
+    dropped. The batch join must be budget-aware."""
+
+    def test_batch_join_is_budget_aware_not_flat_per_thread(self):
+        # The _probe_many join lives in a nested closure inside
+        # probe_cameras_and_update_config, so assert the contract at the source
+        # level: the join budget must scale with batch size (mirroring the ~42s
+        # PHASE-1 lock_budget), and the old flat per-thread cap must be gone.
+        with open(os.path.join(_PROJECT, "bobert_companion.py"),
+                  encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("(CAMERA_PROBE_TIMEOUT_SEC + 0.5) * max(1, len(indices))", src,
+                      "the batch join must scale with batch size, not use a flat "
+                      "per-thread cap that abandons probes queued on the lock")
+        self.assertNotIn("t.join(timeout=CAMERA_PROBE_TIMEOUT_SEC + 0.5)", src,
+                         "the old flat per-thread cap must be gone")
+
+
+@requires_monolith
+class DevicePeriodicReenumTests(unittest.TestCase):
+    """Bug-hunt #4. The device signature is sourced from sd.query_devices(),
+    which PortAudio freezes until the reinit the signature gate blocks — so USB
+    hotplug never trips it and mic auto-switch was dead in steady state. Fix
+    keeps the cheap 4s gate but forces a real re-enumeration every
+    DEVICE_REENUM_INTERVAL when idle. (Removing the gate outright would reinit
+    every 4s — a 0xc0000374 window every 4s.)"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_reenum_interval_is_far_longer_than_check_interval(self):
+        bc = self.bc
+        self.assertGreaterEqual(bc.DEVICE_REENUM_INTERVAL, 60.0,
+                                "the forced re-enum must be RARE vs the 4s "
+                                "signature check — a 4s destructive teardown "
+                                "cadence would reopen the 0xc0000374 window")
+        self.assertGreater(bc.DEVICE_REENUM_INTERVAL, bc.DEVICE_CHECK_INTERVAL * 10)
+
+    def test_last_reenum_at_tracked_in_cache(self):
+        self.assertIn("last_reenum_at", self.bc._device_cache)
+
+
 if __name__ == "__main__":
     unittest.main()

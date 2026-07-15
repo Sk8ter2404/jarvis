@@ -5278,8 +5278,22 @@ def probe_cameras_and_update_config() -> tuple[list[int], list[int]]:
             t = threading.Thread(target=_runner, args=(i,), daemon=True)
             t.start()
             threads.append(t)
+        # BUDGET-AWARE BATCH JOIN (2026-07-14 bug-hunt). A flat per-thread
+        # timeout=CAMERA_PROBE_TIMEOUT_SEC+0.5 (3.5s) abandoned any probe still
+        # QUEUED behind the camera I/O lock — but _probe_camera_index itself
+        # deliberately allows up to CAMERA_PROBE_MAX*(timeout+0.5) (~42s) for the
+        # queue wait (a dead index holds the lock 20-30s per cv2.VideoCapture),
+        # so a runner abandoned at 3.5s never wrote results[i] and a PRESENT
+        # camera queued behind a ghost was dropped as "not found". Use one
+        # global deadline scaled by batch size so the batch honours the same
+        # lock-queue reasoning PHASE-1 does, and wait for ALL runners (so a late
+        # runner can't mutate `results` while the caller iterates it).
+        _deadline = time.monotonic() + (CAMERA_PROBE_TIMEOUT_SEC + 0.5) * max(1, len(indices))
         for t in threads:
-            t.join(timeout=CAMERA_PROBE_TIMEOUT_SEC + 0.5)
+            _remaining = _deadline - time.monotonic()
+            if _remaining <= 0:
+                break
+            t.join(timeout=_remaining)
         return results
 
     # Step 1: probe configured indices in parallel
@@ -5966,7 +5980,20 @@ def list_speakers():
 # Device auto-switching state
 _device_cache = {"in": None, "out": None, "checked_at": 0.0,
                  "last_in_name": None, "last_out_name": None,
-                 "last_devices_signature": None}
+                 "last_devices_signature": None,
+                 "last_reenum_at": 0.0}
+
+# Periodic FORCED PortAudio re-enumeration cadence (2026-07-14 bug-hunt, #4).
+# The device signature is sourced from sd.query_devices(), whose result
+# PortAudio FREEZES until the very sd._terminate()/_initialize() the signature
+# gate is blocking — so a plugged/unplugged mic never changes the signature,
+# the gate short-circuits forever, and mid-session USB hotplug auto-switch is
+# DEAD in steady state. The literal fix (drop the gate) would reinit every
+# DEVICE_CHECK_INTERVAL (4s) — constant destructive teardown churn + a
+# 0xc0000374 window every 4s. Instead, keep the cheap 4s gate but force a real
+# re-enumeration at most this often when the mic is idle, so hotplug is picked
+# up within a few minutes without the churn.
+DEVICE_REENUM_INTERVAL = 300.0
 # Serializes _refresh_devices so two callers (e.g. listen loop + a skill)
 # can't both be tearing PortAudio down at the same time, and so the wake-word
 # pause/resume bracket around sd._terminate() isn't racing with concurrent
@@ -6452,8 +6479,18 @@ def _refresh_devices(force: bool = False):
         # can land on freed PortAudio state. We still bump checked_at so
         # the time gate above re-arms for another DEVICE_CHECK_INTERVAL.
         # force=True (e.g. get_current_mic_name()) always re-enumerates.
+        #
+        # BUT the signature can't be trusted to detect USB HOTPLUG: it's built
+        # from sd.query_devices(), which PortAudio freezes until the reinit this
+        # gate blocks — so a plugged/unplugged mic never trips it. To still catch
+        # hotplug in steady state, fall THROUGH to the reinit once every
+        # DEVICE_REENUM_INTERVAL even when the signature matches (the reinit is
+        # still deferred below if any mic/TTS stream is live, so this adds no
+        # teardown-during-capture risk). 2026-07-14 bug-hunt (#4).
         last_sig = _device_cache["last_devices_signature"]
-        if (not force and last_sig is not None
+        _reenum_due = (now - _device_cache.get("last_reenum_at", 0.0)
+                       >= DEVICE_REENUM_INTERVAL)
+        if (not force and not _reenum_due and last_sig is not None
                 and current_sig is not None
                 and current_sig == last_sig):
             _device_cache["checked_at"] = now
@@ -6499,6 +6536,10 @@ def _refresh_devices(force: bool = False):
                 try:
                     sd._terminate()
                     sd._initialize()
+                    # Only a REAL re-enumeration re-arms the periodic hotplug
+                    # sweep — a deferred (mic-active) pass must retry soon, not
+                    # wait another DEVICE_REENUM_INTERVAL. 2026-07-14 #4.
+                    _device_cache["last_reenum_at"] = now
                 except Exception as e:
                     print(f"  [audio] PortAudio re-init failed: {e}")
 
