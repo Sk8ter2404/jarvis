@@ -1354,6 +1354,18 @@ def merge_memory(new_facts=None, new_projects=None, new_topic=""):
 # action catalogue there — that file is the canonical source.
 from core.prompts import PC_CONTROL_PROMPT  # noqa: F401
 
+# DYNAMIC LOCAL PROMPT (2026-07-15). The full system prompt is ~30k tokens but
+# the LOCAL model's context is capped at 12-16k by _local_num_ctx() to fit the
+# 3090 — so the local brain runs on a TRUNCATED prompt (blind to its own
+# identity + ~half its action grammar) and pays a ~9GB KV tax. When on, the
+# local path routes PC_CONTROL to only the sections a turn needs
+# (core/prompt_router), so the FULL relevant instruction set fits the window
+# uncut. Cloud/Claude (200k ctx) is unaffected and keeps the full prompt. On by
+# default (it strictly repairs the truncated case); set
+# JARVIS_DYNAMIC_LOCAL_PROMPT=0 to force the legacy full-prompt path.
+_DYNAMIC_LOCAL_PROMPT = (os.environ.get("JARVIS_DYNAMIC_LOCAL_PROMPT", "1")
+                         .strip().lower() not in ("0", "false", "no", "off"))
+
 # Phase 4A refactor (2026-05-29): 11 simple _act_* handlers (open_url,
 # web_search, youtube, get_time, screenshot, media_next/prev/playpause,
 # volume_up/down/mute) live in core/actions.py and are re-exported by
@@ -10520,8 +10532,28 @@ def _call_llm(user_text: str) -> str:
     except Exception:
         pass
 
+    from core.config import model_route
+    _chat_route = model_route("chat")
+
+    # DYNAMIC LOCAL PROMPT: on the local path, swap the full PC_CONTROL block for
+    # a per-turn slim version (only the sections this text implicates) so the
+    # ~30k prompt fits the 12-16k local context UNCUT instead of being truncated.
+    # Cloud/Claude keeps the full prompt (200k ctx, no truncation). One string
+    # replace on the cached _system_prompt — the BASE identity, rules, phrasebook
+    # and memory around it are untouched. 2026-07-15.
+    _base_prompt = _system_prompt
+    if (_chat_route == "local" and _DYNAMIC_LOCAL_PROMPT
+            and PC_CONTROL_PROMPT and PC_CONTROL_PROMPT in _system_prompt):
+        try:
+            from core import prompt_router as _pr
+            _slim_pc = _pr.slim_pc_control(user_text, PC_CONTROL_PROMPT)
+            _base_prompt = _system_prompt.replace(PC_CONTROL_PROMPT, _slim_pc, 1)
+        except Exception as _pr_err:
+            print(f"  [prompt-router] slim failed ({_pr_err}); full prompt")
+            _base_prompt = _system_prompt
+
     sys_prompt_now = (
-        _system_prompt
+        _base_prompt
         + _tone_system_addendum(tone)
         + route["addendum"]
         + emotion_addendum
@@ -10533,8 +10565,7 @@ def _call_llm(user_text: str) -> str:
         + _ltm_context(user_text)
     )
 
-    from core.config import model_route
-    if model_route("chat") == "local":
+    if _chat_route == "local":
         # LOCAL-routed turn: local model is primary. On local failure, fall
         # back to Claude if reachable, else speak an HONEST unavailability line
         # (SAC-specific when we have evidence) — never a fabricated answer and
