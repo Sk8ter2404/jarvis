@@ -22931,23 +22931,21 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 _wi._stop()
         except Exception:
             pass
-        # Release CUDA/Kinect BEFORE terminating: a thread parked in a
-        # driver at terminate time corpse-pins the VRAM until Windows
-        # reboots (2026-07-13 — every restart leaked ~5GB per corpse).
+        # Release CUDA/Kinect/mic BEFORE terminating: a thread parked in a
+        # driver at terminate time corpse-pins the VRAM until Windows reboots
+        # (2026-07-13 — every restart leaked ~5GB per corpse). Route through the
+        # ONE hardened path (_release_native_resources) rather than inlined
+        # try-blocks: this block WAS the stale duplicate that reopened the corpse
+        # class — it called unload() WITHOUT the in-flight-CUDA wait and kinect
+        # close() WITHOUT final=True (so a 30Hz pump tick could resurrect the
+        # sensor). The hardened call gives the in-flight wait, close(final=True),
+        # sd.stop, and face-track stop from one place. 2026-07-14 bug-hunt #25.
         try:
-            from core import voice_clone as _vc_teardown
-            _vc_teardown.unload()
+            from core.actions import _release_native_resources
+            _release_native_resources(sys.modules["__main__"])
         except Exception:
             pass
-        try:
-            from audio import kinect_bridge as _kb_teardown
-            _kb_teardown.close()
-        except Exception:
-            pass
-        try: sd.stop()
-        except Exception: pass
-        # Signal background threads
-        _face_track_stop.set()
+        # _focus_tracker_stop is not covered by _release_native_resources.
         _focus_tracker_stop.set()
         set_state("sleep")
         _shutdown_hud()

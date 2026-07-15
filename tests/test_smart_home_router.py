@@ -755,7 +755,7 @@ class AlexaSetStateTests(_RouterTestBase):
         disc = types.ModuleType("skills.smart_home_discover")
         # A faithful, synchronous stand-in for the discover skill's asyncio
         # runner: run the coroutine to completion and return its result.
-        disc._run_async = lambda coro: _drain(coro)
+        disc._run_async = lambda coro, timeout=None: _drain(coro)
         login = object()
         with mock.patch.object(router, "_alexa_login", return_value=login), \
              _inject_modules(alexapy=alexapy,
@@ -774,7 +774,7 @@ class AlexaSetStateTests(_RouterTestBase):
         alexapy.AlexaAPI = types.SimpleNamespace(
             set_appliance_state=_set_appliance_state)
         disc = types.ModuleType("skills.smart_home_discover")
-        disc._run_async = lambda coro: _drain(coro)
+        disc._run_async = lambda coro, timeout=None: _drain(coro)
         with mock.patch.object(router, "_alexa_login", return_value=object()), \
              _inject_modules(alexapy=alexapy,
                              **{"skills.smart_home_discover": disc}):
@@ -788,7 +788,7 @@ class AlexaSetStateTests(_RouterTestBase):
         alexapy.AlexaAPI = types.SimpleNamespace(
             set_appliance_state=_set_appliance_state)
         disc = types.ModuleType("skills.smart_home_discover")
-        disc._run_async = lambda coro: _drain(coro)
+        disc._run_async = lambda coro, timeout=None: _drain(coro)
         with mock.patch.object(router, "_alexa_login", return_value=object()), \
              _inject_modules(alexapy=alexapy,
                              **{"skills.smart_home_discover": disc}):
@@ -803,7 +803,7 @@ class AlexaSetStateTests(_RouterTestBase):
         alexapy.AlexaAPI = types.SimpleNamespace(
             set_appliance_state=_set_appliance_state)
         disc = types.ModuleType("skills.smart_home_discover")
-        disc._run_async = lambda coro: _drain(coro)
+        disc._run_async = lambda coro, timeout=None: _drain(coro)
         with mock.patch.object(router, "_alexa_login", return_value=object()), \
              _inject_modules(alexapy=alexapy,
                              **{"skills.smart_home_discover": disc}):
@@ -816,7 +816,7 @@ class AlexaSetStateTests(_RouterTestBase):
         alexapy = types.ModuleType("alexapy")
         alexapy.AlexaAPI = types.SimpleNamespace()  # no set_appliance_state
         disc = types.ModuleType("skills.smart_home_discover")
-        disc._run_async = lambda coro: _drain(coro)
+        disc._run_async = lambda coro, timeout=None: _drain(coro)
         with mock.patch.object(router, "_alexa_login", return_value=object()), \
              _inject_modules(alexapy=alexapy,
                              **{"skills.smart_home_discover": disc}):
@@ -830,7 +830,7 @@ class AlexaSetStateTests(_RouterTestBase):
         alexapy.AlexaAPI = types.SimpleNamespace(
             set_appliance_state=_set_appliance_state)
         disc = types.ModuleType("skills.smart_home_discover")
-        disc._run_async = lambda coro: _drain(coro)
+        disc._run_async = lambda coro, timeout=None: _drain(coro)
         with mock.patch.object(router, "_alexa_login", return_value=object()), \
              _inject_modules(alexapy=alexapy,
                              **{"skills.smart_home_discover": disc}):

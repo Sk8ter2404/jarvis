@@ -717,9 +717,16 @@ def _tracked_dialog_run(args, *, capture_output=False, text=False,
     like ``subprocess.run``. On timeout the child is killed (mirrors run's
     contract) before the TimeoutExpired propagates. 2026-07-08."""
     pipe = subprocess.PIPE if capture_output else None
-    proc = subprocess.Popen(args, stdout=pipe, stderr=pipe, text=text,
-                            creationflags=creationflags)
+    # Spawn AND register atomically under the lock (2026-07-14 bug-hunt #26).
+    # The old order (Popen, THEN take the lock to append) left a TOCTOU window:
+    # a concurrent _terminate_dialog_procs — which snapshots+clears the list
+    # under this same lock — could run between spawn and register and never see
+    # the new child, orphaning a modal dialog past shutdown. Holding the lock
+    # across Popen makes the reaper either miss the spawn entirely or see the
+    # registered child; there is no in-between.
     with _dialog_procs_lock:
+        proc = subprocess.Popen(args, stdout=pipe, stderr=pipe, text=text,
+                                creationflags=creationflags)
         _dialog_procs.append(proc)
     try:
         out, _err = proc.communicate(timeout=timeout)

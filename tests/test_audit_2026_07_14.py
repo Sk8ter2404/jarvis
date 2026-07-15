@@ -2127,5 +2127,61 @@ class EmailTriageIsBoundedTests(unittest.TestCase):
                                 "their per-message Claude calls")
 
 
+class FinalStaleDuplicateSweepTests(unittest.TestCase):
+    """Bug-hunt #24/#25/#26/#12/#23 — the tail: mostly the stale-duplicate class
+    (a hardened path exists; a sibling copy rotted) plus two cheap
+    class-prevention fixes."""
+
+    def test_hud_card_uses_parent_watch_not_psutil(self):
+        # #24: hud_card's parent-liveness check must use core.parent_watch (the
+        # fleet's canonical, corpse-aware check), not the psutil-backed
+        # _pid_alive that reports True for a kernel-stuck corpse.
+        with open(os.path.join(_PROJECT, "hud_card.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("from core.parent_watch import parent_is_alive", src)
+
+    def test_keyboardinterrupt_teardown_uses_hardened_release(self):
+        # #25: the Ctrl-C teardown must route through _release_native_resources
+        # (in-flight wait + close(final=True)), not inlined unload()/close().
+        with open(os.path.join(_PROJECT, "bobert_companion.py"),
+                  encoding="utf-8") as fh:
+            src = fh.read()
+        ki = src.split("except KeyboardInterrupt:")[1][:2000]
+        self.assertIn("_release_native_resources(sys.modules[\"__main__\"])", ki)
+        # The old inlined stale-duplicate calls must be gone from this block.
+        self.assertNotIn("_vc_teardown.unload()", ki)
+        self.assertNotIn("_kb_teardown.close()", ki)
+
+    def test_tray_dialog_spawn_and_register_are_atomic(self):
+        # #26: Popen must be INSIDE the _dialog_procs_lock with the append, so a
+        # concurrent reaper can't orphan a just-spawned dialog.
+        with open(os.path.join(_PROJECT, "tray.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        fn = src.split("def _tracked_dialog_run(")[1].split("\ndef ")[0]
+        lock_block = fn.split("with _dialog_procs_lock:")[1]
+        self.assertIn("subprocess.Popen(", lock_block.split("_dialog_procs.append")[0],
+                      "Popen must happen under the lock, before the append")
+
+    def test_alexa_fallback_runner_is_bounded(self):
+        # #12: the alexa runner call must pass a timeout so a stalled endpoint
+        # can't wedge the dispatch thread.
+        with open(os.path.join(_PROJECT, "core", "smart_home_router.py"),
+                  encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("_run(_go(), timeout=", src)
+
+    def test_two_hand_overlay_writes_atomically(self):
+        # #23: both overlay writes must go through the temp-file+os.replace
+        # helper, not a plain open()/json.dump the 60Hz reader can tear.
+        with open(os.path.join(_PROJECT, "skills", "kinect_two_hand.py"),
+                  encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("os.replace(tmp, path)", src)
+        pub = src.split("def _publish_two_hand_overlay(")[1]
+        self.assertNotIn("json.dump(data, f)", pub,
+                         "the publisher must use the atomic writer, not a raw "
+                         "json.dump")
+
+
 if __name__ == "__main__":
     unittest.main()

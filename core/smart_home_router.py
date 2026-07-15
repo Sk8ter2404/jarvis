@@ -709,7 +709,11 @@ def _alexa_set_state(device: dict, kwargs: dict) -> dict:
             return {"error": f"alexa call failed: {e}"}
 
     try:
-        return _run(_go())
+        # Bounded so a stalled Amazon endpoint can't wedge the voice dispatch
+        # thread (2026-07-14 bug-hunt #12 — defensive; the current alexapy build
+        # has no set_appliance_state so this path returns fast today, but the
+        # bound protects if a future build restores it).
+        return _run(_go(), timeout=8.0)
     except Exception as e:
         return {"error": f"alexa fallback runner failed: {e}"}
 

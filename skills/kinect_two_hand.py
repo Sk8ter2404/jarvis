@@ -836,6 +836,28 @@ def _ensure_overlay_alive() -> None:
         pass
 
 
+def _atomic_write_overlay_json(path: str, data: dict) -> None:
+    """Write `data` to `path` via a temp file + os.replace, mirroring the
+    air-mouse's hardened writer (2026-07-14 bug-hunt #23 — this was the stale
+    duplicate that still did a plain open()/json.dump, which the 60 Hz reader
+    could catch mid-write as a torn frame). Never raises."""
+    import json as _json
+    import tempfile
+    d = os.path.dirname(path) or "."
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".2hand_", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            _json.dump(data, f)
+        os.replace(tmp, path)
+    except Exception:
+        if tmp is not None:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
+
 def _publish_two_hand_overlay(decision: "TwoHandDecision") -> None:
     """Publish the TWO hands' screen points + the resize state to the air-cursor
     overlay's state file so the HUD draws two reticle circles (BLUE while engaged,
@@ -865,8 +887,7 @@ def _publish_two_hand_overlay(decision: "TwoHandDecision") -> None:
             # overwrites this cleared frame within a tick.
             if _two_hand_overlay_was_active[0]:
                 data = {"visible": False, "two_hand": False, "ts": time.time()}
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump(data, f)
+                _atomic_write_overlay_json(path, data)
                 _two_hand_overlay_was_active[0] = False
             return
         _two_hand_overlay_was_active[0] = True
@@ -887,8 +908,7 @@ def _publish_two_hand_overlay(decision: "TwoHandDecision") -> None:
             ],
             "ts": time.time(),
         }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f)
+        _atomic_write_overlay_json(path, data)
     except Exception:
         pass
 
