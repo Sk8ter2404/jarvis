@@ -11312,6 +11312,16 @@ def _barge_in_wake_enabled() -> bool:
 # longer because the greeting PLAYBACK can extend past 30s.
 _BOOT_BARGE_IN_GRACE_S = 60.0
 
+# Gesture (Kinect hand-swipe) barge-in is OFF by default. It cut TTS mid-playback
+# and then the teardown wedged the main loop → the watchdog reaped the process:
+# JARVIS went DOWN twice on 2026-07-15, BOTH times from a PHANTOM swipe (the owner
+# wasn't deliberately gesturing). The depth sensor false-fires swipes, so a feature
+# that lets a phantom gesture kill the assistant is a net negative — mirror the
+# already-off-by-default acoustic BARGE_IN_ENABLED. Web-UI / tray STOP buttons are
+# unaffected (they aren't gesture sources). Opt in with JARVIS_GESTURE_BARGE_IN=1.
+_GESTURE_BARGE_IN_ENABLED = (os.environ.get("JARVIS_GESTURE_BARGE_IN", "")
+                             .strip().lower() in ("1", "true", "yes", "on"))
+
 
 def request_tts_interrupt(source: str = "wake-word",
                           acoustic: bool = True) -> bool:
@@ -11354,6 +11364,15 @@ def request_tts_interrupt(source: str = "wake-word",
             and (time.time() - _session_start_time) < _BOOT_BARGE_IN_GRACE_S):
         print(f"  [barge-in] ignored during boot grace "
               f"(source={source}, non-acoustic) — greeting plays out")
+        return False
+    if (not acoustic and not _GESTURE_BARGE_IN_ENABLED
+            and any(g in (source or "").lower() for g in ("swipe", "gesture", "kinect"))):
+        # Phantom depth-sensor swipes cutting TTS wedged the main loop → JARVIS
+        # went down twice 2026-07-15. OFF by default (JARVIS_GESTURE_BARGE_IN=1
+        # to re-enable). Web/tray STOP buttons are NOT gesture sources, so they
+        # still interrupt normally.
+        print(f"  [barge-in] gesture barge-in disabled (source={source}); "
+              f"ignoring — set JARVIS_GESTURE_BARGE_IN=1 to enable")
         return False
     if acoustic and "jarvis" in (_tts_current_text[0] or ""):
         print(f"  [barge-in] wake hit ignored (own TTS says 'jarvis'), "

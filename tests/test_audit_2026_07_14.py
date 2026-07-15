@@ -725,8 +725,10 @@ class GestureInterruptIsNotAcousticTests(unittest.TestCase):
 
     def test_non_acoustic_interrupt_bypasses_the_echo_gate(self):
         bc = self.bc
-        # Past the boot grace (booted 2 min ago) so the steady-state path runs.
+        # Past the boot grace (booted 2 min ago) + gesture barge-in opted in, so
+        # the steady-state accept path runs.
         with mock.patch.object(bc, "_session_start_time", time.time() - 120), \
+             mock.patch.object(bc, "_GESTURE_BARGE_IN_ENABLED", True), \
              mock.patch.object(bc, "_tts_playback_active", [True]), \
              mock.patch.object(bc, "_tts_current_text",
                                ["certainly sir, jarvis here"]), \
@@ -739,6 +741,7 @@ class GestureInterruptIsNotAcousticTests(unittest.TestCase):
     def test_non_acoustic_interrupt_ignores_the_wake_word_knob(self):
         bc = self.bc
         with mock.patch.object(bc, "_session_start_time", time.time() - 120), \
+             mock.patch.object(bc, "_GESTURE_BARGE_IN_ENABLED", True), \
              mock.patch.object(bc, "_barge_in_wake_enabled", return_value=False), \
              mock.patch.object(bc, "_tts_playback_active", [True]), \
              mock.patch.object(bc, "_tts_current_text", ["hello"]), \
@@ -762,6 +765,20 @@ class GestureInterruptIsNotAcousticTests(unittest.TestCase):
              mock.patch.object(bc, "_tts_interrupt_seq", [0]):
             ok = bc.request_tts_interrupt(source="kinect-swipe", acoustic=False)
         self.assertFalse(ok, "boot-window non-acoustic barge-in must be ignored")
+        ev.set.assert_not_called()
+
+    def test_gesture_barge_in_off_by_default_ignores_swipe(self):
+        """Phantom Kinect swipes cutting TTS wedged the main loop → JARVIS went
+        down twice 2026-07-15. Gesture barge-in is OFF by default, so a steady-
+        state swipe is ignored (JARVIS_GESTURE_BARGE_IN=1 re-enables it)."""
+        bc = self.bc
+        with mock.patch.object(bc, "_session_start_time", time.time() - 120), \
+             mock.patch.object(bc, "_GESTURE_BARGE_IN_ENABLED", False), \
+             mock.patch.object(bc, "_tts_playback_active", [True]), \
+             mock.patch.object(bc, "_tts_current_text", ["speaking now"]), \
+             mock.patch.object(bc, "_tts_interrupt") as ev:
+            self.assertFalse(
+                bc.request_tts_interrupt(source="kinect-swipe", acoustic=False))
         ev.set.assert_not_called()
 
     def test_acoustic_wake_path_is_unchanged(self):
