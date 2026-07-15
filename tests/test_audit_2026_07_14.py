@@ -1876,5 +1876,63 @@ class YoutubeDirectDoesNotOverclaimTests(unittest.TestCase):
         self.assertNotIn("no further action needed", src)
 
 
+@requires_monolith
+class StandbyWakeGateWordBoundaryTests(unittest.TestCase):
+    """Bug-hunt #5. The standby/sleep wake gate used a raw substring test
+    (`any(wp in tl ...)`), the stale duplicate of the word-boundary matcher the
+    ambient listener already used — so "awakened" matched "wake" and "jar visit"
+    matched "jarvis"."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_substring_false_positives_are_rejected(self):
+        bc = self.bc
+        for bad in ("the machine awakened slowly", "he paid a jar visit",
+                    "i awakened early"):
+            self.assertIsNone(bc._WAKE_RE.search(bad),
+                              f"{bad!r} must NOT trip the wake gate")
+
+    def test_real_wake_phrases_match(self):
+        bc = self.bc
+        for good in ("jarvis", "hey jarvis are you there", "wake up",
+                     "jarvis!", "please wake up"):
+            self.assertIsNotNone(bc._WAKE_RE.search(good),
+                                 f"{good!r} must trip the wake gate")
+
+
+@requires_monolith
+class SpeakReportsPlaybackOutcomeTests(unittest.TestCase):
+    """Bug-hunt #18. _speak swallowed playback failures (by design) but returned
+    nothing, so the streaming flush ledger recorded a TTS-FAILED sentence as
+    spoken — and _strip_stream_spoken_prefix then dropped it from the tail. _speak
+    now returns True on success / False on failure; the ledger records only when
+    it's not False."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_speak_returns_false_on_playback_failure(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_is_staging", return_value=False), \
+             mock.patch.object(bc, "synthesise", return_value=(b"a", 22050)), \
+             mock.patch.object(bc, "play_with_lipsync",
+                               side_effect=RuntimeError("device gone")), \
+             mock.patch.object(bc, "set_state"):
+            out = bc._speak("hello sir")
+        self.assertIs(out, False)
+
+    def test_speak_returns_true_on_success(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_is_staging", return_value=False), \
+             mock.patch.object(bc, "synthesise", return_value=(b"a", 22050)), \
+             mock.patch.object(bc, "play_with_lipsync"), \
+             mock.patch.object(bc, "set_state"):
+            out = bc._speak("hello sir")
+        self.assertIs(out, True)
+
+
 if __name__ == "__main__":
     unittest.main()

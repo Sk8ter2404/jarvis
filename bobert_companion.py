@@ -784,6 +784,22 @@ WAKE_PHRASES = {
     "jarvis", "hey jarvis", "wake up", "start listening",
     "i need you", "come back", "resume listening", "wake",
 }
+
+
+def _wake_phrase_regex(phrases) -> "re.Pattern":
+    """Word-boundary matcher for the wake phrases — same construction as
+    skills/ambient_listen._compile_wake_pattern, so "awakened" doesn't match
+    "wake" and "jar visit" doesn't match "jarvis". Both derive from the single
+    WAKE_PHRASES set; the standby gate used a raw substring test that this
+    replaces (2026-07-14 bug-hunt — the word-boundary fix had landed only in
+    the ambient copy)."""
+    parts = [re.escape(p.strip().lower()) for p in phrases if (p or "").strip()]
+    if not parts:
+        parts = [re.escape("jarvis")]
+    return re.compile(r"\b(?:" + "|".join(parts) + r")\b", re.IGNORECASE)
+
+
+_WAKE_RE = _wake_phrase_regex(WAKE_PHRASES)
 # Ambient listening mode (skills/ambient_listen.py) — passive transcription
 # daemon that keeps the mic open and records everything to a rolling buffer
 # without responding. Wake phrases inside the buffer fire proactive_announce.
@@ -10316,12 +10332,16 @@ class _SentenceFlushBuffer:
                 except Exception:
                     pass
                 fn = speak_fn if speak_fn is not None else _speak
-                fn(sentence)
+                _spoke = fn(sentence)
                 # Record as spoken ONLY after actually dispatching to TTS: a
                 # skipped (barged-in) or TTS-failed sentence must NOT be stripped
                 # from the downstream tail (which would silently DROP it) — it
-                # rides the normal speak path instead. 2026-07-08.
-                self.spoken_prefix += piece
+                # rides the normal speak path instead. 2026-07-08. _speak now
+                # returns False when playback FAILED (2026-07-14 #18); `is not
+                # False` so a custom speak_fn returning None still counts as
+                # spoken (prior behaviour).
+                if _spoke is not False:
+                    self.spoken_prefix += piece
             except Exception:
                 pass   # early speech is a bonus — never let it propagate
 
@@ -19652,6 +19672,7 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
     # so set + consume is atomic w.r.t. any concurrent _speak. The finally
     # clears them again so the next utterance starts clean.
     with _SPEAK_LOCK:
+        _speak_ok = False   # set True only on a completed play (#18 ledger)
         try:
             _last_intent_override[0] = intent
             _last_wry[0] = wry_flag
@@ -19674,6 +19695,7 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
             play_with_lipsync(audio_out, sr)
             last_speech_time = time.time()
             set_state("idle")
+            _speak_ok = True   # signalled to the streaming flush ledger (#18)
         except Exception as _spk_err:
             # A PortAudio/device hiccup (e.g. a stale output-device index
             # after a hot-swap, or a synthesis error) must NOT propagate out
@@ -19681,6 +19703,7 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
             # Lose the line, log it, recover to idle. 2026-05-30 audit.
             print(f"  [speak] playback failed: "
                   f"{type(_spk_err).__name__}: {_spk_err}")
+            _speak_ok = False   # tell the caller the line was NOT voiced (#18)
             try:
                 set_state("idle")
             except Exception:
@@ -19704,6 +19727,10 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
             # the end of playback so it can't leak into the next utterance.
             _tts_current_text[0] = ""
             _tts_interrupt.clear()
+    # Report whether the line was actually voiced. Most callers ignore this;
+    # the streaming flush ledger uses it so a TTS-failed sentence is NOT
+    # recorded as spoken (which would strip it from the tail). 2026-07-14 (#18).
+    return _speak_ok
 
 
 def _do_proactive_turn(memory: dict):
@@ -21483,8 +21510,11 @@ def _handle_sleep_standby(injected_text: str | None) -> None:
         else:
             text = "jarvis" if _wake_hit else ""
     tl = text.strip().lower()
-    # Check for any wake phrase
-    if any(wp in tl for wp in WAKE_PHRASES):
+    # Word-boundary wake match (2026-07-14 bug-hunt). Was `any(wp in tl ...)` —
+    # a raw substring test that fires on "awakened"/"jar visit"; the ambient
+    # listener already used a word-boundary regex, and this standby gate was the
+    # stale duplicate that didn't.
+    if _WAKE_RE.search(tl):
         if _audio_music_should_refuse_wake(text):
             print(f"  [{_label.lower()}] wake-word ignored "
                   f"(music playing, lyric near-miss): '{text[:60]}'")
@@ -21641,6 +21671,14 @@ def _run_llm_dispatch(text: str) -> str:
     if _glance_reply is not None:
         print("  [glance] one-shot reply (focused window auto-attached)")
         reply = _glance_reply
+        # Reset the early-speech ledger here too (2026-07-14 bug-hunt). The
+        # glance path bypasses _call_llm — the ONLY other place that clears
+        # _stream_spoken_prefix — so a prefix left over from a PRIOR streamed
+        # turn would make the downstream _strip_stream_spoken_prefix eat a
+        # matching opener off THIS glance reply, silently dropping spoken text.
+        # The glance reply comes from ask_vision, never the flush buffer, so
+        # there is never a legitimate prefix to strip on a glance turn.
+        _stream_spoken_prefix[0] = ""
     else:
         reply = get_response_with_animation(text)
     print(f"  JARVIS: {reply}")
