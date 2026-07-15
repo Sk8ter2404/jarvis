@@ -2572,7 +2572,13 @@ def _now_doing_label(state: str) -> str:
     2026-05-29 18:05 — 'are you working' confusion fix)."""
     s = (state or "idle").lower()
     if s == "thinking":
-        model = CLAUDE_MODEL if AI_BACKEND == "claude" else OLLAMA_MODEL
+        # Show the RESOLVED local tag, not the vestigial OLLAMA_MODEL constant
+        # (still the retired "llama3" default) — the label read "THINKING
+        # (llama3)" while gemma4:12b was actually on the wire. Read the resolver
+        # CACHE, never _get_local_llm_model() here: on a cold cache it does a 2s
+        # blocking /api/tags GET, and this is the hot UI-label path. 2026-07-14.
+        model = (CLAUDE_MODEL if AI_BACKEND == "claude"
+                 else (_RESOLVED_LOCAL_LLM_MODEL[0] or LOCAL_LLM_MODEL))
         return f"THINKING ({model})"
     if s == "listening":
         return "LISTENING"
@@ -3501,7 +3507,7 @@ def _restore_tray_toggle_state() -> None:
     try:
         _write_hud_state(
             llm_backend=("anthropic" if str(AI_BACKEND).lower() == "claude"
-                         else str(OLLAMA_MODEL)))
+                         else str(_RESOLVED_LOCAL_LLM_MODEL[0] or LOCAL_LLM_MODEL)))
     except Exception:
         pass
 
@@ -10595,8 +10601,19 @@ def _call_llm(user_text: str) -> str:
             reply = resp["message"]["content"]
         except Exception as _e:
             print(f"  [ollama] chat failed: {_e}")
-            reply = ("I'm afraid my local model isn't responding, sir — "
-                     "Ollama may be down. Please check it and try again.")
+            # Route through the instrumented local fallback like the claude
+            # branch and the two sibling call sites, not a dead-end string.
+            # _local_fallback_or → _call_local_llm, which carries the ollama
+            # SELF-HEAL + wedge-reap machinery _ollama_chat_bounded alone does
+            # not trigger — so a wedged/killed runner gets restarted and retried
+            # instead of the user just hearing "Ollama may be down". If the
+            # local model still can't answer, the honest default is spoken.
+            # 2026-07-14 bug-hunt.
+            reply = _local_fallback_or(
+                sys_prompt_now,
+                "I'm afraid my local model isn't responding, sir — "
+                "Ollama may be down. Please check it and try again.",
+            )
 
     else:
         reply = "AI backend not configured. Check AI_BACKEND in the script."

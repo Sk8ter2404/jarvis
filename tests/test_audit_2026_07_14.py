@@ -1692,5 +1692,98 @@ class WhichMonitorUsesCanonicalSideTests(unittest.TestCase):
                       f"label-first side rule must win over look_x: {out!r}")
 
 
+@requires_monolith
+class OllamaBranchUsesInstrumentedFallbackTests(unittest.TestCase):
+    """Bug-hunt #6. _call_llm's ollama branch degraded to a dead-end string on
+    failure, while the claude branch and the two sibling call sites route
+    through _local_fallback_or → _call_local_llm, which carries the ollama
+    SELF-HEAL + wedge-reap machinery. So a wedged runner just said "Ollama may
+    be down" instead of being restarted and retried."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_ollama_failure_routes_through_local_fallback(self):
+        bc = self.bc
+        # model_route("chat")=="local" is the FIRST branch of _call_llm (a
+        # separate _call_local_llm path); force it off "local" so the
+        # AI_BACKEND=="ollama" branch — the one this fix touches — is reached.
+        with mock.patch.object(bc, "AI_BACKEND", "ollama"), \
+             mock.patch("core.config.model_route", return_value="auto"), \
+             mock.patch.object(bc, "detect_tone", return_value=None), \
+             mock.patch.object(bc, "route_voice_emotion",
+                               return_value={"mood": "casual", "addendum": ""}), \
+             mock.patch.object(bc, "_ltm_enqueue"), \
+             mock.patch.object(bc, "_ollama_chat_bounded",
+                               side_effect=RuntimeError("wedged")), \
+             mock.patch.object(bc, "_local_fallback_or",
+                               return_value="recovered locally") as fb, \
+             mock.patch.object(bc, "conversation_history", []):
+            out = bc._call_llm("hi")
+        fb.assert_called_once()   # the self-healing path, not a dead-end string
+        self.assertEqual(out, "recovered locally")
+
+
+class SwitchLlmTagIsAuthoritativeTests(unittest.TestCase):
+    """Bug-hunt #7. _act_switch_llm set bc.OLLAMA_MODEL = tag, but every
+    generation resolves through _get_local_llm_model() (the
+    _RESOLVED_LOCAL_LLM_MODEL cache), which never reads OLLAMA_MODEL — so "switch
+    to qwen2.5:14b" reported success while the box kept answering on gemma4.
+    The pick must repoint the resolver cache (only when the tag is installed)."""
+
+    def _bc(self, installed):
+        bc = mock.Mock()
+        bc.AI_BACKEND = "claude"
+        bc._KNOWN_OLLAMA_MODELS = {"qwen2.5:14b"}
+        bc._RESOLVED_LOCAL_LLM_MODEL = ["gemma4:12b"]
+        bc.OLLAMA_MODEL = "gemma4:12b"
+        bc.LOCAL_LLM_MODEL = "gemma4:12b"
+        bc._ollama_has_model.return_value = installed
+        bc._get_local_llm_model.return_value = "gemma4:12b"
+        return bc
+
+    def test_installed_tag_repoints_the_resolver_cache(self):
+        bc = self._bc(installed=True)
+        with mock.patch.object(A, "_bc", return_value=bc):
+            out = A._act_switch_llm("qwen2.5:14b")
+        self.assertEqual(bc._RESOLVED_LOCAL_LLM_MODEL[0], "qwen2.5:14b",
+                         "an installed pick must take effect next turn")
+        self.assertIn("qwen2.5:14b", out)
+
+    def test_uninstalled_tag_pulls_and_keeps_current_model(self):
+        bc = self._bc(installed=False)
+        with mock.patch.object(A, "_bc", return_value=bc):
+            out = A._act_switch_llm("qwen2.5:14b")
+        # Must NOT repoint the cache to an uninstalled tag (would 404 every turn).
+        self.assertEqual(bc._RESOLVED_LOCAL_LLM_MODEL[0], "gemma4:12b")
+        bc._ollama_pull_async.assert_called_once_with("qwen2.5:14b")
+        self.assertIn("isn't installed", out)
+
+
+@requires_monolith
+class ThinkingLabelShowsResolvedModelTests(unittest.TestCase):
+    """Bug-hunt #19. The THINKING label and the tray llm_backend publish read the
+    vestigial OLLAMA_MODEL constant (retired "llama3"), not the resolved tag —
+    so the HUD said "THINKING (llama3)" while gemma4:12b was on the wire. Read
+    the resolver CACHE (never _get_local_llm_model, which HTTP-blocks on the hot
+    label path)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_thinking_label_uses_resolved_cache_not_ollama_model(self):
+        bc = self.bc
+        with mock.patch.object(bc, "AI_BACKEND", "ollama"), \
+             mock.patch.object(bc, "OLLAMA_MODEL", "llama3"), \
+             mock.patch.object(bc, "_RESOLVED_LOCAL_LLM_MODEL", ["gemma4:12b"]), \
+             mock.patch.object(bc, "_get_local_llm_model",
+                               side_effect=AssertionError("must not HTTP here")):
+            label = bc._now_doing_label("thinking")
+        self.assertIn("gemma4:12b", label)
+        self.assertNotIn("llama3", label)
+
+
 if __name__ == "__main__":
     unittest.main()

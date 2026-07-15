@@ -2835,18 +2835,57 @@ def _act_switch_llm(arg: str = "") -> str:
         bc.AI_BACKEND = "claude"
         _publish_backend("anthropic")
         return f"switched to claude ({CLAUDE_MODEL})"
+    def _resolved_local() -> str:
+        # What the local brain will ACTUALLY use next turn (the resolver cache),
+        # not the vestigial OLLAMA_MODEL constant. 2026-07-14 bug-hunt.
+        try:
+            return bc._get_local_llm_model()
+        except Exception:
+            return getattr(bc, "OLLAMA_MODEL", "")
+
     if tag == "ollama":
         bc.AI_BACKEND = "ollama"
-        _publish_backend(bc.OLLAMA_MODEL)
-        return f"switched to ollama (model: {bc.OLLAMA_MODEL})"
+        model = _resolved_local()
+        _publish_backend(model)
+        return f"switched to ollama (model: {model})"
     # explicit model tag — verify it's one we recognise
     if tag in bc._KNOWN_OLLAMA_MODELS or any(tag.startswith(p) for p in
             ("llama", "qwen", "mistral", "mixtral", "phi", "gemma",
              "deepseek", "codellama")):
         bc.AI_BACKEND = "ollama"
         bc.OLLAMA_MODEL = tag
-        _publish_backend(tag)
-        return f"switched to ollama / {tag}"
+        # MAKE THE PICK AUTHORITATIVE (2026-07-14 bug-hunt). Setting OLLAMA_MODEL
+        # alone had NO effect — every generation resolves through
+        # _get_local_llm_model(), which reads the _RESOLVED_LOCAL_LLM_MODEL cache
+        # and never looks at OLLAMA_MODEL. So "switch to qwen2.5:14b" reported
+        # success while the box kept answering on gemma4:12b. Repoint the
+        # resolver cache the same way skills/model_picker.set_model does — but
+        # ONLY if the tag is actually installed, since pointing the cache at an
+        # uninstalled tag would 404 every turn. If it isn't installed, kick a
+        # background pull and leave the working model in place.
+        installed = False
+        try:
+            installed = bool(bc._ollama_has_model(tag))
+        except Exception:
+            installed = False
+        if installed:
+            cache = getattr(bc, "_RESOLVED_LOCAL_LLM_MODEL", None)
+            if isinstance(cache, list):
+                cache[0] = tag
+            try:
+                bc.LOCAL_LLM_MODEL = tag
+            except Exception:
+                pass
+            _publish_backend(tag)
+            return f"switched to ollama / {tag}"
+        # Not installed yet — pull in the background, keep the current model.
+        try:
+            bc._ollama_pull_async(tag)
+        except Exception:
+            pass
+        _publish_backend(_resolved_local())
+        return (f"'{tag}' isn't installed yet, sir — pulling it in the "
+                f"background. Staying on {_resolved_local()} until it's ready.")
     return (f"unknown backend tag: {tag!r}. "
             f"Use 'claude' or one of: qwen2.5:14b, llama3.1:8b, mistral, ...")
 

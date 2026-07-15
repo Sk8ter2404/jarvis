@@ -2488,6 +2488,12 @@ class SwitchLlmTests(unittest.TestCase):
         bc.AI_BACKEND = backend
         bc.OLLAMA_MODEL = ollama
         bc._KNOWN_OLLAMA_MODELS = {"qwen2.5:14b", "llama3.1:8b"}
+        # 2026-07-14 bug-hunt: switch_llm now reports/repoints via the RESOLVED
+        # local tag (_get_local_llm_model), not the vestigial OLLAMA_MODEL
+        # constant. In these tests the resolved tag IS the configured ollama tag.
+        bc._get_local_llm_model.return_value = ollama
+        bc._ollama_has_model.return_value = True
+        bc._RESOLVED_LOCAL_LLM_MODEL = [ollama]
         return bc
 
     def test_blank_reports_current_claude(self):
