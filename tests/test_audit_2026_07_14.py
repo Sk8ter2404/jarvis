@@ -2054,5 +2054,78 @@ class OrchestratorEmptySummaryKeepsRawDataTests(unittest.TestCase):
                       "an empty summary must fall back to the fetched raw data")
 
 
+class SmartHomeSceneActivatesTests(unittest.TestCase):
+    """Bug-hunt #11. _action_to_kwargs had no branch for verb='scene', so it
+    returned {} and _dispatch_one refused every scene with "nothing to do" —
+    though the scene verb, discovery type, and "Scene running" summary all
+    exist. A scene must emit a kwarg that drives dispatch."""
+
+    def test_scene_verb_emits_a_kwarg(self):
+        from core.smart_home_router import _action_to_kwargs
+        kw = _action_to_kwargs({"verb": "scene"})
+        self.assertTrue(kw, "scene must emit a kwarg so dispatch doesn't refuse")
+        self.assertIs(kw.get("on"), True,
+                      "an Alexa scene activates by turning its entity ON")
+
+    def test_dispatch_does_not_refuse_a_scene(self):
+        from core import smart_home_router as r
+        # With a kwarg present, _dispatch_one must get past the
+        # "nothing to do" short-circuit. Route it to a stub Alexa path.
+        dev = {"name": "Movie", "brand": "alexa", "alexa_entity_id": "e1"}
+        with mock.patch.object(r, "_controller_for", return_value=None), \
+             mock.patch.object(r, "_log_missing_brand"), \
+             mock.patch.object(r, "_alexa_set_state",
+                               return_value={"ok": True, "path": "alexa"}) as ax:
+            out = r._dispatch_one(dev, {"verb": "scene"})
+        ax.assert_called_once()
+        self.assertNotIn("nothing to do", str(out))
+
+
+class AudioProcessorLoopbackStatsTests(unittest.TestCase):
+    """Bug-hunt #17. process() wrote the mic-only raw-RMS / rms-history stats
+    unconditionally, so the LOOPBACK (system-audio) path polluted the silent-mic
+    detector and stress proxy — loud playback made a dead mic look "audible"."""
+
+    def test_process_accepts_record_mic_stats_flag(self):
+        import inspect
+        from core import audio_processor
+        sig = inspect.signature(audio_processor.AudioProcessor.process)
+        self.assertIn("record_mic_stats", sig.parameters)
+        self.assertIs(sig.parameters["record_mic_stats"].default, True,
+                      "default True preserves the real-mic path")
+
+    def test_loopback_caller_passes_false(self):
+        with open(os.path.join(_PROJECT, "skills", "ambient_listen.py"),
+                  encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("record_mic_stats=False", src,
+                      "the loopback call must suppress mic-only stats")
+
+
+class EmailTriageIsBoundedTests(unittest.TestCase):
+    """Bug-hunt #16. categorize_inbox/email_briefing ran an unbounded loop of
+    un-retry-capped Claude calls on the voice/dispatch thread — up to 50
+    messages x (8s x SDK-default-2-retries) = minutes of freeze."""
+
+    def test_clients_cap_retries(self):
+        with open(os.path.join(_PROJECT, "skills", "email_triage.py"),
+                  encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertNotIn("anthropic.Anthropic()", src,
+                         "raw uncapped clients (SDK default max_retries=2) on "
+                         "the voice thread must be gone")
+        self.assertIn("max_retries=1", src)
+
+    def test_batch_loops_have_a_wall_clock_deadline(self):
+        with open(os.path.join(_PROJECT, "skills", "email_triage.py"),
+                  encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("INBOX_TRIAGE_BUDGET_S", src)
+        # Both synchronous batch loops must consult the deadline.
+        self.assertGreaterEqual(src.count("time.monotonic() >= _deadline"), 2,
+                                "both categorize and briefing loops must bound "
+                                "their per-message Claude calls")
+
+
 if __name__ == "__main__":
     unittest.main()

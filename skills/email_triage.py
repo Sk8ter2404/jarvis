@@ -111,6 +111,9 @@ _log = logging.getLogger(__name__)
 # ─── Config ──────────────────────────────────────────────────────────────
 LLM_MODEL                = "claude-haiku-4-5"
 LLM_TIMEOUT_SECONDS      = 8.0
+# Overall wall-clock budget for the synchronous categorize/briefing loops so a
+# large unread set can't freeze the voice thread for minutes (2026-07-14 #16).
+INBOX_TRIAGE_BUDGET_S    = 45.0
 ENABLE_LLM_TRIAGE        = True
 DEFAULT_LIST_LIMIT       = 8
 MAX_SPOKEN_BODY_CHARS    = 600   # truncate long bodies before TTS
@@ -860,7 +863,11 @@ def _triage_message(msg: dict) -> str | None:
 
     if _claude_ok:
         try:
-            client = anthropic.Anthropic()
+            # max_retries=1: the SDK default is 2, and this runs on the
+            # voice/dispatch thread — an un-capped client turns the 8s
+            # per-attempt timeout into a ~24-40s stall per message.
+            # 2026-07-14 bug-hunt #16.
+            client = anthropic.Anthropic(timeout=LLM_TIMEOUT_SECONDS, max_retries=1)
             resp = client.messages.create(
                 model=LLM_MODEL,
                 max_tokens=8,
@@ -934,7 +941,11 @@ def _generate_draft_reply(thread: dict, user_instructions: str = "") -> str | No
 
     if _claude_ok:
         try:
-            client = anthropic.Anthropic()
+            # max_retries=1: the SDK default is 2, and this runs on the
+            # voice/dispatch thread — an un-capped client turns the 8s
+            # per-attempt timeout into a ~24-40s stall per message.
+            # 2026-07-14 bug-hunt #16.
+            client = anthropic.Anthropic(timeout=LLM_TIMEOUT_SECONDS, max_retries=1)
             resp = client.messages.create(
                 model=LLM_MODEL,
                 max_tokens=600,
@@ -1211,7 +1222,16 @@ def action_categorize_inbox(arg: str = "") -> str:
     _save_inbox_index(messages)
     counts = {v: 0 for v in LLM_VERDICTS}
     processed = 0
+    # Wall-clock deadline (2026-07-14 bug-hunt #16). This runs synchronously on
+    # the voice/dispatch thread and _triage_message makes a per-message Claude
+    # call; up to 50 messages x ~16s each is a many-minute freeze. Stop
+    # triaging once the budget is spent and report what we got through.
+    _deadline = time.monotonic() + INBOX_TRIAGE_BUDGET_S
+    truncated = False
     for m in messages:
+        if time.monotonic() >= _deadline:
+            truncated = True
+            break
         verdict = _triage_message(m)
         if verdict is None:
             continue
@@ -1222,7 +1242,9 @@ def action_categorize_inbox(arg: str = "") -> str:
         return ("Triaged nothing, sir — set ANTHROPIC_API_KEY and install "
                 "the anthropic SDK to enable the classifier.")
     summary = ", ".join(f"{counts[v]} {v}" for v in LLM_VERDICTS if counts[v])
-    return f"Triaged {processed} messages, sir — {summary}."
+    tail = (f" (stopped at {processed} to stay responsive — say 'categorize "
+            f"inbox' again for the rest)" if truncated else "")
+    return f"Triaged {processed} messages, sir — {summary}.{tail}"
 
 
 def action_email_briefing(_: str = "") -> str:
@@ -1235,7 +1257,10 @@ def action_email_briefing(_: str = "") -> str:
     _save_inbox_index(messages)
     urgent: list[dict] = []
     other_counts = {"fyi": 0, "newsletter": 0, "spam": 0, "unclassified": 0}
+    _deadline = time.monotonic() + INBOX_TRIAGE_BUDGET_S   # voice-thread bound (#16)
     for m in messages:
+        if time.monotonic() >= _deadline:
+            break
         verdict = _triage_message(m)
         if verdict == "urgent":
             urgent.append(m)

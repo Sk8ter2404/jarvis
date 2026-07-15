@@ -615,6 +615,16 @@ def _action_to_kwargs(action: dict) -> dict[str, Any]:
         out["locked"] = True
     elif verb == "unlock":
         out["locked"] = False
+    elif verb == "scene":
+        # Scene activation was DEAD (2026-07-14 bug-hunt #11): no branch emitted
+        # a kwarg, so _action_to_kwargs returned {} and _dispatch_one refused
+        # with "nothing to do" — even though the scene verb, the discovery
+        # type='scene', and the "Scene running" summary all exist. An Alexa
+        # scene is activated by turning its entity ON (set_appliance_state
+        # entity "ON"), so `on=True` drives it through the existing dispatch/
+        # Alexa path. `on` is a standard kwarg every set_state accepts, so this
+        # is safe even if the device unexpectedly routes to a brand skill.
+        out["on"] = True
     if "brightness" in action and action["brightness"] is not None:
         out["brightness"] = int(action["brightness"])
         out.setdefault("on", out.get("on", True) if action.get("brightness", 0) > 0 else False)

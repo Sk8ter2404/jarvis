@@ -277,8 +277,15 @@ class AudioProcessor:
         enable_aec: bool = True,
         enable_ns: bool = True,
         enable_agc: bool = True,
+        record_mic_stats: bool = True,
     ) -> np.ndarray:
         """Run the three-layer pipeline on a mono float32 chunk.
+
+        `record_mic_stats=False` suppresses the raw-RMS / rms-history writes that
+        feed the silent-mic health detector and the mic-only stress proxy. Set
+        it False on the LOOPBACK (system-audio) path — otherwise media/TTS
+        loudness pollutes those mic-only stats: a silent mic during loud playback
+        would look "audible", masking a genuinely dead mic. 2026-07-14 bug-hunt.
 
         Any stage that raises is skipped — the chunk passes through
         whatever stages succeed. Never returns None for a non-empty
@@ -297,13 +304,16 @@ class AudioProcessor:
 
         # Capture pre-processing RMS for diagnostics (silent-mic detection
         # consumes this via note_raw_rms() / seconds_since_audible_chunk()).
-        try:
-            raw_rms = float(np.sqrt(np.mean(x * x))) if x.size else 0.0
-            with self._stats_lock:
-                self._last_raw_rms = raw_rms
-            note_raw_rms(raw_rms)
-        except Exception:
-            pass
+        # ONLY for the real mic — the loopback path passes record_mic_stats=False
+        # so system-audio loudness can't masquerade as mic input (#17).
+        if record_mic_stats:
+            try:
+                raw_rms = float(np.sqrt(np.mean(x * x))) if x.size else 0.0
+                with self._stats_lock:
+                    self._last_raw_rms = raw_rms
+                note_raw_rms(raw_rms)
+            except Exception:
+                pass
 
         # All three stage wrappers use BaseException + _safe_exc so a
         # numpy / C-extension exception with a corrupted __str__ can't
@@ -345,7 +355,7 @@ class AudioProcessor:
             rms = float(np.sqrt(np.mean(x * x))) if x.size else 0.0
             with self._stats_lock:
                 self._last_proc_rms = rms
-            if rms > 0.0:
+            if record_mic_stats and rms > 0.0:
                 ts = time.time()
                 cutoff = ts - self._rms_history_window_s
                 with self._rms_history_lock:

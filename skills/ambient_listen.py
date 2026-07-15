@@ -191,12 +191,15 @@ def _apply_audio_processing(audio: np.ndarray,
                             *,
                             enable_aec: bool = True,
                             enable_ns: bool = True,
-                            enable_agc: bool = True) -> np.ndarray:
+                            enable_agc: bool = True,
+                            record_mic_stats: bool = True) -> np.ndarray:
     """Best-effort: route a batch through core/audio_processor before it
     reaches Whisper. Falls back to the raw batch if the module isn't
     importable, the parent has disabled processing, or any layer fails.
     Loopback callers pass enable_aec=False — the loopback signal IS the
-    speaker output, so echo cancellation would zero useful audio."""
+    speaker output, so echo cancellation would zero useful audio — and
+    record_mic_stats=False so system-audio loudness doesn't pollute the
+    mic-only silent-mic / stress stats (2026-07-14 bug-hunt #17)."""
     b = _get_bobert()
     if b is not None and not bool(getattr(b, "_audio_master_enabled", [True])[0]):
         return audio
@@ -209,6 +212,7 @@ def _apply_audio_processing(audio: np.ndarray,
             enable_aec=enable_aec,
             enable_ns=enable_ns,
             enable_agc=enable_agc,
+            record_mic_stats=record_mic_stats,
         )
     except Exception as e:
         print(f"  [ambient-listen] audio-proc fallthrough: {e}")
@@ -1182,7 +1186,8 @@ def _audio_worker_loop() -> None:
             audio = _apply_audio_processing(audio, sample_rate,
                                             enable_aec=False,
                                             enable_agc=False,
-                                            enable_ns=False)
+                                            enable_ns=False,
+                                            record_mic_stats=False)
 
             try:
                 text, conf = transcribe(audio)
