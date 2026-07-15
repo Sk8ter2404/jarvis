@@ -1785,5 +1785,96 @@ class ThinkingLabelShowsResolvedModelTests(unittest.TestCase):
         self.assertNotIn("llama3", label)
 
 
+@requires_monolith
+class StreamingVerifyPinsMonitorTests(unittest.TestCase):
+    """Bug-hunt #13. _streaming_verify_playback took a whole-desktop screenshot
+    (monitors[0]) while the click path captured just the player's monitor — so
+    on multi-monitor the verify vision false-negatived and the last-resort
+    media-playpause PAUSED the autoplaying video. The verify capture must use
+    the same monitor pin the click path does."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def test_verify_passes_the_monitor_to_take_screenshot(self):
+        bc = self.bc
+        seen = {}
+        with mock.patch.object(bc, "take_screenshot",
+                               side_effect=lambda m=None: seen.setdefault("mon", m) or b"png"), \
+             mock.patch.object(bc, "ask_vision", return_value="YES it is playing"), \
+             mock.patch.object(bc, "_vision_answer_is_yes", return_value=True):
+            bc._streaming_verify_playback("playing?", monitor="right")
+        self.assertEqual(seen.get("mon"), "right",
+                         "verify must capture the SAME monitor the click path used")
+
+    def test_confirm_threads_cfg_vision_monitor(self):
+        bc = self.bc
+        seen = {}
+        cfg = {"title_confirm": False, "vision_monitor": "left",
+               "verify_question": "is it playing?", "service_key": "youtube"}
+
+        def _fake_verify(q, monitor=None):
+            seen["mon"] = monitor
+            return (True, "YES")
+
+        with mock.patch.object(bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(bc, "_vision_click_backend_available", return_value=True), \
+             mock.patch.object(bc, "_streaming_title_confirms_playback",
+                               return_value=(False, "no title")), \
+             mock.patch.object(bc, "_streaming_verify_playback",
+                               side_effect=_fake_verify):
+            bc._streaming_confirm_playback(cfg, "is it playing?")
+        self.assertEqual(seen.get("mon"), "left")
+
+
+@requires_monolith
+class AppleMusicConfirmScopedToWindowTests(unittest.TestCase):
+    """Bug-hunt #14. _apple_music_title_now_playing scanned EVERY browser window,
+    so a user's own second Apple Music tab (still showing an earlier track)
+    false-confirmed — JARVIS reported "playing <requested>" while the requested
+    track never started. The confirm path must scope to the recorded media
+    window's hwnd."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def _win(self, hwnd, title):
+        w = mock.Mock()
+        w._hWnd = hwnd
+        w.title = title
+        return w
+
+    def test_only_hwnd_ignores_other_windows(self):
+        bc = self.bc
+        import types as _types
+        # A stale OTHER Apple Music tab (hwnd 111) plus our window (hwnd 222,
+        # no track yet). Scoped to 222, the stale 111 must be ignored.
+        wins = [self._win(111, "Old Song — Old Artist - Google Chrome"),
+                self._win(222, "Apple Music - Google Chrome")]
+        fake_gw = _types.SimpleNamespace(getAllWindows=lambda: wins)
+        with mock.patch.dict(sys.modules, {"pygetwindow": fake_gw}):
+            scoped = bc._apple_music_title_now_playing(only_hwnd=222)
+            unscoped = bc._apple_music_title_now_playing()
+        self.assertIsNone(scoped,
+                          "a stale OTHER Apple Music tab must not confirm our request")
+        # Unscoped still sees the stale tab (the now_playing action wants any tab).
+        self.assertIsNotNone(unscoped)
+
+
+class YoutubeDirectDoesNotOverclaimTests(unittest.TestCase):
+    """Bug-hunt #22. youtube_search_direct did NO playback verification yet
+    claimed "video is now playing, no further action needed" — false success on
+    an unavailable/age-gated video, and the phrasing suppressed correction."""
+
+    def test_no_false_playing_claim(self):
+        with open(os.path.join(_PROJECT, "skills", "youtube_search.py"),
+                  encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertNotIn("video is now playing, no further action needed", src)
+        self.assertNotIn("no further action needed", src)
+
+
 if __name__ == "__main__":
     unittest.main()

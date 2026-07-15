@@ -245,10 +245,13 @@ def youtube_search_direct(query: str) -> str:
     # Brief settle so any follow-up see_screen captures the player and not
     # a blank tab. Mirrors the timing used by _act_web_search / _act_youtube.
     time.sleep(3.0)
-    return (
-        f"opened {url} (resolved via yt-dlp for '{query}') — video is now "
-        f"playing, no further action needed"
-    )
+    # State only what actually happened — this fast-path deliberately does NO
+    # playback verification (that's youtube_play's job), so it must not assert
+    # the video is playing or that nothing more is needed; that phrasing
+    # suppressed the user's correction when the video was unavailable /
+    # age-gated / region-blocked. 2026-07-14 bug-hunt.
+    return (f"opened {url} on YouTube (resolved via yt-dlp for '{query}') — "
+            f"it should start playing now, sir.")
 
 
 def register(actions: dict) -> None:

@@ -13503,11 +13503,19 @@ def _parse_apple_music_track_title(raw: str) -> str | None:
     return t
 
 
-def _apple_music_title_now_playing() -> str | None:
+def _apple_music_title_now_playing(only_hwnd: int | None = None) -> str | None:
     """Scan BROWSER window titles for an actively-playing Apple Music track and
     return its "<Song> — <Artist>" string, or None if nothing is clearly
     playing. Deterministic (no vision, no screenshot) — used both by the
-    playback-confirmation path and by the now_playing action."""
+    playback-confirmation path and by the now_playing action.
+
+    `only_hwnd` scopes the scan to a SINGLE window (the one JARVIS opened for
+    this request, recorded in _JARVIS_MEDIA_WINDOW_HWND). Without it the
+    playback-confirm scanned EVERY browser window, so a user's own second Apple
+    Music tab still showing an earlier track would false-confirm — JARVIS would
+    report "playing <requested>" while the requested track never started. None
+    keeps the whole-desktop scan (the now_playing action wants any tab).
+    2026-07-14 bug-hunt."""
     try:
         import pygetwindow as gw
     except Exception:
@@ -13517,6 +13525,8 @@ def _apple_music_title_now_playing() -> str | None:
     except Exception:
         return None
     for w in windows:
+        if only_hwnd is not None and getattr(w, "_hWnd", None) != only_hwnd:
+            continue
         title = (getattr(w, "title", "") or "").strip()
         if not title:
             continue
@@ -13576,21 +13586,35 @@ def _streaming_title_confirms_playback(cfg: dict) -> tuple[bool, str]:
     the vision check."""
     if not cfg.get("title_confirm"):
         return False, "title-confirm not supported for this service"
-    track = _apple_music_title_now_playing()
+    # Scope the confirm to the window JARVIS opened for THIS request, so a
+    # user's own second Apple Music tab can't false-confirm (2026-07-14). When
+    # we have no recorded hwnd (rare — pre-record failure) fall back to the
+    # whole-desktop scan rather than never confirming.
+    _hwnd = _JARVIS_MEDIA_WINDOW_HWND.get(cfg.get("service_key"))
+    track = _apple_music_title_now_playing(only_hwnd=_hwnd)
     if track:
         return True, f"tab title shows now-playing track: {track}"
-    return False, "no now-playing track in any window title yet"
+    return False, "no now-playing track in the media window title yet"
 
 
-def _streaming_verify_playback(verify_question: str) -> tuple[bool, str]:
+def _streaming_verify_playback(verify_question: str,
+                               monitor: str | None = None) -> tuple[bool, str]:
     """Take a fresh screenshot and ask vision whether playback is actually
     happening. Returns (is_playing, raw_answer). Vision-failures collapse
     to (False, error_text) so the caller retries the play click.
 
+    `monitor` pins the capture to the SAME monitor the click path photographed
+    (cfg['vision_monitor']). Without it, verify captured monitors[0] (the whole
+    virtual desktop on a multi-monitor rig) while the click path captured just
+    the player's monitor — so on multi-monitor the verify vision false-
+    negatived, and the caller's last-resort media-playpause then PAUSED the
+    video that was in fact autoplaying. None → whole-desktop, the prior
+    single-monitor behaviour. 2026-07-14 bug-hunt.
+
     NOTE: this is now the FALLBACK confirmation. The primary, deterministic
     check is _streaming_title_confirms_playback (browser tab title); vision
     is only consulted when the title is inconclusive."""
-    png = take_screenshot()
+    png = take_screenshot(monitor)
     if png is None:
         return False, "could not capture screen"
     answer = ask_vision(verify_question, png)
@@ -13684,7 +13708,8 @@ def _streaming_confirm_playback(cfg: dict, verify_q: str) -> tuple[bool, str]:
     vision_ok = (SCREEN_VISION_ENABLED and _vision_click_backend_available())
     if not vision_ok:
         return False, f"{title_detail}; vision fallback unavailable"
-    is_playing, vision_answer = _streaming_verify_playback(verify_q)
+    is_playing, vision_answer = _streaming_verify_playback(
+        verify_q, monitor=cfg.get("vision_monitor"))
     snippet = (vision_answer or "").strip().splitlines()
     snippet = snippet[0][:120] if snippet else "no answer"
     return is_playing, f"vision: {snippet}"
