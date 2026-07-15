@@ -999,14 +999,16 @@ class ProcessUpdateEdgeTests(unittest.TestCase):
             self.mod._process_update(upd, whitelist={42})
         disp.assert_not_called()
 
-    def test_empty_whitelist_allows_through(self):
-        # whitelist falsy → the `whitelist and ...` guard is skipped, message
-        # is processed (the loop warns separately but does not block here).
-        with mock.patch.object(self.mod, "_dispatch_remote",
-                               return_value="done, sir.") as disp, \
+    def test_empty_whitelist_rejects_everyone(self):
+        # 2026-07-14 bug-hunt: this test previously ASSERTED the bypass as
+        # correct ("empty whitelist allows through") — green-by-mock pinning a
+        # real auth hole. An empty whitelist means "deny all" (see
+        # _telegram_whitelist's docstring), so an unwhitelisted message must be
+        # rejected and NEVER reach _dispatch_remote.
+        with mock.patch.object(self.mod, "_dispatch_remote") as disp, \
              mock.patch.object(self.mod, "_send_telegram", return_value=True):
             self.mod._process_update(self._update(5, 5, "hello"), whitelist=set())
-        disp.assert_called_once_with("hello")
+        disp.assert_not_called()
 
     def test_chat_id_in_whitelist_even_if_user_not(self):
         # Group chats: user_id may differ but chat_id is whitelisted.

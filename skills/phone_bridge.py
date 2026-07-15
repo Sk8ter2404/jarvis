@@ -723,10 +723,19 @@ def _telegram_polling_loop() -> None:
         return
     whitelist = _telegram_whitelist()
     if not whitelist:
+        # FAIL CLOSED (2026-07-14 bug-hunt). An empty whitelist means "no inbound
+        # allowed" (see _telegram_whitelist's docstring) — so we must NOT poll.
+        # The old code only warned and fell through to the polling loop, and the
+        # per-message guard below (`if whitelist and ...`) short-circuits to
+        # False on an empty set, so EVERY message from ANY Telegram user was
+        # dispatched to _dispatch_remote — arbitrary JARVIS actions (lights,
+        # email, the LLM) with no auth. The whitelist is the ONLY inbound
+        # boundary; refuse to start until it's set.
         _log.warning("[phone] TELEGRAM_BOT_TOKEN set but TELEGRAM_USER_ID is "
-                     "empty — inbound is disabled until you whitelist a chat.")
+                     "empty — inbound STAYS OFF until you whitelist a chat.")
         with _state_lock:
             _status["last_error"] = "no TELEGRAM_USER_ID whitelist"
+        return
 
     try:
         import requests  # type: ignore
@@ -805,7 +814,10 @@ def _process_update(upd: dict, whitelist: set[int]) -> None:
         return
     if not isinstance(chat_id, int):
         return
-    if whitelist and user_id not in whitelist and chat_id not in whitelist:
+    # Reject when the whitelist is EMPTY too (2026-07-14 bug-hunt): `if whitelist
+    # and ...` let an empty set short-circuit to False and admit everyone. An
+    # empty whitelist is "deny all", never "allow all".
+    if not whitelist or (user_id not in whitelist and chat_id not in whitelist):
         _log.warning("[phone] rejected message from unauthorised user_id=%s "
                      "chat_id=%s", user_id, chat_id)
         try:

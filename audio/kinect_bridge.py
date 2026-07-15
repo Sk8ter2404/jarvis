@@ -404,14 +404,29 @@ def get_runtime() -> tuple[Any, Optional[str]]:
         return None, _open_error[0]
     rt, err = _open_runtime_locked()
     if rt is None and err:
-        _open_error[0] = err
-        # Disabled-by-config is cheap to re-check; only a REAL failed open
-        # (import error / open error / wedged no-frames verify) earns the
-        # long cooldown — the no-frames case is the expensive one.
-        cool = _WEDGED_CACHE_SEC if "no frames" in err else _NEGATIVE_CACHE_SEC
-        if "disabled" not in err:
-            _negative_until[0] = time.monotonic() + cool
+        _publish_open_failure(err)
     return rt, err
+
+
+def _publish_open_failure(err: str) -> None:
+    """Record a failed open into the SHARED negative-cache cells, picking the
+    right cooldown. Both get_runtime() and available() go through here so the
+    cooldown policy can't diverge between them.
+
+    This existed inline in get_runtime() only; available() had its own copy that
+    ALWAYS wrote the short _NEGATIVE_CACHE_SEC — so on a WEDGED sensor (opens but
+    streams no frames) an available() call (fired ~30 Hz by the air-mouse /
+    two-hand pollers, and on the voice thread by kinect_status / who_is_here /
+    air_mouse_on) would overwrite get_runtime()'s intended 90 s wedged cooldown
+    with 5 s, re-arming the ~16 s open gauntlet every few seconds and letting it
+    land back on the voice loop. Disabled-by-config is cheap to re-check, so it
+    earns no cooldown; only a real failed open (import/open error, or the
+    expensive wedged no-frames verify) does. 2026-07-14 bug-hunt."""
+    _open_error[0] = err
+    if "disabled" in err:
+        return
+    cool = _WEDGED_CACHE_SEC if "no frames" in err else _NEGATIVE_CACHE_SEC
+    _negative_until[0] = time.monotonic() + cool
 
 
 def available() -> tuple[bool, str]:
@@ -432,8 +447,10 @@ def available() -> tuple[bool, str]:
     rt, err = _open_runtime_locked()
     if rt is not None:
         return True, ""
-    _open_error[0] = err or "Kinect unavailable"
-    _negative_until[0] = now + _NEGATIVE_CACHE_SEC
+    # Shared cooldown policy — a wedged (no-frames) open earns the long
+    # _WEDGED_CACHE_SEC here too, so an available() call can't stomp the 90 s
+    # cooldown get_runtime() set down to 5 s. 2026-07-14 bug-hunt.
+    _publish_open_failure(err or "Kinect unavailable")
     return False, _open_error[0]
 
 

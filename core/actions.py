@@ -2009,10 +2009,18 @@ def _act_which_monitor(_: str = "") -> str:
     if not visible_indexes:
         return "user is not visible to any camera — can't determine monitor"
 
-    cam_sides = {
-        cam["index"]: ("left" if cam["look_x"] < 0.5 else "right")
-        for cam in CAMERAS
-    }
+    # Use the monolith's canonical side rule (label-first, look_x<=0.5 = left),
+    # not a raw `look_x < 0.5` — that was the 4th surviving copy of the stale
+    # rule the other three call sites already migrated off, and it mislabels the
+    # live LEFT camera whose look_x is exactly 0.5. 2026-07-14 bug-hunt.
+    _side = getattr(bc, "_percam_side", None)
+    if callable(_side):
+        cam_sides = {cam["index"]: _side(cam) for cam in CAMERAS}
+    else:
+        cam_sides = {
+            cam["index"]: ("left" if cam.get("look_x", 0.5) <= 0.5 else "right")
+            for cam in CAMERAS
+        }
     sides_seen = {cam_sides[i] for i in visible_indexes}
 
     if sides_seen == {"left"}:

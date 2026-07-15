@@ -88,6 +88,19 @@ def _base_bc(tmpdir=None):
     bc.CLAUDE_MODEL = "claude-sonnet-5"
     bc.OLLAMA_MODEL = "gemma4:12b"
     bc._get_local_llm_model.return_value = "gemma4:12b"
+
+    # Faithful _percam_side (label-first, look_x<=0.5=left) — the monolith's
+    # canonical camera-side rule. A bare Mock would make bc._percam_side a
+    # callable that returns a Mock (not "left"/"right"), silently breaking any
+    # handler that now routes through it (e.g. _act_which_monitor). 2026-07-14.
+    def _percam_side(cam):
+        lbl = str(cam.get("label", "")).lower()
+        if "left" in lbl:
+            return "left"
+        if "right" in lbl:
+            return "right"
+        return "left" if cam.get("look_x", 0.5) <= 0.5 else "right"
+    bc._percam_side = _percam_side
     return bc
 
 

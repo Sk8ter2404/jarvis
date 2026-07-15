@@ -1548,5 +1548,149 @@ class GenActionIndexCoversPackagesAndAliasesTests(unittest.TestCase):
                         f"not '?': {rows}")
 
 
+# ═════════════════════════════════════════════════════════════════════════
+#  FRESH BUG-HUNT (2026-07-14, post all-45-closed) — confirmed NEW defects
+# ═════════════════════════════════════════════════════════════════════════
+
+class TelegramWhitelistFailsClosedTests(unittest.TestCase):
+    """Bug-hunt HIGH #2 + green-by-mock #16. An empty TELEGRAM_USER_ID whitelist
+    means "deny all" (per _telegram_whitelist's docstring). But _process_update
+    guarded with `if whitelist and ...`, so an empty set short-circuited to False
+    and admitted EVERYONE straight into _dispatch_remote — arbitrary JARVIS
+    actions from any Telegram user. A unit test even PINNED the bypass as
+    correct. The whitelist is the only inbound auth boundary; it must fail
+    closed."""
+
+    def setUp(self):
+        self.mod, _actions = load_skill_isolated("phone_bridge")
+
+    def _update(self, uid, cid, text):
+        return {"update_id": 1, "message": {
+            "text": text, "chat": {"id": cid}, "from": {"id": uid}}}
+
+    def test_empty_whitelist_rejects_and_does_not_dispatch(self):
+        mod = self.mod
+        with mock.patch.object(mod, "_dispatch_remote") as disp, \
+             mock.patch.object(mod, "_send_telegram", return_value=True):
+            mod._process_update(self._update(5, 5, "turn on the lights"),
+                                whitelist=set())
+        disp.assert_not_called()
+
+    def test_whitelisted_user_still_dispatches(self):
+        mod = self.mod
+        with mock.patch.object(mod, "_dispatch_remote",
+                               return_value="done") as disp, \
+             mock.patch.object(mod, "_send_telegram", return_value=True):
+            mod._process_update(self._update(42, 42, "status"), whitelist={42})
+        disp.assert_called_once()
+
+    def test_unwhitelisted_user_with_nonempty_list_rejected(self):
+        mod = self.mod
+        with mock.patch.object(mod, "_dispatch_remote") as disp, \
+             mock.patch.object(mod, "_send_telegram", return_value=True):
+            mod._process_update(self._update(999, 999, "hi"), whitelist={42})
+        disp.assert_not_called()
+
+
+class KinectWedgedCooldownSharedTests(unittest.TestCase):
+    """Bug-hunt HIGH #1. available() and get_runtime() share the negative-cache
+    cells, but available() ALWAYS wrote the short 5s cooldown while get_runtime()
+    correctly applied the 90s WEDGED cooldown for a no-frames open. So an
+    available() call (fired ~30Hz by the air-mouse/two-hand pollers and on the
+    voice thread by kinect_status) re-armed the ~16s open gauntlet every few
+    seconds, defeating the cooldown that keeps a wedged sensor off the voice
+    loop. Both now go through one shared _publish_open_failure."""
+
+    def setUp(self):
+        from audio import kinect_bridge as kb
+        self.kb = kb
+        self._enabled = kb._ENABLED
+        self._rt = kb._runtime[0]
+        self._nu = kb._negative_until[0]
+        self._oe = kb._open_error[0]
+        kb._ENABLED = True
+        kb._runtime[0] = None
+        kb._negative_until[0] = 0.0
+        kb._open_error[0] = None
+
+    def tearDown(self):
+        kb = self.kb
+        kb._ENABLED = self._enabled
+        kb._runtime[0] = self._rt
+        kb._negative_until[0] = self._nu
+        kb._open_error[0] = self._oe
+
+    def test_available_uses_wedged_cooldown_for_no_frames(self):
+        import time as _t
+        kb = self.kb
+        wedged = (None, "Kinect opened but streamed no frames after 4 attempts")
+        with mock.patch.object(kb, "_open_runtime_locked", return_value=wedged):
+            ok, _err = kb.available()
+        self.assertFalse(ok)
+        remaining = kb._negative_until[0] - _t.monotonic()
+        # Must be near the 90s wedged cooldown, NOT the 5s short one.
+        self.assertGreater(remaining, kb._NEGATIVE_CACHE_SEC + 5,
+                           "available() must honour the long wedged cooldown so "
+                           "it can't stomp get_runtime()'s 90s value down to 5s")
+        self.assertLessEqual(remaining, kb._WEDGED_CACHE_SEC + 1)
+
+    def test_available_uses_short_cooldown_for_plain_failure(self):
+        import time as _t
+        kb = self.kb
+        with mock.patch.object(kb, "_open_runtime_locked",
+                               return_value=(None, "could not open Kinect sensor")):
+            kb.available()
+        remaining = kb._negative_until[0] - _t.monotonic()
+        self.assertLessEqual(remaining, kb._NEGATIVE_CACHE_SEC + 1)
+
+    def test_disabled_earns_no_cooldown(self):
+        kb = self.kb
+        kb._negative_until[0] = 0.0
+        with mock.patch.object(kb, "_open_runtime_locked",
+                               return_value=(None, "Kinect is disabled")):
+            kb.available()
+        self.assertEqual(kb._negative_until[0], 0.0,
+                         "disabled-by-config is cheap to re-check; no cooldown")
+
+
+class WhichMonitorUsesCanonicalSideTests(unittest.TestCase):
+    """Bug-hunt #9. _act_which_monitor used a raw `look_x < 0.5` — the 4th copy
+    of the rule the other three call sites migrated off. It ignores the camera
+    LABEL and sends look_x==0.5 (the live LEFT cam's value) to the wrong side.
+    Must use the monolith's canonical _percam_side (label-first, <=0.5)."""
+
+    def _percam_side(self, cam):
+        # Faithful copy of bobert_companion._percam_side (label-first, <=0.5)
+        # so the test needs no heavy monolith import.
+        lbl = str(cam.get("label", "")).lower()
+        if "left" in lbl:
+            return "left"
+        if "right" in lbl:
+            return "right"
+        return "left" if cam.get("look_x", 0.5) <= 0.5 else "right"
+
+    def test_label_wins_over_look_x(self):
+        import threading
+        import types as _types
+        cams = [{"index": 2, "label": "Left webcam (left monitor)", "look_x": 0.9},
+                {"index": 0, "label": "Right webcam", "look_x": 0.1}]
+        bc = mock.Mock()
+        bc._percam_side = self._percam_side
+        bc._camera_state_lock = threading.Lock()
+        bc._camera_last_seen = {2: 9e18, 0: 0.0}   # only index 2 is visible
+        bc._camera_latest_frame = {2: None}
+        fake_cv2 = _types.SimpleNamespace()
+        with mock.patch.object(A, "_bc", return_value=bc), \
+             mock.patch.object(A, "_kinect_gaze_which_monitor", return_value=None), \
+             mock.patch("core.config.CAMERAS", cams), \
+             mock.patch("core.config.MONITORS", ["left", "right", "top"]), \
+             mock.patch.dict(sys.modules, {"cv2": fake_cv2}):
+            out = A._act_which_monitor("")
+        # Visible only to index 2, whose LABEL says left — despite look_x=0.9
+        # which the old raw `look_x < 0.5` rule would have called "right".
+        self.assertIn("LEFT", out.upper(),
+                      f"label-first side rule must win over look_x: {out!r}")
+
+
 if __name__ == "__main__":
     unittest.main()
