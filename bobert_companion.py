@@ -11280,6 +11280,19 @@ def _barge_in_wake_enabled() -> bool:
         return False
 
 
+# A non-acoustic barge-in (Kinect hand-swipe, web stop, tray) that cuts the
+# BOOT greeting mid-synthesis races the still-initialising audio/CUDA stack.
+# Observed 2026-07-15: a phantom hand-track swipe fired during a freshly
+# restarted successor's session-resume greeting, the main loop stalled 100s, and
+# the process VANISHED with no Python traceback — the signature of a native crash
+# (same class as the 0xc0000374 that already forced BARGE_IN_ENABLED off). During
+# this window the owner isn't intentionally gesturing; it's phantom motion. Ignore
+# non-acoustic interrupts for the first N seconds so the greeting plays out. Lines
+# up with the existing 30s boot-window speech throttle (see _speak); a touch
+# longer because the greeting PLAYBACK can extend past 30s.
+_BOOT_BARGE_IN_GRACE_S = 60.0
+
+
 def request_tts_interrupt(source: str = "wake-word",
                           acoustic: bool = True) -> bool:
     """Barge-in entry point, called from skills/wake_listener.py when the
@@ -11316,6 +11329,11 @@ def request_tts_interrupt(source: str = "wake-word",
     if acoustic and not _barge_in_wake_enabled():
         return False
     if not _tts_playback_active[0]:
+        return False
+    if (not acoustic
+            and (time.time() - _session_start_time) < _BOOT_BARGE_IN_GRACE_S):
+        print(f"  [barge-in] ignored during boot grace "
+              f"(source={source}, non-acoustic) — greeting plays out")
         return False
     if acoustic and "jarvis" in (_tts_current_text[0] or ""):
         print(f"  [barge-in] wake hit ignored (own TTS says 'jarvis'), "

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -724,7 +725,9 @@ class GestureInterruptIsNotAcousticTests(unittest.TestCase):
 
     def test_non_acoustic_interrupt_bypasses_the_echo_gate(self):
         bc = self.bc
-        with mock.patch.object(bc, "_tts_playback_active", [True]), \
+        # Past the boot grace (booted 2 min ago) so the steady-state path runs.
+        with mock.patch.object(bc, "_session_start_time", time.time() - 120), \
+             mock.patch.object(bc, "_tts_playback_active", [True]), \
              mock.patch.object(bc, "_tts_current_text",
                                ["certainly sir, jarvis here"]), \
              mock.patch.object(bc, "_tts_interrupt") as ev, \
@@ -735,7 +738,8 @@ class GestureInterruptIsNotAcousticTests(unittest.TestCase):
 
     def test_non_acoustic_interrupt_ignores_the_wake_word_knob(self):
         bc = self.bc
-        with mock.patch.object(bc, "_barge_in_wake_enabled", return_value=False), \
+        with mock.patch.object(bc, "_session_start_time", time.time() - 120), \
+             mock.patch.object(bc, "_barge_in_wake_enabled", return_value=False), \
              mock.patch.object(bc, "_tts_playback_active", [True]), \
              mock.patch.object(bc, "_tts_current_text", ["hello"]), \
              mock.patch.object(bc, "_tts_interrupt") as ev, \
@@ -744,6 +748,21 @@ class GestureInterruptIsNotAcousticTests(unittest.TestCase):
         self.assertTrue(ok, "BARGE_IN_ENABLED is the WAKE-WORD knob; it must "
                             "not silently disable hand gestures")
         ev.set.assert_called_once()
+
+    def test_non_acoustic_interrupt_suppressed_during_boot_grace(self):
+        """A phantom hand-swipe that cuts the BOOT greeting mid-synthesis raced
+        the still-initialising audio/CUDA stack into a native crash (2026-07-15,
+        killed a freshly-restarted successor). Non-acoustic barge-ins are ignored
+        for the first _BOOT_BARGE_IN_GRACE_S seconds; the greeting plays out."""
+        bc = self.bc
+        with mock.patch.object(bc, "_session_start_time", time.time()), \
+             mock.patch.object(bc, "_tts_playback_active", [True]), \
+             mock.patch.object(bc, "_tts_current_text", ["welcome back sir"]), \
+             mock.patch.object(bc, "_tts_interrupt") as ev, \
+             mock.patch.object(bc, "_tts_interrupt_seq", [0]):
+            ok = bc.request_tts_interrupt(source="kinect-swipe", acoustic=False)
+        self.assertFalse(ok, "boot-window non-acoustic barge-in must be ignored")
+        ev.set.assert_not_called()
 
     def test_acoustic_wake_path_is_unchanged(self):
         """The mic-facing gates must survive intact for the wake word."""
