@@ -26,9 +26,19 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Tuple
 
-# A section header in PC_CONTROL_PROMPT: an ALL-CAPS-ish line ending in ':' at
-# (near) column 0. Matches "MUSIC CONTROLS:", "BAMBU 3D PRINTER (H2D):", etc.
-_HEADER_RE = re.compile(r"^([A-Z][A-Z0-9 /&()\.\'\-]{3,50}:)\s*$")
+# A section header in PC_CONTROL_PROMPT: an ALL-CAPS "head" at column 0, ending
+# in ':', OPTIONALLY followed by a lowercase parenthetical BEFORE the colon.
+# The head is captured as the section name; the parenthetical is descriptive only.
+#   "MUSIC CONTROLS:"                                   -> head "MUSIC CONTROLS"
+#   "BAMBU 3D PRINTER (H2D):"                           -> head "BAMBU 3D PRINTER"
+#   "SMART HOME (router across Hue / Govee / LIFX ...):"-> head "SMART HOME"
+#   "SELF-PRESERVATION (CRITICAL — read carefully):"    -> head "SELF-PRESERVATION"
+# CRITICAL: the old regex required the WHOLE line to be uppercase, so it matched
+# only 12 of the ~54 real headers — the other ~42 capability blocks were silently
+# folded into the preceding matched section (bloating it) and vanished from the
+# INDEX safety net. The parenthetical is the dominant header style in prompts.py,
+# so tolerating it is load-bearing, not cosmetic (2026-07-15 review finding).
+_HEADER_RE = re.compile(r"^(?P<head>[A-Z][A-Z0-9 /&.'\-]{2,50})(?:\s*\([^)]*\))?:\s*$")
 
 # Which lowercase keywords pull in each section. Keyed by the section header text
 # (without the trailing colon, upper-cased) — matched leniently by substring of
@@ -43,15 +53,47 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "chrome", "browser", "code", "vscode", "notepad", "explorer", "move",
         "maximize", "minimize", "close", "switch to", "bring up", "pull up",
     ],
+    "WINDOW MANAGEMENT": [
+        "window", "move", "resize", "snap", "tile", "maximize", "minimize",
+        "restore", "left monitor", "right monitor", "fullscreen", "arrange",
+    ],
+    "SCREEN VISION": [
+        "screen", "what's on", "whats on", "looking at", "read the screen",
+        "what do you see", "on my screen", "on screen", "see the screen",
+    ],
+    "WEBCAM AWARENESS": [
+        "camera", "webcam", "see me", "can you see", "pointed at me",
+        "look at me", "how do i look",
+    ],
+    "UNIFIED": ["all cameras", "every camera", "both cameras"],
+    "FACE RECOGNITION": [
+        "who am i", "recognize", "who is at", "who's at", "face",
+        "identify me", "who am i talking",
+    ],
+    "POINT-TO-CONTROL": ["point", "pointing", "that device", "turn that on", "aim at"],
+    "AIR-MOUSE": ["air mouse", "air-mouse", "drive the cursor", "hand mouse", "cursor with my"],
+    "GUARD MODE": ["guard", "security", "intruder", "watch the room", "arm the cameras", "guard mode"],
     "MUSIC CONTROLS": [
         "music", "play", "song", "track", "album", "artist", "playlist",
         "spotify", "apple music", "pause", "resume", "skip", "next", "previous",
         "shuffle", "volume", "louder", "quieter", "youtube", "netflix", "tv",
         "movie", "watch", "stream", "put on", "listen",
     ],
+    "AUDIO OUTPUT DEVICE": [
+        "headset", "headphones", "speakers", "output device", "switch audio",
+        "audio output", "play through", "sound through",
+    ],
+    "LOCAL MODEL SELECTION": [
+        "model", "which model", "local model", "your brain", "ollama", "llm",
+        "what model", "running locally",
+    ],
+    "BARGE-IN": ["interrupt", "barge", "stop talking", "cut you off"],
     "TIMERS / REMINDERS": [
         "timer", "remind", "reminder", "alarm", "wake me", "in a minute",
         "minutes", "seconds", "hour", "countdown", "set a", "alert me",
+    ],
+    "TEAMS CALL SCREENING": [
+        "teams", "call screening", "screen my calls", "screen calls", "meeting",
     ],
     "CLAUDE CREDITS": [
         "claude", "credit", "credits", "api", "quota", "budget", "cost",
@@ -62,9 +104,26 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "temp", "status", "diagnostic", "diagnostics", "how are you running",
         "system", "load", "vram", "fans", "hardware",
     ],
-    "BAMBU 3D PRINTER (H2D)": [
+    "BAMBU 3D PRINTER": [
         "print", "printer", "printing", "bambu", "3d", "filament", "nozzle",
         "bed", "spool", "ams", "h2d", "gcode", "slice",
+    ],
+    "MORNING BRIEFING": [
+        "briefing", "brief me", "morning briefing", "good morning", "my day",
+        "agenda", "what's on today",
+    ],
+    "NEWS BRIEFING": ["news", "headlines", "what's happening", "current events"],
+    "DAILY RECAP": [
+        "recap", "daily recap", "end of day", "summary of my day", "how was my day",
+    ],
+    "DOSSIER": [
+        "dossier", "pull up the file", "file on", "what do you know about",
+        "tell me about",
+    ],
+    "SUIT-UP CINEMATIC": ["suit up", "suit-up", "boot sequence", "cinematic"],
+    "TASK QUEUE": [
+        "task queue", "queue this", "offload", "claude code", "add a task",
+        "todo", "to-do", "build me", "have claude",
     ],
     "SESSION MEMORY RECALL": [
         "remember", "recall", "what did", "earlier", "last time", "before",
@@ -76,22 +135,108 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     ],
     "DO-NOT-DISTURB FOCUS MODE": [
         "focus", "do not disturb", "dnd", "quiet mode", "silence", "mute me",
-        "night owl", "concentrate", "no interruptions", "leave me alone",
+        "concentrate", "no interruptions", "leave me alone",
+    ],
+    "NIGHT-OWL MODE": ["night owl", "late night", "wind down", "dim", "night mode"],
+    "SELF-PRESERVATION": [
+        "shut yourself", "kill you", "turn you off", "stay online",
+        "don't shut down", "preserve yourself", "shut you down",
+    ],
+    "UI AUTOMATION": [
+        "click on", "type into", "automate", "fill in", "press the button",
+        "move the mouse", "click the",
+    ],
+    "CHANGELOG / VERSION": [
+        "version", "what's new", "changelog", "update notes", "your version",
+        "what changed", "what version",
+    ],
+    "SKILLS": ["learn", "teach yourself", "new skill", "teach you", "can you learn"],
+    "SMART HOME": [
+        "light", "lights", "hue", "govee", "lifx", "kasa", "ecobee", "nest",
+        "thermostat", "plug", "bulb", "dim", "brighten", "turn on the",
+        "turn off the", "smart home", "lamp",
+    ],
+    "NETWORK / LAN PRESENCE": [
+        "network", "wifi", "wi-fi", "router", "deco", "who's home", "whos home",
+        "devices online", "lan", "is home", "internet",
+    ],
+    "OBS STUDIO": [
+        "obs", "record", "recording", "stream", "streaming", "scene",
+        "start recording",
+    ],
+    "PYTHON SANDBOX": [
+        "python", "calculate", "run code", "run a script", "compute", "evaluate",
+        "what's the square", "math",
+    ],
+    "IMAGE GENERATION": [
+        "generate an image", "make a picture", "draw me", "image of",
+        "create an image", "sdxl", "picture of", "generate a picture",
+    ],
+    "LOCAL VISION": ["offline vision", "local vision", "vlm"],
+    "PERSONAL RAG": [
+        "my notes", "my files", "search my", "my documents", "in my files",
+        "find in my", "my docs", "my notes about",
     ],
     "TTS BACKEND SWITCHING": [
         "voice", "tts", "speak like", "sound like", "british", "accent",
         "switch voice", "your voice", "talk like", "edge", "clone voice",
+        "kokoro",
     ],
     "VOICE ENROLLMENT / SPEAKER ID": [
         "enroll", "my voice", "learn my voice", "who am i", "speaker",
         "recognize me", "register my voice", "voice id", "identify me",
     ],
+    "PHONE NOTIFICATIONS": [
+        "phone", "notify my phone", "telegram", "ntfy", "pushover", "text me",
+        "send to my phone", "push to my",
+    ],
+    "SCHEDULING": [
+        "schedule", "every day", "cron", "recurring", "remind me every",
+        "trigger when", "when x happens", "each morning", "daily at",
+    ],
+    "MCP TOOLS": ["mcp", "tool server", "model context protocol"],
+    "BROWSER AGENT": [
+        "browse", "web automation", "playwright", "go to the website",
+        "fill the form", "book a", "order online", "navigate to",
+    ],
+    "EMAIL TRIAGE": [
+        "email", "inbox", "gmail", "outlook", "unread", "mail", "my emails",
+    ],
+    "SMART HOME DISCOVERY": [
+        "discover devices", "find my lights", "scan for devices", "find devices",
+    ],
+    "TV DETECTION": ["tv", "television", "is the tv"],
+    "KINECT GAZE TRACKING": ["gaze", "where am i looking", "eye tracking"],
+    "AMAZON ORDER TRACKER": [
+        "amazon", "order", "package", "delivery", "tracking", "my orders",
+        "where's my package", "wheres my package",
+    ],
+    "DECO MESH NETWORK": ["deco", "mesh", "router"],
+    "NOTIFICATION TRIAGE": ["notification", "notifications", "alerts", "my alerts"],
+    "PHONE BRIDGE": ["phone bridge", "my phone"],
+    "SELF DIAGNOSTIC": [
+        "diagnostic", "health check", "self test", "self-diagnostic",
+        "are you ok", "run diagnostics", "check yourself",
+    ],
+    "STABILITY GATE": ["stability", "safe to upgrade", "stability gate"],
+    "WAKE LISTENER": [
+        "wake word", "hey jarvis", "porcupine", "stop listening",
+        "start listening", "listen for",
+    ],
+    "CODE EXECUTOR": ["run python", "execute python", "code executor"],
+    "CUSTOM TTS / XTTS": ["custom voice", "xtts", "clone a voice", "custom tts"],
+    "MCP": ["mcp"],
+    "OBS": ["obs"],
     "BAMBU PRINTER LAN CHECK ALIAS": [
         "print", "printer", "bambu", "3d", "is it printing", "printer online",
     ],
     "REPLAY": [
         "replay", "say again", "repeat that", "come again", "what did you say",
         "one more time",
+    ],
+    "SHUTDOWN ALIASES": [
+        "shut down", "shutdown", "turn off", "go offline", "power down",
+        "restart yourself", "reboot", "sign off",
     ],
 }
 
@@ -129,7 +274,7 @@ def split_pc_control(pc_control: str) -> Tuple[str, List[Tuple[str, str]]]:
         if m:
             if cur_name is not None:
                 sections.append((cur_name, "\n".join(cur_lines)))
-            cur_name = m.group(1).rstrip(":").strip()
+            cur_name = m.group("head").strip()
             cur_lines = [ln]
         else:
             cur_lines.append(ln)

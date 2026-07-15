@@ -79,9 +79,12 @@ class SlimTests(unittest.TestCase):
 
     def test_printer_turn_actually_loads_printer_body(self):
         slim = pr.slim_pc_control("start the 3d printer", FULL)
-        # the section body (not just the index name) must be present
-        self.assertIn("BAMBU 3D PRINTER", slim)
-        self.assertGreater(len(slim), 20000, "printer body is large and included")
+        # the section BODY (its original header line, not just the head name in
+        # the INDEX) must be present — proves the section loaded, not merely
+        # got listed. (Size is no longer a proxy: after the 2026-07-15 header-
+        # regex fix the printer section stopped absorbing 4 unrelated blocks.)
+        self.assertIn("BAMBU 3D PRINTER (H2D):", slim)
+        self.assertGreater(len(slim), 4000, "printer body content is included")
 
     def test_never_raises_returns_full_on_bad_input(self):
         # a prompt with no sections just comes back whole
@@ -97,6 +100,60 @@ class SlimTests(unittest.TestCase):
             total = base + len(pr.slim_pc_control(q, FULL)) // 4 + 800
             self.assertLess(total, 16000,
                             f"{q!r} slim prompt must fit the local window: {total}")
+
+
+class HeaderRegexRegressionTests(unittest.TestCase):
+    """Locks in the 2026-07-15 fix. The header regex used to require the WHOLE
+    line be uppercase, so it matched only 12 of ~54 real headers — the dominant
+    style is 'TITLE (lowercase parenthetical):'. The other ~42 capability blocks
+    were silently folded into the preceding matched section (bloating it) and
+    vanished from BOTH keyword routing and the INDEX safety net. This suite fails
+    if that regression returns."""
+
+    def setUp(self):
+        self.core, self.sections = pr.split_pc_control(FULL)
+        self.names = [n for n, _ in self.sections]
+
+    def test_recognizes_many_sections(self):
+        self.assertGreaterEqual(
+            len(self.sections), 50,
+            "parenthetical headers must be recognized (was a broken 13)")
+
+    def test_recognizes_parenthetical_headers(self):
+        for want in ("SMART HOME", "SCREEN VISION", "SELF-PRESERVATION",
+                     "EMAIL TRIAGE", "IMAGE GENERATION", "AUDIO OUTPUT DEVICE",
+                     "MORNING BRIEFING", "NEWS BRIEFING", "SCHEDULING",
+                     "PHONE NOTIFICATIONS", "BROWSER AGENT", "LOCAL MODEL SELECTION"):
+            self.assertIn(want, self.names, f"{want!r} header not recognized")
+
+    def test_head_name_strips_parenthetical(self):
+        # the section NAME is the uppercase head, not the descriptive paren
+        self.assertIn("BAMBU 3D PRINTER", self.names)
+        self.assertNotIn("BAMBU 3D PRINTER (H2D)", self.names)
+
+    def test_every_section_has_routing_or_is_always(self):
+        # No section may be stranded index-only with zero keywords: a turn that
+        # names the capability must be able to load its full instructions.
+        uncovered = [n for n in self.names
+                     if n.upper() not in pr._ALWAYS and not pr._keywords_for(n)]
+        self.assertEqual(uncovered, [],
+                         f"sections without keyword routing: {uncovered}")
+
+    def test_previously_merged_queries_route_correctly(self):
+        for q, want in (("turn on the living room lights", "SMART HOME"),
+                        ("what's in the news", "NEWS BRIEFING"),
+                        ("what's on my screen", "SCREEN VISION"),
+                        ("check my email", "EMAIL TRIAGE"),
+                        ("switch audio to my headset", "AUDIO OUTPUT DEVICE"),
+                        ("which local model are you using", "LOCAL MODEL SELECTION")):
+            inc, _drop = pr.select_sections(q, self.sections)
+            self.assertIn(want, inc, f"{q!r} should load {want!r}, got {inc}")
+
+    def test_core_preamble_keeps_the_action_grammar(self):
+        # the universal [ACTION: ...] grammar must stay in the always-included
+        # core preamble, not get demoted into a keyword-gated section.
+        self.assertIn("[ACTION:", self.core)
+        self.assertIn("open_url", self.core)
 
 
 if __name__ == "__main__":
