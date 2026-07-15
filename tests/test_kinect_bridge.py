@@ -1769,16 +1769,35 @@ class NonConsumingFallbackTests(_BridgeBase):
         _patch_loader(self, rt)
         kb.get_runtime()
         self.assertTrue(rt.has_new_body_frame())
-        # Seed a cache the fallback can serve, and pretend the pump is alive.
+        # Seed a cache the fallback can serve, and pretend the pump is alive. The
+        # stamp is within _RAW_CACHE_FALLBACK_MAX_SEC (the one-tick race the branch
+        # exists for), so the marginally-stale cache is served rather than [].
         kb._body_cache[0] = [{"id": 5, "joints": {}, "head": None}]
-        kb._body_cache_at[0] = 1.0             # stale stamp (past the fresh window)
+        kb._body_cache_at[0] = kb.time.monotonic()
         with mock.patch.object(kb, "_pump_is_alive", lambda: True):
             got = kb._read_and_cache_bodies(consume=False)
         # The pending frame flag is UNTOUCHED (not stolen from the pump)…
         self.assertTrue(rt.has_new_body_frame())
-        # …and the (even marginally-stale) cache is served rather than [].
+        # …and the fresh-enough cache is served rather than [].
         self.assertEqual(len(got), 1)
         self.assertEqual(got[0]["id"], 5)
+
+    def test_fallback_ages_out_a_departed_body(self):
+        # GHOST FIX (2026-07-15): a stalled-but-alive pump must NOT let the raw-cache
+        # fallback keep serving a body dropped seconds ago. Past
+        # _RAW_CACHE_FALLBACK_MAX_SEC the fallback reports [] (no phantom), while
+        # still leaving the pending frame for the pump.
+        rt = _FakeRuntime(bodies=[_FakeBody(True, {"head": (0, 0.6, 1.8)})])
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        self.assertTrue(rt.has_new_body_frame())
+        kb._body_cache[0] = [{"id": 5, "joints": {}, "head": None}]
+        kb._body_cache_at[0] = (kb.time.monotonic()
+                                - (kb._RAW_CACHE_FALLBACK_MAX_SEC + 1.0))
+        with mock.patch.object(kb, "_pump_is_alive", lambda: True):
+            got = kb._read_and_cache_bodies(consume=False)
+        self.assertTrue(rt.has_new_body_frame())   # frame still left for the pump
+        self.assertEqual(got, [])                  # departed body aged out
 
     def test_fallback_reads_directly_when_no_pump(self):
         # With NO pump alive, a lone consumer's consume=False fallback DOES read the
@@ -2053,6 +2072,93 @@ def _require_numpy(test):
         return np
     except Exception:   # pragma: no cover - numpy is present on dev + CI
         test.skipTest("numpy not importable")
+
+
+class GhostSkeletonGateTests(unittest.TestCase):
+    """The 2026-07-15 ghost-skeleton gate. The Kinect flags reflections /
+    furniture / a just-departed person as is_tracked=True with Inferred(1) or
+    NotTracked(0, zero-filled) joints. _body_is_real must drop those phantoms at
+    the single parse point so they never reach presence / nearest / gestures /
+    the HUD overlay, while a legitimately-occluded real person still passes."""
+
+    def _joints(self, state, z=2.0):
+        """All 25 joints at the given TrackingState, non-zero-fill."""
+        return {nm: (0.1, 0.1, z, state) for nm in kb._JOINT_NAMES}
+
+    def test_body_is_real_true_for_tracked_skeleton(self):
+        self.assertTrue(kb._body_is_real(self._joints(2)))
+
+    def test_body_is_real_false_for_all_inferred(self):
+        self.assertFalse(kb._body_is_real(self._joints(1)))
+
+    def test_body_is_real_false_for_all_nottracked(self):
+        self.assertFalse(kb._body_is_real(self._joints(0)))
+
+    def test_body_is_real_false_for_state2_zero_fill(self):
+        # NotTracked frames zero-fill the position even while state reads 2.
+        self.assertFalse(kb._body_is_real(
+            {nm: (0.0, 0.0, 0.0, 2) for nm in kb._JOINT_NAMES}))
+
+    def test_body_is_real_false_without_a_core_joint(self):
+        # Six reliable LIMB joints but no tracked spine/neck/head → not a person.
+        limbs = ("hand_left", "hand_right", "wrist_left", "wrist_right",
+                 "elbow_left", "elbow_right")
+        self.assertFalse(kb._body_is_real({nm: (0.1, 0.1, 2.0, 2) for nm in limbs}))
+
+    def test_body_is_real_true_for_occluded_lower_body(self):
+        # Real person at a desk: upper body tracked (incl. core), legs inferred.
+        joints = {nm: (0.1, 0.1, 2.0, 2) for nm in
+                  ("head", "neck", "spine_shoulder", "spine_mid",
+                   "shoulder_left", "shoulder_right", "hand_left")}
+        for nm in ("knee_left", "knee_right", "ankle_left", "foot_left"):
+            joints[nm] = (0.1, -0.5, 2.0, 1)   # inferred legs
+        self.assertTrue(kb._body_is_real(joints))
+
+    def test_parse_body_frame_drops_all_inferred_ghost(self):
+        ghost = types.SimpleNamespace(
+            is_tracked=True,
+            joints=[_FakeJoint(0.1, 0.1, 2.0, state=1)
+                    for _ in range(kb._JOINT_COUNT)],
+            tracking_id=999)
+        self.assertEqual(kb._parse_body_frame(_FakeBodyFrame([ghost])), [])
+
+    def test_parse_body_frame_keeps_real_body(self):
+        self.assertEqual(len(kb._parse_body_frame(_FakeBodyFrame([_FakeBody(True)]))), 1)
+
+    def test_parse_body_frame_drops_ghost_keeps_real(self):
+        ghost = types.SimpleNamespace(
+            is_tracked=True,
+            joints=[_FakeJoint(0.0, 0.0, 0.0, state=0)
+                    for _ in range(kb._JOINT_COUNT)],
+            tracking_id=1)
+        parsed = kb._parse_body_frame(_FakeBodyFrame([ghost, _FakeBody(True)]))
+        self.assertEqual(len(parsed), 1)   # only the real one survives
+
+    def test_joint_distance_rejects_inferred(self):
+        self.assertIsNone(kb._joint_distance({"head": (0.1, 0.6, 1.8, 1)}))
+
+    def test_joint_distance_rejects_out_of_range(self):
+        self.assertIsNone(kb._joint_distance({"head": (0.1, 0.6, 7.0, 2)}))
+        self.assertIsNone(kb._joint_distance({"head": (0.1, 0.6, 0.2, 2)}))
+
+    def test_joint_distance_accepts_tracked_in_range(self):
+        self.assertEqual(kb._joint_distance({"head": (0.1, 0.6, 1.8, 2)}), 1.8)
+
+    def test_joint_distance_falls_through_to_tracked_spine(self):
+        # Inferred head, but a tracked spine_shoulder in range → range off the spine.
+        self.assertEqual(kb._joint_distance(
+            {"head": (0.1, 0.6, 1.8, 1), "spine_shoulder": (0.1, 0.3, 2.2, 2)}), 2.2)
+
+    def test_facing_yaw_none_for_inferred_shoulders(self):
+        self.assertIsNone(kb._body_facing_yaw(
+            {"shoulder_left": (-0.2, 0.4, 2.0, 1),
+             "shoulder_right": (0.2, 0.4, 2.0, 1),
+             "head": (0.0, 0.6, 2.0, 1)}))
+
+    def test_facing_yaw_computed_for_tracked_shoulders(self):
+        self.assertIsNotNone(kb._body_facing_yaw(
+            {"shoulder_left": (-0.2, 0.4, 2.0, 2),
+             "shoulder_right": (0.2, 0.4, 2.1, 2)}))
 
 
 if __name__ == "__main__":

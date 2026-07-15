@@ -95,11 +95,20 @@ def _joint_ok(j: Optional[tuple]) -> bool:
 
 
 def _nearest_body(bodies: Any) -> Optional[dict]:
-    """Pick the closest tracked body from a get_bodies()-shaped list, or None.
+    """Pick the body we should read gestures off — the owner at the desk — from a
+    get_bodies()-shaped list, or None.
 
-    "Closest" uses distance_m when present; bodies without a distance sort last
-    so a body we CAN range always wins. Returns None for an empty / non-list
-    input."""
+    Ranking: FACING-the-sensor bodies first, then closest. "Closest" uses
+    distance_m when present; bodies without a distance sort last so a body we CAN
+    range always wins.
+
+    GHOST FIX (2026-07-15): the bridge's _body_is_real gate already drops
+    inferred/zero-fill phantoms, but a true reflection (TV/mirror/window) tracks
+    cleanly at state 2 and can sit NEARER than the real owner — the old pure-
+    distance pick would let that reflection STARVE the owner (only the ghost is
+    ever sampled) or fire a WAVE/SWIPE/RAISE_HAND off it. The owner at the desk
+    faces the sensor; an off-axis reflection typically does not, so preferring a
+    facing body closes the reflection-hijack the distance sort can't."""
     if not bodies:
         return None
     try:
@@ -111,8 +120,13 @@ def _nearest_body(bodies: Any) -> Optional[dict]:
 
     def _key(b: dict):
         d = b.get("distance_m")
-        # None / 0 / negative → push to the back (huge sort key).
-        return d if isinstance(d, (int, float)) and d > 0 else float("inf")
+        dist = d if isinstance(d, (int, float)) and d > 0 else float("inf")
+        # facing True → 0 (preferred), unknown/None → 1, explicitly not-facing → 2,
+        # so a facing owner always outranks a non-facing reflection regardless of
+        # distance, while an unknown-facing body still beats a known side-on one.
+        facing = b.get("facing")
+        facing_rank = 0 if facing is True else (2 if facing is False else 1)
+        return (facing_rank, dist)
 
     return min(candidates, key=_key)
 

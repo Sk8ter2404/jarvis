@@ -114,12 +114,32 @@ def _dot(a: Vec3, b: Vec3) -> float:
 
 
 def _joint_ok(j: Optional[tuple]) -> bool:
-    """True when a (x, y, z, state) joint tuple is present and tracked."""
+    """True when a (x, y, z, state) joint is FULLY tracked (state >= MIN_TRACKING_
+    STATE) AND carries a real, finite, non-zero-fill position.
+
+    GHOST FIX (2026-07-15, CONFIRMED): the old check tested ONLY the tracking
+    state, so a state-2 joint still carrying a NaN/±Inf coordinate (an SDK glitch
+    kinect_bridge._joint_reliable already guards against) — or the NotTracked
+    (0,0,0) zero-fill — produced a garbage pointing ray, which store.resolve()
+    then matched at 0.0° against the FIRST calibrated target and fired
+    'turn that on' on the wrong smart-home device. Mirror _joint_reliable here so
+    every joint feeding a ray (tip / origin / extension) is filtered at this one
+    chokepoint."""
     if not j or len(j) < 4:
         return False
     try:
-        return int(j[3]) >= MIN_TRACKING_STATE
-    except Exception:
+        if int(j[3]) < MIN_TRACKING_STATE:
+            return False
+        x, y, z = float(j[0]), float(j[1]), float(j[2])
+        if x == 0.0 and y == 0.0 and z == 0.0:   # NotTracked zero-fill
+            return False
+        if not (x == x and y == y and z == z):    # NaN != itself
+            return False
+        inf = float("inf")
+        if x in (inf, -inf) or y in (inf, -inf) or z in (inf, -inf):
+            return False
+        return True
+    except (TypeError, ValueError):
         return False
 
 

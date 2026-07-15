@@ -598,6 +598,14 @@ def get_depth():
 # None = never populated). BODY_CACHE_FRESH_SEC bounds how old a cache entry may
 # be and still be served before a consumer falls back to a direct read.
 BODY_CACHE_FRESH_SEC = 0.30        # serve cache stamped within this window
+# The pump-alive raw-cache fallback (in _read_and_cache_bodies) exists to bridge
+# the ~33 ms one-tick race with the pump, NOT to keep serving a body the pump
+# dropped seconds ago when it stalls (GC / CUDA contention — all documented on
+# this box). Bound that peek by age so a stalled-but-alive pump degrades to "no
+# one present" instead of a departed-person phantom. Modest so it still absorbs
+# the intended one-tick race; deliberately NOT BODY_STALE_RESET_SEC (4 s, far too
+# loose for a presence/grip signal). (2026-07-15 ghost audit — CONFIRMED vector)
+_RAW_CACHE_FALLBACK_MAX_SEC = 0.5
 _body_cache: list[Any] = [None]    # last parsed bodies (None=cold, []=none tracked)
 _body_cache_at = [0.0]             # monotonic stamp of the last cache populate
 _body_cache_lock = threading.Lock()
@@ -670,7 +678,13 @@ def _read_and_cache_bodies(consume: bool = True) -> list[dict]:
             # the last bodies instead of a spurious [].
             with _body_cache_lock:
                 cached = _body_cache[0]
-            return list(cached) if cached is not None else []
+                ts = _body_cache_at[0]
+            # AGE-BOUND the raw peek: fine to serve the last bodies for the one-tick
+            # race, but a stalled pump must not keep asserting a departed person for
+            # seconds. Past the cap, report "no bodies" rather than a phantom.
+            if cached is not None and (time.monotonic() - ts) <= _RAW_CACHE_FALLBACK_MAX_SEC:
+                return list(cached)
+            return []
         # We ARE going to consume the frame (the pump, or a pump-less lone consumer).
         # Stamp the staleness clock (PART B) so an actively-read, healthy stream
         # never trips the stale-reset, then take the single frame (clears the flag).
@@ -684,14 +698,22 @@ def _read_and_cache_bodies(consume: bool = True) -> list[dict]:
 
 
 def _joint_distance(joints: dict) -> Optional[float]:
-    """Best available z-distance for a body: prefer head, then spine_shoulder,
-    then spine_mid/base. Returns metres or None."""
+    """Best available z-distance for a body, in metres, or None. Prefers a
+    FULLY-TRACKED (state>=2, finite, non-zero-fill) core joint and only accepts a
+    plausible human range (0.5-4.5 m).
+
+    GHOST FIX (2026-07-15): the old version returned any joint's z as long as
+    `z > 0`, so an Inferred head at z=0.25 m — or an edge-noise blob at z=7 m —
+    became a real distance and sorted the phantom as the NEAREST body ahead of the
+    real user. Gating on _joint_reliable + the Kinect v2 body range denies that.
+    Falls back down the preference list, so a real person with an inferred head
+    still ranges off a tracked spine."""
     for name in ("head", "spine_shoulder", "spine_mid", "spine_base", "neck"):
         j = joints.get(name)
-        if j is not None:
-            z = j[2]
-            if z and z > 0:
-                return float(z)
+        if _joint_reliable(j):
+            z = float(j[2])
+            if 0.5 <= z <= 4.5:
+                return z
     return None
 
 
@@ -937,6 +959,43 @@ def _joint_reliable(j) -> bool:
         return False
 
 
+# ─── ghost-skeleton rejection (real body vs. inferred/zero-fill phantom) ────
+# The Kinect v2 runtime marks a body slot is_tracked=True for reflections,
+# furniture, a coat rack, edge-of-frame noise, or a person who JUST left frame,
+# filling that skeleton with Inferred(1)/NotTracked(0, zero-filled) joints. That
+# "ghost skeleton" (the owner's report: "sees ghost skeletons when arms aren't
+# present") then inflates get_presence count, can be picked as the nearest body,
+# and draws a phantom stick-figure on the HUD. A REAL person facing the sensor
+# shows ~15-25 FULLY-TRACKED (state>=2) joints; a phantom shows 0-3. Requiring a
+# modest floor of reliable joints INCLUDING a reliable core (spine/neck/head)
+# drops the phantom at the SINGLE parse point every consumer reads, while a
+# legitimately-occluded real person (legs under a desk → inferred) still clears
+# it. HONEST LIMIT (per the 2026-07-15 adversarial audit): this does NOT stop a
+# true mirror/TV reflection — its joints track cleanly at state 2 — which would
+# need a separate spatial/depth-plane heuristic, not a joint-reliability check.
+_MIN_REAL_TRACKED_JOINTS = 6
+_REAL_CORE_JOINTS = ("spine_shoulder", "spine_mid", "spine_base", "neck", "head")
+
+
+def _body_is_real(joints: dict) -> bool:
+    """True when a parsed joint dict looks like a genuine tracked person — at
+    least _MIN_REAL_TRACKED_JOINTS fully-tracked joints AND a fully-tracked core
+    joint — rather than an inferred/zero-fill ghost. Pure; never raises (an
+    unusable dict reads as NOT real, failing safe toward "no phantom")."""
+    try:
+        if not joints:
+            return False
+        reliable = 0
+        for j in joints.values():
+            if _joint_reliable(j):
+                reliable += 1
+        if reliable < _MIN_REAL_TRACKED_JOINTS:
+            return False
+        return any(_joint_reliable(joints.get(n)) for n in _REAL_CORE_JOINTS)
+    except Exception:   # pragma: no cover - defensive: malformed joints dict
+        return False
+
+
 def _body_facing_yaw(joints: dict) -> Optional[float]:
     """Estimate the body's facing YAW in degrees from skeleton JOINT POSITIONS,
     or None when the joints needed aren't tracked.
@@ -979,7 +1038,12 @@ def _body_facing_yaw(joints: dict) -> Optional[float]:
     sl = joints.get("shoulder_left")
     sr = joints.get("shoulder_right")
     yaw_shoulder: Optional[float] = None
-    if _tracked(sl) and _tracked(sr):
+    # _joint_reliable (state>=2, finite, non-zero-fill), NOT _tracked (accepts
+    # Inferred state 1): an inferred/occluded shoulder gives a bogus yaw that flows
+    # through get_presence().head_yaw_deg → the gaze-monitor picker, naming the
+    # wrong screen off a guess. Reliable-only → yaw stays None and the picker keeps
+    # the prior monitor rather than swinging on noise. (2026-07-15 ghost audit)
+    if _joint_reliable(sl) and _joint_reliable(sr):
         dx = float(sr[0]) - float(sl[0])
         dz = float(sr[2]) - float(sl[2])
         # Degenerate (both shoulders coincident / vertical) → no shoulder yaw.
@@ -994,7 +1058,7 @@ def _body_facing_yaw(joints: dict) -> Optional[float]:
     # both a head and a shoulder span to normalise against.
     yaw_head: Optional[float] = None
     head = joints.get("head")
-    if _tracked(head) and _tracked(sl) and _tracked(sr):
+    if _joint_reliable(head) and _joint_reliable(sl) and _joint_reliable(sr):
         mid_x = (float(sl[0]) + float(sr[0])) / 2.0
         span = abs(float(sr[0]) - float(sl[0]))
         if span > 0.05:   # a plausible shoulder width in metres
@@ -1058,6 +1122,14 @@ def _parse_body_frame(frame) -> list[dict]:
                         )
                     except Exception:   # pragma: no cover - per-joint read glitch
                         continue
+            # GHOST-SKELETON GATE: drop an is_tracked slot that lacks real tracked
+            # structure (an inferred/zero-fill phantom — reflection, furniture, a
+            # just-departed person) so it never reaches presence/count, the
+            # nearest-body pick, gestures, the gaze yaw, or the HUD overlay. This is
+            # the SINGLE parse point every consumer reads, so one gate cleans them
+            # all. (2026-07-15 ghost-skeleton audit)
+            if not _body_is_real(joints):
+                continue
             head = joints.get("head")
             out.append({
                 # Prefer the Kinect's stable per-person tracking_id (set from

@@ -303,5 +303,24 @@ class RobustnessTests(unittest.TestCase):
         self.assertEqual(fired, kg.WAVE)
 
 
+class NearestBodyFacingTests(unittest.TestCase):
+    """2026-07-15 ghost fix: _nearest_body prefers a FACING body (the owner at the
+    desk) over a nearer non-facing one (a reflection), so a reflection can't starve
+    the owner or drive a gesture off itself."""
+
+    def test_facing_owner_beats_nearer_reflection(self):
+        reflection = _body(hand_right=(0.0, 0.3, 2.0), distance_m=1.2, body_id=1)
+        reflection["facing"] = False
+        owner = _body(hand_right=(0.0, 0.3, 2.0), distance_m=2.5, body_id=2)
+        owner["facing"] = True
+        self.assertEqual(kg._nearest_body([reflection, owner])["id"], 2)
+
+    def test_falls_back_to_distance_when_facing_unknown(self):
+        near = _body(hand_right=(0.0, 0.3, 2.0), distance_m=1.2, body_id=1)
+        far = _body(hand_right=(0.0, 0.3, 2.0), distance_m=2.5, body_id=2)
+        # facing None on both (the default) → pure distance decides → nearer wins.
+        self.assertEqual(kg._nearest_body([near, far])["id"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -291,5 +291,31 @@ class AverageDirectionTests(unittest.TestCase):
         self.assertIsNone(kp.average_direction(dirs))
 
 
+class JointOkHardeningTests(unittest.TestCase):
+    """2026-07-15 CONFIRMED ghost fix: a state-2 joint carrying a NaN/±Inf coord
+    or the NotTracked (0,0,0) zero-fill must be rejected, so a garbage ray never
+    resolves to 0° against the first calibrated target and fires the wrong device."""
+
+    def test_rejects_nan_coordinate(self):
+        self.assertFalse(kp._joint_ok((float("nan"), 0.0, 2.0, 2)))
+
+    def test_rejects_inf_coordinate(self):
+        self.assertFalse(kp._joint_ok((float("inf"), 0.0, 2.0, 2)))
+
+    def test_rejects_zero_fill_even_when_state_tracked(self):
+        self.assertFalse(kp._joint_ok((0.0, 0.0, 0.0, 2)))
+
+    def test_rejects_below_min_state(self):
+        self.assertFalse(kp._joint_ok((0.1, 0.1, 2.0, 1)))
+
+    def test_accepts_real_tracked_joint(self):
+        self.assertTrue(kp._joint_ok((0.1, 0.1, 2.0, 2)))
+
+    def test_arm_direction_none_for_nan_hand(self):
+        # A NaN hand coordinate must not yield a (nan,nan,nan) ray.
+        b = _body(hand=(float("nan"), 0.0, 2.0))
+        self.assertIsNone(kp.arm_direction(b))
+
+
 if __name__ == "__main__":
     unittest.main()
