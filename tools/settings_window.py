@@ -290,8 +290,9 @@ SCHEMA: dict[str, dict] = {
     },
     "TTS_BACKEND": {
         "tab": "voice", "label": "TTS backend", "type": "enum",
-        "choices": ["edge", "pyttsx3", "xtts"], "default": "edge",
-        "help": "edge = online neural; pyttsx3 = offline SAPI; xtts = clone.",
+        "choices": ["edge", "kokoro", "pyttsx3", "xtts"], "default": "edge",
+        "help": "edge = online neural; kokoro = local CPU (offline, frees the GPU); "
+                "pyttsx3 = offline SAPI; xtts = clone.",
     },
     "VOICE_CLONE_ENABLED": {
         "tab": "voice", "label": "Local voice clone (Chatterbox)", "type": "bool",
