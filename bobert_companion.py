@@ -8517,10 +8517,20 @@ _RESOLVED_LOCAL_LLM_MODEL: list[str | None] = [None]
 # MULTIMODAL (chat+vision share one resident model → no swap thrash).
 # `qwen2.5:14b` is the proven failover (6/7, 13.5GB). NOTES: the qwen3:30b MoE
 # was DROPPED — it redlines the 24GB card to <0.3GB free beside the voice clone
-# (the OOM-brick zone); `gemma4:26b-a4b-it-qat` stays REMOVED (2026-07-09) —
-# broken quant returning EMPTY output (ollama #15428/#16456). Neither must be
-# auto-selected; "first available" can still pick them as an absolute last
-# resort, and the empty-response failover self-heals if that happens.
+# (the OOM-brick zone); an on-box re-bench 2026-07-15 measured it at >240s for a
+# first response because it must offload ~1.3GB to CPU (17.3GB free < 18.6GB) —
+# it only becomes viable once TTS moves off the 3090 (master-plan P2). NOTE
+# UPDATED 2026-07-15: `gemma4:26b-a4b-it-qat` is NO LONGER broken — the old
+# EMPTY-output bug (ollama #15428/#16456) is fixed on the current ollama; a fresh
+# on-box bench answered coherently, solved bat-and-ball, ran 106.8 tok/s, and sat
+# 15.2GB fully resident (multimodal, same chat+vision-share win as gemma4:12b).
+# It is STILL not auto-default because 15.2GB leaves only ~1.8GB headroom beside
+# the resident voice clone — too little to absorb a chatterbox synthesis spike on
+# the box the owner relies on. It becomes the clear default upgrade the moment TTS
+# moves to CPU (P2 frees ~6GB). Until then gemma4:12b leads; the 26B is a one-flag
+# opt-in via JARVIS_LOCAL_LLM_MODEL. Neither big model is auto-selected; "first
+# available" can still pick them as a last resort, and the empty-response failover
+# self-heals if that happens.
 _LOCAL_LLM_PREFERENCE = (
     "gemma4:12b",
     "qwen2.5:14b-instruct-q5_K_M",
