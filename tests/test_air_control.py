@@ -113,6 +113,18 @@ class TestEngagement(unittest.TestCase):
         self.assertEqual(op.kind, OP_IDLE)
         self.assertFalse(op.engaged)
 
+    def test_raised_hand_above_shoulder_does_not_engage(self):
+        """The 'raising your hands ≠ mouse' gate (2026-07-15): a FORWARD hand
+        raised well above shoulder height must NOT start engagement, even though
+        it clears forward + above-waist. Shoulder y=0.4, cap +0.10 m → a hand at
+        y=0.65 (0.25 above the shoulder) is rejected. This is the fix for the
+        'false triggers when I raise my hands' reports."""
+        eng, _ = _engine()
+        op = eng.update([_body(hand=(0.0, 0.65, _ENGAGED_Z))], DESK)
+        self.assertEqual(op.kind, OP_IDLE)
+        self.assertFalse(op.engaged)
+
+
     def test_forward_raised_hand_engages_and_moves(self):
         eng, _ = _engine()
         op = eng.update([_body()], DESK)
@@ -158,7 +170,12 @@ class TestMapping(unittest.TestCase):
 
     def test_clamped_at_desktop_edges(self):
         eng, _ = _engine()
-        # Hand way past the right/top of the box → pinned inside the desktop.
+        # Engage first at a normal chest-level reach, THEN push the hand way past
+        # the top/right of the box → cursor pinned inside the desktop. (Fresh
+        # engagement now rejects a hand raised far above the shoulder, so the
+        # extreme top position is reached via the already-engaged hysteresis
+        # path — which is how a real user reaches the top edge too.)
+        eng.update([_body()], DESK)   # engage at box centre
         op = eng.update(
             [_body(hand=(AIR_BOX_WIDTH_M, _CENTER_HAND_Y + AIR_BOX_HEIGHT_M,
                          _ENGAGED_Z))], DESK)

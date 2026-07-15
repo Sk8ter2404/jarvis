@@ -38,7 +38,49 @@ from typing import Dict, List, Tuple
 # folded into the preceding matched section (bloating it) and vanished from the
 # INDEX safety net. The parenthetical is the dominant header style in prompts.py,
 # so tolerating it is load-bearing, not cosmetic (2026-07-15 review finding).
-_HEADER_RE = re.compile(r"^(?P<head>[A-Z][A-Z0-9 /&.'\-]{2,50})(?:\s*\([^)]*\))?:\s*$")
+_HEADER_RE = re.compile(r"^(?P<head>[A-Z][A-Z0-9 +/&.'\-—]{2,60})(?:\s*\([^)]*\))?:\s*$")
+
+# A header whose descriptive parenthetical WRAPS onto the next line(s) can't be
+# seen by the single-line _HEADER_RE, so that header AND its whole capability
+# block get silently folded into the previous section and vanish from the INDEX
+# safety net. 14 of ~69 real headers in PC_CONTROL_PROMPT wrap this way
+# (2026-07-15 review). _join_wrapped_headers stitches such a header back onto one
+# physical line BEFORE matching. A header start = an ALL-CAPS-ish head at the
+# line start immediately followed by '(' whose ')' has not closed on that line.
+_HEADER_START_RE = re.compile(r"^[A-Z][A-Z0-9 +/&.'\-—]{1,60}\(")
+
+
+def _join_wrapped_headers(lines: List[str]) -> List[str]:
+    """Fold a wrapped-parenthetical header (head + '(' … ')':' spanning up to a
+    few lines) into a single line. Conservative: only fires when the '(' is left
+    open on a head-looking line and a following line (within 3) closes it with
+    '):'; bails on a blank line. Non-header text is returned untouched."""
+    out: List[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        ln = lines[i]
+        s = ln.strip()
+        if (_HEADER_START_RE.match(s) and not s.endswith("):")
+                and s.count("(") > s.count(")")):
+            joined = ln.rstrip()
+            j, closed = i + 1, False
+            while j < n and (j - i) <= 3:
+                nxt = lines[j].strip()
+                if not nxt:            # blank line ⇒ not a wrapped header
+                    break
+                joined += " " + nxt
+                if nxt.endswith("):"):
+                    closed = True
+                    j += 1
+                    break
+                j += 1
+            if closed:
+                out.append(joined)
+                i = j
+                continue
+        out.append(ln)
+        i += 1
+    return out
 
 # Which lowercase keywords pull in each section. Keyed by the section header text
 # (without the trailing colon, upper-cased) — matched leniently by substring of
@@ -238,6 +280,80 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "shut down", "shutdown", "turn off", "go offline", "power down",
         "restart yourself", "reboot", "sign off",
     ],
+    # --- Sections surfaced by the 2026-07-15 wrapped-header + char-class fix.
+    # These 17 were folded into their neighbours (invisible to routing) until the
+    # parser learned to read multi-line/punctuated headers; give each real
+    # keywords so naming the capability loads its full instructions, not just its
+    # INDEX line. Kept specific to avoid taxing unrelated turns.
+    "KINECT DEPTH SENSOR": [
+        "kinect", "depth sensor", "who is in the room", "who's in the room",
+        "scan the room", "scan room", "how many people", "body count",
+        "anyone in the room", "who is here", "who's here",
+    ],
+    "AIR CONTROL": [
+        "air control", "spatial mouse", "reach out", "grab and drag",
+        "fist grab", "kinect mouse", "movie-style",
+    ],
+    "MUSIC + VIDEO PLAYBACK": [
+        "playback", "play a video", "media keys", "play/pause", "media control",
+        "resume playback", "pause playback",
+    ],
+    "STREAMING SERVICES": [
+        "netflix", "hulu", "disney", "disney+", "hbo", "prime video",
+        "streaming service", "watch on", "auto-play", "put on a movie",
+    ],
+    "TASTE-AWARE MUSIC": [
+        "my music taste", "recommend a song", "recommend music", "based on my taste",
+        "music recommendation", "something i'd like", "music i'd like",
+    ],
+    "FOCUS MODE / DO-NOT-DISTURB": [
+        "focus mode", "do not disturb", "hold my notifications", "heads down",
+        "what did i miss", "recap what i missed",
+    ],
+    "WEB INTERFACE": [
+        "web interface", "dashboard", "control panel", "web ui", "web dashboard",
+        "open the dashboard", "browser control panel",
+    ],
+    "WELLNESS / FOCUS NUDGES": [
+        "wellness", "focus block", "take a break", "break reminder",
+        "focus session", "pomodoro", "stretch reminder", "posture",
+    ],
+    "CALENDAR": [
+        "calendar", "schedule", "my meetings", "appointment", "agenda",
+        "meetings today", "meetings this week", "what meetings", "on my calendar",
+    ],
+    "WEATHER BRIEFING": [
+        "weather", "forecast", "is it going to rain", "raining", "sunny",
+        "snow", "how hot", "how cold", "umbrella", "outside today",
+    ],
+    "PATTERN LEARNING": [
+        "my patterns", "my habits", "learned about me", "my routine",
+        "behavioral pattern", "what have you noticed", "patterns you've",
+    ],
+    "REPO ROBOT PROJECT": [
+        "repo robot", "animatronic", "robot project", "the robot build",
+        "robot state",
+    ],
+    "SUIT DIAGNOSTICS": [
+        "suit diagnostics", "full system readout", "full diagnostics",
+        "full readout", "complete diagnostics", "detailed diagnostics",
+    ],
+    "MULTI-STEP TASKS": [
+        "add to cart", "find and add", "and add to", "buy me", "order online",
+        "checkout", "multi-step", "then click", "do all of",
+    ],
+    "LOCAL VOICE CLONE": [
+        "voice clone", "cloned voice", "voice profile", "clone voice",
+        "your own voice", "in-character voice", "chatterbox", "switch to my voice",
+    ],
+    "SMART HOME — PER-BRAND LIST": [
+        "list my lights", "list plugs", "which lights", "hue list", "govee list",
+        "kasa list", "per brand", "brand list", "list smart",
+    ],
+    "WAKE-WORD MODE": [
+        "wake word mode", "wake-word mode", "require my name", "require your name",
+        "always listening", "manual wake", "gate on wake",
+    ],
 }
 
 # Sections always kept even with no keyword hit. Deliberately MINIMAL: only
@@ -257,7 +373,7 @@ def split_pc_control(pc_control: str) -> Tuple[str, List[Tuple[str, str]]]:
     action-format rules + intro that must always be present). Each subsequent
     (header, body) pair is one capability section, body INCLUDING the header
     line so the reinjected text is self-describing."""
-    lines = pc_control.split("\n")
+    lines = _join_wrapped_headers(pc_control.split("\n"))
     first_hdr = None
     for i, ln in enumerate(lines):
         if _HEADER_RE.match(ln.strip()):

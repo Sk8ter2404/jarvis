@@ -9151,6 +9151,35 @@ _LOCAL_MODE_DIRECTIVE = (
 _LOCAL_CHEATSHEET_CACHE: list[str | None] = [None]
 
 
+# The single most important instruction on the LOCAL path. A small model with no
+# guard invents the time, its own version, the weather, or a system stat instead
+# of emitting the action that fetches the real value. This lives in ONE place and
+# is used by BOTH local-prompt slimmers — the hand-curated _local_cheatsheet AND
+# the prompt_router slim path. They used to diverge: the router path (the default
+# since 2026-07-15) silently shipped WITHOUT this block, so local turns hedged or
+# fabricated weather / version / whats_broken. Single-source it so that can't recur.
+_LOCAL_NEVER_GUESS_GUARD = (
+    "*** ALWAYS USE THE ACTION — NEVER GUESS THESE ***\n"
+    "You do NOT know the current time, date, your version, the weather, or\n"
+    "any system stat without running its action. NEVER state them from\n"
+    "memory — emit the token and let the system fill in the real value:\n"
+    "  [ACTION: get_time]            \"what time is it\" / \"what's the date\"\n"
+    "  [ACTION: version_info]        \"what version are you on\" / \"when were you updated\"\n"
+    "  [ACTION: weather_briefing]    \"what's the weather\" / \"is it going to rain\"\n"
+    "  [ACTION: system_pulse]        \"system status\" / \"how are you running\" / CPU/RAM\n"
+    "  [ACTION: whats_broken]        \"what's broken\" / \"anything wrong\"\n"
+    "  [ACTION: list_timers]         \"list my timers\" / \"what timers are running\"\n"
+    "  [ACTION: recognize_face]      \"who am I\" / \"who's here\" / \"who's at the desk\" / \"do you recognize me\"\n"
+    "If sir asks any of the above, your reply must contain ONLY the action\n"
+    "token (plus at most a short lead-in like \"One moment, sir.\"). Do not\n"
+    "invent a time, version number, temperature, or status — you will be\n"
+    "wrong. WHO is here is a LIVE CAMERA LOOK: even though you may know sir's\n"
+    "name, never answer 'who am I' / 'who's here' from memory — he may be out\n"
+    "of frame. Emit [ACTION: recognize_face] and report ONLY who the camera\n"
+    "sees now (the recognised name, or that no one is in frame).\n"
+)
+
+
 def _local_cheatsheet() -> str:
     """A COMPACT action reference that REPLACES the ~18k-token PC_CONTROL_PROMPT
     for local-model calls.
@@ -9176,25 +9205,8 @@ def _local_cheatsheet() -> str:
         "Put it on its own line; the system runs it and hands you the result to\n"
         "comment on. Emit an action ONLY when sir wants something DONE — for\n"
         "ordinary conversation, just reply normally with no token.\n\n"
-        "*** ALWAYS USE THE ACTION — NEVER GUESS THESE ***\n"
-        "You do NOT know the current time, date, your version, the weather, or\n"
-        "any system stat without running its action. NEVER state them from\n"
-        "memory — emit the token and let the system fill in the real value:\n"
-        "  [ACTION: get_time]            \"what time is it\" / \"what's the date\"\n"
-        "  [ACTION: version_info]        \"what version are you on\" / \"when were you updated\"\n"
-        "  [ACTION: weather_briefing]    \"what's the weather\" / \"is it going to rain\"\n"
-        "  [ACTION: system_pulse]        \"system status\" / \"how are you running\" / CPU/RAM\n"
-        "  [ACTION: whats_broken]        \"what's broken\" / \"anything wrong\"\n"
-        "  [ACTION: list_timers]         \"list my timers\" / \"what timers are running\"\n"
-        "  [ACTION: recognize_face]      \"who am I\" / \"who's here\" / \"who's at the desk\" / \"do you recognize me\"\n"
-        "If sir asks any of the above, your reply must contain ONLY the action\n"
-        "token (plus at most a short lead-in like \"One moment, sir.\"). Do not\n"
-        "invent a time, version number, temperature, or status — you will be\n"
-        "wrong. WHO is here is a LIVE CAMERA LOOK: even though you may know sir's\n"
-        "name, never answer 'who am I' / 'who's here' from memory — he may be out\n"
-        "of frame. Emit [ACTION: recognize_face] and report ONLY who the camera\n"
-        "sees now (the recognised name, or that no one is in frame).\n\n"
-        "Most-used actions (classic iTunes is GONE — the Apple Music app + music.apple.com are the player):\n"
+        + _LOCAL_NEVER_GUESS_GUARD +
+        "\nMost-used actions (classic iTunes is GONE — the Apple Music app + music.apple.com are the player):\n"
         "  [ACTION: play_music, <artist/song/album>]   play a song/artist/album on Apple Music (music.apple.com)\n"
         "  [ACTION: play_playlist, <name>]   play ANY named playlist — streams it via Apple Music ('shuffle ' prefix shuffles). Use this for every 'play my/the <name> playlist', NOT apple_music.\n"
         "  [ACTION: list_playlists]   (points sir to the Apple Music app)   [ACTION: shuffle_library]   shuffle music via Apple Music\n"
@@ -10600,6 +10612,12 @@ def _call_llm(user_text: str) -> str:
         try:
             from core import prompt_router as _pr
             _slim_pc = _pr.slim_pc_control(user_text, PC_CONTROL_PROMPT)
+            # slim_pc_control keeps PC_CONTROL's own preamble but NOT the local
+            # anti-hallucination guard (the highest-value instruction on this
+            # path). _local_cheatsheet has it; this path did not — restore it
+            # from the single shared source so weather/version/whats_broken stop
+            # getting hedged or fabricated on the default local route.
+            _slim_pc = _LOCAL_NEVER_GUESS_GUARD + "\n" + _slim_pc
             _base_prompt = _system_prompt.replace(PC_CONTROL_PROMPT, _slim_pc, 1)
         except Exception as _pr_err:
             print(f"  [prompt-router] slim failed ({_pr_err}); full prompt")

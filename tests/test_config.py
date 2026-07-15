@@ -62,6 +62,23 @@ class EnvDrivenTests(unittest.TestCase):
         self.assertEqual(mod.BAMBU_ACCESS_CODE, "")
         self.assertEqual(mod.BAMBU_SERIAL, "")
 
+    def test_env_only_secrets_are_never_applied_from_settings(self):
+        # user_settings.json must NOT be able to override the env-only BAMBU
+        # secrets — the printer-reconnect flow once wrote BAMBU_PRINTER_IP there,
+        # which defeated the env contract and broke these tests. A benign key in
+        # the SAME payload still applies, proving the guard is targeted.
+        payload = {"BAMBU_PRINTER_IP": "10.10.10.10", "USER_NAME": "SettingsGuy"}
+        with mock.patch.dict(os.environ, {"BAMBU_PRINTER_IP": "192.168.5.5"},
+                             clear=False):
+            mod = importlib.reload(config)
+            self.assertEqual(mod.BAMBU_PRINTER_IP, "192.168.5.5")
+            with mock.patch("os.path.exists", return_value=True), \
+                 mock.patch("json.load", return_value=payload):
+                mod._apply_user_settings()
+            self.assertEqual(mod.BAMBU_PRINTER_IP, "192.168.5.5")  # secret intact
+            self.assertEqual(mod.USER_NAME, "SettingsGuy")          # benign applied
+        self.assertIn("BAMBU_PRINTER_IP", config._ENV_ONLY_KEYS)
+
 
 class SafetyConstantTests(unittest.TestCase):
     def test_confirm_keywords_non_empty_list(self):

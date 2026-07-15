@@ -124,6 +124,21 @@ AIR_ENGAGE_FORWARD_M = 0.18
 # the hip doesn't engage. ~0.05 m = "at or above the navel".
 AIR_ENGAGE_ABOVE_WAIST_M = 0.05
 
+# UPPER height bound — the "raising your hands ≠ mouse" gate (2026-07-15). A
+# reach-to-control keeps the hand at/BELOW shoulder level; raising or stretching
+# your arms lifts them ABOVE the shoulders. So a hand raised more than this far
+# above the shoulder (hand.y − shoulder.y) does NOT start engagement, even if it
+# is also forward + above the waist — which was the sole cause of the "false
+# triggers when I raise my hands" reports (the old gate had forward + above-waist
+# but NO upper bound). Applies to FRESH engagement only; a brief rise while
+# already controlling won't drop you (that's the forward/waist hysteresis).
+# Set a touch above the interaction-box top (~0.125 m above the shoulder) so a
+# deliberate reach toward the TOP of the screen can still START control, while a
+# clearly-raised/overhead arm (0.2 m+ above the shoulder) cannot. Once engaged,
+# the hand may go higher (mapping clamps to the top edge) — the cap is fresh-
+# engage only. RAISE to allow higher reaches; LOWER to be stricter.
+AIR_ENGAGE_MAX_ABOVE_SHOULDER_M = 0.15
+
 # Hysteresis: once engaged, the hand may relax back to within this (smaller)
 # forward distance before we DISENGAGE, so the cursor doesn't flicker on/off at
 # the exact threshold. Must be < AIR_ENGAGE_FORWARD_M.
@@ -251,6 +266,18 @@ def _hand_height_above_waist(joints: dict, side: str,
     if not _joint_ok(hand) or waist_y is None:
         return None
     return float(hand[1]) - waist_y
+
+
+def _hand_above_shoulder(joints: dict, side: str) -> Optional[float]:
+    """hand.y − shoulder.y in metres (POSITIVE = the hand is raised above the
+    shoulder). Used to reject raised/stretched arms from STARTING engagement — a
+    reach-to-control sits at/below shoulder height. None when we can't tell (a
+    missing shoulder must never block engagement — fail open)."""
+    hand = joints.get(f"hand_{side}")
+    shoulder = joints.get(f"shoulder_{side}")
+    if not _joint_ok(hand) or not _joint_ok(shoulder):
+        return None
+    return float(hand[1]) - float(shoulder[1])
 
 
 def _engagement_score(joints: dict, side: str,
@@ -391,8 +418,18 @@ class AirControlEngine:
                      and above >= AIR_ENGAGE_ABOVE_WAIST_M)
             engaged_now = still
         else:
+            # FRESH engagement also rejects a raised/stretched arm: the hand must
+            # not be more than AIR_ENGAGE_MAX_ABOVE_SHOULDER_M above the shoulder.
+            # This is the fix for "false triggers when I raise my hands" — those
+            # cleared forward + above-waist but sat well above shoulder height. A
+            # missing shoulder joint fails OPEN (None → no block) so tracking gaps
+            # never make the cursor un-grabbable. NOT applied to the hysteresis
+            # branch above, so a brief rise mid-control won't drop you.
+            above_sh = _hand_above_shoulder(joints, side)
             engaged_now = (fwd >= AIR_ENGAGE_FORWARD_M
-                           and above >= AIR_ENGAGE_ABOVE_WAIST_M)
+                           and above >= AIR_ENGAGE_ABOVE_WAIST_M
+                           and (above_sh is None
+                                or above_sh <= AIR_ENGAGE_MAX_ABOVE_SHOULDER_M))
 
         if not engaged_now:
             return self._idle_or_release("hand retracted")

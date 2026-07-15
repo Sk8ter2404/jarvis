@@ -1201,6 +1201,14 @@ STANDBY_WHISPER_PREFER_GPU        = False
 # consumer (the monolith, core.voice_pipeline, the skills) sees the overridden
 # value with no extra wiring.
 #
+# Secrets are env/.env ONLY (see the BAMBU_* constants: "never commit"). The
+# apply-loop below blindly overrides any config constant named in the settings
+# file, so a credential written there — as the printer-reconnect flow once did —
+# would defeat the env contract AND persist a secret into a settings file. These
+# keys are therefore never sourced from user_settings.json. 2026-07-15.
+_ENV_ONLY_KEYS = frozenset({"BAMBU_PRINTER_IP", "BAMBU_ACCESS_CODE", "BAMBU_SERIAL"})
+
+
 # Safe + best-effort (the second import-time I/O in this file, after
 # RAG_INDEX_PATHS): we override ONLY a constant that already exists here — so the
 # GUI's schema, which is curated FROM this file, is the allow-list — coerce to
@@ -1232,8 +1240,8 @@ def _apply_user_settings() -> None:
     g = globals()
     for key, val in data.items():
         key = _LEGACY_KEY_ALIASES.get(key, key)
-        if key.startswith("_") or key not in g:
-            continue          # only override an existing public config constant
+        if key.startswith("_") or key not in g or key in _ENV_ONLY_KEYS:
+            continue          # existing public, non-secret constants only
         cur = g[key]
         # int|None knobs (current value None or a non-bool int) — e.g.
         # MICROPHONE_INDEX / SPEAKER_INDEX — accept an explicit null/blank as

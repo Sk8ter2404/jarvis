@@ -156,5 +156,52 @@ class HeaderRegexRegressionTests(unittest.TestCase):
         self.assertIn("open_url", self.core)
 
 
+class WrappedHeaderRegressionTests(unittest.TestCase):
+    """Locks in the 2026-07-15 SECOND header fix. 14 real headers wrap their
+    descriptive parenthetical across lines, and 3 more used '+'/em-dash/lowercase
+    in the head — all invisible to the single-line uppercase-only matcher, so
+    those 17 capability blocks were folded into a neighbour and dropped from the
+    INDEX. This suite fails if any of that regresses."""
+
+    def setUp(self):
+        self.core, self.sections = pr.split_pc_control(FULL)
+        self.names = [n for n, _ in self.sections]
+
+    def test_previously_wrapped_headers_now_recognized(self):
+        for want in ("AIR CONTROL", "STREAMING SERVICES", "TASTE-AWARE MUSIC",
+                     "FOCUS MODE / DO-NOT-DISTURB", "WEB INTERFACE", "CALENDAR",
+                     "WEATHER BRIEFING", "PATTERN LEARNING", "REPO ROBOT PROJECT",
+                     "SUIT DIAGNOSTICS", "LOCAL VOICE CLONE", "WAKE-WORD MODE",
+                     "WELLNESS / FOCUS NUDGES"):
+            self.assertIn(want, self.names, f"wrapped header {want!r} not recognized")
+
+    def test_punctuated_and_versioned_headers_recognized(self):
+        for want in ("MUSIC + VIDEO PLAYBACK", "SMART HOME — PER-BRAND LIST",
+                     "KINECT DEPTH SENSOR", "MULTI-STEP TASKS"):
+            self.assertIn(want, self.names, f"{want!r} not recognized")
+
+    def test_no_wrapped_header_left_unmatched(self):
+        # after join, no line should look like a header TAIL (ends in '):' with
+        # its '(' on an earlier line) — that shape means a header still wrapped.
+        joined = pr._join_wrapped_headers(FULL.split("\n"))
+        orphan_tails = [l.strip() for l in joined
+                        if l.strip().endswith("):") and "(" not in l]
+        self.assertEqual(orphan_tails, [],
+                         f"headers still wrapping across lines: {orphan_tails}")
+
+    def test_weather_briefing_body_loads_on_weather_turn(self):
+        # the concrete symptom that started this: a weather turn must load the
+        # real WEATHER BRIEFING instructions, not just see its name in the INDEX.
+        slim = pr.slim_pc_control("what's the weather going to be", FULL)
+        self.assertIn("WEATHER BRIEFING", slim)
+        self.assertIn("weather_briefing", slim)  # the action name from its body
+
+    def test_every_section_including_new_ones_has_routing(self):
+        uncovered = [n for n in self.names
+                     if n.upper() not in pr._ALWAYS and not pr._keywords_for(n)]
+        self.assertEqual(uncovered, [],
+                         f"recognized sections without keyword routing: {uncovered}")
+
+
 if __name__ == "__main__":
     unittest.main()
