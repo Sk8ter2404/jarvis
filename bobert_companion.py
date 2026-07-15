@@ -1346,6 +1346,12 @@ def merge_memory(new_facts=None, new_projects=None, new_topic=""):
 
         save_memory(memory)
 
+    # Mirror the newly-learned durable facts/projects into the SEMANTIC long-term
+    # store (chroma + BM25) so fuzzy/paraphrase recall covers everything JARVIS
+    # learns — not just the 23 facts frozen on migration day. Fire-and-forget,
+    # gated, exception-isolated (see _ltm_learn_facts): it can never block or
+    # break this write, and store A (bobert_memory.json) is already saved above.
+    _ltm_learn_facts(added_facts, added_projects)
     return added_facts, added_projects
 
 
@@ -10184,6 +10190,42 @@ def _ltm_worker_loop() -> None:
             ltm.record_turn(role, text)
         except Exception as e:
             print(f"  [ltm] record_turn failed: {e}")
+
+
+def _ltm_learn_facts(facts, projects=None) -> None:
+    """Mirror newly-learned durable facts/projects into the SEMANTIC LTM store
+    (chroma vectors + facts.json + BM25) via long_term_memory.add_fact, which
+    embeds (bge-small) and upserts with its own exact-text dedupe. Fire-and-
+    forget on a daemon thread; NEVER blocks merge_memory or raises into it.
+
+    Closes the 2026-05-28 sync gap: merge_memory (store A, bobert_memory.json)
+    and the semantic store were never wired together, so 97+ facts learned after
+    migration day never became fuzzy-searchable. Gated on _ltm_enabled() (which
+    also honours the JARVIS_STAGING guard) so blue/green test injects can't
+    pollute the real store."""
+    if not _ltm_enabled():
+        return
+    items = [(f, "learned") for f in (facts or [])] + \
+            [(p, "project") for p in (projects or [])]
+    items = [(t.strip(), tag) for (t, tag) in items
+             if isinstance(t, str) and t.strip()]
+    if not items:
+        return
+    ltm = _ltm_module()
+    if ltm is None:
+        return
+
+    def _worker():
+        for text, tag in items:
+            try:
+                ltm.add_fact(text, source="merge_memory", tags=[tag])
+            except Exception as e:
+                print(f"  [ltm] learn_fact failed: {e}")
+
+    try:
+        threading.Thread(target=_worker, name="ltm-learn", daemon=True).start()
+    except Exception:
+        pass
 
 
 def _ltm_enqueue(role: str, text: str) -> None:

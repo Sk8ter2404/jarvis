@@ -68,11 +68,12 @@ SKILLS_ENABLED = True
 # blocks the voice loop). Overridable via data/user_settings.json.
 LTM_ENABLED = True
 # Torch device for the LTM sentence-transformer embedder (bge-small, ~0.4GB).
-# "" = historical default (cuda if available, else cpu). Set "cpu" to keep the
-# embedder OFF the GPU — encoding a short utterance on a modern CPU is a few ms
-# (well inside the 0.6s recall budget), and the freed VRAM goes to the local
-# LLM, which is the tenant that actually needs it. 2026-07-10.
-LTM_EMBED_DEVICE = ""
+# "cpu" (default 2026-07-15): keep the embedder OFF the GPU — encoding a short
+# utterance on the 14900K is a few ms (well inside the 0.6s recall budget), and
+# the freed VRAM goes to the local LLM (now the 26B), the tenant that actually
+# needs it. The old "" auto-default silently loaded it on CUDA on this box. Set
+# "" to restore auto (cuda if available), or a specific device to override.
+LTM_EMBED_DEVICE = "cpu"
 
 # ─── Streaming TTS (sentence-flush) ────────────────────────────────────
 # Speak the first complete, action-free sentence(s) of a Claude reply WHILE
