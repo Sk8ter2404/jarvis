@@ -1981,5 +1981,78 @@ class DevicePeriodicReenumTests(unittest.TestCase):
         self.assertIn("last_reenum_at", self.bc._device_cache)
 
 
+class DispatcherCommaIsGatedTests(unittest.TestCase):
+    """Bug-hunt #10. _STRONG_SEP_RE split eagerly on ANY bare comma, tearing a
+    comma-bearing ENTITY ("Earth, Wind and Fire") into a bogus second action.
+    Bare " and " was already gated on a command-verb RHS; bare comma must be
+    gated the same way."""
+
+    def test_entity_commas_are_not_split(self):
+        from core.dispatcher import _split_chain
+        for u in ("play Earth, Wind and Fire",
+                  "set a timer for 1, 2, 3",
+                  "remind me to call Bob, Jr."):
+            segs = _split_chain(u)
+            self.assertEqual(len(segs), 1,
+                             f"{u!r} is one action, not a chain: {segs}")
+
+    def test_real_command_boundary_still_splits(self):
+        from core.dispatcher import _split_chain
+        segs = _split_chain("dim the lights, play jazz")
+        self.assertEqual(len(segs), 2, f"a real command boundary must split: {segs}")
+        self.assertIn("dim the lights", segs[0])
+        self.assertIn("play jazz", segs[1])
+
+    def test_comma_with_connector_is_still_strong(self):
+        from core.dispatcher import _split_chain
+        # ", and then" is a genuine chain marker (kept in _STRONG_SEP_RE).
+        segs = _split_chain("open chrome, and then play music")
+        self.assertEqual(len(segs), 2, segs)
+
+
+@requires_monolith
+class OrchestratorSyncPathIsBoundedTests(unittest.TestCase):
+    """Bug-hunt #9. orchestrate()'s no-running-loop branch (the path production
+    actually takes) called loop.run_until_complete() with NO wall-clock ceiling,
+    while the sibling running-loop branch was bounded. A wedged worker could
+    block the synchronous main voice turn indefinitely. Both branches must go
+    through the same bounded executor."""
+
+    def test_both_paths_use_the_bounded_executor(self):
+        # The two branches were unified; assert the direct unbounded
+        # run_until_complete on the sync path is gone and the executor+timeout
+        # guard is the sole path.
+        with open(os.path.join(_PROJECT, "core", "orchestrator.py"),
+                  encoding="utf-8") as fh:
+            src = fh.read()
+        orch = src.split("    def orchestrate(")[1].split("\ndef orchestrate(")[0]
+        self.assertIn(".result(timeout=self._overall_timeout_s())", orch)
+        # Exactly one ACTUAL run_until_complete CALL remains (inside _runner) —
+        # count non-comment lines only, so the explanatory comment that mentions
+        # run_until_complete() in prose isn't miscounted (a recurring trap).
+        calls = [ln for ln in orch.splitlines()
+                 if "run_until_complete(" in ln
+                 and not ln.lstrip().startswith("#")]
+        self.assertEqual(len(calls), 1,
+                         f"the sync path must not have its own unbounded "
+                         f"run_until_complete: {calls}")
+
+
+class OrchestratorEmptySummaryKeepsRawDataTests(unittest.TestCase):
+    """Bug-hunt #20. _claude_call/_ollama_call return "" (not raise) on an empty
+    completion, so an empty summary slipped past the except and dropped the whole
+    sub-agent section though real tool data WAS fetched. Fall back to raw data on
+    empty-success too."""
+
+    def test_empty_summary_falls_back_to_raw_data(self):
+        with open(os.path.join(_PROJECT, "core", "orchestrator.py"),
+                  encoding="utf-8") as fh:
+            src = fh.read()
+        worker = src.split("_run_worker_sync")[1]
+        self.assertIn('if not (output or "").strip() and (real_data or "").strip():',
+                      worker,
+                      "an empty summary must fall back to the fetched raw data")
+
+
 if __name__ == "__main__":
     unittest.main()

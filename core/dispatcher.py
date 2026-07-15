@@ -316,10 +316,18 @@ _STRONG_SEP_RE = re.compile(
     r"|\s+then\s+"
     r"|\s+also\s+"
     r"|\s+plus\s+"
-    r"|,\s+"
+    # NOTE: the bare `,\s+` alternative was REMOVED (2026-07-14 bug-hunt #10).
+    # It split eagerly on ANY comma, so "play Earth, Wind and Fire" and "set a
+    # timer for 1, 2, 3" and "remind me to call Bob, Jr." tore a comma-bearing
+    # ENTITY into a bogus second action. A comma followed by a real chain
+    # connector (line 1 above: ", and then …") is still a strong marker; a BARE
+    # comma is now gated by _split_on_comma, exactly like bare " and ".
     r")",
     re.IGNORECASE,
 )
+
+# Bare comma — split only where the right-hand side opens with a command verb.
+_COMMA_SEP_RE = re.compile(r",\s+")
 
 # Bare " and " — only used after a stronger marker has confirmed the
 # utterance is structurally a chain, OR the right-hand side begins with
@@ -386,6 +394,22 @@ def _split_on_and(chunk: str) -> list[str]:
     return pieces
 
 
+def _split_on_comma(chunk: str) -> list[str]:
+    """Split `chunk` on a bare ', ', but only where the right-hand side opens
+    with a recognized command verb — the same gate _split_on_and uses. This
+    keeps 'play Earth, Wind and Fire' and 'call Bob, Jr.' intact while still
+    catching 'dim the lights, play jazz'. 2026-07-14 bug-hunt #10."""
+    pieces: list[str] = []
+    last = 0
+    for m in _COMMA_SEP_RE.finditer(chunk):
+        rhs = chunk[m.end():]
+        if _looks_like_command_start(rhs):
+            pieces.append(chunk[last:m.start()])
+            last = m.end()
+    pieces.append(chunk[last:])
+    return pieces
+
+
 def _split_chain(utterance: str) -> list[str]:
     """Split into segments using strong separators eagerly, then bare
     ' and ' only at command-verb boundaries.
@@ -400,8 +424,9 @@ def _split_chain(utterance: str) -> list[str]:
     strong = _STRONG_SEP_RE.split(s)
     expanded: list[str] = []
     for chunk in strong:
-        for piece in _split_on_and(chunk):
-            expanded.append(piece)
+        for comma_piece in _split_on_comma(chunk):
+            for piece in _split_on_and(comma_piece):
+                expanded.append(piece)
     return [p.strip() for p in expanded if p and p.strip()]
 
 

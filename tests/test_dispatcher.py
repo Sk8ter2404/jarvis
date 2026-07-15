@@ -189,15 +189,27 @@ class ChainResolverTests(unittest.TestCase):
         self.assertIsNone(
             d.command_chain_resolver("play Earth Wind and Fire", ACTIONS))
 
-    def test_unknown_segment_captured_via_comma(self):
-        # A comma forces a 3-way split; the middle non-command becomes unknown
-        # while the two real commands still form a chain.
+    def test_comma_splits_only_at_command_boundaries(self):
+        # 2026-07-14 bug-hunt #10: bare commas are now GATED on a command-verb
+        # RHS (like bare " and "), so an eager comma no longer tears a
+        # comma-bearing entity apart. Here the comma before "take a screenshot"
+        # splits (a command verb) but the non-command aside "ponder the
+        # universe" stays attached to the play segment rather than becoming its
+        # own bogus action. The two real commands still form a chain.
         r = d.command_chain_resolver(
             "play jazz, ponder the universe, take a screenshot", ACTIONS)
         self.assertIsNotNone(r)
         self.assertEqual([s.action for s in r.steps],
                          ["play_music", "screenshot"])
-        self.assertEqual(r.unknown, ["ponder the universe"])
+
+    def test_entity_comma_is_not_split(self):
+        # The motivating case: a comma INSIDE an entity name must NOT create a
+        # spurious chain. "play Earth, Wind and Fire" is ONE action, so the
+        # chain resolver returns None (single commands aren't chains) rather
+        # than the bogus 2-step ["play Earth", "Wind and Fire"] the old eager
+        # comma split produced.
+        self.assertIsNone(
+            d.command_chain_resolver("play Earth, Wind and Fire", ACTIONS))
 
     def test_empty_utterance_returns_none(self):
         self.assertIsNone(d.command_chain_resolver("", ACTIONS))

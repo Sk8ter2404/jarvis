@@ -587,6 +587,18 @@ def _run_worker_sync(
                   spec.name, e)
         output = real_data
 
+    # EMPTY-SUCCESS GUARD (2026-07-14 bug-hunt #20). _claude_call / _ollama_call
+    # return "" (not raise) when the model emits no text block, so a summarizer
+    # that came back empty slipped PAST the except above and dropped the whole
+    # sub-agent section — even though real tool data WAS fetched. Mirror the
+    # exception path: fall back to the genuinely-fetched raw data rather than
+    # publishing an empty summary. Honours the function's "still real, never
+    # fabricated" contract.
+    if not (output or "").strip() and (real_data or "").strip():
+        _log.info("orchestrator: worker %s returned an empty summary — using "
+                  "raw tool data", spec.name)
+        output = real_data
+
     return SubTaskResult(
         sub_agent=spec.name,
         task=task.task,
@@ -850,55 +862,46 @@ class Orchestrator:
     ) -> str:
         """Sync wrapper around `orchestrate_async`. Safe to call from the
         main turn-based loop, which is itself synchronous."""
-        # If a loop is *currently running* in this thread, we can't drive
-        # another one — hand off to a worker thread with its own fresh loop.
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
-        if running is not None:
-            import concurrent.futures
+        import concurrent.futures
 
-            def _runner() -> str:
-                loop = asyncio.new_event_loop()
-                try:
-                    asyncio.set_event_loop(loop)
-                    return loop.run_until_complete(
-                        self.orchestrate_async(request, actions)
-                    )
-                finally:
-                    loop.close()
-
-            # Coarse top-level backstop. orchestrate_async is already bounded
-            # internally (planner + per-worker waits + merger each have their
-            # own timeouts), but this guarantees the synchronous caller — the
-            # main voice turn loop — can never block indefinitely on .result()
-            # even if the worker loop itself wedged. On timeout return "" (the
-            # documented "nothing applicable ran" contract) so the turn proceeds.
-            ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        # Run orchestrate_async in a WORKER THREAD with its own fresh loop, in
+        # BOTH cases (2026-07-14 bug-hunt #9). A worker thread is required when a
+        # loop is already running in this thread; it is also HARMLESS when one
+        # isn't. Doing it unconditionally lets the same wall-clock backstop guard
+        # both paths — the no-running-loop branch used to call
+        # loop.run_until_complete() directly with NO ceiling, so a wedged worker
+        # loop could block the synchronous MAIN VOICE TURN indefinitely on the
+        # exact path production actually takes (_maybe_orchestrate → orchestrate,
+        # no ambient loop running). The bounded branch's docstring promised a
+        # guarantee the other branch didn't honour.
+        def _runner() -> str:
+            loop = asyncio.new_event_loop()
             try:
-                return ex.submit(_runner).result(timeout=self._overall_timeout_s())
-            except concurrent.futures.TimeoutError:
-                _log.warning(
-                    "orchestrator: overall pipeline exceeded %.0fs — abandoning",
-                    self._overall_timeout_s(),
+                asyncio.set_event_loop(loop)
+                return loop.run_until_complete(
+                    self.orchestrate_async(request, actions)
                 )
-                return ""
             finally:
-                # Don't block on a wedged worker thread during teardown.
-                ex.shutdown(wait=False)
+                loop.close()
 
-        # No running loop in this thread. Always build a fresh one — never
-        # touch asyncio.get_event_loop() (deprecated in 3.12+) or asyncio.run
-        # (refuses when another loop has been installed via set_event_loop).
-        loop = asyncio.new_event_loop()
+        # Coarse top-level backstop. orchestrate_async is already bounded
+        # internally (planner + per-worker waits + merger each have their own
+        # timeouts), but this guarantees the synchronous caller — the main voice
+        # turn loop — can never block indefinitely on .result() even if the
+        # worker loop itself wedged. On timeout return "" (the documented
+        # "nothing applicable ran" contract) so the turn proceeds.
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
-            asyncio.set_event_loop(loop)
-            return loop.run_until_complete(
-                self.orchestrate_async(request, actions)
+            return ex.submit(_runner).result(timeout=self._overall_timeout_s())
+        except concurrent.futures.TimeoutError:
+            _log.warning(
+                "orchestrator: overall pipeline exceeded %.0fs — abandoning",
+                self._overall_timeout_s(),
             )
+            return ""
         finally:
-            loop.close()
+            # Don't block on a wedged worker thread during teardown.
+            ex.shutdown(wait=False)
 
 
 # ──────────────────────────────────────────────────────────────────────────
