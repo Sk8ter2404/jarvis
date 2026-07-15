@@ -8532,7 +8532,8 @@ _RESOLVED_LOCAL_LLM_MODEL: list[str | None] = [None]
 # available" can still pick them as a last resort, and the empty-response failover
 # self-heals if that happens.
 _LOCAL_LLM_PREFERENCE = (
-    "gemma4:12b",
+    "gemma4:26b-a4b-it-qat",         # P2 phase B default: 26B MoE, multimodal, ~100 tok/s
+    "gemma4:12b",                    # graceful lower-VRAM fallback (still multimodal)
     "qwen2.5:14b-instruct-q5_K_M",
     "qwen3:14b",
     "llama3.1:8b-instruct-q5_K_M",

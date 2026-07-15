@@ -186,19 +186,21 @@ CLAUDE_OPTIONAL = True
 # (~22 GB resident) was retired — it left no headroom and bricked the GPU
 # whenever vision or whisper co-loaded.
 LOCAL_LLM_FALLBACK = True
-# 2026-07-10: gemma4:12b won the on-box bake-off on the REAL ~10k-token prod
-# prompt — 7/7 (action grammar, honesty, reasoning), 0.6s warm turns, ZERO empty
-# replies, 8.4GB fully GPU-resident @16k ctx (vs qwen2.5:14b 6/7 @13.5GB), and
-# it is MULTIMODAL so chat+vision share ONE resident model (no more chat<->VLM
-# swap thrash — the swaps were wedging ollama's llama-server mid-eviction).
-# Benchmarks: ~77 MMLU-Pro, clearly above Qwen2.5-14B. Thinking disabled via
-# the API `think:false` param (_local_think_param). NOT the 26b-a4b MoE — that
-# quant returns EMPTY output (known ollama bugs #15428/#16456). Disqualified on
-# this 24GB box: qwen3:30b/qwen3.6 (redline the card to <0.3GB free beside the
-# voice clone; qwen3.6 cold turn measured 286s offloaded), gpt-oss:20b (2/7
-# EMPTY replies — Harmony-format quirk). Override per-box via
-# JARVIS_LOCAL_LLM_MODEL or user_settings when more VRAM is free.
-LOCAL_LLM_MODEL    = "gemma4:12b"
+# 2026-07-15 (P2 phase B): PROMOTED to gemma4:26b-a4b-it-qat now that TTS moved
+# OFF the 3090 (Kokoro-on-CPU) freed ~13GB. The old "26b-a4b returns EMPTY output
+# (ollama #15428/#16456)" claim is STALE — a fresh on-box measurement proved it
+# fixed on the current ollama: 0 empties across 5 real >7k-token-prompt turns,
+# 94-110 tok/s, and 18794MiB resident with the brain alone → ~5.8GB free (vs the
+# old ~1.8GB beside the resident clone). It's a 26B MoE (4B active) so it's both
+# smarter and fast, and — critically — MULTIMODAL, so chat+vision keep sharing ONE
+# resident model (no chat<->VLM swap thrash). Thinking disabled via think:false
+# (_local_think_param: gemma4* → false). gemma4:12b is retained as the graceful
+# lower-VRAM fallback (_LOCAL_LLM_PREFERENCE[1] + the empty-response failover).
+# The on-demand voice clone is now VRAM-GATED (core/voice_clone._resolve_device):
+# 26B leaves 5.8GB free < the clone's ~6GB gate, so arming the clone degrades to
+# Kokoro instead of OOM-contending the card. qwen3:30b-a3b stays a text-only opt-in
+# "max brain" (breaks the shared-vision property). Override via JARVIS_LOCAL_LLM_MODEL.
+LOCAL_LLM_MODEL    = "gemma4:26b-a4b-it-qat"
 # 127.0.0.1, NEVER "localhost" (2026-07-12): Windows resolves localhost to
 # ::1 first, and when Ollama listens only on IPv4 the ::1 attempt eats a
 # measured, rock-steady ~2.05s before falling back — pushing every request
@@ -331,11 +333,12 @@ ORCHESTRATOR_MERGER_TIMEOUT_S   = 20.0
 # chat tag, or when there is VRAM headroom for both models at once.
 # Set LOCAL_VISION_MODEL to "off" to disable local vision entirely.
 LOCAL_VISION_FALLBACK = False
-# Same tag as LOCAL_LLM_MODEL: gemma4:12b is multimodal, so vision re-uses the
+# Same tag as LOCAL_LLM_MODEL: gemma4:26b-a4b is multimodal, so vision re-uses the
 # RESIDENT chat model — no eviction/swap, no over-commit (the chat<->VLM swap
-# was wedging llama-server mid-eviction, live outage 2026-07-10 09:13). Vision
-# verified on-box: read synthetic screen text correctly with think:false.
-LOCAL_VISION_MODEL    = "gemma4:12b"
+# was wedging llama-server mid-eviction, live outage 2026-07-10 09:13). Kept in
+# lockstep with LOCAL_LLM_MODEL so promoting the brain never forks vision onto a
+# second VLM. Vision verified on-box with think:false.
+LOCAL_VISION_MODEL    = "gemma4:26b-a4b-it-qat"
 
 
 # ─── Local image generation (skills/image_gen.py) ──────────────────────

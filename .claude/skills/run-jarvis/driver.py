@@ -95,12 +95,14 @@ def is_running() -> bool:
 def boot(timeout: float = 45.0) -> bool:
     print("[driver] booting JARVIS via _boot_jarvis.ps1 ...", file=sys.stderr)
     env = dict(os.environ)
-    # Big local models brick a 24GB GPU once chatterbox + whisper + vision also
-    # load; the gemma4:26b-a4b Q4_0 build returns EMPTY output (broken quant,
-    # 2026-07-09). gemma4:12b won the 2026-07-10 on-box bake-off (7/7 on the
-    # real prod prompt, 8.4GB resident, multimodal so vision shares the same
-    # model). Harmless on a box with more VRAM / cloud routing.
-    env.setdefault("JARVIS_LOCAL_LLM_MODEL", "gemma4:12b")
+    # 2026-07-15 (P2 phase B): default brain is gemma4:26b-a4b-it-qat now that TTS
+    # moved OFF the 3090 (Kokoro-on-CPU) freed ~13GB. Measured on-box: 0 empties
+    # over 5 real turns, 94-110 tok/s, 18.8GB resident → ~5.8GB free with the brain
+    # alone (the old "26b returns EMPTY" claim was a since-fixed ollama bug). 26B MoE,
+    # multimodal so vision shares it. Falls back to gemma4:12b via _LOCAL_LLM_PREFERENCE
+    # + the empty-response failover. Only set as a DEFAULT (setdefault) so a per-boot
+    # JARVIS_LOCAL_LLM_MODEL override (A/B, or a lower-VRAM box) still wins.
+    env.setdefault("JARVIS_LOCAL_LLM_MODEL", "gemma4:26b-a4b-it-qat")
     try:
         subprocess.run(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", BOOT],

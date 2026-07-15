@@ -383,7 +383,7 @@ SCHEMA: dict[str, dict] = {
     },
     "LOCAL_LLM_MODEL": {
         "tab": "ai", "label": "Local LLM model (Ollama, $0)", "type": "combo",
-        "default": "gemma4:12b",
+        "default": "gemma4:26b-a4b-it-qat",
         "choices": OLLAMA_MODEL_FALLBACK,
         "help": "Ollama tag for the always-on local brain — $0 per conversation. "
                 "The list is your installed Ollama chat models (probed when this "

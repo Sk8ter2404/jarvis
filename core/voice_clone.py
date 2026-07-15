@@ -250,11 +250,16 @@ def _cfg_device() -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Minimum free VRAM we require on an EXPLICITLY chosen CUDA device before we
-# load Chatterbox onto it. Below this we degrade to the normal TTS ladder rather
-# than OOM-contend for gemma's headroom. ~2GB gives the model room to load. Only
-# consulted when VOICE_CLONE_DEVICE names a cuda device (unset knob = old path,
-# no gating). 2026-07-08.
-_MIN_FREE_VRAM_BYTES = 2 * 1024 * 1024 * 1024
+# load Chatterbox onto it. Below this we degrade to the normal TTS ladder (now
+# Kokoro-on-CPU) rather than OOM-contend for the brain's headroom. Raised 2GB→6GB
+# on 2026-07-15 (P2 phase B): Chatterbox needs ~5GB, and the default brain is now
+# gemma4:26b-a4b (18.8GB resident → only ~5.8GB free), so a 6GB gate makes the
+# clone REFUSE to co-load beside the 26B (5.8 < 6 → degrade to Kokoro) instead of
+# squeezing into ~0.8GB and risking an OOM brick under a synthesis/compositor
+# spike. With the smaller gemma4:12b resident (~13GB free) the clone still loads.
+# Now consulted on BOTH paths — the unset-knob default path too (was ungated, the
+# owner's box; a runtime 'use my cloned voice' beside the 26B would otherwise OOM).
+_MIN_FREE_VRAM_BYTES = 6 * 1024 * 1024 * 1024
 
 
 def _device_index(device: str) -> int:
@@ -295,7 +300,14 @@ def _resolve_device() -> Optional[str]:
     override always passes. 2026-07-08."""
     want = _cfg_device().strip()
     if not want:
-        return "cuda" if _cuda_available() else "cpu"
+        # Unset knob (the owner's box): default to CUDA, but VRAM-GATE it now that
+        # the big brain lives on the same card — arming the clone beside a resident
+        # gemma4:26b (only ~5.8GB free) must degrade to the Kokoro ladder, not OOM.
+        # (2026-07-15, P2 phase B.) Falls to CPU if CUDA is present but too full is
+        # not desirable for Chatterbox — return None so the caller uses the ladder.
+        if not _cuda_available():
+            return "cpu"
+        return "cuda" if _free_vram_ok("cuda") else None
     if want.lower().startswith("cpu"):
         return want
     if not _cuda_available():
