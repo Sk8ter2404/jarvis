@@ -73,6 +73,43 @@ def local_num_ctx(model: str) -> int:
     return DEFAULT_NUM_CTX
 
 
+def model_resident(model: str, base_url: str = "http://127.0.0.1:11434",
+                   timeout_s: float = 1.5) -> bool:
+    """True iff ``model`` is ALREADY loaded in Ollama right now.
+
+    The guard for optional, latency-sensitive extras (autocorrect embeddings,
+    reachability pings). With OLLAMA_MAX_LOADED_MODELS=1 — the setting JARVIS
+    persists so Ollama EVICTS rather than co-loads — any request naming a
+    model that is not resident silently evicts whatever IS resident, i.e. the
+    voice brain. A 1.5 s client timeout does not protect you: giving up on the
+    response does not cancel the load the server already started.
+
+    So: nice-to-have callers must ask this FIRST and skip themselves when the
+    answer is False, rather than firing a request that costs a brain reload.
+    Cheap GET of /api/ps; never raises.
+    """
+    tag = (model or "").strip()
+    if not tag:
+        return False
+    import json as _json
+    import urllib.request as _url
+    try:
+        req = _url.Request(f"{base_url.rstrip('/')}/api/ps", method="GET")
+        with _url.urlopen(req, timeout=timeout_s) as resp:
+            payload = _json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return False
+    for m in (payload.get("models") or []):
+        name = (m or {}).get("name") or (m or {}).get("model") or ""
+        if not name:
+            continue
+        # Ollama reports fully-qualified tags ("nomic-embed-text:latest");
+        # accept a bare-name configuration too.
+        if name == tag or name.split(":", 1)[0] == tag.split(":", 1)[0]:
+            return True
+    return False
+
+
 def chat_options(model: str, *, num_predict: int | None = None,
                  temperature: float | None = None,
                  extra: dict | None = None) -> dict:

@@ -2182,7 +2182,13 @@ class FinalStaleDuplicateSweepTests(unittest.TestCase):
         with open(os.path.join(_PROJECT, "bobert_companion.py"),
                   encoding="utf-8") as fh:
             src = fh.read()
-        ki = src.split("except KeyboardInterrupt:")[1][:2000]
+        # Window widened 2000 -> 4000 on 2026-07-21: this guard slices a FIXED
+        # number of characters after the handler head, so simply ADDING a
+        # comment inside the block (the intent-gate note for the watchdog
+        # handshake) pushed the asserted call out of view and failed a test
+        # whose subject had not changed. Keep it comfortably larger than the
+        # block; the assertions below still pin the block's real content.
+        ki = src.split("except KeyboardInterrupt:")[1][:4000]
         self.assertIn("_release_native_resources(sys.modules[\"__main__\"])", ki)
         # The old inlined stale-duplicate calls must be gone from this block.
         self.assertNotIn("_vc_teardown.unload()", ki)

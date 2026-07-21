@@ -68,7 +68,15 @@ from typing import Any, Callable
 
 
 _PROJECT_DIR     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_DATA_DIR        = os.path.join(_PROJECT_DIR, "data")
+# STAGING ISOLATION (2026-07-21): resolve through core.paths so a
+# JARVIS_STAGING process writes data_staging/ instead of the live data/.
+# A private join here is how a staging-isolated action sweep overwrote the
+# LIVE smart-home catalog while the settings md5 tripwire stayed green.
+try:
+    from core.paths import data_dir as _jarvis_data_dir
+    _DATA_DIR = _jarvis_data_dir()
+except Exception:   # pragma: no cover - core.paths is in-tree
+    _DATA_DIR = os.path.join(_PROJECT_DIR, "data")
 _PROFILE_DIR     = os.path.join(_DATA_DIR, "browser_agent_profile")
 _SCREENSHOT_DIR  = os.path.join(_DATA_DIR, "browser_agent_shots")
 

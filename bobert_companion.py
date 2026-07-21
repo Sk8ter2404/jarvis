@@ -8735,6 +8735,40 @@ def _ensure_ollama_running(timeout_sec: float = 90.0) -> bool:
     return False
 
 
+def _boot_tts_label() -> str:
+    """What the boot header should say the TTS is — the engine that will
+    ACTUALLY speak, not a config field that may belong to a different engine.
+
+    The header used to print TTS_VOICE unconditionally. TTS_VOICE is an
+    edge-tts voice id ("en-GB-RyanNeural"), so once TTS_BACKEND moved to
+    'kokoro' (v2.0.84/85) every boot advertised an edge voice while Kokoro's
+    bm_george was doing the talking — the same class of defect as preflight
+    claiming "Claude API: reachable" without probing. Report the backend and
+    the voice that backend really uses; fall back to the edge voice for the
+    edge ladder. NEVER raises — a boot banner must not be able to stop boot.
+    """
+    try:
+        backend = (globals().get("TTS_BACKEND", "edge") or "edge").lower()
+    except Exception:
+        backend = "edge"
+    try:
+        if backend == "kokoro":
+            from core import kokoro_tts as _k
+            voice = getattr(_k, "_VOICE", "") or "?"
+            # is_available() is the same gate the synth ladder uses, so an
+            # unusable model shows as the edge fallback the user will hear.
+            if not _k.is_available():
+                return f"edge:{TTS_VOICE} (kokoro selected but unavailable)"
+            return f"kokoro:{voice} (CPU)"
+        if backend == "xtts":
+            return f"xtts:{os.path.basename(XTTS_VOICE_SAMPLE or '?')}"
+        if backend == "pyttsx3":
+            return "pyttsx3 (SAPI5)"
+    except Exception:
+        pass
+    return f"edge:{TTS_VOICE}"
+
+
 def _local_num_ctx(model: str) -> int:
     """Pick the Ollama num_ctx for a model so it fits 100 % on the 3090.
 
@@ -22360,7 +22394,7 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     robot_str = f"robot @ {ROBOT_IP}:{ROBOT_PORT}" if ROBOT_ENABLED else "VOICE-ONLY (no robot)"
     print(f"\nJ.A.R.V.I.S.  —  [{LOCATION}]  —  {robot_str}")
     _stt_label = f"{_stt_model_name or WHISPER_MODEL} ({_stt_device or 'cpu'})"
-    print(f"AI: {AI_BACKEND}  |  TTS: {TTS_VOICE}  |  STT: whisper-{_stt_label}")
+    print(f"AI: {AI_BACKEND}  |  TTS: {_boot_tts_label()}  |  STT: whisper-{_stt_label}")
     print(f"Mic:      {get_current_mic_name()}")
     print(f"Speakers: {get_current_speaker_name()}")
     print(f"Cameras: {', '.join(c['label'] for c in CAMERAS)}")
@@ -23089,6 +23123,14 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 continue
     except KeyboardInterrupt:
         print("\nShutting down…")
+        # DECLARE INTENT (2026-07-21). Reaching this handler means the owner
+        # asked to stop, so the watchdog handshake flag is legitimate here.
+        # _write_clean_shutdown_flag now refuses to write without this — a
+        # crash used to leave the flag via atexit and permanently convince
+        # the watchdog the death was intentional. This path can finish by
+        # falling out of main() (atexit), so mark intent explicitly rather
+        # than relying only on the failsafe Timer's clean=True.
+        mark_intentional_exit()
         # Stop any audio that might be mid-play/wait so sd.wait() doesn't block
         # FAILSAFE (2026-07-12): none of the teardown steps below are
         # time-bounded (sd.stop / HUD kills can block in native code
@@ -23157,19 +23199,51 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
 _CLEAN_SHUTDOWN_FLAG = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "data", "clean_shutdown.flag")
 
+# Set ONLY by a deliberate stop (voice shutdown, tray quit, restart, Ctrl-C).
+# Guards the watchdog handshake flag — see _write_clean_shutdown_flag.
+_intentional_exit = [False]
 
-def _write_clean_shutdown_flag() -> None:
+
+def mark_intentional_exit() -> None:
+    """Record that the stop about to happen is the OWNER'S choice.
+
+    Only an intentional stop may leave the watchdog handshake flag. See
+    _write_clean_shutdown_flag for why this exists."""
+    _intentional_exit[0] = True
+
+
+def _write_clean_shutdown_flag(force: bool = False) -> None:
     """Leave the watchdog handshake flag so an INTENTIONAL stop isn't
     resurrected. Must be callable EXPLICITLY: os._exit / TerminateProcess
     both skip atexit, so the atexit registration alone never fired on a
     voice shutdown — the watchdog would have rebooted JARVIS five minutes
     after the owner said 'shut down' (masked for weeks by the zombie bug
-    below, found 2026-07-12). Staging processes never touch the prod flag."""
+    below, found 2026-07-12). Staging processes never touch the prod flag.
+
+    INTENT GATE (2026-07-21). This was registered with atexit at boot and
+    took NO argument, so it fired on EVERY normal interpreter exit — which
+    includes an unhandled exception propagating out of main() and every
+    boot-path `sys.exit(1)` (Python runs atexit handlers after printing a
+    traceback). A CRASH therefore left the "I meant to stop" flag behind and
+    tools/jarvis_watchdog.ps1 politely declined to resurrect anything. That
+    is the exact opposite of the handshake's purpose: the flag is supposed to
+    distinguish "owner said stop" from "JARVIS died", and it marked both as
+    the former. Live evidence: JARVIS was down from 2026-07-15 to 2026-07-21
+    with the watchdog task installed, enabled, and never firing.
+
+    Now the flag is written only when someone has declared intent —
+    mark_intentional_exit(), or force=True from the explicit _hard_exit
+    clean paths. The atexit registration keeps covering an intentional plain
+    sys.exit, but a crash now leaves NO flag, so the watchdog resurrects."""
     try:
         if _is_staging():
             return
     except Exception:
         pass
+    if not force and not _intentional_exit[0]:
+        # A crash / unhandled exception / failed boot. Leave no flag so the
+        # watchdog treats this as the unintended death it is.
+        return
     try:
         with open(_CLEAN_SHUTDOWN_FLAG, "w", encoding="utf-8") as _f:
             _f.write(str(time.time()))
@@ -23199,9 +23273,12 @@ def _hard_exit(code: int = 0, *, clean: bool = False) -> None:
     reproduced it on the very next restart (2026-07-12, py-spy dumps).
     TerminateProcess skips DLL notification entirely — it cannot block.
     `clean=True` writes the watchdog handshake flag first (nothing after
-    this call runs, atexit included)."""
+    this call runs, atexit included). clean=True IS the declaration of
+    intent — every caller passing it is an owner-initiated stop — so it
+    forces the write past the _intentional_exit gate."""
     if clean:
-        _write_clean_shutdown_flag()
+        mark_intentional_exit()
+        _write_clean_shutdown_flag(force=True)
     _terminate_process_now(code)
 
 

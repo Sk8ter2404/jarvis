@@ -63,7 +63,15 @@ from core.atomic_io import _atomic_write_json
 # ──────────────────────────── module paths ───────────────────────────
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(PROJECT_DIR, "data")
+# STAGING ISOLATION (2026-07-21): resolve through core.paths so a
+# JARVIS_STAGING process writes data_staging/ instead of the live data/.
+# A private join here is how a staging-isolated action sweep overwrote the
+# LIVE smart-home catalog while the settings md5 tripwire stayed green.
+try:
+    from core.paths import data_dir as _jarvis_data_dir
+    DATA_DIR = _jarvis_data_dir()
+except Exception:   # pragma: no cover - core.paths is in-tree
+    DATA_DIR = os.path.join(PROJECT_DIR, "data")
 STATE_FILE = os.path.join(DATA_DIR, "diagnostic_daemons.json")
 TODO_FILE = os.path.join(PROJECT_DIR, "jarvis_todo.md")
 PIPELINE_RUNS_FILE = os.path.join(DATA_DIR, "pipeline_runs.jsonl")

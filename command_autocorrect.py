@@ -106,6 +106,32 @@ def _fetch_embedding(text: str) -> list[float] | None:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    # RESIDENCY GATE (2026-07-21). This layer is a NICE-TO-HAVE that blends a
+    # 0.25-weight embedding score into a Levenshtein match, and it must never
+    # cost more than it is worth. JARVIS persists OLLAMA_MAX_LOADED_MODELS=1 so
+    # Ollama EVICTS rather than co-loads, which means a request naming
+    # nomic-embed-text while the 16 GB voice brain is resident evicts the brain
+    # and cold-loads the embedder. EMBED_TIMEOUT is 1.5 s, which cannot cover
+    # that load — so this path ALWAYS timed out (the similarity layer was dead
+    # in production, permanently degraded to Levenshtein-only) AND abandoning
+    # the response did NOT cancel the swap the server had already begun. Net
+    # effect: a feature that never worked, charging a brain reload every
+    # EMBED_COOLDOWN seconds. Same class as the RAG boot probe and the
+    # ask_vision num_ctx bug — see core/ollama_opts.
+    #
+    # Ask first, fire second: if the embedder is not already loaded, skip and
+    # let Levenshtein handle it. On a box with room to co-load (or with the
+    # embedder genuinely resident) the layer works exactly as before.
+    try:
+        from core.ollama_opts import model_resident
+        if not model_resident(EMBED_MODEL):
+            _mark_embeddings_dead(f"{EMBED_MODEL} not resident; refusing to "
+                                  f"evict the voice brain for autocorrect")
+            return None
+    except Exception:
+        # Never let the guard itself break dispatch — fall through to the
+        # original behaviour if core.ollama_opts is unavailable.
+        pass
     try:
         with urllib.request.urlopen(req, timeout=EMBED_TIMEOUT) as resp:
             payload = json.loads(resp.read().decode("utf-8"))

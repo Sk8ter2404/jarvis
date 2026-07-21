@@ -58,7 +58,15 @@ import time
 from collections import Counter, defaultdict
 
 _HERE        = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_DATA_DIR    = os.path.join(_HERE, "data")
+# STAGING ISOLATION (2026-07-21): resolve through core.paths so a
+# JARVIS_STAGING process writes data_staging/ instead of the live data/.
+# A private join here is how a staging-isolated action sweep overwrote the
+# LIVE smart-home catalog while the settings md5 tripwire stayed green.
+try:
+    from core.paths import data_dir as _jarvis_data_dir
+    _DATA_DIR = _jarvis_data_dir()
+except Exception:   # pragma: no cover - core.paths is in-tree
+    _DATA_DIR = os.path.join(_HERE, "data")
 _LOG_FILE    = os.path.join(_DATA_DIR, "usage_patterns.jsonl")
 _DB_FILE     = os.path.join(_DATA_DIR, "usage_patterns.sqlite3")
 _AGG_FILE    = os.path.join(_DATA_DIR, "usage_patterns_aggregated.json")

@@ -4629,6 +4629,57 @@ class HardExitTests(MonolithGlobalsTestCase):
                 bc._hard_exit(0, clean=True)
             self.assertFalse(os.path.exists(flag))
 
+    # ── INTENT GATE (2026-07-21) ──────────────────────────────────────────
+    # _write_clean_shutdown_flag was registered with atexit and took no
+    # argument, so it fired on EVERY normal interpreter exit — including an
+    # unhandled exception out of main() and every boot-path sys.exit(1),
+    # because Python runs atexit handlers after printing a traceback. A CRASH
+    # therefore left the "I meant to stop" flag and tools/jarvis_watchdog.ps1
+    # declined to resurrect. Live evidence: JARVIS was down 2026-07-15 →
+    # 2026-07-21 with the watchdog installed and enabled.
+
+    def _flagged(self, bc, d, *, mark, force=False):
+        flag = os.path.join(d, "clean_shutdown.flag")
+        with mock.patch.object(bc, "_CLEAN_SHUTDOWN_FLAG", flag), \
+             mock.patch.object(bc, "_is_staging", return_value=False), \
+             mock.patch.object(bc, "_intentional_exit", [bool(mark)]):
+            bc._write_clean_shutdown_flag(force=force)
+        return os.path.isfile(flag)
+
+    def test_atexit_on_a_crash_leaves_no_flag(self):
+        """The regression that matters: no declared intent → no flag → the
+        watchdog still sees an unintended death and resurrects."""
+        with tempfile.TemporaryDirectory() as d:
+            self.assertFalse(self._flagged(self.bc, d, mark=False))
+
+    def test_atexit_after_declared_intent_writes_flag(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(self._flagged(self.bc, d, mark=True))
+
+    def test_force_bypasses_the_gate(self):
+        """_hard_exit(clean=True) IS the declaration of intent."""
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(self._flagged(self.bc, d, mark=False, force=True))
+
+    def test_mark_intentional_exit_sets_the_flag_variable(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_intentional_exit", [False]) as box:
+            bc.mark_intentional_exit()
+            self.assertTrue(box[0])
+
+    def test_hard_exit_clean_marks_intent_for_any_later_atexit(self):
+        bc = self.bc
+        box = [False]
+        with tempfile.TemporaryDirectory() as d:
+            flag = os.path.join(d, "clean_shutdown.flag")
+            with mock.patch.object(bc, "_CLEAN_SHUTDOWN_FLAG", flag), \
+                 mock.patch.object(bc, "_is_staging", return_value=False), \
+                 mock.patch.object(bc, "_intentional_exit", box), \
+                 mock.patch.object(bc, "_terminate_process_now"):
+                bc._hard_exit(0, clean=True)
+            self.assertTrue(box[0], "clean=True must declare intent")
+            self.assertTrue(os.path.isfile(flag))
+
 
 @requires_monolith
 class ProcessCaptureChunkSkipNsTests(MonolithGlobalsTestCase):
