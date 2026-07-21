@@ -351,18 +351,45 @@ class _OllamaEmbedder:
         return vecs
 
 
-def _ollama_reachable() -> bool:
-    """Cheap one-shot reachability check for the Ollama endpoint.
-    True iff a single embedding round-trip succeeds. Used only for
-    logging / diagnostics; callers can still try and fail loudly."""
+def _ollama_reachable() -> tuple[bool, str]:
+    """Reachability check for the Ollama embedding endpoint, as
+    (ok, reason). `reason` is '' when ok.
+
+    DOES NOT EMBED. This used to do a real one-shot embedding round-trip with
+    a 5 s timeout, which was wrong twice over (both observed live 2026-07-21):
+
+      1. FALSE NEGATIVE. When the 16 GB voice brain is resident — i.e. always,
+         at boot — Ollama must EVICT it and cold-load nomic-embed-text to serve
+         the ping. That takes far longer than 5 s, so the probe timed out and
+         the boot log announced "endpoint unreachable — indexing will fail"
+         about an endpoint that was working perfectly; minutes later the same
+         endpoint served real embeddings.
+      2. SELF-INFLICTED HARM. The probe existed only to print a log line, but
+         issuing it EVICTED the primary brain at boot. With
+         OLLAMA_MAX_LOADED_MODELS=1 an embedding request is never free.
+
+    A GET of /api/tags answers both real questions — is the daemon up, and is
+    the embed model pulled — without loading anything.
+    """
+    base = RAG_OLLAMA_ENDPOINT.split("/api/", 1)[0].rstrip("/")
     try:
-        _OllamaEmbedder(
-            RAG_EMBED_MODEL, RAG_OLLAMA_ENDPOINT,
-            batch_size=1, timeout=5.0,
-        )._embed_one("ping")
-        return True
-    except Exception:
-        return False
+        req = urllib.request.Request(f"{base}/api/tags", method="GET")
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    names = set()
+    for m in (payload.get("models") or []):
+        name = (m or {}).get("name") or (m or {}).get("model") or ""
+        if name:
+            names.add(name)
+            # Ollama reports fully-qualified tags ("nomic-embed-text:latest");
+            # accept a bare-name configuration too.
+            names.add(name.split(":", 1)[0])
+    if RAG_EMBED_MODEL not in names and RAG_EMBED_MODEL.split(":", 1)[0] not in names:
+        return False, (f"daemon is up but model {RAG_EMBED_MODEL!r} is not "
+                       f"pulled (ollama pull {RAG_EMBED_MODEL})")
+    return True, ""
 
 
 def _get_embedder():
@@ -803,11 +830,12 @@ def start(initial_scan: bool = True) -> bool:
         return False
     # One-shot probe so the boot log surfaces an unreachable Ollama
     # before the first index attempt silently piles up errors.
-    if not _ollama_reachable():
+    _reach_ok, _reach_why = _ollama_reachable()
+    if not _reach_ok:
         print(f"  [rag] WARNING: Ollama embeddings endpoint "
-              f"{RAG_OLLAMA_ENDPOINT} unreachable — indexing will fail "
+              f"{RAG_OLLAMA_ENDPOINT} unusable — indexing will fail "
               f"until `ollama serve` is running with model "
-              f"'{RAG_EMBED_MODEL}' pulled")
+              f"'{RAG_EMBED_MODEL}' pulled ({_reach_why})")
     global _indexer_thread
     if _indexer_thread is not None and _indexer_thread.is_alive():
         return True

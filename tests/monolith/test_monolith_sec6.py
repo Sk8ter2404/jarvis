@@ -1931,8 +1931,16 @@ class CublasPreflightTests(SectionSixBase):
 # ════════════════════════════════════════════════════════════════════════════
 class PreflightApiKeyTests(SectionSixBase):
     def test_non_claude_backend_skipped(self):
+        # A SKIP must be distinguishable from a verified-reachable ping:
+        # ok=True (boot continues) but with a non-empty reason, so the boot
+        # log cannot claim "reachable — cloud enhancement active" about an
+        # endpoint it never contacted. Regression for the 2026-07-21 finding
+        # where that line was printed while the account was in fact capped.
         with mock.patch.object(self.bc, "AI_BACKEND", "ollama"):
-            self.assertEqual(self.bc._preflight_api_key(), (True, ""))
+            ok, reason = self.bc._preflight_api_key()
+        self.assertTrue(ok)
+        self.assertTrue(reason, "a skip must carry a reason, not look verified")
+        self.assertIn("not probed", reason)
 
     def test_missing_key_reported(self):
         bc = self.bc

@@ -226,8 +226,17 @@ def _ollama_call(
     base_url: str = "http://127.0.0.1:11434",
     timeout_s: float = 30.0,
 ) -> str:
-    """One-shot Ollama /api/chat. Returns assistant text or raises."""
+    """One-shot Ollama /api/chat. Returns assistant text or raises.
+
+    `options` is NOT optional even though Ollama accepts the request without
+    it. Ollama keys a loaded runner by (model, options), so a call that omits
+    num_ctx does not reuse the voice loop's warm runner — it evicts it and
+    reloads the same weights at the model's own default context (262144 for
+    gemma4:26b-a4b), which does not fit 24 GB and spills the brain to CPU.
+    Proven live 2026-07-21; see core/ollama_opts for the incident record.
+    """
     import urllib.request
+    from core.ollama_opts import chat_options
     payload = json.dumps({
         "model": model,
         "stream": False,
@@ -235,6 +244,7 @@ def _ollama_call(
             {"role": "system", "content": system},
             {"role": "user",   "content": user},
         ],
+        "options": chat_options(model),
     }).encode("utf-8")
     req = urllib.request.Request(
         url=f"{base_url.rstrip('/')}/api/chat",

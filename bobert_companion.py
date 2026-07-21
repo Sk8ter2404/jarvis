@@ -8738,31 +8738,17 @@ def _ensure_ollama_running(timeout_sec: float = 90.0) -> bool:
 def _local_num_ctx(model: str) -> int:
     """Pick the Ollama num_ctx for a model so it fits 100 % on the 3090.
 
-    MEASURED on this box (RTX 3090, 24 GB): the 32B-class q4_K_M at
-    num_ctx=16384 spills ~5 % to CPU and runs ~28 tok/s (fragile); at
-    num_ctx=12288 it stays 100 % on the GPU and runs ~49 tok/s (stable). The
-    production tag is `qwen3:30b-a3b…` (a 30B-param MoE) — same ~21 GB resident
-    footprint, so it needs the tighter window too. Smaller models (14B/8B) have
-    headroom to spare, so they keep the larger 16k window. Heuristic: any tag
-    that looks like a 30B-class (or bigger) model gets the smaller 12k window.
+    THIN DELEGATE. The heuristic itself lives in core.ollama_opts so that
+    non-monolith callers (core/orchestrator.py) can share it instead of
+    sending no options at all — which is what they did until 2026-07-21, when
+    a vision call that omitted num_ctx was proven to EVICT the warm 16k runner
+    and reload the same model at its 262144 default, spilling it to CPU and
+    killing the local brain every 300 s. See core/ollama_opts for the full
+    incident record. This name is kept because the monolith and its test
+    harness reference it everywhere.
     """
-    tag = (model or "").lower()
-    # 30b / 32b / 34b / 65b / 70b / 72b … — the big ones that need the tighter
-    # window. `30b` covers the production qwen3:30b-a3b MoE (previously fell
-    # through to 16k → ~40 % slower + CPU spill every turn).
-    if any(b in tag for b in ("30b", "32b", "34b", "65b", "70b", "72b")):
-        return 12288
-    # General param-parse so any FUTURE ≥30B tag also gets the tight window
-    # without a literal here. Match digit-runs immediately followed by `b`
-    # (e.g. the `30` in `30b`), but NOT the active-param `a3b` MoE suffix —
-    # the leading `a` is excluded so `qwen3:30b-a3b` parses as 30, not 3.
-    try:
-        sizes = [int(n) for n in re.findall(r"(?<![a-z0-9])(\d+)b\b", tag)]
-        if sizes and max(sizes) >= 30:
-            return 12288
-    except Exception:
-        pass
-    return 16384
+    from core.ollama_opts import local_num_ctx as _canonical
+    return _canonical(model)
 
 
 def _local_think_param(model: str):
@@ -9920,7 +9906,26 @@ def _call_local_vision(question: str, png_images: list[bytes],
                 "images": b64_images,
             }],
             "stream": False,
-            "options": {"num_predict": max_tokens},
+            # num_ctx MUST be pinned here, and MUST match the value the chat
+            # path sends (_local_num_ctx) — Ollama keys a loaded runner by
+            # (model, options), so an options set that differs by so much as
+            # the context length is a DIFFERENT runner: it EVICTS the warm one
+            # and reloads the weights. Since the v2.0.33 overhaul chat and
+            # vision are the SAME multimodal tag, so omitting num_ctx here made
+            # every vision call silently reload the brain at the model's own
+            # default context — 262144 for gemma4:26b-a4b. PROVEN live
+            # 2026-07-21 (ollama server.log): `llama_context: n_ctx = 262144`,
+            # `ollama ps` → `16 GB  6%/94% CPU/GPU  CONTEXT 262144`, the 3090
+            # pinned at 24147/24576 MiB, and the next chat turn died on the 50 s
+            # read timeout → "My local model isn't responding and I can't reach
+            # the cloud either, sir." The ambient-extract daemon fires a vision
+            # call every 300 s, so this bricked the local brain on a 5-minute
+            # cycle. It also silently falsified the ALREADY-RESIDENT EXEMPTION
+            # above, whose whole premise is that a vision call needs ZERO new
+            # VRAM because the weights are already on the card — true only when
+            # the runner is actually REUSED, which requires matching options.
+            "options": {"num_predict": max_tokens,
+                        "num_ctx": _local_num_ctx(LOCAL_VISION_MODEL)},
         }
         # Thinking-capable multimodal models (qwen3.x / gemma4) must not spend
         # seconds reasoning before describing a screen; pure VLMs (qwen2.5vl)
@@ -20461,7 +20466,16 @@ def _preflight_api_key(timeout_sec: float = 10.0) -> tuple[bool, str]:
     users don't need the key. The ping uses the cheapest possible
     completion (1 token) so we don't burn cache / quota on boot."""
     if AI_BACKEND != "claude":
-        return True, ""
+        # SKIPPED, not verified. The (ok=True, reason='') pair used to be
+        # indistinguishable from a successful ping, so the caller printed
+        # "Claude API: reachable — cloud enhancement active, sir." on every
+        # local-first boot without ever having sent a request. Live 2026-07-21
+        # that line was flatly false: the account was budget-capped (400
+        # invalid_request_error, "You have reached your specified API usage
+        # limits") and the self-diagnostic said so minutes later — two probes
+        # of one question disagreeing, with boot asserting the wrong one. A
+        # non-empty reason marks the skip so the caller can report honestly.
+        return True, f"not probed: AI_BACKEND is {AI_BACKEND!r}, not 'claude'"
     if not os.environ.get("ANTHROPIC_API_KEY"):
         return False, "ANTHROPIC_API_KEY environment variable is not set"
     try:
@@ -20775,7 +20789,11 @@ def _startup_preflight() -> None:
                 print(f"  [preflight] could not speak the error: {_spk_err}")
             close_log()
             sys.exit(1)
-    if ok:
+    if ok and reason:
+        # Verified-good and skipped are DIFFERENT states; only claim what was
+        # actually tested. See _preflight_api_key for the incident.
+        print(f"  [preflight] Claude API: {reason} — running local-first, sir.")
+    elif ok:
         print(f"  [preflight] Claude API: reachable — cloud enhancement active, sir.")
 
     # (2) cublas64_12.dll — gate whisper's CUDA load attempt.

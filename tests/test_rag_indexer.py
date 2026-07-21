@@ -1,4 +1,4 @@
-"""Thorough unit tests for core.rag_indexer — the personal-files RAG indexer.
+﻿"""Thorough unit tests for core.rag_indexer â€” the personal-files RAG indexer.
 
 The real module lazily imports heavy, optional deps (chromadb, numpy, torch,
 sentence_transformers, pypdf, python-docx, watchdog) and reaches Ollama over
@@ -10,9 +10,9 @@ writes are redirected at a per-test tempdir; threading/sleep is avoided by
 driving the worker functions directly rather than spawning the daemon.
 
 Two paths are exercised:
-  * the with-deps path — chromadb + a fake embedder/reranker are present and
+  * the with-deps path â€” chromadb + a fake embedder/reranker are present and
     indexing/querying/ranking/persistence-stamp logic runs end to end;
-  * the degraded path — ``is_available()`` is forced False (chromadb import
+  * the degraded path â€” ``is_available()`` is forced False (chromadb import
     fails) and every public entrypoint returns its safe empty/early value.
 
 stdlib unittest + unittest.mock only.
@@ -32,8 +32,8 @@ class _LockSetsGlobal:
     """A context-manager stand-in for one of the module's init locks that
     populates a module global on __enter__. Used to exercise the second read of
     each double-checked-lock singleton getter: the outer check sees None, then
-    holding the (fake) lock the global is already set — emulating another thread
-    that won the init race — so the inner re-check returns it without rebuilding.
+    holding the (fake) lock the global is already set â€” emulating another thread
+    that won the init race â€” so the inner re-check returns it without rebuilding.
     """
 
     def __init__(self, attr, value):
@@ -49,7 +49,7 @@ class _LockSetsGlobal:
         return False
 
 
-# ───────────────────────── fake optional deps ──────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ fake optional deps â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # These are installed into sys.modules before the target module is imported
 # so its lazy `import chromadb` / `import numpy` / ... resolve to our fakes.
 
@@ -74,7 +74,7 @@ class _FakeNdArray:
 
 
 class _FakeVec:
-    """A single embedding row — needs .tolist() for the search query path."""
+    """A single embedding row â€” needs .tolist() for the search query path."""
 
     def __init__(self, values):
         self._values = list(values)
@@ -97,7 +97,7 @@ def _make_fake_numpy():
         return _FakeNdArray(rows)
 
     def zeros(shape, dtype=None):
-        # Only ever called as zeros((0, 0)) → an empty 2-D array.
+        # Only ever called as zeros((0, 0)) â†’ an empty 2-D array.
         n = shape[0] if isinstance(shape, (tuple, list)) else shape
         return _FakeNdArray([[] for _ in range(n)])
 
@@ -253,18 +253,18 @@ class _FakeReranker:
         self.predicted.append(list(pairs))
         if self._scores is not None:
             return list(self._scores)[:len(pairs)]
-        # Default: longer snippet → higher score (deterministic ordering).
+        # Default: longer snippet â†’ higher score (deterministic ordering).
         return [float(len(p[1])) for p in pairs]
 
 
-# ── fakes for the optional deps ──────────────────────────────────────────
+# â”€â”€ fakes for the optional deps â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # core.rag_indexer imports every heavy dep LAZILY (inside functions:
 # `import chromadb` in is_available()/_get_collection, `import numpy` inside
 # encode(), `import torch` in _device(), `from sentence_transformers import
 # CrossEncoder` in _get_reranker()). So the target can be imported with the
 # real environment present, and the fakes only need to exist WHILE a test
 # runs. We therefore build the fake-module map once but DO NOT write it into
-# sys.modules at module level — that previously leaked a fake numpy (which has
+# sys.modules at module level â€” that previously leaked a fake numpy (which has
 # no `.array`) process-wide during test discovery and broke every later test
 # using real numpy. Instead _RagBase.setUp installs them via
 # mock.patch.dict(sys.modules, _FAKE_MODULES) so they are scoped to each test
@@ -288,7 +288,7 @@ _FAKE_MODULES = _build_fake_modules()
 from core import rag_indexer as rag  # noqa: E402
 
 
-# ───────────────────────────── base fixture ────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ base fixture â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class _RagBase(unittest.TestCase):
     """Redirects all on-disk paths at a tempdir and resets module singletons /
     tunables / stats between tests so each runs in isolation."""
@@ -334,7 +334,7 @@ class _RagBase(unittest.TestCase):
 
         # Silence the module's diagnostic prints. Besides cutting noise this
         # avoids a Windows-only UnicodeEncodeError: several log lines contain a
-        # '→' arrow which the legacy cp1252 console codec can't encode, and the
+        # 'â†’' arrow which the legacy cp1252 console codec can't encode, and the
         # module's broad except-clauses would otherwise mask the real branch
         # under test. Tests never assert on stdout.
         pp = mock.patch("builtins.print", lambda *a, **k: None)
@@ -400,7 +400,7 @@ class _RagBase(unittest.TestCase):
         return emb
 
 
-# ─────────────────────────── pure helpers ──────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ pure helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class ExclusionAndSupportTests(_RagBase):
     def test_is_excluded_matches_glob(self):
         self.assertTrue(rag._is_excluded(r"C:\proj\node_modules\x.js"))
@@ -470,7 +470,7 @@ class ChunkTests(_RagBase):
         self.assertEqual(rag._chunk("   \n  \n   ", 100, 10), [])
 
 
-# ───────────────────────────── _read_text ──────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ _read_text â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class ReadTextTests(_RagBase):
     def test_reads_plain_text(self):
         p = self._write("notes.txt", "hello sir")
@@ -478,11 +478,11 @@ class ReadTextTests(_RagBase):
 
     def test_unknown_extension_returns_empty(self):
         p = self._write("thing.bin", "data")
-        # .bin isn't in any ext set → falls through to the trailing return "".
+        # .bin isn't in any ext set â†’ falls through to the trailing return "".
         self.assertEqual(rag._read_text(p), "")
 
     def test_text_read_error_returns_empty(self):
-        # open() raising is swallowed → "".
+        # open() raising is swallowed â†’ "".
         with mock.patch("builtins.open", side_effect=OSError("nope")):
             self.assertEqual(rag._read_text(os.path.join(self.tmp, "x.txt")), "")
 
@@ -578,10 +578,10 @@ class ReadTextTests(_RagBase):
             self.assertEqual(rag._read_text(p), "")
 
 
-# ─────────────────────── is_available / _device ────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ is_available / _device â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class AvailabilityTests(_RagBase):
     def test_is_available_true_when_chromadb_imports(self):
-        # The fake chromadb is registered → importable → True.
+        # The fake chromadb is registered â†’ importable â†’ True.
         self.assertTrue(rag.is_available())
 
     def test_is_available_false_when_chromadb_missing(self):
@@ -612,7 +612,7 @@ class AvailabilityTests(_RagBase):
             self.assertEqual(rag._device(), "cpu")
 
 
-# ─────────────────────────── _OllamaEmbedder ───────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ _OllamaEmbedder â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class OllamaEmbedderTests(_RagBase):
     def setUp(self):
         super().setUp()
@@ -625,8 +625,13 @@ class OllamaEmbedderTests(_RagBase):
         p.start()
         self.addCleanup(p.stop)
 
-    def _patch_urlopen(self, payload=None, error=None):
-        """Patch urllib so no real socket is opened."""
+    def _patch_urlopen(self, payload=None, error=None, capture=None):
+        """Patch urllib so no real socket is opened.
+
+        Pass ``capture`` a dict to record what the code under test actually
+        requested (``url``, ``method``, ``data``) — used to prove the
+        reachability probe issues a GET /api/tags and never an embedding POST.
+        """
         class _Resp:
             def __init__(self, body):
                 self._body = body
@@ -642,6 +647,10 @@ class OllamaEmbedderTests(_RagBase):
                 return False
 
         def _fake_urlopen(req, timeout=None):
+            if capture is not None:
+                capture["url"] = getattr(req, "full_url", None) or getattr(req, "url", "")
+                capture["method"] = getattr(req, "method", None)
+                capture["data"] = getattr(req, "data", None)
             if error is not None:
                 raise error
             return _Resp(payload if payload is not None else {"embedding": [1.0, 2.0, 2.0]})
@@ -666,7 +675,7 @@ class OllamaEmbedderTests(_RagBase):
 
     def test_normalise_unit_length(self):
         emb = rag._OllamaEmbedder("m", "http://x")
-        out = emb._normalise([3.0, 4.0])  # length 5 → (0.6, 0.8)
+        out = emb._normalise([3.0, 4.0])  # length 5 â†’ (0.6, 0.8)
         self.assertAlmostEqual(out[0], 0.6, places=6)
         self.assertAlmostEqual(out[1], 0.8, places=6)
 
@@ -723,16 +732,49 @@ class OllamaEmbedderTests(_RagBase):
             with self._patch_urlopen(payload={"embedding": [1.0]}):
                 self.assertEqual(emb._embed_one("x"), [1.0])
 
-    def test_ollama_reachable_true(self):
-        with self._patch_urlopen(payload={"embedding": [1.0]}):
-            self.assertTrue(rag._ollama_reachable())
+    # ── reachability probe ────────────────────────────────────────────────
+    # It must NOT embed. Embedding forces Ollama to evict the resident voice
+    # brain and cold-load the embed model, which (a) took far longer than the
+    # old 5 s timeout so the probe false-reported "unreachable" on every boot,
+    # and (b) bricked the primary brain purely to print a log line. Live
+    # 2026-07-21. The probe now GETs /api/tags: daemon up + model pulled.
+    def test_ollama_reachable_true_when_model_pulled(self):
+        with self._patch_urlopen(payload={"models": [{"name": f"{rag.RAG_EMBED_MODEL}:latest"}]}):
+            ok, why = rag._ollama_reachable()
+        self.assertTrue(ok)
+        self.assertEqual(why, "")
+
+    def test_ollama_reachable_accepts_bare_model_name(self):
+        with self._patch_urlopen(payload={"models": [{"name": rag.RAG_EMBED_MODEL}]}):
+            ok, _ = rag._ollama_reachable()
+        self.assertTrue(ok)
+
+    def test_ollama_reachable_false_when_model_not_pulled(self):
+        with self._patch_urlopen(payload={"models": [{"name": "some-other-model:latest"}]}):
+            ok, why = rag._ollama_reachable()
+        self.assertFalse(ok)
+        self.assertIn("not", why)          # explains the model is missing
+        self.assertIn(rag.RAG_EMBED_MODEL, why)
 
     def test_ollama_reachable_false_on_error(self):
         with self._patch_urlopen(error=urllib.error.URLError("down")):
-            self.assertFalse(rag._ollama_reachable())
+            ok, why = rag._ollama_reachable()
+        self.assertFalse(ok)
+        self.assertTrue(why)               # carries the real reason, not silence
+
+    def test_ollama_reachable_does_not_embed(self):
+        """The regression that matters: the probe must never POST an embedding
+        (that is what evicted the brain)."""
+        seen = {}
+        with self._patch_urlopen(payload={"models": [{"name": rag.RAG_EMBED_MODEL}]},
+                                 capture=seen):
+            rag._ollama_reachable()
+        self.assertNotIn("/api/embeddings", seen.get("url", ""))
+        self.assertIn("/api/tags", seen.get("url", ""))
+        self.assertIsNone(seen.get("data"))   # a GET, no body
 
 
-# ─────────────────────── lazy init singletons ──────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ lazy init singletons â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class GetEmbedderTests(_RagBase):
     def test_creates_and_caches(self):
         e1 = rag._get_embedder()
@@ -769,7 +811,7 @@ class GetRerankerTests(_RagBase):
     def test_double_checked_lock_returns_racer_value(self):
         # Model configured (so the outer guard doesn't short-circuit on a blank
         # name) and _reranker None at the outer check, but populated by the time
-        # we hold the lock → the inner re-check returns it without loading a
+        # we hold the lock â†’ the inner re-check returns it without loading a
         # CrossEncoder.
         rag.RAG_RERANKER_MODEL = "some/model"
         sentinel = object()
@@ -836,7 +878,7 @@ class GetRerankerTests(_RagBase):
             self.assertIsNone(rag._get_reranker())
 
 
-# ─────────────────────────── _get_collection ───────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ _get_collection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class GetCollectionTests(_RagBase):
     def test_returns_cached(self):
         sentinel = object()
@@ -845,7 +887,7 @@ class GetCollectionTests(_RagBase):
 
     def test_double_checked_lock_returns_racer_value(self):
         # _collection None at the outer check but set by the time the lock is
-        # held → the inner re-check returns it without importing chromadb or
+        # held â†’ the inner re-check returns it without importing chromadb or
         # touching disk (the race-loser fast path).
         sentinel = object()
         self.assertIsNone(rag._collection)
@@ -854,7 +896,7 @@ class GetCollectionTests(_RagBase):
             self.assertIs(rag._get_collection(), sentinel)
 
     def test_creates_with_metadata_and_stamps_when_unstamped(self):
-        # Fresh collection comes back with no embed_model → it gets stamped.
+        # Fresh collection comes back with no embed_model â†’ it gets stamped.
         coll = rag._get_collection()
         self.assertIsNotNone(coll)
         self.assertEqual(coll.metadata.get("embed_model"), rag.RAG_EMBED_MODEL)
@@ -872,7 +914,7 @@ class GetCollectionTests(_RagBase):
         orig = chromadb.PersistentClient.get_or_create_collection
 
         def _get_or_create(self, name=None, metadata=None):
-            return _Coll(name=name, metadata={})  # unstamped → triggers modify
+            return _Coll(name=name, metadata={})  # unstamped â†’ triggers modify
 
         chromadb.PersistentClient.get_or_create_collection = _get_or_create
         try:
@@ -883,7 +925,7 @@ class GetCollectionTests(_RagBase):
 
     def test_model_mismatch_keeps_data_by_default(self):
         # Stored stamp differs and RAG_REINDEX_ON_MODEL_CHANGE is False / no
-        # force → the collection is preserved (not dropped).
+        # force â†’ the collection is preserved (not dropped).
         rag.RAG_EMBED_MODEL = "new-model"
         rag.RAG_REINDEX_ON_MODEL_CHANGE = False
         chromadb = sys.modules["chromadb"]
@@ -896,7 +938,7 @@ class GetCollectionTests(_RagBase):
         chromadb.PersistentClient.get_or_create_collection = _get_or_create
         try:
             coll = rag._get_collection()
-            self.assertIs(coll, existing)  # same object → not rebuilt
+            self.assertIs(coll, existing)  # same object â†’ not rebuilt
         finally:
             chromadb.PersistentClient.get_or_create_collection = orig
 
@@ -976,12 +1018,12 @@ class GetCollectionTests(_RagBase):
             chromadb.PersistentClient.get_or_create_collection = orig
 
 
-# ───────────────────────── filesystem walking ──────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ filesystem walking â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class IterFilesTests(_RagBase):
     def test_yields_supported_files(self):
         self._write("root/a.txt", "hi")
         self._write("root/b.md", "yo")
-        self._write("root/pic.png", "binary")  # unsupported → skipped
+        self._write("root/pic.png", "binary")  # unsupported â†’ skipped
         root = os.path.join(self.tmp, "root")
         got = sorted(os.path.basename(p) for p in rag._iter_files(root))
         self.assertEqual(got, ["a.txt", "b.md"])
@@ -1066,14 +1108,14 @@ class FileSignatureTests(_RagBase):
         rag._delete_file("fid")
 
 
-# ───────────────────────────── _index_file ─────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ _index_file â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class IndexFileTests(_RagBase):
     def test_unsupported_skipped(self):
         p = self._write("a.png", "x")
         self.assertEqual(rag._index_file(p), 0)
 
     def test_missing_signature_skipped(self):
-        # Supported ext but the file doesn't exist → sig == "" → 0.
+        # Supported ext but the file doesn't exist â†’ sig == "" â†’ 0.
         self.assertEqual(rag._index_file(os.path.join(self.tmp, "ghost.txt")), 0)
 
     def test_unchanged_file_skipped(self):
@@ -1086,7 +1128,7 @@ class IndexFileTests(_RagBase):
         self.assertEqual(rag._index_file(p), 0)
 
     def test_empty_text_deletes_prior(self):
-        p = self._write("a.txt", "   ")  # whitespace → empty after strip
+        p = self._write("a.txt", "   ")  # whitespace â†’ empty after strip
         coll = self._install_collection()
         self._install_embedder()
         fid = rag._file_id(p)
@@ -1166,7 +1208,7 @@ class IndexFileTests(_RagBase):
         self.assertIn("add(", rag._last_error)
 
 
-# ───────────────────────────── index_once ──────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ index_once â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class IndexOnceTests(_RagBase):
     def test_degraded_when_unavailable(self):
         with mock.patch.object(rag, "is_available", return_value=False):
@@ -1201,13 +1243,13 @@ class IndexOnceTests(_RagBase):
         rag.RAG_INDEX_PATHS = [os.path.join(self.tmp, "docs")]
         self._install_collection()
         self._install_embedder()
-        rag._stop_flag.set()  # already set → inner loop breaks immediately
+        rag._stop_flag.set()  # already set â†’ inner loop breaks immediately
         out = rag.index_once()
         self.assertTrue(out["ok"])
         self.assertEqual(out["files_seen"], 0)
 
     def test_progress_callback_invoked(self):
-        # 25-file cadence → make 25 files so progress fires once.
+        # 25-file cadence â†’ make 25 files so progress fires once.
         for i in range(25):
             self._write(f"docs/f{i:02d}.txt", "content")
         rag.RAG_INDEX_PATHS = [os.path.join(self.tmp, "docs")]
@@ -1264,7 +1306,7 @@ class IndexOnceTests(_RagBase):
 
     def test_garbage_collects_stale_chunks(self):
         # A chunk whose path no longer exists and isn't in seen_files is purged.
-        rag.RAG_INDEX_PATHS = []  # nothing on disk → seen_files empty
+        rag.RAG_INDEX_PATHS = []  # nothing on disk â†’ seen_files empty
         coll = self._install_collection()
         coll._store["ghost:0"] = (
             "old", {"file_id": "ghost", "path": os.path.join(self.tmp, "gone.txt")})
@@ -1292,7 +1334,7 @@ class IndexOnceTests(_RagBase):
         self.assertTrue(out["ok"])
 
 
-# ─────────────────────── _drain_event_queue ────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ _drain_event_queue â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class DrainEventQueueTests(_RagBase):
     def test_reindexes_pending_path(self):
         p = self._write("a.txt", "content")
@@ -1374,7 +1416,7 @@ class DrainEventQueueTests(_RagBase):
             rag._drain_event_queue()
 
 
-# ─────────────────────────── _start_watchdog ───────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ _start_watchdog â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class StartWatchdogTests(_RagBase):
     def test_missing_watchdog_returns_false(self):
         with mock.patch.dict(sys.modules, {"watchdog": None,
@@ -1406,7 +1448,7 @@ class StartWatchdogTests(_RagBase):
         observer = self._FakeObserver(fail_first_schedule=True)
         with self._install_fake_watchdog(observer):
             ok = rag._start_watchdog()
-        # One schedule raised, the other succeeded → overall True.
+        # One schedule raised, the other succeeded â†’ overall True.
         self.assertTrue(ok)
         self.assertEqual(observer.scheduled, 1)
 
@@ -1418,14 +1460,14 @@ class StartWatchdogTests(_RagBase):
             rag._start_watchdog()
         handler = observer.handler
 
-        # Supported file event → enqueued.
+        # Supported file event â†’ enqueued.
         ev = types.SimpleNamespace(is_directory=False, src_path="x.txt", dest_path="")
         handler.on_any_event(ev)
         self.assertEqual(rag._event_q.get_nowait(), "x.txt")
 
-        # Directory event → ignored.
+        # Directory event â†’ ignored.
         handler.on_any_event(types.SimpleNamespace(is_directory=True, src_path="d"))
-        # Unsupported extension → ignored.
+        # Unsupported extension â†’ ignored.
         handler.on_any_event(types.SimpleNamespace(
             is_directory=False, src_path="x.png", dest_path=""))
         self.assertTrue(rag._event_q.empty())
@@ -1492,7 +1534,7 @@ class StartWatchdogTests(_RagBase):
         })
 
 
-# ───────────────────────────── start / stop ────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ start / stop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class StartStopTests(_RagBase):
     def test_start_returns_false_when_unavailable(self):
         with mock.patch.object(rag, "is_available", return_value=False):
@@ -1515,7 +1557,7 @@ class StartStopTests(_RagBase):
                 return self._alive
 
         with mock.patch.object(rag, "is_available", return_value=True), \
-                mock.patch.object(rag, "_ollama_reachable", return_value=True), \
+                mock.patch.object(rag, "_ollama_reachable", return_value=(True, "")), \
                 mock.patch.object(rag, "index_once",
                                   side_effect=lambda: events.__setitem__("scan", 1) or {"ok": True}), \
                 mock.patch.object(rag, "_drain_event_queue",
@@ -1541,7 +1583,7 @@ class StartStopTests(_RagBase):
                 return True
 
         with mock.patch.object(rag, "is_available", return_value=True), \
-                mock.patch.object(rag, "_ollama_reachable", return_value=False), \
+                mock.patch.object(rag, "_ollama_reachable", return_value=(False, "down")), \
                 mock.patch.object(rag, "_start_watchdog", return_value=False), \
                 mock.patch.object(rag.threading, "Thread", _NoopThread):
             # Just exercising the unreachable-warning branch; no assertion on
@@ -1562,7 +1604,7 @@ class StartStopTests(_RagBase):
                 return True
 
         with mock.patch.object(rag, "is_available", return_value=True), \
-                mock.patch.object(rag, "_ollama_reachable", return_value=True), \
+                mock.patch.object(rag, "_ollama_reachable", return_value=(True, "")), \
                 mock.patch.object(rag, "index_once",
                                   side_effect=lambda: events.__setitem__("scan", 1)), \
                 mock.patch.object(rag, "_drain_event_queue",
@@ -1585,7 +1627,7 @@ class StartStopTests(_RagBase):
                 return True
 
         with mock.patch.object(rag, "is_available", return_value=True), \
-                mock.patch.object(rag, "_ollama_reachable", return_value=True), \
+                mock.patch.object(rag, "_ollama_reachable", return_value=(True, "")), \
                 mock.patch.object(rag, "index_once", side_effect=RuntimeError("scan boom")), \
                 mock.patch.object(rag, "_drain_event_queue", return_value=None), \
                 mock.patch.object(rag, "_start_watchdog", return_value=True), \
@@ -1600,7 +1642,7 @@ class StartStopTests(_RagBase):
 
         rag._indexer_thread = _AliveThread()
         with mock.patch.object(rag, "is_available", return_value=True), \
-                mock.patch.object(rag, "_ollama_reachable", return_value=True):
+                mock.patch.object(rag, "_ollama_reachable", return_value=(True, "")):
             self.assertTrue(rag.start())
 
     def test_stop_stops_observer(self):
@@ -1625,11 +1667,11 @@ class StartStopTests(_RagBase):
                 pass
 
         rag._observer = _BadObserver()
-        rag.stop()  # swallow → no raise
+        rag.stop()  # swallow â†’ no raise
         self.assertIsNone(rag._observer)
 
 
-# ─────────────────────────────── search ────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ search â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class SearchTests(_RagBase):
     def _seed_query(self, coll, docs, metas, dists):
         coll.query_return = {
@@ -1666,7 +1708,7 @@ class SearchTests(_RagBase):
     def test_basic_ranking_by_cosine(self):
         coll = self._install_collection()
         self._install_embedder()
-        rag.RAG_RERANKER_MODEL = ""  # no rerank → cosine score order
+        rag.RAG_RERANKER_MODEL = ""  # no rerank â†’ cosine score order
         self._seed_query(
             coll,
             docs=["doc near", "doc far"],
@@ -1772,11 +1814,11 @@ class SearchTests(_RagBase):
         self._install_collection()
         self._install_embedder()
         rag.RAG_RERANKER_MODEL = ""
-        # Default query_return → empty docs/metas/dists.
+        # Default query_return â†’ empty docs/metas/dists.
         self.assertEqual(rag.search("query"), [])
 
 
-# ──────────────────────── configure / config / status ──────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ configure / config / status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class ConfigTests(_RagBase):
     def test_configure_updates_known_keys(self):
         cfg = rag.configure(rag_embed_model="custom-model", rag_chunk_chars=999)
@@ -1851,7 +1893,7 @@ class ConfigTests(_RagBase):
         self.assertTrue(rag.status()["running"])
 
 
-# ──────────────────────────── collection_size ──────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ collection_size â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class CollectionSizeTests(_RagBase):
     def test_returns_count(self):
         coll = self._install_collection()
@@ -1864,7 +1906,7 @@ class CollectionSizeTests(_RagBase):
             self.assertEqual(rag.collection_size(), 0)
 
 
-# ───────────────────────── module-level helpers ────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ module-level helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 class ModuleHelperTests(_RagBase):
     def test_user_home_expands(self):
         self.assertEqual(rag._user_home(), os.path.expanduser("~"))
@@ -1884,3 +1926,4 @@ class ModuleHelperTests(_RagBase):
 
 if __name__ == "__main__":
     unittest.main()
+
