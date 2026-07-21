@@ -176,10 +176,12 @@ class SwipeTests(unittest.TestCase):
         self.clk = _Clock()
         self.rec = kg.GestureRecognizer(now_fn=self.clk)
 
-    def _swipe(self, x_start, x_end, steps=4, dt=0.08, y=0.3):
-        """Move the hand from x_start to x_end (above the waist) over a short
-        window with minimal vertical change."""
-        spine_base = (0.0, -0.4, 2.0)
+    def _swipe(self, x_start, x_end, steps=4, dt=0.08, y=0.3,
+               spine_base=(0.0, -0.4, 2.0)):
+        """Move the hand from x_start to x_end over a short window with minimal
+        vertical change. spine_base defaults to a tracked waist well below the
+        hand; pass None (absent) or a 4-tuple with a sub-TRACKED state to
+        exercise the untracked-waist path."""
         fired = None
         for i in range(steps + 1):
             x = x_start + (x_end - x_start) * (i / steps)
@@ -200,6 +202,29 @@ class SwipeTests(unittest.TestCase):
     def test_short_lateral_move_does_not_swipe(self):
         # Travel below SWIPE_MIN_DX_M.
         self.assertIsNone(self._swipe(-0.1, +0.1))
+
+    def test_swipe_requires_tracked_spine_base(self):
+        # REGRESSION (2026-07-21 audit): with spine_base untracked the waist gate
+        # failed OPEN — the `is None or` predicate admitted EVERY sample, so a
+        # flat desk-level reach (the desk occludes the lower torso, spine_base
+        # reports Inferred) fired SWIPE and cancelled speech + a pending
+        # confirmation. The gate must fail CLOSED like raise-hand/wave: the exact
+        # sweep test_swipe_right_fires accepts must NOT fire when the waist
+        # reference is absent on every sample.
+        self.assertIsNone(self._swipe(-0.3, +0.3, spine_base=None))
+
+    def test_swipe_inferred_spine_base_fails_closed(self):
+        # Same fail-closed contract for the SDK's actual seated-desk report:
+        # spine_base present but Inferred (state 1 < MIN_TRACKING_STATE) →
+        # _sample_hand records spine_base_y None → no fire.
+        self.assertIsNone(
+            self._swipe(-0.3, +0.3, spine_base=(0.0, -0.4, 2.0, 1)))
+
+    def test_swipe_below_tracked_waist_does_not_fire(self):
+        # Locks the fail-safe DIRECTION: a tracked waist with the hand sweeping
+        # BELOW it (hand_y -0.6 < spine_base_y -0.4) is filtered by the height
+        # gate — the lateral travel alone must not fire.
+        self.assertIsNone(self._swipe(-0.3, +0.3, y=-0.6))
 
     def test_diagonal_move_does_not_swipe(self):
         # Big horizontal AND big vertical change → fails the flatness gate

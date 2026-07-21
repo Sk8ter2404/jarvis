@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import unittest
 from unittest import mock
 
@@ -447,10 +448,74 @@ class GuiBridgeTests(_CacheResetBase):
     def test_watch_keys_cover_the_budget_inputs(self):
         # The keys the GUI traces for live recompute must include every input
         # predict_budget actually reads.
-        for k in ("LOCAL_LLM_MODEL", "MODEL_ROUTING::vision",
-                  "LOCAL_VISION_FALLBACK", "SCREEN_VISION_ENABLED",
-                  "RAG_ENABLED", "KINECT_ENABLED"):
+        for k in ("LOCAL_LLM_MODEL", "LOCAL_VISION_MODEL",
+                  "MODEL_ROUTING::vision", "LOCAL_VISION_FALLBACK",
+                  "SCREEN_VISION_ENABLED", "RAG_ENABLED", "KINECT_ENABLED"):
             self.assertIn(k, sw.VRAM_WATCH_KEYS)
+
+    def test_watch_keys_cover_every_engine_settings_read(self):
+        """Source-scan invariant: any settings key core/vram_budget.py reads
+        via settings.get("KEY") must be in the GUI's VRAM_WATCH_KEYS.
+
+        This is the stale-duplicate class the 2026-07-21 audit confirmed:
+        predict_budget grew a LOCAL_VISION_MODEL input (the shared-with-chat
+        0-MB branch) while the GUI's watch list kept the old six keys — so
+        _live_vram_values() never passed the key, the else branch double-
+        counted a phantom 7.3 GB VLM, and the panel showed a false "over
+        budget". A future engine input the watch list forgets fails here
+        instead of shipping."""
+        with open(vb.__file__, encoding="utf-8") as f:
+            src = f.read()
+        read_keys = set(re.findall(
+            r'settings\.get\(\s*"([A-Z][A-Z0-9_]*(?:::[a-z]+)?)"', src))
+        self.assertTrue(read_keys, "scan found no settings.get() reads — "
+                                   "update this invariant's regex")
+        # _rag_enabled reads its keys via a `for key in (...)` tuple, not a
+        # literal settings.get("...") — RAG_ENABLED is the GUI spelling (the
+        # others are config-side aliases with no widget).
+        if '"RAG_ENABLED"' in src:
+            read_keys.add("RAG_ENABLED")
+        # The engine accepts BOTH the nested MODEL_ROUTING dict and the
+        # flattened MODEL_ROUTING::vision Tk-var form; the GUI watches (and
+        # _live_vram_values' fallback expands) the flattened key.
+        read_keys.discard("MODEL_ROUTING")
+        for key in sorted(read_keys):
+            self.assertIn(
+                key, sw.VRAM_WATCH_KEYS,
+                msg=(f"core/vram_budget.py reads settings[{key!r}] but the "
+                     "GUI's VRAM_WATCH_KEYS does not watch it — "
+                     "_live_vram_values() will silently drop it and the "
+                     "budget panel will mispredict (the LOCAL_VISION_MODEL "
+                     "phantom-VLM bug, 2026-07-21 audit)"))
+
+    def test_owner_shape_shared_vision_not_double_counted(self):
+        """Behavioral regression for the audit's live trigger: the owner's
+        settings (chat == vision == gemma4:26b, vision routed local, RAG on)
+        filtered through VRAM_WATCH_KEYS exactly like _live_vram_values'
+        fallback must predict UNDER budget with a 0-MB shared-vision entry —
+        not the phantom flat 7475 MB VLM that flipped over=True."""
+        full = {
+            "LOCAL_LLM_MODEL": "gemma4:26b-a4b-it-qat",
+            "LOCAL_VISION_MODEL": "gemma4:26b-a4b-it-qat",
+            "MODEL_ROUTING::vision": "local",
+            "SCREEN_VISION_ENABLED": True,
+            "RAG_ENABLED": True,
+            # Unwatched noise keys must be filtered out, not break anything.
+            "TTS_VOICE": "en-GB-RyanNeural",
+            "KINECT_ENABLED": False,
+        }
+        subset = {k: full[k] for k in sw.VRAM_WATCH_KEYS if k in full}
+        b = sw.budget_from_live_values(subset, total_mb=_CARD_MB)
+        self.assertIsNotNone(b)
+        self.assertFalse(b["over"])
+        # 16384 (gemma) + 0 (shared vision) + 1536 (Whisper) + 307 (embed).
+        self.assertEqual(b["total_mb"], 16 * 1024 + int(1.5 * 1024)
+                         + int(0.3 * 1024))
+        shared = [c for c in b["components"]
+                  if c["label"] == "vision (shared with chat)"]
+        self.assertEqual(len(shared), 1)
+        self.assertEqual(shared[0]["mb"], 0)
+        self.assertNotIn("vision", [c["label"] for c in b["components"]])
 
     def test_schema_has_rag_and_kinect_toggles(self):
         # The GUI edits these (added for the budget) — they must be persisted

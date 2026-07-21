@@ -27,8 +27,10 @@ on the bulb's capabilities):
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
+import socket
 import threading
 import time
 from typing import Any
@@ -102,6 +104,23 @@ def _write_config(cfg: dict) -> None:
 
 
 # ── bridge discovery / connect ─────────────────────────────────────
+def _valid_bridge_host(ip: str) -> bool:
+    """True when `ip` is a literal IP address (v4/v6) or a hostname that
+    actually resolves.  Guards the config against a misheard voice arg
+    (the live file was once poisoned with bridge_ip="test", which
+    permanently disabled autodiscovery)."""
+    try:
+        ipaddress.ip_address(ip)
+        return True
+    except ValueError:
+        pass
+    try:
+        socket.getaddrinfo(ip, 80)
+        return True
+    except Exception:
+        return False
+
+
 def _autodiscover_bridge_ip() -> str | None:
     """Ask meethue.com's discovery endpoint for the local bridge IP.
     Hue bridges register themselves with Philips, so the cloud knows the
@@ -195,6 +214,7 @@ def _get_bridge() -> Any:
         if cached is not None and (time.monotonic() - _bridge_cache["fetched_at"]) < _CACHE_TTL_SECS:
             return cached
     cfg = _read_config()
+    from_config = bool(cfg.get("bridge_ip"))
     bridge_ip = cfg.get("bridge_ip") or _autodiscover_bridge_ip()
     if not bridge_ip:
         print("  [sh-hue] no bridge IP and discovery failed; "
@@ -222,7 +242,38 @@ def _get_bridge() -> Any:
         if "PhueRegistrationException" in res["error"].__class__.__name__:
             _pending["awaiting_button_until"] = time.time() + _RETRY_DELAY_SECS + 5.0
             _schedule_retry()
-        return None
+            return None
+        # SELF-HEAL (2026-07-21): a generic connect error against a
+        # CONFIG-supplied address may mean the stored bridge_ip is poisoned
+        # (the live file once held the misheard voice arg "test").  Re-run
+        # discovery: a different answer replaces the stored value and we
+        # retry once; no answer + a syntactically-garbage stored value drops
+        # the key so the next call rediscovers.  A valid stored IP survives
+        # a transient outage untouched, and the timeout / registration
+        # branches above never reach here — those mean "press the button",
+        # so the stored IP is likely good.
+        healed = False
+        if from_config:
+            discovered = _autodiscover_bridge_ip()
+            if discovered and discovered != bridge_ip:
+                cfg["bridge_ip"] = discovered
+                _write_config(cfg)
+                res = _threaded_connect(phue, discovered)
+                healed = res["bridge"] is not None
+                if healed:
+                    print(f"  [sh-hue] stored bridge IP {bridge_ip!r} failed; "
+                          f"reconnected via discovered {discovered}.")
+                else:
+                    _pending["last_error"] = (
+                        f"stored bridge_ip {bridge_ip!r} failed; discovered "
+                        f"{discovered} not connecting yet")
+            elif not discovered and not _valid_bridge_host(bridge_ip):
+                cfg.pop("bridge_ip", None)
+                _write_config(cfg)
+                print(f"  [sh-hue] dropped invalid stored bridge_ip "
+                      f"{bridge_ip!r}; will rediscover on the next call.")
+        if not healed:
+            return None
 
     bridge = res["bridge"]
     with _lock:
@@ -427,6 +478,9 @@ def hue_set_bridge_ip(arg: str = "") -> str:
     ip = (arg or "").strip()
     if not ip:
         return "Format: hue_set_bridge_ip, <ip>"
+    if not _valid_bridge_host(ip):
+        return (f"'{ip}' doesn't look like a bridge IP or resolvable host, "
+                f"sir — not saved.")
     cfg = _read_config()
     cfg["bridge_ip"] = ip
     _write_config(cfg)

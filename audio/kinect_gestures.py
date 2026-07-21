@@ -335,10 +335,17 @@ class GestureRecognizer:
         SWIPE_WINDOW_SECONDS while moving ≤ SWIPE_MAX_DY_M vertically.
         Returns SWIPE_LEFT / SWIPE_RIGHT by travel direction (sensor frame)."""
         win = self._window(now, SWIPE_WINDOW_SECONDS)
-        # Only consider samples where the hand is above the waist (spine_base).
+        # Only consider samples where the hand is VERIFIABLY above the waist
+        # (spine_base). An untracked waist (spine_base_y None — e.g. the desk
+        # occluding the lower torso, the common seated case) means the sample
+        # CANNOT qualify: fail CLOSED, matching the raise-hand/wave detectors'
+        # reference-joint contract. The old `is None or` accepted every sample
+        # whenever spine_base was untracked, so a flat desk-level reach for the
+        # keyboard fired SWIPE and cancelled speech + pending confirmations
+        # (2026-07-21 audit).
         above = [s for s in win
-                 if s["spine_base_y"] is None
-                 or s["hand_y"] > s["spine_base_y"] + SWIPE_ABOVE_WAIST_M]
+                 if s["spine_base_y"] is not None
+                 and s["hand_y"] > s["spine_base_y"] + SWIPE_ABOVE_WAIST_M]
         if len(above) < 2:
             return None
         xs = [s["hand_x"] for s in above]

@@ -157,7 +157,8 @@ _PATH_ATTRS = ("_DATA_DIR", "_CHROMA_DIR", "_FACTS_JSON", "_EPISODE_LOG",
 _STATE_ATTRS = ("_chroma_client", "_collection", "_embedder",
                 "_embedder_failed_until", "_bm25_index",
                 "_bm25_corpus_ids", "_bm25_corpus", "_facts", "_working",
-                "_loaded", "_turns_since_reflect", "_writes_since_rotate")
+                "_loaded", "_turns_since_reflect", "_writes_since_rotate",
+                "_reflector_llm")
 
 
 class _LtmBase(unittest.TestCase):
@@ -189,6 +190,7 @@ class _LtmBase(unittest.TestCase):
         ltm._loaded = False
         ltm._turns_since_reflect = 0
         ltm._writes_since_rotate = 0
+        ltm._reflector_llm = None
         FakeEmbedder.instances = 0
 
     def tearDown(self):
@@ -1175,6 +1177,281 @@ class ReflectWithEmbedderTests(_LtmBase):
             ltm.reflect_and_consolidate()
         # Guard should have prevented deletion of the mutated 'old'.
         self.assertIn("old", ltm._facts)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Reflector LLM injection (set_reflector_llm) — 2026-07-21 audit #39
+# ──────────────────────────────────────────────────────────────────────────
+
+class ReflectorInjectionTests(_LtmBase):
+    """The contradiction pass was DEAD in production: record_turn's periodic
+    trigger called reflect_and_consolidate() with no llm_call, and no other
+    production caller existed. These pin the injection hook: the trigger now
+    passes the installed adjudicator, defaults to the old behavior when none
+    is installed, honours the trusted-source guard, and bounds LLM work."""
+
+    def setUp(self):
+        super().setUp()
+        self._install_fake_embedder()
+        self._install_fake_chroma()
+        ltm.ensure_loaded()
+
+    def _seed(self, items):
+        """items: list of (id, text, created_at[, source])."""
+        ltm._facts = {}
+        for row in items:
+            fid, text, ca = row[0], row[1], row[2]
+            src = row[3] if len(row) > 3 else ""
+            ltm._facts[fid] = {"id": fid, "text": text, "source": src,
+                               "tags": [], "created_at": ca, "updated_at": ca}
+
+    def test_record_turn_trigger_uses_injected_llm(self):
+        # REGRESSION (audit #39): the production trigger must no longer call
+        # reflect_and_consolidate with llm_call=None — the injected adjudicator
+        # must actually resolve a mid-band contradiction from record_turn.
+        calls = []
+
+        def spy(prompt, ctx):
+            calls.append((prompt, ctx))
+            return "B"          # keep the second presented, condemn the first
+
+        ltm.set_reflector_llm(spy)
+        self._seed([("a", "fact a text", 1.0), ("b", "fact b text", 2.0)])
+        with mock.patch.object(ltm, "REFLECTOR_RUN_EVERY_TURNS", 3), \
+             mock.patch.object(ltm, "_cosine_sim", lambda x, y: 0.7):
+            for _ in range(3):
+                ltm.record_turn("user", "another turn")
+        self.assertTrue(calls, "injected adjudicator was never invoked "
+                               "from record_turn's reflector trigger")
+        # ids scan newest-first → ids[i]="b"; verdict 'B' condemns it.
+        self.assertNotIn("b", ltm._facts)
+        self.assertIn("a", ltm._facts)
+
+    def test_without_injection_defaults_to_old_behavior(self):
+        # No adjudicator installed → llm_call=None → contradiction pass
+        # skipped and both facts stay (exactly the pre-fix behavior).
+        ltm.set_reflector_llm(None)
+        self._seed([("a", "fact a text", 1.0), ("b", "fact b text", 2.0)])
+        with mock.patch.object(ltm, "REFLECTOR_RUN_EVERY_TURNS", 3), \
+             mock.patch.object(ltm, "_cosine_sim", lambda x, y: 0.7):
+            for _ in range(3):
+                ltm.record_turn("user", "another turn")
+        self.assertIn("a", ltm._facts)
+        self.assertIn("b", ltm._facts)
+
+    def test_trusted_source_guard_keeps_migrated_fact(self):
+        # Verdict 'A' condemns ids[j] = the older, migration-sourced fact;
+        # the survivor is an untrusted ambient extraction → guard: both stay.
+        self._seed([("mig", "user's name is Marcus", 1.0,
+                     "bobert_memory_migration"),
+                    ("amb", "user's name is Rodney", 2.0, "merge_memory")])
+        with mock.patch.object(ltm, "_cosine_sim", lambda x, y: 0.7):
+            summary = ltm.reflect_and_consolidate(llm_call=lambda p, c: "A")
+        self.assertEqual(summary["contradictions_resolved"], 0)
+        self.assertIn("mig", ltm._facts)
+        self.assertIn("amb", ltm._facts)
+
+    def test_untrusted_condemned_still_deleted(self):
+        # Complementary arm: condemning the AMBIENT fact in favour of the
+        # migrated one is allowed (verdict 'B' condemns ids[i] = "amb").
+        self._seed([("mig", "user's name is Marcus", 1.0,
+                     "bobert_memory_migration"),
+                    ("amb", "user's name is Rodney", 2.0, "merge_memory")])
+        with mock.patch.object(ltm, "_cosine_sim", lambda x, y: 0.7):
+            summary = ltm.reflect_and_consolidate(llm_call=lambda p, c: "B")
+        self.assertEqual(summary["contradictions_resolved"], 1)
+        self.assertIn("mig", ltm._facts)
+        self.assertNotIn("amb", ltm._facts)
+
+    def test_llm_pair_cap_bounds_adjudications(self):
+        calls = []
+
+        def spy(prompt, ctx):
+            calls.append(prompt)
+            return ""           # both stay — we only count invocations
+
+        # 3 facts, every pair mid-band → 3 qualifying pairs, cap of 1.
+        self._seed([("a", "fact a text", 1.0), ("b", "fact b text", 2.0),
+                    ("c", "fact c text", 3.0)])
+        with mock.patch.object(ltm, "REFLECTOR_MAX_LLM_PAIRS", 1), \
+             mock.patch.object(ltm, "_cosine_sim", lambda x, y: 0.7):
+            ltm.reflect_and_consolidate(llm_call=spy)
+        self.assertEqual(len(calls), 1)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  reset_all — full wipe with backup (2026-07-21 audit #17)
+# ──────────────────────────────────────────────────────────────────────────
+
+class ResetAllTests(_LtmBase):
+    """_act_reset_memory claimed a full wipe while the semantic store kept
+    every fact and the verbatim episode log. reset_all() is the LTM side of
+    that wipe: backup-then-clear of facts + episodes + working window, with
+    migrated.flag left in place so legacy facts can't resurrect."""
+
+    def _backup_dirs(self):
+        root = os.path.join(ltm._DATA_DIR, "backups")
+        if not os.path.isdir(root):
+            return []
+        return sorted(os.path.join(root, d) for d in os.listdir(root)
+                      if d.startswith("pre_reset_"))
+
+    def test_wipes_facts_episodes_working_and_backs_up(self):
+        self._force_no_deps()
+        ltm.ensure_loaded()
+        ltm.add_fact("User's address is 12 Secret Lane")
+        ltm.add_fact("User has a dog")
+        ltm.record_turn("user", "a private turn")
+        ltm.record_turn("assistant", "noted, sir")
+        n = ltm.reset_all()
+        self.assertEqual(n, 2)
+        # (a) store empty from every read path
+        self.assertEqual(ltm.list_facts(), [])
+        self.assertEqual(ltm.retrieve_facts("address"), [])
+        self.assertEqual(ltm.get_working_window(), [])
+        self.assertEqual(ltm.search_episodes(""), [])
+        self.assertFalse(os.path.exists(ltm._EPISODE_LOG) and
+                         os.path.getsize(ltm._EPISODE_LOG) > 0)
+        # (b) pre_reset backup holds the OLD facts + episode log
+        backups = self._backup_dirs()
+        self.assertEqual(len(backups), 1)
+        with open(os.path.join(backups[0], "facts.json"),
+                  encoding="utf-8") as f:
+            old = json.load(f)
+        self.assertEqual(sorted(e["text"] for e in old),
+                         ["User has a dog", "User's address is 12 Secret Lane"])
+        self.assertTrue(os.path.exists(
+            os.path.join(backups[0], "episodes.jsonl")))
+
+    def test_backup_failure_refuses_to_wipe(self):
+        self._force_no_deps()
+        ltm.ensure_loaded()
+        fid = ltm.add_fact("keep me")
+        with mock.patch.object(ltm.shutil, "copy2",
+                               side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                ltm.reset_all()
+        self.assertIn(fid, ltm._facts)             # nothing wiped
+        self.assertTrue(os.path.exists(ltm._FACTS_JSON))
+
+    def test_leaves_migrate_flag_so_legacy_cannot_resurrect(self):
+        self._force_no_deps()
+        with open(ltm._LEGACY_BOBERT_MEMORY, "w", encoding="utf-8") as f:
+            json.dump({"facts": ["legacy fact"]}, f)
+        ltm.ensure_loaded()
+        self.assertEqual(len(ltm._facts), 1)
+        self.assertEqual(ltm.reset_all(), 1)
+        self.assertTrue(os.path.exists(ltm._MIGRATE_FLAG))
+        # A later boot must NOT re-import the wiped legacy facts.
+        ltm._loaded = False
+        ltm.ensure_loaded()
+        self.assertEqual(ltm._facts, {})
+
+    def test_chroma_absent_wipe_still_succeeds(self):
+        self._force_no_deps()
+        ltm.ensure_loaded()
+        ltm.add_fact("degraded-path fact")
+        self.assertEqual(ltm.reset_all(), 1)
+        self.assertEqual(ltm.list_facts(), [])
+
+    def test_chroma_client_collection_recreated(self):
+        self._install_fake_embedder()
+        self._install_fake_chroma()
+        fresh = FakeChromaCollection()
+        client = mock.Mock()
+        client.get_or_create_collection.return_value = fresh
+        ltm._chroma_client = client
+        ltm.ensure_loaded()
+        ltm.add_fact("wipe me")
+        self.assertEqual(ltm.reset_all(), 1)
+        client.delete_collection.assert_called_once_with(ltm.LTM_COLLECTION)
+        self.assertIs(ltm._collection, fresh)
+
+    def test_chroma_without_client_deletes_per_id(self):
+        self._install_fake_embedder()
+        coll = self._install_fake_chroma()     # _chroma_client stays None
+        ltm.ensure_loaded()
+        fid = ltm.add_fact("wipe me")
+        self.assertIn(fid, coll.store)
+        self.assertEqual(ltm.reset_all(), 1)
+        self.assertEqual(coll.store, {})
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  forget_since — time-window purge (2026-07-21 audit #51)
+# ──────────────────────────────────────────────────────────────────────────
+
+class ForgetSinceTests(_LtmBase):
+    """'Forget the last hour' left the hour's verbatim turns in
+    episodes.jsonl, its facts in the semantic store, and the turns in the
+    in-process working window. forget_since purges all three by timestamp."""
+
+    def setUp(self):
+        super().setUp()
+        self._force_no_deps()
+        ltm.ensure_loaded()
+
+    def test_purges_recent_only_across_all_three_tiers(self):
+        now = time.time()
+        old_ts, recent_ts = now - 7200, now - 1800
+        ltm.record_turn("user", "old turn about the garden", ts=old_ts)
+        ltm.record_turn("user", "recent turn about the surprise party",
+                        ts=recent_ts)
+        # A legacy/unparseable line must survive the rewrite untouched.
+        with open(ltm._EPISODE_LOG, "a", encoding="utf-8") as f:
+            f.write("not json at all\n")
+        ltm._facts = {
+            "fold": {"id": "fold", "text": "old durable fact", "source": "",
+                     "tags": [], "created_at": old_ts, "updated_at": old_ts},
+            "fnew": {"id": "fnew", "text": "fact learned just now",
+                     "source": "", "tags": [], "created_at": recent_ts,
+                     "updated_at": recent_ts},
+        }
+        with mock.patch.object(ltm, "_chroma_delete") as cdel:
+            res = ltm.forget_since(now - 3600)
+        self.assertEqual(res, {"episodes": 1, "facts": 1, "working": 1})
+        # Episodic log: recent line gone, old + unparseable kept, atomic.
+        with open(ltm._EPISODE_LOG, encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("old turn about the garden", content)
+        self.assertIn("not json at all", content)
+        self.assertNotIn("surprise party", content)
+        self.assertFalse(os.path.exists(ltm._EPISODE_LOG + ".tmp"))
+        self.assertEqual(ltm.search_episodes("surprise party"), [])
+        self.assertEqual(len(ltm.search_episodes("garden")), 1)
+        # Working window: only the old turn remains in prompt context.
+        window_texts = [t["text"] for t in ltm.get_working_window()]
+        self.assertEqual(window_texts, ["old turn about the garden"])
+        # Facts: recent one gone (incl. its chroma vector), old survives.
+        self.assertNotIn("fnew", ltm._facts)
+        self.assertIn("fold", ltm._facts)
+        cdel.assert_called_once_with("fnew")
+
+    def test_nothing_in_window_is_a_counted_noop(self):
+        now = time.time()
+        ltm.record_turn("user", "ancient turn", ts=now - 7200)
+        ltm._facts = {
+            "fold": {"id": "fold", "text": "old fact", "source": "",
+                     "tags": [], "created_at": now - 7200,
+                     "updated_at": now - 7200},
+        }
+        with mock.patch.object(ltm, "_save_facts_locked") as save:
+            res = ltm.forget_since(now - 3600)
+            save.assert_not_called()
+        self.assertEqual(res, {"episodes": 0, "facts": 0, "working": 0})
+        self.assertFalse(os.path.exists(ltm._EPISODE_LOG + ".tmp"))
+        self.assertIn("fold", ltm._facts)
+
+    def test_ts_less_fact_treated_as_old_and_kept(self):
+        now = time.time()
+        ltm._facts = {
+            "weird": {"id": "weird", "text": "no created_at", "source": "",
+                      "tags": [], "created_at": "garbage",
+                      "updated_at": now},
+        }
+        res = ltm.forget_since(now - 3600)
+        self.assertEqual(res["facts"], 0)
+        self.assertIn("weird", ltm._facts)
 
 
 # ──────────────────────────────────────────────────────────────────────────

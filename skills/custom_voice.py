@@ -25,7 +25,8 @@ pre-router):
                                   audio.
 
   set_backend(name)             → tries to switch bobert_companion.TTS_BACKEND
-                                  to 'edge' | 'pyttsx3' | 'xtts'. Returns
+                                  to any name in _VALID_BACKENDS ('edge' |
+                                  'pyttsx3' | 'xtts' | 'kokoro'). Returns
                                   a spoken confirmation string. If 'xtts' is
                                   requested but the XTTS deps / sample aren't
                                   present, the backend is left on its previous
@@ -45,7 +46,7 @@ Actions registered (so the LLM can also reach the toggle):
                                   restarting JARVIS
 
 Config (lives on bobert_companion, override via env on boot):
-  TTS_BACKEND            "edge" | "pyttsx3" | "xtts"   (default "edge")
+  TTS_BACKEND            "edge" | "pyttsx3" | "xtts" | "kokoro"   (default "edge")
   XTTS_VOICE_SAMPLE      absolute path to a ~10 s WAV (24 kHz mono is best)
   XTTS_LANGUAGE          ISO-639-1 hint, default "en"
 
@@ -517,7 +518,7 @@ def _act_list_tts_backends(_: str = "") -> str:
     xtts_state = "ready" if is_available() else availability_reason() or "unavailable"
     sample_note = f" (sample: {sample})" if sample else ""
     return (f"current backend: {current}. "
-            f"available: edge, pyttsx3, xtts. "
+            f"available: {', '.join(_VALID_BACKENDS)}. "
             f"xtts status: {xtts_state}{sample_note}")
 
 

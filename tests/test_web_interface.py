@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import tempfile
 import time
@@ -278,7 +279,13 @@ class SayInjectTests(_ServerBase):
 class SettingsEndpointTests(_ServerBase):
     """The FULL settings control panel: GET the schema+values, POST changes that
     persist to the temp user_settings.json and round-trip on the next GET, and the
-    validation 400s (unknown key / bad enum)."""
+    validation 400s (unknown key / bad enum).
+
+    2026-07-21 fix: GET /api/settings now overlays the saved user_settings.json
+    (the exact file POST writes) on top of the boot-time core.config snapshot for
+    keys PRESENT in the file, with an honest ``pending_restart`` flag when the
+    file diverges from the live constant — the panel used to echo the stale
+    snapshot, so every save visibly reverted the moment the panel re-fetched."""
 
     def test_get_returns_schema_with_wake_word_value(self):
         # GET /api/settings serves every persisted knob with its current value.
@@ -303,7 +310,9 @@ class SettingsEndpointTests(_ServerBase):
 
     def test_post_bool_persists_and_reflects_on_next_get(self):
         # POST a bool (the wake-word toggle) → it lands in the temp file AND the
-        # next GET reports the new value.
+        # next GET reports the SAVED value (2026-07-21 fix: the payload used to
+        # echo the boot-time core.config snapshot, so the banner toggle visibly
+        # flipped back the moment the panel re-fetched after a save).
         code, data = _post(self.base + "/api/settings",
                            {"name": "WAKE_WORD_AUTOSTART", "value": True})
         self.assertEqual(code, 200)
@@ -314,19 +323,71 @@ class SettingsEndpointTests(_ServerBase):
         with open(self.user_settings_path, encoding="utf-8") as f:
             saved = json.load(f)
         self.assertIs(saved["WAKE_WORD_AUTOSTART"], True)
-        # The next GET still serves the knob (the endpoint reads live each call).
-        # Its ``value`` comes from core.config (import-time) so it may lag the file
-        # until a restart — the FILE is the durable record, already asserted above —
-        # but the key must remain present + JSON-valid on every GET.
+        # The next GET reports the FILE value — the round-trip the panel renders.
+        # Pin the live constant to False so the divergence (and its honest
+        # pending_restart flag) is deterministic regardless of core.config state.
+        orig = wi._config_value
+        wi._config_value = (lambda key, default:
+                            False if key == "WAKE_WORD_AUTOSTART"
+                            else orig(key, default))
+        try:
+            code, data = _get(self.base + "/api/settings")
+        finally:
+            wi._config_value = orig
+        self.assertEqual(code, 200)
+        by_name = {it["name"]: it for it in data["settings"]}
+        wake = by_name["WAKE_WORD_AUTOSTART"]
+        self.assertIs(wake["value"], True)            # the SAVED value, not the snapshot
+        self.assertIs(wake["pending_restart"], True)  # honest: the loop still runs False
+        # And the round-trip holds for a SECOND write too (toggle back off).
+        _post(self.base + "/api/settings",
+              {"name": "WAKE_WORD_AUTOSTART", "value": False})
         code, data = _get(self.base + "/api/settings")
         self.assertEqual(code, 200)
         by_name = {it["name"]: it for it in data["settings"]}
-        self.assertIn("WAKE_WORD_AUTOSTART", by_name)
-        # And the file round-trips a SECOND write too (toggle back off).
-        _post(self.base + "/api/settings",
-              {"name": "WAKE_WORD_AUTOSTART", "value": False})
+        self.assertIs(by_name["WAKE_WORD_AUTOSTART"]["value"], False)
         with open(self.user_settings_path, encoding="utf-8") as f:
             self.assertIs(json.load(f)["WAKE_WORD_AUTOSTART"], False)
+
+    def test_only_file_present_keys_are_overlaid(self):
+        # The overlay must NOT route through settings_window.load_settings()
+        # (which backfills every missing key with the SCHEMA default): a knob
+        # ABSENT from the file must keep reporting the LIVE core.config constant
+        # even when that constant differs from the schema default.
+        _post(self.base + "/api/settings",
+              {"name": "WAKE_WORD_AUTOSTART", "value": True})  # file has ONLY this key
+        sentinel = "SENTINEL-LIVE-VALUE-31"
+        orig = wi._config_value
+        wi._config_value = (lambda key, default:
+                            sentinel if key == "TTS_VOICE"
+                            else orig(key, default))
+        try:
+            code, data = _get(self.base + "/api/settings")
+        finally:
+            wi._config_value = orig
+        self.assertEqual(code, 200)
+        by_name = {it["name"]: it for it in data["settings"]}
+        # Unsaved key → the live constant wins (NOT the schema default).
+        self.assertEqual(by_name["TTS_VOICE"]["value"], sentinel)
+        # And no divergence flag on a row nothing was saved for.
+        self.assertNotIn("pending_restart", by_name["TTS_VOICE"])
+
+    def test_saved_secret_reflects_is_set_without_leaking(self):
+        # Saving a token via the panel must flip is_set on the next GET (the
+        # file overlay feeds the redaction block) while the value stays "".
+        secret = "panel-saved-token-9000"
+        code, data = _post(self.base + "/api/settings",
+                           {"name": "WEB_INTERFACE_TOKEN", "value": secret})
+        self.assertEqual(code, 200)
+        self.assertTrue(data["ok"])
+        code, data = _get(self.base + "/api/settings")
+        self.assertEqual(code, 200)
+        by_name = {it["name"]: it for it in data["settings"]}
+        row = by_name["WEB_INTERFACE_TOKEN"]
+        self.assertEqual(row["value"], "")            # still redacted
+        self.assertTrue(row.get("secret"))
+        self.assertTrue(row.get("is_set"))            # the file-saved token counts
+        self.assertNotIn(secret, json.dumps(data))    # never leaks anywhere
 
     def test_post_enum_persists(self):
         # An enum value in-choices persists coerced.
@@ -862,30 +923,70 @@ class WaitForReplyTests(unittest.TestCase):
 
 
 class UptimeTests(unittest.TestCase):
-    """_uptime_seconds derives a same-day delta from the log's first timestamp."""
+    """_uptime_seconds prefers the FULL boot timestamp in the log's FILENAME
+    (session_%Y-%m-%d_%H-%M-%S.log — survives midnight; 2026-07-21 fix) and falls
+    back to the date-less same-day H:M:S heuristic only for a log whose name
+    doesn't parse (the fallback tests use ``session_x.log`` for exactly that)."""
 
     def test_uptime_none_when_no_log(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertIsNone(wi._uptime_seconds(os.path.join(d, "logs")))
 
-    def test_uptime_none_when_no_timestamp_in_head(self):
+    def test_uptime_crosses_midnight_via_filename(self):
+        # The 2026-07-21 regression case: a boot ~26h ago (guaranteed to cross
+        # midnight) must report ~26h — not the clamped 0.0 / sub-24h value the
+        # old same-day H:M:S heuristic produced. The file's first stamped line
+        # carries the boot's H:M:S (as a real log would), which would mislead
+        # the old code; the filename's full date must win.
         with tempfile.TemporaryDirectory() as d:
             ld = os.path.join(d, "logs")
             os.makedirs(ld)
-            lg = os.path.join(ld, "session_2026-07-07_00-00-00.log")
+            boot = time.time() - 26 * 3600
+            name = time.strftime("session_%Y-%m-%d_%H-%M-%S.log",
+                                 time.localtime(boot))
+            t = time.localtime(boot)
+            stamp = "[%02d:%02d:%02d]" % (t.tm_hour, t.tm_min, t.tm_sec)
+            with open(os.path.join(ld, name), "w", encoding="utf-8") as f:
+                f.write(stamp + " loop starting\n")
+            up = wi._uptime_seconds(ld)
+            self.assertIsNotNone(up)
+            self.assertTrue(abs(up - 26 * 3600) <= 120, f"unexpected uptime {up}")
+
+    def test_uptime_filename_wins_without_in_file_timestamps(self):
+        # A parseable filename alone is enough — no "[HH:MM:SS]" line needed
+        # (the old head-scan-only code returned None here).
+        with tempfile.TemporaryDirectory() as d:
+            ld = os.path.join(d, "logs")
+            os.makedirs(ld)
+            boot = time.time() - 2 * 3600
+            name = time.strftime("session_%Y-%m-%d_%H-%M-%S.log",
+                                 time.localtime(boot))
+            with open(os.path.join(ld, name), "w", encoding="utf-8") as f:
+                f.write("boot banner only, no timestamps\n")
+            up = wi._uptime_seconds(ld)
+            self.assertIsNotNone(up)
+            self.assertTrue(abs(up - 2 * 3600) <= 120, f"unexpected uptime {up}")
+
+    def test_uptime_none_when_no_timestamp_in_head(self):
+        # Unparseable filename AND no stamped line → None (field omitted).
+        with tempfile.TemporaryDirectory() as d:
+            ld = os.path.join(d, "logs")
+            os.makedirs(ld)
+            lg = os.path.join(ld, "session_x.log")
             with open(lg, "w", encoding="utf-8") as f:
                 f.write("no timestamps here\njust plain lines\n")
             self.assertIsNone(wi._uptime_seconds(ld))
 
     def test_uptime_derived_from_first_timestamp(self):
-        # Seed a first line stamped ~2 minutes ago; uptime should be ~120s. We use
-        # the LOCAL clock (matching _uptime_seconds) so this holds regardless of TZ.
+        # FALLBACK path: an unparseable (hand-named) log still yields a same-day
+        # delta from its first "[HH:MM:SS]" line — ~120s here. We use the LOCAL
+        # clock (matching _uptime_seconds) so this holds regardless of TZ.
         with tempfile.TemporaryDirectory() as d:
             ld = os.path.join(d, "logs")
             os.makedirs(ld)
             t = time.localtime(time.time() - 120)
             stamp = "[%02d:%02d:%02d]" % (t.tm_hour, t.tm_min, t.tm_sec)
-            lg = os.path.join(ld, "session_2026-07-07_00-00-00.log")
+            lg = os.path.join(ld, "session_x.log")
             with open(lg, "w", encoding="utf-8") as f:
                 f.write("boot banner (no ts)\n")
                 f.write(stamp + " loop starting\n")
@@ -894,6 +995,207 @@ class UptimeTests(unittest.TestCase):
             # Allow a wide window for test-runner slowness / a midnight-rollover
             # clamp (which would read 0.0); the point is it's a sane float, not None.
             self.assertTrue(up == 0.0 or (100 <= up <= 140), f"unexpected uptime {up}")
+
+
+class DashboardTokenSerializationTests(unittest.TestCase):
+    """2026-07-21 fix: the dashboard used html.escape on the auth token before
+    baking it into the inline <script>. <script> is an HTML raw-text element —
+    character references are NOT decoded there — so a token containing &"'<>
+    reached the JS as &amp;/&quot;/… and every API call 401'd, and a backslash
+    (html.escape leaves it untouched) produced an unterminated JS string that
+    killed the whole inline script. The token is now serialized with json.dumps
+    (+ "</" → "<\\/"): these tests prove the page-baked literal decodes to
+    EXACTLY the token the server accepts."""
+
+    _TOKEN_RE = re.compile(r"const TOKEN = (.+);")
+
+    def _server(self, token):
+        """A real 127.0.0.1:0 server with ``token``, torn down via addCleanup.
+        All file sources point at a throwaway temp dir (same safety contract as
+        _ServerBase)."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        d = tmp.name
+        log_dir = os.path.join(d, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        httpd = wi.create_server(
+            bind="127.0.0.1", port=0, token=token,
+            inject_path=os.path.join(d, "injected_commands.json"),
+            log_dir=log_dir,
+            hud_state_path=os.path.join(d, "hud_state.json"),
+            user_settings_path=os.path.join(d, "user_settings.json"),
+            camera_preview_path=os.path.join(d, ".hud_camera_preview.jpg"),
+            action_index_path=os.path.join(d, "ACTION_INDEX.md"),
+        )
+        thread = wi.serve_in_thread(httpd)
+
+        def _stop():
+            try:
+                httpd.shutdown()
+                httpd.server_close()
+            except Exception:
+                pass
+            thread.join(timeout=3)
+
+        self.addCleanup(_stop)
+        host, port = httpd.server_address[:2]
+        _wait_server_ready(host, port)
+        return f"http://127.0.0.1:{port}"
+
+    def _token_literal(self, base):
+        code, body = _get_raw(base + "/")     # local bind serves the page token-free
+        self.assertEqual(code, 200)
+        m = self._TOKEN_RE.search(body)
+        self.assertIsNotNone(m, "const TOKEN line missing from the page")
+        return m.group(1)
+
+    def test_hostile_token_round_trips_and_authenticates(self):
+        # Every escaper class at once: &, double quote, single quote, <, >, \.
+        token = 'a&b"c\'d<e>f\\g'
+        base = self._server(token)
+        recovered = json.loads(self._token_literal(base))
+        # Under html.escape this held a&amp;b&quot;c… and could never match.
+        self.assertEqual(recovered, token)
+        # The token the page bakes in IS the token the server accepts.
+        code, data = _get(base + "/api/status",
+                          headers={"X-Auth-Token": recovered})
+        self.assertEqual(code, 200)
+        self.assertIn("version", data)
+
+    def test_trailing_backslash_token_stays_valid_js(self):
+        # html.escape left "\" untouched, so '…\\' + the closing quote became an
+        # escaped quote → unterminated string → SyntaxError killing the script.
+        token = "trailing\\"
+        base = self._server(token)
+        literal = self._token_literal(base)
+        self.assertEqual(json.loads(literal), token)   # parses cleanly, round-trips
+
+    def test_script_terminator_token_cannot_break_out(self):
+        # "</script>" inside the literal would TERMINATE the raw-text <script>
+        # element early; the "</" → "<\\/" replacement must keep the raw
+        # terminator out while still decoding to the exact token.
+        token = "x</script><script>y"
+        base = self._server(token)
+        literal = self._token_literal(base)
+        self.assertNotIn("</", literal)                # no raw script terminator
+        self.assertEqual(json.loads(literal), token)   # yet decodes exactly
+
+    def test_source_never_html_escapes_the_token(self):
+        # Stale-duplicate guard for this bug class: the WRONG escaper must not
+        # silently return here (or in a copy-pasted dashboard builder inside
+        # this module).
+        with open(wi.__file__, encoding="utf-8") as f:
+            src = f.read()
+        self.assertNotIn("html.escape(token", src)
+
+
+class RenderCapDisclosureTests(_ServerBase):
+    """2026-07-21 fix: renderActions capped the DOM at 400 rows but only
+    admitted it ('· N shown') when a filter was typed — an empty search claimed
+    the full total while silently hiding the rest — and renderFacts (the Memory
+    tab's copy of the same loop) had the cap with NO qualifier at all. These
+    source-scanning invariants on the served page pin the fix for BOTH copies
+    AND any future copy-pasted render loop (the stale-duplicate bug class)."""
+
+    _CAP_RE = re.compile(r"shown\s*>=\s*\d+")
+    _OVERFLOW_MARKER = "more — refine your search"
+
+    def test_every_dom_cap_advertises_its_truncation(self):
+        code, body = _get_raw(self.base + "/")
+        self.assertEqual(code, 200)
+        caps = self._CAP_RE.findall(body)
+        # Both known cap sites exist (renderActions + renderFacts) …
+        self.assertGreaterEqual(len(caps), 2)
+        # … and EVERY cap site (present or future) must emit the visible
+        # '…N more — refine your search' overflow row, or this fails.
+        self.assertEqual(
+            len(caps), body.count(self._OVERFLOW_MARKER),
+            "a capped render loop does not advertise its truncation")
+
+    def test_shown_qualifier_is_unconditional(self):
+        code, body = _get_raw(self.base + "/")
+        self.assertEqual(code, 200)
+        # The filter-conditional qualifier pattern is gone for good …
+        self.assertIsNone(
+            re.search(r"\(f\s*\?[^;]*shown", body),
+            "the '· N shown' qualifier is still filter-conditional")
+        # … and the suffix itself still renders in the count line.
+        self.assertIn("' shown'", body)
+
+
+class GuiOnlyKeyRoundTripTests(unittest.TestCase):
+    """2026-07-21 fix: keys with NO core.config constant (the GUI-only
+    connection hints OBS_HOST_HINT / OBS_PORT_HINT / HUE_BRIDGE_IP_HINT) always
+    rendered blank in the web panel — build_settings_schema sourced every value
+    from core.config, so a successful save could never redisplay. Saved values
+    must now round-trip from the file."""
+
+    def test_hint_keys_round_trip_from_file(self):
+        # The card's exact failure: save a hint, re-build the payload, see it.
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "user_settings.json")
+            wanted = {"OBS_HOST_HINT": "localhost",
+                      "OBS_PORT_HINT": "4455",
+                      "HUE_BRIDGE_IP_HINT": "192.168.1.50"}
+            wi._write_settings(wanted, p)
+            by_name = {it["name"]: it
+                       for it in wi.build_settings_schema(p)["settings"]}
+            for key, val in wanted.items():
+                self.assertEqual(by_name[key]["value"], val, key)
+
+    def test_every_gui_only_schema_key_round_trips(self):
+        # Class-level invariant (the stale-duplicate rule, applied to keys):
+        # derive EVERY persisted, non-secret schema key with no core.config
+        # constant and prove each round-trips through the REAL write path into
+        # the GET payload — so a FUTURE GUI-only key added to the schema is
+        # covered the day it lands, not when someone notices it renders blank.
+        try:
+            from core import config as core_config
+        except Exception:
+            self.skipTest("core.config unavailable — cannot derive the GUI-only set")
+        from tools import settings_window as sw
+        gui_only = [k for k in sw.SCHEMA
+                    if not k.startswith("_")
+                    and sw.SCHEMA[k].get("type") != "status"
+                    and k not in wi._SECRET_SETTING_KEYS
+                    and not hasattr(core_config, k)]
+        # The three hint keys are the known members; an empty derivation would
+        # mean this invariant tests nothing.
+        for known in ("OBS_HOST_HINT", "OBS_PORT_HINT", "HUE_BRIDGE_IP_HINT"):
+            self.assertIn(known, gui_only)
+
+        def _distinct(spec, i):
+            # A type-appropriate, non-default value for any schema type, so the
+            # strict write-path validation accepts it.
+            typ = spec.get("type")
+            if typ == "bool":
+                return not spec.get("default")
+            if typ in ("int", "device"):
+                return 4200 + i
+            if typ == "float":
+                return 42.5 + i
+            if typ == "enum":
+                choices = spec.get("choices") or []
+                dflt = spec.get("default")
+                others = [c for c in choices if c != dflt]
+                return (others or choices or [dflt])[0]
+            if typ == "text":
+                return [f"distinct-{i}"]
+            if typ == "routing":
+                return dict(spec.get("default") or {})
+            return f"distinct-{i}"
+
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "user_settings.json")
+            updates = {k: _distinct(sw.SCHEMA[k], i)
+                       for i, k in enumerate(gui_only)}
+            # Through the REAL write path, so what we compare against is the
+            # coerced value that actually persisted.
+            applied = wi._write_settings(updates, p)
+            by_name = {it["name"]: it
+                       for it in wi.build_settings_schema(p)["settings"]}
+            for k in gui_only:
+                self.assertEqual(by_name[k]["value"], applied[k], k)
 
 
 class AirMouseStatusTests(unittest.TestCase):

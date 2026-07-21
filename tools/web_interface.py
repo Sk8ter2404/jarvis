@@ -69,7 +69,6 @@ Everything here is stdlib and OS-neutral (no win32, no real JARVIS needed):
 from __future__ import annotations
 
 import glob
-import html
 import json
 import os
 import re
@@ -339,28 +338,44 @@ def _air_mouse_status() -> dict | None:
     return None
 
 
-# The main loop timestamps each log line "[HH:MM:SS] …" (see _capture_utterance /
-# the loop's print wrapper). The FIRST line of a session log is written at boot, so
-# its clock time is the boot time. We can't recover the date cheaply (the filename
-# carries it, but a wall-clock delta is enough for an "up 2h13m" chip), so we treat
-# the first timestamp as today-relative and compute a same-day delta, clamping a
-# negative delta (crossed midnight) to 0 rather than reporting a bogus ~24h uptime.
+# Boot time is recovered from the newest session log, preferring the FULL
+# date+time encoded in its FILENAME (the loop names each log
+# session_%Y-%m-%d_%H-%M-%S.log at boot — see bobert_companion's log setup), so
+# the uptime chip stays correct across midnight. A hand-named/legacy log falls
+# back to the "[HH:MM:SS]" clock of the first timestamped line (the loop
+# timestamps every line): that heuristic is DATE-LESS, so it computes a same-day
+# delta and clamps a negative (crossed-midnight / clock-skew) result to 0 rather
+# than reporting a bogus ~24h uptime.
 _LOG_TS_RE = re.compile(r"\[(\d{2}):(\d{2}):(\d{2})\]")
+_LOG_NAME_TS_RE = re.compile(
+    r"session_(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})\.log$")
 
 
 def _uptime_seconds(log_dir: str) -> float | None:
-    """Best-effort session uptime in seconds, derived from the newest log's first
-    timestamped line, or None when not derivable.
+    """Best-effort session uptime in seconds, or None when not derivable.
 
-    We parse the "[HH:MM:SS]" prefix of the first line that HAS one (the loop's
-    banner lines may precede the first timestamp) and subtract it from the current
-    wall clock's H:M:S. This is intentionally cheap and approximate — it's a status
-    nicety, not a billing meter. Returns None (→ field omitted) when there is no log,
-    no parseable timestamp, or anything at all goes wrong. NEVER raises."""
+    Preferred source: the newest log's FILENAME timestamp
+    (session_%Y-%m-%d_%H-%M-%S.log) — a full date, so the epoch delta survives
+    midnight. Fallback for an unparseable name: the "[HH:MM:SS]" prefix of the
+    first line that HAS one (the loop's banner lines may precede the first
+    timestamp) subtracted from the current wall clock's H:M:S — cheap but
+    date-less, so it clamps a negative (crossed-midnight) delta to 0. This is a
+    status nicety, not a billing meter. Returns None (→ field omitted) when
+    there is no log, no parseable timestamp, or anything at all goes wrong.
+    NEVER raises."""
     lg = _newest_log(log_dir)
     if not lg:
         return None
     try:
+        m = _LOG_NAME_TS_RE.search(os.path.basename(lg))
+        if m:
+            y, mo, dy, hh, mm, ss = (int(g) for g in m.groups())
+            boot = time.mktime((y, mo, dy, hh, mm, ss, 0, 0, -1))
+            delta = time.time() - boot
+            if delta >= 0:
+                return float(delta)
+            # A negative filename delta (clock skew / a future-dated hand-named
+            # file) falls through to the head-scan heuristic below.
         first_hms = None
         with open(lg, encoding="utf-8", errors="replace") as f:
             # Only scan a bounded head of the file — the boot timestamp is in the
@@ -530,13 +545,48 @@ def _config_value(key: str, default):
     constants reflect the values as of THAT import — which is boot time in a live
     JARVIS. A settings write does NOT mutate the running process's constants (see
     the restart caveat in _write_settings), so what we report here is the
-    effective value the CURRENTLY-RUNNING loop is using, which is exactly the
-    truthful thing to show."""
+    effective value the CURRENTLY-RUNNING loop is using. build_settings_schema
+    overlays the saved user_settings.json on top of this for keys the owner has
+    actually saved (with an honest ``pending_restart`` flag), so the panel shows
+    the durable record instead of appearing to revert every save."""
     try:
         from core import config as _config
         return getattr(_config, key, default)
     except Exception:
         return default
+
+
+# Sentinel distinguishing "core.config has NO such constant" (a GUI-only key
+# like OBS_HOST_HINT, or bare CI where core.config can't import) from a
+# constant whose value is legitimately falsy. build_settings_schema passes it
+# as _config_value's default so those two cases route differently.
+_NO_CONSTANT = object()
+
+
+def _read_saved_settings(path: str | None) -> dict:
+    """The raw on-disk user_settings.json as a dict — the durable record the
+    settings write path maintains. ``path=None`` resolves the live path via
+    settings_window.settings_path() (honouring the JARVIS_SETTINGS_PATH /
+    staging redirects). Tolerant like _write_settings' reader: a missing,
+    corrupt, or non-object file — or an unresolvable path on bare CI — degrades
+    to ``{}`` (no overlay). Never raises."""
+    if path is None:
+        try:
+            from tools import settings_window as sw
+            path = sw.settings_path()
+        except Exception:
+            return {}
+    try:
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                raw = f.read().strip()
+            if raw:
+                decoded = json.loads(raw)
+                if isinstance(decoded, dict):
+                    return decoded
+    except Exception:
+        pass
+    return {}
 
 
 # Knobs whose VALUE is a secret. We render a row for them (so the owner can SET
@@ -549,24 +599,48 @@ def _config_value(key: str, default):
 _SECRET_SETTING_KEYS = frozenset({"WEB_INTERFACE_TOKEN"})
 
 
-def build_settings_schema() -> dict:
+def build_settings_schema(settings_path: str | None = None) -> dict:
     """Assemble the /api/settings GET payload: every PERSISTED schema knob with
-    its current effective value. Shape::
+    its current value. Shape::
 
         {"settings": [ {name, tab, label, type, choices, help, value, default,
-                        secret?, is_set?}, ... ],
+                        pending_restart?, secret?, is_set?}, ... ],
          "tabs": ["voice","ai","privacy","integrations","advanced"],
          "note": "…applies on restart…"}
 
     Read LIVE each call (no caching) so the panel always reflects the file/loop
-    state. Status-only rows (keys starting with "_status_", type "status") are
+    state. ``settings_path`` is the user_settings.json the write path targets —
+    the GET handler passes cfg["user_settings_path"], so a GET reads the EXACT
+    file the POST just wrote; None resolves the live path via settings_window.
+
+    VALUE SOURCING (2026-07-21 fix — the panel used to echo only the boot-time
+    core.config snapshot, so every save appeared to revert on the re-fetch, and
+    GUI-only keys with no constant could never display at all):
+      • key PRESENT in the saved file → the FILE value (what the owner saved),
+        coerced through the same schema rules the write path applies, plus
+        ``pending_restart: True`` when it differs from the live core.config
+        constant — honest that the running loop lags the file until a restart;
+      • key ABSENT from the file, live constant exists → that constant (the
+        value the currently-running loop is using);
+      • neither (a GUI-only key like OBS_HOST_HINT with no core.config
+        constant, or bare CI where core.config can't import) → the schema
+        default.
+    We overlay ONLY file-present keys — NOT settings_window.load_settings(),
+    which backfills every missing key with the SCHEMA default — so an unsaved
+    knob keeps reporting the live constant even where that differs from the
+    schema default.
+
+    Status-only rows (keys starting with "_status_", type "status") are
     SKIPPED — they expose integration presence in the GUI but carry no persisted
     value and (deliberately) never surface a secret, so they have no place in a
     write-capable web panel. SECRET knobs (``_SECRET_SETTING_KEYS``) are rendered
-    but their value is REDACTED to "" (with ``secret: True`` and ``is_set``) so
-    the live token never leaves the process. Never raises: an unloadable schema
-    yields an empty list."""
+    but their value is REDACTED to "" (with ``secret: True`` and ``is_set`` —
+    True when the RUNNING loop has a value OR the file has one saved, so a
+    panel-saved token registers immediately and a cleared-but-not-restarted one
+    stays truthfully "set") so the live token never leaves the process. Never
+    raises: an unloadable schema yields an empty list."""
     schema, _coerce = _load_settings_schema()
+    saved = _read_saved_settings(settings_path)
     items: list[dict] = []
     tabs: list[str] = []
     for name, spec in schema.items():
@@ -578,6 +652,18 @@ def build_settings_schema() -> dict:
         if tab not in tabs:
             tabs.append(tab)
         default = spec.get("default")
+        live = _config_value(name, _NO_CONSTANT)
+        if name in saved:
+            # The durable record the owner saved. Coerce through the SAME rules
+            # the write path applies so a hand-edited file still renders sanely.
+            try:
+                value = _coerce(spec, saved[name]) if _coerce else saved[name]
+            except Exception:
+                value = saved[name]
+        elif live is not _NO_CONSTANT:
+            value = live
+        else:
+            value = default
         row = {
             "name": name,
             "tab": tab,
@@ -587,17 +673,25 @@ def build_settings_schema() -> dict:
             # the client can rely on truthiness.
             "choices": spec.get("choices"),
             "help": spec.get("help", ""),
-            # The CURRENT effective value (live from core.config), falling back to
-            # the schema default when the constant isn't readable.
-            "value": _config_value(name, default),
+            "value": value,
             "default": default,
         }
+        if name in saved:
+            # Honest divergence flag: the file says one thing, the running
+            # loop's constant another → the save applies on the next restart.
+            row["pending_restart"] = bool(live is not _NO_CONSTANT
+                                          and value != live)
         if name in _SECRET_SETTING_KEYS:
             # Redact: report only WHETHER a value is set, never the value itself.
             # The client renders a password field and (on an empty save) leaves
-            # the existing secret untouched — see saveSetting.
-            live = row["value"]
-            row["is_set"] = bool(live and str(live).strip())
+            # the existing secret untouched — see saveSetting. "Set" means the
+            # running loop OR the saved file carries a non-empty value: a token
+            # saved via the panel counts immediately, and one cleared in the
+            # file stays set until the restart actually drops it from the loop.
+            live_set = (live is not _NO_CONSTANT
+                        and bool(live and str(live).strip()))
+            file_set = name in saved and bool(str(saved[name] or "").strip())
+            row["is_set"] = bool(live_set or file_set)
             row["value"] = ""
             row["default"] = ""
             row["secret"] = True
@@ -1299,13 +1393,18 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send_json(tail_log(cfg["log_dir"], n))
 
         if path == "/api/settings":
-            # The FULL settings snapshot: every schema knob + its CURRENT effective
-            # value, read live. Gated the same as every other API route (token when
-            # one is set) — reading the config is less sensitive than writing it,
-            # but there's no reason to leak it token-free on an exposed bind.
+            # The FULL settings snapshot: every schema knob + its current value
+            # (the saved file overlaid on the live constants — see
+            # build_settings_schema), read fresh each call. Passing
+            # user_settings_path makes this GET read the EXACT file POST
+            # /api/settings writes, so a save round-trips instead of reverting.
+            # Gated the same as every other API route (token when one is set) —
+            # reading the config is less sensitive than writing it, but there's
+            # no reason to leak it token-free on an exposed bind.
             if not self._authorized(query, is_page=False):
                 return self._unauthorized()
-            return self._send_json(build_settings_schema())
+            return self._send_json(
+                build_settings_schema(cfg["user_settings_path"]))
 
         # ── control-panel endpoints (System / Actions / Voice / Memory + the
         #    camera preview image). Each is auth-gated exactly like /api/status,
@@ -1525,10 +1624,15 @@ def _dashboard_html(token: str) -> str:
     dark theme with arc-reactor cyan accents. Polls /api/status + /api/log/tail
     once a second and POSTs typed commands to /api/say. The token (if any) is
     baked into the JS so the page's own API calls carry it."""
-    # html.escape the token so a token with quotes can't break out of the JS
-    # string literal (it's a shared secret, not attacker-controlled, but cheap
-    # to be correct).
-    tok = html.escape(token or "", quote=True)
+    # Serialize the token as JSON for the JS context it lands in. <script> is an
+    # HTML raw-text element — character references are NOT decoded there — so
+    # html.escape was the WRONG escaper (a token containing &"'<> reached the JS
+    # as &amp;/&quot;/… and every API call 401'd; a backslash produced an
+    # unterminated JS string). json.dumps escapes quotes, backslashes and
+    # control characters correctly for a JS string literal, and the "</" → "<\/"
+    # replacement keeps a token containing "</script>" from terminating the
+    # inline script early ("\/" is a valid JS string escape equal to "/").
+    tok = json.dumps(token or "").replace("</", "<\\/")
     # NOTE: literal braces in the CSS/JS are doubled because this is an f-string.
     return f"""<!doctype html>
 <html lang="en"><head>
@@ -1812,7 +1916,7 @@ def _dashboard_html(token: str) -> str:
   </section>
 </div>
 <script>
-const TOKEN = "{tok}";
+const TOKEN = {tok};
 function hdr() {{ const h = {{'Content-Type':'application/json'}}; if (TOKEN) h['X-Auth-Token']=TOKEN; return h; }}
 function q(u) {{ return TOKEN ? (u + (u.includes('?')?'&':'?') + 'token=' + encodeURIComponent(TOKEN)) : u; }}
 const strip = document.getElementById('strip');
@@ -2129,6 +2233,10 @@ function renderSettings(payload) {{
       const saveBtn=document.createElement('button'); saveBtn.className='save';
       saveBtn.type='button'; saveBtn.textContent='Save';
       const saved=document.createElement('span'); saved.className='saved';
+      // Saved-but-not-yet-live: the file diverges from the running loop's
+      // constant, so be honest that this value applies on the next restart.
+      if (it.pending_restart) {{ saved.textContent='pending restart';
+        saved.style.color='var(--muted)'; }}
       saveBtn.addEventListener('click', () => {{
         const v = c.read();
         // Empty save on a secret = "keep the current value" — never POST "" and
@@ -2245,11 +2353,11 @@ function speakChipClass(sp) {{
 }}
 function renderActions(filter) {{
   const f=(filter||'').trim().toLowerCase();
-  actionsList.innerHTML=''; let shown=0;
+  actionsList.innerHTML=''; let shown=0, matched=0;
   const frag=document.createDocumentFragment();
   for (const a of ALL_ACTIONS) {{
     if (f && a.name.toLowerCase().indexOf(f)===-1) continue;
-    if (shown>=400) break;   // cap the DOM; refine the search to see more
+    matched++; if (shown>=400) continue;   // cap the DOM; the overflow row below advertises the rest
     const row=document.createElement('div'); row.className='lrow';
     const nm=document.createElement('div'); nm.className='nm'; nm.textContent=a.name;
     nm.title='Click to edit in the Live command box';
@@ -2262,9 +2370,16 @@ function renderActions(filter) {{
     row.appendChild(nm); row.appendChild(chip); row.appendChild(send);
     frag.appendChild(row); shown++;
   }}
+  if (matched>shown) {{
+    const more=document.createElement('div'); more.className='lrow';
+    const m=document.createElement('span'); m.className='muted';
+    m.textContent='…'+(matched-shown)+' more — refine your search';
+    more.appendChild(m); frag.appendChild(more);
+  }}
   actionsList.appendChild(frag);
-  actionsCount.textContent = ALL_ACTIONS.length + ' actions'
-    + (f ? '  ·  ' + shown + ' shown' : '');
+  // The shown qualifier is UNCONDITIONAL: with an empty search the cap still
+  // applies, so the header must never claim the full total while rows are cut.
+  actionsCount.textContent = ALL_ACTIONS.length + ' actions  ·  ' + shown + ' shown';
 }}
 actionsSearch.addEventListener('input', () => renderActions(actionsSearch.value));
 async function loadActions() {{
@@ -2348,17 +2463,23 @@ const memFacts = document.getElementById('memFacts');
 let ALL_FACTS = [];
 function renderFacts(filter) {{
   const f=(filter||'').trim().toLowerCase();
-  memFacts.innerHTML=''; let shown=0;
+  memFacts.innerHTML=''; let shown=0, matched=0;
   const frag=document.createDocumentFragment();
   for (const fact of ALL_FACTS) {{
     if (f && (fact.text||'').toLowerCase().indexOf(f)===-1) continue;
-    if (shown>=400) break;
+    matched++; if (shown>=400) continue;   // same DOM cap as renderActions — and the same honest overflow row
     const row=document.createElement('div'); row.className='lrow';
     const txt=document.createElement('div'); txt.className='txt'; txt.textContent=fact.text;
     row.appendChild(txt);
     if (fact.source) {{ const chip=document.createElement('span'); chip.className='schip';
       chip.textContent=fact.source; row.appendChild(chip); }}
     frag.appendChild(row); shown++;
+  }}
+  if (matched>shown) {{
+    const more=document.createElement('div'); more.className='lrow';
+    const m=document.createElement('span'); m.className='muted';
+    m.textContent='…'+(matched-shown)+' more — refine your search';
+    more.appendChild(m); frag.appendChild(more);
   }}
   memFacts.appendChild(frag);
   if (!ALL_FACTS.length) memFacts.innerHTML=

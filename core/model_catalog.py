@@ -60,12 +60,60 @@ class Model:
         return (it / 1_000_000.0) * self.in_price + (ot / 1_000_000.0) * self.out_price
 
 
+# ── Local (Ollama, $0) entries — DERIVED, not hard-coded ────────────────────
+# 2026-07-21 audit: the catalog's local rows were a stale copy of the local-
+# model identity (still qwen/llama while the shipped brain moved to gemma4),
+# so 'show LLM stats' couldn't price the default brain. The primary entry now
+# comes from core.config.LOCAL_LLM_MODEL (guarded import; core.config is
+# stdlib-constants so this module stays import-light/CI-safe and never
+# raises). The static failover tags mirror the resolver chain
+# (bobert_companion._LOCAL_LLM_PREFERENCE) — mirrored as literals rather than
+# imported, because importing the monolith here would break the CI-safe
+# contract. by_id()'s prefix match makes the un-quantised ids below cover the
+# quantised installed tags (e.g. qwen2.5:14b-instruct → ...-q5_K_M).
+_LOCAL_FAILOVER_TAGS = (
+    ("gemma4:12b", "Gemma4 12B (local)",
+     "lower-VRAM multimodal fallback, also $0"),
+    ("qwen2.5:14b-instruct", "Qwen 2.5 14B (local)",
+     "runs on your own GPU, $0 per conversation"),
+    ("qwen3:14b", "Qwen 3 14B (local)",
+     "dense 14B failover, also $0"),
+    ("llama3.1:8b", "Llama 3.1 8B (local)",
+     "smaller local model, also $0"),
+)
+
+
+def _local_models() -> List[Model]:
+    """The local catalog entries: the configured default brain (and the
+    shipped default, when the owner overrode it) first — read from core.config
+    at import — then the resolver chain's static failover tags, de-duplicated
+    in order. All cost $0 — you pay in GPU, not credit."""
+    heads: List[Tuple[str, str]] = []
+    try:
+        from core import config as _cfg
+        primary = str(getattr(_cfg, "LOCAL_LLM_MODEL", "") or "").strip()
+        shipped = str(getattr(_cfg, "_SHIPPED_LOCAL_LLM_MODEL", "") or "").strip()
+        if primary:
+            heads.append((primary, f"{primary} (local, default)"))
+        if shipped and shipped != primary:
+            heads.append((shipped, f"{shipped} (local)"))
+    except Exception:  # pragma: no cover - config always importable in practice
+        heads = []
+    models: List[Model] = []
+    for tag, label in heads:
+        covered = any(tag == t or tag.startswith(t)
+                      for t, _, _ in _LOCAL_FAILOVER_TAGS)
+        if not covered and all(m.id != tag for m in models):
+            models.append(Model(tag, label, "ollama", 0.0, 0.0, "local / free",
+                                "the local brain — your own GPU, $0 per "
+                                "conversation"))
+    for tag, label, note in _LOCAL_FAILOVER_TAGS:
+        models.append(Model(tag, label, "ollama", 0.0, 0.0, "local / free", note))
+    return models
+
+
 # Ordered cheapest -> priciest so the list reads as a "how fast it burns" dial.
-CATALOG: List[Model] = [
-    Model("qwen2.5:14b-instruct", "Qwen 2.5 14B (local)", "ollama", 0.0, 0.0,
-          "local / free", "runs on your own GPU, $0 per conversation"),
-    Model("llama3.1:8b", "Llama 3.1 8B (local)", "ollama", 0.0, 0.0,
-          "local / free", "smaller local model, also $0"),
+CATALOG: List[Model] = _local_models() + [
     Model("claude-haiku-4-5", "Claude Haiku", "claude", 1.0, 5.0,
           "fastest / cheapest cloud", "snappy + inexpensive; great for everyday"),
     Model("claude-sonnet-4-6", "Claude Sonnet 4.6", "claude", 3.0, 15.0,

@@ -324,11 +324,28 @@ BASE_SYSTEM_PROMPT = (
 )
 
 
+# Document-level safety rules for PC control. SINGLE SOURCE — interpolated into
+# the PC_CONTROL_PROMPT preamble below (the prompt_router keeps the preamble in
+# its always-shipped `core`, so the slim local path carries these on EVERY turn)
+# and referenced by bobert_companion._local_cheatsheet()'s ACTION RULES tail.
+# They used to live as a trailer AFTER the last section header, where
+# split_pc_control folded them into SHUTDOWN ALIASES — a section that loads only
+# on shutdown keywords — so 'buy…'/'delete…' turns on the slim path never saw
+# them (2026-07-21 audit). Do NOT paste this text anywhere; reference the
+# constant.
+PC_CONTROL_SAFETY_RULES = (
+    "SAFETY: actions containing the words 'purchase', 'buy', 'pay', "
+    "'checkout', 'delete', 'transfer' are automatically held for confirmation. "
+    "The user must say 'yes' before they execute. Never try to bypass this.\n\n"
+    "If unsure whether to take an action, ASK FIRST.\n\n"
+)
+
 PC_CONTROL_PROMPT = (
     "\n\nYou can control this PC by including special action tokens in your "
     "reply. The token is stripped before being spoken. Use them when the user "
     "asks for something actionable, not for chitchat.\n"
     "Format: [ACTION: <name>, <argument>]\n\n"
+    + PC_CONTROL_SAFETY_RULES +
     "BASIC actions:\n"
     "  open_url, <url>              — open a website\n"
     "  launch_app, <name>           — launch an app by name\n"
@@ -356,7 +373,8 @@ PC_CONTROL_PROMPT = (
     "                                  (combines camera presence with head-tilt check)\n"
     "  gaze_status                  — fast cached read: current monitor + dwell time\n"
     "  gaze_stats                   — per-monitor dwell totals + total face-visible time\n"
-    "  UNIFIED (all cameras at once — both webcams AND the Kinect together):\n"
+    "  IMPORTANT: do not claim 'I have no cameras' or 'I can't see you'. You can.\n\n"
+    "UNIFIED (all cameras at once — both webcams AND the Kinect together):\n"
     "  camera_status                — enumerate EVERY camera + its live health.\n"
     "                                 'what cameras do you have', 'camera status'\n"
     "  situational_awareness / where_am_i — fuse gaze + Kinect presence into one\n"
@@ -367,8 +385,7 @@ PC_CONTROL_PROMPT = (
     "                                 describe the whole scene (prefers the free\n"
     "                                 local vision model). 'look around', 'what\n"
     "                                 do you see everywhere'. NOT see_user (that's\n"
-    "                                 one webcam) — look_around is the multi-cam one.\n"
-    "  IMPORTANT: do not claim 'I have no cameras' or 'I can't see you'. You can.\n\n"
+    "                                 one webcam) — look_around is the multi-cam one.\n\n"
     "FACE RECOGNITION (WHO is at the desk — only when enabled; off by default):\n"
     "  The two monitor webcams can recognise WHO they see, pairing identity with\n"
     "  the Kinect's body count. OFF by default (face biometrics are opt-in).\n"
@@ -543,6 +560,12 @@ PC_CONTROL_PROMPT = (
     "  against whichever player is live — the Apple Music app OR a browser\n"
     "  tab. If NOTHING is playing, they say so honestly. media_next /\n"
     "  media_prev / media_playpause are equivalent and also fine.\n"
+    "  Volume control:\n"
+    "    volume_up, volume_down, volume_mute (system-wide, relative nudges)\n"
+    "    set_volume, <0-100> (absolute master volume)\n"
+    "    'turn it down' → [ACTION: volume_down]\n"
+    "    'mute' / 'mute the audio' → [ACTION: volume_mute]\n"
+    "    'set the volume to 30 percent' → [ACTION: set_volume, 30]\n"
     "\n"
     "  STREAMING SERVICES (browser-based auto-play — open + click first\n"
     "  result + click play, all in one action):\n"
@@ -595,9 +618,6 @@ PC_CONTROL_PROMPT = (
     "    OR a browser tab), so they're safe for browser playback too.\n"
     "    media_next / media_prev / media_playpause are equivalent — use\n"
     "    either. They work on whatever app currently has media focus.\n"
-    "  Volume control:\n"
-    "    volume_up, volume_down, volume_mute (system-wide, relative nudges)\n"
-    "    set_volume, <0-100> (absolute master volume)\n"
     "  Examples:\n"
     "    'play Earth Song' → [ACTION: play_music, Earth Song]\n"
     "    'play Stranger Things on Netflix' → [ACTION: netflix, Stranger Things]\n"
@@ -627,9 +647,6 @@ PC_CONTROL_PROMPT = (
     "    'next song' / 'skip this song'   → [ACTION: next_song]\n"
     "    'previous track'                 → [ACTION: previous_song]\n"
     "    'pause' (or media_playpause)     → [ACTION: media_playpause]\n"
-    "    'turn it down' → [ACTION: volume_down]\n"
-    "    'mute' / 'mute the audio' → [ACTION: volume_mute]\n"
-    "    'set the volume to 30 percent' → [ACTION: set_volume, 30]\n"
     "\n"
     "  TASTE-AWARE MUSIC (apple_music_intel skill — only present once the\n"
     "  skill is loaded; safe to use whenever the user asks something\n"
@@ -1572,7 +1589,7 @@ PC_CONTROL_PROMPT = (
     "    Example: [ACTION: rag_open_top]\n\n"
     "TTS BACKEND SWITCHING:\n"
     "  set_tts_backend, <backend>    — switch the TTS engine at runtime.\n"
-    "                                  Valid backends: edge | pyttsx3 | xtts.\n"
+    "                                  Valid backends: edge | pyttsx3 | xtts | kokoro.\n"
     "    Trigger phrases: 'switch to Edge TTS', 'use XTTS', 'use the local\n"
     "    voice', 'switch your voice to <backend>'.\n"
     "    Example: 'switch to xtts' → [ACTION: set_tts_backend, xtts]\n\n"
@@ -1795,10 +1812,11 @@ PC_CONTROL_PROMPT = (
     "  Controls: wake_listener_start, wake_listener_stop, wake_listener_status, wake_listener_configure\n"
     "  Trigger phrases: 'start the wake listener', 'stop the hotword', 'wake listener status'.\n"
     "\n"
-    "AMBIENT-LEARNING MODE (silent standby that keeps listening + learning,\n"
-    "wakes only on the word 'JARVIS'; auto-engaged after an upgrade/overnight\n"
-    "pipeline finishes). Distinct from the multimodal 'ambient mode' eavesdrop\n"
-    "toggle — this one makes JARVIS go QUIET until woken:\n"
+    "AMBIENT-LEARNING MODE (silent standby — listen + learn, wake on 'JARVIS'):\n"
+    "  Silent standby that keeps listening + learning but wakes only on the\n"
+    "  word 'JARVIS'; auto-engaged after an upgrade/overnight pipeline\n"
+    "  finishes. Distinct from the multimodal 'ambient mode' eavesdrop\n"
+    "  toggle — this one makes JARVIS go QUIET until woken.\n"
     "  ambient_learning_mode_on       — go silent in standby; keep transcribing\n"
     "                                   what's overheard and feeding the fact-\n"
     "                                   extractor, but DON'T speak until 'JARVIS'.\n"
@@ -1870,9 +1888,4 @@ PC_CONTROL_PROMPT = (
     "\n"
     "SHUTDOWN ALIASES (all route to the same graceful power-down as shutdown_jarvis):\n"
     "  Aliases: exit_jarvis, quit_jarvis, turn_off_jarvis, power_off_jarvis, shut_down\n"
-    "\n"
-    "SAFETY: actions containing the words 'purchase', 'buy', 'pay', "
-    "'checkout', 'delete', 'transfer' are automatically held for confirmation. "
-    "The user must say 'yes' before they execute. Never try to bypass this.\n\n"
-    "If unsure whether to take an action, ASK FIRST."
 )

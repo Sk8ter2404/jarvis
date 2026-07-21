@@ -1238,6 +1238,70 @@ class DrainInjectedCommandTests(SectionSevenBase):
         self._p(self.bc.os, "replace", side_effect=_flaky_replace)
         self.assertEqual(self.bc._drain_injected_command(), "head")
 
+    # ── orphaned .consuming recovery (2026-07-21 audit: "queue files are
+    #    never recovered") ────────────────────────────────────────────────────
+
+    def test_orphaned_consuming_recovered_without_live_queue(self):
+        # A crash between the claim and the consume strands the snapshot as
+        # <queue>.consuming; with no live queue it must be renamed back and
+        # drained instead of being silently lost forever.
+        with open(self._path + ".consuming", "w", encoding="utf-8") as f:
+            json.dump(["orphan-cmd"], f)
+        self.assertEqual(self.bc._drain_injected_command(), "orphan-cmd")
+        self.assertFalse(os.path.exists(self._path + ".consuming"))
+
+    def test_orphan_precedes_live_queue_and_nothing_lost(self):
+        # Orphan + live queue both present: the claim must NOT clobber the
+        # orphan (Windows os.replace overwrites its destination) — the orphan
+        # items come first (they are older) and the live items survive.
+        with open(self._path + ".consuming", "w", encoding="utf-8") as f:
+            json.dump(["a"], f)
+        self._write(["b"])
+        self.assertEqual(self.bc._drain_injected_command(), "a")
+        self.assertEqual(self.bc._drain_injected_command(), "b")
+        self.assertFalse(os.path.exists(self._path + ".consuming"))
+
+    def test_corrupt_orphan_discarded_live_queue_still_drains(self):
+        # An unreadable orphan is discarded (same policy as the corrupt-JSON
+        # branch) without exception, and the live queue still drains.
+        with open(self._path + ".consuming", "w", encoding="utf-8") as f:
+            f.write("{not valid json")
+        self._write(["live-cmd"])
+        self.assertEqual(self.bc._drain_injected_command(), "live-cmd")
+        self.assertFalse(os.path.exists(self._path + ".consuming"))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  .consuming claim/recovery invariant (source scan)
+# ════════════════════════════════════════════════════════════════════════════
+class ConsumingQueueRecoveryInvariantTests(SectionSevenBase):
+    """The stale-duplicate defense for the .consuming queue rule: every
+    function that claims a queue by renaming it to `.consuming` must recover
+    an orphaned snapshot BEFORE the claim (via _recover_orphaned_queue_
+    snapshot) — a future third queue copy cannot ship without recovery."""
+
+    def test_every_consuming_claim_recovers_orphans_first(self):
+        import ast
+        with open(self.bc.__file__, "r", encoding="utf-8") as f:
+            src = f.read()
+        tree = ast.parse(src)
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if node.name == "_recover_orphaned_queue_snapshot":
+                continue   # the recovery helper itself
+            seg = ast.get_source_segment(src, node) or ""
+            if '".consuming"' in seg and "os.replace(" in seg:
+                if "_recover_orphaned_queue_snapshot(" not in seg:
+                    offenders.append(node.name)
+        self.assertEqual(
+            offenders, [],
+            "these bobert_companion functions claim a queue via a .consuming "
+            "rename without recovering an orphaned snapshot first (crash "
+            "between claim and consume silently loses the batch): "
+            f"{offenders}")
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  _enforce_singleton  (boot PID-file re-check; subprocess/os mocked)
@@ -1487,9 +1551,16 @@ class StartupPreflightTests(SectionSevenBase):
 
     def test_claude_reachable_path(self):
         self._p(self.bc, "_preflight_api_key", return_value=(True, "ok"))
-        # Should complete without raising and without consulting the local model.
+        # Should complete without raising and — beyond the unconditional
+        # step-(0) local-brain self-heal (2026-07-09), stubbed here — without
+        # consulting the local model: a reachable Claude never needs the
+        # _ollama_alive fallback probe. (This test predated step (0) and
+        # asserted no _ollama_alive call at all, which has been impossible
+        # since the self-heal landed; stale pin repaired 2026-07-21.)
+        ensure = self._p(self.bc, "_ensure_ollama_running", return_value=True)
         alive = self._p(self.bc, "_ollama_alive")
         self.bc._startup_preflight()
+        ensure.assert_called_once()
         alive.assert_not_called()
 
     def test_claude_down_but_local_ok_continues(self):
@@ -1637,6 +1708,23 @@ class LoadSkillsTests(SectionSevenBase):
         # The good skill still loaded despite the broken one.
         self.assertIn("act_ok", self.bc.ACTIONS)
         self.assertNotIn("boom", self.bc._loaded_skill_names)
+        # Regression (2026-07-21 audit): the pre-exec sys.modules insert must
+        # be rolled back on failure — otherwise every lazy
+        # sys.modules.get("skill_boom") bridge (and self_diagnostic's
+        # skill_imports probe) mistakes the half-initialized module for a
+        # healthy skill.
+        self.assertNotIn("skill_boom", self.bc.sys.modules)
+
+    def test_register_raise_pops_sys_modules_entry(self):
+        # Same rollback when exec succeeds but register() raises — the module
+        # body ran, yet the skill never registered, so it must not linger in
+        # sys.modules looking healthy.
+        self._write("regboom.py",
+                    "def register(actions):\n"
+                    "    raise RuntimeError('explode in register')\n")
+        self.bc.load_skills()
+        self.assertNotIn("regboom", self.bc._loaded_skill_names)
+        self.assertNotIn("skill_regboom", self.bc.sys.modules)
 
 
 # ════════════════════════════════════════════════════════════════════════════

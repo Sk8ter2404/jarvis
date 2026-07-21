@@ -128,6 +128,10 @@ def load_skill_isolated(name, *, utils=None, actions=None, register=True,
             if register and hasattr(mod, "register"):
                 mod.register(actions)
     except (ImportError, ModuleNotFoundError) as exc:
+        # Roll back the pre-exec sys.modules insert (mirrors load_skills'
+        # failure path) so a half-initialized module can't leak into other
+        # tests via sys.modules.get("skill_<name>").
+        sys.modules.pop(f"skill_{name}", None)
         # A missing THIRD-PARTY dep (torch, cv2, …) skips the test on a reduced
         # CI runner; a missing INTRA-PROJECT module is a real broken import and
         # propagates. Local dev has every dep, so this never skips there.
@@ -136,6 +140,9 @@ def load_skill_isolated(name, *, utils=None, actions=None, register=True,
             import unittest as _unittest
             raise _unittest.SkipTest(
                 f"skill {name!r}: third-party dep not installed: {dep}") from exc
+        raise
+    except Exception:
+        sys.modules.pop(f"skill_{name}", None)   # same rollback, any failure
         raise
     return mod, actions
 

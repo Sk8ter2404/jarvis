@@ -583,3 +583,19 @@ def register(actions: dict) -> None:
         t = threading.Thread(target=_bg, name="wake-listener-autostart",
                              daemon=True)
         t.start()
+    else:
+        # The detector deliberately does NOT autostart (WAKE_WORD_AUTOSTART
+        # above — its InputStream collides with record_speech() on the same
+        # WASAPI device), yet _gate_and_announce() here is the ONLY acoustic
+        # caller of request_tts_interrupt. So when the owner's barge-in
+        # toggle is on, voice barge-in is silently dead until they start the
+        # detector by hand. Make the mismatch visible in the session log
+        # (2026-07-21 audit). Best-effort: never let it break register().
+        try:
+            from core import config as _core_cfg
+            if getattr(_core_cfg, "BARGE_IN_ENABLED", False):
+                print("  [wake-listener] barge-in is enabled but the wake "
+                      "detector is not running — say 'start listening for "
+                      "the wake word' to arm voice barge-in")
+        except Exception:
+            pass

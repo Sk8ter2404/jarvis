@@ -11,7 +11,11 @@ without importing the ~1M-line monolith.
 Covers: actions registered; on/off toggle the shared flag; duration parsing
 (spoken + numeric + bare + indefinite); whats_missed does NOT clear; off returns
 a recap AND clears; the auto-resume Timer is armed for a timed block and not for
-an indefinite one; end_focus_mode chains a pre-existing dnd_focus_mode handler.
+an indefinite one; EVERY engage alias (focus_mode / focus_mode_on /
+do_not_disturb / quiet_mode) chains dnd_focus_mode's prior engage and EVERY
+disengage alias (end_focus_mode / focus_mode_off / resume) chains its prior
+teardown — exactly once per call, enumerated from the registered actions dict
+so a future un-chained alias fails here rather than in a grep.
 
 stdlib unittest + unittest.mock only. Headless: the resume Timer is mocked so no
 real thread sleeps, and load_skill_isolated neuters Thread.start at import.
@@ -300,7 +304,7 @@ class AutoResumeTests(_FocusSkillBase):
         self.assertIn("Focus time's up", recap_msg)
 
 
-# ─── end_focus_mode chains a pre-existing dnd_focus_mode handler ─────────────
+# ─── every alias chains the pre-existing dnd_focus_mode handlers ─────────────
 
 class ChainingTests(unittest.TestCase):
     def setUp(self):
@@ -372,6 +376,114 @@ class ChainingTests(unittest.TestCase):
             self.fake_bc.proactive_announce("a weather alert", source="skill")
             self.assertEqual(self.fake_bc.focus_missed_count(), 1)
         self.assertIn("hold notifications", out.lower())  # our confirmation spoken
+
+    # ── 2026-07-21 fix: disengage symmetry ───────────────────────────────────
+    # "resume" / "focus_mode_off" used to skip dnd_focus_mode's teardown,
+    # leaving Windows Focus Assist, Teams DND and the nudge suppressors stuck
+    # on until dnd's own expiry thread fired (up to an hour later).
+
+    def test_focus_mode_off_and_resume_chain_prior_end(self):
+        end_calls = []
+
+        def prior_end(a=""):
+            end_calls.append(a)
+            return "Focus mode disengaged, sir."   # dnd_focus_mode's teardown line
+
+        actions = {"end_focus_mode": prior_end}
+        mod, actions = load_skill_isolated("focus_mode", actions=actions)
+        with mock.patch.object(mod, "_arm_resume_timer"):
+            for alias in ("focus_mode_off", "resume"):
+                before = len(end_calls)
+                actions["focus_mode_on"]("")
+                self.fake_bc.proactive_announce("a Teams message", source="skill")
+                out = actions[alias]("")
+                # dnd's OS-level teardown ran, exactly once …
+                self.assertEqual(len(end_calls), before + 1, alias)
+                # … and OUR recap is still returned, gate off.
+                self.assertIn("1 thing", out, alias)
+                self.assertFalse(self.fake_bc._focus_mode[0], alias)
+
+    def test_all_engage_aliases_chain_prior_engage(self):
+        # Mirror gap: "do not disturb" / "quiet mode" used to engage only OUR
+        # gate, never dnd's Focus Assist / Teams DND.
+        engage_calls = []
+
+        def prior_engage(a=""):
+            engage_calls.append(a)
+            return "Windows Focus Assist on, sir."
+
+        actions = {"focus_mode": prior_engage}
+        mod, actions = load_skill_isolated("focus_mode", actions=actions)
+        with mock.patch.object(mod, "_arm_resume_timer"):
+            for alias in ("focus_mode_on", "do_not_disturb", "quiet_mode"):
+                self.fake_bc.set_focus_mode(False)
+                before = len(engage_calls)
+                actions[alias]("")
+                self.assertEqual(len(engage_calls), before + 1, alias)
+                self.assertTrue(self.fake_bc._focus_mode[0], alias)
+
+    def test_shared_names_chain_exactly_once_per_call(self):
+        # Guards the naive-fix regression: chaining in BOTH a shared-name
+        # wrapper and the base handler would fire dnd's teardown twice per
+        # "end focus mode" and silently extend dnd's deadline on every
+        # "focus mode" (its engage extends when already active).
+        engage_calls, end_calls = [], []
+        actions = {
+            "focus_mode":     lambda a="": engage_calls.append(a) or "dnd on",
+            "end_focus_mode": lambda a="": end_calls.append(a) or "dnd off",
+        }
+        mod, actions = load_skill_isolated("focus_mode", actions=actions)
+        with mock.patch.object(mod, "_arm_resume_timer"):
+            actions["focus_mode"]("")
+            self.assertEqual(len(engage_calls), 1)
+            self.assertEqual(len(end_calls), 0)
+            actions["end_focus_mode"]("")
+            self.assertEqual(len(end_calls), 1)
+            self.assertEqual(len(engage_calls), 1)
+
+    def test_every_registered_alias_chains_its_direction(self):
+        # Stale-duplicate invariant: enumerate the names from the ACTIONS dict
+        # itself and classify each handler by its observed effect on the gate —
+        # any handler that ENGAGES must have fired dnd's prior engage exactly
+        # once, any handler that DISENGAGES must have fired dnd's prior end
+        # exactly once. A future alias registered without chaining (or chained
+        # twice) fails here rather than in a grep.
+        engage_calls, end_calls = [], []
+        seeded = {
+            "focus_mode":        lambda a="": engage_calls.append(a) or "dnd on",
+            "end_focus_mode":    lambda a="": end_calls.append(a) or "dnd off",
+            "focus_mode_status": lambda a="": "OS DND state.",
+        }
+        mod, actions = load_skill_isolated("focus_mode", actions=seeded)
+        with mock.patch.object(mod, "_arm_resume_timer"):
+            for name in sorted(actions):
+                handler = actions[name]
+                # From OFF: does this handler engage?
+                self.fake_bc.set_focus_mode(False)
+                e0, d0 = len(engage_calls), len(end_calls)
+                handler("")
+                if self.fake_bc._focus_mode[0]:
+                    # Engage-direction alias.
+                    self.assertEqual(len(engage_calls), e0 + 1,
+                                     f"{name}: engage alias must chain dnd's "
+                                     f"engage exactly once")
+                    self.assertEqual(len(end_calls), d0,
+                                     f"{name}: engage alias must not chain "
+                                     f"dnd's teardown")
+                    continue
+                # From ON: does this handler disengage?
+                self.fake_bc.set_focus_mode(True)
+                e1, d1 = len(engage_calls), len(end_calls)
+                handler("")
+                if not self.fake_bc._focus_mode[0]:
+                    # Disengage-direction alias.
+                    self.assertEqual(len(end_calls), d1 + 1,
+                                     f"{name}: disengage alias must chain "
+                                     f"dnd's teardown exactly once")
+                    self.assertEqual(len(engage_calls), e1,
+                                     f"{name}: disengage alias must not chain "
+                                     f"dnd's engage")
+                # else: pure status alias — no chaining requirement.
 
 
 if __name__ == "__main__":

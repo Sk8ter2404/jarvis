@@ -4,6 +4,7 @@
   "WAKE_WORD_AUTOSTART": false,
   "START_IN_STANDBY": false,
   "AMBIENT_MUSIC_REFUSE_WAKE": true,
+  "REQUIRE_WAKE_MODE": false,
   "MICROPHONE_INDEX": null,
   "PREFERRED_INPUT_DEVICES": [],
   "TTS_VOICE": "en-GB-RyanNeural",

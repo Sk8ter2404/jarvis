@@ -37,7 +37,8 @@ but a saved geometry overrides the CLI default.
 
 CLI:
   python hud/jarvis_unified_hud.py --x 2280 --y -1400 --width 420 \
-      --height 560 --parent-pid 12345
+      --height 560 --parent-pid 12345 [--role staging \
+      --state-file C:/JARVIS/data_staging/hud_state.json]
 """
 from __future__ import annotations
 
@@ -99,6 +100,9 @@ SLOW_REFRESH_S = 600.0        # weather/calendar refresh cadence (background)
 GPU_CACHE_SECONDS = 1.0       # utilization swings 0→100→0 fast; a long cache aliases it
 
 PROJECT_DIR      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Prod defaults. main() repoints HUD_STATE_FILE / CONTROL_FILE / GEOMETRY_FILE
+# into the --state-file directory for blue/green staging instances, so a
+# staging HUD never reads prod state or clobbers prod control/geometry.
 HUD_STATE_FILE   = os.path.join(PROJECT_DIR, "hud_state.json")
 BAMBU_STATE_FILE = os.path.join(PROJECT_DIR, "bambu_overlay_state.json")
 CONTROL_FILE     = os.path.join(PROJECT_DIR, "unified_hud_state.json")
@@ -183,6 +187,22 @@ def _is_parent_alive(pid: int) -> bool:
 
 def _control_says_off() -> bool:
     return (_read_json(CONTROL_FILE).get("mode") or "").lower() == "off"
+
+
+def _boot_overlay_active(boot_phase: str, boot_started_at: float,
+                         boot_duration: float, now: float) -> bool:
+    """True while the boot power-up animation should own the panel.
+
+    Mirrors the boot-sequence override contract of hud/jarvis_hud.py exactly:
+    the phase must be the literal "powering" with a positive start + duration
+    (published by iron_man_boot / boot_sequence / skills.suit_up via
+    _write_hud_state), and the overlay self-clears 0.5 s after the advertised
+    duration so a crashed producer — which would never write the clearing
+    boot_phase="" — cannot strand the animation on screen. Pure (arithmetic
+    only) so it is unit-testable without Qt or a display."""
+    return (boot_phase == "powering" and boot_started_at > 0
+            and boot_duration > 0
+            and (now - boot_started_at) <= (boot_duration + 0.5))
 
 
 def _camera_preview_fresh_at(now: float) -> bool:
@@ -368,10 +388,14 @@ class _SlowData:
 
 # ─── the HUD widget ──────────────────────────────────────────────────────────
 class UnifiedHud(QWidget):
-    def __init__(self, parent_pid: int, slow: _SlowData):
+    def __init__(self, parent_pid: int, slow: _SlowData, role: str = "prod"):
         super().__init__()
         self.parent_pid = parent_pid
         self.slow = slow
+        # Blue/green role from the launcher (--role). Anything other than
+        # "prod" renders the STAGING badge so a green-side HUD can never be
+        # mistaken for the live one.
+        self.role = (role or "prod").lower()
         self.frame = 0
         self._drag_offset: QPoint | None = None
 
@@ -379,6 +403,11 @@ class UnifiedHud(QWidget):
         self.state = "idle"
         self._want_visible = True   # driven by hud_state.json "visible" flag
         self._user_hidden = False   # set by the ✕ button (control-file "hidden")
+        # Boot power-up hook (see _boot_overlay_active): published to
+        # hud_state.json by iron_man_boot / boot_sequence / skills.suit_up.
+        self.boot_phase = ""
+        self.boot_started_at = 0.0
+        self.boot_duration = 0.0
         self.now_doing = ""
         self.now_playing = ""
         self.transcript: list[str] = []
@@ -599,6 +628,16 @@ class UnifiedHud(QWidget):
         # ✕-button hide persists in the control file; 'show HUD' clears it.
         self._user_hidden = bool(_read_json(CONTROL_FILE).get("hidden"))
         self.state = (hud.get("state") or "Idle").lower()
+        # Boot power-up hook — while iron_man_boot / boot_sequence /
+        # skills.suit_up publish boot_phase="powering", paintEvent hands the
+        # panel to _draw_boot_overlay (see _boot_overlay_active).
+        self.boot_phase = str(hud.get("boot_phase") or "")
+        for attr, key in (("boot_started_at", "boot_started_at"),
+                          ("boot_duration", "boot_duration")):
+            try:
+                setattr(self, attr, float(hud.get(key) or 0.0))
+            except (TypeError, ValueError):
+                setattr(self, attr, 0.0)
         self.now_doing = (hud.get("now_doing") or "").strip()
         self.now_playing = (hud.get("now_playing") or "").strip()
         th = hud.get("transcript_history")
@@ -787,6 +826,17 @@ class UnifiedHud(QWidget):
         p.setPen(QPen(PANEL_RIM, 1.4))
         p.drawPath(path)
 
+        # 1b. Boot-sequence override — while iron_man_boot / boot_sequence /
+        # skills.suit_up publish boot_phase="powering", the power-up animation
+        # takes over the whole panel (mirrors hud/jarvis_hud.py's hook). The
+        # gate self-clears 0.5 s after the advertised duration so a crashed
+        # producer can't strand the overlay.
+        if _boot_overlay_active(self.boot_phase, self.boot_started_at,
+                                self.boot_duration, time.time()):
+            self._draw_boot_overlay(p, W, H, s)
+            p.end()
+            return
+
         accent = self._accent()
 
         # 2. Title strip.
@@ -809,6 +859,18 @@ class UnifiedHud(QWidget):
         p.drawText(QRectF(pad, 8 * s, W - 2 * pad - 34 * s, title_h),
                    int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
                    self.state.upper())
+        # Blue/green role badge — a staging-launched HUD must be visually
+        # unmistakable so a green-side render can never pass for the live one.
+        if self.role != "prod":
+            fb = QFont("Consolas", 1)
+            fb.setPixelSize(int(10 * s))
+            fb.setBold(True)
+            p.setFont(fb)
+            p.setPen(QPen(AMBER))
+            p.drawText(QRectF(pad, 8 * s, W - 2 * pad, title_h),
+                       int(Qt.AlignmentFlag.AlignHCenter
+                           | Qt.AlignmentFlag.AlignVCenter),
+                       f"◈ {self.role.upper()}")
         # Divider.
         p.setPen(QPen(PANEL_RIM, 1))
         p.drawLine(QPointF(pad, title_h + 6 * s), QPointF(W - pad, title_h + 6 * s))
@@ -841,6 +903,106 @@ class UnifiedHud(QWidget):
         # 6. Transcript panel (fills remaining space down to the grip).
         self._draw_transcript(p, pad, y, W, H, s)
         p.end()
+
+    # ── boot power-up overlay ────────────────────────────────────────────────
+    def _draw_boot_overlay(self, p, W, H, s) -> None:
+        """Power-up animation drawn while boot_phase == "powering" — the
+        QPainter port of hud/jarvis_hud.py's _draw_boot_animation, so the
+        MIN_VISIBLE_SECONDS hold in iron_man_boot / boot_sequence / suit_up
+        actually shows something on the HUD that is really launched.
+        Concentric rings fill sequentially from the inside out, a central hub
+        grows + brightens with progress, and the INITIALISING / DIAGNOSTICS /
+        ONLINE labels track the same progress thresholds as the original
+        (jarvis_todo.md 2026-05-27 10:04, iron_man_boot contract)."""
+        elapsed = time.time() - self.boot_started_at
+        progress = max(0.0, min(1.0, elapsed / max(0.1, self.boot_duration)))
+        cx, cy = W / 2.0, H * 0.42
+        R = min(W - 4 * 14.0 * s, H * 0.55) * 0.5
+
+        # Rings fill sequentially from inside out, with slight stage overlap
+        # so the animation flows rather than stepping.
+        # (radius, start_progress, end_progress, tick_count)
+        rings = [
+            (R * 0.35, 0.00, 0.30,  8),
+            (R * 0.55, 0.18, 0.55, 12),
+            (R * 0.78, 0.40, 0.75, 18),
+            (R * 1.00, 0.60, 0.95, 24),
+        ]
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for r, p_start, p_end, tick_count in rings:
+            rp = (progress - p_start) / max(0.01, p_end - p_start)
+            rp = max(0.0, min(1.0, rp))
+            if rp <= 0:
+                continue
+            rect = QRectF(cx - r, cy - r, 2 * r, 2 * r)
+            p.setPen(QPen(CYAN_DIM, 1))
+            p.drawEllipse(rect)
+            fill = QPen(CYAN_BRIGHT, max(2.5, 3.0 * s))
+            fill.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(fill)
+            p.drawArc(rect, 90 * 16, -int(360 * 16 * rp))
+            # Counter-rotating shimmer ticks scaled by ring fill — the
+            # "spinning up to speed" feel from the original.
+            spin = self.frame * 0.18 * rp
+            p.setPen(QPen(CYAN, 1))
+            for i in range(tick_count):
+                th = (i / tick_count) * 2 * math.pi + spin
+                p.drawLine(
+                    QPointF(cx + r * math.cos(th), cy + r * math.sin(th)),
+                    QPointF(cx + (r + 3 * s) * math.cos(th),
+                            cy + (r + 3 * s) * math.sin(th)))
+
+        # Central hub grows in size and brightens as the boot progresses.
+        hub_pulse = 0.5 * (1 + math.sin(self.frame * 0.45))
+        hub_r = R * 0.30 * (0.45 + 0.55 * progress) + 1.5 * hub_pulse
+        hub = QColor(CYAN_BRIGHT if progress >= 0.78 else CYAN)
+        hub.setAlpha(int(120 + 135 * progress))
+        p.setPen(QPen(hub, 2))
+        p.setBrush(QBrush(PANEL_BOT))
+        p.drawEllipse(QPointF(cx, cy), hub_r, hub_r)
+        # Final flash — the last 10% gets a bright halo to mark "online".
+        if progress >= 0.90:
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(CYAN_BRIGHT, 2))
+            fr = hub_r + (6 + 3 * hub_pulse) * s
+            p.drawEllipse(QPointF(cx, cy), fr, fr)
+
+        # Center label scrolls through the three boot stages.
+        if progress < 0.38:
+            label, label_col = "INITIALISING", CYAN
+        elif progress < 0.78:
+            label, label_col = "DIAGNOSTICS", CYAN
+        else:
+            label, label_col = "ONLINE", CYAN_BRIGHT
+        fl = QFont("Consolas", 1); fl.setPixelSize(int(13 * s)); fl.setBold(True)
+        p.setFont(fl); p.setPen(QPen(label_col))
+        p.drawText(QRectF(0, cy + R + 10 * s, W, 18 * s),
+                   int(Qt.AlignmentFlag.AlignCenter), label)
+        fp = QFont("Consolas", 1); fp.setPixelSize(int(10 * s))
+        p.setFont(fp); p.setPen(QPen(DIM_FG))
+        p.drawText(QRectF(0, cy + R + 28 * s, W, 16 * s),
+                   int(Qt.AlignmentFlag.AlignCenter), f"{int(progress * 100)}%")
+
+        # Stage breadcrumbs above the rings — brighten one at a time.
+        stages = [("INIT", progress >= 0.00),
+                  ("DIAG", progress >= 0.38),
+                  ("ONLINE", progress >= 0.78)]
+        fs = QFont("Consolas", 1); fs.setPixelSize(int(9 * s)); fs.setBold(True)
+        p.setFont(fs)
+        spacing = 68.0 * s
+        total = spacing * (len(stages) - 1)
+        sy = cy - R - 26 * s
+        for i, (tag, lit) in enumerate(stages):
+            sx = cx - total / 2.0 + i * spacing
+            p.setPen(QPen(CYAN_BRIGHT if lit else CYAN_DIM))
+            p.drawText(QRectF(sx - spacing / 2.0, sy, spacing, 14 * s),
+                       int(Qt.AlignmentFlag.AlignCenter), tag)
+
+        # Bottom strip — marks this as the boot sequence, not an alert.
+        p.setFont(fp); p.setPen(QPen(DIM_FG))
+        p.drawText(QRectF(0, H - 26 * s, W, 16 * s),
+                   int(Qt.AlignmentFlag.AlignCenter),
+                   "J.A.R.V.I.S.  power-up sequence")
 
     # ── live camera preview (picture-in-picture) ─────────────────────────────
     def _draw_camera_preview(self, p, W, pad, title_h, reactor_top,
@@ -1150,10 +1312,33 @@ def main() -> int:
     ap.add_argument("--width", type=int, default=420)
     ap.add_argument("--height", type=int, default=560)
     ap.add_argument("--parent-pid", type=int, default=0)
-    # The shared launcher in bobert_companion also passes --role / --state-file
-    # (blue-green plumbing) and may omit --height. parse_known_args() lets us
-    # ignore anything we don't use rather than erroring out of existence.
+    # Blue/green plumbing from bobert_companion._launch_hud: --state-file
+    # repoints ALL per-role runtime files (state + control + geometry) into the
+    # state file's directory (data_staging/ for green) so a staging HUD neither
+    # renders prod state nor restores/overwrites prod geometry; --role other
+    # than "prod" renders the STAGING badge. Defaults preserve the prod paths.
+    # parse_known_args() still tolerates unknown flags from a newer launcher
+    # rather than erroring out of existence.
+    ap.add_argument("--state-file", type=str, default="",
+                    help="override hud_state.json path "
+                         "(used by blue/green staging instances)")
+    ap.add_argument("--role", type=str, default="prod",
+                    help="blue/green role; anything but 'prod' renders "
+                         "the STAGING badge")
     args, _unknown = ap.parse_known_args()
+
+    # Repoint the per-role files BEFORE anything reads them (and before the
+    # PyQt6 gate, so even a degraded run never touches the prod paths). Every
+    # consumer reads these globals at call time, so reassignment suffices.
+    # Mirrors hud/jarvis_hud.py's --state-file handling; the control/geometry
+    # siblings live in the state file's directory to match
+    # blue_green_manager.resource_paths keeping role files in the role's dir.
+    global HUD_STATE_FILE, CONTROL_FILE, GEOMETRY_FILE
+    if args.state_file:
+        HUD_STATE_FILE = args.state_file
+        _role_dir = os.path.dirname(os.path.abspath(args.state_file))
+        CONTROL_FILE = os.path.join(_role_dir, "unified_hud_state.json")
+        GEOMETRY_FILE = os.path.join(_role_dir, "unified_hud_geometry.json")
 
     if not _HAS_PYQT6:
         print("[unified_hud] PyQt6 is required:  pip install PyQt6",
@@ -1182,7 +1367,7 @@ def main() -> int:
         x, y, w, h = valid["x"], valid["y"], valid["w"], valid["h"]
     slow = _SlowData()
     slow.start()
-    hud = UnifiedHud(args.parent_pid, slow)
+    hud = UnifiedHud(args.parent_pid, slow, role=args.role)
     hud.setGeometry(x, y, w, h)
     hud.show()
     return app.exec()

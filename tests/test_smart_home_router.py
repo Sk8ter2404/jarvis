@@ -1071,8 +1071,13 @@ class SmartHomeControlIntegrationTests(_RouterTestBase):
         self.assertIn("Locked, sir", out)
 
     def test_empty_catalog_devices_message(self):
+        # The live-LAN fallback is stubbed to "nothing on the LAN either" so
+        # this stays a deterministic test of the terminal wizard refusal (the
+        # unstubbed fallback would attempt real sh_kasa LAN discovery).
         self._write_catalog({"device_count": 0, "devices": []})
-        out = router.smart_home_control("turn off the office lamp")
+        with mock.patch.object(router, "_live_lan_fallback",
+                               return_value=None):
+            out = router.smart_home_control("turn off the office lamp")
         self.assertIn("No smart-home catalog", out)
 
     def test_empty_utterance_prompts(self):
@@ -1084,8 +1089,12 @@ class SmartHomeControlIntegrationTests(_RouterTestBase):
                       router.smart_home_control("what time is it").lower())
 
     def test_no_device_match_message(self):
-        self.assertIn("don't see anything",
-                      router.smart_home_control("turn off the garage").lower())
+        # Fallback stubbed to a LAN miss so the terminal refusal is asserted
+        # deterministically (see test_empty_catalog_devices_message).
+        with mock.patch.object(router, "_live_lan_fallback",
+                               return_value=None):
+            out = router.smart_home_control("turn off the garage")
+        self.assertIn("don't see anything", out.lower())
 
     def test_temperature_routes_to_thermostat(self):
         # want_type='thermostat' selects Hall Thermostat over any lamp.
@@ -1113,6 +1122,148 @@ class SmartHomeControlIntegrationTests(_RouterTestBase):
             out = router.smart_home_control("turn off the office lamp")
         self.assertEqual(calls, [("Office Lamp", {"on": False})])
         self.assertIn("Off, sir", out)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Live-LAN fallback (2026-07-21 audit): an empty/missing catalog — or a device
+# on the LAN but absent from the Alexa-seeded catalog — must fall through to
+# skills/sh_kasa's catalog-free LAN handler instead of dead-ending on the
+# "No smart-home catalog yet" wizard refusal. sh_kasa registers the working
+# handler under the SAME action names, but this router loads later (sorted
+# skill order) and overwrites it, so the router itself must keep the LAN
+# path reachable.
+# ════════════════════════════════════════════════════════════════════════════
+class FallbackToLiveLanTests(_RouterTestBase):
+    # sh_kasa's exact miss line (skills/sh_kasa.py smart_home_control).
+    _KASA_MISS = ("I don't see any controllable smart devices on the network "
+                  "yet, sir.")
+
+    def _fake_kasa(self, reply="Done, sir — entry light on.", *, record=None,
+                   raises=False):
+        """A stand-in for the monolith-loaded sh_kasa module
+        (sys.modules['skill_sh_kasa'])."""
+        mod = types.ModuleType("skill_sh_kasa")
+
+        def smart_home_control(utterance=""):
+            if record is not None:
+                record.append(utterance)
+            if raises:
+                raise RuntimeError("LAN blew up")
+            return reply
+        mod.smart_home_control = smart_home_control
+        return mod
+
+    def test_empty_catalog_falls_through_to_lan(self):
+        # Catalog file exists but has zero devices → the LAN reply wins, and
+        # the EXACT utterance is forwarded (sh_kasa does its own parsing).
+        self._write_catalog({"device_count": 0, "devices": []})
+        record: list = []
+        fake = self._fake_kasa(record=record)
+        with _inject_modules(skill_sh_kasa=fake):
+            out = router.smart_home_control("turn on the entry light")
+        self.assertEqual(out, "Done, sir — entry light on.")
+        self.assertEqual(record, ["turn on the entry light"])
+        self.assertNotIn("No smart-home catalog", out)
+
+    def test_missing_catalog_file_falls_through_to_lan(self):
+        # No catalog file on disk at all → same fall-through fires.
+        self.assertFalse(os.path.exists(self.catalog_path))
+        with _inject_modules(skill_sh_kasa=self._fake_kasa()):
+            out = router.smart_home_control("turn on the entry light")
+        self.assertEqual(out, "Done, sir — entry light on.")
+
+    def test_lan_handler_raises_degrades_to_wizard_message(self):
+        # The fallback must never surface a traceback — the wizard hint wins.
+        self._write_catalog({"device_count": 0, "devices": []})
+        with _inject_modules(skill_sh_kasa=self._fake_kasa(raises=True)):
+            out = router.smart_home_control("turn on the entry light")
+        self.assertIn("No smart-home catalog", out)
+
+    def test_lan_miss_reply_degrades_to_wizard_message(self):
+        # sh_kasa reporting "nothing on the LAN either" → wizard hint wins.
+        self._write_catalog({"device_count": 0, "devices": []})
+        fake = self._fake_kasa(reply=self._KASA_MISS)
+        with _inject_modules(skill_sh_kasa=fake):
+            out = router.smart_home_control("turn on the entry light")
+        self.assertIn("No smart-home catalog", out)
+
+    def test_sh_kasa_unavailable_degrades_to_wizard_message(self):
+        # No sh_kasa module loaded under ANY loader name and the import fails
+        # → graceful degradation to the original wizard message.
+        self._write_catalog({"device_count": 0, "devices": []})
+        with _inject_modules(skill_sh_kasa=None, sh_kasa=None,
+                             **{"skills.sh_kasa": None}), \
+             mock.patch.object(router, "_import_skill", return_value=None):
+            out = router.smart_home_control("turn on the entry light")
+        self.assertIn("No smart-home catalog", out)
+
+    def test_catalog_no_match_falls_through_to_lan(self):
+        # Populated catalog whose descriptor matches nothing, but the device
+        # IS on the LAN → LAN reply instead of "don't see anything".
+        self._write_catalog(_catalog())
+        record: list = []
+        fake = self._fake_kasa(reply="Done, sir — garage plug off.",
+                               record=record)
+        with _inject_modules(skill_sh_kasa=fake):
+            out = router.smart_home_control("turn off the garage plug")
+        self.assertEqual(out, "Done, sir — garage plug off.")
+        self.assertEqual(record, ["turn off the garage plug"])
+        self.assertNotIn("don't see anything", out)
+
+    def test_catalog_match_never_consults_lan_fallback(self):
+        # Guard against the setdefault-style overreach: with a populated
+        # catalog and a matching device, the multi-brand router must dispatch
+        # itself — the narrow Kasa/Tuya handler is a fallback, not a shadow.
+        self._write_catalog(_catalog())
+        fb = mock.Mock(return_value="MUST NOT BE SPOKEN")
+        with mock.patch.object(router, "_live_lan_fallback", fb), \
+             mock.patch.object(router, "_dispatch_one",
+                               return_value={"ok": True,
+                                             "device": "Office Lamp"}):
+            out = router.smart_home_control("turn off the office lamp")
+        fb.assert_not_called()
+        self.assertIn("Off, sir", out)
+
+    def test_registration_order_invariant_lan_stays_reachable(self):
+        # THE stale-duplicate/shadowing regression (audit 2026-07-21):
+        # reproduce the monolith's sorted load order — sh_kasa registers
+        # first, the router registers LAST and wins every shared key — then
+        # prove the winning callable still reaches a LAN plug with an EMPTY
+        # catalog. A future re-shuffle of skill load order cannot silently
+        # strand the plugs again: whichever callable wins the key race must
+        # control the LAN.
+        import skills.sh_kasa as sh_kasa
+        actions: dict = {}
+        sh_kasa.register(actions)
+        with mock.patch.object(router, "warm_up", return_value=None):
+            router.register(actions)   # sorted order: router registers last
+        # Today's winner is the catalog-driven router (plain assignment).
+        self.assertIs(actions["smart_home_control"], router.smart_home_control)
+        self.assertIs(actions["control_device"], router.smart_home_control)
+        # Empty catalog + a plug on the LAN (faked at the loaded-module seam).
+        self._write_catalog({"device_count": 0, "devices": []})
+        fake = self._fake_kasa(reply="Done, sir — entry light on.")
+        with _inject_modules(skill_sh_kasa=fake):
+            out = actions["smart_home_control"]("turn on the entry light")
+        self.assertEqual(out, "Done, sir — entry light on.")
+        self.assertNotIn("No smart-home catalog", out)
+
+    def test_miss_prefix_constant_matches_sh_kasa_reply(self):
+        # The router's _LAN_NO_DEVICE_PREFIX is a copy of sh_kasa's miss line
+        # — the codebase's #1 bug class is exactly this kind of duplicated
+        # rule rotting apart. Pin the two together: sh_kasa's real no-device
+        # reply must start with the router's constant.
+        import skills.sh_kasa as sh_kasa
+        with mock.patch.object(sh_kasa, "list_devices", return_value=[]), \
+             mock.patch.object(sh_kasa, "_tuya_mod", return_value=None):
+            reply = sh_kasa.smart_home_control("turn on the entry light")
+        self.assertTrue(
+            reply.startswith(router._LAN_NO_DEVICE_PREFIX),
+            f"sh_kasa's miss line {reply!r} no longer starts with the "
+            f"router's _LAN_NO_DEVICE_PREFIX "
+            f"{router._LAN_NO_DEVICE_PREFIX!r} — the fallback would treat a "
+            f"LAN miss as a real reply and suppress the discovery wizard "
+            f"hint. Update the constant in core/smart_home_router.py.")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1319,6 +1470,23 @@ class ExtractorEdgeTests(_RouterTestBase):
         # 'could you please ' + 'the ' all peel off.
         self.assertEqual(router._strip_filler("Could you please the office"),
                          "office")
+
+    def test_strip_filler_comma_wake_variants(self):
+        # 2026-07-21 audit (stale-duplicates): every copy of the lead-filler
+        # rule must strip Whisper's comma wake form — "JARVIS, turn off the
+        # office light" — or device-name matching sees "jarvis," and misses.
+        self.assertEqual(router._strip_filler("JARVIS, the office"), "office")
+        self.assertEqual(
+            router._strip_filler("hey jarvis, please the office"), "office")
+
+    def test_every_wake_prefix_has_comma_sibling(self):
+        # Source-of-truth invariant so the comma-variant rule can't silently
+        # regress in this module's copy of the filler table.
+        wake = [f for f in router._FILLER_PREFIXES if f.endswith("jarvis ")]
+        self.assertTrue(wake, "expected wake-word fillers in _FILLER_PREFIXES")
+        for f in wake:
+            self.assertIn(f[:-1] + ", ", router._FILLER_PREFIXES,
+                          f"missing comma variant for {f!r}")
 
     def test_parse_number_strips_units_and_handles_empty(self):
         self.assertEqual(router._parse_number("65°"), 65)

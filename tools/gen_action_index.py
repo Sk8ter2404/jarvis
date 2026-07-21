@@ -2,13 +2,24 @@
 """Machine-verified action index generator for JARVIS.
 
 Parses the monolith ACTIONS dict + INFORMATIVE_ACTIONS / SPEAK_RESULT_VERBATIM_ACTIONS
-sets, plus every ``actions["…"] =`` registration across skills/ and core/, and
-writes docs/ACTION_INDEX.md. Never imports the monolith (textual parse only), so
+sets, plus every action registration across skills/ and core/, and writes
+docs/ACTION_INDEX.md. Never imports the monolith (ast.parse only — textual), so
 it is safe to run against a live tree. Run: ``python tools/gen_action_index.py``.
-"""
-import os, re, glob, collections
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+Registration discovery lives in tools/registration_scan.py — the ONE shared
+home for that rule (audit 2026-07-21: the two regexes that used to live here
+missed every lambda-valued monolith entry and every dict-plus-loop / tuple-
+alias-loop skill registration, so ~39 live actions — the whole browser agent
+included — were absent from the web panel's Actions inventory).
+"""
+import os, re, sys, glob, collections
+
+_TOOLS = os.path.dirname(os.path.abspath(__file__))
+if _TOOLS not in sys.path:
+    sys.path.insert(0, _TOOLS)
+import registration_scan
+
+ROOT = os.path.dirname(_TOOLS)
 MONO = os.path.join(ROOT, "bobert_companion.py")
 
 
@@ -18,41 +29,13 @@ def read(p):
 
 
 mono = read(MONO)
-mono_lines = mono.splitlines()
 
 # ---- 1. Monolith ACTIONS dict: name -> handler symbol ----
-actions = {}
-
-
-def scan_region(start_ln, end_ln):
-    for ln in range(start_ln, min(end_ln, len(mono_lines))):
-        line = mono_lines[ln]
-        for m in re.finditer(r'"([a-zA-Z_][a-zA-Z0-9_]*)"\s*:\s*([A-Za-z_][A-Za-z0-9_\.]*)\s*,', line):
-            actions[m.group(1)] = m.group(2)
-        am = re.match(r'\s*ACTIONS\[\s*"([a-zA-Z_0-9]+)"\s*\]\s*=\s*([A-Za-z_][A-Za-z0-9_\.]*)', line)
-        if am:
-            actions[am.group(1)] = am.group(2)
-
-
-def block_end(open_ln):
-    depth = 0
-    started = False
-    for ln in range(open_ln, len(mono_lines)):
-        depth += mono_lines[ln].count("{") - mono_lines[ln].count("}")
-        if "{" in mono_lines[ln]:
-            started = True
-        if started and depth <= 0:
-            return ln
-    return open_ln
-
-
-# locate "ACTIONS = {" and "ACTIONS.update({" blocks by content (line-drift safe)
-for idx, line in enumerate(mono_lines):
-    if re.match(r'\s*ACTIONS(\.update\(\{|\s*=\s*\{)', line):
-        scan_region(idx, block_end(idx) + 1)
-    am = re.match(r'\s*ACTIONS\[\s*"([a-zA-Z_0-9]+)"\s*\]\s*=\s*([A-Za-z_][A-Za-z0-9_\.]*)', line)
-    if am:
-        actions[am.group(1)] = am.group(2)
+# Shared AST scanner: catches the dict literal, every ACTIONS.update({...})
+# block, ACTIONS["x"] = assigns (top-level or inside functions), and resolves
+# lambda-wrapped handlers to their callee (ambient_mode_on → _act_ambient_mode_set).
+actions = {name: reg.symbol for name, reg in registration_scan.scan_registrations(
+    mono, filename="bobert_companion.py", targets=("ACTIONS",)).items()}
 
 
 def extract_set(name):
@@ -73,32 +56,19 @@ _SKILL_SOURCES = (
     + glob.glob(os.path.join(ROOT, "core", "*.py"))
 )
 skill_actions = {}
-_alias_pairs = []   # (alias, target) from `actions["a"] = actions["b"]` lines
 for p in _SKILL_SOURCES:
     base = os.path.relpath(p, ROOT).replace("\\", "/")
-    text = read(p)
-    for m in re.finditer(r'actions\[\s*[\'"]([a-zA-Z_0-9]+)[\'"]\s*\]\s*=\s*([A-Za-z_][A-Za-z0-9_\.]*)', text):
-        skill_actions[m.group(1)] = (base, m.group(2))
-    # ALIAS FORM (2026-07-14 audit, #45): `actions["x"] = actions["y"]`. The
-    # capture above stops its RHS at the `[`, so it records the bare symbol
-    # "actions" — a non-existent handler that renders as `?`. Collect the real
-    # (alias -> target) pairs so we can resolve them to the target's factory.
-    for m in re.finditer(
-            r'actions\[\s*[\'"]([a-zA-Z_0-9]+)[\'"]\s*\]\s*=\s*'
-            r'actions\[\s*[\'"]([a-zA-Z_0-9]+)[\'"]\s*\]', text):
-        _alias_pairs.append((m.group(1), m.group(2)))
-
-# Resolve aliases to a fixed point so chained aliases (a=b, b=c) land on the
-# real factory symbol. An alias whose target is itself unknown is left as-is.
-for _ in range(len(_alias_pairs) + 1):
-    changed = False
-    for alias, target in _alias_pairs:
-        tgt = skill_actions.get(target)
-        if tgt is not None and skill_actions.get(alias) != tgt:
-            skill_actions[alias] = tgt
-            changed = True
-    if not changed:
-        break
+    # Shared AST scanner: direct subscript assigns, dict-plus-loop /
+    # actions.update(handlers) (browser_agent's 12 actions), tuple-alias loops
+    # (kinect_air_mouse's mouse_control_on family), and the #45 alias form
+    # `actions["a"] = actions["b"]` (resolved to the target's factory symbol
+    # via a fixed point inside the scanner, so chained aliases land right).
+    try:
+        regs = registration_scan.scan_file(p, filename=base)
+    except SyntaxError:
+        continue   # unparseable file — nothing registerable to index
+    for name, reg in regs.items():
+        skill_actions[name] = (base, reg.symbol)
 
 # ---- 3. handler def locations ----
 def_index = {}
@@ -114,6 +84,11 @@ for p in ([MONO]
 
 
 def handler_loc(sym):
+    # Inline lambda / expression handlers carry their own site as location
+    # (registration_scan emits `lambda@<file>:<line>` when the lambda body
+    # isn't a plain call it can resolve to a def).
+    if sym.startswith(("lambda@", "expr@")):
+        return sym.split("@", 1)[1]
     return def_index.get(sym.split(".")[-1], "?")
 
 

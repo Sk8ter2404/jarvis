@@ -16,6 +16,8 @@ no brand-skill imports, no network.
 """
 from __future__ import annotations
 
+import sys
+import types
 import unittest
 from unittest import mock
 
@@ -280,12 +282,20 @@ class RouterControlEndToEndTests(unittest.TestCase):
         self.assertIn("68", out)
 
     def test_no_catalog_message(self):
-        with mock.patch.object(router, "_ensure_catalog", return_value=None):
+        # The live-LAN fallback is stubbed to "nothing on the LAN either" so
+        # this deterministically asserts the terminal wizard refusal (the
+        # unstubbed fallback would attempt real sh_kasa LAN discovery).
+        with mock.patch.object(router, "_ensure_catalog", return_value=None), \
+             mock.patch.object(router, "_live_lan_fallback",
+                               return_value=None):
             out = router.smart_home_control("turn off the office light")
         self.assertIn("No smart-home catalog", out)
 
     def test_descriptor_with_no_device_match(self):
-        out = router.smart_home_control("turn off the garage door")
+        # Fallback stubbed to a LAN miss (see test_no_catalog_message).
+        with mock.patch.object(router, "_live_lan_fallback",
+                               return_value=None):
+            out = router.smart_home_control("turn off the garage door")
         self.assertIn("don't see anything", out.lower())
 
     def test_failure_summary_surfaces_device_error(self):
@@ -295,6 +305,80 @@ class RouterControlEndToEndTests(unittest.TestCase):
             out = router.smart_home_control("turn off the office light")
         self.assertIn("didn't work", out.lower())
         self.assertIn("bridge not connected", out)
+
+
+# ── 2g. live-LAN fallback + the load-order clobber regression ────────
+class RouterLiveLanFallbackTests(unittest.TestCase):
+    """2026-07-21 audit: sh_kasa's catalog-free LAN handler registers under the
+    same action names as the router, loses the key race (sorted skill order:
+    'sh_kasa' < 'smart_home_router_skill'), and the router then dead-ended on
+    the empty Alexa-seeded catalog — every LAN plug answered 'No smart-home
+    catalog yet'. The router must fall through to the live-LAN path before
+    refusing."""
+
+    def _fake_kasa(self, reply="Done, sir — entry light on.", record=None):
+        mod = types.ModuleType("skill_sh_kasa")
+
+        def smart_home_control(utterance=""):
+            if record is not None:
+                record.append(utterance)
+            return reply
+        mod.smart_home_control = smart_home_control
+        return mod
+
+    def test_no_catalog_falls_through_to_live_lan(self):
+        record: list = []
+        fake = self._fake_kasa(record=record)
+        with mock.patch.object(router, "_ensure_catalog", return_value=None), \
+             mock.patch.dict(sys.modules, {"skill_sh_kasa": fake}):
+            out = router.smart_home_control("turn on the entry light")
+        self.assertEqual(out, "Done, sir — entry light on.")
+        self.assertEqual(record, ["turn on the entry light"])
+
+    def test_no_catalog_wizard_message_when_lan_also_misses(self):
+        # sh_kasa's own no-device refusal → the wizard hint still speaks.
+        fake = self._fake_kasa(
+            reply="I don't see any controllable smart devices on the "
+                  "network yet, sir.")
+        with mock.patch.object(router, "_ensure_catalog", return_value=None), \
+             mock.patch.dict(sys.modules, {"skill_sh_kasa": fake}):
+            out = router.smart_home_control("turn on the entry light")
+        self.assertIn("No smart-home catalog", out)
+
+    def test_populated_catalog_no_match_falls_through_to_lan(self):
+        # On the LAN but not in the catalog → still reachable.
+        fake = self._fake_kasa(reply="Done, sir — garage plug off.")
+        with mock.patch.object(router, "_ensure_catalog",
+                               return_value=_CATALOG), \
+             mock.patch.dict(sys.modules, {"skill_sh_kasa": fake}):
+            out = router.smart_home_control("turn off the garage plug")
+        self.assertEqual(out, "Done, sir — garage plug off.")
+
+    def test_load_order_clobber_lan_stays_reachable(self):
+        # Reproduce the monolith loader's exact sequence for this
+        # stale-duplicate bug class: sh_kasa registers its LAN handler first,
+        # smart_home_router_skill (sorted later) re-registers the same names
+        # and wins. With an EMPTY catalog and one plug on the LAN, the
+        # surviving callables must still reach the plug — whatever wins the
+        # key race in a future re-shuffle, LAN plugs can never be stranded
+        # behind the 'No smart-home catalog' refusal again.
+        actions: dict = {}
+        kasa_mod, _ = load_skill_isolated("sh_kasa", actions=actions)
+        with mock.patch.object(router, "warm_up", return_value=None):
+            load_skill_isolated("smart_home_router_skill", actions=actions)
+        devs = [{"name": "Entry Light", "lan_ip": "10.0.0.5"}]
+        set_state = mock.Mock(return_value={"ok": True})
+        with mock.patch.object(router, "_ensure_catalog", return_value=None), \
+             mock.patch.object(kasa_mod, "list_devices", return_value=devs), \
+             mock.patch.object(kasa_mod, "_tuya_mod", return_value=None), \
+             mock.patch.object(kasa_mod, "set_state", set_state):
+            out_ctl = actions["smart_home_control"]("turn on entry light")
+            out_dev = actions["control_device"]("turn off entry light")
+        self.assertNotIn("No smart-home catalog", out_ctl)
+        self.assertNotIn("No smart-home catalog", out_dev)
+        self.assertIn("entry light on", out_ctl.lower())
+        self.assertIn("entry light off", out_dev.lower())
+        self.assertEqual(set_state.call_count, 2)
 
 
 # ── 2f. brand → controller resolution ────────────────────────────────

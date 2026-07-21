@@ -495,11 +495,17 @@ class HueGetBridgeTests(_HueBase):
              mock.patch.object(self.mod, "_threaded_connect",
                                return_value={"bridge": None, "error": None,
                                              "timed_out": True}), \
+             mock.patch.object(self.mod, "_autodiscover_bridge_ip") as disco, \
+             mock.patch.object(self.mod, "_write_config") as writer, \
              mock.patch.object(self.mod, "_schedule_retry", sched):
             self.assertIsNone(self.mod._get_bridge())
         self.assertTrue(self.mod._awaiting_button())
         self.assertEqual(self.mod._pending["last_error"], "connect timed out")
         sched.assert_called_once()
+        # Timeout means "press the button" — the stored IP is likely good, so
+        # the self-heal path must NOT rediscover or touch the config.
+        disco.assert_not_called()
+        writer.assert_not_called()
 
     def test_get_bridge_registration_error_sets_awaiting(self):
         self._use_phue(make_fake_phue())
@@ -511,10 +517,16 @@ class HueGetBridgeTests(_HueBase):
              mock.patch.object(self.mod, "_threaded_connect",
                                return_value={"bridge": None, "error": err,
                                              "timed_out": False}), \
+             mock.patch.object(self.mod, "_autodiscover_bridge_ip") as disco, \
+             mock.patch.object(self.mod, "_write_config") as writer, \
              mock.patch.object(self.mod, "_schedule_retry", sched):
             self.assertIsNone(self.mod._get_bridge())
         self.assertTrue(self.mod._awaiting_button())
         sched.assert_called_once()
+        # Registration error = bridge reached, button not pressed — the stored
+        # IP is correct, so no rediscovery and no config write.
+        disco.assert_not_called()
+        writer.assert_not_called()
 
     def test_get_bridge_generic_error_no_awaiting(self):
         self._use_phue(make_fake_phue())
@@ -526,11 +538,87 @@ class HueGetBridgeTests(_HueBase):
                                return_value={"bridge": None,
                                              "error": RuntimeError("conn refused"),
                                              "timed_out": False}), \
+             mock.patch.object(self.mod, "_autodiscover_bridge_ip",
+                               return_value=None), \
+             mock.patch.object(self.mod, "_write_config") as writer, \
              mock.patch.object(self.mod, "_schedule_retry") as sched:
             self.assertIsNone(self.mod._get_bridge())
         self.assertFalse(self.mod._awaiting_button())
         self.assertIn("conn refused", self.mod._pending["last_error"])
         sched.assert_not_called()
+        # Transient-outage safety: the stored IP is syntactically valid and
+        # discovery found nothing better — the config must survive untouched.
+        writer.assert_not_called()
+
+    def test_get_bridge_self_heals_poisoned_config_via_discovery(self):
+        # The stored bridge_ip is the audit's literal poison "test": the first
+        # connect fails generically, discovery answers with the real bridge →
+        # the config is repaired in place and the connect retried once.
+        bridge = _FakeBridge({})
+        self._use_phue(make_fake_phue())
+        self.mod._bridge_cache["bridge"] = None
+        wrote = {}
+
+        def _connect(phue_mod, ip, timeout=None):
+            if ip == "test":
+                return {"bridge": None, "error": RuntimeError("conn refused"),
+                        "timed_out": False}
+            return {"bridge": bridge, "error": None, "timed_out": False}
+
+        with mock.patch.object(self.mod, "_read_config",
+                               return_value={"bridge_ip": "test"}), \
+             mock.patch.object(self.mod, "_autodiscover_bridge_ip",
+                               return_value="192.168.1.55"), \
+             mock.patch.object(self.mod, "_write_config",
+                               side_effect=lambda cfg: wrote.update(cfg)), \
+             mock.patch.object(self.mod, "_threaded_connect",
+                               side_effect=_connect):
+            out = self.mod._get_bridge()
+        self.assertIs(out, bridge)
+        self.assertEqual(wrote.get("bridge_ip"), "192.168.1.55")
+        self.assertIs(self.mod._bridge_cache["bridge"], bridge)
+        self.assertIsNone(self.mod._pending["last_error"])
+
+    def test_get_bridge_persists_discovered_ip_even_if_retry_fails(self):
+        # Discovery found a different bridge but it isn't connecting yet —
+        # the discovered address still replaces the failing stored one.
+        self._use_phue(make_fake_phue())
+        self.mod._bridge_cache["bridge"] = None
+        wrote = {}
+        with mock.patch.object(self.mod, "_read_config",
+                               return_value={"bridge_ip": "test"}), \
+             mock.patch.object(self.mod, "_autodiscover_bridge_ip",
+                               return_value="192.168.1.55"), \
+             mock.patch.object(self.mod, "_write_config",
+                               side_effect=lambda cfg: wrote.update(cfg)), \
+             mock.patch.object(self.mod, "_threaded_connect",
+                               return_value={"bridge": None,
+                                             "error": RuntimeError("conn refused"),
+                                             "timed_out": False}):
+            self.assertIsNone(self.mod._get_bridge())
+        self.assertEqual(wrote.get("bridge_ip"), "192.168.1.55")
+        self.assertIn("not connecting yet", self.mod._pending["last_error"])
+
+    def test_get_bridge_drops_garbage_ip_when_discovery_fails(self):
+        # No discovery answer AND the stored value is syntactic garbage →
+        # the key is dropped so the next call rediscovers from scratch.
+        self._use_phue(make_fake_phue())
+        self.mod._bridge_cache["bridge"] = None
+        writes = []
+        with mock.patch.object(self.mod, "_read_config",
+                               return_value={"bridge_ip": "test"}), \
+             mock.patch.object(self.mod, "_autodiscover_bridge_ip",
+                               return_value=None), \
+             mock.patch.object(self.mod, "_write_config",
+                               side_effect=lambda cfg: writes.append(dict(cfg))), \
+             mock.patch.object(self.mod.socket, "getaddrinfo",
+                               side_effect=OSError("no resolution")), \
+             mock.patch.object(self.mod, "_threaded_connect",
+                               return_value={"bridge": None,
+                                             "error": RuntimeError("conn refused"),
+                                             "timed_out": False}):
+            self.assertIsNone(self.mod._get_bridge())
+        self.assertEqual(writes, [{}])
 
     def test_get_bridge_success_caches_and_clears_pending(self):
         bridge = _FakeBridge({})
@@ -817,6 +905,86 @@ class HueSetBridgeIpTests(_HueBase):
         self.assertEqual(wrote.get("bridge_ip"), "192.168.1.77")
         # Cache invalidated so the next call reconnects.
         self.assertIsNone(self.mod._bridge_cache["bridge"])
+
+    def test_set_bridge_ip_rejects_garbage_without_persisting(self):
+        # "test" (the audit's live poison), an out-of-range quad and a
+        # truncated quad must all be rejected BEFORE any config write. DNS is
+        # stubbed to fail so a wildcard-resolving LAN can't skew the result.
+        saved_cache = dict(self.mod._bridge_cache)
+        with mock.patch.object(self.mod, "_write_config") as writer, \
+             mock.patch.object(self.mod.socket, "getaddrinfo",
+                               side_effect=OSError("no resolution")):
+            for bad in ("test", "999.999.1.1", "192.168.1"):
+                out = self.actions["hue_set_bridge_ip"](bad)
+                self.assertIn("not saved", out)
+                self.assertIn(bad, out)
+        writer.assert_not_called()
+        self.assertEqual(self.mod._bridge_cache, saved_cache)
+
+    def test_set_bridge_ip_resolvable_hostname_persists(self):
+        wrote = {}
+        with mock.patch.object(self.mod, "_read_config", return_value={}), \
+             mock.patch.object(self.mod, "_write_config",
+                               side_effect=lambda cfg: wrote.update(cfg)), \
+             mock.patch.object(self.mod.socket, "getaddrinfo",
+                               return_value=[("stub",)]):
+            out = self.actions["hue_set_bridge_ip"]("hue-bridge.lan")
+        self.assertIn("hue-bridge.lan", out)
+        self.assertEqual(wrote.get("bridge_ip"), "hue-bridge.lan")
+
+    def test_set_bridge_ip_unresolvable_hostname_rejected(self):
+        with mock.patch.object(self.mod, "_write_config") as writer, \
+             mock.patch.object(self.mod.socket, "getaddrinfo",
+                               side_effect=OSError("NXDOMAIN")):
+            out = self.actions["hue_set_bridge_ip"]("hue-bridge.lan")
+        self.assertIn("not saved", out)
+        writer.assert_not_called()
+
+
+class HueBridgeHostValidatorTests(_HueBase):
+    def test_literal_ip_accepted_without_dns(self):
+        # A dotted-quad short-circuits via ipaddress — DNS must not be hit.
+        with mock.patch.object(self.mod.socket, "getaddrinfo",
+                               side_effect=OSError("DNS must not be hit")):
+            self.assertTrue(self.mod._valid_bridge_host("192.168.1.10"))
+            self.assertTrue(self.mod._valid_bridge_host("::1"))
+
+    def test_garbage_rejected_when_unresolvable(self):
+        with mock.patch.object(self.mod.socket, "getaddrinfo",
+                               side_effect=OSError("no resolution")):
+            for bad in ("test", "999.999.1.1", "192.168.1"):
+                self.assertFalse(self.mod._valid_bridge_host(bad))
+
+    def test_resolvable_hostname_accepted(self):
+        with mock.patch.object(self.mod.socket, "getaddrinfo",
+                               return_value=[("ok",)]):
+            self.assertTrue(self.mod._valid_bridge_host("hue-bridge.lan"))
+
+
+class ActionSmokeDenylistTests(unittest.TestCase):
+    """Source-scan invariant: the action sweep must never invoke
+    hue_set_bridge_ip — it would persist the benign sweep arg ("test") as the
+    bridge IP and report a false OK. tools/action_smoke.py mutates os.environ
+    at import time, so we scan its SOURCE via ast instead of importing it."""
+
+    def test_hue_set_bridge_ip_in_action_smoke_denylist(self):
+        import ast
+        import os
+        root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))
+        path = os.path.join(root, "tools", "action_smoke.py")
+        with open(path, "r", encoding="utf-8") as f:
+            tree = ast.parse(f.read(), filename=path)
+        names = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if (isinstance(target, ast.Name)
+                            and target.id == "_DENYLIST_NAMES"):
+                        names = ast.literal_eval(node.value)
+        self.assertIsNotNone(
+            names, "_DENYLIST_NAMES literal not found in tools/action_smoke.py")
+        self.assertIn("hue_set_bridge_ip", names)
 
 
 if __name__ == "__main__":

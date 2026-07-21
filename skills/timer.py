@@ -419,10 +419,10 @@ def register(actions):
         with _lock:
             entry = _timers.pop(tid, None)
         if entry is None:
-            return f"no timer #{tid}"
+            return f"no timer #{tid}, sir."
         timer, msg, _ = entry
         timer.cancel()
-        return f"cancelled timer #{tid} ('{msg}')"
+        return f"cancelled timer #{tid} ('{msg}'), sir."
 
     def cancel_timer(args: str = "") -> str:
         """Cancel a timer from whatever the LLM emitted.
@@ -443,7 +443,7 @@ def register(actions):
                 _timers.clear()
             if not count:
                 return "there are no timers running, sir."
-            return f"cancelled {count} timer(s)"
+            return f"cancelled {count} timer(s), sir."
 
         # Explicit id ("cancel timer 3").
         m = re.search(r"\d+", args)

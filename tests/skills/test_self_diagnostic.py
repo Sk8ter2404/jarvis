@@ -820,6 +820,80 @@ class WebcamProbeTests(_ProbeTestBase):
         self.assertTrue(r["ok"])
         self.assertEqual(r["details"]["cascade"], "loaded")
 
+    # ── 2026-07-21 audit: every open/release must hold _camera_io_lock ──
+    def test_probe_holds_camera_lock_for_every_open_and_release(self):
+        import threading as _thr
+        lock = _thr.Lock()
+        events: list = []
+        cv2 = make_cv2(frames=[(True, _FakeFrame([200] * 4)),
+                               (True, _FakeFrame([200] * 4))])
+        orig_vc = cv2.VideoCapture
+
+        def _vc(idx, *a, **k):
+            events.append(("open", idx, lock.locked()))
+            cap = orig_vc(idx, *a, **k)
+            orig_release = cap.release
+
+            def _rel():
+                events.append(("release", idx, lock.locked()))
+                orig_release()
+
+            cap.release = _rel
+            return cap
+
+        cv2.VideoCapture = _vc
+        bc = types.SimpleNamespace(_camera_io_lock=lock)
+        with inject_modules(cv2=cv2), \
+             mock.patch.object(self.mod, "_bc", return_value=bc):
+            r = self.mod._probe_webcam()
+        self.assertTrue(r["ok"])
+        self.assertTrue(events)
+        for op, idx, held in events:
+            self.assertTrue(held, f"cv2 {op} on index {idx} ran without "
+                                  f"_camera_io_lock held")
+        self.assertFalse(lock.locked())   # released afterward
+
+    def test_probe_skips_when_camera_lock_contended(self):
+        # Lock contended -> benign skip, and the probe must NEVER construct
+        # a capture (mirrors _attempt_camera_wake's contention verdict).
+        lock = mock.MagicMock()
+        lock.acquire.return_value = False
+        cv2 = types.ModuleType("cv2")
+        cv2.VideoCapture = mock.MagicMock(
+            side_effect=AssertionError(
+                "VideoCapture called while camera lock contended"))
+        bc = types.SimpleNamespace(_camera_io_lock=lock)
+        with inject_modules(cv2=cv2), \
+             mock.patch.object(self.mod, "_bc", return_value=bc):
+            r = self.mod._probe_webcam()
+        self.assertTrue(r["ok"])          # busy camera is not a failure
+        self.assertIn("skipped", r["details"])
+        self.assertIn("camera busy", r["details"]["skipped"])
+        cv2.VideoCapture.assert_not_called()
+        lock.release.assert_not_called()
+        lock.acquire.assert_called_once_with(timeout=2.5)
+
+    def test_wake_path_releases_lock_before_delegating(self):
+        # Real RLock + the REAL _attempt_camera_wake: read() returns no
+        # frame so the probe delegates to the wake helper, whose WORKER
+        # thread takes the same lock. If the probe still held it across the
+        # delegation, RLock reentrancy (per-thread) would make every wake
+        # falsely time out with "lock held by tracker" (fixed 2026-07-21).
+        import threading as _thr
+        lock = _thr.RLock()
+        cv2 = make_cv2(frames=[(True, _FakeFrame([200] * 4)), (False, None)])
+        bc = types.SimpleNamespace(_camera_io_lock=lock)
+        with inject_modules(cv2=cv2), \
+             mock.patch.object(self.mod, "_bc", return_value=bc), \
+             mock.patch.object(self.mod, "_windows_camera_pnp_devices",
+                               return_value=None), \
+             mock.patch.object(self.mod, "_camera_lock_suspects",
+                               return_value=[]):
+            r = self.mod._probe_webcam()
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["details"]["wake_attempted"])
+        self.assertNotIn("lock held by tracker", r["details"]["wake_note"])
+
 
 # ─── webcam helper functions ─────────────────────────────────────────────
 class CameraHelperTests(_ProbeTestBase):
@@ -1016,6 +1090,110 @@ class MicrophoneProbeTests(_ProbeTestBase):
             r = self.mod._probe_microphone()
         self.assertTrue(r["ok"])
         self.assertIn("hard-disabled", r["details"]["live_capture_skipped"])
+
+    # ── 2026-07-21 audit: the live capture must gate on the REAL mic-
+    # ownership flags, not just the _sleep_mode conversation latch — in
+    # sleep/standby the main loop runs record_speech(timeout=20)
+    # continuously, so the old awake-only skip ran sd.rec() exactly when
+    # the main loop owned the device. ──────────────────────────────────
+    @staticmethod
+    def _owned_bc(**overrides):
+        base = dict(_sleep_mode=[True],
+                    _mic_input_disabled=lambda: False,
+                    get_input_device=lambda: 0,
+                    _record_speech_active=[False],
+                    _pathb_mic_active=[False],
+                    _ambient_stream_active=[0],
+                    _tts_playback_active=[False])
+        base.update(overrides)
+        return types.SimpleNamespace(**base)
+
+    def _assert_owned_skip(self, bc):
+        sd = make_sounddevice([{"name": "Mic", "max_input_channels": 2}])
+        sd.rec = mock.MagicMock(
+            side_effect=AssertionError("sd.rec called while the mic is owned"))
+        with inject_modules(sounddevice=sd), \
+             mock.patch.object(self.mod, "_bc", return_value=bc):
+            r = self.mod._probe_microphone()
+        self.assertTrue(r["ok"])
+        self.assertIn("live_capture_skipped", r["details"])
+        self.assertEqual(sd.rec.call_count, 0)
+
+    def test_skips_live_capture_when_record_speech_active(self):
+        # THE regression from the audit card: standby (_sleep_mode True)
+        # with record_speech holding the device must NOT open sd.rec().
+        self._assert_owned_skip(self._owned_bc(_record_speech_active=[True]))
+
+    def test_skips_live_capture_when_pathb_mic_active(self):
+        self._assert_owned_skip(self._owned_bc(_pathb_mic_active=[True]))
+
+    def test_skips_live_capture_when_ambient_stream_counter_nonzero(self):
+        # _ambient_stream_active is a refcount, not a boolean.
+        self._assert_owned_skip(self._owned_bc(_ambient_stream_active=[2]))
+
+    def test_skips_live_capture_when_tts_playback_active(self):
+        self._assert_owned_skip(self._owned_bc(_tts_playback_active=[True]))
+
+    def test_standby_with_no_owner_still_captures(self):
+        # Asleep with ALL ownership flags falsy: nobody owns the mic, so
+        # the probe must still measure RMS (the skip must not overtrigger).
+        sd = make_sounddevice([{"name": "Mic", "max_input_channels": 2}],
+                              rec_rms=0.5)
+        rec_calls = []
+        orig_rec = sd.rec
+
+        def _rec(n, **k):
+            rec_calls.append(k)
+            return orig_rec(n, **k)
+
+        sd.rec = _rec
+        with inject_modules(sounddevice=sd, numpy=_fake_np()), \
+             mock.patch.object(self.mod, "_bc",
+                               return_value=self._owned_bc()):
+            r = self.mod._probe_microphone()
+        self.assertTrue(r["ok"])
+        self.assertNotIn("live_capture_skipped", r["details"])
+        self.assertEqual(len(rec_calls), 1)   # active-device capture ran
+
+    def test_standby_flags_absent_still_captures(self):
+        # A bc lacking the ownership attributes entirely (early boot,
+        # legacy test doubles) must degrade to "not owned" and still probe.
+        sd = make_sounddevice([{"name": "Mic", "max_input_channels": 2}],
+                              rec_rms=0.5)
+        bc = types.SimpleNamespace(_sleep_mode=[True],
+                                   _mic_input_disabled=lambda: False,
+                                   get_input_device=lambda: 0)
+        with inject_modules(sounddevice=sd, numpy=_fake_np()), \
+             mock.patch.object(self.mod, "_bc", return_value=bc):
+            r = self.mod._probe_microphone()
+        self.assertTrue(r["ok"])
+        self.assertGreaterEqual(r["details"]["rms"], self.mod.MIC_RMS_FLOOR)
+
+    def test_owner_appearing_mid_scan_aborts_alternates(self):
+        # The ownership flags drop briefly between standby's record_speech
+        # calls; if an owner appears MID-probe the alternates scan must bail
+        # with a benign skip instead of opening more competing streams.
+        devices = [
+            {"name": "Active Mic", "max_input_channels": 2},   # idx 0
+            {"name": "Backup Mic", "max_input_channels": 2},   # idx 1
+        ]
+        sd = make_sounddevice(devices, default_input=0)
+        flag = [False]
+        rec_count = [0]
+
+        def _rec(n, device=None, **k):
+            rec_count[0] += 1
+            flag[0] = True        # record_speech grabs the mic mid-probe
+            return _FakeFrame([0.0, 0.0], shape=(2,))
+
+        sd.rec = _rec
+        bc = self._owned_bc(_record_speech_active=flag)
+        with inject_modules(sounddevice=sd, numpy=_fake_np()), \
+             mock.patch.object(self.mod, "_bc", return_value=bc):
+            r = self.mod._probe_microphone()
+        self.assertTrue(r["ok"])
+        self.assertIn("live_capture_skipped", r["details"])
+        self.assertEqual(rec_count[0], 1)  # only the active capture ran
 
     def test_numpy_missing_when_capturing(self):
         sd = make_sounddevice([{"name": "Mic", "max_input_channels": 2}])
@@ -1239,16 +1417,91 @@ class SttProbeTests(_ProbeTestBase):
         self.assertIn("model_loaded", r["details"])
 
     def test_uses_cached_model(self):
+        import threading as _thr
         cached = mock.MagicMock()
         type(cached).__name__ = "Whisper"
         cached.transcribe = mock.MagicMock(return_value={"text": "hi"})
+        # A real _stt_lock so the guarded (locked) path is exercised —
+        # 2026-07-21 audit: the cached-model branch must hold it.
         bc = types.SimpleNamespace(_stt=cached, _stt_model_name="base",
-                                   _stt_device="cuda")
+                                   _stt_device="cuda", _stt_lock=_thr.RLock())
         with mock.patch.object(self.mod, "_bc", return_value=bc), \
              inject_modules(numpy=_fake_np()):
             r = self.mod._probe_stt()
         self.assertTrue(r["ok"])
         self.assertIn("cached from main loop", r["details"]["model_loaded"])
+
+    # ── 2026-07-21 audit: the cached main-loop model is a shared
+    # CTranslate2 instance — the probe must hold bc._stt_lock across the
+    # ENTIRE transcribe (concurrent access is an uncatchable 0xc0000409). ──
+    def test_cached_model_probe_holds_stt_lock(self):
+        import threading as _thr
+        lock = _thr.RLock()
+        seen_held: list = []
+
+        def _other_thread_can_take_lock() -> bool:
+            box = {}
+
+            def _try():
+                got = lock.acquire(blocking=False)
+                box["got"] = got
+                if got:
+                    lock.release()
+
+            t = _thr.Thread(target=_try)
+            t.start()
+            t.join()
+            return box["got"]
+
+        cached = mock.MagicMock()
+        type(cached).__name__ = "Whisper"
+
+        def _transcribe(audio, language="en"):
+            # While the probe transcribes, a helper thread must NOT be able
+            # to take _stt_lock — proving the probe genuinely holds it.
+            seen_held.append(not _other_thread_can_take_lock())
+            return {"text": "hi"}
+
+        cached.transcribe = mock.MagicMock(side_effect=_transcribe)
+        bc = types.SimpleNamespace(_stt=cached, _stt_model_name="base",
+                                   _stt_device="cuda", _stt_lock=lock)
+        with mock.patch.object(self.mod, "_bc", return_value=bc), \
+             inject_modules(numpy=_fake_np()):
+            r = self.mod._probe_stt()
+        self.assertTrue(r["ok"])
+        self.assertEqual(seen_held, [True])
+        # ...and released afterwards: a helper thread can take it now.
+        self.assertTrue(_other_thread_can_take_lock())
+
+    def test_cached_model_lock_contended_skips_probe(self):
+        lock = mock.MagicMock()
+        lock.acquire.return_value = False
+        cached = mock.MagicMock()
+        type(cached).__name__ = "Whisper"
+        cached.transcribe = mock.MagicMock(return_value={"text": "hi"})
+        bc = types.SimpleNamespace(_stt=cached, _stt_model_name="base",
+                                   _stt_device="cuda", _stt_lock=lock)
+        with mock.patch.object(self.mod, "_bc", return_value=bc), \
+             inject_modules(numpy=_fake_np()):
+            r = self.mod._probe_stt()
+        self.assertTrue(r["ok"])          # benign skip, NOT a failure
+        self.assertIn("skipped", r["details"])
+        self.assertIn("_stt_lock", r["details"]["skipped"])
+        cached.transcribe.assert_not_called()
+        lock.release.assert_not_called()
+        lock.acquire.assert_called_once_with(timeout=5.0)
+
+    def test_probe_local_model_needs_no_lock(self):
+        # bc loaded but WITHOUT a cached model: the probe loads its own tiny
+        # model, private to the probe thread — the shared lock stays idle.
+        wmod, _ = self._whisper()
+        lock = mock.MagicMock()
+        bc = types.SimpleNamespace(_stt=None, _stt_lock=lock)
+        with mock.patch.object(self.mod, "_bc", return_value=bc), \
+             inject_modules(whisper=wmod, numpy=_fake_np()):
+            r = self.mod._probe_stt()
+        self.assertTrue(r["ok"])
+        lock.acquire.assert_not_called()
 
     def test_faster_whisper_model_path(self):
         wmod = types.ModuleType("whisper")
@@ -1801,12 +2054,80 @@ class SkillImportsProbeTests(_ProbeTestBase):
         self.assertIn("broken", r["error"])
 
     def test_cached_module_trusted(self):
+        # bc-UNAVAILABLE fallback only (probe run outside JARVIS, e.g.
+        # standalone pytest): with no loader success set to consult, a live
+        # sys.modules entry is still trusted and the on-disk source is not
+        # compiled. When _loaded_skill_names exists, the set is authoritative
+        # and sys.modules buys nothing — see
+        # test_sys_modules_entry_does_not_mask_unloaded_skill.
         self._write_skill("cached_skill.py", "def f(:\n")  # would fail to compile
-        # but it's already in sys.modules → trusted, skipped
         sys.modules["skill_cached_skill"] = types.ModuleType("skill_cached_skill")
         self.addCleanup(lambda: sys.modules.pop("skill_cached_skill", None))
+        self.assertIsNone(self.mod._bc())   # pin: this is the fallback path
         r = self.mod._probe_skill_imports()
         self.assertTrue(r["ok"])
+
+    def test_sys_modules_entry_does_not_mask_unloaded_skill(self):
+        # Regression (2026-07-21 audit): load_skills registers the module in
+        # sys.modules BEFORE exec, so a skill whose module body or register()
+        # raised at boot left a half-initialized skill_<name> entry behind and
+        # the probe reported PASS. With the loader's success set available, a
+        # sys.modules entry no longer buys a pass — only _loaded_skill_names
+        # does.
+        self._write_skill("alpha.py", "x = 1\n")
+        self._write_skill("broken.py", "x = 1\n")   # parses fine — failed at exec
+        fake_bc = types.ModuleType("bobert_companion")
+        fake_bc.SKILLS_ENABLED = True
+        fake_bc._loaded_skill_names = {"alpha"}
+        sys.modules["bobert_companion"] = fake_bc
+        self.addCleanup(lambda: sys.modules.pop("bobert_companion", None))
+        # Mimic the loader's pre-exec insert that used to poison the probe.
+        sys.modules["skill_broken"] = types.ModuleType("skill_broken")
+        self.addCleanup(lambda: sys.modules.pop("skill_broken", None))
+        r = self.mod._probe_skill_imports()
+        self.assertFalse(r["ok"])
+        self.assertIn("broken", r["error"])
+        self.assertNotIn("alpha", r["error"])
+        fail = next(f for f in r["details"]["failures"] if f["skill"] == "broken")
+        self.assertIn("not loaded at boot", fail["error"])
+
+    def test_all_loaded_including_package_pass(self):
+        # Package skills (skills/<name>/__init__.py) are enumerated too — the
+        # old probe only globbed flat *.py, so packages were never checked.
+        self._write_skill("alpha.py", "x = 1\n")
+        pkg = os.path.join(self.skills, "pkgskill")
+        os.makedirs(pkg)
+        with open(os.path.join(pkg, "__init__.py"), "w", encoding="utf-8") as f:
+            f.write("x = 1\n")
+        bc = types.SimpleNamespace(SKILLS_ENABLED=True,
+                                   _loaded_skill_names={"alpha", "pkgskill"})
+        with mock.patch.object(self.mod, "_bc", return_value=bc):
+            r = self.mod._probe_skill_imports()
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["details"]["checked"], 2)
+
+    def test_unloaded_package_skill_flagged(self):
+        pkg = os.path.join(self.skills, "pkgskill")
+        os.makedirs(pkg)
+        with open(os.path.join(pkg, "__init__.py"), "w", encoding="utf-8") as f:
+            f.write("x = 1\n")
+        bc = types.SimpleNamespace(SKILLS_ENABLED=True,
+                                   _loaded_skill_names=set())
+        with mock.patch.object(self.mod, "_bc", return_value=bc):
+            r = self.mod._probe_skill_imports()
+        self.assertFalse(r["ok"])
+        self.assertIn("pkgskill", r["error"])
+
+    def test_skills_disabled_skips(self):
+        # SKILLS_ENABLED off means nothing SHOULD be loaded — flagging every
+        # on-disk stem would be pure noise, so the probe passes as skipped.
+        self._write_skill("alpha.py", "x = 1\n")
+        bc = types.SimpleNamespace(SKILLS_ENABLED=False,
+                                   _loaded_skill_names=set())
+        with mock.patch.object(self.mod, "_bc", return_value=bc):
+            r = self.mod._probe_skill_imports()
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["details"].get("skipped"), "skills disabled")
 
     def test_underscore_skills_ignored(self):
         self._write_skill("_private.py", "def f(:\n")  # bad but ignored
@@ -3244,6 +3565,70 @@ class ProbeInternalBranchTests(_ProbeTestBase):
         # Only the single unique physical "Backup Mic" alternate was probed.
         self.assertEqual(tried_names.count("Backup Mic"), 1)
         self.assertNotIn("Stereo Mix", tried_names)
+
+
+# ─── stale-duplicate invariants (2026-07-21 audit) ───────────────────────
+class StaleDuplicateInvariantTests(unittest.TestCase):
+    """Source-scanning guards for this codebase's #1 bug class: a rule
+    fixed in one copy while another copy rots. These pin the 2026-07-21
+    audit's concurrency rules at the SOURCE level, so a future skill that
+    re-introduces the pattern fails the suite no matter which file it
+    lands in."""
+
+    @staticmethod
+    def _skill_sources():
+        from tests._skill_harness import SKILLS_DIR
+        for fname in sorted(os.listdir(SKILLS_DIR)):
+            if not fname.endswith(".py"):
+                continue
+            path = os.path.join(SKILLS_DIR, fname)
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                yield fname, fh.read()
+
+    def test_skills_borrowing_shared_stt_model_reference_stt_lock(self):
+        # bobert_companion.transcribe() holds _stt_lock across every touch
+        # of the shared CTranslate2 model — an unlocked concurrent call
+        # corrupts native state and kills the process with an uncatchable
+        # 0xc0000409. Any skill that borrows bc._stt must therefore
+        # reference _stt_lock somewhere in the same file.
+        import re
+        borrow_re = re.compile(
+            r"""getattr\(\s*bc\s*,\s*["']_stt["']|\bbc\._stt\b""")
+        offenders = [
+            fname for fname, text in self._skill_sources()
+            if borrow_re.search(text) and "_stt_lock" not in text
+        ]
+        self.assertEqual(
+            offenders, [],
+            f"skills borrow bobert_companion._stt without referencing "
+            f"_stt_lock (0xc0000409 concurrency hazard): {offenders}")
+
+    def test_mic_probe_gates_on_all_ownership_flags(self):
+        # The canonical mic-ownership rule lives in bobert_companion's
+        # _refresh_devices guard (_record_speech_active / _pathb_mic_active
+        # / _ambient_stream_active / _tts_playback_active). The probe must
+        # mirror ALL of them — the 2026-07-21 audit found it gating on the
+        # _sleep_mode conversation latch instead, so it opened sd.rec()
+        # exactly when standby's record_speech held the device.
+        import inspect
+        mod, _ = load_skill_isolated("self_diagnostic")
+        src = inspect.getsource(mod._probe_microphone)
+        for flag in ("_record_speech_active", "_pathb_mic_active",
+                     "_ambient_stream_active", "_tts_playback_active"):
+            self.assertIn(flag, src,
+                          f"_probe_microphone no longer consults the "
+                          f"{flag} mic-ownership flag")
+
+    def test_webcam_probe_references_camera_io_lock(self):
+        # Every in-process cv2.VideoCapture open/release must be
+        # serialised on bc._camera_io_lock (overlapping open/release
+        # heap-corrupts DirectShow, 0xc0000374).
+        import inspect
+        mod, _ = load_skill_isolated("self_diagnostic")
+        src = inspect.getsource(mod._probe_webcam)
+        self.assertIn("_camera_io_lock", src,
+                      "_probe_webcam no longer takes _camera_io_lock "
+                      "before its VideoCapture scan")
 
 
 if __name__ == "__main__":

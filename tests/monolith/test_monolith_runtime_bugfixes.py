@@ -235,6 +235,39 @@ class VerbatimResultSpokenTests(MonolithGlobalsTestCase):
             self.assertIn(name, self.bc.SPEAK_RESULT_VERBATIM_ACTIONS,
                           f"{name} returns a finished answer that must be spoken")
 
+    def test_cancel_timer_in_verbatim_set(self):
+        # 2026-07-21 audit: cancel_timer was registered on the line after
+        # list_timers (which IS voiced) but was in NEITHER speak set, so its
+        # verdict — including the honest "there are no timers running, sir."
+        # when no timer existed — was dropped, and the LLM's inline "Cancelled,
+        # sir." hallucination was the only thing heard. Same cancel-confirmation
+        # class as cancel_schedule / remove_schedule / cancel_promise, which
+        # were already verbatim.
+        self.assertIn("cancel_timer", self.bc.SPEAK_RESULT_VERBATIM_ACTIONS,
+                      "cancel_timer's verdict must be voiced verbatim")
+        # Kept OUT of INFORMATIVE (the sets must stay disjoint — see
+        # test_speak_sets_are_disjoint).
+        self.assertNotIn("cancel_timer", self.bc.INFORMATIVE_ACTIONS)
+
+    def test_cancel_timer_honest_verdict_passes_failure_guard(self):
+        # The honest no-timers verdict must carry NO FAILURE_MARKERS substring,
+        # or _speak_verbatim_results' failure guard silently re-swallows it and
+        # the fix above is moot. Guards against a future FAILURE_MARKERS
+        # addition (e.g. a "no timer" marker) undoing the voicing. Exercises
+        # the REAL skill handler, not a canned string.
+        from core.failure_markers import FAILURE_MARKERS
+        from tests._skill_harness import load_skill_isolated
+        modt, actions = load_skill_isolated("timer")
+        modt._timers.clear()
+        out = actions["cancel_timer"]("")
+        low = out.lower()
+        self.assertIn("no timers", low)   # the honest correction itself
+        hits = [m for m in FAILURE_MARKERS if m in low]
+        self.assertEqual(hits, [],
+                         f"cancel_timer's honest verdict {out!r} matches "
+                         f"FAILURE_MARKERS {hits} — the verbatim guard would "
+                         f"swallow it and the verdict goes silent again")
+
     def test_verbatim_set_excludes_side_effect_actions(self):
         # TRUE side-effect actions must NEVER verbatim-speak their result (the
         # inline reply already confirms them, and the effect is the point) —
@@ -1038,6 +1071,127 @@ class LlmQuickOllamaBoundedTests(MonolithGlobalsTestCase):
              mock.patch.object(bc, "_call_local_llm", return_value=""):
             out = bc._llm_quick("sys", "user")
         self.assertEqual(out, "")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  2026-07-21 audit: speak-set family completeness (the stale-duplicate class)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Both classes below guard the SAME recurring failure shape: a voicing rule
+# applied to PART of an action family while sibling names silently rotted in
+# neither speak set. Membership assertions pin today's fix; the source-scanning
+# invariants (via tools/registration_scan.py — the one shared home for the
+# "what does this file register?" rule) make the NEXT sibling added to the
+# skill fail the suite instead of being silently dropped.
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _load_registration_scan():
+    """Load tools/registration_scan.py without needing tools/ on sys.path."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "registration_scan", os.path.join(_ROOT, "tools", "registration_scan.py"))
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@requires_monolith
+class AirMouseFamilyVoicedTests(MonolithGlobalsTestCase):
+    """2026-07-21 audit: air_mouse_on / air_mouse_off returned the finished
+    gesture-vocabulary walkthrough (incl. the graceful "Note the Kinect is
+    off" sensor note, which carries no FAILURE_MARKER by design) but were in
+    NEITHER speak set — while their siblings air_mouse_status / arm / disarm /
+    calibrate_air_mouse WERE voiced. The owner heard only the inline preamble
+    and was never told the gesture vocabulary, nor that the Kinect was off and
+    the feature would not actually work."""
+
+    def test_air_mouse_on_off_in_verbatim_set(self):
+        for name in ("air_mouse_on", "air_mouse_off"):
+            self.assertIn(name, self.bc.SPEAK_RESULT_VERBATIM_ACTIONS,
+                          f"{name} returns a finished answer that must be spoken")
+            # Kept DISJOINT from INFORMATIVE (see test_speak_sets_are_disjoint).
+            self.assertNotIn(name, self.bc.INFORMATIVE_ACTIONS)
+
+    def test_every_registered_air_mouse_name_is_voiced(self):
+        # Source-scanning family-completeness invariant: EVERY name
+        # skills/kinect_air_mouse.py registers (direct assigns AND the
+        # alias-tuple loops) is a verbatim-class one-liner speaker, so every
+        # one of them must be in SPEAK_RESULT_VERBATIM_ACTIONS. Catches both
+        # this regression and any FUTURE air-mouse action added to register()
+        # without a voicing route — the exact "fixed in one copy, missed in
+        # the sibling" failure the audit documented.
+        rs = _load_registration_scan()
+        regs = rs.scan_file(os.path.join(_ROOT, "skills", "kinect_air_mouse.py"))
+        # Sanity: the scanner parsed both direct assigns and the alias loops
+        # (13 names at HEAD); an empty/partial scan must not vacuously pass.
+        self.assertIn("air_mouse_on", regs)
+        self.assertIn("take_the_cursor", regs)      # from an alias-tuple loop
+        self.assertGreaterEqual(len(regs), 13)
+        missing = sorted(n for n in regs
+                         if n not in self.bc.SPEAK_RESULT_VERBATIM_ACTIONS)
+        self.assertEqual(
+            missing, [],
+            f"kinect_air_mouse registers action(s) with NO voicing route — "
+            f"their finished one-line results would be logged and dropped: "
+            f"{missing}")
+
+
+@requires_monolith
+class HolographicOverlayStatusVoicedTests(MonolithGlobalsTestCase):
+    """2026-07-21 audit: the ENTIRE holographic_overlay package's status
+    read-outs were missed by the 2026-07-04 read-out sweep (its registrations
+    live in the package __init__, not a flat skills/*.py). Each *_status
+    handler returns one finished user-facing sentence and never self-speaks,
+    so "is the printer overlay up?" was answered to the log only."""
+
+    _STATUS_READOUTS = (
+        "bambu_overlay_status", "bambu_camera_status", "workshop_hud_status",
+        "workshop_print_monitor_status", "holo_hud_v2_status",
+        "arc_reactor_status_status", "stark_status_ring_status",
+        "holographic_status",
+    )
+
+    def test_holo_status_readouts_in_verbatim_set(self):
+        for name in self._STATUS_READOUTS:
+            self.assertIn(name, self.bc.SPEAK_RESULT_VERBATIM_ACTIONS,
+                          f"{name} returns a finished answer that must be spoken")
+            self.assertNotIn(name, self.bc.INFORMATIVE_ACTIONS)
+
+    def test_every_holo_status_readout_is_routed(self):
+        # Source-scanning invariant: every holographic_overlay registration
+        # whose HANDLER is a *_status read-out must be in one of the two speak
+        # sets, so a FUTURE status action added to the package fails the suite
+        # instead of being silently dropped. Matching on the handler symbol
+        # (not the registered name) is deliberate: the package also registers
+        # the name "arc_reactor_status" as a TOGGLE alias (_act_arc_status_
+        # toggle) — a side-effect action that must NOT be verbatim-voiced, and
+        # a name-suffix match would wrongly demand it.
+        rs = _load_registration_scan()
+        regs = rs.scan_file(
+            os.path.join(_ROOT, "skills", "holographic_overlay", "__init__.py"))
+        status_names = sorted(n for n, r in regs.items()
+                              if r.symbol.endswith("_status"))
+        # Sanity: the full 8-read-out family is visible at HEAD; a partial
+        # scan must not vacuously pass.
+        self.assertGreaterEqual(len(status_names), 8, status_names)
+        routed = (set(self.bc.SPEAK_RESULT_VERBATIM_ACTIONS)
+                  | set(self.bc.INFORMATIVE_ACTIONS))
+        missing = [n for n in status_names if n not in routed]
+        self.assertEqual(
+            missing, [],
+            f"holographic_overlay status read-out(s) in NEITHER speak set — "
+            f"their answers would be logged and dropped: {missing}")
+
+    def test_speak_sets_still_disjoint_after_additions(self):
+        # Re-assert the two-set disjointness invariant explicitly here so a
+        # botched future edit to THIS family (adding a name to both sets)
+        # fails next to the family tests, not only in the 2026-07-07 class.
+        overlap = (set(self.bc.INFORMATIVE_ACTIONS)
+                   & set(self.bc.SPEAK_RESULT_VERBATIM_ACTIONS))
+        self.assertEqual(overlap, set(), sorted(overlap))
 
 
 if __name__ == "__main__":

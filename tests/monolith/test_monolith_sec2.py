@@ -423,17 +423,135 @@ class RefreshDevicesTests(_MonolithSec2Base):
         sd._terminate.assert_not_called()
 
     def test_unchanged_signature_skips_reinit(self):
-        # force=False, signature identical to last → bump checked_at, no
-        # _terminate/_initialize.
+        # force=False, signature identical to last, cache POPULATED, periodic
+        # re-enum not due → bump checked_at only; no _terminate/_initialize
+        # and no re-pick. (The pristine cache has last_reenum_at=0.0, which
+        # makes the periodic re-enum due and forces a fall-through — pin it
+        # fresh so this test exercises the short-circuit itself. A CLEARED
+        # cache deliberately no longer short-circuits: see the
+        # cleared-cache re-pick tests below. 2026-07-21 audit.)
         self.bc._device_cache["checked_at"] = 0.0
+        self.bc._device_cache["in"] = 2
+        self.bc._device_cache["out"] = 4
+        self.bc._device_cache["last_reenum_at"] = time.time()
         sig = ((0, "Mic", 1, 0),)
         self.bc._device_cache["last_devices_signature"] = sig
         with mock.patch.object(self.bc, "_devices_signature", return_value=sig):
             sd = mock.Mock()
-            with mock.patch.object(self.bc, "sd", sd):
+            with mock.patch.object(self.bc, "sd", sd), \
+                    mock.patch.object(self.bc, "_pick_device") as pick:
                 self.bc._refresh_devices(force=False)
             sd._terminate.assert_not_called()
+            pick.assert_not_called()
         self.assertGreater(self.bc._device_cache["checked_at"], 0.0)
+        self.assertEqual(self.bc._device_cache["in"], 2)
+        self.assertEqual(self.bc._device_cache["out"], 4)
+
+    def test_cleared_cache_repicks_without_reinit(self):
+        # THE 2026-07-21 regression ("Mic-device cache invalidation is a
+        # no-op"): an invalidating call site cleared the cache (in/out=None,
+        # checked_at=0.0) but the device signature is unchanged → the old
+        # gate returned early and the re-pick never ran, so
+        # get_input_device() kept returning None (= the system-default mic)
+        # for up to DEVICE_REENUM_INTERVAL. The cleared cache must force the
+        # cheap re-pick — WITHOUT the destructive reinit and WITHOUT pausing
+        # the wake-word detector.
+        sig = ((0, "Mic", 1, 0),)
+        self.bc._device_cache.update({
+            "in": None, "out": None, "checked_at": 0.0,
+            "last_devices_signature": sig,
+            "last_reenum_at": time.time(),   # periodic re-enum NOT due
+        })
+        sd = mock.Mock()
+        det = mock.Mock()
+        det.is_running.return_value = True
+        wl = mock.Mock(_detector=det)
+        with mock.patch.object(self.bc, "sd", sd), \
+                mock.patch.object(self.bc, "_devices_signature",
+                                  return_value=sig), \
+                mock.patch.object(self.bc, "_record_speech_active", [False]), \
+                mock.patch.object(self.bc, "_pathb_mic_active", [False]), \
+                mock.patch.object(self.bc, "_ambient_stream_active", [False]), \
+                mock.patch.object(self.bc, "_tts_playback_active", [False]), \
+                mock.patch.object(self.bc, "MICROPHONE_INDEX", None), \
+                mock.patch.object(self.bc, "SPEAKER_INDEX", None), \
+                mock.patch.dict(self.bc.sys.modules,
+                                {"skill_wake_listener": wl}), \
+                mock.patch.object(self.bc, "_pick_device",
+                                  side_effect=[(3, "Mic X"), (5, "Spk Y")]):
+            self.bc._refresh_devices(force=False)
+        # The re-pick RAN (this is the assertion that fails at HEAD)…
+        self.assertEqual(self.bc._device_cache["in"], 3)
+        self.assertEqual(self.bc._device_cache["out"], 5)
+        # …via the repick-only path: no destructive reinit, no wake-word pause.
+        sd._terminate.assert_not_called()
+        det.pause.assert_not_called()
+
+    def test_cleared_cache_no_preferred_device_never_reinit_churns(self):
+        # Churn guard: a permanently unpickable preferred device (headset
+        # unplugged, no fallback match) leaves the cache legitimately None on
+        # every pass. That steady state must NOT convert each
+        # DEVICE_CHECK_INTERVAL pass into a destructive sd._terminate()
+        # cycle — the 0xc0000374 churn the signature gate exists to prevent.
+        sig = ((0, "Mic", 1, 0),)
+        self.bc._device_cache.update({
+            "in": None, "out": None, "checked_at": 0.0,
+            "last_devices_signature": sig,
+            "last_reenum_at": time.time(),
+        })
+        sd = mock.Mock()
+        with mock.patch.object(self.bc, "sd", sd), \
+                mock.patch.object(self.bc, "_devices_signature",
+                                  return_value=sig), \
+                mock.patch.object(self.bc, "_record_speech_active", [False]), \
+                mock.patch.object(self.bc, "_pathb_mic_active", [False]), \
+                mock.patch.object(self.bc, "_ambient_stream_active", [False]), \
+                mock.patch.object(self.bc, "_tts_playback_active", [False]), \
+                mock.patch.object(self.bc, "MICROPHONE_INDEX", None), \
+                mock.patch.object(self.bc, "SPEAKER_INDEX", None), \
+                mock.patch.object(self.bc, "_pick_device",
+                                  return_value=(None, "")):
+            self.bc._refresh_devices(force=False)
+            self.bc._device_cache["checked_at"] = 0.0   # re-arm the time gate
+            self.bc._refresh_devices(force=False)
+        sd._terminate.assert_not_called()
+
+    def test_invalidated_cache_recovers_on_next_get_input_device(self):
+        # End-to-end: get_input_device()'s stale-index probe invalidates the
+        # cache; the NEXT get_input_device() must return the re-picked index
+        # instead of None (the pre-fix behaviour silently captured on the
+        # system-default mic until the 300s forced re-enumeration).
+        sig = ((0, "Mic", 1, 0),)
+        self.bc._device_cache.update({
+            "in": 5, "out": 6, "checked_at": time.time(),
+            "last_devices_signature": sig,
+            "last_reenum_at": time.time(),
+        })
+        sd = mock.Mock()
+
+        def _query(idx=None):
+            if idx == 5:
+                raise Exception("Error querying device 5")
+            return {"name": "Mic X"}
+        sd.query_devices.side_effect = _query
+        with mock.patch.object(self.bc, "_mic_input_disabled",
+                               return_value=False), \
+                mock.patch.object(self.bc, "sd", sd), \
+                mock.patch.object(self.bc, "_devices_signature",
+                                  return_value=sig), \
+                mock.patch.object(self.bc, "_record_speech_active", [False]), \
+                mock.patch.object(self.bc, "_pathb_mic_active", [False]), \
+                mock.patch.object(self.bc, "_ambient_stream_active", [False]), \
+                mock.patch.object(self.bc, "_tts_playback_active", [False]), \
+                mock.patch.object(self.bc, "MICROPHONE_INDEX", None), \
+                mock.patch.object(self.bc, "SPEAKER_INDEX", None), \
+                mock.patch.object(self.bc, "_pick_device",
+                                  side_effect=[(3, "Mic X"), (6, "Spk Y")]):
+            # Stale probe → invalidate → fall back to system default once…
+            self.assertIsNone(self.bc.get_input_device())
+            # …but the NEXT call re-picks instead of staying on None.
+            self.assertEqual(self.bc.get_input_device(), 3)
+        sd._terminate.assert_not_called()
 
     def test_inlock_recheck_returns_when_peer_just_refreshed(self):
         # 3872-3873: the pre-lock time gate passes (checked_at stale), but a
@@ -1243,11 +1361,19 @@ class LateNightTests(_MonolithSec2Base):
             self.bc._is_late_night_suppressed(mem, self._at_hour(2)))
 
     def test_set_suppression_persists(self):
+        # _set_late_night_suppression persists against a FRESH locked
+        # load_memory() (the shutdown-path clobber fix), NOT the passed-in
+        # snapshot — so mock the load too, or the assertion depends on this
+        # box's real bobert_memory.json. (Stale pin of the pre-fix behaviour
+        # repaired 2026-07-21.) The passed snapshot must still be updated
+        # in-session.
         mem = {}
-        with mock.patch.object(self.bc, "save_memory") as save:
+        with mock.patch.object(self.bc, "save_memory") as save, \
+                mock.patch.object(self.bc, "load_memory", return_value={}):
             self.bc._set_late_night_suppression(mem)
         self.assertIn("late_night_no_comments_until", mem)
-        save.assert_called_once_with(mem)
+        key = mem["late_night_no_comments_until"]
+        save.assert_called_once_with({"late_night_no_comments_until": key})
 
     def test_matches_suppress_phrase_true(self):
         self.assertTrue(self.bc._matches_suppress_phrase("no comments tonight"))

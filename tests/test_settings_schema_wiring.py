@@ -156,6 +156,102 @@ class SchemaWiringTests(unittest.TestCase):
                     "_GUI_ONLY_ALLOWLIST and let the main test cover it.",
             )
 
+    def test_runtime_config_flips_have_a_persistence_path(self):
+        """INVERSE invariant of the dead-toggle guard: a RUNTIME assignment to
+        a core.config constant that has NO path to user_settings.json is an
+        AMNESIAC toggle — the voice action flips it live, but
+        core.config._apply_user_settings() re-applies the stale on-disk value
+        at every boot, so the flip silently reverts on restart.
+
+        That is exactly how REQUIRE_WAKE_MODE shipped (2026-07-21 audit): the
+        voice toggle set _cfg.REQUIRE_WAKE_MODE, but the key had no
+        settings_window.SCHEMA row and no _persist_setting-style writer, so
+        "wake word mode off" could never survive a restart while
+        user_settings.json carried true.
+
+        Scan bobert_companion.py + skills/ for every `_cfg.CONST = ...` (and
+        `setattr(_cfg, "CONST", ...)`) and require, per constant, at least one
+        escape hatch:
+          * a persisted SCHEMA row (the GUI/web panel can flip AND save it), or
+          * the assigning file itself persists the key (it contains the quoted
+            key literal and calls the settings_window save path — the
+            skills/model_picker._persist_setting pattern every skill uses), or
+          * an explicit runtime-only allowlist entry below (deliberate,
+            reviewed session-only constants).
+        """
+        import re
+        assign_res = (
+            re.compile(r"\b_cfg\.([A-Z][A-Z0-9_]*)\s*=(?!=)"),
+            re.compile(r"setattr\(\s*_cfg\s*,\s*\"([A-Z][A-Z0-9_]*)\""),
+        )
+        # Deliberately session-only constants: (filename, CONST). Empty today —
+        # every current runtime flip persists. Adding an entry here is a
+        # reviewed exception, not a fix.
+        runtime_only_allowlist: set[tuple[str, str]] = set()
+
+        files = [os.path.join(_PROJECT, "bobert_companion.py")]
+        skills_dir = os.path.join(_PROJECT, "skills")
+        for dirpath, dirnames, filenames in os.walk(skills_dir):
+            dirnames[:] = [d for d in dirnames
+                           if d not in ("__pycache__", ".claude", "backups")]
+            files.extend(os.path.join(dirpath, f) for f in filenames
+                         if f.endswith(".py"))
+
+        persisted = set(sw.persisted_keys())
+        amnesiac = []
+        scanned_consts = 0
+        for fp in files:
+            try:
+                with open(fp, encoding="utf-8", errors="replace") as fh:
+                    src = fh.read()
+            except OSError:
+                continue
+            consts = {c for rx in assign_res for c in rx.findall(src)}
+            if not consts:
+                continue
+            file_persists = "save_settings" in src
+            base = os.path.basename(fp)
+            for const in sorted(consts):
+                scanned_consts += 1
+                if const in persisted:
+                    continue
+                if file_persists and f'"{const}"' in src:
+                    continue
+                if (base, const) in runtime_only_allowlist:
+                    continue
+                amnesiac.append(f"{base}: _cfg.{const}")
+        # Self-check: the scanner must still see the known flip sites — if the
+        # tree refactors them away, this invariant needs updating, not deleting.
+        self.assertGreaterEqual(
+            scanned_consts, 2,
+            "the runtime-flip scanner found almost nothing — its regexes have "
+            "rotted; update them to match the tree's config-assignment style")
+        self.assertEqual(
+            amnesiac, [],
+            msg=(
+                "These runtime config flips have NO persistence path — no "
+                "settings_window.SCHEMA row and no in-file settings writer — "
+                "so the flip reverts at the next boot when "
+                "_apply_user_settings() re-applies the stale on-disk value "
+                f"(the REQUIRE_WAKE_MODE amnesia bug, 2026-07-21): {amnesiac}. "
+                "Persist the flip via the model_picker._persist_setting "
+                "pattern, add a SCHEMA row, or (rare) allowlist it here with "
+                "justification."
+            ),
+        )
+
+    def test_require_wake_mode_row_is_pinned(self):
+        """REQUIRE_WAKE_MODE must keep its schema row (voice tab, bool,
+        default False — matching core/config.py) so the GUI and the web panel
+        (which serves settings_window.SCHEMA as its single source of truth)
+        always offer an escape hatch for the voice toggle."""
+        self.assertIn("REQUIRE_WAKE_MODE", sw.SCHEMA)
+        spec = sw.SCHEMA["REQUIRE_WAKE_MODE"]
+        self.assertEqual(spec["type"], "bool")
+        self.assertIs(spec["default"], False)
+        self.assertEqual(spec["tab"], "voice")
+        self.assertIn("REQUIRE_WAKE_MODE", sw.persisted_keys())
+
     def test_persisted_keys_excludes_status_rows(self):
         """Sanity-check the helper this guard relies on: status rows
         (``_status_*``) must never be treated as persisted settings."""

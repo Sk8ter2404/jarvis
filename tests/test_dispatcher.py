@@ -100,6 +100,22 @@ class MatchSingleIntentTests(unittest.TestCase):
         self.assertEqual(self._mi("hey jarvis play Bowie"),
                          ("play_music", "Bowie", "music queued"))
 
+    def test_comma_wake_prefix_matches(self):
+        # 2026-07-21 audit regression: Whisper renders the wake word with a
+        # comma — "JARVIS, take a screenshot." — and the old dispatcher-local
+        # filler copy had no comma variants, so Controlled mode returned None
+        # here (→ refusal line) for every such command.
+        step = d.match_single_intent("JARVIS, take a screenshot.",
+                                     ["screenshot"])
+        self.assertIsNotNone(step)
+        self.assertEqual(step.action, "screenshot")
+
+    def test_stacked_fillers_stripped_before_match(self):
+        # Stacked lead-ins ("hey jarvis, could you play ...") all peel off —
+        # the old copy stripped at most one filler per call.
+        self.assertEqual(self._mi("hey jarvis, could you play Bowie"),
+                         ("play_music", "Bowie", "music queued"))
+
     def test_no_rule_match_returns_none(self):
         self.assertIsNone(self._mi("what is the meaning of life"))
 
@@ -233,13 +249,26 @@ class SegmentationTests(unittest.TestCase):
             d._split_chain("play Michael Jackson and the Jackson 5"),
             ["play Michael Jackson and the Jackson 5"])
 
-    def test_strip_lead_filler_single_pass(self):
-        # Strips the first matching lead-in only (does not recurse), so
-        # 'please' remains after 'could you ' is removed.
+    def test_strip_lead_filler_loops_until_stable(self):
+        # Stacked lead-ins are ALL removed (loop-until-stable). The old
+        # dispatcher-local copy stripped one filler per call, leaving
+        # 'please play jazz' — that single-pass behavior was the stale
+        # duplicate of core.mode_router's fixed version (2026-07-21 audit).
         self.assertEqual(d._strip_lead_filler("Could you please play jazz"),
-                         "please play jazz")
+                         "play jazz")
         self.assertEqual(d._strip_lead_filler("okay jarvis screenshot"),
                          "screenshot")
+
+    def test_strip_lead_filler_comma_wake_variants(self):
+        # The wake word with Whisper's comma must strip too — the stale copy
+        # only knew the space forms ("jarvis ") and left "JARVIS, ..." intact,
+        # so no ^-anchored intent rule could ever match it.
+        self.assertEqual(d._strip_lead_filler("JARVIS, take a screenshot"),
+                         "take a screenshot")
+        self.assertEqual(d._strip_lead_filler("hey jarvis, play jazz"),
+                         "play jazz")
+        self.assertEqual(d._strip_lead_filler("okay jarvis, play jazz"),
+                         "play jazz")
 
     def test_looks_like_command_start(self):
         self.assertTrue(d._looks_like_command_start("play jazz"))

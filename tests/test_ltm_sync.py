@@ -22,6 +22,23 @@ def _join_learn_worker(timeout: float = 3.0) -> None:
             t.join(timeout=timeout)
 
 
+class _InlineThread:
+    """Drop-in for ``threading.Thread(target=...)`` that runs the target
+    synchronously on ``.start()`` so worker bodies execute deterministically."""
+
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None, **_):
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs or {}
+
+    def start(self):
+        if self._target is not None:
+            self._target(*self._args, **self._kwargs)
+
+    def join(self, *a, **k):
+        return None
+
+
 @requires_monolith
 class LtmSyncTests(unittest.TestCase):
     @classmethod
@@ -67,6 +84,65 @@ class LtmSyncTests(unittest.TestCase):
             bc._ltm_learn_facts(["a durable fact"])   # must not raise
             _join_learn_worker()
         boom.add_fact.assert_called()   # it tried, and swallowed the error
+
+
+@requires_monolith
+class ReflectorWiringTests(unittest.TestCase):
+    """_ltm_boot_warm must inject the local-LLM adjudicator into the LTM
+    reflector via ltm.set_reflector_llm — the contradiction pass was DEAD in
+    production because record_turn's trigger had no llm_call to pass
+    (2026-07-21 audit #39). This is the invariant that keeps the injection
+    from silently un-wiring again: the same 'built but zero production
+    callers' failure mode the 2026-07-06 audit found for LTM as a whole."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bc = load_monolith()
+
+    def _run_warm(self, fake_ltm):
+        bc = self.bc
+        with mock.patch.object(bc, "_ltm_enabled", return_value=True), \
+             mock.patch.object(bc, "_ltm_module", return_value=fake_ltm), \
+             mock.patch.object(bc.threading, "Thread", _InlineThread):
+            bc._ltm_boot_warm()
+
+    def test_boot_warm_installs_reflector_adjudicator(self):
+        fake = mock.Mock()
+        fake.list_facts.return_value = []
+        self._run_warm(fake)
+        fake.ensure_loaded.assert_called_once()
+        fake.set_reflector_llm.assert_called_once()
+        (adapter,) = fake.set_reflector_llm.call_args[0]
+        self.assertTrue(callable(adapter))
+
+    def test_adapter_feeds_llm_quick_prompt_and_both_fact_texts(self):
+        fake = mock.Mock()
+        fake.list_facts.return_value = []
+        self._run_warm(fake)
+        adapter = fake.set_reflector_llm.call_args[0][0]
+        with mock.patch.object(self.bc, "_llm_quick",
+                               return_value="A") as mq:
+            out = adapter("prompt", [{"role": "fact_a", "text": "x"},
+                                     {"role": "fact_b", "text": "y"}])
+        self.assertEqual(out, "A")
+        _, kwargs = mq.call_args
+        self.assertEqual(kwargs.get("system"), "prompt")
+        self.assertIn("fact_a: x", kwargs.get("user", ""))
+        self.assertIn("fact_b: y", kwargs.get("user", ""))
+
+    def test_adapter_tolerates_empty_context(self):
+        fake = mock.Mock()
+        fake.list_facts.return_value = []
+        self._run_warm(fake)
+        adapter = fake.set_reflector_llm.call_args[0][0]
+        with mock.patch.object(self.bc, "_llm_quick", return_value=""):
+            self.assertEqual(adapter("prompt", None), "")
+
+    def test_failed_warm_up_does_not_wire(self):
+        fake = mock.Mock()
+        fake.ensure_loaded.side_effect = RuntimeError("store locked")
+        self._run_warm(fake)                      # must not raise
+        fake.set_reflector_llm.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -346,6 +346,53 @@ class EnrollSampleActionTests(unittest.TestCase):
         self.assertIn("xtts status", out)
 
 
+class BackendListRegressionTests(unittest.TestCase):
+    """2026-07-21 audit: list_tts_backends hardcoded 'available: edge, pyttsx3,
+    xtts' while _VALID_BACKENDS had grown kokoro — so with TTS_BACKEND=kokoro
+    (the live user_settings value) the action answered 'current backend:
+    kokoro. available: edge, pyttsx3, xtts.', contradicting itself. Classic
+    stale duplicate: the rule lived in three copies (skill literal, LLM prompt,
+    settings GUI) and only one was updated."""
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("custom_voice")
+
+    def test_list_backends_reports_every_valid_backend(self):
+        # The exact failing scenario: current backend is kokoro; the available
+        # list must contain it (and every other valid backend).
+        with mock.patch.object(self.mod, "get_backend", return_value="kokoro"), \
+             mock.patch.object(self.mod, "is_available", return_value=False), \
+             mock.patch.object(self.mod, "availability_reason",
+                               return_value="Coqui TTS isn't installed"), \
+             mock.patch.object(self.mod, "get_sample_path", return_value=""):
+            out = self.actions["list_tts_backends"]("")
+        self.assertIn("current backend: kokoro", out)
+        available = out.split("available:", 1)[1]
+        for backend in self.mod._VALID_BACKENDS:
+            self.assertIn(backend, available,
+                          f"{backend!r} missing from the advertised list: {out!r}")
+
+    def test_backend_list_copies_stay_in_sync(self):
+        # Cross-copy invariant (anti-stale-duplicate): adding a backend to
+        # _VALID_BACKENDS must fail this test until BOTH other copies — the
+        # settings GUI choices and the LLM action prompt — are updated too.
+        from core import prompts
+        from tools import settings_window
+        valid = set(self.mod._VALID_BACKENDS)
+        self.assertEqual(
+            set(settings_window.SCHEMA["TTS_BACKEND"]["choices"]), valid,
+            "tools/settings_window.py TTS_BACKEND choices drifted from "
+            "skills/custom_voice._VALID_BACKENDS")
+        prompt_lines = [ln for ln in prompts.PC_CONTROL_PROMPT.split("\n")
+                        if "Valid backends:" in ln]
+        self.assertEqual(len(prompt_lines), 1,
+                         "expected exactly one 'Valid backends:' prompt line")
+        for backend in valid:
+            self.assertIn(backend, prompt_lines[0],
+                          f"core/prompts.py 'Valid backends:' line is missing "
+                          f"{backend!r}: {prompt_lines[0]!r}")
+
+
 # ─────────────────────────────────────────────────────────────────────────
 #  Config accessors that read sample-path / language off bobert or env
 # ─────────────────────────────────────────────────────────────────────────

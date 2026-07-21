@@ -4226,13 +4226,31 @@ class EnsureOllamaRunningTests(MonolithGlobalsTestCase):
             self.assertTrue(bc._ensure_ollama_running(timeout_sec=1.0))
         popen.assert_not_called()   # never launch when it's already up
 
+    def _prod_env(self):
+        """Context manager stack that clears the harness's suite-wide staging
+        posture (JARVIS_STAGING=1 env + the module's staging BLUE_GREEN_ROLE)
+        so a test can exercise the real PROD start-when-down logic. The
+        2026-07-21 staging gate would otherwise short-circuit every test."""
+        ctx = mock.patch.dict(os.environ, {}, clear=False)
+        ctx.start()
+        os.environ.pop("JARVIS_STAGING", None)
+        staging = mock.patch.object(self.bc, "_is_staging", return_value=False)
+        staging.start()
+        self.addCleanup(staging.stop)
+        self.addCleanup(ctx.stop)
+
     def test_starts_server_when_down_then_comes_up(self):
         bc = self.bc
-        # down on the first check, up after we "start" it.
-        alive = iter([False, True])
+        self._prod_env()
+        # down on the first check AND through the 3 outage-confirmation
+        # probes (2026-07-21: a single /api/tags blip must not escalate to a
+        # reap), up once we "start" it. time.sleep is mocked so the probe
+        # backoff costs nothing.
+        alive = iter([False, False, False, False, True])
         with mock.patch.object(bc, "_ollama_alive", side_effect=lambda: next(alive)), \
                 mock.patch("shutil.which", return_value=r"C:\ollama.exe"), \
                 mock.patch.object(bc, "_reap_wedged_ollama") as reap, \
+                mock.patch.object(bc.time, "sleep"), \
                 mock.patch.object(bc.subprocess, "Popen") as popen:
             ok = bc._ensure_ollama_running(timeout_sec=5.0)
         self.assertTrue(ok)
@@ -4243,14 +4261,110 @@ class EnsureOllamaRunningTests(MonolithGlobalsTestCase):
         # cleared any wedged stack before relaunching
         reap.assert_called_once()
 
+    def test_momentary_blip_does_not_reap(self):
+        # 2026-07-21 audit: the /api/tags probe times out exactly when the
+        # server is busiest (model load / CUDA discovery). If a confirmation
+        # re-probe answers, the reap and relaunch must be skipped entirely.
+        bc = self.bc
+        self._prod_env()
+        alive = iter([False, True])   # blip, then the first re-probe answers
+        with mock.patch.object(bc, "_ollama_alive", side_effect=lambda: next(alive)), \
+                mock.patch("shutil.which", return_value=r"C:\ollama.exe"), \
+                mock.patch.object(bc, "_reap_wedged_ollama") as reap, \
+                mock.patch.object(bc.time, "sleep"), \
+                mock.patch.object(bc.subprocess, "Popen") as popen:
+            self.assertTrue(bc._ensure_ollama_running(timeout_sec=5.0))
+        reap.assert_not_called()
+        popen.assert_not_called()
+
     def test_returns_false_when_exe_missing(self):
         bc = self.bc
+        self._prod_env()
         with mock.patch.object(bc, "_ollama_alive", return_value=False), \
                 mock.patch("shutil.which", return_value=None), \
                 mock.patch("os.path.isfile", return_value=False), \
                 mock.patch.object(bc.subprocess, "Popen") as popen:
             self.assertFalse(bc._ensure_ollama_running(timeout_sec=1.0))
         popen.assert_not_called()
+
+    # ── staging/test isolation (2026-07-21 audit: "Ollama reap/restart is
+    #    the only ollama boot step" not gated for staging) ───────────────────
+
+    def test_staging_never_reaps_or_spawns(self):
+        # A staging boot with the shared server momentarily unreachable must
+        # neither taskkill nor spawn — prod owns the ollama stack.
+        bc = self.bc
+        with mock.patch.dict(os.environ, {"JARVIS_STAGING": "1"}), \
+                mock.patch.object(bc, "_ollama_alive", return_value=False), \
+                mock.patch("shutil.which", return_value=r"C:\ollama.exe"), \
+                mock.patch.object(bc, "_reap_wedged_ollama") as reap, \
+                mock.patch.object(bc.subprocess, "Popen") as popen, \
+                mock.patch("builtins.print"):
+            self.assertFalse(bc._ensure_ollama_running(timeout_sec=1.0))
+        reap.assert_not_called()
+        popen.assert_not_called()
+
+    def test_staging_still_observes_alive_server(self):
+        # Staging may still OBSERVE the shared server's state (the fast path)
+        # — only the reap/spawn escalation is fenced off.
+        bc = self.bc
+        with mock.patch.dict(os.environ, {"JARVIS_STAGING": "1"}), \
+                mock.patch.object(bc, "_ollama_alive", return_value=True), \
+                mock.patch.object(bc.subprocess, "Popen") as popen:
+            self.assertTrue(bc._ensure_ollama_running(timeout_sec=1.0))
+        popen.assert_not_called()
+
+    def test_reap_gated_in_staging(self):
+        # The reap itself must refuse to taskkill under JARVIS_STAGING=1 —
+        # this covers EVERY caller, including the wedge detector's direct
+        # _reap_wedged_ollama() call that bypasses _ensure_ollama_running.
+        bc = self.bc
+        with mock.patch.dict(os.environ, {"JARVIS_STAGING": "1"}), \
+                mock.patch.object(bc.subprocess, "run") as run, \
+                mock.patch.object(bc.time, "sleep"):
+            bc._reap_wedged_ollama()
+        run.assert_not_called()
+
+    def test_reap_gated_in_test_mode(self):
+        # ci_sim safety made structural: with only the harness default
+        # JARVIS_TEST_MODE=1 (no staging vars) a live taskkill would murder
+        # the REAL server — the in-function gate must block it even when a
+        # test forgets to mock _reap_wedged_ollama.
+        bc = self.bc
+        with mock.patch.dict(os.environ, {"JARVIS_TEST_MODE": "1"}, clear=False), \
+                mock.patch.object(bc, "_is_staging", return_value=False), \
+                mock.patch.object(bc.subprocess, "run") as run, \
+                mock.patch.object(bc.time, "sleep"):
+            os.environ.pop("JARVIS_STAGING", None)
+            bc._reap_wedged_ollama()
+        run.assert_not_called()
+
+    def test_taskkill_functions_carry_staging_sentinel(self):
+        # Source-scanning invariant (the repo's stale-duplicate defense): any
+        # bobert_companion function that taskkills an ollama image must carry
+        # the JARVIS_STAGING sentinel, so a future second reap copy cannot
+        # ship ungated.
+        import ast
+        with open(self.bc.__file__, "r", encoding="utf-8") as f:
+            src = f.read()
+        tree = ast.parse(src)
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            seg = ast.get_source_segment(src, node) or ""
+            if "taskkill" not in seg:
+                continue
+            if not any(img in seg for img in
+                       ("ollama.exe", "llama-server.exe", "ollama app.exe")):
+                continue
+            if "JARVIS_STAGING" not in seg:
+                offenders.append(node.name)
+        self.assertEqual(
+            offenders, [],
+            "these bobert_companion functions taskkill the ollama stack "
+            "without the JARVIS_STAGING staging/test sentinel (a staging or "
+            f"test run would murder the shared prod server): {offenders}")
 
 
 @requires_monolith
@@ -4821,6 +4935,22 @@ class VisionWedgeDetectorTests(MonolithGlobalsTestCase):
             bc._vision_wedge_note_timeout()
             bc._vision_wedge_note_timeout()     # inside cooldown → no reap
         reap.assert_called_once()
+
+    def test_wedge_reap_blocked_in_staging(self):
+        # 2026-07-21 audit: the wedge detector calls _reap_wedged_ollama()
+        # DIRECTLY (bypassing _ensure_ollama_running), so a call-site-only
+        # staging gate would leave this path able to taskkill the shared prod
+        # server. Prove the IN-FUNCTION gate covers it: run the REAL reap
+        # (not mocked) under JARVIS_STAGING=1 and assert taskkill never runs.
+        bc = self.bc
+        with mock.patch.dict(os.environ, {"JARVIS_STAGING": "1"}), \
+             mock.patch.object(bc, "_ensure_ollama_running"), \
+             mock.patch.object(bc.subprocess, "run") as run, \
+             mock.patch.object(bc.time, "sleep"), \
+             self._thread_runner(), mock.patch("builtins.print"):
+            bc._vision_wedge_note_timeout()
+            bc._vision_wedge_note_timeout()     # threshold → reap fires inline
+        run.assert_not_called()
 
 
 if __name__ == "__main__":

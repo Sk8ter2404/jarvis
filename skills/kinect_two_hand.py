@@ -522,6 +522,10 @@ def _air_mouse_mod():
                 spec.loader.exec_module(m)
                 return m
         except Exception:
+            # Roll back the pre-exec insert — a failed exec must not leave a
+            # half-initialized module for the next sys.modules.get() to trust
+            # (same rule as load_skills' failure path).
+            sys.modules.pop("skill_kinect_air_mouse", None)
             return None
     return None
 

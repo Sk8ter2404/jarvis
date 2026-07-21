@@ -871,11 +871,14 @@ def _on_open_changelog(icon, item):
 def _on_switch_anthropic(icon, item):
     _send_command("switch_llm", backend="anthropic")
 
-def _on_switch_qwen(icon, item):
-    _send_command("switch_llm", backend="qwen2.5:14b")
-
-def _on_switch_llama(icon, item):
-    _send_command("switch_llm", backend="llama3.1:8b")
+def _on_switch_local(icon, item):
+    # Send the "ollama" sentinel, NOT a hard-coded model tag (2026-07-21
+    # audit): the tray's old 'qwen2.5:14b'/'llama3.1:8b' literals drifted from
+    # the tags actually installed (qwen2.5:14b-instruct-q5_K_M etc.), pinning
+    # the resolver cache at a tag Ollama 404s on every turn. _act_switch_llm's
+    # "ollama" branch resolves the live local default via _get_local_llm_model,
+    # so the tray can never name a model the box doesn't have.
+    _send_command("switch_llm", backend="ollama")
 
 def _on_switch_other_llm(icon, item):
     _send_command("switch_llm_picker")
@@ -1801,10 +1804,11 @@ def main():
     ai_menu = pystray.Menu(
         pystray.MenuItem("Switch to Anthropic Claude",       _on_switch_anthropic,
                          checked=lambda i: _active_llm_backend() == "anthropic"),
-        pystray.MenuItem("Switch to Local LLM (qwen2.5:14b)", _on_switch_qwen,
-                         checked=lambda i: _active_llm_backend().startswith("qwen")),
-        pystray.MenuItem("Switch to Local LLM (llama3.1:8b)", _on_switch_llama,
-                         checked=lambda i: _active_llm_backend().startswith("llama")),
+        # One resolver-backed local item — no hard-coded tags in labels or
+        # commands (2026-07-21 audit; the monolith picks the concrete model).
+        pystray.MenuItem("Switch to Local LLM (default)",    _on_switch_local,
+                         checked=lambda i: _active_llm_backend()
+                         not in ("", "anthropic")),
         pystray.MenuItem("Switch to Local LLM (other…)",     _on_switch_other_llm),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Debug Mode",                       _on_toggle_debug_mode,

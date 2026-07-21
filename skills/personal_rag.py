@@ -295,6 +295,24 @@ def register(actions: dict) -> None:
     if rag is None:
         return  # core module not importable — actions still registered for status
 
+    # Push core.config's RAG_* knobs into the indexer. Without this the
+    # constants in core/config.py (and their data/user_settings.json
+    # overrides) are dead config: core.rag_indexer keeps independent
+    # module-level defaults and the only other configure() caller is the
+    # manual rag_configure voice action. Safe at register time — no
+    # embedder/reranker/collection singleton exists yet, so the
+    # invalidation branches in rag_indexer.configure() are no-ops.
+    try:
+        from core import config as _cfg
+        rag.configure(
+            rag_index_paths=list(getattr(_cfg, "RAG_INDEX_PATHS", rag.RAG_INDEX_PATHS)),
+            rag_embed_model=getattr(_cfg, "RAG_EMBED_MODEL", rag.RAG_EMBED_MODEL),
+            rag_ollama_endpoint=getattr(_cfg, "RAG_OLLAMA_ENDPOINT", rag.RAG_OLLAMA_ENDPOINT),
+            rag_reranker_model=getattr(_cfg, "RAG_RERANKER_MODEL", rag.RAG_RERANKER_MODEL),
+        )
+    except Exception as e:
+        print(f"  [personal-rag] config push failed (using indexer defaults): {e}")
+
     if RAG_AUTOSTART and rag.is_available():
         def _bg():
             try:

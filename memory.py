@@ -16,6 +16,7 @@ Storage:
 
 Public API:
   record_voice_command(text)              — log accepted user utterance
+  forget_voice_commands_since(cutoff_ts)  — purge logged commands in a window
   get_patterns()                          — list of detected habit dicts
   maybe_pattern_offer()                   — JARVIS-style offer string
   record_session_summary(summary, ...)    — append one session-level summary
@@ -217,6 +218,43 @@ def record_voice_command(text: str, active_app: str | None = None) -> None:
     if _writes_since_rotate[0] >= 100:
         _writes_since_rotate[0] = 0
         _maybe_rotate()
+
+
+def forget_voice_commands_since(cutoff_ts: float) -> int:
+    """Drop voice-command log entries recorded at or after ``cutoff_ts``
+    (epoch seconds). voice_commands.jsonl holds the user's verbatim last-hour
+    speech, so a 'forget the last hour' that skipped it left the exact
+    material the owner asked to erase (2026-07-21 audit — same gap as the
+    LTM episode log, one store over).
+
+    Atomic rewrite via the same tmp + os.replace pattern as _maybe_rotate,
+    under _log_lock. Entries without a parseable ts are KEPT (legacy
+    convention: old entries survive a time-window forget). Exceptions
+    propagate so the caller can disclose a failed purge. Returns the number
+    of entries dropped."""
+    with _log_lock:
+        if not os.path.exists(_LOG_FILE):
+            return 0
+        with open(_LOG_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        keep = []
+        dropped = 0
+        for line in lines:
+            ts = None
+            try:
+                ts = float(json.loads(line).get("ts"))
+            except Exception:
+                ts = None           # unparseable / ts-less → treated as old
+            if ts is not None and ts >= cutoff_ts:
+                dropped += 1
+                continue
+            keep.append(line)
+        if dropped:
+            tmp = _LOG_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.writelines(keep)
+            os.replace(tmp, _LOG_FILE)
+        return dropped
 
 
 def _maybe_rotate() -> None:

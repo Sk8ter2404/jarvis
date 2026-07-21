@@ -294,6 +294,17 @@ def _publish_runtime(rt) -> Any:
             now0 = time.monotonic()
             _last_body_frame_at[0] = now0
             _last_color_frame_at[0] = now0
+            # Seed the per-stream seen-cells from THIS runtime's current frame
+            # times: a reopened instance must neither register a spurious "new
+            # frame" off its just-verified first frames nor be masked by the dead
+            # instance's older perf_counter stamps (perf_counter is process-wide,
+            # so cross-instance comparisons are meaningless).
+            for _attr, _cell in (("_last_color_frame_time", _color_time_seen),
+                                 ("_last_body_frame_time", _body_time_seen)):
+                try:
+                    _cell[0] = float(getattr(rt, _attr, 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    _cell[0] = 0.0
             winner = rt
             adopt_loser = False
     if adopt_loser:
@@ -459,6 +470,52 @@ def available() -> tuple[bool, str]:
 # returns a numpy array (or None). numpy/cv2 are imported lazily inside the
 # functions so module import stays dependency-free on a sensorless / CI host.
 
+# BRIDGE-DERIVED FRESHNESS (2026-07-21 audit: "staleness/self-heal is a no-op").
+# The installed pykinect2 build assigns `_last_color_frame_access` /
+# `_last_body_frame_access` as bare LOCALS inside its get_last_* methods (no
+# `self.`), so has_new_color_frame()/has_new_body_frame() — which compare the
+# advancing `self._last_*_frame_time` against the never-updated __init__ access
+# stamp — are permanently True once ONE frame of that stream has ever arrived.
+# Everything the bridge built on those flags (the `had_new` color stamp, the
+# body `pending` gate, both staleness clocks, and thus reset_if_body_stale) was
+# therefore a no-op on a wedged/unplugged sensor: frozen frames served forever,
+# presence asserting a departed person, no self-heal reopen. The
+# `_last_*_frame_time` attrs ARE trustworthy — handle_*_arrived() advances them
+# only on real frame arrival — so the bridge now tracks its own last-consumed
+# frame time per stream and derives "a genuinely new frame is pending" from the
+# time ADVANCING past that stamp. On runtimes without the timestamp attrs (test
+# fakes / foreign builds) the helper degrades to the has_new_* flag, keeping
+# clear-on-read builds working unchanged.
+_color_time_seen = [0.0]           # last _last_color_frame_time this bridge served
+_body_time_seen = [0.0]            # last _last_body_frame_time this bridge consumed
+
+
+def _frame_time_advanced(rt, time_attr: str, flag_attr: str,
+                         cell: list) -> tuple[bool, Optional[float]]:
+    """(advanced, t) for one stream: `advanced` is True iff a GENUINELY new
+    frame is pending — the runtime's `time_attr` (e.g. _last_color_frame_time)
+    has advanced past `cell[0]`, the last value this bridge consumed. `t` is the
+    runtime's current frame time so the CALLER can stamp `cell[0] = t` when it
+    actually serves/consumes the frame (None when the attr is absent/unusable,
+    in which case the verdict came from the `flag_attr` readiness flag fallback
+    and there is nothing to stamp). NEVER raises."""
+    try:
+        t = getattr(rt, time_attr, None)
+        if t is not None:
+            try:
+                t = float(t)
+            except (TypeError, ValueError):
+                t = None
+        if t is None:
+            # No usable timestamp on this build → trust the readiness flag
+            # (correct on clear-on-read builds and the test fakes).
+            flag = getattr(rt, flag_attr, None)
+            return (bool(flag()) if callable(flag) else False), None
+        return (t > cell[0]), t
+    except Exception:   # pragma: no cover - defensive: odd runtime attr
+        return False, None
+
+
 def get_color_bgr(require_new: bool = True):
     """Latest color frame as a (1080, 1920, 3) BGR uint8 ndarray, or None.
 
@@ -485,7 +542,12 @@ def get_color_bgr(require_new: bool = True):
         # require_new=False prime — so "color is stale" could NEVER become true on a
         # fully-dead sensor and the both-plane stale-reset never fired. Stamp ONLY
         # when had_new; still SERVE the re-served buffer for require_new=False peeks.
-        had_new = rt.has_new_color_frame()
+        # `had_new` is BRIDGE-DERIVED from _last_color_frame_time advancing (see
+        # _frame_time_advanced): the installed build's has_new_color_frame() is
+        # permanently True after the first frame ever, which silently defeated
+        # this whole gate (2026-07-21 audit).
+        had_new, ct = _frame_time_advanced(
+            rt, "_last_color_frame_time", "has_new_color_frame", _color_time_seen)
         if require_new and not had_new:
             return None
         flat = rt.get_last_color_frame()
@@ -497,8 +559,12 @@ def get_color_bgr(require_new: bool = True):
         bgra = arr.reshape((1080, 1920, 4))
         # Stamp the COLOR staleness clock ONLY on a real new frame (the preview-keep-
         # alive fix): a re-served stale buffer must NOT count as the color stream
-        # being live, or the both-plane stale-reset can never fire (H1).
+        # being live, or the both-plane stale-reset can never fire (H1). Also stamp
+        # the seen-cell in BOTH require_new modes (the ~30 Hz pump prime is the
+        # usual warmer) so a frozen frame time reads as consumed exactly once.
         if had_new:
+            if ct is not None:
+                _color_time_seen[0] = ct
             note_color_frame_seen()
         return bgra[:, :, :3]   # BGRA → BGR (drop alpha)
     except Exception:   # pragma: no cover - defensive: mid-stream frame glitch
@@ -661,8 +727,15 @@ def _read_and_cache_bodies(consume: bool = True) -> list[dict]:
     if rt is None:
         return []
     try:
-        has_new = getattr(rt, "has_new_body_frame", None)
-        pending = callable(has_new) and has_new()
+        # BRIDGE-DERIVED pending (2026-07-21 audit): the installed build's
+        # has_new_body_frame() is permanently True after the first frame ever
+        # (bare-local access-stamp bug), which made this gate re-parse the frozen
+        # _body_frame_bodies and re-stamp the staleness clock forever on a wedged
+        # sensor. Derive "a new frame is pending" from _last_body_frame_time
+        # advancing past what we last consumed; degrade to the flag on builds
+        # without the timestamp attr (see _frame_time_advanced).
+        pending, bt = _frame_time_advanced(
+            rt, "_last_body_frame_time", "has_new_body_frame", _body_time_seen)
         if not pending:
             # No new frame to consume this tick — serve a still-fresh cache so two
             # readers in the same frame don't see []; else nothing to report.
@@ -686,8 +759,12 @@ def _read_and_cache_bodies(consume: bool = True) -> list[dict]:
                 return list(cached)
             return []
         # We ARE going to consume the frame (the pump, or a pump-less lone consumer).
-        # Stamp the staleness clock (PART B) so an actively-read, healthy stream
+        # Stamp the seen-cell ONLY on this consume path (the H3 non-consuming
+        # fallback above leaves the frame — and the cell — pending for the pump)
+        # and the staleness clock (PART B) so an actively-read, healthy stream
         # never trips the stale-reset, then take the single frame (clears the flag).
+        if bt is not None:
+            _body_time_seen[0] = bt
         note_body_frame_seen()
         frame = rt.get_last_body_frame()
     except Exception:   # pragma: no cover - defensive: mid-stream readiness/getter glitch
@@ -897,17 +974,33 @@ def _body_is_facing(joints: dict) -> Optional[bool]:
     """Rough 'is this body facing the sensor' heuristic, or None if we can't
     tell. We don't have HD-face orientation in scope, so approximate: the head
     is present AND sits above the spine (upright torso) AND both shoulders are
-    roughly equidistant in z (chest toward the camera rather than side-on)."""
+    roughly equidistant in z (chest toward the camera rather than side-on).
+
+    FAIL-TO-NONE CONTRACT (2026-07-21 audit — the last un-migrated copy of the
+    2026-07-15 ghost-audit joint-reliability gate): every joint read is gated on
+    _joint_reliable, mirroring _joint_distance / _body_facing_yaw. A NotTracked
+    zero-fill (0,0,0) head or shoulder used to fabricate a confident WRONG False
+    (`0.0 > spine.y` reads as slumped; `|0.0 - z|` reads as side-on), which
+    demoted the real owner to the worst facing_rank in the gesture owner-pick
+    and misreported get_presence()['facing']. When the head/spine references
+    aren't reliably tracked we return None (unknown) — never a guess; the
+    downstream any()-aggregation and facing_rank sort already handle None. The
+    shoulder z-gap term is used only when BOTH shoulders are reliable,
+    otherwise the verdict falls back to upright-only."""
     head = joints.get("head")
-    spine = joints.get("spine_shoulder") or joints.get("spine_mid")
-    if head is None or spine is None:
+    spine = joints.get("spine_shoulder")
+    if not _joint_reliable(spine):
+        # Reliability-aware fallback: a present-but-unreliable spine_shoulder
+        # must not block fall-through to a reliable spine_mid.
+        spine = joints.get("spine_mid")
+    if not _joint_reliable(head) or not _joint_reliable(spine):
         return None
     # Kinect camera-space y increases UPWARD, so an upright person has
     # head.y > spine.y.
     upright = head[1] > spine[1]
     sl = joints.get("shoulder_left")
     sr = joints.get("shoulder_right")
-    if sl is not None and sr is not None:
+    if _joint_reliable(sl) and _joint_reliable(sr):
         # Side-on bodies show a big z-gap between the two shoulders; facing
         # bodies show both shoulders at a similar depth.
         shoulder_facing = abs(float(sl[2]) - float(sr[2])) < 0.30
@@ -1509,6 +1602,11 @@ def reset_if_body_stale(now: Optional[float] = None) -> bool:
         stamp = time.monotonic() if now is None else now
         _last_body_frame_at[0] = stamp
         _last_color_frame_at[0] = stamp
+        # Zero the per-stream seen-cells: the dead instance's frame-time stamps
+        # must not carry over to the reopened one (_publish_runtime re-seeds them
+        # from the fresh instance on the next successful open).
+        _color_time_seen[0] = 0.0
+        _body_time_seen[0] = 0.0
         print("  [kinect] body AND color streams stale > "
               f"{BODY_STALE_RESET_SEC:.0f}s - resetting runtime to reopen a live "
               "stream")

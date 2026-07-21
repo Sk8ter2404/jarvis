@@ -1331,7 +1331,14 @@ def _act_force_backup(_: str = "") -> str:
 def _act_reset_memory(_: str = "") -> str:
     """Snapshot bobert_memory.json to backups/, then re-initialise it
     to the empty schema. Destructive — but the backup is unconditional,
-    so the user can restore by copying the file back."""
+    so the user can restore by copying the file back.
+
+    Also wipes the tiered long-term store (core/long_term_memory:
+    facts.json + chroma + episodes.jsonl, with its own pre_reset backup):
+    _ltm_context() retrieves from that store every turn, so leaving it
+    intact made a confirmed wipe a lie — JARVIS kept reciting the facts it
+    just claimed to have erased (2026-07-21 audit). A failed LTM wipe is
+    DISCLOSED in the reply, never silent."""
     bc = _bc()
     try:
         with bc._memory_lock:
@@ -1347,9 +1354,21 @@ def _act_reset_memory(_: str = "") -> str:
                 except Exception as e:
                     return f"backup failed, refused to wipe: {e}"
             bc.save_memory(bc._empty_memory())
+        # Long-term store wipe runs OUTSIDE bc._memory_lock so it can't nest
+        # with long_term_memory._lock (reset_all takes its own lock).
+        try:
+            from core import long_term_memory as ltm
+            n = ltm.reset_all()
+            ltm_note = (f" + {n} long-term fact(s) cleared "
+                        f"(backup -> data/long_term_memory/backups)")
+        except Exception as le:
+            ltm_note = (f" — WARNING: the long-term semantic store was NOT "
+                        f"cleared ({le}); recorded facts and the "
+                        f"conversation log remain")
         if existed:
-            return f"memory reset (backup -> backups/{os.path.basename(backup_path)})"
-        return "memory was already empty"
+            return (f"memory reset (backup -> backups/"
+                    f"{os.path.basename(backup_path)}){ltm_note}")
+        return f"memory was already empty{ltm_note}"
     except Exception as e:
         return f"reset_memory failed: {e}"
 
@@ -1562,10 +1581,16 @@ def _entry_ts(entry: dict) -> float:
 
 
 def _act_forget_last_hour(_: str = "") -> str:
-    """Drop topics/sessions whose timestamp falls in the last hour.
-    Facts/projects are intentionally NOT touched — those are durable
-    knowledge, not session traces. Held under _memory_lock so it can't
-    race with learn_from_turn."""
+    """Drop the last hour's traces from EVERY conversation store:
+    bobert_memory.json topics/sessions, the tiered LTM store (verbatim
+    episodes.jsonl turn log, semantic facts created in the window, the
+    in-process working turns) and the voice-command pattern log.
+    Facts/projects in bobert_memory are intentionally NOT touched — those
+    are durable knowledge, not session traces. The bobert prune is held
+    under _memory_lock so it can't race with learn_from_turn; the LTM
+    purge runs outside it (long_term_memory takes its own lock). A failed
+    purge of any store is DISCLOSED in the reply — silently leaving the
+    hour on disk was the 2026-07-21 audit bug."""
     bc = _bc()
     try:
         # Numeric epoch cutoff. Entries carry a float ts=time.time() written
@@ -1585,12 +1610,42 @@ def _act_forget_last_hour(_: str = "") -> str:
                              if _entry_ts(s) < cutoff]
             removed = (len(old_topics) - len(kept_topics)
                        + len(old_sessions) - len(kept_sessions))
-            if removed == 0:
-                return "nothing recent enough to forget"
-            mem["topics"]  = kept_topics
-            mem["sessions"] = kept_sessions
-            bc.save_memory(mem)
-        return f"forgot {removed} item(s) from the last hour"
+            if removed:
+                mem["topics"]  = kept_topics
+                mem["sessions"] = kept_sessions
+                bc.save_memory(mem)
+        # LTM + voice-command purges are deliberately NOT gated behind
+        # removed == 0: bobert_memory can have nothing recent while the
+        # episode log still holds the whole hour verbatim.
+        failures = []
+        ltm_counts = {}
+        try:
+            from core import long_term_memory as ltm
+            ltm_counts = ltm.forget_since(cutoff)
+        except Exception as le:
+            failures.append(f"the conversation log was NOT purged ({le})")
+        vc_removed = 0
+        try:
+            vc_removed = int(
+                bc.pattern_memory.forget_voice_commands_since(cutoff))
+        except Exception as ve:
+            failures.append(f"the voice-command log was NOT purged ({ve})")
+
+        bits = []
+        if removed:
+            bits.append(f"{removed} item(s)")
+        eps = int(ltm_counts.get("episodes", 0) or 0)
+        fcs = int(ltm_counts.get("facts", 0) or 0)
+        if eps:
+            bits.append(f"{eps} logged turn(s)")
+        if fcs:
+            bits.append(f"{fcs} fact(s)")
+        if vc_removed:
+            bits.append(f"{vc_removed} voice command(s)")
+        warn = (" — WARNING: " + "; ".join(failures)) if failures else ""
+        if not bits:
+            return "nothing recent enough to forget" + warn
+        return "forgot " + ", ".join(bits) + " from the last hour" + warn
     except Exception as e:
         return f"forget_last_hour failed: {e}"
 
@@ -2860,24 +2915,39 @@ def _act_switch_llm(arg: str = "") -> str:
         # and never looks at OLLAMA_MODEL. So "switch to qwen2.5:14b" reported
         # success while the box kept answering on gemma4:12b. Repoint the
         # resolver cache the same way skills/model_picker.set_model does — but
-        # ONLY if the tag is actually installed, since pointing the cache at an
-        # uninstalled tag would 404 every turn. If it isn't installed, kick a
+        # ONLY at the CONCRETE installed tag (2026-07-21 audit): the old
+        # base-name installed check passed for any sibling tag, pinning e.g.
+        # 'qwen2.5:14b' while the box only has 'qwen2.5:14b-instruct-q5_K_M' —
+        # a 404 on every later turn with no recovery until restart. Resolve
+        # the request to what Ollama actually has; if nothing matches, kick a
         # background pull and leave the working model in place.
-        installed = False
+        old = _resolved_local()   # the OLD chat tag, before any cache repoint
+        concrete = None
         try:
-            installed = bool(bc._ollama_has_model(tag))
+            concrete = bc._ollama_resolve_model(tag)
         except Exception:
-            installed = False
-        if installed:
+            concrete = None
+        if concrete:
             cache = getattr(bc, "_RESOLVED_LOCAL_LLM_MODEL", None)
             if isinstance(cache, list):
-                cache[0] = tag
+                cache[0] = concrete
             try:
-                bc.LOCAL_LLM_MODEL = tag
+                bc.LOCAL_LLM_MODEL = concrete
             except Exception:
                 pass
-            _publish_backend(tag)
-            return f"switched to ollama / {tag}"
+            # Vision LOCKSTEP (2026-07-21 audit, same rule as set_model):
+            # when vision shared the OLD chat tag, carry it to the new tag —
+            # live only (persist=False: this branch doesn't persist the chat
+            # tag either, so persisting vision alone would desync
+            # user_settings.json on restart). Reuses the ONE helper rather
+            # than minting another copy of the rule.
+            try:
+                from skills.model_picker import _sync_vision_to_chat
+                _sync_vision_to_chat(old, concrete, persist=False, bc=bc)
+            except Exception:
+                pass
+            _publish_backend(concrete)
+            return f"switched to ollama / {concrete}"
         # Not installed yet — pull in the background, keep the current model.
         try:
             bc._ollama_pull_async(tag)
@@ -2886,8 +2956,12 @@ def _act_switch_llm(arg: str = "") -> str:
         _publish_backend(_resolved_local())
         return (f"'{tag}' isn't installed yet, sir — pulling it in the "
                 f"background. Staying on {_resolved_local()} until it's ready.")
+    # Derive the suggestion from config so it can't drift from the shipped
+    # default brain (2026-07-21 audit — it used to name retired tags).
+    from core.config import LOCAL_LLM_MODEL as _local_default
     return (f"unknown backend tag: {tag!r}. "
-            f"Use 'claude' or one of: qwen2.5:14b, llama3.1:8b, mistral, ...")
+            f"Use 'claude', 'ollama' (local default: {_local_default}), or an "
+            f"installed tag (qwen.../llama.../gemma...)")
 
 
 # ─── Vision: find on screen (Phase 4C) ─────────────────────────────────

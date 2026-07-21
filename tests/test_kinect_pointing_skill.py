@@ -287,10 +287,15 @@ class PronounIntegrationTests(_Base):
     def test_is_pronoun_device_command(self):
         mod = self._load()
         for yes in ("turn that on", "turn that off", "that one off",
-                    "switch this on", "that on", "this one on", "Turn That On."):
+                    "switch this on", "that on", "this one on", "Turn That On.",
+                    # 2026-07-21 audit (stale lead-filler rule): Whisper's
+                    # comma wake form and STACKED fillers must match too.
+                    "JARVIS, turn that on", "hey jarvis, that one off",
+                    "could you please turn that off"):
             self.assertTrue(mod.is_pronoun_device_command(yes), yes)
         for no in ("turn off the office light", "turn on the desk lamp",
-                   "set the bedroom to 65", "play music", "", "lights on"):
+                   "set the bedroom to 65", "play music", "", "lights on",
+                   "JARVIS, turn off the office light"):
             self.assertFalse(mod.is_pronoun_device_command(no), no)
 
     def test_resolve_pointing_command_fires_when_active(self):
@@ -381,8 +386,10 @@ class RouterHookTests(_Base):
         fake.is_pronoun_device_command = lambda u: True
         fake.resolve_pointing_command = lambda u: None    # nothing resolved
         self._inject("skills.kinect_pointing", fake)
-        # Force the catalog empty so we hit the deterministic no-catalog branch.
-        with mock.patch.object(shr, "_ensure_catalog", lambda *a, **k: None):
+        # Force the catalog empty so we hit the deterministic no-catalog branch
+        # (live-LAN fallback stubbed to a miss so no real discovery runs).
+        with mock.patch.object(shr, "_ensure_catalog", lambda *a, **k: None), \
+             mock.patch.object(shr, "_live_lan_fallback", lambda u: None):
             out = shr.smart_home_control("turn that on")
         self.assertIn("no smart-home catalog", out.lower())
 
@@ -394,7 +401,8 @@ class RouterHookTests(_Base):
         fake.is_pronoun_device_command = lambda u: False   # not a pronoun
         fake.resolve_pointing_command = lambda u: called.append(u) or "X"
         self._inject("skills.kinect_pointing", fake)
-        with mock.patch.object(shr, "_ensure_catalog", lambda *a, **k: None):
+        with mock.patch.object(shr, "_ensure_catalog", lambda *a, **k: None), \
+             mock.patch.object(shr, "_live_lan_fallback", lambda u: None):
             out = shr.smart_home_control("turn off the office light")
         self.assertEqual(called, [])
         self.assertIn("no smart-home catalog", out.lower())

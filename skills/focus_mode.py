@@ -29,14 +29,16 @@ monolith:
 
 Actions registered
 ───────────────────
-  focus_mode_on / do_not_disturb / quiet_mode
+  focus_mode_on / do_not_disturb / quiet_mode / focus_mode
         Engage. Arg may carry a duration ("30 minutes", "an hour", "45m"); no
         arg = indefinite. Sets focus on, arms an auto-resume Timer if timed.
+        EVERY engage alias first chains the pre-existing dnd_focus_mode engage
+        (Windows Focus Assist / Teams DoNotDisturb) — see _chain_prior below.
   focus_mode_off / resume / end_focus_mode
         Disengage + return a RECAP one-liner of what was missed, then clear the
-        buffer. (end_focus_mode ALSO chains the pre-existing dnd_focus_mode
-        handler of the same name so its Windows-Focus-Assist / Teams-presence
-        teardown still runs — see _chain_prior below.)
+        buffer. EVERY disengage alias first chains the pre-existing
+        dnd_focus_mode teardown so its Windows-Focus-Assist / Teams-presence
+        restore runs no matter which phrase the owner used.
   whats_missed / focus_mode_status
         Report whether focus is on (+ remaining time if timed) and how many
         announcements are held — WITHOUT clearing. A pure status query.
@@ -55,10 +57,17 @@ Coexistence with skills/dnd_focus_mode.py
 dnd_focus_mode.py is a SEPARATE, older DND skill that toggles Windows Focus
 Assist + Teams presence and suppresses a few named skills' nudges. It registers
 `focus_mode`, `end_focus_mode`, `focus_mode_status`. We load alphabetically AFTER
-it (d < f), so to avoid clobbering its OS-level teardown we CHAIN the two names
-we share (`end_focus_mode`, `focus_mode_status`): call its handler first, then
-append our recap/status. Our unique names (focus_mode_on/off, resume,
-do_not_disturb, quiet_mode, whats_missed) never collide.
+it (d < f), so to avoid clobbering its OS-level side effects we capture its
+handlers at register() time and CHAIN them from our BASE handlers: every
+engage-direction alias calls its `focus_mode` first, every disengage-direction
+alias calls its `end_focus_mode` first, and `focus_mode_status` prepends its
+status line. Chaining in the base handlers (2026-07-21 fix) keeps every alias
+symmetric — previously only the shared names chained, so "resume" /
+"focus_mode_off" left Focus Assist, Teams DND and the nudge suppressors stuck
+on until dnd's own expiry thread fired (up to an hour later), and
+"do_not_disturb" / "quiet_mode" never engaged them at all. Our unique names
+(focus_mode_on/off, resume, do_not_disturb, quiet_mode, whats_missed) never
+collide.
 """
 from __future__ import annotations
 
@@ -265,8 +274,9 @@ def _spoken_duration(seconds: int) -> str:
 
 def _chain_prior(actions: dict, name: str):
     """Return the handler already registered under `name` (dnd_focus_mode's, if
-    it loaded first), or None. We call it BEFORE our own logic for the two names
-    we share so its Windows-Focus-Assist / Teams-presence teardown still runs.
+    it loaded first), or None. Our BASE handlers call it before their own logic
+    so dnd's Windows-Focus-Assist / Teams-presence engage/teardown runs on
+    EVERY alias, engage and disengage alike — exactly once per invocation.
     Captured at register() time so a later re-register can't recurse into us."""
     prior = actions.get(name)
     return prior if callable(prior) else None
@@ -282,6 +292,21 @@ def register(actions):
     _prior_engage = _chain_prior(actions, "focus_mode")
 
     def focus_mode_on(args: str = "") -> str:
+        # 2026-07-07 fix (widened 2026-07-21): the phrase "focus mode" routes to
+        # the SHARED name `focus_mode` (dnd_focus_mode's engage), and before the
+        # chain existed it turned on dnd's OS-level Focus Assist but left OUR
+        # announcement-holding gate OFF — notifications were NOT actually held
+        # and `focus_mode_status` reported a contradiction. Chaining now lives
+        # HERE, in the base handler, so every engage alias (focus_mode,
+        # focus_mode_on, do_not_disturb, quiet_mode) fires dnd's engage (Focus
+        # Assist / Teams presence) exactly once, then engages our state too.
+        # Chain-first so dnd's enqueued engage line speaks before our gate
+        # closes. We return OUR message (dnd's return is discarded).
+        if _prior_engage is not None:
+            try:
+                _prior_engage(args)
+            except Exception:
+                pass
         secs = _parse_duration_seconds(args) if args else None
         if secs is not None and secs > 0:
             until = time.time() + secs
@@ -294,7 +319,17 @@ def register(actions):
         _set_focus(True, until=0.0)
         return "Focus mode on, sir — I'll hold notifications until you resume."
 
-    def focus_mode_off(_: str = "") -> str:
+    def focus_mode_off(args: str = "") -> str:
+        # Chain dnd_focus_mode's teardown FIRST (Windows Focus Assist / Teams
+        # presence / nudge suppressors) so no disengage alias — focus_mode_off,
+        # resume, end_focus_mode — leaves its OS-level side effects stuck on.
+        # Safe unconditionally: dnd's _exit_focus_mode is idempotent and just
+        # says "was not active" when it never engaged.
+        if _prior_end is not None:
+            try:
+                _prior_end(args)
+            except Exception:
+                pass
         # Cancel any pending auto-resume first so it can't double-fire.
         _cancel_resume_timer()
         was_active = _is_active()
@@ -309,32 +344,6 @@ def register(actions):
 
     def resume(args: str = "") -> str:
         # 'resume' / 'I'm back' / 'what did I miss' → same as focus_mode_off.
-        return focus_mode_off(args)
-
-    def engage(args: str = "") -> str:
-        # 2026-07-07 fix: the phrase "focus mode" routes to the SHARED name
-        # `focus_mode` (dnd_focus_mode's engage), NOT our `focus_mode_on`. Before
-        # this, saying "focus mode" turned on dnd's OS-level Focus Assist but left
-        # OUR announcement-holding gate OFF — so notifications were NOT actually
-        # held and `focus_mode_status` reported a contradiction (dnd engaged / us
-        # off). Chain dnd's engage (Focus Assist / Teams presence) for side
-        # effects, then engage our state too, so one command does both and status
-        # stays consistent. We return OUR message (dnd's return is discarded).
-        if _prior_engage is not None:
-            try:
-                _prior_engage(args)
-            except Exception:
-                pass
-        return focus_mode_on(args)
-
-    def end_focus_mode(args: str = "") -> str:
-        # Chain the pre-existing dnd_focus_mode teardown (Focus Assist / Teams)
-        # first, then return OUR recap so the owner hears what he missed.
-        if _prior_end is not None:
-            try:
-                _prior_end(args)
-            except Exception:
-                pass
         return focus_mode_off(args)
 
     def whats_missed(_: str = "") -> str:
@@ -383,11 +392,13 @@ def register(actions):
     actions["focus_mode_off"] = focus_mode_off
     actions["resume"]         = resume
     actions["whats_missed"]   = whats_missed
-    # Shared names — chained to preserve dnd_focus_mode's OS-level behaviour.
-    actions["focus_mode"]        = engage
-    actions["end_focus_mode"]    = end_focus_mode
+    # Shared names — same base handlers. Chaining lives IN the base handlers,
+    # so every alias fires dnd_focus_mode's engage/teardown exactly once.
+    actions["focus_mode"]        = focus_mode_on
+    actions["end_focus_mode"]    = focus_mode_off
     actions["focus_mode_status"] = focus_mode_status
 
     print("  [focus_mode] ready — actions: focus_mode_on / do_not_disturb / "
-          "quiet_mode / focus_mode_off / resume / whats_missed "
-          "(+ chained end_focus_mode / focus_mode_status)")
+          "quiet_mode / focus_mode / focus_mode_off / resume / end_focus_mode "
+          "/ whats_missed / focus_mode_status (dnd_focus_mode chained on every "
+          "engage + disengage alias)")

@@ -28,6 +28,15 @@ _TESTS = os.path.join(_ROOT, "tests")
 def _run_suite() -> bool:
     if _ROOT not in sys.path:
         sys.path.insert(0, _ROOT)
+    # Same live-box guards as tools/run_tests.py (imported, not copied — one
+    # implementation, no stale duplicate): point settings AND the whole data/
+    # dir at throwaways BEFORE any test is imported, so a forgotten per-test
+    # path redirect can't clobber the owner's live runtime state (the ecobee
+    # token-file incident, 2026-07-21). Both respect external overrides.
+    from tools.run_tests import (_redirect_data_dir_to_throwaway,
+                                 _redirect_settings_to_throwaway)
+    _redirect_settings_to_throwaway()
+    _redirect_data_dir_to_throwaway()
     loader = unittest.TestLoader()
     suite = loader.discover(start_dir=_TESTS, pattern="test_*.py",
                             top_level_dir=_ROOT)

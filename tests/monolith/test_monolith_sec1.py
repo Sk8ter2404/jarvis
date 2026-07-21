@@ -756,6 +756,66 @@ class LearnFromTurnTests(_MonolithTestBase):
             self.bc.learn_from_turn("x", "y", mem)
         mmerge.assert_not_called()  # no "{" → early return before merge
 
+    def test_worker_builds_dedupe_block_from_fresh_load_not_caller_snapshot(self):
+        # REGRESSION (2026-07-21 audit #38): the extractor's 'Existing facts
+        # (do NOT duplicate…)' block used to be rendered from the CALLER's
+        # memory dict — main()'s boot-time snapshot, never reassigned — so
+        # every fact learned during the session was invisible to the extractor
+        # and it kept re-proposing paraphrases (merge_memory dedup is
+        # exact-string only). The worker must build the block from a fresh
+        # load_memory() instead, same as the prompt-rebuild Timer fix.
+        captured = []
+
+        def fake_llm(system, user, max_tokens=250):
+            captured.append(system)
+            return "no json"       # stop before merge; we only want the prompt
+
+        caller_snapshot = {"facts": ["stale boot fact"],
+                           "projects": ["stale boot project"]}
+        disk_truth = {"facts": ["User has a dog"],
+                      "projects": ["Building a shed"]}
+        with mock.patch.object(self.bc, "LEARN_EVERY_TURN", True), \
+             mock.patch.object(self.bc.threading, "Thread", _InlineThread), \
+             mock.patch.object(self.bc, "load_memory",
+                               return_value=disk_truth) as mload, \
+             mock.patch.object(self.bc, "_llm_quick", side_effect=fake_llm), \
+             mock.patch.object(self.bc, "merge_memory") as mmerge:
+            self.bc.learn_from_turn("x", "y", caller_snapshot)
+        mload.assert_called_once()
+        self.assertEqual(len(captured), 1)
+        self.assertIn("- User has a dog", captured[0])
+        self.assertIn("- Building a shed", captured[0])
+        self.assertNotIn("stale boot fact", captured[0])
+        self.assertNotIn("stale boot project", captured[0])
+        mmerge.assert_not_called()
+
+    def test_worker_dedupe_block_is_per_call_fresh_not_frozen(self):
+        # Second half of the audit-#38 regression: the list must be fresh on
+        # EVERY call, not merely fresher-than-boot — a fact learned between
+        # two turns has to show up in the second turn's extractor prompt.
+        captured = []
+
+        def fake_llm(system, user, max_tokens=250):
+            captured.append(system)
+            return "no json"
+
+        snapshot = {"facts": ["stale boot fact"], "projects": []}
+        loads = [{"facts": ["User has a dog"], "projects": []},
+                 {"facts": ["User has a dog", "User plays chess"],
+                  "projects": []}]
+        with mock.patch.object(self.bc, "LEARN_EVERY_TURN", True), \
+             mock.patch.object(self.bc.threading, "Thread", _InlineThread), \
+             mock.patch.object(self.bc, "load_memory",
+                               side_effect=lambda: loads.pop(0)), \
+             mock.patch.object(self.bc, "_llm_quick", side_effect=fake_llm), \
+             mock.patch.object(self.bc, "merge_memory"):
+            self.bc.learn_from_turn("turn one", "reply one", snapshot)
+            self.bc.learn_from_turn("turn two", "reply two", snapshot)
+        self.assertEqual(len(captured), 2)
+        self.assertNotIn("User plays chess", captured[0])
+        self.assertIn("- User plays chess", captured[1])
+        self.assertIn("- User has a dog", captured[1])
+
 
 # ──────────────────────────────────────────────────────────────────────────
 #  Action error / history / session-action bookkeeping

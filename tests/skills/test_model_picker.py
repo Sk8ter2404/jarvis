@@ -28,6 +28,7 @@ from skills import model_picker as M
 # a future unmocked persistence test can't clobber the owner's real settings.
 _SAVED_SETTINGS_ENV: "str | None" = None
 _SETTINGS_TMPDIR: "str | None" = None
+_SAVED_CFG: dict = {}
 
 
 def setUpModule() -> None:
@@ -36,6 +37,15 @@ def setUpModule() -> None:
     _SETTINGS_TMPDIR = tempfile.mkdtemp(prefix="jarvis_model_picker_test_")
     os.environ["JARVIS_SETTINGS_PATH"] = os.path.join(
         _SETTINGS_TMPDIR, "test_user_settings.json")
+    # set_model/set_brain LIVE-mutate core.config (LOCAL_LLM_MODEL /
+    # LOCAL_VISION_MODEL / MODEL_ROUTING["chat"]) by design. Snapshot + restore
+    # them at module scope so this suite can't leak a fake tag into other test
+    # modules that read core.config in the same process (e.g. the
+    # model-catalog default-brain invariant). 2026-07-21.
+    import core.config as cfg
+    _SAVED_CFG["LOCAL_LLM_MODEL"] = cfg.LOCAL_LLM_MODEL
+    _SAVED_CFG["LOCAL_VISION_MODEL"] = cfg.LOCAL_VISION_MODEL
+    _SAVED_CFG["MODEL_ROUTING"] = dict(cfg.MODEL_ROUTING)
 
 
 def tearDownModule() -> None:
@@ -43,6 +53,10 @@ def tearDownModule() -> None:
         os.environ.pop("JARVIS_SETTINGS_PATH", None)
     else:
         os.environ["JARVIS_SETTINGS_PATH"] = _SAVED_SETTINGS_ENV
+    import core.config as cfg
+    cfg.LOCAL_LLM_MODEL = _SAVED_CFG["LOCAL_LLM_MODEL"]
+    cfg.LOCAL_VISION_MODEL = _SAVED_CFG["LOCAL_VISION_MODEL"]
+    cfg.MODEL_ROUTING = _SAVED_CFG["MODEL_ROUTING"]
 
 # The installed models on the dev box (per the task brief): three CHAT models,
 # one VISION model, one EMBEDDING model.
@@ -52,6 +66,10 @@ CHAT_8B = "llama3.1:8b-instruct-q5_K_M"
 VISION = "qwen2.5vl:7b"
 EMBED = "nomic-embed-text"
 ALL_TAGS = [CHAT_32B, CHAT_14B, CHAT_8B, VISION, EMBED]
+
+# A MULTIMODAL chat tag (gemma4 family serves chat AND vision) — used by the
+# vision-lockstep tests; it must pass the chat filter (no _VISION_MARKERS hit).
+GEMMA_MM = "gemma4:12b"
 
 
 # ─── Ollama /api/tags faking ───────────────────────────────────────────────
@@ -340,6 +358,90 @@ class SetModelRejectTests(unittest.TestCase):
         with _patch_tags():
             out = M.set_model("")
         self.assertIn("which model", out.lower())
+
+
+# ─── set_model: vision LOCKSTEP (2026-07-21 audit) ──────────────────────────
+class VisionLockstepTests(unittest.TestCase):
+    """set_model must carry LOCAL_VISION_MODEL along when — and ONLY when —
+    vision shared the OLD chat tag (the shipped one-multimodal-brain config)
+    and the NEW tag can see. Before the 2026-07-21 audit the lockstep that
+    core/config.py:337-342 mandates was never enforced by any switch site, so
+    a voice switch off the shared tag silently killed local vision (the
+    co-load guard refused every call) until restart or a hand-edited JSON."""
+
+    def setUp(self):
+        import core.config as cfg
+        self._saved_vis = cfg.LOCAL_VISION_MODEL
+        self._saved_llm = cfg.LOCAL_LLM_MODEL
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        import core.config as cfg
+        cfg.LOCAL_VISION_MODEL = self._saved_vis
+        cfg.LOCAL_LLM_MODEL = self._saved_llm
+
+    @staticmethod
+    def _patch_show(capabilities):
+        """Patch requests.post (the /api/show capabilities probe) on the
+        module so _is_multimodal never touches a real Ollama."""
+        resp = mock.Mock()
+        resp.ok = True
+        resp.json = mock.Mock(return_value={"capabilities": list(capabilities)})
+        return mock.patch.object(M.requests, "post", return_value=resp)
+
+    def test_shared_brain_switch_syncs_vision_live_and_persisted(self):
+        import core.config as cfg
+        store = {}
+        tags = [GEMMA_MM, CHAT_14B, CHAT_8B, VISION, EMBED]
+        bc = _fake_monolith(resolved=CHAT_14B, local_model=CHAT_14B)
+        bc.LOCAL_VISION_MODEL = CHAT_14B          # vision shares the OLD brain
+        with _patch_tags(tags), self._patch_show(["completion", "vision"]), \
+                _MonolithCtx(bc), _patch_persist(store):
+            M.set_model(GEMMA_MM)
+        # LIVE: monolith global AND core.config both repointed.
+        self.assertEqual(bc.LOCAL_VISION_MODEL, GEMMA_MM)
+        self.assertEqual(cfg.LOCAL_VISION_MODEL, GEMMA_MM)
+        # PERSISTED: BOTH keys written so the pair survives a restart.
+        self.assertEqual(store.get("LOCAL_LLM_MODEL"), GEMMA_MM)
+        self.assertEqual(store.get("LOCAL_VISION_MODEL"), GEMMA_MM)
+
+    def test_text_only_switch_leaves_vision_and_does_not_persist_it(self):
+        import core.config as cfg
+        store = {}
+        tags = [GEMMA_MM, CHAT_14B, CHAT_8B, VISION, EMBED]
+        bc = _fake_monolith(resolved=GEMMA_MM, local_model=GEMMA_MM)
+        bc.LOCAL_VISION_MODEL = GEMMA_MM          # shared multimodal brain
+        with _patch_tags(tags), self._patch_show(["completion"]), \
+                _MonolithCtx(bc), _patch_persist(store):
+            M.set_model(CHAT_14B)                 # text-only target
+        # Vision stays on the old multimodal tag (degrades with a printed
+        # reason via the residency guards, never silently blinded).
+        self.assertEqual(bc.LOCAL_VISION_MODEL, GEMMA_MM)
+        self.assertEqual(cfg.LOCAL_VISION_MODEL, self._saved_vis)
+        self.assertEqual(store.get("LOCAL_LLM_MODEL"), CHAT_14B)
+        self.assertNotIn("LOCAL_VISION_MODEL", store)
+
+    def test_pinned_separate_vlm_is_never_touched(self):
+        store = {}
+        tags = [GEMMA_MM, CHAT_14B, CHAT_8B, VISION, EMBED]
+        bc = _fake_monolith(resolved=CHAT_14B, local_model=CHAT_14B)
+        bc.LOCAL_VISION_MODEL = VISION            # user-pinned separate VLM
+        with _patch_tags(tags), self._patch_show(["completion", "vision"]), \
+                _MonolithCtx(bc), _patch_persist(store):
+            M.set_model(GEMMA_MM)
+        self.assertEqual(bc.LOCAL_VISION_MODEL, VISION)
+        self.assertNotIn("LOCAL_VISION_MODEL", store)
+
+    def test_is_multimodal_capabilities_then_family_fallback(self):
+        with self._patch_show(["completion", "vision"]):
+            self.assertTrue(M._is_multimodal(CHAT_14B))
+        with self._patch_show(["completion"]):
+            self.assertFalse(M._is_multimodal(CHAT_14B))
+        # Probe down → the known-family fallback decides (gemma4 is
+        # multimodal; a llama instruct tag is not).
+        with mock.patch.object(M.requests, "post", side_effect=OSError("down")):
+            self.assertTrue(M._is_multimodal("gemma4:26b-a4b-it-qat"))
+            self.assertFalse(M._is_multimodal(CHAT_8B))
 
 
 # ─── set_brain: route switch + persist MODEL_ROUTING.chat ───────────────────

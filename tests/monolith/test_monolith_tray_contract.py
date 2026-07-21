@@ -49,10 +49,16 @@ class TrayCommandContractTests(MonolithGlobalsTestCase):
             f"{unhandled}")
 
     def test_open_hud_clears_x_button_latch_before_relaunch(self):
-        """P1-hud reopen bug: after the unified HUD is hidden via its ✕, the
-        persisted 'hidden' latch must be cleared or the relaunched subprocess
-        re-hides itself immediately. The open_hud dispatch branch must call
-        _set_unified_hud_hidden(False) BEFORE _launch_hud()."""
+        """P1-hud reopen bug + 2026-07-21 audit ('Open HUD is a silent no-op
+        after a voice hide HUD'): the open_hud branch must clear BOTH persisted
+        hide latches — the ✕-button 'hidden' flag in unified_hud_state.json AND
+        the voice-hide visible=False in hud_state.json — or the relaunched
+        subprocess re-hides itself immediately from whichever latch was stale.
+        The regression class is 'un-hide rule fixed in one copy, stale in
+        another', so the branch must DELEGATE to core.actions._act_show_hud,
+        the single owner of the un-hide rule (its visible=True +
+        _set_unified_hud_hidden(False) pairing is pinned by
+        tests/test_actions_sec1.py ShowHudTests)."""
         with open(self.bc.__file__, "r", encoding="utf-8") as f:
             src = f.read()
         # Isolate the open_hud elif block (up to the next elif/else/def).
@@ -62,14 +68,26 @@ class TrayCommandContractTests(MonolithGlobalsTestCase):
         self.assertIsNotNone(m, "could not locate the open_hud dispatch block")
         block = m.group(1)
         self.assertIn(
-            "_set_unified_hud_hidden(False)", block,
-            "open_hud must clear the ✕-button 'hidden' latch (P1-hud reopen bug)")
-        # Ordering: the latch clear must precede the relaunch, else the freshly
-        # launched HUD reads hidden=True and hides before the clear lands.
+            "_act_show_hud(", block,
+            "open_hud must delegate to core.actions._act_show_hud — the single "
+            "owner of the un-hide rule (visible=True + ✕-latch clear); a local "
+            "re-implementation is exactly the stale-duplicate class that made "
+            "the tray button a silent no-op after a voice 'hide HUD'")
+        # Ordering 1: the un-hide must precede the relaunch, else the freshly
+        # launched HUD reads the stale latches and hides before the clear lands.
         self.assertLess(
-            block.index("_set_unified_hud_hidden(False)"),
+            block.index("_act_show_hud("),
             block.index("_launch_hud()"),
-            "open_hud must clear the latch BEFORE relaunching the HUD subprocess")
+            "open_hud must un-hide BEFORE relaunching the HUD subprocess")
+        # Ordering 2: the un-hide must come after the HUD_ENABLED flip —
+        # _write_hud_state is a no-op while HUD_ENABLED is False, so calling
+        # _act_show_hud first would silently drop the visible=True write.
+        self.assertIn("HUD_ENABLED = True", block)
+        self.assertLess(
+            block.index("HUD_ENABLED = True"),
+            block.index("_act_show_hud("),
+            "open_hud must flip HUD_ENABLED on BEFORE _act_show_hud, else the "
+            "visible=True write is a no-op and the stale latch survives")
 
 
 @requires_monolith

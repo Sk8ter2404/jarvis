@@ -13,6 +13,12 @@ Resolution order for a target device:
   2. Alexa cookie fallback via `alexapy.AlexaAPI.set_appliance_state` — only
      used if every direct path raises or returns an error.
 
+When the catalog is missing/empty, or a control command matches nothing in
+it, the router falls through to `skills.sh_kasa.smart_home_control` — the
+live-LAN handler (Kasa discovery + Tuya merge) that needs no catalog — before
+refusing, so LAN plugs stay reachable even though this router's registration
+overwrites sh_kasa's under the shared action names (sorted skill-load order).
+
 If a discovered device's brand has no matching `skills/sh_<brand>.py`, a one-
 liner `[TODO: build skill for brand X]` is logged and a self-implementing
 task is appended to `jarvis_todo.md` (idempotent — duplicate markers are
@@ -38,6 +44,7 @@ import importlib
 import json
 import os
 import re
+import sys
 import threading
 import time
 from typing import Any, Callable
@@ -242,9 +249,13 @@ _NUMBER_WORDS = {
 }
 
 # Filler words stripped before device-name matching so 'turn off the office
-# light' and 'turn off office light' both resolve identically.
+# light' and 'turn off office light' both resolve identically. Every wake-word
+# filler needs its comma sibling ("jarvis, ") — Whisper renders the wake word
+# with a comma, and the missing variants were the stale-duplicate bug that
+# broke Controlled mode in core/dispatcher (2026-07-21 audit).
 _FILLER_PREFIXES = (
-    "could you ", "can you ", "please ", "jarvis ", "hey jarvis ",
+    "could you ", "can you ", "please ", "jarvis ", "jarvis, ",
+    "hey jarvis ", "hey jarvis, ",
     "would you ", "for me ", "the ", "a ", "an ",
 )
 
@@ -806,6 +817,57 @@ def _try_pointing_resolution(utterance: str) -> str | None:
         _pointing_hook_active.on = False
 
 
+# ── live-LAN fallback (sh_kasa delegation) ──────────────────────────
+# sh_kasa's own "the LAN is empty too" refusal (skills/sh_kasa.py,
+# smart_home_control). When the fallback reply starts with this, the router's
+# catalog-centric wizard hint should still win. Kept in lockstep with the
+# skill by tests/test_smart_home_router.py (FallbackToLiveLanTests).
+_LAN_NO_DEVICE_PREFIX = "I don't see any controllable smart devices"
+
+
+def _sh_kasa_module() -> Any:
+    """Locate the loaded sh_kasa skill module (its name varies by loader —
+    the monolith registers skills as ``skill_<name>``), mirroring the lookup
+    pattern of skills/sh_kasa._tuya_mod. Returns None when unavailable."""
+    for nm in ("skill_sh_kasa", "sh_kasa", "skills.sh_kasa"):
+        m = sys.modules.get(nm)
+        if m is not None:
+            return m
+    return _import_skill("sh_kasa")
+
+
+def _live_lan_fallback(utterance: str) -> str | None:
+    """Delegate `utterance` to skills/sh_kasa.smart_home_control — the live
+    LAN handler that needs NO catalog (it merges Kasa discovery + the Tuya
+    skill's devices and parses on/off/toggle/status itself).
+
+    2026-07-21 audit (critical): sh_kasa registers that handler under the same
+    action names as this router, but the router loads later (sorted skill
+    order) and overwrites it — so with the Alexa-seeded catalog empty, every
+    LAN smart plug answered "No smart-home catalog yet" despite needing no
+    catalog at all. This fallback keeps the LAN path reachable from the
+    catalog-driven entry point.
+
+    Returns the LAN handler's spoken reply, or None when the LAN path is
+    unavailable, errored, or itself sees no devices — so the caller's own
+    refusal still speaks. Never raises. (No recursion risk: sh_kasa's
+    smart_home_control never calls back into this router.)"""
+    mod = _sh_kasa_module()
+    fn = getattr(mod, "smart_home_control", None) if mod is not None else None
+    if not callable(fn):
+        return None
+    try:
+        reply = fn(utterance)
+    except Exception as e:
+        print(f"  [sh-router] live-LAN fallback failed: {e}")
+        return None
+    if not isinstance(reply, str) or not reply.strip():
+        return None
+    if reply.strip().startswith(_LAN_NO_DEVICE_PREFIX):
+        return None
+    return reply
+
+
 def smart_home_control(utterance: str = "") -> str:
     """Voice / LLM entry point. Parses `utterance`, finds the device(s),
     dispatches via the right brand skill (with Alexa fallback)."""
@@ -824,6 +886,12 @@ def smart_home_control(utterance: str = "") -> str:
 
     catalog = _ensure_catalog()
     if catalog is None or not catalog.get("devices"):
+        # Missing/empty catalog must NOT strand the LAN plugs — sh_kasa's
+        # direct Kasa/Tuya control needs no catalog. Only refuse with the
+        # wizard hint when the live LAN genuinely has nothing either.
+        live = _live_lan_fallback(utterance)
+        if live is not None:
+            return live
         return ("No smart-home catalog yet, sir. "
                 "Say 'discover smart home devices' to run the wizard.")
 
@@ -868,6 +936,11 @@ def smart_home_control(utterance: str = "") -> str:
 
     devices = _resolve_devices(descriptor, catalog, want_type=want_type)
     if not devices:
+        # A device that's on the LAN but missing from the (Alexa-seeded)
+        # catalog is still reachable through the live-LAN path.
+        live = _live_lan_fallback(utterance)
+        if live is not None:
+            return live
         return f"I don't see anything in the catalog matching '{descriptor}', sir."
 
     results = [_dispatch_one(d, action) for d in devices]

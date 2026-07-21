@@ -555,8 +555,11 @@ def point_control_off(_: str = "") -> str:
 # matches when the TARGET is a pronoun (that/this/it/that one/this one), never a
 # named device, so 'turn off the office light' never gets hijacked.
 _PRONOUN_TARGET = r"(?:that|this|it)(?:\s+one)?"
+# Lead-in fillers may STACK ("could you please ...") and the wake word may
+# carry Whisper's comma ("JARVIS, turn that on") — same lead-filler rule as
+# core.lead_fillers, in regex form (2026-07-21 audit, stale-duplicates).
 _PRONOUN_COMMAND_RE = re.compile(
-    r"^\s*(?:could you|can you|please|jarvis|hey jarvis|would you)?\s*"
+    r"^\s*(?:(?:could you|can you|please|jarvis|hey jarvis|would you),?\s+)*"
     r"(?:turn|switch|flip)?\s*"
     r"(?:(?P<on1>on|off)\s+" + _PRONOUN_TARGET + r"|"
     r"" + _PRONOUN_TARGET + r"\s+(?P<on2>on|off))"

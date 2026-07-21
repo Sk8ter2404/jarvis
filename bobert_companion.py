@@ -1358,7 +1358,7 @@ def merge_memory(new_facts=None, new_projects=None, new_topic=""):
 # Phase 3 refactor (2026-05-29): the ~1160-line PC_CONTROL_PROMPT
 # string literal moved verbatim into core/prompts.py. Edit the
 # action catalogue there — that file is the canonical source.
-from core.prompts import PC_CONTROL_PROMPT  # noqa: F401
+from core.prompts import PC_CONTROL_PROMPT, PC_CONTROL_SAFETY_RULES  # noqa: F401
 
 # DYNAMIC LOCAL PROMPT (2026-07-15). The full system prompt is ~30k tokens but
 # the LOCAL model's context is capped at 12-16k by _local_num_ctx() to fit the
@@ -1652,16 +1652,29 @@ def _parse_json_array(text: str) -> list:
 
 
 def learn_from_turn(user_msg: str, ai_reply: str, memory: dict):
-    """Background: extract new facts/projects/topic from this exchange."""
+    """Background: extract new facts/projects/topic from this exchange.
+
+    ``memory`` is accepted (and deliberately IGNORED) for call-site
+    compatibility: the callers pass main()'s boot-time snapshot, which
+    merge_memory never writes back into, so its fact list is frozen at boot
+    and the extractor's 'do not duplicate' block went stale after the first
+    learned fact — it kept re-proposing paraphrases all session (2026-07-21
+    audit). The worker below builds the block from a FRESH load_memory()
+    instead, the same fix the prompt-rebuild Timer already got."""
     if not LEARN_EVERY_TURN:
         return
 
-    # Snapshot existing facts/projects so the extractor can avoid duplicates
-    existing_facts_str    = "\n".join(f"- {f}" for f in memory.get("facts", []))
-    existing_projects_str = "\n".join(f"- {p}" for p in memory.get("projects", []))
-
     def _worker():
         try:
+            # Snapshot existing facts/projects FRESH from disk so the
+            # extractor's dedupe list includes everything learned this
+            # session, not just what was known at boot.
+            with _memory_lock:
+                _mem = load_memory()
+            existing_facts_str    = "\n".join(
+                f"- {f}" for f in _mem.get("facts", []))
+            existing_projects_str = "\n".join(
+                f"- {p}" for p in _mem.get("projects", []))
             system = (
                 "You extract long-term memory items from a conversation turn. "
                 "Output ONLY valid JSON in this exact shape, nothing else:\n"
@@ -2766,9 +2779,11 @@ def _launch_hud():
 
     2026-05-30: repointed from the old slim corner ring (hud/jarvis_hud.py) to
     the unified, draggable/resizable, feature-packed HUD. The unified HUD
-    ignores extra launcher args (--role/--state-file) via parse_known_args and
-    restores its own saved geometry, so the blue/green per-role plumbing below
-    is harmless — the saved position simply wins on a normal boot."""
+    honours the blue/green plumbing below: --state-file repoints its state +
+    control + geometry files into the role's data dir (so a staging HUD never
+    reads prod state or clobbers prod geometry) and --role != "prod" renders
+    the STAGING badge. On a normal prod boot both keep their prod defaults and
+    the HUD's own saved geometry still wins over the first-launch anchor."""
     global _hud_process
     if not HUD_ENABLED:
         return
@@ -3321,12 +3336,19 @@ def _dispatch_tray_command(cmd: str, entry: dict) -> None:
         _shutdown_hud()
         if not HUD_ENABLED:
             HUD_ENABLED = True
-        # Clear a persisted ✕-button hide first, exactly like _act_show_hud —
-        # otherwise the relaunched HUD reads the 'hidden' latch and re-hides
-        # itself immediately, so the tray "Open HUD" appears to do nothing.
+        # Clear BOTH persisted hide latches first by delegating to the show-HUD
+        # action in core.actions — the single owner of the un-hide rule. It
+        # writes visible=True to hud_state.json (undoing a voice "hide HUD",
+        # whose stale visible=False otherwise makes the relaunched HUD re-hide
+        # itself on its first refresh) AND clears the ✕-button 'hidden' latch
+        # in unified_hud_state.json. Must run AFTER the HUD_ENABLED flip above
+        # (the hud-state write is a no-op while HUD_ENABLED is False) and
+        # BEFORE the relaunch below so the fresh subprocess can't read stale
+        # state. The returned confirmation string is discarded — the tray path
+        # doesn't speak.
         try:
-            from core.actions import _set_unified_hud_hidden
-            _set_unified_hud_hidden(False)
+            from core.actions import _act_show_hud
+            _act_show_hud("")
         except Exception:
             pass
         _launch_hud()
@@ -6508,19 +6530,37 @@ def _refresh_devices(force: bool = False):
         last_sig = _device_cache["last_devices_signature"]
         _reenum_due = (now - _device_cache.get("last_reenum_at", 0.0)
                        >= DEVICE_REENUM_INTERVAL)
-        if (not force and not _reenum_due and last_sig is not None
-                and current_sig is not None
-                and current_sig == last_sig):
+        _sig_unchanged = (not force and not _reenum_due and last_sig is not None
+                         and current_sig is not None
+                         and current_sig == last_sig)
+        # A CLEARED cache is a re-pick REQUEST, not a steady state: the four
+        # invalidating call sites (get_input_device / get_output_device's
+        # stale-index probes, record_speech's failed InputStream open,
+        # _play_audio_safe's playback retry) set in/out=None + checked_at=0.0
+        # expecting the next pass to re-pick. Short-circuiting on an unchanged
+        # signature alone made that invalidation a NO-OP — get_input_device()
+        # then returned None (= the system-default mic) for up to
+        # DEVICE_REENUM_INTERVAL. An unchanged signature still skips the
+        # DESTRUCTIVE reinit below (see the _sig_unchanged branch in the
+        # reinit chain); it must not skip the cheap re-pick. 2026-07-21 audit.
+        _cache_cleared = (_device_cache["in"] is None
+                         or _device_cache["out"] is None)
+        if _sig_unchanged and not _cache_cleared:
             _device_cache["checked_at"] = now
             return
 
         # Pause the wake-word detector's persistent InputStream so PortAudio
         # can be torn down without dangling stream state. resume() reopens
-        # it after we've re-enumerated.
+        # it after we've re-enumerated. Only needed when a destructive reinit
+        # may actually run — the unchanged-signature repick-only fall-through
+        # never tears PortAudio down, so pausing there would just churn the
+        # wake-word stream every DEVICE_CHECK_INTERVAL while the cache is
+        # legitimately empty (no preferred device connected).
         wl = sys.modules.get("skill_wake_listener")
         det = getattr(wl, "_detector", None) if wl is not None else None
         paused_det = None
-        if det is not None and hasattr(det, "pause") and hasattr(det, "is_running"):
+        if (not _sig_unchanged and det is not None
+                and hasattr(det, "pause") and hasattr(det, "is_running")):
             try:
                 if det.is_running():
                     det.pause()
@@ -6550,6 +6590,12 @@ def _refresh_devices(force: bool = False):
                 print("  [audio] device drift detected but TTS playback is "
                       "live — deferring PortAudio reinit to avoid tearing down "
                       "the barge-in stream (0xc0000374).")
+            elif _sig_unchanged:
+                # Cache invalidated but the device list is unchanged — the
+                # cheap _pick_device re-pick below runs over the EXISTING
+                # enumeration; no destructive reinit (and none of its
+                # 0xc0000374 risk) is needed or wanted here. 2026-07-21 audit.
+                pass
             else:
                 try:
                     sd._terminate()
@@ -8649,6 +8695,17 @@ def _reap_wedged_ollama() -> None:
     2026-07-09). Only call when the API is unreachable: any such process is by
     definition not serving. Separate function so tests can mock it (a live
     taskkill during ci_sim would murder the REAL server). Never raises."""
+    # STAGING/TEST GATE (2026-07-21 audit): the staging blue/green candidate
+    # and the unit-test harness share this box with the REAL prod server — a
+    # live taskkill from either murders prod's local brain mid-conversation
+    # (the docstring's ci_sim worry, made structural instead of relying on
+    # every test remembering to mock this function). Same four-signal
+    # sentinel as _warm_up_local_llm_async.
+    if (os.environ.get("JARVIS_STAGING", "").strip() == "1"
+            or os.environ.get("JARVIS_TEST_MODE", "").strip() == "1"
+            or "--staging" in sys.argv
+            or _is_staging()):
+        return
     if os.name != "nt":
         return
     for _img in ("ollama.exe", "llama-server.exe", "ollama app.exe"):
@@ -8677,6 +8734,20 @@ def _ensure_ollama_running(timeout_sec: float = 90.0) -> bool:
     the attempt. Best-effort; never raises. 2026-07-09."""
     if _ollama_alive():
         return True
+    # STAGING GATE (2026-07-21 audit): the staging/blue-green candidate may
+    # OBSERVE the shared server (the fast path above) but must never reap or
+    # spawn it — the staging branch disables tray/mic/cameras yet nothing
+    # gated this boot step, so a staging boot could taskkill prod's ollama
+    # stack mid-conversation. JARVIS_TEST_MODE is deliberately NOT in this
+    # gate (the unit harness sets it suite-wide and tests exercise the real
+    # start-when-down logic with Popen/_reap_wedged_ollama mocked);
+    # _reap_wedged_ollama carries its own harder gate that does include it.
+    if (os.environ.get("JARVIS_STAGING", "").strip() == "1"
+            or "--staging" in sys.argv
+            or _is_staging()):
+        print("  [ollama] server is down but this is the STAGING instance — "
+              "leaving the shared prod server alone (no reap, no spawn).")
+        return False
     exe = None
     try:
         import shutil as _sh
@@ -8695,6 +8766,15 @@ def _ensure_ollama_running(timeout_sec: float = 90.0) -> bool:
         print("  [ollama] server is down and ollama.exe wasn't found — the local "
               "model is unavailable until Ollama is started.")
         return False
+    # CONFIRM THE OUTAGE before escalating to a reap (2026-07-21 audit): a
+    # single 2s /api/tags timeout is a BLIP, not a wedge — the probe times out
+    # exactly when the server is busiest (a ~21GB model load, post-reboot CUDA
+    # discovery), and reaping then taskkills a HEALTHY stack. Re-probe a few
+    # times over ~12s and bail back to the fast path if it answers.
+    for _probe in range(3):
+        time.sleep(4.0)
+        if _ollama_alive():
+            return True
     # WEDGED-server reap (see _reap_wedged_ollama): a hung ollama would block
     # the fresh `ollama serve` from binding :11434, so clear it first.
     _reap_wedged_ollama()
@@ -8813,13 +8893,21 @@ def _get_local_llm_model() -> str:
     """Resolve which Ollama tag the local-LLM fallback should target.
 
     Priority order:
-      1. JARVIS_LOCAL_LLM_MODEL env var (non-empty after stripping).
-      2. First entry in _LOCAL_LLM_PREFERENCE that's installed locally
+      1. JARVIS_LOCAL_LLM_MODEL env var (non-empty after stripping) — the
+         documented A/B / low-VRAM escape hatch always wins.
+      2. The owner's PERSISTED pick: LOCAL_LLM_MODEL when it differs from
+         the shipped default (core.config._SHIPPED_LOCAL_LLM_MODEL) —
+         i.e. the Settings-GUI dropdown / voice `set_model` value that
+         _apply_user_settings restored at boot — provided it's installed
+         (matched exactly, then by bare base name so a `:latest` variant
+         counts). Before the 2026-07-21 audit the preference chain ran
+         first, so the saved choice silently reverted on every restart.
+      3. First entry in _LOCAL_LLM_PREFERENCE that's installed locally
          (matched exactly, then by bare base name so a `:latest` variant
          counts).
-      3. First tag returned by Ollama's /api/tags — any installed model
+      4. First tag returned by Ollama's /api/tags — any installed model
          beats none, even off-list.
-      4. LOCAL_LLM_MODEL — the preferred default. Returned (without
+      5. LOCAL_LLM_MODEL — the preferred default. Returned (without
          caching) when Ollama is unreachable or has zero models, so the
          background pull triggered by _call_local_llm() targets the
          smart model and a finished pull is picked up on the next call.
@@ -8848,6 +8936,31 @@ def _get_local_llm_model() -> str:
 
     if installed:
         installed_set = set(installed)
+        # 2. The owner's persisted pick (Settings GUI / voice set_model, both
+        # land in user_settings.json and are restored onto LOCAL_LLM_MODEL by
+        # core.config._apply_user_settings at boot). "User-set" = differs from
+        # the shipped default, captured ONCE in core.config BEFORE overrides
+        # (never hard-code the tag here — stale-duplicate bug class). Only an
+        # INSTALLED pick is honoured; an uninstalled one falls through to the
+        # preference chain so a box whose saved tag was removed still boots
+        # onto a working brain. 2026-07-21 audit.
+        try:
+            from core import config as _cfg
+            _shipped = getattr(_cfg, "_SHIPPED_LOCAL_LLM_MODEL", LOCAL_LLM_MODEL)
+        except Exception:
+            _shipped = LOCAL_LLM_MODEL
+        user_pick = (LOCAL_LLM_MODEL or "").strip()
+        if user_pick and user_pick != _shipped:
+            if user_pick in installed_set:
+                pick = user_pick
+            else:
+                base = user_pick.split(":", 1)[0]
+                pick = next((n for n in installed if n.split(":", 1)[0] == base), None)
+            if pick:
+                _RESOLVED_LOCAL_LLM_MODEL[0] = pick
+                print(f"  [local-llm] model selected from user settings: `{pick}`")
+                _log_gpu_state(pick)
+                return pick
         for pref in _LOCAL_LLM_PREFERENCE:
             if pref in installed_set:
                 pick = pref
@@ -8902,16 +9015,65 @@ def _next_local_llm_fallback(exclude: str) -> str | None:
 
 
 def _ollama_has_model(model: str) -> bool:
+    """Is `model` ACTUALLY pulled? Exact tag match, allowing only the implicit
+    ":latest" expansion ("m" <-> "m:latest", how Ollama names a bare-name pull).
+
+    Deliberately NOT a base-name match (2026-07-21 audit): matching on the text
+    before ':' returned True for any sibling tag, so _act_switch_llm's
+    "only if installed" guard passed for 'qwen2.5:14b' when only
+    'qwen2.5:14b-instruct-q5_K_M' was pulled — pinning the resolver cache at a
+    tag Ollama 404s on EVERY turn, with no recovery until restart (the empty-
+    response failover only fires on kind='empty', not the 404's kind='fail').
+    Callers that want sibling resolution use _ollama_resolve_model below."""
     try:
         r = requests.get(f"{LOCAL_LLM_BASE_URL}/api/tags", timeout=2)
         if not r.ok:
             return False
-        # Tags can be exact ("llama3.1:8b-instruct-q5_K_M") or carry the
-        # implicit ":latest" suffix when the user pulled by bare name.
         names = {m.get("name", "") for m in r.json().get("models", [])}
-        return model in names or any(n.split(":", 1)[0] == model.split(":", 1)[0] for n in names)
+        if model in names:
+            return True
+        if ":" not in model:
+            return f"{model}:latest" in names
+        if model.endswith(":latest"):
+            return model[: -len(":latest")] in names
+        return False
     except Exception:
         return False
+
+
+def _ollama_resolve_model(model: str) -> str | None:
+    """Resolve a requested tag to the CONCRETE installed tag, or None.
+
+    Order: exact match, then the bare-name <-> ":latest" equivalence, then the
+    first installed tag denoting the SAME model per skills.model_picker's
+    size-token-aware _same_model — so 'qwen2.5:14b' resolves to the installed
+    'qwen2.5:14b-instruct-q5_K_M' but never to 'qwen2.5:32b-...' (different
+    sizes are different models). Lets a switch request use the model that is
+    ALREADY pulled instead of 404ing or re-pulling ~9 GB. Never raises."""
+    want = (model or "").strip()
+    if not want:
+        return None
+    try:
+        r = requests.get(f"{LOCAL_LLM_BASE_URL}/api/tags", timeout=2)
+        if not r.ok:
+            return None
+        names = [m.get("name", "") for m in r.json().get("models", []) if m.get("name")]
+    except Exception:
+        return None
+    if want in names:
+        return want
+    if ":" not in want and f"{want}:latest" in names:
+        return f"{want}:latest"
+    if want.endswith(":latest") and want[: -len(":latest")] in names:
+        return want[: -len(":latest")]
+    try:
+        from skills.model_picker import _same_model
+    except Exception:
+        return None
+    for tag in names:
+        if _same_model(want, tag):
+            return tag
+    return None
 
 
 # A model holding ≥ this many bytes of VRAM is treated as the "big" resident
@@ -9298,6 +9460,10 @@ def _local_cheatsheet() -> str:
         "  it, say so plainly in one sentence — do not pretend.\n"
         "- One action per reply unless the task plainly needs more.\n"
         "- The argument is plain text after the comma — no JSON, no quotes.\n"
+        # Single-sourced from core.prompts so this cheatsheet path (the
+        # JARVIS_DYNAMIC_LOCAL_PROMPT=0 fallback) can never silently drop the
+        # confirmation-hold / ask-first rules again (2026-07-21 audit).
+        + PC_CONTROL_SAFETY_RULES +
         "=== END PC CONTROL ===\n"
     )
     out = common + allnames + tail
@@ -10224,6 +10390,28 @@ def _ltm_boot_warm() -> None:
                   f"({len(ltm.list_facts() or [])} semantic fact(s))")
         except Exception as e:
             print(f"  [ltm] warm-up failed: {e}")
+            return
+        # Wire the reflector's contradiction adjudicator. reflect_and_
+        # consolidate's contradiction pass was DEAD in production — its sole
+        # caller (record_turn's every-50-turns trigger) passed llm_call=None,
+        # so mid-band contradictions ('user's name is X' x7) were never
+        # resolved (2026-07-21 audit #39). _llm_quick honours
+        # AMBIENT_LEARNING_FORCE_LOCAL / model_route("ambient"), so
+        # adjudication stays local-only/free, and returns "" on failure,
+        # which the reflector treats as 'both facts stay'. Reflection runs
+        # on the ltm-queue worker thread — never the voice thread.
+        try:
+            def _ltm_reflector_llm(prompt, ctx):
+                return _llm_quick(
+                    system=prompt,
+                    user="\n".join(
+                        f"{m.get('role', '')}: {m.get('text', '')}"
+                        for m in (ctx or [])),
+                    max_tokens=60,
+                )
+            ltm.set_reflector_llm(_ltm_reflector_llm)
+        except Exception as e:
+            print(f"  [ltm] reflector wiring failed: {e}")
 
     threading.Thread(target=_warm, name="ltm-warm", daemon=True).start()
 
@@ -10970,6 +11158,20 @@ def _resolve_tts_preset(text: str, user_tone: str | None) -> tuple[str, dict[str
     )
 
 
+def _rate_to_speed(rate: str) -> float:
+    """Map an edge-tts style rate string ('-15%'…'+15%') to a Kokoro speed
+    multiplier (0.85…1.15). Kokoro's create() takes a float speed instead of a
+    percentage, so this is the bridge that lets the prosody presets drive the
+    kokoro backend too (2026-07-21 audit: the preset rate was computed, logged,
+    then thrown away on kokoro). Fail-closed: any malformed value maps to 1.0
+    so a bad preset can never mute or distort speech; clamped to [0.5, 2.0]."""
+    try:
+        pct = float(str(rate).strip().rstrip("%"))
+    except (TypeError, ValueError):
+        return 1.0
+    return max(0.5, min(2.0, 1.0 + pct / 100.0))
+
+
 async def _tts_bytes(text: str, rate: str = "+0%", pitch: str = "+0Hz") -> bytes:
     import edge_tts
     buf = io.BytesIO()
@@ -11115,6 +11317,23 @@ def synthesise(text: str) -> tuple[np.ndarray, int]:
             mood_tag = f" mood={_last_mood[0]}" if _last_mood[0] else ""
             print(f"  [tts] preset={chosen}{tone_tag}{mood_tag} rate={rate} pitch={pitch} gain={gain:.2f}")
 
+        # Wry deliveries get a brief beat spliced in before the final clause
+        # so the punchline actually lands. core.tts.split_for_wry_pause()
+        # returns (text, None) when no good split exists — single-pass render
+        # in that case. Computed ONCE here, ABOVE the backend selection, so
+        # both the kokoro and edge-tts renderers splice the same pause — the
+        # split used to live inside the edge branch only, so kokoro replies
+        # lost their comic beat (2026-07-21 audit).
+        wry_split = None
+        if chosen == "wry" and _tts_layer is not None:
+            try:
+                _wry_head, _wry_tail = _tts_layer.split_for_wry_pause(text)
+                if _wry_tail:
+                    wry_split = (_wry_head, _wry_tail,
+                                 int(_tts_layer.WRY_PAUSE_MS))
+            except Exception:
+                wry_split = None
+
         # LOCAL VOICE-CLONE (Chatterbox) takes precedence over EVERY backend
         # below when the owner has opted in (VOICE_CLONE_ENABLED) and selected a
         # consented profile and core.voice_clone.is_available() agrees the
@@ -11223,9 +11442,33 @@ def synthesise(text: str) -> tuple[np.ndarray, int]:
             # returns None) so a missing/corrupt model or a wedged engine falls
             # straight through to the edge → pyttsx3 → SAPI5 → silence ladder and
             # never mutes JARVIS. See core/kokoro_tts.py. (2026-07-15, P2.)
+            # The preset's rate drives Kokoro's speed (2026-07-21 audit — it
+            # was resolved, logged, then silently dropped here); pitch has no
+            # kokoro_onnx equivalent, so speed + the wry pause + gain are the
+            # prosody this backend honours.
             try:
                 from core import kokoro_tts as _kokoro
-                res = _kokoro.synthesize(text) if _kokoro.is_available() else None
+                res = None
+                if _kokoro.is_available():
+                    speed = _rate_to_speed(rate)
+                    if wry_split is not None:
+                        # Two-part wry render: BOTH clauses must succeed or the
+                        # whole attempt falls through to the edge ladder (which
+                        # does its own wry splice) — a half-rendered wry line
+                        # must never ship head-only audio.
+                        w_head, w_tail, pause_ms = wry_split
+                        head_res = _kokoro.synthesize(w_head, speed=speed)
+                        tail_res = _kokoro.synthesize(w_tail, speed=speed)
+                        if head_res is not None and tail_res is not None:
+                            head_audio, sr = head_res
+                            tail_audio, _ = tail_res
+                            pause_samples = max(0, int(sr * pause_ms / 1000))
+                            silence = np.zeros(pause_samples, dtype=np.float32)
+                            res = (np.concatenate(
+                                [head_audio, silence, tail_audio]
+                            ).astype(np.float32), sr)
+                    else:
+                        res = _kokoro.synthesize(text, speed=speed)
                 if res is not None:
                     audio, sr = res
                     if gain != 1.0:
@@ -11236,19 +11479,8 @@ def synthesise(text: str) -> tuple[np.ndarray, int]:
                       f"falling back to edge-tts")
 
         try:
-            # Wry deliveries get a brief beat spliced in before the final clause
-            # so the punchline actually lands. core.tts.split_for_wry_pause()
-            # returns (text, None) when no good split exists — we fall through
-            # to the single-pass render in that case.
-            wry_split = None
-            if chosen == "wry" and _tts_layer is not None:
-                try:
-                    head, tail = _tts_layer.split_for_wry_pause(text)
-                    if tail:
-                        wry_split = (head, tail, int(_tts_layer.WRY_PAUSE_MS))
-                except Exception:
-                    wry_split = None
-
+            # wry_split was computed once above the backend selection (shared
+            # with the kokoro branch); (text, None) → single-pass render.
             if wry_split is not None:
                 head, tail, pause_ms = wry_split
                 head_audio, sr = _render_edge_tts(head, rate, pitch)
@@ -11340,7 +11572,18 @@ def is_using_headset() -> bool:
     try:
         idx = get_output_device()
         if idx is None:
-            return False
+            # None means "no explicit preference — use the SYSTEM DEFAULT
+            # output" (the default config: SPEAKER_INDEX unset and
+            # PREFERRED_OUTPUT_DEVICES empty), not "no device". Resolve the
+            # real default and name-check IT — treating None as False
+            # hard-wired this to False for the default install, which made
+            # standby_audio_detect's auto-standby-on-music unreachable
+            # (2026-07-21 audit). PortAudio reports "no default output"
+            # as -1; an empty/None default tuple means the same.
+            dflt = sd.default.device
+            idx = dflt[1] if dflt else None
+            if idx is None or (isinstance(idx, int) and idx < 0):
+                return False
         name = sd.query_devices(idx)["name"].lower()
         return any(kw in name for kw in HEADSET_NAME_HINTS)
     except Exception:
@@ -16675,9 +16918,15 @@ def _probe_via_selfdiag(name: str, probe_attr: str) -> str:
 # voice when an external TV (which the OS media session can't see) is playing,
 # so JARVIS requires a leading "JARVIS" on every command until they turn it off.
 def _act_wake_word_mode_set(on: bool) -> str:
-    """Turn the manual wake-word gate on/off. Updates BOTH the live runtime
-    mirror (read by _should_refuse_background_audio) and the config constant
-    (so a status read / settings save reflects it). Returns a JARVIS line."""
+    """Turn the manual wake-word gate on/off. Updates the live runtime
+    mirror (read by _should_refuse_background_audio), the config constant
+    (so a status read reflects it), AND persists the flip to
+    user_settings.json via the Settings GUI's own merge-not-clobber writer
+    (the skills/model_picker._persist_setting pattern). Without the write,
+    core.config._apply_user_settings() re-applied the stale on-disk value at
+    every boot, so a voice "off" reverted on restart (2026-07-21 audit).
+    Persistence is best-effort: on failure the flip still holds for THIS
+    session and the spoken reply carries a caveat. Returns a JARVIS line."""
     global _require_wake_runtime
     _require_wake_runtime = bool(on)
     try:
@@ -16685,10 +16934,22 @@ def _act_wake_word_mode_set(on: bool) -> str:
         _cfg.REQUIRE_WAKE_MODE = bool(on)
     except Exception:
         pass
+    persisted = False
+    try:
+        from tools import settings_window as sw
+        cur = sw.load_settings()
+        if not isinstance(cur, dict):
+            cur = {}
+        cur["REQUIRE_WAKE_MODE"] = bool(on)
+        sw.save_settings(cur)
+        persisted = True
+    except Exception:
+        persisted = False
+    caveat = "" if persisted else " (though I couldn't save that for next boot)"
     if on:
         return ("Wake-word mode on, sir — I'll only respond when you start "
-                "with 'JARVIS', until you turn it off.")
-    return "Wake-word mode off, sir — listening normally again."
+                f"with 'JARVIS', until you turn it off{caveat}.")
+    return f"Wake-word mode off, sir — listening normally again{caveat}."
 
 
 def _act_wake_word_mode_status() -> str:
@@ -17061,6 +17322,15 @@ def load_skills():
             _collect_skill_prompt_examples(mod, name)
             _loaded_skill_names.add(name)   # mark loaded only after success
         except Exception as e:
+            # Roll back the pre-exec sys.modules insert (it exists so package
+            # sub-imports resolve during exec). Without the pop, a skill whose
+            # module body or register() raised leaves a HALF-INITIALIZED
+            # skill_<name> module behind, and every lazy
+            # sys.modules.get("skill_...") bridge — plus self_diagnostic's
+            # skill_imports probe — mistakes the corpse for a healthy skill
+            # (2026-07-21 audit). Matches CPython's own failed-import
+            # semantics: a module that fails to import is removed.
+            sys.modules.pop(f"skill_{name}", None)
             print(f"  [skill] {name}: failed to load — {e}")
 
 
@@ -17593,6 +17863,12 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     "who_is_here", "where_am_i", "situational_awareness",
     "session_memory_recall", "rag_search", "search_files",
     "list_schedules", "list_timers", "current_model", "list_models",
+    # cancel_timer verdict (skills/timer.py) — same cancel-confirmation class
+    # as cancel_schedule / remove_schedule / cancel_promise below; the honest
+    # no-timers-running verdict carries no FAILURE_MARKER by design (an honest
+    # answer, not an error), so without this only the LLM's inline claim was
+    # ever heard — even when no timer existed to cancel. 2026-07-21 audit.
+    "cancel_timer",
     "whoami", "face_id_status",
     # Audio output-device switching (skills/audio_autoswitch.py) — each returns
     # a finished confirmation sentence.
@@ -17679,6 +17955,15 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     "stability_gate_status", "gate_status",
     #   proactive print-announcer suppression state (skills/bambu_print_announcer.py).
     "proactive_announcer_status",
+    #   pause/resume print-control verdicts (same skill, registered on the two
+    #   lines above proactive_announcer_status) — each returns ONE finished
+    #   sentence and never self-speaks; the honest no-active-print corrections
+    #   carry no FAILURE_MARKER by design, so without this only the LLM's
+    #   inline claim was heard. The reach-failure branches contain a couldn't
+    #   marker and still route to the failure follow-up, and the already-spoken
+    #   substring guard in _speak_verbatim_results prevents double-speak when
+    #   the inline reply carries the same sentence. 2026-07-21 audit.
+    "pause_print", "resume_print",
     #   Microsoft Graph calendar agenda (skills/ms_graph.py). Direct-turn readout;
     #   the calendar_scanner orchestrator worker dispatches the same callable
     #   directly and folds it into a briefing, so no double-speak here.
@@ -17735,6 +18020,14 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     "air_mouse_arm", "air_mouse_disarm",
     "mouse_control_on", "take_the_cursor", "give_me_the_cursor", "hand_mouse_on",
     "mouse_control_off", "release_the_cursor", "hand_mouse_off",
+    # AIR-MOUSE ON / OFF (same skill) — each returns ONE finished sentence (the
+    # gesture-vocabulary walkthrough / the off confirmation), never self-speaks,
+    # and the graceful sensor note (Note the Kinect is off — …) carries no
+    # FAILURE_MARKER by design, matching the arm/disarm guardrail above. Their
+    # siblings air_mouse_status / calibrate_air_mouse were already in this set;
+    # only on/off were missed, so the walkthrough was logged, never voiced.
+    # 2026-07-21 audit.
+    "air_mouse_on", "air_mouse_off",
     # LIVE WEB INTERFACE — local-LAN dashboard + text command channel
     # (skills/web_interface.py, engine tools/web_interface.py, 2026-07). Each
     # returns ONE finished sentence: web_interface_on -> "Web interface online,
@@ -17834,6 +18127,20 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     "play_playlist", "shuffle_library",                        # itunes_library.py
     "keep_music_open", "stop_keeping_music_open",              # itunes_library.py
     "youtube_search_direct", "youtube_direct", "yt_direct",    # youtube_search.py
+    # ── 2026-07-21 audit: holographic_overlay package status read-outs ───────
+    # The 2026-07-04 read-out sweep missed the whole skills/holographic_overlay
+    # PACKAGE (its registrations live in the package __init__, not a flat
+    # skills/*.py). Each name below maps to a *_status handler that returns ONE
+    # finished user-facing sentence and never self-speaks, so it must voice
+    # here or the answer is logged and dropped. bambu_camera_status's
+    # last_error branch can carry a FAILURE_MARKER, in which case the guard in
+    # _speak_verbatim_results correctly routes it to the failure follow-up.
+    # Deliberately NOT in INFORMATIVE_ACTIONS (kept DISJOINT — see
+    # test_speak_sets_are_disjoint).
+    "bambu_overlay_status", "bambu_camera_status", "workshop_hud_status",
+    "workshop_print_monitor_status", "holo_hud_v2_status",
+    "arc_reactor_status_status", "stark_status_ring_status",
+    "holographic_status",
 }
 
 # Actions whose runtime can plausibly exceed MID_TASK_STATUS_DELAY (~8 s).
@@ -20861,6 +21168,80 @@ INJECTED_COMMANDS_PATH = _BLUE_GREEN_PATHS["inject_file"]
 _INJECT_TEST_MODE = os.environ.get("JARVIS_TEST_MODE") == "1"
 
 
+def _recover_orphaned_queue_snapshot(queue_path: str, tag: str) -> None:
+    """Recover an orphaned ``<queue>.consuming`` snapshot left by a crash.
+
+    Both JSON-array file queues (injected commands, pending speech) claim
+    their queue by os.replace()-ing it to a sibling ``.consuming`` and remove
+    that snapshot only after consuming it — a crash / hard-kill / watchdog
+    bounce in between strands the snapshot, and because Windows os.replace()
+    OVERWRITES its destination, the NEXT claim would silently clobber the
+    orphan (the same hazard _drain_tray_commands_once documents for its
+    ``.inflight`` file). Until 2026-07-21 nothing recovered these, so a
+    reminder batch or injected command claimed at the wrong moment vanished
+    permanently. Called at the top of each drain, BEFORE the claim — the
+    drains run every main-loop pass, so the first pass after a restart also
+    covers the crash-across-restart case:
+
+      • orphan only            → rename it back to the live queue;
+      • orphan + live queue    → merge (orphan items first — they are older),
+                                 write atomically, remove the orphan;
+      • corrupt/unreadable orphan → discard it with a printed warning (same
+                                 policy as the drains' corrupt-JSON branch).
+
+    Never raises. 2026-07-21 audit: 'queue files are never recovered'."""
+    consume_path = queue_path + ".consuming"
+    try:
+        if not os.path.exists(consume_path):
+            return
+        if not os.path.exists(queue_path):
+            os.replace(consume_path, queue_path)
+            print(f"  [{tag}] recovered an orphaned .consuming snapshot "
+                  f"from a previous unclean exit")
+            return
+        with open(consume_path, "r", encoding="utf-8") as f:
+            orphan_raw = f.read().strip()
+        orphan_items = (json.JSONDecoder().raw_decode(orphan_raw)[0]
+                        if orphan_raw else [])
+        if not isinstance(orphan_items, list):
+            orphan_items = []
+        with open(queue_path, "r", encoding="utf-8") as f:
+            live_raw = f.read().strip()
+        live_items = (json.JSONDecoder().raw_decode(live_raw)[0]
+                      if live_raw else [])
+        if not isinstance(live_items, list):
+            live_items = []
+        merged = orphan_items + live_items
+        # Same mkstemp + os.replace atomic-write pattern as the tail requeue
+        # in _drain_injected_command, so a kill mid-merge can't torch the
+        # live queue.
+        fd: int = -1
+        tmp: str | None = None
+        try:
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(queue_path),
+                                       suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                fd = -1   # fdopen took ownership of the descriptor
+                json.dump(merged, f, indent=2)
+            os.replace(tmp, queue_path)
+            tmp = None
+        finally:
+            if fd >= 0:
+                try: os.close(fd)
+                except Exception: pass
+            if tmp is not None:
+                try: os.unlink(tmp)
+                except Exception: pass
+        os.remove(consume_path)
+        print(f"  [{tag}] merged {len(orphan_items)} orphaned item(s) from a "
+              f"previous unclean exit back into the queue")
+    except Exception as _e:
+        print(f"  [{tag}] orphaned .consuming snapshot unrecoverable — "
+              f"discarding: {_e}")
+        try: os.remove(consume_path)
+        except Exception: pass
+
+
 def _drain_injected_command():
     """Pop and return the next injected command text, or None.
 
@@ -20870,7 +21251,11 @@ def _drain_injected_command():
     rewrite any remaining items back to a fresh queue file so we
     don't strand the tail. Any JSON / encoding error discards the
     whole snapshot rather than crashing the main loop.
-    """
+
+    An orphaned `.consuming` snapshot from a previous crash is merged
+    back BEFORE claiming (see _recover_orphaned_queue_snapshot) —
+    Windows os.replace() would otherwise silently overwrite it."""
+    _recover_orphaned_queue_snapshot(INJECTED_COMMANDS_PATH, "inject")
     if not os.path.exists(INJECTED_COMMANDS_PATH):
         return None
     consume_path = INJECTED_COMMANDS_PATH + ".consuming"
@@ -20953,7 +21338,14 @@ def _speak_pending():
     reminder during the speak loop creates a fresh `pending_speech.json`
     on disk rather than appending to a file we're about to delete. Items
     that get written DURING the speak loop fire on the next idle pass
-    instead of being silently dropped."""
+    instead of being silently dropped.
+
+    An orphaned `.consuming` snapshot from a previous crash is merged
+    back BEFORE claiming (see _recover_orphaned_queue_snapshot) — a
+    reminder batch stranded by a mid-speak kill is spoken on the next
+    pass instead of vanishing; re-speaks are bounded by the
+    _speech_was_recently_spoken dedupe below."""
+    _recover_orphaned_queue_snapshot(PENDING_SPEECH_PATH, "pending")
     if not os.path.exists(PENDING_SPEECH_PATH):
         return False
     consume_path = PENDING_SPEECH_PATH + ".consuming"

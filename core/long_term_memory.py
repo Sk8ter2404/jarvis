@@ -54,6 +54,9 @@ Public API
   search_episodes(query='', start=None,
                   end=None, limit=20)          -> list[dict]
   reflect_and_consolidate(llm_call=None)       -> dict
+  set_reflector_llm(fn)                        -> None   # contradiction pass
+  reset_all()                                  -> int    # full wipe (+backup)
+  forget_since(cutoff_ts)                      -> dict   # time-window purge
   is_available()                               -> dict   # per-feature flags
   status()                                     -> dict
   config_summary()                             -> dict
@@ -66,26 +69,42 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
 from typing import Callable, Iterable, Optional
 
 from core.atomic_io import _atomic_write_json
+from core import paths as _paths
 
 
 # ──────────────────────────────────────────────────────────────────────────
 #  PATHS / CONSTANTS
 # ──────────────────────────────────────────────────────────────────────────
 
-_PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_DATA_DIR     = os.path.join(_PROJECT_DIR, "data", "long_term_memory")
+_PROJECT_DIR  = _paths.PROJECT_DIR
+
+# Staging-aware root via the canonical chooser (core/paths — the 2026-07-21
+# fix for the private-_DATA_DIR bug class): a JARVIS_STAGING process keeps its
+# store under data_staging/ and can never touch the live one. That matters
+# here specifically because the DESTRUCTIVE maintenance APIs below
+# (reset_all / forget_since) are reachable from core.actions directly — the
+# monolith's _ltm_enabled staging gate does not cover them. Bound at import
+# like the rest of these constants; tests repoint them directly.
+_DATA_DIR     = os.path.join(_paths.data_dir(create=False),
+                             "long_term_memory")
+# The legacy import source lives at the project root on a live box; a staging
+# process sees the staged copy instead, mirroring memory.py's redirect.
+_LEGACY_BOBERT_MEMORY = (
+    os.path.join(_paths.data_dir(create=False), "bobert_memory.json")
+    if _paths.is_staging()
+    else os.path.join(_PROJECT_DIR, "bobert_memory.json"))
+
 _CHROMA_DIR   = os.path.join(_DATA_DIR, "chroma")
 _FACTS_JSON   = os.path.join(_DATA_DIR, "facts.json")        # mirror + BM25 source
 _EPISODE_LOG  = os.path.join(_DATA_DIR, "episodes.jsonl")    # per-turn log
 _MIGRATE_FLAG = os.path.join(_DATA_DIR, "migrated.flag")
-
-_LEGACY_BOBERT_MEMORY = os.path.join(_PROJECT_DIR, "bobert_memory.json")
 
 LTM_COLLECTION    = "jarvis_semantic_facts"
 LTM_EMBED_MODEL   = "BAAI/bge-small-en-v1.5"
@@ -102,6 +121,15 @@ REFLECTOR_RUN_EVERY_TURNS = 50
 # reflector for seconds on every run. Above this many facts we only consider
 # the most-recently-updated REFLECTOR_MAX_PAIRWISE for the pairwise pass.
 REFLECTOR_MAX_PAIRWISE = 400
+# Cap the CONTRADICTION pass's LLM adjudications per reflector run — a large
+# 0.6..REFLECTOR_DUP_SIM cohort must not stall the serial ltm-queue worker
+# for minutes calling the LLM on every mid-band pair. (2026-07-21 audit #39)
+REFLECTOR_MAX_LLM_PAIRS = 20
+# Fact sources the contradiction pass treats as ground truth: a fact from one
+# of these is never condemned in favour of a survivor from an untrusted
+# (ambient-extraction) source — a mis-heard Whisper variant must not delete a
+# migrated/backfilled fact. (2026-07-21 audit #39)
+_TRUSTED_FACT_SOURCES = {"bobert_memory_migration", "bobert_memory_backfill"}
 
 _lock = threading.RLock()
 
@@ -853,9 +881,12 @@ def record_turn(role: str, text: str, *, ts: Optional[float] = None) -> None:
         _turns_since_reflect += 1
         should_reflect = _turns_since_reflect >= REFLECTOR_RUN_EVERY_TURNS
     if should_reflect:
-        # Run reflector outside the lock; it acquires its own.
+        # Run reflector outside the lock; it acquires its own. Pass the
+        # injected adjudicator so the contradiction pass actually runs in
+        # production (2026-07-21 audit #39) — with nothing injected this is
+        # llm_call=None and the pass is skipped, exactly the old behavior.
         try:
-            reflect_and_consolidate()
+            reflect_and_consolidate(llm_call=_reflector_llm)
         except Exception as e:
             print(f"  [ltm] reflector raised: {e}")
         with _lock:
@@ -914,6 +945,25 @@ def search_episodes(query: str = "",
 #  PUBLIC API — self-editing reflector
 # ──────────────────────────────────────────────────────────────────────────
 
+# Injected adjudicator for the contradiction pass. record_turn's periodic
+# trigger hands this to reflect_and_consolidate(); production wires it from
+# the monolith's LTM bridge via set_reflector_llm() (this core module must
+# not import bobert_companion). None — the default — skips the contradiction
+# pass, which was the only production behavior before the 2026-07-21 audit
+# (#39: every caller passed llm_call=None, so the pass was dead code).
+_reflector_llm: Optional[Callable[[str, list], Optional[str]]] = None
+
+
+def set_reflector_llm(fn: Optional[Callable[[str, list], Optional[str]]]) -> None:
+    """Install the LLM used by reflect_and_consolidate's contradiction pass.
+
+    ``fn`` has the same contract as reflect_and_consolidate's ``llm_call``
+    parameter: fn(prompt, context_msgs) -> ''/'A'/'B'/'MERGE: <text>' (a
+    None/''/raising call means "both facts stay"). Pass None to disable."""
+    global _reflector_llm
+    _reflector_llm = fn
+
+
 def _cosine_sim(a, b) -> float:
     """Cosine similarity on two pre-normalised numpy vectors. Returns 0
     if either is None."""
@@ -969,6 +1019,10 @@ def reflect_and_consolidate(
         ids = [str(e.get("id") or "") for e in items]
         texts = [e.get("text", "") for e in items]
         snapshot_text = dict(zip(ids, texts))
+        # Source snapshot for the contradiction pass's trusted-source guard —
+        # captured with the text snapshot so a concurrent edit can't shift it.
+        snapshot_source = dict(zip(ids, ((e.get("source") or "")
+                                         for e in items)))
         if len(ids) < 2:
             return summary
 
@@ -1000,6 +1054,7 @@ def reflect_and_consolidate(
 
     # ── pairwise scan
     to_delete: set[str] = set()
+    llm_pairs = 0   # contradiction-pass adjudications this run (bounded)
     n = len(ids)
     for i in range(n):
         if ids[i] in to_delete:
@@ -1032,6 +1087,12 @@ def reflect_and_consolidate(
                     summary["duplicates_removed"] += 1
                 continue
             if 0.6 <= sim < REFLECTOR_DUP_SIM and llm_call is not None:
+                # Bound the per-run LLM work — beyond the cap, remaining
+                # mid-band pairs simply wait for a later run instead of
+                # stalling the serial ltm-queue worker. (2026-07-21 #39)
+                if llm_pairs >= REFLECTOR_MAX_LLM_PAIRS:
+                    continue
+                llm_pairs += 1
                 a_text = texts[i]
                 b_text = texts[j]
                 try:
@@ -1045,11 +1106,22 @@ def reflect_and_consolidate(
                 except Exception as e:
                     print(f"  [ltm] reflector llm raised: {e}")
                     verdict = ""
-                if verdict.upper().startswith("A"):
-                    to_delete.add(ids[j])
-                    summary["contradictions_resolved"] += 1
-                elif verdict.upper().startswith("B"):
-                    to_delete.add(ids[i])
+                if (verdict.upper().startswith("A")
+                        or verdict.upper().startswith("B")):
+                    # 'A' keeps the first presented (ids[i]); 'B' the second.
+                    if verdict.upper().startswith("A"):
+                        survivor, condemned = ids[i], ids[j]
+                    else:
+                        survivor, condemned = ids[j], ids[i]
+                    # Trusted-source guard: never delete a migrated/backfilled
+                    # fact in favour of a survivor from an untrusted (ambient-
+                    # extraction) source — both stay. (2026-07-21 audit #39)
+                    if (snapshot_source.get(condemned, "")
+                            in _TRUSTED_FACT_SOURCES
+                            and snapshot_source.get(survivor, "")
+                            not in _TRUSTED_FACT_SOURCES):
+                        continue
+                    to_delete.add(condemned)
                     summary["contradictions_resolved"] += 1
                 elif verdict.upper().startswith("MERGE"):
                     merged = verdict.split(":", 1)[-1].strip()
@@ -1085,6 +1157,149 @@ def reflect_and_consolidate(
             _save_facts_locked()
             _rebuild_bm25_locked()
     return summary
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  PUBLIC API — destructive maintenance (full wipe / time-window purge)
+# ──────────────────────────────────────────────────────────────────────────
+
+def reset_all() -> int:
+    """Wipe the ENTIRE long-term store: semantic facts (JSON mirror + chroma
+    + BM25 index), the episodic turn log, and the in-process working window —
+    after snapshotting facts.json / episodes.jsonl into
+    _DATA_DIR/backups/pre_reset_<ts>/.
+
+    Mirrors _act_reset_memory's contract: if the backup copy fails, the wipe
+    is REFUSED (the exception propagates so the caller can disclose it).
+    migrated.flag is deliberately LEFT IN PLACE so _migrate_legacy_locked
+    cannot resurrect the wiped facts from bobert_memory.json on the next
+    boot. Degrades gracefully without chromadb — the JSON + BM25 + episode
+    wipe still succeeds. Returns the number of semantic facts cleared.
+    (2026-07-21 audit #17: reset_memory wiped only bobert_memory.json while
+    _ltm_context kept injecting the surviving facts every turn.)"""
+    global _collection
+    ensure_loaded()
+    with _lock:
+        # Backup FIRST — refuse to wipe anything if the copy fails.
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        backup_dir = os.path.join(_DATA_DIR, "backups", f"pre_reset_{ts}")
+        to_copy = [p for p in (_FACTS_JSON, _EPISODE_LOG) if os.path.exists(p)]
+        if to_copy:
+            os.makedirs(backup_dir, exist_ok=True)
+            for src in to_copy:
+                shutil.copy2(src, os.path.join(backup_dir,
+                                               os.path.basename(src)))
+
+        count = len(_facts)
+        fact_ids = list(_facts.keys())
+        _facts.clear()
+        _save_facts_locked()
+
+        # Episodic log + working window: a wipe that leaves the verbatim turn
+        # log (or the turns already in get_working_window() prompt context)
+        # is not a wipe.
+        try:
+            if os.path.exists(_EPISODE_LOG):
+                os.remove(_EPISODE_LOG)
+        except Exception:
+            # Locked by a concurrent reader — truncate in place instead.
+            with open(_EPISODE_LOG, "w", encoding="utf-8"):
+                pass
+        _working.clear()
+
+        # Chroma: drop the whole collection (also clears any orphan vectors)
+        # and recreate it fresh. With no client (an injected bare collection
+        # handle, e.g. in tests) fall back to per-id deletes. Chroma absent →
+        # nothing to do; the JSON/BM25 wipe above is authoritative.
+        coll = _try_import_chroma()
+        if coll is not None:
+            try:
+                with _chroma_lock:
+                    if _chroma_client is not None:
+                        _chroma_client.delete_collection(LTM_COLLECTION)
+                        _collection = _chroma_client.get_or_create_collection(
+                            name=LTM_COLLECTION,
+                            metadata={"hnsw:space": "cosine"},
+                        )
+                    elif fact_ids:
+                        coll.delete(ids=fact_ids)
+            except Exception as e:
+                print(f"  [ltm] chroma reset failed: {e}")
+
+        _rebuild_bm25_locked()
+        return count
+
+
+def forget_since(cutoff_ts: float) -> dict:
+    """Purge every stored trace of conversation recorded at or after
+    ``cutoff_ts`` (epoch seconds): in-process working turns, episodic-log
+    lines, and semantic facts created inside the window.
+
+    The episode rewrite uses the tmp + os.replace pattern (mirroring
+    _rotate_episodes_locked) so a crash can't half-truncate the log.
+    Unparseable / ts-less lines and facts are KEPT — legacy entries are
+    treated as old, matching _act_forget_last_hour's convention for
+    bobert_memory entries. Exceptions propagate: the caller must DISCLOSE a
+    failed purge rather than claim success (the silent-survival gap is the
+    bug). Returns counts {"episodes": n, "facts": n, "working": n}.
+    (2026-07-21 audit #51: forget_last_hour left the hour's verbatim turns
+    in episodes.jsonl and its facts in the semantic store.)"""
+    counts = {"episodes": 0, "facts": 0, "working": 0}
+    ensure_loaded()
+    with _lock:
+        # (a) In-process working window — purging only the file would leave
+        # the turns in get_working_window() prompt context all session.
+        kept_working = []
+        for entry in _working:
+            try:
+                ts = float(entry.get("ts", 0.0))
+            except (TypeError, ValueError):
+                ts = 0.0
+            if ts >= cutoff_ts:
+                counts["working"] += 1
+            else:
+                kept_working.append(entry)
+        _working[:] = kept_working
+
+        # (b) Episodic log — atomic rewrite keeping only pre-cutoff lines.
+        if os.path.exists(_EPISODE_LOG):
+            with open(_EPISODE_LOG, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            keep_lines = []
+            for line in lines:
+                ts = None
+                try:
+                    ts = float(json.loads(line).get("ts"))
+                except Exception:
+                    ts = None       # unparseable / ts-less → treated as old
+                if ts is not None and ts >= cutoff_ts:
+                    counts["episodes"] += 1
+                    continue
+                keep_lines.append(line)
+            if counts["episodes"]:
+                tmp = _EPISODE_LOG + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.writelines(keep_lines)
+                os.replace(tmp, _EPISODE_LOG)
+
+        # (c) Semantic facts created inside the window — drop from the JSON
+        # mirror + chroma per id, then one save + BM25 rebuild at the end.
+        doomed = []
+        for fid, entry in _facts.items():
+            try:
+                created = float(entry.get("created_at", 0.0))
+            except (TypeError, ValueError):
+                created = 0.0
+            if created >= cutoff_ts:
+                doomed.append(fid)
+        for fid in doomed:
+            del _facts[fid]
+            _chroma_delete(fid)
+        if doomed:
+            _save_facts_locked()
+            _rebuild_bm25_locked()
+        counts["facts"] = len(doomed)
+    return counts
 
 
 # ──────────────────────────────────────────────────────────────────────────

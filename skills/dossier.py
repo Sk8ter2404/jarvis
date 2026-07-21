@@ -597,7 +597,20 @@ def _renderer_main(parent_pid: int) -> int:
             if now >= expiry:
                 root.destroy()
                 return
-            if parent_pid > 0 and not _pid_alive(parent_pid):
+            # Liveness via core.parent_watch (2026-07-21 audit) — the
+            # psutil-backed _pid_alive was the stale duplicate hud_card and
+            # the whole hud/overlay fleet already migrated off:
+            # psutil.pid_exists reports True for BOTH Windows dead states
+            # (kernel-stuck corpse + exited), so a corpsed parent left this
+            # card lingering. parent_is_alive uses GetExitCodeProcess +
+            # WaitForSingleObject and returns True for pid<=0, preserving the
+            # old `parent_pid > 0` guard's intent. Falls back to _pid_alive
+            # only if the import fails.
+            try:
+                from core.parent_watch import parent_is_alive as _alive
+            except Exception:
+                _alive = lambda p: _pid_alive(p) if p > 0 else True
+            if not _alive(parent_pid):
                 root.destroy()
                 return
             rem = max(0, int(expiry - now))

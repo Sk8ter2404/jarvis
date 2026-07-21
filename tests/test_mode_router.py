@@ -353,5 +353,50 @@ class ControlledDispatchChainTests(_ControlledBase):
         self.assertEqual(out, "Done, sir.")
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Stale-duplicate invariant (2026-07-21 audit): the lead-filler stripper
+# existed as two drifting copies — this module's fixed version (comma wake
+# variants + loop-until-stable) and core.dispatcher's stale one (neither),
+# which made Controlled mode refuse "JARVIS, take a screenshot". There must
+# be exactly ONE implementation, shared from core.lead_fillers.
+# ─────────────────────────────────────────────────────────────────────────
+
+class LeadFillerSingleImplementationTests(unittest.TestCase):
+    def test_one_shared_strip_function(self):
+        # Function-object IDENTITY — stronger than any source grep. If either
+        # module grows a private def again, this fails immediately.
+        import core.dispatcher as disp
+        import core.lead_fillers as lf
+        self.assertIs(mr._strip_lead_filler, lf.strip_lead_filler)
+        self.assertIs(disp._strip_lead_filler, lf.strip_lead_filler)
+
+    def test_one_shared_filler_table(self):
+        import core.dispatcher as disp
+        import core.lead_fillers as lf
+        self.assertIs(mr._LEAD_FILLERS, lf.LEAD_FILLERS)
+        # dispatcher must never regrow its own table; if the name exists at
+        # all it must BE the shared tuple, not a fork.
+        self.assertIs(getattr(disp, "_LEAD_FILLERS", lf.LEAD_FILLERS),
+                      lf.LEAD_FILLERS)
+
+    def test_every_wake_filler_has_comma_sibling(self):
+        # The comma-variant rule can never silently regress in the shared
+        # copy: every filler ending in "jarvis " needs its ", "-suffixed
+        # sibling (Whisper renders the wake word with a comma).
+        import core.lead_fillers as lf
+        wake = [f for f in lf.LEAD_FILLERS if f.endswith("jarvis ")]
+        self.assertTrue(wake, "expected wake-word fillers in LEAD_FILLERS")
+        for f in wake:
+            self.assertIn(f[:-1] + ", ", lf.LEAD_FILLERS,
+                          f"missing comma variant for {f!r}")
+
+    def test_strip_is_loop_until_stable_with_comma_variants(self):
+        import core.lead_fillers as lf
+        self.assertEqual(lf.strip_lead_filler("JARVIS, please switch to agent mode"),
+                         "switch to agent mode")
+        self.assertEqual(lf.strip_lead_filler("hey jarvis, could you play jazz"),
+                         "play jazz")
+
+
 if __name__ == "__main__":
     unittest.main()

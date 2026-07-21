@@ -177,6 +177,78 @@ def _same_model(a: str, b: str) -> bool:
     return ra == rb
 
 
+# ─── vision lockstep (chat + vision share ONE multimodal brain) ────────────
+def _is_multimodal(tag: str) -> bool:
+    """True when `tag` can serve VISION as well as chat. Asks Ollama's
+    /api/show for the model's declared capabilities; on any error falls back
+    to the family markers (_VISION_MARKERS plus gemma4, the known multimodal
+    CHAT family). Never raises."""
+    t = (tag or "").strip()
+    if not t:
+        return False
+    try:
+        r = requests.post(f"{_BASE_URL}/api/show", json={"model": t},
+                          timeout=_TIMEOUT)
+        if r.ok:
+            return "vision" in (r.json().get("capabilities") or [])
+    except Exception:
+        pass
+    tl = t.lower()
+    return any(m in tl for m in _VISION_MARKERS) or "gemma4" in tl
+
+
+def _sync_vision_to_chat(old_tag, new_tag, persist: bool = True, bc=None) -> bool:
+    """Keep LOCAL_VISION_MODEL in LOCKSTEP with a chat-model switch.
+
+    core/config.py mandates the lockstep ("promoting the brain never forks
+    vision onto a second VLM"), but until the 2026-07-21 audit every switch
+    site repointed only the CHAT tag — leaving vision on the OLD tag, so the
+    co-load guard refused every local vision call ("REFUSING co-load: big
+    model ... is resident") until restart.
+
+    Syncs ONLY when the current vision tag equals the OLD chat tag (the
+    shared-brain config) AND the new tag is vision-capable:
+      * a user-pinned separate VLM (vision != old chat tag) is never touched;
+      * a switch to a TEXT-ONLY tag leaves vision on the old multimodal tag
+        (the residency/co-load guards then degrade with a printed reason
+        instead of silently blinding local vision on a chat-only model).
+
+    `bc` is the monolith module (resolved via _monolith() when omitted).
+    `persist=False` for callers that don't persist the chat tag either —
+    persisting vision alone would desync user_settings.json on restart.
+    Returns True when vision was repointed. Never raises."""
+    if bc is None:
+        bc = _monolith()
+    vision = getattr(bc, "LOCAL_VISION_MODEL", None) if bc is not None else None
+    if not vision:
+        try:
+            import core.config as _cfg
+            vision = getattr(_cfg, "LOCAL_VISION_MODEL", None)
+        except Exception:
+            vision = None
+    if not (isinstance(vision, str) and vision and old_tag and new_tag):
+        return False
+    if not _same_model(vision, old_tag):
+        return False   # separate pinned VLM — never touch it
+    if _same_model(vision, new_tag):
+        return False   # already in lockstep — nothing to do
+    if not _is_multimodal(new_tag):
+        return False   # text-only brain — keep the old multimodal vision tag
+    if bc is not None:
+        try:
+            setattr(bc, "LOCAL_VISION_MODEL", new_tag)
+        except Exception:
+            pass
+    try:
+        import core.config as _cfg
+        _cfg.LOCAL_VISION_MODEL = new_tag
+    except Exception:
+        pass
+    if persist:
+        _persist_setting("LOCAL_VISION_MODEL", new_tag)
+    return True
+
+
 # ─── persistence (reuse the Settings-GUI atomic, merge-not-clobber writer) ──
 def _persist_setting(key: str, value) -> bool:
     """Write {key: value} into data/user_settings.json WITHOUT clobbering the
@@ -476,6 +548,13 @@ def set_model(arg: str) -> str:
         pass
 
     persisted = _persist_setting("LOCAL_LLM_MODEL", target)
+
+    # Vision LOCKSTEP (2026-07-21 audit): when vision shares the OLD chat tag
+    # (the shipped one-multimodal-brain config), carry LOCAL_VISION_MODEL
+    # along — live AND persisted — so the switch can't fork vision onto a
+    # second VLM / dead tag. No-op for a pinned separate VLM or a text-only
+    # target (see _sync_vision_to_chat).
+    _sync_vision_to_chat(active, target, persist=True, bc=bc)
 
     # Confirmation, with a one-beat character note on the trade-off.
     note = ""

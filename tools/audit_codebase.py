@@ -97,6 +97,14 @@ CORE_DIR    = os.path.join(PROJECT_DIR, "core")
 TOOLS_DIR   = os.path.join(PROJECT_DIR, "tools")
 REQUIREMENTS_FILE = os.path.join(PROJECT_DIR, "requirements.txt")
 
+# Shared action-registration scanner — the ONE home for the "which actions
+# does this file register?" rule (also used by tools/gen_action_index.py).
+# Imported by path so both `python tools/audit_codebase.py` and the tests'
+# spec_from_file_location loads work without a tools/ package.
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+import registration_scan  # noqa: E402
+
 EXCLUDE_DIRS = {"backups", "__pycache__", "pending_skills", ".git", "camera_previews",
                 "screenshots", "logs", "memory", "data", "tests",
                 "data_staging", "logs_staging", "dist", "build"}
@@ -985,82 +993,70 @@ def check_actions(skill_files: list[str], bc_actions: set[str]) -> tuple[list[Fi
                 message="register() takes no arguments — must accept the actions dict",
             ))
             continue
-        actions_param = register_fn.args.args[0].arg
+        # Registration discovery via the shared scanner (the ONE home for the
+        # rule — tools/registration_scan.py). Unlike the old inline walk, this
+        # also sees dict-plus-loop, actions.update(handlers), and tuple-alias-
+        # loop registrations, so those names join the collision/arity checks.
+        for action_name, reg in sorted(
+                registration_scan.scan_registrations(
+                    tree, filename=_rel(path)).items(),
+                key=lambda kv: (kv[1].lineno, kv[0])):
+            reg_lineno = reg.lineno
+            # Arity-check only direct Name/Attribute handlers — a "call" kind
+            # names the FACTORY (the real handler is its returned closure) and
+            # "lambda"/"alias"/"expr" kinds don't name the dispatched def.
+            callable_name = None
+            if reg.kind == "direct":
+                callable_name = reg.symbol.split(".")[-1]
 
-        # Walk register() body for `actions[name] = callable`
-        for sub in ast.walk(register_fn):
-            if not isinstance(sub, ast.Assign):
-                continue
-            for target in sub.targets:
-                if not (isinstance(target, ast.Subscript)
-                        and isinstance(target.value, ast.Name)
-                        and target.value.id == actions_param):
-                    continue
-                # Extract the string key
-                key = target.slice
-                if isinstance(key, ast.Constant) and isinstance(key.value, str):
-                    action_name = key.value
-                else:
-                    continue   # dynamic key — can't analyse statically
+            # Collision check — skip when caller marked the wrap intentional.
+            # Look for an `INTENTIONAL_WRAP` comment on the registration line
+            # itself or on either of the two immediately preceding lines (so
+            # block-style markers like a leading `# INTENTIONAL_WRAP: …` are
+            # also recognised).
+            intentional = False
+            for ln in range(max(1, reg_lineno - 2), reg_lineno + 1):
+                if ln - 1 < len(lines) and "INTENTIONAL_WRAP" in lines[ln - 1]:
+                    intentional = True
+                    break
+            if (action_name in owners
+                    and owners[action_name] != _rel(path)
+                    and not intentional):
+                out.append(Finding(
+                    severity="P1", category="actions",
+                    file=_rel(path), line=reg_lineno,
+                    message=(f"action name '{action_name}' collides with "
+                             f"existing registration in {owners[action_name]} "
+                             f"— this skill will overwrite (last-load-wins)"),
+                ))
+            owners[action_name] = _rel(path)
 
-                # Resolve the right-hand callable to a name (best effort)
-                rhs = sub.value
-                callable_name = None
-                if isinstance(rhs, ast.Name):
-                    callable_name = rhs.id
-                elif isinstance(rhs, ast.Attribute):
-                    callable_name = rhs.attr
-                elif isinstance(rhs, ast.Lambda):
-                    callable_name = "<lambda>"
-
-                # Collision check — skip when caller marked the wrap intentional.
-                # Look for an `INTENTIONAL_WRAP` comment on the assignment line
-                # itself or on either of the two immediately preceding lines (so
-                # block-style markers like a leading `# INTENTIONAL_WRAP: …` are
-                # also recognised).
-                intentional = False
-                for ln in range(max(1, sub.lineno - 2), sub.lineno + 1):
-                    if ln - 1 < len(lines) and "INTENTIONAL_WRAP" in lines[ln - 1]:
-                        intentional = True
+            # Verify the callable takes exactly one positional argument.
+            # Look for the function definition in this same module.
+            if callable_name:
+                for fn_node in tree.body:
+                    if (isinstance(fn_node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                            and fn_node.name == callable_name):
+                        pos_args = fn_node.args.args
+                        n = len(pos_args)
+                        defaults = len(fn_node.args.defaults)
+                        required = n - defaults
+                        if required > 1:
+                            out.append(Finding(
+                                severity="P1", category="actions",
+                                file=_rel(path), line=fn_node.lineno,
+                                message=(f"action '{action_name}' → {callable_name}() "
+                                         f"requires {required} positional args; "
+                                         f"action callables must accept 1 (the str payload)"),
+                            ))
+                        elif n == 0:
+                            out.append(Finding(
+                                severity="P1", category="actions",
+                                file=_rel(path), line=fn_node.lineno,
+                                message=(f"action '{action_name}' → {callable_name}() "
+                                         f"takes zero args; should take 1 (the str payload)"),
+                            ))
                         break
-                if (action_name in owners
-                        and owners[action_name] != _rel(path)
-                        and not intentional):
-                    out.append(Finding(
-                        severity="P1", category="actions",
-                        file=_rel(path), line=sub.lineno,
-                        message=(f"action name '{action_name}' collides with "
-                                 f"existing registration in {owners[action_name]} "
-                                 f"— this skill will overwrite (last-load-wins)"),
-                    ))
-                owners[action_name] = _rel(path)
-
-                # Verify the callable takes exactly one positional argument.
-                # Look for the function definition in this same module.
-                if callable_name and callable_name != "<lambda>":
-                    for fn_node in tree.body:
-                        if (isinstance(fn_node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                                and fn_node.name == callable_name):
-                            pos_args = fn_node.args.args
-                            n = len(pos_args)
-                            defaults = len(fn_node.args.defaults)
-                            required = n - defaults
-                            if required > 1:
-                                out.append(Finding(
-                                    severity="P1", category="actions",
-                                    file=_rel(path), line=fn_node.lineno,
-                                    message=(f"action '{action_name}' → {callable_name}() "
-                                             f"requires {required} positional args; "
-                                             f"action callables must accept 1 (the str payload)"),
-                                ))
-                            elif n == 0:
-                                out.append(Finding(
-                                    severity="P1", category="actions",
-                                    file=_rel(path), line=fn_node.lineno,
-                                    message=(f"action '{action_name}' → {callable_name}() "
-                                             f"takes zero args; should take 1 (the str payload)"),
-                                ))
-                            break
     return out, owners
 
 
@@ -1805,77 +1801,13 @@ def _profile_skill(path: str) -> dict[str, Any]:
                         profile["uses_atomic_writer"] = True
                         break
 
-    # Actions registered: look for `register(actions)` and the
-    # `actions[name] = callable` pattern inside.
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "register":
-            if not node.args.args:
-                continue
-            param = node.args.args[0].arg
-            # (a) direct `actions["name"] = fn`
-            for sub in ast.walk(node):
-                if (isinstance(sub, ast.Assign)
-                        and len(sub.targets) == 1
-                        and isinstance(sub.targets[0], ast.Subscript)
-                        and isinstance(sub.targets[0].value, ast.Name)
-                        and sub.targets[0].value.id == param):
-                    key = sub.targets[0].slice
-                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
-                        profile["actions"][key.value] = sub.lineno
-            # (b) dict-driven registration, e.g. browser_agent / many skills:
-            #       handlers = {"name": fn, ...}
-            #       for k, v in handlers.items(): actions[k] = v   (or actions.update(handlers))
-            #     The direct check above misses these (slice is a Name, not a
-            #     str const), causing spurious "documented but not registered".
-            dict_keys: dict[str, list[str]] = {}
-            for sub in ast.walk(node):
-                tgt_name = dval = None
-                if (isinstance(sub, ast.Assign) and len(sub.targets) == 1
-                        and isinstance(sub.targets[0], ast.Name)
-                        and isinstance(sub.value, ast.Dict)):
-                    tgt_name, dval = sub.targets[0].id, sub.value
-                elif (isinstance(sub, ast.AnnAssign)        # handlers: dict = {...}
-                        and isinstance(sub.target, ast.Name)
-                        and isinstance(sub.value, ast.Dict)):
-                    tgt_name, dval = sub.target.id, sub.value
-                if tgt_name is not None and dval is not None:
-                    ks = [k.value for k in dval.keys
-                          if isinstance(k, ast.Constant) and isinstance(k.value, str)]
-                    if ks:
-                        dict_keys[tgt_name] = ks
-            for sub in ast.walk(node):
-                # actions.update(<dict-name or dict-literal>)
-                if (isinstance(sub, ast.Call)
-                        and isinstance(sub.func, ast.Attribute)
-                        and sub.func.attr == "update"
-                        and isinstance(sub.func.value, ast.Name)
-                        and sub.func.value.id == param and sub.args):
-                    a0 = sub.args[0]
-                    if isinstance(a0, ast.Name):
-                        for k in dict_keys.get(a0.id, []):
-                            profile["actions"].setdefault(k, sub.lineno)
-                    elif isinstance(a0, ast.Dict):
-                        for k in a0.keys:
-                            if isinstance(k, ast.Constant) and isinstance(k.value, str):
-                                profile["actions"].setdefault(k.value, sub.lineno)
-                # for k, v in <dict-name>.items(): actions[k] = v
-                elif isinstance(sub, ast.For):
-                    it = sub.iter
-                    src = (it.func.value.id
-                           if isinstance(it, ast.Call)
-                           and isinstance(it.func, ast.Attribute)
-                           and it.func.attr == "items"
-                           and isinstance(it.func.value, ast.Name)
-                           else None)
-                    assigns_param = any(
-                        isinstance(b, ast.Assign) and len(b.targets) == 1
-                        and isinstance(b.targets[0], ast.Subscript)
-                        and isinstance(b.targets[0].value, ast.Name)
-                        and b.targets[0].value.id == param
-                        for b in ast.walk(sub))
-                    if src and assigns_param:
-                        for k in dict_keys.get(src, []):
-                            profile["actions"].setdefault(k, sub.lineno)
+    # Actions registered — via the shared scanner (tools/registration_scan.py,
+    # the ONE home for the rule, also used by gen_action_index and check 5).
+    # Covers direct subscript assigns, dict literals + .update(), dict-plus-
+    # loop, tuple-alias loops, and lambda-valued handlers.
+    for aname, reg in registration_scan.scan_registrations(
+            tree, filename=os.path.basename(path)).items():
+        profile["actions"][aname] = reg.lineno
 
     _skill_profile_cache[path] = profile
     return profile
@@ -2996,21 +2928,15 @@ def main() -> int:
     bc_actions: set[str] = set()
     bc_text, _ = _read_source(os.path.join(PROJECT_DIR, "bobert_companion.py"))
     if bc_text:
-        m = re.search(r"^ACTIONS\s*=\s*\{([^}]*)\}", bc_text, re.MULTILINE | re.DOTALL)
-        if m:
-            for kv in re.finditer(r'["\']([a-z_][a-z_0-9]*)["\']\s*:', m.group(1)):
-                bc_actions.add(kv.group(1))
-        for extra in re.finditer(r'ACTIONS\[\s*["\']([a-z_][a-z_0-9]*)["\']\s*\]\s*=', bc_text):
-            bc_actions.add(extra.group(1))
-        # Actions wired in via `ACTIONS.update({ ... })` blocks. Some controls
-        # (e.g. the ambient-learning mode handlers) register after the ACTIONS
-        # literal because their handler functions are defined further down the
-        # file. Capture every "key": inside each update() dict so they aren't
-        # mis-flagged as "documented but not registered". Non-greedy to the
-        # first "})" — the update dicts here hold lambdas, not nested braces.
-        for upd in re.finditer(r'ACTIONS\.update\(\s*\{(.*?)\}\s*\)', bc_text, re.DOTALL):
-            for kv in re.finditer(r'["\']([a-z_][a-z_0-9]*)["\']\s*:', upd.group(1)):
-                bc_actions.add(kv.group(1))
+        # Monolith registrations via the shared scanner (the ONE home for the
+        # rule): the ACTIONS literal, every ACTIONS.update({...}) block (e.g.
+        # the ambient-learning handlers registered after the literal), and
+        # ACTIONS["x"] = assigns — lambda-valued entries included.
+        try:
+            bc_actions = set(registration_scan.scan_registrations(
+                bc_text, filename="bobert_companion.py", targets=("ACTIONS",)))
+        except SyntaxError:
+            pass   # unparseable monolith — the syntax check will flag it
 
     findings: list[Finding] = []
     if not args.integration_only:

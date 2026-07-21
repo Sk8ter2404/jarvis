@@ -55,6 +55,9 @@ _DENYLIST_NAMES = {
     # destructive state
     "reset_memory", "forget_last_hour", "export_memory", "clear_tasks",
     "smart_home_purge_cookie", "forget_alexa_login",
+    # persists its raw sweep arg ("test") as the Hue bridge IP and reports a
+    # false OK; staging redirection is belt, this is suspenders.
+    "hue_set_bridge_ip",
     # long-lived side effects / upgrade pipeline
     "upgrade", "start_overnight_upgrade", "check_for_updates", "check_updates",
     "is_there_an_update", "stop_pipeline", "queue_task", "create_skill",

@@ -19,8 +19,9 @@ dispatched:
                follow-up loop depth is also boosted (handled by the
                caller via is_in_agent_mode()).
 
-Mode is persisted to data/conversation_mode.json so the chosen mode
-survives JARVIS restarts.
+Mode is persisted to conversation_mode.json in the staging-aware data dir
+(core.paths.data_dir() — live data/, or data_staging/ under JARVIS_STAGING=1)
+so the chosen mode survives JARVIS restarts.
 
 Public API:
   current_mode()                                  → str
@@ -53,6 +54,11 @@ import re
 import threading
 from pathlib import Path
 
+from core.lead_fillers import (
+    LEAD_FILLERS as _LEAD_FILLERS,
+    strip_lead_filler as _strip_lead_filler,
+)
+
 
 # ── modes ────────────────────────────────────────────────────────────────
 
@@ -67,7 +73,15 @@ _DEFAULT_MODE = MODE_SMART
 # ── persisted state ─────────────────────────────────────────────────────
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_DATA_DIR     = _PROJECT_ROOT / "data"
+# Resolve the data dir through the staging-aware core.paths so a
+# JARVIS_STAGING=1 process (sweeps, tests) never writes the live data/
+# (the exact rot core/paths.py documents). Defensive fallback keeps this
+# module loading even if core.paths is broken mid-boot.
+try:
+    from core.paths import data_dir as _data_dir
+    _DATA_DIR = Path(_data_dir(create=False))
+except Exception:
+    _DATA_DIR = _PROJECT_ROOT / "data"
 _STATE_FILE   = _DATA_DIR / "conversation_mode.json"
 
 _LOCK = threading.Lock()
@@ -148,31 +162,9 @@ def is_in_agent_mode() -> bool:
 
 _PUNCT_TAIL = re.compile(r"[.!?,;:]+\s*$")
 
-_LEAD_FILLERS = (
-    "could you ", "can you ", "would you ", "please ",
-    "jarvis ", "jarvis, ", "hey jarvis ", "hey jarvis, ",
-    "ok jarvis ", "ok jarvis, ", "okay jarvis ", "okay jarvis, ",
-    "go ahead and ", "i need you to ", "i'd like you to ",
-)
-
-
-def _strip_lead_filler(s: str) -> str:
-    # Strip STACKED lead-ins ("JARVIS, please switch to agent mode") by looping
-    # until stable — a single pass left the second filler in place and broke the
-    # toggle match (caught by tests/test_mode_router). Each pass removes at most
-    # one filler, then re-checks the shortened head.
-    cur = s.strip()
-    changed = True
-    while changed:
-        changed = False
-        low = cur.lower()
-        for f in _LEAD_FILLERS:
-            if low.startswith(f):
-                cur = cur[len(f):].lstrip()
-                changed = True
-                break
-    return cur
-
+# _LEAD_FILLERS / _strip_lead_filler moved to core.lead_fillers (imported at
+# the top) — this module's fixed copy became the shared canonical one after
+# core.dispatcher's stale duplicate broke Controlled mode (2026-07-21 audit).
 
 _SWITCH_VERBS = (
     r"switch\s+(?:to\s+)?|change\s+(?:to\s+)?|"

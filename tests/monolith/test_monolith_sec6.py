@@ -2146,6 +2146,51 @@ class SpeakPendingTests(SectionSixBase):
                 self.bc._speak_pending()
             self.assertFalse(os.path.exists(path))
 
+    # ── orphaned .consuming recovery (2026-07-21 audit: "queue files are
+    #    never recovered") ────────────────────────────────────────────────────
+
+    def test_orphaned_consuming_spoken_and_removed(self):
+        # A reminder batch stranded mid-speak by a crash (the snapshot was
+        # claimed as .consuming but never consumed) must be spoken on the
+        # next pass instead of vanishing forever.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pending.json")
+            self._redirect(path)
+            with open(path + ".consuming", "w", encoding="utf-8") as f:
+                json.dump([{"message": "orphaned reminder"}], f)
+            self.assertTrue(self.bc._speak_pending())
+            self.assertFalse(os.path.exists(path + ".consuming"))
+            self.assertFalse(os.path.exists(path))
+        self.assertEqual(self.spoke, ["orphaned reminder"])
+
+    def test_orphan_and_live_both_spoken_orphan_first(self):
+        # Orphan + live queue both present: the claim must not clobber the
+        # orphan — both batches are spoken, the (older) orphan's first.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pending.json")
+            self._redirect(path)
+            with open(path + ".consuming", "w", encoding="utf-8") as f:
+                json.dump([{"message": "old"}], f)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump([{"message": "new"}], f)
+            self.assertTrue(self.bc._speak_pending())
+            self.assertFalse(os.path.exists(path + ".consuming"))
+        self.assertEqual(self.spoke, ["old", "new"])
+
+    def test_corrupt_orphan_discarded_live_queue_still_drains(self):
+        # An unreadable orphan is discarded without exception (same policy as
+        # the corrupt-queue branch) and the live queue still drains.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pending.json")
+            self._redirect(path)
+            with open(path + ".consuming", "w", encoding="utf-8") as f:
+                f.write("not json at all")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump([{"message": "ok"}], f)
+            self.assertTrue(self.bc._speak_pending())
+            self.assertFalse(os.path.exists(path + ".consuming"))
+        self.assertEqual(self.spoke, ["ok"])
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Orchestrator gate
@@ -3756,6 +3801,67 @@ class PreflightApiKeyImportFailureTests(SectionSixBase):
             ok, reason = bc._preflight_api_key(timeout_sec=1.0)
         self.assertFalse(ok)
         self.assertIn("not importable", reason)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  2026-07-21 audit: pause_print / resume_print confirmations were dropped
+#  while the ADJACENT proactive_announcer_status (registered one line below
+#  them in skills/bambu_print_announcer.py) was spoken — the stale-duplicate
+#  class where a voicing rule lands on part of a skill's family only. The
+#  worst case was the honest correction: with nothing printing, "pause the
+#  print" returned "No active print to pause, sir." (no FAILURE_MARKER by
+#  design), which was voiced NOWHERE — the LLM's inline "Pausing it now, sir."
+#  hallucination was the only thing the owner heard.
+# ────────────────────────────────────────────────────────────────────────────
+class PrintControlVerdictVoicedTests(SectionSixBase):
+    def test_pause_resume_family_voiced_verbatim(self):
+        # Membership against the imported set (source-of-truth invariant, same
+        # pattern as test_report_bug_family_voiced_verbatim above).
+        for name in ("pause_print", "resume_print",
+                     "proactive_announcer_status"):   # the adjacent precedent
+            self.assertIn(name, self.bc.SPEAK_RESULT_VERBATIM_ACTIONS,
+                          f"{name} verdict must be voiced verbatim")
+            # Disjointness is enforced globally by test_speak_sets_are_disjoint;
+            # assert locally too so a double-add fails next to this family.
+            self.assertNotIn(name, self.bc.INFORMATIVE_ACTIONS)
+
+    def test_pause_verdict_voiced_failure_routed_away(self):
+        # Functional proof through the real helper: the finished confirmation
+        # is voiced, while the reach-failure line (carries the "couldn't"
+        # FAILURE_MARKER) is NOT — it stays with the failure follow-up loop.
+        bc = self.bc
+        spoken = []
+        with mock.patch.object(bc, "_speak",
+                               lambda *a, **k: spoken.append(a[0] if a else "")):
+            handled = bc._speak_verbatim_results(
+                [("pause_print", "Pausing the print, sir.", False)])
+        self.assertEqual(spoken, ["Pausing the print, sir."])
+        self.assertEqual(handled, {"pause_print"})
+
+        spoken.clear()
+        with mock.patch.object(bc, "_speak",
+                               lambda *a, **k: spoken.append(a[0] if a else "")):
+            handled = bc._speak_verbatim_results(
+                [("pause_print",
+                  "I couldn't reach the printer to pause it, sir — timeout.",
+                  False)])
+        self.assertEqual(spoken, [],
+                         "reach-failure must route to the failure follow-up, "
+                         "not the verbatim read-back")
+        self.assertEqual(handled, set())
+
+    def test_pause_verdict_not_double_spoken_when_inlined(self):
+        # The already-spoken substring guard: if the LLM inlined the same
+        # sentence, the verbatim pass must not repeat it.
+        bc = self.bc
+        spoken = []
+        with mock.patch.object(bc, "_speak",
+                               lambda *a, **k: spoken.append(a[0] if a else "")):
+            handled = bc._speak_verbatim_results(
+                [("resume_print", "Resuming the print, sir.", False)],
+                already_spoken="Of course. Resuming the print, sir.")
+        self.assertEqual(spoken, [])
+        self.assertEqual(handled, set())
 
 
 if __name__ == "__main__":

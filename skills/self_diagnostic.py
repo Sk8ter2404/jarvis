@@ -29,7 +29,9 @@ Probes (15 subsystems)
     9.  bambu             — MQTT connect with 5s timeout (skipped when
                             BAMBU_PRINTER_IP unset).
    10.  media_playback    — Chrome reachable on disk; Apple Music if found.
-   11.  skill_imports     — every .py in skills/ imports without raising.
+   11.  skill_imports     — every skill on disk (flat .py AND package dirs)
+                            is in load_skills' success set; falls back to a
+                            parse check when run outside JARVIS.
    12.  gpu               — torch.cuda.is_available() when WHISPER_DEVICE
                             wants CUDA OR a local LLM is configured.
    13.  disk              — > 1 GB free on the project drive.
@@ -646,11 +648,71 @@ def _maybe_announce_once(key: str, message: str) -> None:
     _proactive_announce(message)
 
 
+class _CameraLockHold:
+    """Bounded, idempotent hold on bobert_companion._camera_io_lock for the
+    webcam probe. ``release()`` is safe to call more than once — the probe
+    drops the lock EARLY before delegating to _attempt_camera_wake (whose
+    worker acquires the same lock from a different thread, diag-wake-N;
+    RLock reentrancy is per-thread, so holding on here would make every
+    wake falsely time out with "lock held by tracker"), while the caller's
+    ``finally`` still guarantees release on every other path. A None lock
+    (bobert_companion not loaded — pytest, standalone runs) degrades to a
+    no-op, exactly as in _attempt_camera_wake."""
+
+    def __init__(self, lock) -> None:
+        self._lock = lock
+        self.held = False
+
+    def acquire(self, timeout_s: float) -> bool:
+        if self._lock is None:
+            return True
+        self.held = bool(self._lock.acquire(timeout=timeout_s))
+        return self.held
+
+    def release(self) -> None:
+        if not self.held:
+            return
+        self.held = False
+        try:
+            self._lock.release()
+        except Exception:  # pragma: no cover - defensive: foreign lock object refusing release
+            pass
+
+
 def _probe_webcam() -> dict:
     start = _now()
     try:
-        import cv2  # type: ignore
+        import cv2  # type: ignore  # noqa: F401 — availability check before taking the lock
     except Exception as e:
+        return _result(False, (_now() - start) * 1000.0,
+                       error=f"opencv not importable: {e}")
+
+    # 2026-07-21 audit: every in-process cv2.VideoCapture open/release must
+    # hold bobert_companion._camera_io_lock — overlapping open/release in
+    # DirectShow's plumbing heap-corrupts the process (0xc0000374), and an
+    # unlocked probe steals the device from the face tracker mid-cycle.
+    # Same lock + bounded acquire as _attempt_camera_wake; contention means
+    # the tracker is actively using the camera, so skip as a NON-failure —
+    # the upgrade pipeline must not queue repair tasks for a busy device.
+    bc = _bc()
+    hold = _CameraLockHold(getattr(bc, "_camera_io_lock", None) if bc else None)
+    if not hold.acquire(2.5):
+        return _result(True, (_now() - start) * 1000.0,
+                       details={"skipped": "camera busy — probe skipped "
+                                           "(lock held by tracker)"})
+    try:
+        return _probe_webcam_locked(start, hold)
+    finally:
+        hold.release()
+
+
+def _probe_webcam_locked(start: float, hold: _CameraLockHold) -> dict:
+    """Body of the webcam probe. Runs with ``hold`` taken on
+    _camera_io_lock (when bobert_companion is loaded); drops it early
+    before delegating to _attempt_camera_wake — see _CameraLockHold."""
+    try:
+        import cv2  # type: ignore
+    except Exception as e:  # pragma: no cover — the caller already imported cv2
         return _result(False, (_now() - start) * 1000.0,
                        error=f"opencv not importable: {e}")
 
@@ -764,6 +826,14 @@ def _probe_webcam() -> dict:
             except Exception:  # pragma: no cover - defensive: cv2 release() before wake retry (live-camera I/O, cv2 absent on CI)
                 pass
             cap = None
+            # Release the camera lock BEFORE delegating to the wake helper:
+            # its worker acquires the same lock from a different thread
+            # (diag-wake-N), and RLock reentrancy is per-thread — holding on
+            # here would make every wake falsely time out with "lock held by
+            # tracker". cap is already released and None, and every
+            # post-wake path returns without touching the device, so no
+            # re-acquire is needed.
+            hold.release()
             wake_ok, wake_note = _attempt_camera_wake(cam_index)
             details["wake_attempted"] = True
             details["wake_recovered"] = bool(wake_ok)
@@ -1061,20 +1131,54 @@ def _probe_microphone() -> dict:
         except Exception:  # pragma: no cover - defensive: device-name subscript on a sparse sounddevice list (audio I/O, sounddevice absent on CI)
             pass
 
-    # crash-fix-3 (2026-05-28): opening an `sd.rec()` capture stream from
-    # this probe's daemon thread races the main loop's record_speech and
-    # the wake-word InputStream. When the probe hits PER_PROBE_TIMEOUT_S
-    # the thread is abandoned mid-capture, PortAudio is left holding the
-    # buffer, and the next sweep triggers heap corruption. Skip the live
-    # capture step entirely when JARVIS is awake (mic in active use by
-    # the main loop). Enumeration plus PnP hardware count is enough to
-    # confirm the audio stack is alive.
+    # crash-fix-3 (2026-05-28), extended 2026-07-21 audit: opening an
+    # `sd.rec()` capture stream from this probe's daemon thread while any
+    # other stream is live on the mic causes the documented WASAPI
+    # double-open contention (record_speech records garbage for ~70s until
+    # the watchdog resets the loop), and when the probe hits
+    # PER_PROBE_TIMEOUT_S the thread is abandoned mid-capture, PortAudio is
+    # left holding the buffer, and the next sweep triggers heap corruption.
+    # Skip the live capture step entirely when:
+    #   • any mic/audio OWNERSHIP FLAG is set — the monolith's canonical
+    #     mic-ownership rule (mirrors _refresh_devices' deferral guard in
+    #     bobert_companion). This is the load-bearing check: in sleep/
+    #     standby the main loop runs record_speech(timeout=20) continuously,
+    #     so the old awake-only skip gated the capture exactly backwards —
+    #     _sleep_mode is a conversation-mode latch, not a mic-ownership
+    #     flag;
+    #   • JARVIS is awake — kept as a belt-and-braces skip because the
+    #     wake-word detector's persistent InputStream sets NONE of the
+    #     ownership flags, so awake gaps between turns are not flag-covered;
+    #   • the mic is hard-disabled.
+    # Enumeration plus PnP hardware count is enough to confirm the audio
+    # stack is alive.
     bc = _bc()
+
+    def _owner_flag(name: str) -> bool:
+        """Read a bobert_companion mic-ownership flag: a 1-element list
+        ([False]/[True], or _ambient_stream_active's refcount [0]). An
+        absent attribute / odd shape (SimpleNamespace test doubles, early
+        boot) degrades to False."""
+        try:
+            v = getattr(bc, name, None)
+            return bool(v and v[0])
+        except Exception:
+            return False
+
+    def _mic_owned() -> bool:
+        return bc is not None and (
+            _owner_flag("_record_speech_active")
+            or _owner_flag("_pathb_mic_active")
+            or _owner_flag("_ambient_stream_active")   # refcount — truthy when > 0
+            or _owner_flag("_tts_playback_active"))
+
     awake = bool(bc is not None and not getattr(bc, "_sleep_mode", [True])[0])
     mic_off = bool(getattr(bc, "_mic_input_disabled", lambda: False)())
-    if awake or mic_off:
+    mic_owned = _mic_owned()
+    if awake or mic_off or mic_owned:
         details["live_capture_skipped"] = (
             ("mic hard-disabled (staging / MICROPHONE_INDEX < 0)" if mic_off
+             else "mic owned by record_speech/Path B/ambient/TTS" if mic_owned
              else "JARVIS awake — mic owned by main loop")
             + "; skipping sd.rec() (crash-fix-3 / no-mic guard)"
         )
@@ -1106,6 +1210,16 @@ def _probe_microphone() -> dict:
 
     # Step 1: try the device JARVIS would actually use. This is the only
     # device that matters for "can JARVIS hear me right now".
+    # Re-check ownership immediately before EACH capture (here and per
+    # alternate below): the standby loop's flag drops briefly between
+    # record_speech calls and this probe spans ~1s, so an owner can appear
+    # mid-probe. Same snapshot-race acceptance as the monolith's
+    # _refresh_devices guard, but re-checked per capture.
+    if _mic_owned():
+        details["live_capture_skipped"] = (
+            "mic/audio stream went live before capture; skipping sd.rec() "
+            "(crash-fix-3 / no-mic guard)")
+        return _result(True, (_now() - start) * 1000.0, details=details)
     active_rms, active_err = _capture_rms(active_idx)
     details["active_rms"] = round(active_rms, 5) if active_rms is not None else None
     if active_err:
@@ -1145,6 +1259,15 @@ def _probe_microphone() -> dict:
         except Exception:  # pragma: no cover - defensive: device-name subscript when scanning mic alternates (audio I/O, sounddevice absent on CI)
             best_name = None
     for idx, name in alternates[:MAX_ALTERNATES]:
+        if _mic_owned():
+            # An owner grabbed the mic mid-scan (e.g. standby's next
+            # record_speech turn) — stop opening devices immediately and
+            # report a benign skip rather than a false "silent mic"
+            # verdict built from contended captures.
+            details["live_capture_skipped"] = (
+                "mic/audio stream went live mid-scan; skipping remaining "
+                "sd.rec() captures (crash-fix-3 / no-mic guard)")
+            return _result(True, (_now() - start) * 1000.0, details=details)
         rms, err = _capture_rms(idx, duration_s=0.15)
         alternates_tried.append({
             "index": idx, "name": name,
@@ -1355,8 +1478,35 @@ def _probe_stt() -> dict:
             result = m.transcribe(audio, language="en")
             return (result.get("text") or "").strip()
 
+    # 2026-07-21 audit: when reusing the main loop's cached model we MUST
+    # hold bc._stt_lock across the ENTIRE call — the .transcribe() AND the
+    # generator drain inside _do_transcribe — because two threads driving
+    # one CTranslate2 instance corrupt native state and terminate the
+    # process with an uncatchable 0xc0000409 (see bobert_companion
+    # .transcribe(), the lock's contract). Bounded acquire: contention is
+    # a benign skip, not a failure — the main loop demonstrably has a
+    # working model because it is transcribing with it right now. The
+    # probe-local models (tiny above, CPU fallback below) stay unlocked —
+    # they are private to this probe thread. Deliberately NOT routed
+    # through bc.transcribe(): _transcribe_impl swallows every exception
+    # and returns ("", ...), which would bypass the _is_stt_cuda_dll_error
+    # classification below and turn real STT failures (including the
+    # CUDA-DLL environmental case) into false-passing probes.
+    using_cached = cached_model is not None and model is cached_model
+    lock = getattr(bc, "_stt_lock", None) if using_cached else None
+    if lock is not None and not lock.acquire(timeout=5.0):
+        return _result(True, (_now() - start) * 1000.0,
+                       details={**details,
+                                "skipped": "main loop holds _stt_lock "
+                                           "(STT busy) — probe deferred"})
     try:
-        text = _do_transcribe(model)
+        if lock is not None:
+            try:
+                text = _do_transcribe(model)
+            finally:
+                lock.release()
+        else:
+            text = _do_transcribe(model)
         details["transcribed_text"] = text[:60]
     except Exception as e:
         # CUDA DLL load failures are environmental: the GPU runtime
@@ -1807,6 +1957,20 @@ def _probe_media_playback() -> dict:
 
 
 # ─── Probe 11: skill imports ─────────────────────────────────────────────
+def _compile_skill_source(path: str) -> str | None:
+    """Compile (never exec — exec has side effects: daemon threads, network
+    calls) a skill's source. Returns an error string, or None when it parses."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            source = f.read()
+        compile(source, path, "exec")
+        return None
+    except SyntaxError as e:
+        return f"SyntaxError: {e.msg} (line {e.lineno})"
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+
+
 def _probe_skill_imports() -> dict:
     start = _now()
     skills_dir = os.path.join(_PROJECT_DIR, "skills")
@@ -1814,11 +1978,16 @@ def _probe_skill_imports() -> dict:
         return _result(False, (_now() - start) * 1000.0,
                        error=f"skills directory missing at {skills_dir}")
 
-    # Most skills already imported successfully (load_skills ran at boot).
-    # The probe checks the cache first — if the live module exists, we
-    # don't re-import (re-importing has side effects: re-spawning daemon
-    # threads, re-binding actions). For skills NOT in sys.modules we do
-    # the cheap spec-only resolution to verify the file still parses.
+    bc = _bc()
+    if bc is not None and not getattr(bc, "SKILLS_ENABLED", True):
+        # Skills are switched off entirely — nothing SHOULD be loaded, so
+        # flagging every on-disk stem would be pure noise.
+        return _result(True, (_now() - start) * 1000.0,
+                       details={"skipped": "skills disabled"})
+    loaded = getattr(bc, "_loaded_skill_names", None) if bc is not None else None
+    if not isinstance(loaded, set):
+        loaded = None
+
     failures: list[dict] = []
     checked = 0
 
@@ -1828,31 +1997,57 @@ def _probe_skill_imports() -> dict:
         return _result(False, (_now() - start) * 1000.0,
                        error=f"could not list skills dir: {e}")
 
+    # Enumerate the SAME entries load_skills() enumerates: package dirs
+    # with an __init__.py (which take import precedence) plus flat *.py
+    # stems not shadowed by a package. The probe historically only saw
+    # flat modules, so package skills were never checked at all.
+    to_check: list[tuple[str, str]] = []   # (stem, source path)
+    pkg_stems: set[str] = set()
+    for name in entries:
+        sub = os.path.join(skills_dir, name)
+        if not os.path.isdir(sub) or name.startswith("_") or name == "__pycache__":
+            continue
+        init_path = os.path.join(sub, "__init__.py")
+        if os.path.isfile(init_path):
+            to_check.append((name, init_path))
+            pkg_stems.add(name)
     for name in entries:
         if not name.endswith(".py") or name.startswith("_"):
             continue
         stem = name[:-3]
-        modname = f"skill_{stem}"
+        if stem in pkg_stems:
+            continue   # loader uses the package, not the flat file
+        to_check.append((stem, os.path.join(skills_dir, name)))
+
+    for stem, path in to_check:
         checked += 1
 
-        # If the live module is already loaded we trust it — it
-        # registered actions at boot so a failed import would have
-        # already surfaced.
-        if sys.modules.get(modname) is not None:
+        if loaded is not None:
+            # JARVIS live: cross-check the loader's own success set.
+            # A sys.modules["skill_<stem>"] entry is NOT proof of health —
+            # load_skills registers the module BEFORE exec (so package
+            # sub-imports resolve), so a skill whose module body or
+            # register() raised used to leave a half-initialized module
+            # there and this probe called it green (2026-07-21 audit).
+            # _loaded_skill_names is only added to after successful
+            # exec + register, so it is the authoritative record.
+            if stem in loaded:
+                continue
+            err = _compile_skill_source(path)
+            if err is None:
+                err = ("on disk but not loaded at boot — import/register "
+                       "raised, see boot log; run reload_skills if newly added")
+            failures.append({"skill": stem, "error": err})
             continue
 
-        # Otherwise verify the file parses. We compile rather than
-        # exec because exec can have side effects (network calls,
-        # daemon threads) we don't want to repeat per sweep.
-        path = os.path.join(skills_dir, name)
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                source = f.read()
-            compile(source, path, "exec")
-        except SyntaxError as e:
-            failures.append({"skill": stem, "error": f"SyntaxError: {e.msg} (line {e.lineno})"})
-        except Exception as e:
-            failures.append({"skill": stem, "error": f"{type(e).__name__}: {e}"})
+        # Loader set unavailable (probe running outside JARVIS, e.g.
+        # standalone pytest): fall back to trusting a live sys.modules
+        # entry, and verifying that unloaded files at least parse.
+        if sys.modules.get(f"skill_{stem}") is not None:
+            continue
+        err = _compile_skill_source(path)
+        if err is not None:
+            failures.append({"skill": stem, "error": err})
 
     details = {"checked": checked, "failures": failures,
                "loaded_modules": sum(1 for k in sys.modules if k.startswith("skill_"))}
@@ -1860,7 +2055,7 @@ def _probe_skill_imports() -> dict:
     if failures:
         names = ", ".join(f["skill"] for f in failures)
         return _result(False, (_now() - start) * 1000.0,
-                       error=f"{len(failures)} skill(s) failed to compile: {names}",
+                       error=f"{len(failures)} skill(s) failed to load: {names}",
                        details=details)
     return _result(True, (_now() - start) * 1000.0, details=details)
 

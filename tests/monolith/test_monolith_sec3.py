@@ -965,12 +965,27 @@ class OllamaProbeTests(MonolithGlobalsTestCase):
         with mock.patch.object(self.bc, "requests", fake_req):
             self.assertTrue(self.bc._ollama_has_model("llama3.1:8b-instruct-q5_K_M"))
 
-    def test_has_model_base_name_match(self):
+    def test_has_model_latest_expansion_match(self):
+        # Only the implicit ':latest' expansion counts ("m" <-> "m:latest") —
+        # how Ollama names a bare-name pull.
         fake_req = mock.Mock()
         fake_req.get.return_value = _FakeResp(
             ok=True, json_data={"models": [{"name": "qwen2.5:latest"}]})
         with mock.patch.object(self.bc, "requests", fake_req):
-            self.assertTrue(self.bc._ollama_has_model("qwen2.5:14b-instruct"))
+            self.assertTrue(self.bc._ollama_has_model("qwen2.5"))
+            self.assertTrue(self.bc._ollama_has_model("qwen2.5:latest"))
+
+    def test_has_model_sibling_tag_does_not_match(self):
+        # 2026-07-21 audit: the old base-name match returned True for ANY
+        # sibling tag, defeating _act_switch_llm's "only if installed" guard —
+        # the resolver cache got pinned at an uninstalled tag that 404'd every
+        # turn with no recovery. A different sized/quantised sibling is NOT
+        # the requested model.
+        fake_req = mock.Mock()
+        fake_req.get.return_value = _FakeResp(
+            ok=True, json_data={"models": [{"name": "qwen2.5:latest"}]})
+        with mock.patch.object(self.bc, "requests", fake_req):
+            self.assertFalse(self.bc._ollama_has_model("qwen2.5:14b-instruct"))
 
     def test_has_model_absent(self):
         fake_req = mock.Mock()
@@ -1904,9 +1919,12 @@ class SynthesiseTests(MonolithGlobalsTestCase):
 
     def test_edge_path_applies_gain(self):
         base = np.full(8, 0.5, dtype=np.float32)
+        # Pin TTS_BACKEND: the live config on this box selects 'kokoro', which
+        # would render REAL audio instead of the mocked edge render.
         with mock.patch.object(self.bc, "_last_voice_route", [None]), \
                 mock.patch.object(self.bc, "_last_user_tone", [None]), \
                 mock.patch.object(self.bc, "_last_mood", [None]), \
+                mock.patch.dict(self.bc.__dict__, {"TTS_BACKEND": "edge"}), \
                 mock.patch.object(self.bc, "_resolve_tts_preset",
                                   return_value=("amused",
                                                 {"rate": "+0%", "pitch": "+0Hz",
@@ -1973,8 +1991,52 @@ class IsUsingHeadsetTests(MonolithGlobalsTestCase):
             self.assertTrue(self.bc.is_using_headset())
 
     def test_false_when_no_device(self):
-        with mock.patch.object(self.bc, "get_output_device", return_value=None):
+        # get_output_device()=None now falls back to resolving the SYSTEM
+        # DEFAULT output (2026-07-21 audit) — only a genuinely absent default
+        # (sd.default.device None/empty) is False. Patch a fake sd so the
+        # assertion doesn't depend on this machine's real default device.
+        fake_sd = mock.Mock()
+        fake_sd.default.device = None
+        with mock.patch.object(self.bc, "get_output_device",
+                               return_value=None), \
+                mock.patch.object(self.bc, "sd", fake_sd):
             self.assertFalse(self.bc.is_using_headset())
+
+    def test_default_output_resolved_and_matched(self):
+        # THE 2026-07-21 regression ("reports False whenever the speaker
+        # cache falls back"): with no explicit preference the system default
+        # output must be resolved and name-checked like an explicit one —
+        # otherwise auto-standby-on-music is dead for the default config.
+        fake_sd = mock.Mock()
+        fake_sd.default.device = [0, 5]
+        fake_sd.query_devices.return_value = {"name": "USB Wireless Headset"}
+        with mock.patch.object(self.bc, "get_output_device",
+                               return_value=None), \
+                mock.patch.object(self.bc, "sd", fake_sd), \
+                mock.patch.object(self.bc, "HEADSET_NAME_HINTS", ["headset"]):
+            self.assertTrue(self.bc.is_using_headset())
+        fake_sd.query_devices.assert_called_once_with(5)
+
+    def test_default_output_resolved_but_not_headset(self):
+        fake_sd = mock.Mock()
+        fake_sd.default.device = [0, 5]
+        fake_sd.query_devices.return_value = {"name": "Realtek Speakers"}
+        with mock.patch.object(self.bc, "get_output_device",
+                               return_value=None), \
+                mock.patch.object(self.bc, "sd", fake_sd), \
+                mock.patch.object(self.bc, "HEADSET_NAME_HINTS", ["headset"]):
+            self.assertFalse(self.bc.is_using_headset())
+
+    def test_portaudio_no_default_output_guard(self):
+        # PortAudio reports "no default output" as -1 — must return False
+        # without ever querying index -1.
+        fake_sd = mock.Mock()
+        fake_sd.default.device = [0, -1]
+        with mock.patch.object(self.bc, "get_output_device",
+                               return_value=None), \
+                mock.patch.object(self.bc, "sd", fake_sd):
+            self.assertFalse(self.bc.is_using_headset())
+        fake_sd.query_devices.assert_not_called()
 
     def test_false_on_exception(self):
         fake_sd = mock.Mock()
@@ -2558,6 +2620,135 @@ class SynthesiseExtraPathsTests(MonolithGlobalsTestCase):
             for p in patches:
                 p.stop()
         self.assertEqual(sr, 22050)
+
+    # ── kokoro prosody (2026-07-21 audit: "Kokoro TTS backend discards the
+    #    whole prosody layer") — the preset rate must reach kokoro as a speed
+    #    multiplier, and wry replies must keep their spliced pause. ──────────
+
+    def test_rate_to_speed_parses_and_clamps(self):
+        self.assertAlmostEqual(self.bc._rate_to_speed("-15%"), 0.85)
+        self.assertAlmostEqual(self.bc._rate_to_speed("+0%"), 1.0)
+        self.assertAlmostEqual(self.bc._rate_to_speed("+3%"), 1.03)
+        # Clamped so a wild preset can't distort speech…
+        self.assertAlmostEqual(self.bc._rate_to_speed("+300%"), 2.0)
+        self.assertAlmostEqual(self.bc._rate_to_speed("-90%"), 0.5)
+        # …and malformed values fail closed to 1.0 (never mute JARVIS).
+        self.assertAlmostEqual(self.bc._rate_to_speed("garbage"), 1.0)
+        self.assertAlmostEqual(self.bc._rate_to_speed(""), 1.0)
+        self.assertAlmostEqual(self.bc._rate_to_speed(None), 1.0)
+
+    def test_kokoro_receives_preset_speed(self):
+        # The direct regression pin for "rate computed then thrown away":
+        # a '-15%' preset must reach kokoro as speed=0.85.
+        base = np.ones(8, dtype=np.float32)
+        preset = {"rate": "-15%", "pitch": "+0Hz", "gain": 1.0}
+        patches = self._common_patches("neutral", preset)
+        patches.append(mock.patch.dict(
+            self.bc.__dict__,
+            {"TTS_BACKEND": "kokoro", "VOICE_CLONE_ENABLED": False}))
+        patches.append(mock.patch("core.kokoro_tts.is_available",
+                                  return_value=True))
+        for p in patches:
+            p.start()
+        try:
+            with mock.patch("core.kokoro_tts.synthesize",
+                            return_value=(base, 24000)) as ks:
+                audio, sr = self.bc.synthesise("hello")
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertEqual(sr, 24000)
+        self.assertAlmostEqual(ks.call_args.kwargs["speed"], 0.85, places=6)
+
+    def test_kokoro_neutral_rate_passes_speed_one(self):
+        base = np.ones(8, dtype=np.float32)
+        preset = {"rate": "+0%", "pitch": "+0Hz", "gain": 1.0}
+        patches = self._common_patches("neutral", preset)
+        patches.append(mock.patch.dict(
+            self.bc.__dict__,
+            {"TTS_BACKEND": "kokoro", "VOICE_CLONE_ENABLED": False}))
+        patches.append(mock.patch("core.kokoro_tts.is_available",
+                                  return_value=True))
+        for p in patches:
+            p.start()
+        try:
+            with mock.patch("core.kokoro_tts.synthesize",
+                            return_value=(base, 24000)) as ks:
+                self.bc.synthesise("hello")
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertAlmostEqual(ks.call_args.kwargs["speed"], 1.0, places=6)
+
+    def test_kokoro_wry_split_splices_silence(self):
+        # Mirrors the edge wry test above: the hoisted wry split must splice
+        # the pause on the KOKORO branch too (it used to be edge-only, so
+        # kokoro replies lost the comic beat).
+        fake_layer = mock.Mock()
+        fake_layer.split_for_wry_pause.return_value = ("Setup,", "punchline.")
+        fake_layer.WRY_PAUSE_MS = 200
+        preset = {"rate": "+3%", "pitch": "+0Hz", "gain": 1.0}
+        patches = self._common_patches("wry", preset)
+        patches.append(mock.patch.object(self.bc, "_tts_layer", fake_layer))
+        patches.append(mock.patch.dict(
+            self.bc.__dict__,
+            {"TTS_BACKEND": "kokoro", "VOICE_CLONE_ENABLED": False}))
+        patches.append(mock.patch("core.kokoro_tts.is_available",
+                                  return_value=True))
+        for p in patches:
+            p.start()
+        try:
+            with mock.patch(
+                    "core.kokoro_tts.synthesize",
+                    side_effect=[(np.ones(100, dtype=np.float32), 24000),
+                                 (np.ones(50, dtype=np.float32), 24000)]) as ks, \
+                    mock.patch.object(self.bc, "_render_edge_tts") as edge:
+                audio, sr = self.bc.synthesise("Setup, punchline.")
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertEqual(sr, 24000)
+        # head + (200ms silence @24k = 4800) + tail
+        self.assertEqual(audio.shape[0], 100 + int(24000 * 200 / 1000) + 50)
+        edge.assert_not_called()
+        # Both clause renders carried the preset speed.
+        for c in ks.call_args_list:
+            self.assertAlmostEqual(c.kwargs["speed"], 1.03, places=6)
+
+    def test_kokoro_wry_partial_failure_falls_through(self):
+        # Fail-closed rule: a half-rendered wry line must never ship head-only
+        # kokoro audio — if EITHER clause returns None the whole attempt falls
+        # through to the edge ladder, which performs its own wry splice.
+        fake_layer = mock.Mock()
+        fake_layer.split_for_wry_pause.return_value = ("Setup,", "punchline.")
+        fake_layer.WRY_PAUSE_MS = 200
+        preset = {"rate": "+0%", "pitch": "+0Hz", "gain": 1.0}
+        patches = self._common_patches("wry", preset)
+        patches.append(mock.patch.object(self.bc, "_tts_layer", fake_layer))
+        patches.append(mock.patch.dict(
+            self.bc.__dict__,
+            {"TTS_BACKEND": "kokoro", "VOICE_CLONE_ENABLED": False}))
+        patches.append(mock.patch("core.kokoro_tts.is_available",
+                                  return_value=True))
+        for p in patches:
+            p.start()
+        try:
+            with mock.patch(
+                    "core.kokoro_tts.synthesize",
+                    side_effect=[(np.ones(100, dtype=np.float32), 24000),
+                                 None]), \
+                    mock.patch.object(
+                        self.bc, "_render_edge_tts",
+                        side_effect=[(np.ones(40, dtype=np.float32), 24000),
+                                     (np.ones(20, dtype=np.float32), 24000)]) as edge:
+                audio, sr = self.bc.synthesise("Setup, punchline.")
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertEqual(sr, 24000)
+        # The edge ladder rendered BOTH clauses and spliced its own pause.
+        self.assertEqual(edge.call_count, 2)
+        self.assertEqual(audio.shape[0], 40 + int(24000 * 200 / 1000) + 20)
 
 
 @requires_monolith
@@ -5342,8 +5533,12 @@ class GetLocalLlmModel32bTests(MonolithGlobalsTestCase):
             out = self.bc._get_local_llm_model()
         self.assertEqual(out, "gemma4:26b-a4b-it-qat")
 
-    def test_picks_qwen3_moe_when_no_gemma4(self):
-        # gemma4 not installed → next chain entry is the qwen3 30B MoE.
+    def test_picks_14b_when_no_gemma4(self):
+        # gemma4 not installed → the next chain entry that matches is the
+        # proven qwen2.5 14B failover. (This test used to expect the qwen3
+        # 30B MoE, but that tag was DROPPED from _LOCAL_LLM_PREFERENCE in
+        # 2026-07 — it redlines the 24 GB card beside the voice clone — so
+        # the off-list installed 30B must NOT beat the chain's 14B.)
         fake_req = mock.Mock()
         fake_req.get.return_value = _FakeResp(ok=True, json_data={"models": [
             {"name": "qwen3:30b-a3b-instruct-2507-q4_K_M"},
@@ -5352,7 +5547,7 @@ class GetLocalLlmModel32bTests(MonolithGlobalsTestCase):
         with mock.patch.object(self.bc, "requests", fake_req), \
                 mock.patch.object(self.bc, "_log_gpu_state"):
             out = self.bc._get_local_llm_model()
-        self.assertEqual(out, "qwen3:30b-a3b-instruct-2507-q4_K_M")
+        self.assertEqual(out, "qwen2.5:14b-instruct-q5_K_M")
 
     def test_falls_to_14b_when_only_14b_present(self):
         # Neither MoE installed → cleanly drops to the next chain entry (14B).

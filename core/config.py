@@ -202,6 +202,15 @@ LOCAL_LLM_FALLBACK = True
 # Kokoro instead of OOM-contending the card. qwen3:30b-a3b stays a text-only opt-in
 # "max brain" (breaks the shared-vision property). Override via JARVIS_LOCAL_LLM_MODEL.
 LOCAL_LLM_MODEL    = "gemma4:26b-a4b-it-qat"
+# The SHIPPED default, captured BEFORE _apply_user_settings() (bottom of this
+# file) can overwrite the public constant from data/user_settings.json. The
+# resolver (bobert_companion._get_local_llm_model) compares LOCAL_LLM_MODEL
+# against this to tell "the owner picked a model" from "still the default" —
+# capturing it HERE, once, avoids hard-coding the tag a second time anywhere
+# else (the stale-duplicate bug class). The underscore prefix keeps it out of
+# `from core.config import *` AND makes it un-overridable: the settings
+# apply-loop skips `_`-prefixed keys. 2026-07-21 audit.
+_SHIPPED_LOCAL_LLM_MODEL = LOCAL_LLM_MODEL
 # 127.0.0.1, NEVER "localhost" (2026-07-12): Windows resolves localhost to
 # ::1 first, and when Ollama listens only on IPv4 the ::1 attempt eats a
 # measured, rock-steady ~2.05s before falling back — pushing every request

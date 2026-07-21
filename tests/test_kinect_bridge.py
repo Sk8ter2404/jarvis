@@ -170,6 +170,56 @@ class _FakeRuntime:
         self.closed = True
 
 
+class _RealisticFlagsRuntime:
+    """Mimics the INSTALLED pykinect2 build's real (buggy) surface — the
+    2026-07-21 audit's root cause. That build assigns `_last_*_frame_access` as
+    bare LOCALS in get_last_*() (no `self.`), so has_new_color/body_frame() is
+    permanently True once ONE frame of the stream has ever arrived: reading a
+    frame does NOT clear the readiness flag (unlike _FakeRuntime's faithful
+    clear-on-read model of the intended API). Freshness is carried instead by
+    `_last_color_frame_time` / `_last_body_frame_time`, which advance ONLY on
+    simulated frame ARRIVAL (deliver_color_frame / deliver_body_frame) — exactly
+    like the real handle_*_arrived callbacks."""
+
+    def __init__(self):
+        self.source_flags = 0
+        self._color = None
+        self._bodies = None
+        self._ever_color = False
+        self._ever_body = False
+        self._last_color_frame_time = 0.0
+        self._last_body_frame_time = 0.0
+        self.closed = False
+
+    # Simulated frame ARRIVAL — the ONLY thing that advances the frame times.
+    def deliver_color_frame(self, flat):
+        self._color = flat
+        self._ever_color = True
+        self._last_color_frame_time += 1.0
+
+    def deliver_body_frame(self, bodies):
+        self._bodies = bodies
+        self._ever_body = True
+        self._last_body_frame_time += 1.0
+
+    # The installed-build bug: sticky True forever after the first frame.
+    def has_new_color_frame(self):
+        return self._ever_color
+
+    def has_new_body_frame(self):
+        return self._ever_body
+
+    # Getters re-serve the frozen buffer and do NOT clear the flags (the bug).
+    def get_last_color_frame(self):
+        return self._color
+
+    def get_last_body_frame(self):
+        return _FakeBodyFrame(self._bodies) if self._bodies is not None else None
+
+    def close(self):
+        self.closed = True
+
+
 def _patch_loader(test, runtime):
     """Make import_pykinect2() return a fake PyKinectV2 plus a runtime module
     whose PyKinectRuntime(flags) yields `runtime`. Returns nothing; restores on
@@ -198,6 +248,10 @@ class _BridgeBase(unittest.TestCase):
         # of being served a previous test's still-fresh cached bodies.
         kb._body_cache[0] = None
         kb._body_cache_at[0] = 0.0
+        # Reset the per-stream last-consumed frame-time cells (the bridge-derived
+        # freshness layer) so one test's consumed stamps never leak into the next.
+        kb._color_time_seen[0] = 0.0
+        kb._body_time_seen[0] = 0.0
         self._orig_enabled = kb._ENABLED
         kb._ENABLED = True   # most tests assume opted-in; disabled tests flip it
         # The production open-path now polls rt.has_new_color/body_frame() for
@@ -232,6 +286,8 @@ class _BridgeBase(unittest.TestCase):
         kb._negative_until[0] = 0.0
         kb._body_cache[0] = None
         kb._body_cache_at[0] = 0.0
+        kb._color_time_seen[0] = 0.0
+        kb._body_time_seen[0] = 0.0
         kb._ENABLED = self._orig_enabled
 
     def _inject(self, name, module):
@@ -633,6 +689,109 @@ class PresenceTests(_BridgeBase):
         })
         _patch_loader(self, _FakeRuntime(bodies=[body]))
         self.assertFalse(kb.get_presence()["facing"])
+
+
+class BodyIsFacingReliabilityTests(_BridgeBase):
+    """2026-07-21 audit: _body_is_facing was the LAST un-migrated copy of the
+    2026-07-15 ghost-audit joint-reliability gate. A NotTracked zero-fill head
+    or shoulder fabricated a confident WRONG False (owner demoted to the worst
+    facing_rank in the gesture owner-pick; presence['facing'] misreported). The
+    fixed contract: unreliable head/spine → None (unknown, never a guess);
+    unreliable shoulders → fall back to the upright-only verdict."""
+
+    def test_none_when_head_zero_filled_not_false(self):
+        # The card's core scenario: NotTracked zero-fill head + tracked spine.
+        # Old code computed upright = 0.0 > 0.35 → a confident WRONG False.
+        j = {"head": (0.0, 0.0, 0.0, 0),
+             "spine_shoulder": (0.0, 0.35, 2.0, 2),
+             "shoulder_left": (0.0, 0.0, 0.0, 0),
+             "shoulder_right": (0.0, 0.0, 0.0, 0)}
+        self.assertIsNone(kb._body_is_facing(j))
+
+    def test_none_when_head_only_inferred(self):
+        # Inferred (state 1) is the SDK's guess, below the reliability floor.
+        j = {"head": (0.0, 0.6, 2.0, 1), "spine_shoulder": (0.0, 0.35, 2.0, 2)}
+        self.assertIsNone(kb._body_is_facing(j))
+
+    def test_none_when_no_reliable_spine_reference(self):
+        j = {"head": (0.0, 0.6, 2.0, 2),
+             "spine_shoulder": (0.0, 0.35, 2.0, 1),
+             "spine_mid": (0.0, 0.0, 0.0, 0)}
+        self.assertIsNone(kb._body_is_facing(j))
+
+    def test_upright_only_verdict_when_shoulders_unreliable(self):
+        # Tracked head+spine but garbage shoulders: an INFERRED huge z-gap (the
+        # occluded-shoulder case that used to read as side-on → False) must be
+        # ignored — the verdict falls back to upright-only True.
+        j = {"head": (0.0, 0.6, 2.0, 2), "spine_shoulder": (0.0, 0.35, 2.0, 2),
+             "shoulder_left": (-0.2, 0.4, 1.2, 1),
+             "shoulder_right": (0.2, 0.4, 2.8, 1)}
+        self.assertTrue(kb._body_is_facing(j))
+
+    def test_zero_filled_shoulders_do_not_fake_a_facing_match(self):
+        # Both shoulders zero-filled would satisfy abs(0-0) < 0.30 — the verdict
+        # must come from the upright term only, never the garbage gap.
+        j = {"head": (0.0, 0.2, 2.0, 2), "spine_shoulder": (0.0, 0.35, 2.0, 2),
+             "shoulder_left": (0.0, 0.0, 0.0, 2),
+             "shoulder_right": (0.0, 0.0, 0.0, 2)}
+        # Head BELOW spine → not upright → False via the upright-only path
+        # (a slumped/odd pose with reliable references is a real verdict).
+        self.assertIs(kb._body_is_facing(j), False)
+
+    def test_unreliable_spine_shoulder_falls_through_to_spine_mid(self):
+        # A present-but-unreliable spine_shoulder must not block the reliable
+        # spine_mid fallback (the fix's refinement over `get() or get()`).
+        j = {"head": (0.0, 0.6, 2.0, 2),
+             "spine_shoulder": (0.0, 0.0, 0.0, 0),
+             "spine_mid": (0.0, 0.2, 2.0, 2)}
+        self.assertIs(kb._body_is_facing(j), True)
+
+    def test_fully_tracked_verdicts_unchanged(self):
+        # Behaviour regression guard: reliable joints keep the old semantics.
+        square = {"head": (0.0, 0.6, 2.0, 2), "spine_shoulder": (0.0, 0.0, 2.0, 2),
+                  "shoulder_left": (-0.2, 0.4, 2.0, 2),
+                  "shoulder_right": (0.2, 0.4, 2.0, 2)}
+        self.assertIs(kb._body_is_facing(square), True)
+        side_on = {"head": (0.0, 0.6, 2.0, 2), "spine_shoulder": (0.0, 0.0, 2.0, 2),
+                   "shoulder_left": (-0.1, 0.4, 1.6, 2),
+                   "shoulder_right": (0.1, 0.4, 2.4, 2)}
+        self.assertIs(kb._body_is_facing(side_on), False)
+
+    def test_presence_facing_none_when_head_untracked_end_to_end(self):
+        # A real body (passes _body_is_real: plenty of tracked joints + core)
+        # whose HEAD is zero-filled must flow facing=None through get_presence's
+        # any()-aggregation — not a confident wrong False.
+        jlist = []
+        for idx in range(kb._JOINT_COUNT):
+            name = kb._JOINT_NAMES[idx]
+            if name == "head":
+                jlist.append(_FakeJoint(0.0, 0.0, 0.0, state=0))  # zero-fill
+            else:
+                jlist.append(_FakeJoint(0.1, 0.2, 2.0, state=2))
+        body = types.SimpleNamespace(is_tracked=True, joints=jlist,
+                                     tracking_id=7)
+        _patch_loader(self, _FakeRuntime(bodies=[body]))
+        pres = kb.get_presence()
+        self.assertTrue(pres["present"])
+        self.assertIsNone(pres["facing"])
+
+    def test_body_is_facing_source_gates_every_joint_read(self):
+        # STALE-DUPLICATE INVARIANT: _body_is_facing rotted for a week as the
+        # one raw-joint-read copy while its siblings were migrated. Enforce
+        # structurally that every joints.get() result it binds is passed through
+        # _joint_reliable somewhere in the function, so a future edit cannot
+        # reintroduce an ungated read without failing the suite.
+        import inspect
+        import re
+        src = inspect.getsource(kb._body_is_facing)
+        assigned = re.findall(r"(\w+)\s*=\s*joints\.get\(", src)
+        self.assertTrue(assigned, "expected joints.get() reads in _body_is_facing")
+        gated = set(re.findall(r"_joint_reliable\(\s*(\w+)\s*\)", src))
+        for var in assigned:
+            self.assertIn(
+                var, gated,
+                f"_body_is_facing binds a joint to {var!r} without a "
+                f"_joint_reliable gate — the ghost-audit regression class")
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -1892,6 +2051,216 @@ class ColorStaleStampGatingTests(_BridgeBase):
         # …so color reads as stale once the window elapses.
         self.assertTrue(
             kb._color_frame_is_stale(now=100.0 + kb.BODY_STALE_RESET_SEC + 0.5))
+
+
+class RealisticFlagFreshnessTests(_BridgeBase):
+    """2026-07-21 audit: the INSTALLED pykinect2 build never clears its
+    has_new_*_frame() flags (bare-local access-stamp bug), so every freshness
+    gate the bridge built on them — require_new, both staleness clocks,
+    reset_if_body_stale, presence aging — was a no-op: a wedged/unplugged
+    sensor was served as live FOREVER. The bridge now derives freshness from
+    `_last_*_frame_time` ADVANCING (see _frame_time_advanced), falling back to
+    the flags on builds without the timestamp attrs. _RealisticFlagsRuntime
+    models the real buggy surface; every test here is RED against flag-trusting
+    code."""
+
+    def setUp(self):
+        super().setUp()
+        self._orig_last = kb._last_body_frame_at[0]
+        self._orig_last_color = kb._last_color_frame_at[0]
+        self.addCleanup(lambda: kb._last_body_frame_at.__setitem__(0, self._orig_last))
+        self.addCleanup(lambda: kb._last_color_frame_at.__setitem__(0, self._orig_last_color))
+
+    def _body(self):
+        return _FakeBody(True, {"head": (0, 0.6, 1.8),
+                                "spine_shoulder": (0, 0.0, 1.8)})
+
+    # ── (1) the headline wedge self-heal ────────────────────────────────────
+    def test_wedged_sensor_goes_stale_and_resets_despite_sticky_flags(self):
+        np = _require_numpy(self)
+        flat = np.zeros(1920 * 1080 * 4, dtype=np.uint8)
+        rt = _RealisticFlagsRuntime()
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        # One real frame arrives on each plane and the pump consumes it.
+        rt.deliver_color_frame(flat)
+        rt.deliver_body_frame([self._body()])
+        kb._pump_tick()
+        self.assertEqual(len(kb.get_bodies()), 1)
+        # The sensor now WEDGES: no more arrivals — frame times FROZEN — but the
+        # installed-build bug keeps both readiness flags asserting True.
+        self.assertTrue(rt.has_new_color_frame())
+        self.assertTrue(rt.has_new_body_frame())
+        # Pin both staleness clocks, then run more pump-style reads: with the
+        # flags sticky-True the OLD code re-stamped both clocks every tick, so
+        # staleness could never accrue. The fixed code sees no time advance and
+        # must leave the clocks untouched.
+        kb._last_body_frame_at[0] = 100.0
+        kb._last_color_frame_at[0] = 100.0
+        for _ in range(5):
+            kb._read_and_cache_bodies()
+            kb._prime_color_frame()
+        self.assertEqual(kb._last_body_frame_at[0], 100.0)
+        self.assertEqual(kb._last_color_frame_at[0], 100.0)
+        # Both planes therefore go stale and the self-heal reset actually fires.
+        later = 100.0 + kb.BODY_STALE_RESET_SEC + 1.0
+        self.assertTrue(kb._color_frame_is_stale(now=later))
+        self.assertTrue(kb._body_frame_is_stale(now=later))
+        self.assertTrue(kb.reset_if_body_stale(now=later))
+        self.assertIsNone(kb._runtime[0])   # dropped for reopen
+        self.assertTrue(rt.closed)          # dead handle released
+
+    # ── (2) frozen-frame refusal ────────────────────────────────────────────
+    def test_require_new_refuses_frozen_frame_despite_sticky_flag(self):
+        np = _require_numpy(self)
+        flat = np.zeros(1920 * 1080 * 4, dtype=np.uint8)
+        rt = _RealisticFlagsRuntime()
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        rt.deliver_color_frame(flat)
+        # The genuinely-new frame serves…
+        self.assertIsNotNone(kb.get_color_bgr(require_new=True))
+        # …then the flag stays wrongly True (the installed-build bug) but the
+        # frame time is frozen: require_new must now refuse (ask_vision must not
+        # be fed an arbitrarily old picture as fresh)…
+        self.assertTrue(rt.has_new_color_frame())
+        self.assertIsNone(kb.get_color_bgr(require_new=True))
+        # …while the require_new=False preview peek still serves the last buffer.
+        self.assertIsNotNone(kb.get_color_bgr(require_new=False))
+
+    # ── (3) no phantom presence off a frozen body stream ────────────────────
+    def test_frozen_body_stream_ages_out_no_phantom_presence(self):
+        rt = _RealisticFlagsRuntime()
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        rt.deliver_body_frame([self._body()])
+        self.assertEqual(len(kb._read_and_cache_bodies()), 1)   # real frame served
+        # Person departs + stream wedges: frozen body time, sticky flag. Reads
+        # must NOT re-stamp the staleness clock…
+        kb._last_body_frame_at[0] = 50.0
+        kb._read_and_cache_bodies()
+        self.assertEqual(kb._last_body_frame_at[0], 50.0)
+        # …and once the cache ages past BODY_CACHE_FRESH_SEC the consumers stop
+        # asserting the departed person instead of re-serving them forever.
+        kb._body_cache_at[0] = kb.time.monotonic() - (kb.BODY_CACHE_FRESH_SEC + 1.0)
+        self.assertEqual(kb.get_bodies(), [])
+        self.assertFalse(kb.get_presence()["present"])
+
+    # ── (4) healthy-stream no-regression (the starvation guard) ─────────────
+    def test_healthy_stream_still_serves_and_never_resets(self):
+        # Guards against the card's PRIMARY (rejected) clear-on-read patch,
+        # which would have made COLOR single-consumer and let the pump starve
+        # require_new=True on a HEALTHY sensor. With frame times advancing every
+        # tick: one-shot consumers keep getting frames, the seen-cells advance,
+        # and the stale-reset never fires.
+        np = _require_numpy(self)
+        flat = np.zeros(1920 * 1080 * 4, dtype=np.uint8)
+        rt = _RealisticFlagsRuntime()
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        for _ in range(5):
+            rt.deliver_color_frame(flat)
+            rt.deliver_body_frame([self._body()])
+            self.assertIsNotNone(kb.get_color_bgr(require_new=True))
+            kb._pump_tick()
+            self.assertEqual(len(kb.get_bodies()), 1)
+        self.assertIsNotNone(kb._runtime[0])            # reset never fired
+        self.assertEqual(kb._color_time_seen[0], rt._last_color_frame_time)
+        self.assertEqual(kb._body_time_seen[0], rt._last_body_frame_time)
+
+    # ── (5) H3 interplay: the non-consuming fallback leaves the frame pending ─
+    def test_non_consuming_fallback_leaves_seen_cell_for_pump(self):
+        rt = _RealisticFlagsRuntime()
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        rt.deliver_body_frame([self._body()])
+        # A consumer's non-consuming fallback with a live pump serves the cache
+        # and must NOT stamp the seen-cell — the pending frame belongs to the pump.
+        kb._body_cache[0] = [{"id": 5, "joints": {}, "head": None}]
+        kb._body_cache_at[0] = kb.time.monotonic()
+        with mock.patch.object(kb, "_pump_is_alive", lambda: True):
+            got = kb._read_and_cache_bodies(consume=False)
+        self.assertEqual(got[0]["id"], 5)
+        self.assertEqual(kb._body_time_seen[0], 0.0)    # still pending
+        # The pump then consumes it and stamps the cell.
+        got2 = kb._read_and_cache_bodies(consume=True)
+        self.assertEqual(len(got2), 1)
+        self.assertEqual(kb._body_time_seen[0], rt._last_body_frame_time)
+
+    # ── helper + seeding unit coverage ──────────────────────────────────────
+    def test_frame_time_advanced_flag_fallback_without_timestamp_attrs(self):
+        # Builds without _last_*_frame_time (the clear-on-read _FakeRuntime and
+        # any foreign pykinect2) degrade to the readiness flag — proving the
+        # whole existing fake-backed suite still exercises the same paths.
+        rt = _FakeRuntime(color=object())
+        cell = [0.0]
+        adv, t = kb._frame_time_advanced(
+            rt, "_last_color_frame_time", "has_new_color_frame", cell)
+        self.assertTrue(adv)
+        self.assertIsNone(t)                 # nothing to stamp on the fallback
+        rt.get_last_color_frame()            # clears the fake's readiness flag
+        adv2, t2 = kb._frame_time_advanced(
+            rt, "_last_color_frame_time", "has_new_color_frame", cell)
+        self.assertFalse(adv2)
+        self.assertIsNone(t2)
+
+    def test_frame_time_advanced_tracks_timestamp(self):
+        rt = types.SimpleNamespace(_last_color_frame_time=5.0)
+        cell = [5.0]
+        self.assertEqual(
+            kb._frame_time_advanced(rt, "_last_color_frame_time",
+                                    "has_new_color_frame", cell),
+            (False, 5.0))
+        rt._last_color_frame_time = 6.5
+        self.assertEqual(
+            kb._frame_time_advanced(rt, "_last_color_frame_time",
+                                    "has_new_color_frame", cell),
+            (True, 6.5))
+
+    def test_frame_time_advanced_never_raises_on_garbage(self):
+        # A junk timestamp attr + no readiness flag degrades to (False, None).
+        rt = types.SimpleNamespace(_last_color_frame_time="junk")
+        self.assertEqual(
+            kb._frame_time_advanced(rt, "_last_color_frame_time",
+                                    "has_new_color_frame", [0.0]),
+            (False, None))
+
+    def test_publish_runtime_seeds_seen_cells_from_instance_times(self):
+        # A freshly-published runtime's ALREADY-ARRIVED frames (the open verify)
+        # must read as seen — no spurious "new frame" — and the dead instance's
+        # older stamps must not mask the new instance (perf_counter is
+        # process-wide, so cross-instance comparisons are meaningless).
+        rt = _RealisticFlagsRuntime()
+        rt._last_color_frame_time = 7.5
+        rt._last_body_frame_time = 3.25
+        kb._runtime[0] = None
+        with mock.patch.object(kb, "_ensure_pump_alive", lambda: False):
+            got = kb._publish_runtime(rt)
+        self.assertIs(got, rt)
+        self.assertEqual(kb._color_time_seen[0], 7.5)
+        self.assertEqual(kb._body_time_seen[0], 3.25)
+
+    def test_publish_runtime_zeroes_seen_cells_without_timestamp_attrs(self):
+        kb._color_time_seen[0] = 42.0
+        kb._body_time_seen[0] = 42.0
+        kb._runtime[0] = None
+        with mock.patch.object(kb, "_ensure_pump_alive", lambda: False):
+            kb._publish_runtime(_FakeRuntime())
+        self.assertEqual(kb._color_time_seen[0], 0.0)
+        self.assertEqual(kb._body_time_seen[0], 0.0)
+
+    def test_reset_if_body_stale_zeroes_seen_cells(self):
+        rt = _FakeRuntime()
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        kb._color_time_seen[0] = 9.0
+        kb._body_time_seen[0] = 9.0
+        kb._last_body_frame_at[0] = 1.0
+        kb._last_color_frame_at[0] = 1.0
+        self.assertTrue(
+            kb.reset_if_body_stale(now=1.0 + kb.BODY_STALE_RESET_SEC + 1.0))
+        self.assertEqual(kb._color_time_seen[0], 0.0)
+        self.assertEqual(kb._body_time_seen[0], 0.0)
 
 
 class ImportPoisonCleanupTests(unittest.TestCase):

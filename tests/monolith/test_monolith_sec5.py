@@ -28,7 +28,10 @@ On the light-deps CI runner these all skip via @requires_monolith.
 """
 from __future__ import annotations
 
+import json
+import os
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -2013,10 +2016,27 @@ class WakeWordModeActionTests(SectionFiveBase):
         self.addCleanup(self._restore)
         bc._require_wake_runtime = False
         _cfg.REQUIRE_WAKE_MODE = False
+        # _act_wake_word_mode_set now PERSISTS the flip via the Settings-GUI
+        # writer (2026-07-21 audit: without it, _apply_user_settings re-applied
+        # the stale on-disk value every boot). Redirect every settings
+        # read/write in this class to a throwaway temp file — settings_path()
+        # honours JARVIS_SETTINGS_PATH at call time — so no test can touch the
+        # real (or staging) user_settings.json.
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        self._settings_file = os.path.join(tmpdir.name, "user_settings.json")
+        env = mock.patch.dict(os.environ,
+                              {"JARVIS_SETTINGS_PATH": self._settings_file})
+        env.start()
+        self.addCleanup(env.stop)
 
     def _restore(self):
         self.bc._require_wake_runtime = self._orig_runtime
         self._cfg.REQUIRE_WAKE_MODE = self._orig_cfg
+
+    def _read_settings_file(self):
+        with open(self._settings_file, encoding="utf-8") as f:
+            return json.load(f)
 
     def test_set_on_sets_both_flags(self):
         bc = self.bc
@@ -2053,6 +2073,46 @@ class WakeWordModeActionTests(SectionFiveBase):
         self.assertTrue(bc._require_wake_runtime)
         bc.ACTIONS["wake_word_mode_off"]("")
         self.assertFalse(bc._require_wake_runtime)
+
+    def test_off_flip_persists_to_settings_file(self):
+        # THE audit failure: user_settings.json carried REQUIRE_WAKE_MODE: true
+        # and every boot re-applied it (_apply_user_settings → star-import →
+        # _require_wake_runtime), so a voice "off" reverted on restart. The
+        # action must now write the flip THROUGH to disk.
+        with open(self._settings_file, "w", encoding="utf-8") as f:
+            json.dump({"REQUIRE_WAKE_MODE": True}, f)
+        self.bc._act_wake_word_mode_set(False)
+        self.assertIs(self._read_settings_file()["REQUIRE_WAKE_MODE"], False)
+
+    def test_on_flip_persists_to_settings_file(self):
+        self.bc._act_wake_word_mode_set(True)
+        self.assertIs(self._read_settings_file()["REQUIRE_WAKE_MODE"], True)
+
+    def test_persist_merges_not_clobbers_other_keys(self):
+        # The write must reuse the GUI's merge-not-clobber path: an unrelated
+        # passthrough key already on disk survives the flip.
+        with open(self._settings_file, "w", encoding="utf-8") as f:
+            json.dump({"REQUIRE_WAKE_MODE": True,
+                       "SOME_FUTURE_KEY": "keep-me"}, f)
+        self.bc._act_wake_word_mode_set(False)
+        doc = self._read_settings_file()
+        self.assertEqual(doc["SOME_FUTURE_KEY"], "keep-me")
+        self.assertIs(doc["REQUIRE_WAKE_MODE"], False)
+
+    def test_reply_carries_caveat_when_persist_fails(self):
+        from tools import settings_window as sw
+        with mock.patch.object(sw, "save_settings",
+                               side_effect=OSError("disk full")):
+            msg = self.bc._act_wake_word_mode_set(False)
+        self.assertIn("couldn't save", msg.lower())
+        # The runtime flip still took effect for THIS session.
+        self.assertFalse(self.bc._require_wake_runtime)
+        self.assertFalse(self._cfg.REQUIRE_WAKE_MODE)
+
+    def test_reply_clean_when_persist_succeeds(self):
+        msg = self.bc._act_wake_word_mode_set(True)
+        self.assertNotIn("couldn't save", msg.lower())
+        self.assertIn("wake-word mode on", msg.lower())
 
 
 # ════════════════════════════════════════════════════════════════════════════

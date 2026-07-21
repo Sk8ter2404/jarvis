@@ -1028,11 +1028,28 @@ class CommandCallbackTests(TrayTestBase):
     def test_switch_anthropic(self):
         self._assert_cmd(tray._on_switch_anthropic, "switch_llm", backend="anthropic")
 
-    def test_switch_qwen(self):
-        self._assert_cmd(tray._on_switch_qwen, "switch_llm", backend="qwen2.5:14b")
+    def test_switch_local(self):
+        # 2026-07-21 audit: the tray sends the "ollama" sentinel and lets the
+        # monolith resolve the live local default — its old hard-coded short
+        # tags ('qwen2.5:14b') drifted from the installed quantised tags and
+        # pinned the resolver cache at a model Ollama 404'd on every turn.
+        self._assert_cmd(tray._on_switch_local, "switch_llm", backend="ollama")
 
-    def test_switch_llama(self):
-        self._assert_cmd(tray._on_switch_llama, "switch_llm", backend="llama3.1:8b")
+    def test_no_menu_label_hardcodes_a_local_tag(self):
+        # Same-rule stale-duplicate guard: no tray menu LABEL may embed a
+        # concrete Ollama tag (family:size) that can drift from the installed
+        # reality — the monolith owns model identity.
+        import re
+        src_path = os.path.abspath(tray.__file__)
+        with open(src_path, "r", encoding="utf-8") as f:
+            src = f.read()
+        labels = re.findall(r'MenuItem\(\s*"([^"]*)"', src)
+        self.assertTrue(labels, "expected to find pystray MenuItem labels")
+        offenders = [l for l in labels
+                     if re.search(r"(qwen|llama|gemma|mistral|phi|deepseek)"
+                                  r"[\w.\-]*:", l, re.IGNORECASE)]
+        self.assertEqual(offenders, [],
+                         f"tray menu labels hard-code local model tags: {offenders}")
 
     def test_switch_other(self):
         self._assert_cmd(tray._on_switch_other_llm, "switch_llm_picker")

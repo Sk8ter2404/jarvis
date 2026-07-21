@@ -477,5 +477,124 @@ class RagRegisterTests(unittest.TestCase):
             captured["t"]()   # must not raise
 
 
+class RagRegisterConfigPushTests(unittest.TestCase):
+    """register() must forward core.config's RAG_* knobs into the indexer.
+
+    Regression for the dead-config defect (AUDIT_2026_07_21: 'nothing ever
+    applies them to the indexer'): core/config.py defined RAG_INDEX_PATHS /
+    RAG_EMBED_MODEL / RAG_OLLAMA_ENDPOINT / RAG_RERANKER_MODEL, but nothing
+    in production called rag_indexer.configure(), so editing the constants
+    (or overriding them via data/user_settings.json) was a silent no-op."""
+
+    def setUp(self):
+        self.mod, self.actions, patcher = _load_rag_skill()
+        self.addCleanup(patcher.stop)
+
+    def test_register_pushes_config_into_indexer(self):
+        import threading as _thr
+        from core import config as real_cfg
+        rag = _fake_rag(available=True)
+        actions = {}
+        captured = {}
+        with mock.patch.object(real_cfg, "RAG_ENABLED", True, create=True), \
+             mock.patch.object(real_cfg, "RAG_INDEX_PATHS",
+                               ["X:/docs"], create=True), \
+             mock.patch.object(real_cfg, "RAG_EMBED_MODEL",
+                               "cfg-embed", create=True), \
+             mock.patch.object(real_cfg, "RAG_OLLAMA_ENDPOINT",
+                               "http://cfg:1/api/embeddings", create=True), \
+             mock.patch.object(real_cfg, "RAG_RERANKER_MODEL",
+                               "cfg-rerank", create=True), \
+             mock.patch.object(self.mod, "_rag", return_value=rag), \
+             mock.patch.object(self.mod, "RAG_AUTOSTART", True), \
+             mock.patch.object(_thr.Thread, "start",
+                               lambda self: captured.__setitem__("t", self._target)):
+            self.mod.register(actions)
+        rag.configure.assert_called_once_with(
+            rag_index_paths=["X:/docs"],
+            rag_embed_model="cfg-embed",
+            rag_ollama_endpoint="http://cfg:1/api/embeddings",
+            rag_reranker_model="cfg-rerank",
+        )
+        # Drive the autostart closure and verify configure() preceded start()
+        # — the indexer must scan the CONFIGURED paths, not its defaults.
+        with mock.patch.object(self.mod.time, "sleep", return_value=None):
+            captured["t"]()
+        rag.start.assert_called_once_with(initial_scan=True)
+        names = [c[0] for c in rag.mock_calls]
+        self.assertLess(names.index("configure"), names.index("start"))
+
+    def test_register_config_push_survives_missing_keys(self):
+        # Config without the four knobs → getattr falls back to the indexer's
+        # own module defaults; register() must not raise and still registers.
+        from core import config as real_cfg
+        rag = _fake_rag(available=False)  # unavailable → no autostart thread
+        rag.RAG_INDEX_PATHS = ["D:/fallback-docs"]
+        rag.RAG_EMBED_MODEL = "fallback-embed"
+        rag.RAG_OLLAMA_ENDPOINT = "http://fallback:11434/api/embeddings"
+        rag.RAG_RERANKER_MODEL = "fallback-rerank"
+        keys = ("RAG_INDEX_PATHS", "RAG_EMBED_MODEL",
+                "RAG_OLLAMA_ENDPOINT", "RAG_RERANKER_MODEL")
+        saved = {k: getattr(real_cfg, k) for k in keys if hasattr(real_cfg, k)}
+        actions = {}
+        try:
+            for k in saved:
+                delattr(real_cfg, k)
+            with mock.patch.object(real_cfg, "RAG_ENABLED", True, create=True), \
+                 mock.patch.object(self.mod, "_rag", return_value=rag):
+                self.mod.register(actions)  # must not raise
+        finally:
+            for k, v in saved.items():
+                setattr(real_cfg, k, v)
+        rag.configure.assert_called_once_with(
+            rag_index_paths=["D:/fallback-docs"],
+            rag_embed_model="fallback-embed",
+            rag_ollama_endpoint="http://fallback:11434/api/embeddings",
+            rag_reranker_model="fallback-rerank",
+        )
+        self.assertIn("rag_search", actions)
+
+
+class RagConfigDeadKnobInvariantTests(unittest.TestCase):
+    """Source-scanning guard against the dead-config bug class recurring:
+    every top-level RAG_* constant in core/config.py (except RAG_ENABLED,
+    the master switch personal_rag reads directly) must appear as a
+    forwarded kwarg inside register() in skills/personal_rag.py. Adding a
+    fifth RAG_* knob to core/config.py fails here until it is actually
+    pushed into rag_indexer.configure()."""
+
+    def test_every_config_rag_knob_is_forwarded_in_register(self):
+        import ast
+        import os
+        import re
+        root = os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__))))
+        with open(os.path.join(root, "core", "config.py"),
+                  encoding="utf-8") as f:
+            cfg_src = f.read()
+        knobs = sorted(set(re.findall(r"(?m)^(RAG_[A-Z0-9_]+)\s*=", cfg_src)))
+        knobs = [k for k in knobs if k != "RAG_ENABLED"]
+        # Sanity: the four knobs this guard was written for must be seen.
+        self.assertGreaterEqual(len(knobs), 4, knobs)
+        with open(os.path.join(root, "skills", "personal_rag.py"),
+                  encoding="utf-8") as f:
+            skill_src = f.read()
+        register_src = None
+        for node in ast.parse(skill_src).body:
+            if isinstance(node, ast.FunctionDef) and node.name == "register":
+                register_src = ast.get_source_segment(skill_src, node)
+                break
+        self.assertIsNotNone(
+            register_src, "skills/personal_rag.py must define register()")
+        for k in knobs:
+            kwarg = k.lower() + "="
+            self.assertIn(
+                kwarg, register_src,
+                f"core/config.py defines {k} but personal_rag.register() never "
+                f"forwards it via rag.configure({kwarg}...) — dead config "
+                f"(AUDIT_2026_07_21: 'nothing ever applies them to the "
+                f"indexer'). Wire it into the config push in register().")
+
+
 if __name__ == "__main__":
     unittest.main()

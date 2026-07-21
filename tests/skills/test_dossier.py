@@ -1054,14 +1054,51 @@ class DossierRendererMainTests(unittest.TestCase):
         self.assertTrue(getattr(root, "destroyed", False))
 
     def test_tick_parent_dead_destroys(self):
+        # 2026-07-21 audit: the watchdog now consults the corpse-aware
+        # core.parent_watch.parent_is_alive (as hud_card does), not the
+        # psutil-backed _pid_alive that reports True for a kernel-stuck
+        # corpse. Stub the authoritative layer to say "dead".
+        self._write_state()
+        root = _FakeTk()
+        import core.parent_watch as _pw
+        with inject_modules(tkinter=make_fake_tkinter(root)), \
+             mock.patch.object(_pw, "parent_is_alive", return_value=False):
+            self.mod._renderer_main(parent_pid=4242)
+            for cb in list(root.after_calls):
+                cb()
+        # NB: getattr(root, "destroyed", False) is vacuously truthy on the
+        # fakes (__getattr__ returns _noop), so check the instance dict.
+        self.assertIs(root.__dict__.get("destroyed"), True)
+
+    def test_tick_parent_dead_fallback_without_parent_watch(self):
+        # If core.parent_watch is un-importable the tick falls back to the
+        # local _pid_alive — a dead parent must still tear the card down.
         self._write_state()
         root = _FakeTk()
         with inject_modules(tkinter=make_fake_tkinter(root)), \
+             block_import("core.parent_watch"), \
              mock.patch.object(self.mod, "_pid_alive", return_value=False):
             self.mod._renderer_main(parent_pid=4242)
             for cb in list(root.after_calls):
                 cb()
-        self.assertTrue(getattr(root, "destroyed", False))
+        self.assertIs(root.__dict__.get("destroyed"), True)
+
+    def test_tick_fallback_no_parent_to_watch_stays_up(self):
+        # Fallback path, pid <= 0 ("no parent supplied"): must read alive —
+        # parent_is_alive's pid<=0 convention is preserved by the lambda.
+        self._write_state()
+        root = _FakeTk()
+        with inject_modules(tkinter=make_fake_tkinter(root)), \
+             block_import("core.parent_watch"), \
+             mock.patch.object(self.mod, "_pid_alive",
+                               return_value=False) as pa:
+            self.mod._renderer_main(parent_pid=0)
+            for cb in list(root.after_calls):
+                cb()
+        # _pid_alive(0) would say False; the fallback must not even consult
+        # it for pid<=0, and the card must survive the tick.
+        pa.assert_not_called()
+        self.assertNotIn("destroyed", root.__dict__)
 
     def test_tick_state_vanished_destroys(self):
         self._write_state()
@@ -1156,6 +1193,77 @@ class DossierRendererMainTests(unittest.TestCase):
                                    side_effect=RuntimeError("read blew up")):
                 # Must not raise despite destroy() also failing.
                 tick()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# NEW (2026-07-21 audit): parent-watchdog stale-duplicate sweep
+# ──────────────────────────────────────────────────────────────────────────
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
+
+
+class ParentWatchdogStaleDuplicateSweepTests(unittest.TestCase):
+    """2026-07-21 audit: dossier's card renderer was the LAST --parent-pid
+    watchdog still gating on the psutil-backed _pid_alive, which reports True
+    for both Windows dead states (terminated-but-unreaped and kernel-stuck
+    corpse), so the card outlived a dead JARVIS. hud_card was migrated to
+    core.parent_watch on 2026-07-14 (bug-hunt #24) while dossier's copy
+    rotted — the classic stale-duplicate class — so this guard sweeps EVERY
+    subprocess card renderer rather than pinning one file: a future renderer
+    copied from the stale pattern fails the sweep, not just dossier.
+    """
+
+    _EXCLUDED_DIRS = ("tests", "__pycache__", ".git", ".claude",
+                      "backups", "_backups", "dist", "models",
+                      "logs", "logs_staging", "data", "data_staging",
+                      "node_modules", "venv", ".venv")
+
+    def _card_renderer_sources(self):
+        """Map relpath -> source for every production file that is a
+        subprocess card renderer with a local psutil pid helper, i.e. it
+        both carries a --parent-pid CLI contract and defines _pid_alive.
+        (Parent-side managers like blue_green_manager keep _pid_alive for
+        CHILD liveness — the safe direction — and don't match.)"""
+        found = {}
+        for base, dirs, files in os.walk(_PROJECT_ROOT):
+            dirs[:] = [d for d in dirs if d not in self._EXCLUDED_DIRS]
+            for fn in files:
+                if not fn.endswith(".py"):
+                    continue
+                path = os.path.join(base, fn)
+                try:
+                    with open(path, "r", encoding="utf-8",
+                              errors="replace") as fh:
+                        src = fh.read()
+                except OSError:
+                    continue
+                if "--parent-pid" in src and "def _pid_alive(" in src:
+                    rel = os.path.relpath(path, _PROJECT_ROOT)
+                    found[rel.replace("\\", "/")] = src
+        return found
+
+    def test_sweep_discovers_the_known_renderers(self):
+        # If the discovery predicate ever rots, the sweep would pass
+        # vacuously — pin the two renderers it must always see.
+        rels = set(self._card_renderer_sources())
+        self.assertIn("hud_card.py", rels)
+        self.assertIn("skills/dossier.py", rels)
+
+    def test_every_card_renderer_watchdog_uses_parent_watch(self):
+        offenders = []
+        for rel, src in sorted(self._card_renderer_sources().items()):
+            if "from core.parent_watch import parent_is_alive" not in src:
+                offenders.append(
+                    f"{rel}: parent watchdog missing the corpse-aware "
+                    f"core.parent_watch.parent_is_alive import")
+            if "not _pid_alive(parent_pid)" in src:
+                offenders.append(
+                    f"{rel}: pre-migration psutil gate "
+                    f"'not _pid_alive(parent_pid)' still present")
+        self.assertEqual([], offenders,
+                         "card renderers must watch their parent via "
+                         "core.parent_watch (psutil.pid_exists reads a "
+                         "corpsed parent as alive):\n" + "\n".join(offenders))
 
 
 # ──────────────────────────────────────────────────────────────────────────

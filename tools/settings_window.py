@@ -266,6 +266,14 @@ SCHEMA: dict[str, dict] = {
                 "(stops replies to song lyrics). Turn OFF if it keeps cutting "
                 "you off while your own music is on.",
     },
+    "REQUIRE_WAKE_MODE": {
+        "tab": "voice", "label": "Wake-word mode (manual, Alexa-style)",
+        "type": "bool", "default": False,
+        "help": "Require a leading 'JARVIS' on every command until turned "
+                "off. Also toggled by voice ('wake word mode on/off') — "
+                "handy when an external TV the media session can't see is "
+                "playing.",
+    },
     "MICROPHONE_INDEX": {
         "tab": "voice", "label": "Microphone", "type": "device",
         "default": None,
@@ -442,7 +450,10 @@ SCHEMA: dict[str, dict] = {
         "tab": "voice", "label": "Barge-in (interrupt him by voice)",
         "type": "bool", "default": True,
         "help": "Say the wake word while JARVIS is talking to cut him off "
-                "and be heard. His own voice can never trigger it.",
+                "and be heard. Requires the wake-word detector to be "
+                "running — say 'JARVIS, start listening for the wake word' "
+                "(wake_listener_start) first; his own voice can never "
+                "trigger it.",
     },
     "FOCUS_MODE_ENABLED": {
         "tab": "voice", "label": "Focus mode / do-not-disturb available",
@@ -934,6 +945,7 @@ def integration_status(spec: dict) -> tuple[bool, str]:
 # name the routing combobox uses (see the routing widget + _collect()).
 VRAM_WATCH_KEYS = (
     "LOCAL_LLM_MODEL",
+    "LOCAL_VISION_MODEL",
     "MODEL_ROUTING::vision",
     "LOCAL_VISION_FALLBACK",
     "SCREEN_VISION_ENABLED",

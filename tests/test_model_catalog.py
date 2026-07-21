@@ -103,6 +103,59 @@ class FormatTests(unittest.TestCase):
         self.assertIn("cheapest first", s)
 
 
+class LocalCatalogDriftInvariantTests(unittest.TestCase):
+    """2026-07-21 audit: CATALOG's local rows were a stale copy of the local-
+    model identity (still qwen/llama while core.config shipped gemma4), so
+    'show LLM stats' couldn't price the default brain. These invariants READ
+    the expectation from core.config AT TEST TIME — a future promotion of the
+    default brain that isn't reflected here fails immediately instead of
+    shipping another drift."""
+
+    def test_default_brain_is_in_the_catalog_and_free(self):
+        import core.config as cfg
+        entry = mc.by_id(cfg.LOCAL_LLM_MODEL)
+        self.assertIsNotNone(
+            entry, f"core.config.LOCAL_LLM_MODEL={cfg.LOCAL_LLM_MODEL!r} "
+                   f"has no catalog entry — the catalog drifted from config")
+        self.assertEqual(entry.backend, "ollama")
+        self.assertEqual(entry.cost_per_conversation(), 0.0)
+
+    def test_shipped_default_brain_is_in_the_catalog(self):
+        import core.config as cfg
+        shipped = getattr(cfg, "_SHIPPED_LOCAL_LLM_MODEL", cfg.LOCAL_LLM_MODEL)
+        entry = mc.by_id(shipped)
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.backend, "ollama")
+
+    def test_every_resolver_chain_tag_resolves(self):
+        # The resolver chain (bobert_companion._LOCAL_LLM_PREFERENCE) —
+        # quantised installed tags exercise by_id's prefix path.
+        for tag in ("gemma4:26b-a4b-it-qat", "gemma4:12b",
+                    "qwen2.5:14b-instruct-q5_K_M", "qwen3:14b",
+                    "llama3.1:8b-instruct-q5_K_M"):
+            entry = mc.by_id(tag)
+            self.assertIsNotNone(entry, f"{tag} missing from CATALOG")
+            self.assertEqual(entry.backend, "ollama", tag)
+            self.assertEqual(entry.cost_per_conversation(), 0.0, tag)
+
+    def test_show_llm_stats_prices_the_default_brain(self):
+        # End-to-end vehicle: 'show LLM stats' on the default local brain must
+        # price it, not apologise ("not in the cost catalog").
+        import core.actions as A
+        import core.config as cfg
+        with mock.patch.object(A, "_live_backend_and_model",
+                               return_value=("ollama", cfg.LOCAL_LLM_MODEL)):
+            out = A._act_show_llm_stats()
+        self.assertIn("$0 (local)", out)
+        self.assertNotIn("not in the cost catalog", out)
+
+    def test_format_catalog_lists_the_default_brain(self):
+        import core.config as cfg
+        entry = mc.by_id(cfg.LOCAL_LLM_MODEL)
+        self.assertIsNotNone(entry)
+        self.assertIn(entry.label, mc.format_catalog())
+
+
 class ModelActionTests(unittest.TestCase):
     """The core.actions surfaces (light tier; they delegate to model_catalog)."""
 

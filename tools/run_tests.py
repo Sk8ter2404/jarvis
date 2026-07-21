@@ -44,6 +44,23 @@ def _redirect_settings_to_throwaway() -> None:
     os.environ["JARVIS_SETTINGS_PATH"] = throwaway
 
 
+def _redirect_data_dir_to_throwaway() -> None:
+    """Point core.paths.data_dir() at a throwaway directory so ANY test that
+    forgets to redirect a module's file-path globals still cannot write the
+    owner's live ``data/``.
+
+    Companion to _redirect_settings_to_throwaway — same incident class: a
+    targeted run of tests/skills/test_sh_ecobee.py once overwrote the LIVE
+    ``data/sh_ecobee_tokens.json`` with fake fixture tokens because an
+    ineffective builtins.open mock let the real atomic write through
+    (2026-07-21). Sets ``JARVIS_DATA_DIR`` (highest precedence in
+    core.paths.data_dir()) BEFORE any test is imported; respects an
+    externally-set override (does nothing if already set)."""
+    if (os.environ.get("JARVIS_DATA_DIR") or "").strip():
+        return
+    os.environ["JARVIS_DATA_DIR"] = tempfile.mkdtemp(prefix="jarvis_test_data_")
+
+
 def _stop_lingering_daemons() -> None:
     """Best-effort: stop any opt-in background daemon a test may have left alive
     (currently the apple-music keep-alive watchdog) so it can't outlive the
@@ -60,6 +77,9 @@ def main(argv: list[str]) -> int:
     # Redirect settings I/O to a throwaway copy BEFORE any test is imported, so
     # a leaked real save_settings can't touch data/user_settings.json.
     _redirect_settings_to_throwaway()
+    # Same guard for the whole data/ directory: a forgotten per-test path
+    # redirect must land in a throwaway, never the live runtime state.
+    _redirect_data_dir_to_throwaway()
     if _PROJECT_ROOT not in sys.path:
         sys.path.insert(0, _PROJECT_ROOT)
 

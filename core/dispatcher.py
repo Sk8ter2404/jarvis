@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
 from core.failure_markers import FAILURE_MARKERS
+from core.lead_fillers import strip_lead_filler as _strip_lead_filler
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -361,21 +362,11 @@ def _looks_like_command_start(segment: str) -> bool:
         first = seg.split(None, 2)[1]
     return first in _COMMAND_VERBS
 
-# Filler / lead-ins to strip from the beginning of the WHOLE utterance.
-_LEAD_FILLERS = [
-    "could you ", "can you ", "would you ", "please ",
-    "jarvis ", "hey jarvis ", "ok jarvis ", "okay jarvis ",
-    "go ahead and ", "i need you to ", "i'd like you to ",
-]
-
-
-def _strip_lead_filler(s: str) -> str:
-    low = s.lower().lstrip()
-    for f in _LEAD_FILLERS:
-        if low.startswith(f):
-            # Strip the filler from the original (preserving case).
-            return s.lstrip()[len(f):].lstrip()
-    return s.strip()
+# Filler / lead-ins are stripped from the beginning of the WHOLE utterance by
+# the shared core.lead_fillers.strip_lead_filler (imported above as
+# _strip_lead_filler). This module used to carry its own stale copy — no comma
+# wake variants ("jarvis, "), single pass — so Controlled mode refused
+# "JARVIS, take a screenshot" (2026-07-21 audit). ONE implementation now.
 
 
 def _split_on_and(chunk: str) -> list[str]:

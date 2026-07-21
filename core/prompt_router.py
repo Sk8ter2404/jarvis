@@ -107,7 +107,15 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "camera", "webcam", "see me", "can you see", "pointed at me",
         "look at me", "how do i look",
     ],
-    "UNIFIED": ["all cameras", "every camera", "both cameras"],
+    # UNIFIED documents camera_status / situational_awareness (where_am_i) /
+    # look_around — cover every trigger phrase its body spells out, not just
+    # the "all cameras" phrasings (2026-07-21 audit: 'where am I' / 'camera
+    # status' / 'look around' loaded nothing).
+    "UNIFIED": [
+        "all cameras", "every camera", "both cameras", "camera status",
+        "what cameras", "where am i", "what am i doing", "what's my status",
+        "look around", "see everywhere",
+    ],
     "FACE RECOGNITION": [
         "who am i", "recognize", "who is at", "who's at", "face",
         "identify me", "who am i talking",
@@ -120,6 +128,10 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "spotify", "apple music", "pause", "resume", "skip", "next", "previous",
         "shuffle", "volume", "louder", "quieter", "youtube", "netflix", "tv",
         "movie", "watch", "stream", "put on", "listen",
+        # volume grammar lives in this section's body — "mute" had NO keyword
+        # anywhere and the un-anchored turn-it-down/up phrasings only matched
+        # the dispatcher's anchored fast-paths (2026-07-21 audit).
+        "mute", "turn it down", "turn it up",
     ],
     "AUDIO OUTPUT DEVICE": [
         "headset", "headphones", "speakers", "output device", "switch audio",
@@ -166,6 +178,15 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "TASK QUEUE": [
         "task queue", "queue this", "offload", "claude code", "add a task",
         "todo", "to-do", "build me", "have claude",
+        # The section body also documents the lifecycle + HUD/overlay actions
+        # (restart, hide_hud/show_hud/toggle_hud, arc_reactor, the holographic
+        # overlay, workshop_hud, upgrade) — without these keywords a 'restart
+        # yourself' turn loaded only the SHUTDOWN aliases and 'hide the HUD'
+        # loaded nothing (2026-07-21 audit). Substring hits on shutdown-adjacent
+        # turns are harmless: the model just sees restart AND shutdown_jarvis.
+        "restart", "reboot", "relaunch", "start over", "hud", "overlay",
+        "arc reactor", "reactor", "holo", "holographic", "workshop",
+        "upgrade", "apply the changes", "doorless",
     ],
     "SESSION MEMORY RECALL": [
         "remember", "recall", "what did", "earlier", "last time", "before",
@@ -276,9 +297,14 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "replay", "say again", "repeat that", "come again", "what did you say",
         "one more time",
     ],
+    # "restart yourself"/"reboot" deliberately NOT here: those phrases mean
+    # RESTART, and this section documents only power-off aliases — loading it
+    # as the sole power-related section pulled the model toward shutdown_jarvis
+    # for a restart request (2026-07-21 audit). TASK QUEUE (which documents
+    # `restart`) now carries those keywords.
     "SHUTDOWN ALIASES": [
         "shut down", "shutdown", "turn off", "go offline", "power down",
-        "restart yourself", "reboot", "sign off",
+        "sign off",
     ],
     # --- Sections surfaced by the 2026-07-15 wrapped-header + char-class fix.
     # These 17 were folded into their neighbours (invisible to routing) until the
@@ -353,6 +379,10 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "WAKE-WORD MODE": [
         "wake word mode", "wake-word mode", "require my name", "require your name",
         "always listening", "manual wake", "gate on wake",
+    ],
+    "AMBIENT-LEARNING MODE": [
+        "ambient learning", "listen and learn", "go quiet", "keep learning",
+        "stay talkative", "answer then go quiet",
     ],
 }
 

@@ -22,13 +22,20 @@ flow. Coverage:
 
 `pyecobee` is NOT a CI dependency, so it is ALWAYS injected as a fake — never
 imported for real — keeping the suite deterministic and offline. Module
-globals (_state) are reset in tearDown.
+globals (_state) are reset in tearDown, and every file-path global
+(_DATA_DIR/_CONFIG_PATH/_TOKEN_PATH) is redirected to a per-test tempdir in
+setUp so no test — mocked or not — can ever touch the repo's data/ (the suite
+once overwrote the owner's LIVE sh_ecobee_tokens.json, see
+test_save_tokens_swallows_errors).
 """
 from __future__ import annotations
 
 import contextlib
 import io
+import os
+import shutil
 import sys
+import tempfile
 import threading
 import types
 import unittest
@@ -145,6 +152,14 @@ def _fake_pyecobee(service=None, omit_service=False):
 class _EcobeeBase(unittest.TestCase):
     def setUp(self):
         self.mod, self.actions = load_skill_isolated("sh_ecobee")
+        # Redirect every file-path global to a fresh tempdir (same pattern as
+        # test_apple_music_intel) so no test can reach the repo's data/ even
+        # when a mock turns out to be ineffective.
+        self.tmp = tempfile.mkdtemp(prefix="ecobee_test_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.mod._DATA_DIR = self.tmp
+        self.mod._CONFIG_PATH = os.path.join(self.tmp, "sh_ecobee_config.json")
+        self.mod._TOKEN_PATH = os.path.join(self.tmp, "sh_ecobee_tokens.json")
         self.addCleanup(self._reset_state)
 
     def _reset_state(self):
@@ -218,11 +233,32 @@ class EcobeeIOTests(_EcobeeBase):
         self.assertEqual(captured["data"]["authorization_token"], "auth")
 
     def test_save_tokens_swallows_errors(self):
+        # _save_tokens writes via core.atomic_io._atomic_write_json
+        # (tempfile.mkstemp + os.fdopen + os.replace) — builtins.open is NEVER
+        # called, so an open() mock cannot block it. This test used to patch
+        # builtins.open with an OSError side_effect: the mock never fired, the
+        # write SUCCEEDED, and running the suite on the live box clobbered the
+        # owner's real data/sh_ecobee_tokens.json with these fixture values
+        # (2026-07-21). The failure must be injected at the atomic writer.
         svc = types.SimpleNamespace(access_token="at", refresh_token="rt",
                                     authorization_token="auth")
-        with mock.patch("builtins.open", side_effect=OSError("ro fs")), \
+        with mock.patch("core.atomic_io._atomic_write_json",
+                        side_effect=OSError("ro fs")), \
              contextlib.redirect_stdout(io.StringIO()):
             self.mod._save_tokens(svc)   # no exception
+        # Proves the swallow path genuinely ran: nothing was written.
+        self.assertFalse(os.path.exists(self.mod._TOKEN_PATH))
+
+    def test_save_tokens_real_write_lands_in_test_tempdir(self):
+        # Unmocked round-trip: the real mkstemp+replace write must land under
+        # this test's tempdir (setUp redirect), never the repo's data/.
+        self.assertEqual(os.path.dirname(self.mod._TOKEN_PATH), self.tmp)
+        svc = types.SimpleNamespace(access_token="at", refresh_token="rt",
+                                    authorization_token="auth")
+        self.mod._save_tokens(svc)
+        self.assertEqual(self.mod._load_tokens(),
+                         {"access_token": "at", "refresh_token": "rt",
+                          "authorization_token": "auth"})
 
 
 # ─── _run_with_timeout ───────────────────────────────────────────────────

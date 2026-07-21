@@ -52,6 +52,9 @@ import unittest
 from unittest import mock
 
 import core.actions as A
+# Light import (no heavy deps at module level): patched in the reset/forget
+# tests so the REAL tiered store is never touched by this suite.
+import core.long_term_memory as LTM
 
 
 # ---------------------------------------------------------------------------
@@ -218,10 +221,18 @@ class ResetMemoryTests(unittest.TestCase):
     def test_backs_up_then_resets_when_file_exists(self):
         with tempfile.TemporaryDirectory() as td:
             bc, mem_path = self._bc_with_memory(td)
-            with _patch_bc(bc):
+            with _patch_bc(bc), \
+                    mock.patch.object(LTM, "reset_all",
+                                      return_value=3) as mreset:
                 out = A._act_reset_memory()
             self.assertIn("memory reset (backup -> backups/memory_pre_reset_",
                           out)
+            # REGRESSION (2026-07-21 audit #17): the tiered LTM store is wiped
+            # in the same action and its outcome is spoken in the reply — the
+            # semantic store used to survive a confirmed wipe and keep feeding
+            # _ltm_context() every turn.
+            mreset.assert_called_once_with()
+            self.assertIn("3 long-term fact(s) cleared", out)
             bc.save_memory.assert_called_once_with({"facts": []})
             # A backup copy was actually written into backups/.
             backups = os.listdir(os.path.join(td, "backups"))
@@ -231,9 +242,12 @@ class ResetMemoryTests(unittest.TestCase):
     def test_no_file_reports_already_empty(self):
         with tempfile.TemporaryDirectory() as td:
             bc, _ = self._bc_with_memory(td, write_file=False)
-            with _patch_bc(bc):
+            with _patch_bc(bc), \
+                    mock.patch.object(LTM, "reset_all", return_value=0):
                 out = A._act_reset_memory()
-            self.assertEqual(out, "memory was already empty")
+            self.assertTrue(out.startswith("memory was already empty"))
+            # Even with no bobert file, the LTM outcome is still reported.
+            self.assertIn("0 long-term fact(s) cleared", out)
             bc.save_memory.assert_called_once()
 
     def test_copy_failure_refuses_to_wipe(self):
@@ -241,10 +255,30 @@ class ResetMemoryTests(unittest.TestCase):
             bc, _ = self._bc_with_memory(td)
             with _patch_bc(bc), \
                     mock.patch.object(A.shutil, "copy2",
-                                      side_effect=OSError("perm denied")):
+                                      side_effect=OSError("perm denied")), \
+                    mock.patch.object(LTM, "reset_all") as mreset:
                 out = A._act_reset_memory()
             self.assertTrue(out.startswith("backup failed, refused to wipe:"))
             bc.save_memory.assert_not_called()
+            # A refused bobert wipe must not go on to wipe the LTM store.
+            mreset.assert_not_called()
+
+    def test_ltm_wipe_failure_is_disclosed_never_silent(self):
+        # REGRESSION (2026-07-21 audit #17): a failed semantic-store wipe must
+        # be DISCLOSED in the reply — never the bare 'memory reset' success
+        # line while facts.json / chroma / episodes.jsonl live on.
+        with tempfile.TemporaryDirectory() as td:
+            bc, _ = self._bc_with_memory(td)
+            with _patch_bc(bc), \
+                    mock.patch.object(LTM, "reset_all",
+                                      side_effect=RuntimeError("chroma wedged")):
+                out = A._act_reset_memory()
+            # bobert side still succeeded and is reported…
+            self.assertIn("memory reset (backup -> backups/memory_pre_reset_",
+                          out)
+            # …but the surviving semantic store is called out explicitly.
+            self.assertIn("long-term semantic store was NOT cleared", out)
+            self.assertIn("chroma wedged", out)
 
     def test_outer_exception_caught(self):
         bc = _base_bc()
@@ -253,9 +287,11 @@ class ResetMemoryTests(unittest.TestCase):
         lock.__enter__.side_effect = RuntimeError("lock boom")
         bc._memory_lock = lock
         bc.MEMORY_FILE = "irrelevant.json"
-        with _patch_bc(bc):
+        with _patch_bc(bc), \
+                mock.patch.object(LTM, "reset_all") as mreset:
             out = A._act_reset_memory()
         self.assertTrue(out.startswith("reset_memory failed: lock boom"))
+        mreset.assert_not_called()
 
 
 # ===========================================================================
@@ -601,11 +637,25 @@ class TestEachSkillTests(unittest.TestCase):
 # _act_forget_last_hour
 # ===========================================================================
 class ForgetLastHourTests(unittest.TestCase):
-    def _bc(self, mem):
+    _NO_LTM = {"episodes": 0, "facts": 0, "working": 0}
+
+    def _bc(self, mem, vc_removed=0):
         bc = _base_bc()
         bc._memory_lock = mock.MagicMock()
         bc.load_memory.return_value = mem
+        # bc.pattern_memory is the root memory.py module on the real monolith;
+        # the handler purges memory/voice_commands.jsonl through it.
+        bc.pattern_memory.forget_voice_commands_since.return_value = vc_removed
         return bc
+
+    def _patch_ltm(self, counts=None, side_effect=None):
+        """Patch core.long_term_memory.forget_since so the REAL store is
+        never touched by these tests."""
+        if side_effect is not None:
+            return mock.patch.object(LTM, "forget_since",
+                                     side_effect=side_effect)
+        return mock.patch.object(LTM, "forget_since",
+                                 return_value=dict(counts or self._NO_LTM))
 
     def test_drops_recent_topics_and_sessions(self):
         # Freeze "now"; entries carry a numeric ts (epoch). now = 1_000_000.0,
@@ -623,9 +673,14 @@ class ForgetLastHourTests(unittest.TestCase):
         }
         bc = self._bc(mem)
         with _patch_bc(bc), \
-                mock.patch.object(A.time, "time", return_value=now):
+                mock.patch.object(A.time, "time", return_value=now), \
+                self._patch_ltm() as mfs:
             out = A._act_forget_last_hour()
         self.assertEqual(out, "forgot 2 item(s) from the last hour")
+        # Both companion stores are purged with the SAME epoch cutoff.
+        mfs.assert_called_once_with(now - 3600)
+        bc.pattern_memory.forget_voice_commands_since \
+            .assert_called_once_with(now - 3600)
         saved = bc.save_memory.call_args[0][0]
         self.assertEqual(len(saved["topics"]), 1)
         self.assertEqual(saved["sessions"], [])
@@ -648,7 +703,8 @@ class ForgetLastHourTests(unittest.TestCase):
         }
         bc = self._bc(mem)
         with _patch_bc(bc), \
-                mock.patch.object(A.time, "time", return_value=now):
+                mock.patch.object(A.time, "time", return_value=now), \
+                self._patch_ltm():
             out = A._act_forget_last_hour()
         self.assertEqual(out, "forgot 1 item(s) from the last hour")
         saved = bc.save_memory.call_args[0][0]
@@ -661,10 +717,15 @@ class ForgetLastHourTests(unittest.TestCase):
         mem = {"topics": [{"date": "2020-01-01"}], "sessions": []}
         bc = self._bc(mem)
         with _patch_bc(bc), \
-                mock.patch.object(A.time, "time", return_value=now):
+                mock.patch.object(A.time, "time", return_value=now), \
+                self._patch_ltm() as mfs:
             out = A._act_forget_last_hour()
         self.assertEqual(out, "nothing recent enough to forget")
         bc.save_memory.assert_not_called()
+        # REGRESSION (2026-07-21 audit #51): the LTM purge is NOT gated behind
+        # the removed == 0 bobert result — the episode log can hold the whole
+        # hour verbatim while topics/sessions have nothing recent.
+        mfs.assert_called_once_with(now - 3600)
 
     def test_nothing_recent(self):
         now = 1_700_000_000.0
@@ -672,10 +733,70 @@ class ForgetLastHourTests(unittest.TestCase):
                "sessions": []}
         bc = self._bc(mem)
         with _patch_bc(bc), \
-                mock.patch.object(A.time, "time", return_value=now):
+                mock.patch.object(A.time, "time", return_value=now), \
+                self._patch_ltm() as mfs:
             out = A._act_forget_last_hour()
         self.assertEqual(out, "nothing recent enough to forget")
         bc.save_memory.assert_not_called()
+        mfs.assert_called_once_with(now - 3600)
+        bc.pattern_memory.forget_voice_commands_since \
+            .assert_called_once_with(now - 3600)
+
+    def test_ltm_purge_runs_and_reports_when_bobert_empty(self):
+        # bobert_memory has nothing recent but the LTM store does: the purge
+        # still runs and its counts are folded into the spoken reply.
+        now = 1_700_000_000.0
+        bc = self._bc({"topics": [], "sessions": []})
+        with _patch_bc(bc), \
+                mock.patch.object(A.time, "time", return_value=now), \
+                self._patch_ltm({"episodes": 5, "facts": 2,
+                                 "working": 3}) as mfs:
+            out = A._act_forget_last_hour()
+        mfs.assert_called_once_with(now - 3600)
+        self.assertEqual(
+            out, "forgot 5 logged turn(s), 2 fact(s) from the last hour")
+        bc.save_memory.assert_not_called()
+
+    def test_ltm_failure_is_disclosed_not_silent(self):
+        # REGRESSION (2026-07-21 audit #51): a failed LTM purge must be
+        # disclosed — the bobert-side result alone must never read as a
+        # complete forget while episodes.jsonl still holds the hour.
+        now = 1_700_000_000.0
+        mem = {"topics": [{"date": "2026-06-01", "ts": now - 600}],
+               "sessions": []}
+        bc = self._bc(mem)
+        with _patch_bc(bc), \
+                mock.patch.object(A.time, "time", return_value=now), \
+                self._patch_ltm(side_effect=RuntimeError("episode log locked")):
+            out = A._act_forget_last_hour()
+        self.assertIn("forgot 1 item(s)", out)
+        self.assertIn("WARNING", out)
+        self.assertIn("the conversation log was NOT purged", out)
+        self.assertIn("episode log locked", out)
+
+    def test_voice_commands_purged_and_counted(self):
+        now = 1_700_000_000.0
+        bc = self._bc({"topics": [], "sessions": []}, vc_removed=4)
+        with _patch_bc(bc), \
+                mock.patch.object(A.time, "time", return_value=now), \
+                self._patch_ltm():
+            out = A._act_forget_last_hour()
+        bc.pattern_memory.forget_voice_commands_since \
+            .assert_called_once_with(now - 3600)
+        self.assertEqual(out, "forgot 4 voice command(s) from the last hour")
+
+    def test_voice_command_failure_disclosed(self):
+        now = 1_700_000_000.0
+        bc = self._bc({"topics": [], "sessions": []})
+        bc.pattern_memory.forget_voice_commands_since.side_effect = \
+            RuntimeError("jsonl locked")
+        with _patch_bc(bc), \
+                mock.patch.object(A.time, "time", return_value=now), \
+                self._patch_ltm():
+            out = A._act_forget_last_hour()
+        self.assertTrue(out.startswith("nothing recent enough to forget"))
+        self.assertIn("the voice-command log was NOT purged", out)
+        self.assertIn("jsonl locked", out)
 
     def test_exception_caught(self):
         bc = _base_bc()
@@ -684,9 +805,57 @@ class ForgetLastHourTests(unittest.TestCase):
         with _patch_bc(bc), \
                 mock.patch.object(A.time, "strftime", return_value="x"), \
                 mock.patch.object(A.time, "localtime"), \
-                mock.patch.object(A.time, "time", return_value=0.0):
+                mock.patch.object(A.time, "time", return_value=0.0), \
+                self._patch_ltm() as mfs:
             out = A._act_forget_last_hour()
         self.assertTrue(out.startswith("forget_last_hour failed: mem broke"))
+        mfs.assert_not_called()
+
+
+# ===========================================================================
+# memory-wipe actions must cover the LTM store — source-scan invariant
+# ===========================================================================
+class MemoryWipeCoversLtmInvariantTests(unittest.TestCase):
+    """Guard for the stale-duplicate bug class behind the 2026-07-21 audit
+    (#17 reset_memory, #51 forget_last_hour): a memory-wiping action that
+    touches only bobert_memory.json silently leaves the tiered LTM store
+    (facts.json + chroma + episodes.jsonl) feeding the prompt. Every
+    forget/reset action in core/actions.py must therefore reference
+    ``long_term_memory`` — or carry an explicit ``# ltm-exempt: <reason>``
+    comment — so the NEXT wipe action added can't quietly skip the store."""
+
+    def test_every_forget_or_reset_action_references_ltm(self):
+        import ast
+        import inspect
+        import re
+
+        src_path = inspect.getsourcefile(A)
+        with open(src_path, "r", encoding="utf-8") as f:
+            src = f.read()
+        tree = ast.parse(src)
+        seen = set()
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if not node.name.startswith("_act_"):
+                continue
+            if not re.search(r"forget|reset_memory|wipe_memory", node.name):
+                continue
+            seen.add(node.name)
+            seg = ast.get_source_segment(src, node) or ""
+            if "long_term_memory" not in seg and "# ltm-exempt:" not in seg:
+                offenders.append(node.name)
+        self.assertEqual(
+            offenders, [],
+            f"memory-wipe action(s) {offenders} never reference "
+            "core.long_term_memory — purge the LTM store too, or mark the "
+            "function with an explicit '# ltm-exempt: <reason>' comment")
+        # Sanity: the scan actually matched the two known wipe actions (if
+        # this fails, the regex or the action names drifted and the guard
+        # is scanning nothing).
+        self.assertIn("_act_reset_memory", seen)
+        self.assertIn("_act_forget_last_hour", seen)
 
 
 # ===========================================================================
@@ -2493,6 +2662,10 @@ class SwitchLlmTests(unittest.TestCase):
         # constant. In these tests the resolved tag IS the configured ollama tag.
         bc._get_local_llm_model.return_value = ollama
         bc._ollama_has_model.return_value = True
+        # 2026-07-21 audit: the installed check is now _ollama_resolve_model
+        # (exact/sibling-aware). Identity = "the requested tag is installed
+        # verbatim", preserving these tests' original semantics.
+        bc._ollama_resolve_model.side_effect = lambda t: t
         bc._RESOLVED_LOCAL_LLM_MODEL = [ollama]
         return bc
 
@@ -2557,6 +2730,89 @@ class SwitchLlmTests(unittest.TestCase):
         # backend unchanged on a rejected tag
         self.assertEqual(bc.AI_BACKEND, "claude")
         self.assertIn("unknown backend tag", out)
+
+    def test_unknown_tag_suggestion_names_the_config_default(self):
+        # 2026-07-21 audit: the suggestion string is derived from
+        # core.config.LOCAL_LLM_MODEL, never a hard-coded (retirable) tag list.
+        import core.config as cfg
+        bc = self._bc(backend="claude")
+        with _patch_bc(bc), mock.patch("core.config.CLAUDE_MODEL", "claude-x"):
+            out = A._act_switch_llm("turbotron9000")
+        self.assertIn(cfg.LOCAL_LLM_MODEL, out)
+
+    # ── 2026-07-21 audit: short tags resolve to the CONCRETE installed tag ──
+    def test_short_tag_pins_concrete_installed_tag(self):
+        # tray-style 'qwen2.5:14b' while the box has the quantised sibling:
+        # the cache must be pinned at the tag Ollama ACTUALLY has (the old
+        # base-name check pinned the raw request → 404 on every later turn).
+        concrete = "qwen2.5:14b-instruct-q5_K_M"
+        bc = self._bc(backend="claude", ollama="gemma4:12b")
+        bc._ollama_resolve_model.side_effect = \
+            lambda t: concrete if t == "qwen2.5:14b" else None
+        with _patch_bc(bc), mock.patch("core.config.CLAUDE_MODEL", "claude-x"):
+            out = A._act_switch_llm("qwen2.5:14b")
+        self.assertEqual(bc._RESOLVED_LOCAL_LLM_MODEL[0], concrete)
+        self.assertEqual(bc.LOCAL_LLM_MODEL, concrete)
+        self.assertIn(f"switched to ollama / {concrete}", out)
+
+    def test_unresolvable_tag_pulls_and_keeps_working_model(self):
+        bc = self._bc(backend="claude", ollama="gemma4:12b")
+        bc._ollama_resolve_model.side_effect = lambda t: None
+        with _patch_bc(bc), mock.patch("core.config.CLAUDE_MODEL", "claude-x"):
+            out = A._act_switch_llm("qwen2.5:14b")
+        # cache untouched, background pull kicked for the REQUESTED tag.
+        self.assertEqual(bc._RESOLVED_LOCAL_LLM_MODEL[0], "gemma4:12b")
+        bc._ollama_pull_async.assert_called_once_with("qwen2.5:14b")
+        self.assertIn("isn't installed yet", out)
+
+    # ── 2026-07-21 audit: vision lockstep on the explicit-tag branch ────────
+    def _vision_ctx(self, multimodal):
+        """Patch the picker's multimodal probe (no network) + record persists."""
+        import skills.model_picker as MP
+        return (mock.patch.object(MP, "_is_multimodal", return_value=multimodal),
+                mock.patch.object(MP, "_persist_setting", return_value=True))
+
+    def test_switch_carries_shared_vision_tag_live_only(self):
+        import core.config as cfg
+        bc = self._bc(backend="claude", ollama="qwen2.5:14b")
+        bc.LOCAL_VISION_MODEL = "qwen2.5:14b"     # vision shares the OLD brain
+        saved = cfg.LOCAL_VISION_MODEL
+        self.addCleanup(setattr, cfg, "LOCAL_VISION_MODEL", saved)
+        is_mm, persist = self._vision_ctx(multimodal=True)
+        with _patch_bc(bc), mock.patch("core.config.CLAUDE_MODEL", "claude-x"), \
+                is_mm, persist as p:
+            A._act_switch_llm("gemma4:12b")
+        self.assertEqual(bc.LOCAL_VISION_MODEL, "gemma4:12b")
+        self.assertEqual(cfg.LOCAL_VISION_MODEL, "gemma4:12b")
+        # persist=False on this branch: the chat tag isn't persisted either,
+        # so persisting vision alone would desync user_settings.json.
+        p.assert_not_called()
+
+    def test_switch_never_touches_a_pinned_separate_vlm(self):
+        import core.config as cfg
+        bc = self._bc(backend="claude", ollama="qwen2.5:14b")
+        bc.LOCAL_VISION_MODEL = "qwen2.5vl:7b"    # user-pinned separate VLM
+        saved = cfg.LOCAL_VISION_MODEL
+        self.addCleanup(setattr, cfg, "LOCAL_VISION_MODEL", saved)
+        is_mm, persist = self._vision_ctx(multimodal=True)
+        with _patch_bc(bc), mock.patch("core.config.CLAUDE_MODEL", "claude-x"), \
+                is_mm, persist:
+            A._act_switch_llm("gemma4:12b")
+        self.assertEqual(bc.LOCAL_VISION_MODEL, "qwen2.5vl:7b")
+        self.assertEqual(cfg.LOCAL_VISION_MODEL, saved)
+
+    def test_switch_to_text_only_tag_keeps_old_vision(self):
+        import core.config as cfg
+        bc = self._bc(backend="claude", ollama="gemma4:12b")
+        bc.LOCAL_VISION_MODEL = "gemma4:12b"      # shared multimodal brain
+        saved = cfg.LOCAL_VISION_MODEL
+        self.addCleanup(setattr, cfg, "LOCAL_VISION_MODEL", saved)
+        is_mm, persist = self._vision_ctx(multimodal=False)
+        with _patch_bc(bc), mock.patch("core.config.CLAUDE_MODEL", "claude-x"), \
+                is_mm, persist:
+            A._act_switch_llm("qwen2.5:14b")      # text-only target
+        # vision stays on the old multimodal tag rather than going blind.
+        self.assertEqual(bc.LOCAL_VISION_MODEL, "gemma4:12b")
 
 
 # ===========================================================================
