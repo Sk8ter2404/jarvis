@@ -89,21 +89,41 @@ def _import_companion():
 
 def _speak(text: str) -> bool:
     """Route the prompt through the companion's TTS path so it shares the
-    serialised _SPEAK_LOCK with every other speech caller. Returns True
-    iff speech actually went out — a False return tells the caller to
-    abort (fail-closed: never auto-send when we couldn't even read the
-    draft aloud)."""
+    serialised _SPEAK_LOCK with every other speech caller.
+
+    Returns True **iff the line was actually voiced**. Anything else — no
+    companion, no callable speaker, a raise, or a companion ``_speak``
+    that returned anything other than literal ``True`` — returns False and
+    the caller must abort (fail-closed: never auto-send when we couldn't
+    even read the draft aloud).
+
+    The strict ``is True`` check below is load-bearing.
+    ``bobert_companion._speak`` has four exits and only one of them
+    returns True: it returns ``None`` when the tray "Mute TTS" toggle is
+    on (a state that PERSISTS ACROSS REBOOTS), ``None`` when nothing
+    audible survives tag/markdown stripping, ``None`` on a staging
+    instance, and ``False`` when synthesis/playback fails. None of those
+    raise. Treating a silent no-op as "the owner heard the draft" would
+    open the confirmation window with nobody having been read to, and any
+    stray "okay"/"yeah" in the room would confirm the send."""
     bc = _import_companion()
     speaker = getattr(bc, "_speak", None) if bc is not None else None
     if not callable(speaker):
         _log.warning("[draft_confirm] no TTS available; aborting confirmation")
         return False
     try:
-        speaker(text)
-        return True
+        ok = speaker(text)
     except Exception as e:
-        _log.warning("[draft_confirm] _speak failed: %s", e)
+        _log.warning("[draft_confirm] _speak raised: %s", e)
         return False
+    # Strict identity, NOT bool(ok) / truthiness: a MagicMock is truthy, and
+    # so is any future non-bool sentinel. Only a literal True means voiced.
+    if ok is not True:
+        _log.warning("[draft_confirm] readback was NOT voiced "
+                     "(muted / nothing audible / staging / playback failed) "
+                     "— aborting confirmation")
+        return False
+    return True
 
 
 def _capture_and_transcribe(timeout_s: float) -> str | None:

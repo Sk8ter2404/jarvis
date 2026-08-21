@@ -37,12 +37,27 @@ Public API
     schedule_when(name, condition, action, arg=..., chain=...)
                                      -> add a conditional trigger
     register_condition(name, fn)     -> register a custom boolean predicate
-    list_jobs()                      -> list of {id, kind, next_run, action, arg, ...}
+    list_jobs()                      -> list of {id, kind, next_run, action, arg, broken, ...}
     list_conditions()                -> list of conditional triggers
     available_conditions()           -> registered condition names
     cancel_job(job_id)               -> remove a job (cron/interval/date OR conditional)
     fire_now(job_id)                 -> dispatch a job's action immediately
     shutdown(wait=False)             -> stop the scheduler
+    unknown_actions(action, chain)   -> names not in the live ACTIONS dict (arm-time check)
+    suggest_actions(name)            -> close registered names, for a refusal hint
+    unresolved_actions()             -> fire-time resolution misses recorded so far
+    clear_unresolved(job_id=None)    -> forget recorded misses
+    set_notify_hook(fn)              -> override the owner-notice channel (tests)
+
+Silent-failure note (2026-08-20)
+--------------------------------
+A step whose action name is absent from ACTIONS used to be dropped with no
+log at all — APScheduler discards ``run_action``'s return string and its
+executor then logs ``Job "..." executed successfully`` for that very job, so
+the only trace was an actively false success line. Misses are now logged at
+WARNING, recorded in the ``unresolved`` ledger that ``status()`` reports, and
+(rate-limited) announced to the owner. ``skills/schedule_manager`` also
+rejects an impossible job at ARM time via ``unknown_actions()``.
 """
 from __future__ import annotations
 
@@ -157,11 +172,157 @@ _state: dict[str, Any] = {
     "cond_stop":    None,    # threading.Event
     "cond_state":   {},      # condition_name → last_seen_bool (debounce)
     "last_error":   None,
+    # UNRESOLVED-ACTION LEDGER (2026-08-20). A scheduled step whose action
+    # name isn't in the live ACTIONS dict used to evaporate silently: the
+    # miss produced no log, and APScheduler drops run_action's return value
+    # on the floor (its executor even logs 'Job "%s" executed successfully'
+    # for that exact case). Every miss is now recorded here, keyed
+    # "<job_id>::<action>", so status()/list_schedules can report a broken
+    # job instead of a healthy-looking one with a next_run.
+    "unresolved":   {},
 }
+
+# Don't re-announce the same broken job more often than this. A daily cron
+# therefore complains once a day; a 30-second interval job pointed at a ghost
+# action complains at most once per window instead of 2,880 times.
+_UNRESOLVED_ANNOUNCE_COOLDOWN_S = 6 * 3600
+
+# Test/override seam for the owner-facing notice. When None, run_action reaches
+# for bobert_companion.proactive_announce *only if the monolith is already
+# imported* — core.scheduler must never drag the monolith into a bare unit-test
+# process just to complain about a missing action.
+_notify_hook: Callable[[str], bool] | None = None
+
+
+def set_notify_hook(fn: Callable[[str], bool] | None) -> None:
+    """Install (or clear) the callable used to speak scheduler warnings."""
+    global _notify_hook
+    _notify_hook = fn
+
+
+def _announce(message: str) -> bool:
+    """Best-effort owner notice. Returns True only if it was really queued.
+
+    Honest-failure contract: a notice that could not be delivered is logged as
+    an explicit WARNING rather than dropped, so the log still carries the
+    evidence even when speech is unavailable.
+    """
+    hook = _notify_hook
+    if hook is None:
+        import sys as _sys
+        bc = _sys.modules.get("bobert_companion")
+        announcer = getattr(bc, "proactive_announce", None) if bc is not None else None
+        if callable(announcer):
+            hook = lambda msg: bool(announcer(msg, source="scheduler"))  # noqa: E731
+    if hook is None:
+        _log.warning("scheduler notice not spoken (no announcer available): %s",
+                     message)
+        return False
+    try:
+        ok = bool(hook(message))
+    except Exception:
+        _log.exception("scheduler notice failed to enqueue: %s", message)
+        return False
+    if not ok:
+        _log.warning("scheduler notice was rejected by the announcer: %s", message)
+    return ok
+
+
+def _note_unresolved(job_id: str, action: str) -> None:
+    """Record + log + (rate-limited) speak a fire-time action-resolution miss."""
+    key = f"{job_id or '?'}::{action}"
+    now = time.time()
+    with _lock:
+        rec = _state["unresolved"].get(key)
+        if rec is None:
+            rec = {"job_id": job_id or "", "action": action,
+                   "count": 0, "first_seen": now, "last_seen": now,
+                   "last_announced": 0.0}
+            _state["unresolved"][key] = rec
+        rec["count"] += 1
+        rec["last_seen"] = now
+        count = rec["count"]
+        due = (now - rec["last_announced"]) >= _UNRESOLVED_ANNOUNCE_COOLDOWN_S
+        if due:
+            rec["last_announced"] = now
+    # Everything below runs OUTSIDE _lock on purpose: the announcer writes to
+    # pending_speech.json, and holding the scheduler lock across a filesystem
+    # write would let a slow disk stall list_jobs()/status() for every caller.
+    # LOUD, always — this is the line that used to be missing entirely.
+    _log.warning(
+        "scheduled job %r fired action %r which is NOT registered — step skipped "
+        "(occurrence #%d). Say 'schedule status' to list broken schedules.",
+        job_id or "<unknown-job>", action, count,
+    )
+    if due:
+        _announce(
+            f"Sir, scheduled job {job_id or 'unknown'} tried to run "
+            f"'{action}', but there's no such action registered. Nothing ran."
+        )
+
+
+def unresolved_actions() -> list[dict]:
+    """Snapshot of every scheduled step that failed to resolve at fire time."""
+    with _lock:
+        return [dict(v) for v in _state["unresolved"].values()]
+
+
+def clear_unresolved(job_id: str | None = None) -> int:
+    """Forget recorded misses (all of them, or just one job's). Returns count."""
+    with _lock:
+        if job_id is None:
+            n = len(_state["unresolved"])
+            _state["unresolved"] = {}
+            return n
+        drop = [k for k, v in _state["unresolved"].items()
+                if v.get("job_id") == job_id]
+        for k in drop:
+            _state["unresolved"].pop(k, None)
+        return len(drop)
+
+
+def unknown_actions(action: str, chain: list | None = None) -> list[str]:
+    """Names in ``action`` + ``chain`` that are absent from the live ACTIONS dict.
+
+    ARM-TIME validation seam. Deliberately FAILS OPEN (returns []) when the
+    scheduler hasn't been bootstrapped yet, because skills arm jobs during
+    load — ``skills/self_diagnostic.py`` and ``skills/sh_hue.py`` both call
+    ``schedule_interval`` / ``schedule_once`` for actions their own module
+    registers moments later. Only the voice/LLM entry points in
+    ``skills/schedule_manager.py`` call this, and by then every skill has
+    loaded. Never call it from ``schedule_*`` itself or those load-time arms
+    would start being rejected.
+    """
+    with _lock:
+        actions = _state.get("actions")
+    if not actions:
+        return []
+    names = [action]
+    for entry in (chain or []):
+        if isinstance(entry, dict) and entry.get("action"):
+            names.append(entry["action"])
+    seen: set[str] = set()
+    missing: list[str] = []
+    for n in names:
+        if n and n not in actions and n not in seen:
+            seen.add(n)
+            missing.append(n)
+    return missing
+
+
+def suggest_actions(name: str, limit: int = 3) -> list[str]:
+    """Close registered action names for ``name`` (arm-time refusal hint)."""
+    with _lock:
+        actions = _state.get("actions")
+    if not actions or not name:
+        return []
+    import difflib
+    return difflib.get_close_matches(name, list(actions.keys()), n=limit, cutoff=0.6)
 
 
 # ── module-level dispatch (persistable) ─────────────────────────────
-def run_action(action: str, arg: str = "", chain: list | None = None) -> str:
+def run_action(action: str, arg: str = "", chain: list | None = None,
+               job_id: str = "") -> str:
     """The single entry point every persisted job points at.
 
     APScheduler resolves persisted jobs by importable path, so jobs must
@@ -173,6 +334,11 @@ def run_action(action: str, arg: str = "", chain: list | None = None) -> str:
     ``chain`` is an optional list of ``[{"action": "...", "arg": "..."}]``
     entries dispatched in order after ``action`` so a single scheduled
     job can run "brief emails, then weather, then play lo-fi".
+
+    ``job_id`` is carried in the job's kwargs purely so a fire-time failure
+    can name the schedule the owner has to cancel or fix. It defaults to ""
+    so a job persisted by an older build (whose kwargs predate this
+    parameter) still re-binds and fires cleanly.
     """
     with _lock:
         actions = _state.get("actions")
@@ -195,6 +361,11 @@ def run_action(action: str, arg: str = "", chain: list | None = None) -> str:
         a    = step.get("arg") or ""
         fn   = actions.get(name)
         if fn is None:
+            # LOUD, not silent. APScheduler discards this return value and
+            # then logs 'executed successfully' for the job, so without the
+            # warning + ledger below a scheduled step that never ran would
+            # leave *no* evidence anywhere. See _note_unresolved.
+            _note_unresolved(job_id, name)
             results.append(f"{name}: not registered")
             continue
         try:
@@ -376,7 +547,9 @@ def _evaluate_conditions_once() -> None:
             if value and not prev:
                 # rising edge — fire the action chain
                 try:
-                    run_action(action, arg, chain=chain if isinstance(chain, list) else None)
+                    run_action(action, arg,
+                               chain=chain if isinstance(chain, list) else None,
+                               job_id=tid)
                     fired_any = True
                 except Exception as e:
                     _log.exception("conditional trigger %s dispatch failed: %s", tid, e)
@@ -529,11 +702,19 @@ def _make_aware(dt: datetime) -> datetime:
     return dt.astimezone()
 
 
-def _job_kwargs(action: str, arg: str, chain: list | None) -> dict:
-    """Build the kwargs APScheduler hands to ``run_action`` at fire time."""
+def _job_kwargs(action: str, arg: str, chain: list | None,
+                job_id: str = "") -> dict:
+    """Build the kwargs APScheduler hands to ``run_action`` at fire time.
+
+    ``job_id`` is embedded so a fire-time resolution failure can name the
+    schedule in its warning — APScheduler does not hand the job object to the
+    dispatched callable, so the id has to ride along in the kwargs.
+    """
     kw: dict[str, Any] = {"action": action, "arg": arg or ""}
     if chain:
         kw["chain"] = list(chain)
+    if job_id:
+        kw["job_id"] = job_id
     return kw
 
 
@@ -573,7 +754,7 @@ def schedule_cron(
     sched.add_job(
         run_action,
         trigger=trigger,
-        kwargs=_job_kwargs(action, arg, chain),
+        kwargs=_job_kwargs(action, arg, chain, jid),
         id=jid,
         replace_existing=replace_existing,
         name=f"cron:{action}",
@@ -607,7 +788,7 @@ def schedule_interval(
     sched.add_job(
         run_action,
         trigger=trigger,
-        kwargs=_job_kwargs(action, arg, chain),
+        kwargs=_job_kwargs(action, arg, chain, jid),
         id=jid,
         replace_existing=replace_existing,
         name=f"interval:{action}",
@@ -641,7 +822,7 @@ def schedule_once(
     sched.add_job(
         run_action,
         trigger=trigger,
-        kwargs=_job_kwargs(action, arg, chain),
+        kwargs=_job_kwargs(action, arg, chain, jid),
         id=jid,
         replace_existing=replace_existing,
         name=f"once:{action}",
@@ -725,6 +906,10 @@ def _job_summary(job: Any) -> dict:
     kind, summary = _describe_trigger(job.trigger)
     kw = getattr(job, "kwargs", {}) or {}
     next_run = getattr(job, "next_run_time", None)
+    # A listing that shows a next_run for a job whose action doesn't exist is
+    # actively corroborating a false belief, so every summary carries the
+    # resolution verdict alongside the schedule.
+    missing = unknown_actions(kw.get("action") or "", kw.get("chain") or [])
     return {
         "id":       job.id,
         "kind":     kind,
@@ -734,6 +919,8 @@ def _job_summary(job: Any) -> dict:
         "chain":    kw.get("chain") or [],
         "next_run": next_run.isoformat() if next_run else None,
         "name":     job.name,
+        "unknown_actions": missing,
+        "broken":   bool(missing),
     }
 
 
@@ -755,13 +942,16 @@ def list_conditions() -> list[dict]:
     triggers = _read_conditions()
     with _lock:
         state = dict(_state["cond_state"])
-    return [
-        {
+    out: list[dict] = []
+    for t in triggers:
+        missing = unknown_actions(t.get("action") or "", t.get("chain") or [])
+        out.append({
             **t,
             "current_value": state.get(t.get("id"), None),
-        }
-        for t in triggers
-    ]
+            "unknown_actions": missing,
+            "broken": bool(missing),
+        })
+    return out
 
 
 def cancel_job(job_id: str) -> bool:
@@ -789,6 +979,10 @@ def cancel_job(job_id: str) -> bool:
 
     with _lock:
         _state["cond_state"].pop(job_id, None)
+    if removed:
+        # Drop this job's fire-time misses too — otherwise status() would keep
+        # reporting a broken schedule the owner already cancelled.
+        clear_unresolved(job_id)
     return removed
 
 
@@ -809,6 +1003,7 @@ def fire_now(job_id: str) -> str:
                 kw.get("action") or "",
                 kw.get("arg")    or "",
                 chain=kw.get("chain"),
+                job_id=kw.get("job_id") or job_id,
             )
 
     # Conditional trigger fallback
@@ -818,6 +1013,7 @@ def fire_now(job_id: str) -> str:
                 trig.get("action") or "",
                 trig.get("arg")    or "",
                 chain=trig.get("chain"),
+                job_id=job_id,
             )
     return f"job '{job_id}' not found"
 
@@ -830,6 +1026,15 @@ def status() -> dict:
         last_error = _state.get("last_error")
     jobs       = list_jobs()
     conditions = list_conditions()
+    # Jobs/triggers whose action name doesn't resolve right now — reported
+    # BEFORE they ever fire, so "schedule status" catches a 6am ghost at 9pm.
+    broken = [j for j in jobs if j.get("broken")]
+    for c in conditions:
+        if c.get("broken"):
+            broken.append({"id": c.get("id"), "kind": "when",
+                           "action": c.get("action"),
+                           "unknown_actions": c.get("unknown_actions") or [],
+                           "broken": True})
     return {
         "available":         is_available(),
         "running":           s is not None and getattr(s, "running", False),
@@ -839,6 +1044,8 @@ def status() -> dict:
         "condition_count":   len(conditions),
         "registered_conditions": available_conditions(),
         "last_error":        last_error,
+        "broken_jobs":       broken,
+        "unresolved":        unresolved_actions(),
     }
 
 

@@ -788,6 +788,56 @@ def _coerce_setting(name: str, value, schema: dict, coerce_value) -> object:
     return coerce_value(spec, value)
 
 
+def _log_warn(msg: str) -> None:
+    """One-line stderr warning for a settings write that DEGRADED.
+
+    Per-request logging is deliberately silenced (see JarvisHandler.log_message
+    — it would spam the session log we tail), but a settings write that quietly
+    did less than it should is exactly what must never be silent. Settings
+    writes are rare, so this cannot spam. Never raises."""
+    try:
+        print(f"[web_interface] {msg}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+def _lockstep_vision(current: dict, new_chat) -> str | None:
+    """The LOCAL_VISION_MODEL tag this settings write must ALSO set, or None.
+
+    POST /api/settings can repoint LOCAL_LLM_MODEL, which makes the dashboard a
+    model-switch entry point — but until 2026-08-20 it applied none of the
+    chat↔vision lockstep the voice switch does, so a dashboard save forked the
+    shipped one-multimodal-brain config onto a real second VLM (and neither UI
+    could repair it afterwards: the voice path reads the mismatch as a pinned
+    VLM). The RULE lives once in core.model_lockstep; this only resolves the
+    inputs (the pre-merge document holds the OLD chat tag, and a key the
+    document omits is still live at its core/config.py value).
+
+    LOCAL_VISION_MODEL has no SCHEMA row, so _coerce_setting would 400 it —
+    the caller merges the returned tag into the document directly, exactly the
+    way settings_window's Save writes it as a passthrough key. Never raises."""
+    try:
+        from core.model_lockstep import (LOCKSTEP_TEXT_ONLY, config_default,
+                                         vision_lockstep_decision)
+    except Exception as exc:
+        _log_warn(f"vision lockstep unavailable ({exc}) — a chat-model write "
+                  f"will NOT move LOCAL_VISION_MODEL")
+        return None
+    try:
+        old_chat = current.get("LOCAL_LLM_MODEL") or config_default(
+            "LOCAL_LLM_MODEL")
+        cur_vision = (current.get("LOCAL_VISION_MODEL")
+                      or config_default("LOCAL_VISION_MODEL"))
+        tag, reason = vision_lockstep_decision(old_chat, new_chat, cur_vision)
+        if reason == LOCKSTEP_TEXT_ONLY:
+            _log_warn(f"chat model set to {new_chat!r}, which is not vision-"
+                      f"capable — local vision stays on {cur_vision!r}")
+        return tag
+    except Exception as exc:                       # pragma: no cover
+        _log_warn(f"vision lockstep skipped: {exc}")
+        return None
+
+
 def _write_settings(updates: dict, path: str) -> dict:
     """MERGE ``updates`` (name→value) into the user_settings.json at ``path``,
     atomically, preserving every other key already in the file.
@@ -796,6 +846,11 @@ def _write_settings(updates: dict, path: str) -> dict:
     ``SettingsWriteError`` if ANY update is invalid (unknown key / bad type) —
     validation happens for ALL updates BEFORE we touch disk, so a bad key in a
     batch never leaves a half-applied file.
+
+    One key can be written that the caller did NOT send: repointing
+    LOCAL_LLM_MODEL carries LOCAL_VISION_MODEL with it when the two share the
+    one multimodal brain (see _lockstep_vision). It is included in the return
+    value so the response names every key this write changed.
 
     ATOMICITY / PRESERVATION
     ========================
@@ -836,6 +891,15 @@ def _write_settings(updates: dict, path: str) -> dict:
                         current = decoded
         except Exception:
             current = {}      # a corrupt file is overwritten with a valid merge
+        # Vision LOCKSTEP — must happen HERE, inside the lock and BEFORE the
+        # merge, because `current` is the only place the OLD chat tag still
+        # exists (the rule's precondition is "vision currently denotes the old
+        # chat tag"). Reported back in `applied` so the API answer names every
+        # key this write actually changed. 2026-08-20 audit.
+        if "LOCAL_LLM_MODEL" in applied:
+            synced = _lockstep_vision(current, applied["LOCAL_LLM_MODEL"])
+            if synced:
+                applied["LOCAL_VISION_MODEL"] = synced
         current.update(applied)
         # 3) Atomic write (temp in the same dir + os.replace) — never a partial file.
         _dir = os.path.dirname(os.path.abspath(path)) or "."

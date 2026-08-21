@@ -202,9 +202,7 @@ There is no push-to-talk hotkey by default — JARVIS listens continuously. Spea
 
 ### Category 12: Microsoft Teams integration
 
-- **Teams call screener** — polls window titles for VIP-caller patterns (e.g. "a VIP contact is calling you"). Speaks caller's name and arms answer/decline.
-  - "yes, patch him through", "answer it", "take it", "no, send my regards", "decline the call"
-  - Actions: `screen_teams_calls`, `answer_call`, `decline_call`, `vip_priority_handler`
+- **Teams call screener** — *not in this repo.* The screener (window-title VIP polling, `answer_call` / `decline_call` / `vip_priority_handler`) lives in a personal skill that is gitignored and never shipped, so those actions do not exist in a public install. It documents itself to the model through its own `PROMPT_EXAMPLES` when present.
 - **Teams unread nudge** — vision-based: full-screen capture every N seconds, Claude vision looks for unread badge, queues a JARVIS nudge if not snoozed.
   - "check Teams", "any Teams messages"
   - Action: `check_teams`
@@ -267,7 +265,7 @@ There is no push-to-talk hotkey by default — JARVIS listens continuously. Spea
   - Bambu actively printing → "At your service — the print is at 47%, by the way."
   - Out of view on every camera → quieter "Yes, sir?"
   - Otherwise one of 12 phrases tagged formal / terse / playful / soft / general.
-- **Barge-in** — on a headset, TTS is killed mid-sentence if mic detects sustained speech. Silent on speakers to avoid feedback.
+- **Barge-in** — say "JARVIS" while he's talking to cut TTS mid-sentence, on speakers as well as headsets. Requires the wake-word detector to be running (`wake_listener_start`); it does not autostart, so talking over him does nothing on its own. Refused while the sentence being spoken contains "jarvis" (echo safety). The legacy loudness/headset watcher is hard-disabled (its mic-stream teardown crashed the audio stack).
 - **Goodnight = overnight upgrade** — any bedtime phrasing fires `start_overnight_upgrade` and silences JARVIS until morning.
 - **Workshop auto-engagement** — opening any CAD/slicer app drops TTS volume 30%, shortens replies, auto-engages focus mode for an hour (auto-releases when app closes).
 - **Promises ("I'll let you know when…")** — skills register deferred announcement via `skill_utils["make_promise"]` (e.g. "tell me when the print finishes", "let me know when the bed cools").

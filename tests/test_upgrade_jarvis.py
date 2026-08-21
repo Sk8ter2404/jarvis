@@ -30,6 +30,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -1116,7 +1117,11 @@ class RelaunchJarvisTests(_UpgBase):
         _FakePopen.instances = []
 
     def test_basic_relaunch(self):
+        # kill_running_jarvis() is stubbed because relaunch_jarvis() now reaps
+        # stale PROD first (H-7); its subprocess.run() would otherwise build
+        # the first _FakePopen and instances[0] would be the CIM query.
         with mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch.object(U, "kill_running_jarvis", return_value=0), \
              mock.patch.object(U.subprocess, "Popen", _FakePopen):
             os.environ.pop("JARVIS_AMBIENT_LEARNING", None)
             os.environ.pop("JARVIS_WAKE_RESUME", None)
@@ -1126,7 +1131,8 @@ class RelaunchJarvisTests(_UpgBase):
         self.assertNotIn("--resume-handoff", ps)
 
     def test_handoff_adds_resume_flag(self):
-        with mock.patch.object(U.subprocess, "Popen", _FakePopen):
+        with mock.patch.object(U, "kill_running_jarvis", return_value=0), \
+             mock.patch.object(U.subprocess, "Popen", _FakePopen):
             U.relaunch_jarvis(with_handoff=True)
         ps = _FakePopen.instances[0].cmd[-1]
         self.assertIn("--resume-handoff", ps)
@@ -1134,6 +1140,7 @@ class RelaunchJarvisTests(_UpgBase):
     def test_ambient_env_propagated(self):
         with mock.patch.dict(os.environ, {"JARVIS_AMBIENT_LEARNING": "0",
                                           "JARVIS_WAKE_RESUME": "stay_talkative"}), \
+             mock.patch.object(U, "kill_running_jarvis", return_value=0), \
              mock.patch.object(U.subprocess, "Popen", _FakePopen):
             U.relaunch_jarvis()
         ps = _FakePopen.instances[0].cmd[-1]
@@ -1918,6 +1925,353 @@ class ImportTimeGuardTests(unittest.TestCase):
         printed = buf.getvalue()
         self.assertIn("blue_green_manager unavailable", printed)
         self.assertIn("staging_instance unavailable", printed)
+
+
+
+# ══════════ upgrade-in-progress marker (H-7 watchdog handshake) ═══════════
+# tools/jarvis_watchdog.py resurrects JARVIS on "no process + no
+# data/clean_shutdown.flag". That is exactly the state an upgrade run leaves
+# behind for hours: the pipeline's tester stage boots a real prod JARVIS for
+# its smoke test (whose boot path DELETES clean_shutdown.flag unconditionally)
+# and then kills it with Stop-Process -Force, which never reaches atexit — and
+# no killer writes the flag back. From the first tester stage onward the
+# watchdog booted a live-mic JARVIS every 5 minutes out of a tree the
+# implementer stage was mid-rewrite on.
+#
+# The fix must never become the MIRROR-IMAGE bug (2026-07-15 → 07-21: a crash
+# left clean_shutdown.flag behind and nothing was resurrected for six days),
+# so every bound below is load-bearing: lease, hard ceiling, owner liveness.
+
+
+class _MarkerBase(_UpgBase):
+    """_UpgBase plus a clean, non-leaking _marker_state per test."""
+
+    _DEFAULT_STATE = {"depth": 0, "owned": False, "stop": None,
+                      "thread": None, "started_at": 0.0, "hard_deadline": 0.0}
+
+    def setUp(self):
+        super().setUp()
+        self._saved_marker = dict(U._marker_state)
+        self.addCleanup(self._reset_marker_state)
+        U._marker_state.clear()
+        U._marker_state.update(self._DEFAULT_STATE)
+
+    def _reset_marker_state(self):
+        # Stop any heartbeat thread this test started before restoring state,
+        # so no daemon thread survives into the next test.
+        for _ in range(10):
+            if not (U._marker_state.get("depth") or U._marker_state.get("owned")):
+                break
+            U.release_upgrade_marker()
+        U._marker_state.clear()
+        U._marker_state.update(self._saved_marker)
+
+    @property
+    def marker(self):
+        return U._upgrade_marker_path()
+
+    def read_marker(self):
+        with open(self.marker, encoding="utf-8") as f:
+            return json.load(f)
+
+    def write_foreign_marker(self, **over):
+        now = time.time()
+        payload = {"pid": 999999, "started_at": now, "heartbeat_at": now,
+                   "expires_at": now + 600, "hard_deadline": now + 21600,
+                   "argv": "upgrade_jarvis.py"}
+        payload.update(over)
+        os.makedirs(os.path.dirname(self.marker), exist_ok=True)
+        with open(self.marker, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        return payload
+
+
+class MarkerConfigTests(_MarkerBase):
+    def test_defaults(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("JARVIS_UPGRADE_MARKER_TTL_S", None)
+            os.environ.pop("JARVIS_UPGRADE_MARKER_MAX_AGE_S", None)
+            self.assertEqual(U._marker_config(), (600, 21600))
+
+    def test_ttl_floor_is_two_heartbeats(self):
+        # A lease shorter than the refresh cadence would lapse between
+        # heartbeats and re-open the window the marker exists to close.
+        with mock.patch.dict(os.environ, {"JARVIS_UPGRADE_MARKER_TTL_S": "5"}):
+            ttl, _ = U._marker_config()
+        self.assertEqual(ttl, U._MARKER_HEARTBEAT_S * 2)
+
+    def test_garbage_env_falls_back(self):
+        with mock.patch.dict(os.environ,
+                             {"JARVIS_UPGRADE_MARKER_TTL_S": "soon",
+                              "JARVIS_UPGRADE_MARKER_MAX_AGE_S": "never"}):
+            self.assertEqual(U._marker_config(), (600, 21600))
+
+    def test_max_age_never_below_ttl(self):
+        with mock.patch.dict(os.environ,
+                             {"JARVIS_UPGRADE_MARKER_TTL_S": "900",
+                              "JARVIS_UPGRADE_MARKER_MAX_AGE_S": "60"}):
+            ttl, max_age = U._marker_config()
+        self.assertEqual((ttl, max_age), (900, 900))
+
+
+class MarkerPathTests(_MarkerBase):
+    def test_path_follows_PROJECT_DIR_at_call_time(self):
+        # Guards a real hazard: a module-level constant baked at import would
+        # make every main() test write a REAL C:\JARVIS\data marker and park
+        # the live watchdog scheduled task for hours.
+        self.assertTrue(self.marker.startswith(self.tmp))
+        self.assertTrue(self.marker.endswith(
+            os.path.join("data", "upgrade_in_progress.flag")))
+
+
+class AcquireReleaseTests(_MarkerBase):
+    def test_acquire_writes_a_bounded_marker(self):
+        before = time.time()
+        self.assertTrue(U.acquire_upgrade_marker())
+        data = self.read_marker()
+        self.assertEqual(data["pid"], os.getpid())
+        self.assertGreater(data["expires_at"], before)
+        self.assertGreater(data["hard_deadline"], data["expires_at"])
+        # the ceiling is never open-ended
+        self.assertLessEqual(data["hard_deadline"] - data["started_at"],
+                             U._marker_config()[1] + 1)
+
+    def test_release_deletes_the_marker(self):
+        U.acquire_upgrade_marker()
+        U.release_upgrade_marker()
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_no_tmp_file_left_behind(self):
+        U.acquire_upgrade_marker()
+        self.assertFalse(os.path.exists(self.marker + ".tmp"))
+
+    def test_context_manager_releases_on_exception(self):
+        # THE anti-park-forever guarantee at the source: a crashing upgrade
+        # must still drop the marker on the way out.
+        with self.assertRaises(RuntimeError):
+            with U.upgrade_in_progress():
+                self.assertTrue(os.path.exists(self.marker))
+                raise RuntimeError("implementer blew up")
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_context_manager_releases_on_sys_exit(self):
+        with self.assertRaises(SystemExit):
+            with U.upgrade_in_progress():
+                sys.exit(1)
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_reentrant_acquire_holds_until_the_last_release(self):
+        U.acquire_upgrade_marker()
+        U.acquire_upgrade_marker()
+        U.release_upgrade_marker()
+        self.assertTrue(os.path.exists(self.marker))     # inner release only
+        U.release_upgrade_marker()
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_write_failure_is_reported_and_not_fatal(self):
+        out = io.StringIO()
+        with mock.patch.object(U, "_write_upgrade_marker", return_value=False), \
+             mock.patch("sys.stdout", out):
+            self.assertFalse(U.acquire_upgrade_marker())
+            U.release_upgrade_marker()
+        self.assertIn("COULD NOT WRITE", out.getvalue())
+
+    def test_heartbeat_thread_is_daemon_and_stops_on_release(self):
+        U.acquire_upgrade_marker()
+        thread = U._marker_state["thread"]
+        self.assertTrue(thread.daemon)
+        U.release_upgrade_marker()
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+
+
+class ForeignMarkerTests(_MarkerBase):
+    def test_live_foreign_marker_is_not_stolen_or_deleted(self):
+        self.write_foreign_marker()
+        out = io.StringIO()
+        with mock.patch.object(U, "_marker_pid_alive", return_value=True), \
+             mock.patch("sys.stdout", out):
+            self.assertFalse(U.acquire_upgrade_marker())
+            U.release_upgrade_marker()
+        self.assertTrue(os.path.exists(self.marker))
+        self.assertEqual(self.read_marker()["pid"], 999999)
+        self.assertIn("already holds it", out.getvalue())
+
+    def test_dead_owner_marker_is_taken_over(self):
+        self.write_foreign_marker()
+        with mock.patch.object(U, "_marker_pid_alive", return_value=False):
+            self.assertTrue(U.acquire_upgrade_marker())
+        self.assertEqual(self.read_marker()["pid"], os.getpid())
+
+    def test_lapsed_lease_marker_is_taken_over(self):
+        self.write_foreign_marker(expires_at=time.time() - 1)
+        with mock.patch.object(U, "_marker_pid_alive", return_value=True):
+            self.assertTrue(U.acquire_upgrade_marker())
+        self.assertEqual(self.read_marker()["pid"], os.getpid())
+
+    def test_marker_past_hard_ceiling_is_taken_over(self):
+        now = time.time()
+        self.write_foreign_marker(expires_at=now + 600, hard_deadline=now - 1)
+        with mock.patch.object(U, "_marker_pid_alive", return_value=True):
+            self.assertTrue(U.acquire_upgrade_marker())
+        self.assertEqual(self.read_marker()["pid"], os.getpid())
+
+    def test_release_does_not_delete_a_marker_someone_else_took_over(self):
+        U.acquire_upgrade_marker()
+        self.write_foreign_marker(pid=123456)     # taken over behind our back
+        U.release_upgrade_marker()
+        self.assertTrue(os.path.exists(self.marker))
+        self.assertEqual(self.read_marker()["pid"], 123456)
+
+    def test_unreadable_marker_is_taken_over(self):
+        os.makedirs(os.path.dirname(self.marker), exist_ok=True)
+        with open(self.marker, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        self.assertTrue(U.acquire_upgrade_marker())
+        self.assertEqual(self.read_marker()["pid"], os.getpid())
+
+
+class MarkerIsLiveTests(_MarkerBase):
+    def test_none_is_not_live(self):
+        self.assertFalse(U._marker_is_live(None))
+        self.assertFalse(U._marker_is_live({}))
+
+    def test_missing_expiry_is_not_live(self):
+        self.assertFalse(U._marker_is_live({"pid": os.getpid()}))
+
+    def test_non_numeric_deadlines_are_not_live(self):
+        self.assertFalse(U._marker_is_live(
+            {"pid": os.getpid(), "expires_at": "soon"}))
+
+    def test_pid_check_is_skipped_when_absent(self):
+        self.assertTrue(U._marker_is_live({"expires_at": time.time() + 60}))
+
+
+class MainMarkerIntegrationTests(_MarkerBase):
+    def _run_main(self, argv):
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), \
+             mock.patch("sys.stdout", out):
+            try:
+                U.main()
+            except SystemExit:
+                pass
+        return out.getvalue()
+
+    def test_marker_is_held_across_the_whole_run_then_cleared(self):
+        # THE regression: while Claude Code is rewriting the tree the marker
+        # must be on disk, and it must be gone once the run ends.
+        self.write("jarvis_todo.md", "- [ ] task one\n")
+        seen = {}
+
+        def _spawn(*a, **k):
+            seen["marker_present"] = os.path.exists(self.marker)
+            seen["pid"] = self.read_marker()["pid"]
+            return _FakePopen(["x"])
+
+        with mock.patch.object(U, "find_claude_cli", return_value=r"C:\claude.exe"), \
+             mock.patch.object(U, "backup_codebase",
+                               return_value=os.path.join(self.tmp, "bk")), \
+             mock.patch.object(U, "kill_running_jarvis", return_value=1), \
+             mock.patch.object(U, "spawn_claude_code", side_effect=_spawn):
+            self._run_main(["upgrade_jarvis.py"])
+        self.assertTrue(seen["marker_present"])
+        self.assertEqual(seen["pid"], os.getpid())
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_marker_is_up_before_the_first_mutating_step(self):
+        # backup_codebase() / kill_running_jarvis() are the first things that
+        # touch the machine — the marker must precede BOTH.
+        self.write("jarvis_todo.md", "- [ ] task one\n")
+        order = []
+
+        with mock.patch.object(U, "find_claude_cli", return_value=None), \
+             mock.patch.object(
+                 U, "backup_codebase",
+                 side_effect=lambda: (order.append(os.path.exists(self.marker)),
+                                      os.path.join(self.tmp, "bk"))[1]), \
+             mock.patch.object(
+                 U, "kill_running_jarvis",
+                 side_effect=lambda: (order.append(os.path.exists(self.marker)),
+                                      0)[1]), \
+             mock.patch.object(U.subprocess, "Popen", _FakePopen), \
+             mock.patch.object(U.os, "startfile", create=True), \
+             mock.patch("builtins.input", return_value=""):
+            self._run_main(["upgrade_jarvis.py"])
+        self.assertEqual(order, [True, True])
+
+    def test_marker_is_cleared_even_when_main_raises(self):
+        self.write("jarvis_todo.md", "- [ ] t\n")
+        with mock.patch.object(U, "backup_codebase",
+                               side_effect=RuntimeError("disk full")):
+            with mock.patch.object(sys, "argv", ["upgrade_jarvis.py"]), \
+                 mock.patch("sys.stdout", io.StringIO()):
+                with self.assertRaises(RuntimeError):
+                    U.main()
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_dry_audit_does_not_claim_the_marker(self):
+        # Read-only preview: no kill, no backup, no writes. Parking the
+        # resurrection net for it would make the marker mean something false.
+        self.write("jarvis_todo.md", "- [ ] task one\n")
+        seen = {}
+
+        def _audit(*a, **k):
+            seen["marker_present"] = os.path.exists(self.marker)
+            return _FakePopen(["x"])
+
+        with mock.patch.object(U, "find_claude_cli", return_value=r"C:\claude.exe"), \
+             mock.patch.object(U, "spawn_claude_dry_audit", side_effect=_audit):
+            self._run_main(["upgrade_jarvis.py", "--dry-audit"])
+        self.assertFalse(seen["marker_present"])
+
+    def test_blue_green_branch_still_releases_through_sys_exit(self):
+        with mock.patch.object(U, "run_blue_green_handoff",
+                               return_value={"ok": True, "stage_failed": None}):
+            self._run_main(["upgrade_jarvis.py", "--blue-green"])
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_a_failed_marker_write_never_aborts_the_upgrade(self):
+        self.write("jarvis_todo.md", "- [ ] task one\n")
+        with mock.patch.object(U, "_write_upgrade_marker", return_value=False), \
+             mock.patch.object(U, "find_claude_cli", return_value=r"C:\claude.exe"), \
+             mock.patch.object(U, "backup_codebase",
+                               return_value=os.path.join(self.tmp, "bk")), \
+             mock.patch.object(U, "kill_running_jarvis", return_value=0), \
+             mock.patch.object(U, "spawn_claude_code",
+                               return_value=_FakePopen(["x"])) as spawn:
+            txt = self._run_main(["upgrade_jarvis.py"])
+        spawn.assert_called_once()
+        self.assertIn("COULD NOT WRITE", txt)
+
+
+class RelaunchReapsStaleProdTests(_UpgBase):
+    def setUp(self):
+        super().setUp()
+        _FakePopen.instances = []
+
+    def test_relaunch_kills_prod_before_spawning(self):
+        # H-7 blast-radius fix: relaunch_jarvis() does NOT go through
+        # _boot_jarvis.ps1, so a JARVIS the watchdog resurrected mid-upgrade
+        # would still hold jarvis.lock and the "upgraded" process would
+        # sys.exit(0) on the singleton check while the pipeline printed
+        # "JARVIS relaunched."
+        with mock.patch.object(U, "kill_running_jarvis", return_value=2) as kill, \
+             mock.patch.object(U.subprocess, "Popen", _FakePopen), \
+             mock.patch("sys.stdout", io.StringIO()):
+            U.relaunch_jarvis()
+        kill.assert_called_once()
+        self.assertEqual(len(_FakePopen.instances), 1)
+
+    def test_relaunch_survives_a_failing_pre_kill(self):
+        out = io.StringIO()
+        with mock.patch.object(U, "kill_running_jarvis",
+                               side_effect=OSError("wmi down")), \
+             mock.patch.object(U.subprocess, "Popen", _FakePopen), \
+             mock.patch("sys.stdout", out):
+            U.relaunch_jarvis()
+        self.assertEqual(len(_FakePopen.instances), 1)
+        self.assertIn("pre-kill failed", out.getvalue())
 
 
 if __name__ == "__main__":

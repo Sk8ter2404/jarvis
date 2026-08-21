@@ -58,6 +58,7 @@ from __future__ import annotations
 import math
 import os
 import queue
+import sys
 import threading
 import time
 from typing import Callable, Optional
@@ -84,8 +85,9 @@ def _safe_close_stream(stream, timeout_sec: float = 2.0) -> None:
     Mirrors bobert_companion._safe_close_stream: sounddevice.close() at
     sounddevice.py:1167 SIGSEGV'd on this build (faulthandler caught the
     crash across multiple PIDs on 2026-05-29). Stop synchronously, then run
-    close() on a daemon thread; if it hangs past timeout_sec, force sd.stop()
-    and let the daemon die with the process."""
+    close() on a daemon thread; if it hangs past timeout_sec, ABANDON the
+    daemon (it dies with the process) — never sd.stop(), see the H-3 note at
+    the bottom of this function."""
     if stream is None:
         return
     try:
@@ -93,6 +95,19 @@ def _safe_close_stream(stream, timeout_sec: float = 2.0) -> None:
     except Exception as e:
         print(f"  [wake-word] stream.stop raised: {e!r}")
     done = threading.Event()
+    # H-6 (2026-08-20) — THE STALE-DUPLICATE HALF. This copy abandons a native
+    # Pa_CloseStream exactly like bobert_companion._safe_close_stream does, and
+    # bobert_companion._refresh_devices calls det.pause() — which lands HERE —
+    # immediately before its destructive sd._terminate(). So a wake-word close
+    # that hung past timeout_sec was abandoned and then torn down underneath
+    # (0xc0000374), by the very code path the gate protects. Register the
+    # hand-off with the host's _pa_close_pending cell when the monolith is
+    # loaded; degrade to a plain start() when it is not (standalone / test
+    # import), where there is no _refresh_devices to defer in the first place.
+    _bc = sys.modules.get("bobert_companion")
+    _handoff = getattr(_bc, "_pa_close_handoff", None) if _bc is not None else None
+    _retire = getattr(_bc, "_pa_close_done", None) if _bc is not None else None
+    _gated = callable(_handoff) and callable(_retire)
 
     def _do_close():
         try:
@@ -100,18 +115,39 @@ def _safe_close_stream(stream, timeout_sec: float = 2.0) -> None:
         except Exception as e:
             print(f"  [wake-word] stream.close raised: {e!r}")
         finally:
+            if _gated:
+                # Retire BEFORE waking the caller — a successful bounded wait
+                # must never leave a phantom count deferring hotplug.
+                try:
+                    _retire()
+                except Exception:
+                    pass
             done.set()
 
     t = threading.Thread(target=_do_close, daemon=True)
-    t.start()
+    if _gated:
+        # Bumps the count, then starts t (and retires again on a failed start,
+        # so a thread that never ran can't defer the reinit forever).
+        _handoff(t)
+    else:
+        t.start()
     if not done.wait(timeout=timeout_sec):
+        # H-3 (2026-08-20) — THE STALE-DUPLICATE HALF of the same deletion in
+        # bobert_companion._safe_close_stream. Module-level sd.stop() does NOT
+        # touch the stream passed in: sounddevice 0.5.5 stops+closes whatever
+        # `_last_callback` points at, which is only ever set by
+        # sd.play()/sd.rec()/sd.playrec(). `s` here is always an explicitly
+        # constructed InputStream, so the call could never free this handle —
+        # but it CAN close the live TTS playback stream out from under
+        # play_with_lipsync's reaper (two threads in Pa_CloseStream on one
+        # WASAPI stream -> 0xc0000374). Abandon instead; the close stays
+        # registered with the host's _pa_close_pending gate above.
         print(f"  [wake-word] stream.close hung >{timeout_sec:.1f}s — "
-              "forcing sd.stop()")
-        try:
-            import sounddevice as sd
-            sd.stop()
-        except Exception:
-            pass
+              "abandoning the close daemon (it dies with the process). "
+              "sd.stop() is deliberately NOT called: it acts only on the last "
+              "sd.play()/sd.rec() stream, so it cannot free this handle and "
+              "would instead close a live TTS playback stream "
+              "(double Pa_CloseStream -> 0xc0000374).")
 
 
 def _phrase_to_oww_model_name(phrase: str) -> str:

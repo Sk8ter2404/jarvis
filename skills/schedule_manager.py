@@ -28,6 +28,19 @@ fire time.
 
 If APScheduler is not installed the skill still registers, but every
 action returns a clean install hint instead of crashing.
+
+Arm-time validation (2026-08-20)
+--------------------------------
+Every step named on the RHS is checked against the live ACTIONS dict via
+``core.scheduler.unknown_actions()`` BEFORE the job is created, so an
+impossible schedule is refused out loud while the owner is still in the
+conversation instead of evaporating silently at 6 a.m.  The check is
+deliberately absent from ``core.scheduler``'s own ``schedule_*`` entry
+points: ``skills/self_diagnostic.py`` and ``skills/sh_hue.py`` arm jobs
+during skill load for actions their own module registers moments later,
+and a check there would start rejecting those.  ``list_schedules`` and
+``schedule_status`` additionally report any already-armed job whose
+action no longer resolves.
 """
 from __future__ import annotations
 
@@ -106,6 +119,55 @@ def _split_action_and_arg(token: str) -> tuple[str, str]:
     return parts[0], parts[1].strip()
 
 
+# ── arm-time action validation ──────────────────────────────────────
+# WHY THIS EXISTS (2026-08-20). "every morning at 8 remind me to…" used to
+# arm happily against an action name that doesn't exist, speak "Recurring
+# schedule armed, sir", and then evaporate at 6am with no log and no notice.
+# Rejecting at arm time is the only point where the owner is still in the
+# conversation and can be told. The rule lives in ONE place —
+# core.scheduler.unknown_actions() — precisely so it can't rot into three
+# divergent copies across _make_recurring / _make_once / _make_when.
+def _unknown_step_actions(scheduler, action: str, chain: list[dict]) -> list[str]:
+    """Names in this job that aren't registered actions. [] means 'arm it'.
+
+    Fails OPEN on any unexpected error (an old/partial core.scheduler, a
+    duck-typed double) so validation can never be what stops a legitimate
+    schedule — but says so on stdout rather than degrading quietly.
+    """
+    try:
+        return list(scheduler.unknown_actions(action, chain) or [])
+    except Exception as e:
+        print(f"  [schedule_manager] arm-time action validation unavailable "
+              f"({type(e).__name__}: {e}) — arming without it")
+        return []
+
+
+def _name_phrase(names: list[str]) -> tuple[str, str]:
+    """("'a' or 'b'", "are") / ("'a'", "is") — these strings are SPOKEN."""
+    quoted = [f"'{n}'" for n in names]
+    if len(quoted) == 1:
+        return quoted[0], "is"
+    return " or ".join([", ".join(quoted[:-1]), quoted[-1]]), "are"
+
+
+def _reject_unknown(scheduler, action: str, chain: list[dict]) -> str | None:
+    """Owner-facing refusal string if any step is unregistered, else None."""
+    bad = _unknown_step_actions(scheduler, action, chain)
+    if not bad:
+        return None
+    names, _verb = _name_phrase(bad)
+    msg = (f"I don't have an action called {names}, sir — nothing armed. "
+           f"Say 'list skills' if you'd like the registered names.")
+    try:
+        hints = scheduler.suggest_actions(bad[0])
+    except Exception:
+        hints = []
+    if hints:
+        msg = (f"I don't have an action called {names}, sir — nothing armed. "
+               f"Did you mean {' or '.join(hints)}?")
+    return msg
+
+
 def _format_jobs(jobs: list[dict]) -> str:
     if not jobs:
         return "No scheduled jobs, sir."
@@ -119,8 +181,27 @@ def _format_jobs(jobs: list[dict]) -> str:
             head += f" + {len(chain)} chained step(s)"
         if j.get("next_run"):
             head += f" — next: {j['next_run']}"
+        # A next_run printed for a job whose action does not exist actively
+        # corroborates a false belief, so the verdict rides on the same line.
+        missing = j.get("unknown_actions") or []
+        if missing:
+            _names, _verb = _name_phrase(missing)
+            head += (f" — BROKEN: {_names} {_verb} not a registered "
+                     f"action, so this will do nothing")
         lines.append(head)
-    return f"{len(jobs)} schedule(s), sir:\n" + "\n".join(lines)
+    out = f"{len(jobs)} schedule(s), sir:\n" + "\n".join(lines)
+    n_broken = sum(1 for j in jobs if j.get("unknown_actions"))
+    if n_broken:
+        # Spoken verbatim by list_schedules, so get the grammar right.
+        if n_broken == 1:
+            out += ("\nHeads up, sir: 1 of those is broken and will do nothing "
+                    "when it fires — cancel it and re-arm with a registered "
+                    "action.")
+        else:
+            out += (f"\nHeads up, sir: {n_broken} of those are broken and will do "
+                    f"nothing when they fire — cancel them and re-arm with "
+                    f"registered actions.")
+    return out
 
 
 def _format_conditions(conds: list[dict]) -> str:
@@ -139,6 +220,11 @@ def _format_conditions(conds: list[dict]) -> str:
         cv = c.get("current_value")
         if cv is not None:
             head += f" — currently {cv}"
+        missing = c.get("unknown_actions") or []
+        if missing:
+            _names, _verb = _name_phrase(missing)
+            head += (f" — BROKEN: {_names} {_verb} not a registered "
+                     f"action, so this will do nothing")
         lines.append(head)
     return f"{len(conds)} conditional trigger(s), sir:\n" + "\n".join(lines)
 
@@ -159,6 +245,11 @@ def _make_recurring(scheduler) -> Callable[[str], str]:
         p_action, p_arg, chain = _parse_action_chain(rhs)
         if not p_action:
             return "Format: <spec> | <action> [arg]"
+        # Refuse BEFORE _build_recurring_job — a rejected job must never reach
+        # the scheduler, or list_schedules would show a ghost with a next_run.
+        bad = _reject_unknown(scheduler, p_action, chain)
+        if bad:
+            return bad
         try:
             jid = _build_recurring_job(scheduler, lhs, p_action, p_arg, chain)
         except ValueError as e:
@@ -251,6 +342,9 @@ def _make_once(scheduler) -> Callable[[str], str]:
         when = scheduler.parse_when(lhs)
         if when is None:
             return f"Could not parse when='{lhs}', sir."
+        bad = _reject_unknown(scheduler, p_action, chain)
+        if bad:
+            return bad
         try:
             jid = scheduler.schedule_once(
                 action=p_action, arg=p_arg, chain=chain, run_at=when,
@@ -279,6 +373,9 @@ def _make_when(scheduler) -> Callable[[str], str]:
         # duplicate triggers.
         tid = f"when_{lhs.strip().lower()}_{p_action}"
         tid = re.sub(r"[^a-z0-9_]+", "_", tid).strip("_") or "when_trigger"
+        bad = _reject_unknown(scheduler, p_action, chain)
+        if bad:
+            return bad
         try:
             scheduler.schedule_when(
                 name=tid, condition=lhs.strip(),
@@ -345,6 +442,18 @@ def _make_status(scheduler) -> Callable[[str], str]:
             f"{s['job_count']} job(s), {s['condition_count']} conditional trigger(s). "
             f"Conditions available: {', '.join(s['registered_conditions'])}."
         )
+        broken = s.get("broken_jobs") or []
+        if broken:
+            ids = ", ".join(str(b.get("id")) for b in broken)
+            line += (f" Warning, sir: {len(broken)} schedule(s) point at actions "
+                     f"that are not registered and will do nothing when they "
+                     f"fire — {ids}.")
+        misses = s.get("unresolved") or []
+        if misses:
+            line += " " + "; ".join(
+                f"job {m.get('job_id') or 'unknown'} already tried to run "
+                f"'{m.get('action')}' {m.get('count')} time(s) and found nothing"
+                for m in misses) + "."
         if s.get("last_error"):
             line += f" Last error: {s['last_error']}."
         return line

@@ -37,6 +37,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -93,6 +94,52 @@ class _ImmediateThread:
 
     def is_alive(self):
         return False
+
+
+def _fake_llm_client():
+    """core.llm_client stand-in whose ``stream_text()`` mirrors ``complete()``.
+
+    _call_llm's claude arm calls ``_llm_client.stream_text(...)`` whenever
+    ``_streaming_tts_enabled()`` is on — and that is the SHIPPED DEFAULT
+    (``core.config.STREAMING_TTS_ENABLED = True`` since 2026-07-07). It calls
+    ``complete()`` only when the knob is off, or as the one-shot fallback after
+    a stream raises (bobert_companion.py:11019-11062).
+
+    A bare ``mock.Mock()`` therefore hands the branch tests below an unconsumed
+    ``<Mock stream_text()>`` object instead of the programmed reply, and every
+    ``reply == …`` / captured-kwargs assertion fails. Mirroring ``complete()``
+    from ``stream_text()`` keeps those tests asserting the REAL contract under
+    EITHER setting of the knob: a programmed return value flows straight
+    through, and a programmed exception is re-raised by the stream→complete
+    fallback so the SAME ``anthropic.*`` handler runs. ``on_delta`` is dropped
+    because it exists only on the streaming signature.
+
+    Streaming's OWN behaviour (early sentence flush, ``_stream_spoken_prefix``,
+    the stream→complete fallback log) is covered by
+    tests/monolith/test_monolith_sec1.py :: StreamingTtsTests, which pins the
+    knob explicitly — never rely on the ambient config value in a test.
+    """
+    client = mock.Mock()
+    client.stream_text.side_effect = lambda **kw: client.complete(
+        **{k: v for k, v in kw.items() if k != "on_delta"})
+    return client
+
+
+def _wire_fake_stream(fake_sd, active=False):
+    """Give a Mock sounddevice module the get_stream() affordance the
+    single-toucher tts-reaper (_reap_playback) needs: a fake play stream
+    whose .active is programmable and whose abort()/close() flip it inactive
+    (mirroring Pa_AbortStream/Pa_CloseStream). Without this, a bare Mock's
+    truthy .active would spin the reaper to its 5 s deadline."""
+    stream = mock.Mock()
+    stream.active = active
+
+    def _deactivate(ignore_errors=True):
+        stream.active = False
+    stream.abort.side_effect = _deactivate
+    stream.close.side_effect = _deactivate
+    fake_sd.get_stream.return_value = stream
+    return stream
 
 
 # ===========================================================================
@@ -212,8 +259,17 @@ class SafeCloseStreamTests(MonolithGlobalsTestCase):
         self.bc._safe_close_stream(stream, timeout_sec=1.0)
         stream.close.assert_called_once()
 
-    def test_hung_close_forces_sd_stop(self):
-        # close() blocks past the timeout → the helper must call sd.stop().
+    def test_hung_close_abandons_daemon_and_never_calls_sd_stop(self):
+        # H-3 (2026-08-20). The old shape called the PROCESS-GLOBAL sd.stop()
+        # here and logged it as "forcing sd.stop()". That is not a recovery:
+        # sounddevice's module-level stop() ignores the stream it was handed
+        # and stops+closes `_last_callback`, which only sd.play()/sd.rec()/
+        # sd.playrec() ever publish. Every stream that reaches this helper is
+        # an explicitly constructed InputStream, so the call could never free
+        # the hung handle — but it COULD close the live TTS playback stream
+        # that play_with_lipsync's single-toucher reaper is holding, putting
+        # two threads inside Pa_CloseStream on one WASAPI stream (0xc0000374).
+        # The helper must abandon the daemon instead and say so honestly.
         release = threading.Event()
         stream = mock.Mock()
 
@@ -222,11 +278,59 @@ class SafeCloseStreamTests(MonolithGlobalsTestCase):
         stream.close.side_effect = _slow_close
         fake_sd = mock.Mock()
         try:
-            with mock.patch.object(self.bc, "sd", fake_sd):
+            with mock.patch.object(self.bc, "sd", fake_sd), \
+                 self.assertLogs("root", level="WARNING") as cm:
                 self.bc._safe_close_stream(stream, timeout_sec=0.05)
-            fake_sd.stop.assert_called_once()
+            fake_sd.stop.assert_not_called()
+            joined = "\n".join(cm.output)
+            self.assertIn("abandoning the close daemon", joined)
+            self.assertIn("sd.stop() is deliberately NOT called", joined)
         finally:
             release.set()  # let the daemon close-thread finish
+
+    def test_no_copy_of_safe_close_stream_calls_global_sd_stop(self):
+        # H-3 stale-duplicate guard. The escape hatch existed in FOUR copies
+        # (this one, core/wake_word, skills/ambient_listen, skills/enroll_voice)
+        # and the ambient copy still asserted the disproven contract "force-stop
+        # every stream globally". Scan each _safe_close_stream body for a live
+        # sd.stop() call so a future copy-paste cannot silently regrow it.
+        import ast
+        import os
+        import re
+        root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))
+        targets = [
+            ("bobert_companion.py", "_safe_close_stream"),
+            (os.path.join("core", "wake_word.py"), "_safe_close_stream"),
+            (os.path.join("skills", "ambient_listen.py"), "_safe_close_stream"),
+        ]
+        call_re = re.compile(r"^\s*sd\.stop\(\)", re.M)
+        offenders = []
+        for rel, fname in targets:
+            path = os.path.join(root, rel)
+            with open(path, "r", encoding="utf-8") as fh:
+                src = fh.read()
+            tree = ast.parse(src)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef) and node.name == fname:
+                    body = ast.get_source_segment(src, node) or ""
+                    if call_re.search(body):
+                        offenders.append(rel)
+        # skills/enroll_voice._record_seconds legitimately owns _last_callback
+        # (it called sd.rec itself), so only its INLINE teardown block is
+        # checked — the block that closes an explicitly opened InputStream.
+        ev = os.path.join(root, "skills", "enroll_voice.py")
+        with open(ev, "r", encoding="utf-8") as fh:
+            ev_src = fh.read()
+        tail = ev_src.split("_close_in_daemon", 1)[-1]
+        if call_re.search(tail):
+            offenders.append("skills/enroll_voice.py")
+        self.assertEqual(
+            offenders, [],
+            "these _safe_close_stream copies still call the process-global "
+            "sd.stop() on a hung close — it cannot free an explicitly "
+            "constructed InputStream and cross-closes the live TTS play "
+            f"stream (0xc0000374): {offenders}")
 
 
 # ===========================================================================
@@ -1594,7 +1698,7 @@ class CallLlmTests(MonolithGlobalsTestCase):
         return m
 
     def test_claude_happy_path_via_llm_client(self):
-        client = mock.Mock()
+        client = _fake_llm_client()
         client.complete.return_value = "At your service, sir."
         with mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
                 mock.patch.object(self.bc, "_llm_client", client), \
@@ -1615,7 +1719,7 @@ class CallLlmTests(MonolithGlobalsTestCase):
         fake_anthropic.BadRequestError = _BadReq
         fake_anthropic.RateLimitError = type("RL", (Exception,), {})
         fake_anthropic.APIStatusError = type("AS", (Exception,), {})
-        client = mock.Mock()
+        client = _fake_llm_client()
         client.complete.side_effect = _BadReq("Your credit balance is too low")
         with mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
                 mock.patch.object(self.bc, "_llm_client", client), \
@@ -1637,10 +1741,17 @@ class CallLlmTests(MonolithGlobalsTestCase):
     def test_ollama_backend_failure_is_caught(self):
         # The ollama path now goes through the bounded helper; a wedged-runner
         # timeout (or any error) raised by it must be caught, not propagated.
+        # _call_local_llm is stubbed to None so the except arm's
+        # _local_fallback_or returns its honest DEFAULT: unstubbed it opens a
+        # real socket to LOCAL_LLM_BASE_URL and, on a dev box where Ollama
+        # happens to be up, answers with a genuine model reply — the test then
+        # fails for an environmental reason that has nothing to do with the
+        # guard under test. Monolith tests must never touch the live runner.
         with mock.patch.object(self.bc, "AI_BACKEND", "ollama"), \
                 mock.patch.object(self.bc, "OLLAMA_MODEL", "m"), \
                 mock.patch.object(self.bc, "_ollama_chat_bounded",
                                   side_effect=RuntimeError("ollama down")), \
+                mock.patch.object(self.bc, "_call_local_llm", return_value=None), \
                 mock.patch.object(self.bc, "_mcu_phrases", self._make_phrases()):
             reply = self.bc._call_llm("hi")
         self.assertIn("local model isn't responding", reply)
@@ -2294,6 +2405,7 @@ class PlayWithLipsyncTests(MonolithGlobalsTestCase):
 
     def test_unmuted_no_robot_plays_audio(self):
         fake_sd = mock.Mock()
+        stream = _wire_fake_stream(fake_sd)   # inactive → reaper exits at once
         fake_layer = mock.Mock()
         fake_layer.is_muted.return_value = False
         ducker = mock.Mock()
@@ -2310,6 +2422,10 @@ class PlayWithLipsyncTests(MonolithGlobalsTestCase):
                 mock.patch.object(self.bc.time, "sleep"):
             self.bc.play_with_lipsync(audio, 24000)
         fake_sd.play.assert_called_once()
+        # Single-toucher contract: the reaper closed the stream; the module-
+        # level sd.stop() (hidden double-close) must never be called.
+        stream.close.assert_called_once()
+        fake_sd.stop.assert_not_called()
         self.assertFalse(self.bc._tts_playback_active[0])
 
 
@@ -2889,7 +3005,7 @@ class CallLlmMoreBranchesTests(MonolithGlobalsTestCase):
 
     def test_rate_limit_error_falls_back_local(self):
         a = self._anthropic_stub()
-        client = mock.Mock()
+        client = _fake_llm_client()
         client.complete.side_effect = a.RateLimitError("slow down")
         phrases = mock.Mock()
         phrases.detect_phrases_in_reply.return_value = {}
@@ -2905,7 +3021,7 @@ class CallLlmMoreBranchesTests(MonolithGlobalsTestCase):
 
     def test_api_status_error_falls_back_local(self):
         a = self._anthropic_stub()
-        client = mock.Mock()
+        client = _fake_llm_client()
         client.complete.side_effect = a.APIStatusError(status_code=529,
                                                        message="overloaded")
         phrases = mock.Mock()
@@ -2922,7 +3038,7 @@ class CallLlmMoreBranchesTests(MonolithGlobalsTestCase):
 
     def test_phrase_rotation_persists_hits_to_memory(self):
         a = self._anthropic_stub()
-        client = mock.Mock()
+        client = _fake_llm_client()
         client.complete.return_value = "As you wish, sir."
         phrases = mock.Mock()
         phrases.detect_phrases_in_reply.return_value = {"greeting": "As you wish"}
@@ -2943,7 +3059,7 @@ class CallLlmMoreBranchesTests(MonolithGlobalsTestCase):
 
     def test_claude_usage_limit_message(self):
         a = self._anthropic_stub()
-        client = mock.Mock()
+        client = _fake_llm_client()
         client.complete.side_effect = a.BadRequestError(
             "You have reached your monthly usage limit")
         phrases = mock.Mock()
@@ -3007,7 +3123,7 @@ class CallLlmClassifierSideTripsTests(MonolithGlobalsTestCase):
         return m
 
     def _client(self):
-        c = mock.Mock()
+        c = _fake_llm_client()
         c.complete.return_value = "Indeed, sir."
         return c
 
@@ -3028,7 +3144,7 @@ class CallLlmClassifierSideTripsTests(MonolithGlobalsTestCase):
         def _complete(**kw):
             captured["system"] = kw["system"]
             return "On it, sir."
-        client = mock.Mock()
+        client = _fake_llm_client()
         client.complete.side_effect = _complete
         with mock.patch.object(self.bc, "detect_tone", return_value="rushed"), \
                 mock.patch.object(self.bc, "route_voice_emotion",
@@ -3093,7 +3209,7 @@ class CallLlmClassifierSideTripsTests(MonolithGlobalsTestCase):
         def _complete(**kw):
             captured["system"] = kw["system"]
             return "Mm."
-        client = mock.Mock()
+        client = _fake_llm_client()
         client.complete.side_effect = _complete
         with mock.patch.object(self.bc, "detect_tone", return_value="rushed"), \
                 mock.patch.object(self.bc, "route_voice_emotion",
@@ -3133,7 +3249,7 @@ class CallLlmClassifierSideTripsTests(MonolithGlobalsTestCase):
         a.BadRequestError = _BadReq
         a.RateLimitError = type("RL", (Exception,), {})
         a.APIStatusError = type("AS", (Exception,), {})
-        client = mock.Mock()
+        client = _fake_llm_client()
         client.complete.side_effect = _BadReq("model not found for this account")
         with mock.patch.object(self.bc, "detect_tone", return_value=None), \
                 mock.patch.object(self.bc, "route_voice_emotion",
@@ -3155,7 +3271,7 @@ class CallLlmClassifierSideTripsTests(MonolithGlobalsTestCase):
         a.BadRequestError = type("BR", (Exception,), {})
         a.RateLimitError = type("RL", (Exception,), {})
         a.APIStatusError = type("AS", (Exception,), {})
-        client = mock.Mock()
+        client = _fake_llm_client()
         client.complete.side_effect = KeyError("weird")
         with mock.patch.object(self.bc, "detect_tone", return_value=None), \
                 mock.patch.object(self.bc, "route_voice_emotion",
@@ -3329,6 +3445,23 @@ class CallLocalVisionBranchTests(MonolithGlobalsTestCase):
                 p.stop()
         install.assert_called_once()
 
+    def _fake_requests(self):
+        """A Mock `requests` module carrying the REAL exception classes.
+
+        _call_local_vision's handler does `except requests.RequestException`
+        AND `isinstance(_e, requests.Timeout)` (the vision-wedge detector,
+        bobert_companion.py:10309-10321). On a bare Mock, `requests.Timeout`
+        is an auto-created Mock attribute, so isinstance() raises
+        `TypeError: arg 2 must be a type…` from inside the handler. BOTH
+        classes must come from the real module — wire them HERE, once, rather
+        than per test (five partial copies is how the missing Timeout went
+        unnoticed).
+        """
+        fake_req = mock.Mock()
+        fake_req.RequestException = self.bc.requests.RequestException
+        fake_req.Timeout = self.bc.requests.Timeout
+        return fake_req
+
     def _live_patches(self, fake_req):
         return self._enable() + [
             mock.patch.object(self.bc, "_ollama_alive", return_value=True),
@@ -3348,41 +3481,50 @@ class CallLocalVisionBranchTests(MonolithGlobalsTestCase):
                 p.stop()
 
     def test_http_not_ok_returns_none(self):
-        fake_req = mock.Mock()
+        fake_req = self._fake_requests()
         fake_req.post.return_value = _FakeResp(ok=False, status_code=503,
                                                text="down")
-        fake_req.RequestException = self.bc.requests.RequestException
         self.assertIsNone(self._run(fake_req))
 
     def test_non_json_body_returns_none(self):
         bad = _FakeResp(ok=True)
         bad.json = mock.Mock(side_effect=ValueError("not json"))
         bad.text = "<html>"
-        fake_req = mock.Mock()
+        fake_req = self._fake_requests()
         fake_req.post.return_value = bad
-        fake_req.RequestException = self.bc.requests.RequestException
         self.assertIsNone(self._run(fake_req))
 
     def test_message_not_dict_returns_none(self):
-        fake_req = mock.Mock()
+        fake_req = self._fake_requests()
         fake_req.post.return_value = _FakeResp(
             ok=True, json_data={"message": "oops a string"})
-        fake_req.RequestException = self.bc.requests.RequestException
         self.assertIsNone(self._run(fake_req))
 
     def test_empty_content_returns_none(self):
-        fake_req = mock.Mock()
+        fake_req = self._fake_requests()
         fake_req.post.return_value = _FakeResp(
             ok=True, json_data={"message": {"content": "  "},
                                 "done_reason": "stop"})
-        fake_req.RequestException = self.bc.requests.RequestException
         self.assertIsNone(self._run(fake_req))
 
     def test_request_exception_returns_none(self):
-        fake_req = mock.Mock()
-        fake_req.RequestException = self.bc.requests.RequestException
+        # A NON-timeout RequestException: caught, None returned, and the
+        # wedge counter must NOT be bumped.
+        fake_req = self._fake_requests()
         fake_req.post.side_effect = self.bc.requests.RequestException("boom")
-        self.assertIsNone(self._run(fake_req))
+        with mock.patch.object(self.bc, "_vision_wedge_note_timeout") as note:
+            self.assertIsNone(self._run(fake_req))
+        note.assert_not_called()
+
+    def test_timeout_notes_vision_wedge(self):
+        # The other half of the same handler: a requests.Timeout IS the
+        # vision-wedged-runner signature, so the consecutive-timeout counter
+        # must be bumped (bobert_companion.py:10319-10320).
+        fake_req = self._fake_requests()
+        fake_req.post.side_effect = self.bc.requests.Timeout("read timed out")
+        with mock.patch.object(self.bc, "_vision_wedge_note_timeout") as note:
+            self.assertIsNone(self._run(fake_req))
+        note.assert_called_once()
 
 
 @requires_monolith
@@ -4416,8 +4558,8 @@ class PlayWithLipsyncExtraPathsTests(MonolithGlobalsTestCase):
     """The barge-in arm (headset + listener + watch thread) and the robot
     lip-sync arm of play_with_lipsync. Threads run synchronously via
     _ImmediateThread so each closure body (_amp_pump, _barge_watch, _sync,
-    _safe_wait*) executes once and the done-event is set before the bounded
-    wait, exercising the post-play teardown."""
+    _reap_playback) executes once and the done-event is set before the
+    bounded wait, exercising the post-play teardown."""
 
     @classmethod
     def setUpClass(cls):
@@ -4444,14 +4586,18 @@ class PlayWithLipsyncExtraPathsTests(MonolithGlobalsTestCase):
         ]
 
     def test_barge_in_headset_path_opens_and_closes_listener(self):
-        # 6706-6726 + 6867-6868: BARGE_IN_ENABLED + headset → listener opened,
-        # watch closure runs (flag set → sd.stop), stream closed in finally.
+        # BARGE_IN_ENABLED + headset → listener opened, watch closure runs
+        # (flag routed into _tts_interrupt → the tts-reaper aborts the play
+        # stream), listener stream closed in finally. Module-level sd.stop()
+        # must NEVER fire (its hidden second Pa_CloseStream was the
+        # 0xc0000374 double-free).
         fake_sd = mock.Mock()
+        stream = _wire_fake_stream(fake_sd, active=True)
         fake_layer = mock.Mock()
         fake_layer.is_muted.return_value = False
         ducker = mock.Mock()
         barge_stream = mock.Mock()
-        # The watch closure observes the interrupt flag and calls sd.stop().
+        # The watch closure observes the interrupt flag and sets _tts_interrupt.
         self.bc._barge_in_interrupted = True
         audio = np.zeros(48, dtype=np.float32)
         scs_patch = mock.patch.object(self.bc, "_safe_close_stream")
@@ -4471,8 +4617,11 @@ class PlayWithLipsyncExtraPathsTests(MonolithGlobalsTestCase):
             for p in patches:
                 p.stop()
         fake_sd.play.assert_called_once()
-        # watch thread saw the interrupt and stopped playback
-        fake_sd.stop.assert_called()
+        # watch thread saw the flag, routed it into _tts_interrupt, and the
+        # reaper cut playback via stream.abort — never via sd.stop.
+        stream.abort.assert_called_once()
+        stream.close.assert_called_once()
+        fake_sd.stop.assert_not_called()
         scs.assert_called_once_with(barge_stream)
         self.assertFalse(self.bc._tts_playback_active[0])
 
@@ -4480,6 +4629,7 @@ class PlayWithLipsyncExtraPathsTests(MonolithGlobalsTestCase):
         # 6804-6846: ROBOT_ENABLED → the _sync lip-sync closure streams mouth
         # values via send(); sd.play + bounded wait still run.
         fake_sd = mock.Mock()
+        _wire_fake_stream(fake_sd)
         fake_layer = mock.Mock()
         fake_layer.is_muted.return_value = False
         ducker = mock.Mock()
@@ -4508,6 +4658,7 @@ class PlayWithLipsyncExtraPathsTests(MonolithGlobalsTestCase):
         # 6817-6818 + 6823-6824: send() raises inside _sync → caught per-
         # iteration; play_with_lipsync still completes.
         fake_sd = mock.Mock()
+        _wire_fake_stream(fake_sd)
         fake_layer = mock.Mock()
         fake_layer.is_muted.return_value = False
         ducker = mock.Mock()
@@ -4636,6 +4787,16 @@ class GetMicBufferPathBTests(MonolithGlobalsTestCase):
         # must NOT stomp that flag back to False — the old save+restore did,
         # re-opening the ~70s WASAPI stall + 0xc0000374 reinit-under-live-callback
         # window the flag exists to close.
+        #
+        # The race window is the TEARDOWN, not the capture loop: that loop now
+        # yields the device the moment it sees _record_speech_active (see
+        # test_path_b_yields_mid_capture_when_record_speech_claims below), so
+        # flipping the flag before the loop runs would just make Path B bail
+        # with no data and never exercise the finally at all. Fire the flip
+        # from _safe_close_stream instead — i.e. record_speech claims the mic
+        # exactly between the last captured frame and Path B's release, which
+        # IS the lost-update window the dedicated _pathb_mic_active cell (and,
+        # since 2026-08-14, _pa_release_owner) exists to close.
         self.bc._record_speech_active[0] = False
         self._saved_pathb = list(self.bc._pathb_mic_active)
         self.addCleanup(lambda: self.bc._pathb_mic_active.__setitem__(
@@ -4647,7 +4808,47 @@ class GetMicBufferPathBTests(MonolithGlobalsTestCase):
                 _s._cb = k["callback"]
 
             def start(_s):
-                # record_speech starts mid-capture and claims the mic.
+                _s._cb(np.ones(16000, dtype=np.float32).reshape(-1, 1),
+                       16000, None, None)
+
+        def _close_and_claim(*_a, **_k):
+            # record_speech grabs the mic while Path B is tearing down.
+            self.bc._record_speech_active[0] = True
+
+        fake_sd = mock.Mock()
+        fake_sd.InputStream.side_effect = _FakeStream
+        with mock.patch.object(self.bc, "_mic_input_disabled",
+                               return_value=False), \
+                mock.patch.object(self.bc, "sd", fake_sd), \
+                mock.patch.object(self.bc, "get_input_device", return_value=3), \
+                mock.patch.object(self.bc, "_safe_close_stream",
+                                  side_effect=_close_and_claim), \
+                mock.patch.object(self.bc.time, "sleep"):
+            out = self.bc.get_mic_buffer(0.5, sample_rate=16000)
+        self.assertIsNotNone(out)
+        # record_speech's genuine ownership survives Path B's teardown.
+        self.assertTrue(self.bc._record_speech_active[0])
+        # …and Path B still released only its OWN cell.
+        self.assertFalse(self.bc._pathb_mic_active[0])
+
+    def test_path_b_yields_mid_capture_when_record_speech_claims(self):
+        # The other half of the same rule: once record_speech owns the mic,
+        # Path B must NOT sit on a second InputStream against the same WASAPI
+        # device (the ~70s double-open capture stall). The capture loop breaks
+        # immediately, so with nothing captured yet get_mic_buffer returns None
+        # and the caller re-invokes (and then taps via Path A2).
+        self.bc._record_speech_active[0] = False
+        self._saved_pathb = list(self.bc._pathb_mic_active)
+        self.addCleanup(lambda: self.bc._pathb_mic_active.__setitem__(
+            slice(None), self._saved_pathb))
+        self.bc._pathb_mic_active[0] = False
+
+        class _FakeStream:
+            def __init__(_s, *a, **k):
+                _s._cb = k["callback"]
+
+            def start(_s):
+                # record_speech claims the mic before the loop's first pass.
                 self.bc._record_speech_active[0] = True
                 _s._cb(np.ones(16000, dtype=np.float32).reshape(-1, 1),
                        16000, None, None)
@@ -4658,12 +4859,13 @@ class GetMicBufferPathBTests(MonolithGlobalsTestCase):
                                return_value=False), \
                 mock.patch.object(self.bc, "sd", fake_sd), \
                 mock.patch.object(self.bc, "get_input_device", return_value=3), \
-                mock.patch.object(self.bc, "_safe_close_stream"), \
+                mock.patch.object(self.bc, "_safe_close_stream") as scs, \
                 mock.patch.object(self.bc.time, "sleep"):
             out = self.bc.get_mic_buffer(0.5, sample_rate=16000)
-        self.assertIsNotNone(out)
-        # record_speech's genuine ownership survives Path B's teardown.
-        self.assertTrue(self.bc._record_speech_active[0])
+        self.assertIsNone(out)
+        scs.assert_called_once()                              # stream closed
+        self.assertTrue(self.bc._record_speech_active[0])     # not clobbered
+        self.assertFalse(self.bc._pathb_mic_active[0])        # own cell released
 
     def test_path_b_no_frames_returns_none(self):
         # 4898-4899: stream starts but never delivers → deadline → None.
@@ -4917,7 +5119,7 @@ class CallLlmModeRouterArmTests(MonolithGlobalsTestCase):
                     name == "core" and "mode_router" in (a[2] or ())):
                 raise ImportError("no mode_router")
             return real_import(name, *a, **k)
-        client = mock.Mock()
+        client = _fake_llm_client()
         client.complete.return_value = "Very good, sir."
         with mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
                 mock.patch.object(self.bc, "detect_tone", return_value=None), \
@@ -4986,9 +5188,20 @@ class OllamaAsyncFailureArmTests(MonolithGlobalsTestCase):
 
     def test_install_winget_failure_swallowed(self):
         # 5538-5539: subprocess.run raises → caught inside _do.
+        # _do() debounces first: it sleeps _OLLAMA_INSTALL_RECHECK_S (10 s real
+        # time under _ImmediateThread!) and then bails when _ollama_alive() or
+        # _ollama_binary_present() says so. Both must be pinned False here —
+        # unpinned, _ollama_alive() probes the LIVE server on 127.0.0.1 and, on
+        # a box where Ollama is up, _do() returns at the re-probe and
+        # subprocess.run is never reached. Same pin as the sibling
+        # OllamaAsyncHelperTests.test_install_async_runs_winget_once.
         fake_sp = mock.Mock()
         fake_sp.run.side_effect = RuntimeError("winget exploded")
         with mock.patch.object(self.bc.threading, "Thread", _ImmediateThread), \
+                mock.patch.object(self.bc, "_OLLAMA_INSTALL_RECHECK_S", 0), \
+                mock.patch.object(self.bc, "_ollama_alive", return_value=False), \
+                mock.patch.object(self.bc, "_ollama_binary_present",
+                                  return_value=False), \
                 mock.patch.dict(sys.modules, {"subprocess": fake_sp}):
             self.bc._ollama_install_async()   # must not raise
         fake_sp.run.assert_called_once()
@@ -5154,8 +5367,13 @@ class RecordSpeechLiveStreamTests(MonolithGlobalsTestCase):
             mock.patch.object(self.bc, "_mic_input_disabled", return_value=False),
             mock.patch.object(self.bc, "sd", fake_sd),
             mock.patch.object(self.bc, "get_input_device", return_value=1),
+            # Pass-through stand-in. MUST accept skip_ns: the capture loop
+            # calls _process_capture_chunk(data, SAMPLE_RATE, skip_ns=…) to
+            # drop noise suppression on clearly-idle chunks
+            # (bobert_companion.py:7271-7273, 7728-7732); a 2-arg lambda
+            # raises TypeError from inside the loop instead.
             mock.patch.object(self.bc, "_process_capture_chunk",
-                              side_effect=lambda c, sr: c),
+                              side_effect=lambda c, sr, skip_ns=False: c),
             mock.patch.object(self.bc, "pause_face_tracking"),
             mock.patch.object(self.bc, "set_state"),
             mock.patch.object(self.bc, "_heartbeat"),
@@ -5241,9 +5459,10 @@ class RecordSpeechLiveStreamTests(MonolithGlobalsTestCase):
 
 @requires_monolith
 class PlayWithLipsyncDefensiveHandlerTests(MonolithGlobalsTestCase):
-    """The single-line except handlers inside play_with_lipsync's closures and
-    teardown. Threads run synchronously via _ImmediateThread; the barge-watch
-    closure is given an already-set interrupt flag so it returns at once."""
+    """The except handlers inside play_with_lipsync's closures, the tts-reaper
+    (_reap_playback) and teardown. Threads run synchronously via
+    _ImmediateThread; the barge-watch closure is given an already-set
+    interrupt flag so it returns at once."""
 
     @classmethod
     def setUpClass(cls):
@@ -5274,6 +5493,7 @@ class PlayWithLipsyncDefensiveHandlerTests(MonolithGlobalsTestCase):
         # 6772-6773: _tts_layer.is_muted() raises -> _muted stays False and
         # playback proceeds down the no-robot arm. No barge listener.
         fake_sd = mock.Mock()
+        _wire_fake_stream(fake_sd)
         fake_layer = mock.Mock()
         fake_layer.is_muted.side_effect = RuntimeError("mute probe boom")
         ducker = mock.Mock()
@@ -5293,11 +5513,14 @@ class PlayWithLipsyncDefensiveHandlerTests(MonolithGlobalsTestCase):
         fake_sd.play.assert_called_once()
         self.assertFalse(self.bc._tts_playback_active[0])
 
-    def test_sd_wait_exception_is_logged_not_raised(self):
-        # 6792-6793: sd.wait() inside _safe_wait raises -> logged, done-event
-        # still set in finally, playback completes. No barge listener.
+    def test_reaper_stream_stop_exception_swallowed(self):
+        # The tts-reaper's teardown: stream.stop() raises -> swallowed, the
+        # single close still runs, done-event set in the finally, playback
+        # completes. (Replaces the old sd.wait-raises test — sd.wait() is
+        # gone from this path by design.) No barge listener.
         fake_sd = mock.Mock()
-        fake_sd.wait.side_effect = RuntimeError("wait boom")
+        stream = _wire_fake_stream(fake_sd)
+        stream.stop.side_effect = RuntimeError("stop boom")
         fake_layer = mock.Mock()
         fake_layer.is_muted.return_value = False
         ducker = mock.Mock()
@@ -5310,19 +5533,27 @@ class PlayWithLipsyncDefensiveHandlerTests(MonolithGlobalsTestCase):
         for p in patches:
             p.start()
         try:
-            self.bc.play_with_lipsync(audio, 24000)
+            self.bc.play_with_lipsync(audio, 24000)   # must not raise
         finally:
             for p in patches:
                 p.stop()
-        fake_sd.wait.assert_called()
+        stream.stop.assert_called()
+        stream.close.assert_called_once()   # close still ran after stop boom
         self.assertFalse(self.bc._tts_playback_active[0])
 
-    def test_barge_watch_sd_stop_exception_swallowed(self):
-        # 6722-6723: the barge-watch closure sees the interrupt flag and calls
-        # sd.stop(), which raises -> swallowed. Flag pre-set so the closure
-        # returns immediately under _ImmediateThread.
+    def test_barge_watch_routed_abort_exception_swallowed(self):
+        # The barge-watch closure sees the interrupt flag and routes it into
+        # _tts_interrupt; the tts-reaper's stream.abort() raises -> swallowed,
+        # teardown completes. Flag pre-set so the closure returns immediately
+        # under _ImmediateThread. (Replaces the old watch-calls-sd.stop test —
+        # the watch no longer touches the stream at all.)
         fake_sd = mock.Mock()
-        fake_sd.stop.side_effect = RuntimeError("stop boom")
+        stream = _wire_fake_stream(fake_sd, active=True)
+
+        def _abort_boom(ignore_errors=True):
+            stream.active = False   # dying stream: abort errors AND stops
+            raise RuntimeError("abort boom")
+        stream.abort.side_effect = _abort_boom
         fake_layer = mock.Mock()
         fake_layer.is_muted.return_value = False
         ducker = mock.Mock()
@@ -5343,12 +5574,15 @@ class PlayWithLipsyncDefensiveHandlerTests(MonolithGlobalsTestCase):
         finally:
             for p in patches:
                 p.stop()
-        fake_sd.stop.assert_called()
+        stream.abort.assert_called()
+        stream.close.assert_called_once()   # teardown survived the abort boom
+        fake_sd.stop.assert_not_called()
         self.assertFalse(self.bc._tts_playback_active[0])
 
     def test_ducker_restore_exception_swallowed(self):
         # 6872-6873: _audio_ducker.restore() in the finally raises -> swallowed.
         fake_sd = mock.Mock()
+        _wire_fake_stream(fake_sd)
         fake_layer = mock.Mock()
         fake_layer.is_muted.return_value = False
         ducker = mock.Mock()
@@ -5369,11 +5603,14 @@ class PlayWithLipsyncDefensiveHandlerTests(MonolithGlobalsTestCase):
         ducker.restore.assert_called_once()
         self.assertFalse(self.bc._tts_playback_active[0])
 
-    def test_robot_sd_wait_exception_is_logged_not_raised(self):
-        # 6836-6837: in the robot arm, sd.wait() inside _safe_wait_robot raises
-        # -> logged, done-event still set, playback completes. No barge listener.
+    def test_robot_reaper_close_exception_swallowed(self):
+        # In the robot arm, the tts-reaper's stream.close() raises ->
+        # swallowed, done-event still set in the finally, playback completes.
+        # (Replaces the old robot sd.wait-raises test — sd.wait() is gone
+        # from this path by design.) No barge listener.
         fake_sd = mock.Mock()
-        fake_sd.wait.side_effect = RuntimeError("robot wait boom")
+        stream = _wire_fake_stream(fake_sd)
+        stream.close.side_effect = RuntimeError("robot close boom")
         fake_layer = mock.Mock()
         fake_layer.is_muted.return_value = False
         ducker = mock.Mock()
@@ -5391,7 +5628,7 @@ class PlayWithLipsyncDefensiveHandlerTests(MonolithGlobalsTestCase):
         finally:
             for p in patches:
                 p.stop()
-        fake_sd.wait.assert_called()
+        stream.close.assert_called()
         self.assertFalse(self.bc._tts_playback_active[0])
 
     def test_thread_join_exceptions_swallowed(self):
@@ -5403,6 +5640,7 @@ class PlayWithLipsyncDefensiveHandlerTests(MonolithGlobalsTestCase):
                 raise RuntimeError("join boom")
 
         fake_sd = mock.Mock()
+        _wire_fake_stream(fake_sd)
         fake_layer = mock.Mock()
         fake_layer.is_muted.return_value = False
         ducker = mock.Mock()
@@ -5425,6 +5663,249 @@ class PlayWithLipsyncDefensiveHandlerTests(MonolithGlobalsTestCase):
             for p in patches:
                 p.stop()
         self.assertFalse(self.bc._tts_playback_active[0])
+
+
+class _ReaperFakeStream:
+    """Hand-rolled play-stream fake for the tts-reaper contract tests:
+    records (method, thread_ident) for every native-surface call; .active is
+    programmable; abort()/stop()/close() flip it inactive like PortAudio."""
+
+    def __init__(self, active=True, close_block=None):
+        self.active = active
+        self.calls = []            # (method_name, thread_ident)
+        self._close_block = close_block
+
+    def abort(self, ignore_errors=True):
+        self.calls.append(("abort", threading.get_ident()))
+        self.active = False
+
+    def stop(self, ignore_errors=True):
+        self.calls.append(("stop", threading.get_ident()))
+        self.active = False
+
+    def close(self, ignore_errors=True):
+        self.calls.append(("close", threading.get_ident()))
+        self.active = False
+        if self._close_block is not None:
+            self._close_block.wait()   # simulate a wedged native Pa_CloseStream
+
+
+class _ReaperFakeSd:
+    """Stand-in for the sounddevice module exposing exactly the surface the
+    playback path uses: play / get_stream / PortAudioError, plus a module-
+    level stop() counter to prove the double-close vector is never touched."""
+
+    class PortAudioError(Exception):
+        pass
+
+    def __init__(self, stream):
+        self._stream = stream
+        self.play_calls = 0
+        self.stop_calls = 0
+
+    def play(self, audio, sr, device=None):
+        self.play_calls += 1
+
+    def get_stream(self):
+        return self._stream
+
+    def stop(self, ignore_errors=True):
+        self.stop_calls += 1
+
+
+@requires_monolith
+class PlaybackReaperTests(MonolithGlobalsTestCase):
+    """The single-toucher tts-reaper (_reap_playback) — 2026-08 barge-in-stall
+    fix. REAL threads (no _ImmediateThread), real time: these pin the
+    threading contract itself — every native call on the play stream lands on
+    ONE reaper thread that is not the caller's, sd.stop()/sd.wait() are never
+    used on it, and a wedged native teardown strands the daemon, never the
+    caller (the old shape stalled the main loop 100-181 s until the watchdog
+    reaped the process, or heap-corrupted it outright: 0xc0000374)."""
+
+    def _patches(self, fake_sd, robot=False):
+        fake_layer = mock.Mock()
+        fake_layer.is_muted.return_value = False
+        return [
+            mock.patch.object(self.bc, "sd", fake_sd),
+            mock.patch.object(self.bc, "_tts_layer", fake_layer),
+            mock.patch.object(self.bc, "_audio_ducker", mock.Mock()),
+            mock.patch.object(self.bc, "BARGE_IN_ENABLED", False),
+            mock.patch.object(self.bc, "ROBOT_ENABLED", robot),
+            mock.patch.object(self.bc, "get_output_device", return_value=1),
+            mock.patch.object(self.bc, "_write_hud_state"),
+            mock.patch.object(self.bc, "_feed_playback_reference"),
+        ]
+
+    def _run_barged(self, robot=False, audio_secs=0.2):
+        """Run play_with_lipsync on a real worker thread against an active
+        fake stream, fire an accepted barge-in ~0.05 s after playback goes
+        live, and return (stream, fake_sd, caller_ident, elapsed)."""
+        bc = self.bc
+        stream = _ReaperFakeStream(active=True)
+        fake_sd = _ReaperFakeSd(stream)
+        audio = np.zeros(int(24000 * audio_secs), dtype=np.float32)
+        caller_ident, elapsed = [], []
+
+        def _worker():
+            caller_ident.append(threading.get_ident())
+            t0 = time.monotonic()
+            bc.play_with_lipsync(audio, 24000)
+            elapsed.append(time.monotonic() - t0)
+
+        patches = self._patches(fake_sd, robot=robot) + (
+            [mock.patch.object(bc, "send")] if robot else []
+        ) + [mock.patch.object(bc, "_barge_in_wake_enabled",
+                               return_value=True)]
+        for p in patches:
+            p.start()
+        try:
+            bc._tts_current_text[0] = ""   # echo gate must not trip
+            w = threading.Thread(target=_worker, daemon=True)
+            w.start()
+            deadline = time.monotonic() + 2.0
+            while (not bc._tts_playback_active[0]
+                   and time.monotonic() < deadline):
+                time.sleep(0.01)
+            time.sleep(0.05)               # let the reaper start polling
+            self.assertTrue(bc.request_tts_interrupt(source="test"),
+                            "barge-in was not accepted")
+            w.join(timeout=5.0)
+            self.assertFalse(w.is_alive(), "caller failed to return after cut")
+        finally:
+            for p in patches:
+                p.stop()
+        return stream, fake_sd, caller_ident[0], elapsed[0]
+
+    def test_barge_cut_aborts_off_caller_thread(self):
+        stream, fake_sd, caller_ident, elapsed = self._run_barged(
+            robot=False, audio_secs=2.0)   # long clip — must NOT play out
+        self.assertLess(elapsed, 2.0,
+                        "cut playback should return almost immediately")
+        names = [c[0] for c in stream.calls]
+        self.assertEqual(names.count("abort"), 1, stream.calls)
+        self.assertEqual(names.count("close"), 1, stream.calls)
+        # THE CONTRACT: one thread, and it is not the caller.
+        idents = {c[1] for c in stream.calls}
+        self.assertEqual(len(idents), 1,
+                         f"native calls from more than one thread: {stream.calls}")
+        self.assertNotIn(caller_ident, idents,
+                         "caller thread touched the native stream")
+        # Module-level sd.stop() (the hidden double-close) never fires.
+        self.assertEqual(fake_sd.stop_calls, 0)
+
+    def test_robot_branch_shares_reaper_single_toucher(self):
+        # Robot twin — both branches share _reap_playback, no divergent copy.
+        # Short clip so the real _sync daemon drains before patches unwind.
+        stream, fake_sd, caller_ident, elapsed = self._run_barged(
+            robot=True, audio_secs=0.2)
+        self.assertLess(elapsed, 3.0)
+        names = [c[0] for c in stream.calls]
+        self.assertEqual(names.count("abort"), 1, stream.calls)
+        self.assertEqual(names.count("close"), 1, stream.calls)
+        idents = {c[1] for c in stream.calls}
+        self.assertEqual(len(idents), 1, stream.calls)
+        self.assertNotIn(caller_ident, idents)
+        self.assertEqual(fake_sd.stop_calls, 0)
+
+    def test_single_closer_on_natural_completion(self):
+        # Stream already inactive (natural end) → exactly one stop() then one
+        # close(), no abort, prompt return.
+        bc = self.bc
+        stream = _ReaperFakeStream(active=False)
+        fake_sd = _ReaperFakeSd(stream)
+        audio = np.zeros(24, dtype=np.float32)
+        patches = self._patches(fake_sd)
+        for p in patches:
+            p.start()
+        try:
+            t0 = time.monotonic()
+            bc.play_with_lipsync(audio, 24000)
+            elapsed = time.monotonic() - t0
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual([c[0] for c in stream.calls], ["stop", "close"])
+        self.assertEqual(fake_sd.stop_calls, 0)
+
+    def test_wedged_native_close_cannot_stall_caller(self):
+        # Regression pin for the 100-181 s heartbeat stall → watchdog reap:
+        # a reaper wedged inside a native call must strand the DAEMON (which
+        # dies with the process), never the caller. The caller's pure Event
+        # wait is bounded at max(audio+2, 5)+1 = 6 s here.
+        bc = self.bc
+        release = threading.Event()
+        stream = _ReaperFakeStream(active=False, close_block=release)
+        fake_sd = _ReaperFakeSd(stream)
+        audio = np.zeros(24, dtype=np.float32)
+        patches = self._patches(fake_sd)
+        for p in patches:
+            p.start()
+        try:
+            t0 = time.monotonic()
+            bc.play_with_lipsync(audio, 24000)   # must not raise, must return
+            elapsed = time.monotonic() - t0
+        finally:
+            release.set()                        # free the stranded daemon
+            for p in patches:
+                p.stop()
+        self.assertGreaterEqual(elapsed, 5.5, "bounded wait was skipped")
+        self.assertLess(elapsed, 9.0, "caller stalled past the bound")
+        self.assertFalse(bc._tts_playback_active[0])   # finally still ran
+        self.assertEqual(fake_sd.stop_calls, 0)        # no caller-side stop
+
+    def test_get_stream_failure_degrades_safely(self):
+        # sd.get_stream() raising → no reaper, no native calls, prompt return,
+        # finally-block state intact.
+        bc = self.bc
+        stream = _ReaperFakeStream(active=True)
+        fake_sd = _ReaperFakeSd(stream)
+
+        def _boom():
+            raise RuntimeError("get_stream boom")
+        fake_sd.get_stream = _boom
+        audio = np.zeros(24, dtype=np.float32)
+        patches = self._patches(fake_sd)
+        for p in patches:
+            p.start()
+        try:
+            t0 = time.monotonic()
+            bc.play_with_lipsync(audio, 24000)   # must not raise
+            elapsed = time.monotonic() - t0
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(stream.calls, [])       # zero native calls attempted
+        self.assertEqual(fake_sd.stop_calls, 0)
+        self.assertFalse(bc._tts_playback_active[0])
+
+    def test_playback_path_never_reintroduces_sd_stop_or_wait(self):
+        # Structural stale-duplicate guard (audit finding-#37 style): the
+        # steady-state playback path must never regrow sd.stop()/sd.wait() —
+        # sd.stop() hides a second Pa_CloseStream that raced sd.wait()'s
+        # finally-close (the 0xc0000374 double-free / native-wedge class).
+        # Comments and docstrings may (and do) mention the tokens to explain
+        # the rule, so scan CODE tokens only.
+        import inspect
+        import tokenize
+
+        def _code_tokens(src):
+            drop = {tokenize.COMMENT, tokenize.STRING, tokenize.NL,
+                    tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT}
+            return "".join(
+                tok.string
+                for tok in tokenize.generate_tokens(io.StringIO(src).readline)
+                if tok.type not in drop)
+
+        for fn in (self.bc.play_with_lipsync, self.bc._reap_playback):
+            code = _code_tokens(inspect.getsource(fn))
+            for token in ("sd.stop(", "sd.wait("):
+                self.assertNotIn(
+                    token, code,
+                    f"{fn.__name__} reintroduced {token} — only the "
+                    f"single-toucher tts-reaper may touch the play stream")
 
 
 # ===========================================================================
@@ -5706,8 +6187,13 @@ class OllamaChatBoundedTests(MonolithGlobalsTestCase):
     def test_call_llm_ollama_timeout_degrades_not_hangs(self):
         # End-to-end: a timeout in the bounded helper must surface the honest
         # "local model isn't responding" line, never propagate or hang.
+        # _call_local_llm is stubbed to None so _local_fallback_or yields that
+        # DEFAULT instead of opening a real socket to LOCAL_LLM_BASE_URL (on a
+        # box with Ollama actually up it answered with a live model reply and
+        # the assertion failed for a purely environmental reason).
         with mock.patch.object(self.bc, "AI_BACKEND", "ollama"), \
                 mock.patch.object(self.bc, "OLLAMA_MODEL", "m"), \
+                mock.patch.object(self.bc, "_call_local_llm", return_value=None), \
                 mock.patch.object(self.bc, "detect_tone", return_value=None), \
                 mock.patch.object(self.bc, "route_voice_emotion",
                                   return_value={"mood": "casual", "addendum": ""}), \

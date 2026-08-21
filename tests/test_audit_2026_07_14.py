@@ -445,9 +445,28 @@ class LlmIndependentControlPlaneTests(unittest.TestCase):
         cls.bc = load_monolith()
 
     def _dispatch(self, cmd):
+        # PATCH THE MONOLITH'S MODULE-LEVEL NAMES, NOT core.actions.
+        #
+        # _dispatch_tray_command resolves `_act_restart` / `_act_shutdown_jarvis`
+        # through bobert_companion's OWN globals (they are bound there by the
+        # `from core.actions import *` at the top of the file, and the tray path
+        # deliberately uses the module global — see the comment at
+        # bobert_companion.py:3322-3340). Patching `core.actions._act_restart`
+        # rebinds a DIFFERENT name, so this dispatch ran the REAL action.
+        #
+        # That is not theoretical: on 2026-08-20 this exact helper drove the real
+        # core.actions._act_restart, which starts a daemon thread that 1.5s later
+        # spawns a DETACHED `python bobert_companion.py` — a live JARVIS whose
+        # boot path unlinks the owner's data/clean_shutdown.flag — and then
+        # TerminateProcess()es this test runner. The shutdown branch is just as
+        # live: the real _act_shutdown_jarvis speaks a goodbye line through the
+        # owner's SPEAKERS and hard-exits with clean=True.
+        #
+        # tests/monolith/test_monolith_sec1.py's TrayDispatchTests already used
+        # mock.patch.object(bc, ...) for this; this copy was the stale duplicate.
         bc = self.bc
-        with mock.patch("core.actions._act_restart") as restart, \
-             mock.patch("core.actions._act_shutdown_jarvis") as shutdown, \
+        with mock.patch.object(bc, "_act_restart") as restart, \
+             mock.patch.object(bc, "_act_shutdown_jarvis") as shutdown, \
              mock.patch("builtins.print"):
             bc._dispatch_tray_command(cmd, {})
         return restart, shutdown

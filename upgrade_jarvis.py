@@ -46,6 +46,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 # Make all console output UTF-8-safe. The pipeline's status lines use arrows
@@ -108,6 +109,280 @@ def _gate_config() -> tuple[int, int, bool]:
 # _gate_config() fresh so STABILITY_GATE_INTERVAL / STABILITY_GATE_DURATION_S /
 # STABILITY_GATE_DISABLE can be toggled mid-session (e.g. by an operator
 # tweaking the env var between pipeline runs) without re-importing.
+
+# ═════════════ Upgrade-in-progress marker (watchdog handshake) ════════════
+# WHY THIS EXISTS (H-7, 2026-08-20).
+# tools/jarvis_watchdog.py resurrects JARVIS whenever it sees "no
+# bobert_companion process AND no data/clean_shutdown.flag". That is exactly
+# the state an upgrade run leaves behind for HOURS:
+#
+#   • The production entry point is JARVIS itself: _overnight_upgrade_thread
+#     -> _act_upgrade spawns `python upgrade_jarvis.py --relaunch` and then
+#     self-exits via _hard_exit(clean=True), which DOES write
+#     data/clean_shutdown.flag. So at pipeline START the watchdog correctly
+#     stands down. That part was never broken.
+#   • The flag does not SURVIVE the run. The pipeline's tester stage
+#     (tools/multi_agent_pipeline.py stage 4/4, and _run_stability_smoke_test
+#     / _stability_gate below) boots a real PROD JARVIS for the smoke test,
+#     and bobert_companion's boot path DELETES data/clean_shutdown.flag
+#     unconditionally ("delete the flag NOW so a crash after a prior clean
+#     shutdown is still resurrected"). The tester then kills that instance
+#     with `Stop-Process -Force` = TerminateProcess, which never reaches
+#     atexit / _write_clean_shutdown_flag. Neither killer writes the flag
+#     back: `clean_shutdown` has ZERO hits in upgrade_jarvis.py,
+#     tools/multi_agent_pipeline.py, tools/stability_smoke_test.py and
+#     _boot_jarvis.ps1.
+#
+# From the FIRST task's tester stage onward, for the rest of a multi-hour
+# run, the flag is gone and JARVIS is dead — so the watchdog fires every 5
+# minutes and boots a full interactive JARVIS (mic live, TTS unmuted) out of
+# a tree the implementer stage is mid-rewrite on. The same window opens for a
+# manual `python upgrade_jarvis.py` run, where main()'s kill_running_jarvis()
+# TerminateProcess-es a live JARVIS without leaving a flag.
+#
+# THE MIRROR-IMAGE BUG WE MUST NOT RECREATE. From 2026-07-15 to 07-21 a crash
+# left clean_shutdown.flag behind and the watchdog politely declined to
+# resurrect anything for six days. A marker that is never cleared silently
+# disables the resurrection net, which is WORSE than the bug it fixes. So
+# this marker is bounded three independent ways:
+#
+#   pid           owner process id. A dead owner = abandoned marker.
+#   expires_at    short lease, refreshed by a heartbeat thread every
+#                 _MARKER_HEARTBEAT_S. Owner dies or wedges -> the lease
+#                 lapses within ttl (default 10 min) and the net re-arms.
+#   hard_deadline absolute ceiling stamped ONCE at acquire and never
+#                 extended, so even a heartbeat thread still running after
+#                 the upgrade has wedged cannot park the watchdog past
+#                 max_age (default 6 h).
+#
+# The two deadlines are written into the file as ABSOLUTE EPOCH TIMESTAMPS on
+# purpose. The reader (tools/jarvis_watchdog._upgrade_in_progress) then needs
+# no copy of this policy — it only compares two numbers against now(). That
+# makes this project's #1 bug class (the STALE DUPLICATE: a rule fixed in one
+# copy while the other rots) structurally impossible here: retune a timeout
+# below and the watchdog follows automatically, with nothing to keep in sync.
+
+_MARKER_HEARTBEAT_S = 60          # lease-refresh cadence
+
+
+def _marker_config() -> tuple[int, int]:
+    """Return (ttl_s, max_age_s) for the upgrade-in-progress marker.
+
+    Env: JARVIS_UPGRADE_MARKER_TTL_S (default 600) and
+    JARVIS_UPGRADE_MARKER_MAX_AGE_S (default 21600 = 6h). The ttl floor is
+    two heartbeats — a lease shorter than that would expire between
+    refreshes and re-open the very window it exists to close."""
+    try:
+        ttl = max(_MARKER_HEARTBEAT_S * 2,
+                  int(os.environ.get("JARVIS_UPGRADE_MARKER_TTL_S", "600")))
+    except ValueError:
+        ttl = 600
+    try:
+        max_age = int(os.environ.get("JARVIS_UPGRADE_MARKER_MAX_AGE_S", "21600"))
+    except ValueError:
+        max_age = 21600
+    return ttl, max(ttl, max_age)
+
+
+def _upgrade_marker_path() -> str:
+    """Marker path, derived at CALL time rather than import time.
+
+    Deliberate: the unit suite redirects PROJECT_DIR into a per-test tempdir,
+    and a module-level constant baked at import would make every main() test
+    write a REAL C:\\JARVIS\\data\\upgrade_in_progress.flag — parking the live
+    watchdog on the developer's machine for hours."""
+    return os.path.join(PROJECT_DIR, "data", "upgrade_in_progress.flag")
+
+
+# depth: re-entrancy refcount within THIS process.
+# owned: True only when this process actually wrote the file, so a nested or
+#        child acquire can never delete an outer owner's marker.
+_marker_state: dict = {"depth": 0, "owned": False, "stop": None,
+                       "thread": None, "started_at": 0.0,
+                       "hard_deadline": 0.0}
+
+
+def _marker_pid_alive(pid: int) -> bool:
+    """Is `pid` genuinely executing? Uses core.parent_watch
+    (GetExitCodeProcess + WaitForSingleObject), which is corpse-aware — a
+    kernel-stuck 'terminating forever' row must not count as a live owner.
+
+    Unknown -> True (assume alive). Safe, because expires_at / hard_deadline
+    already bound the marker regardless of what the pid check says."""
+    try:
+        from core.parent_watch import parent_is_alive  # type: ignore
+    except Exception:
+        return True
+    try:
+        return bool(parent_is_alive(pid))
+    except Exception:
+        return True
+
+
+def _write_upgrade_marker() -> bool:
+    """(Re)write the marker atomically with a refreshed lease. Never raises."""
+    ttl, _ = _marker_config()
+    now = time.time()
+    path = _upgrade_marker_path()
+    payload = {
+        "pid":           os.getpid(),
+        "started_at":    _marker_state["started_at"],
+        "heartbeat_at":  now,
+        "expires_at":    now + ttl,
+        "hard_deadline": _marker_state["hard_deadline"],
+        "argv":          " ".join(sys.argv)[:300],
+    }
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        # Atomic swap: the watchdog polls this file from another process every
+        # 5 minutes and must never read a half-written one.
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+
+
+def _read_upgrade_marker() -> "dict | None":
+    """Parse the marker, or None when absent / unreadable / malformed."""
+    try:
+        with open(_upgrade_marker_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _marker_is_live(data: "dict | None") -> bool:
+    """True while `data` still holds the watchdog off.
+
+    The same three bounds the watchdog applies, read out of the file rather
+    than duplicated: lease not lapsed, hard ceiling not reached, owner alive."""
+    if not data:
+        return False
+    now = time.time()
+    try:
+        if now >= float(data.get("expires_at", 0)):
+            return False
+        hard = float(data.get("hard_deadline", 0))
+        if hard and now >= hard:
+            return False
+    except (TypeError, ValueError):
+        return False
+    pid = data.get("pid")
+    if isinstance(pid, int) and pid > 0 and not _marker_pid_alive(pid):
+        return False
+    return True
+
+
+def acquire_upgrade_marker() -> bool:
+    """Declare "the JARVIS source tree is being rewritten" BEFORE the first
+    mutating step, so the watchdog stops reading "dead + no clean-shutdown
+    flag" as a crash to resurrect.
+
+    Re-entrant within a process (refcount). Across processes: a LIVE marker
+    owned by somebody else is left alone and False is returned — that owner
+    releases it, never us. An ABANDONED marker (dead owner, lapsed lease, or
+    past the hard ceiling) is taken over. Returns True when WE own it.
+    Never raises."""
+    _marker_state["depth"] += 1
+    if _marker_state["owned"]:
+        return True
+    existing = _read_upgrade_marker()
+    if _marker_is_live(existing) and existing.get("pid") != os.getpid():
+        print(f"  [upgrade-marker] pid {existing.get('pid')} already holds it "
+              f"— running under their marker, not taking it over")
+        return False
+    _, max_age = _marker_config()
+    now = time.time()
+    _marker_state["started_at"] = now
+    _marker_state["hard_deadline"] = now + max_age
+    if not _write_upgrade_marker():
+        print("  [upgrade-marker] COULD NOT WRITE the marker — the watchdog "
+              "may resurrect JARVIS from half-written source mid-upgrade")
+        return False
+    _marker_state["owned"] = True
+    stop = threading.Event()
+    _marker_state["stop"] = stop
+
+    def _heartbeat() -> None:
+        # Event.wait, NOT time.sleep: the unit suite stubs time.sleep to a
+        # no-op, and a heartbeat built on it would busy-spin a daemon thread
+        # for the whole test run.
+        while not stop.wait(_MARKER_HEARTBEAT_S):
+            if time.time() >= _marker_state["hard_deadline"]:
+                break          # never extend past the ceiling
+            if not _marker_state["owned"]:
+                break
+            _write_upgrade_marker()
+
+    thread = threading.Thread(target=_heartbeat,
+                              name="upgrade-marker-heartbeat", daemon=True)
+    _marker_state["thread"] = thread
+    thread.start()
+    print(f"  [upgrade-marker] held (pid {os.getpid()}, ceiling {max_age}s) "
+          f"— watchdog resurrection paused for this run")
+    return True
+
+
+def release_upgrade_marker() -> None:
+    """Drop the marker. MUST run from a finally: an unreleased marker disables
+    the resurrection net until its lease lapses. Only the process that wrote
+    the file deletes it, and only while it still owns it, so a child or nested
+    acquire can never clear its parent's. Never raises."""
+    if _marker_state["depth"] > 0:
+        _marker_state["depth"] -= 1
+    if _marker_state["depth"] > 0 or not _marker_state["owned"]:
+        return
+    stop = _marker_state.get("stop")
+    thread = _marker_state.get("thread")
+    _marker_state["owned"] = False
+    if stop is not None:
+        try:
+            stop.set()
+        except Exception:
+            pass
+    if thread is not None:
+        # Join before unlinking. The heartbeat is parked in Event.wait(), so
+        # this returns immediately; without it the thread can wake between
+        # `owned = False` and the unlink and rewrite the marker we just tried
+        # to delete. Bounded (it would lapse on its own inside the lease), but
+        # the deterministic fix costs nothing.
+        try:
+            thread.join(timeout=5)
+        except Exception:
+            pass
+    _marker_state["stop"] = None
+    _marker_state["thread"] = None
+    data = _read_upgrade_marker()
+    if data is not None and data.get("pid") not in (None, os.getpid()):
+        return          # somebody took it over after our lease lapsed
+    try:
+        os.remove(_upgrade_marker_path())
+    except OSError:
+        pass
+
+
+class upgrade_in_progress:
+    """`with upgrade_in_progress():` — acquire/release around a whole run.
+
+    .owned tells the caller whether the marker is actually ours; the body
+    runs either way (a missing marker degrades to the pre-H-7 behaviour — it
+    must never abort an upgrade)."""
+
+    def __init__(self) -> None:
+        self.owned = False
+
+    def __enter__(self) -> "upgrade_in_progress":
+        self.owned = acquire_upgrade_marker()
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        release_upgrade_marker()
+        return False
+
 
 TASK_RE = re.compile(r"^- \[ \] (.+)$", re.MULTILINE)
 DONE_RE = re.compile(r"^- \[x\] (.+)$", re.MULTILINE)
@@ -1368,6 +1643,22 @@ def relaunch_jarvis(with_handoff: bool = False):
     # (answer_then_quiet | stay_talkative) is propagated through unchanged.
     _ambient = os.environ.get("JARVIS_AMBIENT_LEARNING", "1").strip() or "1"
     _wake_resume = os.environ.get("JARVIS_WAKE_RESUME", "answer_then_quiet").strip()
+    # H-7: reap any PROD JARVIS before spawning the replacement. This path
+    # does NOT go through _boot_jarvis.ps1 (which kills stale prod itself), so
+    # without this an instance the WATCHDOG resurrected mid-upgrade still holds
+    # jarvis.lock; the upgraded process then trips the singleton check, prints
+    # "[singleton] Another JARVIS already holds the lock", sys.exit(0)s into a
+    # PowerShell window opened without -NoExit, and the caller cheerfully
+    # reports success for a relaunch that never happened. kill_running_jarvis()
+    # excludes --staging, so a green/blue-green instance is never touched.
+    try:
+        reaped = kill_running_jarvis()
+        if reaped:
+            print(f"  [relaunch] reaped {reaped} stale PROD JARVIS process(es) "
+                  f"before relaunch")
+            time.sleep(2)
+    except Exception as _ke:
+        print(f"  [relaunch] pre-kill failed ({_ke!r}) — spawning anyway")
     ps_inline = (
         f"$env:ANTHROPIC_API_KEY = "
         f"[System.Environment]::GetEnvironmentVariable('ANTHROPIC_API_KEY', 'User'); "
@@ -1677,6 +1968,24 @@ def run_blue_green_handoff(timeout_boot_s: float = 60.0,
 
 
 def main():
+    """Thin wrapper that holds the upgrade-in-progress marker for the WHOLE run.
+
+    The marker goes up BEFORE the first mutating step (backup / JARVIS kill /
+    Claude Code spawn) and comes down in a finally — including the blue-green
+    branch's sys.exit(0), since SystemExit still unwinds a with-block. Without
+    it the watchdog resurrects JARVIS from half-written source every 5 minutes
+    for the length of the run; see the marker block above for the full trace.
+
+    --dry-audit is genuinely read-only (no backup, no kill, no writes) and is
+    deliberately NOT covered: parking the resurrection net for a read-only
+    preview would make the marker mean something it does not mean."""
+    if "--dry-audit" in sys.argv:
+        return _main_body()
+    with upgrade_in_progress():
+        return _main_body()
+
+
+def _main_body():
     auto_relaunch = "--relaunch" in sys.argv
     dry_audit     = "--dry-audit" in sys.argv
     single_stage  = "--single-stage" in sys.argv

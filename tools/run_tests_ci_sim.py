@@ -26,6 +26,13 @@ of failure locally:
 
 Exit 0 = CI-clean (0 failed / 0 errored; skips are fine).
 
+Every run sits inside a HARD MEMORY CEILING (tools/mem_guard.py, applied as the
+first thing main() does — before the gate subprocesses, which inherit it). That
+is the RAM sibling of the _redirect_settings_to_throwaway() /
+_redirect_data_dir_to_throwaway() guards below: a test run must not be able to
+damage the box it runs on. See tools/mem_guard.py for the 2026-08-20 bugcheck
+that motivated it and the JARVIS_TEST_MEM_CAP_GB knob (0 = off).
+
 Calibration: a CLEAN tree must give 0 failed / 0 errored here — only genuinely
 Windows-assuming tests should fail. ``tzlocal`` / ``apscheduler`` have real
 Linux code paths but pick a Windows backend at import time on this box; they are
@@ -282,6 +289,24 @@ def _stop_lingering_daemons() -> None:
 
 def main() -> int:
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # HARD MEMORY CEILING FIRST — before the gate subprocesses (they are spawned
+    # into this process's Job Object, so they inherit the ceiling), before the
+    # platform flip, and before any test is imported. Same family as the two
+    # redirect guards below (a test run must not be able to damage the box);
+    # this one is the RAM half, added after an uncapped run committed 144 GB and
+    # bugchecked the machine on 2026-08-20. See tools/mem_guard.py. The sys.path
+    # insert has to precede it so ``tools.mem_guard`` is importable when this
+    # file is run as a script.
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from tools.mem_guard import apply_memory_ceiling
+    apply_memory_ceiling()
+    # NO REAL BROWSER either — belt and braces beside tests/__init__.py, which
+    # is the chokepoint that covers `python -m unittest` too. Added after CI
+    # runs spammed dozens of live tabs into the owner's default Chrome profile
+    # on 2026-08-20 via production webbrowser.open() calls. Idempotent.
+    from tools import browser_guard
+    browser_guard.install()
     # Redirect settings I/O to a throwaway copy BEFORE discovery/import (and
     # before the gate subprocesses, which inherit this env), so no test or gate
     # can touch the real data/user_settings.json.

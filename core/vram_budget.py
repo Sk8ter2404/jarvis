@@ -36,6 +36,12 @@ import subprocess
 import time
 from typing import Optional
 
+# Vision tag markers live in core.model_lockstep (stdlib-only, import-light, so
+# the design contract above still holds): this file, skills/model_picker.py and
+# the lockstep rule itself each kept an identical private tuple until
+# 2026-08-20 — ONE copy now, so "what counts as a vision tag" cannot drift.
+from core.model_lockstep import VISION_MARKERS as _VISION_MARKERS
+
 # ──────────────────────────────────────────────────────────────────────────
 #  Constants — calibrated anchors (megabytes)
 # ──────────────────────────────────────────────────────────────────────────
@@ -92,7 +98,7 @@ _DISK_TO_VRAM_FACTOR = 1.15
 
 # Tags that are NOT chat models (vision / embedding) — used by the param-count
 # fallback to pick a sane default when a tag is wholly unrecognised.
-_VISION_MARKERS = ("vl:", "-vl", "vision", "llava", "moondream", "bakllava")
+# (_VISION_MARKERS is imported from core.model_lockstep at the top of the file.)
 _EMBED_MARKERS = ("embed", "nomic", "bge-", "minilm")
 
 

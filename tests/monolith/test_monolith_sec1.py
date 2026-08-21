@@ -2235,15 +2235,40 @@ class LlmQuickOllamaTests(_MonolithTestBase):
         self.addCleanup(_p.stop)
 
     def test_ollama_backend_returns_message_content(self):
+        # SHAPE OF THE CALL (kept in step with the code twice now):
+        #   * the ollama branch goes through _ollama_chat_bounded, i.e.
+        #     ``ollama.Client(host=…, timeout=…).chat(…)`` — NOT a bare
+        #     ``ollama.chat(…)`` (2026-06-06 audit P1-2 added the wall-clock
+        #     bound). A fake exposing only ``.chat`` leaves ``Client(...)`` a
+        #     bare Mock, ``resp["message"]`` raises TypeError, and _llm_quick
+        #     silently degrades into its _call_local_llm fallback.
+        #   * the tag comes from _get_local_llm_model(), not OLLAMA_MODEL (the
+        #     raw OLLAMA_MODEL default is the retired "llama3" tag, 2026-07-14
+        #     audit). Patching it also stops the real GET /api/tags this test
+        #     used to fire at the owner's live Ollama.
+        # _call_local_llm is booby-trapped rather than merely stubbed: it is
+        # the ONLY way this test can reach a real model, and a silent live call
+        # is exactly how the stale version of this test "passed" locally for
+        # months (same hazard tests/monolith/test_monolith_sec3.py documents).
         fake_ollama = mock.Mock()
-        fake_ollama.chat.return_value = {"message": {"content": "ollama says hi"}}
+        fake_client = fake_ollama.Client.return_value
+        fake_client.chat.return_value = {"message": {"content": "ollama says hi"}}
         with mock.patch.object(self.bc, "AI_BACKEND", "ollama"), \
-             mock.patch.object(self.bc, "OLLAMA_MODEL", "llama3"), \
+             mock.patch.object(self.bc, "_get_local_llm_model",
+                               return_value="llama3"), \
+             mock.patch.object(self.bc, "_call_local_llm", side_effect=AssertionError(
+                 "the ollama branch must not fall back to the local model")), \
              mock.patch.dict("sys.modules", {"ollama": fake_ollama}):
             out = self.bc._llm_quick("sys", "user", max_tokens=33)
         self.assertEqual(out, "ollama says hi")
-        fake_ollama.chat.assert_called_once()
-        _, kwargs = fake_ollama.chat.call_args
+        # Bounded client, not the module-level convenience function.
+        fake_ollama.Client.assert_called_once()
+        _, ctor_kwargs = fake_ollama.Client.call_args
+        self.assertEqual(ctor_kwargs.get("host"), self.bc.LOCAL_LLM_BASE_URL)
+        self.assertEqual(ctor_kwargs.get("timeout"),
+                         self.bc._OLLAMA_CHAT_TIMEOUT_S)
+        fake_client.chat.assert_called_once()
+        _, kwargs = fake_client.chat.call_args
         self.assertEqual(kwargs["model"], "llama3")
         self.assertEqual(kwargs["messages"][0]["role"], "system")
 
@@ -3351,9 +3376,30 @@ class StreamingTtsTests(_MonolithTestBase):
         buf = self.bc._SentenceFlushBuffer(speak_fn=_boom)
         with mock.patch.object(self.bc, "threading", self._inline_threading()):
             buf.feed("All good here, sir. And more text. ")  # must not raise
-        # both sentences were still consumed onto the ledger
-        self.assertEqual(buf.spoken_prefix,
-                         "All good here, sir. And more text. ")
+        # …and NOTHING lands on the ledger. spoken_prefix is exactly what
+        # _strip_stream_spoken_prefix later REMOVES from the downstream tail,
+        # so recording a sentence TTS never actually voiced would silently DROP
+        # it from the reply instead of letting the normal path speak it. Until
+        # v2.0.74 (#18) the ledger was stamped in _try_flush *before* dispatch,
+        # so a failed speak was still credited — this assertion encoded that old
+        # behaviour and went stale when _dispatch moved the += behind the
+        # `_spoke is not False` gate.
+        self.assertEqual(buf.spoken_prefix, "")
+
+    def test_flush_buffer_failed_speak_not_credited_to_ledger(self):
+        # Sibling of the exception case above for the OTHER failure signal:
+        # _speak returns False when playback failed (v2.0.74 #18). A returned
+        # False must not be credited either — same silent-drop hazard.
+        spoken = []
+
+        def _fails(sentence):
+            spoken.append(sentence)
+            return False
+        buf = self.bc._SentenceFlushBuffer(speak_fn=_fails)
+        with mock.patch.object(self.bc, "threading", self._inline_threading()):
+            buf.feed("All good here, sir. And more text. ")
+        self.assertEqual(spoken, ["All good here, sir.", "And more text."])
+        self.assertEqual(buf.spoken_prefix, "")
 
     # -- downstream prefix-strip ------------------------------------------
     def test_strip_stream_spoken_prefix_variants(self):

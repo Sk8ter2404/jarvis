@@ -62,6 +62,8 @@ from __future__ import annotations
 
 import io
 import os
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -751,16 +753,33 @@ class PlayWithLipsyncEndpointSwapTests(MonolithGlobalsTestCase):
     class _FakeSd:
         """Stand-in for the sounddevice module: records every play(device=...)
         and lets the test program a sequence of side effects (an exception type
-        raises, anything else is treated as a successful open)."""
+        raises, anything else is treated as a successful open). get_stream()
+        returns an already-inactive fake stream so the single-toucher
+        tts-reaper (_reap_playback) exits its poll loop immediately — the
+        old wait()/stop() surface is gone from the playback path by design
+        (2026-08 barge-in-stall fix)."""
 
         class PortAudioError(Exception):
             pass
+
+        class _FakeStream:
+            active = False
+
+            def abort(self, ignore_errors=True):
+                pass
+
+            def stop(self, ignore_errors=True):
+                pass
+
+            def close(self, ignore_errors=True):
+                pass
 
         def __init__(self, play_effects):
             # play_effects: list, one entry consumed per play() call. An entry
             # that is an Exception instance is raised; None means success.
             self._effects = list(play_effects)
             self.play_calls = []   # list of the `device` kwarg per call
+            self._stream = self._FakeStream()
 
         def play(self, audio, sr, device=None):
             self.play_calls.append(device)
@@ -768,11 +787,8 @@ class PlayWithLipsyncEndpointSwapTests(MonolithGlobalsTestCase):
             if isinstance(effect, BaseException):
                 raise effect
 
-        def wait(self):
-            pass
-
-        def stop(self):
-            pass
+        def get_stream(self):
+            return self._stream
 
     def _run_play(self, play_effects, *, out_dev=7):
         """Run play_with_lipsync with sd faked + out_dev pinned. Returns the
@@ -1192,6 +1208,1022 @@ class HolographicOverlayStatusVoicedTests(MonolithGlobalsTestCase):
         overlap = (set(self.bc.INFORMATIVE_ACTIONS)
                    & set(self.bc.SPEAK_RESULT_VERBATIM_ACTIONS))
         self.assertEqual(overlap, set(), sorted(overlap))
+
+
+@requires_monolith
+class PaTeardownGateTests(MonolithGlobalsTestCase):
+    """2026-08-14 portaudio-teardown-race (0xc0000374): _refresh_devices'
+    owner-flag check used to be a one-shot snapshot taken WITHOUT _mic_lock,
+    while sd._terminate()/sd._initialize() are long native calls — an owner
+    could claim AND open a stream inside that native window. The _pa_gate
+    check-and-latch makes check+latch one atomic step under _mic_lock and
+    makes claims (_pa_claim_owner) wait, bounded, while the latch is up, so
+    teardown under a live/opening/closing guarded stream is structurally
+    impossible. These pin the gate's mechanics plus the two release-order
+    fixes (flag must cover the stream's native close)."""
+
+    _REFRESH_PATCHES = None  # built per-test; see _refresh_ctx
+
+    def _refresh_ctx(self, fake_terminate):
+        """The RefreshDevicesReinitGuardTests mock harness: real bc.sd with
+        _terminate/_initialize/query_devices patched, _pick_device stubbed,
+        no explicit device indices, prints silenced."""
+        bc = self.bc
+        return [
+            mock.patch.object(bc.sd, "_terminate", side_effect=fake_terminate),
+            mock.patch.object(bc.sd, "_initialize"),
+            mock.patch.object(bc.sd, "query_devices",
+                              return_value={"name": "FakeMic"}),
+            mock.patch.object(bc, "_pick_device", return_value=(0, "FakeMic")),
+            mock.patch.object(bc, "MICROPHONE_INDEX", None),
+            mock.patch.object(bc, "SPEAKER_INDEX", None),
+            mock.patch("builtins.print"),
+        ]
+
+    def test_claim_blocked_then_released_by_latch(self):
+        # A claim during a reinit must WAIT (bounded) and return False WITHOUT
+        # setting the cell; once the latch drops (with notify_all) a fresh
+        # claim succeeds immediately.
+        bc = self.bc
+        cell = [False]
+        bc._pa_reinit_active[0] = True
+        try:
+            t0 = time.monotonic()
+            ok = bc._pa_claim_owner(cell, timeout=0.2)
+            dt = time.monotonic() - t0
+        finally:
+            with bc._pa_gate:
+                bc._pa_reinit_active[0] = False
+                bc._pa_gate.notify_all()
+        self.assertFalse(ok, "claim must fail while the latch is up")
+        self.assertFalse(cell[0], "a timed-out claim must NOT set the cell")
+        self.assertGreaterEqual(dt, 0.15, "the wait must be real, not a poll-once")
+        self.assertLess(dt, 2.0, "the wait must be bounded")
+        self.assertTrue(bc._pa_claim_owner(cell, timeout=0.2),
+                        "claim must succeed once the latch is clear")
+        self.assertTrue(cell[0])
+
+    def test_no_claim_can_interleave_into_native_window(self):
+        # THE regression test for the check→terminate TOCTOU: while
+        # sd._terminate is executing, the latch must be up and a concurrent
+        # _pa_claim_owner must fail without flipping the flag — deterministic
+        # proof that no owner can claim (and therefore open a stream) inside
+        # the native window.
+        bc = self.bc
+        bc._device_cache["checked_at"] = 0.0
+        result = {}
+
+        def fake_terminate():
+            result["latched"] = bc._pa_reinit_active[0]
+            out = {}
+
+            def _worker():
+                out["ok"] = bc._pa_claim_owner(bc._record_speech_active,
+                                               timeout=0.3)
+
+            t = threading.Thread(target=_worker, daemon=True)
+            t.start()
+            t.join(timeout=5.0)
+            result["worker_done"] = not t.is_alive()
+            result["claim_ok"] = out.get("ok")
+            result["flag_after"] = bc._record_speech_active[0]
+
+        patches = self._refresh_ctx(fake_terminate)
+        for p in patches:
+            p.start()
+        try:
+            bc._refresh_devices(force=True)
+        finally:
+            for p in patches:
+                p.stop()
+
+        self.assertIs(result.get("latched"), True,
+                      "_pa_reinit_active must be latched while sd._terminate runs")
+        self.assertIs(result.get("worker_done"), True,
+                      "the concurrent claim must complete (bounded), not deadlock")
+        self.assertIs(result.get("claim_ok"), False,
+                      "no claim may land while sd._terminate executes")
+        self.assertIs(result.get("flag_after"), False,
+                      "the owner flag must stay False after the refused claim")
+        # After the refresh: latch dropped, claims flow again.
+        self.assertFalse(bc._pa_reinit_active[0])
+        self.assertTrue(bc._pa_claim_owner(bc._record_speech_active, timeout=0.5))
+        bc._record_speech_active[0] = False
+
+    def test_reinit_never_latches_while_any_owner_live(self):
+        # Every owner cell — including the NEW diag/enroll cells — must defer
+        # the destructive reinit, and the latch must never be taken.
+        bc = self.bc
+        cells = ("_record_speech_active", "_pathb_mic_active",
+                 "_ambient_stream_active", "_tts_playback_active",
+                 "_diag_capture_active", "_enroll_capture_active")
+        refcounts = ("_ambient_stream_active", "_diag_capture_active")
+        for name in cells:
+            with self.subTest(owner=name):
+                cell = getattr(bc, name)
+                prev = cell[0]
+                cell[0] = 1 if name in refcounts else True
+                terminated = {"called": False}
+                patches = self._refresh_ctx(
+                    lambda: terminated.__setitem__("called", True))
+                for p in patches:
+                    p.start()
+                try:
+                    bc._device_cache["checked_at"] = 0.0
+                    bc._refresh_devices(force=True)
+                finally:
+                    for p in patches:
+                        p.stop()
+                    cell[0] = prev
+                self.assertFalse(terminated["called"],
+                                 f"sd._terminate must NOT run while {name} is live")
+                self.assertFalse(bc._pa_reinit_active[0],
+                                 f"latch must never be taken while {name} is live")
+
+    def test_latch_cleared_when_terminate_raises(self):
+        # A raising sd._terminate must still drop the latch (finally +
+        # notify_all) — a stuck latch would time out every future claim
+        # (JARVIS deaf AND mute).
+        bc = self.bc
+        bc._device_cache["checked_at"] = 0.0
+
+        def boom():
+            raise RuntimeError("portaudio terminate boom")
+
+        patches = self._refresh_ctx(boom)
+        for p in patches:
+            p.start()
+        try:
+            bc._refresh_devices(force=True)
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertFalse(bc._pa_reinit_active[0],
+                         "latch must be cleared even when sd._terminate raises")
+        self.assertTrue(bc._pa_claim_owner(bc._record_speech_active, timeout=0.5),
+                        "claims must flow again after a failed reinit")
+        bc._record_speech_active[0] = False
+
+    def test_repick_path_never_latches_or_waits(self):
+        # The cheap cleared-cache re-pick (sec2's 2026-07-21 scenario) must
+        # never touch the latch, so concurrent claimants never wait on it.
+        bc = self.bc
+        sig = ((0, "Mic", 1, 0),)
+        bc._device_cache.update({
+            "in": None, "out": None, "checked_at": 0.0,
+            "last_devices_signature": sig,
+            "last_reenum_at": time.time(),   # periodic re-enum NOT due
+        })
+        latch_seen = []
+
+        def _pick(prefs, want_input=True):
+            latch_seen.append(bc._pa_reinit_active[0])
+            return (3, "Mic X") if want_input else (5, "Spk Y")
+
+        fake_sd = mock.Mock()
+        with mock.patch.object(bc, "sd", fake_sd), \
+                mock.patch.object(bc, "_devices_signature", return_value=sig), \
+                mock.patch.object(bc, "MICROPHONE_INDEX", None), \
+                mock.patch.object(bc, "SPEAKER_INDEX", None), \
+                mock.patch.object(bc, "_pick_device", side_effect=_pick), \
+                mock.patch("builtins.print"):
+            bc._refresh_devices(force=False)
+        fake_sd._terminate.assert_not_called()
+        self.assertTrue(latch_seen, "the re-pick must actually have run")
+        self.assertFalse(any(latch_seen),
+                         "the repick-only path must never latch the gate")
+        # A zero-timeout claim succeeds — nobody waits behind a re-pick.
+        cell = [False]
+        self.assertTrue(bc._pa_claim_owner(cell, timeout=0))
+        self.assertTrue(cell[0])
+
+    def test_record_speech_flag_covers_close(self):
+        # Release-order fix: record_speech's finally must CLOSE the stream
+        # while _record_speech_active is still True (close-then-release), so a
+        # reinit can never latch mid-close.
+        bc = self.bc
+        seen = {}
+
+        def _capture_close(stream):
+            seen["flag_at_close"] = bc._record_speech_active[0]
+
+        class FakeStream:
+            def __init__(_self, *a, **k):
+                pass
+
+            def start(_self):
+                pass
+
+        bc._watchdog_reset_signal.set()
+        self.addCleanup(bc._watchdog_reset_signal.clear)
+        with mock.patch.object(bc, "_mic_input_disabled", return_value=False), \
+                mock.patch.object(bc, "get_input_device", return_value=0), \
+                mock.patch.object(bc, "_safe_close_stream",
+                                  side_effect=_capture_close), \
+                mock.patch.object(bc.sd, "InputStream", FakeStream), \
+                mock.patch("builtins.print"):
+            out = bc.record_speech(timeout=0.0)
+        self.assertIsNone(out)   # watchdog-bail returns None
+        self.assertIs(seen.get("flag_at_close"), True,
+                      "the stream must be closed BEFORE ownership is released")
+        self.assertFalse(bc._record_speech_active[0],
+                         "ownership must be released after the close")
+
+    def test_record_speech_claim_timeout_returns_none_without_flag(self):
+        # A reinit hung past the claim bound must skip the cycle: None back to
+        # the main loop (treated as no-speech), no flag set, no stream opened.
+        bc = self.bc
+        bc._pa_reinit_active[0] = True
+        try:
+            with mock.patch.object(bc, "_mic_input_disabled",
+                                   return_value=False), \
+                    mock.patch.object(bc, "get_input_device", return_value=0), \
+                    mock.patch.object(
+                        bc.sd, "InputStream",
+                        side_effect=AssertionError(
+                            "no stream may open on a refused claim")), \
+                    mock.patch.object(bc, "_pa_claim_owner",
+                                      wraps=bc._pa_claim_owner) as claim, \
+                    mock.patch("builtins.print"):
+                # Real claim path against the held latch: waits its bounded
+                # ~1s default, then refuses.
+                out = bc.record_speech(timeout=0.0)
+        finally:
+            with bc._pa_gate:
+                bc._pa_reinit_active[0] = False
+                bc._pa_gate.notify_all()
+        self.assertIsNone(out)
+        claim.assert_called_once()
+        self.assertFalse(bc._record_speech_active[0])
+
+    def test_play_with_lipsync_flag_covers_barge_close(self):
+        # Release-order fix: _tts_playback_active must still be True when the
+        # barge-in stream's close runs, and False after return. (The old code
+        # cleared the flag at the top of the finally, before the close — the
+        # ordering its own comment claimed not to have.)
+        import numpy as np
+        bc = self.bc
+        seen = {}
+        barge = object()
+
+        def _capture_close(stream):
+            if stream is barge:
+                seen["flag_at_barge_close"] = bc._tts_playback_active[0]
+
+        fake_sd = mock.Mock()
+        fake_layer = mock.Mock()
+        fake_layer.is_muted.return_value = True   # muted path: no sd.play
+        audio = np.zeros(24, dtype=np.float32)
+        with mock.patch.object(bc, "sd", fake_sd), \
+                mock.patch.object(bc, "_tts_layer", fake_layer), \
+                mock.patch.object(bc, "_audio_ducker", mock.Mock()), \
+                mock.patch.object(bc, "BARGE_IN_ENABLED", True), \
+                mock.patch.object(bc, "ROBOT_ENABLED", False), \
+                mock.patch.object(bc, "is_using_headset", return_value=True), \
+                mock.patch.object(bc, "_start_barge_in_listener",
+                                  return_value=barge), \
+                mock.patch.object(bc, "get_output_device", return_value=1), \
+                mock.patch.object(bc, "_write_hud_state"), \
+                mock.patch.object(bc, "_feed_playback_reference"), \
+                mock.patch.object(bc, "_safe_close_stream",
+                                  side_effect=_capture_close), \
+                mock.patch("builtins.print"):
+            bc.play_with_lipsync(audio, 24000)
+        self.assertIs(seen.get("flag_at_barge_close"), True,
+                      "barge-in close must run while TTS ownership is held")
+        self.assertFalse(bc._tts_playback_active[0],
+                         "TTS ownership must be released after the close")
+
+    def test_play_with_lipsync_claim_timeout_raises_without_flag(self):
+        # A hung reinit at playback time must lose the utterance LOUDLY
+        # (RuntimeError into _speak's device-hiccup handler), never open the
+        # barge-in/play streams, and never leave the flag set.
+        import numpy as np
+        bc = self.bc
+        with mock.patch.object(bc, "_pa_claim_owner", return_value=False), \
+                mock.patch.object(
+                    bc, "get_output_device",
+                    side_effect=AssertionError(
+                        "playback setup must not run on a refused claim")), \
+                mock.patch("builtins.print"):
+            with self.assertRaises(RuntimeError):
+                bc.play_with_lipsync(np.zeros(8, dtype=np.float32), 16000)
+        self.assertFalse(bc._tts_playback_active[0])
+
+    def test_pathb_deny_still_yields_and_does_not_claim(self):
+        # The deny_if conversion must preserve the yield-to-record_speech rule
+        # (GetMicBufferPathBExclusionTests semantics) AND leave the Path-B
+        # flag unclaimed on the veto.
+        bc = self.bc
+        prev_active = bc._record_speech_active[0]
+        prev_sr = bc._record_speech_sr[0]
+        bc._record_speech_active[0] = True
+        bc._record_speech_sr[0] = 48000     # sr mismatch → skips A2, lands in B
+        try:
+            with mock.patch.object(bc, "_mic_input_disabled",
+                                   return_value=False), \
+                    mock.patch.object(
+                        bc.sd, "InputStream",
+                        side_effect=AssertionError(
+                            "Path B must not open over record_speech")), \
+                    mock.patch.object(bc, "get_input_device", return_value=0), \
+                    mock.patch("builtins.print"):
+                bc.sys.modules.pop("skill_wake_listener", None)
+                out = bc.get_mic_buffer(0.1, sample_rate=16000)
+        finally:
+            bc._record_speech_active[0] = prev_active
+            bc._record_speech_sr[0] = prev_sr
+        self.assertIsNone(out)
+        self.assertFalse(bc._pathb_mic_active[0],
+                         "a deny_if veto must not leave the Path-B flag claimed")
+
+
+@requires_monolith
+class PaAbandonedCloseGateTests(MonolithGlobalsTestCase):
+    """H-6 (2026-08-20) — an ABANDONED native Pa_CloseStream must defer the
+    destructive PortAudio reinit.
+
+    Found by an adversarial pre-ship review of the 2026-08-14
+    portaudio-teardown-race wave and independently verified. Both abandonable
+    closes — _safe_close_stream's daemon and play_with_lipsync's tts-reaper —
+    give the caller a BOUNDED wait and then ABANDON the daemon ("it dies with
+    the process"). The caller's finally then cleared its owner flag
+    UNCONDITIONALLY, directly beneath a comment asserting "the flag covers its
+    whole native lifetime". But a caller timeout is POSITIVE EVIDENCE that the
+    daemon is still inside PortAudio's stop/close, so that flag drop handed
+    _refresh_devices permission to run sd._terminate()/sd._initialize()
+    straight into a live native call — re-opening the exact 0xc0000374
+    heap-corruption window the gate was built to close.
+
+    The fix must NOT freeze the owner flags: the barge-in gate, ambient
+    listen, the face tracker, the dossier and the self-diagnostic probe all
+    read them and would stall forever on a lie. So the in-flight native close
+    gets its OWN count, _pa_close_pending — bumped by the CALLER
+    (_pa_close_handoff) while its own owner flag is still up, retired by the
+    DAEMON (_pa_close_done) after its native close returns.
+    """
+
+    # ---- harness ---------------------------------------------------------
+    def _refresh_ctx(self, fake_terminate, printed):
+        """RefreshDevicesReinitGuardTests' mock harness, with prints captured
+        so the deny REASON can be asserted (each deny branch has its own
+        line — a shared message would hide which rule fired)."""
+        bc = self.bc
+        return [
+            mock.patch.object(bc.sd, "_terminate", side_effect=fake_terminate),
+            mock.patch.object(bc.sd, "_initialize"),
+            mock.patch.object(bc.sd, "query_devices",
+                              return_value={"name": "FakeMic"}),
+            mock.patch.object(bc, "MICROPHONE_INDEX", None),
+            mock.patch.object(bc, "SPEAKER_INDEX", None),
+            mock.patch("builtins.print",
+                       side_effect=lambda *a, **k: printed.append(
+                           " ".join(str(x) for x in a))),
+        ]
+
+    def _run_refresh(self, picks=None):
+        """Drive one forced _refresh_devices pass. Returns
+        (terminate_called, printed_lines, pick_device_mock)."""
+        bc = self.bc
+        printed = []
+        terminated = {"called": False}
+        pick = mock.Mock(return_value=(0, "FakeMic"))
+        patches = self._refresh_ctx(
+            lambda: terminated.__setitem__("called", True), printed)
+        patches.append(mock.patch.object(bc, "_pick_device", pick))
+        for p in patches:
+            p.start()
+        try:
+            bc._device_cache["checked_at"] = 0.0
+            bc._refresh_devices(force=True)
+        finally:
+            for p in patches:
+                p.stop()
+        return terminated["called"], printed, pick
+
+    @staticmethod
+    def _wait_zero(cell, deadline_s=5.0):
+        end = time.monotonic() + deadline_s
+        while time.monotonic() < end:
+            if cell[0] == 0:
+                return True
+            time.sleep(0.01)
+        return False
+
+    # ---- the gate itself -------------------------------------------------
+    def test_abandoned_close_defers_reinit_with_its_own_reason(self):
+        # THE H-6 regression. Every owner flag is down (they must be — the
+        # callers legitimately released them) yet a native close is still in
+        # flight: the destructive reinit must NOT run.
+        bc = self.bc
+        with bc._mic_lock:
+            bc._pa_close_pending[0] = 1
+        terminated, printed, _ = self._run_refresh()
+        self.assertFalse(terminated,
+                         "sd._terminate must NOT run while an abandoned "
+                         "native close is still inside PortAudio")
+        self.assertFalse(bc._pa_reinit_active[0],
+                         "the reinit latch must never be taken on the "
+                         "deferred path")
+        blob = "\n".join(printed)
+        self.assertIn("an abandoned native close is still in flight", blob)
+        self.assertIn("deferring PortAudio reinit", blob)
+
+    def test_cheap_repick_still_runs_while_the_reinit_is_deferred(self):
+        # ACCEPTED DEGRADATION boundary: deferring costs HOTPLUG DISCOVERY
+        # only. The owner now follows the Windows default from a Stream Deck,
+        # so switching between ALREADY-ENUMERATED devices happens constantly
+        # and must keep working — that is the cheap _pick_device re-pick over
+        # the existing enumeration, which runs after the deny chain.
+        bc = self.bc
+        with bc._mic_lock:
+            bc._pa_close_pending[0] = 1
+        bc._device_cache["last_reenum_at"] = 0.0
+        terminated, _, pick = self._run_refresh()
+        self.assertFalse(terminated)
+        self.assertEqual(pick.call_count, 2,
+                         "the input AND output re-picks must still run while "
+                         "the destructive reinit is deferred")
+        self.assertGreater(bc._device_cache["checked_at"], 0.0,
+                           "a deferred pass must still refresh the cache")
+        self.assertEqual(bc._device_cache["last_reenum_at"], 0.0,
+                         "a DEFERRED pass must not re-arm the periodic "
+                         "hotplug sweep — it has to retry soon, not in "
+                         "another DEVICE_REENUM_INTERVAL")
+
+    def test_reinit_runs_again_once_the_count_is_retired(self):
+        # The deferral is not sticky: with the count back at 0 the very same
+        # refresh performs the destructive reinit.
+        bc = self.bc
+        with bc._mic_lock:
+            bc._pa_close_pending[0] = 0
+        terminated, _, _ = self._run_refresh()
+        self.assertTrue(terminated,
+                        "with no close in flight the reinit must proceed")
+
+    def test_pa_streams_live_lists_the_new_cell(self):
+        # The canonical owner list must name it, so the ONE written-down
+        # definition of "a stream is live" stays honest even though
+        # _refresh_devices spells its checks out inline.
+        bc = self.bc
+        with bc._mic_lock:
+            self.assertFalse(bc._pa_streams_live())
+            bc._pa_close_pending[0] = 1
+            self.assertTrue(bc._pa_streams_live(),
+                            "_pa_streams_live must count an in-flight "
+                            "abandoned close as a live stream owner")
+
+    def test_close_pending_does_not_deny_new_claims(self):
+        # DELIBERATE SCOPE: the count gates only the DESTRUCTIVE reinit. A
+        # wedged close on one stream must not make JARVIS deaf by refusing
+        # every new capture claim — the mic/TTS flags already permit opening
+        # a new stream while another one is closing.
+        bc = self.bc
+        with bc._mic_lock:
+            bc._pa_close_pending[0] = 2
+        cell = [False]
+        self.assertTrue(bc._pa_claim_owner(cell, timeout=0),
+                        "an in-flight close must not block unrelated claims")
+        self.assertTrue(cell[0])
+        bc._pa_release_owner(cell)
+
+    # ---- the hand-off pair ----------------------------------------------
+    def test_handoff_defers_and_a_late_daemon_releases_it(self):
+        # THE property that makes the degradation narrow: the count is keyed
+        # on the daemon still being inside its native call. A daemon that
+        # merely finishes LATE retires the count itself — no timer, no
+        # liveness sweep, no window where the gate guesses.
+        bc = self.bc
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def _wedged():
+            release.wait(10.0)
+            bc._pa_close_done()
+
+        t = threading.Thread(target=_wedged, daemon=True)
+        bc._pa_close_handoff(t)
+        self.assertEqual(bc._pa_close_pending[0], 1)
+        terminated, _, _ = self._run_refresh()
+        self.assertFalse(terminated, "a live hand-off must defer the reinit")
+
+        release.set()
+        t.join(timeout=5.0)
+        self.assertFalse(t.is_alive())
+        self.assertTrue(self._wait_zero(bc._pa_close_pending),
+                        "a late-finishing daemon must retire its own count")
+        terminated, _, _ = self._run_refresh()
+        self.assertTrue(terminated,
+                        "the reinit must resume once the native close returns")
+
+    def test_handoff_retires_when_the_thread_cannot_start(self):
+        # Thread exhaustion under load is real here (it is why _speak keeps a
+        # belt-and-braces _tts_playback_active clear). A hand-off whose thread
+        # never STARTS registered a close that will never happen — that would
+        # defer hotplug for the life of the process.
+        bc = self.bc
+
+        class _DeadThread:
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        with self.assertRaises(RuntimeError):
+            bc._pa_close_handoff(_DeadThread())
+        self.assertEqual(bc._pa_close_pending[0], 0,
+                         "a failed start must retire the registration")
+
+    def test_count_never_goes_negative(self):
+        # A negative count would read as falsy and turn the deferral into a
+        # permanent PASS — strictly worse than the bug being fixed.
+        bc = self.bc
+        for _ in range(5):
+            bc._pa_close_done()
+        self.assertEqual(bc._pa_close_pending[0], 0)
+        with bc._mic_lock:
+            bc._pa_close_pending[0] = 1
+        bc._pa_close_done()
+        bc._pa_close_done()
+        self.assertEqual(bc._pa_close_pending[0], 0)
+
+    # ---- _safe_close_stream (record_speech + barge_stream abandons) ------
+    def test_safe_close_stream_abandon_holds_the_count_until_the_daemon_returns(self):
+        # _safe_close_stream is the ONE edit that covers record_speech's
+        # abandon AND play_with_lipsync's barge_stream abandon.
+        bc = self.bc
+        release = threading.Event()
+        self.addCleanup(release.set)
+        stream = mock.Mock()
+        stream.close.side_effect = lambda: release.wait(10.0)
+        fake_sd = mock.Mock()
+        with mock.patch.object(bc, "sd", fake_sd), \
+                mock.patch("builtins.print"), \
+                self.assertLogs("root", level="WARNING") as cm:
+            bc._safe_close_stream(stream, timeout_sec=0.05)
+        # It really was abandoned. H-3 (2026-08-20) removed the sd.stop() this
+        # used to assert on — that call could not free the hung InputStream
+        # (module-level stop() only touches sounddevice's _last_callback) and
+        # cross-closed the live TTS play stream — so the abandon is proved by
+        # the warning it now logs instead.
+        self.assertIn("abandoning the close daemon", "\n".join(cm.output))
+        fake_sd.stop.assert_not_called()
+        self.assertEqual(bc._pa_close_pending[0], 1,
+                         "an abandoned close must stay registered")
+        terminated, _, _ = self._run_refresh()
+        self.assertFalse(terminated,
+                         "the reinit must be deferred while the abandoned "
+                         "stream.close is still executing")
+        release.set()
+        self.assertTrue(self._wait_zero(bc._pa_close_pending))
+        terminated, _, _ = self._run_refresh()
+        self.assertTrue(terminated)
+
+    def test_safe_close_stream_normal_path_leaves_no_phantom_count(self):
+        # The retire happens BEFORE the daemon sets the caller's done-event,
+        # so a caller whose bounded wait SUCCEEDS observes a clean count the
+        # instant it returns — no transient deferral on every utterance.
+        bc = self.bc
+        stream = mock.Mock()
+        with mock.patch("builtins.print"):
+            bc._safe_close_stream(stream, timeout_sec=2.0)
+        stream.close.assert_called_once()
+        self.assertEqual(bc._pa_close_pending[0], 0,
+                         "a completed close must retire before waking the "
+                         "caller, or every healthy turn would defer hotplug")
+        terminated, _, _ = self._run_refresh()
+        self.assertTrue(terminated)
+
+    # ---- the tts-reaper --------------------------------------------------
+    def test_reap_playback_retires_before_setting_the_done_event(self):
+        # Ordering proof for the reaper half: _pa_close_done() must run BEFORE
+        # done_evt.set(), else the caller could wake and immediately see a
+        # phantom count.
+        bc = self.bc
+        seen = {}
+
+        class _RecordingEvent(threading.Event):
+            def set(self):
+                seen["count_at_set"] = bc._pa_close_pending[0]
+                super().set()
+
+        stream = mock.Mock()
+        stream.active = False
+        with bc._mic_lock:
+            bc._pa_close_pending[0] = 1
+        evt = _RecordingEvent()
+        with mock.patch("builtins.print"):
+            bc._reap_playback(stream, evt, 0.0)
+        self.assertTrue(evt.is_set())
+        self.assertEqual(seen.get("count_at_set"), 0,
+                         "_reap_playback must retire the count before it "
+                         "signals the caller")
+        self.assertEqual(bc._pa_close_pending[0], 0)
+
+    def _lipsync_ctx(self, fake_sd, robot=False):
+        bc = self.bc
+        layer = mock.Mock()
+        layer.is_muted.return_value = False     # exercise the REAL play path
+        return [
+            mock.patch.object(bc, "sd", fake_sd),
+            mock.patch.object(bc, "_tts_layer", layer),
+            mock.patch.object(bc, "_audio_ducker", mock.Mock()),
+            mock.patch.object(bc, "BARGE_IN_ENABLED", False),
+            mock.patch.object(bc, "ROBOT_ENABLED", robot),
+            mock.patch.object(bc, "send", mock.Mock()),
+            mock.patch.object(bc, "get_output_device", return_value=1),
+            mock.patch.object(bc, "_write_hud_state"),
+            mock.patch.object(bc, "_feed_playback_reference"),
+            mock.patch("builtins.print"),
+        ]
+
+    def _healthy_playback(self, robot):
+        """Run one healthy play_with_lipsync through the REAL reaper (the fake
+        stream reports inactive, so it finishes immediately). Returns the
+        _pa_close_handoff spy."""
+        import numpy as np
+        bc = self.bc
+        stream = mock.Mock()
+        stream.active = False
+        fake_sd = mock.Mock()
+        fake_sd.get_stream.return_value = stream
+        spy = mock.Mock(wraps=bc._pa_close_handoff)
+        patches = self._lipsync_ctx(fake_sd, robot=robot)
+        patches.append(mock.patch.object(bc, "_pa_close_handoff", spy))
+        for p in patches:
+            p.start()
+        try:
+            bc.play_with_lipsync(np.zeros(240, dtype=np.float32), 24000)
+        finally:
+            for p in patches:
+                p.stop()
+        return spy
+
+    def test_play_with_lipsync_hands_the_reaper_through_the_gate(self):
+        bc = self.bc
+        spy = self._healthy_playback(robot=False)
+        spy.assert_called_once()
+        handed = spy.call_args[0][0]
+        self.assertEqual(getattr(handed, "name", None), "tts-reaper")
+        self.assertEqual(bc._pa_close_pending[0], 0)
+        self.assertFalse(bc._tts_playback_active[0])
+
+    def test_play_with_lipsync_robot_twin_hands_the_reaper_through_the_gate(self):
+        # The robot branch is a deliberate SHARED body, not a divergent copy —
+        # the stale-duplicate rule this codebase keeps paying for.
+        bc = self.bc
+        spy = self._healthy_playback(robot=True)
+        spy.assert_called_once()
+        self.assertEqual(getattr(spy.call_args[0][0], "name", None),
+                         "tts-reaper")
+        self.assertEqual(bc._pa_close_pending[0], 0)
+        self.assertFalse(bc._tts_playback_active[0])
+
+    def test_abandoned_reaper_defers_reinit_and_still_clears_the_tts_flag(self):
+        # END-TO-END H-6. A wedged tts-reaper: the caller's bounded wait
+        # expires, it abandons the daemon and runs its finally.
+        #   * _tts_playback_active MUST still be cleared (it must not regress
+        #     to lying — the barge-in gate, ambient listen and the face
+        #     tracker read it and would stall forever).
+        #   * _pa_close_pending MUST still be up, so the destructive reinit is
+        #     deferred while PortAudio is inside the close.
+        import numpy as np
+        bc = self.bc
+        release = threading.Event()
+        self.addCleanup(release.set)
+        entered = threading.Event()
+
+        def _wedged_reaper(stream, done_evt, audio_secs):
+            # Models a daemon stuck inside Pa_CloseStream: it neither retires
+            # the count nor signals the caller.
+            entered.set()
+            release.wait(15.0)
+            bc._pa_close_done()
+            done_evt.set()
+
+        # Only the caller's ~6 s abandon wait is shortened; every other wait
+        # (the amp pump's 0.2 s join, the barge watcher's 0.02 s poll) is left
+        # exactly as the code sets it.
+        _RealEvent = threading.Event
+
+        class _NoLongWaitEvent(_RealEvent):
+            def wait(self, timeout=None):
+                if timeout is not None and timeout > 1.0:
+                    return _RealEvent.wait(self, 0.05)
+                return _RealEvent.wait(self, timeout)
+
+        stream = mock.Mock()
+        fake_sd = mock.Mock()
+        fake_sd.get_stream.return_value = stream
+        patches = self._lipsync_ctx(fake_sd, robot=False)
+        patches.append(mock.patch.object(bc, "_reap_playback",
+                                         side_effect=_wedged_reaper))
+        patches.append(mock.patch.object(bc.threading, "Event",
+                                         _NoLongWaitEvent))
+        for p in patches:
+            p.start()
+        try:
+            bc.play_with_lipsync(np.zeros(240, dtype=np.float32), 24000)
+        finally:
+            for p in patches:
+                p.stop()
+
+        self.assertTrue(entered.wait(5.0), "the reaper must have started")
+        self.assertFalse(bc._tts_playback_active[0],
+                         "the TTS owner flag must STILL be cleared on abandon "
+                         "— it must not regress to lying to the barge-in "
+                         "gate / ambient listen / face tracker")
+        self.assertEqual(bc._pa_close_pending[0], 1,
+                         "the abandoned native close must still be registered")
+        terminated, printed, _ = self._run_refresh()
+        self.assertFalse(terminated,
+                         "H-6: sd._terminate must NOT run while the abandoned "
+                         "tts-reaper is inside PortAudio")
+        self.assertIn("an abandoned native close is still in flight",
+                      "\n".join(printed))
+
+        release.set()
+        self.assertTrue(self._wait_zero(bc._pa_close_pending))
+        terminated, _, _ = self._run_refresh()
+        self.assertTrue(terminated,
+                        "hotplug discovery must return once the native close "
+                        "actually completes")
+
+
+@requires_monolith
+class PaCloseGateStaleDuplicateTests(MonolithGlobalsTestCase):
+    """The #1 bug class here is a rule fixed in ONE copy while the others rot.
+    core/wake_word.py carries its own _safe_close_stream that abandons a
+    native close the same way — and _refresh_devices calls det.pause() (which
+    lands in that copy) IMMEDIATELY BEFORE its own sd._terminate(). Pin both
+    the source-level mirror and the wiring."""
+
+    def test_wake_word_close_copy_registers_with_the_host_gate(self):
+        import core.wake_word as ww
+        import inspect
+        src = inspect.getsource(ww._safe_close_stream)
+        self.assertIn("_pa_close_handoff", src,
+                      "core/wake_word._safe_close_stream abandons a native "
+                      "close too — it must register with the host's "
+                      "_pa_close_pending gate or _refresh_devices will "
+                      "sd._terminate() straight through its own det.pause()")
+        self.assertIn("_pa_close_done", src)
+
+    def test_wake_word_close_defers_the_hosts_reinit(self):
+        # Functional half: with the monolith in sys.modules, a wedged
+        # wake-word close must hold the host's count up.
+        import core.wake_word as ww
+        bc = self.bc
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        class _Stream:
+            def stop(self):
+                pass
+
+            def close(self):
+                release.wait(10.0)
+
+        with mock.patch.dict(ww.sys.modules,
+                             {"bobert_companion": bc}, clear=False), \
+                mock.patch("builtins.print"):
+            ww._safe_close_stream(_Stream(), timeout_sec=0.05)
+        self.assertEqual(bc._pa_close_pending[0], 1,
+                         "an abandoned wake-word close must defer the host's "
+                         "PortAudio reinit")
+        release.set()
+        end = time.monotonic() + 5.0
+        while time.monotonic() < end and bc._pa_close_pending[0]:
+            time.sleep(0.01)
+        self.assertEqual(bc._pa_close_pending[0], 0,
+                         "the wake-word daemon must retire its own count")
+
+    def test_self_diagnostic_mirror_lists_every_canonical_cell(self):
+        # skills/self_diagnostic._mic_owned mirrors _pa_streams_live minus the
+        # probe's own _diag_capture_active claim. Derive the canonical list
+        # from the monolith SOURCE so a new cell can never be added on one
+        # side only.
+        import inspect
+        import re
+        bc = self.bc
+        canon = (inspect.getsource(bc._pa_streams_live)
+                 + inspect.getsource(bc._pa_mic_capture_live))
+        cells = {m for m in re.findall(r"_[a-z_]+_(?:active|pending)\b", canon)}
+        cells.discard("_diag_capture_active")   # documented exception
+        cells.discard("_pa_reinit_active")
+        self.assertIn("_pa_close_pending", cells,
+                      "the canonical owner list must name the H-6 cell")
+        sd_path = os.path.join(os.path.dirname(os.path.dirname(bc.__file__)),
+                               "JARVIS", "skills", "self_diagnostic.py")
+        if not os.path.isfile(sd_path):
+            sd_path = os.path.join(os.path.dirname(bc.__file__),
+                                   "skills", "self_diagnostic.py")
+        with io.open(sd_path, encoding="utf-8") as fh:
+            probe_src = fh.read()
+        start = probe_src.index("def _mic_owned()")
+        # Slice the REAL function extent, not a fixed character window: the
+        # old `start + 1500` proxy broke the moment a comment was added inside
+        # _mic_owned (H-4, 2026-08-20), reporting a mirror drift that did not
+        # exist. The body ends at the next line indented 4 spaces (the probe's
+        # own scope) that is not blank.
+        rest = probe_src[start:]
+        end = len(rest)
+        for m in re.finditer(r"\n {4}(?=\S)", rest):
+            end = m.start()
+            break
+        block = rest[:end]
+        missing = sorted(c for c in cells if c not in block)
+        self.assertEqual(
+            missing, [],
+            f"skills/self_diagnostic._mic_owned no longer mirrors "
+            f"bobert_companion's canonical owner list: {missing}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  H-5 (2026-08-20) — focus mode's ALIAS names were in neither speak set
+#
+#  skills/focus_mode.py:397-398 binds "focus_mode" -> focus_mode_on and
+#  "end_focus_mode" -> focus_mode_off, the SAME handlers as the routed
+#  focus_mode_on / focus_mode_off names. Nothing on the path canonicalises an
+#  alias: parse_and_run_actions records the RAW name and
+#  _speak_verbatim_results gates on `name.lower() in
+#  SPEAK_RESULT_VERBATIM_ACTIONS`. So "JARVIS, end focus mode" ran
+#  focus_mode_off, which calls _build_recap(clear=True) — DESTROYING the held
+#  items — and returned the recap into a path with no speaker. The owner heard
+#  nothing and the "what you missed" list was gone; whats_missed cannot
+#  recover it, because the buffer is already cleared.
+#
+#  WHY NOT CANONICALISE BY HANDLER IDENTITY (the tempting general fix — make
+#  an alias inherit its sibling's speak-set membership)? Measured against the
+#  tree at HEAD it is WRONG twice over:
+#    * skills/network_deco.py:883-884 registers ONE handler,
+#      _act_deco_topology, under two names that are DELIBERATELY split —
+#      "deco_topology" is verbatim (a one-line status) and "network_topology"
+#      is informative (a multi-device list the LLM should summarise), with the
+#      split spelled out in bobert_companion's INFORMATIVE_ACTIONS comment.
+#      Handler-identity canonicalisation would silently collapse that.
+#    * skills/personal_rag.py's "search_my_files" is verbatim while its
+#      same-handler sibling "rag_search_quiet" is not; that verbatim entry is
+#      itself a known defect (it is bound to the MACHINE-READABLE handler, so
+#      it reads raw "[1] path=... score=0.812" blocks aloud). Canonicalising
+#      would PROPAGATE that defect to the sibling.
+#  The membership decision is legitimately per-NAME. What must not be silent
+#  is DRIFT — so the anti-drift mechanism is a source scan, below.
+# ═══════════════════════════════════════════════════════════════════════════
+@requires_monolith
+class FocusModeFamilyVoicedTests(MonolithGlobalsTestCase):
+    def test_focus_mode_aliases_are_voiced(self):
+        for name in ("focus_mode", "end_focus_mode"):
+            self.assertIn(
+                name, self.bc.SPEAK_RESULT_VERBATIM_ACTIONS,
+                f"{name} is a registered alias of the focus-mode handlers; "
+                f"unvoiced, ending a block destroys the held-items recap and "
+                f"says nothing")
+            self.assertNotIn(name, self.bc.INFORMATIVE_ACTIONS)
+
+    def test_every_registered_focus_mode_name_is_voiced(self):
+        # Source-scanning family invariant, mirroring
+        # test_every_registered_air_mouse_name_is_voiced: every name
+        # skills/focus_mode.py registers returns a finished, user-facing
+        # one-liner (the on/off confirmations, the resume RECAP, the
+        # whats_missed / focus_mode_status queries), so every one of them must
+        # be in SPEAK_RESULT_VERBATIM_ACTIONS. A FUTURE alias added to
+        # register() now fails the suite instead of silently swallowing a
+        # recap — which is exactly how "end_focus_mode" rotted.
+        rs = _load_registration_scan()
+        regs = rs.scan_file(os.path.join(_ROOT, "skills", "focus_mode.py"))
+        # Sanity: 9 names at HEAD; a partial scan must not vacuously pass.
+        self.assertIn("focus_mode_on", regs)
+        self.assertIn("end_focus_mode", regs)
+        self.assertGreaterEqual(len(regs), 9, sorted(regs))
+        missing = sorted(n for n in regs
+                         if n not in self.bc.SPEAK_RESULT_VERBATIM_ACTIONS)
+        self.assertEqual(
+            missing, [],
+            f"skills/focus_mode.py registers action(s) with NO voicing route "
+            f"— their finished one-line results (and, for the disengage "
+            f"aliases, the destroyed recap) would be dropped: {missing}")
+
+    def test_disengage_aliases_share_the_recap_destroying_handler(self):
+        # The premise the fix rests on, asserted from source rather than
+        # assumed: end_focus_mode really is bound to focus_mode_off, which
+        # really does clear the buffer. If a future edit gives it its own
+        # self-speaking handler this test says so instead of silently passing.
+        rs = _load_registration_scan()
+        regs = rs.scan_file(os.path.join(_ROOT, "skills", "focus_mode.py"))
+        self.assertEqual(regs["end_focus_mode"].symbol, "focus_mode_off")
+        self.assertEqual(regs["focus_mode"].symbol, "focus_mode_on")
+        with io.open(os.path.join(_ROOT, "skills", "focus_mode.py"),
+                     encoding="utf-8") as fh:
+            src = fh.read()
+        body = src[src.index("def focus_mode_off"):]
+        body = body[:body.index("\n    def ")] if "\n    def " in body else body
+        self.assertIn("clear=True", body,
+                      "focus_mode_off no longer destroys the held items — "
+                      "re-check whether the unvoiced-alias harm still applies")
+
+
+@requires_monolith
+class ActionAliasSpeakSetDriftTests(MonolithGlobalsTestCase):
+    """Repo-wide anti-drift scan for the H-5 class.
+
+    Groups every registered action by (file, handler symbol) and flags any
+    family where SOME names are routed to a speak set and others are in
+    NEITHER. Membership is legitimately per-name (see the block comment
+    above), so this does not demand uniformity — it demands that every
+    non-uniform family be DECLARED here, with why. A new alias added to a
+    routed handler fails this test instead of silently going mute.
+    """
+
+    # (relative path, handler symbol) -> why this family is legitimately
+    # non-uniform, or the open finding that tracks it. Fix a finding, delete
+    # its row. Every row was verified against the tree on 2026-08-20.
+    _DECLARED_SPLITS = {
+        ("bobert_companion.py", "_act_read_changelog"):
+            "OPEN FINDING: 'recent_changes' is registered one line below three "
+            "routed aliases of the same handler and documented alongside them, "
+            "but is in neither speak set.",
+        ("bobert_companion.py", "_act_web_search"):
+            "'search' is a bare-verb alias of the informative 'web_search'; "
+            "left unrouted deliberately so a naked 'search' does not force a "
+            "follow-up round-trip.",
+        ("skills/face_id.py", "enroll_face"):
+            "OPEN FINDING: 'remember_my_face' is an unrouted alias of the "
+            "routed enroll_face / learn_my_face pair.",
+        ("skills/face_id.py", "learn_guest"):
+            "OPEN FINDING: 'learn_guest' - the only guest-enrolment name the "
+            "prompt documents - is in neither speak set while its sibling "
+            "alias 'remember_this_person' is.",
+        ("skills/personal_rag.py", "rag_search_quiet"):
+            "'rag_search_quiet' is the deliberately SILENT twin of the routed "
+            "'search_my_files' (whose own verbatim membership is itself an "
+            "open finding - it is bound to the machine-readable handler).",
+        ("skills/sh_kasa.py", "smart_home_control"):
+            "control_light / control_plug / kasa_control are side-effect "
+            "control aliases; the routed smart_home_control / control_device "
+            "pair carries the spoken confirmation for the family.",
+        ("skills/trip_planner.py", "_action_status"):
+            "'bonnaroo_brief' returns the long multi-paragraph brief, not the "
+            "one-line 'bonnaroo_status' read-out, so it is deliberately not "
+            "verbatim-voiced.",
+    }
+
+    def test_no_undeclared_alias_family_drifts_out_of_the_speak_sets(self):
+        rs = _load_registration_scan()
+        routed = (set(self.bc.SPEAK_RESULT_VERBATIM_ACTIONS)
+                  | set(self.bc.INFORMATIVE_ACTIONS))
+        # Sanity: an empty/partial speak set must not make this vacuous.
+        self.assertGreater(len(routed), 300, len(routed))
+
+        paths = [os.path.join(_ROOT, "bobert_companion.py")]
+        for sub in ("skills", "core"):
+            d = os.path.join(_ROOT, sub)
+            for fname in sorted(os.listdir(d)):
+                if fname.endswith(".py"):
+                    paths.append(os.path.join(d, fname))
+
+        found = {}
+        for path in paths:
+            rel = os.path.relpath(path, _ROOT).replace(os.sep, "/")
+            try:
+                regs = rs.scan_file(path)
+            except SyntaxError:
+                continue
+            by_symbol = {}
+            for name, r in regs.items():
+                if r.symbol.startswith(rs.OPAQUE_SYMBOL_PREFIXES):
+                    continue     # lambda@ / expr@ / ?alias: — no real family
+                by_symbol.setdefault(r.symbol, []).append(name)
+            for symbol, names in by_symbol.items():
+                inset = [n for n in names if n in routed]
+                out = sorted(n for n in names if n not in routed)
+                if inset and out:
+                    found[(rel, symbol)] = out
+
+        # Sanity: the scan must actually see the tree.
+        self.assertIn(("skills/face_id.py", "learn_guest"), found)
+
+        undeclared = sorted(k for k in found if k not in self._DECLARED_SPLITS)
+        self.assertEqual(
+            undeclared, [],
+            "these action families have some aliases routed to a speak set and "
+            "others in NEITHER — the H-5 shape, where the owner says the alias, "
+            "the work happens, and JARVIS says nothing. Route them, or declare "
+            "the split in _DECLARED_SPLITS with why: "
+            + "; ".join(f"{f}:{sym} -> {found[(f, sym)]}"
+                        for f, sym in undeclared))
+
+        stale = sorted(k for k in self._DECLARED_SPLITS if k not in found)
+        self.assertEqual(
+            stale, [],
+            f"_DECLARED_SPLITS names families that no longer drift — delete "
+            f"the stale rows so the ledger keeps meaning something: {stale}")
+
+    def test_focus_mode_is_no_longer_a_drifting_family(self):
+        # The H-5 fix itself, expressed against the scan: focus_mode must NOT
+        # appear in the drift ledger, and must not need to.
+        self.assertNotIn(("skills/focus_mode.py", "focus_mode_off"),
+                         self._DECLARED_SPLITS)
+        self.assertNotIn(("skills/focus_mode.py", "focus_mode_on"),
+                         self._DECLARED_SPLITS)
 
 
 if __name__ == "__main__":

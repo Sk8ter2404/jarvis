@@ -97,20 +97,47 @@ def _get_pending(action_name: str = "") -> dict | None:
     return None
 
 
-def _speak(text: str) -> None:
+def _speak(text: str) -> bool:
     """Route a line through the companion's TTS path so it shares the
     serialised _SPEAK_LOCK with every other speech caller (mid-task timer,
-    tray drainer, proactive_announce). Falls back to a console print so the
-    gate stays usable in headless / unit-test contexts."""
+    tray drainer, proactive_announce).
+
+    Returns True **iff the line was actually voiced**, so ``run_with_gate``
+    can hold the send when the owner never heard the read-back. This module's
+    docstring promises "if TTS fails ... we abort the send"; that promise is
+    only real if this function reports the failure.
+
+    Every non-voiced outcome returns False:
+      * no companion / no callable ``_speak``  → console print, then False.
+        A console line is NOT a read-back the owner heard, so a headless
+        context is a *refusal*, not a pass. That is the correct reading for
+        a send gate.
+      * ``speaker(text)`` raised                → False.
+      * ``speaker(text)`` returned anything other than literal ``True``
+        → False. ``bobert_companion._speak`` returns ``None`` when the tray
+        "Mute TTS" toggle is on (a state restored across reboots), ``None``
+        when nothing audible survives tag/markdown stripping, ``None`` on a
+        staging instance, and ``False`` when synthesis/playback fails — none
+        of which raise. Strict ``is True``, never ``bool(...)``: a MagicMock
+        is truthy and would re-open this exact hole in the tests."""
     bc = _import_companion()
     speaker = getattr(bc, "_speak", None) if bc is not None else None
     if callable(speaker):
         try:
-            speaker(text)
-            return
+            ok = speaker(text)
         except Exception as e:
-            _log.debug("[draft_gate] _speak failed: %s", e)
+            _log.warning("[draft_gate] _speak raised: %s", e)
+            return False
+        if ok is not True:
+            _log.warning("[draft_gate] readback was NOT voiced "
+                         "(muted / nothing audible / staging / playback "
+                         "failed) — failing closed")
+            return False
+        return True
+    _log.warning("[draft_gate] no TTS available; a console print is not a "
+                 "readback — failing closed")
     print(f"  [draft_gate] (tts unavailable) {text}")
+    return False
 
 
 def _capture_and_transcribe(timeout_s: float) -> str:
@@ -209,11 +236,20 @@ def run_with_gate(action_name: str, arg: str,
         # Nothing to preview — let the underlying action speak for itself.
         return fn(arg)
 
+    # Both lines must be genuinely VOICED before the confirm window opens.
+    # `_speak` returns False (without raising) when TTS is muted, staged, or
+    # playback failed — treating that silence as "the owner heard the draft"
+    # is what made this gate fail open. Strict `is True` so a truthy test
+    # double can't stand in for a real read-back. The try/except stays because
+    # _readback_text can still raise (pending.get on a truthy non-dict).
     try:
-        _speak(_readback_text(pending))
-        _speak(_PROMPT_LINE)
+        voiced = (_speak(_readback_text(pending)) is True
+                  and _speak(_PROMPT_LINE) is True)
     except Exception as e:
         _log.exception("[draft_gate] readback failed: %s", e)
+        voiced = False
+    if not voiced:
+        _log.warning("[draft_gate] readback not voiced — holding the send")
         return ("Draft preview failed before I could read it back, sir — "
                 "holding the send. Say 'send' again to retry.")
 

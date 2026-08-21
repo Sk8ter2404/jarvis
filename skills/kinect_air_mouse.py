@@ -2894,34 +2894,61 @@ def _apply_decision(decision: AirMouseDecision) -> None:
         _mark_self_action()
 
 
-# ─── ISSUE 2b: live HEIGHT-gate DEBUG LOG (~2 Hz) ────────────────────────────
-# While the air-mouse is enabled, print the live numbers at ~2 Hz so the owner can
-# SEE what the gate sees and tune the margins, e.g.
+# ─── ISSUE 2b: live HEIGHT-gate TELEMETRY (transitions + heartbeat) ──────────
+# While the air-mouse is enabled, print the live numbers so the owner can SEE
+# what the gate sees and tune the margins, e.g.
 #   [air-mouse] lift=+0.07 hand=right engaged=True yield=False reach=0.18 straight=0.91
 # lift is the HEIGHT of the controlling hand above the shoulder (the PRIMARY gate);
 # yield is True while the air-mouse is suppressed by recent REAL input. The
 # highest-raised hand is logged (the one the gate is judging). reach/straight are
 # kept as the demoted secondary cues for context.
-_AIR_MOUSE_DEBUG_INTERVAL = 0.5             # seconds between debug lines (~2 Hz)
+#
+# FREQUENCY (the 2026-08-14 flood fix): a line prints on every meaningful STATE
+# TRANSITION (engage/disengage, fist-latch, debounced grip, auto-yield, tracked,
+# hand-presence, controlling-hand switch WHILE engaged) — coalesced to the 0.5 s
+# floor — plus one heartbeat per 30 s while nothing changes, so a tracked-but-
+# idle body no longer floods the session log / web Live view at 2 Hz (77% of one
+# live session log was this line, 97.8% of it a disengaged open-hand body doing
+# nothing). Set JARVIS_AIR_MOUSE_TELEMETRY=verbose to restore the steady ~2 Hz
+# firehose for a deliberate tuning session; the 0.5 s floor always applies, so
+# the bounded worst case is exactly the old rate.
+# NB: the highest-raised-arm designation flaps left↔right on a DISENGAGED body
+# doing nothing (~15,900 pseudo-transitions in one live log), so while
+# disengaged the hand side is collapsed to mere PRESENCE in the signature.
+_AIR_MOUSE_DEBUG_INTERVAL = 0.5             # hard floor between lines (2 Hz cap)
 _air_mouse_debug_last = [0.0]               # module-list so the throttle persists
-# When the air-mouse is IDLE (no hand tracked, not engaged, no fist-latch) and
-# nothing has changed, the ~2 Hz line is pure noise that floods the session log
-# and the web Live view. Suppress it in that case, emitting only a slow heartbeat
-# so a still, empty room doesn't drown out real activity. Interesting frames (a
-# hand up, engaged, latched, or ANY state change) still log at the full 2 Hz.
-_air_mouse_debug_last_sig = [None]          # last-logged (hand, engaged, latch, tracked)
-_AIR_MOUSE_IDLE_HEARTBEAT_S = 30.0          # idle+unchanged: at most one line / 30 s
+_air_mouse_debug_last_sig = [None]          # last-logged meaningful signature
+_AIR_MOUSE_HEARTBEAT_S = 30.0               # unchanged state: at most one line / 30 s
+_AIR_MOUSE_TELEMETRY_ENV = "JARVIS_AIR_MOUSE_TELEMETRY"  # =verbose → 2 Hz firehose
+
+
+def _debounced_grip_for(arm, ctrl) -> str:
+    """The DEBOUNCED stable grip of the HIGHEST-RAISED hand (`arm`) — NOT
+    _controlling_grip(), which returns "open" while disengaged and so hid the
+    real hand state in the diagnostic log (2026-07-07). Grip + fist-latch are
+    the two signals that explain a "jittery when closed" repro (grip flicker
+    open↔closed, or the latch holding re-engage off). Shared by the telemetry
+    formatter and the transition signature so the grip-read rule lives ONCE.
+    NEVER raises."""
+    try:
+        if arm is not None and arm.side == "left":
+            return ctrl._grip_left.stable
+        if arm is not None and arm.side == "right":
+            return ctrl._grip_right.stable
+        return ctrl._controlling_grip()
+    except Exception:
+        return "?"
 
 
 def _format_reach_debug(left_ext, right_ext, tracked: bool, ctrl,
                         yielding: "Optional[bool]" = None) -> str:
-    """The ~2 Hz debug line. Leads with the HEIGHT delta (lift = hand_y minus the
+    """The telemetry line. Leads with the HEIGHT delta (lift = hand_y minus the
     shoulder Y, the PRIMARY gate) for the highest-raised hand, the controlling
     side, engaged, and the auto-YIELD state; then the demoted reach/straight cues
-    for context. PURE-ish (reads ctrl state); NEVER raises."""
+    for context. `yielding` is resolved by _maybe_debug_log (so the printed line
+    agrees with the transition signature). PURE-ish (reads ctrl state); NEVER
+    raises."""
     try:
-        if yielding is None:
-            yielding = real_input_recent()
         arms = [a for a in (left_ext, right_ext) if a is not None]
         arm = max(arms, key=lambda a: a.reach_score()) if arms else None
         if arm is None:
@@ -2933,20 +2960,7 @@ def _format_reach_debug(left_ext, right_ext, tracked: bool, ctrl,
             straight_s = ("%.2f" % arm.straightness
                           if arm.straightness is not None else "n/a")
             hand_s = arm.side or "?"
-        # Grip + fist-latch: the two signals that explain a "jittery when closed"
-        # repro (grip flicker open↔closed, or the latch holding re-engage off).
-        # Read the HIGHEST-RAISED hand's DEBOUNCED grip directly — not
-        # _controlling_grip(), which returns "open" while disengaged and so hid the
-        # real hand state in the diagnostic log (2026-07-07).
-        try:
-            if arm is not None and arm.side == "left":
-                grip_s = ctrl._grip_left.stable
-            elif arm is not None and arm.side == "right":
-                grip_s = ctrl._grip_right.stable
-            else:
-                grip_s = ctrl._controlling_grip()
-        except Exception:
-            grip_s = "?"
+        grip_s = _debounced_grip_for(arm, ctrl)
         latch_s = bool(getattr(ctrl, "fist_release_latched", False))
         return ("  [air-mouse] lift=%s hand=%s grip=%s engaged=%s latch=%s "
                 "yield=%s reach=%s straight=%s tracked=%s"
@@ -2959,28 +2973,43 @@ def _format_reach_debug(left_ext, right_ext, tracked: bool, ctrl,
 def _maybe_debug_log(left_ext, right_ext, tracked: bool, ctrl,
                      now: "Optional[float]" = None,
                      yielding: "Optional[bool]" = None) -> bool:
-    """Emit the height-gate debug line if the throttle window has elapsed. Returns
-    True iff a line was printed (for the test). Suppresses the line when the
-    air-mouse is IDLE and unchanged (empty room), keeping only a slow heartbeat,
-    so it doesn't flood the log / web Live view at 2 Hz. NEVER raises."""
+    """Emit the height-gate telemetry line if it's worth printing. Returns True
+    iff a line was printed (for the test). A line is worth printing when the
+    MEANINGFUL signature changed since the last logged line (a state
+    TRANSITION), or the 30 s heartbeat elapsed, or JARVIS_AIR_MOUSE_TELEMETRY=
+    verbose — always behind the 0.5 s interval floor, so the bounded worst case
+    is the old ~2 Hz. NEVER raises."""
     try:
         t = time.monotonic() if now is None else float(now)
         if (t - _air_mouse_debug_last[0]) < _AIR_MOUSE_DEBUG_INTERVAL:
             return False
-        # Classify the frame. IDLE = no controlling hand, not engaged, no
-        # fist-latch, nothing tracked. Only suppress when idle AND the meaningful
-        # signature is unchanged from the last logged line.
+        verbose = (os.environ.get(_AIR_MOUSE_TELEMETRY_ENV, "")
+                   .strip().lower() == "verbose")
+        # Resolve the yield state HERE when the caller didn't pass it (the live
+        # path passes it from _poll_once) so the signature and the printed line
+        # agree on the same value.
+        if yielding is None:
+            yielding = real_input_recent()
+        # The MEANINGFUL signature — every member is debounced / hysteresis-
+        # protected, so none can flicker at frame rate. The hand side counts as
+        # a transition only WHILE engaged/latched (a controlling-hand switch is
+        # a real event); on a DISENGAGED body the highest-raised-arm designation
+        # flaps left↔right constantly, so collapse it to mere presence.
         arms = [a for a in (left_ext, right_ext) if a is not None]
         arm = max(arms, key=lambda a: a.reach_score()) if arms else None
-        hand = arm.side if arm is not None else None
         engaged = bool(getattr(ctrl, "engaged", False))
         latch = bool(getattr(ctrl, "fist_release_latched", False))
-        idle = (arm is None) and (not engaged) and (not latch) and (not tracked)
-        sig = (hand, engaged, latch, bool(tracked))
-        if idle and sig == _air_mouse_debug_last_sig[0]:
-            # Nothing meaningful changed — emit at most a slow heartbeat.
-            if (t - _air_mouse_debug_last[0]) < _AIR_MOUSE_IDLE_HEARTBEAT_S:
-                return False
+        if engaged or latch:
+            hand_sig = (arm.side if arm is not None
+                        else getattr(ctrl, "hand", None))
+        else:
+            hand_sig = "up" if arm is not None else None
+        sig = (hand_sig, _debounced_grip_for(arm, ctrl), engaged, latch,
+               bool(yielding), bool(tracked))
+        if (not verbose and sig == _air_mouse_debug_last_sig[0]
+                and (t - _air_mouse_debug_last[0]) < _AIR_MOUSE_HEARTBEAT_S):
+            # Nothing meaningful changed — emit at most the slow heartbeat.
+            return False
         _air_mouse_debug_last[0] = t
         _air_mouse_debug_last_sig[0] = sig
         print(_format_reach_debug(left_ext, right_ext, tracked, ctrl,
@@ -2988,6 +3017,15 @@ def _maybe_debug_log(left_ext, right_ext, tracked: bool, ctrl,
         return True
     except Exception:
         return False
+
+
+def _reset_debug_throttle() -> None:
+    """Forget the last-logged telemetry signature (NOT the 0.5 s time floor) so
+    the first past-floor frame always prints a baseline line. Called on the
+    enable edge in _poll_loop — otherwise a re-enable into an unchanged scene
+    could stay silent for up to the 30 s heartbeat and the owner couldn't tell
+    the poller saw the flag."""
+    _air_mouse_debug_last_sig[0] = None
 
 
 def _poll_once(ctrl: AirMouseController, bridge) -> Optional[AirMouseDecision]:
@@ -3046,8 +3084,9 @@ def _poll_once(ctrl: AirMouseController, bridge) -> Optional[AirMouseDecision]:
 
     enabled = _air_mouse_enabled()
     # ISSUE 2b: while enabled, surface the live height/lift numbers + yield state
-    # at ~2 Hz for tuning. Throttled + best-effort; only when enabled so a disabled
-    # poller stays quiet.
+    # on state transitions + a 30 s heartbeat (JARVIS_AIR_MOUSE_TELEMETRY=verbose
+    # restores ~2 Hz for tuning). Throttled + best-effort; only when enabled so a
+    # disabled poller stays quiet.
     if enabled:
         _maybe_debug_log(left_ext, right_ext, tracked, ctrl, yielding=yielding)
     if not enabled:
@@ -3124,6 +3163,10 @@ def _poll_loop() -> None:  # pragma: no cover - non-terminating daemon; each tic
                 ctrl.reach = _reach_box_for_virtual_desktop(refresh=True)
                 last_bounds_refresh = now
                 ctrl.reset()
+                # Baseline telemetry: forget the last-logged signature so the
+                # first past-floor frame prints, confirming the poller saw the
+                # enable even when the scene hasn't changed.
+                _reset_debug_throttle()
             elif enabled and (now - last_bounds_refresh) >= VIRTUAL_BOUNDS_REFRESH_SECONDS:
                 # Periodic refresh while running so a hot-plugged / rearranged
                 # monitor is picked up live. _cached_virtual_bounds() only hits

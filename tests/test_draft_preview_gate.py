@@ -7,6 +7,16 @@ pending draft it reads the body aloud and only calls fn(arg) on an explicit
 spoken confirmation. Everything else — cancel, silence, ambiguity, a readback
 failure — holds the draft and returns a status string WITHOUT calling fn.
 
+"Readback failure" is the subtle one, and the reason this file was rewritten:
+``bobert_companion._speak`` reports a failed/suppressed readback by RETURNING
+(None when muted — a tray toggle that persists across reboots — None on a
+staging instance, None when nothing audible survives tag/markdown stripping,
+False on a playback error), never by raising. An earlier revision only tested
+the raising case and patched ``gate._speak`` with a bare MagicMock whose truthy
+return stood in for "voiced", so the suite was green while a muted JARVIS would
+still open the 8-second yes-window on a draft nobody had heard. Model the return
+values, not an exception.
+
 The companion (bobert_companion) and the per-skill pending-draft providers are
 mocked, so no audio runs and nothing is sent. stdlib unittest + mock only.
 """
@@ -56,10 +66,22 @@ class _GateHarness(unittest.TestCase):
     """Helpers to drive run_with_gate with a controllable pending draft and a
     controllable transcription result, without any real audio."""
 
-    def _run(self, *, pending, heard, action_name="send_draft", arg="x"):
+    def _run(self, *, pending, heard, action_name="send_draft", arg="x",
+             speak_returns=True):
+        """Drive run_with_gate.
+
+        ``speak_returns`` is the value the patched ``gate._speak`` hands back.
+        It defaults to literal ``True`` — "the line was genuinely voiced" —
+        because that is the ONLY value production returns on success. A bare
+        ``mock.patch.object(gate, "_speak")`` yields a truthy MagicMock, which
+        is exactly the false-green that let this gate ship fail-open; pass an
+        explicit ``None`` / ``False`` to model a readback the owner never
+        heard.
+        """
         fn = mock.MagicMock(return_value="SENT")
         with mock.patch.object(gate, "_get_pending", return_value=pending), \
-             mock.patch.object(gate, "_speak") as speak, \
+             mock.patch.object(gate, "_speak",
+                               return_value=speak_returns) as speak, \
              mock.patch.object(gate, "_capture_and_transcribe", return_value=heard):
             result = gate.run_with_gate(action_name, arg, fn)
         return result, fn, speak
@@ -99,6 +121,62 @@ class FailClosedTests(_GateHarness):
              mock.patch.object(gate, "_speak", side_effect=RuntimeError("tts boom")), \
              mock.patch.object(gate, "_capture_and_transcribe", return_value="yes"):
             result = gate.run_with_gate("send_draft", "x", fn)
+        fn.assert_not_called()
+        self.assertIn("holding the send", result.lower())
+
+    def test_unvoiced_readback_holds_draft_without_raising(self):
+        # THE REGRESSION THIS FILE EXISTS FOR. _speak returns False (muted TTS,
+        # staging instance, nothing audible after stripping, playback failure)
+        # WITHOUT raising. The owner heard nothing, so the 8-second yes-window
+        # must never open and fn must never fire — even with a confirm word
+        # sitting in the mic.
+        for ret in (False, None):
+            with self.subTest(speak_returns=ret):
+                result, fn, _ = self._run(pending=self.PENDING, heard="yes",
+                                          speak_returns=ret)
+                fn.assert_not_called()
+                self.assertIn("holding the send", result.lower())
+
+    def test_muted_readback_never_opens_the_mic(self):
+        # Stronger than the above: the capture step is not even reached, so a
+        # stray "okay" in the room cannot be heard, let alone matched.
+        fn = mock.MagicMock(return_value="SENT")
+        with mock.patch.object(gate, "_get_pending", return_value=self.PENDING), \
+             mock.patch.object(gate, "_speak", return_value=False), \
+             mock.patch.object(gate, "_capture_and_transcribe") as cap:
+            result = gate.run_with_gate("send_draft", "x", fn)
+        cap.assert_not_called()
+        fn.assert_not_called()
+        self.assertIn("holding the send", result.lower())
+
+    def test_prompt_line_unvoiced_holds_draft(self):
+        # The body read back fine but the "Shall I send it, sir?" prompt did
+        # not — the owner never heard the question, so still fail closed.
+        fn = mock.MagicMock(return_value="SENT")
+        with mock.patch.object(gate, "_get_pending", return_value=self.PENDING), \
+             mock.patch.object(gate, "_speak", side_effect=[True, False]), \
+             mock.patch.object(gate, "_capture_and_transcribe") as cap:
+            result = gate.run_with_gate("send_draft", "x", fn)
+        cap.assert_not_called()
+        fn.assert_not_called()
+        self.assertIn("holding the send", result.lower())
+
+    def test_truthy_non_true_readback_holds_draft(self):
+        # A truthy-but-not-True _speak (e.g. an unconfigured MagicMock) must
+        # NOT count as voiced. This is the guard against `if _speak(...)`.
+        result, fn, _ = self._run(pending=self.PENDING, heard="yes",
+                                  speak_returns=mock.MagicMock(name="truthy"))
+        fn.assert_not_called()
+        self.assertIn("holding the send", result.lower())
+
+    def test_readback_text_raising_holds_draft(self):
+        # _readback_text still raises on a truthy non-dict pending; the
+        # try/except must keep that fail-closed too.
+        fn = mock.MagicMock(return_value="SENT")
+        with mock.patch.object(gate, "_get_pending", return_value="not-a-dict"), \
+             mock.patch.object(gate, "_capture_and_transcribe") as cap:
+            result = gate.run_with_gate("send_draft", "x", fn)
+        cap.assert_not_called()
         fn.assert_not_called()
         self.assertIn("holding the send", result.lower())
 
@@ -208,36 +286,73 @@ class ImportCompanionTests(unittest.TestCase):
 
 
 class SpeakTests(unittest.TestCase):
-    def test_routes_to_companion_speak(self):
+    """``gate._speak`` returns True IFF the line was actually voiced.
+
+    ``run_with_gate`` gates the whole send on this bool, so every value other
+    than literal ``True`` has to come back False. ``bobert_companion._speak``
+    signals "not voiced" by RETURNING, not by raising: ``None`` when the tray
+    mute toggle is on (persisted across reboots), ``None`` on a staging
+    instance, ``None`` when nothing audible survives tag/markdown stripping,
+    and ``False`` when synthesis/playback fails."""
+
+    def _speak_with(self, companion, text="hello sir"):
+        with mock.patch.object(gate, "_import_companion",
+                               return_value=companion):
+            return gate._speak(text)
+
+    def test_routes_to_companion_speak_and_returns_true_when_voiced(self):
         bc = mock.MagicMock()
-        with mock.patch.object(gate, "_import_companion", return_value=bc):
-            gate._speak("hello sir")
+        bc._speak.return_value = True
+        self.assertIs(self._speak_with(bc), True)
         bc._speak.assert_called_once_with("hello sir")
 
-    def test_falls_back_to_print_when_no_companion(self):
+    def test_returns_false_when_companion_speak_returns_none(self):
+        # Muted TTS / staging / nothing audible after stripping.
+        bc = mock.MagicMock()
+        bc._speak.return_value = None
+        self.assertIs(self._speak_with(bc), False)
+
+    def test_returns_false_when_companion_speak_returns_false(self):
+        # Synthesis / playback failure (PortAudio, edge-tts, SAPI5).
+        bc = mock.MagicMock()
+        bc._speak.return_value = False
+        self.assertIs(self._speak_with(bc), False)
+
+    def test_truthy_non_true_return_is_false(self):
+        # Guards against a `bool(ok)` / `if ok:` regression — an unconfigured
+        # MagicMock is truthy, which is precisely what kept this suite green
+        # while the gate was fail-open.
+        for truthy in (mock.MagicMock(name="mock"), 1, "voiced", ["x"]):
+            with self.subTest(truthy=truthy):
+                bc = mock.MagicMock()
+                bc._speak.return_value = truthy
+                self.assertIs(self._speak_with(bc), False)
+
+    def test_exception_returns_false(self):
+        bc = mock.MagicMock()
+        bc._speak.side_effect = RuntimeError("tts boom")
+        self.assertIs(self._speak_with(bc), False)
+
+    def test_no_companion_prints_but_still_returns_false(self):
+        # The console fallback keeps the line visible in headless contexts,
+        # but a print is NOT a readback the owner heard — a send gate must
+        # treat it as a refusal.
         with mock.patch.object(gate, "_import_companion", return_value=None), \
                 mock.patch("builtins.print") as mprint:
-            gate._speak("fallback line")
+            out = gate._speak("fallback line")
+        self.assertIs(out, False)
         self.assertTrue(
             any("fallback line" in str(c) for c in mprint.call_args_list))
 
-    def test_falls_back_to_print_when_speak_missing(self):
+    def test_speak_missing_prints_but_still_returns_false(self):
         bc = mock.MagicMock()
-        bc._speak = None        # not callable → fallback path
+        bc._speak = None        # not callable → console fallback path
         with mock.patch.object(gate, "_import_companion", return_value=bc), \
                 mock.patch("builtins.print") as mprint:
-            gate._speak("no speaker")
+            out = gate._speak("no speaker")
+        self.assertIs(out, False)
         self.assertTrue(
             any("no speaker" in str(c) for c in mprint.call_args_list))
-
-    def test_speak_exception_falls_back_to_print(self):
-        bc = mock.MagicMock()
-        bc._speak.side_effect = RuntimeError("tts boom")
-        with mock.patch.object(gate, "_import_companion", return_value=bc), \
-                mock.patch("builtins.print") as mprint:
-            gate._speak("after error")
-        self.assertTrue(
-            any("after error" in str(c) for c in mprint.call_args_list))
 
 
 class GetPendingVipRoutingTests(unittest.TestCase):

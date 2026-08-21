@@ -3320,7 +3320,23 @@ def _dispatch_tray_command(cmd: str, entry: dict) -> None:
         # any LLM call, so it works while the brain is face-down.
         print(f"  [tray] {cmd} — running the hardened teardown (no LLM involved)")
         try:
-            from core.actions import _act_restart, _act_shutdown_jarvis
+            # Call the MODULE-LEVEL names, not a function-local
+            # `from core.actions import _act_restart, _act_shutdown_jarvis`.
+            # Both are already bound here by the `from core.actions import *`
+            # at the top of this file (they are listed in core.actions.__all__,
+            # so the leading underscore does NOT exclude them), so the local
+            # import bought nothing — but it SHADOWED the module global, which
+            # meant the tray route and the ACTIONS-dict route ("restart":
+            # _act_restart, below) resolved to two different lookups. Anything
+            # applied at module level — a monkeypatch, a test's
+            # mock.patch.object(bc, "_act_restart") — bound the ACTIONS route
+            # and was silently bypassed here. That is not cosmetic: with the
+            # local import in place, tests/monolith/test_monolith_sec1.py's
+            # TrayDispatchTests.test_restart_command_calls_act_restart ran the
+            # REAL _act_restart, which spawns a second bobert_companion.py
+            # process and hard-exits the caller (proven live 2026-08-20: the
+            # baseline run logged "[restart] successor spawned"). Resolving
+            # through the global keeps one lookup for one command.
             if cmd == "restart":
                 _act_restart("")
             else:
@@ -3353,11 +3369,14 @@ def _dispatch_tray_command(cmd: str, entry: dict) -> None:
             pass
         _launch_hud()
         print("  [tray] open_hud — re-launched HUD subprocess")
-    elif cmd == "restart":
-        print("  [tray] restart — relaunching JARVIS")
-        try: _act_restart()
-        except Exception as e:
-            print(f"  [tray] restart action failed: {e}")
+    # NOTE (2026-08-20): a second `elif cmd == "restart":` branch used to sit
+    # here — the ORIGINAL tray-restart handler. v2.0.64 added the
+    # LLM-independent `elif cmd in ("restart", "shutdown")` branch ABOVE
+    # without deleting it, so this copy became unreachable dead code (the
+    # earlier elif in the same chain always wins) while still LOOKING like the
+    # tray-restart implementation. Classic stale duplicate: the live branch was
+    # hardened and this one rotted. Removed — the branch above is the only
+    # tray-restart path.
     elif cmd == "trigger_overnight":
         print("  [tray] trigger_overnight — starting overnight engine")
         try: _act_start_overnight_upgrade()
@@ -6017,9 +6036,22 @@ def list_speakers():
                   f"{int(d['default_samplerate'])} Hz){marker}")
 
 
-# Device auto-switching state
+# Device auto-switching state.
+#
+# "in"/"out" are the SELECTED indices and None means "no explicit preference —
+# let sounddevice resolve the CURRENT system default at open time". That None
+# is the whole follow-the-default contract (see _refresh_devices): it must NOT
+# be replaced with a resolved default index, or JARVIS pins itself to today's
+# default and stops following the owner's Stream Deck.
+#
+# "last_in_*"/"last_out_*" are TRACKING state for the change detector only —
+# never used to open anything. Both the index AND the name are stored because
+# MME truncates device descriptions to 31 characters, so two distinct endpoints
+# routinely enumerate under an identical name and a name-only compare misses a
+# real 4 → 3 switch entirely (defect D1, 2026-08-20).
 _device_cache = {"in": None, "out": None, "checked_at": 0.0,
                  "last_in_name": None, "last_out_name": None,
+                 "last_in_index": None, "last_out_index": None,
                  "last_devices_signature": None,
                  "last_reenum_at": 0.0}
 
@@ -6038,6 +6070,9 @@ DEVICE_REENUM_INTERVAL = 300.0
 # can't both be tearing PortAudio down at the same time, and so the wake-word
 # pause/resume bracket around sd._terminate() isn't racing with concurrent
 # sd.query_devices() calls coming from a peer refresh.
+# LOCK DISCIPLINE (2026-08-14): when both are needed the order is ALWAYS
+# _device_refresh_lock -> _mic_lock (the _pa_gate teardown-gate lock), never
+# the reverse — see the matching note at _mic_lock's definition.
 _device_refresh_lock = threading.Lock()
 
 
@@ -6069,21 +6104,94 @@ def _devices_signature():
         return None
 
 
+# Speakable aliases for the endpoints the owner actually switches between from
+# his Stream Deck. The generic parse below is technically correct but produces
+# unspeakable strings for exactly these ('CORSAIR VOID ELITE Wireless Gaming
+# Dongle'), and the follow-the-default announcement reads the result OUT LOUD
+# ("Switched to <this>, sir."). Matched case-insensitively as a substring of the
+# RAW description, so an MME-truncated variant still hits. Deliberately narrow:
+# anything not listed here keeps the generic parse untouched (a broad 'speakers'
+# entry would swallow 'Speakers (Realtek)' → 'Realtek', which callers like the
+# boot sequence and suit_up rely on).
+_FRIENDLY_DEVICE_ALIASES = (
+    ("corsair",    "your headset"),
+    ("void elite", "your headset"),
+    ("snowball",   "the Blue Snowball"),
+)
+
+# Endpoint descriptions that carry NO brand at all once parsed. Spoken bare they
+# read like a proper noun ("Switched to Speakers, sir"), so they get possessed.
+_GENERIC_ENDPOINT_NAMES = {"speakers", "speaker", "headphones", "headset",
+                           "microphone", "output", "input"}
+
+
+def _parens_balanced(s: str) -> bool:
+    """True when every ')' in `s` closes an earlier '(' and none are left open.
+    Used by _friendly_device_name to tell a NESTED parenthetical
+    ('Realtek(R) Audio' — keep whole) from two SIBLING ones
+    ('2- USB) (Realtek' — the greedy span spilled across both)."""
+    depth = 0
+    for ch in s:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
+
+
 def _friendly_device_name(raw: str) -> str:
     """Speakable short name for a sounddevice description, e.g.
     'Microphone (USB Mic), MME' → 'USB Mic';
     'Headset Microphone (Gaming Headset), Windows DirectSound' → 'Gaming Headset';
-    'Speakers (Realtek)' → 'Realtek'."""
+    'Speakers (Realtek)' → 'Realtek';
+    'Headset Microphone (CORSAIR VOID ELITE …)' → 'your headset' (alias table);
+    'Speakers (2- USB Audio Device)' → 'USB Audio Device' (MME index prefix);
+    'Speakers (DualSense Wireless Co' → 'DualSense Wireless Co' (MME cuts the
+    description at 31 chars, closing paren included)."""
     if not raw:
         return ""
-    name = raw.split(",")[0].strip()
-    m = re.search(r"\(([^)]+)\)", name)
+    low = raw.lower()
+    for needle, alias in _FRIENDLY_DEVICE_ALIASES:
+        if needle in low:
+            return alias
+    first = raw.split(",")[0].strip()
+    # Trademark markers are noise the TTS reads out ("Realtek R Audio").
+    name = re.sub(r"\((?:R|TM|C)\)", "", first, flags=re.I).strip()
+    # Prefer the OUTERMOST parenthetical so a nested marker doesn't truncate the
+    # brand: 'Speakers (Realtek(R) Audio)' must not become 'Realtek(R'. Falls
+    # back to the first group when the greedy span isn't properly nested (two
+    # sibling parentheticals, e.g. 'Microphone (2- USB) (Realtek)').
+    m = re.search(r"\((.+)\)", name)
+    if m and not _parens_balanced(m.group(1)):
+        m = re.search(r"\(([^)]+)\)", name)
     if m:
-        return m.group(1).strip()
-    for prefix in ("Headset Microphone ", "External Microphone ",
-                   "Microphone ", "Headphones ", "Speakers "):
-        if name.startswith(prefix):
-            return name[len(prefix):].strip() or name
+        inner = m.group(1).strip()
+    elif "(" in name and ")" not in name:
+        # MME truncates at 31 characters, which routinely amputates the closing
+        # paren ('Speakers (DualSense Wireless Co'). Take what survives.
+        inner = name.split("(", 1)[1].strip()
+    else:
+        inner = ""
+    if inner:
+        name = inner
+    else:
+        for prefix in ("Headset Microphone ", "External Microphone ",
+                       "Microphone ", "Headphones ", "Speakers "):
+            if name.startswith(prefix):
+                name = name[len(prefix):].strip() or name
+                break
+    # Windows/MME disambiguates duplicate endpoints with a '2- ' index prefix;
+    # spoken, that becomes "two dash USB Audio Device".
+    name = re.sub(r"^\d+-\s*", "", name).strip()
+    name = name.strip(" ()").strip()
+    if not name:
+        # Nothing but punctuation survived ('Microphone ()') — fall back to the
+        # endpoint's leading word, which the generic map below can possess.
+        name = re.split(r"[\s(]+", first)[0].strip() or first
+    if name.lower() in _GENERIC_ENDPOINT_NAMES:
+        return f"your {name.lower()}"
     return name
 
 
@@ -6478,6 +6586,87 @@ def _pick_device(preferred_names: list[str], want_input: bool) -> tuple[int | No
     return None, ""
 
 
+def _default_device_identity(want_input: bool) -> tuple[int | None, str]:
+    """(index, name) of the endpoint Windows CURRENTLY calls the default input
+    (want_input=True) or output — for CHANGE DETECTION and ANNOUNCEMENT WORDING
+    ONLY.
+
+    FOLLOW-THE-DEFAULT contract (2026-08-20): the owner selects his mic and
+    speakers from a Stream Deck, which moves the WINDOWS DEFAULT. JARVIS follows
+    it by leaving _device_cache["in"]/["out"] as None so every stream open
+    re-resolves the default afresh. This lookup exists purely so the refresh
+    loop can SEE that the default moved and NAME it out loud — its result must
+    NEVER be written into _device_cache["in"]/["out"], because pinning the
+    resolved index is exactly how JARVIS would stop following the next switch.
+
+    Total by construction: sd.default.device may be a 2-tuple, None, or a
+    non-subscriptable stub, and PortAudio reports 'no default' as -1. Every one
+    of those maps to (None, "") so this can never raise into the device loop."""
+    try:
+        dflt = sd.default.device
+        idx = dflt[0 if want_input else 1] if dflt else None
+    except Exception:
+        return None, ""
+    if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0:
+        return None, ""
+    try:
+        info = sd.query_devices(idx)
+        name = info.get("name", "") if isinstance(info, dict) else ""
+    except Exception:
+        name = ""
+    return idx, (name or "")
+
+
+def _device_name_present(name: str) -> bool | None:
+    """Is `name` still in PortAudio's enumeration?
+
+    True / False when the device list can be read, None when it can't (or is
+    empty) — 'unknown', which callers must NOT treat as a loss. Used by
+    _announce_device_change to tell a deliberate switch (previous endpoint still
+    there, the owner just moved the default) from a genuine disappearance (the
+    headset powered off). Read-only: no reinit, no stream open."""
+    if not name:
+        return None
+    try:
+        names = [d.get("name", "") for d in sd.query_devices()]
+    except Exception:
+        return None
+    if not names:
+        return None
+    return name in names
+
+
+def _announce_device_change(prev_name: str, new_name: str,
+                            want_input: bool) -> None:
+    """Speak an audio-device switch.
+
+    NEUTRAL BY DEFAULT (2026-08-20). The owner drives his mic and speakers from
+    a Stream Deck, so a change is normally DELIBERATE — narrating it as a fault
+    ("your headset appears to have dropped off") was wrong on both directions of
+    every intentional switch. The historical loss wording is kept for the one
+    case that really is a loss: the previous endpoint is GONE from PortAudio's
+    enumeration. That is decided from the DEVICE LIST, never from the name — a
+    headset-shaped name is not evidence that the headset died, and 'unknown'
+    (list unreadable) deliberately falls to the neutral line."""
+    new_friendly = (_friendly_device_name(new_name)
+                    or ("the fallback mic" if want_input
+                        else "the default speakers"))
+    if _device_name_present(prev_name) is False:
+        prev_lower = (prev_name or "").lower()
+        if "headset" in prev_lower or "headphone" in prev_lower:
+            msg = (f"Switched to {new_friendly}, sir — "
+                   f"your headset appears to have dropped off.")
+        else:
+            old_friendly = (_friendly_device_name(prev_name)
+                            or ("the previous mic" if want_input
+                                else "the previous speakers"))
+            msg = (f"Switched to {new_friendly}, sir — "
+                   f"{old_friendly} appears to have disconnected.")
+    else:
+        msg = f"Switched to {new_friendly}, sir."
+    _enqueue_device_announcement(msg)
+
+
 def _refresh_devices(force: bool = False):
     """Re-check preferred devices if enough time has passed.
     Logs a message when the active device changes.
@@ -6489,12 +6678,19 @@ def _refresh_devices(force: bool = False):
     teardown frees backing state out from under live callbacks (0xc0000374
     heap corruption — see crash-fix-1 in jarvis_todo.md).
 
-    Two mitigations together make it safe:
+    Three mitigations together make it safe:
       • _device_refresh_lock serializes concurrent refresh attempts and
         protects the critical section from peer sd.query_devices() callers.
       • The persistent wake-word InputStream is paused before re-init and
-        resumed after. The short-lived barge-in stream is scoped to TTS
-        playback and we don't refresh during that window in practice."""
+        resumed after.
+      • The _pa_gate TEARDOWN GATE (2026-08-14): the destructive reinit may
+        start only by atomically — under _mic_lock — verifying that NO stream
+        owner flag is set AND latching _pa_reinit_active in the same step.
+        Owners claim their flags under the same lock only while the latch is
+        clear (_pa_claim_owner, bounded wait). Claim-before-open plus
+        close-before-release make a reinit under a live/opening/closing
+        guarded stream structurally impossible; the old one-shot flag
+        snapshot could race the long native teardown window."""
     now = time.time()
     if not force and (now - _device_cache["checked_at"] < DEVICE_CHECK_INTERVAL):
         return
@@ -6576,27 +6772,63 @@ def _refresh_devices(force: bool = False):
             # live inside record_speech (its InputStream open), tearing
             # PortAudio down here corrupts the heap (0xc0000374). The
             # wake-word pause does not cover record_speech, barge-in, or
-            # ambient streams. Guard on the record_speech ownership flag:
-            # when it holds the mic we SKIP the destructive reinit and just
-            # re-pick from the existing enumeration. The drift (mic plugged/
-            # unplugged) gets picked up on the next refresh once record_speech
-            # is briefly idle — which happens every utterance / 20s timeout.
-            if _record_speech_active[0] or _pathb_mic_active[0] or _ambient_stream_active[0]:
-                print("  [audio] device drift detected but a mic/audio stream is "
-                      "live (record_speech, get_mic_buffer Path B, or ambient "
-                      "listen) — deferring PortAudio reinit to avoid a mid-capture "
-                      "teardown (0xc0000374).")
-            elif _tts_playback_active[0]:
-                print("  [audio] device drift detected but TTS playback is "
-                      "live — deferring PortAudio reinit to avoid tearing down "
-                      "the barge-in stream (0xc0000374).")
-            elif _sig_unchanged:
-                # Cache invalidated but the device list is unchanged — the
-                # cheap _pick_device re-pick below runs over the EXISTING
-                # enumeration; no destructive reinit (and none of its
-                # 0xc0000374 risk) is needed or wanted here. 2026-07-21 audit.
-                pass
-            else:
+            # ambient streams.
+            #
+            # TEARDOWN GATE (2026-08-14): the owner check and the reinit latch
+            # are ONE atomic step under _mic_lock (_pa_gate). The old one-shot
+            # flag snapshot here ran BEFORE the natives, so an owner could
+            # claim AND open a stream inside the tens-to-hundreds-of-ms native
+            # window. Now _pa_claim_owner refuses (bounded wait) while the
+            # latch is up, so no claim — and therefore no open — can interleave
+            # into the native window. When any owner holds a stream we SKIP the
+            # destructive reinit and just re-pick from the existing
+            # enumeration; the drift gets picked up on the next refresh once
+            # the owners are briefly idle — which happens every utterance /
+            # 20s timeout. The natives themselves run OUTSIDE _mic_lock (only
+            # the latch protects them) so claimants time out instead of
+            # queueing behind a slow WASAPI teardown.
+            do_reinit = False
+            with _pa_gate:
+                if _pa_mic_capture_live():
+                    print("  [audio] device drift detected but a mic/audio stream is "
+                          "live (record_speech, get_mic_buffer Path B, ambient "
+                          "listen, or a diagnostic/enrolment capture) — "
+                          "deferring PortAudio reinit to avoid a mid-capture "
+                          "teardown (0xc0000374).")
+                elif _tts_playback_active[0]:
+                    print("  [audio] device drift detected but TTS playback is "
+                          "live — deferring PortAudio reinit to avoid tearing down "
+                          "the barge-in stream (0xc0000374).")
+                elif _pa_close_pending[0]:
+                    # H-6 (2026-08-20). A caller handed a native
+                    # Pa_CloseStream to a daemon, its bounded wait expired,
+                    # and it ABANDONED the daemon — so its owner flag is
+                    # already (correctly) down while PortAudio is still
+                    # executing the close. Tearing PortAudio down now is the
+                    # same 0xc0000374 heap corruption the owner flags exist to
+                    # prevent, reached through the one hole they cannot cover.
+                    # The count retires itself when the daemon returns, so a
+                    # merely-slow close costs one deferred pass; only a truly
+                    # wedged one defers indefinitely — and then deferring is
+                    # correct. The cheap _pick_device re-pick below still runs,
+                    # so already-enumerated devices keep switching.
+                    print("  [audio] device drift detected but an abandoned "
+                          "native close is still in flight — deferring "
+                          "PortAudio reinit (the daemon is still inside "
+                          "Pa_CloseStream; sd._terminate() there is "
+                          "0xc0000374).")
+                elif _sig_unchanged:
+                    # Cache invalidated but the device list is unchanged — the
+                    # cheap _pick_device re-pick below runs over the EXISTING
+                    # enumeration; no destructive reinit (and none of its
+                    # 0xc0000374 risk) is needed or wanted here, and this path
+                    # never latches the gate, so claimants never wait on a
+                    # re-pick. 2026-07-21 audit.
+                    pass
+                else:
+                    _pa_reinit_active[0] = True
+                    do_reinit = True
+            if do_reinit:
                 try:
                     sd._terminate()
                     sd._initialize()
@@ -6606,45 +6838,86 @@ def _refresh_devices(force: bool = False):
                     _device_cache["last_reenum_at"] = now
                 except Exception as e:
                     print(f"  [audio] PortAudio re-init failed: {e}")
+                finally:
+                    # ALWAYS drop the latch — a stuck latch would time out
+                    # every future claim (JARVIS deaf AND mute). notify_all so
+                    # bounded waiters re-check immediately instead of burning
+                    # their whole timeout.
+                    with _pa_gate:
+                        _pa_reinit_active[0] = False
+                        _pa_gate.notify_all()
 
             # Input
             if MICROPHONE_INDEX is not None:
                 in_idx = MICROPHONE_INDEX
                 try: in_name = sd.query_devices(in_idx)["name"]
                 except Exception: in_name = ""
+                in_track = (in_idx, in_name)
             else:
                 in_idx, in_name = _pick_device(PREFERRED_INPUT_DEVICES, want_input=True)
+                # FOLLOW-THE-DEFAULT. No preference matched — which is the
+                # owner's NORMAL configuration (PREFERRED_INPUT_DEVICES is empty
+                # because his Stream Deck selects the mic by moving the Windows
+                # default, and a name-pinned list beat the default even when the
+                # pinned device was a powered-off headset that still enumerates
+                # and still passes check_input_settings — 90 minutes deaf,
+                # 2026-08-20). in_idx STAYS None on purpose so every open
+                # re-resolves the current default; the identity below is for
+                # detection/announcement only and is never cached as the index.
+                in_track = ((in_idx, in_name) if in_idx is not None
+                            else _default_device_identity(want_input=True))
 
             # Output
             if SPEAKER_INDEX is not None:
                 out_idx = SPEAKER_INDEX
                 try: out_name = sd.query_devices(out_idx)["name"]
                 except Exception: out_name = ""
+                out_track = (out_idx, out_name)
             else:
                 out_idx, out_name = _pick_device(PREFERRED_OUTPUT_DEVICES, want_input=False)
+                # Same contract for playback: out_idx stays None → the default
+                # speakers follow the Stream Deck too.
+                out_track = ((out_idx, out_name) if out_idx is not None
+                             else _default_device_identity(want_input=False))
 
-            # Log changes — and on a genuine mid-session mic switch (i.e. the name
-            # changed away from a previous non-None value), enqueue a spoken alert so
-            # JARVIS doesn't silently fall back to a worse mic. Initial detection at
-            # startup (None → first name) is suppressed so we don't announce on boot.
-            if in_name and in_name != _device_cache["last_in_name"]:
-                print(f"  [audio] mic → [{in_idx}] {in_name}")
-                prev_in = _device_cache["last_in_name"]
-                if prev_in:
-                    new_friendly = _friendly_device_name(in_name) or "the fallback mic"
-                    prev_lower   = prev_in.lower()
-                    if "headset" in prev_lower or "headphone" in prev_lower:
-                        msg = (f"Switched to {new_friendly}, sir — "
-                               f"your headset appears to have dropped off.")
-                    else:
-                        old_friendly = _friendly_device_name(prev_in) or "the previous mic"
-                        msg = (f"Switched to {new_friendly}, sir — "
-                               f"{old_friendly} appears to have disconnected.")
-                    _enqueue_device_announcement(msg)
-                _device_cache["last_in_name"] = in_name
-            if out_name and out_name != _device_cache["last_out_name"]:
-                print(f"  [audio] speakers → [{out_idx}] {out_name}")
-                _device_cache["last_out_name"] = out_name
+            # Log + announce changes, for BOTH directions.
+            #
+            # The guard compares (INDEX, NAME) — name alone missed a real switch
+            # between two endpoints sharing an MME-truncated name (D1), and in
+            # the follow-the-default configuration the picked name is "" on
+            # every pass, which suppressed the log AND the announcement outright
+            # (D2). Boot (None → first device) is logged but never spoken.
+            # Wording is chosen inside _announce_device_change: neutral for a
+            # deliberate switch, loss phrasing only when the previous endpoint
+            # has actually vanished from the device list.
+            #
+            # One Stream Deck press usually moves BOTH defaults (the headset is
+            # mic AND speakers), so both branches enqueue — deliberately. The
+            # two lines are IDENTICAL text in that case, and _speak_pending's
+            # seen_in_batch / _speech_was_recently_spoken dedupe collapses them
+            # to one spoken sentence; when the endpoints differ the owner gets
+            # both, which is the information he asked for. Do NOT "fix" this by
+            # announcing only one direction.
+            for _kind, (_track_idx, _track_name) in (("in", in_track),
+                                                     ("out", out_track)):
+                if not _track_name:
+                    continue   # nothing identifiable to track, log, or say
+                # .get(), not [] — a KeyError here would escape _refresh_devices
+                # (the enclosing try has only a finally) and take down every
+                # get_input_device() caller, i.e. the main loop. The tracking
+                # keys are new in 2026-08-20, so an older cache dict handed in
+                # by a caller/test may not carry them.
+                _prev_name = _device_cache.get(f"last_{_kind}_name")
+                _prev_idx  = _device_cache.get(f"last_{_kind}_index")
+                if _track_name == _prev_name and _track_idx == _prev_idx:
+                    continue
+                _label = "mic" if _kind == "in" else "speakers"
+                print(f"  [audio] {_label} → [{_track_idx}] {_track_name}")
+                if _prev_name:
+                    _announce_device_change(_prev_name, _track_name,
+                                            want_input=(_kind == "in"))
+                _device_cache[f"last_{_kind}_name"]  = _track_name
+                _device_cache[f"last_{_kind}_index"] = _track_idx
 
             _device_cache["in"]         = in_idx
             _device_cache["out"]        = out_idx
@@ -7281,9 +7554,11 @@ def _safe_close_stream(stream, timeout_sec: float = 2.0) -> None:
     (faulthandler caught it across multiple PIDs on 2026-05-29). The pattern
     here mirrors the previous barge_stream fix: stop synchronously, then
     close on a daemon thread guarded by `timeout_sec`. If native close hangs
-    we force `sd.stop()` and let the daemon die with the process. Use this
-    in place of `with sd.InputStream(...)` so context-manager exits — which
-    were the unprotected path — never crash the interpreter."""
+    we ABANDON the daemon (it dies with the process) — see the H-3 note at
+    the bottom of this function for why there is no sd.stop() "recovery".
+    Use this in place of `with sd.InputStream(...)` so context-manager
+    exits — which were the unprotected path — never crash the
+    interpreter."""
     if stream is None:
         return
     try:
@@ -7297,16 +7572,45 @@ def _safe_close_stream(stream, timeout_sec: float = 2.0) -> None:
         except Exception:
             logging.exception("[audio] stream.close raised — swallowing")
         finally:
+            # H-6: retire the in-flight-close registration BEFORE waking the
+            # caller, so a caller whose bounded wait SUCCEEDS never leaves a
+            # phantom count behind. On the abandon path this runs late (or
+            # never, if PortAudio truly wedged) — which is the whole point.
+            _pa_close_done()
             done.set()
     t = threading.Thread(target=_do_close, daemon=True)
-    t.start()
+    # H-6 (2026-08-20): the wait below is bounded and we ABANDON the daemon on
+    # timeout — while it is still inside Pa_CloseStream. Register the close so
+    # _refresh_devices defers its destructive sd._terminate() until this native
+    # call actually returns. This single edit covers BOTH abandon sites that
+    # route here: record_speech's stream teardown and play_with_lipsync's
+    # barge_stream teardown.
+    _pa_close_handoff(t)
     if not done.wait(timeout=timeout_sec):
-        logging.warning("[audio] stream.close hung >%.1fs — forcing sd.stop()",
-                        timeout_sec)
-        try:
-            sd.stop()
-        except Exception:
-            pass
+        # H-3 (2026-08-20): DO NOT call sd.stop() here. It is not a recovery —
+        # it is a cross-close. Module-level sd.stop() (sounddevice 0.5.5,
+        # sounddevice.py:406-418) ignores the stream you are holding and
+        # instead stops+closes whatever `_last_callback` points at, and
+        # `_last_callback` is published in exactly ONE place —
+        # _CallbackContext.start_stream, reached only from
+        # sd.play()/sd.rec()/sd.playrec(). Every stream that reaches this
+        # helper is an explicitly constructed InputStream, so sd.stop() could
+        # never free THIS handle; what it could do is stop+close the live TTS
+        # play stream that play_with_lipsync's single-toucher reaper owns —
+        # two threads inside Pa_CloseStream on one WASAPI stream, which is the
+        # 0xc0000374 heap corruption the reaper contract at _reap_playback was
+        # written to eliminate. It fired benignly three times in the session
+        # logs (most recently 2026-08-20 03:34:47) only because no sd.play()
+        # happened to be live. Abandoning is the honest outcome: the daemon
+        # keeps the close registered via _pa_close_pending, so _refresh_devices
+        # defers its destructive sd._terminate() until PortAudio really returns.
+        logging.warning(
+            "[audio] stream.close hung >%.1fs — abandoning the close daemon "
+            "(it dies with the process; the in-flight close stays registered "
+            "with the teardown gate). sd.stop() is deliberately NOT called: it "
+            "only acts on the last sd.play()/sd.rec() stream, so it cannot "
+            "free this handle and would instead close a live TTS playback "
+            "stream (double Pa_CloseStream -> 0xc0000374).", timeout_sec)
 
 
 # ── Live taps on record_speech's mic stream ───────────────────────────────
@@ -7329,7 +7633,8 @@ _record_speech_sr     = [SAMPLE_RATE]    # sample rate of the live stream
 # True back to False while its stream was live, re-opening the ~70s WASAPI stall +
 # 0xc0000374 reinit-under-live-callback window the flag exists to close. Each owner
 # now writes ONLY its own flag; _refresh_devices defers its destructive PortAudio
-# reinit while EITHER is set.
+# reinit while ANY owner cell is set (checked atomically with the reinit latch
+# under _mic_lock — see the _pa_gate teardown gate below, 2026-08-14).
 _pathb_mic_active     = [False]
 # REFCOUNT of live dedicated InputStreams held by skills/ambient_listen — its
 # WASAPI system-audio loopback stream and/or its mic-fallback stream. Those daemons
@@ -7339,10 +7644,185 @@ _pathb_mic_active     = [False]
 # It is a COUNT, not a boolean: the mic worker and the loopback worker are separate
 # skills that can run CONCURRENTLY, so a shared boolean let whichever exited first
 # clear the guard while the other's stream was still live (bug-hunt 2026-07-08).
-# ambient_listen increments on each stream open and decrements on close (under
-# _mic_lock); _refresh_devices defers its destructive reinit while the count is > 0.
+# ambient_listen increments on each stream open and decrements on close (via
+# _pa_claim_owner/_pa_release_owner when the host exposes them, falling back to
+# a plain _mic_lock-guarded ++/--); _refresh_devices defers its destructive
+# reinit while the count is > 0.
 _ambient_stream_active = [0]
-_mic_lock = threading.Lock()             # serialises Path-B mic-ownership flag writes
+# REFCOUNT of live sd.rec() probe captures held by skills/self_diagnostic's
+# microphone probe (sweeps could overlap, hence a count like the ambient cell).
+# The probe daemon's ~0.25s captures set NONE of the flags above, so before the
+# teardown gate _refresh_devices could reinit PortAudio under a live sd.rec
+# callback (0xc0000374). Claimed via _pa_claim_owner(refcount=True); released
+# in a finally after the last capture. 2026-08-14.
+_diag_capture_active = [0]
+# True while skills/enroll_voice's local FALLBACK capture (its sd.rec or its
+# InputStream twin) is live. Enrolment runs on the main voice thread only, so
+# a plain boolean cell suffices. 2026-08-14.
+_enroll_capture_active = [False]
+# COUNT of native Pa_CloseStream calls that have been handed to an ABANDONABLE
+# daemon thread (H-6, 2026-08-20). _safe_close_stream and play_with_lipsync
+# both hand the native close to a daemon and then park on a BOUNDED wait; when
+# that wait expires they ABANDON the daemon ("it dies with the process") and
+# run their own finally, which drops their owner flag. But a caller timeout is
+# POSITIVE EVIDENCE that the daemon is STILL INSIDE PortAudio's stop/close —
+# so dropping the owner flag there told _refresh_devices "nobody owns a
+# stream" and re-opened the exact sd._terminate()-during-a-live-native-call
+# window (0xc0000374 heap corruption) the teardown gate was built to close.
+#
+# The owner flags themselves must keep telling the TRUTH — the barge-in gate,
+# ambient listen, the face tracker, the dossier and the self-diagnostic probe
+# all read them and would stall forever on a lie — so the in-flight native
+# close gets its OWN cell instead of pinning somebody else's flag up.
+#
+# A COUNT, not a boolean: barge_stream, the play stream and record_speech's
+# stream can each be abandoned independently and concurrently.
+#
+# INCREMENTED BY THE CALLER (_pa_close_handoff) while its own owner flag is
+# STILL SET — the latch is provably clear at that moment (the caller's own
+# flag is what keeps it clear), so the bump needs no _pa_claim_owner wait and
+# can never fail. DECREMENTED BY THE DAEMON (_pa_close_done) in the finally
+# that follows its native close, BEFORE it signals the caller's event.
+# Consequence worth knowing: a daemon that merely finishes LATE releases the
+# deferral by itself; only a daemon that never returns from PortAudio holds it
+# for the life of the process — and in that case deferring is CORRECT, not
+# merely conservative, because the native call really is still running.
+#
+# Deferral scope: this cell gates ONLY the destructive
+# sd._terminate()/sd._initialize() pass. It deliberately does NOT deny
+# _pa_claim_owner — opening a NEW stream while some other stream's close is
+# wedged is exactly what the mic/TTS flags already allow — and it does NOT
+# skip _refresh_devices' cheap _pick_device re-pick over the existing
+# enumeration, so switching between ALREADY-ENUMERATED devices keeps working.
+# What is lost while it is held: discovery of a device that was not in the
+# last enumeration (true hotplug). See the deny chain in _refresh_devices.
+#
+# Read by _pa_streams_live + _refresh_devices' deny chain; MIRRORED in
+# skills/self_diagnostic._mic_owned and registered from
+# core/wake_word._safe_close_stream (stale-duplicate rule — all three).
+_pa_close_pending = [0]
+# Serialises every owner-flag write above AND the reinit latch below into ONE
+# atomic domain (the _pa_gate Condition is built on this same lock).
+# LOCK DISCIPLINE (deadlock rule, 2026-08-14): the only permitted order is
+# _device_refresh_lock -> _mic_lock, never the reverse — so NEVER call
+# _refresh_devices / get_input_device / get_output_device while holding
+# _mic_lock, and never hold _mic_lock across native PortAudio calls or slow
+# work. Flag/latch transitions only.
+_mic_lock = threading.Lock()             # serialises mic-ownership flag + reinit-latch writes
+# TEARDOWN GATE (2026-08-14, portaudio-teardown-race). True ONLY while
+# _refresh_devices is inside its destructive sd._terminate()/sd._initialize()
+# pass. Set atomically (under _mic_lock, via _pa_gate) after verifying that
+# ZERO stream owners are live; owners claim their flags under the same lock
+# only while this latch is clear (_pa_claim_owner, bounded wait). Because every
+# stream open follows its claim and every release follows its close, an open
+# stream implies a set flag implies the latch can never be taken — a reinit
+# under a live/opening/closing guarded stream is structurally impossible. The
+# old one-shot flag snapshot at the top of the reinit chain could race the
+# tens-to-hundreds-of-ms native window (0xc0000374 heap corruption).
+_pa_reinit_active = [False]
+_pa_gate = threading.Condition(_mic_lock)
+
+
+def _pa_mic_capture_live() -> bool:
+    """True while any MIC-side capture owner holds (or is opening/closing) a
+    stream. Caller MUST hold _mic_lock (_pa_gate). Sub-check of
+    _pa_streams_live so the owner list exists in exactly ONE place."""
+    return bool(_record_speech_active[0] or _pathb_mic_active[0]
+                or _ambient_stream_active[0] or _diag_capture_active[0]
+                or _enroll_capture_active[0])
+
+
+def _pa_streams_live() -> bool:
+    """THE canonical PortAudio owner check: True while ANY guarded stream owner
+    is live (mic-side captures + TTS playback/barge-in) OR while an abandoned
+    native Pa_CloseStream is still in flight (_pa_close_pending, H-6). Caller
+    MUST hold _mic_lock. skills/self_diagnostic._mic_owned mirrors this list
+    (minus the probe's own _diag_capture_active cell) — update BOTH together.
+
+    VERIFIED 2026-08-20: this helper has NO callers — _refresh_devices spells
+    the same checks out inline so each can print its own reason, and THAT is
+    the site that actually gates the reinit. Keep this function as the single
+    written-down definition of the owner list, but understand that adding a
+    cell here alone changes nothing: it must also go into _refresh_devices'
+    deny chain below."""
+    return (_pa_mic_capture_live() or bool(_tts_playback_active[0])
+            or bool(_pa_close_pending[0]))
+
+
+def _pa_claim_owner(cell, *, refcount: bool = False, timeout: float = 1.0,
+                    deny_if=None) -> bool:
+    """Atomically claim a PortAudio owner cell, honouring the reinit latch.
+
+    Waits (BOUNDED — house rule: no unbounded waits) while _refresh_devices'
+    destructive sd._terminate()/_initialize() pass is in flight, then sets the
+    cell under _mic_lock (booleans -> True; refcounts -> +1). Returns False
+    WITHOUT claiming when the latch stays up past ``timeout`` (the caller must
+    skip this capture/playback cycle) or when ``deny_if()`` — evaluated under
+    the lock — vetoes the claim. Every successful claim MUST be paired with
+    exactly one _pa_release_owner at the same call depth, and the release must
+    run only AFTER the owned stream's native close (close-then-release)."""
+    deadline = time.monotonic() + timeout
+    with _pa_gate:
+        while _pa_reinit_active[0]:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                return False
+            _pa_gate.wait(rem)
+        if deny_if is not None and deny_if():
+            return False
+        cell[0] = (int(cell[0]) + 1) if refcount else True
+        return True
+
+
+def _pa_release_owner(cell, *, refcount: bool = False) -> None:
+    """Release a cell claimed via _pa_claim_owner (booleans -> False;
+    refcounts -> -1, floored at 0). Call ONLY after the owned stream's native
+    teardown has completed — the flag must cover the stream's whole native
+    lifetime or the gate can latch mid-close (0xc0000374)."""
+    with _mic_lock:
+        cell[0] = max(0, int(cell[0]) - 1) if refcount else False
+
+
+def _pa_close_handoff(t: "threading.Thread") -> None:
+    """Register an ABANDONABLE native Pa_CloseStream and start the daemon that
+    performs it (H-6, 2026-08-20).
+
+    The caller is about to hand ``t`` a live PortAudio stream and then park on
+    a BOUNDED wait it is allowed to give up on. Bump _pa_close_pending FIRST,
+    while the caller's own owner flag is still set: the reinit latch is
+    provably clear at that instant (the caller's flag is what keeps it clear),
+    so this needs no _pa_claim_owner wait and cannot fail. The daemon retires
+    the count via _pa_close_done in the finally after its native close.
+
+    If the thread cannot even be STARTED (``RuntimeError: can't start new
+    thread`` — the same thread exhaustion _speak's belt-and-braces flag clear
+    already guards against) the count is retired again before re-raising:
+    otherwise a hand-off that never happened would defer hotplug for the life
+    of the process.
+
+    ONE definition, three call sites (_safe_close_stream and
+    play_with_lipsync's two tts-reaper branches) plus the
+    core/wake_word._safe_close_stream twin — do not inline copies."""
+    with _mic_lock:
+        _pa_close_pending[0] = int(_pa_close_pending[0]) + 1
+    try:
+        t.start()
+    except BaseException:
+        _pa_close_done()
+        raise
+
+
+def _pa_close_done() -> None:
+    """Retire ONE in-flight native close. Called by the abandonable daemon in
+    the finally that follows its Pa_CloseStream — BEFORE it sets the caller's
+    done-event, so a caller whose bounded wait SUCCEEDS never leaves a phantom
+    count behind. Floored at 0 so a stray call (a test driving the daemon body
+    directly, a future double-retire) can never drive the gate negative and
+    silently turn the deferral into a permanent PASS."""
+    with _mic_lock:
+        _pa_close_pending[0] = max(0, int(_pa_close_pending[0]) - 1)
+
+
 _record_speech_taps: "list[queue.Queue]" = []
 _record_speech_taps_lock = threading.Lock()
 
@@ -7435,17 +7915,20 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
     # window in which our own stream is live.
     _in_dev = get_input_device()
     # TOCTOU fix (0xc0000374): publish mic ownership BEFORE the InputStream is
-    # opened+started, not after. _refresh_devices() only skips the destructive
-    # sd._terminate()/_initialize() reinit while _record_speech_active is True;
-    # if we set the flag *after* start() (as before), a concurrent background
-    # caller (self_diagnostic / ambient_listen → get_input_device) could fire
-    # the reinit in the ~ms gap between our stream going live and the flag
-    # flipping, tearing PortAudio out from under the just-started callback and
-    # heap-corrupting the process. Setting it first closes that window. Any
-    # open/start failure below clears it again before returning so the flag is
-    # never left stuck True on a stream we don't actually hold.
+    # opened+started, not after — and claim it through the _pa_gate TEARDOWN
+    # GATE (2026-08-14), which atomically refuses the claim while
+    # _refresh_devices is inside its destructive sd._terminate()/_initialize()
+    # window. The old plain flag write closed the set-after-start gap but
+    # could itself land INSIDE an in-flight native teardown (the refresher's
+    # one-shot snapshot ran before the natives). A claim timeout (reinit hung
+    # >1s) skips this cycle: the main loop treats None as no-speech and
+    # re-loops. Any open/start failure below closes the stream and then clears
+    # the flag so it is never left stuck True on a stream we don't hold.
     _record_speech_sr[0] = SAMPLE_RATE
-    _record_speech_active[0] = True
+    if not _pa_claim_owner(_record_speech_active):
+        print("  [record_speech] PortAudio reinit in flight — "
+              "skipping this capture cycle")
+        return None
     # If get_mic_buffer Path B is mid-capture on this same device, we've just
     # signalled it to bail (Path B re-checks _record_speech_active every 0.2s and
     # breaks). Wait a BOUNDED moment for it to tear its temporary InputStream down
@@ -7483,15 +7966,18 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
         _record_stream.start()
     except Exception:
         # Open (incl. the system-default retry) or start() failed: we never
-        # got a live stream, so drop the ownership flag we optimistically set
-        # above before bailing, otherwise _refresh_devices would defer reinits
-        # forever against a stream that doesn't exist.
+        # got a RUNNING stream, so drop the ownership flag we claimed above
+        # before bailing, otherwise _refresh_devices would defer reinits
+        # forever against a stream that doesn't exist. Close FIRST, release
+        # SECOND (2026-08-14): a constructed-but-failed stream still holds
+        # native state, and the flag must cover its close too or a reinit can
+        # latch mid-teardown (same 0xc0000374 class as the main finally).
         logging.exception("[record_speech] InputStream open/start failed")
-        _record_speech_active[0] = False
         try:
             _safe_close_stream(_record_stream)
         except Exception:
             pass
+        _record_speech_active[0] = False
         return None
     record_start_ts = 0.0   # set when recording actually begins (VAD trip)
     try:  # pragma: no cover - live mic capture loop (blocks on real audio frames until utterance ends)
@@ -7632,10 +8118,25 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
                               f"(threshold {VAD_THRESHOLD})")
                     return None
     finally:
-        # Release mic ownership BEFORE closing the stream so any tap loop
-        # sees _record_speech_active flip false and stops waiting on us.
-        _record_speech_active[0] = False
+        # Close the stream BEFORE releasing mic ownership (2026-08-14): the
+        # flag must cover the stream's whole native lifetime, or a reinit that
+        # latches in the release→close gap runs Pa_Terminate while
+        # stream.stop()/close() are still executing — exactly the 0xc0000374
+        # class the _pa_gate teardown gate exists to kill. Tap consumers
+        # (get_mic_buffer Path A2, the ambient tap) are deadline-bounded, so
+        # the later flag drop costs them at most _safe_close_stream's 2s
+        # bound — degraded, never hung. Do NOT swap this back to
+        # release-then-close for tap latency.
+        #
+        # H-6 (2026-08-20) refines exactly ONE word of that claim: when
+        # _safe_close_stream's own bounded wait expires it ABANDONS its close
+        # daemon and returns, so the flag covers the native lifetime only up to
+        # the abandon. The remainder is covered by _pa_close_pending, which
+        # _safe_close_stream registers and the daemon retires. This flag itself
+        # must still drop here — the barge-in gate, ambient listen, the face
+        # tracker and the dossier read it and would stall forever on a lie.
         _safe_close_stream(_record_stream)
+        _record_speech_active[0] = False
 
     if _debug_mode[0]:
         print(f"  [vad] peak RMS={peak_rms:.4f}  threshold={VAD_THRESHOLD}  "
@@ -7801,19 +8302,23 @@ def get_mic_buffer(seconds: float,
     # True back to False while its InputStream was live — re-opening the exact
     # ~70s WASAPI-contention stall and 0xc0000374 window the flag exists to close.
     # record_speech owns _record_speech_active exclusively; Path B owns
-    # _pathb_mic_active exclusively; _refresh_devices defers on EITHER. Path B no
-    # longer touches _record_speech_active/_record_speech_sr at all, so it can
-    # never clobber record_speech's ownership.
-    with _mic_lock:
-        if _record_speech_active[0]:
-            # record_speech owns (or just grabbed) the mic. Path A2 above only
-            # taps it when the sample rates MATCH; when they differ we land here,
-            # and opening a SECOND InputStream on the same WASAPI device would
-            # re-introduce the ~70s double-open capture stall (HIGH, 2026-07-08).
-            # Yield the device: return None so the caller re-invokes and either
-            # taps (A2) or skips this cycle — never double-opens.
-            return None
-        _pathb_mic_active[0] = True
+    # _pathb_mic_active exclusively; _refresh_devices defers on ANY owner cell
+    # (atomically, via the _pa_gate teardown gate). Path B no longer touches
+    # _record_speech_active/_record_speech_sr at all, so it can never clobber
+    # record_speech's ownership.
+    #
+    # Claim through _pa_claim_owner (2026-08-14): the deny_if preserves the
+    # yield-to-record_speech rule — record_speech owns (or just grabbed) the
+    # mic; Path A2 above only taps it when the sample rates MATCH, and opening
+    # a SECOND InputStream on the same WASAPI device would re-introduce the
+    # ~70s double-open capture stall (HIGH, 2026-07-08). A False return also
+    # covers a destructive PortAudio reinit in flight (bounded wait timed
+    # out). Either way: return None so the caller re-invokes and either taps
+    # (A2) or skips this cycle — never double-opens, never opens into a
+    # native teardown.
+    if not _pa_claim_owner(_pathb_mic_active,
+                           deny_if=lambda: bool(_record_speech_active[0])):
+        return None
     try:
         # 2026-05-29 silent-crash fix: avoid `with sd.InputStream(...)`. Open the
         # stream explicitly and tear it down via _safe_close_stream so the close
@@ -7847,8 +8352,10 @@ def get_mic_buffer(seconds: float,
         finally:
             _safe_close_stream(stream)
     finally:
-        with _mic_lock:
-            _pathb_mic_active[0] = False
+        # The nested finally above closed the stream FIRST; release only after
+        # (close-then-release, 2026-08-14) so the flag covers the stream's
+        # whole native lifetime.
+        _pa_release_owner(_pathb_mic_active)
     if not chunks2:
         return None
     out2 = np.concatenate(chunks2).astype(np.float32, copy=False)
@@ -10663,7 +11170,8 @@ class _SentenceFlushBuffer:
                 if prev is not None:
                     prev.join(timeout=60)
                 # If the user BARGED IN (a wake-word hit cut the prior sentence
-                # via sd.stop(), which unblocks prev.join above), do NOT speak the
+                # via the tts-reaper's stream.abort(), which unblocks
+                # prev.join above), do NOT speak the
                 # next chained early sentence — honour the interrupt instead of
                 # blurting one more line the user talked over. Compare the
                 # monotonic accepted-barge counter to the snapshot taken at reply
@@ -11599,16 +12107,18 @@ _barge_in_interrupted = False
 # never waits out a long reply. This path is deliberately separate from the
 # legacy RMS listener above: it opens NO extra InputStream (the wake listener
 # already owns its own mic), so the 0xc0000374 PortAudio use-after-free that
-# killed the RMS path cannot recur here. sd.stop() is only ever called from
-# play_with_lipsync's sliced playback wait (_wait_done_or_barge) on the
-# caller's own thread — never from a PortAudio callback, never from the wake
-# listener's thread — mirroring the safe teardown contract documented on
-# _start_barge_in_listener().
+# killed the RMS path cannot recur here. ALL native calls on the play stream
+# (active/abort/stop/close) happen on the single tts-reaper daemon
+# (_reap_playback); sd.stop()/sd.wait() are NEVER called on this stream
+# (sd.stop hides a second Pa_CloseStream that raced sd.wait's finally-close —
+# the 0xc0000374 double-free, 2026-08 barge-in-stall fix). Never from a
+# PortAudio callback, never from the wake listener's thread, never from the
+# caller's thread.
 #
 # _tts_interrupt        — set by request_tts_interrupt(); polled every 50 ms
-#                         by the sliced playback wait in play_with_lipsync
-#                         (_wait_done_or_barge — worst-case abort latency well
-#                         under the 300 ms budget).
+#                         by the tts-reaper daemon (_reap_playback — worst-case
+#                         abort latency one 50 ms slice, well under the 300 ms
+#                         budget).
 # _tts_current_text     — single-element-list cell (the monolith's shared-
 #                         mutable idiom) holding the LOWERCASED text currently
 #                         in playback, published by _speak() right before
@@ -11693,11 +12203,11 @@ def request_tts_interrupt(source: str = "wake-word",
     name. Non-acoustic sources still require live playback — there must be
     something to actually stop. 2026-07-14 audit.
 
-    Only sets the event — the actual sd.stop() runs inside
-    play_with_lipsync's sliced playback wait (_wait_done_or_barge), on the
-    caller thread that already owns the utterance: a plain non-callback
-    thread, the documented safe context for stopping PortAudio streams in
-    this codebase."""
+    Only sets the event — the actual cut (stream.abort()) runs on the
+    tts-reaper daemon (_reap_playback), the ONE thread allowed to make
+    native calls on the play stream. The caller thread parks on a pure
+    Event wait and never enters PortAudio, so a wedged native teardown
+    can no longer stall the main loop (2026-08 barge-in-stall fix)."""
     if acoustic and not _barge_in_wake_enabled():
         return False
     if not _tts_playback_active[0]:
@@ -11735,7 +12245,9 @@ def _start_barge_in_listener():
     The callback ONLY sets `_barge_in_interrupted = True`; calling sd.stop()
     from inside a PortAudio callback frees the stream while the callback
     that triggered the free is still on the stack (use-after-free → 0xc0000374).
-    The actual sd.stop() lives in the watch thread inside play_with_lipsync.
+    The watch thread inside play_with_lipsync routes the flag into
+    _tts_interrupt so the tts-reaper daemon — the play stream's single
+    toucher — performs the actual cut (2026-08 barge-in-stall fix).
     Returns the stream so we can close it when playback finishes, or None
     on failure."""
     global _barge_in_interrupted
@@ -11970,6 +12482,82 @@ class _AudioDucker:
 _audio_ducker = _AudioDucker()
 
 
+def _reap_playback(stream, done_evt: threading.Event, audio_secs: float) -> None:
+    """Single-toucher playback reaper — the body of the "tts-reaper" daemon.
+
+    THE THREADING CONTRACT (2026-08 barge-in-stall fix): ALL native calls on
+    the play stream (active/abort/stop/close) happen on this ONE thread;
+    sd.stop()/sd.wait() are NEVER called on this stream. The old shape — a
+    caller-side sd.stop() cutting playback while a _safe_wait daemon sat in
+    sd.wait() — hid a second Pa_CloseStream inside sd.stop() that raced
+    sd.wait()'s finally-close: both threads read the live _ptr (Stream.close
+    has no lock and nulls _ptr only AFTER Pa_CloseStream returns) and both
+    closed it. Concurrent Pa_CloseStream on one WASAPI stream corrupts the
+    heap (0xc0000374 — the process VANISHES with no Python traceback) or
+    wedges WASAPI natively under the caller, which held _SPEAK_LOCK on the
+    main voice loop → the 100-181 s heartbeat stalls the watchdog kept
+    reaping. Do not reintroduce sd.wait()/sd.stop() here.
+
+    Polls every 50 ms:
+      * _tts_interrupt set → stream.abort() (Pa_AbortStream — no buffer
+        drain, snappier than stop()); abort latency ≤ one slice, well
+        inside the 300 ms barge-in budget.
+      * stream inactive (natural end, or post-abort) → break.
+      * past deadline (audio length + 2 s grace, floor 5 s) → abort, break.
+    Then the ONLY Pa_CloseStream for this stream: stop() before close()
+    (sounddevice issue #87), both ignore_errors. The caller parks on a pure
+    done_evt.wait() and never enters PortAudio — a wedged native teardown
+    strands this daemon (it dies with the process), not the main loop.
+
+    Interaction with the NEXT utterance: sd.play()'s internal module-level
+    stop() runs against this already-closed stream — its _ptr is NULL, so
+    Pa_StopStream/Pa_CloseStream(NULL) return paBadStreamPtr, which
+    sounddevice ignores. Benign, and single-threaded under _SPEAK_LOCK."""
+    try:
+        deadline = time.monotonic() + max(audio_secs + 2.0, 5.0)
+        cut = False
+        while True:
+            try:
+                if not stream.active:   # False once closed/aborted/finished
+                    break
+            except Exception:
+                break
+            if not cut and _tts_interrupt.is_set():
+                print("  [barge-in] cutting TTS playback (wake word)")
+                t0 = time.monotonic()
+                try:
+                    stream.abort(ignore_errors=True)
+                except Exception:
+                    pass
+                cut = True
+                print("  [barge-in] cut complete (%d ms)"
+                      % int((time.monotonic() - t0) * 1000))
+            if time.monotonic() >= deadline:
+                try:
+                    stream.abort(ignore_errors=True)
+                except Exception:
+                    pass
+                break
+            time.sleep(0.05)
+        try:
+            stream.stop(ignore_errors=True)
+        except Exception:
+            pass
+        try:
+            stream.close(ignore_errors=True)
+        except Exception:
+            pass
+    finally:
+        # H-6: retire the in-flight-close registration made by
+        # _pa_close_handoff in play_with_lipsync, BEFORE signalling the caller
+        # — so a caller whose bounded wait succeeds never leaves a phantom
+        # count deferring hotplug. If this thread never gets here (wedged in
+        # the Pa_CloseStream above) the count stays up, which is exactly what
+        # keeps sd._terminate() away from the live native call.
+        _pa_close_done()
+        done_evt.set()
+
+
 def play_with_lipsync(audio: np.ndarray, sr: int):
     """Play TTS audio through speakers. If a robot is connected, also stream
     mouth-open values at ~30 fps so it lip-syncs. If barge-in is enabled and
@@ -11978,12 +12566,19 @@ def play_with_lipsync(audio: np.ndarray, sr: int):
     Always publishes a per-chunk TTS amplitude to the HUD state (separate
     field from mic_level) so the arc-reactor HUD can brighten the ring
     during speech — see hud/jarvis_hud.py (arc_reactor_hud upgrade)."""
-    # Mark TTS playback live for the whole function so _refresh_devices skips
-    # its destructive sd._terminate()/_initialize() reinit while the barge-in
-    # InputStream / sd.stop() are in play. Mirrors the _record_speech_active
-    # guard — a device refresh firing here otherwise frees PortAudio state
-    # under the live barge-in stream (0xc0000374). Reset in the finally below.
-    _tts_playback_active[0] = True
+    # Claim TTS playback for the whole function (via the _pa_gate teardown
+    # gate, 2026-08-14) so _refresh_devices cannot start its destructive
+    # sd._terminate()/_initialize() reinit while the barge-in InputStream /
+    # tts-reaper teardown are in play. Mirrors the _record_speech_active claim
+    # — a device refresh firing here otherwise frees PortAudio state under the
+    # live barge-in stream (0xc0000374). Released in the finally below, AFTER
+    # the barge-in stream's close. A claim timeout means a reinit's native
+    # call has hung >1s: losing this one utterance beats opening streams into
+    # a heap-corrupting teardown, so raise into _speak's existing
+    # device-hiccup handler (it logs the line and returns _speak_ok=False to
+    # the streaming flush ledger).
+    if not _pa_claim_owner(_tts_playback_active):
+        raise RuntimeError("PortAudio reinit hung >1s — skipping playback")
     # A stale interrupt from a previous utterance (e.g. one that raced the
     # end of playback and set the event after that utterance's wait loop
     # exited) must not kill THIS utterance at its first chunk — start every
@@ -12018,9 +12613,11 @@ def play_with_lipsync(audio: np.ndarray, sr: int):
         barge_stream = _start_barge_in_listener()
 
     # Barge-in watch: the InputStream callback flags `_barge_in_interrupted`
-    # but cannot call sd.stop() itself (that triggers a PortAudio use-after-
-    # free). A daemon thread polls the flag and stops playback from a safe
-    # context. Started only when the listener is actually live.
+    # but cannot touch the play stream itself (native calls from a PortAudio
+    # callback → use-after-free). A daemon thread polls the flag and routes
+    # it into _tts_interrupt so the tts-reaper — the ONLY thread allowed to
+    # make native calls on the play stream (_reap_playback) — performs the
+    # actual cut. Started only when the listener is actually live.
     barge_watch_stop = threading.Event()
     barge_watch_thread: threading.Thread | None = None
     if barge_stream is not None:
@@ -12028,41 +12625,10 @@ def play_with_lipsync(audio: np.ndarray, sr: int):
             while not barge_watch_stop.wait(0.02):
                 if _barge_in_interrupted:
                     print("  [barge-in] user interrupted")
-                    try:
-                        sd.stop()
-                    except Exception:
-                        pass
+                    _tts_interrupt.set()
                     return
         barge_watch_thread = threading.Thread(target=_barge_watch, daemon=True)
         barge_watch_thread.start()
-
-    # Wake-word barge-in wait: request_tts_interrupt() (fired from
-    # skills/wake_listener.py on an engine hit) only SETS _tts_interrupt;
-    # sd.stop() must run from a safe context. Deliberately NOT a watch thread
-    # (the legacy _barge_watch pattern): play_with_lipsync's caller thread is
-    # already parked on a bounded _done_evt.wait() during playback, so we
-    # slice that same wait into 50 ms polls and issue sd.stop() right here —
-    # a plain (non-callback) thread, the same context the timeout-recovery
-    # sd.stop() below already uses. Zero extra threads, and abort latency is
-    # one poll slice (≤50 ms), comfortably inside the 300 ms budget. After
-    # sd.stop() the native stream closes, sd.wait() returns, _done_evt sets,
-    # and the function falls through its normal finally — state flags are
-    # cleaned up exactly as if the reply had finished on its own.
-    def _wait_done_or_barge(done_evt: threading.Event, timeout: float) -> None:
-        deadline = time.monotonic() + timeout
-        stop_issued = False
-        while not done_evt.wait(timeout=0.05):
-            if time.monotonic() >= deadline:
-                return   # timed out — caller's force-stop recovery takes over
-            if not stop_issued and _tts_interrupt.is_set():
-                # Set only via request_tts_interrupt(), which already gated
-                # on the config knob + the "own TTS says jarvis" echo rule.
-                print("  [barge-in] cutting TTS playback (wake word)")
-                try:
-                    sd.stop()
-                except Exception:
-                    pass
-                stop_issued = True   # keep waiting for the stream to close
 
     # Duck Chrome / Spotify / Apple Music / Edge so JARVIS sits cleanly
     # over whatever's already playing. Fades down in the background so
@@ -12118,33 +12684,47 @@ def play_with_lipsync(audio: np.ndarray, sr: int):
             # amp_thread + barge-in watchdog logic identical. Waiting on
             # _tts_interrupt (instead of time.sleep) keeps the muted path
             # barge-in-responsive too: an accepted interrupt ends the
-            # simulated playback immediately, same as sd.stop() would.
+            # simulated playback immediately, same as the reaper's abort would.
             _tts_interrupt.wait(timeout=min(audio_secs, 30.0))
         elif not ROBOT_ENABLED:
-            # 2026-05-29 silent-crash fix: sd.wait() blocks until the stream
-            # closes natively, and sounddevice's close() at C-level SIGSEGVs
-            # under bursty boot speech (faulthandler trace caught it across
-            # 7+ PIDs today). Wrap wait+close in a thread with a hard timeout
-            # so a hung native close can't take down the whole process.
+            # 2026-05-29 silent-crash fix, rebuilt 2026-08 (barge-in-stall):
+            # hand the played stream to the single-toucher tts-reaper daemon
+            # (_reap_playback) — it owns EVERY native call on the stream
+            # (active/abort/stop/close) while this caller parks on a pure
+            # Event wait. No sd.wait() (its finally-close raced sd.stop()'s
+            # hidden second close — the 0xc0000374 double-free) and no
+            # caller-side sd.stop() (the old timeout "recovery" WAS the
+            # crash vector, and unbounded native calls on this thread are
+            # what stalled the main loop 100-181 s until the watchdog reaped
+            # the process).
             _play_audio_safe()
-            _done_evt = threading.Event()
-            def _safe_wait():
-                try:
-                    sd.wait()
-                except Exception:
-                    logging.exception("[audio] sd.wait raised — proceeding")
-                finally:
-                    _done_evt.set()
-            _t = threading.Thread(target=_safe_wait, daemon=True)
-            _t.start()
-            # Bound the wait at audio length + 2s grace; if it stalls past
-            # that, force-stop the stream and move on. Process stays alive.
-            # Sliced into 50 ms polls so a wake-word barge-in can cut
-            # playback mid-wait (see _wait_done_or_barge above).
-            _wait_done_or_barge(_done_evt, max(audio_secs + 2.0, 5.0))
-            if not _done_evt.is_set():
-                try: sd.stop()  # pragma: no cover - timeout-recovery: only runs if a live sd.wait() hangs past the grace window
-                except Exception: pass  # pragma: no cover - timeout-recovery: only runs if a live sd.wait() hangs past the grace window
+            try:
+                _stream = sd.get_stream()
+            except Exception:
+                logging.exception(
+                    "[audio] sd.get_stream() failed — skipping playback reaper")
+                _stream = None
+            if _stream is not None:
+                _done_evt = threading.Event()
+                _t = threading.Thread(target=_reap_playback,
+                                      args=(_stream, _done_evt, audio_secs),
+                                      daemon=True, name="tts-reaper")
+                # H-6: register the reaper's native close BEFORE starting it —
+                # the wait below is abandonable, and the finally further down
+                # clears _tts_playback_active unconditionally (it must: the
+                # barge-in gate, ambient listen and the face tracker read that
+                # flag and would stall forever on a lie). _pa_close_pending is
+                # what keeps the destructive reinit away from the abandoned
+                # close.
+                _pa_close_handoff(_t)
+                # Bounded pure-Python wait: the reaper's own deadline plus
+                # 1 s grace for its native teardown. On timeout, ABANDON the
+                # daemon (precedent: _safe_close_stream) — never touch the
+                # stream from this thread.
+                if not _done_evt.wait(
+                        timeout=max(audio_secs + 2.0, 5.0) + 1.0):
+                    print("  [audio] tts-reaper wedged in native code — "
+                          "abandoning (daemon dies with process)")
         else:
             pos = 0
 
@@ -12170,31 +12750,32 @@ def play_with_lipsync(audio: np.ndarray, sr: int):
             t = threading.Thread(target=_sync, daemon=True)
             t.start()
             _play_audio_safe()
-            # 2026-05-29 silent-crash fix: same hardening as the no-robot branch
-            # above — sd.wait()/native close has SIGSEGV'd during boot speech.
-            # Bound the wait so a hung close can't kill the process.
-            _done_evt = threading.Event()
-            def _safe_wait_robot():
-                try:
-                    sd.wait()
-                except Exception:
-                    logging.exception("[audio] sd.wait raised (robot) — proceeding")
-                finally:
-                    _done_evt.set()
-            _t = threading.Thread(target=_safe_wait_robot, daemon=True)
-            _t.start()
-            # Same sliced wait as the no-robot branch — barge-in works with
-            # the robot connected too.
-            _wait_done_or_barge(_done_evt, max(audio_secs + 2.0, 5.0))
-            if not _done_evt.is_set():
-                try: sd.stop()  # pragma: no cover - timeout-recovery: only runs if a live sd.wait() hangs past the grace window (robot arm)
-                except Exception: pass  # pragma: no cover - timeout-recovery: only runs if a live sd.wait() hangs past the grace window (robot arm)
+            # Same single-toucher tts-reaper as the no-robot branch — barge-in
+            # works with the robot connected too. Shared _reap_playback body,
+            # deliberately NOT a divergent copy (the old _safe_wait_robot twin
+            # was exactly the stale-duplicate shape this codebase keeps paying
+            # for).
+            try:
+                _stream = sd.get_stream()
+            except Exception:
+                logging.exception(
+                    "[audio] sd.get_stream() failed — skipping playback reaper (robot)")
+                _stream = None
+            if _stream is not None:
+                _done_evt = threading.Event()
+                _t = threading.Thread(target=_reap_playback,
+                                      args=(_stream, _done_evt, audio_secs),
+                                      daemon=True, name="tts-reaper")
+                # H-6 — same registration as the no-robot branch above.
+                # Deliberately NOT a divergent copy of the rule: both branches
+                # call the one _pa_close_handoff.
+                _pa_close_handoff(_t)
+                if not _done_evt.wait(
+                        timeout=max(audio_secs + 2.0, 5.0) + 1.0):
+                    print("  [audio] tts-reaper wedged in native code — "
+                          "abandoning (daemon dies with process)")
             t.join(timeout=0.5)
     finally:
-        # Clear the TTS-playback guard first so a queued device refresh can
-        # resume its normal reinit path once the barge-in stream is closed
-        # below. Set unconditionally to mirror the start-of-function flag.
-        _tts_playback_active[0] = False
         amp_stop.set()
         try:
             amp_thread.join(timeout=0.2)
@@ -12218,6 +12799,21 @@ def play_with_lipsync(audio: np.ndarray, sr: int):
         _write_hud_state(tts_amplitude=0.0)
         if barge_stream is not None:
             _safe_close_stream(barge_stream)
+        # Release the TTS-playback claim only NOW — after the barge-in
+        # stream's native close — so the flag covers its whole native lifetime
+        # and a queued device refresh can never latch its reinit while that
+        # close is still executing (2026-08-14; an older comment promised this
+        # ordering but the code cleared the flag at the top of this finally).
+        # _speak's belt-and-braces force-clear still backstops a setup-time
+        # raise. Plain write: releases need no lock, only claims do.
+        #
+        # H-6 (2026-08-20): "its whole native lifetime" is exact only up to an
+        # ABANDON — both the barge_stream close above and the tts-reaper wait
+        # further up give up after a bounded time while PortAudio may still be
+        # inside the close. That remainder is covered by _pa_close_pending
+        # (registered by _pa_close_handoff, retired by the daemon), NOT by
+        # pinning this flag up: it MUST keep telling the truth here.
+        _tts_playback_active[0] = False
         # Fade Chrome/Spotify/Apple Music/Edge back to their original volumes
         try:
             _audio_ducker.restore()
@@ -17907,8 +18503,22 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     # 2026-07-04 sweep block below; the rest are added here. Kept OUT of
     # INFORMATIVE_ACTIONS (the two sets must stay disjoint — see
     # test_speak_sets_are_disjoint).
-    "focus_mode_on", "do_not_disturb", "quiet_mode",
-    "focus_mode_off", "resume", "whats_missed",
+    #
+    # H-5 (2026-08-20): "focus_mode" and "end_focus_mode" are the SAME two
+    # handlers (skills/focus_mode.py:397-398 binds them to focus_mode_on /
+    # focus_mode_off) but were in NEITHER set, and nothing canonicalises an
+    # alias to its sibling — parse_and_run_actions carries the RAW name into
+    # _speak_verbatim_results, which gates on `name.lower() in
+    # SPEAK_RESULT_VERBATIM_ACTIONS`. So "JARVIS, end focus mode" ran
+    # focus_mode_off, which builds the recap with clear=True and DESTROYS the
+    # held-items buffer, then returned that recap into a path with no speaker:
+    # the block ended, the buffer was gone, and JARVIS said nothing. Worse on
+    # the local brain, which is handed ONLY the section teaching
+    # `end_focus_mode` (core/prompt_router._HEADER_RE matches column 0 and the
+    # sibling focus block's header is indented), so it can emit no other name.
+    # Both names are in the shipped prompt, so both must be voiced.
+    "focus_mode_on", "do_not_disturb", "quiet_mode", "focus_mode",
+    "focus_mode_off", "resume", "whats_missed", "end_focus_mode",
     # ── 2026-07-04 read-out completeness sweep ────────────────────────────
     # Verified silent read-outs (a full-repo audit + live drive confirmed each
     # RETURNS a finished, user-facing answer, does NOT self-speak, and was in
@@ -20257,13 +20867,16 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
             _last_intent_override[0] = None
             _last_wry[0] = False
             _last_mood[0] = None
-            # play_with_lipsync sets _tts_playback_active True before its own
-            # try/finally that resets it. If it raised during setup (e.g. a
-            # thread-create RuntimeError under load) BEFORE reaching that
-            # finally, the flag would be left stuck True — permanently disabling
-            # _refresh_devices' PortAudio hotplug reinit for the rest of the
-            # session. _speak is the sole caller and nothing is playing once it
-            # returns, so force the guard back to False here.
+            # play_with_lipsync claims _tts_playback_active (via
+            # _pa_claim_owner, 2026-08-14) before its own try/finally that
+            # releases it after the barge-in stream closes. If it raised
+            # during setup (e.g. a thread-create RuntimeError under load)
+            # BEFORE reaching that finally, the flag would be left stuck True
+            # — permanently disabling _refresh_devices' PortAudio hotplug
+            # reinit for the rest of the session. (A claim-timeout raise never
+            # set the flag, so this clear is a harmless no-op there.) _speak
+            # is the sole caller and nothing is playing once it returns, so
+            # force the guard back to False here.
             _tts_playback_active[0] = False
             # Wake-word barge-in bookkeeping: no utterance owns the speakers
             # any more, so clear the echo-gate text (a stale sentence

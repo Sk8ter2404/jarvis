@@ -136,6 +136,8 @@ class SchedulerTestBase(unittest.TestCase):
         sched._state["cond_stop"] = None
         sched._state["cond_state"] = {}
         sched._state["last_error"] = None
+        sched._state["unresolved"] = {}
+        sched.set_notify_hook(None)
 
         # Redirect every data-file path into a throwaway temp dir.
         self._tmp = tempfile.mkdtemp(prefix="sched_test_")
@@ -179,6 +181,8 @@ class SchedulerTestBase(unittest.TestCase):
                 sched._state[k] = copy.deepcopy(v)
         sched._state["conditions"] = {}
         sched._state["cond_state"] = {}
+        sched._state["unresolved"] = {}
+        sched.set_notify_hook(None)
         import shutil
         shutil.rmtree(self._tmp, ignore_errors=True)
 
@@ -237,9 +241,17 @@ class RunActionTests(SchedulerTestBase):
         self.assertEqual(out, "ping: ok")
 
     def test_run_action_unregistered_action_is_reported(self):
+        # The return string is NOT enough: APScheduler discards run_action's
+        # retval, so this assertion alone was green while the real-world
+        # behaviour was total silence. Pin the emitted log record too.
         sched._state["actions"] = {"known": lambda a: "x"}
-        out = sched.run_action("unknown", "")
+        with self.assertLogs("jarvis.scheduler", level="WARNING") as cm:
+            out = sched.run_action("unknown", "", job_id="cron_morning")
         self.assertEqual(out, "unknown: not registered")
+        blob = "\n".join(cm.output)
+        self.assertIn("unknown", blob)
+        self.assertIn("cron_morning", blob)
+        self.assertIn("NOT registered", blob)
 
     def test_run_action_catches_action_exception(self):
         def boom(_):
@@ -270,6 +282,255 @@ class RunActionTests(SchedulerTestBase):
             chain=["not a dict", {"arg": "no action key"}],
         )
         self.assertEqual(out, "a: ra")
+
+
+# ── unresolved-action loudness (2026-08-20 regression) ──────────
+class UnresolvedActionTests(SchedulerTestBase):
+    """A scheduled step naming an action that isn't registered must never be
+    silent. APScheduler drops run_action's return value and then logs
+    'Job "..." executed successfully', so the ONLY evidence a job evaporated
+    has to come from this module: a WARNING, a queryable broken state, and a
+    (rate-limited) owner notice."""
+
+    def _spy(self):
+        seen = []
+        sched.set_notify_hook(lambda msg: seen.append(msg) or True)
+        return seen
+
+    def test_miss_is_never_silent(self):
+        sched._state["actions"] = {"known": lambda a: "x"}
+        self._spy()
+        with self.assertLogs("jarvis.scheduler", level="WARNING"):
+            sched.run_action("ghost_action", "", job_id="cron_6am")
+
+    def test_miss_records_a_detectable_broken_state(self):
+        sched._state["actions"] = {"known": lambda a: "x"}
+        self._spy()
+        sched.run_action("ghost_action", "", job_id="cron_6am")
+        recs = sched.unresolved_actions()
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["action"], "ghost_action")
+        self.assertEqual(recs[0]["job_id"], "cron_6am")
+        self.assertEqual(recs[0]["count"], 1)
+        # status() is the surface a "schedule status" voice query reads.
+        self.assertEqual(len(sched.status()["unresolved"]), 1)
+
+    def test_miss_announces_to_the_owner(self):
+        sched._state["actions"] = {"known": lambda a: "x"}
+        seen = self._spy()
+        sched.run_action("ghost_action", "", job_id="cron_6am")
+        self.assertEqual(len(seen), 1)
+        self.assertIn("ghost_action", seen[0])
+        self.assertIn("cron_6am", seen[0])
+
+    def test_repeat_miss_counts_but_does_not_spam_the_owner(self):
+        sched._state["actions"] = {"known": lambda a: "x"}
+        seen = self._spy()
+        for _ in range(5):
+            sched.run_action("ghost_action", "", job_id="intv_30s")
+        self.assertEqual(len(seen), 1)                      # cooldown holds
+        self.assertEqual(sched.unresolved_actions()[0]["count"], 5)
+
+    def test_announce_cooldown_expires(self):
+        sched._state["actions"] = {"known": lambda a: "x"}
+        seen = self._spy()
+        sched.run_action("ghost_action", "", job_id="cron_6am")
+        rec = sched._state["unresolved"]["cron_6am::ghost_action"]
+        rec["last_announced"] -= (sched._UNRESOLVED_ANNOUNCE_COOLDOWN_S + 1)
+        sched.run_action("ghost_action", "", job_id="cron_6am")
+        self.assertEqual(len(seen), 2)
+
+    def test_undeliverable_notice_is_logged_not_swallowed(self):
+        # Honest-failure contract: if the notice can't be spoken, say so.
+        # Hermetic about the monolith either way — another suite in the same
+        # process may well have imported bobert_companion already.
+        import sys
+        sched._state["actions"] = {"known": lambda a: "x"}
+        sched.set_notify_hook(None)
+        mods = dict(sys.modules)
+        mods.pop("bobert_companion", None)
+        with mock.patch.dict(sys.modules, mods, clear=True):
+            with self.assertLogs("jarvis.scheduler", level="WARNING") as cm:
+                sched.run_action("ghost_action", "", job_id="cron_6am")
+        self.assertTrue(any("not spoken" in line for line in cm.output))
+
+    def test_notice_goes_through_the_monolith_announcer_when_loaded(self):
+        # The production channel: core.scheduler must NOT import the monolith
+        # itself (a bare unit-test process would drag in all of JARVIS), it
+        # only uses proactive_announce when it is already loaded.
+        import sys
+        import types
+        fake_bc = types.ModuleType("bobert_companion")
+        calls = []
+
+        def _announce(msg, source="skill", **kw):
+            calls.append((msg, source))
+            return True
+
+        fake_bc.proactive_announce = _announce
+        sched._state["actions"] = {"known": lambda a: "x"}
+        sched.set_notify_hook(None)
+        with mock.patch.dict(sys.modules, {"bobert_companion": fake_bc}):
+            sched.run_action("ghost_action", "", job_id="cron_6am")
+        self.assertEqual(len(calls), 1)
+        self.assertIn("ghost_action", calls[0][0])
+        self.assertEqual(calls[0][1], "scheduler")
+
+    def test_announcer_returning_false_is_logged(self):
+        sched._state["actions"] = {"known": lambda a: "x"}
+        sched.set_notify_hook(lambda msg: False)
+        with self.assertLogs("jarvis.scheduler", level="WARNING") as cm:
+            sched.run_action("ghost_action", "", job_id="cron_6am")
+        self.assertTrue(any("rejected by the announcer" in line
+                            for line in cm.output))
+
+    def test_announcer_exception_does_not_break_dispatch(self):
+        def boom(_msg):
+            raise RuntimeError("tts offline")
+        sched.set_notify_hook(boom)
+        sched._state["actions"] = {"ok": lambda a: "ran"}
+        out = sched.run_action("ghost", "", chain=[{"action": "ok"}],
+                               job_id="cron_x")
+        # The good step still ran; the bad one is reported, not raised.
+        self.assertEqual(out, "ghost: not registered | ok: ran")
+
+    def test_chain_step_miss_is_recorded_separately(self):
+        sched._state["actions"] = {"a": lambda x: "ra"}
+        self._spy()
+        out = sched.run_action("a", "", chain=[{"action": "ghost"}],
+                               job_id="cron_chain")
+        self.assertEqual(out, "a: ra | ghost: not registered")
+        self.assertEqual([r["action"] for r in sched.unresolved_actions()],
+                         ["ghost"])
+
+    def test_conditional_trigger_miss_names_the_trigger(self):
+        # The condition poller calls run_action directly — it never goes
+        # through APScheduler, so it needs the same loudness.
+        sched._state["actions"] = {"known": lambda a: "x"}
+        self._spy()
+        sched.register_condition("flip", lambda: True)
+        sched._write_conditions([{"id": "when_flip_ghost", "condition": "flip",
+                                  "action": "ghost", "arg": "", "chain": []}])
+        sched._state["cond_state"] = {"when_flip_ghost": False}
+        sched._evaluate_conditions_once()
+        recs = sched.unresolved_actions()
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["job_id"], "when_flip_ghost")
+
+    def test_clear_unresolved_by_job_and_all(self):
+        sched._state["actions"] = {"known": lambda a: "x"}
+        self._spy()
+        sched.run_action("ghost1", "", job_id="j1")
+        sched.run_action("ghost2", "", job_id="j2")
+        self.assertEqual(sched.clear_unresolved("j1"), 1)
+        self.assertEqual([r["job_id"] for r in sched.unresolved_actions()], ["j2"])
+        self.assertEqual(sched.clear_unresolved(), 1)
+        self.assertEqual(sched.unresolved_actions(), [])
+
+    def test_cancel_job_prunes_its_misses(self):
+        fs = self._install_fake_scheduler()
+        sched._state["actions"] = {"known": lambda a: "x"}
+        self._spy()
+        sched.schedule_cron(action="ghost", job_id="cron_dead", hour=6)
+        sched.run_action("ghost", "", job_id="cron_dead")
+        self.assertEqual(len(sched.unresolved_actions()), 1)
+        self.assertTrue(sched.cancel_job("cron_dead"))
+        self.assertEqual(sched.unresolved_actions(), [])
+        self.assertNotIn("cron_dead", fs.jobs)
+
+    def test_fire_now_passes_the_job_id_through(self):
+        self._install_fake_scheduler()
+        sched._state["actions"] = {"known": lambda a: "x"}
+        self._spy()
+        sched.schedule_cron(action="ghost", job_id="cron_manual", hour=6)
+        out = sched.fire_now("cron_manual")
+        self.assertEqual(out, "ghost: not registered")
+        self.assertEqual(sched.unresolved_actions()[0]["job_id"], "cron_manual")
+
+
+# ── arm-time validation seam ────────────────────────────────
+class UnknownActionsTests(SchedulerTestBase):
+    def test_fails_open_before_bootstrap(self):
+        # Skills arm jobs during load (self_diagnostic, sh_hue) — validation
+        # must never be the thing that rejects those.
+        sched._state["actions"] = None
+        self.assertEqual(sched.unknown_actions("anything"), [])
+
+    def test_reports_missing_primary_and_chain_names(self):
+        sched._state["actions"] = {"weather": lambda a: "w"}
+        self.assertEqual(sched.unknown_actions("weather"), [])
+        self.assertEqual(
+            sched.unknown_actions("ghost", [{"action": "weather"},
+                                            {"action": "phantom"},
+                                            "junk", {"arg": "no action"}]),
+            ["ghost", "phantom"])
+
+    def test_deduplicates_repeated_missing_names(self):
+        sched._state["actions"] = {"weather": lambda a: "w"}
+        self.assertEqual(
+            sched.unknown_actions("ghost", [{"action": "ghost"}]), ["ghost"])
+
+    def test_action_registered_after_arming_still_fires(self):
+        # THE regression that arm-time validation must not cause: a job armed
+        # while its action is missing is NOT rejected by the core entry points,
+        # and once the owning skill registers the handler the job runs for real.
+        self._install_fake_scheduler()
+        live: dict = {}
+        sched._state["actions"] = live
+        jid = sched.schedule_cron(action="late_skill_action", job_id="cron_late",
+                                  hour=6)
+        self.assertEqual(jid, "cron_late")               # armed, not refused
+        ran = []
+        live["late_skill_action"] = lambda a: ran.append(a) or "did it"
+        self.assertEqual(sched.fire_now("cron_late"), "late_skill_action: did it")
+        self.assertEqual(ran, [""])
+        self.assertEqual(sched.unresolved_actions(), [])
+
+    def test_suggest_actions_offers_near_misses(self):
+        sched._state["actions"] = {"morning_briefing": lambda a: "", "weather": lambda a: ""}
+        self.assertIn("morning_briefing", sched.suggest_actions("morning_brief"))
+        self.assertEqual(sched.suggest_actions("zzzzzzzz"), [])
+
+    def test_suggest_actions_empty_before_bootstrap(self):
+        sched._state["actions"] = None
+        self.assertEqual(sched.suggest_actions("anything"), [])
+
+
+# ── broken-job reporting surfaces ──────────────────────────
+class BrokenJobReportingTests(SchedulerTestBase):
+    def test_list_jobs_flags_an_unresolvable_job(self):
+        self._install_fake_scheduler()
+        sched._state["actions"] = {"weather": lambda a: "w"}
+        sched.schedule_cron(action="ghost", job_id="cron_ghost", hour=6)
+        sched.schedule_cron(action="weather", job_id="cron_ok", hour=7)
+        by_id = {j["id"]: j for j in sched.list_jobs()}
+        self.assertTrue(by_id["cron_ghost"]["broken"])
+        self.assertEqual(by_id["cron_ghost"]["unknown_actions"], ["ghost"])
+        self.assertFalse(by_id["cron_ok"]["broken"])
+
+    def test_status_reports_broken_jobs_before_they_ever_fire(self):
+        self._install_fake_scheduler()
+        sched._state["actions"] = {"weather": lambda a: "w"}
+        sched.schedule_cron(action="ghost", job_id="cron_ghost", hour=6)
+        st = sched.status()
+        self.assertEqual([b["id"] for b in st["broken_jobs"]], ["cron_ghost"])
+
+    def test_status_reports_broken_conditional_triggers(self):
+        sched._state["actions"] = {"weather": lambda a: "w"}
+        sched.register_condition("flip", lambda: False)
+        sched.schedule_when(name="when_flip_ghost", condition="flip",
+                            action="ghost")
+        st = sched.status()
+        self.assertEqual([b["id"] for b in st["broken_jobs"]], ["when_flip_ghost"])
+        self.assertTrue(sched.list_conditions()[0]["broken"])
+
+    def test_list_jobs_not_flagged_before_bootstrap(self):
+        # actions is None → fail open, so a pre-bootstrap listing doesn't
+        # slander every job as broken.
+        self._install_fake_scheduler()
+        sched._state["actions"] = None
+        sched.schedule_cron(action="ghost", job_id="cron_ghost", hour=6)
+        self.assertFalse(sched.list_jobs()[0]["broken"])
 
 
 # ── condition registry ──────────────────────────────────────────────
@@ -778,7 +1039,11 @@ class ScheduleJobTests(SchedulerTestBase):
         self.assertIs(call["func"], sched.run_action)
         self.assertEqual(call["id"], "morning")
         self.assertEqual(call["name"], "cron:brief")
-        self.assertEqual(call["kwargs"], {"action": "brief", "arg": "emails"})
+        # job_id rides in the kwargs so run_action can name the schedule in a
+        # fire-time "action not registered" warning (APScheduler never hands
+        # the job object to the dispatched callable).
+        self.assertEqual(call["kwargs"],
+                         {"action": "brief", "arg": "emails", "job_id": "morning"})
         # A real apscheduler CronTrigger was built.
         self.assertEqual(type(call["trigger"]).__name__, "CronTrigger")
 

@@ -61,6 +61,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -1967,33 +1968,61 @@ class SafeCloseStreamTests(SectionSevenBase):
         # The daemon-thread close raises; the helper swallows it and returns.
         self.bc._safe_close_stream(stream, timeout_sec=2.0)
 
-    def test_close_hang_forces_sd_stop(self):
+    def _hung_close_stream(self):
+        """A stream whose close() parks until the test releases it, plus the
+        (gate, closed) events needed to retire the abandoned daemon before the
+        test returns. The daemon decrements the SHARED _pa_close_pending cell
+        in its finally, so a test that leaves it parked corrupts the next
+        test's reading of that cell — settle it here, not in the next test."""
         import threading as _t
-        # A close that blocks past the timeout -> the helper forces sd.stop().
         gate = _t.Event()
-        stream = mock.MagicMock()
-        stream.close.side_effect = lambda: gate.wait(5.0)
-        sd_stop = self._p(self.bc.sd, "stop")
-        try:
-            self.bc._safe_close_stream(stream, timeout_sec=0.1)
-            sd_stop.assert_called_once()
-        finally:
-            gate.set()   # release the blocked daemon thread
+        closed = _t.Event()
 
-    def test_close_hang_sd_stop_exception_swallowed(self):
-        import threading as _t
-        # 4507-4510: close hangs past the timeout AND the forced sd.stop() also
-        # raises -> the except swallows it; the helper still returns promptly.
-        gate = _t.Event()
+        def _blocking_close():
+            gate.wait(5.0)
+            closed.set()
+
         stream = mock.MagicMock()
-        stream.close.side_effect = lambda: gate.wait(5.0)
-        sd_stop = self._p(self.bc.sd, "stop")
-        sd_stop.side_effect = RuntimeError("sd.stop boom")
-        try:
-            self.bc._safe_close_stream(stream, timeout_sec=0.1)   # must not raise
-            sd_stop.assert_called_once()
-        finally:
+        stream.close.side_effect = _blocking_close
+
+        def _settle():
             gate.set()
+            closed.wait(5.0)
+            # the daemon retires its count right after close() returns
+            for _ in range(100):
+                if int(self.bc._pa_close_pending[0]) <= 0:
+                    break
+                time.sleep(0.02)
+        self.addCleanup(_settle)
+        return stream
+
+    def test_close_hang_abandons_without_touching_sd_stop(self):
+        # H-3 (2026-08-20): a close that blocks past the timeout is ABANDONED.
+        # The old "forcing sd.stop()" recovery was a cross-close — sounddevice's
+        # module-level stop() acts on `_last_callback` (only sd.play()/sd.rec()
+        # publish that), never on the InputStream handed in here, so it could
+        # not free the hung handle and could only close the live TTS playback
+        # stream underneath the reaper (0xc0000374).
+        stream = self._hung_close_stream()
+        sd_stop = self._p(self.bc.sd, "stop")
+        self.bc._safe_close_stream(stream, timeout_sec=0.1)
+        sd_stop.assert_not_called()
+
+    def test_close_hang_still_returns_promptly_and_keeps_close_registered(self):
+        # The abandon path must return to the caller quickly AND leave the
+        # in-flight native close registered with the teardown gate, so
+        # _refresh_devices keeps deferring its destructive sd._terminate()
+        # until PortAudio actually returns (H-6 contract, preserved by H-3).
+        stream = self._hung_close_stream()
+        sd_stop = self._p(self.bc.sd, "stop")
+        self.bc._pa_close_pending[0] = 0
+        t0 = time.time()
+        self.bc._safe_close_stream(stream, timeout_sec=0.1)  # must not raise
+        self.assertLess(time.time() - t0, 2.0)
+        sd_stop.assert_not_called()
+        self.assertEqual(int(self.bc._pa_close_pending[0]), 1,
+                         "the abandoned close must stay registered with the "
+                         "teardown gate while PortAudio is still inside it")
 
 
 # ════════════════════════════════════════════════════════════════════════════

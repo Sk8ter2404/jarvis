@@ -22,6 +22,44 @@ from unittest import mock
 from tests._skill_harness import load_skill_isolated
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# HERMETIC CONFIG — do NOT inherit the owner's live data/user_settings.json.
+#
+# core.config._apply_user_settings() reads <repo>/data/user_settings.json off a
+# __file__-relative path at import; it honours NEITHER JARVIS_DATA_DIR nor
+# JARVIS_SETTINGS_PATH. So every flag this module's code branches on is really
+# whatever the owner last toggled in the Settings GUI — the tests below silently
+# inherited it. That has now turned this exact file red THREE times on the same
+# flag (2026-07-10, 2026-07-11, and 2026-08-20 when KINECT_GAZE_ENABLED went
+# true): _read_kinect_presence() fetches when presence OR **gaze** is on, so
+# "presence disabled → None" only holds while gaze is also off.
+# See the incident notes at the top of tools/action_smoke.py.
+#
+# Pin all four to their SHIPPED core/config.py defaults for the whole module, so
+# a GUI toggle can never flip this suite. Per-test intent still layers on top via
+# _patch_config (mock restores LIFO, so the inner patch wins while it is active).
+_CONFIG_DEFAULTS = {
+    "KINECT_PRESENCE_ENABLED": False,
+    "KINECT_PRESENCE_STANDBY": False,
+    "KINECT_PRESENCE_WAKE": False,
+    "KINECT_GAZE_ENABLED": False,
+}
+_MODULE_PATCHES = []
+
+
+def setUpModule():
+    from core import config as cfg
+    for name, val in _CONFIG_DEFAULTS.items():
+        p = mock.patch.object(cfg, name, val, create=True)
+        p.start()
+        _MODULE_PATCHES.append(p)
+
+
+def tearDownModule():
+    while _MODULE_PATCHES:
+        _MODULE_PATCHES.pop().stop()
+
+
 def _fake_bridge(presence, *, available=(True, "")):
     m = types.ModuleType("audio.kinect_bridge")
     m.available = lambda: available
@@ -57,18 +95,24 @@ class _FaceTrackerKinectBase(unittest.TestCase):
         mod, _actions = load_skill_isolated("face_tracker", register=False)
         return mod
 
-    def _patch_config(self, *, enabled=True, standby=False, wake=False):
+    def _patch_config(self, *, enabled=True, standby=False, wake=False,
+                      gaze=False):
         """Patch the Kinect flags on the REAL core.config module.
 
         ``_cfg_flag`` does ``from core import config`` — once the ``core``
         package is imported (which the whole suite does), that binds the real
         submodule, NOT a ``sys.modules['core.config']`` swap. So we must set
         the attributes on the live module. mock.patch.object(create=True)
-        restores them afterward whether or not they pre-existed."""
+        restores them afterward whether or not they pre-existed.
+
+        ``gaze`` is pinned here as well because _read_kinect_presence() fetches
+        when presence OR gaze is enabled — leaving it ambient is what made
+        test_disabled_flag_returns_none depend on the owner's Settings GUI."""
         from core import config as cfg
         for name, val in (("KINECT_PRESENCE_ENABLED", enabled),
                           ("KINECT_PRESENCE_STANDBY", standby),
-                          ("KINECT_PRESENCE_WAKE", wake)):
+                          ("KINECT_PRESENCE_WAKE", wake),
+                          ("KINECT_GAZE_ENABLED", gaze)):
             p = mock.patch.object(cfg, name, val, create=True)
             p.start()
             self.addCleanup(p.stop)

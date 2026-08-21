@@ -241,28 +241,47 @@ def _get_bobert():
             or sys.modules.get("__main__"))
 
 
-def _set_ambient_stream_active(claim: bool) -> None:
+def _set_ambient_stream_active(claim: bool) -> bool:
     """Refcount bobert_companion._ambient_stream_active: +1 when this worker's
     dedicated ambient InputStream opens, -1 when it closes. _refresh_devices
     defers its destructive PortAudio sd._terminate()/_initialize() while the
     count is > 0, so a USB plug/unplug mid-capture can't tear PortAudio down
     under a live callback thread → 0xc0000374 heap corruption (HIGH, 2026-07-08).
 
+    TEARDOWN GATE (2026-08-14): claims prefer bobert's _pa_claim_owner /
+    _pa_release_owner when the host exposes them — the claim is then atomic
+    with the monolith's reinit latch, so it can no longer land inside an
+    in-flight sd._terminate() native window. Returns False ONLY when that
+    gate refuses the claim (a reinit stayed in flight past the bounded 2s
+    wait); the caller must treat it like an open failure and NOT open a
+    stream. Older hosts / unit-test doubles fall back to the plain
+    _mic_lock-guarded ++/-- and always return True.
+
     It MUST be a refcount, not a boolean: the mic worker and the WASAPI loopback
     worker are independent skills that can run CONCURRENTLY (room mic + system
     audio). With a shared boolean, whichever exits first cleared the guard while
     the other's stream was still live — re-opening the exact crash window this
-    guards (bug-hunt 2026-07-08). Callers MUST pair every True with exactly one
-    False (only on the code path that actually opened a stream). Guarded by
-    bobert's _mic_lock so the ++/-- is atomic across workers. Best-effort: a
-    missing module/flag/lock (unit tests) still adjusts the count when present."""
+    guards (bug-hunt 2026-07-08). Callers MUST pair every successful True claim
+    with exactly one False release (only on the code path that actually opened
+    a stream), and the release must come AFTER the stream's close. Best-effort:
+    a missing module/flag/lock (unit tests) still adjusts the count when
+    present."""
     bc = _get_bobert()
     if bc is None:
-        return
+        return True
     try:
         flag = getattr(bc, "_ambient_stream_active", None)
         if not isinstance(flag, list) or not flag:
-            return
+            return True
+        claim_fn = getattr(bc, "_pa_claim_owner", None)
+        release_fn = getattr(bc, "_pa_release_owner", None)
+        if callable(claim_fn) and callable(release_fn):
+            if claim:
+                return bool(claim_fn(flag, refcount=True, timeout=2.0))
+            release_fn(flag, refcount=True)
+            return True
+        # Fallback for hosts predating the gate (and SimpleNamespace test
+        # doubles): plain refcount, atomic under bobert's _mic_lock if present.
         lock = getattr(bc, "_mic_lock", None)
         delta = 1 if claim else -1
         if lock is not None:
@@ -270,8 +289,11 @@ def _set_ambient_stream_active(claim: bool) -> None:
                 flag[0] = max(0, int(flag[0]) + delta)
         else:
             flag[0] = max(0, int(flag[0]) + delta)
+        return True
     except Exception:
-        pass
+        # Bookkeeping must never take the worker down — behave like the
+        # gate-less host and let the capture proceed.
+        return True
 
 
 def _safe_close_stream(stream) -> None:
@@ -309,15 +331,22 @@ def _safe_close_stream(stream) -> None:
             done.set()
     threading.Thread(target=_close_in_daemon, daemon=True).start()
     if not done.wait(timeout=2.0):
-        # Escape hatch — mirrors bobert_companion._safe_close_stream. If the
-        # daemon's close() hangs (PortAudio occasionally wedges on Windows),
-        # force-stop every stream globally so the next open() doesn't inherit
-        # a half-torn-down handle and SIGSEGV at sounddevice.py:1167.
-        try:
-            import sounddevice as sd
-            sd.stop()
-        except Exception:
-            pass
+        # H-3 (2026-08-20) — STALE-DUPLICATE HALF, deleted in all four copies
+        # (bobert_companion._safe_close_stream, core/wake_word, this one,
+        # skills/enroll_voice). The old comment here asserted a contract
+        # sounddevice explicitly denies: module-level sd.stop() does NOT
+        # "force-stop every stream globally". Per sounddevice 0.5.5
+        # (sounddevice.py:406-418) it stops+closes only `_last_callback`, which
+        # is published solely by sd.play()/sd.rec()/sd.playrec() — never by an
+        # explicitly constructed InputStream like this one. So it could not
+        # free this handle, and its one reachable effect would be closing the
+        # host's live TTS playback stream mid-utterance (two threads inside
+        # Pa_CloseStream on one WASAPI stream -> 0xc0000374). Abandon the
+        # daemon honestly instead; it dies with the process.
+        print("  [ambient] stream.close hung >2.0s — abandoning the close "
+              "daemon (it dies with the process). sd.stop() is deliberately "
+              "NOT called: it cannot free this InputStream and would instead "
+              "close a live TTS playback stream.")
 
 
 def _get_config(name: str, default):
@@ -816,7 +845,15 @@ def _worker_loop() -> None:
         # bug already fixed for record_speech in bobert_companion; both ambient
         # workers still had the pre-fix order. Claim first, and release on
         # EVERY failure path so a failed open can't strand the refcount.
-        _set_ambient_stream_active(True)
+        # 2026-08-14: the claim now goes through the monolith's _pa_gate
+        # teardown gate when available; a False claim means a destructive
+        # PortAudio reinit stayed in flight past the bounded wait — treat it
+        # like an open failure and DON'T open a stream into the teardown.
+        if not _set_ambient_stream_active(True):
+            _last_error = ("PortAudio reinit in flight — could not claim the "
+                           "audio device; ambient capture not started")
+            print(f"  [ambient-listen] {_last_error}")
+            return
         claimed_ambient = True
         try:
             stream = sd.InputStream(
@@ -1099,7 +1136,14 @@ def _audio_worker_loop() -> None:
     # gap runs sd._terminate()/sd._initialize() under the live callback and
     # heap-corrupts the process. Same bug record_speech was fixed for; both
     # ambient workers still had the pre-fix order. Released on every failure path.
-    _set_ambient_stream_active(True)
+    # 2026-08-14: the claim now goes through the monolith's _pa_gate teardown
+    # gate when available; a False claim means a destructive reinit stayed in
+    # flight past the bounded wait — bail like an open failure.
+    if not _set_ambient_stream_active(True):
+        _audio_last_error = ("PortAudio reinit in flight — could not claim the "
+                             "audio device; system-audio capture not started")
+        print(f"  [ambient-audio] {_audio_last_error}")
+        return
     try:
         stream = sd.InputStream(
             samplerate=dev_sr,

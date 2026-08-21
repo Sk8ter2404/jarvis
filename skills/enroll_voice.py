@@ -121,129 +121,176 @@ def _record_seconds(seconds: float) -> Optional[np.ndarray]:
         print(f"  [enroll_voice] sounddevice unavailable: {e}")
         return None
 
-    n_frames = int(seconds * ENROLL_SAMPLE_RATE)
-    device = _input_device()
-    try:
-        # sd.rec is blocking-friendly and matches the simplest path; if it
-        # fails on the user's driver (some USB headsets don't honour
-        # it), fall back to a callback-based InputStream that drains into a
-        # list — that path is known-good from bobert_companion.record_speech.
-        rec = sd.rec(
-            n_frames,
-            samplerate=ENROLL_SAMPLE_RATE,
-            channels=1,
-            dtype="float32",
-            device=device,
-        )
-        # BOUNDED WAIT (2026-07-14 audit). sd.wait() blocks until the recording
-        # finishes — but this runs on the MAIN VOICE THREAD, and a stalled mic
-        # (a device that opens but never delivers its frames) makes it block
-        # FOREVER: JARVIS goes deaf and mute mid-enrolment. Wait on a daemon
-        # instead, bounded to the recording length plus a grace margin; on
-        # overrun, stop the stream and fall through to the InputStream path
-        # below (which the except-branch already handles). The bound is
-        # recording-length-relative so a legitimately long enrolment isn't cut.
-        _done = threading.Event()
-
-        def _await_rec():
+    # TEARDOWN-GATE CLAIM (2026-08-14): these local fallback captures (the
+    # sd.rec below and its InputStream twin) set none of the monolith's
+    # classic mic-ownership flags, so bobert's _refresh_devices could run its
+    # destructive sd._terminate()/_initialize() under a live callback
+    # (0xc0000374). Claim bobert_companion._enroll_capture_active for the
+    # whole capture span via bc._pa_claim_owner when the host exposes the
+    # gate; degrade to the old unguarded behaviour when it doesn't
+    # (stand-alone runs, older monoliths, unit-test doubles). A False claim
+    # means a reinit stayed in flight past the bounded wait — bail like a
+    # capture failure. Released in the finally at the bottom, AFTER the
+    # stream teardown (close-then-release).
+    _gate_release = None
+    _gate_bc = _bobert()
+    if _gate_bc is not None:
+        _claim_fn = getattr(_gate_bc, "_pa_claim_owner", None)
+        _release_fn = getattr(_gate_bc, "_pa_release_owner", None)
+        _enroll_cell = getattr(_gate_bc, "_enroll_capture_active", None)
+        if (callable(_claim_fn) and callable(_release_fn)
+                and isinstance(_enroll_cell, list) and _enroll_cell):
             try:
-                sd.wait()
-            finally:
-                _done.set()
-
-        threading.Thread(target=_await_rec, daemon=True).start()
-        if not _done.wait(timeout=seconds + 2.0):
-            try:
-                sd.stop()
+                if not _claim_fn(_enroll_cell, timeout=1.0):
+                    print("  [enroll_voice] PortAudio reinit in flight — "
+                          "cannot capture right now, try again in a moment")
+                    return None
+                _gate_release = (_release_fn, _enroll_cell)
             except Exception:
-                pass
-            raise TimeoutError(
-                f"sd.rec did not finish within {seconds + 2.0:.0f}s "
-                f"(mic stalled)")
-        if rec is not None and rec.size > 0:
-            arr = rec[:, 0] if rec.ndim > 1 else rec
-            return np.asarray(arr, dtype=np.float32)
-    except Exception as e:
-        print(f"  [enroll_voice] sd.rec failed ({e}); falling back to InputStream")
-
-    # InputStream fallback.
-    import queue
-    chunks: list[np.ndarray] = []
-    q: queue.Queue = queue.Queue()
-
-    def _cb(indata, frames, time_info, status):  # noqa: ARG001
-        mono = indata[:, 0] if indata.ndim > 1 else indata
-        q.put(mono.astype(np.float32, copy=False).copy())
-
-    # 2026-05-29 silent-crash fix: avoid `with sd.InputStream(...)`. The
-    # context manager's __exit__ invokes sd close() unguarded, which has
-    # SIGSEGV'd in production. Route teardown through bobert_companion's
-    # _safe_close_stream when available so close runs on a daemon thread.
-    bc_close = None
-    bc = _bobert()
-    if bc is not None:
-        bc_close = getattr(bc, "_safe_close_stream", None)
+                _gate_release = None   # gate bookkeeping failed — old behaviour
     try:
-        stream = sd.InputStream(
-            samplerate=ENROLL_SAMPLE_RATE,
-            channels=1,
-            dtype="float32",
-            blocksize=1024,
-            device=device,
-            callback=_cb,
-        )
-    except Exception as e:
-        print(f"  [enroll_voice] InputStream open failed: {e}")
-        return None
-    try:
-        stream.start()
-        start = time.time()
-        while (time.time() - start) < seconds:
-            try:
-                chunks.append(q.get(timeout=0.2))
-            except queue.Empty:
-                continue
-    except Exception as e:
-        print(f"  [enroll_voice] InputStream failed: {e}")
-        return None
-    finally:
-        if callable(bc_close):
-            try:
-                bc_close(stream)
-            except Exception:
-                pass
-        else:
-            # Fallback when running stand-alone (no bobert_companion loaded):
-            # mirror the helper inline so we never call close() on the caller
-            # thread without a timeout guard.
-            import threading as _threading
-            try:
-                stream.stop()
-            except Exception:
-                pass
-            _done = _threading.Event()
-            def _close_in_daemon():
+        n_frames = int(seconds * ENROLL_SAMPLE_RATE)
+        device = _input_device()
+        try:
+            # sd.rec is blocking-friendly and matches the simplest path; if it
+            # fails on the user's driver (some USB headsets don't honour
+            # it), fall back to a callback-based InputStream that drains into a
+            # list — that path is known-good from bobert_companion.record_speech.
+            rec = sd.rec(
+                n_frames,
+                samplerate=ENROLL_SAMPLE_RATE,
+                channels=1,
+                dtype="float32",
+                device=device,
+            )
+            # BOUNDED WAIT (2026-07-14 audit). sd.wait() blocks until the recording
+            # finishes — but this runs on the MAIN VOICE THREAD, and a stalled mic
+            # (a device that opens but never delivers its frames) makes it block
+            # FOREVER: JARVIS goes deaf and mute mid-enrolment. Wait on a daemon
+            # instead, bounded to the recording length plus a grace margin; on
+            # overrun, stop the stream and fall through to the InputStream path
+            # below (which the except-branch already handles). The bound is
+            # recording-length-relative so a legitimately long enrolment isn't cut.
+            _done = threading.Event()
+
+            def _await_rec():
                 try:
-                    stream.close()
-                except Exception:
-                    pass
+                    sd.wait()
                 finally:
                     _done.set()
-            _threading.Thread(target=_close_in_daemon, daemon=True).start()
-            if not _done.wait(timeout=2.0):
-                # Escape hatch — mirrors bobert_companion._safe_close_stream.
-                # If close() hangs in the daemon, force every PortAudio stream
-                # to stop globally so the interpreter can exit cleanly instead
-                # of SIGSEGV'ing at sounddevice.py:1167.
+
+            threading.Thread(target=_await_rec, daemon=True).start()
+            if not _done.wait(timeout=seconds + 2.0):
                 try:
-                    import sounddevice as sd
                     sd.stop()
                 except Exception:
                     pass
+                raise TimeoutError(
+                    f"sd.rec did not finish within {seconds + 2.0:.0f}s "
+                    f"(mic stalled)")
+            if rec is not None and rec.size > 0:
+                arr = rec[:, 0] if rec.ndim > 1 else rec
+                return np.asarray(arr, dtype=np.float32)
+        except Exception as e:
+            print(f"  [enroll_voice] sd.rec failed ({e}); falling back to InputStream")
 
-    if not chunks:
-        return None
-    return np.concatenate(chunks).astype(np.float32, copy=False)
+        # InputStream fallback.
+        import queue
+        chunks: list[np.ndarray] = []
+        q: queue.Queue = queue.Queue()
+
+        def _cb(indata, frames, time_info, status):  # noqa: ARG001
+            mono = indata[:, 0] if indata.ndim > 1 else indata
+            q.put(mono.astype(np.float32, copy=False).copy())
+
+        # 2026-05-29 silent-crash fix: avoid `with sd.InputStream(...)`. The
+        # context manager's __exit__ invokes sd close() unguarded, which has
+        # SIGSEGV'd in production. Route teardown through bobert_companion's
+        # _safe_close_stream when available so close runs on a daemon thread.
+        bc_close = None
+        bc = _bobert()
+        if bc is not None:
+            bc_close = getattr(bc, "_safe_close_stream", None)
+        try:
+            stream = sd.InputStream(
+                samplerate=ENROLL_SAMPLE_RATE,
+                channels=1,
+                dtype="float32",
+                blocksize=1024,
+                device=device,
+                callback=_cb,
+            )
+        except Exception as e:
+            print(f"  [enroll_voice] InputStream open failed: {e}")
+            return None
+        try:
+            stream.start()
+            start = time.time()
+            while (time.time() - start) < seconds:
+                try:
+                    chunks.append(q.get(timeout=0.2))
+                except queue.Empty:
+                    continue
+        except Exception as e:
+            print(f"  [enroll_voice] InputStream failed: {e}")
+            return None
+        finally:
+            if callable(bc_close):
+                try:
+                    bc_close(stream)
+                except Exception:
+                    pass
+            else:
+                # Fallback when running stand-alone (no bobert_companion loaded):
+                # mirror the helper inline so we never call close() on the caller
+                # thread without a timeout guard.
+                import threading as _threading
+                try:
+                    stream.stop()
+                except Exception:
+                    pass
+                _done = _threading.Event()
+                def _close_in_daemon():
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                    finally:
+                        _done.set()
+                _threading.Thread(target=_close_in_daemon, daemon=True).start()
+                if not _done.wait(timeout=2.0):
+                    # H-3 (2026-08-20) — STALE-DUPLICATE HALF, deleted in all
+                    # four copies (bobert_companion._safe_close_stream,
+                    # core/wake_word, skills/ambient_listen, this one). The old
+                    # comment claimed sd.stop() forces "every PortAudio stream"
+                    # to stop; sounddevice 0.5.5 (sounddevice.py:406-418) stops
+                    # and closes ONLY `_last_callback`, published solely by
+                    # sd.play()/sd.rec()/sd.playrec(). `stream` here is an
+                    # explicitly constructed InputStream, so the call could not
+                    # free this handle — while it COULD close the host's live
+                    # TTS playback stream (double Pa_CloseStream on one WASAPI
+                    # stream -> 0xc0000374). Abandon the daemon; it dies with
+                    # the process. NOTE: the sd.stop() at the sd.rec bounded
+                    # wait above is a DIFFERENT and legitimate call — that path
+                    # owns `_last_callback` because it called sd.rec itself.
+                    print("  [enroll_voice] stream.close hung >2.0s — "
+                          "abandoning the close daemon (it dies with the "
+                          "process). sd.stop() is deliberately NOT called: it "
+                          "cannot free this InputStream and would instead "
+                          "close a live TTS playback stream.")
+
+        if not chunks:
+            return None
+        return np.concatenate(chunks).astype(np.float32, copy=False)
+    finally:
+        # Release AFTER every capture/teardown path above (incl. the inner
+        # finally's stream close) — close-then-release, so the flag covers the
+        # streams' whole native lifetime.
+        if _gate_release is not None:
+            try:
+                _gate_release[0](_gate_release[1])
+            except Exception:
+                pass
 
 
 def _say(text: str) -> None:

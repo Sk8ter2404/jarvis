@@ -6,6 +6,15 @@ unambiguous confirmation keyword within the window returns False, so a skill
 firing an outbound message never auto-sends on silence, ambiguity, a cancel
 word, or a broken mic / TTS / whisper path.
 
+The single most important thing this suite must model correctly is the return
+contract of ``bobert_companion._speak``: it returns True ONLY when a line was
+actually voiced, and returns None (tray mute — which persists across reboots —
+staging, or nothing audible after tag/markdown stripping) or False (playback
+failure) WITHOUT raising. An earlier revision of this file modelled success as
+``_speak.return_value = None`` — literally the muted value — and modelled "TTS
+down" as an exception production cannot raise, so the whole suite stayed green
+while the gate failed open. Do not reintroduce that shape.
+
 These tests mock the companion (`bobert_companion`) so no real audio I/O runs,
 and point the pending-draft file at a tempdir so nothing writes into the real
 data/ directory. stdlib unittest + unittest.mock only.
@@ -20,21 +29,48 @@ from unittest import mock
 from core import draft_confirm as dc
 
 
-def _fake_companion(*, speak_ok=True, heard=None, record_returns=object(),
+_UNSET = object()
+
+# The REAL return contract of bobert_companion._speak, which this suite must
+# model faithfully or the gate can fail open while the tests stay green:
+#
+#   True   — the line was actually voiced (the ONLY success value).
+#   None   — tray "Mute TTS" is on (persists across reboots) / nothing audible
+#            survived tag+markdown stripping / staging instance. No exception.
+#   False  — synthesis or playback failed (PortAudio, edge-tts, SAPI5).
+#
+# Note what is NOT in that list: raising. Production catches its own errors and
+# returns False, so a suite that models "TTS down" as an exception is testing a
+# path production cannot reach. That is exactly how this gate shipped fail-open.
+_NOT_VOICED_RETURNS = (None, False)
+
+
+def _fake_companion(*, speak_ok=True, speak_returns=_UNSET, speak_raises=None,
+                    heard=None, record_returns=object(),
                     transcribe_meta=None):
     """Build a stand-in bobert_companion module.
 
-    speak_ok        — whether _speak succeeds (False ⇒ TTS down).
+    speak_ok        — True  ⇒ _speak returns True (line genuinely voiced).
+                      False ⇒ _speak returns False (playback failed) — the
+                      real, non-raising TTS-down mode.
+    speak_returns   — override the raw _speak return value outright (e.g.
+                      ``None`` for the muted / staging / nothing-audible
+                      exits, or a truthy non-True object).
+    speak_raises    — make _speak raise instead. Defensive only: production
+                      catches its own errors, but the caller must still fail
+                      closed if a future change lets one escape.
     heard           — the transcribed text returned by transcribe(); when None,
                       record_speech() returns None (silence in the window).
     record_returns  — sentinel audio object handed to transcribe().
     """
     bc = mock.MagicMock(name="bobert_companion")
 
-    if speak_ok:
-        bc._speak.return_value = None
+    if speak_raises is not None:
+        bc._speak.side_effect = speak_raises
+    elif speak_returns is not _UNSET:
+        bc._speak.return_value = speak_returns
     else:
-        bc._speak.side_effect = RuntimeError("tts down")
+        bc._speak.return_value = True if speak_ok else False
 
     if heard is None:
         bc.record_speech.return_value = None          # silence
@@ -104,10 +140,47 @@ class FailClosedTests(DraftConfirmTestBase):
         bc._speak.assert_not_called()
         bc.record_speech.assert_not_called()
 
-    def test_tts_down_fails_closed(self):
+    def test_playback_failure_does_not_open_the_confirm_window(self):
+        # bobert_companion._speak returns False (NOT an exception) when
+        # synthesis/playback fails. The owner heard nothing, so the yes-window
+        # must never open — otherwise a stray "okay" in the room confirms a
+        # send that was never read out.
         bc = _fake_companion(speak_ok=False, heard="yes")
         self.assertFalse(self._run("ship the build", "Sam", companion=bc))
-        # Never even gets to recording once speech failed.
+        bc.record_speech.assert_not_called()
+
+    def test_muted_tts_does_not_open_the_confirm_window(self):
+        # The tray "Mute TTS" toggle makes _speak return None and PERSISTS
+        # ACROSS REBOOTS — a durable disarmed state, not a race. The gate must
+        # refuse, not listen.
+        bc = _fake_companion(speak_returns=None, heard="okay")
+        self.assertFalse(self._run("wire the money", "Sam", companion=bc))
+        bc.record_speech.assert_not_called()
+        bc.transcribe.assert_not_called()
+
+    def test_every_non_voiced_return_fails_closed(self):
+        # Covers mute / staging / nothing-audible (None) and playback
+        # failure (False) in one place, with a confirm word waiting in the mic.
+        for ret in _NOT_VOICED_RETURNS:
+            with self.subTest(speak_returns=ret):
+                bc = _fake_companion(speak_returns=ret, heard="yes go ahead")
+                self.assertFalse(self._run("body", "Sam", companion=bc))
+                bc.record_speech.assert_not_called()
+
+    def test_truthy_non_true_return_fails_closed(self):
+        # The bug that let this ship: `bool(ok)` / plain truthiness passes a
+        # MagicMock. Only a literal True may open the window.
+        bc = _fake_companion(speak_returns=mock.MagicMock(name="truthy"),
+                             heard="yes")
+        self.assertFalse(self._run("body", "Sam", companion=bc))
+        bc.record_speech.assert_not_called()
+
+    def test_speak_raising_fails_closed(self):
+        # Production catches its own errors, but if one ever escapes the
+        # caller must still refuse rather than propagate or auto-send.
+        bc = _fake_companion(speak_raises=RuntimeError("tts down"),
+                             heard="yes")
+        self.assertFalse(self._run("ship the build", "Sam", companion=bc))
         bc.record_speech.assert_not_called()
 
     def test_no_speaker_callable_fails_closed(self):
@@ -151,8 +224,8 @@ class FailClosedTests(DraftConfirmTestBase):
     def test_record_missing_returns_false(self):
         # Companion present but lacks record_speech/transcribe callables.
         bc = mock.MagicMock()
-        bc._speak.return_value = None
-        bc.record_speech = None
+        bc._speak.return_value = True      # readback genuinely voiced...
+        bc.record_speech = None            # ...but the mic path is missing
         bc.transcribe = None
         self.assertFalse(self._run("hi", "x", companion=bc))
 
@@ -231,6 +304,57 @@ class GateRaisesTests(DraftConfirmTestBase):
         with mock.patch.object(dc, "_capture_and_transcribe",
                                side_effect=RuntimeError("surprise")):
             self.assertFalse(self._run("ship it", "Sam", companion=bc))
+
+
+class SpeakContractTests(unittest.TestCase):
+    """Pin core.draft_confirm._speak's own contract: True iff VOICED.
+
+    draft_confirm() gates the confirm window on this bool, so a regression
+    here silently re-arms the fail-open path even if every gate-level test
+    above still passes."""
+
+    def _speak_with(self, companion):
+        with mock.patch.object(dc, "_import_companion", return_value=companion):
+            return dc._speak("read this back")
+
+    def test_true_only_when_companion_returns_literal_true(self):
+        bc = mock.MagicMock()
+        bc._speak.return_value = True
+        self.assertIs(self._speak_with(bc), True)
+        bc._speak.assert_called_once_with("read this back")
+
+    def test_none_return_is_false(self):
+        # muted / staging / nothing audible after stripping
+        bc = mock.MagicMock()
+        bc._speak.return_value = None
+        self.assertIs(self._speak_with(bc), False)
+
+    def test_false_return_is_false(self):
+        # synthesis / playback failure
+        bc = mock.MagicMock()
+        bc._speak.return_value = False
+        self.assertIs(self._speak_with(bc), False)
+
+    def test_truthy_non_true_return_is_false(self):
+        # Guards against a future `bool(ok)` / `if ok:` regression.
+        for truthy in (mock.MagicMock(name="mock"), 1, "voiced", ["x"]):
+            with self.subTest(truthy=truthy):
+                bc = mock.MagicMock()
+                bc._speak.return_value = truthy
+                self.assertIs(self._speak_with(bc), False)
+
+    def test_raise_is_false(self):
+        bc = mock.MagicMock()
+        bc._speak.side_effect = RuntimeError("boom")
+        self.assertIs(self._speak_with(bc), False)
+
+    def test_no_companion_is_false(self):
+        self.assertIs(self._speak_with(None), False)
+
+    def test_non_callable_speaker_is_false(self):
+        bc = mock.MagicMock()
+        bc._speak = "not callable"
+        self.assertIs(self._speak_with(bc), False)
 
 
 if __name__ == "__main__":

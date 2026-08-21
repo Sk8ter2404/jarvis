@@ -24,6 +24,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -170,6 +171,7 @@ def _fake_np():
     np.sin = lambda a: _wrap([0.0 for _ in a]) if isinstance(a, list) else 0.0
     np.linspace = lambda lo, hi, n, dtype=None: _wrap([0.0] * n)
     np.array = lambda seq, dtype=None: _wrap(list(seq))
+    np.concatenate = lambda seqs: _wrap([v for sub in seqs for v in sub])
     return np
 
 
@@ -604,24 +606,90 @@ def make_cv2(open_map=None, frames=None, cascade_empty=False, raise_cascade=Fals
     return cv2
 
 
+# Frames the fake InputStream delivers per start(). The probe's active
+# capture needs int(0.25 * 16000) = 4000 samples and each alternate needs
+# int(0.15 * 16000) = 2400, so one frame of this size always satisfies the
+# drain loop on its first queue.get() and the tests never sit on the
+# wall-clock deadline.
+_PROBE_FRAME_N = 4000
+
+
+def make_probe_stream(on_open=None, value_for=None, n=_PROBE_FRAME_N,
+                      open_raises=False, on_stop=None):
+    """Build a fake ``sd.InputStream`` class for the microphone probe.
+
+    H-4 (2026-08-20): the probe no longer uses the process-global
+    ``sd.rec()``/``sd.wait()`` pair — those bind to sounddevice's single
+    module-global ``_last_callback``, so they cross-close whatever stream
+    ``sd.play()`` last published (0xc0000374). It opens a PRIVATE InputStream
+    and drains it through a queue instead, so the fakes model that.
+
+    ``on_open(kwargs)`` observes each open, ``value_for(device_index)`` picks
+    the sample magnitude (RMS, since every sample is identical), and
+    ``on_stop()`` fires from ``stop()`` for tests that need an owner to appear
+    only AFTER a capture has completed.
+    """
+    _value_for = value_for if value_for is not None else (lambda _dev: 0.0)
+
+    class _ProbeStream:
+        def __init__(self, **kw):
+            self.kw = kw
+            self.started = False
+            self.stopped = False
+            self.closed = False
+            if on_open is not None:
+                on_open(kw)
+            if open_raises:
+                raise RuntimeError("PortAudio exploded")
+            self._val = _value_for(kw.get("device"))
+
+        def start(self):
+            self.started = True
+            cb = self.kw.get("callback")
+            if cb is not None:
+                cb(_FakeFrame([self._val] * n, shape=(n,)), n, None, None)
+
+        def stop(self):
+            self.stopped = True
+            if on_stop is not None:
+                on_stop()
+
+        def close(self):
+            self.closed = True
+
+    return _ProbeStream
+
+
 def make_sounddevice(devices, default_input=0, rec_rms=None, rec_raises=False):
     """Fake sounddevice. ``devices`` is a list of dicts with
-    max_input_channels/name. ``rec_rms`` lets rec()->wait() yield a chosen RMS."""
+    max_input_channels/name. ``rec_rms`` picks the RMS the probe's private
+    InputStream will deliver; ``rec_raises`` makes the open fail.
+
+    ``sd.rec`` / ``sd.wait`` are deliberately LANDMINES: H-4 removed the
+    process-global pair from the probe because both operate on sounddevice's
+    one module-global ``_last_callback`` (published only by
+    play()/rec()/playrec()), so ``sd.rec`` closed the live TTS playback stream
+    and a concurrent ``sd.play`` closed the probe's recording stream mid-wait —
+    two threads inside Pa_CloseStream on one WASAPI stream. Any regression back
+    to them fails every probe test immediately instead of silently."""
     sd = types.ModuleType("sounddevice")
     sd.query_devices = lambda: devices
     sd.default = types.SimpleNamespace(device=(default_input, 1))
+    sd._opens = []
+    val = 0.0 if rec_rms is None else rec_rms
+    sd.InputStream = make_probe_stream(on_open=sd._opens.append,
+                                       value_for=lambda _dev: val,
+                                       open_raises=rec_raises)
 
-    def _rec(n, **k):
-        if rec_raises:
-            raise RuntimeError("PortAudio exploded")
-        # Magnitude chosen so RMS computed by _fake_np equals rec_rms.
-        val = 0.0 if rec_rms is None else rec_rms
-        from tests.skills.test_self_diagnostic import _FakeFrame  # local _Arr-like
-        arr = _FakeFrame([val, val], shape=(2,))
-        return arr
+    def _forbidden(*_a, **_k):
+        raise AssertionError(
+            "the microphone probe must not use the process-global "
+            "sd.rec()/sd.wait() pair (H-4): they bind to sounddevice's "
+            "module-global _last_callback and cross-close the live TTS "
+            "playback stream (0xc0000374)")
 
-    sd.rec = _rec
-    sd.wait = lambda: None
+    sd.rec = _forbidden
+    sd.wait = _forbidden
     return sd
 
 
@@ -1110,18 +1178,18 @@ class MicrophoneProbeTests(_ProbeTestBase):
 
     def _assert_owned_skip(self, bc):
         sd = make_sounddevice([{"name": "Mic", "max_input_channels": 2}])
-        sd.rec = mock.MagicMock(
-            side_effect=AssertionError("sd.rec called while the mic is owned"))
+        sd.InputStream = mock.MagicMock(side_effect=AssertionError(
+            "a capture stream was opened while the mic is owned"))
         with inject_modules(sounddevice=sd), \
              mock.patch.object(self.mod, "_bc", return_value=bc):
             r = self.mod._probe_microphone()
         self.assertTrue(r["ok"])
         self.assertIn("live_capture_skipped", r["details"])
-        self.assertEqual(sd.rec.call_count, 0)
+        self.assertEqual(sd.InputStream.call_count, 0)
 
     def test_skips_live_capture_when_record_speech_active(self):
         # THE regression from the audit card: standby (_sleep_mode True)
-        # with record_speech holding the device must NOT open sd.rec().
+        # with record_speech holding the device must NOT open a capture.
         self._assert_owned_skip(self._owned_bc(_record_speech_active=[True]))
 
     def test_skips_live_capture_when_pathb_mic_active(self):
@@ -1139,21 +1207,17 @@ class MicrophoneProbeTests(_ProbeTestBase):
         # the probe must still measure RMS (the skip must not overtrigger).
         sd = make_sounddevice([{"name": "Mic", "max_input_channels": 2}],
                               rec_rms=0.5)
-        rec_calls = []
-        orig_rec = sd.rec
-
-        def _rec(n, **k):
-            rec_calls.append(k)
-            return orig_rec(n, **k)
-
-        sd.rec = _rec
         with inject_modules(sounddevice=sd, numpy=_fake_np()), \
              mock.patch.object(self.mod, "_bc",
                                return_value=self._owned_bc()):
             r = self.mod._probe_microphone()
         self.assertTrue(r["ok"])
         self.assertNotIn("live_capture_skipped", r["details"])
-        self.assertEqual(len(rec_calls), 1)   # active-device capture ran
+        self.assertEqual(len(sd._opens), 1)   # active-device capture ran
+        # H-4: the capture must be a PRIVATE stream — never published into
+        # sounddevice's module-global _last_callback.
+        self.assertEqual(sd._opens[0]["channels"], 1)
+        self.assertTrue(callable(sd._opens[0]["callback"]))
 
     def test_standby_flags_absent_still_captures(self):
         # A bc lacking the ownership attributes entirely (early boot,
@@ -1179,21 +1243,126 @@ class MicrophoneProbeTests(_ProbeTestBase):
         ]
         sd = make_sounddevice(devices, default_input=0)
         flag = [False]
-        rec_count = [0]
-
-        def _rec(n, device=None, **k):
-            rec_count[0] += 1
-            flag[0] = True        # record_speech grabs the mic mid-probe
-            return _FakeFrame([0.0, 0.0], shape=(2,))
-
-        sd.rec = _rec
+        opens = []
+        # The owner appears once the first capture has finished (stop()), so
+        # the ACTIVE capture completes and the ALTERNATES scan must bail.
+        sd.InputStream = make_probe_stream(
+            on_open=opens.append,
+            on_stop=lambda: flag.__setitem__(0, True))
         bc = self._owned_bc(_record_speech_active=flag)
         with inject_modules(sounddevice=sd, numpy=_fake_np()), \
              mock.patch.object(self.mod, "_bc", return_value=bc):
             r = self.mod._probe_microphone()
         self.assertTrue(r["ok"])
         self.assertIn("live_capture_skipped", r["details"])
-        self.assertEqual(rec_count[0], 1)  # only the active capture ran
+        self.assertEqual(len(opens), 1)  # only the active capture ran
+
+    # ── 2026-08-14 teardown gate: the probe claims the monolith's
+    # _diag_capture_active refcount around ALL its sd.rec captures, so
+    # _refresh_devices can never reinit PortAudio under a live probe
+    # capture; a refused claim (reinit in flight) skips the captures. ──
+    @staticmethod
+    def _gate_recorders(events, cell):
+        """(claim, release) fns that mimic bobert's _pa_claim_owner /
+        _pa_release_owner refcount semantics and log to ``events``."""
+        def _claim(c, refcount=False, timeout=1.0, deny_if=None):
+            events.append(("claim", refcount))
+            c[0] = (int(c[0]) + 1) if refcount else True
+            return True
+
+        def _release(c, refcount=False):
+            events.append(("release", refcount))
+            c[0] = max(0, int(c[0]) - 1) if refcount else False
+
+        return _claim, _release
+
+    def test_probe_claims_diag_cell_around_all_captures(self):
+        devices = [
+            {"name": "Active Mic", "max_input_channels": 2},   # idx 0 (active)
+            {"name": "Backup Mic", "max_input_channels": 2},   # idx 1 alt
+        ]
+        sd = make_sounddevice(devices, default_input=0)
+        cell = [0]
+        events: list = []
+        sd.InputStream = make_probe_stream(
+            on_open=lambda _kw: events.append(("open", cell[0])))
+        claim, release = self._gate_recorders(events, cell)
+        bc = self._owned_bc(_diag_capture_active=cell,
+                            _pa_claim_owner=claim,
+                            _pa_release_owner=release)
+        with inject_modules(sounddevice=sd, numpy=_fake_np()), \
+             mock.patch.object(self.mod, "_bc", return_value=bc), \
+             mock.patch.object(self.mod, "_windows_microphone_hardware_count",
+                               return_value=1):
+            r = self.mod._probe_microphone()
+        self.assertFalse(r["ok"])          # all silent — normal LOW verdict
+        rec_events = [e for e in events if e[0] == "open"]
+        self.assertEqual(len(rec_events), 2, "active + one alternate captured")
+        self.assertTrue(all(count > 0 for _tag, count in rec_events),
+                        "every capture stream must be opened while the diag "
+                        "refcount is held")
+        self.assertEqual(events[0], ("claim", True),
+                         "the claim must precede the first capture (refcount)")
+        self.assertEqual(events[-1], ("release", True),
+                         "the release must follow the last capture (refcount)")
+        self.assertEqual(cell[0], 0, "claimed exactly once, released exactly once")
+
+    def test_probe_skips_captures_when_gate_claim_fails(self):
+        sd = make_sounddevice([{"name": "Mic", "max_input_channels": 2}])
+        sd.InputStream = mock.MagicMock(side_effect=AssertionError(
+            "no capture stream may be opened on a refused claim"))
+        bc = self._owned_bc(_diag_capture_active=[0],
+                            _pa_claim_owner=lambda c, **k: False,
+                            _pa_release_owner=lambda c, **k: None)
+        with inject_modules(sounddevice=sd, numpy=_fake_np()), \
+             mock.patch.object(self.mod, "_bc", return_value=bc):
+            r = self.mod._probe_microphone()
+        self.assertTrue(r["ok"])
+        self.assertIn("live_capture_skipped", r["details"])
+        self.assertIn("reinit", r["details"]["live_capture_skipped"])
+        self.assertEqual(sd.InputStream.call_count, 0)
+
+    def test_probe_releases_gate_on_mid_scan_abort(self):
+        # The finally must release the refcount on the early owner-appeared
+        # return too — a stranded count would defer every future reinit
+        # forever (the known stuck-flag failure mode).
+        devices = [
+            {"name": "Active Mic", "max_input_channels": 2},
+            {"name": "Backup Mic", "max_input_channels": 2},
+        ]
+        sd = make_sounddevice(devices, default_input=0)
+        flag = [False]
+        sd.InputStream = make_probe_stream(
+            on_stop=lambda: flag.__setitem__(0, True))
+        cell = [0]
+        events: list = []
+        claim, release = self._gate_recorders(events, cell)
+        bc = self._owned_bc(_record_speech_active=flag,
+                            _diag_capture_active=cell,
+                            _pa_claim_owner=claim,
+                            _pa_release_owner=release)
+        with inject_modules(sounddevice=sd, numpy=_fake_np()), \
+             mock.patch.object(self.mod, "_bc", return_value=bc):
+            r = self.mod._probe_microphone()
+        self.assertTrue(r["ok"])
+        self.assertIn("live_capture_skipped", r["details"])
+        self.assertEqual(cell[0], 0,
+                         "the mid-scan early return must still release the "
+                         "diag refcount")
+        self.assertEqual(events[-1][0], "release")
+
+    def test_probe_gate_absent_degrades_to_unguarded_capture(self):
+        # A host without the gate API (older monolith / SimpleNamespace
+        # double) must degrade to the old unguarded capture — no raise, no
+        # skip. (_owned_bc has no _pa_claim_owner.)
+        sd = make_sounddevice([{"name": "Mic", "max_input_channels": 2}],
+                              rec_rms=0.5)
+        with inject_modules(sounddevice=sd, numpy=_fake_np()), \
+             mock.patch.object(self.mod, "_bc",
+                               return_value=self._owned_bc()):
+            r = self.mod._probe_microphone()
+        self.assertTrue(r["ok"])
+        self.assertNotIn("live_capture_skipped", r["details"])
 
     def test_numpy_missing_when_capturing(self):
         sd = make_sounddevice([{"name": "Mic", "max_input_channels": 2}])
@@ -1231,12 +1400,9 @@ class MicrophoneProbeTests(_ProbeTestBase):
             {"name": "Backup Mic", "max_input_channels": 2},   # idx 1
         ]
         sd = make_sounddevice(devices, default_input=0)
-        # Active silent, alternate loud: vary rec by device index.
-        def _rec(n, device=None, **k):
-            from tests.skills.test_self_diagnostic import _FakeFrame
-            val = 0.5 if device == 1 else 0.0
-            return _FakeFrame([val, val], shape=(2,))
-        sd.rec = _rec
+        # Active silent, alternate loud: vary the delivered level by device.
+        sd.InputStream = make_probe_stream(
+            value_for=lambda device: 0.5 if device == 1 else 0.0)
         with inject_modules(sounddevice=sd, numpy=_fake_np()), \
              mock.patch.object(self.mod, "_bc", return_value=None), \
              mock.patch.object(self.mod, "_windows_microphone_hardware_count",
@@ -1267,6 +1433,214 @@ class MicrophoneProbeTests(_ProbeTestBase):
             r = self.mod._probe_microphone()
         self.assertFalse(r["ok"])
         self.assertIn("active_capture_error", r["details"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  H-4 (2026-08-20): the probe's capture must be a PRIVATE InputStream
+#
+#  The old capture was `sd.rec(...)` + `sd.wait()`. Both are process-global:
+#  sounddevice keeps ONE module-level `_last_callback`, published only by
+#  play()/rec()/playrec(), and `_CallbackContext.start_stream` opens with
+#  `stop()` — which stops AND closes whatever was there. So the probe's rec
+#  closed the monolith's live TTS playback stream, and a concurrent sd.play()
+#  closed the probe's recording stream mid-capture, waking `sd.wait()` whose
+#  finally closes the SAME handle from a second thread. `_StreamBase.close`
+#  calls Pa_CloseStream and only then nulls `_ptr`, with no lock — two
+#  concurrent Pa_CloseStream on one WASAPI stream is 0xc0000374, the exact
+#  crash the monolith's _reap_playback contract forbids. And `sd.wait()` is
+#  unbounded while the thread holds the _diag_capture_active refcount, which
+#  _run_with_timeout can only ABANDON — the same defect the enroll_voice twin
+#  was fixed for on 2026-07-14.
+# ═══════════════════════════════════════════════════════════════════════════
+class MicProbePrivateStreamTests(_ProbeTestBase):
+    @staticmethod
+    def _owned_bc(**overrides):
+        base = dict(_sleep_mode=[True],
+                    _mic_input_disabled=lambda: False,
+                    get_input_device=lambda: 0,
+                    _record_speech_active=[False],
+                    _pathb_mic_active=[False],
+                    _ambient_stream_active=[0],
+                    _tts_playback_active=[False])
+        base.update(overrides)
+        return types.SimpleNamespace(**base)
+
+    def test_probe_source_never_calls_the_process_global_sd_api(self):
+        # THE invariant. A source scan, not a behavioural one: a future edit
+        # that reintroduces sd.rec/sd.wait/sd.play/sd.stop anywhere in the
+        # probe fails here even if it happens to pass on a quiet machine.
+        import ast
+        import inspect
+        import textwrap
+        mod, _ = load_skill_isolated("self_diagnostic")
+        src = textwrap.dedent(inspect.getsource(mod._probe_microphone))
+        tree = ast.parse(src)
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            if (isinstance(fn, ast.Attribute)
+                    and isinstance(fn.value, ast.Name) and fn.value.id == "sd"
+                    and fn.attr in ("rec", "wait", "play", "playrec", "stop")):
+                offenders.append(f"sd.{fn.attr}() at line {node.lineno}")
+        self.assertEqual(
+            offenders, [],
+            "the microphone probe must never use sounddevice's process-global "
+            "convenience API — every one of those calls operates on the single "
+            "module-global _last_callback, cross-closing whichever stream "
+            "sd.play() last published (0xc0000374). Open a private "
+            f"sd.InputStream instead. Found: {offenders}")
+
+    def test_probe_source_opens_a_private_input_stream(self):
+        import inspect
+        mod, _ = load_skill_isolated("self_diagnostic")
+        src = inspect.getsource(mod._probe_microphone)
+        self.assertIn("sd.InputStream(", src,
+                      "the probe must open its own InputStream — a private "
+                      "stream is never published into _last_callback")
+
+    def test_capture_stream_is_stopped_and_closed(self):
+        # close-then-release: the native handle must be gone before the
+        # _diag_capture_active refcount drops, or the teardown gate can latch
+        # mid-close (0xc0000374).
+        streams = []
+        sd = make_sounddevice([{"name": "Mic", "max_input_channels": 2}],
+                              rec_rms=0.5)
+        base = make_probe_stream(value_for=lambda _d: 0.5)
+
+        class _Tracking(base):
+            def __init__(self, **kw):
+                super().__init__(**kw)
+                streams.append(self)
+
+        sd.InputStream = _Tracking
+        with inject_modules(sounddevice=sd, numpy=_fake_np()), \
+             mock.patch.object(self.mod, "_bc",
+                               return_value=self._owned_bc()):
+            r = self.mod._probe_microphone()
+        self.assertTrue(r["ok"])
+        self.assertEqual(len(streams), 1)
+        self.assertTrue(streams[0].started)
+        self.assertTrue(streams[0].stopped)
+        self.assertTrue(streams[0].closed)
+
+    def test_capture_teardown_prefers_the_host_guarded_closer(self):
+        # bobert_companion._safe_close_stream is the ONE closer that registers
+        # an abandoned native Pa_CloseStream with the teardown gate
+        # (_pa_close_pending). When the monolith is loaded the probe must use
+        # it rather than closing inline.
+        closed = []
+        sd = make_sounddevice([{"name": "Mic", "max_input_channels": 2}],
+                              rec_rms=0.5)
+        bc = self._owned_bc(_safe_close_stream=closed.append)
+        with inject_modules(sounddevice=sd, numpy=_fake_np()), \
+             mock.patch.object(self.mod, "_bc", return_value=bc):
+            r = self.mod._probe_microphone()
+        self.assertTrue(r["ok"])
+        self.assertEqual(len(closed), 1,
+                         "the probe must tear its capture stream down through "
+                         "bc._safe_close_stream when the host exposes it")
+
+    def test_capture_is_bounded_when_the_mic_delivers_no_frames(self):
+        # THE second half of H-4. A device that opens but never delivers a
+        # frame used to park sd.wait() forever on a thread holding the
+        # _diag_capture_active refcount — _run_with_timeout only ABANDONS that
+        # thread, so the count was pinned and _refresh_devices deferred every
+        # PortAudio re-enumeration for the rest of the session. The wall-clock
+        # deadline must end the capture and the finally must release.
+        sd = make_sounddevice([{"name": "Mic", "max_input_channels": 2}])
+
+        class _Silent:
+            """Opens fine, never invokes the callback."""
+            def __init__(self, **kw):
+                self.kw = kw
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+            def close(self):
+                pass
+
+        sd.InputStream = _Silent
+        cell = [0]
+        events: list = []
+
+        def _claim(c, refcount=False, timeout=1.0, deny_if=None):
+            events.append("claim")
+            c[0] = (int(c[0]) + 1) if refcount else True
+            return True
+
+        def _release(c, refcount=False):
+            events.append("release")
+            c[0] = max(0, int(c[0]) - 1) if refcount else False
+
+        bc = self._owned_bc(_diag_capture_active=cell,
+                            _pa_claim_owner=_claim,
+                            _pa_release_owner=_release)
+        t0 = time.monotonic()
+        with inject_modules(sounddevice=sd, numpy=_fake_np()), \
+             mock.patch.object(self.mod, "_bc", return_value=bc), \
+             mock.patch.object(self.mod, "_windows_microphone_hardware_count",
+                               return_value=1):
+            r = self.mod._probe_microphone()
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 8.0,
+                        "a mic that delivers no frames must not park the probe")
+        self.assertIn("active_capture_error", r["details"])
+        self.assertIn("TimeoutError", r["details"]["active_capture_error"])
+        self.assertEqual(cell[0], 0,
+                         "a stalled capture must not pin the diag refcount — "
+                         "a pinned count defers PortAudio re-enumeration for "
+                         "the life of the process")
+        self.assertEqual(events[-1], "release")
+
+    def test_owner_appearing_DURING_a_capture_yields_the_device(self):
+        # The pre-capture ownership checks are check-then-act instants; the
+        # hazard is span-long, because a background _speak can begin inside
+        # the 0.25 s capture. The drain loop must re-check and bail.
+        sd = make_sounddevice([{"name": "Mic", "max_input_channels": 2}])
+        flag = [False]
+        pushes = [0]
+
+        class _Trickle:
+            """Delivers one small frame per callback drive, flipping the TTS
+            ownership flag after the first one — i.e. mid-capture."""
+            def __init__(self, **kw):
+                self.kw = kw
+                self.closed = False
+
+            def start(self):
+                cb = self.kw.get("callback")
+                # one frame far short of `need`, so the drain loop must
+                # iterate again — and on that iteration the owner is live
+                cb(_FakeFrame([0.4] * 16, shape=(16,)), 16, None, None)
+                pushes[0] += 1
+                flag[0] = True          # a background _speak just started
+
+            def stop(self):
+                pass
+
+            def close(self):
+                self.closed = True
+
+        sd.InputStream = _Trickle
+        bc = self._owned_bc(_tts_playback_active=flag)
+        t0 = time.monotonic()
+        with inject_modules(sounddevice=sd, numpy=_fake_np()), \
+             mock.patch.object(self.mod, "_bc", return_value=bc), \
+             mock.patch.object(self.mod, "_windows_microphone_hardware_count",
+                               return_value=1):
+            r = self.mod._probe_microphone()
+        elapsed = time.monotonic() - t0
+        self.assertEqual(pushes[0], 1, "exactly one capture was opened")
+        self.assertLess(elapsed, 3.0,
+                        "the capture must yield as soon as an owner appears, "
+                        "not sit out its full deadline")
+        self.assertTrue(r["ok"] or "rms" in r["details"])
 
 
 # ─── microphone helpers ──────────────────────────────────────────────────
@@ -3605,16 +3979,27 @@ class StaleDuplicateInvariantTests(unittest.TestCase):
 
     def test_mic_probe_gates_on_all_ownership_flags(self):
         # The canonical mic-ownership rule lives in bobert_companion's
-        # _refresh_devices guard (_record_speech_active / _pathb_mic_active
-        # / _ambient_stream_active / _tts_playback_active). The probe must
-        # mirror ALL of them — the 2026-07-21 audit found it gating on the
-        # _sleep_mode conversation latch instead, so it opened sd.rec()
-        # exactly when standby's record_speech held the device.
+        # _pa_streams_live (the owner list _refresh_devices' teardown gate
+        # checks): _record_speech_active / _pathb_mic_active /
+        # _ambient_stream_active / _tts_playback_active, plus the 2026-08-14
+        # _enroll_capture_active cell. The probe must mirror ALL of them
+        # (its own _diag_capture_active claim is the documented exception —
+        # consulting it would make the probe defer against itself) — the
+        # 2026-07-21 audit found it gating on the _sleep_mode conversation
+        # latch instead, so it opened sd.rec() exactly when standby's
+        # record_speech held the device.
         import inspect
         mod, _ = load_skill_isolated("self_diagnostic")
         src = inspect.getsource(mod._probe_microphone)
         for flag in ("_record_speech_active", "_pathb_mic_active",
-                     "_ambient_stream_active", "_tts_playback_active"):
+                     "_ambient_stream_active", "_tts_playback_active",
+                     "_enroll_capture_active",
+                     # H-6 (2026-08-20): an abandoned native Pa_CloseStream.
+                     # The owner flag above it is legitimately down while
+                     # PortAudio is still executing the close, so the probe
+                     # must defer on this cell too or its sd.rec() lands in
+                     # the same hazard window.
+                     "_pa_close_pending"):
             self.assertIn(flag, src,
                           f"_probe_microphone no longer consults the "
                           f"{flag} mic-ownership flag")

@@ -1,18 +1,28 @@
 """
-Smart-home discovery wizard via Alexa.
+Smart-home discovery — Alexa + live LAN.
 
-One-time wizard that signs into Amazon Alexa, enumerates every smart
-home device the user's Alexa account controls (lights, locks, plugs,
-thermostats, cameras, scenes), cross-references each entry with a LAN
-ARP scan to recover IP + MAC where possible, and writes a canonical
-device catalog at `data/smart_home_devices.json` for the smart-home
-router (`core/smart_home_router.py`, research-4b) to dispatch per-brand
-direct API calls without ongoing Alexa dependency.
+Populates the canonical device catalog at `data/smart_home_devices.json`
+from TWO sources, each reported honestly per-source:
 
-After the first successful run the cookie is cached at
+  1. Live LAN discovery via the brand controller skills
+     (sh_kasa / sh_tuya / sh_govee / sh_hue `list_devices()`), bounded
+     by per-source and overall deadlines — needs no Amazon account.
+  2. The Amazon Alexa graph (via alexapy + a cached cookie), which adds
+     rooms, groups and entity ids when a cached sign-in is available.
+
+Records from both sources are merged (a LAN record enriches its Alexa
+twin instead of duplicating it), cross-referenced against a LAN ARP
+scan to recover IP + MAC where possible, and consumed by the smart-home
+router (`core/smart_home_router.py`, research-4b) which dispatches
+per-brand direct API calls without ongoing Alexa dependency.
+
+The FIRST Amazon sign-in is a one-time console wizard (run
+`python -m skills.smart_home_discover`); it caches the cookie at
 `data/alexa_cookie.json` (metadata) plus `data/alexa_cookie.pickle`
 (the alexapy-format jar) — subsequent runs reuse the cookie until it
-expires.
+expires. The voice action never blocks on a terminal: without a cached
+cookie it still runs the LAN phase and reports the Alexa source as
+unavailable.
 
 Registered actions
 ------------------
@@ -29,9 +39,10 @@ Voice trigger hints (handled by the LLM via these action names):
     'JARVIS, refresh smart home catalog'
 
 Optional dependency:
-    alexapy   ← REQUIRED  (pip install alexapy)
-              Falls back to a graceful 'not installed' message and
-              leaves the rest of JARVIS untouched.
+    alexapy   ← needed only for the Alexa source (pip install alexapy).
+              When absent the LAN sources still run; the summary
+              reports Alexa discovery as unavailable and the rest of
+              JARVIS is untouched.
 
 For brands found by Alexa but without a JARVIS controller skill yet,
 the wizard appends a self-implementing task to `jarvis_todo.md` so the
@@ -83,6 +94,21 @@ _COOKIE_SUGGEST_REFRESH_DAYS = 300
 # with no timeout would wedge the whole voice loop. 45s is generous for a warm
 # cookie fetch yet bounded enough to fail fast and speak a timeout notice.
 _DISCOVERY_TIMEOUT_SEC = 45.0
+
+# Live-LAN discovery sources — each is a brand controller skill exposing the
+# uniform `list_devices()` API. The catalog is built from these PLUS the Alexa
+# fetch, so a dead Alexa cookie can no longer leave the catalog empty forever.
+_LAN_SOURCES = ("sh_kasa", "sh_tuya", "sh_govee", "sh_hue")
+_LAN_SOURCE_LABELS = {"sh_kasa": "Kasa", "sh_tuya": "Tuya",
+                      "sh_govee": "Govee", "sh_hue": "Hue"}
+# Bounds for the LAN phase (voice dispatch thread — must never wedge). The
+# per-source ceiling covers the worst internal budgets (kasa 5s UDP broadcast,
+# govee 1.5s LAN + 6s cloud, hue 4s meethue + 3s bridge connect, tuya ~0);
+# the overall deadline is shared by all source threads joined in parallel.
+# Stragglers are abandoned as daemon threads — the established pattern of
+# `_run_async` below and sh_hue._threaded_connect.
+_LAN_SOURCE_TIMEOUT_SEC = 12.0
+_LAN_TOTAL_TIMEOUT_SEC = 15.0
 
 # Brand string → controller skill name. alexapy returns free-form
 # manufacturer strings ('Philips Hue', 'Signify Netherlands B.V.',
@@ -249,35 +275,42 @@ def _load_catalog() -> dict | None:
 # Fields that the user may hand-edit in data/smart_home_devices.json.
 # A re-run of the wizard preserves any non-empty existing value for these
 # fields, so a manual rename or controller override survives. All other
-# fields are refreshed from the live discovery.
+# fields are refreshed from the live discovery. EXCEPTION: for a record the
+# LIVE LAN scan just produced (`source` starts with "lan:"), the fresh
+# `lan_ip`/`lan_mac` win — a scan answer is ground truth and DHCP moves IPs,
+# so preserving a stale manual address would break direct control.
 _USER_OVERRIDE_FIELDS = ("name", "controller_skill", "lan_ip", "lan_mac")
 
 
 def _merge_with_existing_catalog(fresh: dict) -> dict:
     """Merge a freshly-built catalog with the existing on-disk catalog,
     preserving user overrides to the fields listed in
-    `_USER_OVERRIDE_FIELDS`. Devices are matched by `alexa_entity_id`;
-    devices absent from the existing file are kept as-is from `fresh`,
-    and devices absent from `fresh` (i.e. removed in Alexa) are dropped."""
+    `_USER_OVERRIDE_FIELDS`. Devices are matched by `alexa_entity_id`
+    (Alexa records) or `device_id` (LAN records); devices absent from the
+    existing file are kept as-is from `fresh`, and devices absent from
+    `fresh` (i.e. removed at the source) are dropped."""
     existing = _load_catalog()
     if not existing or not isinstance(existing.get("devices"), list):
         return fresh
     by_id: dict[str, dict] = {}
     for d in existing["devices"]:
         if isinstance(d, dict):
-            eid = d.get("alexa_entity_id")
+            eid = d.get("alexa_entity_id") or d.get("device_id")
             if eid:
                 by_id[eid] = d
     if not by_id:
         return fresh
     for d in fresh.get("devices", []):
-        eid = d.get("alexa_entity_id")
+        eid = d.get("alexa_entity_id") or d.get("device_id")
         if not eid:
             continue
         prev = by_id.get(eid)
         if not prev:
             continue
+        fresh_is_lan = str(d.get("source") or "").startswith("lan:")
         for k in _USER_OVERRIDE_FIELDS:
+            if fresh_is_lan and k in ("lan_ip", "lan_mac"):
+                continue    # live scan wins for addresses (see comment above)
             old = prev.get(k)
             if old not in (None, "", []):
                 d[k] = old
@@ -989,6 +1022,198 @@ def _build_catalog(devices: dict, arp_table: list[dict]) -> dict:
     }
 
 
+# ── live-LAN catalog sources ────────────────────────────────────────
+def _lan_record(source: str, dev: dict, arp_table: list[dict]) -> dict:
+    """Convert one brand-skill `list_devices()` dict into a canonical catalog
+    record. Every key starting with "_" is DROPPED — sh_tuya's `_tuya` carries
+    the secret local key, and credentials must never be written into the
+    catalog. `device_id` is stable across scans: keyed on the ARP-resolved MAC
+    when the record's lan_ip matched a row, else on the source + name slug."""
+    rec: dict[str, Any] = {}
+    for k, v in dev.items():
+        if isinstance(k, str) and k.startswith("_"):
+            continue
+        rec[k] = v
+    name = str(rec.get("name") or "").strip() or "(unnamed)"
+    rec["name"] = name
+    rec["brand"] = _normalise_brand(rec.get("brand"))
+    rec["model"] = rec.get("model") or ""
+    rec["type"] = rec.get("type") or "unknown"
+    rec["capabilities"] = rec.get("capabilities") or []
+    rec["lan_ip"] = str(rec.get("lan_ip") or "").strip()
+    rec["alexa_entity_id"] = ""
+    rec["alexa_room"] = ""
+    rec["alexa_groups"] = []
+    rec["controller_skill"] = source
+    rec["source"] = f"lan:{source}"
+    mac = ""
+    for row in arp_table:
+        if rec["lan_ip"] and row.get("ip") == rec["lan_ip"]:
+            mac = row.get("mac") or ""
+            break
+    rec["lan_mac"] = mac
+    if mac:
+        rec["device_id"] = "mac:" + mac
+    else:
+        slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "unknown"
+        rec["device_id"] = f"lan:{source}:{slug}"
+    return rec
+
+
+def _lan_discover_all(arp_table: list[dict]) -> tuple[list[dict], dict]:
+    """Scan every `_LAN_SOURCES` brand skill in parallel daemon threads,
+    bounded by `_LAN_SOURCE_TIMEOUT_SEC` per source under one overall
+    `_LAN_TOTAL_TIMEOUT_SEC` deadline. A straggler is abandoned (daemon —
+    same pattern as `_run_async`); a raising source degrades to its own
+    error entry without touching the others.
+
+    Returns (records, status) where status maps each source name to
+    {"ok": bool, "count": int, "error": str?}."""
+    # Lazy import so the two modules keep no import-time cycle (the router
+    # already lazy-imports this module inside its own functions). The loader
+    # lookup rule lives in ONE place — core.smart_home_router._skill_module.
+    try:
+        from core.smart_home_router import _skill_module
+    except Exception as e:
+        err = f"skill loader unavailable: {e}"
+        return [], {s: {"ok": False, "count": 0, "error": err}
+                    for s in _LAN_SOURCES}
+
+    status: dict[str, dict] = {}
+    records: list[dict] = []
+    results: dict[str, Any] = {}
+    threads: dict[str, threading.Thread] = {}
+    for source in _LAN_SOURCES:
+        try:
+            mod = _skill_module(source)
+        except Exception:
+            mod = None
+        fn = getattr(mod, "list_devices", None) if mod is not None else None
+        if not callable(fn):
+            status[source] = {"ok": False, "count": 0,
+                              "error": "skill unavailable"}
+            continue
+
+        def _worker(source: str = source, fn: Any = fn) -> None:
+            try:
+                results[source] = list(fn() or [])
+            except Exception as e:
+                results[source] = e
+
+        t = threading.Thread(target=_worker, daemon=True,
+                             name=f"sh-discover-lan-{source}")
+        t.start()
+        threads[source] = t
+
+    deadline = time.monotonic() + _LAN_TOTAL_TIMEOUT_SEC
+    for source, t in threads.items():
+        remaining = max(0.0, deadline - time.monotonic())
+        t.join(min(_LAN_SOURCE_TIMEOUT_SEC, remaining))
+        got = results.get(source)
+        if t.is_alive():
+            status[source] = {"ok": False, "count": 0, "error": "timed out"}
+            print(f"  [sh-discover] {source} LAN scan timed out; abandoned.")
+            continue
+        if isinstance(got, Exception):
+            status[source] = {"ok": False, "count": 0, "error": str(got)}
+            print(f"  [sh-discover] {source} LAN scan failed: {got}")
+            continue
+        recs = [_lan_record(source, d, arp_table)
+                for d in (got or []) if isinstance(d, dict)]
+        records.extend(recs)
+        status[source] = {"ok": True, "count": len(recs)}
+        print(f"  [sh-discover] {source}: {len(recs)} device(s) on the LAN.")
+    return records, status
+
+
+def _alexa_status_from_devices(devices: dict | None) -> dict:
+    """Honest per-source status for a completed (non-raising) Alexa fetch."""
+    n = len((devices or {}).get("smarthome") or [])
+    if n:
+        return {"ok": True, "count": n}
+    return {"ok": False, "count": 0, "console": True,
+            "error": ("the device fetch returned no devices — the cached "
+                      "cookie may be expired")}
+
+
+def _dedupe_key(rec: dict) -> tuple[str, str]:
+    """Cross-source identity: same controller skill (or brand) + same name.
+    The normal case is Alexa mirroring the LAN alias, so a LAN record lands on
+    its Alexa twin and enriches it instead of duplicating."""
+    return ((rec.get("controller_skill")
+             or (rec.get("brand") or "").lower() or ""),
+            (rec.get("name") or "").strip().lower())
+
+
+def _build_catalog_v2(alexa_devices: dict | None, alexa_status: dict,
+                      lan_records: list[dict], lan_status: dict,
+                      arp_table: list[dict], force: bool = False) -> dict:
+    """Assemble the merged Alexa + LAN catalog.
+
+    Alexa records go through the UNCHANGED `_entity_to_record`/`_build_catalog`
+    machinery; LAN records that share a `_dedupe_key` with an Alexa record
+    enrich it (fill empty lan_ip/lan_mac/device_id) instead of duplicating.
+    Non-force runs UNION-preserve prior on-disk `lan:*` devices whose identity
+    wasn't re-found — one missed UDP broadcast must not evict a plug (sh_kasa
+    re-resolves by name at control time); `force` rebuilds clean.
+
+    Output keeps the v1 shape plus an additive `sources` map (the router reads
+    catalog fields only via .get, so version 2 is backward-compatible)."""
+    base = _build_catalog(
+        alexa_devices if isinstance(alexa_devices, dict) else {}, arp_table)
+    records: list[dict] = []
+    by_key: dict[tuple[str, str], dict] = {}
+    for r in base["devices"]:
+        r.setdefault("source", "alexa")
+        records.append(r)
+        by_key[_dedupe_key(r)] = r
+    for lr in lan_records:
+        key = _dedupe_key(lr)
+        prev = by_key.get(key)
+        if prev is not None:
+            for f in ("lan_ip", "lan_mac", "device_id"):
+                if not prev.get(f) and lr.get(f):
+                    prev[f] = lr[f]
+            continue
+        by_key[key] = lr
+        records.append(lr)
+    if not force:
+        prior = _load_catalog()
+        prior_devices = (prior or {}).get("devices") \
+            if isinstance(prior, dict) else None
+        if isinstance(prior_devices, list):
+            present_ids = {r.get("device_id") for r in records
+                           if r.get("device_id")}
+            for d in prior_devices:
+                if not isinstance(d, dict):
+                    continue
+                if not str(d.get("source") or "").startswith("lan:"):
+                    continue
+                if d.get("device_id") in present_ids \
+                        or _dedupe_key(d) in by_key:
+                    continue
+                records.append(d)
+                by_key[_dedupe_key(d)] = d
+                if d.get("device_id"):
+                    present_ids.add(d.get("device_id"))
+    records.sort(key=lambda r: ((r.get("alexa_room") or "").lower(),
+                                (r.get("name") or "").lower()))
+    sources = {"alexa": dict(alexa_status or {})}
+    for s in _LAN_SOURCES:
+        sources[s] = dict((lan_status or {}).get(s)
+                          or {"ok": False, "count": 0, "error": "not scanned"})
+    return {
+        "version": 2,
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat() + "Z",
+        "device_count": len(records),
+        "echo_count": base["echo_count"],
+        "group_count": base["group_count"],
+        "arp_seen": len(arp_table),
+        "sources": sources,
+        "devices": records,
+    }
+
+
 def _queue_missing_skill_tasks(catalog: dict) -> int:
     """Append one self-implementing task per unknown brand to
     jarvis_todo.md so the upgrade pipeline can build the missing
@@ -1131,6 +1356,9 @@ def _prompt_credentials() -> tuple[str, str] | None:
     return (email, password)
 
 
+# Spoken only as the Alexa-unavailable suffix (status["console"] True) and by
+# the explicit reauth path — the LAN phase runs regardless, so this hint no
+# longer gates the whole discovery.
 _CLI_HINT = (
     "Sir, the smart-home discovery wizard needs an interactive terminal "
     "for Amazon sign-in. Please run "
@@ -1138,55 +1366,71 @@ _CLI_HINT = (
 )
 
 
-def smart_home_discover(arg: str = "") -> str:
-    """Voice action — non-blocking. Defers the interactive sign-in flow
-    to a direct CLI invocation so input() never freezes the voice loop.
-    If a cached cookie is present we still refresh the catalog inline
-    (no input() needed); otherwise we return the CLI hint immediately."""
+def _alexa_voice_phase(force_refresh: bool) -> tuple[dict | None, dict]:
+    """Bounded, non-interactive Alexa fetch for the VOICE path. Returns
+    (devices_or_None, status). Never prompts, never raises — every failure
+    degrades to an honest status entry so the LAN phase still runs."""
     if _alexapy() is None:
-        return ("Smart-home discovery is offline, sir — install alexapy "
-                "with `pip install alexapy` and try again.")
+        return None, {"ok": False, "count": 0, "console": False,
+                      "error": ("alexapy is not installed — Alexa discovery "
+                                "is offline (pip install alexapy)")}
+    meta = _load_cookie_meta()
+    if not meta or not os.path.exists(_COOKIE_PICKLE_PATH):
+        return None, {"ok": False, "count": 0, "console": True,
+                      "error": "no cached Amazon sign-in"}
+    try:
+        devices = _run_async(_restore_and_fetch_async(),
+                             timeout=_DISCOVERY_TIMEOUT_SEC)
+    except TimeoutError:
+        # 2026-07-08: a stalled Amazon endpoint must not wedge the voice
+        # dispatch thread — the fetch is bounded and reported, not fatal.
+        return None, {"ok": False, "count": 0, "console": False,
+                      "error": "timed out talking to Amazon"}
+    except Exception as e:
+        print(f"  [sh-discover] fetch traceback:\n{traceback.format_exc()}")
+        return None, {"ok": False, "count": 0, "console": False,
+                      "error": f"the device fetch failed ({e})"}
+    if devices is None:
+        return None, {"ok": False, "count": 0, "console": True,
+                      "error": "the cached sign-in was unusable"}
+    if force_refresh:
+        # An explicit reauth request means the user distrusts the cookie —
+        # report what the fetch produced but keep the console pointer.
+        st = _alexa_status_from_devices(devices)
+        if not st.get("ok"):
+            st["console"] = True
+        return devices, st
+    return devices, _alexa_status_from_devices(devices)
 
+
+def smart_home_discover(arg: str = "") -> str:
+    """Voice action — non-blocking. Runs the live LAN discovery (Kasa /
+    Tuya / Govee / Hue) plus, when a cached Amazon cookie is available,
+    the bounded Alexa fetch — no interactive terminal required. The first
+    Amazon sign-in still needs the console wizard (input()/getpass must
+    never run on the voice loop); a missing or expired cookie is reported
+    per-source instead of aborting the whole scan."""
     force_refresh = any(w in (arg or "").lower()
                         for w in ("force", "reauth", "fresh"))
-
-    meta = _load_cookie_meta()
-    if force_refresh or not meta or not os.path.exists(_COOKIE_PICKLE_PATH):
-        _say(_CLI_HINT)
-        return _CLI_HINT
-
     if not _wizard_lock.acquire(blocking=False):
         return "Smart-home discovery wizard is already running, sir."
     try:
         _say("One moment, sir — refreshing the smart home catalog.")
-        try:
-            devices = _run_async(_restore_and_fetch_async(),
-                                 timeout=_DISCOVERY_TIMEOUT_SEC)
-        except TimeoutError:
-            # 2026-07-08: a stalled Amazon endpoint must not wedge the voice
-            # dispatch thread — bail with a spoken notice, catalog untouched.
-            msg = ("Smart-home discovery timed out talking to Amazon, sir — "
-                   "the catalog is unchanged. Try again in a moment.")
-            _say(msg)
-            return msg
-        except Exception as e:
-            print(f"  [sh-discover] fetch traceback:\n{traceback.format_exc()}")
-            return f"Catalog refresh failed during device fetch: {e}"
-        if devices is None:
-            _say(_CLI_HINT)
-            return _CLI_HINT
-
+        alexa_devices, alexa_status = _alexa_voice_phase(force_refresh)
         arp_table = _scan_lan_arp()
-        catalog = _build_catalog(devices, arp_table)
+        lan_records, lan_status = _lan_discover_all(arp_table)
+        catalog = _build_catalog_v2(alexa_devices, alexa_status,
+                                    lan_records, lan_status,
+                                    arp_table, force=force_refresh)
         if not force_refresh:
             catalog = _merge_with_existing_catalog(catalog)
         try:
             _save_catalog(catalog)
         except CatalogWipeRefused as e:
             print(f"  [sh-discover] {e}")
-            msg = ("The device fetch came back empty, sir — likely an Alexa "
-                   "sign-in or network hiccup. I've kept your existing catalog "
-                   "rather than wiping it. Try again once you're reconnected.")
+            msg = ("Discovery came back empty from both Alexa and the LAN, "
+                   "sir — I've kept your existing catalog rather than wiping "
+                   "it. Try again once the network settles.")
             _say(msg)
             return msg
         queued = _queue_missing_skill_tasks(catalog)
@@ -1198,13 +1442,44 @@ def smart_home_discover(arg: str = "") -> str:
 def _summarise_catalog(catalog: dict, arp_table: list[dict],
                        queued: int, speak: bool) -> str:
     n = catalog["device_count"]
-    unknown = sum(1 for d in catalog["devices"] if not d["controller_skill"])
-    cross = sum(1 for d in catalog["devices"] if d["lan_ip"])
-    bits = [
-        f"Catalog complete, sir: {n} smart-home device(s) across "
-        f"{catalog['echo_count']} Echo speaker(s) and "
-        f"{catalog['group_count']} group(s)."
-    ]
+    unknown = sum(1 for d in catalog["devices"]
+                  if not d.get("controller_skill"))
+    cross = sum(1 for d in catalog["devices"] if d.get("lan_ip"))
+    sources = catalog.get("sources") or {}
+    bits: list[str] = []
+    if sources:
+        # v2 catalog — honest per-source reporting (Alexa + live LAN).
+        bits.append(f"Catalog updated, sir: {n} smart-home device(s).")
+        found: list[str] = []
+        failed: list[str] = []
+        for src in _LAN_SOURCES:
+            st = sources.get(src) or {}
+            label = _LAN_SOURCE_LABELS.get(src, src)
+            if st.get("ok"):
+                if int(st.get("count") or 0) > 0:
+                    found.append(f"{int(st['count'])} {label}")
+            elif st.get("error") not in (None, "", "skill unavailable"):
+                failed.append(f"{label} ({st['error']})")
+        if found:
+            bits.append("Found " + ", ".join(found) + " devices on the LAN.")
+        if failed:
+            bits.append("The LAN scan failed for " + ", ".join(failed) + ".")
+        alexa = sources.get("alexa") or {}
+        if alexa.get("ok"):
+            bits.append(f"Alexa contributed "
+                        f"{int(alexa.get('count') or 0)} device(s).")
+        else:
+            bits.append("Alexa discovery unavailable — "
+                        f"{alexa.get('error') or 'not attempted'}.")
+            if alexa.get("console"):
+                bits.append(_CLI_HINT)
+    else:
+        # v1 catalog (Alexa-only build) — legacy phrasing preserved.
+        bits.append(
+            f"Catalog complete, sir: {n} smart-home device(s) across "
+            f"{catalog['echo_count']} Echo speaker(s) and "
+            f"{catalog['group_count']} group(s)."
+        )
     if unknown:
         bits.append(
             f"{unknown} brand(s) have no controller skill yet; "
@@ -1301,114 +1576,139 @@ async def _restore_and_fetch_async() -> dict | None:
     return await _fetch_devices_async(login)
 
 
+def _wizard_alexa_phase(force_refresh: bool) -> tuple[dict | None, dict]:
+    """Interactive-console Alexa phase of the wizard: cached-cookie reuse,
+    else credential prompt + alexapy login + Playwright fallback. Returns
+    (devices_or_None, status) and NEVER aborts the wizard — a cancelled or
+    failed Amazon sign-in is recorded honestly so the LAN phase still runs
+    and the CLI wizard can land a LAN-only catalog."""
+    login = None
+    devices = None
+    meta = _load_cookie_meta()
+    if meta and not force_refresh:
+        if _cookie_is_stale(meta):
+            age = int((time.time() - meta.get("saved_at", 0)) / 86400)
+            print(f"  [sh-discover] cached cookie is {age} days old "
+                  "— a refresh may be needed soon.")
+        # Build the login AND fetch the catalog in ONE event loop (Py3.14
+        # needs the alexapy/aiohttp session created + used on the same
+        # running loop). This reuses the cached cookie — no re-sign-in.
+        try:
+            devices = _run_async(_restore_and_fetch_async())
+        except Exception as e:
+            print(f"  [sh-discover] cached-cookie fetch failed: {e}")
+            devices = None
+        if devices is not None:
+            print("  [sh-discover] Reused cached Amazon login — no fresh "
+                  "sign-in needed.")
+
+    creds_email = (meta or {}).get("email", "")
+    if devices is None:
+        creds = _prompt_credentials()
+        if creds is None:
+            return None, {"ok": False, "count": 0, "console": False,
+                          "error": ("Amazon sign-in cancelled — no "
+                                    "credentials provided")}
+        creds_email = creds[0]
+        used_playwright = False
+        try:
+            login = _run_async(_login_async(*creds))
+        except _LoginNeedsPlaywright:
+            # alexapy 1.29.22 can't parse Amazon's current login
+            # response. Drive Chromium directly so the user can sign
+            # in and we can capture the session cookies.
+            pw_result = _run_async(_login_via_playwright(creds_email))
+            if pw_result is None:
+                return None, {"ok": False, "count": 0, "console": False,
+                              "error": ("Amazon sign-in did not complete "
+                                        "(Playwright fallback unavailable "
+                                        "or cancelled)")}
+            jar, raw_pw_cookies = pw_result
+            shim = _PlaywrightLoginShim(creds_email, jar)
+            try:
+                _save_cookie_meta(creds_email, dict(shim.status), jar)
+            except Exception as e:
+                print(f"  [sh-discover] cookie save failed: {e}")
+            used_playwright = True
+            # The cookie pickle is now saved — enumerate via the SAME
+            # single-loop path the cached case uses (construct + login +
+            # fetch all inside one event loop). Avoids the old
+            # "no running event loop" failure from building the AlexaLogin
+            # outside a loop, so the user gets devices immediately instead
+            # of a "please re-run" message.
+            try:
+                devices = _run_async(_restore_and_fetch_async())
+            except Exception as e:
+                print(f"  [sh-discover] post-signin fetch failed: {e}")
+                devices = None
+            login = None
+        except Exception as e:
+            print(f"  [sh-discover] login traceback:\n{traceback.format_exc()}")
+            return None, {"ok": False, "count": 0, "console": False,
+                          "error": f"failed during sign-in ({e})"}
+        if used_playwright and devices is None:
+            return None, {"ok": False, "count": 0, "console": False,
+                          "error": ("the device fetch came back empty after "
+                                    "sign-in — the cached Alexa cookie may "
+                                    "not be scoped correctly (cookies at "
+                                    + os.path.relpath(_COOKIE_JSON_PATH,
+                                                      _PROJECT_DIR) + ")")}
+        if login is None and not used_playwright:
+            return None, {"ok": False, "count": 0, "console": False,
+                          "error": "Amazon sign-in did not complete"}
+        if not used_playwright:
+            try:
+                jar = _extract_cookie_jar(login)
+                _save_cookie_meta(creds_email,
+                                  dict(login.status or {}), jar)
+            except Exception as e:
+                print(f"  [sh-discover] cookie save failed: {e}")
+
+    if devices is None:
+        # Fresh sign-in path only — the cached path already fetched above.
+        print("  [sh-discover] Signed in. Enumerating devices.")
+        try:
+            devices = _run_async(_fetch_devices_async(login))
+        except Exception as e:
+            print(f"  [sh-discover] fetch traceback:\n{traceback.format_exc()}")
+            return None, {"ok": False, "count": 0, "console": False,
+                          "error": f"failed during device fetch ({e})"}
+    return devices, _alexa_status_from_devices(devices)
+
+
 def _run_wizard_interactive(arg: str = "") -> str:
     """Full wizard with terminal input(). ONLY call from the __main__
     guard — never from voice context (would freeze the audio loop)."""
     if not _wizard_lock.acquire(blocking=False):
         return "Smart-home discovery wizard is already running, sir."
     try:
-        if _alexapy() is None:
-            return ("Smart-home discovery is offline, sir — install alexapy "
-                    "with `pip install alexapy` and try again.")
-
         force_refresh = any(w in (arg or "").lower()
                             for w in ("force", "reauth", "fresh"))
         print("  [sh-discover] Looking up your smart home devices.")
 
-        login = None
-        devices = None
-        meta = _load_cookie_meta()
-        if meta and not force_refresh:
-            if _cookie_is_stale(meta):
-                age = int((time.time() - meta.get("saved_at", 0)) / 86400)
-                print(f"  [sh-discover] cached cookie is {age} days old "
-                      "— a refresh may be needed soon.")
-            # Build the login AND fetch the catalog in ONE event loop (Py3.14
-            # needs the alexapy/aiohttp session created + used on the same
-            # running loop). This reuses the cached cookie — no re-sign-in.
-            try:
-                devices = _run_async(_restore_and_fetch_async())
-            except Exception as e:
-                print(f"  [sh-discover] cached-cookie fetch failed: {e}")
-                devices = None
-            if devices is not None:
-                print("  [sh-discover] Reused cached Amazon login — no fresh "
-                      "sign-in needed.")
-
-        creds_email = (meta or {}).get("email", "")
-        if devices is None:
-            creds = _prompt_credentials()
-            if creds is None:
-                return "Wizard cancelled — no credentials provided."
-            creds_email = creds[0]
-            used_playwright = False
-            try:
-                login = _run_async(_login_async(*creds))
-            except _LoginNeedsPlaywright:
-                # alexapy 1.29.22 can't parse Amazon's current login
-                # response. Drive Chromium directly so the user can sign
-                # in and we can capture the session cookies.
-                pw_result = _run_async(_login_via_playwright(creds_email))
-                if pw_result is None:
-                    return ("Wizard failed — Amazon sign-in did not complete "
-                            "(Playwright fallback unavailable or cancelled).")
-                jar, raw_pw_cookies = pw_result
-                shim = _PlaywrightLoginShim(creds_email, jar)
-                try:
-                    _save_cookie_meta(creds_email, dict(shim.status), jar)
-                except Exception as e:
-                    print(f"  [sh-discover] cookie save failed: {e}")
-                used_playwright = True
-                # The cookie pickle is now saved — enumerate via the SAME
-                # single-loop path the cached case uses (construct + login +
-                # fetch all inside one event loop). Avoids the old
-                # "no running event loop" failure from building the AlexaLogin
-                # outside a loop, so the user gets devices immediately instead
-                # of a "please re-run" message.
-                try:
-                    devices = _run_async(_restore_and_fetch_async())
-                except Exception as e:
-                    print(f"  [sh-discover] post-signin fetch failed: {e}")
-                    devices = None
-                login = None
-            except Exception as e:
-                print(f"  [sh-discover] login traceback:\n{traceback.format_exc()}")
-                return f"Wizard failed during sign-in: {e}"
-            if used_playwright and devices is None:
-                return ("Amazon sign-in captured, sir, but the device fetch "
-                        "came back empty — the cached Alexa cookie may not be "
-                        "scoped correctly. Cookies are at "
-                        f"{os.path.relpath(_COOKIE_JSON_PATH, _PROJECT_DIR)}.")
-            if login is None and not used_playwright:
-                return "Wizard failed — Amazon sign-in did not complete."
-            if not used_playwright:
-                try:
-                    jar = _extract_cookie_jar(login)
-                    _save_cookie_meta(creds_email,
-                                      dict(login.status or {}), jar)
-                except Exception as e:
-                    print(f"  [sh-discover] cookie save failed: {e}")
-
-        if devices is None:
-            # Fresh sign-in path only — the cached path already fetched above.
-            print("  [sh-discover] Signed in. Enumerating devices.")
-            try:
-                devices = _run_async(_fetch_devices_async(login))
-            except Exception as e:
-                print(f"  [sh-discover] fetch traceback:\n{traceback.format_exc()}")
-                return f"Wizard failed during device fetch: {e}"
+        if _alexapy() is None:
+            devices, alexa_status = None, {
+                "ok": False, "count": 0, "console": False,
+                "error": ("alexapy is not installed — Alexa discovery is "
+                          "offline (pip install alexapy)")}
+        else:
+            devices, alexa_status = _wizard_alexa_phase(force_refresh)
 
         arp_table = _scan_lan_arp()
-        catalog = _build_catalog(devices, arp_table)
+        lan_records, lan_status = _lan_discover_all(arp_table)
+        catalog = _build_catalog_v2(devices, alexa_status,
+                                    lan_records, lan_status,
+                                    arp_table, force=force_refresh)
         if not force_refresh:
             catalog = _merge_with_existing_catalog(catalog)
         try:
             _save_catalog(catalog)
         except CatalogWipeRefused as e:
             print(f"  [sh-discover] {e}")
-            return ("The device fetch came back empty — I kept the existing "
-                    "catalog rather than overwriting it with nothing. Check the "
-                    "Alexa sign-in / network and re-run.")
+            return ("Discovery came back empty from both Alexa and the LAN — "
+                    "I kept the existing catalog rather than overwriting it "
+                    "with nothing. Check the Alexa sign-in / network and "
+                    "re-run.")
         queued = _queue_missing_skill_tasks(catalog)
         return _summarise_catalog(catalog, arp_table, queued, speak=False)
     finally:

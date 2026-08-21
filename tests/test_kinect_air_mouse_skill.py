@@ -2030,8 +2030,11 @@ class _StepClock:
 
 
 class DebugLogFormatTests(_Base):
-    """ISSUE 2b — the ~2 Hz live height-gate debug line shows the values for
-    tuning: lift (the primary cue), the controlling hand, engaged, and yield."""
+    """ISSUE 2b — the live height-gate telemetry line shows the values for
+    tuning: lift (the primary cue), the controlling hand, engaged, and yield.
+    It prints on meaningful STATE TRANSITIONS (coalesced to the 0.5 s floor)
+    plus a 30 s heartbeat while unchanged — NOT at a steady 2 Hz (the 2026-08-14
+    log-flood fix); JARVIS_AIR_MOUSE_TELEMETRY=verbose restores the firehose."""
 
     class _Ctrl:
         engaged = False
@@ -2072,15 +2075,27 @@ class DebugLogFormatTests(_Base):
         ext = mod.ArmExtension("right", forward_m=0.2, straightness=0.9,
                                hand=(0, 0.55, 1.8, 2), lift_m=0.1)
         mod._air_mouse_debug_last[0] = 0.0
-        # First call at t=100 prints; an immediate second call is throttled.
+        mod._air_mouse_debug_last_sig[0] = None
+        # First call at t=100 prints (baseline); an immediate second call is
+        # floor-throttled.
         self.assertTrue(mod._maybe_debug_log(None, ext, True, self._Ctrl(),
                                              now=100.0, yielding=False))
         self.assertFalse(mod._maybe_debug_log(None, ext, True, self._Ctrl(),
                                               now=100.1, yielding=False))
-        # Past the interval it prints again.
-        self.assertTrue(mod._maybe_debug_log(
+        # Past the floor but UNCHANGED: suppressed (the flood fix — the old
+        # build printed an identical tracked frame here every 0.5 s).
+        self.assertFalse(mod._maybe_debug_log(
             None, ext, True, self._Ctrl(),
             now=100.0 + mod._AIR_MOUSE_DEBUG_INTERVAL, yielding=False))
+        # A state TRANSITION (engage) past the floor prints...
+        engaged_ctrl = self._Ctrl()
+        engaged_ctrl.engaged = True
+        self.assertTrue(mod._maybe_debug_log(None, ext, True, engaged_ctrl,
+                                             now=101.0, yielding=False))
+        # ...but the 0.5 s floor holds even for a transition (disengage 0.2 s
+        # later is coalesced; worst case stays the old 2 Hz).
+        self.assertFalse(mod._maybe_debug_log(None, ext, True, self._Ctrl(),
+                                              now=101.2, yielding=False))
 
     def test_idle_unchanged_is_suppressed(self):
         # An empty room (no hand, not engaged, not tracked) must NOT spam the log
@@ -2105,7 +2120,7 @@ class DebugLogFormatTests(_Base):
                                              now=100.0, yielding=False))
         self.assertTrue(mod._maybe_debug_log(
             None, None, False, self._Ctrl(),
-            now=100.0 + mod._AIR_MOUSE_IDLE_HEARTBEAT_S + 0.1, yielding=False))
+            now=100.0 + mod._AIR_MOUSE_HEARTBEAT_S + 0.1, yielding=False))
 
     def test_state_change_from_idle_logs_immediately(self):
         # When a hand appears after idle, the very next past-gate frame logs (a
@@ -2119,6 +2134,128 @@ class DebugLogFormatTests(_Base):
                                hand=(0, 0.55, 1.8, 2), lift_m=0.1)
         self.assertTrue(mod._maybe_debug_log(None, ext, True, self._Ctrl(),
                                              now=100.6, yielding=False))
+
+    # ── the 2026-08-14 flood fix: transitions + heartbeat, never a steady 2 Hz ──
+
+    def _arm(self, mod, side):
+        return mod.ArmExtension(side, forward_m=0.2, straightness=0.9,
+                                hand=(0, 0.55, 1.8, 2), lift_m=0.1)
+
+    def test_tracked_unchanged_uses_heartbeat(self):
+        # THE FLOOD REPRO: a tracked, disengaged, open-hand body doing nothing
+        # was 97.8% of a live session log (session_2026-08-08). Unchanged
+        # tracked frames must ride the 30 s heartbeat, not print at 2 Hz.
+        mod = self._load()
+        ext = self._arm(mod, "right")
+        mod._air_mouse_debug_last[0] = 0.0
+        mod._air_mouse_debug_last_sig[0] = None
+        self.assertTrue(mod._maybe_debug_log(None, ext, True, self._Ctrl(),
+                                             now=100.0, yielding=False))
+        for t in (100.6, 110.0, 129.0):
+            self.assertFalse(mod._maybe_debug_log(
+                None, ext, True, self._Ctrl(), now=t, yielding=False))
+        self.assertTrue(mod._maybe_debug_log(
+            None, ext, True, self._Ctrl(),
+            now=100.0 + mod._AIR_MOUSE_HEARTBEAT_S + 0.1, yielding=False))
+
+    def test_hand_flap_while_disengaged_is_not_a_transition(self):
+        # The highest-raised-arm designation flaps left↔right on a DISENGAGED
+        # body (~15,900 pseudo-transitions in one live log). While disengaged
+        # the hand side is NOT part of the signature — only hand PRESENCE is.
+        mod = self._load()
+        left, right = self._arm(mod, "left"), self._arm(mod, "right")
+        mod._air_mouse_debug_last[0] = 0.0
+        mod._air_mouse_debug_last_sig[0] = None
+        self.assertTrue(mod._maybe_debug_log(left, None, True, self._Ctrl(),
+                                             now=100.0, yielding=False))
+        self.assertFalse(mod._maybe_debug_log(None, right, True, self._Ctrl(),
+                                              now=100.6, yielding=False))
+        self.assertFalse(mod._maybe_debug_log(left, None, True, self._Ctrl(),
+                                              now=101.2, yielding=False))
+
+    def test_hand_switch_while_engaged_logs(self):
+        # A controlling-hand switch WHILE engaged is a real event (rare,
+        # hysteresis-protected per ISSUE 3) and must log.
+        mod = self._load()
+        left, right = self._arm(mod, "left"), self._arm(mod, "right")
+        ctrl = self._Ctrl()
+        ctrl.engaged = True
+        mod._air_mouse_debug_last[0] = 0.0
+        mod._air_mouse_debug_last_sig[0] = None
+        self.assertTrue(mod._maybe_debug_log(left, None, True, ctrl,
+                                             now=100.0, yielding=False))
+        self.assertTrue(mod._maybe_debug_log(None, right, True, ctrl,
+                                             now=100.6, yielding=False))
+
+    def test_grip_change_logs(self):
+        # The debounced stable grip is part of the signature: open→closed on
+        # the highest hand logs past the floor, and the line shows the change.
+        mod = self._load()
+        ext = self._arm(mod, "right")
+
+        class _GripCtrl:
+            engaged = False
+            hand = None
+
+        ctrl = _GripCtrl()
+        ctrl._grip_right = types.SimpleNamespace(stable="open")
+        mod._air_mouse_debug_last[0] = 0.0
+        mod._air_mouse_debug_last_sig[0] = None
+        self.assertTrue(mod._maybe_debug_log(None, ext, True, ctrl,
+                                             now=100.0, yielding=False))
+        ctrl._grip_right = types.SimpleNamespace(stable="closed")
+        with mock.patch("builtins.print") as p:
+            self.assertTrue(mod._maybe_debug_log(None, ext, True, ctrl,
+                                                 now=100.6, yielding=False))
+        self.assertIn("grip=closed", p.call_args[0][0])
+
+    def test_yield_edge_logs(self):
+        # The auto-yield state is part of the signature — its edge logs even
+        # with everything else unchanged (it wasn't in the pre-fix signature).
+        mod = self._load()
+        ext = self._arm(mod, "right")
+        mod._air_mouse_debug_last[0] = 0.0
+        mod._air_mouse_debug_last_sig[0] = None
+        self.assertTrue(mod._maybe_debug_log(None, ext, True, self._Ctrl(),
+                                             now=100.0, yielding=False))
+        self.assertTrue(mod._maybe_debug_log(None, ext, True, self._Ctrl(),
+                                             now=100.6, yielding=True))
+
+    def test_verbose_env_restores_firehose(self):
+        # JARVIS_AIR_MOUSE_TELEMETRY=verbose restores the steady ~2 Hz stream
+        # for a deliberate tuning session — but the 0.5 s floor still caps it.
+        mod = self._load()
+        ext = self._arm(mod, "right")
+        mod._air_mouse_debug_last[0] = 0.0
+        mod._air_mouse_debug_last_sig[0] = None
+        with mock.patch.dict(os.environ,
+                             {"JARVIS_AIR_MOUSE_TELEMETRY": "verbose"}):
+            self.assertTrue(mod._maybe_debug_log(None, ext, True, self._Ctrl(),
+                                                 now=100.0, yielding=False))
+            # Unchanged frames keep printing at every floor interval...
+            self.assertTrue(mod._maybe_debug_log(None, ext, True, self._Ctrl(),
+                                                 now=100.5, yielding=False))
+            self.assertTrue(mod._maybe_debug_log(None, ext, True, self._Ctrl(),
+                                                 now=101.0, yielding=False))
+            # ...but the 0.5 s floor still applies even in verbose mode.
+            self.assertFalse(mod._maybe_debug_log(
+                None, ext, True, self._Ctrl(), now=101.1, yielding=False))
+
+    def test_enable_edge_resets_throttle_sig(self):
+        # _reset_debug_throttle (called on the enable edge in _poll_loop) drops
+        # the remembered signature so the first past-floor frame after a
+        # re-enable prints a baseline line even into an unchanged scene.
+        mod = self._load()
+        ext = self._arm(mod, "right")
+        mod._air_mouse_debug_last[0] = 0.0
+        mod._air_mouse_debug_last_sig[0] = None
+        self.assertTrue(mod._maybe_debug_log(None, ext, True, self._Ctrl(),
+                                             now=100.0, yielding=False))
+        self.assertFalse(mod._maybe_debug_log(None, ext, True, self._Ctrl(),
+                                              now=100.6, yielding=False))
+        mod._reset_debug_throttle()
+        self.assertTrue(mod._maybe_debug_log(None, ext, True, self._Ctrl(),
+                                             now=101.2, yielding=False))
 
 
 # ══════════════════════════════════════════════════════════════════════════

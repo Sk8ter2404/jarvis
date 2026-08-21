@@ -17,6 +17,14 @@ broadcast.
 
 All public functions degrade gracefully — if `python-kasa` isn't
 installed, they return informative error dicts.
+
+Two contracts this module must keep (2026-08-20):
+  * BOUNDED — every await goes through `_run_async`, which is bounded on both
+    its paths. These calls sit on the voice dispatch thread and nothing above
+    them applies a timeout.
+  * HONEST — `set_state` returns ok:True only when the whole request landed;
+    a failed or capability-skipped sub-command yields ok:False plus `failed`/
+    `skipped` naming the device and what did not happen, and logs it.
 """
 from __future__ import annotations
 
@@ -59,25 +67,80 @@ def is_available() -> bool:
 
 
 # ── async runner ──────────────────────────────────────────────────
-def _run_async(coro):
+# BOUNDED (2026-08-20). Everything below runs ON THE VOICE DISPATCH THREAD.
+# The old runner had no bound at all — `asyncio.run(coro)` on the direct path
+# and a bare `t.join()` on the nested one — so a half-open plug could stall
+# JARVIS indefinitely (python-kasa retries 4x5 s with 1 s backoff ~= 23 s per
+# query; update()+turn_on() ~= 46 s, and a toggle ~= 79 s, past the 60 s
+# _MAIN_LOOP_HEARTBEAT_TIMEOUT) with no spoken "still working" line, because
+# no smart-home action is in LONG_RUNNING_ACTIONS.
+#
+# The in-repo twin skills/smart_home_discover._run_async was given exactly this
+# shape on 2026-07-08 and this copy never received the edit — bug class #1, the
+# stale duplicate. Keep the two in step.
+#
+# asyncio.wait_for is the load-bearing part: it CANCELS the pending python-kasa
+# query rather than orphaning a daemon thread holding an open socket. The join
+# grace margin only covers a coroutine that ignores cancellation.
+_CALL_TIMEOUT_SECS = 12.0        # one device call (update / turn_on / set_*)
+_DISCOVERY_TIMEOUT_SECS = 10.0   # UDP broadcast: the library's own 5 s + margin,
+                                 # kept under smart_home_discover's
+                                 # _LAN_SOURCE_TIMEOUT_SEC = 12.0 ceiling.
+# Whole-turn ceiling for smart_home_control, measured from function entry so
+# discovery counts against it: "turn off everything" fans out sequentially, so
+# a per-call bound alone still multiplies by the device count.
+_CONTROL_BUDGET_SECS = 20.0
+# Extra wall-clock allowed on the worker-thread join beyond the coroutine's own
+# budget, for a coro blocked in a native call that never sees the cancel.
+_JOIN_GRACE_SECS = 5.0
+
+_USE_DEFAULT_TIMEOUT = object()   # sentinel: the budgets stay patchable/tunable
+                                  # at call time instead of being frozen into a
+                                  # default argument at import.
+
+
+def _run_async(coro, timeout=_USE_DEFAULT_TIMEOUT, what: str = "call"):
     """Run `coro` to completion, even if the calling thread is itself in
-    an event loop (delegated to a worker thread in that case)."""
+    an event loop (delegated to a worker thread in that case) — bounded by
+    `timeout` seconds on BOTH paths.
+
+    On expiry raises TimeoutError carrying what timed out and after how long;
+    every caller turns that into an honest {"error": ...} or a logged
+    degradation, never a silent one. `timeout=None` restores the old unbounded
+    behaviour and is used by nothing."""
+    if timeout is _USE_DEFAULT_TIMEOUT:
+        timeout = _CALL_TIMEOUT_SECS
+    msg = (f"kasa {what} timed out after {timeout:g}s"
+           if timeout is not None else f"kasa {what} timed out")
+
+    async def _bounded():
+        if timeout is None:
+            return await coro
+        try:
+            return await asyncio.wait_for(coro, timeout)
+        except (asyncio.TimeoutError, TimeoutError):
+            # asyncio.wait_for raises a bare TimeoutError with no message;
+            # restate it so the log/spoken line says WHAT timed out.
+            raise TimeoutError(msg) from None
+
     try:
         asyncio.get_running_loop()
         nested = True
     except RuntimeError:
         nested = False
     if not nested:
-        return asyncio.run(coro)
+        return asyncio.run(_bounded())
     box: dict = {}
     def _go() -> None:
         try:
-            box["v"] = asyncio.run(coro)
+            box["v"] = asyncio.run(_bounded())
         except Exception as e:
             box["err"] = e
     t = threading.Thread(target=_go, daemon=True)
     t.start()
-    t.join()
+    t.join(None if timeout is None else timeout + _JOIN_GRACE_SECS)
+    if t.is_alive():
+        raise TimeoutError(msg + " (worker thread abandoned)")
     if "err" in box:
         raise box["err"]
     return box.get("v")
@@ -130,9 +193,11 @@ def _refresh_discovery(force: bool = False) -> dict[str, Any]:
         if not force and (time.monotonic() - _state["fetched_at"]) < _DISCOVERY_TTL:
             return dict(_state["by_ip"])
     try:
-        found = _run_async(_discover_async()) or {}
+        found = _run_async(_discover_async(),
+                           timeout=_DISCOVERY_TIMEOUT_SECS,
+                           what="LAN discovery") or {}
     except Exception as e:
-        print(f"  [sh-kasa] discovery error: {e}")
+        print(f"  [sh-kasa] discovery error: {type(e).__name__}: {e}")
         found = {}
     by_name: dict[str, Any] = {}
     for ip, dev in found.items():
@@ -180,11 +245,16 @@ def _device_for(device_record: dict) -> Any:
     # Direct by IP when possible.
     if ip:
         try:
-            dev = _run_async(_device_from_ip_async(ip))
+            dev = _run_async(_device_from_ip_async(ip),
+                             what=f"connect {ip}")
             if dev is not None:
                 return dev
-        except Exception:
-            pass
+        except Exception as e:
+            # A DEGRADED PATH MUST LOG. This used to be `except: pass`, so a
+            # timeout here was invisible and we silently fell through to a full
+            # LAN broadcast — doubling the wait with no trace of why.
+            print(f"  [sh-kasa] direct connect to {ip} failed "
+                  f"({type(e).__name__}: {e}); falling back to broadcast")
     # Otherwise scan and look up by alias.
     _refresh_discovery()
     with _lock:
@@ -232,7 +302,8 @@ def get_state(device: dict) -> dict:
     if dev is None:
         return {"error": f"kasa device '{device.get('name')}' not found"}
     try:
-        _run_async(dev.update())
+        _run_async(dev.update(),
+                   what=f"state read '{device.get('name')}'")
         return {
             "on":          bool(getattr(dev, "is_on", False)),
             "brightness":  int(getattr(dev, "brightness", 0) or 0) if getattr(dev, "is_dimmable", False) else None,
@@ -244,11 +315,45 @@ def get_state(device: dict) -> dict:
 
 
 def set_state(device: dict, **kwargs) -> dict:
+    """Drive one Kasa/Tapo device. THE RESULT REPORTS WHAT ACTUALLY HAPPENED.
+
+    HONEST-FAILURE CONTRACT (2026-08-20). Every sub-command used to be wrapped
+    in a bare `except Exception: pass` and the function returned a flat
+    {"ok": True} regardless, so a request the hardware never honoured was
+    reported as a success — e.g. "set the desk lamp to 30 percent" against a
+    non-dimmable plug switched it fully ON, recorded nothing, and the router
+    spoke "Set to 30%, sir". The owner walks away believing a light dimmed.
+
+    Return shape:
+      * everything requested landed  -> {"ok": True, "device", "applied"}
+      * anything failed or was skipped ->
+            {"ok": False, "device", "applied", "partial", "failed", "skipped",
+             "error": "<device>: <per-sub-command detail> (applied: ...)"}
+        `ok` is True ONLY when the whole request landed. `failed` holds
+        sub-commands that were attempted and raised; `skipped` holds ones the
+        hardware cannot do (capability gate) so they were never attempted.
+        Both are also printed, so a degraded run is visible in the log even if
+        a caller ignores the dict.
+      * power (`on`) is deliberately NOT swallowed: if turn_on/turn_off raises,
+        the whole apply aborts into the error branch — there is no point
+        dimming a device we could not switch.
+    """
+    name = (device.get("name") or "").strip() or "device"
     dev = _device_for(device)
     if dev is None:
         return {"error": f"kasa device '{device.get('name')}' not found"}
 
     applied: dict[str, Any] = {}
+    failed:  dict[str, str] = {}   # attempted and raised
+    skipped: dict[str, str] = {}   # never attempted (device can't do it)
+
+    def _fail(key: str, exc: Exception) -> None:
+        failed[key] = f"{type(exc).__name__}: {exc}"
+        print(f"  [sh-kasa] {name}: {key} FAILED — {type(exc).__name__}: {exc}")
+
+    def _skip(key: str, why: str) -> None:
+        skipped[key] = why
+        print(f"  [sh-kasa] {name}: {key} NOT applied — {why}")
 
     async def _apply() -> None:
         await dev.update()
@@ -265,36 +370,63 @@ def set_state(device: dict, **kwargs) -> dict:
                 try:
                     await dev.set_brightness(pct)
                     applied["brightness"] = pct
-                except Exception:
-                    pass
+                except Exception as e:
+                    _fail("brightness", e)
+            else:
+                # The owner's TP-Link fleet is plugs, so this is the live case:
+                # a brightness request lands here, the plug is switched fully
+                # on below, and without this marker the result claimed success.
+                _skip("brightness", "device is not dimmable")
             if pct > 0 and not applied.get("on", False):
                 try:
                     await dev.turn_on()
                     applied["on"] = True
-                except Exception:
-                    pass
+                except Exception as e:
+                    _fail("on", e)
         if "color_temperature" in kwargs and kwargs["color_temperature"]:
             if getattr(dev, "is_variable_color_temp", False):
                 try:
                     await dev.set_color_temp(int(kwargs["color_temperature"]))
                     applied["color_temperature_k"] = int(kwargs["color_temperature"])
-                except Exception:
-                    pass
+                except Exception as e:
+                    _fail("color_temperature", e)
+            else:
+                _skip("color_temperature",
+                      "device has no variable colour temperature")
         if "color" in kwargs and kwargs["color"]:
             if getattr(dev, "is_color", False):
                 try:
                     h, s, v = _rgb_to_hsv(kwargs["color"])
                     await dev.set_hsv(h, s, v)
                     applied["color"] = list(kwargs["color"])
-                except Exception:
-                    pass
+                except Exception as e:
+                    _fail("color", e)
+            else:
+                _skip("color", "device is not colour-capable")
 
     try:
-        _run_async(_apply())
+        _run_async(_apply(), what=f"set_state '{name}'")
     except Exception as e:
-        return {"error": f"kasa set_state failed: {e}", "partial": applied}
+        return {"error": f"kasa set_state failed: {e}",
+                "device": name, "applied": applied, "partial": applied,
+                "failed": failed, "skipped": skipped}
 
-    return {"ok": True, "applied": applied}
+    if not failed and not skipped:
+        return {"ok": True, "device": name, "applied": applied}
+
+    problems = [f"{k} failed ({v})" for k, v in failed.items()]
+    problems += [f"{k} not applied ({v})" for k, v in skipped.items()]
+    did = ", ".join(f"{k}={v}" for k, v in applied.items()) or "nothing"
+    return {
+        "ok": False,
+        "device":  name,
+        "applied": applied,
+        "partial": applied,
+        "failed":  failed,
+        "skipped": skipped,
+        "error":   f"kasa '{name}': " + "; ".join(problems)
+                   + f" (applied: {did})",
+    }
 
 
 def _rgb_to_hsv(rgb) -> tuple[int, int, int]:
@@ -329,7 +461,11 @@ def kasa_list(_: str = "") -> str:
 
 def _tuya_mod():
     """Locate the loaded sh_tuya skill module (name varies by loader) so the
-    unified control below can drive Tuya devices too. None if not loaded."""
+    unified control below can drive Tuya devices too. None if not loaded.
+
+    Deliberate sibling copy of core.smart_home_router._skill_module — the
+    lookup rule's one shared home — kept local so this skill works when the
+    router isn't loaded at all. Change BOTH if the loader naming changes."""
     import sys
     import importlib
     for nm in ("skill_sh_tuya", "sh_tuya", "skills.sh_tuya"):
@@ -344,6 +480,15 @@ def _tuya_mod():
     return None
 
 
+def _failure_reason(result: dict) -> str:
+    """Short, speakable reason out of a skill result dict. Never invents one —
+    an unlabelled failure says so rather than being dressed up."""
+    txt = str((result or {}).get("error") or "").strip()
+    if not txt:
+        txt = "no reason reported"
+    return txt if len(txt) <= 140 else txt[:137] + "..."
+
+
 def smart_home_control(request: str = "") -> str:
     """Voice control for the LAN smart plugs: 'turn on the entry light',
     'turn off dining room', 'toggle kitchen 2', 'are the lights on?'.
@@ -353,6 +498,11 @@ def smart_home_control(request: str = "") -> str:
     Amazon/Alexa needed. 2026-05-30 (added after Amazon locked down the Alexa
     cookie API; these TP-Link Kasa plugs are controlled locally instead)."""
     import re as _re
+    # Whole-turn deadline (2026-08-20). Bounding each device call is not
+    # enough: "turn off everything" fans out sequentially, so N devices still
+    # multiply N x the per-call bound. Started before discovery so the
+    # broadcast counts against the same budget.
+    _turn_deadline = time.monotonic() + _CONTROL_BUDGET_SECS
     req = (request or "").strip()
     if not req:
         return "What would you like me to control, sir?"
@@ -417,11 +567,18 @@ def smart_home_control(request: str = "") -> str:
         names = ", ".join(_clean(d.get("name")) for d in devs)
         return (f"I'm not sure which one you meant, sir. I can control: {names}.")
 
-    out = []
+    out: list[str] = []
+    failures = 0
+    not_attempted: list[str] = []
     for d in matches:
         rec = {"name": _clean(d.get("name")), "lan_ip": d.get("lan_ip"),
                "_tuya": d.get("_tuya")}
         nm = rec["name"]
+        if time.monotonic() >= _turn_deadline:
+            # Out of budget. Say so — do NOT quietly drop the rest and then
+            # report "Done" for a set we never touched.
+            not_attempted.append(nm)
+            continue
         # Route to the right controller (Kasa local API vs Tuya/tinytuya).
         if d.get("_ctl") == "tuya" and tmod is not None:
             _set, _get = tmod.set_state, tmod.get_state
@@ -429,18 +586,51 @@ def smart_home_control(request: str = "") -> str:
             _set, _get = set_state, get_state
         if intent in ("on", "off"):
             r = _set(rec, on=(intent == "on"))
-            out.append(f"{nm} {intent}" if r.get("ok") else f"{nm} (failed)")
+            if r.get("ok"):
+                out.append(f"{nm} {intent}")
+            else:
+                failures += 1
+                out.append(f"{nm} (failed: {_failure_reason(r)})")
         elif intent == "toggle":
             st = _get(rec)
-            new = not bool(st.get("on"))
-            r = _set(rec, on=new)
-            out.append(f"{nm} {'on' if new else 'off'}" if r.get("ok")
-                       else f"{nm} (failed)")
+            if "error" in st or st.get("on") is None:
+                # NEVER GUESS. `not bool(st.get("on"))` on an unreadable device
+                # resolved to True, so a failed state read silently became a
+                # "turn it on" command whose result was then reported as fact.
+                failures += 1
+                out.append(f"{nm} (failed: couldn't read state — "
+                           f"{_failure_reason(st)})")
+                continue
+            new_on = not bool(st.get("on"))
+            r = _set(rec, on=new_on)
+            if r.get("ok"):
+                out.append(f"{nm} {'on' if new_on else 'off'}")
+            else:
+                failures += 1
+                out.append(f"{nm} (failed: {_failure_reason(r)})")
         else:
             st = _get(rec)
-            out.append(f"{nm} is {'on' if st.get('on') else 'off'}")
+            if "error" in st or st.get("on") is None:
+                # An unreadable device used to be reported as "is off".
+                failures += 1
+                out.append(f"{nm} status unknown ({_failure_reason(st)})")
+            else:
+                out.append(f"{nm} is {'on' if st.get('on') else 'off'}")
+    if not_attempted:
+        # Phrased with "couldn't" on purpose: core.failure_markers.FAILURE_MARKERS
+        # is what bobert_companion._is_failure / dispatcher._is_failure_result
+        # classify on, and "not attempted" alone matches no marker — the line
+        # would have been filed as a SUCCESS.
+        out.append(f"{len(not_attempted)} not attempted "
+                   f"({', '.join(not_attempted)}) — I couldn't get to them "
+                   f"in time")
     if intent is None:
         return "Status, sir — " + "; ".join(out) + "."
+    attempted = len(matches) - len(not_attempted)
+    if failures and failures >= attempted:
+        return "That didn't work, sir — " + "; ".join(out) + "."
+    if failures or not_attempted:
+        return "Partly done, sir — " + "; ".join(out) + "."
     return "Done, sir — " + "; ".join(out) + "."
 
 

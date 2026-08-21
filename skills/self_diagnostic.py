@@ -95,6 +95,7 @@ import importlib.util
 import json
 import logging
 import os
+import queue
 import re
 import socket
 import struct
@@ -1132,7 +1133,7 @@ def _probe_microphone() -> dict:
             pass
 
     # crash-fix-3 (2026-05-28), extended 2026-07-21 audit: opening an
-    # `sd.rec()` capture stream from this probe's daemon thread while any
+    # probe capture stream from this probe's daemon thread while any
     # other stream is live on the mic causes the documented WASAPI
     # double-open contention (record_speech records garbage for ~70s until
     # the watchdog resets the loop), and when the probe hits
@@ -1140,8 +1141,9 @@ def _probe_microphone() -> dict:
     # left holding the buffer, and the next sweep triggers heap corruption.
     # Skip the live capture step entirely when:
     #   • any mic/audio OWNERSHIP FLAG is set — the monolith's canonical
-    #     mic-ownership rule (mirrors _refresh_devices' deferral guard in
-    #     bobert_companion). This is the load-bearing check: in sleep/
+    #     mic-ownership rule (mirrors bobert_companion._pa_streams_live, the
+    #     owner list _refresh_devices' teardown gate checks). This is the
+    #     load-bearing check: in sleep/
     #     standby the main loop runs record_speech(timeout=20) continuously,
     #     so the old awake-only skip gated the capture exactly backwards —
     #     _sleep_mode is a conversation-mode latch, not a mic-ownership
@@ -1166,11 +1168,31 @@ def _probe_microphone() -> dict:
             return False
 
     def _mic_owned() -> bool:
+        # Mirrors bobert_companion._pa_streams_live (the canonical owner
+        # list) MINUS _diag_capture_active — that cell is THIS probe's own
+        # claim, held across its captures below; consulting it here
+        # would make the probe defer against itself. Update BOTH lists
+        # together (stale-duplicate rule).
+        #
+        # H-4 (2026-08-20): mirroring the owner list is NECESSARY BUT NOT
+        # SUFFICIENT here. Every call of this is a check-then-act instant,
+        # while the hazard is SPAN-long: a background _speak can begin inside
+        # a 0.25 s capture. That is why _capture_rms opens a PRIVATE
+        # InputStream (never published into sounddevice’s global
+        # _last_callback, so a concurrent sd.play() cannot close it) AND
+        # re-checks this predicate inside its own drain loop.
         return bc is not None and (
             _owner_flag("_record_speech_active")
             or _owner_flag("_pathb_mic_active")
             or _owner_flag("_ambient_stream_active")   # refcount — truthy when > 0
-            or _owner_flag("_tts_playback_active"))
+            or _owner_flag("_enroll_capture_active")
+            or _owner_flag("_tts_playback_active")
+            # H-6 (2026-08-20): a native Pa_CloseStream handed to a daemon
+            # whose caller already gave up waiting. The owner flag is down but
+            # PortAudio is still executing the close, so opening another
+            # capture stream here is the same class of hazard the flags above
+            # cover. COUNT cell — truthy when > 0.
+            or _owner_flag("_pa_close_pending"))
 
     awake = bool(bc is not None and not getattr(bc, "_sleep_mode", [True])[0])
     mic_off = bool(getattr(bc, "_mic_input_disabled", lambda: False)())
@@ -1178,9 +1200,10 @@ def _probe_microphone() -> dict:
     if awake or mic_off or mic_owned:
         details["live_capture_skipped"] = (
             ("mic hard-disabled (staging / MICROPHONE_INDEX < 0)" if mic_off
-             else "mic owned by record_speech/Path B/ambient/TTS" if mic_owned
+             else ("mic owned by record_speech/Path B/ambient/TTS, or an "
+                   "abandoned native close is still in flight") if mic_owned
              else "JARVIS awake — mic owned by main loop")
-            + "; skipping sd.rec() (crash-fix-3 / no-mic guard)"
+            + "; skipping the live capture (crash-fix-3 / no-mic guard)"
         )
         return _result(True, (_now() - start) * 1000.0, details=details)
 
@@ -1191,93 +1214,271 @@ def _probe_microphone() -> dict:
                        error=f"numpy not importable: {e}",
                        details=details)
 
+    def _close_probe_stream(stream) -> None:
+        """Tear down one probe InputStream through the host’s guarded closer.
+
+        bobert_companion._safe_close_stream stops synchronously, runs the
+        native close on a daemon, registers it with the teardown gate
+        (_pa_close_pending) and ABANDONS it on a bounded timeout. Prefer it;
+        the inline fallback below exists only for stand-alone runs and test
+        doubles with no monolith loaded.
+
+        H-3 (2026-08-20): neither path may call the process-global sd.stop().
+        It cannot free an explicitly constructed InputStream (sounddevice
+        0.5.5 stops+closes ``_last_callback``, published only by
+        sd.play()/sd.rec()/sd.playrec()) and its one reachable effect is
+        closing a live TTS playback stream out from under
+        play_with_lipsync’s reaper — two threads inside Pa_CloseStream on one
+        WASAPI stream, i.e. 0xc0000374. Copies of that rule live in
+        bobert_companion._safe_close_stream, core/wake_word,
+        skills/ambient_listen and skills/enroll_voice — change all of them
+        together (stale-duplicate rule)."""
+        if stream is None:
+            return
+        bc_close = getattr(bc, "_safe_close_stream", None) if bc is not None else None
+        if callable(bc_close):
+            try:
+                bc_close(stream)
+                return
+            except Exception:
+                pass   # fall through to the inline teardown below
+        try:
+            stream.stop()
+        except Exception:
+            pass
+        _closed = threading.Event()
+
+        def _close_in_daemon():
+            try:
+                stream.close()
+            except Exception:
+                pass
+            finally:
+                _closed.set()
+        threading.Thread(target=_close_in_daemon, daemon=True).start()
+        if not _closed.wait(timeout=2.0):
+            print("  [self-diag] probe stream.close hung >2.0s — abandoning "
+                  "the close daemon (it dies with the process); sd.stop() is "
+                  "deliberately NOT called (H-3)")
+
     def _capture_rms(device_idx: int | None,
                      duration_s: float = 0.25,
                      rate: int = 16000) -> tuple[float | None, str | None]:
         """Record ``duration_s`` of mono float32 audio from ``device_idx``
         (None → system default) and return ``(rms, err)``. ``rms`` is
-        None when capture itself raised."""
+        None when capture itself raised.
+
+        H-4 (2026-08-20): this used to be ``sd.rec(...)`` + ``sd.wait()``, the
+        PROCESS-GLOBAL convenience pair. Both defects that removed were real:
+
+        (a) CROSS-CLOSE. sounddevice 0.5.5 publishes exactly one global
+            ``_last_callback``, and ``_CallbackContext.start_stream`` opens
+            with ``stop()`` — which stops AND closes whatever the previous
+            play/rec context left there. So this probe’s ``sd.rec`` closed the
+            monolith’s live TTS playback stream, and a concurrent ``sd.play``
+            closed this probe’s recording stream mid-capture, waking our
+            ``sd.wait()`` whose ``finally`` closes the same handle from a
+            second thread. ``_StreamBase.close`` is
+            ``Pa_CloseStream(self._ptr)`` and only THEN nulls ``_ptr``, with no
+            lock: two concurrent Pa_CloseStream on one WASAPI stream is the
+            0xc0000374 heap corruption the monolith’s ``_reap_playback``
+            contract ("sd.stop()/sd.wait() are NEVER called on this stream")
+            was written to eliminate. The probe holds no _SPEAK_LOCK and runs
+            on an abandonable daemon, so neither of that contract’s stated
+            preconditions held here.
+
+        (b) UNBOUNDED WAIT. ``sd.wait()`` has no timeout, and the probe thread
+            holds the ``_diag_capture_active`` refcount across it; the release
+            lives in a ``finally`` a never-returning wait never reaches, and
+            ``_run_with_timeout`` only ABANDONS the thread. The identical
+            idiom in skills/enroll_voice was fixed on 2026-07-14 for exactly
+            this reason — this copy rotted (stale-duplicate rule).
+
+        The replacement is the pattern already proven in-tree at
+        bobert_companion.get_mic_buffer Path B: a PRIVATE ``sd.InputStream``
+        drained through a local queue under a wall-clock deadline. A private
+        stream is never published into ``_last_callback``, so no ``sd.play()``
+        can stop or close it and no ``sd.wait()`` of ours can ever bind to a
+        play context — exactly ONE thread makes native calls on this stream.
+        The deadline is inherently bounded, so the refcount can no longer be
+        pinned. The loop also re-checks ``_mic_owned()`` DURING the capture,
+        not merely between captures: TTS can start inside the 0.25 s span."""
+        need = int(duration_s * rate)
+        if need <= 0:
+            return 0.0, None
+        frames: "queue.Queue" = queue.Queue()
+
+        def _cb(indata, n_frames, time_info, status):  # noqa: ARG001
+            # Runs on the PortAudio callback thread: cheap, exception-proof,
+            # and it MUST copy — sounddevice reuses the input buffer.
+            try:
+                mono = indata[:, 0] if getattr(indata, "ndim", 1) > 1 else indata
+                frames.put(mono.copy())
+            except Exception:
+                pass
+
         try:
-            audio = sd.rec(int(duration_s * rate), samplerate=rate,
-                           channels=1, dtype="float32",
-                           device=device_idx)
-            sd.wait()
-            a = audio.squeeze() if hasattr(audio, "squeeze") else audio
-            rms = float(np.sqrt(np.mean(np.square(a)))) if len(a) else 0.0
-            return rms, None
+            stream = sd.InputStream(samplerate=rate, channels=1,
+                                    dtype="float32", blocksize=1024,
+                                    device=device_idx, callback=_cb)
         except Exception as exc:
             return None, f"{type(exc).__name__}: {exc}"
+        chunks: list = []
+        captured = 0
+        try:
+            stream.start()
+            # Wall-clock bound, not _now(): _now is monkeypatched to a frozen
+            # clock in tests, and a frozen deadline would never expire.
+            deadline = time.monotonic() + duration_s + 1.0
+            while captured < need and time.monotonic() < deadline:
+                if _mic_owned():
+                    # An owner appeared mid-capture (the standby loop’s next
+                    # record_speech turn, or a background _speak). Yield the
+                    # device immediately rather than sitting as a second open
+                    # stream on it; the finally below closes ours.
+                    break
+                try:
+                    frame = frames.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                chunks.append(frame)
+                captured += int(getattr(frame, "size", 0) or len(frame))
+        except Exception as exc:
+            return None, f"{type(exc).__name__}: {exc}"
+        finally:
+            _close_probe_stream(stream)
+        if not chunks:
+            return None, (f"TimeoutError: mic delivered no frames within "
+                          f"{duration_s + 1.0:.2f}s")
+        a = np.concatenate(chunks)
+        if len(a) > need:
+            a = a[:need]
+        rms = float(np.sqrt(np.mean(np.square(a)))) if len(a) else 0.0
+        return rms, None
 
     # Step 1: try the device JARVIS would actually use. This is the only
     # device that matters for "can JARVIS hear me right now".
     # Re-check ownership immediately before EACH capture (here and per
     # alternate below): the standby loop's flag drops briefly between
     # record_speech calls and this probe spans ~1s, so an owner can appear
-    # mid-probe. Same snapshot-race acceptance as the monolith's
-    # _refresh_devices guard, but re-checked per capture.
+    # mid-probe. The monolith's _refresh_devices closed its own snapshot race
+    # with the _pa_gate check-and-latch (2026-08-14); these per-capture
+    # re-checks remain because they police a DIFFERENT hazard the gate does
+    # not — opening a COMPETING stream while an owner is live (the WASAPI
+    # double-open contention of crash-fix-3).
     if _mic_owned():
         details["live_capture_skipped"] = (
-            "mic/audio stream went live before capture; skipping sd.rec() "
-            "(crash-fix-3 / no-mic guard)")
-        return _result(True, (_now() - start) * 1000.0, details=details)
-    active_rms, active_err = _capture_rms(active_idx)
-    details["active_rms"] = round(active_rms, 5) if active_rms is not None else None
-    if active_err:
-        details["active_capture_error"] = active_err
-    if active_rms is not None and active_rms >= MIC_RMS_FLOOR:
-        details["rms"] = round(active_rms, 5)  # back-compat field
+            "mic/audio stream went live before capture; skipping the live "
+            "capture (crash-fix-3 / no-mic guard)")
         return _result(True, (_now() - start) * 1000.0, details=details)
 
-    # Step 2: active mic is silent (or capture raised). Scan a small set
-    # of physical alternates so we can distinguish "audio stack broken
-    # entirely" from "user's preferred mic is muted/off but the box has
-    # other working inputs". Skip virtual devices (Steam Streaming, Sound
-    # Mapper, etc.) and dedupe by name root so we don't try the same
-    # physical mic four times via different hostapis.
-    seen_names: set[str] = set()
-    alternates: list[tuple[int, str]] = []
-    for idx, dev in inputs:
-        if idx == active_idx:
-            continue
-        name = (dev.get("name") or "").strip()
-        if not name or _VIRTUAL_INPUT_RE.search(name):
-            continue
-        key = name.lower()
-        if key in seen_names:
-            continue
-        seen_names.add(key)
-        alternates.append((idx, name))
-
-    MAX_ALTERNATES = 4
-    alternates_tried: list[dict] = []
-    best_rms = active_rms if active_rms is not None else 0.0
-    best_idx = active_idx if active_rms is not None else None
-    best_name: str | None = None
-    if active_idx is not None:
-        try:
-            best_name = devices[active_idx]["name"]
-        except Exception:  # pragma: no cover - defensive: device-name subscript when scanning mic alternates (audio I/O, sounddevice absent on CI)
-            best_name = None
-    for idx, name in alternates[:MAX_ALTERNATES]:
-        if _mic_owned():
-            # An owner grabbed the mic mid-scan (e.g. standby's next
-            # record_speech turn) — stop opening devices immediately and
-            # report a benign skip rather than a false "silent mic"
-            # verdict built from contended captures.
-            details["live_capture_skipped"] = (
-                "mic/audio stream went live mid-scan; skipping remaining "
-                "sd.rec() captures (crash-fix-3 / no-mic guard)")
+    # TEARDOWN-GATE CLAIM (2026-08-14): hold bobert's _diag_capture_active
+    # refcount across the WHOLE capture span (this capture and every
+    # alternate below) via bc._pa_claim_owner, so _refresh_devices cannot run its
+    # destructive sd._terminate()/_initialize() under one of these ~0.25s
+    # captures — they set none of the classic owner flags, which is exactly
+    # how the probe used to get PortAudio torn down beneath a live capture
+    # callback (0xc0000374). Degrades to the old unguarded behaviour when the
+    # host predates the gate API (SimpleNamespace doubles, older monoliths);
+    # a False claim (reinit in flight past the bounded wait) skips the
+    # captures with the same benign detail as a live owner. Released in the
+    # finally below, which brackets every capture INCLUDING the mid-scan
+    # early returns.
+    _diag_release = None
+    if bc is not None:
+        _claim_fn = getattr(bc, "_pa_claim_owner", None)
+        _release_fn = getattr(bc, "_pa_release_owner", None)
+        _diag_cell = getattr(bc, "_diag_capture_active", None)
+        if (callable(_claim_fn) and callable(_release_fn)
+                and isinstance(_diag_cell, list) and _diag_cell):
+            try:
+                if not _claim_fn(_diag_cell, refcount=True, timeout=0.5):
+                    details["live_capture_skipped"] = (
+                        "PortAudio reinit in flight; skipping the live "
+                        "capture (teardown gate / no-mic guard)")
+                    return _result(True, (_now() - start) * 1000.0,
+                                   details=details)
+                _diag_release = (_release_fn, _diag_cell)
+            except Exception:
+                _diag_release = None   # gate bookkeeping failed — old behaviour
+    try:
+        active_rms, active_err = _capture_rms(active_idx)
+        details["active_rms"] = round(active_rms, 5) if active_rms is not None else None
+        if active_err:
+            details["active_capture_error"] = active_err
+        if active_rms is not None and active_rms >= MIC_RMS_FLOOR:
+            details["rms"] = round(active_rms, 5)  # back-compat field
             return _result(True, (_now() - start) * 1000.0, details=details)
-        rms, err = _capture_rms(idx, duration_s=0.15)
-        alternates_tried.append({
-            "index": idx, "name": name,
-            "rms": round(rms, 5) if rms is not None else None,
-            "error": err,
-        })
-        if rms is not None and rms > best_rms:
-            best_rms = rms
-            best_idx = idx
-            best_name = name
+
+        # Step 2: active mic is silent (or capture raised). Scan a small set
+        # of physical alternates so we can distinguish "audio stack broken
+        # entirely" from "user's preferred mic is muted/off but the box has
+        # other working inputs". Skip virtual devices (Steam Streaming, Sound
+        # Mapper, etc.) and dedupe by name root so we don't try the same
+        # physical mic four times via different hostapis.
+        seen_names: set[str] = set()
+        alternates: list[tuple[int, str]] = []
+        for idx, dev in inputs:
+            if idx == active_idx:
+                continue
+            name = (dev.get("name") or "").strip()
+            if not name or _VIRTUAL_INPUT_RE.search(name):
+                continue
+            key = name.lower()
+            if key in seen_names:
+                continue
+            seen_names.add(key)
+            alternates.append((idx, name))
+
+        MAX_ALTERNATES = 4
+        alternates_tried: list[dict] = []
+        best_rms = active_rms if active_rms is not None else 0.0
+        best_idx = active_idx if active_rms is not None else None
+        best_name: str | None = None
+        if active_idx is not None:
+            try:
+                best_name = devices[active_idx]["name"]
+            except Exception:  # pragma: no cover - defensive: device-name subscript when scanning mic alternates (audio I/O, sounddevice absent on CI)
+                best_name = None
+        for idx, name in alternates[:MAX_ALTERNATES]:
+            if _mic_owned():
+                # An owner grabbed the mic mid-scan (e.g. standby's next
+                # record_speech turn) — stop opening devices immediately and
+                # report a benign skip rather than a false "silent mic"
+                # verdict built from contended captures.
+                details["live_capture_skipped"] = (
+                    "mic/audio stream went live mid-scan; skipping remaining "
+                    "captures (crash-fix-3 / no-mic guard)")
+                return _result(True, (_now() - start) * 1000.0, details=details)
+            rms, err = _capture_rms(idx, duration_s=0.15)
+            alternates_tried.append({
+                "index": idx, "name": name,
+                "rms": round(rms, 5) if rms is not None else None,
+                "error": err,
+            })
+            if rms is not None and rms > best_rms:
+                best_rms = rms
+                best_idx = idx
+                best_name = name
+    finally:
+        # Release the diag refcount AFTER the last capture’s stream has been
+        # torn down — close-then-release, so the flag covers the stream’s
+        # whole native lifetime. _capture_rms closes its private InputStream in
+        # its own finally before returning, so by here every native handle this
+        # probe opened is closed (or registered as an abandoned in-flight close
+        # with the host’s _pa_close_pending gate). Runs on every exit: normal
+        # fall-through, the loud-active early return, and the mid-scan
+        # owner-appeared returns above.
+        #
+        # H-4 (2026-08-20): the note that used to sit here — "sd.rec+sd.wait
+        # are synchronous" — was the disproven assertion that licensed this
+        # release. sd.wait() is unbounded, and the enroll_voice twin was fixed
+        # for that on 2026-07-14; the captures no longer use either call.
+        if _diag_release is not None:
+            try:
+                _diag_release[0](_diag_release[1], refcount=True)
+            except Exception:
+                pass
     details["rms"] = round(best_rms, 5)
     if alternates_tried:
         details["alternates_tried"] = alternates_tried

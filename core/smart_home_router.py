@@ -825,15 +825,24 @@ def _try_pointing_resolution(utterance: str) -> str | None:
 _LAN_NO_DEVICE_PREFIX = "I don't see any controllable smart devices"
 
 
-def _sh_kasa_module() -> Any:
-    """Locate the loaded sh_kasa skill module (its name varies by loader —
-    the monolith registers skills as ``skill_<name>``), mirroring the lookup
-    pattern of skills/sh_kasa._tuya_mod. Returns None when unavailable."""
-    for nm in ("skill_sh_kasa", "sh_kasa", "skills.sh_kasa"):
+def _skill_module(skill_name: str) -> Any:
+    """Locate a loaded brand skill module (its name varies by loader — the
+    monolith registers skills as ``skill_<name>``), falling back to a fresh
+    import. Returns None when unavailable. This is the ONE shared home of the
+    loader-name lookup rule — consumed by `_live_lan_fallback` below and by
+    skills.smart_home_discover._lan_discover_all; the single deliberate
+    sibling copy is skills/sh_kasa._tuya_mod, which must keep working when
+    this router isn't loaded at all."""
+    for nm in (f"skill_{skill_name}", skill_name, f"skills.{skill_name}"):
         m = sys.modules.get(nm)
         if m is not None:
             return m
-    return _import_skill("sh_kasa")
+    return _import_skill(skill_name)
+
+
+def _sh_kasa_module() -> Any:
+    """Locate the loaded sh_kasa skill module — delegates to _skill_module."""
+    return _skill_module("sh_kasa")
 
 
 def _live_lan_fallback(utterance: str) -> str | None:
@@ -936,8 +945,8 @@ def smart_home_control(utterance: str = "") -> str:
 
     devices = _resolve_devices(descriptor, catalog, want_type=want_type)
     if not devices:
-        # A device that's on the LAN but missing from the (Alexa-seeded)
-        # catalog is still reachable through the live-LAN path.
+        # A device that's on the LAN but missing from the catalog (Alexa +
+        # LAN seeded since v2) is still reachable through the live-LAN path.
         live = _live_lan_fallback(utterance)
         if live is not None:
             return live

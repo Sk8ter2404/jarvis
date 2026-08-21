@@ -279,6 +279,44 @@ class AmbientListenHelperTests(unittest.TestCase):
             self.mod._set_ambient_stream_active(False)   # stray release
             self.assertEqual(bc._ambient_stream_active[0], 0)   # never negative
 
+    def test_ambient_claim_prefers_host_teardown_gate(self):
+        # 2026-08-14: when the host exposes the _pa_gate teardown-gate API,
+        # claims/releases must route through bc._pa_claim_owner /
+        # bc._pa_release_owner (refcount semantics) so the claim is atomic
+        # with the monolith's reinit latch — and a refused claim must surface
+        # as False so the worker aborts instead of opening a stream into a
+        # native teardown.
+        calls = []
+
+        def _claim(cell, refcount=False, timeout=1.0, deny_if=None):
+            calls.append(("claim", refcount, timeout))
+            cell[0] = int(cell[0]) + 1
+            return True
+
+        def _release(cell, refcount=False):
+            calls.append(("release", refcount))
+            cell[0] = max(0, int(cell[0]) - 1)
+
+        bc = types.SimpleNamespace(_ambient_stream_active=[0],
+                                   _mic_lock=threading.Lock(),
+                                   _pa_claim_owner=_claim,
+                                   _pa_release_owner=_release)
+        with mock.patch.object(self.mod, "_get_bobert", return_value=bc):
+            self.assertTrue(self.mod._set_ambient_stream_active(True))
+            self.assertEqual(bc._ambient_stream_active[0], 1)
+            self.assertTrue(self.mod._set_ambient_stream_active(False))
+            self.assertEqual(bc._ambient_stream_active[0], 0)
+        self.assertEqual(calls, [("claim", True, 2.0), ("release", True)])
+
+    def test_ambient_claim_refused_by_gate_returns_false(self):
+        bc = types.SimpleNamespace(_ambient_stream_active=[0],
+                                   _mic_lock=threading.Lock(),
+                                   _pa_claim_owner=lambda *a, **k: False,
+                                   _pa_release_owner=lambda *a, **k: None)
+        with mock.patch.object(self.mod, "_get_bobert", return_value=bc):
+            self.assertFalse(self.mod._set_ambient_stream_active(True))
+        self.assertEqual(bc._ambient_stream_active[0], 0)
+
     # ── _hamming / _phash64 ──────────────────────────────────────────────
     def test_hamming_distance(self):
         self.assertEqual(self.mod._hamming(0b1010, 0b1010), 0)
@@ -2069,9 +2107,15 @@ class ResidualEdgeTests(_TmpDirMixin, unittest.TestCase):
         with mock.patch.object(self.mod, "_get_bobert", return_value=None):
             self.mod._safe_close_stream(stream)  # both swallowed, no raise
 
-    def test_safe_close_fallback_timeout_calls_sd_stop(self):
-        # done.wait() returns False (close hangs) → the escape hatch imports
-        # sounddevice and calls sd.stop().
+    def test_safe_close_fallback_timeout_never_calls_sd_stop(self):
+        # H-3 (2026-08-20): done.wait() returns False (close hangs) → the
+        # daemon is ABANDONED. The old escape hatch called the process-global
+        # sd.stop() under a comment claiming it would "force-stop every stream
+        # globally"; sounddevice 0.5.5 stops+closes only `_last_callback`,
+        # which nothing but sd.play()/sd.rec()/sd.playrec() publishes. It could
+        # never free this explicitly constructed InputStream, and its one
+        # reachable effect was closing the host's live TTS play stream
+        # (double Pa_CloseStream -> 0xc0000374).
         stream = mock.MagicMock()
         sd = _make_sd()
         fake_evt = mock.MagicMock()
@@ -2080,8 +2124,8 @@ class ResidualEdgeTests(_TmpDirMixin, unittest.TestCase):
              mock.patch.object(self.mod.threading, "Event", return_value=fake_evt), \
              mock.patch.object(self.mod.threading, "Thread"), \
              inject_modules(sounddevice=sd):
-            self.mod._safe_close_stream(stream)
-        sd.stop.assert_called_once()
+            self.mod._safe_close_stream(stream)   # must not raise
+        sd.stop.assert_not_called()
 
     # ── _focused_window_title length<=0 branch (Windows) ────────────────
     def test_focused_title_zero_length(self):
@@ -2712,18 +2756,22 @@ class DeepWorkerArmTests(_TmpDirMixin, unittest.TestCase):
                                side_effect=RuntimeError("unlink boom")):
             self.mod._rotate_jsonl_if_needed(path, cap=10)  # both swallowed
 
-    # ── _safe_close_stream escape hatch: sd.stop() itself raises ────────
-    def test_safe_close_escape_hatch_sd_stop_raises(self):
+    # ── H-3: the hung-close path is inert even when sounddevice is a
+    # landmine — nothing on the module-global API may be touched ────────
+    def test_safe_close_hung_path_touches_no_global_sd_api(self):
         stream = mock.MagicMock()
         sd = _make_sd()
         sd.stop = mock.MagicMock(side_effect=RuntimeError("sd.stop boom"))
+        sd.wait = mock.MagicMock(side_effect=RuntimeError("sd.wait boom"))
         fake_evt = mock.MagicMock()
         fake_evt.wait.return_value = False
         with mock.patch.object(self.mod, "_get_bobert", return_value=None), \
              mock.patch.object(self.mod.threading, "Event", return_value=fake_evt), \
              mock.patch.object(self.mod.threading, "Thread"), \
              inject_modules(sounddevice=sd):
-            self.mod._safe_close_stream(stream)  # both swallowed
+            self.mod._safe_close_stream(stream)  # must not raise
+        sd.stop.assert_not_called()
+        sd.wait.assert_not_called()
 
 
 if __name__ == "__main__":

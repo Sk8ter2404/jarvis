@@ -14,6 +14,15 @@ percentage reflects real unit coverage of testable code, and we ratchet it up.
 
 coverage runs in-process via its API (App-Control-safe, no ``.exe``). Install
 with ``python -m pip install --user coverage`` if missing.
+
+Every run sits inside a HARD MEMORY CEILING (tools/mem_guard.py, applied as the
+first thing main() does, so it covers coverage's own start-up, discovery, every
+test import and every child process). This is the THIRD discovery runner — CI
+itself invokes it (``python tools/run_coverage.py --xml --fail-under 80``) — so
+it carries the identical guard to tools/run_tests.py and
+tools/run_tests_ci_sim.py: a test run must not be able to damage the box it runs
+on. See tools/mem_guard.py for the 2026-08-20 bugcheck that motivated it and the
+JARVIS_TEST_MEM_CAP_GB knob (0 = off).
 """
 from __future__ import annotations
 
@@ -45,6 +54,35 @@ def _run_suite() -> bool:
 
 
 def main(argv: list[str]) -> int:
+    # HARD MEMORY CEILING FIRST — before coverage boots, before discovery, and
+    # before any test is imported, so it covers everything this run touches and
+    # every process it spawns. Same family as the _redirect_settings_to_throwaway()
+    # / _redirect_data_dir_to_throwaway() guards in _run_suite() (a test run must
+    # not be able to damage the box); this one is the RAM half, added after an
+    # uncapped run committed 144 GB and bugchecked the machine on 2026-08-20.
+    # See tools/mem_guard.py. The sys.path insert has to precede it so
+    # ``tools.mem_guard`` is importable when this file is run as a script.
+    #
+    # KNOWN, MEASURED SIDE EFFECT (2026-08-20): importing the guard here runs
+    # tools/mem_guard.py's module body BEFORE cov.start(), so coverage scores
+    # THAT ONE FILE lower — 67.0% -> 48.5%, ~19 of its 103 statements — with its
+    # tests unchanged. Against the 52,885-statement measured denominator that is
+    # 0.04 pts on the TOTAL the --fail-under gate reads, so the gate is
+    # unaffected and the trade (a bounded run) is obviously worth it. Do NOT
+    # "fix" the number by popping tools.mem_guard out of sys.modules to force a
+    # re-import under measurement: the applied ceiling would then live in one
+    # module object while the suite imports a second, fresh one — this repo's #1
+    # bug class (the stale duplicate) wired straight into the safety guard.
+    if _ROOT not in sys.path:
+        sys.path.insert(0, _ROOT)
+    from tools.mem_guard import apply_memory_ceiling
+    apply_memory_ceiling()
+    # NO REAL BROWSER either — belt and braces beside tests/__init__.py, which
+    # is the chokepoint that covers `python -m unittest` too. Added after CI
+    # runs spammed dozens of live tabs into the owner's default Chrome profile
+    # on 2026-08-20 via production webbrowser.open() calls. Idempotent.
+    from tools import browser_guard
+    browser_guard.install()
     try:
         import coverage
     except ImportError:

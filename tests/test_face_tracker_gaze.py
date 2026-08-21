@@ -28,7 +28,8 @@ import types
 import unittest
 from unittest import mock
 
-from tests._skill_harness import load_skill_isolated
+from tests._skill_harness import (load_skill_isolated,
+                                  no_background_threads)
 
 # A standard 4-monitor desk layout (matches core.config.MONITORS defaults).
 _MONITORS = {
@@ -260,7 +261,17 @@ class WhichMonitorWebcamFreeTests(_GazeBase):
         # The original webcam action would fail with no cameras:
         original = lambda _a="": "user is not visible to any camera"
         actions = {"which_monitor": original}
-        ft.register(actions)
+        # THREAD LEAK GUARD — _load() uses load_skill_isolated(register=False),
+        # so the harness's Thread.start neuter has already exited by the time we
+        # call register() by hand. Unguarded, this starts a REAL daemon thread
+        # named "face-tracker-skill" running _poll_loop at ~0.5s against the
+        # REAL audio.kinect_bridge, and it outlives this test for the whole CI
+        # process: it trips face_tracker.register()'s duplicate-poller guard in
+        # tests/skills/test_face_tracker.py (making that suite fail only when it
+        # runs AFTER this one) and keeps touching the sensor. Proven leaking
+        # 2026-08-20. Reuse the harness's own neuter.
+        with no_background_threads():
+            ft.register(actions)
         # Seed a fresh Kinect monitor via the merge (as the poller would).
         import time as _t
         with ft._state_lock:

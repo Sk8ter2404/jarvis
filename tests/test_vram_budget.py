@@ -491,20 +491,26 @@ class GuiBridgeTests(_CacheResetBase):
     def test_owner_shape_shared_vision_not_double_counted(self):
         """Behavioral regression for the audit's live trigger: the owner's
         settings (chat == vision == gemma4:26b, vision routed local, RAG on)
-        filtered through VRAM_WATCH_KEYS exactly like _live_vram_values'
-        fallback must predict UNDER budget with a 0-MB shared-vision entry —
-        not the phantom flat 7475 MB VLM that flipped over=True."""
+        must predict UNDER budget with a 0-MB shared-vision entry — not the
+        phantom flat 7475 MB VLM that flipped over=True.
+
+        The input goes through sw.resolve_vram_values, the SAME resolution the
+        GUI's _live_vram_values() runs. It used to hand-inject the settings
+        dict and filter it through VRAM_WATCH_KEYS, which tested the watch
+        tuple rather than the resolver — so it stayed green for two audits
+        while the GUI could not actually produce that dict (2026-08-20)."""
         full = {
             "LOCAL_LLM_MODEL": "gemma4:26b-a4b-it-qat",
             "LOCAL_VISION_MODEL": "gemma4:26b-a4b-it-qat",
-            "MODEL_ROUTING::vision": "local",
+            "MODEL_ROUTING": {"chat": "local", "vision": "local"},
             "SCREEN_VISION_ENABLED": True,
             "RAG_ENABLED": True,
             # Unwatched noise keys must be filtered out, not break anything.
             "TTS_VOICE": "en-GB-RyanNeural",
             "KINECT_ENABLED": False,
         }
-        subset = {k: full[k] for k in sw.VRAM_WATCH_KEYS if k in full}
+        subset = sw.resolve_vram_values({}, full)
+        self.assertEqual(subset.get("MODEL_ROUTING::vision"), "local")
         b = sw.budget_from_live_values(subset, total_mb=_CARD_MB)
         self.assertIsNotNone(b)
         self.assertFalse(b["over"])
@@ -516,6 +522,70 @@ class GuiBridgeTests(_CacheResetBase):
         self.assertEqual(len(shared), 1)
         self.assertEqual(shared[0]["mb"], 0)
         self.assertNotIn("vision", [c["label"] for c in b["components"]])
+
+    def test_gui_budget_matches_the_full_budget_for_the_shipped_default(self):
+        """THE 2026-08-20 finding: the panel called the SHIPPED default config
+        over-budget.
+
+        LOCAL_VISION_MODEL is watched but has no schema row, so it is in
+        neither default_settings() nor any widget. Before the fix the resolver
+        dropped it, predict_budget took its "older settings dict" branch and
+        charged a flat 7.3 GB VLM: 25702 MB / 111.6% red, with an over_warning
+        telling the owner to pick a smaller brain or route vision to the cloud
+        — advice that dismantles the one-multimodal-brain design core/config.py
+        deliberately ships. Every fresh install saw it.
+
+        So: what the GUI computes from the shipped defaults must EQUAL what the
+        engine computes from the full effective settings, and must be green."""
+        import core.config as cfg
+        defaults = sw.default_settings()
+        self.assertNotIn("LOCAL_VISION_MODEL", defaults)   # no schema row
+        values = sw.resolve_vram_values({}, defaults)
+        # The config fallback resolved the key the document never carries.
+        self.assertEqual(values.get("LOCAL_VISION_MODEL"),
+                         cfg.LOCAL_VISION_MODEL)
+        gui = sw.budget_from_live_values(values, total_mb=_CARD_MB)
+        full = vb.predict_budget(
+            dict(defaults, LOCAL_VISION_MODEL=cfg.LOCAL_VISION_MODEL),
+            total_mb=_CARD_MB)
+        self.assertEqual(gui, full,
+                         "the Settings VRAM panel disagrees with the engine "
+                         "for the SHIPPED defaults — a watched key is not "
+                         "reaching predict_budget")
+        # The shipped config shares ONE multimodal brain, so vision is free…
+        self.assertEqual(str(cfg.LOCAL_VISION_MODEL).lower(),
+                         str(defaults["LOCAL_LLM_MODEL"]).lower(),
+                         "core/config.py and the schema default disagree about "
+                         "the one-brain pair")
+        shared = [c for c in gui["components"]
+                  if c["label"] == "vision (shared with chat)"]
+        self.assertEqual([c["mb"] for c in shared], [0])
+        # …and the panel must therefore read GREEN, not 111.6% red.
+        self.assertFalse(gui["over"])
+        self.assertLess(gui["pct"], 100.0)
+        self.assertNotIn(vb.VISION_VRAM_MB,
+                         [c["mb"] for c in gui["components"]],
+                         "the phantom flat VLM allowance is being charged "
+                         "again")
+
+    def test_resolution_order_widget_beats_settings_beats_config(self):
+        """The config fallback must never override a real value: an unsaved
+        widget edit wins over the saved document, which wins over config."""
+        import core.config as cfg
+        settings = {"LOCAL_VISION_MODEL": "qwen2.5vl:7b"}
+        self.assertEqual(
+            sw.resolve_vram_values({}, settings)["LOCAL_VISION_MODEL"],
+            "qwen2.5vl:7b")
+        self.assertEqual(
+            sw.resolve_vram_values({"LOCAL_VISION_MODEL": "off"},
+                                   settings)["LOCAL_VISION_MODEL"], "off")
+        self.assertEqual(
+            sw.resolve_vram_values({}, {})["LOCAL_VISION_MODEL"],
+            cfg.LOCAL_VISION_MODEL)
+        # A falsy-but-real saved value is not "missing" — it must survive.
+        self.assertIs(
+            sw.resolve_vram_values({}, {"RAG_ENABLED": False})["RAG_ENABLED"],
+            False)
 
     def test_schema_has_rag_and_kinect_toggles(self):
         # The GUI edits these (added for the budget) — they must be persisted

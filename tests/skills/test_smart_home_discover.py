@@ -22,6 +22,7 @@ mocked so the suite is deterministic and fully offline.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import pickle
 import shutil
@@ -34,6 +35,22 @@ from unittest import mock
 from tests._skill_harness import load_skill_isolated
 
 
+@contextlib.contextmanager
+def _lan_phase_stubbed(mod, records=None, status=None, prior_catalog=None):
+    """Stub the 2026-08-14 LAN discovery phase (and the on-disk catalog read
+    that union-preserve does) so action/wizard tests stay offline and
+    deterministic: no `arp -a` subprocess, no brand-skill scans, no real
+    catalog file."""
+    lan_status = status if status is not None else {
+        s: {"ok": True, "count": 0} for s in mod._LAN_SOURCES}
+    with mock.patch.object(mod, "_scan_lan_arp", return_value=[]), \
+         mock.patch.object(mod, "_lan_discover_all",
+                           return_value=(list(records or []), lan_status)), \
+         mock.patch.object(mod, "_load_catalog",
+                           return_value=prior_catalog):
+        yield
+
+
 class DiscoverDegradationTests(unittest.TestCase):
     def setUp(self):
         self.mod, self.actions = load_skill_isolated("smart_home_discover")
@@ -42,11 +59,23 @@ class DiscoverDegradationTests(unittest.TestCase):
         with mock.patch.object(self.mod, "_alexapy", return_value=None):
             self.assertFalse(self.mod.is_available())
 
-    def test_discover_action_offline_without_alexapy(self):
-        with mock.patch.object(self.mod, "_alexapy", return_value=None):
+    def test_discover_action_without_alexapy_still_scans_lan(self):
+        # 2026-08-14 catalog-from-LAN: a missing alexapy no longer aborts the
+        # discovery — the LAN phase still runs and the summary reports the
+        # Alexa source as offline.
+        with mock.patch.object(self.mod, "_alexapy", return_value=None), \
+             _lan_phase_stubbed(self.mod), \
+             mock.patch.object(self.mod, "_merge_with_existing_catalog",
+                               side_effect=lambda c: c), \
+             mock.patch.object(self.mod, "_save_catalog") as save, \
+             mock.patch.object(self.mod, "_queue_missing_skill_tasks",
+                               return_value=0), \
+             mock.patch.object(self.mod, "_say"):
             out = self.actions["smart_home_discover"]("")
         self.assertIn("offline", out)
         self.assertIn("alexapy", out)
+        self.assertIn("Catalog updated", out)
+        save.assert_called_once()
 
     def test_catalog_action_when_no_catalog(self):
         with mock.patch.object(self.mod, "_load_catalog", return_value=None):
@@ -1672,23 +1701,57 @@ class SmartHomeDiscoverActionTests(unittest.TestCase):
         self.mod, self.actions = load_skill_isolated("smart_home_discover")
         self.fake = _make_fake_alexapy()
 
-    def test_no_cookie_returns_cli_hint(self):
+    def test_no_cookie_runs_lan_phase_with_console_hint_suffix(self):
+        # 2026-08-14 catalog-from-LAN: no cached cookie no longer aborts with
+        # the CLI hint — the LAN phase runs and lands a catalog; the hint
+        # survives only as the Alexa-unavailable suffix of the summary.
+        kasa = [{"name": "entry light", "brand": "TP-Link", "model": "HS103",
+                 "type": "plug", "capabilities": ["on_off"],
+                 "lan_ip": "10.0.0.2", "lan_mac": "", "alexa_entity_id": "",
+                 "alexa_room": "", "alexa_groups": [],
+                 "controller_skill": "sh_kasa", "source": "lan:sh_kasa",
+                 "device_id": "lan:sh_kasa:entry_light"}]
+        status = {s: {"ok": True, "count": (1 if s == "sh_kasa" else 0)}
+                  for s in self.mod._LAN_SOURCES}
         with mock.patch.object(self.mod, "_alexapy", return_value=self.fake), \
-             mock.patch.object(self.mod, "_load_cookie_meta", return_value=None), \
+             mock.patch.object(self.mod, "_load_cookie_meta",
+                               return_value=None), \
+             _lan_phase_stubbed(self.mod, records=kasa, status=status), \
+             mock.patch.object(self.mod, "_merge_with_existing_catalog",
+                               side_effect=lambda c: c), \
+             mock.patch.object(self.mod, "_save_catalog") as save, \
+             mock.patch.object(self.mod, "_queue_missing_skill_tasks",
+                               return_value=0), \
              mock.patch.object(self.mod, "_say") as say:
             out = self.actions["smart_home_discover"]("")
-        self.assertIn("interactive terminal", out)
-        say.assert_called_once()
+        self.assertIn("1 Kasa", out)
+        self.assertIn("Alexa discovery unavailable", out)
+        self.assertIn("interactive terminal", out)   # _CLI_HINT as suffix
+        save.assert_called_once()
+        say.assert_called()
 
-    def test_force_refresh_returns_cli_hint(self):
-        # Even with a cookie, 'force' forces the CLI hint.
+    def test_force_refresh_skips_merge_and_completes(self):
+        # 'force' used to short-circuit to the CLI hint; it now completes a
+        # clean rebuild (merge skipped) with the cached cookie still consulted.
+        devices = {"echo": [], "groups": [], "smarthome": [
+            {"friendlyName": "Lamp", "manufacturerName": "Hue",
+             "entityId": "e1",
+             "capabilities": [{"interface": "Alexa.ColorController"}]}]}
         with mock.patch.object(self.mod, "_alexapy", return_value=self.fake), \
              mock.patch.object(self.mod, "_load_cookie_meta",
                                return_value={"email": "e"}), \
              mock.patch.object(self.mod.os.path, "exists", return_value=True), \
+             mock.patch.object(self.mod, "_run_async", return_value=devices), \
+             _lan_phase_stubbed(self.mod), \
+             mock.patch.object(self.mod, "_merge_with_existing_catalog") as mg, \
+             mock.patch.object(self.mod, "_save_catalog") as save, \
+             mock.patch.object(self.mod, "_queue_missing_skill_tasks",
+                               return_value=0), \
              mock.patch.object(self.mod, "_say"):
             out = self.actions["smart_home_discover"]("please force reauth")
-        self.assertIn("interactive terminal", out)
+        mg.assert_not_called()
+        save.assert_called_once()
+        self.assertIn("Catalog updated", out)
 
     def test_cached_refresh_success_full_path(self):
         devices = {"echo": [{"serialNumber": "SN"}],
@@ -1702,7 +1765,7 @@ class SmartHomeDiscoverActionTests(unittest.TestCase):
                                return_value={"email": "e"}), \
              mock.patch.object(self.mod.os.path, "exists", return_value=True), \
              mock.patch.object(self.mod, "_run_async", return_value=devices), \
-             mock.patch.object(self.mod, "_scan_lan_arp", return_value=[]), \
+             _lan_phase_stubbed(self.mod), \
              mock.patch.object(self.mod, "_merge_with_existing_catalog",
                                side_effect=lambda c: c), \
              mock.patch.object(self.mod, "_save_catalog") as save, \
@@ -1710,30 +1773,51 @@ class SmartHomeDiscoverActionTests(unittest.TestCase):
                                return_value=1), \
              mock.patch.object(self.mod, "_say"):
             out = self.actions["smart_home_discover"]("")
-        self.assertIn("Catalog complete", out)
+        self.assertIn("Catalog updated", out)
+        self.assertIn("Alexa contributed 1 device(s)", out)
         save.assert_called_once()
 
-    def test_cached_refresh_fetch_returns_none_gives_cli_hint(self):
+    def test_cached_refresh_fetch_none_reports_and_continues(self):
+        # Fetch returning None used to end in the CLI hint with no catalog
+        # write; the LAN phase now still lands and the summary is honest.
         with mock.patch.object(self.mod, "_alexapy", return_value=self.fake), \
              mock.patch.object(self.mod, "_load_cookie_meta",
                                return_value={"email": "e"}), \
              mock.patch.object(self.mod.os.path, "exists", return_value=True), \
              mock.patch.object(self.mod, "_run_async", return_value=None), \
+             _lan_phase_stubbed(self.mod), \
+             mock.patch.object(self.mod, "_merge_with_existing_catalog",
+                               side_effect=lambda c: c), \
+             mock.patch.object(self.mod, "_save_catalog") as save, \
+             mock.patch.object(self.mod, "_queue_missing_skill_tasks",
+                               return_value=0), \
              mock.patch.object(self.mod, "_say"):
             out = self.actions["smart_home_discover"]("")
-        self.assertIn("interactive terminal", out)
+        self.assertIn("Alexa discovery unavailable", out)
+        self.assertIn("unusable", out)
+        self.assertIn("interactive terminal", out)   # console hint suffix
+        save.assert_called_once()
 
-    def test_cached_refresh_fetch_raises_returns_error(self):
+    def test_cached_refresh_fetch_raises_reports_and_continues(self):
+        # A raising fetch used to abort the whole action ("Catalog refresh
+        # failed"); it is now recorded per-source and the LAN catalog lands.
         with mock.patch.object(self.mod, "_alexapy", return_value=self.fake), \
              mock.patch.object(self.mod, "_load_cookie_meta",
                                return_value={"email": "e"}), \
              mock.patch.object(self.mod.os.path, "exists", return_value=True), \
              mock.patch.object(self.mod, "_run_async",
                                side_effect=RuntimeError("net down")), \
+             _lan_phase_stubbed(self.mod), \
+             mock.patch.object(self.mod, "_merge_with_existing_catalog",
+                               side_effect=lambda c: c), \
+             mock.patch.object(self.mod, "_save_catalog") as save, \
+             mock.patch.object(self.mod, "_queue_missing_skill_tasks",
+                               return_value=0), \
              mock.patch.object(self.mod, "_say"):
             out = self.actions["smart_home_discover"]("")
-        self.assertIn("Catalog refresh failed", out)
         self.assertIn("net down", out)
+        self.assertIn("Catalog updated", out)
+        save.assert_called_once()
 
     def test_wizard_lock_already_held(self):
         # Acquire the lock so the action reports "already running".
@@ -1804,10 +1888,19 @@ class RunWizardInteractiveTests(unittest.TestCase):
             self.mod._wizard_lock.release()
         self.assertIn("already running", out)
 
-    def test_alexapy_absent_returns_offline(self):
-        with mock.patch.object(self.mod, "_alexapy", return_value=None):
+    def test_alexapy_absent_still_runs_lan_phase(self):
+        # 2026-08-14: missing alexapy no longer aborts the wizard — the LAN
+        # phase still lands a catalog and the Alexa clause reports offline.
+        with mock.patch.object(self.mod, "_alexapy", return_value=None), \
+             _lan_phase_stubbed(self.mod), \
+             mock.patch.object(self.mod, "_merge_with_existing_catalog",
+                               side_effect=lambda c: c), \
+             mock.patch.object(self.mod, "_save_catalog"), \
+             mock.patch.object(self.mod, "_queue_missing_skill_tasks",
+                               return_value=0):
             out = self.mod._run_wizard_interactive("")
         self.assertIn("offline", out)
+        self.assertIn("Catalog updated", out)
 
     def test_cached_cookie_reuse_success(self):
         devices = {"echo": [], "smarthome": [], "groups": []}
@@ -1817,14 +1910,14 @@ class RunWizardInteractiveTests(unittest.TestCase):
                                              "saved_at": 1e9}), \
              mock.patch.object(self.mod, "_cookie_is_stale", return_value=False), \
              mock.patch.object(self.mod, "_run_async", return_value=devices), \
-             mock.patch.object(self.mod, "_scan_lan_arp", return_value=[]), \
+             _lan_phase_stubbed(self.mod), \
              mock.patch.object(self.mod, "_merge_with_existing_catalog",
                                side_effect=lambda c: c), \
              mock.patch.object(self.mod, "_save_catalog"), \
              mock.patch.object(self.mod, "_queue_missing_skill_tasks",
                                return_value=0):
             out = self.mod._run_wizard_interactive("")
-        self.assertIn("Catalog complete", out)
+        self.assertIn("Catalog updated", out)
 
     def test_stale_cookie_warns_then_reuses(self):
         devices = {"echo": [], "smarthome": [], "groups": []}
@@ -1834,17 +1927,18 @@ class RunWizardInteractiveTests(unittest.TestCase):
              mock.patch.object(self.mod, "_load_cookie_meta",
                                return_value=old_meta), \
              mock.patch.object(self.mod, "_run_async", return_value=devices), \
-             mock.patch.object(self.mod, "_scan_lan_arp", return_value=[]), \
+             _lan_phase_stubbed(self.mod), \
              mock.patch.object(self.mod, "_merge_with_existing_catalog",
                                side_effect=lambda c: c), \
              mock.patch.object(self.mod, "_save_catalog"), \
              mock.patch.object(self.mod, "_queue_missing_skill_tasks",
                                return_value=0):
             out = self.mod._run_wizard_interactive("")
-        self.assertIn("Catalog complete", out)
+        self.assertIn("Catalog updated", out)
 
     def test_cached_fetch_raises_then_prompts_and_cancels(self):
-        # cached fetch raises → devices None → prompt creds → user cancels.
+        # cached fetch raises → devices None → prompt creds → user cancels →
+        # the wizard CONTINUES to the LAN phase and reports the cancellation.
         with mock.patch.object(self.mod, "_alexapy", return_value=self.fake), \
              mock.patch.object(self.mod, "_load_cookie_meta",
                                return_value={"email": "e", "saved_at": 1e9}), \
@@ -1852,9 +1946,16 @@ class RunWizardInteractiveTests(unittest.TestCase):
              mock.patch.object(self.mod, "_run_async",
                                side_effect=RuntimeError("boom")), \
              mock.patch.object(self.mod, "_prompt_credentials",
-                               return_value=None):
+                               return_value=None), \
+             _lan_phase_stubbed(self.mod), \
+             mock.patch.object(self.mod, "_merge_with_existing_catalog",
+                               side_effect=lambda c: c), \
+             mock.patch.object(self.mod, "_save_catalog"), \
+             mock.patch.object(self.mod, "_queue_missing_skill_tasks",
+                               return_value=0):
             out = self.mod._run_wizard_interactive("")
         self.assertIn("cancelled", out)
+        self.assertIn("Catalog updated", out)
 
     def test_fresh_login_success_full_path(self):
         login = _FakeLogin(statuses=[{"login_successful": True}])
@@ -1869,33 +1970,47 @@ class RunWizardInteractiveTests(unittest.TestCase):
              mock.patch.object(self.mod, "_extract_cookie_jar",
                                return_value={"jar": 1}), \
              mock.patch.object(self.mod, "_save_cookie_meta"), \
-             mock.patch.object(self.mod, "_scan_lan_arp", return_value=[]), \
+             _lan_phase_stubbed(self.mod), \
              mock.patch.object(self.mod, "_merge_with_existing_catalog",
                                side_effect=lambda c: c), \
              mock.patch.object(self.mod, "_save_catalog"), \
              mock.patch.object(self.mod, "_queue_missing_skill_tasks",
                                return_value=0):
             out = self.mod._run_wizard_interactive("")
-        self.assertIn("Catalog complete", out)
+        self.assertIn("Catalog updated", out)
 
-    def test_fresh_login_returns_none_fails(self):
+    def test_fresh_login_returns_none_continues_to_lan(self):
         with mock.patch.object(self.mod, "_alexapy", return_value=self.fake), \
              mock.patch.object(self.mod, "_load_cookie_meta", return_value=None), \
              mock.patch.object(self.mod, "_prompt_credentials",
                                return_value=("e@e.com", "pw")), \
-             mock.patch.object(self.mod, "_run_async", return_value=None):
+             mock.patch.object(self.mod, "_run_async", return_value=None), \
+             _lan_phase_stubbed(self.mod), \
+             mock.patch.object(self.mod, "_merge_with_existing_catalog",
+                               side_effect=lambda c: c), \
+             mock.patch.object(self.mod, "_save_catalog"), \
+             mock.patch.object(self.mod, "_queue_missing_skill_tasks",
+                               return_value=0):
             out = self.mod._run_wizard_interactive("")
         self.assertIn("did not complete", out)
+        self.assertIn("Catalog updated", out)
 
-    def test_fresh_login_raises_returns_error(self):
+    def test_fresh_login_raises_reports_and_continues(self):
         with mock.patch.object(self.mod, "_alexapy", return_value=self.fake), \
              mock.patch.object(self.mod, "_load_cookie_meta", return_value=None), \
              mock.patch.object(self.mod, "_prompt_credentials",
                                return_value=("e@e.com", "pw")), \
              mock.patch.object(self.mod, "_run_async",
-                               side_effect=RuntimeError("sign-in boom")):
+                               side_effect=RuntimeError("sign-in boom")), \
+             _lan_phase_stubbed(self.mod), \
+             mock.patch.object(self.mod, "_merge_with_existing_catalog",
+                               side_effect=lambda c: c), \
+             mock.patch.object(self.mod, "_save_catalog"), \
+             mock.patch.object(self.mod, "_queue_missing_skill_tasks",
+                               return_value=0):
             out = self.mod._run_wizard_interactive("")
         self.assertIn("failed during sign-in", out)
+        self.assertIn("Catalog updated", out)
 
     def test_playwright_fallback_success(self):
         # _login_async raises _LoginNeedsPlaywright; playwright path returns a
@@ -1926,14 +2041,14 @@ class RunWizardInteractiveTests(unittest.TestCase):
                                return_value=("e@e.com", "pw")), \
              mock.patch.object(self.mod, "_run_async", side_effect=_run), \
              mock.patch.object(self.mod, "_save_cookie_meta"), \
-             mock.patch.object(self.mod, "_scan_lan_arp", return_value=[]), \
+             _lan_phase_stubbed(self.mod), \
              mock.patch.object(self.mod, "_merge_with_existing_catalog",
                                side_effect=lambda c: c), \
              mock.patch.object(self.mod, "_save_catalog"), \
              mock.patch.object(self.mod, "_queue_missing_skill_tasks",
                                return_value=0):
             out = self.mod._run_wizard_interactive("")
-        self.assertIn("Catalog complete", out)
+        self.assertIn("Catalog updated", out)
 
     def test_playwright_fallback_unavailable(self):
         def _run(coro):
@@ -1952,7 +2067,13 @@ class RunWizardInteractiveTests(unittest.TestCase):
              mock.patch.object(self.mod, "_load_cookie_meta", return_value=None), \
              mock.patch.object(self.mod, "_prompt_credentials",
                                return_value=("e@e.com", "pw")), \
-             mock.patch.object(self.mod, "_run_async", side_effect=_run):
+             mock.patch.object(self.mod, "_run_async", side_effect=_run), \
+             _lan_phase_stubbed(self.mod), \
+             mock.patch.object(self.mod, "_merge_with_existing_catalog",
+                               side_effect=lambda c: c), \
+             mock.patch.object(self.mod, "_save_catalog"), \
+             mock.patch.object(self.mod, "_queue_missing_skill_tasks",
+                               return_value=0):
             out = self.mod._run_wizard_interactive("")
         self.assertIn("did not complete", out)
 
@@ -1979,7 +2100,13 @@ class RunWizardInteractiveTests(unittest.TestCase):
              mock.patch.object(self.mod, "_prompt_credentials",
                                return_value=("e@e.com", "pw")), \
              mock.patch.object(self.mod, "_run_async", side_effect=_run), \
-             mock.patch.object(self.mod, "_save_cookie_meta"):
+             mock.patch.object(self.mod, "_save_cookie_meta"), \
+             _lan_phase_stubbed(self.mod), \
+             mock.patch.object(self.mod, "_merge_with_existing_catalog",
+                               side_effect=lambda c: c), \
+             mock.patch.object(self.mod, "_save_catalog"), \
+             mock.patch.object(self.mod, "_queue_missing_skill_tasks",
+                               return_value=0):
             out = self.mod._run_wizard_interactive("")
         self.assertIn("device fetch", out)
 
@@ -2007,7 +2134,13 @@ class RunWizardInteractiveTests(unittest.TestCase):
              mock.patch.object(self.mod, "_run_async", side_effect=_run), \
              mock.patch.object(self.mod, "_extract_cookie_jar",
                                return_value={}), \
-             mock.patch.object(self.mod, "_save_cookie_meta"):
+             mock.patch.object(self.mod, "_save_cookie_meta"), \
+             _lan_phase_stubbed(self.mod), \
+             mock.patch.object(self.mod, "_merge_with_existing_catalog",
+                               side_effect=lambda c: c), \
+             mock.patch.object(self.mod, "_save_catalog"), \
+             mock.patch.object(self.mod, "_queue_missing_skill_tasks",
+                               return_value=0):
             out = self.mod._run_wizard_interactive("")
         self.assertIn("failed during device fetch", out)
 
@@ -2024,14 +2157,14 @@ class RunWizardInteractiveTests(unittest.TestCase):
              mock.patch.object(self.mod, "_extract_cookie_jar",
                                side_effect=RuntimeError("extract boom")), \
              mock.patch.object(self.mod, "_save_catalog"), \
-             mock.patch.object(self.mod, "_scan_lan_arp", return_value=[]), \
+             _lan_phase_stubbed(self.mod), \
              mock.patch.object(self.mod, "_merge_with_existing_catalog",
                                side_effect=lambda c: c), \
              mock.patch.object(self.mod, "_queue_missing_skill_tasks",
                                return_value=0):
             out = self.mod._run_wizard_interactive("")
         # Still completes despite the cookie-save error.
-        self.assertIn("Catalog complete", out)
+        self.assertIn("Catalog updated", out)
 
 
 # ── _prompt_credentials ─────────────────────────────────────────────────────
@@ -2467,14 +2600,14 @@ class WizardPlaywrightCookieSaveFailureTests(unittest.TestCase):
              mock.patch.object(self.mod, "_run_async", side_effect=_run), \
              mock.patch.object(self.mod, "_save_cookie_meta",
                                side_effect=RuntimeError("save boom")), \
-             mock.patch.object(self.mod, "_scan_lan_arp", return_value=[]), \
+             _lan_phase_stubbed(self.mod), \
              mock.patch.object(self.mod, "_merge_with_existing_catalog",
                                side_effect=lambda c: c), \
              mock.patch.object(self.mod, "_save_catalog"), \
              mock.patch.object(self.mod, "_queue_missing_skill_tasks",
                                return_value=0):
             out = self.mod._run_wizard_interactive("")
-        self.assertIn("Catalog complete", out)
+        self.assertIn("Catalog updated", out)
 
     def test_playwright_post_signin_fetch_raises_sets_devices_none(self):
         # _restore_and_fetch_async raises after playwright sign-in (1288-1290),
@@ -2501,7 +2634,13 @@ class WizardPlaywrightCookieSaveFailureTests(unittest.TestCase):
              mock.patch.object(self.mod, "_prompt_credentials",
                                return_value=("e@e.com", "pw")), \
              mock.patch.object(self.mod, "_run_async", side_effect=_run), \
-             mock.patch.object(self.mod, "_save_cookie_meta"):
+             mock.patch.object(self.mod, "_save_cookie_meta"), \
+             _lan_phase_stubbed(self.mod), \
+             mock.patch.object(self.mod, "_merge_with_existing_catalog",
+                               side_effect=lambda c: c), \
+             mock.patch.object(self.mod, "_save_catalog"), \
+             mock.patch.object(self.mod, "_queue_missing_skill_tasks",
+                               return_value=0):
             out = self.mod._run_wizard_interactive("")
         self.assertIn("device fetch", out)
 

@@ -23,14 +23,38 @@ class FakeScheduler:
     """Minimal stand-in for core.scheduler — records calls and returns
     deterministic values so the action factories can be unit-tested."""
 
-    def __init__(self, available=True):
+    def __init__(self, available=True, registered=None):
         self._available = available
         self.calls = []
         self.jobs = []
         self.conditions = []
+        # `registered` mirrors core.scheduler's live ACTIONS dict. None means
+        # "not bootstrapped" — unknown_actions() then FAILS OPEN, exactly like
+        # the real module, which is why every pre-existing test in this file
+        # keeps arming without listing its action names.
+        self.registered = registered
 
     def is_available(self):
         return self._available
+
+    # ── arm-time validation contract (mirrors core.scheduler) ──
+    def unknown_actions(self, action, chain=None):
+        if self.registered is None:
+            return []
+        names = [action] + [e.get("action") for e in (chain or [])
+                            if isinstance(e, dict) and e.get("action")]
+        out = []
+        for n in names:
+            if n and n not in self.registered and n not in out:
+                out.append(n)
+        return out
+
+    def suggest_actions(self, name, limit=3):
+        if self.registered is None or not name:
+            return []
+        import difflib
+        return difflib.get_close_matches(name, list(self.registered),
+                                         n=limit, cutoff=0.6)
 
     # ── spec parsing primitives the skill calls ──
     def parse_every(self, body):
@@ -548,6 +572,168 @@ class ScheduleRegisterTests(unittest.TestCase):
         actions, out = self._register_with(fake)
         self.assertIn("schedule_recurring", actions)
         self.assertIn("APScheduler not installed", out)
+
+
+class ScheduleArmTimeValidationTests(unittest.TestCase):
+    """A job whose action name doesn't resolve must be refused while the owner
+    is still in the conversation — not armed, spoken as "armed, sir", and then
+    evaporated at 6 a.m. with nothing in the log."""
+
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("schedule_manager")
+        self.mod._bootstrap_error = None
+        self.sched = FakeScheduler(
+            registered={"morning_briefing", "weather", "play_music",
+                        "take_screenshot", "proactive_announce"})
+
+    def test_recurring_refuses_unregistered_action_and_arms_nothing(self):
+        act = self.mod._make_recurring(self.sched)
+        out = act("8am | morning_brief")
+        self.assertIn("don't have an action called", out)
+        self.assertIn("morning_brief", out)
+        self.assertEqual(self.sched.calls, [])          # no ghost job created
+
+    def test_refusal_offers_a_near_miss_suggestion(self):
+        act = self.mod._make_recurring(self.sched)
+        out = act("8am | morning_brief")
+        self.assertIn("morning_briefing", out)
+
+    def test_recurring_refuses_when_only_a_chain_step_is_unknown(self):
+        act = self.mod._make_recurring(self.sched)
+        out = act("8am | morning_briefing && phantom_step")
+        self.assertIn("phantom_step", out)
+        self.assertEqual(self.sched.calls, [])
+
+    def test_recurring_arms_when_every_step_resolves(self):
+        act = self.mod._make_recurring(self.sched)
+        out = act("8am | morning_briefing && weather")
+        self.assertIn("armed", out.lower())
+        self.assertEqual(self.sched.calls[-1][0], "cron")
+
+    def test_once_refuses_unregistered_action(self):
+        act = self.mod._make_once(self.sched)
+        out = act("in 30 minutes | phantom")
+        self.assertIn("don't have an action called", out)
+        self.assertEqual(self.sched.calls, [])
+
+    def test_when_refuses_unregistered_action(self):
+        act = self.mod._make_when(self.sched)
+        out = act("bambu_print_done | phantom")
+        self.assertIn("don't have an action called", out)
+        self.assertEqual(self.sched.calls, [])
+
+    def test_action_registered_later_still_arms(self):
+        # Skills load after the scheduler arms. Before bootstrap the live
+        # ACTIONS dict is unknown, so validation FAILS OPEN and the job is
+        # created — it must not be rejected just because the handler hasn't
+        # been registered yet.
+        sched = FakeScheduler(registered=None)
+        act = self.mod._make_recurring(sched)
+        out = act("8am | a_skill_that_loads_later")
+        self.assertIn("armed", out.lower())
+        self.assertEqual(sched.calls[-1][0], "cron")
+
+    def test_validation_failure_fails_open_but_says_so(self):
+        import contextlib
+        import io as _io
+        sched = FakeScheduler(registered={"weather"})
+        sched.unknown_actions = lambda *a, **k: (_ for _ in ()).throw(
+            AttributeError("no such thing"))
+        buf = _io.StringIO()
+        act = self.mod._make_recurring(sched)
+        with contextlib.redirect_stdout(buf):
+            out = act("8am | anything_at_all")
+        self.assertIn("armed", out.lower())                     # fail OPEN
+        self.assertIn("validation unavailable", buf.getvalue())  # but LOUD
+
+
+class ScheduleBrokenJobReportingTests(unittest.TestCase):
+    """list_schedules / schedule_status must not corroborate a job that will
+    do nothing when it fires."""
+
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("schedule_manager")
+        self.mod._bootstrap_error = None
+        self.sched = FakeScheduler()
+
+    def test_format_jobs_marks_a_broken_job(self):
+        out = self.mod._format_jobs([{
+            "id": "cron_ghost", "kind": "cron", "trigger": "hour=6",
+            "action": "morning_brief", "arg": "", "chain": [],
+            "next_run": "2026-08-21 06:00",
+            "unknown_actions": ["morning_brief"], "broken": True}])
+        self.assertIn("BROKEN", out)
+        self.assertIn("morning_brief", out)
+        self.assertIn("1 of those is broken", out)
+
+    def test_format_jobs_pluralises_multiple_broken_jobs(self):
+        rows = [{"id": f"cron_{n}", "kind": "cron", "trigger": "hour=6",
+                 "action": "ghost", "arg": "", "chain": [], "next_run": None,
+                 "unknown_actions": ["ghost"], "broken": True} for n in (1, 2)]
+        out = self.mod._format_jobs(rows)
+        self.assertIn("2 of those are broken", out)
+
+    def test_format_jobs_leaves_healthy_jobs_alone(self):
+        out = self.mod._format_jobs([{
+            "id": "cron_ok", "kind": "cron", "trigger": "hour=6",
+            "action": "weather", "arg": "", "chain": [],
+            "next_run": None, "unknown_actions": [], "broken": False}])
+        self.assertNotIn("BROKEN", out)
+        self.assertNotIn("broken", out)
+
+    def test_format_conditions_marks_a_broken_trigger(self):
+        out = self.mod._format_conditions([{
+            "id": "when_x", "condition": "disk_low", "action": "phantom",
+            "arg": "", "chain": [], "one_shot": False, "current_value": False,
+            "unknown_actions": ["phantom"], "broken": True}])
+        self.assertIn("BROKEN", out)
+        self.assertIn("phantom", out)
+
+    def test_status_reports_broken_jobs_and_past_misses(self):
+        self.sched.status = lambda: {
+            "running": True, "job_count": 1, "condition_count": 0,
+            "registered_conditions": [], "last_error": None,
+            "broken_jobs": [{"id": "cron_ghost", "action": "morning_brief",
+                             "unknown_actions": ["morning_brief"],
+                             "broken": True}],
+            "unresolved": [{"job_id": "cron_ghost", "action": "morning_brief",
+                            "count": 3}],
+        }
+        out = self.mod._make_status(self.sched)("")
+        self.assertIn("cron_ghost", out)
+        self.assertIn("not registered", out)
+        self.assertIn("3 time(s)", out)
+
+    def test_status_stays_quiet_when_nothing_is_broken(self):
+        out = self.mod._make_status(self.sched)("")
+        self.assertNotIn("Warning", out)
+        self.assertNotIn("broken", out.lower())
+
+
+class ScheduleCoreContractTests(unittest.TestCase):
+    """Pin the seam between this skill and the REAL core.scheduler, so the
+    fake above can't drift away from the module it stands in for."""
+
+    def test_core_scheduler_exposes_the_validation_seam(self):
+        from core import scheduler as core_sched
+        for name in ("unknown_actions", "suggest_actions",
+                     "unresolved_actions", "clear_unresolved",
+                     "set_notify_hook"):
+            self.assertTrue(callable(getattr(core_sched, name, None)),
+                            f"core.scheduler.{name} is missing")
+
+    def test_core_unknown_actions_fails_open_when_not_bootstrapped(self):
+        from core import scheduler as core_sched
+        with mock.patch.dict(core_sched._state, {"actions": None}):
+            self.assertEqual(core_sched.unknown_actions("anything"), [])
+
+    def test_core_unknown_actions_reports_missing_names(self):
+        from core import scheduler as core_sched
+        with mock.patch.dict(core_sched._state,
+                             {"actions": {"weather": lambda a: ""}}):
+            self.assertEqual(
+                core_sched.unknown_actions("ghost", [{"action": "weather"}]),
+                ["ghost"])
 
 
 if __name__ == "__main__":

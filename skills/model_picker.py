@@ -50,6 +50,20 @@ import sys
 
 import requests
 
+# Tag semantics + the chat<->vision lockstep RULE live in core/model_lockstep
+# (stdlib-only, no network): the Settings GUI and the web dashboard are
+# switch sites too, so the rule must have exactly ONE copy for all of them.
+# Imported unwrapped on purpose — a missing engine must fail loudly here
+# rather than silently reverting this module to a private duplicate.
+from core.model_lockstep import (
+    SIZE_ORDER as _SIZE_ORDER,
+    VISION_MARKERS as _VISION_MARKERS,
+    is_multimodal_tag as _is_multimodal_tag,
+    same_model as _same_model,
+    size_rank as _size_rank,
+    vision_tag_after_chat_switch as _vision_tag_after_chat_switch,
+)
+
 # Ollama base URL + the names of the NON-chat models to hide from / reject for
 # the chat slot. Pulled from core.config so a host that moved Ollama still
 # works; falls back to the well-known defaults if config can't be imported.
@@ -61,8 +75,8 @@ except Exception:  # pragma: no cover - config always importable in practice
 # Substrings that mark a tag as NOT a chat model. The embedding model can't
 # chat at all; the VL (vision-language) model is reserved for the vision slot
 # (LOCAL_VISION_MODEL) and must never be selected as the chat brain.
+# (_VISION_MARKERS is imported above — one copy, shared with the VRAM engine.)
 _EMBED_MARKERS = ("nomic-embed", "embed-text", "-embed", "bge-", "all-minilm")
-_VISION_MARKERS = ("vl:", "-vl", "vision", "llava", "moondream", "bakllava")
 
 _TIMEOUT = (3, 5)  # (connect, read) — /api/tags is tiny and local
 
@@ -155,34 +169,18 @@ def _short_name(tag: str) -> str:
     return f"{family} {size}".strip() if size else (tag.split(":", 1)[0] or tag)
 
 
-def _same_model(a: str, b: str) -> bool:
-    """True when two tags denote the SAME model. Exact (case-insensitive) tag
-    match, OR same base name where neither carries a DIFFERENT explicit size —
-    so a bare 'qwen2.5' matches 'qwen2.5:32b-...', but 'qwen2.5:14b' does NOT
-    match 'qwen2.5:32b' (different sizes of the same family are distinct
-    models). Distinguishing 14B from 32B is the whole point of the feature, so
-    a plain base-name comparison would be wrong here."""
-    if not a or not b:
-        return False
-    al, bl = a.lower(), b.lower()
-    if al == bl:
-        return True
-    if a.split(":", 1)[0].lower() != b.split(":", 1)[0].lower():
-        return False
-    # Same base name: same model only if their size tokens don't conflict.
-    ra, rb = _size_rank(a), _size_rank(b)
-    unknown = len(_SIZE_ORDER)
-    if ra == unknown or rb == unknown:   # one side has no size token → treat same
-        return True
-    return ra == rb
+# _same_model / _size_rank / _SIZE_ORDER are imported from core.model_lockstep
+# at the top of this file — the tag-identity rule the lockstep depends on has
+# ONE copy, shared with the Settings GUI and the web dashboard.
 
 
 # ─── vision lockstep (chat + vision share ONE multimodal brain) ────────────
 def _is_multimodal(tag: str) -> bool:
     """True when `tag` can serve VISION as well as chat. Asks Ollama's
     /api/show for the model's declared capabilities; on any error falls back
-    to the family markers (_VISION_MARKERS plus gemma4, the known multimodal
-    CHAT family). Never raises."""
+    to the shared offline family check (core.model_lockstep.is_multimodal_tag:
+    _VISION_MARKERS plus gemma4, the known multimodal CHAT family — the same
+    check the Settings GUI and web dashboard use). Never raises."""
     t = (tag or "").strip()
     if not t:
         return False
@@ -193,8 +191,7 @@ def _is_multimodal(tag: str) -> bool:
             return "vision" in (r.json().get("capabilities") or [])
     except Exception:
         pass
-    tl = t.lower()
-    return any(m in tl for m in _VISION_MARKERS) or "gemma4" in tl
+    return _is_multimodal_tag(t)
 
 
 def _sync_vision_to_chat(old_tag, new_tag, persist: bool = True, bc=None) -> bool:
@@ -206,8 +203,14 @@ def _sync_vision_to_chat(old_tag, new_tag, persist: bool = True, bc=None) -> boo
     co-load guard refused every local vision call ("REFUSING co-load: big
     model ... is resident") until restart.
 
-    Syncs ONLY when the current vision tag equals the OLD chat tag (the
-    shared-brain config) AND the new tag is vision-capable:
+    The DECISION ("must vision move, and to what?") is
+    core.model_lockstep.vision_tag_after_chat_switch — the one copy every
+    switch site shares, including the Settings GUI's Save and the web
+    dashboard's POST /api/settings (2026-08-20 audit: those two repointed the
+    chat tag with no vision consideration at all). This function owns only the
+    live/persisted ASSIGNMENT. Summary of the shared rule: sync ONLY when the
+    current vision tag equals the OLD chat tag (the shared-brain config) AND
+    the new tag is vision-capable:
       * a user-pinned separate VLM (vision != old chat tag) is never touched;
       * a switch to a TEXT-ONLY tag leaves vision on the old multimodal tag
         (the residency/co-load guards then degrade with a printed reason
@@ -226,14 +229,12 @@ def _sync_vision_to_chat(old_tag, new_tag, persist: bool = True, bc=None) -> boo
             vision = getattr(_cfg, "LOCAL_VISION_MODEL", None)
         except Exception:
             vision = None
-    if not (isinstance(vision, str) and vision and old_tag and new_tag):
+    # The shared rule decides; _is_multimodal (which asks Ollama for the real
+    # declared capabilities) is injected so the voice path stays as smart as
+    # it was while the offline UIs use the family-marker fallback.
+    if not _vision_tag_after_chat_switch(old_tag, new_tag, vision,
+                                         is_multimodal=_is_multimodal):
         return False
-    if not _same_model(vision, old_tag):
-        return False   # separate pinned VLM — never touch it
-    if _same_model(vision, new_tag):
-        return False   # already in lockstep — nothing to do
-    if not _is_multimodal(new_tag):
-        return False   # text-only brain — keep the old multimodal vision tag
     if bc is not None:
         try:
             setattr(bc, "LOCAL_VISION_MODEL", new_tag)
@@ -301,16 +302,11 @@ _SMALL_WORDS = (
 )
 
 # Size tokens, largest→smallest, used to rank chat tags for big/medium/small.
-_SIZE_ORDER = ("72b", "70b", "65b", "34b", "32b", "14b", "13b", "8b", "7b", "3b", "1.5b")
-
-
-def _size_rank(tag: str) -> int:
-    """Index of a tag's size in _SIZE_ORDER (lower = bigger). Unknown → end."""
-    t = (tag or "").lower()
-    for i, s in enumerate(_SIZE_ORDER):
-        if s in t:
-            return i
-    return len(_SIZE_ORDER)
+# _SIZE_ORDER / _size_rank come from core.model_lockstep (imported at the top),
+# which owns tag semantics for every switch site. NOTE: ranking is not
+# IDENTITY — _same_model compares the tag's DECLARED parameter count, because
+# this list can never enumerate every shipped size (it has no 26b/12b entry,
+# which is what made the 26B brain and its 12B sibling compare equal).
 
 
 def _by_size(chat: list[str]):

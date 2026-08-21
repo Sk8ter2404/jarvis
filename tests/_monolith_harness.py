@@ -159,6 +159,15 @@ _MONOLITH_RESTORE_NAMES = (
     "_device_cache", "_recent_spoken_messages", "_record_speech_taps",
     "_record_speech_active", "_pathb_mic_active", "_tts_playback_active",
     "_ambient_stream_active",
+    # PortAudio teardown-gate cells (2026-08-14): the diag/enroll owner
+    # refcounts and the reinit latch. A leaked non-zero cell would make every
+    # later _refresh_devices test silently defer its reinit; a leaked latch
+    # would time out every claim.
+    "_diag_capture_active", "_enroll_capture_active", "_pa_reinit_active",
+    # H-6 (2026-08-20): the abandoned-native-close count. A leaked non-zero
+    # value would make every later _refresh_devices test silently defer its
+    # reinit — the exact "green for the wrong reason" shape.
+    "_pa_close_pending",
     "_camera_failure_summary",
     # ── single-flight / barge-in counter cells (2026-07-08 bug-hunt) ────────
     # New single-element-list cells: reset in place so a test that abandons a

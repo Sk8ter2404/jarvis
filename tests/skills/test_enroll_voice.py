@@ -668,8 +668,17 @@ class RecordSecondsTests(unittest.TestCase):
         self.assertIsNotNone(out)
         self.assertGreater(out.size, 0)
 
-    # ── inline teardown escape hatch: daemon close hangs (213-217) ───────
-    def test_inline_teardown_escape_hatch_on_hung_close(self):
+    # ── H-3: inline teardown, daemon close hangs (213-217) ───────
+    # H-3 (2026-08-20): the hung-close branch ABANDONS the daemon. It must
+    # never reach for the process-global sd.stop(): sounddevice 0.5.5
+    # stops+closes only `_last_callback`, published solely by
+    # sd.play()/sd.rec()/sd.playrec(), so it could not free this explicitly
+    # constructed InputStream - while it COULD close the host's live TTS
+    # playback stream from this thread (double Pa_CloseStream on one WASAPI
+    # stream -> 0xc0000374). The DIFFERENT sd.stop() in the sd.rec bounded
+    # wait above stays: that path called sd.rec itself and therefore
+    # genuinely owns `_last_callback`.
+    def test_inline_teardown_hung_close_never_calls_global_sd_stop(self):
         import threading as _threading
         stopped_globally = {"called": False}
 
@@ -691,8 +700,8 @@ class RecordSecondsTests(unittest.TestCase):
         sd.stop = lambda: stopped_globally.__setitem__("called", True)
         bc = types.SimpleNamespace(get_input_device=lambda: None)
         clock = iter([20.0, 20.0, 20.02, 9999.0, 9999.0, 9999.0])
-        # Force the post-daemon wait() to report a timeout so the global
-        # sd.stop() escape hatch fires — without actually waiting 2 s.
+        # Force the post-daemon wait() to report a timeout so the abandon
+        # branch runs - without actually waiting 2 s.
         with mock.patch.object(self.mod, "_bobert", return_value=bc), \
              inject_modules(sounddevice=sd), \
              mock.patch.object(_threading.Event, "wait", return_value=False), \
@@ -700,7 +709,9 @@ class RecordSecondsTests(unittest.TestCase):
                                side_effect=lambda: next(clock)):
             out = self.mod._record_seconds(0.25)
         self.assertIsNotNone(out)
-        self.assertTrue(stopped_globally["called"])
+        self.assertFalse(stopped_globally["called"],
+                         "the inline teardown's hung-close branch must not "
+                         "call the process-global sd.stop()")
 
     # ── bc._safe_close_stream raises -> swallowed (188-189) ──────────────
     def test_safe_close_stream_error_is_swallowed(self):
@@ -721,15 +732,20 @@ class RecordSecondsTests(unittest.TestCase):
             out = self.mod._record_seconds(0.25)
         self.assertIsNotNone(out)   # teardown error must not break the return
 
-    # ── escape-hatch global sd.stop() itself raises (216-217) ────────────
-    def test_escape_hatch_global_stop_error_swallowed(self):
+    # ── H-3: hung close must not touch the global sd API (216-217) ──
+    # H-3: the hung-close branch is inert even when the global sd API is a
+    # landmine - it must touch none of it (a raising sd.stop() would now
+    # escape rather than be swallowed, because it is never called).
+    def test_inline_teardown_hung_close_touches_no_global_sd_api(self):
         import threading as _threading
 
         def _factory(**k):
             return _FakeStream(callback=k["callback"], value=0.2, n_pushes=2)
 
         sd = _make_sd(rec_raises=True, stream_factory=_factory)
+        calls = []
         def _boom_stop():
+            calls.append("stop")
             raise RuntimeError("global stop failed")
         sd.stop = _boom_stop
         bc = types.SimpleNamespace(get_input_device=lambda: None)
@@ -741,6 +757,9 @@ class RecordSecondsTests(unittest.TestCase):
                                side_effect=lambda: next(clock)):
             out = self.mod._record_seconds(0.25)
         self.assertIsNotNone(out)
+        self.assertEqual(calls, [],
+                         "the inline teardown's hung-close branch must not "
+                         "touch the process-global sd API at all (H-3)")
 
     # ── sd.rec returns an empty (size-0) buffer -> InputStream fallback ──
     def test_sd_rec_empty_buffer_falls_to_inputstream(self):

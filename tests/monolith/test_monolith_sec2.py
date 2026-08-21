@@ -19,7 +19,10 @@ and RUN in the local full tier (intended).
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -625,7 +628,9 @@ class RefreshDevicesTests(_MonolithSec2Base):
 
     def test_mic_switch_enqueues_announcement(self):
         # A genuine mid-session mic change (prev non-None → new name) should
-        # call _enqueue_device_announcement.
+        # call _enqueue_device_announcement. (The device list is unreadable
+        # through this bare Mock, so loss is UNKNOWN and the neutral wording
+        # is used — see FollowTheDefaultDeviceTests for both wordings.)
         self.bc._device_cache["checked_at"] = 0.0
         self.bc._device_cache["last_in_name"] = "Gaming Headset"
         self.bc._device_cache["last_out_name"] = None
@@ -1014,28 +1019,313 @@ class FaceTrackingToggleTests(_MonolithSec2Base):
 # ───────────────────────────────────────────────────────────────────────────
 #  _face_tracking_thread  (no cameras → fast clean exit)
 # ───────────────────────────────────────────────────────────────────────────
+#
+#  HARDWARE FIREWALL + WATCHDOG  (2026-08-20 isolation fix)
+#  ────────────────────────────────────────────────────────
+#  These tests used to open the REAL Kinect v2 and then spin the capture loop
+#  forever: the process reached 130-144 GB of commit and BUGCHECKED the machine
+#  (0x0000000A). Three facts combined:
+#
+#    1. data/user_settings.json sets KINECT_ENABLED=true, so merely IMPORTING
+#       the monolith runs ``_kinect_bridge.set_enabled(True)``
+#       (bobert_companion.py:557) -> ``start_body_pump()`` -> a daemon thread
+#       that opens the real sensor and publishes it into the PROCESS-GLOBAL
+#       ``audio.kinect_bridge._runtime[0]``.
+#    2. data/user_settings.json also sets KINECT_AS_CAMERA=true, and
+#       ``_open_capture`` computes (bobert_companion.py:5493)
+#           want_kinect = (cam.get("type") == "kinect"
+#                          or (KINECT_AS_CAMERA and not cam_name))
+#       - so a CAMERAS entry with NO "name" key HIJACKS the mocked webcam and is
+#       handed a real ``kinect_bridge.KinectCapture`` instead.
+#    3. Whether that KinectCapture reports ``isOpened()`` depends purely on
+#       WALL-CLOCK TIME: while the import-time pump is still inside its ~16 s
+#       open gauntlet, ``_open_attempt_lock.acquire(timeout=0.5)`` fails and the
+#       capture reports "Kinect open already in progress" -> closed -> caps
+#       empty -> the "No cameras available" early return fires and every test
+#       passes. Once the pump HAS published the runtime, the same code gets a
+#       LIVE sensor -> caps non-empty -> the loop runs until the process dies,
+#       while the bridge's stale-stream watchdog re-opens the runtime again and
+#       again, leaking a full set of frame buffers each time.
+#
+#  So the failure was ORDER- and TIME-dependent, not a leaked global from an
+#  earlier class. PROOF (capped runs, 4 GB job-object cap):
+#    * DeviceAccessorExtraTests + DeviceAccessorTests + DeviceSelectionTests
+#      then this class ............................. peak 968 MB, OK
+#    * THE SAME THREE CLASSES REPEATED 3x then this class
+#                                    ............... *** HIT CAP *** 4096 MB
+#  Same classes, more elapsed time -> balloon. The contaminated global is
+#  ``audio.kinect_bridge._runtime[0]``, filled in asynchronously by the
+#  import-time body pump - nothing this module could "restore in a tearDown".
+#
+#  The fix is therefore defence in depth, so ANY execution order is safe:
+#    * every CAMERAS entry here carries a "name" -> the KINECT_AS_CAMERA hijack
+#      cannot fire (the rule _open_capture documents at bobert_companion.py:5485);
+#    * KINECT_AS_CAMERA is patched False anyway;
+#    * ``bc._kinect_bridge`` is swapped for ``_StubKinectBridge``, whose
+#      KinectCapture NEVER opens - so no test can reach the real sensor even if
+#      both of the above regress;
+#    * ``_dshow_name_to_index`` is stubbed so a "name" never triggers a LIVE
+#      pygrabber DirectShow enumeration;
+#    * every call goes through ``_run_face_tracking_bounded()``, a watchdog that
+#      sets ``_face_track_stop`` and FAILS the test if the thread has not
+#      returned - an unbounded loop now asserts in seconds instead of allocating;
+#    * the three face-track Events are cleared before AND after every test.
+# ───────────────────────────────────────────────────────────────────────────
+class _StubKinectCapture:
+    """A ``kinect_bridge.KinectCapture`` work-alike that is ALWAYS closed.
+
+    Mirrors the real contract (``isOpened``/``read``/``get``/``set``/``release``
+    plus ``_open_error``, which ``_open_capture`` prints) so the opener takes its
+    "Kinect requested but unavailable -> fall back to the webcam" branch WITHOUT
+    touching the sensor. Deliberately a plain class and not a ``mock.Mock``: a
+    Mock retains every call and every argument forever, which is itself an
+    unbounded leak when the thing calling it is a per-frame capture loop."""
+
+    def __init__(self):
+        self._open_error = "kinect stubbed out for tests"
+
+    def isOpened(self):             # noqa: N802 - mirrors cv2.VideoCapture
+        return False
+
+    def read(self):
+        return False, None
+
+    def get(self, _prop):
+        return 0.0
+
+    def set(self, *_a, **_k):
+        return False
+
+    def release(self):
+        pass
+
+
+class _StubKinectBridge:
+    """Stand-in for ``bobert_companion._kinect_bridge`` in the face-track tests.
+
+    Counts how many times ``_open_capture`` asked for a ``KinectCapture`` so a
+    test can PROVE the KINECT_AS_CAMERA hijack did not fire."""
+
+    def __init__(self):
+        self.capture_requests = 0
+
+    def KinectCapture(self):        # noqa: N802 - mirrors the bridge's API
+        self.capture_requests += 1
+        return _StubKinectCapture()
+
+
 class FaceTrackingThreadTests(_MonolithSec2Base):
+    # The single configured camera every test in this class uses. The "name"
+    # key is LOAD-BEARING: without it, KINECT_AS_CAMERA (true on this box via
+    # data/user_settings.json) makes _open_capture bypass the mocked webcam for
+    # a real Kinect. Never drop it. See the module note above.
+    CAM = {"index": 0, "label": "X", "name": "Test Webcam 0",
+           "primary": True, "look_x": 0.5, "look_y": 0.5}
+
+    def _cams(self):
+        """A fresh one-entry CAMERAS list (copied, so an in-place rewrite by the
+        code under test cannot mutate the class constant)."""
+        return [dict(self.CAM)]
+
+    def setUp(self):
+        bc = self.bc
+        # -- hardware firewall ------------------------------------------------
+        # Started here rather than as per-test `with` blocks so EVERY test in
+        # the class is covered, including any added later; addCleanup unwinds
+        # them even when a test raises.
+        for patcher in (
+                # Belt: the global opt-in is off for the whole class.
+                mock.patch.object(bc, "KINECT_AS_CAMERA", False),
+                # Braces: even with it ON, the bridge can never open a sensor.
+                mock.patch.object(bc, "_kinect_bridge", _StubKinectBridge()),
+                # A "name" must not trigger a LIVE DirectShow enumeration.
+                # Resolving to the same static index keeps the opener quiet.
+                mock.patch.object(bc, "_dshow_name_to_index",
+                                  side_effect=lambda _name: self.CAM["index"]),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        # -- deterministic event baseline -------------------------------------
+        # No test may inherit a set/cleared face-track Event from a sibling, and
+        # none may leak one into a later class (the harness restores globals but
+        # NOT threading.Events).
+        for ev in (bc._face_track_stop, bc._face_track_pause,
+                   bc._face_track_camera_off):
+            ev.clear()
+            self.addCleanup(ev.clear)
+
+    def _run_face_tracking_bounded(self, timeout=8.0):
+        """Call ``bc._face_tracking_thread()`` under a WATCHDOG.
+
+        REGRESSION GUARD. If the function has not returned within ``timeout``
+        the capture loop is unbounded - a camera the test meant to be closed
+        actually opened - so we SET ``_face_track_stop`` to break the loop, wait
+        for the thread, and FAIL LOUDLY. Before this guard existed that exact
+        condition hung the runner and allocated until the box bugchecked, which
+        is unreadable as a test result; now it is a one-line assertion.
+
+        Runs the function on its own thread (which is how production runs it),
+        so the watchdog can regain control; any exception is re-raised on the
+        calling thread so unittest still reports it normally."""
+        box: dict = {}
+
+        def _runner():
+            try:
+                self.bc._face_tracking_thread()
+            except BaseException as exc:      # noqa: BLE001 - re-raised below
+                box["exc"] = exc
+
+        t = threading.Thread(target=_runner, name="sec2-face-track-watchdog",
+                             daemon=True)
+        t.start()
+        t.join(timeout)
+        if t.is_alive():
+            self.bc._face_track_stop.set()    # break the loop ...
+            t.join(10.0)                      # ... and let it unwind cleanly
+            self.fail(
+                f"_face_tracking_thread did not return within {timeout}s - the "
+                "capture loop is UNBOUNDED (a real camera/Kinect opened where "
+                "the test expected none). Stopped via _face_track_stop; see the "
+                "KINECT_AS_CAMERA note above this class.")
+        exc = box.get("exc")
+        if exc is not None:
+            raise exc
+
     def test_no_cameras_returns_immediately(self):
-        # _open_capture returns None for every configured cam → caps empty →
+        # _open_capture returns None for every configured cam -> caps empty ->
         # the thread prints "No cameras available" and returns without looping.
         cv2 = mock.Mock()
         bad_cap = mock.Mock()
         bad_cap.isOpened.return_value = False
         cv2.VideoCapture.return_value = bad_cap
         cv2.CAP_DSHOW = 700
+        # Belt: even if a capture DID open, the loop must not run - the stop
+        # event is armed before the call and cleared again by setUp/addCleanup.
+        self.bc._face_track_stop.set()
+        buf = io.StringIO()
         with mock.patch.object(self.bc, "cv2", cv2), \
-                mock.patch.object(self.bc, "CAMERAS",
-                                  [{"index": 0, "label": "X", "primary": True,
-                                    "look_x": 0.5, "look_y": 0.5}]):
+                mock.patch.object(self.bc, "CAMERAS", self._cams()), \
+                contextlib.redirect_stdout(buf):
             # Should return quickly with no surviving thread/loop.
-            self.bc._face_tracking_thread()
+            self._run_face_tracking_bounded()
+        # PROVE the early-return branch actually ran. Asserting only "it
+        # returned" was what let the balloon hide: with the stop event armed the
+        # thread ALSO returns quickly after opening a real camera, so the branch
+        # itself has to be observed.
+        self.assertIn("No cameras available", buf.getvalue())
+        # ...and the mocked webcam is what was tried, not the Kinect.
+        cv2.VideoCapture.assert_called_once_with(0, 700)
+        self.assertEqual(self.bc._kinect_bridge.capture_requests, 0)
+
+    def test_kinect_as_camera_cannot_hijack_a_named_camera(self):
+        # REGRESSION GUARD for the 144 GB balloon. With KINECT_AS_CAMERA ON, a
+        # NAMED CAMERAS entry must still open the WEBCAM, never the Kinect -
+        # the rule _open_capture documents at bobert_companion.py:5485. Every
+        # CAMERAS dict in this class relies on it.
+        bridge = _StubKinectBridge()
+        cv2 = mock.Mock()
+        bad_cap = mock.Mock()
+        bad_cap.isOpened.return_value = False
+        cv2.VideoCapture.return_value = bad_cap
+        cv2.CAP_DSHOW = 700
+        self.bc._face_track_stop.set()
+        buf = io.StringIO()
+        with mock.patch.object(self.bc, "KINECT_AS_CAMERA", True), \
+                mock.patch.object(self.bc, "_kinect_bridge", bridge), \
+                mock.patch.object(self.bc, "cv2", cv2), \
+                mock.patch.object(self.bc, "CAMERAS", self._cams()), \
+                contextlib.redirect_stdout(buf):
+            self._run_face_tracking_bounded()
+        self.assertEqual(
+            bridge.capture_requests, 0,
+            "KINECT_AS_CAMERA hijacked a NAMED camera entry - the mocked webcam "
+            "was bypassed for a Kinect capture (this is the exact defect that "
+            "made these tests open the real sensor and allocate 130+ GB)")
+        cv2.VideoCapture.assert_called_once_with(0, 700)
+
+    def test_unnamed_camera_entry_opts_into_kinect(self):
+        # The mechanism, pinned. With KINECT_AS_CAMERA on, an entry with NO
+        # "name" IS handed a KinectCapture - that is deliberate (an unnamed slot
+        # opts the sensor in), and it is precisely why every CAMERAS dict in
+        # this class must carry a name. Uses the STUB bridge, so this documents
+        # the hijack without ever touching the sensor.
+        bridge = _StubKinectBridge()
+        cv2 = mock.Mock()
+        bad_cap = mock.Mock()
+        bad_cap.isOpened.return_value = False
+        cv2.VideoCapture.return_value = bad_cap
+        cv2.CAP_DSHOW = 700
+        unnamed = {"index": 0, "label": "X", "primary": True,
+                   "look_x": 0.5, "look_y": 0.5}
+        self.bc._face_track_stop.set()
+        buf = io.StringIO()
+        with mock.patch.object(self.bc, "KINECT_AS_CAMERA", True), \
+                mock.patch.object(self.bc, "_kinect_bridge", bridge), \
+                mock.patch.object(self.bc, "cv2", cv2), \
+                mock.patch.object(self.bc, "CAMERAS", [unnamed]), \
+                contextlib.redirect_stdout(buf):
+            self._run_face_tracking_bounded()
+        self.assertEqual(bridge.capture_requests, 1)
+        self.assertIn("Kinect requested but unavailable", buf.getvalue())
+
+    def test_watchdog_fails_loudly_on_unbounded_loop(self):
+        # REGRESSION GUARD for the guard: a capture that keeps opening and never
+        # honours the stop event must make _run_face_tracking_bounded FAIL, not
+        # hang. Everything here is a plain object (no Mock retains frames) and
+        # the window is one second, so this cannot itself balloon.
+        class _NeverEndingCap:
+            def isOpened(self):     # noqa: N802 - mirrors cv2.VideoCapture
+                return True
+
+            def read(self):
+                time.sleep(0.01)
+                return False, None      # never a frame, never a stop
+
+            def get(self, _prop):
+                return 0
+
+            def set(self, *_a, **_k):
+                return True
+
+            def release(self):
+                pass
+
+        class _Cv2Stub:
+            CAP_DSHOW = 700
+            CAP_PROP_FRAME_WIDTH = 3
+            CAP_PROP_FRAME_HEIGHT = 4
+            CAP_PROP_BUFFERSIZE = 38
+            error = self.bc.cv2.error
+
+            def VideoCapture(self, *_a, **_k):   # noqa: N802 - cv2 API name
+                return _NeverEndingCap()
+
+        buf = io.StringIO()
+        logging.disable(logging.CRITICAL)
+        try:
+            with mock.patch.object(self.bc, "cv2", _Cv2Stub()), \
+                    mock.patch.object(self.bc, "CAMERAS", self._cams()), \
+                    mock.patch.object(self.bc, "_note_camera_read_attempt"), \
+                    mock.patch.object(self.bc, "find_camera_locking_processes",
+                                      return_value=[]), \
+                    mock.patch.object(self.bc, "_hud_camera_preview_enabled",
+                                      return_value=False), \
+                    mock.patch.object(self.bc, "send"), \
+                    contextlib.redirect_stdout(buf):
+                with self.assertRaises(self.failureException) as caught:
+                    self._run_face_tracking_bounded(timeout=1.0)
+        finally:
+            logging.disable(logging.NOTSET)
+        self.assertIn("UNBOUNDED", str(caught.exception))
+        # The watchdog must also have actually STOPPED the thread it caught.
+        self.assertTrue(self.bc._face_track_stop.is_set())
 
     def test_one_good_frame_iteration_then_stop(self):
         # Drive exactly one healthy loop iteration: the camera opens, yields a
-        # good frame, a face is detected on the primary cam → the eye-control
+        # good frame, a face is detected on the primary cam -> the eye-control
         # math + send() path runs, then _face_track_stop ends the loop. Covers
         # the frame-cache / detection / tracking-math body (not just the empty
-        # early-return). No real device, no real thread — runs inline.
+        # early-return). No real device - the thread is watchdog-bounded.
         import numpy as np
         frame = np.zeros((720, 1280, 3), dtype=np.uint8)
         cap = mock.Mock()
@@ -1043,9 +1333,6 @@ class FaceTrackingThreadTests(_MonolithSec2Base):
         cap.get.return_value = 1280
 
         stop = self.bc._face_track_stop
-        pause = self.bc._face_track_pause
-        stop.clear()
-        pause.clear()
 
         # First read() yields a good frame; immediately arm the stop event so
         # the while-loop condition is False at the top of the next iteration.
@@ -1059,27 +1346,20 @@ class FaceTrackingThreadTests(_MonolithSec2Base):
         cv2.CAP_DSHOW = 700
 
         sends = []
-        try:
-            with mock.patch.object(self.bc, "cv2", cv2), \
-                    mock.patch.object(self.bc, "CAMERAS",
-                                      [{"index": 0, "label": "X",
-                                        "primary": True,
-                                        "look_x": 0.5, "look_y": 0.5}]), \
-                    mock.patch.object(self.bc, "_detect_face",
-                                      return_value=(0.5, 0.5)), \
-                    mock.patch.object(self.bc, "_note_camera_read_attempt"), \
-                    mock.patch.object(self.bc, "send",
-                                      side_effect=lambda **k: sends.append(k)), \
-                    mock.patch.object(self.bc.time, "sleep"):
-                self.bc._face_tracking_thread()
-        finally:
-            stop.clear()
-            pause.clear()
+        with mock.patch.object(self.bc, "cv2", cv2), \
+                mock.patch.object(self.bc, "CAMERAS", self._cams()), \
+                mock.patch.object(self.bc, "_detect_face",
+                                  return_value=(0.5, 0.5)), \
+                mock.patch.object(self.bc, "_note_camera_read_attempt"), \
+                mock.patch.object(self.bc, "send",
+                                  side_effect=lambda **k: sends.append(k)), \
+                mock.patch.object(self.bc.time, "sleep"):
+            self._run_face_tracking_bounded()
         # The good frame was cached for see_user.
         with self.bc._camera_state_lock:
             self.assertIn(0, self.bc._camera_latest_frame)
 
-    # ── camera STAYS ON during listening/speaking (fix/camera-stays-on) ──────
+    # -- camera STAYS ON during listening/speaking (fix/camera-stays-on) ------
     def _drive_one_preview_iteration(self, *, paused, camera_off, standby):
         """Run exactly one face-track loop iteration with the HUD-preview
         writer/remover mocked, returning (write_mock, remove_mock, detect_mock)
@@ -1094,7 +1374,6 @@ class FaceTrackingThreadTests(_MonolithSec2Base):
         stop = self.bc._face_track_stop
         pause = self.bc._face_track_pause
         cam_off = self.bc._face_track_camera_off
-        stop.clear(); pause.clear(); cam_off.clear()
         if paused:
             pause.set()
         if camera_off:
@@ -1117,10 +1396,7 @@ class FaceTrackingThreadTests(_MonolithSec2Base):
         self.bc._standby_mode[0] = bool(standby)
         try:
             with mock.patch.object(self.bc, "cv2", cv2), \
-                    mock.patch.object(self.bc, "CAMERAS",
-                                      [{"index": 0, "label": "X",
-                                        "primary": True,
-                                        "look_x": 0.5, "look_y": 0.5}]), \
+                    mock.patch.object(self.bc, "CAMERAS", self._cams()), \
                     mock.patch.object(self.bc, "_detect_face", detect_mock), \
                     mock.patch.object(self.bc, "_hud_camera_preview_enabled",
                                       return_value=True), \
@@ -1131,39 +1407,38 @@ class FaceTrackingThreadTests(_MonolithSec2Base):
                     mock.patch.object(self.bc, "_note_camera_read_attempt"), \
                     mock.patch.object(self.bc, "send"), \
                     mock.patch.object(self.bc.time, "sleep"):
-                self.bc._face_tracking_thread()
+                self._run_face_tracking_bounded()
         finally:
             self.bc._standby_mode[0] = saved_standby
-            stop.clear(); pause.clear(); cam_off.clear()
         return write_mock, remove_mock, detect_mock
 
     def test_paused_for_voice_keeps_preview_live(self):
         # The core fix: while paused for voice (listening/thinking/speaking) the
-        # camera must STAY visibly ON — the primary frame is still mirrored to
-        # the HUD preview — while the HEAVY cv2 face detection is still skipped
+        # camera must STAY visibly ON - the primary frame is still mirrored to
+        # the HUD preview - while the HEAVY cv2 face detection is still skipped
         # (the recognition cost the pause exists to save).
         write_mock, remove_mock, detect_mock = self._drive_one_preview_iteration(
             paused=True, camera_off=False, standby=False)
-        # Preview kept live → HUD never shows "CAMERA OFF" just for listening.
+        # Preview kept live -> HUD never shows "CAMERA OFF" just for listening.
         # (The thread's on-shutdown cleanup removes the file once after the loop
-        # ends — the single test iteration triggers that teardown — so the live
+        # ends - the single test iteration triggers that teardown - so the live
         # signal is "write happened" + "no top-of-loop blank", i.e. remove was
         # NOT called BEFORE the write. That ordering is asserted below.)
         write_mock.assert_called_once()
         # Mock records calls in order across distinct mocks via a shared parent
         # only if attached; here we assert the in-loop blank never fired by
-        # checking remove was called at most once (the post-loop teardown) — a
+        # checking remove was called at most once (the post-loop teardown) - a
         # top-of-loop blank would make it 2 (blank + teardown), as the
         # camera_off / standby tests confirm.
         self.assertLessEqual(remove_mock.call_count, 1)
         # Frame still cached so the air-mouse / gaze keep getting frames.
         with self.bc._camera_state_lock:
             self.assertIn(0, self.bc._camera_latest_frame)
-        # …but the expensive recognition pass was NOT run while paused.
+        # ...but the expensive recognition pass was NOT run while paused.
         detect_mock.assert_not_called()
 
     def test_low_memory_camera_off_blanks_preview(self):
-        # The KINECT_REVIEW P0 low-memory guard sets _face_track_camera_off →
+        # The KINECT_REVIEW P0 low-memory guard sets _face_track_camera_off ->
         # the preview must blank (file removed, never written) so the HUD shows
         # "CAMERA OFF" and we stop mirroring HD frames under memory pressure,
         # even though the capture loop keeps running. Removed twice here: the
@@ -1175,7 +1450,7 @@ class FaceTrackingThreadTests(_MonolithSec2Base):
 
     def test_standby_blanks_preview(self):
         # Standby / empty room (_standby_mode) must STILL blank the preview to
-        # the "CAMERA OFF" placeholder — only the listening/speaking case was
+        # the "CAMERA OFF" placeholder - only the listening/speaking case was
         # changed to keep the camera on. Removed twice (top-of-loop + teardown).
         write_mock, remove_mock, _ = self._drive_one_preview_iteration(
             paused=False, camera_off=False, standby=True)
@@ -1185,9 +1460,8 @@ class FaceTrackingThreadTests(_MonolithSec2Base):
     def test_detect_face_cv2_error_degrades_gracefully(self):
         # A cv2.error out of _detect_face (e.g. an OpenCL/GPU hiccup) must NOT
         # unwind the tracking thread. The loop should swallow it, cache the
-        # frame for see_user, back off with time.sleep(0.5), and continue —
+        # frame for see_user, back off with time.sleep(0.5), and continue -
         # then exit cleanly when _face_track_stop fires.
-        import logging
         import numpy as np
         frame = np.zeros((720, 1280, 3), dtype=np.uint8)
         cap = mock.Mock()
@@ -1195,9 +1469,6 @@ class FaceTrackingThreadTests(_MonolithSec2Base):
         cap.get.return_value = 1280
 
         stop = self.bc._face_track_stop
-        pause = self.bc._face_track_pause
-        stop.clear()
-        pause.clear()
 
         def _read():
             stop.set()          # end the loop after this single iteration
@@ -1216,29 +1487,22 @@ class FaceTrackingThreadTests(_MonolithSec2Base):
             raise self.bc.cv2.error("CL_OUT_OF_RESOURCES")
 
         sleeps = []
-        try:
-            with mock.patch.object(self.bc, "cv2", cv2), \
-                    mock.patch.object(self.bc, "CAMERAS",
-                                      [{"index": 0, "label": "X",
-                                        "primary": True,
-                                        "look_x": 0.5, "look_y": 0.5}]), \
-                    mock.patch.object(self.bc, "_detect_face",
-                                      side_effect=_boom), \
-                    mock.patch.object(self.bc, "_note_camera_read_attempt"), \
-                    mock.patch.object(self.bc, "send"), \
-                    mock.patch.object(self.bc.time, "sleep",
-                                      side_effect=lambda s: sleeps.append(s)):
-                # Must return normally — the cv2.error is swallowed, not raised.
-                # Silence the expected logging.exception traceback so the test
-                # log stays clean (the handler under test logs the swallow).
-                logging.disable(logging.CRITICAL)
-                try:
-                    self.bc._face_tracking_thread()
-                finally:
-                    logging.disable(logging.NOTSET)
-        finally:
-            stop.clear()
-            pause.clear()
+        with mock.patch.object(self.bc, "cv2", cv2), \
+                mock.patch.object(self.bc, "CAMERAS", self._cams()), \
+                mock.patch.object(self.bc, "_detect_face",
+                                  side_effect=_boom), \
+                mock.patch.object(self.bc, "_note_camera_read_attempt"), \
+                mock.patch.object(self.bc, "send"), \
+                mock.patch.object(self.bc.time, "sleep",
+                                  side_effect=lambda s: sleeps.append(s)):
+            # Must return normally - the cv2.error is swallowed, not raised.
+            # Silence the expected logging.exception traceback so the test
+            # log stays clean (the handler under test logs the swallow).
+            logging.disable(logging.CRITICAL)
+            try:
+                self._run_face_tracking_bounded()
+            finally:
+                logging.disable(logging.NOTSET)
         # Frame was still cached despite the detection failure.
         with self.bc._camera_state_lock:
             self.assertIn(0, self.bc._camera_latest_frame)
@@ -2577,14 +2841,30 @@ class RefreshDevicesReinitTests(_MonolithSec2Base):
         self.assertEqual(self.bc._device_cache["out"], 4)
 
     def test_headset_drop_message_phrasing(self):
-        # prev mic name contains "headset" → the headset-specific switch
-        # message branch (3956-3958) is used.
+        # prev mic name contains "headset" AND the headset is GONE from the
+        # device list → the headset-specific loss message fires.
+        #
+        # 2026-08-20 (follow-the-default): the loss wording is now gated on the
+        # previous endpoint having actually VANISHED from the enumeration, not
+        # on its name containing "headset" — a deliberate Stream Deck switch
+        # away from a still-present headset gets the neutral line instead (see
+        # FollowTheDefaultDeviceTests). So this test must arrange a real
+        # disappearance: the mocked device list contains only the new mic.
         self.bc._device_cache["checked_at"] = 0.0
         self.bc._device_cache["last_in_name"] = "Gaming Headset"
+        self.bc._device_cache["last_in_index"] = 9
         self.bc._device_cache["last_out_name"] = None
         announced = []
         sd = mock.Mock()
-        sd.query_devices.return_value = {"name": "ignored"}
+
+        def _qd(idx=None, **kw):
+            if idx is None:
+                return [{"name": "Fallback Laptop Mic",
+                         "max_input_channels": 1, "max_output_channels": 0},
+                        {"name": "Speakers",
+                         "max_input_channels": 0, "max_output_channels": 2}]
+            return {"name": "ignored"}
+        sd.query_devices.side_effect = _qd
         with mock.patch.object(self.bc, "sd", sd), \
                 mock.patch.dict(self.bc.sys.modules, {}, clear=False), \
                 mock.patch.object(self.bc, "_record_speech_active", [False]), \
@@ -2975,14 +3255,25 @@ class RefreshDevicesNonHeadsetSwitchTests(_MonolithSec2Base):
         self.bc._device_cache.update(self._saved_cache)
 
     def test_non_headset_previous_mic_uses_disconnected_phrasing(self):
-        # prev mic name has NO "headset"/"headphone" → the else branch
-        # (3960-3962) builds the "appears to have disconnected" message.
+        # prev mic GONE from the device list and its name has NO
+        # "headset"/"headphone" → the "appears to have disconnected" message.
+        # (Loss is decided from the device LIST since 2026-08-20 — the mocked
+        # enumeration below deliberately no longer contains "Blue Yeti".)
         self.bc._device_cache["checked_at"] = 0.0
         self.bc._device_cache["last_in_name"] = "Blue Yeti"
+        self.bc._device_cache["last_in_index"] = 9
         self.bc._device_cache["last_out_name"] = None
         announced = []
         sd = mock.Mock()
-        sd.query_devices.return_value = {"name": "ignored"}
+
+        def _qd(idx=None, **kw):
+            if idx is None:
+                return [{"name": "Fallback Laptop Mic",
+                         "max_input_channels": 1, "max_output_channels": 0},
+                        {"name": "Speakers",
+                         "max_input_channels": 0, "max_output_channels": 2}]
+            return {"name": "ignored"}
+        sd.query_devices.side_effect = _qd
         with mock.patch.object(self.bc, "sd", sd), \
                 mock.patch.dict(self.bc.sys.modules, {}, clear=False), \
                 mock.patch.object(self.bc, "_record_speech_active", [False]), \
@@ -3001,6 +3292,391 @@ class RefreshDevicesNonHeadsetSwitchTests(_MonolithSec2Base):
         self.assertEqual(len(announced), 1)
         self.assertIn("disconnected", announced[0].lower())
         self.assertNotIn("headset", announced[0].lower())
+
+
+# ───────────────────────────────────────────────────────────────────────────
+#  FOLLOW-THE-DEFAULT audio + spoken switch announcements (2026-08-20)
+#
+#  The owner selects his mic and speakers from a Stream Deck, which moves the
+#  WINDOWS DEFAULT device. JARVIS must FOLLOW that default (never pin an index
+#  of its own) and SAY which device it moved to, in both directions.
+#
+#  These tests pin the feature and cover the two defects it fixes:
+#    D1 — the change guard compared the NAME ONLY and stored no index, so a
+#         device moving 4 → 3 under an identical (MME-truncated) name was
+#         invisible.
+#    D2 — in the follow-the-default configuration _pick_device returns
+#         (None, ""), and the `if in_name and …` guard therefore suppressed the
+#         log AND the announcement outright; the output branch never announced
+#         at all.
+#  …and the outage that motivated it: PREFERRED_INPUT_DEVICES pinned "CORSAIR",
+#  the powered-off headset still enumerated and still passed
+#  check_input_settings, so it won every re-pick while the live Blue Snowball
+#  sat at the Windows default — JARVIS was deaf for 90 minutes (2026-08-20).
+#
+#  Deterministic: no real device is opened or enumerated anywhere below.
+# ───────────────────────────────────────────────────────────────────────────
+class FollowTheDefaultDeviceTests(_MonolithSec2Base):
+    CORSAIR = "Headset Microphone (CORSAIR VOID ELITE Wireless Gaming Dongle)"
+    SNOWBALL = "Microphone (Blue Snowball)"
+    SPEAKERS = "Speakers (Realtek(R) Audio)"
+    HEADPHONES = "Headphones (CORSAIR VOID ELITE Wireless Gaming Dongle)"
+
+    def setUp(self):
+        self._saved_cache = dict(self.bc._device_cache)
+
+    def tearDown(self):
+        self.bc._device_cache.clear()
+        self.bc._device_cache.update(self._saved_cache)
+
+    # ── fixtures ──────────────────────────────────────────────────────────
+    def _devices(self, names):
+        """Device list where any name containing 'microphone'/'mic' is an input
+        and everything else is an output."""
+        out = []
+        for n in names:
+            is_in = "microphone" in n.lower() or "mic" in n.lower()
+            out.append({"name": n,
+                        "max_input_channels": 1 if is_in else 0,
+                        "max_output_channels": 0 if is_in else 2,
+                        "default_samplerate": 16000 if is_in else 48000})
+        return out
+
+    def _sd(self, names, default_in, default_out):
+        """sounddevice stub: a readable device list plus a Windows default
+        pair, which is the whole surface _default_device_identity touches."""
+        devices = self._devices(names)
+        sd = mock.Mock()
+
+        def _query(idx=None, **kw):
+            if idx is None:
+                return list(devices)
+            if isinstance(idx, int) and 0 <= idx < len(devices):
+                return devices[idx]
+            raise RuntimeError(f"Error querying device {idx}")
+        sd.query_devices.side_effect = _query
+        sd.check_input_settings.return_value = None
+        sd.default = mock.Mock()
+        sd.default.device = (default_in, default_out)
+        return sd
+
+    def _refresh(self, sd, *, prefs_in=(), prefs_out=(), announced=None):
+        """Drive one forced _refresh_devices pass against the stub."""
+        sink = announced.append if announced is not None else (lambda _m: None)
+        with mock.patch.object(self.bc, "sd", sd), \
+                mock.patch.dict(self.bc.sys.modules, {}, clear=False), \
+                mock.patch.object(self.bc, "_record_speech_active", [False]), \
+                mock.patch.object(self.bc, "_pathb_mic_active", [False]), \
+                mock.patch.object(self.bc, "_ambient_stream_active", [False]), \
+                mock.patch.object(self.bc, "_diag_capture_active", [False]), \
+                mock.patch.object(self.bc, "_enroll_capture_active", [False]), \
+                mock.patch.object(self.bc, "_tts_playback_active", [False]), \
+                mock.patch.object(self.bc, "MICROPHONE_INDEX", None), \
+                mock.patch.object(self.bc, "SPEAKER_INDEX", None), \
+                mock.patch.object(self.bc, "PREFERRED_INPUT_DEVICES",
+                                  list(prefs_in)), \
+                mock.patch.object(self.bc, "PREFERRED_OUTPUT_DEVICES",
+                                  list(prefs_out)), \
+                mock.patch.object(self.bc, "_devices_signature",
+                                  return_value=None), \
+                mock.patch.object(self.bc, "_enqueue_device_announcement",
+                                  side_effect=sink), \
+                mock.patch("builtins.print"):
+            self.bc.sys.modules.pop("skill_wake_listener", None)
+            self.bc._device_cache["checked_at"] = 0.0
+            self.bc._refresh_devices(force=True)
+
+    def _boot(self):
+        """Neutral starting state: nothing tracked yet (boot)."""
+        self.bc._device_cache.update({
+            "in": None, "out": None, "checked_at": 0.0,
+            "last_in_name": None, "last_out_name": None,
+            "last_in_index": None, "last_out_index": None,
+            "last_devices_signature": None, "last_reenum_at": 0.0,
+        })
+
+    # ── _default_device_identity: total, and never pins anything ──────────
+    def test_default_identity_reads_current_default(self):
+        sd = self._sd([self.CORSAIR, self.SNOWBALL, self.SPEAKERS],
+                      default_in=1, default_out=2)
+        with mock.patch.object(self.bc, "sd", sd):
+            self.assertEqual(self.bc._default_device_identity(want_input=True),
+                             (1, self.SNOWBALL))
+            self.assertEqual(self.bc._default_device_identity(want_input=False),
+                             (2, self.SPEAKERS))
+
+    def test_default_identity_handles_no_default(self):
+        # PortAudio reports "no default endpoint" as -1.
+        sd = self._sd([self.SNOWBALL], default_in=-1, default_out=-1)
+        with mock.patch.object(self.bc, "sd", sd):
+            self.assertEqual(self.bc._default_device_identity(want_input=True),
+                             (None, ""))
+            self.assertEqual(self.bc._default_device_identity(want_input=False),
+                             (None, ""))
+
+    def test_default_identity_swallows_errors(self):
+        # sd.default.device raising, and a default index that can't be queried,
+        # must BOTH degrade quietly — this runs inside the device loop.
+        sd = mock.Mock()
+        type(sd.default).device = mock.PropertyMock(
+            side_effect=RuntimeError("portaudio down"))
+        with mock.patch.object(self.bc, "sd", sd):
+            self.assertEqual(self.bc._default_device_identity(want_input=True),
+                             (None, ""))
+        sd2 = self._sd([self.SNOWBALL], default_in=7, default_out=0)
+        with mock.patch.object(self.bc, "sd", sd2):
+            # index out of range → name unknown, but the index still tracks
+            self.assertEqual(self.bc._default_device_identity(want_input=True),
+                             (7, ""))
+
+    # ── the outage: an empty list follows, a pinned list does not ─────────
+    def test_empty_preferences_follow_the_default_and_never_pin(self):
+        self._boot()
+        sd = self._sd([self.CORSAIR, self.SNOWBALL, self.SPEAKERS],
+                      default_in=1, default_out=2)
+        self._refresh(sd)
+        # THE contract: the cache stays None so every open re-resolves the
+        # CURRENT default. A resolved index here would freeze JARVIS on
+        # today's default and stop following the Stream Deck.
+        self.assertIsNone(self.bc._device_cache["in"])
+        self.assertIsNone(self.bc._device_cache["out"])
+        # …but the default's identity IS tracked, so a later switch is visible.
+        self.assertEqual(self.bc._device_cache["last_in_index"], 1)
+        self.assertEqual(self.bc._device_cache["last_in_name"], self.SNOWBALL)
+        self.assertEqual(self.bc._device_cache["last_out_index"], 2)
+        self.assertEqual(self.bc._device_cache["last_out_name"], self.SPEAKERS)
+
+    def test_preferred_name_list_pins_the_dead_headset(self):
+        # Regression for the 90-minute deafness: the powered-off CORSAIR still
+        # enumerates and still passes check_input_settings, so a name list wins
+        # over the live default. This is the behaviour the owner's config no
+        # longer opts into (PREFERRED_INPUT_DEVICES = []).
+        self._boot()
+        sd = self._sd([self.CORSAIR, self.SNOWBALL, self.SPEAKERS],
+                      default_in=1, default_out=2)
+        self._refresh(sd, prefs_in=["CORSAIR", "Blue Snowball"])
+        self.assertEqual(self.bc._device_cache["in"], 0,
+                         "a name preference pins index 0 — the dead headset")
+        # Same enumeration, no preferences: the live default wins instead.
+        self._boot()
+        self._refresh(sd)
+        self.assertIsNone(self.bc._device_cache["in"])
+        self.assertEqual(self.bc._device_cache["last_in_index"], 1)
+
+    # ── D2: a default change is DETECTED and ANNOUNCED, both directions ───
+    def test_boot_detection_is_silent(self):
+        self._boot()
+        announced = []
+        sd = self._sd([self.CORSAIR, self.SNOWBALL, self.SPEAKERS],
+                      default_in=1, default_out=2)
+        self._refresh(sd, announced=announced)
+        self.assertEqual(announced, [],
+                         "None → first device is boot, not a switch")
+
+    def test_input_default_change_is_announced_neutrally(self):
+        self._boot()
+        names = [self.CORSAIR, self.SNOWBALL, self.SPEAKERS]
+        announced = []
+        self._refresh(self._sd(names, 1, 2), announced=announced)   # boot
+        self.assertEqual(announced, [])
+        # Stream Deck moves the default mic to the headset.
+        self._refresh(self._sd(names, 0, 2), announced=announced)
+        self.assertEqual(len(announced), 1, announced)
+        self.assertEqual(announced[0], "Switched to your headset, sir.")
+        self.assertEqual(self.bc._device_cache["last_in_index"], 0)
+        # …and JARVIS is STILL following, not pinned.
+        self.assertIsNone(self.bc._device_cache["in"])
+
+    def test_output_default_change_is_announced(self):
+        # D2 (output half): the old code only PRINTED for the speaker branch.
+        self._boot()
+        names = [self.SNOWBALL, self.SPEAKERS, self.HEADPHONES]
+        announced = []
+        self._refresh(self._sd(names, 0, 1), announced=announced)   # boot
+        self.assertEqual(announced, [])
+        self._refresh(self._sd(names, 0, 2), announced=announced)
+        self.assertEqual(len(announced), 1, announced)
+        self.assertEqual(announced[0], "Switched to your headset, sir.")
+        self.assertEqual(self.bc._device_cache["last_out_index"], 2)
+        self.assertIsNone(self.bc._device_cache["out"])
+
+    def test_switch_to_snowball_names_the_device(self):
+        self._boot()
+        names = [self.CORSAIR, self.SNOWBALL, self.SPEAKERS]
+        announced = []
+        self._refresh(self._sd(names, 0, 2), announced=announced)   # boot
+        self._refresh(self._sd(names, 1, 2), announced=announced)
+        self.assertEqual(announced, ["Switched to the Blue Snowball, sir."])
+
+    # ── D1: an index-only change under an identical name is detected ──────
+    def test_index_only_change_same_name_is_detected(self):
+        # Two endpoints can share an MME-truncated name; the old name-only
+        # compare saw nothing at all when the default moved between them.
+        self._boot()
+        dup = "Microphone (USB Audio Device)"
+        announced = []
+        self._refresh(self._sd([self.SPEAKERS, dup, dup], 2, 0),
+                      announced=announced)          # boot, tracked at index 2
+        self.assertEqual(self.bc._device_cache["last_in_index"], 2)
+        self.assertEqual(self.bc._device_cache["last_in_name"], dup)
+        self._refresh(self._sd([self.SPEAKERS, dup, dup], 1, 0),
+                      announced=announced)          # same NAME, index 2 → 1
+        self.assertEqual(self.bc._device_cache["last_in_index"], 1,
+                         "index-only change must be detected (D1)")
+        self.assertEqual(self.bc._device_cache["last_in_name"], dup,
+                         "the name is identical — which is the whole point")
+        self.assertEqual(len(announced), 1, announced)
+
+    # ── wording: neutral for a switch, loss only for a real disappearance ─
+    def test_still_present_previous_device_gets_neutral_wording(self):
+        self._boot()
+        names = [self.CORSAIR, self.SNOWBALL, self.SPEAKERS]
+        announced = []
+        self._refresh(self._sd(names, 0, 2), announced=announced)   # boot
+        self._refresh(self._sd(names, 1, 2), announced=announced)
+        self.assertEqual(len(announced), 1)
+        self.assertNotIn("dropped off", announced[0].lower())
+        self.assertNotIn("disconnected", announced[0].lower())
+
+    def test_vanished_previous_device_keeps_loss_wording(self):
+        # The headset sits LAST so unplugging it leaves the speaker index
+        # alone — this test is about the input announcement only.
+        self._boot()
+        announced = []
+        # Headset is the default mic…
+        self._refresh(self._sd([self.SNOWBALL, self.SPEAKERS, self.CORSAIR],
+                               2, 1), announced=announced)
+        # …then it powers off: gone from the enumeration entirely, and Windows
+        # falls back to the Snowball.
+        self._refresh(self._sd([self.SNOWBALL, self.SPEAKERS], 0, 1),
+                      announced=announced)
+        self.assertEqual(len(announced), 1, announced)
+        self.assertIn("dropped off", announced[0].lower())
+        self.assertIn("the Blue Snowball", announced[0])
+
+    def test_vanished_non_headset_device_uses_disconnected_wording(self):
+        self._boot()
+        announced = []
+        self._refresh(self._sd([self.SNOWBALL, self.SPEAKERS], 0, 1),
+                      announced=announced)
+        # The Snowball is unplugged; the headset takes over as default mic.
+        self._refresh(self._sd([self.CORSAIR, self.SPEAKERS], 0, 1),
+                      announced=announced)
+        self.assertEqual(len(announced), 1, announced)
+        self.assertIn("disconnected", announced[0].lower())
+        self.assertIn("the Blue Snowball", announced[0])
+
+    def test_unreadable_device_list_is_not_treated_as_a_loss(self):
+        # _device_name_present returns None ("unknown") — that must fall to the
+        # neutral line, never to a fabricated disconnect report.
+        sd = mock.Mock()
+        sd.query_devices.side_effect = RuntimeError("portaudio down")
+        announced = []
+        with mock.patch.object(self.bc, "sd", sd), \
+                mock.patch.object(self.bc, "_enqueue_device_announcement",
+                                  side_effect=announced.append):
+            self.assertIsNone(self.bc._device_name_present("Gaming Headset"))
+            self.bc._announce_device_change("Gaming Headset", self.SNOWBALL,
+                                            want_input=True)
+        self.assertEqual(announced, ["Switched to the Blue Snowball, sir."])
+
+    def test_one_press_moving_both_defaults_enqueues_identical_text(self):
+        # A single Stream Deck press moves the mic AND the speakers to the
+        # headset. Both branches announce (by design), and because the text is
+        # IDENTICAL _speak_pending's dedupe collapses it to one spoken line.
+        self._boot()
+        names = [self.SNOWBALL, self.SPEAKERS, self.CORSAIR, self.HEADPHONES]
+        announced = []
+        self._refresh(self._sd(names, 0, 1), announced=announced)   # boot
+        self._refresh(self._sd(names, 2, 3), announced=announced)
+        self.assertEqual(announced,
+                         ["Switched to your headset, sir."] * 2)
+        self.assertEqual(len(set(announced)), 1,
+                         "identical text is what the speech dedupe collapses")
+
+    def test_unchanged_default_never_repeats_the_announcement(self):
+        # Anti-spam: the refresh runs every DEVICE_CHECK_INTERVAL (4 s); a
+        # stable default must stay silent forever.
+        self._boot()
+        names = [self.CORSAIR, self.SNOWBALL, self.SPEAKERS]
+        announced = []
+        self._refresh(self._sd(names, 0, 2), announced=announced)   # boot
+        self._refresh(self._sd(names, 1, 2), announced=announced)   # switch
+        for _ in range(3):
+            self._refresh(self._sd(names, 1, 2), announced=announced)
+        self.assertEqual(len(announced), 1, announced)
+
+
+class FriendlyDeviceNameSpokenAliasTests(_MonolithSec2Base):
+    """The announcement reads _friendly_device_name OUT LOUD, so the owner's
+    three real endpoints must come out speakable."""
+
+    def test_corsair_headset_alias(self):
+        self.assertEqual(
+            self.bc._friendly_device_name(
+                "Headset Microphone (CORSAIR VOID ELITE Wireless Gaming Dongle)"),
+            "your headset")
+
+    def test_corsair_output_alias(self):
+        self.assertEqual(
+            self.bc._friendly_device_name(
+                "Headphones (CORSAIR VOID ELITE Wireless Gaming Dongle), MME"),
+            "your headset")
+
+    def test_snowball_alias(self):
+        self.assertEqual(
+            self.bc._friendly_device_name("Microphone (Blue Snowball), MME"),
+            "the Blue Snowball")
+
+    def test_generic_speakers_possessed(self):
+        self.assertEqual(self.bc._friendly_device_name("Speakers, MME"),
+                         "your speakers")
+
+    def test_mme_duplicate_index_prefix_stripped(self):
+        self.assertEqual(
+            self.bc._friendly_device_name("Speakers (2- USB Audio Device)"),
+            "USB Audio Device")
+
+    def test_branded_speakers_unchanged(self):
+        # The generic parse still owns everything outside the alias table.
+        self.assertEqual(self.bc._friendly_device_name("Speakers (Realtek)"),
+                         "Realtek")
+
+    def test_nested_trademark_marker_does_not_truncate_the_brand(self):
+        # The real default-speaker name on this box. A non-greedy parenthetical
+        # match stopped at the nested ')' and spoke "Realtek(R".
+        self.assertEqual(
+            self.bc._friendly_device_name("Speakers (Realtek(R) Audio), MME"),
+            "Realtek Audio")
+
+    def test_sibling_parentheticals_fall_back_to_the_first_group(self):
+        # Greedy would spill across both groups ("2- USB) (Realtek"); the
+        # balance check rejects that and takes the first group, whose MME
+        # duplicate-index prefix is then stripped.
+        self.assertEqual(
+            self.bc._friendly_device_name("Microphone (2- USB) (Realtek)"),
+            "USB")
+
+    def test_mme_truncated_description_keeps_the_brand(self):
+        # MME cuts descriptions at 31 chars — closing paren and all. Real names
+        # off this box: 'Speakers (DualSense Wireless Co', 'Headset Earphone
+        # (CORSAIR VOID '.
+        self.assertEqual(
+            self.bc._friendly_device_name("Speakers (DualSense Wireless Co"),
+            "DualSense Wireless Co")
+        self.assertEqual(
+            self.bc._friendly_device_name("Headset Earphone (CORSAIR VOID "),
+            "your headset")
+
+    def test_empty_parenthetical_falls_back_to_the_endpoint_word(self):
+        # Real name off this box: 'Microphone ()' — must not speak "( )".
+        self.assertEqual(self.bc._friendly_device_name("Microphone ()"),
+                         "your microphone")
+
+    def test_parens_balanced_helper(self):
+        self.assertTrue(self.bc._parens_balanced("Realtek(R) Audio"))
+        self.assertFalse(self.bc._parens_balanced("2- USB) (Realtek"))
+        self.assertFalse(self.bc._parens_balanced("open ("))
 
 
 if __name__ == "__main__":

@@ -24,6 +24,43 @@ from unittest import mock
 from tests._skill_harness import load_skill_isolated
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# HERMETIC CONFIG — do NOT inherit the owner's live data/user_settings.json.
+#
+# core.config._apply_user_settings() reads <repo>/data/user_settings.json off a
+# __file__-relative path at import, honouring NEITHER JARVIS_DATA_DIR nor
+# JARVIS_SETTINGS_PATH, so anything this suite does not pin is really "whatever
+# the owner last toggled in the Settings GUI". _build_which_monitor_wrapper
+# branches on KINECT_GAZE_ENABLED twice (the _kinect_gaze_monitor short-circuit
+# and the "away" phrasing), so the legacy webcam assertions below only hold
+# while gaze is OFF — the shipped core/config.py default. That flag going true
+# in the live settings file is what turned this suite red on 2026-08-20, the
+# THIRD repeat of the same leak (see tools/action_smoke.py for 07-10 / 07-11).
+#
+# Pin the shipped defaults module-wide; tests that want the Kinect path on say
+# so explicitly (mock restores LIFO, so an inner patch wins while active).
+_CONFIG_DEFAULTS = {
+    "KINECT_GAZE_ENABLED": False,
+    "KINECT_PRESENCE_ENABLED": False,
+    "KINECT_PRESENCE_STANDBY": False,
+    "KINECT_PRESENCE_WAKE": False,
+}
+_MODULE_PATCHES = []
+
+
+def setUpModule():
+    from core import config as cfg
+    for name, val in _CONFIG_DEFAULTS.items():
+        p = mock.patch.object(cfg, name, val, create=True)
+        p.start()
+        _MODULE_PATCHES.append(p)
+
+
+def tearDownModule():
+    while _MODULE_PATCHES:
+        _MODULE_PATCHES.pop().stop()
+
+
 def _fake_bc(cameras=None, monitors=None, last_seen=None):
     bc = mock.MagicMock()
     bc.CAMERAS = cameras if cameras is not None else [
@@ -287,10 +324,27 @@ class FaceTrackerActionTests(unittest.TestCase):
         self.assertIn("right", out)
 
     def test_which_monitor_fast_path_away(self):
+        # Gaze OFF (pinned module-wide) → the legacy webcam phrasing. Without
+        # that pin this read the owner's live KINECT_GAZE_ENABLED and flipped
+        # to the Kinect wording below.
         wrapped = self.mod._build_which_monitor_wrapper(lambda a="": "ORIG")
         self.mod._state.update({"last_sample_at": time.time(),
                                 "current_monitor": "away"})
         self.assertIn("not visible", wrapped(""))
+
+    def test_which_monitor_fast_path_away_blames_kinect_when_gaze_on(self):
+        # Gaze ON + no body in view → blame the empty Kinect view, never the
+        # (possibly absent) webcams. This branch had no test of its own; it was
+        # only ever reached by accident when the live settings file flipped.
+        from core import config as cfg
+        wrapped = self.mod._build_which_monitor_wrapper(lambda a="": "ORIG")
+        self.mod._state.update({"last_sample_at": time.time(),
+                                "current_monitor": "away",
+                                "kinect_yaw_at": 0.0, "kinect_monitor": None})
+        with mock.patch.object(cfg, "KINECT_GAZE_ENABLED", True, create=True):
+            out = wrapped("")
+        self.assertIn("no one in the Kinect's view", out)
+        self.assertNotIn("not visible", out)
 
     def test_which_monitor_fast_path_import_failure_drops_suffix(self):
         # bc import raising → monitors={} → no "(left)" suffix, still fast-path.

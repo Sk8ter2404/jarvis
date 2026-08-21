@@ -308,50 +308,44 @@ class TrayBackendTagInvariantTests(unittest.TestCase):
 # ===========================================================================
 class VisionLockstepSourceInvariantTests(unittest.TestCase):
     """Stale-duplicate guard for the vision-lockstep rule (this codebase's #1
-    bug class): every file under skills/ and core/ that WRITES the monolith's
-    _RESOLVED_LOCAL_LLM_MODEL cache (a chat-model switch site) must also
-    reference _sync_vision_to_chat — a future third switch site fails the
-    suite unless it keeps LOCAL_VISION_MODEL in lockstep."""
+    bug class): every file that switches the local chat model must also keep
+    LOCAL_VISION_MODEL in lockstep.
 
-    _WRITE_RES = (
-        re.compile(r"cache\[0\]\s*="),
-        re.compile(r"setattr\([^)\n]*_RESOLVED_LOCAL_LLM_MODEL"),
-    )
+    2026-08-20 UPDATE — THIS SCAN WAS TOO NARROW AND MISSED TWO SITES. It
+    walked only ``skills/`` and ``core/`` and only flagged files that write the
+    monolith's ``_RESOLVED_LOCAL_LLM_MODEL`` cache. The Settings GUI and the
+    web dashboard switch the chat model by PERSISTING the tag, from ``tools/``,
+    and the dashboard never even names LOCAL_LLM_MODEL (it writes whatever key
+    the schema accepts) — so both were invisible here while they forked the
+    pair on every model change.
 
-    def test_every_external_cache_writer_syncs_vision(self):
-        offenders = []
-        for root in ("skills", "core"):
-            for dirpath, dirnames, filenames in os.walk(
-                    os.path.join(_PROJECT, root)):
-                dirnames[:] = [d for d in dirnames
-                               if d not in ("__pycache__", ".claude")]
-                for fn in filenames:
-                    if not fn.endswith(".py") or fn.startswith("test_"):
-                        continue
-                    path = os.path.join(dirpath, fn)
-                    with open(path, encoding="utf-8", errors="replace") as f:
-                        src = f.read()
-                    if "_RESOLVED_LOCAL_LLM_MODEL" not in src:
-                        continue
-                    if not any(rx.search(src) for rx in self._WRITE_RES):
-                        continue          # read-only reference
-                    if "_sync_vision_to_chat" not in src:
-                        offenders.append(os.path.relpath(path, _PROJECT))
-        self.assertEqual(
-            offenders, [],
-            f"these files repoint the local-LLM resolver cache without the "
-            f"vision lockstep (_sync_vision_to_chat): {offenders}")
+    The widened scan (tools/ included, persisted writes counted, plus a pinned
+    registry of schema-driven settings writers) lives in
+    tests/test_model_lockstep.py. Keeping a second copy of the scan HERE would
+    be the very duplication this class exists to prevent, so it now asserts its
+    successor is present and still sees the two sites this audit knew about."""
 
-    def test_known_switch_sites_are_covered_by_the_scan(self):
-        # Self-check: the two known external switch sites must be visible to
-        # the scanner (guards against the invariant rotting into a no-op).
+    def test_the_widened_invariant_exists_and_covers_this_audits_sites(self):
+        from tests import test_model_lockstep as tml
         for rel in (os.path.join("skills", "model_picker.py"),
                     os.path.join("core", "actions.py")):
             with open(os.path.join(_PROJECT, rel), encoding="utf-8") as f:
                 src = f.read()
-            self.assertIn("_RESOLVED_LOCAL_LLM_MODEL", src, rel)
-            self.assertTrue(any(rx.search(src) for rx in self._WRITE_RES), rel)
+            self.assertTrue(
+                tml._writes_chat_tag(src),
+                f"{rel} is no longer detected as a chat-model switch site — "
+                f"the successor invariant has rotted into a no-op")
             self.assertIn("_sync_vision_to_chat", src, rel)
+
+    def test_the_successor_scan_covers_tools(self):
+        """The specific widening that would have caught the 2026-08-20 fork."""
+        from tests import test_model_lockstep as tml
+        scanned = {os.path.normpath(rel) for rel, _src in tml._sources()}
+        for rel in (os.path.join("tools", "settings_window.py"),
+                    os.path.join("tools", "web_interface.py")):
+            self.assertIn(os.path.normpath(rel), scanned,
+                          "the lockstep scan must walk tools/ — both settings "
+                          "writers live there")
 
 
 # ===========================================================================

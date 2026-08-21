@@ -954,6 +954,88 @@ VRAM_WATCH_KEYS = (
 )
 
 
+# One-shot guard so a missing core.model_lockstep is REPORTED once instead of
+# degrading silently on every keystroke (the live budget callback is hot).
+_LOCKSTEP_IMPORT_WARNED = [False]
+
+# Mirrors core.model_lockstep.LOCKSTEP_TEXT_ONLY — the one reason the Save
+# button explains out loud ("your new brain can't see, so vision stayed put").
+# Duplicated as a literal only because this module must not import core at
+# import time; tests/test_model_lockstep.py pins the two together.
+LOCKSTEP_TEXT_ONLY_REASON = "text-only"
+
+
+def _model_lockstep():
+    """Import core.model_lockstep lazily, returning the module or None.
+
+    Lazy for the same reason core.vram_budget is: this file's contract is that
+    importing it costs nothing but stdlib, so a bare CI runner / the tray's
+    schema use never pulls core in. A failure is PRINTED once (stderr) rather
+    than swallowed — the two things this module needs it for (the VRAM budget's
+    config fallback and the vision lockstep) both degrade to a wrong-but-quiet
+    answer otherwise, which is exactly the failure mode the audit found."""
+    try:
+        from core import model_lockstep  # lazy: keeps module import stdlib-only
+        return model_lockstep
+    except Exception as exc:             # pragma: no cover - in-repo module
+        if not _LOCKSTEP_IMPORT_WARNED[0]:
+            _LOCKSTEP_IMPORT_WARNED[0] = True
+            print(f"[settings] core.model_lockstep unavailable ({exc}) — the "
+                  f"VRAM budget will ignore config defaults and Save will not "
+                  f"keep the vision model in lockstep.", file=sys.stderr)
+        return None
+
+
+def _config_default(key: str):
+    """The value core/config.py ships for ``key``, or None.
+
+    A key with no SCHEMA row is still LIVE at its config value (core.config
+    only overrides keys the settings file actually contains), so anything
+    reasoning about the EFFECTIVE settings has to consult config for the keys
+    the document omits — see _live_vram_values()."""
+    mod = _model_lockstep()
+    return None if mod is None else mod.config_default(key)
+
+
+def apply_vision_lockstep(base: dict, out: dict) -> tuple[str | None, str]:
+    """Keep LOCAL_VISION_MODEL in lockstep when a Save repoints LOCAL_LLM_MODEL.
+
+    ``base`` is the document as it stands ON DISK (it still holds the OLD chat
+    tag); ``out`` is the document about to be written (it holds the NEW one).
+    Mutates ``out`` in place and returns ``(new_vision_tag_or_None, reason)``
+    from the shared rule — see core.model_lockstep.vision_lockstep_decision.
+
+    WHY THE GUI NEEDS THIS: the chat-model combo is a real model-switch entry
+    point, but until 2026-08-20 only the VOICE path applied the lockstep. A
+    Save that moved LOCAL_LLM_MODEL left LOCAL_VISION_MODEL pointing at the
+    old tag — forking the one-multimodal-brain config into a genuine second
+    VLM co-load, and permanently: the voice path then reads the mismatch as a
+    user-pinned VLM and refuses to repair it.
+
+    LOCAL_VISION_MODEL has no SCHEMA row on purpose (a persisted row would pin
+    it statically for every fresh install); save_settings passes unknown keys
+    through verbatim, so writing it here lands it in the file exactly like the
+    voice path's _persist_setting does. Never raises."""
+    mod = _model_lockstep()
+    if mod is None:
+        return (None, "unavailable")
+    try:
+        old_chat = base.get("LOCAL_LLM_MODEL") or mod.config_default(
+            "LOCAL_LLM_MODEL")
+        new_chat = out.get("LOCAL_LLM_MODEL")
+        cur_vision = (out.get("LOCAL_VISION_MODEL")
+                      or base.get("LOCAL_VISION_MODEL")
+                      or mod.config_default("LOCAL_VISION_MODEL"))
+        tag, reason = mod.vision_lockstep_decision(old_chat, new_chat,
+                                                   cur_vision)
+        if tag:
+            out["LOCAL_VISION_MODEL"] = tag
+        return (tag, reason)
+    except Exception as exc:             # pragma: no cover - defensive
+        print(f"[settings] vision lockstep skipped: {exc}", file=sys.stderr)
+        return (None, "error")
+
+
 def _load_vram_budget():
     """Import core.vram_budget lazily, returning the module or None.
 
@@ -965,6 +1047,47 @@ def _load_vram_budget():
         return vram_budget
     except Exception:
         return None
+
+
+def resolve_vram_values(widget_values: dict, settings: dict) -> dict:
+    """Resolve every VRAM_WATCH_KEYS entry to its EFFECTIVE value.
+
+    ``widget_values`` is what the live Tk vars currently hold (only the keys
+    whose widget exists); ``settings`` is the loaded settings document.
+    Resolution order is widget → saved settings → core/config.py constant, so
+    an unsaved edit beats a saved value which beats the shipped default.
+
+    The LAST fallback is load-bearing, not belt-and-braces. LOCAL_VISION_MODEL
+    is watched but has NO schema row, so it is in neither default_settings()
+    nor any widget — yet core.config._apply_user_settings leaves its constant
+    live. Without the config fallback the engine saw the key as ABSENT, took
+    its legacy branch, and charged a phantom flat 7.3 GB VLM: on the SHIPPED
+    default config the panel read 25702 MB / 111.6% and warned the owner to
+    pick a smaller brain, when the real figure is 18227 MB / 79.1% because
+    vision SHARES the resident chat model at 0 MB. 2026-08-20 audit.
+
+    Pure and Tk-free so the tests drive the same resolution the GUI does."""
+    out: dict = {}
+    settings = settings if isinstance(settings, dict) else {}
+    for key in VRAM_WATCH_KEYS:
+        if key in widget_values:
+            out[key] = widget_values[key]
+            continue
+        if "::" in key:                     # flattened routing sub-key
+            root_key, fn = key.split("::", 1)
+            cur = settings.get(root_key)
+            if not isinstance(cur, dict):
+                cur = _config_default(root_key)
+            if isinstance(cur, dict) and fn in cur:
+                out[key] = cur.get(fn)
+            continue
+        if key in settings:
+            out[key] = settings.get(key)
+            continue
+        val = _config_default(key)
+        if val is not None:
+            out[key] = val
+    return out
 
 
 def budget_from_live_values(values: dict, total_mb=None) -> dict | None:
@@ -1104,26 +1227,22 @@ def run_gui(start_tab: int = 0) -> int:
     def _live_vram_values() -> dict:
         """Snapshot the CURRENT widget values the budget depends on, as a flat
         dict for budget_from_live_values(). Reads the live Tk vars so the bar
-        reflects unsaved edits. Falls back to the loaded ``settings`` value for
-        any var not yet built (e.g. its tab isn't constructed)."""
-        out: dict = {}
+        reflects unsaved edits, then hands them to resolve_vram_values() for
+        the saved-settings / config-default fallbacks. The resolution itself
+        lives at module level so the tests exercise the REAL chain instead of a
+        re-implementation of it (the previous regression test hand-built the
+        dict the GUI could not actually produce, and stayed green through the
+        whole phantom-VLM defect)."""
+        widget: dict = {}
         for key in VRAM_WATCH_KEYS:
             var = vars_by_key.get(key)
-            if var is not None:
-                try:
-                    out[key] = var.get()
-                    continue
-                except Exception:
-                    pass
-            # Fall back to the on-disk/default value (handle the routing subkey).
-            if "::" in key:
-                base, fn = key.split("::", 1)
-                cur = settings.get(base)
-                if isinstance(cur, dict):
-                    out[key] = cur.get(fn)
-            elif key in settings:
-                out[key] = settings.get(key)
-        return out
+            if var is None:
+                continue
+            try:
+                widget[key] = var.get()
+            except Exception:
+                pass          # var not usable yet → fall through to settings
+        return resolve_vram_values(widget, settings)
 
     def update_budget(*_a) -> None:
         """Recompute the prediction from live widget values and repaint the bar,
@@ -1445,12 +1564,21 @@ def run_gui(start_tab: int = 0) -> int:
     ttk.Label(bar, textvariable=status_var, style="Help.TLabel").pack(
         side="left", padx=10)
 
+    # Set by _collect() so _on_save can SAY what the vision lockstep did —
+    # a silent rewrite of a model tag would be exactly the kind of unreported
+    # side effect this codebase's honest-failure rule forbids.
+    lockstep_result: list = [(None, "")]
+
     def _collect() -> dict:
         # Seed from the CURRENT on-disk document (not the window-open snapshot)
         # so a key a runtime action persisted while this window was open is kept
         # rather than reverted; the GUI's own field values are layered on below.
         # 2026-07-08.
         out: dict = _current_settings_base(settings)  # keep unknown/passthrough keys
+        # The pre-overlay copy still holds the OLD chat tag — the vision
+        # lockstep below needs it to tell "the owner changed the brain" from
+        # "the owner pinned a separate VLM".
+        base: dict = dict(out)
         for key, var in vars_by_key.items():
             out[key] = var.get()
         for key, widget in text_widgets.items():
@@ -1460,17 +1588,31 @@ def run_gui(start_tab: int = 0) -> int:
             out[key] = mic_label_to_index(var.get(), choices)
         # Fold routing sub-keys ("MODEL_ROUTING::vision") into their nested dict.
         for compound in [c for c in list(out) if "::" in c]:
-            base, fn = compound.split("::", 1)
+            root_key, fn = compound.split("::", 1)
             val = out.pop(compound)
-            if not isinstance(out.get(base), dict):
-                out[base] = {}
-            out[base][fn] = val
+            if not isinstance(out.get(root_key), dict):
+                out[root_key] = {}
+            out[root_key][fn] = val
+        # Vision LOCKSTEP: a chat-model change must carry LOCAL_VISION_MODEL
+        # with it (or say why it didn't) — the shared rule in
+        # core.model_lockstep, the same one the voice switch uses.
+        lockstep_result[0] = apply_vision_lockstep(base, out)
         return out
 
     def _on_save():
         try:
-            save_settings(_collect())
-            status_var.set("Saved.")
+            doc = _collect()
+            save_settings(doc)
+            tag, reason = lockstep_result[0]
+            if tag:
+                status_var.set(f"Saved. Vision model moved with the brain "
+                               f"→ {tag}.")
+            elif reason == LOCKSTEP_TEXT_ONLY_REASON:
+                vis = doc.get("LOCAL_VISION_MODEL") or "its own model"
+                status_var.set(f"Saved. Local vision stays on {vis} — the new "
+                               f"chat model isn't vision-capable.")
+            else:
+                status_var.set("Saved.")
         except Exception as exc:
             try:
                 messagebox.showerror("JARVIS Settings",

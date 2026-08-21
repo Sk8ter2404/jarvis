@@ -278,10 +278,18 @@ class SafeCloseStreamTests(unittest.TestCase):
         ww._safe_close_stream(s, timeout_sec=2.0)  # daemon thread swallows it
         self.assertTrue(s.stopped)
 
-    def test_close_hang_forces_sd_stop(self):
-        # close() blocks past the timeout → the helper imports sounddevice and
-        # calls sd.stop(). Use a tiny timeout and a close that waits on an event
-        # we never set (released in finally so the daemon thread can exit).
+    def test_close_hang_abandons_and_never_calls_sd_stop(self):
+        # H-3 (2026-08-20) — the STALE-DUPLICATE half of the deletion in
+        # bobert_companion._safe_close_stream. close() blocks past the timeout
+        # → the daemon is ABANDONED. The old code called the process-global
+        # sd.stop(), which (sounddevice 0.5.5, sounddevice.py:406-418) stops
+        # and closes `_last_callback` — published only by sd.play()/sd.rec()/
+        # sd.playrec(). `s` is an explicitly constructed InputStream, so the
+        # call could never free it; what it COULD do is close the monolith's
+        # live TTS playback stream from this thread while play_with_lipsync's
+        # reaper is inside its own Pa_CloseStream (0xc0000374). Use a tiny
+        # timeout and a close that waits on an event we never set (released in
+        # the cleanup so the daemon thread can exit).
         import threading
         release = threading.Event()
         self.addCleanup(release.set)
@@ -294,9 +302,15 @@ class SafeCloseStreamTests(unittest.TestCase):
         sd = make_fake_sd()
         with inject_modules(sounddevice=sd):
             ww._safe_close_stream(s, timeout_sec=0.05)
-        self.assertEqual(sd._stopped["n"], 1)  # forced sd.stop() on hang
+        self.assertEqual(sd._stopped["n"], 0,
+                         "the hung-close path must not call the process-global "
+                         "sd.stop() — it cannot free this InputStream and "
+                         "cross-closes the live TTS play stream")
 
-    def test_close_hang_sd_import_failure_is_swallowed(self):
+    def test_close_hang_is_inert_when_sounddevice_is_absent(self):
+        # H-3: with the escape hatch gone there is no inner `import
+        # sounddevice` left on this path at all, so an absent module cannot
+        # even be reached. The helper must still return promptly.
         import threading
         release = threading.Event()
         self.addCleanup(release.set)
@@ -306,9 +320,90 @@ class SafeCloseStreamTests(unittest.TestCase):
                 release.wait(timeout=5.0)
         s = _S(samplerate=16000, channels=1, dtype="float32", blocksize=1280,
                device=None, callback=lambda *a: None)
-        # sounddevice absent → the inner import raises and is swallowed.
         with inject_modules(sounddevice=None):
             ww._safe_close_stream(s, timeout_sec=0.05)  # no raise
+
+    # ── H-6 (2026-08-20): this is the STALE-DUPLICATE half of the
+    # abandoned-native-close gate. bobert_companion._refresh_devices calls
+    # det.pause() — which lands in THIS _safe_close_stream — immediately
+    # before its destructive sd._terminate(). If the close hangs past
+    # timeout_sec we abandon the daemon while PortAudio is still inside
+    # Pa_CloseStream, and the reinit that follows is 0xc0000374. So the
+    # hand-off must be registered with the host's _pa_close_pending cell.
+    @staticmethod
+    def _fake_host():
+        """Minimal stand-in for the loaded monolith's gate API."""
+        import threading as _th
+        import types as _types
+        host = _types.SimpleNamespace(_pa_close_pending=[0],
+                                      _lock=_th.Lock())
+
+        def _handoff(t):
+            with host._lock:
+                host._pa_close_pending[0] += 1
+            try:
+                t.start()
+            except BaseException:
+                _done()
+                raise
+
+        def _done():
+            with host._lock:
+                host._pa_close_pending[0] = max(
+                    0, host._pa_close_pending[0] - 1)
+
+        host._pa_close_handoff = _handoff
+        host._pa_close_done = _done
+        return host
+
+    def test_abandoned_close_stays_registered_with_the_host_gate(self):
+        import threading
+        import time
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        class _S(FakeInputStream):
+            def close(self):
+                release.wait(timeout=10.0)
+        s = _S(samplerate=16000, channels=1, dtype="float32", blocksize=1280,
+               device=None, callback=lambda *a: None)
+        host = self._fake_host()
+        sd = make_fake_sd()
+        with inject_modules(sounddevice=sd, bobert_companion=host):
+            ww._safe_close_stream(s, timeout_sec=0.05)
+            self.assertEqual(
+                host._pa_close_pending[0], 1,
+                "an ABANDONED wake-word close must keep the host's PortAudio "
+                "reinit deferred — _refresh_devices runs sd._terminate() "
+                "immediately after the det.pause() that lands here")
+            release.set()
+            end = time.monotonic() + 5.0
+            while time.monotonic() < end and host._pa_close_pending[0]:
+                time.sleep(0.01)
+        self.assertEqual(host._pa_close_pending[0], 0,
+                         "a late-finishing daemon must retire its own count")
+
+    def test_completed_close_leaves_no_phantom_registration(self):
+        s = FakeInputStream(samplerate=16000, channels=1, dtype="float32",
+                            blocksize=1280, device=None,
+                            callback=lambda *a: None)
+        host = self._fake_host()
+        with inject_modules(bobert_companion=host):
+            ww._safe_close_stream(s, timeout_sec=2.0)
+            # Retired BEFORE the caller's done-event fires, so a healthy close
+            # never costs a deferred hotplug sweep.
+            self.assertEqual(host._pa_close_pending[0], 0)
+        self.assertTrue(s.closed)
+
+    def test_no_host_loaded_still_closes(self):
+        # Standalone / test import: no monolith in sys.modules → plain start(),
+        # since there is no _refresh_devices to defer in the first place.
+        s = FakeInputStream(samplerate=16000, channels=1, dtype="float32",
+                            blocksize=1280, device=None,
+                            callback=lambda *a: None)
+        with inject_modules(bobert_companion=None):
+            ww._safe_close_stream(s, timeout_sec=2.0)
+        self.assertTrue(s.closed)
 
 
 # ──────────────────────────────────────────────────────────────────────

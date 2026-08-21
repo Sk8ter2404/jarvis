@@ -146,7 +146,13 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "timer", "remind", "reminder", "alarm", "wake me", "in a minute",
         "minutes", "seconds", "hour", "countdown", "set a", "alert me",
     ],
-    "TEAMS CALL SCREENING": [
+    # Header renamed TEAMS CALL SCREENING -> MICROSOFT TEAMS (2026-08-20): the
+    # three screener actions it used to document ship only in the gitignored
+    # skills/teams_screener.py, so the tracked prompt now covers the unread
+    # sweep alone. Keyword list is unchanged so "screen my calls" still loads
+    # the section on the local route. The key MUST match the section head or
+    # test_every_section_has_routing_or_is_always strands the section.
+    "MICROSOFT TEAMS": [
         "teams", "call screening", "screen my calls", "screen calls", "meeting",
     ],
     "CLAUDE CREDITS": [

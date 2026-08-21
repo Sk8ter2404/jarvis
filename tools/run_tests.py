@@ -9,6 +9,13 @@ environment and inside the self-upgrade pipeline without installing anything.
     python tools/run_tests.py atomic_io  # run only tests/test_atomic_io.py
 
 Exit code 0 = all passed, 1 = failures/errors — so the pipeline can gate on it.
+
+Every run sits inside a HARD MEMORY CEILING (tools/mem_guard.py, applied as the
+first thing main() does, so it covers every import and every child process).
+That is the RAM sibling of the _redirect_settings_to_throwaway() /
+_redirect_data_dir_to_throwaway() guards below: a test run must not be able to
+damage the box it runs on. See tools/mem_guard.py for the 2026-08-20 bugcheck
+that motivated it and the JARVIS_TEST_MEM_CAP_GB knob (0 = off).
 """
 from __future__ import annotations
 import os
@@ -74,6 +81,22 @@ def _stop_lingering_daemons() -> None:
 
 
 def main(argv: list[str]) -> int:
+    # HARD MEMORY CEILING FIRST — before any test is imported, before anything
+    # allocates. Same family as the two redirect guards below (a test run must
+    # not be able to damage the box); this one is the RAM half, added after an
+    # uncapped run committed 144 GB and bugchecked the machine on 2026-08-20.
+    # See tools/mem_guard.py. The sys.path insert has to precede it so
+    # ``tools.mem_guard`` is importable when this file is run as a script.
+    if _PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, _PROJECT_ROOT)
+    from tools.mem_guard import apply_memory_ceiling
+    apply_memory_ceiling()
+    # NO REAL BROWSER either — belt and braces beside tests/__init__.py, which
+    # is the chokepoint that covers `python -m unittest` too. Added after CI
+    # runs spammed dozens of live tabs into the owner's default Chrome profile
+    # on 2026-08-20 via production webbrowser.open() calls. Idempotent.
+    from tools import browser_guard
+    browser_guard.install()
     # Redirect settings I/O to a throwaway copy BEFORE any test is imported, so
     # a leaked real save_settings can't touch data/user_settings.json.
     _redirect_settings_to_throwaway()

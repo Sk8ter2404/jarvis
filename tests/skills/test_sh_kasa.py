@@ -20,6 +20,9 @@ reset in tearDown so nothing leaks between tests.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
+import time
 import types
 import unittest
 from unittest import mock
@@ -550,7 +553,7 @@ class KasaDeviceResolutionTests(_KasaBase):
         real_run = self.mod._run_async
         calls = {"n": 0}
 
-        def _flaky(coro):
+        def _flaky(coro, *_a, **_kw):   # _run_async now takes timeout/what
             calls["n"] += 1
             if calls["n"] == 1:
                 coro.close()  # avoid 'never awaited' warning
@@ -660,12 +663,19 @@ class KasaSetStateTests(_KasaBase):
         self.assertNotIn("on", res["applied"])
         self.assertNotIn(("turn_on",), dev.calls)
 
-    def test_set_brightness_on_non_dimmable_noop(self):
+    def test_set_brightness_on_non_dimmable_reports_the_skip(self):
+        # REGRESSION (C1): the plug is switched fully ON and the brightness is
+        # never applied. The old code returned a flat ok:True, so the router
+        # spoke "Set to 50%, sir" about a level the hardware cannot reach.
         self._dev_patch(FakeKasaDevice(alias="Plug", is_dimmable=False))
         res = self.mod.set_state({"name": "Plug"}, brightness=50)
-        # Non-dimmable: no set_brightness applied, but >0 still forces power on.
         self.assertNotIn("brightness", res["applied"])
-        self.assertTrue(res["applied"].get("on"))
+        self.assertTrue(res["applied"].get("on"))   # >0 still forces power on
+        self.assertFalse(res.get("ok"))             # NOT a success
+        self.assertIn("not dimmable", res["skipped"]["brightness"])
+        self.assertEqual(res["failed"], {})         # nothing was attempted
+        self.assertIn("brightness not applied", res["error"])
+        self.assertIn("Plug", res["error"])
 
     def test_set_color_temperature_on_capable_bulb(self):
         dev = self._dev_patch(FakeKasaDevice(alias="Bulb",
@@ -680,6 +690,8 @@ class KasaSetStateTests(_KasaBase):
         res = self.mod.set_state({"name": "Plug"}, color_temperature=3000)
         self.assertNotIn("color_temperature_k", res["applied"])
         self.assertNotIn(("set_color_temp", 3000), dev.calls)
+        self.assertFalse(res.get("ok"))
+        self.assertIn("colour temperature", res["skipped"]["color_temperature"])
 
     def test_set_color_on_color_bulb(self):
         dev = self._dev_patch(FakeKasaDevice(alias="Bulb", is_color=True))
@@ -692,6 +704,8 @@ class KasaSetStateTests(_KasaBase):
         self._dev_patch(FakeKasaDevice(alias="Plug", is_color=False))
         res = self.mod.set_state({"name": "Plug"}, color=(255, 0, 0))
         self.assertNotIn("color", res["applied"])
+        self.assertFalse(res.get("ok"))
+        self.assertIn("not colour-capable", res["skipped"]["color"])
 
     def test_set_state_apply_exception_returns_partial(self):
         dev = FakeKasaDevice(alias="Lamp", update_raises=True)
@@ -700,47 +714,72 @@ class KasaSetStateTests(_KasaBase):
         self.assertIn("set_state failed", res["error"])
         self.assertIn("partial", res)
 
-    def test_set_brightness_set_call_swallows_exception(self):
-        # set_brightness raising is caught silently; result still ok.
+    def test_set_brightness_set_call_failure_is_not_ok(self):
+        # REGRESSION (C1): a sub-command that was ATTEMPTED and RAISED must
+        # never yield ok:True. It used to be `except Exception: pass`.
         dev = FakeKasaDevice(alias="Lamp", is_dimmable=True)
         async def _boom(_pct):
             raise RuntimeError("dim boom")
         dev.set_brightness = _boom
         with mock.patch.object(self.mod, "_device_for", return_value=dev):
             res = self.mod.set_state({"name": "Lamp"}, brightness=40)
-        self.assertTrue(res["ok"])
+        self.assertFalse(res.get("ok"))
         self.assertNotIn("brightness", res["applied"])
+        self.assertIn("dim boom", res["failed"]["brightness"])
+        self.assertIn("brightness failed", res["error"])
+        # ...and what DID land is still reported, not thrown away.
+        self.assertTrue(res["applied"].get("on"))
+        self.assertIn("applied: on=True", res["error"])
 
-    def test_set_color_temp_call_swallows_exception(self):
+    def test_set_color_temp_call_failure_is_not_ok(self):
         dev = FakeKasaDevice(alias="Bulb", is_variable_color_temp=True)
         async def _boom(_k):
             raise RuntimeError("ct boom")
         dev.set_color_temp = _boom
         with mock.patch.object(self.mod, "_device_for", return_value=dev):
             res = self.mod.set_state({"name": "Bulb"}, color_temperature=3000)
-        self.assertTrue(res["ok"])
+        self.assertFalse(res.get("ok"))
         self.assertNotIn("color_temperature_k", res["applied"])
+        self.assertIn("ct boom", res["failed"]["color_temperature"])
 
-    def test_set_color_call_swallows_exception(self):
+    def test_set_color_call_failure_is_not_ok(self):
         dev = FakeKasaDevice(alias="Bulb", is_color=True)
         async def _boom(_h, _s, _v):
             raise RuntimeError("hsv boom")
         dev.set_hsv = _boom
         with mock.patch.object(self.mod, "_device_for", return_value=dev):
             res = self.mod.set_state({"name": "Bulb"}, color=(0, 255, 0))
-        self.assertTrue(res["ok"])
+        self.assertFalse(res.get("ok"))
         self.assertNotIn("color", res["applied"])
+        self.assertIn("hsv boom", res["failed"]["color"])
 
-    def test_set_brightness_forced_on_swallows_turn_on_exception(self):
-        # Non-applied 'on' path: brightness>0 tries turn_on which raises → caught.
+    def test_set_brightness_forced_on_failure_is_reported(self):
+        # brightness>0 on a non-dimmable device tries turn_on, which raises.
+        # Nothing at all reached the hardware — the result must say so twice
+        # over (skipped brightness AND failed power) and never claim success.
         dev = FakeKasaDevice(alias="Lamp", is_dimmable=False)
         async def _boom():
             raise RuntimeError("on boom")
         dev.turn_on = _boom
         with mock.patch.object(self.mod, "_device_for", return_value=dev):
             res = self.mod.set_state({"name": "Lamp"}, brightness=40)
-        self.assertTrue(res["ok"])
+        self.assertFalse(res.get("ok"))
         self.assertNotIn("on", res["applied"])
+        self.assertIn("on boom", res["failed"]["on"])
+        self.assertIn("not dimmable", res["skipped"]["brightness"])
+        self.assertIn("applied: nothing", res["error"])
+
+    def test_fully_applied_request_is_still_plain_ok(self):
+        # The honest-failure work must not make healthy calls look degraded.
+        dev = self._dev_patch(FakeKasaDevice(alias="Bulb", is_dimmable=True))
+        res = self.mod.set_state({"name": "Bulb"}, on=True, brightness=40)
+        self.assertTrue(res["ok"])
+        self.assertNotIn("error", res)
+        self.assertNotIn("failed", res)
+        self.assertNotIn("skipped", res)
+        self.assertEqual(res["applied"]["brightness"], 40)
+        self.assertEqual(res["device"], "Bulb")
+        self.assertIn(("set_brightness", 40), dev.calls)
 
 
 class KasaListDevicesEdgeTests(_KasaBase):
@@ -842,13 +881,248 @@ class KasaSmartHomeControlExtraTests(_KasaBase):
         self.assertIn("Garage", out)
 
     def test_control_failure_reports_failed(self):
+        # REGRESSION (C1): "turn on the entry light", the LAN call fails —
+        # JARVIS must NOT say "Done", and must name the device and the reason.
         devs = [{"name": "Entry", "lan_ip": "10.0.0.5"}]
         with mock.patch.object(self.mod, "list_devices", return_value=devs), \
              mock.patch.object(self.mod, "_tuya_mod", return_value=None), \
              mock.patch.object(self.mod, "set_state",
                                return_value={"error": "device offline"}):
             out = self.actions["smart_home_control"]("turn on entry")
-        self.assertIn("entry (failed)", out.lower())
+        low = out.lower()
+        self.assertFalse(low.startswith("done, sir"))
+        self.assertIn("that didn", low)
+        self.assertIn("entry (failed: device offline)", low)
+
+    def test_control_partial_failure_is_not_reported_as_done(self):
+        # One of two devices fails → "Partly done", both outcomes named.
+        devs = [{"name": "Entry Light", "lan_ip": "10.0.0.5"},
+                {"name": "Dining Room", "lan_ip": "10.0.0.6"}]
+
+        def _set(rec, **_kw):
+            if rec["name"] == "Entry Light":
+                return {"ok": True}
+            return {"error": "no route to host"}
+
+        with mock.patch.object(self.mod, "list_devices", return_value=devs), \
+             mock.patch.object(self.mod, "_tuya_mod", return_value=None), \
+             mock.patch.object(self.mod, "set_state", side_effect=_set):
+            out = self.actions["smart_home_control"]("turn off all the lights")
+        low = out.lower()
+        self.assertFalse(low.startswith("done, sir"))
+        self.assertIn("partly done", low)
+        self.assertIn("entry light off", low)
+        self.assertIn("dining room (failed: no route to host)", low)
+
+    def test_control_skipped_subcommand_is_not_reported_as_done(self):
+        # set_state's honest ok:False (capability skip) must survive into the
+        # spoken line rather than being read as success.
+        devs = [{"name": "Entry", "lan_ip": "10.0.0.5"}]
+        res = {"ok": False, "device": "Entry", "applied": {"on": True},
+               "skipped": {"brightness": "device is not dimmable"},
+               "error": "kasa 'Entry': brightness not applied "
+                        "(device is not dimmable) (applied: on=True)"}
+        with mock.patch.object(self.mod, "list_devices", return_value=devs), \
+             mock.patch.object(self.mod, "_tuya_mod", return_value=None), \
+             mock.patch.object(self.mod, "set_state", return_value=res):
+            out = self.actions["smart_home_control"]("turn on entry")
+        self.assertFalse(out.lower().startswith("done, sir"))
+        self.assertIn("not dimmable", out)
+
+    def test_toggle_refuses_to_guess_when_state_unreadable(self):
+        # NEVER GUESS: a failed get_state used to fall through to
+        # `not bool(st.get("on"))` == True and silently switch the device ON.
+        devs = [{"name": "Entry", "lan_ip": "10.0.0.5"}]
+        set_state = mock.Mock(return_value={"ok": True})
+        with mock.patch.object(self.mod, "list_devices", return_value=devs), \
+             mock.patch.object(self.mod, "_tuya_mod", return_value=None), \
+             mock.patch.object(self.mod, "get_state",
+                               return_value={"error": "kasa state read failed"}), \
+             mock.patch.object(self.mod, "set_state", set_state):
+            out = self.actions["smart_home_control"]("toggle entry")
+        set_state.assert_not_called()
+        low = out.lower()
+        self.assertIn("read state", low)
+        self.assertFalse(low.startswith("done, sir"))
+
+    def test_status_query_says_unknown_instead_of_off(self):
+        devs = [{"name": "Dining Room", "lan_ip": "10.0.0.6"}]
+        with mock.patch.object(self.mod, "list_devices", return_value=devs), \
+             mock.patch.object(self.mod, "_tuya_mod", return_value=None), \
+             mock.patch.object(self.mod, "get_state",
+                               return_value={"error": "kasa state read failed: boom"}):
+            out = self.actions["smart_home_control"]("status of the dining room")
+        low = out.lower()
+        self.assertIn("status unknown", low)
+        self.assertNotIn("is off", low)
+
+    def test_control_turn_budget_reports_devices_not_attempted(self):
+        # REGRESSION (C2): "turn off everything" fans out sequentially, so a
+        # per-call bound alone still multiplies by device count. Once the turn
+        # budget is spent the remaining devices must be NAMED as not attempted,
+        # never silently dropped under a "Done".
+        devs = [{"name": "Entry Light", "lan_ip": "10.0.0.5"},
+                {"name": "Dining Room", "lan_ip": "10.0.0.6"}]
+
+        def _slow(_rec, **_kw):
+            time.sleep(0.12)
+            return {"ok": True}
+
+        with mock.patch.object(self.mod, "list_devices", return_value=devs), \
+             mock.patch.object(self.mod, "_tuya_mod", return_value=None), \
+             mock.patch.object(self.mod, "_CONTROL_BUDGET_SECS", 0.05), \
+             mock.patch.object(self.mod, "set_state", side_effect=_slow) as ss:
+            out = self.actions["smart_home_control"]("turn off all the lights")
+        self.assertEqual(ss.call_count, 1)          # second never attempted
+        low = out.lower()
+        self.assertFalse(low.startswith("done, sir"))
+        self.assertIn("partly done", low)
+        self.assertIn("1 not attempted", low)
+        self.assertIn("dining room", low)
+        self.assertIn("couldn", low)   # matches FAILURE_MARKERS ("couldn't")
+
+
+# ─── C2: every await is BOUNDED, and expiry is reported, never swallowed ──
+class KasaBoundedCallTests(_KasaBase):
+    """skills/sh_kasa runs on the voice dispatch thread and nothing above it
+    applies a timeout (bobert_companion's mid-task status line is gated on
+    LONG_RUNNING_ACTIONS, which has no smart-home entry). `_run_async` used to
+    be `asyncio.run(coro)` / bare `t.join()` with no bound at all, so a
+    half-open plug could stall JARVIS past the 60 s main-loop heartbeat in
+    total silence. These pin the bound AND the honesty of its expiry."""
+
+    def test_run_async_times_out_on_the_production_path(self):
+        # Not nested → `asyncio.run(_bounded())`, the branch that actually runs
+        # in production. The old code had no future to time out here at all.
+        t0 = time.monotonic()
+        with self.assertRaises(TimeoutError) as ctx:
+            self.mod._run_async(asyncio.sleep(30), timeout=0.05,
+                                what="probe call")
+        self.assertLess(time.monotonic() - t0, 5.0)
+        msg = str(ctx.exception)
+        self.assertIn("probe call", msg)        # says WHAT timed out
+        self.assertIn("timed out", msg)
+        self.assertIn("0.05", msg)              # …and after how long
+
+    def test_run_async_cancels_rather_than_orphaning_the_coroutine(self):
+        # asyncio.wait_for is the load-bearing part: a plain join(timeout)
+        # would return control but leave the python-kasa query running on an
+        # open socket forever.
+        seen = []
+
+        async def _long():
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                seen.append("cancelled")
+                raise
+
+        with self.assertRaises(TimeoutError):
+            self.mod._run_async(_long(), timeout=0.05)
+        self.assertEqual(seen, ["cancelled"])
+
+    def test_run_async_times_out_inside_a_running_loop(self):
+        async def _outer():
+            return self.mod._run_async(asyncio.sleep(30), timeout=0.05,
+                                       what="nested probe")
+        with self.assertRaises(TimeoutError) as ctx:
+            asyncio.run(_outer())
+        self.assertIn("nested probe", str(ctx.exception))
+
+    def test_run_async_abandons_a_worker_that_ignores_cancellation(self):
+        # A coroutine blocked in a native call never sees the cancel, so the
+        # join carries its own grace margin and then gives up out loud.
+        async def _blocking():
+            time.sleep(0.4)        # blocks the worker's whole event loop
+            return "late"
+
+        async def _outer():
+            return self.mod._run_async(_blocking(), timeout=0.01,
+                                       what="wedged call")
+
+        with mock.patch.object(self.mod, "_JOIN_GRACE_SECS", 0.02):
+            with self.assertRaises(TimeoutError) as ctx:
+                asyncio.run(_outer())
+        self.assertIn("worker thread abandoned", str(ctx.exception))
+
+    def test_run_async_default_timeout_is_read_at_call_time(self):
+        # The budgets must stay tunable/patchable, not frozen into a default
+        # argument at import.
+        with mock.patch.object(self.mod, "_CALL_TIMEOUT_SECS", 0.05):
+            with self.assertRaises(TimeoutError):
+                self.mod._run_async(asyncio.sleep(30))
+
+    def test_run_async_unbounded_only_when_asked(self):
+        self.assertEqual(self.mod._run_async(asyncio.sleep(0, result=5),
+                                             timeout=None), 5)
+
+    def test_set_state_timeout_is_reported_not_swallowed(self):
+        # REGRESSION (C2 + honest-failure): a hung device must time out AND
+        # say so — never a silent hang, never a claimed success.
+        dev = FakeKasaDevice(alias="Entry Light")
+
+        async def _hang():
+            await asyncio.sleep(30)
+        dev.update = _hang
+
+        with mock.patch.object(self.mod, "_device_for", return_value=dev), \
+             mock.patch.object(self.mod, "_CALL_TIMEOUT_SECS", 0.05):
+            t0 = time.monotonic()
+            res = self.mod.set_state({"name": "Entry Light"}, on=True)
+        self.assertLess(time.monotonic() - t0, 5.0)
+        self.assertNotIn("ok", res)
+        self.assertIn("timed out", res["error"])
+        self.assertIn("Entry Light", res["error"])
+        self.assertEqual(res["applied"], {})     # nothing reached the hardware
+        self.assertNotIn(("turn_on",), dev.calls)
+
+    def test_get_state_timeout_is_reported_not_swallowed(self):
+        dev = FakeKasaDevice(alias="Entry Light")
+
+        async def _hang():
+            await asyncio.sleep(30)
+        dev.update = _hang
+
+        with mock.patch.object(self.mod, "_device_for", return_value=dev), \
+             mock.patch.object(self.mod, "_CALL_TIMEOUT_SECS", 0.05):
+            st = self.mod.get_state({"name": "Entry Light"})
+        self.assertIn("timed out", st["error"])
+        self.assertNotIn("on", st)
+
+    def test_discovery_timeout_degrades_to_empty_and_logs(self):
+        async def _hang():
+            await asyncio.sleep(30)
+
+        buf = io.StringIO()
+        self.mod._state["fetched_at"] = 0.0
+        with mock.patch.object(self.mod, "_discover_async",
+                               side_effect=_hang), \
+             mock.patch.object(self.mod, "_DISCOVERY_TIMEOUT_SECS", 0.05), \
+             contextlib.redirect_stdout(buf):
+            found = self.mod._refresh_discovery(force=True)
+        self.assertEqual(found, {})
+        out = buf.getvalue()
+        self.assertIn("discovery error", out)
+        self.assertIn("TimeoutError", out)       # the degraded path LOGS
+
+    def test_direct_ip_failure_logs_before_falling_back_to_broadcast(self):
+        # Was `except Exception: pass` — a timeout here was invisible and we
+        # silently paid for a full LAN broadcast on top of it.
+        async def _hang(_ip):
+            await asyncio.sleep(30)
+
+        buf = io.StringIO()
+        with mock.patch.object(self.mod, "_device_from_ip_async",
+                               side_effect=_hang), \
+             mock.patch.object(self.mod, "_refresh_discovery",
+                               return_value={}), \
+             mock.patch.object(self.mod, "_CALL_TIMEOUT_SECS", 0.05), \
+             contextlib.redirect_stdout(buf):
+            dev = self.mod._device_for({"name": "Entry", "lan_ip": "10.0.0.5"})
+        self.assertIsNone(dev)
+        out = buf.getvalue()
+        self.assertIn("direct connect to 10.0.0.5 failed", out)
+        self.assertIn("falling back to broadcast", out)
 
 
 if __name__ == "__main__":

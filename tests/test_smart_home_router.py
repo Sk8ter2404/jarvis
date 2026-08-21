@@ -1562,6 +1562,90 @@ class LogMissingBrandIOErrorTests(_RouterTestBase):
             router._log_missing_brand("Wyze")   # must not raise
 
 
+class SkillModuleLookupTests(_RouterTestBase):
+    """`_skill_module` generalises the old `_sh_kasa_module` loader lookup
+    (2026-08-14, smarthome catalog-from-LAN). Pin all three loader names and
+    the delegate so the FallbackToLiveLanTests contract can't silently drift."""
+
+    def test_all_three_loader_names_resolve(self):
+        fake = types.ModuleType("fake_sh_kasa")
+        with _inject_modules(skill_sh_kasa=fake):
+            self.assertIs(router._skill_module("sh_kasa"), fake)
+        with _inject_modules(skill_sh_kasa=None, sh_kasa=fake):
+            self.assertIs(router._skill_module("sh_kasa"), fake)
+        with _inject_modules(skill_sh_kasa=None, sh_kasa=None,
+                             **{"skills.sh_kasa": fake}):
+            self.assertIs(router._skill_module("sh_kasa"), fake)
+
+    def test_sh_kasa_module_delegates(self):
+        fake = types.ModuleType("fake_sh_kasa")
+        with _inject_modules(skill_sh_kasa=fake):
+            self.assertIs(router._sh_kasa_module(), fake)
+
+    def test_falls_back_to_import_skill(self):
+        sentinel = types.ModuleType("imported")
+        with _inject_modules(skill_sh_govee=None, sh_govee=None,
+                             **{"skills.sh_govee": None}), \
+             mock.patch.object(router, "_import_skill",
+                               return_value=sentinel) as imp:
+            self.assertIs(router._skill_module("sh_govee"), sentinel)
+        imp.assert_called_once_with("sh_govee")
+
+
+class LanCatalogConsumabilityTests(_RouterTestBase):
+    """A catalog produced by skills.smart_home_discover._build_catalog_v2 from
+    LAN-only records must drive the router's ordinary catalog path: grouping,
+    resolution, and direct brand dispatch — the point of the 2026-08-14
+    catalog-from-LAN fix."""
+
+    def _lan_only_catalog(self):
+        from skills import smart_home_discover as disc
+        # RFC 5737 TEST-NET-1 addresses — see the note in
+        # tests/test_smart_home_discover.py::_kasa_five. Never a real LAN IP.
+        plugs = [{"name": nm, "brand": "TP-Link", "model": "HS103",
+                  "type": "plug", "capabilities": ["on_off"],
+                  "lan_ip": f"192.0.2.{60 + i}"}
+                 for i, nm in enumerate(("entry light", "porch light",
+                                         "desk plug", "shelf plug",
+                                         "corner plug"))]
+        lan_records = [disc._lan_record("sh_kasa", p, []) for p in plugs]
+        lan_status = {s: {"ok": s == "sh_kasa",
+                          "count": 5 if s == "sh_kasa" else 0}
+                      for s in disc._LAN_SOURCES}
+        # force=True keeps the builder off the real on-disk catalog (the
+        # discover module's own _CATALOG_PATH is not redirected here).
+        return disc._build_catalog_v2(
+            None, {"ok": False, "count": 0, "error": "no cached sign-in"},
+            lan_records, lan_status, [], force=True)
+
+    def test_present_skills_groups_lan_records(self):
+        grouped = router._present_skills(self._lan_only_catalog())
+        self.assertEqual(set(grouped), {"sh_kasa"})
+        self.assertEqual(len(grouped["sh_kasa"]), 5)
+
+    def test_control_dispatches_direct_sh_kasa(self):
+        self._write_catalog(self._lan_only_catalog())
+        calls = []
+
+        def _set_state(device, **kw):
+            calls.append((device.get("name"), device.get("lan_ip"), kw))
+            return {"ok": True}
+        fake = _fake_brand_skill("skills.sh_kasa", set_state=_set_state)
+        with mock.patch.object(router.importlib, "import_module",
+                               return_value=fake):
+            out = router.smart_home_control("turn off entry light")
+        self.assertEqual(calls, [("entry light", "192.0.2.60",
+                                  {"on": False})])
+        self.assertIn("Off, sir", out)
+
+    def test_devices_listing_speaks_lan_catalog(self):
+        # Was "No smart-home catalog yet" forever while the wizard kept
+        # writing device_count 0.
+        self._write_catalog(self._lan_only_catalog())
+        out = router.smart_home_devices("")
+        self.assertIn("5 devices", out)
+
+
 class QueryReplyNoFailureMarkerTests(unittest.TestCase):
     """2026-07-08: the status-query SUCCESS reply ("are the lights on?") must not
     contain any core.failure_markers.FAILURE_MARKER substring. It is spoken via
