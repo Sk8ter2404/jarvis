@@ -1925,6 +1925,25 @@ def run_blue_green_handoff(timeout_boot_s: float = 60.0,
         return {"ok": False, "stage_failed": "handoff_timeout",
                 "details": {"target_version": target_version}}
 
+    # Prod is confirmed gone. If the signal is STILL on disk, nobody ever acted
+    # on it: prod was already down when the ceremony started, or it died inside
+    # the ~3-21 s window between signal_handoff() and its next tick. Either way
+    # the grace loop broke on its first poll, so signal_handoff_failure() was
+    # never written and nothing else in the tree deletes this file. Leaving it
+    # makes the freshly promoted prod consume a takeover addressed to its
+    # PREDECESSOR: it announces "Switching to the new version, sir" and exits
+    # 10 s into its first main loop, while this pipeline prints "handoff
+    # complete" and returns ok:True. consume_handoff_signal() now refuses a
+    # pre-boot signal as a second line of defence; this is the first.
+    try:
+        if _bgm.clear_unconsumed_handoff_signal():
+            print("[blue-green] the handoff signal was never consumed (prod "
+                  "was not running) — cleared it before promote so the new "
+                  "prod cannot inherit its predecessor's takeover.")
+    except Exception as _cue:
+        print(f"[blue-green] WARN — could not clear the handoff signal: "
+              f"{type(_cue).__name__}: {_cue}")
+
     # ── Stop staging and bring up the new prod. ──
     print("[blue-green] stopping staging instance before new prod boot...")
     try:

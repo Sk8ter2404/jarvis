@@ -49,6 +49,24 @@ if _PROJECT_DIR not in sys.path:
 
 from core.atomic_io import _atomic_write_json  # noqa: E402
 
+# The mute rule and the "a send is being held" publisher live in the sibling
+# gate and are IMPORTED, never mirrored — the #1 bug class in this repo is the
+# stale duplicate (a rule fixed in one copy while the others rot), and this
+# file already hand-mirrors _CONFIRM_KEYWORDS / _CANCEL_KEYWORDS. If the
+# sibling is unavailable we claim no cause rather than growing a second copy
+# of the rule: the refusal falls back to the generic wording.
+try:                                                       # noqa: E402
+    from core.draft_preview_gate import (MUTED_REASON, UNVOICED_REASON,
+                                         publish_held_send, tts_is_muted)
+except Exception as _e:  # pragma: no cover - sibling core module is in-tree
+    MUTED_REASON = 'tray "Mute TTS" is on'
+    UNVOICED_REASON = "the speech path did not voice it"
+    tts_is_muted = lambda: False            # noqa: E731 - no local mute rule
+    publish_held_send = lambda *a, **k: None  # noqa: E731
+    logging.getLogger(__name__).warning(
+        "[draft_confirm] core.draft_preview_gate unavailable (%s) — a held "
+        "send will still be refused, but the cause cannot be named", _e)
+
 # Words that count as "yes, send it". Whole-word match,
 # case-insensitive. Kept aligned with core.draft_preview_gate so the user
 # only learns one vocabulary.
@@ -75,6 +93,50 @@ _PENDING_FILE = os.path.join(_PROJECT_DIR, "data", "draft_confirm_pending.json")
 # (one per process); the file write inside is its own atomic step via
 # core.atomic_io._atomic_write_json.
 _gate_lock = threading.Lock()
+
+# Why the last confirmation was refused before it ever prompted, or "".
+# Single-element list, mutated in place (the core/state.py convention) so a
+# background nudge thread's write is visible to a reader on the voice thread.
+_last_hold_reason: list[str] = [""]
+
+
+def last_hold_reason() -> str:
+    """The cause of the most recent unvoiced-read-back refusal, or "".
+
+    Exposed so a diagnostic ("outbound gate status") can answer "why did
+    nothing send?" without the owner having to find it in the log — which,
+    when the cause is muted TTS, he cannot be told any other way.
+    """
+    return _last_hold_reason[0]
+
+
+def _report_unvoiced_hold(body: str, recipient: str) -> None:
+    """Announce a confirmation refused because the read-back was not voiced.
+
+    THE POINT (2026-08-20 review, HIGH): failing closed on an unvoiced
+    read-back is right, but tray "Mute TTS" is a deliberate owner toggle that
+    survives reboots, so with it on this gate refused EVERY outbound draft
+    forever — and the refusal itself was inaudible by construction. A refusal
+    nobody can perceive is indistinguishable from a bug. So the cause goes to
+    the console and the HUD, where a muted owner can actually see it.
+
+    There is deliberately NO owner-override here, unlike
+    core.draft_preview_gate.run_with_gate. This module's callers (teams_nudge,
+    phone_bridge) fire from BACKGROUND threads with no user turn attached, so
+    the last thing he said is not an answer to THIS prompt and must never be
+    read as consent for it. Holding a JARVIS-initiated push is the correct
+    answer; what changed is that the hold is no longer silent.
+    """
+    reason = MUTED_REASON if tts_is_muted() else UNVOICED_REASON
+    _last_hold_reason[0] = reason
+    _log.warning("[draft_confirm] read-back was NOT voiced (%s) — refusing the "
+                 "send. Nothing was read aloud, so nothing was confirmed.",
+                 reason)
+    try:
+        publish_held_send(_prompt_line(body, recipient), reason,
+                          source="draft_confirm")
+    except Exception as e:  # pragma: no cover - reporting is never load-bearing
+        _log.debug("[draft_confirm] hold publish failed: %s", e)
 
 
 def _import_companion():
@@ -228,7 +290,11 @@ def draft_confirm(text: str, recipient: str = "") -> bool:
         })
         try:
             if not _speak(prompt):
+                # Fail closed — but SAY SO somewhere he can see it, and record
+                # the cause. See _report_unvoiced_hold.
+                _report_unvoiced_hold(body, rcpt)
                 return False
+            _last_hold_reason[0] = ""
 
             heard = _capture_and_transcribe(CONFIRM_TIMEOUT_S)
             if heard is None:

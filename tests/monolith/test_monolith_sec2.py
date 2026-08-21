@@ -1775,6 +1775,78 @@ class WatchdogTests(_MonolithSec2Base):
         self.assertGreater(self.bc._main_loop_heartbeat[0], 0.0)
         self.assertFalse(self.bc._watchdog_reset_signal.is_set())
 
+    # ── the ON-DISK half of the heartbeat (2026-08-20) ──────────────────
+    # core/diagnostic_daemons._check_stuck_loop used hud_state.json's mtime as
+    # its main-loop liveness signal. _write_hud_state returns immediately when
+    # HUD_ENABLED is False, and nothing ever deletes hud_state.json, so
+    # unticking "On-screen HUD" in Settings froze the mtime and the anomaly
+    # watcher queued "[anomaly] main loop appears stuck" every 30 minutes for
+    # the life of the session — a false alarm that never stops, into a todo
+    # file the overnight upgrade pipeline consumes.
+
+    def _hb_sandbox(self):
+        """(tmpdir, path) with the heartbeat file redirected into it."""
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="jv_hb_")
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        return tmp, os.path.join(tmp, "main_loop_heartbeat")
+
+    def _patch_hb_path(self, path):
+        return mock.patch.object(self.bc, "_main_loop_heartbeat_path_cache",
+                                 [path])
+
+    def test_publish_writes_the_file(self):
+        _tmp, path = self._hb_sandbox()
+        with self._patch_hb_path(path), \
+             mock.patch.object(self.bc, "_last_heartbeat_publish", [0.0]):
+            self.bc._publish_main_loop_heartbeat(force=True, now=1234.5)
+        self.assertTrue(os.path.exists(path))
+
+    def test_publish_is_not_gated_by_hud_enabled(self):
+        """THE regression. The whole defect was a liveness signal sitting
+        behind a feature toggle."""
+        _tmp, path = self._hb_sandbox()
+        with self._patch_hb_path(path), \
+             mock.patch.object(self.bc, "HUD_ENABLED", False), \
+             mock.patch.object(self.bc, "_last_heartbeat_publish", [0.0]):
+            self.bc._heartbeat()
+        self.assertTrue(
+            os.path.exists(path),
+            "the main-loop heartbeat must be published with the HUD OFF — "
+            "gating it is exactly the defect this file replaced")
+
+    def test_publish_is_throttled_but_force_bypasses(self):
+        _tmp, path = self._hb_sandbox()
+        with self._patch_hb_path(path), \
+             mock.patch.object(self.bc, "_last_heartbeat_publish", [0.0]):
+            self.bc._publish_main_loop_heartbeat(now=1000.0)   # writes
+            first = os.path.getmtime(path)
+            os.utime(path, (first - 500, first - 500))
+            # 0.1 s later: inside the throttle window, must NOT rewrite.
+            self.bc._publish_main_loop_heartbeat(now=1000.1)
+            self.assertEqual(os.path.getmtime(path), first - 500)
+            # force ignores the throttle (used once at loop entry so the
+            # daemon never judges this run against a previous run's mtime).
+            self.bc._publish_main_loop_heartbeat(force=True, now=1000.2)
+            self.assertNotEqual(os.path.getmtime(path), first - 500)
+
+    def test_publish_never_raises_into_the_main_loop(self):
+        # An unwritable path must not be able to kill the loop it measures.
+        with self._patch_hb_path(os.path.join(os.sep, "no", "such", "dir",
+                                              "main_loop_heartbeat")), \
+             mock.patch.object(self.bc, "_last_heartbeat_publish", [0.0]):
+            self.bc._publish_main_loop_heartbeat(force=True, now=1.0)
+            self.bc._heartbeat()          # must not raise
+
+    def test_writer_and_watcher_agree_on_one_path(self):
+        """No second private join. Writer/watcher disagreeing about the path
+        would reproduce the permanently-firing false alarm from the other
+        side, and this repo's #1 bug class is one rule in two copies."""
+        from core import diagnostic_daemons as _dd
+        with mock.patch.object(self.bc, "_main_loop_heartbeat_path_cache", [""]):
+            self.assertEqual(self.bc._main_loop_heartbeat_path(),
+                             _dd.MAIN_LOOP_HEARTBEAT_FILE)
+
     def test_watchdog_check_detects_stall(self):
         self.bc._main_loop_heartbeat[0] = 100.0
         # now far ahead of heartbeat, threshold small → stall
@@ -2696,6 +2768,187 @@ class ListMonitorsGuessTests(_MonolithSec2Base):
 #  _refresh_devices — wake-word pause/resume + destructive reinit + its error
 #  branches (3895-3900, 3927-3928, 3979-3982)
 # ───────────────────────────────────────────────────────────────────────────
+class SilentMicReportingTests(_MonolithSec2Base):
+    """_report_silent_mic — the escalation the [self-heal] silent-mic detector
+    never had.
+
+    2026-08-20 LOW finding. The detector printed ONE line per process and did
+    nothing else. Two things made that worse than it looks: the reset arm is
+    `elif rms > 1e-5` and core.audio_processor._AUDIBLE_RMS_FLOOR is that same
+    1e-5, so a device returning true digital silence could never clear the
+    latch; and JARVIS normally runs under pythonw, where nobody reads the
+    console. The one fault the owner cannot ask about — the microphone — was
+    the one reported only in writing.
+    """
+
+    def setUp(self):
+        # MonolithGlobalsTestCase deep-restores these after each test (they are
+        # listed in tests/_monolith_harness.py), so plain assignment is safe.
+        self.bc._silent_mic_warned[0] = False
+        self.bc._silent_mic_warned_at[0] = 0.0
+        self.bc._silent_mic_warned_device[0] = ""
+
+    def test_first_report_speaks_and_prints(self):
+        with mock.patch.object(self.bc, "proactive_announce") as msay, \
+                mock.patch.object(self.bc, "_device_cache",
+                                  {"last_in_name": "Yeti X"}), \
+                mock.patch("builtins.print") as mprint:
+            self.assertTrue(self.bc._report_silent_mic(45.0, 1000.0))
+        msay.assert_called_once()
+        said = msay.call_args[0][0]
+        self.assertIn("silent", said.lower())
+        self.assertIn("Yeti", said)
+        self.assertTrue(
+            any("silent-mic" in " ".join(str(a) for a in c.args)
+                for c in mprint.call_args_list),
+            "the console line must survive — speech can be muted or focused")
+
+    def test_repeat_inside_the_window_is_throttled(self):
+        with mock.patch.object(self.bc, "proactive_announce") as msay, \
+                mock.patch.object(self.bc, "_device_cache",
+                                  {"last_in_name": "Yeti X"}), \
+                mock.patch("builtins.print"):
+            self.assertTrue(self.bc._report_silent_mic(45.0, 1000.0))
+            self.assertFalse(self.bc._report_silent_mic(60.0, 1000.0 + 10))
+            self.assertFalse(self.bc._report_silent_mic(
+                600.0, 1000.0 + self.bc.MIC_SILENT_REWARN_SECONDS - 1))
+        msay.assert_called_once()
+
+    def test_it_re_warns_after_the_window(self):
+        """THE regression: the old latch was one-shot for the life of the
+        process, so a fault that started at 09:00 was never mentioned again."""
+        with mock.patch.object(self.bc, "proactive_announce") as msay, \
+                mock.patch.object(self.bc, "_device_cache",
+                                  {"last_in_name": "Yeti X"}), \
+                mock.patch("builtins.print"):
+            self.assertTrue(self.bc._report_silent_mic(45.0, 1000.0))
+            self.assertTrue(self.bc._report_silent_mic(
+                9000.0, 1000.0 + self.bc.MIC_SILENT_REWARN_SECONDS + 1))
+        self.assertEqual(msay.call_count, 2)
+
+    def test_a_different_silent_device_re_arms_immediately(self):
+        # Following the Windows default to a NEW endpoint that is also silent
+        # is new information, not a repeat.
+        cache = {"last_in_name": "Yeti X"}
+        with mock.patch.object(self.bc, "proactive_announce") as msay, \
+                mock.patch.object(self.bc, "_device_cache", cache), \
+                mock.patch("builtins.print"):
+            self.assertTrue(self.bc._report_silent_mic(45.0, 1000.0))
+            cache["last_in_name"] = "Realtek USB Audio"
+            self.assertTrue(self.bc._report_silent_mic(45.0, 1001.0))
+        self.assertEqual(msay.call_count, 2)
+
+    def test_it_does_not_pin_the_input_device(self):
+        """It must not 'demote' a silent input by writing _device_cache["in"].
+
+        Since the follow-the-default contract, that key is deliberately None so
+        every stream open re-resolves the Windows default; pinning a name is
+        exactly what left this box deaf for 90 minutes behind a powered-off
+        headset that still enumerated and still passed check_input_settings."""
+        cache = {"last_in_name": "Yeti X", "in": None, "checked_at": 123.0}
+        with mock.patch.object(self.bc, "proactive_announce"), \
+                mock.patch.object(self.bc, "_device_cache", cache), \
+                mock.patch("builtins.print"):
+            self.bc._report_silent_mic(45.0, 1000.0)
+        self.assertIsNone(cache["in"])
+        self.assertEqual(cache["checked_at"], 123.0)
+
+    def test_a_failing_announcement_never_escapes_the_capture_loop(self):
+        with mock.patch.object(self.bc, "proactive_announce",
+                               side_effect=RuntimeError("queue full")), \
+                mock.patch.object(self.bc, "_device_cache",
+                                  {"last_in_name": "Yeti X"}), \
+                mock.patch("builtins.print"):
+            self.assertTrue(self.bc._report_silent_mic(45.0, 1000.0))
+
+    def test_an_unreadable_device_cache_still_reports(self):
+        broken = mock.Mock()
+        broken.get.side_effect = RuntimeError("cache boom")
+        with mock.patch.object(self.bc, "proactive_announce") as msay, \
+                mock.patch.object(self.bc, "_device_cache", broken), \
+                mock.patch("builtins.print"):
+            self.assertTrue(self.bc._report_silent_mic(45.0, 1000.0))
+        msay.assert_called_once()
+
+
+class WakeWordResumeOrReportTests(_MonolithSec2Base):
+    """_wake_word_resume_or_report — the honest replacement for a bare
+    `try: paused_det.resume() except Exception: print(...)`.
+
+    Why the two obvious fixes are wrong, pinned here so they are not
+    reintroduced:
+      * "retry resume()" is a no-op. Detector.resume() opens with
+        `if not self._paused: return False`, and the failing path already
+        cleared _paused before it failed. start() is the only real retry.
+      * "clear skill_wake_listener._detector so the next refresh rebuilds it"
+        does nothing — _refresh_devices never builds a detector, it only pauses
+        the one it finds; clearing the global guarantees it is never restarted.
+    """
+
+    def test_clean_resume_needs_no_restart_and_no_announcement(self):
+        det = mock.Mock()
+        det.resume.return_value = True
+        with mock.patch.object(self.bc,
+                               "_enqueue_device_announcement") as msay:
+            self.assertTrue(self.bc._wake_word_resume_or_report(det))
+        det.start.assert_not_called()
+        msay.assert_not_called()
+
+    def test_false_resume_escalates_to_start(self):
+        det = mock.Mock()
+        det.resume.return_value = False
+        det.start.return_value = True
+        with mock.patch.object(self.bc,
+                               "_enqueue_device_announcement") as msay, \
+                mock.patch("builtins.print"):
+            self.assertTrue(self.bc._wake_word_resume_or_report(det))
+        det.start.assert_called_once()
+        msay.assert_not_called()
+
+    def test_raising_resume_also_escalates_to_start(self):
+        det = mock.Mock()
+        det.resume.side_effect = RuntimeError("stream gone")
+        det.start.return_value = True
+        with mock.patch("builtins.print"):
+            self.assertTrue(self.bc._wake_word_resume_or_report(det))
+        det.start.assert_called_once()
+
+    def test_total_failure_is_reported_out_loud_and_returns_false(self):
+        det = mock.Mock()
+        det.resume.return_value = False
+        det.start.return_value = False
+        with mock.patch.object(self.bc,
+                               "_enqueue_device_announcement") as msay, \
+                mock.patch("builtins.print") as mprint:
+            self.assertFalse(self.bc._wake_word_resume_or_report(det))
+        msay.assert_called_once()
+        self.assertTrue(
+            any("WAKE-WORD DETECTOR IS DOWN" in " ".join(str(a) for a in c.args)
+                for c in mprint.call_args_list))
+
+    def test_raising_start_is_contained(self):
+        det = mock.Mock()
+        det.resume.return_value = False
+        det.start.side_effect = RuntimeError("engine gone")
+        with mock.patch.object(self.bc,
+                               "_enqueue_device_announcement") as msay, \
+                mock.patch("builtins.print"):
+            self.assertFalse(self.bc._wake_word_resume_or_report(det))
+        msay.assert_called_once()
+
+    def test_a_failing_announcement_does_not_escape(self):
+        # This runs inside _refresh_devices' finally, with the device-refresh
+        # lock held; an exception here would leave the lock in an odd state and
+        # break every get_input_device() caller.
+        det = mock.Mock()
+        det.resume.return_value = False
+        det.start.return_value = False
+        with mock.patch.object(self.bc, "_enqueue_device_announcement",
+                               side_effect=RuntimeError("queue full")), \
+                mock.patch("builtins.print"):
+            self.assertFalse(self.bc._wake_word_resume_or_report(det))
+
+
 class RefreshDevicesReinitTests(_MonolithSec2Base):
     def setUp(self):
         self._saved_cache = dict(self.bc._device_cache)
@@ -2791,6 +3044,75 @@ class RefreshDevicesReinitTests(_MonolithSec2Base):
                                   side_effect=[(0, "USB Mic"), (1, "Realtek")]):
             self.bc._refresh_devices(force=True)
         det.resume.assert_called_once()
+
+    def test_resume_returning_false_restarts_and_announces(self):
+        """THE 2026-08-20 finding. core/wake_word.Detector.resume() does NOT
+        raise on failure — it clears _running and returns False — so the old
+        `try: resume() except Exception:` caught nothing that ever happens and
+        the boolean was discarded. With _running clear, the pause site's
+        `if det.is_running()` guard skips the detector on every later refresh,
+        so a single transient endpoint blip disarmed acoustic barge-in for the
+        whole session, and the only record was one line in a log nobody reads
+        under pythonw."""
+        self.bc._device_cache["checked_at"] = 0.0
+        self.bc._device_cache["last_in_name"] = None
+        self.bc._device_cache["last_out_name"] = None
+        det = self._detector(running=True)
+        det.resume.return_value = False
+        det.start.return_value = True          # the restart takes
+        wl = mock.Mock()
+        wl._detector = det
+        sd = mock.Mock()
+        sd.query_devices.return_value = {"name": "ignored"}
+        with mock.patch.object(self.bc, "sd", sd), \
+                mock.patch.dict(self.bc.sys.modules,
+                                {"skill_wake_listener": wl}, clear=False), \
+                mock.patch.object(self.bc, "_record_speech_active", [False]), \
+                mock.patch.object(self.bc, "_tts_playback_active", [False]), \
+                mock.patch.object(self.bc, "MICROPHONE_INDEX", None), \
+                mock.patch.object(self.bc, "SPEAKER_INDEX", None), \
+                mock.patch.object(self.bc, "_devices_signature",
+                                  return_value=None), \
+                mock.patch.object(self.bc, "_pick_device",
+                                  side_effect=[(0, "USB Mic"), (1, "Realtek")]), \
+                mock.patch.object(self.bc,
+                                  "_enqueue_device_announcement") as msay:
+            self.bc._refresh_devices(force=True)
+        det.resume.assert_called_once()
+        det.start.assert_called_once()
+        # It came back, so the owner must NOT be told barge-in is down.
+        msay.assert_not_called()
+
+    def test_permanent_resume_failure_is_announced_to_the_owner(self):
+        self.bc._device_cache["checked_at"] = 0.0
+        self.bc._device_cache["last_in_name"] = None
+        self.bc._device_cache["last_out_name"] = None
+        det = self._detector(running=True)
+        det.resume.return_value = False
+        det.start.return_value = False         # and the restart fails too
+        wl = mock.Mock()
+        wl._detector = det
+        sd = mock.Mock()
+        sd.query_devices.return_value = {"name": "ignored"}
+        with mock.patch.object(self.bc, "sd", sd), \
+                mock.patch.dict(self.bc.sys.modules,
+                                {"skill_wake_listener": wl}, clear=False), \
+                mock.patch.object(self.bc, "_record_speech_active", [False]), \
+                mock.patch.object(self.bc, "_tts_playback_active", [False]), \
+                mock.patch.object(self.bc, "MICROPHONE_INDEX", None), \
+                mock.patch.object(self.bc, "SPEAKER_INDEX", None), \
+                mock.patch.object(self.bc, "_devices_signature",
+                                  return_value=None), \
+                mock.patch.object(self.bc, "_pick_device",
+                                  side_effect=[(0, "USB Mic"), (1, "Realtek")]), \
+                mock.patch.object(self.bc,
+                                  "_enqueue_device_announcement") as msay:
+            self.bc._refresh_devices(force=True)
+        det.start.assert_called_once()
+        msay.assert_called_once()
+        said = msay.call_args[0][0].lower()
+        self.assertIn("wake-word", said)
+        self.assertIn("barge-in", said)
 
     def test_portaudio_reinit_failure_is_caught(self):
         # sd._terminate() raises → the `except Exception as e` (3927-3928)
@@ -3360,10 +3682,21 @@ class FollowTheDefaultDeviceTests(_MonolithSec2Base):
         sd.default.device = (default_in, default_out)
         return sd
 
-    def _refresh(self, sd, *, prefs_in=(), prefs_out=(), announced=None):
-        """Drive one forced _refresh_devices pass against the stub."""
+    def _refresh(self, sd, *, prefs_in=(), prefs_out=(), announced=None,
+                 endpoints=(None, None)):
+        """Drive one forced _refresh_devices pass against the stub.
+
+        ``endpoints`` is the (render id, capture id) pair
+        _win_default_endpoints() would report. It is PATCHED, never live: the
+        real helper queries this machine's MMDevice API, which would make every
+        assertion here depend on which speakers the owner happens to be using.
+        The default (None, None) models a host with no MMDevice API at all —
+        the conservative branch, where an index-only shift has no corroborating
+        evidence."""
         sink = announced.append if announced is not None else (lambda _m: None)
         with mock.patch.object(self.bc, "sd", sd), \
+                mock.patch.object(self.bc, "_win_default_endpoints",
+                                  return_value=tuple(endpoints)), \
                 mock.patch.dict(self.bc.sys.modules, {}, clear=False), \
                 mock.patch.object(self.bc, "_record_speech_active", [False]), \
                 mock.patch.object(self.bc, "_pathb_mic_active", [False]), \
@@ -3392,6 +3725,8 @@ class FollowTheDefaultDeviceTests(_MonolithSec2Base):
             "in": None, "out": None, "checked_at": 0.0,
             "last_in_name": None, "last_out_name": None,
             "last_in_index": None, "last_out_index": None,
+            "last_in_endpoint": None, "last_out_endpoint": None,
+            "last_default_endpoints": None,
             "last_devices_signature": None, "last_reenum_at": 0.0,
         })
 
@@ -3511,7 +3846,10 @@ class FollowTheDefaultDeviceTests(_MonolithSec2Base):
     # ── D1: an index-only change under an identical name is detected ──────
     def test_index_only_change_same_name_is_detected(self):
         # Two endpoints can share an MME-truncated name; the old name-only
-        # compare saw nothing at all when the default moved between them.
+        # compare saw nothing at all when the default moved between them. The
+        # pair-compare still DETECTS it (tracking follows the new index) —
+        # what it may no longer do is SPEAK on the index alone. See
+        # test_index_only_change_is_not_announced_without_endpoint_evidence.
         self._boot()
         dup = "Microphone (USB Audio Device)"
         announced = []
@@ -3525,7 +3863,69 @@ class FollowTheDefaultDeviceTests(_MonolithSec2Base):
                          "index-only change must be detected (D1)")
         self.assertEqual(self.bc._device_cache["last_in_name"], dup,
                          "the name is identical — which is the whole point")
+
+    def test_index_only_change_speaks_when_the_endpoint_really_moved(self):
+        # D1 done honestly: the same MME-truncated name at a new index IS a
+        # real switch when Windows says the default endpoint moved. The
+        # endpoint id neither renumbers nor truncates, so it is the evidence
+        # the index alone cannot supply.
+        self._boot()
+        dup = "Microphone (USB Audio Device)"
+        announced = []
+        self._refresh(self._sd([self.SPEAKERS, dup, dup], 2, 0),
+                      announced=announced, endpoints=("{render}", "{mic-A}"))
+        self._refresh(self._sd([self.SPEAKERS, dup, dup], 1, 0),
+                      announced=announced, endpoints=("{render}", "{mic-B}"))
+        self.assertEqual(self.bc._device_cache["last_in_index"], 1)
         self.assertEqual(len(announced), 1, announced)
+        self.assertEqual(announced[0], "Switched to USB Audio Device, sir.")
+
+    def test_index_only_change_is_not_announced_without_endpoint_evidence(self):
+        # THE REGRESSION (2026-08-20 review). Inputs enumerate before outputs,
+        # so ANY input appearing or disappearing slides every output index by
+        # one while the endpoint itself never changes — and the (index, name)
+        # announce trigger spoke "Switched to Realtek(R) Audio, sir." about the
+        # speakers JARVIS was already using. With no MMDevice evidence the
+        # shift is tracked and logged, never spoken.
+        self._boot()
+        announced = []
+        self._refresh(self._sd([self.SNOWBALL, self.CORSAIR, self.SPEAKERS],
+                               0, 2), announced=announced)
+        self.assertEqual(self.bc._device_cache["last_out_index"], 2)
+        # The CORSAIR mic goes away: the speakers slide 2 → 1, same name.
+        self._refresh(self._sd([self.SNOWBALL, self.SPEAKERS], 0, 1),
+                      announced=announced)
+        self.assertEqual(self.bc._device_cache["last_out_index"], 1,
+                         "the re-key must still happen — tracking follows")
+        self.assertEqual(self.bc._device_cache["last_out_name"], self.SPEAKERS)
+        self.assertEqual(announced, [],
+                         "an index-only shift with no endpoint evidence must "
+                         "NOT claim a switch that did not happen")
+
+    def test_index_only_shift_is_silent_when_the_endpoint_is_unchanged(self):
+        # Negative control for the evidence path: MMDevice IS available and
+        # reports the SAME endpoint id across the renumbering. Evidence that
+        # says "unchanged" must not be read as evidence of a change.
+        self._boot()
+        announced = []
+        self._refresh(self._sd([self.SNOWBALL, self.CORSAIR, self.SPEAKERS],
+                               0, 2), announced=announced,
+                      endpoints=("{spk-1}", "{mic-1}"))
+        self._refresh(self._sd([self.SNOWBALL, self.SPEAKERS], 0, 1),
+                      announced=announced, endpoints=("{spk-1}", "{mic-1}"))
+        self.assertEqual(self.bc._device_cache["last_out_index"], 1)
+        self.assertEqual(announced, [])
+
+    def test_name_change_is_announced_with_no_endpoint_api_at_all(self):
+        # Negative control for the guard as a whole: removing the announce on
+        # index-only shifts must not remove the announce on a REAL switch. No
+        # MMDevice API here — the name is enough on its own.
+        self._boot()
+        names = [self.CORSAIR, self.SNOWBALL, self.SPEAKERS]
+        announced = []
+        self._refresh(self._sd(names, 0, 2), announced=announced)
+        self._refresh(self._sd(names, 1, 2), announced=announced)
+        self.assertEqual(announced, ["Switched to the Blue Snowball, sir."])
 
     # ── wording: neutral for a switch, loss only for a real disappearance ─
     def test_still_present_previous_device_gets_neutral_wording(self):

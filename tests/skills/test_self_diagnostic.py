@@ -4571,5 +4571,268 @@ class MicSkipPathStructureTests(unittest.TestCase):
                 self.assertFalse(text.startswith("sd."),
                                  f"the passive check touched sounddevice: {text}")
 
+# ═════════════════════════════════════════════════════════════════════════
+#  2026-08-20 adversarial review, HIGH: the flagship sentence was never SPOKEN
+#
+#  run_diagnostic / are_you_ok / system_check / self_diagnostic /
+#  diagnostic_status are all in bobert_companion.SPEAK_RESULT_VERBATIM_ACTIONS
+#  and in NEITHER INFORMATIVE_ACTIONS, and _speak_verbatim_results drops any
+#  result containing a core.failure_markers.FAILURE_MARKERS substring. The
+#  UNVERIFIED wording shipped in v2.0.95 carried TWO of them ("couldn't run",
+#  "I can't call the system nominal"), so the single most important sentence of
+#  the release was silently swallowed and re-worded by an extra LLM round-trip.
+# ═════════════════════════════════════════════════════════════════════════
+class HonestSurfaceIsSpeakableTests(_ProbeTestBase):
+    """Every sentence the honest (non-failure) surface can emit must survive
+    _speak_verbatim_results' failure-marker filter."""
+
+    def setUp(self):
+        super().setUp()
+        from core.failure_markers import FAILURE_MARKERS
+        self.markers = tuple(m.lower() for m in FAILURE_MARKERS)
+        self.tmp = tempfile.mkdtemp(prefix="selfdiag_speak_")
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp,
+                                                            ignore_errors=True))
+        mock.patch.object(self.mod, "_TODO_PATH",
+                          os.path.join(self.tmp, "jarvis_todo.md")).start()
+        mock.patch.object(self.mod, "_HISTORY_PATH",
+                          os.path.join(self.tmp, "history.json")).start()
+
+    def _markers_in(self, text):
+        low = (text or "").lower()
+        return [m for m in self.markers if m in low]
+
+    def _run(self, *, failed=(), unverified=(), probes=None):
+        run = {"ts": self.mod._now() - 60.0, "iso": "2026-08-20T00:00:00",
+               "duration_ms": 1234.0, "probes": probes or {},
+               "failed": list(failed), "severity_failed":
+                   {c: self.mod.SEVERITY_HIGH for c in failed},
+               "unverified": list(unverified)}
+        return run
+
+    def _mic_unverified_probes(self, *, transient=True, cause_key="mic_no_frames"):
+        r = self.mod._unverified(
+            5.0, reason="the live capture was skipped and there is no passive "
+                        "liveness signal either",
+            short_cause=self.mod._UNVERIFIED_SHORT_CAUSES[cause_key],
+            transient=transient)
+        return {"microphone": r}
+
+    # ── the sentence itself ──────────────────────────────────────
+    def test_summarise_unverified_sentence_carries_no_failure_marker(self):
+        run = self._run(unverified=["microphone"],
+                        probes=self._mic_unverified_probes())
+        out = self.mod._summarise(run, [])
+        self.assertEqual(self._markers_in(out), [],
+                         "the 'I can't call the system nominal' sentence is "
+                         "dropped by _speak_verbatim_results and never spoken: "
+                         + out)
+        self.assertIn("UNVERIFIED", out)
+        self.assertIn("microphone", out)
+        self.assertNotIn("All systems nominal", out)
+
+    def test_summarise_failure_plus_unverified_carries_no_marker(self):
+        run = self._run(failed=["webcam"], unverified=["microphone"],
+                        probes=self._mic_unverified_probes())
+        out = self.mod._summarise(run, ["webcam"])
+        self.assertEqual(self._markers_in(out), [], out)
+        self.assertIn("UNVERIFIED", out)
+        self.assertIn("webcam", out)
+
+    def test_summarise_all_nominal_carries_no_marker(self):
+        out = self.mod._summarise(self._run(), [])
+        self.assertEqual(self._markers_in(out), [], out)
+
+    def test_diagnostic_status_unverified_sentence_carries_no_marker(self):
+        # Non-transient (mic hard-disabled) so the live re-check cannot clear
+        # it and the UNVERIFIED sentence is definitely the one rendered.
+        run = self._run(unverified=["microphone"],
+                        probes=self._mic_unverified_probes(
+                            transient=False, cause_key="mic_disabled"))
+        self.mod._state["last_run"] = run
+        out = self.actions["diagnostic_status"]("")
+        self.assertEqual(self._markers_in(out), [], out)
+        self.assertIn("UNVERIFIED", out)
+
+    def test_diagnostic_status_failure_branch_carries_no_marker(self):
+        run = self._run(failed=["webcam"], unverified=["microphone"],
+                        probes=self._mic_unverified_probes(transient=False))
+        self.mod._state["last_run"] = run
+        out = self.actions["diagnostic_status"]("")
+        self.assertEqual(self._markers_in(out), [], out)
+
+    def test_diagnostic_history_unverified_line_carries_no_marker(self):
+        self.mod._save_history([{"ts": 1.0, "iso": "2026-08-20T00:00:00",
+                                 "failed": [], "unverified": ["microphone"]}])
+        out = self.actions["diagnostic_history"]("1")
+        self.assertEqual(self._markers_in(out), [], out)
+        self.assertIn("unverified", out)
+
+    # ── the table the sentence is built from ──────────────────────
+    def test_every_short_cause_is_marker_free(self):
+        for key, cause in self.mod._UNVERIFIED_SHORT_CAUSES.items():
+            with self.subTest(cause=key):
+                self.assertEqual(self._markers_in(cause), [],
+                                 f"short cause {key!r} would take the whole "
+                                 f"honest sentence off the verbatim path")
+
+    def test_a_marker_carrying_short_cause_is_dropped_not_spoken(self):
+        # Belt-and-braces: if a future edit puts a marker in a short cause,
+        # the four words are dropped rather than the whole sentence.
+        r = self.mod._unverified(1.0, reason="x",
+                                 short_cause="the probe couldn't reach it")
+        run = self._run(unverified=["microphone"], probes={"microphone": r})
+        out = self.mod._summarise(run, [])
+        self.assertEqual(self._markers_in(out), [], out)
+        self.assertIn("microphone", out)
+
+    # ── the honest surface still NAMES the cause ─────────────────
+    def test_summary_names_why_the_check_did_not_run(self):
+        run = self._run(unverified=["microphone"],
+                        probes=self._mic_unverified_probes())
+        out = self.mod._summarise(run, [])
+        self.assertIn(self.mod._UNVERIFIED_SHORT_CAUSES["mic_no_frames"], out,
+                      "a bare 'microphone' is alarming; the cause makes it "
+                      "actionable")
+
+    def test_history_entries_without_details_still_render(self):
+        # Older history entries carry no probe details — the phrase must not
+        # require them.
+        out = self.mod._unverified_phrase(["microphone", "stt"], None)
+        self.assertIn("microphone", out)
+        self.assertIn("stt", out)
+        self.assertEqual(self._markers_in(out), [], out)
+
+    # ── the OTHER half of the rule: real failures KEEP their marker ─────
+    def test_a_genuine_failure_line_still_carries_a_marker(self):
+        # whats_broken's unreadable-todo path is a real failure and MUST stay
+        # on the failure path — the rule is "no markers on the HONEST surface",
+        # not "no markers anywhere".
+        out = self.actions["whats_broken"]("")
+        self.assertTrue(self._markers_in(out),
+                        "a real failure must still be classified as one: " + out)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  2026-08-20 adversarial review, MED: a transient UNVERIFIED must not latch
+#
+#  The passive mic signal exists only while record_speech's chunk loop runs, so
+#  a 30-minute sweep landing during a long awake turn writes
+#  "microphone: UNVERIFIED" into last_run with nothing wrong — and every
+#  "diagnostic status" for the next half hour repeats it. An alarm that cries
+#  wolf is how a real one gets ignored.
+# ═════════════════════════════════════════════════════════════════════════
+class TransientUnverifiedRecheckTests(_ProbeTestBase):
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.mkdtemp(prefix="selfdiag_transient_")
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp,
+                                                            ignore_errors=True))
+        mock.patch.object(self.mod, "_HISTORY_PATH",
+                          os.path.join(self.tmp, "history.json")).start()
+        from core.failure_markers import FAILURE_MARKERS
+        self.markers = tuple(m.lower() for m in FAILURE_MARKERS)
+
+    def _run_with(self, result):
+        return {"ts": self.mod._now() - 600.0, "iso": "2026-08-20T00:00:00",
+                "duration_ms": 900.0, "probes": {"microphone": result},
+                "failed": [], "severity_failed": {},
+                "unverified": ["microphone"]}
+
+    def _nodata_result(self):
+        return self.mod._unverified(
+            5.0, reason="no passive liveness signal",
+            short_cause=self.mod._UNVERIFIED_SHORT_CAUSES["mic_no_frames"],
+            transient=True)
+
+    # ── the probe marks the no-frames verdict transient ────────────
+    def test_the_real_probe_marks_a_nodata_verdict_transient(self):
+        ap = fake_audio_processor(now=self.mod._now(), poll_age=120.0,
+                                  session_age=600.0)
+        with inject_modules(**{"core.audio_processor": ap}):
+            r = self.mod._mic_result_without_capture(self.mod._now(), {})
+        self.assertFalse(r["tested"])
+        self.assertTrue(r["details"].get("unverified_transient"),
+                        "a mid-turn sweep with no frames is a transient "
+                        "no-data condition, not a standing problem")
+        self.assertEqual(r["details"].get("unverified_short_cause"),
+                         self.mod._UNVERIFIED_SHORT_CAUSES["mic_no_frames"])
+
+    def test_a_hard_disabled_mic_is_NOT_transient(self):
+        r = self.mod._mic_result_without_capture(self.mod._now(), {},
+                                                 mic_off=True)
+        self.assertFalse(r["details"].get("unverified_transient"),
+                         "a configured-off mic will not clear by itself; "
+                         "re-measuring it every read would be pointless")
+
+    # ── diagnostic_status re-measures instead of repeating ──────────
+    def test_status_clears_a_transient_unverified_on_live_evidence(self):
+        self.mod._state["last_run"] = self._run_with(self._nodata_result())
+        with mock.patch.object(self.mod, "_passive_mic_liveness",
+                               return_value={"verdict": "alive"}):
+            out = self.actions["diagnostic_status"]("")
+        self.assertNotIn("UNVERIFIED", out,
+                         "the mic was re-measured live and is fine — repeating "
+                         "a half-hour-old UNVERIFIED is noise: " + out)
+        self.assertIn("All systems nominal", out)
+        self.assertIn("re-measured", out)
+        self.assertEqual([m for m in self.markers if m in out.lower()], [], out)
+
+    def test_status_keeps_the_unverified_when_the_recheck_is_not_positive(self):
+        self.mod._state["last_run"] = self._run_with(self._nodata_result())
+        with mock.patch.object(self.mod, "_passive_mic_liveness",
+                               return_value={"verdict": "nodata"}):
+            out = self.actions["diagnostic_status"]("")
+        self.assertIn("UNVERIFIED", out)
+        self.assertNotIn("All systems nominal", out)
+
+    def test_a_live_silent_verdict_never_clears_the_entry(self):
+        # "silent" means the loop is reading NULL FRAMES — the deaf-JARVIS
+        # condition. It must never be read as evidence of health.
+        self.mod._state["last_run"] = self._run_with(self._nodata_result())
+        with mock.patch.object(self.mod, "_passive_mic_liveness",
+                               return_value={"verdict": "silent"}):
+            out = self.actions["diagnostic_status"]("")
+        self.assertIn("UNVERIFIED", out)
+
+    def test_a_non_transient_unverified_is_never_recheck_cleared(self):
+        r = self.mod._unverified(
+            5.0, reason="the microphone is hard-disabled in configuration",
+            short_cause=self.mod._UNVERIFIED_SHORT_CAUSES["mic_disabled"])
+        self.mod._state["last_run"] = self._run_with(r)
+        with mock.patch.object(self.mod, "_passive_mic_liveness",
+                               return_value={"verdict": "alive"}) as live:
+            out = self.actions["diagnostic_status"]("")
+        live.assert_not_called()
+        self.assertIn("UNVERIFIED", out)
+
+    def test_the_recorded_run_and_history_are_not_rewritten(self):
+        run = self._run_with(self._nodata_result())
+        self.mod._state["last_run"] = run
+        with mock.patch.object(self.mod, "_passive_mic_liveness",
+                               return_value={"verdict": "alive"}):
+            self.actions["diagnostic_status"]("")
+        self.assertEqual(run["unverified"], ["microphone"],
+                         "the sweep really had no data at the time; the record "
+                         "of that must stay true")
+
+    def test_a_raising_recheck_leaves_the_entry_unverified(self):
+        self.mod._state["last_run"] = self._run_with(self._nodata_result())
+        with mock.patch.object(self.mod, "_passive_mic_liveness",
+                               side_effect=RuntimeError("boom")):
+            out = self.actions["diagnostic_status"]("")
+        self.assertIn("UNVERIFIED", out)
+
+    def test_the_sweep_summary_itself_still_reports_unverified(self):
+        # The re-check belongs to the READ path only. At sweep time there
+        # genuinely was no data, and _summarise must still say so.
+        run = self._run_with(self._nodata_result())
+        with mock.patch.object(self.mod, "_passive_mic_liveness",
+                               return_value={"verdict": "alive"}):
+            out = self.mod._summarise(run, [])
+        self.assertIn("UNVERIFIED", out)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import threading
 import unittest
 from unittest import mock
 
@@ -70,8 +71,119 @@ class ReleaseNativeResourcesTests(unittest.TestCase):
             A._release_native_resources(bc)
         close.assert_called_once_with(final=True)
         unload.assert_called_once()
-        bc.sd.stop.assert_called_once()
         bc._face_track_stop.set.assert_called_once()
+
+    def test_release_does_not_call_the_process_global_sd_stop(self):
+        """H-3, FIFTH COPY (2026-08-20). This step was `bc.sd.stop()` under a
+        `# WASAPI streams` comment, and BOTH halves of that were wrong.
+
+        Module-level sd.stop() stops+closes `_last_callback` and nothing else
+        (sounddevice.py:406-418), and `_last_callback` is published only by
+        sd.play()/sd.rec()/sd.playrec(). Every stream alive at shutdown is an
+        explicitly constructed InputStream/OutputStream, so the call released
+        NONE of them — teardown then hit TerminateProcess with threads still
+        inside WASAPI, the exact kernel-stuck corpse this function exists to
+        prevent. And when `_last_callback` was NOT empty (a queued proactive
+        _speak mid-playback, two seconds after the goodbye line) it was a
+        cross-close against the tts-reaper's stream: 0xc0000374 during
+        teardown. Four copies of this hatch were deleted on 2026-08-20; this
+        one was missed. Teardown gets no exemption."""
+        bc = mock.Mock()
+        with mock.patch.object(kb, "close"), \
+             mock.patch("core.voice_clone.unload"), \
+             mock.patch("builtins.print"):
+            A._release_native_resources(bc)
+        bc.sd.stop.assert_not_called()
+        # And it is gone from the SOURCE too, so it cannot come back as a
+        # "harmless" belt-and-braces line. ast.unparse drops comments AND the
+        # docstrings that explain the deleted call, so only real code is
+        # scanned (str.replace on fn.__doc__ does NOT work here: Python 3.13+
+        # dedents docstrings, so __doc__ no longer matches the source text).
+        import ast
+        import inspect
+        import textwrap
+        code = ""
+        for fn in (A._release_native_resources, A._release_audio_streams):
+            tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+            for node in ast.walk(tree):
+                body = getattr(node, "body", None)
+                if (isinstance(body, list) and body
+                        and isinstance(body[0], ast.Expr)
+                        and isinstance(getattr(body[0], "value", None),
+                                       ast.Constant)
+                        and isinstance(body[0].value.value, str)):
+                    body.pop(0)
+            code += ast.unparse(tree)
+        self.assertNotIn("sd.stop", code)
+
+    def test_release_asks_the_real_stream_owners_to_let_go(self):
+        """The replacement must actually release something. The three
+        subsystems that hold PortAudio streams at shutdown are record_speech
+        (via the watchdog reset signal), the wake-word detector's persistent
+        InputStream, and ambient listen's mic + WASAPI-loopback workers."""
+        bc = mock.Mock()
+        det = mock.Mock()
+        wl = mock.Mock()
+        wl._detector = det
+        al = mock.Mock()
+        with mock.patch.object(kb, "close"), \
+             mock.patch("core.voice_clone.unload"), \
+             mock.patch.dict(A.sys.modules,
+                             {"skill_wake_listener": wl,
+                              "skill_ambient_listen": al}), \
+             mock.patch("builtins.print"):
+            A._release_native_resources(bc)
+        bc._watchdog_reset_signal.set.assert_called_once()
+        det.stop.assert_called_once()
+        al.ambient_listen_stop.assert_called_once_with("")
+        al.ambient_audio_stop.assert_called_once_with("")
+
+    def test_release_audio_streams_is_bounded_and_never_raises(self):
+        """A wedged owner must cost the budget, not the caller's whole failsafe
+        window — the ambient stops already join 3 s each internally, so the
+        signalling runs on an abandonable daemon."""
+        bc = mock.Mock()
+        wedged = threading.Event()
+        self.addCleanup(wedged.set)
+        al = mock.Mock()
+        al.ambient_listen_stop.side_effect = lambda _s: wedged.wait(30.0)
+        t0 = time.monotonic()
+        with mock.patch.dict(A.sys.modules, {"skill_ambient_listen": al}), \
+                mock.patch("builtins.print"):
+            A._release_audio_streams(bc, budget_s=0.2)
+        self.assertLess(time.monotonic() - t0, 5.0,
+                        "a wedged owner must not stall the teardown")
+
+    def test_release_audio_streams_waits_for_the_owner_flags(self):
+        """Honest reporting: it waits, bounded, for the gate to say the streams
+        are really gone — and says so out loud when they are not."""
+        import threading as _threading
+
+        class _Bc:
+            _mic_lock = _threading.Lock()
+
+            def __init__(self, live):
+                self._live = live
+                self._watchdog_reset_signal = mock.Mock()
+
+            def _pa_streams_live(self):
+                return self._live
+
+        printed = []
+        with mock.patch("builtins.print",
+                        side_effect=lambda *a, **k: printed.append(
+                            " ".join(str(x) for x in a))):
+            A._release_audio_streams(_Bc(False), budget_s=0.5)
+        self.assertIn("audio streams released", "\n".join(printed))
+
+        printed.clear()
+        t0 = time.monotonic()
+        with mock.patch("builtins.print",
+                        side_effect=lambda *a, **k: printed.append(
+                            " ".join(str(x) for x in a))):
+            A._release_audio_streams(_Bc(True), budget_s=0.3)
+        self.assertGreaterEqual(time.monotonic() - t0, 0.3)
+        self.assertIn("did NOT all release", "\n".join(printed))
 
     def test_release_waits_for_the_in_flight_gpu_worker(self):
         # 2026-07-14: unload() cannot release a model that is still LOADING.
@@ -266,26 +378,74 @@ class CameraProbeBudgetTests(unittest.TestCase):
         self.assertGreater(dt, 0.5, "it really did wait for the lock")
 
     def test_unavailable_lock_reports_honestly(self):
+        """The queued probe must give up honestly — WITHOUT letting its
+        abandoned worker touch the owner's real webcam after the test returns.
+
+        2026-08-20 audit. This test used to patch nothing but CAMERA_PROBE_MAX
+        and print. `_probe_camera_index` gives up in PHASE 1 (never acquires
+        the lock) and returns False, so the test went green — and only THEN did
+        the ``finally: forever.set()`` free the lock, at which point the
+        abandoned daemon worker woke up and ran the module-global, entirely
+        unpatched ``cv2.VideoCapture(7, cv2.CAP_DSHOW)`` against live
+        DirectShow, holding the process-wide camera RLock for up to OpenCV's
+        ~26 s internal retry. The sibling 20 lines above is safe only because
+        its worker finishes INSIDE the with-block; this one drains after it.
+
+        Note what does NOT fix this: wrapping the probe call in
+        ``mock.patch.object(bc.cv2, "VideoCapture", ...)``. The patch unwinds
+        when the probe RETURNS, which is before the hog is released — the
+        orphan would still reach the real OpenCV. The release and the drain
+        have to happen while the patch is still installed."""
         import threading
-        import time as _t
         bc = self.bc
         forever = threading.Event()
+        entered = threading.Event()
 
         def _hog():
             with bc._camera_io_lock:
+                entered.set()
                 forever.wait(timeout=30)
 
         hog = threading.Thread(target=_hog, daemon=True)
         hog.start()
-        _t.sleep(0.2)
+        self.assertTrue(entered.wait(5.0), "the hog never took the camera lock")
+        before = set(threading.enumerate())
+        fake_cap = mock.Mock()
+        fake_cap.isOpened.return_value = False
         try:
-            with mock.patch.object(bc, "CAMERA_PROBE_MAX", 1), \
+            with mock.patch.object(bc.cv2, "VideoCapture",
+                                   return_value=fake_cap) as mcap, \
+                 mock.patch.object(bc, "CAMERA_PROBE_MAX", 1), \
                  mock.patch("builtins.print"):
                 # lock_budget = max(2.0, ...) → ~2s, then an honest False.
                 ok = bc._probe_camera_index(7, timeout_sec=0.1)
-            self.assertFalse(ok)
+                self.assertFalse(ok)
+                # PHASE 1 timed out, so the probe never called VideoCapture
+                # itself — the orphan is still parked on the lock.
+                mcap.assert_not_called()
+                # Release the hog and DRAIN the orphan while the mock is still
+                # installed, so the only VideoCapture it can ever reach is this
+                # one. Everything below is inside the with-block on purpose.
+                forever.set()
+                hog.join(timeout=10)
+                leaked = []
+                for th in set(threading.enumerate()) - before:
+                    th.join(timeout=10)
+                    if th.is_alive():
+                        leaked.append(th.name)
+                self.assertEqual(
+                    leaked, [],
+                    "a camera-probe worker outlived the test while holding "
+                    "_camera_io_lock — it will hit REAL DirectShow once the "
+                    "patch unwinds")
+                # It DID run, against the mock, exactly once.
+                mcap.assert_called_once_with(7, bc.cv2.CAP_DSHOW)
         finally:
             forever.set()
+        # The lock must be free for every later camera test in the process.
+        self.assertTrue(bc._camera_io_lock.acquire(timeout=5),
+                        "_camera_io_lock is still held after the drain")
+        bc._camera_io_lock.release()
 
 
 @requires_monolith

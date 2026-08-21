@@ -443,29 +443,31 @@ class HelperPlumbingTests(unittest.TestCase):
 #  No real PortAudio stream is ever opened; every branch is driven by the
 #  injected fake's behaviour.
 # ─────────────────────────────────────────────────────────────────────────
-def _make_sd(*, rec_result=_SENTINEL, rec_raises=False,
-             stream_factory=_SENTINEL, stream_raises=False):
+def _make_sd(*, stream_factory=_SENTINEL, stream_raises=False):
     """Build a fake `sounddevice` module.
 
-    rec_result    : array returned by sd.rec()+sd.wait() (default: a 1-D
-                    non-empty float32 buffer). Pass None to simulate an empty
-                    capture that forces the InputStream fallback.
-    rec_raises    : sd.rec() raises -> exercises the rec→InputStream fallback.
-    stream_factory: callable(**kwargs) -> fake InputStream (for the fallback).
+    stream_factory: callable(**kwargs) -> fake InputStream. The default pumps
+                    three frames through the callback, which is the ONLY
+                    capture path enroll_voice has since H-4 (2026-08-20).
     stream_raises : sd.InputStream(...) construction raises (open-failed path).
+
+    sd.rec / sd.wait / sd.stop are wired to EXPLODE. They are the
+    process-global trio that shares sounddevice's single `_last_callback`
+    slot, and re-introducing any of them here re-opens the cross-close that
+    let a concurrent _speak and this capture close each other's stream
+    (0xc0000374). A fake that quietly tolerated them would let that come back
+    silently.
     """
     sd = types.ModuleType("sounddevice")
 
-    def _rec(n, **k):
-        if rec_raises:
-            raise RuntimeError("sd.rec exploded")
-        if rec_result is _SENTINEL:
-            return np.ones(n, dtype=np.float32)
-        return rec_result
+    def _forbidden(*a, **k):
+        raise AssertionError(
+            "enroll_voice must never call the process-global "
+            "sd.rec/sd.wait/sd.stop trio (H-4, 2026-08-20)")
 
-    sd.rec = _rec
-    sd.wait = lambda: None
-    sd.stop = lambda: None
+    sd.rec = _forbidden
+    sd.wait = _forbidden
+    sd.stop = _forbidden
 
     if stream_raises:
         def _InputStream(**k):
@@ -473,6 +475,8 @@ def _make_sd(*, rec_result=_SENTINEL, rec_raises=False,
         sd.InputStream = _InputStream
     elif stream_factory is not _SENTINEL:
         sd.InputStream = stream_factory
+    else:
+        sd.InputStream = lambda **k: _FakeStream(callback=k["callback"])
     return sd
 
 
@@ -480,17 +484,20 @@ class _FakeStream:
     """Minimal sd.InputStream stand-in. On start() it pumps `n_pushes` frames
     of `value` through the callback, then reports time elapsed so the capture
     while-loop exits quickly. close()/stop() record that they ran."""
-    def __init__(self, *, callback, value=0.2, n_pushes=3, frames=512):
+    def __init__(self, *, callback, value=0.2, n_pushes=3, frames=512,
+                 stereo=False):
         self._cb = callback
         self._value = value
         self._n = n_pushes
         self._frames = frames
+        self._stereo = stereo
         self.stopped = False
         self.closed = False
 
     def start(self):
         for _ in range(self._n):
-            block = np.full(self._frames, self._value, dtype=np.float32)
+            shape = (self._frames, 2) if self._stereo else (self._frames,)
+            block = np.full(shape, self._value, dtype=np.float32)
             self._cb(block, self._frames, None, None)
 
     def stop(self):
@@ -517,15 +524,16 @@ class RecordSecondsTests(unittest.TestCase):
         self.assertEqual(out.dtype, np.float32)
         self.assertEqual(out.size, 8000)
 
-    def test_mic_buffer_empty_falls_through_to_sd_rec(self):
-        # get_mic_buffer returns an empty array (size 0) -> skip tap, use sd.rec.
+    def test_mic_buffer_empty_falls_through_to_local_capture(self):
+        # get_mic_buffer returns an empty array (size 0) -> skip the tap and
+        # run the local private-InputStream capture.
         bc = types.SimpleNamespace(
             get_mic_buffer=lambda secs, sr: np.zeros(0, dtype=np.float32),
             get_input_device=lambda: None)
-        sd = _make_sd()   # default rec returns a non-empty buffer
+        sd = _make_sd()
         with mock.patch.object(self.mod, "_bobert", return_value=bc), \
              inject_modules(sounddevice=sd):
-            out = self.mod._record_seconds(0.25)
+            out = self.mod._record_seconds(0.05)
         self.assertIsNotNone(out)
         self.assertGreater(out.size, 0)
 
@@ -537,7 +545,7 @@ class RecordSecondsTests(unittest.TestCase):
         sd = _make_sd()
         with mock.patch.object(self.mod, "_bobert", return_value=bc), \
              inject_modules(sounddevice=sd):
-            out = self.mod._record_seconds(0.25)
+            out = self.mod._record_seconds(0.05)
         self.assertIsNotNone(out)
 
     # ── sounddevice missing entirely ─────────────────────────────────────
@@ -546,22 +554,67 @@ class RecordSecondsTests(unittest.TestCase):
              block_import("sounddevice"):
             self.assertIsNone(self.mod._record_seconds(0.25))
 
-    # ── sd.rec happy path ────────────────────────────────────────────────
-    def test_sd_rec_happy_path_1d(self):
-        sd = _make_sd(rec_result=np.ones(4000, dtype=np.float32))
+    # ── the ONLY capture path: a private InputStream ─────────────────────
+    def test_private_input_stream_is_the_capture_path(self):
+        sd = _make_sd()
         with mock.patch.object(self.mod, "_bobert", return_value=None), \
              inject_modules(sounddevice=sd):
-            out = self.mod._record_seconds(0.25)
-        self.assertEqual(out.size, 4000)
-
-    def test_sd_rec_happy_path_2d_takes_first_channel(self):
-        stereo = np.ones((3000, 2), dtype=np.float32)
-        sd = _make_sd(rec_result=stereo)
-        with mock.patch.object(self.mod, "_bobert", return_value=None), \
-             inject_modules(sounddevice=sd):
-            out = self.mod._record_seconds(0.25)
+            out = self.mod._record_seconds(0.05)
+        self.assertIsNotNone(out)
         self.assertEqual(out.ndim, 1)
-        self.assertEqual(out.size, 3000)
+        self.assertEqual(out.dtype, np.float32)
+        self.assertGreater(out.size, 0)
+
+    def test_stereo_frames_are_collapsed_to_mono(self):
+        def _factory(**k):
+            return _FakeStream(callback=k["callback"], stereo=True)
+
+        sd = _make_sd(stream_factory=_factory)
+        with mock.patch.object(self.mod, "_bobert", return_value=None), \
+             inject_modules(sounddevice=sd):
+            out = self.mod._record_seconds(0.05)
+        self.assertEqual(out.ndim, 1)
+
+    def test_the_process_global_trio_is_never_called(self):
+        """H-4, SECOND COPY (2026-08-20). enroll_voice opened with
+        ``sd.rec(...)`` + a daemon in ``sd.wait()`` + ``sd.stop()`` on
+        overrun, and today's commit added a comment declaring that sd.stop()
+        "DIFFERENT and legitimate ... that path owns `_last_callback` because
+        it called sd.rec itself".
+
+        There is no ownership to own: `_last_callback` is ONE process-global
+        slot, `_CallbackContext.start_stream` opens by stopping AND CLOSING
+        whatever the previous context left there, and this capture holds no
+        _SPEAK_LOCK while timers / the tray drainer / proactive announcements
+        can speak underneath it. Two threads in Pa_CloseStream on one WASAPI
+        stream is 0xc0000374. The fake's rec/wait/stop raise AssertionError,
+        so this fails loudly if any of the three ever comes back."""
+        sd = _make_sd()
+        bc = types.SimpleNamespace(get_input_device=lambda: None,
+                                   _safe_close_stream=lambda s: None)
+        with mock.patch.object(self.mod, "_bobert", return_value=bc), \
+             inject_modules(sounddevice=sd):
+            out = self.mod._record_seconds(0.05)
+        self.assertIsNotNone(out)
+        # And the CALLS are gone from the source. Walked as AST, not grepped:
+        # the surviving H-3 log line quotes "sd.stop() is deliberately NOT
+        # called", and a substring check would read that prose as the call.
+        import ast
+        import inspect
+        import textwrap
+        tree = ast.parse(textwrap.dedent(
+            inspect.getsource(self.mod._record_seconds)))
+        called = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "sd"
+        }
+        self.assertEqual(called & {"rec", "wait", "stop"}, set())
+        self.assertIn("InputStream", called,
+                      "the private InputStream is the capture path")
 
     # ── sd.rec fails -> InputStream callback fallback succeeds ────────────
     def test_rec_fails_then_inputstream_callback_succeeds(self):
@@ -572,7 +625,7 @@ class RecordSecondsTests(unittest.TestCase):
             created["stream"] = s
             return s
 
-        sd = _make_sd(rec_raises=True, stream_factory=_factory)
+        sd = _make_sd(stream_factory=_factory)
         # bc has no _safe_close_stream -> exercises the inline daemon-close
         # teardown (stream.stop + daemon close + Event.wait).
         bc = types.SimpleNamespace(get_input_device=lambda: None)
@@ -589,7 +642,7 @@ class RecordSecondsTests(unittest.TestCase):
 
     # ── InputStream open itself fails -> None ────────────────────────────
     def test_rec_fails_and_inputstream_open_fails(self):
-        sd = _make_sd(rec_raises=True, stream_raises=True)
+        sd = _make_sd(stream_raises=True)
         with mock.patch.object(self.mod, "_bobert", return_value=None), \
              inject_modules(sounddevice=sd):
             self.assertIsNone(self.mod._record_seconds(0.25))
@@ -601,7 +654,7 @@ class RecordSecondsTests(unittest.TestCase):
         def _factory(**k):
             return _FakeStream(callback=k["callback"], value=0.25, n_pushes=3)
 
-        sd = _make_sd(rec_raises=True, stream_factory=_factory)
+        sd = _make_sd(stream_factory=_factory)
         bc = types.SimpleNamespace(
             get_input_device=lambda: None,
             _safe_close_stream=lambda s: closed.setdefault("via", "bc"))
@@ -630,7 +683,7 @@ class RecordSecondsTests(unittest.TestCase):
             def close(self):
                 self.closed = True
 
-        sd = _make_sd(rec_raises=True, stream_factory=lambda **k: _BoomStream(**k))
+        sd = _make_sd(stream_factory=lambda **k: _BoomStream(**k))
         bc = types.SimpleNamespace(get_input_device=lambda: None,
                                    _safe_close_stream=lambda s: None)
         with mock.patch.object(self.mod, "_bobert", return_value=bc), \
@@ -654,7 +707,7 @@ class RecordSecondsTests(unittest.TestCase):
             def close(self):
                 raise RuntimeError("close failed")
 
-        sd = _make_sd(rec_raises=True,
+        sd = _make_sd(
                       stream_factory=lambda **k: _GrumpyStream(**k))
         # No _safe_close_stream -> inline daemon-close path runs; both stop()
         # and close() raise and must be swallowed (finally never propagates).
@@ -695,7 +748,7 @@ class RecordSecondsTests(unittest.TestCase):
             def close(self):
                 pass
 
-        sd = _make_sd(rec_raises=True,
+        sd = _make_sd(
                       stream_factory=lambda **k: _SlowStream(**k))
         sd.stop = lambda: stopped_globally.__setitem__("called", True)
         bc = types.SimpleNamespace(get_input_device=lambda: None)
@@ -721,7 +774,7 @@ class RecordSecondsTests(unittest.TestCase):
         def _boom_close(_s):
             raise RuntimeError("safe-close blew up")
 
-        sd = _make_sd(rec_raises=True, stream_factory=_factory)
+        sd = _make_sd(stream_factory=_factory)
         bc = types.SimpleNamespace(get_input_device=lambda: None,
                                    _safe_close_stream=_boom_close)
         clock = iter([30.0, 30.0, 30.02, 9999.0, 9999.0, 9999.0])
@@ -742,7 +795,7 @@ class RecordSecondsTests(unittest.TestCase):
         def _factory(**k):
             return _FakeStream(callback=k["callback"], value=0.2, n_pushes=2)
 
-        sd = _make_sd(rec_raises=True, stream_factory=_factory)
+        sd = _make_sd(stream_factory=_factory)
         calls = []
         def _boom_stop():
             calls.append("stop")
@@ -761,33 +814,13 @@ class RecordSecondsTests(unittest.TestCase):
                          "the inline teardown's hung-close branch must not "
                          "touch the process-global sd API at all (H-3)")
 
-    # ── sd.rec returns an empty (size-0) buffer -> InputStream fallback ──
-    def test_sd_rec_empty_buffer_falls_to_inputstream(self):
-        def _factory(**k):
-            return _FakeStream(callback=k["callback"], value=0.2, n_pushes=2)
-
-        # rec returns a size-0 array: the `rec.size > 0` guard is False, so the
-        # code drops past sd.rec into the InputStream fallback (138->145).
-        sd = _make_sd(rec_result=np.zeros(0, dtype=np.float32),
-                      stream_factory=_factory)
-        bc = types.SimpleNamespace(get_input_device=lambda: None,
-                                   _safe_close_stream=lambda s: None)
-        clock = iter([50.0, 50.0, 50.02, 9999.0, 9999.0, 9999.0])
-        with mock.patch.object(self.mod, "_bobert", return_value=bc), \
-             inject_modules(sounddevice=sd), \
-             mock.patch.object(self.mod.time, "time",
-                               side_effect=lambda: next(clock)):
-            out = self.mod._record_seconds(0.25)
-        self.assertIsNotNone(out)
-        self.assertGreater(out.size, 0)
-
     # ── InputStream yields no frames -> returns None ─────────────────────
     def test_inputstream_no_frames_returns_none(self):
         def _factory(**k):
             # n_pushes=0 -> callback never fires -> chunks stays empty.
             return _FakeStream(callback=k["callback"], n_pushes=0)
 
-        sd = _make_sd(rec_raises=True, stream_factory=_factory)
+        sd = _make_sd(stream_factory=_factory)
         bc = types.SimpleNamespace(
             get_input_device=lambda: None,
             _safe_close_stream=lambda s: None)

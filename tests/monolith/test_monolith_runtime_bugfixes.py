@@ -2154,10 +2154,6 @@ class ActionAliasSpeakSetDriftTests(MonolithGlobalsTestCase):
     # out in tracked source; without teaching the scan about it, moving a name
     # there would look like the name went mute.
     _DECLARED_SPLITS = {
-        ("bobert_companion.py", "_act_read_changelog"):
-            "OPEN FINDING: 'recent_changes' is registered one line below three "
-            "routed aliases of the same handler and documented alongside them, "
-            "but is in neither speak set.",
         ("bobert_companion.py", "_act_web_search"):
             "'search' is a bare-verb alias of the informative 'web_search'; "
             "left unrouted deliberately so a naked 'search' does not force a "
@@ -2280,6 +2276,41 @@ class ActionAliasSpeakSetDriftTests(MonolithGlobalsTestCase):
                          self._DECLARED_SPLITS)
         self.assertNotIn(("skills/focus_mode.py", "focus_mode_on"),
                          self._DECLARED_SPLITS)
+
+    def test_recent_changes_is_no_longer_a_drifting_alias(self):
+        """2026-08-20 LOW finding: 'recent_changes' was the FOURTH alias of
+        _act_read_changelog and the only one in neither speak set, so a model
+        that reached for it spent an LLM summarisation call whose answer was
+        printed and dropped. Exactly the cancel_timer shape.
+
+        Both halves are asserted: the name is routed AND the ledger row that
+        tracked it as an open finding is gone (a stale row makes the ledger
+        stop meaning anything — the scan's own `stale` assertion enforces the
+        same thing from the other side)."""
+        self.assertIn("recent_changes", self.bc.SPEAK_RESULT_VERBATIM_ACTIONS)
+        # The family's other four aliases were already voiced on 2026-07-04;
+        # pin them so a future sweep cannot mute the group instead.
+        for sibling in ("read_changelog", "show_changelog",
+                        "what_changed", "whats_new"):
+            self.assertIn(sibling, self.bc.SPEAK_RESULT_VERBATIM_ACTIONS)
+        self.assertNotIn(("bobert_companion.py", "_act_read_changelog"),
+                         self._DECLARED_SPLITS)
+        # Disjointness is the other invariant this set has to keep.
+        self.assertNotIn("recent_changes", self.bc.INFORMATIVE_ACTIONS)
+
+    def test_smart_home_devices_pair_is_voiced(self):
+        """2026-08-20 LOW finding: core/smart_home_router.register() routes
+        smart_home_router_status but left smart_home_devices / smart_home_list
+        — bound to the same catalog-listing handler one line ABOVE it — in
+        neither speak set. They are deliberately absent from core/prompts.py,
+        but bobert's local-model cheat-sheet dumps every ACTIONS key by name,
+        so a local turn can emit them and the computed answer was dropped."""
+        for name in ("smart_home_devices", "smart_home_list"):
+            self.assertIn(name, self.bc.SPEAK_RESULT_VERBATIM_ACTIONS)
+            self.assertNotIn(name, self.bc.INFORMATIVE_ACTIONS)
+        # The sibling that WAS routed stays routed.
+        self.assertIn("smart_home_router_status",
+                      self.bc.SPEAK_RESULT_VERBATIM_ACTIONS)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2889,6 +2920,475 @@ class CameraReopenBackoffTests(MonolithGlobalsTestCase):
         self.assertIn("will reopen in {_backoff:.1f}s", block,
                       "the dead-camera line must report the backoff that was "
                       "armed, not a constant the code goes on to ignore")
+
+
+@requires_monolith
+class PlayStreamFenceTests(MonolithGlobalsTestCase):
+    """H-7 (2026-08-20) — the ABANDONED tts-reaper must be unreachable by the
+    NEXT sd.play().
+
+    H-3 deleted every EXPLICIT sd.stop() in the tree, but sd.play() calls it
+    IMPLICITLY: _CallbackContext.start_stream begins with `stop()`
+    (sounddevice.py:2663), and module-level stop() is
+    `_last_callback.stream.stop(...); _last_callback.stream.close(...)`
+    (sounddevice.py:414-418). _StreamBase.close runs Pa_CloseStream(self._ptr)
+    and only THEN nulls _ptr, with no lock.
+
+    So on the abandon path the caller's bounded wait expires while the reaper
+    is still inside Pa_CloseStream, _tts_playback_active is (correctly)
+    cleared, and the very next utterance's sd.play() would run a SECOND
+    Pa_CloseStream against that live handle from a second thread — the
+    0xc0000374 the single-toucher contract exists to prevent, reached through
+    the one path the contract explicitly accepts. _pa_close_pending cannot
+    cover this: it gates only the destructive reinit and must never deny
+    playback (a wedged close would otherwise mute JARVIS for the session).
+
+    The fence is ownership: the moment the stream is handed to the reaper it
+    leaves sounddevice's shared `_last_callback` slot.
+    """
+
+    class _Ctx:
+        """Stand-in for sounddevice's _CallbackContext — the only attribute
+        that matters here is `.stream`."""
+
+        def __init__(self, stream):
+            self.stream = stream
+
+    def _lipsync_ctx(self, fake_sd, robot=False):
+        bc = self.bc
+        layer = mock.Mock()
+        layer.is_muted.return_value = False     # exercise the REAL play path
+        return [
+            mock.patch.object(bc, "sd", fake_sd),
+            mock.patch.object(bc, "_tts_layer", layer),
+            mock.patch.object(bc, "_audio_ducker", mock.Mock()),
+            mock.patch.object(bc, "BARGE_IN_ENABLED", False),
+            mock.patch.object(bc, "ROBOT_ENABLED", robot),
+            mock.patch.object(bc, "send", mock.Mock()),
+            mock.patch.object(bc, "get_output_device", return_value=1),
+            mock.patch.object(bc, "_write_hud_state"),
+            mock.patch.object(bc, "_feed_playback_reference"),
+            mock.patch("builtins.print"),
+        ]
+
+    def _play(self, fake_sd, robot=False, extra=()):
+        import numpy as np
+        bc = self.bc
+        patches = self._lipsync_ctx(fake_sd, robot=robot) + list(extra)
+        for p in patches:
+            p.start()
+        try:
+            bc.play_with_lipsync(np.zeros(240, dtype=np.float32), 24000)
+        finally:
+            for p in patches:
+                p.stop()
+
+    # ---- the helper itself ----------------------------------------------
+    def test_detach_is_identity_checked(self):
+        bc = self.bc
+        mine, theirs = mock.Mock(name="mine"), mock.Mock(name="theirs")
+        fake_sd = mock.Mock()
+        fake_sd._last_callback = self._Ctx(theirs)
+        with mock.patch.object(bc, "sd", fake_sd):
+            self.assertFalse(bc._pa_detach_play_stream(mine),
+                             "a slot holding somebody else's context must be "
+                             "left alone — nulling it would strand THEIR "
+                             "stream, and ours is already unreachable")
+            self.assertIsInstance(fake_sd._last_callback, self._Ctx)
+            self.assertTrue(bc._pa_detach_play_stream(theirs))
+            self.assertIsNone(fake_sd._last_callback)
+            # Idempotent + total: an empty slot, and a None stream.
+            self.assertFalse(bc._pa_detach_play_stream(theirs))
+            self.assertFalse(bc._pa_detach_play_stream(None))
+
+    def test_detach_never_raises_on_a_sounddevice_without_the_global(self):
+        import types
+        bc = self.bc
+        with mock.patch.object(bc, "sd", types.SimpleNamespace()):
+            self.assertFalse(bc._pa_detach_play_stream(mock.Mock()))
+
+    # ---- wired into both playback branches -------------------------------
+    def test_healthy_playback_detaches_the_handed_over_stream(self):
+        bc = self.bc
+        stream = mock.Mock()
+        stream.active = False          # the real reaper finishes immediately
+        fake_sd = mock.Mock()
+        fake_sd.get_stream.return_value = stream
+        fake_sd._last_callback = self._Ctx(stream)
+        self._play(fake_sd)
+        self.assertIsNone(fake_sd._last_callback,
+                          "the reaper owns this stream now — it must not stay "
+                          "reachable through sounddevice's shared slot")
+        self.assertFalse(bc._tts_playback_active[0])
+
+    def test_robot_branch_detaches_too(self):
+        # The robot twin is a deliberate SHARED body; a stale duplicate here
+        # would leave that path with the double-close the other path just lost.
+        bc = self.bc
+        stream = mock.Mock()
+        stream.active = False
+        fake_sd = mock.Mock()
+        fake_sd.get_stream.return_value = stream
+        fake_sd._last_callback = self._Ctx(stream)
+        self._play(fake_sd, robot=True)
+        self.assertIsNone(fake_sd._last_callback)
+        self.assertFalse(bc._tts_playback_active[0])
+
+    def test_a_foreign_slot_is_left_alone_by_playback(self):
+        # NEGATIVE CONTROL: play_with_lipsync must not blindly clear the slot.
+        # If something else published a context between the play and the
+        # handoff, nulling it would strand that stream instead of ours.
+        stream = mock.Mock()
+        stream.active = False
+        foreign = self._Ctx(mock.Mock(name="somebody-elses-stream"))
+        fake_sd = mock.Mock()
+        fake_sd.get_stream.return_value = stream
+        fake_sd._last_callback = foreign
+        self._play(fake_sd)
+        self.assertIs(fake_sd._last_callback, foreign)
+
+    def test_abandoned_reaper_stream_is_unreachable_from_the_next_play(self):
+        """THE CRITICAL PATH. A wedged reaper is abandoned; the stream it is
+        still closing must no longer be in `_last_callback`, or the next
+        utterance's sd.play() runs a second Pa_CloseStream on it."""
+        bc = self.bc
+        release = threading.Event()
+        self.addCleanup(release.set)
+        entered = threading.Event()
+
+        def _wedged_reaper(stream, done_evt, audio_secs):
+            entered.set()
+            release.wait(15.0)
+            bc._pa_close_done()
+            done_evt.set()
+
+        _RealEvent = threading.Event
+
+        class _NoLongWaitEvent(_RealEvent):
+            def wait(self, timeout=None):
+                if timeout is not None and timeout > 1.0:
+                    return _RealEvent.wait(self, 0.05)
+                return _RealEvent.wait(self, timeout)
+
+        stream = mock.Mock()
+        fake_sd = mock.Mock()
+        fake_sd.get_stream.return_value = stream
+        fake_sd._last_callback = self._Ctx(stream)
+        self._play(fake_sd, extra=[
+            mock.patch.object(bc, "_reap_playback", side_effect=_wedged_reaper),
+            mock.patch.object(bc.threading, "Event", _NoLongWaitEvent),
+        ])
+
+        self.assertTrue(entered.wait(5.0), "the reaper must have started")
+        self.assertIsNone(fake_sd._last_callback,
+                          "an ABANDONED reaper's stream must be unreachable "
+                          "from the next sd.play()'s implicit stop() — that "
+                          "is the double Pa_CloseStream (0xc0000374)")
+        # The H-6 guarantees still hold, unchanged.
+        self.assertFalse(bc._tts_playback_active[0])
+        self.assertEqual(bc._pa_close_pending[0], 1)
+        release.set()
+        end = time.monotonic() + 5.0
+        while time.monotonic() < end and bc._pa_close_pending[0]:
+            time.sleep(0.01)
+        self.assertEqual(bc._pa_close_pending[0], 0)
+
+    def test_detach_is_ordered_after_the_close_handoff(self):
+        """Ordering is load-bearing: _pa_close_handoff RE-RAISES when the
+        daemon cannot be started, and a stream nobody reaps must stay
+        reachable so the next sd.play()'s implicit stop() still frees it."""
+        bc = self.bc
+        stream = mock.Mock()
+        stream.active = False
+        fake_sd = mock.Mock()
+        fake_sd.get_stream.return_value = stream
+        fake_sd._last_callback = self._Ctx(stream)
+
+        def _cannot_start(_t):
+            raise RuntimeError("can't start new thread")
+
+        with self.assertRaises(RuntimeError):
+            self._play(fake_sd, extra=[
+                mock.patch.object(bc, "_pa_close_handoff",
+                                  side_effect=_cannot_start)])
+        self.assertIsInstance(fake_sd._last_callback, self._Ctx,
+                              "no reaper was started, so the stream must stay "
+                              "reachable for the implicit reap")
+        self.assertFalse(bc._tts_playback_active[0],
+                         "the owner flag must still be released")
+
+
+@requires_monolith
+class RecordSpeechFlagUnconditionalReleaseTests(MonolithGlobalsTestCase):
+    """H-8 (2026-08-20) — record_speech's finally must clear
+    _record_speech_active even when the stream close RAISES.
+
+    _safe_close_stream now routes through _pa_close_handoff, which
+    deliberately re-raises when the close daemon cannot be started
+    ("RuntimeError: can't start new thread" — the thread exhaustion this
+    codebase already treats as a live hazard). The two statements used to sit
+    side by side in one finally, so that raise skipped the flag clear and
+    _record_speech_active stayed True for the life of the process: no further
+    PortAudio re-enumeration (hotplug and follow-the-default dead), every
+    get_mic_buffer Path-B claim refused (speaker-ID, enrolment, standby audio
+    silently None forever) and the self-diagnostic reporting the mic
+    permanently owned. get_mic_buffer Path B already had the nested shape;
+    this copy did not."""
+
+    class _FakeStream:
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def close(self):
+            pass
+
+    def setUp(self):
+        bc = self.bc
+        self._patches = [
+            mock.patch.object(bc, "_mic_input_disabled", return_value=False),
+            mock.patch.object(bc, "get_input_device", return_value=0),
+            mock.patch.object(bc.sd, "InputStream", self._FakeStream),
+            mock.patch("builtins.print"),
+        ]
+        for p in self._patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.addCleanup(bc._watchdog_reset_signal.clear)
+
+    def test_flag_is_cleared_even_when_the_close_raises(self):
+        bc = self.bc
+        bc._watchdog_reset_signal.set()      # bail out of the capture loop
+        with mock.patch.object(bc, "_safe_close_stream",
+                               side_effect=RuntimeError(
+                                   "can't start new thread")):
+            with self.assertRaises(RuntimeError):
+                bc.record_speech(timeout=0.0)
+        self.assertFalse(bc._record_speech_active[0],
+                         "a raising close must NOT leave the mic-ownership "
+                         "flag stuck True — four subsystems read it as truth")
+
+    def test_normal_teardown_still_clears_the_flag(self):
+        # Negative control: the ordinary path is unchanged (close first, then
+        # release — the flag must cover the stream's whole native lifetime).
+        bc = self.bc
+        order = []
+        bc._watchdog_reset_signal.set()
+        with mock.patch.object(
+                bc, "_safe_close_stream",
+                side_effect=lambda *_a, **_k: order.append(
+                    ("close", bc._record_speech_active[0]))):
+            bc.record_speech(timeout=0.0)
+        self.assertEqual(order, [("close", True)],
+                         "close must run while ownership is still published")
+        self.assertFalse(bc._record_speech_active[0])
+
+
+@requires_monolith
+class Pyttsx3InflightStartFailureTests(MonolithGlobalsTestCase):
+    """LOW (2026-08-20) — the pyttsx3 single-flight claim is made on the
+    CALLER's thread but released only inside the worker, so a Thread.start()
+    that raises left the claim set forever: every later edge-tts failure
+    printed "pyttsx3 worker still in flight from a prior timeout" — a false
+    statement about a worker that never existed — and skipped the rung."""
+
+    def _fake_pyttsx3(self):
+        return mock.Mock()
+
+    def test_start_failure_releases_the_claim_and_falls_through_to_sapi5(self):
+        bc = self.bc
+        self.assertFalse(bc._pyttsx3_inflight[0])
+        sentinel = ("audio", 22050)
+        with mock.patch.dict(bc.sys.modules,
+                             {"pyttsx3": self._fake_pyttsx3()}),                 mock.patch.object(bc.threading, "Thread") as thread_cls,                 mock.patch.object(bc, "_try_sapi5_then_silence",
+                                  return_value=sentinel) as sapi,                 mock.patch("builtins.print"):
+            thread_cls.return_value.start.side_effect = RuntimeError(
+                "can't start new thread")
+            out = bc._pyttsx3_tts("hello")
+        self.assertEqual(out, sentinel, "the rung must degrade, not raise — "
+                                       "site 2 of 2 turns a raise into silence")
+        sapi.assert_called_once()
+        self.assertFalse(bc._pyttsx3_inflight[0],
+                         "a claim with no worker to retire it disables the "
+                         "pyttsx3 rung for the whole session")
+
+    def test_a_started_worker_still_owns_the_release(self):
+        # Negative control: the claim must NOT be released by the caller on the
+        # normal path — the worker's finally owns it, which is what makes the
+        # guard survive an ABANDONED (timed-out) worker.
+        bc = self.bc
+        started = threading.Event()
+        with mock.patch.dict(bc.sys.modules,
+                             {"pyttsx3": self._fake_pyttsx3()}),                 mock.patch.object(bc.threading, "Thread") as thread_cls,                 mock.patch.object(bc, "_try_sapi5_then_silence",
+                                  return_value=("x", 1)),                 mock.patch("builtins.print"):
+            t = thread_cls.return_value
+            t.start.side_effect = started.set
+            t.is_alive.return_value = True          # models the timeout path
+            bc._pyttsx3_tts("hello")
+        self.assertTrue(started.is_set())
+        self.assertTrue(bc._pyttsx3_inflight[0],
+                        "an abandoned-but-live worker keeps the claim")
+        bc._pyttsx3_inflight[0] = False
+
+
+@requires_monolith
+class FollowTheDefaultResponsivenessTests(MonolithGlobalsTestCase):
+    """HIGH behaviour (2026-08-20) — a Stream Deck press must move JARVIS's
+    audio within one DEVICE_CHECK_INTERVAL, not one DEVICE_REENUM_INTERVAL.
+
+    The owner selects his mic and speakers by moving the WINDOWS DEFAULT.
+    Nothing PortAudio exposes can see that: sd.query_devices() (hence
+    _devices_signature) is the table PortAudio freezes until the very reinit
+    the signature gate blocks, and sd.default.device reads
+    Pa_GetDefaultInput/OutputDevice — a struct field the host API fills in once
+    inside Pa_Initialize. So the ONLY thing that ever picked a press up was the
+    300 s DEVICE_REENUM_INTERVAL sweep: up to five minutes of capturing from
+    the old mic and replying through the old speakers, then announcing the
+    switch minutes late, with no voice action able to force it sooner (the only
+    force=True caller is get_current_mic_name()).
+
+    _win_default_endpoints() answers LIVE (Windows' own MMDevice API — the same
+    COM interface audio/audio_switch.py uses to SET the default), so a moved
+    endpoint now forces the re-enumeration on the next 4 s pass. Pure hotplug
+    keeps the 300 s ceiling, and a host without the MMDevice API degrades to
+    exactly the old behaviour."""
+
+    RENDER_A, RENDER_B = "{0.0.0.}.{spk-A}", "{0.0.0.}.{spk-B}"
+    CAPTURE_A, CAPTURE_B = "{0.0.1.}.{mic-A}", "{0.0.1.}.{mic-B}"
+
+    def _run_pass(self, endpoints, *, owners_busy=False, sig=("stable",)):
+        """One _refresh_devices pass with an UNCHANGED device signature and the
+        300 s sweep NOT due — so the only thing that can trigger a reinit is
+        the endpoint poll. Returns (terminate_called, printed)."""
+        bc = self.bc
+        printed = []
+        terminated = {"n": 0}
+        patches = [
+            mock.patch.object(bc.sd, "_terminate",
+                              side_effect=lambda: terminated.__setitem__(
+                                  "n", terminated["n"] + 1)),
+            mock.patch.object(bc.sd, "_initialize"),
+            mock.patch.object(bc.sd, "query_devices",
+                              return_value={"name": "FakeMic"}),
+            mock.patch.object(bc, "_devices_signature", return_value=sig),
+            mock.patch.object(bc, "_pick_device",
+                              return_value=(None, "")),
+            mock.patch.object(bc, "_default_device_identity",
+                              return_value=(1, "FakeMic")),
+            mock.patch.object(bc, "_win_default_endpoints",
+                              return_value=endpoints),
+            mock.patch.object(bc, "MICROPHONE_INDEX", None),
+            mock.patch.object(bc, "SPEAKER_INDEX", None),
+            mock.patch.object(bc, "_record_speech_active", [owners_busy]),
+            mock.patch.object(bc, "_enqueue_device_announcement", mock.Mock()),
+            mock.patch("builtins.print",
+                       side_effect=lambda *a, **k: printed.append(
+                           " ".join(str(x) for x in a))),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            bc._device_cache["checked_at"] = 0.0
+            bc._device_cache["last_devices_signature"] = sig
+            bc._device_cache["last_reenum_at"] = time.time()   # sweep NOT due
+            bc._refresh_devices()
+        finally:
+            for p in patches:
+                p.stop()
+        return terminated["n"], printed
+
+    def setUp(self):
+        self.bc._device_cache["last_default_endpoints"] = None
+
+    def test_first_poll_is_a_baseline_not_a_switch(self):
+        n, printed = self._run_pass((self.RENDER_A, self.CAPTURE_A))
+        self.assertEqual(n, 0, "the first observation of the session is a "
+                               "baseline — announcing/re-enumerating on it "
+                               "would fire on every boot")
+        self.assertEqual(
+            self.bc._device_cache["last_default_endpoints"],
+            (self.RENDER_A, self.CAPTURE_A))
+
+    def test_moved_default_forces_a_reenumeration_on_the_next_pass(self):
+        self._run_pass((self.RENDER_A, self.CAPTURE_A))          # baseline
+        n, printed = self._run_pass((self.RENDER_B, self.CAPTURE_B))
+        self.assertEqual(n, 1, "a moved Windows default must re-enumerate "
+                               "PortAudio on the NEXT 4 s pass — that is the "
+                               "only way sd.default.device can see the move")
+        self.assertIn("Windows default audio endpoint moved",
+                      "\n".join(printed))
+        self.assertEqual(
+            self.bc._device_cache["last_default_endpoints"],
+            (self.RENDER_B, self.CAPTURE_B),
+            "the baseline rebases after a SUCCESSFUL re-enumeration")
+
+    def test_unchanged_default_does_not_re_enumerate(self):
+        # NEGATIVE CONTROL: the trigger is the endpoint CHANGE, not the pass.
+        # Without this the fix would just be "reinit every 4 s" — the constant
+        # destructive teardown churn DEVICE_REENUM_INTERVAL exists to avoid.
+        self._run_pass((self.RENDER_A, self.CAPTURE_A))
+        n, _ = self._run_pass((self.RENDER_A, self.CAPTURE_A))
+        self.assertEqual(n, 0)
+
+    def test_no_mmdevice_api_degrades_to_the_old_behaviour(self):
+        # NEGATIVE CONTROL: (None, None) is "unavailable", not "moved".
+        n, _ = self._run_pass((None, None))
+        self.assertEqual(n, 0)
+        n, _ = self._run_pass((None, None))
+        self.assertEqual(n, 0)
+        self.assertIsNone(self.bc._device_cache["last_default_endpoints"])
+
+    def test_a_live_mic_defers_the_trigger_without_forgetting_it(self):
+        """The press must not be dropped, and must not churn either: while an
+        owner holds a stream the trigger is not asserted at all (the gate would
+        deny it anyway, and pausing the wake-word stream for a guaranteed
+        deferral is pure churn on an un-retryable resume) — but the baseline is
+        NOT rebased, so the very next idle pass still follows the press."""
+        self._run_pass((self.RENDER_A, self.CAPTURE_A))          # baseline
+        n, printed = self._run_pass((self.RENDER_B, self.CAPTURE_B),
+                                    owners_busy=True)
+        self.assertEqual(n, 0, "no reinit while a mic stream is live")
+        self.assertNotIn("Windows default audio endpoint moved",
+                         "\n".join(printed))
+        self.assertEqual(
+            self.bc._device_cache["last_default_endpoints"],
+            (self.RENDER_A, self.CAPTURE_A),
+            "rebasing here would FORGET the press — the 300 s lag returns")
+        n, _ = self._run_pass((self.RENDER_B, self.CAPTURE_B))
+        self.assertEqual(n, 1, "the next idle pass must follow the press")
+
+    def test_endpoint_poll_failures_disable_themselves_and_never_raise(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_win_endpoint_enumerator",
+                               return_value=None):
+            self.assertEqual(bc._win_default_endpoints(), (None, None))
+        boom = mock.Mock()
+        boom.GetDefaultAudioEndpoint.side_effect = OSError("COM is having a day")
+        with mock.patch.object(bc, "_win_endpoint_enumerator",
+                               return_value=boom):
+            self.assertEqual(bc._win_default_endpoints(), (None, None))
+        # A per-call failure must NOT burn the sticky setup budget: 12 s with
+        # no audio hardware would otherwise kill the feature until restart.
+        self.assertEqual(bc._win_endpoint_setup_fails[0], 0)
+
+    def test_setup_failures_are_sticky(self):
+        bc = self.bc
+        with mock.patch.object(bc, "_win_endpoint_tls", threading.local()):
+            with mock.patch.dict(bc.sys.modules, {"comtypes": None}), \
+                    mock.patch("builtins.print"):
+                for _ in range(bc._WIN_ENDPOINT_MAX_SETUP_FAILS):
+                    self.assertIsNone(bc._win_endpoint_enumerator())
+            self.assertGreaterEqual(bc._win_endpoint_setup_fails[0],
+                                    bc._WIN_ENDPOINT_MAX_SETUP_FAILS)
+            # Sticky: no further import attempts, so this is free forever.
+            with mock.patch.dict(bc.sys.modules, {"comtypes": None}):
+                self.assertIsNone(bc._win_endpoint_enumerator())
+        bc._win_endpoint_setup_fails[0] = 0
 
 if __name__ == "__main__":
     unittest.main()

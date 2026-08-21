@@ -28,6 +28,7 @@ numpy aren't importable — only the HUD animation + spoken line will run.
 import datetime as _dt
 import math
 import os
+import sys
 import time
 
 # Animation length (seconds) — the HUD shows the rings filling for this long
@@ -59,6 +60,29 @@ DEFAULT_STING_PATH = os.path.join(_PROJECT_DIR, "data", "iron_man_boot.wav")
 # the buffer becomes GC-eligible while PortAudio is still copying from it
 # (0xc0000374 heap corruption on Windows).
 _LAST_STING_BUF = None
+
+# True while the sting holds bobert's _tts_playback_active claim (2026-08-20).
+_STING_CLAIMED = [False]
+
+
+def _sting_host():
+    """bobert_companion, but ONLY if it is already imported AND exposes the
+    PortAudio teardown gate. Returns None otherwise.
+
+    Deliberately a sys.modules LOOKUP, never an import: this module is
+    self-contained by design (callers pass speak_fn / write_hud_state in), and
+    a stand-alone run or a unit test must keep working with no monolith at all.
+    """
+    bc = sys.modules.get("bobert_companion")
+    if bc is None:
+        return None
+    for name in ("_pa_claim_owner", "_pa_release_owner"):
+        if not callable(getattr(bc, name, None)):
+            return None
+    cell = getattr(bc, "_tts_playback_active", None)
+    if not isinstance(cell, list) or not cell:
+        return None
+    return bc
 
 
 def _time_of_day_phrase(now: _dt.datetime | None = None) -> str:
@@ -155,6 +179,36 @@ def _play_sting_async(audio, sample_rate: int,
     drives the same output device the TTS path uses, so the sting and the
     spoken line come out the same speakers."""
     global _LAST_STING_BUF
+    # TEARDOWN-GATE CLAIM (2026-08-20). sd.play() opens a live OutputStream
+    # with a running PortAudio callback and publishes it into sounddevice's
+    # module-global `_last_callback`. This claimed NOTHING, so for the whole
+    # 1.5 s sting bobert's owner flags all read clear — and boot is exactly
+    # when the wake listener, the ambient workers, the diagnostic daemons and
+    # the face tracker all start calling get_input_device()/get_output_device().
+    # The first of those runs _refresh_devices against a first-pass (None)
+    # baseline, sees drift, finds no owner and no pending close, and runs
+    # sd._terminate()/sd._initialize() with the sting's callback thread LIVE:
+    # the 0xc0000374 heap corruption the whole gate exists to prevent, at the
+    # worst possible moment (no traceback, watchdog sees a vanished process).
+    # The buffer-lifetime half of this hazard was already fixed (_LAST_STING_BUF
+    # + the full-duration sleep); this is the PortAudio-teardown half.
+    #
+    # _tts_playback_active is the right cell: this IS TTS-side playback, and it
+    # is already in BOTH places the gate reads (_pa_streams_live and
+    # _refresh_devices' inline deny chain) — a new dedicated cell added to only
+    # one of those would change nothing at all.
+    bc = _sting_host()
+    claimed = False
+    if bc is not None:
+        try:
+            if not bc._pa_claim_owner(bc._tts_playback_active, timeout=1.0):
+                print("  [iron_man_boot] PortAudio reinit in flight — "
+                      "skipping the sting rather than opening a stream into "
+                      "a live teardown")
+                return False
+            claimed = True
+        except Exception:
+            claimed = False        # older monolith / test double: old behaviour
     try:
         import sounddevice as sd
         kwargs = {"samplerate": sample_rate}
@@ -164,10 +218,68 @@ def _play_sting_async(audio, sample_rate: int,
         # numpy array can't be reclaimed mid-playback if the caller returns.
         _LAST_STING_BUF = audio
         sd.play(audio, **kwargs)
-        return True
     except Exception as e:
         print(f"  [iron_man_boot] sting playback failed: {e}")
+        if claimed:
+            try:
+                bc._pa_release_owner(bc._tts_playback_active)
+            except Exception:
+                pass
         return False
+    _STING_CLAIMED[0] = claimed
+    return True
+
+
+def _finish_sting() -> None:
+    """Close the sting's playback stream and drop the gate claim. Never raises.
+
+    The sting used to be the one PortAudio stream nobody ever closed: sd.play()
+    is non-blocking, _play_sting_async returned immediately, no reaper was
+    attached, and the handle simply stayed open until the NEXT sd.play()'s
+    internal stop() happened to reap it. Close it here instead, on the same
+    thread that waited out its full duration, and in the same order the
+    monolith's playback path uses: close FIRST, then detach from sounddevice's
+    shared `_last_callback` slot (so no later sd.play() can stop+close it a
+    second time — H-7), then release the owner claim LAST, so the flag covers
+    the stream's whole native lifetime."""
+    claimed = _STING_CLAIMED[0]
+    _STING_CLAIMED[0] = False
+    bc = _sting_host()
+    try:
+        try:
+            import sounddevice as sd
+            stream = sd.get_stream()
+        except Exception:
+            stream = None
+        if stream is not None:
+            closed = False
+            closer = getattr(bc, "_safe_close_stream", None) if bc else None
+            if callable(closer):
+                # Bounded, daemon-threaded, and it registers an abandoned close
+                # with the teardown gate — all three matter here.
+                closer(stream)
+                closed = True
+            else:
+                try:
+                    stream.stop()
+                except Exception:
+                    pass
+                try:
+                    stream.close()
+                    closed = True
+                except Exception:
+                    pass
+            detach = getattr(bc, "_pa_detach_play_stream", None) if bc else None
+            if closed and callable(detach):
+                detach(stream)
+    except Exception as e:
+        print(f"  [iron_man_boot] sting teardown failed: {e}")
+    finally:
+        if claimed and bc is not None:
+            try:
+                bc._pa_release_owner(bc._tts_playback_active)
+            except Exception:
+                pass
 
 
 def _load_sting_from_disk(path: str):
@@ -262,6 +374,11 @@ def play_iron_man_boot(speak_fn,
             time.sleep(STING_DURATION_SECONDS)
         except Exception:
             pass
+        # PortAudio is done with the buffer now — close the stream and drop the
+        # gate claim BEFORE speak_fn opens its own playback stream. Always
+        # called, even when the sting failed to start: _finish_sting is a
+        # no-op with nothing to close and nothing claimed.
+        _finish_sting()
 
     # ── 4. Speak the single boot line. _speak() handles set_state /
     #       lip-sync / pending-speech queueing inside the host process.

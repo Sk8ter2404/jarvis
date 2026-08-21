@@ -50,13 +50,27 @@ WHAT IS INTERCEPTED
 WHAT IS DELIBERATELY *NOT* INTERCEPTED
 --------------------------------------
 * Non-browser subprocess commands — see ``_browser_in_command``.
-* Process-management tools that merely NAME a browser (``taskkill /IM
-  chrome.exe``, ``tasklist``, ``pkill firefox``, ``wmic``, …). Those close or
-  count windows; they never open one, and blocking them would break the
-  monolith's "reuse one media window" logic. See ``_PROCESS_TOOLS``.
-* ``xdg-open`` / ``explorer <url>`` / ``start`` as argv[0]. Too broad to block
-  wholesale — but note a command line like ``cmd /c start chrome <url>`` IS
-  caught, because ``chrome`` appears as a token.
+* READ-ONLY process tools that merely NAME a browser (``tasklist``, ``wmic``,
+  ``pgrep``, ``where``, ``reg query``, …). Those count or filter; they cannot
+  open a window and cannot close one. See ``_PROCESS_TOOLS``.
+
+  The KILL verbs are NOT in that exemption (they were until 2026-08-20, on a
+  justification — "``taskkill /IM chrome.exe`` is how the monolith reuses a
+  single media window" — that does not exist anywhere in the tree). A kill verb
+  aimed at a browser image is blocked and recorded; aimed at anything else
+  (``taskkill /IM ollama.exe``, ``taskkill /F /T /PID n``) it passes straight
+  through.
+* ``explorer <folder>`` / ``start <folder>``. A shell launcher only counts as a
+  browser launch when a URL-shaped argument is on the same command line —
+  ``start <url>`` / ``explorer <url>`` / ``rundll32 url.dll,FileProtocolHandler
+  <url>`` all open the DEFAULT browser without naming one, and those ARE
+  blocked.
+
+Note a command line like ``cmd /c start chrome <url>`` is caught in every
+spelling: the argument after a ``-c`` / ``-Command`` / ``/c`` switch is
+re-tokenised, so the browser name is found whether the caller passed it as one
+string, as a fully split list, or as the ``powershell -Command "…"`` form
+everything real actually uses.
 
 COMPATIBILITY WITH ``mock.patch`` (load-bearing)
 -----------------------------------------------
@@ -133,21 +147,57 @@ _BROWSER_BINARIES = frozenset({
     "iexplore.exe", "safari",
 })
 
-# Commands that merely NAME a browser without launching one. If one of these is
-# argv[0] the whole command line is exempt — otherwise `taskkill /IM chrome.exe`
-# (how the monolith reuses a single media window instead of stacking tabs) would
-# be blocked, which is both wrong and a behaviour change.
+# READ-ONLY process tools. They enumerate, filter or query; they cannot open a
+# window and they cannot close one. If one of these is argv[0] the whole command
+# line is exempt, which costs nothing.
+#
+# THE KILL VERBS USED TO BE IN HERE (removed 2026-08-20). The comment justifying
+# that said `taskkill /IM chrome.exe` is "how the monolith reuses a single media
+# window instead of stacking tabs" — and no such call site exists. Every
+# `taskkill /IM` in core/, skills/, tools/, bobert_companion.py, tray.py and
+# hud/ is `_reap_wedged_ollama`, whose images are ollama.exe / llama-server.exe
+# / "ollama app.exe"; window reuse is done with pygetwindow's w.close() in
+# `_close_browser_windows_matching`. So the exemption bought nothing and cost an
+# unbounded hole: one `taskkill /IM chrome.exe /F` from a test closes every
+# Chrome window the owner has open — losing his tabs, which is strictly worse
+# than the tab-spam incident this guard was written for.
 _PROCESS_TOOLS = frozenset({
-    "taskkill.exe", "taskkill", "tasklist.exe", "tasklist",
-    "pkill", "killall", "kill", "ps", "pgrep",
+    "tasklist.exe", "tasklist", "ps", "pgrep",
     "wmic.exe", "wmic", "sc.exe", "sc", "qprocess",
     "findstr.exe", "findstr", "grep", "where.exe", "where", "which",
     "reg.exe", "reg", "query",
 })
 
+# Kill verbs: deliberately NOT exempt. They stay inside the browser scan, so
+# `taskkill /F /IM chrome.exe` / `pkill firefox` are blocked and recorded while
+# `taskkill /IM ollama.exe` and `taskkill /F /T /PID <n>` (the repo's only real
+# users) pass straight through, untouched.
+_KILL_TOOLS = frozenset({
+    "taskkill.exe", "taskkill", "pkill", "killall", "kill",
+})
+
+# Commands that hand a URL to the DEFAULT browser without ever naming one, so
+# the binary scan cannot see them. Only a launch: a URL-shaped argument has to
+# be present too, which is what keeps `explorer <folder>` and `curl <url>` out.
+_URL_LAUNCHERS = frozenset({
+    "start", "start.exe", "explorer", "explorer.exe",
+    "xdg-open", "gio", "gnome-open", "kde-open", "open",
+    "rundll32", "rundll32.exe",
+})
+
+_URL_RE = re.compile(r'^["\']?(?:https?|ftp)://', re.IGNORECASE)
+
 # Tokeniser for a shell=True string command line: a double-quoted run, a
 # single-quoted run, or a bare whitespace-free run.
 _TOKEN_RE = re.compile(r'"[^"]*"|\'[^\']*\'|\S+')
+
+# Switches whose NEXT argv element is a whole command LINE, not a path. ONLY an
+# element that follows one of these gets re-tokenised — that discriminator is
+# what keeps a claude PROMPT that happens to say "chrome" from being blocked
+# while `powershell -Command "Start-Process chrome <url>"` is caught.
+_CMDLINE_SWITCHES = frozenset({
+    "-c", "--command", "-command", "/c", "/k", "-e", "-ec", "-encodedcommand",
+})
 
 _THIS_FILE = os.path.normcase(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -312,13 +362,31 @@ def _binary_name(token: typing.Any) -> str:
 def _command_tokens(args: typing.Any) -> list[str]:
     """Flatten a Popen ``args`` into the tokens to inspect.
 
-    A sequence is already tokenised — each element is one token, and splitting
-    it again would shred ``C:\\Program Files\\...`` into fragments. A bare
-    string is a shell command line, so it gets the quote-aware split.
+    A bare string is a shell command line and gets the quote-aware split. A
+    sequence is already tokenised — each element is one token — EXCEPT that one
+    element can itself be a whole command LINE, which is the shape every real
+    shell-mediated launch takes: ``powershell -Command "Start-Process chrome
+    <url>"``, ``cmd /c "start chrome <url>"``, ``bash -c "google-chrome <url>"``.
+    Those were invisible to the guard (2026-08-20 review), while the docstring
+    asserted ``cmd /c start chrome <url>`` was caught — true only of the fully
+    split list form nobody actually writes.
+
+    Such an element is split too, but ONLY when it follows a command-line
+    switch. That is the discriminator: it re-tokenises the argument that IS a
+    command line without shredding a plain positional argument, so
+    tools/multi_agent_pipeline.py's multi-line claude prompts (which mention
+    browsers and boot scripts in prose) stay out of the scan.
     """
     try:
         if isinstance(args, (list, tuple)):
-            return [str(item) for item in args if item is not None]
+            elements = [str(item) for item in args if item is not None]
+            tokens = list(elements)
+            prev = ""
+            for item in elements:
+                if prev in _CMDLINE_SWITCHES and item:
+                    tokens.extend(m.group(0) for m in _TOKEN_RE.finditer(item))
+                prev = item.strip().strip('"').strip("'").lower()
+            return tokens
         try:
             args = os.fspath(args)
         except TypeError:
@@ -332,21 +400,39 @@ def _command_tokens(args: typing.Any) -> list[str]:
         return []
 
 
+def _looks_like_url(token: typing.Any) -> bool:
+    try:
+        return bool(_URL_RE.match(str(token).strip()))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _browser_in_command(args: typing.Any) -> str | None:
     """Return the offending token if this command would open a browser.
 
     Surgical by construction: it returns None for everything that is not a
-    browser binary, so a non-browser subprocess call is delegated to the real
+    browser launch, so a non-browser subprocess call is delegated to the real
     function with its arguments untouched.
     """
     tokens = _command_tokens(args)
     if not tokens:
         return None
     if _binary_name(tokens[0]) in _PROCESS_TOOLS:
-        return None  # taskkill/tasklist/pkill name a browser, never launch one
+        return None  # tasklist/wmic/pgrep name a browser, never touch a window
     for token in tokens:
-        if _binary_name(token) in _BROWSER_BINARIES:
+        name = _binary_name(token)
+        if name in _BROWSER_BINARIES:
             return token
+        if name in _KILL_TOOLS:
+            continue     # the kill verb itself is fine; its TARGET is scanned
+    # ``start <url>`` / ``explorer <url>`` / ``rundll32 url.dll,… <url>`` open
+    # the DEFAULT browser without naming one. A launcher alone is not enough
+    # (``explorer C:\JARVIS\logs`` is a folder), and a URL alone is not either
+    # (``curl <url>``) — it takes both.
+    if any(_binary_name(t) in _URL_LAUNCHERS for t in tokens):
+        for token in tokens:
+            if _looks_like_url(token):
+                return token
     return None
 
 
@@ -450,11 +536,54 @@ def _allowed(env: dict | None = None) -> bool:
     return str(raw).strip().lower() in _ALLOW_WORDS
 
 
+def _marked(obj: typing.Any) -> bool:
+    """True iff OUR stub is ``obj`` or sits somewhere in its wrapper chain.
+
+    Two hardenings over a bare ``getattr``, both of which bit for real:
+
+    * ``object.__getattribute__`` — a ``MagicMock`` fabricates an attribute for
+      every name, so ``getattr(mock, _GUARD_MARK, False)`` is truthy and a stub
+      replaced by a mock would report itself still in place.
+    * a ``__wrapped__`` walk — ``tests/live_data_guard.py`` wraps ``os.startfile``
+      too, and a sibling guard sitting on top of our stub is cooperation, not
+      displacement. Without this, two correct guards read as one broken one and
+      ``_repair()`` would re-wrap on every call.
+
+    Classes get an MRO scan, because ``object.__getattribute__`` on a class does
+    not search its bases (``subprocess.Popen`` is a class).
+    """
+    if isinstance(obj, type):
+        try:
+            return any(k.__dict__.get(_GUARD_MARK) is True for k in obj.__mro__)
+        except Exception:  # noqa: BLE001
+            return False
+    depth = 0
+    while obj is not None and depth < 12:
+        depth += 1
+        try:
+            if object.__getattribute__(obj, _GUARD_MARK) is True:
+                return True
+        except Exception:  # noqa: BLE001 - not our stub (or a mock)
+            pass
+        try:
+            nxt = object.__getattribute__(obj, "__wrapped__")
+        except Exception:  # noqa: BLE001 - the chain ends here
+            return False
+        if nxt is obj:
+            return False
+        obj = nxt
+    return False
+
+
 def _swap(module, name: str, replacement, original) -> typing.Callable[[], None] | None:
     """Replace ``module.name`` with ``replacement``, returning an undo callable
     (or None if the assignment did not take). Never raises."""
     try:
         setattr(replacement, _GUARD_MARK, True)
+        # Record what we wrapped so a SIBLING guard's marker check can look
+        # through us, and ours through it. See _marked().
+        if not isinstance(replacement, type):
+            replacement.__wrapped__ = original
     except Exception:  # noqa: BLE001 - an immutable replacement; only a marker
         pass
     try:
@@ -463,6 +592,34 @@ def _swap(module, name: str, replacement, original) -> typing.Callable[[], None]
         return None
 
     def _undo() -> None:
+        """Put ``original`` back — but ONLY while WE still own the attribute.
+
+        MEASURED 2026-08-20. ``tests/live_data_guard.py`` also wraps
+        ``os.startfile``, and which of the two ends up on top is decided by
+        install order. ``tests/__init__.py`` arms the live-data guard FIRST so
+        our stub sits UNDER it and this snapshot restores the sibling's hook —
+        but the three tools/ runners called ``browser_guard.install()`` with no
+        live-data guard in the process yet, so under them ``original`` is the
+        RAW ``os.startfile`` and the sibling wrapped US. A blind ``setattr``
+        then threw the live-data hook away: after the first
+        ``_reset_for_tests()`` in tests/test_browser_guard.py the whole rest of
+        the CI run had NO interception on ``os.startfile``, while
+        ``live_data_guard.is_armed()`` went on answering True. With
+        ``JARVIS_ALLOW_REAL_BROWSER=1`` that is a live
+        ``os.startfile(r"C:\\JARVIS\\_boot_jarvis.ps1")`` — the shell route
+        that boots a real JARVIS and deletes the owner's clean_shutdown.flag.
+
+        So: identity-check first. If the attribute is no longer our
+        replacement, someone else owns it now (a sibling guard, or a live
+        ``mock.patch``) and restoring our snapshot would destroy their work.
+        Leave it alone — an extra layer of blocking is safe, a missing one is
+        not. The runner wiring was fixed too; this makes the property hold
+        whatever the install order turns out to be."""
+        try:
+            if getattr(module, name, None) is not replacement:
+                return
+        except Exception:  # noqa: BLE001 - a diagnostic must never raise
+            return
         try:
             setattr(module, name, original)
         except Exception:  # noqa: BLE001
@@ -496,7 +653,7 @@ def _install_into(webbrowser_mod, subprocess_mod, os_mod) -> list[typing.Callabl
             if not hasattr(module, name):
                 return
             original = getattr(module, name)
-            if getattr(original, _GUARD_MARK, False):
+            if _marked(original):
                 return
         except Exception:  # noqa: BLE001
             return
@@ -765,7 +922,7 @@ def unarmed_targets() -> list[str]:
             try:
                 if not hasattr(module, name):
                     continue          # os.startfile on POSIX
-                if not getattr(getattr(module, name), _GUARD_MARK, False):
+                if not _marked(getattr(module, name)):
                     bad.append(f"{modname}.{name}")
             except Exception:  # noqa: BLE001 - a diagnostic must never raise
                 bad.append(f"{modname}.{name}")

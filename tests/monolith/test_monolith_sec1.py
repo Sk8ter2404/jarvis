@@ -419,7 +419,12 @@ class SystemPromptTests(_MonolithTestBase):
                               "    Example: [ACTION: my_action]"},
                              clear=True):
             prompt = self.bc.build_system_prompt(mem)
-        self.assertIn("ADDITIONAL SKILL ACTIONS", prompt)
+        # Anchor on _skill_prompt_examples_block()'s OWN header, not the bare
+        # phrase: core/prompts.py:763 narrates "ADDITIONAL SKILL ACTIONS" in
+        # prose (added 7a31dc9), so the short form is in every prompt whether
+        # or not a skill contributed anything.
+        self.assertIn("ADDITIONAL SKILL ACTIONS (locally-installed skills",
+                      prompt)
         self.assertIn("[ACTION: my_action]", prompt)
 
     def test_build_system_prompt_no_skill_block_when_empty(self):
@@ -430,7 +435,11 @@ class SystemPromptTests(_MonolithTestBase):
                                return_value="PB"), \
              mock.patch.dict(self.bc._SKILL_PROMPT_EXAMPLES, {}, clear=True):
             prompt = self.bc.build_system_prompt(mem)
-        self.assertNotIn("ADDITIONAL SKILL ACTIONS", prompt)
+        # See the note in the positive test: assert the BLOCK is absent, not
+        # the phrase. This assertion was red at adb9d81 for exactly that
+        # reason -- the prompt started narrating the phrase in prose.
+        self.assertNotIn("ADDITIONAL SKILL ACTIONS (locally-installed skills",
+                         prompt)
 
     # ── _cached_system_param (Anthropic two-breakpoint prompt-cache split) ──
     def _cached_param(self, full, base, stable_len):
@@ -1536,11 +1545,40 @@ class TrayDispatchTests(_MonolithTestBase):
         mremove.assert_called_once_with(self.bc.OVERNIGHT_FLAG_FILE)
 
     def test_open_hud_relaunches(self):
+        """One tray click must bring the HUD back and spawn AT MOST ONE.
+
+        2026-08-20: the click now runs two things that can launch a HUD --
+        core.actions._act_show_hud (which relaunches a dead HUD since the
+        show_hud honesty fix) and the branch's own _launch_hud(). Counting
+        _launch_hud CALLS would only measure the redundancy; what matters is
+        that _launch_hud is idempotent, so drive the real one with Popen mocked
+        and count PROCESSES. Two would mean an orphaned HUD that _shutdown_hud
+        can never terminate (it only holds the newest handle)."""
+        fresh = mock.Mock()
+        fresh.pid = 4242
+
+        def _spawn(*_a, **_k):
+            fresh.poll.return_value = None      # the new child is alive
+            return fresh
+
         with mock.patch.object(self.bc, "_shutdown_hud") as mdown, \
-             mock.patch.object(self.bc, "_launch_hud") as mup:
+             mock.patch.object(self.bc, "_hud_process", None), \
+             mock.patch.object(self.bc, "HUD_ENABLED", True), \
+             mock.patch.object(self.bc.os.path, "exists", return_value=True), \
+             mock.patch.object(self.bc.subprocess, "Popen",
+                               side_effect=_spawn) as mpop, \
+             mock.patch.object(self.bc, "_write_hud_state"), \
+             mock.patch("core.actions._set_unified_hud_hidden",
+                        return_value=True) as mclear:
             self.bc._dispatch_tray_command("open_hud", {})
-        mdown.assert_called_once()
-        mup.assert_called_once()
+            mdown.assert_called_once()
+            mclear.assert_called_once_with(False)
+            self.assertEqual(
+                mpop.call_count, 1,
+                "one Open HUD click spawned more than one HUD process — the "
+                "extra one is orphaned forever")
+            self.assertIs(self.bc._hud_process, fresh)
+        self.bc._hud_process = None
 
     def test_restart_command_calls_act_restart(self):
         with mock.patch.object(self.bc, "_act_restart") as mrestart:
@@ -1708,6 +1746,62 @@ class LaunchPathTests(_MonolithTestBase):
              mock.patch.object(self.bc, "_hud_process", "sentinel"):
             self.bc._launch_hud()  # must not raise
             self.assertIsNone(self.bc._hud_process)
+        self.bc._hud_process = None
+
+    def test_launch_hud_is_idempotent_while_the_child_is_alive(self):
+        """2026-08-20: _launch_hud used to Popen unconditionally and reassign
+        _hud_process, ORPHANING any live HUD (the old handle was overwritten,
+        so _shutdown_hud could only ever terminate the newest one).
+
+        That was survivable while boot and the tray were the only callers, but
+        core.actions._restore_hud now relaunches a dead HUD from the VOICE
+        path, and the tray route runs _act_show_hud AND _launch_hud back to
+        back -- without this guard, one 'Open HUD' click would leak a HUD."""
+        alive = mock.Mock()
+        alive.poll.return_value = None          # Popen.poll(): None == running
+        with mock.patch.object(self.bc, "HUD_ENABLED", True), \
+             mock.patch.object(self.bc.os.path, "exists", return_value=True), \
+             mock.patch.object(self.bc.subprocess, "Popen") as mpop, \
+             mock.patch.object(self.bc, "_hud_process", alive):
+            self.bc._launch_hud()
+            mpop.assert_not_called()
+            self.assertIs(self.bc._hud_process, alive,
+                          "the live handle must survive -- replacing it is how "
+                          "the first HUD gets orphaned")
+        self.bc._hud_process = None
+
+    def test_launch_hud_respawns_when_the_child_has_exited(self):
+        """poll() returning an int means the child is gone -- respawn. This is
+        the path core.actions._restore_hud depends on for a voice route back
+        from a crashed HUD (a Qt crash, or PyQt6 absent -> the HUD exits 2)."""
+        dead = mock.Mock()
+        dead.poll.return_value = 2
+        fresh = mock.Mock()
+        fresh.pid = 777
+        with mock.patch.object(self.bc, "HUD_ENABLED", True), \
+             mock.patch.object(self.bc.os.path, "exists", return_value=True), \
+             mock.patch.object(self.bc.subprocess, "Popen",
+                               return_value=fresh) as mpop, \
+             mock.patch.object(self.bc, "_hud_process", dead):
+            self.bc._launch_hud()
+            mpop.assert_called_once()
+            self.assertIs(self.bc._hud_process, fresh)
+        self.bc._hud_process = None
+
+    def test_launch_hud_respawns_when_the_handle_is_unreadable(self):
+        """An un-poll-able handle is not evidence the child is alive -- fall
+        through and spawn rather than silently leaving the owner with no HUD."""
+        broken = mock.Mock()
+        broken.poll.side_effect = OSError("handle gone")
+        fresh = mock.Mock()
+        fresh.pid = 778
+        with mock.patch.object(self.bc, "HUD_ENABLED", True), \
+             mock.patch.object(self.bc.os.path, "exists", return_value=True), \
+             mock.patch.object(self.bc.subprocess, "Popen",
+                               return_value=fresh) as mpop, \
+             mock.patch.object(self.bc, "_hud_process", broken):
+            self.bc._launch_hud()
+            mpop.assert_called_once()
         self.bc._hud_process = None
 
     def test_launch_tray_spawns_and_seeds_audio_state(self):
@@ -3754,6 +3848,41 @@ class FocusModeGateTests(_MonolithTestBase):
 
     def test_focus_mode_active_self_resumes_lapsed_timer(self):
         bc = self.bc
+        # LIVE-QUEUE LEAK (found 2026-08-20). proactive_announce resolves its
+        # queue as os.path.dirname(os.path.abspath(__file__)) +
+        # "pending_speech.json" -- bound to __file__, in the PROJECT ROOT, so
+        # neither JARVIS_DATA_DIR nor JARVIS_STAGING nor the capped harness can
+        # redirect it (same shape as the clean_shutdown.flag escape that
+        # tests/live_data_guard.py exists for, but a different file, and that
+        # guard only covers data/clean_shutdown.flag).
+        #
+        # The inner mock block below was added to stop the RECAP write, but the
+        # seeding call on the line after set_focus_mode already leaked TWO real
+        # utterances per run: `until` is in the PAST, so the focus gate inside
+        # proactive_announce self-resumes on that very call -- it enqueues
+        # "Focus time's up, sir -- nothing came up while you were focused."
+        # un-gated, then falls through and enqueues "held while focused" too.
+        # Measured on the owner's box: 34 entries, 17 identical pairs, one pair
+        # per suite run, all of which JARVIS speaks aloud on its next boot.
+        #
+        # Redirect __file__ for the whole test so the real write path runs
+        # against a temp dir. Nothing else here reads __file__.
+        import tempfile as _tempfile
+        import shutil as _shutil
+        _tmp = _tempfile.mkdtemp(prefix="jv_pending_")
+        self.addCleanup(_shutil.rmtree, _tmp, True)
+        _queue = os.path.join(_tmp, "pending_speech.json")
+        with mock.patch.object(bc, "__file__",
+                               os.path.join(_tmp, "bobert_companion.py")):
+            self._focus_lapse_body(bc)
+        # Proof the redirect is real, not decorative: the utterances landed in
+        # the temp queue. If this ever goes empty, the writes went somewhere
+        # else -- check the live pending_speech.json before trusting the run.
+        self.assertTrue(os.path.exists(_queue),
+                        "the seeding announce did not write where we told it "
+                        "to -- it may have reached the LIVE queue")
+
+    def _focus_lapse_body(self, bc):
         # Engage a block whose deadline is already in the past.
         bc.set_focus_mode(True, until=time.time() - 1)
         bc.proactive_announce("held while focused", source="s")

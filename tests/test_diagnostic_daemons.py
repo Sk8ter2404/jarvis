@@ -217,6 +217,8 @@ class _Base(unittest.TestCase):
             mock.patch.object(dd, "LOGS_DIR", self._logs),
             mock.patch.object(dd, "BOOT_FAILURES_FILE", P("data", "boot.jsonl")),
             mock.patch.object(dd, "HUD_STATE_FILE", P("hud_state.json")),
+            mock.patch.object(dd, "MAIN_LOOP_HEARTBEAT_FILE",
+                              P("data", "main_loop_heartbeat")),
             # Use the temp dir as the project root so the source-file walk in
             # deep-audit stays inside the sandbox.
             mock.patch.object(dd, "PROJECT_DIR", self._tmp),
@@ -1783,23 +1785,37 @@ class CheckBootFailuresTests(_Base):
 
 
 class CheckStuckLoopTests(_Base):
-    def test_no_hud_file_resets_streak(self):
+    """The stuck-main-loop detector.
+
+    2026-08-20: repointed from hud_state.json to data/main_loop_heartbeat.
+    hud_state.json's writer starts `if not HUD_ENABLED: return`, so disabling
+    the HUD FROZE its mtime (the file is never deleted) and the detector fired
+    forever on a healthy box. The old existence guard's comment claimed to
+    cover that case; it only covered "file absent", which does not happen on a
+    machine that has ever run with the HUD on.
+    """
+
+    def _write_heartbeat(self, mtime=None):
+        with open(dd.MAIN_LOOP_HEARTBEAT_FILE, "w", encoding="utf-8") as f:
+            f.write("1000000.000\n")
+        if mtime is not None:
+            os.utime(dd.MAIN_LOOP_HEARTBEAT_FILE, (mtime, mtime))
+
+    def test_no_heartbeat_file_resets_streak(self):
         self._write_state_file({"anomaly_watch": {
             "stuck_loop_consecutive_misses": 3}})
         q = [0]
-        # HUD_STATE_FILE doesn't exist in temp dir.
+        # MAIN_LOOP_HEARTBEAT_FILE doesn't exist in temp dir — the main loop
+        # has not published yet this run.
         dd._check_stuck_loop(q)
         self.assertEqual(q[0], 0)
         self.assertEqual(
             self._read_state_file()["anomaly_watch"]["stuck_loop_consecutive_misses"],
             0)
 
-    def test_fresh_hud_resets_streak(self):
-        with open(dd.HUD_STATE_FILE, "w", encoding="utf-8") as f:
-            f.write("{}")
+    def test_fresh_heartbeat_resets_streak(self):
         now = 1_000_000.0
-        # mtime = now (age 0 < threshold).
-        os.utime(dd.HUD_STATE_FILE, (now, now))
+        self._write_heartbeat(now)          # age 0 < threshold
         self._write_state_file({"anomaly_watch": {
             "stuck_loop_consecutive_misses": 2}})
         q = [0]
@@ -1811,11 +1827,8 @@ class CheckStuckLoopTests(_Base):
             0)
 
     def test_first_stale_sweep_increments_but_no_queue(self):
-        with open(dd.HUD_STATE_FILE, "w", encoding="utf-8") as f:
-            f.write("{}")
         now = 1_000_000.0
-        old = now - dd.ANOMALY_STUCK_LOOP_THRESHOLD_S - 50
-        os.utime(dd.HUD_STATE_FILE, (old, old))
+        self._write_heartbeat(now - dd.ANOMALY_STUCK_LOOP_THRESHOLD_S - 50)
         q = [0]
         with mock.patch.object(dd, "_now", return_value=now):
             dd._check_stuck_loop(q)
@@ -1827,11 +1840,8 @@ class CheckStuckLoopTests(_Base):
         self.assertEqual(self._todo_text(), "")
 
     def test_threshold_reached_queues_and_resets(self):
-        with open(dd.HUD_STATE_FILE, "w", encoding="utf-8") as f:
-            f.write("{}")
         now = 1_000_000.0
-        old = now - dd.ANOMALY_STUCK_LOOP_THRESHOLD_S - 50
-        os.utime(dd.HUD_STATE_FILE, (old, old))
+        self._write_heartbeat(now - dd.ANOMALY_STUCK_LOOP_THRESHOLD_S - 50)
         # Pre-seed one prior miss so this sweep crosses MIN_CONSECUTIVE=2.
         self._write_state_file({"anomaly_watch": {
             "stuck_loop_consecutive_misses": 1, "queued_signatures": {}}})
@@ -1839,20 +1849,77 @@ class CheckStuckLoopTests(_Base):
         with mock.patch.object(dd, "_now", return_value=now):
             dd._check_stuck_loop(q)
         self.assertEqual(q[0], 1)
-        self.assertIn("[anomaly] main loop appears stuck", self._todo_text())
+        todo = self._todo_text()
+        self.assertIn("[anomaly] main loop appears stuck", todo)
+        # The queued text must name the file the detector actually watched, or
+        # the owner (and the overnight pipeline that consumes this todo) goes
+        # looking at the wrong artefact.
+        self.assertIn("main_loop_heartbeat", todo)
+        self.assertNotIn("hud_state.json", todo)
         # Streak reset after successful queue.
         self.assertEqual(
             self._read_state_file()["anomaly_watch"]["stuck_loop_consecutive_misses"],
             0)
 
     def test_getmtime_oserror_returns(self):
-        with open(dd.HUD_STATE_FILE, "w", encoding="utf-8") as f:
-            f.write("{}")
+        self._write_heartbeat()
         with mock.patch.object(dd.os.path, "getmtime",
                                side_effect=OSError("stat fail")):
             q = [0]
             dd._check_stuck_loop(q)   # must not raise
         self.assertEqual(q[0], 0)
+
+    def test_a_frozen_hud_state_file_no_longer_triggers_a_false_alarm(self):
+        """THE regression. Simulate the HUD-disabled box exactly: an ANCIENT
+        hud_state.json still on disk (nothing deletes it) while the main loop
+        is demonstrably alive (fresh heartbeat). The old detector queued an
+        anomaly here every 30 minutes, forever."""
+        now = 1_000_000.0
+        ancient = now - 86_400
+        with open(dd.HUD_STATE_FILE, "w", encoding="utf-8") as f:
+            f.write("{}")
+        os.utime(dd.HUD_STATE_FILE, (ancient, ancient))
+        self._write_heartbeat(now)
+        self._write_state_file({"anomaly_watch": {
+            "stuck_loop_consecutive_misses": 1, "queued_signatures": {}}})
+        q = [0]
+        with mock.patch.object(dd, "_now", return_value=now):
+            dd._check_stuck_loop(q)
+            dd._check_stuck_loop(q)     # a second sweep would cross the bar
+        self.assertEqual(q[0], 0, "a stale hud_state.json must not look like a "
+                                  "stuck main loop — the HUD is a feature "
+                                  "toggle, not a liveness signal")
+        self.assertEqual(self._todo_text(), "")
+        self.assertEqual(
+            self._read_state_file()["anomaly_watch"]["stuck_loop_consecutive_misses"],
+            0)
+
+    def test_a_wedged_loop_is_still_caught_with_the_hud_file_fresh(self):
+        """The other direction: the HUD publisher is only one of ~30 writers of
+        hud_state.json (the tray publisher and the amp pump are on their own
+        threads), so a fresh hud_state.json was never proof the MAIN loop was
+        alive either. A frozen heartbeat must still fire."""
+        now = 1_000_000.0
+        with open(dd.HUD_STATE_FILE, "w", encoding="utf-8") as f:
+            f.write("{}")
+        os.utime(dd.HUD_STATE_FILE, (now, now))
+        self._write_heartbeat(now - dd.ANOMALY_STUCK_LOOP_THRESHOLD_S - 50)
+        self._write_state_file({"anomaly_watch": {
+            "stuck_loop_consecutive_misses": 1, "queued_signatures": {}}})
+        q = [0]
+        with mock.patch.object(dd, "_now", return_value=now):
+            dd._check_stuck_loop(q)
+        self.assertEqual(q[0], 1)
+        self.assertIn("[anomaly] main loop appears stuck", self._todo_text())
+
+    def test_heartbeat_path_lives_under_the_staging_aware_data_dir(self):
+        """The old join was PROJECT_DIR/hud_state.json while the monolith
+        resolved that same file through _BLUE_GREEN_PATHS — so a staging
+        process already watched the wrong artefact. Keep the new one anchored
+        to DATA_DIR (core.paths), which both roles agree on."""
+        self.assertEqual(
+            os.path.dirname(os.path.abspath(dd.MAIN_LOOP_HEARTBEAT_FILE)),
+            os.path.abspath(dd.DATA_DIR))
 
 
 class LooksLikeTextLogTests(_Base):

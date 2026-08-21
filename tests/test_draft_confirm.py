@@ -21,6 +21,7 @@ data/ directory. stdlib unittest + unittest.mock only.
 """
 from __future__ import annotations
 
+import io
 import os
 import tempfile
 import unittest
@@ -355,6 +356,80 @@ class SpeakContractTests(unittest.TestCase):
         bc = mock.MagicMock()
         bc._speak = "not callable"
         self.assertIs(self._speak_with(bc), False)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  2026-08-20 adversarial review, HIGH: a refusal nobody can perceive
+#
+#  Failing closed on an unvoiced read-back is right. Doing it SILENTLY, when
+#  the reason the read-back was unvoiced is that the owner muted TTS, means he
+#  gets no draft, no send, and no explanation — indistinguishable from a bug.
+#  The cause now goes to the console + HUD and is recorded in last_hold_reason.
+#
+#  There is deliberately NO owner-override here (unlike
+#  core.draft_preview_gate): this module's callers are BACKGROUND senders with
+#  no user turn attached, so the last thing he said is not an answer to this
+#  prompt and must never be read as consent for it.
+# ═════════════════════════════════════════════════════════════════════════
+class UnvoicedHoldIsReportedTests(DraftConfirmTestBase):
+
+    def setUp(self):
+        super().setUp()
+        from core import state as core_state
+        self._core_state = core_state
+        dc._last_hold_reason[0] = ""
+        self.addCleanup(mock.patch.stopall)
+
+    def _mute(self, on=True):
+        mock.patch.object(self._core_state, "_tts_muted", [bool(on)]).start()
+
+    def _refuse(self, *, muted):
+        import contextlib
+        self._mute(muted)
+        bc = _fake_companion(speak_returns=None, heard="yes")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            out = self._run("the body", "Sam", companion=bc)
+        return out, buf.getvalue(), bc
+
+    def test_a_muted_refusal_records_and_prints_the_cause(self):
+        out, printed, bc = self._refuse(muted=True)
+        self.assertIs(out, False)
+        bc.record_speech.assert_not_called()      # window never opened
+        self.assertIn("Mute TTS", dc.last_hold_reason())
+        self.assertIn("SEND HELD", printed)
+        self.assertIn("the body", printed,
+                      "the draft has to be visible — TTS is exactly what is "
+                      "unavailable")
+
+    def test_a_broken_tts_refusal_does_not_claim_it_was_muted(self):
+        out, _printed, _bc = self._refuse(muted=False)
+        self.assertIs(out, False)
+        self.assertNotIn("Mute TTS", dc.last_hold_reason())
+        self.assertTrue(dc.last_hold_reason())
+
+    def test_a_voiced_prompt_clears_the_hold_reason(self):
+        dc._last_hold_reason[0] = "stale"
+        bc = _fake_companion(speak_ok=True, heard="yes")
+        self.assertIs(self._run("body", "Sam", companion=bc), True)
+        self.assertEqual(dc.last_hold_reason(), "")
+
+    def test_there_is_no_owner_override_on_the_background_path(self):
+        # Even with the override phrase sitting in the last-utterance cell, a
+        # background nudge must NOT send: that utterance was never an answer
+        # to this prompt.
+        self._mute(True)
+        bc = _fake_companion(speak_returns=None, heard="yes")
+        bc._last_user_text = ["send it anyway"]
+        out = self._run("the body", "Sam", companion=bc)
+        self.assertIs(out, False)
+
+    def test_the_mute_rule_is_imported_not_mirrored(self):
+        # Stale-duplicate rule: one home for "is TTS muted?". If this ever
+        # becomes a second copy, the two will drift.
+        from core import draft_preview_gate as gate
+        self.assertIs(dc.tts_is_muted, gate.tts_is_muted)
+        self.assertIs(dc.publish_held_send, gate.publish_held_send)
 
 
 if __name__ == "__main__":

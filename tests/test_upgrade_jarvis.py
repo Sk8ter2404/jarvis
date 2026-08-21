@@ -85,6 +85,9 @@ class _FakeBGM:
         self._prod_running_seq = [False]   # popped per prod_is_running() call
         self._instances = {}
         self._version = "2.3.4"
+        # Whether data/handoff.signal is still on disk when the pipeline
+        # sweeps for an unconsumed one (2026-08-20 orphan fix).
+        self.unconsumed_signal_present = False
 
     # -- helpers the tests tune --
     def set_prod_running_sequence(self, seq):
@@ -120,6 +123,11 @@ class _FakeBGM:
     def signal_handoff_failure(self, reason="timeout"):
         self._rec("signal_handoff_failure", reason=reason)
         return True
+
+    def clear_unconsumed_handoff_signal(self):
+        self._rec("clear_unconsumed_handoff_signal")
+        return self.unconsumed_signal_present
+
 
     def promote_staging(self, new_version=None, staging_pid=None):
         self._rec("promote_staging", new_version=new_version,
@@ -1338,6 +1346,73 @@ class RunBlueGreenHandoffTests(_UpgBase):
         self.assertIn("signal_handoff", names)
         self.assertIn("promote_staging", names)
         relaunch.assert_called_once()
+        # 2026-08-20: this "happy path" is BIT-FOR-BIT the orphan scenario
+        # (`set_prod_running_sequence([False])` == prod already down when the
+        # grace loop first polls), and it asserted ok:True while nothing ever
+        # cleaned up data/handoff.signal. The sweep must run, and it must run
+        # BEFORE the promote, or the freshly booted prod inherits the takeover.
+        self.assertIn("clear_unconsumed_handoff_signal", names)
+        self.assertLess(names.index("clear_unconsumed_handoff_signal"),
+                        names.index("promote_staging"))
+
+    def test_orphaned_signal_is_swept_before_promote(self):
+        """The signal is still on disk after prod is confirmed gone -> nobody
+        consumed it -> clear it. 'Still present' is the exact invariant: a prod
+        that acted on the signal deleted it inside consume_handoff_signal."""
+        bgm, stg = _FakeBGM(self.tmp), _FakeSTG()
+        bgm.unconsumed_signal_present = True
+        bgm.set_prod_running_sequence([False])
+        proc = _FakePopen(["x"])
+        ctxs = self._patch_helpers(bgm, stg)
+        with ctxs[0], ctxs[1], \
+             mock.patch.object(U, "spawn_staging_jarvis", return_value=proc), \
+             mock.patch.object(U, "_wait_for_prod_idle", return_value=True), \
+             mock.patch.object(U, "relaunch_jarvis"), \
+             mock.patch.object(U, "_wait_for_new_prod_heartbeat",
+                               return_value=True), \
+             mock.patch("builtins.print") as mprint:
+            out = U.run_blue_green_handoff()
+        self.assertTrue(out["ok"])
+        self.assertIn("clear_unconsumed_handoff_signal", bgm.names())
+        self.assertTrue(
+            any("never consumed" in " ".join(str(a) for a in c.args)
+                for c in mprint.call_args_list),
+            "clearing an orphan must be reported, not done silently")
+
+    def test_sweep_failure_does_not_abort_the_ceremony(self):
+        bgm, stg = _FakeBGM(self.tmp), _FakeSTG()
+        bgm.clear_unconsumed_handoff_signal = mock.Mock(
+            side_effect=RuntimeError("fs gone"))
+        bgm.set_prod_running_sequence([False])
+        proc = _FakePopen(["x"])
+        ctxs = self._patch_helpers(bgm, stg)
+        with ctxs[0], ctxs[1], \
+             mock.patch.object(U, "spawn_staging_jarvis", return_value=proc), \
+             mock.patch.object(U, "_wait_for_prod_idle", return_value=True), \
+             mock.patch.object(U, "relaunch_jarvis"), \
+             mock.patch.object(U, "_wait_for_new_prod_heartbeat",
+                               return_value=True), \
+             mock.patch("builtins.print"):
+            out = U.run_blue_green_handoff()
+        self.assertTrue(out["ok"])
+
+    def test_sweep_is_skipped_when_prod_refuses_to_yield(self):
+        """The abort path leaves the signal alone: prod is still alive and the
+        ceremony writes handoff_failure.signal for it to react to. Deleting the
+        signal here would silently cancel a takeover prod may still be mid-way
+        through announcing."""
+        bgm, stg = _FakeBGM(self.tmp), _FakeSTG()
+        bgm.set_prod_running_sequence([True] * 50)
+        proc = _FakePopen(["x"])
+        ctxs = self._patch_helpers(bgm, stg)
+        tvals = iter([1000.0] + [1000.0, 1001.0, 1002.0] + [9999.0] * 50)
+        with ctxs[0], ctxs[1], \
+             mock.patch.object(U, "spawn_staging_jarvis", return_value=proc), \
+             mock.patch.object(U, "_wait_for_prod_idle", return_value=True), \
+             mock.patch.object(U.time, "time", lambda: next(tvals)):
+            out = U.run_blue_green_handoff()
+        self.assertFalse(out["ok"])
+        self.assertNotIn("clear_unconsumed_handoff_signal", bgm.names())
 
     def test_prod_does_not_yield_aborts(self):
         bgm, stg = _FakeBGM(self.tmp), _FakeSTG()

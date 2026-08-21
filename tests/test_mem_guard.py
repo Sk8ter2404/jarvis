@@ -474,5 +474,208 @@ class RunnerWiringTests(unittest.TestCase):
                     "_KNOWN_UNGUARDED so the scan covers it")
 
 
+def _is_apply_call(node: ast.Call) -> bool:
+    """``apply_memory_ceiling(...)`` however it was imported or aliased —
+    tests/__init__.py binds it as ``_apply_memory_ceiling`` so the guards cannot
+    be shadowed by a test module's own name."""
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id.lstrip("_") == "apply_memory_ceiling"
+    if isinstance(func, ast.Attribute):
+        return func.attr.lstrip("_") == "apply_memory_ceiling"
+    return False
+
+
+class ChokepointWiringTests(unittest.TestCase):
+    """THE CHOKEPOINT, and the one place this guard was missing from.
+
+    Importing ANY test module imports the ``tests`` package first, so
+    ``tests/__init__.py`` is what covers ``python -m unittest tests.foo``,
+    ``unittest discover``, an IDE runner and the scratchpad harness — every path
+    the three ``tools/`` runners never see. Both sibling guards are armed there;
+    the memory ceiling was not, so a TARGETED run was uncapped while printing
+    ``[browser-guard] armed …`` and saying nothing about RAM.
+
+    That matters because the 144 GB bugcheck came from BISECTING a suspected
+    leak — i.e. re-running one suite, which is exactly the
+    ``python -m unittest tests.<suite>`` path with no ceiling. Absence of a line
+    is not a signal anyone reads."""
+
+    _TESTS_INIT = os.path.join(_PROJECT_ROOT, "tests", "__init__.py")
+
+    def _src(self):
+        with open(self._TESTS_INIT, "r", encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_tests_package_applies_the_memory_ceiling(self):
+        src = self._src()
+        self.assertIn("mem_guard", src,
+                      "tests/__init__.py no longer references the memory guard")
+        tree = ast.parse(src)
+        found = [n for n in ast.walk(tree)
+                 if isinstance(n, ast.Call)
+                 and _is_apply_call(n)]
+        self.assertTrue(
+            found,
+            "tests/__init__.py must call apply_memory_ceiling() beside the two "
+            "other guards — without it `python -m unittest tests.<suite>` (the "
+            "bisect path that caused the 144 GB bugcheck) runs with NO ceiling")
+
+    def test_the_ceiling_is_applied_at_import_time(self):
+        """A call parked inside a function that nothing invokes would satisfy
+        the test above and cap nothing."""
+        tree = ast.parse(self._src())
+        for node in tree.body:
+            self.assertNotIsInstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+                "tests/__init__.py must stay a flat module body so the ceiling "
+                "is applied at import time")
+
+    def test_the_ceiling_cannot_break_collection(self):
+        tree = ast.parse(self._src())
+        wrapped = any(
+            isinstance(node, ast.Try)
+            and any(isinstance(inner, ast.Call) and _is_apply_call(inner)
+                    for inner in ast.walk(node))
+            for node in tree.body)
+        self.assertTrue(wrapped,
+                        "the apply_memory_ceiling() call in tests/__init__.py "
+                        "must sit inside a try/except — an unbounded run still "
+                        "beats no run at all")
+
+    def test_the_ceiling_is_applied_before_the_other_guards(self):
+        """It bounds the guards' own imports too, and it is the ordering the
+        three runners already use — keeping them identical is what stops one
+        copy of the rule rotting."""
+        tree = ast.parse(self._src())
+        lines = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = ""
+            if _is_apply_call(node):
+                name = "apply_memory_ceiling"
+            elif (isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "install"
+                    and isinstance(node.func.value, ast.Name)):
+                name = node.func.value.id.lstrip("_")
+            if name in ("apply_memory_ceiling", "live_data_guard",
+                        "browser_guard"):
+                lines.setdefault(name, node.lineno)
+        self.assertIn("apply_memory_ceiling", lines)
+        for other in ("live_data_guard", "browser_guard"):
+            with self.subTest(guard=other):
+                self.assertLess(lines["apply_memory_ceiling"], lines[other],
+                                "the memory ceiling must be applied before "
+                                f"{other}.install() in tests/__init__.py")
+
+
+class JobObjectFlagTests(unittest.TestCase):
+    """KILL_ON_JOB_CLOSE + JOB_MEMORY apply to EVERY descendant, and neither
+    ``CREATE_NO_WINDOW`` nor ``DETACHED_PROCESS`` breaks a child out of a Job
+    Object — only ``CREATE_BREAKAWAY_FROM_JOB`` does, and that is refused unless
+    the job carries ``JOB_OBJECT_LIMIT_BREAKAWAY_OK``.
+
+    So a process the suite deliberately starts to OUTLIVE the run — the
+    monolith's ``_ensure_ollama_running`` spawns ``ollama serve`` and its own
+    comment says the server 'still outlives JARVIS' — joins the job, counts its
+    ~13.5 GB model load against the 8 GB job-wide cap (failing the RUNNER's
+    allocations, nowhere near the offending test), and is TERMINATED when the
+    runner's handle closes. Killing ollama is a standing 'never do this' rule
+    for this box, so the job must at least make the escape possible."""
+
+    @unittest.skipUnless(os.name == "nt", "Job Objects are Windows-only")
+    def test_the_job_allows_a_deliberate_breakaway(self):
+        import ctypes
+        # tools/run_tests_ci_sim.py emulates the Linux runner IN THIS PROCESS:
+        # it deletes ``ctypes.WinDLL`` and evicts ``ctypes.wintypes`` from
+        # sys.modules behind a blocking import shim. ``os.name`` stays "nt" —
+        # deliberately, it is the honest kernel identity the ceiling itself keys
+        # off (see test_uses_os_name_not_the_spoofed_sys_platform) — so this
+        # Windows-only test still RUNS under the sim and has to supply the
+        # Windows ctypes surface itself instead of exploding on the removed
+        # attribute. It is NOT skipped there: the flags asserted below are the
+        # whole point, and a test that quietly stops running is how a guard
+        # stops being checked.
+        #
+        # The real wintypes module is still reachable as an ATTRIBUTE of the
+        # ctypes package (the sim clears sys.modules, not the attribute), and
+        # every runner applies the memory ceiling — which imports it — long
+        # before the platform flip. Putting it back into sys.modules for the
+        # duration is the sim's own documented pattern for a win-only import.
+        wintypes = (sys.modules.get("ctypes.wintypes")
+                    or getattr(ctypes, "wintypes", None))
+        if wintypes is None:  # pragma: no cover - unreachable on a real nt box
+            self.skipTest("ctypes.wintypes is unavailable on this host")
+        captured = {}
+        # getattr, not attribute access: under the sim there is no WinDLL to
+        # snapshot. It is only ever used by the unreachable non-kernel32 branch
+        # below, so its absence must not fail the test before it starts.
+        real_windll = getattr(ctypes, "WinDLL", None)
+
+        # Plain functions, assigned as INSTANCE attributes so they stay plain
+        # functions (a bound method has no __dict__, and mem_guard sets
+        # .restype / .argtypes on every prototype it uses).
+        def _create(*a):
+            return 0x1234
+
+        def _setinfo(job, klass, ptr, size):
+            blob = ctypes.string_at(ptr, size)
+            # LimitFlags is the 3rd field: two c_longlong then a DWORD.
+            captured["flags"] = int.from_bytes(blob[16:20], "little")
+            return 1
+
+        def _assign(*a):
+            return 1
+
+        def _current(*a):
+            return 7
+
+        class _FakeK32:
+            def __init__(self):
+                self.CreateJobObjectW = _create
+                self.SetInformationJobObject = _setinfo
+                self.AssignProcessToJobObject = _assign
+                self.GetCurrentProcess = _current
+
+        def _fake_windll(name, *a, **k):
+            if name == "kernel32":
+                return _FakeK32()
+            if real_windll is None:  # pragma: no cover - only kernel32 is asked
+                raise OSError(f"WinDLL({name!r}) is unavailable under the CI sim")
+            return real_windll(name, *a, **k)   # pragma: no cover
+
+        # create=True so the patch also works where the sim removed WinDLL; the
+        # attribute is deleted again on exit, leaving the sim's Linux face
+        # exactly as it was.
+        with mock.patch.dict(sys.modules, {"ctypes.wintypes": wintypes}),              mock.patch.object(ctypes, "WinDLL", _fake_windll, create=True):
+            mem_guard._apply_windows_job_object(1 << 30)
+        mem_guard._job_handle = None
+
+        BREAKAWAY_OK = 0x00000800
+        self.assertTrue(
+            captured["flags"] & BREAKAWAY_OK,
+            "the job does not carry JOB_OBJECT_LIMIT_BREAKAWAY_OK, so a child "
+            "that is SUPPOSED to outlive the run (ollama serve) cannot escape "
+            "KILL_ON_JOB_CLOSE even by asking for CREATE_BREAKAWAY_FROM_JOB")
+        for name, bit in (("PROCESS_MEMORY", 0x00000100),
+                          ("JOB_MEMORY", 0x00000200),
+                          ("KILL_ON_JOB_CLOSE", 0x00002000)):
+            with self.subTest(flag=name):
+                self.assertTrue(captured["flags"] & bit,
+                                f"{name} was dropped from the job")
+
+    def test_the_docstring_documents_the_breakaway(self):
+        """STALE-DUPLICATE GUARD: the contract lives in the docstring, and a
+        flag added without documenting it is how the next reader learns the
+        wrong rule."""
+        src = mem_guard.__doc__ or ""
+        self.assertIn("BREAKAWAY", src.upper(),
+                      "tools/mem_guard.py's docstring still says 'no child "
+                      "outlives the runner' with no mention of how a child that "
+                      "is meant to (ollama serve) can opt out")
+
+
+
 if __name__ == "__main__":  # pragma: no cover - CLI entrypoint
     unittest.main()

@@ -319,14 +319,16 @@ class SubprocessInterceptionTests(_GuardTestCase):
         ])
 
     def test_process_management_tools_naming_a_browser_pass_through(self):
-        """`taskkill /IM chrome.exe` CLOSES windows — it is how the monolith
-        reuses one media window instead of stacking tabs. Blocking it would be
-        both wrong and a silent behaviour change."""
+        """READ-ONLY process tools count or filter; they cannot open a window
+        and cannot close one, so naming a browser is harmless.
+
+        The KILL verbs used to be exempt here too, on a justification that does
+        not exist in the tree — see ``KillVerbTests``, which now owns them."""
         _, sp, _, calls = self._install_fakes()
-        for cmd in (["taskkill", "/F", "/IM", "chrome.exe"],
-                    ["tasklist", "/FI", "IMAGENAME eq msedge.exe"],
-                    ["pkill", "firefox"],
-                    "wmic process where name='chrome.exe' get ProcessId"):
+        for cmd in (["tasklist", "/FI", "IMAGENAME eq msedge.exe"],
+                    ["pgrep", "-f", "firefox"],
+                    "wmic process where name='chrome.exe' get ProcessId",
+                    ["reg", "query", r"HKCU\Software\Google\Chrome"]):
             with self.subTest(cmd=cmd):
                 sp.Popen(cmd)
         self.assertEqual(browser_guard.blocked_attempts(), ())
@@ -700,6 +702,254 @@ class ArmedStateTests(_GuardTestCase):
         browser_guard.install(quiet=True)
         browser_guard.install(quiet=True)
         self.assertIs(webbrowser.open, before)
+
+
+
+class ShellMediatedLaunchTests(_GuardTestCase):
+    """A browser hidden INSIDE one argv element.
+
+    ``_command_tokens`` returned a list's elements verbatim, so the quote-aware
+    split only ever ran on a bare string. Every real-world shell-mediated launch
+    — ``powershell -Command "Start-Process chrome ..."``, ``cmd /c start chrome
+    <url>``, ``bash -c "google-chrome <url>"`` — puts the browser name inside
+    ONE element, where the guard could not see it. The docstring claimed
+    ``cmd /c start chrome <url>`` was caught; it was, but only in the fully
+    tokenised list form nobody writes."""
+
+    def test_powershell_command_string_is_split(self):
+        _, sp, _, calls = self._install_fakes()
+        sp.Popen(["powershell", "-Command",
+                  f"Start-Process chrome '{_URL}'"])
+        self.assertEqual(calls, [])
+        self.assertEqual(len(browser_guard.blocked_attempts()), 1)
+
+    def test_cmd_slash_c_start_chrome_is_split(self):
+        _, sp, _, calls = self._install_fakes()
+        sp.Popen(["cmd", "/c", f"start chrome {_URL}"])
+        self.assertEqual(calls, [])
+        self.assertEqual(len(browser_guard.blocked_attempts()), 1)
+
+    def test_bash_dash_c_command_line_is_split(self):
+        _, sp, _, calls = self._install_fakes()
+        sp.Popen(["bash", "-c", f"google-chrome {_URL}"])
+        self.assertEqual(calls, [])
+        self.assertEqual(len(browser_guard.blocked_attempts()), 1)
+
+    def test_url_shaped_shell_launches_are_blocked(self):
+        """``start <url>`` / ``explorer <url>`` / ``rundll32 url.dll,...`` hand
+        the URL to the DEFAULT browser without ever naming one, so the binary
+        scan cannot see them. They were listed as 'deliberately not
+        intercepted' — but a URL argument makes the intent unambiguous."""
+        _, sp, _, calls = self._install_fakes()
+        for cmd in (["cmd", "/c", "start", _URL],
+                    ["explorer.exe", _URL],
+                    ["rundll32", "url.dll,FileProtocolHandler", _URL],
+                    ["xdg-open", _URL]):
+            with self.subTest(cmd=cmd):
+                sp.Popen(cmd)
+        self.assertEqual(calls, [])
+        self.assertEqual(len(browser_guard.blocked_attempts()), 4)
+
+    def test_a_url_without_a_launcher_still_passes(self):
+        """The anti-false-positive half: a URL is only a launch when something
+        that OPENS it is on the command line."""
+        _, sp, _, calls = self._install_fakes()
+        sp.Popen(["curl", "-fsSL", _URL])
+        sp.Popen(["git", "clone", "https://github.com/x/y"])
+        self.assertEqual(browser_guard.blocked_attempts(), ())
+        self.assertEqual(len(calls), 2)
+
+    def test_a_folder_shell_launch_still_passes(self):
+        """``explorer <folder>`` is not a browser launch. (os.startfile of a
+        folder is separately blocked; this is about the subprocess route.)"""
+        _, sp, _, calls = self._install_fakes()
+        sp.Popen(["explorer.exe", r"C:\JARVIS\logs"])
+        sp.Popen(["cmd", "/c", "start", r"C:\JARVIS"])
+        self.assertEqual(browser_guard.blocked_attempts(), ())
+        self.assertEqual(len(calls), 2)
+
+    def test_prose_arguments_are_not_split(self):
+        """Only an element that FOLLOWS a shell command-line switch is
+        re-tokenised. tools/multi_agent_pipeline.py hands the claude CLI
+        multi-line prompts; shredding those into words would block any prompt
+        that happens to say 'chrome'."""
+        _, sp, _, calls = self._install_fakes()
+        sp.Popen(["claude", "--print", "--",
+                  "Investigate why chrome opens during the test run."])
+        self.assertEqual(browser_guard.blocked_attempts(), ())
+        self.assertEqual(len(calls), 1)
+
+
+class KillVerbTests(_GuardTestCase):
+    """``_PROCESS_TOOLS`` exempted the ENTIRE command line whenever argv[0] was
+    one of eighteen process tools — including the kill verbs — with the stated
+    justification that ``taskkill /IM chrome.exe`` is "how the monolith reuses a
+    single media window".
+
+    That justification does not exist in the tree. The only ``taskkill /IM`` in
+    the repo is ``bobert_companion._reap_wedged_ollama`` and its images are
+    ``ollama.exe`` / ``llama-server.exe`` / ``ollama app.exe``; window reuse is
+    done with ``pygetwindow``'s ``w.close()``
+    (``_close_browser_windows_matching``). So the exemption bought nothing and
+    cost an unbounded hole in a guard whose whole point is that a test run must
+    not be able to take over the box: one ``taskkill /IM chrome.exe /F`` closes
+    every Chrome window the owner has open — strictly worse than the tab spam
+    this guard was written for."""
+
+    def test_killing_a_browser_by_image_name_is_refused(self):
+        _, sp, _, calls = self._install_fakes()
+        for cmd in (["taskkill", "/F", "/IM", "chrome.exe"],
+                    ["pkill", "firefox"],
+                    ["killall", "google-chrome"]):
+            with self.subTest(cmd=cmd):
+                sp.Popen(cmd)
+        self.assertEqual(calls, [], "a real browser kill was executed")
+        self.assertEqual(len(browser_guard.blocked_attempts()), 3)
+
+    def test_killing_a_non_browser_by_image_name_still_works(self):
+        """The monolith's ollama reaper and skills/code_executor's PID kill are
+        the real users of taskkill, and neither may be touched."""
+        _, sp, _, calls = self._install_fakes()
+        sp.Popen(["taskkill", "/IM", "ollama.exe", "/F", "/T"])
+        sp.Popen(["taskkill", "/F", "/T", "/PID", "1234"])
+        self.assertEqual(browser_guard.blocked_attempts(), ())
+        self.assertEqual(len(calls), 2)
+
+    def test_read_only_process_tools_naming_a_browser_still_pass_through(self):
+        """These enumerate or filter; they cannot open OR close a window, so
+        exempting the whole command line costs nothing."""
+        _, sp, _, calls = self._install_fakes()
+        for cmd in (["tasklist", "/FI", "IMAGENAME eq msedge.exe"],
+                    ["pgrep", "chrome"],
+                    "wmic process where name='chrome.exe' get ProcessId",
+                    ["where", "chrome.exe"]):
+            with self.subTest(cmd=cmd):
+                sp.Popen(cmd)
+        self.assertEqual(browser_guard.blocked_attempts(), ())
+        self.assertEqual(len(calls), 4)
+
+    def test_no_kill_verb_is_in_the_unconditional_exemption(self):
+        """STALE-DUPLICATE GUARD, structural rather than textual: the exemption
+        list is what actually decides, and a kill verb landing back in it would
+        silently reopen the hole no matter what the comment says."""
+        overlap = sorted(browser_guard._PROCESS_TOOLS
+                         & browser_guard._KILL_TOOLS)
+        self.assertEqual(overlap, [],
+                         "these kill verbs exempt the WHOLE command line from "
+                         f"the browser scan again: {overlap}")
+        for verb in ("taskkill", "taskkill.exe", "pkill", "killall", "kill"):
+            with self.subTest(verb=verb):
+                self.assertNotIn(verb, browser_guard._PROCESS_TOOLS)
+                self.assertIn(verb, browser_guard._KILL_TOOLS)
+
+
+class CrossGuardTests(_GuardTestCase):
+    """``_reset_for_tests()`` restores ``subprocess.Popen`` to the STOCK class,
+    which throws away anything another guard parked on the subclass it replaces.
+
+    On 2026-08-20 that silently uninstalled ``core/no_window_subprocess`` — the
+    net that exists because ~38 ghost Windows Terminal windows appeared in 30
+    minutes — for the rest of every run, while ``no_window_subprocess.install()``
+    went on returning True because it latched on ``_ORIG_INIT[0]``. Same shape
+    as the live-data defect already fixed that day, aimed at a THIRD net.
+    tests/test_live_data_guard.py has the sibling assertion for the live-data
+    guard; this is the one for the no-window net."""
+
+    def test_unlatching_leaves_the_no_window_net_installed(self):
+        from core import no_window_subprocess as nw
+        if os.name != "nt":
+            self.skipTest("the no-window net is Windows-only")
+        # Importing bobert_companion.py is what arms this net in a real run;
+        # install() is idempotent and repair-only, so calling it here reproduces
+        # that state without dragging the monolith in.
+        nw.install()
+        self.assertTrue(nw.is_armed(),
+                        "the no-window net would not arm at all")
+        with _unlatched():
+            browser_guard.install(quiet=True)
+            self.assertTrue(
+                nw.is_armed(),
+                "browser_guard._reset_for_tests() + install() discarded "
+                "core/no_window_subprocess — from here on a bare "
+                "subprocess.run() in production code under test spawns a "
+                "VISIBLE console window on the owner's desktop, and "
+                "no_window_subprocess.install() still reports itself installed")
+        self.assertTrue(nw.is_armed())
+
+    def test_unlatching_leaves_the_live_data_guard_armed(self):
+        from tests import live_data_guard
+        if not live_data_guard._INSTALLED:
+            self.skipTest("live-data guard not installed")
+        with _unlatched():
+            browser_guard.install(quiet=True)
+            self.assertEqual(live_data_guard.unarmed_hooks(), [])
+        self.assertEqual(live_data_guard.unarmed_hooks(), [])
+
+    def test_the_undo_never_clobbers_a_sibling_that_wrapped_us(self):
+        """``_reset_for_tests()`` must not be able to DELETE another guard.
+
+        Whichever guard is armed first ends up underneath, and until 2026-08-20
+        our undo callable did a blind ``setattr(module, name, original)``: when a
+        sibling had wrapped our stub, that put OUR pre-guard snapshot back and
+        threw the sibling's hook away. Under the tools/ runners (which armed the
+        browser guard with no live-data guard in the process yet) that snapshot
+        was the RAW ``os.startfile``, so the first ``_unlatched()`` in this
+        module left the rest of the CI run with NO interception on the shell
+        route to a live JARVIS. The ordering is fixed in every runner now; this
+        makes the property hold regardless of who installs first.
+
+        Fake modules, so the running suite's own hooks are never touched."""
+        wb, sp, osmod, _calls = _fake_modules()
+        raw = osmod.startfile
+        undos = browser_guard._install_into(wb, sp, osmod)
+        our_stub = osmod.startfile
+        self.assertIsNot(our_stub, raw, "the guard did not wrap startfile")
+
+        # A sibling guard arriving AFTER us, wrapping our stub (this is exactly
+        # what tests/live_data_guard.py does to os.startfile).
+        def _sibling(path, *a, **k):
+            return our_stub(path, *a, **k)
+        _sibling.__wrapped__ = our_stub
+        osmod.startfile = _sibling
+
+        for undo in undos:
+            undo()
+        self.assertIs(osmod.startfile, _sibling,
+                      "browser_guard's undo discarded a sibling guard's hook — "
+                      "the run is now unprotected on os.startfile and nothing "
+                      "reports it")
+        # ...and with nobody on top, the undo still restores exactly as before:
+        # the identity check must not turn reset into a no-op.
+        osmod.startfile = raw
+        undos = browser_guard._install_into(wb, sp, osmod)
+        self.assertIsNot(osmod.startfile, raw, "re-install did not re-wrap")
+        for undo in undos:
+            undo()
+        self.assertIs(osmod.startfile, raw,
+                      "the undo stopped restoring even when nothing else had "
+                      "touched the attribute")
+
+    def test_a_sibling_guard_wrapping_our_stub_is_not_read_as_displacement(self):
+        """``unarmed_targets()`` must look THROUGH a wrapper another guard put
+        on top of our stub, or two correctly-cooperating guards read as one
+        broken one."""
+        saved = webbrowser.open
+        try:
+            def _sibling(url, *a, **k):
+                return saved(url, *a, **k)
+            _sibling.__wrapped__ = saved
+            webbrowser.open = _sibling
+            self.assertNotIn("webbrowser.open", browser_guard.unarmed_targets())
+        finally:
+            webbrowser.open = saved
+
+    def test_unarmed_targets_is_not_fooled_by_a_magicmock(self):
+        saved = webbrowser.open
+        try:
+            webbrowser.open = mock.MagicMock()
+            self.assertIn("webbrowser.open", browser_guard.unarmed_targets())
+        finally:
+            webbrowser.open = saved
 
 
 class WiringTests(unittest.TestCase):

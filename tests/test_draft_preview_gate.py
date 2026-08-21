@@ -22,6 +22,7 @@ mocked, so no audio runs and nothing is sent. stdlib unittest + mock only.
 """
 from __future__ import annotations
 
+import io
 import unittest
 from unittest import mock
 
@@ -404,6 +405,278 @@ class GetPendingVipRoutingTests(unittest.TestCase):
         mod._get_pending.return_value = {"body": "via private"}
         with mock.patch.object(gate.importlib, "import_module", return_value=mod):
             self.assertEqual(gate._get_pending("send_draft"), {"body": "via private"})
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  2026-08-20 adversarial review, HIGH — a REGRESSION FROM THE FAIL-CLOSED FIX
+#
+#  Failing closed on an unvoiced read-back was correct. But tray "Mute TTS" is
+#  a DELIBERATE owner toggle restored across reboots, so with it on every
+#  send_* draft was held forever; the refusal said "say 'send' again to retry",
+#  a retry that could never succeed; and the refusal was itself inaudible by
+#  construction. Silent, permanent, and self-contradicting.
+#
+#  The safety property must still hold — no spoken word, stray or deliberate,
+#  may confirm a draft he did not hear — so the fix is NOT fail-open. It is:
+#  name the cause, publish the draft where a muted owner can SEE it, and honour
+#  one explicit instruction ("send it anyway") that says out loud he accepts an
+#  unheard send.
+# ═════════════════════════════════════════════════════════════════════════
+class _MutedHarness(unittest.TestCase):
+    PENDING = {"to": "Sam", "subject": "Hi", "body": "ship it"}
+
+    def setUp(self):
+        import sys
+        import types
+        from core import state as core_state
+        self._core_state = core_state
+        # A stand-in monolith so the gate can publish to the HUD and read the
+        # last utterance WITHOUT importing the real one (which would run the
+        # monolith's import-time boot code inside the test process).
+        self.hud = mock.MagicMock(name="_write_hud_state")
+        self.bc = types.SimpleNamespace(_write_hud_state=self.hud,
+                                        _last_user_text=[""])
+        self._saved = sys.modules.get("bobert_companion")
+        sys.modules["bobert_companion"] = self.bc
+        self.addCleanup(self._restore_bc)
+        self.addCleanup(mock.patch.stopall)
+
+    def _restore_bc(self):
+        import sys
+        if self._saved is not None:
+            sys.modules["bobert_companion"] = self._saved
+        else:
+            sys.modules.pop("bobert_companion", None)
+
+    def _mute(self, on=True):
+        mock.patch.object(self._core_state, "_tts_muted", [bool(on)]).start()
+
+    def _said(self, utterance):
+        self.bc._last_user_text[0] = utterance
+
+    def _drive(self, *, pending=None, heard="yes"):
+        """Run the gate with a read-back that is never voiced."""
+        import contextlib
+        fn = mock.MagicMock(return_value="SENT")
+        buf = io.StringIO()
+        with mock.patch.object(gate, "_speak", return_value=False), \
+             mock.patch.object(gate, "_get_pending",
+                               return_value=(self.PENDING if pending is None
+                                             else pending)), \
+             mock.patch.object(gate, "_capture_and_transcribe",
+                               return_value=heard) as cap, \
+             contextlib.redirect_stdout(buf):
+            result = gate.run_with_gate("send_draft", "x", fn)
+        return result, fn, cap, buf.getvalue()
+
+
+class MutedSendIsExplainedNotSilentTests(_MutedHarness):
+    """THE test the fix exists for: a muted owner must be TOLD why nothing
+    sent, not left with silence and an impossible retry."""
+
+    def test_muted_hold_names_the_cause_and_a_remedy_that_can_work(self):
+        self._mute()
+        result, fn, cap, _out = self._drive()
+        fn.assert_not_called()
+        cap.assert_not_called()          # the confirm window never opens
+        low = result.lower()
+        self.assertIn("muted", low,
+                      "the owner must be told WHY, or the hold is "
+                      "indistinguishable from a bug: " + result)
+        self.assertIn("un-mute", low)
+        self.assertNotIn("say 'send' again to retry", low,
+                         "a retry against a persistent toggle can never "
+                         "succeed; that is the wording being fixed")
+
+    def test_the_held_draft_is_printed_where_a_muted_owner_can_see_it(self):
+        self._mute()
+        _result, _fn, _cap, out = self._drive()
+        self.assertIn("SEND HELD", out)
+        self.assertIn("ship it", out,
+                      "the draft body has to be visible somewhere — TTS is "
+                      "exactly what is unavailable")
+        self.assertIn("Mute TTS", out)
+
+    def test_the_hold_is_published_to_the_hud_with_the_mute_flag(self):
+        self._mute()
+        self._drive()
+        self.hud.assert_called()
+        kw = self.hud.call_args.kwargs
+        self.assertTrue(kw.get("held_send"))
+        self.assertIn("Mute TTS", kw.get("held_send_reason", ""))
+        self.assertTrue(kw.get("tts_muted"))
+
+    def test_the_refusal_is_classified_as_a_failure_so_it_is_surfaced(self):
+        # send_* is in NEITHER SPEAK_RESULT_VERBATIM_ACTIONS nor
+        # INFORMATIVE_ACTIONS, so a result with no FAILURE_MARKER is never
+        # reported to the owner at all. Silence is the bug being fixed, so the
+        # hold line must keep a marker.
+        from core.failure_markers import FAILURE_MARKERS
+        self._mute()
+        result, _fn, _cap, _out = self._drive()
+        low = result.lower()
+        self.assertTrue(any(m.lower() in low for m in FAILURE_MARKERS),
+                        "a marker-free hold would be filed as a SUCCESS and "
+                        "never surfaced: " + result)
+
+    def test_it_only_claims_the_HUD_when_the_HUD_really_got_it(self):
+        # Honest-failure contract: the refusal says where the draft is. With
+        # no HUD writer reachable it must promise only the console.
+        import sys
+        self._mute()
+        saved = sys.modules.pop("bobert_companion", None)
+        try:
+            result, _fn, _cap, _out = self._drive()
+        finally:
+            if saved is not None:
+                sys.modules["bobert_companion"] = saved
+        low = result.lower()
+        self.assertIn("console", low)
+        self.assertNotIn("hud", low,
+                         "nothing wrote to the HUD, so the refusal must not "
+                         "say it did: " + result)
+
+    def test_a_broken_tts_path_gets_the_other_wording(self):
+        self._mute(False)
+        result, fn, _cap, _out = self._drive()
+        fn.assert_not_called()
+        self.assertIn("holding the send", result.lower())
+        self.assertNotIn("muted", result.lower(),
+                         "do not claim a cause that was not established")
+
+
+class MutedOwnerOverrideTests(_MutedHarness):
+    """The one honest route through a muted gate: his own explicit words."""
+
+    def test_send_it_anyway_sends_and_says_it_went_out_unread(self):
+        self._mute()
+        self._said("send it anyway")
+        result, fn, cap, _out = self._drive()
+        fn.assert_called_once_with("x")
+        cap.assert_not_called()          # still no voice window, ever
+        self.assertIn("SENT", result)
+        self.assertIn("without reading it back", result.lower())
+
+    def test_other_explicit_phrasings_also_work(self):
+        for said in ("send it without reading it back",
+                     "just send it unread",
+                     "send the draft, i know what it says",
+                     "no readback, just send it"):
+            with self.subTest(said=said):
+                self._mute()
+                self._said(said)
+                _result, fn, _cap, _out = self._drive()
+                fn.assert_called_once_with("x")
+
+    def test_the_ordinary_confirm_vocabulary_can_NEVER_clear_a_muted_gate(self):
+        # This is the safety property. "yes" / "okay" / "send it" is exactly
+        # what a stray word in the room sounds like, and he did not hear the
+        # draft, so none of it may send.
+        for said in ("yes", "okay", "send it", "send the draft", "confirm",
+                     "go ahead and send it", "do it"):
+            with self.subTest(said=said):
+                self._mute()
+                self._said(said)
+                result, fn, _cap, _out = self._drive()
+                fn.assert_not_called()
+                self.assertIn("muted", result.lower())
+
+    def test_a_cancel_shaped_utterance_never_overrides(self):
+        for said in ("don't send it", "no, cancel that", "do not send it anyway"):
+            with self.subTest(said=said):
+                self._mute()
+                self._said(said)
+                _result, fn, _cap, _out = self._drive()
+                fn.assert_not_called()
+
+    def test_an_override_phrase_without_the_word_send_does_not_fire(self):
+        # Guards a STALE utterance being read as consent for some later
+        # background send: the utterance must itself be a send instruction.
+        self._mute()
+        self._said("anyway, what is the weather")
+        _result, fn, _cap, _out = self._drive()
+        fn.assert_not_called()
+
+    def test_override_needs_a_draft_we_could_actually_show_him(self):
+        # _readback_text raised, so nothing was displayed either — there is
+        # nothing he could have consented to.
+        self._mute()
+        self._said("send it anyway")
+        _result, fn, _cap, _out = self._drive(pending="not-a-dict")
+        fn.assert_not_called()
+
+    def test_override_also_works_when_tts_is_broken_rather_than_muted(self):
+        self._mute(False)
+        self._said("send it anyway")
+        result, fn, _cap, _out = self._drive()
+        fn.assert_called_once_with("x")
+        self.assertIn("SENT", result)
+
+    def test_a_non_string_utterance_cell_is_ignored(self):
+        # A MagicMock stringifies into something a pattern could match; the
+        # shape check must reject it (the truthy-MagicMock lesson).
+        self._mute()
+        self.bc._last_user_text = mock.MagicMock()
+        _result, fn, _cap, _out = self._drive()
+        fn.assert_not_called()
+
+
+class MuteDetectionTests(_MutedHarness):
+    def test_reads_the_canonical_core_state_cell(self):
+        self._mute(True)
+        self.assertTrue(gate.tts_is_muted())
+        self._mute(False)
+        self.assertFalse(gate.tts_is_muted())
+
+    def test_a_mock_shaped_cell_reads_as_not_muted(self):
+        mock.patch.object(self._core_state, "_tts_muted",
+                          mock.MagicMock()).start()
+        self.assertFalse(gate.tts_is_muted(),
+                         "a truthy MagicMock must not answer 'muted' for every "
+                         "test double")
+
+    def test_override_matcher_table(self):
+        cases = {
+            "send it anyway": True,
+            "send that anyway": True,
+            "send it unheard": True,
+            "send it without the readback": True,
+            "skip the readback and send it": True,
+            "no readback, send it": True,
+            "send it, i already know what it says": True,
+            "send it": False,
+            "yes send it now": False,
+            "okay": False,
+            "": False,
+            "anyway": False,
+            "read it back again": False,
+            # a negated / cancelled send is never an override, however the
+            # rest of the sentence reads
+            "do not send it anyway": False,
+            "don't send it anyway": False,
+            "cancel that, send it anyway": False,
+            # ...but a bare "no" inside an override phrase is not a cancel
+            "no readback, send it anyway": True,
+        }
+        for said, expected in cases.items():
+            with self.subTest(said=said):
+                self._said(said)
+                self.assertIs(gate._owner_asked_for_unheard_send(), expected)
+
+
+class HeldMarkerIsClearedTests(_MutedHarness):
+    def test_a_normal_confirmed_send_clears_the_held_marker(self):
+        fn = mock.MagicMock(return_value="SENT")
+        with mock.patch.object(gate, "_speak", return_value=True), \
+             mock.patch.object(gate, "_get_pending", return_value=self.PENDING), \
+             mock.patch.object(gate, "_capture_and_transcribe",
+                               return_value="yes"):
+            result = gate.run_with_gate("send_draft", "x", fn)
+        self.assertEqual(result, "SENT")
+        cleared = [c for c in self.hud.call_args_list
+                   if c.kwargs.get("held_send") == ""]
+        self.assertTrue(cleared, "a completed send must not leave a stale "
+                                 "'held' marker on the HUD")
 
 
 if __name__ == "__main__":

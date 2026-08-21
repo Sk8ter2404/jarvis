@@ -39,12 +39,21 @@ sw = importlib.util.module_from_spec(_spec)
 assert _spec.loader is not None
 _spec.loader.exec_module(sw)
 
-# Intentionally GUI-only keys that persist a non-secret connection HINT to
-# user_settings.json but deliberately have NO core/config.py constant — they
-# are reference values the user reads off, not config the runtime consumes.
-# Confirmed against the settings_window.py module docstring ("non-secret
-# connection hints (host/port)"). Adding a key here is a deliberate, reviewed
-# exception — it should be rare.
+# Intentionally GUI-only keys that persist to user_settings.json but
+# deliberately have NO core/config.py constant.
+#
+# CORRECTED 2026-08-20. The old justification here — "reference values the user
+# reads off" — was factually wrong and had to go: NOTHING in the tree ever
+# WRITES these keys. They ship as "", they are "" in the owner's live
+# user_settings.json, and the only writer is the owner typing into the box. A
+# value cannot be "read off" unless something puts it there. They are OWNER
+# NOTES, and the settings rows now say so in their own labels and help (pinned
+# by GuiOnlyRowsAreHonestTests below) instead of relying on a comment in a test
+# file nobody opens while troubleshooting OBS.
+#
+# See the block comment above the rows in tools/settings_window.py for why they
+# are neither wired nor deleted. Adding a key here is a deliberate, reviewed
+# exception — it should be rare, and it must come with honest label/help text.
 _GUI_ONLY_ALLOWLIST = {
     "OBS_HOST_HINT",
     "OBS_PORT_HINT",
@@ -155,6 +164,51 @@ class SchemaWiringTests(unittest.TestCase):
                     "constant — it's properly wired, so remove it from "
                     "_GUI_ONLY_ALLOWLIST and let the main test cover it.",
             )
+
+    def test_gui_only_rows_advertise_that_nothing_reads_them(self):
+        """2026-08-20 LOW finding: three GUI-editable, persisted, help-texted
+        settings that no runtime code reads.
+
+        Nothing MISBEHAVED — obs_control's failure line names the endpoint it
+        actually dialled, and sh_hue falls back to mDNS discovery — so this was
+        never the silent-failure class. The cost was owner troubleshooting time:
+        the rows are rendered by the same tab builder as every live knob, saved
+        by the same button, and confirmed with the same "Saved." status, so
+        there was no way to tell them apart. The old OBS help even split the
+        password (env) from the host (this field), the exact inverse of the
+        truth.
+
+        Fixing that in prose alone is how it rots back. This asserts it."""
+        for key, source in (("OBS_HOST_HINT", "OBS_HOST"),
+                            ("OBS_PORT_HINT", "OBS_PORT"),
+                            ("HUE_BRIDGE_IP_HINT", "sh_hue_config.json")):
+            spec = sw.SCHEMA[key]
+            label = str(spec.get("label", ""))
+            help_text = str(spec.get("help", ""))
+            self.assertIn(
+                "note only", label.lower(),
+                msg=f"{key}'s LABEL must mark it as a note; the label is what "
+                    "the owner reads before he reads the help.")
+            self.assertIn(
+                "not read", (label + " " + help_text).lower(),
+                msg=f"{key} must state outright that nothing reads it.")
+            self.assertIn(
+                source, help_text,
+                msg=f"{key}'s help must name the REAL source ({source}) so a "
+                    "misconfigured integration points somewhere useful.")
+            # The old help's "e.g. localhost" was wrong for this box even as an
+            # example: localhost resolves ::1 first here, while obs_control's
+            # _DEFAULT_HOST is 127.0.0.1.
+            self.assertNotIn("localhost", help_text.lower(), msg=key)
+
+    def test_the_obs_status_row_names_its_source_like_the_hue_one(self):
+        """_status_hue has carried "Configured via data/sh_hue_config.json"
+        since it was written, three rows above the Hue note field — which is
+        why the Hue half of this finding was half-mitigated and the OBS half
+        was not."""
+        self.assertIn("OBS_HOST", str(sw.SCHEMA["_status_obs"].get("help", "")))
+        self.assertIn("sh_hue_config.json",
+                      str(sw.SCHEMA["_status_hue"].get("help", "")))
 
     def test_runtime_config_flips_have_a_persistence_path(self):
         """INVERSE invariant of the dead-toggle guard: a RUNTIME assignment to

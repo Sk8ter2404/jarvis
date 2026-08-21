@@ -860,7 +860,14 @@ def _body_scale_m(joints: dict) -> Optional[float]:
 
 def arm_extension(joints: dict, side: str) -> dict:
     """Describe how EXTENDED one arm (`side` ∈ {"left","right"}) is, for the
-    air-mouse reach-to-engage gate. Reads the shoulder / elbow / hand joints of
+    air-mouse engage gate. NOTE (2026-08-20): that gate is HEIGHT-based —
+    `lift_m`, hand above the shoulder line. The reach fields below
+    (forward_reach_m / reach_ratio / straightness) were the original
+    reach-to-engage signal and are now DEMOTED to non-gating
+    (skills/kinect_air_mouse.py ships AIR_MOUSE_EXTEND_*_ENGAGE = 0.0, so a
+    forward-reaching arm can neither engage nor hold the gate); they are still
+    computed and still surfaced for tuning, calibration and diagnostics.
+    Reads the shoulder / elbow / hand joints of
     that side plus a torso depth reference off `joints` (the get_bodies() shape).
     NEVER raises — any missing joint leaves its field None. Shape:
 

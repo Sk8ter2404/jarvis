@@ -321,9 +321,20 @@ def _act_hide_hud(_: str = "") -> str:
     return "HUD hidden, sir. Say 'show HUD' when you want it back."
 
 
-def _set_unified_hud_hidden(hidden: bool) -> None:
+def _set_unified_hud_hidden(hidden: bool) -> bool:
     """Set the unified HUD's own ✕-button 'hidden' flag in its control file so
-    its close-button hide and the voice show/hide commands stay in sync."""
+    its close-button hide and the voice show/hide commands stay in sync.
+
+    Returns True when the latch actually reached disk, False when it did not.
+    2026-08-20: it used to swallow every failure and return None, and
+    _act_show_hud said "HUD restored, sir." on the strength of that None -- a
+    spoken success nothing had verified. The swallow itself is deliberate and
+    pinned (tests/test_actions_sec1.py
+    ::test_replace_and_cleanup_both_fail_still_swallowed): this runs on the
+    voice path and must never raise into it. What changed is that the caller
+    can now TELL, and one log line names the failure instead of nothing at
+    all. Unlike _write_hud_state's ~30 Hz callers this helper only runs on an
+    explicit user command, so a log line here cannot spam."""
     try:
         import os as _os
         import json as _json
@@ -359,15 +370,79 @@ def _set_unified_hud_hidden(hidden: bool) -> None:
             except Exception:
                 pass
             raise
+        return True
+    except Exception as e:
+        print(f"  [hud] couldn't write the ✕ hide latch "
+              f"(unified_hud_state.json): {type(e).__name__}: {e}")
+        return False
+
+
+def _hud_child_state(bc) -> str:
+    """What bobert's ``_hud_process`` handle says about the HUD subprocess:
+    ``"running"`` / ``"dead"`` / ``"never-launched"``.
+
+    Deliberately asymmetric — it reports death only from POSITIVE evidence.
+    ``Popen.poll()`` is None while the child lives and an int returncode once it
+    has exited, so an int means dead and None means alive; anything else (a test
+    double, an unexpected object) is NOT evidence of death and reads as running.
+    Claiming a failure we did not verify is the same sin as claiming a success
+    we did not verify. Uses poll(), never psutil.pid_exists — that returns True
+    for both Windows dead states. Never raises."""
+    try:
+        proc = getattr(bc, "_hud_process", None)
     except Exception:
-        pass
+        return "running"
+    if proc is None:
+        # Boot-time launch failed, HUD_ENABLED was off at boot, or
+        # _shutdown_hud() ran. Either way there is nothing on screen.
+        return "never-launched"
+    try:
+        rc = proc.poll()
+    except Exception:
+        return "running"
+    return "dead" if isinstance(rc, int) else "running"
+
+
+def _restore_hud(bc) -> str:
+    """Shared body of show_hud / toggle_hud's un-hide branch.
+
+    2026-08-20 honest-failure fix. This used to write two latches and say "HUD
+    restored, sir." unconditionally — including when HUD_ENABLED was off (both
+    writes are no-ops then), when the latch write failed (swallowed, silent),
+    and when the HUD subprocess was DEAD, which is precisely the state the owner
+    is in when he says "turn on the HUD" (core/prompts.py documents that phrase
+    as a show_hud trigger). Nothing polls the child, so the parent can believe a
+    HUD is up long after a Qt crash, a missing PyQt6 (the HUD exits 2), or the
+    owner killing the window.
+
+    Now: relaunch when the handle says the child is gone, and report honestly
+    when the HUD cannot actually be put back. The relaunch is only safe because
+    bobert_companion._launch_hud() is idempotent as of the same date — without
+    that guard this call would orphan a live HUD on the tray route, which
+    already calls _act_show_hud and then _launch_hud itself."""
+    if not getattr(bc, "HUD_ENABLED", True):
+        return ("The HUD is switched off in Settings, sir — turn 'On-screen "
+                "HUD' back on there and I'll bring it up.")
+    bc._write_hud_state(visible=True)
+    latched = _set_unified_hud_hidden(False)   # clear a ✕-button hide too
+    if _hud_child_state(bc) != "running":
+        try:
+            bc._launch_hud()
+        except Exception as e:
+            print(f"  [hud] relaunch from show_hud failed: "
+                  f"{type(e).__name__}: {e}")
+    if _hud_child_state(bc) != "running":
+        return ("The HUD process isn't running, sir, and I couldn't restart "
+                "it — the tray's Open HUD is the other way in.")
+    if not latched:
+        return ("I brought the HUD back, sir, but I couldn't clear its close-"
+                "button latch — it may hide itself again on the next tick.")
+    return "HUD restored, sir."
 
 
 def _act_show_hud(_: str = "") -> str:
     """Re-display the HUD after a previous hide_hud (or a ✕-button close)."""
-    _bc()._write_hud_state(visible=True)
-    _set_unified_hud_hidden(False)   # clear a ✕-button hide too
-    return "HUD restored, sir."
+    return _restore_hud(_bc())
 
 
 def _act_toggle_hud(_: str = "") -> str:
@@ -378,14 +453,16 @@ def _act_toggle_hud(_: str = "") -> str:
             currently_visible = bool(bc._hud_state_cache.get("visible", True))
     except Exception:
         currently_visible = True
-    bc._write_hud_state(visible=not currently_visible)
     if currently_visible:
+        bc._write_hud_state(visible=False)
         return "HUD hidden, sir."
     # Toggling back to visible must also clear a ✕-button hide, exactly like
     # _act_show_hud — otherwise the persisted 'hidden' latch keeps the window
-    # down and the toggle silently fails to bring it back.
-    _set_unified_hud_hidden(False)
-    return "HUD restored, sir."
+    # down and the toggle silently fails to bring it back. Delegating to
+    # _restore_hud keeps ONE owner of the un-hide rule (this pair drifting apart
+    # is what tests/monolith/test_monolith_tray_contract.py exists to stop) and
+    # inherits the deliverability check.
+    return _restore_hud(bc)
 
 
 # ─── Self-diagnostic probes (Phase 4B) ─────────────────────────────────
@@ -2693,6 +2770,117 @@ def _hard_exit_via_bc(bc, code: int = 0, clean: bool = False) -> None:
     os._exit(code)
 
 
+def _release_audio_streams(bc, budget_s: float = 3.0) -> None:
+    """Release the PortAudio/WASAPI streams this process actually owns, before
+    TerminateProcess lands. Bounded by ``budget_s``; never raises.
+
+    H-3, FIFTH COPY (2026-08-20). This step used to be one line:
+
+        try: bc.sd.stop()                 # WASAPI streams
+        except Exception: pass
+
+    Four copies of that escape hatch were deleted on 2026-08-20
+    (bobert_companion._safe_close_stream, core/wake_word, skills/ambient_listen,
+    skills/enroll_voice); this one was missed, and it is the only one whose
+    stated purpose DEPENDED on the claim those deletions disproved. Module-level
+    ``sd.stop()`` (sounddevice 0.5.5, sounddevice.py:406-418) does not touch
+    "WASAPI streams": it stops+closes ``_last_callback`` and nothing else, and
+    ``_last_callback`` is published in exactly one place —
+    ``_CallbackContext.start_stream``, reached only from
+    sd.play()/sd.rec()/sd.playrec(). Every stream alive at shutdown here is an
+    explicitly constructed InputStream/OutputStream (the wake-word detector's
+    persistent stream, ambient listen's mic + WASAPI-loopback streams,
+    record_speech's stream), so the call was a NO-OP for all of them — the
+    function went on to TerminateProcess with threads still inside the WASAPI
+    driver, which is precisely the kernel-stuck 'terminating forever' corpse
+    _release_native_resources exists to prevent.
+
+    And when ``_last_callback`` was NOT empty it was worse than a no-op: the
+    goodbye line is spoken two seconds earlier, so a queued proactive/timer
+    _speak can be mid-playback with play_with_lipsync's single-toucher reaper
+    owning that stream — sd.stop() would then stop+close it from a SECOND
+    thread (0xc0000374, mid-teardown). Since H-7 the reaper's stream is
+    detached from ``_last_callback`` at handoff, so the call is now provably a
+    no-op in every case: it can only ever act on a stream nobody owns.
+
+    Teardown does NOT get an exemption from the H-3 rule. What it gets instead
+    is this: ask each owner to close its own stream, then wait — bounded — for
+    the ownership flags to actually drop. The signalling runs on a daemon so a
+    wedged owner costs ``budget_s``, not the caller's whole failsafe window
+    (the ambient stops join 3 s each internally); an abandoned daemon dies with
+    the process, the same idiom as every other abandonable close here."""
+    done = {}
+
+    def _signal():
+        # (a) record_speech / the main loop. The watchdog reset signal is the
+        #     documented way to make it wake from audio_q.get, close its
+        #     InputStream and return (see _main_loop_watchdog_thread).
+        try:
+            bc._watchdog_reset_signal.set()
+            done["record_speech"] = True
+        except Exception:
+            pass
+        # (b) the wake-word detector's persistent InputStream — the one stream
+        #     that is open for the entire session.
+        try:
+            wl = sys.modules.get("skill_wake_listener")
+            det = getattr(wl, "_detector", None) if wl is not None else None
+            stop = getattr(det, "stop", None)
+            if callable(stop):
+                stop()
+                done["wake_word"] = True
+        except Exception:
+            pass
+        # (c) ambient listen's mic and WASAPI-loopback workers. Both entry
+        #     points are already bounded (3 s joins) and idempotent when the
+        #     worker is not running.
+        try:
+            al = sys.modules.get("skill_ambient_listen")
+            for name in ("ambient_listen_stop", "ambient_audio_stop"):
+                fn = getattr(al, name, None) if al is not None else None
+                if callable(fn):
+                    fn("")
+                    done[name] = True
+        except Exception:
+            pass
+
+    try:
+        import threading as _threading
+        t = _threading.Thread(target=_signal, name="audio-release", daemon=True)
+        t.start()
+        t.join(timeout=budget_s)
+    except Exception:
+        # Could not even spawn the helper (thread exhaustion): do it inline
+        # rather than skipping the release entirely.
+        try:
+            _signal()
+        except Exception:
+            pass
+
+    # Now wait — bounded — for the owner flags to actually drop, so
+    # TerminateProcess lands with nothing inside the driver. A flag that never
+    # clears means a native call really is still running; we report that
+    # instead of pretending the release worked.
+    deadline = time.time() + budget_s
+    live = True
+    while time.time() < deadline:
+        try:
+            with bc._mic_lock:
+                live = bool(bc._pa_streams_live())
+        except Exception:
+            live = False        # no gate on this host — nothing to wait for
+            break
+        if not live:
+            break
+        time.sleep(0.05)
+    if live:
+        print("  [teardown] audio streams did NOT all release in "
+              f"{budget_s:.1f}s (a native call is still in flight) — "
+              f"terminating anyway")
+    elif done:
+        print(f"  [teardown] audio streams released ({', '.join(sorted(done))})")
+
+
 def _release_native_resources(bc) -> None:
     """Best-effort release of every native/driver resource BEFORE process
     termination. TerminateProcess (v2.0.51) prevents the ExitProcess
@@ -2748,10 +2936,7 @@ def _release_native_resources(bc) -> None:
             _kb.set_enabled(False)
     except Exception:
         pass
-    try:
-        bc.sd.stop()                      # WASAPI streams
-    except Exception:
-        pass
+    _release_audio_streams(bc)
     try:
         bc._face_track_stop.set()         # camera caps (thread releases them)
     except Exception:
@@ -2790,8 +2975,9 @@ def _act_shutdown_jarvis(_: str = "") -> str:
         print(f"  [shutdown_jarvis] goodbye TTS failed: {_e}")
 
     def _do_shutdown():
-        # FAILSAFE: the teardown steps below are not time-bounded (sd.stop /
-        # HUD kills can block in native code forever) — arm an independent
+        # FAILSAFE: the teardown steps below are not time-bounded (the audio
+        # release and the HUD kills can block in native code forever, and the
+        # CUDA in-flight wait alone allows 20 s) — arm an independent
         # hard kill so a wedged step can never strand a half-shut-down
         # immortal process. clean=True: this path only runs on an
         # INTENTIONAL stop, so the watchdog must not resurrect.
@@ -2805,8 +2991,11 @@ def _act_shutdown_jarvis(_: str = "") -> str:
             # CUDA/Kinect first — a thread parked in a driver at terminate
             # time corpse-pins the VRAM until reboot (2026-07-13).
             _release_native_resources(bc)
-            try: bc.sd.stop()
-            except Exception: pass
+            # (No `bc.sd.stop()` here: it was a second copy of a call that
+            # cannot free any stream this process owns, and
+            # _release_native_resources already ran the real release.
+            # _face_track_stop is re-set because it costs nothing and the
+            # helper's own attempt is inside a swallowing try.)
             try: bc._face_track_stop.set()
             except Exception: pass
             try: bc._focus_tracker_stop.set()

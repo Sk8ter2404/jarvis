@@ -2286,7 +2286,75 @@ class BlueGreenLoopTickBranchTests(SectionSevenBase):
         self._p(self.bc, "_bgm", self.bgm)
         self._p(self.bc, "_bg_last_heartbeat", [self.bc.time.time()])  # not due
         self._p(self.bc, "_bg_handoff_seen_at", [0.0])
+        self._p(self.bc, "_bg_handoff_grace_s",
+                [self.bc._BG_HANDOFF_GRACE_DEFAULT_S])
         self._p(self.bc, "BLUE_GREEN_ROLE", "prod")
+
+    # ── grace_seconds is transmitted; honour it (2026-08-20) ─────────────
+    # signal_handoff() has always put grace_seconds in the payload and this
+    # side has always exited on a hardcoded `>= 10.0`, so raising the grace on
+    # the ceremony silently changed nothing on the instance that has to drain
+    # its TTS.
+
+    def test_payload_grace_is_recorded(self):
+        self.bgm.consume_handoff_signal.return_value = {
+            "target_version": "2.0", "grace_seconds": 25}
+        self.bc._blue_green_loop_tick()
+        self.assertEqual(self.bc._bg_handoff_grace_s[0], 25.0)
+
+    def test_exit_waits_the_payload_grace_not_a_hardcoded_ten(self):
+        self.bgm.consume_handoff_signal.return_value = {
+            "target_version": "2.0", "grace_seconds": 25}
+        t0 = self.bc.time.time()
+        self.bc._blue_green_loop_tick()
+        seen = self.bc._bg_handoff_seen_at[0]
+        self.assertGreater(seen, 0.0)
+        # 12 s in: past the OLD hardcoded 10 s, but well inside a 25 s grace.
+        self.bgm.consume_handoff_signal.return_value = None
+        with mock.patch.object(self.bc.time, "time", return_value=seen + 12.0):
+            self.assertFalse(self.bc._blue_green_loop_tick(),
+                             "exited after 10 s while the ceremony asked for 25")
+        with mock.patch.object(self.bc.time, "time", return_value=seen + 26.0):
+            self.assertTrue(self.bc._blue_green_loop_tick())
+        self.assertIsInstance(t0, float)
+
+    def test_missing_or_junk_grace_falls_back_to_the_default(self):
+        for payload in ({"target_version": "2.0"},
+                        {"target_version": "2.0", "grace_seconds": "soon"},
+                        {"target_version": "2.0", "grace_seconds": None}):
+            self.bc._bg_handoff_seen_at[0] = 0.0
+            self.bc._bg_handoff_grace_s[0] = 999.0
+            self.bgm.consume_handoff_signal.return_value = payload
+            self.bc._blue_green_loop_tick()
+            self.assertEqual(self.bc._bg_handoff_grace_s[0],
+                             self.bc._BG_HANDOFF_GRACE_DEFAULT_S, payload)
+
+    def test_absurd_grace_is_clamped(self):
+        # run_blue_green_handoff only waits grace + 8 s before declaring
+        # failure and rolling back, so honouring an unbounded payload would
+        # guarantee a rollback rather than a graceful handoff.
+        self.bgm.consume_handoff_signal.return_value = {
+            "target_version": "2.0", "grace_seconds": 10_000}
+        self.bc._blue_green_loop_tick()
+        self.assertEqual(self.bc._bg_handoff_grace_s[0],
+                         self.bc._BG_HANDOFF_GRACE_MAX_S)
+        self.bc._bg_handoff_seen_at[0] = 0.0
+        self.bgm.consume_handoff_signal.return_value = {
+            "target_version": "2.0", "grace_seconds": -5}
+        self.bc._blue_green_loop_tick()
+        self.assertEqual(self.bc._bg_handoff_grace_s[0], 0.0)
+
+    def test_handoff_failure_resets_the_grace_with_the_pending_exit(self):
+        self.bgm.consume_handoff_signal.return_value = {
+            "target_version": "2.0", "grace_seconds": 45}
+        self.bc._blue_green_loop_tick()
+        self.assertEqual(self.bc._bg_handoff_grace_s[0], 45.0)
+        self.bgm.consume_handoff_signal.return_value = None
+        self.bgm.consume_handoff_failure_signal.return_value = {"reason": "x"}
+        self.bc._blue_green_loop_tick()
+        self.assertEqual(self.bc._bg_handoff_seen_at[0], 0.0)
+        self.assertEqual(self.bc._bg_handoff_grace_s[0],
+                         self.bc._BG_HANDOFF_GRACE_DEFAULT_S)
 
     def test_handoff_announce_exception_swallowed(self):
         self.bgm.consume_handoff_signal.return_value = {"target_version": "2.0"}

@@ -1125,5 +1125,197 @@ class KasaBoundedCallTests(_KasaBase):
         self.assertIn("falling back to broadcast", out)
 
 
+# ═════════════════════════════════════════════════════════════════════════
+#  2026-08-20 adversarial review, MED: the honesty fix over-corrected
+#
+#  "dim the entry light" against a non-dimmable plug switches the plug fully ON
+#  and cannot dim. The pre-2026-08-20 answer was "Set to 30%, sir" — a lie. The
+#  fix made it ok:False, which the router renders as "That didn't work, sir" —
+#  the mirror-image lie: the light is now BRIGHT and he is told nothing
+#  happened. Partial must read as partial.
+# ═════════════════════════════════════════════════════════════════════════
+class KasaPartialSuccessTests(_KasaBase):
+    def _dev_patch(self, dev):
+        p = mock.patch.object(self.mod, "_device_for", return_value=dev)
+        p.start()
+        self.addCleanup(p.stop)
+        return dev
+
+    def test_a_capability_gap_with_something_applied_is_PARTIAL(self):
+        self._dev_patch(FakeKasaDevice(alias="Entry Light", is_dimmable=False))
+        res = self.mod.set_state({"name": "Entry Light"}, brightness=30, on=True)
+        self.assertFalse(res["ok"])              # the whole request did NOT land
+        self.assertTrue(res["partial_ok"])       # ...but part of it did
+        self.assertTrue(res["applied"].get("on"))
+        self.assertEqual(res["failed"], {})
+        self.assertIn("not dimmable", res["skipped"]["brightness"])
+
+    def test_a_device_that_could_not_be_reached_is_NOT_partial(self):
+        with mock.patch.object(self.mod, "_device_for", return_value=None):
+            res = self.mod.set_state({"name": "Ghost"}, on=True)
+        self.assertFalse(res.get("partial_ok"))
+
+    def test_an_attempted_and_raised_sub_command_is_NOT_partial(self):
+        # `failed` means something was tried and blew up — that is a real
+        # failure even if another step landed, and must keep the failure voice.
+        dev = self._dev_patch(FakeKasaDevice(alias="Bulb", is_dimmable=True))
+
+        async def _boom(_pct):
+            raise RuntimeError("no")
+        dev.set_brightness = _boom
+        res = self.mod.set_state({"name": "Bulb"}, brightness=30, on=True)
+        self.assertFalse(res["ok"])
+        self.assertFalse(res["partial_ok"])
+        self.assertIn("brightness", res["failed"])
+
+    def test_a_fully_applied_request_is_not_flagged_partial(self):
+        self._dev_patch(FakeKasaDevice(alias="Bulb", is_dimmable=True))
+        res = self.mod.set_state({"name": "Bulb"}, brightness=30)
+        self.assertTrue(res["ok"])
+        self.assertNotIn("partial_ok", res)
+
+    def test_the_partial_note_is_speakable_and_marker_free(self):
+        from core.failure_markers import FAILURE_MARKERS
+        self._dev_patch(FakeKasaDevice(alias="Entry Light", is_dimmable=False))
+        res = self.mod.set_state({"name": "Entry Light"}, brightness=30, on=True)
+        note = self.mod._partial_note(res).lower()
+        self.assertIn("not dimmable", note)
+        self.assertEqual([m for m in FAILURE_MARKERS if m.lower() in note], [],
+                         "a partial is a success in part; a marker would drop "
+                         "the spoken line off the verbatim path")
+
+    def test_the_skills_own_control_path_does_not_call_a_partial_a_failure(self):
+        devs = [{"name": "Entry Light", "lan_ip": "10.0.0.5"}]
+        partial = {"ok": False, "partial_ok": True, "device": "Entry Light",
+                   "applied": {"on": True},
+                   "skipped": {"brightness": "device is not dimmable"},
+                   "failed": {}, "error": "kasa 'Entry Light': ..."}
+        with mock.patch.object(self.mod, "list_devices", return_value=devs), \
+             mock.patch.object(self.mod, "_tuya_mod", return_value=None), \
+             mock.patch.object(self.mod, "set_state", return_value=partial):
+            out = self.actions["smart_home_control"]("turn on the entry light")
+        low = out.lower()
+        self.assertNotIn("that didn't work", low)
+        self.assertIn("entry light on", low)
+        self.assertIn("not dimmable", low)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  2026-08-20 adversarial review, LOW: the 20 s budget, and what it says
+#
+#  (a) the deadline was only checked BETWEEN devices, so the last device could
+#      still run its full 12 s bound plus a 10 s broadcast fallback — ~34 s
+#      against a nominal 20 s ceiling;
+#  (b) the "I couldn't get to them in time" line was appended to the STATUS
+#      answer too, and smart_home_control is spoken verbatim — so a partial
+#      status read was dropped and re-run through the LLM.
+# ═════════════════════════════════════════════════════════════════════════
+class KasaTurnBudgetClampTests(_KasaBase):
+
+    def tearDown(self):
+        self.mod._set_turn_deadline(None)
+
+    def test_a_call_is_clamped_to_the_time_left_in_the_turn(self):
+        # 12 s per-call bound, but only ~0.05 s of turn budget left.
+        self.mod._set_turn_deadline(time.monotonic() + 0.05)
+        t0 = time.monotonic()
+        with self.assertRaises(TimeoutError) as ctx:
+            self.mod._run_async(asyncio.sleep(30), what="clamped call")
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, self.mod._CALL_TIMEOUT_SECS,
+                        "the call ran its own bound instead of the remaining "
+                        "turn budget")
+        self.assertIn("clamped call", str(ctx.exception))
+
+    def test_the_clamp_has_a_floor_so_the_last_device_still_gets_a_chance(self):
+        # An exhausted budget must not turn into a 0 s timeout that reports a
+        # failure without attempting anything.
+        self.mod._set_turn_deadline(time.monotonic() - 5.0)
+
+        async def _quick():
+            return "done"
+        self.assertEqual(self.mod._run_async(_quick(), what="floored"), "done")
+
+    def test_no_deadline_means_the_per_call_bound_is_untouched(self):
+        self.mod._set_turn_deadline(None)
+
+        async def _quick():
+            return "done"
+        self.assertEqual(self.mod._run_async(_quick(), what="unbudgeted"),
+                         "done")
+
+    def test_an_explicit_unbounded_timeout_is_still_unbounded(self):
+        self.mod._set_turn_deadline(time.monotonic() + 0.01)
+
+        async def _quick():
+            return "done"
+        self.assertEqual(self.mod._run_async(_quick(), timeout=None), "done")
+
+    def test_the_deadline_is_cleared_after_a_control_turn(self):
+        with mock.patch.object(self.mod, "list_devices", return_value=[]), \
+             mock.patch.object(self.mod, "_tuya_mod", return_value=None):
+            self.actions["smart_home_control"]("turn on the lamp")
+        self.assertIsNone(self.mod._turn_deadline_remaining(),
+                          "a stale deadline would throttle the next, "
+                          "unbudgeted call")
+
+    def test_the_deadline_is_cleared_even_when_the_turn_raises(self):
+        with mock.patch.object(self.mod, "_smart_home_control",
+                               side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self.actions["smart_home_control"]("turn on the lamp")
+        self.assertIsNone(self.mod._turn_deadline_remaining())
+
+
+class KasaStatusBranchWordingTests(_KasaBase):
+    """A partial STATUS read is an answer, not a failed command."""
+
+    def _devs(self):
+        return [{"name": "Entry Light", "lan_ip": "10.0.0.5"},
+                {"name": "Dining Room", "lan_ip": "10.0.0.6"}]
+
+    def _partial_status(self):
+        def _slow(_rec):
+            time.sleep(0.12)
+            return {"on": True}
+        with mock.patch.object(self.mod, "list_devices",
+                               return_value=self._devs()), \
+             mock.patch.object(self.mod, "_tuya_mod", return_value=None), \
+             mock.patch.object(self.mod, "_CONTROL_BUDGET_SECS", 0.05), \
+             mock.patch.object(self.mod, "get_state", side_effect=_slow):
+            return self.actions["smart_home_control"]("are all the lights on?")
+
+    def test_a_partial_status_answer_carries_no_failure_marker(self):
+        from core.failure_markers import FAILURE_MARKERS
+        out = self._partial_status()
+        low = out.lower()
+        self.assertTrue(low.startswith("status, sir"))
+        self.assertIn("dining room", low)
+        self.assertIn("did not reach", low)
+        self.assertEqual([m for m in FAILURE_MARKERS if m.lower() in low], [],
+                         "a marker here drops the honest status answer off the "
+                         "verbatim speak path and burns an LLM round-trip: "
+                         + out)
+
+    def test_the_control_branch_KEEPS_its_marker(self):
+        # The other half of the rule: an abandoned COMMAND is a failure and
+        # must stay classified as one.
+        from core.failure_markers import FAILURE_MARKERS
+
+        def _slow(_rec, **_kw):
+            time.sleep(0.12)
+            return {"ok": True}
+        with mock.patch.object(self.mod, "list_devices",
+                               return_value=self._devs()), \
+             mock.patch.object(self.mod, "_tuya_mod", return_value=None), \
+             mock.patch.object(self.mod, "_CONTROL_BUDGET_SECS", 0.05), \
+             mock.patch.object(self.mod, "set_state", side_effect=_slow):
+            out = self.actions["smart_home_control"]("turn off all the lights")
+        low = out.lower()
+        self.assertIn("1 not attempted", low)
+        self.assertTrue([m for m in FAILURE_MARKERS if m.lower() in low],
+                        "an abandoned command must still be filed as a failure")
+
+
 if __name__ == "__main__":
     unittest.main()

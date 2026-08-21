@@ -22,9 +22,13 @@ Design notes
   ``_send_command`` so a crash mid-save can't corrupt the settings file.
 * SECURITY: integration secrets are NEVER read from or written to the repo.
   The Integrations tab shows only PRESENT / not-set status for each key (probed
-  from the OS environment) and never displays a secret's value. The plain
-  text fields there persist NON-secret connection hints (host/port) to the
-  user (gitignored) settings file only.
+  from the OS environment) and never displays a secret's value. The three
+  plain-text rows there (OBS_HOST_HINT / OBS_PORT_HINT / HUE_BRIDGE_IP_HINT)
+  are OWNER NOTES: they persist to the user (gitignored) settings file and are
+  read by NOTHING at runtime. Their labels and help say so, because a Settings
+  row that looks like configuration and is not is a defect regardless of what
+  the docs say. See the block comment above them for why they are neither
+  wired nor deleted.
 
 Everything above the ``# ── GUI ──`` divider is import-safe with no GUI
 dependency, so the test-suite can exercise the schema, defaults, load/save
@@ -590,6 +594,11 @@ SCHEMA: dict[str, dict] = {
     "_status_obs": {
         "tab": "integrations", "label": "OBS Studio", "type": "status",
         "secret_env": ["OBS_HOST", "OBS_PASSWORD"],
+        # Names the real source in the same tab, exactly as _status_hue does.
+        # Its absence is why the note fields below could be mistaken for the
+        # thing that configures OBS.
+        "help": "Configured via OBS_HOST / OBS_PORT / OBS_PASSWORD in your "
+                ".env or OS environment (defaults 127.0.0.1:4455).",
     },
     "_status_deco": {
         "tab": "integrations", "label": "TP-Link Deco router", "type": "status",
@@ -601,22 +610,57 @@ SCHEMA: dict[str, dict] = {
         "help": "PRESENT if any one channel (Telegram / ntfy / Pushover) is set.",
         "match": "any",
     },
-    # Non-secret connection hints persisted to user_settings.json:
+    # ── OWNER NOTES — persisted, but READ BY NOTHING ────────────────────
+    # These three rows are a notepad, not configuration. Verified 2026-08-20:
+    # a whole-tree grep for the names finds this schema, the example settings
+    # file, two explanatory comments in tools/web_interface.py, the tests, and
+    # the persisted (empty) values — and ZERO runtime readers.
+    # core/config.py:1252 guarantees it stays that way: _apply_user_settings
+    # skips any key with no module-level constant, and
+    # tests/test_settings_schema_wiring.py asserts none of these ever gains one.
+    #
+    # They are NOT wired, deliberately:
+    #   * HUE_BRIDGE_IP_HINT — skills/sh_hue.py already owns `bridge_ip` as a
+    #     SINGLE authority with a self-heal that REWRITES the stored address
+    #     when a configured one fails. A second source for the same field is
+    #     this repo's #1 bug class: the GUI note and the self-healed config file
+    #     would silently disagree the moment discovery corrected a stale IP.
+    #   * OBS_*_HINT — skills/obs_control._config() reads OBS_HOST / OBS_PORT
+    #     from the ENVIRONMENT on every call so they can change without a
+    #     restart. Routing them through a restart-scoped settings file instead
+    #     would be a downgrade, and its failure line already NAMES the endpoint
+    #     it dialled ("I couldn't reach OBS at 127.0.0.1:4455, sir"), so a
+    #     mismatch is audible rather than silent.
+    # They are NOT deleted either: the round-trip path for schema keys with no
+    # core.config constant is real machinery (tools/web_interface's _NO_CONSTANT
+    # sourcing, pinned by tests/test_web_interface.GuiOnlyKeyRoundTripTests) and
+    # these are its only live instances.
+    #
+    # What WAS wrong is that they read as live knobs. The old help split the
+    # password (env) from the host (this box) — the exact inverse of the truth,
+    # since OBS_HOST env is the only thing obs_control reads. Labels and help
+    # now say so outright. Keep it that way: anything here that sounds like
+    # configuration is a lie the owner will troubleshoot against.
     "OBS_HOST_HINT": {
-        "tab": "integrations", "label": "OBS host (non-secret)", "type": "str",
-        "default": "",
-        "help": "e.g. localhost. Stored in user_settings.json, not the repo. "
-                "Leave the password in your .env / OS environment.",
+        "tab": "integrations", "label": "OBS host (note only — not read)",
+        "type": "str", "default": "",
+        "help": "Reminder field. JARVIS reads OBS_HOST from your .env / OS "
+                "environment (default 127.0.0.1) — typing here records the "
+                "value, it does NOT change what JARVIS dials.",
     },
     "OBS_PORT_HINT": {
-        "tab": "integrations", "label": "OBS port (non-secret)", "type": "str",
-        "default": "",
-        "help": "e.g. 4455. Non-secret — safe to keep here.",
+        "tab": "integrations", "label": "OBS port (note only — not read)",
+        "type": "str", "default": "",
+        "help": "Reminder field. JARVIS reads OBS_PORT from your .env / OS "
+                "environment (default 4455); this value is not read.",
     },
     "HUE_BRIDGE_IP_HINT": {
-        "tab": "integrations", "label": "Hue bridge IP (non-secret)",
+        "tab": "integrations", "label": "Hue bridge IP (note only — not read)",
         "type": "str", "default": "",
-        "help": "Local bridge IP, e.g. 192.168.1.50. Non-secret hint only.",
+        "help": "Reminder field. The live bridge IP lives in "
+                "data/sh_hue_config.json (auto-discovered, and self-healed "
+                "when a stored address stops answering); this value is not "
+                "read.",
     },
 
     # ── Advanced ───────────────────────────────────────────────────────

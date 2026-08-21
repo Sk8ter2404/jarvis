@@ -172,6 +172,12 @@ except Exception:  # pragma: no cover — boot-order safety
             raise
 
 
+try:
+    from core.failure_markers import FAILURE_MARKERS
+except Exception:  # pragma: no cover - boot-order safety; core/ is in-tree
+    FAILURE_MARKERS = ("could not", "failed", "refused", "couldn't", "can't",
+                       "didn't", "wouldn't", "unknown ", "format:")
+
 _log = logging.getLogger("jarvis.self_diagnostic")
 
 # ─── Config ──────────────────────────────────────────────────────────────
@@ -215,6 +221,44 @@ SEVERITY_UNKNOWN         = "UNKNOWN"
 # silent-mic warning uses, judged against core.audio_processor's own
 # _AUDIBLE_RMS_FLOOR.
 _PASSIVE_POLL_FRESH_S    = 30.0
+
+# ─── Spoken-surface wording rule (2026-08-20 review, HIGH) ───
+# run_diagnostic / are_you_ok / system_check / self_diagnostic /
+# diagnostic_status / diagnostic_history are ALL in
+# bobert_companion.SPEAK_RESULT_VERBATIM_ACTIONS and in NEITHER
+# INFORMATIVE_ACTIONS — so their return string is read back to the owner
+# verbatim... unless it contains a core.failure_markers.FAILURE_MARKERS
+# substring, in which case _speak_verbatim_results DROPS it (`continue`) and
+# _is_failure re-routes it through the follow-up loop as a failed action: a
+# whole extra local-LLM round-trip that re-words the sentence, and can drop the
+# UNVERIFIED distinction entirely.
+#
+# The UNVERIFIED wording that shipped this morning read "N check(s) couldn't
+# run" and "I can't call the system nominal" — TWO markers — so the flagship
+# sentence of v2.0.95 was never spoken as written. Same trap
+# core/smart_home_router.py:920-930 already documents by name ("can't read its
+# live state" used to match "can't").
+#
+# RULE: no string this module emits on the HONEST (non-failure) surface may
+# contain a FAILURE_MARKER. Say "did not run" instead of "couldn't run", and
+# "I am not able to" instead of "I can't". Genuine failure text (whats_broken's
+# "I couldn't scan jarvis_todo.md") KEEPS its marker — that is what puts it on
+# the failure path. tests/skills/test_self_diagnostic.py enforces both halves.
+
+# Short, speakable causes attached to an UNVERIFIED result so the summary can
+# say WHY a check did not run instead of only naming it — "microphone (no audio
+# frames to judge yet)" is actionable; a bare "microphone" is alarming. One
+# table, not per-call-site literals, so the marker-free rule above can be
+# enforced by a single test over the values.
+_UNVERIFIED_SHORT_CAUSES: dict[str, str] = {
+    "mic_no_frames":   "no audio frames to judge yet",
+    "mic_disabled":    "the microphone is switched off in configuration",
+    "mic_speaking":    "JARVIS was speaking at the time",
+    "mic_disagree":    "the two microphone readings disagreed",
+    "camera_busy":     "the face tracker had the camera",
+    "stt_busy":        "a transcription was already in flight",
+    "host_not_loaded": "the host module was not loaded",
+}
 
 # Per-subsystem default severity on failure. Overridable per-probe.
 SUBSYSTEM_SEVERITY: dict[str, str] = {
@@ -347,7 +391,8 @@ def _result(ok: bool, latency_ms: float, *, error: str | None = None,
 
 
 def _unverified(latency_ms: float, *, reason: str, details: dict | None = None,
-                remedy: str | None = None) -> dict:
+                remedy: str | None = None, short_cause: str | None = None,
+                transient: bool = False) -> dict:
     """Canonical UNVERIFIED result — the probe could NOT perform its check.
 
     Neither a pass nor a failure. ``ok`` is False so nothing downstream can
@@ -375,6 +420,16 @@ def _unverified(latency_ms: float, *, reason: str, details: dict | None = None,
     d = dict(details or {})
     d["tested"] = False
     d["unverified_reason"] = reason
+    # short_cause: a few marker-free words the SUMMARY may speak (see
+    # _UNVERIFIED_SHORT_CAUSES). transient: this condition is expected to clear
+    # on its own — the check had no data at that instant, not a standing
+    # problem — so a reader may RE-MEASURE it live rather than repeat a
+    # half-hour-old "UNVERIFIED" until the next sweep. Re-measure, never
+    # carry-forward: a stale pass is the sin this release exists to fix.
+    if short_cause:
+        d["unverified_short_cause"] = short_cause
+    if transient:
+        d["unverified_transient"] = True
     return _result(False, latency_ms, error=msg, details=d,
                    severity=SEVERITY_UNKNOWN, tested=False)
 
@@ -791,7 +846,9 @@ def _probe_webcam() -> dict:
                            reason=("the face tracker holds _camera_io_lock, so "
                                    "the probe never opened the device"),
                            details={"skipped": "camera busy — probe skipped "
-                                               "(lock held by tracker)"})
+                                               "(lock held by tracker)"},
+                           short_cause=_UNVERIFIED_SHORT_CAUSES["camera_busy"],
+                           transient=True)
     try:
         return _probe_webcam_locked(start, hold)
     finally:
@@ -1299,6 +1356,65 @@ def _passive_mic_liveness() -> dict:
     return out
 
 
+def _mic_live_recheck() -> bool:
+    """Re-measure the microphone RIGHT NOW, device-free. True only on POSITIVE
+    evidence that the capture loop is hearing audible audio.
+
+    _passive_mic_liveness is stateless and opens nothing, so this is cheap
+    enough to run on a read (`diagnostic status`) rather than waiting for the
+    next 30-minute sweep. Anything that is not a live "alive" verdict returns
+    False and the entry stays UNVERIFIED — this may only CLEAR an unverified
+    entry, never create a pass out of missing data.
+    """
+    try:
+        return _passive_mic_liveness().get("verdict") == "alive"
+    except Exception:
+        return False
+
+
+# component -> "is it healthy right now?" probe that is safe to run on a READ:
+# device-free, side-effect-free, and returning True only on positive evidence.
+# Consulted for TRANSIENT unverified entries only (see _unverified).
+_LIVE_RECHECKS: dict[str, Callable[[], bool]] = {
+    "microphone": _mic_live_recheck,
+}
+
+
+def _live_recheck_unverified(run: dict,
+                             unverified: list[str]) -> tuple[list[str], list[str]]:
+    """Split ``unverified`` into (still-unverified, cleared-by-live-evidence).
+
+    WHY (2026-08-20 review, MED): an UNVERIFIED that cannot clear until the
+    next sweep is noise, and noise is how a real alarm gets ignored. The
+    microphone probe's passive signal exists only while record_speech's chunk
+    loop is running, so a sweep that lands during a long awake turn latches
+    "microphone: UNVERIFIED" into last_run — and "diagnostic status" then
+    refuses "all systems nominal" for up to half an hour with nothing wrong.
+
+    This does NOT carry a stale pass forward. It takes a NEW measurement
+    through the same device-free path the probe uses and clears the entry only
+    on positive evidence. The recorded run and the history file are left
+    untouched — the sweep genuinely had no data at the time, and that record
+    stays true.
+    """
+    still: list[str] = []
+    cleared: list[str] = []
+    probes = (run or {}).get("probes") or {}
+    for comp in unverified:
+        det = ((probes.get(comp) or {}).get("details") or {})
+        checker = (_LIVE_RECHECKS.get(comp)
+                   if det.get("unverified_transient") else None)
+        if checker is None:
+            still.append(comp)
+            continue
+        try:
+            ok = bool(checker())
+        except Exception:
+            ok = False
+        (cleared if ok else still).append(comp)
+    return still, cleared
+
+
 def _mic_result_without_capture(start: float, details: dict, *,
                                 mic_off: bool = False,
                                 tts_live: bool = False,
@@ -1341,7 +1457,8 @@ def _mic_result_without_capture(start: float, details: dict, *,
                                    "configuration (staging / MICROPHONE_INDEX "
                                    "< 0), so there is nothing listening to "
                                    "check"),
-                           details=details)
+                           details=details,
+                           short_cause=_UNVERIFIED_SHORT_CAUSES["mic_disabled"])
     passive = _passive_mic_liveness()
     details["passive_mic"] = passive
     verdict = passive.get("verdict")
@@ -1353,7 +1470,9 @@ def _mic_result_without_capture(start: float, details: dict, *,
                                    "playback can mask the input — not "
                                    "attributable to the mic"),
                            details=details,
-                           remedy="Re-checked on the next sweep.")
+                           remedy="Re-checked on the next sweep.",
+                           short_cause=_UNVERIFIED_SHORT_CAUSES["mic_speaking"],
+                           transient=True)
     if verdict == "silent":
         if partial_silence:
             # Two independent readings agree: our own capture of the active
@@ -1373,14 +1492,26 @@ def _mic_result_without_capture(start: float, details: dict, *,
                                    "main loop reports audible audio — the two "
                                    "readings disagree"),
                            details=details,
-                           remedy="Re-checked on the next sweep.")
+                           remedy="Re-checked on the next sweep.",
+                           short_cause=_UNVERIFIED_SHORT_CAUSES["mic_disagree"],
+                           transient=True)
+    # nodata. TRANSIENT by construction: the passive signal exists only while
+    # record_speech's chunk loop is running, so ANY awake stretch longer than
+    # _PASSIVE_POLL_FRESH_S with no capture — a long local-LLM turn, a long TTS
+    # reply, a _HEAVY_ACTIONS skill, the tray "Mute Mic" toggle — lands here
+    # with a perfectly healthy microphone. Latching that into last_run for the
+    # whole 30-minute interval turns an honest signal into noise, and noise is
+    # how a real alarm gets ignored, so readers may re-measure it live
+    # (_live_recheck_unverified).
     return _unverified(latency,
                        reason=("the live capture was skipped and there is no "
                                "passive liveness signal either: "
                                + str(passive.get("reason") or "no data")),
                        details=details,
                        remedy=("Nothing here says the mic works — it says the "
-                               "check did not run."))
+                               "check did not run."),
+                       short_cause=_UNVERIFIED_SHORT_CAUSES["mic_no_frames"],
+                       transient=True)
 
 
 def _probe_microphone() -> dict:
@@ -2003,7 +2134,9 @@ def _probe_stt() -> dict:
                                    "never ran one of its own"),
                            details={**details,
                                     "skipped": "main loop holds _stt_lock "
-                                               "(STT busy) — probe deferred"})
+                                               "(STT busy) — probe deferred"},
+                           short_cause=_UNVERIFIED_SHORT_CAUSES["stt_busy"],
+                           transient=True)
     try:
         if lock is not None:
             try:
@@ -2219,7 +2352,8 @@ def _probe_hud_subprocesses() -> dict:
         return _unverified(0.0,
                            reason=("bobert_companion is not loaded, so the HUD "
                                    "process handles cannot be inspected"),
-                           details={"skipped": "bobert_companion not loaded"})
+                           details={"skipped": "bobert_companion not loaded"},
+                           short_cause=_UNVERIFIED_SHORT_CAUSES["host_not_loaded"])
 
     details: dict[str, Any] = {}
     alive: list[str] = []
@@ -2342,7 +2476,8 @@ def _probe_bambu() -> dict:
         return _unverified(0.0,
                            reason=("bobert_companion is not loaded, so the "
                                    "printer settings cannot even be read"),
-                           details={"skipped": "bobert_companion not loaded"})
+                           details={"skipped": "bobert_companion not loaded"},
+                           short_cause=_UNVERIFIED_SHORT_CAUSES["host_not_loaded"])
 
     ip      = (getattr(bc, "BAMBU_PRINTER_IP", "")   or "").strip()
     access  = (getattr(bc, "BAMBU_ACCESS_CODE", "")  or "").strip()
@@ -3497,29 +3632,72 @@ def run_diagnostic(_: str = "") -> str:
         _run_lock.release()
 
 
-def _unverified_phrase(unverified: list[str]) -> str:
+def _short_cause_for(run: dict | None, comp: str) -> str:
+    """The few marker-free words explaining why ``comp`` was not measured, or
+    "" when the run carries none (older history entries, foreign results)."""
+    try:
+        det = (((run or {}).get("probes") or {}).get(comp) or {}).get("details") or {}
+        cause = str(det.get("unverified_short_cause") or "").strip()
+    except Exception:
+        return ""
+    if not cause:
+        return ""
+    low = cause.lower()
+    if any(m.lower() in low for m in FAILURE_MARKERS):
+        # Belt-and-braces for the wording rule at the top of this module: a
+        # cause carrying a marker would take the WHOLE honest sentence off the
+        # verbatim speak path. Drop the four words rather than lose the
+        # sentence; the full reason is still in the probe result and the log.
+        _log.warning("self-diagnostic: dropping short cause for %s — it "
+                     "contains a failure marker: %r", comp, cause)
+        return ""
+    return cause
+
+
+def _unverified_phrase(unverified: list[str], run: dict | None = None) -> str:
     """Shared wording for the third outcome so _summarise, diagnostic_status
-    and diagnostic_history can never drift apart (stale-duplicate rule)."""
+    and diagnostic_history can never drift apart (stale-duplicate rule).
+
+    MARKER-FREE BY CONTRACT — see the spoken-surface wording rule at the top of
+    this module. "couldn't run" (the wording that shipped this morning) matches
+    core.failure_markers.FAILURE_MARKERS, which drops the whole sentence off
+    bobert_companion's verbatim speak path and burns an extra LLM round-trip
+    re-wording it. "did not run" says exactly the same thing and is spoken.
+
+    ``run`` is optional so history entries (which carry no probe details) still
+    render; when given, each component also names WHY it was not measured.
+    """
     if not unverified:
         return ""
-    names = ", ".join(c.replace("_", " ") for c in unverified)
+    parts = []
+    for c in unverified:
+        pretty = c.replace("_", " ")
+        cause = _short_cause_for(run, c)
+        parts.append(f"{pretty} ({cause})" if cause else pretty)
+    names = ", ".join(parts)
     n = len(unverified)
-    return (f"{n} check{'s' if n != 1 else ''} couldn't run, so "
+    return (f"{n} check{'s' if n != 1 else ''} did not run, so "
             f"{'they are' if n != 1 else 'it is'} UNVERIFIED — {names}")
 
 
 def _summarise(run: dict, queued: list[str]) -> str:
     failed = run.get("failed") or []
     unverified = run.get("unverified") or []
-    unv = _unverified_phrase(unverified)
+    unv = _unverified_phrase(unverified, run)
     duration_s = (run.get("duration_ms") or 0) / 1000.0
     if not failed:
         if not unverified:
             return f"All systems nominal, sir. ({duration_s:.1f}s sweep, {len(PROBES)} probes.)"
-        # Never "nominal" while something could not be checked — that is the
-        # exact sentence that covered for a deaf JARVIS on 2026-08-20.
-        return (f"Sir, nothing is reporting a failure, but I can't call the "
-                f"system nominal: {unv}. ({duration_s:.1f}s sweep, "
+        # Never "nominal" while something was not checked — that is the exact
+        # sentence that covered for a deaf JARVIS on 2026-08-20.
+        #
+        # "I am not able to", NOT "I can't": this is THE sentence the release
+        # was built around, and "can't" is a FAILURE_MARKER, so the version
+        # that shipped this morning was dropped by _speak_verbatim_results and
+        # re-worded by an LLM follow-up instead of being read to him. See the
+        # spoken-surface wording rule at the top of this module.
+        return (f"Sir, nothing is reporting a failure, but I am not able to "
+                f"call the system nominal: {unv}. ({duration_s:.1f}s sweep, "
                 f"{len(PROBES)} probes.)")
 
     counts: dict[str, int] = {}
@@ -3544,6 +3722,10 @@ def _summarise(run: dict, queued: list[str]) -> str:
 
     sev_breakdown = " / ".join(f"{n} {sev.lower()}" for sev, n in counts.items())
     ustr = f" Separately, {unv}." if unv else ""
+    # NB the failure branch is marker-free too ("Sir, one issue — microphone.
+    # Severity breakdown: 1 high.") and is meant to be: it is SPOKEN VERBATIM,
+    # which is how the owner hears the subsystem names and the severity counts
+    # rather than an LLM's paraphrase of them.
     return (f"Sir, {body}. Severity breakdown: {sev_breakdown}.{qstr}{ustr} "
             f"({duration_s:.1f}s sweep.)")
 
@@ -3563,17 +3745,31 @@ def diagnostic_status(_: str = "") -> str:
         age = f"{age_s / 3600.0:.1f} hours ago"
 
     failed = run.get("failed") or []
-    unverified = run.get("unverified") or []
-    unv = _unverified_phrase(unverified)
+    # TRANSIENT unverified entries are re-measured HERE, at read time, through
+    # the same device-free path the probe uses — so a sweep that happened to
+    # land mid-turn does not make "diagnostic status" cry UNVERIFIED for the
+    # next half hour with nothing wrong. Positive evidence only; anything else
+    # stays unverified, and the recorded run is not rewritten.
+    unverified, cleared = _live_recheck_unverified(run, run.get("unverified") or [])
+    cleared_note = ""
+    if cleared:
+        cnames = ", ".join(c.replace("_", " ") for c in cleared)
+        label = "check" if len(cleared) == 1 else "checks"
+        cleared_note = (f" The {cnames} {label} had no data at the time — I "
+                        f"re-measured just now and the signal is live.")
+    unv = _unverified_phrase(unverified, run)
     if not failed:
         if not unverified:
             return (f"All systems nominal as of {age}, sir. "
-                    f"{len(PROBES)} probes, {(run['duration_ms'] / 1000):.1f}s sweep.")
+                    f"{len(PROBES)} probes, "
+                    f"{(run['duration_ms'] / 1000):.1f}s sweep.{cleared_note}")
         return (f"As of {age}, sir, nothing is reporting a failure — but {unv}. "
-                f"{len(PROBES)} probes, {(run['duration_ms'] / 1000):.1f}s sweep.")
+                f"{len(PROBES)} probes, "
+                f"{(run['duration_ms'] / 1000):.1f}s sweep.{cleared_note}")
     names = ", ".join(c.replace("_", " ") for c in failed)
     ustr = f" Separately, {unv}." if unv else ""
-    return (f"Last sweep was {age}, sir — {len(failed)} subsystem(s) reporting issues: {names}.{ustr}")
+    return (f"Last sweep was {age}, sir — {len(failed)} subsystem(s) "
+            f"reporting issues: {names}.{ustr}{cleared_note}")
 
 
 def whats_broken(_: str = "") -> str:

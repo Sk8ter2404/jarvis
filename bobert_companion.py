@@ -2787,6 +2787,21 @@ def _launch_hud():
     global _hud_process
     if not HUD_ENABLED:
         return
+    # IDEMPOTENT (2026-08-20). This used to Popen unconditionally and reassign
+    # _hud_process, so a second call ORPHANED the first HUD: the old handle was
+    # overwritten and _shutdown_hud could then only terminate the newest one.
+    # That was survivable while the only callers were boot and the tray (which
+    # calls _shutdown_hud first) -- but core.actions._restore_hud now relaunches
+    # a dead HUD from the voice path, and the tray route runs BOTH. poll() is
+    # the right liveness test here: it is None while the child lives and an int
+    # once it exits. Never psutil.pid_exists -- that reads True for a Windows
+    # corpse and for a recycled PID.
+    if _hud_process is not None:
+        try:
+            if _hud_process.poll() is None:
+                return
+        except Exception:
+            pass          # unreadable handle -> fall through and respawn
     hud_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "hud", "jarvis_unified_hud.py")
     if not os.path.exists(hud_path):
@@ -6128,9 +6143,20 @@ def list_speakers():
 # MME truncates device descriptions to 31 characters, so two distinct endpoints
 # routinely enumerate under an identical name and a name-only compare misses a
 # real 4 → 3 switch entirely (defect D1, 2026-08-20).
+#
+# "last_in_endpoint"/"last_out_endpoint" hold the WINDOWS endpoint id that the
+# tracked identity came from (None whenever that direction is pinned by
+# MICROPHONE_INDEX/PREFERRED_* — then the default endpoint describes a
+# different device and is not evidence about this one). They are what lets the
+# change detector tell a real switch between two identically-named endpoints
+# from a PortAudio renumbering. "last_default_endpoints" is the (render,
+# capture) pair the follow-the-default trigger compares against, rebased ONLY
+# after a real re-enumeration.
 _device_cache = {"in": None, "out": None, "checked_at": 0.0,
                  "last_in_name": None, "last_out_name": None,
                  "last_in_index": None, "last_out_index": None,
+                 "last_in_endpoint": None, "last_out_endpoint": None,
+                 "last_default_endpoints": None,
                  "last_devices_signature": None,
                  "last_reenum_at": 0.0}
 
@@ -6616,6 +6642,61 @@ def _enqueue_device_announcement(message: str) -> None:
     proactive_announce(message, source="audio")
 
 
+def _wake_word_resume_or_report(det) -> bool:
+    """Bring the wake-word detector back after a device refresh, or say so.
+
+    2026-08-20 honest-failure fix. The call site was:
+
+        try:
+            paused_det.resume()
+        except Exception as e:
+            print(f"  [audio] wake-word resume failed: {e}")
+
+    core/wake_word.Detector.resume() does not RAISE on failure — it clears
+    _running and returns False — so that `except` was dead code for the only
+    failure mode that actually happens, and the boolean was dropped on the
+    floor. Once _running is clear, the pause site's `if det.is_running()` guard
+    skips the detector on every later refresh, so nothing ever retries: one
+    transient endpoint blip during a hotplug silently disarmed acoustic
+    barge-in for the rest of the session. (Standby wake-word ACTIVATION is
+    unaffected — that runs off the Whisper transcript and a separate
+    _standby_wake_detector object — so the loss is real but bounded.)
+
+    Two things the obvious fixes get wrong, hence this shape:
+      * resume() cannot be retried. Its first line is `if not self._paused:
+        return False`, and the failing path already cleared _paused before it
+        failed. The retry has to be start(), which re-inits the engine and
+        clears _stop_flag.
+      * Clearing skill_wake_listener._detector does nothing: _refresh_devices
+        never BUILDS a detector, it only pauses the one it finds. Setting it to
+        None just guarantees it is never restarted.
+
+    No sleeps and no retry loop: this runs with _device_refresh_lock held, and
+    stalling here delays every get_input_device()/get_output_device() caller.
+    Returns True when the detector is listening again."""
+    ok = False
+    try:
+        ok = bool(det.resume())
+    except Exception as e:
+        print(f"  [audio] wake-word resume raised: {type(e).__name__}: {e}")
+    if not ok:
+        try:
+            ok = bool(det.start())
+        except Exception as e:
+            print(f"  [audio] wake-word restart raised: "
+                  f"{type(e).__name__}: {e}")
+    if not ok:
+        print("  [audio] WAKE-WORD DETECTOR IS DOWN after a device refresh "
+              "— voice barge-in is disarmed until it is restarted")
+        try:
+            _enqueue_device_announcement(
+                "The wake-word detector dropped during a device change, sir "
+                "— barge-in is disarmed until you restart it.")
+        except Exception as e:
+            print(f"  [audio] wake-word down-announcement failed: {e}")
+    return ok
+
+
 def _input_openable(idx: int) -> bool:
     """True when an InputStream can actually be opened on `idx` at JARVIS's
     capture format (SAMPLE_RATE / mono / float32).
@@ -6665,10 +6746,124 @@ def _pick_device(preferred_names: list[str], want_input: bool) -> tuple[int | No
     return None, ""
 
 
+# ── Live Windows default-endpoint poll (follow-the-default, 2026-08-20) ────
+# PortAudio CANNOT see a default-device change on its own. Pa_GetDefaultOutput
+# Device() returns hostApis[Pa_GetDefaultHostApi()]->info.defaultOutputDevice —
+# a STRUCT FIELD each host API fills in ONCE, inside Pa_Initialize. sd.default
+# .device re-reads that field on every access (measured here: 0.00006 ms/call,
+# and it resolves to concrete indices — [1, 7] = 'Microphone (Blue Snowball )'
+# / 'Speakers (Realtek USB2.0 Audio)', not the Sound Mapper), but the value
+# behind it is FROZEN until sd._terminate()/sd._initialize() runs. It is the
+# same freeze DEVICE_REENUM_INTERVAL exists for on the hotplug side — which is
+# why "re-resolve the identity on the 4 s cadence" cannot by itself make
+# follow-the-default responsive: every re-resolution returns the same stale
+# endpoint until a re-enumeration happens. The owner presses a Stream Deck key
+# and JARVIS keeps using the old mic/speakers for up to DEVICE_REENUM_INTERVAL
+# (300 s), then announces the switch minutes late.
+#
+# Windows itself answers LIVE, through the MMDevice API — the very COM
+# interface audio/audio_switch.py uses to SET the default endpoint. This is the
+# READER for that WRITER. Cost with the enumerator cached, measured on this
+# machine: 1.15 ms (render) + 0.63 ms (capture) per poll, against 0.077 ms for
+# a full sd.query_devices(); paid at most once per DEVICE_CHECK_INTERVAL (4 s)
+# because _refresh_devices' own time gate fronts it. It opens NO device.
+#
+# eConsole is the role queried: it is the "preferred device" WMME reports
+# through DRVM_MAPPER_PREFERRED_GET — the one PortAudio's own default follows —
+# and every switcher in practice (audio_switch.py's SetDefaultEndpoint loop
+# included) moves all three roles together.
+#
+# Endpoint ids ('{0.0.0.00000000}.{guid}') are also the only STABLE audio
+# identity available here: they do not renumber like PortAudio indices and are
+# not truncated at 31 characters like MME names, so they are what tells a real
+# switch from a renumbering in the announcement guard below.
+_WIN_ENDPOINT_MAX_SETUP_FAILS = 3
+_win_endpoint_setup_fails = [0]
+_win_endpoint_tls = threading.local()
+
+
+def _win_endpoint_enumerator():
+    """Per-THREAD MMDeviceEnumerator, or None when the MMDevice API isn't
+    usable here. Never raises.
+
+    Per-thread on purpose: COM apartments are per-thread, and _refresh_devices
+    runs on whichever thread reached get_input_device()/get_output_device()
+    first (main voice loop, ambient workers, the face tracker, diagnostic
+    daemons). Sharing one apartment-threaded interface pointer across threads
+    is the classic RPC_E_WRONG_THREAD bug; a threading.local sidesteps it
+    without marshalling.
+
+    STICKY: after _WIN_ENDPOINT_MAX_SETUP_FAILS setup failures the poll is off
+    for the rest of the session — a machine without comtypes/pycaw must not pay
+    a failing import every 4 s forever. It then degrades to exactly the
+    pre-2026-08-20 behaviour (the DEVICE_REENUM_INTERVAL sweep), never to a
+    wrong answer."""
+    enum = getattr(_win_endpoint_tls, "enumerator", None)
+    if enum is not None:
+        return enum
+    if _win_endpoint_setup_fails[0] >= _WIN_ENDPOINT_MAX_SETUP_FAILS:
+        return None
+    try:
+        import comtypes
+        from pycaw.pycaw import IMMDeviceEnumerator
+        from pycaw.constants import CLSID_MMDeviceEnumerator
+        try:
+            # Refcounted and idempotent per thread. RPC_E_CHANGED_MODE (this
+            # thread already joined the MTA) is not fatal — CoCreateInstance
+            # below is what actually decides whether we can query.
+            comtypes.CoInitialize()
+        except Exception:
+            pass
+        enum = comtypes.CoCreateInstance(
+            CLSID_MMDeviceEnumerator, IMMDeviceEnumerator,
+            comtypes.CLSCTX_INPROC_SERVER)
+        _win_endpoint_tls.enumerator = enum
+        _win_endpoint_setup_fails[0] = 0
+        return enum
+    except Exception as e:
+        _win_endpoint_setup_fails[0] += 1
+        if _win_endpoint_setup_fails[0] >= _WIN_ENDPOINT_MAX_SETUP_FAILS:
+            print(f"  [audio] Windows default-endpoint poll unavailable "
+                  f"({type(e).__name__}: {e}) — follow-the-default falls back "
+                  f"to the {DEVICE_REENUM_INTERVAL:.0f}s re-enumeration sweep")
+        return None
+
+
+def _win_default_endpoints() -> tuple[str | None, str | None]:
+    """(default RENDER endpoint id, default CAPTURE endpoint id) as Windows
+    reports them RIGHT NOW, or (None, None) when unavailable.
+
+    A per-call failure (no default device at all because everything is
+    unplugged, a transient COM error) returns (None, None) and drops the
+    cached enumerator so the next pass rebuilds it — it does NOT count toward
+    the sticky setup-failure budget, or a 12-second stretch with no audio
+    hardware would disable the feature until restart. Never raises: this runs
+    inside _refresh_devices, which the main loop depends on."""
+    enum = _win_endpoint_enumerator()
+    if enum is None:
+        return (None, None)
+    try:
+        out_id = enum.GetDefaultAudioEndpoint(0, 0).GetId()   # eRender/eConsole
+        in_id = enum.GetDefaultAudioEndpoint(1, 0).GetId()    # eCapture/eConsole
+        return (out_id or None, in_id or None)
+    except Exception:
+        _win_endpoint_tls.enumerator = None
+        return (None, None)
+
+
 def _default_device_identity(want_input: bool) -> tuple[int | None, str]:
-    """(index, name) of the endpoint Windows CURRENTLY calls the default input
+    """(index, name) of the endpoint PORTAUDIO calls the default input
     (want_input=True) or output — for CHANGE DETECTION and ANNOUNCEMENT WORDING
     ONLY.
+
+    "PortAudio calls", not "Windows calls": sd.default.device reads
+    Pa_GetDefaultInput/OutputDevice, and those return a struct field frozen at
+    Pa_Initialize time, so this lags a real default switch until the next
+    sd._terminate()/sd._initialize(). Polling it faster changes nothing. The
+    LIVE answer comes from _win_default_endpoints() above, which is what
+    _refresh_devices uses to decide that a re-enumeration is due; this function
+    then reports what PortAudio actually resolved, which is what every
+    device=None stream open will use and therefore the right thing to announce.
 
     FOLLOW-THE-DEFAULT contract (2026-08-20): the owner selects his mic and
     speakers from a Stream Deck, which moves the WINDOWS DEFAULT. JARVIS follows
@@ -6805,7 +7000,52 @@ def _refresh_devices(force: bool = False):
         last_sig = _device_cache["last_devices_signature"]
         _reenum_due = (now - _device_cache.get("last_reenum_at", 0.0)
                        >= DEVICE_REENUM_INTERVAL)
-        _sig_unchanged = (not force and not _reenum_due and last_sig is not None
+        # FOLLOW-THE-DEFAULT TRIGGER (2026-08-20). The owner moves his mic and
+        # speakers from a Stream Deck, i.e. by moving the WINDOWS DEFAULT — and
+        # a moved default changes NEITHER current_sig (it is built from
+        # sd.query_devices(), the table PortAudio freezes until the very reinit
+        # this gate blocks) NOR sd.default.device (a struct field frozen at the
+        # same moment). So before this trigger existed the ONLY thing that ever
+        # picked a Stream Deck press up was _reenum_due — up to
+        # DEVICE_REENUM_INTERVAL = 300 s of JARVIS still capturing from the old
+        # mic and replying through the old speakers, then announcing the switch
+        # minutes after the fact, with no way to force it sooner (the only
+        # force=True caller is get_current_mic_name(), which no voice action
+        # reaches). _win_default_endpoints() answers LIVE and cheap, so a press
+        # now costs at most one DEVICE_CHECK_INTERVAL (4 s) instead of 300 s,
+        # while pure hotplug keeps the 300 s ceiling. When the MMDevice API is
+        # unavailable this is (None, None) and the old behaviour is exactly
+        # what remains.
+        #
+        # ACT ONLY WHEN A REINIT COULD ACTUALLY RUN. The endpoint baseline is
+        # rebased only after a successful re-enumeration, so this trigger keeps
+        # re-asserting itself every 4 s until one lands — and record_speech
+        # holds the mic for most of an awake session. Firing it into a
+        # guaranteed deferral would pause/resume the wake-word stream and print
+        # the deny line every 4 s for nothing. _owners_busy is ADVISORY (the
+        # flags can change a microsecond later); the binding decision is still
+        # the atomic _pa_gate check-and-latch below, and losing that race costs
+        # exactly one deferred pass. Deliberately gates ONLY this trigger — a
+        # real signature change or the 300 s sweep still attempts, and still
+        # logs its deferral reason, exactly as before.
+        _owners_busy = False
+        with _pa_gate:
+            _owners_busy = _pa_streams_live()
+        _now_eps = _win_default_endpoints()
+        _prev_eps = _device_cache.get("last_default_endpoints")
+        _have_eps = _now_eps != (None, None)
+        if _have_eps and _prev_eps is None:
+            # First observation of the session: a BASELINE, never a change —
+            # boot already enumerates, and announcing "switched" for the
+            # endpoint JARVIS started on would be a lie.
+            _device_cache["last_default_endpoints"] = _prev_eps = _now_eps
+        _default_moved = bool(_have_eps and _prev_eps is not None
+                              and _now_eps != _prev_eps and not _owners_busy)
+        if _default_moved:
+            print("  [audio] the Windows default audio endpoint moved — "
+                  "re-enumerating PortAudio so JARVIS follows it")
+        _sig_unchanged = (not force and not _reenum_due and not _default_moved
+                         and last_sig is not None
                          and current_sig is not None
                          and current_sig == last_sig)
         # A CLEARED cache is a re-pick REQUEST, not a steady state: the four
@@ -6831,10 +7071,16 @@ def _refresh_devices(force: bool = False):
         # never tears PortAudio down, so pausing there would just churn the
         # wake-word stream every DEVICE_CHECK_INTERVAL while the cache is
         # legitimately empty (no preferred device connected).
+        #
+        # ...and never when an owner already holds a stream (_owners_busy,
+        # sampled above): the gate below would DEFER the reinit anyway, so
+        # pausing here would close+reopen the wake-word stream for nothing —
+        # and core/wake_word.resume() is documented as un-retryable, so every
+        # avoided pause is one less chance to lose barge-in for the session.
         wl = sys.modules.get("skill_wake_listener")
         det = getattr(wl, "_detector", None) if wl is not None else None
         paused_det = None
-        if (not _sig_unchanged and det is not None
+        if (not _sig_unchanged and not _owners_busy and det is not None
                 and hasattr(det, "pause") and hasattr(det, "is_running")):
             try:
                 if det.is_running():
@@ -6915,6 +7161,12 @@ def _refresh_devices(force: bool = False):
                     # sweep — a deferred (mic-active) pass must retry soon, not
                     # wait another DEVICE_REENUM_INTERVAL. 2026-07-14 #4.
                     _device_cache["last_reenum_at"] = now
+                    # Same rule for the follow-the-default baseline: rebase it
+                    # ONLY after PortAudio has actually re-enumerated, because
+                    # only then can sd.default.device see the moved endpoint.
+                    # Rebasing on a deferred pass would forget the press.
+                    if _have_eps:
+                        _device_cache["last_default_endpoints"] = _now_eps
                 except Exception as e:
                     print(f"  [audio] PortAudio re-init failed: {e}")
                 finally:
@@ -6945,6 +7197,9 @@ def _refresh_devices(force: bool = False):
                 # detection/announcement only and is never cached as the index.
                 in_track = ((in_idx, in_name) if in_idx is not None
                             else _default_device_identity(want_input=True))
+            # Did this direction's identity come from the WINDOWS DEFAULT? Only
+            # then does the default endpoint id below describe the same device.
+            in_from_default = (MICROPHONE_INDEX is None and in_idx is None)
 
             # Output
             if SPEAKER_INDEX is not None:
@@ -6958,6 +7213,7 @@ def _refresh_devices(force: bool = False):
                 # speakers follow the Stream Deck too.
                 out_track = ((out_idx, out_name) if out_idx is not None
                              else _default_device_identity(want_input=False))
+            out_from_default = (SPEAKER_INDEX is None and out_idx is None)
 
             # Log + announce changes, for BOTH directions.
             #
@@ -6977,6 +7233,33 @@ def _refresh_devices(force: bool = False):
             # to one spoken sentence; when the endpoints differ the owner gets
             # both, which is the information he asked for. Do NOT "fix" this by
             # announcing only one direction.
+            #
+            # WHAT COUNTS AS A SWITCH, AND WHAT ONLY COUNTS AS A RE-KEY
+            # (2026-08-20, second pass). Tracking the pair is right; ANNOUNCING
+            # on either half moving is not. Twenty lines below, this same
+            # function states the property that makes the index untrustworthy
+            # here: "Indices can shift across a reinit even when the underlying
+            # hardware is unchanged." On this machine inputs enumerate before
+            # outputs, so powering off the DualSense pad — or any other input
+            # appearing/disappearing — slides every OUTPUT index down by one
+            # while the default speakers never move, and the old guard spoke
+            # "Switched to Realtek USB2.0 Audio, sir." about the endpoint
+            # JARVIS was already using. Claiming a switch that did not happen
+            # is the same sin as claiming a success that did not happen.
+            #
+            # So: the NAME moving is a switch. The INDEX moving alone is a
+            # switch only with POSITIVE EVIDENCE that the endpoint really
+            # changed — the Windows endpoint id, which neither renumbers nor
+            # truncates. That evidence is exactly what D1 needed (two endpoints
+            # sharing an MME-truncated 31-character name, where a real switch
+            # moves ONLY the index): the pair-compare keeps detecting it, and
+            # the endpoint id is what makes it speakable. With no evidence
+            # available (no MMDevice API, or a direction pinned by
+            # MICROPHONE_INDEX/PREFERRED_* so the default endpoint describes a
+            # different device) an index-only shift is TRACKED and LOGGED but
+            # not spoken — silence beats a confident wrong sentence.
+            _ep_now = {"in": (_now_eps[1] if in_from_default else None),
+                       "out": (_now_eps[0] if out_from_default else None)}
             for _kind, (_track_idx, _track_name) in (("in", in_track),
                                                      ("out", out_track)):
                 if not _track_name:
@@ -6992,11 +7275,22 @@ def _refresh_devices(force: bool = False):
                     continue
                 _label = "mic" if _kind == "in" else "speakers"
                 print(f"  [audio] {_label} → [{_track_idx}] {_track_name}")
-                if _prev_name:
+                _prev_ep = _device_cache.get(f"last_{_kind}_endpoint")
+                _new_ep  = _ep_now.get(_kind)
+                _endpoint_moved = (_new_ep is not None and _prev_ep is not None
+                                   and _new_ep != _prev_ep)
+                if _prev_name and (_track_name != _prev_name
+                                   or _endpoint_moved):
                     _announce_device_change(_prev_name, _track_name,
                                             want_input=(_kind == "in"))
+                elif _prev_name:
+                    print(f"  [audio] {_label} index moved "
+                          f"[{_prev_idx}] → [{_track_idx}] with the same "
+                          f"endpoint — re-keying silently, not announcing a "
+                          f"switch that did not happen")
                 _device_cache[f"last_{_kind}_name"]  = _track_name
                 _device_cache[f"last_{_kind}_index"] = _track_idx
+                _device_cache[f"last_{_kind}_endpoint"] = _new_ep
 
             _device_cache["in"]         = in_idx
             _device_cache["out"]        = out_idx
@@ -7008,10 +7302,7 @@ def _refresh_devices(force: bool = False):
             _device_cache["last_devices_signature"] = _devices_signature()
         finally:
             if paused_det is not None:
-                try:
-                    paused_det.resume()
-                except Exception as e:
-                    print(f"  [audio] wake-word resume failed: {e}")
+                _wake_word_resume_or_report(paused_det)
 
 
 def get_input_device() -> int | None:
@@ -7497,11 +7788,76 @@ _last_recording_peak = 0.0   # set by record_speech, read by callers
 _last_capture_audio: "np.ndarray | None" = None
 _last_capture_sr: int = 0
 
-# 2026-05-30 [self-heal]: one-shot guard for the silent-mic warning emitted
-# by record_speech when raw mic RMS stays at zero past MIC_SILENT_WARN_SECONDS
-# while JARVIS is awake. Resets back to False once an audible chunk is seen,
-# so a transient driver glitch + recovery can re-warn next time.
+# 2026-05-30 [self-heal]: guard for the silent-mic warning emitted by
+# record_speech when raw mic RMS stays at zero past MIC_SILENT_WARN_SECONDS
+# while JARVIS is awake. Resets once an audible chunk is seen, so a transient
+# driver glitch + recovery can re-warn next time.
+#
+# 2026-08-20 (honest reporting): it was one print per PROCESS, into a console
+# that does not exist under pythonw. The reset arm is `elif rms > 1e-5`, and
+# core.audio_processor._AUDIBLE_RMS_FLOOR is that same 1e-5, so on a device
+# handing back true digital silence the latch could never clear — the owner got
+# exactly one line, ever, describing the one fault he cannot ask JARVIS about
+# (the mic is how you ask). It now re-warns on a bounded interval, re-arms when
+# the selected input changes, and SAYS it once per stretch.
+#
+# What it deliberately does NOT do is demote the device. Under the
+# follow-the-default contract (see _refresh_devices / _default_device_identity)
+# _device_cache["in"] is left None on purpose so every stream open re-resolves
+# the Windows default; a skip-list written into that cache is exactly the
+# pinning that contract exists to prevent — and it was pinning a
+# still-enumerable dead endpoint that left this box deaf for 90 minutes.
+# PREFERRED_INPUT_DEVICES is empty here, so there is no "next preferred entry"
+# to demote to either. The honest move is to name the endpoint and the remedy.
 _silent_mic_warned = [False]
+_silent_mic_warned_at = [0.0]
+_silent_mic_warned_device = [""]
+# Bounded re-warn so a persistent fault stays visible across a long session
+# without becoming chatter. Not a config knob: MIC_SILENT_WARN_SECONDS already
+# owns the "how long is too long" decision; this only bounds repetition.
+MIC_SILENT_REWARN_SECONDS = 900.0
+
+
+def _report_silent_mic(silent_age: float, now: float) -> bool:
+    """Report a mic that enumerates and opens but returns only zeros.
+
+    Console AND spoken, because the failure mode removes the owner's ability to
+    ask. Throttled by MIC_SILENT_REWARN_SECONDS, and re-armed immediately when
+    the selected input device changes (a fresh endpoint that is ALSO silent is
+    new information). Returns True when it reported this time.
+
+    Never raises: this runs inside record_speech's per-chunk loop."""
+    try:
+        device = _device_cache.get("last_in_name") or ""
+    except Exception:
+        device = ""
+    changed = device != _silent_mic_warned_device[0]
+    if (_silent_mic_warned[0] and not changed
+            and (now - _silent_mic_warned_at[0]) < MIC_SILENT_REWARN_SECONDS):
+        return False
+    _silent_mic_warned[0] = True
+    _silent_mic_warned_at[0] = now
+    _silent_mic_warned_device[0] = device
+    try:
+        named = _friendly_device_name(device) or "your active microphone"
+    except Exception:
+        named = "your active microphone"
+    print(f"  [vad] WARNING: raw mic RMS has been ≈0 for {silent_age:.0f}s "
+          f"while JARVIS is awake on {device or 'the default input'} — likely "
+          f"silent-mic hardware/driver fault. Check Windows Privacy → "
+          f"Microphone, verify the active input device, and try unplug/replug "
+          f"if USB. (threshold "
+          f"MIC_SILENT_WARN_SECONDS={MIC_SILENT_WARN_SECONDS})")
+    try:
+        proactive_announce(
+            f"Sir, {named} has been completely silent for "
+            f"{int(silent_age)} seconds — I can hear nothing at all from it. "
+            f"Check Windows microphone privacy, or switch input devices and "
+            f"I'll follow.",
+            source="audio")
+    except Exception as e:
+        print(f"  [vad] silent-mic announcement failed: {e}")
+    return True
 
 # ── Main-loop watchdog (bug-5) ────────────────────────────────────────────
 # Guards against record_speech() (or anything else on the main thread)
@@ -7519,12 +7875,76 @@ _watchdog_reset_signal = threading.Event()
 _watchdog_stop_event   = threading.Event()   # only for test cleanup
 
 
+# The on-disk half of the heartbeat, for the out-of-process reader:
+# core/diagnostic_daemons._check_stuck_loop. Throttled so a 30 Hz-ish loop does
+# not become a 30 Hz writer; the reader only ever looks at the mtime.
+_MAIN_LOOP_HEARTBEAT_PUBLISH_S = 1.0
+_last_heartbeat_publish = [0.0]
+_main_loop_heartbeat_path_cache = [""]
+
+
+def _main_loop_heartbeat_path() -> str:
+    """Path of the liveness file core/diagnostic_daemons watches.
+
+    IMPORTED from the reader rather than re-joined here. This repo's #1 bug
+    class is one rule living in two copies, and a heartbeat whose writer and
+    watcher disagree about the path is a permanently-firing false alarm (the
+    exact defect this whole heartbeat replaces). Resolved lazily and cached:
+    the daemons module is already imported by the time the main loop ticks.
+    """
+    if not _main_loop_heartbeat_path_cache[0]:
+        try:
+            from core.diagnostic_daemons import MAIN_LOOP_HEARTBEAT_FILE as _p
+            _main_loop_heartbeat_path_cache[0] = _p
+        except Exception:
+            # Degraded fallback only — same resolver the daemon uses, so the
+            # two still agree unless core.paths itself is unimportable.
+            try:
+                from core.paths import data_file as _data_file
+                _main_loop_heartbeat_path_cache[0] = _data_file(
+                    "main_loop_heartbeat")
+            except Exception:
+                return ""
+    return _main_loop_heartbeat_path_cache[0]
+
+
+def _publish_main_loop_heartbeat(force: bool = False, now: float | None = None):
+    """Touch the main-loop liveness file, at most once a second.
+
+    UNCONDITIONAL by design. The previous liveness signal was hud_state.json's
+    mtime, whose writer starts `if not HUD_ENABLED: return` — so turning the
+    HUD off froze the signal and the anomaly watcher reported a stuck main loop
+    every 30 minutes, forever, on a perfectly healthy JARVIS. Nothing may gate
+    this call. Never raises: instrumentation must not be able to kill the loop
+    it measures."""
+    now = time.time() if now is None else now
+    if not force and (now - _last_heartbeat_publish[0]
+                      < _MAIN_LOOP_HEARTBEAT_PUBLISH_S):
+        return
+    _last_heartbeat_publish[0] = now
+    try:
+        path = _main_loop_heartbeat_path()
+        if not path:
+            return
+        # Plain truncate-write: the reader only uses getmtime(), there is a
+        # single writer, and an atomic replace would cost a temp file per
+        # second for no benefit.
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"{now:.3f}\n")
+    except Exception:
+        pass
+
+
 def _heartbeat():
     """Mark the main loop as alive. Called by the main loop just before
     each of its four status-line prints (Listening / Recording / Sleeping
     / [inject]). Also clears any stale reset signal — if we got here, the
-    last recovery succeeded and the loop is healthy again."""
+    last recovery succeeded and the loop is healthy again.
+
+    Publishes the on-disk heartbeat too (throttled), so the out-of-process
+    anomaly watcher measures the SAME liveness the in-process watchdog does."""
     _main_loop_heartbeat[0] = time.time()
+    _publish_main_loop_heartbeat(now=_main_loop_heartbeat[0])
     if _watchdog_reset_signal.is_set():
         _watchdog_reset_signal.clear()
 
@@ -7680,7 +8100,12 @@ def _safe_close_stream(stream, timeout_sec: float = 2.0) -> None:
         # 0xc0000374 heap corruption the reaper contract at _reap_playback was
         # written to eliminate. It fired benignly three times in the session
         # logs (most recently 2026-08-20 03:34:47) only because no sd.play()
-        # happened to be live. Abandoning is the honest outcome: the daemon
+        # happened to be live. (H-7, same day, narrows the second half: a
+        # reaper-owned play stream now leaves `_last_callback` at handoff, so
+        # sd.stop() could no longer reach it. The rule is unchanged — it still
+        # cannot free THIS handle, so it is all risk and no benefit, and the
+        # risk returns the moment anything republishes that slot.) Abandoning
+        # is the honest outcome: the daemon
         # keeps the close registered via _pa_close_pending, so _refresh_devices
         # defers its destructive sd._terminate() until PortAudio really returns.
         logging.warning(
@@ -7818,12 +8243,15 @@ def _pa_streams_live() -> bool:
     MUST hold _mic_lock. skills/self_diagnostic._mic_owned mirrors this list
     (minus the probe's own _diag_capture_active cell) — update BOTH together.
 
-    VERIFIED 2026-08-20: this helper has NO callers — _refresh_devices spells
-    the same checks out inline so each can print its own reason, and THAT is
-    the site that actually gates the reinit. Keep this function as the single
-    written-down definition of the owner list, but understand that adding a
-    cell here alone changes nothing: it must also go into _refresh_devices'
-    deny chain below."""
+    VERIFIED 2026-08-20: its ONE caller is _refresh_devices' ADVISORY
+    pre-check (`_owners_busy`), which decides whether it is worth pausing the
+    wake-word stream and asserting the follow-the-default trigger this pass.
+    That call does NOT gate the reinit — _refresh_devices spells the same
+    checks out again inline, under the same lock, so each can print its own
+    reason, and THAT inline chain is the site that actually gates it. Keep this
+    function as the single written-down definition of the owner list, but
+    understand that adding a cell here alone changes nothing binding: it must
+    also go into _refresh_devices' deny chain below."""
     return (_pa_mic_capture_live() or bool(_tts_playback_active[0])
             or bool(_pa_close_pending[0]))
 
@@ -7900,6 +8328,64 @@ def _pa_close_done() -> None:
     silently turn the deferral into a permanent PASS."""
     with _mic_lock:
         _pa_close_pending[0] = max(0, int(_pa_close_pending[0]) - 1)
+
+
+def _pa_detach_play_stream(stream) -> bool:
+    """Take the stream we just handed to the tts-reaper OUT of sounddevice's
+    module-global ``_last_callback`` slot, so the NEXT ``sd.play()`` cannot
+    touch it. Returns True when this call actually detached it.
+
+    H-7 (2026-08-20) — the hole H-6 left open. H-3 deleted every EXPLICIT
+    ``sd.stop()`` in the tree, but ``sd.play()`` calls it IMPLICITLY:
+    ``_CallbackContext.start_stream`` begins with ``stop()``
+    (sounddevice.py:2663), and module-level ``stop()`` is
+    ``_last_callback.stream.stop(ignore_errors); _last_callback.stream.close(
+    ignore_errors)`` (sounddevice.py:414-418). ``_StreamBase.close`` runs
+    ``Pa_CloseStream(self._ptr)`` and only THEN nulls ``_ptr``, with no lock.
+
+    So on the ABANDON path — the tts-reaper is still inside Pa_CloseStream, its
+    caller's bounded wait expired, ``_tts_playback_active`` is (correctly)
+    cleared — the very next utterance's ``sd.play()`` would run
+    Pa_StopStream + a SECOND Pa_CloseStream against the handle the stranded
+    reaper is still executing. Two threads in Pa_CloseStream on one WASAPI
+    stream is the 0xc0000374 heap corruption the single-toucher contract
+    exists to prevent, reached through the one path that contract explicitly
+    accepts. ``_pa_close_pending`` cannot cover this: it deliberately gates
+    only the destructive reinit and must NOT deny playback (a wedged close
+    would otherwise mute JARVIS for the life of the process).
+
+    The fence is ownership, not waiting: the moment the stream belongs to the
+    reaper it leaves the shared slot, so it is provably unreachable by any
+    later ``sd.play()``/``sd.stop()``/``sd.wait()``. This runs on EVERY
+    handoff, not just the abandoned ones — one rule, one place, no branch to
+    rot (the reaper is then the single toucher by construction rather than by
+    luck, and the "benign Pa_CloseStream(NULL)" interaction described in
+    _reap_playback's docstring stops happening at all).
+
+    Safe against the object lifetime: the ctx in ``_last_callback`` is also
+    referenced by the live stream itself (``_StreamBase._callback`` /
+    ``_finished_callback`` hold it, and the numpy buffer hangs off the ctx),
+    and the stream is referenced by the reaper thread's own argument — so
+    dropping the module-global bookmark frees nothing PortAudio is reading.
+
+    IDENTITY-CHECKED: only detaches when the slot still points at OUR stream.
+    A slot holding somebody else's context means our stream is already
+    unreachable (``stop()`` only ever touches the CURRENT ``_last_callback``),
+    and nulling a live foreign context would strand ITS stream instead.
+    Never raises — a sounddevice that has no such global (a test double, a
+    future release) simply reports False."""
+    if stream is None:
+        return False
+    try:
+        ctx = getattr(sd, "_last_callback", None)
+        if ctx is None or getattr(ctx, "stream", None) is not stream:
+            return False
+        sd._last_callback = None
+        return True
+    except Exception:
+        logging.exception("[audio] could not detach the play stream from "
+                          "sounddevice's _last_callback")
+        return False
 
 
 _record_speech_taps: "list[queue.Queue]" = []
@@ -8137,21 +8623,19 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
                 # so the user sees a concrete pointer instead of just
                 # "JARVIS isn't hearing me".
                 silent_age = _ap_for_vad.seconds_since_audible_chunk()
-                if (not _silent_mic_warned[0]
-                        and silent_age != float("inf")
+                if (silent_age != float("inf")
                         and silent_age > float(MIC_SILENT_WARN_SECONDS)):
-                    print(f"  [vad] WARNING: raw mic RMS has been ≈0 for "
-                          f"{silent_age:.0f}s while JARVIS is awake — "
-                          f"likely silent-mic hardware/driver fault. "
-                          f"Check Windows Privacy → Microphone, verify "
-                          f"the active input device, and try unplug/"
-                          f"replug if USB. (threshold "
-                          f"MIC_SILENT_WARN_SECONDS={MIC_SILENT_WARN_SECONDS})")
-                    _silent_mic_warned[0] = True
+                    # _report_silent_mic owns the latch, the re-warn throttle
+                    # and the spoken escalation.
+                    _report_silent_mic(silent_age, now_ts)
                 elif rms > 1e-5 and _silent_mic_warned[0]:
                     # Mic recovered — allow the warning to re-fire next
                     # time we drop silent for that long.
                     _silent_mic_warned[0] = False
+                    _silent_mic_warned_at[0] = 0.0
+                    _silent_mic_warned_device[0] = ""
+                    print(f"  [vad] mic is audible again "
+                          f"(RMS {rms:.5f}) — silent-mic warning re-armed")
             except Exception:
                 pass
 
@@ -8214,8 +8698,24 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
         # _safe_close_stream registers and the daemon retires. This flag itself
         # must still drop here — the barge-in gate, ambient listen, the face
         # tracker and the dossier read it and would stall forever on a lie.
-        _safe_close_stream(_record_stream)
-        _record_speech_active[0] = False
+        #
+        # H-8 (2026-08-20): the flag clear gets its OWN finally. These used to
+        # be two plain statements, and _safe_close_stream can now RAISE out of
+        # the first one — _pa_close_handoff deliberately re-raises when the
+        # close daemon cannot even be started ("RuntimeError: can't start new
+        # thread", the thread exhaustion this codebase already treats as a live
+        # hazard). One such raise and `_record_speech_active` stayed True for
+        # the life of the process: _refresh_devices never re-enumerates again
+        # (USB hotplug + follow-the-default dead), get_mic_buffer Path B
+        # refuses every claim (speaker-ID, enrolment and standby audio return
+        # None forever) and the self-diagnostic reports the mic permanently
+        # owned — all silently, because the raise unwinds into the main loop's
+        # per-iteration net. get_mic_buffer Path B already had this shape; this
+        # copy did not (stale-duplicate rule).
+        try:
+            _safe_close_stream(_record_stream)
+        finally:
+            _record_speech_active[0] = False
 
     if _debug_mode[0]:
         print(f"  [vad] peak RMS={peak_rms:.4f}  threshold={VAD_THRESHOLD}  "
@@ -12193,7 +12693,28 @@ def _pyttsx3_tts(text: str) -> tuple[np.ndarray, int]:
 
     _pt = threading.Thread(target=_pyttsx3_worker, name="pyttsx3-synth",
                            daemon=True)
-    _pt.start()
+    # The claim above was made on THIS thread but is released only inside the
+    # worker's finally — so a start() that raises (RuntimeError: can't start
+    # new thread, the thread exhaustion _pa_close_handoff's contract already
+    # treats as real) would leave a claim with no worker to retire it. The
+    # pyttsx3 rung would then be skipped for the rest of the session while the
+    # console asserted "worker still in flight from a prior timeout", which is
+    # a false statement about a worker that never existed. Same shape as
+    # _pa_close_handoff's re-raising unwind. 2026-08-20.
+    try:
+        _pt.start()
+    except BaseException as _se:
+        with _pyttsx3_inflight_lock:
+            _pyttsx3_inflight[0] = False
+        if isinstance(_se, Exception):
+            # Same destination as every other failure branch in this function:
+            # the rung failed, so try SAPI5 rather than raising into the ladder
+            # (site 2 of 2 would turn the raise into _silent_clip()). Loud,
+            # and it names the REAL cause instead of the in-flight fiction.
+            print(f"  [tts] pyttsx3 worker thread could not start "
+                  f"({type(_se).__name__}: {_se}); trying SAPI5")
+            return _try_sapi5_then_silence(text)
+        raise            # KeyboardInterrupt / SystemExit stay unswallowed
     _pt.join(timeout=_PYTTSX3_TIMEOUT_S)
     if _pt.is_alive():
         # DEGRADED PATH — must be loud. The worker still holds the SAPI engine
@@ -12658,10 +13179,16 @@ def _reap_playback(stream, done_evt: threading.Event, audio_secs: float) -> None
     done_evt.wait() and never enters PortAudio — a wedged native teardown
     strands this daemon (it dies with the process), not the main loop.
 
-    Interaction with the NEXT utterance: sd.play()'s internal module-level
-    stop() runs against this already-closed stream — its _ptr is NULL, so
-    Pa_StopStream/Pa_CloseStream(NULL) return paBadStreamPtr, which
-    sounddevice ignores. Benign, and single-threaded under _SPEAK_LOCK."""
+    Interaction with the NEXT utterance: none, since H-7 (2026-08-20). The
+    caller runs _pa_detach_play_stream the instant it hands this stream over,
+    so the stream is no longer in sounddevice's module-global `_last_callback`
+    and the next sd.play()'s IMPLICIT module-level stop() cannot reach it.
+    That interaction used to be described here as benign — "its _ptr is NULL by
+    then, so Pa_StopStream/Pa_CloseStream(NULL) return paBadStreamPtr" — which
+    held only on the HEALTHY path. On the ABANDON path (caller's bounded wait
+    expired while this thread is still inside Pa_CloseStream) the _ptr is still
+    live, and that implicit stop() was a genuine second Pa_CloseStream from a
+    second thread: the 0xc0000374 this contract exists to prevent."""
     try:
         deadline = time.monotonic() + max(audio_secs + 2.0, 5.0)
         cut = False
@@ -12866,6 +13393,17 @@ def play_with_lipsync(audio: np.ndarray, sr: int):
                 # what keeps the destructive reinit away from the abandoned
                 # close.
                 _pa_close_handoff(_t)
+                # H-7 (2026-08-20): the stream now belongs to the reaper, so
+                # take it OUT of sounddevice's shared `_last_callback` slot.
+                # The wait below is abandonable, and an abandoned reaper is
+                # still inside Pa_CloseStream — the next utterance's sd.play()
+                # would then run its IMPLICIT module-level stop() (a second
+                # Pa_StopStream + Pa_CloseStream) against that same handle:
+                # 0xc0000374. Ordered AFTER the handoff on purpose — if the
+                # daemon could not be started, _pa_close_handoff re-raises and
+                # the stream stays reachable so the next sd.play() still reaps
+                # it. See _pa_detach_play_stream.
+                _pa_detach_play_stream(_stream)
                 # Bounded pure-Python wait: the reaper's own deadline plus
                 # 1 s grace for its native teardown. On timeout, ABANDON the
                 # daemon (precedent: _safe_close_stream) — never touch the
@@ -12919,6 +13457,10 @@ def play_with_lipsync(audio: np.ndarray, sr: int):
                 # Deliberately NOT a divergent copy of the rule: both branches
                 # call the one _pa_close_handoff.
                 _pa_close_handoff(_t)
+                # H-7 — same fence as the no-robot branch, same one helper.
+                # A stale duplicate here would leave the robot path with the
+                # abandoned-reaper double-close the no-robot path just closed.
+                _pa_detach_play_stream(_stream)
                 if not _done_evt.wait(
                         timeout=max(audio_secs + 2.0, 5.0) + 1.0):
                     print("  [audio] tts-reaper wedged in native code — "
@@ -18971,6 +19513,27 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     "workshop_print_monitor_status", "holo_hud_v2_status",
     "arc_reactor_status_status", "stark_status_ring_status",
     "holographic_status",
+    # ── 2026-08-20 audit: the last two unvoiced-alias families ──────────────
+    #   recent_changes — the FOURTH alias of _act_read_changelog
+    #   (bobert_companion.py, registered one line below read_changelog /
+    #   show_changelog / what_changed / whats_new). The other four were voiced
+    #   by the 2026-07-04 read-out sweep; this one was missed, so a model that
+    #   reached past the three worked examples in core/prompts.py for the
+    #   fourth alias spent an LLM summarisation call whose answer was printed
+    #   and dropped — the owner heard only the model's improvised preamble.
+    #   Same shape as cancel_timer (see test_cancel_timer_in_verbatim_set).
+    #   _act_read_changelog never self-speaks and returns a finished sentence
+    #   on every branch, so it is safe here.
+    "recent_changes",
+    #   smart_home_devices / smart_home_list — core/smart_home_router.py's
+    #   register() routes smart_home_router_status (the very next line) but
+    #   left this pair in NEITHER set. Both are bound to smart_home_devices(),
+    #   which returns a finished "N devices, sir: 3 in Bedroom, …" sentence and
+    #   never self-speaks. They are deliberately absent from core/prompts.py
+    #   (tools/audit_codebase._INTERNAL_ONLY_ACTIONS) — but the local-model
+    #   cheat-sheet dumps EVERY ACTIONS key by name, so a local turn can and
+    #   does emit them, and the answer was computed and dropped.
+    "smart_home_devices", "smart_home_list",
 }
 
 # Actions whose runtime can plausibly exceed MID_TASK_STATUS_DELAY (~8 s).
@@ -22778,6 +23341,16 @@ def _capture_utterance(injected_text, memory):
 # idiom): last-heartbeat wall-clock and when a handoff signal was first seen.
 _bg_last_heartbeat = [0.0]
 _bg_handoff_seen_at = [0.0]
+# How long to keep talking before exiting, taken from the handoff payload.
+# signal_handoff() has always transmitted grace_seconds and the prod side has
+# always ignored it in favour of a hardcoded 10.0, so raising the ceremony's
+# grace silently changed nothing. Seeded with the same 10.0 default the
+# ceremony uses so behaviour is unchanged when the payload omits it.
+_BG_HANDOFF_GRACE_DEFAULT_S = 10.0
+# The ceremony only waits grace_seconds + 8 before declaring failure and rolling
+# back, so honouring an absurd payload value would guarantee a rollback. Clamp.
+_BG_HANDOFF_GRACE_MAX_S = 120.0
+_bg_handoff_grace_s = [_BG_HANDOFF_GRACE_DEFAULT_S]
 
 
 def _blue_green_loop_tick() -> bool:
@@ -22805,6 +23378,13 @@ def _blue_green_loop_tick() -> bool:
             _signal = None
         if _signal:
             _bg_handoff_seen_at[0] = _now_bg
+            # Honour the grace the ceremony actually asked for (2026-08-20).
+            try:
+                _g = float(_signal.get("grace_seconds",
+                                       _BG_HANDOFF_GRACE_DEFAULT_S))
+            except (TypeError, ValueError):
+                _g = _BG_HANDOFF_GRACE_DEFAULT_S
+            _bg_handoff_grace_s[0] = max(0.0, min(_g, _BG_HANDOFF_GRACE_MAX_S))
             _target = _signal.get("target_version") or "the new build"
             # blue-green-2: cinematic single-line takeover. Short
             # enough that the 3-second post-announce gap in the
@@ -22858,6 +23438,7 @@ def _blue_green_loop_tick() -> bool:
         if _fail:
             # Cancel any pending exit — the takeover isn't happening.
             _bg_handoff_seen_at[0] = 0.0
+            _bg_handoff_grace_s[0] = _BG_HANDOFF_GRACE_DEFAULT_S
             try:
                 _speak("Handoff failure, sir — I'll stay on the "
                        "current build.")
@@ -22865,8 +23446,11 @@ def _blue_green_loop_tick() -> bool:
                 print(f"  [blue-green] handoff-failure announce "
                       f"failed: {_fe}")
     # If we observed a handoff signal, exit `grace_seconds` later
-    # so any in-flight TTS completes before the green takeover.
-    if _bg_handoff_seen_at[0] and (_now_bg - _bg_handoff_seen_at[0]) >= 10.0:
+    # so any in-flight TTS completes before the green takeover. The number comes
+    # from the signal payload (clamped); it used to be a hardcoded 10.0, which
+    # made signal_handoff's grace_seconds argument decorative on this side.
+    if (_bg_handoff_seen_at[0]
+            and (_now_bg - _bg_handoff_seen_at[0]) >= _bg_handoff_grace_s[0]):
         print("  [blue-green] handoff window elapsed — prod exiting cleanly")
         return True
     return False
@@ -22874,7 +23458,8 @@ def _blue_green_loop_tick() -> bool:
 
 # Hard-kill failsafe for the blue/green teardown. upgrade_jarvis's
 # run_blue_green_handoff gives prod grace_seconds + 8 to disappear and the tick
-# above has already spent the 10s grace, so the teardown gets the remaining
+# above has already spent that same grace (read from the signal payload since
+# 2026-08-20, no longer a hardcoded 10 s), so the teardown gets the remaining
 # margin before the ceremony declares failure and rolls back.
 _BLUE_GREEN_EXIT_FAILSAFE_S = 8.0
 
@@ -24215,6 +24800,11 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         # between launching the watchdog and this point can run several
         # seconds, and we don't want a slow boot to look like a stall.
         _main_loop_heartbeat[0] = time.time()
+        # Publish once up front (force past the throttle) so the anomaly
+        # watcher never judges this run against a PREVIOUS run's mtime: the
+        # file persists across restarts, and a long boot would otherwise look
+        # like a stall on the daemon's first sweep.
+        _publish_main_loop_heartbeat(force=True, now=_main_loop_heartbeat[0])
         while True:
             try:
                 if _blue_green_loop_tick():
@@ -24470,12 +25060,11 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         # falling out of main() (atexit), so mark intent explicitly rather
         # than relying only on the failsafe Timer's clean=True.
         mark_intentional_exit()
-        # Stop any audio that might be mid-play/wait so sd.wait() doesn't block
         # FAILSAFE (2026-07-12): none of the teardown steps below are
-        # time-bounded (sd.stop / HUD kills can block in native code
-        # forever) — arm an independent hard-kill so this path can NEVER
-        # produce an immortal half-shut-down process. clean=True: reaching
-        # this path at all means the stop was intentional.
+        # time-bounded (the audio release and the HUD kills can block in
+        # native code forever) — arm an independent hard-kill so this path can
+        # NEVER produce an immortal half-shut-down process. clean=True:
+        # reaching this path at all means the stop was intentional.
         _t = threading.Timer(25.0, _hard_exit, kwargs={"clean": True})
         _t.daemon = True
         _t.start()

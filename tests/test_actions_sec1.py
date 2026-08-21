@@ -447,7 +447,7 @@ class SetUnifiedHudHiddenTests(unittest.TestCase):
             return orig_join(*parts)
 
         with mock.patch("os.path.join", side_effect=fake_join):
-            A._set_unified_hud_hidden(hidden)
+            return A._set_unified_hud_hidden(hidden)
 
     def test_creates_control_file_with_hidden_flag(self):
         self._run_with_ctrl_path(True)
@@ -507,11 +507,29 @@ class SetUnifiedHudHiddenTests(unittest.TestCase):
         # replace fails AND the temp-removal in the inner except ALSO fails;
         # the innermost ``except Exception: pass`` swallows it, then the
         # re-raise bubbles to the outer try and is swallowed too. No raise.
+        #
+        # 2026-08-20: the swallow stays (this runs on the voice path and must
+        # never raise into it) but it is no longer SILENT and no longer
+        # indistinguishable from success -- the helper returns False and logs
+        # once, which is what lets _act_show_hud stop claiming "HUD restored,
+        # sir." for a latch that never reached disk.
         with mock.patch("os.replace", side_effect=OSError("replace boom")), \
-                mock.patch("os.remove", side_effect=OSError("remove boom")):
+                mock.patch("os.remove", side_effect=OSError("remove boom")), \
+                mock.patch("builtins.print") as mprint:
             # must not raise despite both failures
-            self._run_with_ctrl_path(True)
+            ok = self._run_with_ctrl_path(True)
         self.assertFalse(os.path.exists(self.ctrl))
+        self.assertIs(ok, False, "a failed latch write must report False, not "
+                                 "a None that reads as success to the caller")
+        self.assertTrue(
+            any("hide latch" in " ".join(str(a) for a in c.args)
+                for c in mprint.call_args_list),
+            "the failure must leave exactly one named log line, not nothing")
+
+    def test_successful_write_reports_true(self):
+        # The other half of the contract: the happy path must be
+        # distinguishable from the swallowed failure.
+        self.assertIs(self._run_with_ctrl_path(True), True)
 
 
 class ShowHudTests(unittest.TestCase):
@@ -523,6 +541,175 @@ class ShowHudTests(unittest.TestCase):
         fake._write_hud_state.assert_called_once_with(visible=True)
         mclear.assert_called_once_with(False)
         self.assertIn("HUD restored", out)
+
+
+def _healthy_hud_bc():
+    """A bc double whose HUD subprocess handle reads as ALIVE.
+
+    Popen.poll() returns None while the child runs, so that is what a live HUD
+    looks like to _hud_child_state.
+    """
+    fake = mock.Mock()
+    fake.HUD_ENABLED = True
+    fake._hud_process = mock.Mock()
+    fake._hud_process.poll.return_value = None
+    return fake
+
+
+class HonestShowHudTests(unittest.TestCase):
+    """2026-08-20 LOW finding: show_hud / toggle_hud said "HUD restored, sir."
+    unconditionally.
+
+    Three states produced that spoken lie, and none of them left a log line:
+      * HUD_ENABLED False -- both writes are no-ops, nothing can come back;
+      * the latch write failing -- swallowed by _set_unified_hud_hidden;
+      * the HUD SUBPROCESS being dead -- which is exactly the state the owner
+        is in when he says "turn on the HUD" (core/prompts.py teaches that
+        phrase as a show_hud trigger), and which nothing in the tree polls for.
+
+    The un-hide is now delivered or reported, never assumed.
+    """
+
+    def test_healthy_path_still_confirms(self):
+        fake = _healthy_hud_bc()
+        with _patch_bc(fake), \
+                mock.patch.object(A, "_set_unified_hud_hidden",
+                                  return_value=True) as mclear:
+            out = A._act_show_hud("")
+        fake._write_hud_state.assert_called_once_with(visible=True)
+        mclear.assert_called_once_with(False)
+        fake._launch_hud.assert_not_called()
+        self.assertEqual(out, "HUD restored, sir.")
+
+    def test_hud_disabled_says_so_and_writes_nothing(self):
+        fake = _healthy_hud_bc()
+        fake.HUD_ENABLED = False
+        with _patch_bc(fake), \
+                mock.patch.object(A, "_set_unified_hud_hidden") as mclear:
+            out = A._act_show_hud("")
+        self.assertNotIn("HUD restored", out)
+        self.assertIn("Settings", out)
+        # Both writes are no-ops while HUD_ENABLED is False -- don't pretend.
+        fake._write_hud_state.assert_not_called()
+        mclear.assert_not_called()
+
+    def test_dead_hud_is_relaunched_then_confirmed(self):
+        fake = _healthy_hud_bc()
+        fake._hud_process.poll.return_value = 2      # PyQt6 missing -> exit 2
+
+        def _revive(*_a, **_k):
+            fake._hud_process.poll.return_value = None
+
+        fake._launch_hud.side_effect = _revive
+        with _patch_bc(fake), \
+                mock.patch.object(A, "_set_unified_hud_hidden",
+                                  return_value=True):
+            out = A._act_show_hud("")
+        fake._launch_hud.assert_called_once()
+        self.assertEqual(out, "HUD restored, sir.")
+
+    def test_dead_hud_that_will_not_relaunch_is_reported(self):
+        fake = _healthy_hud_bc()
+        fake._hud_process.poll.return_value = 1      # crashed and stays dead
+        with _patch_bc(fake), \
+                mock.patch.object(A, "_set_unified_hud_hidden",
+                                  return_value=True):
+            out = A._act_show_hud("")
+        fake._launch_hud.assert_called_once()
+        self.assertNotIn("HUD restored", out)
+        self.assertIn("isn't running", out)
+
+    def test_never_launched_hud_is_relaunched(self):
+        # _hud_process is None after a boot-time launch failure or a
+        # _shutdown_hud() -- nothing is on screen.
+        fake = _healthy_hud_bc()
+        fake._hud_process = None
+        with _patch_bc(fake), \
+                mock.patch.object(A, "_set_unified_hud_hidden",
+                                  return_value=True):
+            out = A._act_show_hud("")
+        fake._launch_hud.assert_called_once()
+        # Still None -> the relaunch did not take; say so.
+        self.assertNotIn("HUD restored", out)
+
+    def test_relaunch_exception_does_not_escape_the_voice_path(self):
+        fake = _healthy_hud_bc()
+        fake._hud_process = None
+        fake._launch_hud.side_effect = RuntimeError("spawn boom")
+        with _patch_bc(fake), \
+                mock.patch.object(A, "_set_unified_hud_hidden",
+                                  return_value=True), \
+                mock.patch("builtins.print"):
+            out = A._act_show_hud("")       # must not raise
+        self.assertNotIn("HUD restored", out)
+
+    def test_failed_latch_write_is_not_reported_as_restored(self):
+        fake = _healthy_hud_bc()
+        with _patch_bc(fake), \
+                mock.patch.object(A, "_set_unified_hud_hidden",
+                                  return_value=False):
+            out = A._act_show_hud("")
+        self.assertNotIn("HUD restored", out)
+        self.assertIn("latch", out)
+
+    def test_toggle_shares_the_same_honest_body(self):
+        # The un-hide rule must have ONE owner; toggle inherits every check
+        # above by delegating to _restore_hud.
+        fake = _healthy_hud_bc()
+        fake._hud_state_lock = mock.MagicMock()
+        fake._hud_state_cache = {"visible": False}
+        fake._hud_process.poll.return_value = 1     # dead, won't come back
+        with _patch_bc(fake), \
+                mock.patch.object(A, "_set_unified_hud_hidden",
+                                  return_value=True):
+            out = A._act_toggle_hud("")
+        self.assertNotIn("HUD restored", out)
+        self.assertIn("isn't running", out)
+
+    def test_toggle_hide_branch_does_not_touch_the_launcher(self):
+        fake = _healthy_hud_bc()
+        fake._hud_state_lock = mock.MagicMock()
+        fake._hud_state_cache = {"visible": True}
+        with _patch_bc(fake), \
+                mock.patch.object(A, "_set_unified_hud_hidden") as mclear:
+            out = A._act_toggle_hud("")
+        fake._write_hud_state.assert_called_once_with(visible=False)
+        mclear.assert_not_called()
+        fake._launch_hud.assert_not_called()
+        self.assertIn("HUD hidden", out)
+
+
+class HudChildStateTests(unittest.TestCase):
+    """_hud_child_state must report death only from POSITIVE evidence -- a
+    fabricated failure is the same contract breach as a fabricated success."""
+
+    def test_none_handle_is_never_launched(self):
+        self.assertEqual(A._hud_child_state(mock.Mock(_hud_process=None)),
+                         "never-launched")
+
+    def test_live_poll_is_running(self):
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        self.assertEqual(A._hud_child_state(mock.Mock(_hud_process=proc)),
+                         "running")
+
+    def test_int_returncode_is_dead(self):
+        for rc in (0, 1, 2, -1):
+            proc = mock.Mock()
+            proc.poll.return_value = rc
+            self.assertEqual(A._hud_child_state(mock.Mock(_hud_process=proc)),
+                             "dead", rc)
+
+    def test_unreadable_handle_is_not_evidence_of_death(self):
+        proc = mock.Mock()
+        proc.poll.side_effect = OSError("handle gone")
+        self.assertEqual(A._hud_child_state(mock.Mock(_hud_process=proc)),
+                         "running")
+
+    def test_non_int_poll_result_is_not_evidence_of_death(self):
+        proc = mock.Mock()          # poll() returns a Mock, not an int
+        self.assertEqual(A._hud_child_state(mock.Mock(_hud_process=proc)),
+                         "running")
 
 
 class ToggleHudTests(unittest.TestCase):

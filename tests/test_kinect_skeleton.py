@@ -220,9 +220,11 @@ class ControllingHandPointTests(unittest.TestCase):
         self.assertIsNone(ks.controlling_hand_point(None))
 
     def test_prefer_side_follows_extended_hand(self):
-        # The reach-to-engage air-mouse passes the live which-hand: with both
-        # hands projected, prefer_side="left" draws the circle on the LEFT hand
-        # (the extended one), overriding the default right-first order.
+        # The air-mouse passes the live which-hand: with both hands projected,
+        # prefer_side="left" draws the circle on the LEFT hand (the engaged
+        # one), overriding the default right-first order. ("reach-to-engage"
+        # here was stale wording — engagement is the HEIGHT gate, hand above
+        # the shoulder line; see audio/kinect_bridge.arm_extension.)
         points = {"hand_right": (100, 200), "hand_left": (300, 400)}
         self.assertEqual(
             ks.controlling_hand_point(points, prefer_side="left"), (300, 400))

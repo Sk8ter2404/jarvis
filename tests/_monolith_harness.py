@@ -143,6 +143,9 @@ _MONOLITH_RESTORE_NAMES = (
     "_audio_aec_enabled", "_audio_ns_enabled", "_audio_agc_enabled",
     "_jarvis_played_music_at", "_ambient_music_last_hit", "_ambient_music_hits",
     "_session_resume_done", "_main_loop_heartbeat",
+    "_last_heartbeat_publish", "_main_loop_heartbeat_path_cache",
+    "_bg_handoff_grace_s",
+    "_silent_mic_warned", "_silent_mic_warned_at", "_silent_mic_warned_device",
     # ── voice fast-path latches (bobert_companion-local single-element lists) ─
     # Reset to [None]/[False] so a wake detector built (or a disable-latch
     # tripped) in one test can't bleed into the next. (tests/monolith/

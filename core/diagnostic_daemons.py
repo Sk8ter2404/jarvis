@@ -22,7 +22,7 @@ Four background threads run continuously while JARVIS is up:
                             $JARVIS_DEEP_AUDIT_BUDGET_USD per day (default 5).
     4. AnomalyWatchDaemon — local-only (no LLM, no shell-out). Every ~90 s
                             tails the freshest session log + checks for
-                            stale hud_state.json mtime + reads
+                            a stale data/main_loop_heartbeat mtime + reads
                             data/boot_failures.jsonl. Queues [anomaly]
                             tasks for: repeated single-skill failures,
                             unhandled exception bursts, stuck main loop,
@@ -78,6 +78,26 @@ PIPELINE_RUNS_FILE = os.path.join(DATA_DIR, "pipeline_runs.jsonl")
 LOGS_DIR = os.path.join(PROJECT_DIR, "logs")
 BOOT_FAILURES_FILE = os.path.join(DATA_DIR, "boot_failures.jsonl")
 HUD_STATE_FILE = os.path.join(PROJECT_DIR, "hud_state.json")
+# THE main-loop liveness signal. Written unconditionally (~1 Hz) by
+# bobert_companion._heartbeat via _publish_main_loop_heartbeat, which imports
+# THIS constant so there is exactly one join for the path.
+#
+# 2026-08-20: _check_stuck_loop used to watch HUD_STATE_FILE's mtime, guarded
+# by `if not os.path.exists(HUD_STATE_FILE)` with the comment "HUD might be
+# disabled". That guard tests the wrong thing. _write_hud_state's first line is
+# `if not HUD_ENABLED: return`, so disabling the HUD FREEZES the mtime rather
+# than removing the file — and hud_state.json is gitignored runtime state that
+# nothing in the tree ever deletes. On any box that has run with the HUD on
+# (i.e. the shipped default), unticking "On-screen HUD" in Settings therefore
+# made "[anomaly] main loop appears stuck" fire every 30 minutes for the life of
+# the session, into jarvis_todo.md — which toasts the owner (jarvis_watcher.py)
+# and feeds the overnight upgrade pipeline a defect that does not exist. A false
+# alarm that never stops is how a real alarm gets ignored.
+#
+# Resolved through DATA_DIR (core.paths) so a staging process watches its own
+# heartbeat; the old PROJECT_DIR/hud_state.json join also disagreed with the
+# monolith's _BLUE_GREEN_PATHS["hud_state_file"] under a blue/green role.
+MAIN_LOOP_HEARTBEAT_FILE = os.path.join(DATA_DIR, "main_loop_heartbeat")
 
 # ──────────────────────────── tuning ─────────────────────────────────
 
@@ -112,7 +132,8 @@ DEEP_AUDIT_ESTIMATED_COST_PER_RUN_USD = 0.05
 THREAD_JOIN_TIMEOUT_S = 5.0
 
 # ── anomaly-watch tuning ──
-# Watch session logs + boot_failures.jsonl + hud_state mtime for signs that
+# Watch session logs + boot_failures.jsonl + main_loop_heartbeat mtime for signs
+# that
 # JARVIS is sick: skills failing repeatedly, tracebacks piling up, main loop
 # stuck, or recent boot crashes. Thresholds are deliberately conservative —
 # a slow disk, a network blip, or a one-off transient must NOT flood
@@ -123,7 +144,7 @@ ANOMALY_POLL_INTERVAL_S = 90           # check every 90s
 ANOMALY_WINDOW_S = 600                 # 10-min window for repeated failures
 ANOMALY_FAILURE_THRESHOLD = 5          # same skill failing N+ times in tail
 ANOMALY_EXCEPTION_THRESHOLD = 6        # N+ tracebacks in tail
-ANOMALY_STUCK_LOOP_THRESHOLD_S = 300   # hud_state stale N+ s = loop stuck
+ANOMALY_STUCK_LOOP_THRESHOLD_S = 300   # heartbeat stale N+ s = loop stuck
 ANOMALY_STUCK_LOOP_MIN_CONSECUTIVE = 2 # require N consecutive stale sweeps
 ANOMALY_DEDUP_GAP_S = 1800             # 30-min cooldown per signature
 ANOMALY_LOG_TAIL_BYTES = 64 * 1024     # tail size per scan (cheap)
@@ -1124,21 +1145,28 @@ def _check_boot_failures(queued_so_far: list[int]) -> None:
 
 
 def _check_stuck_loop(queued_so_far: list[int]) -> None:
-    """Use hud_state.json mtime as a main-loop heartbeat. The HUD publisher
-    runs in the main thread on every audio tick, so a stale hud_state.json
-    is a *candidate* signal the event loop has wedged — but a single slow
-    I/O sweep can also briefly stall HUD writes, so we require
-    ANOMALY_STUCK_LOOP_MIN_CONSECUTIVE consecutive stale sweeps before we
-    queue anything. That removes the worst false-positive class (heavy
-    disk/network I/O blocking the main loop for ~5 min while JARVIS is
-    perfectly healthy)."""
-    if not os.path.exists(HUD_STATE_FILE):
-        # HUD might be disabled — don't false-positive in that case.
+    """Use data/main_loop_heartbeat's mtime as the main-loop heartbeat.
+
+    bobert_companion._heartbeat() touches that file on every loop iteration
+    (throttled to ~1 Hz) with NO feature gate in front of it, so a stale mtime
+    is a *candidate* signal the event loop has wedged — but a single slow I/O
+    sweep can also briefly stall it, so we require
+    ANOMALY_STUCK_LOOP_MIN_CONSECUTIVE consecutive stale sweeps before we queue
+    anything. That removes the worst false-positive class (heavy disk/network
+    I/O blocking the main loop for ~5 min while JARVIS is perfectly healthy).
+
+    This used to watch hud_state.json, whose writer returns early when
+    HUD_ENABLED is False — see the note on MAIN_LOOP_HEARTBEAT_FILE. The
+    existence guard below is now what it always claimed to be: "the main loop
+    has not published yet this run" (early boot, or a build without the
+    publisher), not a proxy for a feature toggle."""
+    if not os.path.exists(MAIN_LOOP_HEARTBEAT_FILE):
+        # The main loop has not published a heartbeat yet — nothing to judge.
         _update_state(lambda s: s["anomaly_watch"].update(
             {"stuck_loop_consecutive_misses": 0}))
         return
     try:
-        age = _now() - os.path.getmtime(HUD_STATE_FILE)
+        age = _now() - os.path.getmtime(MAIN_LOOP_HEARTBEAT_FILE)
     except OSError:
         return
 
@@ -1163,7 +1191,8 @@ def _check_stuck_loop(queued_so_far: list[int]) -> None:
         return
 
     body = (
-        f"[anomaly] main loop appears stuck — hud_state.json hasn't been "
+        f"[anomaly] main loop appears stuck — data/main_loop_heartbeat hasn't "
+        f"been "
         f"updated in {int(age)}s across {misses} consecutive sweeps "
         f"(threshold {ANOMALY_STUCK_LOOP_THRESHOLD_S}s × "
         f"{ANOMALY_STUCK_LOOP_MIN_CONSECUTIVE}). Possible deadlock or "

@@ -1672,5 +1672,93 @@ class QueryReplyNoFailureMarkerTests(unittest.TestCase):
         self.assertIn("office lights", reply)   # it IS the honest status answer
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  2026-08-20 adversarial review, MED: partial must not be spoken as failure
+#
+#  "dim the entry light" against a non-dimmable plug turns the plug fully ON
+#  and cannot dim it. sh_kasa reports ok:False + partial_ok:True; rendering
+#  that as "That didn't work, sir" tells him nothing happened while the light
+#  is now bright — the mirror image of the "Set to 30%, sir" lie this contract
+#  was written to kill. It also carries "didn't", a FAILURE_MARKER, so the line
+#  is dropped from the verbatim speak path and re-run through the LLM.
+# ═════════════════════════════════════════════════════════════════════════════
+class SummarizePartialTests(_RouterTestBase):
+    ACTION = {"verb": "on", "brightness": 30, "descriptor": "entry light"}
+
+    def _partial(self):
+        return {"error": "kasa 'entry light': brightness not applied "
+                         "(device is not dimmable) (applied: on=True)",
+                "partial_ok": True, "device": "entry light",
+                "applied": {"on": True},
+                "skipped": {"brightness": "device is not dimmable"},
+                "failed": {}}
+
+    def test_a_partial_result_is_not_reported_as_total_failure(self):
+        out = router._summarize_results(self.ACTION, [self._partial()])
+        low = out.lower()
+        self.assertNotIn("didn't work", low, out)
+        self.assertIn("on, sir", low)
+        self.assertIn("entry light", low)
+        self.assertIn("not dimmable", low)
+
+    def test_the_partial_line_is_speakable(self):
+        from core import failure_markers
+        out = router._summarize_results(self.ACTION, [self._partial()])
+        low = out.lower()
+        hits = [m for m in failure_markers.FAILURE_MARKERS if m.lower() in low]
+        self.assertEqual(hits, [],
+                         f"partial reply matched failure markers {hits}: {out!r}")
+
+    def test_the_raw_error_dict_stays_out_of_the_spoken_line(self):
+        out = router._summarize_results(self.ACTION, [self._partial()])
+        self.assertNotIn("(applied:", out)      # the raw dict dump
+        self.assertNotIn("kasa '", out)
+        self.assertIn("Brightness not applied", out)
+
+    def test_a_real_failure_is_still_a_failure(self):
+        out = router._summarize_results(
+            self.ACTION, [{"error": "boom", "device": "entry light"}])
+        self.assertIn("didn't work", out.lower())
+
+    def test_a_mixed_batch_is_not_treated_as_partial(self):
+        # One device partly landed, another is genuinely dead: that batch is
+        # not a clean "partial" and must keep the failure voice.
+        out = router._summarize_results(
+            self.ACTION, [self._partial(),
+                          {"error": "boom", "device": "hall lamp"}])
+        self.assertIn("didn't work", out.lower())
+
+    def test_other_brand_skills_are_unaffected(self):
+        # Only a skill that opts in with partial_ok changes behaviour.
+        out = router._summarize_results(
+            self.ACTION, [{"error": "boom", "device": "hue bulb"}])
+        self.assertIn("didn't work", out.lower())
+
+    def test_a_partial_inside_a_mixed_batch_is_still_named(self):
+        # One dimmer landed fully, one plug only partly: the device count
+        # alone ("1/2 device(s)") never says WHY, so the gap must be named.
+        from core import failure_markers
+        out = router._summarize_results(
+            self.ACTION, [{"ok": True, "device": "hall lamp"}, self._partial()])
+        low = out.lower()
+        self.assertIn("not dimmable", low, out)
+        self.assertIn("entry light", low)
+        hits = [m for m in failure_markers.FAILURE_MARKERS if m.lower() in low]
+        self.assertEqual(hits, [], f"mixed reply matched {hits}: {out!r}")
+
+    def test_a_clean_batch_gains_no_note(self):
+        out = router._summarize_results(
+            {"verb": "on", "descriptor": "kitchen"},
+            [{"ok": True, "device": "A"}, {"ok": True, "device": "B"}])
+        self.assertEqual(out, "On, sir - 2 kitchen devices.".replace("-", chr(8212)))
+
+    def test_an_off_partial_reads_as_off(self):
+        r = self._partial()
+        r["applied"] = {"on": False}
+        out = router._summarize_results({"verb": "off", "descriptor": "entry"},
+                                        [r])
+        self.assertIn("Off, sir", out)
+
+
 if __name__ == "__main__":
     unittest.main()

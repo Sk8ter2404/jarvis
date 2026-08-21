@@ -301,10 +301,15 @@ def main() -> int:
         sys.path.insert(0, root)
     from tools.mem_guard import apply_memory_ceiling
     apply_memory_ceiling()
-    # NO REAL BROWSER either — belt and braces beside tests/__init__.py, which
-    # is the chokepoint that covers `python -m unittest` too. Added after CI
-    # runs spammed dozens of live tabs into the owner's default Chrome profile
-    # on 2026-08-20 via production webbrowser.open() calls. Idempotent.
+    # THEN THE LIVE-DATA GUARD, AND ONLY THEN THE BROWSER GUARD (no live tabs in
+    # the owner's Chrome). The ORDER is a contract, stated in full in
+    # tests/__init__.py: both wrap os.startfile, and the one armed FIRST is the
+    # one the other's un-wrap snapshot restores instead of discards. That rule
+    # lived ONLY there, so this runner armed the browser guard with no live-data
+    # guard in the process yet, and the first _reset_for_tests() in
+    # tests/test_browser_guard.py wiped the live-data hook off os.startfile for
+    # the rest of the run (full CI, 2026-08-20). The tests package IS that
+    import tests  # chokepoint: it arms all three, in order, idempotently
     from tools import browser_guard
     browser_guard.install()
     # Redirect settings I/O to a throwaway copy BEFORE discovery/import (and

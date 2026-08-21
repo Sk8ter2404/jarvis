@@ -25,6 +25,10 @@ Two contracts this module must keep (2026-08-20):
   * HONEST — `set_state` returns ok:True only when the whole request landed;
     a failed or capability-skipped sub-command yields ok:False plus `failed`/
     `skipped` naming the device and what did not happen, and logs it.
+    HONEST CUTS BOTH WAYS (2026-08-20 review): a request that PARTLY landed
+    also carries `partial_ok: True`, because "dim the entry light" against a
+    non-dimmable plug does switch it on, and calling that total failure is the
+    mirror image of the old lie. Callers phrase partial as partial.
 """
 from __future__ import annotations
 
@@ -93,6 +97,31 @@ _CONTROL_BUDGET_SECS = 20.0
 # Extra wall-clock allowed on the worker-thread join beyond the coroutine's own
 # budget, for a coro blocked in a native call that never sees the cancel.
 _JOIN_GRACE_SECS = 5.0
+# Floor for a clamped call. Checking the deadline only BEFORE each device left
+# the real worst case far past the ceiling: a call starting at t=19.9 s could
+# still run its full 12 s bound, plus a 10 s broadcast fallback inside
+# _device_for — ~34 s against a nominal 20 s budget. Every _run_async now
+# clamps to the time actually left, with this floor so the last device gets a
+# fair attempt instead of an instant, meaningless timeout. Worst-case overrun
+# is therefore bounded by (floor x nested calls), not by the per-call bound.
+_MIN_CALL_TIMEOUT_SECS = 1.0
+
+# Absolute monotonic deadline for the whole turn, THREAD-LOCAL: smart_home_control
+# runs on the voice dispatch thread while _run_async's nested path spawns its own
+# worker, and a process-global would let one turn's budget clamp another's.
+_turn_budget = threading.local()
+
+
+def _set_turn_deadline(deadline: float | None) -> None:
+    _turn_budget.deadline = deadline
+
+
+def _turn_deadline_remaining() -> float | None:
+    """Seconds left in the current turn's budget, or None when none is set."""
+    deadline = getattr(_turn_budget, "deadline", None)
+    if deadline is None:
+        return None
+    return deadline - time.monotonic()
 
 _USE_DEFAULT_TIMEOUT = object()   # sentinel: the budgets stay patchable/tunable
                                   # at call time instead of being frozen into a
@@ -110,6 +139,15 @@ def _run_async(coro, timeout=_USE_DEFAULT_TIMEOUT, what: str = "call"):
     behaviour and is used by nothing."""
     if timeout is _USE_DEFAULT_TIMEOUT:
         timeout = _CALL_TIMEOUT_SECS
+    # Clamp to what is left of the whole-turn budget (when one is set). Without
+    # this the deadline was only consulted BETWEEN devices, so the last device
+    # of a fan-out could still overrun the ceiling by its full per-call bound
+    # plus a broadcast fallback. `timeout=None` (unbounded) is deliberately
+    # left alone — it is used by nothing and means "I really mean forever".
+    if timeout is not None:
+        remaining = _turn_deadline_remaining()
+        if remaining is not None:
+            timeout = max(_MIN_CALL_TIMEOUT_SECS, min(timeout, remaining))
     msg = (f"kasa {what} timed out after {timeout:g}s"
            if timeout is not None else f"kasa {what} timed out")
 
@@ -328,12 +366,20 @@ def set_state(device: dict, **kwargs) -> dict:
       * everything requested landed  -> {"ok": True, "device", "applied"}
       * anything failed or was skipped ->
             {"ok": False, "device", "applied", "partial", "failed", "skipped",
+             "partial_ok": <bool>,
              "error": "<device>: <per-sub-command detail> (applied: ...)"}
         `ok` is True ONLY when the whole request landed. `failed` holds
         sub-commands that were attempted and raised; `skipped` holds ones the
         hardware cannot do (capability gate) so they were never attempted.
         Both are also printed, so a degraded run is visible in the log even if
         a caller ignores the dict.
+        `partial_ok` is True when something DID land and nothing was attempted
+        and failed — i.e. a pure capability gap: "dim the entry light" against
+        a plug turns it on and cannot dim it. That is not a total failure, and
+        a caller that says "that did not work" for it is lying in the opposite
+        direction from the bug this contract was written to fix. Callers must
+        phrase it as partial ("On, sir — entry light. Brightness not applied:
+        device is not dimmable."). 2026-08-20 review.
       * power (`on`) is deliberately NOT swallowed: if turn_on/turn_off raises,
         the whole apply aborts into the error branch — there is no point
         dimming a device we could not switch.
@@ -419,6 +465,10 @@ def set_state(device: dict, **kwargs) -> dict:
     did = ", ".join(f"{k}={v}" for k, v in applied.items()) or "nothing"
     return {
         "ok": False,
+        # Something landed and nothing was attempted-and-raised: a capability
+        # gap, not a dead device. See the docstring — the caller must not
+        # report this as total failure.
+        "partial_ok": bool(applied) and not failed,
         "device":  name,
         "applied": applied,
         "partial": applied,
@@ -489,6 +539,22 @@ def _failure_reason(result: dict) -> str:
     return txt if len(txt) <= 140 else txt[:137] + "..."
 
 
+def _partial_note(result: dict) -> str:
+    """Speakable note for a PARTIAL result — what did not land and why.
+
+    Marker-free by contract: a partial IS a success in part, and
+    smart_home_control is spoken verbatim, so a "couldn't"-shaped phrase would
+    drop the whole line off the verbatim path. Shared by this skill and
+    core.smart_home_router._summarize_partial's phrasing rules.
+    """
+    skipped = (result or {}).get("skipped") or {}
+    if not skipped:
+        return "partly applied"
+    bits = [f"{k} not applied: {v}" for k, v in skipped.items()]
+    note = "; ".join(bits)
+    return note if len(note) <= 140 else note[:137] + "..."
+
+
 def smart_home_control(request: str = "") -> str:
     """Voice control for the LAN smart plugs: 'turn on the entry light',
     'turn off dining room', 'toggle kitchen 2', 'are the lights on?'.
@@ -497,12 +563,25 @@ def smart_home_control(request: str = "") -> str:
     against the live Kasa discovery, and drives it directly over the LAN — no
     Amazon/Alexa needed. 2026-05-30 (added after Amazon locked down the Alexa
     cookie API; these TP-Link Kasa plugs are controlled locally instead)."""
-    import re as _re
     # Whole-turn deadline (2026-08-20). Bounding each device call is not
     # enough: "turn off everything" fans out sequentially, so N devices still
     # multiply N x the per-call bound. Started before discovery so the
     # broadcast counts against the same budget.
     _turn_deadline = time.monotonic() + _CONTROL_BUDGET_SECS
+    # Publish it so EVERY _run_async below — discovery, the direct connect, the
+    # broadcast fallback, each device call — clamps to the time actually left
+    # rather than to its own per-call bound. Cleared in the finally at the end
+    # so a later, unbudgeted call is not throttled by a stale deadline.
+    _set_turn_deadline(_turn_deadline)
+    try:
+        return _smart_home_control(request, _turn_deadline)
+    finally:
+        _set_turn_deadline(None)
+
+
+def _smart_home_control(request: str, _turn_deadline: float) -> str:
+    """Body of smart_home_control, with the whole-turn deadline armed."""
+    import re as _re
     req = (request or "").strip()
     if not req:
         return "What would you like me to control, sir?"
@@ -588,6 +667,10 @@ def smart_home_control(request: str = "") -> str:
             r = _set(rec, on=(intent == "on"))
             if r.get("ok"):
                 out.append(f"{nm} {intent}")
+            elif r.get("partial_ok"):
+                # Something landed; only a capability gap remains. Not a
+                # failure — see set_state's contract.
+                out.append(f"{nm} {intent} ({_partial_note(r)})")
             else:
                 failures += 1
                 out.append(f"{nm} (failed: {_failure_reason(r)})")
@@ -605,6 +688,9 @@ def smart_home_control(request: str = "") -> str:
             r = _set(rec, on=new_on)
             if r.get("ok"):
                 out.append(f"{nm} {'on' if new_on else 'off'}")
+            elif r.get("partial_ok"):
+                out.append(f"{nm} {'on' if new_on else 'off'} "
+                           f"({_partial_note(r)})")
             else:
                 failures += 1
                 out.append(f"{nm} (failed: {_failure_reason(r)})")
@@ -617,13 +703,24 @@ def smart_home_control(request: str = "") -> str:
             else:
                 out.append(f"{nm} is {'on' if st.get('on') else 'off'}")
     if not_attempted:
-        # Phrased with "couldn't" on purpose: core.failure_markers.FAILURE_MARKERS
-        # is what bobert_companion._is_failure / dispatcher._is_failure_result
-        # classify on, and "not attempted" alone matches no marker — the line
-        # would have been filed as a SUCCESS.
-        out.append(f"{len(not_attempted)} not attempted "
-                   f"({', '.join(not_attempted)}) — I couldn't get to them "
-                   f"in time")
+        names = ", ".join(not_attempted)
+        if intent is None:
+            # STATUS BRANCH: this is an ANSWER, not a failed command, and
+            # smart_home_control is in SPEAK_RESULT_VERBATIM_ACTIONS — so a
+            # FAILURE_MARKER here would drop the whole honest status line off
+            # the verbatim path and re-run it through the LLM (the trap
+            # core/smart_home_router.py:920-930 documents by name). Same
+            # information, marker-free wording. 2026-08-20 review.
+            out.append(f"{len(not_attempted)} I did not reach in time "
+                       f"({names})")
+        else:
+            # CONTROL BRANCH: phrased with "couldn't" on purpose —
+            # core.failure_markers.FAILURE_MARKERS is what
+            # bobert_companion._is_failure / dispatcher._is_failure_result
+            # classify on, and "not attempted" alone matches no marker, so the
+            # line would have been filed as a SUCCESS.
+            out.append(f"{len(not_attempted)} not attempted "
+                       f"({names}) — I couldn't get to them in time")
     if intent is None:
         return "Status, sir — " + "; ".join(out) + "."
     attempted = len(matches) - len(not_attempted)

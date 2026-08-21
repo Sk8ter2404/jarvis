@@ -13,7 +13,8 @@ test is imported, so the ceiling is inherited by everything the run spawns:
 
   * Windows — a Job Object with JOB_OBJECT_LIMIT_PROCESS_MEMORY (per process)
     + JOB_OBJECT_LIMIT_JOB_MEMORY (the whole job, children included)
-    + JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (no child outlives the runner). Past
+    + JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (no child outlives the runner BY
+    ACCIDENT — see the breakaway note) + JOB_OBJECT_LIMIT_BREAKAWAY_OK. Past
     the limit the kernel FAILS the commit: CPython raises MemoryError, or the
     process dies with STATUS_COMMITMENT_LIMIT (0xC000012D). Either way the
     machine keeps breathing.
@@ -52,6 +53,26 @@ CI runner the same number is comfortably above the suite's address-space need
 documented, explicit escape hatch for the rare case that legitimately needs
 more than the ceiling — it is deliberately loud in the log. Anything
 unparseable or negative falls back to the default (fail *closed*: protected).
+
+WINDOWS BREAKAWAY NOTE — A CHILD THAT IS *MEANT* TO OUTLIVE THE RUN
+-------------------------------------------------------------------
+Every descendant joins the job, and neither CREATE_NO_WINDOW nor
+DETACHED_PROCESS breaks a process out of one — only CREATE_BREAKAWAY_FROM_JOB
+does, and Windows refuses that unless the job carries
+JOB_OBJECT_LIMIT_BREAKAWAY_OK. Without that flag "no child outlives the runner"
+was unconditional, which is wrong for a child the suite deliberately starts to
+outlive it: the monolith's ``_ensure_ollama_running`` spawns ``ollama serve``
+and its own comment says the server "still outlives JARVIS". One unmocked call
+under a runner would (a) load a ~13.5 GB model INSIDE the 8 GB job-wide cap, so
+the RUNNER's own allocations start failing nowhere near the offending test, and
+(b) get ollama TERMINATED when the runner's handle closes — which this box has a
+standing "never kill ollama" rule against.
+
+So the job now carries BREAKAWAY_OK: the default is still "you are inside the
+ceiling and you die with it", but a spawn that explicitly asks with
+CREATE_BREAKAWAY_FROM_JOB can opt out. That makes the escape POSSIBLE; it does
+not make it automatic, and the real fix for ollama is the structural
+JARVIS_TEST_MODE gate the monolith's own comments already intend.
 
 WINDOWS NESTED-JOB NOTE
 -----------------------
@@ -147,6 +168,7 @@ def _apply_windows_job_object(limit_bytes: int) -> str:
 
     JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100
     JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200
+    JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
     JobObjectExtendedLimitInformation = 9
 
@@ -203,7 +225,11 @@ def _apply_windows_job_object(limit_bytes: int) -> str:
     info.BasicLimitInformation.LimitFlags = (
         JOB_OBJECT_LIMIT_PROCESS_MEMORY     # any ONE process over the line dies
         | JOB_OBJECT_LIMIT_JOB_MEMORY       # ...and so does the job in total
-        | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)  # no child outlives the runner
+        | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE  # no child outlives us by accident
+        # ...but one that is SUPPOSED to (ollama serve) can opt out with
+        # CREATE_BREAKAWAY_FROM_JOB, which Windows refuses without this flag.
+        # See the breakaway note in the module docstring.
+        | JOB_OBJECT_LIMIT_BREAKAWAY_OK)
     if not k32.SetInformationJobObject(job, JobObjectExtendedLimitInformation,
                                        ctypes.byref(info), ctypes.sizeof(info)):
         raise ctypes.WinError(ctypes.get_last_error())

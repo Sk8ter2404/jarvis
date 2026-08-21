@@ -956,12 +956,78 @@ def smart_home_control(utterance: str = "") -> str:
     return _summarize_results(action, results)
 
 
+def _summarize_partial(results: list[dict]) -> str:
+    """Speak a PARTIAL result as partial — what landed, and what did not.
+
+    2026-08-20 review (MED). A brand skill reports `partial_ok: True` when
+    something DID land and nothing was attempted-and-raised: the live case is
+    "dim the entry light" against a non-dimmable plug, which switches the plug
+    fully ON and cannot dim. Reporting that as "That didn't work, sir" is the
+    mirror image of the pre-2026-08-20 lie ("Set to 30%, sir") — the plug is
+    now bright, and he is told nothing happened.
+
+    Marker-free by contract: smart_home_control is in
+    SPEAK_RESULT_VERBATIM_ACTIONS, so "didn't"/"couldn't" here would drop the
+    whole honest line off the verbatim path and re-run it through the LLM (see
+    the query-branch comment above). The raw error dict stays out of the
+    spoken line; it is already in the log.
+    """
+    lead_bits: list[str] = []
+    note_bits: list[str] = []
+    for r in results:
+        dev = r.get("device") or "the device"
+        applied = r.get("applied") or {}
+        skipped = r.get("skipped") or {}
+        if "on" in applied:
+            lead_bits.append(f"{'On' if applied['on'] else 'Off'}, sir — {dev}")
+        elif applied:
+            did = ", ".join(str(k) for k in applied)
+            lead_bits.append(f"{did} set, sir — {dev}")
+        for key, why in skipped.items():
+            note_bits.append(f"{key} not applied: {why}")
+    lead = "; ".join(lead_bits) or "Partly done, sir"
+    if not note_bits:
+        return lead + "."
+    note = "; ".join(note_bits)
+    return lead + ". " + note[:1].upper() + note[1:] + "."
+
+
 def _summarize_results(action: dict, results: list[dict]) -> str:
+    """One-line summary suitable for TTS, with any capability gap named.
+
+    The verdict comes from _summarize_verdict; this wrapper only adds the note
+    a MIXED batch would otherwise swallow. When one device of several landed
+    only in part, the verdict counts it out of the success tally ("1/2
+    device(s)") but never says WHY — so "dim the lamps" against one dimmer and
+    one plug would report a clean-sounding count while one of them is simply
+    at full brightness. The all-partial case already carries its own note from
+    _summarize_partial and is not double-annotated.
+    """
+    line = _summarize_verdict(action, results)
+    ok = [r for r in results if "error" not in r]
+    partial = [r for r in results if "error" in r and r.get("partial_ok")]
+    if not ok or not partial:
+        return line
+    notes: list[str] = []
+    for r in partial:
+        dev = r.get("device") or "one device"
+        for key, why in (r.get("skipped") or {}).items():
+            notes.append(f"{dev}: {key} not applied, {why}")
+    if not notes:
+        return line
+    return line + " " + "; ".join(notes) + "."
+
+
+def _summarize_verdict(action: dict, results: list[dict]) -> str:
     """One-line summary suitable for TTS."""
     ok = [r for r in results if "error" not in r]
     bad = [r for r in results if "error" in r]
     n = len(results)
     if not ok and bad:
+        # PARTIAL is not FAILURE. A result carrying partial_ok did land in
+        # part; only a capability gap remains. See _summarize_partial.
+        if all(r.get("partial_ok") for r in bad):
+            return _summarize_partial(bad)
         first = bad[0]
         return (f"That didn't work, sir — {first.get('device','device')} "
                 f"reported: {first['error']}")

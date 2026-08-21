@@ -33,6 +33,7 @@ Public surface:
   unregister_instance(pid)       — remove from instances.json (atexit)
   signal_handoff(...)            — write handoff.signal so prod idles + exits
   consume_handoff_signal()       — prod-side: pop the signal, return its payload
+  clear_unconsumed_handoff_signal() — pipeline-side: drop a signal nobody acted on
   promote_staging(...)           — atomically swap lock pointers + bump version
   rollback(...)                  — remove staging artifacts; deployment_state stays on prod
 
@@ -49,6 +50,11 @@ import time
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR    = os.path.join(PROJECT_DIR, "data")
+
+# When THIS interpreter started, captured at import. consume_handoff_signal()
+# uses it to refuse a signal that was written before we existed — such a signal
+# was addressed to our PREDECESSOR, not to us. See the note there.
+_PROCESS_START = time.time()
 DATA_STAGING_DIR = os.path.join(PROJECT_DIR, "data_staging")
 
 DEPLOYMENT_STATE_FILE = os.path.join(DATA_DIR, "deployment_state.json")
@@ -375,7 +381,32 @@ def signal_handoff(reason: str = "upgrade",
 def consume_handoff_signal() -> dict | None:
     """Called by the prod JARVIS's main-loop watchdog. If the signal file
     is present, return the payload and DELETE the file so it only fires
-    once. Returns None when no signal is pending."""
+    once. Returns None when no signal is pending.
+
+    ORPHAN GUARD (2026-08-20). The file is one-shot but it had no age check at
+    all, while its sibling consume_handoff_state() has had
+    HANDOFF_STATE_TTL_SECONDS since it was written ("secondary defense against
+    orphaned handoff.json files left behind by an aborted blue-green run").
+    The same orphan is reachable here: run_blue_green_handoff() writes the
+    signal unconditionally, and if prod is already down (or dies inside the
+    ~3-21 s window before its next tick) its grace loop breaks on the FIRST
+    poll, so the compensating handoff_failure.signal is never written and
+    nothing deletes the file. The freshly promoted prod then consumed a
+    takeover addressed to its predecessor, announced "Switching to the new
+    version, sir", and exited 10 s into its first main loop — while the
+    pipeline printed "handoff complete" and returned ok:True.
+
+    The rule is boot-relative, NOT a flat TTL. A wall-clock TTL has to be
+    guessed, and the legitimate consume happens after a choreography sleep +
+    grace poll + staging teardown + a full cold boot, which can easily exceed
+    any value small enough to catch the orphan. "Written before this process
+    existed" has no false negatives: a signal meant for US cannot predate us.
+    It is also NOT "ignore the signal when --resume-handoff is in argv" — the
+    relaunched prod keeps that flag for its whole lifetime, so a blanket skip
+    would break every second and subsequent blue-green upgrade.
+
+    The file is deleted either way: an orphan must not survive to poison the
+    next boot too."""
     if not os.path.exists(HANDOFF_SIGNAL_FILE):
         return None
     payload = _read_json(HANDOFF_SIGNAL_FILE, {})
@@ -383,7 +414,34 @@ def consume_handoff_signal() -> dict | None:
         os.remove(HANDOFF_SIGNAL_FILE)
     except OSError:
         pass
-    return payload if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    signaled_at = payload.get("signaled_at")
+    if (isinstance(signaled_at, (int, float))
+            and not isinstance(signaled_at, bool)
+            and float(signaled_at) < _PROCESS_START):
+        print(f"  [blue-green] ignoring an orphaned handoff signal written "
+              f"{_PROCESS_START - float(signaled_at):.1f}s before this process "
+              f"started — it was addressed to our predecessor. Cleared.")
+        return None
+    return payload
+
+
+def clear_unconsumed_handoff_signal() -> bool:
+    """Pipeline-side sweep: delete a handoff signal that no prod acted on.
+
+    Returns True only when a file was actually removed. "Still on disk" is the
+    exact invariant — a prod that acted on the signal deleted it inside
+    consume_handoff_signal — so this covers both orphan variants (the ceremony
+    was run with prod already down, and prod dying inside the signal window)
+    without having to guess which one happened. Never raises."""
+    if not os.path.exists(HANDOFF_SIGNAL_FILE):
+        return False
+    try:
+        os.remove(HANDOFF_SIGNAL_FILE)
+        return True
+    except OSError:
+        return False
 
 
 def write_handoff_state(state: dict) -> bool:

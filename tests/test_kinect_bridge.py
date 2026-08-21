@@ -862,7 +862,9 @@ class HandStateTests(_BridgeBase):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# arm-extension / forward-reach geometry (the air-mouse reach-to-engage signal)
+# arm-extension / forward-reach geometry (the air-mouse's ORIGINAL engage
+# signal; demoted to non-gating in favour of the height gate — still computed,
+# still surfaced for tuning/diagnostics)
 # ─────────────────────────────────────────────────────────────────────────
 # Camera space: x sensor-right, y up, z depth AWAY from the sensor (metres).
 # arm_extension(joints, side) returns forward_reach_m (torso_z - hand_z; >0 when

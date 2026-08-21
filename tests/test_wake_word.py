@@ -937,6 +937,23 @@ class LifecycleTests(unittest.TestCase):
             self.assertFalse(d.resume())
         self.assertFalse(d._running)
 
+    def test_resume_cannot_be_retried_after_it_fails(self):
+        """Pins WHY bobert_companion._wake_word_resume_or_report escalates to
+        start() instead of calling resume() again: the failing path already
+        cleared _paused, so a second resume() short-circuits on its own
+        `if not self._paused: return False` without touching the stream. A
+        "bounded retry" built on resume() would be a silent no-op."""
+        d = ww.WakeWordDetector(engine="openwakeword")
+        d._running = True
+        d._paused = True
+        with mock.patch.object(d, "_open_stream",
+                               return_value=False) as mopen:
+            self.assertFalse(d.resume())
+            mopen.assert_called_once()
+            self.assertFalse(d.resume())
+            # Second call never even attempted to reopen.
+            mopen.assert_called_once()
+
     def test_pause_then_resume_roundtrip(self):
         d = ww.WakeWordDetector(engine="openwakeword")
         s = FakeInputStream(samplerate=16000, channels=1, dtype="float32",

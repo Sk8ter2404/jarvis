@@ -12,11 +12,11 @@
 | Total registered actions (incl. aliases) | 671 |
 | — monolith `ACTIONS` dict | 139 |
 | — skill / core registered | 532 |
-| VERBATIM speak set | 315 |
+| VERBATIM speak set | 320 |
 | INFORMATIVE speak set | 79 |
-| neither set | 277 |
+| neither set | 272 |
 | no `prompts.py` example | 542 |
-| no test reference | 80 |
+| no test reference | 83 |
 
 A result in **neither** set is spoken only if the handler self-speaks; otherwise the answer
 is dropped. That is correct for side-effect actions but is the recurring "logged but never
@@ -28,10 +28,10 @@ Aliases sharing a handler are collapsed. `ex?` = has a prompts.py `[ACTION: …]
 
 | action(s) | handler | speak | ex? | tests |
 |---|---|---|:--:|:--:|
-| `wake_word_mode_off`, `wake_word_mode_on` | `bobert_companion.py:17516` | neither | — | 1 |
-| `wake_word_mode_status` | `bobert_companion.py:17551` | **VERBATIM** | — | 3 |
-| `ambient_learning_mode`, `ambient_learning_mode_off`, `ambient_learning_mode_on`, `enter_ambient_learning`, `exit_ambient_learning` | `bobert_companion.py:18118` | neither | — | 2 |
-| `wake_resume_answer_then_quiet`, `wake_resume_stay_talkative` | `bobert_companion.py:18154` | neither | — | 2 |
+| `wake_word_mode_off`, `wake_word_mode_on` | `bobert_companion.py:17665` | neither | — | 1 |
+| `wake_word_mode_status` | `bobert_companion.py:17700` | **VERBATIM** | — | 3 |
+| `ambient_learning_mode`, `ambient_learning_mode_off`, `ambient_learning_mode_on`, `enter_ambient_learning`, `exit_ambient_learning` | `bobert_companion.py:18325` | neither | — | 2 |
+| `wake_resume_answer_then_quiet`, `wake_resume_stay_talkative` | `bobert_companion.py:18361` | neither | — | 2 |
 | `ambient_mode_off`, `ambient_mode_on`, `silent_learning_off`, `silent_learning_on`, `start_eavesdropping`, `stop_eavesdropping` | `core/actions.py:1013` | neither | — | 4 |
 | `greet_new_people_off`, `greet_new_people_on`, `notice_new_people`, `stop_greeting_people` | `core/actions.py:1058` | neither | — | 0 |
 | `youtube` | `core/actions.py:107` | neither | yes | 4 |
@@ -69,8 +69,7 @@ Aliases sharing a handler are collapsed. `ex?` = has a prompts.py `[ACTION: …]
 | `volume_up` | `core/actions.py:213` | neither | — | 5 |
 | `last_screen`, `previous_screen`, `recall_screen`, `screen_history` | `core/actions.py:2172` | *INFORMATIVE* | yes | 0 |
 | `volume_down` | `core/actions.py:222` | neither | yes | 3 |
-| `read_changelog`, `show_changelog`, `what_changed`, `whats_new` | `core/actions.py:2239` | **VERBATIM** | yes | 1 |
-| `recent_changes` | `core/actions.py:2239` | neither | — | 1 |
+| `read_changelog`, `recent_changes`, `show_changelog`, `what_changed`, `whats_new` | `core/actions.py:2239` | **VERBATIM** | yes | 1 |
 | `start_overnight_upgrade` | `core/actions.py:2305` | neither | — | 0 |
 | `volume_mute` | `core/actions.py:231` | neither | yes | 3 |
 | `open_on_monitor` | `core/actions.py:2341` | neither | — | 1 |
@@ -134,7 +133,7 @@ Aliases sharing a handler are collapsed. `ex?` = has a prompts.py `[ACTION: …]
 | `refresh_smart_home_router` | `core/smart_home_router.py:1044` | neither | — | 2 |
 | `control_device`, `control_smart_home`, `smart_home_control` | `core/smart_home_router.py:880` | **VERBATIM** | yes | 4 |
 | `control_light`, `control_plug`, `kasa_control` | `core/smart_home_router.py:880` | neither | — | 0 |
-| `smart_home_devices`, `smart_home_list` | `core/smart_home_router.py:994` | neither | — | 2 |
+| `smart_home_devices`, `smart_home_list` | `core/smart_home_router.py:994` | **VERBATIM** | — | 3 |
 | `resume` | `core/wake_word.py:388` | **VERBATIM** | — | 3 |
 | `morning_tabs` | `skills/_example_skill.py:13` | neither | — | 0 |
 | `vscode_command` | `skills/_example_skill.py:23` | neither | — | 0 |
@@ -226,10 +225,8 @@ Aliases sharing a handler are collapsed. `ex?` = has a prompts.py `[ACTION: …]
 | `set_active_speaker` | `skills/enroll_voice.py:385` | **VERBATIM** | — | 2 |
 | `voice_id_status` | `skills/enroll_voice.py:398` | **VERBATIM** | — | 2 |
 | `evening_briefing` | `skills/evening_briefing.py:801` | neither | — | 3 |
-| `enroll_face`, `learn_my_face` | `skills/face_id.py:197` | **VERBATIM** | — | 2 |
-| `remember_my_face` | `skills/face_id.py:197` | neither | — | 2 |
-| `learn_guest`, `learn_their_face`, `remember_their_face` | `skills/face_id.py:257` | neither | — | 2 |
-| `remember_this_person` | `skills/face_id.py:257` | **VERBATIM** | — | 2 |
+| `enroll_face`, `learn_my_face`, `remember_my_face` | `skills/face_id.py:197` | **VERBATIM** | — | 2 |
+| `learn_guest`, `learn_their_face`, `remember_their_face`, `remember_this_person` | `skills/face_id.py:257` | **VERBATIM** | — | 2 |
 | `do_you_recognize_me`, `recognize_face`, `who_am_i`, `whoami`, `whos_at_the_desk` | `skills/face_id.py:305` | **VERBATIM** | yes | 2 |
 | `face_id_status` | `skills/face_id.py:357` | **VERBATIM** | — | 1 |
 | `forget_face` | `skills/face_id.py:395` | **VERBATIM** | — | 2 |
@@ -362,13 +359,12 @@ Aliases sharing a handler are collapsed. `ex?` = has a prompts.py `[ACTION: …]
 | `pattern_aggregate` | `skills/pattern_learning.py:1092` | **VERBATIM** | — | 2 |
 | `weekly_digest` | `skills/pattern_learning.py:1101` | **VERBATIM** | — | 2 |
 | `pattern_stats` | `skills/pattern_learning.py:1115` | **VERBATIM** | — | 2 |
-| `rag_search` | `skills/personal_rag.py:118` | **VERBATIM** | yes | 1 |
-| `rag_search_quiet` | `skills/personal_rag.py:135` | neither | — | 2 |
-| `search_my_files` | `skills/personal_rag.py:135` | **VERBATIM** | — | 2 |
-| `rag_reindex` | `skills/personal_rag.py:175` | **VERBATIM** | — | 2 |
-| `rag_status` | `skills/personal_rag.py:193` | **VERBATIM** | — | 2 |
-| `rag_configure` | `skills/personal_rag.py:212` | **VERBATIM** | — | 2 |
-| `rag_open_top` | `skills/personal_rag.py:247` | **VERBATIM** | yes | 2 |
+| `rag_search`, `search_my_files` | `skills/personal_rag.py:124` | **VERBATIM** | yes | 2 |
+| `rag_search_quiet` | `skills/personal_rag.py:141` | neither | — | 2 |
+| `rag_reindex` | `skills/personal_rag.py:181` | **VERBATIM** | — | 2 |
+| `rag_status` | `skills/personal_rag.py:199` | **VERBATIM** | — | 2 |
+| `rag_configure` | `skills/personal_rag.py:218` | **VERBATIM** | — | 2 |
+| `rag_open_top` | `skills/personal_rag.py:253` | **VERBATIM** | yes | 2 |
 | `notify_phone`, `push_to_phone`, `text_my_phone` | `skills/phone_bridge.py:892` | **VERBATIM** | yes | 2 |
 | `phone_bridge_status`, `phone_status` | `skills/phone_bridge.py:925` | **VERBATIM** | — | 2 |
 | `list_phone_backends` | `skills/phone_bridge.py:957` | **VERBATIM** | — | 2 |
@@ -387,10 +383,10 @@ Aliases sharing a handler are collapsed. `ex?` = has a prompts.py `[ACTION: …]
 | `fire_schedule`, `run_schedule` | `skills/schedule_manager.py:422` | **VERBATIM** | — | 1 |
 | `schedule_status` | `skills/schedule_manager.py:434` | **VERBATIM** | — | 1 |
 | `screen_watch_status` | `skills/screen_watch.py:323` | **VERBATIM** | — | 2 |
-| `are_you_ok`, `self_diagnostic`, `system_check` | `skills/self_diagnostic.py:3089` | **VERBATIM** | — | 2 |
-| `what_is_broken`, `whats_broken` | `skills/self_diagnostic.py:3204` | **VERBATIM** | — | 2 |
-| `diagnostic_history` | `skills/self_diagnostic.py:3239` | **VERBATIM** | — | 2 |
-| `last_diagnostic_run` | `skills/self_diagnostic.py:3264` | **VERBATIM** | — | 2 |
+| `are_you_ok`, `self_diagnostic`, `system_check` | `skills/self_diagnostic.py:3438` | **VERBATIM** | — | 2 |
+| `what_is_broken`, `whats_broken` | `skills/self_diagnostic.py:3579` | **VERBATIM** | — | 2 |
+| `diagnostic_history` | `skills/self_diagnostic.py:3614` | **VERBATIM** | — | 2 |
+| `last_diagnostic_run` | `skills/self_diagnostic.py:3646` | **VERBATIM** | — | 2 |
 | `ecobee_request_pin` | `skills/sh_ecobee.py:332` | **VERBATIM** | — | 1 |
 | `ecobee_complete_setup` | `skills/sh_ecobee.py:347` | **VERBATIM** | — | 2 |
 | `ecobee_authorize` | `skills/sh_ecobee.py:385` | **VERBATIM** | — | 1 |
@@ -423,8 +419,7 @@ Aliases sharing a handler are collapsed. `ex?` = has a prompts.py `[ACTION: …]
 | `set_timer` | `skills/timer.py:364` | neither | yes | 9 |
 | `list_timers` | `skills/timer.py:401` | **VERBATIM** | — | 1 |
 | `cancel_timer` | `skills/timer.py:427` | **VERBATIM** | yes | 2 |
-| `bonnaroo_brief` | `skills/trip_planner.py:622` | neither | — | 1 |
-| `bonnaroo_status` | `skills/trip_planner.py:622` | **VERBATIM** | — | 1 |
+| `bonnaroo_brief`, `bonnaroo_status` | `skills/trip_planner.py:622` | neither | — | 0 |
 | `bonnaroo_prep` | `skills/trip_planner.py:630` | neither | — | 0 |
 | `calibrate_tv_region`, `tv_calibrate` | `skills/tv_detect.py:303` | **VERBATIM** | — | 1 |
 | `tv_detect_status`, `tv_status` | `skills/tv_detect.py:348` | **VERBATIM** | — | 2 |
@@ -432,7 +427,7 @@ Aliases sharing a handler are collapsed. `ex?` = has a prompts.py `[ACTION: …]
 | `tv_detect_off` | `skills/tv_detect.py:399` | **VERBATIM** | — | 1 |
 | `holographic_status` | `skills/vip_boss_mode.py:350` | **VERBATIM** | — | 2 |
 | `vip_intercept_status` | `skills/vip_boss_mode.py:350` | **VERBATIM** | — | 2 |
-| `wayne_boss_mode_status` | `skills/vip_boss_mode.py:350` | **VERBATIM** | — | 1 |
+| `wayne_boss_mode_status` | `skills/vip_boss_mode.py:350` | neither | — | 0 |
 | `wayne_boss_test_work_hours` | `skills/vip_boss_mode.py:364` | neither | — | 0 |
 | `wayne_boss_test_evening` | `skills/vip_boss_mode.py:375` | neither | — | 0 |
 | `scrap_vip_reply` | `skills/vip_intercept.py:1019` | **VERBATIM** | — | 1 |

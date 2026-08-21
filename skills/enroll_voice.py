@@ -101,7 +101,8 @@ def _record_seconds(seconds: float) -> Optional[np.ndarray]:
     # Prefer the companion's shared mic buffer when available — it taps the
     # wake-word listener's persistent InputStream so we don't trigger a
     # WASAPI "device in use" rejection by opening a second exclusive stream
-    # on the same input device (the original sd.rec path below was the bug).
+    # on the same input device (the sd.rec path this used to fall back to
+    # was the bug; it is gone — see the H-4 note in _record_seconds).
     bc = _bobert()
     if bc is not None:
         getter = getattr(bc, "get_mic_buffer", None)
@@ -121,8 +122,8 @@ def _record_seconds(seconds: float) -> Optional[np.ndarray]:
         print(f"  [enroll_voice] sounddevice unavailable: {e}")
         return None
 
-    # TEARDOWN-GATE CLAIM (2026-08-14): these local fallback captures (the
-    # sd.rec below and its InputStream twin) set none of the monolith's
+    # TEARDOWN-GATE CLAIM (2026-08-14): this local fallback capture (the
+    # private InputStream below) sets none of the monolith's
     # classic mic-ownership flags, so bobert's _refresh_devices could run its
     # destructive sd._terminate()/_initialize() under a live callback
     # (0xc0000374). Claim bobert_companion._enroll_capture_active for the
@@ -149,52 +150,47 @@ def _record_seconds(seconds: float) -> Optional[np.ndarray]:
             except Exception:
                 _gate_release = None   # gate bookkeeping failed — old behaviour
     try:
-        n_frames = int(seconds * ENROLL_SAMPLE_RATE)
         device = _input_device()
-        try:
-            # sd.rec is blocking-friendly and matches the simplest path; if it
-            # fails on the user's driver (some USB headsets don't honour
-            # it), fall back to a callback-based InputStream that drains into a
-            # list — that path is known-good from bobert_companion.record_speech.
-            rec = sd.rec(
-                n_frames,
-                samplerate=ENROLL_SAMPLE_RATE,
-                channels=1,
-                dtype="float32",
-                device=device,
-            )
-            # BOUNDED WAIT (2026-07-14 audit). sd.wait() blocks until the recording
-            # finishes — but this runs on the MAIN VOICE THREAD, and a stalled mic
-            # (a device that opens but never delivers its frames) makes it block
-            # FOREVER: JARVIS goes deaf and mute mid-enrolment. Wait on a daemon
-            # instead, bounded to the recording length plus a grace margin; on
-            # overrun, stop the stream and fall through to the InputStream path
-            # below (which the except-branch already handles). The bound is
-            # recording-length-relative so a legitimately long enrolment isn't cut.
-            _done = threading.Event()
-
-            def _await_rec():
-                try:
-                    sd.wait()
-                finally:
-                    _done.set()
-
-            threading.Thread(target=_await_rec, daemon=True).start()
-            if not _done.wait(timeout=seconds + 2.0):
-                try:
-                    sd.stop()
-                except Exception:
-                    pass
-                raise TimeoutError(
-                    f"sd.rec did not finish within {seconds + 2.0:.0f}s "
-                    f"(mic stalled)")
-            if rec is not None and rec.size > 0:
-                arr = rec[:, 0] if rec.ndim > 1 else rec
-                return np.asarray(arr, dtype=np.float32)
-        except Exception as e:
-            print(f"  [enroll_voice] sd.rec failed ({e}); falling back to InputStream")
-
-        # InputStream fallback.
+        # H-4, SECOND COPY (2026-08-20). This used to open with
+        # ``sd.rec(...)`` + a daemon in ``sd.wait()`` + ``sd.stop()`` on
+        # overrun, falling back to the private InputStream below only when
+        # that raised. All three are PROCESS-GLOBAL calls and the same trio
+        # skills/self_diagnostic's mic probe was rebuilt to remove:
+        #
+        #   * sounddevice publishes exactly ONE module-global
+        #     ``_last_callback``, and ``_CallbackContext.start_stream`` opens
+        #     with ``stop()`` — which stops AND CLOSES whatever the previous
+        #     play/rec context left there. So this capture closed the
+        #     monolith's live TTS playback stream mid-sentence, and a
+        #     concurrent ``sd.play()`` (the timer skill, the mid-task-status
+        #     timer, the tray drainer, a proactive announcement — all of which
+        #     can speak while enrolment runs on the main voice thread) closed
+        #     THIS recording stream while our daemon sat in ``sd.wait()``,
+        #     whose ``finally`` then closed the same handle from a second
+        #     thread. ``_StreamBase.close`` runs Pa_CloseStream and only THEN
+        #     nulls ``_ptr``, with no lock: two concurrent Pa_CloseStream on
+        #     one WASAPI stream is the 0xc0000374 heap corruption.
+        #   * The ``sd.stop()`` on the overrun path fired against whatever
+        #     ``_last_callback`` held AT THAT MOMENT — possibly the live TTS
+        #     stream owned by play_with_lipsync's single-toucher reaper. That
+        #     is verbatim the cross-close H-3 deleted from four other copies.
+        #   * The abandoned ``_await_rec`` daemon's eventual close was never
+        #     registered with ``_pa_close_pending``, so _refresh_devices could
+        #     run ``sd._terminate()`` on top of it.
+        #
+        # A comment shipped earlier today blessed that ``sd.stop()`` as "a
+        # DIFFERENT and legitimate call — that path owns ``_last_callback``
+        # because it called sd.rec itself". The premise is false:
+        # ``_last_callback`` is ONE process-global slot with no ownership at
+        # all, and this capture holds no _SPEAK_LOCK.
+        #
+        # The private InputStream below has none of those properties: it is
+        # never published into ``_last_callback``, so no ``sd.play()`` can
+        # stop or close it and no ``sd.wait()`` of ours can bind to a play
+        # context — exactly ONE thread makes native calls on it, and its
+        # teardown goes through bobert's _safe_close_stream (which registers
+        # the abandonable close with the teardown gate). It was already the
+        # known-good fallback here; now it is the only path.
         import queue
         chunks: list[np.ndarray] = []
         q: queue.Queue = queue.Queue()
@@ -260,8 +256,12 @@ def _record_seconds(seconds: float) -> Optional[np.ndarray]:
                 _threading.Thread(target=_close_in_daemon, daemon=True).start()
                 if not _done.wait(timeout=2.0):
                     # H-3 (2026-08-20) — STALE-DUPLICATE HALF, deleted in all
-                    # four copies (bobert_companion._safe_close_stream,
-                    # core/wake_word, skills/ambient_listen, this one). The old
+                    # FIVE copies (bobert_companion._safe_close_stream,
+                    # core/wake_word, skills/ambient_listen, this one, and
+                    # core/actions._release_native_resources — that fifth one
+                    # was MISSED on the first pass and found by the same-day
+                    # review, which is exactly why the count is written down
+                    # here). The old
                     # comment claimed sd.stop() forces "every PortAudio stream"
                     # to stop; sounddevice 0.5.5 (sounddevice.py:406-418) stops
                     # and closes ONLY `_last_callback`, published solely by
@@ -270,9 +270,10 @@ def _record_seconds(seconds: float) -> Optional[np.ndarray]:
                     # free this handle — while it COULD close the host's live
                     # TTS playback stream (double Pa_CloseStream on one WASAPI
                     # stream -> 0xc0000374). Abandon the daemon; it dies with
-                    # the process. NOTE: the sd.stop() at the sd.rec bounded
-                    # wait above is a DIFFERENT and legitimate call — that path
-                    # owns `_last_callback` because it called sd.rec itself.
+                    # the process. (The sd.rec/sd.wait/sd.stop rung that used
+                    # to sit above this one — and the note that blessed its
+                    # sd.stop() as "different and legitimate" — is gone: see
+                    # the H-4 comment at the top of this function.)
                     print("  [enroll_voice] stream.close hung >2.0s — "
                           "abandoning the close daemon (it dies with the "
                           "process). sd.stop() is deliberately NOT called: it "
