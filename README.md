@@ -3,19 +3,20 @@
 JARVIS is an Iron-Man-style voice assistant that runs on your own Windows
 machine. It listens, thinks with Claude (or a local LLM), speaks back, and can
 actually *do* things — control your PC, run a battery of skills (briefings,
-timers, smart-home, 3D-printer monitoring, and ~70 more), and remember context
+timers, smart-home, 3D-printer monitoring, and ~90 more), and remember context
 across conversations.
 
 ```
   mic → Whisper (STT) → Claude / Ollama (LLM) → edge-tts (TTS) → speakers
-        cameras → face/presence awareness        + ~78 dynamically-loaded skills
+        cameras → face/presence awareness        + ~95 dynamically-loaded skills
         persistent memory across conversations   + a self-diagnostic loop
 ```
 
-> **Status: `2.0.29`.** This is a personal project shared for
-> others to try. It's Windows-focused, expects some setup (your own API keys,
-> optional hardware), and is provided as-is. Expect rough edges — and please
-> file issues.
+> **Latest published release: `2.0.29`.** (The working tree's own version lives
+> in the top-level `VERSION` file and runs ahead of the last tag.) This is a
+> personal project shared for others to try. It's Windows-focused, expects some
+> setup (your own API keys, optional hardware), and is provided as-is. Expect
+> rough edges — and please file issues.
 
 ---
 
@@ -25,7 +26,7 @@ across conversations.
   an in-character "JARVIS" persona and tone-aware delivery.
 - **PC control** — open apps and URLs, search, take screenshots, click/type, focus
   windows, run code snippets.
-- **~78 skills** (auto-loaded from `skills/`), including: morning/evening
+- **~95 skills** (auto-loaded from `skills/`), including: morning/evening
   briefings, weather & news, timers & reminders, a notification triage engine,
   smart-home control (Hue, Kasa, LIFX, Govee, Nest, Ecobee, …), Bambu Lab
   3D-printer monitoring, Microsoft Teams/email helpers, OBS control, pattern
@@ -91,7 +92,7 @@ python tools/update_wizard.py          # --check to just look, --yes to skip the
   parse actions → run → speak). A large monolith by design.
 - **`core/`** — reusable modules extracted from the monolith: LLM client, TTS,
   memory, mode routing, voice/emotion, the action registry, etc.
-- **`skills/`** — ~78 self-contained skills. Each defines `register(actions)` and
+- **`skills/`** — ~95 self-contained skills. Each defines `register(actions)` and
   is loaded dynamically at boot. Drop a new `.py` in here to teach JARVIS a trick.
 - **`hud/`** — optional on-screen HUD overlays (tkinter / PyQt).
 - **`tools/`** — dev tooling: test runner, codebase auditor, coverage, the
@@ -104,24 +105,28 @@ python tools/update_wizard.py          # --check to just look, --yes to skip the
 
 ## Testing
 
-JARVIS ships with a substantial test suite (**~2,100 tests**, stdlib `unittest`,
-no pytest) split into two tiers:
+JARVIS ships with a substantial test suite (**~14,900 tests** across 231 files,
+stdlib `unittest`, no pytest) split into two tiers:
 
 ```powershell
 python tools/run_tests.py            # fast unit suite (skills load in isolation, all I/O mocked)
 python tools/run_tests.py -v         # verbose
 python tools/run_coverage.py         # coverage report (core/ + skills/ + tools/)
-python tools/audit_codebase.py       # static auditor (must be 0 findings)
+python tools/audit_codebase.py       # static auditor — LOCAL only (must be 0 findings)
 ```
 
-- **Light tier** (the above) runs anywhere — every skill is loaded in isolation
-  with mocked I/O, so no hardware/network/keys are needed. This is what CI runs.
+- **Light tier** (the first three) runs anywhere — every skill is loaded in
+  isolation with mocked I/O, so no hardware/network/keys are needed. This is what
+  CI runs.
 - **Heavy/local tier** boots a real (muted, mic-less) staging instance and drives
   the end-to-end pipeline: `python tools/staging_integration.py` (needs
   `ANTHROPIC_API_KEY`).
 
-CI (GitHub Actions, `.github/workflows/ci.yml`) runs compile + lint + the unit
-suite + the auditor + a coverage floor on every push.
+CI (GitHub Actions, `.github/workflows/ci.yml`) runs compile + lint + the PII/secret
+gate + the unit suite + a coverage floor on every push. **`tools/audit_codebase.py`
+is deliberately NOT a CI step** — on a bare runner its import-resolution checks flag
+every uninstalled optional dep, so it only gives accurate results in the full local
+environment. Run it yourself before opening a PR.
 
 ---
 

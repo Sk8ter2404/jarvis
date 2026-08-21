@@ -36,6 +36,41 @@ from tests._skill_harness import load_skill_isolated
 _SENTINEL = object()
 
 
+def fake_audio_processor(*, poll_age=None, audible_age=None,
+                         session_age=None, now=None):
+    """A stand-in for core.audio_processor's VAD counters, which is where the
+    microphone probe reads its PASSIVE liveness signal (the audio the main
+    loop already captured). ``None`` ages mean "never happened".
+
+    ``poll_age``    seconds since the capture loop last inspected a chunk.
+    ``audible_age`` seconds since a chunk crossed the audible RMS floor.
+    ``session_age`` seconds since polling began (the cold-start fallback that
+                    the real seconds_since_audible_chunk() uses when no chunk
+                    has EVER been audible).
+    """
+    now = float(now if now is not None else time.time())
+    ap = types.ModuleType("core.audio_processor")
+    state = {
+        "last_vad_active_ts":    0.0,
+        "last_vad_poll_ts":      0.0 if poll_age is None else now - poll_age,
+        "vad_session_start":     0.0 if session_age is None else now - session_age,
+        "total_vad_trips":       0,
+        "last_audible_chunk_ts": 0.0 if audible_age is None else now - audible_age,
+    }
+    ap.get_vad_state = lambda: dict(state)
+    ap._vad_state = state
+
+    def _since_audible():
+        if audible_age is not None:
+            return float(audible_age)
+        if session_age is not None:
+            return float(session_age)
+        return float("inf")
+
+    ap.seconds_since_audible_chunk = _since_audible
+    return ap
+
+
 @contextlib.contextmanager
 def inject_modules(**mods):
     """Temporarily install fake modules into sys.modules (e.g. cv2, torch,
@@ -934,7 +969,11 @@ class WebcamProbeTests(_ProbeTestBase):
         with inject_modules(cv2=cv2), \
              mock.patch.object(self.mod, "_bc", return_value=bc):
             r = self.mod._probe_webcam()
-        self.assertTrue(r["ok"])          # busy camera is not a failure
+        # Busy camera is not a FAILURE — and (2026-08-20) not a PASS either:
+        # the device was never opened, so the probe knows nothing about it.
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["tested"])
+        self.assertEqual(r["severity"], self.mod.SEVERITY_UNKNOWN)
         self.assertIn("skipped", r["details"])
         self.assertIn("camera busy", r["details"]["skipped"])
         cv2.VideoCapture.assert_not_called()
@@ -1138,14 +1177,22 @@ class MicrophoneProbeTests(_ProbeTestBase):
         self.assertIn("no input devices enumerated", r["error"])
 
     def test_skips_live_capture_when_awake(self):
+        # 2026-08-20 (H-flagship): the SKIP is still correct (crash-fix-3) —
+        # what changed is that a skipped check may no longer render as a PASS.
+        # With no passive signal to fall back on, the honest answer is
+        # UNVERIFIED.
         sd = make_sounddevice([{"name": "Mic", "max_input_channels": 2}])
         bc = types.SimpleNamespace(_sleep_mode=[False],
                                    _mic_input_disabled=lambda: False,
                                    get_input_device=lambda: 0)
-        with inject_modules(sounddevice=sd), \
+        with inject_modules(sounddevice=sd,
+                            **{"core.audio_processor": fake_audio_processor()}), \
              mock.patch.object(self.mod, "_bc", return_value=bc):
             r = self.mod._probe_microphone()
-        self.assertTrue(r["ok"])
+        self.assertFalse(r["ok"], "a check that never ran is not a pass")
+        self.assertFalse(r["tested"])
+        self.assertEqual(r["severity"], self.mod.SEVERITY_UNKNOWN)
+        self.assertIn("UNVERIFIED", r["error"])
         self.assertIn("awake", r["details"]["live_capture_skipped"])
 
     def test_skips_live_capture_when_mic_disabled(self):
@@ -1156,8 +1203,13 @@ class MicrophoneProbeTests(_ProbeTestBase):
         with inject_modules(sounddevice=sd), \
              mock.patch.object(self.mod, "_bc", return_value=bc):
             r = self.mod._probe_microphone()
-        self.assertTrue(r["ok"])
+        # Hard-disabled is a CONFIGURED silence: never a failure, but never a
+        # pass either — nothing was listening, so nothing was verified.
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["tested"])
+        self.assertEqual(r["severity"], self.mod.SEVERITY_UNKNOWN)
         self.assertIn("hard-disabled", r["details"]["live_capture_skipped"])
+        self.assertIn("hard-disabled", r["error"])
 
     # ── 2026-07-21 audit: the live capture must gate on the REAL mic-
     # ownership flags, not just the _sleep_mode conversation latch — in
@@ -1176,16 +1228,26 @@ class MicrophoneProbeTests(_ProbeTestBase):
         base.update(overrides)
         return types.SimpleNamespace(**base)
 
-    def _assert_owned_skip(self, bc):
+    def _assert_owned_skip(self, bc, ap=None):
+        """The owner-held skip must open NO stream and must NOT read as a pass.
+
+        With no passive liveness data (the default fake below reports a cold
+        capture loop) the only honest verdict is UNVERIFIED.
+        """
         sd = make_sounddevice([{"name": "Mic", "max_input_channels": 2}])
         sd.InputStream = mock.MagicMock(side_effect=AssertionError(
             "a capture stream was opened while the mic is owned"))
-        with inject_modules(sounddevice=sd), \
+        with inject_modules(sounddevice=sd,
+                            **{"core.audio_processor": ap or fake_audio_processor()}), \
              mock.patch.object(self.mod, "_bc", return_value=bc):
             r = self.mod._probe_microphone()
-        self.assertTrue(r["ok"])
+        self.assertFalse(r["ok"], "the probe never opened the device — that is "
+                                  "not a pass (2026-08-20 flagship defect)")
+        self.assertFalse(r["tested"])
+        self.assertEqual(r["severity"], self.mod.SEVERITY_UNKNOWN)
         self.assertIn("live_capture_skipped", r["details"])
         self.assertEqual(sd.InputStream.call_count, 0)
+        return r
 
     def test_skips_live_capture_when_record_speech_active(self):
         # THE regression from the audit card: standby (_sleep_mode True)
@@ -1250,10 +1312,14 @@ class MicrophoneProbeTests(_ProbeTestBase):
             on_open=opens.append,
             on_stop=lambda: flag.__setitem__(0, True))
         bc = self._owned_bc(_record_speech_active=flag)
-        with inject_modules(sounddevice=sd, numpy=_fake_np()), \
+        with inject_modules(sounddevice=sd, numpy=_fake_np(),
+                            **{"core.audio_processor": fake_audio_processor()}), \
              mock.patch.object(self.mod, "_bc", return_value=bc):
             r = self.mod._probe_microphone()
-        self.assertTrue(r["ok"])
+        # The active device measured SILENT before the scan was cut short, so
+        # this is not a clean skip and certainly not a pass.
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["tested"])
         self.assertIn("live_capture_skipped", r["details"])
         self.assertEqual(len(opens), 1)  # only the active capture ran
 
@@ -1314,10 +1380,12 @@ class MicrophoneProbeTests(_ProbeTestBase):
         bc = self._owned_bc(_diag_capture_active=[0],
                             _pa_claim_owner=lambda c, **k: False,
                             _pa_release_owner=lambda c, **k: None)
-        with inject_modules(sounddevice=sd, numpy=_fake_np()), \
+        with inject_modules(sounddevice=sd, numpy=_fake_np(),
+                            **{"core.audio_processor": fake_audio_processor()}), \
              mock.patch.object(self.mod, "_bc", return_value=bc):
             r = self.mod._probe_microphone()
-        self.assertTrue(r["ok"])
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["tested"])
         self.assertIn("live_capture_skipped", r["details"])
         self.assertIn("reinit", r["details"]["live_capture_skipped"])
         self.assertEqual(sd.InputStream.call_count, 0)
@@ -1341,10 +1409,12 @@ class MicrophoneProbeTests(_ProbeTestBase):
                             _diag_capture_active=cell,
                             _pa_claim_owner=claim,
                             _pa_release_owner=release)
-        with inject_modules(sounddevice=sd, numpy=_fake_np()), \
+        with inject_modules(sounddevice=sd, numpy=_fake_np(),
+                            **{"core.audio_processor": fake_audio_processor()}), \
              mock.patch.object(self.mod, "_bc", return_value=bc):
             r = self.mod._probe_microphone()
-        self.assertTrue(r["ok"])
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["tested"])
         self.assertIn("live_capture_skipped", r["details"])
         self.assertEqual(cell[0], 0,
                          "the mid-scan early return must still release the "
@@ -1858,7 +1928,11 @@ class SttProbeTests(_ProbeTestBase):
         with mock.patch.object(self.mod, "_bc", return_value=bc), \
              inject_modules(numpy=_fake_np()):
             r = self.mod._probe_stt()
-        self.assertTrue(r["ok"])          # benign skip, NOT a failure
+        # Benign skip, NOT a failure — and not a pass: a held lock proves a
+        # transcription is in flight, not that it succeeds (2026-08-20).
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["tested"])
+        self.assertEqual(r["severity"], self.mod.SEVERITY_UNKNOWN)
         self.assertIn("skipped", r["details"])
         self.assertIn("_stt_lock", r["details"]["skipped"])
         cached.transcribe.assert_not_called()
@@ -2072,7 +2146,11 @@ class HudProbeTests(_ProbeTestBase):
     def test_no_bc_skips(self):
         with mock.patch.object(self.mod, "_bc", return_value=None):
             r = self.mod._probe_hud_subprocesses()
-        self.assertTrue(r["ok"])
+        # No host module → no process handles to inspect. "I cannot see the
+        # HUDs" is not "the HUDs are fine" (2026-08-20).
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["tested"])
+        self.assertEqual(r["severity"], self.mod.SEVERITY_UNKNOWN)
         self.assertIn("skipped", r["details"])
 
     def test_all_alive(self):
@@ -2221,7 +2299,12 @@ class BambuProbeTests(_ProbeTestBase):
     def test_no_bc_skips(self):
         with mock.patch.object(self.mod, "_bc", return_value=None):
             r = self.mod._probe_bambu()
-        self.assertTrue(r["ok"])
+        # Cannot even read the printer settings → cannot claim reachability.
+        # (The two CONFIGURED skips below stay passes: "nothing is configured"
+        # is a verified statement about the config, not about hardware.)
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["tested"])
+        self.assertEqual(r["severity"], self.mod.SEVERITY_UNKNOWN)
         self.assertIn("skipped", r["details"])
 
     def test_not_configured_skips(self):
@@ -4015,6 +4098,478 @@ class StaleDuplicateInvariantTests(unittest.TestCase):
                       "_probe_webcam no longer takes _camera_io_lock "
                       "before its VideoCapture scan")
 
+
+# ══════════════════════════════════════════════════════════════════════════
+#  H-FLAGSHIP (2026-08-20): a check that did not run must never read as a pass
+#
+#  The microphone probe skipped its live capture whenever an owner held the
+#  device — correct, per crash-fix-3 — and then returned ok=True. Under
+#  START_IN_STANDBY the main loop holds the mic on essentially every sweep, so
+#  the ONE safety net that should have caught JARVIS being deaf reported a
+#  HIGH-severity subsystem healthy in 100 of 100 recorded runs without ever
+#  touching the hardware. The fix has two halves and both are pinned below:
+#    (a) a skipped check reports UNVERIFIED — ok=False + tested=False, out of
+#        run["failed"], never announced, never queued, and never averaged into
+#        "all systems nominal";
+#    (b) the probe gets a REAL liveness signal for exactly those states by
+#        reading the audio the MAIN LOOP already captured (no second stream,
+#        so no ownership contention), which also detects a live-but-null mic.
+# ══════════════════════════════════════════════════════════════════════════
+class PassiveMicLivenessTests(_ProbeTestBase):
+    """_passive_mic_liveness judges the mic from frames the capture loop
+    already read — it must open nothing, and it must distinguish POSITIVE
+    evidence from "I have no data"."""
+
+    def _verdict(self, **kw):
+        ap = fake_audio_processor(now=self.mod._now(), **kw)
+        with inject_modules(**{"core.audio_processor": ap}):
+            return self.mod._passive_mic_liveness()
+
+    def test_alive_when_the_loop_read_audible_audio_recently(self):
+        v = self._verdict(poll_age=1.0, audible_age=2.0, session_age=600.0)
+        self.assertEqual(v["verdict"], "alive")
+        self.assertTrue(v["has_audible_chunk"])
+
+    def test_silent_when_the_loop_polls_but_nothing_is_ever_audible(self):
+        # A dead mic delivering null frames: polling fine, no audible chunk
+        # since the session began.
+        v = self._verdict(poll_age=1.0, audible_age=None, session_age=600.0)
+        self.assertEqual(v["verdict"], "silent")
+        self.assertFalse(v["has_audible_chunk"])
+
+    def test_silent_when_the_last_audible_chunk_is_older_than_the_window(self):
+        v = self._verdict(poll_age=1.0, audible_age=120.0, session_age=600.0)
+        self.assertEqual(v["verdict"], "silent")
+
+    def test_nodata_when_the_capture_loop_is_not_polling(self):
+        # Stale poll: the loop is not reading chunks, so its silence proves
+        # nothing about the hardware.
+        v = self._verdict(poll_age=120.0, audible_age=None, session_age=600.0)
+        self.assertEqual(v["verdict"], "nodata")
+
+    def test_nodata_when_polling_never_started(self):
+        self.assertEqual(self._verdict()["verdict"], "nodata")
+
+    def test_nodata_when_the_session_is_too_young_to_judge(self):
+        # Polling began 5 s ago and no audible chunk yet — that is not
+        # evidence of a dead mic, and it is not evidence of a live one either.
+        v = self._verdict(poll_age=1.0, audible_age=None, session_age=5.0)
+        self.assertEqual(v["verdict"], "nodata")
+
+    def test_nodata_when_the_counters_are_unavailable(self):
+        ap = types.ModuleType("core.audio_processor")   # no get_vad_state
+        with inject_modules(**{"core.audio_processor": ap}):
+            v = self.mod._passive_mic_liveness()
+        self.assertEqual(v["verdict"], "nodata")
+
+    def test_nodata_when_get_vad_state_raises(self):
+        ap = types.ModuleType("core.audio_processor")
+        ap.get_vad_state = mock.MagicMock(side_effect=RuntimeError("x"))
+        with inject_modules(**{"core.audio_processor": ap}):
+            v = self.mod._passive_mic_liveness()
+        self.assertEqual(v["verdict"], "nodata")
+
+    def test_nodata_when_seconds_since_audible_raises(self):
+        ap = fake_audio_processor(now=self.mod._now(), poll_age=1.0)
+        ap.seconds_since_audible_chunk = mock.MagicMock(
+            side_effect=RuntimeError("x"))
+        with inject_modules(**{"core.audio_processor": ap}):
+            v = self.mod._passive_mic_liveness()
+        self.assertEqual(v["verdict"], "nodata")
+
+    def test_reuses_the_projects_silence_window_rather_than_inventing_one(self):
+        from core.config import MIC_SILENT_WARN_SECONDS
+        v = self._verdict(poll_age=1.0, audible_age=2.0, session_age=600.0)
+        self.assertEqual(v["silent_window_s"], float(MIC_SILENT_WARN_SECONDS))
+
+    def test_verdict_is_stateless_so_a_recovered_mic_clears(self):
+        # THE anti-blacklist invariant: nothing may latch. Three silent reads
+        # must not stop the fourth (recovered) read from saying "alive", and a
+        # later silence must still be detectable.
+        for _ in range(3):
+            self.assertEqual(
+                self._verdict(poll_age=1.0, session_age=600.0)["verdict"],
+                "silent")
+        self.assertEqual(
+            self._verdict(poll_age=1.0, audible_age=1.0,
+                          session_age=600.0)["verdict"], "alive")
+        self.assertEqual(
+            self._verdict(poll_age=1.0, session_age=600.0)["verdict"],
+            "silent")
+
+
+class MicProbeHonestSkipTests(_ProbeTestBase):
+    """Probe-level behaviour on the paths where the live capture is skipped."""
+
+    @staticmethod
+    def _owned_bc(**overrides):
+        base = dict(_sleep_mode=[True],
+                    _mic_input_disabled=lambda: False,
+                    get_input_device=lambda: 0,
+                    _record_speech_active=[True],   # standby holds the mic
+                    _pathb_mic_active=[False],
+                    _ambient_stream_active=[0],
+                    _tts_playback_active=[False])
+        base.update(overrides)
+        return types.SimpleNamespace(**base)
+
+    def _probe(self, ap, bc=None):
+        sd = make_sounddevice([{"name": "Mic", "max_input_channels": 2}])
+        sd.InputStream = mock.MagicMock(side_effect=AssertionError(
+            "the probe must NOT open a competing stream while an owner holds "
+            "the mic (crash-fix-3) — the passive signal needs no device"))
+        with inject_modules(sounddevice=sd,
+                            **{"core.audio_processor": ap}), \
+             mock.patch.object(self.mod, "_bc",
+                               return_value=bc or self._owned_bc()):
+            r = self.mod._probe_microphone()
+        self.assertEqual(sd.InputStream.call_count, 0)
+        return r
+
+    def _ap(self, **kw):
+        return fake_audio_processor(now=self.mod._now(), **kw)
+
+    def test_owned_mic_with_live_passive_signal_is_an_EARNED_pass(self):
+        r = self._probe(self._ap(poll_age=1.0, audible_age=1.0,
+                                 session_age=600.0))
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["tested"])
+        # The pass is backed by evidence, not by the skip.
+        self.assertEqual(r["details"]["passive_mic"]["verdict"], "alive")
+
+    def test_owned_mic_delivering_null_frames_is_a_real_failure(self):
+        # The state that went unnoticed for 90 minutes: the loop IS listening,
+        # every frame is null, and the probe cannot open the device to check.
+        r = self._probe(self._ap(poll_age=1.0, session_age=600.0))
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["tested"], "this is a measured failure, not a skip")
+        self.assertNotIn("UNVERIFIED", r["error"])
+        self.assertEqual(r["error"], self.mod._MIC_PASSIVE_SILENT_ERROR)
+        # severity None → the aggregator fills the subsystem default (HIGH),
+        # which is what makes it speak.
+        self.assertIsNone(r["severity"])
+
+    def test_silent_error_text_is_stable_so_it_is_announced_once(self):
+        # _announce_failures dedups per component on the ERROR STRING. A
+        # changing number in it would re-speak "the microphone appears to be
+        # down" every single sweep.
+        a = self._probe(self._ap(poll_age=1.0, session_age=600.0))["error"]
+        b = self._probe(self._ap(poll_age=2.0, session_age=900.0))["error"]
+        self.assertEqual(a, self.mod._MIC_PASSIVE_SILENT_ERROR)
+        self.assertEqual(a, b, "the silent-mic error must not carry a changing "
+                              "measurement \u2014 _announce_failures dedups on it")
+
+    def test_silence_is_not_blamed_on_the_mic_while_jarvis_is_speaking(self):
+        # JARVIS's own playback can legitimately mask the input — report
+        # UNVERIFIED rather than a mic fault.
+        bc = self._owned_bc(_tts_playback_active=[True])
+        r = self._probe(self._ap(poll_age=1.0, session_age=600.0), bc=bc)
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["tested"])
+        self.assertIn("playback", r["error"])
+
+    def test_recovered_mic_clears_on_the_very_next_sweep(self):
+        # Nothing may blacklist a device: the Corsair powering back on must be
+        # able to win again with no reset, no cooldown, no restart.
+        first = self._probe(self._ap(poll_age=1.0, session_age=600.0))
+        self.assertFalse(first["ok"])
+        second = self._probe(self._ap(poll_age=1.0, audible_age=0.5,
+                                      session_age=900.0))
+        self.assertTrue(second["ok"])
+        self.assertEqual(second["details"]["passive_mic"]["verdict"], "alive")
+        # ...and a later relapse is still detected (no "already reported" latch)
+        third = self._probe(self._ap(poll_age=1.0, session_age=1200.0))
+        self.assertFalse(third["ok"])
+        self.assertEqual(third["error"], self.mod._MIC_PASSIVE_SILENT_ERROR)
+
+    def test_mid_scan_abort_with_passive_silence_is_a_corroborated_failure(self):
+        # The probe's own capture of the active device was below the floor and
+        # an owner cut the alternate scan short. Passive agrees the loop is
+        # getting null frames — two independent readings, one verdict.
+        devices = [
+            {"name": "Active Mic", "max_input_channels": 2},
+            {"name": "Backup Mic", "max_input_channels": 2},
+        ]
+        sd = make_sounddevice(devices, default_input=0)
+        flag = [False]
+        sd.InputStream = make_probe_stream(
+            on_stop=lambda: flag.__setitem__(0, True))   # owner appears after 1
+        bc = self._owned_bc(_record_speech_active=flag)
+        ap = self._ap(poll_age=1.0, session_age=600.0)
+        with inject_modules(sounddevice=sd, numpy=_fake_np(),
+                            **{"core.audio_processor": ap}), \
+             mock.patch.object(self.mod, "_bc", return_value=bc):
+            r = self.mod._probe_microphone()
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["tested"])
+        self.assertEqual(r["error"], self.mod._MIC_PASSIVE_SILENT_ERROR)
+        self.assertTrue(r["details"]["silence_corroborated_by_probe_capture"])
+
+    def test_passive_alive_cannot_launder_a_silent_active_capture(self):
+        # Same abort, but the loop reports audible audio: the two readings
+        # disagree, so the verdict is UNVERIFIED — never a clean pass.
+        devices = [
+            {"name": "Active Mic", "max_input_channels": 2},
+            {"name": "Backup Mic", "max_input_channels": 2},
+        ]
+        sd = make_sounddevice(devices, default_input=0)
+        flag = [False]
+        sd.InputStream = make_probe_stream(
+            on_stop=lambda: flag.__setitem__(0, True))
+        bc = self._owned_bc(_record_speech_active=flag)
+        ap = self._ap(poll_age=1.0, audible_age=1.0, session_age=600.0)
+        with inject_modules(sounddevice=sd, numpy=_fake_np(),
+                            **{"core.audio_processor": ap}), \
+             mock.patch.object(self.mod, "_bc", return_value=bc):
+            r = self.mod._probe_microphone()
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["tested"])
+        self.assertIn("disagree", r["error"])
+
+    def test_no_passive_data_is_UNVERIFIED_not_a_pass(self):
+        r = self._probe(self._ap(poll_age=120.0, session_age=600.0))
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["tested"])
+        self.assertEqual(r["severity"], self.mod.SEVERITY_UNKNOWN)
+        self.assertIn("UNVERIFIED", r["error"])
+        self.assertEqual(r["details"]["passive_mic"]["verdict"], "nodata")
+
+
+class UnverifiedAggregationTests(_ProbeTestBase):
+    """The aggregate must SURFACE the third outcome, not average it away."""
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.mkdtemp(prefix="selfdiag_unver_")
+        self.addCleanup(self._cleanup)
+        self.todo = os.path.join(self.tmp, "jarvis_todo.md")
+        mock.patch.object(self.mod, "_TODO_PATH", self.todo).start()
+        mock.patch.object(self.mod, "_HISTORY_PATH",
+                          os.path.join(self.tmp, "history.json")).start()
+        mock.patch.object(self.mod, "_AUTOQUEUE_PATH",
+                          os.path.join(self.tmp, "autoq.json")).start()
+        mock.patch.object(self.mod, "_run_with_timeout",
+                          lambda fn, t, name: fn()).start()
+        self.mod._state["last_run"] = None
+        self.mod._announced_failure_state.clear()
+
+    def _cleanup(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _patch_probes(self, mapping):
+        fake = {name: (lambda res=res: res) for name, res in mapping.items()}
+        return mock.patch.object(self.mod, "PROBES", fake)
+
+    def _unver(self):
+        return self.mod._unverified(5.0, reason="the check could not run")
+
+    def test_unverified_is_neither_a_pass_nor_a_failure(self):
+        with self._patch_probes({"microphone": self._unver()}):
+            run = self.mod._run_all_probes()
+        self.assertEqual(run["failed"], [])
+        self.assertEqual(run["unverified"], ["microphone"])
+        self.assertNotIn("microphone", run["severity_failed"])
+        self.assertFalse(run["probes"]["microphone"]["ok"])
+
+    def test_unverified_is_never_spoken_and_never_queued(self):
+        with self._patch_probes({"microphone": self._unver()}), \
+             mock.patch.object(self.mod, "_run_autoqueue_pass", return_value=[]), \
+             mock.patch.object(self.mod, "_proactive_announce") as speak, \
+             mock.patch.object(self.mod, "_push_phone") as push:
+            out = self.mod.run_diagnostic("")
+        speak.assert_not_called()
+        push.assert_not_called()
+        self.assertFalse(os.path.exists(self.todo),
+                         "an unverified check must not file a repair task")
+        self.assertNotIn("All systems nominal", out)
+
+    def test_summary_refuses_to_call_the_system_nominal(self):
+        with self._patch_probes({"microphone": self._unver()}):
+            run = self.mod._run_all_probes()
+        out = self.mod._summarise(run, [])
+        self.assertNotIn("All systems nominal", out)
+        self.assertIn("UNVERIFIED", out)
+        self.assertIn("microphone", out)
+
+    def test_status_refuses_to_call_the_system_nominal(self):
+        with self._patch_probes({"microphone": self._unver()}):
+            run = self.mod._run_all_probes()
+        self.mod._state["last_run"] = run
+        out = self.actions["diagnostic_status"]("")
+        self.assertNotIn("All systems nominal", out)
+        self.assertIn("UNVERIFIED", out)
+
+    def test_summary_reports_unverified_alongside_real_failures(self):
+        with self._patch_probes({
+                "microphone": self._unver(),
+                "webcam": self.mod._result(False, 1.0, error="dead")}):
+            run = self.mod._run_all_probes()
+        out = self.mod._summarise(run, ["webcam"])
+        self.assertIn("webcam", out)
+        self.assertIn("UNVERIFIED", out)
+        self.assertIn("microphone", out)
+
+    def test_history_line_reports_unverified(self):
+        self.mod._save_history([{"ts": 1.0, "iso": "2026-08-20T00:00:00",
+                                 "failed": [], "unverified": ["microphone"]}])
+        out = self.actions["diagnostic_history"]("1")
+        self.assertNotIn("all nominal", out)
+        self.assertIn("unverified", out)
+        self.assertIn("microphone", out)
+
+    def test_end_to_end_a_deaf_jarvis_is_now_caught_announced_and_queued(self):
+        """THE incident, replayed: standby, record_speech owns the mic, the
+        probe cannot open the device — and the mic is delivering null frames.
+        Before 2026-08-20 this sweep said "All systems nominal"."""
+        sd = make_sounddevice([{"name": "Mic", "max_input_channels": 2}])
+        sd.InputStream = mock.MagicMock(side_effect=AssertionError(
+            "no competing stream may be opened while the mic is owned"))
+        bc = types.SimpleNamespace(_sleep_mode=[True],
+                                   _mic_input_disabled=lambda: False,
+                                   get_input_device=lambda: 0,
+                                   _record_speech_active=[True],
+                                   _pathb_mic_active=[False],
+                                   _ambient_stream_active=[0],
+                                   _tts_playback_active=[False])
+        ap = fake_audio_processor(now=self.mod._now(), poll_age=1.0,
+                                  session_age=600.0)
+        # The REAL probe here, not a canned result — this test exists to
+        # prove the live code path behaves.
+        with mock.patch.object(self.mod, "PROBES",
+                               {"microphone": self.mod._probe_microphone}), \
+             inject_modules(sounddevice=sd,
+                            **{"core.audio_processor": ap}), \
+             mock.patch.object(self.mod, "_bc", return_value=bc), \
+             mock.patch.object(self.mod, "_run_autoqueue_pass", return_value=[]), \
+             mock.patch.object(self.mod, "_push_phone"), \
+             mock.patch.object(self.mod, "_proactive_announce") as speak:
+            out = self.mod.run_diagnostic("")
+        run = self.mod._state["last_run"]
+        self.assertEqual(run["failed"], ["microphone"])
+        self.assertEqual(run["severity_failed"]["microphone"],
+                         self.mod.SEVERITY_HIGH)
+        self.assertEqual(sd.InputStream.call_count, 0)
+        speak.assert_called_once()
+        self.assertIn("microphone", speak.call_args[0][0])
+        self.assertIn("microphone", open(self.todo, encoding="utf-8").read())
+        self.assertNotIn("All systems nominal", out)
+
+    def test_queue_repair_task_refuses_an_untested_probe(self):
+        run = {"probes": {"microphone": self._unver()}}
+        self.assertFalse(self.mod._queue_repair_task("microphone", run, []))
+        self.assertFalse(os.path.exists(self.todo))
+
+    def test_unverified_run_does_not_count_as_a_last_successful_run(self):
+        # _queue_repair_task reports "last successful: <ts>"; a sweep that
+        # never checked the mic must not be remembered as proof it worked.
+        hist = [{"ts": 1.0, "iso": "2026-08-20T00:00:00",
+                 "probes": {"microphone": self._unver()}}]
+        self.assertIsNone(self.mod._last_successful_ts(hist, "microphone"))
+
+
+class HonestSkipNegativeControlTests(UnverifiedAggregationTests):
+    """Negative controls — proof the assertions above actually bite, and that
+    the new detector does not simply fire all the time."""
+
+    def test_negative_control_the_pre_fix_result_would_pass_every_check(self):
+        # EXACTLY what the probe used to return from the owned-mic skip.
+        pre_fix = self.mod._result(
+            True, 9.0, details={"live_capture_skipped": "mic owned by "
+                                                        "record_speech"})
+        # The new assertions must FAIL against it — otherwise they prove nothing.
+        with self.assertRaises(AssertionError):
+            self.assertFalse(pre_fix["ok"])
+        with self.assertRaises(AssertionError):
+            self.assertFalse(pre_fix["tested"])
+        # ...and the old shape sails through the aggregate as perfect health,
+        # which is the defect in one line.
+        with self._patch_probes({"microphone": pre_fix}):
+            run = self.mod._run_all_probes()
+        self.assertEqual(run["failed"], [])
+        self.assertEqual(run["unverified"], [])
+        self.assertIn("All systems nominal", self.mod._summarise(run, []))
+
+    def test_negative_control_a_live_mic_is_never_reported_silent(self):
+        ap = fake_audio_processor(now=self.mod._now(), poll_age=1.0,
+                                  audible_age=1.0, session_age=600.0)
+        with inject_modules(**{"core.audio_processor": ap}):
+            self.assertEqual(self.mod._passive_mic_liveness()["verdict"],
+                             "alive")
+
+    def test_negative_control_an_idle_box_is_never_reported_silent(self):
+        # JARVIS not capturing at all (no poll) must never be called deaf.
+        ap = fake_audio_processor(now=self.mod._now(), poll_age=600.0)
+        with inject_modules(**{"core.audio_processor": ap}):
+            self.assertEqual(self.mod._passive_mic_liveness()["verdict"],
+                             "nodata")
+
+    def test_negative_control_real_failures_still_fail_and_still_queue(self):
+        # The new bucket must not swallow tested failures.
+        with self._patch_probes({"microphone": self.mod._result(
+                False, 1.0, error="all inputs silent")}), \
+             mock.patch.object(self.mod, "_run_autoqueue_pass", return_value=[]), \
+             mock.patch.object(self.mod, "_proactive_announce") as speak:
+            out = self.mod.run_diagnostic("")
+        self.assertIn("microphone", out)
+        self.assertTrue(os.path.exists(self.todo))
+        speak.assert_called_once()
+
+
+class MicSkipPathStructureTests(unittest.TestCase):
+    """Structural guard (stale-duplicate rule): a future edit must not
+    re-grow a bare pass on a skip path. A source scan, so it fails even on a
+    machine where the behavioural tests happen to take another branch."""
+
+    def test_no_skip_branch_returns_a_bare_pass(self):
+        import ast
+        import inspect
+        import textwrap
+        mod, _ = load_skill_isolated("self_diagnostic")
+        src = textwrap.dedent(inspect.getsource(mod._probe_microphone))
+        tree = ast.parse(src)
+        offenders = []
+        for node in ast.walk(tree):
+            for field in ("body", "orelse", "finalbody"):
+                block = getattr(node, field, None)
+                if not isinstance(block, list):
+                    continue
+                # Sibling-precise: only a `return` that follows a
+                # details["live_capture_skipped"] assignment AT THE SAME
+                # nesting level is the skip-then-pass shape. (A whole-subtree
+                # text scan would flag any enclosing try: that merely contains
+                # both somewhere.)
+                skipped_here = False
+                for stmt in block:
+                    text = ast.unparse(stmt)
+                    if isinstance(stmt, ast.Assign) and "live_capture_skipped" in text:
+                        skipped_here = True
+                    elif (isinstance(stmt, ast.Return) and skipped_here
+                            and "_result(True" in text):
+                        offenders.append(f"line {stmt.lineno}: {text[:60]}")
+        self.assertEqual(
+            offenders, [],
+            "a branch that skips the live capture returned _result(True, …) "
+            "— that is the 2026-08-20 flagship defect: a HIGH-severity probe "
+            "reporting a pass for a check it never performed. Route it through "
+            f"_mic_result_without_capture instead. Found at: {offenders}")
+
+    def test_probe_source_still_never_opens_a_device_on_the_passive_path(self):
+        # The passive signal must stay passive: reading counters, never
+        # constructing a stream (that is what makes it immune to the
+        # ownership gate that forced the skip in the first place).
+        import ast
+        import inspect
+        import textwrap
+        mod, _ = load_skill_isolated("self_diagnostic")
+        src = textwrap.dedent(inspect.getsource(mod._passive_mic_liveness))
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                text = ast.unparse(node.func)
+                self.assertNotIn("InputStream", text)
+                self.assertFalse(text.startswith("sd."),
+                                 f"the passive check touched sounddevice: {text}")
 
 if __name__ == "__main__":
     unittest.main()

@@ -459,5 +459,74 @@ class StatusListForgetTests(FaceIdSkillBase):
         self.assertIn("don't have", out.lower())
 
 
+# ─── 2026-08-20 audit (c): the unvoiced guest-enrolment family ──────────────
+class GuestEnrolmentRepliesNeedARouteTests(FaceIdSkillBase):
+    """learn_guest — the only guest-enrolment name core/prompts.py documents,
+    and the one skills/face_tracker.py actively solicits ("say 'remember their
+    face'") — was in NEITHER of the monolith's speak sets, while its sibling
+    alias remember_this_person was verbatim.
+
+    This class pins the PREMISE that made that fatal rather than cosmetic: the
+    replies below carry no FAILURE_MARKER, so the failure follow-up could not
+    rescue them either. An unrouted name meant the owner heard only the model's
+    affirmative prose while nobody was enrolled. The routing fix itself lives
+    in bobert_companion.SPEAK_RESULT_VERBATIM_ACTIONS and is asserted by
+    tests/monolith/test_monolith_runtime_bugfixes.FaceIdFamilyVoicedTests.
+    """
+
+    def _replies(self):
+        bc = _fake_monolith(frames={0: _Frame("p")})
+        out = {}
+
+        eng = _fake_engine(enroll_n=4)
+        _m, actions = self._load(bc=bc, engine=eng)
+        out["success"] = actions["learn_guest"]("Sam")
+        out["needs_name"] = actions["learn_guest"]("")
+        out["placeholder"] = actions["learn_guest"]("guest")
+
+        eng2 = _fake_engine(enroll_unknown_result={
+            "added": 0, "saw_face": True, "saw_unknown": False})
+        _m2, actions2 = self._load(bc=bc, engine=eng2)
+        out["all_known"] = actions2["learn_guest"]("Sam")
+
+        eng3 = _fake_engine()
+        _m3, actions3 = self._load(bc=bc, engine=eng3, enabled=False)
+        out["gate_off"] = actions3["learn_guest"]("Sam")
+        return out
+
+    def test_replies_carry_no_failure_marker_so_unrouted_means_silent(self):
+        from core.failure_markers import FAILURE_MARKERS
+        markers = tuple(m.lower() for m in FAILURE_MARKERS)
+        for branch, reply in self._replies().items():
+            low = (reply or "").lower()
+            self.assertTrue(low.strip(), f"{branch} returned nothing at all")
+            hit = [m for m in markers if m in low]
+            self.assertEqual(
+                hit, [],
+                f"the '{branch}' reply now trips {hit} — that would route it "
+                f"through the FAILURE follow-up instead of the verbatim "
+                f"speaker. Re-check FaceIdFamilyVoicedTests before relying on "
+                f"markers to voice an enrolment outcome.")
+
+    def test_every_branch_returns_a_finished_spoken_sentence(self):
+        # The precondition for SPEAK_RESULT_VERBATIM_ACTIONS membership: each
+        # reply must already be a complete, user-facing sentence, not a data
+        # blob and not an empty string (which the speaker skips).
+        for branch, reply in self._replies().items():
+            self.assertTrue(reply.strip().endswith((".", "?", ")")),
+                            f"{branch}: {reply!r} is not a finished sentence")
+            for blob in ("path=", "score=", "{", "[1]"):
+                self.assertNotIn(blob, reply, f"{branch} looks machine-readable")
+
+    def test_the_success_line_reports_the_count_it_actually_captured(self):
+        # Honest-failure: the confirmation must carry the real frame count, so
+        # voicing it tells the owner something the model's prose cannot invent.
+        bc = _fake_monolith(frames={0: _Frame("p")})
+        eng = _fake_engine(enroll_n=4)
+        _m, actions = self._load(bc=bc, engine=eng)
+        out = actions["learn_guest"]("Sam")
+        self.assertIn("4", out)
+        self.assertIn("views", out)
+
 if __name__ == "__main__":   # pragma: no cover
     unittest.main()

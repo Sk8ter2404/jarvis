@@ -11,6 +11,10 @@ LLM to call mid-reply.
 Registered actions
 ------------------
     rag_search        — speak top hits for a query
+    search_my_files   — the spoken alias of rag_search (same voice-formatted
+                        answer). NOTE: this ACTION is not the module-level
+                        search_my_files(query, k) helper below — that keeps the
+                        tool-shaped signature and the machine-readable block.
     rag_search_quiet  — search but return a structured string Claude can quote
     rag_reindex       — kick a one-shot full-scan in the background
     rag_status        — short human status line
@@ -99,8 +103,10 @@ def _format_hits_for_voice(hits: list[dict]) -> str:
 
 
 def _format_hits_for_llm(hits: list[dict]) -> str:
-    """Compact, LLM-readable block. Used both by `rag_search_quiet`
-    and by the `search_my_files` tool Claude can call."""
+    """Compact, LLM-readable block. Used by `rag_search_quiet` and by the
+    module-level `search_my_files(query, k)` helper below. NOT by the ACTION
+    named search_my_files — that one is voiced verbatim, so it is bound to
+    rag_search / _format_hits_for_voice (2026-08-20 audit)."""
     if not hits:
         return "[no matches]"
     lines: list[str] = []
@@ -280,7 +286,19 @@ def _rag_enabled() -> bool:
 def register(actions: dict) -> None:
     actions["rag_search"]        = rag_search
     actions["rag_search_quiet"]  = rag_search_quiet
-    actions["search_my_files"]   = rag_search_quiet  # alias usable as a tool name
+    # `search_my_files` is a VOICE action: core/prompts.py teaches it as a
+    # callable Operation reached by "search my files for <X>", and
+    # bobert_companion lists it in SPEAK_RESULT_VERBATIM_ACTIONS, whose contract
+    # is "this result is already a finished, user-facing sentence". It was bound
+    # to rag_search_quiet, the MACHINE-READABLE twin, so JARVIS synthesised and
+    # read aloud the raw `[1] path=<absolute path> score=0.812` block —
+    # up to RAG_DEFAULT_K untruncated 1200-char chunks of the owner's private
+    # files, absolute paths included, with no failure marker to stop it. Nothing
+    # ever consumed that block: there is no mid-reply tool loop, and the name is
+    # not in INFORMATIVE_ACTIONS, so the ONLY thing it ever fed was the speaker.
+    # Bind the spoken name to the spoken formatter; rag_search_quiet keeps the
+    # machine-readable one under its own name. 2026-08-20 audit.
+    actions["search_my_files"]   = rag_search
     actions["rag_reindex"]       = rag_reindex
     actions["rag_status"]        = rag_status
     actions["rag_configure"]     = rag_configure

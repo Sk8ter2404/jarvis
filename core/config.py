@@ -181,9 +181,16 @@ CLAUDE_OPTIONAL = True
 # _local_num_ctx: 30B-class tags get 12k, everything else 16k). For local
 # calls the giant Claude-tuned PC_CONTROL_PROMPT is swapped for a compact
 # action cheatsheet (see _local_cheatsheet). The runtime selector
-# `_get_local_llm_model()` consults JARVIS_LOCAL_LLM_MODEL first, then walks
-# a fallback chain (gemma4:26b-a4b → qwen3:30b-a3b → qwen2.5:14b →
-# llama3.1:8b → first available tag). The old dense qwen2.5:32b default
+# `_get_local_llm_model()` resolves in this order: JARVIS_LOCAL_LLM_MODEL, then
+# the owner's persisted pick (LOCAL_LLM_MODEL when it differs from
+# _SHIPPED_LOCAL_LLM_MODEL below AND is installed), then the first installed
+# entry of bobert_companion._LOCAL_LLM_PREFERENCE, then the first installed tag.
+# Do NOT re-list the chain's tags here — read that tuple; its one sanctioned
+# mirror is core.model_catalog._LOCAL_FAILOVER_TAGS. (An earlier copy of this
+# comment named qwen3:30b-a3b as a chain member; it never was — the note under
+# LOCAL_LLM_MODEL below calls it a text-only opt-in "max brain". That stale list
+# is exactly what deferring to the tuple prevents.)
+# The old dense qwen2.5:32b default
 # (~22 GB resident) was retired — it left no headroom and bricked the GPU
 # whenever vision or whisper co-loaded.
 LOCAL_LLM_FALLBACK = True
@@ -697,11 +704,18 @@ KINECT_GESTURES_ENABLED = False
 #   drives a device in staging/test. See audio/kinect_pointing.py (geometry +
 #   store) + skills/kinect_pointing.py (wiring).
 KINECT_POINT_CONTROL_ENABLED = False
-# KINECT_AIR_MOUSE_ENABLED — when True, "air-mouse": point an OPEN hand at the
-#   screen to move the cursor, CLOSE the hand to RIGHT-click, and hold it closed
-#   to drag (close→open quickly = a right-click; close→move→open = a right-drag).
-#   A background poller (~30 Hz) maps the pointing hand's position within a
-#   calibrated reach-box onto the PRIMARY monitor, heavily EMA-smoothed to fight
+# KINECT_AIR_MOUSE_ENABLED — when True, "air-mouse": RAISE a hand above the
+#   shoulder to take the cursor (the SMART-ENGAGE block right below is the single
+#   source for the exact gate — don't restate it here); LOWERING the hand releases
+#   it. Clicking is HAND-SPECIFIC: closing the LEFT hand presses the LEFT mouse
+#   button, closing the RIGHT hand presses the RIGHT one, and holding either
+#   closed while moving drags with that button. Either hand can click regardless
+#   of which one drives the cursor (skills/kinect_air_mouse.py :: engage_decision
+#   → _apply_decision → _mouse_button).
+#   A background poller (~30 Hz) maps the driving hand's position within a
+#   calibrated reach-box onto the WHOLE VIRTUAL DESKTOP — every monitor, incl.
+#   any left of / above the primary, so target pixels may be negative
+#   (_reach_box_for_virtual_desktop) — heavily EMA-smoothed to fight
 #   jitter, and drives the cursor via win32api (pyautogui fallback). A glowing
 #   JARVIS reticle (hud/jarvis_air_cursor.py) follows the cursor — cyan while
 #   tracking an open hand, gold-locked on grab/drag. Off by default; never runs

@@ -16,8 +16,12 @@ Probes (15 subsystems)
 ----------------------
     1.  webcam            — open device, grab a non-black frame, verify the
                             haar face cascade loads.
-    2.  microphone        — sounddevice can enumerate input devices and the
-                            preferred input registers RMS > floor.
+    2.  microphone        — sounddevice enumerates input devices AND the mic
+                            is proven live: by a private capture when nothing
+                            owns the device, otherwise passively from the
+                            audio the main loop is already reading (see
+                            _passive_mic_liveness). A sweep that can do
+                            neither reports UNVERIFIED — never a pass.
     3.  tts               — edge-tts CDN reachable AND pyttsx3 initialises.
     4.  stt               — Whisper model loaded; tiny synthesized audio
                             roundtrips through transcribe without raising.
@@ -54,6 +58,24 @@ Each probe assigns one of LOW / MED / HIGH on failure.
             (announces only via the next ``run_diagnostic`` summary).
     LOW   — cosmetic / intermittent. Logged only — never auto-queued.
 
+    UNKNOWN — the THIRD outcome: the probe could not perform its check at
+            all (the device is owned by the main loop, a lock is held, the
+            host module isn't loaded). Carries ``ok=False`` + ``tested=False``,
+            lands in ``run["unverified"]`` rather than ``run["failed"]``, is
+            WARN-logged every sweep, and is never spoken or auto-queued.
+            2026-08-20: this exists because every "couldn't check" path in
+            this file used to return ``ok=True``. The microphone one mattered
+            most — under START_IN_STANDBY the main loop holds the mic across
+            essentially every sweep, so a HIGH-severity subsystem was reported
+            healthy in 100 of 100 recorded runs without the device ever being
+            opened, including the 90 minutes JARVIS was deaf. A check that did
+            not run must never render as a pass.
+
+A subsystem that is legitimately ABSENT or OFF *by configuration* (no
+ANTHROPIC_API_KEY, no Bambu printer configured, SKILLS_ENABLED=False) still
+passes: "there is nothing here to be broken" is a verified statement about the
+config, not an unverified claim about hardware.
+
 Persistence
 -----------
 Results land in ``data/self_diagnostic.json`` as a list of timestamped
@@ -71,6 +93,7 @@ a dict::
         },
         "failed": ["microphone"],
         "severity_failed": {"microphone": "HIGH"},
+        "unverified": ["webcam"],      # checks that could not run at all
     }
 
 Schedule
@@ -174,6 +197,24 @@ MIC_RMS_FLOOR            = 0.0005       # mic noise floor — quiet room is ~0.0
 SEVERITY_LOW             = "LOW"
 SEVERITY_MED             = "MED"
 SEVERITY_HIGH            = "HIGH"
+# The third outcome — NOT a failure severity. Attached to results whose probe
+# could not perform its check; _run_all_probes routes these to
+# run["unverified"] instead of run["failed"], so they are never announced and
+# never queued for repair. See _unverified().
+SEVERITY_UNKNOWN         = "UNKNOWN"
+
+# Passive mic-liveness window. The capture loop publishes the raw RMS of every
+# chunk it reads through core.audio_processor (note_vad_poll / note_raw_rms),
+# so the probe can read a liveness signal WITHOUT opening a competing stream.
+# A poll older than this means the loop isn't reading chunks right now, so its
+# silence data says nothing. Deliberately the same 30 s window
+# _collect_vad_stall_signal uses for the identical "is the input loop actually
+# running" question — one constant, not two (stale-duplicate rule). The
+# silence threshold itself is NOT redefined here: it is
+# core.config.MIC_SILENT_WARN_SECONDS, the same value record_speech's
+# silent-mic warning uses, judged against core.audio_processor's own
+# _AUDIBLE_RMS_FLOOR.
+_PASSIVE_POLL_FRESH_S    = 30.0
 
 # Per-subsystem default severity on failure. Overridable per-probe.
 SUBSYSTEM_SEVERITY: dict[str, str] = {
@@ -285,16 +326,57 @@ def _today_iso_date() -> str:
 
 
 def _result(ok: bool, latency_ms: float, *, error: str | None = None,
-            details: dict | None = None, severity: str | None = None) -> dict:
+            details: dict | None = None, severity: str | None = None,
+            tested: bool = True) -> dict:
     """Canonical probe-result shape. Probes return this so the aggregator
-    doesn't have to special-case different keys."""
+    doesn't have to special-case different keys.
+
+    ``tested`` is the honesty bit: False means the probe could not perform its
+    check, so ``ok=False`` there means "I don't know", not "it's broken".
+    Build those through _unverified() rather than passing tested= by hand —
+    it keeps the wording and the severity consistent.
+    """
     return {
         "ok":         bool(ok),
+        "tested":     bool(tested),    # False → UNVERIFIED, not a failure
         "latency_ms": round(float(latency_ms), 1),
         "error":      None if ok else (error or "unknown error"),
         "details":    details or {},
         "severity":   severity,        # may be None — aggregator fills default
     }
+
+
+def _unverified(latency_ms: float, *, reason: str, details: dict | None = None,
+                remedy: str | None = None) -> dict:
+    """Canonical UNVERIFIED result — the probe could NOT perform its check.
+
+    Neither a pass nor a failure. ``ok`` is False so nothing downstream can
+    mistake it for health; ``tested`` is False so _run_all_probes keeps it out
+    of ``run["failed"]`` — which is what stops _announce_failures from speaking
+    about it and _queue_repair_task from filing a repair for a check that never
+    ran. Every one is WARN-logged by the aggregator and listed in
+    ``run["unverified"]``, and _summarise / diagnostic_status refuse to say
+    "all systems nominal" while one exists.
+
+    2026-08-20 (H-flagship): before this existed, every "couldn't check" path
+    in this file returned ``_result(True, …)``. The microphone probe's
+    owned-device skip is the one that mattered — under START_IN_STANDBY the
+    main loop holds the mic across essentially every sweep, so the probe
+    reported a HIGH-severity subsystem healthy in 100 of 100 recorded runs
+    without ever opening the device, including the 90 minutes JARVIS was deaf.
+    The one safety net that should have caught that was reporting success it
+    never verified.
+    """
+    msg = f"UNVERIFIED — {reason}"
+    if remedy:
+        if msg[-1] not in ".!?":
+            msg += "."
+        msg += f" {remedy}"
+    d = dict(details or {})
+    d["tested"] = False
+    d["unverified_reason"] = reason
+    return _result(False, latency_ms, error=msg, details=d,
+                   severity=SEVERITY_UNKNOWN, tested=False)
 
 
 def _bc():
@@ -698,9 +780,18 @@ def _probe_webcam() -> dict:
     bc = _bc()
     hold = _CameraLockHold(getattr(bc, "_camera_io_lock", None) if bc else None)
     if not hold.acquire(2.5):
-        return _result(True, (_now() - start) * 1000.0,
-                       details={"skipped": "camera busy — probe skipped "
-                                           "(lock held by tracker)"})
+        # 2026-08-20: contention is not a failure — but it is not a PASS
+        # either. We never opened the device, so we know nothing about it; the
+        # tracker holding the lock could be failing every read (that case is
+        # covered separately by face_tracker's read-failure signal, which
+        # _run_autoqueue_pass consumes). UNVERIFIED keeps the "never queue a
+        # repair for a busy device" behaviour — unverified results never reach
+        # _queue_repair_task — without claiming the camera works.
+        return _unverified((_now() - start) * 1000.0,
+                           reason=("the face tracker holds _camera_io_lock, so "
+                                   "the probe never opened the device"),
+                           details={"skipped": "camera busy — probe skipped "
+                                               "(lock held by tracker)"})
     try:
         return _probe_webcam_locked(start, hold)
     finally:
@@ -1099,6 +1190,199 @@ def _jarvis_active_mic_index(sd) -> int | None:
     return None
 
 
+# ─── Passive mic liveness (no device access) ───────────────────────────
+# Stable text — _announce_failures dedups per component on the ERROR STRING, so
+# this must not carry a changing number or JARVIS would re-speak it every
+# sweep. The measurements live in details["passive_mic"] instead.
+_MIC_PASSIVE_SILENT_ERROR = (
+    "JARVIS is not hearing anything: the capture loop is reading chunks, but "
+    "every one of them has been below the audible floor for longer than the "
+    "silent-mic window — the mic is enumerated and open yet delivering null "
+    "frames. Judged from the audio the main loop itself captured (see "
+    "details.passive_mic). Check Windows Privacy -> Microphone, the mixer mute, "
+    "and whether the wireless mic is powered on."
+)
+
+
+def _passive_mic_liveness() -> dict:
+    """Judge the mic from audio THE MAIN LOOP ALREADY READ — no device access.
+
+    record_speech measures a raw RMS for every chunk it inspects and publishes
+    it through core.audio_processor (``note_vad_poll`` + ``note_raw_rms``, at
+    bobert_companion.py's capture loop). Reading those counters needs no
+    stream, so it cannot contend with an owner, cannot trip the crash-fix-3
+    WASAPI double-open, and — unlike ``_collect_vad_stall_signal``, which bails
+    while sleeping — works in awake AND standby, which is where the mic probe
+    spends essentially all of its life.
+
+    Returns ``{"verdict": "alive" | "silent" | "nodata", "reason": str, …}``:
+
+        alive   — POSITIVE evidence: the loop read a chunk above
+                  core.audio_processor._AUDIBLE_RMS_FLOOR within
+                  core.config.MIC_SILENT_WARN_SECONDS. (A dead mic measured
+                  ~1e-5 on 2026-08-20 while a genuinely quiet room measured
+                  ~1e-3 — two orders apart, so "quiet user" does not read as
+                  dead.)
+        silent  — the loop IS polling, yet nothing has crossed that floor for
+                  longer than the window: null frames, i.e. JARVIS is deaf.
+        nodata  — no basis for either statement (loop not polling, counters
+                  cold, audio_processor unavailable). The caller must report
+                  UNVERIFIED, never a pass.
+
+    Deliberately STATELESS: every call re-derives its verdict from the live
+    counters, and nothing here caches, latches or blacklists a device. The
+    moment the Corsair powers back on and delivers one audible chunk,
+    ``last_audible_chunk_ts`` moves and the very next sweep says "alive" again.
+
+    Thresholds are reused, never re-invented (stale-duplicate rule):
+    MIC_SILENT_WARN_SECONDS is core.config's, the audible floor is
+    audio_processor's own (applied inside note_raw_rms), and the poll-freshness
+    window is _PASSIVE_POLL_FRESH_S, shared with _collect_vad_stall_signal.
+    """
+    out: dict[str, Any] = {"verdict": "nodata", "reason": "",
+                           "source": "core.audio_processor"}
+    try:
+        from core import audio_processor as _ap
+    except Exception as e:
+        out["reason"] = (f"core.audio_processor is unavailable "
+                         f"({type(e).__name__}) — no passive signal to read")
+        return out
+    try:
+        st = _ap.get_vad_state() or {}
+    except Exception as e:
+        out["reason"] = f"get_vad_state raised {type(e).__name__}"
+        return out
+    try:
+        from core.config import MIC_SILENT_WARN_SECONDS as _silent_window_s
+    except Exception:
+        # Config unreachable: fall back to the poll window rather than
+        # inventing a third silence threshold.
+        _silent_window_s = _PASSIVE_POLL_FRESH_S
+    out["silent_window_s"] = float(_silent_window_s)
+
+    now = _now()
+    last_poll = float(st.get("last_vad_poll_ts") or 0.0)
+    poll_age = (now - last_poll) if last_poll > 0.0 else float("inf")
+    out["poll_age_s"] = None if poll_age == float("inf") else round(poll_age, 1)
+    if poll_age > _PASSIVE_POLL_FRESH_S:
+        out["reason"] = ("the capture loop has not inspected a chunk recently, "
+                         "so it has no frames to judge")
+        return out
+
+    try:
+        silence_age = float(_ap.seconds_since_audible_chunk())
+    except Exception as e:
+        out["reason"] = f"seconds_since_audible_chunk raised {type(e).__name__}"
+        return out
+    # last_audible_chunk_ts > 0 is what separates POSITIVE evidence from
+    # seconds_since_audible_chunk's cold-start fallback (it returns time since
+    # the session began when the mic has never yet produced an audible chunk).
+    has_audible = float(st.get("last_audible_chunk_ts") or 0.0) > 0.0
+    out["silence_age_s"] = None if silence_age == float("inf") else round(silence_age, 1)
+    out["has_audible_chunk"] = has_audible
+    if silence_age == float("inf"):
+        out["reason"] = "the capture loop has not started polling this session"
+        return out
+    if silence_age > float(_silent_window_s):
+        out["verdict"] = "silent"
+        out["reason"] = ("the capture loop is polling but no chunk has crossed "
+                         "the audible floor for longer than the silent-mic "
+                         "window")
+        return out
+    if has_audible:
+        out["verdict"] = "alive"
+        out["reason"] = ("the capture loop read audible audio within the "
+                         "silent-mic window")
+        return out
+    out["reason"] = ("polling started only moments ago and has not delivered an "
+                     "audible chunk yet — too early to call it either way")
+    return out
+
+
+def _mic_result_without_capture(start: float, details: dict, *,
+                                mic_off: bool = False,
+                                tts_live: bool = False,
+                                partial_silence: bool = False) -> dict:
+    """Verdict for a sweep whose own live capture could not run.
+
+    THE flagship fix (2026-08-20). This path used to ``return _result(True, …)``
+    — a HIGH-severity probe reporting a pass for a check it never performed, on
+    the path that runs in virtually every sweep under START_IN_STANDBY. It now
+    asks _passive_mic_liveness what the MAIN LOOP is hearing, which needs no
+    device and so cannot fight the ownership gate that forced the skip:
+
+        alive  → a real pass, with the evidence in details["passive_mic"]
+        silent → a real failure at the microphone's default severity (HIGH):
+                 this is not the environmental "every device I opened was
+                 quiet" verdict in _probe_microphone's step 3, which stays
+                 LOW — it means the loop
+                 that is listening RIGHT NOW is getting null frames, i.e.
+                 JARVIS is deaf, which is exactly the condition nothing
+                 surfaced for 90 minutes. Announcement is deduped per
+                 component on the (constant) error string, so it is spoken
+                 once, not every sweep.
+        nodata → UNVERIFIED — visibly distinct from both, kept out of
+                 run["failed"], never announced, never queued.
+
+    ``mic_off``: hard-disabled by configuration; silence is the CONFIGURED
+    state so it can never be a failure — but it is not a pass either.
+    ``tts_live``: JARVIS is speaking; its own playback can legitimately make
+    the input look null, so a silence verdict is downgraded to UNVERIFIED
+    rather than blamed on the mic. A positive "alive" reading is still trusted.
+    ``partial_silence``: the probe already measured the active device silent
+    before an owner cut the scan short, so a passive "alive" may not be
+    upgraded to a clean pass — the two readings disagree and that is exactly
+    the state we must not paper over.
+    """
+    latency = (_now() - start) * 1000.0
+    if mic_off:
+        return _unverified(latency,
+                           reason=("the microphone is hard-disabled in "
+                                   "configuration (staging / MICROPHONE_INDEX "
+                                   "< 0), so there is nothing listening to "
+                                   "check"),
+                           details=details)
+    passive = _passive_mic_liveness()
+    details["passive_mic"] = passive
+    verdict = passive.get("verdict")
+
+    if verdict == "silent" and tts_live:
+        return _unverified(latency,
+                           reason=("the capture loop is reading null frames, "
+                                   "but JARVIS is speaking and its own "
+                                   "playback can mask the input — not "
+                                   "attributable to the mic"),
+                           details=details,
+                           remedy="Re-checked on the next sweep.")
+    if verdict == "silent":
+        if partial_silence:
+            # Two independent readings agree: our own capture of the active
+            # device was below the floor AND the main loop is getting null
+            # frames. Recorded in details, never in the error text — that
+            # string is the announce-dedup key and must stay constant.
+            details["silence_corroborated_by_probe_capture"] = True
+        return _result(False, latency, error=_MIC_PASSIVE_SILENT_ERROR,
+                       details=details)      # severity → subsystem default (HIGH)
+    if verdict == "alive" and not partial_silence:
+        return _result(True, latency, details=details)
+    if verdict == "alive":
+        return _unverified(latency,
+                           reason=("the probe's own capture of the active "
+                                   "device measured silent and the alternate "
+                                   "scan was cut short by an owner, while the "
+                                   "main loop reports audible audio — the two "
+                                   "readings disagree"),
+                           details=details,
+                           remedy="Re-checked on the next sweep.")
+    return _unverified(latency,
+                       reason=("the live capture was skipped and there is no "
+                               "passive liveness signal either: "
+                               + str(passive.get("reason") or "no data")),
+                       details=details,
+                       remedy=("Nothing here says the mic works — it says the "
+                               "check did not run."))
+
+
 def _probe_microphone() -> dict:
     start = _now()
     try:
@@ -1205,7 +1489,16 @@ def _probe_microphone() -> dict:
              else "JARVIS awake — mic owned by main loop")
             + "; skipping the live capture (crash-fix-3 / no-mic guard)"
         )
-        return _result(True, (_now() - start) * 1000.0, details=details)
+        # The skip itself is CORRECT and must stay (crash-fix-3). What was
+        # wrong until 2026-08-20 was returning a PASS from it: under
+        # START_IN_STANDBY the main loop holds the mic on essentially every
+        # sweep, so this line reported "microphone: ok" in 100 of 100 recorded
+        # runs without ever opening the device. Fall through to the passive
+        # judgement instead — same information the main loop already has,
+        # no competing stream.
+        return _mic_result_without_capture(
+            start, details, mic_off=mic_off,
+            tts_live=_owner_flag("_tts_playback_active"))
 
     try:
         import numpy as np  # type: ignore
@@ -1370,7 +1663,8 @@ def _probe_microphone() -> dict:
         details["live_capture_skipped"] = (
             "mic/audio stream went live before capture; skipping the live "
             "capture (crash-fix-3 / no-mic guard)")
-        return _result(True, (_now() - start) * 1000.0, details=details)
+        return _mic_result_without_capture(
+            start, details, tts_live=_owner_flag("_tts_playback_active"))
 
     # TEARDOWN-GATE CLAIM (2026-08-14): hold bobert's _diag_capture_active
     # refcount across the WHOLE capture span (this capture and every
@@ -1396,8 +1690,9 @@ def _probe_microphone() -> dict:
                     details["live_capture_skipped"] = (
                         "PortAudio reinit in flight; skipping the live "
                         "capture (teardown gate / no-mic guard)")
-                    return _result(True, (_now() - start) * 1000.0,
-                                   details=details)
+                    return _mic_result_without_capture(
+                        start, details,
+                        tts_live=_owner_flag("_tts_playback_active"))
                 _diag_release = (_release_fn, _diag_cell)
             except Exception:
                 _diag_release = None   # gate bookkeeping failed — old behaviour
@@ -1449,7 +1744,12 @@ def _probe_microphone() -> dict:
                 details["live_capture_skipped"] = (
                     "mic/audio stream went live mid-scan; skipping remaining "
                     "captures (crash-fix-3 / no-mic guard)")
-                return _result(True, (_now() - start) * 1000.0, details=details)
+                # partial_silence: the ACTIVE device already measured below the
+                # floor, so this is not a clean skip — a passive "alive" may
+                # not launder it into a pass.
+                return _mic_result_without_capture(
+                    start, details, partial_silence=True,
+                    tts_live=_owner_flag("_tts_playback_active"))
             rms, err = _capture_rms(idx, duration_s=0.15)
             alternates_tried.append({
                 "index": idx, "name": name,
@@ -1685,8 +1985,9 @@ def _probe_stt() -> dict:
     # one CTranslate2 instance corrupt native state and terminate the
     # process with an uncatchable 0xc0000409 (see bobert_companion
     # .transcribe(), the lock's contract). Bounded acquire: contention is
-    # a benign skip, not a failure — the main loop demonstrably has a
-    # working model because it is transcribing with it right now. The
+    # not a failure — but it is not a pass either (2026-08-20). A held lock
+    # proves a transcription is IN FLIGHT, not that it will succeed, and this
+    # probe did not run one: report UNVERIFIED. The
     # probe-local models (tiny above, CPU fallback below) stay unlocked —
     # they are private to this probe thread. Deliberately NOT routed
     # through bc.transcribe(): _transcribe_impl swallows every exception
@@ -1696,10 +1997,13 @@ def _probe_stt() -> dict:
     using_cached = cached_model is not None and model is cached_model
     lock = getattr(bc, "_stt_lock", None) if using_cached else None
     if lock is not None and not lock.acquire(timeout=5.0):
-        return _result(True, (_now() - start) * 1000.0,
-                       details={**details,
-                                "skipped": "main loop holds _stt_lock "
-                                           "(STT busy) — probe deferred"})
+        return _unverified((_now() - start) * 1000.0,
+                           reason=("the main loop holds _stt_lock (a "
+                                   "transcription is in flight), so the probe "
+                                   "never ran one of its own"),
+                           details={**details,
+                                    "skipped": "main loop holds _stt_lock "
+                                               "(STT busy) — probe deferred"})
     try:
         if lock is not None:
             try:
@@ -1910,8 +2214,12 @@ def _probe_hud_subprocesses() -> dict:
     start = _now()
     bc = _bc()
     if bc is None:
-        return _result(True, 0.0,
-                       details={"skipped": "bobert_companion not loaded"})
+        # No host module → no process handles to inspect. That is "I cannot
+        # see the HUDs", not "the HUDs are fine" (2026-08-20).
+        return _unverified(0.0,
+                           reason=("bobert_companion is not loaded, so the HUD "
+                                   "process handles cannot be inspected"),
+                           details={"skipped": "bobert_companion not loaded"})
 
     details: dict[str, Any] = {}
     alive: list[str] = []
@@ -2028,8 +2336,13 @@ def _probe_bambu() -> dict:
     start = _now()
     bc = _bc()
     if bc is None:
-        return _result(True, 0.0,
-                       details={"skipped": "bobert_companion not loaded"})
+        # Unlike the two skips below — which read real config and conclude
+        # there is nothing to talk to — this one cannot even read the config,
+        # so it must not claim the printer is reachable (2026-08-20).
+        return _unverified(0.0,
+                           reason=("bobert_companion is not loaded, so the "
+                                   "printer settings cannot even be read"),
+                           details={"skipped": "bobert_companion not loaded"})
 
     ip      = (getattr(bc, "BAMBU_PRINTER_IP", "")   or "").strip()
     access  = (getattr(bc, "BAMBU_ACCESS_CODE", "")  or "").strip()
@@ -2251,7 +2564,20 @@ def _probe_skill_imports() -> dict:
             failures.append({"skill": stem, "error": err})
 
     details = {"checked": checked, "failures": failures,
-               "loaded_modules": sum(1 for k in sys.modules if k.startswith("skill_"))}
+               "loaded_modules": sum(1 for k in sys.modules if k.startswith("skill_")),
+               # Honest-failure contract: say which check actually ran. The
+               # fallback is genuinely WEAKER — it proves the files parse, not
+               # that they imported and registered — so a pass from it must
+               # not read like a pass from the authoritative loader set.
+               "verification": ("loader success set (_loaded_skill_names)"
+                                if loaded is not None
+                                else "parse-only fallback — loader success set "
+                                     "unavailable (probe running outside "
+                                     "JARVIS); import/register was NOT proven")}
+    if loaded is None:
+        _log.info("self-diagnostic: skill_imports ran its parse-only fallback "
+                  "— _loaded_skill_names unavailable, so import/register "
+                  "success is unproven for %d skill(s).", checked)
 
     if failures:
         names = ", ".join(f["skill"] for f in failures)
@@ -2410,10 +2736,19 @@ PROBES: dict[str, Callable[[], dict]] = {
 
 # ─── Sweep + persistence ─────────────────────────────────────────────────
 def _run_all_probes() -> dict:
-    """Run every probe sequentially and return the aggregated run dict."""
+    """Run every probe sequentially and return the aggregated run dict.
+
+    Three buckets, not two. A probe that could not perform its check
+    (``tested`` False — see _unverified) goes to ``unverified``, NOT to
+    ``failed``: it must never be announced or auto-queued as a broken
+    subsystem, and it must never be averaged into "all systems nominal"
+    either. Every one is WARN-logged here, once per sweep, so the degraded
+    path leaves a trail even when nobody reads the summary.
+    """
     sweep_start = _now()
     probes_out: dict[str, dict] = {}
     failed: list[str] = []
+    unverified: list[str] = []
     sev_failed: dict[str, str] = {}
 
     for name, fn in PROBES.items():
@@ -2422,9 +2757,17 @@ def _run_all_probes() -> dict:
         if r.get("severity") is None:
             r["severity"] = SUBSYSTEM_SEVERITY.get(name, SEVERITY_MED)
         probes_out[name] = r
-        if not r.get("ok", False):
-            failed.append(name)
-            sev_failed[name] = r["severity"]
+        if r.get("ok", False):
+            continue
+        # .get(..., True) so any result built outside _result() (older shape,
+        # a test double) is treated as a real, tested failure — fail loud.
+        if not r.get("tested", True):
+            unverified.append(name)
+            _log.warning("self-diagnostic: %s UNVERIFIED — %s (this is NOT a "
+                         "pass: the check did not run)", name, r.get("error"))
+            continue
+        failed.append(name)
+        sev_failed[name] = r["severity"]
 
     run = {
         "ts":           sweep_start,
@@ -2433,6 +2776,7 @@ def _run_all_probes() -> dict:
         "probes":       probes_out,
         "failed":       failed,
         "severity_failed": sev_failed,
+        "unverified":   unverified,
     }
     return run
 
@@ -2547,6 +2891,12 @@ def _queue_repair_task(component: str, run: dict, history: list[dict]) -> bool:
     failed. Only MED+ severity gets queued — LOW failures stay in history
     only."""
     probe = (run.get("probes") or {}).get(component, {})
+    # Belt-and-braces (2026-08-20): run_diagnostic only walks run["failed"],
+    # which _run_all_probes already keeps unverified probes out of — but a
+    # future caller must not be able to file a repair task for a check that
+    # never ran. "I could not look" is not a defect report.
+    if not probe.get("tested", True):
+        return False
     sev = probe.get("severity") or SUBSYSTEM_SEVERITY.get(component, SEVERITY_MED)
     if sev == SEVERITY_LOW:
         return False
@@ -2875,7 +3225,7 @@ def _collect_vad_stall_signal() -> dict | None:
     # itself stale, that's a separate problem covered by the microphone
     # probe — don't double-queue.
     poll_age = (now - last_poll) if last_poll else float("inf")
-    if poll_age > 30.0:
+    if poll_age > _PASSIVE_POLL_FRESH_S:   # shared with _passive_mic_liveness
         return None
     # Also need enough time to have elapsed since first poll — otherwise
     # we'd false-positive on the very first capture session.
@@ -3147,11 +3497,30 @@ def run_diagnostic(_: str = "") -> str:
         _run_lock.release()
 
 
+def _unverified_phrase(unverified: list[str]) -> str:
+    """Shared wording for the third outcome so _summarise, diagnostic_status
+    and diagnostic_history can never drift apart (stale-duplicate rule)."""
+    if not unverified:
+        return ""
+    names = ", ".join(c.replace("_", " ") for c in unverified)
+    n = len(unverified)
+    return (f"{n} check{'s' if n != 1 else ''} couldn't run, so "
+            f"{'they are' if n != 1 else 'it is'} UNVERIFIED — {names}")
+
+
 def _summarise(run: dict, queued: list[str]) -> str:
     failed = run.get("failed") or []
+    unverified = run.get("unverified") or []
+    unv = _unverified_phrase(unverified)
     duration_s = (run.get("duration_ms") or 0) / 1000.0
     if not failed:
-        return f"All systems nominal, sir. ({duration_s:.1f}s sweep, {len(PROBES)} probes.)"
+        if not unverified:
+            return f"All systems nominal, sir. ({duration_s:.1f}s sweep, {len(PROBES)} probes.)"
+        # Never "nominal" while something could not be checked — that is the
+        # exact sentence that covered for a deaf JARVIS on 2026-08-20.
+        return (f"Sir, nothing is reporting a failure, but I can't call the "
+                f"system nominal: {unv}. ({duration_s:.1f}s sweep, "
+                f"{len(PROBES)} probes.)")
 
     counts: dict[str, int] = {}
     for c in failed:
@@ -3174,7 +3543,8 @@ def _summarise(run: dict, queued: list[str]) -> str:
                 f"queued in jarvis_todo.md.")
 
     sev_breakdown = " / ".join(f"{n} {sev.lower()}" for sev, n in counts.items())
-    return (f"Sir, {body}. Severity breakdown: {sev_breakdown}.{qstr} "
+    ustr = f" Separately, {unv}." if unv else ""
+    return (f"Sir, {body}. Severity breakdown: {sev_breakdown}.{qstr}{ustr} "
             f"({duration_s:.1f}s sweep.)")
 
 
@@ -3193,11 +3563,17 @@ def diagnostic_status(_: str = "") -> str:
         age = f"{age_s / 3600.0:.1f} hours ago"
 
     failed = run.get("failed") or []
+    unverified = run.get("unverified") or []
+    unv = _unverified_phrase(unverified)
     if not failed:
-        return (f"All systems nominal as of {age}, sir. "
+        if not unverified:
+            return (f"All systems nominal as of {age}, sir. "
+                    f"{len(PROBES)} probes, {(run['duration_ms'] / 1000):.1f}s sweep.")
+        return (f"As of {age}, sir, nothing is reporting a failure — but {unv}. "
                 f"{len(PROBES)} probes, {(run['duration_ms'] / 1000):.1f}s sweep.")
     names = ", ".join(c.replace("_", " ") for c in failed)
-    return (f"Last sweep was {age}, sir — {len(failed)} subsystem(s) reporting issues: {names}.")
+    ustr = f" Separately, {unv}." if unv else ""
+    return (f"Last sweep was {age}, sir — {len(failed)} subsystem(s) reporting issues: {names}.{ustr}")
 
 
 def whats_broken(_: str = "") -> str:
@@ -3252,9 +3628,16 @@ def diagnostic_history(arg: str = "") -> str:
     lines = []
     for run in recent:
         failed = run.get("failed") or []
+        unverified = run.get("unverified") or []
         iso = run.get("iso") or _iso(run.get("ts", 0))
         if failed:
-            lines.append(f"{iso}: {len(failed)} issue(s) — {', '.join(failed)}")
+            line = f"{iso}: {len(failed)} issue(s) — {', '.join(failed)}"
+            if unverified:
+                line += f" (+{len(unverified)} unverified)"
+            lines.append(line)
+        elif unverified:
+            lines.append(f"{iso}: no failures, {len(unverified)} unverified "
+                         f"— {', '.join(unverified)}")
         else:
             lines.append(f"{iso}: all nominal")
     return f"Last {len(recent)} sweeps, sir: " + " | ".join(lines)

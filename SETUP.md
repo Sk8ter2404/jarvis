@@ -62,7 +62,7 @@ It loads Whisper + all skills, then reaches a listening standby. Try:
 | Say | Expect |
 |---|---|
 | "JARVIS, what time is it" | the current time |
-| "JARVIS, what version are you on" | `2.0.29` |
+| "JARVIS, what version are you on" | whatever the top-level `VERSION` file says |
 | "JARVIS, give me a system status report" | live CPU/RAM/GPU stats |
 
 Prefer to try it **without** using your mic/speakers? Boot the muted, mic-less
@@ -77,9 +77,14 @@ python tools/staging_integration.py -v
 ## 5. Optional services
 
 - **Ollama** (local LLM fallback + local vision/embeddings):
-  `winget install Ollama.Ollama`, then `ollama pull qwen2.5:14b-instruct` (or a
-  smaller model on low-VRAM machines — the selector falls back automatically).
-  Pin one with `JARVIS_LOCAL_LLM_MODEL`.
+  `winget install Ollama.Ollama`, then `ollama pull gemma4:26b-a4b-it-qat` — the
+  shipped default (`LOCAL_LLM_MODEL` in `core/config.py`; ~16 GB VRAM at JARVIS's
+  16k context, see `core/vram_budget.py`). It is **multimodal**, so chat and local
+  vision share that one resident model — there is no separate vision model to pull.
+  On cards under 16 GB pull `gemma4:12b` instead (~9 GB, also multimodal). If
+  neither is present the selector walks a fallback chain
+  (`bobert_companion._LOCAL_LLM_PREFERENCE`) and uses the first installed tag.
+  Pin one explicitly with `JARVIS_LOCAL_LLM_MODEL`.
 - **ComfyUI** (local image generation): run it on its default
   `http://localhost:8188`; JARVIS auto-detects it.
 - **Wake word** ("Hey JARVIS"): set `PORCUPINE_ACCESS_KEY` (free at

@@ -18,8 +18,8 @@ own self-upgrade pipeline uses. From your fork:
    fork, and opens a PR upstream. Nothing auto-merges.
 
 Prefer to do it by hand? Branch, commit, push to your fork, open a PR. Either
-way every PR runs CI (compile + lint + the full unit suite + the PII scan) and
-is reviewed before merge.
+way every PR runs CI (compile + lint + the PII scan + the full unit suite + a
+coverage floor) and is reviewed before merge.
 
 ## Reporting a bug
 
@@ -38,11 +38,11 @@ JARVIS uses the standard-library `unittest` (no pytest) so nothing extra is
 needed beyond the deps.
 
 ```powershell
-python tools/run_tests.py             # the full unit suite (~2,100 tests, ~30s)
+python tools/run_tests.py             # the full unit suite (prints its own "N run" total)
 python tools/run_tests.py <name>      # one file, e.g. `timer` or `skills.test_sh_hue`
 python tools/run_tests.py -v          # verbose
 python tools/run_coverage.py          # coverage over core/ + skills/ + tools/
-python tools/audit_codebase.py        # static auditor — must report 0 findings
+python tools/audit_codebase.py        # static auditor — LOCAL only, must report 0 findings
 python -m pyflakes tests              # lint the test code
 python tools/check_no_pii.py          # leak gate — no owner PII / secrets tracked
 ```
@@ -50,8 +50,14 @@ python tools/check_no_pii.py          # leak gate — no owner PII / secrets tra
 The unit suite loads every skill **in isolation** (no monolith boot) with a fake
 `skill_utils` and all I/O mocked, so it needs no hardware, network, or API keys.
 On a machine missing a heavy dependency (torch, opencv…), the affected skill
-tests **skip** rather than fail. CI (`.github/workflows/ci.yml`) runs exactly
-these gates.
+tests **skip** rather than fail.
+
+CI (`.github/workflows/ci.yml`) runs *most* of the above — compileall, pyflakes,
+`check_no_pii.py`, `run_tests.py`, and `run_coverage.py --fail-under 80` — but
+**not `tools/audit_codebase.py`**, which is a LOCAL/full-deps gate: on a bare
+runner its import-resolution checks flag every declared-but-uninstalled optional
+dep, so it is only accurate in the full environment (see the NOTE in `ci.yml`).
+Run the auditor yourself before opening a PR; CI going green does not cover it.
 
 For an end-to-end check of the real pipeline (boots a muted staging instance and
 asserts non-fabricated replies):

@@ -5309,6 +5309,82 @@ def find_camera_locking_processes() -> list[str]:
     return suspects
 
 
+# ── camera reopen scheduling (P1-3 "live camera-contention yield") ─────────
+# THE SINGLE OWNER of entry["next_reopen_at"]. It used to be assigned in THREE
+# places inside _face_tracking_thread and only ONE of them consulted contention:
+#   * the recovery path re-armed a flat 2 s on every FAILED reopen, overwriting
+#     the 30 s yield the wedge branch had just scheduled, one tick later;
+#   * the soft-wake failure path carried a second copy of the same flat 2 s;
+#   * only the wedge branch called find_camera_locking_processes().
+# So the backoff decayed to 2 s and the loop went straight back to hammering
+# DirectShow - the overlapping open/release churn this file names at the
+# WAKE_AFTER comment as "the leading suspect for the silent crash cascade".
+# Worse, in the exact scenario the feature was written for (Teams holding the
+# device) the wedge branch is UNREACHABLE: the soft wake fires at ~25-40
+# consecutive failures, its own reopen fails, and its failure path parks the
+# entry in the recovery path with `fails` frozen below MAX_READ_FAILURES - which
+# is only ever reset on SUCCESS - so CONTENTION_BACKOFF_SEC never executed once
+# and the "appears LOCKED by ..." hint never printed.
+# Now every scheduling decision goes through here, contention is re-evaluated on
+# EVERY attempt, and the number the caller logs is the number that was stored.
+# 2026-08-20 audit (stale-duplicate + honest-failure).
+CAMERA_REOPEN_BACKOFF_SEC     = 2.0    # normal "don't hammer reopen" spacing
+CAMERA_CONTENTION_BACKOFF_SEC = 30.0   # a known webcam-locking app holds it
+# find_camera_locking_processes() walks every process, and the reopen path can
+# now ask up to once per backoff window per camera; a short shared TTL keeps
+# that off the face-track loop's critical path without ever serving an answer
+# old enough to matter against a 2 s decision.
+_CAMERA_LOCKER_CACHE_TTL_S = 5.0
+_camera_locker_cache: list = [0.0, []]
+_camera_locker_cache_lock = threading.Lock()
+
+
+def _camera_lockers_cached(now: float | None = None) -> list[str]:
+    """find_camera_locking_processes() behind a short TTL cache."""
+    now = time.time() if now is None else now
+    with _camera_locker_cache_lock:
+        if (_camera_locker_cache[0]
+                and (now - _camera_locker_cache[0]) < _CAMERA_LOCKER_CACHE_TTL_S):
+            return list(_camera_locker_cache[1])
+    lockers = find_camera_locking_processes()
+    with _camera_locker_cache_lock:
+        _camera_locker_cache[0] = now
+        _camera_locker_cache[1] = list(lockers)
+    return list(lockers)
+
+
+def _schedule_camera_reopen(entry: dict, label: str, index,
+                            now: float | None = None,
+                            lockers: list[str] | None = None
+                            ) -> tuple[float, list[str]]:
+    """Arm this camera entry's next reopen attempt and say what was armed.
+
+    Returns ``(backoff_seconds, lockers)``. Callers MUST NOT write
+    ``entry["next_reopen_at"]`` themselves - a second writer is exactly how the
+    contention yield rotted. Both state transitions LOG once: entering the
+    widened backoff, and leaving it again.
+    """
+    now = time.time() if now is None else now
+    if lockers is None:
+        lockers = _camera_lockers_cached(now)
+    if lockers:
+        backoff = CAMERA_CONTENTION_BACKOFF_SEC
+        if not entry.get("contention_logged"):
+            entry["contention_logged"] = True
+            print(f"  [face-track] {label} (index {index}) appears LOCKED by "
+                  f"{', '.join(lockers)} — backing off reopen to "
+                  f"{backoff:.0f}s. Close {lockers[0]} to free the camera.")
+    else:
+        backoff = CAMERA_REOPEN_BACKOFF_SEC
+        if entry.get("contention_logged"):
+            # Degraded -> recovered must be LOGGED, not a silent speed-up.
+            entry["contention_logged"] = False
+            print(f"  [face-track] {label} (index {index}) no longer appears "
+                  f"locked — reopen backoff restored to {backoff:.0f}s.")
+    entry["next_reopen_at"] = now + backoff
+    return backoff, list(lockers)
+
+
 def probe_cameras_and_update_config() -> tuple[list[int], list[int]]:
     """At startup, try the configured CAMERA indices. If both fail, fall back
     to probing indices 0..CAMERA_PROBE_MAX-1 to find any working webcam, and
@@ -5464,14 +5540,14 @@ def _face_tracking_thread():
     # driver returned half-init Mat headers). Release and reopen instead of
     # continuing to call .read() on a dead handle (heap-corrupting on Logitech).
     MAX_READ_FAILURES = 60
-    REOPEN_BACKOFF_SEC = 2.0   # don't hammer reopen attempts
-    # LIVE CAMERA-CONTENTION YIELD (P1-3): when a camera is declared dead AND a
-    # known webcam-locking app (Teams / Zoom / OBS …) is running, the device
-    # isn't coming back until that app releases it — so widen THIS entry's reopen
+    # LIVE CAMERA-CONTENTION YIELD (P1-3): when a camera won't reopen AND a known
+    # webcam-locking app (Teams / Zoom / OBS …) is running, the device isn't
+    # coming back until that app releases it — so widen THIS entry's reopen
     # backoff to ~30 s instead of retrying every 2 s, to stop hammering
     # DirectShow (each failed CAP_DSHOW open churns the driver) while it's locked.
-    # Reset to the normal backoff the moment the locker disappears.
-    CONTENTION_BACKOFF_SEC = 30.0
+    # Reset to the normal backoff the moment the locker disappears. BOTH values
+    # and the whole decision live in _schedule_camera_reopen at MODULE scope —
+    # there is exactly ONE writer of entry["next_reopen_at"]; never re-inline it.
     # Self-diag 2026-05-29: bumped WAKE_AFTER from 10→25 and added a wall-
     # clock gate (WAKE_AFTER_SEC) after observing the right webcam log a
     # "read failure #1 → woke via release+reopen" burst roughly every 30 s.
@@ -5647,11 +5723,21 @@ def _face_tracking_thread():
                     if now_loop < entry["next_reopen_at"]:
                         continue
                     new_c = _open_capture(cam)
-                    entry["next_reopen_at"] = now_loop + REOPEN_BACKOFF_SEC
                     if new_c is None:
+                        # RE-EVALUATE contention on EVERY failed reopen. This
+                        # line used to hardcode the 2 s spacing, silently
+                        # overwriting the 30 s contention yield one tick after
+                        # the wedge branch armed it. Fresh clock on purpose: an
+                        # unavailable CAP_DSHOW index can block _open_capture
+                        # for 20-30 s, so an already-stale loop-top timestamp
+                        # would arm a window that has already expired.
+                        _schedule_camera_reopen(entry, cam["label"],
+                                                cam["index"])
                         continue
                     entry["cap"] = new_c
                     entry["fails"] = 0
+                    entry["next_reopen_at"] = 0.0
+                    entry["contention_logged"] = False
                     print(f"  [face-track] Reopened {cam['label']} (index {cam['index']}) after recovery")
                     c = new_c
 
@@ -5784,7 +5870,13 @@ def _face_tracking_thread():
                                 # takes over instead of touching a stale
                                 # handle.
                                 entry["cap"] = None
-                                entry["next_reopen_at"] = now_loop + REOPEN_BACKOFF_SEC
+                                # Third copy of the flat-2s rule, deleted: this
+                                # is the path a Teams-held camera actually takes
+                                # (fails stalls at ~25-40, below
+                                # MAX_READ_FAILURES), so it must consult
+                                # contention too or the yield never runs at all.
+                                _schedule_camera_reopen(entry, cam["label"],
+                                                        cam["index"])
                                 c = None
                     if not ret:
                         if entry["fails"] >= MAX_READ_FAILURES:
@@ -5798,28 +5890,15 @@ def _face_tracking_thread():
                                     except Exception:
                                         logging.exception("[face-track] release after %d failed reads", entry["fails"])
                             entry["cap"] = None
-                            # LIVE CAMERA-CONTENTION YIELD (P1-3): a dead camera
-                            # with a known locker running (Teams/Zoom/OBS) won't
-                            # come back until that app releases it. Widen THIS
-                            # entry's reopen backoff to ~30 s so we stop hammering
-                            # DirectShow while it's locked, and emit ONE actionable
-                            # hint. Reset to the normal 2 s backoff (and re-arm the
-                            # one-time log) the instant the locker disappears.
-                            lockers = find_camera_locking_processes()
-                            if lockers:
-                                entry["next_reopen_at"] = now_loop + CONTENTION_BACKOFF_SEC
-                                if not entry.get("contention_logged"):
-                                    entry["contention_logged"] = True
-                                    print(f"  [face-track] {cam['label']} (index "
-                                          f"{cam['index']}) appears LOCKED by "
-                                          f"{', '.join(lockers)} — backing off reopen "
-                                          f"to {CONTENTION_BACKOFF_SEC:.0f}s. Close "
-                                          f"{lockers[0]} to free the camera.")
-                            else:
-                                entry["next_reopen_at"] = now_loop + REOPEN_BACKOFF_SEC
-                                entry["contention_logged"] = False
-                            _backoff = (CONTENTION_BACKOFF_SEC if lockers
-                                        else REOPEN_BACKOFF_SEC)
+                            # LIVE CAMERA-CONTENTION YIELD (P1-3) — the decision
+                            # (and the one-time "appears LOCKED by ..." hint) lives
+                            # in _schedule_camera_reopen so the recovery and
+                            # soft-wake paths can no longer undo it. _backoff is
+                            # what was ACTUALLY armed, so the log line below,
+                            # which used to promise 30 s and then quietly retry at
+                            # 2 s, is now true.
+                            _backoff, lockers = _schedule_camera_reopen(
+                                entry, cam["label"], cam["index"], now_loop)
                             with _camera_state_lock:
                                 _camera_last_read_error[cam["index"]] = (
                                     f"capture wedged after {entry['fails']} read failures"
@@ -12034,6 +12113,28 @@ def _try_sapi5_then_silence(text: str, rate: str = "+0%", pitch: str = "+0Hz") -
         return _silent_clip()
 
 
+# WALL-CLOCK CAP on the pyttsx3 rung of the TTS ladder (2026-08-20 audit).
+# EVERY other backend in the ladder is already bounded — the voice clone joins
+# at _VOICE_CLONE_TIMEOUT_S, edge-tts at fut.result(timeout=30), Kokoro at
+# core/kokoro_tts._SYNTH_TIMEOUT_S, SAPI5 at tts/render._SUBPROCESS_TIMEOUT_S —
+# because synthesise() runs on the VOICE THREAD underneath _SPEAK_LOCK, and the
+# house rule is that NOTHING unbounded runs there: a hang, unlike a raise, is
+# unrecoverable (the main loop never reaches the watchdog's reset consumer, so
+# JARVIS goes permanently deaf AND mute while every other _speak() caller piles
+# up on the untimed `with _SPEAK_LOCK`). engine.runAndWait() was the one rung
+# with no bound of any kind: it drives a synchronous ISpeechVoice::Speak render
+# into an SAPI.SPFileStream, which is native code we cannot interrupt.
+_PYTTSX3_TIMEOUT_S = 15.0
+# SINGLE-FLIGHT GUARD, same rationale as the voice clone's. On a timeout we
+# ABANDON the daemon worker but it keeps holding the SAPI engine. pyttsx3.init()
+# memoises its driver in a module-level registry, so a second call would hand a
+# fresh caller the SAME wedged engine (and a second concurrent runAndWait on it).
+# While a worker is in flight the fallback goes straight to the subprocess-bounded
+# SAPI5 rung instead — JARVIS still speaks.
+_pyttsx3_inflight = [False]
+_pyttsx3_inflight_lock = threading.Lock()
+
+
 def _pyttsx3_tts(text: str) -> tuple[np.ndarray, int]:
     try:
         import pyttsx3
@@ -12042,32 +12143,80 @@ def _pyttsx3_tts(text: str) -> tuple[np.ndarray, int]:
         # the caller. Try SAPI5 next so a missing pyttsx3 doesn't silence us.
         print(f"  [tts] pyttsx3 unavailable ({e}); trying SAPI5")
         return _try_sapi5_then_silence(text)
-    try:
-        engine = pyttsx3.init()
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            path = f.name
+
+    with _pyttsx3_inflight_lock:
+        _busy = _pyttsx3_inflight[0]
+        if not _busy:
+            _pyttsx3_inflight[0] = True
+    if _busy:
+        print("  [tts] pyttsx3 worker still in flight from a prior timeout — "
+              "trying SAPI5")
+        return _try_sapi5_then_silence(text)
+
+    # The worker owns the temp .wav for its whole lifetime: an ABANDONED worker
+    # must not race the caller over unlink(), and the caller must not delete a
+    # file the wedged SAPI stream is still writing.
+    _box: dict = {}
+
+    def _pyttsx3_worker():
+        path = None
         try:
-            engine.save_to_file(text, path)
-            engine.runAndWait()
-            engine.stop()   # release the file handle before we try to delete it
-            audio, sr = sf.read(path, dtype="float32")
-            if audio.ndim > 1:
-                audio = audio.mean(axis=1)
-            return audio, sr
-        finally:
-            # Always remove the temp .wav — if save_to_file/runAndWait/sf.read
-            # raised before we got here the file would otherwise leak.
+            engine = pyttsx3.init()
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                path = f.name
+            _box["path"] = path
             try:
-                if os.path.exists(path):
-                    os.unlink(path)
-            except OSError:
-                pass   # Windows can hold the file briefly; not worth crashing over
-    except Exception as e:
+                engine.save_to_file(text, path)
+                engine.runAndWait()
+                engine.stop()   # release the file handle before we delete it
+                audio, sr = sf.read(path, dtype="float32")
+                if audio.ndim > 1:
+                    audio = audio.mean(axis=1)
+                _box["v"] = (audio, sr)
+            finally:
+                # Always remove the temp .wav — if save_to_file/runAndWait/
+                # sf.read raised before we got here the file would otherwise
+                # leak.
+                try:
+                    if path and os.path.exists(path):
+                        os.unlink(path)
+                except OSError:
+                    pass   # Windows can hold the file briefly; not fatal
+        except Exception as _re:   # noqa: BLE001 - reported to the caller below
+            _box["err"] = _re
+        finally:
+            # Release the single-flight guard whenever this worker actually
+            # finishes — even long after we abandoned it — so the next
+            # utterance may try pyttsx3 again.
+            with _pyttsx3_inflight_lock:
+                _pyttsx3_inflight[0] = False
+
+    _pt = threading.Thread(target=_pyttsx3_worker, name="pyttsx3-synth",
+                           daemon=True)
+    _pt.start()
+    _pt.join(timeout=_PYTTSX3_TIMEOUT_S)
+    if _pt.is_alive():
+        # DEGRADED PATH — must be loud. The worker still holds the SAPI engine
+        # and its temp .wav; we abandon both rather than block the voice thread.
+        print(f"  [tts] pyttsx3 render timed out (>{_PYTTSX3_TIMEOUT_S:.0f}s) — "
+              f"abandoning the worker (temp wav "
+              f"{_box.get('path') or 'not yet created'} is left behind if it "
+              f"never returns); trying SAPI5")
+        return _try_sapi5_then_silence(text)
+    if "err" in _box:
         # pyttsx3 itself blew up (init failed, save_to_file failed, etc.).
         # Try SAPI5 before giving up — this is the cascade the user kept
         # seeing as 'edge-tts failed → pyttsx3 render failed → silence'.
+        e = _box["err"]
         print(f"  [tts] pyttsx3 render failed ({type(e).__name__}: {e}); trying SAPI5")
         return _try_sapi5_then_silence(text)
+    out = _box.get("v")
+    if out is None:
+        # Worker finished without a result AND without an exception — should be
+        # unreachable, but never report success we did not verify.
+        print("  [tts] pyttsx3 render produced no audio and no error; trying SAPI5")
+        return _try_sapi5_then_silence(text)
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -17823,6 +17972,63 @@ def _collect_skill_prompt_examples(mod, name: str) -> None:
         pass
 
 
+# Speak-set memberships contributed by skills at load time. A skill may define
+# a module-level ``SPEAK_VERBATIM_ACTIONS`` and/or ``INFORMATIVE_ACTIONS``
+# iterable of action names; the loader folds them into the two global sets so
+# the skill's own results are voiced.
+#
+# This exists for the GITIGNORED personal skills (vip_boss_mode, trip_planner,
+# vip_intercept, ...), the same reason _SKILL_PROMPT_EXAMPLES above exists.
+# .gitignore excludes those FILES precisely because their action names embed a
+# specific person or a one-off personal event -- but the names themselves were
+# still spelled out here, in TRACKED source, and in a tracked test, so the
+# exclusion leaked into a public repo. tools/check_no_pii.py could not catch it:
+# its owner-name pattern is anchored with a regex word boundary, and a word
+# boundary never matches inside an identifier (there is none between a letter
+# and an underscore), so the gate reported OK over a real leak. Declaring
+# the membership inside the private skill keeps the private name private.
+#
+# Fail-loud, never silent: the two sets must stay DISJOINT (there is a test for
+# it), so a name a skill tries to route into one set while it already sits in
+# the other is REFUSED and logged rather than silently corrupting the routing.
+# Counts only in the log -- the names are the sensitive part, and load_skills
+# already echoes registrations separately.
+def _collect_skill_speak_sets(mod, name: str) -> None:
+    """Fold a just-loaded skill's declared speak-set memberships into the
+    global routing sets. Best-effort per attribute — a malformed declaration is
+    reported and skipped, never fatal to skill loading."""
+    for attr, target, other, label in (
+            ("SPEAK_VERBATIM_ACTIONS", SPEAK_RESULT_VERBATIM_ACTIONS,
+             INFORMATIVE_ACTIONS, "verbatim"),
+            ("INFORMATIVE_ACTIONS", INFORMATIVE_ACTIONS,
+             SPEAK_RESULT_VERBATIM_ACTIONS, "informative")):
+        try:
+            declared = getattr(mod, attr, None)
+            if not declared or isinstance(declared, (str, bytes)):
+                continue
+            added: list[str] = []
+            refused: list[str] = []
+            for _an in declared:
+                if not isinstance(_an, str) or not _an.strip():
+                    continue
+                _an = _an.strip()
+                if _an in other:
+                    refused.append(_an)
+                    continue
+                if _an not in target:
+                    target.add(_an)
+                    added.append(_an)
+            if added:
+                print(f"  [skill] {name}: routed {len(added)} action(s) to the "
+                      f"{label} speak set")
+            if refused:
+                print(f"  [skill] {name}: REFUSED {label} routing for "
+                      f"{len(refused)} action(s) already in the other speak "
+                      f"set — the sets must stay disjoint; fix the skill")
+        except Exception as _sse:
+            print(f"  [skill] {name}: {attr} could not be applied: {_sse}")
+
+
 def _skill_prompt_examples_block() -> str:
     """The system-prompt block for skill-contributed routing examples, or ''
     when no skill registered any."""
@@ -17916,6 +18122,7 @@ def load_skills():
                 else:
                     print(f"  [skill] {name}: loaded (no new actions)")
             _collect_skill_prompt_examples(mod, name)
+            _collect_skill_speak_sets(mod, name)
             _loaded_skill_names.add(name)   # mark loaded only after success
         except Exception as e:
             # Roll back the pre-exec sys.modules insert (it exists so package
@@ -18531,7 +18738,7 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     # these are safe. See docs/ACTION_INDEX.md for the full audit.
     "air_mouse_status", "amazon_tracking_status", "ambient_extract_status", "ambient_listen_status",
     "anticipation_briefing_status", "anticipation_status", "are_you_ok", "audio_music_status",
-    "banter_status", "bonnaroo_status", "cancel_promise", "chappie_recall_today",
+    "banter_status", "cancel_promise", "chappie_recall_today",
     "chappie_status", "check_budget", "deco_status", "diagnostic_daemon_status",
     "diagnostic_history", "diagnostic_status", "do_you_recognize_me", "draft_preview_gate_status",
     "email_triage_status", "face_track_status", "focus_mode_status", "gaze_calibration_status",
@@ -18549,7 +18756,7 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     "show_last_diagnostic", "show_llm_stats", "show_recent_facts", "smart_home_catalog",
     "status_panel", "suit_diagnostics", "system_status", "triage_status",
     "tv_detect_status", "tv_status", "vip_intercept_status", "voice_id_status",
-    "wake_listener_status", "wayne_boss_mode_status", "weekly_digest", "weekly_digest_status",
+    "wake_listener_status", "weekly_digest", "weekly_digest_status",
     "what_changed", "what_is_broken", "whats_broken", "whats_new",
     "who_am_i", "who_is_talking", "whos_at_the_desk", "whos_talking",
     "workshop_status",
@@ -18697,8 +18904,21 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     #   skills' register() (generic identifiers, no PII). 2026-07-07 bug-hunt.
     "send_vip_reply", "scrap_vip_reply",
     "screen_teams_calls", "answer_call", "decline_call",
-    #   face_id.py — enrol / forget confirmations.
-    "enroll_face", "learn_my_face", "remember_this_person", "forget_face",
+    #   face_id.py — enrol / forget confirmations. EVERY name skills/face_id.py
+    #   registers is routed (whoami's query aliases live in INFORMATIVE_ACTIONS;
+    #   these enrol/forget one-liners are finished sentences). learn_guest is the
+    #   ONLY guest-enrolment name core/prompts.py documents, and face_tracker
+    #   actively solicits it ("say 'remember their face'…") — yet it, its two
+    #   sibling aliases, and remember_my_face were in NEITHER set, so the
+    #   handler's own reply was printed and dropped: the "what's their name?"
+    #   question, the honest "everyone I can see is already someone I recognise"
+    #   refusal, and the "(Captured N good views.)" confirmation all carry no
+    #   FAILURE_MARKER, so even the failure follow-up could not rescue them. The
+    #   owner heard only the model's affirmative prose — success-shaped audio for
+    #   an enrolment that did not happen. 2026-08-20 audit.
+    "enroll_face", "learn_my_face", "remember_my_face",
+    "learn_guest", "remember_their_face", "remember_this_person",
+    "learn_their_face", "forget_face",
     #   guard_mode.py — on/off confirmations.
     "guard_on", "guard_off",
     #   enroll_voice.py — enrol / forget / active-speaker confirmations.
@@ -22652,6 +22872,114 @@ def _blue_green_loop_tick() -> bool:
     return False
 
 
+# Hard-kill failsafe for the blue/green teardown. upgrade_jarvis's
+# run_blue_green_handoff gives prod grace_seconds + 8 to disappear and the tick
+# above has already spent the 10s grace, so the teardown gets the remaining
+# margin before the ceremony declares failure and rolls back.
+_BLUE_GREEN_EXIT_FAILSAFE_S = 8.0
+
+
+def _blue_green_teardown_and_exit() -> None:   # pragma: no cover - process-terminating; the ORDER is asserted by source-scan tests instead
+    """Hardened teardown for the blue/green handoff.
+
+    This used to be a bare ``return`` out of main(). That is the ONLY
+    intentional stop in the whole program that did not go through a hardened
+    path: falling out of main() runs CPython finalization -> Py_FinalizeEx ->
+    ExitProcess, which walks DLL_PROCESS_DETACH under the LOADER LOCK. A worker
+    parked in a CUDA/WASAPI/Kinect call holds that lock and the process becomes
+    an immortal terminating corpse -- proven live twice (pid 14608 survived 22
+    HOURS past its own session-end banner; pid 36364 reproduced it on the very
+    next restart, 2026-07-12 py-spy dumps). _hard_exit exists precisely to avoid
+    that route, and NONE of the six atexit handlers releases the CUDA context,
+    the Kinect handle, the WASAPI streams or the :8766 socket -- so a handoff
+    could leave a driver-parked corpse pinning ~5GB of the 3090 and the
+    dashboard port until Windows was rebooted, while upgrade_jarvis (whose
+    prod_is_running() -> _pid_alive OpenProcess still SUCCEEDS on that corpse)
+    declared "prod did not exit within grace window" and rolled the upgrade
+    back.
+
+    THE ORDER IS LOAD-BEARING:
+      1. mark_intentional_exit() -- without it the atexit handshake writer
+         short-circuits, so even a perfect handoff left no clean_shutdown.flag
+         and tools/jarvis_watchdog read the takeover as an unintended death.
+      2. Free what the SUCCESSOR needs (the jarvis.lock byte-range lock and the
+         dashboard socket) FIRST, before touching anything that can wedge in
+         native code. A green instance that cannot claim the lock or co-bind
+         the port is a failed handoff.
+      3. Arm an independent hard-kill failsafe: nothing below is time-bounded.
+         Sized to the pipeline's own margin -- run_blue_green_handoff gives prod
+         grace_seconds + 8 to disappear and _blue_green_loop_tick has already
+         spent the 10s grace, so a wedged teardown must still free the machine
+         inside the remaining window or the ceremony rolls back.
+      4. Release the natives through the ONE hardened helper (in-flight CUDA
+         wait, kinect close(final=True), sd.stop, face-track stop), never
+         re-inlined here -- that inlining WAS the stale duplicate that reopened
+         the corpse class in the Ctrl-C path.
+      5. Exit via TerminateProcess, which cannot block on the loader lock.
+
+    Deliberately NOT done here (unlike the Ctrl-C path): no session save and no
+    session-pattern write. The conversation is being HANDED OVER, not ended --
+    _blue_green_loop_tick already snapshotted the tail into handoff.json for the
+    successor to resume, and an LLM-backed "end of session" summary would both
+    burn the remaining grace window and record a session that is still running.
+    """
+    print("  [blue-green] hardened teardown: releasing singleton + port, then natives")
+    # 1. Declare intent so the watchdog handshake flag is legitimate.
+    try:
+        mark_intentional_exit()
+    except Exception as _bge:
+        print(f"  [blue-green] intent marking failed: {_bge}")
+    # 2. Free the successor's resources first.
+    try:
+        _release_singleton()
+    except Exception as _bge:
+        print(f"  [blue-green] singleton release failed: {_bge}")
+    try:
+        _wi = sys.modules.get("skill_web_interface")
+        if _wi is not None and getattr(_wi, "_httpd", None) is not None:
+            _wi._stop()
+    except Exception as _bge:
+        print(f"  [blue-green] dashboard socket release failed: {_bge}")
+    # 3. Failsafe hard-kill.
+    try:
+        _bg_failsafe = threading.Timer(_BLUE_GREEN_EXIT_FAILSAFE_S,
+                                       _hard_exit, kwargs={"clean": True})
+        _bg_failsafe.daemon = True
+        _bg_failsafe.start()
+    except Exception as _bge:
+        print(f"  [blue-green] failsafe timer arm failed: {_bge}")
+    # 4. Release the natives through the hardened path.
+    try:
+        from core.actions import _release_native_resources
+        _release_native_resources(sys.modules["__main__"])
+    except Exception as _bge:
+        print(f"  [blue-green] native resource release failed: {_bge}")
+    try:
+        _focus_tracker_stop.set()   # not covered by _release_native_resources
+    except Exception as _bge:
+        print(f"  [blue-green] focus-tracker stop failed: {_bge}")
+    try:
+        _shutdown_hud()
+        _shutdown_tray()
+    except Exception as _bge:
+        print(f"  [blue-green] HUD/tray shutdown failed: {_bge}")
+    try:
+        if _bgm is not None:
+            _bgm.unregister_instance()
+    except Exception as _bge:
+        print(f"  [blue-green] instance unregister failed: {_bge}")
+    try:
+        _restore_prior_power_plan()
+    except Exception as _bge:
+        print(f"  [blue-green] power-plan restore failed: {_bge}")
+    try:
+        close_log()
+    except Exception:
+        pass
+    # 5. Un-deadlockable exit (never returns).
+    _hard_exit(0, clean=True)
+
+
 def _consume_blue_green_handoff() -> tuple[float | None, list]:
     """Blue-green-2: when relaunched as the new prod after a successful
     upgrade, pull the previous prod's in-flight conversation tail (+ last
@@ -23890,6 +24218,12 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         while True:
             try:
                 if _blue_green_loop_tick():
+                    # NEVER a bare `return` here: that falls out of main() into
+                    # CPython finalization -> ExitProcess under the loader lock,
+                    # the one route that can leave a driver-parked corpse
+                    # holding the mic/GPU/port until reboot. See
+                    # _blue_green_teardown_and_exit (it does not return).
+                    _blue_green_teardown_and_exit()
                     return
                 # Check for an injected command BEFORE we block on the mic. An
                 # external tester (Claude Code, tools/say_to_jarvis.py, smoke

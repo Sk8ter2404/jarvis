@@ -190,10 +190,18 @@ class VerbatimResultSpokenTests(MonolithGlobalsTestCase):
         # one-liners only; multi-item readers + side-effect actions are excluded
         # (a later INFORMATIVE pass owns those). Regression guard: keep them
         # voiced.
+        # NOTE (2026-08-20 privacy audit): two names that used to be pinned here
+        # belonged to GITIGNORED personal skills and embedded a real person /
+        # a one-off personal event. They were spelled out in this TRACKED test
+        # and in the tracked monolith, so .gitignore was not actually hiding
+        # them — the repo is public. Those skills now declare their own
+        # SPEAK_VERBATIM_ACTIONS and bobert_companion folds them in at load
+        # time (_collect_skill_speak_sets); the mechanism is covered by
+        # SkillContributedSpeakSetTests below. Do NOT re-add private names here.
         sweep = (
             "air_mouse_status", "amazon_tracking_status", "ambient_extract_status",
             "ambient_listen_status", "anticipation_briefing_status", "anticipation_status",
-            "are_you_ok", "audio_music_status", "banter_status", "bonnaroo_status",
+            "are_you_ok", "audio_music_status", "banter_status",
             "cancel_promise", "chappie_recall_today", "chappie_status", "check_budget",
             "deco_status", "diagnostic_daemon_status", "diagnostic_history",
             "diagnostic_status", "do_you_recognize_me", "draft_preview_gate_status",
@@ -214,7 +222,7 @@ class VerbatimResultSpokenTests(MonolithGlobalsTestCase):
             "show_llm_stats", "show_recent_facts", "smart_home_catalog", "status_panel",
             "suit_diagnostics", "system_status", "triage_status", "tv_detect_status",
             "tv_status", "vip_intercept_status", "voice_id_status", "wake_listener_status",
-            "wayne_boss_mode_status", "weekly_digest", "weekly_digest_status",
+            "weekly_digest", "weekly_digest_status",
             "what_changed", "what_is_broken", "whats_broken", "whats_new", "who_am_i",
             "who_is_talking", "whos_at_the_desk", "whos_talking", "workshop_status",
         )
@@ -2060,11 +2068,12 @@ class PaCloseGateStaleDuplicateTests(MonolithGlobalsTestCase):
 #      is informative (a multi-device list the LLM should summarise), with the
 #      split spelled out in bobert_companion's INFORMATIVE_ACTIONS comment.
 #      Handler-identity canonicalisation would silently collapse that.
-#    * skills/personal_rag.py's "search_my_files" is verbatim while its
-#      same-handler sibling "rag_search_quiet" is not; that verbatim entry is
-#      itself a known defect (it is bound to the MACHINE-READABLE handler, so
-#      it reads raw "[1] path=... score=0.812" blocks aloud). Canonicalising
-#      would PROPAGATE that defect to the sibling.
+#    * skills/personal_rag.py registered "search_my_files" (verbatim) and
+#      "rag_search_quiet" (silent) on the SAME machine-readable handler.
+#      Canonicalising by handler would have PROPAGATED that pairing rather
+#      than exposing it; the real defect was the BINDING, and it is now fixed
+#      by binding the spoken name to the spoken formatter (2026-08-20), which
+#      is a per-name decision canonicalisation could not have made.
 #  The membership decision is legitimately per-NAME. What must not be silent
 #  is DRIFT — so the anti-drift mechanism is a source scan, below.
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2136,6 +2145,14 @@ class ActionAliasSpeakSetDriftTests(MonolithGlobalsTestCase):
     # (relative path, handler symbol) -> why this family is legitimately
     # non-uniform, or the open finding that tracks it. Fix a finding, delete
     # its row. Every row was verified against the tree on 2026-08-20.
+    #
+    # A name is "routed" if it is in one of the monolith's two speak sets OR if
+    # its own skill DECLARES it (module-level SPEAK_VERBATIM_ACTIONS /
+    # INFORMATIVE_ACTIONS, folded in at load time by
+    # bobert_companion._collect_skill_speak_sets). The declaration route exists
+    # so a GITIGNORED personal skill never has to spell its private action names
+    # out in tracked source; without teaching the scan about it, moving a name
+    # there would look like the name went mute.
     _DECLARED_SPLITS = {
         ("bobert_companion.py", "_act_read_changelog"):
             "OPEN FINDING: 'recent_changes' is registered one line below three "
@@ -2145,26 +2162,49 @@ class ActionAliasSpeakSetDriftTests(MonolithGlobalsTestCase):
             "'search' is a bare-verb alias of the informative 'web_search'; "
             "left unrouted deliberately so a naked 'search' does not force a "
             "follow-up round-trip.",
-        ("skills/face_id.py", "enroll_face"):
-            "OPEN FINDING: 'remember_my_face' is an unrouted alias of the "
-            "routed enroll_face / learn_my_face pair.",
-        ("skills/face_id.py", "learn_guest"):
-            "OPEN FINDING: 'learn_guest' - the only guest-enrolment name the "
-            "prompt documents - is in neither speak set while its sibling "
-            "alias 'remember_this_person' is.",
-        ("skills/personal_rag.py", "rag_search_quiet"):
-            "'rag_search_quiet' is the deliberately SILENT twin of the routed "
-            "'search_my_files' (whose own verbatim membership is itself an "
-            "open finding - it is bound to the machine-readable handler).",
         ("skills/sh_kasa.py", "smart_home_control"):
             "control_light / control_plug / kasa_control are side-effect "
             "control aliases; the routed smart_home_control / control_device "
             "pair carries the spoken confirmation for the family.",
         ("skills/trip_planner.py", "_action_status"):
-            "'bonnaroo_brief' returns the long multi-paragraph brief, not the "
-            "one-line 'bonnaroo_status' read-out, so it is deliberately not "
-            "verbatim-voiced.",
+            # Names elided on purpose: this skill is gitignored precisely
+            # because its action names embed a one-off personal event, and this
+            # file is TRACKED and public. See the privacy note on `sweep`.
+            "the *_brief alias of this status handler returns the long "
+            "multi-paragraph briefing, not the one-line read-out, so it is "
+            "deliberately not verbatim-voiced.",
     }
+
+    @staticmethod
+    def _declared_speak_names(path):
+        """Names a skill routes itself, read from SOURCE (no import).
+
+        Mirrors bobert_companion._collect_skill_speak_sets: a module-level
+        SPEAK_VERBATIM_ACTIONS / INFORMATIVE_ACTIONS iterable of string
+        literals. Source-read rather than imported so a gitignored personal
+        skill is never executed by the suite.
+        """
+        import ast
+        out = set()
+        try:
+            with io.open(path, encoding="utf-8") as fh:
+                tree = ast.parse(fh.read())
+        except (OSError, SyntaxError):
+            return out
+        for node in tree.body:
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = (node.targets if isinstance(node, ast.Assign)
+                       else [node.target])
+            names = {t.id for t in targets if isinstance(t, ast.Name)}
+            if not names & {"SPEAK_VERBATIM_ACTIONS", "INFORMATIVE_ACTIONS"}:
+                continue
+            value = node.value
+            if isinstance(value, (ast.Tuple, ast.List, ast.Set)):
+                for elt in value.elts:
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        out.add(elt.value)
+        return out
 
     def test_no_undeclared_alias_family_drifts_out_of_the_speak_sets(self):
         rs = _load_registration_scan()
@@ -2179,6 +2219,12 @@ class ActionAliasSpeakSetDriftTests(MonolithGlobalsTestCase):
             for fname in sorted(os.listdir(d)):
                 if fname.endswith(".py"):
                     paths.append(os.path.join(d, fname))
+
+        # Skills that route their own names count as routed (see the header
+        # note). load_skills() has not run under the import-only harness, so
+        # without this the declaration route would read as a regression.
+        for path in paths:
+            routed |= self._declared_speak_names(path)
 
         found = {}
         for path in paths:
@@ -2198,8 +2244,11 @@ class ActionAliasSpeakSetDriftTests(MonolithGlobalsTestCase):
                 if inset and out:
                     found[(rel, symbol)] = out
 
-        # Sanity: the scan must actually see the tree.
-        self.assertIn(("skills/face_id.py", "learn_guest"), found)
+        # Sanity: the scan must actually see the tree. Anchored on a
+        # DELIBERATE split (a bare-verb alias left unrouted on purpose) rather
+        # than an open finding, so closing a finding cannot make the whole
+        # scan vacuously pass.
+        self.assertIn(("bobert_companion.py", "_act_web_search"), found)
 
         undeclared = sorted(k for k in found if k not in self._DECLARED_SPLITS)
         self.assertEqual(
@@ -2211,7 +2260,14 @@ class ActionAliasSpeakSetDriftTests(MonolithGlobalsTestCase):
             + "; ".join(f"{f}:{sym} -> {found[(f, sym)]}"
                         for f, sym in undeclared))
 
-        stale = sorted(k for k in self._DECLARED_SPLITS if k not in found)
+        # A row whose FILE is absent from this checkout is not stale, it is
+        # unobservable: the personal skills are gitignored, so a public clone
+        # legitimately cannot see them. Only rows whose file IS present and
+        # whose family no longer drifts are stale.
+        stale = sorted(
+            k for k in self._DECLARED_SPLITS
+            if k not in found
+            and os.path.exists(os.path.join(_ROOT, k[0].replace("/", os.sep))))
         self.assertEqual(
             stale, [],
             f"_DECLARED_SPLITS names families that no longer drift — delete "
@@ -2225,6 +2281,614 @@ class ActionAliasSpeakSetDriftTests(MonolithGlobalsTestCase):
         self.assertNotIn(("skills/focus_mode.py", "focus_mode_on"),
                          self._DECLARED_SPLITS)
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  2026-08-20 audit — six defects, all the same shape: a path that reports (or
+#  implies) success it did not verify, or degrades without saying so.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@requires_monolith
+class Pyttsx3WallClockCapTests(MonolithGlobalsTestCase):
+    """(a) The pyttsx3 rung of the TTS ladder had NO wall-clock bound.
+
+    synthesise() runs on the voice thread under _SPEAK_LOCK. Every other rung
+    is capped (voice clone 20 s, edge-tts 30 s, Kokoro, SAPI5 subprocess 15 s)
+    because a HANG there is unrecoverable: the main loop never reaches the
+    watchdog's reset consumer, so JARVIS goes permanently deaf AND mute while
+    every other _speak() caller piles up on the untimed lock. runAndWait()
+    drives a synchronous native SAPI render and was the one uncapped rung.
+    """
+
+    def _wedged_pyttsx3(self, gate):
+        engine = mock.Mock()
+        engine.runAndWait.side_effect = lambda: gate.wait(30)
+        fake = mock.Mock()
+        fake.init.return_value = engine
+        return fake, engine
+
+    def _release(self, gate):
+        gate.set()
+        deadline = time.time() + 10
+        while self.bc._pyttsx3_inflight[0] and time.time() < deadline:
+            time.sleep(0.02)
+
+    def test_a_wedged_render_is_bounded_and_falls_through_to_sapi5(self):
+        import sys
+        gate = threading.Event()
+        self.addCleanup(self._release, gate)
+        fake, engine = self._wedged_pyttsx3(gate)
+        sentinel = ("sapi5-sentinel", 22050)
+        with mock.patch.dict(sys.modules, {"pyttsx3": fake}), \
+                mock.patch.object(self.bc, "_PYTTSX3_TIMEOUT_S", 0.4), \
+                mock.patch.object(self.bc, "_try_sapi5_then_silence",
+                                  return_value=sentinel) as sapi:
+            t0 = time.time()
+            out = self.bc._pyttsx3_tts("hello")
+            elapsed = time.time() - t0
+        # The whole point: the CALLER (the voice thread) came back.
+        self.assertLess(elapsed, 8.0,
+                        "pyttsx3 render is not wall-clock bounded — the voice "
+                        "thread stayed parked in native SAPI under _SPEAK_LOCK")
+        self.assertEqual(out, sentinel,
+                         "a timed-out pyttsx3 render must fall through to the "
+                         "subprocess-bounded SAPI5 rung, never hang or raise")
+        sapi.assert_called_once()
+        self.assertTrue(engine.runAndWait.called,
+                        "test is vacuous if the wedged rung was never entered")
+
+    def test_a_single_flight_refuses_a_second_engine_while_one_is_wedged(self):
+        # pyttsx3.init() memoises its driver, so a second call during a wedge
+        # would hand out the SAME stuck engine and start a concurrent
+        # runAndWait on it. The abandoned worker holds the guard until it
+        # really finishes.
+        import sys
+        gate = threading.Event()
+        self.addCleanup(self._release, gate)
+        fake, _engine = self._wedged_pyttsx3(gate)
+        sentinel = ("sapi5-sentinel", 22050)
+        with mock.patch.dict(sys.modules, {"pyttsx3": fake}), \
+                mock.patch.object(self.bc, "_PYTTSX3_TIMEOUT_S", 0.3), \
+                mock.patch.object(self.bc, "_try_sapi5_then_silence",
+                                  return_value=sentinel):
+            first = self.bc._pyttsx3_tts("one")
+            second = self.bc._pyttsx3_tts("two")
+        self.assertEqual(first, sentinel)
+        self.assertEqual(second, sentinel)
+        self.assertEqual(fake.init.call_count, 1,
+                         "a second engine was constructed while the first was "
+                         "still wedged")
+
+    def test_a_render_failure_still_reports_and_routes_to_sapi5(self):
+        # The pre-existing raise path must survive the move onto a worker: a
+        # failure is REPORTED to the caller, never swallowed into silence, and
+        # the single-flight guard must not leak.
+        import sys
+        engine = mock.Mock()
+        engine.save_to_file.side_effect = AssertionError("")
+        fake = mock.Mock()
+        fake.init.return_value = engine
+        sentinel = ("sapi5-sentinel", 22050)
+        with mock.patch.dict(sys.modules, {"pyttsx3": fake}), \
+                mock.patch.object(self.bc, "_try_sapi5_then_silence",
+                                  return_value=sentinel) as sapi:
+            out = self.bc._pyttsx3_tts("boom")
+        self.assertEqual(out, sentinel)
+        sapi.assert_called_once()
+        self.assertFalse(self.bc._pyttsx3_inflight[0],
+                         "the single-flight guard leaked after a clean failure")
+
+
+@requires_monolith
+class SearchMyFilesBindingTests(MonolithGlobalsTestCase):
+    """(b) `search_my_files` sat in SPEAK_RESULT_VERBATIM_ACTIONS — whose whole
+    contract is "this result is already a finished, user-facing sentence" —
+    while being bound to rag_search_quiet, the MACHINE-READABLE handler. JARVIS
+    synthesised and read aloud raw `[1] path=<absolute path> score=0.812`
+    blocks: up to RAG_DEFAULT_K untruncated chunks of the owner's private
+    files, absolute paths included. Nothing else ever consumed that block (no
+    mid-reply tool loop; the name is not in INFORMATIVE_ACTIONS), so the
+    speaker was its only reader.
+
+    Fixed by CHANGING THE BINDING, not by adding another name to a list. The
+    alternative — canonicalising aliases by handler identity — is rejected in
+    the H-5 block comment above and would have been wrong here twice over: it
+    would have propagated this defect onto rag_search_quiet, and it would have
+    collapsed the deliberate deco_topology / network_topology split.
+    """
+
+    def test_b_spoken_name_is_bound_to_the_spoken_formatter(self):
+        rs = _load_registration_scan()
+        regs = rs.scan_file(os.path.join(_ROOT, "skills", "personal_rag.py"))
+        self.assertIn("search_my_files", regs)
+        self.assertEqual(
+            regs["search_my_files"].symbol, "rag_search",
+            "search_my_files is voiced VERBATIM, so it must resolve to the "
+            "voice formatter; bound to rag_search_quiet it reads a "
+            "machine-readable block aloud")
+        # The machine-readable twin keeps its own name and its own behaviour.
+        self.assertEqual(regs["rag_search_quiet"].symbol, "rag_search_quiet")
+
+    def test_b_membership_and_disjointness_unchanged(self):
+        self.assertIn("search_my_files", self.bc.SPEAK_RESULT_VERBATIM_ACTIONS)
+        self.assertIn("rag_search", self.bc.SPEAK_RESULT_VERBATIM_ACTIONS)
+        self.assertNotIn("search_my_files", self.bc.INFORMATIVE_ACTIONS)
+        # rag_search_quiet stays deliberately silent: it is the block-producing
+        # twin, and nothing should ever read a block aloud.
+        self.assertNotIn("rag_search_quiet",
+                         self.bc.SPEAK_RESULT_VERBATIM_ACTIONS)
+        self.assertNotIn("rag_search_quiet", self.bc.INFORMATIVE_ACTIONS)
+
+    def test_b_the_failure_guard_could_never_have_caught_the_block(self):
+        # Why this was silent-by-construction rather than merely unlucky:
+        # _speak_verbatim_results' only escape hatch is FAILURE_MARKERS, and a
+        # hits block (or either sentinel) contains none of them. Pinned so a
+        # future "just add a marker" fix is understood to be insufficient.
+        from core.failure_markers import FAILURE_MARKERS
+        for probe in ("[1] path=C:/x/y.txt score=0.812\nsome private text",
+                      "[no matches]",
+                      "[error: personal RAG unavailable]"):
+            low = probe.lower()
+            self.assertFalse(
+                any(m.lower() in low for m in FAILURE_MARKERS),
+                f"{probe!r} now trips a failure marker — re-check this test's "
+                f"reasoning, but do NOT rely on markers to gate "
+                f"machine-readable output")
+
+
+@requires_monolith
+class FaceIdFamilyVoicedTests(MonolithGlobalsTestCase):
+    """(c) learn_guest — the ONLY guest-enrolment name core/prompts.py
+    documents, and the one skills/face_tracker.py actively solicits ("say
+    'remember their face'") — was in NEITHER speak set, while its sibling alias
+    remember_this_person was verbatim. Five of learn_guest's branches carry no
+    FAILURE_MARKER, so they were printed and dropped: the "what's their name?"
+    question, the honest "everyone I can see is already someone I recognise"
+    refusal, and the "(Captured N good views.)" confirmation. The owner heard
+    only the model's affirmative prose — success-shaped audio for an enrolment
+    that never happened.
+    """
+
+    def test_c_guest_enrolment_names_are_voiced(self):
+        for name in ("learn_guest", "remember_their_face", "learn_their_face",
+                     "remember_my_face"):
+            self.assertIn(
+                name, self.bc.SPEAK_RESULT_VERBATIM_ACTIONS,
+                f"{name} is a registered enrolment name whose handler reply is "
+                f"the only honest signal of what actually happened")
+            # Sets must stay disjoint (see test_speak_sets_are_disjoint).
+            self.assertNotIn(name, self.bc.INFORMATIVE_ACTIONS)
+
+    def test_c_every_registered_face_id_name_is_routed(self):
+        # Source-scanning family invariant, mirroring the air-mouse and
+        # focus-mode ones: a FUTURE alias added to skills/face_id.register()
+        # fails the suite instead of silently swallowing an enrolment reply.
+        # "Routed", not "uniformly verbatim": the whoami query aliases are
+        # legitimately INFORMATIVE.
+        rs = _load_registration_scan()
+        regs = rs.scan_file(os.path.join(_ROOT, "skills", "face_id.py"))
+        self.assertIn("learn_guest", regs)
+        self.assertIn("enroll_face", regs)
+        self.assertGreaterEqual(len(regs), 15, sorted(regs))
+        routed = (set(self.bc.SPEAK_RESULT_VERBATIM_ACTIONS)
+                  | set(self.bc.INFORMATIVE_ACTIONS))
+        missing = sorted(n for n in regs if n not in routed)
+        self.assertEqual(
+            missing, [],
+            f"skills/face_id.py registers action(s) with NO voicing route — "
+            f"their reply, refusals included, would be dropped: {missing}")
+
+    def test_c_guest_aliases_share_the_enrolling_handler(self):
+        # The premise the fix rests on, asserted from source not assumed.
+        rs = _load_registration_scan()
+        regs = rs.scan_file(os.path.join(_ROOT, "skills", "face_id.py"))
+        for alias in ("remember_their_face", "remember_this_person",
+                      "learn_their_face"):
+            self.assertEqual(regs[alias].symbol, "learn_guest")
+        self.assertEqual(regs["remember_my_face"].symbol, "enroll_face")
+
+
+@requires_monolith
+class SkillContributedSpeakSetTests(MonolithGlobalsTestCase):
+    """(d) Owner-private action names from GITIGNORED personal skills were
+    spelled out in TRACKED source (this module's speak sets and a pinned test
+    tuple), so .gitignore was not actually hiding them — the repo is public and
+    the strings are already pushed. tools/check_no_pii.py cannot catch a
+    re-introduction either: its owner-name patterns are word-boundary anchored
+    and there is no word boundary inside an identifier. The private skills now
+    declare their own speak-set membership and the monolith folds it in.
+    """
+
+    def _fake_skill(self, **attrs):
+        import types
+        m = types.ModuleType("skill_fake_private")
+        for k, v in attrs.items():
+            setattr(m, k, v)
+        return m
+
+    def _discard(self, *names):
+        for n in names:
+            self.bc.SPEAK_RESULT_VERBATIM_ACTIONS.discard(n)
+            self.bc.INFORMATIVE_ACTIONS.discard(n)
+
+    def test_d_declared_names_are_folded_into_the_live_sets(self):
+        self.addCleanup(self._discard, "zz_probe_verbatim", "zz_probe_info")
+        mod = self._fake_skill(
+            SPEAK_VERBATIM_ACTIONS=("zz_probe_verbatim",),
+            INFORMATIVE_ACTIONS=("zz_probe_info",))
+        self.bc._collect_skill_speak_sets(mod, "fake_private")
+        self.assertIn("zz_probe_verbatim",
+                      self.bc.SPEAK_RESULT_VERBATIM_ACTIONS)
+        self.assertIn("zz_probe_info", self.bc.INFORMATIVE_ACTIONS)
+
+    def test_d_disjointness_violation_is_refused_and_logged(self):
+        # Never silently corrupt the routing: a name already in the other set
+        # is refused, loudly. (version_info is verbatim at HEAD.)
+        import contextlib
+        import io as _io
+        self.assertIn("version_info", self.bc.SPEAK_RESULT_VERBATIM_ACTIONS)
+        mod = self._fake_skill(INFORMATIVE_ACTIONS=("version_info",))
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.bc._collect_skill_speak_sets(mod, "fake_private")
+        self.assertNotIn("version_info", self.bc.INFORMATIVE_ACTIONS,
+                         "a skill was allowed to break set disjointness")
+        self.assertIn("REFUSED", buf.getvalue(),
+                      "the refusal was silent — a degraded path must LOG")
+
+    def test_d_a_malformed_declaration_cannot_break_skill_loading(self):
+        for bad in ("not-an-iterable-of-names", 17, object()):
+            mod = self._fake_skill(SPEAK_VERBATIM_ACTIONS=bad)
+            self.bc._collect_skill_speak_sets(mod, "fake_private")   # no raise
+        self.assertNotIn("n", self.bc.SPEAK_RESULT_VERBATIM_ACTIONS,
+                         "a bare string was iterated character-by-character")
+
+    def test_d_the_loader_actually_invokes_the_collector(self):
+        # Otherwise the mechanism exists and routes nothing.
+        with io.open(os.path.join(_ROOT, "bobert_companion.py"),
+                     encoding="utf-8") as fh:
+            src = fh.read()
+        body = src[src.index("def load_skills("):]
+        body = body[:body.index("\ndef ", 1)]
+        self.assertIn("_collect_skill_speak_sets(mod, name)", body,
+                      "load_skills does not call _collect_skill_speak_sets — a "
+                      "private skill's declared names would never be routed")
+
+    def test_d_every_declared_name_is_actually_registered_by_that_skill(self):
+        # A declaration for a name the skill never registers routes NOTHING —
+        # it would look like coverage while the action stayed mute. Generic
+        # scan over skills/, so no private filename or action name appears
+        # here. Uses the same source-reader the drift ledger uses.
+        rs = _load_registration_scan()
+        d = os.path.join(_ROOT, "skills")
+        checked = 0
+        for fname in sorted(os.listdir(d)):
+            if not fname.endswith(".py"):
+                continue
+            path = os.path.join(d, fname)
+            declared = ActionAliasSpeakSetDriftTests._declared_speak_names(path)
+            if not declared:
+                continue
+            try:
+                regs = rs.scan_file(path)
+            except SyntaxError:
+                continue
+            missing = sorted(n for n in declared if n not in regs)
+            self.assertEqual(
+                missing, [],
+                f"skills/{fname} declares speak-set membership for name(s) it "
+                f"does not register — the declaration routes nothing: "
+                f"{missing}")
+            checked += 1
+        # Sanity: at least one skill uses the mechanism, or this is vacuous.
+        self.assertGreaterEqual(
+            checked, 1,
+            "no skill declares SPEAK_VERBATIM_ACTIONS / INFORMATIVE_ACTIONS — "
+            "the private-name routing mechanism has no user, so a private name "
+            "has probably been moved back into tracked source")
+
+    def test_d_no_owner_private_names_in_the_tracked_tree(self):
+        # Uses the OWNER'S OWN pattern list (tools/pii_local.py, gitignored) so
+        # this tracked test carries no private string of its own. It also
+        # applies the rule the shipped gate is missing: identifiers are scanned
+        # a second time with "_" treated as a separator, which is exactly why
+        # <name>_boss_mode_status slipped past a word-boundary-anchored pattern.
+        import importlib.util
+        import re
+        import subprocess
+        local = os.path.join(_ROOT, "tools", "pii_local.py")
+        if not os.path.exists(local):
+            self.skipTest("tools/pii_local.py (gitignored) absent — the "
+                          "owner's private pattern list is unavailable here")
+        spec = importlib.util.spec_from_file_location("pii_local", local)
+        pii = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pii)
+        pats = []
+        for attr in ("WARN", "HARD", "WARN_PATTERNS", "HARD_PATTERNS"):
+            for row in (getattr(pii, attr, None) or ()):
+                try:
+                    label, rx = row[0], row[1]
+                except (TypeError, IndexError, KeyError):
+                    continue
+                low = str(label).lower()
+                if isinstance(rx, str) and any(k in low for k in
+                                               ("name", "trip", "venue")):
+                    pats.append((label, re.compile(rx)))
+        if not pats:
+            self.skipTest("tools/pii_local.py exports no personal-name pattern")
+
+        try:
+            out = subprocess.run(["git", "ls-files"], cwd=_ROOT, timeout=90,
+                                 capture_output=True, text=True)
+        except (OSError, subprocess.SubprocessError):
+            self.skipTest("git unavailable")
+        if out.returncode != 0:
+            self.skipTest("not a git checkout")
+
+        # Files whose leak belongs to a DIFFERENT open finding: a generated doc
+        # and two VIP test fixtures. Listed by PATH only — never by content.
+        # ALLOWED, not required: closing those findings keeps this green.
+        elsewhere = {
+            "docs/ACTION_INDEX.md",
+            "tests/test_audit_2026_07_14.py",
+            "tests/skills/test_vip_intercept.py",
+        }
+        hits = []
+        for rel in out.stdout.splitlines():
+            rel = rel.strip()
+            if not rel or rel in elsewhere:
+                continue
+            if os.path.splitext(rel)[1].lower() not in (
+                    ".py", ".md", ".ps1", ".json", ".yml", ".yaml", ".txt"):
+                continue
+            path = os.path.join(_ROOT, rel.replace("/", os.sep))
+            try:
+                with io.open(path, encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            tokenised = text.replace("_", " ")
+            for label, rx in pats:
+                if rx.search(text) or rx.search(tokenised):
+                    hits.append(f"{rel} ({label})")
+                    break
+        self.assertEqual(
+            sorted(set(hits)), [],
+            "tracked file(s) carry a name the project classifies as private "
+            "(paths and labels only; contents deliberately not echoed): "
+            + ", ".join(sorted(set(hits))))
+
+
+@requires_monolith
+class BlueGreenHardenedExitTests(MonolithGlobalsTestCase):
+    """(e) The blue/green handoff was the ONE intentional stop that skipped the
+    hardened teardown: a bare `return` out of main() into CPython finalization
+    -> ExitProcess under the loader lock — the exact route that produced
+    22-hour immortal zombies twice. None of the six atexit handlers releases
+    the CUDA context, the Kinect handle, the WASAPI streams or the :8766
+    socket, and mark_intentional_exit() was never called either, so even a
+    perfect handoff left no watchdog handshake flag.
+    """
+
+    def _run_teardown(self):
+        import sys
+        import core.actions as _ca
+        order = []
+
+        def rec(tag, ret=None):
+            def _f(*a, **k):
+                order.append(tag)
+                return ret
+            return _f
+
+        wi = mock.Mock()
+        wi._httpd = object()
+        wi._stop.side_effect = rec("port")
+        bgm = mock.Mock()
+        bgm.unregister_instance.side_effect = rec("bgm")
+        timer = mock.Mock()
+        timer.start.side_effect = rec("failsafe")
+        focus = mock.Mock()
+        focus.set.side_effect = rec("focus")
+
+        with mock.patch.dict(sys.modules, {"skill_web_interface": wi}), \
+                mock.patch.object(self.bc, "mark_intentional_exit",
+                                  rec("intent")), \
+                mock.patch.object(self.bc, "_release_singleton",
+                                  rec("singleton")), \
+                mock.patch.object(self.bc.threading, "Timer",
+                                  mock.Mock(return_value=timer)), \
+                mock.patch.object(_ca, "_release_native_resources",
+                                  rec("natives")), \
+                mock.patch.object(self.bc, "_focus_tracker_stop", focus), \
+                mock.patch.object(self.bc, "_shutdown_hud", rec("hud")), \
+                mock.patch.object(self.bc, "_shutdown_tray", rec("tray")), \
+                mock.patch.object(self.bc, "_bgm", bgm), \
+                mock.patch.object(self.bc, "_restore_prior_power_plan",
+                                  rec("power")), \
+                mock.patch.object(self.bc, "close_log", rec("log")), \
+                mock.patch.object(self.bc, "_hard_exit", rec("exit")):
+            self.bc._blue_green_teardown_and_exit()
+        return order
+
+    def test_e_teardown_runs_and_ends_in_the_undeadlockable_exit(self):
+        order = self._run_teardown()
+        for tag in ("intent", "singleton", "port", "failsafe", "natives",
+                    "focus", "hud", "tray", "bgm", "exit"):
+            self.assertIn(tag, order, f"{tag} step missing: {order}")
+        self.assertEqual(order[-1], "exit",
+                         f"teardown did not end in _hard_exit: {order}")
+
+    def test_e_order_is_load_bearing(self):
+        order = self._run_teardown()
+        i = order.index
+        self.assertLess(i("intent"), i("exit"),
+                        "without mark_intentional_exit the watchdog reads the "
+                        "takeover as an unintended death")
+        self.assertLess(i("singleton"), i("natives"),
+                        "the successor's singleton lock must be freed BEFORE "
+                        "anything that can wedge in native code")
+        self.assertLess(i("port"), i("natives"),
+                        "the dashboard socket must be freed before the natives")
+        self.assertLess(i("failsafe"), i("natives"),
+                        "nothing below the failsafe is time-bounded; arm it "
+                        "first or a wedged release is unrecoverable")
+        self.assertLess(i("natives"), i("exit"),
+                        "a thread parked in a driver at exit time corpse-pins "
+                        "the VRAM")
+
+    def test_e_handoff_call_site_never_returns_bare_from_main(self):
+        with io.open(os.path.join(_ROOT, "bobert_companion.py"),
+                     encoding="utf-8") as fh:
+            src = fh.read()
+        i = src.index("if _blue_green_loop_tick():")
+        lines = src[i:i + 900].splitlines()
+        self.assertTrue(
+            any("_blue_green_teardown_and_exit()" in ln for ln in lines),
+            "the handoff exit fell back to a bare return — that is the "
+            "ExitProcess-under-the-loader-lock route")
+        call_i = next(n for n, ln in enumerate(lines)
+                      if "_blue_green_teardown_and_exit()" in ln)
+        ret_i = next(n for n, ln in enumerate(lines) if ln.strip() == "return")
+        self.assertLess(call_i, ret_i,
+                        "teardown must run BEFORE the return")
+
+    def test_e_teardown_uses_the_one_hardened_native_release(self):
+        # Re-inlining the release (unload() without the in-flight CUDA wait,
+        # kinect close() without final=True) is exactly the stale duplicate
+        # that reopened the corpse class in the Ctrl-C path.
+        with io.open(os.path.join(_ROOT, "bobert_companion.py"),
+                     encoding="utf-8") as fh:
+            src = fh.read()
+        body = src[src.index("def _blue_green_teardown_and_exit"):]
+        body = body[:body.index("\ndef ", 1)]
+        # Scan the CODE, not the docstring (which names the hardened steps).
+        _d0 = body.index('"""')
+        code = body[body.index('"""', _d0 + 3) + 3:]
+        self.assertIn("from core.actions import _release_native_resources",
+                      code)
+        for inlined in ("close(final=True)", "unload(", "sd.stop("):
+            self.assertNotIn(inlined, code,
+                             f"{inlined} was re-inlined here instead of "
+                             f"going through _release_native_resources")
+        # And it must NOT end the session: the conversation is handed over.
+        self.assertNotIn("save_session_to_memory", code)
+
+
+@requires_monolith
+class CameraReopenBackoffTests(MonolithGlobalsTestCase):
+    """(f) The P1-3 camera-contention yield was applied exactly once. THREE
+    separate sites wrote entry["next_reopen_at"] and only the wedge branch
+    consulted contention, so the very next failed reopen overwrote the 30 s
+    yield with a flat 2 s and the loop went back to hammering DirectShow — the
+    overlapping open/release churn this file names as the leading suspect for
+    the silent crash cascade. Worse, in the scenario the feature exists for
+    (Teams holding the device) the wedge branch is unreachable, so the yield
+    never ran at all — while the log line promised a backoff the code then
+    abandoned.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._reset_cache()
+        self.addCleanup(self._reset_cache)
+
+    def _reset_cache(self):
+        self.bc._camera_locker_cache[0] = 0.0
+        self.bc._camera_locker_cache[1] = []
+
+    def test_f_every_failed_reopen_re_evaluates_contention(self):
+        entry = {"next_reopen_at": 0.0, "contention_logged": False}
+        wide = self.bc.CAMERA_CONTENTION_BACKOFF_SEC
+        for attempt, now in enumerate((100.0, 130.0, 160.0)):
+            backoff, _lockers = self.bc._schedule_camera_reopen(
+                entry, "emeet", 0, now, lockers=["Teams.exe"])
+            self.assertEqual(backoff, wide, f"attempt {attempt}")
+            self.assertAlmostEqual(
+                entry["next_reopen_at"], now + wide, places=6,
+                msg=f"attempt {attempt}: the contention yield decayed back to "
+                    f"the flat reopen spacing — that is the defect")
+
+    def test_f_hint_is_logged_once_and_recovery_is_logged_too(self):
+        import contextlib
+        import io as _io
+        entry = {"next_reopen_at": 0.0, "contention_logged": False}
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.bc._schedule_camera_reopen(entry, "emeet", 0, 100.0,
+                                            lockers=["Teams.exe"])
+            self.bc._schedule_camera_reopen(entry, "emeet", 0, 130.0,
+                                            lockers=["Teams.exe"])
+        self.assertEqual(buf.getvalue().count("appears LOCKED"), 1,
+                         "the actionable hint must be one-shot per episode")
+        self.assertTrue(entry["contention_logged"])
+
+        buf2 = _io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            backoff, _ = self.bc._schedule_camera_reopen(
+                entry, "emeet", 0, 200.0, lockers=[])
+        self.assertEqual(backoff, self.bc.CAMERA_REOPEN_BACKOFF_SEC)
+        self.assertAlmostEqual(entry["next_reopen_at"],
+                               200.0 + self.bc.CAMERA_REOPEN_BACKOFF_SEC,
+                               places=6)
+        self.assertFalse(entry["contention_logged"])
+        self.assertIn("no longer appears", buf2.getvalue(),
+                      "leaving the degraded state must LOG, not silently speed "
+                      "back up")
+
+    def test_f_locker_lookup_is_cached_off_the_face_track_hot_path(self):
+        calls = []
+
+        def _walk():
+            calls.append(1)
+            return ["OBS"]
+
+        with mock.patch.object(self.bc, "find_camera_locking_processes",
+                               side_effect=_walk):
+            self.assertEqual(self.bc._camera_lockers_cached(500.0), ["OBS"])
+            self.assertEqual(
+                self.bc._camera_lockers_cached(
+                    500.0 + self.bc._CAMERA_LOCKER_CACHE_TTL_S / 2), ["OBS"])
+            self.assertEqual(len(calls), 1, "the process walk was not cached")
+            self.bc._camera_lockers_cached(
+                500.0 + self.bc._CAMERA_LOCKER_CACHE_TTL_S + 1.0)
+            self.assertEqual(len(calls), 2, "the cache never expires")
+
+    def test_f_next_reopen_at_has_exactly_one_scheduling_writer(self):
+        # The stale duplicate is this codebase's #1 bug class, and three copies
+        # of this rule are what made the yield dead. Any assignment outside
+        # _schedule_camera_reopen must be a plain reset to 0.0.
+        with io.open(os.path.join(_ROOT, "bobert_companion.py"),
+                     encoding="utf-8") as fh:
+            lines = fh.readlines()
+        helper_start = next(i for i, ln in enumerate(lines)
+                            if ln.startswith("def _schedule_camera_reopen("))
+        helper_end = next(i for i in range(helper_start + 1, len(lines))
+                          if lines[i].startswith("def "))
+        offenders = []
+        for i, ln in enumerate(lines):
+            if helper_start <= i < helper_end:
+                continue
+            for marker in ('next_reopen_at"] =', "next_reopen_at'] ="):
+                if marker in ln:
+                    rhs = ln.split(marker, 1)[1].strip().rstrip(",")
+                    if rhs not in ("0.0", "0"):
+                        offenders.append(f"{i + 1}: {ln.strip()}")
+        self.assertEqual(
+            offenders, [],
+            "a second scheduling writer of next_reopen_at re-appeared — that "
+            "is exactly how the contention yield was overwritten: "
+            + "; ".join(offenders))
+
+    def test_f_wedge_branch_logs_the_backoff_it_actually_armed(self):
+        with io.open(os.path.join(_ROOT, "bobert_companion.py"),
+                     encoding="utf-8") as fh:
+            src = fh.read()
+        i = src.index("_backoff, lockers = _schedule_camera_reopen(")
+        block = src[i:i + 1600]
+        self.assertIn("will reopen in {_backoff:.1f}s", block,
+                      "the dead-camera line must report the backoff that was "
+                      "armed, not a constant the code goes on to ignore")
 
 if __name__ == "__main__":
     unittest.main()

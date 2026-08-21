@@ -596,5 +596,73 @@ class RagConfigDeadKnobInvariantTests(unittest.TestCase):
                 f"indexer'). Wire it into the config push in register().")
 
 
+class SearchMyFilesSpokenBindingTests(unittest.TestCase):
+    """2026-08-20 audit (b). The ACTION `search_my_files` is in
+    bobert_companion.SPEAK_RESULT_VERBATIM_ACTIONS, whose contract is "this
+    result is already a finished, user-facing sentence spoken as-is". It was
+    bound to rag_search_quiet, the MACHINE-READABLE handler, so JARVIS
+    synthesised and read aloud raw `[1] path=<absolute path> score=0.812`
+    blocks — with RAG_DEFAULT_K untruncated 1200-char chunks of the owner's
+    private files. Nothing else ever consumed that block: there is no mid-reply
+    tool loop, and the name is not in INFORMATIVE_ACTIONS, so the speaker was
+    the ONLY reader. The fix is the binding, not another list entry.
+    """
+
+    def setUp(self):
+        self.mod, self.actions, patcher = _load_rag_skill()
+        self.addCleanup(patcher.stop)
+
+    _HITS = [{"filename": "budget.md", "path": r"C:\Users\o\Documents\budget.md",
+              "snippet": "private paragraph the owner would not want read out "
+                         "with its full path", "score": 0.812}]
+
+    def test_spoken_alias_returns_the_voice_format_not_a_data_block(self):
+        rag = _fake_rag(hits=list(self._HITS))
+        with mock.patch.object(self.mod, "_rag", return_value=rag):
+            out = self.actions["search_my_files"]("budget")
+        for leak in ("path=", "score=", "[1]"):
+            self.assertNotIn(
+                leak, out,
+                f"the spoken alias emitted {leak!r} — this string is spoken "
+                f"verbatim, so a machine-readable block is read aloud")
+        self.assertIn("budget.md", out)
+        self.assertIn("sir", out.lower())
+
+    def test_machine_readable_twin_keeps_its_own_name_and_shape(self):
+        rag = _fake_rag(hits=list(self._HITS))
+        with mock.patch.object(self.mod, "_rag", return_value=rag):
+            block = self.actions["rag_search_quiet"]("budget")
+        self.assertIn("path=", block)
+        self.assertIn("score=", block)
+
+    def test_spoken_alias_and_rag_search_are_the_same_handler(self):
+        self.assertIs(self.actions["search_my_files"],
+                      self.actions["rag_search"])
+        self.assertIsNot(self.actions["search_my_files"],
+                         self.actions["rag_search_quiet"])
+
+    def test_empty_query_asks_instead_of_emitting_an_error_sentinel(self):
+        # The verbatim speaker has no sentinel handling: "[error: empty query]"
+        # would have been spoken as-is.
+        out = self.actions["search_my_files"]("")
+        self.assertNotIn("[error", out)
+        self.assertIn("What should I search", out)
+
+    def test_offline_path_is_a_spoken_sentence_not_a_bracket_sentinel(self):
+        with mock.patch.object(self.mod, "_rag",
+                               return_value=_fake_rag(available=False)):
+            out = self.actions["search_my_files"]("x")
+        self.assertNotIn("[error", out)
+        self.assertIn("offline", out.lower())
+
+    def test_the_module_level_tool_helper_is_untouched(self):
+        # search_my_files(query, k) — the tool-shaped Python helper — still
+        # exists with its own signature and still produces the block. Only the
+        # ACTION binding changed.
+        rag = _fake_rag(hits=list(self._HITS))
+        with mock.patch.object(self.mod, "_rag", return_value=rag):
+            block = self.mod.search_my_files("budget", k=3)
+        self.assertIn("path=", block)
+
 if __name__ == "__main__":
     unittest.main()

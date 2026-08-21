@@ -16,6 +16,16 @@ Zero external deps (stdlib only) so it runs in the App-Control-locked
 environment and on a bare CI runner. Add new patterns as the owner's personal
 data surface grows — keep this file itself free of real secrets (the patterns
 below are deliberately partial / well-known formats, not live values).
+
+SINGLE SOURCE OF TRUTH — and the DIRECTION matters. ``core/bug_reporter.py``
+IMPORTS ``HARD``/``WARN`` from this module (its ``_gate_patterns()``) and applies
+them on top of its own built-in scrub rules, so a credential shape added HERE
+reaches the runtime scrubber for free. The reverse is NOT true — shapes added
+only to ``bug_reporter._SCRUB_RULES`` never flow back, and that asymmetry is
+exactly how this gate silently fell behind the scrubber on GitHub tokens
+(found 2026-08-20). New credential shapes therefore belong in ``HARD`` below
+FIRST. ``tests/test_gate_scrubber_parity.py`` fails if the two drift apart
+again.
 """
 from __future__ import annotations
 
@@ -60,6 +70,32 @@ HARD = [
     ("aws-access-key",    _rx(r"\bAKIA[0-9A-Z]{16}\b")),
     ("google-api-key",    _rx(r"\bAIza[0-9A-Za-z_\-]{32,}\b")),
     ("private-key-block", _rx(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----")),
+    # GitHub tokens. This was the gate's one genuinely REACHABLE leak: the
+    # TRACKED .env.example ships a `JARVIS_GITHUB_TOKEN=` line the user is told
+    # to fill in (core/bug_reporter._issue_token reads exactly that variable and
+    # sends it as `Authorization: Bearer`), so filling the TEMPLATE instead of
+    # the gitignored .env used to sail past the pre-commit hook, CI, and the
+    # release scan with nothing — not even a WARN — firing. A classic token is a
+    # fixed prefix + 36 base62 chars; a fine-grained one is `github_pat_` + a
+    # 22-char id + `_` + a 59-char secret.
+    ("github-token",       _rx(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b")),
+    ("github-fg-token",    _rx(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b")),
+    # OpenAI's modern project / service-account keys do NOT match the legacy
+    # `sk-` + 32-base62 rule above (they carry `-` and `_`), so they need their
+    # own shape. Kept PREFIXED rather than widening "openai-key", which would
+    # start matching ordinary hyphenated identifiers that begin "sk-".
+    ("openai-project-key", _rx(r"\bsk-(?:proj|svcacct|admin)-[A-Za-z0-9_\-]{20,}\b")),
+    # Slack + JWT. Deliberately TIGHTER than core/bug_reporter._SCRUB_RULES'
+    # equivalents, so this repo’s own synthetic fixtures cannot HARD-fail the
+    # gate (tests/test_bug_reporter.py carries a literal "xoxb-12345678abcd" and
+    # a .../T00/B00/... webhook): a REAL Slack token has three dash-separated
+    # groups and a real webhook full T…/B…/24-char path segments. Both still
+    # catch every well-formed live credential.
+    ("slack-token",        _rx(r"\bxox[bpoas]-\d{9,}-\d{9,}-[0-9A-Za-z]{20,}\b")),
+    ("slack-webhook",      _rx(r"https://hooks\.slack\.com/services/"
+                               r"T[A-Z0-9]{6,}/B[A-Z0-9]{6,}/[A-Za-z0-9]{20,}")),
+    ("jwt",                _rx(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"
+                               r"\.[A-Za-z0-9_\-]{10,}\b")),
 ]
 
 WARN = [
@@ -67,8 +103,12 @@ WARN = [
     # false-positive on test fixtures (fake creds) and the .env.example
     # template. Run `check_no_pii.py --strict` (e.g. in the release build) to
     # block on these. Owner-specific advisory tokens load from pii_local.py.
+    # The `auth` prefix on `token` is OPTIONAL on purpose: requiring it was the
+    # odd one out of three copies of this name list (core/bug_reporter.py and
+    # tools/audit_codebase.py both match a bare `token`), and it meant a quoted
+    # `GITHUB_TOKEN = "…"` produced no finding at all. 2026-08-20.
     ("secret-literal",    _rx(r"(?i)(password|passwd|access[_-]?code|secret|api[_-]?key|"
-                              r"auth[_-]?token)\s*[:=]\s*[\"'][^\"']{6,}[\"']")),
+                              r"(?:auth[_-]?)?token)\s*[:=]\s*[\"'][^\"']{6,}[\"']")),
     ("private-ip",        _rx(r"\b(?:10\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])|192\.168)\.\d{1,3}\.\d{1,3}\b")),
 ]
 
