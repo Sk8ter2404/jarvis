@@ -820,6 +820,10 @@ def get_stream_health() -> dict:
          "body_age_s":  float | None,
          "depth_age_s": float | None,
          "infrared": "unsupported",     # always: see get_infrared_gray()
+         "enabled": bool,               # KINECT_ENABLED as mirrored by set_enabled
+         "open_error": str | None,      # last failed-open reason, None when healthy
+         "cooldown_s": float,           # seconds left on the negative cache (0 = none)
+         "pump_alive": bool,            # the always-on body pump thread is running
          "ts": <monotonic>}
 
     TWO DIFFERENT QUESTIONS, and conflating them is how the old probe lied:
@@ -843,12 +847,47 @@ def get_stream_health() -> dict:
     so that probe reported "color, depth" on a sensor that had stopped
     streaming — the exact class of lie the 2026-07-21 audit found for color and
     body and missed for depth. None for an age means no frame of that stream
-    has been served since this runtime was published."""
+    has been served since this runtime was published.
+
+    WHY THE FOUR NON-STREAM KEYS (2026-09-04). ``open == False`` with every
+    *_pending False and every *_age_s None is the SAME reading for four
+    completely different situations - Kinect switched off, pykinect2 missing,
+    the sensor object refusing to construct, and "opened but streamed no
+    frames" (the plugged-in-but-unpowered / held-by-another-process case). The
+    only symbol that separates them is ``_open_error[0]``, which had no public
+    accessor at all, so a caller either guessed or reached into a private cell.
+    ``cooldown_s`` is a SECOND, independent fingerprint of the wedged case (only
+    a no-frames open earns _WEDGED_CACHE_SEC; import/ctor failures get the short
+    _NEGATIVE_CACHE_SEC and disabled earns none), and ``pump_alive`` separates a
+    hardware fault from "our own worker thread died". All four are pure cell
+    reads - no lock, no I/O, no open attempt - so a UI poll can ask this
+    question safely; calling available()/get_runtime() instead would drag the
+    caller into the ~16 s open gauntlet that tripped the main-loop watchdog on
+    2026-07-10.
+
+    ``open_error`` is None both when the sensor is HEALTHY and when nothing has
+    tried to open it yet. A caller that needs to tell those apart must also read
+    ``open``: (open False, open_error None) means NOT YET PROBED, not "failed".
+    """
     now = time.monotonic()
     out = {"open": _runtime[0] is not None,
            "color_pending": False, "body_pending": False, "depth_pending": False,
            "color_age_s": None, "body_age_s": None, "depth_age_s": None,
            "infrared": "unsupported", "ts": now}
+    # The four discriminators, in their OWN try block: an odd runtime object in
+    # the per-stream loop below must never cost us the failure REASON, which is
+    # the single field that tells "no sensor" apart from "sensor there, no
+    # frames". None of these touches the runtime at all.
+    try:
+        out["enabled"] = bool(_ENABLED)
+        out["open_error"] = _open_error[0]
+        out["cooldown_s"] = round(max(0.0, _negative_until[0] - now), 2)
+        out["pump_alive"] = _pump_is_alive()
+    except Exception:   # pragma: no cover - defensive: cells swapped by a test
+        out.setdefault("enabled", False)
+        out.setdefault("open_error", None)
+        out.setdefault("cooldown_s", 0.0)
+        out.setdefault("pump_alive", False)
     rt = _runtime[0]
     try:
         for key, cell, seen, time_attr, flag_attr in (

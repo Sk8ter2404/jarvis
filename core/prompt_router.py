@@ -264,9 +264,54 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "trigger when", "when x happens", "each morning", "daily at",
     ],
     "MCP TOOLS": ["mcp", "tool server", "model context protocol"],
+    # 2026-09-04 documented the REST of the browser-agent surface in
+    # core/prompts.py (browse_for, find_cheapest, book_appointment, fill_form,
+    # browser_status/stop/open/reset_profile) but left this keyword list at its
+    # 2026-07 shape, so the section's OWN flagship examples never loaded it.
+    # Measured against the live prompt before this fix:
+    #   'find me the cheapest 2tb nvme'            -> BROWSER AGENT dropped
+    #   'book me a haircut friday afternoon'       -> dropped ("book a" is not
+    #                                                 a substring of "book me")
+    #   'fill that form in with my name and email' -> dropped ("fill the form"
+    #                                                 is not a substring of it)
+    #   'go read up on petg nozzle temps'          -> dropped
+    # i.e. all four sentences the body prints as "'X' -> [ACTION: Y]" reached
+    # the local model as an INDEX line and nothing else. The six phrases that
+    # did route only did so because they contain the literal header word
+    # "browser", not because of any keyword here.
+    # Why this matters more than an ordinary miss: PC_CONTROL_SAFETY_RULES
+    # (always shipped, in the core preamble) now tells the model that a
+    # near-miss is worse than nothing. With find_cheapest / browse_for /
+    # book_appointment / fill_form invisible, the closed list pushes these
+    # turns toward "I'm afraid I've no way to check that, sir." rather than the
+    # documented action. Keep every quoted trigger the body documents covered
+    # here — BrowserAgentRoutingRegressionTests in tests/test_prompt_router.py
+    # re-extracts them from the prompt and fails if one stops routing back.
     "BROWSER AGENT": [
         "browse", "web automation", "playwright", "go to the website",
         "fill the form", "book a", "order online", "navigate to",
+        # find_cheapest — the body's own example is 'find me the cheapest …',
+        # and it is the action that must win over web_search when prices are
+        # to be COMPARED across sites.
+        "cheapest", "best price", "lowest price", "compare prices",
+        "price compare", "shop around", "bargain", "how much is",
+        # browse_for — 'go read up on PETG nozzle temps and summarise it'.
+        # "look up" is deliberately here even though the body assigns 'look up
+        # X' to web_search: that contrast is only teachable if the section is
+        # in front of the model when he says it.
+        "read up", "look up", "search the web", "on the web", "summarise",
+        "summarize", "top three results",
+        # book_appointment — "book a" alone missed 'book me a haircut'.
+        "book me", "book an", "book the", "appointment", "reservation",
+        "reserve a", "reserve me", "make me a booking",
+        # fill_form — "fill the form" alone missed 'fill that form in with …'.
+        # Word-initial "fill" variants only; a bare "form" would fire on
+        # "information" / "format" / "platform" / "perform".
+        "fill in", "fill out", "fill that", "fill this", "fill my",
+        "fill the",
+        # browser_status — 'how's the browser doing' / 'what's it up to'. The
+        # first carries the header word; the second carries nothing at all.
+        "what's it up to", "whats it up to",
     ],
     "EMAIL TRIAGE": [
         "email", "inbox", "gmail", "outlook", "unread", "mail", "my emails",
@@ -397,6 +442,19 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     # never its instructions or trigger phrases. tests/test_prompt_router.py
     # fails when a recognised section has no routing, which is what caught
     # these — keep that test green rather than adding a section here silently.
+    # Verified live 2026-09-04: without these, "what microphone are you using"
+    # selected only MULTI-MONITOR APP LAUNCHING / PHONE NOTIFICATIONS / PHONE
+    # BRIDGE (the last two by the substring "phone" inside "microphone"), so
+    # what_microphone never reached the model while system_pulse did — which is
+    # precisely the mis-route the owner reported.
+    "AUDIO DEVICES — WHICH MICROPHONE AND SPEAKERS ARE IN USE": [
+        "microphone", "mic", "what mic", "which mic", "listening on",
+        "hearing me", "heard on", "heard me", "being heard", "picking me up",
+        "speaker", "speakers", "headphones", "earphone", "playing through",
+        "speaking through", "audio device", "audio devices", "input device",
+        "output device", "sound device", "what are you using to hear",
+        "what am i speaking into",
+    ],
     "EVENING / DAILY BRIEFING": [
         "evening briefing", "daily briefing", "brief me", "end of day",
         "before bed", "tomorrow", "what's tomorrow", "run the briefing",
@@ -427,6 +485,32 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "are you muted", "am i muted", "is your mic muted", "muted",
         "whisper model", "what model are you using for speech", "cuda or cpu",
         "why are you slow", "are you deaf", "can you hear me",
+    ],
+    # STATUS READ-BACKS — the "is it ON?" block (20 <feature>_status
+    # actions). Until 2026-09-05 its opening line was PROSE, not a header,
+    # so split_pc_control folded the whole block into SUIT DIAGNOSTICS and
+    # all 17 trigger phrases it documents missed it. Now that the header
+    # parses, these keywords are the other half: the user never says the
+    # action name, he asks a QUESTION ("is the workshop HUD showing", "are
+    # you listening in the background"), so route on the questions. A miss
+    # here is not a quiet degrade — PC_CONTROL_SAFETY_RULES ships its
+    # closed-list rule on every turn, so an unreached read-back comes back
+    # as "I've no way to check that, sir" for a capability that exists.
+    "STATUS READ-BACKS": [
+        # generic "is it on / still running" shapes
+        "is it on", "is it still", "is it running", "is that on",
+        "still on", "still up", "still running", "still going",
+        "still active", "are you still", "are you running",
+        # on-screen surfaces
+        "holographic", "holo overlay", "workshop hud", "workshop mode",
+        "printer camera", "chamber camera", "bambu camera", "arc reactor",
+        "stark ring", "status ring", "is the hud", "hud up", "hud showing",
+        # background watchers
+        "listening", "watching my screen", "are you watching", "ambient",
+        "extractor", "learned anything", "keeping an eye", "anticipation",
+        "predicting", "briefing me", "weekly digest", "banter",
+        "making jokes", "robot build", "smart home router", "not respond",
+        "didn't respond", "outbound gate", "gate armed", "draft preview",
     ],
 }
 

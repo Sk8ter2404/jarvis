@@ -477,5 +477,265 @@ class AmbientLearningRegressionTests(unittest.TestCase):
                          f"{orphans}")
 
 
+class BrowserAgentRoutingRegressionTests(unittest.TestCase):
+    """2026-09-04 reachability work documented the rest of the browser-agent
+    surface (browse_for / find_cheapest / book_appointment / fill_form and the
+    status/stop/open/reset_profile controls) in core/prompts.py but left
+    _SECTION_KEYWORDS["BROWSER AGENT"] at its 2026-07 shape. Result: all four
+    sentences the section itself prints as "'X' -> [ACTION: Y]" routed the
+    section OUT, so on the default slim local path the model saw those actions
+    as an INDEX line and nothing else. "book a" is not a substring of "book me
+    a haircut"; "fill the form" is not a substring of "fill that form in with".
+
+    This is worse than an ordinary keyword miss because the always-shipped
+    PC_CONTROL_SAFETY_RULES tell the model that a near-miss is worse than
+    nothing: with no browser action visible, the closed list steers a turn like
+    "find me the cheapest 2TB NVMe" toward "I've no way to check that, sir."
+    """
+
+    # The four flagship examples the BROWSER AGENT body prints verbatim, and
+    # the action each one is documented to produce.
+    FLAGSHIP = (
+        ("find me the cheapest 2tb nvme", "find_cheapest"),
+        ("go read up on petg nozzle temps and summarise it", "browse_for"),
+        ("book me a haircut friday afternoon", "book_appointment"),
+        ("fill that form in with my name and email", "fill_form"),
+    )
+
+    def setUp(self):
+        self.core, self.sections = pr.split_pc_control(FULL)
+        self.bodies = dict(self.sections)
+
+    def test_browser_agent_is_a_parsed_section(self):
+        self.assertIn("BROWSER AGENT", self.bodies)
+
+    def test_flagship_examples_load_the_browser_section(self):
+        misses = [q for q, _ in self.FLAGSHIP
+                  if "BROWSER AGENT" not in pr.select_sections(q, self.sections)[0]]
+        self.assertEqual(misses, [],
+                         f"the section's own documented examples must load it: "
+                         f"{misses}")
+
+    def test_flagship_examples_ship_their_action_name(self):
+        # The INDEX line is not enough: the model must see the action itself.
+        for q, action in self.FLAGSHIP:
+            slim = pr.slim_pc_control(q, FULL)
+            self.assertIn(action, slim,
+                          f"{q!r} must ship the {action!r} doc, not just the "
+                          f"capability INDEX")
+
+    def test_documented_arrow_examples_route_back(self):
+        # Bug-class invariant: in the BROWSER AGENT body every utterance
+        # printed immediately before an "-> [ACTION: ...]" arrow must pull the
+        # section back in. Any action documented here in future whose trigger
+        # phrasing outruns the keyword list fails this automatically.
+        text = " ".join(self.bodies["BROWSER AGENT"].split())
+        phrases = []
+        for seg in text.split("→")[:-1]:
+            # everything after the previous example's closing "]" is this
+            # arrow's trigger utterance(s), quoted and "/"-separated.
+            phrases.extend(_quoted_phrases(seg.rsplit("]", 1)[-1]))
+        self.assertGreaterEqual(
+            len(phrases), 8,
+            f"extraction should find the documented triggers, got {phrases}")
+        misses = []
+        for ph in phrases:
+            inc, _ = pr.select_sections(ph, self.sections)
+            if "BROWSER AGENT" not in inc:
+                misses.append(ph)
+        self.assertEqual(misses, [],
+                         f"documented BROWSER AGENT triggers that no longer "
+                         f"route back: {misses}")
+
+    def test_no_browser_turn_ships_a_browserless_prompt(self):
+        # Phrasing of the failure that survives future section reshuffles: a
+        # turn the prompt itself answers with a browser action may never reach
+        # the model with the closed-list rule and no browser action at all.
+        for q, action in self.FLAGSHIP:
+            slim = pr.slim_pc_control(q, FULL)
+            self.assertFalse(
+                "emit no action at all" in slim and action not in slim,
+                f"{q!r}: slim prompt carries the no-action rule but not the "
+                f"{action!r} it is documented to fire")
+
+
+# A "'phrase' -> [ACTION: name]" example line, whitespace-normalized first so
+# the many examples that wrap the arrow onto the next line still extract.
+_ARROW_EXAMPLE_RE = re.compile(
+    r"'([^']{2,80})'\s*\u2192\s*\[ACTION:\s*([A-Za-z_][A-Za-z0-9_]*)\]")
+
+# A line at column 0 opening with a run of two or more ALL-CAPS words. Every
+# such line in PC_CONTROL_PROMPT is a section header -- there is no column-0
+# prose in this prompt -- so one that did NOT parse is a pseudo-header.
+_CAPS_RUN_RE = re.compile(
+    r"^([A-Z][A-Z0-9'\-]{1,}(?:[ /+&\-\u2014]+[A-Z][A-Z0-9'\-]*){1,6})")
+
+
+class StatusReadBackRoutingRegressionTests(unittest.TestCase):
+    """2026-09-05: the STATUS READ-BACKS block (20 <feature>_status actions)
+    opened with a PROSE line -- mixed case, no trailing colon -- so _HEADER_RE
+    could not match it and split_pc_control folded the whole block into SUIT
+    DIAGNOSTICS, whose keywords are diagnostics-only. Measured before the fix:
+    0 of the 17 trigger phrases the block itself documents selected it, and the
+    dropped-section INDEX could not help because the INDEX lists section NAMES.
+    That gap was not a quiet degrade: PC_CONTROL_SAFETY_RULES ships its
+    closed-list rule on 100% of turns, so 'is the workshop HUD showing?' came
+    back as 'I've no way to check that, sir' while workshop_hud_status was
+    registered and documented. Same bug class as the audio_devices incident --
+    being IN the prompt is not the same as REACHING the model."""
+
+    def setUp(self):
+        self.core, self.sections = pr.split_pc_control(FULL)
+        self.names = [n for n, _ in self.sections]
+        self.bodies = dict(self.sections)
+
+    def test_status_read_backs_is_a_parsed_section(self):
+        self.assertIn("STATUS READ-BACKS", self.names,
+                      "the read-back block must be its own parsed section, not "
+                      "prose folded into whatever section precedes it")
+
+    def test_status_read_backs_has_keyword_routing(self):
+        self.assertTrue(pr._keywords_for("STATUS READ-BACKS"),
+                        "a parsed section with no keywords is reachable only by "
+                        "its header words -- which no user ever says")
+
+    def test_documented_phrases_load_the_block_and_ship_the_action(self):
+        body = self.bodies.get("STATUS READ-BACKS", "")
+        self.assertTrue(body, "no STATUS READ-BACKS section to check")
+        text = " ".join(body.split())
+        pairs = _ARROW_EXAMPLE_RE.findall(text)
+        self.assertGreaterEqual(len(pairs), 15,
+                                "extraction should find the documented examples")
+        misses = []
+        for phrase, action in pairs:
+            inc, _ = pr.select_sections(phrase, self.sections)
+            slim = pr.slim_pc_control(phrase, FULL)
+            if "STATUS READ-BACKS" not in inc or action not in slim:
+                misses.append((phrase, action))
+        self.assertEqual(misses, [],
+                         f"documented read-back phrases that do not reach their "
+                         f"own action: {misses}")
+
+    def test_read_back_home_loads_wherever_it_lives(self):
+        # Placement-independent, like the set_volume invariant: WHEREVER
+        # workshop_hud_status / ambient_listen_status are documented, the
+        # questions the owner actually asks must load that section.
+        for q, action in (("is the workshop HUD showing", "workshop_hud_status"),
+                          ("are you listening in the background",
+                           "ambient_listen_status"),
+                          ("is the weekly digest still running",
+                           "weekly_digest_status")):
+            homes = [h for h, b in self.sections if action in b]
+            self.assertTrue(homes, f"some section must document {action!r}")
+            inc, _ = pr.select_sections(q, self.sections)
+            for h in homes:
+                self.assertIn(h, inc,
+                              f"{q!r} must load {h!r} (the {action} home)")
+
+    def test_read_backs_are_not_folded_into_suit_diagnostics(self):
+        # The concrete mis-fold: the block's actions must not be answerable
+        # only through a section whose keywords are diagnostics-only.
+        self.assertNotIn("workshop_hud_status",
+                         self.bodies.get("SUIT DIAGNOSTICS", ""),
+                         "read-back actions folded back into SUIT DIAGNOSTICS")
+
+    def test_no_column_zero_caps_line_fails_to_parse(self):
+        # Bug-class invariant, and the net that would have caught this one:
+        # every column-0 line that opens with a run of ALL-CAPS words must have
+        # become a parsed section. The existing header-shaped guard only looks
+        # for a '(' or a trailing ':', which a prose pseudo-header has neither
+        # of. Verified 2026-09-05 to flag exactly the defective line and
+        # nothing else across the whole prompt.
+        parsed = {h.strip() for h, _ in self.sections}
+        orphans = []
+        for ln in pr._join_wrapped_headers(FULL.split("\n")):
+            if not ln or ln != ln.lstrip():
+                continue
+            m = _CAPS_RUN_RE.match(ln)
+            if not m:
+                continue
+            head = m.group(1).strip()
+            if any(head.startswith(p) or p.startswith(head) for p in parsed):
+                continue
+            orphans.append(ln[:80])
+        self.assertEqual(orphans, [],
+                         f"column-0 ALL-CAPS lines that never became sections "
+                         f"(pseudo-headers -- their block is unreachable): "
+                         f"{orphans}")
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class LivenessIsNotUnreadableStateRegressionTests(unittest.TestCase):
+    """2026-09-05 over-refusal review of the 2026-09-04 reachability work.
+
+    That work added 'can you hear me' and 'are you deaf' to the keyword list
+    for MUTE / DEAF / SLOW / WHISPER - UNREADABLE STATE, a section whose whole
+    body says "there is no token to emit ... Say plainly that you cannot check
+    it". So the most basic question a voice assistant ever receives was routed
+    straight into a decline block, reinforced by the always-shipped preamble
+    rule ("Say plainly you cannot check it: 'I'm afraid I've no way to check
+    that, sir.'"). Grepping core/prompts.py for 'hear me' returned NOTHING --
+    there was no counter-instruction anywhere saying the true answer is yes.
+
+    Deleting the two keywords would not have fixed it: 'deaf' and 'slow' are
+    HEADER words, so select_sections pulls this section in on 'are you deaf'
+    with the keyword gone. The fix has to live in the prompt TEXT, which is
+    what these tests pin."""
+
+    LIVENESS_TURNS = ("jarvis, can you hear me", "can you hear me now",
+                      "are you deaf", "hey jarvis are you there")
+    # Questions that genuinely have no read-back and must still be declined.
+    UNREADABLE_TURNS = ("are you muted", "is echo cancellation on",
+                        "what whisper model are you using")
+
+    def setUp(self):
+        self.core, self.sections = pr.split_pc_control(FULL)
+        self.bodies = dict(self.sections)
+        self.homes = [n for n in self.bodies if "UNREADABLE STATE" in n]
+
+    def test_unreadable_state_section_is_parsed(self):
+        self.assertEqual(len(self.homes), 1,
+                         f"expected exactly one unreadable-state section, "
+                         f"got {self.homes}")
+
+    def test_liveness_exception_is_read_before_the_decline(self):
+        body = self.bodies[self.homes[0]]
+        low = body.lower()
+        self.assertIn("can you hear me", low,
+                      "the section that 'can you hear me' routes into must "
+                      "say what the answer is")
+        self.assertLess(low.index("can you hear me"),
+                        body.index("No action reads any of the following"),
+                        "the liveness exception must come BEFORE the "
+                        "no-handler decline, not after it")
+
+    def test_liveness_answer_ships_on_every_turn(self):
+        # Not every liveness phrasing routes here -- 'are you there' loads
+        # WAKE LISTENER -- so the carve-out must also ride in the core
+        # preamble, which is where the competing decline rule already lives.
+        self.assertIn("whether you HEARD him", self.core,
+                      "the always-shipped safety rules must carve liveness "
+                      "out of the no-way-to-check answer")
+
+    def test_liveness_turns_carry_the_answer_not_just_the_refusal(self):
+        for q in self.LIVENESS_TURNS:
+            slim = pr.slim_pc_control(q, FULL)
+            self.assertIn("whether you HEARD him", slim,
+                          f"{q!r}: slim prompt must tell the model it CAN "
+                          f"answer this")
+
+    def test_carveout_is_narrow_genuine_unreadable_state_still_declines(self):
+        for q in self.UNREADABLE_TURNS:
+            slim = pr.slim_pc_control(q, FULL)
+            self.assertIn("there is no token to emit", slim,
+                          f"{q!r}: must still get the honest no-handler "
+                          f"answer -- the carve-out is liveness only")
+
+    def test_microphone_turn_still_reaches_audio_devices(self):
+        # Guard the change that this review is auditing: the carve-out must
+        # not disturb the 2026-09-04 what_microphone routing fix.
+        slim = pr.slim_pc_control("what microphone are you using", FULL)
+        self.assertIn("what_microphone", slim)

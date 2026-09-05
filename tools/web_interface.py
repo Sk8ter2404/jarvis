@@ -74,6 +74,7 @@ import os
 import re
 import select
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -137,6 +138,17 @@ _camera_stream_clients = [0]
 _camera_stream_clients_lock = threading.Lock()
 
 
+def _camera_streams_saturated() -> bool:
+    """True when every MJPEG slot is taken, so the NEXT /api/camera-stream is
+    refused with 503 (see _stream_camera). One int read under the counter's own
+    lock: no I/O, nothing to block on, safe to call from the reason path.
+
+    This is the ONE thing the server actually knows about a refused stream, and
+    _camera_off_reason exists to say only what is established."""
+    with _camera_stream_clients_lock:
+        return _camera_stream_clients[0] >= _CAMERA_STREAM_MAX_CLIENTS
+
+
 class UnknownCamError(ValueError):
     """?cam= named something that is not one of _CAMERA_PREVIEW_CAMS."""
 
@@ -169,6 +181,486 @@ def _preview_stat(path: str):
     except OSError:
         return None
     return st.st_mtime_ns, st.st_size, time.time() - st.st_mtime
+
+
+def _camera_live_map(cfg: dict) -> dict:
+    """{cam: bool} — is each tile's preview file CURRENT right now.
+
+    WHY THIS EXISTS (measured in Chrome 2026-09-05, see the MID-STREAM DEATH
+    note in the page script): a multipart/x-mixed-replace <img> gets NO DOM
+    event when the stream ends, so the page cannot notice a camera that dies
+    mid-stream on its own. This is the ONE fact it was missing, and it is
+    answered by three os.stat calls through the SAME (_preview_stat,
+    _CAMERA_PREVIEW_STALE_S) pair /api/camera-preview, /api/camera-stream and
+    _camera_off_reason use — so the supervisor can never disagree with the
+    moment _stream_camera decides to close.
+
+    Deliberately stat-ONLY: this sits on the dashboard's poll path, so it must
+    never touch the reason ladder or the ~0.7 s device-enumeration probe. It
+    reports freshness and nothing else; the WORDS still come from
+    /api/camera-reason, on the down path only.
+    """
+    out = {}
+    for cam in _CAMERA_PREVIEW_CAMS:
+        try:
+            info = _preview_stat(_preview_path_for(cfg, cam))
+        except UnknownCamError:          # unreachable: cams come from the tuple
+            info = None
+        out[cam] = info is not None and info[2] <= _CAMERA_PREVIEW_STALE_S
+    return out
+
+
+# -- WHY IS THIS TILE BLANK? (one source of truth) ---------------------------
+# The owner asked for the words "Kinect not detected" on the tile. Measured on
+# his machine 2026-09-04 23:09-23:28: the OS enumerated the sensor fine the whole
+# time (Xbox NUI Sensor / WDF KinectSensor Interface 0 / Microphone Array, all
+# Status OK) while the bridge streamed nothing for six minutes, and then it
+# started working. So "not detected" would have been FALSE at every moment of the
+# outage he was staring at, and it would have sent him to check a cable that was
+# already fine. This module therefore treats "no picture" as a LADDER of states,
+# each rung gated on a symbol that actually establishes it, and hands the owner
+# his literal string ONLY on the rung where device enumeration came back empty.
+#
+# The rules the ladder obeys:
+#   * "not detected" requires a COMPLETED enumeration that found nothing. A probe
+#     that failed to run yields None (unknown), never False.
+#   * "not powered" is never asserted. The OS cannot see mains power, so the
+#     no-frames rung is worded as GUIDANCE ("check its power adapter") and keeps
+#     the other candidate cause (another app holding the sensor) in the same
+#     sentence, because those two are genuinely indistinguishable from here.
+#   * when two states cannot be told apart, the message says the ambiguous thing.
+#     There are two separate no-frames rungs for exactly that reason: one that
+#     may say "plugged in" because enumeration proved it, and one that may not.
+#   * enumeration is ASYMMETRIC, and the messages respect that. A device that
+#     enumerates PRESENT is physically attached (-PresentOnly means attached
+#     right now), so the present-rung may say "plugged in". A sweep that matched
+#     NOTHING establishes only that Windows currently enumerates no Kinect. The
+#     v2's USB3 adapter carries the data link AND the mains brick, so a brick
+#     switched off or dead - and equally a removed, blocked or disabled driver
+#     stack - stops the whole adapter enumerating while the cable is still fully
+#     seated. "Kinect not detected" therefore names the OBSERVATION and never
+#     asserts that nothing is plugged in: that claim would send the owner to
+#     re-seat a cable that is fine while the power switch is the actual fault.
+#   * left/right webcams never consult any Kinect signal, so a dead Kinect can
+#     never change (or blank) their tiles.
+
+# How long a device-enumeration result is reused. The probe is a powershell.exe
+# spawn measured at 0.61-0.78 s on this box, so it must never sit on a hot path.
+# 20 s is the smallest TTL at which a tile stuck in the dashboard's 4 Hz error
+# retry still spawns at most 3 processes a minute, while a replug the owner does
+# at the desk shows up before he has walked back to the keyboard. It is consulted
+# ONLY on the error path (see /api/camera-reason), so while a camera is streaming
+# normally this probe never runs at all.
+_KINECT_ENUM_TTL_S = 20.0
+_KINECT_ENUM_TIMEOUT_S = 8.0
+_kinect_enum_cache = {"ts": 0.0, "present": None, "names": (), "how": "never run"}
+_kinect_enum_lock = threading.Lock()
+
+# Match on BOTH friendly names and raw Kinect USB hardware ids: a sensor whose
+# driver failed to install has no recognisable FriendlyName but still enumerates
+# its USB node, and calling that "not detected" would be the same lie in a new
+# costume. -PresentOnly is the load-bearing flag - the PnP Enum registry keeps a
+# key for every device the machine has EVER seen, so an unfiltered sweep would
+# happily report a Kinect that was unplugged months ago.
+_KINECT_PNP_PS = (
+    "$ErrorActionPreference='SilentlyContinue';"
+    "Get-PnpDevice -PresentOnly | Where-Object {"
+    " $_.FriendlyName -like '*Kinect*'"
+    " -or $_.FriendlyName -like '*NUI Sensor*'"
+    " -or $_.InstanceId -like '*VID_045E&PID_02C4*'"
+    " -or $_.InstanceId -like '*VID_045E&PID_02D8*'"
+    " -or $_.InstanceId -like '*VID_045E&PID_02D9*'"
+    " -or $_.InstanceId -like '*VID_045E&PID_02BB*'"
+    " -or $_.InstanceId -like '*VID_045E&PID_02AE*' } |"
+    # THE PROJECTION MUST EMIT SOMETHING NON-EMPTY FOR EVERY MATCH. Projecting
+    # $_.FriendlyName alone silently undid the five InstanceId clauses above:
+    # they exist precisely for a sensor whose driver failed to bind, and such a
+    # node enumerates with a NULL FriendlyName. The pipeline then exited 0 with
+    # no printable line, _probe_kinect_devices' `if ln.strip()` dropped it, and
+    # a plugged-in, enumerated Kinect read as present=False - the one and only
+    # reading that unlocks the "not_detected" rung. Measured on the owner's box
+    # 2026-09-04: Get-PnpDevice -PresentOnly does return present nodes whose
+    # FriendlyName is $null, so this was not hypothetical. Fall back
+    # to the InstanceId, then to a literal, so a matched device can NEVER
+    # vanish between the filter and stdout.
+    " ForEach-Object {"
+    " $n = $_.FriendlyName;"
+    " if ([string]::IsNullOrWhiteSpace($n)) { $n = $_.InstanceId };"
+    " if ([string]::IsNullOrWhiteSpace($n)) { $n = 'unnamed present device' };"
+    " $n }"
+)
+
+
+def _probe_kinect_devices() -> tuple:
+    """Run the OS device-enumeration probe ONCE. Returns (present, names, how):
+
+      present True  - the sweep completed and matched at least one live device
+      present False - the sweep completed and matched NOTHING (the only reading
+                      that may ever produce the words "Kinect not detected")
+      present None  - the sweep did not complete (not Windows, no powershell,
+                      timed out, non-zero exit). UNKNOWN, never "no".
+
+    Never raises. Kept separate from the cache so a test can patch just this."""
+    if sys.platform != "win32":
+        return None, (), "not windows"
+    try:
+        proc = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive",
+             "-Command", _KINECT_PNP_PS],
+            capture_output=True, text=True, timeout=_KINECT_ENUM_TIMEOUT_S,
+            # No console flash over the owner's work - the same guard the
+            # monolith puts on every subprocess it spawns from the main loop.
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as e:
+        return None, (), "probe failed: %s" % type(e).__name__
+    if proc.returncode != 0:
+        # A sweep that errored proves nothing about the hardware.
+        return None, (), "probe exit %s" % proc.returncode
+    names = tuple(ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip())
+    return bool(names), names, "Get-PnpDevice -PresentOnly"
+
+
+def _kinect_devices_present(now: float | None = None) -> tuple:
+    """TTL-cached (present, names, how) from _probe_kinect_devices.
+
+    Concurrency: three tiles can fire their error handlers in the same frame, so
+    the probe sits behind a lock with a SHORT acquire timeout - a caller that
+    loses the race returns whatever the cache already holds (unknown on a cold
+    start) instead of queueing behind a second-long subprocess. Being briefly
+    vague is fine; blocking three dashboard workers on powershell is not."""
+    t = time.time() if now is None else now
+    c = _kinect_enum_cache
+    if c["how"] != "never run" and (t - c["ts"]) < _KINECT_ENUM_TTL_S:
+        return c["present"], c["names"], c["how"]
+    if not _kinect_enum_lock.acquire(timeout=0.05):
+        return c["present"], c["names"], c["how"]
+    try:
+        if c["how"] != "never run" and (time.time() - c["ts"]) < _KINECT_ENUM_TTL_S:
+            return c["present"], c["names"], c["how"]   # a winner just refreshed it
+        present, names, how = _probe_kinect_devices()
+        c.update({"ts": time.time(), "present": present, "names": names, "how": how})
+        return present, names, how
+    finally:
+        _kinect_enum_lock.release()
+
+
+def _kinect_health() -> dict | None:
+    """audio.kinect_bridge.get_stream_health(), or None when not cheaply reachable.
+
+    WHY sys.modules AND NOT AN IMPORT - the identical reasoning as
+    _air_mouse_status() below, which is the precedent this follows: the web
+    interface runs IN-PROCESS with the JARVIS main loop, so when the bridge is
+    part of this build it is already in sys.modules under that key. Importing it
+    here instead would drag pykinect2/comtypes into a bare-CI or cloud-only web
+    process, and would make "the module is absent" indistinguishable from "the
+    sensor is dead". None therefore means UNKNOWN and the ladder says so, rather
+    than inventing a failure.
+
+    WHY get_stream_health() AND NOT available()/get_runtime() - those two OPEN
+    the sensor, and the winner of the bridge's open lock runs a retry gauntlet of
+    up to ~16 s inline (kinect_bridge._open_runtime_locked); that gauntlet
+    tripped the JARVIS main-loop watchdog on 2026-07-10. get_stream_health() is
+    pure cell reads: no lock, no I/O, no open attempt."""
+    try:
+        kb = sys.modules.get("audio.kinect_bridge")
+        getter = getattr(kb, "get_stream_health", None) if kb else None
+        if callable(getter):
+            h = getter()
+            if isinstance(h, dict):
+                return h
+    except Exception:
+        pass
+    return None
+
+
+# The rungs, kept as data so this module, the tests and the dashboard JS cannot
+# drift into three different vocabularies for the same state.
+_CAMERA_REASONS = {
+    # THIS ANSWER IS ONLY EVER READ INSIDE AN EMPTY BOX. /api/camera-reason is
+    # fetched from exactly one place - a tile's `error` handler - and its message
+    # is written into .camoff, the dashed placeholder that is by definition
+    # showing because there is no picture. "Live." there asserted the opposite of
+    # what the owner was looking at, which is the same class of lie as "not
+    # detected" on a sensor Windows can see.
+    #
+    # What a fresh preview file actually establishes is: the camera IS producing
+    # frames, and this page is not showing them - so the fault is the page's
+    # video connection, not the camera. WHICH fault (a refused stream, an aborted
+    # connection, the browser's per-origin cap) is NOT established, so none is
+    # named; the tile says the ambiguous thing and stops there.
+    "live":            ("Camera is sending pictures, but this page is not "
+                        "receiving them - reconnecting."),
+    # The one sub-case the server CAN establish, because it is the thing the
+    # server itself just did: every stream slot is taken, so /api/camera-stream
+    # is refusing new clients (503) right now. Named separately because it is the
+    # only rung with an action the owner can take from where he is sitting, and
+    # because the dashboard uses it to stop asking (see explainTile).
+    "stream_busy":     ("Camera is sending pictures, but every video connection "
+                        "slot is in use - close other dashboard tabs."),
+    "webcam_off":      "Webcam off - no picture is being sent right now.",
+    "disabled":        "Kinect is switched off in JARVIS settings.",
+    # THE OWNER'S LITERAL STRING. Reachable from exactly one place: a completed
+    # enumeration that matched nothing. Never from a bridge signal. It stops at
+    # what that sweep established - Windows enumerates no Kinect device - and
+    # does NOT go on to say nothing is plugged in, which an empty sweep cannot
+    # establish (the asymmetry note above; a Kinect whose mains brick is off
+    # stops enumerating with its cable still seated).
+    "not_detected":    "Kinect not detected - Windows sees no Kinect device.",
+    "no_frames":       ("Kinect is plugged in but sending no pictures - check its "
+                        "power adapter is on, or if another app is using it."),
+    "no_frames_unverified": ("Kinect is sending no pictures - check it is plugged "
+                             "in, its power adapter is on, and no other app has it."),
+    # TWO rungs, not one, because the bridge genuinely tells them apart and they
+    # send the owner to two different places. Both name the PYTHON PACKAGE, which
+    # is what an import failure establishes; neither names the Kinect DRIVER,
+    # which the bridge never reached (see the pykinect2 rung in the ladder).
+    "pykinect2_missing":  ("JARVIS's Kinect Python package (pykinect2) is not installed, "
+                           "so JARVIS never reached the Kinect driver - fix it with: "
+                           "pip install pykinect2."),
+    "pykinect2_unusable": ("JARVIS's Kinect Python package (pykinect2) would not load, "
+                           "so JARVIS never reached the Kinect driver - hover this "
+                           "message for the error."),
+    # An open that is STILL RUNNING is not a failure, and dressing it as one is
+    # the same class of lie as the rungs above: nothing has been established
+    # except that no attempt has FINISHED. Present tense, no cause named, and it
+    # stays true even if the cell is a few seconds stale - the worst it can be is
+    # "not finished yet", never "it broke".
+    "open_in_progress": ("Kinect is still being opened - JARVIS has not finished "
+                         "trying yet."),
+    "open_failed":     "JARVIS could not open the Kinect.",
+    # NOT "nothing has probed it yet". That is only ONE of the two situations
+    # that produce this exact reading, and no symbol the bridge publishes tells
+    # them apart (see the rung in the ladder). Names both, asserts neither, and
+    # blames no hardware - the reading is equally consistent with a perfectly
+    # healthy sensor nobody has asked for yet.
+    "not_open_no_error": ("Kinect is not open right now and JARVIS recorded no "
+                          "error - either nothing has probed the sensor yet, or a "
+                          "connection that was working has since dropped."),
+    "worker_stopped":  "Kinect is connected, but the JARVIS worker reading it stopped.",
+    # Reachable ONLY from color_pending True. Color is the single stream this
+    # tile renders, so only color may claim the picture is being produced.
+    "frames_not_shown": "Kinect is running, but its picture is not reaching this page.",
+    # The sensor is alive on a stream this tile does NOT display (body/depth),
+    # which establishes the Kinect is streaming and establishes NOTHING about the
+    # color camera. Says the ambiguous thing on purpose: color_pending False is a
+    # failure to confirm, not proof the camera died, so the message names both
+    # candidates and picks neither. Never asserts the picture reaches the page.
+    "color_unconfirmed": ("Kinect is running and sending data, but no new camera "
+                          "picture has been confirmed - could be the color camera "
+                          "or this page."),
+    "open_quiet":      "Kinect is connected but no new pictures are arriving.",
+    "unknown":         "Kinect state unknown.",
+    "no_path":         "No preview is configured for this camera.",
+}
+
+# The bridge's IN-FLIGHT marker, matched as a substring exactly the way the
+# "no frames" / "pykinect2 " markers are. Named, rather than inlined at the rung,
+# so the test that greps audio/kinect_bridge.py for it fails loudly the day that
+# string is reworded there - a marker matched in one copy and reworded in the
+# other is the stale-duplicate shape this ladder keeps getting bitten by.
+# SOURCE: kinect_bridge._open_runtime_locked's lost-acquire return,
+#   return None, (_open_error[0] or "Kinect open already in progress")
+_KINECT_OPEN_IN_PROGRESS = "open already in progress"
+
+
+def _reason(cam: str, state: str, detail: str | None = None) -> dict:
+    """One rung as a payload. ``message`` always comes from _CAMERA_REASONS, so a
+    state can never ship with hand-written prose that drifts from the table."""
+    out = {"cam": cam, "state": state,
+           "message": _CAMERA_REASONS.get(state, _CAMERA_REASONS["unknown"])}
+    if detail:
+        out["detail"] = detail
+    return out
+
+
+def _camera_off_reason(cfg: dict, cam: str) -> dict:
+    """Why ``cam``'s tile has no picture: {"cam","state","message"[,"detail"]}.
+
+    THE one place that answers this question, for every tile. Raises
+    UnknownCamError for an unknown ?cam= (the route already handles that).
+
+    Freshness is decided by _preview_stat + _CAMERA_PREVIEW_STALE_S - the SAME
+    pair /api/camera-preview and /api/camera-stream use to decide their 404 - so
+    the explanation can never disagree with the thing it is explaining."""
+    path = _preview_path_for(cfg, cam)                 # may raise UnknownCamError
+    cam = (cam or "").strip().lower()
+    if not path:
+        return _reason(cam, "no_path")
+    info = _preview_stat(path)
+    fresh = info is not None and info[2] <= _CAMERA_PREVIEW_STALE_S
+    if fresh:
+        # The file IS current, so the camera is not why this tile is blank - the
+        # page's video connection is. Claiming the camera is off here would be a
+        # lie; so is the bare word "Live." in a box that has no picture in it.
+        # Split, because the cap is the one sub-case the server can prove: with
+        # every slot taken, _stream_camera is answering 503 right now, and the
+        # tile is told so (and stops re-arming a stream it cannot get).
+        if _camera_streams_saturated():
+            return _reason(cam, "stream_busy")
+        return _reason(cam, "live")
+    if cam != "kinect":
+        # Webcams expose no health surface at all, so "no recent frame" is
+        # everything that is actually established. Deliberately routed through NO
+        # Kinect signal: a dead Kinect must never alter a webcam's tile.
+        return _reason(cam, "webcam_off")
+
+    health = _kinect_health()
+    # RUNG 1 - the switch. With KINECT_ENABLED off the bridge never opens the
+    # sensor at all, so whether one is plugged in is not why this tile is blank.
+    if health is not None and not health.get("enabled", True):
+        return _reason(cam, "disabled")
+
+    # RUNG 2 - the only rung that may say "not detected", and only on a COMPLETED
+    # sweep that matched nothing. present None (the probe could not run) falls
+    # through to the bridge signals rather than guessing.
+    present, _names, how = _kinect_devices_present()
+    if present is False:
+        return _reason(cam, "not_detected", detail="device enumeration: %s" % how)
+
+    if health is None:
+        return _reason(cam, "unknown",
+                       detail="audio.kinect_bridge is not loaded in this process")
+
+    err = (health.get("open_error") or "").strip()
+    detail = err or None
+    if not health.get("open"):
+        # RUNG 3 - opened but streamed nothing: the plugged-in-but-no-picture
+        # case, and the one the owner actually hit tonight. Unpowered, unplugged
+        # mid-session and held-by-another-process are indistinguishable from
+        # here, so the message keeps every candidate and asserts none of them.
+        if "no frames" in err:
+            state = "no_frames" if present else "no_frames_unverified"
+            return _reason(cam, state, detail=detail)
+        # RUNG 4 - the bridge could not load the pykinect2 PYTHON PACKAGE. Its
+        # two strings both start "pykinect2 " (kinect_bridge, the
+        # import_pykinect2() call in _open_runtime_locked): "pykinect2 not
+        # installed - pip install pykinect2" on ImportError, and "pykinect2
+        # failed to load: {type}: {e}" on anything else - a broken comtypes, a
+        # venv rebuilt against a new Python, a corrupted site-packages.
+        #
+        # WHY THIS MUST NOT SAY "DRIVER" (2026-09-05). Both are pip-level import
+        # failures INSIDE JARVIS, raised before PyKinectRuntime is ever
+        # constructed, so nothing about the Windows Kinect driver has been
+        # established - and enumeration two rungs up may have just returned
+        # present True, i.e. the driver is demonstrably fine. The old single
+        # "Kinect driver software is missing" rung sent the owner off to
+        # reinstall the Kinect SDK (an hour, a reboot) when the fix was one pip
+        # command, and the true text survived only in the hover title. Name the
+        # dependency that actually failed, and nothing else.
+        if err.startswith("pykinect2 "):
+            # "not installed" is the ImportError branch: the package is absent.
+            if "not installed" in err:
+                return _reason(cam, "pykinect2_missing", detail=detail)
+            # Anything else got FURTHER than absent but still would not load.
+            # WHY it died lives in the exception, which we do not interpret - and
+            # this is also where an unrecognised future pykinect2 string lands,
+            # so the fallback is the hedged message, never the specific one.
+            return _reason(cam, "pykinect2_unusable", detail=detail)
+        # RUNG 5 - an open that is STILL IN FLIGHT, which is not a completed
+        # failure at all. kinect_bridge._open_runtime_locked hands
+        # "Kinect open already in progress" to whoever LOSES the 0.5 s acquire on
+        # its open-attempt lock while the winner is inside the ~16 s
+        # verify/retry gauntlet, and get_runtime() then feeds that string to
+        # _publish_open_failure, which latches it into the SAME open_error cell a
+        # real failure uses (with the short 5 s cooldown, since it is not a
+        # no-frames verdict). Nothing about the sensor has been established here:
+        # the only fact is that another thread got there first.
+        #
+        # WHY IT MATTERS (2026-09-05). At boot this is the NORMAL reading - the
+        # always-on body pump is in the gauntlet, the preview compositor's
+        # get_color_bgr() -> get_runtime() loses the race, and the preview file is
+        # still last session's, so the tile fires its error handler and asks
+        # precisely then. Reported as open_failed it said "JARVIS could not open
+        # the Kinect." during an open that went on to SUCCEED (measured
+        # 2026-09-04 23:16: "[kinect] sensor live after 2 open attempts") - a
+        # first-frame delay rendered as a hardware fault, which is exactly the
+        # wrong place to send the owner. Checked AFTER the two markers above: the
+        # bridge returns a previously latched error in preference to this string,
+        # so an err carrying "no frames"/"pykinect2 " is a real completed
+        # verdict and keeps its own rung.
+        if _KINECT_OPEN_IN_PROGRESS in err:
+            return _reason(cam, "open_in_progress", detail=detail)
+        if err:
+            return _reason(cam, "open_failed", detail=detail)
+        # RUNG 6 - open False with NO recorded error. This is TWO situations
+        # wearing one reading, and NOTHING in the health dict separates them
+        # (reproduced against the real bridge 2026-09-05):
+        #   * nothing has probed the sensor yet - the cold-start reading; and
+        #   * a sensor that opened, streamed, and then DIED mid-session.
+        #     kinect_bridge._publish_runtime clears _open_error[0] on every
+        #     successful open, and reset_if_body_stale then drops _runtime[0] on
+        #     the both-planes-stale path WITHOUT writing an error - so the
+        #     instant the owner's "skeleton rendered for a while then stopped"
+        #     intermittent fires, health reads open False / open_error None,
+        #     exactly like a cold start, and keeps reading that way for the
+        #     whole ~16 s reopen gauntlet.
+        # The old message ("JARVIS has not tried the sensor yet") asserted the
+        # first one, so the tile sent the owner hunting a boot problem while his
+        # Kinect was mid-death. get_stream_health's own docstring codifies the
+        # same inference ("(open False, open_error None) means NOT YET PROBED");
+        # it is wrong there too, and neither copy can establish it.
+        #
+        # DO NOT try to re-derive the distinction from the other health keys:
+        # set_enabled(True) calls start_body_pump(), which sets pump_alive AND
+        # seeds BOTH frame clocks (so body_age_s/color_age_s go non-None) with
+        # no sensor ever opened - a cold start and a torn-down runtime read the
+        # same on all of them. Separating the two needs a has-ever-opened flag
+        # the bridge does not publish; until it does, the tile says the
+        # ambiguous thing rather than picking the likelier one.
+        #
+        # detail carries the one thing actually OBSERVED (it lands in the tile's
+        # hover title): a Kinect preview frame was written at that mtime, or
+        # there is no preview file at all. Evidence, not a verdict - the file
+        # outlives the process, so it dates the last frame, not this session.
+        age = None if info is None else info[2]
+        return _reason(cam, "not_open_no_error", detail=(
+            "no runtime open, no recorded open error; last %s preview frame: %s"
+            % (cam, "none on disk" if age is None else "%.1fs ago" % age)))
+
+    # open True from here: a runtime exists, so the sensor answered at least once.
+    if not health.get("pump_alive", True):
+        return _reason(cam, "worker_stopped")
+    if health.get("color_pending"):
+        # COLOR ONLY. color_pending True is poll-independent proof a NEW COLOR
+        # frame is arriving, and COLOR is the one and only stream this tile
+        # renders (bobert_companion._compose_kinect_preview builds the JPEG from
+        # get_color_bgr), so the gap really is downstream of the sensor.
+        #
+        # WHY NOT any(color, body, depth) - 2026-09-05. That is what this rung
+        # used to read, and it let a stream the tile does not display assert that
+        # the picture was being produced:
+        #   * DEPTH is pinned pending FOREVER. _depth_time_seen only advances
+        #     inside get_depth(), and nothing polls depth on a schedule (the
+        #     bridge says so itself at audio/kinect_bridge.py: "nothing polls
+        #     depth on a schedule; body has the 30 Hz pump"). Its only callers
+        #     are the on-demand kinect_status voice probe and the hand-depth
+        #     heuristic. So while the sensor emits depth at all, `t > cell[0]`
+        #     never stops being true.
+        #   * BODY is the documented BODY-but-no-COLOR reopen - "the skeleton
+        #     stayed dark while gestures worked" - the exact failure the bridge's
+        #     require_color=True flag exists to reject.
+        # Either one made health{open, pump_alive, color_pending=False,
+        # depth_pending=True} render "Kinect is running, but its picture is not
+        # reaching this page." on a DEAD COLOR CAMERA, sending the owner to debug
+        # his browser. A rung that judges a COLOR tile reads color_pending.
+        return _reason(cam, "frames_not_shown")
+
+    others = [k for k in ("body_pending", "depth_pending") if health.get(k)]
+    if others:
+        # The sensor is demonstrably alive - a non-color stream is delivering new
+        # frames - but COLOR, the only stream this tile shows, is unconfirmed.
+        # That is a FAILURE TO ESTABLISH, not a dead camera: color_pending False
+        # is also the normal reading in the instant after the preview composer
+        # consumed the frame. Both candidates stay on the table, neither is
+        # asserted, and the detail carries the evidence into the tooltip.
+        return _reason(cam, "color_unconfirmed",
+                       detail="new frames on %s; color_pending false"
+                              % ", ".join(k[:-len("_pending")] for k in others))
+    # Nothing pending is NOT proof of death - it is also the normal reading in the
+    # instant after the 30 Hz body pump consumed the frame. Hence the hedged,
+    # present-tense "no new pictures are arriving", with no cause named.
+    return _reason(cam, "open_quiet")
 
 
 # Reply-wait bounds. The main loop can take a while on a cloud LLM turn, so we
@@ -1493,7 +1985,19 @@ class _Handler(BaseHTTPRequestHandler):
           * missing or already-stale file  -> 404 before any body, so the <img>
             fires `error` and the tile shows its 'off' placeholder immediately;
           * the frame going stale mid-stream (camera switched off) -> CLOSE the
-            stream, which fires the same `error` on the client;
+            stream. THE CLIENT IS NOT TOLD. This used to claim the close "fires
+            the same `error` on the client"; measured against a real Chrome
+            2026-09-05, that is false, and three different endings were tried:
+                clean close after a complete part -> events [load @413ms] and
+                    nothing after it; img.complete stayed true, naturalWidth 1
+                truncated final part             -> the same single load, no
+                    error, and naturalWidth silently fell to 0
+                boundary + headers then close    -> the same single load
+            `load` fires ONCE, just after the FIRST frame — not per frame, and
+            not at the close — so there is no ending this route can produce that
+            the DOM will report. The tile is therefore supervised on the
+            client's own clock against /api/camera-live (_camera_live_map),
+            which answers with this same staleness rule;
           * we only OPEN the file when its (mtime_ns, size) actually changed, so
             we read exactly as often as JARVIS writes, never at the poll rate.
             That matters on Windows: the producer publishes via os.replace, and a
@@ -1686,6 +2190,41 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._send_bytes(data, "image/jpeg")
             except Exception:
                 return self._send_json({"error": "no preview"}, code=404)
+
+        if path == "/api/camera-reason":
+            if not self._authorized(query, is_page=False):
+                return self._unauthorized()
+            # WHY A SEPARATE ENDPOINT rather than putting the text in the 404
+            # body of camera-preview/camera-stream: an <img> DISCARDS the body of
+            # a failed load. The tile learns of the failure only through the DOM
+            # `error` event, which carries nothing, so a second fetch is the only
+            # mechanism that can put words in the placeholder at all. It also
+            # keeps the cost strictly on the error path - the streaming path
+            # never touches the ladder, and the device probe behind it never runs
+            # while a camera is working.
+            try:
+                r = _camera_off_reason(cfg, query.get("cam", [""])[0] or "")
+            except UnknownCamError:
+                return self._send_json({"error": "unknown cam"}, code=404)
+            except Exception as e:   # never let the explainer break the page
+                return self._send_json({"cam": query.get("cam", [""])[0] or "",
+                                        "state": "unknown",
+                                        "message": _CAMERA_REASONS["unknown"],
+                                        "detail": f"{type(e).__name__}: {e}"})
+            return self._send_json(r)
+
+        if path == "/api/camera-live":
+            if not self._authorized(query, is_page=False):
+                return self._unauthorized()
+            # THE TILE'S ONLY WAY TO NOTICE A MID-STREAM DEATH. An MJPEG <img>
+            # is told nothing when the server closes its stream (measured, see
+            # _stream_camera), so the dashboard asks here instead of waiting for
+            # an event that never comes. Three stats, no ladder, no device
+            # probe: it runs about once a second while the Camera tab is open,
+            # which is a quarter of what the still-polling design it replaced
+            # was already paying, and nothing at all on every other tab.
+            return self._send_json({"stale_after": _CAMERA_PREVIEW_STALE_S,
+                                    "cams": _camera_live_map(cfg)})
 
         if path == "/api/camera-stream":
             if not self._authorized(query, is_page=False):
@@ -2010,9 +2549,15 @@ def _dashboard_html(token: str) -> str:
           border-radius:10px; padding:8px; }}
   .camtile img {{ width:100%; border-radius:6px; background:#04070c;
           display:none; }}
+  /* The placeholder is now the tile's EXPLANATION, not the word "off" (see
+     _camera_off_reason). Sized to be read at a glance from across the room:
+     13px/1.5 in the main text colour, not the dim muted grey a one-word label
+     could get away with. It wraps - a wrapped honest sentence beats a truncated
+     one - and holds its height so a tile that goes dark doesn't jump the row. */
   .camtile .camoff {{ border:1px dashed var(--cyan-dim); border-radius:6px;
-          padding:28px 8px; text-align:center; color:var(--muted);
-          font-size:12px; }}
+          padding:22px 10px; text-align:center; color:var(--text);
+          font-size:13px; line-height:1.5; min-height:74px;
+          display:flex; align-items:center; justify-content:center; }}
   .camtile figcaption {{ color:var(--muted); font-size:12px; margin-top:6px;
           letter-spacing:.08em; text-transform:uppercase; }}
 </style></head><body>
@@ -2107,21 +2652,29 @@ def _dashboard_html(token: str) -> str:
          left/right webcams + Kinect (skeleton-annotated). Each tile shows a
          dim placeholder when that camera is off/stale, independent of the
          others, so one dead camera never blanks the row. -->
+    <!-- PLACEHOLDER TEXT (2026-09-04, owner: "add the kinect not detected
+         message to the tile"). Each tile's placeholder now carries a SENTENCE
+         fetched from /api/camera-reason on the img `error` event - never on the
+         happy path, so the continuous stream costs exactly what it did before.
+         The words come from the server's ladder (_camera_off_reason), which
+         only says "Kinect not detected" when device enumeration actually came
+         back empty; every other outage gets a message that names what was
+         established and hedges what was not. -->
     <div class="count">Live cameras — left, right, and the Kinect (skeleton-annotated). Updates while each camera is on.</div>
     <div class="camgrid">
       <figure class="camtile">
         <img id="camLeft" data-cam="left" alt="left webcam">
-        <div class="camoff" id="camLeftOff">off</div>
+        <div class="camoff" id="camLeftOff">checking…</div>
         <figcaption>Left webcam</figcaption>
       </figure>
       <figure class="camtile">
         <img id="camRight" data-cam="right" alt="right webcam">
-        <div class="camoff" id="camRightOff">off</div>
+        <div class="camoff" id="camRightOff">checking…</div>
         <figcaption>Right webcam</figcaption>
       </figure>
       <figure class="camtile">
         <img id="camKinect" data-cam="kinect" alt="kinect">
-        <div class="camoff" id="camKinectOff">off</div>
+        <div class="camoff" id="camKinectOff">checking…</div>
         <figcaption>Kinect (skeleton)</figcaption>
       </figure>
     </div>
@@ -2677,30 +3230,155 @@ async function loadVoices() {{
 const CAM_TICK_MS = 250;          // supervisor tick == still-poll interval
 let   camMode = 'stream';         // 'stream' | 'poll'
 let   camEverStreamed = false;    // a stream has delivered at least one frame
-const camTiles = [
+const camPairs = [
   ['camLeft', 'camLeftOff'], ['camRight', 'camRightOff'],
   ['camKinect', 'camKinectOff'],
 ].map(([imgId, offId]) => {{
   const img = document.getElementById(imgId);
   const off = document.getElementById(offId);
   img.dataset.errs = '0';
+  img.dataset.loadAt = '0';
   img.addEventListener('load',  () => {{
     img.style.display='block'; off.style.display='none';
     img.dataset.errs = '0';
+    img.dataset.loadAt = String(Date.now());
+    // Drop the old explanation and the throttle: the NEXT outage may have a
+    // different cause, and a stale sentence sitting behind a live tile is
+    // exactly the kind of leftover that gets read as current.
+    off.textContent = 'checking\u2026'; off.title = '';
+    img.dataset.reasonAt = '0';
     if (camMode === 'stream' && img.dataset.streaming === '1') camEverStreamed = true;
   }});
   img.addEventListener('error', () => {{
-    img.style.display='none';  off.style.display='block';
-    img.dataset.streaming = '';                       // let the tick re-arm it
     img.dataset.errs = String((+img.dataset.errs || 0) + 1);
     // Streaming is broken in this browser only if it NEVER worked anywhere.
     if (camMode === 'stream' && !camEverStreamed &&
-        camTiles.every(t => (+t.dataset.errs || 0) >= 3)) camMode = 'poll';
+        camPairs.every(([t]) => (+t.dataset.errs || 0) >= 3)) camMode = 'poll';
+    tileDown(img, off);
   }});
-  return img;
+  return [img, off];
 }});
+const camTiles = camPairs.map(([img]) => img);
+
+// WHY THE TILE ASKS THE SERVER
+// ---------------------------------
+// An <img> that fails to load throws away the response body, so the 404 from
+// /api/camera-stream can never reach the placeholder - the `error` event is all
+// the DOM gives us, and it carries no text. /api/camera-reason is therefore a
+// second, tiny fetch fired ONLY here, on the error path. The streaming path is
+// untouched: while a camera works this never runs, and neither does the
+// device-enumeration probe behind it.
+//
+// Throttled per tile (REASON_MIN_MS): the supervisor re-arms a dead stream every
+// CAM_TICK_MS, so each failing tile would otherwise ask 4x a second forever. And
+// the supervisor itself only ticks while the Camera tab is open (showView starts
+// cameraTimer, stopViewTimers kills it), so a dashboard sitting on any other tab
+// asks nothing and the device probe never fires at all.
+const REASON_MIN_MS = 4000;
+function explainTile(img, off) {{
+  const now = Date.now();
+  if (img.dataset.reasonBusy === '1') return;
+  if (now - (+img.dataset.reasonAt || 0) < REASON_MIN_MS) return;
+  img.dataset.reasonAt = String(now);
+  img.dataset.reasonBusy = '1';
+  fetch(q('/api/camera-reason?cam=' + img.dataset.cam), {{headers:hdr()}})
+    .then(r => r.ok ? r.json() : null)
+    .then(j => {{
+      // Only overwrite while the tile is still DOWN: a frame may have arrived
+      // between the error and this reply, and stamping "no picture" over a
+      // working tile would be its own little lie.
+      if (j && j.message && off.style.display !== 'none') {{
+        off.textContent = j.message;
+        off.title = j.detail || '';
+      }}
+      // THE WAY OUT.  An `error` clears dataset.streaming, so the CAM_TICK_MS
+      // supervisor re-arms this tile ~4x a second - forever, if the stream is
+      // refused every time (8 slots = 3 tiles x 3 tabs).  camMode's own fallback
+      // cannot rescue it: that needs !camEverStreamed, which the other two
+      // working tiles have already falsified.  So when the SERVER has
+      // established the camera is producing frames, the broken part is this
+      // page's stream: this ONE tile stops asking for one and polls stills
+      // instead - the same tick, but every request now returns a picture.
+      // 'stream_busy' is proof (all slots taken -> the next request IS a 503),
+      // so it demotes at once; 'live' waits for 3 consecutive failures so a
+      // single dropped connection does not cost the session its pushed frames.
+      if (j && img.dataset.mode !== 'poll' &&
+          (j.state === 'stream_busy' ||
+           (j.state === 'live' && (+img.dataset.errs || 0) >= 3))) {{
+        img.dataset.mode = 'poll';
+        img.dataset.streaming = '';
+      }}
+    }})
+    .catch(() => {{}})
+    .finally(() => {{ img.dataset.reasonBusy = ''; }});
+}}
+
+// ── MID-STREAM DEATH ────────────────────────────────────────────────────────
+// THE DEFECT THIS FIXES (2026-09-05): a camera that died WHILE STREAMING left
+// its tile showing a frozen, minutes-old picture with no placeholder and no
+// sentence — the dashboard silently asserting a live camera. dataset.streaming
+// stayed '1', so startCameraStreams() skipped the tile forever.
+//
+// WHY it could not be fixed in the `error` handler: measured against a real
+// Chrome on this box, a multipart/x-mixed-replace <img> is told NOTHING when
+// the server closes its stream. Three endings were tried — clean close after a
+// complete part, a truncated final part, and boundary+headers then close — and
+// all three produced exactly one event, `load` at 413 ms (just after the FIRST
+// frame), with nothing at all at the close ~1.6 s later. img.complete stayed
+// true and naturalWidth kept the last frame's size throughout, so no DOM
+// property betrays the ending either. `load` is not per-frame and is not an
+// end-of-stream signal, so NO event-driven design can see this.
+//
+// The tile is therefore supervised on our own clock. Once a second the tick
+// asks /api/camera-live — three os.stat calls, the same staleness rule
+// _stream_camera uses to decide when to close, and deliberately nowhere near
+// the reason ladder or the ~0.7 s device probe. That is one ~60-byte JSON per
+// second while the Camera tab is open (the still-polling design this replaced
+// was already fetching three JPEGs a second) and nothing on any other tab.
+//
+// It may only ever take a tile DOWN. A fresh FILE is not proof that THIS
+// browser is receiving frames, so bringing a tile up stays the stream's job.
+const CAM_LIVE_MIN_MS = 1000;
+let camLiveAt = 0, camLiveBusy = false;
+
+// The ONE way a tile goes dark, shared by the `error` event and the supervisor,
+// so a tile can never be hidden without also being explained.
+function tileDown(img, off) {{
+  img.style.display='none'; off.style.display='flex';
+  img.dataset.streaming = '';                         // let the tick re-arm it
+  // Drop the frozen frame and hand back the connection slot. Guarded on the
+  // attribute being there so that if a browser ever does fire `error` for this,
+  // the re-entry stops after one pass instead of looping.
+  if (img.hasAttribute('src')) img.removeAttribute('src');
+  explainTile(img, off);
+}}
+
+function checkCameraLiveness() {{
+  if (camMode !== 'stream') return;    // poll mode 404s on its own every tick
+  const now = Date.now();
+  if (camLiveBusy || now - camLiveAt < CAM_LIVE_MIN_MS) return;
+  camLiveAt = now; camLiveBusy = true;
+  const asked = now;
+  fetch(q('/api/camera-live'), {{headers:hdr()}})
+    .then(r => r.ok ? r.json() : null)
+    .then(j => {{
+      if (!j || !j.cams) return;
+      for (const [img, off] of camPairs) {{
+        if (j.cams[img.dataset.cam] !== false) continue;   // fresh, or unknown
+        if (img.dataset.streaming !== '1') continue;       // already down
+        // A frame landed after we asked, so this answer is out of date — say
+        // nothing rather than blanking a camera that just came back.
+        if ((+img.dataset.loadAt || 0) > asked) continue;
+        tileDown(img, off);
+      }}
+    }})
+    .catch(() => {{}})
+    .finally(() => {{ camLiveBusy = false; }});
+}}
+
 function startCameraStreams() {{
   for (const img of camTiles) {{
+    if (img.dataset.mode === 'poll') continue;        // demoted: it polls stills
     if (img.dataset.streaming === '1') continue;      // already connected
     img.dataset.streaming = '1';
     img.src = q('/api/camera-stream?cam=' + img.dataset.cam);
@@ -2712,12 +3390,25 @@ function stopCameraStreams() {{
     img.removeAttribute('src');                       // aborts the connection
   }}
 }}
+function pollTile(img) {{
+  img.dataset.streaming = '';
+  img.src = q('/api/camera-preview?cam=' + img.dataset.cam + '&t=' + Date.now());
+}}
 function refreshCamera() {{
   // One tick drives both modes: re-arm any dropped stream, or poll stills.
   if (!autoOn()) {{ stopCameraStreams(); return; }}
-  if (camMode === 'stream') {{ startCameraStreams(); return; }}
-  for (const img of camTiles)
-    img.src = q('/api/camera-preview?cam=' + img.dataset.cam + '&t=' + Date.now());
+  if (camMode === 'stream') {{
+    // Supervise BEFORE re-arming. The DOM never reports a stream that ENDED
+    // (measured — see the MID-STREAM DEATH note above), so this is the only
+    // thing on the page that can notice a camera which died while streaming.
+    checkCameraLiveness();
+    startCameraStreams();
+    // A tile demoted by explainTile polls while the REST of the page still
+    // streams: its stream is the thing that is broken, not the others'.
+    for (const img of camTiles) if (img.dataset.mode === 'poll') pollTile(img);
+    return;
+  }}
+  for (const img of camTiles) pollTile(img);
 }}
 
 // ── MEMORY TAB ──────────────────────────────────────────────────────────────

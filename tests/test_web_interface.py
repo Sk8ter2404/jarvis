@@ -43,6 +43,8 @@ import json
 import os
 import re
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -1693,6 +1695,1226 @@ class NoUnboundedServerTeardownTests(unittest.TestCase):
         self.assertEqual(calls, ["shutdown", "close"])
         self.assertLess(time.monotonic() - t0, 1.0,
                         "the time-box must cost nothing when nothing wedges")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# WHY IS THIS TILE BLANK  (/api/camera-reason)
+# ═══════════════════════════════════════════════════════════════════════════
+def _health(**over):
+    """A get_stream_health() payload with every key present, so a test overrides
+    only the ONE symbol it is exercising and can never pass by accident because
+    a key it forgot happened to be missing."""
+    h = {"open": False, "color_pending": False, "body_pending": False,
+         "depth_pending": False, "color_age_s": None, "body_age_s": None,
+         "depth_age_s": None, "infrared": "unsupported", "ts": 0.0,
+         "enabled": True, "open_error": None, "cooldown_s": 0.0,
+         "pump_alive": True}
+    h.update(over)
+    return h
+
+
+# The bridge's REAL failure strings, copied from audio/kinect_bridge.py so a
+# reworded message there shows up here as a failing test rather than as a tile
+# that silently drops to the generic rung.
+ERR_NO_FRAMES = ("Kinect opened but streamed no frames after 4 attempts (opened "
+                 "but no frames streaming); sensor may be held by another process")
+ERR_NO_PYKINECT = "pykinect2 not installed \u2014 pip install pykinect2"
+# The bridge's SECOND pykinect2 string, from the non-ImportError branch of
+# import_pykinect2(): the package was FOUND and something else blew up - a
+# broken comtypes, a venv rebuilt against a new Python, a corrupted
+# site-packages. It had no constant here before 2026-09-05, which is why the
+# suite could not see it collapsing into the same message as ERR_NO_PYKINECT.
+ERR_PYKINECT_BROKEN = ("pykinect2 failed to load: ImportError: DLL load failed "
+                       "while importing _ctypes: The specified module could "
+                       "not be found.")
+ERR_CTOR = "could not open Kinect sensor: OSError: [WinError 5] Access is denied"
+# NOT a failure: what _open_runtime_locked hands the loser of its 0.5 s
+# open-lock acquire while the WINNER is still inside the open gauntlet. It is
+# latched into the same open_error cell as the three above, which is how the
+# ladder used to mistake it for a completed failure.
+ERR_OPEN_IN_PROGRESS = "Kinect open already in progress"
+
+
+class _ReasonBase(_ServerBase):
+    """Serves a real server and stubs the two live inputs of the ladder.
+
+    NOTHING here may spawn powershell: _probe_kinect_devices is replaced for
+    every test, so the suite stays headless-CI safe AND a Windows dev box does
+    not fire ~20 subprocesses per run."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved = (wi._kinect_health, wi._probe_kinect_devices,
+                       dict(wi._kinect_enum_cache))
+        self.probe_calls = []
+        self.set_enum(True, ("Xbox NUI Sensor",))
+        self.set_health(None)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        wi._kinect_health, wi._probe_kinect_devices, cache = self._saved
+        wi._kinect_enum_cache.clear()
+        wi._kinect_enum_cache.update(cache)
+
+    def set_enum(self, present, names=(), how="stub"):
+        """Replace the OS device probe and clear its TTL cache."""
+        def _probe():
+            self.probe_calls.append(present)
+            return present, tuple(names), how
+        wi._probe_kinect_devices = _probe
+        wi._kinect_enum_cache.update({"ts": 0.0, "present": None, "names": (),
+                                      "how": "never run"})
+
+    def set_health(self, health):
+        wi._kinect_health = lambda: health
+
+    def dark(self, cam):
+        """Make sure ``cam`` has no preview file at all (the outage path)."""
+        path = wi._preview_path_for(
+            {"camera_preview_path": self.camera_preview_path}, cam)
+        if os.path.exists(path):
+            os.remove(path)
+
+    def lit(self, cam):
+        """Write a fresh preview file for ``cam`` (the working path)."""
+        path = wi._preview_path_for(
+            {"camera_preview_path": self.camera_preview_path}, cam)
+        with open(path, "wb") as f:
+            f.write(b"\xff\xd8\xff\xd9")             # a minimal JPEG-ish blob
+        return path
+
+    def reason(self, cam):
+        code, data = _get(self.base + "/api/camera-reason?cam=" + cam)
+        self.assertEqual(code, 200, data)
+        return data
+
+
+class CameraReasonStateTests(_ReasonBase):
+    """Every rung of the ladder produces its OWN message, and every rung is
+    backed by a symbol that actually establishes it."""
+
+    def test_fresh_preview_is_live_not_an_outage(self):
+        # The tile can fire `error` for reasons that are not the camera (a
+        # stream refused at the client cap). Claiming "off" then would be a lie
+        # of exactly the kind this endpoint exists to stop.
+        self.lit("kinect")
+        self.set_health(_health(open=False, open_error=ERR_NO_FRAMES))
+        self.assertEqual(self.reason("kinect")["state"], "live")
+
+    def test_switched_off_reports_the_switch_not_the_hardware(self):
+        self.dark("kinect")
+        self.set_health(_health(enabled=False))
+        r = self.reason("kinect")
+        self.assertEqual(r["state"], "disabled")
+        self.assertIn("switched off", r["message"])
+
+    def test_enumeration_empty_gives_the_owner_his_literal_string(self):
+        self.dark("kinect")
+        self.set_enum(False, ())                      # sweep ran, matched nothing
+        self.set_health(_health(open=False, open_error=ERR_NO_FRAMES))
+        r = self.reason("kinect")
+        self.assertEqual(r["state"], "not_detected")
+        self.assertIn("kinect not detected", r["message"].lower())
+
+    def test_no_frames_with_the_device_present(self):
+        self.dark("kinect")
+        self.set_enum(True, ("Xbox NUI Sensor",))
+        self.set_health(_health(open=False, open_error=ERR_NO_FRAMES))
+        r = self.reason("kinect")
+        self.assertEqual(r["state"], "no_frames")
+        self.assertIn("plugged in", r["message"])
+        self.assertIn("no pictures", r["message"])
+
+    def test_missing_python_package(self):
+        self.dark("kinect")
+        self.set_health(_health(open=False, open_error=ERR_NO_PYKINECT))
+        self.assertEqual(self.reason("kinect")["state"], "pykinect2_missing")
+
+    def test_unloadable_python_package_is_its_own_rung(self):
+        self.dark("kinect")
+        self.set_health(_health(open=False, open_error=ERR_PYKINECT_BROKEN))
+        self.assertEqual(self.reason("kinect")["state"], "pykinect2_unusable")
+
+    def test_open_failure_reports_verbatim_in_detail(self):
+        self.dark("kinect")
+        self.set_health(_health(open=False, open_error=ERR_CTOR))
+        r = self.reason("kinect")
+        self.assertEqual(r["state"], "open_failed")
+        self.assertEqual(r["detail"], ERR_CTOR)       # the raw error, not prose
+
+    def test_no_recorded_error_is_not_reported_as_a_failure(self):
+        # open False AND open_error None must blame no hardware. It is ALSO not
+        # a licence to claim the sensor was never tried - that half is nailed
+        # down in CameraReasonNotOpenNoErrorTests below.
+        self.dark("kinect")
+        self.set_health(_health(open=False, open_error=None))
+        r = self.reason("kinect")
+        self.assertEqual(r["state"], "not_open_no_error")
+        for blame in ("not detected", "power", "plugged", "missing"):
+            self.assertNotIn(blame, r["message"].lower(), r["message"])
+
+    def test_dead_worker_is_named_as_software_not_hardware(self):
+        self.dark("kinect")
+        self.set_health(_health(open=True, pump_alive=False))
+        r = self.reason("kinect")
+        self.assertEqual(r["state"], "worker_stopped")
+        self.assertIn("worker", r["message"])
+        self.assertNotIn("not detected", r["message"].lower())
+
+    def test_frames_arriving_but_not_reaching_the_page(self):
+        # color_pending True is poll-independent PROOF a new COLOR frame is
+        # arriving, and color is the only stream this tile renders, so the gap
+        # is downstream of the sensor and must not be blamed on it.
+        self.dark("kinect")
+        self.set_health(_health(open=True, color_pending=True))
+        r = self.reason("kinect")
+        self.assertEqual(r["state"], "frames_not_shown")
+        self.assertNotIn("power", r["message"].lower())
+
+    def test_a_non_color_stream_may_not_claim_the_picture_is_being_produced(self):
+        """THE DEPTH-PINNED LIE (2026-09-05).
+
+        This rung used to be `any(color_pending, body_pending, depth_pending)`,
+        so a stream the tile does NOT display could assert that the picture was
+        being produced and the PAGE was the fault.
+
+        DEPTH is the worst of the two because it is pinned pending forever:
+        audio.kinect_bridge advances _depth_time_seen only inside get_depth(),
+        and nothing polls depth on a schedule (the bridge's own docstring:
+        "nothing polls depth on a schedule; body has the 30 Hz pump"). So while
+        the sensor emits depth at all, depth_pending never goes False. BODY is
+        the documented BODY-but-no-COLOR reopen the bridge's require_color=True
+        flag exists to reject.
+
+        With the color camera DEAD, either one rendered "Kinect is running, but
+        its picture is not reaching this page." - sending the owner to debug his
+        browser while the camera was what died."""
+        self.dark("kinect")
+        for label, h in (
+                ("depth only", _health(open=True, depth_pending=True)),
+                ("body only", _health(open=True, body_pending=True)),
+                ("body+depth", _health(open=True, body_pending=True,
+                                       depth_pending=True))):
+            self.set_health(h)
+            r = self.reason("kinect")
+            msg = r["message"].lower()
+            self.assertEqual(
+                r["state"], "color_unconfirmed",
+                "%s (color_pending FALSE) reached %s: a stream this tile does "
+                "not display asserted the picture was being produced"
+                % (label, r["state"]))
+            # The specific sentence that sent him to the browser.
+            self.assertNotIn("not reaching this page", msg, label)
+            # ...and it must not swing the other way into an unestablished
+            # hardware verdict either: color_pending False is a failure to
+            # confirm, not proof the camera died.
+            for blame in ("not detected", "power", "adapter", "unplug",
+                          "plugged in"):
+                self.assertNotIn(blame, msg, "%s / %r" % (label, r["message"]))
+            # Both candidates named, neither asserted.
+            self.assertIn("color camera", msg, label)
+            self.assertIn("this page", msg, label)
+            # The evidence rides along in the tooltip.
+            self.assertIn("color_pending false", r.get("detail", ""), label)
+
+    def test_only_color_pending_can_reach_frames_not_shown(self):
+        """The inverse guard, stated over the WHOLE truth table so a future
+        `any()` cannot creep back in on some other key."""
+        self.dark("kinect")
+        for body in (False, True):
+            for depth in (False, True):
+                for color in (False, True):
+                    self.set_health(_health(open=True, color_pending=color,
+                                            body_pending=body,
+                                            depth_pending=depth))
+                    r = self.reason("kinect")
+                    combo = "color=%s body=%s depth=%s" % (color, body, depth)
+                    if r["state"] == "frames_not_shown":
+                        self.assertTrue(
+                            color,
+                            "%s claimed the picture is produced and the page is "
+                            "at fault WITHOUT a pending color frame" % combo)
+                    if color:
+                        self.assertEqual(r["state"], "frames_not_shown", combo)
+
+    def test_open_but_quiet_is_hedged(self):
+        # pending False is NOT proof of death (it is the normal reading right
+        # after the 30 Hz pump consumed the frame), so no cause may be named.
+        self.dark("kinect")
+        self.set_health(_health(open=True))
+        r = self.reason("kinect")
+        self.assertEqual(r["state"], "open_quiet")
+        for blame in ("not detected", "power", "adapter", "unplug"):
+            self.assertNotIn(blame, r["message"].lower(), r["message"])
+
+    def test_bridge_absent_is_unknown_not_a_verdict(self):
+        self.dark("kinect")
+        self.set_health(None)                         # module not in sys.modules
+        r = self.reason("kinect")
+        self.assertEqual(r["state"], "unknown")
+        self.assertIn("unknown", r["message"].lower())
+
+    def test_every_state_has_its_own_distinct_message(self):
+        seen = {}
+        for state, msg in wi._CAMERA_REASONS.items():
+            self.assertNotIn(msg, seen,
+                             "%s and %s share a message, so the tile cannot "
+                             "tell them apart" % (state, seen.get(msg)))
+            seen[msg] = state
+            self.assertTrue(msg.strip().endswith("."), state)
+
+    def test_the_states_the_ladder_can_reach_are_all_in_the_table(self):
+        """A rung returning a slug with no table entry would silently render the
+        generic 'unknown' text - the stale-duplicate shape, in message form."""
+        with open(wi.__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        body = src[src.index("def _camera_off_reason("):]
+        used = set(re.findall(r'_reason\(cam, "([a-z_]+)"', body))
+        self.assertTrue(used, "the scan found no rungs - it would pass blind")
+        self.assertEqual(used - set(wi._CAMERA_REASONS), set())
+
+
+class NotDetectedIsNeverGuessedTests(_ReasonBase):
+    """THE POINT OF THE WHOLE TASK.
+
+    Measured on the owner's machine 2026-09-04 23:09-23:28: enumeration reported
+    Xbox NUI Sensor / WDF KinectSensor Interface 0 / Microphone Array all Status
+    OK for the entire six minutes the Kinect sent no frames. A tile that had said
+    "Kinect not detected" would have been factually wrong at every instant, and
+    would have sent him to check a cable that was fine. So: the words may appear
+    ONLY when a completed device sweep matched nothing."""
+
+    def test_never_says_not_detected_while_enumeration_succeeds(self):
+        self.dark("kinect")
+        self.set_enum(True, ("Xbox NUI Sensor", "WDF KinectSensor Interface 0"))
+        bad = []
+        for label, h in (
+                ("no frames", _health(open=False, open_error=ERR_NO_FRAMES)),
+                ("pykinect2 missing", _health(open=False, open_error=ERR_NO_PYKINECT)),
+                ("pykinect2 broken", _health(open=False, open_error=ERR_PYKINECT_BROKEN)),
+                ("ctor failed", _health(open=False, open_error=ERR_CTOR)),
+                ("never probed", _health(open=False, open_error=None)),
+                ("disabled", _health(enabled=False)),
+                ("worker dead", _health(open=True, pump_alive=False)),
+                ("open, quiet", _health(open=True)),
+                ("streaming", _health(open=True, color_pending=True)),
+                ("body/depth only", _health(open=True, body_pending=True,
+                                            depth_pending=True)),
+                ("bridge absent", None)):
+            self.set_health(h)
+            r = self.reason("kinect")
+            if r["state"] == "not_detected" or "not detected" in r["message"].lower():
+                bad.append("%s -> %s / %r" % (label, r["state"], r["message"]))
+        self.assertEqual(
+            bad, [],
+            "the tile claimed the Kinect was NOT DETECTED while device "
+            "enumeration was reporting it present: %s. That is the exact lie "
+            "this endpoint exists to prevent - the OS saw the sensor the whole "
+            "time the owner was being told to go hunt for it." % bad)
+
+    def test_a_probe_that_could_not_run_is_unknown_never_absent(self):
+        # not Windows / no powershell / timeout / non-zero exit -> present None.
+        # None must NEVER be allowed to decay into "not detected".
+        self.dark("kinect")
+        for how in ("not windows", "probe failed: TimeoutExpired", "probe exit 1"):
+            self.set_enum(None, (), how)
+            self.set_health(_health(open=False, open_error=ERR_NO_FRAMES))
+            r = self.reason("kinect")
+            self.assertNotEqual(r["state"], "not_detected", how)
+            self.assertEqual(r["state"], "no_frames_unverified", how)
+
+    def test_unverified_no_frames_does_not_claim_the_device_is_plugged_in(self):
+        # With enumeration unknown we have NOT established that anything is
+        # attached, so the message may not say so - it lists the candidates.
+        self.dark("kinect")
+        self.set_enum(None, (), "not windows")
+        self.set_health(_health(open=False, open_error=ERR_NO_FRAMES))
+        m = self.reason("kinect")["message"]
+        self.assertNotIn("is plugged in but", m)
+        self.assertIn("check it is plugged in", m)
+
+    def test_power_is_offered_as_a_check_never_asserted(self):
+        # The OS cannot see mains power. Every message that mentions power must
+        # phrase it as something to CHECK, and none may state it as fact.
+        for state, msg in wi._CAMERA_REASONS.items():
+            low = msg.lower()
+            for claimed in ("is not powered", "has no power", "is unpowered",
+                            "is not turned on", "power is off"):
+                self.assertNotIn(claimed, low, "%s asserts power state" % state)
+            if "power adapter" in low:
+                self.assertIn("check", low, "%s must hedge" % state)
+
+    def test_not_detected_says_only_what_enumeration_established(self):
+        self.dark("kinect")
+        self.set_enum(False, ())
+        self.set_health(_health(open=False, open_error=ERR_NO_FRAMES))
+        r = self.reason("kinect")
+        self.assertEqual(r["state"], "not_detected")
+        # It may report ONLY what the sweep established - that Windows currently
+        # enumerates no Kinect device. It must not go on to diagnose power or
+        # other apps, which it cannot see, NOR to assert that nothing is plugged
+        # in, which an empty sweep does not establish either (next test).
+        self.assertNotIn("power", r["message"].lower())
+        self.assertIn("enumeration", r.get("detail", ""))
+
+    def test_not_detected_never_claims_nothing_is_plugged_in(self):
+        """Enumeration is ASYMMETRIC and the message must respect that.
+
+        A match proves attachment (-PresentOnly means attached right now), so
+        the no_frames rung may say "plugged in". An EMPTY sweep proves only that
+        Windows enumerates no Kinect: the v2's USB3 adapter carries the data
+        link AND the mains brick, so a brick switched off or dead - and equally
+        a removed, blocked or disabled driver stack - stops the whole adapter
+        enumerating with the cable still fully seated. That is the state the
+        owner reported ("isn't showing or even powered on"), and a tile that
+        answered "no Kinect is plugged in" sent him to re-seat a cable that was
+        fine while the power switch was the actual fault."""
+        self.dark("kinect")
+        self.set_enum(False, ())                      # sweep ran, matched nothing
+        self.set_health(_health(open=False, open_error=ERR_NO_FRAMES))
+        r = self.reason("kinect")
+        self.assertEqual(r["state"], "not_detected")
+        low = r["message"].lower()
+        for claimed in ("no kinect is plugged in", "nothing is plugged in",
+                        "not plugged in", "is unplugged", "no kinect is connected",
+                        "nothing is connected", "is disconnected"):
+            self.assertNotIn(
+                claimed, low,
+                "the tile asserted a cable state that device enumeration cannot "
+                "establish (%r): an empty sweep is equally the reading for a "
+                "Kinect whose power brick is off, or whose driver was removed, "
+                "with the cable still seated." % r["message"])
+        # ...and it still hands the owner the words he asked for, plus the one
+        # fact that WAS established.
+        self.assertIn("kinect not detected", low)
+        self.assertIn("windows", low)
+
+    def test_no_message_in_the_table_asserts_a_cable_state(self):
+        """The table-wide twin of the test above: no rung, present or future,
+        may state as fact something only a human at the desk can see."""
+        for state, msg in wi._CAMERA_REASONS.items():
+            low = msg.lower()
+            for claimed in ("no kinect is plugged in", "nothing is plugged in",
+                            "is not plugged in", "is unplugged",
+                            "nothing is connected", "is disconnected"):
+                self.assertNotIn(claimed, low,
+                                 "%s asserts a cable state: %r" % (state, msg))
+
+
+class Pykinect2IsNotTheKinectDriverTests(_ReasonBase):
+    """A pip-level import failure must never be reported as a missing DRIVER.
+
+    kinect_bridge._open_runtime_locked has exactly two pykinect2 failure
+    strings, both produced by its ``import_pykinect2()`` call:
+
+        except ImportError:  return None, "pykinect2 not installed - pip install pykinect2"
+        except Exception:    return None, f"pykinect2 failed to load: {type(e).__name__}: {e}"
+
+    Both are raised BEFORE PyKinectRuntime is ever constructed, so neither
+    establishes one single thing about the Windows Kinect driver - and the
+    enumeration rung two steps above can be returning present True in the very
+    same request, i.e. the driver is demonstrably fine.
+
+    Until 2026-09-05 the ladder mapped BOTH to state "driver_missing" and the
+    sentence "Kinect driver software is missing, so JARVIS cannot use it." That
+    sends the owner off to reinstall the Kinect SDK - an hour and a reboot - for
+    a fault whose fix is one pip command, and the true text survived only in the
+    hover title attribute he has no reason to hover. It also called a package
+    that was FOUND-but-broken "missing", which is false on its own terms."""
+
+    def _ask(self, err, present=True):
+        self.dark("kinect")
+        self.set_enum(present, ("Xbox NUI Sensor", "WDF KinectSensor Interface 0")
+                      if present else ())
+        self.set_health(_health(open=False, open_error=err))
+        return self.reason("kinect")
+
+    def test_the_absent_package_is_named_and_pip_is_the_instruction(self):
+        r = self._ask(ERR_NO_PYKINECT)
+        self.assertEqual(r["state"], "pykinect2_missing")
+        low = r["message"].lower()
+        self.assertIn("pykinect2", low, r["message"])
+        self.assertIn("pip install", low, r["message"])
+
+    def test_a_broken_package_is_not_called_missing(self):
+        # This string is reachable ONLY when the import got past absent, so
+        # "not installed"/"is missing" would be a false statement about it.
+        r = self._ask(ERR_PYKINECT_BROKEN)
+        self.assertEqual(r["state"], "pykinect2_unusable")
+        self.assertIn("pykinect2", r["message"].lower())
+        for lie in ("not installed", "is missing", "missing,"):
+            self.assertNotIn(lie, r["message"].lower(), r["message"])
+
+    def test_the_two_bridge_strings_do_not_collapse_to_one_verdict(self):
+        # THE REGRESSION. Both used to return the identical state AND sentence,
+        # so the tile could not tell "run pip install" from "read the error".
+        a, b = self._ask(ERR_NO_PYKINECT), self._ask(ERR_PYKINECT_BROKEN)
+        self.assertNotEqual(a["state"], b["state"])
+        self.assertNotEqual(a["message"], b["message"])
+
+    def test_no_pykinect2_failure_blames_the_driver_software(self):
+        """THE DEFECT, stated as the property it violated.
+
+        A pykinect2 import failure may name the pip package and may say JARVIS
+        never got as far as the driver. It may NOT assert that the driver stack
+        itself is absent, broken or in need of reinstalling - nothing in this
+        request established that, and enumeration is concurrently saying the
+        opposite."""
+        for err in (ERR_NO_PYKINECT, ERR_PYKINECT_BROKEN,
+                    "pykinect2 went sideways in some brand new way"):
+            r = self._ask(err)
+            low = r["message"].lower()
+            for lie in ("driver software is missing", "driver software",
+                        "driver is missing", "driver is not installed",
+                        "reinstall the driver", "kinect sdk"):
+                self.assertNotIn(
+                    lie, low,
+                    "a pip-level import failure (%r) blamed the Kinect DRIVER: "
+                    "%r. Device enumeration returned present True in this same "
+                    "request, so the driver is the one thing here that is known "
+                    "to be fine." % (err, r["message"]))
+            # ...and it must positively name the thing that DID fail, or the
+            # owner has nowhere to go but the driver anyway.
+            self.assertIn("pykinect2", low, "%r -> %r" % (err, r["message"]))
+
+    def test_an_unrecognised_pykinect2_string_gets_the_hedged_rung(self):
+        # A reworded/new bridge string must fall to the vaguer message, never be
+        # guessed into the specific "is not installed" one.
+        r = self._ask("pykinect2 went sideways in some brand new way")
+        self.assertEqual(r["state"], "pykinect2_unusable")
+
+    def test_the_raw_bridge_error_still_reaches_the_detail(self):
+        for err in (ERR_NO_PYKINECT, ERR_PYKINECT_BROKEN):
+            self.assertEqual(self._ask(err)["detail"], err)
+
+    def test_both_strings_still_come_from_the_bridge_verbatim(self):
+        """The stale-duplicate guard: these markers are matched in
+        web_interface and PRODUCED in kinect_bridge. If either string is
+        reworded there, this fails loudly instead of the tile silently sliding
+        down to the generic open_failed rung."""
+        with open(os.path.join(os.path.dirname(wi.__file__), "..",
+                               "audio", "kinect_bridge.py"), encoding="utf-8") as fh:
+            bridge = fh.read()
+        self.assertIn("pykinect2 not installed", bridge)
+        self.assertIn("pykinect2 failed to load:", bridge)
+        # ...and the prefix the ladder actually keys on holds for both.
+        for err in (ERR_NO_PYKINECT, ERR_PYKINECT_BROKEN):
+            self.assertTrue(err.startswith("pykinect2 "), err)
+
+
+class FreshFileMeansTheStreamFailed_NotTheCameraTests(_ReasonBase):
+    """A FRESH preview file with a BLANK tile is not "Live." — it is a broken
+    video connection, and the tile must say so.
+
+    /api/camera-reason is fetched from exactly one place: a tile's `error`
+    handler. Its message is written into .camoff — the dashed placeholder that is
+    only visible BECAUSE there is no picture. So an answer of "Live." rendered
+    the word Live inside an empty box: the same class of lie as "not detected" on
+    a sensor Windows can see, and it points the owner at nothing.
+
+    REPRODUCED 2026-09-05 on a private instance: eight concurrent
+    /api/camera-stream?cam=kinect clients filled _CAMERA_STREAM_MAX_CLIENTS, the
+    ninth got `503 {"error": "too many camera streams"}`, and camera-reason
+    answered `{"state": "live", "message": "Live."}` at that same instant. Three
+    dashboard tabs (3 tiles x 3 = 9 streams) is enough to reach it in normal use.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(self._restore_stream_count,
+                        wi._camera_stream_clients[0])
+        wi._camera_stream_clients[0] = 0              # a known-free baseline
+
+    def _restore_stream_count(self, n):
+        wi._camera_stream_clients[0] = n
+
+    def saturate(self):
+        """Fill every MJPEG slot, exactly as 8 live tiles would."""
+        wi._camera_stream_clients[0] = wi._CAMERA_STREAM_MAX_CLIENTS
+
+    def test_a_blank_tile_is_never_answered_with_bare_liveness(self):
+        # THE BUG: fresh file -> "Live." -> rendered in the empty placeholder.
+        self.lit("kinect")
+        r = self.reason("kinect")
+        low = r["message"].lower().strip().rstrip(".")
+        self.assertNotIn(low, ("live", "ok", "working", "streaming", "fine"),
+                         "the placeholder is only ever visible when the tile has "
+                         "NO picture, so %r asserts the opposite of what the "
+                         "owner is looking at" % r["message"])
+        # It must instead explain the empty box: the camera is fine, this page
+        # is not getting the picture.
+        self.assertIn("this page", r["message"].lower())
+
+    def test_no_rung_claims_a_camera_is_fine_without_explaining_the_blank_box(self):
+        """Table-wide twin: every message is read inside an empty placeholder, so
+        a rung that says the camera IS sending pictures must go on to say the
+        page is not getting them. Otherwise it contradicts the box it sits in."""
+        for state, msg in wi._CAMERA_REASONS.items():
+            low = msg.lower()
+            if "sending pictures" not in low:
+                continue
+            self.assertTrue("this page" in low or "video connection" in low,
+                            "%s says the camera is sending pictures but never "
+                            "says why the tile is blank: %r" % (state, msg))
+
+    def test_a_full_stream_cap_is_named_instead_of_guessed(self):
+        # The one sub-case the server can actually establish - it is the thing
+        # the server itself is doing - so it is the only one with an action.
+        self.lit("kinect")
+        self.saturate()
+        r = self.reason("kinect")
+        self.assertEqual(r["state"], "stream_busy")
+        low = r["message"].lower()
+        self.assertIn("close other", low)             # something he can DO
+        for blame in ("not detected", "power", "adapter", "unplug", "switched off"):
+            self.assertNotIn(blame, low, "%r blames the hardware for a refused "
+                                         "stream" % r["message"])
+
+    def test_the_rung_and_the_503_read_the_same_counter(self):
+        """The refusal and the explanation must flip together, or the tile is
+        told 'live' at the exact moment its stream is being refused - which is
+        how this defect was reproduced."""
+        self.lit("kinect")
+        self.assertEqual(self.reason("kinect")["state"], "live")   # slots free
+        self.saturate()
+        code, body = _get_raw(self.base + "/api/camera-stream?cam=kinect")
+        self.assertEqual(code, 503, body)
+        self.assertIn("too many camera streams", body)
+        self.assertEqual(self.reason("kinect")["state"], "stream_busy")
+
+    def test_a_webcam_at_the_cap_gets_the_same_answer_as_the_kinect(self):
+        # The cap is global, so a refused webcam stream is the same event; and
+        # this must still cost NO device probe (a webcam never touches it).
+        self.lit("left")
+        self.saturate()
+        r = self.reason("left")
+        self.assertEqual(r["state"], "stream_busy")
+        self.assertNotIn("kinect", r["message"].lower())
+        self.assertEqual(self.probe_calls, [])
+
+    def test_the_saturation_check_never_blocks_the_reason_path(self):
+        # It is one int read under the counter's own lock. If it ever grew into
+        # something that waits (or that opens a socket), a dead tile asking 4x a
+        # second would drag /api/status down with it.
+        self.assertFalse(wi._camera_streams_saturated())
+        self.saturate()
+        self.assertTrue(wi._camera_streams_saturated())
+        t0 = time.monotonic()
+        for _ in range(200):
+            wi._camera_streams_saturated()
+        self.assertLess(time.monotonic() - t0, 0.5)
+
+    def test_the_page_stops_re_arming_a_stream_the_server_is_refusing(self):
+        """The other half of the defect: an <img> `error` clears
+        dataset.streaming, so the 250 ms supervisor re-arms the tile and is
+        refused again ~4x a second, forever - camMode's fallback cannot help
+        because camEverStreamed is already true from the two working tiles. The
+        server's answer has to be able to end it."""
+        code, html = _get_raw(self.base + "/")
+        self.assertEqual(code, 200)
+        self.assertIn("stream_busy", html)                # the client keys on it
+        self.assertIn("img.dataset.mode = 'poll'", html)  # ...and demotes itself
+        # and the supervisor must HONOUR the demotion, both ways round, or the
+        # demotion is a dead letter: no new stream for that tile, and it still
+        # gets a picture from the still endpoint.
+        self.assertIn("if (img.dataset.mode === 'poll') continue;", html)
+        self.assertIn("if (img.dataset.mode === 'poll') pollTile(img);", html)
+
+
+class WebcamsAreUnaffectedByTheKinectTests(_ReasonBase):
+    """A dead Kinect must never blank, or re-label, a working webcam."""
+
+    def test_working_webcam_stays_live_while_the_kinect_is_dead(self):
+        self.lit("left")
+        self.lit("right")
+        self.dark("kinect")
+        self.set_enum(False, ())                      # the worst Kinect verdict
+        self.set_health(_health(open=False, open_error=ERR_NO_FRAMES))
+        self.assertEqual(self.reason("left")["state"], "live")
+        self.assertEqual(self.reason("right")["state"], "live")
+        self.assertEqual(self.reason("kinect")["state"], "not_detected")
+        # and the picture itself still serves (raw bytes: _get_raw decodes as
+        # utf-8, and a JPEG is not text)
+        req = urllib.request.Request(self.base + "/api/camera-preview?cam=left")
+        with _urlopen_retry(req, timeout=5) as resp:
+            self.assertEqual(resp.status, 200)
+            self.assertTrue(resp.read())
+
+    def test_a_dark_webcam_never_borrows_a_kinect_message(self):
+        self.dark("left")
+        self.set_enum(False, ())
+        self.set_health(_health(open=False, open_error=ERR_NO_FRAMES))
+        r = self.reason("left")
+        self.assertEqual(r["state"], "webcam_off")
+        self.assertNotIn("kinect", r["message"].lower())
+
+    def test_a_webcam_reason_never_runs_the_device_probe(self):
+        # The probe is a ~0.7 s powershell spawn; a webcam has nothing to do with
+        # it, and paying for it on every dark webcam tile would be a real cost on
+        # the error path.
+        self.dark("left")
+        self.dark("right")
+        self.reason("left")
+        self.reason("right")
+        self.assertEqual(self.probe_calls, [])
+
+
+class CameraReasonPlumbingTests(_ReasonBase):
+    """Cost, caching, auth and the wiring into the page."""
+
+    def test_enumeration_is_cached_for_the_ttl(self):
+        self.dark("kinect")
+        self.set_health(_health(open=False, open_error=ERR_NO_FRAMES))
+        for _ in range(5):
+            self.reason("kinect")
+        self.assertEqual(len(self.probe_calls), 1,
+                         "the ~0.7 s device sweep must run once per TTL, not "
+                         "once per tile error: %s" % self.probe_calls)
+
+    def test_the_ttl_is_bounded_so_a_replug_is_noticed(self):
+        self.assertGreater(wi._KINECT_ENUM_TTL_S, 0)
+        self.assertLessEqual(wi._KINECT_ENUM_TTL_S, 60.0)
+
+    def test_health_is_read_from_sys_modules_and_never_opens_the_sensor(self):
+        """available()/get_runtime() run an open gauntlet of up to ~16 s inline
+        and have tripped the main-loop watchdog. The status read must not go
+        anywhere near them."""
+        wi._kinect_health = self._saved[0]            # the real implementation
+
+        class _Boom:
+            @staticmethod
+            def get_stream_health():
+                return _health(open=True, color_pending=True)
+
+            @staticmethod
+            def available():
+                raise AssertionError("the tile opened the sensor")
+
+            @staticmethod
+            def get_runtime():
+                raise AssertionError("the tile opened the sensor")
+
+        prev = sys.modules.get("audio.kinect_bridge")
+        sys.modules["audio.kinect_bridge"] = _Boom()
+
+        def _put_back():
+            if prev is None:
+                sys.modules.pop("audio.kinect_bridge", None)
+            else:
+                sys.modules["audio.kinect_bridge"] = prev
+        self.addCleanup(_put_back)
+
+        self.dark("kinect")
+        self.assertEqual(self.reason("kinect")["state"], "frames_not_shown")
+
+    def test_a_broken_health_getter_degrades_to_unknown(self):
+        def _raise():
+            raise RuntimeError("bridge exploded")
+
+        wi._kinect_health = self._saved[0]
+        prev = sys.modules.get("audio.kinect_bridge")
+        sys.modules["audio.kinect_bridge"] = type(
+            "_M", (), {"get_stream_health": staticmethod(_raise)})()
+
+        def _put_back():
+            if prev is None:
+                sys.modules.pop("audio.kinect_bridge", None)
+            else:
+                sys.modules["audio.kinect_bridge"] = prev
+        self.addCleanup(_put_back)
+
+        self.dark("kinect")
+        self.assertEqual(self.reason("kinect")["state"], "unknown")
+
+    def test_unknown_cam_is_404(self):
+        code, _ = _get_raw(self.base + "/api/camera-reason?cam=ceiling")
+        self.assertEqual(code, 404)
+
+    def test_dashboard_wires_the_placeholder_to_the_endpoint(self):
+        code, html = _get_raw(self.base + "/")
+        self.assertEqual(code, 200)
+        self.assertIn("/api/camera-reason?cam=", html)
+        self.assertIn("explainTile", html)
+        # still exactly the three tiles, and each has its own placeholder
+        for tile in ("camLeftOff", "camRightOff", "camKinectOff"):
+            self.assertIn(tile, html)
+        self.assertEqual(html.count('class="camtile"'), 3)
+        # the reason fetch must live on the ERROR path only - never in the tick
+        self.assertNotIn("explainTile(",
+                         html.split("function refreshCamera")[1])
+
+
+class CameraReasonTokenTests(_ReasonBase):
+    token = "s3cr3t"
+
+    def test_reason_requires_the_token(self):
+        self.dark("kinect")
+        code, _ = _get_raw(self.base + "/api/camera-reason?cam=kinect")
+        self.assertEqual(code, 401)
+        code, _ = _get_raw(self.base + "/api/camera-reason?cam=kinect",
+                           headers={"X-Auth-Token": self.token})
+        self.assertEqual(code, 200)
+
+
+class ProbeHonestyTests(unittest.TestCase):
+    """The device probe itself: a sweep that did not COMPLETE must report
+    unknown, because 'unknown' is what stops the owner's literal string."""
+
+    def _run_with(self, fake_run):
+        """Swap wi.subprocess and wi.sys for shims so this runs identically on
+        headless Linux CI and on the Windows box - patching the REAL subprocess
+        module (or sys.platform) would leak into every other test."""
+        saved_sub, saved_sys = wi.subprocess, wi.sys
+        wi.subprocess = type("_Sub", (), {"run": staticmethod(fake_run),
+                                          "CREATE_NO_WINDOW": 0})
+        wi.sys = type("_Sys", (), {"platform": "win32",
+                                   "modules": sys.modules})
+
+        def _put_back():
+            wi.subprocess, wi.sys = saved_sub, saved_sys
+        self.addCleanup(_put_back)
+        return wi._probe_kinect_devices()
+
+    @staticmethod
+    def _proc(returncode, stdout=""):
+        return lambda *a, **k: type("_P", (), {"returncode": returncode,
+                                               "stdout": stdout})()
+
+    def test_non_zero_exit_is_unknown(self):
+        self.assertIsNone(self._run_with(self._proc(1))[0])
+
+    def test_an_exception_is_unknown(self):
+        def _boom(*a, **k):
+            raise OSError("powershell missing")
+        self.assertIsNone(self._run_with(_boom)[0])
+
+    def test_a_clean_empty_sweep_is_a_definitive_no(self):
+        present, names, _how = self._run_with(self._proc(0, "\n  \n"))
+        self.assertIs(present, False)
+        self.assertEqual(names, ())
+
+    def test_a_clean_sweep_with_matches_is_a_definitive_yes(self):
+        present, names, _how = self._run_with(self._proc(
+            0, "Xbox NUI Sensor\nWDF KinectSensor Interface 0\n"))
+        self.assertIs(present, True)
+        self.assertEqual(len(names), 2)
+
+    def test_off_windows_the_probe_is_unknown_not_a_verdict(self):
+        saved_sys = wi.sys
+        wi.sys = type("_Sys", (), {"platform": "linux", "modules": sys.modules})
+        self.addCleanup(lambda: setattr(wi, "sys", saved_sys))
+        self.assertIsNone(wi._probe_kinect_devices()[0])
+
+    def test_the_query_only_matches_present_devices(self):
+        # Without -PresentOnly the PnP Enum registry answers for every device the
+        # machine has EVER seen, so a Kinect unplugged months ago would read as
+        # present and the owner's string could never fire.
+        self.assertIn("-PresentOnly", wi._KINECT_PNP_PS)
+
+    def test_the_query_also_matches_raw_kinect_usb_ids(self):
+        # A sensor whose driver failed to install has no recognisable
+        # FriendlyName but still enumerates its USB node; calling that "not
+        # detected" would be the same lie in a new costume.
+        self.assertIn("VID_045E&PID_02C4", wi._KINECT_PNP_PS)
+
+
+class KinectProbeProjectionTests(unittest.TestCase):
+    """The Where-Object filter and the ForEach-Object projection must AGREE.
+
+    Every -like clause in _KINECT_PNP_PS exists to make some device COUNT as
+    found. A clause that can match a device the projection then throws away is
+    worse than having no clause at all, because the failure is silent and
+    inverted: powershell exits 0, stdout holds nothing printable,
+    _probe_kinect_devices' `if ln.strip()` drops it, names==() and present
+    becomes False - the single reading that unlocks the owner's literal
+    "Kinect not detected". The tile then sends him to check a cable on a sensor
+    Windows is enumerating perfectly well.
+
+    The five InstanceId clauses are exactly that hazard: they were added for a
+    sensor whose driver failed to bind, and such a node has a NULL FriendlyName.
+    Measured on the owner's box 2026-09-04, Get-PnpDevice -PresentOnly really
+    does return present nodes with a null FriendlyName (the root PnP node is one),
+    so this is a reachable state and not a thought experiment."""
+
+    # A Kinect v2 hub whose driver did not bind: matches ONLY on InstanceId,
+    # and FriendlyName is $null exactly as Windows reports it.
+    _SYNTH = (r"@([pscustomobject]@{FriendlyName=$null;"
+              r"InstanceId='USB\VID_045E&PID_02C4&2d0d3e5f&0&4'})")
+
+    def test_the_projection_can_emit_an_instance_id(self):
+        """Platform-independent guard: InstanceId must appear in the PROJECTION
+        half, not merely in the filter half. This is the half of the assertion
+        test_the_query_also_matches_raw_kinect_usb_ids was missing - it proved
+        the clause was written, never that a match on it could survive."""
+        head, sep, projection = wi._KINECT_PNP_PS.partition("ForEach-Object")
+        self.assertTrue(sep, "the probe no longer has a projection stage")
+        self.assertIn("VID_045E", head,
+                      "the InstanceId clauses moved out of the filter")
+        self.assertIn(
+            "InstanceId", projection,
+            "the projection discards InstanceId-only matches, so a driverless "
+            "but ENUMERATED Kinect reads as present=False -> 'not detected'")
+
+    @unittest.skipUnless(sys.platform == "win32", "needs a real powershell.exe")
+    def test_a_driverless_kinect_survives_the_real_pipeline(self):
+        """Run the REAL filter+projection text - only the device SOURCE is
+        swapped for a synthetic one, so no hardware is touched and
+        Get-PnpDevice is never called. Fails on the pre-fix projection with
+        present False; passes only when a nameless match still prints."""
+        cmd = wi._KINECT_PNP_PS.replace("Get-PnpDevice -PresentOnly", self._SYNTH)
+        self.assertIn(self._SYNTH, cmd,
+                      "the device source string changed; this test would have "
+                      "silently enumerated real hardware instead")
+        proc = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmd],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # Parsed with the exact expression _probe_kinect_devices uses, because
+        # the blank-line drop is half of what made the old bug invisible.
+        names = tuple(ln.strip() for ln in (proc.stdout or "").splitlines()
+                      if ln.strip())
+        self.assertTrue(
+            names,
+            "a matched, PRESENT device vanished between filter and stdout; "
+            "present would be False and the tile would say 'not detected' "
+            "about a Kinect Windows is enumerating")
+        self.assertIn("VID_045E&PID_02C4", names[0])
+
+
+class OpenStillRunningIsNotAFailureTests(_ReasonBase):
+    """An open that has not FINISHED must never be rendered as one that FAILED.
+
+    kinect_bridge._open_runtime_locked hands "Kinect open already in progress"
+    to whoever LOSES the 0.5 s acquire on its open-attempt lock while the winner
+    is inside the ~16 s verify/retry gauntlet, and get_runtime() feeds that
+    string straight to _publish_open_failure - which latches it into the SAME
+    open_error cell a real failure uses. The ladder's generic `if err:` rung then
+    called it open_failed / "JARVIS could not open the Kinect."
+
+    REPRODUCED END TO END 2026-09-05, no sensor touched: a thread holding
+    _open_attempt_lock made get_stream_health() return open=False,
+    open_error='Kinect open already in progress', cooldown_s=5.0, and feeding
+    that dict to _camera_off_reason gave state=open_failed. At boot that is the
+    NORMAL reading - the always-on body pump is in the gauntlet, the preview
+    compositor's get_color_bgr() loses the race, and the preview file is still
+    last session's, so the tile asks precisely then. The open it was calling
+    dead then SUCCEEDED ("[kinect] sensor live after 2 open attempts",
+    2026-09-04 23:16): a first-frame delay rendered as a hardware fault."""
+
+    def test_an_open_still_in_flight_is_not_reported_as_a_failed_open(self):
+        self.dark("kinect")
+        self.set_enum(True, ("Xbox NUI Sensor",))
+        self.set_health(_health(open=False, open_error=ERR_OPEN_IN_PROGRESS,
+                                cooldown_s=5.0))
+        r = self.reason("kinect")
+        self.assertEqual(
+            r["state"], "open_in_progress",
+            "an open that is STILL RUNNING was reported as %r / %r - the tile "
+            "asserted a failure that has not happened" % (r["state"], r["message"]))
+        self.assertEqual(r["detail"], ERR_OPEN_IN_PROGRESS)   # raw, not prose
+
+    def test_the_in_flight_message_asserts_no_fault_at_all(self):
+        # It may say the open has not finished. It may not say anything broke,
+        # and it may not send the owner to a cable, a plug or a power brick.
+        self.dark("kinect")
+        self.set_enum(True, ("Xbox NUI Sensor",))
+        self.set_health(_health(open=False, open_error=ERR_OPEN_IN_PROGRESS,
+                                cooldown_s=5.0))
+        low = self.reason("kinect")["message"].lower()
+        for lie in ("could not", "failed", "not detected", "power", "adapter",
+                    "plugged", "missing", "stopped"):
+            self.assertNotIn(lie, low, "in-flight message claims %r: %r" % (lie, low))
+
+    def test_a_genuinely_completed_failure_still_reports_open_failed(self):
+        # The new rung must not swallow the real thing it was carved out of: a
+        # constructor that actually returned an error IS a finished failure.
+        self.dark("kinect")
+        self.set_enum(True, ("Xbox NUI Sensor",))
+        self.set_health(_health(open=False, open_error=ERR_CTOR))
+        self.assertEqual(self.reason("kinect")["state"], "open_failed")
+        self.assertNotIn(wi._KINECT_OPEN_IN_PROGRESS, ERR_CTOR)
+
+    def test_a_latched_completed_verdict_still_wins_over_the_marker(self):
+        # The bridge returns `_open_error[0] or "<in progress>"`, so a caller that
+        # loses the acquire while a REAL verdict is already latched gets that
+        # verdict's text back. Those keep their own rungs - the in-flight rung is
+        # checked after them, and must not steal them.
+        self.dark("kinect")
+        self.set_enum(True, ("Xbox NUI Sensor",))
+        for err, want in ((ERR_NO_FRAMES, "no_frames"),
+                          (ERR_NO_PYKINECT, "pykinect2_missing")):
+            self.set_health(_health(open=False, open_error=err))
+            self.assertEqual(self.reason("kinect")["state"], want, err)
+
+    def test_the_bridge_really_emits_the_marker_this_rung_matches(self):
+        """STALE-DUPLICATE GUARD. The rung matches a substring of a string that
+        lives in ANOTHER file; if kinect_bridge rewords it, the tile would drop
+        silently back to "JARVIS could not open the Kinect." with nothing
+        failing. Fail here instead, loudly, in the copy that can be fixed."""
+        src = os.path.join(wi.PROJECT_DIR, "audio", "kinect_bridge.py")
+        with open(src, encoding="utf-8") as fh:
+            bridge = fh.read()
+        self.assertIn(
+            ERR_OPEN_IN_PROGRESS, bridge,
+            "audio/kinect_bridge.py no longer emits %r, so the ladder's "
+            "in-flight rung matches nothing and an open that is merely still "
+            "running renders as a completed failure again" % ERR_OPEN_IN_PROGRESS)
+        self.assertIn(wi._KINECT_OPEN_IN_PROGRESS, ERR_OPEN_IN_PROGRESS)
+
+
+class CameraReasonNotOpenNoErrorTests(_ReasonBase):
+    """(open False, open_error None) is TWO situations, and the tile may not
+    pick one of them.
+
+    THE BUG THIS PINS (2026-09-05, reproduced against the real bridge).
+    kinect_bridge._publish_runtime clears ``_open_error[0]`` on every SUCCESSFUL
+    open, and reset_if_body_stale then drops ``_runtime[0]`` on the
+    both-planes-stale path without ever writing an error. So a Kinect that
+    opened, streamed for an hour and then went quiet on body AND color - the
+    owner's "skeleton rendered for a while then stopped" intermittent - leaves
+    get_stream_health() reading open False / open_error None: byte for byte the
+    cold-start reading. The tile answered "Kinect state unknown - JARVIS has not
+    tried the sensor yet." for the whole ~16 s reopen gauntlet, which sent him
+    hunting a boot problem while the sensor was mid-death."""
+
+    # What get_stream_health() returns in the instant AFTER reset_if_body_stale
+    # tears a LIVE runtime down: no runtime, no error, the always-on pump still
+    # alive, and BOTH frame clocks re-seeded by the reset itself - so pump_alive
+    # and the *_age_s cells look exactly like a freshly enabled cold start too.
+    TORN_DOWN = dict(open=False, open_error=None, pump_alive=True,
+                     body_age_s=0.4, color_age_s=0.4)
+
+    def setUp(self):
+        super().setUp()
+        self.dark("kinect")
+        self.set_enum(True, ("Xbox NUI Sensor",))     # enumeration SUCCEEDS
+
+    def test_a_sensor_that_died_mid_session_is_not_called_untried(self):
+        self.set_health(_health(**self.TORN_DOWN))
+        r = self.reason("kinect")
+        msg = r["message"].lower()
+        # The LIE first, so a regression fails on the sentence the owner reads
+        # rather than on the state name, which is only its label.
+        for lie in ("has not tried", "not tried the sensor", "never tried",
+                    "has not probed", "state unknown"):
+            self.assertNotIn(
+                lie, msg,
+                "the tile told the owner %r about a sensor that had just been "
+                "streaming: %s" % (lie, r["message"]))
+        self.assertEqual(r["state"], "not_open_no_error")
+
+    def test_the_message_names_both_candidates_and_asserts_neither(self):
+        self.set_health(_health(**self.TORN_DOWN))
+        msg = self.reason("kinect")["message"].lower()
+        self.assertIn("probed", msg)                  # candidate 1: never asked
+        self.assertIn("dropped", msg)                 # candidate 2: died on us
+        self.assertIn(" or ", msg)                    # ...offered as a choice
+        # And it still blames no hardware it has not established.
+        for blame in ("not detected", "power", "plugged", "missing"):
+            self.assertNotIn(blame, msg, msg)
+
+    def test_cold_start_and_torn_down_get_the_SAME_answer(self):
+        """Neither reading may out-rank the other: the ladder cannot tell them
+        apart, so producing two different sentences would mean it had guessed."""
+        self.set_health(_health(open=False, open_error=None))
+        cold = self.reason("kinect")
+        self.set_health(_health(**self.TORN_DOWN))
+        dead = self.reason("kinect")
+        self.assertEqual(cold["state"], dead["state"])
+        self.assertEqual(cold["message"], dead["message"])
+
+    def test_detail_carries_observed_evidence_not_a_verdict(self):
+        # detail lands in the tile's hover title. It may report what was seen -
+        # the preview file's age - and must not name a cause.
+        self.set_health(_health(**self.TORN_DOWN))
+        d = self.reason("kinect").get("detail", "")
+        self.assertIn("no runtime open", d)
+        self.assertIn("no recorded open error", d)
+        self.assertIn("none on disk", d)              # nothing was ever written
+        path = self.lit("kinect")                     # now a frame DOES exist...
+        old = time.time() - (wi._CAMERA_PREVIEW_STALE_S + 30)
+        os.utime(path, (old, old))                    # ...but a stale one
+        d2 = self.reason("kinect").get("detail", "")
+        self.assertIn("last kinect preview frame:", d2)
+        self.assertIn("s ago", d2)
+        self.assertNotIn("none on disk", d2)
+
+    def test_the_bridge_still_cannot_tell_these_two_apart(self):
+        """STALE-DUPLICATE GUARD, and the trigger to SHARPEN this rung.
+
+        The hedge is only correct while the bridge records nothing on teardown.
+        The day reset_if_body_stale starts marking the runtime as torn down (or
+        _publish_runtime starts latching a has-ever-opened flag), the tile can
+        stop hedging - and this test fails to say so, in the copy that has to
+        change, instead of the hedge quietly outliving its reason."""
+        src = os.path.join(wi.PROJECT_DIR, "audio", "kinect_bridge.py")
+        with open(src, encoding="utf-8") as fh:
+            bridge = fh.read()
+        tree = ast.parse(bridge)
+        bodies = {n.name: ast.get_source_segment(bridge, n)
+                  for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef)}
+        self.assertIn("_publish_runtime", bodies)
+        self.assertIn("reset_if_body_stale", bodies)
+        self.assertIn("_open_error[0] = None", bodies["_publish_runtime"],
+                      "_publish_runtime no longer clears the error on a good "
+                      "open - re-check whether the ladder still has to hedge")
+        self.assertNotIn(
+            "_open_error", bodies["reset_if_body_stale"],
+            "reset_if_body_stale now writes _open_error, so a torn-down runtime "
+            "is finally distinguishable from a never-probed one: the "
+            "not_open_no_error rung can name which one it is")
+
+
+def _js_fn(html, name):
+    """The rendered source of one page function, so a test can assert about the
+    body it cares about instead of about the whole 180 KB document."""
+    start = html.index("function %s(" % name)
+    return html[start:html.index("\n}", start)]
+
+
+class MidStreamDeathTests(_ReasonBase):
+    """A camera that dies WHILE STREAMING.
+
+    THE DEFECT (2026-09-05): the tile could only ever be taken down by the
+    <img> `error` event, and a server that closes a multipart/x-mixed-replace
+    response after a COMPLETE part fires no such event. Measured against a real
+    Chrome on this box, three different endings - a clean close after a
+    complete part, a truncated final part, and boundary+headers then close -
+    each produced exactly ONE event, `load` at 413 ms (just after the FIRST
+    frame), and nothing at all at the close ~1.6 s later; img.complete stayed
+    true and naturalWidth kept the last frame's size the whole time. So `load`
+    is neither per-frame nor an end-of-stream signal, and NO DOM signal reports
+    the ending at all.
+
+    The live consequence, reproduced on this machine: with all three tiles
+    streaming, stopping ONLY the kinect writer left the server 404ing
+    /api/camera-preview?cam=kinect 61 s later while the browser tile still read
+    streaming='1', errs='0', naturalWidth=160 and 'checking...' - a minutes-old
+    frozen picture the dashboard was presenting as live, with the entire reason
+    ladder unreachable behind it. That is the exact failure this whole feature
+    exists to prevent: a tile asserting something it has not established.
+
+    So the page cannot wait for an event, it has to ASK. These tests cover the
+    fact it asks for (/api/camera-live) and the wiring that lets the tick take a
+    streaming tile down with no DOM event involved.
+    """
+
+    def live(self):
+        code, j = _get(self.base + "/api/camera-live")
+        self.assertEqual(code, 200)
+        return j["cams"]
+
+    def test_camera_live_answers_for_every_tile_independently(self):
+        self.lit("left")
+        self.dark("right")
+        self.dark("kinect")
+        self.assertEqual(self.live(),
+                         {"left": True, "right": False, "kinect": False})
+
+    def test_camera_live_flips_at_the_same_instant_the_stream_closes(self):
+        """The supervisor and the thing it supervises must share ONE rule.
+
+        If /api/camera-live were even slightly more patient than
+        _stream_camera's staleness test, the tick would keep re-arming a stream
+        the server has already decided to close, and the tile would flap."""
+        self.lit("kinect")
+        self.assertTrue(self.live()["kinect"])
+        path = wi._preview_path_for(
+            {"camera_preview_path": self.camera_preview_path}, "kinect")
+        old = time.time() - (wi._CAMERA_PREVIEW_STALE_S + 1.0)
+        os.utime(path, (old, old))
+        self.assertFalse(self.live()["kinect"],
+                         "the supervisor still calls this tile live after the "
+                         "stream route would have closed it")
+        # ...and the stream route agrees, right now, about the same file. Safe
+        # to request only because it is STALE: a fresh one would stream forever.
+        code, _ = _get_raw(self.base + "/api/camera-stream?cam=kinect")
+        self.assertEqual(code, 404)
+
+    def test_camera_live_never_runs_the_device_probe(self):
+        """It sits on the POLL path (about 1 Hz while the Camera tab is open),
+        so it must never reach the ~0.7 s powershell sweep behind the ladder."""
+        self.dark("kinect")
+        self.set_health(_health(open=False, open_error=ERR_NO_FRAMES))
+        for _ in range(5):
+            self.live()
+        self.assertEqual(self.probe_calls, [],
+                         "the liveness poll spawned the device probe: %s"
+                         % self.probe_calls)
+
+    def test_the_tick_can_take_a_streaming_tile_down_with_no_dom_event(self):
+        """THE REGRESSION TEST.
+
+        Before the fix nothing in the tick could clear a tile's
+        dataset.streaming - only the `error` listener did, and that listener
+        never runs for a mid-stream close. So startCameraStreams() skipped the
+        tile forever and the frozen frame stayed up."""
+        code, html = _get_raw(self.base + "/")
+        self.assertEqual(code, 200)
+
+        tick = html.split("function refreshCamera")[1]
+        self.assertIn("checkCameraLiveness()", tick,
+                      "the supervisor tick does not consult the server, so a "
+                      "camera that dies mid-stream is again invisible to it")
+
+        live = _js_fn(html, "checkCameraLiveness")
+        self.assertIn("/api/camera-live", live)
+        self.assertIn("tileDown(", live,
+                      "the liveness answer is fetched but cannot take the "
+                      "tile down")
+
+        down = _js_fn(html, "tileDown")
+        self.assertIn("dataset.streaming = ''", down,
+                      "a tile taken down still looks connected, so the tick "
+                      "will keep skipping it")
+        self.assertIn("explainTile(", down,
+                      "the tile goes dark with no sentence - a blank tile and "
+                      "no reason is the state this feature exists to remove")
+
+    def test_a_tile_can_never_be_hidden_without_being_explained(self):
+        """Hiding lives in exactly ONE function. Two copies of 'hide the tile'
+        is how one of them ends up without the explanation."""
+        _code, html = _get_raw(self.base + "/")
+        self.assertEqual(html.count("off.style.display='flex'"), 1,
+                         "more than one place hides a tile behind its "
+                         "placeholder; they will drift")
+        self.assertIn("off.style.display='flex'", _js_fn(html, "tileDown"))
+
+    def test_liveness_may_only_ever_take_a_tile_down(self):
+        """A fresh FILE is not proof that THIS browser is receiving frames, so
+        the supervisor must not be able to declare a tile live - that stays the
+        stream's job, on evidence the stream itself delivered."""
+        live = _js_fn(html=_get_raw(self.base + "/")[1],
+                      name="checkCameraLiveness")
+        for up in ("display='block'", 'display="block"', "streaming = '1'"):
+            self.assertNotIn(up, live,
+                             "the liveness poll brings a tile UP on file "
+                             "freshness alone: %r" % up)
+
+    def test_the_stream_docstring_no_longer_claims_the_close_fires_error(self):
+        """The claim was measured false in Chrome. It sat in the code for a day
+        and is exactly why the client was built to wait for an event that never
+        comes, so it must not come back."""
+        with open(wi.__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        body = src[src.index("def _stream_camera("):]
+        body = body[:body.index('"""', body.index('"""') + 3)]
+        self.assertNotIn("fires the same `error` on the client", body)
+        self.assertIn("/api/camera-live", body,
+                      "the docstring does not say what actually notices the "
+                      "close, so the next reader re-learns it the hard way")
+
+
+class CameraLiveTokenTests(_ReasonBase):
+    token = "s3cr3t"
+
+    def test_liveness_requires_the_token(self):
+        code, _ = _get_raw(self.base + "/api/camera-live")
+        self.assertEqual(code, 401)
+        code, _ = _get_raw(self.base + "/api/camera-live",
+                           headers={"X-Auth-Token": self.token})
+        self.assertEqual(code, 200)
 
 
 if __name__ == "__main__":

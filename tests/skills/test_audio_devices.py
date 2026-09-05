@@ -117,6 +117,47 @@ class ReachabilityTests(_Base):
             "registered but undocumented — the model can never emit these, so "
             f"they are dead on arrival: {missing}")
 
+    def test_the_names_survive_the_LOCAL_prompt_slimmer(self):
+        """Presence in core/prompts.py is NOT reachability.
+
+        2026-09-05, found by live test after this file was already green: the
+        block had been inserted after the volume lines, which put it INSIDE the
+        MUSIC CONTROLS section. On the DEFAULT local path
+        (core/prompt_router.slim_pc_control) only the sections a turn implicates
+        are shipped, and "what microphone are you using" does not implicate
+        music — so the names were in the file, in the speak set, registered,
+        and STILL unreachable. JARVIS answered [ACTION: system_pulse] again,
+        verbatim, with this file passing.
+
+        test_every_registered_action_is_routable above cannot catch that: its
+        _prompt_source() concatenates every module string, i.e. the PRE-SLIM
+        text. This one asks the question that actually matters — after routing,
+        can the model still emit the name?"""
+        from core import prompt_router, prompts
+        for utt in ("what microphone are you using right now",
+                    "what mic are you using",
+                    "what microphone are you on",
+                    "what speakers are you using",
+                    "what audio devices are you using"):
+            slim = prompt_router.slim_pc_control(utt, prompts.PC_CONTROL_PROMPT)
+            self.assertIn(
+                "what_microphone" if "mic" in utt else "what_speakers"
+                if "speaker" in utt else "audio_devices", slim,
+                f"the local router drops the audio-device actions for {utt!r} — "
+                f"the model cannot emit a name it was never shown")
+
+    def test_the_audio_device_block_is_its_own_section(self):
+        # The mechanism behind the test above: only a real section header
+        # (column 0, all-caps, trailing colon) gets its own routing entry. As an
+        # indented sub-heading it was folded into whatever section preceded it.
+        from core import prompt_router, prompts
+        _core, sections = prompt_router.split_pc_control(prompts.PC_CONTROL_PROMPT)
+        owners = [h for h, body in sections if "what_microphone" in body]
+        self.assertTrue(
+            any("AUDIO DEVICE" in h.upper() for h in owners),
+            f"the mic actions live in {owners} — they need their own section so "
+            f"prompt_router can route to them by keyword")
+
     def test_the_reported_phrasing_is_steered_away_from_system_pulse(self):
         # The actual owner-reported failure. Documenting the names is necessary
         # but not sufficient: system_pulse is a plausible neighbour, so the

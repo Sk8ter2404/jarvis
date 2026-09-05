@@ -119,7 +119,7 @@ L1 NOTHING PERSISTS. Every change is a process-memory cell. This module writes
    permanently off. Use `_idle_cfg_flag` (a live core.config flip) for anything
    whose own action persists. A source-shaped test CANNOT see that mistake — the
    write happens in the called skill — so it is pinned behaviourally instead, in
-   tests/skills/test_game_mode_no_persist.py, against the real settings writer.
+   tests/skills/test_game_mode_l1_kinect_levers.py, against the real settings writer.
 L2 PID WATCHDOG, NOT EVENTS. Exit is decided by polling "is this pid alive".
    A missed event, swallowed exception or dropped callback still recovers.
 L3 DEADMAN CEILING (GAME_MODE_MAX_SECONDS, and a hard 2x absolute ceiling).
@@ -1319,7 +1319,7 @@ def _suspend_luxuries(notes: list, applied: dict) -> None:
     #    data/diagnostic_daemons.json that four loops read back from disk, so it
     #    survives the power button and would leave the crash-watch dead
     #    forever. Full reasoning at lever 6 above. Pinned by
-    #    tests/skills/test_game_mode_no_persistence.py.
+    #    tests/skills/test_game_mode_l1_no_disk_writes.py.
 
 
 def _restore_luxuries(notes: list, applied: dict) -> None:
@@ -1547,7 +1547,7 @@ def _enter(pid, exe, manual: bool = False, *, defer_verify: bool = False) -> str
             prev_brain = _repoint_brain(new_tag, notes)
             downshifted = _current_brain() == new_tag
             notes.append(f"brain: {old_tag} -> {new_tag} ({why})"
-                         if downshifted else f"brain: repoint did not stick")
+                         if downshifted else "brain: repoint did not stick")
         else:
             notes.append(f"brain: NOT downshifted — {why}")
 

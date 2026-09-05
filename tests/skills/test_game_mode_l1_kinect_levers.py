@@ -50,6 +50,13 @@ and every Ollama/nvidia-smi primitive is replaced, so nothing here allocates a
 model, touches the GPU, or reaches the live Ollama server.
 
 stdlib unittest + unittest.mock only (pytest is not installed).
+SIBLING: tests/skills/test_game_mode_l1_no_disk_writes.py pins the SAME L1
+claim from the other side — by observing real bytes on disk rather than by
+recording calls. These were once named test_game_mode_no_persist.py and
+test_game_mode_no_persistence.py, one character apart, which in a codebase
+whose #1 defect is "fixed in one copy, left to rot in the other" was a trap.
+If you change L1 behaviour, change BOTH.
+
 """
 from __future__ import annotations
 

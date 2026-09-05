@@ -49,6 +49,12 @@ WHAT THESE TESTS DO DIFFERENTLY
 
 Nothing here touches a real process, GPU, model, camera, Kinect or the real
 data/ directory. stdlib unittest + unittest.mock only (pytest is not installed).
+SIBLING: tests/skills/test_game_mode_l1_kinect_levers.py pins the SAME L1
+claim from the other side — by recording which persisting actions get
+called, and it carries the write-up of the original defect (the Kinect
+levers persisted through their spoken actions). If you change L1
+behaviour, change BOTH.
+
 """
 from __future__ import annotations
 
