@@ -1078,16 +1078,67 @@ BAMBU_CAMERA_AUTO_WHILE_PRINTING = False
 # ─── Auto-switch default audio on headset power (audio/audio_switch.py) ──
 # A USB-dongle wireless headset (e.g. a CORSAIR VOID ELITE) keeps its dongle
 # plugged in whether the headset is ON or off, so plug/unplug detection misses
-# the power state. Windows flips the headset's audio ENDPOINT Active<->NotPresent
-# instead; this watcher polls that and moves the SYSTEM default render device:
-#   headset ON  -> default = the headset   (remembers the prior default)
-#   headset OFF -> default = the prior default, else AUDIO_AUTOSWITCH_FALLBACK
+# the power state.
+#
+# CORRECTED 2026-09-05. The sentence that stood here until now said "Windows
+# flips the headset's audio ENDPOINT Active<->NotPresent instead; this watcher
+# polls that". That is FALSE and was never measured. Measured 2026-09-04 with
+# the CORSAIR VOID ELITE POWERED OFF, Windows reported BOTH of its endpoints
+# Status=OK / Active, because the endpoint belongs to the DONGLE. The watcher
+# reads the dongle's Corsair vendor HID report (audio/void_link.py) instead,
+# which is three-valued (on / off / genuinely unknown), and unknown HOLDS.
+#
+#   PLAYBACK  headset ON  -> default = the headset (remembers the prior default)
+#             headset OFF -> prior default, else AUDIO_AUTOSWITCH_FALLBACK
+#   RECORDING (AUDIO_AUTOSWITCH_MIC only)
+#             headset ON  -> default mic = the headset's microphone
+#             headset OFF -> remembered mic, else AUDIO_AUTOSWITCH_MIC_FALLBACK
+#
 # Opt-in. HEADSET/FALLBACK are case-insensitive substrings of the Windows
 # device friendly name (see `python -m audio.audio_switch --list`).
 AUDIO_AUTOSWITCH_ENABLED  = os.getenv("JARVIS_AUDIO_AUTOSWITCH", "").lower() in ("1", "true", "yes", "on")
 AUDIO_AUTOSWITCH_HEADSET  = os.getenv("JARVIS_AUDIO_HEADSET", "")    # e.g. "CORSAIR VOID ELITE"
 AUDIO_AUTOSWITCH_FALLBACK = os.getenv("JARVIS_AUDIO_FALLBACK", "")   # e.g. "Realtek USB2.0 Audio"
 AUDIO_AUTOSWITCH_POLL_S   = float(os.getenv("JARVIS_AUDIO_POLL_S", "3.0"))
+
+# The INPUT half — make the MICROPHONE follow the headset's power too.
+# Separate from AUDIO_AUTOSWITCH_ENABLED and OFF by default: it writes the
+# default RECORDING endpoint, and getting that wrong is how JARVIS goes deaf
+# (measured 2026-09-05 00:48-00:52 — the output moved to the speakers, the
+# input stayed on the powered-off headset, and the VAD read peak RMS 0.0000).
+AUDIO_AUTOSWITCH_MIC = os.getenv("JARVIS_AUDIO_MIC_FOLLOW", "").lower() in ("1", "true", "yes", "on")
+
+# The desk microphone to fall back to when the headset powers off. It needs its
+# OWN setting and must NOT borrow AUDIO_AUTOSWITCH_FALLBACK: measured
+# 2026-09-05, that setting's value on this machine ("Realtek USB2.0 Audio") has
+# ZERO Active RECORDING endpoints — Line In and Microphone both Unplugged,
+# Internal AUX Jack Disabled — so reusing it would resolve to nothing and
+# silently no-op, which is the exact failure shape (a device of the wrong
+# direction sitting in a fallback slot, saying nothing) that this module was
+# rewritten to eliminate. Blank = the input half has nothing to fall back to
+# and will say so loudly rather than move the microphone somewhere unverified.
+# Check a candidate with `python -m audio.audio_switch --list-mics`.
+AUDIO_AUTOSWITCH_MIC_FALLBACK = os.getenv("JARVIS_AUDIO_MIC_FALLBACK", "")  # e.g. "Blue Snowball"
+
+# How long the SELECTED headset microphone may produce literal digital silence,
+# while the capture loop is demonstrably running, before the watcher moves off
+# it. This is the ON side's only signal test and the only place in the audio
+# auto-switch that measures HEARING rather than SELECTION.
+#
+# WHY IT EXISTS. The ON side fired once, on the power-up transition, and then
+# never looked again: `if was_on is True: return None` was the whole
+# steady-state branch. So a headset that is powered ON but hearing nothing —
+# boom mic flipped up (its own hardware mute), the endpoint muted in Windows,
+# the owner in another room — got the default recording endpoint moved onto it
+# and kept it, for hours. The OFF rescue cannot help there, because the headset
+# MEASURES powered on, and nothing consulted the microphone's actual signal.
+#
+# 60 s, not 30. core.audio_processor already WARNS at MIC_SILENT_WARN_SECONDS
+# = 30 s; this MOVES a device, so it wants a longer, more confident window and
+# deliberately sits behind that warning rather than racing it.
+# <= 0 switches the watchdog off entirely (the ON side then behaves as it did
+# before 2026-09-05, i.e. fire-once-and-never-re-check).
+AUDIO_AUTOSWITCH_MIC_SILENT_S = float(os.getenv("JARVIS_AUDIO_MIC_SILENT_S", "60.0"))
 
 
 # ─── Mic / speaker device selection (bobert_companion _refresh_devices) ─
