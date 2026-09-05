@@ -4414,15 +4414,32 @@ def _open_tile_capture(idx: int) -> "cv2.VideoCapture | None":
     """Open a side-tile webcam at `idx` (DirectShow), modest 640×480 since it's
     only a thumbnail. Returns an opened capture or None. Serialised on
     _camera_io_lock (DirectShow heap-corrupts on overlapping open/release).
-    NEVER raises."""
-    try:
+    NEVER raises.
+
+    THIS IS WHERE THE PRODUCER DIED (measured 2026-09-05, py-spy, live PID).
+    The thread sat forever on `cap.set(CAP_PROP_FRAME_HEIGHT, 480)` for a sick
+    USB 2.0 webcam, INSIDE `with _camera_io_lock:`, so it published nothing for
+    any camera - left, right and Kinect tiles all went dark - and, because a
+    hang raises nothing, said not one word about it.
+
+    Two guards, both cheap on the healthy path:
+      * a QUARANTINED index is never opened at all (that is the only way to
+        stop a known-sick device from finding this wedge again), and
+      * the open itself is BOUNDED - it runs on a throwaway worker that owns
+        the lock, and we walk away after _CAMERA_OPEN_TIMEOUT_S.
+    The healthy path still performs exactly one DirectShow open, as before."""
+    if _camera_is_quarantined(idx):
+        return None
+
+    def _do_open():
         with _camera_io_lock:
             cap = cv2.VideoCapture(int(idx), cv2.CAP_DSHOW)
             if not cap.isOpened():
-                try:
-                    cap.release()
-                except Exception:
-                    pass
+                # Through the lock OBJECT, not a bare release: if this worker
+                # was abandoned and its lock retired while cv2.VideoCapture was
+                # still inside its 20-30 s retry loop, a bare release here would
+                # overlap live camera I/O. See _release_on_current_camera_lock.
+                _release_on_current_camera_lock(cap)
                 return None
             try:
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -4431,7 +4448,11 @@ def _open_tile_capture(idx: int) -> "cv2.VideoCapture | None":
             except Exception:
                 pass
             return cap
+
+    try:
+        return _open_capture_bounded(idx, _do_open, label=f"side tile index {idx}")
     except Exception:
+        logging.exception("[face-track] _open_tile_capture failed for index %s", idx)
         return None
 
 
@@ -4486,6 +4507,12 @@ def _face_track_frame_for_slot(slot: str, now: float):
             if _percam_side(cam) != slot:
                 continue
             idx = cam.get("index")
+            # A benched camera has no live frame worth reusing, and letting the
+            # fast path decline here would drop us into the OPEN fallback that
+            # wedged the producer. Say "nothing" outright: the slot becomes a
+            # placeholder and no DirectShow call is made for it at all.
+            if _camera_is_quarantined(idx, now):
+                return None
             with _camera_state_lock:
                 frame = _camera_latest_frame.get(idx)
                 seen_at = _camera_last_frame_at.get(idx, 0.0)
@@ -4528,11 +4555,8 @@ def _read_side_tile_webcams(now: float) -> dict:
                 _kinect_tile_last_read[slot] = now
                 cap = _kinect_tile_caps.get(slot)
                 if cap is not None:
-                    try:
-                        with _camera_io_lock:
-                            cap.release()
-                    except Exception:
-                        pass
+                    _release_capture_guarded(cap, idx=f"tile/{slot}",
+                                             label="side tile")
                     _kinect_tile_caps[slot] = None
                 continue
             if name_idx is None:
@@ -4543,13 +4567,25 @@ def _read_side_tile_webcams(now: float) -> dict:
                 # handle/frame so the slot becomes a placeholder.
                 cap = _kinect_tile_caps.get(slot)
                 if cap is not None:
-                    try:
-                        with _camera_io_lock:
-                            cap.release()
-                    except Exception:
-                        pass
+                    _release_capture_guarded(cap, idx=f"tile/{slot}",
+                                             label="side tile")
                     _kinect_tile_caps[slot] = None
                 _kinect_tile_frames[slot] = None
+                continue
+            # QUARANTINE GATE (2026-09-05). The producer wedged HERE, opening a
+            # camera the face-track loop had already given up on: the fast path
+            # declines the moment the loop's cached frame goes stale (2.0 s),
+            # which is exactly when the camera is sick, so the fallback below
+            # re-opened the wedging device on every composite. A benched camera
+            # is not opened, not read and not released - its slot simply goes to
+            # the placeholder, and the OTHER slot keeps publishing.
+            if _camera_is_quarantined(idx, now):
+                cap = _kinect_tile_caps.get(slot)
+                if cap is not None:
+                    _release_capture_guarded(cap, idx, f"side tile {slot}")
+                    _kinect_tile_caps[slot] = None
+                _kinect_tile_frames[slot] = None
+                _kinect_tile_last_read[slot] = now
                 continue
             # Throttle: reuse the cached frame between reads.
             if (now - _kinect_tile_last_read.get(slot, 0.0)
@@ -4583,11 +4619,7 @@ def _read_side_tile_webcams(now: float) -> dict:
                 out[slot] = frame
             else:
                 # Read failed — release so the next tick re-opens; placeholder now.
-                try:
-                    with _camera_io_lock:
-                        cap.release()
-                except Exception:
-                    pass
+                _release_capture_guarded(cap, idx, f"side tile {slot}")
                 _kinect_tile_caps[slot] = None
                 _kinect_tile_frames[slot] = None
                 # A failing read is the classic symptom of a bus re-enumeration
@@ -4605,11 +4637,10 @@ def _release_side_tile_webcams() -> None:
         for slot in ("left", "right"):
             cap = _kinect_tile_caps.get(slot)
             if cap is not None:
-                try:
-                    with _camera_io_lock:
-                        cap.release()
-                except Exception:
-                    pass
+                # Guarded: this runs from inside the face-track loop, so a
+                # blocking acquire here is another way to hang the producer.
+                _release_capture_guarded(cap, idx=f"tile/{slot}",
+                                         label="side tile")
             _kinect_tile_caps[slot] = None
             _kinect_tile_frames[slot] = None
             _kinect_tile_last_read[slot] = 0.0
@@ -5238,12 +5269,978 @@ def _warn_slow_camera_read(label: str, idx: int, ms: float, now: float) -> None:
     except Exception:
         pass
 
+
+# SHARED-PREVIEW FAILOVER ANNOUNCEMENTS (2026-09-05). The keep-alive at the
+# bottom of the per-camera loop keeps the HUD tile alive when the PRIMARY
+# camera never reaches its publish branch (benched, backing off, or failing to
+# reopen). Keeping it alive is only half the job: showing the RIGHT webcam in
+# the tile the owner reads as the LEFT one, and saying nothing, is exactly the
+# kind of quiet substitution this file exists to stamp out. Both states are
+# announced, throttled to one line per minute so a long bench can't flood the
+# session log, and re-announced when the state changes.
+_PREVIEW_FAILOVER_LOG_GAP_S = 60.0
+# [last-log-ts, last-state-key] - state key flips when the substituted camera
+# changes or the starved/substituted state flips, forcing a fresh line.
+_preview_failover_log = [0.0, ""]
+
+
+def _note_preview_failover(cam: dict, now: float) -> None:
+    """The shared HUD preview is being served by a NON-primary camera because
+    the primary could not publish. Throttled; never raises."""
+    try:
+        key = f"failover:{cam.get('index')}"
+        if (key == _preview_failover_log[1]
+                and (now - _preview_failover_log[0]) < _PREVIEW_FAILOVER_LOG_GAP_S):
+            return
+        _preview_failover_log[0] = now
+        _preview_failover_log[1] = key
+        primary = next((c for c in CAMERAS if c.get("primary")), None)
+        p_lbl = (f"{primary.get('label')} (index {primary.get('index')})"
+                 if primary else "the primary camera")
+        msg = (f"  [face-track] {p_lbl} is not publishing (benched or backing "
+               f"off) - the HUD camera tile is now showing "
+               f"{cam.get('label')} (index {cam.get('index')}) instead. The "
+               f"view in that tile is NOT the primary camera.")
+        print(msg)
+        logging.warning(msg.strip())
+    except Exception:
+        pass
+
+
+def _note_preview_starved(now: float) -> None:
+    """No camera produced a frame this iteration, so the shared HUD preview is
+    going stale. Say WHY rather than letting the tile just go dark. Throttled;
+    never raises."""
+    try:
+        key = "starved"
+        if (key == _preview_failover_log[1]
+                and (now - _preview_failover_log[0]) < _PREVIEW_FAILOVER_LOG_GAP_S):
+            return
+        _preview_failover_log[0] = now
+        _preview_failover_log[1] = key
+        benched = [f"{e.get('label') or idx} (index {idx})"
+                   for idx, e in get_camera_quarantine().items()
+                   if e.get("quarantined")]
+        why = (f"benched: {', '.join(benched)}" if benched
+               else "no camera delivered a frame this iteration")
+        msg = (f"  [face-track] the HUD camera tile is going stale - no camera "
+               f"could publish a frame ({why}). This is JARVIS reporting a "
+               f"camera problem, NOT the HUD failing.")
+        print(msg)
+        logging.warning(msg.strip())
+    except Exception:
+        pass
+
+
 # Serializes every cv2.VideoCapture open / release across threads (probe sweep,
 # face-tracking, list-cameras, snapshot). DirectShow heap-corrupts when an
 # abandoned probe worker's release() overlaps another thread's release(), so
 # every cv2 capture handle is brought up and torn down inside this lock.
 # RLock so a single thread can do open + release in one critical section.
-_camera_io_lock = threading.RLock()
+class _CameraIOLock:
+    """The process-wide camera I/O lock — an RLock that can be RETIRED.
+
+    WHY THIS IS NOT JUST ``threading.RLock()`` (measured 2026-09-05, stub
+    opener, no camera involved):
+
+    The bounded-open machinery below abandons a worker that does not return in
+    time. That worker is parked INSIDE ``with _camera_io_lock:`` — wedged in a
+    C-level DirectShow call — and it never comes back, so with a plain RLock it
+    OWNS THE PROCESS-WIDE CAMERA LOCK FOREVER. Everything downstream then fails
+    while blaming the wrong thing, and it was all measured:
+
+      * ``_camera_io_lock.acquire(timeout=1.0)`` from any other thread returned
+        False permanently — which is the exact probe skills/self_diagnostic.py
+        runs, so its webcam check would read UNVERIFIED for the rest of the
+        session ("the face tracker holds _camera_io_lock") no matter how
+        healthy the cameras were;
+      * an open of the HEALTHY primary (index 2, the eMeet C960) returned None
+        after its full timeout with the opener body executed ZERO times — it
+        never touched DirectShow at all, it only queued on the dead lock;
+      * three of those in 120 s printed
+        "QUARANTINE Left webcam (PRIMARY) (index 2) - 3 failed recovery cycles
+        ... (open wedged >1.0s) ... every OTHER camera keeps publishing"
+        while benching the one camera that was fine and with no other camera
+        publishing;
+      * every ``_release_capture_guarded`` timed out and parked a leaked handle.
+
+    So one sick camera still took every camera down — it just took three extra
+    timeouts to get there, and it logged the opposite of what happened. That is
+    the same end state the bounded-open work exists to prevent.
+
+    THE FIX: when a worker is abandoned while it OWNS the lock, that lock is
+    RETIRED — kept alive forever (its wedged owner still holds it and will
+    ``release()`` it whenever DirectShow lets go, which must not explode) and
+    replaced by a fresh RLock that live threads serialize on instead.
+
+    ``acquire`` therefore polls in short slices rather than blocking on one
+    underlying lock forever: a thread already queued on a lock that gets retired
+    under it MIGRATES to the replacement instead of waiting for a wedge that is
+    never coming back. On the healthy, uncontended path the very first slice
+    succeeds, so this costs nothing.
+
+    WHAT THIS DELIBERATELY DOES **NOT** WEAKEN: every RELEASE still happens
+    inside whatever lock is CURRENT at the moment of the release — the wedged
+    worker's own late teardown re-enters through this object, so it acquires the
+    replacement, and no release ever overlaps another. Overlapping releases are
+    what corrupt the DirectShow heap (0xc0000374); an abandoned OPEN racing a
+    healthy open on a different device is the price this file already chose to
+    pay when it started abandoning workers at all (see _camera_pending_releases
+    and _defer_camera_release, which keep the same discipline for releases the
+    producer could not perform in time).
+
+    Drop-in for threading.RLock: ``acquire(blocking=True, timeout=-1)``,
+    ``release()``, and the context-manager protocol — which is all any caller
+    in this repo uses (skills/self_diagnostic.py's _CameraLockHold and
+    _attempt_camera_wake both call ``acquire(timeout=...)`` / ``release()``).
+    """
+
+    # How long a waiter sits on one underlying lock before re-checking whether
+    # that lock was retired under it. Far below every camera timeout in this
+    # file (4 s / 5 s / 35 s), so a rotation is invisible; and irrelevant to
+    # throughput because this lock is taken a handful of times a second at most.
+    _RECHECK_S = 0.05
+
+    def __init__(self) -> None:
+        self._swap = threading.Lock()     # guards _lock / _owner / _hold_id
+        self._lock = threading.RLock()    # the CURRENT underlying lock
+        self._owner = None                # ident of the thread holding _lock
+        # Bumped on every OUTERMOST acquire. A caller that saw hold N and then
+        # asks to retire hold N is asking about THAT hold: if the owner let go
+        # and took the lock again in between, the id has moved on and the
+        # retirement is refused. Without it, retire() is a check-then-act race
+        # that can rotate the lock out from under a LIVE camera operation -
+        # which is the overlapping-teardown heap corruption, not a fix for it.
+        self._hold_id = 0
+        self._retired: list = []          # never released, never collected
+        self._local = threading.local()   # per-thread stack of held locks
+
+    def _stack(self) -> list:
+        s = getattr(self._local, "stack", None)
+        if s is None:
+            s = []
+            self._local.stack = s
+        return s
+
+    def _claim(self, lk, me) -> bool:
+        """Record a just-acquired underlying lock, or refuse it if it has been
+        retired in the meantime. Returns True when the caller may keep `lk`."""
+        with self._swap:
+            if lk is not self._lock:
+                return False
+            st = self._stack()
+            if lk not in st:            # OUTERMOST hold, not a reentrant one
+                self._hold_id += 1
+                self._owner = me
+            st.append(lk)
+            return True
+
+    # ---- threading.RLock-compatible surface ------------------------------
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        me = threading.get_ident()
+        if not blocking:
+            timeout = 0.0
+        deadline = (None if (timeout is None or timeout < 0)
+                    else time.monotonic() + max(0.0, timeout))
+        while True:
+            with self._swap:
+                lk = self._lock
+            slice_s = self._RECHECK_S
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    # One last non-blocking try so a zero/expired budget can
+                    # still take a free lock (matches RLock(blocking=False)).
+                    if lk.acquire(False):
+                        if self._claim(lk, me):
+                            return True
+                        lk.release()
+                    return False
+                slice_s = min(slice_s, remaining)
+            if lk.acquire(True, slice_s):
+                if self._claim(lk, me):
+                    return True
+                # Retired while we were queued on it. Hand it straight back and
+                # re-aim at the replacement — THIS is what stops a poisoned lock
+                # from parking every camera thread in the process forever.
+                lk.release()
+
+    def release(self) -> None:
+        st = self._stack()
+        if not st:
+            raise RuntimeError("release of an un-acquired camera I/O lock")
+        lk = st.pop()
+        with self._swap:
+            # Only clear ownership when this thread is giving up its LAST hold
+            # on the lock that is still current (a nested hold, or a hold on an
+            # already-retired lock, must not clear the live owner).
+            if (lk is self._lock and lk not in st
+                    and self._owner == threading.get_ident()):
+                self._owner = None
+        lk.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+        return False
+
+    # ---- retirement ------------------------------------------------------
+    def owner_hold(self) -> tuple:
+        """``(owner_ident, hold_id)`` for the CURRENT lock — the token that
+        ``retire_if_holding`` re-checks. Reading these two together is what
+        lets a caller tell "this worker is wedged HOLDING the lock" (retire it)
+        from "this worker is merely QUEUED behind someone else" (do not blame
+        its camera) WITHOUT racing the holder."""
+        with self._swap:
+            return (self._owner, self._hold_id)
+
+    def owner_ident(self):
+        """Thread ident currently owning the CURRENT lock, or None."""
+        with self._swap:
+            return self._owner
+
+    def retired_count(self) -> int:
+        with self._swap:
+            return len(self._retired)
+
+    def retire_if_holding(self, owner_ident, hold_id, reason: str = "") -> int:
+        """Retire the current lock ONLY if `owner_ident` still holds it under
+        the same `hold_id` seen earlier. Returns the retired-lock count, or 0
+        when the holder has moved on (in which case nothing is retired).
+
+        THIS, NOT ``retire``, IS WHAT PRODUCTION CODE CALLS. A plain
+        "read the owner, then retire" is a check-then-act race: the worker can
+        release and re-take the lock for its own late teardown in that gap, and
+        rotating the lock out from under a LIVE release is the overlapping
+        DirectShow teardown (0xc0000374) this lock exists to prevent. The
+        hold_id moves on every outermost acquire, so a stale token can never
+        retire a live hold. The check and the swap happen in ONE critical
+        section - re-checking and then rotating in two would be the same race
+        one level down. NEVER raises."""
+        try:
+            with self._swap:
+                if self._owner != owner_ident or self._hold_id != hold_id:
+                    return 0
+                n = self._retire_locked()
+        except Exception:
+            logging.exception("[face-track] guarded camera I/O lock retirement "
+                              "failed")
+            return 0
+        self._announce_retirement(reason, n)
+        return n
+
+    def _retire_locked(self) -> int:
+        """Swap in a fresh lock. Caller MUST hold ``self._swap``. Logging is
+        deliberately left to the caller, outside the critical section."""
+        self._retired.append(self._lock)
+        self._lock = threading.RLock()
+        self._owner = None
+        return len(self._retired)
+
+    def retire(self, reason: str = "") -> int:
+        """Abandon the current underlying lock and install a fresh one.
+
+        UNCONDITIONAL. Production code must go through ``retire_if_holding``;
+        this is the primitive underneath it (and what tests use to force a
+        rotation). Returns the new retired-lock count. NEVER raises."""
+        try:
+            with self._swap:
+                n = self._retire_locked()
+            self._announce_retirement(reason, n)
+            return n
+        except Exception:
+            logging.exception("[face-track] camera I/O lock retirement failed")
+            return -1
+
+    def _announce_retirement(self, reason: str, n: int) -> None:
+        """A subsystem-level recovery the owner cannot see is exactly the bug
+        class this file exists to stamp out. NEVER raises."""
+        try:
+            msg = (f"  [face-track] the camera I/O lock was RETIRED "
+                   f"({reason or 'holder abandoned'}). The wedged worker keeps "
+                   f"the old lock forever; every other camera thread has been "
+                   f"moved onto a fresh one, so opens, releases and the "
+                   f"self-diagnostic webcam probe all work again instead of "
+                   f"timing out and blaming a healthy camera. "
+                   f"Retired locks this session: {n}.")
+            print(msg)
+            logging.warning(msg.strip())
+        except Exception:
+            logging.exception("[face-track] camera I/O lock retirement "
+                              "announcement failed")
+
+
+_camera_io_lock = _CameraIOLock()
+
+
+def _release_on_current_camera_lock(cap) -> None:
+    """Release `cap` under whatever camera I/O lock is CURRENT *right now*.
+
+    Every caller of this already sits inside a worker holding _camera_io_lock,
+    so on the normal path this is a reentrant no-op costing one uncontended
+    acquire. It exists for the ONE case that is not normal: a worker that was
+    abandoned, had its lock RETIRED under it (see _CameraIOLock), and only then
+    unwedged. Such a worker holds a lock nobody else uses, so a bare
+    ``cap.release()`` there would overlap the live threads' opens and releases
+    - which is the DirectShow heap corruption (0xc0000374) this whole lock
+    exists to prevent. Re-entering through the lock OBJECT re-aims at the
+    replacement, so the late release is serialised after all. NEVER raises."""
+    if cap is None:
+        return
+    try:
+        with _camera_io_lock:
+            cap.release()
+    except Exception:
+        logging.exception("[camera] release under the current camera I/O lock "
+                          "failed")
+
+
+# --------------------------------------------------------------------------
+#  CAMERA QUARANTINE + BOUNDED CAMERA I/O  (2026-09-05)
+# --------------------------------------------------------------------------
+#
+# THE DEFECT THIS CLOSES, measured on the owner's rig across two sessions:
+# ONE sick webcam took the whole preview producer down, silently, for the rest
+# of the session - all three tiles (left, right AND Kinect) went dark and never
+# came back until a restart.
+#
+# It was NOT an exception and NOT an exit. Measured live with py-spy against the
+# running PID (7 identical samples over 4 minutes, re-confirmed hours later):
+#
+#     Thread-67 (_face_tracking_thread)   <- ALIVE, idle, not moving
+#         _open_tile_capture        (bobert_companion.py:4429)
+#         _read_side_tile_webcams   (bobert_companion.py:4561)
+#         _compose_kinect_preview   (bobert_companion.py:5101)
+#         _hud_kinect_preview_write (bobert_companion.py:5195)
+#         _face_tracking_thread     (bobert_companion.py:6119)
+#
+# The producer was parked inside a C-level DirectShow call - cap.set() on a
+# freshly opened handle for the sick camera - INSIDE `with _camera_io_lock:`.
+# Corroborated three times over: skills/self_diagnostic's probe does a real
+# _camera_io_lock.acquire(timeout=2.5) and it returned False at 01:22:53,
+# 01:52:53 and 02:22:53. A dead thread cannot hold an RLock; the loop had not
+# died, it had HUNG, and nothing anywhere was watching for that.
+#
+# Three things were wrong, and all three are fixed here + in the loop:
+#   1. UNBOUNDED CAMERA I/O UNDER A GLOBAL LOCK. cv2.VideoCapture / cap.set()
+#      on a sick DirectShow device can block forever. Held under the process-
+#      wide _camera_io_lock that is a whole-subsystem hang. Every camera open
+#      the preview producer performs now runs on a throwaway worker with a
+#      wall-clock cap (the pattern _probe_camera_index has used since July),
+#      and every release it performs uses a BOUNDED acquire.
+#   2. NO QUARANTINE. The sick camera opened fine every ~10 s and then failed
+#      to read, so the recovery machinery retried it forever - a hot reopen
+#      loop that eventually found the wedge. A camera that keeps needing rescue
+#      is now benched, and the healthy cameras keep publishing.
+#   3. NO LIVENESS SIGNAL. See _face_track_watchdog below.
+#
+# WHY THESE NUMBERS (all from the measured failure, not taste):
+#   * STRIKES = 3. The soft-wake recovery fired at 01:22:03, ~01:22:14,
+#     01:22:24 and 01:22:40 - four cycles, then the wedge. Quarantining on the
+#     3rd fires ~25 s into the sickness, BEFORE the cycle that killed it. A
+#     genuine USB power-save blip resolves in <1 s and never even reaches the
+#     wake path (which needs 25 consecutive failures AND 2 s of silence), so it
+#     scores zero strikes.
+#   * WINDOW = 120 s. Strikes must be consecutive-ish to count: the observed
+#     cycle period is ~10 s, so 120 s holds a dozen of them, while a camera
+#     that misbehaves once an hour never accumulates a quarantine.
+#   * BACKOFF 60 s -> 600 s, doubling. The failing cadence was one reopen every
+#     ~10 s; 60 s is 6x that, which is what kills the hot loop, and it still
+#     re-tests a transient fault within a minute. The 10-minute ceiling keeps a
+#     camera that was merely unplugged recoverable without a restart.
+_CAMERA_QUARANTINE_STRIKES   = 3       # failed rescue cycles before benching
+_CAMERA_QUARANTINE_WINDOW_S  = 120.0   # strikes older than this decay away
+_CAMERA_QUARANTINE_BASE_S    = 60.0    # first bench; doubles per re-offence
+_CAMERA_QUARANTINE_MAX_S     = 600.0   # ceiling, so an unplug still self-heals
+# Wall-clock cap on ONE DirectShow open performed by the preview producer.
+# Measured: a healthy open on this rig completes well inside a second; the sick
+# one never returned at all.
+_CAMERA_OPEN_TIMEOUT_S       = 4.0
+# Wall-clock cap on acquiring _camera_io_lock for a release. Skipping a release
+# leaks a handle; BLOCKING on it hangs the producer, which is the bug. Leaking
+# is the safe direction - an overlapping release is what corrupts the heap, a
+# skipped one merely wastes a handle.
+_CAMERA_IO_LOCK_TIMEOUT_S    = 5.0
+# Wall-clock cap on the face-track loop's OWN 1280x720 open. Deliberately much
+# more generous than the tile cap: this file already documents (see
+# _probe_camera_index) that cv2.VideoCapture(CAP_DSHOW) can legitimately spend
+# 20-30 s in its internal retry loop on an index with no device behind it, so
+# anything at or below that would abandon opens that were going to succeed.
+# 35 s sits above that measured ceiling: it can only ever fire on a call that
+# was NEVER coming back, which turns "hang forever" into "hang once, say so,
+# and keep the other cameras publishing".
+_CAMERA_LOOP_OPEN_TIMEOUT_S  = 35.0
+# How often the producer BEATS while it is parked waiting on one of those
+# bounded opens. Load-bearing, not cosmetic: _CAMERA_LOOP_OPEN_TIMEOUT_S (35 s)
+# is deliberately LONGER than the watchdog's _FACE_TRACK_STALL_WARN_S (30 s),
+# so with a single blind join the producer went silent for the whole open and
+# the watchdog fired on every LEGITIMATE open of an absent index - a boot that
+# then completed normally was reported as a "WEDGED CAMERA CALL" with a stack
+# dump, and every backoff-driven reopen of an unplugged camera re-shouted it
+# every 120 s. The producer must keep saying "still here, still waiting on
+# THIS open" for the whole wait; the open's OWN timeout - not the watchdog -
+# is what reports a wedge on this path, and it does so with a better message.
+# Anything comfortably below _FACE_TRACK_STALL_WARN_S works; 1 s costs ~35
+# wakeups across a fully wedged open.
+_CAMERA_OPEN_BEAT_INTERVAL_S = 1.0
+
+# index -> {"strikes": [ts, ...], "until": ts, "reason": str, "since": ts,
+#           "count": int, "backoff": float, "label": str}
+_camera_quarantine: dict[int, dict] = {}
+_camera_quarantine_lock = threading.Lock()
+
+# Wall-clock budget the deferred-release reaper gives ONE attempt at
+# _camera_io_lock, and the interval between attempts. Nothing here runs on the
+# producer's clock - the reaper is a daemon of its own, so it can afford to
+# keep asking.
+_CAMERA_RELEASE_RETRY_S      = 2.0
+# How long a handle may sit unreleasable before we say so out loud, ONCE. Sized
+# above the longest legitimate hold this file documents (a dead CAP_DSHOW index
+# retries internally for ~26-30 s), so crossing it is EVIDENCE of a real wedge
+# rather than routine contention - evidence, not proof, and the message says
+# which.
+_CAMERA_RELEASE_ESCALATE_S   = 60.0
+
+# Capture handles whose release could not be performed on the CALLER's clock.
+# They are queued here for a reaper that retries the bounded acquire and then
+# releases them INSIDE _camera_io_lock - the same contract every other release
+# site in this file obeys. Entries: {"cap", "idx", "label", "since",
+# "escalated"}.
+#
+# THIS USED TO BE A GRAVEYARD, AND THAT WAS TWO LIES AT ONCE (fixed 2026-09-05).
+# The old code appended the handle to a list nothing ever drained and announced
+# "the camera I/O lock is held by a wedged DirectShow call".
+#
+#   * THE CAUSE WAS NEVER ESTABLISHED. A 5 s acquire timeout proves exactly ONE
+#     thing - we did not get the lock in 5 s. Healthy code in this process holds
+#     it far longer than that, routinely: skills/self_diagnostic's
+#     _probe_webcam_locked holds it across cv2.VideoCapture on indices 0, 1 AND
+#     2 plus a PowerShell PnP query, every 30 minutes, concurrently with this
+#     loop; _probe_camera_index holds it for its whole CAMERA_PROBE_TIMEOUT_SEC
+#     budget per index - and budgets its OWN wait at
+#     (timeout + 0.5) x CAMERA_PROBE_MAX (~42 s) for precisely this reason;
+#     _open_with_warmup holds it across 15 warm-up reads at 0.05 s each. So the
+#     most likely trigger was JARVIS's own diagnostic working exactly as
+#     designed, and the log blamed DirectShow for it.
+#   * THE COST WAS PERMANENT. The parked handle is a LIVE capture: its
+#     DirectShow filter graph kept the USB device open for the remaining life
+#     of the process, so every later reopen of that index had to contend with a
+#     graph JARVIS itself still held. On a bandwidth-limited USB 2.0 camera
+#     that is the documented failure mode - made permanent for the session by
+#     the very code meant to survive it.
+#
+# The safety property that motivated the graveyard is KEPT INTACT: the handle
+# is still never released off-lock, and the queue still holds a strong
+# reference so CPython cannot run the destructor (which would call release()
+# OUTSIDE the lock - the overlapping teardown that heap-corrupts DirectShow)
+# behind our back. It is simply released when the lock frees, instead of never.
+_camera_pending_releases: list = []
+_camera_pending_lock = threading.Lock()
+# Single-element cell holding the reaper thread, or None when idle. Read AND
+# written only under _camera_pending_lock, so "the reaper is alive, it will
+# handle this" and "the queue is empty, I may exit" can never both be believed.
+_camera_release_reaper: list = [None]
+
+
+def _camera_quarantine_entry(idx: int) -> dict:
+    """Row for `idx`, created on first use. Caller holds the lock."""
+    e = _camera_quarantine.get(idx)
+    if e is None:
+        e = {"strikes": [], "until": 0.0, "reason": None, "since": 0.0,
+             "count": 0, "backoff": 0.0, "label": ""}
+        _camera_quarantine[idx] = e
+    return e
+
+
+def _camera_is_quarantined(idx, now: float | None = None) -> bool:
+    """True while `idx` is benched. NEVER raises - a bookkeeping fault must not
+    be able to stop the producer from publishing the other cameras."""
+    try:
+        now = time.time() if now is None else now
+        with _camera_quarantine_lock:
+            e = _camera_quarantine.get(int(idx))
+            return bool(e) and now < e["until"]
+    except Exception:
+        return False
+
+
+def _camera_note_sick_cycle(idx, label: str, reason: str,
+                            now: float | None = None) -> bool:
+    """Record ONE failed rescue cycle for camera `idx` (a soft wake, a wedge
+    release, or a bounded-open timeout). Returns True iff this call put the
+    camera into quarantine. NEVER raises."""
+    try:
+        now = time.time() if now is None else now
+        idx = int(idx)
+        with _camera_quarantine_lock:
+            e = _camera_quarantine_entry(idx)
+            e["label"] = label or e["label"]
+            if now < e["until"]:
+                return False            # already benched; nothing to escalate
+            cutoff = now - _CAMERA_QUARANTINE_WINDOW_S
+            e["strikes"] = [t for t in e["strikes"] if t >= cutoff]
+            e["strikes"].append(now)
+            if len(e["strikes"]) < _CAMERA_QUARANTINE_STRIKES:
+                return False
+            # Escalating bench: 60 s, 120 s, 240 s ... capped at 600 s.
+            prev = e["backoff"] or 0.0
+            backoff = (_CAMERA_QUARANTINE_BASE_S if prev <= 0.0
+                       else min(prev * 2.0, _CAMERA_QUARANTINE_MAX_S))
+            e["backoff"] = backoff
+            e["until"]   = now + backoff
+            e["since"]   = now
+            e["reason"]  = str(reason)[:240]
+            e["count"]  += 1
+            e["strikes"] = []
+            count = e["count"]
+        # Logged OUTSIDE the lock, and loudly: this is the line that tells the
+        # owner one camera was benched rather than "JARVIS's cameras broke".
+        # Say which tile actually goes dark. The old wording promised "every
+        # OTHER camera keeps publishing" unconditionally, which was FALSE for
+        # the primary: the shared HUD preview is published from the primary's
+        # branch, so benching it used to blank the HUD tile too and this line
+        # then pointed the owner at his webcam hardware. Benching the primary
+        # now fails the shared tile over to another camera (announced by
+        # _note_preview_failover), and this line says so.
+        try:
+            _is_primary = any(c.get("primary") and c.get("index") == idx
+                              for c in CAMERAS)
+        except Exception:
+            _is_primary = False
+        _effect = ("it is the PRIMARY, so the shared HUD camera tile fails "
+                   "over to another camera (or goes stale if none can publish)"
+                   if _is_primary else
+                   "its own tile goes dark; every OTHER camera keeps publishing")
+        msg = (f"  [face-track] QUARANTINE {label or 'camera'} (index {idx}) - "
+               f"{_CAMERA_QUARANTINE_STRIKES} failed recovery cycles in "
+               f"{_CAMERA_QUARANTINE_WINDOW_S:.0f}s ({reason}). Benched for "
+               f"{backoff:.0f}s; {_effect}. Retry #{count} is automatic.")
+        print(msg)
+        logging.warning(msg.strip())
+        return True
+    except Exception:
+        logging.exception("[face-track] quarantine bookkeeping failed for %s", idx)
+        return False
+
+
+def _camera_note_healthy(idx, label: str = "") -> None:
+    """A real frame arrived - drop this camera's strikes and lift any bench.
+    NEVER raises."""
+    try:
+        idx = int(idx)
+        lifted = False
+        with _camera_quarantine_lock:
+            e = _camera_quarantine.get(idx)
+            if not e:
+                return
+            if e["until"]:
+                lifted = True
+                e["until"] = 0.0
+                e["since"] = 0.0
+                e["reason"] = None
+            e["strikes"] = []
+            e["backoff"] = 0.0
+        if lifted:
+            msg = (f"  [face-track] {label or 'camera'} (index {idx}) is "
+                   f"delivering frames again - quarantine lifted.")
+            print(msg)
+            logging.warning(msg.strip())
+    except Exception:
+        pass
+
+
+def get_camera_quarantine() -> dict:
+    """Snapshot copy of the quarantine registry, keyed by camera index."""
+    now = time.time()
+    with _camera_quarantine_lock:
+        return {idx: {"quarantined": now < e["until"],
+                      "quarantine_until": e["until"],
+                      "quarantine_reason": e["reason"],
+                      "quarantine_since": e["since"],
+                      "quarantine_count": e["count"],
+                      "quarantine_strikes": len(e["strikes"]),
+                      "label": e["label"]}
+                for idx, e in _camera_quarantine.items()}
+
+
+def _drain_camera_pending_releases(timeout: float | None = None) -> int:
+    """ONE pass over the deferred-release queue: release everything on it
+    INSIDE _camera_io_lock. Returns how many handles were actually released.
+
+    Waits at most `timeout` for the lock, so this is safe to call from any
+    thread - it can never become the hang it exists to prevent. NEVER raises.
+
+    Note the lock ORDER: the queue is snapshotted under _camera_pending_lock,
+    which is then DROPPED before _camera_io_lock is taken. Nothing in this file
+    ever takes them the other way round, so the reaper cannot deadlock against
+    an enqueue."""
+    try:
+        timeout = _CAMERA_RELEASE_RETRY_S if timeout is None else timeout
+        # CLAIM the batch atomically. Two passes can legitimately overlap (the
+        # reaper thread plus a direct call), and while both would serialize on
+        # _camera_io_lock rather than truly racing, letting both drain the same
+        # entry would still mean release() twice on one handle. Claim-then-drain
+        # makes each handle the property of exactly one pass.
+        with _camera_pending_lock:
+            batch = [i for i in _camera_pending_releases if not i.get("claimed")]
+            for i in batch:
+                i["claimed"] = True
+        if not batch:
+            return 0
+        got = False
+        try:
+            got = _camera_io_lock.acquire(timeout=timeout)
+        except Exception:
+            logging.exception("[face-track] deferred release could not acquire "
+                              "the camera I/O lock")
+            got = False
+        if not got:
+            # Hand them back so the next pass retries them.
+            with _camera_pending_lock:
+                for i in batch:
+                    i["claimed"] = False
+            # Still busy. Say so ONCE per handle, and only after long enough
+            # that "wedge" is a defensible reading - and even then, say what
+            # was measured rather than naming a culprit we never observed.
+            now = time.time()
+            for item in batch:
+                try:
+                    waited = now - item.get("since", now)
+                    if item.get("escalated") or waited < _CAMERA_RELEASE_ESCALATE_S:
+                        continue
+                    item["escalated"] = True
+                    msg = (f"  [face-track] {item.get('label') or 'camera'} "
+                           f"(index {item.get('idx')}) has been waiting "
+                           f"{waited:.0f}s to be released - the camera I/O lock "
+                           f"has stayed busy that whole time. That is longer "
+                           f"than any legitimate holder in this process (a dead "
+                           f"CAP_DSHOW index retries for ~30s), so a genuine "
+                           f"wedge is LIKELY - but a busy lock is all that has "
+                           f"actually been measured. Still retrying every "
+                           f"{_CAMERA_RELEASE_RETRY_S:.0f}s; the handle is NOT "
+                           f"abandoned.")
+                    print(msg)
+                    logging.warning(msg.strip())
+                except Exception:
+                    pass
+            return 0
+        released = 0
+        try:
+            for item in batch:
+                cap = item.get("cap")
+                try:
+                    if cap is not None:
+                        cap.release()
+                    released += 1
+                except Exception:
+                    # Dropped from the queue anyway: retrying a release() that
+                    # RAISED is how a double-release happens, and that is the
+                    # heap corruption this whole lock exists to prevent.
+                    logging.exception("[face-track] deferred release raised "
+                                      "for index %s", item.get("idx"))
+        finally:
+            try:
+                _camera_io_lock.release()
+            except Exception:
+                pass
+        now = time.time()
+        with _camera_pending_lock:
+            for item in batch:
+                try:
+                    _camera_pending_releases.remove(item)
+                except ValueError:
+                    pass
+        for item in batch:
+            try:
+                waited = now - item.get("since", now)
+                msg = (f"  [face-track] deferred release of "
+                       f"{item.get('label') or 'camera'} (index "
+                       f"{item.get('idx')}) completed after {waited:.1f}s - the "
+                       f"camera I/O lock was BUSY, not wedged. The DirectShow "
+                       f"graph is gone and the device is free again.")
+                logging.info(msg.strip())
+                if item.get("escalated"):
+                    # We printed a scary line about this handle; print the
+                    # resolution too, or the log stands as an unretracted
+                    # accusation.
+                    print(msg)
+            except Exception:
+                pass
+        return released
+    except Exception:
+        logging.exception("[face-track] deferred release pass failed")
+        try:
+            # A claim that is never handed back would strand the handle in the
+            # queue unreleased forever - the very shape this function exists to
+            # remove. Unclaim everything still queued so the next pass retries.
+            with _camera_pending_lock:
+                for i in _camera_pending_releases:
+                    i["claimed"] = False
+        except Exception:
+            pass
+        return 0
+
+
+def _camera_release_reaper_loop() -> None:
+    """Retry the deferred releases until the queue drains, then exit so an idle
+    JARVIS carries no extra thread. NEVER raises: a bookkeeping fault here must
+    not strand a live camera handle."""
+    try:
+        while True:
+            _drain_camera_pending_releases()
+            with _camera_pending_lock:
+                if not _camera_pending_releases:
+                    # Cleared under the SAME lock a new enqueue takes, so the
+                    # next _defer_camera_release starts a fresh reaper instead
+                    # of trusting this one.
+                    _camera_release_reaper[0] = None
+                    return
+            time.sleep(_CAMERA_RELEASE_RETRY_S)
+    except BaseException:
+        try:
+            with _camera_pending_lock:
+                if _camera_release_reaper[0] is threading.current_thread():
+                    _camera_release_reaper[0] = None
+        except Exception:
+            pass
+        logging.exception("[face-track] deferred release reaper died")
+
+
+def _defer_camera_release(cap, idx, label: str = "") -> bool:
+    """Queue `cap` to be released INSIDE _camera_io_lock by the reaper thread.
+
+    Returns True if it was queued. The strong reference held by the queue is
+    load-bearing: it stops CPython from running the capture's destructor -
+    which would call release() OFF-lock - while we wait for the lock. NEVER
+    raises."""
+    if cap is None:
+        return False
+    item = {"cap": cap, "idx": idx, "label": label,
+            "since": time.time(), "escalated": False, "claimed": False}
+    try:
+        with _camera_pending_lock:
+            _camera_pending_releases.append(item)
+            t = _camera_release_reaper[0]
+            if t is None or not t.is_alive():
+                t = threading.Thread(target=_camera_release_reaper_loop,
+                                     daemon=True, name="cam-release-reaper")
+                t.start()          # cell set only AFTER a successful start, so
+                _camera_release_reaper[0] = t   # a failed start is retried.
+        return True
+    except Exception:
+        logging.exception("[face-track] could not queue deferred release "
+                          "for index %s", idx)
+        try:
+            # Last resort: keep a strong reference SOMEWHERE, even with no
+            # reaper running. A retained handle is a leak; a destructor firing
+            # off-lock is a 0xc0000374. The next successful defer starts a
+            # reaper that drains this one too.
+            if item not in _camera_pending_releases:
+                _camera_pending_releases.append(item)
+        except Exception:
+            pass
+        return False
+
+
+def _release_capture_guarded(cap, idx, label: str = "",
+                             timeout: float | None = None) -> bool:
+    """Release `cap` INSIDE _camera_io_lock, but give up after `timeout`.
+
+    Returns True if the handle was released ON THIS CALL. On a timeout the
+    handle is handed to the deferred-release reaper - which retries the bounded
+    acquire and then releases it inside the SAME lock - and False is returned.
+    False therefore means "not released YET", never "abandoned": see
+    _camera_pending_releases for why the old graveyard both leaked a live
+    camera and named a cause it had never established.
+
+    This exists because the producer's release sites used a plain
+    ``with _camera_io_lock:``: once an abandoned open worker owned that lock,
+    the very next release wedged the producer a second time. NEVER raises."""
+    if cap is None:
+        return True
+    timeout = _CAMERA_IO_LOCK_TIMEOUT_S if timeout is None else timeout
+    got = False
+    try:
+        got = _camera_io_lock.acquire(timeout=timeout)
+        if got:
+            try:
+                cap.release()
+            except Exception:
+                logging.exception("[face-track] release raised for index %s", idx)
+            return True
+    except Exception:
+        logging.exception("[face-track] guarded release failed for index %s", idx)
+    finally:
+        if got:
+            try:
+                _camera_io_lock.release()
+            except Exception:
+                pass
+    if not got:
+        try:
+            queued = _defer_camera_release(cap, idx, label)
+            msg = (f"  [face-track] could not release {label or 'camera'} "
+                   f"(index {idx}) within {timeout:.1f}s - the camera I/O lock "
+                   f"is BUSY. Holder not identified: a {timeout:.1f}s acquire "
+                   f"timeout only proves we did not get the lock, and the "
+                   f"self-diagnostic's webcam probe legitimately holds it for "
+                   f"longer than that. Release "
+                   + ("DEFERRED - the reaper will perform it inside the lock, "
+                      "so the device is not held for the rest of the session."
+                      if queued else
+                      "COULD NOT BE QUEUED - handle retained (never released "
+                      "off-lock), so the device stays open until the process "
+                      "exits."))
+            print(msg)
+            logging.warning(msg.strip())
+        except Exception:
+            pass
+    return False
+
+
+def _open_capture_bounded(idx, opener, label: str = "",
+                          timeout: float | None = None,
+                          beat=None):
+    """Run `opener()` - which MUST do its own ``with _camera_io_lock:`` - on a
+    throwaway daemon worker and give up after `timeout` seconds.
+
+    Returns the capture, or None on failure OR timeout. On a timeout the worker
+    is abandoned; when (if ever) it finishes, it releases whatever it opened
+    from inside the same lock, so nothing is left dangling and no release ever
+    overlaps another. Modelled on _probe_camera_index, which has used exactly
+    this shape since 2026-07 for the same reason: cv2.VideoCapture(CAP_DSHOW)
+    has no timeout of its own and a sick device never returns.
+
+    `beat` is an optional one-argument callable - in practice
+    _face_track_beat - invoked every _CAMERA_OPEN_BEAT_INTERVAL_S for as long
+    as the open is outstanding. Pass it from the PREVIEW PRODUCER's thread and
+    nowhere else: the heartbeat records the calling thread's ident for the
+    watchdog's stack dump, so beating from another thread would both forge
+    liveness the producer does not have and point the dump at the wrong stack.
+
+    NEVER raises. Performs exactly ONE open - no extra DirectShow traffic."""
+    timeout = _CAMERA_OPEN_TIMEOUT_S if timeout is None else timeout
+    box: dict = {"cap": None}
+    abandoned = [False]
+
+    def _run():
+        cap = None
+        try:
+            cap = opener()
+        except Exception:
+            logging.exception("[face-track] bounded open raised for index %s", idx)
+            cap = None
+        if abandoned[0]:
+            # Our joiner gave up long ago. Tear the handle down ourselves,
+            # inside the lock, so the late success doesn't leak a device.
+            if cap is not None:
+                released = False
+                try:
+                    with _camera_io_lock:
+                        cap.release()
+                    released = True
+                except Exception:
+                    logging.exception(
+                        "[face-track] abandoned open worker could not release "
+                        "its late handle for index %s", idx)
+                # Say what actually happened, in words that cannot be read as
+                # "the camera came back": the caller was handed None long ago
+                # and is NOT using this handle. (An opener that announced its
+                # own success used to print "opened <cam> at index N" right
+                # about here — a success line for a discarded capture, printed
+                # after the abandon line.)
+                try:
+                    msg = (f"  [face-track] {label or 'camera'} (index {idx}) "
+                           f"finished opening AFTER the attempt was abandoned; "
+                           f"handle "
+                           f"{'released' if released else 'NOT released (release raised)'}"
+                           f" and discarded — the producer is NOT using it.")
+                    print(msg)
+                    logging.warning(msg.strip())
+                except Exception:
+                    pass
+            return
+        box["cap"] = cap
+
+    t = threading.Thread(target=_run, daemon=True, name=f"cam-open-{idx}")
+    t.start()
+    if beat is None:
+        t.join(timeout=timeout)
+    else:
+        # HEARTBEAT THE WAIT (2026-09-05). The caller is about to sit here for
+        # up to `timeout` seconds, which for _CAMERA_LOOP_OPEN_TIMEOUT_S is
+        # LONGER than the watchdog's stall threshold. A single blind join made
+        # every legitimate 20-30 s DirectShow open on an absent index look
+        # exactly like a wedge. Slice the join and say what we are waiting for,
+        # so liveness reads "waiting on THIS open, N s in" instead of silence.
+        _wait_t0 = time.monotonic()
+        while True:
+            _waited = time.monotonic() - _wait_t0
+            _left = timeout - _waited
+            if _left <= 0:
+                break
+            try:
+                beat(f"opening {label or 'camera'} (index {idx}) "
+                     f"{_waited:.0f}s/{timeout:.0f}s")
+            except Exception:  # pragma: no cover - defensive: a beat must never break an open
+                pass
+            t.join(timeout=min(_CAMERA_OPEN_BEAT_INTERVAL_S, _left))
+            if not t.is_alive():
+                break
+    if t.is_alive():
+        abandoned[0] = True
+        # DID THIS WORKER ACTUALLY REACH DIRECTSHOW, OR IS IT ONLY QUEUED?
+        # The opener takes _camera_io_lock first, so a worker that does NOT own
+        # the lock never called cv2 at all - it is stuck behind SOMEONE ELSE's
+        # camera operation. The two cases need opposite handling, and treating
+        # them alike is what benched the healthy primary in the measured
+        # failure (its opener body ran ZERO times and still scored strikes):
+        #   * OWNS the lock -> genuinely wedged inside DirectShow while holding
+        #     the process-wide lock it will never give back. RETIRE that lock so
+        #     every other camera thread stops queueing on a corpse, and score
+        #     the strike: this camera really is sick.
+        #   * does NOT own it -> contention, not a fault of THIS camera. Say so
+        #     and score NOTHING. (Exactly the mistake _probe_camera_index's
+        #     PHASE 1 comment already documents: a queued worker reported as a
+        #     dead camera.)
+        # The retirement is what ESTABLISHES the wedge, so it happens BEFORE
+        # the log line rather than after it: retire_if_holding re-checks, under
+        # the lock's own mutex, that this worker still holds the exact hold it
+        # was seen holding. A non-zero return is proof; anything else is not,
+        # and gets reported as what it is.
+        retired = 0
+        try:
+            owner, hold = _camera_io_lock.owner_hold()
+            if owner == t.ident:
+                retired = _camera_io_lock.retire_if_holding(
+                    t.ident, hold,
+                    f"{label or 'camera'} (index {idx}) wedged inside its "
+                    f"DirectShow open")
+        except Exception:  # pragma: no cover - defensive: foreign lock object
+            logging.exception("[face-track] could not retire the camera I/O "
+                              "lock for index %s", idx)
+        if retired:
+            msg = (f"  [face-track] {label or 'camera'} (index {idx}) did not "
+                   f"finish opening within {timeout:.1f}s - DirectShow is wedged "
+                   f"inside the open. Abandoning the attempt so the preview "
+                   f"producer keeps running for every other camera.")
+            print(msg)
+            logging.warning(msg.strip())
+            _camera_note_sick_cycle(idx, label, f"open wedged >{timeout:.1f}s")
+        else:
+            msg = (f"  [face-track] {label or 'camera'} (index {idx}) gave up "
+                   f"after {timeout:.1f}s without EVER being shown to reach "
+                   f"DirectShow - it does not hold the camera I/O lock, so it "
+                   f"either spent the budget queued behind another camera "
+                   f"operation or has already left the open. No strike is "
+                   f"scored against this camera: nothing here says it is sick.")
+            print(msg)
+            logging.warning(msg.strip())
+        return None
+    return box["cap"]
 
 
 def _detect_face(frame_bgr: np.ndarray) -> tuple[float, float] | None:
@@ -5351,11 +6348,10 @@ def _probe_camera_index(idx: int, timeout_sec: float = CAMERA_PROBE_TIMEOUT_SEC)
             except Exception:
                 pass
             finally:
-                try:
-                    if cap is not None:
-                        cap.release()
-                except Exception:
-                    pass
+                # Through the lock OBJECT: an abandoned probe worker whose lock
+                # was retired must not release outside the lock live threads
+                # use. See _release_on_current_camera_lock.
+                _release_on_current_camera_lock(cap)
 
     t = threading.Thread(target=_open, daemon=True)
     t.start()
@@ -5377,6 +6373,24 @@ def _probe_camera_index(idx: int, timeout_sec: float = CAMERA_PROBE_TIMEOUT_SEC)
         # Wedged in the C-level open call. Abandon the worker and report
         # failure — the underlying handle will be released when the worker
         # eventually returns (or when the process exits).
+        #
+        # RETIRE THE LOCK IT IS SITTING ON (2026-09-05). PHASE 1 proved this
+        # worker OWNS _camera_io_lock (started only fires from inside the
+        # ``with``), so abandoning it here used to poison the process-wide
+        # camera lock exactly as an abandoned bounded-open worker did: every
+        # later open, every later release and skills/self_diagnostic's
+        # acquire(timeout=2.5) would fail forever, and the face-track loop
+        # would score quarantine strikes against cameras that never blocked.
+        # Same defect, second call site — closed the same way.
+        try:
+            owner, hold = _camera_io_lock.owner_hold()
+            if owner == t.ident:
+                _camera_io_lock.retire_if_holding(
+                    t.ident, hold,
+                    f"cam-probe index {idx} wedged inside its DirectShow open")
+        except Exception:  # pragma: no cover - defensive: foreign lock object
+            logging.exception("[cam-probe] camera I/O lock retire failed for "
+                              "index %s", idx)
         return False
     return result["ok"]
 
@@ -5677,7 +6691,284 @@ def probe_cameras_and_update_config() -> tuple[list[int], list[int]]:
     return found, [i for i in configured if i not in found]
 
 
+# --------------------------------------------------------------------------
+#  CAMERA-PREVIEW PRODUCER LIVENESS: heartbeat + watchdog  (2026-09-05)
+# --------------------------------------------------------------------------
+#
+# THE FACT THAT WAS MISSING FROM THE LOG. The owner's three camera tiles went
+# dark ~30 minutes into two consecutive sessions and stayed dark until a
+# restart, and the session log said NOTHING - no traceback, no "Stopped", no
+# further [face-track] line of any kind for the following hour. He concluded
+# his webcam hardware had failed again. It had not.
+#
+# Measured with py-spy against the live PID: the producer thread was ALIVE the
+# whole time, blocked inside a C-level DirectShow call (see the quarantine
+# block above for the full stack). So every theory of the form "the loop exited
+# and the exception was swallowed" is WRONG, and so is any fix that only makes
+# exits loud. The loop did not exit. It hung, and nothing was watching.
+#
+# TWO instruments, because there are two failure shapes and neither covers the
+# other:
+#   * THE HEARTBEAT + WATCHDOG (here) catch the shape that actually happened -
+#     a producer that is alive and stuck. Nothing else can: an exit handler
+#     never runs, an exception never fires, the process never dies. The
+#     watchdog re-reports on a backoff and names the STAGE, then dumps the
+#     stuck thread's Python stack straight into the session log - i.e. it hands
+#     the owner the py-spy answer for free, at the moment it happens.
+#   * THE SUPERVISOR (_face_tracking_thread, below) catches every shape where
+#     the loop really does stop, INCLUDING the one exit that is silent by
+#     construction today: a BaseException such as SystemExit slips past the
+#     loop's `except Exception`, skips the release loop and the "Stopped" print
+#     (plain statements after the `while`, not a finally), and is then dropped
+#     without a word by threading's default excepthook, which returns early for
+#     SystemExit. Measured under this exact interpreter + logging setup: an
+#     uncaught Exception in a daemon thread DOES reach the session log, an
+#     uncaught SystemExit produces absolutely nothing.
+#
+# WHY 30 s. The producer's measured iteration period is bursty - up to ~2.1 s
+# under load - and the dashboard already calls a tile dead at 5 s
+# (_CAMERA_PREVIEW_STALE_S). 30 s is >14x the worst healthy iteration, so a
+# slow burst cannot trip it, and it is 6x the point at which the owner can SEE
+# the tiles are dead, so the log now explains the blank tiles within half a
+# minute instead of never.
+#
+# WHY IT MAY SIT BELOW _CAMERA_LOOP_OPEN_TIMEOUT_S (35 s) - the one thing that
+# makes that legal. The producer BEATS THROUGHOUT a bounded open, every
+# _CAMERA_OPEN_BEAT_INTERVAL_S, from inside _open_capture_bounded. Until
+# 2026-09-05 it did not, and this threshold fired on the ordinary 20-30 s
+# CAP_DSHOW block that _probe_camera_index documents for an index with no
+# device behind it: unplugging a webcam turned a normal boot into an ERROR
+# reading "WEDGED CAMERA CALL, not a hardware failure" plus a stack dump, and
+# every backoff-driven recovery reopen re-shouted it every 120 s. A watchdog
+# that fires on a condition this same file calls legitimate is noise, not
+# signal. So: do NOT remove that beat without raising this constant above
+# _CAMERA_LOOP_OPEN_TIMEOUT_S. Pinned by ProducerBeatsWhileOpeningTests in
+# tests/monolith/test_monolith_camera_quarantine.py.
+_FACE_TRACK_STALL_WARN_S    = 30.0    # no heartbeat for this long = stalled
+_FACE_TRACK_STALL_REWARN_S  = 120.0   # then re-shout every 2 min, not every tick
+_FACE_TRACK_WATCHDOG_TICK_S = 5.0     # how often the watchdog looks
+
+_face_track_heartbeat: dict = {
+    "at": 0.0,            # monotonic-ish wall clock of the last beat
+    "stage": "not started",
+    "iters": 0,
+    "tid": 0,             # producer thread ident, for the stack dump
+    "started_at": 0.0,
+}
+_face_track_heartbeat_lock = threading.Lock()
+_face_track_stall_state: dict = {"warned_at": 0.0, "stalled": False,
+                                 "since": 0.0}
+
+
+def _face_track_beat(stage: str, now: float | None = None) -> None:
+    """Producer says 'still moving, currently doing <stage>'. Cheap enough to
+    call several times per iteration; NEVER raises."""
+    try:
+        with _face_track_heartbeat_lock:
+            _face_track_heartbeat["at"] = time.time() if now is None else now
+            _face_track_heartbeat["stage"] = stage
+            _face_track_heartbeat["tid"] = threading.get_ident()
+    except Exception:
+        pass
+
+
+def _face_track_beat_iteration(now: float | None = None) -> None:
+    """Top-of-loop beat: also counts iterations so a stall is distinguishable
+    from a loop that is spinning without publishing."""
+    try:
+        with _face_track_heartbeat_lock:
+            _face_track_heartbeat["iters"] += 1
+    except Exception:
+        pass
+    _face_track_beat("loop top", now)
+
+
+def get_face_track_liveness(now: float | None = None) -> dict:
+    """Is the camera-preview producer actually running? Snapshot of the
+    heartbeat plus the derived age, for self-diagnostic / see_user.
+
+    ``age_s`` is None when the producer has never beaten (not started)."""
+    now = time.time() if now is None else now
+    with _face_track_heartbeat_lock:
+        hb = dict(_face_track_heartbeat)
+    at = hb.get("at", 0.0) or 0.0
+    hb["age_s"] = (now - at) if at else None
+    hb["stalled"] = bool(at) and (now - at) >= _FACE_TRACK_STALL_WARN_S
+    return hb
+
+
+def _face_track_thread_stack(tid: int) -> str:
+    """Python stack of thread `tid` right now, as text. This is the whole point
+    of the watchdog: a hang leaves no traceback, so we go and take one.
+    Returns a short explanation instead of raising when the frame is gone."""
+    try:
+        frame = sys._current_frames().get(int(tid))
+        if frame is None:
+            return "(producer thread not found in sys._current_frames)"
+        return "".join(traceback.format_stack(frame)).rstrip()
+    except Exception as e:      # pragma: no cover - introspection is best-effort
+        return f"(stack unavailable: {type(e).__name__}: {e})"
+
+
+def _face_track_watchdog_check(now: float | None = None) -> bool:
+    """One watchdog pass. Returns True iff it reported a stall on this call.
+
+    Reports LOUDLY (print + logging.error) with the stage, the age, and the
+    stuck thread's stack; re-reports only every _FACE_TRACK_STALL_REWARN_S; and
+    says so again when the producer starts moving. NEVER raises - a watchdog
+    that can throw is a watchdog that stops watching."""
+    try:
+        now = time.time() if now is None else now
+        with _face_track_heartbeat_lock:
+            at = _face_track_heartbeat.get("at", 0.0) or 0.0
+            stage = _face_track_heartbeat.get("stage", "?")
+            iters = _face_track_heartbeat.get("iters", 0)
+            tid = _face_track_heartbeat.get("tid", 0)
+        if not at:
+            return False                      # never started; nothing to judge
+        age = now - at
+        if age < _FACE_TRACK_STALL_WARN_S:
+            if _face_track_stall_state["stalled"]:
+                stalled_for = now - (_face_track_stall_state["since"] or now)
+                _face_track_stall_state["stalled"] = False
+                _face_track_stall_state["warned_at"] = 0.0
+                _face_track_stall_state["since"] = 0.0
+                msg = (f"  [face-track] WATCHDOG: the camera-preview producer "
+                       f"is moving again after {stalled_for:.0f}s stalled "
+                       f"(now at '{stage}').")
+                print(msg)
+                logging.warning(msg.strip())
+            return False
+        if (_face_track_stall_state["stalled"]
+                and (now - _face_track_stall_state["warned_at"])
+                < _FACE_TRACK_STALL_REWARN_S):
+            return False
+        if not _face_track_stall_state["stalled"]:
+            _face_track_stall_state["stalled"] = True
+            _face_track_stall_state["since"] = at
+        _face_track_stall_state["warned_at"] = now
+        msg = (f"  [face-track] WATCHDOG: the camera-preview producer has not "
+               f"moved for {age:.0f}s - it is STALLED, not stopped, at stage "
+               f"'{stage}' after {iters} iterations. Every camera tile will be "
+               f"stale until it moves. This is a WEDGED CAMERA CALL, not a "
+               f"hardware failure of every camera at once. Producer stack:\n"
+               f"{_face_track_thread_stack(tid)}")
+        print(msg)
+        logging.error(msg.strip())
+        return True
+    except Exception:
+        try:
+            logging.exception("[face-track] watchdog check raised")
+        except Exception:
+            pass
+        return False
+
+
+def _face_track_watchdog(stop_event, tick: float | None = None) -> None:
+    """Watchdog thread body: poll _face_track_watchdog_check until stopped."""
+    tick = _FACE_TRACK_WATCHDOG_TICK_S if tick is None else tick
+    try:
+        while not stop_event.wait(tick):
+            _face_track_watchdog_check()
+    except Exception:   # pragma: no cover - defensive: the loop above cannot raise
+        logging.exception("[face-track] watchdog thread died")
+
+
+def _face_track_note_stopped(reason: str, exc: BaseException | None = None
+                             ) -> None:
+    """THE line whose absence cost the owner an evening: say that the producer
+    stopped, and why. Emitted from the supervisor's `finally`, so it runs for a
+    normal shutdown, for an escaped Exception, AND for a BaseException such as
+    SystemExit that today vanishes without a trace. NEVER raises."""
+    try:
+        msg = (f"  [face-track] STOPPED - the camera-preview producer is no "
+               f"longer running. Reason: {reason}. Every camera tile stays "
+               f"dark until JARVIS restarts it.")
+        print(msg)
+        if exc is not None:
+            logging.error(msg.strip(), exc_info=(type(exc), exc,
+                                                 exc.__traceback__))
+            try:
+                print("".join(traceback.format_exception(
+                    type(exc), exc, exc.__traceback__)).rstrip())
+            except Exception:
+                pass
+        else:
+            logging.error(msg.strip())
+    except Exception:
+        pass
+
+
+def _face_track_release_all(caps) -> None:
+    """Release every capture the producer holds, each inside _camera_io_lock
+    but with a BOUNDED acquire (a wedged lock must not turn shutdown into a
+    second hang). NEVER raises."""
+    try:
+        for entry in (caps or []):
+            try:
+                c = entry.get("cap") if isinstance(entry, dict) else None
+                if c is None:
+                    continue
+                cam = entry.get("cam") or {}
+                _release_capture_guarded(c, cam.get("index"),
+                                         cam.get("label", "camera"))
+                entry["cap"] = None
+            except Exception:
+                logging.exception("[face-track] release on shutdown")
+    except Exception:
+        logging.exception("[face-track] release sweep failed")
+
+
+# The producer's live capture list, published so the supervisor's `finally` can
+# tear it down even when the body never returns normally.
+_face_track_caps: list = [None]
+
+
 def _face_tracking_thread():
+    """SUPERVISOR around the real producer loop (_face_tracking_thread_body).
+
+    Exists so the producer CANNOT stop quietly. Whatever happens - clean stop,
+    an Exception that escapes the per-iteration handler, or a BaseException
+    like SystemExit that the default threading excepthook drops on the floor -
+    the `finally` releases the cameras, clears the preview, and logs one line
+    saying the producer stopped and why. It also runs the liveness watchdog for
+    exactly as long as the producer is meant to be running.
+
+    Signature and thread target are unchanged, so nothing else moves."""
+    _face_track_caps[0] = []
+    _face_track_beat("starting")
+    wd_stop = threading.Event()
+    wd = threading.Thread(target=_face_track_watchdog, args=(wd_stop,),
+                          daemon=True, name="face-track-watchdog")
+    wd.start()
+    reason = "returned normally"
+    exc: BaseException | None = None
+    try:
+        _face_tracking_thread_body()
+        # A return WITHOUT the stop event is not a shutdown, it is a defect -
+        # and it used to be indistinguishable from a healthy exit in the log.
+        reason = ("stop event set (normal shutdown)"
+                  if _face_track_stop.is_set()
+                  else "the producer loop RETURNED without the stop event set "
+                       "(e.g. no cameras could be opened)")
+    except BaseException as e:
+        exc = e
+        reason = f"unhandled {type(e).__name__}: {e}"
+        raise
+    finally:
+        wd_stop.set()
+        _face_track_release_all(_face_track_caps[0])
+        # Camera is fully off now - drop the HUD preview frame so it doesn't
+        # linger (moved here from the body so it runs on EVERY exit path).
+        try:
+            _hud_camera_preview_remove()
+        except Exception:
+            logging.exception("[face-track] preview remove on shutdown")
+        _face_track_beat("stopped")
+        _face_track_note_stopped(reason, exc)
+
+
+def _face_tracking_thread_body():
     """
     Multi-camera attention tracking:
       • Primary camera sees you → track face position precisely
@@ -5744,6 +7035,15 @@ def _face_tracking_thread():
             idx = cam
             cam_name = None
             want_kinect = KINECT_AS_CAMERA
+        # LIVENESS (2026-09-05). EVERYTHING below this line can block ON THE
+        # PRODUCER THREAD: the friendly-name DirectShow enumeration, the Kinect
+        # bridge open, and the bounded cv2 open itself. The initial
+        # `for cam in CAMERAS` sweep has no other beat BETWEEN cameras - the
+        # supervisor beats "starting" once and then nothing until the loop top -
+        # so without this a two-camera boot could go quiet for two full open
+        # windows and be reported as a wedge. _open_capture is a closure inside
+        # the producer body, so this only ever runs on the producer thread.
+        _face_track_beat(f"opening camera index {idx}")
         # NAME-BASED RESOLUTION (P0-1, the mic-shuffle bug class): if the entry
         # carries a "name", resolve the LIVE DirectShow index by that friendly-
         # name substring at OPEN time and PREFER it over the static "index". A USB
@@ -5779,33 +7079,66 @@ def _face_tracking_thread():
         # releases. Without this, an abandoned probe worker's eventual
         # release() can collide with this open or its failure-path
         # release() and trash DirectShow's heap.
-        with _camera_io_lock:
-            c = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-            if c.isOpened():
-                c.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-                c.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-                # Buffersize=1 keeps the driver from queueing stale frames.
-                # Some DirectShow drivers silently ignore this; harmless if so.
-                try:
-                    c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                except Exception:  # pragma: no cover - defensive: some DirectShow drivers reject CAP_PROP_BUFFERSIZE
-                    pass
-                # Read back the index we actually opened so a name→index shuffle
-                # is VISIBLE in the log (covers initial open AND every reopen /
-                # wake path, which the one-shot 'Opened …' line below does not).
-                _label = cam_name if cam_name else (
-                    cam.get("label") if isinstance(cam, dict) else f"index {idx}")
-                print(f"  [face-track] opened {_label} at index {idx}")
-                return c
-            try:
-                c.release()
-            except Exception:  # pragma: no cover - defensive: release of a half-opened capture handle rarely raises
-                pass
-            return None
+        #
+        # BOUNDED since 2026-09-05. This is the SAME call shape that was
+        # measured wedged forever in _open_tile_capture - cv2.VideoCapture +
+        # cap.set() on a sick device, under the process-wide camera lock - and
+        # the session log shows this opener hitting that very device every ~10 s
+        # ("opened usb 2.0 camera at index 0"). Which of the two wedged first
+        # was luck. Neither is unbounded now.
+        _label = cam_name if cam_name else (
+            cam.get("label") if isinstance(cam, dict) else f"index {idx}")
+
+        def _dshow_open():
+            with _camera_io_lock:
+                c = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                if c.isOpened():
+                    c.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+                    c.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                    # Buffersize=1 keeps the driver from queueing stale frames.
+                    # Some DirectShow drivers silently ignore this; harmless if so.
+                    try:
+                        c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    except Exception:  # pragma: no cover - defensive: some DirectShow drivers reject CAP_PROP_BUFFERSIZE
+                        pass
+                    return c
+                # Through the lock OBJECT, not a bare release - this worker may
+                # have been abandoned (and its lock retired) while cv2 was still
+                # inside the open. See _release_on_current_camera_lock.
+                _release_on_current_camera_lock(c)
+                return None
+
+        # beat= is what lets _FACE_TRACK_STALL_WARN_S (30 s) legally sit BELOW
+        # this 35 s cap - see _CAMERA_OPEN_BEAT_INTERVAL_S. Only the producer
+        # thread may pass it, and this closure only ever runs there.
+        c = _open_capture_bounded(idx, _dshow_open, label=_label,
+                                  timeout=_CAMERA_LOOP_OPEN_TIMEOUT_S,
+                                  beat=_face_track_beat)
+        if c is not None:
+            # ANNOUNCED HERE, BY THE JOINER, AND ONLY FOR A HANDLE THIS CALL
+            # HANDS BACK TO THE LOOP. It used to be printed inside _dshow_open,
+            # i.e. on the worker, before _open_capture_bounded's _run checks
+            # `abandoned` — so an ABANDONED open still printed "opened <cam> at
+            # index N" moments AFTER "Abandoning the attempt…", for a capture
+            # _run then released and threw away. Worse, it landed LAST, so it
+            # read as the camera having come back. That line is the one the
+            # 01:22 timeline was reconstructed from ("read failure #25 ->
+            # opened -> woke"); it has to mean the producer holds this capture,
+            # and nothing else.
+            # Still covers the initial open AND every reopen / wake path (they
+            # all come through _open_capture), which the one-shot 'Opened …'
+            # line below does not, and still reads back the index we actually
+            # opened so a name→index shuffle stays VISIBLE.
+            print(f"  [face-track] opened {_label} at index {idx}")
+        return c
 
     # Open all configured cameras at HD. Each entry is a mutable dict so
     # individual captures can be released & reopened independently mid-loop.
     caps: list[dict] = []
+    # Published so the SUPERVISOR's finally can release these handles even when
+    # this body never returns normally (a BaseException used to skip the whole
+    # release sweep below).
+    _face_track_caps[0] = caps
     for cam in CAMERAS:
         c = _open_capture(cam)
         if c is not None:
@@ -5830,6 +7163,12 @@ def _face_tracking_thread():
 
     while not _face_track_stop.is_set():  # pragma: no cover - live-capture daemon loop (per-frame camera read/detect/smooth, runs until stop)
         try:
+            # LIVENESS. One beat per iteration, plus finer-grained beats around
+            # the calls that can block in C (below). The watchdog thread turns a
+            # missing beat into a loud log line WITH this thread's stack - the
+            # diagnostic whose absence made a wedged webcam look like three
+            # dead cameras and a hardware fault.
+            _face_track_beat_iteration()
             # Always read from cameras so the latest frames stay fresh for see_user,
             # even when the tracker is paused (e.g. during speaking/listening).
             paused = _face_track_pause.is_set()
@@ -5866,16 +7205,45 @@ def _face_tracking_thread():
             # Read all cameras, run face detection on each
             primary_face = None
             side_hits: list[tuple[float, float]] = []
+            # SHARED-PREVIEW PUBLISH BOOKKEEPING (2026-09-05). The single HUD
+            # preview JPEG is written ONLY from the `cam["primary"]` branch far
+            # below, which lives INSIDE this per-camera loop and therefore
+            # behind every `continue` above it - the quarantine bench, the
+            # reopen backoff, the failed reopen, the wake-path bench. So a
+            # benched or backing-off PRIMARY silently stopped the whole HUD
+            # camera tile, not just its own. These two carry the state the
+            # post-loop keep-alive needs to publish anyway.
+            #   primary_published - the primary reached the publisher branch.
+            #   preview_fallback  - (cam, frame) of a HEALTHY non-primary that
+            #                       produced a real frame this iteration.
+            primary_published = False
+            preview_fallback: tuple[dict, "np.ndarray"] | None = None
 
             now_loop = time.time()
             for entry in caps:
                 cam = entry["cam"]
                 c = entry["cap"]
+                # QUARANTINE GATE (2026-09-05). A camera that has needed
+                # rescuing _CAMERA_QUARANTINE_STRIKES times in a row is BENCHED:
+                # not read, not woken, not reopened, and - critically - not
+                # opened by the side-tile compositor either. Its own tile goes
+                # dark; every other camera keeps publishing. Retrying it forever
+                # is what walked the producer into a wedged DirectShow open.
+                # NOTE: this `continue` also skips the SHARED preview write far
+                # below (it is gated on cam["primary"]), which is why the
+                # post-loop keep-alive at the bottom of this loop exists.
+                if _camera_is_quarantined(cam["index"], now_loop):
+                    if c is not None:
+                        _release_capture_guarded(c, cam["index"], cam["label"])
+                        entry["cap"] = None
+                    continue
+                _face_track_beat(f"camera {cam['index']}")
                 # Recovery path: capture was released after too many failures.
                 # Try to reopen if backoff window has elapsed.
                 if c is None:
                     if now_loop < entry["next_reopen_at"]:
                         continue
+                    _face_track_beat(f"reopen camera {cam['index']}")
                     new_c = _open_capture(cam)
                     if new_c is None:
                         # RE-EVALUATE contention on EVERY failed reopen. This
@@ -5895,6 +7263,7 @@ def _face_tracking_thread():
                     print(f"  [face-track] Reopened {cam['label']} (index {cam['index']}) after recovery")
                     c = new_c
 
+                _face_track_beat(f"read camera {cam['index']}")
                 _read_t0 = time.perf_counter()
                 ret, frame = c.read()
                 _read_ms = (time.perf_counter() - _read_t0) * 1000.0
@@ -5939,66 +7308,100 @@ def _face_tracking_thread():
                         with _camera_state_lock:
                             _camera_wake_attempts[cam["index"]] = (
                                 _camera_wake_attempts.get(cam["index"], 0) + 1)
-                        with _camera_io_lock:
-                            try:
-                                c.release()
-                            except Exception:
-                                logging.exception("[face-track] wake release raised")
-                            # The old handle is now released — NEVER touch it
-                            # again. Drop it from entry so that if the reopen
-                            # below fails, the next loop iteration takes the
-                            # recovery path (c is None → _open_capture) and
-                            # re-opens cleanly instead of calling .read() on a
-                            # RELEASED handle, which is heap corruption /
-                            # 0xc0000374. 2026-05-30 deep audit.
+                        # ONE strike per rescue cycle. A wake attempt IS a
+                        # rescue: reaching it took 25 consecutive read failures
+                        # AND 2 s of silence, so a USB power-save blip (resolves
+                        # in <1 s) never scores. The measured death ran four of
+                        # these cycles ~10 s apart before wedging; benching on
+                        # the third fires ~25 s in, before that fourth cycle.
+                        if _camera_note_sick_cycle(
+                                cam["index"], cam["label"],
+                                f"{entry['fails']} consecutive read failures; "
+                                f"soft wake #{_camera_wake_attempts.get(cam['index'], 0)}",
+                                now_loop):
                             entry["cap"] = None
+                            _release_capture_guarded(c, cam["index"],
+                                                     cam["label"])
+                            continue
+                        _face_track_beat(f"wake camera {cam['index']}")
+                        # RELEASE inside the lock, REOPEN outside it. These
+                        # used to share ONE `with _camera_io_lock:`, which
+                        # DEADLOCKED the wake the moment the opener became
+                        # bounded (2026-09-05): _open_capture now delegates to
+                        # _open_capture_bounded, whose WORKER thread takes
+                        # _camera_io_lock itself. That lock is an RLock -
+                        # reentrant for the SAME thread only - so a producer
+                        # parked in t.join() while holding it could never let
+                        # the worker in. Measured, with no camera involved: the
+                        # reopen returned None after the full
+                        # _CAMERA_LOOP_OPEN_TIMEOUT_S every single time, froze
+                        # all three tiles past _CAMERA_PREVIEW_STALE_S while it
+                        # sat on the process-wide lock, and blamed a device
+                        # that had never even been reached - killing the
+                        # "woke via release+reopen" recovery outright. The lock
+                        # still covers every open and every release; it is just
+                        # taken by the code that performs them, never held by
+                        # this thread across a join.
+                        _release_capture_guarded(c, cam["index"], cam["label"])
+                        # The old handle is now released — NEVER touch it
+                        # again. Drop it from entry so that if the reopen
+                        # below fails, the next loop iteration takes the
+                        # recovery path (c is None → _open_capture) and
+                        # re-opens cleanly instead of calling .read() on a
+                        # RELEASED handle, which is heap corruption /
+                        # 0xc0000374. 2026-05-30 deep audit.
+                        entry["cap"] = None
+                        new_c = None
+                        woke_ret, woke_frame = False, None
+                        time.sleep(0.15)
+                        try:
+                            # Use the shared name-resolving opener (the same
+                            # one the initial + recovery opens use) rather
+                            # than a raw cv2.VideoCapture on the STATIC
+                            # cam["index"]. A USB re-enumeration can move the
+                            # device to a new live index, so the static index
+                            # would silently wake the WRONG camera (or a
+                            # random webcam where the Kinect belongs),
+                            # bypassing _dshow_name_to_index and the Kinect
+                            # branch. This is exactly the mic/USB-shuffle
+                            # event the name resolution exists to survive.
+                            new_c = _open_capture(cam)
+                            if new_c is not None and new_c.isOpened():
+                                try: new_c.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+                                except Exception: pass
+                                try: new_c.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                                except Exception: pass
+                                try:
+                                    new_c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                                except Exception:
+                                    pass
+                                # Warmup frame — first read often comes back
+                                # empty even on a healthy reopen. Read OUTSIDE
+                                # _camera_io_lock, like every other read in this
+                                # file: holding it across a blocking cap.read()
+                                # is the whole-subsystem hang already documented
+                                # in _face_track_frame_for_slot.
+                                try:
+                                    new_c.read()
+                                except Exception:
+                                    pass
+                                woke_ret, woke_frame = new_c.read()
+                            else:
+                                if new_c is not None:
+                                    _release_capture_guarded(
+                                        new_c, cam["index"], cam["label"])
+                                new_c = None
+                        except Exception:
+                            # A DirectShow open/set/read on a half-init
+                            # handle can raise — release the new handle so
+                            # it can't leak; entry["cap"] stays None so the
+                            # recovery path re-opens next iteration.
+                            logging.exception("[face-track] wake reopen raised")
+                            if new_c is not None:
+                                _release_capture_guarded(
+                                    new_c, cam["index"], cam["label"])
                             new_c = None
                             woke_ret, woke_frame = False, None
-                            time.sleep(0.15)
-                            try:
-                                # Use the shared name-resolving opener (the same
-                                # one the initial + recovery opens use) rather
-                                # than a raw cv2.VideoCapture on the STATIC
-                                # cam["index"]. A USB re-enumeration can move the
-                                # device to a new live index, so the static index
-                                # would silently wake the WRONG camera (or a
-                                # random webcam where the Kinect belongs),
-                                # bypassing _dshow_name_to_index and the Kinect
-                                # branch. This is exactly the mic/USB-shuffle
-                                # event the name resolution exists to survive.
-                                new_c = _open_capture(cam)
-                                if new_c is not None and new_c.isOpened():
-                                    try: new_c.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-                                    except Exception: pass
-                                    try: new_c.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-                                    except Exception: pass
-                                    try:
-                                        new_c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                                    except Exception:
-                                        pass
-                                    # Warmup frame — first read often comes back
-                                    # empty even on a healthy reopen.
-                                    try:
-                                        new_c.read()
-                                    except Exception:
-                                        pass
-                                    woke_ret, woke_frame = new_c.read()
-                                else:
-                                    if new_c is not None:
-                                        try: new_c.release()
-                                        except Exception: pass
-                                    new_c = None
-                            except Exception:
-                                # A DirectShow open/set/read on a half-init
-                                # handle can raise — release the new handle so
-                                # it can't leak; entry["cap"] stays None so the
-                                # recovery path re-opens next iteration.
-                                logging.exception("[face-track] wake reopen raised")
-                                if new_c is not None:
-                                    try: new_c.release()
-                                    except Exception: pass
-                                new_c = None
-                                woke_ret, woke_frame = False, None
                         if new_c is not None and woke_ret and woke_frame is not None:
                             entry["cap"] = new_c
                             entry["fails"] = 0
@@ -6045,12 +7448,14 @@ def _face_tracking_thread():
                             # a half-initialized Mat and trashes the heap. Mark
                             # for reopen on the next loop after backoff.
                             if c is not None:
-                                with _camera_io_lock:
-                                    try:
-                                        c.release()
-                                    except Exception:
-                                        logging.exception("[face-track] release after %d failed reads", entry["fails"])
+                                _release_capture_guarded(c, cam["index"],
+                                                         cam["label"])
                             entry["cap"] = None
+                            # A full wedge is unambiguously a failed rescue.
+                            _camera_note_sick_cycle(
+                                cam["index"], cam["label"],
+                                f"capture wedged after {entry['fails']} "
+                                f"failed reads", now_loop)
                             # LIVE CAMERA-CONTENTION YIELD (P1-3) — the decision
                             # (and the one-time "appears LOCKED by ..." hint) lives
                             # in _schedule_camera_reopen so the recovery and
@@ -6079,13 +7484,29 @@ def _face_tracking_thread():
                         if (cam["primary"] and not camera_off
                                 and _hud_camera_preview_enabled()):
                             try:
-                                _hud_kinect_preview_write(now_loop)
+                                # The RETURN VALUE, not merely "we got here".
+                                # A read miss means the primary has NO frame, so
+                                # the composite is the only thing that can
+                                # publish for it - and on the live rig the
+                                # composite is OFF (KINECT_ENABLED=False), so
+                                # this returns False and NOTHING was written.
+                                # Recording True here would suppress the
+                                # post-loop keep-alive and leave the tile dark
+                                # in exactly the owner's fault mode: a camera
+                                # that OPENS FINE every 10 s and then never
+                                # delivers a frame.
+                                primary_published = bool(
+                                    _hud_kinect_preview_write(now_loop))
                             except Exception:
                                 logging.exception(
                                     "[face-track] kinect preview write on read-miss failed")
                         continue
                 entry["fails"] = 0
                 _note_camera_read_attempt(cam["index"], ok=True)
+                # A real frame is the only proof of health there is - the sick
+                # camera OPENED fine every 10 s and still delivered nothing, so
+                # nothing short of a frame may clear the strikes.
+                _camera_note_healthy(cam["index"], cam["label"])
                 # Cache frame for see_user action regardless of face detection
                 with _camera_state_lock:
                     _camera_latest_frame[cam["index"]] = frame.copy()
@@ -6101,6 +7522,16 @@ def _face_tracking_thread():
                 # family as the main preview. 2026-07-10.
                 if not camera_off and _hud_camera_preview_enabled():
                     _hud_percam_preview_write(_percam_side(cam), frame, now_loop)
+                # Remember the first HEALTHY non-primary frame of this
+                # iteration. It is what the post-loop keep-alive publishes to
+                # the SHARED preview when the primary is benched/backing off
+                # and the Kinect composite is unavailable (the live rig runs
+                # KINECT_ENABLED=False, so the composite returns False there
+                # and this fallback is the ONLY thing that keeps the HUD
+                # camera tile alive). Never silent: the keep-alive logs which
+                # camera it substituted.
+                if not cam["primary"] and preview_fallback is None:
+                    preview_fallback = (cam, frame)
                 # Mirror the PRIMARY camera's live frame to the HUD preview file
                 # (a small overwriting JPEG). We write it whenever the primary
                 # camera is producing frames — INCLUDING while paused for voice
@@ -6111,6 +7542,12 @@ def _face_tracking_thread():
                 # HUD_CAMERA_PREVIEW.
                 if (cam["primary"] and not camera_off
                         and _hud_camera_preview_enabled()):
+                    # THE MEASURED WEDGE POINT lives under here
+                    # (_hud_kinect_preview_write -> _compose_kinect_preview ->
+                    # _read_side_tile_webcams -> _open_tile_capture), so beat
+                    # with that stage name: the watchdog's stall line then says
+                    # exactly which call never came back.
+                    _face_track_beat("kinect composite preview write")
                     # PART A: prefer the Kinect color + LIVE SKELETON composite
                     # (incl. the two webcam tiles) when the overlay is enabled +
                     # the Kinect is streaming; it returns False when off/no
@@ -6118,6 +7555,7 @@ def _face_tracking_thread():
                     # and the HUD tile is never left blank.
                     if not _hud_kinect_preview_write(now_loop):
                         _hud_camera_preview_write(frame, now_loop)
+                    primary_published = True
                 if paused:
                     # Skip the HEAVY cv2 face detection + eye-control servo math
                     # while paused for voice — that recognition cost is what the
@@ -6144,6 +7582,43 @@ def _face_tracking_thread():
                     primary_face = face
                 else:
                     side_hits.append((cam["look_x"], cam["look_y"]))
+
+            # SHARED-PREVIEW KEEP-ALIVE (2026-09-05). THE DEFECT THIS CLOSES:
+            # the single HUD camera preview is published from ONE branch that
+            # sits inside the per-camera loop above and is gated on
+            # `cam["primary"]`. Every `continue` before it therefore takes the
+            # WHOLE preview down, not just that camera's tile:
+            #   * the quarantine bench  (a benched PRIMARY -> 60-600 s dark),
+            #   * `now_loop < entry["next_reopen_at"]` (reopen backoff),
+            #   * a failed reopen,
+            #   * the wake path's own bench.
+            # On the live rig the PRIMARY is index 2 (the eMeet C960), so the
+            # very camera most likely to be stolen by Teams/Zoom is the one
+            # whose bench blanked the HUD - the owner's original symptom, and
+            # the reason the quarantine log line promising "every OTHER camera
+            # keeps publishing" read as a lie. Publish from here instead when
+            # the primary never reached its branch.
+            #
+            # Preference order, and NEVER silent about which one it used:
+            #   1. the Kinect composite (needs no primary handle at all), then
+            #   2. a healthy non-primary frame, announced as a substitution,
+            #   3. nothing to publish - say so, with the reason.
+            if (not primary_published and not camera_off
+                    and _hud_camera_preview_enabled()):
+                try:
+                    _face_track_beat("shared preview keep-alive")
+                    if not _hud_kinect_preview_write(now_loop):
+                        if preview_fallback is not None:
+                            _fb_cam, _fb_frame = preview_fallback
+                            if _hud_camera_preview_write(_fb_frame, now_loop):
+                                _note_preview_failover(_fb_cam, now_loop)
+                        else:
+                            _note_preview_starved(now_loop)
+                except Exception:
+                    # A preview fault must never be able to stop the producer -
+                    # that is the entire bug class this file is defending.
+                    logging.exception(
+                        "[face-track] shared preview keep-alive failed")
 
             # Average all side cameras that see the face → handles "both cameras
             # see you" (= looking forward) gracefully.
@@ -6189,18 +7664,11 @@ def _face_tracking_thread():
             logging.exception("[face-track] error in tracking loop iteration")
             time.sleep(0.1)
 
-    for entry in caps:
-        c = entry["cap"]
-        if c is None:
-            continue  # pragma: no cover - defensive: a None cap entry only occurs if an earlier open failed
-        with _camera_io_lock:
-            try:
-                c.release()
-            except Exception:  # pragma: no cover - defensive: camera release during shutdown rarely raises
-                logging.exception("[face-track] release on shutdown")
-    # Camera is fully off now — drop the HUD preview frame so it doesn't linger.
-    _hud_camera_preview_remove()
-    print("  [face-track] Stopped")
+    # TEARDOWN MOVED (2026-09-05) to _face_tracking_thread's `finally` -
+    # _face_track_release_all + _hud_camera_preview_remove + the stop line. As
+    # plain statements HERE they ran only on a clean fall-through: a
+    # BaseException (SystemExit) skipped all three and the producer vanished
+    # without releasing a camera and without a single word in the log.
 
 
 def get_monitors() -> list[tuple[int, int, int, int]]:
@@ -7894,13 +9362,29 @@ def list_cameras(max_check: int = CAMERA_PROBE_MAX):
                 except Exception:
                     pass
                 finally:
-                    try: cap.release()
-                    except Exception: pass  # pragma: no cover - defensive: list-cameras probe release rarely raises
+                    # Through the lock OBJECT - see
+                    # _release_on_current_camera_lock.
+                    _release_on_current_camera_lock(cap)
 
         t = threading.Thread(target=_do, daemon=True)
         t.start()
         # Generous timeout for list-cameras (warm-up frames take ~0.75 s alone)
         t.join(timeout=max(CAMERA_PROBE_TIMEOUT_SEC, 5.0))
+        if t.is_alive():
+            # Abandoned while it OWNS _camera_io_lock — retire that lock, or
+            # this diagnostic command silently kills camera I/O for the whole
+            # running process (the face-track producer included). Same defect
+            # as the bounded opener's, third call site.
+            try:
+                owner, hold = _camera_io_lock.owner_hold()
+                if owner == t.ident:
+                    _camera_io_lock.retire_if_holding(
+                        t.ident, hold,
+                        f"list-cameras index {idx} wedged inside its "
+                        f"DirectShow open")
+            except Exception:  # pragma: no cover - defensive: foreign lock object
+                logging.exception("[list-cameras] camera I/O lock retire failed "
+                                  "for index %s", idx)
         return (result["opened"], result["ret"], result["w"], result["h"],
                 result["bright"], result["frame"])
 
@@ -16867,10 +18351,25 @@ def get_camera_health() -> dict:
     ``last_read_error`` (str or None), ``last_read_error_at`` (epoch or
     0.0), ``wake_attempts`` (int), ``recoveries`` (int), and
     ``last_read_ms`` (how long the last cap.read() blocked - the slowest
-    camera here is what caps the HUD/web preview frame rate). Safe to call from
-    any thread — uses the same lock as the face-tracking writer.
+    camera here is what caps the HUD/web preview frame rate), and the
+    QUARANTINE fields (2026-09-05) - ``quarantined`` / ``quarantine_reason`` /
+    ``quarantine_until`` / ``quarantine_since`` / ``quarantine_count`` /
+    ``quarantine_strikes`` - which say whether this ONE camera has been benched
+    so the others could keep publishing.
+
+    A NOTE ON READING THIS DICT HONESTLY: every field here is written by the
+    face-tracking producer, so when the producer STALLS they all freeze at
+    their last value and a wedged subsystem reads as a merely-idle camera. That
+    is exactly how a 68-minute hang looked like healthy state. Pair it with
+    ``get_face_track_liveness()``, which is the only signal that can tell you
+    the writer itself stopped. This dict stays STRICTLY keyed by camera index -
+    liveness is a property of the producer, not of any one camera.
+
+    Safe to call from any thread — uses the same lock as the face-tracking
+    writer.
     """
     out: dict[int, dict] = {}
+    quarantine = get_camera_quarantine()
     with _camera_state_lock:
         indices: set[int] = set()
         indices.update(_camera_last_frame_at.keys())
@@ -16891,6 +18390,17 @@ def get_camera_health() -> dict:
                 # therefore the preview's ceiling (2026-09-04).
                 "last_read_ms":        _camera_read_ms.get(idx, 0.0),
             }
+            # Quarantine state for this index (all-false defaults when the
+            # camera has never been benched).
+            q = quarantine.get(idx) or {}
+            out[idx].update({
+                "quarantined":        bool(q.get("quarantined", False)),
+                "quarantine_reason":  q.get("quarantine_reason"),
+                "quarantine_until":   q.get("quarantine_until", 0.0),
+                "quarantine_since":   q.get("quarantine_since", 0.0),
+                "quarantine_count":   q.get("quarantine_count", 0),
+                "quarantine_strikes": q.get("quarantine_strikes", 0),
+            })
     return out
 
 

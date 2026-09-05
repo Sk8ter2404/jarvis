@@ -1361,8 +1361,11 @@ class OpenCaptureByNameTests(MonolithGlobalsTestCase):
     def test_source_prefers_name_resolved_index(self):
         # Guard the wiring: _open_capture calls _dshow_name_to_index on cam['name']
         # and uses its result as the index (falling back to the static one).
+        # 2026-09-05: the loop was split into a thin SUPERVISOR
+        # (_face_tracking_thread, which guarantees a stop is logged) and the
+        # producer body. _open_capture is nested in the BODY, so read that.
         import inspect
-        src = inspect.getsource(self.bc._face_tracking_thread)
+        src = inspect.getsource(self.bc._face_tracking_thread_body)
         self.assertIn("_dshow_name_to_index(cam_name)", src)
         self.assertIn("opened", src)   # the read-back log line
         # The read-back log uses the index variable we actually opened.

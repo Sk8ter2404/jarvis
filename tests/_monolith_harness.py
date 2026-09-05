@@ -172,6 +172,14 @@ _MONOLITH_RESTORE_NAMES = (
     # reinit — the exact "green for the wrong reason" shape.
     "_pa_close_pending",
     "_camera_failure_summary",
+    # Camera quarantine + producer-liveness state (2026-09-05). A test that
+    # benches a camera or fakes a stalled heartbeat must not leak it: a
+    # leftover quarantine would make every later camera test silently skip
+    # the device, and a leftover heartbeat would make the watchdog tests
+    # green for the wrong reason.
+    "_camera_quarantine", "_camera_pending_releases",
+    "_face_track_heartbeat", "_face_track_stall_state",
+    "_face_track_caps",
     # ── single-flight / barge-in counter cells (2026-07-08 bug-hunt) ────────
     # New single-element-list cells: reset in place so a test that abandons a
     # clone worker (leaving _voice_clone_inflight True) or accepts a barge-in
