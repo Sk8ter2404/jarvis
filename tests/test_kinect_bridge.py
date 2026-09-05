@@ -2532,5 +2532,534 @@ class GhostSkeletonGateTests(unittest.TestCase):
              "shoulder_right": (0.2, 0.4, 2.1, 2)}))
 
 
+# ═════════════════════════════════════════════════════════════════════════
+# 2026-09-04 KINECT CAPABILITY AUDIT
+# Three findings, one regression class each:
+#   1. DEPTH was the last stream still gated on the installed build's sticky
+#      has_new_depth_frame() flag - a frozen buffer served forever, and
+#      kinect_status announcing "depth" on a dead sensor.
+#   2. _parse_body_frame dropped four fields the installed KinectBody has
+#      always published (hand_*_confidence, clipped_edges) plus the joint
+#      tracking-state census.
+#   3. arm_extension's wrist fallback was DEAD CODE, so the PRIMARY air-mouse
+#      engage gate (lift_m) went None on every inferred-hand frame - 12-58% of
+#      tracked frames measured across 33 live session logs.
+# Plus the new depth-space corroboration layer for the open mirror/TV defect.
+# ═════════════════════════════════════════════════════════════════════════
+
+
+class _DepthFlagsRuntime:
+    """The INSTALLED pykinect2 build's DEPTH surface, faithfully wrong.
+
+    get_last_depth_frame() assigns `_last_color_frame_access` as a bare LOCAL
+    (no `self.`, and it stamps the COLOR name - two bugs in one line), so
+    has_new_depth_frame() is permanently True once one depth frame has ever
+    arrived and reading never clears it. Freshness is carried only by
+    `_last_depth_frame_time`, which advances on simulated ARRIVAL."""
+
+    def __init__(self):
+        self.source_flags = 0
+        self._depth = None
+        self._ever = False
+        self._last_depth_frame_time = 0.0
+        self._last_color_frame_time = 0.0
+        self._last_body_frame_time = 0.0
+        self.closed = False
+
+    def deliver_depth_frame(self, flat):
+        self._depth = flat
+        self._ever = True
+        self._last_depth_frame_time += 1.0
+
+    def has_new_depth_frame(self):
+        return self._ever          # the bug: sticky True forever
+
+    def has_new_color_frame(self):
+        return False
+
+    def has_new_body_frame(self):
+        return False
+
+    def get_last_depth_frame(self):
+        return self._depth         # re-serves the frozen buffer, clears nothing
+
+    def get_last_color_frame(self):
+        return None
+
+    def get_last_body_frame(self):
+        return None
+
+    def close(self):
+        self.closed = True
+
+
+class DepthFreshnessTests(_BridgeBase):
+    """FINDING 1. get_depth() used to trust has_new_depth_frame(); on this build
+    that flag never goes False, so a wedged sensor kept re-serving one frozen
+    512x424 buffer and every liveness probe built on "did it return bytes?"
+    reported depth as live. Depth now derives freshness the same way color and
+    body have since the 2026-07-21 audit."""
+
+    def setUp(self):
+        super().setUp()
+        kb._depth_time_seen[0] = 0.0
+        kb._last_depth_frame_at[0] = 0.0
+
+    def _armed(self):
+        np = _require_numpy(self)
+        rt = _DepthFlagsRuntime()
+        _patch_loader(self, rt)
+        # PUBLISH FIRST. _publish_runtime seeds the per-stream seen-cells from the
+        # instance's CURRENT frame times, so a frame delivered before the open
+        # would be (correctly) treated as already consumed by this bridge.
+        kb.get_runtime()
+        rt.deliver_depth_frame(np.full(512 * 424, 1500, dtype=np.uint16))
+        return rt
+
+    def test_require_new_refuses_frozen_frame_despite_sticky_flag(self):
+        rt = self._armed()
+        first = kb.get_depth(require_new=True)
+        self.assertIsNotNone(first)              # the genuinely new frame
+        # No new arrival: the sticky flag still says True, but the bridge's own
+        # frame-time cell has caught up, so a require_new caller gets nothing.
+        self.assertTrue(rt.has_new_depth_frame())
+        self.assertIsNone(kb.get_depth(require_new=True))
+        # ...and a real arrival unblocks it again.
+        rt.deliver_depth_frame(rt._depth)
+        self.assertIsNotNone(kb.get_depth(require_new=True))
+
+    def test_default_still_serves_the_latest_buffer(self):
+        self._armed()
+        self.assertIsNotNone(kb.get_depth())
+        self.assertIsNotNone(kb.get_depth())     # a poller faster than 30 Hz
+
+    def test_delivery_clock_only_stamps_on_a_real_new_frame(self):
+        rt = self._armed()
+        kb.get_depth()
+        stamped = kb._last_depth_frame_at[0]
+        self.assertGreater(stamped, 0.0)
+        kb._last_depth_frame_at[0] = 0.0
+        kb.get_depth()                            # re-served frozen buffer
+        self.assertEqual(kb._last_depth_frame_at[0], 0.0)
+        rt.deliver_depth_frame(rt._depth)
+        kb.get_depth()
+        self.assertGreater(kb._last_depth_frame_at[0], 0.0)
+
+    def test_still_reshapes_to_512x424_uint16(self):
+        self._armed()
+        d = kb.get_depth()
+        self.assertEqual(d.shape, (424, 512))
+        self.assertEqual(str(d.dtype), "uint16")
+
+
+class StreamHealthTests(_BridgeBase):
+    """get_stream_health separates the two questions the old accessor-probe
+    conflated: is a NEW frame pending from the SDK (poll-independent liveness)
+    vs how old is what the bridge would hand back (poll-dependent)."""
+
+    def setUp(self):
+        super().setUp()
+        kb._depth_time_seen[0] = 0.0
+        kb._last_depth_frame_at[0] = 0.0
+
+    def test_closed_runtime_reports_nothing_live(self):
+        h = kb.get_stream_health()
+        self.assertFalse(h["open"])
+        self.assertFalse(h["depth_pending"])
+        self.assertIsNone(h["depth_age_s"])
+        self.assertEqual(h["infrared"], "unsupported")
+
+    def test_pending_is_true_before_the_frame_is_served_and_false_after(self):
+        np = _require_numpy(self)
+        rt = _DepthFlagsRuntime()
+        _patch_loader(self, rt)
+        kb.get_runtime()                          # publish it, THEN deliver
+        rt.deliver_depth_frame(np.full(512 * 424, 1200, dtype=np.uint16))
+        self.assertTrue(kb.get_stream_health()["depth_pending"])
+        kb.get_depth()
+        self.assertFalse(kb.get_stream_health()["depth_pending"])
+        rt.deliver_depth_frame(rt._depth)
+        self.assertTrue(kb.get_stream_health()["depth_pending"])
+
+    def test_age_reports_since_the_last_served_new_frame(self):
+        np = _require_numpy(self)
+        rt = _DepthFlagsRuntime()
+        _patch_loader(self, rt)
+        kb.get_runtime()
+        rt.deliver_depth_frame(np.full(512 * 424, 1200, dtype=np.uint16))
+        kb.get_depth()
+        self.assertIsNotNone(kb.get_stream_health()["depth_age_s"])
+        self.assertGreaterEqual(kb.get_stream_health()["depth_age_s"], 0.0)
+
+    def test_never_raises_on_a_junk_runtime(self):
+        kb._runtime[0] = object()                 # no frame-time attrs at all
+        self.addCleanup(lambda: kb._runtime.__setitem__(0, None))
+        h = kb.get_stream_health()
+        self.assertTrue(h["open"])
+        self.assertIn("body_pending", h)
+
+
+class BodyFrameCapabilityTests(unittest.TestCase):
+    """FINDING 2. The installed KinectBody publishes hand_left_confidence,
+    hand_right_confidence and clipped_edges on every tracked body (verified by
+    reading site-packages/pykinect2/PyKinectRuntime.py). _parse_body_frame read
+    none of them. They are now surfaced ADDITIVELY - no pre-existing key
+    changes meaning."""
+
+    def _real_body(self, **attrs):
+        b = _FakeBody(True, hand_right_state=2, hand_left_state=3)
+        for k, v in attrs.items():
+            setattr(b, k, v)
+        return b
+
+    # --- the decoders -----------------------------------------------------
+    def test_hand_confidence_names(self):
+        self.assertEqual(kb._hand_confidence_name(0), "low")
+        self.assertEqual(kb._hand_confidence_name(1), "high")
+        self.assertEqual(kb._hand_confidence_name(None), "unknown")
+        self.assertEqual(kb._hand_confidence_name("junk"), "unknown")
+        self.assertEqual(kb._hand_confidence_name(7), "unknown")
+
+    def test_clipped_edges_bitfield(self):
+        # FrameEdge_Right=1, _Left=2, _Top=4, _Bottom=8
+        self.assertEqual(kb._clipped_edges(0),
+                         {"right": False, "left": False, "top": False,
+                          "bottom": False, "any": False})
+        c = kb._clipped_edges(1 | 4)
+        self.assertTrue(c["right"] and c["top"] and c["any"])
+        self.assertFalse(c["left"] or c["bottom"])
+        self.assertFalse(kb._clipped_edges(None)["any"])
+        self.assertFalse(kb._clipped_edges("junk")["any"])
+
+    def test_joint_state_census(self):
+        joints = {"head": (0.0, 0.6, 2.0, 2), "neck": (0.0, 0.5, 2.0, 2),
+                  "hand_left": (0.2, 0.1, 2.0, 1), "foot_left": (0.0, 0.0, 0.0, 0)}
+        c = kb._joint_state_counts(joints)
+        self.assertEqual(c, {"tracked": 2, "inferred": 1,
+                             "not_tracked": 1, "total": 4})
+        self.assertEqual(kb._joint_state_counts({})["total"], 0)
+        self.assertEqual(kb._joint_state_counts(None)["total"], 0)
+
+    def test_joint_state_census_never_raises_on_short_tuples(self):
+        c = kb._joint_state_counts({"head": (0.0, 0.6), "neck": None})
+        self.assertEqual(c["total"], 2)
+        self.assertEqual(c["not_tracked"], 2)
+
+    # --- the parse-point wiring ------------------------------------------
+    def test_parse_emits_confidence_clipping_and_census(self):
+        body = self._real_body(hand_right_confidence=1, hand_left_confidence=0,
+                               clipped_edges=2 | 8)
+        parsed = kb._parse_body_frame(_FakeBodyFrame([body]))
+        self.assertEqual(len(parsed), 1)
+        b = parsed[0]
+        self.assertEqual(b["hand_right_conf"], "high")
+        self.assertEqual(b["hand_left_conf"], "low")
+        self.assertTrue(b["clipped"]["left"])
+        self.assertTrue(b["clipped"]["bottom"])
+        self.assertTrue(b["clipped"]["any"])
+        self.assertEqual(b["joint_states"]["total"], kb._JOINT_COUNT)
+        self.assertEqual(b["joint_states"]["tracked"], kb._JOINT_COUNT)
+
+    def test_parse_degrades_when_the_build_lacks_the_attrs(self):
+        # _FakeBody sets no confidence / clipped_edges attrs at all.
+        b = kb._parse_body_frame(_FakeBodyFrame([_FakeBody(True)]))[0]
+        self.assertEqual(b["hand_right_conf"], "unknown")
+        self.assertEqual(b["hand_left_conf"], "unknown")
+        self.assertFalse(b["clipped"]["any"])
+
+    def test_existing_keys_are_unchanged_by_the_addition(self):
+        body = self._real_body(hand_right_confidence=0, hand_left_confidence=0,
+                               clipped_edges=0)
+        b = kb._parse_body_frame(_FakeBodyFrame([body]))[0]
+        for key in ("id", "joints", "head", "distance_m", "facing",
+                    "facing_yaw_deg", "hand_right", "hand_left"):
+            self.assertIn(key, b)
+        # Gate OFF by default -> a LOW-confidence grip is still reported raw.
+        self.assertFalse(kb.HAND_CONFIDENCE_GATE)
+        self.assertEqual(b["hand_right"], "open")     # HandState_Open
+        self.assertEqual(b["hand_left"], "closed")    # HandState_Closed
+
+    def test_confidence_gate_collapses_low_confidence_grips_when_enabled(self):
+        with mock.patch.object(kb, "HAND_CONFIDENCE_GATE", True):
+            self.assertEqual(kb._grip_with_confidence(3, "low"), "unknown")
+            self.assertEqual(kb._grip_with_confidence(3, "high"), "closed")
+            self.assertEqual(kb._grip_with_confidence(2, "unknown"), "open")
+            # A grip that is ALREADY unknown stays unknown.
+            self.assertEqual(kb._grip_with_confidence(1, "low"), "unknown")
+
+    def test_confidence_gate_is_a_noop_while_disabled(self):
+        self.assertEqual(kb._grip_with_confidence(3, "low"), "closed")
+        self.assertEqual(kb._grip_with_confidence(2, "low"), "open")
+
+
+class ArmExtensionWristFallbackTests(unittest.TestCase):
+    """FINDING 3. arm_extension's `joints.get("hand_X") or joints.get("wrist_X")`
+    was DEAD CODE: _parse_body_frame populates all 25 joint names, so the hand
+    key is never ABSENT - only ever present-and-untracked. lift_m (the PRIMARY
+    air-mouse engage gate) therefore went None on every inferred-hand frame,
+    which is 12-58% of tracked frames measured across 33 live session logs.
+    The height reference now falls back to the WRIST, at the SAME
+    fully-tracked floor. The cursor/click joint (out["hand"]) deliberately does
+    NOT fall back."""
+
+    def _joints(self, hand_state=2, wrist_state=2, hand_y=0.7, wrist_y=0.64):
+        return {
+            "spine_shoulder": (0.0, 0.40, 2.0, 2),
+            "shoulder_right": (0.20, 0.40, 2.0, 2),
+            "elbow_right": (0.35, 0.55, 1.9, 2),
+            "wrist_right": (0.40, wrist_y, 1.8, wrist_state),
+            "hand_right": (0.42, hand_y, 1.78, hand_state),
+            "spine_mid": (0.0, 0.10, 2.0, 2),
+        }
+
+    def test_lift_uses_the_hand_when_the_hand_is_tracked(self):
+        ext = kb.arm_extension(self._joints(), "right")
+        self.assertEqual(ext["lift_ref"], "hand")
+        self.assertAlmostEqual(ext["lift_m"], 0.30, places=6)
+
+    def test_lift_falls_back_to_the_wrist_when_the_hand_is_inferred(self):
+        # THE REGRESSION: this returned lift_m=None before the fix, so the
+        # engage gate read "not extended" and the cursor dropped out.
+        ext = kb.arm_extension(self._joints(hand_state=1), "right")
+        self.assertEqual(ext["lift_ref"], "wrist")
+        self.assertIsNotNone(ext["lift_m"])
+        self.assertAlmostEqual(ext["lift_m"], 0.24, places=6)
+
+    def test_wrist_derived_lift_is_biased_low_so_it_fails_safe(self):
+        hand_lift = kb.arm_extension(self._joints(), "right")["lift_m"]
+        wrist_lift = kb.arm_extension(self._joints(hand_state=1),
+                                      "right")["lift_m"]
+        self.assertLess(wrist_lift, hand_lift)   # harder to engage, not easier
+
+    def test_zero_fill_hand_also_falls_back(self):
+        j = self._joints()
+        j["hand_right"] = (0.0, 0.0, 0.0, 2)     # NotTracked zero-fill
+        ext = kb.arm_extension(j, "right")
+        self.assertEqual(ext["lift_ref"], "wrist")
+        self.assertIsNotNone(ext["lift_m"])
+
+    def test_no_fallback_when_the_wrist_is_also_unreliable(self):
+        ext = kb.arm_extension(self._joints(hand_state=1, wrist_state=1),
+                               "right")
+        self.assertIsNone(ext["lift_ref"])
+        self.assertIsNone(ext["lift_m"])         # still fails safe
+
+    def test_floor_is_not_loosened_the_wrist_must_be_fully_tracked(self):
+        for bad in (0, 1):
+            ext = kb.arm_extension(self._joints(hand_state=0, wrist_state=bad),
+                                   "right")
+            self.assertIsNone(ext["lift_m"])
+
+    def test_cursor_and_click_joint_is_NOT_repointed_at_the_wrist(self):
+        # skills/kinect_air_mouse maps the cursor from ext.hand and gates CLICKS
+        # on joint_well_tracked(ext.hand) (FILTER 4). Swapping in a joint ~7 cm
+        # away would teleport the cursor AND let an inferred-hand frame press a
+        # button. Only the HEIGHT reference falls back.
+        ext = kb.arm_extension(self._joints(hand_state=1), "right")
+        self.assertEqual(ext["hand"][3], 1)                # still the hand joint
+        self.assertAlmostEqual(ext["hand"][1], 0.7, places=6)
+
+    def test_lift_ref_none_when_no_shoulder_reference(self):
+        j = self._joints()
+        j["spine_shoulder"] = (0.0, 0.40, 2.0, 1)
+        j["shoulder_right"] = (0.20, 0.40, 2.0, 1)
+        ext = kb.arm_extension(j, "right")
+        self.assertIsNone(ext["lift_m"])
+
+    def test_secondary_cues_are_unaffected(self):
+        ext = kb.arm_extension(self._joints(hand_state=1), "right")
+        self.assertIsNotNone(ext["forward_reach_m"])
+        self.assertIsNotNone(ext["straightness"])
+
+    def test_never_raises_on_garbage(self):
+        self.assertIsNone(kb.arm_extension({}, "right")["lift_m"])
+        self.assertIsNone(kb.arm_extension({"hand_right": None,
+                                            "wrist_right": None},
+                                           "right")["lift_m"])
+
+
+class DepthCorroborationTests(unittest.TestCase):
+    """The depth-space layer for the open mirror/TV defect. depth_corroborate
+    is PURE (injected raster + mapper) so the heuristic is testable with no
+    sensor. It SCORES; it does not gate - nothing drops a body on its verdict."""
+
+    W, H = kb.DEPTH_W, kb.DEPTH_H
+
+    def _raster(self, fill_mm):
+        return [[fill_mm] * self.W for _ in range(self.H)]
+
+    def _body(self, z=2.0, n=12):
+        """A body whose n reliable joints project to a small cluster of pixels."""
+        joints = {}
+        for i in range(n):
+            joints["j%d" % i] = (0.01 * i, 0.01 * i, z, 2)
+        return {"id": 1, "joints": joints, "distance_m": z}
+
+    def _mapper(self):
+        """Camera x/y -> a deterministic pixel cluster near the frame centre.
+        _body()'s joints land in cols 256-267, rows 212-223."""
+        def m(x, y, z):
+            return (256.0 + x * 100.0, 212.0 + y * 100.0)
+        return m
+
+    def _paint_body(self, raster, mm):
+        """Paint a silhouette that covers the joint cluster but stays INSIDE the
+        sampling ring, so the ring reads the surrounding geometry (which is the
+        whole point of the surround test) rather than the body itself."""
+        for y in range(210, 227):
+            for x in range(254, 271):
+                raster[y][x] = mm
+
+    # --- the pixel reader ------------------------------------------------
+    def test_depth_mm_at_bounds_and_zero_sentinel(self):
+        r = self._raster(1500)
+        self.assertEqual(kb._depth_mm_at(r, 10, 10), 1500)
+        self.assertIsNone(kb._depth_mm_at(r, -1, 10))
+        self.assertIsNone(kb._depth_mm_at(r, self.W, 10))
+        self.assertIsNone(kb._depth_mm_at(r, 10, self.H))
+        r[10][10] = 0                       # the sensor's "no return" sentinel
+        self.assertIsNone(kb._depth_mm_at(r, 10, 10))
+        self.assertIsNone(kb._depth_mm_at(None, 10, 10))
+
+    # --- verdicts ---------------------------------------------------------
+    def test_real_person_occluding_the_background(self):
+        # Body at 2.0 m; the whole scene behind reads 3.5 m -> the ring is
+        # FARTHER, which is what a real occluder looks like.
+        r = self._raster(3500)
+        self._paint_body(r, 2000)
+        rep = kb.depth_corroborate(self._body(), r, self._mapper())
+        self.assertEqual(rep["verdict"], "real")
+        self.assertGreaterEqual(rep["agree_frac"], 0.9)
+        self.assertEqual(rep["surround_nearer"], 0)
+
+    def test_reflection_framed_by_nearer_geometry_is_suspect(self):
+        # The mirror/TV case: the body reads 2.0 m (the folded path length) but
+        # the aperture around it - the frame, bezel, wall - is real geometry at
+        # 1.0 m, so the ring reads NEARER.
+        r = self._raster(1000)
+        self._paint_body(r, 2000)
+        rep = kb.depth_corroborate(self._body(), r, self._mapper())
+        self.assertEqual(rep["verdict"], "suspect")
+        self.assertGreaterEqual(rep["surround_nearer_frac"],
+                                kb.DEPTH_SURROUND_SUSPECT_FRAC)
+        self.assertIn("NEARER", rep["reason"])
+
+    def test_uncorroborated_skeleton_with_no_mass_behind_it(self):
+        # Joints claim 2.0 m; the raster shows an empty room at 5.0 m.
+        rep = kb.depth_corroborate(self._body(), self._raster(5000),
+                                   self._mapper())
+        self.assertEqual(rep["verdict"], "uncorroborated")
+        self.assertLess(rep["agree_frac"], kb.DEPTH_AGREE_GHOST_FRAC)
+
+    def test_unknown_when_the_depth_is_all_no_return(self):
+        rep = kb.depth_corroborate(self._body(), self._raster(0),
+                                   self._mapper())
+        self.assertEqual(rep["verdict"], "unknown")
+        self.assertEqual(rep["joint_samples"], 0)
+
+    def test_unknown_with_too_few_reliable_joints(self):
+        body = self._body(n=3)
+        rep = kb.depth_corroborate(body, self._raster(2000), self._mapper())
+        self.assertEqual(rep["verdict"], "unknown")
+
+    def test_inferred_joints_are_not_sampled(self):
+        body = self._body()
+        for k in list(body["joints"]):
+            x, y, z, _st = body["joints"][k]
+            body["joints"][k] = (x, y, z, 1)      # all inferred
+        rep = kb.depth_corroborate(body, self._raster(2000), self._mapper())
+        self.assertEqual(rep["verdict"], "unknown")
+        self.assertIn("no reliable joint", rep["reason"])
+
+    def test_out_of_frustum_mapper_returns_are_skipped(self):
+        rep = kb.depth_corroborate(self._body(), self._raster(2000),
+                                   lambda x, y, z: None)
+        self.assertEqual(rep["verdict"], "unknown")
+
+    def test_never_raises_on_garbage(self):
+        for bad in ({}, None, {"joints": None}):
+            rep = kb.depth_corroborate(bad, self._raster(2000), self._mapper())
+            self.assertEqual(rep["verdict"], "unknown")
+        rep = kb.depth_corroborate(self._body(), self._raster(2000), "not callable")
+        self.assertEqual(rep["verdict"], "unknown")
+
+    def test_verdict_never_drops_a_body_from_the_parse_point(self):
+        # The whole point of "scores, does not gate": _parse_body_frame must not
+        # consult depth at all, so a suspect body still reaches every consumer.
+        body = _FakeBody(True)
+        self.assertEqual(len(kb._parse_body_frame(_FakeBodyFrame([body]))), 1)
+
+
+class DepthCheckBodiesTests(_BridgeBase):
+    """The sensor-touching wrapper degrades to [] on every missing piece."""
+
+    def test_empty_without_a_sensor(self):
+        kb._ENABLED = False
+        self.assertEqual(kb.depth_check_bodies(), [])
+
+    def test_empty_when_no_bodies(self):
+        self.assertEqual(kb.depth_check_bodies(bodies=[]), [])
+
+    def test_empty_when_no_depth_frame(self):
+        with mock.patch.object(kb, "get_depth", lambda *a, **k: None):
+            self.assertEqual(kb.depth_check_bodies(bodies=[{"id": 1}]), [])
+
+    def test_empty_when_no_mapper(self):
+        with mock.patch.object(kb, "get_depth", lambda *a, **k: [[1]]), \
+                mock.patch.object(kb, "get_depth_space_mapper", lambda: None):
+            self.assertEqual(kb.depth_check_bodies(bodies=[{"id": 1}]), [])
+
+    def test_annotates_each_body_with_its_id(self):
+        with mock.patch.object(kb, "get_depth", lambda *a, **k: [[0]]), \
+                mock.patch.object(kb, "get_depth_space_mapper",
+                                  lambda: (lambda x, y, z: None)):
+            out = kb.depth_check_bodies(bodies=[{"id": 7, "joints": {}}])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["id"], 7)
+        self.assertIn("verdict", out[0])
+
+
+class DepthSpaceMapperTests(_BridgeBase):
+    """get_depth_space_mapper mirrors the color mapper and filters the SDK's
+    out-of-frustum -inf / NaN returns so callers never index on garbage."""
+
+    def _with_mapper(self, ret):
+        class _M:
+            def MapCameraPointToDepthSpace(self, _pt):
+                return ret
+        rt = _FakeRuntime()
+        rt._mapper = _M()
+        _patch_loader(self, rt)
+        pk2 = _fake_pk2_module()
+        pk2.CameraSpacePoint = type("CSP", (), {"x": 0.0, "y": 0.0, "z": 0.0})
+        rt_mod = types.ModuleType("pykinect2.PyKinectRuntime")
+        rt_mod.PyKinectRuntime = lambda flags: rt
+        p = mock.patch.object(kb, "import_pykinect2", lambda: (pk2, rt_mod))
+        p.start()
+        self.addCleanup(p.stop)
+        return kb.get_depth_space_mapper()
+
+    def test_maps_a_point(self):
+        m = self._with_mapper(types.SimpleNamespace(x=12.5, y=34.5))
+        self.assertEqual(m(0.0, 0.0, 2.0), (12.5, 34.5))
+
+    def test_filters_out_of_frustum_infinity(self):
+        m = self._with_mapper(types.SimpleNamespace(x=float("-inf"), y=0.0))
+        self.assertIsNone(m(0.0, 0.0, 2.0))
+
+    def test_filters_nan(self):
+        m = self._with_mapper(types.SimpleNamespace(x=float("nan"), y=0.0))
+        self.assertIsNone(m(0.0, 0.0, 2.0))
+
+    def test_none_without_a_coordinate_mapper(self):
+        rt = _FakeRuntime()
+        _patch_loader(self, rt)
+        self.assertIsNone(kb.get_depth_space_mapper())
+
+    def test_none_when_the_sensor_is_off(self):
+        kb._ENABLED = False
+        self.assertIsNone(kb.get_depth_space_mapper())
+
+
 if __name__ == "__main__":
     unittest.main()

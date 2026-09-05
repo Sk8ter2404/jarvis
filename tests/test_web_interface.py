@@ -38,11 +38,13 @@ stdlib unittest + urllib only; no pytest, no third-party HTTP client.
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
 import socket
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -113,6 +115,71 @@ def _post(url, obj, headers=None):
         return e.code, json.loads(e.read().decode("utf-8"))
 
 
+def _bounded(call, timeout, what):
+    """Run ``call`` on a throwaway daemon thread and give up after ``timeout``.
+
+    Returns True if it finished. Never raises: the whole point is to survive a
+    call that cannot be interrupted."""
+    box = {"done": False}
+
+    def _run():
+        try:
+            call()
+        except Exception:
+            pass
+        box["done"] = True
+
+    t = threading.Thread(target=_run, daemon=True, name=f"test-{what}")
+    t.start()
+    t.join(timeout)
+    if not box["done"]:
+        print(f"  [test-web-interface] {what}() wedged after {timeout}s "
+              f"— abandoning it so the suite keeps moving")
+    return box["done"]
+
+
+def _stop_server(httpd, thread=None, *, shutdown_timeout=5.0,
+                 close_timeout=5.0, join_timeout=3.0):
+    """Tear a REAL served ThreadingHTTPServer down with NO unbounded wait.
+
+    THE POINT. Both stdlib calls a fixture reaches for here block forever in a
+    reachable state, and one of them has already frozen a JARVIS ci_sim run:
+
+      * ``BaseServer.shutdown()`` sets a flag and then waits on an Event that
+        ONLY ``serve_forever()`` sets as it exits. A serve thread that never
+        started (spawn race) or that already died leaves that Event unset and
+        the wait is FOREVER. Live 2026-07-12: py-spy caught exactly that —
+        tearDown -> shutdown -> Event.wait — mid-suite, with no test id and no
+        traceback, because a hang produces no unittest output at all.
+      * ``ThreadingMixIn.server_close()`` joins EVERY handler thread with no
+        timeout. ``ThreadingHTTPServer`` sets ``daemon_threads = True`` but
+        leaves ``block_on_close`` True, so handler threads are still tracked
+        and still joined (verified on this box, CPython 3.14.4). And
+        tools/web_interface.py deliberately parks a worker for the entire life
+        of an ``/api/camera-stream`` MJPEG connection, and for up to
+        ``_REPLY_TIMEOUT_MAX`` (120s) on a reply-wait — so this join can
+        outlive by minutes the test that opened the connection.
+
+    ``skills/web_interface.py::_stop()`` time-boxes the FIRST of those. That fix
+    landed only there: this module — which starts a real server for every one of
+    its ~200 tests and is the largest single module in the suite — kept calling
+    the raw pair inside a ``try/except Exception`` that catches nothing, because
+    a block is not an exception. That is the stale-duplicate shape the house
+    rule warns about, so the time-box now lives in ONE helper that every fixture
+    in this file goes through, and
+    ``NoUnboundedServerTeardownTests`` fails if a new fixture skips it."""
+    if httpd is not None:
+        _bounded(httpd.shutdown, shutdown_timeout, "shutdown")
+        # server_close() runs even when shutdown() wedged — it is what frees the
+        # listening socket, and an abandoned ephemeral port costs nothing.
+        _bounded(httpd.server_close, close_timeout, "server_close")
+    if thread is not None:
+        try:
+            thread.join(timeout=join_timeout)
+        except Exception:
+            pass
+
+
 class _ServerBase(unittest.TestCase):
     """Spin up a real server on 127.0.0.1:0 in a temp dir; tear it down cleanly."""
 
@@ -151,15 +218,9 @@ class _ServerBase(unittest.TestCase):
         _wait_server_ready(self.host, self.port)   # no request before accept() is live
 
     def tearDown(self):
-        try:
-            self.httpd.shutdown()
-            self.httpd.server_close()
-        except Exception:
-            pass
-        try:
-            self.thread.join(timeout=3)
-        except Exception:
-            pass
+        # Time-boxed: see _stop_server. The raw pair that used to be here is a
+        # pair of UNBOUNDED waits, and one of them froze a whole ci_sim run.
+        _stop_server(self.httpd, self.thread)
         self.tmp.cleanup()
 
 
@@ -788,9 +849,7 @@ class SecurityBindTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 wi.create_server(bind="127.0.0.1", port=port, token="")
         finally:
-            first.shutdown()
-            first.server_close()
-            thread.join(timeout=2)
+            _stop_server(first, thread, join_timeout=2)
 
     def test_free_port_probe_is_false(self):
         # A concrete port with no listener probes False → bind proceeds. Uses a
@@ -1029,15 +1088,7 @@ class DashboardTokenSerializationTests(unittest.TestCase):
         )
         thread = wi.serve_in_thread(httpd)
 
-        def _stop():
-            try:
-                httpd.shutdown()
-                httpd.server_close()
-            except Exception:
-                pass
-            thread.join(timeout=3)
-
-        self.addCleanup(_stop)
+        self.addCleanup(_stop_server, httpd, thread)
         host, port = httpd.server_address[:2]
         _wait_server_ready(host, port)
         return f"http://127.0.0.1:{port}"
@@ -1517,6 +1568,131 @@ class WebInterfaceBugfix20260708Tests(unittest.TestCase):
         finally:
             wi._nvidia_smi_gpus_uncached = orig_uncached
             wi._nvidia_smi_cache.update(orig_cache)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  THE HANG GUARD — this module must never be able to freeze the suite again
+#
+#  2026-07-12: a wedged socketserver.shutdown() in a tearDown froze an entire
+#  ci_sim run mid-suite. The time-box that fixed it went into
+#  skills/web_interface.py::_stop() and into tests/skills/test_web_interface.py
+#  — but NOT here, in the module that actually starts a real ThreadingHTTPServer
+#  for every one of its tests. A fix that lands in one copy while the others rot
+#  is the house's #1 bug class, so the two tests below make the omission
+#  impossible to repeat: the time-box is the ONLY way out of this file.
+# ════════════════════════════════════════════════════════════════════════════
+class NoUnboundedServerTeardownTests(unittest.TestCase):
+    @staticmethod
+    def _source() -> str:
+        with open(__file__, "r", encoding="utf-8") as fh:
+            return fh.read()
+
+    # This class quotes the very patterns it bans, and _stop_server is the one
+    # place the raw calls are supposed to live, so both are exempt from the scan.
+    _EXEMPT = ("_stop_server", "NoUnboundedServerTeardownTests")
+
+    def _units(self, *, top_level: bool):
+        """(name, source) pairs to scan, with the exempt units removed.
+
+        Two granularities, because the two rules genuinely need different ones:
+
+          * TOP LEVEL (class or module function) for the "must use the
+            time-box" pairing — _ServerBase starts the serve thread in setUp
+            and stops it in tearDown, so a per-function rule could never see
+            the pair.
+          * PER FUNCTION for the raw-pair ban — SecurityBindTests holds one
+            method that serves a real server and two that only bind and
+            immediately close one. An unserved server has no handler threads
+            and no serve_forever Event, so ITS server_close() is genuinely
+            instant and must not be flagged."""
+        src = self._source()
+        tree = ast.parse(src)
+        skip = []
+        for node in tree.body:
+            if (isinstance(node, (ast.ClassDef, ast.FunctionDef))
+                    and node.name in self._EXEMPT):
+                skip.append((node.lineno, node.end_lineno or node.lineno))
+        nodes = tree.body if top_level else list(ast.walk(tree))
+        out = []
+        for node in nodes:
+            want = (ast.ClassDef, ast.FunctionDef) if top_level else ast.FunctionDef
+            if not isinstance(node, want):
+                continue
+            if any(lo <= node.lineno <= hi for lo, hi in skip):
+                continue
+            out.append((node.name, ast.get_source_segment(src, node) or ""))
+        return out
+
+    def _served(self, *, top_level: bool):
+        return [(n, s) for n, s in self._units(top_level=top_level)
+                if "serve_in_thread(" in s]
+
+    def test_the_scan_still_sees_the_real_fixtures(self):
+        """A source scan that matches nothing passes for the wrong reason."""
+        names = [n for n, _ in self._served(top_level=True)]
+        self.assertIn("_ServerBase", names)
+        self.assertGreaterEqual(len(names), 2, names)
+
+    def test_every_served_fixture_tears_down_through_the_timebox(self):
+        offenders = [name for name, seg in self._served(top_level=True)
+                     if "_stop_server" not in seg]
+        self.assertEqual(
+            offenders, [],
+            "these units start a REAL serve thread but do not stop it through "
+            "_stop_server(): %s. BaseServer.shutdown() and "
+            "ThreadingMixIn.server_close() are both UNBOUNDED waits — a serve "
+            "thread that never started, or a handler parked in the MJPEG "
+            "camera stream, makes them block forever and the whole suite hangs "
+            "with no test id and no traceback." % offenders)
+
+    def test_no_served_function_calls_the_raw_pair(self):
+        offenders = [name for name, seg in self._served(top_level=False)
+                     if ".shutdown()" in seg or ".server_close()" in seg]
+        self.assertEqual(
+            offenders, [],
+            "these functions start a serve thread and then call the raw "
+            "unbounded teardown pair directly instead of going through "
+            "_stop_server(): %s" % offenders)
+
+    # ── the helper actually survives both wedges ─────────────────────────────
+    def test_stop_server_survives_a_wedged_shutdown(self):
+        never = threading.Event()
+        self.addCleanup(never.set)
+        closed = threading.Event()
+        httpd = type("_Wedged", (), {})()
+        httpd.shutdown = never.wait                  # blocks forever
+        httpd.server_close = closed.set
+        t0 = time.monotonic()
+        _stop_server(httpd, None, shutdown_timeout=0.2, close_timeout=1.0)
+        self.assertLess(time.monotonic() - t0, 5.0)
+        self.assertTrue(closed.is_set(),
+                        "server_close must still run — it is what frees the "
+                        "listening socket")
+
+    def test_stop_server_survives_a_wedged_server_close(self):
+        # The half the 2026-07-12 fix never covered: ThreadingMixIn.
+        # server_close() joins every handler thread, and a handler parked in
+        # /api/camera-stream or on a 120s reply-wait makes that join outlive
+        # the test.
+        never = threading.Event()
+        self.addCleanup(never.set)
+        httpd = type("_Wedged", (), {})()
+        httpd.shutdown = lambda: None
+        httpd.server_close = never.wait              # blocks forever
+        t0 = time.monotonic()
+        _stop_server(httpd, None, shutdown_timeout=1.0, close_timeout=0.2)
+        self.assertLess(time.monotonic() - t0, 5.0)
+
+    def test_stop_server_is_a_no_op_cost_on_the_healthy_path(self):
+        calls = []
+        httpd = type("_Clean", (), {})()
+        httpd.shutdown = lambda: calls.append("shutdown")
+        httpd.server_close = lambda: calls.append("close")
+        t0 = time.monotonic()
+        _stop_server(httpd, None)
+        self.assertEqual(calls, ["shutdown", "close"])
+        self.assertLess(time.monotonic() - t0, 1.0,
+                        "the time-box must cost nothing when nothing wedges")
 
 
 if __name__ == "__main__":

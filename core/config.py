@@ -771,6 +771,43 @@ AIR_MOUSE_ARM_RELAXES_GATE = True
 #   before engaging, so a 1-frame height spike still can't grab it while a quick
 #   deliberate raise engages almost instantly. ~0.15 s.
 AIR_MOUSE_ARM_ENGAGE_DEBOUNCE_SEC = 0.15
+# AIR_MOUSE_ARM_TIMEOUT_SEC — how long the ARMED (relaxed) window lasts, refreshed
+#   for as long as the owner is actually driving the cursor. ARMED used to LATCH
+#   for the whole session: after one "take the cursor" every later raised hand
+#   could re-grab it on height alone, with no open-palm / facing / stillness /
+#   reach test. It now lapses back to the strict PASSIVE gate once he stops using
+#   it. ~120 s. 0 restores the old latch-forever behaviour.
+AIR_MOUSE_ARM_TIMEOUT_SEC = 120.0
+# ─── PASSIVE ACQUIRE REACH CONJUNCT (2026-09-04) ──────────────────────────────
+# The PASSIVE gate's other tests (open palm, facing, still) are all satisfied MORE
+# easily by someone sitting motionless than by someone reaching, so a raised hand
+# above the shoulder line was effectively the ONLY requirement — and any relaxed
+# posture that parks a hand high (hand on the head, arm on an armrest or the back
+# of the couch, a stretch) took the cursor. These two bars add the one thing a
+# resting arm does NOT do: REACH. Fresh PASSIVE acquisition only — never a
+# stay-engaged veto (no stutter), never in ARMED mode.
+# AIR_MOUSE_ENGAGE_REACH_RATIO — forward reach ÷ body scale (shoulder span). Used
+#   whenever a body scale is measurable, because an absolute metre bar is NOT
+#   position-independent (the same gesture measures less forward reach the farther
+#   away the owner sits). RAISE if a resting posture still takes the cursor; LOWER
+#   if a genuine reach fails to; 0 disables the forward half.
+AIR_MOUSE_ENGAGE_REACH_RATIO = 0.50
+# AIR_MOUSE_ENGAGE_REACH_M — absolute forward-reach fallback in metres, used only
+#   when no shoulder span / torso height is measurable this frame.
+AIR_MOUSE_ENGAGE_REACH_M = 0.20
+# AIR_MOUSE_ENGAGE_STRAIGHT — arm straightness (shoulder→hand chord ÷ arm length,
+#   0..1) required to engage. A pure ratio of the owner's own arm, so it is immune
+#   to distance AND to torso lean — unlike forward reach, whose spine reference
+#   shifts when he sits back. A reach extends the elbow; a resting arm is folded.
+#   0 disables the elbow half.
+AIR_MOUSE_ENGAGE_STRAIGHT = 0.85
+# AIR_MOUSE_GRIP_CLOSE_FRAMES — consecutive frames a CLOSED hand must be seen
+#   before it presses a button. Deliberately STRICTER than the open/release
+#   debounce: a spurious release only drops a drag, a spurious press is a click the
+#   owner never made (one closed his browser tabs). ~4 frames ≈ 133 ms at 30 Hz —
+#   past the correlated 2-3-frame misreads the Kinect hand classifier produces at
+#   range, which a 2-frame bar did not cover. NB "lasso" also votes CLOSED.
+AIR_MOUSE_GRIP_CLOSE_FRAMES = 4
 # AIR_MOUSE_FIST_RELEASES — a SUSTAINED closed fist while engaged force-disengages
 #   (an extra, optional snappy release to "let go" without lowering the hand).
 #   DEFAULT OFF (2026-07-07 owner report): it FOUGHT the click/drag gesture — a
@@ -1230,6 +1267,63 @@ STANDBY_WHISPER_PREFER_GPU        = False
 # would defeat the env contract AND persist a secret into a settings file. These
 # keys are therefore never sourced from user_settings.json. 2026-07-15.
 _ENV_ONLY_KEYS = frozenset({"BAMBU_PRINTER_IP", "BAMBU_ACCESS_CODE", "BAMBU_SERIAL"})
+
+
+# ─── Game low-power mode (skills/game_mode.py) ─────────────────────────────
+# JARVIS gets out of the way while a game runs: the local brain is repointed at
+# a SMALLER tag (in process only — nothing here is persisted, so any restart
+# undoes the whole mode with zero cleanup code), the big model is unloaded, and
+# the camera/gesture/diagnostic luxuries pause. It never gates the LLM: there is
+# no cloud on this box (AI_BACKEND=ollama, MODEL_ROUTING all-local), so
+# suppressing local chat would MUTE JARVIS, not reroute him.
+#
+# These constants MUST be declared here even though the skill owns the logic:
+# _apply_user_settings() below skips any key that is `not in globals()`, so an
+# undeclared setting is silently dropped and the owner's saved value never
+# reaches the runtime. That is this project's defining bug class.
+#
+# OFF by default — the mode is enabled live, deliberately, not by shipping it on.
+GAME_MODE_ENABLED = False
+# EXACT executable basenames, lower-case. NOT substrings: measured live
+# 2026-09-04 there are four Fortnite processes at once (FortniteBootstrapper,
+# FortniteLauncher, FortniteClient-Win64-Shipping_EAC_EOS, and the real
+# FortniteClient-Win64-Shipping), and a substring test matches the EAC wrapper
+# too. Ships with exactly one entry because one is all that has been measured;
+# "JARVIS, treat this as a game" adds more.
+GAME_MODE_PROCESS_HINTS = ["fortniteclient-win64-shipping.exe"]
+# The brain to run while gaming. gemma4:12b — 7.6 GB on disk, ~9 GB calibrated
+# @16k, MULTIMODAL so see_screen keeps working. Do NOT "escalate" to
+# gemma4:latest: core/vram_budget.py calls it 4 GB, but live `ollama list` on
+# 2026-09-04 measures the installed blob at 9.6 GB — BIGGER than gemma4:12b.
+# game_mode._pick_game_brain() re-checks this against live /api/tags and refuses
+# any candidate that is not measurably smaller than the tag it replaces.
+GAME_MODE_BRAIN = "gemma4:12b"
+GAME_MODE_POLL_SECONDS = 5.0
+# The game must hold the FOREGROUND continuously for this long before the mode
+# engages — entry fails closed, so a game merely launching behind his work never
+# trips it. Exit is owned by PROCESS LIFETIME, so alt-tab never exits.
+GAME_MODE_ENTER_DWELL_SECONDS = 20.0
+GAME_MODE_REQUIRE_FOREGROUND = True
+# The game pid must be gone this long before restoring — a crash-and-relaunch
+# must not thrash two big model loads back to back.
+GAME_MODE_EXIT_GRACE_SECONDS = 45.0
+# Deadman ceiling (L3). Past this with the game gone, the watcher force-exits
+# regardless of internal state; past 2x it exits unconditionally.
+GAME_MODE_MAX_SECONDS = 43200.0          # 12 h
+# How long to wait after the unload before taking the 'after' sample.
+GAME_MODE_VERIFY_DELAY_SECONDS = 8.0
+# Below this MEASURED VRAM delta the mode reports FAILURE and shows a failure
+# state. A mode that claims memory it did not free is the defect this whole
+# feature is written against.
+GAME_MODE_MIN_VRAM_DELTA_MB = 3000
+# Re-ping the small model this often so it does not evict on Ollama's clock.
+# `keep_alive: "20m"` is HARDCODED in the chat payload (bobert_companion.py:
+# 11148), so a long keep_alive cannot be pinned from outside — but the refresh
+# only ever fires when the model is ALREADY RESIDENT, so it can never itself
+# cause a load. 0 disables it.
+GAME_MODE_KEEP_WARM_SECONDS = 600.0
+# Say nothing on entry by default — he is mid-match.
+GAME_MODE_ANNOUNCE = False
 
 
 # Safe + best-effort (the second import-time I/O in this file, after

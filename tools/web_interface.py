@@ -72,6 +72,8 @@ import glob
 import json
 import os
 import re
+import select
+import socket
 import sys
 import tempfile
 import threading
@@ -106,6 +108,68 @@ DEFAULT_ACTION_INDEX_PATH = os.path.join(PROJECT_DIR, "docs", "ACTION_INDEX.md")
 # A preview frame older than this is treated as "camera off" (stale) and served
 # as a 404 so the panel shows its placeholder rather than a frozen last frame.
 _CAMERA_PREVIEW_STALE_S = 5.0
+
+# The per-camera tiles the dashboard can ask for (?cam=). One tuple, used by BOTH
+# the still route and the stream route (see _preview_path_for) so the two can
+# never drift into disagreeing about which names are valid.
+_CAMERA_PREVIEW_CAMS = ("left", "right", "kinect")
+
+# ── /api/camera-stream (MJPEG) ───────────────────────────────────────────────
+# WHY THIS EXISTS (measured live 2026-09-04, owner: "the preview of webcams is
+# very slow still"): serving ONE still per request costs only ~1.6 ms end to end,
+# so the request was never the problem — the dashboard's setInterval(…, 1000) WAS
+# the frame rate. A still-per-frame design also cannot do better than the poll
+# interval, and shrinking that interval multiplies connection churn (this server
+# speaks HTTP/1.0, so every still is its own TCP connection).
+# multipart/x-mixed-replace fixes both: ONE connection per tile, and the server
+# pushes the next JPEG the instant the preview file changes, so latency is
+# (producer write -> _CAMERA_STREAM_POLL_S) instead of (producer write -> up to a
+# full poll interval). The still route is untouched — the HUD, old bookmarks and
+# the tests still use it, and it is the client's fallback.
+_CAMERA_STREAM_BOUNDARY = "jarvisframe"
+_CAMERA_STREAM_POLL_S = 0.02      # how often a streaming thread re-stats the file
+# Each stream holds a ThreadingHTTPServer worker thread for as long as the tab is
+# open, so cap them: 3 tiles x a couple of dashboards, and no more. Beyond this a
+# stream request is refused (503) and the client falls back to still polling — a
+# refused stream must never be able to starve /api/status or /api/log of threads.
+_CAMERA_STREAM_MAX_CLIENTS = 8
+_camera_stream_clients = [0]
+_camera_stream_clients_lock = threading.Lock()
+
+
+class UnknownCamError(ValueError):
+    """?cam= named something that is not one of _CAMERA_PREVIEW_CAMS."""
+
+
+def _preview_path_for(cfg: dict, cam: str) -> str:
+    """Resolve the preview JPEG path for ``cam`` ("" = the primary/composite file
+    the HUD reads, otherwise one of _CAMERA_PREVIEW_CAMS). Raises UnknownCamError
+    for any other name. Returns "" when no preview path is configured at all.
+
+    ONE source of truth for /api/camera-preview AND /api/camera-stream: the two
+    routes used to be free to disagree about where a tile lives, which is exactly
+    how a stale duplicate starts."""
+    p = cfg.get("camera_preview_path", "")
+    cam = (cam or "").strip().lower()
+    if not cam:
+        return p
+    if cam not in _CAMERA_PREVIEW_CAMS:
+        raise UnknownCamError(cam)
+    base = os.path.dirname(p) if p else os.path.join(PROJECT_DIR, "data")
+    return os.path.join(base, f".hud_camera_preview_{cam}.jpg")
+
+
+def _preview_stat(path: str):
+    """(mtime_ns, size, age_seconds) for a preview file, or None when it is
+    missing/unreadable. Cheap: a stat, never an open. Never raises."""
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_mtime_ns, st.st_size, time.time() - st.st_mtime
+
 
 # Reply-wait bounds. The main loop can take a while on a cloud LLM turn, so we
 # allow a generous ceiling but poll cheaply. A caller (the POST handler) passes a
@@ -1419,6 +1483,92 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
+    def _stream_camera(self, path: str) -> None:
+        """Stream ``path`` as multipart/x-mixed-replace (MJPEG) until the camera
+        goes away or the client disconnects. ONE connection, one frame pushed per
+        producer write. Never raises out of the handler.
+
+        Contract, deliberately identical to /api/camera-preview so the tile's
+        on/off behaviour is unchanged:
+          * missing or already-stale file  -> 404 before any body, so the <img>
+            fires `error` and the tile shows its 'off' placeholder immediately;
+          * the frame going stale mid-stream (camera switched off) -> CLOSE the
+            stream, which fires the same `error` on the client;
+          * we only OPEN the file when its (mtime_ns, size) actually changed, so
+            we read exactly as often as JARVIS writes, never at the poll rate.
+            That matters on Windows: the producer publishes via os.replace, and a
+            replace FAILS while any process holds the file open (measured
+            2026-09-04: 200/200 replaces failed against a held handle), so every
+            needless open is a chance to silently drop a frame.
+        """
+        info = _preview_stat(path)
+        if info is None or info[2] > _CAMERA_PREVIEW_STALE_S:
+            return self._send_json({"error": "no preview"}, code=404)
+        with _camera_stream_clients_lock:
+            if _camera_stream_clients[0] >= _CAMERA_STREAM_MAX_CLIENTS:
+                # Refuse rather than hold yet another worker thread hostage; the
+                # dashboard falls back to polling stills.
+                return self._send_json({"error": "too many camera streams"},
+                                       code=503)
+            _camera_stream_clients[0] += 1
+        try:
+            self.send_response(200)
+            self.send_header(
+                "Content-Type",
+                f"multipart/x-mixed-replace; boundary={_CAMERA_STREAM_BOUNDARY}")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            last = None
+            while True:
+                # LIVENESS: a client that closed shows up as a readable
+                # socket yielding EOF. Without this, a stream whose frames
+                # are momentarily frozen holds its worker thread AND one of
+                # the _CAMERA_STREAM_MAX_CLIENTS slots until the frame goes
+                # stale - long enough for a few tab reloads to lock every
+                # slot out. MSG_PEEK so we never consume anything.
+                try:
+                    if select.select([self.connection], [], [], 0)[0]:
+                        if not self.connection.recv(1, socket.MSG_PEEK):
+                            return
+                except Exception:
+                    return
+                info = _preview_stat(path)
+                if info is None or info[2] > _CAMERA_PREVIEW_STALE_S:
+                    return              # camera off -> close -> client shows 'off'
+                key = (info[0], info[1])
+                if key == last:
+                    time.sleep(_CAMERA_STREAM_POLL_S)
+                    continue
+                try:
+                    with open(path, "rb") as f:
+                        data = f.read()
+                except OSError:
+                    # Lost the race with the producer's os.replace — try again on
+                    # the next tick rather than tearing the stream down.
+                    time.sleep(_CAMERA_STREAM_POLL_S)
+                    continue
+                if not data:
+                    time.sleep(_CAMERA_STREAM_POLL_S)
+                    continue
+                last = key
+                head = (f"--{_CAMERA_STREAM_BOUNDARY}\r\n"
+                        f"Content-Type: image/jpeg\r\n"
+                        f"Content-Length: {len(data)}\r\n\r\n").encode("ascii")
+                # ONE write per frame (headers + body + trailing CRLF in a
+                # single send) rather than three: fewer syscalls and no
+                # tiny 2-byte tail segment for Nagle to sit on. Measured
+                # 2026-09-04 this made no difference on loopback — it is
+                # kept because it cannot be worse, not because it was the
+                # win. The win is the stream itself (1.0 -> 15.2 fps).
+                self.wfile.write(head + data + b"\r\n")
+                self.wfile.flush()
+        except Exception:
+            return                      # client went away / broken pipe
+        finally:
+            with _camera_stream_clients_lock:
+                _camera_stream_clients[0] -= 1
+
     def _unauthorized(self) -> None:
         self._send_json({"error": "unauthorized"}, code=401)
 
@@ -1524,26 +1674,30 @@ class _Handler(BaseHTTPRequestHandler):
             # the historical primary/composite preview, so the HUD and old
             # bookmarks are unaffected.
             try:
-                p = cfg.get("camera_preview_path", "")
-                cam = (query.get("cam", [""])[0] or "").strip().lower()
-                if cam:
-                    if cam not in ("left", "right", "kinect"):
-                        return self._send_json({"error": "unknown cam"}, code=404)
-                    base = os.path.dirname(p) if p else os.path.join(PROJECT_DIR, "data")
-                    p = os.path.join(base, f".hud_camera_preview_{cam}.jpg")
-                if not p or not os.path.exists(p):
-                    return self._send_json({"error": "no preview"}, code=404)
-                try:
-                    age = time.time() - os.path.getmtime(p)
-                except Exception:
-                    age = 1e9
-                if age > _CAMERA_PREVIEW_STALE_S:
+                p = _preview_path_for(cfg, query.get("cam", [""])[0] or "")
+            except UnknownCamError:
+                return self._send_json({"error": "unknown cam"}, code=404)
+            try:
+                info = _preview_stat(p)
+                if info is None or info[2] > _CAMERA_PREVIEW_STALE_S:
                     return self._send_json({"error": "no preview"}, code=404)
                 with open(p, "rb") as f:
                     data = f.read()
                 return self._send_bytes(data, "image/jpeg")
             except Exception:
                 return self._send_json({"error": "no preview"}, code=404)
+
+        if path == "/api/camera-stream":
+            if not self._authorized(query, is_page=False):
+                return self._unauthorized()
+            # LIVE MJPEG for the Camera tab. Same file, same staleness rule and
+            # same ?cam= vocabulary as /api/camera-preview above (both go through
+            # _preview_path_for) — the difference is that this one KEEPS PUSHING.
+            try:
+                p = _preview_path_for(cfg, query.get("cam", [""])[0] or "")
+            except UnknownCamError:
+                return self._send_json({"error": "unknown cam"}, code=404)
+            return self._stream_camera(p)
 
         return self._send_json({"error": "not found"}, code=404)
 
@@ -1940,18 +2094,20 @@ def _dashboard_html(token: str) -> str:
     <div id="voiceBtns" class="voicebtns"></div>
   </section>
 
-  <!-- ── CAMERA VIEW (live preview frame, refreshed ~1s while visible) ──────
-       The img points at /api/camera-preview; on error (missing/stale = camera
-       off) the placeholder is shown instead. -->
+  <!-- ── CAMERA VIEW (live MJPEG streams, one connection per tile) ───────
+       THREE tiles, one per real source: left webcam, right webcam, Kinect.
+       There is deliberately NO unified /api/camera-preview tile — it serves the
+       DEFAULT preview file, which is written from the PRIMARY camera, so it
+       duplicated whichever named tile was primary (2026-09-04, owner-reported:
+       "two of the cameras are the same"). Kinect INFRARED is not a fourth tile:
+       this pykinect2 build exposes has_new_infrared_frame but NOT
+       get_last_infrared_frame, so IR frames can be detected and never read. -->
   <section id="viewCamera" class="view" hidden>
-    <div class="count">Live camera preview (updates while the camera is on).</div>
-    <img id="camImg" alt="camera preview">
-    <div id="camOff">camera off / no preview</div>
     <!-- Per-camera tiles (2026-07-10): every camera streams individually —
          left/right webcams + Kinect (skeleton-annotated). Each tile shows a
          dim placeholder when that camera is off/stale, independent of the
          others, so one dead camera never blanks the row. -->
-    <div class="count" style="margin-top:14px;">Individual cameras</div>
+    <div class="count">Live cameras — left, right, and the Kinect (skeleton-annotated). Updates while each camera is on.</div>
     <div class="camgrid">
       <figure class="camtile">
         <img id="camLeft" data-cam="left" alt="left webcam">
@@ -2177,7 +2333,13 @@ let actionsLoaded = false, voiceLoaded = false, memoryLoaded = false;
 
 function stopViewTimers() {{
   if (systemTimer) {{ clearInterval(systemTimer); systemTimer = null; }}
-  if (cameraTimer) {{ clearInterval(cameraTimer); cameraTimer = null; }}
+  if (cameraTimer) {{
+    clearInterval(cameraTimer); cameraTimer = null;
+    // An MJPEG stream holds a server worker thread AND one of the browser's ~6
+    // connections-per-origin for as long as the <img> keeps its src. Leaving the
+    // Camera tab must hand both back.
+    stopCameraStreams();
+  }}
 }}
 
 function showView(which) {{
@@ -2198,8 +2360,10 @@ function showView(which) {{
   else if (which === 'voice')   {{ if (!voiceLoaded)   {{ loadVoices();  voiceLoaded  = true; }} }}
   else if (which === 'memory')  {{ if (!memoryLoaded)  {{ loadMemory();  memoryLoaded = true; }} }}
   else if (which === 'camera')  {{
+    // refreshCamera() is now a SUPERVISOR tick (re-arms dropped MJPEG streams, or
+    // polls stills in fallback mode) - it no longer sets the frame rate.
     refreshCamera();
-    cameraTimer = setInterval(() => {{ if (autoOn()) refreshCamera(); }}, 1000);
+    cameraTimer = setInterval(refreshCamera, CAM_TICK_MS);
   }}
 }}
 navLive.addEventListener('click', () => showView('live'));
@@ -2495,26 +2659,63 @@ async function loadVoices() {{
 }}
 
 // ── CAMERA TAB ──────────────────────────────────────────────────────────────
-// The <img> points at /api/camera-preview (cache-busted each poll). On load it
-// shows; on error (404 = missing/stale = camera off) the placeholder shows.
-const camImg = document.getElementById('camImg');
-const camOff = document.getElementById('camOff');
-camImg.addEventListener('load',  () => {{ camImg.style.display='block'; camOff.style.display='none'; }});
-camImg.addEventListener('error', () => {{ camImg.style.display='none';  camOff.style.display='block'; }});
-// Per-camera tiles: same load/error toggle per tile, each polling its own
-// ?cam= stream so one dead camera never blanks the others (2026-07-10).
+// Each tile is an MJPEG STREAM (/api/camera-stream?cam=...): ONE connection the
+// server pushes a new JPEG down the instant JARVIS writes one.
+//
+// It used to re-fetch a STILL every 1000 ms, which pinned the dashboard at 1 fps
+// no matter how fast frames were produced. Measured 2026-09-04 on the live rig: a
+// still request costs ~1.6 ms end to end, so the request was never the cost - the
+// poll interval WAS the frame rate.
+//
+// On load the tile shows; on error (404 = missing/stale, or the server closing a
+// stream because that camera went off) its own placeholder shows, so one dead
+// camera never blanks the others (2026-07-10 contract, unchanged).
+//
+// FALLBACK: if streaming never works in this browser (no tile ever loaded from a
+// stream and every tile has errored repeatedly) we drop back to polling the STILL
+// endpoint every CAM_TICK_MS - still 4x the old rate, identical behaviour.
+const CAM_TICK_MS = 250;          // supervisor tick == still-poll interval
+let   camMode = 'stream';         // 'stream' | 'poll'
+let   camEverStreamed = false;    // a stream has delivered at least one frame
 const camTiles = [
   ['camLeft', 'camLeftOff'], ['camRight', 'camRightOff'],
   ['camKinect', 'camKinectOff'],
 ].map(([imgId, offId]) => {{
   const img = document.getElementById(imgId);
   const off = document.getElementById(offId);
-  img.addEventListener('load',  () => {{ img.style.display='block'; off.style.display='none'; }});
-  img.addEventListener('error', () => {{ img.style.display='none';  off.style.display='block'; }});
+  img.dataset.errs = '0';
+  img.addEventListener('load',  () => {{
+    img.style.display='block'; off.style.display='none';
+    img.dataset.errs = '0';
+    if (camMode === 'stream' && img.dataset.streaming === '1') camEverStreamed = true;
+  }});
+  img.addEventListener('error', () => {{
+    img.style.display='none';  off.style.display='block';
+    img.dataset.streaming = '';                       // let the tick re-arm it
+    img.dataset.errs = String((+img.dataset.errs || 0) + 1);
+    // Streaming is broken in this browser only if it NEVER worked anywhere.
+    if (camMode === 'stream' && !camEverStreamed &&
+        camTiles.every(t => (+t.dataset.errs || 0) >= 3)) camMode = 'poll';
+  }});
   return img;
 }});
+function startCameraStreams() {{
+  for (const img of camTiles) {{
+    if (img.dataset.streaming === '1') continue;      // already connected
+    img.dataset.streaming = '1';
+    img.src = q('/api/camera-stream?cam=' + img.dataset.cam);
+  }}
+}}
+function stopCameraStreams() {{
+  for (const img of camTiles) {{
+    img.dataset.streaming = '';
+    img.removeAttribute('src');                       // aborts the connection
+  }}
+}}
 function refreshCamera() {{
-  camImg.src = q('/api/camera-preview?t=' + Date.now());
+  // One tick drives both modes: re-arm any dropped stream, or poll stills.
+  if (!autoOn()) {{ stopCameraStreams(); return; }}
+  if (camMode === 'stream') {{ startCameraStreams(); return; }}
   for (const img of camTiles)
     img.src = q('/api/camera-preview?cam=' + img.dataset.cam + '&t=' + Date.now());
 }}

@@ -312,6 +312,16 @@ def main() -> int:
     import tests  # chokepoint: it arms all three, in order, idempotently
     from tools import browser_guard
     browser_guard.install()
+    # THEN THE TIME CEILING — the sibling of the memory ceiling above. mem_guard
+    # bounds what a run may ALLOCATE; this bounds how long it may STALL, which
+    # is the failure the memory guard structurally cannot see (a hang is not an
+    # allocation). Armed HERE, before the gate subprocesses and before
+    # discovery, because a hang during the import sweep is the one that is
+    # completely invisible — no test has started, so there is nothing in the
+    # output to name. See tools/test_watchdog.py for the 2026-09-04 exit-124
+    # that motivated it and the JARVIS_TEST_TIMEOUT_S knob (0 = off).
+    from tools import test_watchdog
+    test_watchdog.arm()
     # Redirect settings I/O to a throwaway copy BEFORE discovery/import (and
     # before the gate subprocesses, which inherit this env), so no test or gate
     # can touch the real data/user_settings.json.
@@ -403,7 +413,13 @@ def main() -> int:
         sys.path.insert(0, root)
     suite = unittest.TestLoader().discover(
         os.path.join(root, "tests"), pattern="test_*.py", top_level_dir=root)
-    res = unittest.TextTestRunner(verbosity=1).run(suite)
+    res = unittest.TextTestRunner(
+        verbosity=1,
+        resultclass=test_watchdog.WatchdogTextTestResult).run(suite)
+    # The suite is over: stand the watchdog down so nothing can fire during the
+    # reap/summary below (and so a slow tail here is never misreported as a
+    # hung test).
+    test_watchdog.disarm()
     # Belt-and-suspenders: reap any lingering opt-in daemon a test left running
     # (e.g. the apple-music keep-alive watchdog) so it can't bleed CPU into the
     # next invocation. The real guard is per-test cleanup in the test modules;

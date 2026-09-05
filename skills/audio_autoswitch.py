@@ -5,6 +5,15 @@ on/off (the dongle stays plugged in, so plug/unplug detection misses it — see
 audio/audio_switch.py). Opt-in via AUDIO_AUTOSWITCH_ENABLED + a headset name
 fragment. Registers status / on / off / manual-switch voice actions and starts
 the background watcher at boot when enabled.
+
+EVERY power question here goes through `audio_switch.headset_powered()`, which
+is THREE-VALUED (True / False / None). It does NOT use `find_active()` for
+that: measured 2026-09-04, a CORSAIR VOID ELITE that is POWERED OFF still
+reports both endpoints as Active, so the endpoint check answers "on" forever.
+`find_active()` is still used to RESOLVE a device id once a decision is made —
+that part of it was never wrong.
+
+A None answer is spoken as "I can't tell", never as "off".
 """
 import importlib
 import os
@@ -70,9 +79,12 @@ def register(actions):
         if not headset:
             return ("Audio auto-switch isn't set up, sir — give me the headset's "
                     "device name (AUDIO_AUTOSWITCH_HEADSET) and turn it on.")
-        on = audio_switch.find_active(headset) is not None
+        powered = audio_switch.headset_powered(headset)
+        if powered is None:
+            return (f"Audio auto-switch is off, sir — and I can't tell whether the "
+                    f"'{headset}' headset is powered right now.")
         return (f"Audio auto-switch is off, sir. The '{headset}' headset is "
-                f"{'on' if on else 'off'} right now.")
+                f"{'on' if powered else 'off'} right now.")
 
     def audio_autoswitch_on(_: str = "") -> str:
         if not _cfg_str("AUDIO_AUTOSWITCH_HEADSET"):
@@ -86,18 +98,36 @@ def register(actions):
         return "Audio auto-switch is off, sir."
 
     def use_headset(_: str = "") -> str:
+        # An explicit "switch to the headset" is obeyed unless the headset is
+        # MEASURED off — sending audio to a powered-down headset is silence.
+        # An UNKNOWN power state still switches (the owner asked), but says so.
         headset = _cfg_str("AUDIO_AUTOSWITCH_HEADSET")
-        hs = audio_switch.find_active(headset) if headset else None
+        if not headset:
+            return "I don't have a headset device configured, sir."
+        powered = audio_switch.headset_powered(headset)
+        if powered is False:
+            return "The headset is powered off, sir — I'd be sending audio nowhere."
+        hs = audio_switch.find_active(headset)
         if not hs:
-            return "The headset isn't powered on, sir."
-        return ("Audio's on the headset now, sir." if audio_switch.set_default_render(hs[0])
-                else "I couldn't switch to the headset, sir.")
+            return (f"I can't find a playback device matching '{headset}', sir — "
+                    f"the name may be wrong.")
+        if not audio_switch.set_default_render(hs[0]):
+            return "I couldn't switch to the headset, sir."
+        if powered is None:
+            return ("Audio's on the headset now, sir — though I couldn't confirm "
+                    "it's actually powered on.")
+        return "Audio's on the headset now, sir."
 
     def use_speakers(_: str = "") -> str:
+        # resolve_fallback() logs exactly why an unusable fallback failed; this
+        # says it out loud too, rather than the old silent "not configured".
         fb = _cfg_str("AUDIO_AUTOSWITCH_FALLBACK")
-        spk = audio_switch.find_active(fb) if fb else None
-        if not spk:
+        if not fb:
             return "I don't have a speakers device configured, sir."
+        spk = audio_switch.resolve_fallback(fb)
+        if not spk:
+            problem = audio_switch.fallback_problem(fb) or "it could not be resolved"
+            return (f"I can't switch to the speakers, sir: {problem}.")
         return ("Audio's on the speakers now, sir." if audio_switch.set_default_render(spk[0])
                 else "I couldn't switch to the speakers, sir.")
 

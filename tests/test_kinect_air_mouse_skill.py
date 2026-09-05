@@ -521,7 +521,7 @@ class SingleHandRevertedMappingTests(_Base):
         # A raised RIGHT hand at a known camera (x, y). The cursor must equal the
         # PLAIN fixed-centre box map of that same (x, y) — body refs are ignored.
         hx, hy = 0.10, 0.55
-        arm = mod.ArmExtension("right", forward_m=0.0, straightness=None,
+        arm = mod.ArmExtension("right", forward_m=0.30, straightness=0.95,
                                hand=(hx, hy, 1.8, 2), lift_m=0.15,
                                shoulder_ref_y=0.40)
         d = c.update(relaxed_l, arm, "open", "open", True)
@@ -542,7 +542,7 @@ class SingleHandRevertedMappingTests(_Base):
 
         def arm(body_x, hand_dx, shoulder_y=0.40):
             return mod.ArmExtension(
-                "right", forward_m=0.0, straightness=None,
+                "right", forward_m=0.30, straightness=0.95,
                 hand=(body_x + hand_dx, shoulder_y + 0.20, 1.8, 2),
                 lift_m=0.20, shoulder_ref_y=shoulder_y)
         c1 = self._ctrl(mod)
@@ -1090,7 +1090,7 @@ class ReachEngageGateTests(_Base):
                + mod.AIR_MOUSE_ENGAGE_DOWN_MARGIN_M) / 2.0
 
         def mid_arm():
-            return mod.ArmExtension("right", forward_m=0.0, straightness=None,
+            return mod.ArmExtension("right", forward_m=0.30, straightness=0.95,
                                     hand=(0.1, SHOULDER_Y + mid, TORSO_Z - 0.30, 2),
                                     lift_m=mid)
         relaxed_l = self._relaxed(mod, "left")
@@ -2406,7 +2406,7 @@ class ControllingHandHysteresisTests(_Base):
 
         def right_arm(hand_x):
             # Controlling hand held at a FIXED position, clearly raised.
-            return mod.ArmExtension("right", forward_m=0.0, straightness=None,
+            return mod.ArmExtension("right", forward_m=0.30, straightness=0.95,
                                     hand=(hand_x, SHOULDER_Y + 0.30, 1.8, 2),
                                     lift_m=0.30, shoulder_ref_y=SHOULDER_Y)
 
@@ -2525,24 +2525,37 @@ class EngageDebounceTests(_Base):
         self.assertFalse(c.right_is_down)
 
     def test_poll_holdoff_makes_zero_setcursorpos_then_engages(self):
-        """Through the LIVE _poll_once with the LIVE default debounce: a 1-frame
-        raise makes ZERO cursor moves; a sustained raise eventually moves it."""
+        """Through the LIVE _poll_once with the LIVE policy: a raise held for less
+        than the DWELL makes ZERO cursor moves; held past the dwell it engages.
+
+        REWRITTEN 2026-09-04. This used to poll AIR_MOUSE_ENGAGE_DEBOUNCE_FRAMES
+        times back-to-back and assert engagement — which passed only because the
+        frame-credit bridge let a 3-frame streak stand in for the whole
+        AIR_MOUSE_ENGAGE_DWELL_SEC, i.e. it asserted the very short-circuit that
+        made the dwell decorative (~100 ms at 30 Hz instead of 300 ms). The live
+        policy is now the wall-clock dwell, so the pose is held on an injected
+        clock: frames alone must NOT engage, elapsed time must."""
         mod = self._load()
         self._not_staging(mod)
         self._patch_flag(True)
         moves, buttons = self._capture_mouse(mod)
-        # Use the module default engage debounce (the real policy) via a plain ctrl.
+        clk = _FakeClock(100.0)
+        # A plain ctrl: engage_debounce_frames UNPINNED == the live policy.
         ctrl = mod.AirMouseController(mod.ReachBox(2560, 1440),
-                                      debounce_frames=1, grace_sec=0.0)
-        # One raised frame → held off, no move yet.
-        mod._poll_once(ctrl, _fake_bridge(
-            bodies=[_body(reach_side="right", grip_right="open")]))
-        self.assertFalse(ctrl.engaged)
+                                      debounce_frames=1, grace_sec=0.0, clock=clk)
+        raised = lambda: _fake_bridge(
+            bodies=[_body(reach_side="right", grip_right="open")])
+        # Many frames but almost NO elapsed time → still held off, zero moves. This
+        # is the regression guard: frame count alone can no longer buy engagement.
+        for _ in range(4 * mod.AIR_MOUSE_ENGAGE_DEBOUNCE_FRAMES):
+            clk.advance(0.001)
+            mod._poll_once(ctrl, raised())
+        self.assertFalse(ctrl.engaged, "frame count alone engaged: the dwell "
+                                       "short-circuit is back")
         self.assertEqual(moves, [])
-        # Keep raising until it engages (bounded by the debounce frames).
-        for _ in range(mod.AIR_MOUSE_ENGAGE_DEBOUNCE_FRAMES):
-            mod._poll_once(ctrl, _fake_bridge(
-                bodies=[_body(reach_side="right", grip_right="open")]))
+        # Hold the same pose past the dwell → engage + move.
+        clk.advance(mod.AIR_MOUSE_ENGAGE_DWELL_SEC + 0.01)
+        mod._poll_once(ctrl, raised())
         self.assertTrue(ctrl.engaged)
         self.assertGreaterEqual(len(moves), 1)
 
@@ -2880,7 +2893,7 @@ class ClickTrackingStateTests(_Base):
 
     def _ext(self, mod, side, *, hand_state=2, lift=0.20):
         hx = 0.1 if side == "right" else -0.1
-        return mod.ArmExtension(side, forward_m=0.0, straightness=None,
+        return mod.ArmExtension(side, forward_m=0.30, straightness=0.95,
                                 hand=(hx, SHOULDER_Y + lift, TORSO_Z - 0.30,
                                       hand_state),
                                 lift_m=lift, shoulder_ref_y=SHOULDER_Y)
@@ -4077,6 +4090,290 @@ class SavedSettingsCacheTests(_Base):
         mod._settings_cache["key"] = None
         # No file → os.stat raises, key falls back; must return a dict, not raise.
         self.assertIsInstance(mod._saved_settings(), dict)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  REGRESSION: "the air-mouse grabs the cursor and CLICKS while I sit still"
+#  (2026-09-04). The owner disabled the feature after a false engagement closed
+#  his Chrome tabs mid-show. Every fixture below is built from the ACTUAL numbers
+#  the live telemetry recorded — see the per-test citation — so these tests fail
+#  the day the gate drifts back to "any hand above the shoulder line".
+#
+#  Each blocking test is paired with a NEGATIVE CONTROL from a CONFIRMED
+#  owner-driven acquisition, so a future "fix" cannot pass by simply making the
+#  air-mouse impossible to engage: the owner's requirement is BOTH halves.
+# ══════════════════════════════════════════════════════════════════════════
+class SeatedFalseEngageRegressionTests(_Base):
+    """A relaxed seated posture must never take the cursor; a deliberate reach
+    still must."""
+
+    # ── postures lifted verbatim from logs/session_*.log telemetry ────────────
+    # 2026-08-20 10:26:44 — engaged=True while the owner sat watching TV:
+    #   lift=+0.10 reach=-0.00 straight=0.54   (hand parked high, elbow folded)
+    COUCH_BENT = dict(lift=0.10, forward=-0.001, straight=0.54)
+    # 2026-08-20 10:30:03 — engaged=True: a STRETCH. The arm is straight but goes
+    #   straight UP, not forward:  lift=+0.35 reach=0.02 straight=0.98
+    STRETCH = dict(lift=0.35, forward=0.02, straight=0.98)
+    # 2026-08-20 11:54:10 — engaged=True with the hand BEHIND the torso plane:
+    #   lift=+0.34 reach=-0.33 straight=0.97
+    ARM_BEHIND = dict(lift=0.34, forward=-0.33, straight=0.97)
+    # 2026-09-04 19:50:28 — the CONFIRMED owner-driven acquisition (he was
+    #   deliberately taking the cursor):  lift=+0.22 reach=0.58 straight=0.98
+    REAL_REACH = dict(lift=0.22, forward=0.58, straight=0.98)
+
+    BODY_SCALE = 0.40          # shoulder span (m) — the reach-ratio denominator
+
+    def _arm(self, mod, side, posture):
+        """One arm posed exactly as the telemetry recorded it. reach_ratio is the
+        body-relative forward cue the live gate actually reads."""
+        hx = 0.1 if side == "right" else -0.1
+        return mod.ArmExtension(
+            side,
+            forward_m=posture["forward"],
+            straightness=posture["straight"],
+            hand=(hx, SHOULDER_Y + posture["lift"], TORSO_Z - posture["forward"], 2),
+            reach_ratio=posture["forward"] / self.BODY_SCALE,
+            lift_m=posture["lift"], shoulder_ref_y=SHOULDER_Y)
+
+    def _lowered(self, mod, side):
+        j = _relaxed_arm_joints(side)
+        return mod.ArmExtension.from_bridge(mod._local_arm_extension(j, side))
+
+    def _ctrl(self, mod, clk):
+        """A LIVE-policy controller: engage_debounce_frames and the grip close bar
+        are left UNPINNED, so this exercises exactly what the poller builds."""
+        return mod.AirMouseController(mod.ReachBox(2560, 1440), grace_sec=0.0,
+                                      clock=clk)
+
+    def _sit_still(self, mod, c, clk, posture, seconds=6.0, grip="open"):
+        """Hold one posture perfectly still, facing the sensor, for `seconds` of
+        wall clock at the 30 Hz poll rate — i.e. every PASSIVE condition except the
+        reach conjunct is satisfied, continuously, for many times the dwell."""
+        right = self._arm(mod, "right", posture)
+        left = self._lowered(mod, "left")
+        d = None
+        for _ in range(int(seconds * mod.AIR_MOUSE_POLL_HZ)):
+            clk.advance(mod.AIR_MOUSE_POLL_INTERVAL)
+            d = c.update(left, right, "open", grip, True, facing_deg=0.0,
+                         armed=False)
+        return d
+
+    def test_couch_posture_never_engages(self):
+        """THE BUG: hand above the shoulder, open palm, facing the sensor, dead
+        still — but the elbow is folded and the hand is not forward. 2026-08-20
+        engaged on exactly this and the log recorded engaged=True 34 times."""
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = self._ctrl(mod, clk)
+        d = self._sit_still(mod, c, clk, self.COUCH_BENT)
+        self.assertFalse(c.engaged, "a relaxed seated posture took the cursor")
+        self.assertIsNone(d.cursor, "SetCursorPos would have been called")
+        self.assertEqual(d.overlay, "hidden")
+
+    def test_overhead_stretch_never_engages(self):
+        """A STRETCH: arm straight (0.98) but going UP, not forward. This is the
+        case v2.0.89's upper-height bound was meant to kill — that bound went into
+        core/air_control.py, which AIR_CONTROL_ENABLED=False keeps switched off, so
+        the live engine never had it. The forward half of the conjunct covers it."""
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = self._ctrl(mod, clk)
+        self._sit_still(mod, c, clk, self.STRETCH)
+        self.assertFalse(c.engaged, "an overhead stretch took the cursor")
+
+    def test_hand_behind_the_torso_never_engages(self):
+        """Hand raised but BEHIND the torso plane (reach -0.33) — an arm along the
+        back of the couch. The arm is straight, so straightness alone would let it
+        in; the forward half is what rejects it."""
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = self._ctrl(mod, clk)
+        self._sit_still(mod, c, clk, self.ARM_BEHIND)
+        self.assertFalse(c.engaged, "an arm resting behind the body took the cursor")
+
+    def test_NEGATIVE_CONTROL_deliberate_reach_still_engages(self):
+        """THE OTHER HALF OF THE REQUIREMENT. The same harness, posed with the
+        CONFIRMED owner-driven acquisition (2026-09-04 19:50:28): reaching out with
+        an extended arm MUST still take the cursor. Without this, every test above
+        could be satisfied by simply breaking the feature."""
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = self._ctrl(mod, clk)
+        d = self._sit_still(mod, c, clk, self.REAL_REACH, seconds=1.0)
+        self.assertTrue(c.engaged, "a deliberate reach no longer takes the cursor")
+        self.assertIsNotNone(d.cursor)
+        self.assertEqual(d.overlay, "track")
+
+    def test_NEGATIVE_CONTROL_reach_engages_within_a_second(self):
+        """Responsiveness guard: the deliberate reach must be taken shortly after
+        the dwell, not seconds later."""
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = self._ctrl(mod, clk)
+        right = self._arm(mod, "right", self.REAL_REACH)
+        left = self._lowered(mod, "left")
+        frames = 0
+        while not c.engaged and frames < int(1.0 * mod.AIR_MOUSE_POLL_HZ):
+            clk.advance(mod.AIR_MOUSE_POLL_INTERVAL)
+            c.update(left, right, "open", "open", True, facing_deg=0.0, armed=False)
+            frames += 1
+        self.assertTrue(c.engaged)
+        held = frames * mod.AIR_MOUSE_POLL_INTERVAL
+        self.assertLessEqual(held, mod.AIR_MOUSE_ENGAGE_DWELL_SEC + 0.10,
+                             "engaging a deliberate reach got sluggish")
+
+    def test_couch_posture_cannot_click_even_with_a_flickering_grip(self):
+        """The destructive half: 2026-08-20 recorded engaged=True with grip=closed
+        TWICE, and a closed grip is a mouse-DOWN. Sitting still while the Kinect
+        hand classifier flickers must produce NO button edge at all, because the
+        posture must not engage in the first place."""
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = self._ctrl(mod, clk)
+        right = self._arm(mod, "right", self.COUCH_BENT)
+        left = self._lowered(mod, "left")
+        edges = []
+        for i in range(int(6.0 * mod.AIR_MOUSE_POLL_HZ)):
+            clk.advance(mod.AIR_MOUSE_POLL_INTERVAL)
+            # Flicker the grip the way the classifier does at range.
+            grip = "closed" if (i // 5) % 2 else "open"
+            d = c.update(left, right, "open", grip, True, facing_deg=0.0,
+                         armed=False)
+            edges += [e for e in (d.left, d.right) if e]
+        self.assertFalse(c.engaged)
+        self.assertEqual(edges, [], "phantom button edges fired: %r" % (edges,))
+
+
+class EngageDwellIsRealRegressionTests(_Base):
+    """AIR_MOUSE_ENGAGE_DWELL_SEC must actually be enforced in the LIVE policy.
+
+    It was not: the frame-credit bridge granted the FULL dwell after
+    engage_debounce_frames (3) valid frames, so at the 30 Hz poll rate the real
+    hold requirement was ~100 ms whatever the constant said — and less at any
+    higher rate. Both halves are asserted so neither policy can quietly vanish."""
+
+    def _arm(self, mod, side):
+        j = _extended_arm_joints(side)
+        return mod.ArmExtension.from_bridge(mod._local_arm_extension(j, side))
+
+    def _lowered(self, mod, side):
+        j = _relaxed_arm_joints(side)
+        return mod.ArmExtension.from_bridge(mod._local_arm_extension(j, side))
+
+    def test_frames_alone_cannot_buy_engagement(self):
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        # UNPINNED engage_debounce_frames == the live policy.
+        c = mod.AirMouseController(mod.ReachBox(2560, 1440), grace_sec=0.0,
+                                   clock=clk)
+        right, left = self._arm(mod, "right"), self._lowered(mod, "left")
+        # 10x the old frame requirement, but only a hair of wall clock.
+        for _ in range(10 * mod.AIR_MOUSE_ENGAGE_DEBOUNCE_FRAMES):
+            clk.advance(0.001)
+            c.update(left, right, "open", "open", True, facing_deg=0.0, armed=False)
+        self.assertFalse(c.engaged,
+                         "the frame-credit dwell short-circuit is back")
+
+    def test_the_full_dwell_is_required_then_engages(self):
+        mod = self._load()
+        clk = _FakeClock(100.0)
+        c = mod.AirMouseController(mod.ReachBox(2560, 1440), grace_sec=0.0,
+                                   clock=clk)
+        right, left = self._arm(mod, "right"), self._lowered(mod, "left")
+        # Just SHORT of the dwell → still priming, not engaged.
+        clk.advance(0.001)
+        c.update(left, right, "open", "open", True, facing_deg=0.0, armed=False)
+        clk.advance(mod.AIR_MOUSE_ENGAGE_DWELL_SEC - 0.05)
+        d = c.update(left, right, "open", "open", True, facing_deg=0.0, armed=False)
+        self.assertFalse(c.engaged)
+        self.assertGreater(d.prime, 0.0)          # the HUD priming ring is filling
+        # Past it → engaged.
+        clk.advance(0.06)
+        c.update(left, right, "open", "open", True, facing_deg=0.0, armed=False)
+        self.assertTrue(c.engaged)
+
+
+class PressDebounceAsymmetryTests(_Base):
+    """A spurious PRESS is a click the owner never made; a spurious RELEASE only
+    drops a drag. The two edges are debounced separately, and the LIVE controller
+    (which pins neither) must get the strict press bar."""
+
+    def test_close_needs_more_frames_than_open(self):
+        mod = self._load()
+        d = mod.GripDebouncer(frames=2, close_frames=4, initial="open")
+        for _ in range(3):
+            self.assertEqual(d.update("closed"), "open",
+                             "3 closed frames pressed against a 4-frame bar")
+        self.assertEqual(d.update("closed"), "closed")
+        # Releasing stays snappy: the 2-frame bar.
+        self.assertEqual(d.update("open"), "closed")
+        self.assertEqual(d.update("open"), "open")
+
+    def test_default_debouncer_stays_symmetric(self):
+        """close_frames=None must not change any existing caller's contract."""
+        mod = self._load()
+        d = mod.GripDebouncer(frames=2, initial="open")
+        self.assertEqual(d.close_frames, d.frames)
+
+    def test_live_controller_gets_the_strict_press_bar(self):
+        mod = self._load()
+        c = mod.AirMouseController(mod.ReachBox(2560, 1440))
+        self.assertEqual(c._grip_left.close_frames,
+                         mod.AIR_MOUSE_GRIP_CLOSE_FRAMES)
+        self.assertEqual(c._grip_right.close_frames,
+                         mod.AIR_MOUSE_GRIP_CLOSE_FRAMES)
+        self.assertGreater(mod.AIR_MOUSE_GRIP_CLOSE_FRAMES,
+                           mod.AIR_MOUSE_GRIP_DEBOUNCE_FRAMES)
+        # …while the release bar is untouched.
+        self.assertEqual(c._grip_left.frames, mod.AIR_MOUSE_GRIP_DEBOUNCE_FRAMES)
+
+    def test_pinned_debounce_frames_restore_symmetry(self):
+        """A caller that pins the debounce is pinning the whole grip contract."""
+        mod = self._load()
+        c = mod.AirMouseController(mod.ReachBox(2560, 1440), debounce_frames=1)
+        self.assertEqual(c._grip_left.close_frames, 1)
+
+
+class ArmWindowExpiryTests(_Base):
+    """ARMED (the relaxed, height-only gate) used to latch for the whole session,
+    so one "take the cursor" left every later raised hand able to grab it with no
+    open-palm / facing / stillness / reach test at all. It is now a window that
+    lapses once the owner stops using it."""
+
+    def setUp(self):
+        self._mod = self._load()
+        self.addCleanup(self._mod.air_mouse_disarm)
+
+    def test_arm_expires_after_the_timeout(self):
+        mod = self._mod
+        base = [1000.0]
+        with mock.patch.object(mod.time, "monotonic", lambda: base[0]):
+            mod.air_mouse_arm()
+            self.assertTrue(mod.air_mouse_is_armed())
+            base[0] += mod.AIR_MOUSE_ARM_TIMEOUT_SEC / 2.0
+            self.assertTrue(mod.air_mouse_is_armed(), "expired far too early")
+            base[0] += mod.AIR_MOUSE_ARM_TIMEOUT_SEC
+            self.assertFalse(mod.air_mouse_is_armed(),
+                             "ARMED latched past its window")
+
+    def test_use_refreshes_the_window(self):
+        mod = self._mod
+        base = [1000.0]
+        with mock.patch.object(mod.time, "monotonic", lambda: base[0]):
+            mod.air_mouse_arm()
+            for _ in range(5):
+                base[0] += mod.AIR_MOUSE_ARM_TIMEOUT_SEC * 0.9
+                mod.air_mouse_arm_refresh()          # what an engaged frame does
+                self.assertTrue(mod.air_mouse_is_armed())
+            base[0] += mod.AIR_MOUSE_ARM_TIMEOUT_SEC + 1.0
+            self.assertFalse(mod.air_mouse_is_armed())
+
+    def test_disarm_still_wins_immediately(self):
+        mod = self._mod
+        mod.air_mouse_arm()
+        self.assertTrue(mod.air_mouse_is_armed())
+        mod.air_mouse_disarm()
+        self.assertFalse(mod.air_mouse_is_armed())
 
 
 if __name__ == "__main__":

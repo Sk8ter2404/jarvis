@@ -219,6 +219,123 @@ _WEDGED_CACHE_SEC = 90.0
 _open_attempt_lock = threading.Lock()
 
 
+# ─── PER-BODY FIELDS THE BRIDGE USED TO THROW AWAY (2026-09-04 capability audit)
+# The installed PyKinectRuntime's KinectBody carries MORE than joints + grip, and
+# _parse_body_frame read only `is_tracked`, `tracking_id`, `joints` and
+# `hand_*_state`. Verified present on this build by reading the installed source
+# (site-packages/pykinect2/PyKinectRuntime.py, class KinectBody): it also sets
+# `hand_left_confidence`, `hand_right_confidence`, `clipped_edges`, `lean`,
+# `lean_tracking_state`, `is_restricted` and `engaged` on every tracked body.
+#
+# The two that matter here:
+#
+#  * hand_*_confidence (TrackingConfidence_Low=0 / _High=1). The v2 grip
+#    classifier publishes its OWN confidence precisely because a low-confidence
+#    open/closed call is close to a coin flip. The bridge reported the grip at
+#    face value, so a low-confidence "closed" reached the air-mouse's click /
+#    fist-latch path indistinguishable from a high-confidence one — a direct
+#    candidate for the owner's "it false-fires when I'm still". Surfaced as a
+#    field (NOT silently gated: see HAND_CONFIDENCE_GATE below) so consumers can
+#    weigh it and so the rate can finally be MEASURED on this desk.
+#
+#  * clipped_edges (FrameEdge_Right=1 / _Left=2 / _Top=4 / _Bottom=8). The SDK
+#    telling us the body is running off the edge of the frustum. This is the
+#    honest explanation for a whole class of "tracking is unreliable" that no
+#    software fix can cure — a joint outside the FOV is GUESSED, not measured.
+#    The owner sits ~0.6-0.9 m from the sensor (measured from the live session
+#    log: "about 2 feet back" / "about 3 feet out"), which is at/below the v2
+#    body-tracking envelope, so clipping is expected to be common. Surfacing it
+#    lets JARVIS say "you're too close, sir" instead of silently degrading.
+_FRAME_EDGE_BITS = (("right", 1), ("left", 2), ("top", 4), ("bottom", 8))
+
+# When True, a grip the SDK flags LOW-confidence is reported as "unknown" (the
+# sentinel every consumer already handles as "no reliable grip this frame")
+# rather than as open/closed. Left OFF by default: the live low-confidence RATE
+# on this desk has never been measured, and if it is high this would silently
+# stop clicks working. Flip it only with a measured before/after — get_bodies()
+# now carries hand_*_conf so that measurement is a log-parse away.
+HAND_CONFIDENCE_GATE = False
+
+
+def _hand_confidence_name(raw: Any) -> str:
+    """Map a raw Kinect TrackingConfidence int to "low"/"high", or "unknown"
+    when the attribute is absent (an older build / a test fake) or unusable.
+    Pure; never raises."""
+    try:
+        if raw is None:
+            return "unknown"
+        v = int(raw)
+    except (TypeError, ValueError):
+        return "unknown"
+    if v == 0:
+        return "low"
+    if v == 1:
+        return "high"
+    return "unknown"
+
+
+def _grip_with_confidence(raw_state: Any, conf: str) -> str:
+    """The friendly grip name for a raw HandState int, collapsed to "unknown"
+    when the SDK flagged the classification LOW-confidence *and*
+    HAND_CONFIDENCE_GATE is on. With the gate off (the default) this is exactly
+    _hand_state_name, so behaviour is unchanged until the rate is measured.
+    Pure; never raises."""
+    name = _hand_state_name(raw_state)
+    if HAND_CONFIDENCE_GATE and conf == "low" and name in ("open", "closed", "lasso"):
+        return "unknown"
+    return name
+
+
+def _clipped_edges(raw: Any) -> dict:
+    """Decode a Kinect `clipped_edges` bitfield into
+    {"right": bool, "left": bool, "top": bool, "bottom": bool, "any": bool}.
+    All False (and any=False) when the attribute is absent or unusable, so a
+    build/fake without it degrades to "not clipped" rather than raising."""
+    out = {name: False for name, _bit in _FRAME_EDGE_BITS}
+    out["any"] = False
+    try:
+        if raw is None:
+            return out
+        v = int(raw)
+    except (TypeError, ValueError):
+        return out
+    for name, bit in _FRAME_EDGE_BITS:
+        out[name] = bool(v & bit)
+    out["any"] = any(out[name] for name, _b in _FRAME_EDGE_BITS)
+    return out
+
+
+def _joint_state_counts(joints: dict) -> dict:
+    """Tracking-state census for one parsed joint dict:
+    {"tracked": n, "inferred": n, "not_tracked": n, "total": n}.
+
+    This is the number the 2026-09-04 telemetry audit had to infer indirectly.
+    Parsing 33 live session logs (219,000+ air-mouse telemetry lines) showed the
+    controlling HAND joint failing the fully-tracked floor on 12-58% of frames in
+    which the BODY itself was tracked (36.6% in the 2026-09-04 session, 47.4%
+    across the 68,649-sample 2026-08-08 session) — the gate cannot even be
+    computed on those frames, which is what "one-hand tracking feels unreliable"
+    actually is. Exposing the census per body makes that measurable directly
+    instead of by inference. Pure; never raises."""
+    out = {"tracked": 0, "inferred": 0, "not_tracked": 0, "total": 0}
+    try:
+        for j in (joints or {}).values():
+            out["total"] += 1
+            try:
+                st = int(j[3])
+            except (TypeError, ValueError, IndexError):
+                st = 0
+            if st >= 2:
+                out["tracked"] += 1
+            elif st == 1:
+                out["inferred"] += 1
+            else:
+                out["not_tracked"] += 1
+    except Exception:   # pragma: no cover - defensive: malformed joints dict
+        pass
+    return out
+
+
 def clear_negative_cache() -> None:
     """Forget any cached 'sensor unavailable' verdict so the very next available()/
     get_runtime() re-probes the SDK immediately instead of waiting out the negative
@@ -299,8 +416,10 @@ def _publish_runtime(rt) -> Any:
             # frame" off its just-verified first frames nor be masked by the dead
             # instance's older perf_counter stamps (perf_counter is process-wide,
             # so cross-instance comparisons are meaningless).
+            _last_depth_frame_at[0] = now0
             for _attr, _cell in (("_last_color_frame_time", _color_time_seen),
-                                 ("_last_body_frame_time", _body_time_seen)):
+                                 ("_last_body_frame_time", _body_time_seen),
+                                 ("_last_depth_frame_time", _depth_time_seen)):
                 try:
                     _cell[0] = float(getattr(rt, _attr, 0.0) or 0.0)
                 except (TypeError, ValueError):
@@ -488,6 +607,14 @@ def available() -> tuple[bool, str]:
 # clear-on-read builds working unchanged.
 _color_time_seen = [0.0]           # last _last_color_frame_time this bridge served
 _body_time_seen = [0.0]            # last _last_body_frame_time this bridge consumed
+# DEPTH was the LAST stream still trusting the installed build's broken
+# has_new_depth_frame() (2026-09-04 audit): the 2026-07-21 fix converted color
+# and body to bridge-derived freshness and left get_depth() on the sticky flag,
+# so a wedged/unplugged sensor kept re-serving the SAME frozen depth buffer
+# forever and kinect_status kept reporting "depth" as a live stream. Same cell
+# pattern, same helper — the stream now reports its own honest freshness.
+_depth_time_seen = [0.0]           # last _last_depth_frame_time this bridge served
+_last_depth_frame_at = [0.0]       # monotonic of the last DELIVERED depth frame
 
 
 def _frame_time_advanced(rt, time_attr: str, flag_attr: str,
@@ -634,15 +761,36 @@ def get_infrared_gray():
         return None
 
 
-def get_depth():
-    """Latest depth frame as a (424, 512) uint16 ndarray (millimetre-ish
-    depth), or None."""
+def get_depth(require_new: bool = False):
+    """Latest depth frame as a (424, 512) uint16 ndarray of MILLIMETRES, or None.
+
+    0 is the sensor's "no return" sentinel (too near, too far, specular, shadowed)
+    and MUST be excluded before any arithmetic — every depth consumer in this
+    module masks it.
+
+    require_new=False (the default) serves the most recent buffer, which is what
+    a poller faster than the sensor's 30 Hz wants; require_new=True returns None
+    unless a GENUINELY new frame has arrived since the bridge last served one.
+
+    FRESHNESS (2026-09-04 audit — the last stale duplicate of the 2026-07-21 fix):
+    this used to gate on `rt.has_new_depth_frame()`. On the INSTALLED pykinect2
+    build that flag is permanently True once one depth frame has ever arrived —
+    `get_last_depth_frame()` assigns `_last_color_frame_access` as a bare LOCAL
+    (no `self.`, and note it stamps the COLOR name, a second bug in the same
+    line), so the access stamp the flag compares against never advances. Color
+    and body were converted to bridge-derived freshness in July; depth was
+    missed, so a dead sensor kept re-serving one frozen 512x424 buffer and
+    skills/kinect_vision.kinect_status kept announcing "depth" as a live stream.
+    Depth now uses the same _frame_time_advanced helper and stamps its own
+    delivery clock, so get_stream_health() can tell the truth about it."""
     rt, _ = get_runtime()
     if rt is None:
         return None
     try:
         import numpy as np
-        if not rt.has_new_depth_frame():
+        had_new, dt = _frame_time_advanced(
+            rt, "_last_depth_frame_time", "has_new_depth_frame", _depth_time_seen)
+        if require_new and not had_new:
             return None
         flat = rt.get_last_depth_frame()
         if flat is None:
@@ -650,9 +798,75 @@ def get_depth():
         arr = np.asarray(flat, dtype=np.uint16)
         if arr.size != 512 * 424:
             return None
+        # Stamp ONLY on a real new frame (mirrors get_color_bgr): a re-served
+        # frozen buffer must never read as "the depth stream is alive".
+        if had_new:
+            if dt is not None:
+                _depth_time_seen[0] = dt
+            _last_depth_frame_at[0] = time.monotonic()
         return arr.reshape((424, 512))
     except Exception:   # pragma: no cover - defensive: mid-stream frame glitch
         return None
+
+
+def get_stream_health() -> dict:
+    """Honest per-stream liveness for the diagnostics / voice layer. NEVER raises.
+
+        {"open": bool,                  # a runtime is currently published
+         "color_pending": bool,         # the SDK has a NEW frame we have not served
+         "body_pending":  bool,
+         "depth_pending": bool,
+         "color_age_s": float | None,   # since the bridge last SERVED a new frame
+         "body_age_s":  float | None,
+         "depth_age_s": float | None,
+         "infrared": "unsupported",     # always: see get_infrared_gray()
+         "ts": <monotonic>}
+
+    TWO DIFFERENT QUESTIONS, and conflating them is how the old probe lied:
+
+      *_pending is POLL-INDEPENDENT PROOF the stream is arriving right now. It
+      reads the runtime's own arrival timestamp (`_last_<stream>_frame_time`,
+      advanced ONLY by handle_*_arrived) against the last value this bridge
+      served. Non-consuming: it does not read or clear a frame, so it never
+      steals the body frame from the pump.
+
+      *_age_s is how long since the BRIDGE last handed a genuinely new frame to
+      a caller — which for DEPTH only advances when something actually calls
+      get_depth() (nothing polls depth on a schedule; body has the 30 Hz pump
+      and color is primed by it). A large depth age therefore means "nobody
+      asked recently", NOT necessarily "the sensor is dead". Use *_pending for
+      liveness, *_age_s for "how fresh is what I would get back".
+
+    WHY THIS EXISTS: skills/kinect_vision.kinect_status probes liveness by
+    calling each accessor and checking for a non-None return. On this pykinect2
+    build a frozen buffer returns bytes forever (the sticky has_new_* flags),
+    so that probe reported "color, depth" on a sensor that had stopped
+    streaming — the exact class of lie the 2026-07-21 audit found for color and
+    body and missed for depth. None for an age means no frame of that stream
+    has been served since this runtime was published."""
+    now = time.monotonic()
+    out = {"open": _runtime[0] is not None,
+           "color_pending": False, "body_pending": False, "depth_pending": False,
+           "color_age_s": None, "body_age_s": None, "depth_age_s": None,
+           "infrared": "unsupported", "ts": now}
+    rt = _runtime[0]
+    try:
+        for key, cell, seen, time_attr, flag_attr in (
+                ("color", _last_color_frame_at, _color_time_seen,
+                 "_last_color_frame_time", "has_new_color_frame"),
+                ("body", _last_body_frame_at, _body_time_seen,
+                 "_last_body_frame_time", "has_new_body_frame"),
+                ("depth", _last_depth_frame_at, _depth_time_seen,
+                 "_last_depth_frame_time", "has_new_depth_frame")):
+            at = float(cell[0] or 0.0)
+            if at > 0.0:
+                out[f"{key}_age_s"] = round(max(0.0, now - at), 2)
+            if rt is not None:
+                advanced, _t = _frame_time_advanced(rt, time_attr, flag_attr, seen)
+                out[f"{key}_pending"] = bool(advanced)
+    except Exception:   # pragma: no cover - defensive: odd runtime / clock cell
+        return out
+    return out
 
 
 # ─── body / skeleton tracking ─────────────────────────────────────────────
@@ -880,7 +1094,8 @@ def arm_extension(joints: dict, side: str) -> dict:
          "shoulder_hand_m": float | None,     # straight-line shoulder→hand (m)
          "arm_len_m": float | None,           # shoulder→elbow + elbow→hand (m)
          "shoulder_ref_y": float | None,      # shoulder-line Y reference (camera-up)
-         "lift_m": float | None}              # hand_y - shoulder_ref_y (>0 = raised)
+         "lift_m": float | None,              # hand_y - shoulder_ref_y (>0 = raised)
+         "lift_ref": "hand"|"wrist"|None}     # which joint lift_m was measured from
 
     forward_reach_m is POSITIVE when the hand is pushed toward the sensor (in
     front of the torso). reach_ratio NORMALISES that absolute reach by a body-size
@@ -901,16 +1116,19 @@ def arm_extension(joints: dict, side: str) -> dict:
     when the elbow is bent and the hand pulled back; forward_reach_m / reach_ratio
     are retained as weak SECONDARY cues only (the height gate is primary).
 
-    TRACKING-STATE FLOOR: lift_m (the PRIMARY gate) is computed ONLY when BOTH the
-    controlling hand and the shoulder reference are FULLY TRACKED (TrackingState
-    >= 2) with real finite non-zero-fill coords — otherwise it stays None and the
-    gate fails safe (is_extended treats None as NOT extended). The demoted
+    TRACKING-STATE FLOOR: lift_m (the PRIMARY gate) is computed ONLY from FULLY
+    TRACKED (TrackingState >= 2) joints with real finite non-zero-fill coords — the
+    shoulder reference, plus the hand OR, when the hand joint is not reliable, the
+    same-side WRIST (`lift_ref` says which; see the block on that fallback below).
+    With neither usable it stays None and the gate fails safe (is_extended treats
+    None as NOT extended). The floor itself is NOT loosened — the wrist must clear
+    exactly the same bar the hand had to. The demoted
     forward/straightness cues are NOT floored this way (they can't engage on their
     own), so they may still populate off inferred joints for the debug log."""
     out = {"side": side, "hand": None, "forward_reach_m": None,
            "reach_ratio": None, "body_scale_m": None,
            "straightness": None, "shoulder_hand_m": None, "arm_len_m": None,
-           "shoulder_ref_y": None, "lift_m": None}
+           "shoulder_ref_y": None, "lift_m": None, "lift_ref": None}
     try:
         shoulder = joints.get(f"shoulder_{side}")
         elbow = joints.get(f"elbow_{side}")
@@ -935,9 +1153,49 @@ def arm_extension(joints: dict, side: str) -> dict:
         shoulder_ref = joints.get("spine_shoulder")
         if not _joint_reliable(shoulder_ref):
             shoulder_ref = shoulder if _joint_reliable(shoulder) else None
-        if shoulder_ref is not None and _joint_reliable(hand):
+        # WRIST FALLBACK for the HEIGHT reference (2026-09-04). The HAND joint is
+        # the least reliable joint in the v2 skeleton — it is the smallest, the
+        # most distal, the first to motion-blur and the first to leave the frustum
+        # of a user sitting ~0.6-0.9 m out (this desk). MEASURED over 33 live
+        # session logs / 219,000+ air-mouse telemetry lines: on 12-58% of frames in
+        # which the BODY was tracked (36.6% on 2026-09-04, 47.4% across the
+        # 68,649-line 2026-08-08 session) the controlling hand joint failed the
+        # fully-tracked floor, so lift_m came back None, is_extended() read False,
+        # and the cursor dropped out mid-gesture. That IS the owner's "one-hand
+        # tracking feels unreliable".
+        #
+        # The WRIST is one joint proximal, physically larger, better constrained by
+        # the forearm, and stays TRACKED through most of those frames. For a HEIGHT
+        # measurement it is a legitimate stand-in: wrist_y trails hand_y by roughly
+        # a hand length (~0.04-0.08 m) when the arm is raised, so a wrist-derived
+        # lift reads slightly LOW — i.e. it fails SAFE in both directions (harder to
+        # engage, and the disengage bar is the lower of the two). We do NOT
+        # compensate that bias: a fixed offset would be a guess that varies with
+        # wrist pose. `lift_ref` names which joint produced lift_m so a consumer
+        # that cares can weigh it.
+        #
+        # DELIBERATELY NARROW: out["hand"] is NOT re-pointed at the wrist. The
+        # air-mouse maps the CURSOR from ext.hand and gates CLICKS on
+        # joint_well_tracked(ext.hand) (skills/kinect_air_mouse._grip_if_tracked,
+        # FILTER 4). Substituting a joint ~7 cm away there would teleport the
+        # cursor and would let an inferred-hand frame press a button — the owner's
+        # OTHER complaint. Only the height reference falls back.
+        #
+        # (This also revives a fallback that has never once fired: the original
+        # `joints.get(f"hand_{side}") or joints.get(f"wrist_{side}")` is dead code,
+        # because _parse_body_frame populates ALL 25 joint names unconditionally,
+        # so the hand key is never absent — only ever present-and-untracked.)
+        lift_j = hand if _joint_reliable(hand) else None
+        lift_ref = "hand" if lift_j is not None else None
+        if lift_j is None:
+            wrist = joints.get(f"wrist_{side}")
+            if _joint_reliable(wrist):
+                lift_j = wrist
+                lift_ref = "wrist"
+        out["lift_ref"] = lift_ref
+        if shoulder_ref is not None and lift_j is not None:
             out["shoulder_ref_y"] = float(shoulder_ref[1])
-            out["lift_m"] = float(hand[1]) - float(shoulder_ref[1])
+            out["lift_m"] = float(lift_j[1]) - float(shoulder_ref[1])
         # FORWARD-DEPTH (weak secondary cue): hand z vs a torso depth reference
         # (spine first, then the same-side shoulder). Positive = hand in front.
         body_ref = None
@@ -1187,7 +1445,16 @@ def _parse_body_frame(frame) -> list[dict]:
          "facing": bool | None,
          "facing_yaw_deg": float | None,   # 0=square, -=sensor-left, +=sensor-right
          "hand_right": "open"|"closed"|"lasso"|"unknown",
-         "hand_left":  "open"|"closed"|"lasso"|"unknown"}"""
+         "hand_left":  "open"|"closed"|"lasso"|"unknown",
+         "hand_right_conf": "low"|"high"|"unknown",   # SDK grip confidence
+         "hand_left_conf":  "low"|"high"|"unknown",
+         "clipped": {"right","left","top","bottom","any" -> bool},  # FrameEdges
+         "joint_states": {"tracked","inferred","not_tracked","total" -> int}}
+
+    The last three are NEW (2026-09-04 capability audit) — fields the installed
+    KinectBody has always published and this parser used to drop on the floor.
+    They are ADDITIVE: every pre-existing key keeps its exact meaning, so no
+    consumer changes behaviour by their presence."""
     try:
         # NB: frame.bodies on real hardware is a length-6 numpy ndarray
         # (dtype=object) — NEVER apply bool()/`not` to it or numpy raises
@@ -1231,6 +1498,11 @@ def _parse_body_frame(frame) -> list[dict]:
             if not _body_is_real(joints):
                 continue
             head = joints.get("head")
+            conf_right = _hand_confidence_name(
+                getattr(body, "hand_right_confidence", None))
+            conf_left = _hand_confidence_name(
+                getattr(body, "hand_left_confidence", None))
+            clipped = _clipped_edges(getattr(body, "clipped_edges", None))
             out.append({
                 # Prefer the Kinect's stable per-person tracking_id (set from
                 # body.TrackingId for every tracked body; PyKinectRuntime.py:406)
@@ -1246,8 +1518,16 @@ def _parse_body_frame(frame) -> list[dict]:
                 "facing_yaw_deg": _body_facing_yaw(joints),
                 # getattr so an older build lacking these attrs degrades to
                 # "unknown" rather than KeyError-ing the whole body out.
-                "hand_right": _hand_state_name(getattr(body, "hand_right_state", None)),
-                "hand_left": _hand_state_name(getattr(body, "hand_left_state", None)),
+                "hand_right": _grip_with_confidence(
+                    getattr(body, "hand_right_state", None), conf_right),
+                "hand_left": _grip_with_confidence(
+                    getattr(body, "hand_left_state", None), conf_left),
+                # NEW (2026-09-04): fields this build publishes and the bridge
+                # used to discard. See the capability-audit block above.
+                "hand_right_conf": conf_right,   # "low" | "high" | "unknown"
+                "hand_left_conf": conf_left,
+                "clipped": clipped,              # right/left/top/bottom/any bools
+                "joint_states": _joint_state_counts(joints),
             })
         return out
     except Exception:   # pragma: no cover - defensive: mid-stream body-frame glitch
@@ -1345,6 +1625,296 @@ def get_color_space_mapper():
             return None
 
     return _mapper
+
+
+def get_depth_space_mapper():
+    """Return a callable ``mapper(x, y, z) -> (px, py) | None`` projecting a
+    CAMERA-SPACE metre point onto the 512x424 DEPTH frame, or None when the
+    Kinect is off / absent. NEVER raises.
+
+    The depth twin of get_color_space_mapper(), and the primitive the whole
+    depth plane was missing: without it the depth frame get_depth() returns is
+    an orphan raster that cannot be related to a single skeleton joint. Uses
+    ICoordinateMapper::MapCameraPointToDepthSpace (present on this build --
+    verified in the installed PyKinectV2.py COMMETHOD table) directly, for the
+    same reason get_color_space_mapper avoids the runtime's convenience
+    wrappers: those allocate ``numpy.object``, removed in numpy 1.24+.
+
+    The SDK returns -inf / NaN for a camera point that does not project into
+    the depth frustum; those are filtered to None here so callers never index
+    an array with a garbage coordinate."""
+    rt, _ = get_runtime()
+    if rt is None:
+        return None
+    mapper = getattr(rt, "_mapper", None)
+    map_fn = getattr(mapper, "MapCameraPointToDepthSpace", None) if mapper else None
+    if not callable(map_fn):
+        return None
+    try:
+        pk2, _rt_mod = import_pykinect2()
+    except Exception:   # pragma: no cover - loader already proven at open time
+        return None
+    csp_type = (getattr(pk2, "CameraSpacePoint", None)
+                or getattr(pk2, "_CameraSpacePoint", None))
+    if csp_type is None:
+        return None
+
+    def _mapper(x: float, y: float, z: float):
+        try:
+            pt = csp_type()
+            pt.x = float(x)
+            pt.y = float(y)
+            pt.z = float(z)
+            ds = map_fn(pt)
+            px, py = float(ds.x), float(ds.y)
+            # Reject the SDK's out-of-frustum sentinels (-inf) and any NaN.
+            if px != px or py != py:
+                return None
+            if px in (float("inf"), float("-inf")) or py in (float("inf"),
+                                                             float("-inf")):
+                return None
+            return (px, py)
+        except Exception:   # pragma: no cover - per-point COM/marshalling glitch
+            return None
+
+    return _mapper
+
+
+# --- DEPTH-SPACE BODY CORROBORATION (the open mirror/TV-reflection defect) ----
+# THE DEFECT (open since the 2026-07-15 ghost audit, recorded on _body_is_real):
+# the joint-reliability gate drops inferred/zero-fill phantoms but "does NOT stop
+# a true mirror/TV reflection - its joints track cleanly; needs a spatial/depth
+# heuristic". This is that heuristic's data layer.
+#
+# BE HONEST ABOUT THE PHYSICS FIRST. A plane mirror is not a defect in the
+# sensor - it is a correct measurement of a virtual scene. The Kinect reports the
+# FOLDED PATH LENGTH (sensor -> mirror -> subject), so the reflection sits at
+# exactly the distance, and subtends exactly the angular size, of a real person
+# standing at the mirrored position. Size-vs-distance, depth-vs-joint, bone
+# lengths, motion smoothness and joint tracking states are ALL self-consistent.
+# There is therefore NO single-frame, single-body geometric test that can be
+# certain. Anybody who claims otherwise has not done the geometry.
+#
+# WHAT *IS* ASYMMETRIC, and what these two tests measure:
+#
+#  1. CORROBORATION (agree_frac) - "is there actually mass where the skeleton
+#     says?" Project each fully-tracked joint into depth space and compare the
+#     depth reading against the joint's own z. A real person (or a reflection of
+#     one) agrees; a skeleton hallucinated onto furniture, a coat rack, or the
+#     residue of someone who just left frame does NOT. This is _body_is_real's
+#     joint-state gate rebuilt on independent evidence - a body can fake
+#     TrackingState, it cannot fake the depth raster.
+#
+#  2. SURROUND (surround_nearer_frac) - "is this body OCCLUDING its
+#     surroundings, or is it FRAMED by nearer geometry?" A real person standing
+#     in a room occludes whatever is behind them, so the ring of depth just
+#     outside their silhouette reads FARTHER than they do. A virtual image lives
+#     inside a physical aperture - a mirror in its frame, a TV in its bezel, a
+#     picture, a doorway - and every reflected pixel is at the folded path
+#     length while the aperture's edge is the real wall at its true, MUCH NEARER
+#     distance. So a large fraction of the surrounding ring reads NEARER than
+#     the body. That asymmetry does not disappear with mirror geometry, because
+#     the frame is a real object and the image is not.
+#
+# KNOWN FALSE POSITIVE, stated up front: a real person standing IN a doorway, or
+# leaning past a nearby wall edge / monitor / door jamb, is also framed by nearer
+# geometry. That is why nothing below is wired into _parse_body_frame and no body
+# is dropped: these functions SCORE, they do not gate. The thresholds are seeded
+# from geometry, NOT calibrated - this box's sensor was held by the live JARVIS
+# throughout this work, so no reflection has been measured through them yet.
+# tools/kinect_depth_probe.py collects the data needed to set them.
+DEPTH_JOINT_TOL_NEAR_M = 0.35   # depth may read this much NEARER than a joint
+DEPTH_JOINT_TOL_FAR_M = 0.12    # ...and only this much FARTHER (joints sit inside)
+DEPTH_SURROUND_MARGIN_M = 0.30  # a ring sample counts as "nearer" beyond this
+DEPTH_SURROUND_SUSPECT_FRAC = 0.60   # ring this nearer-dominated -> "suspect"
+DEPTH_AGREE_GHOST_FRAC = 0.35   # corroboration below this -> "uncorroborated"
+DEPTH_MIN_SAMPLES = 6           # fewer valid samples than this -> "unknown"
+DEPTH_W, DEPTH_H = 512, 424
+
+
+def _depth_mm_at(depth, px: float, py: float) -> Optional[int]:
+    """Depth in MILLIMETRES at a depth-space pixel, or None when the pixel is
+    outside the 512x424 frame or reads the sensor's 0 "no return" sentinel
+    (too near / too far / specular / IR-shadowed). Indexes with [row][col] so a
+    numpy (424, 512) frame and a list-of-lists test fixture both work. Pure;
+    never raises."""
+    try:
+        x = int(px)
+        y = int(py)
+        if x < 0 or y < 0 or x >= DEPTH_W or y >= DEPTH_H:
+            return None
+        v = int(depth[y][x])
+        return v if v > 0 else None
+    except Exception:   # pragma: no cover - defensive: odd array / index type
+        return None
+
+
+def depth_corroborate(body: dict, depth, mapper) -> dict:
+    """Score ONE parsed body (a get_bodies() entry) against a DEPTH frame.
+    PURE -- `depth` and `mapper` are injected, so this is unit-testable with a
+    synthetic raster and no sensor. NEVER raises. Shape:
+
+        {"verdict": "real"|"suspect"|"uncorroborated"|"unknown",
+         "reason": str,
+         "body_z_m": float | None,       # the reference depth used
+         "joint_samples": int,           # joints with a valid depth reading
+         "joint_agree": int,             # ...that matched the joint's own z
+         "agree_frac": float | None,
+         "surround_samples": int,        # valid ring samples around the body
+         "surround_nearer": int,         # ...reading NEARER than the body
+         "surround_nearer_frac": float | None}
+
+    Verdicts:
+      "unknown"        -- too little valid depth to judge (fewer than
+                         DEPTH_MIN_SAMPLES joint readings). NOT a rejection.
+      "uncorroborated" -- the depth raster does not show mass where the skeleton
+                         claims it (agree_frac < DEPTH_AGREE_GHOST_FRAC).
+      "suspect"        -- corroborated, but framed by nearer geometry
+                         (surround_nearer_frac >= DEPTH_SURROUND_SUSPECT_FRAC):
+                         consistent with a mirror / screen / doorway aperture.
+                         Also consistent with a real person in a doorway -- see
+                         the KNOWN FALSE POSITIVE note above.
+      "real"           -- corroborated and occluding its surroundings.
+
+    Nothing acts on this verdict yet; it is scoring, not gating."""
+    out = {"verdict": "unknown", "reason": "", "body_z_m": None,
+           "joint_samples": 0, "joint_agree": 0, "agree_frac": None,
+           "surround_samples": 0, "surround_nearer": 0,
+           "surround_nearer_frac": None}
+    try:
+        if not body or depth is None or not callable(mapper):
+            out["reason"] = "no body / depth frame / mapper"
+            return out
+        joints = body.get("joints") or {}
+        pts = []          # (px, py, z_m) for every reliably-tracked joint
+        for j in joints.values():
+            if not _joint_reliable(j):
+                continue
+            m = mapper(float(j[0]), float(j[1]), float(j[2]))
+            if m is None:
+                continue
+            pts.append((m[0], m[1], float(j[2])))
+        if not pts:
+            out["reason"] = "no reliable joint projected into depth space"
+            return out
+
+        # 1. corroboration
+        agree = 0
+        samples = 0
+        for px, py, z in pts:
+            mm = _depth_mm_at(depth, px, py)
+            if mm is None:
+                continue
+            samples += 1
+            d = mm / 1000.0
+            if (z - DEPTH_JOINT_TOL_NEAR_M) <= d <= (z + DEPTH_JOINT_TOL_FAR_M):
+                agree += 1
+        out["joint_samples"] = samples
+        out["joint_agree"] = agree
+        if samples < DEPTH_MIN_SAMPLES:
+            out["reason"] = "only %d valid depth samples on the skeleton" % samples
+            return out
+        frac = agree / float(samples)
+        out["agree_frac"] = round(frac, 3)
+
+        # Reference depth: the body's own distance when we have it, else the
+        # median of the projected joint depths.
+        z_ref = body.get("distance_m")
+        if not isinstance(z_ref, (int, float)) or z_ref <= 0:
+            zs = sorted(z for _px, _py, z in pts)
+            z_ref = zs[len(zs) // 2]
+        out["body_z_m"] = round(float(z_ref), 3)
+
+        if frac < DEPTH_AGREE_GHOST_FRAC:
+            out["verdict"] = "uncorroborated"
+            out["reason"] = ("depth agrees with only %d/%d tracked joints - no "
+                             "mass where the skeleton claims" % (agree, samples))
+            return out
+
+        # 2. surround
+        xs = [px for px, _py, _z in pts]
+        ys = [py for _px, py, _z in pts]
+        x0, x1 = min(xs), max(xs)
+        y0, y1 = min(ys), max(ys)
+        pad = max(8.0, 0.25 * max(x1 - x0, y1 - y0))
+        rx0, rx1 = x0 - pad, x1 + pad
+        ry0, ry1 = y0 - pad, y1 + pad
+        step = max(4.0, (rx1 - rx0 + ry1 - ry0) / 32.0)
+        ring = []
+        cx = rx0
+        while cx <= rx1:
+            ring.append((cx, ry0))
+            ring.append((cx, ry1))
+            cx += step
+        cy = ry0
+        while cy <= ry1:
+            ring.append((rx0, cy))
+            ring.append((rx1, cy))
+            cy += step
+        near_cut = float(z_ref) - DEPTH_SURROUND_MARGIN_M
+        s_total = 0
+        s_near = 0
+        for px, py in ring:
+            mm = _depth_mm_at(depth, px, py)
+            if mm is None:
+                continue
+            s_total += 1
+            if (mm / 1000.0) < near_cut:
+                s_near += 1
+        out["surround_samples"] = s_total
+        out["surround_nearer"] = s_near
+        if s_total < DEPTH_MIN_SAMPLES:
+            out["verdict"] = "real"
+            out["reason"] = ("corroborated (%d/%d joints); surround unreadable "
+                             "(%d valid samples)" % (agree, samples, s_total))
+            return out
+        nfrac = s_near / float(s_total)
+        out["surround_nearer_frac"] = round(nfrac, 3)
+        if nfrac >= DEPTH_SURROUND_SUSPECT_FRAC:
+            out["verdict"] = "suspect"
+            out["reason"] = ("%d/%d of the surrounding depth ring is NEARER than "
+                             "the body - framed by nearer geometry (mirror / "
+                             "screen / doorway aperture)" % (s_near, s_total))
+            return out
+        out["verdict"] = "real"
+        out["reason"] = ("corroborated (%d/%d joints) and occluding its "
+                         "surroundings (%d/%d ring nearer)"
+                         % (agree, samples, s_near, s_total))
+        return out
+    except Exception:   # pragma: no cover - defensive: malformed body / raster
+        out["reason"] = "depth corroboration failed"
+        return out
+
+
+def depth_check_bodies(bodies: Optional[list] = None) -> list[dict]:
+    """Convenience: grab ONE depth frame + ONE depth-space mapper and run
+    depth_corroborate() over `bodies` (default: the current get_bodies()).
+    Returns a list of ``{"id": ..., **report}`` dicts - empty when the sensor is
+    off, no body is tracked, or no depth frame is available. NEVER raises.
+
+    This is the sensor-touching wrapper; depth_corroborate() itself stays pure
+    so the heuristic is testable without hardware. Reading depth here does NOT
+    steal anything from the body pump: on this pykinect2 build
+    get_last_depth_frame() copies the current buffer and clears no flag."""
+    try:
+        if bodies is None:
+            bodies = get_bodies()
+        if not bodies:
+            return []
+        depth = get_depth()
+        if depth is None:
+            return []
+        mapper = get_depth_space_mapper()
+        if mapper is None:
+            return []
+        out = []
+        for b in bodies:
+            rep = depth_corroborate(b, depth, mapper)
+            rep["id"] = b.get("id")
+            out.append(rep)
+        return out
+    except Exception:   # pragma: no cover - defensive: accessors already swallow
+        return []
 
 
 def _nearest_body(bodies: list[dict]) -> Optional[dict]:
@@ -1614,6 +2184,8 @@ def reset_if_body_stale(now: Optional[float] = None) -> bool:
         # from the fresh instance on the next successful open).
         _color_time_seen[0] = 0.0
         _body_time_seen[0] = 0.0
+        _depth_time_seen[0] = 0.0
+        _last_depth_frame_at[0] = stamp
         print("  [kinect] body AND color streams stale > "
               f"{BODY_STALE_RESET_SEC:.0f}s - resetting runtime to reopen a live "
               "stream")

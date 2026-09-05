@@ -196,6 +196,20 @@ AIR_MOUSE_EMA_ALPHA = 0.55
 #   Raise back to 3 if any stray clicks appear; 2 is the snappy-but-safe floor.
 AIR_MOUSE_GRIP_DEBOUNCE_FRAMES = 2
 
+# ASYMMETRIC CLOSE debounce (2026-09-04 stray-click fix). The two grip edges are
+# NOT equally dangerous: a spurious RELEASE drops a drag (annoying, recoverable),
+# a spurious PRESS is a CLICK the owner never made — which is what closed his
+# Chrome tabs. So the two are debounced separately: opening keeps the snappy
+# 2-frame bar above, closing needs this many CONSECUTIVE frames. At 30 Hz, 4
+# frames ≈ 133 ms — still well under a deliberate grab, but past the length of the
+# correlated 2-3-frame misreads the Kinect hand classifier produces at range (its
+# errors are NOT independent frame to frame, which is exactly why a 2-frame bar was
+# nearly no protection). NB GripDebouncer._canon also maps "lasso" → closed, so a
+# half-curled/pointing hand votes to PRESS — another reason the press bar is the
+# one that must be strict. RAISE if stray clicks persist; LOWER toward 2 if a
+# deliberate click feels late.
+AIR_MOUSE_GRIP_CLOSE_FRAMES = 4
+
 # ─── HEIGHT-TO-ENGAGE gate (RAISE a hand ABOVE THE SHOULDER to drive the cursor) ─
 # THE PRIMARY GATE (the 2026-06-09 "forward-reach is broken for a desk user" fix):
 #   The forward-reach model was PROVEN unusable at a desk — the live log showed
@@ -409,6 +423,76 @@ AIR_MOUSE_ENGAGE_STILL_M = 0.06          # PASSIVE: max hand travel over the dwe
 AIR_MOUSE_FACING_MAX_DEG = 40.0          # PASSIVE: face the sensor within this
 AIR_MOUSE_ARM_RELAXES_GATE = True        # ARMED: relax to height-only + short hold
 AIR_MOUSE_ARM_ENGAGE_DEBOUNCE_SEC = 0.15  # ARMED: short engage hold (relaxed gate)
+
+# ─── PASSIVE ACQUIRE REACH CONJUNCT (2026-09-04 "it grabs the cursor while I sit
+#     still" fix) ───────────────────────────────────────────────────────────────
+# THE DEFECT: until now the PASSIVE gate had exactly ONE necessary condition —
+# hand HEIGHT above the shoulder line (lift_m > up-margin). Its other three tests
+# (OPEN palm, FACING the sensor, hand STILL) are each satisfied MORE easily by a
+# person sitting motionless in front of the TV than by a person deliberately
+# reaching: a relaxed hand reads "open", a seated owner faces the sensor, and
+# "still" is what sitting still IS. So every posture that parks a hand above the
+# neck-base — hand on the head, elbow on an armrest, arm along the back of the
+# couch, a stretch — cleared the whole gate. Measured over the 129,762 telemetry
+# lines in logs/session_*.log: 3,527 engaged samples with a MEDIAN lift of only
+# +0.08 m against the +0.07 bar (the gate lived on its own threshold), and 66 % of
+# them carried a resting-arm signature.
+#
+# THE TWO SIGNALS THAT DO SEPARATE A REACH FROM A REST were already computed — and
+# were both deliberately set to 0.0 ("permissive") above, so neither could engage
+# NOR veto:
+#   • forward reach  — a deliberate reach pushes the hand well in FRONT of the
+#     torso; a hand resting on the head/armrest sits at or behind the torso plane,
+#     and a stretch goes straight UP (forward ≈ 0).
+#   • arm straightness — shoulder→hand chord / arm length. INTRINSIC to the arm:
+#     invariant to torso lean, chair position and distance from the sensor (unlike
+#     forward reach, whose spine-z reference shifts when the owner leans back). A
+#     reach extends the elbow; a resting arm is folded.
+# Neither works ALONE — that is the whole lesson of the 2026-06-09 revert, where
+# forward reach as the SOLE gate could not tell a hand resting on the DESK
+# (~0.38 m) from a reach (~0.60 m). It is used differently here: as a CONJUNCT on
+# top of the height gate, which has ALREADY rejected the desk-resting hand (that
+# hand is at waist level, lift ≈ −0.40 m). Forward reach only has to separate
+# RAISED-and-resting from RAISED-and-reaching, which it does cleanly.
+#
+# APPLIED TO FRESH ACQUISITION ONLY (inside the PASSIVE pose test, which
+# engage_decision consults solely while disengaged) — never as a stay-engaged veto,
+# so control never stutters once taken, and never in ARMED mode, which stays
+# height-only-responsive because the owner explicitly asked for the cursor.
+#
+# BARS FITTED TO THE RECORDED TELEMETRY, not guessed. Over the 485 engage rising
+# edges in the log history, `forward >= 0.20 AND straightness >= 0.85` blocks
+# 78.4 % of them; the 105 survivors are a tight, obviously-deliberate cluster
+# (forward 0.27–0.58 m, straightness 0.87–1.00) that includes every confirmed
+# owner-driven engagement, e.g. the 2026-09-04 19:50:28 acquisition
+# (lift +0.22, reach 0.58, straight 0.98) — nearly 3× the forward bar.
+# RAISE either bar if a resting posture still takes the cursor; LOWER them if a
+# genuine reach fails to (0.0 disables that half of the conjunct entirely).
+# NB the forward half is gated on the BODY-RELATIVE reach RATIO
+# (forward_reach_m / shoulder width) whenever a body scale is measurable, exactly
+# like the legacy bars — an ABSOLUTE metre bar is NOT position-independent: the
+# same gesture on a body 40 % farther from the sensor measures 40 % less forward
+# reach (proven by tests.HeightGatePositionIndependenceTests, where a real reach at
+# scale 0.6 reads 0.18 m against a 0.20 m bar). The absolute bar below is the
+# FALLBACK used only when no shoulder span / torso height is measurable.
+# 0.50 is the 0.20 m bar expressed against a ~0.40 m adult shoulder span; it is the
+# ONE number here not read directly off the recorded telemetry (the log line
+# records absolute reach only, never the scale), so it is deliberately set at the
+# permissive end — nudge it up if a resting posture still takes the cursor.
+AIR_MOUSE_ENGAGE_REACH_RATIO = 0.50  # PASSIVE: forward reach ÷ body scale
+AIR_MOUSE_ENGAGE_REACH_M = 0.20      # PASSIVE: …absolute fallback (no body scale)
+AIR_MOUSE_ENGAGE_STRAIGHT = 0.85     # PASSIVE: …with the elbow this extended
+
+# ARMED auto-expiry. air_mouse_arm() used to latch the relaxed (height-only,
+# 0.15 s) gate ON for the REST OF THE SESSION — nothing ever cleared it but an
+# explicit "disarm", so one "take the cursor" left a permanent false-engagement
+# machine behind: from then on ANY hand above the shoulder for 150 ms re-grabbed
+# the cursor, with no open-palm / facing / stillness / reach test at all. The arm
+# is now a WINDOW: it expires this many seconds after the request, refreshed for
+# as long as the owner is actually driving the cursor, so "give me the cursor"
+# stays instantly responsive while he is using it and lapses back to the strict
+# PASSIVE gate once he stops. 0 disables the expiry (the old latch-forever).
+AIR_MOUSE_ARM_TIMEOUT_SEC = 120.0
 AIR_MOUSE_FIST_RELEASES = False          # OFF by default (fought click/drag — a
 #                                          normal close stopped tracking); close =
 #                                          click/drag, lower the hand to let go
@@ -430,12 +514,29 @@ AIR_MOUSE_DISABLED_APP_HINTS = [         # lower-case title/class substrings
 # by the live loop each tick. NB this is orthogonal to KINECT_AIR_MOUSE_ENABLED
 # (the master on/off) — disarming returns to passive, it does NOT disable.
 _air_mouse_armed = [False]
+# When the arm window was last refreshed (monotonic). Paired with
+# AIR_MOUSE_ARM_TIMEOUT_SEC so ARMED expires on idle instead of latching for the
+# whole session — see the constant's note.
+_air_mouse_armed_at = [0.0]
 
 
 def air_mouse_arm() -> None:
     """ARM the air-mouse: relax the PASSIVE gate to the responsive armed gate (the
-    owner explicitly asked for the cursor). Idempotent. NEVER raises."""
+    owner explicitly asked for the cursor). Starts/refreshes the arm WINDOW.
+    Idempotent. NEVER raises."""
     _air_mouse_armed[0] = True
+    air_mouse_arm_refresh()
+
+
+def air_mouse_arm_refresh() -> None:
+    """Restart the ARMED expiry countdown. Called by air_mouse_arm() and by the
+    controller on every frame it is actually driving the cursor in relaxed mode, so
+    the relaxed gate stays alive while in USE and lapses once the owner stops.
+    NEVER raises."""
+    try:
+        _air_mouse_armed_at[0] = time.monotonic()
+    except Exception:
+        pass
 
 
 def air_mouse_disarm() -> None:
@@ -445,8 +546,21 @@ def air_mouse_disarm() -> None:
 
 
 def air_mouse_is_armed() -> bool:
-    """True while the air-mouse is ARMED (relaxed gate). NEVER raises."""
-    return bool(_air_mouse_armed[0])
+    """True while the air-mouse is ARMED (relaxed gate) AND the arm window has not
+    expired. Expiry is evaluated HERE (lazily, on read) so there is no timer thread
+    and every caller — live loop, status action, tests — sees one truth. NEVER
+    raises; on any clock failure it keeps the flag as-is (fail-responsive, matching
+    the old behaviour) rather than silently disarming mid-use."""
+    if not _air_mouse_armed[0]:
+        return False
+    try:
+        timeout = _cfg_float("AIR_MOUSE_ARM_TIMEOUT_SEC", AIR_MOUSE_ARM_TIMEOUT_SEC)
+        if timeout > 0.0 and (time.monotonic() - _air_mouse_armed_at[0]) > timeout:
+            _air_mouse_armed[0] = False
+            return False
+    except Exception:
+        pass
+    return True
 
 
 # What the pure engage gate decides each frame.
@@ -473,13 +587,22 @@ class EngageVerdict:
 
 def _pose_ok_passive(*, lift_ok: bool, grip: "Optional[str]", facing_deg,
                      hand_still: bool, require_open_palm: bool,
-                     facing_max_deg: float) -> bool:
+                     facing_max_deg: float, reach_ok: bool = True) -> bool:
     """Does the PASSIVE smart pose hold THIS frame (before the dwell test)? All of:
-    the hand raised (lift_ok), an OPEN palm (when required — the DEBOUNCED stable
-    grip so a 1-frame flicker doesn't matter), FACING the sensor within
-    facing_max_deg (missing facing → treated as OK, never an un-passable gate), and
-    the hand held STILL. PURE; NEVER raises."""
+    the hand raised (lift_ok), REACHING (reach_ok — pushed forward with an extended
+    elbow; see AIR_MOUSE_ENGAGE_REACH_M), an OPEN palm (when required — the
+    DEBOUNCED stable grip so a 1-frame flicker doesn't matter), FACING the sensor
+    within facing_max_deg (missing facing → treated as OK, never an un-passable
+    gate), and the hand held STILL. PURE; NEVER raises.
+
+    reach_ok defaults True so a caller that doesn't measure the reach cue behaves
+    exactly as before; the live controller always supplies it. It is the ONE
+    condition here that a motionless seated owner does NOT satisfy — the other
+    three are all satisfied MORE easily by sitting still than by reaching, which is
+    why the gate could be cleared from the couch."""
     if not lift_ok:
+        return False
+    if not reach_ok:
         return False
     if require_open_palm and (grip or "").lower() != "open":
         return False
@@ -498,6 +621,7 @@ def _pose_ok_passive(*, lift_ok: bool, grip: "Optional[str]", facing_deg,
 
 def engage_decision(*, lift_ok: bool, currently_engaged: bool, armed: bool,
                     grip: "Optional[str]" = None, facing_deg=None,
+                    reach_ok: bool = True,
                     hand_still: bool = True, dwell_elapsed: float = 0.0,
                     arm_debounce_elapsed: float = 0.0,
                     require_open_palm: "Optional[bool]" = None,
@@ -514,6 +638,12 @@ def engage_decision(*, lift_ok: bool, currently_engaged: bool, armed: bool,
       lift_ok            — the HEIGHT gate already passed (hand raised above the
                            shoulder past the engage/stay-engage margin with the
                            existing hysteresis). This wraps the existing lift line.
+      reach_ok           — the PASSIVE REACH conjunct passed: the hand is pushed
+                           FORWARD of the torso with an EXTENDED elbow
+                           (AIR_MOUSE_ENGAGE_REACH_M / _STRAIGHT). PASSIVE
+                           acquisition only — never consulted while already
+                           engaged (no stutter) nor in the ARMED relaxed gate.
+                           Defaults True so an un-measuring caller is unchanged.
       currently_engaged  — was the air-mouse engaged last frame (staying engaged
                            only needs lift_ok — the pose/dwell are for ACQUIRING).
       armed              — the module ARMED flag (owner explicitly asked for the
@@ -576,7 +706,7 @@ def engage_decision(*, lift_ok: bool, currently_engaged: bool, armed: bool,
     pose_ok = _pose_ok_passive(
         lift_ok=lift_ok, grip=grip, facing_deg=facing_deg,
         hand_still=hand_still, require_open_palm=require_open_palm,
-        facing_max_deg=facing_max_deg)
+        facing_max_deg=facing_max_deg, reach_ok=reach_ok)
     if not pose_ok:
         return EngageVerdict(engaged=False, priming=False, prime=0.0)
     d = max(1e-6, float(dwell_sec))
@@ -805,14 +935,27 @@ class GripDebouncer:
         than spuriously releasing a drag. The dead-man (hand UNTRACKED) is what
         releases a held button, not a single ambiguous frame.
     Hysteresis falls out of the consecutive-frame requirement: a fist must be
-    seen `frames` times to latch CLOSED, and an open hand `frames` times to
-    latch OPEN, so neither flickers.
+    seen `close_frames` times to latch CLOSED, and an open hand `frames` times to
+    latch OPEN, so neither flickers. The two bars are DELIBERATELY ASYMMETRIC
+    (close_frames >= frames): a spurious PRESS is a click the owner never made, a
+    spurious RELEASE only drops a drag — see AIR_MOUSE_GRIP_CLOSE_FRAMES.
 
     `stable` starts at "open" so the first real close is a clean down-edge."""
 
     def __init__(self, frames: int = AIR_MOUSE_GRIP_DEBOUNCE_FRAMES,
-                 initial: str = "open"):
+                 initial: str = "open",
+                 close_frames: "Optional[int]" = None):
         self.frames = max(1, int(frames))
+        # ASYMMETRIC: latching CLOSED (a PRESS — the destructive edge) needs its own,
+        # stricter consecutive-frame bar; latching OPEN (a RELEASE) keeps `frames`.
+        # None → the live AIR_MOUSE_GRIP_CLOSE_FRAMES, floored at `frames` so a
+        # caller that pins a large `frames` never accidentally LOOSENS the press.
+        # None → SYMMETRIC (== frames), so every existing caller/test keeps the
+        # exact contract it had. The controller passes the live
+        # AIR_MOUSE_GRIP_CLOSE_FRAMES explicitly. Floored at `frames` so a caller
+        # that pins a large `frames` can never accidentally LOOSEN the press.
+        self.close_frames = (self.frames if close_frames is None
+                             else max(self.frames, int(close_frames)))
         self._stable = initial
         self._candidate: Optional[str] = None
         self._count = 0
@@ -862,7 +1005,10 @@ class GripDebouncer:
         else:
             self._candidate = vote
             self._count = 1
-        if self._count >= self.frames:
+        # The bar depends on WHICH WAY we are flipping: pressing (→ closed) is the
+        # strict one, releasing (→ open) stays snappy.
+        need = self.close_frames if vote == "closed" else self.frames
+        if self._count >= need:
             self._stable = vote
             self._candidate = None
             self._count = 0
@@ -1165,12 +1311,12 @@ class AirMouseController:
 
     def __init__(self, reach: ReachBox,
                  alpha: float = AIR_MOUSE_EMA_ALPHA,
-                 debounce_frames: int = AIR_MOUSE_GRIP_DEBOUNCE_FRAMES,
+                 debounce_frames: "Optional[int]" = None,
                  grace_sec: float = AIR_MOUSE_DISENGAGE_GRACE_SEC,
                  clock=time.monotonic,
                  switch_margin: float = HAND_SWITCH_MARGIN,
                  switch_frames: int = HAND_SWITCH_FRAMES,
-                 engage_debounce_frames: int = AIR_MOUSE_ENGAGE_DEBOUNCE_FRAMES,
+                 engage_debounce_frames: "Optional[int]" = None,
                  untracked_ceiling_sec: float = AIR_MOUSE_UNTRACKED_CEILING_SEC,
                  retrack_frames: int = AIR_MOUSE_RETRACK_FRAMES,
                  dwell_sec: "Optional[float]" = None,
@@ -1180,14 +1326,38 @@ class AirMouseController:
                  require_open_palm: "Optional[bool]" = None,
                  facing_max_deg: "Optional[float]" = None,
                  arm_relaxes_gate: "Optional[bool]" = None,
-                 fist_releases: "Optional[bool]" = None):
+                 fist_releases: "Optional[bool]" = None,
+                 engage_reach_m: "Optional[float]" = None,
+                 engage_reach_ratio: "Optional[float]" = None,
+                 engage_straight: "Optional[float]" = None,
+                 close_debounce_frames: "Optional[int]" = None):
         self.reach = reach
         self._ema_x = EMA(alpha)
         self._ema_y = EMA(alpha)
         # One debouncer + one button-down flag PER HAND so each hand drives its
         # own (left/right) mouse button independently.
-        self._grip_left = GripDebouncer(debounce_frames, initial="open")
-        self._grip_right = GripDebouncer(debounce_frames, initial="open")
+        # ASYMMETRIC press/release debounce (see AIR_MOUSE_GRIP_CLOSE_FRAMES):
+        # releasing uses `debounce_frames`, PRESSING the stricter close bar.
+        #
+        # PINNING RULE: a caller that explicitly pins `debounce_frames` is pinning
+        # the WHOLE grip contract (state-machine tests pass 1 precisely to take the
+        # debounce out of the picture), so the close bar follows it and the pair is
+        # SYMMETRIC. Only the default construction — which is what the live poller
+        # uses — picks up the asymmetric live bar. Either can be overridden outright
+        # with close_debounce_frames.
+        if close_debounce_frames is not None:
+            close_frames = int(close_debounce_frames)
+        elif debounce_frames is not None:
+            close_frames = int(debounce_frames)
+        else:
+            close_frames = int(_cfg_float("AIR_MOUSE_GRIP_CLOSE_FRAMES",
+                                          AIR_MOUSE_GRIP_CLOSE_FRAMES))
+        if debounce_frames is None:
+            debounce_frames = AIR_MOUSE_GRIP_DEBOUNCE_FRAMES
+        self._grip_left = GripDebouncer(debounce_frames, initial="open",
+                                        close_frames=close_frames)
+        self._grip_right = GripDebouncer(debounce_frames, initial="open",
+                                         close_frames=close_frames)
         self._left_down = False
         self._right_down = False
         # Engage gate state.
@@ -1199,7 +1369,15 @@ class AirMouseController:
         # ENGAGE DEBOUNCE (FIX 3): a raised hand must persist above the engage line
         # for this many CONSECUTIVE frames before the cursor is actually taken, so a
         # 1-frame Kinect height spike can't grab it. DISENGAGE stays instant.
-        self._engage_debounce_frames = max(1, int(engage_debounce_frames))
+        # PINNING RULE (mirrors the grip debounce above): the LEGACY frame-count
+        # engage policy applies ONLY when a caller explicitly pins it. The live
+        # poller constructs with defaults, so production is governed purely by the
+        # wall-clock dwell — see the frame-credit note in update(). A pinned value
+        # keeps the exact old frame semantics for the state-machine tests.
+        self._frame_credit_enabled = engage_debounce_frames is not None
+        self._engage_debounce_frames = max(
+            1, int(AIR_MOUSE_ENGAGE_DEBOUNCE_FRAMES
+                   if engage_debounce_frames is None else engage_debounce_frames))
         self._engage_streak = 0      # consecutive frames a hand has cleared the line
         # Controlling-hand HYSTERESIS (ISSUE 3): the challenger must out-reach the
         # holder by `switch_margin` for `switch_frames` consecutive frames before
@@ -1257,6 +1435,19 @@ class AirMouseController:
         self._fist_releases = (
             bool(fist_releases) if fist_releases is not None
             else bool(_cfg_flag("AIR_MOUSE_FIST_RELEASES", AIR_MOUSE_FIST_RELEASES)))
+        # PASSIVE ACQUIRE REACH CONJUNCT (see AIR_MOUSE_ENGAGE_REACH_M): the two
+        # bars that separate a deliberate reach from a raised-but-resting arm.
+        # 0.0 on either disables that half.
+        self._engage_reach_m = (
+            float(engage_reach_m) if engage_reach_m is not None
+            else _cfg_float("AIR_MOUSE_ENGAGE_REACH_M", AIR_MOUSE_ENGAGE_REACH_M))
+        self._engage_reach_ratio = (
+            float(engage_reach_ratio) if engage_reach_ratio is not None
+            else _cfg_float("AIR_MOUSE_ENGAGE_REACH_RATIO",
+                            AIR_MOUSE_ENGAGE_REACH_RATIO))
+        self._engage_straight = (
+            float(engage_straight) if engage_straight is not None
+            else _cfg_float("AIR_MOUSE_ENGAGE_STRAIGHT", AIR_MOUSE_ENGAGE_STRAIGHT))
         # Priming state (the smart-pose dwell). _pose_started_at is the clock() when
         # the CURRENT continuous valid pose began (None when no pose held); the dwell
         # elapsed = now - that. _prime is the last progress published (0..1).
@@ -1434,6 +1625,42 @@ class AirMouseController:
             setattr(self, down_attr, False)
             return "up"
         return None
+
+    def _reach_ok(self, arm) -> bool:
+        """The PASSIVE ACQUIRE REACH CONJUNCT for the candidate controlling arm: is
+        this a deliberate REACH (hand pushed FORWARD of the torso with an EXTENDED
+        elbow) rather than a raised-but-RESTING arm? See AIR_MOUSE_ENGAGE_REACH_M.
+
+        Consulted ONLY for fresh PASSIVE acquisition — never to hold or drop an
+        engagement (no stutter), never in ARMED mode.
+
+        FAILS OPEN on a missing cue (None forward/straightness), matching the house
+        rule that a tracking gap must never make the cursor un-takeable. That is
+        safe here because lift_m — which gated us this far — already carries the
+        strict both-joints-fully-Tracked floor from _local_arm_extension, so a frame
+        that reaches this test has a real hand and a real shoulder reference. PURE;
+        NEVER raises."""
+        try:
+            ratio = getattr(arm, "reach_ratio", None)
+            fwd = getattr(arm, "forward_m", None)
+            straight = getattr(arm, "straightness", None)
+            # FORWARD half — body-relative RATIO when the bridge could measure a
+            # body scale (position-independent), else the absolute metre fallback.
+            if self._engage_reach_ratio > 0.0 and ratio is not None:
+                if float(ratio) < self._engage_reach_ratio:
+                    return False
+            elif (self._engage_reach_m > 0.0 and fwd is not None
+                    and float(fwd) < self._engage_reach_m):
+                return False
+            # ELBOW half — straightness is a pure ratio of arm segment lengths, so
+            # it needs no scale and is immune to torso lean (unlike forward reach,
+            # whose spine-z reference moves when the owner sits back).
+            if (self._engage_straight > 0.0 and straight is not None
+                    and float(straight) < self._engage_straight):
+                return False
+            return True
+        except (TypeError, ValueError):
+            return True
 
     def _select_controlling_arm(self, left_ext, right_ext,
                                 thresholds: "Optional[dict]"):
@@ -1681,6 +1908,11 @@ class AirMouseController:
         #    DISENGAGED we measure the PASSIVE dwell + stillness (or the ARMED short
         #    hold) that engage_decision needs; once engaged, height alone holds it.
         relaxed = bool(armed and self._arm_relaxes_gate)
+        # PASSIVE ACQUIRE REACH CONJUNCT — measured once per frame for the arm the
+        # height gate selected. Only meaningful while acquiring passively; while
+        # engaged (or in ARMED relaxed mode) it is forced True so it can never
+        # interrupt control the owner already has.
+        reach_ok = (True if (self._engaged or relaxed) else self._reach_ok(arm))
         hand = arm.hand
         hand_xy = (float(hand[0]), float(hand[1]), float(hand[2])
                    if len(hand) > 2 else 0.0)
@@ -1736,18 +1968,40 @@ class AirMouseController:
             if _pose_ok_passive(lift_ok=True, grip=ctrl_stable,
                                 facing_deg=facing_deg, hand_still=hand_still,
                                 require_open_palm=self._require_open_palm,
-                                facing_max_deg=self._facing_max_deg):
+                                facing_max_deg=self._facing_max_deg,
+                                reach_ok=reach_ok):
                 self._engage_streak += 1
-                frame_credit = (self._dwell_sec
-                                * (self._engage_streak / self._engage_debounce_frames)
-                                if self._engage_debounce_frames > 0 else self._dwell_sec)
-                dwell_elapsed = max(dwell_elapsed, frame_credit)
+                # 2026-09-04 (THE DWELL WAS DECORATIVE): this frame-credit bridge
+                # took max(wall-clock dwell, dwell_sec * streak/debounce_frames), so
+                # at the live engage_debounce_frames=3 the credit reached the FULL
+                # dwell after 3 frames — ~100 ms at the 30 Hz poll rate, and less at
+                # any higher rate. AIR_MOUSE_ENGAGE_DWELL_SEC could be set to
+                # anything and the gate still fired in 3 frames: the wall clock
+                # never bound, so the "hold the pose" half of the smart-engage
+                # rewrite was never actually enforced in production.
+                # The bridge exists only for callers that pin engage_debounce_frames
+                # and drive the state machine frame-by-frame (the unit tests), so it
+                # now applies ONLY to them. The live poller pins nothing, so in
+                # PRODUCTION the measured wall-clock dwell is the sole authority and
+                # AIR_MOUSE_ENGAGE_DWELL_SEC finally means what it says. Nothing is
+                # lost: 0.30 s at the 30 Hz poll rate is ~9 CONSECUTIVE valid-pose
+                # frames (any invalid frame clears _pose_started_at), which is
+                # strictly stronger spike rejection than the 3-frame streak it
+                # replaces.
+                if self._frame_credit_enabled:
+                    frame_credit = (self._dwell_sec
+                                    * (self._engage_streak
+                                       / self._engage_debounce_frames)
+                                    if self._engage_debounce_frames > 0
+                                    else self._dwell_sec)
+                    dwell_elapsed = max(dwell_elapsed, frame_credit)
             else:
                 self._engage_streak = 0
 
         verdict = engage_decision(
             lift_ok=True, currently_engaged=self._engaged, armed=bool(armed),
-            grip=ctrl_stable, facing_deg=facing_deg, hand_still=hand_still,
+            grip=ctrl_stable, facing_deg=facing_deg, reach_ok=reach_ok,
+            hand_still=hand_still,
             dwell_elapsed=dwell_elapsed, arm_debounce_elapsed=arm_elapsed,
             require_open_palm=self._require_open_palm,
             facing_max_deg=self._facing_max_deg, dwell_sec=self._dwell_sec,
@@ -1814,6 +2068,13 @@ class AirMouseController:
         self._arm_pose_started_at = None
         self._hand = arm.side
         self._last_engaged_at = now
+        # ARM WINDOW REFRESH: while the owner is actually DRIVING the cursor in the
+        # relaxed (voice-armed) gate, keep the arm alive. It expires only after he
+        # stops using it (see AIR_MOUSE_ARM_TIMEOUT_SEC), so "give me the cursor"
+        # stays responsive for as long as he wants it and then lapses back to the
+        # strict PASSIVE gate instead of latching for the rest of the session.
+        if relaxed:
+            air_mouse_arm_refresh()
 
         # ── FIST-RELEASE (AIR_MOUSE_FIST_RELEASES): a SUSTAINED closed fist on the
         #    controlling hand while engaged is an explicit "let go" — force-disengage

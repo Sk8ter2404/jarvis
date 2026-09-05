@@ -3638,7 +3638,15 @@ class RefreshDevicesNonHeadsetSwitchTests(_MonolithSec2Base):
 #
 #  Deterministic: no real device is opened or enumerated anywhere below.
 # ───────────────────────────────────────────────────────────────────────────
-class FollowTheDefaultDeviceTests(_MonolithSec2Base):
+class _FollowTheDefaultFixtures:
+    """Stub fixtures shared by the follow-the-default test classes.
+
+    A MIXIN, not a base test class, deliberately: subclassing one TestCase from
+    another makes unittest re-collect and re-run every inherited test method
+    under the child's name, which is the same duplicate-coverage trap the
+    stale-duplicate rule warns about — the copies drift and one of them starts
+    passing for a reason nobody checks."""
+
     CORSAIR = "Headset Microphone (CORSAIR VOID ELITE Wireless Gaming Dongle)"
     SNOWBALL = "Microphone (Blue Snowball)"
     SPEAKERS = "Speakers (Realtek(R) Audio)"
@@ -3666,7 +3674,12 @@ class FollowTheDefaultDeviceTests(_MonolithSec2Base):
 
     def _sd(self, names, default_in, default_out):
         """sounddevice stub: a readable device list plus a Windows default
-        pair, which is the whole surface _default_device_identity touches."""
+        pair, which is the whole surface _default_device_identity touches.
+
+        Every row carries hostapi 0 and sd.default.hostapi is 0, because
+        _endpoint_device_identity (2026-08-21) restricts its endpoint→index
+        match to the DEFAULT HOST API — the same restriction that makes the
+        resolved index equal to what a re-enumeration would have produced."""
         devices = self._devices(names)
         sd = mock.Mock()
 
@@ -3680,10 +3693,12 @@ class FollowTheDefaultDeviceTests(_MonolithSec2Base):
         sd.check_input_settings.return_value = None
         sd.default = mock.Mock()
         sd.default.device = (default_in, default_out)
+        sd.default.hostapi = 0
         return sd
 
     def _refresh(self, sd, *, prefs_in=(), prefs_out=(), announced=None,
-                 endpoints=(None, None)):
+                 endpoints=(None, None), endpoint_names=None, printed=None,
+                 mic_live=False, tts_live=False, signature=None, force=True):
         """Drive one forced _refresh_devices pass against the stub.
 
         ``endpoints`` is the (render id, capture id) pair
@@ -3692,18 +3707,38 @@ class FollowTheDefaultDeviceTests(_MonolithSec2Base):
         assertion here depend on which speakers the owner happens to be using.
         The default (None, None) models a host with no MMDevice API at all —
         the conservative branch, where an index-only shift has no corroborating
-        evidence."""
+        evidence.
+
+        ``endpoint_names`` maps endpoint id → the Windows FRIENDLY NAME, i.e.
+        what _win_endpoint_friendly_name() reads out of the endpoint's property
+        store. It is patched for the same reason and defaults to EMPTY, which
+        models "the id cannot be resolved to a name" and therefore keeps every
+        pre-2026-08-21 test on the fallback path it was written against.
+
+        ``mic_live`` / ``tts_live`` raise the corresponding PortAudio owner
+        flag, which is how the deferral branches are reached. ``signature``, if
+        given, is what _devices_signature() returns (a stable value means "the
+        device list did not change", so no teardown is wanted); the default
+        None reproduces the old fixture, where a null signature forces the
+        reinit chain on every pass. ``printed`` collects the [audio] log lines.
+        """
         sink = announced.append if announced is not None else (lambda _m: None)
+        names = dict(endpoint_names or {})
+        log = printed if printed is not None else []
         with mock.patch.object(self.bc, "sd", sd), \
                 mock.patch.object(self.bc, "_win_default_endpoints",
                                   return_value=tuple(endpoints)), \
+                mock.patch.object(self.bc, "_win_endpoint_friendly_name",
+                                  side_effect=lambda eid: names.get(eid)), \
                 mock.patch.dict(self.bc.sys.modules, {}, clear=False), \
-                mock.patch.object(self.bc, "_record_speech_active", [False]), \
+                mock.patch.object(self.bc, "_record_speech_active",
+                                  [bool(mic_live)]), \
                 mock.patch.object(self.bc, "_pathb_mic_active", [False]), \
                 mock.patch.object(self.bc, "_ambient_stream_active", [False]), \
                 mock.patch.object(self.bc, "_diag_capture_active", [False]), \
                 mock.patch.object(self.bc, "_enroll_capture_active", [False]), \
-                mock.patch.object(self.bc, "_tts_playback_active", [False]), \
+                mock.patch.object(self.bc, "_tts_playback_active",
+                                  [bool(tts_live)]), \
                 mock.patch.object(self.bc, "MICROPHONE_INDEX", None), \
                 mock.patch.object(self.bc, "SPEAKER_INDEX", None), \
                 mock.patch.object(self.bc, "PREFERRED_INPUT_DEVICES",
@@ -3711,25 +3746,37 @@ class FollowTheDefaultDeviceTests(_MonolithSec2Base):
                 mock.patch.object(self.bc, "PREFERRED_OUTPUT_DEVICES",
                                   list(prefs_out)), \
                 mock.patch.object(self.bc, "_devices_signature",
-                                  return_value=None), \
+                                  return_value=signature), \
                 mock.patch.object(self.bc, "_enqueue_device_announcement",
                                   side_effect=sink), \
-                mock.patch("builtins.print"):
+                mock.patch("builtins.print",
+                           side_effect=lambda *a, **k: log.append(
+                               " ".join(str(x) for x in a))):
             self.bc.sys.modules.pop("skill_wake_listener", None)
             self.bc._device_cache["checked_at"] = 0.0
-            self.bc._refresh_devices(force=True)
+            self.bc._refresh_devices(force=force)
+        return log
 
-    def _boot(self):
-        """Neutral starting state: nothing tracked yet (boot)."""
+    def _boot(self, *, signature=None, reenum_at=0.0):
+        """Neutral starting state: nothing tracked yet (boot).
+
+        ``signature``/``reenum_at`` let a test start from a SETTLED session
+        instead (enumeration already current, hotplug sweep freshly armed) —
+        the state JARVIS is actually in when the owner presses his Stream
+        Deck, and the only state in which "was a teardown avoided?" is a
+        meaningful question."""
+        self.bc._pa_defer_logged[0] = None
         self.bc._device_cache.update({
             "in": None, "out": None, "checked_at": 0.0,
             "last_in_name": None, "last_out_name": None,
             "last_in_index": None, "last_out_index": None,
             "last_in_endpoint": None, "last_out_endpoint": None,
             "last_default_endpoints": None,
-            "last_devices_signature": None, "last_reenum_at": 0.0,
+            "last_devices_signature": signature, "last_reenum_at": reenum_at,
         })
 
+
+class FollowTheDefaultDeviceTests(_FollowTheDefaultFixtures, _MonolithSec2Base):
     # ── _default_device_identity: total, and never pins anything ──────────
     def test_default_identity_reads_current_default(self):
         sd = self._sd([self.CORSAIR, self.SNOWBALL, self.SPEAKERS],
@@ -3765,14 +3812,15 @@ class FollowTheDefaultDeviceTests(_MonolithSec2Base):
                              (7, ""))
 
     # ── the outage: an empty list follows, a pinned list does not ─────────
-    def test_empty_preferences_follow_the_default_and_never_pin(self):
+    def test_empty_preferences_follow_the_default_without_mmdevice(self):
+        # NO endpoint names available (no MMDevice API, or an id that resolves
+        # to nothing): the index falls back to None so the open is left to
+        # sounddevice's own default. This was the WHOLE contract until
+        # 2026-08-21; it is now the FALLBACK, kept for hosts without pycaw.
         self._boot()
         sd = self._sd([self.CORSAIR, self.SNOWBALL, self.SPEAKERS],
                       default_in=1, default_out=2)
         self._refresh(sd)
-        # THE contract: the cache stays None so every open re-resolves the
-        # CURRENT default. A resolved index here would freeze JARVIS on
-        # today's default and stop following the Stream Deck.
         self.assertIsNone(self.bc._device_cache["in"])
         self.assertIsNone(self.bc._device_cache["out"])
         # …but the default's identity IS tracked, so a later switch is visible.
@@ -3780,6 +3828,50 @@ class FollowTheDefaultDeviceTests(_MonolithSec2Base):
         self.assertEqual(self.bc._device_cache["last_in_name"], self.SNOWBALL)
         self.assertEqual(self.bc._device_cache["last_out_index"], 2)
         self.assertEqual(self.bc._device_cache["last_out_name"], self.SPEAKERS)
+
+    def test_empty_preferences_resolve_the_live_default_to_an_index(self):
+        # WITH the MMDevice API the live default endpoint is resolved to a row
+        # in the CURRENT enumeration and that index is what gets opened.
+        #
+        # WHY THIS REPLACED "the cache must stay None" (2026-08-21). That rule
+        # rested on "None means every open re-resolves the current default".
+        # It does not: sounddevice maps device=None to
+        # Pa_GetDefaultInput/OutputDevice, a struct field each host API fills
+        # in ONCE inside Pa_Initialize — frozen until sd._terminate(). So None
+        # followed the default JARVIS BOOTED ON. Proved live in
+        # logs/session_2026-08-21_00-00-51.log: the owner moved his default to
+        # the CORSAIR headset and JARVIS stayed on the Realtek for the whole
+        # session while printing 34 deferral lines.
+        self._boot()
+        sd = self._sd([self.CORSAIR, self.SNOWBALL, self.SPEAKERS],
+                      default_in=1, default_out=2)
+        self._refresh(sd, endpoints=("{ep-spk}", "{ep-snow}"),
+                      endpoint_names={"{ep-snow}": self.SNOWBALL,
+                                      "{ep-spk}": self.SPEAKERS})
+        self.assertEqual(self.bc._device_cache["in"], 1)
+        self.assertEqual(self.bc._device_cache["out"], 2)
+
+    def test_resolved_index_is_not_a_pin_it_tracks_the_live_default(self):
+        # The index is a RESULT of the live endpoint read, recomputed every
+        # pass — so moving the default moves the index, and moving it back
+        # moves it back. That is the property "never pin" was protecting.
+        names = [self.CORSAIR, self.SNOWBALL, self.SPEAKERS, self.HEADPHONES]
+        eps = {"{ep-corsair}": self.CORSAIR, "{ep-snow}": self.SNOWBALL,
+               "{ep-spk}": self.SPEAKERS, "{ep-phones}": self.HEADPHONES}
+        self._boot()
+        sd = self._sd(names, default_in=1, default_out=2)
+        self._refresh(sd, endpoints=("{ep-spk}", "{ep-snow}"),
+                      endpoint_names=eps)
+        self.assertEqual((self.bc._device_cache["in"],
+                          self.bc._device_cache["out"]), (1, 2))
+        self._refresh(sd, endpoints=("{ep-phones}", "{ep-corsair}"),
+                      endpoint_names=eps)
+        self.assertEqual((self.bc._device_cache["in"],
+                          self.bc._device_cache["out"]), (0, 3))
+        self._refresh(sd, endpoints=("{ep-spk}", "{ep-snow}"),
+                      endpoint_names=eps)
+        self.assertEqual((self.bc._device_cache["in"],
+                          self.bc._device_cache["out"]), (1, 2))
 
     def test_preferred_name_list_pins_the_dead_headset(self):
         # Regression for the 90-minute deafness: the powered-off CORSAIR still
@@ -3819,7 +3911,9 @@ class FollowTheDefaultDeviceTests(_MonolithSec2Base):
         self.assertEqual(len(announced), 1, announced)
         self.assertEqual(announced[0], "Switched to your headset, sir.")
         self.assertEqual(self.bc._device_cache["last_in_index"], 0)
-        # …and JARVIS is STILL following, not pinned.
+        # …and with no resolvable endpoint NAME here, this direction stays on
+        # the device=None fallback (see
+        # test_empty_preferences_follow_the_default_without_mmdevice).
         self.assertIsNone(self.bc._device_cache["in"])
 
     def test_output_default_change_is_announced(self):
@@ -3833,6 +3927,7 @@ class FollowTheDefaultDeviceTests(_MonolithSec2Base):
         self.assertEqual(len(announced), 1, announced)
         self.assertEqual(announced[0], "Switched to your headset, sir.")
         self.assertEqual(self.bc._device_cache["last_out_index"], 2)
+        # Same: no endpoint name is supplied, so the fallback applies.
         self.assertIsNone(self.bc._device_cache["out"])
 
     def test_switch_to_snowball_names_the_device(self):
@@ -4005,6 +4100,290 @@ class FollowTheDefaultDeviceTests(_MonolithSec2Base):
         for _ in range(3):
             self._refresh(self._sd(names, 1, 2), announced=announced)
         self.assertEqual(len(announced), 1, announced)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+#  FOLLOW-THE-DEFAULT, SECOND PASS — the two defects the FIRST LIVE BOOT of
+#  the 2026-08-20 work exposed (logs/session_2026-08-21_00-00-51.log).
+#
+#  DEFECT 1 — THE FEATURE NEVER RAN. The trigger suppressed itself whenever a
+#    PortAudio stream owner was live (`and not _owners_busy`), on the theory
+#    that firing it into a guaranteed deferral was pure churn. But
+#    record_speech re-opens the mic continuously, so an owner is live
+#    essentially always on an awake session: in 15 minutes the trigger never
+#    asserted once, the endpoint baseline was never rebased (it rebased only
+#    after a successful re-enumeration), and a Stream Deck press after boot was
+#    never followed. The root error was equating "follow the default" with
+#    "re-enumerate": a press moves the default between endpoints PortAudio
+#    ALREADY has rows for, so the new device's INDEX — not a teardown — is what
+#    is actually needed.
+#
+#  DEFECT 2 — THE DEFERRAL LOGGED PER CYCLE. 34 "device drift detected …"
+#    lines in 15 minutes, none of which described a real deferral: the owner
+#    checks were evaluated BEFORE the "is a teardown even wanted?" check, so
+#    every cache-cleared re-pick pass that happened to coincide with a live mic
+#    printed one. A repeating condition is a STATE and must log its
+#    transitions, not its cycles.
+#
+#  Deterministic: no real device, no real MMDevice API, no real PortAudio.
+# ───────────────────────────────────────────────────────────────────────────
+class FollowTheDefaultWhileStreamsAreLiveTests(_FollowTheDefaultFixtures,
+                                               _MonolithSec2Base):
+    EPS = {"{ep-snow}": _FollowTheDefaultFixtures.SNOWBALL,
+           "{ep-spk}": _FollowTheDefaultFixtures.SPEAKERS,
+           "{ep-corsair}": _FollowTheDefaultFixtures.CORSAIR,
+           "{ep-phones}": _FollowTheDefaultFixtures.HEADPHONES}
+    NAMES = [_FollowTheDefaultFixtures.CORSAIR,
+             _FollowTheDefaultFixtures.SNOWBALL,
+             _FollowTheDefaultFixtures.SPEAKERS,
+             _FollowTheDefaultFixtures.HEADPHONES]
+    SIG = ("stable-device-list",)
+
+    def _settled(self, sd, eps=("{ep-spk}", "{ep-snow}"), **kw):
+        """Settle into a session already tracking `eps`, with the enumeration
+        current and the 300 s hotplug sweep freshly armed — so any teardown
+        that happens afterwards can only have been caused by the default move
+        under test."""
+        self._boot(signature=self.SIG, reenum_at=time.time())
+        self._refresh(sd, endpoints=eps, endpoint_names=self.EPS,
+                      signature=self.SIG, force=False, **kw)
+
+    # ── DEFECT 1 ─────────────────────────────────────────────────────────
+    def test_default_move_is_adopted_while_the_mic_is_live(self):
+        sd = self._sd(self.NAMES, default_in=1, default_out=2)
+        self._settled(sd)
+        self.assertEqual((self.bc._device_cache["in"],
+                          self.bc._device_cache["out"]), (1, 2))
+        sd._terminate.reset_mock()
+        sd._initialize.reset_mock()
+        announced = []
+        # THE PRESS, with record_speech holding the mic — the exact condition
+        # that made the shipped version do nothing at all.
+        self._refresh(sd, endpoints=("{ep-phones}", "{ep-corsair}"),
+                      endpoint_names=self.EPS, signature=self.SIG,
+                      force=False, mic_live=True, announced=announced)
+        self.assertEqual(self.bc._device_cache["in"], 0,
+                         "the new default MIC must be adopted")
+        self.assertEqual(self.bc._device_cache["out"], 3,
+                         "the new default SPEAKERS must be adopted")
+        sd._terminate.assert_not_called()
+        sd._initialize.assert_not_called()
+        self.assertEqual(announced, ["Switched to your headset, sir."] * 2)
+
+    def test_adopted_move_rebases_the_baseline_so_it_cannot_re_fire(self):
+        # The shipped version rebased ONLY after a successful re-enumeration,
+        # which is why an un-runnable teardown turned into an endless retry.
+        sd = self._sd(self.NAMES, default_in=1, default_out=2)
+        self._settled(sd)
+        moved = ("{ep-phones}", "{ep-corsair}")
+        log = []
+        for _ in range(12):
+            self._refresh(sd, endpoints=moved, endpoint_names=self.EPS,
+                          signature=self.SIG, force=False, mic_live=True,
+                          printed=log)
+        self.assertEqual(self.bc._device_cache["last_default_endpoints"],
+                         moved)
+        hits = [ln for ln in log if "default audio endpoint moved" in ln]
+        self.assertEqual(len(hits), 1,
+                         f"one move, one line — got {len(hits)}: {hits}")
+
+    def test_move_to_an_unenumerated_device_still_escalates_to_a_reinit(self):
+        # The teardown is still the right answer for TRUE hotplug: a default
+        # that points at a device PortAudio has no row for cannot be opened
+        # from the frozen list, so the destructive path must still be taken.
+        sd = self._sd(self.NAMES, default_in=1, default_out=2)
+        self._settled(sd)
+        sd._terminate.reset_mock()
+        log = []
+        self._refresh(sd, endpoints=("{ep-spk}", "{ep-ghost}"),
+                      endpoint_names=dict(self.EPS,
+                                          **{"{ep-ghost}": "Microphone (Just Plugged In)"}),
+                      signature=self.SIG, force=False, printed=log)
+        sd._terminate.assert_called_once()
+        self.assertTrue(any("not in PortAudio's current enumeration" in ln
+                            for ln in log), log)
+
+    def test_ambiguous_truncated_name_refuses_to_guess(self):
+        # Two endpoints sharing an MME-truncated 31-character name is a real
+        # configuration here (defect D1). Opening the WRONG mic is strictly
+        # worse than staying on the stale-but-known one, so ambiguity resolves
+        # to "unresolved" and the fallback applies.
+        dup31 = "Microphone (USB Audio Device XY"      # exactly 31 chars
+        self.assertEqual(len(dup31), 31)
+        full = "Microphone (USB Audio Device XYZ Rev B)"
+        sd = self._sd([dup31, dup31, self.SPEAKERS], default_in=0, default_out=2)
+        self._boot()
+        self._refresh(sd, endpoints=("{ep-spk}", "{ep-dup}"),
+                      endpoint_names={"{ep-spk}": self.SPEAKERS,
+                                      "{ep-dup}": full},
+                      signature=self.SIG, force=False)
+        self.assertIsNone(self.bc._device_cache["in"],
+                          "an ambiguous match must NOT pick a device")
+        self.assertEqual(self.bc._device_cache["out"], 2,
+                         "the unambiguous direction still resolves")
+
+    def test_truncated_name_matches_its_untruncated_endpoint(self):
+        # The complement: ONE 31-character row that prefixes the friendly name
+        # is the MME truncation of it, and must match.
+        trunc = "Headset Earphone (CORSAIR VOID "     # exactly 31 chars
+        self.assertEqual(len(trunc), 31)
+        full = "Headset Earphone (CORSAIR VOID ELITE Wireless Gaming Headset)"
+        sd = self._sd([self.SNOWBALL, trunc], default_in=0, default_out=1)
+        self._boot()
+        self._refresh(sd, endpoints=("{ep-void}", "{ep-snow}"),
+                      endpoint_names={"{ep-void}": full,
+                                      "{ep-snow}": self.SNOWBALL},
+                      signature=self.SIG, force=False)
+        self.assertEqual(self.bc._device_cache["out"], 1)
+
+    def test_resolution_is_restricted_to_the_default_host_api(self):
+        # Every endpoint enumerates once per host API (MME / DirectSound /
+        # WASAPI / WDM-KS). Only the DEFAULT host API's row is the one
+        # device=None would have resolved to after a reinit, so only that row
+        # may be picked — otherwise the duplicates read as ambiguity and the
+        # feature would never resolve anything on a real machine.
+        sd = self._sd([self.SNOWBALL, self.SPEAKERS, self.SPEAKERS],
+                      default_in=0, default_out=1)
+        devices = sd.query_devices(None)
+        devices[2]["hostapi"] = 2           # the WASAPI twin of index 1
+        sd.query_devices.side_effect = lambda idx=None, **kw: (
+            list(devices) if idx is None else devices[idx])
+        self._boot()
+        self._refresh(sd, endpoints=("{ep-spk}", "{ep-snow}"),
+                      endpoint_names={"{ep-spk}": self.SPEAKERS,
+                                      "{ep-snow}": self.SNOWBALL},
+                      signature=self.SIG, force=False)
+        self.assertEqual(self.bc._device_cache["out"], 1,
+                         "the default-host-API row wins; the twin is ignored")
+
+    # ── DEFECT 2 ─────────────────────────────────────────────────────────
+    def test_a_persistent_deferral_logs_once_not_every_cycle(self):
+        sd = self._sd(self.NAMES, default_in=1, default_out=2)
+        self._settled(sd)
+        log = []
+        # A teardown that IS wanted (the 300 s hotplug sweep is due) and CANNOT
+        # run (the mic is live) — held for 40 consecutive passes, which is
+        # ~5 minutes of the live cadence.
+        self.bc._device_cache["last_reenum_at"] = 0.0
+        for _ in range(40):
+            self._refresh(sd, endpoints=("{ep-spk}", "{ep-snow}"),
+                          endpoint_names=self.EPS, signature=self.SIG,
+                          force=False, mic_live=True, printed=log)
+        deny = [ln for ln in log if "mid-capture" in ln]
+        self.assertEqual(len(deny), 1,
+                         f"one state, one line — got {len(deny)}")
+        sd._terminate.assert_not_called()
+        # The owner releases the mic: exactly one closing line, and the
+        # teardown that was being held off finally runs.
+        log2 = []
+        self._refresh(sd, endpoints=("{ep-spk}", "{ep-snow}"),
+                      endpoint_names=self.EPS, signature=self.SIG,
+                      force=False, printed=log2)
+        self.assertEqual(len([ln for ln in log2 if "no longer deferred" in ln]),
+                         1, log2)
+        sd._terminate.assert_called_once()
+
+    def test_a_repick_pass_with_a_live_mic_prints_no_deny_line(self):
+        # THE 34 LINES. None of them was a real deferral: the pass wanted no
+        # teardown at all (unchanged signature, cache-cleared re-pick), it just
+        # happened to coincide with a live mic. Asking "is a teardown wanted?"
+        # first is what removes them.
+        sd = self._sd(self.NAMES, default_in=1, default_out=2)
+        self._settled(sd)
+        log = []
+        for _ in range(25):
+            # An invalidating call site cleared the cache — a re-pick REQUEST,
+            # not drift. record_speech is live throughout, as it is live.
+            self.bc._device_cache["in"] = None
+            self._refresh(sd, endpoints=("{ep-spk}", "{ep-snow}"),
+                          endpoint_names=self.EPS, signature=self.SIG,
+                          force=False, mic_live=True, printed=log)
+        self.assertEqual([ln for ln in log if "device drift detected" in ln],
+                         [], "no drift happened, so no drift may be reported")
+        self.assertEqual(self.bc._device_cache["in"], 1,
+                         "…and the re-pick it asked for still happened")
+        sd._terminate.assert_not_called()
+
+    def test_deferral_reason_change_is_a_transition_and_does_log(self):
+        # mic → TTS is different information about why JARVIS is not following
+        # the device yet, so it prints; a repeat of the same reason does not.
+        sd = self._sd(self.NAMES, default_in=1, default_out=2)
+        self._settled(sd)
+        self.bc._device_cache["last_reenum_at"] = 0.0
+        log = []
+        kw = dict(endpoints=("{ep-spk}", "{ep-snow}"), endpoint_names=self.EPS,
+                  signature=self.SIG, force=False, printed=log)
+        self._refresh(sd, mic_live=True, **kw)
+        self._refresh(sd, mic_live=True, **kw)
+        self._refresh(sd, tts_live=True, **kw)
+        self._refresh(sd, tts_live=True, **kw)
+        self.assertEqual(len([ln for ln in log if "mid-capture" in ln]), 1, log)
+        self.assertEqual(len([ln for ln in log if "TTS playback is" in ln]), 1,
+                         log)
+
+    def test_log_reinit_deferral_is_total_and_transition_only(self):
+        # The helper itself: same reason is silent, a change prints, clearing
+        # prints once, clearing twice is silent, and nothing it does can raise
+        # into the device loop.
+        self.bc._pa_defer_logged[0] = None
+        with mock.patch("builtins.print") as p:
+            self.bc._log_reinit_deferral("mic", "  [audio] first")
+            self.bc._log_reinit_deferral("mic", "  [audio] first")
+            self.bc._log_reinit_deferral("mic", "  [audio] first")
+        self.assertEqual(p.call_count, 1)
+        with mock.patch("builtins.print") as p:
+            self.bc._log_reinit_deferral(None)
+            self.bc._log_reinit_deferral(None)
+        self.assertEqual(p.call_count, 1)
+        self.assertIn("no longer deferred", p.call_args[0][0])
+        with mock.patch("builtins.print", side_effect=RuntimeError("boom")):
+            self.bc._log_reinit_deferral("tts", "  [audio] x")   # must not raise
+
+    # ── the helper, in isolation ─────────────────────────────────────────
+    def test_endpoint_device_identity_is_total(self):
+        sd = self._sd([self.SNOWBALL, self.SPEAKERS], 0, 1)
+        with mock.patch.object(self.bc, "sd", sd), \
+                mock.patch.object(self.bc, "_win_endpoint_friendly_name",
+                                  return_value=None):
+            self.assertEqual(
+                self.bc._endpoint_device_identity("{ep}", want_input=True),
+                (None, ""), "an unreadable friendly name is not a crash")
+            self.assertEqual(
+                self.bc._endpoint_device_identity(None, want_input=True),
+                (None, ""))
+        # sd.query_devices exploding, and a non-integer host api, both degrade.
+        broken = mock.Mock()
+        broken.query_devices.side_effect = RuntimeError("portaudio down")
+        broken.default.hostapi = 0
+        with mock.patch.object(self.bc, "sd", broken), \
+                mock.patch.object(self.bc, "_win_endpoint_friendly_name",
+                                  return_value=self.SNOWBALL):
+            self.assertEqual(
+                self.bc._endpoint_device_identity("{ep}", want_input=True),
+                (None, ""))
+        nohost = self._sd([self.SNOWBALL], 0, 0)
+        nohost.default.hostapi = None
+        with mock.patch.object(self.bc, "sd", nohost), \
+                mock.patch.object(self.bc, "_win_endpoint_friendly_name",
+                                  return_value=self.SNOWBALL):
+            self.assertEqual(
+                self.bc._endpoint_device_identity("{ep}", want_input=True),
+                (None, ""))
+
+    def test_unresolvable_name_is_forgotten_so_a_rename_self_heals(self):
+        # A cached friendly name that no longer matches anything must be
+        # dropped, or a renamed device would need a restart — the stale-
+        # duplicate rule applied to a cache.
+        self.bc._win_endpoint_names.clear()
+        self.bc._win_endpoint_names["{ep}"] = "Microphone (Old Name)"
+        sd = self._sd([self.SNOWBALL, self.SPEAKERS], 0, 1)
+        with mock.patch.object(self.bc, "sd", sd), \
+                mock.patch.object(self.bc, "_win_endpoint_enumerator",
+                                  return_value=None):
+            self.assertEqual(
+                self.bc._endpoint_device_identity("{ep}", want_input=True),
+                (None, ""))
+        self.assertNotIn("{ep}", self.bc._win_endpoint_names)
 
 
 class FriendlyDeviceNameSpokenAliasTests(_MonolithSec2Base):

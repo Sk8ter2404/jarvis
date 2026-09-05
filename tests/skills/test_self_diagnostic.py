@@ -2520,6 +2520,18 @@ class SkillImportsProbeTests(_ProbeTestBase):
         self._write_skill("cached_skill.py", "def f(:\n")  # would fail to compile
         sys.modules["skill_cached_skill"] = types.ModuleType("skill_cached_skill")
         self.addCleanup(lambda: sys.modules.pop("skill_cached_skill", None))
+        # ORDER-INDEPENDENCE (2026-09-04): this test PINS the bc-unavailable
+        # branch, so it must establish that precondition rather than inherit it.
+        # unittest discovery is alphabetical, so the set of modules that ran
+        # before this one changes whenever a test file is added — and any of
+        # them importing the monolith leaves a live sys.modules entry here,
+        # making _bc() return it and silently skipping the branch under test.
+        # That is what happened when tests/skills/test_game_mode*.py landed.
+        # Safe to pop: _bc() is a bare sys.modules.get with no import fallback,
+        # so nothing here can trigger a real (device-touching) monolith import.
+        _real_bc = sys.modules.pop("bobert_companion", None)
+        if _real_bc is not None:
+            self.addCleanup(sys.modules.__setitem__, "bobert_companion", _real_bc)
         self.assertIsNone(self.mod._bc())   # pin: this is the fallback path
         r = self.mod._probe_skill_imports()
         self.assertTrue(r["ok"])

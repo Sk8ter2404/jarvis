@@ -185,26 +185,31 @@ class WiringTests(DiscoveryArmTests):
     """Reuses the discovery harness (temp fixture pkg) to assert the runner's
     verbosity wiring and the ``sys.path`` bootstrap branch."""
 
-    def test_verbose_flag_sets_verbosity_2(self):
+    def _runner_kwargs(self, argv):
+        """The kwargs main() builds its TextTestRunner with."""
         self._write("test_v.py", _PASS_SRC)
         with mock.patch.object(RT.unittest, "TextTestRunner",
                                wraps=RT.unittest.TextTestRunner) as runner:
-            self._run(["-v"])
-        runner.assert_called_once_with(verbosity=2)
+            self._run(argv)
+        runner.assert_called_once()
+        return runner.call_args.kwargs
+
+    def test_verbose_flag_sets_verbosity_2(self):
+        self.assertEqual(self._runner_kwargs(["-v"])["verbosity"], 2)
 
     def test_long_verbose_flag(self):
-        self._write("test_v.py", _PASS_SRC)
-        with mock.patch.object(RT.unittest, "TextTestRunner",
-                               wraps=RT.unittest.TextTestRunner) as runner:
-            self._run(["--verbose"])
-        runner.assert_called_once_with(verbosity=2)
+        self.assertEqual(self._runner_kwargs(["--verbose"])["verbosity"], 2)
 
     def test_default_verbosity_1(self):
-        self._write("test_v.py", _PASS_SRC)
-        with mock.patch.object(RT.unittest, "TextTestRunner",
-                               wraps=RT.unittest.TextTestRunner) as runner:
-            self._run([])
-        runner.assert_called_once_with(verbosity=1)
+        self.assertEqual(self._runner_kwargs([])["verbosity"], 1)
+
+    def test_the_runner_reports_through_the_time_watchdog(self):
+        """tools/test_watchdog.py bounds how long the run may STALL, but only
+        the result class makes the report name a TEST — without it a hang is
+        still just 'somewhere in the suite' (the 2026-09-04 exit-124)."""
+        from tools.test_watchdog import WatchdogTextTestResult
+        self.assertIs(self._runner_kwargs([])["resultclass"],
+                      WatchdogTextTestResult)
 
     def test_inserts_project_root_when_absent(self):
         self._write("test_p.py", _PASS_SRC)

@@ -474,6 +474,36 @@ def _background_loop() -> None:
             _loop_consecutive[0] = 0
             continue
 
+        # SILENCE GATE (2026-09-04, TRACK 3 profile). A buffer below MIN_RMS
+        # cannot be music — MIN_RMS is this module's OWN "too quiet to
+        # classify" floor (see _classify_chunk), so running whisper-tiny and
+        # librosa over it is pure waste. Measured on this box, one silent
+        # iteration costs 1.25 CPU-s (whisper-tiny/int8 over a 3 s buffer,
+        # ctranslate2 fanned across the cores) + 0.52 CPU-s (librosa
+        # onset_strength) = 1.77 CPU-s, and the loop fires every ~8.5 s all
+        # day: ~0.21 of a core burned continuously with the room silent.
+        #
+        # It is also a CORRECTNESS fix. whisper-tiny HALLUCINATES on silence
+        # (measured: a 3 s pure-noise buffer transcribed as " You", and the
+        # live log shows the main path rejecting the same hallucination), and
+        # when the hallucination is a [Music]/(Music)/♪ marker
+        # _looks_like_lyrics() returns True IMMEDIATELY — a step toward
+        # auto-standby from an empty room. Skipping silence removes that path.
+        #
+        # Behaviour on a silent window is otherwise unchanged: a real
+        # transcribe of silence scores rhyme≈0, so _looks_like_lyrics() would
+        # return False and the else-branch below would zero the counter — which
+        # is exactly what this does.
+        try:
+            _a = audio if audio.ndim == 1 else audio.mean(axis=1)
+            _rms = float(np.sqrt(np.mean(_a.astype(np.float32) ** 2)))
+        except Exception:
+            _rms = float("inf")     # unreadable → do NOT skip; behave as before
+        if _rms < MIN_RMS:
+            _loop_consecutive[0] = 0
+            audio = None
+            continue
+
         try:
             text  = _transcribe_buffer(audio, sample_rate)
             onset = _onset_energy(audio, sample_rate)

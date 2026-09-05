@@ -390,6 +390,44 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "ambient learning", "listen and learn", "go quiet", "keep learning",
         "stay talkative", "answer then go quiet",
     ],
+    # ── Sections added 2026-09-04 with the reachability work. Documenting an
+    # action in core/prompts.py is only HALF of making it reachable: a section
+    # the router never selects reaches the model as a name in the capability
+    # INDEX and nothing else, so the model sees that the capability exists but
+    # never its instructions or trigger phrases. tests/test_prompt_router.py
+    # fails when a recognised section has no routing, which is what caught
+    # these — keep that test green rather than adding a section here silently.
+    "EVENING / DAILY BRIEFING": [
+        "evening briefing", "daily briefing", "brief me", "end of day",
+        "before bed", "tomorrow", "what's tomorrow", "run the briefing",
+        "night briefing", "recap",
+    ],
+    "MEMORY MAINTENANCE": [
+        "back up your memory", "export your memory", "snapshot your memory",
+        "save a copy of what you know", "forget the last", "forget last hour",
+        "forget that", "wipe your memory", "clear your memory",
+        "what do you remember", "recent facts", "memory file",
+    ],
+    "PENDING PROMISES": [
+        "promise", "promises", "waiting on", "still pending", "owe me",
+        "going to tell me", "let me know when", "outstanding",
+    ],
+    "SELF-TEST PROBES": [
+        "test the mic", "test my mic", "test microphone", "mic test",
+        "test your speech", "test tts", "test the camera", "test vision",
+        "test your voice", "self test", "self-test", "probe", "is my mic working",
+    ],
+    # The unreadable-state section is the one that teaches an HONEST refusal —
+    # it exists precisely so a question with no handler stops coming back as a
+    # confidently wrong neighbouring action (the 2026-09-04 "what microphone are
+    # you using" -> system_pulse CPU read-out). Its keywords must therefore
+    # cover the QUESTIONS, not any action name, because there is no action.
+    "MUTE / DEAF / SLOW / WHISPER — UNREADABLE STATE": [
+        "echo cancellation", "noise suppression", "agc", "audio processing",
+        "are you muted", "am i muted", "is your mic muted", "muted",
+        "whisper model", "what model are you using for speech", "cuda or cpu",
+        "why are you slow", "are you deaf", "can you hear me",
+    ],
 }
 
 # Sections always kept even with no keyword hit. Deliberately MINIMAL: only

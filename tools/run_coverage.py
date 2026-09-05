@@ -49,7 +49,13 @@ def _run_suite() -> bool:
     loader = unittest.TestLoader()
     suite = loader.discover(start_dir=_TESTS, pattern="test_*.py",
                             top_level_dir=_ROOT)
-    result = unittest.TextTestRunner(verbosity=1).run(suite)
+    from tools import test_watchdog
+    result = unittest.TextTestRunner(
+        verbosity=1,
+        resultclass=test_watchdog.WatchdogTextTestResult).run(suite)
+    # Suite over: stand the watchdog down before coverage reports (a slow
+    # report is not a hung test).
+    test_watchdog.disarm()
     return result.wasSuccessful()
 
 
@@ -88,6 +94,14 @@ def main(argv: list[str]) -> int:
     import tests  # chokepoint: it arms all three, in order, idempotently
     from tools import browser_guard
     browser_guard.install()
+    # THEN THE TIME CEILING (tools/test_watchdog.py) — mem_guard bounds what a
+    # run may ALLOCATE, this bounds how long it may STALL. Coverage instruments
+    # every executed line, so this run is legitimately several times slower than
+    # a bare one: the ceilings are raised 4x here rather than shared, which is
+    # the whole reason arm() takes them as arguments.
+    from tools import test_watchdog
+    test_watchdog.arm(per_phase_s=test_watchdog.DEFAULT_PER_PHASE_S * 4,
+                      total_s=test_watchdog.DEFAULT_TOTAL_S * 4)
     try:
         import coverage
     except ImportError:

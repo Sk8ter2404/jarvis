@@ -49,6 +49,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -2190,6 +2191,227 @@ class SpeakPendingTests(SectionSixBase):
             self.assertTrue(self.bc._speak_pending())
             self.assertFalse(os.path.exists(path + ".consuming"))
         self.assertEqual(self.spoke, ["ok"])
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  _speak_pending — main-loop watchdog starvation + per-pass drain budget
+#
+#  LIVE DEFECT, session_2026-08-21_00-00-51.log:
+#
+#      [00:02:42]   🔔 [reminder] Focus time's up, sir …
+#      [00:02:47]   🔔 [reminder] held while focused
+#      [00:02:50]   🔔 [reminder] [intent:briefing] Sir, today took two Teams …
+#      [00:02:59]   🔔 [reminder] It's past 11, sir. Night-owl mode engaged …
+#      [00:03:10]   🔔 [reminder] [intent:briefing] Good evening, sir. 6 voice …
+#      [00:03:49] [watchdog] main loop stalled — recovering (heartbeat 67.2s old)
+#      [00:03:51]   [pending] suppressed duplicate: It's past 11, sir …
+#      [00:03:51] Listening…
+#
+#  Every one of those 🔔 lines is printed from inside _speak_pending, and the
+#  LAST of them printed two seconds AFTER the watchdog fired — so one
+#  uninterrupted drain held the main loop from 00:02:42 to 00:03:51 (69s) with
+#  no heartbeat and no 'Listening…'. Two invariants come out of that, and both
+#  are asserted below:
+#
+#    1. the heartbeat is ticked before EVERY utterance, so a stale heartbeat
+#       means "the loop is stuck", never "JARVIS is talking"; and
+#    2. one pass is bounded by _PENDING_DRAIN_BUDGET_S — the tail is requeued
+#       (merged, not clobbered) and spoken on the next pass, so a long batch
+#       cannot hold the mic shut while the user is trying to talk.
+# ════════════════════════════════════════════════════════════════════════════
+class SpeakPendingDrainBudgetTests(SectionSixBase):
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        self.spoke: list = []
+        self.events: list = []
+        self._p(bc, "_mark_speech_spoken", lambda m: None)
+        self._p(bc, "_speech_was_recently_spoken", lambda m: False)
+        # The heartbeat cell is a module-level list, so restore it by value.
+        self._hb_snapshot = list(bc._main_loop_heartbeat)
+        self.addCleanup(
+            lambda: bc._main_loop_heartbeat.__setitem__(
+                slice(None), self._hb_snapshot))
+
+    def _redirect(self, path):
+        self._p(self.bc, "PENDING_SPEECH_PATH", path)
+
+    @staticmethod
+    def _write(path, messages):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump([{"message": m} for m in messages], f)
+
+    @staticmethod
+    def _read(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return [i["message"] for i in json.load(f)]
+
+    # ── invariant 1: a heartbeat before every utterance ──────────────────────
+
+    def test_heartbeat_ticks_before_every_utterance(self):
+        # The regression: before the fix _speak_pending never called
+        # _heartbeat at all, so this list came back with 5 'speak' entries and
+        # zero 'beat' entries.
+        self._p(self.bc, "_heartbeat", lambda: self.events.append("beat"))
+        self._p(self.bc, "_speak",
+                lambda msg, **k: self.events.append(f"speak:{msg}"))
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pending.json")
+            self._redirect(path)
+            self._write(path, ["a", "b", "c", "d", "e"])
+            self.assertTrue(self.bc._speak_pending())
+        self.assertEqual(
+            self.events,
+            ["beat", "speak:a", "beat", "speak:b", "beat", "speak:c",
+             "beat", "speak:d", "beat", "speak:e"])
+
+    def test_real_watchdog_never_declares_a_stall_across_a_long_batch(self):
+        # End-to-end against the REAL _main_loop_watchdog_check and the REAL
+        # 60s threshold, on a simulated clock: five utterances of 25s each —
+        # 125s of speech, twice the live incident's 69s. The watchdog is
+        # ticked from inside each 'utterance' the way the real daemon thread
+        # would tick it, and must never report a stall.
+        bc = self.bc
+        fake_now = [10_000.0]
+        stalls: list = []
+
+        def _fake_heartbeat():
+            # Mirrors the real _heartbeat's contract on the fake clock.
+            bc._main_loop_heartbeat[0] = fake_now[0]
+
+        def _fake_speak(msg, **k):
+            # Utterance runs for 25s; the watchdog wakes mid-way and at the end.
+            for _ in range(2):
+                fake_now[0] += 12.5
+                if bc._main_loop_watchdog_check(now=fake_now[0]):
+                    stalls.append((msg, fake_now[0]))
+            self.spoke.append(msg)
+
+        self._p(bc, "_heartbeat", _fake_heartbeat)
+        self._p(bc, "_speak", _fake_speak)
+        # Budget is measured with time.monotonic, which this fake clock does
+        # not drive — keep it out of the way so this test isolates invariant 1.
+        self._p(bc, "_PENDING_DRAIN_BUDGET_S", 10_000.0)
+        # Seed the heartbeat the way main() does right before the loop starts.
+        bc._main_loop_heartbeat[0] = fake_now[0]
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pending.json")
+            self._redirect(path)
+            self._write(path, ["a", "b", "c", "d", "e"])
+            self.assertTrue(bc._speak_pending())
+        self.assertEqual(self.spoke, ["a", "b", "c", "d", "e"])
+        self.assertEqual(stalls, [],
+                         f"watchdog declared a stall mid-drain: {stalls}")
+
+    # ── invariant 2: the per-pass budget ─────────────────────────────────────
+
+    def test_budget_defers_the_tail_and_preserves_order(self):
+        # Budget 0 => exactly one utterance per pass (the spoke_any gate
+        # guarantees forward progress), the rest go back on the queue in order.
+        self._p(self.bc, "_speak", lambda msg, **k: self.spoke.append(msg))
+        self._p(self.bc, "_PENDING_DRAIN_BUDGET_S", 0.0)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pending.json")
+            self._redirect(path)
+            self._write(path, ["a", "b", "c"])
+            self.assertTrue(self.bc._speak_pending())
+            self.assertFalse(os.path.exists(path + ".consuming"))
+            self.assertEqual(self._read(path), ["b", "c"])
+            # Next pass picks up where this one left off.
+            self.assertTrue(self.bc._speak_pending())
+            self.assertEqual(self._read(path), ["c"])
+        self.assertEqual(self.spoke, ["a", "b"])
+
+    def test_budget_is_measured_in_elapsed_time(self):
+        # Proves the gate is a real clock budget, not an unconditional defer:
+        # 0.30s of budget against 0.25s utterances lets 1-2 through and defers
+        # the rest. (Ranged rather than exact so scheduler jitter can't make
+        # this flaky; the sleep can overrun but never finish early, so 2 is a
+        # hard ceiling.)
+        def _slow_speak(msg, **k):
+            time.sleep(0.25)
+            self.spoke.append(msg)
+
+        self._p(self.bc, "_speak", _slow_speak)
+        self._p(self.bc, "_PENDING_DRAIN_BUDGET_S", 0.30)
+        msgs = ["a", "b", "c", "d", "e", "f"]
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pending.json")
+            self._redirect(path)
+            self._write(path, msgs)
+            self.assertTrue(self.bc._speak_pending())
+            left = self._read(path)
+        self.assertGreaterEqual(len(self.spoke), 1)
+        self.assertLessEqual(len(self.spoke), 2)
+        # Nothing lost, nothing reordered, nothing spoken twice.
+        self.assertEqual(self.spoke + left, msgs)
+
+    def test_batch_within_budget_leaves_no_queue_behind(self):
+        # The common case must be untouched: a short batch drains in one pass
+        # and the queue file is gone afterwards (no spurious requeue).
+        self._p(self.bc, "_speak", lambda msg, **k: self.spoke.append(msg))
+        self._p(self.bc, "_PENDING_DRAIN_BUDGET_S", 3600.0)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pending.json")
+            self._redirect(path)
+            self._write(path, ["a", "b", "c"])
+            self.assertTrue(self.bc._speak_pending())
+            self.assertFalse(os.path.exists(path))
+            self.assertFalse(os.path.exists(path + ".consuming"))
+        self.assertEqual(self.spoke, ["a", "b", "c"])
+
+    def test_requeue_merges_with_items_queued_during_the_drain(self):
+        # _speak_pending's docstring promises that a reminder written DURING
+        # the drain fires on the next pass instead of being dropped. A requeue
+        # that os.replace()d the file would silently eat it — so the deferred
+        # tail must MERGE, oldest first.
+        holder: dict = {}
+
+        def _speak_then_enqueue(msg, **k):
+            self.spoke.append(msg)
+            # A skill queues a fresh reminder while we are still speaking.
+            with open(holder["path"], "w", encoding="utf-8") as f:
+                json.dump([{"message": "arrived-mid-drain"}], f)
+
+        self._p(self.bc, "_speak", _speak_then_enqueue)
+        self._p(self.bc, "_PENDING_DRAIN_BUDGET_S", 0.0)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pending.json")
+            holder["path"] = path
+            self._redirect(path)
+            self._write(path, ["a", "b"])
+            self.assertTrue(self.bc._speak_pending())
+            self.assertEqual(self._read(path), ["b", "arrived-mid-drain"])
+        self.assertEqual(self.spoke, ["a"])
+
+    def test_single_over_budget_utterance_still_makes_progress(self):
+        # A lone announcement longer than the whole budget must still be
+        # spoken — deferring it would leave the queue wedged forever.
+        self._p(self.bc, "_speak", lambda msg, **k: self.spoke.append(msg))
+        self._p(self.bc, "_PENDING_DRAIN_BUDGET_S", 0.0)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pending.json")
+            self._redirect(path)
+            self._write(path, ["the only one"])
+            self.assertTrue(self.bc._speak_pending())
+            self.assertFalse(os.path.exists(path))
+        self.assertEqual(self.spoke, ["the only one"])
+
+    def test_requeue_failure_is_reported_not_swallowed(self):
+        # Honest-failure contract: if the tail cannot be written back, say so
+        # rather than losing reminders silently.
+        self._p(self.bc, "_speak", lambda msg, **k: self.spoke.append(msg))
+        self._p(self.bc, "_PENDING_DRAIN_BUDGET_S", 0.0)
+        with mock.patch.object(self.bc.tempfile, "mkstemp",
+                               side_effect=OSError("read-only share")):
+            with tempfile.TemporaryDirectory() as d:
+                path = os.path.join(d, "pending.json")
+                self._redirect(path)
+                self._write(path, ["a", "b"])
+                with mock.patch("builtins.print") as pr:
+                    self.assertTrue(self.bc._speak_pending())
+        printed = " ".join(str(c.args[0]) for c in pr.call_args_list if c.args)
+        self.assertIn("failed to requeue", printed)
 
 
 # ════════════════════════════════════════════════════════════════════════════

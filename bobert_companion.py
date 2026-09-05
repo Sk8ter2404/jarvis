@@ -4011,12 +4011,37 @@ def _enumerate_dshow_input_devices() -> "list[str] | None":
     This is the single place that touches pygrabber; both the per-frame preview
     tile resolver and the face-track open-by-name path (_dshow_name_to_index)
     funnel through it so there is ONE enumeration contract."""
+    # SystemDeviceEnum, not FilterGraph. FilterGraph.get_input_devices() is
+    # literally `self.system_device_enum.get_available_filters(VideoInputDevice)`
+    # (pygrabber/dshow_graph.py:498), but constructing the FilterGraph first also
+    # builds a filter-graph manager, a CaptureGraphBuilder2, a FilterFactory AND a
+    # WmProfileManager that loads every system Windows-Media profile — all thrown
+    # away unread. Measured on this box over 30 enumerations, identical device
+    # lists both ways:
+    #     FilterGraph()       71.0 ms wall / 39.6 ms CPU per call
+    #     SystemDeviceEnum()  46.3 ms wall / 12.0 ms CPU per call
+    #
+    # This does NOT fix the leak: BOTH paths leak +1 OS thread and +103 handles
+    # per call inside the moniker enumeration itself (measured, identical for
+    # both — it is the KS/DirectShow device-moniker bind, not the graph). At the
+    # 10 s TTL below that is +6 threads and +618 handles per MINUTE in the live
+    # process; it accounts for the mfksproxy.dll thread growth measured at
+    # +7.9/min. Treat this call as expensive AND leaky. (2026-09-04, TRACK 3.)
+    names = None
     try:
-        from pygrabber.dshow_graph import FilterGraph
-        names = FilterGraph().get_input_devices()
+        from pygrabber.dshow_graph import SystemDeviceEnum
+        from pygrabber.dshow_ids import DeviceCategories
+        names = SystemDeviceEnum().get_available_filters(
+            DeviceCategories.VideoInputDevice)
     except Exception:
-        # pygrabber missing / COM hiccup.
-        return None
+        names = None            # older pygrabber / import shape — fall through
+    if names is None:
+        try:
+            from pygrabber.dshow_graph import FilterGraph
+            names = FilterGraph().get_input_devices()
+        except Exception:
+            # pygrabber missing / COM hiccup.
+            return None
     try:
         return [str(n or "") for n in names]
     except Exception:
@@ -4410,6 +4435,70 @@ def _open_tile_capture(idx: int) -> "cv2.VideoCapture | None":
         return None
 
 
+# ── FAST PATH: reuse the face-track loop's frames, never re-open the device ──
+# MEASURED LIVE 2026-09-04 (owner using the web dashboard) by watching the mtime
+# of the four preview JPEGs. The loop's period is BURSTY, not steady:
+#   * a 10 s window sat locked at 2.10 s per iteration = 0.48 fps per tile;
+#   * a 30 s window averaged 1.93 fps, running at ~5 fps (200 ms iterations) and
+#     then dropping into 0.5-1.0 s stalls;
+#   * every stall is a BLOCKING webcam read - in the locked window, exactly two
+#     ~1.00 s reads per iteration: one HERE (inside the composite) and one in the
+#     loop itself. The frames they returned were genuinely new (7 file updates,
+#     7 distinct images), so a read was waiting on a device delivering about
+#     1 fps per open handle, not re-serving a frozen buffer.
+# Either way the preview never reached the ~6.7 fps _HUD_CAM_PREVIEW_MIN_GAP
+# allows, because the preview is published from inside this loop.
+#
+# This reader was opening a SECOND DirectShow graph — at 640x480 — on webcams the
+# loop already holds open at 1280x720, and the loop ALREADY caches each camera's
+# newest frame in _camera_latest_frame. The second open bought nothing while
+# costing a whole blocking read per composite (35-70 ms in the good bursts, up to
+# ~1.00 s in the bad ones), so it is removed here.
+#
+# HONEST LIMIT: whether the duplicate graph also CAUSED the slow reads is unproven
+# — the other webcam (an eMeet C960) was double-opened too and read in ~0 ms.
+# Removing the duplicate provably removes one read per composite; the read-timing
+# warning added in _face_tracking_thread now names whichever camera is left
+# gating the loop, which is the diagnostic that was missing all along.
+#
+# The 2026-07-10 rule that created this reader still holds and is ENFORCED below:
+# a KINECT-backed slot must NEVER be reused (that is the bug that made both side
+# tiles mirror the Kinect). Only real NAMED webcam entries qualify, and only while
+# their cached frame is fresh — anything else falls through to the original
+# open-and-read path, unchanged.
+_KINECT_PREVIEW_TILE_REUSE_MAX_AGE = 2.0   # s; an older cache counts as absent
+
+
+def _face_track_frame_for_slot(slot: str, now: float):
+    """Return the face-tracking loop's freshest frame for side-tile ``slot``
+    ('left'/'right'), or None when there is none we are allowed to reuse.
+    NEVER raises."""
+    try:
+        for cam in CAMERAS:
+            if not isinstance(cam, dict):
+                continue
+            cam_name = cam.get("name")
+            # Kinect-backed slot (explicit type, or KINECT_AS_CAMERA hijacking an
+            # UNNAMED entry — the same test _face_tracking_thread applies): its
+            # cached frame is the KINECT, not this webcam. Never reuse it.
+            if cam.get("type") == "kinect" or (KINECT_AS_CAMERA and not cam_name):
+                continue
+            if _percam_side(cam) != slot:
+                continue
+            idx = cam.get("index")
+            with _camera_state_lock:
+                frame = _camera_latest_frame.get(idx)
+                seen_at = _camera_last_frame_at.get(idx, 0.0)
+            if frame is None:
+                return None
+            if (now - seen_at) > _KINECT_PREVIEW_TILE_REUSE_MAX_AGE:
+                return None    # loop stalled/stopped -> fall back to our own read
+            return frame
+    except Exception:
+        return None
+    return None
+
+
 def _read_side_tile_webcams(now: float) -> dict:
     """Read the two named side-tile WEBCAMS directly (throttled + cached) and
     return {'left': frame|None, 'right': frame|None}. A slot is None when its
@@ -4421,10 +4510,33 @@ def _read_side_tile_webcams(now: float) -> dict:
     between. A handle that starts failing is released so the next call re-opens
     it (so re-plugging / un-covering a webcam recovers without a restart).
     NEVER raises."""
-    name_idx = _resolve_webcam_indices_by_name()
+    # Resolved LAZILY below: when both slots are served from the face-track
+    # loop's cache we never need a DirectShow enumeration at all.
+    name_idx: dict | None = None
     out: dict = {"left": None, "right": None}
     with _kinect_tile_lock:
         for slot in ("left", "right"):
+            # FAST PATH (2026-09-04): the face-track loop already holds this
+            # webcam open and has just cached its newest frame. Use that, and
+            # release any duplicate handle we are still carrying — a second
+            # graph on the same device costs a whole blocking read per
+            # composite (measured ~1.00 s) and buys nothing.
+            reused = _face_track_frame_for_slot(slot, now)
+            if reused is not None:
+                out[slot] = reused
+                _kinect_tile_frames[slot] = reused
+                _kinect_tile_last_read[slot] = now
+                cap = _kinect_tile_caps.get(slot)
+                if cap is not None:
+                    try:
+                        with _camera_io_lock:
+                            cap.release()
+                    except Exception:
+                        pass
+                    _kinect_tile_caps[slot] = None
+                continue
+            if name_idx is None:
+                name_idx = _resolve_webcam_indices_by_name()
             idx = name_idx.get(slot)
             if idx is None:
                 # No device of that name → no real webcam to show; drop any stale
@@ -5099,6 +5211,33 @@ _camera_last_frame_at: dict[int, float]      = {}      # index → ts of last go
 _camera_wake_attempts: dict[int, int]        = {}      # index → wake attempts since last good frame
 _camera_recoveries: dict[int, int]           = {}      # index → cumulative successful wakes
 
+# PREVIEW-RATE DIAGNOSTIC (2026-09-04). A BLOCKING cap.read() is what sets the
+# face-tracking loop's period, and the loop's period is the HUD/web camera
+# preview frame rate - the preview is published from inside it. A slow read is
+# indistinguishable from a healthy one in every log line we had, which is how a
+# 1.0 s stall PER CAMERA PER ITERATION (measured live: a 10 s window locked at a
+# 2.10 s period = 0.48 fps per tile; a 30 s window averaged 1.93 fps with bursts
+# to ~5 fps) stayed invisible. Record the cost
+# of every read and say it out loud, throttled, when it is the bottleneck.
+_camera_read_ms: dict[int, float]            = {}      # index -> last read cost (ms)
+_CAMERA_SLOW_READ_WARN_MS    = 250.0   # a read this slow IS the loop period
+_CAMERA_SLOW_READ_WARN_GAP_S = 60.0    # one line per camera per minute, at most
+_camera_slow_read_warned_at: dict[int, float] = {}
+
+
+def _warn_slow_camera_read(label: str, idx: int, ms: float, now: float) -> None:
+    """Throttled one-liner naming the camera that is gating the preview rate.
+    Never raises into the tracking loop."""
+    try:
+        if (now - _camera_slow_read_warned_at.get(idx, 0.0)) < _CAMERA_SLOW_READ_WARN_GAP_S:
+            return
+        _camera_slow_read_warned_at[idx] = now
+        print(f"  [face-track] {label} (index {idx}) took {ms:.0f} ms to deliver "
+              f"a frame - that one read caps the tracking loop, and therefore "
+              f"the HUD/web camera preview, at ~{1000.0 / max(ms, 1.0):.1f} fps")
+    except Exception:
+        pass
+
 # Serializes every cv2.VideoCapture open / release across threads (probe sweep,
 # face-tracking, list-cameras, snapshot). DirectShow heap-corrupts when an
 # abandoned probe worker's release() overlaps another thread's release(), so
@@ -5756,7 +5895,14 @@ def _face_tracking_thread():
                     print(f"  [face-track] Reopened {cam['label']} (index {cam['index']}) after recovery")
                     c = new_c
 
+                _read_t0 = time.perf_counter()
                 ret, frame = c.read()
+                _read_ms = (time.perf_counter() - _read_t0) * 1000.0
+                with _camera_state_lock:
+                    _camera_read_ms[cam["index"]] = _read_ms
+                if _read_ms >= _CAMERA_SLOW_READ_WARN_MS:
+                    _warn_slow_camera_read(cam["label"], cam["index"],
+                                           _read_ms, now_loop)
                 if not ret:
                     entry["fails"] += 1
                     # Record the failure so see_user / self-diagnostic can
@@ -6132,11 +6278,23 @@ def list_speakers():
 
 # Device auto-switching state.
 #
-# "in"/"out" are the SELECTED indices and None means "no explicit preference —
-# let sounddevice resolve the CURRENT system default at open time". That None
-# is the whole follow-the-default contract (see _refresh_devices): it must NOT
-# be replaced with a resolved default index, or JARVIS pins itself to today's
-# default and stops following the owner's Stream Deck.
+# "in"/"out" are the SELECTED indices. In the owner's follow-the-default
+# configuration they hold the index of the device WINDOWS CURRENTLY CALLS THE
+# DEFAULT, re-resolved on every refresh pass from a LIVE MMDevice read
+# (_endpoint_device_identity). That is not a pin: the value is a RESULT of the
+# current default, recomputed at most DEVICE_CHECK_INTERVAL after it moves, so
+# it tracks the owner's Stream Deck instead of freezing on one device.
+#
+# None means "could not resolve — let sounddevice resolve the default at open
+# time". CORRECTED 2026-08-21: None used to be the follow-the-default contract
+# itself, on the belief that device=None re-resolves the default at every open.
+# It does not. sounddevice maps device=None to Pa_GetDefaultInput/OutputDevice,
+# a struct field each host API fills in ONCE inside Pa_Initialize, so device=
+# None re-reads the SAME endpoint forever — the very freeze the reinit exists
+# to break. Leaving the index None therefore followed the default JARVIS BOOTED
+# ON, not the current one (proved live in
+# session_2026-08-21_00-00-51.log). None is now the FALLBACK, kept because it
+# is the best available answer on a host with no MMDevice API.
 #
 # "last_in_*"/"last_out_*" are TRACKING state for the change detector only —
 # never used to open anything. Both the index AND the name are stored because
@@ -6851,6 +7009,167 @@ def _win_default_endpoints() -> tuple[str | None, str | None]:
         return (None, None)
 
 
+# ── Endpoint id → PortAudio index, WITHOUT a re-enumeration (2026-08-21) ───
+# WHAT A DEFAULT-DEVICE MOVE ACTUALLY NEEDS, established by measurement on this
+# machine rather than assumed:
+#
+#   • PortAudio's DEVICE LIST is frozen at Pa_Initialize, but the owner's
+#     Stream Deck does NOT plug anything in — it moves the Windows default
+#     BETWEEN endpoints that are already enumerated. Measured 2026-08-21 while
+#     the live JARVIS was running: every ACTIVE MMDevice endpoint on this box
+#     (Blue Snowball, CORSAIR VOID ELITE, Realtek USB2.0, both NVIDIA HDMI
+#     sinks, the Xbox NUI array, the eMeet webcam) already had a row in the
+#     FROZEN sd.query_devices() list. So the new device's INDEX is obtainable
+#     without ever calling sd._terminate().
+#   • What the re-enumeration uniquely provides is the refreshed value behind
+#     `device=None` — Pa_GetDefaultInputDevice(), i.e.
+#     hostApis[Pa_GetDefaultHostApi()]->defaultInputDevice. That is the DEFAULT
+#     HOST API's own idea of the default. Measured: sd.default.hostapi is MME
+#     (0) here, and MME's default_input_device/default_output_device were 1 and
+#     6 — byte-identical to the endpoints MMDevice reports as the live
+#     eConsole defaults ('Microphone (Blue Snowball )' / 'Headset Earphone
+#     (CORSAIR VOID …)'). So resolving the LIVE endpoint's friendly name inside
+#     the DEFAULT HOST API reproduces exactly the index a reinit would hand
+#     `device=None` — which is why an explicit index here is a faithful
+#     substitute for the teardown, not an approximation of it.
+#   • The teardown therefore remains necessary for exactly ONE thing: a device
+#     that is NOT in the frozen list (true USB hotplug). That is what
+#     DEVICE_REENUM_INTERVAL and the signature check are for, and they are
+#     untouched.
+#
+# Restricting the match to the DEFAULT HOST API is load-bearing twice over: it
+# reproduces `device=None`'s answer as above, and it collapses the four
+# duplicate rows every endpoint has (MME / DirectSound / WASAPI / WDM-KS) to
+# the one PortAudio would itself have picked.
+_win_endpoint_names: dict[str, str] = {}
+_win_endpoint_names_lock = threading.Lock()
+
+
+def _win_endpoint_friendly_name(endpoint_id: str | None) -> str | None:
+    """Windows' friendly name for one endpoint id ('Speakers (Realtek USB2.0
+    Audio)'), or None when it can't be read. Opens NO device — this is a
+    property-store read on the endpoint object. Never raises.
+
+    CACHED because a friendly name changes only when the owner renames the
+    device in Sound settings, while this is consulted on every refresh pass.
+    The cache is DROPPED BY THE CALLER whenever a cached name fails to resolve
+    against the device list (see _endpoint_device_identity), so a rename costs
+    one failed pass rather than needing a restart — the stale-duplicate rule
+    applied to a cache instead of to code."""
+    if not endpoint_id:
+        return None
+    with _win_endpoint_names_lock:
+        hit = _win_endpoint_names.get(endpoint_id)
+    if hit is not None:
+        return hit
+    enum = _win_endpoint_enumerator()
+    if enum is None:
+        return None
+    try:
+        from comtypes import GUID
+        from pycaw.pycaw import PROPERTYKEY
+        pk = PROPERTYKEY()
+        # PKEY_Device_FriendlyName — the same string Sound settings shows and
+        # the same string PortAudio builds its MME/WASAPI names from.
+        pk.fmtid = GUID("{A45C254E-DF1C-4EFD-8020-67D146A850E0}")
+        pk.pid = 14
+        store = enum.GetDevice(endpoint_id).OpenPropertyStore(0)  # STGM_READ
+        val = store.GetValue(pk)
+        name = val.GetValue()
+        try:
+            val.clear()
+        except Exception:
+            pass
+    except Exception:
+        # Same policy as _win_default_endpoints: a per-call COM failure drops
+        # the cached enumerator so the next pass rebuilds it, and does NOT
+        # count against the sticky setup-failure budget.
+        _win_endpoint_tls.enumerator = None
+        return None
+    if not isinstance(name, str) or not name:
+        return None
+    with _win_endpoint_names_lock:
+        _win_endpoint_names[endpoint_id] = name
+    return name
+
+
+def _forget_endpoint_name(endpoint_id: str | None) -> None:
+    """Drop one cached friendly name (the device was renamed, or the name no
+    longer matches anything PortAudio enumerates)."""
+    if not endpoint_id:
+        return
+    with _win_endpoint_names_lock:
+        _win_endpoint_names.pop(endpoint_id, None)
+
+
+def _endpoint_device_identity(endpoint_id: str | None,
+                              want_input: bool) -> tuple[int | None, str]:
+    """(index, name) of the PortAudio device that IS the Windows endpoint
+    ``endpoint_id``, resolved against the EXISTING (frozen) enumeration — or
+    (None, "") when it can't be resolved unambiguously.
+
+    This is the whole cheap half of follow-the-default: it lets a Stream Deck
+    press be ADOPTED on the next 4 s pass by opening an explicit index, with no
+    sd._terminate()/sd._initialize() and therefore no 0xc0000374 window and no
+    waiting for the mic to fall idle.
+
+    MATCHING. Candidates are restricted to the DEFAULT HOST API (see the block
+    comment above) and to the right direction. A candidate matches when its
+    name equals the friendly name, or — because MME truncates descriptions to
+    31 characters — when it is exactly 31 characters long and is a prefix of
+    it.
+
+    AMBIGUITY IS A FAILURE, NOT A COIN FLIP. Two endpoints sharing an
+    MME-truncated 31-character name is a real configuration on this machine
+    (defect D1), and picking the wrong one would open the WRONG microphone —
+    strictly worse than today's stale-but-known device. More than one candidate
+    therefore returns (None, ""), which degrades to exactly the pre-2026-08-21
+    behaviour: device=None plus the re-enumeration path.
+
+    Opens NO device and probes NO format: this runs on the refresh path while
+    the owner's mic is live, so it must stay a pure lookup. A resolved index
+    that turns out to be unopenable is already covered downstream —
+    get_input_device() re-queries it and record_speech retries with
+    device=None."""
+    friendly = _win_endpoint_friendly_name(endpoint_id)
+    if not friendly:
+        return None, ""
+    try:
+        host = sd.default.hostapi
+    except Exception:
+        host = None
+    if not isinstance(host, int) or isinstance(host, bool) or host < 0:
+        return None, ""
+    try:
+        devices = list(sd.query_devices())
+    except Exception:
+        return None, ""
+    hits: list[tuple[int, str]] = []
+    for i, d in enumerate(devices):
+        if not isinstance(d, dict):
+            continue
+        if d.get("hostapi") != host:
+            continue
+        chans = ("max_input_channels" if want_input else "max_output_channels")
+        try:
+            if int(d.get(chans, 0)) <= 0:
+                continue
+        except Exception:
+            continue
+        name = d.get("name") or ""
+        if name == friendly or (len(name) == 31 and friendly.startswith(name)):
+            hits.append((i, name))
+    if len(hits) != 1:
+        # Nothing matched → the endpoint is genuinely absent from the frozen
+        # list (true hotplug, or a rename that invalidated the cached name), so
+        # forget the name and let the re-enumeration path do its job. Several
+        # matched → ambiguous, and silence beats the wrong mic.
+        if not hits:
+            _forget_endpoint_name(endpoint_id)
+        return None, ""
+    return hits[0]
+
+
 def _default_device_identity(want_input: bool) -> tuple[int | None, str]:
     """(index, name) of the endpoint PORTAUDIO calls the default input
     (want_input=True) or output — for CHANGE DETECTION and ANNOUNCEMENT WORDING
@@ -6865,13 +7184,16 @@ def _default_device_identity(want_input: bool) -> tuple[int | None, str]:
     then reports what PortAudio actually resolved, which is what every
     device=None stream open will use and therefore the right thing to announce.
 
-    FOLLOW-THE-DEFAULT contract (2026-08-20): the owner selects his mic and
-    speakers from a Stream Deck, which moves the WINDOWS DEFAULT. JARVIS follows
-    it by leaving _device_cache["in"]/["out"] as None so every stream open
-    re-resolves the default afresh. This lookup exists purely so the refresh
-    loop can SEE that the default moved and NAME it out loud — its result must
-    NEVER be written into _device_cache["in"]/["out"], because pinning the
-    resolved index is exactly how JARVIS would stop following the next switch.
+    NOT THE FOLLOW-THE-DEFAULT PATH — the FALLBACK for it (corrected
+    2026-08-21). The owner selects his mic and speakers from a Stream Deck,
+    which moves the WINDOWS DEFAULT; JARVIS follows that through
+    _endpoint_device_identity(), which resolves the LIVE endpoint id to a row in
+    the current enumeration. This function is consulted only when that
+    resolution fails, and then purely so the refresh loop can still SEE and NAME
+    whatever PortAudio happens to be resolving. Its result must NEVER be written
+    into _device_cache["in"]/["out"]: it is a STALE index by construction (the
+    frozen struct field above), so caching it would pin JARVIS to the endpoint
+    it booted on — which is exactly the bug the 2026-08-20 version shipped.
 
     Total by construction: sd.default.device may be a 2-tuple, None, or a
     non-subscriptable stub, and PortAudio reports 'no default' as -1. Every one
@@ -7017,17 +7339,35 @@ def _refresh_devices(force: bool = False):
         # unavailable this is (None, None) and the old behaviour is exactly
         # what remains.
         #
-        # ACT ONLY WHEN A REINIT COULD ACTUALLY RUN. The endpoint baseline is
-        # rebased only after a successful re-enumeration, so this trigger keeps
-        # re-asserting itself every 4 s until one lands — and record_speech
-        # holds the mic for most of an awake session. Firing it into a
-        # guaranteed deferral would pause/resume the wake-word stream and print
-        # the deny line every 4 s for nothing. _owners_busy is ADVISORY (the
-        # flags can change a microsecond later); the binding decision is still
-        # the atomic _pa_gate check-and-latch below, and losing that race costs
-        # exactly one deferred pass. Deliberately gates ONLY this trigger — a
-        # real signature change or the 300 s sweep still attempts, and still
-        # logs its deferral reason, exactly as before.
+        # THE 2026-08-20 VERSION OF THIS TRIGGER DID NOT WORK, AND THE FIRST
+        # LIVE BOOT PROVED IT (session_2026-08-21_00-00-51.log).
+        # It suppressed itself whenever a stream owner was live
+        # (`and not _owners_busy`) on the reasoning that firing into a
+        # guaranteed deferral would only churn the wake-word stream and print a
+        # deny line. But record_speech re-opens the mic continuously and TTS
+        # plays constantly, so on an awake session an owner is live essentially
+        # ALWAYS: the trigger never asserted once in 15 minutes, the Stream Deck
+        # press was never followed, and the log still filled with 34 deny lines
+        # (from the cache-cleared re-pick path, which the follow-the-default
+        # contract leaves permanently armed — see _cache_cleared below).
+        #
+        # THE REAL ERROR WAS EQUATING "FOLLOW THE DEFAULT" WITH "RE-ENUMERATE".
+        # A Stream Deck press does not plug anything in; it moves the default
+        # between endpoints PortAudio ALREADY has rows for. _endpoint_device_
+        # identity() resolves the live endpoint id to one of those rows for the
+        # price of a property-store read, so the press can be ADOPTED on this
+        # very pass — no sd._terminate(), no 0xc0000374 window, and no waiting
+        # for a mic that never falls idle. See that helper's block comment for
+        # the measurements behind "the resolved index is what a reinit would
+        # have produced anyway".
+        #
+        # So the trigger now fires REGARDLESS of _owners_busy, because the
+        # response is no longer destructive. _owners_busy survives for what it
+        # was always actually good for: deciding whether pausing the wake-word
+        # stream is worth it (core/wake_word.resume() is documented
+        # un-retryable, so every avoided pause matters). The destructive reinit
+        # is escalated to ONLY when the cheap adoption fails — i.e. the new
+        # default is genuinely not in the frozen list, which is true hotplug.
         _owners_busy = False
         with _pa_gate:
             _owners_busy = _pa_streams_live()
@@ -7040,14 +7380,56 @@ def _refresh_devices(force: bool = False):
             # endpoint JARVIS started on would be a lie.
             _device_cache["last_default_endpoints"] = _prev_eps = _now_eps
         _default_moved = bool(_have_eps and _prev_eps is not None
-                              and _now_eps != _prev_eps and not _owners_busy)
-        if _default_moved:
-            print("  [audio] the Windows default audio endpoint moved — "
-                  "re-enumerating PortAudio so JARVIS follows it")
-        _sig_unchanged = (not force and not _reenum_due and not _default_moved
-                         and last_sig is not None
-                         and current_sig is not None
-                         and current_sig == last_sig)
+                              and _now_eps != _prev_eps)
+        # Can this move be followed CHEAPLY, from the existing enumeration?
+        # A direction HARD-pinned by MICROPHONE_INDEX/SPEAKER_INDEX never
+        # follows the default at all, so it can never be the reason a teardown
+        # is needed. PREFERRED_* is deliberately NOT consulted here: a
+        # PREFERRED_ list that matches nothing still falls through to the
+        # default, and asking _pick_device would mean a second round of its
+        # _input_openable() probe opens on every pass. Erring toward "check it"
+        # can only cost one unnecessary re-enumeration (exactly what 2026-08-20
+        # did on every move); erring the other way would let the baseline rebase
+        # on a move that was never actually applied, i.e. silently DROP a press.
+        _follows_default = (MICROPHONE_INDEX is None or SPEAKER_INDEX is None)
+        _default_adopted = True
+        if _default_moved and _follows_default:
+            if MICROPHONE_INDEX is None:
+                _default_adopted &= (
+                    _endpoint_device_identity(_now_eps[1],
+                                              want_input=True)[0] is not None)
+            if SPEAKER_INDEX is None:
+                _default_adopted &= (
+                    _endpoint_device_identity(_now_eps[0],
+                                              want_input=False)[0] is not None)
+            if _default_adopted:
+                print("  [audio] the Windows default audio endpoint moved — "
+                      "re-picking from the current enumeration so JARVIS "
+                      "follows it (no PortAudio teardown needed)")
+            else:
+                print("  [audio] the Windows default audio endpoint moved to a "
+                      "device that is not in PortAudio's current enumeration — "
+                      "a full re-enumeration is required to follow it")
+        if _default_moved and _default_adopted:
+            # REBASE NOW, not after a reinit. The 2026-08-20 rule ("rebase only
+            # after a real re-enumeration, or a deferred pass would forget the
+            # press") was right for a teardown-only mechanism and is exactly
+            # what turned an un-runnable teardown into an endless retry: the
+            # baseline never moved, so the same move re-asserted every 4 s
+            # forever. When the press is adopted on THIS pass it is not
+            # forgotten — it is APPLIED — so the baseline must move with it.
+            # (With both directions hard-pinned nothing follows the default, so
+            # the move is irrelevant and is rebased silently.)
+            _device_cache["last_default_endpoints"] = _now_eps
+        # A move that WAS adopted must not also force the destructive path:
+        # the cheap re-pick below is the whole response. A move that was NOT
+        # adopted still does, because only a re-enumeration can reach a device
+        # PortAudio has never seen.
+        _reinit_wanted = bool(force or _reenum_due
+                              or (_default_moved and not _default_adopted)
+                              or last_sig is None or current_sig is None
+                              or current_sig != last_sig)
+        _sig_unchanged = not _reinit_wanted
         # A CLEARED cache is a re-pick REQUEST, not a steady state: the four
         # invalidating call sites (get_input_device / get_output_device's
         # stale-index probes, record_speech's failed InputStream open,
@@ -7060,7 +7442,17 @@ def _refresh_devices(force: bool = False):
         # reinit chain); it must not skip the cheap re-pick. 2026-07-21 audit.
         _cache_cleared = (_device_cache["in"] is None
                          or _device_cache["out"] is None)
-        if _sig_unchanged and not _cache_cleared:
+        # An ADOPTED default move is the second kind of re-pick request, and it
+        # is the one that made this feature work at all: _sig_unchanged is True
+        # for it (no teardown is wanted — that is the point), so without this
+        # term the early return below would swallow the Stream Deck press on
+        # the very pass that was able to follow it. 2026-08-21.
+        _repick_due = _cache_cleared or (_default_moved and _default_adopted
+                                         and _follows_default)
+        if _sig_unchanged and not _repick_due:
+            # Nothing to re-pick and no teardown wanted — so if a teardown was
+            # previously being held off, it is not being held off any more.
+            _log_reinit_deferral(None)
             _device_cache["checked_at"] = now
             return
 
@@ -7112,18 +7504,48 @@ def _refresh_devices(force: bool = False):
             # 20s timeout. The natives themselves run OUTSIDE _mic_lock (only
             # the latch protects them) so claimants time out instead of
             # queueing behind a slow WASAPI teardown.
+            #
+            # ORDER MATTERS, AND IT WAS WRONG (fixed 2026-08-21). The owner
+            # checks used to be tested BEFORE `_sig_unchanged`, so a pass that
+            # wanted no teardown at all — the cache-cleared re-pick, which the
+            # follow-the-default contract used to leave permanently armed —
+            # still printed "device drift detected …" every time a mic happened
+            # to be live. That is where all 34 deny lines in
+            # session_2026-08-21_00-00-51.log came from: not one of them
+            # described a real deferral, because on those passes there was no
+            # drift and nothing to defer. "Is a teardown even wanted?" is now
+            # answered FIRST, and only then "may it run?".
             do_reinit = False
+            _defer_reason = None
+            _defer_message = ""
             with _pa_gate:
-                if _pa_mic_capture_live():
-                    print("  [audio] device drift detected but a mic/audio stream is "
-                          "live (record_speech, get_mic_buffer Path B, ambient "
-                          "listen, or a diagnostic/enrolment capture) — "
-                          "deferring PortAudio reinit to avoid a mid-capture "
-                          "teardown (0xc0000374).")
+                if _sig_unchanged:
+                    # No teardown wanted: either the cache was invalidated (a
+                    # re-pick REQUEST) or the Windows default moved to a device
+                    # already in this enumeration. Both are answered by the
+                    # cheap _pick_device / _endpoint_device_identity re-pick
+                    # below, over the EXISTING device list; no destructive
+                    # reinit (and none of its 0xc0000374 risk) is needed or
+                    # wanted, and this path never latches the gate, so
+                    # claimants never wait on a re-pick. 2026-07-21 audit,
+                    # re-ordered 2026-08-21.
+                    pass
+                elif _pa_mic_capture_live():
+                    _defer_reason = "mic"
+                    _defer_message = (
+                        "  [audio] device drift detected but a mic/audio stream is "
+                        "live (record_speech, get_mic_buffer Path B, ambient "
+                        "listen, or a diagnostic/enrolment capture) — "
+                        "deferring PortAudio reinit to avoid a mid-capture "
+                        "teardown (0xc0000374). Logged once; the next line "
+                        "about it will be when the deferral ends.")
                 elif _tts_playback_active[0]:
-                    print("  [audio] device drift detected but TTS playback is "
-                          "live — deferring PortAudio reinit to avoid tearing down "
-                          "the barge-in stream (0xc0000374).")
+                    _defer_reason = "tts"
+                    _defer_message = (
+                        "  [audio] device drift detected but TTS playback is "
+                        "live — deferring PortAudio reinit to avoid tearing down "
+                        "the barge-in stream (0xc0000374). Logged once; the "
+                        "next line about it will be when the deferral ends.")
                 elif _pa_close_pending[0]:
                     # H-6 (2026-08-20). A caller handed a native
                     # Pa_CloseStream to a daemon, its bounded wait expired,
@@ -7137,22 +7559,21 @@ def _refresh_devices(force: bool = False):
                     # wedged one defers indefinitely — and then deferring is
                     # correct. The cheap _pick_device re-pick below still runs,
                     # so already-enumerated devices keep switching.
-                    print("  [audio] device drift detected but an abandoned "
-                          "native close is still in flight — deferring "
-                          "PortAudio reinit (the daemon is still inside "
-                          "Pa_CloseStream; sd._terminate() there is "
-                          "0xc0000374).")
-                elif _sig_unchanged:
-                    # Cache invalidated but the device list is unchanged — the
-                    # cheap _pick_device re-pick below runs over the EXISTING
-                    # enumeration; no destructive reinit (and none of its
-                    # 0xc0000374 risk) is needed or wanted here, and this path
-                    # never latches the gate, so claimants never wait on a
-                    # re-pick. 2026-07-21 audit.
-                    pass
+                    _defer_reason = "close"
+                    _defer_message = (
+                        "  [audio] device drift detected but an abandoned "
+                        "native close is still in flight — deferring "
+                        "PortAudio reinit (the daemon is still inside "
+                        "Pa_CloseStream; sd._terminate() there is "
+                        "0xc0000374). Logged once; the next line about it "
+                        "will be when the deferral ends.")
                 else:
                     _pa_reinit_active[0] = True
                     do_reinit = True
+            # OUTSIDE the lock: _log_reinit_deferral prints, and printing under
+            # _mic_lock would put I/O inside the teardown-gate's critical
+            # section (the lock discipline above forbids slow work there).
+            _log_reinit_deferral(_defer_reason, _defer_message)
             if do_reinit:
                 try:
                     sd._terminate()
@@ -7161,10 +7582,13 @@ def _refresh_devices(force: bool = False):
                     # sweep — a deferred (mic-active) pass must retry soon, not
                     # wait another DEVICE_REENUM_INTERVAL. 2026-07-14 #4.
                     _device_cache["last_reenum_at"] = now
-                    # Same rule for the follow-the-default baseline: rebase it
-                    # ONLY after PortAudio has actually re-enumerated, because
-                    # only then can sd.default.device see the moved endpoint.
-                    # Rebasing on a deferred pass would forget the press.
+                    # The follow-the-default baseline is normally rebased the
+                    # moment the move is ADOPTED (above), which is the common
+                    # case. This rebases it for the OTHER case: a move to a
+                    # device that was not in the frozen list, which only a real
+                    # re-enumeration can reach — so it is rebased only once that
+                    # re-enumeration has actually happened. Rebasing THAT on a
+                    # deferred pass would forget the press.
                     if _have_eps:
                         _device_cache["last_default_endpoints"] = _now_eps
                 except Exception as e:
@@ -7178,6 +7602,25 @@ def _refresh_devices(force: bool = False):
                         _pa_reinit_active[0] = False
                         _pa_gate.notify_all()
 
+            # FOLLOW-THE-DEFAULT, RESOLVED (2026-08-21). The 2026-08-20 rule was
+            # "leave the index None so every open re-resolves the current
+            # default". That reasoning had a false premise: sounddevice resolves
+            # device=None through Pa_GetDefaultInput/OutputDevice, a struct
+            # field frozen at Pa_Initialize — so device=None does not re-resolve
+            # ANYTHING, it re-reads the SAME stale endpoint until a teardown.
+            # Leaving it None did not follow the default; it followed whatever
+            # the default was at boot.
+            #
+            # What follows the default is resolving the LIVE endpoint id to a
+            # row in the current enumeration and opening THAT index. It does not
+            # pin, because it is re-derived from a fresh MMDevice read on every
+            # pass — the index is a RESULT of the live default, never a memory
+            # of an old one. When it cannot be resolved (no MMDevice API, an
+            # ambiguous MME-truncated name, a device not in the frozen list)
+            # it falls back to None, i.e. precisely the previous behaviour.
+            _resolved_in = (None, "")
+            _resolved_out = (None, "")
+
             # Input
             if MICROPHONE_INDEX is not None:
                 in_idx = MICROPHONE_INDEX
@@ -7186,20 +7629,29 @@ def _refresh_devices(force: bool = False):
                 in_track = (in_idx, in_name)
             else:
                 in_idx, in_name = _pick_device(PREFERRED_INPUT_DEVICES, want_input=True)
-                # FOLLOW-THE-DEFAULT. No preference matched — which is the
-                # owner's NORMAL configuration (PREFERRED_INPUT_DEVICES is empty
-                # because his Stream Deck selects the mic by moving the Windows
-                # default, and a name-pinned list beat the default even when the
-                # pinned device was a powered-off headset that still enumerates
-                # and still passes check_input_settings — 90 minutes deaf,
-                # 2026-08-20). in_idx STAYS None on purpose so every open
-                # re-resolves the current default; the identity below is for
-                # detection/announcement only and is never cached as the index.
-                in_track = ((in_idx, in_name) if in_idx is not None
-                            else _default_device_identity(want_input=True))
+                # No preference matched — which is the owner's NORMAL
+                # configuration (PREFERRED_INPUT_DEVICES is empty because his
+                # Stream Deck selects the mic by moving the Windows default, and
+                # a name-pinned list beat the default even when the pinned
+                # device was a powered-off headset that still enumerates and
+                # still passes check_input_settings — 90 minutes deaf,
+                # 2026-08-20).
+                if in_idx is None:
+                    _resolved_in = _endpoint_device_identity(_now_eps[1],
+                                                             want_input=True)
+                    in_idx, in_name = _resolved_in
+                    in_track = (_resolved_in if in_idx is not None
+                                else _default_device_identity(want_input=True))
+                else:
+                    in_track = (in_idx, in_name)
             # Did this direction's identity come from the WINDOWS DEFAULT? Only
             # then does the default endpoint id below describe the same device.
-            in_from_default = (MICROPHONE_INDEX is None and in_idx is None)
+            # True both when the default was RESOLVED to an index and when it
+            # was left to device=None — in both cases the tracked identity is
+            # the default's.
+            in_from_default = (MICROPHONE_INDEX is None
+                               and (in_idx is None
+                                    or _resolved_in[0] is not None))
 
             # Output
             if SPEAKER_INDEX is not None:
@@ -7209,11 +7661,19 @@ def _refresh_devices(force: bool = False):
                 out_track = (out_idx, out_name)
             else:
                 out_idx, out_name = _pick_device(PREFERRED_OUTPUT_DEVICES, want_input=False)
-                # Same contract for playback: out_idx stays None → the default
-                # speakers follow the Stream Deck too.
-                out_track = ((out_idx, out_name) if out_idx is not None
-                             else _default_device_identity(want_input=False))
-            out_from_default = (SPEAKER_INDEX is None and out_idx is None)
+                # Same contract for playback: the default speakers follow the
+                # Stream Deck too.
+                if out_idx is None:
+                    _resolved_out = _endpoint_device_identity(_now_eps[0],
+                                                              want_input=False)
+                    out_idx, out_name = _resolved_out
+                    out_track = (_resolved_out if out_idx is not None
+                                 else _default_device_identity(want_input=False))
+                else:
+                    out_track = (out_idx, out_name)
+            out_from_default = (SPEAKER_INDEX is None
+                                and (out_idx is None
+                                     or _resolved_out[0] is not None))
 
             # Log + announce changes, for BOTH directions.
             #
@@ -8225,6 +8685,44 @@ _mic_lock = threading.Lock()             # serialises mic-ownership flag + reini
 # tens-to-hundreds-of-ms native window (0xc0000374 heap corruption).
 _pa_reinit_active = [False]
 _pa_gate = threading.Condition(_mic_lock)
+
+# ONE-SHOT DEFERRAL LOGGING (2026-08-21). _refresh_devices' deny chain used to
+# print its reason on EVERY pass it deferred. Live proof that this is not a
+# theoretical concern: session_2026-08-21_00-00-51.log carries 34 of those
+# lines in 15 minutes — 25 "a mic/audio stream is live" and 9 "TTS playback is
+# live" — because record_speech and TTS are essentially always live on an awake
+# session, so a state that persists for minutes printed like an event that
+# happened hundreds of times. A repeating condition is a STATE: log the
+# transition in, and the transition out, and nothing in between. Holds the
+# reason KEY that was last logged, or None while nothing is deferred.
+_pa_defer_logged = [None]
+
+
+def _log_reinit_deferral(reason: str | None, message: str = "") -> None:
+    """Log the destructive-reinit deferral as a STATE TRANSITION.
+
+    ``reason`` is a short stable key ("mic" / "tts" / "close") while the reinit
+    is being held off, or None when it no longer is. The first pass that enters
+    a reason prints ``message``; every later pass with the SAME reason prints
+    nothing; the pass that clears it prints one closing line. A reason CHANGING
+    (mic → tts) is a real transition and prints, because it is different
+    information about why JARVIS is not following the device yet.
+
+    Never raises — this sits on the path every get_input_device() caller takes,
+    including the main voice loop."""
+    try:
+        prev = _pa_defer_logged[0]
+        if reason == prev:
+            return
+        _pa_defer_logged[0] = reason
+        if reason is not None:
+            if message:
+                print(message)
+        elif prev is not None:
+            print("  [audio] the PortAudio re-enumeration is no longer "
+                  "deferred — the stream owner that was holding it released.")
+    except Exception:
+        pass
 
 
 def _pa_mic_capture_live() -> bool:
@@ -16367,7 +16865,9 @@ def get_camera_health() -> dict:
     Returns a dict keyed by camera index with: ``last_frame_at`` (float
     epoch seconds; 0.0 if the device has never produced a frame),
     ``last_read_error`` (str or None), ``last_read_error_at`` (epoch or
-    0.0), ``wake_attempts`` (int), ``recoveries`` (int). Safe to call from
+    0.0), ``wake_attempts`` (int), ``recoveries`` (int), and
+    ``last_read_ms`` (how long the last cap.read() blocked - the slowest
+    camera here is what caps the HUD/web preview frame rate). Safe to call from
     any thread — uses the same lock as the face-tracking writer.
     """
     out: dict[int, dict] = {}
@@ -16386,6 +16886,10 @@ def get_camera_health() -> dict:
                 "last_read_error_at":  _camera_last_read_error_at.get(idx, 0.0),
                 "wake_attempts":       _camera_wake_attempts.get(idx, 0),
                 "recoveries":          _camera_recoveries.get(idx, 0),
+                # How long this camera's last cap.read() BLOCKED. The
+                # slowest camera here is the tracking loop's period and
+                # therefore the preview's ceiling (2026-09-04).
+                "last_read_ms":        _camera_read_ms.get(idx, 0.0),
             }
     return out
 
@@ -22726,6 +23230,92 @@ def _drain_injected_command():
         return None
     return text
 
+# How long ONE _speak_pending() drain may hold the main loop before it hands
+# the tail back to the queue and returns to 'Listening…'.
+#
+# HOUSE RULE — a per-pass budget, not longer individual timeouts. Every wait
+# inside a single _speak() is already individually bounded (_pa_claim_owner 1s
+# + kokoro's 30s synth cap + the 15s _PYTTSX3_TIMEOUT_S join + a 2s
+# _safe_close_stream), but a QUEUED BATCH multiplies that ceiling by the item
+# count — and plain honest speech needs no timeout at all to blow past the
+# watchdog: on the 2026-08-21 00:00:51 boot five queued announcements (two
+# focus reminders, a Teams follow-up, the night-owl notice and a ~85-word
+# evening briefing) drained back-to-back for 69s and the watchdog declared the
+# main loop stalled at 67.2s. Bounding the individual waits harder is the wrong
+# fix — it truncates real speech mid-sentence. Bounding the PASS is the right
+# one. Kept well under _MAIN_LOOP_HEARTBEAT_TIMEOUT (60s) so a pass that trips
+# the budget still leaves headroom for the utterance already in flight.
+_PENDING_DRAIN_BUDGET_S = 25.0
+
+
+def _requeue_pending_speech(items: list) -> bool:
+    """Put un-spoken announcements back on the pending-speech queue.
+
+    Called when _speak_pending's per-pass budget cuts a drain short. MERGES
+    rather than clobbers: skills keep writing to a fresh pending_speech.json
+    while a drain is in flight (that is the entire point of the
+    consume-and-rename claim), so a plain overwrite here would silently drop
+    every reminder queued during the batch we just spoke — the exact loss
+    _speak_pending's docstring promises does not happen. Deferred items go
+    FIRST because they are older, matching _recover_orphaned_queue_snapshot's
+    merge order.
+
+    Takes _pending_speech_lock for the whole read-modify-write so it cannot
+    lose an update to a concurrent proactive_announce, and reuses that
+    writer's mkstemp + os.replace atomic pattern and its 50-item cap. Returns
+    True when the tail was written. Never raises — a failed requeue must not
+    take down the loop that speaks the rest of the queue."""
+    if not items:
+        return True
+    _pending_speech_lock.acquire()
+    try:
+        proj_dir = os.path.dirname(PENDING_SPEECH_PATH)
+        live: list = []
+        if os.path.exists(PENDING_SPEECH_PATH):
+            try:
+                with open(PENDING_SPEECH_PATH, "r", encoding="utf-8") as f:
+                    raw = f.read().strip()
+                if raw:
+                    decoded, _ = json.JSONDecoder().raw_decode(raw)
+                    if isinstance(decoded, list):
+                        live = decoded
+            except Exception:
+                live = []
+        merged = list(items) + live
+        # Same cap proactive_announce enforces (keep the most recent 50). Say
+        # so out loud when it bites: these are announcements we deferred and
+        # therefore implicitly promised to speak, and a silent drop is exactly
+        # the kind of unreported failure this project forbids.
+        if len(merged) > 50:
+            print(f"  [pending] queue over cap — dropping "
+                  f"{len(merged) - 50} of the oldest announcement(s)")
+            merged = merged[-50:]
+        fd: int = -1
+        tmp: str | None = None
+        try:
+            fd, tmp = tempfile.mkstemp(dir=proj_dir, suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                fd = -1   # fdopen took ownership of the descriptor
+                json.dump(merged, f, indent=2)
+            os.replace(tmp, PENDING_SPEECH_PATH)
+            tmp = None
+        except Exception:
+            if fd >= 0:
+                try: os.close(fd)
+                except Exception: pass  # pragma: no cover - defensive: os.close of an owned descriptor effectively never raises
+            if tmp is not None:
+                try: os.unlink(tmp)
+                except Exception: pass  # pragma: no cover - defensive: os.unlink of the just-created requeue temp effectively never raises
+            raise
+        return True
+    except Exception as _e:
+        print(f"  [pending] failed to requeue {len(items)} deferred "
+              f"announcement(s): {_e}")
+        return False
+    finally:
+        _pending_speech_lock.release()
+
+
 def _speak_pending():
     """If skills (like the timer) have queued reminders, speak them now.
 
@@ -22782,7 +23372,23 @@ def _speak_pending():
     # message strings, so this won't suppress them.
     spoke_any = False
     seen_in_batch: set[str] = set()
+    # Per-pass budget bookkeeping (see _PENDING_DRAIN_BUDGET_S).
+    _drain_started = time.monotonic()
+    deferred: list = []
     for item in items:
+        # ── PER-PASS BUDGET ───────────────────────────────────────
+        # Once this pass has spent its budget, stop speaking and hand the rest
+        # back to the queue: the loop returns to 'Listening…' so the user can
+        # get a word in, and the tail is spoken on the next idle pass. Gated on
+        # `spoke_any` so a pass ALWAYS makes forward progress — a single
+        # over-budget utterance can never wedge the queue by deferring itself
+        # forever. Once anything is deferred everything after it defers too,
+        # so the queue keeps its order.
+        if deferred or (spoke_any and
+                        (time.monotonic() - _drain_started)
+                        >= _PENDING_DRAIN_BUDGET_S):
+            deferred.append(item)
+            continue
         msg = item.get("message", "")
         if not msg:
             continue
@@ -22798,6 +23404,15 @@ def _speak_pending():
         item_mood = item.get("mood")
         if not isinstance(item_mood, str) or item_mood not in _VOICE_MOOD_NAMES:
             item_mood = None
+        # The watchdog measures MAIN-LOOP liveness, and this drain IS the main
+        # loop doing its intended work — but it used to run for tens of seconds
+        # without a single tick. On the 2026-08-21 00:00:51 boot the five
+        # announcements queued during boot drained from 00:02:42 to 00:03:51
+        # and the watchdog fired at 67.2s. Tick before EACH utterance so a
+        # stale heartbeat means "the loop is stuck", never "JARVIS is talking"
+        # — the same fix record_speech's frame loop got after the 2026-05-30
+        # ~70s stall, where a long CAPTURE starved the heartbeat the same way.
+        _heartbeat()
         try:
             _speak(msg, volume_scale=vol, mood=item_mood)
             _mark_speech_spoken(msg)
@@ -22807,9 +23422,16 @@ def _speak_pending():
             # continue to the next reminder. The snapshot is gone (we
             # already renamed), so this one is lost — but JARVIS stays up.
             print(f"  [pending] speak failed for reminder: {_spe}")
+    # Budget tripped: put the un-spoken tail back BEFORE dropping the
+    # snapshot, so the deferred announcements are never stranded.
+    if deferred:
+        print(f"  [pending] drain budget ({_PENDING_DRAIN_BUDGET_S:.0f}s) "
+              f"reached — deferring {len(deferred)} announcement(s) to the "
+              f"next pass")
+        _requeue_pending_speech(deferred)
     # Snapshot fully consumed — delete it. Any new items written DURING
     # this loop live in a fresh pending_speech.json that the next call
-    # will pick up.
+    # will pick up (and that the requeue above merged with, not clobbered).
     try:
         os.remove(consume_path)
     except Exception:

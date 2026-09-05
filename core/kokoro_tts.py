@@ -51,6 +51,85 @@ _SR = 24000               # Kokoro native sample rate (matches chatterbox/edge p
 # edge ladder speaks instead. Mirrors voice_clone's timeout discipline.
 _SYNTH_TIMEOUT_S = float(os.environ.get("KOKORO_SYNTH_TIMEOUT_S", "30"))
 
+# ── onnxruntime session tuning (2026-09-04 profile, TRACK 3) ─────────────
+# kokoro_onnx builds its InferenceSession with DEFAULT SessionOptions. On this
+# box that means ORT sizes the intra-op pool to the PHYSICAL core count (24 on
+# the 14900K) and leaves spin-wait ON, so every worker that finishes its slice
+# BUSY-WAITS on the next op instead of sleeping. Measured on this rig, one
+# 2.3 s reply cost 644 ms wall and 13.7 CPU-seconds — 21 cores, of which most
+# was spin, and the spinning threads were stealing cycles from the threads
+# doing real work. A bounded pool with spinning OFF is faster AND ~4x cheaper:
+#
+#   config                short reply        long reply        CPU burned
+#   default (today)       644 ms             1814 ms           21.2 cores
+#   16 threads, no spin   491 ms  (-24%)     1268 ms  (-30%)    6.7-7.7 cores
+#   8 threads,  no spin   586 ms  ( -9%)     1465 ms  (-19%)    3.9-4.2 cores
+#   (3 passes x 5 reps each, one config per subprocess, medians)
+#
+# Output is unchanged: the tuned session is bit-identical on short replies and
+# within 3e-6 (~-110 dBFS, far below 16-bit quantisation) on long ones, across
+# voices/speeds — thread count only reorders float reductions.
+#
+# KOKORO_ONNX_THREADS=0 restores kokoro_onnx's stock construction entirely.
+_ONNX_THREADS = os.environ.get("KOKORO_ONNX_THREADS", "16")
+_ONNX_SPIN = (os.environ.get("KOKORO_ONNX_SPIN", "0").strip() or "0")
+
+
+def _tuned_session(model_path: str):
+    """An onnxruntime InferenceSession for Kokoro with a BOUNDED intra-op pool
+    and spin-wait disabled. Returns None — meaning "let kokoro_onnx construct
+    the session itself, exactly as before" — when onnxruntime is missing, the
+    tunable is disabled, or ANYTHING at all goes wrong. Never raises. Imported
+    lazily so the module load stays free of native deps (CI-safety contract)."""
+    try:
+        import onnxruntime as _rt
+    except Exception:
+        return None
+    try:
+        n = int(_ONNX_THREADS)
+    except Exception:
+        n = 16
+    if n <= 0:                      # explicit opt-out
+        return None
+    try:
+        n = max(1, min(n, os.cpu_count() or n))
+        so = _rt.SessionOptions()
+        so.intra_op_num_threads = n
+        so.inter_op_num_threads = 1
+        so.execution_mode = _rt.ExecutionMode.ORT_SEQUENTIAL
+        # "0" = a worker that finishes its slice SLEEPS instead of burning a
+        # core until the next op arrives. This is the change that matters.
+        so.add_session_config_entry("session.intra_op.allow_spinning", _ONNX_SPIN)
+        so.add_session_config_entry("session.inter_op.allow_spinning", _ONNX_SPIN)
+        provider = os.environ.get("ONNX_PROVIDER") or "CPUExecutionProvider"
+        sess = _rt.InferenceSession(model_path, sess_options=so,
+                                    providers=[provider])
+        return sess
+    except Exception as e:
+        print(f"  [kokoro] tuned ONNX session unavailable "
+              f"({type(e).__name__}: {e}); using kokoro_onnx defaults")
+        return None
+
+
+def _build_engine(Kokoro):
+    """Build the Kokoro engine, preferring our tuned session. Returns
+    (engine, how) where `how` is a short string for the ready line. Falls back
+    to kokoro_onnx's own construction on any problem, so this can only ever be
+    as good as before, never worse."""
+    sess = _tuned_session(_MODEL)
+    if sess is not None and hasattr(Kokoro, "from_session"):
+        try:
+            eng = Kokoro.from_session(sess, _VOICES)
+            n = getattr(sess, "_sess_options", None)
+            n = getattr(n, "intra_op_num_threads", None) or _ONNX_THREADS
+            spin = "on" if _ONNX_SPIN not in ("0", "false", "False") else "off"
+            return eng, f"onnx intra_op={n}, spinning {spin}"
+        except Exception as e:
+            print(f"  [kokoro] from_session failed ({type(e).__name__}: {e}); "
+                  f"falling back to stock construction")
+    return Kokoro(_MODEL, _VOICES), "onnx defaults"
+
+
 
 def _models_present() -> bool:
     try:
@@ -106,8 +185,8 @@ def _engine():
                 print(f"  [kokoro] espeak wiring warning ({type(_pe).__name__}: "
                       f"{_pe}); continuing — kokoro may still self-wire")
             from kokoro_onnx import Kokoro
-            _ENGINE[0] = Kokoro(_MODEL, _VOICES)
-            print(f"  [kokoro] CPU engine ready (voice={_VOICE}, {_LANG})")
+            _ENGINE[0], _how = _build_engine(Kokoro)
+            print(f"  [kokoro] CPU engine ready (voice={_VOICE}, {_LANG}) — {_how}")
             return _ENGINE[0]
         except Exception as e:
             _FAILED[0] = True

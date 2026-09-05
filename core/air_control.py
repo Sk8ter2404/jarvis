@@ -1,6 +1,31 @@
 """
 air_control — pure, hardware-free "AIR CONTROL" engine for the Kinect v2.
 
+⚠️  THIS IS NOT THE ENGINE THE OWNER IS RUNNING. READ THIS BEFORE TOUCHING IT.
+====================================================================
+There are TWO Kinect hand-mouse implementations in this tree and they share no
+code:
+
+  • THIS module + skills/air_control.py — gated by AIR_CONTROL_ENABLED, which is
+    **False** in data/user_settings.json. Nothing here runs.
+  • skills/kinect_air_mouse.py — gated by KINECT_AIR_MOUSE_ENABLED, which is
+    **True**. THAT is the live air-mouse: the one that emits the
+    "[air-mouse] lift=… engaged=…" telemetry, and the one to change.
+
+They also use OPPOSITE engage models. This engine gates on FORWARD REACH plus an
+above-waist/below-shoulder height band (AIR_ENGAGE_FORWARD_M and friends below).
+The live engine gates on HEIGHT ABOVE THE SHOULDER and demoted forward reach to a
+non-gating cue in 2026-06 after forward reach was measured to be unusable on its
+own at a desk. So a constant here has NO counterpart there, and tuning one has no
+effect on the other.
+
+COST OF NOT KNOWING THIS: v2.0.89 added an upper height bound HERE to stop
+"raising my hands" from grabbing the cursor. The live engine never got it, so the
+false triggers continued for weeks and the owner switched the feature off after a
+false click closed his browser tabs. The real fix (2026-09-04) went into
+skills/kinect_air_mouse.py. If you are chasing a live air-mouse behaviour, you are
+in the wrong file.
+
 WHY THIS MODULE EXISTS
 ======================
 Movie-style spatial hand control: the owner reaches a hand out toward the

@@ -102,6 +102,13 @@ def main(argv: list[str]) -> int:
     import tests  # chokepoint: it arms all three, in order, idempotently
     from tools import browser_guard
     browser_guard.install()
+    # THEN THE TIME CEILING — the sibling of the memory ceiling above. mem_guard
+    # bounds what a run may ALLOCATE; this bounds how long it may STALL, which
+    # a memory ceiling structurally cannot see (a hang is not an allocation).
+    # Armed before discovery so an import-time hang is named too. See
+    # tools/test_watchdog.py (JARVIS_TEST_TIMEOUT_S=0 turns it off).
+    from tools import test_watchdog
+    test_watchdog.arm()
     # Redirect settings I/O to a throwaway copy BEFORE any test is imported, so
     # a leaked real save_settings can't touch data/user_settings.json.
     _redirect_settings_to_throwaway()
@@ -125,8 +132,12 @@ def main(argv: list[str]) -> int:
         suite = loader.discover(start_dir=_TESTS_DIR, pattern="test_*.py",
                                 top_level_dir=_PROJECT_ROOT)
 
-    runner = unittest.TextTestRunner(verbosity=2 if verbose else 1)
+    runner = unittest.TextTestRunner(
+        verbosity=2 if verbose else 1,
+        resultclass=test_watchdog.WatchdogTextTestResult)
     result = runner.run(suite)
+    # Suite over: stand the watchdog down before the reap/summary below.
+    test_watchdog.disarm()
 
     # Belt-and-suspenders: reap any opt-in background daemon a test left running
     # (e.g. the apple-music keep-alive watchdog, a non-terminating loop) so it

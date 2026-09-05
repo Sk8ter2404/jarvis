@@ -830,6 +830,149 @@ class SideTileWebcamReadTests(MonolithGlobalsTestCase):
 # ══════════════════════════════════════════════════════════════════════════
 #  B2 — the air-mouse hand circle: BLUE engaged / ORANGE closed / grey idle
 # ══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
+#  The side tiles REUSE the face-track loop's frames instead of re-opening the
+#  device (2026-09-04 preview-speed fix)
+# ═══════════════════════════════════════════════════════════════════════════
+@requires_monolith
+class SideTileReuseFaceTrackFramesTests(MonolithGlobalsTestCase):
+    """MEASURED live 2026-09-04: the face-track loop stalled on BLOCKING webcam
+    reads - a 10 s window locked at a 2.10 s period (two ~1.00 s reads per
+    iteration = 0.48 fps per preview tile); a 30 s window averaged 1.93 fps. One
+    of those reads was THIS reader opening a SECOND DirectShow graph (640x480) on
+    a webcam the loop already held at 1280x720, even though the loop caches every
+    camera's newest frame. The tile reader must REUSE that cache and never open
+    the device a second time."""
+
+    def setUp(self):
+        self.bc._release_side_tile_webcams()
+        self.addCleanup(self.bc._release_side_tile_webcams)
+
+    class _FakeCap:
+        def __init__(self, value):
+            self._np = __import__("numpy")
+            self._value = value
+            self.released = False
+
+        def read(self):
+            return True, self._np.full((480, 640, 3), self._value,
+                                       dtype=self._np.uint8)
+
+        def release(self):
+            self.released = True
+
+    def _cams(self):
+        """Two NAMED webcam entries, the live shape of CAMERAS."""
+        return [
+            {"index": 2, "label": "Left webcam (left monitor)",
+             "name": "emeet c960", "primary": True, "look_x": 0.5, "look_y": 0.5},
+            {"index": 0, "label": "Right webcam (top of right monitor)",
+             "name": "usb 2.0 camera", "primary": False, "look_x": 0.85,
+             "look_y": 0.5},
+        ]
+
+    def _seed(self, now, left_val=40, right_val=80, age=0.0):
+        np = _np()
+        self.bc._camera_latest_frame[2] = np.full((720, 1280, 3), left_val,
+                                                  dtype=np.uint8)
+        self.bc._camera_latest_frame[0] = np.full((720, 1280, 3), right_val,
+                                                  dtype=np.uint8)
+        self.bc._camera_last_frame_at[2] = now - age
+        self.bc._camera_last_frame_at[0] = now - age
+
+    def test_fresh_cached_frames_are_reused_and_no_device_is_opened(self):
+        now = 1000.0
+        self._seed(now)
+        opened = []
+        with mock.patch.object(self.bc, "CAMERAS", self._cams()), \
+                mock.patch.object(self.bc, "_open_tile_capture",
+                                  lambda idx: opened.append(idx)), \
+                mock.patch.object(self.bc, "_resolve_webcam_indices_by_name",
+                                  return_value={"left": 2, "right": 0}):
+            out = self.bc._read_side_tile_webcams(now=now)
+        self.assertEqual(opened, [])                     # NO second device open
+        self.assertEqual(int(out["left"].mean()), 40)
+        self.assertEqual(int(out["right"].mean()), 80)
+
+    def test_stale_cache_falls_back_to_the_original_capture_path(self):
+        # The face-track loop stopped / stalled -> the cached frame is old, so we
+        # must NOT show a frozen tile: fall through to the real capture.
+        now = 1000.0
+        self._seed(now, age=self.bc._KINECT_PREVIEW_TILE_REUSE_MAX_AGE + 1.0)
+        opened = []
+
+        def _fake_open(idx):
+            opened.append(idx)
+            return self._FakeCap(111)
+
+        with mock.patch.object(self.bc, "CAMERAS", self._cams()), \
+                mock.patch.object(self.bc, "_open_tile_capture", _fake_open), \
+                mock.patch.object(self.bc, "_resolve_webcam_indices_by_name",
+                                  return_value={"left": 5, "right": 6}):
+            out = self.bc._read_side_tile_webcams(now=now)
+        self.assertEqual(sorted(opened), [5, 6])         # fell back, by NAME
+        self.assertEqual(int(out["left"].mean()), 111)
+
+    def test_kinect_backed_slot_is_never_reused(self):
+        # The 2026-07-10 bug: reusing _camera_latest_frame for a KINECT-backed
+        # entry made both side tiles mirror the Kinect. A kinect-typed entry must
+        # still go down the real-webcam capture path.
+        now = 1000.0
+        self._seed(now)
+        cams = self._cams()
+        cams[0] = {"index": 2, "label": "Kinect", "type": "kinect",
+                   "primary": True, "look_x": 0.5, "look_y": 0.5}
+        opened = []
+
+        def _fake_open(idx):
+            opened.append(idx)
+            return self._FakeCap(222)
+
+        with mock.patch.object(self.bc, "CAMERAS", cams), \
+                mock.patch.object(self.bc, "_open_tile_capture", _fake_open), \
+                mock.patch.object(self.bc, "_resolve_webcam_indices_by_name",
+                                  return_value={"left": 5, "right": 6}):
+            out = self.bc._read_side_tile_webcams(now=now)
+        self.assertIn(5, opened)                         # left came from a WEBCAM
+        self.assertEqual(int(out["left"].mean()), 222)   # not the Kinect cache
+        self.assertEqual(int(out["right"].mean()), 80)   # right still reused
+
+    def test_reuse_releases_a_duplicate_handle_we_were_still_holding(self):
+        # Handles opened before the loop warmed up must be handed back once the
+        # cache is usable - otherwise the duplicate graph keeps starving the bus.
+        now = 1000.0
+        self._seed(now)
+        held = self._FakeCap(9)
+        self.bc._kinect_tile_caps["left"] = held
+        with mock.patch.object(self.bc, "CAMERAS", self._cams()), \
+                mock.patch.object(self.bc, "_open_tile_capture",
+                                  lambda idx: None), \
+                mock.patch.object(self.bc, "_resolve_webcam_indices_by_name",
+                                  return_value={"left": 2, "right": 0}):
+            self.bc._read_side_tile_webcams(now=now)
+        self.assertTrue(held.released)
+        self.assertIsNone(self.bc._kinect_tile_caps["left"])
+
+    def test_no_dshow_enumeration_when_both_slots_are_reused(self):
+        # _resolve_webcam_indices_by_name() walks the DirectShow device list via
+        # pygrabber (COM). If both tiles come from the cache we must not pay it.
+        now = 1000.0
+        self._seed(now)
+        calls = {"n": 0}
+
+        def _resolve():
+            calls["n"] += 1
+            return {"left": 2, "right": 0}
+
+        with mock.patch.object(self.bc, "CAMERAS", self._cams()), \
+                mock.patch.object(self.bc, "_open_tile_capture",
+                                  lambda idx: None), \
+                mock.patch.object(self.bc, "_resolve_webcam_indices_by_name",
+                                  _resolve):
+            self.bc._read_side_tile_webcams(now=now)
+        self.assertEqual(calls["n"], 0)
+
+
 @requires_monolith
 class HandCircleDrawTests(MonolithGlobalsTestCase):
     def _inject_air_mouse_state(self, engaged, grip, hand="right"):
