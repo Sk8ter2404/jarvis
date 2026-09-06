@@ -371,6 +371,231 @@ class ResolverEnumerationGateTests(MonolithGlobalsTestCase):
 
 
 @requires_monolith
+class AmplifierUnderLoadTests(MonolithGlobalsTestCase):
+    """THE AMPLIFIER AT THE RATE THE CODE ACTUALLY ALLOWS, and what a failed-open
+    gate does to it.
+
+    WHY THIS CLASS EXISTS. The 2026-09-06 sick-camera soak was reported as "the
+    sick camera does NOT reopen the amplifier — 96.4 min, both cameras, sick one
+    live". It did not test that. _KINECT_PREVIEW_TILE_READ_INTERVAL is 0.25 s, so
+    the right tile got ~24,000 reads in that window; the gap watcher recorded 3
+    right-tile gaps over 1 s in 23,465 writes and the tile's own byte count kept
+    moving (99 distinct sizes over 460 samples), i.e. the camera was delivering
+    frames, not placeholders. HOW OFTEN THE AMPLIFIER ACTUALLY FIRED IS NOT
+    KNOWABLE FROM THAT RUN — nothing counted invalidations (the counters landed
+    later the same day) and the side-tile failure path logs nothing, so the run
+    is silent on the only quantity the claim was about. What it does show is a
+    camera that healed. Cut to matched process-age windows the sick
+    leg (0.021 mfksproxy thr/min) and the healthy leg (0.019) are
+    indistinguishable, and both mfksproxy steps in each leg land 15-31 s after a
+    run_diagnostic sweep on its own 30-minute scheduler, in BOTH legs. Nothing in
+    that soak was a statement about the amplifier.
+
+    SOAKED PROPERLY 2026-09-06, real COM, real leaky enumeration, threads counted
+    by Win32 start address inside mfksproxy.dll:
+
+        35.0 min  gate healthy,  amplifier at 4 Hz   8,320 firings
+                        1 enumeration total, +1 mfksproxy thread, +237 handles,
+                        and the real probe answered on all 8,320 calls
+         3.0 min  gate degraded, amplifier quiet     6.00 enum/min   +664 hnd/min
+         3.0 min  gate degraded, amplifier at 4 Hz 208.13 enum/min +19,259 hnd/min
+         8.5 min  same, floor removed (confirm)    200.21 enum/min +18,340 hnd/min
+        25.0 min  gate degraded, amplifier at 4 Hz,  5.96 enum/min    +566 hnd/min
+                        with the floor (5,916 firings)
+
+    The two degraded amplifier rows are what nobody had measured, and they are
+    why the module's "+6 OS threads and +618 handles per MINUTE" description of
+    the degraded state was ~31x optimistic: at those rates the v2.0.100 death
+    numbers (14,507 threads / 1,419,190 handles) arrive in 74-82 minutes rather
+    than ~40 hours. The 8.5 min run stopped at a 1,500-thread safety cap with
+    the rate still flat, so the number is a rate, not an extrapolation.
+
+    These tests count CALLS into the leaky enumerator, like the rest of the file
+    — never threads, which are a property of the machine."""
+
+    # 20 minutes of the tile compositor's 4 Hz read throttle. Long enough that a
+    # per-tick leak and a per-TTL leak differ by two orders of magnitude, which
+    # is the whole point: at 60 s they differ by 6 vs 240 and a slow fixture
+    # could blur that.
+    _SOAK_MINUTES = 20.0
+
+    def setUp(self):
+        self.bc._kinect_preview_webcam_idx.clear()
+        self.bc._kinect_preview_webcam_resolved[0] = False
+        self.bc._kinect_preview_webcam_resolved_at[0] = 0.0
+        self.bc._kinect_preview_webcam_fingerprint[0] = None
+        self.bc._kinect_preview_webcam_enumerated_at[0] = 0.0
+        self.calls = []
+
+    def _amplify(self, fingerprint, minutes=None, tick=None,
+                 names=("Left Cam", "Right Cam"), clock_start=1000.0):
+        """Fire _invalidate_side_tile_indices() + the resolver every `tick`
+        seconds for `minutes` minutes — exactly what a camera that opens and
+        then fails every read does to this path — and return
+        (leaky enumerations, firings).
+
+        `fingerprint` is one constant value or a LIST giving the value per
+        FIRING (the last entry repeats), for the same reason the other fixtures
+        in this file do it that way: a re-enumerating tick samples the probe
+        twice, so a per-CALL generator desynchronises from ticks and the test
+        starts measuring itself."""
+        tick = self.bc._KINECT_PREVIEW_TILE_READ_INTERVAL if tick is None else tick
+        minutes = self._SOAK_MINUTES if minutes is None else minutes
+        fires = int(round(minutes * 60.0 / tick))
+        t = [clock_start]
+        schedule = (list(fingerprint) if isinstance(fingerprint, list)
+                    else [fingerprint])
+        i = [0]
+
+        def _fp_now():
+            return schedule[min(i[0], len(schedule) - 1)]
+
+        def _enumerate():
+            self.calls.append(1)
+            return list(names)
+
+        with mock.patch.object(self.bc, "_enumerate_dshow_input_devices",
+                               _enumerate), \
+             mock.patch.object(self.bc, "_video_device_fingerprint",
+                               side_effect=_fp_now), \
+             mock.patch.object(self.bc, "_kinect_preview_webcam_names",
+                               return_value={"left": "left cam",
+                                             "right": "right cam"}), \
+             mock.patch.object(self.bc, "_report_video_fingerprint_gate",
+                               return_value=False), \
+             mock.patch.object(self.bc.time, "time", side_effect=lambda: t[0]):
+            for k in range(fires):
+                i[0] = k
+                self.bc._invalidate_side_tile_indices()
+                self.bc._resolve_webcam_indices_by_name()
+                t[0] += tick
+        return len(self.calls), fires
+
+    def _ttl_bound(self, minutes=None):
+        """The most enumerations the TTL floor can permit over `minutes`."""
+        minutes = self._SOAK_MINUTES if minutes is None else minutes
+        return int(minutes * 60.0 / self.bc._WEBCAM_IDX_TTL_SEC) + 1
+
+    def test_the_fixture_really_does_fire_the_amplifier_every_tick(self):
+        """FIRST, PROVE THE SOAK IS A SOAK. This is the check the 2026-09-06
+        sick-camera run could not make: 3 amplifier firings in 100 minutes were
+        reported as evidence about a mechanism that fires 240 times a minute
+        when it fires at all. Assert the firing COUNT before asserting anything
+        about what it cost."""
+        _n, fires = self._amplify(_fp(), minutes=1.0)
+        self.assertEqual(fires, 240,
+                         "the fixture fired the amplifier %d times in a minute; "
+                         "_KINECT_PREVIEW_TILE_READ_INTERVAL says 240" % fires)
+
+    def test_twenty_minutes_of_the_amplifier_costs_one_enumeration(self):
+        """THE HEALTHY-GATE CONTRACT, at load. 4,800 forced re-resolves — a
+        camera that opens and fails every read for 20 minutes — must reach the
+        leaky enumerator exactly once, because an unchanged fingerprint proves
+        the indices cannot have reshuffled and re-enumeration could not fix a
+        sick device anyway. Measured against the real COM probes on this rig the
+        same shape gave 1 enumeration and +1 mfksproxy thread over 8,300
+        firings."""
+        n, fires = self._amplify(_fp())
+        self.assertEqual(fires, 4800, "fixture drifted: %d firings" % fires)
+        self.assertEqual(n, 1, "%d leaky enumerations for %d forced re-resolves "
+                               "on an unchanged bus" % (n, fires))
+
+    def test_a_failed_open_gate_does_not_let_the_amplifier_multiply_the_leak(self):
+        """THE DEFECT THIS CLASS WAS WRITTEN FOR.
+
+        When _video_device_fingerprint() returns None the resolver deliberately
+        degrades to re-enumerating — the right SAFETY choice, and the module's
+        alarm block describes the cost as "+6 OS threads and +618 handles per
+        MINUTE". That description silently assumed the TTL was pacing the calls.
+        It is not: _invalidate_side_tile_indices() clears the resolved flag, so
+        the TTL early-return never fires and the degraded path ran at the TILE
+        rate. Measured on this rig at 208 enumerations/min against 6.00/min with
+        the amplifier quiet — 31x, and ~75 minutes to the v2.0.100 death numbers
+        instead of ~40 hours.
+
+        A forced invalidation may still bypass the TTL, but only once per TTL
+        window. Over 20 minutes that is at most 121 enumerations, not 4,800."""
+        n, fires = self._amplify(None)
+        bound = self._ttl_bound()
+        self.assertLessEqual(
+            n, bound,
+            "a failed-open gate under the amplifier made %d leaky enumerations "
+            "in %.0f min (%d firings). The TTL permits at most %d; anything "
+            "near %d means the forced path is bypassing the rate floor and the "
+            "process is ~75 min from thread exhaustion."
+            % (n, self._SOAK_MINUTES, fires, bound, fires))
+        # ...and it must still be re-enumerating, not pinned: a probe that
+        # cannot tell is never evidence that nothing moved.
+        self.assertGreaterEqual(
+            n, bound - 2,
+            "the degraded gate made only %d enumerations in %.0f min — it has "
+            "stopped self-healing, which is the wrong-camera bug the whole "
+            "resolver exists to prevent" % (n, self._SOAK_MINUTES))
+
+    def test_the_floor_is_what_bounds_it_not_the_fixture(self):
+        """THE COUNTERFACTUAL, so the test above cannot pass for the wrong
+        reason (a fixture whose clock never advances would also report a small
+        number). Drive _WEBCAM_IDX_TTL_SEC to 0 and the SAME fixture must go
+        back to one leaky enumeration per firing — i.e. it really is sensitive
+        to the defect, and the bound above is the floor, not the harness."""
+        with mock.patch.object(self.bc, "_WEBCAM_IDX_TTL_SEC", 0.0):
+            n, fires = self._amplify(None, minutes=1.0)
+        self.assertEqual(n, fires,
+                         "with the floor removed the amplifier produced %d "
+                         "enumerations for %d firings; the fixture is not "
+                         "exercising the defect" % (n, fires))
+
+    def test_the_first_failed_read_after_a_quiet_window_still_re_resolves(self):
+        """THE OTHER HALF OF THE CONTRACT. The floor must not turn "a failed
+        read re-resolves by name" into "a failed read is ignored". With the gate
+        degraded and no enumeration for longer than the TTL, the very next
+        forced invalidation has to reach the enumerator immediately — that is
+        the 2026-07-14 behaviour the invalidation exists for."""
+        n, _ = self._amplify(None, minutes=1.0)
+        before = n
+        # A quiet window longer than the TTL, then ONE failed read.
+        n2, _ = self._amplify(
+            None, minutes=self.bc._KINECT_PREVIEW_TILE_READ_INTERVAL / 60.0,
+            clock_start=1000.0 + 60.0 + self.bc._WEBCAM_IDX_TTL_SEC * 3)
+        self.assertEqual(n2 - before, 1,
+                         "the first failed read after a quiet window did not "
+                         "re-resolve (%d new enumerations)" % (n2 - before))
+
+    def test_the_floor_never_delays_a_real_bus_change(self):
+        """THE FLOOR APPLIES ONLY TO 'COULD NOT TELL'. A fingerprint that
+        CHANGES is a real device joining, leaving or re-arriving, and DirectShow
+        indices really can have reshuffled — so that must still re-enumerate on
+        the very next tick even though the previous enumeration was
+        milliseconds ago and the amplifier is hammering the path.
+
+        This is the failure that would be quieter than the leak: the tiles would
+        keep reading, from the wrong camera."""
+        moved = _fp((("usb#vid_1&pid_1", b"\x77" * 8),))
+        # 8 firings = 2 s, far inside the TTL. Change the bus on firing 4.
+        schedule = [_fp()] * 4 + [moved] * 4
+        n, fires = self._amplify(schedule, minutes=8 * 0.25 / 60.0)
+        self.assertEqual(fires, 8, "fixture drifted: %d firings" % fires)
+        self.assertEqual(n, 2, "a bus change inside the TTL window was not "
+                               "re-enumerated (%d enumerations)" % n)
+
+    def test_a_quiet_amplifier_is_not_evidence_about_a_loud_one(self):
+        """THE REPORTING DEFECT, pinned so it cannot be made again. Three
+        firings and 4,800 firings must be distinguishable from the numbers a
+        soak collects; if the accounting cannot tell them apart, a run in which
+        the camera healed reads exactly like a run in which the gate held.
+
+        get_side_tile_gate_stats()['invalidations'] is that witness."""
+        self.bc._side_tile_gate_counts["invalidations"] = 0
+        self.bc._side_tile_gate_counts["enumerations"] = 0
+        self._amplify(_fp(), minutes=1.0)
+        loud = self.bc.get_side_tile_gate_stats()["invalidations"]
+        self.assertEqual(loud, 240,
+                         "the amplifier fired 240 times and the accounting saw "
+                         "%d — a soak using these numbers could not tell a gate "
+                         "that held from a camera that healed" % loud)
+
+
+@requires_monolith
 class SetupApiProbeReleaseTests(MonolithGlobalsTestCase):
     """The replacement probe opens a real OS handle (SetupDiGetClassDevs). The
     whole point of this change is not leaking, so it must destroy that handle on
@@ -743,13 +968,26 @@ class SickCameraReopenIsNotGatedTests(MonolithGlobalsTestCase):
     Like the rest of this file, these tests count CALLS, never threads."""
 
     class _SickCap:
-        """Opens fine, every read fails - the v2.0.100 symptom exactly. A camera
-        that will not OPEN never reaches the invalidate/reopen path at all
-        (_read_side_tile_webcams `continue`s on a None capture), so an
-        out-of-range index is the wrong stand-in for a sick one."""
+        """Opens fine, delivers ONE frame, then every read fails - the
+        v2.0.100 symptom. A camera that will not OPEN never reaches the
+        invalidate/reopen path at all (_read_side_tile_webcams `continue`s on
+        a None capture), so an out-of-range index is the wrong stand-in for a
+        sick one.
+
+        THE FIRST FRAME WAS ADDED 2026-09-05 and is not a softening of the
+        fixture — it makes it match the device. The owner's sick webcam does
+        not fail every read; it delivers, then drops one every ~10 s to ~9 min.
+        It also matters now that the openers prove a frame before handing a
+        handle back (a Media Foundation open of a camera another process holds
+        reports isOpened() True and then delivers nothing, so "opened" stopped
+        being evidence). A cap that never reads at all is that OTHER shape, and
+        under the current code it is correctly refused at open — which would
+        make this class silently measure zero reopens instead of the churn it
+        exists to pin."""
 
         def __init__(self):
             self.releases = 0
+            self._first = True
 
         def isOpened(self):
             return True
@@ -758,6 +996,10 @@ class SickCameraReopenIsNotGatedTests(MonolithGlobalsTestCase):
             return True
 
         def read(self, *_a):
+            if self._first:
+                self._first = False
+                import numpy as _np
+                return True, _np.zeros((8, 8, 3), dtype=_np.uint8)
             return False, None
 
         def release(self):

@@ -52,14 +52,32 @@ from tests._monolith_harness import MonolithGlobalsTestCase, requires_monolith, 
 
 class _FakeCap:
     """Stand-in for cv2.VideoCapture. Optionally blocks inside ``set()`` -
-    which is the exact line the live producer was measured wedged on."""
+    which is the exact line the live producer was measured wedged on.
 
-    def __init__(self, opened=True, block_event=None, frames=None):
+    A BARE ``_FakeCap()`` NOW DELIVERS FRAMES FOREVER (changed 2026-09-05).
+    It used to open and then return ``(False, None)`` from every read, which
+    was a fine stand-in while "opened" was the whole definition of a usable
+    camera. It is not any more: the openers moved to Media Foundation, and a
+    device another process is holding reports isOpened() True on MSMF,
+    accepts set(), reads the requested resolution back out of get() — and
+    delivers nothing (measured 2026-09-05: 0 frames of 20, against
+    DirectShow's honest isOpened() == False). So _open_tile_capture() and the
+    face-track producer now require a frame before they will hand a handle
+    back, and a fake that never reads models a BROKEN camera, not a healthy
+    one. Tests that want the broken shape ask for it: ``delivers=False``."""
+
+    _NO_FRAMES = object()
+
+    def __init__(self, opened=True, block_event=None, frames=_NO_FRAMES,
+                 delivers=True):
         self._opened = opened
         self._block = block_event
-        self._frames = list(frames or [])
+        self._scripted = frames is not _FakeCap._NO_FRAMES
+        self._frames = list(frames or []) if self._scripted else []
+        self._delivers = delivers
         self.released = False
         self.set_calls = []
+        self.reads = 0
 
     def isOpened(self):
         return self._opened
@@ -72,9 +90,15 @@ class _FakeCap:
         return True
 
     def read(self):
-        if self._frames:
-            return True, self._frames.pop(0)
-        return False, None
+        self.reads += 1
+        if self._scripted:
+            if self._frames:
+                return True, self._frames.pop(0)
+            return False, None
+        if not self._delivers:
+            return False, None
+        import numpy as _np
+        return True, _np.zeros((8, 8, 3), dtype=_np.uint8)
 
     def release(self):
         self.released = True
@@ -509,7 +533,9 @@ class BoundedCameraIoTests(MonolithGlobalsTestCase):
         OpenCaptureByNameTests already does for the name resolution.)"""
         import inspect
         src = inspect.getsource(self.bc._face_tracking_thread_body)
-        self.assertIn("_open_capture_bounded(idx, _dshow_open", src)
+        # Renamed from _dshow_open on 2026-09-05: the opener is no longer
+        # DirectShow-specific, it goes through _camera_open().
+        self.assertIn("_open_capture_bounded(idx, _backend_open", src)
         self.assertIn("_CAMERA_LOOP_OPEN_TIMEOUT_S", src)
         # Generous on purpose: cv2 can legitimately spend 20-30 s retrying a
         # dead index, so the cap must sit ABOVE that or it would abandon opens
@@ -636,7 +662,11 @@ class SickCameraDoesNotStopTheOthersTests(MonolithGlobalsTestCase):
              mock.patch.object(self.bc, "_open_tile_capture",
                                return_value=cap) as opener:
             out = self.bc._read_side_tile_webcams(after)
-        opener.assert_any_call(0)
+        # The tile opener takes the CAMERAS name as well as the index since
+        # 2026-09-05: matching by name is what lets Media Foundation be given
+        # the right device without a DirectShow enumeration (the two backends
+        # do not index the same list).
+        self.assertIn(0, [c.args[0] for c in opener.call_args_list])
         self.assertIsNotNone(out["right"], "the retry never produced a frame")
 
 
@@ -947,16 +977,34 @@ class AnOpenedLineMeansTheProducerHoldsThatCameraTests(MonolithGlobalsTestCase):
             gate.set()
 
     def test_the_worker_side_opener_cannot_print_at_all(self):
-        """Structural belt: ``_dshow_open`` runs on the abandonable worker, so
-        it must not be able to announce anything. Asserted on the code object,
-        so it cannot be defeated by re-wording the message."""
-        dshow = [c for c in _open_capture_code(self.bc).co_consts
-                 if isinstance(c, types.CodeType) and c.co_name == "_dshow_open"]
-        self.assertEqual(len(dshow), 1, "_dshow_open moved or was renamed")
+        """Structural belt: ``_backend_open`` runs on the abandonable worker,
+        so it must not be able to announce anything. Asserted on the code
+        object, so it cannot be defeated by re-wording the message.
+
+        RENAMED from ``_dshow_open`` on 2026-09-05, when the opener stopped
+        being DirectShow-specific and moved to _camera_open()."""
+        opener = [c for c in _open_capture_code(self.bc).co_consts
+                  if isinstance(c, types.CodeType)
+                  and c.co_name == "_backend_open"]
+        self.assertEqual(len(opener), 1, "_backend_open moved or was renamed")
         self.assertNotIn(
-            "print", dshow[0].co_names,
-            "_dshow_open prints from the throwaway worker again - an abandoned "
-            "open will narrate itself as a success")
+            "print", opener[0].co_names,
+            "_backend_open prints from the throwaway worker again - an "
+            "abandoned open will narrate itself as a success")
+
+    def test_the_shared_opener_cannot_print_either(self):
+        """The same rule, one level down.
+
+        _backend_open now delegates to the module-level _camera_open(), so the
+        structural check above would pass while _camera_open printed the
+        backend decision straight into the session transcript from the
+        throwaway worker. It did, briefly, on 2026-09-05. Everything
+        _camera_open has to say goes through logging instead."""
+        self.assertNotIn(
+            "print", self.bc._camera_open.__code__.co_names,
+            "_camera_open prints from the throwaway open worker - an abandoned "
+            "open will narrate itself into the transcript after the abandon "
+            "line, exactly as an 'opened' line used to")
 
 
 

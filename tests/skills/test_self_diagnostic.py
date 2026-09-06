@@ -618,6 +618,15 @@ def make_cv2(open_map=None, frames=None, cascade_empty=False, raise_cascade=Fals
     default opens index 0. ``frames`` overrides the frame sequence."""
     cv2 = types.ModuleType("cv2")
     cv2.CAP_DSHOW = 700
+    # The webcam probe moved to Media Foundation on 2026-09-05 (DirectShow
+    # leaks +4.6 OS threads and ~+479 handles per open/release cycle, measured;
+    # and the probe's two halves were using two different backends, so "index
+    # 0" meant a different physical camera to each). Real cv2 has always had
+    # both constants; this fake only had one.
+    cv2.CAP_MSMF = 1400
+    cv2.CAP_PROP_FRAME_WIDTH = 3
+    cv2.CAP_PROP_FRAME_HEIGHT = 4
+    cv2.CAP_PROP_BUFFERSIZE = 38
     open_map = open_map if open_map is not None else {0: True}
 
     def _VideoCapture(idx, *a, **k):
@@ -3813,7 +3822,15 @@ class ProbeInternalBranchTests(_ProbeTestBase):
         # warmup ok, first real read black, retry read returns (False, None),
         # then a black frame again → still persistent black.
         black = _FakeFrame([0, 0, 0, 0])
-        frames = [(True, black), (True, black), (False, None), (True, black),
+        # ONE EXTRA LEADING FRAME since 2026-09-05. The index scan now proves
+        # the device delivers before accepting it, because "opened" stopped
+        # being evidence: under MSMF, index 0 on the owner's rig is the
+        # Kinect's Media Foundation interface, which opens at 512x424 and then
+        # fails every read - so the old scan always chose a camera that could
+        # never work. That proof consumes one read, so the sequence this test
+        # cares about starts one entry later.
+        frames = [(True, black),
+                  (True, black), (True, black), (False, None), (True, black),
                   (True, black)]
         cv2 = make_cv2(frames=frames)
         with inject_modules(cv2=cv2), \
@@ -3844,6 +3861,7 @@ class ProbeInternalBranchTests(_ProbeTestBase):
 
         cv2 = types.ModuleType("cv2")
         cv2.CAP_DSHOW = 700
+        cv2.CAP_MSMF = 1400          # the probe opens with MSMF since 2026-09-05
         cv2.VideoCapture = lambda *a, **k: _Cap()
         with inject_modules(cv2=cv2), \
              mock.patch.object(self.mod, "_bc", return_value=None):

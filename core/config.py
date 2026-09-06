@@ -617,6 +617,30 @@ CAMERAS = [
     {"index": 0, "label": "Right webcam (top of right monitor)", "name": "usb 2.0 camera", "primary": False, "look_x": 0.85, "look_y": 0.5},
 ]
 
+# CAMERA_BACKEND — which OpenCV capture backend actually opens a camera:
+# "msmf" (Media Foundation, the default since 2026-09-05) or "dshow"
+# (DirectShow, the historical behaviour). Override for one run with the env var
+# JARVIS_CAMERA_BACKEND.
+#
+# DirectShow LEAKS. Measured on this rig 2026-09-05, 25 open/read/release
+# cycles per figure, each in a fresh process, 1280x720 requested:
+#     eMeet C960   CAP_DSHOW  +4.58 OS threads  +479 handles  per cycle
+#     eMeet C960   CAP_MSMF   -0.21 OS threads    +0.97       per cycle
+#     USB 2.0 Cam  CAP_DSHOW  +4.55 OS threads  +479 handles  per cycle
+#     USB 2.0 Cam  CAP_MSMF   -0.18 OS threads    +1.06       per cycle
+# The DirectShow threads are owned by mfksproxy.dll and are never reclaimed —
+# the same leak v2.0.101 gated in the ENUMERATION path, reappearing in the OPEN
+# path where no gate can help. A DEAD index costs +103 handles under DirectShow
+# and +0 under Media Foundation, so index sweeps pay it too.
+#
+# The indices below are still DIRECTSHOW indices: the two backends enumerate
+# DIFFERENT lists (DirectShow 0=USB 2.0 Camera 1=Kinect 2=eMeet 3=OBS Virtual
+# Camera; Media Foundation 0=Kinect 1=USB 2.0 Camera 2=eMeet, no OBS at all),
+# so core/camera_backend.py TRANSLATES at open time — by device NAME where
+# CAMERAS supplies one. Do NOT hand a raw CAMERAS index to CAP_MSMF; on this
+# rig that repoints index 0 from the USB webcam to the Kinect.
+CAMERA_BACKEND            = "msmf"
+
 # Camera probe — if CAMERAS fails to open, sweep indices 0..MAX-1 and
 # rewrite CAMERAS with whatever's actually plugged in. cv2.CAP_DSHOW
 # retries internally for ~26s on a missing index, so each probe is

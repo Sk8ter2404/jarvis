@@ -199,6 +199,18 @@ _MONOLITH_RESTORE_NAMES = (
     # vacuously.
     "_webcam_fingerprint_degraded", "_webcam_fingerprint_degraded_since",
     "_webcam_fingerprint_warned_at", "_webcam_fingerprint_leaky_enums",
+    # ...and the AMPLIFIER accounting (2026-09-06). These are the counters that
+    # make "the amplifier fired" a checkable statement instead of a story, so a
+    # test that leaks a non-zero window start would make the NEXT test's report
+    # line silently not print (throttled + edge-triggered, exactly like the
+    # alarm cells above), and a leaked invalidation count would let a soak-
+    # honesty test pass on somebody else's failures.
+    "_side_tile_gate_counts", "_side_tile_gate_window",
+    # ...and the producer-owned decline note's per-slot throttle (2026-09-06).
+    # Same edge-triggered hazard: a leaked timestamp makes the NEXT test's
+    # "declined N own-handle open(s)" line silently not print, so a test
+    # asserting the line fails for a reason unrelated to its own code.
+    "_tile_open_declined_note",
     # ...and the camera-OPEN path's slot of the same gate, which
     # _dshow_name_to_index() owns. Same hazard as the resolver's cells above and
     # then some: this one is consulted by _open_capture and by the boot rescue,

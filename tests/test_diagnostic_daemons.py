@@ -2358,6 +2358,91 @@ class PauseResumeTests(_Base):
         self.assertIn("resumed", dd.act_resume_diagnostics().lower())
         self.assertFalse(self._read_state_file()["paused"])
 
+    # ---- reconcile_paused -------------------------------------------------
+    # Boot-time repair for the stale-pause defect found live 2026-09-06: the
+    # persisted flag could be stuck True with no way to clear it, because the
+    # restore path only ever pushed the True case. All four loops stamp
+    # alive_ts BEFORE testing paused, so a stale True is invisible to every
+    # liveness check - the daemons heartbeat forever and do nothing.
+
+    def test_reconcile_clears_a_stale_pause_and_reports_the_drift(self):
+        dd.pause_diagnostics()
+        self.assertTrue(self._read_state_file()["paused"])
+        self.assertTrue(dd.reconcile_paused(False))
+        self.assertFalse(self._read_state_file()["paused"])
+
+    def test_reconcile_sets_pause_and_reports_the_drift(self):
+        dd.resume_diagnostics()
+        self.assertTrue(dd.reconcile_paused(True))
+        self.assertTrue(self._read_state_file()["paused"])
+
+    def test_reconcile_reports_no_drift_when_already_correct(self):
+        dd.resume_diagnostics()
+        self.assertFalse(dd.reconcile_paused(False))
+        self.assertFalse(self._read_state_file()["paused"])
+        dd.pause_diagnostics()
+        self.assertFalse(dd.reconcile_paused(True))
+        self.assertTrue(self._read_state_file()["paused"])
+
+    def test_reconcile_is_idempotent(self):
+        dd.pause_diagnostics()
+        self.assertTrue(dd.reconcile_paused(False))    # first call repairs
+        self.assertFalse(dd.reconcile_paused(False))   # second is a no-op
+        self.assertFalse(self._read_state_file()["paused"])
+
+    def test_reconcile_coerces_truthy_values_to_bool(self):
+        dd.resume_diagnostics()
+        self.assertTrue(dd.reconcile_paused("yes"))
+        self.assertIs(self._read_state_file()["paused"], True)
+        self.assertFalse(dd.reconcile_paused(1))
+
+    def test_reconcile_touches_only_the_paused_key(self):
+        """Every counter and cursor must survive the repair.
+
+        crash_watch.last_seen_record_id is the one that matters most: the
+        watcher re-seeds when it reads 0, and losing the cursor would replay
+        every historical APPCRASH in the event log as a fresh detection.
+        """
+        dd._update_state(lambda s: (
+            s.update({"paused": True}),
+            s["crash_watch"].update({"last_seen_record_id": 987654,
+                                     "detections": 3}),
+            s["self_diag"].update({"runs": 293}),
+            s["deep_audit"].update({"daily_budget_spent_usd": 0.4,
+                                    "daily_budget_date": "2026-05-30"}),
+            s["anomaly_watch"].update({"detections": 9,
+                                       "last_boot_failure_offset": 512}),
+        ))
+        self.assertTrue(dd.reconcile_paused(False))
+        after = self._read_state_file()
+        self.assertFalse(after["paused"])
+        self.assertEqual(after["crash_watch"]["last_seen_record_id"], 987654)
+        self.assertEqual(after["crash_watch"]["detections"], 3)
+        self.assertEqual(after["self_diag"]["runs"], 293)
+        self.assertEqual(after["deep_audit"]["daily_budget_spent_usd"], 0.4)
+        self.assertEqual(after["deep_audit"]["daily_budget_date"], "2026-05-30")
+        self.assertEqual(after["anomaly_watch"]["detections"], 9)
+        self.assertEqual(after["anomaly_watch"]["last_boot_failure_offset"], 512)
+
+    def test_reconcile_on_a_missing_state_file_reports_no_drift(self):
+        """Default state is unpaused, so a fresh box needs no repair."""
+        if os.path.exists(dd.STATE_FILE):
+            os.remove(dd.STATE_FILE)
+        self.assertFalse(dd.reconcile_paused(False))
+        self.assertFalse(self._read_state_file()["paused"])
+
+    def test_reconcile_result_unblocks_a_paused_loop(self):
+        """End-to-end: the flag the four loops actually read is what moves.
+
+        Asserted through diagnostic_daemon_status(), which is what the HUD and
+        the status action report, so a future refactor that repairs the file
+        but not the reported state still fails here.
+        """
+        dd.pause_diagnostics()
+        self.assertTrue(dd.diagnostic_daemon_status()["paused"])
+        dd.reconcile_paused(False)
+        self.assertFalse(dd.diagnostic_daemon_status()["paused"])
+
 
 class StatusTests(_Base):
     def test_status_defaults_not_started(self):

@@ -1334,13 +1334,18 @@ class FaceTrackingThreadTests(_MonolithSec2Base):
 
         stop = self.bc._face_track_stop
 
-        # First read() yields a good frame; immediately arm the stop event so
-        # the while-loop condition is False at the top of the next iteration.
-        def _read():
-            stop.set()
-            return True, frame
-
-        cap.read.side_effect = _read
+        # STOP FROM THE LOOP, NOT FROM read(). This used to arm the stop event
+        # inside cap.read(), on the assumption that the FIRST read the code
+        # makes is the loop's. That stopped being true on 2026-09-05:
+        # _camera_open() proves the device delivers a frame before handing the
+        # handle back (under Media Foundation a camera another process holds
+        # reports isOpened() True and then produces nothing, so "opened" is no
+        # longer evidence), which consumes one read per camera BEFORE the loop
+        # starts — so the old fake stopped the loop before it ran at all.
+        # _note_camera_read_attempt is called only by the loop, once per read
+        # result, so arming from there restores "exactly one iteration"
+        # whatever the open costs.
+        cap.read.return_value = (True, frame)
         cv2 = mock.Mock()
         cv2.VideoCapture.return_value = cap
         cv2.CAP_DSHOW = 700
@@ -1350,7 +1355,8 @@ class FaceTrackingThreadTests(_MonolithSec2Base):
                 mock.patch.object(self.bc, "CAMERAS", self._cams()), \
                 mock.patch.object(self.bc, "_detect_face",
                                   return_value=(0.5, 0.5)), \
-                mock.patch.object(self.bc, "_note_camera_read_attempt"), \
+                mock.patch.object(self.bc, "_note_camera_read_attempt",
+                                  side_effect=lambda *a, **k: stop.set()), \
                 mock.patch.object(self.bc, "send",
                                   side_effect=lambda **k: sends.append(k)), \
                 mock.patch.object(self.bc.time, "sleep"):
@@ -1379,10 +1385,10 @@ class FaceTrackingThreadTests(_MonolithSec2Base):
         if camera_off:
             cam_off.set()
 
-        def _read():
-            stop.set()          # end the loop after this single iteration
-            return True, frame
-        cap.read.side_effect = _read
+        # Armed from _note_camera_read_attempt below, not from read() — see
+        # test_one_good_frame_iteration_then_stop for why read() is no longer a
+        # reliable "the loop is running" signal.
+        cap.read.return_value = (True, frame)
 
         cv2 = mock.Mock()
         cv2.VideoCapture.return_value = cap
@@ -1404,7 +1410,8 @@ class FaceTrackingThreadTests(_MonolithSec2Base):
                                       write_mock), \
                     mock.patch.object(self.bc, "_hud_camera_preview_remove",
                                       remove_mock), \
-                    mock.patch.object(self.bc, "_note_camera_read_attempt"), \
+                    mock.patch.object(self.bc, "_note_camera_read_attempt",
+                                      side_effect=lambda *a, **k: stop.set()), \
                     mock.patch.object(self.bc, "send"), \
                     mock.patch.object(self.bc.time, "sleep"):
                 self._run_face_tracking_bounded()
@@ -1470,10 +1477,10 @@ class FaceTrackingThreadTests(_MonolithSec2Base):
 
         stop = self.bc._face_track_stop
 
-        def _read():
-            stop.set()          # end the loop after this single iteration
-            return True, frame
-        cap.read.side_effect = _read
+        # Armed from _note_camera_read_attempt below, not from read() — see
+        # test_one_good_frame_iteration_then_stop for why read() is no longer a
+        # reliable "the loop is running" signal.
+        cap.read.return_value = (True, frame)
 
         cv2 = mock.Mock()
         cv2.VideoCapture.return_value = cap
@@ -1491,7 +1498,8 @@ class FaceTrackingThreadTests(_MonolithSec2Base):
                 mock.patch.object(self.bc, "CAMERAS", self._cams()), \
                 mock.patch.object(self.bc, "_detect_face",
                                   side_effect=_boom), \
-                mock.patch.object(self.bc, "_note_camera_read_attempt"), \
+                mock.patch.object(self.bc, "_note_camera_read_attempt",
+                                  side_effect=lambda *a, **k: stop.set()), \
                 mock.patch.object(self.bc, "send"), \
                 mock.patch.object(self.bc.time, "sleep",
                                   side_effect=lambda s: sleeps.append(s)):
@@ -2310,7 +2318,9 @@ class RestoreTrayToggleErrorTests(_MonolithSec2Base):
                                 clear=False):
             self.assertIsNone(self.bc._restore_tray_toggle_state())
         self.assertTrue(paused[0])
-        fake_diag.pause_diagnostics.assert_called_once()
+        # The restore now RECONCILES the on-disk mirror instead of only ever
+        # pushing the True case - see reconcile_paused's docstring.
+        fake_diag.reconcile_paused.assert_called_once_with(True)
         fake_al.set_paused.assert_called_once_with(True)
 
     def test_daemons_paused_owner_failures_are_caught(self):
@@ -2328,7 +2338,7 @@ class RestoreTrayToggleErrorTests(_MonolithSec2Base):
                 mod = mock.Mock()
                 # accessing .diagnostic_daemons.pause_diagnostics raises
                 dd = mock.Mock()
-                dd.pause_diagnostics.side_effect = RuntimeError("pause fail")
+                dd.reconcile_paused.side_effect = RuntimeError("pause fail")
                 mod.diagnostic_daemons = dd
                 return mod
             return real_import(name, *a, **k)
@@ -2342,6 +2352,70 @@ class RestoreTrayToggleErrorTests(_MonolithSec2Base):
             # Both failures caught → returns cleanly.
             self.assertIsNone(self.bc._restore_tray_toggle_state())
         self.assertTrue(paused[0])
+
+
+    def test_unpaused_boot_clears_a_stale_paused_mirror(self):
+        """REGRESSION (found live on this box 2026-09-06).
+
+        A stale ``"paused": true`` in data/diagnostic_daemons.json used to
+        survive every restart. This block only ever pushed the True case, so a
+        mirror left paused by a path the visible HUD flag never followed - a
+        spoken pause_diagnostics, or a lever whose restore never ran because
+        the box was power-cycled - could not be cleared by restarting JARVIS.
+        It failed silently in the worst direction: all four loops stamp their
+        alive_ts BEFORE testing paused, so every liveness check saw four happy
+        heartbeats while the daemons did no work at all. Measured that day:
+        last real work 94-101 days stale under a boot log printing
+        ``paused=False``, with crash-watch among the daemons quietly disarmed.
+
+        Drives the REAL core.diagnostic_daemons against a temp state file, so
+        this proves the whole chain writes the cleared flag to disk rather
+        than just asserting that a mock was called.
+        """
+        from core import diagnostic_daemons as real_dd
+        state_path = os.path.join(self.tmp, "diagnostic_daemons.json")
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump({"paused": True,
+                       "crash_watch": {"last_seen_record_id": 4242,
+                                       "detections": 7}}, f)
+        with open(self.hud_file, "w", encoding="utf-8") as f:
+            json.dump({"daemons_paused": False}, f)
+        # Seeded True so a no-op restore is caught by the assert below.
+        paused = [True]
+        with mock.patch.object(real_dd, "STATE_FILE", state_path), \
+                mock.patch.object(real_dd, "DATA_DIR", self.tmp), \
+                mock.patch.object(self.bc, "_daemons_paused", paused), \
+                mock.patch.object(self.bc, "ACTIONS", {}):
+            self.assertIsNone(self.bc._restore_tray_toggle_state())
+        self.assertFalse(paused[0], "hud daemons_paused=False not restored")
+        with open(state_path, encoding="utf-8") as f:
+            after = json.load(f)
+        self.assertFalse(
+            after["paused"],
+            "stale paused mirror survived the restart - the daemons would "
+            "keep heartbeating while doing no work")
+        # Reconciling must touch ONLY `paused`: the crash-watch cursor is what
+        # stops a re-seed from replaying every historical APPCRASH.
+        self.assertEqual(after["crash_watch"]["last_seen_record_id"], 4242)
+        self.assertEqual(after["crash_watch"]["detections"], 7)
+
+    def test_paused_boot_still_writes_the_mirror_through(self):
+        """The other direction still works: a real tray pause reaches disk."""
+        from core import diagnostic_daemons as real_dd
+        state_path = os.path.join(self.tmp, "diagnostic_daemons.json")
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump({"paused": False}, f)
+        with open(self.hud_file, "w", encoding="utf-8") as f:
+            json.dump({"daemons_paused": True}, f)
+        paused = [False]
+        with mock.patch.object(real_dd, "STATE_FILE", state_path), \
+                mock.patch.object(real_dd, "DATA_DIR", self.tmp), \
+                mock.patch.object(self.bc, "_daemons_paused", paused), \
+                mock.patch.object(self.bc, "ACTIONS", {}):
+            self.assertIsNone(self.bc._restore_tray_toggle_state())
+        self.assertTrue(paused[0])
+        with open(state_path, encoding="utf-8") as f:
+            self.assertTrue(json.load(f)["paused"])
 
 
 # ───────────────────────────────────────────────────────────────────────────

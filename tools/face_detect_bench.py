@@ -53,6 +53,23 @@ def _load_frame(path: str) -> np.ndarray:
 
 
 def _grab_camera_frame(index: int, w: int, h: int) -> np.ndarray:
+    # DELIBERATELY STILL DirectShow, while the daemon moved to Media Foundation
+    # on 2026-09-05 (core/camera_backend.py). Two reasons, both about this file
+    # being a hand-run CLI rather than part of the running system:
+    #
+    #   * The leak DirectShow causes (+4.6 OS threads, ~+479 handles per
+    #     open/release cycle, measured) is permanent only for the life of the
+    #     process. This one grabs a single frame and exits, so it leaks nothing
+    #     that outlives the command.
+    #   * `--camera N` is documented against what `--list-cameras` prints,
+    #     which is a DIRECTSHOW index. Media Foundation enumerates a different
+    #     list (on this rig DirectShow 0 is the USB webcam while Media
+    #     Foundation 0 is the Kinect), so switching the backend here without
+    #     changing the flag's meaning would quietly hand the operator a
+    #     different camera than the one they asked for.
+    #
+    # If this ever becomes something the daemon calls, route it through
+    # bobert_companion._camera_open() instead of changing the constant here.
     cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
     if not cap.isOpened():
         cap.release()

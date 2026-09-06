@@ -676,10 +676,84 @@ def _camera_pnp_diagnosis(devices: list[dict] | None) -> dict:
     }
 
 
-def _attempt_camera_wake(idx: int, timeout_s: float = 2.5) -> tuple[bool, str]:
+# Seconds the index SCAN waits for a real frame from one index before moving
+# on. Not a single read: a healthy camera can return False for its first reads
+# after a cold open, and on MSMF a device another process holds reports
+# isOpened() True and then never produces anything at all.
+#
+# SIZED AGAINST THE LOCK, not just the camera. The scan runs while holding
+# bobert_companion._camera_io_lock, and the face-track producer waits on that
+# lock, so the worst case that matters is "all three indices open and none
+# delivers": 3 x (open + this budget). Measured on this rig 2026-09-05, an MSMF
+# open with 1280x720 set on it costs ~0.5 s, and a frame arrived 0.30-0.42 s
+# after the sets on BOTH webcams in every cycle of a 25-cycle bench. So:
+#   1.5 s is ~3.5x the measured worst first-frame latency, and
+#   3 x (0.5 + 1.5) = 6.0 s is the worst lock hold, comfortably under the 30 s
+#   _FACE_TRACK_STALL_WARN_S that would otherwise blame a healthy producer.
+# At 2.5 s that worst case was 9.0 s of held lock to buy margin nothing had
+# asked for.
+_CAMERA_PROBE_WARMUP_S = 1.5
+
+
+def _camera_backend_name() -> str:
+    """'msmf' or 'dshow' — the ONE backend this whole probe uses.
+
+    Both halves of the webcam probe must agree, because the two backends do not
+    index the same device list. See the block in _probe_webcam_locked."""
+    try:
+        from core.camera_backend import configured_backend
+        return configured_backend()
+    except Exception:
+        # core unavailable (bare-skill import / CI). MSMF is what a
+        # backend-less cv2.VideoCapture(idx) resolves to on Windows anyway, so
+        # this default keeps the two halves consistent rather than silently
+        # reintroducing the DirectShow half of the mismatch.
+        return "msmf"
+
+
+def _open_probe_capture(idx: int, backend: str,
+                        require_frame: float = 0.0):
+    """Open ``idx`` on ``backend``, or None. Never raises.
+
+    ``require_frame`` > 0 makes the open PROVE the device delivers before
+    handing the handle back. The SCAN needs that — under MSMF, index 0 on this
+    rig is the Kinect's Media Foundation interface, which opens at 512x424 and
+    then fails every read, so "first index that opens" picked a camera that can
+    never work and the probe took the soft-wake branch every 30 minutes
+    forever. The WAKE does not need it and must not use it: the wake reads the
+    device itself, and that read IS its verdict — proving a frame at open too
+    would just consume one and prove the same thing twice."""
+    try:
+        from core.camera_backend import open_camera
+    except Exception:
+        open_camera = None
+    if open_camera is not None:
+        return open_camera(idx, backend=backend, require_frame=require_frame)
+    try:  # pragma: no cover - only when core/ is not importable
+        import cv2  # type: ignore
+        api = cv2.CAP_DSHOW if backend == "dshow" else cv2.CAP_MSMF
+        c = cv2.VideoCapture(idx, api)
+        if c is not None and c.isOpened():
+            return c
+        if c is not None:
+            c.release()
+    except Exception:
+        pass
+    return None
+
+
+def _attempt_camera_wake(idx: int, timeout_s: float = 2.5,
+                         backend: "str | None" = None) -> tuple[bool, str]:
     """Try a soft wake of camera ``idx``: release + brief sleep + reopen +
     read with warmup. Runs inside its own thread with a hard wall-clock
-    timeout so a wedged DirectShow open can't block the diagnostic sweep.
+    timeout so a wedged open can't block the diagnostic sweep.
+
+    ``backend`` MUST be the same backend the caller used to find ``idx``.
+    It used to be hard-wired to cv2.CAP_DSHOW while its only caller found the
+    index with a backend-less (MSMF) open, so the two disagreed about which
+    physical camera the integer named — see _probe_webcam_locked. Defaults to
+    the configured backend rather than to DirectShow, because defaulting to
+    DirectShow is exactly the bug.
 
     Returns (success, note). Uses the same _camera_io_lock as the face-
     tracking thread when bobert_companion is loaded, so a wake here can't
@@ -689,6 +763,14 @@ def _attempt_camera_wake(idx: int, timeout_s: float = 2.5) -> tuple[bool, str]:
         import cv2  # type: ignore
     except Exception as e:
         return False, f"opencv unavailable: {e}"
+    # AVAILABILITY CHECK ONLY. This function no longer touches cv2 itself — the
+    # open goes through _open_probe_capture — but "opencv unavailable" is still
+    # the honest verdict when it cannot be imported, and it has to be checked
+    # before the worker starts or the failure would surface as a timeout.
+    # Dropping the name keeps pyflakes honest about that (a bare `# noqa` would
+    # not: pyflakes does not read noqa).
+    del cv2
+    backend = backend or _camera_backend_name()
     box: dict[str, Any] = {"ok": False, "note": ""}
 
     bc = _bc()
@@ -713,13 +795,24 @@ def _attempt_camera_wake(idx: int, timeout_s: float = 2.5) -> tuple[bool, str]:
                     box["note"] = "wake skipped — camera lock held by tracker"
                     return
             try:
-                # First release any prior handle the face-tracker had open
-                # by opening a fresh one — DirectShow refuses to hand out
-                # the device to two open()s in parallel, so this also acts
-                # as a "did we fail to claim the device?" probe.
-                cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-                if not cap.isOpened():
-                    box["note"] = "wake reopen failed — device refused open"
+                # First release any prior handle the face-tracker had open by
+                # opening a fresh one. This used to double as a "did we fail to
+                # claim the device?" probe on the strength of DirectShow
+                # refusing a second open — that inference DOES NOT HOLD on
+                # MSMF. Measured 2026-09-05 with one process holding the eMeet
+                # and reading it: a DirectShow contender got isOpened() ==
+                # False in 0.65 s, while an MSMF contender got isOpened() ==
+                # True, set(W/H) == True, read 1280x720 back out of get(), and
+                # then produced 0 frames out of 20. So the FRAME, never the
+                # open, is what says the device is ours and alive — which is
+                # why the verdict below is the read's and not isOpened()'s.
+                # (require_frame is left at 0 here on purpose: this function
+                # reads the device itself two lines down, and proving a frame
+                # inside the open as well would consume one to learn the same
+                # thing twice.)
+                cap = _open_probe_capture(idx, backend)
+                if cap is None:
+                    box["note"] = f"wake reopen failed — device refused open ({backend})"
                     return
                 # Brief warmup — generic UVC cameras commonly return False
                 # on the very first read after a cold open.
@@ -817,6 +910,306 @@ class _CameraLockHold:
             pass
 
 
+# ─── who owns the cameras ───────────────────────────────────────────────
+#
+# _camera_io_lock SERIALISES OPEN/RELEASE. IT DOES NOT MEAN THE DEVICE IS FREE.
+# The face-tracking producer opens its cameras once and then reads from them
+# for the life of the process, OUTSIDE that lock on purpose — holding it across
+# a blocking cap.read() is what wedged the whole camera subsystem for two hours
+# (v2.0.100). So a probe that takes the lock and then opens an index the
+# producer is streaming gets a SECOND HANDLE ON A LIVE DEVICE.
+#
+# WHAT THAT COSTS, measured in-process on this rig 2026-09-06 with JARVIS
+# stopped — one producer thread holding MSMF index 1 ("USB 2.0 Camera", the
+# owner's right webcam) at 1280x720, 30 s windows either side of the event,
+# CONTROL and PROBE arms identical but for the one extra open:
+#
+#   CONTROL (nothing else touches it)
+#       before  828 reads / 0 fail / 30.0 fps   during 361 / 0 / 30.1 fps
+#       after   539 reads / 0 fail / 30.0 fps
+#   PROBE (one 3.1 s _probe_webcam_locked-shaped scan of indices 0,1,2)
+#       before  826 reads / 0 fail / 30.0 fps
+#       during  3,704,096 FAILED reads /  4.4 fps
+#       after   5,411,405 FAILED reads /  0.0 fps  — and it never came back
+#
+# The probe won index 1: the producer's own camera. It did not merely slow the
+# holder down, it ENDED the stream, permanently, for a device that was healthy.
+#
+# WHY THE MIGRATION'S EVIDENCE SAID THIS WAS SAFE. core/camera_backend.py's
+# docstring records "Both backends leave the HOLDER undisturbed … so a partial
+# migration is safe". That was measured ACROSS TWO PROCESSES, where MSMF does
+# refuse the contender honestly — reproduced here, all three indices refused,
+# zero disturbance to the holder. In-process it does not refuse, and in-process
+# is the only configuration JARVIS runs in.
+#
+# WHY IT ONLY STARTED BITING WITH require_frame. Before the MSMF migration the
+# scan accepted the first index that merely isOpened(), which under MSMF is
+# index 0 — the Kinect — so it stopped one index SHORT of the producer's
+# cameras every time. All 70+ recorded diagnostics from 2026-08-20 through
+# 2026-09-05T20:25 carry details={'index': 0} with wake_attempted=True, and not
+# one of them is followed by a face-track read failure inside the 8-10 s window
+# that every post-migration sweep is (the pre-migration sessions DO contain read
+# failures - they just fall nowhere near a sweep). Making the scan demand a real
+# frame fixed the Kinect problem and walked it straight onto index 1. Every
+# diagnostic from 2026-09-05T22:39 onward recorded {'index': 1, 'backend':
+# 'msmf'}, and the session logs show a "[face-track] Right webcam (top of right
+# monitor) (index 0) read failure #25" 8-17 s after EVERY one of them — NINE
+# for nine, across three sessions:
+#   session_2026-09-05_23-19-39  sweeps 23:21:05 23:50:05 00:20:05 00:50:05
+#                                       01:20:05
+#                                fails  23:21:14 23:50:14 00:20:15 00:50:13
+#                                       01:20:13
+#   session_2026-09-06_04-55-31  sweeps 04:57:04 05:26:04 05:56:04
+#                                fails  04:57:13 05:26:12 05:56:13
+#   session_2026-09-06_06-59-08  sweep  07:02:49   fail 07:03:06
+# and at 04:32:56 the scan landed on index 2 instead, so that time it was the
+# LEFT webcam that failed. No camera was safe.
+#
+# require_frame protects the CONTENDER from a useless handle. Nothing in it
+# protects the HOLDER, and the damage is done by the open and the reads before
+# the verdict is even reached. The only fix is not to open the device at all:
+# ASK WHO OWNS IT FIRST.
+#
+# A camera the producer is reading from does not need a second handle to prove
+# it works — the producer IS a continuous open-and-read test of that device.
+# MEASURED LIVE 2026-09-06 by counting distinct writes of the shared HUD
+# preview, which the producer emits once per loop iteration: 678 writes in
+# 120 s = 6.4 fps median (5.7 mean), loop period median 0.156 s, p90 0.238 s,
+# max 0.347 s. Several reads a second, forever, is strictly stronger evidence
+# than one spot check every 30 minutes — and it is 30 fps ONLY in the
+# measurement harness above, never here; do not copy that number across.
+# So an owned-and-streaming camera is reported from the producer's own
+# telemetry, and an owned-but-silent one is reported UNVERIFIED rather than
+# opened. The genuinely-sick case is not lost: the producer's read-failure
+# signal reaches the self-heal pipeline through _run_autoqueue_pass, which is
+# where it already lived and where this file's own comments already point.
+
+# A frame this dark is "the sensor is streaming but sees nothing" — lens cap,
+# privacy shutter, unpowered sensor. ONE definition, because there are now two
+# places that judge it (an opened device, and the producer's own cached frame)
+# and a threshold fixed in one copy while the other rots is this codebase's
+# most expensive bug shape.
+_BLACK_FRAME_MEAN_MIN = 1.0
+_BLACK_FRAME_RETRIES  = 3
+
+# How recently the producer must have pulled a frame for that camera to count
+# as PROVEN WORKING. 10 s is 2x the 5 s at which the dashboard calls a preview
+# tile dead and a third of the 30 s at which the producer's own watchdog calls
+# the loop stalled, so a single slow iteration cannot trip it: the producer's
+# period measured 0.156 s median / 0.347 s max over 120 s on 2026-09-06, and
+# the worst this codebase has ever recorded is the ~2.1 s of 2026-09-04. 10 s
+# clears both by more than 4x.
+_PRODUCER_FRAME_FRESH_S = 10.0
+
+# How much of a camera's quarantine window must remain before the probe will
+# treat the bench as "this device is free". 30 s is 5x the scan's worst-case
+# hold, so the bench cannot expire out from under an open in flight. See the
+# benched-camera branch in _producer_camera_ownership.
+_QUARANTINE_SAFE_MARGIN_S = 30.0
+
+
+def _translate_camera_index(cfg_idx, name: str, backend: str):
+    """The index ``backend`` uses for the camera CAMERAS calls ``cfg_idx`` /
+    ``name``, or None when we cannot say.
+
+    None is a REAL ANSWER and callers must read it as "I do not know which scan
+    index this device is", never as "not owned" — see the fail-closed branch in
+    _probe_webcam_locked. Translation is by NAME, never by arithmetic on the
+    configured integer: the two backends enumerate different device lists
+    (DirectShow 0=USB 2.0 Camera 1=Kinect 2=eMeet 3=OBS Virtual Camera; Media
+    Foundation 0=Kinect 1=USB 2.0 Camera 2=eMeet, with no OBS entry at all),
+    which is the whole reason core/camera_backend.py exists."""
+    try:
+        if backend == "dshow":
+            # CAMERAS holds DirectShow indices; that IS this index space.
+            return None if cfg_idx is None else int(cfg_idx)
+        if backend != "msmf":
+            return None                      # unknown index space — fail closed
+        from core.camera_backend import msmf_index_for_name
+    except Exception:
+        return None
+    if not name:
+        return None
+    try:
+        return msmf_index_for_name(name)
+    except Exception:
+        return None
+
+
+def _producer_camera_ownership(backend: str) -> dict:
+    """Which capture targets the face-tracking producer OWNS right now, in
+    ``backend``'s index space, plus what its own telemetry says about each.
+
+    Keys:
+      ``owns``       — the producer is between "starting" and "stopped", so its
+                       configured cameras are OFF LIMITS to this probe.
+      ``indices``    — set of indices IN ``backend``'s space not to open.
+      ``unresolved`` — labels of owned cameras we could not place in that index
+                       space. Non-empty while ``owns`` means we do not know
+                       which scan index is the producer's camera, so the caller
+                       must FAIL CLOSED rather than guess — guessing wrong is
+                       the 0 fps outcome documented above.
+      ``fresh``      — owned cameras that delivered a frame within
+                       _PRODUCER_FRAME_FRESH_S. Non-empty means the webcam is
+                       proven working, with no device I/O at all.
+      ``cameras``    — per-camera telemetry, for the result details.
+
+    Reads ONLY the monolith's public accessors plus its published capture list,
+    and NEVER raises: every failure degrades to "we know nothing", which leaves
+    the pre-existing scan behaviour exactly as it was. CI, bare-skill imports
+    and a JARVIS whose producer never started all land there."""
+    out: dict[str, Any] = {"owns": False, "indices": set(), "unresolved": [],
+                           "fresh": [], "cameras": [], "producer": {}}
+    bc = _bc()
+    if bc is None:
+        return out
+
+    # ── is the producer holding devices? ──
+    # Two independent signals, UNIONED, because either one alone has a hole:
+    #   * the heartbeat STAGE. The supervisor beats "starting" before any open
+    #     and "stopped" in its finally, AFTER _face_track_release_all. Anything
+    #     between the two means it holds — or is about to open — a camera. This
+    #     is the signal that covers the race between an open returning and the
+    #     handle being recorded, and it stays true for a WEDGED producer, which
+    #     still owns its devices however dead it looks.
+    #   * the published capture list. A handle recorded there is owned even if
+    #     the heartbeat says something unexpected.
+    try:
+        live = bc.get_face_track_liveness()
+        if isinstance(live, dict):
+            out["producer"] = {"stage":   live.get("stage"),
+                               "age_s":   live.get("age_s"),
+                               "stalled": live.get("stalled"),
+                               "iters":   live.get("iters")}
+            if live.get("at") and live.get("stage") not in ("stopped",
+                                                            "not started"):
+                out["owns"] = True
+    except Exception:
+        pass
+    held_indices: set = set()
+    try:
+        caps = getattr(bc, "_face_track_caps", None)
+        entries = caps[0] if caps else None
+        for entry in (entries or []):
+            if not isinstance(entry, dict) or entry.get("cap") is None:
+                continue
+            out["owns"] = True
+            cam = entry.get("cam") or {}
+            if isinstance(cam, dict) and cam.get("index") is not None:
+                held_indices.add(cam["index"])
+    except Exception:
+        pass
+    if not out["owns"]:
+        return out
+
+    try:
+        health = bc.get_camera_health() or {}
+    except Exception:
+        health = {}
+    try:
+        cameras = list(getattr(bc, "CAMERAS", None) or [])
+    except Exception:
+        cameras = []
+    now = _now()
+    for cam in cameras:
+        if not isinstance(cam, dict):
+            continue
+        # A Kinect slot is not a cv2 webcam — the producer reaches it through
+        # pykinect2, never through VideoCapture, so it owns no index here.
+        if str(cam.get("type") or "").lower() == "kinect":
+            continue
+        cfg_idx = cam.get("index")
+        name    = (cam.get("name") or "").strip()
+        label   = cam.get("label") or f"index {cfg_idx}"
+        h       = health.get(cfg_idx) or {}
+        last_at = float(h.get("last_frame_at") or 0.0)
+        age     = (now - last_at) if last_at else None
+        # A BENCHED CAMERA IS NOT OWNED. The producer's quarantine gate is an
+        # unconditional `continue` that releases the handle and never opens the
+        # device again until the bench expires, so for that window the camera
+        # genuinely belongs to nobody — and it is exactly the camera the
+        # diagnostic most wants to look at. Fencing it off would trade the
+        # collision for a permanently blind probe on a single-camera rig whose
+        # one camera is sick.
+        #
+        # ONLY WITH ROOM TO SPARE. The bench expiring mid-probe would put the
+        # producer's reopen and this open back in the same race, so we need
+        # more of the window left than the probe's worst-case hold: 3 indices x
+        # (open + _CAMERA_PROBE_WARMUP_S) is ~6 s, and this margin is 5x that.
+        q_until = float(h.get("quarantine_until") or 0.0)
+        benched = (bool(h.get("quarantined"))
+                   and (q_until - now) > _QUARANTINE_SAFE_MARGIN_S)
+        rec: dict[str, Any] = {
+            "config_index":     cfg_idx,
+            "label":            label,
+            "held":             cfg_idx in held_indices,
+            "last_frame_age_s": None if age is None else round(age, 1),
+            "quarantined":      bool(h.get("quarantined")),
+            "benched_free":     benched,
+            "last_read_error":  h.get("last_read_error"),
+        }
+        probe_idx = _translate_camera_index(cfg_idx, name, backend)
+        rec["probe_index"] = probe_idx
+        if benched:
+            pass                       # free: neither fenced nor unresolvable
+        elif probe_idx is None:
+            out["unresolved"].append(label)
+        else:
+            out["indices"].add(probe_idx)
+        if age is not None and age <= _PRODUCER_FRAME_FRESH_S:
+            out["fresh"].append(rec)
+        out["cameras"].append(rec)
+    return out
+
+
+def _producer_latest_frame(cfg_idx):
+    """The face-tracking producer's OWN newest frame for camera ``cfg_idx``,
+    or None.
+
+    The producer caches every frame it successfully reads, under the same
+    _camera_state_lock and in the same critical section that stamps
+    ``last_frame_at`` — so this is exactly the image the freshness figure is
+    about, obtained without opening anything. That is what lets the
+    no-device-I/O verdict keep the black-frame check instead of quietly
+    dropping it. NEVER raises."""
+    bc = _bc()
+    if bc is None:
+        return None
+    try:
+        store = getattr(bc, "_camera_latest_frame", None)
+        if store is None:
+            return None
+        lock = getattr(bc, "_camera_state_lock", None)
+        if lock is None:
+            return store.get(cfg_idx)
+        with lock:
+            return store.get(cfg_idx)
+    except Exception:
+        return None
+
+
+def _frame_mean(frame) -> float:
+    try:
+        return float(frame.mean())
+    except Exception:  # pragma: no cover - defensive: mean() on a malformed frame
+        return 0.0
+
+
+def _face_cascade_status(cv2_mod) -> "tuple[bool, str]":
+    """(ok, note) for the Haar cascade face_tracker depends on.
+
+    Device-free, so every webcam verdict — including the ones that open nothing
+    because the producer owns the cameras — still runs it."""
+    try:
+        path = cv2_mod.data.haarcascades + "haarcascade_frontalface_default.xml"
+        cascade = cv2_mod.CascadeClassifier(path)
+        if cascade.empty():
+            return False, f"face cascade failed to load from {path}"
+        return True, "loaded"
+    except Exception as e:
+        return False, f"face cascade failed: {type(e).__name__}: {e}"
+
+
 def _probe_webcam() -> dict:
     start = _now()
     try:
@@ -858,7 +1251,15 @@ def _probe_webcam() -> dict:
 def _probe_webcam_locked(start: float, hold: _CameraLockHold) -> dict:
     """Body of the webcam probe. Runs with ``hold`` taken on
     _camera_io_lock (when bobert_companion is loaded); drops it early
-    before delegating to _attempt_camera_wake — see _CameraLockHold."""
+    before delegating to _attempt_camera_wake — see _CameraLockHold.
+
+    HOLDING THAT LOCK IS NOT PERMISSION TO OPEN A CAMERA. It only means no
+    other open/release is in flight; the face-tracking producer holds its
+    handles across it and reads outside it. So this function asks
+    _producer_camera_ownership() who owns what BEFORE it opens anything, and
+    every device the producer owns is off limits — see the block above that
+    function for the measurement that made this rule, and for the 30 minutes
+    of 0 fps it cost the owner each time it was broken."""
     try:
         import cv2  # type: ignore
     except Exception as e:  # pragma: no cover — the caller already imported cv2
@@ -868,22 +1269,184 @@ def _probe_webcam_locked(start: float, hold: _CameraLockHold) -> dict:
     details: dict[str, Any] = {}
     # Try indices 0..2 — most laptops expose the integrated camera at 0,
     # USB cams take 1/2 depending on enumeration order.
+    #
+    # TWO BUGS LIVED IN THESE SIX LINES, and they compounded (measured
+    # 2026-09-05 on the owner's rig, JARVIS stopped, cameras idle):
+    #
+    # 1. MIXED INDEX SPACES. This scan called cv2.VideoCapture(idx) with no
+    #    backend, which resolves to MSMF here — verified live,
+    #    getBackendName() == 'MSMF'. The winning index was then handed to
+    #    _attempt_camera_wake(), which opened it with cv2.CAP_DSHOW. The two
+    #    backends enumerate DIFFERENT device lists (Media Foundation
+    #    0=Kinect 1=USB 2.0 Camera 2=eMeet; DirectShow 0=USB 2.0 Camera
+    #    1=Kinect 2=eMeet), so "index 0" meant the Kinect to the scan and the
+    #    USB webcam to the wake. The probe diagnosed one device and then
+    #    tried to revive a different one.
+    # 2. OPENED IS NOT WORKING. The scan accepted the first index that merely
+    #    isOpened(). Under MSMF that is index 0, the Kinect's Media
+    #    Foundation interface, which opens at 512x424 and then fails every
+    #    read (OnReadSample error -2147024809) — inherently, not because
+    #    something else holds it. So the scan ALWAYS picked a device that can
+    #    never produce a frame, always fell into the soft-wake branch, and
+    #    the DirectShow open inside that branch is the +3 OS threads and
+    #    ~+309 handles this probe leaked every 30 minutes.
+    #
+    # Both are fixed by asking the shared resolver for a camera that actually
+    # DELIVERS AN IMAGE, on one stated backend, and telling the wake helper
+    # which backend that was. _CAMERA_PROBE_WARMUP_S is a budget rather than a
+    # single read because a healthy camera can legitimately return False for
+    # its first couple of seconds while it warms up.
     cap = None
     cam_index = None
+    cam_backend = _camera_backend_name()
+
+    # A THIRD BUG LIVED HERE, and fixing #2 is what armed it (2026-09-06).
+    # Demanding a real frame stopped the scan settling on the Kinect at MSMF
+    # index 0 — and walked it onto MSMF index 1, which is the face-tracking
+    # producer's own right webcam. Opening that collapsed the producer's stream
+    # to 0 fps, permanently, every 30 minutes. The full measurement, the
+    # nine-for-nine live confirmation and why the migration's cross-process
+    # evidence said it was safe are in the block above
+    # _producer_camera_ownership.
+    #
+    # So: ASK WHO OWNS THE DEVICE BEFORE OPENING IT.
+    owned = _producer_camera_ownership(cam_backend)
+    if owned["owns"]:
+        details["producer"] = owned["producer"]
+        details["producer_cameras"] = owned["cameras"]
+        if owned["unresolved"]:
+            # FAIL CLOSED. The producer owns a camera we could not place in
+            # this backend's index space, so every index in the sweep might be
+            # it. Opening the wrong one costs the owner his primary vision
+            # until JARVIS restarts; skipping one sweep costs a data point.
+            return _unverified(
+                (_now() - start) * 1000.0,
+                reason=("the face tracker owns "
+                        + ", ".join(owned["unresolved"])
+                        + " and the probe was not able to work out which "
+                          "capture index that is, so it opened nothing"),
+                details=dict(details,
+                             skipped="camera owned by the face tracker; "
+                                     "index not resolvable on "
+                                     + cam_backend),
+                short_cause=_UNVERIFIED_SHORT_CAUSES["camera_busy"],
+                transient=True)
+        if owned["fresh"]:
+            # PROVEN WORKING, WITHOUT TOUCHING THE DEVICE. The producer pulled
+            # a frame off this camera within the last _PRODUCER_FRAME_FRESH_S —
+            # a live open-and-read test of exactly the thing this probe exists
+            # to check, running at a measured 6.4 fps median (2026-09-06, 678
+            # preview writes in 120 s). Strictly better evidence than one spot
+            # check every half hour, and it costs no handle, no thread and no
+            # risk to the stream. Everything below the device I/O still runs.
+            best = min(owned["fresh"],
+                       key=lambda r: r["last_frame_age_s"])
+            details["verified_via"]   = "face-track producer telemetry"
+            # ``index`` KEEPS ITS OLD MEANING: the index in ``backend``'s space,
+            # because that pairing is what every reader of this record assumes
+            # and the two spaces disagree (the owner's right webcam is
+            # DirectShow 0 and Media Foundation 1). The CAMERAS index goes
+            # alongside under its own name rather than silently overloading
+            # this one — on this rig the eMeet happens to be 2 in BOTH lists,
+            # which is exactly the coincidence that would hide the mix-up.
+            details["index"]          = best["probe_index"]
+            details["config_index"]   = best["config_index"]
+            details["backend"]        = cam_backend
+            details["camera"]         = best["label"]
+            details["frame_age_s"]    = best["last_frame_age_s"]
+            details["device_opened"]  = False
+            # THE BLACK-FRAME CHECK IS NOT DROPPED WITH THE OPEN. A camera that
+            # streams perfectly and sees nothing — lens cap, privacy shutter,
+            # unpowered sensor — is a real finding this probe has always made,
+            # and losing it would be paying for the fix with a blind spot. The
+            # producer hands us the image for free.
+            #
+            # The retries here re-SAMPLE the producer's cache rather than
+            # pulling new reads off the device, and the producer's period can
+            # be up to ~2.1 s, so two samples may be the same frame; the
+            # timestamps recorded alongside make that visible instead of
+            # implied. This is why the gap is 0.25 s and not the scan path's
+            # 0.05 s. It matters less than it looks: the transient blackness
+            # those retries exist for is a driver INITIALISATION artifact, and
+            # a frame in this cache is by definition one the producer already
+            # read successfully from a running stream.
+            frame = _producer_latest_frame(best["config_index"])
+            if frame is not None:
+                mean_val = _frame_mean(frame)
+                details["frame_mean"]  = round(mean_val, 2)
+                details["frame_shape"] = list(getattr(frame, "shape", ()))
+                if mean_val < _BLACK_FRAME_MEAN_MIN:
+                    means = [mean_val]
+                    for _ in range(_BLACK_FRAME_RETRIES):
+                        time.sleep(0.25)
+                        f2 = _producer_latest_frame(best["config_index"])
+                        m2 = _frame_mean(f2) if f2 is not None else 0.0
+                        means.append(m2)
+                        if m2 >= _BLACK_FRAME_MEAN_MIN:
+                            mean_val = m2
+                            break
+                    details["frame_mean"]        = round(mean_val, 2)
+                    details["frame_retry_means"] = [round(m, 2) for m in means]
+                if mean_val < _BLACK_FRAME_MEAN_MIN:
+                    details["auto_repairable"] = False
+                    details["failure_mode"]    = "persistent_black_frame"
+                    _maybe_announce_once(
+                        "webcam_black_frame",
+                        "Sir, the webcam is producing only black frames — "
+                        "check the lens cover, privacy shutter, or USB power.",
+                    )
+                    return _result(
+                        False, (_now() - start) * 1000.0,
+                        error=(f"{best['label']} is streaming to the face "
+                               f"tracker but every frame is black (mean "
+                               f"{details['frame_mean']}). Sensor is running "
+                               f"and sees nothing. Check (in order): (1) lens "
+                               f"cover or privacy shutter, (2) USB cable / hub "
+                               f"power, (3) Device Manager → camera driver. "
+                               f"This is environmental and cannot be "
+                               f"auto-fixed from code."),
+                        details=details,
+                        severity=SEVERITY_LOW,
+                    )
+            ok_c, note = _face_cascade_status(cv2)
+            details["cascade"] = note
+            if not ok_c:
+                return _result(False, (_now() - start) * 1000.0,
+                               error=note, details=details)
+            return _result(True, (_now() - start) * 1000.0, details=details)
+
+    skip = set(owned["indices"])
+    if skip:
+        details["skipped_indices"] = sorted(skip)
     for idx in (0, 1, 2):
+        if idx in skip:
+            continue                 # the producer is streaming this device
         try:
-            c = cv2.VideoCapture(idx)
-            if c is not None and c.isOpened():
+            c = _open_probe_capture(idx, cam_backend,
+                                    require_frame=_CAMERA_PROBE_WARMUP_S)
+            if c is not None:
                 cap = c
                 cam_index = idx
                 break
-            else:
-                try:
-                    c.release()
-                except Exception:  # pragma: no cover - defensive: cv2 release() on a non-opened capture (live-camera I/O, cv2 absent on CI)
-                    pass
         except Exception:
             continue
+    if cap is None and skip:
+        # Nothing left to open, because the only cameras that could have
+        # answered are the ones the producer holds and none of them is
+        # currently delivering. That is NOT "no webcam found" — we never
+        # looked at the devices in question. The sick-camera case is already
+        # carried by the producer's own read-failure signal, which reaches the
+        # self-heal pipeline through _run_autoqueue_pass; reporting a failure
+        # here as well would file a repair task for a device we did not test.
+        return _unverified(
+            (_now() - start) * 1000.0,
+            reason=("the face tracker owns every camera and none of them has "
+                    "produced a frame recently, so the probe opened nothing "
+                    "rather than taking a second handle on a live device"),
+            details=dict(details,
+                         skipped="camera owned by the face tracker"),
+            short_cause=_UNVERIFIED_SHORT_CAUSES["camera_busy"],
+            transient=True)
     if cap is None:
         pnp_devices = _windows_camera_pnp_devices()
         diag = _camera_pnp_diagnosis(pnp_devices)
@@ -959,6 +1522,7 @@ def _probe_webcam_locked(start: float, hold: _CameraLockHold) -> dict:
                               f"Manager, update / reinstall the camera driver)."),
                        details=details_open)
     details["index"] = cam_index
+    details["backend"] = cam_backend
 
     try:
         # Some cameras need a warmup frame — read twice and use the second.
@@ -983,7 +1547,8 @@ def _probe_webcam_locked(start: float, hold: _CameraLockHold) -> dict:
             # post-wake path returns without touching the device, so no
             # re-acquire is needed.
             hold.release()
-            wake_ok, wake_note = _attempt_camera_wake(cam_index)
+            wake_ok, wake_note = _attempt_camera_wake(
+                cam_index, backend=cam_backend)
             details["wake_attempted"] = True
             details["wake_recovered"] = bool(wake_ok)
             details["wake_note"]      = wake_note
@@ -1091,10 +1656,9 @@ def _probe_webcam_locked(start: float, hold: _CameraLockHold) -> dict:
             mean_val = 0.0
         details["frame_mean"] = round(mean_val, 2)
         details["frame_shape"] = list(getattr(frame, "shape", ()))
-        if mean_val < 1.0:
-            BLACK_FRAME_RETRIES = 3
+        if mean_val < _BLACK_FRAME_MEAN_MIN:
             retry_means: list[float] = [mean_val]
-            for _ in range(BLACK_FRAME_RETRIES):
+            for _ in range(_BLACK_FRAME_RETRIES):
                 time.sleep(0.05)
                 try:
                     ok_r, frame_r = cap.read()
@@ -1108,14 +1672,14 @@ def _probe_webcam_locked(start: float, hold: _CameraLockHold) -> dict:
                 except Exception:  # pragma: no cover - defensive: numpy mean() on a malformed retry frame (live-camera I/O, cv2 absent on CI)
                     rmean = 0.0
                 retry_means.append(rmean)
-                if rmean >= 1.0:
+                if rmean >= _BLACK_FRAME_MEAN_MIN:
                     # Sensor warmed up — accept this frame and move on.
                     mean_val = rmean
                     frame = frame_r
                     break
             details["frame_mean"]       = round(mean_val, 2)
             details["frame_retry_means"] = [round(m, 2) for m in retry_means]
-            if mean_val < 1.0:
+            if mean_val < _BLACK_FRAME_MEAN_MIN:
                 # Every retry yielded a black frame. The device is opening
                 # and streaming buffers but the sensor sees nothing.
                 # Auto-repair cannot distinguish a deliberately-covered
@@ -1152,19 +1716,14 @@ def _probe_webcam_locked(start: float, hold: _CameraLockHold) -> dict:
             except Exception:  # pragma: no cover - defensive: cv2 release() in the probe's finally (live-camera I/O, cv2 absent on CI)
                 pass
 
-    # Verify the face cascade loads — face_tracker depends on it.
-    try:
-        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        cascade = cv2.CascadeClassifier(cascade_path)
-        if cascade.empty():
-            return _result(False, (_now() - start) * 1000.0,
-                           error=f"face cascade failed to load from {cascade_path}",
-                           details=details)
-        details["cascade"] = "loaded"
-    except Exception as e:
+    # Verify the face cascade loads — face_tracker depends on it. Shared with
+    # the producer-telemetry verdict above, which opens no device but must
+    # still make this check.
+    ok_c, note = _face_cascade_status(cv2)
+    details["cascade"] = note
+    if not ok_c:
         return _result(False, (_now() - start) * 1000.0,
-                       error=f"face cascade failed: {type(e).__name__}: {e}",
-                       details=details)
+                       error=note, details=details)
 
     return _result(True, (_now() - start) * 1000.0, details=details)
 

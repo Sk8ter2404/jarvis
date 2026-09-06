@@ -737,7 +737,7 @@ class SideTileWebcamReadTests(MonolithGlobalsTestCase):
         # must open EXACTLY those indices — the webcams, never the Kinect frame.
         opened = []
 
-        def _fake_open(idx):
+        def _fake_open(idx, name=None):
             opened.append(idx)
             return self._FakeCap(100 + idx)
 
@@ -758,7 +758,7 @@ class SideTileWebcamReadTests(MonolithGlobalsTestCase):
         with mock.patch.object(self.bc, "_resolve_webcam_indices_by_name",
                                return_value={"left": 5}), \
                 mock.patch.object(self.bc, "_open_tile_capture",
-                                  lambda idx: self._FakeCap(120)):
+                                  lambda idx, name=None: self._FakeCap(120)):
             out = self.bc._read_side_tile_webcams(now=2000.0)
         self.assertIsNotNone(out["left"])
         self.assertIsNone(out["right"])                    # → placeholder
@@ -768,7 +768,7 @@ class SideTileWebcamReadTests(MonolithGlobalsTestCase):
         with mock.patch.object(self.bc, "_resolve_webcam_indices_by_name",
                                return_value={"left": 5, "right": 6}), \
                 mock.patch.object(self.bc, "_open_tile_capture",
-                                  lambda idx: None):
+                                  lambda idx, name=None: None):
             out = self.bc._read_side_tile_webcams(now=3000.0)
         self.assertIsNone(out["left"])
         self.assertIsNone(out["right"])
@@ -778,7 +778,7 @@ class SideTileWebcamReadTests(MonolithGlobalsTestCase):
         # it returns the cached frame (low-rate capture).
         calls = {"n": 0}
 
-        def _fake_open(idx):
+        def _fake_open(idx, name=None):
             calls["n"] += 1
             return self._FakeCap(130)
 
@@ -886,7 +886,7 @@ class SideTileReuseFaceTrackFramesTests(MonolithGlobalsTestCase):
         opened = []
         with mock.patch.object(self.bc, "CAMERAS", self._cams()), \
                 mock.patch.object(self.bc, "_open_tile_capture",
-                                  lambda idx: opened.append(idx)), \
+                                  lambda idx, name=None: opened.append(idx)), \
                 mock.patch.object(self.bc, "_resolve_webcam_indices_by_name",
                                   return_value={"left": 2, "right": 0}):
             out = self.bc._read_side_tile_webcams(now=now)
@@ -901,7 +901,7 @@ class SideTileReuseFaceTrackFramesTests(MonolithGlobalsTestCase):
         self._seed(now, age=self.bc._KINECT_PREVIEW_TILE_REUSE_MAX_AGE + 1.0)
         opened = []
 
-        def _fake_open(idx):
+        def _fake_open(idx, name=None):
             opened.append(idx)
             return self._FakeCap(111)
 
@@ -924,7 +924,7 @@ class SideTileReuseFaceTrackFramesTests(MonolithGlobalsTestCase):
                    "primary": True, "look_x": 0.5, "look_y": 0.5}
         opened = []
 
-        def _fake_open(idx):
+        def _fake_open(idx, name=None):
             opened.append(idx)
             return self._FakeCap(222)
 
@@ -946,7 +946,7 @@ class SideTileReuseFaceTrackFramesTests(MonolithGlobalsTestCase):
         self.bc._kinect_tile_caps["left"] = held
         with mock.patch.object(self.bc, "CAMERAS", self._cams()), \
                 mock.patch.object(self.bc, "_open_tile_capture",
-                                  lambda idx: None), \
+                                  lambda idx, name=None: None), \
                 mock.patch.object(self.bc, "_resolve_webcam_indices_by_name",
                                   return_value={"left": 2, "right": 0}):
             self.bc._read_side_tile_webcams(now=now)
@@ -966,7 +966,7 @@ class SideTileReuseFaceTrackFramesTests(MonolithGlobalsTestCase):
 
         with mock.patch.object(self.bc, "CAMERAS", self._cams()), \
                 mock.patch.object(self.bc, "_open_tile_capture",
-                                  lambda idx: None), \
+                                  lambda idx, name=None: None), \
                 mock.patch.object(self.bc, "_resolve_webcam_indices_by_name",
                                   _resolve):
             self.bc._read_side_tile_webcams(now=now)

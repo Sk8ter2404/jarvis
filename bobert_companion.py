@@ -3613,12 +3613,33 @@ def _restore_tray_toggle_state() -> None:
                 print(f"  [tray-restore] ambient_listen_start failed: {e}")
 
     # Push the paused state into both daemon owners.
+    #
+    # The diagnostic-daemons half reconciles in BOTH directions, and must.
+    # `_daemons_paused[0]` (hud_state.json) is the flag the tray, the HUD and
+    # the boot log all report; data/diagnostic_daemons.json's "paused" is only
+    # a MIRROR of it that the four worker loops actually obey. This block used
+    # to push the True case alone, so a mirror set True by a path the HUD flag
+    # never followed — a spoken pause_diagnostics, or a lever whose restore
+    # never ran because the box was power-cycled — could not be cleared by any
+    # number of restarts. It failed silently in the worst direction: every loop
+    # stamps its alive_ts BEFORE testing paused, so all four kept heartbeating
+    # while doing nothing. Found live 2026-09-06 with the mirror stuck True and
+    # last real work 94-101 days stale, under a boot log printing paused=False
+    # — crash-watch among the daemons that were quietly off. See
+    # core.diagnostic_daemons.reconcile_paused.
+    #
+    # ambient_listen deliberately stays inside the `if` below: its paused flag
+    # is a module-level cell in a freshly imported module (default False), so
+    # unlike the on-disk mirror it cannot be stale at boot.
+    try:
+        from core import diagnostic_daemons as _diag_daemons
+        if _diag_daemons.reconcile_paused(bool(_daemons_paused[0])):
+            print("  [tray-restore] diagnostic-daemon paused mirror had drifted "
+                  f"— forced to paused={bool(_daemons_paused[0])}")
+    except Exception as e:
+        print(f"  [tray-restore] reconcile_paused failed: {e}")
+
     if _daemons_paused[0]:
-        try:
-            from core import diagnostic_daemons as _diag_daemons
-            _diag_daemons.pause_diagnostics()
-        except Exception as e:
-            print(f"  [tray-restore] pause_diagnostics failed: {e}")
         try:
             _al = sys.modules.get("skill_ambient_listen")
             if _al is not None and hasattr(_al, "set_paused"):
@@ -4419,6 +4440,35 @@ def _fingerprint_sees_rejoin(fp) -> bool:
 # bug than the leak. But it is also, exactly, the pre-fix behaviour and the
 # pre-fix leak: +6 OS threads and +618 handles per MINUTE, permanently.
 #
+# "+6/MIN" IS THE QUIET HALF, and saying only that understated the danger by
+# 31x. MEASURED 2026-09-06, real COM, real leaky enumeration, thread census by
+# Win32 start address inside mfksproxy.dll, 3.0 min per arm, fresh process:
+#   3.0 min, fingerprint None, amplifier quiet
+#         18 enums    6.00/min    +18 thr      +664 hnd/min
+#   3.0 min, fingerprint None, amplifier at 4 Hz
+#        625 enums  208.13/min   +560 thr   +19,259 hnd/min
+#   8.5 min, fingerprint None, amplifier at 4 Hz, floor removed (confirmation;
+#            stopped at a 1,500-thread safety cap, rate flat throughout)
+#      1,711 enums  200.21/min +1,520 thr   +18,340 hnd/min
+# The amplifier rows are the ones that matter: _invalidate_side_tile_indices()
+# fires on EVERY failed side-tile read and clears the resolved flag, so a sick
+# camera drives this path at _KINECT_PREVIEW_TILE_READ_INTERVAL (0.25 s), not at
+# the TTL. At those rates the v2.0.100 death numbers (14,507 threads /
+# 1,419,190 handles) arrive in 74-82 MINUTES, not the ~40 hours "+6/min"
+# implies - i.e. the operator would have seen the 15-minute re-warning perhaps
+# five times before the process stopped logging at all.
+#
+# So the degraded path is now FLOORED at _WEBCAM_IDX_TTL_SEC in
+# _resolve_webcam_indices_by_name() (see the "RATE FLOOR" block there): a
+# forced invalidation may still bypass the TTL, but only once per TTL window,
+# which makes "+6 OS threads and +618 handles per MINUTE" above true of BOTH
+# rows instead of only the first. That floor is deliberately NOT applied to
+# _dshow_input_devices_gated(): its callers are backoff-bounded
+# (CAMERA_REOPEN_BACKOFF_SEC = 2 s, so <=30/min even fully degraded) and
+# test_unreadable_fingerprint_degrades_to_enumerating_every_time pins that
+# contract on purpose. The tile resolver is the only consumer with a per-frame
+# amplifier behind it, so it is the only one that needed the floor.
+#
 # And it used to happen in TOTAL SILENCE. Measured 2026-09-05 on this rig, same
 # process, 30 TTL ticks each:
 #     real pygrabber          fingerprint OK   ->  0 enumerations, +0 threads
@@ -4457,6 +4507,143 @@ _webcam_fingerprint_degraded = [False]
 _webcam_fingerprint_degraded_since = [0.0]
 _webcam_fingerprint_warned_at = [0.0]
 _webcam_fingerprint_leaky_enums = [0]
+
+
+# ── THE AMPLIFIER, COUNTED (2026-09-06) ──────────────────────────────────────
+# _invalidate_side_tile_indices() is the amplifier that killed v2.0.100: every
+# FAILED SIDE-TILE READ forces a re-resolve, and the tile loop retries every
+# _KINECT_PREVIEW_TILE_READ_INTERVAL (0.25 s), so a camera that opens and then
+# stops delivering can drive this path ~240x a minute instead of the 6x a
+# minute the TTL allows. The fingerprint gate above is what is supposed to turn
+# those into free SetupAPI probes instead of leaky DirectShow enumerations.
+#
+# THIS EXISTS BECAUSE THE PATH WAS UNOBSERVABLE, and that is not a small thing.
+# A soak reported on 2026-09-06 04:32-04:55 that "under the full amplifier
+# condition (camera permanently unavailable, producer retrying opens forever)
+# mfksproxy was 2 -> 2, +0.000/min over 17.2 min". It was not. At 04:31:14 the
+# preflight had already logged "camera index 0: failed to open in 2.0s -
+# marking bad" and "dropped 1 bad camera index/es; 1 remain", which removes the
+# camera from CAMERAS for the whole session; _kinect_preview_webcam_names() is
+# DERIVED from CAMERAS, so the 'right' slot never resolved, no tile handle was
+# ever opened, no read ever failed, and the amplifier could not fire even once.
+# The reviewer's own tile sampler agreed - the right tile changed 1 sample in
+# 1108, median age 806 s, max 1503 s - and the claim still stood, because
+# nothing IN the process counted. A +0.000/min measured on an idle one-camera
+# JARVIS was reported as the amplifier being safe.
+#
+# So: COUNT IT, and say so on the console. After this, "the amplifier ran" is a
+# checkable statement - a soak that cannot show these numbers did not test it.
+# Cheap by construction: four int increments on a path that already does COM
+# work, plus one throttled time comparison per resolve.
+_DSHOW_ENUM_LEAK_HANDLES = 103        # per leaked CreateClassEnumerator call
+
+# invalidations : failed side-tile reads that forced a re-resolve (the amplifier)
+# suppressed    : re-resolves the FREE device fingerprint absorbed (no leak)
+# enumerations  : leaky DirectShow enumerations actually performed (1 thread +
+#                 _DSHOW_ENUM_LEAK_HANDLES handles each, never reclaimed)
+# ttl_cached    : resolves answered from the 10 s TTL without reaching the gate
+# producer_owned: tile opens DECLINED because the face-track producer holds that
+#                 camera. Each one is a duplicate in-process handle not taken —
+#                 and a duplicate handle measured 98.6-99.5% producer read
+#                 failures with no recovery until release+reopen, so this is the
+#                 count of producer blackouts prevented, not a housekeeping stat.
+#                 See _TILE_PRODUCER_OWNED_MAX_AGE for the measurement.
+# ttl_floored   : forced re-resolves the _WEBCAM_IDX_TTL_SEC rate floor
+#                 absorbed while the FINGERPRINT COULD NOT ANSWER. Separate
+#                 from `suppressed` on purpose: that one means the free probe
+#                 proved the bus had not moved, this one means nothing proved
+#                 anything and we declined to pay 4x/second to keep asking.
+#                 Nonzero here always means the gate is failing open.
+_side_tile_gate_counts = {"invalidations": 0, "suppressed": 0,
+                          "enumerations": 0, "ttl_cached": 0,
+                          "producer_owned": 0, "ttl_floored": 0}
+
+# Reporting window: [started_at, invalidations, suppressed, enumerations, reports]
+# — the counts as of the window start, so every line quotes a RATE over its own
+# window rather than an average since boot. A burst two hours ago must not be
+# reported as current load, and this project's own rule is that a 60-second
+# sample is not a rate.
+_side_tile_gate_window = [0.0, 0, 0, 0, 0, 0]
+_SIDE_TILE_GATE_FIRST_REPORT_S = 60.0     # say it quickly the first time...
+_SIDE_TILE_GATE_REPORT_GAP_S = 300.0      # ...then settle to every 5 min
+
+
+def get_side_tile_gate_stats() -> dict:
+    """Snapshot of the side-tile re-resolve (amplifier) accounting.
+
+    Keys: ``invalidations`` (failed side-tile reads that forced a re-resolve),
+    ``suppressed`` (absorbed by the free fingerprint gate), ``enumerations``
+    (leaky DirectShow enumerations actually made), ``ttl_cached``,
+    ``producer_owned`` (own-handle opens declined because the producer holds
+    that camera — duplicate-handle producer blackouts prevented), plus the
+    derived ``leaked_threads`` / ``leaked_handles`` those enumerations cost and
+    ``fingerprint_none`` (enumerations made with the gate failed open).
+
+    READ THIS BEFORE BELIEVING ANY SICK-CAMERA SOAK: ``invalidations == 0``
+    means the amplifier never fired, whatever else the run measured. And
+    ``producer_owned > 0`` with ``invalidations == 0`` is the healthy shape
+    since 2026-09-06: the tile wanted its own handle and was refused one."""
+    d = dict(_side_tile_gate_counts)
+    d["leaked_threads"] = d["enumerations"]
+    d["leaked_handles"] = d["enumerations"] * _DSHOW_ENUM_LEAK_HANDLES
+    d["fingerprint_none"] = _webcam_fingerprint_leaky_enums[0]
+    return d
+
+
+def _report_side_tile_amplifier(now: float) -> bool:
+    """Print (throttled) what the amplifier did in the window just ended, and
+    what the gate cost. Returns True when it printed. NEVER raises.
+
+    Says NOTHING while the amplifier is quiet — the healthy steady state is the
+    common one and must stay silent, or an operator learns to ignore the line —
+    and slides the window forward instead, so a later burst is measured over
+    ITS OWN window."""
+    try:
+        w = _side_tile_gate_window
+        if len(w) < 6:
+            w.extend([0] * (6 - len(w)))
+        inval = _side_tile_gate_counts["invalidations"]
+        supp = _side_tile_gate_counts["suppressed"]
+        enum = _side_tile_gate_counts["enumerations"]
+        floored = _side_tile_gate_counts["ttl_floored"]
+        if w[0] <= 0.0 or not (now >= w[0]):
+            # not (now >= w[0]) rather than now < w[0]: it also catches a NaN
+            # clock, which would otherwise reach the division below.
+            w[0], w[1], w[2], w[3], w[5] = now, inval, supp, enum, floored
+            return False
+        d_inval = inval - w[1]
+        if d_inval <= 0:
+            w[0], w[1], w[2], w[3], w[5] = now, inval, supp, enum, floored
+            return False
+        gap = (_SIDE_TILE_GATE_FIRST_REPORT_S if w[4] == 0
+               else _SIDE_TILE_GATE_REPORT_GAP_S)
+        elapsed = now - w[0]
+        if elapsed < gap:
+            return False
+        mins = elapsed / 60.0
+        d_supp = supp - w[2]
+        d_enum = enum - w[3]
+        d_floor = floored - w[5]
+        w[0], w[1], w[2], w[3], w[5] = now, inval, supp, enum, floored
+        w[4] += 1
+        print(f"  [kinect-preview] side-tile AMPLIFIER active: {d_inval} failed "
+              f"side-tile read(s) in the last {mins:.1f} min "
+              f"({d_inval / mins:.1f}/min) forced a re-resolve. The device "
+              f"fingerprint absorbed {d_supp} of them for free and the "
+              f"{_WEBCAM_IDX_TTL_SEC:.0f}s rate floor absorbed {d_floor} "
+              f"more (anything but 0 there means the fingerprint could "
+              f"not answer at all - see the FAILED OPEN warning); "
+              f"{d_enum} reached the leaky DirectShow enumeration "
+              f"(≈{d_enum} OS thread(s), "
+              f"≈{d_enum * _DSHOW_ENUM_LEAK_HANDLES} handle(s), never "
+              f"reclaimed before a restart). Ungated this window would have "
+              f"cost ≈{d_inval} threads and "
+              f"≈{d_inval * _DSHOW_ENUM_LEAK_HANDLES} handles. A camera is "
+              f"opening and then failing its reads - this is the v2.0.100 "
+              f"death path, and this line is the only evidence it ran.")
+        return True
+    except Exception:
+        return False
 
 
 def _report_video_fingerprint_gate(fp, names, now: float) -> bool:
@@ -4533,12 +4720,16 @@ def _report_video_fingerprint_gate(fp, names, now: float) -> bool:
                      "fingerprint did not — a race, or a device that left "
                      "between the two probes")
         # QUOTE THE MEASURED RATE once there is a window to measure over, not
-        # the TTL-derived one. The TTL is only the FLOOR: every failed
-        # side-tile read calls _invalidate_side_tile_indices(), which bypasses
-        # the TTL entirely, so a sick camera on a failed-open gate leaks far
-        # faster than 6/min (that amplifier was ~89% of the v2.0.100 leak). A
-        # warning that always printed the floor would understate exactly the
-        # case that kills the process fastest.
+        # the TTL-derived one. The TTL used to be only a FLOOR here: every
+        # failed side-tile read calls _invalidate_side_tile_indices(), which
+        # bypassed the TTL entirely, and a sick camera on a failed-open gate
+        # therefore leaked at 208 enumerations/min - MEASURED 2026-09-06, 3 min,
+        # real COM - against 6.00/min with the amplifier quiet. That path is now
+        # floored at _WEBCAM_IDX_TTL_SEC, so the two rates have converged; the
+        # OPEN path (_dshow_input_devices_gated, backoff-bounded at <=30/min)
+        # is deliberately not floored and is not counted here. The measured
+        # rate is still what gets printed, because a floor is a claim about the
+        # code and this line is supposed to report the machine.
         n = _webcam_fingerprint_leaky_enums[0]
         mins = max(0.0, now - _webcam_fingerprint_degraded_since[0]) / 60.0
         if mins >= 1.0:
@@ -4548,10 +4739,10 @@ def _report_video_fingerprint_gate(fp, names, now: float) -> bool:
                     f"≈{rate * 103:.0f} handles per MINUTE")
         else:
             floor = 60.0 / max(_WEBCAM_IDX_TTL_SEC, 0.001)
-            cost = (f"at least ≈{floor:.0f} OS threads and ≈{floor * 103:.0f} "
+            cost = (f"about ≈{floor:.0f} OS threads and ≈{floor * 103:.0f} "
                     f"handles per MINUTE — one per {_WEBCAM_IDX_TTL_SEC:.0f}s "
-                    f"TTL tick, and more whenever a failed side-tile read "
-                    f"forces an extra resolve")
+                    f"TTL tick, which a failed side-tile read can bring "
+                    f"forward but no longer multiply")
         print(f"  [kinect-preview] WARNING: the DirectShow enumeration leak "
               f"gate has FAILED OPEN — the video-device fingerprint is "
               f"unreadable, so the leaky enumeration is running unguarded. "
@@ -4746,6 +4937,238 @@ def _dshow_name_to_index(substr: str) -> "int | None":
     return None
 
 
+try:
+    from core import camera_backend as _camera_backend
+except Exception:      # pragma: no cover - core/ always ships with the monolith
+    _camera_backend = None
+
+# Remembers the last decision logged per (index, name, LABEL) so a per-frame
+# tile open does not narrate the same translation forever.
+#
+# THE LABEL IS IN THE KEY BECAUSE LEAVING IT OUT HID A WHOLE CONTENDER.
+# The key used to be (index, name) alone, and `name` is the CAMERA, not the
+# caller - so the FIRST call site to open a given webcam was the only one this
+# process ever announced. Every later opener of that same device - the side
+# tile compositor, the probe sweep, a snapshot - matched the same key, found
+# the same (open_idx, backend), and said nothing, forever.
+#
+# What that cost. Every "[face-track] Right webcam ... read failure" line in
+# the 8 consecutive restarts that opened that camera under this opener
+# (logs/session_2026-09-05_22-37-30.log through session_2026-09-06_06-12-11.log)
+# was classified against the scheduler lines in the same log, 2026-09-06:
+#
+#     27  right-camera read failures, total
+#      8  at camera-open +7..13 s          <- ONE PER RESTART, no scheduler line
+#      8  at the self-diag BOOT sweep      (+8..13 s after it fires)
+#     11  at a 30-minute interval sweep    (+8..10 s after the apscheduler line)
+#      0  unaccounted for
+#
+# So the per-restart count inside the first 90 s is TWO, not one, and the
+# probes explain 19 of 27 failures rather than all of them. The boot sweep is
+# announced ("[self-diag] boot sweep queued (fires in 60s)") 8-10 s BEFORE the
+# camera opens and fires 60 s later, which is why its failure lands at open
+# +59..63 s and is easy to find. The +9 s one has no scheduled anything behind
+# it: the boot sweep has not fired, the 30-minute interval:run_diagnostic job
+# was only just added and does not run for another half hour, and - until this
+# key changed - the session log carried exactly ONE camera-open line for that
+# webcam no matter how many call sites touched it. So the boot log read as a
+# healthy producer that simply stopped getting frames, with no opener named
+# anywhere, and the conclusion that invites ("every producer read failure is
+# the 30-minute probe, so this one must be the USB camera dying") is the wrong
+# turn that has already cost this owner an evening.
+#
+# For contrast, the three restarts that opened this same webcam BEFORE the
+# 2026-09-05 camera-open rewrite (2026-09-04 23:09, 2026-09-05 00:48, 00:52)
+# logged exactly ONE boot-window failure each, and it was the boot sweep's:
+# open +70/+75/+99 s, i.e. 18-48 s after that sweep fired, against 8-12 s
+# after it now. (The right camera was then absent from CAMERAS from 09-05
+# 07:14 until 22:11, which is why no restart in between opened it at all.)
+# HONEST LIMIT: 3 boots before against 8 after, and what changed between them
+# was the whole opener - Media Foundation, index translation, require_frame,
+# the tile/probe rewrite - not one switch. So this says the +9 s failure showed
+# up alongside that rewrite; it does not isolate which part of it. Which is
+# exactly the question the log has to be able to answer, and could not, because
+# it named only the first opener of each camera.
+#
+# WHAT THE +9 s CONTENDER TURNED OUT TO BE, and why that is the argument for
+# this key rather than against it: the side-tile compositor opening its OWN
+# second in-process handle on the camera the producer already holds (measured
+# separately at 98.6-99.5% producer read failures; the tile now declines that
+# open and says so - "[kinect-preview] <slot> tile: declined N own-handle
+# open(s)"). Verified live on the 2026-09-06 07:55:26 restart, the first one
+# after that gate: right webcam opened 07:55:49, the tile decline was logged in
+# the same second, and the next 32 minutes - covering the 60 s boot sweep AND
+# the first 30-minute interval sweep (08:25:41, which completed in 3 s) -
+# produced ZERO right-camera read failures, where the previous 8 restarts each
+# produced 2 in the boot window alone plus one per interval sweep.
+#
+# Which also suggests, though this part is inference and not measurement, that
+# the tile was the AMPLIFIER for all three kinds: a probe stalls the producer
+# briefly, its cached frame ages past _KINECT_PREVIEW_TILE_REUSE_MAX_AGE, the
+# tile stops reusing it and opens its own handle, and THAT is what turns a
+# blip into 25 consecutive failed reads. If so, the original "every failure is
+# the probe" reading named the trigger and missed the mechanism.
+#
+# That contender opened the same (index, name) as the producer, which is
+# exactly the pair this dedupe collapsed - so for eight restarts the log could
+# not name it, and this key is why the next one will be named on the first
+# line it prints.
+#
+# Still bounded: a key is (index, name, label), and every label a call site
+# passes is either a configured camera's name/label or an f-string over the
+# INDEX alone ("index N", "probe index N", "side tile index N"). So the dict is
+# capped by call sites x indices, not by time or frame count.
+_camera_backend_notes: dict = {}
+
+# Lines _camera_open() wants said, waiting for a thread that is allowed to say
+# them. See _drain_camera_backend_notes for why this queue exists at all.
+_camera_backend_pending: deque = deque(maxlen=32)
+
+
+def _drain_camera_backend_notes() -> None:
+    """Print whatever _camera_open() queued, from the CALLER's thread.
+
+    TWO RULES COLLIDE HERE, and this queue is what satisfies both.
+
+    1. _camera_open() runs on the throwaway open worker that
+       _open_capture_bounded may abandon, and that worker MUST NOT print - an
+       abandoned open that narrates itself lands after "Abandoning the
+       attempt…" and reads as the camera coming back. (See
+       AnOpenedLineMeansTheProducerHoldsThatCamera.)
+    2. logging is not an escape hatch. The daemon Tees stdout/stderr into
+       logs/session_*.log and configures no logging handler at all, so
+       logging.info() goes NOWHERE in production - verified 2026-09-05 by
+       grepping a live session log for logging-formatted lines: zero. Routing
+       the backend decision there made it invisible on the only machine that
+       matters, which is this project's signature failure, not a fix for it.
+
+    So the worker QUEUES and a joiner SAYS. What is queued is a decision
+    ("opening with MSMF at index 1"), never an outcome, so it cannot be misread
+    as a success even when it is printed after an abandon. NEVER raises."""
+    while True:
+        try:
+            line = _camera_backend_pending.popleft()
+        except IndexError:
+            return
+        except Exception:       # pragma: no cover - defensive
+            return
+        try:
+            print(line)
+        except Exception:       # pragma: no cover - defensive
+            return
+
+
+def _camera_open(idx, *, name: "str | None" = None,
+                 width: "int | None" = None, height: "int | None" = None,
+                 require_frame: float = 0.0, label: str = ""):
+    """THE camera opener. Picks the backend, translates the index for it, and
+    hands back an opened capture (or None). Callers keep their own locking and
+    their own wall-clock bounding — this is only the inner open.
+
+    ``idx`` is a DIRECTSHOW index, because that is what CAMERAS on disk holds
+    and what _dshow_name_to_index() produces. The two backends do NOT index the
+    same list (verified on this rig 2026-09-05: DirectShow 0=USB 2.0 Camera
+    1=Kinect 2=eMeet 3=OBS Virtual Camera; Media Foundation 0=Kinect
+    1=USB 2.0 Camera 2=eMeet, with no OBS entry at all), so handing a raw
+    CAMERAS index to CAP_MSMF would repoint index 0 from the USB webcam to the
+    Kinect and succeed. Everything here exists to stop that.
+
+    WHY MSMF AT ALL — measured, 25 open/read/release cycles per figure, fresh
+    process each, 1280x720 requested, 30 reads per cycle:
+        eMeet C960   CAP_DSHOW  +4.58 OS threads  +479 handles  per cycle
+        eMeet C960   CAP_MSMF   -0.21 OS threads    +0.97       per cycle
+        USB 2.0 Cam  CAP_DSHOW  +4.55 OS threads  +479 handles  per cycle
+        USB 2.0 Cam  CAP_MSMF   -0.18 OS threads    +1.06       per cycle
+    The DirectShow threads all start inside mfksproxy.dll and are never
+    reclaimed. That is the OPEN half of the same leak v2.0.101 gated in the
+    enumeration half, and unlike the enumeration it cannot be gated away: the
+    face-track loop has to open the camera.
+
+    NAME FIRST, INDEX SECOND. Matching the configured CAMERAS name against the
+    Media Foundation device list needs no DirectShow enumeration at all — and
+    MFEnumDeviceSources measured +0.000 threads and +0.000 handles per call
+    over 40 calls (1.2 ms median), against the DirectShow enumeration's
+    +0.924 / +95.3 per call at 41.8 ms in the same harness. So a named camera
+    reaches a true zero, which is the thing
+    _resolve_webcam_indices_by_name()'s own comment says a gate could never
+    do. The DirectShow name list is fetched ONLY as the fallback for an
+    unnamed index, and only through the gated accessor."""
+    if _camera_backend is None:      # pragma: no cover - defensive
+        # core/camera_backend.py failed to import. Degrade to exactly what this
+        # code did before it existed rather than to no cameras at all: a raw
+        # DirectShow open at the configured index. That leaks, and it is still
+        # better than a rig whose face tracker cannot see.
+        try:
+            cap = cv2.VideoCapture(int(idx), cv2.CAP_DSHOW)
+            if cap.isOpened():
+                if width and height:
+                    try:
+                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
+                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    except Exception:
+                        pass
+                return cap
+            _release_on_current_camera_lock(cap)
+        except Exception:
+            logging.exception("[camera] fallback DirectShow open failed for "
+                              "index %s", idx)
+        return None
+    open_idx, backend, why = _camera_backend.resolve_capture_target(
+        idx, name=name, dshow_names=None)
+    if (backend != "msmf"
+            and not name
+            and _camera_backend.configured_backend() == "msmf"
+            and _camera_backend.msmf_device_names() is not None):
+        # Media Foundation IS available; we just cannot map a BARE index to it
+        # without knowing the DirectShow device names. Pay for the gated (and
+        # therefore leaky) enumeration only here, and only for an index with no
+        # configured name — the index sweeps.
+        #
+        # `not name` is load-bearing, not an optimisation. A name that failed
+        # to match Media Foundation has already answered the question: the
+        # DirectShow list could only help by matching some OTHER device's
+        # friendly name at that index, which is precisely the wrong-camera
+        # outcome this whole module exists to prevent. Falling back to
+        # DirectShow at the configured index is what the code did before and
+        # is the honest answer. It also keeps the leaky enumeration out of the
+        # per-composite tile path, where a sick camera would otherwise buy one
+        # per self-heal floor on a SECOND cache.
+        names = _dshow_input_devices_gated(_dshow_open_devices_cache)
+        if names:
+            open_idx, backend, why = _camera_backend.resolve_capture_target(
+                idx, name=name, dshow_names=names)
+    # QUEUED, not printed and not logged. This runs on the throwaway open
+    # worker, which may not narrate itself; and logging goes nowhere in the
+    # daemon. See _drain_camera_backend_notes, which a joiner calls.
+    # `label` is the CALL SITE, and it is in the key on purpose: without it the
+    # second and every later opener of a camera is silent for the life of the
+    # process, which is how a boot-time contender stayed invisible for eight
+    # restarts. See _camera_backend_notes.
+    key = (idx, name, label)
+    if _camera_backend_notes.get(key) != (open_idx, backend):
+        _camera_backend_notes[key] = (open_idx, backend)
+        _camera_backend_pending.append(
+            f"  [camera] {label or ('index ' + str(idx))}: opening with "
+            f"{backend.upper()} at index {open_idx} — {why}")
+    # cv2_mod=cv2 hands the shared opener THIS module's cv2 reference rather
+    # than letting it import its own. That is what makes a monolith-level cv2
+    # substitution (the audit harness's stub, and every test that patches
+    # bc.cv2.VideoCapture) actually reach the open — without it the opener
+    # silently used the real cv2 and the substitution recorded nothing.
+    # release_hook: this runs on the throwaway open worker, which may be
+    # abandoned and have its camera I/O lock RETIRED under it. Every failure
+    # path inside open_camera (refused open, retry, frameless handle) must
+    # therefore release through the CURRENT lock object rather than bare, or a
+    # late release from an abandoned worker overlaps live camera I/O — the
+    # 0xc0000374 heap corruption this whole locking scheme exists to prevent.
+    return _camera_backend.open_camera(
+        open_idx, backend=backend, width=width, height=height,
+        require_frame=require_frame, cv2_mod=cv2,
+        release_hook=_release_on_current_camera_lock,
+        log=_camera_backend_pending.append)
+
+
 def _resolve_webcam_indices_by_name() -> dict[str, int]:
     """Map 'left'/'right' → the DirectShow device INDEX whose friendly name
     contains the configured substring, via pygrabber. Cached after the first
@@ -4765,8 +5188,14 @@ def _resolve_webcam_indices_by_name() -> dict[str, int]:
     resolve every _WEBCAM_IDX_TTL_SEC, and let a failed tile read invalidate the
     cache immediately (see _invalidate_side_tile_indices)."""
     now = time.time()
+    # Throttled amplifier accounting. Here rather than in the tile loop
+    # because this is the function the amplifier actually costs something
+    # in, and it is reached only when a slot is NOT being served from the
+    # face-track loop's cache - i.e. only when there is something to say.
+    _report_side_tile_amplifier(now)
     if (_kinect_preview_webcam_resolved[0]
             and (now - _kinect_preview_webcam_resolved_at[0]) < _WEBCAM_IDX_TTL_SEC):
+        _side_tile_gate_counts["ttl_cached"] += 1
         return _kinect_preview_webcam_idx
     # The TTL has expired -- but expiry alone is NOT a reason to re-enumerate.
     # _enumerate_dshow_input_devices() leaks a thread and 103 handles every time
@@ -4828,9 +5257,71 @@ def _resolve_webcam_indices_by_name() -> dict[str, int]:
              else _WEBCAM_IDX_SELFHEAL_SEC)
     if (now - _kinect_preview_webcam_enumerated_at[0]) >= floor:
         pass                    # fall through to the real enumeration below
-    elif _kinect_preview_webcam_fingerprint[0] is not None:
-        fp = _video_device_fingerprint()
-        if fp is not None and fp == _kinect_preview_webcam_fingerprint[0]:
+    else:
+        held = _kinect_preview_webcam_fingerprint[0]
+        fp = _video_device_fingerprint() if held is not None else None
+        if fp is not None and fp == held:
+            _side_tile_gate_counts["suppressed"] += 1
+            _kinect_preview_webcam_resolved[0] = True
+            _kinect_preview_webcam_resolved_at[0] = now
+            return _kinect_preview_webcam_idx
+        # RATE FLOOR ON THE FORCED PATH (2026-09-06, measured).
+        #
+        # There are exactly three ways to reach the leaky enumeration below:
+        #   (a) the self-heal floor expired      -- already rate-limited, >=300 s
+        #   (b) the fingerprint CHANGED          -- a real bus event, rare
+        #   (c) the fingerprint is UNREADABLE    -- "could not tell"
+        # (a) and (b) are bounded by physics. (c) is not, and (c) is the one the
+        # amplifier multiplies: _invalidate_side_tile_indices() clears the
+        # resolved flag on EVERY failed side-tile read, so the TTL early-return
+        # above never fires and a sick camera arrives here 4x/second forever.
+        #
+        # MEASURED 2026-09-06, real COM, real leaky enumeration, threads counted
+        # by Win32 start address inside mfksproxy.dll:
+        #   3.0 min  fingerprint None, amplifier quiet
+        #                                         6.00 enum/min   +664 hnd/min
+        #   3.0 min  fingerprint None, amplifier at 4 Hz
+        #                                       208.13 enum/min +19,259 hnd/min
+        #   8.5 min  same, confirmation run    200.21 enum/min +18,340 hnd/min
+        #  25.0 min  fingerprint None, amplifier at 4 Hz, WITH this floor
+        #            (5,916 firings)              5.96 enum/min    +566 hnd/min
+        #  35.0 min  gate HEALTHY, amplifier at 4 Hz (8,320 firings)
+        #                                        0.029 enum/min      +7 hnd/min
+        # The unfloored degraded arms reach the v2.0.100 death numbers (14,507
+        # threads / 1,419,190 handles) in 74-82 minutes; the floored one lands
+        # on the 6.00/min the alarm block already claims for the quiet case,
+        # i.e. the amplifier stops being a multiplier. The HEALTHY row is the
+        # one the 2026-09-06 sick-camera soak was reported as having measured
+        # and had not: 8,320 forced re-resolves, one enumeration. The module's own alarm block called
+        # the degraded state "+6 OS threads and +618 handles per MINUTE"; under
+        # the amplifier it was 31x that, and nothing in either soak leg of
+        # 2026-09-06 could have told the two apart: the sick camera healed
+        # partway through, and NEITHER leg counted invalidations at all (these
+        # counters did not exist yet), so how often the amplifier fired in
+        # them is not knowable from the artifacts - only that the right tile
+        # kept republishing live content every ~0.24 s with 3 gaps over 1 s in
+        # 23,465 writes, and that both legs logged the identical 6 camera
+        # read-failure/reopen events.
+        #
+        # So: a forced invalidation may still bypass the TTL -- but only ONCE
+        # per _WEBCAM_IDX_TTL_SEC. The first failed read after a quiet window
+        # still re-resolves immediately, which is the whole point of the
+        # 2026-07-14 invalidation; the 39 that follow it inside the same 10 s
+        # reuse the map. That is not a new staleness risk: 10 s is precisely the
+        # window _WEBCAM_IDX_TTL_SEC already defines as acceptable for this map,
+        # so the forced path is being held to the bound the timed path has had
+        # since the beginning, instead of being exempt from it.
+        #
+        # DELIBERATELY NOT MIRRORED into _dshow_input_devices_gated(). That gate
+        # is reached from the face-track reopen branch at
+        # CAMERA_REOPEN_BACKOFF_SEC (2 s), so fully degraded it is <=30/min --
+        # bounded, and test_unreadable_fingerprint_degrades_to_enumerating_
+        # every_time pins "enumerate on every attempt" there on purpose. Only
+        # this resolver has a per-frame amplifier behind it.
+        if (held is None or fp is None) and (
+                now - _kinect_preview_webcam_enumerated_at[0]
+                ) < _WEBCAM_IDX_TTL_SEC:
+            _side_tile_gate_counts["ttl_floored"] += 1
             _kinect_preview_webcam_resolved[0] = True
             _kinect_preview_webcam_resolved_at[0] = now
             return _kinect_preview_webcam_idx
@@ -4842,6 +5333,12 @@ def _resolve_webcam_indices_by_name() -> dict[str, int]:
     _kinect_preview_webcam_fingerprint[0] = _video_device_fingerprint()
     _kinect_preview_webcam_enumerated_at[0] = now
     names = _enumerate_dshow_input_devices()
+    if names is not None:
+        # COUNT ONLY WHAT LEAKED. `names is None` means the enumeration
+        # failed at the pygrabber IMPORT and never reached
+        # CreateClassEnumerator, so nothing leaked - counting it would
+        # inflate the exact number this accounting exists to keep honest.
+        _side_tile_gate_counts["enumerations"] += 1
     # ALARM if the fingerprint we just stamped is None: the gate cannot fire
     # against it, so this leaky enumeration will repeat every TTL tick forever.
     # It has to be HERE and not at the probe — `names` is what separates "the
@@ -4884,12 +5381,63 @@ def _resolve_webcam_indices_by_name() -> dict[str, int]:
     return _kinect_preview_webcam_idx
 
 
+# Throttle for the producer-owned decline line: [last_printed_at, suppressed].
+# One line per slot would be one line per composite (~4 Hz) without this.
+_tile_open_declined_note = {"left": [0.0, 0], "right": [0.0, 0]}
+_TILE_OPEN_DECLINED_NOTE_GAP_S = 300.0
+
+
+def _note_tile_open_declined(slot: str, now: float) -> bool:
+    """Say (throttled, per slot) that a side-tile open was DECLINED because the
+    producer holds that camera. Returns True when it printed. NEVER raises.
+
+    This is the line the DECLINE gets. It is not a substitute for the open note
+    and does not depend on it: _camera_open() now keys _camera_backend_notes by
+    (index, name, LABEL), so a tile open would announce itself as "side tile
+    index N" — but through the eight boots this gate exists for the key was
+    (index, name) only, and the tile's name comes from
+    _kinect_preview_webcam_names(), which is derived from CAMERAS, i.e. the SAME
+    (index, name) the producer had already opened with. The second open
+    therefore printed NOTHING, and eight boots of right-camera read failures
+    were attributed to the 30-minute self-diagnostic sweep — which the sweep
+    timestamps in data/self_diagnostic.json flatly contradict (the nearest sweep
+    was 37-44 s LATER, every time). An open that is now visible is still an open
+    that must not happen; this line says it did not.
+
+    Silent about the healthy steady state — where it never fires at all — and
+    loud exactly once per five minutes while it is firing."""
+    try:
+        note = _tile_open_declined_note.get(slot)
+        if note is None:
+            return False
+        note[1] += 1
+        if note[0] > 0.0 and (now - note[0]) < _TILE_OPEN_DECLINED_NOTE_GAP_S:
+            return False
+        n, note[0], note[1] = note[1], now, 0
+        print(f"  [kinect-preview] {slot} tile: declined {n} own-handle open(s) "
+              f"— the face-track producer holds this camera. A second "
+              f"in-process handle measured 98.6-99.5% producer read failures "
+              f"and the producer did NOT recover when it was released. The "
+              f"tile shows the producer's cached frame (or the off panel past "
+              f"{_TILE_PRODUCER_OWNED_MAX_AGE:.0f}s) instead.")
+        return True
+    except Exception:
+        return False
+
+
 def _invalidate_side_tile_indices() -> None:
     """Force the next _resolve_webcam_indices_by_name() to re-enumerate.
     Called when a side-tile read fails: the most likely cause is a bus
     re-enumeration that moved the device, and re-resolving by NAME is exactly
-    how we find it again. Never raises."""
+    how we find it again. Never raises.
+
+    COUNTED (2026-09-06): this is THE amplifier, and it used to leave no
+    trace at all - which is how a soak came to report "measured under the
+    full amplifier condition" for a run in which this function was never
+    called once. ``get_side_tile_gate_stats()['invalidations'] == 0`` now
+    says so."""
     try:
+        _side_tile_gate_counts["invalidations"] += 1
         _kinect_preview_webcam_resolved[0] = False
         _kinect_preview_webcam_resolved_at[0] = 0.0
     except Exception:
@@ -5180,9 +5728,43 @@ _kinect_tile_lock = threading.Lock()
 _kinect_preview_tiles_open = [False]
 
 
-def _open_tile_capture(idx: int) -> "cv2.VideoCapture | None":
-    """Open a side-tile webcam at `idx` (DirectShow), modest 640×480 since it's
-    only a thumbnail. Returns an opened capture or None. Serialised on
+# How long a side-tile open waits for a REAL frame before giving up. Short:
+# a tile is a thumbnail, the compositor has a placeholder, and the slot is
+# retried on the next composite anyway.
+# How long a side-tile open waits for a REAL frame before giving up.
+#
+# SIZED AGAINST _CAMERA_OPEN_TIMEOUT_S (4.0 s), which bounds the whole tile
+# open, using measured numbers rather than a guess. Worst observed MSMF tile
+# open: a transient open failure (0.04 s) + the 0.25 s retry sleep + a second
+# open (0.68 s) + set(W)/set(H) (0.90 s) = 1.87 s, leaving ~2.1 s. The frame
+# itself arrived 0.30-0.42 s after the sets in every measured cycle on both
+# webcams, so 1.0 s is ~2.4x the observed worst case and still fits inside the
+# bound with headroom. A tile that misses is a placeholder for one composite
+# and is retried on the next, so the cheap direction is the right one.
+_TILE_OPEN_FRAME_BUDGET_S = 1.0
+# Same budget for the face-track producer's own open. Longer than the tile's:
+# this handle is the one the whole loop runs on, and a camera that is merely
+# warming up (documented at _probe_camera_index: ~2 s of False reads after a
+# cold open) must not be thrown away as dead.
+_LOOP_OPEN_FRAME_BUDGET_S = 2.5
+
+# The resolution the face-track producer ACTUALLY requests for a CAMERAS entry.
+# NAMED, because two call sites now have to agree on it: the producer itself,
+# and list_cameras(), which recommends indices to paste into CAMERAS and must
+# therefore prove them at THIS size rather than only at its own sweep
+# resolution. Those are not the same question on this rig — measured
+# 2026-09-06, JARVIS stopped, through core.camera_backend.open_camera: the
+# Kinect V2 delivers 1920x1080 at 30.1 fps under Media Foundation and exactly
+# 0 frames at 1280x720, 640x480, or with no resolution set (it falls back to
+# 512x424 and then fails every read). A hardcoded duplicate here is precisely
+# the stale-copy shape this codebase pays for most, so there is one copy.
+_LOOP_OPEN_WIDTH = 1280
+_LOOP_OPEN_HEIGHT = 720
+
+
+def _open_tile_capture(idx: int, name: "str | None" = None) -> "cv2.VideoCapture | None":
+    """Open a side-tile webcam at DirectShow index `idx`, modest 640×480 since
+    it's only a thumbnail. Returns an opened capture or None. Serialised on
     _camera_io_lock (DirectShow heap-corrupts on overlapping open/release).
     NEVER raises.
 
@@ -5197,26 +5779,29 @@ def _open_tile_capture(idx: int) -> "cv2.VideoCapture | None":
         stop a known-sick device from finding this wedge again), and
       * the open itself is BOUNDED - it runs on a throwaway worker that owns
         the lock, and we walk away after _CAMERA_OPEN_TIMEOUT_S.
-    The healthy path still performs exactly one DirectShow open, as before."""
+    The healthy path still performs exactly one open, as before - but since
+    2026-09-05 that open goes through _camera_open(), which means Media
+    Foundation and a translated index rather than DirectShow and a raw one.
+    DirectShow cost +4.58 OS threads and +479 handles PER open/release cycle
+    here (measured, 25 cycles, fresh process); MSMF cost -0.21 and +0.97."""
     if _camera_is_quarantined(idx):
         return None
 
     def _do_open():
         with _camera_io_lock:
-            cap = cv2.VideoCapture(int(idx), cv2.CAP_DSHOW)
-            if not cap.isOpened():
-                # Through the lock OBJECT, not a bare release: if this worker
-                # was abandoned and its lock retired while cv2.VideoCapture was
-                # still inside its 20-30 s retry loop, a bare release here would
-                # overlap live camera I/O. See _release_on_current_camera_lock.
-                _release_on_current_camera_lock(cap)
+            # require_frame: on MSMF a device another process holds reports
+            # isOpened() True, accepts set(), reads the requested size back out
+            # of get(), and then delivers nothing (measured 2026-09-05: 0 of 20
+            # reads, against DirectShow's honest isOpened() == False). A tile
+            # that holds such a handle would fail every read forever and feed
+            # _invalidate_side_tile_indices - the amplifier that killed
+            # v2.0.100. Proving a frame at open turns that into a placeholder,
+            # which is what a busy camera looked like under DirectShow anyway.
+            cap = _camera_open(idx, name=name, width=640, height=480,
+                               require_frame=_TILE_OPEN_FRAME_BUDGET_S,
+                               label=f"side tile index {idx}")
+            if cap is None:
                 return None
-            try:
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            except Exception:
-                pass
             return cap
 
     try:
@@ -5259,11 +5844,110 @@ def _open_tile_capture(idx: int) -> "cv2.VideoCapture | None":
 # open-and-read path, unchanged.
 _KINECT_PREVIEW_TILE_REUSE_MAX_AGE = 2.0   # s; an older cache counts as absent
 
+# ── THE SECOND IN-PROCESS OPENER (measured 2026-09-06) ───────────────────────
+#
+# The fast path above declines whenever the producer's cached frame is older
+# than _KINECT_PREVIEW_TILE_REUSE_MAX_AGE, and the fallback under it then
+# OPENED A SECOND HANDLE on a camera the producer is still holding and
+# streaming. That is not a harmless duplicate. Measured in a clean room
+# (JARVIS stopped, one process, both webcams, 3 cycles each, 12 s per phase,
+# the real _camera_open shapes: producer 1280x720 require_frame=2.5, tile
+# 640x480 require_frame=1.0):
+#
+#                       producer reads BEFORE   DURING     AFTER (tile released)
+#   USB 2.0 Camera      208 ok /   0 fail       1 ok / 210 fail    0 ok / 239 fail
+#   eMeet C960          211 ok /   0 fail       1 ok / 211 fail    0 ok / 239 fail
+#
+# Three findings, none of them optional:
+#   1. The second MSMF open is GRANTED - it even satisfies require_frame, so
+#      the "prove a frame at open" guard does not catch this case. The tile
+#      gets the stream; the producer starves 98.6-99.5% of its reads.
+#   2. RELEASING the tile handle does NOT give it back. The producer stayed at
+#      0 ok / 239 fail for a further 12 s in every cycle; only a full
+#      release+reopen recovers it - which is exactly the
+#      "read failure #25 ... woke via release+reopen" pair in the session logs.
+#   3. It is NOT a sick-camera effect. The healthy eMeet C960 died identically.
+#      camera_backend's docstring measured contention CROSS-PROCESS ("both
+#      backends leave the HOLDER undisturbed"); IN-PROCESS is the opposite.
+#
+# WHY IT ONLY EVER HIT THE RIGHT TILE. _read_side_tile_webcams runs from inside
+# the PRIMARY camera's branch of the producer loop, immediately after the
+# primary's frame is cached - so the primary slot's cache is 0 s old and always
+# takes the fast path. The NON-primary camera is read AFTER the composite in
+# the same iteration, so at composite time its cache is one whole loop period
+# old, and on the first iteration it does not exist at all. On this rig the
+# primary is the LEFT eMeet and the non-primary is the RIGHT USB 2.0 Camera,
+# which is why 8 boots out of 8 - EVERY boot in the 2026-09-05 22:00 ->
+# 2026-09-06 07:50 log window in which the producer actually held the right
+# camera AND the tile had a right slot (22:38:43, 22:41:10, 23:20:21, 02:13:45,
+# 02:23:17, 04:56:21, 06:01:36, 06:12:37) - logged a RIGHT read failure 7-13 s
+# after "[kinect-preview] webcam tiles resolved by name", and not one of them
+# had a self-diagnostic sweep before it: the nearest sweep was 37-44 s LATER.
+#
+# So: when the producer HOLDS the camera, the tile may never open its own
+# handle. Its only honest source is the producer's cache, at whatever age that
+# cache has. A duplicate open cannot help - it provably takes the stream away
+# from the loop that needs it.
+#
+# The ceiling below is what stops a frozen thumbnail from being displayed as if
+# it were live. It is sized above a full producer recovery (2.5 s open budget +
+# up to one retry, plus the 25-fail / 2 s wake threshold) so a normal wake does
+# not blink the tile to a placeholder, and well under a minute so a genuinely
+# dead producer shows the "off" panel rather than a stale picture forever.
+_TILE_PRODUCER_OWNED_MAX_AGE = 15.0        # s
 
-def _face_track_frame_for_slot(slot: str, now: float):
+
+def _producer_holds_side(slot: str) -> bool:
+    """True iff the face-track producer currently HOLDS AN OPEN capture for the
+    camera behind side-tile ``slot``.
+
+    This is the whole precondition of the no-duplicate-open rule, and it is
+    deliberately about the HANDLE, not about configuration: ``entry["cap"]`` is
+    None for every state in which the producer has let go of a camera (open
+    backoff, dead-after-N-fails, mid-reopen, quarantine bench, shutdown), and in
+    exactly those states the tile opening its own handle is legitimate and is
+    the only way the slot can show anything at all.
+
+    NO RACE, AND NOT BY LUCK: _read_side_tile_webcams runs from inside
+    _compose_kinect_preview, which runs from inside _hud_kinect_preview_write,
+    which is called only from the producer loop itself. So the thread asking
+    "does the producer hold this?" IS the producer, and it cannot be halfway
+    through its own _open_capture while it is here. A caller on any OTHER thread
+    would have to reckon with the window between _camera_open() returning and
+    entry["cap"] being assigned, where this answers False for a camera that is
+    about to be held — the unsafe direction.
+
+    The handle/Kinect rules live in get_face_track_held_indices() and are NOT
+    restated here — this is only the slot→index half. Two openers already
+    needed this predicate independently (see that function), so a second copy
+    of its reasoning is the stale duplicate waiting to happen. NEVER raises."""
+    try:
+        held = get_face_track_held_indices()
+        if not held:
+            return False
+        for cam in CAMERAS:
+            if not isinstance(cam, dict):
+                continue
+            if _percam_side(cam) != slot:
+                continue
+            if cam.get("index") in held:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _face_track_frame_for_slot(slot: str, now: float,
+                               max_age: "float | None" = None):
     """Return the face-tracking loop's freshest frame for side-tile ``slot``
     ('left'/'right'), or None when there is none we are allowed to reuse.
-    NEVER raises."""
+
+    ``max_age`` overrides _KINECT_PREVIEW_TILE_REUSE_MAX_AGE. The caller passes
+    the wider _TILE_PRODUCER_OWNED_MAX_AGE for a slot whose camera the producer
+    is HOLDING, where a slightly stale cached frame is not a second-best option
+    but the only frame that legitimately exists. NEVER raises."""
+    ceiling = (_KINECT_PREVIEW_TILE_REUSE_MAX_AGE if max_age is None
+               else float(max_age))
     try:
         for cam in CAMERAS:
             if not isinstance(cam, dict):
@@ -5288,7 +5972,7 @@ def _face_track_frame_for_slot(slot: str, now: float):
                 seen_at = _camera_last_frame_at.get(idx, 0.0)
             if frame is None:
                 return None
-            if (now - seen_at) > _KINECT_PREVIEW_TILE_REUSE_MAX_AGE:
+            if (now - seen_at) > ceiling:
                 return None    # loop stalled/stopped -> fall back to our own read
             return frame
     except Exception:
@@ -5329,6 +6013,44 @@ def _read_side_tile_webcams(now: float) -> dict:
                                              label="side tile")
                     _kinect_tile_caps[slot] = None
                 continue
+            # PRODUCER-OWNED GATE (2026-09-06). The fast path just declined, and
+            # before this gate existed that dropped straight into an open of a
+            # camera the producer is STILL HOLDING. Measured: the second
+            # in-process MSMF handle is granted, takes the stream, and leaves the
+            # producer at 98.6-99.5% read failures — and releasing it does not
+            # give the stream back, so the producer only recovers by
+            # release+reopen. See _TILE_PRODUCER_OWNED_MAX_AGE for the numbers
+            # and for why this fired once per boot on the NON-primary tile.
+            #
+            # So we never open. The producer's cache, at whatever age it has, is
+            # the only honest source for this slot; past the ceiling the slot
+            # goes to the placeholder rather than showing a frozen picture.
+            if _producer_holds_side(slot):
+                cap = _kinect_tile_caps.get(slot)
+                if cap is not None:
+                    # Nothing should be held here after this gate exists, but a
+                    # handle opened before the producer (re)took the camera must
+                    # not be left on the device.
+                    _release_capture_guarded(cap, idx=f"tile/{slot}",
+                                             label="side tile")
+                    _kinect_tile_caps[slot] = None
+                stale = _face_track_frame_for_slot(
+                    slot, now, max_age=_TILE_PRODUCER_OWNED_MAX_AGE)
+                out[slot] = stale
+                _kinect_tile_frames[slot] = stale
+                # COUNTED AT THE TILE-READ RATE, NOT THE COMPOSITE RATE. This
+                # branch runs on every composite tick, but the code it replaces
+                # only touched the device once per
+                # _KINECT_PREVIEW_TILE_READ_INTERVAL — the throttle further down
+                # served the cache in between. Counting every tick would
+                # overstate what was prevented by the ratio of the two rates,
+                # and this counter's whole job is to be quotable in a soak.
+                if ((now - _kinect_tile_last_read.get(slot, 0.0))
+                        >= _KINECT_PREVIEW_TILE_READ_INTERVAL):
+                    _kinect_tile_last_read[slot] = now
+                    _side_tile_gate_counts["producer_owned"] += 1
+                    _note_tile_open_declined(slot, now)
+                continue
             if name_idx is None:
                 name_idx = _resolve_webcam_indices_by_name()
             idx = name_idx.get(slot)
@@ -5364,7 +6086,8 @@ def _read_side_tile_webcams(now: float) -> dict:
                 continue
             cap = _kinect_tile_caps.get(slot)
             if cap is None:
-                cap = _open_tile_capture(idx)
+                cap = _open_tile_capture(
+                    idx, name=_kinect_preview_webcam_names().get(slot))
                 _kinect_tile_caps[slot] = cap
             if cap is None:
                 _kinect_tile_frames[slot] = None      # → placeholder
@@ -6329,12 +7052,25 @@ class _CameraIOLock:
         """A subsystem-level recovery the owner cannot see is exactly the bug
         class this file exists to stamp out. NEVER raises."""
         try:
+            # SAY ONLY WHAT IS KNOWN (2026-09-06). This line used to assert
+            # that "the wedged worker keeps the old lock forever". That was
+            # never measured, and it is false in the case that actually
+            # produces most of these: an abandoned cam-probe worker measured
+            # 2.74-3.25 s against a 2.50 s joiner budget, i.e. it came back
+            # 0.2-0.8 s after being abandoned, released its handle and dropped
+            # the retired lock, and the process was back to its baseline thread
+            # count within 8 s. An external reviewer read this sentence as
+            # evidence that every retirement permanently leaks a worker thread
+            # and built a capacity argument on it. The honest statement is that
+            # the abandoned worker keeps the OLD lock until it returns, and
+            # nothing here knows whether that will be in a moment or never.
             msg = (f"  [face-track] the camera I/O lock was RETIRED "
-                   f"({reason or 'holder abandoned'}). The wedged worker keeps "
-                   f"the old lock forever; every other camera thread has been "
-                   f"moved onto a fresh one, so opens, releases and the "
-                   f"self-diagnostic webcam probe all work again instead of "
-                   f"timing out and blaming a healthy camera. "
+                   f"({reason or 'holder abandoned'}). The abandoned worker "
+                   f"keeps the OLD lock until it returns — which may be in a "
+                   f"moment or never; nothing here can tell. Every other "
+                   f"camera thread has been moved onto a fresh one, so opens, "
+                   f"releases and the self-diagnostic webcam probe all work "
+                   f"again instead of timing out and blaming a healthy camera. "
                    f"Retired locks this session: {n}.")
             print(msg)
             logging.warning(msg.strip())
@@ -6891,7 +7627,19 @@ def _open_capture_bounded(idx, opener, label: str = "",
     watchdog's stack dump, so beating from another thread would both forge
     liveness the producer does not have and point the dump at the wrong stack.
 
-    NEVER raises. Performs exactly ONE open - no extra DirectShow traffic."""
+    NEVER raises.
+
+    CALL COUNT, HONESTLY (updated 2026-09-05): this wrapper itself performs no
+    camera traffic at all - `opener` does, exactly once per invocation of this
+    function. What `opener` costs changed when the openers moved to
+    _camera_open(): on MSMF a first open fails transiently about 3-7% of the
+    time (measured over 120 back-to-back opens of two webcams; it fails in
+    ~40 ms where a success takes ~400-490 ms) and is retried once, which
+    recovered every single case. So the worst case here is TWO opens plus one
+    0.25 s sleep, not one. That is deliberate: without the retry a healthy
+    camera would report a spurious open failure several times an hour, and
+    spurious failures are what feed backoff and quarantine.
+    """
     timeout = _CAMERA_OPEN_TIMEOUT_S if timeout is None else timeout
     box: dict = {"cap": None}
     abandoned = [False]
@@ -6960,6 +7708,11 @@ def _open_capture_bounded(idx, opener, label: str = "",
             t.join(timeout=min(_CAMERA_OPEN_BEAT_INTERVAL_S, _left))
             if not t.is_alive():
                 break
+    # SAY WHAT THE WORKER COULD NOT. The opener runs on a thread that is
+    # forbidden to print (it may be abandoned) and logging goes nowhere in the
+    # daemon, so _camera_open() queues its backend decision instead and this
+    # joiner delivers it. See _drain_camera_backend_notes.
+    _drain_camera_backend_notes()
     if t.is_alive():
         abandoned[0] = True
         # DID THIS WORKER ACTUALLY REACH DIRECTSHOW, OR IS IT ONLY QUEUED?
@@ -7065,12 +7818,35 @@ def _detect_face(frame_bgr: np.ndarray) -> tuple[float, float] | None:
 def _probe_camera_index(idx: int, timeout_sec: float = CAMERA_PROBE_TIMEOUT_SEC) -> bool:
     """Open a camera index with a hard wall-clock timeout.
 
-    cv2.VideoCapture(..., CAP_DSHOW) can block 20-30 s in its internal retry
-    loop when an index has no device behind it. Running the open in a worker
-    thread lets the main flow give up after `timeout_sec` and move on — the
-    worker may keep running, but it's daemon and will finish (or never).
-    Returns True only if the camera opened AND yielded a real frame in time.
+    A camera open has no timeout of its own and a sick device can fail to
+    return at all, so the open runs on a worker thread and the main flow gives
+    up after `timeout_sec` — the worker may keep running, but it's daemon and
+    will finish (or never). Returns True only if the camera opened AND yielded
+    a real frame in time.
+
+    ``idx`` is and stays a DIRECTSHOW index: it is what CAMERAS holds, what
+    this sweep rewrites, and what --list-cameras prints. The BACKEND that
+    actually opens it is _camera_open()'s business (Media Foundation by
+    default since 2026-09-05, with the index translated to match), which is
+    also what stopped a dead index in this sweep costing +103 handles a step.
     """
+    # BENCHED INDEX -> DO NOT OPEN IT AT ALL (2026-09-06). This is the half of
+    # the bound that has teeth: scoring strikes on the retirement branch below
+    # only counts wedges, it does not stop them. A camera that has already
+    # wedged _CAMERA_QUARANTINE_STRIKES times is one whose next open costs
+    # another abandoned worker and another retired lock for no new information,
+    # so the probe must decline to start one - the same rule the preview
+    # producer's own quarantine gate has followed since 2026-09-05, applied at
+    # the call site that had no gate. Benches expire (60 s, doubling to 600 s),
+    # so an index that was merely busy still re-tests itself without a restart.
+    # Said out loud, because "not probed" and "probed and failed" are different
+    # facts and the owner is entitled to know which one he is looking at.
+    if _camera_is_quarantined(idx):
+        print(f"  [cam-probe] index {idx}: NOT probed — benched after "
+              f"{_CAMERA_QUARANTINE_STRIKES} wedged opens; each retry abandons "
+              f"a worker inside the camera driver and retires the camera I/O "
+              f"lock. It re-tests itself when the bench expires.")
+        return False
     result = {"ok": False}
     started = threading.Event()      # set the instant the worker OWNS the lock
 
@@ -7095,18 +7871,52 @@ def _probe_camera_index(idx: int, timeout_sec: float = CAMERA_PROBE_TIMEOUT_SEC)
             # and why the by-name rescue — a SERIAL re-probe — appeared to
             # "fix" them: it wasn't the name, it was finally getting the lock.
             started.set()
+            # ONE BUDGET FOR THE WHOLE WORKER, STAMPED HERE (2026-09-06).
+            # The read loop below used to start ITS deadline after the open
+            # returned, so the worker's real cost was open + (timeout_sec-0.2)
+            # while its joiner only ever waited timeout_sec + 0.5. Any open
+            # slower than 0.7 s therefore OVERRAN the joiner by construction,
+            # and the joiner's overrun branch does not merely give up - it
+            # RETIRES the process-wide camera I/O lock and announces a wedge.
+            # Measured on this rig 2026-09-06, index 0 held by another process
+            # (see worker_timing.py in the session scratchpad), timeout_sec=2.0:
+            #     open 0.936 / 1.053 / 1.189 / 1.441 s, then 8 reads over
+            #     1.80 s -> worker_total 2.740 / 2.856 / 2.990 / 3.249 s
+            #     against a 2.500 s joiner budget: OVER on 4 of 4.
+            # Every one of those printed "wedged inside its camera open" and
+            # retired a lock, and 8 s later the process was back to its normal
+            # thread count - i.e. NOTHING was wedged and NOTHING was leaked;
+            # the arithmetic manufactured the diagnosis. A soak of the same
+            # call at the boot cadence retired one lock per attempt, forever,
+            # because nothing but the caller running out of calls ever stopped
+            # it. Stamping the deadline HERE makes open+reads fit inside the
+            # caller's own timeout_sec, so an overrun once again means what the
+            # joiner says it means: a call that did not come back.
+            budget_ends = time.monotonic() + max(0.05, timeout_sec - 0.2)
             cap = None
             try:
-                cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-                if cap.isOpened():
+                # require_frame is deliberately NOT used here: this probe has
+                # its own read-until-deadline loop below, whose budget scales
+                # with timeout_sec so the tiny-timeout unit tests stay fast.
+                # Two nested frame budgets would only make the timing harder to
+                # reason about. The open itself still goes through
+                # _camera_open(), so the index is translated for whichever
+                # backend is in force and a dead DirectShow index no longer
+                # costs +103 handles per sweep step.
+                cap = _camera_open(idx, label=f"probe index {idx}")
+                if cap is not None:
                     # RETRY reads until the probe deadline — a WARMING camera
                     # opens instantly but returns False frames for its first
                     # ~2s (the Logi measured exactly that), so the old single
                     # immediate read() failed healthy devices and the by-name
                     # shuffled-index rescue could never succeed. The deadline
                     # scales with timeout_sec so tiny-timeout unit tests stay
-                    # fast. 2026-07-10.
-                    deadline = time.monotonic() + max(0.05, timeout_sec - 0.2)
+                    # fast. 2026-07-10. It is stamped at the top of the worker
+                    # (budget_ends), NOT here: a camera that opens instantly
+                    # still gets the whole warm-up window, while one with a
+                    # slow open spends the caller's budget instead of silently
+                    # doubling it and tripping the joiner's wedge branch.
+                    deadline = budget_ends
                     while True:
                         ret, _ = cap.read()
                         if ret:
@@ -7139,6 +7949,7 @@ def _probe_camera_index(idx: int, timeout_sec: float = CAMERA_PROBE_TIMEOUT_SEC)
     # +0.5s over the worker's own read deadline so a worker that succeeds at
     # the buzzer isn't misread as wedged by a same-instant join expiry.
     t.join(timeout=timeout_sec + 0.5)
+    _drain_camera_backend_notes()
     if t.is_alive():
         # Wedged in the C-level open call. Abandon the worker and report
         # failure — the underlying handle will be released when the worker
@@ -7152,15 +7963,44 @@ def _probe_camera_index(idx: int, timeout_sec: float = CAMERA_PROBE_TIMEOUT_SEC)
         # acquire(timeout=2.5) would fail forever, and the face-track loop
         # would score quarantine strikes against cameras that never blocked.
         # Same defect, second call site — closed the same way.
+        retired = 0
         try:
             owner, hold = _camera_io_lock.owner_hold()
             if owner == t.ident:
-                _camera_io_lock.retire_if_holding(
+                retired = _camera_io_lock.retire_if_holding(
                     t.ident, hold,
-                    f"cam-probe index {idx} wedged inside its DirectShow open")
+                    f"cam-probe index {idx} wedged inside its camera open")
         except Exception:  # pragma: no cover - defensive: foreign lock object
             logging.exception("[cam-probe] camera I/O lock retire failed for "
                               "index %s", idx)
+        if retired:
+            # A RETIREMENT MUST COST THIS CAMERA A STRIKE (2026-09-06).
+            # WHAT WAS WRONG: the producer's bounded opener has scored a
+            # quarantine strike on this exact branch since 2026-09-05, but THIS
+            # call site retired the process-wide lock and told the quarantine
+            # registry nothing at all. Nothing anywhere counted probe wedges,
+            # so nothing could ever stop one: the retirement count was exactly
+            # the number of times a caller happened to call, and boot happens
+            # to call three times per camera (first pass, retry pass, by-name
+            # rescue). A session log showing "3 retirements, then stable for 17
+            # minutes" was therefore read as proof of a bound when it was only
+            # proof that preflight had finished - it had DROPPED the camera, so
+            # nothing retried it, so nothing could be retired. Soaked at the
+            # boot cadence with the camera left in place (2026-09-06, one probe
+            # every 6 s), the same call retired ONE LOCK PER ATTEMPT with no
+            # ceiling whatsoever.
+            # Feeding the SAME registry the producer uses is what turns that
+            # into a real bound: three wedges bench the index, the gate at the
+            # top of this function then refuses to open it at all, and the
+            # bench backs off 60 -> 600 s. The count stops because the CODE
+            # stops it, not because the caller ran out of calls.
+            try:
+                _lbl = next((c.get("label") or "" for c in CAMERAS
+                             if c.get("index") == idx), "")
+            except Exception:
+                _lbl = ""
+            _camera_note_sick_cycle(idx, _lbl,
+                                    f"probe open wedged >{timeout_sec:.1f}s")
         return False
     return result["ok"]
 
@@ -7553,6 +8393,64 @@ def _face_track_beat_iteration(now: float | None = None) -> None:
     _face_track_beat("loop top", now)
 
 
+def get_face_track_held_indices() -> set:
+    """THE answer to "which cv2 camera indices is the producer holding open".
+
+    ONE PLACE, on purpose. Every in-process opener has to ask this question
+    before it touches a device — measured 2026-09-06, in-process, on this rig:
+    a second MSMF handle on a camera the producer is streaming is GRANTED, takes
+    the stream, and leaves the producer at 98.6-99.5% read failures, and
+    releasing the second handle does NOT give it back (only the producer's own
+    release+reopen recovers). Both webcams behaved identically, so this is not a
+    sick-device effect. ``core/camera_backend.py``'s "both backends leave the
+    HOLDER undisturbed" was measured ACROSS processes; in-process is the
+    opposite, and in-process is the only way JARVIS runs.
+
+    Two openers have already had to answer it independently — the side-tile
+    compositor (_producer_holds_side, above) and the self-diagnostic webcam
+    probe (skills/self_diagnostic.py) — which is exactly how this project's
+    signature STALE DUPLICATE starts. New callers use this; they do not walk
+    _face_track_caps themselves.
+
+    A Kinect-backed entry is excluded because the producer reaches the sensor
+    through pykinect2, never through cv2.VideoCapture, so it holds no cv2 index
+    for that slot and collides with no webcam opener. The test is the same one
+    _open_capture applies (explicit ``{"type": "kinect"}`` OR the
+    KINECT_AS_CAMERA opt-in hijacking an UNNAMED entry), not the narrower
+    type-only test, or an unnamed slot on a Kinect rig reads as a held webcam.
+
+    ``entry["cap"] is None`` means the producer has LET GO — open backoff, dead
+    after N failed reads, mid-reopen, quarantine bench, shutdown — and in those
+    states another opener collides with nothing and must not be blocked, or the
+    device could never be shown again.
+
+    ONE WINDOW THIS CANNOT SEE, and a caller off the producer thread has to
+    handle it: between _camera_open() returning a handle and the loop assigning
+    it to entry["cap"], this answers False for a camera that is about to be
+    held. The side tile is exempt because it runs ON the producer thread (see
+    _producer_holds_side); skills/self_diagnostic.py is not, which is why it
+    also consults the producer HEARTBEAT — a beat inside the window means "holds
+    or is about to open" — and fails closed. Copy that pattern, not just this
+    call. NEVER raises; returns an empty set when the producer is not running."""
+    held: set = set()
+    try:
+        for entry in (_face_track_caps[0] or []):
+            if not isinstance(entry, dict) or entry.get("cap") is None:
+                continue
+            cam = entry.get("cam")
+            if not isinstance(cam, dict):
+                continue
+            cam_name = cam.get("name")
+            if cam.get("type") == "kinect" or (KINECT_AS_CAMERA and not cam_name):
+                continue
+            idx = cam.get("index")
+            if idx is not None:
+                held.add(idx)
+    except Exception:
+        pass
+    return held
+
+
 def get_face_track_liveness(now: float | None = None) -> dict:
     """Is the camera-preview producer actually running? Snapshot of the
     heartbeat plus the derived age, for self-diagnostic / see_user.
@@ -7859,29 +8757,27 @@ def _face_tracking_thread_body():
         _label = cam_name if cam_name else (
             cam.get("label") if isinstance(cam, dict) else f"index {idx}")
 
-        def _dshow_open():
+        def _backend_open():
             with _camera_io_lock:
-                c = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-                if c.isOpened():
-                    c.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-                    c.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-                    # Buffersize=1 keeps the driver from queueing stale frames.
-                    # Some DirectShow drivers silently ignore this; harmless if so.
-                    try:
-                        c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                    except Exception:  # pragma: no cover - defensive: some DirectShow drivers reject CAP_PROP_BUFFERSIZE
-                        pass
-                    return c
-                # Through the lock OBJECT, not a bare release - this worker may
-                # have been abandoned (and its lock retired) while cv2 was still
-                # inside the open. See _release_on_current_camera_lock.
-                _release_on_current_camera_lock(c)
-                return None
+                # require_frame: this loop's whole job is frames. A handle that
+                # opens and never delivers is worse than no handle - it is the
+                # state that produces an endless read-failure cascade, and on
+                # MSMF it is exactly what a device another process holds looks
+                # like (measured 2026-09-05: isOpened() True, set() True,
+                # get() reads back 1280x720, 0 of 20 reads produce anything,
+                # while a DirectShow contender got an honest isOpened() ==
+                # False). Returning None instead hands the caller the same
+                # "couldn't open" it already knows how to back off from.
+                return _camera_open(idx, name=cam_name,
+                                    width=_LOOP_OPEN_WIDTH,
+                                    height=_LOOP_OPEN_HEIGHT,
+                                    require_frame=_LOOP_OPEN_FRAME_BUDGET_S,
+                                    label=str(_label))
 
         # beat= is what lets _FACE_TRACK_STALL_WARN_S (30 s) legally sit BELOW
         # this 35 s cap - see _CAMERA_OPEN_BEAT_INTERVAL_S. Only the producer
         # thread may pass it, and this closure only ever runs there.
-        c = _open_capture_bounded(idx, _dshow_open, label=_label,
+        c = _open_capture_bounded(idx, _backend_open, label=_label,
                                   timeout=_CAMERA_LOOP_OPEN_TIMEOUT_S,
                                   beat=_face_track_beat)
         if c is not None:
@@ -8063,6 +8959,25 @@ def _face_tracking_thread_body():
                     if (entry["fails"] >= LOG_FIRST_AT_FAILS
                             and entry["fails"] % LOG_EVERY_N_FAILS
                                 == LOG_FIRST_AT_FAILS % LOG_EVERY_N_FAILS):
+                        # BEFORE BLAMING THE CAMERA, COUNT THE RESTART.
+                        # All 27 of these lines for the right webcam across the
+                        # 8 restarts in session logs 2026-09-05_22-37-30 ..
+                        # 2026-09-06_06-12-11 were classified 2026-09-06: 8 at
+                        # camera-open +7..13 s (one per restart, NO scheduler
+                        # line), 8 at the self-diag boot sweep, 11 at a
+                        # 30-minute interval sweep, 0 left over. So a restart
+                        # produces TWO of these inside 90 s, "every failure is
+                        # the 30-minute probe" is wrong by exactly one per
+                        # restart, and a debugger who greps for a scheduler
+                        # entry behind the +9 s line, finds none, and concludes
+                        # the USB device is failing has taken the wrong turn.
+                        # Which call site opened the camera is answerable from
+                        # the "[camera] <label>: opening with ..." lines - see
+                        # _camera_backend_notes for why those went missing for
+                        # every opener after the first, and what that hid. (The
+                        # +9 s contender was the side tile's own-handle open;
+                        # once it was gated, the 2026-09-06 07:55:26 restart
+                        # logged NO boot-window failures at all.)
                         gap_str = (f"{time_since_good:.1f}s since last frame"
                                    if time_since_good >= 0 else "no good frame yet")
                         print(f"  [face-track] {cam['label']} (index {cam['index']}) "
@@ -8137,14 +9052,20 @@ def _face_tracking_thread_body():
                             # event the name resolution exists to survive.
                             new_c = _open_capture(cam)
                             if new_c is not None and new_c.isOpened():
-                                try: new_c.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-                                except Exception: pass
-                                try: new_c.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-                                except Exception: pass
-                                try:
-                                    new_c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                                except Exception:
-                                    pass
+                                # NO cap.set() HERE ANY MORE (2026-09-05).
+                                # _open_capture already applies 1280x720 and
+                                # BUFFERSIZE=1 inside _camera_open, under
+                                # _camera_io_lock and inside the bounded open
+                                # worker. Repeating them here was redundant in
+                                # every case and actively bad in the one that
+                                # matters: these three ran OUTSIDE the lock and
+                                # OUTSIDE the bound, on a device that had just
+                                # failed 25 reads in a row - and an unbounded
+                                # cap.set() on a sick camera is the exact call
+                                # that wedged the producer for two hours
+                                # (see _open_tile_capture). On MSMF each set()
+                                # measures 0.35-0.50 s, so this also removes
+                                # ~1 s of latency from every wake attempt.
                                 # Warmup frame — first read often comes back
                                 # empty even on a healthy reopen. Read OUTSIDE
                                 # _camera_io_lock, like every other read in this
@@ -10088,8 +11009,58 @@ def list_cameras(max_check: int = CAMERA_PROBE_MAX):
     """Probe camera indexes at their max resolution, save a preview JPEG
     for each working one so you can tell which physical camera is which.
 
-    Each probe is wrapped in a thread+timeout so missing indices return
-    quickly (cv2.CAP_DSHOW retries internally for ~26 s otherwise).
+    Each probe is wrapped in a thread+timeout so a missing index or a sick
+    device cannot stall the sweep.
+
+    The indices printed are DIRECTSHOW indices, because those are what the user
+    pastes into CAMERAS. Which backend opens them is _camera_open()'s business.
+
+    THE KINECT DOES NOT DROP OUT OF THIS LISTING, AND THE ANSWER IS
+    RESOLUTION-DEPENDENT. An earlier version of this docstring claimed Media
+    Foundation "never delivers a frame" from the Kinect V2 and was "strictly
+    WORSE for this one device", so the sensor supposedly vanished from the
+    sweep. Re-measured on this rig 2026-09-06 with JARVIS stopped, through the
+    shipped opener (core.camera_backend.open_camera), fresh process per figure:
+
+        MSMF  msmf idx 0  1920x1080 : 1920x1080, 30.05-30.10 fps, 91/91 reads
+                                      in 3 s, first frame 0.03 s, mean
+                                      brightness ~122.  (n=3)
+        MSMF  msmf idx 0  1280x720  : opens, get() reads back 512x424, then
+                                      EVERY read fails - 0 frames in 5 s.
+                                      640x480 and "no resolution set" behave
+                                      identically.  (n=2 each)
+        DSHOW dshow idx 1 1920x1080 : 1 refused open and 15.1 fps once in 7
+                                      tries; the other 5 gave 1.0 fps with
+                                      mean brightness 0.0 - BLACK frames. It
+                                      ignores any requested size.  (n=7)
+
+    So at 1920x1080 - the ONLY size this sweep ever requests - Media
+    Foundation is ~30x BETTER here, not worse, and the Kinect is listed as
+    working. `python bobert_companion.py --list-cameras` on 2026-09-06 printed
+    "Camera 1: working (1920x1080) [OK, brightness=124.4]", the brightest
+    entry in the whole sweep. (A frameless device would not "drop out" either:
+    _open_with_warmup reports opened=True for any non-None capture, and the
+    line below then reads "opened but no frame".)
+
+    THE HAZARD THAT IS REAL is that this tool's whole purpose is to tell the
+    owner which index to paste into CAMERAS - and a CAMERAS entry is opened by
+    the face-track producer at _LOOP_OPEN_WIDTH x _LOOP_OPEN_HEIGHT with a
+    require_frame budget, i.e. 1280x720, where this device yields nothing at
+    all. "Working at 1920x1080" alone would therefore be advice the face
+    tracker cannot honour: it logs "Could not open ... skipping" and the
+    camera is dropped. Hence the CONFIRM probe below - every index that works
+    at the sweep's resolution is re-opened at the producer's, and one that
+    fails is printed with an explicit do-not-paste warning rather than a bare
+    "working".
+
+    NOTE ALSO: this sweep only PRINTS. It rewrites nothing - see the closing
+    "Then edit the CAMERAS list" line. The function that actually rewrites
+    CAMERAS is probe_cameras_and_update_config() via _probe_camera_index(),
+    which passes NO resolution and so still measures 0 frames on the Kinect
+    and still excludes it. If you want the sensor for face tracking, go
+    through audio/kinect_bridge.KinectCapture and the official runtime, not
+    cv2 - which is also what this file's config comment ("never grab index 1,
+    that's the Kinect colour stream") has always said.
     """
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "camera_previews")
     os.makedirs(out_dir, exist_ok=True)
@@ -10103,8 +11074,15 @@ def list_cameras(max_check: int = CAMERA_PROBE_MAX):
 
     print(f"Scanning indices 0..{max_check - 1} (timeout {CAMERA_PROBE_TIMEOUT_SEC}s each)…")
 
-    def _open_with_warmup(idx: int) -> tuple[bool, bool, int, int, float, "np.ndarray | None"]:
-        """Returns (opened, got_frame, w, h, mean_brightness, frame_or_None)."""
+    def _open_with_warmup(idx: int, width: int = 1920, height: int = 1080,
+                          what: str = "") -> tuple[bool, bool, int, int, float, "np.ndarray | None"]:
+        """Returns (opened, got_frame, w, h, mean_brightness, frame_or_None).
+
+        ``width``/``height`` are a parameter and not a constant because this
+        sweep asks TWO questions of every working index — "does it deliver at
+        the sweep's 1920x1080" and "does it deliver at the resolution a
+        CAMERAS entry is actually opened at" — and on this rig those have
+        different answers for the Kinect (see this function's docstring)."""
         result = {"opened": False, "ret": False, "w": 0, "h": 0,
                   "bright": 0.0, "frame": None}
         def _do():
@@ -10112,13 +11090,17 @@ def list_cameras(max_check: int = CAMERA_PROBE_MAX):
             # if this worker wedges past the join() timeout, the lock keeps
             # its eventual release() from colliding with later camera ops.
             with _camera_io_lock:
-                cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                # The INDEX PRINTED BY THIS TOOL IS A DIRECTSHOW INDEX, because
+                # that is what the user pastes into CAMERAS. _camera_open()
+                # keeps that contract and translates internally for whichever
+                # backend actually opens the device.
+                cap = _camera_open(idx, width=width, height=height,
+                                   label=f"list-cameras index {idx}"
+                                         f"{what}")
                 try:
-                    if not cap.isOpened():
+                    if cap is None:
                         return
                     result["opened"] = True
-                    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1920)
-                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
                     # Warm up — many cameras need several frames before auto-exposure works
                     for _ in range(15):
                         cap.read()
@@ -10140,6 +11122,7 @@ def list_cameras(max_check: int = CAMERA_PROBE_MAX):
         t.start()
         # Generous timeout for list-cameras (warm-up frames take ~0.75 s alone)
         t.join(timeout=max(CAMERA_PROBE_TIMEOUT_SEC, 5.0))
+        _drain_camera_backend_notes()
         if t.is_alive():
             # Abandoned while it OWNS _camera_io_lock — retire that lock, or
             # this diagnostic command silently kills camera I/O for the whole
@@ -10150,29 +11133,72 @@ def list_cameras(max_check: int = CAMERA_PROBE_MAX):
                 if owner == t.ident:
                     _camera_io_lock.retire_if_holding(
                         t.ident, hold,
-                        f"list-cameras index {idx} wedged inside its "
-                        f"DirectShow open")
+                        f"list-cameras index {idx}{what} wedged inside its "
+                        f"camera open")
             except Exception:  # pragma: no cover - defensive: foreign lock object
                 logging.exception("[list-cameras] camera I/O lock retire failed "
                                   "for index %s", idx)
         return (result["opened"], result["ret"], result["w"], result["h"],
                 result["bright"], result["frame"])
 
+    def _usable_by_face_tracker(idx: int) -> bool:
+        """Does index ``idx`` still deliver at the resolution a CAMERAS entry
+        is opened at? Only asked of an index that already produced a frame.
+
+        RETRIED ONCE before it is believed. A "no" here prints DO-NOT-PASTE
+        advice about the owner's own webcam, so a transient must not produce
+        one: MSMF fails 3-7% of back-to-back reopens (measured; see
+        core.camera_backend.default_retries), and a camera another app grabs
+        between the two probes looks identical to a format refusal. Two
+        failures in a row on a device that delivered a frame seconds earlier
+        is a format answer, not a flake.
+
+        Costs one extra open, and only for an index that WORKS - two of twelve
+        on this rig. On Media Foundation that is ~free (+0.97 handles per
+        open/release cycle, measured); a DirectShow-only device pays +479, but
+        it pays that only if it is a real working camera the owner is about to
+        configure, which is exactly when the answer is worth buying."""
+        for _ in range(2):
+            _, loop_ret, _, _, _, _ = _open_with_warmup(
+                idx, _LOOP_OPEN_WIDTH, _LOOP_OPEN_HEIGHT,
+                what=f" at {_LOOP_OPEN_WIDTH}x{_LOOP_OPEN_HEIGHT}")
+            if loop_ret:
+                return True
+        return False
+
+    unusable: list[int] = []
     for i in range(max_check):
         opened, ret, w, h, mean_brightness, frame = _open_with_warmup(i)
+        loop_ok = True
         if ret and frame is not None:
             path = os.path.join(out_dir, f"camera_{i}.jpg")
             cv2.imwrite(path, frame)
             quality = "OK" if mean_brightness > 10 else "⚠ BLACK / blocked"
             status = f"working  ({w}x{h})  [{quality}, brightness={mean_brightness:.1f}]  → preview saved"
+            # THE SECOND QUESTION. "Works at 1920x1080" is not the same claim
+            # as "works as a CAMERAS entry" — see this function's docstring for
+            # the Kinect measurements that make them differ.
+            loop_ok = _usable_by_face_tracker(i)
         elif opened:
             status = "opened but no frame"
         else:
             status = "not available"
         print(f"  Camera {i}: {status}")
+        if not loop_ok:
+            unusable.append(i)
+            print(f"      ⚠  DO NOT PUT INDEX {i} IN CAMERAS. It delivers a frame at "
+                  f"{w}x{h}, but none at {_LOOP_OPEN_WIDTH}x{_LOOP_OPEN_HEIGHT} — which is "
+                  f"what the face-track loop opens a CAMERAS entry at, so it would be "
+                  f"dropped with \"Could not open … skipping\".")
+            print("         Usual cause: a device with ONE fixed format (the Kinect V2 "
+                  "colour stream is exactly this — 1920x1080 or nothing). If this is an "
+                  "ordinary webcam, another app grabbed it mid-sweep; close it and re-run.")
     print(f"\nPreviews saved to: {out_dir}")
     print("Open the JPEGs to identify which index is the Kinect, left webcam, and right webcam.")
     print("Then edit the CAMERAS list at the top of the script.")
+    if unusable:
+        print(f"⚠  Skip {', '.join(str(i) for i in unusable)} — flagged above as "
+              f"unusable at {_LOOP_OPEN_WIDTH}x{_LOOP_OPEN_HEIGHT}.")
 
 
 def pause_face_tracking():

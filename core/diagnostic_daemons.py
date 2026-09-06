@@ -42,6 +42,9 @@ Lifecycle
                                   a short bounded join.
     pause_diagnostics()         — set the global paused flag (persists).
     resume_diagnostics()        — clear it.
+    reconcile_paused(desired)   — force the persisted flag to `desired` and
+                                  report whether it had drifted. Boot-time
+                                  repair for a stale pause; see its docstring.
     diagnostic_daemon_status()  — dict snapshot of last-run times, budget
                                   remaining, pending findings count.
 
@@ -1450,6 +1453,44 @@ def pause_diagnostics() -> str:
 def resume_diagnostics() -> str:
     _update_state(lambda s: s.update({"paused": False}))
     return "Diagnostics resumed, sir."
+
+
+def reconcile_paused(desired: bool) -> bool:
+    """Force the persisted paused flag to `desired`. Returns True if it moved.
+
+    WHY THIS EXISTS. There are two paused flags and only one of them is
+    visible. `hud_state.json`'s `daemons_paused` is the user-facing one — the
+    tray menu, the HUD and the boot log all report THAT. `state["paused"]`
+    here is a MIRROR of it that the four worker loops actually obey, re-read
+    from disk every tick (:353, :519, :927, :1355).
+
+    Boot used to push the mirror one way only: pause when the restored flag
+    was True, and do nothing at all when it was False. So a mirror left True
+    by anything the HUD flag did not follow — a spoken `pause_diagnostics`, or
+    a game-mode style lever whose restore never ran because the box was power-
+    cycled — could never be cleared again. Restarting JARVIS did not help;
+    that was the whole bug. Worse, it was silent in the most misleading way
+    possible: each loop writes its `alive_ts` heartbeat BEFORE testing
+    `paused`, so all four daemons looked alive to every liveness check while
+    doing no work whatsoever. Found live 2026-09-06 with the mirror stuck True
+    and the daemons last real work 94-101 days stale, while both the HUD and
+    the boot log said `paused=False`. The daemon that was silently off
+    included crash-watch — the one meant to notice JARVIS dying unattended.
+
+    Reconciling in BOTH directions makes the mirror convergent and fails safe
+    toward ARMED: a pause the HUD cannot show does not outlive a restart.
+    Only the `paused` key is touched, so every counter/cursor in the state
+    file (last_seen_record_id, budget, offsets) survives untouched.
+    """
+    desired = bool(desired)
+    drifted = [False]
+
+    def _mut(s: dict[str, Any]) -> None:
+        drifted[0] = bool(s.get("paused")) != desired
+        s["paused"] = desired
+
+    _update_state(_mut)
+    return drifted[0]
 
 
 def diagnostic_daemon_status() -> dict[str, Any]:
