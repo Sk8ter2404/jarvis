@@ -180,6 +180,32 @@ _MONOLITH_RESTORE_NAMES = (
     "_camera_quarantine", "_camera_pending_releases",
     "_face_track_heartbeat", "_face_track_stall_state",
     "_face_track_caps",
+    # Side-tile webcam index resolver (2026-09-05). These five cells ARE the
+    # DirectShow-enumeration leak gate, and leaving them untracked makes every
+    # test that touches the resolver ORDER-DEPENDENT: once one test records a
+    # device fingerprint, a later test's call short-circuits on it and returns
+    # whatever is in _kinect_preview_webcam_idx instead of enumerating the
+    # pygrabber list the test just installed — passing or failing on the
+    # machine's real camera set rather than on the code under test.
+    "_kinect_preview_webcam_idx", "_kinect_preview_webcam_resolved",
+    "_kinect_preview_webcam_resolved_at", "_kinect_preview_webcam_fingerprint",
+    "_kinect_preview_webcam_enumerated_at",
+    # ...and the four cells behind the gate's fail-open ALARM. Same hazard, one
+    # step removed: the alarm is throttled and edge-triggered, so a test that
+    # leaves _webcam_fingerprint_degraded True (or the throttle stamped at a
+    # mocked time) makes the NEXT test's warning silently not fire — a test
+    # asserting the alarm would then fail for a reason that has nothing to do
+    # with the code it is testing, and one asserting silence would pass
+    # vacuously.
+    "_webcam_fingerprint_degraded", "_webcam_fingerprint_degraded_since",
+    "_webcam_fingerprint_warned_at", "_webcam_fingerprint_leaky_enums",
+    # ...and the camera-OPEN path's slot of the same gate, which
+    # _dshow_name_to_index() owns. Same hazard as the resolver's cells above and
+    # then some: this one is consulted by _open_capture and by the boot rescue,
+    # so a fingerprint left behind by one test makes the NEXT test's
+    # _dshow_name_to_index() answer out of a stale cache instead of the device
+    # list the test just installed — i.e. green for the wrong reason.
+    "_dshow_open_devices_cache",
     # ── single-flight / barge-in counter cells (2026-07-08 bug-hunt) ────────
     # New single-element-list cells: reset in place so a test that abandons a
     # clone worker (leaving _voice_clone_inflight True) or accepts a barge-in

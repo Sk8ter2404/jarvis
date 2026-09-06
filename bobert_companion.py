@@ -4000,6 +4000,570 @@ _kinect_preview_webcam_resolved_at = [0.0]
 # device joins/leaves the bus, so a permanently-cached index eventually points
 # at the WRONG camera (2026-07-14 audit).
 _WEBCAM_IDX_TTL_SEC = 10.0
+# Last value of _video_device_fingerprint(), so the TTL tick can tell "the device
+# set is unchanged, skip the leaky enumeration" from "something moved, re-resolve".
+_kinect_preview_webcam_fingerprint: list = [None]
+# When we last did a REAL DirectShow enumeration. The fingerprint gate can skip
+# the leaky call indefinitely, so this is the floor that guarantees we still
+# re-learn the index map periodically even if the fingerprint never changes.
+_kinect_preview_webcam_enumerated_at = [0.0]
+# Self-heal floor -- the interval at which we re-enumerate (and so leak) even
+# when the fingerprint says nothing moved. There are TWO, and which one applies
+# depends on whether the fingerprint we are holding can actually see a device
+# that left and rejoined between samples (_fingerprint_sees_rejoin).
+#
+#   UNSTAMPED (300 s): the fingerprint is only a device SET, so a leave+rejoin
+#   between two samples reshuffles DirectShow order invisibly and the resulting
+#   reads SUCCEED from the wrong camera -- the failed-read backstop never fires.
+#   The floor is the ONLY thing that ever corrects that, so it has to be short.
+#
+#   STAMPED (3600 s): the PnP half carries DEVPKEY_Device_LastArrivalDate, and
+#   that stamp was MEASURED to advance across a real removal + re-arrival of the
+#   SAME device instance (the experiment is written up in
+#   _setupapi_camera_instances), so a leave+rejoin changes the fingerprint even
+#   when it is only observed after the fact. That is the one reshuffle mechanism
+#   a device-SET fingerprint cannot see, so closing it demotes the unconditional
+#   re-enumeration from THE correctness mechanism to a safety net.
+#   BUT ONLY FOR THE MECHANISMS ACTUALLY CHECKED -- this is NOT "everything that
+#   can reshuffle DirectShow order is now detected directly". A devnode
+#   disable/enable was never tested (it needs elevation, which the session that
+#   wrote this did not have), and the probe throws PnP ORDER away on purpose
+#   (tuple(sorted(...))), so the stamp is the only witness a reshuffle has here.
+#   The floor is what bounds anything those miss. Cost at 3600 s is 1 leaked
+#   thread + 103 handles per HOUR (0.017/min) versus 6.0/min unpatched.
+_WEBCAM_IDX_SELFHEAL_SEC = 300.0
+_WEBCAM_IDX_SELFHEAL_STAMPED_SEC = 3600.0
+
+
+# --- leak-free video-device change detection --------------------------------
+# WHY THIS EXISTS (2026-09-05, measured):
+# ICreateDevEnum::CreateClassEnumerator(CLSID_VideoInputDeviceCategory) leaks
+# +1 OS thread and +103 handles PER CALL, permanently, inside mfksproxy.dll.
+# Nothing reclaims it -- not Release, not CoUninitialize, not a fresh apartment,
+# not gc. At the 10 s TTL below that was +6 threads and +618 handles per MINUTE
+# forever, and it is what exhausted the v2.0.100 process (14,507 threads /
+# 1,419,190 handles before every subsystem stopped logging).
+#
+# The leak is in building the PnP kernel-streaming device list, NOT the moniker
+# bind -- a repro that only calls CreateClassEnumerator and binds nothing leaks
+# identically. Measured per-call, 20-300 iterations each:
+#     CoCreateInstance(SystemDeviceEnum)      +0.00 thr    +0.00 hnd
+#     + CreateClassEnumerator (dwFlags=0)     +1.00 thr  +103.00 hnd   <-- leak
+#     + IEnumMoniker::Next loop               +1.00 thr  +103.00 hnd
+#     + IMoniker::BindToStorage               +1.00 thr  +103.00 hnd
+#     + IPropertyBag::Read (what we call)     +1.00 thr  +103.00 hnd
+# Only the VIDEO INPUT category leaks. AudioInputDevice (6 devices),
+# AudioRenderer (14), VideoCompressor (5) and LegacyAmFilter (70!) are all
+# +0.00/+0.00 -- so this is the KS camera path, not COM enumeration in general.
+# Splitting the category by dwFlags isolates it further: CDEF_DEVMON_PNP_DEVICE
+# leaks the full amount, CDEF_DEVMON_FILTER (software/virtual cams) leaks zero.
+#
+# So we cannot make the call cheap -- we can only stop MAKING it. These two
+# probes together see every device DirectShow's default enumeration returns,
+# and both are free (0 threads, 0 handles over 300 calls, 0.35 ms combined vs
+# 33-46 ms for the leaky call):
+#     SetupAPI KSCATEGORY_VIDEO_CAMERA  -> the PnP cameras
+#     CreateClassEnumerator + DEVMON_FILTER -> the virtual/software cameras
+# NOTE they are a CHANGE DETECTOR only, never an index source: SetupAPI returns
+# the same devices in a DIFFERENT order than DirectShow (measured -- the Kinect
+# and the USB 2.0 Camera swap places), so using its order would open the wrong
+# camera, which is the exact bug the 2026-07-14 TTL was added to prevent.
+_KSCATEGORY_VIDEO_CAMERA = "{e5323777-f976-4f5b-9b55-b94699c46e44}"
+# The OLDER, broader KS category, probed TOGETHER with VIDEO_CAMERA above.
+# DirectShow's PnP video enumeration is driven by KSCATEGORY_CAPTURE ∩
+# KSCATEGORY_VIDEO; VIDEO_CAMERA is a Win8.1-era category that modern UVC
+# cameras also register. Measured on this rig they return the IDENTICAL three
+# devices — exactly the three PnP entries DirectShow shows at indices 0-2 (index
+# 3 is the software OBS Virtual Camera, covered by the FILTER probe below) — but
+# "identical here" is not "identical everywhere", so probe the UNION. Getting
+# this wrong in the OVER-covering direction costs at most one spurious
+# re-enumeration; getting it wrong in the UNDER-covering direction means a real
+# reshuffle we never notice, which is precisely the wrong-camera bug this gate
+# exists to prevent. KSCATEGORY_CAPTURE itself is NOT usable as the probe: it
+# also contains 18 AUDIO endpoints on this machine, so every headset power-cycle
+# would force a leaky re-enumeration.
+_KSCATEGORY_VIDEO = "{6994ad05-93ef-11d0-a3cc-00a0c9223196}"
+_CDEF_DEVMON_FILTER = 0x0080
+_DIGCF_PRESENT_IFACE = 0x02 | 0x10
+# DEVPKEY_Device_LastArrivalDate. PnP re-stamps this FILETIME on the devnode
+# every time the device ARRIVES, which is what lets a fingerprint sampled AFTER
+# a leave+rejoin still see that it happened. Measured, not assumed -- the
+# experiment is written up in _setupapi_camera_instances.
+_DEVPKEY_FMTID_DEVICE_TIMESTAMPS = "{83da6326-97a6-4088-9453-a1923f573b29}"
+_DEVPKEY_PID_LAST_ARRIVAL = 102
+# DEVPROP_TYPE_FILETIME, checked explicitly -- see _stamp().
+_DEVPROP_TYPE_FILETIME = 0x10
+# DEVPKEY_Device_LastRemovalDate is DELIBERATELY NOT READ. The pid is kept here
+# only so nobody re-adds it believing it contributes something: Windows CLEARS
+# it when the device comes back, so a probe that enumerates PRESENT devices can
+# never observe one. Measured 2026-09-05 on this box, two independent ways:
+#   * census of all 545 reachable devnodes -- 161 carry a removal stamp and
+#     every one of them is NON-PRESENT. Of the 304 PRESENT devnodes that carry
+#     an arrival stamp, ZERO carry a removal stamp.
+#   * watched live across an ISO mount/dismount cycle -- the stamp appeared on
+#     removal (present True->False) and went back to unreadable on re-arrival
+#     (present False->True), on the same instance id.
+# _setupapi_camera_instances() uses DIGCF_PRESENT, so it read b'' for all three
+# cameras on every call. Carrying that in the fingerprint made the mechanism
+# read as though it had two legs when it has one.
+_DEVPKEY_PID_LAST_REMOVAL_NOT_USED = 103
+
+
+def _setupapi_camera_instances() -> "tuple[tuple[str, bytes], ...] | None":
+    """Every PnP video-capture device present right now, as
+    ``(device-instance-path, last-arrival-stamp)``.
+
+    Leak-free and ~0.4 ms, versus +1 OS thread / +103 handles and 35-47 ms for
+    the DirectShow enumeration it replaces. Returns None on any failure.
+    NEVER raises.
+
+    THE TIMESTAMP IS THE POINT, not decoration. A device-instance SET on its
+    own cannot see a device that LEAVES AND REJOINS between two samples: the set
+    afterwards is byte-identical, yet DirectShow has renumbered underneath us —
+    so the tiles read the WRONG CAMERA and every read still SUCCEEDS, meaning
+    the failed-read backstop never fires and nothing anywhere reports it. That
+    hole is the only reason the old code re-enumerated (and leaked) every 10 s.
+    This function also returns tuple(sorted(...)), throwing PnP order away on
+    purpose (SetupAPI order is NOT DirectShow order — see the note above), so
+    the arrival stamp is the ONLY thing here that can witness a reshuffle.
+
+    THE STAMP WAS OBSERVED TO MOVE. That is the load-bearing assumption, and no
+    number of reads of a stamp that never changes can establish it — a property
+    written once per devnode per session yields byte-identical readings forever,
+    which is indistinguishable from one that tracks nothing. So it was cycled.
+    Experiment (2026-09-05): mounting an ISO creates a genuine PnP devnode that
+    a NON-elevated user can create and destroy on demand. Mount / dismount /
+    re-mount, while polling every devnode on the box every 5 s, gave for the one
+    instance id ``SCSI\\CdRom&Ven_Msft&Prod_Virtual_DVD-ROM\\2&1f4adffe&0&000004``:
+        23:51:38.464  arrival stamped, present
+        23:52:08.381  removal stamped, present -> absent
+        23:52:31.967  ARRIVAL RE-STAMPED, absent -> present, removal cleared
+    Then repeated for volume, because one observation is an anecdote: 14 further
+    mount/dismount cycles produced 11 re-arrivals of an ALREADY-KNOWN instance
+    id across 3 distinct devnodes, and the arrival stamp advanced on 11 of 11 —
+    never once unchanged. PnP therefore does re-stamp on re-arrival of an
+    instance it has seen before, which is the case that matters: a USB camera
+    replugged into the SAME port keeps its instance id and so leaves the device
+    SET byte-identical. (The removal stamp behaved as the note on
+    _DEVPKEY_PID_LAST_REMOVAL_NOT_USED describes throughout — set on the way
+    out, gone again on the way back in — which is why it is not collected.)
+
+    AND IT MOVED FOR A CYCLE THE PRESENCE CHECK COULD NOT SEE, which is the
+    whole point. A separate 5 s poller running through the same campaign logged
+    16 arrival-stamp advances: 12 where the devnode was absent on the previous
+    sample and present on this one, ZERO on a devnode that stayed present the
+    whole time (so the stamp never drifts on its own), and 4 where the devnode
+    read ABSENT on BOTH samples yet the stamp had advanced between them — a
+    full leave+rejoin that fell entirely inside one sampling interval and was
+    invisible to the device SET, exactly as it would be for a camera. Note the
+    honest gap: those 4 are the absent/absent mirror of the camera case, not a
+    present/present case, which the sampler never happened to catch.
+
+    WHAT THAT DOES AND DOES NOT COVER — the honest boundary. It is a SCSI\\CdRom
+    devnode, not a USB camera. Two things carry it across: the property is
+    written by the PnP manager on devnode start rather than by a bus driver, and
+    it is observably generic here — 304 of the 323 present devnodes carry an
+    arrival stamp, across 19 different enumerators, including 71 of 71 on USB.
+    On USB specifically, 58 of those 71 were INSTALLED before this boot yet
+    carry an arrival stamp at or after it, and 39 carry one more than 15 min
+    after boot: they re-arrived mid-session and the stamp recorded it. NOT
+    COVERED: a devnode disable/enable in Device Manager, which needs elevation
+    this session did not have. If that path turns out not to re-stamp, the
+    self-heal floor is what bounds it — which is why the floor is still there
+    and is described as a safety net rather than as dead weight.
+
+    (Read via ctypes the raw FILETIMEs are UTC; the comparison is on raw bytes,
+    so the zone never matters.)"""
+    try:
+        import ctypes
+        import re as _re
+        from ctypes import wintypes
+
+        class _GUID(ctypes.Structure):
+            _fields_ = [("d1", ctypes.c_ulong), ("d2", ctypes.c_ushort),
+                        ("d3", ctypes.c_ushort), ("d4", ctypes.c_ubyte * 8)]
+
+            # Default s=None MATTERS: ctypes zero-initialises nested struct
+            # fields without calling this, but a required arg would still break
+            # any accidental no-arg construction.
+            def __init__(self, s=None):
+                super().__init__()
+                if s:
+                    ctypes.windll.ole32.CLSIDFromString(ctypes.c_wchar_p(s),
+                                                        ctypes.byref(self))
+
+        class _DEVPROPKEY(ctypes.Structure):
+            _fields_ = [("fmtid", _GUID), ("pid", ctypes.c_ulong)]
+
+        class _IFACE(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD),
+                        ("InterfaceClassGuid", _GUID),
+                        ("Flags", wintypes.DWORD),
+                        ("Reserved", ctypes.POINTER(ctypes.c_ulonglong))]
+
+        class _DEVINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("ClassGuid", _GUID),
+                        ("DevInst", wintypes.DWORD),
+                        ("Reserved", ctypes.POINTER(ctypes.c_ulonglong))]
+
+        sa = ctypes.windll.setupapi
+        cfgmgr = ctypes.windll.cfgmgr32
+        # restype MATTERS: without it ctypes assumes c_int and truncates the
+        # 64-bit HDEVINFO, which yields ZERO devices instead of an error.
+        sa.SetupDiGetClassDevsW.restype = wintypes.HANDLE
+
+        def _stamp(devinst: int, prop_pid: int) -> bytes:
+            """The raw FILETIME bytes of one DEVPKEY, or b'' when it is not a
+            stamp that could ever move.
+
+            b'' is a DOWNGRADE signal, never an error: it makes
+            _fingerprint_sees_rejoin() report False, which puts the short
+            self-heal floor back in charge. That path is live rather than
+            theoretical -- 19 of this machine's 323 present devnodes return
+            CR_NO_SUCH_VALUE for this property.
+
+            STRICT ON PURPOSE. The long floor is granted on 'this fingerprint
+            carries a stamp', so a value that EXISTS but can never advance
+            would buy an hour of pinned indices while detecting nothing --
+            precisely the it-exists-so-it-must-work reasoning this gate is
+            here to avoid. Accept only what a real arrival stamp is:
+            DEVPROP_TYPE_FILETIME, exactly 8 bytes, non-zero. Measured across
+            all 545 reachable devnodes, every readable stamp is type 0x10 /
+            8 bytes / non-zero, so this rejects nothing real on this box."""
+            key = _DEVPROPKEY()
+            key.fmtid = _GUID(_DEVPKEY_FMTID_DEVICE_TIMESTAMPS)
+            key.pid = prop_pid
+            ptype = ctypes.c_ulong(0)
+            size = ctypes.c_ulong(0)
+            cfgmgr.CM_Get_DevNode_PropertyW(devinst, ctypes.byref(key),
+                                            ctypes.byref(ptype), None,
+                                            ctypes.byref(size), 0)
+            # A FILETIME is exactly 8 bytes; anything else is not one.
+            if size.value != 8:
+                return b""
+            buf = ctypes.create_string_buffer(size.value)
+            if cfgmgr.CM_Get_DevNode_PropertyW(devinst, ctypes.byref(key),
+                                               ctypes.byref(ptype), buf,
+                                               ctypes.byref(size), 0) != 0:
+                return b""
+            if ptype.value != _DEVPROP_TYPE_FILETIME:
+                return b""
+            raw = buf.raw[:8]
+            # An all-zero FILETIME is 'the property exists and was never set'.
+            # Those are truthy bytes, so letting one through would earn the
+            # long floor on a value guaranteed never to change.
+            return b"" if raw == b"\x00" * 8 else raw
+
+        found: "dict[str, tuple[str, bytes, bytes]]" = {}
+        for cat_str in (_KSCATEGORY_VIDEO_CAMERA, _KSCATEGORY_VIDEO):
+            cat = _GUID(cat_str)
+            hdi = sa.SetupDiGetClassDevsW(ctypes.byref(cat), None, None,
+                                          _DIGCF_PRESENT_IFACE)
+            if not hdi or hdi in (-1, 0xFFFFFFFFFFFFFFFF):
+                return None
+            hdi = ctypes.c_void_p(hdi)
+            try:
+                idx = 0
+                while True:
+                    did = _IFACE()
+                    did.cbSize = ctypes.sizeof(_IFACE)
+                    if not sa.SetupDiEnumDeviceInterfaces(hdi, None,
+                                                          ctypes.byref(cat), idx,
+                                                          ctypes.byref(did)):
+                        break
+                    # Increment BEFORE any `continue` below, or a single
+                    # unreadable interface spins this loop forever.
+                    idx += 1
+                    need = wintypes.DWORD(0)
+                    sa.SetupDiGetDeviceInterfaceDetailW(hdi, ctypes.byref(did),
+                                                        None, 0,
+                                                        ctypes.byref(need), None)
+                    buf = ctypes.create_string_buffer(max(need.value, 8))
+                    ctypes.cast(buf, ctypes.POINTER(wintypes.DWORD))[0] = 8
+                    dinfo = _DEVINFO()
+                    dinfo.cbSize = ctypes.sizeof(_DEVINFO)
+                    if not sa.SetupDiGetDeviceInterfaceDetailW(
+                            hdi, ctypes.byref(did), buf, need.value,
+                            ctypes.byref(need), ctypes.byref(dinfo)):
+                        continue
+                    path = ctypes.wstring_at(ctypes.addressof(buf) + 4).lower()
+                    # drop the interface-class GUID; keep the device instance
+                    path = _re.sub(r"#\{[0-9a-f-]{36}\}.*$", "",
+                                   path.replace("\\\\?\\", ""))
+                    if path in found:
+                        continue    # same device via the other category
+                    found[path] = (
+                        path,
+                        _stamp(dinfo.DevInst, _DEVPKEY_PID_LAST_ARRIVAL),
+                    )
+            finally:
+                sa.SetupDiDestroyDeviceInfoList(hdi)
+        return tuple(sorted(found.values()))
+    except Exception:
+        return None
+
+
+def _dshow_software_camera_names() -> "tuple[str, ...] | None":
+    """Friendly names of the SOFTWARE/virtual DirectShow cameras (OBS Virtual
+    Camera and friends). Uses CDEF_DEVMON_FILTER, which is the non-leaking half
+    of the video category. Returns None on failure. NEVER raises."""
+    try:
+        from comtypes import GUID as _GUID
+        from pygrabber.dshow_graph import SystemDeviceEnum, IPropertyBag
+        from pygrabber.dshow_ids import DeviceCategories
+        sde = SystemDeviceEnum().system_device_enum
+        enum = sde.CreateClassEnumerator(
+            _GUID(DeviceCategories.VideoInputDevice),
+            dwFlags=_CDEF_DEVMON_FILTER)
+        if not enum:
+            return ()
+        out: list[str] = []
+        try:
+            mon, cnt = enum.Next(1)
+        except ValueError:
+            return ()
+        while cnt > 0:
+            try:
+                pb = mon.BindToStorage(
+                    0, 0, IPropertyBag._iid_).QueryInterface(IPropertyBag)
+                out.append(str(pb.Read("FriendlyName", pErrorLog=None)))
+            except Exception:
+                out.append("<unreadable>")
+            mon, cnt = enum.Next(1)
+        return tuple(out)
+    except Exception:
+        return None
+
+
+def _video_device_fingerprint() -> "tuple | None":
+    """A cheap, LEAK-FREE identity for the current video-capture device set.
+    Changes whenever a camera (physical OR virtual) joins or leaves -- and,
+    because the PnP half carries a re-stamped arrival FILETIME, also when one
+    leaves and REJOINS between two samples. Those are the only times DirectShow indices
+    can reshuffle. None means "could not tell" -- callers must then fall back to
+    re-enumerating on the timer, so a probe failure degrades to the old
+    behaviour rather than pinning a stale index. NEVER raises.
+
+    Note the two halves are compared against the state captured AT THE LAST REAL
+    ENUMERATION, not against the previous sample. That is what makes a
+    transient that fully reverts (a virtual camera that starts and stops between
+    two ticks) correctly read as "no change": the index map built before it is
+    still the right one afterwards."""
+    pnp = _setupapi_camera_instances()
+    soft = _dshow_software_camera_names()
+    if pnp is None or soft is None:
+        return None
+    return (pnp, soft)
+
+
+def _usable_arrival_stamp(v) -> bool:
+    """True iff `v` is an arrival stamp that could actually ADVANCE: a non-zero
+    8-byte FILETIME. Pure; NEVER raises.
+
+    Split out, and applied here as well as inside _stamp(), on purpose.
+    _stamp() is the only producer today, but the value it produces is what buys
+    the LONG self-heal floor, and 'the bytes are non-empty' is a weaker claim
+    than 'this is a timestamp that moves'. A 4-byte value or an all-zero
+    FILETIME is truthy and would sail straight through a bare truth test."""
+    try:
+        return len(v) == 8 and any(v)
+    except Exception:
+        return False
+
+
+def _fingerprint_sees_rejoin(fp) -> bool:
+    """True iff `fp` carries a usable arrival stamp for EVERY PnP camera in it,
+    i.e. this fingerprint can distinguish "a device left and rejoined" from
+    "nothing happened". Pure; NEVER raises.
+
+    This is the switch between the two self-heal floors. A stamped fingerprint
+    closes the leave+rejoin hole outright, so the unconditional re-enumeration
+    becomes a pure belt-and-braces safety net and can be hours apart; an
+    unstamped one leaves that hole open, so the short floor has to stay.
+
+    IT ASKS "CAN THIS FINGERPRINT SEE A REJOIN", NOT "DID ONE HAPPEN", and the
+    split is deliberate. Here we check only that a usable stamp is PRESENT;
+    whether one MOVED is decided by the callers, which compare the WHOLE
+    fingerprint tuple against the one taken at the last real enumeration. That
+    split is sound only because the stamp was measured to genuinely advance on a
+    re-arrival (the experiment is written up in _setupapi_camera_instances).
+    Absent that measurement this would be presence standing in for proof, which
+    is the exact failure the block exists to prevent -- hence the extra
+    _usable_arrival_stamp() check rather than a bare truth test.
+
+    Requiring at least one PnP device is deliberate, not defensive noise: a
+    SetupAPI probe that silently enumerates NOTHING returns an empty tuple, not
+    None, and is otherwise indistinguishable from a machine with no cameras. An
+    empty PnP half must therefore never be read as proof that the bus is quiet
+    -- `all()` over an empty sequence is True, and that vacuous True is exactly
+    how a broken probe would earn the long floor it has not verified."""
+    try:
+        pnp = fp[0]
+    except Exception:
+        return False
+    if not pnp:
+        return False
+    try:
+        return all(len(entry) >= 2 and _usable_arrival_stamp(entry[1])
+                   for entry in pnp)
+    except Exception:
+        return False
+
+
+# --- ALARM: the gate falling open ------------------------------------------
+# The gate below is only as good as the free probe under it. When
+# _video_device_fingerprint() cannot answer, _resolve_webcam_indices_by_name()
+# deliberately degrades to re-enumerating on the 10 s TTL. That is the right
+# SAFETY choice -- pinning an index we cannot prove is still correct would put
+# the wrong camera in the tile with every read SUCCEEDING, which is a quieter
+# bug than the leak. But it is also, exactly, the pre-fix behaviour and the
+# pre-fix leak: +6 OS threads and +618 handles per MINUTE, permanently.
+#
+# And it used to happen in TOTAL SILENCE. Measured 2026-09-05 on this rig, same
+# process, 30 TTL ticks each:
+#     real pygrabber          fingerprint OK   ->  0 enumerations, +0 threads
+#     SystemDeviceEnum hidden fingerprint None -> 30 enumerations, +30 threads
+#                                                 = 6.00/min, the FULL pre-fix
+#                                                 rate, and 0 bytes written to
+#                                                 stdout, stderr or the log.
+# So a reverted fix was indistinguishable from a working one, and the first
+# symptom would be the original death ~40 h later: 14,507 threads, every
+# subsystem stops logging, exactly as at 07:00:36 on 2026-09-05.
+#
+# The trigger is not hypothetical. _dshow_software_camera_names() depends on a
+# strictly NARROWER pygrabber/comtypes surface than the leaky call it protects
+# (SystemDeviceEnum().system_device_enum, CreateClassEnumerator(dwFlags=...),
+# IPropertyBag) and has NO fallback -- while _enumerate_dshow_input_devices()
+# carries an explicit FilterGraph fallback for precisely the "older pygrabber /
+# import shape" this cannot survive. Reproduced by exposing only FilterGraph on
+# pygrabber.dshow_graph: the leaky enumeration still returned all four devices
+# (leak fully armed) while the fingerprint was None on every call. A routine
+# `pip install -U pygrabber`, a comtypes regeneration that renames dwFlags, or
+# a SetupDiGetClassDevsW failure on another Windows build all land here.
+#
+# Hence this: the degradation announces itself, loudly and greppably, the first
+# time it happens and every WEBCAM_FINGERPRINT_REWARN_SECONDS afterwards -- and
+# announces the recovery too, so the log shows the window rather than just its
+# start. Console-only and throttled on purpose: this is reached from the HUD
+# preview compositor's per-frame path, so it must be cheap and it must never
+# raise.
+WEBCAM_FINGERPRINT_REWARN_SECONDS = 900.0
+
+# True while the gate is known to be failing open; when it started; when we last
+# said so; and how many leaky enumerations that has cost. The count is the
+# damage estimate the warning quotes -- one leaked OS thread and 103 leaked
+# handles each, none of them ever reclaimed short of a restart.
+_webcam_fingerprint_degraded = [False]
+_webcam_fingerprint_degraded_since = [0.0]
+_webcam_fingerprint_warned_at = [0.0]
+_webcam_fingerprint_leaky_enums = [0]
+
+
+def _report_video_fingerprint_gate(fp, names, now: float) -> bool:
+    """Report the DirectShow-enumeration leak gate failing open, and closing
+    again. Returns True when it printed. NEVER raises.
+
+    Call ONLY from the real-enumeration path of
+    ``_resolve_webcam_indices_by_name()``, with ``fp`` = the fingerprint stamped
+    for this enumeration and ``names`` = what ``_enumerate_dshow_input_devices``
+    returned.
+
+    ``names is None`` is deliberately NOT an alarm, and that is the whole reason
+    this is called after the enumeration rather than at the probe. When
+    pygrabber is absent the enumeration fails at the IMPORT and never reaches
+    CreateClassEnumerator, so nothing leaked and a leak warning there would be
+    false. The alarm condition is the dangerous COMBINATION: the leaky call
+    SUCCEEDED (so it leaked) while the fingerprint that exists to prevent the
+    next one is unreadable (so it will leak again in _WEBCAM_IDX_TTL_SEC, and
+    every tick after that, forever)."""
+    try:
+        if names is None:
+            return False
+        if fp is not None:
+            if not _webcam_fingerprint_degraded[0]:
+                return False        # healthy, and was healthy — say nothing
+            leaked = _webcam_fingerprint_leaky_enums[0]
+            mins = max(0.0, now - _webcam_fingerprint_degraded_since[0]) / 60.0
+            _webcam_fingerprint_degraded[0] = False
+            _webcam_fingerprint_leaky_enums[0] = 0
+            print(f"  [kinect-preview] video-device fingerprint is READABLE "
+                  f"again — the DirectShow enumeration leak gate is closed. It "
+                  f"was open for {mins:.1f} min and cost {leaked} leaky "
+                  f"enumeration(s) ≈ {leaked} OS threads and {leaked * 103} "
+                  f"handles, none of which come back before a restart.")
+            return True
+        # Fingerprint unreadable: the gate cannot fire, so the leaky
+        # enumeration is now running on the bare TTL — the pre-fix leak.
+        _webcam_fingerprint_leaky_enums[0] += 1
+        if not _webcam_fingerprint_degraded[0]:
+            _webcam_fingerprint_degraded[0] = True
+            _webcam_fingerprint_degraded_since[0] = now
+        elif (now - _webcam_fingerprint_warned_at[0]
+                ) < WEBCAM_FINGERPRINT_REWARN_SECONDS:
+            return False            # already shouting; don't shout every 10 s
+        _webcam_fingerprint_warned_at[0] = now
+        # Name the failing half — without it the operator has a leak and no
+        # lead. Both probes are free (measured 0 threads / 0 handles over 300
+        # calls, 0.35 ms combined), and this only runs on the throttled warn
+        # path, so re-probing to attribute the failure costs nothing.
+        try:
+            pnp_ok = _setupapi_camera_instances() is not None
+        except Exception:
+            pnp_ok = False
+        try:
+            soft_ok = _dshow_software_camera_names() is not None
+        except Exception:
+            soft_ok = False
+        if not pnp_ok and not soft_ok:
+            which = ("BOTH halves failed — _setupapi_camera_instances "
+                     "(SetupDiGetClassDevsW on the KS video categories) and "
+                     "_dshow_software_camera_names (pygrabber DEVMON_FILTER)")
+        elif not pnp_ok:
+            which = ("_setupapi_camera_instances failed — SetupDiGetClassDevsW "
+                     "on the KS video categories returned nothing usable")
+        elif not soft_ok:
+            which = ("_dshow_software_camera_names failed — it needs "
+                     "pygrabber's SystemDeviceEnum + IPropertyBag and "
+                     "CreateClassEnumerator(dwFlags=…), a NARROWER surface "
+                     "than the leaky call it guards, and unlike "
+                     "_enumerate_dshow_input_devices it has no FilterGraph "
+                     "fallback, so a pygrabber/comtypes upgrade lands here")
+        else:
+            which = ("both halves answer when probed individually but the "
+                     "fingerprint did not — a race, or a device that left "
+                     "between the two probes")
+        # QUOTE THE MEASURED RATE once there is a window to measure over, not
+        # the TTL-derived one. The TTL is only the FLOOR: every failed
+        # side-tile read calls _invalidate_side_tile_indices(), which bypasses
+        # the TTL entirely, so a sick camera on a failed-open gate leaks far
+        # faster than 6/min (that amplifier was ~89% of the v2.0.100 leak). A
+        # warning that always printed the floor would understate exactly the
+        # case that kills the process fastest.
+        n = _webcam_fingerprint_leaky_enums[0]
+        mins = max(0.0, now - _webcam_fingerprint_degraded_since[0]) / 60.0
+        if mins >= 1.0:
+            rate = n / mins
+            cost = (f"MEASURED {rate:.1f} leaked enumerations/min over the "
+                    f"last {mins:.0f} min = ≈{rate:.1f} OS threads and "
+                    f"≈{rate * 103:.0f} handles per MINUTE")
+        else:
+            floor = 60.0 / max(_WEBCAM_IDX_TTL_SEC, 0.001)
+            cost = (f"at least ≈{floor:.0f} OS threads and ≈{floor * 103:.0f} "
+                    f"handles per MINUTE — one per {_WEBCAM_IDX_TTL_SEC:.0f}s "
+                    f"TTL tick, and more whenever a failed side-tile read "
+                    f"forces an extra resolve")
+        print(f"  [kinect-preview] WARNING: the DirectShow enumeration leak "
+              f"gate has FAILED OPEN — the video-device fingerprint is "
+              f"unreadable, so the leaky enumeration is running unguarded. "
+              f"{which}. Cost: {cost}, permanently, until JARVIS restarts — "
+              f"{n} leaked enumeration(s) so far. This is the v2.0.100 death "
+              f"mode (14,507 threads / 1,419,190 handles, then every subsystem "
+              f"stops logging). Fix the probe or pin pygrabber. Re-warning "
+              f"every {WEBCAM_FINGERPRINT_REWARN_SECONDS / 60.0:.0f} min while "
+              f"it lasts.")
+        return True
+    except Exception:
+        return False
 
 
 def _enumerate_dshow_input_devices() -> "list[str] | None":
@@ -4022,11 +4586,18 @@ def _enumerate_dshow_input_devices() -> "list[str] | None":
     #     SystemDeviceEnum()  46.3 ms wall / 12.0 ms CPU per call
     #
     # This does NOT fix the leak: BOTH paths leak +1 OS thread and +103 handles
-    # per call inside the moniker enumeration itself (measured, identical for
-    # both — it is the KS/DirectShow device-moniker bind, not the graph). At the
-    # 10 s TTL below that is +6 threads and +618 handles per MINUTE in the live
-    # process; it accounts for the mfksproxy.dll thread growth measured at
-    # +7.9/min. Treat this call as expensive AND leaky. (2026-09-04, TRACK 3.)
+    # per call, identically. CORRECTED 2026-09-05 — an earlier note here blamed
+    # "the device-moniker bind", and that is WRONG in a way that matters: a
+    # decomposition of the chain (see the block above _setupapi_camera_instances)
+    # showed CreateClassEnumerator ALONE already leaks the full +1/+103 before a
+    # single moniker exists, and Next()/BindToStorage/Read add exactly nothing.
+    # A raw-ctypes repro that binds nothing leaks the same. So you CANNOT dodge
+    # this by sourcing the names differently — any call that builds the video
+    # class enumerator pays it. The only fix is to call it less often.
+    # At the 10 s TTL below that was +6 threads and +618 handles per MINUTE in
+    # the live process, which is the mfksproxy.dll growth. Treat this call as
+    # expensive AND leaky, and go through _resolve_webcam_indices_by_name(),
+    # which now gates it behind a free device-set fingerprint.
     names = None
     try:
         from pygrabber.dshow_graph import SystemDeviceEnum
@@ -4048,17 +4619,125 @@ def _enumerate_dshow_input_devices() -> "list[str] | None":
         return None
 
 
+def _dshow_input_devices_gated(cache: list,
+                               now: float | None = None) -> "list[str] | None":
+    """``_enumerate_dshow_input_devices()`` behind the free device-set
+    fingerprint gate and the self-heal floor. THE RAW FUNCTION IS THE LEAKY
+    PRIMITIVE (+1 OS thread, +103 handles, permanently, per call); every
+    consumer that calls it on a repeating schedule must come through here.
+
+    ``cache`` is one caller-owned 3-slot list ``[names, fingerprint,
+    enumerated_at]``. It is PASSED IN rather than closed over so that the one
+    copy of the gate RULE serves every consumer: two consumers with separate
+    caches each pay at most one enumeration per self-heal floor, which is a cost
+    (2 threads/hour instead of 1), but the rule they enforce cannot drift apart
+    — and a rule fixed in one copy while the other rots is this codebase's
+    single most expensive bug shape.
+
+    Returns a fresh copy of the device-name list, or None when the enumeration
+    is unavailable (pygrabber missing / COM hiccup) — callers then fall back to
+    a configured static index exactly as they did before. NEVER raises.
+
+    WRITE ORDER IS LOAD-BEARING, and is why this needs no lock. Unlike the
+    side-tile resolver, this runs on the face-track PRODUCER thread and on the
+    boot probe as well, so two threads can be inside it at once. The fingerprint
+    is CLEARED before the slow enumeration starts and re-published only AFTER
+    the name list is stored, so a concurrent reader sees either the complete old
+    pair or no fingerprint at all. It can never pair a NEW fingerprint with the
+    OLD names — the one interleaving that would hand out a stale index for a bus
+    that had just moved, i.e. open the wrong camera and succeed. The cost of the
+    conservative direction is at most one extra enumeration."""
+    now = time.time() if now is None else now
+    # A cache this function cannot use is a reason to enumerate, never a reason
+    # to fail: the gate must never be why a camera could not be opened. Checked
+    # by type and length rather than by try/except around the unpack, because a
+    # 3-CHARACTER STRING unpacks perfectly happily and then explodes on the
+    # arithmetic two lines later (caught by
+    # test_junk_cache_degrades_to_the_raw_enumeration_and_never_raises).
+    if not isinstance(cache, list) or len(cache) < 3:
+        return _enumerate_dshow_input_devices()
+    names, fp_at_last_enum, enumerated_at = cache[0], cache[1], cache[2]
+    # Same two floors, and the same reason, as the side-tile resolver: a stamped
+    # fingerprint sees a leave+rejoin after the fact and so makes the
+    # unconditional re-enumeration a safety net rather than the correctness
+    # mechanism; an unstamped one leaves that hole open and has to keep paying.
+    floor = (_WEBCAM_IDX_SELFHEAL_STAMPED_SEC
+             if _fingerprint_sees_rejoin(fp_at_last_enum)
+             else _WEBCAM_IDX_SELFHEAL_SEC)
+    try:
+        within_floor = (now - float(enumerated_at)) < floor
+    except Exception:  # pragma: no cover - defensive: a non-numeric stamp
+        within_floor = False
+    if names is not None and fp_at_last_enum is not None and within_floor:
+        fp = _video_device_fingerprint()
+        # A None fingerprint is "could not tell", NEVER "nothing changed": fall
+        # through and pay for the real enumeration rather than pin a stale index.
+        if fp is not None and fp == fp_at_last_enum:
+            return list(names)
+    # Sample the fingerprint BEFORE enumerating, for the same reason the
+    # side-tile resolver does: a device that arrives *during* the 40 ms
+    # enumeration then leaves us holding a stale fingerprint and we re-resolve
+    # on the next call — the safe direction. Sampling after would record the new
+    # device set against an index map built without it, and we would never
+    # re-resolve.
+    fp_before = _video_device_fingerprint()
+    cache[2] = now
+    cache[1] = None                 # invalidate while the slow call is out
+    fresh = _enumerate_dshow_input_devices()
+    if fresh is None:
+        # No index map, so the fingerprint sampled alongside it describes
+        # nothing. Both stay cleared: keeping either would let ONE COM hiccup
+        # suppress every retry for a whole self-heal period. Costs nothing in
+        # the permanent case — a genuinely missing pygrabber fails at the
+        # IMPORT and never reaches the leaky call.
+        cache[0] = None
+        return None
+    cache[0] = list(fresh)
+    cache[1] = fp_before            # publish LAST
+    return list(fresh)
+
+
+# The camera OPEN path's own slot of the gate above: [names, fingerprint,
+# enumerated_at]. Owned by _dshow_name_to_index() and therefore by the
+# face-track opener (_open_capture) and the boot rescue (_camera_rescued_by_name).
+#
+# WHY IT IS GATED AT ALL (2026-09-05, measured — this was the hole left by the
+# first pass of the leak fix). _dshow_name_to_index() was a SECOND, UNGATED
+# caller of the leaky enumeration: measured on this rig it costs +1.00 OS thread
+# and +103.0 handles in ~43 ms per call, INCLUDING when the requested name does
+# not match anything — the enumeration happens before the name comparison, so an
+# ABSENT camera pays full price. It is called unconditionally at the top of
+# _open_capture(), and _open_capture() is what the face-track loop's recovery
+# branch calls every CAMERA_REOPEN_BACKOFF_SEC (2.0 s) for a camera whose handle
+# is None. A configured camera that goes sick or is unplugged, and whose static
+# fallback index then also fails to open, therefore drove ~30 ungated
+# enumerations per MINUTE — five times the 6.0/min the TTL gate had just removed
+# — for as long as the condition lasted. The fingerprint answers that case
+# exactly right: the bus is NOT changing while a camera is merely sick, so after
+# the one enumeration that observes the device leaving, every subsequent reopen
+# attempt is served from this cache for free.
+_dshow_open_devices_cache: list = [None, None, 0.0]
+
+
 def _dshow_name_to_index(substr: str) -> "int | None":
     """The LIVE DirectShow index of the first input device whose friendly name
     contains ``substr`` (case-insensitive), or None when pygrabber is
-    unavailable / nothing matched. Enumerates DEVICES FRESH on every call (it is
-    only called at camera open / reopen, not per frame), so it reflects the
-    CURRENT USB enumeration — the whole point of opening a camera by name is to
-    survive an index shuffle. Pure-ish (one COM read); NEVER raises."""
+    unavailable / nothing matched.
+
+    GATED, NOT FRESH (2026-09-05 — the docstring here used to promise "enumerates
+    DEVICES FRESH on every call", and that promise is what made this the second
+    ungated caller of a call that leaks an OS thread every time). The names come
+    from _dshow_input_devices_gated(), which re-enumerates only when the free
+    device-set fingerprint says the bus actually moved, or when the self-heal
+    floor expires. That preserves the property this function exists for — an
+    index shuffle is still seen, because a shuffle REQUIRES a device to join,
+    leave, or leave-and-rejoin, and the fingerprint detects all three — while a
+    camera that is merely sick, absent or held by another app no longer buys a
+    leaked thread per reopen attempt. NEVER raises."""
     needle = (substr or "").strip().lower()
     if not needle:
         return None
-    names = _enumerate_dshow_input_devices()
+    names = _dshow_input_devices_gated(_dshow_open_devices_cache)
     if not names:
         return None
     for i, n in enumerate(names):
@@ -4089,10 +4768,101 @@ def _resolve_webcam_indices_by_name() -> dict[str, int]:
     if (_kinect_preview_webcam_resolved[0]
             and (now - _kinect_preview_webcam_resolved_at[0]) < _WEBCAM_IDX_TTL_SEC):
         return _kinect_preview_webcam_idx
+    # The TTL has expired -- but expiry alone is NOT a reason to re-enumerate.
+    # _enumerate_dshow_input_devices() leaks a thread and 103 handles every time
+    # (see the block above _setupapi_camera_instances), so on a bus that has not
+    # changed we were paying that 6x a minute forever to re-learn the same map.
+    # Ask the free probe first: if the device set is byte-identical to the one
+    # the cached mapping was built from, the indices cannot have reshuffled, so
+    # just slide the TTL forward and reuse the cache. A None fingerprint means
+    # the probe could not tell, and we fall through to the real enumeration --
+    # degrading to the old behaviour rather than trusting a stale index.
+    # NOTE this deliberately keys off the FINGERPRINT, not the resolved flag, so
+    # it also covers the forced-invalidation path. _invalidate_side_tile_indices()
+    # clears the resolved flag on every failed side-tile read, which used to mean
+    # a sick camera re-enumerated PER FRAME instead of per 10 s — and that is the
+    # amplifier that killed v2.0.100 (a wedged camera, ~4 enumerations per retry
+    # cycle: 1 to re-resolve + 3 more inside the CAP_DSHOW reopen). But a failed
+    # read only justifies re-resolving if the device set actually MOVED, and an
+    # unchanged fingerprint proves it did not: the index is still correct and the
+    # camera is failing for some other reason (sick device, USB power, wedged
+    # driver), none of which re-enumeration can fix. So: same devices, same map.
+    #
+    # ...WITH A SELF-HEAL FLOOR, whose length depends on how good the
+    # fingerprint we are holding actually is.
+    #
+    # A device-SET fingerprint has one hole, and it is a nasty one: the set is
+    # sampled only every _WEBCAM_IDX_TTL_SEC, so a device that leaves and
+    # REJOINS between two samples reshuffles the DirectShow order while leaving
+    # the set byte-identical (the Kinect does exactly this on this rig -- its
+    # measured arrival stamp was 4h35m after the other two cameras' in the same
+    # boot). Nothing catches that: the reads still SUCCEED, they just come from
+    # the wrong camera, so the failed-read backstop never fires either. The old
+    # code self-healed within 10 s only because it re-resolved unconditionally;
+    # a pure set-fingerprint gate would stay wrong FOREVER, which is a worse bug
+    # than the leak it fixes.
+    #
+    # So the PnP half of the fingerprint carries DEVPKEY_Device_LastArrivalDate
+    # (see _setupapi_camera_instances, which also records the experiment that
+    # actually observed that stamp advancing across a removal + re-arrival of
+    # the same instance). That makes a leave+rejoin visible even when it is only
+    # observed afterwards -- closing the hole rather than time-boxing it. The
+    # REMOVAL stamp is NOT carried and is no part of this: Windows clears it
+    # when the device returns, so a DIGCF_PRESENT probe can never see one.
+    # When that holds (_fingerprint_sees_rejoin), the unconditional
+    # re-enumeration stops being the correctness mechanism and becomes a pure
+    # safety net for unknown-unknowns, so it can be an hour apart instead of
+    # five minutes. When it does NOT hold -- CM_Get_DevNode_PropertyW failed, or
+    # the probe returned no PnP devices at all and so proves nothing -- we fall
+    # back to the short floor and keep paying for it.
+    #
+    # BE HONEST ABOUT THE NUMBER: this is a reduction, not zero. 3600 s is still
+    # 1 leaked thread + 103 handles per hour (24 threads/day, ~2,500 handles/day)
+    # against 6.0/min = 8,640/day unpatched. It is ~356x, not infinite. The only
+    # way to reach a true zero here is to stop calling the leaky API at all,
+    # which means not sourcing indices from DirectShow -- and DirectShow order is
+    # the one thing cv2.VideoCapture(idx, CAP_DSHOW) indexes by, so that is a
+    # capture-backend change, not a leak fix.
+    floor = (_WEBCAM_IDX_SELFHEAL_STAMPED_SEC
+             if _fingerprint_sees_rejoin(_kinect_preview_webcam_fingerprint[0])
+             else _WEBCAM_IDX_SELFHEAL_SEC)
+    if (now - _kinect_preview_webcam_enumerated_at[0]) >= floor:
+        pass                    # fall through to the real enumeration below
+    elif _kinect_preview_webcam_fingerprint[0] is not None:
+        fp = _video_device_fingerprint()
+        if fp is not None and fp == _kinect_preview_webcam_fingerprint[0]:
+            _kinect_preview_webcam_resolved[0] = True
+            _kinect_preview_webcam_resolved_at[0] = now
+            return _kinect_preview_webcam_idx
+    # Stamp the fingerprint we are about to resolve AGAINST, before enumerating.
+    # Taking it first means a device that arrives *during* the enumeration
+    # leaves us with a stale fingerprint and we re-resolve on the next tick —
+    # the safe direction. Taking it after would record the new device set
+    # against an index map built without it, and we would never re-resolve.
+    _kinect_preview_webcam_fingerprint[0] = _video_device_fingerprint()
+    _kinect_preview_webcam_enumerated_at[0] = now
     names = _enumerate_dshow_input_devices()
+    # ALARM if the fingerprint we just stamped is None: the gate cannot fire
+    # against it, so this leaky enumeration will repeat every TTL tick forever.
+    # It has to be HERE and not at the probe — `names` is what separates "the
+    # gate failed open and we are leaking again" (names present: the leaky call
+    # ran) from "pygrabber is simply absent" (names None: the call failed at the
+    # import and leaked nothing). See _report_video_fingerprint_gate.
+    _report_video_fingerprint_gate(_kinect_preview_webcam_fingerprint[0],
+                                   names, now)
     if names is None:
         # pygrabber missing / COM hiccup — mark resolved so we don't retry every
         # frame; the caller falls back to the CAMERAS-config indices.
+        #
+        # But DROP the fingerprint we just stamped. It was recorded as "the
+        # device set this index map was built from", and there is no index map:
+        # keeping it would let the gate above suppress every retry for a whole
+        # self-heal period (up to an hour) on the strength of one COM hiccup.
+        # Clearing it costs nothing in the permanent case — when pygrabber is
+        # genuinely missing, _enumerate_dshow_input_devices() fails at the
+        # IMPORT and never reaches the leaky call, so retrying on the 10 s TTL
+        # leaks nothing — and in the transient case retrying is exactly right.
+        _kinect_preview_webcam_fingerprint[0] = None
         _kinect_preview_webcam_resolved[0] = True
         _kinect_preview_webcam_resolved_at[0] = now
         return _kinect_preview_webcam_idx
