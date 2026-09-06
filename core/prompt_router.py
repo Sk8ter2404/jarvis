@@ -115,6 +115,15 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "all cameras", "every camera", "both cameras", "camera status",
         "what cameras", "where am i", "what am i doing", "what's my status",
         "look around", "see everywhere",
+        # 2026-09-06 live regression: "are both webcams ok" and "can you check
+        # if both webcams are still working" BOTH emitted system_pulse and
+        # answered with CPU/memory percentages, never mentioning a camera. The
+        # literal "camera status" routed fine, so camera_status was reachable —
+        # the router just failed on paraphrase, because "webcam" lived only in
+        # the WEBCAM AWARENESS section and nothing mapped webcam + health here.
+        "webcam", "webcams", "cameras working", "camera working",
+        "cameras ok", "webcams ok", "cameras still", "webcams still",
+        "camera health", "cameras up",
     ],
     "FACE RECOGNITION": [
         "who am i", "recognize", "who is at", "who's at", "face",
@@ -163,6 +172,15 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "health", "cpu", "gpu", "ram", "memory usage", "disk", "temperature",
         "temp", "status", "diagnostic", "diagnostics", "how are you running",
         "system", "load", "vram", "fans", "hardware",
+        # 2026-09-06 live regression: "how hot is my graphics card" loaded only
+        # MULTI-MONITOR APP LAUNCHING and WEATHER BRIEFING — SYSTEM HEALTH was
+        # DROPPED, so gpu_usage never reached the model and it answered with
+        # system_pulse ("GPU running at 33 percent") to a question about
+        # TEMPERATURE. "how hot is the GPU" worked, which is what proved it was
+        # vocabulary and not the action. Note "hot" also pulled in WEATHER
+        # BRIEFING, so the wrong section loaded while the right one did not.
+        "graphics card", "graphics", "video card", "how hot", "hot", "degrees",
+        "celsius", "throttl", "overheat", "running hot",
     ],
     "BAMBU 3D PRINTER": [
         "print", "printer", "printing", "bambu", "3d", "filament", "nozzle",

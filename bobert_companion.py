@@ -10996,6 +10996,19 @@ def get_current_mic_name() -> str:
 
 
 def get_current_speaker_name() -> str:
+    """Friendly name of whatever output device is currently selected.
+
+    Refreshes FIRST, symmetrically with get_current_mic_name(). Until
+    2026-09-06 this read _device_cache["out"] with no refresh at all, so the
+    spoken answer to "what speakers are you using" came from a cache rather
+    than from the live default render endpoint. It happened to be right,
+    because get_output_device() refreshes on every TTS playback and JARVIS
+    speaks constantly — i.e. it was correct by accident of timing, not by
+    construction. That is precisely the "names a device it never read" shape
+    that produced this session's other audio defects, so the asymmetry is
+    closed rather than left resting on how chatty JARVIS happens to be.
+    """
+    _refresh_devices(force=True)
     idx = _device_cache["out"]
     if idx is None:
         return "(system default)"
