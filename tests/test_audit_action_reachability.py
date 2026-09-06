@@ -751,12 +751,17 @@ class DocumentedActionsResolveTests(_ScanCase):
 # sentence core/prompts.py's AUDIO DEVICES comment already carries; these tests
 # are the executable version of it.
 #
-# KNOWN LIMIT, stated rather than papered over: this is NOT yet a whole-prompt
-# ratchet. Measured 2026-09-05, 16 of 92 extractable "'phrase' → [ACTION: x]"
-# examples elsewhere in the prompt still fail the same round-trip (air-mouse,
-# keep_music_open, check_for_updates, model_costs, test_vision, …). Each is a
-# real gap and none is this card. Reproduce with the extractor below over every
-# section; turning that into an exact-set ratchet is the follow-up.
+# THAT FOLLOW-UP LANDED 2026-09-06 and lives below as
+# ``WholePromptArrowRatchetTests``. The limit this comment used to state — "16
+# of 92 extractable examples elsewhere in the prompt still fail the same
+# round-trip" — was reproduced exactly, then closed by widening ten keyword
+# lists in ``core/prompt_router.py`` (air-mouse arm/disarm, air_control_off,
+# keep_music_open, music_history, audio_autoswitch_status, morning_handoff,
+# predictive_morning_setup, reset_memory, check_for_updates, model_costs,
+# disable_voice_clone, test_vision, latency_benchmark). The scoped read-back
+# test is KEPT rather than folded in: it locates its block by CONTENT
+# (``workshop_hud_status``) so it survives a rename, while the sweep below
+# locates examples structurally. Two different ways to be wrong, two guards.
 _ARROW_EXAMPLE_RE = re.compile(
     r"(?<!\w)'([^'<>]{4,80})'(?!\w)\s*(?:→|->)\s*"
     r"\[ACTION:\s*([A-Za-z_][A-Za-z0-9_]*)\]")
@@ -781,6 +786,71 @@ def _arrow_examples(text: str) -> list[tuple[str, str]]:
         if _PLAIN_UTTERANCE_RE.match(phrase):
             out.append((phrase, action))
     return out
+
+
+def _slim_keeps_action(phrase: str, action: str,
+                       pc_control: str = PC_CONTROL_PROMPT) -> bool:
+    """Does ``action`` survive ``slim_pc_control(phrase)``?
+
+    THE question this whole section asks, in one place. Reuses ``_occurrences``
+    rather than re-spelling the lookaround inline: a second copy of the match
+    rule is exactly the drift this project's ``registration_scan`` docstring
+    was written about, and the two copies would silently disagree the first
+    time either is tightened.
+
+    Deliberately asks about the NAME, not about which section loaded. What
+    matters to the model is whether it has a token to answer with — an action
+    cross-referenced from a sibling section that DID load is genuinely
+    answerable, and demanding the home section would fail those honestly."""
+    return bool(_occurrences(prompt_router.slim_pc_control(phrase, pc_control),
+                             action))
+
+
+def _arrow_round_trip(pc_control: str = PC_CONTROL_PROMPT) -> tuple[
+        dict[tuple[str, str], str], list[tuple[str, str, str]]]:
+    """Sweep every section for documented examples and check each round-trips.
+
+    Returns ``(seen, misses)`` where ``seen`` maps (phrase, action) -> the
+    section that documents it and ``misses`` is the sorted subset whose action
+    does NOT survive slimming, as (home_section, phrase, action).
+
+    Deduped on (phrase, action): a couple of examples are printed in two
+    sections, and the promise — "say this, get that" — is the same promise
+    wherever it is written, so the ledger keys on it rather than on placement.
+
+    The CORE preamble is not swept. It ships on 100 % of turns, so any example
+    in it round-trips by construction; measured 2026-09-06 it contains none
+    anyway, so this excludes nothing real, only noise."""
+    sections = prompt_router.split_pc_control(pc_control)[1]
+    seen: dict[tuple[str, str], str] = {}
+    for header, body in sections:
+        for pair in _arrow_examples(body):
+            seen.setdefault(pair, header.strip())
+    misses = sorted(((home, phrase, action)
+                     for (phrase, action), home in seen.items()
+                     if not _slim_keeps_action(phrase, action, pc_control)),
+                    key=lambda t: (t[0], t[1]))
+    return seen, misses
+
+
+# ── the ledger: promises deliberately left open ──────────────────────────────
+# Same contract as action_reachability_allowlist.txt and the same reason for
+# existing, one tier down: that file lists actions the PROMPT never teaches;
+# this one lists actions the prompt teaches but the ROUTER cannot deliver on
+# the default local path. Kept in-module rather than in a file because it is
+# meant to stay small — if it ever grows past a handful of lines, that is the
+# signal to give it a file and a --write mode like its sibling, not to let it
+# sprawl here.
+#
+# EMPTY IS THE GOAL STATE, and it is where this stands at 2026-09-06: all 92
+# extractable examples round-trip. An empty ledger makes the staleness test
+# below vacuous, which is precisely why ``ArrowRatchetMechanismTests`` pins the
+# sweep against a FIXTURE — otherwise "0 misses" and "the sweep broke" look
+# identical from here, and this project's defining bug class is the guard that
+# reports green because it stopped looking.
+#
+# format:  (phrase, action): reason it is knowingly left open
+_ARROW_LEDGER: dict[tuple[str, str], str] = {}
 
 
 class LocalSlimPathVisibilityTests(unittest.TestCase):
@@ -849,9 +919,8 @@ class LocalSlimPathVisibilityTests(unittest.TestCase):
             f"{examples} — the extractor drifted and this would pass blind")
         misses = []
         for phrase, action in examples:
-            slim = prompt_router.slim_pc_control(phrase, PC_CONTROL_PROMPT)
-            if not re.search(r"(?<![A-Za-z0-9_])" + re.escape(action)
-                             + r"(?![A-Za-z0-9_])", slim):
+            if not _slim_keeps_action(phrase, action):
+                slim = prompt_router.slim_pc_control(phrase, PC_CONTROL_PROMPT)
                 misses.append(f"{phrase!r} -> {action} "
                               f"(slim prompt {len(slim)} chars)")
         self.assertEqual(
@@ -864,6 +933,182 @@ class LocalSlimPathVisibilityTests(unittest.TestCase):
             + "\n  FIX: widen the section's keyword list in "
             "core/prompt_router.py::_SECTION_KEYWORDS, or check the section "
             "header still parses. Do NOT delete the example.")
+
+
+class WholePromptArrowRatchetTests(unittest.TestCase):
+    """The whole-prompt version of the read-back check above: EVERY documented
+    "'phrase' → [ACTION: x]" example, in every section, must still carry its
+    action after slimming.
+
+    WHY AN EXACT SET AND NOT A COUNT. A count ratchet ("no more than 16") lets
+    a fixed gap pay for a new one — the number stays put while the prompt
+    silently trades a working promise for a broken one. Equality against the
+    ledger fails in both directions, so a fix must be recorded as a fix.
+
+    WHAT A FAILURE MEANS, concretely. The prompt prints the phrase the owner is
+    invited to say, next to the action it should fire. When the action name is
+    absent from the slimmed prompt, the local brain is handed that exact
+    question with no token to answer it — and PC_CONTROL_SAFETY_RULES ships its
+    closed-list rule on 100 % of turns, so the reply is either a confident
+    neighbouring action or "I'm afraid I've no way to check that, sir" for a
+    capability that is registered, documented and working. Both were measured
+    in the week before this test existed; neither is a quiet degrade.
+
+    Measured 2026-09-06 before the fix: 16 of 92 failed. Several were not
+    merely absent but actively wrong — 'stop keeping Apple Music open' loaded
+    MUSIC CONTROLS, whose nearest token STOPS THE MUSIC, and 'JARVIS, forget
+    everything you know about me' loaded the PARTIAL forget."""
+
+    @classmethod
+    def setUpClass(cls):
+        # ~92 slim_pc_control calls over a 126k-char prompt; ~150 ms total, so
+        # compute once for the class rather than per test method.
+        cls.seen, cls.misses = _arrow_round_trip()
+
+    def test_sweep_is_not_blind(self):
+        """Floors, same reason as every other guard in this file: an extractor
+        that quietly stops matching reports a clean sweep, and a clean sweep is
+        indistinguishable from a healthy prompt. 92 pairs across 29 sections at
+        2026-09-06; these sit below that with room for ordinary prompt edits."""
+        self.assertGreaterEqual(
+            len(self.seen), 80,
+            f"only {len(self.seen)} 'phrase' → [ACTION: x] examples extracted "
+            f"— _ARROW_EXAMPLE_RE or the section splitter drifted, so this "
+            f"ratchet would pass by finding nothing")
+        self.assertGreaterEqual(
+            len(set(self.seen.values())), 20,
+            "the examples came from too few sections — the splitter is folding "
+            "blocks together and most of the prompt is going unswept")
+
+    def test_every_documented_trigger_keeps_its_action(self):
+        """THE regression. Exact set against the ledger."""
+        unledgered = [(h, p, a) for h, p, a in self.misses
+                      if (p, a) not in _ARROW_LEDGER]
+        detail = "\n".join(f"    {h:<28} {p!r} -> {a}" for h, p, a in unledgered)
+        self.assertEqual(
+            unledgered, [],
+            "core/prompts.py prints these phrases next to the action they "
+            "should fire, but after core.prompt_router.slim_pc_control the "
+            "action name is GONE from the prompt — so on the DEFAULT local "
+            "route the model is asked the question with no token to answer "
+            f"it:\n{detail}\n"
+            "  FIX: widen the home section's keyword list in "
+            "core/prompt_router.py::_SECTION_KEYWORDS, deriving the keywords "
+            "from the trigger phrases the section itself prints. Do NOT delete "
+            "the example, do NOT relax prompt_router._HEADER_RE (that folds "
+            "real prose into sections), and do NOT add a line to "
+            "_ARROW_LEDGER to get green — that ledger is for promises "
+            "knowingly left open, and an unreachable documented trigger is a "
+            "promise the product does not keep.")
+
+    def test_ledger_has_no_stale_entries(self):
+        """The half that makes the ledger SHRINK. Two ways to go stale: the
+        promise now round-trips (fixed — delete the line), or the example is no
+        longer in the prompt at all (reworded or removed — delete the line)."""
+        broken = {(p, a) for _h, p, a in self.misses}
+        fixed = sorted(k for k in _ARROW_LEDGER
+                       if k in self.seen and k not in broken)
+        gone = sorted(k for k in _ARROW_LEDGER if k not in self.seen)
+        detail = ""
+        if fixed:
+            detail += ("\n  now routes correctly (delete these):\n"
+                       + "\n".join(f"    {p!r} -> {a}" for p, a in fixed))
+        if gone:
+            detail += ("\n  no longer documented in the prompt (delete "
+                       "these):\n"
+                       + "\n".join(f"    {p!r} -> {a}" for p, a in gone))
+        self.assertEqual(
+            fixed + gone, [],
+            f"stale _ARROW_LEDGER entries.{detail}\n"
+            "  A ledger that only ever grows is a dumping ground; deleting an "
+            "entry the moment it is fixed is what keeps this one honest.")
+
+    def test_ledger_entries_carry_a_real_reason(self):
+        thin = sorted(k for k, r in _ARROW_LEDGER.items() if len(r.strip()) < 10)
+        self.assertEqual(
+            thin, [],
+            "every _ARROW_LEDGER entry needs a one-line reason saying why the "
+            "promise is knowingly left open — an unexplained entry is "
+            "indistinguishable from one added to silence the build")
+
+
+# A miniature prompt with the two outcomes the sweep must tell apart. Shaped
+# like the real thing: a core preamble, then two parseable sections, neither of
+# which has an entry in _SECTION_KEYWORDS — so each is selected only when the
+# turn contains one of its own header words.
+#   'engage it now' shares no word with "WIDGET CONTROL"  -> section DROPPED
+#                                                         -> widget_on absent
+#   'gadget on'     contains the header word "gadget"     -> section KEPT
+#                                                         -> gadget_on present
+# The ASCII '->' arrow is used on purpose: the live prompt writes '→'
+# exclusively, so this is the only place the regex's other branch is exercised.
+_FIXTURE_PROMPT = """\
+Action format: emit [ACTION: name] when you act on a request.
+
+WIDGET CONTROL:
+  widget_on                    - turn the widget on.
+    Example: 'engage it now' -> [ACTION: widget_on]
+
+GADGET CONTROL:
+  gadget_on                    - turn the gadget on.
+  widget_on_boot               - start the widget at launch.
+    Example: 'gadget on' -> [ACTION: gadget_on]
+"""
+
+
+class ArrowRatchetMechanismTests(unittest.TestCase):
+    """Pin the sweep against a FIXTURE, not the live prompt.
+
+    Without this the ratchet above is untestable in its healthy state: with an
+    empty ledger and zero misses, "the prompt is clean" and "the sweep silently
+    stopped finding anything" produce identical green. Same argument, and the
+    same fixture-not-tree approach, as ActionEvidenceRuleTests — and the same
+    lesson as tests/test_prompt_router.py, where a deliberately broken input
+    was the only thing that proved a guard could still discriminate.
+
+    Needs no git checkout, so it runs on a bare CI box where every _ScanCase
+    skips."""
+
+    def test_fixture_parses_into_two_sections(self):
+        # If the fixture stops parsing, both assertions below go vacuous in the
+        # "everything passes" direction, so check the input first.
+        sections = prompt_router.split_pc_control(_FIXTURE_PROMPT)[1]
+        self.assertEqual([h for h, _b in sections],
+                         ["WIDGET CONTROL", "GADGET CONTROL"])
+
+    def test_sweep_extracts_both_ascii_arrow_examples(self):
+        seen, _misses = _arrow_round_trip(_FIXTURE_PROMPT)
+        self.assertEqual(
+            seen, {("engage it now", "widget_on"): "WIDGET CONTROL",
+                   ("gadget on", "gadget_on"): "GADGET CONTROL"})
+
+    def test_sweep_reports_the_dropped_section_and_only_it(self):
+        """The discrimination check: a real miss is caught, and a promise that
+        DOES round-trip is not reported. A sweep that flagged both would cry
+        wolf; one that flagged neither would be the silent failure."""
+        _seen, misses = _arrow_round_trip(_FIXTURE_PROMPT)
+        self.assertEqual(
+            misses, [("WIDGET CONTROL", "engage it now", "widget_on")],
+            "the sweep must flag exactly the example whose section the router "
+            "drops, and must not flag the one it keeps")
+
+    def test_slim_keeps_action_is_identifier_aware(self):
+        """The helper must not credit an action because a LONGER name that
+        merely CONTAINS it survived — the ``hud_on`` inside ``show_hud_on_boot``
+        hazard from the module docstring, re-checked here because the helper is
+        now shared by two test classes and would drift silently.
+
+        On 'gadget on' the fixture's GADGET section loads, so ``widget_on_boot``
+        is in the slim prompt while ``widget_on`` (whose own section was
+        dropped) is not — and only the lookarounds tell those apart."""
+        slim = prompt_router.slim_pc_control("gadget on", _FIXTURE_PROMPT)
+        self.assertIn("widget_on_boot", slim, "fixture precondition")
+        self.assertTrue(_slim_keeps_action("gadget on", "gadget_on",
+                                           _FIXTURE_PROMPT))
+        self.assertFalse(
+            _slim_keeps_action("gadget on", "widget_on", _FIXTURE_PROMPT),
+            "widget_on occurs ONLY inside widget_on_boot here; crediting it "
+            "would certify a dropped action as delivered")
 
 
 # ── maintenance entry point ──────────────────────────────────────────────────

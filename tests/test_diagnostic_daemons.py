@@ -914,6 +914,81 @@ class CrashWatchLoopTests(_Base):
         # never persisting the transient 0.
         self.assertEqual(st.get("last_seen_record_id"), 500)
 
+    def test_loop_repairs_out_of_range_cursor_and_sees_new_crash(self):
+        # Regression (found 2026-09-06 on the live box): data/diagnostic_daemons.json
+        # held last_seen_record_id=10**12 — the sentinel the seed call passes to
+        # _scan_event_log_for_crashes, wrongly PERSISTED by a pre-v1.79.0 build.
+        # v1.79.0 stopped the scanner RETURNING that value but never migrated the
+        # copy already on disk, and the `new_head > last_seen` persist gate cannot
+        # repair it: a real DWORD head (~51k) is never > 10**12. Measured symptom —
+        # alive_ts refreshed every 30s for 26 min while last_poll_ts stayed frozen
+        # at 2026-05-28T12:11:41 and detections stayed 0. Permanently blind.
+        #
+        # NOTE ON TEST DESIGN: the poison value is byte-identical to the re-seed
+        # sentinel, so "the scanner saw 10**12" proves NOTHING — that is equally
+        # consistent with a broken fall-through poll. The load-bearing assertion is
+        # the BOUND OF THE SECOND CALL: a real repair polls at the recovered head
+        # (51156); a regression polls at 10**12 again and persists nothing.
+        POISON = 10 ** 12
+        REAL_HEAD = 51156
+        self._write_state_file({"crash_watch": {"last_seen_record_id": POISON}})
+        historical = [{"ts": "2026-05-01T00:00:00", "app": "python.exe",
+                       "offset": "0xOLD", "record_id": 51000}]
+        fresh = {"ts": "2026-09-06T00:00:00", "app": "python.exe",
+                 "offset": "0xNEW", "record_id": 51200}
+        bounds = []
+
+        def fake_scan(api, last_record_id):
+            bounds.append(last_record_id)
+            if last_record_id > REAL_HEAD:
+                # Faithful to the real scanner: bounded past the head, it hits
+                # `rec_id <= last_record_id` on the FIRST (newest) event and
+                # early-returns ([], true_head) without inspecting anything. This
+                # IS the blindness, and it repeats for as long as the poisoned
+                # cursor survives — so an unrepaired loop can never see `fresh`.
+                return [], REAL_HEAD
+            if last_record_id == 0:
+                # A poll on an unseeded baseline replays every historical crash.
+                return historical, REAL_HEAD
+            return [fresh], 51200
+
+        with mock.patch.object(dd, "_import_win_event_api",
+                               return_value=FakeWin32EvtLog()),                 mock.patch.object(dd, "_scan_event_log_for_crashes",
+                                  side_effect=fake_scan),                 mock.patch.object(dd, "_latest_session_log_tail",
+                                  return_value="tail"):
+            _drive_loop(dd._crash_watch_loop, [False, True])  # two bodies
+
+        # The repair actually took effect: tick 2 polled at the RECOVERED head,
+        # not at the poison. This is the assertion a regression breaks.
+        self.assertEqual(bounds, [POISON, REAL_HEAD])
+        st = self._read_state_file()["crash_watch"]
+        # Blindness lifted — a genuinely new crash was surfaced...
+        self.assertIn("0xNEW", self._todo_text())
+        self.assertEqual(st.get("detections"), 1)
+        self.assertEqual(st.get("last_seen_record_id"), 51200)
+        # ...without replaying the pre-repair backlog as brand-new tasks.
+        self.assertNotIn("0xOLD", self._todo_text())
+
+    def test_loop_does_not_clamp_max_valid_record_id(self):
+        # Boundary guard: 0xFFFFFFFF is the largest LEGAL DWORD RecordNumber, so
+        # it must be treated as a real seeded baseline, never discarded. Without
+        # this, an over-eager clamp would re-seed a healthy watcher every tick.
+        self._write_state_file({
+            "crash_watch": {"last_seen_record_id": dd.CRASH_MAX_RECORD_ID},
+        })
+        bounds = []
+
+        def fake_scan(api, last_record_id):
+            bounds.append(last_record_id)
+            return [], last_record_id
+
+        with mock.patch.object(dd, "_import_win_event_api",
+                               return_value=FakeWin32EvtLog()),                 mock.patch.object(dd, "_scan_event_log_for_crashes",
+                                  side_effect=fake_scan):
+            _drive_loop(dd._crash_watch_loop, [True])
+        # Seed path skipped entirely: one poll, bounded at the stored cursor.
+        self.assertEqual(bounds, [dd.CRASH_MAX_RECORD_ID])
+
     def test_loop_skips_seed_when_already_seeded(self):
         self._write_state_file({
             "crash_watch": {"last_seen_record_id": 500},

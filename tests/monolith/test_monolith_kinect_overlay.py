@@ -652,6 +652,44 @@ class ResolveWebcamNamesTests(MonolithGlobalsTestCase):
         self.addCleanup(self.bc._kinect_preview_webcam_idx.clear)
         self.addCleanup(lambda: self.bc._kinect_preview_webcam_resolved.__setitem__(0, False))
 
+    # SYNTHETIC needles + device names, deliberately naming no real hardware.
+    #
+    # These two tests exercise the MATCHING and CACHING inside
+    # _resolve_webcam_indices_by_name(); the slot→needle derivation is a
+    # DIFFERENT unit. The fixture used to spell the live rig ("Fullhan
+    # Webcam"), which coupled it to whatever webcam was plugged in that month:
+    # when the owner retired the C270 for an eMeet C960 on 2026-07-13 and
+    # core/config.py's CAMERAS name became "emeet c960", no enumerated device
+    # contained the left needle any more, the slot resolved to None, and both
+    # tests failed. That is the SAME stale-duplicate class
+    # _kinect_preview_webcam_names() itself was fixed for on 2026-07-14 (it
+    # stopped hardcoding "logi c270" and started deriving from CAMERAS) — the
+    # duplicate was not eliminated then, it MOVED from the production dict into
+    # this fixture, where it sat until the next swap tripped it.
+    #
+    # Deriving the fixture back from _kinect_preview_webcam_names() would fix
+    # the rot but buy a tautology: the slot→needle association would supply
+    # BOTH the fake device list and the expected answer, so a _percam_side()
+    # regression that swapped left/right would swap both together and the test
+    # would still pass. That association is already pinned, against an explicit
+    # CAMERAS literal, by test_audit_2026_07_14.ResolveWebcamNames
+    # (test_names_are_derived_from_cameras) — so deriving here would duplicate
+    # that coverage AND weaken it. Mock the needles instead, exactly as every
+    # sibling does (test_monolith_dshow_enum_leak.py, dshow_open_path_gate.py):
+    # a camera swap can then never reach this class again.
+    NEEDLES = {"left": "left cam", "right": "right cam"}
+    # Mixed case, with the needle EMBEDDED in a longer name: the contract is a
+    # case-insensitive SUBSTRING match, not equality, and neither device name
+    # contains the other slot's needle.
+    LEFT_DEV = "Acme LEFT CAM 9000"
+    RIGHT_DEV = "Acme RIGHT CAM 9000"
+    OTHER_DEV = "Kinect V2 Video Sensor"          # matches neither needle
+
+    def _needles(self):
+        """Pin the slot→needle map to NEEDLES for the duration of a `with`."""
+        return mock.patch.object(self.bc, "_kinect_preview_webcam_names",
+                                 return_value=dict(self.NEEDLES))
+
     def _fake_pygrabber(self, names):
         """Install a fake pygrabber.dshow_graph.FilterGraph whose
         get_input_devices() returns `names` (index == list position)."""
@@ -667,18 +705,19 @@ class ResolveWebcamNamesTests(MonolithGlobalsTestCase):
 
     def test_resolves_left_right_by_name(self):
         mod, sub = self._fake_pygrabber(
-            ["USB 2.0 Camera", "Kinect V2 Video Sensor", "Fullhan Webcam"])
-        with mock.patch.dict("sys.modules",
-                             {"pygrabber": mod, "pygrabber.dshow_graph": sub}):
+            [self.RIGHT_DEV, self.OTHER_DEV, self.LEFT_DEV])
+        with self._needles(),                 mock.patch.dict("sys.modules",
+                                {"pygrabber": mod, "pygrabber.dshow_graph": sub}):
             got = self.bc._resolve_webcam_indices_by_name()
-        # 'Fullhan Webcam' is at index 2 → left; 'USB 2.0 Camera' at 0 → right.
+        # LEFT_DEV is at index 2 → left; RIGHT_DEV at 0 → right. The Kinect
+        # sitting between them must be skipped, not counted.
         self.assertEqual(got.get("left"), 2)
         self.assertEqual(got.get("right"), 0)
 
     def test_result_is_cached(self):
-        mod, sub = self._fake_pygrabber(["Fullhan Webcam", "USB 2.0 Camera"])
-        with mock.patch.dict("sys.modules",
-                             {"pygrabber": mod, "pygrabber.dshow_graph": sub}):
+        mod, sub = self._fake_pygrabber([self.LEFT_DEV, self.RIGHT_DEV])
+        with self._needles(),                 mock.patch.dict("sys.modules",
+                                {"pygrabber": mod, "pygrabber.dshow_graph": sub}):
             self.bc._resolve_webcam_indices_by_name()
         # Second call must NOT re-enumerate (pygrabber now absent) — cache holds.
         with mock.patch.dict("sys.modules", {}, clear=False):

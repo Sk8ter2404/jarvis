@@ -739,3 +739,259 @@ class LivenessIsNotUnreadableStateRegressionTests(unittest.TestCase):
         # not disturb the 2026-09-04 what_microphone routing fix.
         slim = pr.slim_pc_control("what microphone are you using", FULL)
         self.assertIn("what_microphone", slim)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  CACHE-STABLE SPLIT  (2026-09-06 latency work)
+# ──────────────────────────────────────────────────────────────────────────
+#
+# stable_pc_block() + turn_pc_block() replace slim_pc_control() ON THE WIRE for
+# the local route: the stable half stays in the system prompt (byte-identical
+# every turn, so the KV prefix survives) and the volatile half rides with the
+# user's message. That is a POSITION change and must never become a CONTENT
+# change — the whole point is that the model still sees everything slimming
+# would have given it. These tests are what make that claim checkable rather
+# than asserted, because the existing suite above exercises slim_pc_control
+# directly and would stay green even if the split silently dropped a section.
+#
+# ⚠ SCOPE — READ BEFORE TRUSTING THIS SECTION (added 2026-09-06 after the
+# review of the unverified latency work). Everything below models the PRIMARY
+# turn and NOTHING ELSE. `stable + turn_pc_block(u)` is the message pair
+# _call_llm builds; it is not what any other call site sends. The split has
+# THREE live call sites, and the ratchet below was green at 65/65 while one of
+# the other two was silently shipping a fraction of the vocabulary:
+#
+#   get_followup_response() reuses the primary turn's system prompt (so
+#   stable_pc_block, no PC_CONTROL_PROMPT) and originally added no turn block
+#   at all. Because _call_local_llm's cheatsheet swap is gated on
+#   `PC_CONTROL_PROMPT in sys_prompt`, that swap stopped firing too — so the
+#   round lost BOTH sources of action names at once. MEASURED on this box:
+#   registered action names reachable by a follow-up round fell from 135/135
+#   (legacy — the full _local_cheatsheet) to 11/135, and the model answered
+#   "…and then mute the volume" with the unregistered [ACTION: mute_volume]
+#   while claiming success.
+#
+# The lesson is about THIS FILE, not that bug: a ratchet is only a ratchet for
+# the call site it models. Re-deriving prompt strings here can never catch a
+# WIRING regression, because `stable + turn_pc_block(u)` is the same expression
+# for every round — the question is only whether a call site still sends it.
+# That question is answered by driving the real function, which
+# tests/test_followup_turn_context.py does; the guard below keeps this file's
+# claim honest by failing if that coverage disappears.
+
+# An action-shaped token: lowercase words joined by underscores. Deliberately
+# NOT bare words — 'search'/'play' are ordinary English inside descriptions and
+# would make this test pass (or fail) for reasons that have nothing to do with
+# the split. Same evidence tier tests/test_audit_action_reachability.py uses.
+_ACTION_NAME_RE = re.compile(
+    r"(?<![A-Za-z0-9_])([a-z][a-z0-9]*(?:_[a-z0-9]+)+)(?![A-Za-z0-9_])")
+
+# Utterances spanning every routing shape the suite above cares about, plus the
+# four regression classes fixed in the week before this change (webcam health,
+# GPU temperature, microphone identity, browser-agent flagships).
+_SPLIT_CORPUS = [
+    "what time is it", "play some music", "mute the music",
+    "how hot is my graphics card", "are both webcams ok",
+    "what microphone are you using", "find me the cheapest 2tb nvme",
+    "book me a haircut friday afternoon", "is the workshop hud showing",
+    "set a timer for ten minutes", "how's the printer doing",
+    "open chrome on the left monitor", "restart yourself", "shut down",
+    "turn on the lights", "read me my unread email", "what version are you",
+    "who am i", "run diagnostics", "back up your memory", "test the mic",
+    "remind me to call mom at six", "what's the weather going to be",
+    "start recording in obs", "how many people are in the room",
+    "what's on my screen", "check the network", "tell me the news",
+]
+
+
+class CacheStableSplitTests(unittest.TestCase):
+    def test_stable_block_is_byte_identical_regardless_of_turn(self):
+        """The entire point: if this ever varies, the prefix cache dies and the
+        ~2.9 s full prompt re-evaluation comes straight back."""
+        first = pr.stable_pc_block(FULL)
+        for u in _SPLIT_CORPUS:
+            pr.turn_pc_block(u, FULL)          # must not mutate shared state
+            self.assertEqual(pr.stable_pc_block(FULL), first,
+                             f"stable_pc_block changed after {u!r}")
+
+    def test_stable_block_keeps_the_action_grammar_and_safety_rules(self):
+        stable = pr.stable_pc_block(FULL)
+        self.assertIn("[ACTION:", stable,
+                      "the action grammar lives in the core preamble and must "
+                      "stay in the always-cached half")
+        # Single-sourced safety trailer — same anchor SafetyTrailerRegression
+        # Tests uses, so a reworded rule fails in one place, not two.
+        self.assertIn(prompts.PC_CONTROL_SAFETY_RULES.strip()[:60], stable)
+
+    def test_index_names_every_section(self):
+        stable = pr.stable_pc_block(FULL)
+        _core, sections = pr.split_pc_control(FULL)
+        missing = [h.strip() for h, _b in sections if h.strip() not in stable]
+        self.assertEqual(missing, [],
+                         "every capability must stay named in the always-"
+                         "shipped index, or the model stops knowing it exists")
+
+    def test_split_loses_no_action_name_slimming_would_have_shipped(self):
+        """THE ratchet FOR THE PRIMARY TURN. For every utterance, stable+turn
+        must be a content SUPERSET of slim_pc_control — position may change,
+        coverage may not.
+
+        Scope is load-bearing, not pedantry: this models the message pair
+        _call_llm builds and says nothing about the other two call sites. See
+        the ⚠ SCOPE note above and FollowupRoundIsRatchetedElsewhereTests."""
+        stable = pr.stable_pc_block(FULL)
+        losses = []
+        for u in _SPLIT_CORPUS:
+            slim = pr.slim_pc_control(u, FULL)
+            combined = stable + "\n" + pr.turn_pc_block(u, FULL)
+            missing = (set(_ACTION_NAME_RE.findall(slim))
+                       - set(_ACTION_NAME_RE.findall(combined)))
+            if missing:
+                losses.append(f"{u!r} loses {sorted(missing)[:8]}")
+        self.assertEqual(losses, [],
+                         "the cache-stable split must never ship the local "
+                         "model LESS than slim_pc_control did:\n  "
+                         + "\n  ".join(losses))
+
+    def test_always_sections_are_hoisted_and_not_duplicated(self):
+        """_ALWAYS sections are in every selection, so they belong in the
+        stable half — and must then NOT also be in the volatile tail, or every
+        turn pays for them twice."""
+        _core, sections = pr.split_pc_control(FULL)
+        always_bodies = [b for h, b in sections
+                         if h.strip().upper() in pr._ALWAYS]
+        self.assertTrue(always_bodies, "no _ALWAYS section parsed — this test "
+                                       "would pass blind")
+        stable = pr.stable_pc_block(FULL)
+        for body in always_bodies:
+            probe = body.strip().split("\n")[0]
+            self.assertIn(probe, stable)
+            for u in _SPLIT_CORPUS:
+                self.assertNotIn(probe, pr.turn_pc_block(u, FULL),
+                                 f"{probe!r} shipped twice on {u!r}")
+
+    def test_turn_block_is_much_smaller_than_the_slim_prompt(self):
+        """It rides in the uncached tail, so its size is the thing that decides
+        whether the NEXT turn hits the prefix cache."""
+        for u in _SPLIT_CORPUS:
+            self.assertLess(len(pr.turn_pc_block(u, FULL)),
+                            len(pr.slim_pc_control(u, FULL)))
+
+    def test_never_raises_on_garbage(self):
+        for bad in ("", "no headers here at all", None):
+            try:
+                pr.stable_pc_block(bad if bad is not None else "")
+                pr.turn_pc_block("hello", bad if bad is not None else "")
+            except Exception as e:            # pragma: no cover - guard
+                self.fail(f"raised on {bad!r}: {e}")
+
+
+class FollowupRoundIsRatchetedElsewhereTests(unittest.TestCase):
+    """Keep the ⚠ SCOPE note above TRUE.
+
+    The ratchet in CacheStableSplitTests models the primary turn only, and that
+    narrowness is exactly what let the follow-up round regress to 11/135 action
+    names while the suite sat at 65/65 green. Re-deriving prompt strings in
+    this file cannot fix that: `stable + turn_pc_block(u)` is the same
+    expression for every round, so a content assertion here is a tautology and
+    would pass just as happily with the follow-up unwired. Only driving the
+    real function catches a WIRING regression.
+
+    So this class asserts the two things that ARE checkable from here:
+      1. the premise — the stable half alone is NOT a usable action reference,
+         which is WHY a call site that ships only the stable half is broken;
+      2. the coverage — a guard that drives the real get_followup_response
+         still exists, and the runtime still carries a turn context into it.
+    Both are cheap; neither imports the monolith, so this file stays runnable
+    on the light-deps CI tier.
+    """
+
+    #: The companion guard. Named here so deleting it fails loudly rather than
+    #: silently restoring the exact blind spot this file's SCOPE note denies.
+    FOLLOWUP_GUARD = "test_followup_turn_context.py"
+
+    def test_the_stable_half_alone_is_not_a_usable_action_reference(self):
+        """The premise of the whole follow-up fix, pinned.
+
+        If a refactor ever makes stable_pc_block self-sufficient this goes red
+        — which is GOOD NEWS, not a failure: it means the follow-up's carried
+        bodies stopped being load-bearing and the guard can be simplified. It
+        must be a deliberate decision, not a silent drift, because the
+        opposite drift is what shipped [ACTION: mute_volume] to a dispatcher
+        that has no such action.
+        """
+        stable_names = set(_ACTION_NAME_RE.findall(pr.stable_pc_block(FULL)))
+        carried = set()
+        for u in _SPLIT_CORPUS:
+            carried |= set(_ACTION_NAME_RE.findall(pr.turn_pc_block(u, FULL)))
+        carried -= stable_names
+        # Measured 2026-09-06: 10 in the stable half, 263 only in the bodies.
+        self.assertLess(len(stable_names), 40,
+                        "stable_pc_block now names a lot of actions on its "
+                        "own — re-check whether the follow-up round still "
+                        "needs turn_pc_block carried into it")
+        self.assertGreaterEqual(
+            len(carried), 5 * max(1, len(stable_names)),
+            f"only {len(carried)} action names live exclusively in the turn "
+            f"bodies vs {len(stable_names)} in the stable half; the premise "
+            "of the follow-up fix (bodies carry the vocabulary) has changed")
+
+    def test_a_guard_drives_the_real_get_followup_response(self):
+        """Source-scan, no import: the companion file must exist and must
+        actually CALL get_followup_response while intercepting the last hop
+        before the model. A guard that only re-derived strings would have
+        stayed green through the regression, so 'a file exists' is not
+        enough — it has to drive the function and inspect what it hands over."""
+        path = os.path.join(_PROJECT, "tests", self.FOLLOWUP_GUARD)
+        self.assertTrue(
+            os.path.isfile(path),
+            f"{self.FOLLOWUP_GUARD} is gone. The ⚠ SCOPE note in this file "
+            "says the follow-up call site is ratcheted THERE; without it "
+            "nothing covers it and this file's ratchet silently over-claims "
+            "again. Restore it or move the coverage and update the note.")
+        with open(path, "r", encoding="utf-8") as f:
+            guard = f.read()
+        for probe, why in (
+            ("get_followup_response(", "must call the real follow-up entry "
+                                       "point, not a re-derived copy"),
+            ("_local_then_cloud_or_honest", "must intercept the last hop "
+                                            "before the model, so what it "
+                                            "asserts on is what the model "
+                                            "actually sees"),
+        ):
+            self.assertIn(probe, guard,
+                          f"{self.FOLLOWUP_GUARD} no longer contains {probe!r} "
+                          f"— it {why}")
+
+    def test_the_followup_call_site_still_carries_a_turn_context(self):
+        """The runtime half of the same claim.
+
+        get_followup_response reuses the primary turn's system prompt, which
+        has no PC_CONTROL_PROMPT in it — so _call_local_llm's cheatsheet swap
+        cannot fire and the ONLY remaining source of action names is a turn
+        context. If that branch ever stops passing one, the round is back to
+        the index alone."""
+        path = os.path.join(_PROJECT, "bobert_companion.py")
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+        start = src.index("def get_followup_response")
+        end = src.index("\ndef ", start)
+        # CODE ONLY. Probing the raw body was this guard's own first draft and
+        # it was toothless: get_followup_response *explains* the mechanism in a
+        # comment ("See _last_turn_pc_block."), so deleting the actual carry
+        # left the probe green. Strip comments before matching — the whole
+        # point of this file's SCOPE note is that a guard which passes for the
+        # wrong reason is worse than no guard.
+        body = "\n".join(line.split("#", 1)[0]
+                         for line in src[start:end].split("\n"))
+        self.assertIn("_with_turn_context(", body,
+                      "get_followup_response no longer sends a turn context "
+                      "at all — the follow-up round is back to whatever the "
+                      "reused system prompt happens to carry")
+        self.assertIn("_last_turn_pc_block[0]", body,
+                      "get_followup_response stopped carrying the primary "
+                      "turn's turn_pc_block() bodies (_last_turn_pc_block). "
+                      "That is the regression that took the follow-up round "
+                      "from 135/135 action names to 11/135. If the slot was "
+                      "renamed, update this probe; if the mechanism changed, "
+                      "prove the new one in " + self.FOLLOWUP_GUARD)

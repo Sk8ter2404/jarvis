@@ -109,6 +109,9 @@ SELF_DIAG_DEDUP_MIN_GAP_S = 240       # skip if <4 min since last run
 
 CRASH_POLL_INTERVAL_S = 30
 CRASH_FAULTING_APP_RE = re.compile(r"python(w)?\.exe", re.IGNORECASE)
+# Windows EVENTLOGRECORD.RecordNumber is a DWORD, so no genuine record id can
+# ever exceed this. Any persisted cursor above it is corrupt, not a baseline.
+CRASH_MAX_RECORD_ID = 0xFFFFFFFF
 
 DEEP_AUDIT_BATCH_SIZE = 10
 DEEP_AUDIT_AGGRESSIVE_GAP_S = 3600    # 1h: aggressive mtime-triggered fallback
@@ -524,6 +527,24 @@ def _crash_watch_loop() -> None:
                     return
                 continue
             last_seen = int(state.get("crash_watch", {}).get("last_seen_record_id", 0))
+            # Clamp an out-of-range cursor back to "unseeded" so the re-seed path
+            # below repairs it. This is the OTHER half of the v1.79.0 blindness fix:
+            # that change stopped _scan_event_log_for_crashes from RETURNING 10**12,
+            # but nothing migrated the 10**12 an earlier build had already persisted,
+            # and the `new_head > last_seen` gate below is precisely what blocks
+            # self-repair — a real DWORD head (~51k) is never > 10**12, so the
+            # poisoned value is overwritten by nothing and the watcher stays blind
+            # forever while still ticking alive_ts. Do NOT relax that gate instead:
+            # it is the monotonicity guard that stops a transient short read from
+            # rewinding the cursor and replaying history. Values <= 0 are folded in
+            # here too: a negative cursor is truthy, so the baseline filter
+            # (`rec_id <= last_record_id`) would never fire and every historical
+            # APPCRASH in the window would queue as new.
+            if not 0 < last_seen <= CRASH_MAX_RECORD_ID:
+                if last_seen:
+                    print("  [diag-daemons] crash watcher cursor out of range "
+                          f"({last_seen}); discarding and re-seeding baseline")
+                last_seen = 0
             # last_seen == 0 means we have never successfully seeded a baseline:
             # first run, or a prior seed hit a transient Event Log error / empty
             # read and returned head 0. RE-SEED here — capture the current head to

@@ -106,6 +106,26 @@ def _read_lock_pid(path, max_retries=10, retry_delay=0.05):
 _SINGLETON_HELD_FD = None
 
 
+def _singleton_lock_dir() -> str:
+    """Directory holding jarvis.lock / jarvis.singleton.lock / the boot-error
+    marker.
+
+    Honours ``JARVIS_LOCK_DIR`` — the third sibling of JARVIS_SETTINGS_PATH and
+    JARVIS_DATA_DIR (see tools/run_tests.py), set by every suite runner and
+    inherited by the subprocesses they spawn, so a test run can never write the
+    owner's live lock. Unset at a real boot → the repo root, unchanged.
+
+    ONE resolver on purpose. The lock path is resolved in two places — the
+    early-boot claim below and _LOCK_FILE (the main() re-check + the
+    "lock file missing after _enforce_singleton" fast-fail) — and this
+    codebase's signature bug is the same rule fixed in one copy while the other
+    rots. Split here, a redirected boot would write the lock to the temp dir,
+    then fail the root-path existence check and sys.exit(1).
+    """
+    return ((os.environ.get("JARVIS_LOCK_DIR") or "").strip()
+            or os.path.dirname(os.path.abspath(__file__)))
+
+
 def _acquire_os_singleton_lock(fd) -> bool:
     """Non-blocking exclusive OS lock on byte 0 of the dedicated mutex file.
 
@@ -114,23 +134,42 @@ def _acquire_os_singleton_lock(fd) -> bool:
     problem we fail OPEN (return True) — a possible duplicate is less bad than
     refusing to start at all when the locking machinery is simply missing.
     """
+    # Dispatch on the locking module we can actually IMPORT, never on
+    # sys.platform. msvcrt exists only on Windows and fcntl only on POSIX, so
+    # the probe is unambiguous — and unlike a platform string it cannot be
+    # faked. tools/run_tests_ci_sim.py sets sys.platform = "linux" to reproduce
+    # the Linux CI runner; the old branch then took the POSIX arm, `import
+    # fcntl` raised ModuleNotFoundError (which is NOT an OSError, so the inner
+    # handler missed it), and the fail-open below turned a REFUSAL into a
+    # successful claim. The runner then wrote its own PID over the live
+    # jarvis.lock while JARVIS held the mutex — reproduced 2026-09-06, PID
+    # 101264 over live 105488. msvcrt is not in that runner's _WIN_ONLY block
+    # list, so the probe still resolves correctly under the sim.
     try:
-        if sys.platform == "win32":
+        try:
             import msvcrt
+        except ImportError:  # pragma: no cover - POSIX host (this box is win32)
+            msvcrt = None
+        if msvcrt is not None:
             try:
                 os.lseek(fd, 0, os.SEEK_SET)
                 msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # non-blocking exclusive
                 return True
             except OSError:
                 return False
-        else:  # pragma: no cover - POSIX fcntl lock branch (unreachable on the win32 test/runtime host)
-            import fcntl
-            try:
-                fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 0)
-                return True
-            except OSError:
-                return False
+        import fcntl  # pragma: no cover - POSIX fcntl lock branch (unreachable on the win32 test/runtime host)
+        try:  # pragma: no cover - POSIX fcntl lock branch
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 0)
+            return True
+        except OSError:
+            return False
     except Exception:
+        # Neither locking module is available — a genuinely lock-less platform.
+        # FAIL OPEN: see the docstring. NOTE (2026-09-06): this arm is why a
+        # mis-routed call could claim the singleton, and the caller writes
+        # jarvis.lock on a True return without knowing the claim was never
+        # verified. The routing hole above is closed; whether an UNVERIFIED
+        # claim should still be allowed to stamp the PID file is an open call.
         return True
 
 
@@ -169,16 +208,16 @@ def _early_boot_singleton_lock():  # pragma: no cover - boot entry: real OS byte
     lock_name = "jarvis_staging.lock" if is_staging else "jarvis.lock"
     mutex_name = ("jarvis_staging.singleton.lock" if is_staging
                   else "jarvis.singleton.lock")
-    root_dir = os.path.dirname(os.path.abspath(__file__))
-    lock_path = os.path.join(root_dir, lock_name)
-    mutex_path = os.path.join(root_dir, mutex_name)
+    lock_dir = _singleton_lock_dir()
+    lock_path = os.path.join(lock_dir, lock_name)
+    mutex_path = os.path.join(lock_dir, mutex_name)
     # Side-channel marker: detached pythonw.exe has no parent console, so
     # stderr alone won't reach the boot script. Drop a small file the
     # stability smoke test can read when the lock never materialises, so
     # 'jarvis.lock never appeared' becomes an actionable cause.
     boot_err_name = ("jarvis_staging_boot_error.txt" if is_staging
                      else "jarvis_boot_error.txt")
-    boot_err_path = os.path.join(root_dir, boot_err_name)
+    boot_err_path = os.path.join(lock_dir, boot_err_name)
     try:
         if os.path.exists(boot_err_path):
             os.remove(boot_err_path)
@@ -302,15 +341,38 @@ def _early_boot_singleton_lock():  # pragma: no cover - boot entry: real OS byte
         pass
     return True
 
-try:  # pragma: no cover - boot-entry call wrapper (lock fast-fail / lockless-fallback paths run only at real boot)
-    _early_boot_singleton_lock()
-except SystemExit:  # pragma: no cover - boot lock fast-fail propagation (real boot only)
-    # Lock-write fast-fail above — propagate so we exit immediately.
-    raise
-except Exception as _ebse:  # pragma: no cover - boot lockless-fallback on unexpected early-lock error (real boot only)
-    # Never let the early-boot check raise on UNEXPECTED errors — better to
-    # proceed lock-less than to crash silently before the session log is open.
-    print(f"  [early-singleton] check failed, proceeding without lock: {_ebse}")
+# ── BOOT ENTRY ONLY — never on a plain import ─────────────────────────────
+# Gated on __main__ because this function WRITES jarvis.lock, and jarvis.lock is
+# the file every other tool trusts to name the live JARVIS. Ungated, it ran on
+# every `import bobert_companion` — including the lazy
+# importlib.import_module("bobert_companion") that core/actions.py,
+# core/orchestrator.py and ~40 skills' _bc() helpers do — so ANY process that
+# merely touched one of those paths became a lock writer.
+#
+# That is not theoretical. tools/run_tests_ci_sim.py fakes sys.platform =
+# "linux" (line 167) to reproduce the Linux CI runner; _acquire_os_singleton_lock
+# then takes its POSIX arm, `import fcntl` raises ModuleNotFoundError (no fcntl
+# on Windows), that is NOT an OSError so it escapes the inner handler into the
+# fail-open `except Exception: return True`, and the runner believes it owns a
+# mutex the live JARVIS is holding. Observed 2026-09-05 (a run stamped PID
+# 108124 over the live 82540, and tools/audit_codebase.py then read the stale
+# value); reproduced 2026-09-06 — PID 101264 (`python tools/run_tests_ci_sim.py`)
+# wrote itself into the live jarvis.lock while JARVIS 105488 held the mutex.
+#
+# JARVIS is only ever launched as a script (tools/bounce_jarvis.py,
+# _boot_jarvis.ps1, core/actions._act_restart), so __main__ holds for every real
+# boot. The call still sits at the top of the file, so the boot watchdog still
+# sees jarvis.lock within milliseconds — before the heavy imports, as designed.
+if __name__ == "__main__":
+    try:  # pragma: no cover - boot-entry call wrapper (lock fast-fail / lockless-fallback paths run only at real boot)
+        _early_boot_singleton_lock()
+    except SystemExit:  # pragma: no cover - boot lock fast-fail propagation (real boot only)
+        # Lock-write fast-fail above — propagate so we exit immediately.
+        raise
+    except Exception as _ebse:  # pragma: no cover - boot lockless-fallback on unexpected early-lock error (real boot only)
+        # Never let the early-boot check raise on UNEXPECTED errors — better to
+        # proceed lock-less than to crash silently before the session log is open.
+        print(f"  [early-singleton] check failed, proceeding without lock: {_ebse}")
 
 import asyncio, hashlib, io, json, logging, math, queue, random, re, tempfile, threading, time, traceback
 import warnings as _warnings
@@ -1371,6 +1433,91 @@ from core.prompts import PC_CONTROL_PROMPT, PC_CONTROL_SAFETY_RULES  # noqa: F40
 # JARVIS_DYNAMIC_LOCAL_PROMPT=0 to force the legacy full-prompt path.
 _DYNAMIC_LOCAL_PROMPT = (os.environ.get("JARVIS_DYNAMIC_LOCAL_PROMPT", "1")
                          .strip().lower() not in ("0", "false", "no", "off"))
+
+# CACHE-STABLE LOCAL PREFIX (2026-09-06 latency work). _DYNAMIC_LOCAL_PROMPT
+# above fixed CONTENT — the right instructions reach a 16k window. This flag
+# fixes POSITION, which turned out to be 40 % of speak-to-speak latency.
+#
+# The slimmed PC block is spliced into the MIDDLE of the system prompt, so its
+# per-turn churn moves the divergence point ~6,800 tokens back from the end.
+# The local brain is a sliding-window model: llama.cpp can only reuse a prefix
+# when the divergence sits inside a 2048-cell SWA "context checkpoint", i.e.
+# within ~1024 tokens of the end of the previous prompt. Past that it logs
+#   "forcing full prompt re-processing due to lack of cache data (…SWA…)"
+# and re-evaluates all ~12.7k tokens at ~4,200 tok/s — ~2.9 s, every turn.
+# MEASURED on this box at production prompt size (scratchpad e1_distance.py):
+#   divergence 53 tok from the end → 68 ms · 535 tok → 168 ms · 1070 tok →
+#   2506 ms · 10,695 tok → 2536 ms · pure append → 30 ms.
+#
+# With the flag on, the system prompt is byte-identical every turn and the
+# per-turn material (selected PC sections, tone/emotion/mood/LTM addenda) rides
+# at the head of the FINAL user message instead — after everything cached.
+# Nothing is dropped: prompt_router.stable_pc_block() + turn_pc_block() is a
+# strict content SUPERSET of slim_pc_control() (asserted per-utterance by
+# tests/test_prompt_router.py::CacheStableSplitTests).
+# LOCAL ROUTE ONLY — Claude has its own cache-breakpoint design
+# (_cached_system_param) and is untouched. Set JARVIS_STABLE_LOCAL_PREFIX=0 for
+# the legacy layout.
+_STABLE_LOCAL_PREFIX = (os.environ.get("JARVIS_STABLE_LOCAL_PREFIX", "1")
+                        .strip().lower() not in ("0", "false", "no", "off"))
+
+# Wrapper for the per-turn material that now rides with the user's message.
+# Explicitly framed so the model never mistakes reference text for something
+# the owner said — the user's own words are appended AFTER this block.
+_TURN_CTX_OPEN = ("[TURN CONTEXT — reference material selected for this turn. "
+                  "It is NOT something the user said; do not answer it, "
+                  "quote it, or mention it.]\n")
+_TURN_CTX_CLOSE = "\n[END TURN CONTEXT]\n\n"
+
+
+# The exact system prompt this turn's primary LLM call used, when the
+# cache-stable layout is active ('' otherwise). get_followup_response reuses it
+# so an action chain is a pure APPEND onto the sequence the runner already
+# holds. Single-element list = the GIL-atomic cross-thread slot idiom used
+# throughout this file.
+_last_stable_sys_prompt = [""]
+
+# This turn's turn_pc_block() bodies — the section text the cache-stable split
+# moved OUT of the system prompt and onto the user message ('' when the split
+# is off, or when the turn implicated nothing beyond the always-on sections).
+#
+# WHY THIS SLOT EXISTS (2026-09-06 review of the unverified latency work):
+# get_followup_response reuses _last_stable_sys_prompt, whose PC_CONTROL_PROMPT
+# has already been replaced by stable_pc_block. _call_local_llm's cheatsheet
+# swap is gated on `PC_CONTROL_PROMPT in sys_prompt`, so it no longer fires
+# either — and the bodies never enter conversation_history (_with_turn_context
+# copies). MEASURED: registered action names visible to a follow-up round fell
+# from 135/135 (legacy: full _local_cheatsheet) to 11/135 (the always-on
+# section + the index of bare NAMES). "…and then mute the volume" put
+# volume_mute nowhere in the follow-up's context and the model invented
+# [ACTION: mute_volume], which dispatches to nothing while JARVIS says it
+# muted the volume. Carrying the SAME bodies the primary turn saw restores the
+# chain's own vocabulary without touching the cached prefix (this rides in the
+# volatile tail, after the divergence point the follow-up already has).
+_last_turn_pc_block = [""]
+
+
+def _with_turn_context(messages: list, turn_ctx: str) -> list:
+    """Return `messages` with `turn_ctx` prepended to the LAST user message.
+
+    A copy — `conversation_history` itself must stay clean, or the reference
+    block would be replayed as history next turn (and would then sit in the
+    cached prefix, which is the whole thing this avoids). Degrades to the
+    original list when there is nothing to add or no trailing user message."""
+    if not turn_ctx:
+        return messages
+    try:
+        out = list(messages)
+        for i in range(len(out) - 1, -1, -1):
+            m = out[i]
+            if isinstance(m, dict) and m.get("role") == "user":
+                out[i] = dict(m)
+                out[i]["content"] = (_TURN_CTX_OPEN + turn_ctx
+                                     + _TURN_CTX_CLOSE + (m.get("content") or ""))
+                return out
+        return messages
+    except Exception:
+        return messages
 
 # Phase 4A refactor (2026-05-29): 11 simple _act_* handlers (open_url,
 # web_search, youtube, get_time, screenshot, media_next/prev/playpause,
@@ -11531,7 +11678,265 @@ def get_response_with_animation(user_text: str) -> str:
 #  AUDIO RECORDING  (energy-based VAD)
 # ──────────────────────────────────────────────────────────────────────────
 
+
+# ── TEMPORARY PERF PROBE (2026-09-06 latency work) ───────────────────────
+import time as _prof_time
+_PROF_ON = bool(os.environ.get("JARVIS_PERF_PROBE"))
+_PROF_PATH = os.environ.get("JARVIS_PERF_PROBE",
+                            "") or "perf_probe.tsv"
+_prof_lock = threading.Lock()
+
+
+def _prof(tag, extra=""):
+    if not _PROF_ON:
+        return
+    try:
+        with _prof_lock:
+            with open(_PROF_PATH, "a", encoding="utf-8") as f:
+                f.write(f"{_prof_time.perf_counter():.6f}\t{tag}\t"
+                        f"{threading.get_ident()}\t{extra}\n")
+    except Exception:
+        pass
+# ── END TEMPORARY PERF PROBE ─────────────────────────────────────────────
+
+
+def _prof_ollama(r):
+    """Ollama's own per-request timings, for the probe TSV."""
+    try:
+        j = r.json()
+        return (f"total={j.get('total_duration',0)/1e6:.1f} "
+                f"load={j.get('load_duration',0)/1e6:.1f} "
+                f"peval={j.get('prompt_eval_duration',0)/1e6:.1f} "
+                f"ptok={j.get('prompt_eval_count',0)} "
+                f"eval={j.get('eval_duration',0)/1e6:.1f} "
+                f"etok={j.get('eval_count',0)}")
+    except Exception:
+        return "unparsed"
+
 _last_recording_peak = 0.0   # set by record_speech, read by callers
+
+# ── SPECULATIVE TRANSCRIPTION (2026-09-06 latency work) ───────────────────
+#
+# Every spoken turn pays SILENCE_SECS (1.4 s) of pure dead air before ANY work
+# starts — int(1.4 * 16000 / 1024) = 21 chunks the loop below must count out
+# after the owner's last voiced frame. Measured at 1,340 ms p50, 16 % of
+# speak-to-speak latency, spent doing nothing. Whisper then costs another
+# 1,427 ms p50 on top of it.
+#
+# Those two are strictly sequential today and need not be. Once ~0.45 s of
+# silence has passed, the utterance is very probably finished: snapshot it and
+# start transcribing in the background while the loop keeps counting. If the
+# owner does resume, the snapshot is discarded and a fresh one is taken at the
+# next pause; if he does not, the transcript is ready (or nearly) the moment
+# the hangover expires.
+#
+# WHY THIS IS NOT A CORRECTNESS TRADE. The snapshot is only ever accepted when
+# NO voiced frame arrived after it — enforced by _spec_stt["chunks"] being
+# invalidated in the rms > VAD_THRESHOLD branch, not by a timing guess. So the
+# accepted audio differs from the full buffer by trailing SILENCE ONLY, and
+# faster-whisper's Silero VAD filter drops that silence before decoding either
+# way. tests/test_speculative_stt.py pins the invalidation rule; the
+# transcript-identity claim was measured on real recordings (see the module
+# docstring of scratchpad e5_spec_stt.py in the 2026-09-06 latency work).
+#
+# DEFAULT OFF as of 2026-09-06 adversarial review. The invariant above is
+# sound and could not be broken -- no frame above VAD_THRESHOLD ever arrived
+# after an accepted snapshot -- but it is the WRONG invariant. VAD_THRESHOLD
+# (raw RMS 0.008) is an ENDPOINT gate, not a speech detector, and it is far
+# coarser than what Whisper can read once _process_capture_chunk's AGC and
+# apply_capture_auto_gain (up to 10x) have run. This machine's own logs
+# (n=465 real captures) put the median WHOLE-UTTERANCE peak at 0.0087 and p75
+# at 0.0098 -- i.e. almost every chunk of a normal sentence sits BELOW the
+# gate, which is exactly what the 1.4 s hangover exists to carry. Snapshotting
+# at 0.45 s therefore discards real speech that the full buffer transcribes
+# correctly. Measured end-to-end through this loop with the prod model:
+#   full buffer -> 'Turn off the lights in the kitchen.'
+#   snapshot    -> 'Turn off the light.'          (peak 0.0083, p25)
+#   snapshot    -> 'Turn off the lights in the'   (peak 0.0087, p50)
+# A wrong command executed silently is worse than a slow one. Re-enable only
+# once the snapshot gate is at least as sensitive as the decoder -- e.g. trip
+# on the CAPTURE_AUTO_GAIN_NOISE_FLOOR (0.005) or on a fraction of peak_rms,
+# not on VAD_THRESHOLD.
+# Set JARVIS_SPECULATIVE_STT=1 to re-enable; the default now transcribes
+# exactly as before the 2026-09-06 latency work.
+_SPECULATIVE_STT = (os.environ.get("JARVIS_SPECULATIVE_STT", "0")
+                    .strip().lower() not in ("0", "false", "no", "off"))
+# How much silence to see before betting the utterance is over. Below ~0.35 s
+# ordinary stop-consonants and mid-sentence breaths trip it (wasted GPU, never
+# a wrong transcript); above ~0.6 s there is too little hangover left to hide
+# Whisper behind.
+_SPEC_STT_SILENCE_SECS = float(os.environ.get("JARVIS_SPECULATIVE_STT_SECS",
+                                              "0.45"))
+# Shortest snapshot worth decoding — below this the callers reject the capture
+# anyway (`len(audio) < SAMPLE_RATE * 0.4`).
+_SPEC_STT_MIN_SECS = 0.4
+# How long _transcribe_capture waits on an in-flight speculative decode before
+# it starts SAYING so. This is not a latency bound and must not be described as
+# one — see the proof in _transcribe_capture. _HARD is the last-resort valve for
+# a worker that is wedged rather than merely slow.
+_SPEC_STT_WAIT = float(os.environ.get("JARVIS_SPECULATIVE_STT_WAIT", "8"))
+_SPEC_STT_HARD_WAIT = float(os.environ.get("JARVIS_SPECULATIVE_STT_HARD_WAIT",
+                                           "20"))
+
+# The in-flight speculative decode. Written only by record_speech (mic thread)
+# and read by the capture callers on the same thread, so the dict needs no lock
+# of its own; `thread`/`result` are touched by the worker, which is why result
+# is written exactly once, last.
+_spec_stt: dict = {
+    "token": 0,        # bumped per capture; a stale worker's result is ignored
+    "gen": 0,          # bumped the moment the in-flight snapshot stops being
+                       # this utterance (a voiced frame, or the next capture).
+                       # The worker re-checks it on the far side of _stt_lock
+                       # and abandons the decode — see _spec_stt_note_voiced.
+    "chunks": -1,      # snapshot length in chunks, or -1 once invalidated
+    "thread": None,
+    "result": None,    # (text, conf) once the worker finishes
+}
+
+
+def _spec_stt_reset() -> None:
+    """Start a new capture: nothing from the previous one may be reused."""
+    _spec_stt["token"] += 1
+    # Bumping the token already stops a late worker WRITING its result; bumping
+    # gen also stops it DOING the work. An orphan's decode is unusable by
+    # definition, and every second it spends holding _stt_lock is stolen from
+    # the capture that just started.
+    _spec_stt["gen"] += 1
+    _spec_stt["chunks"] = -1
+    _spec_stt["thread"] = None
+    _spec_stt["result"] = None
+
+
+def _spec_stt_note_voiced() -> None:
+    """A voiced frame arrived — any pending snapshot is no longer a complete
+    prefix of this utterance, so it must never be accepted.
+
+    THIS is the correctness guarantee, and it is a fact about what was heard,
+    not a timing guess: a snapshot survives only when literally no frame above
+    VAD_THRESHOLD followed it.
+
+    CANCELLING the decode as well (2026-09-06 review) is a LATENCY guarantee,
+    and it was missing: setting chunks = -1 stopped the prefix being spoken but
+    nothing told the worker, which ran on holding _stt_lock for a full pass.
+    _transcribe_capture skips its join entirely once chunks < 0, so the real
+    end-of-capture decode went straight to transcribe() and blocked on that
+    same lock — the mid-sentence-pause turn paid for TWO Whisper passes and
+    waited out the useless one. Measured on the helpers here: one turn, decodes
+    of [16000, 32000] samples where only the 32000 is wanted.
+
+    A decode already inside faster-whisper still cannot be interrupted — that
+    residual is unfixable without preemption, and is one of the standing
+    reasons _SPECULATIVE_STT ships off."""
+    if _spec_stt["chunks"] >= 0:
+        _spec_stt["chunks"] = -1
+        _spec_stt["gen"] += 1
+
+
+def _spec_stt_should_snapshot(silence_n: int, spec_at: int, n_chunks: int,
+                              spec_min_chunks: int) -> bool:
+    """Take a speculative snapshot on THIS chunk?  Exactly at the trip point
+    (so one snapshot per silence run), only with no snapshot already standing,
+    only with enough audio to be worth decoding, and only when no earlier
+    speculative decode is still running (bounding us to one at a time)."""
+    if not _SPECULATIVE_STT:
+        return False
+    if _spec_stt["chunks"] >= 0 or silence_n != spec_at:
+        return False
+    if n_chunks < spec_min_chunks:
+        return False
+    t = _spec_stt["thread"]
+    return t is None or not t.is_alive()
+
+
+def _spec_stt_start(snapshot, peak_rms: float, n_chunks: int) -> None:
+    """Transcribe `snapshot` on a daemon thread. Never raises into the mic
+    loop — a failure here just means the normal path does the work."""
+    token = _spec_stt["token"]
+    gen = _spec_stt["gen"]
+
+    def _worker():
+        res = None
+        try:
+            # CANCELLATION CHECK 1 — before any work. The owner can resume in
+            # the gap between t.start() and this line; under GIL contention
+            # with the audio callback that gap is real milliseconds.
+            if _spec_stt["gen"] != gen:
+                return
+            audio, _gain = apply_capture_auto_gain(snapshot, peak_rms)
+            # NEVER QUEUE on _stt_lock (2026-09-06 review). A speculative
+            # decode is a bet, and a bet that has to wait its turn has already
+            # lost: whoever holds the lock is mid-decode, and the voice thread's
+            # own fallback transcribe() would then sit behind BOTH of us — the
+            # feature would have ADDED latency to the turn it exists to shorten.
+            # If the model is busy, fold and let the normal path do the work.
+            # transcribe() is the blocking entry point, so take the lock
+            # ourselves and call _transcribe_impl, whose contract is exactly
+            # "_stt_lock held".
+            if _stt_lock.acquire(blocking=False):
+                try:
+                    # CANCELLATION CHECK 2 — on the far side of the lock, the
+                    # last instant before the model is committed. Winning the
+                    # lock is not the same as still being wanted.
+                    if _spec_stt["gen"] != gen:
+                        return
+                    res = _transcribe_impl(audio)
+                finally:
+                    _stt_lock.release()
+            elif _debug_mode[0]:
+                print("  [spec-stt] model busy — folding, no bet placed")
+        except Exception as _e:
+            print(f"  [spec-stt] speculative decode failed "
+                  f"({type(_e).__name__}: {_e}) — falling back")
+            res = None
+        if _spec_stt["token"] == token:
+            _spec_stt["result"] = res
+    try:
+        t = threading.Thread(target=_worker, daemon=True, name="spec-stt")
+        _spec_stt["chunks"] = n_chunks
+        _spec_stt["thread"] = t
+        t.start()
+    except Exception as _e:
+        # Thread exhaustion is a live hazard in this codebase — degrade, never
+        # raise into the capture loop.
+        print(f"  [spec-stt] could not start ({type(_e).__name__}: {_e})")
+        _spec_stt["chunks"] = -1
+        _spec_stt["thread"] = None
+
+
+def _transcribe_capture(audio):
+    """transcribe(`audio`), but collect the speculative decode instead when
+    this capture produced a valid one. Same (text, conf) return either way.
+
+    `audio` must already be auto-gained — the speculative worker applies the
+    same gain to its own snapshot from the same (final) peak RMS, so the two
+    paths feed faster-whisper identically-scaled samples."""
+    t = _spec_stt.get("thread")
+    if _SPECULATIVE_STT and t is not None and _spec_stt.get("chunks", -1) >= 0:
+        # This join is NOT a latency bound, and the comment here used to claim
+        # it was ("Bounded: a wedged decode must not hold the voice thread").
+        # It cannot be one, by construction: transcribe() below acquires
+        # _stt_lock, and a still-running worker is INSIDE that same lock. So
+        # abandoning the join does not free the voice thread — it queues a
+        # SECOND, redundant decode behind the very one we just gave up on, and
+        # we pay both. Measured on the real helpers with a 12 s stalled worker:
+        # 1,400 ms with the feature off vs 13,401 ms giving up at 8 s.
+        # Waiting for the decode already in flight is therefore never slower
+        # than giving up on it, and usually much faster.
+        t.join(timeout=_SPEC_STT_WAIT)
+        if t.is_alive():
+            print(f"  [spec-stt] decode still running after {_SPEC_STT_WAIT:.0f}s"
+                  f" — waiting for it rather than queueing a second decode"
+                  f" behind it on _stt_lock")
+            t.join(timeout=_SPEC_STT_HARD_WAIT)
+        res = _spec_stt.get("result")
+        # Re-check the snapshot rule: only trailing silence may separate the
+        # decoded audio from the final buffer.
+        if res is not None and _spec_stt.get("chunks", -1) >= 0:
+            if _debug_mode[0]:
+                print(f"  [spec-stt] used speculative transcript "
+                      f"({_spec_stt['chunks']} chunks)")
+            return res
+    return transcribe(audio)
 
 # Raw (pre auto-gain) audio + sample-rate of the most recent mic capture, stashed
 # by _capture_utterance so the background-audio gate can run voice-ID on it
@@ -12244,6 +12649,13 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
     CHUNK       = 1024
     PRE_BUFFER  = 12
     silence_lim = int(SILENCE_SECS * SAMPLE_RATE / CHUNK)
+    # Speculative-transcription trip point, clamped so it can never land on or
+    # past the real end-of-speech decision (a snapshot taken at silence_lim
+    # would buy nothing) and never before there is any silence at all.
+    spec_at = max(1, min(silence_lim - 1,
+                         int(_SPEC_STT_SILENCE_SECS * SAMPLE_RATE / CHUNK)))
+    spec_min_chunks = int(_SPEC_STT_MIN_SECS * SAMPLE_RATE / CHUNK)
+    _spec_stt_reset()
     pre_ring: list[np.ndarray] = []
     chunks:   list[np.ndarray] = []
     recording   = False
@@ -12455,6 +12867,12 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
                     set_state("listening")
                 chunks.append(processed.copy())
                 silence_n = 0
+                _prof("voiced")
+                # A voiced frame arrived AFTER a speculative snapshot, so that
+                # snapshot is no longer this utterance — invalidate it. This is
+                # the whole correctness guarantee: an accepted snapshot can
+                # only ever differ from the final buffer by trailing silence.
+                _spec_stt_note_voiced()
             else:
                 if not recording and rms > silent_peak:
                     silent_peak = rms
@@ -12464,7 +12882,19 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
                 if recording:
                     chunks.append(processed.copy())
                     silence_n += 1
+                    # Speculative transcription: bet the utterance is over and
+                    # hide Whisper inside the remaining hangover. Only one
+                    # decode in flight at a time (a resumed-then-paused
+                    # utterance would otherwise queue several on _stt_lock).
+                    if _spec_stt_should_snapshot(
+                            silence_n, spec_at, len(chunks), spec_min_chunks):
+                        _prof("spec_fire")
+                        _spec_stt["result"] = None
+                        _spec_stt_start(
+                            np.concatenate(chunks).flatten(),
+                            peak_rms, len(chunks))
                     if silence_n >= silence_lim:
+                        _prof("vad_break")
                         break
                 elif timeout is not None and (time.time() - start_time) >= timeout:
                     if _debug_mode[0]:
@@ -12511,6 +12941,7 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
     if _debug_mode[0]:
         print(f"  [vad] peak RMS={peak_rms:.4f}  threshold={VAD_THRESHOLD}  "
               f"ambient={silent_peak:.4f}")
+    _prof("rec_return")
     global _last_recording_peak
     _last_recording_peak = peak_rms
     if not chunks:
@@ -14390,12 +14821,22 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
             if "[ACTION: see_screen" in content:
                 last_see_idx = i
         if last_search_idx >= 0 and last_see_idx <= last_search_idx:
-            sys_prompt = (
+            _search_guard = (
                 "IMPORTANT: a web search was just fired but the results have "
                 "not been read. Do NOT fabricate or claim source attributions. "
                 "Acknowledge the search was opened in the browser and offer to "
                 "read the results via see_screen.\n\n"
-            ) + sys_prompt
+            )
+            if _STABLE_LOCAL_PREFIX:
+                # Under the cache-stable layout this must NOT go on the front
+                # of the system prompt: a per-turn prepend moves the divergence
+                # point to token 0 and costs a full ~2.9 s re-evaluation of the
+                # whole prompt (see _STABLE_LOCAL_PREFIX). The tail of the user
+                # message is both free and MORE salient, which is what the
+                # "IMPORTANT" was reaching for anyway.
+                messages = _with_turn_context(messages, _search_guard)
+            else:
+                sys_prompt = _search_guard + sys_prompt
     except Exception:
         pass
     # Reinforce the local-mode behaviour rules at the most-salient (final)
@@ -14446,9 +14887,11 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
         _think = _local_think_param(model_tag)
         if _think is not None:
             payload["think"] = _think
+        _prof("llm_post", f"sys={len(sys_prompt)}")
         try:
             r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat", json=payload,
                               timeout=_LOCAL_GENERATE_TIMEOUT)
+            _prof("llm_resp", _prof_ollama(r))
             if not r.ok:
                 print(f"  [local-llm] HTTP {r.status_code}: {r.text[:200]}")
                 return (None, "fail")
@@ -15711,8 +16154,33 @@ def _call_llm(user_text: str) -> str:
     # Cloud/Claude keeps the full prompt (200k ctx, no truncation). One string
     # replace on the cached _system_prompt — the BASE identity, rules, phrasebook
     # and memory around it are untouched. 2026-07-15.
+    _prof("prompt_start")
     _base_prompt = _system_prompt
-    if (_chat_route == "local" and _DYNAMIC_LOCAL_PROMPT
+    # Per-turn material that must NOT sit in the cached prefix on the local
+    # route. Empty string = legacy behaviour (everything in the system prompt).
+    _turn_ctx = ""
+    _stable_split = False
+    if (_chat_route == "local" and _DYNAMIC_LOCAL_PROMPT and _STABLE_LOCAL_PREFIX
+            and PC_CONTROL_PROMPT and PC_CONTROL_PROMPT in _system_prompt):
+        # CACHE-STABLE SPLIT — see _STABLE_LOCAL_PREFIX. The system prompt keeps
+        # the guard + PC core preamble (action grammar + safety rules) + an
+        # index of every capability, all byte-identical turn to turn; only the
+        # section BODIES this turn implicates move to the user message.
+        try:
+            from core import prompt_router as _pr
+            _stable_pc = (_LOCAL_NEVER_GUESS_GUARD + "\n"
+                          + _pr.stable_pc_block(PC_CONTROL_PROMPT))
+            _base_prompt = _system_prompt.replace(
+                PC_CONTROL_PROMPT, _stable_pc, 1)
+            _turn_ctx = _pr.turn_pc_block(user_text, PC_CONTROL_PROMPT)
+            _stable_split = True
+        except Exception as _pr_err:
+            print(f"  [prompt-router] stable split failed ({_pr_err}); "
+                  f"full prompt")
+            _base_prompt = _system_prompt
+            _turn_ctx = ""
+            _stable_split = False
+    elif (_chat_route == "local" and _DYNAMIC_LOCAL_PROMPT
             and PC_CONTROL_PROMPT and PC_CONTROL_PROMPT in _system_prompt):
         try:
             from core import prompt_router as _pr
@@ -15728,9 +16196,8 @@ def _call_llm(user_text: str) -> str:
             print(f"  [prompt-router] slim failed ({_pr_err}); full prompt")
             _base_prompt = _system_prompt
 
-    sys_prompt_now = (
-        _base_prompt
-        + _tone_system_addendum(tone)
+    _turn_addenda = (
+        _tone_system_addendum(tone)
         + route["addendum"]
         + emotion_addendum
         + mode_addendum
@@ -15741,12 +16208,39 @@ def _call_llm(user_text: str) -> str:
         + _ltm_context(user_text)
     )
 
+    if _stable_split:
+        # Cache-stable layout: the system prompt is byte-identical every turn,
+        # so EVERY per-turn addendum has to travel with the user message too —
+        # a 300-char tone hint spliced onto the system prompt costs exactly as
+        # much cache as a 6,800-token PC block does.
+        sys_prompt_now = _base_prompt
+        # Stash the BODIES alone (before the addenda are folded in, so the
+        # follow-up doesn't get the tone hint twice — it recomputes its own).
+        # See _last_turn_pc_block: without this the follow-up round loses the
+        # action reference entirely.
+        _last_turn_pc_block[0] = _turn_ctx
+        _turn_ctx = _turn_ctx + _turn_addenda
+    else:
+        sys_prompt_now = _base_prompt + _turn_addenda
+        _turn_ctx = ""
+        _last_turn_pc_block[0] = ""
+    # Remember the split so the follow-up round (get_followup_response) can
+    # re-use the very same cached system prompt instead of rebuilding a
+    # different one and paying a second full prompt evaluation. (It used to
+    # build from the FULL _system_prompt, which _call_local_llm then swapped
+    # for the 21k-char static cheatsheet — a completely different prefix, so
+    # every action chain paid a second ~3 s prompt eval AND left the next
+    # turn's prefix cold.)
+    _last_stable_sys_prompt[0] = sys_prompt_now if _stable_split else ""
+
+    _prof("prompt_end", f"sys={len(sys_prompt_now)} ctx={len(_turn_ctx)}")
     if _chat_route == "local":
         # LOCAL-routed turn: local model is primary. On local failure, fall
         # back to Claude if reachable, else speak an HONEST unavailability line
         # (SAC-specific when we have evidence) — never a fabricated answer and
         # never a silent freeze (the generate read-timeout trips the fallback).
-        reply = _local_then_cloud_or_honest(sys_prompt_now, conversation_history)
+        reply = _local_then_cloud_or_honest(
+            sys_prompt_now, _with_turn_context(conversation_history, _turn_ctx))
     elif AI_BACKEND == "claude":
         import anthropic
         try:
@@ -15886,6 +16380,7 @@ def _call_llm(user_text: str) -> str:
     else:
         reply = "AI backend not configured. Check AI_BACKEND in the script."
 
+    _prof("reply_ready", reply[:40].replace("\t", " "))
     conversation_history.append({"role": "assistant", "content": reply})
     _ltm_enqueue("assistant", reply)
 
@@ -17050,6 +17545,7 @@ def play_with_lipsync(audio: np.ndarray, sr: int):
     # end of playback and set the event after that utterance's wait loop
     # exited) must not kill THIS utterance at its first chunk — start every
     # playback with a clean slate.
+    _prof("play_enter")
     _tts_interrupt.clear()
     out_dev = get_output_device()
 
@@ -17064,8 +17560,10 @@ def play_with_lipsync(audio: np.ndarray, sr: int):
         mid-playback endpoint change finishes the speech on the new endpoint
         instead of swallowing it. If the fallback also fails, re-raise so the
         outer handler logs it loudly rather than failing silent."""
+        _prof("sdplay_call")
         try:
             sd.play(audio, sr, device=out_dev)
+            _prof("sdplay_return")
         except sd.PortAudioError as e:
             # -9999 / endpoint vanished mid-open: drop to the live system default.
             print(f"  [speak] playback open failed on device {out_dev} ({e}); "
@@ -24817,12 +25315,15 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
         _mode_add = _mode_addendum()
     except Exception:
         pass
-    sys_prompt_now = (
-        _system_prompt
-        + _tone_system_addendum(_last_user_tone[0])
+    _followup_addenda = (
+        _tone_system_addendum(_last_user_tone[0])
         + _route.get("addendum", "")
         + _mode_add
     )
+    # LEGACY (full-prompt) layout — what every non-local branch below uses, and
+    # what _cached_system_param is built to split. The cache-stable layout is
+    # applied ONLY inside the local branch, deliberately; see below.
+    sys_prompt_now = _system_prompt + _followup_addenda
 
     # LOCAL-routed turn: keep the whole action chain on the same brain as the
     # primary turn. Mirror _call_llm's local-first idiom — when model_route
@@ -24830,18 +25331,68 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
     # or_honest) BEFORE the AI_BACKEND cloud branches, otherwise a local-only
     # deployment would silently punch out to the cloud on every follow-up round
     # and break the local route for the rest of the chain. 2026-07-08.
+    #
+    # Resolve the route FIRST (2026-09-06): the cache-stable layout below keys
+    # off it, so it can no longer be decided before we know where this round is
+    # actually going.
     try:
         from core.config import model_route
-        if model_route("chat") == "local":
-            return _local_then_cloud_or_honest(
-                sys_prompt_now,
-                list(conversation_history) + [{"role": "user", "content": extra}],
-                max_tokens=400,
-            )
+        _followup_route = model_route("chat")
     except Exception:
         # Route lookup failed — fall through to the existing backend branches
         # (same degrade-to-cloud posture the primary turn would take).
-        pass
+        _followup_route = ""
+
+    if _followup_route == "local":
+        # CACHE-STABLE LAYOUT (see _STABLE_LOCAL_PREFIX): reuse the EXACT system
+        # prompt the primary call just used, so this round is a pure append onto
+        # the sequence the runner still holds instead of a fresh ~12.7k-token
+        # prefill. The tone/mood addenda ride with `extra` in the trailing user
+        # message, same as the primary turn's per-turn material.
+        #
+        # ROUTE-GATED, and it must stay inside this branch. _last_stable_sys_
+        # prompt is LOCAL-SHAPED (stable_pc_block replaced every PC_CONTROL
+        # section BODY with a bare index of section NAMES) and the material that
+        # compensates for that — bodies + addenda — is delivered by
+        # _with_turn_context, which only this branch calls. Adopting the slot on
+        # truthiness alone broke all three other branches at once, and the
+        # trigger is one ordinary sentence: "switch to Claude and tell me what's
+        # broken" routes round 1 LOCAL (stamping the slot), parse_and_run_actions
+        # then runs [ACTION: set_brain, cloud] — which live-mutates
+        # MODEL_ROUTING['chat'] (skills/model_picker.py) — and the follow-up
+        # lands on the Claude branch below. Claude then got (a) the gutted
+        # local prompt despite its 200k window, (b) no tone / voice-mood /
+        # agent-mode addenda at all (before this layout they were concatenated
+        # into sys_prompt_now and could not be dropped), and (c) no prompt
+        # caching, because _cached_system_param returns the string untouched
+        # once full_prompt.startswith(_system_prompt) is False. Off the local
+        # route we keep the legacy full prompt. 2026-09-06.
+        _local_sys, _local_ctx = sys_prompt_now, ""
+        if _last_stable_sys_prompt[0]:
+            _local_sys = _last_stable_sys_prompt[0]
+            # Re-send THIS turn's section bodies. That system prompt no longer
+            # contains PC_CONTROL_PROMPT (stable_pc_block replaced it), so
+            # _call_local_llm's cheatsheet swap does not fire, and the bodies are
+            # not in conversation_history either — without this line the follow-up
+            # round can see only the capability INDEX (bare names, no grammar) and
+            # invents plausible-looking tokens that dispatch to nothing. The
+            # dropped step the follow-up exists to finish comes from the same user
+            # text these bodies were selected for. See _last_turn_pc_block.
+            _local_ctx = _last_turn_pc_block[0] + _followup_addenda
+        try:
+            return _local_then_cloud_or_honest(
+                _local_sys,
+                _with_turn_context(
+                    list(conversation_history)
+                    + [{"role": "user", "content": extra}], _local_ctx),
+                max_tokens=400,
+            )
+        except Exception:
+            # Unexpected raise on the local path (it has its own no-propagate
+            # wrapper, so this is belt-and-braces): fall through to the backend
+            # branches, which carry the LEGACY sys_prompt_now — never the
+            # local-shaped one.
+            pass
 
     try:
         if AI_BACKEND == "claude":
@@ -25526,7 +26077,13 @@ def _do_proactive_turn(memory: dict):
     resume_face_tracking()
 
 
-_LOCK_FILE = _BLUE_GREEN_PATHS["lock_file"]
+# Same directory the early-boot claim used (see _singleton_lock_dir): keep the
+# blue/green BASENAME the role chose, redirect only the directory. Resolving
+# these two independently would split-brain a redirected boot — the lock lands
+# in the temp dir while the fast-fail below checks the repo root, and JARVIS
+# exits 1 with "lock file missing after _enforce_singleton".
+_LOCK_FILE = os.path.join(_singleton_lock_dir(),
+                          os.path.basename(_BLUE_GREEN_PATHS["lock_file"]))
 
 
 def _enforce_singleton():
@@ -27274,7 +27831,12 @@ def _capture_utterance(injected_text, memory):
               f"-> x{_ag:.1f}")
 
     print("  Transcribing…")
-    text, conf = transcribe(audio)
+    _prof("stt_start")
+    # _transcribe_capture, not transcribe: when record_speech already ran a
+    # speculative decode for this exact utterance inside the VAD hangover,
+    # this collects it instead of paying for Whisper twice.
+    text, conf = _transcribe_capture(audio)
+    _prof("stt_end", text[:40].replace("\t", " "))
     return text, conf
 
 
@@ -27616,7 +28178,7 @@ def _handle_sleep_standby(injected_text: str | None) -> None:
         #           later standby tick (the selector latched the failure).
         _wake_hit = _standby_wake_detected(audio)
         if _wake_hit is None:
-            text, _ = transcribe(audio)
+            text, _ = _transcribe_capture(audio)
         else:
             text = "jarvis" if _wake_hit else ""
     tl = text.strip().lower()
@@ -27789,6 +28351,15 @@ def _run_llm_dispatch(text: str) -> str:
         # The glance reply comes from ask_vision, never the flush buffer, so
         # there is never a legitimate prefix to strip on a glance turn.
         _stream_spoken_prefix[0] = ""
+        # Same reason, same bypass: _call_llm is the ONLY place that stamps
+        # _last_stable_sys_prompt, so a glance turn would leave the PREVIOUS
+        # turn's system prompt standing and get_followup_response would reuse
+        # it. Clearing it makes the follow-up rebuild from the live
+        # _system_prompt, which is what a glance turn's chain should see.
+        # Same for the turn's PC bodies — they belong to the PREVIOUS turn's
+        # user text and must not be replayed as this chain's reference.
+        _last_stable_sys_prompt[0] = ""
+        _last_turn_pc_block[0] = ""
     else:
         reply = get_response_with_animation(text)
     print(f"  JARVIS: {reply}")
@@ -28125,7 +28696,8 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         _root_dir = os.path.dirname(os.path.abspath(__file__))
         _err_name = ("jarvis_staging_boot_error.txt" if _is_staging()
                      else "jarvis_boot_error.txt")
-        _err_path = os.path.join(_root_dir, _err_name)
+        # Beside the lock, matching _early_boot_singleton_lock's marker.
+        _err_path = os.path.join(_singleton_lock_dir(), _err_name)
         _msg = (f"[singleton] lock file missing after _enforce_singleton "
                 f"(path={_LOCK_FILE}) — exiting to avoid lock-watcher hang")
         print(_msg)

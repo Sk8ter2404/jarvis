@@ -1985,6 +1985,27 @@ def check_action_smoke_tests(skill_files: list[str]) -> tuple[list[Finding], dic
             if PROJECT_DIR not in sys.path:
                 sys.path.insert(0, PROJECT_DIR)
             bc_mod = importlib.import_module("bobert_companion")
+        except SystemExit as e:
+            # SystemExit is a BaseException, NOT an Exception — so the arm below
+            # could never catch it, and it propagated straight out of main(),
+            # ending the auditor with the exit code the monolith chose. When a
+            # live JARVIS held the singleton, that code was 0 — and 0 is this
+            # tool's documented "zero findings". So the auditor silently
+            # reported CLEAN, having audited nothing, every time it ran while
+            # JARVIS was up — including from upgrade_jarvis.py's post-upgrade
+            # gate, which runs before the relaunch and therefore ALWAYS hit it
+            # (verified 2026-09-06: exit 0 with only the [singleton] banner).
+            # bobert_companion no longer runs its singleton on a plain import,
+            # but the class of bug — an import that exits instead of raising —
+            # must never again be readable as "clean". P1, not P2: an auditor
+            # that could not load the monolith has NOT audited it.
+            out.append(Finding(
+                severity="P1", category="smoke-test",
+                file="bobert_companion.py", line=0,
+                message=(f"bobert_companion exited during import "
+                         f"(SystemExit code {e.code!r}) — smoke tests did NOT "
+                         f"run; falling back to static check"),
+            ))
         except Exception as e:
             out.append(Finding(
                 severity="P2", category="smoke-test",

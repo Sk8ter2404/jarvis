@@ -168,6 +168,162 @@ class LockHelperTests(_MonolithTestBase):
             os.environ.get("_JARVIS_SINGLETON_PID"), str(os.getpid()))
         self.assertTrue(self.bc._early_boot_singleton_lock())
 
+    def test_acquire_does_not_fail_open_on_faked_platform(self):
+        # REGRESSION (observed 2026-09-05, reproduced 2026-09-06).
+        # tools/run_tests_ci_sim.py sets sys.platform = "linux" to reproduce the
+        # Linux CI runner. The helper used to dispatch on that string, take the
+        # POSIX arm, and die on `import fcntl` with ModuleNotFoundError — which
+        # is NOT an OSError, so the inner handler missed it and the outer
+        # fail-open returned True. The runner then believed it owned the
+        # singleton and wrote its own PID over the LIVE jarvis.lock (PID 101264
+        # over live 105488), leaving tools/audit_codebase.py refusing to start
+        # against a dead PID. Dispatch is on the importable locking MODULE now,
+        # which cannot be faked, so a faked platform must change nothing: a
+        # mutex byte another handle already holds still reports False.
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "mutex.lock")
+        holder = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        contender = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            self.assertTrue(self.bc._acquire_os_singleton_lock(holder))
+            with mock.patch.object(self.bc.sys, "platform", "linux"):
+                self.assertFalse(
+                    self.bc._acquire_os_singleton_lock(contender),
+                    "a faked sys.platform must not let a second handle claim "
+                    "a mutex that is already held")
+        finally:
+            os.close(contender)
+            os.close(holder)
+
+    def test_early_boot_honours_lock_dir_redirect(self):
+        # JARVIS_LOCK_DIR is the third sibling of JARVIS_SETTINGS_PATH and
+        # JARVIS_DATA_DIR (see tools/run_tests.py). With it set, a full
+        # singleton acquisition must land ENTIRELY in the throwaway dir and
+        # leave the repo's live jarvis.lock untouched.
+        bc = self.bc
+        d = tempfile.mkdtemp()
+        saved_fd = bc._SINGLETON_HELD_FD
+        saved_pid_env = os.environ.get("_JARVIS_SINGLETON_PID")
+        saved_lock_env = os.environ.get("JARVIS_LOCK_DIR")
+
+        def _cleanup():
+            fd = bc._SINGLETON_HELD_FD
+            if fd is not None and fd != saved_fd:
+                try:
+                    os.close(fd)          # drops the byte-range lock too
+                except OSError:
+                    pass
+            bc._SINGLETON_HELD_FD = saved_fd
+            for key, val in (("_JARVIS_SINGLETON_PID", saved_pid_env),
+                             ("JARVIS_LOCK_DIR", saved_lock_env)):
+                if val is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = val
+        self.addCleanup(_cleanup)
+
+        os.environ["JARVIS_LOCK_DIR"] = d
+        os.environ.pop("_JARVIS_SINGLETON_PID", None)   # bypass re-entrancy guard
+        self.assertTrue(bc._early_boot_singleton_lock())
+
+        produced = sorted(os.listdir(d))
+        # The harness sets JARVIS_STAGING=1, so the PID file may carry either
+        # name; what matters is that it was written HERE and names us.
+        pid_files = [n for n in produced
+                     if n in ("jarvis.lock", "jarvis_staging.lock")]
+        self.assertTrue(pid_files, f"no PID file in the redirect dir: {produced}")
+        with open(os.path.join(d, pid_files[0]), encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), str(os.getpid()))
+        # …and the real repo-root lock was not the one we stamped.
+        repo_lock = os.path.join(os.path.dirname(os.path.abspath(bc.__file__)),
+                                 "jarvis.lock")
+        if os.path.exists(repo_lock):
+            with open(repo_lock, encoding="utf-8") as f:
+                self.assertNotEqual(f.read().strip(), str(os.getpid()),
+                                    "the redirect did not protect the live lock")
+
+    def test_singleton_lock_dir_honours_env(self):
+        bc = self.bc
+        saved = os.environ.get("JARVIS_LOCK_DIR")
+
+        def _restore(v=saved):
+            if v is None:
+                os.environ.pop("JARVIS_LOCK_DIR", None)
+            else:
+                os.environ["JARVIS_LOCK_DIR"] = v
+        self.addCleanup(_restore)
+
+        os.environ["JARVIS_LOCK_DIR"] = os.path.join(tempfile.mkdtemp(), "x")
+        self.assertEqual(bc._singleton_lock_dir(),
+                         os.environ["JARVIS_LOCK_DIR"])
+        os.environ.pop("JARVIS_LOCK_DIR", None)
+        self.assertEqual(
+            os.path.normcase(bc._singleton_lock_dir()),
+            os.path.normcase(os.path.dirname(os.path.abspath(bc.__file__))),
+            "unset JARVIS_LOCK_DIR must resolve to the repo root")
+
+    def test_lock_file_resolves_through_the_same_helper(self):
+        # STALE-DUPLICATE GUARD — this codebase's signature bug class. The lock
+        # path is resolved TWICE: the early-boot claim, and module-level
+        # _LOCK_FILE (main()'s re-check plus its "lock file missing after
+        # _enforce_singleton" sys.exit(1) fast-fail). Let those diverge and a
+        # redirected boot writes the lock to the throwaway dir, then kills
+        # itself for not finding it in the repo root. Asserted on the AST, not
+        # by grepping text — a source grep happily matches the fix's own
+        # comment (4 false greens in one earlier hunt).
+        import ast as _ast
+        path = os.path.abspath(self.bc.__file__)
+        with open(path, "r", encoding="utf-8") as fh:
+            tree = _ast.parse(fh.read(), filename=path)
+
+        assigns = [n for n in tree.body
+                   if isinstance(n, _ast.Assign)
+                   and any(isinstance(t, _ast.Name) and t.id == "_LOCK_FILE"
+                           for t in n.targets)]
+        self.assertEqual(len(assigns), 1,
+                         "expected exactly one module-level _LOCK_FILE binding")
+        helper_calls = [n for n in _ast.walk(assigns[0].value)
+                        if isinstance(n, _ast.Call)
+                        and isinstance(n.func, _ast.Name)
+                        and n.func.id == "_singleton_lock_dir"]
+        self.assertTrue(
+            helper_calls,
+            "_LOCK_FILE must resolve its directory through "
+            "_singleton_lock_dir() so it can never disagree with the "
+            "early-boot lock path")
+
+    def test_boot_singleton_call_is_gated_on_dunder_main(self):
+        # The module-level call must NEVER run on a plain
+        # `import bobert_companion` — it WRITES jarvis.lock, and core/actions.py,
+        # core/orchestrator.py and ~40 skills' _bc() helpers all import the
+        # monolith lazily at runtime. Ungated, every one of those paths turned
+        # its process into a lock writer. Asserted on the SOURCE because the
+        # module is already imported by the time a test runs.
+        import ast as _ast
+        path = os.path.abspath(self.bc.__file__)
+        with open(path, "r", encoding="utf-8") as fh:
+            tree = _ast.parse(fh.read(), filename=path)
+
+        def _boot_calls(node):
+            return [n for n in _ast.walk(node)
+                    if isinstance(n, _ast.Call)
+                    and isinstance(n.func, _ast.Name)
+                    and n.func.id == "_early_boot_singleton_lock"]
+
+        guarded = []
+        for stmt in tree.body:
+            if isinstance(stmt, _ast.If) and "__main__" in _ast.dump(stmt.test):
+                guarded.extend(_boot_calls(stmt))
+            else:
+                self.assertEqual(
+                    _boot_calls(stmt), [],
+                    "_early_boot_singleton_lock() is invoked at module scope "
+                    "outside an `if __name__ == \"__main__\"` guard — a plain "
+                    "import would write the live jarvis.lock")
+        self.assertTrue(guarded,
+                        "no _early_boot_singleton_lock() call found under the "
+                        "__main__ guard — the real boot would never claim it")
+
 
 # ──────────────────────────────────────────────────────────────────────────
 #  _is_staging + conversation-history trim

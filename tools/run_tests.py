@@ -68,6 +68,27 @@ def _redirect_data_dir_to_throwaway() -> None:
     os.environ["JARVIS_DATA_DIR"] = tempfile.mkdtemp(prefix="jarvis_test_data_")
 
 
+def _redirect_lock_dir_to_throwaway() -> None:
+    """Point the singleton lock files at a throwaway directory so no test — and
+    no subprocess a test spawns — can write the owner's live ``jarvis.lock``.
+
+    Third sibling of _redirect_settings_to_throwaway /
+    _redirect_data_dir_to_throwaway, and the same incident class: jarvis.lock is
+    live runtime state. It names the PID of the running JARVIS, and both
+    tools/stability_smoke_test.py and the upgrade pipeline read it to decide
+    which process that is. On 2026-09-05 a tools/run_tests_ci_sim.py run stamped
+    its OWN pid over the live one — bobert_companion._early_boot_singleton_lock
+    ran on a plain `import bobert_companion` and its OS-lock helper fail-opened
+    under the runner's faked ``sys.platform`` — so tools/audit_codebase.py then
+    refused to start against a PID that had already exited. Sets
+    ``JARVIS_LOCK_DIR`` (honoured by _early_boot_singleton_lock) BEFORE any test
+    is imported, so every subprocess inherits it too; respects an externally-set
+    override (does nothing if already set)."""
+    if (os.environ.get("JARVIS_LOCK_DIR") or "").strip():
+        return
+    os.environ["JARVIS_LOCK_DIR"] = tempfile.mkdtemp(prefix="jarvis_test_lock_")
+
+
 def _stop_lingering_daemons() -> None:
     """Best-effort: stop any opt-in background daemon a test may have left alive
     (currently the apple-music keep-alive watchdog) so it can't outlive the
@@ -115,6 +136,9 @@ def main(argv: list[str]) -> int:
     # Same guard for the whole data/ directory: a forgotten per-test path
     # redirect must land in a throwaway, never the live runtime state.
     _redirect_data_dir_to_throwaway()
+    # Third guard, same family: jarvis.lock is live runtime state (it names the
+    # running JARVIS's PID), so a test run must not be able to write it either.
+    _redirect_lock_dir_to_throwaway()
     if _PROJECT_ROOT not in sys.path:
         sys.path.insert(0, _PROJECT_ROOT)
 

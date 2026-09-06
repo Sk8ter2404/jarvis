@@ -130,7 +130,20 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "identify me", "who am i talking",
     ],
     "POINT-TO-CONTROL": ["point", "pointing", "that device", "turn that on", "aim at"],
-    "AIR-MOUSE": ["air mouse", "air-mouse", "drive the cursor", "hand mouse", "cursor with my"],
+    # 2026-09-06 whole-prompt arrow-example audit (the follow-up the STATUS
+    # READ-BACKS card named): this section prints "'take the cursor' →
+    # [ACTION: air_mouse_arm]" and "'release the cursor' → [ACTION:
+    # air_mouse_disarm]" as its own examples, and BOTH selected nothing but the
+    # always-on app launcher — so the arm/disarm tokens never reached the local
+    # model and the nearest thing it could see was air_mouse_on/off, which is a
+    # DIFFERENT operation (feature power vs. the pose gate). Cover every
+    # trigger phrase the body prints, not just the "air mouse" spellings.
+    "AIR-MOUSE": [
+        "air mouse", "air-mouse", "drive the cursor", "hand mouse",
+        "cursor with my", "take the cursor", "give me the cursor",
+        "release the cursor", "grab the cursor", "mouse control",
+        "calibrate reach",
+    ],
     "GUARD MODE": ["guard", "security", "intruder", "watch the room", "arm the cameras", "guard mode"],
     "MUSIC CONTROLS": [
         "music", "play", "song", "track", "album", "artist", "playlist",
@@ -145,6 +158,13 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "AUDIO OUTPUT DEVICE": [
         "headset", "headphones", "speakers", "output device", "switch audio",
         "audio output", "play through", "sound through",
+        # 2026-09-06: 'is auto switching on' → audio_autoswitch_status loaded
+        # TTS BACKEND SWITCHING (on the bare word "switch") and nothing else —
+        # the wrong subsystem entirely, so the model was offered voice-backend
+        # tokens for a question about the audio-device WATCHER. "auto switch"
+        # is a substring of "auto switching"/"auto switches", so one entry
+        # covers the tense variants.
+        "auto switch", "auto-switch", "autoswitch", "audio status",
     ],
     "LOCAL MODEL SELECTION": [
         "model", "which model", "local model", "your brain", "ollama", "llm",
@@ -189,6 +209,15 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "MORNING BRIEFING": [
         "briefing", "brief me", "morning briefing", "good morning", "my day",
         "agenda", "what's on today",
+        # 2026-09-06: this section documents FOUR distinct openers
+        # (morning_briefing / morning_handoff / predictive_morning_setup /
+        # morning_arrival) and the keyword list only covered the word
+        # "briefing". Its own examples 'JARVIS, catch me up' → morning_handoff
+        # and 'JARVIS, set up my workspace' → predictive_morning_setup selected
+        # nothing at all. "arrival"/"cold open" are spelled out rather than
+        # left as a bare "arrival" so package-delivery turns stay clear of this.
+        "catch me up", "handoff", "hand off", "workspace",
+        "morning apps", "morning arrival", "arrival briefing", "cold open",
     ],
     "NEWS BRIEFING": ["news", "headlines", "what's happening", "current events"],
     "DAILY RECAP": [
@@ -233,9 +262,25 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "click on", "type into", "automate", "fill in", "press the button",
         "move the mouse", "click the",
     ],
+    # NOTE this key routes TWO physically separate sections — the prompt has a
+    # full "CHANGELOG / VERSION (self-awareness…)" block and a short
+    # "CHANGELOG / VERSION (additional phrasings)" one, and _keywords_for is
+    # keyed by header NAME, so one list serves both. That is fine here (same
+    # topic) but it is why the list has to cover the big block's actions too.
     "CHANGELOG / VERSION": [
         "version", "what's new", "changelog", "update notes", "your version",
         "what changed", "what version",
+        # 2026-09-06: the big block also owns check_for_updates, model_costs
+        # and report_bug, and the list above covered none of them.
+        #   'check for updates'  -> selected BAMBU PRINTER LAN CHECK ALIAS (!)
+        #   'which model is cheapest?' -> LOCAL MODEL SELECTION + BROWSER AGENT
+        # The second is the expensive near-miss: BROWSER AGENT's find_cheapest
+        # is a SHOPPING action, so "which model is cheapest" was one token away
+        # from opening a price-comparison browse for an LLM.
+        "check for update", "new version", "newer version", "up to date",
+        "updates available", "newer you",
+        "model cost", "model prices", "each model", "compare models",
+        "model is cheapest", "model burn",
     ],
     "SKILLS": ["learn", "teach yourself", "new skill", "teach you", "can you learn"],
     "SMART HOME": [
@@ -385,9 +430,19 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "scan the room", "scan room", "how many people", "body count",
         "anyone in the room", "who is here", "who's here",
     ],
+    # 2026-09-06: 'hand mouse off' → air_control_off is this section's own
+    # example, and it loaded AIR-MOUSE alone — which documents air_mouse_disarm
+    # for that same phrase. The prompt deliberately gives BOTH sections the
+    # 'hand mouse on/off' and 'give me the cursor' triggers and then tells the
+    # model they are separate subsystems ("separate from the air-mouse above").
+    # That disambiguation is only teachable when both bodies are in front of it,
+    # so these keywords overlap AIR-MOUSE's on purpose — do not "resolve" the
+    # ambiguity by giving the phrase to one section; the prompt owns that call.
     "AIR CONTROL": [
         "air control", "spatial mouse", "reach out", "grab and drag",
         "fist grab", "kinect mouse", "movie-style",
+        "hand mouse", "control the mouse", "give me back the mouse",
+        "give me the cursor",
     ],
     "MUSIC + VIDEO PLAYBACK": [
         "playback", "play a video", "media keys", "play/pause", "media control",
@@ -396,10 +451,26 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "STREAMING SERVICES": [
         "netflix", "hulu", "disney", "disney+", "hbo", "prime video",
         "streaming service", "watch on", "auto-play", "put on a movie",
+        # 2026-09-06: the Apple Music APP-LIFECYCLE actions live at the foot of
+        # this section, and its own examples for them routed to MUSIC CONTROLS
+        # instead — where the only nearby tokens are pause_music/stop. That is
+        # an actively harmful near-miss, not a silent one: 'stop keeping Apple
+        # Music open' would have STOPPED THE MUSIC rather than cancelled the
+        # keep-alive. NOTE "keep apple music" cannot match "keepING apple
+        # music", so the gerund needs its own entry.
+        "keep apple music", "stop keeping", "keep music", "keep it open",
+        "keep it running", "always open apple music", "in the tray",
     ],
     "TASTE-AWARE MUSIC": [
         "my music taste", "recommend a song", "recommend music", "based on my taste",
         "music recommendation", "something i'd like", "music i'd like",
+        # 2026-09-06: 'what have I been listening to lately?' → music_history
+        # is this section's own example and it selected MUSIC CONTROLS (on the
+        # keyword "listen") + STATUS READ-BACKS, neither of which carries
+        # music_history. The taste keywords above are all REQUEST-shaped
+        # ("recommend…"); every read-back phrasing was missing.
+        "been listening", "listening history", "listen history",
+        "recently played", "been playing lately", "last few songs",
     ],
     "FOCUS MODE / DO-NOT-DISTURB": [
         "focus mode", "do not disturb", "hold my notifications", "heads down",
@@ -440,6 +511,11 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "LOCAL VOICE CLONE": [
         "voice clone", "cloned voice", "voice profile", "clone voice",
         "your own voice", "in-character voice", "chatterbox", "switch to my voice",
+        # 2026-09-06: 'stop cloning' → disable_voice_clone selected nothing.
+        # Every spelling here was a NOUN ("voice clone", "cloned voice"); the
+        # gerund the body itself prints as the trigger had no entry. Bare
+        # "cloning" is safe — the word appears nowhere else in this grammar.
+        "cloning", "normal voice", "what voices",
     ],
     "SMART HOME — PER-BRAND LIST": [
         "list my lights", "list plugs", "which lights", "hue list", "govee list",
@@ -483,6 +559,16 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "save a copy of what you know", "forget the last", "forget last hour",
         "forget that", "wipe your memory", "clear your memory",
         "what do you remember", "recent facts", "memory file",
+        # 2026-09-06: 'JARVIS, forget everything you know about me' →
+        # reset_memory selected SESSION MEMORY RECALL (on "forget"), whose only
+        # nearby token is the PARTIAL forget. The scope note in this very body
+        # — "Only an explicit 'everything' / 'all of it' / 'start over' earns
+        # reset_memory" — was therefore never in front of the model on the one
+        # turn it exists to govern. A near-miss here is a DATA outcome, not a
+        # wording one: the owner asks for a full wipe and gets an hour dropped.
+        "forget everything", "erase your memory", "forget all of it",
+        "start over and forget", "scrub the last hour",
+        "never happened",
     ],
     "PENDING PROMISES": [
         "promise", "promises", "waiting on", "still pending", "owe me",
@@ -492,6 +578,21 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "test the mic", "test my mic", "test microphone", "mic test",
         "test your speech", "test tts", "test the camera", "test vision",
         "test your voice", "self test", "self-test", "probe", "is my mic working",
+        # 2026-09-06: every keyword above starts "test …", so the two examples
+        # the body prints in any OTHER shape both missed.
+        #   'check the webcam' -> WEBCAM AWARENESS + UNIFIED, i.e. the model was
+        #     shown the camera-LOOK actions and asked to run a camera PROBE.
+        #     The body's own "'test the camera' / 'check the webcam'" pairing is
+        #     what makes both spellings this section's, so route both.
+        #   'how fast is your brain right now' -> LOCAL MODEL SELECTION (on
+        #     "your brain"), which names models but never latency_benchmark.
+        # "why are you slow" is deliberately NOT added: it already routes to
+        # UNREADABLE STATE, whose body cites [ACTION: latency_benchmark] as the
+        # one measurable thing — so that phrasing is answered, and duplicating
+        # it here would put two competing sections on the same turn.
+        "check the webcam", "check the camera", "test the webcam",
+        "test all your skills", "test your skills",
+        "how fast is your brain", "how fast are you", "latency",
     ],
     # The unreadable-state section is the one that teaches an HONEST refusal —
     # it exists precisely so a question with no handler stops coming back as a
@@ -633,3 +734,113 @@ def slim_pc_control(user_text: str, pc_control: str) -> str:
         return "\n".join(parts)
     except Exception:
         return pc_control
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  CACHE-STABLE SPLIT  (2026-09-06 latency work)
+# ──────────────────────────────────────────────────────────────────────────
+#
+# WHY THIS EXISTS — and why slim_pc_control above is not enough.
+#
+# slim_pc_control does its job: it cuts PC_CONTROL from ~126k chars to ~6k and
+# costs 1.4 ms. But its output CHANGES every turn, and it is spliced into the
+# MIDDLE of the system prompt (~46 % depth). That single fact was, measured,
+# 40 % of JARVIS's entire speak-to-speak latency.
+#
+# The local brain (gemma4:26b-a4b-it-qat) is a SLIDING-WINDOW-attention model:
+# llama.cpp keeps a full KV cache for only 5 of its 30 layers and a 2048-cell
+# SWA cache for the other 25. Reusing a prefix therefore needs a "context
+# checkpoint" — a snapshot of that 2048-cell SWA state — and llama.cpp can only
+# restore one when the divergence point is inside it. Measured on this box with
+# a production-sized 11.4k-token prompt (scratchpad e1_distance.py, n=3 each):
+#
+#     divergence   53 tokens from the end of the previous prompt →    68 ms
+#     divergence  535 tokens from the end                        →   168 ms
+#     divergence 1070 tokens from the end                        →  2506 ms
+#     divergence 2406 tokens from the end                        →  2534 ms
+#     divergence 10695 tokens from the end                       →  2536 ms
+#     pure append (identical prompt, new user text)              →    30 ms
+#
+# There is no gentle degradation: past ~1024 tokens of divergence llama.cpp
+# logs "forcing full prompt re-processing due to lack of cache data (likely due
+# to SWA…)" and re-evaluates ALL 12.7k tokens at ~4,200 tok/s. And there is no
+# cross-request rescue: A → B → A re-evaluates A in full every time (e2_cache.py),
+# so keeping a handful of prompt variants in rotation does not help either.
+#
+# So the fix is not to make the volatile block smaller or to move it later in
+# the system prompt — it is to get it OUT of the cached region entirely:
+#
+#   stable_pc_block()  →  byte-identical on every turn: the core preamble
+#                         (action grammar + safety rules) plus an INDEX naming
+#                         every capability. Lives where PC_CONTROL used to.
+#   turn_pc_block()    →  just the section BODIES this turn implicates. The
+#                         caller puts this at the head of the FINAL user
+#                         message, i.e. after everything cached.
+#
+# Content-wise this is a SUPERSET of slim_pc_control's output (same core, same
+# selected bodies, and an index of ALL sections rather than only the dropped
+# ones), which is what tests/test_prompt_router.py::CacheStableSplitTests
+# asserts utterance by utterance — the split may reorder what the model sees,
+# never subtract from it.
+
+_STABLE_BLOCK_CACHE: Dict[int, str] = {}
+
+_INDEX_HEADER = (
+    "\n\nCAPABILITY INDEX — every capability you have. The full instructions "
+    "for the ones this turn needs are supplied with the user's message below; "
+    "for anything else here, say you can do it and ask for the word:\n")
+
+
+def stable_pc_block(pc_control: str) -> str:
+    """The BYTE-STABLE half of the PC block: core preamble + an index naming
+    every capability. Identical for every turn, so the KV prefix survives.
+
+    Cached on the identity of ``pc_control`` — it is a module constant, so this
+    is computed once per process. Never raises: a bad parse degrades to the
+    core preamble alone, which still carries the action grammar and the safety
+    rules, and turn_pc_block() still delivers the bodies."""
+    key = id(pc_control)
+    hit = _STABLE_BLOCK_CACHE.get(key)
+    if hit is not None:
+        return hit
+    try:
+        core, sections = split_pc_control(pc_control)
+        if not sections:
+            out = pc_control
+        else:
+            names = [h.strip() for h, _b in sections]
+            # The _ALWAYS sections are, by definition, in EVERY turn's
+            # selection — so hoisting them up here changes nothing about what
+            # the model sees and takes their bytes out of every volatile tail
+            # forever. Free, and it is the only promotion that is provably
+            # content-neutral.
+            always = [b for h, b in sections if h.strip().upper() in _ALWAYS]
+            out = ("\n".join([core] + always)
+                   + _INDEX_HEADER + "; ".join(names) + ".")
+    except Exception:
+        out = pc_control
+    _STABLE_BLOCK_CACHE[key] = out
+    return out
+
+
+def turn_pc_block(user_text: str, pc_control: str) -> str:
+    """The VOLATILE half: the bodies of the sections `user_text` implicates.
+
+    Returns '' when the turn implicates nothing beyond the always-on section
+    set, so a turn that needs no extra instructions costs the cache nothing at
+    all. Never raises — on a parse failure it returns the FULL section text,
+    which is slower but never less informed than slim_pc_control was."""
+    try:
+        _core, sections = split_pc_control(pc_control)
+        if not sections:
+            return ""
+        included, _dropped = select_sections(user_text, sections)
+        inc = set(included)
+        bodies = [b for h, b in sections
+                  if h.strip() in inc and h.strip().upper() not in _ALWAYS]
+        return "\n".join(bodies)
+    except Exception:
+        try:
+            return "\n".join(b for _h, b in split_pc_control(pc_control)[1])
+        except Exception:
+            return pc_control

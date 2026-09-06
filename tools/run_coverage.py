@@ -43,9 +43,13 @@ def _run_suite() -> bool:
     # path redirect can't clobber the owner's live runtime state (the ecobee
     # token-file incident, 2026-07-21). Both respect external overrides.
     from tools.run_tests import (_redirect_data_dir_to_throwaway,
+                                 _redirect_lock_dir_to_throwaway,
                                  _redirect_settings_to_throwaway)
     _redirect_settings_to_throwaway()
     _redirect_data_dir_to_throwaway()
+    # Third guard, same family: jarvis.lock is live runtime state (it names the
+    # running JARVIS's PID), so a coverage run must not be able to write it.
+    _redirect_lock_dir_to_throwaway()
     loader = unittest.TestLoader()
     suite = loader.discover(start_dir=_TESTS, pattern="test_*.py",
                             top_level_dir=_ROOT)

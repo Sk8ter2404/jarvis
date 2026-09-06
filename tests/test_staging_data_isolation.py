@@ -417,5 +417,86 @@ class RunnerDataDirRedirectTests(unittest.TestCase):
                             "test discovery/import")
 
 
+class RunnerLockDirRedirectTests(unittest.TestCase):
+    """Every suite runner must point JARVIS_LOCK_DIR at a throwaway BEFORE any
+    test is imported, so no suite-run process — nor any subprocess it spawns,
+    which inherit the env — can write the owner's live ``jarvis.lock``.
+
+    THE INCIDENT (2026-09-05, observed live; reproduced 2026-09-06)
+    --------------------------------------------------------------
+    jarvis.lock records the PID of the running JARVIS; tools/stability_smoke_test.py
+    and the upgrade pipeline both read it to decide which process that is. A
+    ``tools/run_tests_ci_sim.py`` run stamped its OWN pid over the live one and
+    left a PID belonging to no process: the runner fakes ``sys.platform =
+    "linux"``, a lazy ``import bobert_companion`` (core/actions, core/orchestrator
+    and ~40 skills' ``_bc()`` helpers all do one) then ran the monolith's
+    module-level ``_early_boot_singleton_lock()``, and its OS-lock helper
+    fail-opened on the POSIX arm because ``import fcntl`` raises
+    ModuleNotFoundError — not OSError — on Windows. tools/audit_codebase.py then
+    refused to start against the dead PID. Third sibling of the settings and
+    data-dir redirects above; same rule, same reason."""
+
+    ENV = "JARVIS_LOCK_DIR"
+
+    def setUp(self):
+        self._saved = os.environ.get(self.ENV)
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop(self.ENV, None)
+        else:
+            os.environ[self.ENV] = self._saved
+
+    def _assert_redirects(self, redirect_fn):
+        os.environ.pop(self.ENV, None)
+        redirect_fn()
+        val = (os.environ.get(self.ENV) or "").strip()
+        self.assertTrue(val, "redirect did not set JARVIS_LOCK_DIR")
+        self.assertTrue(os.path.isdir(val), val)
+        self.assertNotEqual(os.path.normcase(os.path.abspath(val)),
+                            os.path.normcase(_PROJECT_ROOT),
+                            "lock dir must not be the repo root")
+
+    def test_run_tests_redirects_lock_dir(self):
+        from tools import run_tests as rt
+        self._assert_redirects(rt._redirect_lock_dir_to_throwaway)
+
+    def test_ci_sim_redirects_lock_dir(self):
+        from tools import run_tests_ci_sim as cs
+        self._assert_redirects(cs._redirect_lock_dir_to_throwaway)
+
+    def test_redirect_respects_external_override(self):
+        from tools import run_tests as rt
+        os.environ[self.ENV] = "preset_by_operator"
+        rt._redirect_lock_dir_to_throwaway()
+        self.assertEqual(os.environ[self.ENV], "preset_by_operator")
+
+    def test_runners_call_redirect_before_discovery(self):
+        for fn in ("run_tests.py", "run_tests_ci_sim.py", "run_coverage.py"):
+            path = os.path.join(_PROJECT_ROOT, "tools", fn)
+            with open(path, "r", encoding="utf-8") as fh:
+                src = fh.read()
+            lines = src.splitlines()
+            call = next((i for i, ln in enumerate(lines)
+                         if ln.strip() == "_redirect_lock_dir_to_throwaway()"
+                         and ln.startswith("    ")), -1)
+            disc = next((i for i, ln in enumerate(lines)
+                         if ".discover(" in ln), -1)
+            self.assertGreater(call, -1, f"{fn}: lock redirect is never called")
+            if disc > -1:
+                self.assertLess(call, disc,
+                                f"{fn}: lock-dir redirect must run before "
+                                "test discovery/import")
+
+    def test_monolith_honours_the_env_var(self):
+        # The redirect is only worth anything if the monolith reads it. Assert
+        # the contract at the source level so a rename on either side fails
+        # here rather than silently un-protecting the live lock.
+        with open(os.path.join(_PROJECT_ROOT, "bobert_companion.py"),
+                  "r", encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn('os.environ.get("JARVIS_LOCK_DIR")', src)
+
+
 if __name__ == "__main__":
     unittest.main()

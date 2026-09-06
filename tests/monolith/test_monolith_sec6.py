@@ -1237,6 +1237,169 @@ class GetFollowupResponseTests(SectionSixBase):
             out = bc.get_followup_response([("x", "y")])
         self.assertEqual(out, "cloud follow-up, sir.")
 
+    # ── Cache-stable layout (2026-09-06 latency work) — adversarial review ──
+    # get_followup_response reuses the system prompt the PRIMARY call built
+    # (_last_stable_sys_prompt) so an action chain is a pure append onto the KV
+    # prefix the local runner still holds. That prompt is LOCAL-SHAPED:
+    # prompt_router.stable_pc_block() replaces every PC_CONTROL section BODY
+    # with a bare index of section NAMES, and the bodies + the
+    # tone/voice-mood/agent-mode addenda ride in the user message instead
+    # (_with_turn_context). BOTH of those are only correct for a follow-up that
+    # is still on the local route — the slot must therefore be adopted on the
+    # LIVE ROUTE, never on truthiness alone.
+    def _stub_stable_slot(self, local_shaped):
+        """Primary turn routed local and stamped the cache-stable slot, with a
+        tone addendum and a voice-mood addendum in play."""
+        bc = self.bc
+        self._p(bc, "_last_stable_sys_prompt", [local_shaped])
+        self._p(bc, "_last_turn_pc_block", ["PC-BODIES-SENTINEL"])
+        self._p(bc, "_tone_system_addendum", lambda _t: "TONE-ADDENDUM-SENTINEL")
+        self._p(bc, "_last_user_tone", ["clipped"])
+        self._p(bc, "_last_voice_route", [{"addendum": "MOOD-ADDENDUM-SENTINEL"}])
+
+    @staticmethod
+    def _flatten_system(sys_param):
+        if isinstance(sys_param, str):
+            return sys_param
+        return "".join(b.get("text", "") for b in sys_param)
+
+    def test_midchain_set_brain_cloud_does_not_reuse_local_prompt(self):
+        # "Switch to Claude and tell me what's broken."  Round 1 routes LOCAL
+        # (stamping _last_stable_sys_prompt); parse_and_run_actions then runs
+        # [ACTION: set_brain, cloud], which live-mutates MODEL_ROUTING['chat']
+        # (skills/model_picker.py, and core.config.MODEL_ROUTING with it); the
+        # follow-up therefore lands on the Claude branch. Adopting the stable
+        # slot on truthiness ALONE handed Claude the gutted local prompt, AND
+        # dropped the tone / voice-mood / agent-mode addenda entirely, because
+        # _followup_ctx is applied only inside the local branch.
+        bc = self.bc
+        import core.config as cfg
+
+        local_shaped = ("LOCAL-STABLE-PROMPT-SENTINEL "
+                        "(PC_CONTROL bodies replaced by a section-name index)")
+        self._stub_stable_slot(local_shaped)
+
+        seen = {}
+
+        class FakeClient:
+            def complete(self, **kwargs):
+                seen.update(kwargs)
+                return "cloud follow-up, sir."
+
+        with mock.patch.object(cfg, "model_route", lambda _fn: "cloud"), \
+             mock.patch.object(bc, "AI_BACKEND", "claude"), \
+             mock.patch.object(bc, "_llm_client", FakeClient()):
+            out = bc.get_followup_response([("whats_broken", "all clear, sir")])
+        self.assertEqual(out, "cloud follow-up, sir.")
+
+        sys_text = self._flatten_system(seen["system"])
+        msg_text = "".join(str(m.get("content", "")) for m in seen["messages"])
+        both = sys_text + msg_text
+
+        # (a) the local-shaped prompt must never be handed to the 200k-context
+        #     cloud model — it would answer with only an INDEX of capability
+        #     names where the real instructions should be.
+        self.assertNotIn("LOCAL-STABLE-PROMPT-SENTINEL", both)
+        self.assertIn(bc._system_prompt[:400], sys_text)
+        # (b) the per-turn addenda must survive, wherever they ride.
+        self.assertIn("TONE-ADDENDUM-SENTINEL", both)
+        self.assertIn("MOOD-ADDENDUM-SENTINEL", both)
+        # (c) the Anthropic cache breakpoints must survive: _cached_system_param
+        #     returns the string UNCHANGED when the prompt does not start with
+        #     _system_prompt, silently losing both ephemeral breakpoints.
+        self.assertIsInstance(seen["system"], list)
+        self.assertTrue(any(b.get("cache_control") for b in seen["system"]))
+
+    def test_midchain_set_brain_cloud_ollama_branch_keeps_addenda(self):
+        # Same defect, ollama branch: it builds its own msgs list without
+        # _with_turn_context, so the addenda have to be in the system message.
+        bc = self.bc
+        import core.config as cfg
+
+        self._stub_stable_slot("LOCAL-STABLE-PROMPT-SENTINEL")
+
+        seen = {}
+
+        def _fake_bounded(model, msgs, **kw):
+            seen["msgs"] = msgs
+            return {"message": {"content": "ollama follow-up, sir."}}
+
+        with mock.patch.object(cfg, "model_route", lambda _fn: "cloud"), \
+             mock.patch.object(bc, "AI_BACKEND", "ollama"), \
+             mock.patch.object(bc, "_ollama_chat_bounded", _fake_bounded), \
+             mock.patch.object(bc, "_get_local_llm_model", lambda: "m"):
+            out = bc.get_followup_response([("whats_broken", "all clear, sir")])
+        self.assertEqual(out, "ollama follow-up, sir.")
+        blob = "".join(str(m.get("content", "")) for m in seen["msgs"])
+        self.assertNotIn("LOCAL-STABLE-PROMPT-SENTINEL", blob)
+        self.assertIn("TONE-ADDENDUM-SENTINEL", blob)
+        self.assertIn("MOOD-ADDENDUM-SENTINEL", blob)
+
+    def test_midchain_set_brain_cloud_except_fallback_keeps_addenda(self):
+        # Same defect, except-fallback: the cloud raised (usage cap), so the
+        # chain is kept alive on _call_local_llm — which also builds msgs
+        # WITHOUT _with_turn_context, so again the addenda must ride in
+        # sys_prompt or they are gone.
+        bc = self.bc
+        import core.config as cfg
+        import anthropic
+
+        self._stub_stable_slot("LOCAL-STABLE-PROMPT-SENTINEL")
+
+        seen = {}
+
+        def _fake_local(sys_prompt, messages, max_tokens=400):
+            seen["sys"] = sys_prompt
+            seen["msgs"] = messages
+            return "local rescue, sir."
+
+        with mock.patch.object(cfg, "model_route", lambda _fn: "cloud"), \
+             mock.patch.object(bc, "AI_BACKEND", "claude"), \
+             mock.patch.object(bc, "_llm_client", None), \
+             mock.patch.object(anthropic, "Anthropic",
+                               side_effect=Exception("cap hit")), \
+             mock.patch.object(bc, "_call_local_llm", _fake_local):
+            out = bc.get_followup_response([("x", "y")])
+        self.assertEqual(out, "local rescue, sir.")
+        blob = seen["sys"] + "".join(
+            str(m.get("content", "")) for m in seen["msgs"])
+        self.assertNotIn("LOCAL-STABLE-PROMPT-SENTINEL", blob)
+        self.assertIn("TONE-ADDENDUM-SENTINEL", blob)
+        self.assertIn("MOOD-ADDENDUM-SENTINEL", blob)
+
+    def test_local_followup_still_reuses_the_stable_prompt(self):
+        # The optimisation itself must keep working on the route it was built
+        # for: a still-local follow-up reuses the EXACT primary system prompt
+        # (pure KV append) and carries the addenda in the user message.
+        bc = self.bc
+        import core.config as cfg
+
+        local_shaped = "LOCAL-STABLE-PROMPT-SENTINEL"
+        self._stub_stable_slot(local_shaped)
+
+        seen = {}
+
+        def _fake_local(sys_prompt, messages, max_tokens=400):
+            seen["sys"] = sys_prompt
+            seen["msgs"] = messages
+            return "Local follow-up, sir."
+
+        with mock.patch.object(cfg, "model_route", lambda _fn: "local"), \
+             mock.patch.object(bc, "_local_then_cloud_or_honest", _fake_local):
+            out = bc.get_followup_response([("get_time", "3pm")])
+        self.assertEqual(out, "Local follow-up, sir.")
+        self.assertEqual(seen["sys"], local_shaped)
+        last = seen["msgs"][-1]["content"]
+        self.assertIn("PC-BODIES-SENTINEL", last)
+        self.assertIn("TONE-ADDENDUM-SENTINEL", last)
+        self.assertIn("MOOD-ADDENDUM-SENTINEL", last)
+        self.assertIn(bc._TURN_CTX_OPEN, last)
+        # conversation_history itself must stay clean (no replayed reference
+        # block next turn) — _with_turn_context copies.
+        for m in bc.conversation_history:
+            self.assertNotIn("TONE-ADDENDUM-SENTINEL",
+                             str(m.get("content", "")))
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  handle_confirmation_response
