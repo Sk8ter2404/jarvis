@@ -25,6 +25,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -322,14 +323,18 @@ class MainBootTests(_IntegrationBase):
     # marker -> reply-line index used by both reply readback and battery checks
     def _all_pass_map(self):
         # boot 'listening' found @1; every 'jarvis:' reply found @2; every
-        # expected marker (current time is / 2.0.29 / cpu) found.
-        return {
-            "listening": 1,
-            "jarvis:": 2,
-            "current time is": 2,
-            "2.0.29": 2,
-            "cpu": 2,
-        }
+        # marker the battery declares found @2.
+        #
+        # DERIVED from DEFAULT_BATTERY on purpose.  This fixture used to
+        # hardcode the same "2.0.29" literal the battery did, so the two agreed
+        # with each other while both disagreed with the product — the version
+        # item failed on every real run and this suite never noticed.  Deriving
+        # it means a marker change can no longer leave the fixture behind.
+        m = {"listening": 1, "jarvis:": 2}
+        for _utterance, markers in SI.DEFAULT_BATTERY:
+            for marker in markers:
+                m[marker] = 2
+        return m
 
     def _seed(self):
         # something for reply read-back: index 2 (1-based) -> _lines[1]
@@ -370,16 +375,18 @@ class MainBootTests(_IntegrationBase):
 
     def test_boot_via_standby_fallback(self):
         # primary 'listening' missing; 'standby' fallback present
-        m = {"standby": 1, "jarvis:": 2, "current time is": 2,
-             "2.0.29": 2, "cpu": 2}
+        m = self._all_pass_map()
+        del m["listening"]
+        m["standby"] = 1
         rc, out, _, _ = self._run_main([], m, seed_lines=self._seed())
         self.assertEqual(rc, 0)
         self.assertIn("3/3 passed", out)
 
     def test_boot_via_vad_fallback(self):
         # both 'listening' and 'standby' missing; '[vad]' present
-        m = {"[vad]": 7, "jarvis:": 2, "current time is": 2,
-             "2.0.29": 2, "cpu": 2}
+        m = self._all_pass_map()
+        del m["listening"]
+        m["[vad]"] = 7
         rc, out, _, _ = self._run_main([], m, seed_lines=self._seed())
         self.assertEqual(rc, 0)
         self.assertIn("3/3 passed", out)
@@ -418,6 +425,44 @@ class MainBootTests(_IntegrationBase):
                 f.write("stale")
         rc, out, _, _ = self._run_main([], self._all_pass_map(), seed_lines=self._seed())
         self.assertEqual(rc, 0)
+
+# ─────────────────── battery marker freshness (anti-rot) ─────────────────
+
+
+class BatteryMarkerFreshnessTests(unittest.TestCase):
+    """The battery's version marker MUST track the VERSION file, not a snapshot.
+
+    Regression (found 2026-09-26): the marker was hardcoded to "2.0.29" and
+    rotted 76 releases behind the product, so the version item failed on every
+    real run — while THIS suite stayed green, because its fixtures hardcoded
+    the SAME literal.  A marker that agrees with its own test fixture but not
+    with the product proves nothing.  These two tests close that loop by
+    checking the battery against the VERSION file itself.
+    """
+
+    @staticmethod
+    def _version_file() -> str:
+        with open(os.path.join(_ROOT, "VERSION"), encoding="utf-8") as fh:
+            return fh.read().strip()
+
+    def test_version_item_expects_the_live_version(self):
+        markers = {u: m for u, m in SI.DEFAULT_BATTERY}
+        self.assertIn("what version are you on", markers,
+                      "the version battery item disappeared")
+        self.assertIn(
+            self._version_file(), markers["what version are you on"],
+            "the version item does not expect the CURRENT VERSION file value — "
+            "read VERSION at runtime instead of hardcoding a release string")
+
+    def test_no_battery_marker_is_a_stale_version_literal(self):
+        live = self._version_file()
+        for utterance, markers in SI.DEFAULT_BATTERY:
+            for marker in markers:
+                if re.fullmatch(r"\d+\.\d+\.\d+", marker):
+                    self.assertEqual(
+                        marker, live,
+                        f"battery item {utterance!r} expects version "
+                        f"{marker!r} but VERSION says {live!r}")
 
 
 if __name__ == "__main__":  # pragma: no cover

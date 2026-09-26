@@ -12,8 +12,9 @@ across conversations.
         persistent memory across conversations   + a self-diagnostic loop
 ```
 
-> **Latest published release: `2.0.29`.** (The working tree's own version lives
-> in the top-level `VERSION` file and runs ahead of the last tag.) This is a
+> **Latest release: see the [tag list](https://github.com/Sk8ter2404/jarvis/tags).**
+> (The running build's own version is the top-level `VERSION` file — that single
+> source is what JARVIS reports when you ask him his version.) This is a
 > personal project shared for others to try. It's Windows-focused, expects some
 > setup (your own API keys, optional hardware), and is provided as-is. Expect
 > rough edges — and please file issues.

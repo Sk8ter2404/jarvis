@@ -369,6 +369,61 @@ class VersionSmokeTestDocTests(unittest.TestCase):
                 return
         self.fail("SETUP.md no longer contains the version smoke-test row")
 
+    # The test above names ONE file -- and that is how the same defect survived
+    # in a sibling for 75 releases.  SETUP.md was found, fixed and guarded,
+    # while tools/staging_integration.py pinned "2.0.29" for the SAME utterance
+    # and nothing looked.  So the guard below does not name its subjects: it
+    # DISCOVERS every surface that pairs the utterance with a version literal.
+    # A guard that hardcodes its file list inherits the staleness it exists to
+    # prevent.
+    _SCAN_SUFFIXES = (".py", ".md", ".txt", ".json")
+    _SCAN_SKIP_DIRS = frozenset({
+        ".git", "backups", ".claude", "__pycache__", "node_modules",
+        "venv", ".venv", "data",
+    })
+    # Append-only HISTORICAL records: quoting the version that was current when
+    # the entry was written is correct there, not rot.  CHANGELOG.md is the
+    # release log; jarvis_todo.md is the completed-task archive (its 2026-05-28
+    # entry quotes the original changelog-2 spec verbatim, version literal and
+    # all).  This file is skipped because its own prose names the offenders it
+    # hunts for.  Everything else is a LIVE surface and must not pin a version.
+    _SCAN_SKIP_FILES = frozenset({
+        "CHANGELOG.md", "jarvis_todo.md", "test_docs_truth.py",
+    })
+
+    def _version_pinning_lines(self):
+        """Every (relpath, lineno, line) pairing the version utterance with a
+        hardcoded semver on the SAME line, anywhere in the working tree."""
+        hits = []
+        for dirpath, dirnames, filenames in os.walk(_ROOT):
+            dirnames[:] = [d for d in dirnames if d not in self._SCAN_SKIP_DIRS]
+            for name in filenames:
+                if not name.endswith(self._SCAN_SUFFIXES):
+                    continue
+                if name in self._SCAN_SKIP_FILES:
+                    continue
+                full = os.path.join(dirpath, name)
+                try:
+                    with open(full, "rb") as fh:
+                        text = fh.read().decode("utf-8-sig", "replace")
+                except OSError:
+                    continue
+                for i, line in enumerate(text.splitlines(), 1):
+                    if ("what version are you on" in line.lower()
+                            and re.search(r"\b\d+\.\d+\.\d+\b", line)):
+                        hits.append((os.path.relpath(full, _ROOT), i,
+                                     line.strip()))
+        return hits
+
+    def test_no_surface_anywhere_pins_a_version_literal(self):
+        hits = self._version_pinning_lines()
+        self.assertEqual(
+            hits, [],
+            "these surfaces pin a version literal alongside the version "
+            "utterance; version_info single-sources the top-level VERSION "
+            "file, so read it at runtime instead of snapshotting it:\n"
+            + "\n".join(f"  {p}:{n}: {ln}" for p, n, ln in hits))
+
 
 class CiGateClaimTests(unittest.TestCase):
     """"CI runs exactly these gates" was false: ci.yml deliberately excludes the

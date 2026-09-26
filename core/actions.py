@@ -1453,8 +1453,17 @@ def _act_reset_memory(_: str = "") -> str:
 # ─── Version info (Phase 4G) ───────────────────────────────────────────
 
 def _act_version_info(_: str = "") -> str:
-    """Read data/version.json and report current version + a human-friendly
-    rendering of last_upgrade_at (e.g. 'this morning at 8:43 AM')."""
+    """Report the current version + a human-friendly rendering of the last
+    upgrade time (e.g. 'this morning at 8:43 AM').
+
+    SINGLE SOURCE — do NOT "fix" this to report data/version.json's own
+    ``version`` key.  That key is the self-upgrade pipeline's internal counter
+    and has been frozen at an old value for months (1.0.17 while the release
+    was 2.0.104); reporting it would make JARVIS state his version wrong by a
+    whole major series.  The release version comes from core/version.py (the
+    VERSION file).  Only ``last_upgrade_at`` is read out of the JSON, and even
+    that yields to the VERSION file's mtime when the mtime is newer — see the
+    inline comments below."""
     bc = _bc()
     try:
         from datetime import datetime as _dt

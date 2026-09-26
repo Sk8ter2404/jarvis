@@ -14,8 +14,10 @@ hermetic for CI) — run it explicitly on a machine with ANTHROPIC_API_KEY set:
 Exit 0 = booted + every battery item answered with its expected marker; else 1.
 
 Non-fabrication is proven by markers the LLM cannot invent:
-  * version  -> "2.0.29" (only readable from the VERSION file via the
-                 version_info action),
+  * version  -> the live VERSION file string, read at runtime by
+                 _live_version() (the system prompt carries only a literal
+                 "1.0.0" example, so the real build number is reachable ONLY
+                 by running the version_info action),
   * system   -> "cpu"        (system_pulse reads live psutil stats),
   * time     -> "it is"      (get_time formats the real clock).
 """
@@ -33,10 +35,32 @@ PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INJECT = os.path.join(PROJECT, "injected_commands_staging.json")
 LOG = os.path.join(PROJECT, "_staging_integration.log")
 
+def _live_version() -> str:
+    """The release string ``version_info`` will report, read at RUNTIME.
+
+    ``version_info`` single-sources the release version from ``core/version.py``,
+    which reads the VERSION file (it deliberately IGNORES the stale ``version``
+    key in data/version.json — that's the self-upgrade pipeline's own counter).
+    So the VERSION file is the marker's one true source.
+
+    This used to be a hardcoded literal and rotted 76 releases behind the
+    product, failing the version item on every run.  Never snapshot it again.
+
+    On an unreadable/empty VERSION the sentinel can match NO log line, so the
+    item fails LOUDLY with a self-describing marker — never vacuously passes
+    (an empty marker would substring-match every line).
+    """
+    try:
+        with open(os.path.join(PROJECT, "VERSION"), "r", encoding="utf-8") as fh:
+            return fh.read().strip() or "<VERSION-FILE-EMPTY>"
+    except OSError:
+        return "<VERSION-FILE-UNREADABLE>"
+
+
 # (utterance, [expected lowercase substrings — ALL must appear in the reply window])
 DEFAULT_BATTERY = [
     ("what time is it", ["current time is"]),       # get_time real-clock output
-    ("what version are you on", ["2.0.29"]),          # version_info reads VERSION file
+    ("what version are you on", [_live_version()]),  # version_info reads VERSION file
     ("give me a system status report", ["cpu"]),     # system_pulse live psutil stats
 ]
 

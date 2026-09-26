@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -134,18 +135,50 @@ def _processor_label(size_vram: int | None, size_total: int | None) -> str:
 # ─── source 1 (fallback): parse `ollama ps` table text ───────────────────
 
 def _run_ollama_ps() -> str | None:
-    """Capture ``ollama ps`` stdout, or None on any failure. Never raises."""
+    """Capture ``ollama ps`` stdout, or None on any failure. Never raises.
+
+    BOUNDED BY CONSTRUCTION — do NOT "simplify" this back to
+    ``subprocess.run(["ollama", "ps"], capture_output=True, timeout=_PS_TIMEOUT)``.
+    On Windows that call is NOT bounded by its own timeout: when the timeout
+    fires, CPython does ``process.kill()`` and then an **untimed**
+    ``process.communicate()`` to drain the pipe (subprocess.py, the
+    ``if _mswindows:`` branch inside ``except TimeoutExpired``).  ``ollama ps``
+    leaves the long-lived ollama SERVER holding the inherited write end of that
+    pipe, so EOF never arrives and the drain blocks FOREVER.
+
+    Reproduced 2026-09-26: still blocked 15 s after a 2.0 s timeout, having
+    wedged the entire test suite mid-run (a "unit" test reached this through
+    web_interface.build_status → gpu_snapshot).  py-spy put the main thread in
+    ``join`` under ``_communicate`` with the ollama server still LISTENing.
+
+    Redirecting stdout to a temp FILE removes the pipe entirely: nothing is
+    inheritable that we must see closed, and there is no reader thread to join,
+    so ``wait(timeout=...)`` is a bound that actually holds.
+    """
     try:
-        r = subprocess.run(
-            ["ollama", "ps"],
-            capture_output=True, text=True, timeout=_PS_TIMEOUT,
-            creationflags=_NO_WINDOW,
-        )
+        with tempfile.TemporaryFile() as out:
+            try:
+                proc = subprocess.Popen(
+                    ["ollama", "ps"], stdout=out, stderr=subprocess.DEVNULL,
+                    creationflags=_NO_WINDOW,
+                )
+            except Exception:
+                return None
+            try:
+                rc = proc.wait(timeout=_PS_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    pass
+                return None
+            if rc != 0:
+                return None
+            out.seek(0)
+            return out.read().decode("utf-8", "replace")
     except Exception:
         return None
-    if r.returncode != 0:
-        return None
-    return r.stdout or ""
 
 
 def _parse_ollama_ps(text: str) -> list[dict]:

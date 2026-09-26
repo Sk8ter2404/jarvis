@@ -175,21 +175,28 @@ class OllamaPsTextTests(_GpuUsageBase):
         self.assertEqual(rows[0]["vram_mb"], 21 * 1024)
         self.assertEqual(rows[0]["processor"], "12%/88% CPU/GPU")
 
+    # These three patch ``_run_ollama_ps``, NOT ``subprocess.run``.  They are
+    # about the /api/ps -> `ollama ps` fallback LOGIC, so binding them to the
+    # spawn mechanism was the wrong seam: when _run_ollama_ps moved off
+    # subprocess.run (to make it actually bounded on Windows), the
+    # subprocess.run mocks stopped intercepting anything and two of these went
+    # green VACUOUSLY -- the real `ollama ps` ran and happened to return an
+    # empty table, so "both sources down" passed while neither was down.
     def test_resident_models_prefers_api_over_text(self):
-        # When /api/ps answers, `ollama ps` is never spawned.
-        run = mock.MagicMock()
+        # When /api/ps answers, the `ollama ps` fallback is never reached.
+        ps = mock.MagicMock()
         with mock.patch.object(gpu_usage.urllib.request, "urlopen",
                                _fake_urlopen(_API_PS_BODY)), \
-             mock.patch.object(gpu_usage.subprocess, "run", run):
+             mock.patch.object(gpu_usage, "_run_ollama_ps", ps):
             rows = gpu_usage._resident_models()
         self.assertEqual(len(rows), 3)
-        run.assert_not_called()
+        ps.assert_not_called()
 
     def test_resident_models_falls_back_to_text(self):
         with mock.patch.object(gpu_usage.urllib.request, "urlopen",
                                side_effect=OSError("down")), \
-             mock.patch.object(gpu_usage.subprocess, "run",
-                               return_value=_ps_ok()):
+             mock.patch.object(gpu_usage, "_run_ollama_ps",
+                               return_value=_OLLAMA_PS_TEXT):
             rows = gpu_usage._resident_models()
         self.assertEqual([r["name"] for r in rows][:1],
                          ["qwen2.5:14b-instruct-q5_K_M"])
@@ -197,9 +204,92 @@ class OllamaPsTextTests(_GpuUsageBase):
     def test_resident_models_empty_when_both_down(self):
         with mock.patch.object(gpu_usage.urllib.request, "urlopen",
                                side_effect=OSError("down")), \
-             mock.patch.object(gpu_usage.subprocess, "run",
-                               side_effect=FileNotFoundError()):
+             mock.patch.object(gpu_usage, "_run_ollama_ps",
+                               return_value=None):
             self.assertEqual(gpu_usage._resident_models(), [])
+
+
+class OllamaPsBoundednessTests(_GpuUsageBase):
+    """`ollama ps` must be spawned by a construction that is bounded on Windows.
+
+    Regression 2026-09-26 — the body used to be::
+
+        subprocess.run(["ollama", "ps"], capture_output=True, timeout=_PS_TIMEOUT)
+
+    which is NOT bounded on Windows.  When the timeout fires, CPython kills the
+    child and then calls an **untimed** ``communicate()`` to drain the pipe (see
+    the ``if _mswindows:`` branch of ``except TimeoutExpired`` in subprocess.py).
+    The long-lived ollama SERVER holds the inherited write end of that pipe, so
+    EOF never arrives and the drain never returns.
+
+    Measured against a synthetic child that outlived the timeout and left a
+    grandchild holding the pipe: the ``run()`` form never returned (>22 s), the
+    file-redirect form returned in 2.01 s.  In the wild it wedged the entire
+    test suite mid-run, reached from a "unit" test via build_status.
+    """
+
+    def _src(self) -> str:
+        """The function's CODE, with the docstring stripped.
+
+        The docstring deliberately names the forbidden construction so the next
+        reader knows what not to go back to -- which tripped these assertions
+        against the prose rather than the code.  Strip it via ast so the guard
+        judges what actually executes.
+        """
+        import ast
+        import inspect
+        import textwrap
+        fn = ast.parse(
+            textwrap.dedent(inspect.getsource(gpu_usage._run_ollama_ps))).body[0]
+        body = getattr(fn, "body", [])
+        if (body and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            fn.body = body[1:]
+        return ast.unparse(fn)
+
+    def test_does_not_use_the_unbounded_run_form(self):
+        src = self._src()
+        self.assertNotIn(
+            "capture_output", src,
+            "capture_output pipes stdout; on Windows the post-timeout drain of "
+            "that pipe is UNTIMED and hangs when a grandchild holds it")
+        self.assertNotIn(
+            "subprocess.run", src,
+            "subprocess.run's timeout is not a bound on Windows -- spawn with "
+            "Popen and redirect stdout to a file instead")
+
+    def test_redirects_stdout_to_a_file_and_waits_with_a_timeout(self):
+        src = self._src()
+        self.assertIn("tempfile.", src,
+                      "stdout must go to a temp FILE so there is no pipe to "
+                      "inherit and no reader thread to join")
+        self.assertRegex(src, r"wait\(timeout=",
+                         "the wait must carry the timeout")
+
+    def test_timeout_kills_the_child_and_returns_none(self):
+        """The timeout branch must kill the child and give up -- not drain."""
+        exc = gpu_usage.subprocess.TimeoutExpired(cmd=["ollama", "ps"],
+                                                 timeout=gpu_usage._PS_TIMEOUT)
+
+        class _FakeProc:
+            def __init__(self) -> None:
+                self.killed = False
+
+            def wait(self, timeout=None):
+                if not self.killed:
+                    raise exc
+                return -9
+
+            def kill(self) -> None:
+                self.killed = True
+
+        fake = _FakeProc()
+        with mock.patch.object(gpu_usage.subprocess, "Popen",
+                               return_value=fake):
+            self.assertIsNone(gpu_usage._run_ollama_ps())
+        self.assertTrue(fake.killed,
+                        "a timed-out `ollama ps` child was never killed")
 
 
 # ─── nvidia-smi CSV parsing ────────────────────────────────────────────────
@@ -239,8 +329,16 @@ class NvidiaSmiTests(_GpuUsageBase):
 class SnapshotTests(_GpuUsageBase):
     def _run_with(self, *, api=_API_PS_BODY, smi=_SMI_LINE,
                   urlopen_exc=None, smi_exc=None):
-        """Run gpu_snapshot with /api/ps + nvidia-smi mocked. subprocess.run is
-        routed by argv: nvidia-smi → the CSV, `ollama ps` → the table."""
+        """Run gpu_snapshot with /api/ps + nvidia-smi + `ollama ps` all mocked.
+
+        nvidia-smi is routed by argv through subprocess.run; `ollama ps` is
+        mocked at ``_run_ollama_ps`` instead.  It must NOT be routed through the
+        argv mock: that helper deliberately does not use subprocess.run (it
+        redirects stdout to a temp file so its timeout is bounded on Windows),
+        so an argv router left the REAL binary reachable from a test that
+        believed every source was mocked -- which is how a "no model source at
+        all" case silently became "whatever ollama happens to say".
+        """
         def _run(cmd, *a, **kw):
             exe = cmd[0] if cmd else ""
             if smi_exc is not None and exe == "nvidia-smi":
@@ -248,21 +346,20 @@ class SnapshotTests(_GpuUsageBase):
             if exe == "nvidia-smi":
                 return _smi_ok(smi) if smi is not None else mock.MagicMock(
                     returncode=1, stdout="")
-            if exe == "ollama":
-                # When /api/ps is forced down, also make the `ollama ps`
-                # subprocess fallback unavailable so the snapshot is exercised
-                # with NO model source at all.
-                if urlopen_exc is not None:
-                    raise FileNotFoundError()
-                return _ps_ok()
             return mock.MagicMock(returncode=1, stdout="")
+
+        # When /api/ps is forced down, make the `ollama ps` fallback
+        # unavailable too, so the snapshot is exercised with NO model source.
+        ps_text = None if urlopen_exc is not None else _OLLAMA_PS_TEXT
 
         url = (_fake_urlopen(OSError("x")) if urlopen_exc
                else _fake_urlopen(api))
         cm_url = (mock.patch.object(gpu_usage.urllib.request, "urlopen",
                                     side_effect=urlopen_exc) if urlopen_exc
                   else mock.patch.object(gpu_usage.urllib.request, "urlopen", url))
-        with cm_url, mock.patch.object(gpu_usage.subprocess, "run", _run):
+        with cm_url, mock.patch.object(gpu_usage.subprocess, "run", _run), \
+             mock.patch.object(gpu_usage, "_run_ollama_ps",
+                               return_value=ps_text):
             return gpu_usage.gpu_snapshot(use_cache=False)
 
     def test_full_snapshot(self):
@@ -305,7 +402,8 @@ class SnapshotTests(_GpuUsageBase):
 
         with mock.patch.object(gpu_usage.urllib.request, "urlopen",
                                _fake_urlopen(_API_PS_BODY)), \
-             mock.patch.object(gpu_usage.subprocess, "run", _run):
+             mock.patch.object(gpu_usage.subprocess, "run", _run), \
+             mock.patch.object(gpu_usage, "_run_ollama_ps", return_value=None):
             gpu_usage.gpu_snapshot(use_cache=False)   # primes cache
             n_after_first = calls["n"]
             gpu_usage.gpu_snapshot(use_cache=True)     # served from cache
