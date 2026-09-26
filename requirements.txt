@@ -17,10 +17,25 @@ sounddevice          # audio I/O
 soundfile            # read/write audio for TTS
 numpy                # audio math
 requests             # HTTP to robot
-opencv-python        # face detection
+opencv-python<5      # face detection. PINNED BELOW 5: opencv-python 5.0.0.93 is
+#                      the current stable on PyPI (checked 2026-09-26), and 5.x
+#                      crashes JARVIS at startup. Unpinned, a fresh
+#                      `pip install -r requirements.txt` — exactly what SETUP.md
+#                      tells a new user to run — installs the broken major.
+#                      `<5` (not ==) still takes 4.x fixes. Verify on 5.x before
+#                      raising this, and expect the cv2 API breaks that a major
+#                      bump implies.
 
 # AI backend — install the one(s) you want:
-anthropic            # Claude API — needs ANTHROPIC_API_KEY env var
+anthropic<1          # Claude API — needs ANTHROPIC_API_KEY env var.
+#                      PINNED BELOW 1 as a PRECAUTION (2026-09-26), not from an
+#                      observed crash: JARVIS is verified on 0.76.0, while PyPI
+#                      stable is already 1.8.0. A 0.x -> 1.x bump is breaking by
+#                      convention and this is the primary LLM path, so an
+#                      unpinned fresh install could hand a new user a broken
+#                      brain. Unlike the opencv pin above, nothing here is known
+#                      to fail on 1.x — test against it and raise this pin
+#                      deliberately rather than leaving it to resolve at random.
 ollama               # optional — local LLM backend (free, no internet; also run: ollama pull llama3)
 
 # TTS — primary (needs internet, great quality Microsoft neural voices):
