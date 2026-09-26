@@ -1158,3 +1158,60 @@ class BannerTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class FdRelativeDeleteTests(unittest.TestCase):
+    """A bare entry name passed with `dir_fd=` is NOT relative to the CWD.
+
+    Regression 2026-09-26. The delete guard resolved every path with
+    os.path.abspath(), which joins against the CWD. shutil.rmtree's POSIX
+    implementation (_rmtree_safe_fd) deletes with bare entry names and a
+    `dir_fd=`, so cleaning up ANY tempdir that happened to contain a "data/"
+    subdirectory looked exactly like deleting the live data dir, and the guard
+    refused it. That was 193 of the 195 errors in GitHub CI.
+
+    It could not reproduce on Windows: shutil.rmtree there does not use the fd
+    functions, so the guard always saw full paths. The local suite stayed green
+    while CI was red for 38 releases (2026-07-14 -> 2026-09-26).
+    """
+
+    def setUp(self):
+        if not live_data_guard._INSTALLED:
+            self.skipTest("live-data guard not installed (JARVIS_ALLOW_LIVE_DATA?)")
+
+    def test_rmtree_of_a_tempdir_containing_a_data_subdir_is_allowed(self):
+        """The exact shape that broke CI. On Windows this exercises the
+        full-path route instead, which is still worth asserting."""
+        import shutil
+        top = tempfile.mkdtemp()
+        inner = os.path.join(top, "data")
+        os.makedirs(inner, exist_ok=True)
+        with open(os.path.join(inner, "payload.txt"), "w", encoding="utf-8") as fh:
+            fh.write("not the live data dir")
+        shutil.rmtree(top)                      # must NOT raise
+        self.assertFalse(os.path.exists(top))
+
+    @unittest.skipUnless(os.name == "posix", "dir_fd deletes are POSIX-only")
+    def test_fd_relative_delete_outside_live_data_is_allowed(self):
+        top = tempfile.mkdtemp()
+        os.mkdir(os.path.join(top, "data"))
+        fd = os.open(top, os.O_RDONLY)
+        try:
+            os.rmdir("data", dir_fd=fd)         # must NOT raise
+            self.assertFalse(os.path.exists(os.path.join(top, "data")))
+        finally:
+            os.close(fd)
+            import shutil
+            shutil.rmtree(top, ignore_errors=True)
+
+    @unittest.skipUnless(os.name == "posix", "dir_fd deletes are POSIX-only")
+    def test_fd_relative_delete_INSIDE_live_data_is_still_blocked(self):
+        """The fix must not buy CI green by disarming the guard."""
+        parent = os.path.dirname(live_data_guard.LIVE_DATA_DIR)
+        fd = os.open(parent, os.O_RDONLY)
+        try:
+            name = os.path.basename(live_data_guard.LIVE_DATA_DIR)
+            with self.assertRaises(live_data_guard.LiveDataGuardError):
+                os.rmdir(name, dir_fd=fd)
+        finally:
+            os.close(fd)

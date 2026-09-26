@@ -393,10 +393,52 @@ def _boot_script_in(args) -> str | None:
 # Module level, not closures inside install(), so _arm() can rebuild exactly the
 # one that was displaced without disturbing the others.
 
+def _fd_under_live_data(dir_fd, name) -> bool:
+    """Is ``name``, resolved against the OPEN DIRECTORY ``dir_fd``, inside the
+    live data dir?
+
+    Resolves the fd through /proc where that exists; failing that, compares the
+    fd's identity against the live data dir by ``(st_dev, st_ino)``.
+
+    Treating an unresolvable fd as "not live data" is safe rather than lax:
+    every public entry point that can begin an fd-relative walk
+    (``shutil.rmtree``) is itself guarded with a FULL path, so a walk into the
+    live data dir is refused before any fd-relative delete can happen.
+    """
+    try:
+        target = os.readlink(f"/proc/self/fd/{int(dir_fd)}")
+    except Exception:  # noqa: BLE001 — no /proc, or a closed/invalid fd
+        target = None
+    if target:
+        try:
+            return _under_live_data(os.path.join(target, os.fspath(name)))
+        except Exception:  # noqa: BLE001
+            return False
+    try:
+        a = os.stat(dir_fd)
+        b = os.stat(LIVE_DATA_DIR)
+        return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _guard_delete(op: str, real):
     def wrapper(path, *a, **k):
-        if _under_live_data(path):
-            _refuse(op, str(path))
+        dir_fd = k.get("dir_fd")
+        if dir_fd is None:
+            if _under_live_data(path):
+                _refuse(op, str(path))
+        # `path` is relative to an open DIRECTORY FD, not to the CWD, so
+        # _under_live_data()'s os.path.abspath() would resolve it against the
+        # repo root and mis-judge it.  shutil.rmtree's POSIX implementation
+        # (_rmtree_safe_fd) deletes with bare entry names exactly this way, so
+        # ANY tempdir containing a "data/" subdir looked identical to the live
+        # data dir and its cleanup was refused.  That produced 193 of the 195
+        # errors in CI and was invisible on Windows, where shutil.rmtree does
+        # not use the fd functions at all — so the local suite stayed green
+        # while GitHub went red for 38 releases (2026-07-14 → 2026-09-26).
+        elif _fd_under_live_data(dir_fd, path):
+            _refuse(op, f"{path} (dir_fd={dir_fd})")
         return real(path, *a, **k)
     return _mark(wrapper, real)
 
