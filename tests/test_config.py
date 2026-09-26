@@ -72,7 +72,15 @@ class EnvDrivenTests(unittest.TestCase):
                              clear=False):
             mod = importlib.reload(config)
             self.assertEqual(mod.BAMBU_PRINTER_IP, "192.168.5.5")
+            # `open` must be mocked too, not just exists + json.load:
+            # data/user_settings.json is gitignored (.gitignore `data/*`), so on
+            # a clean checkout os.path.exists lies True, open() then raises
+            # FileNotFoundError, _apply_user_settings swallows it and returns
+            # early -- and USER_NAME stayed "" instead of the settings value.
+            # That passed only on a machine where the real file happens to
+            # exist, and errored on every CI run.
             with mock.patch("os.path.exists", return_value=True), \
+                 mock.patch("builtins.open", mock.mock_open(read_data="{}")), \
                  mock.patch("json.load", return_value=payload):
                 mod._apply_user_settings()
             self.assertEqual(mod.BAMBU_PRINTER_IP, "192.168.5.5")  # secret intact

@@ -1539,7 +1539,16 @@ class TeamsNoDeclineAfterOutOfBandAnswerTests(unittest.TestCase):
     taken, plus a focus steal. It must re-check live window state first."""
 
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("teams_screener")
+        # teams_screener is a PERSONAL skill and is gitignored (.gitignore:84),
+        # so it does not exist in a clean clone. Loading it unconditionally
+        # errored on every CI run while passing locally, where the file is
+        # present -- skip instead, so the coverage still runs for whoever has
+        # the skill without failing a checkout that legitimately lacks it.
+        try:
+            self.mod, self.actions = load_skill_isolated("teams_screener")
+        except FileNotFoundError:
+            self.skipTest("teams_screener is a gitignored personal skill and is "
+                          "absent from this checkout")
         self.mod.PRIORITY_AUTO_DECLINE_SECONDS = 0    # no real wait in the test
 
     def test_grace_thread_does_not_decline_an_ended_call(self):
