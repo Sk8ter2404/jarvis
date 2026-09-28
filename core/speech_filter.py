@@ -135,3 +135,58 @@ def is_valid_speech(text: str, conf: dict, peak_rms: float = 0.0) -> tuple[bool,
             return False, f"low confidence (logprob={conf['avg_logprob']:.2f})"
 
     return True, ""
+
+
+# ── Per-install tuning ──────────────────────────────────────────────────────
+# These thresholds depend on the MICROPHONE: its gain decides what RMS "loud"
+# is, and its noise floor shapes Whisper's confidence. An install whose mic
+# differs from the desktop's (e.g. a laptop edge node) overrides them through
+# core.config.SPEECH_FILTER_OVERRIDES (data/user_settings.json); the monolith
+# calls apply_overrides() once at import. This module stays pure: it never
+# imports config and does no I/O.
+#
+# Only these four are overridable, each with a type and a sane range. Anything
+# else -- unknown names, wrong types, bools, out-of-range values, a
+# non-integral word count -- is skipped rather than half-applied.
+_OVERRIDABLE = {
+    "WHISPER_MIN_WORDS":          (int,   1,     10),
+    "WHISPER_MAX_NO_SPEECH_PROB": (float, 0.0,   1.0),
+    "WHISPER_MIN_AVG_LOGPROB":    (float, -10.0, 0.0),
+    "WHISPER_TRUST_RMS":          (float, 0.0,   1.0),
+}
+_DEFAULTS = {name: globals()[name] for name in _OVERRIDABLE}
+
+
+def apply_overrides(overrides) -> dict:
+    """Apply validated overrides to this module's thresholds.
+
+    Returns ``{name: value}`` for what was ACTUALLY applied (never raises).
+    Callers that re-export a threshold by value must re-read it afterwards."""
+    applied = {}
+    if not isinstance(overrides, dict):
+        return applied
+    g = globals()
+    for name, val in overrides.items():
+        spec = _OVERRIDABLE.get(name)
+        if spec is None or isinstance(val, bool):
+            continue
+        typ, lo, hi = spec
+        try:
+            if typ is int:
+                if isinstance(val, float) and not val.is_integer():
+                    continue
+                v = int(val)
+            else:
+                v = float(val)
+        except (TypeError, ValueError):
+            continue
+        if not (lo <= v <= hi):
+            continue
+        g[name] = v
+        applied[name] = v
+    return applied
+
+
+def reset_overrides() -> None:
+    """Restore every overridable threshold to its built-in default."""
+    globals().update(_DEFAULTS)

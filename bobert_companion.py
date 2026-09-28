@@ -572,6 +572,16 @@ from audio import kinect_bridge as _kinect_bridge  # type: ignore
 # THERE, not here. See core/config.py docstring for the contract.
 from core.config import *  # noqa: F401,F403
 
+# Per-install speech-filter tuning (config SPEECH_FILTER_OVERRIDES). Applied
+# here, not in core/speech_filter.py, so that module stays pure. WHISPER_TRUST_RMS
+# was imported BY VALUE above, so it is re-read afterwards: overriding only the
+# module would leave this copy stale (a test pins the two in lockstep).
+import core.speech_filter as _speech_filter_mod  # noqa: E402
+_speech_filter_applied = _speech_filter_mod.apply_overrides(SPEECH_FILTER_OVERRIDES)
+if _speech_filter_applied:
+    print(f"  [speech-filter] per-install overrides: {_speech_filter_applied}")
+WHISPER_TRUST_RMS = _speech_filter_mod.WHISPER_TRUST_RMS
+
 # (LOCAL_LLM_*, ORCHESTRATOR_*, LOCAL_VISION_*, IMAGE_GEN_*, TTS_*, XTTS_*,
 # WHISPER_MODEL — all moved to core/config.py in Phase-1 refactor.
 # Override per-machine by editing core/config.py or by setting the
@@ -13944,9 +13954,28 @@ def _ollama_chat_bounded(model, messages):
     return client.chat(model=model, messages=messages)
 
 
+def _llm_brain_is_remote() -> bool:
+    """True when LOCAL_LLM_BASE_URL points off this machine (an edge-node
+    install whose brain is another box over the network/tailnet). Two things
+    change then: probes need a network-tolerant timeout, and the local-server
+    self-heal must not run at all -- starting an ollama.exe HERE can never fix an
+    outage THERE. Ported 2026-09-28 from the Dell edge node."""
+    from core.ollama_opts import endpoint_is_remote
+    return endpoint_is_remote(LOCAL_LLM_BASE_URL)
+
+
+def _ollama_probe_timeout() -> float:
+    """Timeout for EVERY liveness/inventory probe of the LLM server. One knob:
+    the Dell's patch fixed only _ollama_alive, while five more probes kept a
+    hardcoded 2 s and false-failed the same way against a busy remote brain
+    ("model not installed", no failover). See core/ollama_opts.probe_timeout."""
+    from core.ollama_opts import probe_timeout
+    return probe_timeout(LOCAL_LLM_BASE_URL)
+
+
 def _ollama_alive() -> bool:
     try:
-        return requests.get(f"{LOCAL_LLM_BASE_URL}/api/tags", timeout=2).ok
+        return requests.get(f"{LOCAL_LLM_BASE_URL}/api/tags", timeout=_ollama_probe_timeout()).ok
     except Exception:
         return False
 
@@ -14042,6 +14071,14 @@ def _ensure_ollama_running(timeout_sec: float = 90.0) -> bool:
     the attempt. Best-effort; never raises. 2026-07-09."""
     if _ollama_alive():
         return True
+    # REMOTE-BRAIN GATE (ported 2026-09-28 from the Dell edge node): when the
+    # brain is another machine, reaping/spawning a LOCAL ollama cannot heal the
+    # outage -- and a local server that did come up would sit unused, or pull a
+    # model onto a small local GPU. Report honestly and let the caller degrade.
+    if _llm_brain_is_remote():
+        print(f"  [ollama] brain is REMOTE ({LOCAL_LLM_BASE_URL}) and not "
+              f"answering -- not starting a local server; check the link.")
+        return False
     # STAGING GATE (2026-07-21 audit): the staging/blue-green candidate may
     # OBSERVE the shared server (the fast path above) but must never reap or
     # spawn it — the staging branch disables tray/mic/cameras yet nothing
@@ -14236,7 +14273,7 @@ def _get_local_llm_model() -> str:
         return override
 
     try:
-        r = requests.get(f"{LOCAL_LLM_BASE_URL}/api/tags", timeout=2)
+        r = requests.get(f"{LOCAL_LLM_BASE_URL}/api/tags", timeout=_ollama_probe_timeout())
         installed = [m.get("name", "") for m in r.json().get("models", [])] if r.ok else []
     except Exception:
         installed = []
@@ -14297,7 +14334,7 @@ def _next_local_llm_fallback(exclude: str) -> str | None:
     _get_local_llm_model's base-name matching so a `:latest` variant counts.
     2026-07-09 — added so one bad quant can't mute the local brain."""
     try:
-        r = requests.get(f"{LOCAL_LLM_BASE_URL}/api/tags", timeout=2)
+        r = requests.get(f"{LOCAL_LLM_BASE_URL}/api/tags", timeout=_ollama_probe_timeout())
         installed = [m.get("name", "") for m in r.json().get("models", [])] if r.ok else []
     except Exception:
         installed = []
@@ -14334,7 +14371,7 @@ def _ollama_has_model(model: str) -> bool:
     response failover only fires on kind='empty', not the 404's kind='fail').
     Callers that want sibling resolution use _ollama_resolve_model below."""
     try:
-        r = requests.get(f"{LOCAL_LLM_BASE_URL}/api/tags", timeout=2)
+        r = requests.get(f"{LOCAL_LLM_BASE_URL}/api/tags", timeout=_ollama_probe_timeout())
         if not r.ok:
             return False
         names = {m.get("name", "") for m in r.json().get("models", [])}
@@ -14362,7 +14399,7 @@ def _ollama_resolve_model(model: str) -> str | None:
     if not want:
         return None
     try:
-        r = requests.get(f"{LOCAL_LLM_BASE_URL}/api/tags", timeout=2)
+        r = requests.get(f"{LOCAL_LLM_BASE_URL}/api/tags", timeout=_ollama_probe_timeout())
         if not r.ok:
             return None
         names = [m.get("name", "") for m in r.json().get("models", []) if m.get("name")]
@@ -14402,7 +14439,7 @@ def _ollama_loaded_models() -> list[dict]:
     conservatively. This is the canonical runtime residency check; unlike
     /api/tags (which lists INSTALLED models) /api/ps lists LOADED ones."""
     try:
-        r = requests.get(f"{LOCAL_LLM_BASE_URL}/api/ps", timeout=2)
+        r = requests.get(f"{LOCAL_LLM_BASE_URL}/api/ps", timeout=_ollama_probe_timeout())
         if not r.ok:
             return []
         models = r.json().get("models", [])
@@ -23067,6 +23104,12 @@ def _audio_music_should_refuse_wake(text: str) -> bool:
 # the wake_word_mode_on/off voice actions.
 _require_wake_runtime = REQUIRE_WAKE_MODE
 
+# Follow-up window (core/followup_window.py): in wake-word mode, follow-ups
+# shortly after the user addressed JARVIS need no wake word. Sized by config
+# FOLLOWUP_WINDOW_S; 0 (default) disables it and this gate is unchanged.
+from core.followup_window import FollowupWindow as _FollowupWindow  # noqa: E402
+_followup_window = _FollowupWindow(FOLLOWUP_WINDOW_S)
+
 
 def _text_has_wake_prefix(text: str) -> bool:
     """True if ``text`` is a short utterance led by a wake word
@@ -23116,8 +23159,11 @@ def _should_refuse_background_audio(text: str) -> "tuple[bool, str]":
     gate failure can never silence JARVIS."""
     try:
         if _text_has_wake_prefix(text):
+            _followup_window.note_addressed()
             return (False, "")
         if _require_wake_runtime:
+            if _followup_window.admit():
+                return (False, "follow-up window")
             return (True, "wake-word mode")
         if _smtc_media_playing():
             return (True, "media playing")

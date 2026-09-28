@@ -5,7 +5,6 @@ load-time crash in any skill/core/tool file fails here in seconds, without a
 full boot."""
 import importlib
 import os
-import py_compile
 import unittest
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -28,6 +27,7 @@ _IMPORT_LIGHT_CORE = (
     "core.tts", "core.llm_client", "core.tone_detector",
     "core.speech_filter", "core.voice_emotion", "core.memory_guards",
     "core.legacy_memory", "core.stream_speech",
+    "core.followup_window", "core.ollama_opts",
 )
 
 
@@ -53,14 +53,25 @@ def _iter_source_files():
 
 class CompileSweepTests(unittest.TestCase):
     def test_all_sources_compile(self):
+        # Compiles IN MEMORY. This is a syntax sweep, so it must not write .pyc
+        # files into the live repo's __pycache__ -- but it used
+        # py_compile.compile(), which does. On a Windows box with on-access
+        # antivirus the overwrite of the freshly written ~1.2 MB monolith .pyc
+        # was transiently refused (WinError 5: still refused after 50 ms,
+        # accepted after 200 ms; no process held the file), which failed this
+        # test under tools/run_tests_ci_sim.py on 2026-09-28. compile() on the
+        # source bytes is exactly what py_compile does before it writes
+        # (importlib's source_to_code), so the check itself is unchanged.
         failures = []
         count = 0
         for path in _iter_source_files():
             count += 1
             try:
-                py_compile.compile(path, doraise=True)
-            except py_compile.PyCompileError as exc:
-                failures.append(f"{os.path.relpath(path, _PROJECT_ROOT)}: {exc.msg}")
+                with open(path, "rb") as fh:
+                    compile(fh.read(), path, "exec", dont_inherit=True)
+            except Exception as exc:  # SyntaxError, bad encoding, null bytes...
+                failures.append(f"{os.path.relpath(path, _PROJECT_ROOT)}: "
+                                f"{type(exc).__name__}: {exc}")
         self.assertGreater(count, 50, "expected to sweep >50 source files")
         self.assertEqual(failures, [], "files failed to compile:\n" + "\n".join(failures))
 

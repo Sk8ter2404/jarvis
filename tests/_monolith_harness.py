@@ -78,6 +78,17 @@ def load_monolith():
     if root not in sys.path:
         sys.path.insert(0, root)
     import bobert_companion as bc  # noqa: E402  (env must be set first)
+    # Per-install tuning must never reach a test. At import the monolith applied
+    # THIS box's user_settings.json SPEECH_FILTER_OVERRIDES (mutating the shared
+    # core.speech_filter module) and sized its follow-up window from
+    # FOLLOWUP_WINDOW_S. Both are expected to differ per machine (the Dell edge
+    # node sets them), so put the shipped defaults back: every test then sees the
+    # same thresholds on every box, not "passes only on the author's machine".
+    import core.speech_filter as _sf  # noqa: E402
+    from core.followup_window import FollowupWindow  # noqa: E402
+    _sf.reset_overrides()
+    bc.WHISPER_TRUST_RMS = _sf.WHISPER_TRUST_RMS
+    bc._followup_window = FollowupWindow(0)
     _bc = bc
     return bc
 

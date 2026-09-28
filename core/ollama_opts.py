@@ -34,6 +34,7 @@ existing caller and test keeps working.
 from __future__ import annotations
 
 import re
+from urllib.parse import urlsplit
 
 # The window every model that comfortably fits gets. Measured on the 3090.
 DEFAULT_NUM_CTX = 16384
@@ -51,6 +52,45 @@ _BIG_TAGS = ("30b", "32b", "34b", "65b", "70b", "72b")
 # active-param `a3b` MoE suffix — the leading `a` is excluded by the lookbehind
 # so `qwen3:30b-a3b` parses as 30, not 3.
 _SIZE_RE = re.compile(r"(?<![a-z0-9])(\d+)b\b")
+
+# ── Probe timeouts: sized to WHERE the server is ───────────────────────────
+# A liveness or inventory probe of the LLM server (GET /api/tags, /api/ps) needs
+# a timeout that fits the server's location. 2 s is right for loopback. It is far
+# too tight for a REMOTE brain: measured live 2026-09-09 on an edge-node install
+# whose brain was a GPU box on the tailnet, a healthy server mid-generation blew
+# the 2 s probe, JARVIS declared the brain dead and answered "my local model
+# isn't responding" while the remote box was serving fine. Every probe of the
+# LLM server takes its timeout from probe_timeout() -- one knob, not six copies
+# (a static test fails if a probe pins a literal timeout again).
+PROBE_TIMEOUT_LOCAL_S = 2
+PROBE_TIMEOUT_REMOTE_S = 8
+
+
+def endpoint_is_remote(base_url) -> bool:
+    """True when ``base_url`` points OFF this machine.
+
+    Loopback is the whole 127.0.0.0/8 block, ``localhost``, ``::1`` and the
+    wildcard ``0.0.0.0``. Anything unparseable returns False: treating junk as
+    local keeps the pre-existing behaviour (short probe, local self-heal allowed)
+    instead of inventing a remote brain. Never raises."""
+    try:
+        s = str(base_url or "").strip()
+        if not s:
+            return False
+        host = urlsplit(s if "//" in s else "//" + s).hostname
+        if not host:
+            return False
+        host = host.lower()
+        if host in ("localhost", "::1", "0.0.0.0") or host.startswith("127."):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def probe_timeout(base_url) -> float:
+    """Seconds to wait on a liveness/inventory probe of ``base_url``."""
+    return PROBE_TIMEOUT_REMOTE_S if endpoint_is_remote(base_url) else PROBE_TIMEOUT_LOCAL_S
 
 
 def local_num_ctx(model: str) -> int:

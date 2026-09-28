@@ -470,6 +470,15 @@ AMBIENT_MUSIC_REFUSE_WAKE = True
 # user_settings.json, and the voice action toggles it live at runtime.
 REQUIRE_WAKE_MODE = False
 
+# Follow-up window for wake-word mode, in seconds. After the user addresses
+# JARVIS by its wake word, follow-ups inside this window need no wake word, and
+# each admitted one extends it. 0 (default) = strict wake-word mode, unchanged.
+# Ported 2026-09-28 from the Dell edge node, which ran it at 45. CAUTION: every
+# admitted utterance extends the window, so in a noisy room (the reason to use
+# wake-word mode at all) steady crosstalk such as a TV can hold it open; see
+# core/followup_window.py. Set via user_settings.json.
+FOLLOWUP_WINDOW_S = 0.0
+
 
 # ─── Whisper STT (faster-whisper preferred, GPU when present) ──────────
 # `WHISPER_DEVICE = 'auto'` lets ctranslate2 + torch decide; 'cuda'
@@ -480,6 +489,15 @@ REQUIRE_WAKE_MODE = False
 WHISPER_DEVICE      = "auto"            # "auto" | "cuda" | "cuda:N" | "cpu"
 WHISPER_MODEL_CUDA  = "large-v3-turbo"  # ~3.1 GB VRAM, 8x faster than large-v3
 WHISPER_MODEL_CPU   = "small"           # CPU-friendly default when no GPU
+
+# Per-install speech-filter tuning. The Whisper gate thresholds depend on the
+# MICROPHONE, so an install whose mic differs from the desktop's overrides them
+# here (via user_settings.json) instead of editing core/speech_filter.py and
+# carrying a local patch. Allowed keys: WHISPER_MIN_WORDS, WHISPER_TRUST_RMS,
+# WHISPER_MIN_AVG_LOGPROB, WHISPER_MAX_NO_SPEECH_PROB; anything else is ignored.
+# Empty (default) = the built-in thresholds. Example for a laptop mic:
+#   {"WHISPER_MIN_WORDS": 3, "WHISPER_MIN_AVG_LOGPROB": -1.15, "WHISPER_TRUST_RMS": 0.15}
+SPEECH_FILTER_OVERRIDES = {}
 
 
 # ─── Audio ducking (WASAPI session volume during JARVIS speech) ────────
