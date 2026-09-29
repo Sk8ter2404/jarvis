@@ -87,7 +87,39 @@ def _tail(path: str, n: int) -> str:
         return ""
 
 
+def _prod_jarvis_pids() -> list[int] | None:
+    """PIDs of running PROD JARVIS processes (bobert_companion.py without
+    --staging), or None when processes cannot be listed here (no psutil)."""
+    try:
+        import psutil
+    except Exception:
+        return None
+    pids = []
+    try:
+        for p in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                name = (p.info.get("name") or "").lower()
+                cmd = " ".join(p.info.get("cmdline") or [])
+            except Exception:
+                continue
+            if name.startswith("python") and "bobert_companion" in cmd and "--staging" not in cmd:
+                pids.append(int(p.info["pid"]))
+    except Exception:
+        return None
+    return pids
+
+
 def is_running() -> bool:
+    """True when a PROD JARVIS process exists.
+
+    The old test -- "the session log was written in the last 15 s" -- misfires on
+    an idle JARVIS, which only logs 'Listening…' about every 20 s: the driver then
+    ran _boot_jarvis.ps1, whose first step KILLS the running instance (seen live
+    2026-09-29 14:57, mid test-sweep). Log freshness is now only the fallback when
+    processes cannot be listed."""
+    pids = _prod_jarvis_pids()
+    if pids is not None:
+        return bool(pids)
     lg = latest_log()
     return bool(lg) and (time.time() - os.path.getmtime(lg)) < ALIVE_WINDOW_S
 
@@ -126,7 +158,18 @@ def boot(timeout: float = 45.0) -> bool:
 def force_wake() -> None:
     # The inject channel is mic-independent, so the wake WORD can't reach it;
     # the tray command channel is drained regardless of sleep/standby.
-    _write_atomic(TRAY, json.dumps([{"cmd": "force_wake"}]))
+    # Append, never overwrite: a command the app hasn't drained yet (a queued
+    # "restart" from a redeploy, say) must not be silently replaced.
+    items = []
+    if os.path.exists(TRAY):
+        try:
+            items = json.loads(open(TRAY, encoding="utf-8").read().strip() or "[]")
+            if not isinstance(items, list):
+                items = []
+        except Exception:
+            items = []
+    items.append({"cmd": "force_wake"})
+    _write_atomic(TRAY, json.dumps(items))
     time.sleep(1.5)
 
 

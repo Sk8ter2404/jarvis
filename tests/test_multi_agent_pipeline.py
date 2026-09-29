@@ -1825,6 +1825,25 @@ class LoopDriverTests(LoopDriverBase):
             rc, out = self._run_loop(max_iter=2, task_count=0)
         self.assertEqual(rc, 0)
 
+    def test_loop_leaves_sys_path_as_it_found_it(self):
+        # CI 2026-09-29: the driver left project_dir (here a temp tree with a
+        # stub bobert_companion.py) on sys.path for the rest of the process; a
+        # later import on another thread resolved into it and tempdir cleanup
+        # failed with "Directory not empty".
+        self.write_todo("- [x] done\n")
+        before = list(sys.path)
+        rc, out = self._run_loop(max_iter=2, task_count=0)
+        self.assertEqual(rc, 0)
+        self.assertNotIn(self.tmp, sys.path)
+        self.assertEqual(sys.path, before)
+        self.assertNotIn("stability-gate helper unavailable", out)   # import still resolves
+
+    def test_import_from_project_restores_path_on_failure(self):
+        before = list(sys.path)
+        with self.assertRaises(ImportError):
+            P._import_from_project(self.tmp, "no_such_module_zz9")
+        self.assertEqual(sys.path, before)
+
     def test_first_unchecked_none_race_breaks_loop(self):
         # _count_unchecked sees a pending task (so the loop body runs) but the
         # follow-up _first_unchecked_task returns None (a concurrent edit ticked

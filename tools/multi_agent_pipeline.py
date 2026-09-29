@@ -1335,6 +1335,30 @@ def run_pipeline_on_task(task_line: str, *, claude_path: str,
 # and runs it. Keeping the loop in a real module (not inside the template
 # string) makes it grep-able, testable, and trivial to extend.
 
+def _import_from_project(project_dir: str, module: str):
+    """Import ``module`` with ``project_dir`` first on sys.path only for the
+    duration of the import.
+
+    Both call sites used to ``sys.path.insert(0, project_dir)`` and never take
+    it back out, so every caller's project dir stayed on the process's import
+    path. In the test suite that dir is a temp tree holding a stub
+    ``bobert_companion.py``: a later ``import bobert_companion`` on any thread
+    could resolve to the stub (and write a ``__pycache__`` into the tree while
+    it was being removed -- CI 2026-09-29, "Directory not empty")."""
+    import importlib
+    added = project_dir not in sys.path
+    if added:
+        sys.path.insert(0, project_dir)
+    try:
+        return importlib.import_module(module)
+    finally:
+        if added:
+            try:
+                sys.path.remove(project_dir)
+            except ValueError:
+                pass
+
+
 def run_pipeline_loop_driver(*, project_dir: str, claude_path: str,
                              stream_log: str, max_iter: int,
                              task_count: int,
@@ -1454,11 +1478,9 @@ def run_pipeline_loop_driver(*, project_dir: str, claude_path: str,
     # -> this module). We only need the helper when the gate actually
     # fires, so deferring import is also faster on the no-gate path.
     try:
-        sys.path.insert(0, project_dir)
-        from upgrade_jarvis import (  # type: ignore
-            _stability_gate as _run_stability_gate,
-            _gate_config as _read_gate_config,
-        )
+        _uj = _import_from_project(project_dir, "upgrade_jarvis")
+        _run_stability_gate = _uj._stability_gate
+        _read_gate_config = _uj._gate_config
     except Exception as _gate_imp_exc:
         emit(f"{YELLOW}[gate] stability-gate helper unavailable "
              f"({_gate_imp_exc!r}); gate disabled this run{RESET}")
@@ -1704,9 +1726,7 @@ def _cli(argv: list[str]) -> int:
         # is driven by upgrade_jarvis.py the orchestrator owns the relaunch,
         # so we must NOT relaunch here too (would race the singleton lock).
         try:
-            sys.path.insert(0, PROJECT_DIR)
-            from upgrade_jarvis import relaunch_jarvis  # type: ignore
-            relaunch_jarvis()
+            _import_from_project(PROJECT_DIR, "upgrade_jarvis").relaunch_jarvis()
             print("[pipeline] JARVIS relaunched in ambient-learning standby "
                   "(say 'JARVIS' to wake).")
         except Exception as _relaunch_exc:
