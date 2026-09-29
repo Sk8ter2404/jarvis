@@ -995,3 +995,113 @@ class FollowupRoundIsRatchetedElsewhereTests(unittest.TestCase):
                       "from 135/135 action names to 11/135. If the slot was "
                       "renamed, update this probe; if the mechanism changed, "
                       "prove the new one in " + self.FOLLOWUP_GUARD)
+
+
+class GenericHeaderWordRoutingRegressionTests(unittest.TestCase):
+    """2026-09-29: select_sections' header-word fallback fired on ANY header
+    word longer than three letters, with a loose prefix/suffix test. Generic
+    words ("mode", "control", "status", ...) sit in many headers, so one of
+    them in a turn loaded every section carrying it. Measured before the fix:
+
+      'turn off wake word mode'  -> 9 sections, ~8.5k chars of volatile tail
+                                    (GUARD / FOCUS x2 / NIGHT-OWL / AMBIENT
+                                    MODE on "mode", WAKE LISTENER on "wake",
+                                    SHUTDOWN ALIASES on "turn off")
+      'Jarvis now has full control over the Butterbot'
+                                 -> AIR CONTROL + POINT-TO-CONTROL on "control"
+      'how much space is left on my C drive'
+                                 -> nothing beyond the always-on launcher, so
+                                    check_system never reached the model
+
+    Every test here fails on the pre-fix router."""
+
+    WAKE_MODE_TURN = "turn off wake word mode"
+    CONTROL_TURN = "Jarvis now has full control over the Butterbot"
+    DISK_TURN = "how much space is left on my C drive"
+
+    def setUp(self):
+        self.core, self.sections = pr.split_pc_control(FULL)
+        self.bodies = dict(self.sections)
+        self.always = {h.strip() for h, _b in self.sections
+                       if h.strip().upper() in pr._ALWAYS}
+        self.assertTrue(self.always, "no _ALWAYS section parsed -- the "
+                                     "exact-set assertion below would be blind")
+
+    def test_wake_word_mode_turn_selects_only_its_section(self):
+        inc, _ = pr.select_sections(self.WAKE_MODE_TURN, self.sections)
+        self.assertEqual(set(inc), {"WAKE-WORD MODE"} | self.always,
+                         f"{self.WAKE_MODE_TURN!r} must load WAKE-WORD MODE "
+                         f"and the always-on sections only, got {inc}")
+
+    def test_wake_word_mode_turn_ships_the_off_action_not_its_neighbours(self):
+        slim = pr.slim_pc_control(self.WAKE_MODE_TURN, FULL)
+        self.assertIn("wake_word_mode_off", slim)
+        for near_miss in ("wake_listener_stop", "turn_off_jarvis",
+                          "guard_off", "ambient_learning_mode_off"):
+            self.assertNotIn(near_miss, slim,
+                             f"{self.WAKE_MODE_TURN!r} must not hand the "
+                             f"model the near-miss {near_miss!r}")
+
+    def test_wake_word_mode_turn_tail_is_small(self):
+        # ~8.5k chars before the fix; WAKE-WORD MODE's own body is under 1k.
+        tail = pr.turn_pc_block(self.WAKE_MODE_TURN, FULL)
+        self.assertIn("wake_word_mode_off", tail)
+        self.assertLess(len(tail), 2000,
+                        f"volatile tail is {len(tail)} chars -- generic header "
+                        f"words are pulling unrelated sections again")
+
+    def test_full_control_sentence_does_not_load_air_control(self):
+        inc, _ = pr.select_sections(self.CONTROL_TURN, self.sections)
+        self.assertNotIn("AIR CONTROL", inc)
+        self.assertNotIn("POINT-TO-CONTROL", inc)
+
+    def test_c_drive_space_question_reaches_check_system(self):
+        # Located by CONTENT so a rename or move cannot make this pass blind:
+        # whichever section DEFINES check_system (an indented action line, not
+        # a cross-reference) must load, and the action must be in the tail.
+        homes = [h for h, b in self.sections
+                 if re.search(r"^\s+check_system\s+\S", b, re.M)]
+        self.assertTrue(homes, "no section defines check_system")
+        inc, _ = pr.select_sections(self.DISK_TURN, self.sections)
+        for h in homes:
+            self.assertIn(h, inc, f"{self.DISK_TURN!r} must load {h!r}")
+        self.assertIn("[ACTION: check_system]",
+                      pr.turn_pc_block(self.DISK_TURN, FULL))
+
+    def test_generic_word_alone_selects_nothing_by_header(self):
+        # Bug-class invariant: a turn whose only content word is a generic
+        # header word may load a section ONLY through that section's explicit
+        # keyword list, never through its header.
+        for w in sorted(pr._GENERIC_HEADER_WORDS):
+            turn = f"the {w} please"
+            low = " " + turn + " "
+            inc, _ = pr.select_sections(turn, self.sections)
+            by_header = [n for n in inc if n not in self.always and
+                         not any(k in low for k in pr._keywords_for(n))]
+            self.assertEqual(by_header, [],
+                             f"{turn!r} loaded {by_header} on the generic "
+                             f"header word {w!r} alone")
+
+    def test_ordinary_turn_off_does_not_offer_jarvis_power_off(self):
+        # Bare "turn off" routed SHUTDOWN ALIASES on every "turn off the X".
+        slim = pr.slim_pc_control("turn off the lights", FULL)
+        self.assertNotIn("turn_off_jarvis", slim)
+        # ...while the self-directed form still reaches the aliases.
+        inc, _ = pr.select_sections("turn yourself off", self.sections)
+        self.assertIn("SHUTDOWN ALIASES", inc)
+
+    def test_phrases_that_routed_only_on_generic_words_keep_their_home(self):
+        # These documented triggers reached their own section -- or, for
+        # 'system status', its status_panel action via STATUS READ-BACKS --
+        # ONLY through a now-generic header word; each home section now has
+        # an explicit keyword for it instead.
+        for phrase, home in (("music mode", "WAKE-WORD MODE"),
+                             ("quiet mode", "FOCUS MODE / DO-NOT-DISTURB"),
+                             ("list my Hue lights",
+                              "SMART HOME \u2014 PER-BRAND LIST"),
+                             ("list my Tuya plugs",
+                              "SMART HOME \u2014 PER-BRAND LIST"),
+                             ("JARVIS, system status", "SUIT DIAGNOSTICS")):
+            self.assertIn(home, self.bodies, f"fixture drift: no {home!r}")
+            inc, _ = pr.select_sections(phrase, self.sections)
+            self.assertIn(home, inc, f"{phrase!r} must still load {home!r}")

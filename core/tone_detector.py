@@ -29,8 +29,19 @@ _STRESS_SWEAR_WORDS = (
 
 _URGENCY_WORDS = (
     "now", "just", "finally", "hurry", "quick", "quickly", "asap",
-    "immediately", "already", "still",
+    "immediately", "already",
 )
+
+# Words that signal push-back ONLY in context. 'still' used to be a plain
+# urgency word, so "I'm still having USB issues" -- the owner REPORTING a
+# lingering fault, often the first time he mentions it -- came out 'rushed'
+# ("acknowledge in <=5 words, then act"), and with any swear word attached,
+# 'frustrated' ("Do NOT explain. Act."). Both registers push the model to
+# guess an action when the turn needs a question or a diagnostic. It now
+# counts, as frustration, only when the previous JARVIS turn failed or the
+# owner is restating himself; on its own it counts for nothing. Multi-word
+# phrases that contain it ("still not" in _REPETITION_PHRASES) are unchanged.
+_CONTEXT_GATED_FRUSTRATION_WORDS = ("still",)
 
 _REPETITION_PHRASES = (
     "i said", "i told you", "again", "like i said", "as i said",
@@ -84,7 +95,36 @@ def _is_late_night_hour(now: "datetime.datetime | None" = None) -> bool:
     return h >= _LATE_NIGHT_START_HOUR or h < _LATE_NIGHT_END_HOUR
 
 
-def detect_tone(user_text: str, prev_user_text: str | None = None) -> str | None:
+def _clean(text) -> str:
+    """Lowercase, letters/apostrophes/spaces only, whitespace collapsed."""
+    s = re.sub(r"[^a-z' ]+", " ", str(text).strip().lower())
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def is_restatement(user_text: str, prev_user_text) -> bool:
+    """True when ``user_text`` restates ``prev_user_text``: the two share a
+    majority of their words (at least 2). An IDENTICAL previous line does not
+    count -- callers take "previous" from a history the current turn may
+    already sit in, and comparing a line with itself is not repetition.
+
+    Shared with core.emotion_tracker so both classifiers agree on what
+    "repeating himself" means. Never raises: anything that cannot be read as
+    text is simply not a restatement."""
+    try:
+        if not prev_user_text or not user_text:
+            return False
+        cur = _clean(user_text)
+        prev = _clean(prev_user_text)
+        if not prev or not cur or prev == cur:
+            return False
+        pw, cw = set(prev.split()), set(cur.split())
+        return len(pw & cw) >= max(2, min(len(pw), len(cw)) // 2)
+    except Exception:
+        return False
+
+
+def detect_tone(user_text: str, prev_user_text: str | None = None,
+                prev_turn_failed: bool = False) -> str | None:
     """Classify the emotional tone of a transcribed user utterance.
 
     Returns one of: 'frustrated' | 'stressed' | 'rushed' | 'tired' |
@@ -93,8 +133,12 @@ def detect_tone(user_text: str, prev_user_text: str | None = None) -> str | None
 
     `prev_user_text` is the user's PREVIOUS utterance (or None); when it shares
     a majority of content words with this one the user is restating themselves,
-    a strong frustration signal. 'late_night' is a time-of-day fallback applied
-    only when no other tone fires, so explicit signals still win after midnight.
+    a strong frustration signal. `prev_turn_failed` says JARVIS's previous turn
+    did not do what was asked; it defaults to False because the live caller
+    has no such signal today. Either one turns a bare 'still' into
+    frustration (see _CONTEXT_GATED_FRUSTRATION_WORDS); without them 'still'
+    is neutral. 'late_night' is a time-of-day fallback applied only when no
+    other tone fires, so explicit signals still win after midnight.
 
     Pure-Python heuristics only — no LLM call, no model load, side-effect free.
     """
@@ -131,26 +175,21 @@ def detect_tone(user_text: str, prev_user_text: str | None = None) -> str | None
     # Cross-turn repetition: if the previous utterance shares a majority of its
     # content words with this one, the user is restating — a strong frustration
     # signal even without explicit "I said" markers.
-    similar_to_last = False
-    try:
-        if prev_user_text:
-            p = re.sub(r"[^a-z' ]+", " ", str(prev_user_text).strip().lower())
-            p = re.sub(r"\s+", " ", p).strip()
-            if p and p != clean:
-                pw = set(p.split())
-                cw = set(clean.split())
-                overlap = len(pw & cw)
-                if overlap >= max(2, min(len(pw), len(cw)) // 2):
-                    similar_to_last = True
-    except Exception:
-        similar_to_last = False
+    similar_to_last = is_restatement(clean, prev_user_text)
+
+    # 'still' is push-back only in context. A restatement is frustrated on
+    # its own (similar_to_last below), so the one extra case is a 'still'
+    # right after a failed turn. Alone it is a status report, not frustration.
+    gated_pushback = (prev_turn_failed
+                      and _has_any(_CONTEXT_GATED_FRUSTRATION_WORDS))
 
     # Priority: frustrated > excited > stressed > rushed > tired > playful >
     # late_night (time-based fallback). Frustration trumps stress because the
     # response strategy differs; excited fires before stressed because both can
     # carry exclamation marks but excitement pairs them with positive markers
     # and no swearing / clipped-imperative pattern.
-    if has_repeat or similar_to_last or (has_swear and (has_urgency or is_clipped)):
+    if (has_repeat or similar_to_last or gated_pushback
+            or (has_swear and (has_urgency or is_clipped))):
         return "frustrated"
 
     if has_excited and not has_swear and not is_clipped:
@@ -175,12 +214,20 @@ def detect_tone(user_text: str, prev_user_text: str | None = None) -> str | None
 
 
 _TONE_HINTS: dict[str, str] = {
+    # Rewritten 2026-09-29. The old hint ended "Do NOT explain. Act." -- an
+    # order to GUESS: a frustrated owner describing a fault got a random
+    # neighbouring action instead of the question or check that would find
+    # the cause. Still terse, still no defending the last attempt, but the
+    # next move is now a clarifying question or the matching diagnostic.
     "frustrated": (
         "USER_TONE: frustrated — the user appears to be repeating "
-        "themselves or pushing back. Skip pleasantries, skip 'sir' "
-        "filler, briefly acknowledge the misfire ('Apologies, sir — "
-        "trying again.') and immediately try a different approach. "
-        "Do NOT defend the previous attempt. Do NOT explain. Act."
+        "themselves or pushing back. Skip pleasantries and 'sir' filler, "
+        "acknowledge the misfire in a few words ('Apologies, sir.') and do "
+        "NOT defend the previous attempt. Do NOT guess at a different "
+        "action: if what he wants is unclear, ask ONE short clarifying "
+        "question; if he is describing a fault, run the matching "
+        "diagnostic or status check and report what it shows. Act "
+        "directly only when the request is unambiguous."
     ),
     "stressed": (
         "USER_TONE: stressed — be extra calm, efficient, and skip "
