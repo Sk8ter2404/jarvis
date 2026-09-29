@@ -9,7 +9,7 @@ first audio out) into ONE line per turn::
 you=1584 llm_post=1650 llm_done=4410 actions_done=4418 synth_start=4420 \
 first_play=5120 end=5890 prompt_eval_count=11873 prompt_eval_ms=2702 \
 eval_count=84 eval_ms=790 llm_calls=1 turn_ctx_chars=1342 sys_chars=31012 \
-followup_rounds=0 filler=0 filler_ms=-
+followup_rounds=0 filler=0 filler_ms=- lead_dropped=0
 
 Offsets are integer milliseconds from the turn's t0: the record_speech VAD
 break for a spoken turn, the inject-queue drain for a typed/injected turn. A
@@ -30,6 +30,10 @@ helper it adopted (the streaming-TTS flush threads), and only after "you": a
 reminder, tray command or mid-task status line spoken by another thread is not
 the answer's first audio. The processing filler is tracked separately
 (filler / filler_ms).
+
+lead_dropped is 1 when the answer-first rule (ANSWER_FIRST_ENABLED) skipped the
+model's short lead-in ("One moment, sir.") on this turn, so first_play then
+measures the real answer rather than the lead-in.
 
 Contracts (the monolith relies on every one):
   * print-only: nothing here changes behaviour, and no method ever raises;
@@ -63,7 +67,7 @@ _AFTER_YOU = frozenset(("synth_start", "first_play"))
 # Stats fields, printed after the marks in this order.
 STAT_FIELDS = ("prompt_eval_count", "prompt_eval_ms", "eval_count", "eval_ms",
                "llm_calls", "turn_ctx_chars", "sys_chars", "followup_rounds",
-               "filler", "filler_ms")
+               "filler", "filler_ms", "lead_dropped")
 
 # Local-LLM wrappers: when one of these is the direct caller of
 # _call_local_llm, the caller tag also names the function that called IT, so
@@ -173,7 +177,8 @@ def caller_tag(frame=None, wrappers=LLM_WRAPPERS) -> str:
 def _new_turn(kind: str, t0: float, owner: int) -> dict:
     return {"kind": kind, "t0": t0, "owner": owner, "marks": {},
             "stats": {}, "llm_calls": 0, "followup_rounds": 0,
-            "filler": 0, "filler_at": None, "helpers": []}
+            "filler": 0, "filler_at": None, "lead_dropped": 0,
+            "helpers": []}
 
 
 class TurnTiming:
@@ -348,6 +353,18 @@ class TurnTiming:
         except Exception:
             pass
 
+    def note_lead_dropped(self) -> None:
+        """The answer-first rule skipped this turn's lead-in. Turn-thread
+        only, like followup_round."""
+        try:
+            ident = threading.get_ident()
+            with self._lock:
+                t = self._turn
+                if t is not None and ident == t["owner"]:
+                    t["lead_dropped"] = 1
+        except Exception:
+            pass
+
     # ── output ────────────────────────────────────────────────────────────
     def emit(self, outcome: str = "ok") -> "str | None":
         """Finish the active turn and print its line — once. Only the turn's
@@ -400,6 +417,7 @@ def format_line(turn: dict, end, outcome: str = "ok") -> str:
         "sys_chars": stats.get("sys_chars"),
         "followup_rounds": turn["followup_rounds"],
         "filler": turn["filler"],
+        "lead_dropped": turn.get("lead_dropped", 0),
     }
     for k in STAT_FIELDS:
         if k == "filler_ms":

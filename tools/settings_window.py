@@ -480,6 +480,14 @@ SCHEMA: dict[str, dict] = {
                 "line. Set at or below the filler delay to turn it off. "
                 "Applies on the next start.",
     },
+    "ANSWER_FIRST_ENABLED": {
+        "tab": "voice", "label": "Answer first (skip 'one moment' lead-ins)",
+        "type": "bool", "default": True,
+        "help": "When a command speaks a real answer, skip the short "
+                "'One moment, sir.' said before it, so the answer comes "
+                "sooner. Lead-ins with numbers, questions or any real "
+                "content are still spoken. Applies on the next start.",
+    },
     "STREAMING_AUTO_FULLSCREEN": {
         "tab": "ai", "label": "Auto-fullscreen TV shows & movies", "type": "bool",
         "default": True,

@@ -576,6 +576,22 @@ PROCESSING_FILLER_DELAY       = 2.5    # s after the transcript before stage 1
 PROCESSING_FILLER_STILL_DELAY = 12.0   # s of turn silence before stage 2
 
 
+# ─── Answer first (skip the model's short lead-in before a spoken answer) ──
+# 2026-09-29. A reply like "One moment, sir. [ACTION: get_time]" used to speak
+# "One moment, sir." in full and only THEN the action's real answer, so the
+# answer arrived 1.5-2.5 s later (and a lead-in such as "I'll have to check on
+# that" could contradict it). With this on, a SHORT lead-in that is pure
+# acknowledgement (15 words or less, no digits, no question, nothing but
+# "one moment" / "on it" / "let me check" style words) is not spoken when every
+# action in the reply speaks a real answer: a verbatim-result action produced a
+# short one, or an informative action runs a follow-up round while the
+# processing filler covers the wait. A lead-in that carries content, or that
+# confirms a side-effect action, is always spoken. The lead-in stays in the
+# conversation history. Pushback / confirmation / hallucination replacements
+# are never touched. Changes apply on the next start.
+ANSWER_FIRST_ENABLED = True
+
+
 # ─── Focus mode / do-not-disturb (skills/focus_mode.py) ────────────────
 # FOCUS_MODE_ENABLED — makes the do-not-disturb "focus mode" FEATURE available
 #   (the voice actions focus_mode_on / focus_mode_off / whats_missed and the

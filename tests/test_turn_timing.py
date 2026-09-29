@@ -227,6 +227,27 @@ class TurnTimingTests(unittest.TestCase):
         self.assertEqual(d["followup_rounds"], "0")
         self.assertEqual((d["filler"], d["filler_ms"]), ("0", "-"))
 
+    def test_lead_dropped_defaults_to_zero(self):
+        d = tt.parse_line(self._full_turn())
+        self.assertEqual(d["lead_dropped"], "0")
+        self.assertEqual(tt.STAT_FIELDS[-1], "lead_dropped")
+
+    def test_lead_dropped_marked_by_the_turn_thread_only(self):
+        t = self.t
+        t.begin("inject")
+        th = threading.Thread(target=t.note_lead_dropped)
+        th.start()
+        th.join()
+        self.assertEqual(tt.parse_line(t.emit())["lead_dropped"], "0")
+        t.begin("inject")
+        t.note_lead_dropped()
+        t.note_lead_dropped()
+        self.assertEqual(tt.parse_line(t.emit())["lead_dropped"], "1")
+
+    def test_lead_dropped_without_a_turn_never_raises(self):
+        self.t.note_lead_dropped()
+        self.assertIsNone(self.t.emit())
+
     def test_fixed_schema_order(self):
         line = self._full_turn()
         keys = [tok.split("=")[0] for tok in

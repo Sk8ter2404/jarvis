@@ -265,6 +265,82 @@ class ArmTests(unittest.TestCase):
         t = f.arm()
         self.assertEqual(t.owner, threading.get_ident())
 
+    # ── ack_state_here (answer first, 2026-09-29) ───────────────────────
+    # The monolith's answer-first rule asks "will the filler acknowledge
+    # THIS voice turn?" before it skips the model's own lead-in. A turn
+    # object merely existing is not enough: it may be cancelled, clip-less
+    # or too slow to ever speak.
+    def test_ack_state_only_on_the_arming_thread(self):
+        f, _c, _p, _a = _make()
+        self.assertEqual(f.ack_state_here(), "")
+        t = f.arm()
+        self.assertEqual(f.ack_state_here(), "pending")
+        seen = []
+        th = threading.Thread(target=lambda: seen.append(f.ack_state_here()))
+        th.start()
+        th.join()
+        self.assertEqual(seen, [""])
+        f.disarm(t)
+        self.assertEqual(f.ack_state_here(), "")
+
+    def test_ack_state_cancelled_turn_is_not_pending(self):
+        f, _c, _p, _a = _make()
+        f.arm()
+        f.cancel("action:long")
+        self.assertTrue(f.armed())
+        self.assertEqual(f.ack_state_here(), "")
+
+    def test_ack_state_fired_survives_a_later_cancel(self):
+        f, _c, _p, _a = _make()
+        t = f.arm()
+        self.assertEqual(f.claim(t, 1), "ok")
+        f.play_done()
+        self.assertEqual(f.ack_state_here(), "fired")
+        f.cancel("action:long")
+        self.assertEqual(f.ack_state_here(), "fired")
+
+    def test_ack_state_needs_a_playable_first_clip(self):
+        f, _c, _p, _a = _make()
+        f.arm()
+        self.assertEqual(f.ack_state_here(first_ready=False), "")
+
+    def test_ack_state_after_speech_is_not_pending(self):
+        f, _c, _p, _a = _make()
+        f.arm()
+        f.note_speech()
+        self.assertEqual(f.ack_state_here(), "")
+
+    def test_ack_state_long_delay_is_not_pending(self):
+        f, _c, _p, _a = _make(first=10.0, still=20.0)
+        f.arm()
+        self.assertEqual(f.ack_state_here(), "")
+        self.assertEqual(f.ack_state_here(max_first_s=12.0), "pending")
+
+    def test_ack_state_live_capture_is_not_pending(self):
+        # A BACKGROUND capture (another thread) holds stage 1 off while live.
+        f, _c, _p, _a = _make()
+        f.arm()
+
+        def on_other_thread(fn):
+            th = threading.Thread(target=fn)
+            th.start()
+            th.join()
+
+        on_other_thread(f.begin_capture)
+        self.assertEqual(f.ack_state_here(), "")
+        on_other_thread(f.end_capture)
+        self.assertEqual(f.ack_state_here(), "pending")
+
+    def test_ack_state_retry_window_over_is_not_pending(self):
+        # Stage 1 gives up first_retry_s after its delay; past that it will
+        # never play.
+        f, clock, _p, _a = _make(first=2.5)
+        f.arm()
+        clock.now = 5.4
+        self.assertEqual(f.ack_state_here(), "pending")
+        clock.now = 5.6
+        self.assertEqual(f.ack_state_here(), "")
+
 
 # ── claim ────────────────────────────────────────────────────────────────────
 class ClaimTests(unittest.TestCase):

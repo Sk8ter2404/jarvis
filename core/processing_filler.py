@@ -274,6 +274,41 @@ class ProcessingFiller:
     def armed(self) -> bool:
         return self._current is not None
 
+    def ack_state_here(self, first_ready: bool = True,
+                       max_first_s: float = 3.0) -> str:
+        """Is the filler this voice turn's "I heard you" signal? Asked by the
+        calling (dispatch) thread. Returns:
+
+          'fired'   stage 1 already claimed its clip on this turn (a later
+                    cancel does not undo that);
+          'pending' stage 1 has not played yet but still will: the turn was
+                    armed by this thread and is not cancelled, nothing has
+                    spoken, no capture holds the mic, the caller says a
+                    first-stage clip can play (``first_ready``: cached and
+                    not suppressed), the delay is at most ``max_first_s`` and
+                    stage 1's retry window is still open;
+          ''        anything else — no turn, another thread's turn, a
+                    cancelled / closed turn, or a stage 1 that will never
+                    play. A turn object merely existing is NOT enough.
+        Never raises."""
+        try:
+            t = self._current
+            if t is None or t.owner != threading.get_ident():
+                return ""
+            with self._lock:
+                if self._closed or t is not self._current:
+                    return ""
+                if 1 in t.fired:
+                    return "fired"
+                if (t.cancel.is_set() or t.spoke or self._captures > 0
+                        or not first_ready or t.first > float(max_first_s)):
+                    return ""
+                if self._clock() - t.t0 >= t.first + self._first_retry_s:
+                    return ""
+                return "pending"
+        except Exception:
+            return ""
+
     # ── speech marks ────────────────────────────────────────────────────
     @staticmethod
     def _mark(t: FillerTurn | None, now, owner_only: bool) -> None:

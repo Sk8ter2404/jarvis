@@ -333,12 +333,13 @@ class VerbatimResultSpokenTests(MonolithGlobalsTestCase):
         self.assertEqual(handled, set())
 
     # ── end-to-end through _run_llm_dispatch ────────────────────────────────
-    def _dispatch_capture(self, reply, actions):
+    def _dispatch_capture(self, reply, actions, answer_first=True):
         """Run _run_llm_dispatch with a canned LLM reply + stub actions, and
         return the list of strings handed to _speak."""
         bc = self.bc
         spoken = []
-        with mock.patch.object(bc, "get_response_with_animation",
+        with mock.patch.object(bc, "ANSWER_FIRST_ENABLED", answer_first), \
+             mock.patch.object(bc, "get_response_with_animation",
                                return_value=reply), \
              mock.patch.object(bc, "maybe_glance_response", return_value=None), \
              mock.patch.object(bc, "_speak",
@@ -353,13 +354,24 @@ class VerbatimResultSpokenTests(MonolithGlobalsTestCase):
         return spoken
 
     def test_dispatch_speaks_version_result_exactly_once(self):
-        # THE BUG: preamble was spoken, version answer was dropped.
+        # THE BUG: preamble was spoken, version answer was dropped. With the
+        # answer-first rule off (ANSWER_FIRST_ENABLED=False) the preamble is
+        # still spoken first, exactly as before 2026-09-29.
         spoken = self._dispatch_capture(
             "One moment, sir. [ACTION: version_info]",
-            {"version_info": lambda a="": self.VER})
+            {"version_info": lambda a="": self.VER}, answer_first=False)
         self.assertIn("One moment, sir.", spoken)
         self.assertEqual(sum(1 for s in spoken if self.VER in s), 1,
                          f"version answer must be spoken exactly once: {spoken}")
+
+    def test_dispatch_answer_first_speaks_only_the_version(self):
+        # Answer first (2026-09-29, the shipped default): the short preamble
+        # is skipped and the version answer is the only thing spoken — still
+        # exactly once.
+        spoken = self._dispatch_capture(
+            "One moment, sir. [ACTION: version_info]",
+            {"version_info": lambda a="": self.VER})
+        self.assertEqual(spoken, [self.VER])
 
     def test_dispatch_does_not_double_speak_inlined_answer(self):
         # When the LLM already inlined the answer, speak it once, not twice.

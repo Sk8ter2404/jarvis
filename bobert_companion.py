@@ -26434,6 +26434,212 @@ def _apply_quip_layer(spoken_text: str,
         return spoken_text
 
 
+def _verbatim_result_text(name, result) -> str:
+    """The text _speak_verbatim_results would voice for one action result, or
+    "" when it would voice nothing: the action is not in
+    SPEAK_RESULT_VERBATIM_ACTIONS, the result is empty, or it is a failure
+    ("could not read version info: …" belongs to the failure follow-up path,
+    not a verbatim read-back)."""
+    if not name or str(name).lower() not in SPEAK_RESULT_VERBATIM_ACTIONS:
+        return ""
+    text = (result or "").strip() if isinstance(result, str) else ""
+    if not text:
+        return ""
+    low = text.lower()
+    if any(m.lower() in low for m in FAILURE_MARKERS):
+        return ""
+    return text
+
+
+# ── Answer first (2026-09-29, R4) ─────────────────────────────────────────
+# Measured live: on a warm turn the FIRST audio was the model's own lead-in
+# ("One moment, sir.", "I'm afraid I'll have to check on that for you, sir."),
+# spoken in full before the action's real answer was even synthesised — 1.5-
+# 2.5 s of delay, sometimes contradicting the answer that followed. When the
+# turn is going to speak a real answer anyway, a SHORT lead-in that is pure
+# ACKNOWLEDGEMENT is skipped (it stays in conversation_history; only the
+# audio goes). Kill switch: ANSWER_FIRST_ENABLED in core/config.py.
+_ANSWER_FIRST_MAX_WORDS = 15
+# A verbatim answer longer than this takes seconds to synthesise (_speak
+# renders the whole text before playing), so the lead-in stays as the quick
+# "I heard you" — unless the processing filler already said it.
+_ANSWER_FIRST_MAX_ANSWER_WORDS = 30
+# Result prefixes parse_and_run_actions records when it REPLACED or deferred
+# the prose on purpose (pushback objection, CONFIRM_KEYWORDS prompt, autocorrect
+# ambiguity). Those replies are never answer-first candidates.
+_ANSWER_FIRST_DEFERRED_PREFIXES = ("⚠  PUSHBACK:", "⚠  REQUIRES CONFIRMATION:",
+                                   "⚠  AMBIGUOUS:")
+_ANSWER_FIRST_DIGIT_RE = re.compile(r"\d")
+# Leading prosody tag _speak strips before synthesis (core.tts.parse_wry_tag
+# shape); [intent:] / [mood:] use _INTENT_TAG_RE / _MOOD_TAG_RE.
+_ANSWER_FIRST_WRY_TAG_RE = re.compile(r"^\s*\[\s*wry\s*\]\s*", re.IGNORECASE)
+# Acknowledgement lexicon. A lead-in is skipped only when EVERY clause of it
+# is acknowledgement: made only of these words ("One moment, sir.", "I'm
+# afraid I'll have to check on that for you, sir."), or a "checking X" clause
+# (an _ANSWER_FIRST_CHECK_PREFIXES opener + at most _ANSWER_FIRST_CHECK_TAIL
+# words, none of them a finding / negation / contrast word). Anything else is
+# content — a second answer, a refusal, a confirmation — and is spoken. Words
+# are compared after processing_filler.normalise_line ("sir" and punctuation
+# removed).
+_ANSWER_FIRST_ACK_WORDS = frozenset("""
+    a absolutely afraid allow at away bear certainly check checking course
+    fetching find for get getting give glad good have i i'd i'll i'm indeed
+    into it just let look looking me moment now of on once one pleasure pull
+    pulling quick quickly right second see shall sure that the thing this to
+    understood up very well will with you
+""".split())
+_ANSWER_FIRST_CHECK_PREFIXES = (
+    "let me check", "i'll check", "i will check", "checking", "let me look at",
+    "let me look up", "looking up", "let me pull up", "pulling up",
+    "let me get", "getting", "fetching", "let me see",
+)
+_ANSWER_FIRST_CHECK_TAIL = 6
+_ANSWER_FIRST_CHECK_BLOCK = frozenset("""
+    is are was were it's that's there's has had not no never nor but however
+    although though unfortunately sorry cannot
+""".split())
+_ANSWER_FIRST_CLAUSE_RE = re.compile(r"[.!;:,—–]+|\s-\s")
+
+
+def _answer_first_audible_lead(text) -> str:
+    """``text`` without the leading [intent:] / [mood:] / [wry] tags _speak
+    strips before synthesis (any order, any number), stripped. Pure — no
+    shared state is touched. Never raises."""
+    try:
+        s = str(text or "")
+        while True:
+            m = (_INTENT_TAG_RE.match(s) or _MOOD_TAG_RE.match(s)
+                 or _ANSWER_FIRST_WRY_TAG_RE.match(s))
+            if not m:
+                return s.strip()
+            s = s[m.end():]
+    except Exception:
+        return ""
+
+
+def _answer_first_is_ack(lead) -> bool:
+    """True when every clause of ``lead`` is a pure acknowledgement (see
+    _ANSWER_FIRST_ACK_WORDS). False for content, and for a lead with no
+    words at all. Never raises."""
+    try:
+        text = str(lead or "").replace("’", "'")
+        seen = False
+        for clause in _ANSWER_FIRST_CLAUSE_RE.split(text):
+            words = _pf_mod.normalise_line(clause).split()
+            if not words:
+                continue
+            seen = True
+            if all(w in _ANSWER_FIRST_ACK_WORDS for w in words):
+                continue
+            joined = " ".join(words)
+            tail = None
+            for p in _ANSWER_FIRST_CHECK_PREFIXES:
+                if joined == p or joined.startswith(p + " "):
+                    tail = joined[len(p):].split()
+                    break
+            if (tail is not None and len(tail) <= _ANSWER_FIRST_CHECK_TAIL
+                    and not any(w in _ANSWER_FIRST_CHECK_BLOCK
+                                or w.endswith("n't") for w in tail)):
+                continue
+            return False
+        return seen
+    except Exception:
+        return False
+
+
+def _answer_first_drop_count(reply: str, lead: str,
+                             action_results, filler_state: str = "") -> int:
+    """How many words of lead-in to skip: the audible lead's word count when
+    the answer-first rule applies, else 0 (speak it as always).
+
+    ``filler_state`` is _answer_first_filler_state(): 'fired' (the processing
+    filler already said "I heard you" on this voice turn), 'pending' (it
+    still will) or '' (it will not — typed turn, filler off / cancelled /
+    clip-less / suppressed).
+
+    Applies only when ALL hold:
+      * ANSWER_FIRST_ENABLED;
+      * the reply carried a real [ACTION:] token (an action the preemptive
+        hallucination layer injected into token-less prose leaves the prose
+        exactly as today) and no synthetic / deferred result is present
+        (hallucination warnings, dropped steps, pushback, confirmation,
+        ambiguity) — those paths replace the prose deliberately;
+      * EVERY action brings its own answer: a SPEAK_RESULT_VERBATIM_ACTIONS
+        action with a speakable result, or an INFORMATIVE_ACTIONS action
+        whose follow-up round speaks the answer. A side-effect, fire-and-exit,
+        unknown, failed or empty action keeps the lead-in (it may be that
+        action's only confirmation);
+      * something says "I heard you" quickly without the lead-in: the first
+        verbatim answer is short (<= _ANSWER_FIRST_MAX_ANSWER_WORDS) or the
+        filler already fired; with no verbatim answer, the filler is 'fired'
+        or 'pending' (the follow-up round is slow, and without the filler
+        the lead-in is the only acknowledgement);
+      * the audible lead (leading [intent:]/[mood:]/[wry] tags removed) is
+        short (<= _ANSWER_FIRST_MAX_WORDS words), has no digit and no
+        question mark, and is pure acknowledgement (_answer_first_is_ack).
+    Never raises."""
+    try:
+        if not globals().get("ANSWER_FIRST_ENABLED", True):
+            return 0
+        audible = _answer_first_audible_lead(lead)
+        if not audible or not action_results:
+            return 0
+        if not _ACTION_RE.search(reply or ""):
+            return 0
+        first_answer_words = None
+        informative = False
+        for name, result, is_info in action_results:
+            n = str(name or "").lower()
+            if not n or n.startswith("_") or n in _FIRE_AND_EXIT_ACTIONS:
+                return 0
+            if isinstance(result, str) and result.startswith(
+                    _ANSWER_FIRST_DEFERRED_PREFIXES):
+                return 0
+            text = _verbatim_result_text(n, result)
+            if text:
+                if first_answer_words is None:
+                    first_answer_words = len(text.split())
+                continue
+            if is_info and n in INFORMATIVE_ACTIONS:
+                informative = True
+                continue
+            return 0
+        if first_answer_words is not None:
+            if (first_answer_words > _ANSWER_FIRST_MAX_ANSWER_WORDS
+                    and filler_state != "fired"):
+                return 0
+        elif not (informative and filler_state in ("fired", "pending")):
+            return 0
+        words = len(audible.split())
+        if words > _ANSWER_FIRST_MAX_WORDS:
+            return 0
+        if "?" in audible or _ANSWER_FIRST_DIGIT_RE.search(audible):
+            return 0
+        if not _answer_first_is_ack(audible):
+            return 0
+        return words
+    except Exception:
+        return 0
+
+
+def _answer_first_filler_state() -> str:
+    """'fired' / 'pending' / '' — whether the processing filler is (or will
+    be) the calling thread's voice-turn acknowledgement. See
+    ProcessingFiller.ack_state_here. 'pending' also needs a first-stage clip
+    in the cache and no quiet-mode suppression right now. Typed / injected
+    turns and a disabled filler give ''. Never raises."""
+    try:
+        try:
+            ready = (bool(_filler_clips.available(_pf_mod.FIRST_LINES))
+                     and _filler_suppressed(transient_ok=True) is None)
+        except Exception:
+            ready = False
+        state = _processing_filler.ack_state_here(first_ready=ready)
+        return state if state in ("fired", "pending") else ""
+    except Exception:
+        return ""
+
+
 def _speak_verbatim_results(
     action_results: list[tuple[str, str, bool]],
     already_spoken: str = "",
@@ -26465,18 +26671,11 @@ def _speak_verbatim_results(
     if not action_results:
         return spoken_names
     prior = (already_spoken or "").lower()
-    fail_markers = tuple(m.lower() for m in FAILURE_MARKERS)
     for name, result, _is_info in action_results:
-        if not name or name.lower() not in SPEAK_RESULT_VERBATIM_ACTIONS:
-            continue
-        text = (result or "").strip()
+        text = _verbatim_result_text(name, result)
         if not text:
             continue
         low = text.lower()
-        # A failure ("could not read version info: …") belongs to the failure
-        # follow-up path, not a verbatim read-back.
-        if any(m in low for m in fail_markers):
-            continue
         # Already voiced as part of the inline reply / quip — don't repeat it.
         if low in prior:
             continue
@@ -29484,7 +29683,6 @@ def _run_llm_dispatch_body(text: str) -> str:
     # early-spoken the remainder is empty and the _speak below is skipped.
     # Applied BEFORE the quip layer so a quip attaches to the unspoken tail.
     spoken_text = _strip_stream_spoken_prefix(spoken_text)
-    spoken_text = _apply_quip_layer(spoken_text, action_results)
     # Barge gate: if a wake-word barge was accepted while the reply streamed,
     # the seq advanced — honour the interrupt and don't speak the tail. 2026-07-08.
     _barged = False
@@ -29492,6 +29690,25 @@ def _run_llm_dispatch_body(text: str) -> str:
         _barged = _tts_interrupt_seq[0] != _barge_seq0
     except Exception:
         _barged = False
+    # Answer first (2026-09-29, R4): when this turn will speak a real answer
+    # (a short verbatim result, or an informative follow-up covered by the
+    # processing filler), skip a short pure-acknowledgement lead-in such as
+    # "One moment, sir." so the answer is the first thing heard. Only the
+    # audio is skipped — the reply stays in conversation_history. Never when
+    # part of the reply was already voiced early by the streaming flush (the
+    # tail is then the rest of a sentence pair, not a lead-in). Decided on the
+    # model's own prose, BEFORE the quip layer, so a random aside never flips
+    # it; a skipped lead-in gets no quip. See _answer_first_drop_count.
+    _af_words = 0
+    if spoken_text and not _barged and not _stream_spoken_prefix[0]:
+        _af_words = _answer_first_drop_count(
+            reply, spoken_text, action_results, _answer_first_filler_state())
+    if _af_words:
+        print(f"  [answer-first] dropped lead-in ({_af_words} words)")
+        _tt("note_lead_dropped")
+        spoken_text = ""
+    else:
+        spoken_text = _apply_quip_layer(spoken_text, action_results)
     if spoken_text and not _barged:
         _speak(spoken_text)
 

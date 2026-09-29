@@ -157,6 +157,11 @@ class StructuralInvariantTests(unittest.TestCase):
         primaries = [c for c in config.CAMERAS if c.get("primary")]
         self.assertEqual(len(primaries), 1)
 
+    def test_answer_first_ships_on(self):
+        # 2026-09-29: the short lead-in before a spoken answer is skipped by
+        # default; the kill switch is a plain bool.
+        self.assertIs(config.ANSWER_FIRST_ENABLED, True)
+
     def test_processing_filler_ships_off_with_float_delays(self):
         # 2026-09-29: the filler is OFF until proven by ear; both delays are
         # float literals (an int default would make _apply_user_settings
