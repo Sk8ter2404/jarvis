@@ -2310,7 +2310,16 @@ def _act_session_memory_recall(args: str = "") -> str:
     'recap our conversation', 'what have we discussed' summarise THIS
     session's conversation_history instead (see
     _summarise_current_conversation). Decided from the argument AND the
-    owner's own words for this turn, so a bare token still gets it right."""
+    owner's own words for this turn, so a bare token still gets it right.
+
+    "What did I just ask you" / "what was my last question" is about THIS
+    conversation, not the session index: it is answered deterministically from
+    conversation_history with the most recent PRIOR owner utterance. By the
+    time this action runs on the LLM path, _call_llm has already appended the
+    CURRENT utterance, so that entry is skipped (fast_paths.recall_turn_-
+    recorded), as is any earlier "what did I just ask" question. The index +
+    LLM route recalled the current question itself ("You just asked me what
+    you had previously asked me, sir.", live 2026-09-29)."""
     bc = _bc()
     from core.owner_turn import current_owner_utterance
     query = (args or "").strip()
@@ -2320,6 +2329,15 @@ def _act_session_memory_recall(args: str = "") -> str:
     if not query:
         # A bare token: his own words carry the time reference.
         query = utterance
+    try:
+        from core import fast_paths as _fp
+        if _fp.is_last_utterance_question(query, loose=True):
+            history = list(bc.conversation_history)
+            return _fp.last_utterance_reply(
+                query, history,
+                skip_newest=_fp.recall_turn_recorded(history))
+    except Exception:
+        pass   # fall back to the session-index recall below
     try:
         sessions = bc.pattern_memory.get_session_summaries(query, limit=8)
     except Exception as e:

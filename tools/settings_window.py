@@ -452,6 +452,14 @@ SCHEMA: dict[str, dict] = {
                 "Never loads a model, never in game mode or mid-turn. Applies "
                 "on the next start.",
     },
+    "FAST_PATHS_ENABLED": {
+        "tab": "ai", "label": "Instant answers (dates, my name, last question)",
+        "type": "bool", "default": True,
+        "help": "Answer date questions ('how many days until Christmas'), "
+                "'what did I just ask' and 'what's my name' instantly and "
+                "exactly, without the AI model. Anything else still goes to "
+                "the model. Applies on the next start.",
+    },
     "STREAMING_TTS_ENABLED": {
         "tab": "voice", "label": "Speak while replies stream", "type": "bool",
         "default": True,

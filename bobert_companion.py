@@ -14941,6 +14941,8 @@ _LOCAL_NEVER_GUESS_GUARD = (
     "name, never answer 'who am I' / 'who's here' from memory — he may be out\n"
     "of frame. Emit [ACTION: recognize_face] and report ONLY who the camera\n"
     "sees now (the recognised name, or that no one is in frame).\n"
+    "\"What's my name\" is NOT a camera look: no action — say the name you\n"
+    "know, or that you don't know it. Never guess a name.\n"
 )
 
 
@@ -24896,36 +24898,139 @@ def _emit_mid_task_status(name: str, arg: str, fired_flag: list[bool]) -> None:
         print(f"  [mid_task_status] speak failed for {name}: {_e}")
 
 
-# Phrases that suggest JARVIS just *claimed* to perform an action. If the
-# reply contains one of these but no [ACTION: ...] token actually ran, the
-# LLM is hallucinating execution (e.g. "Restarting now, sir." with no
-# restart action emitted). Detector below appends a synthetic
-# _unverified_claim result so the follow-up loop can self-correct.
-_ACTION_CLAIM_PHRASES = (
-    "restarting", "rebooting",
-    "opening ", "launching ", "starting up",
-    "playing ", "queueing ", "queuing ", "queued ",
-    "closing ", "shutting down", "killing ",
-    "pausing ", "resuming ",
-    "skipping ", "switching to ", "moving ",
-    "minimising", "minimizing", "maximising", "maximizing",
-    "typing ", "clicking ", "pressing ",
-    "searching for ", "looking up ",
-    "setting a timer", "starting a timer",
-    "logging in", "logging out",
-    "taking a screenshot", "taking a look",
-    "on it, sir", "right away, sir",
-)
+# Reactive hallucinated-execution check. When a reply with no [ACTION: ...]
+# token CLAIMS JARVIS acted ("Restarting now, sir." with no restart emitted),
+# parse_and_run_actions appends a synthetic _unverified_claim result so the
+# follow-up loop can self-correct. The rules live in core/claim_validator.py:
+# only FIRST-PERSON claims of JARVIS acting count ("I've moved", "I'll move",
+# "Moving it now, sir.", "I have sent"), never a fact about a third party.
+#
+# This replaced a bare substring list (_ACTION_CLAIM_PHRASES: "moving ",
+# "opening ", "on it, sir", ...) that live v2.0.115 (2026-09-29) caught in two
+# false positives, each costing a whole extra LLM round and extra speech:
+#   * "the moon is actually moving about 1.5 inches away ..." matched "moving "
+#     and JARVIS retracted, 11 s later, that it "can't actually move the moon";
+#   * "On it, sir. You asked about <x>." answering "what did I just ask you"
+#     matched "on it, sir" and the forced second round gave a second, wrong
+#     answer.
+from core import claim_validator as _claim_validator  # noqa: E402
 
 
-# Preemptive hallucination patterns. The reactive _ACTION_CLAIM_PHRASES check
-# below only fires AFTER parse_and_run_actions has finished — meaning TTS has
-# already spoken the LLM's incorrect "switching to ambient mode" prose by the
-# time the synthetic warning reaches the follow-up loop. These patterns run
-# BEFORE _ACTION_RE.sub so we can either auto-inject the missing [ACTION:]
-# token (when the claim phrase maps unambiguously to a real action) or refuse
-# the reply entirely (when no clear action exists) and force an immediate
-# re-prompt before any speech goes out.
+# ── Turn grounding ledger (2026-09-29) ──────────────────────────────────────
+# The validators judge ONE reply at a time. In a follow-up round that reply
+# summarises results that already came back THIS turn, so "It is 2:53 PM",
+# "Playing X by Y, sir." or "Done, sir." legitimately carry no [ACTION:] token
+# of their own. Judged in isolation they read as hallucinations: live v2.0.115
+# re-ran get_time for the time it had just read aloud. The ledger records, per
+# dispatch, the owner's utterance and every action that ran SUCCESSFULLY, so
+# the preemptive injector and the reactive claim check can tell a grounded
+# summary from a fresh claim.
+#
+# Thread-local (like the see_screen budget) and ACTIVE ONLY inside
+# _run_llm_dispatch, which begins and ends it around the whole turn (first
+# reply + every follow-up round). Outside a turn (the proactive path, direct
+# calls) nothing is recorded, the ledger reads empty and both validators behave
+# exactly as before — the safe direction.
+_turn_grounding = threading.local()
+
+
+def _begin_turn_grounding(user_text: str):
+    """Open a fresh ledger for one dispatch; returns the previous frame so a
+    nested dispatch on the same thread restores it (_end_turn_grounding)."""
+    prev = getattr(_turn_grounding, "frame", None)
+    _turn_grounding.frame = {"user_text": str(user_text or ""), "ran": set()}
+    return prev
+
+
+def _end_turn_grounding(prev) -> None:
+    _turn_grounding.frame = prev
+
+
+def _note_turn_action_ran(name: str, result) -> None:
+    """Record an action that ran this turn. Failures are NOT recorded: a
+    failed get_time grounds nothing, so a time stated afterwards still gets
+    the real action injected. Never raises."""
+    try:
+        frame = getattr(_turn_grounding, "frame", None)
+        if frame is None:
+            return
+        low = str(result).lower()
+        if any(m.lower() in low for m in FAILURE_MARKERS):
+            return
+        frame["ran"].add(str(name).strip().lower())
+    except Exception:
+        pass
+
+
+def _turn_actions_ran() -> frozenset:
+    frame = getattr(_turn_grounding, "frame", None)
+    return frozenset(frame["ran"]) if frame else frozenset()
+
+
+def _turn_user_text() -> str:
+    frame = getattr(_turn_grounding, "frame", None)
+    return frame["user_text"] if frame else ""
+
+
+def _strip_ack_preface(spoken: str, user_text: str) -> str:
+    """Drop a meaningless "On it, sir." / "Done, sir." preface from a reply
+    that ANSWERS the owner's question (claim_validator.strip_ack_preface has
+    the rules). Called by _run_llm_dispatch_body only for a reply that ran no
+    action, AFTER the early-spoken stream prefix is removed — so a preface the
+    stream already voiced is never re-matched and nothing is said twice.
+    Never raises: on any fault the text is returned unchanged."""
+    try:
+        out = _claim_validator.strip_ack_preface(
+            spoken, user_text, ran_actions=_turn_actions_ran())
+    except Exception:
+        return spoken
+    if out != spoken:
+        print("  [validation] dropped the acknowledgement preface on an answer")
+    return out
+
+
+# Actions that ground the same preemptive claim category as the action the
+# injector would add (beyond registered aliases, which _preempt_grounded_by
+# finds through the shared handler). A successful run of any of them this turn
+# means a follow-up stating that fact is reading the result, not inventing it.
+_PREEMPT_GROUNDING_GROUPS: dict[str, frozenset] = {
+    "get_time": frozenset({"get_time"}),
+    "version_info": frozenset({"version_info", "what_version",
+                               "when_updated"}),
+    "weather_briefing": frozenset({"weather_briefing", "weather_forecast"}),
+    "system_pulse": frozenset({"system_pulse", "check_system",
+                               "status_report"}),
+}
+
+
+def _preempt_grounded_by(action_name: str) -> str | None:
+    """Name of an action that already ran successfully this turn and grounds
+    the claim the preemptive layer would inject ``action_name`` for — the
+    action itself, a registered alias (same handler), or a member of its
+    _PREEMPT_GROUNDING_GROUPS entry. None when nothing grounds it (always the
+    case on a first round and outside a dispatch)."""
+    ran = _turn_actions_ran()
+    if not ran or not action_name:
+        return None
+    target = action_name.lower()
+    group = _PREEMPT_GROUNDING_GROUPS.get(target, frozenset()) | {target}
+    fn = ACTIONS.get(target)
+    for name in sorted(ran):
+        if name in group:
+            return name
+        if fn is not None and ACTIONS.get(name) is fn:
+            return name
+    return None
+
+
+# Preemptive hallucination patterns. The reactive claim check (see
+# core/claim_validator.py) only fires AFTER parse_and_run_actions has finished
+# — meaning TTS has already spoken the LLM's incorrect "switching to ambient
+# mode" prose by the time the synthetic warning reaches the follow-up loop.
+# These patterns run BEFORE _ACTION_RE.sub so we can either auto-inject the
+# missing [ACTION:] token (when the claim phrase maps unambiguously to a real
+# action) or refuse the reply entirely (when no clear action exists) and force
+# an immediate re-prompt before any speech goes out.
 #
 # Each entry is (regex, action_name_or_None, short_description).
 #   action_name in ACTIONS → 'inject': append [ACTION: name] and continue.
@@ -25139,6 +25244,7 @@ _LEADING_TAGS_RE = re.compile(r"^(?:\s*\[[^\]]*\]\s*)+")
 
 def _detect_preemptive_hallucination(
     reply: str,
+    is_grounded=None,
 ) -> tuple[str, str | None, str] | None:
     """Pre-flight scan for hallucinated execution claims.
 
@@ -25150,6 +25256,13 @@ def _detect_preemptive_hallucination(
 
     Skips when the reply already contains any [ACTION:] token (the LLM did
     emit something — the reactive detector handles partial-emission cases).
+
+    ``is_grounded`` (optional) — ``is_grounded(action_name) -> bool``. An
+    inject-pattern whose action is grounded (it already ran this turn, so the
+    reply is reading its result back) is skipped and the scan CONTINUES, so a
+    follow-up that reads back the time but invents the weather still gets
+    weather_briefing injected. 'refuse' patterns are never skipped. Omitted
+    (the stream gate, first-round semantics) → every match counts, as before.
     """
     if _ACTION_RE.search(reply):
         return None
@@ -25167,6 +25280,8 @@ def _detect_preemptive_hallucination(
         if not regex.search(scan):
             continue
         if action_name and action_name in ACTIONS:
+            if is_grounded is not None and is_grounded(action_name):
+                continue
             return ("inject", action_name, desc)
         return ("refuse", None, desc)
     return None
@@ -25837,7 +25952,33 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
     # to a real action) or refuse outright and force an immediate re-prompt
     # — the reactive detector at the bottom of this function only catches
     # the slip AFTER TTS has already spoken the wrong claim.
-    _preempt = _detect_preemptive_hallucination(reply)
+    #
+    # GROUNDED claims (2026-09-29): in a follow-up round the reply reads back
+    # a result that came back THIS turn ("It is 2:53 PM" right after get_time
+    # ran). Re-injecting would run the action again for nothing (live
+    # v2.0.115: get_time ran twice) and, when the result changed in between,
+    # cost another LLM round. A claim is grounded only by a SUCCESSFUL run of
+    # the same action (or an alias / same-category action) this turn — see
+    # _preempt_grounded_by — so a first-round reply stating the time with no
+    # action is still injected, and a follow-up that reads back the time but
+    # invents the weather still gets weather_briefing. 'refuse' patterns (no
+    # real action exists) are never grounded.
+    _grounded_skips: dict[str, str] = {}
+
+    def _preempt_is_grounded(action_name: str) -> bool:
+        _by = _preempt_grounded_by(action_name)
+        if _by:
+            _grounded_skips.setdefault(action_name, _by)
+        return bool(_by)
+
+    _preempt = _detect_preemptive_hallucination(
+        reply, is_grounded=_preempt_is_grounded)
+    for _g_action, _g_by in _grounded_skips.items():
+        print(
+            f"  [preemptive_hallucination] claim is grounded by {_g_by}, "
+            f"which already ran this turn — not re-injecting "
+            f"[ACTION: {_g_action}]"
+        )
     if _preempt is not None:
         _kind, _action_name, _desc = _preempt
         if _kind == "inject":
@@ -26044,6 +26185,10 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
                 res = fn(arg)
             results.append((name, res, name in INFORMATIVE_ACTIONS))
             print(f"  [action] {name}: {res[:120]}{'…' if len(res) > 120 else ''}")
+            # Turn grounding ledger: lets a later follow-up round that reads
+            # this result back pass the claim validators (no-op outside a
+            # dispatch; failures are not recorded).
+            _note_turn_action_ran(name, res)
             record_session_action(name, arg)
             # Replay-last-action history. Skip when the replay handler itself
             # is the action so the deque continues to point at the real target.
@@ -26119,10 +26264,24 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
     # something but no [ACTION: ...] token actually ran, the LLM is faking
     # execution. Log it and append a synthetic informative result so the
     # follow-up loop surfaces the slip back to the LLM and gives it a chance
-    # to either emit the real token or admit the failure.
+    # to either emit the real token or admit the failure. Only first-person
+    # claims of JARVIS acting count, a claim that reads back an action which
+    # already ran this turn is grounded, and an acknowledgement preface on a
+    # substantive answer to the owner's QUESTION is not a claim — see
+    # core/claim_validator.py for the rules and the live false positives they
+    # fixed. A detector fault must never break the dispatch: fall back to "no
+    # claim" (the reply is still spoken; only the self-correction round is
+    # skipped).
     if not results:
-        low = cleaned.lower()
-        matched = next((p for p in _ACTION_CLAIM_PHRASES if p in low), None)
+        try:
+            matched = _claim_validator.find_unverified_claim(
+                cleaned,
+                ran_actions=_turn_actions_ran(),
+                user_text=_turn_user_text(),
+            )
+        except Exception as _cv_err:
+            print(f"  [validation] claim check failed: {_cv_err}")
+            matched = None
         if matched:
             warn = (
                 f"reply claims '{matched.strip()}' but no [ACTION: ...] token "
@@ -29003,11 +29162,59 @@ def _maybe_orchestrate(text: str) -> bool:
     return True
 
 
+from core import fast_paths as _fast_paths  # noqa: E402
+
+
+def _fast_path_now():
+    """The local wall-clock time the fast paths answer date questions from.
+    A seam so tests can freeze the clock."""
+    import datetime as _fp_datetime
+    return _fp_datetime.datetime.now()
+
+
+def _run_fast_paths(text: str) -> bool:
+    """Deterministic answers with no LLM (core/fast_paths.py, 2026-09-29):
+    relative-date math ("what's the date tomorrow", "how many days until
+    Christmas", "how long until Friday"), "what did I just ask you" (the most
+    recent PRIOR owner utterance in conversation_history — the current one is
+    not in it yet) and "what's my name" (USER_NAME; blank = no match, so the
+    LLM answers and nothing is invented). The local model was wrong at all
+    three and slow.
+
+    Runs from _run_voice_shortcuts, i.e. for voice AND typed / injected turns,
+    right before _run_llm_dispatch: no processing filler is ever armed and the
+    LLM is never called. A hit logs one "[fast-path] <kind>" line, appends the
+    turn like every shortcut (so follow-ups work), speaks through _speak and
+    returns True. FAST_PATHS_ENABLED (core.config, default True) turns it off.
+    Never raises: any failure falls through to the LLM."""
+    if not globals().get("FAST_PATHS_ENABLED", True):
+        return False
+    try:
+        hit = _fast_paths.match(
+            text,
+            now=_fast_path_now(),
+            history=list(conversation_history),
+            owner_name=globals().get("USER_NAME", "") or "",
+        )
+    except Exception as _e:
+        print(f"  [fast-path] failed: {_e}")
+        return False
+    if hit is None:
+        return False
+    print(f"  [fast-path] {hit.kind}")
+    _append_turn(text, hit.reply)
+    _speak(hit.reply)
+    set_state("idle")
+    return True
+
+
 def _run_voice_shortcuts(text: str) -> bool:
     """Normal-mode voice shortcuts that bypass the LLM round-trip: replay-
     last-action, the TTS-backend toggle, conversation-mode toggle /
-    controlled-mode dispatch, and the multi-step chain resolver. Each
-    speaks its own reply and appends the turn to conversation_history.
+    controlled-mode dispatch, the multi-step chain resolver and, last, the
+    deterministic fast paths (_run_fast_paths). Each speaks its own reply and
+    appends the turn to conversation_history. Main() runs this for voice and
+    typed / injected turns alike.
     Returns True when a shortcut handled the utterance (caller should
     ``continue``); False to fall through to the full LLM dispatch.
     """
@@ -29123,7 +29330,11 @@ def _run_voice_shortcuts(text: str) -> bool:
         _speak(_chain_reply)
         set_state("idle")
         return True
-    return False
+
+    # Deterministic fast paths (date math, "what did I just ask", "what's my
+    # name"): the last stop before the LLM, so every shortcut above keeps
+    # precedence and nothing here ever arms the processing filler.
+    return _run_fast_paths(text)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -29946,11 +30157,16 @@ def _run_llm_dispatch(text: str, *, voice: bool = False) -> str:
         except Exception:
             _pf_turn = None
     _tt_outcome = "error"
+    # Turn grounding ledger for the claim validators: the owner's utterance and
+    # every action that runs successfully during this turn (first reply AND
+    # follow-up rounds). Closed in the finally so it never outlives the turn.
+    _tg_prev = _begin_turn_grounding(text)
     try:
         _reply = _run_llm_dispatch_body(text)
         _tt_outcome = "ok"
         return _reply
     finally:
+        _end_turn_grounding(_tg_prev)
         if voice:
             _filler_end_turn(_pf_turn)
         # [turn-timing]: the turn's one line, partial when the body raised.
@@ -30022,6 +30238,11 @@ def _run_llm_dispatch_body(text: str) -> str:
     # early-spoken the remainder is empty and the _speak below is skipped.
     # Applied BEFORE the quip layer so a quip attaches to the unspoken tail.
     spoken_text = _strip_stream_spoken_prefix(spoken_text)
+    # "On it, sir. You asked about X." answering a question: the preface is
+    # filler, not a promise — speak only the answer (2026-09-29). The quip
+    # layer runs later, after the answer-first decision (v2.0.119).
+    if not action_results:
+        spoken_text = _strip_ack_preface(spoken_text, text)
     # Barge gate: if a wake-word barge was accepted while the reply streamed,
     # the seq advanced — honour the interrupt and don't speak the tail. 2026-07-08.
     _barged = False
@@ -30162,6 +30383,8 @@ def _run_llm_dispatch_body(text: str) -> str:
             break
         print(f"  JARVIS: {followup}")
         f_spoken, current_results = parse_and_run_actions(followup)
+        if not current_results:
+            f_spoken = _strip_ack_preface(f_spoken, text)
         f_spoken = _apply_quip_layer(f_spoken, current_results)
         # Append follow-up to history so context carries forward
         conversation_history.append({"role": "assistant", "content": followup})

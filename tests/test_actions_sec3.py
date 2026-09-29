@@ -1634,6 +1634,83 @@ class SessionMemoryRecallTests(unittest.TestCase):
         self.assertIn("recalled 1 session(s) but the recall LLM returned nothing",
                       out)
 
+    # ── "what did I just ask you" (live bug 2026-09-29) ─────────────────
+    # The LLM path appends the CURRENT utterance to conversation_history and
+    # then emits the action, so the newest user entry is the question being
+    # asked, not the one to recall. The action used to hand it to the session
+    # index + LLM, which answered "You just asked me what you had previously
+    # asked me, sir."
+
+    @staticmethod
+    def _llm_path_history(current):
+        return [
+            {"role": "assistant", "content": "Good afternoon, sir."},
+            {"role": "user", "content": "Jarvis, open the project notes."},
+            {"role": "assistant", "content": "Opening them now, sir."},
+            {"role": "user", "content": current},
+            {"role": "assistant",
+             "content": f"One moment, sir. [ACTION: session_memory_recall, "
+                        f"{current}]"},
+        ]
+
+    def test_just_asked_recalls_the_prior_utterance_not_the_current_one(self):
+        bc = self._bc()
+        bc.conversation_history = self._llm_path_history(
+            "what did I just ask you")
+        with _patch_bc(bc):
+            out = A._act_session_memory_recall("what did I just ask you")
+        self.assertEqual(out, 'You asked me: "open the project notes", sir.')
+        bc.pattern_memory.get_session_summaries.assert_not_called()
+        bc._llm_quick.assert_not_called()
+
+    def test_paraphrased_current_turn_is_still_skipped(self):
+        # The owner's words are not one of the strict phrasings, but the
+        # current turn is recorded (the action token follows it): skip it.
+        bc = self._bc()
+        bc.conversation_history = self._llm_path_history(
+            "hmm, which thing did I bring up before this one")
+        with _patch_bc(bc):
+            out = A._act_session_memory_recall("what was my last question")
+        self.assertEqual(out,
+                         'Your last question was: "open the project notes", '
+                         'sir.')
+
+    def test_just_asked_with_no_earlier_turn_says_so(self):
+        bc = self._bc()
+        bc.conversation_history = [
+            {"role": "user", "content": "what did I just ask you"},
+            {"role": "assistant",
+             "content": "[ACTION: session_memory_recall, what did I just ask "
+                        "you]"},
+        ]
+        with _patch_bc(bc):
+            out = A._act_session_memory_recall("what did I just ask you")
+        self.assertEqual(out, "You haven't asked me anything else in this "
+                              "conversation yet, sir.")
+
+    def test_pre_llm_path_keeps_the_newest_entry(self):
+        # Chain resolver / controlled mode: the current utterance is not in
+        # the history yet, so the newest user entry IS the prior one.
+        bc = self._bc()
+        bc.conversation_history = [
+            {"role": "user", "content": "open the project notes"},
+            {"role": "assistant", "content": "Opening them now, sir."},
+        ]
+        with _patch_bc(bc):
+            out = A._act_session_memory_recall("what did I just say")
+        self.assertEqual(out, 'You said: "open the project notes", sir.')
+
+    def test_earlier_sessions_still_use_the_session_index(self):
+        bc = self._bc()
+        bc.conversation_history = self._llm_path_history(
+            "what did I ask you yesterday")
+        bc.pattern_memory.get_session_summaries.return_value = []
+        bc.pattern_memory.describe_window.return_value = "for yesterday"
+        with _patch_bc(bc):
+            out = A._act_session_memory_recall("what did I ask you yesterday")
+        self.assertIn("no recollection for yesterday", out)
+        bc.pattern_memory.get_session_summaries.assert_called_once()
+
 
 # ===========================================================================
 # _act_recall_screen

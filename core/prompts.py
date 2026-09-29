@@ -453,6 +453,8 @@ PC_CONTROL_PROMPT = (
     "  source of truth for who is physically present — do not state a name unless\n"
     "  that action just returned it this turn. (If face-ID is off, the action\n"
     "  says so honestly — that is still the correct route, not a memory answer.)\n"
+    "  \"What's my name\" is NOT a camera look: no action — say the name you know,\n"
+    "  or that you don't know it. Never guess a name.\n"
     "  face_id_status               — is face recognition on, models present,\n"
     "                                 who's enrolled. 'is face recognition on',\n"
     "                                 'face id status'\n"

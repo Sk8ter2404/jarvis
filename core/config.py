@@ -604,6 +604,16 @@ PROCESSING_FILLER_STILL_DELAY = 12.0   # s of turn silence before stage 2
 # are never touched. Changes apply on the next start.
 ANSWER_FIRST_ENABLED = True
 
+# ─── Deterministic fast paths (core/fast_paths.py + core/date_math.py) ──
+# When True, relative-date questions ("what's the date tomorrow", "how many
+# days until Christmas", "how long until Friday"), "what did I just ask you"
+# and "what's my name" (from USER_NAME) are answered right before the LLM,
+# from the clock, this conversation and the config: correct and instant where
+# the local model guessed. Voice and typed turns alike; no processing filler.
+# Anything they don't fully understand still goes to the LLM. Set via
+# user_settings.json; applies on the next start.
+FAST_PATHS_ENABLED = True
+
 
 # ─── Focus mode / do-not-disturb (skills/focus_mode.py) ────────────────
 # FOCUS_MODE_ENABLED — makes the do-not-disturb "focus mode" FEATURE available
