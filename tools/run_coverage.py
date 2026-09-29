@@ -44,23 +44,96 @@ def _run_suite() -> bool:
     # token-file incident, 2026-07-21). Both respect external overrides.
     from tools.run_tests import (_redirect_data_dir_to_throwaway,
                                  _redirect_lock_dir_to_throwaway,
-                                 _redirect_settings_to_throwaway)
+                                 _redirect_settings_to_throwaway,
+                                 _runner_stream)
     _redirect_settings_to_throwaway()
     _redirect_data_dir_to_throwaway()
     # Third guard, same family: jarvis.lock is live runtime state (it names the
     # running JARVIS's PID), so a coverage run must not be able to write it.
     _redirect_lock_dir_to_throwaway()
+    # The runner's OWN stream, taken BEFORE discovery imports a single test
+    # module. TextTestRunner otherwise reports through whatever sys.stderr is
+    # once discovery is done, shared with every thread in the process — and on
+    # v2.0.128 a leaked poller's import-time sys.stderr.reconfigure() crashed
+    # THIS step mid-suite (io.UnsupportedOperation: not writable). See
+    # tools/run_tests._runner_stream.
+    runner_stream, owned_stream = _runner_stream()
     loader = unittest.TestLoader()
     suite = loader.discover(start_dir=_TESTS, pattern="test_*.py",
                             top_level_dir=_ROOT)
     from tools import test_watchdog
-    result = unittest.TextTestRunner(
-        verbosity=1,
-        resultclass=test_watchdog.WatchdogTextTestResult).run(suite)
+    try:
+        result = unittest.TextTestRunner(
+            stream=runner_stream,
+            verbosity=1,
+            resultclass=test_watchdog.WatchdogTextTestResult).run(suite)
+    finally:
+        if owned_stream:
+            runner_stream.close()
     # Suite over: stand the watchdog down before coverage reports (a slow
     # report is not a hung test).
     test_watchdog.disarm()
     return result.wasSuccessful()
+
+
+def _coverage_for(coverage_mod, *, full: bool = False, **coverage_kwargs):
+    """``(Coverage, label)`` — the ONE definition of what this gate measures
+    (source set, omit list, excluded line patterns). tools/run_tests_ci_sim.py
+    --coverage builds its measurement through here as well, so the local
+    simulation and CI's coverage step cannot drift onto two different
+    surfaces. ``coverage_kwargs`` pass straight to coverage.Coverage (the
+    ci-sim passes data_file=None: it reports in memory, writes no file).
+    Relative source dirs: the caller must chdir to the repo root first."""
+    _omit = ["*/tests/*", "*/__pycache__/*", "tools/run_coverage.py",
+             "tools/run_tests_ci_sim.py",
+             # gitignored personal skills — not shipped, absent on CI, so they
+             # don't belong in the shipped-coverage denominator.
+             "*/skills/vip_intercept.py", "*/skills/vip_boss_mode.py",
+             "*/skills/trip_planner.py", "*/skills/teams_screener.py",
+             # One-off operational / hardware-bench / scratch utilities — run by
+             # hand, not part of the shipped runtime library surface, and several
+             # need hardware (camera/LAN/PyQt) absent on CI. Excluded from the
+             # measured denominator (the product code + the release/CI gates are
+             # what we hold to coverage; these are dev conveniences):
+             "tools/audit_local.py", "tools/pii_local.py",
+             "tools/bounce_jarvis.py", "tools/face_detect_bench.py",
+             "tools/generate_jarvis_icon.py", "tools/identify_vendors.py",
+             "tools/render_unified_hud.py", "tools/say_to_jarvis.py",
+             "tools/scan_full_network.py", "tools/scan_lan_devices.py",
+             "tools/test_local_prompt.py",
+             # Developer-facing TEMPLATE skill (copy-me example), not a real
+             # shipped/registered skill — documentation by example, not logic.
+             "*/skills/_example_skill.py"]
+    if full:
+        # LOCAL full tier: adds the ~14K-line monolith + the other root product
+        # modules + the smaller product packages. Needs all deps present (these
+        # can't import on the bare CI runner), so this tier is local-only — the
+        # default source below is the CI light-tier gate.
+        # NB: hud/ is intentionally NOT measured — it's the PyQt holographic-
+        # overlay presentation layer (GUI paint/layout). It needs a live Qt
+        # display, can't import on the bare runner, and GUI paint code is
+        # conventionally excluded from UNIT coverage (it's exercised
+        # behaviorally by the staging tier, like the monolith's boot path).
+        # Everything with unit-testable logic IS measured.
+        _source = ["core", "skills", "tools", "adapters", "audio",
+                   "bobert_companion", "tray", "boot_sequence", "upgrade_jarvis"]
+        _label = "FULL local tier: core/skills/tools + monolith + root modules"
+    else:
+        _source = ["core", "skills", "tools"]
+        _label = "core/ + skills/ + tools/"
+    cov = coverage_mod.Coverage(source=_source, omit=_omit, branch=False,
+                                **coverage_kwargs)
+    # Conventional never-unit-tested lines, excluded everywhere so the report
+    # reflects *reachable* code. cov.exclude ADDS to coverage's default
+    # "pragma: no cover" (it doesn't replace it). Substantive unreachable blocks
+    # (the boot entrypoint, while-True daemon loops, live mic/camera capture)
+    # carry their own inline ``# pragma: no cover - <reason>`` at the block head.
+    for _pat in (r"if __name__ == ['\"]__main__['\"]:",
+                 r"if (typing\.)?TYPE_CHECKING:",
+                 r"raise NotImplementedError",
+                 r"@(abc\.)?abstractmethod"):
+        cov.exclude(_pat)
+    return cov, _label
 
 
 def main(argv: list[str]) -> int:
@@ -124,54 +197,7 @@ def main(argv: list[str]) -> int:
             return 2
 
     want_full = "--full" in argv
-    _omit = ["*/tests/*", "*/__pycache__/*", "tools/run_coverage.py",
-             "tools/run_tests_ci_sim.py",
-             # gitignored personal skills — not shipped, absent on CI, so they
-             # don't belong in the shipped-coverage denominator.
-             "*/skills/vip_intercept.py", "*/skills/vip_boss_mode.py",
-             "*/skills/trip_planner.py", "*/skills/teams_screener.py",
-             # One-off operational / hardware-bench / scratch utilities — run by
-             # hand, not part of the shipped runtime library surface, and several
-             # need hardware (camera/LAN/PyQt) absent on CI. Excluded from the
-             # measured denominator (the product code + the release/CI gates are
-             # what we hold to coverage; these are dev conveniences):
-             "tools/audit_local.py", "tools/pii_local.py",
-             "tools/bounce_jarvis.py", "tools/face_detect_bench.py",
-             "tools/generate_jarvis_icon.py", "tools/identify_vendors.py",
-             "tools/render_unified_hud.py", "tools/say_to_jarvis.py",
-             "tools/scan_full_network.py", "tools/scan_lan_devices.py",
-             "tools/test_local_prompt.py",
-             # Developer-facing TEMPLATE skill (copy-me example), not a real
-             # shipped/registered skill — documentation by example, not logic.
-             "*/skills/_example_skill.py"]
-    if want_full:
-        # LOCAL full tier: adds the ~14K-line monolith + the other root product
-        # modules + the smaller product packages. Needs all deps present (these
-        # can't import on the bare CI runner), so this tier is local-only — the
-        # default source below is the CI light-tier gate.
-        # NB: hud/ is intentionally NOT measured — it's the PyQt holographic-
-        # overlay presentation layer (GUI paint/layout). It needs a live Qt
-        # display, can't import on the bare runner, and GUI paint code is
-        # conventionally excluded from UNIT coverage (it's exercised
-        # behaviorally by the staging tier, like the monolith's boot path).
-        # Everything with unit-testable logic IS measured.
-        _source = ["core", "skills", "tools", "adapters", "audio",
-                   "bobert_companion", "tray", "boot_sequence", "upgrade_jarvis"]
-        _label = "FULL local tier: core/skills/tools + monolith + root modules"
-    else:
-        _source = ["core", "skills", "tools"]
-        _label = "core/ + skills/ + tools/"
-    cov = coverage.Coverage(source=_source, omit=_omit, branch=False)
-    # Conventional never-unit-tested lines, excluded everywhere so the report
-    # reflects *reachable* code. cov.exclude ADDS to coverage's default
-    # "pragma: no cover" (it doesn't replace it). Substantive unreachable blocks
-    # (the boot entrypoint, while-True daemon loops, live mic/camera capture)
-    # carry their own inline ``# pragma: no cover - <reason>`` at the block head.
-    for _pat in (r"if __name__ == ['\"]__main__['\"]:",
-                 r"if (typing\.)?TYPE_CHECKING:",
-                 r"raise NotImplementedError",
-                 r"@(abc\.)?abstractmethod"):
-        cov.exclude(_pat)
+    cov, _label = _coverage_for(coverage, full=want_full)
     cov.start()
     ok = _run_suite()
     cov.stop()

@@ -211,6 +211,12 @@ class WiringTests(DiscoveryArmTests):
         self.assertIs(self._runner_kwargs([])["resultclass"],
                       WatchdogTextTestResult)
 
+    def test_the_runner_is_handed_its_own_stream(self):
+        """Runtime, not just source: main() passes stream= (taken before
+        discovery — see RunnerStreamTests) instead of letting TextTestRunner
+        read sys.stderr once every test module has been imported."""
+        self.assertIn("stream", self._runner_kwargs([]))
+
     def test_inserts_project_root_when_absent(self):
         self._write("test_p.py", _PASS_SRC)
         sys.path[:] = [p for p in sys.path if p != self.root]
@@ -308,6 +314,113 @@ class SelectorArmTests(unittest.TestCase):
         rc, out = self._run(["-v", "solo"])
         self.assertEqual(rc, 0)
         self.assertIn("1 run", out)
+
+
+# ─────────────────────── the runner's own stream ─────────────────────────
+
+
+class RunnerStreamTests(unittest.TestCase):
+    """``_runner_stream()`` — the private stream all three runners report
+    through (the v2.0.128 CI crash: a leaked poller's import-time
+    ``sys.stderr.reconfigure()`` left the SHARED stderr without an encoder for
+    an instant, and the runner's "." died with ``io.UnsupportedOperation: not
+    writable`` in TextTestResult.addSuccess).
+
+    Each test stands a temp file in for the process's real stderr — BOTH
+    ``sys.stderr`` and ``sys.__stderr__`` — so what the private dup writes can
+    be read back without touching this run's own fd 2."""
+
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(prefix="rt_stream_", suffix=".err")
+        os.close(fd)
+        self.err = open(self.path, "w", encoding="utf-8",
+                        errors="backslashreplace")
+        self.addCleanup(self._cleanup)
+        for attr in ("stderr", "__stderr__"):
+            p = mock.patch.object(sys, attr, self.err)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _cleanup(self):
+        self.err.close()
+        os.unlink(self.path)
+
+    def _written(self) -> str:
+        with open(self.path, encoding="utf-8") as f:
+            return f.read()
+
+    def _private(self):
+        stream, owned = RT._runner_stream()
+        self.assertTrue(owned, "the real stderr should get a private dup")
+        self.addCleanup(stream.close)
+        return stream
+
+    def test_a_private_stream_on_the_same_destination(self):
+        stream = self._private()
+        self.assertIsNot(stream, self.err)
+        self.assertNotEqual(stream.fileno(), self.err.fileno())
+        stream.write("dots.")
+        stream.flush()
+        self.assertIn("dots.", self._written())
+
+    def test_it_mirrors_stderrs_encoding_and_error_handler(self):
+        stream = self._private()
+        self.assertEqual(stream.encoding, self.err.encoding)
+        self.assertEqual(stream.errors, self.err.errors)
+        self.assertTrue(stream.line_buffering)
+
+    def test_nothing_done_to_sys_stderr_afterwards_reaches_it(self):
+        """THE v2.0.128 SHAPE, made deterministic: the object the runner would
+        otherwise share becomes a stream whose write() raises exactly CI's
+        exception — and is then CLOSED outright. The runner's stream writes on."""
+        stream = self._private()
+        read_only = open(self.path, encoding="utf-8")
+        self.addCleanup(read_only.close)
+        with self.assertRaisesRegex(io.UnsupportedOperation, "not writable"):
+            read_only.write(".")          # the CI traceback's exact exception
+        sys.stderr = read_only             # restored by the patch's cleanup
+        self.err.close()
+        stream.write("still reporting")
+        stream.flush()
+        self.assertIn("still reporting", self._written())
+
+    def test_a_deliberate_redirect_is_honoured(self):
+        """redirect_stderr around main() (this file's own harness) must still
+        capture the report, so a redirected stderr is used as-is, unowned."""
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stderr", buf):
+            self.assertEqual(RT._runner_stream(), (buf, False))
+
+    def test_no_descriptor_falls_back_to_stderr_itself(self):
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stderr", buf), \
+                mock.patch.object(sys, "__stderr__", buf):
+            self.assertEqual(RT._runner_stream(), (buf, False))
+
+    def test_no_stderr_at_all(self):
+        with mock.patch.object(sys, "stderr", None), \
+                mock.patch.object(sys, "__stderr__", None):
+            self.assertEqual(RT._runner_stream(), (None, False))
+
+
+class EveryRunnerOwnsItsStreamTests(unittest.TestCase):
+    """All three discovery runners take the private stream BEFORE discovery
+    and hand it to TextTestRunner. Left to its default, TextTestRunner reads
+    ``sys.stderr`` only after discovery has imported every test module."""
+
+    RUNNERS = ("run_tests.py", "run_coverage.py", "run_tests_ci_sim.py")
+
+    def test_every_runner_takes_its_stream_before_discovery(self):
+        for name in self.RUNNERS:
+            with self.subTest(runner=name):
+                with open(os.path.join(_ROOT, "tools", name),
+                          encoding="utf-8") as f:
+                    src = f.read()
+                self.assertIn("= _runner_stream()", src)
+                self.assertIn("stream=runner_stream", src)
+                self.assertLess(src.index("= _runner_stream()"),
+                                src.index(".discover("),
+                                f"{name} takes its stream after discovery")
 
 
 if __name__ == "__main__":  # pragma: no cover

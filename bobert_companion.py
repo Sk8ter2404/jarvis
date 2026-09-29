@@ -34,18 +34,41 @@ Quick setup
 # the boot watchdog — which polls for jarvis.lock with a 30s timeout —
 # sees us alive within milliseconds, not 5-10s later once PortAudio /
 # OpenCV finish initialising. stdlib-only on purpose.
-import os, sys, subprocess, time
+import codecs, os, sys, subprocess, threading, time
 
 # Make stdout/stderr UTF-8 so JARVIS's non-ASCII output (─, ≥, →, em-dashes,
 # etc.) never raises UnicodeEncodeError on a legacy cp1252 Windows console — a
 # tester may run `python bobert_companion.py` in a raw console rather than the
 # utf-8 log redirect the desktop launcher uses. Best-effort; a no-op if the
-# stream is already utf-8 or doesn't support reconfigure.
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
-    except Exception:  # pragma: no cover - import-time console-encoding fallback; only fires on a stream without reconfigure()
-        pass
+# stream is already utf-8/"replace" or doesn't support reconfigure.
+#
+# MAIN THREAD ONLY, AND NEVER TWICE (2026-09-29). reconfigure() is not atomic:
+# CPython drops the stream's encoder, runs Python code to build the new one,
+# then installs it, so a write() from ANOTHER thread in that gap raises
+# io.UnsupportedOperation("not writable"). A real boot runs this once, on the
+# main thread, before any other thread exists. But ~40 modules late-bind the
+# monolith with importlib.import_module("bobert_companion"), several from daemon
+# threads, and wherever that import FAILS (the Linux CI runner has no
+# sounddevice/cv2) nothing is cached, so every attempt re-ran this loop. A
+# game-mode poller leaked by a test did it ~800 times in one ci-sim run, and on
+# v2.0.128 one landed mid-write: the unittest runner's "." reached sys.stderr
+# with no encoder and CI's coverage step died mid-suite. So a re-import that
+# finds the stream already converted leaves the live encoder alone, and an
+# import from a worker thread never touches process-wide stdio at all.
+# tests/test_monolith_import_stdio.py pins both halves.
+if threading.current_thread() is threading.main_thread():
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stdio_done = (codecs.lookup(_stream.encoding).name == "utf-8"
+                           and _stream.errors == "replace")
+        except Exception:
+            _stdio_done = False
+        if _stdio_done:
+            continue
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        except Exception:  # pragma: no cover - import-time console-encoding fallback; only fires on a stream without reconfigure()
+            pass
 
 def _read_lock_pid(path, max_retries=10, retry_delay=0.05):
     """Read a PID from a singleton lock file with retries for the write-race.

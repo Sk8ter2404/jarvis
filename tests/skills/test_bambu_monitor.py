@@ -853,12 +853,22 @@ class BambuStartStopMonitorTests(unittest.TestCase):
              mock.patch.object(self.mod, "_HAS_MQTT", True), \
              mock.patch.object(self.mod, "_start_mqtt",
                                return_value=fake_client):
-            # Thread.start is neutered by the harness, so the poll loop never
-            # actually runs.
             ok = self.mod.start_monitor()
         self.assertTrue(ok)
         self.assertIs(self.mod._mqtt_client[0], fake_client)
-        self.assertIsNotNone(self.mod._poll_thread[0])
+        t = self.mod._poll_thread[0]
+        self.assertIsNotNone(t)
+        # That is a REAL poll thread: nothing neuters Thread.start in this
+        # class (an old comment here said the harness did). Nulling the handle
+        # used to strand it for the rest of the suite, and 30 s later it began
+        # re-importing the real monolith from its own thread on every poll —
+        # the leak class behind v2.0.128's CI coverage crash (2026-09-29; see
+        # tests/skills/test_game_mode.py _Base.tearDown). Release its own stop
+        # event (its initial wait returns at once) and join it — not
+        # stop_monitor(), which also writes overlay state to disk.
+        self.mod._monitor_stop_evt[0].set()
+        t.join(timeout=5)
+        self.assertFalse(t.is_alive(), "the poll thread outlived its test")
         # Clean up module-global handles so we don't leak into siblings.
         self.mod._mqtt_client[0] = None
         self.mod._poll_thread[0] = None

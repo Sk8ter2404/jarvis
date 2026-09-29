@@ -164,9 +164,37 @@ class _Base(unittest.TestCase):
         whose import fails on the singleton lock and, in failing, DELETES the
         fake the next test just installed. That is how one leaked worker turned
         into a SystemExit inside an unrelated test's _load(). tearDown runs
-        before addCleanup, so this lands ahead of the sys.modules unpatch."""
+        before addCleanup, so this lands ahead of the sys.modules unpatch.
+
+        The auto-exit WATCHER gets the same treatment (2026-09-29).
+        game_mode_off arms the REAL one whenever it leaves a brain debt with a
+        game still up (test_game_mode_deferred_restore does so three times) and
+        nothing ever stopped it: each outlived its test by the rest of the
+        suite, polling every GAME_MODE_POLL_SECONDS, and with the fake gone
+        every poll's _cfg() -> _bc() re-imported the real monolith. On the
+        Linux CI runner that import FAILS, so it is re-run from scratch each
+        time, and its first act was to rebuild sys.stderr's encoder — ~800
+        times per run, off the main thread. On v2.0.128 one of those caught the
+        unittest runner mid-write and `io.UnsupportedOperation: not writable`
+        killed CI's coverage step mid-suite."""
+        self._stop_skill_threads()
+
+    def _stop_skill_threads(self):
+        """Stop and JOIN every thread the skill started for this test: the
+        watcher first (so it cannot re-enter), then the verify worker. A
+        watcher that will not stop fails the test — leaking it is the proven
+        hazard above, so it must never pass quietly."""
         mod = getattr(self, "mod", None)
-        t = getattr(mod, "_verify_thread", [None])[0] if mod is not None else None
+        if mod is None:
+            return
+        w = getattr(mod, "_thread", [None])[0]
+        if w is not None:
+            mod.stop_watcher()              # sets _stop; its wait returns now
+            w.join(timeout=15)
+            if w.is_alive():
+                self.fail("the game-mode watcher this test armed did not stop "
+                          "within 15 s — it would outlive the test")
+        t = getattr(mod, "_verify_thread", [None])[0]
         if t is not None:
             with mod._lock:
                 mod._st.active = False      # make the wake-up a no-op...

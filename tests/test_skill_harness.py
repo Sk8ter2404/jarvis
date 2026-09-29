@@ -38,8 +38,16 @@ class SkillHarnessTests(unittest.TestCase):
 
     def test_timer_action_actually_runs(self):
         # Driving a registered handler end-to-end with the fake utils.
-        _, actions = load_skill_isolated("timer")
+        mod, actions = load_skill_isolated("timer")
         out = actions["set_timer"]("1 minute | tea")
+        # That armed a REAL threading.Timer, and nothing cancelled it: 60 s
+        # later, mid-suite, it fired on its own thread, re-imported the monolith
+        # and — wherever that import fails (the CI runner, ci-sim) — appended
+        # "Reminder, sir — tea" to the repo's pending_speech.json, the queue a
+        # live JARVIS speaks from. tools/run_tests_ci_sim.py's leaked-thread
+        # tripwire caught it (2026-09-29). Cancel it with the test.
+        for timer, _msg, _fire_at in list(mod._timers.values()):
+            self.addCleanup(timer.cancel)
         self.assertIsInstance(out, str)
         self.assertTrue(out.strip(), "set_timer returned empty")
 

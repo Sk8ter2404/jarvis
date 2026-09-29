@@ -58,7 +58,9 @@ main suite are under concurrent edit; stdlib unittest only (no pytest).
 """
 from __future__ import annotations
 
+import threading
 import unittest
+from unittest import mock
 
 from tests.skills.test_game_mode import BIG, GAME, SMALL, _Base
 
@@ -246,6 +248,56 @@ class TestTheDebtIsNotPaidTooEarly(_Deferred):
         # restore against stale state.
         self.assertEqual(mod._tick(), "none")
         self._assert_big_brain_back("after an idle tick")
+
+
+class TestTheArmedWatcherDiesWithItsTest(unittest.TestCase):
+    """REGRESSION (2026-09-29): three tests above make game_mode_off arm the
+    REAL auto-exit watcher, and until _Base stopped it those pollers outlived
+    their tests by the rest of the suite. Once the fake monolith was unpatched
+    every poll re-imported the real one — a FAILED import on the Linux CI
+    runner, re-run from scratch every time, whose first act rebuilt
+    sys.stderr's encoder off the main thread. On v2.0.128 that caught the
+    unittest runner mid-write and killed CI's coverage step
+    (`io.UnsupportedOperation: not writable` in TextTestResult.addSuccess).
+
+    Each case runs one of those tests through its FULL lifecycle (setUp, body,
+    tearDown, cleanups) and then asks whether the watcher it started is still
+    alive. Verified able to fail: against the pre-fix _Base.tearDown all three
+    report the poller still running."""
+
+    ARMS_THE_WATCHER = (
+        (TestDeferredBrainRestoreIsAlwaysPaid,
+         "test_full_power_mid_match_is_not_a_permanent_downshift"),
+        (TestDeferredBrainRestoreIsAlwaysPaid,
+         "test_off_is_not_a_dead_end_once_the_game_is_closed"),
+        (TestTheDebtIsNotPaidTooEarly,
+         "test_off_while_the_game_runs_holds_the_brain_and_promises_it_back"),
+    )
+
+    def test_no_watcher_outlives_the_test_that_armed_it(self):
+        real_start = threading.Thread.start
+        for cls, name in self.ARMS_THE_WATCHER:
+            with self.subTest(test=name):
+                started = []
+
+                def _recording_start(th, *a, **k):
+                    if th.name == "game-mode-watch":
+                        started.append(th)
+                    return real_start(th, *a, **k)
+
+                result = unittest.TestResult()
+                with mock.patch.object(threading.Thread, "start",
+                                       _recording_start):
+                    cls(name).run(result)
+                self.assertTrue(result.wasSuccessful(),
+                                result.errors + result.failures)
+                # Precondition, or a green result proves nothing: the test
+                # really did start the REAL poller.
+                self.assertTrue(started, f"{name} no longer arms the real "
+                                         f"watcher; pick one that does")
+                alive = [t for t in started if t.is_alive()]
+                self.assertEqual(alive, [], f"{name} left the game-mode "
+                                            f"watcher running after it ended")
 
 
 if __name__ == "__main__":

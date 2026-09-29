@@ -89,6 +89,51 @@ def _redirect_lock_dir_to_throwaway() -> None:
     os.environ["JARVIS_LOCK_DIR"] = tempfile.mkdtemp(prefix="jarvis_test_lock_")
 
 
+def _runner_stream():
+    """``(stream, owned)``: what the unittest runner should report through.
+
+    A PRIVATE text stream on a dup of fd 2, taken BEFORE discovery, so nothing
+    a test or an imported module does to ``sys.stderr`` can reach the runner:
+    not swapping it (a leaked mock or redirect), not closing it, and not
+    ``reconfigure()``-ing it from another thread. Without it TextTestRunner
+    reports through whatever object ``sys.stderr`` is when it is BUILT —
+    after discovery has imported every test module — and that object is shared
+    with every thread in the process. The v2.0.128 CI crash was exactly that:
+    a poller leaked by a test kept re-running the monolith's import-time
+    ``sys.stderr.reconfigure()``, which drops the encoder while it builds the
+    next one, and the runner's "." landed in the gap —
+    ``io.UnsupportedOperation: not writable`` in TextTestResult.addSuccess, the
+    coverage step dead mid-suite.
+
+    Same bytes, same place: the dup writes where stderr writes, with stderr's
+    encoding and error handler, line-buffered (the runner flushes after every
+    result anyway); on Windows io.open picks the console raw class for a
+    console descriptor, so a console stays a console.
+
+    Returns the current ``sys.stderr`` untouched (owned=False) when it has been
+    deliberately redirected — a caller that wraps main() in
+    contextlib.redirect_stderr, as tests/test_run_tests.py does, still captures
+    the report — or when it has no usable descriptor. Close the stream after
+    the run iff ``owned``. Shared by all three runners (tools/run_tests.py,
+    tools/run_coverage.py, tools/run_tests_ci_sim.py): one implementation."""
+    err = sys.stderr
+    if err is None or err is not sys.__stderr__:
+        return err, False
+    try:
+        err.flush()
+        fd = os.dup(err.fileno())
+    except Exception:
+        return err, False
+    try:
+        stream = os.fdopen(fd, "w", buffering=1,
+                           encoding=getattr(err, "encoding", None) or "utf-8",
+                           errors=getattr(err, "errors", None) or "backslashreplace")
+    except Exception:
+        os.close(fd)
+        return err, False
+    return stream, True
+
+
 def _stop_lingering_daemons() -> None:
     """Best-effort: stop any opt-in background daemon a test may have left alive
     (currently the apple-music keep-alive watchdog) so it can't outlive the
@@ -145,6 +190,9 @@ def main(argv: list[str]) -> int:
     verbose = "-v" in argv or "--verbose" in argv
     selectors = [a for a in argv if not a.startswith("-")]
 
+    # The runner's own stream, taken BEFORE discovery imports a single test
+    # module — see _runner_stream (the v2.0.128 "not writable" crash).
+    runner_stream, owned_stream = _runner_stream()
     loader = unittest.TestLoader()
     if selectors:
         suite = unittest.TestSuite()
@@ -157,9 +205,14 @@ def main(argv: list[str]) -> int:
                                 top_level_dir=_PROJECT_ROOT)
 
     runner = unittest.TextTestRunner(
+        stream=runner_stream,
         verbosity=2 if verbose else 1,
         resultclass=test_watchdog.WatchdogTextTestResult)
-    result = runner.run(suite)
+    try:
+        result = runner.run(suite)
+    finally:
+        if owned_stream:
+            runner_stream.close()
     # Suite over: stand the watchdog down before the reap/summary below.
     test_watchdog.disarm()
 

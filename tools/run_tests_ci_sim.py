@@ -22,9 +22,12 @@ of failure locally:
      imports — Linux has ctypes, just no windll), and
      ``subprocess.CREATE_NO_WINDOW`` is removed.
 
-    python tools/run_tests_ci_sim.py
+    python tools/run_tests_ci_sim.py              # the pre-push gate
+    python tools/run_tests_ci_sim.py --coverage   # + CI's coverage step
 
-Exit 0 = CI-clean (0 failed / 0 errored; skips are fine).
+Exit 0 = CI-clean (0 failed / 0 errored; skips are fine). ``--coverage`` also
+runs the suite under coverage.py with tools/run_coverage.py's measured surface
+and fails below the ``--fail-under`` floor that .github/workflows/ci.yml sets.
 
 Every run sits inside a HARD MEMORY CEILING (tools/mem_guard.py, applied as the
 first thing main() does — before the gate subprocesses, which inherit it). That
@@ -44,11 +47,15 @@ from __future__ import annotations
 import builtins
 import importlib
 import importlib.util
+import io
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import traceback
 import unittest
 
 # Heavy / optional pip packages the CI runner does NOT install (everything
@@ -295,6 +302,58 @@ def _redirect_data_dir_to_throwaway() -> None:
     os.environ["JARVIS_DATA_DIR"] = tempfile.mkdtemp(prefix="jarvis_test_data_")
 
 
+class _OffMainMonolithImportTripwire:
+    """A sys.meta_path sentinel that records every FRESH import of the
+    monolith attempted from any thread but the main one. It never blocks
+    anything: find_spec() notes the attempt and returns None, so the normal
+    finders proceed; and meta_path is consulted only for modules NOT already
+    in sys.modules, so a cached import costs nothing.
+
+    WHY THIS IS A GATE (2026-09-29). Under this simulation — and on the real
+    runner — ``import bobert_companion`` always FAILS (no sounddevice/cv2), so
+    it is never cached: every attempt re-executes the module's top level from
+    scratch, and its failure can delete a fake ``sys.modules["bobert_companion"]``
+    the main thread's current test installed meanwhile. From a background
+    thread that is a test-isolation leak: a poller outliving the test that
+    started it. The v2.0.128 CI coverage crash was one — a game-mode watcher leaked
+    by tests/skills/test_game_mode_deferred_restore.py made ~800 such imports
+    per run, and one of them caught the unittest runner mid-write. The crash
+    itself was a race that needed luck to show; the leaked import is
+    deterministic, so that is what fails the run here."""
+
+    NAME = "bobert_companion"
+    MAX_KEPT = 20
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.hits: dict[str, list] = {}     # stack text -> [thread name, count]
+
+    def find_spec(self, name, path=None, target=None):
+        if name == self.NAME and                 threading.current_thread() is not threading.main_thread():
+            try:
+                stack = "".join(traceback.format_stack(limit=25)[:-1])
+                with self._lock:
+                    if stack in self.hits:
+                        self.hits[stack][1] += 1
+                    elif len(self.hits) < self.MAX_KEPT:
+                        self.hits[stack] = [threading.current_thread().name, 1]
+            except Exception:
+                pass
+        return None
+
+    def report(self) -> bool:
+        """Print what was caught; True iff nothing was."""
+        if not self.hits:
+            return True
+        print("[ci-sim] FAIL: a background thread freshly imported "
+              f"{self.NAME} — a thread outlived the test that started it:")
+        for stack, (thread_name, count) in self.hits.items():
+            print(f"  --- thread {thread_name!r}, {count} import(s), from:")
+            for line in stack.rstrip().splitlines():
+                print(f"    {line}")
+        return False
+
+
 def _stop_lingering_daemons() -> None:
     """Best-effort: stop any opt-in background daemon a test may have left alive
     so it can't outlive the suite. Currently just the apple-music keep-alive
@@ -308,7 +367,33 @@ def _stop_lingering_daemons() -> None:
         pass
 
 
-def main() -> int:
+def _ci_coverage_floor(root: str) -> float | None:
+    """CI's ``--fail-under`` for tools/run_coverage.py, read out of
+    .github/workflows/ci.yml itself so the local number can never drift from
+    the gate's. None if the workflow or the flag cannot be found."""
+    try:
+        with open(os.path.join(root, ".github", "workflows", "ci.yml"),
+                  encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return None
+    m = re.search(r"run_coverage\.py\b[^\n]*--fail-under\s+([0-9]+(?:\.[0-9]+)?)",
+                  text)
+    return float(m.group(1)) if m else None
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    # --coverage: ALSO be CI's coverage step (tools/run_coverage.py --xml
+    # --fail-under <ci.yml's floor>) — the same suite under coverage.py, the
+    # same measured surface (built by run_coverage._coverage_for, not copied),
+    # the floor read from ci.yml — but under THIS simulation's dependency set.
+    # Two things only that combination shows locally: the light-tier
+    # percentage (the ~3,000 tests that skip on the runner add nothing, as on
+    # CI; a plain local run_coverage.py counts them), and the coverage tracer's
+    # timing, the only thing CI's coverage step does differently from its unit
+    # step (v2.0.128 died in that step alone).
+    want_cov = "--coverage" in argv
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     # HARD MEMORY CEILING FIRST — before the gate subprocesses (they are spawned
     # into this process's Job Object, so they inherit the ceiling), before the
@@ -342,7 +427,13 @@ def main() -> int:
     # output to name. See tools/test_watchdog.py for the 2026-09-04 exit-124
     # that motivated it and the JARVIS_TEST_TIMEOUT_S knob (0 = off).
     from tools import test_watchdog
-    test_watchdog.arm()
+    if want_cov:
+        # Coverage instruments every executed line: the same 4x ceilings
+        # tools/run_coverage.py arms, for the same reason.
+        test_watchdog.arm(per_phase_s=test_watchdog.DEFAULT_PER_PHASE_S * 4,
+                          total_s=test_watchdog.DEFAULT_TOTAL_S * 4)
+    else:
+        test_watchdog.arm()
     # Redirect settings I/O to a throwaway copy BEFORE discovery/import (and
     # before the gate subprocesses, which inherit this env), so no test or gate
     # can touch the real data/user_settings.json.
@@ -357,6 +448,24 @@ def main() -> int:
     # platform flip — these run in a normal environment on CI, so a clean
     # subprocess here is faithful and catches regressions the test run can't.
     gates_ok = _run_ci_gates(root)
+
+    # --coverage: build the measurement BEFORE the platform flip — coverage.py
+    # resolves its per-OS path handling when it is imported.
+    cov = cov_label = cov_floor = None
+    if want_cov:
+        try:
+            import coverage
+        except ImportError:
+            print("coverage not installed — run: python -m pip install --user coverage")
+            return 2
+        cov_floor = _ci_coverage_floor(root)
+        if cov_floor is None:
+            print("[ci-sim coverage] could not read run_coverage.py's "
+                  "--fail-under from .github/workflows/ci.yml")
+            return 2
+        from tools.run_coverage import _coverage_for
+        os.chdir(root)  # _coverage_for's source dirs are relative, as in CI
+        cov, cov_label = _coverage_for(coverage, full=False, data_file=None)
 
     real_import = builtins.__import__
     real_find_spec = importlib.util.find_spec
@@ -435,11 +544,33 @@ def main() -> int:
 
     if root not in sys.path:
         sys.path.insert(0, root)
+    if cov is not None:
+        cov.start()   # same point as tools/run_coverage.py: before discovery
+    # The runner's OWN stream, taken BEFORE discovery imports a single test
+    # module, exactly as the two CI runners now do — see
+    # tools/run_tests._runner_stream (the v2.0.128 "not writable" crash).
+    from tools.run_tests import _runner_stream
+    runner_stream, owned_stream = _runner_stream()
+    # See _OffMainMonolithImportTripwire: a leaked thread re-importing the
+    # (here always-failing) monolith is caught deterministically, not by luck.
+    tripwire = _OffMainMonolithImportTripwire()
+    sys.meta_path.insert(0, tripwire)
     suite = unittest.TestLoader().discover(
         os.path.join(root, "tests"), pattern="test_*.py", top_level_dir=root)
-    res = unittest.TextTestRunner(
-        verbosity=1,
-        resultclass=test_watchdog.WatchdogTextTestResult).run(suite)
+    try:
+        res = unittest.TextTestRunner(
+            stream=runner_stream,
+            verbosity=1,
+            resultclass=test_watchdog.WatchdogTextTestResult).run(suite)
+    finally:
+        if owned_stream:
+            runner_stream.close()
+        try:
+            sys.meta_path.remove(tripwire)
+        except ValueError:
+            pass
+    if cov is not None:
+        cov.stop()
     # The suite is over: stand the watchdog down so nothing can fire during the
     # reap/summary below (and so a slow tail here is never misreported as a
     # hung test).
@@ -449,10 +580,25 @@ def main() -> int:
     # next invocation. The real guard is per-test cleanup in the test modules;
     # this is a harmless final sweep that never fails the run.
     _stop_lingering_daemons()
+    cov_ok, cov_note = True, ""
+    if cov is not None:
+        # Total only (the per-file table is tools/run_coverage.py's job); the
+        # report is built in memory — data_file=None, nothing is written.
+        total = cov.report(skip_covered=False, file=io.StringIO())
+        cov_ok = total >= cov_floor
+        print(f"[ci-sim coverage] TOTAL {total:.1f}% (measured: {cov_label}) "
+              f"vs CI floor {cov_floor:.1f}% -> {'OK' if cov_ok else 'FAIL'}")
+        cov_note = f", coverage {total:.1f}%/{cov_floor:.0f}%"
+        if not cov_ok:
+            cov_note += "  [+ COVERAGE BELOW CI FLOOR]"
+    trip_ok = tripwire.report()
+    trip_note = "" if trip_ok else "  [+ LEAKED THREAD IMPORTED THE MONOLITH]"
     gate_note = "" if gates_ok else "  [+ CI GATE FAILURE above]"
     print(f"=== CI-SIM: {res.testsRun} run, {len(res.failures)} failed, "
-          f"{len(res.errors)} errored, {len(res.skipped)} skipped{gate_note} ===")
-    return 0 if (res.wasSuccessful() and gates_ok) else 1
+          f"{len(res.errors)} errored, {len(res.skipped)} skipped"
+          f"{cov_note}{trip_note}{gate_note} ===")
+    return 0 if (res.wasSuccessful() and gates_ok and cov_ok
+                 and trip_ok) else 1
 
 
 if __name__ == "__main__":
