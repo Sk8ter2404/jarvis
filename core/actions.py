@@ -1672,9 +1672,9 @@ def _entry_ts(entry: dict) -> float:
 
 def _act_forget_last_hour(_: str = "") -> str:
     """Drop the last hour's traces from EVERY conversation store:
-    bobert_memory.json topics/sessions, the tiered LTM store (verbatim
-    episodes.jsonl turn log, semantic facts created in the window, the
-    in-process working turns) and the voice-command pattern log.
+    bobert_memory.json topics/sessions and hidden topic sightings, the tiered
+    LTM store (verbatim episodes.jsonl turn log, semantic facts created in the
+    window, the in-process working turns) and the voice-command pattern log.
     Facts/projects in bobert_memory are intentionally NOT touched — those
     are durable knowledge, not session traces. The bobert prune is held
     under _memory_lock so it can't race with learn_from_turn; the LTM
@@ -1698,8 +1698,17 @@ def _act_forget_last_hour(_: str = "") -> str:
                             if _entry_ts(t) < cutoff]
             kept_sessions = [s for s in old_sessions
                              if _entry_ts(s) < cutoff]
+            # The hidden topic/project SIGHTINGS (core/topic_hygiene.py) are
+            # conversation traces too: left in place, a forgotten hour could
+            # still promote a topic on its next mention. Mutates mem in place.
+            try:
+                from core import topic_hygiene as _th
+                sightings = _th.forget_sightings_since(mem, cutoff)
+            except Exception:
+                sightings = 0
             removed = (len(old_topics) - len(kept_topics)
-                       + len(old_sessions) - len(kept_sessions))
+                       + len(old_sessions) - len(kept_sessions)
+                       + sightings)
             if removed:
                 mem["topics"]  = kept_topics
                 mem["sessions"] = kept_sessions

@@ -233,6 +233,14 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "DAILY RECAP": [
         "recap", "daily recap", "end of day", "summary of my day", "how was my day",
     ],
+    # 2026-09-29: both header words are generic ("project", "status"), so this
+    # section routes ONLY on these. A miss here is the live failure it exists
+    # for: "what am I working on" answered from mis-heard learned topics.
+    "PROJECT STATUS": [
+        "working on", "been doing lately", "been up to", "my projects",
+        "project status", "project list", "status of my", "my project",
+        "what am i doing lately",
+    ],
     "DOSSIER": [
         "dossier", "pull up the file", "file on", "what do you know about",
         "tell me about",

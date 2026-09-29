@@ -1346,8 +1346,27 @@ from core.memory_guards import (  # noqa: E402,F401
 # follow-up-loop _is_failure() check below can't drift from the dispatcher's.
 from core.failure_markers import FAILURE_MARKERS  # noqa: E402
 
+# Write-time quality gates for auto-learned TOPICS / PROJECTS (2026-09-29: a
+# mis-heard TV line became a standing "project" the model then volunteered).
+# See core/topic_hygiene.py for the rules; merge_memory applies them to every
+# caller that passes `provenance`.
+from core import topic_hygiene as _topic_hygiene  # noqa: E402
 
-def merge_memory(new_facts=None, new_projects=None, new_topic=""):
+
+def _owner_vocab() -> frozenset:
+    """Words the owner has used in >= 2 separate logged turns (the
+    voice-command log pattern_memory writes for every accepted owner turn).
+    Lets a real proper noun he keeps saying pass the non-word check. Empty on
+    any error — never raises into the learner."""
+    try:
+        return _topic_hygiene.load_owner_vocab(
+            getattr(pattern_memory, "_LOG_FILE", ""))
+    except Exception:
+        return frozenset()
+
+
+def merge_memory(new_facts=None, new_projects=None, new_topic="", *,
+                 provenance=None):
     """Atomically merge new facts/projects/topic into bobert_memory.json.
 
     Holds _memory_lock across load → dedupe → trim → save so concurrent
@@ -1361,7 +1380,23 @@ def merge_memory(new_facts=None, new_projects=None, new_topic=""):
     extended to projects 2026-06-07) so secrets can't leak into the system
     prompt that's sent to the cloud every turn. Pre-existing secret-shaped
     projects already on disk are also pruned during the in-place repair.
+
+    provenance (2026-09-29 topic hygiene) — who produced the TOPIC and
+    PROJECTS. None keeps the legacy contract: the caller vouches for them and
+    they land directly (tests, deliberate edits). The automated learners pass
+    a dict ``{"owner_directed": bool, "turn_text": str, "conf": dict|None,
+    "source": str}`` and the topic/projects then go through the write gate in
+    core/topic_hygiene.py: rejected unless owner-directed with a clean
+    transcript; otherwise recorded as a sighting and only SURFACED (appended
+    to topics / added to projects) once seen in MIN_OWNER_TURNS separate owner
+    turns with a label that is not mostly non-words. Facts are unaffected.
     """
+    # A bare string (a malformed extractor reply) would otherwise be iterated
+    # character by character into one-letter "facts"/"projects".
+    if isinstance(new_facts, str):
+        new_facts = [new_facts]
+    if isinstance(new_projects, str):
+        new_projects = [new_projects]
     _raw_facts = [f.strip() for f in (new_facts or [])
                   if isinstance(f, str) and f.strip()]
     # Drop anything that looks like a credential before it can be stored.
@@ -1399,6 +1434,26 @@ def merge_memory(new_facts=None, new_projects=None, new_topic=""):
     added_facts: list[str] = []
     added_projects: list[str] = []
 
+    # Topic/project write gate (rules 1-2 here, outside the lock: the owner-
+    # vocabulary read is file I/O). See the docstring and core/topic_hygiene.
+    gated = provenance is not None
+    _turn = ""
+    _vocab: frozenset = frozenset()
+    if gated and (new_topic or new_projects):
+        _prov = provenance if isinstance(provenance, dict) else {}
+        _src = str(_prov.get("source") or "learner")
+        _vocab = _owner_vocab()
+        _why = _topic_hygiene.screen_reason(
+            owner_directed=bool(_prov.get("owner_directed")),
+            turn_text=_prov.get("turn_text") or "",
+            conf=_prov.get("conf"), vocab=_vocab)
+        if _why:
+            print(f"  [topic-gate] rejected {len(new_projects)} project(s)"
+                  f"{' and a topic' if new_topic else ''} from {_src}: {_why}")
+            new_topic, new_projects = "", []
+        else:
+            _turn = _topic_hygiene.turn_id(_prov.get("turn_text") or "")
+
     if not new_facts and not new_projects and not new_topic:
         return added_facts, added_projects
 
@@ -1428,13 +1483,37 @@ def merge_memory(new_facts=None, new_projects=None, new_topic=""):
             added_facts.append(f)
 
         existing_projs = {p.lower() for p in memory["projects"] if isinstance(p, str)}
+        _now = time.time()
+        # The owner's stored facts are his own words too: a client or place
+        # named there is a known word when a label is judged (rule 4).
+        if gated:
+            _vocab = _vocab | _topic_hygiene.facts_vocab(memory)
         for p in new_projects:
             if p.lower() in existing_projs:
                 continue
+            if gated:
+                # Rules 3-4: record the sighting; surface only once seen in
+                # enough separate owner turns, and never a paraphrase of a
+                # project that is already listed.
+                _ok, _why = _topic_hygiene.observe(
+                    memory, kind="project", label=p, turn=_turn,
+                    vocab=_vocab, now=_now)
+                if not _ok:
+                    print(f"  [topic-gate] project {_why}")
+                    continue
+                if _topic_hygiene.matches_any(p, memory["projects"]):
+                    continue
             memory["projects"].append(p)
             existing_projs.add(p.lower())
             added_projects.append(p)
 
+        if new_topic and gated:
+            _ok, _why = _topic_hygiene.observe(
+                memory, kind="topic", label=new_topic, turn=_turn,
+                vocab=_vocab, now=_now)
+            if not _ok:
+                print(f"  [topic-gate] topic {_why}")
+                new_topic = ""
         if new_topic:
             memory["topics"].append({
                 "date":     time.strftime("%Y-%m-%d"),
@@ -1693,13 +1772,25 @@ def build_system_prompt(memory: dict) -> str:
         prompt += "\n\nWhat you know about your owner:\n"
         prompt += "\n".join(f"- {f}" for f in memory["facts"])
 
+    # Projects and topics are AUTO-LEARNED from speech recognition, so they
+    # are framed as low-confidence hints the model must not volunteer
+    # (2026-09-29: mis-heard TV lines were being offered back as the owner's
+    # projects). "What am I working on" has a grounded source instead:
+    # project_status (skills/project_status.py).
     if memory["projects"]:
-        prompt += "\n\nProjects they've mentioned:\n"
+        prompt += ("\n\nProjects picked up from past conversations "
+                   "(auto-learned and unverified: never volunteer one, and "
+                   "answer 'what am I working on' with project_status, not "
+                   "this list):\n")
         prompt += "\n".join(f"- {p}" for p in memory["projects"])
 
     if memory["topics"]:
         recent_topics = memory["topics"][-15:]
-        prompt += "\n\nRecent topics you've discussed:\n"
+        prompt += ("\n\nTopics picked up from recent conversations "
+                   "(auto-learned from speech recognition and possibly "
+                   "mis-heard: low-confidence hints only, never volunteer "
+                   "them or state them as fact; use one only if sir raises "
+                   "it first):\n")
         prompt += "\n".join(
             f"- {t['date']} ({t.get('location', '?')}): {t['topic']}"
             for t in recent_topics
@@ -1885,14 +1976,16 @@ def _parse_json_array(text: str) -> list:
 # background gate while the owner is in a conversation, so the turns that
 # arrive meanwhile are extracted by ONE call when it goes quiet instead of one
 # prefix-evicting call per turn. At most _LEARN_BATCH_MAX turns per call; the
-# rest go in the next call.
+# rest go in the next call. Each queued turn keeps its own provenance (topic
+# hygiene) and a batch never mixes owner-directed with overheard turns.
 _learn_lock = threading.Lock()
-_learn_pending: list = []          # [(user_msg, ai_reply), ...] oldest first
+_learn_pending: list = []          # [(user_msg, ai_reply, owner_directed, conf), ...] oldest first
 _learn_worker_live = [False]       # a worker thread owns the queue
 _LEARN_BATCH_MAX = 6
 
 
-def learn_from_turn(user_msg: str, ai_reply: str, memory: dict):
+def learn_from_turn(user_msg: str, ai_reply: str, memory: dict, *,
+                    owner_directed: bool = True, conf=None):
     """Background: extract new facts/projects/topic from this exchange.
 
     ``memory`` is accepted (and deliberately IGNORED) for call-site
@@ -1904,11 +1997,18 @@ def learn_from_turn(user_msg: str, ai_reply: str, memory: dict):
     instead, the same fix the prompt-rebuild Timer already got.
 
     Queued, never dropped (2026-09-29): the turn joins _learn_pending and the
-    one live worker extracts it; see _learn_worker for the coalescing."""
+    one live worker extracts it; see _learn_worker for the coalescing.
+
+    ``owner_directed`` / ``conf`` (2026-09-29 topic hygiene): the extracted
+    topic and projects go through merge_memory's write gate
+    (core/topic_hygiene.py). The main loop's answered turn is owner-directed
+    and passes that turn's Whisper metadata; the ambient path
+    (_ambient_learn_from_gated) passes owner_directed=False, so overheard
+    speech can still teach facts but never a topic or a project."""
     if not LEARN_EVERY_TURN:
         return
     with _learn_lock:
-        _learn_pending.append((user_msg, ai_reply))
+        _learn_pending.append((user_msg, ai_reply, bool(owner_directed), conf))
         if _learn_worker_live[0]:
             return          # the live worker picks this turn up
         _learn_worker_live[0] = True
@@ -1919,6 +2019,40 @@ def learn_from_turn(user_msg: str, ai_reply: str, memory: dict):
         with _learn_lock:
             _learn_worker_live[0] = False
         print(f"  [learn] worker start failed: {type(e).__name__}")
+
+
+def _learn_turn_fields(t) -> tuple:
+    """(user_msg, ai_reply, owner_directed, conf) of one queued turn. Older
+    2-tuples (tests, pre-hygiene callers) count as owner-directed, no conf."""
+    u, a = t[0], t[1]
+    owner = bool(t[2]) if len(t) > 2 else True
+    conf = t[3] if len(t) > 3 else None
+    return u, a, owner, conf
+
+
+def _learn_provenance(batch) -> dict | None:
+    """merge_memory's provenance for one extraction over `batch` (topic
+    hygiene, core/topic_hygiene.py). The batch is homogeneous in
+    owner_directed (see _learn_worker); a multi-turn batch passes the WORST
+    Whisper scores of its turns and the most recent turn's text (the topic
+    label is that turn's), which only ever makes the gate stricter."""
+    if not batch:
+        return None
+    turns = [_learn_turn_fields(t) for t in batch]
+    owner = all(t[2] for t in turns)
+    confs = [t[3] for t in turns if isinstance(t[3], dict)]
+    conf = None
+    if confs:
+        conf = {}
+        for key, pick in (("no_speech_prob", max), ("avg_logprob", min),
+                          ("compression_ratio", max)):
+            vals = [c.get(key) for c in confs
+                    if isinstance(c.get(key), (int, float))
+                    and not isinstance(c.get(key), bool)]
+            if vals:
+                conf[key] = pick(vals)
+    return {"owner_directed": owner, "turn_text": turns[-1][0], "conf": conf,
+            "source": "owner turn" if owner else "ambient speech"}
 
 
 def _learn_prompt(batch: list) -> tuple:
@@ -1960,7 +2094,7 @@ def _learn_prompt(batch: list) -> tuple:
         f"{existing_projects_str or '(none yet)'}"
     )
     if len(batch) == 1:
-        user_msg, ai_reply = batch[0]
+        user_msg, ai_reply = _learn_turn_fields(batch[0])[:2]
         return system, f"User said: {user_msg}\nAssistant said: {ai_reply}", 250
     system += (
         "\n\nThe input below holds several consecutive turns of ONE "
@@ -1968,12 +2102,14 @@ def _learn_prompt(batch: list) -> tuple:
         "covering all of them, and make the topic label the most recent turn.")
     user = "\n\n".join(
         f"Turn {i}:\nUser said: {u}\nAssistant said: {a}"
-        for i, (u, a) in enumerate(batch, 1))
+        for i, (u, a, _o, _c) in enumerate(
+            (_learn_turn_fields(t) for t in batch), 1))
     return system, user, 400
 
 
-def _learn_apply(text: str) -> None:
-    """Parse one extraction reply and merge it into memory."""
+def _learn_apply(text: str, batch=None) -> None:
+    """Parse one extraction reply and merge it into memory, gated by the
+    batch's provenance (None = the legacy ungated merge)."""
     # Extract the FIRST complete JSON object from the response.
     # Using raw_decode instead of a regex so we never accidentally
     # capture two objects (which produces JSONDecodeError: Extra data).
@@ -1994,6 +2130,7 @@ def _learn_apply(text: str) -> None:
         new_facts=data.get("new_facts"),
         new_projects=data.get("new_projects"),
         new_topic=topic,
+        provenance=_learn_provenance(batch),
     )
 
     added = [f"fact: {f}" for f in added_facts] \
@@ -2042,8 +2179,17 @@ def _learn_worker() -> None:
                 try:
                     with _bg_local_slot(_llm_quick_goes_local()):
                         with _learn_lock:
-                            batch = _learn_pending[:_LEARN_BATCH_MAX]
-                            del _learn_pending[:len(batch)]
+                            # Leading run of turns with the SAME provenance
+                            # kind: overheard speech never rides in an
+                            # owner-directed extraction (or vice versa).
+                            head = _learn_pending[:_LEARN_BATCH_MAX]
+                            n = 1 if head else 0
+                            while (n < len(head)
+                                   and _learn_turn_fields(head[n])[2]
+                                   == _learn_turn_fields(head[0])[2]):
+                                n += 1
+                            batch = head[:n]
+                            del _learn_pending[:n]
                         if not batch:
                             continue
                         if len(batch) > 1:
@@ -2051,7 +2197,7 @@ def _learn_worker() -> None:
                                   f"queued turns in one call")
                         system, user, max_tokens = _learn_prompt(batch)
                         text = _llm_quick(system, user, max_tokens=max_tokens)
-                    _learn_apply(text or "")
+                    _learn_apply(text or "", batch)
                 except Exception as e:
                     # Log to console (which logs to file too) but don't break
                     # the chat -- and keep draining the queue.
@@ -2314,7 +2460,10 @@ def _ambient_learn_from_gated(text: str, memory: dict,
                 # matched) is never learned.
                 if not _ambient_should_learn_text(snippet, conf, peak_rms):
                     return
-                learn_from_turn(snippet, "", memory)
+                # Overheard (not addressed to JARVIS): facts only — never a
+                # topic or project (core/topic_hygiene.py rule 1).
+                learn_from_turn(snippet, "", memory, owner_directed=False,
+                                conf=conf)
                 print(f"  [ambient-learn] ingested gated text ({n} chars) "
                       f"— owner voice (score={vscore:.2f})")
                 return
@@ -2336,7 +2485,7 @@ def _ambient_learn_from_gated(text: str, memory: dict,
         if not _ambient_should_learn_text(snippet, conf, peak_rms):
             return
 
-        learn_from_turn(snippet, "", memory)
+        learn_from_turn(snippet, "", memory, owner_directed=False, conf=conf)
         print(f"  [ambient-learn] ingested gated text ({n} chars) "
               "— no media, voice-ID unavailable (content heuristic passed)")
     except Exception as _e:
@@ -12200,12 +12349,18 @@ def should_be_proactive() -> bool:
 
 def generate_proactive_comment() -> str:
     """Use the LLM + memory to write a brief JARVIS-style observation."""
+    # 2026-09-29: this used to ask for "something you remember they're
+    # working on" / "a question about a recent topic" — i.e. it ORDERED the
+    # model to volunteer the auto-learned topics and projects, which are
+    # speech-recognition guesses (a mis-heard TV line became a "project" it
+    # then brought up unprompted). Those lists are hints, never openers.
     system = _system_prompt + (
         "\n\nYou are now generating a PROACTIVE comment. Your owner has been "
         "quiet for a while but you can see them at their desk. "
-        "Pick ONE of: a brief observation about something you remember they're "
-        "working on, a thoughtful question about a recent topic, a short interesting "
-        "fact related to their interests, or a check-in. "
+        "Pick ONE of: a short interesting fact related to their interests, "
+        "a light remark about the hour, or a check-in. Never raise an "
+        "auto-learned topic or project from memory: those are unverified and "
+        "may be mis-heard. "
         "Keep it to ONE sentence. Do not start with 'Hey' or any greeting. "
         "Sound natural, like you just thought of it."
     )
@@ -15568,6 +15723,7 @@ _LOCAL_NEVER_GUESS_GUARD = (
     "  [ACTION: whats_broken]        \"what's broken\" / \"anything wrong\"\n"
     "  [ACTION: list_timers]         \"list my timers\" / \"what timers are running\"\n"
     "  [ACTION: recognize_face]      \"who am I\" / \"who's here\" / \"who's at the desk\" / \"do you recognize me\"\n"
+    "  [ACTION: project_status]      \"what am I working on\" / \"what are my projects\"\n"
     "If sir asks any of the above, your reply must contain ONLY the action\n"
     "token (plus at most a short lead-in like \"One moment, sir.\"). Do not\n"
     "invent a time, version number, temperature, or status — you will be\n"
@@ -16853,6 +17009,12 @@ def _ltm_context(user_text: str) -> str:
     for f in result[:_LTM_RETRIEVE_K]:
         t = (f.get("text") or "").strip() if isinstance(f, dict) else ""
         if t:
+            # Projects mirrored here by merge_memory are auto-learned from
+            # speech (2026-09-29 topic hygiene): mark them so recall of a
+            # mis-heard one is never restated as what sir is working on.
+            tags = f.get("tags")
+            if isinstance(tags, (list, tuple)) and "project" in tags:
+                t = "(auto-learned project mention, unverified) " + t
             lines.append(f"- {t[:300]}")
     if not lines:
         return ""
@@ -32294,8 +32456,10 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
 
                 reply = _run_llm_dispatch(text, voice=_injected_text is None)
 
-                # Real-time learning: extract facts in background (non-blocking)
-                learn_from_turn(text, reply, memory)
+                # Real-time learning: extract facts in background (non-blocking).
+                # An answered turn is owner-directed; its Whisper metadata lets
+                # the topic gate refuse a low-confidence transcript.
+                learn_from_turn(text, reply, memory, conf=conf)
 
                 # Ambient-learning 'answer_then_quiet': this normal-mode turn was the
                 # ONE reply granted after the wake word — now drop straight back to

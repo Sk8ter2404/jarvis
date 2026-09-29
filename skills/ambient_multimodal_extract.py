@@ -14,9 +14,11 @@ small LLM prompt to:
      already merges into bobert_memory.json.
 
 New facts/projects are appended to bobert_memory.json via the same MAX_*
-ceilings + dedupe pass the live learner uses. The extractor also writes a
-per-run summary into data/ambient_extracts.jsonl so the user can audit what
-was learned.
+ceilings + dedupe pass the live learner uses. Projects from this overheard
+stream are refused by merge_memory's topic gate (core/topic_hygiene.py: only
+owner-directed turns may teach a project); facts are unaffected. The
+extractor also writes a per-run summary into data/ambient_extracts.jsonl so
+the user can audit what was learned.
 
 Actions registered:
     ambient_extract_start    — kick the loop manually (idempotent)
@@ -207,9 +209,15 @@ def _merge_into_memory(extracted: dict) -> tuple[int, int]:
         return 0, 0
 
     try:
+        # Overheard mic / system audio / screen — never speech addressed to
+        # JARVIS. merge_memory's topic gate (core/topic_hygiene.py) therefore
+        # refuses every PROJECT from here: a mis-heard TV line must not become
+        # a standing "project" (2026-09-29). Facts still merge as before.
         added_facts_list, added_projs_list = merge(
             new_facts=new_facts,
             new_projects=new_projects,
+            provenance={"owner_directed": False,
+                        "source": "ambient extractor"},
         )
     except Exception as e:
         print(f"  [ambient-extract] memory merge failed: {e}")

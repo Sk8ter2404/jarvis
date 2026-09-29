@@ -438,6 +438,57 @@ class LearnCoalescingTests(_Base):
         self.assertNotIn("several consecutive turns",
                          self.posted[0]["messages"][0]["content"])
 
+    _JSON_BODY = {"model": "gemma-test",
+                  "message": {"role": "assistant",
+                              "content": '{"new_facts": [], "new_projects": ["p"], '
+                                         '"topic": "t"}'},
+                  "done": True, "prompt_eval_count": 1234, "eval_count": 1}
+
+    def _provenances(self):
+        return [c.kwargs.get("provenance") for c in self.merge.call_args_list]
+
+    def test_overheard_and_owner_turns_never_share_an_extraction(self):
+        # v2.0.129 merge of the batching queue (R6) with topic hygiene (Q4):
+        # a batch must be homogeneous, or overheard speech would ride an
+        # owner-directed extraction and be allowed to teach projects.
+        bc = self.bc
+        self.posted = self._local_llm(body=self._JSON_BODY)
+        mem = bc._empty_memory()
+        self._talking()
+        with contextlib.redirect_stdout(io.StringIO()):
+            bc.learn_from_turn("owner one", "r1", mem)
+            bc.learn_from_turn("tv line", "", mem, owner_directed=False)
+            bc.learn_from_turn("owner two", "r2", mem)
+            time.sleep(0.2)
+            self._quiet()
+            self._drained()
+        self.assertEqual(len(self.posted), 3, "a mixed backlog must split into runs")
+        self.assertEqual([p["owner_directed"] for p in self._provenances()],
+                         [True, False, True])
+        self.assertEqual([p["turn_text"] for p in self._provenances()],
+                         ["owner one", "tv line", "owner two"])
+
+    def test_a_batch_passes_the_strictest_confidence_of_its_turns(self):
+        bc = self.bc
+        self.posted = self._local_llm(body=self._JSON_BODY)
+        mem = bc._empty_memory()
+        self._talking()
+        with contextlib.redirect_stdout(io.StringIO()):
+            bc.learn_from_turn("clear one", "r1", mem, conf={
+                "avg_logprob": -0.2, "no_speech_prob": 0.1, "compression_ratio": 1.2})
+            bc.learn_from_turn("murky two", "r2", mem, conf={
+                "avg_logprob": -0.9, "no_speech_prob": 0.5, "compression_ratio": 2.0})
+            time.sleep(0.2)
+            self._quiet()
+            self._drained()
+        self.assertEqual(len(self.posted), 1)
+        (prov,) = self._provenances()
+        self.assertEqual(prov["conf"], {"no_speech_prob": 0.5, "avg_logprob": -0.9,
+                                        "compression_ratio": 2.0})
+        self.assertTrue(prov["owner_directed"])
+        self.assertEqual(prov["turn_text"], "murky two")
+        self.assertEqual(prov["source"], "owner turn")
+
     def test_a_long_backlog_is_split_into_capped_batches(self):
         bc = self.bc
         self._talking()

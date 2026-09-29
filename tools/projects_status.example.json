@@ -1,0 +1,22 @@
+{
+  "_about": "Example only. Copy to data/projects_status.json (gitignored, private) and edit. JARVIS reads it for 'what am I working on'. Fields: name (required), status (free text; 'done'/'finished'/'archived' = finished), updated (YYYY-MM-DD), next (optional next step).",
+  "projects": [
+    {
+      "name": "Garden shed",
+      "status": "Frame is up; roof next",
+      "updated": "2026-09-20",
+      "next": "Order shingles"
+    },
+    {
+      "name": "Bird feeder",
+      "status": "Printing the second prototype",
+      "updated": "2026-09-27",
+      "next": "Leave it outside for a week"
+    },
+    {
+      "name": "Bookshelf",
+      "status": "done",
+      "updated": "2026-08-30"
+    }
+  ]
+}

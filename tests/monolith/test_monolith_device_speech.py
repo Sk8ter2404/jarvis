@@ -234,7 +234,8 @@ class MainLoopWiringTests(_Base):
                       "pattern_memory.record_voice_command(text)",
                       "_run_voice_shortcuts(text)",
                       "reply = _run_llm_dispatch(text",
-                      "learn_from_turn(text, reply, memory)"):
+                      # prefix: the call also passes the turn's conf now
+                      "learn_from_turn(text, reply, memory"):
             self.assertLess(gate, src.index(later), later)
 
     def test_standby_gate_precedes_the_wake_match_and_learning(self):

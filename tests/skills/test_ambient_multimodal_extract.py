@@ -101,6 +101,18 @@ class AmbientExtractFormatTests(unittest.TestCase):
         self.assertEqual((facts, projs), (1, 2))
         bc.merge_memory.assert_called_once()
 
+    def test_projects_are_offered_as_overheard_not_owner_directed(self):
+        # 2026-09-29: this stream is overheard mic / system audio / screen,
+        # never speech addressed to JARVIS. merge_memory's topic gate
+        # (core/topic_hygiene.py) refuses projects from a non-owner-directed
+        # source, so a mis-heard TV line can no longer become a "project".
+        bc = _bc_with(merge_return=(["fact1"], []))
+        with mock.patch.object(self.mod, "_get_bobert", return_value=bc):
+            self.mod._merge_into_memory(
+                {"new_facts": ["fact1"], "new_projects": ["proj1"]})
+        prov = bc.merge_memory.call_args.kwargs["provenance"]
+        self.assertIs(prov["owner_directed"], False)
+
     def test_merge_noop_when_empty(self):
         bc = _bc_with()
         with mock.patch.object(self.mod, "_get_bobert", return_value=bc):
