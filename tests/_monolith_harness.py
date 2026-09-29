@@ -177,6 +177,9 @@ _MONOLITH_RESTORE_NAMES = (
     # by a test that drove record_speech would make a later what_microphone
     # test answer from THAT test's fake device instead of its own fixture.
     "_live_capture_device",
+    # Capture open-failure log throttle (2026-09-29): a leaked entry would
+    # silence the NEXT test's first open-failure line.
+    "_open_fail_log",
     # PortAudio teardown-gate cells (2026-08-14): the diag/enroll owner
     # refcounts and the reinit latch. A leaked non-zero cell would make every
     # later _refresh_devices test silently defer its reinit; a leaked latch
@@ -365,6 +368,14 @@ def _restore_monolith_pristine(bc) -> None:
     # not make every later tagged call wait out the deferral cap.
     try:
         bc._lt.GATE.reset()
+    except Exception:
+        pass
+    # Audio flap governor (2026-09-29): one process-wide instance, rebound
+    # never, so its flip history / held sentence / storm must be wiped in
+    # place — a storm left open by one test would keep the NEXT test's
+    # device announcements quiet (green or red for the wrong reason).
+    try:
+        bc._audio_flap.reset()
     except Exception:
         pass
 

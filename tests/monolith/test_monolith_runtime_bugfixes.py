@@ -3294,6 +3294,12 @@ class FollowTheDefaultResponsivenessTests(MonolithGlobalsTestCase):
                               return_value=(1, "FakeMic")),
             mock.patch.object(bc, "_win_default_endpoints",
                               return_value=endpoints),
+            # 2026-09-29: endpoint states unreadable (the pre-flap-work
+            # behaviour) and the follow-hysteresis off, so a moved default is
+            # followed on the next pass exactly as these tests pin.
+            mock.patch.object(bc, "_win_active_endpoint_ids",
+                              return_value=None),
+            mock.patch.object(bc, "AUDIO_REPICK_STABLE_S", 0.0, create=True),
             mock.patch.object(bc, "MICROPHONE_INDEX", None),
             mock.patch.object(bc, "SPEAKER_INDEX", None),
             mock.patch.object(bc, "_record_speech_active", [owners_busy]),

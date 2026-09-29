@@ -1287,6 +1287,30 @@ AUDIO_AUTOSWITCH_MIC_FALLBACK = os.getenv("JARVIS_AUDIO_MIC_FALLBACK", "")  # e.
 AUDIO_AUTOSWITCH_MIC_SILENT_S = float(os.getenv("JARVIS_AUDIO_MIC_SILENT_S", "60.0"))
 
 
+# ─── Audio-device flap damping (bobert_companion + core/audio_flap.py) ─
+# 2026-09-29: a desk mic's Windows endpoint went Active <-> NotPresent every
+# ~20-40 s (USB still connected), Windows bounced the default recording device
+# between it and a powered-off headset, and JARVIS spoke 17 audio-device
+# sentences in ~10 minutes to an empty room. Every audio-device sentence
+# ("Switched to ...", "I may not be able to hear you ...", its recovery line,
+# speaker switches) now goes through one governor:
+#   * a device that changes AUDIO_FLAP_THRESHOLD times inside
+#     AUDIO_FLAP_WINDOW_S is FLAPPING: ONE plain sentence, then quiet until it
+#     has gone twice that window (10 min at the defaults) without a change,
+#     which is also said once. AUDIO_FLAP_THRESHOLD below 2 turns it off.
+#   * at most one audio-device sentence per AUDIO_ANNOUNCE_MIN_GAP_S; a newer
+#     one replaces a held or still-queued older one. 0 turns the gap off.
+#   * the capture device follows a moved Windows default only once the new
+#     default has held for AUDIO_REPICK_STABLE_S, unless the current device is
+#     gone (no longer an Active endpoint). 0 = follow on the first pass.
+# Floats are float literals (an int default would make _apply_user_settings
+# truncate a saved 7.5 to 7). Changes apply on the next start.
+AUDIO_FLAP_WINDOW_S      = 300.0   # s: window the changes are counted in
+AUDIO_FLAP_THRESHOLD     = 3       # changes inside the window = flapping
+AUDIO_ANNOUNCE_MIN_GAP_S = 60.0    # s: at most one audio-device sentence per
+AUDIO_REPICK_STABLE_S    = 8.0     # s a new default must hold before JARVIS follows it
+
+
 # ─── Mic / speaker device selection (bobert_companion _refresh_devices) ─
 # These live HERE (not in bobert_companion.py) so the Settings GUI mic-device
 # picker -> data/user_settings.json -> _apply_user_settings() override path

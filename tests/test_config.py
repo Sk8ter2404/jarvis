@@ -210,6 +210,22 @@ class StructuralInvariantTests(unittest.TestCase):
         self.assertIn("apply on", block)
         self.assertIn("the next start", block)
 
+    def test_audio_flap_knobs_are_typed_and_say_next_start(self):
+        # 2026-09-29 audio-device flap damping: the three seconds knobs are
+        # floats (an int default would make _apply_user_settings truncate a
+        # saved 7.5 to 7), the threshold is a plain int, and the block says
+        # when a change applies. core/audio_flap.py's own tests pin the
+        # shipped VALUES against its defaults.
+        for name in ("AUDIO_FLAP_WINDOW_S", "AUDIO_ANNOUNCE_MIN_GAP_S",
+                     "AUDIO_REPICK_STABLE_S"):
+            self.assertIsInstance(getattr(config, name), float, name)
+        self.assertIs(type(config.AUDIO_FLAP_THRESHOLD), int)
+        with open(config.__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        block = src[src.index("Audio-device flap damping"):
+                    src.index("AUDIO_REPICK_STABLE_S    =")]
+        self.assertIn("apply on the next start", block)
+
 
 if __name__ == "__main__":
     unittest.main()

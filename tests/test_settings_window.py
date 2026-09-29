@@ -508,6 +508,23 @@ class ExampleTemplateTests(unittest.TestCase):
                     "MICROPHONE_INDEX", "PREFERRED_INPUT_DEVICES"):
             self.assertIn(key, data, msg=f"{key} missing from the template")
 
+    def test_audio_flap_knobs_are_persisted_and_typed(self):
+        # 2026-09-29 audio-device flap damping: settable from the GUI (voice
+        # tab), persisted, in the template, with the right numeric type.
+        data = self._example()
+        types = {"AUDIO_FLAP_WINDOW_S": "float", "AUDIO_FLAP_THRESHOLD": "int",
+                 "AUDIO_ANNOUNCE_MIN_GAP_S": "float",
+                 "AUDIO_REPICK_STABLE_S": "float"}
+        for key, typ in types.items():
+            self.assertIn(key, sw.persisted_keys(), key)
+            self.assertEqual(sw.SCHEMA[key]["type"], typ, key)
+            self.assertEqual(sw.SCHEMA[key]["tab"], "voice", key)
+            self.assertIn(key, data, msg=f"{key} missing from the template")
+        self.assertEqual(
+            sw.coerce_value(sw.SCHEMA["AUDIO_FLAP_THRESHOLD"], "4"), 4)
+        self.assertEqual(
+            sw.coerce_value(sw.SCHEMA["AUDIO_REPICK_STABLE_S"], "7.5"), 7.5)
+
 
 class SchemaMatchesConfigLiteralTests(unittest.TestCase):
     """Every scalar SCHEMA default must equal the core/config.py literal it

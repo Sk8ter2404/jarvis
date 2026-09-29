@@ -9813,7 +9813,18 @@ _device_cache = {"in": None, "out": None, "checked_at": 0.0,
                  "last_in_endpoint": None, "last_out_endpoint": None,
                  "last_default_endpoints": None,
                  "last_devices_signature": None,
-                 "last_reenum_at": 0.0}
+                 "last_reenum_at": 0.0,
+                 # 2026-09-29 audio flap / stale-index work (_refresh_devices):
+                 # the Active endpoint set last seen, the set PortAudio last
+                 # enumerated against, the default Windows last REPORTED (vs
+                 # the one JARVIS follows), a default move still inside its
+                 # hysteresis, and a re-enumeration requested by a failed open.
+                 "last_active_endpoints": None,
+                 "pa_active_endpoints": None,
+                 "pa_stale_logged": False,
+                 "last_seen_default_endpoints": None,
+                 "default_candidate": None,
+                 "reenum_requested": False}
 
 # Periodic FORCED PortAudio re-enumeration cadence (2026-07-14 bug-hunt, #4).
 # The device signature is sourced from sd.query_devices(), whose result
@@ -10160,7 +10171,8 @@ def _build_focus_recap(*, clear: bool, prefix: str = "While you were focused, si
 
 def proactive_announce(message: str, source: str = "skill",
                        *, mood: str | None = None,
-                       volume_scale: float = 1.0) -> bool:
+                       volume_scale: float = 1.0,
+                       supersede: str | None = None) -> bool:
     """Public proactive-speech API for skills.
 
     Skills that want JARVIS to speak something unprompted (print milestones,
@@ -10175,6 +10187,14 @@ def proactive_announce(message: str, source: str = "skill",
     forwards it as mood= to _speak() so the queued utterance lands with the
     matching preset (urgent_clipped for VIP alerts, concerned_soft for
     self-diagnostic problems, etc.).
+
+    `supersede` (optional, 2026-09-29) is a family tag: every still-queued,
+    not-yet-spoken entry carrying the SAME tag is removed before this one is
+    appended, so a newer state REPLACES an older one instead of queueing
+    behind it ("Switched to your headset" left unspoken when the device has
+    already bounced back). The audio-device governor uses "audio-device".
+    Entries without a tag are never touched. A snapshot the drainer has
+    already claimed (.consuming) is not rewritten.
     """
     # ── FOCUS MODE GATE ──────────────────────────────────────────────────────
     # This is the whole point of focus / do-not-disturb: while the owner is
@@ -10231,6 +10251,15 @@ def proactive_announce(message: str, source: str = "skill",
             except Exception:
                 data = []
         entry: dict = {"ts": time.time(), "message": message}
+        if supersede:
+            _before = len(data)
+            data = [e for e in data
+                    if not (isinstance(e, dict)
+                            and e.get("supersede") == supersede)]
+            if len(data) != _before:
+                print(f"  [pending] replaced {_before - len(data)} unspoken "
+                      f"'{supersede}' announcement(s) with: {message[:80]}")
+            entry["supersede"] = supersede
         if mood:
             entry["mood"] = mood
         if volume_scale != 1.0:
@@ -10290,11 +10319,117 @@ def _update_check_thread():
         print(f"  [update_check] skipped: {e}")
 
 
-def _enqueue_device_announcement(message: str) -> None:
-    """Audio-device change notifier. Thin wrapper around proactive_announce()
-    so the device-change call site keeps its dedicated `[audio]` log tag for
-    the console-fallback path."""
-    proactive_announce(message, source="audio")
+# ── Audio-device announcement governor (2026-09-29) ─────────────────────────
+# Live 2026-09-29 15:20-15:29: a desk microphone's Windows ENDPOINT flapped
+# Active <-> NotPresent every ~20-40 s, Windows bounced the default recording
+# device between it and a powered-off headset's still-Active endpoint, and
+# JARVIS spoke 17 audio-device sentences in ~10 minutes to an empty room
+# ("Switched to ...", "I may not be able to hear you ...", "... off the
+# powered-off headset now ..."). Every audio-device sentence -- this file's
+# switch announcements AND the audio/audio_switch.py daemon's (routed here by
+# skills/audio_autoswitch.py) -- now goes through ONE governor, core/audio_flap:
+# flap detection (AUDIO_FLAP_THRESHOLD changes inside AUDIO_FLAP_WINDOW_S ->
+# one plain sentence, then quiet until it has settled), at most one sentence
+# per AUDIO_ANNOUNCE_MIN_GAP_S (a later one REPLACES a held one), and hearing
+# alerts at most once per 10 minutes while nothing changes. It decides WHAT
+# may be said and WHEN; it never touches a device. Log tag: [audio-flap].
+import core.audio_flap as _audio_flap_mod  # noqa: E402
+_audio_flap = _audio_flap_mod.AudioFlapGovernor()
+# The pending-speech tag every governed sentence carries, so a newer one
+# replaces a still-unspoken older one in pending_speech.json instead of
+# queueing behind it (proactive_announce(supersede=...)).
+_AUDIO_SUPERSEDE_TAG = "audio-device"
+
+
+def _audio_flap_sync_cfg() -> None:
+    """Push the three knobs into the governor. Read from this module's globals
+    (core.config arrives via the star import) at CALL time, so a test -- or a
+    future live-settings reload -- that rebinds them is honoured. Never
+    raises."""
+    try:
+        _audio_flap.configure(
+            window_s=globals().get("AUDIO_FLAP_WINDOW_S", 300.0),
+            threshold=globals().get("AUDIO_FLAP_THRESHOLD", 3),
+            min_gap_s=globals().get("AUDIO_ANNOUNCE_MIN_GAP_S", 60.0))
+    except Exception as e:
+        print(f"  [audio-flap] could not apply the flap settings: {e}")
+
+
+def _audio_flap_speak(messages, tagged: bool = True) -> bool:
+    """Enqueue what the governor released. Governed sentences carry the
+    supersede tag (a newer one replaces an unspoken older one in the queue).
+    Returns True when at least one was enqueued. Never raises: this runs on
+    the device-refresh path and on the audio daemon's poll."""
+    ok = False
+    for m in messages or ():
+        try:
+            if tagged:
+                ok = bool(proactive_announce(
+                    m, source="audio", supersede=_AUDIO_SUPERSEDE_TAG)) or ok
+            else:
+                ok = bool(proactive_announce(m, source="audio")) or ok
+        except Exception as e:
+            print(f"  [audio] announcement failed ({e}): {m}")
+    return ok
+
+
+def _audio_device_announce(message: str, kind: str = "switch") -> bool:
+    """THE entry point for an audio-device sentence (see the block above).
+
+    ``kind``: "switch" / "deaf" / "deaf-clear" are fully governed; "alert"
+    (a safety alert with its own throttle, e.g. the silent-mic warning) is
+    only kept quiet inside a flap storm; anything else passes straight
+    through. Fails OPEN: a governor error speaks the sentence unfiltered
+    rather than losing a safety announcement. Never raises."""
+    if not message:
+        return False
+    try:
+        _audio_flap_sync_cfg()
+        out = _audio_flap.submit(message, kind)
+    except Exception as e:
+        print(f"  [audio-flap] governor error ({type(e).__name__}: {e}) - "
+              f"announcing unfiltered")
+        out = [message]
+    return _audio_flap_speak(
+        out, tagged=(kind in _audio_flap_mod.GOVERNED_KINDS))
+
+
+def _audio_flap_note(key: str, label: str, verb: str | None = None) -> None:
+    """Record one audio-device family change with the governor and enqueue
+    the storm sentence if this change starts one. Never raises."""
+    try:
+        _audio_flap_sync_cfg()
+        kw = {"verb": verb} if verb else {}
+        out = _audio_flap.note_flip(key, label, **kw)
+    except Exception as e:
+        print(f"  [audio-flap] could not record a device change: {e}")
+        return
+    _audio_flap_speak(out)
+
+
+def _audio_flap_flush() -> bool:
+    """Release a held audio sentence whose gap has opened, and announce a
+    flap storm's end. Called at the top of _speak_pending -- the only place a
+    queued sentence can be spoken anyway. Never raises."""
+    try:
+        _audio_flap_sync_cfg()
+        out = _audio_flap.flush()
+    except Exception as e:
+        print(f"  [audio-flap] flush failed: {e}")
+        return False
+    return _audio_flap_speak(out)
+
+
+def _enqueue_device_announcement(message: str, kind: str = "switch") -> None:
+    """Audio-device change notifier -- routed through the flap governor
+    (_audio_device_announce) so a bouncing device cannot talk every few
+    seconds. ``kind`` "other" (e.g. the wake-word-down line) bypasses the
+    governor. Keeps the dedicated `[audio]` log tag for the console-fallback
+    path."""
+    if kind not in _audio_flap_mod.GOVERNED_KINDS and kind != "alert":
+        proactive_announce(message, source="audio")
+        return
+    _audio_device_announce(message, kind)
 
 
 def _wake_word_resume_or_report(det) -> bool:
@@ -10344,9 +10479,11 @@ def _wake_word_resume_or_report(det) -> bool:
         print("  [audio] WAKE-WORD DETECTOR IS DOWN after a device refresh "
               "— voice barge-in is disarmed until it is restarted")
         try:
+            # kind="other": a one-shot capability loss, not a device switch --
+            # never rate-limited or folded into a flap storm.
             _enqueue_device_announcement(
                 "The wake-word detector dropped during a device change, sir "
-                "— barge-in is disarmed until you restart it.")
+                "— barge-in is disarmed until you restart it.", kind="other")
         except Exception as e:
             print(f"  [audio] wake-word down-announcement failed: {e}")
     return ok
@@ -10504,6 +10641,145 @@ def _win_default_endpoints() -> tuple[str | None, str | None]:
     except Exception:
         _win_endpoint_tls.enumerator = None
         return (None, None)
+
+
+def _win_active_endpoint_ids() -> frozenset | None:
+    """Ids of every ACTIVE audio endpoint (render AND capture) Windows reports
+    RIGHT NOW, or None when that cannot be read. Never raises.
+
+    WHY (2026-09-29). Two things need the endpoint STATE, which neither the
+    frozen PortAudio list nor the default-endpoint poll can see:
+
+      * FLAP DETECTION. The owner's desk mic's endpoint went Active <->
+        NotPresent every ~20-40 s with its USB device still connected; each
+        edge here is one flip for the audio flap governor.
+      * STALE INDICES. PortAudio's MME host API stores each device's waveIn /
+        waveOut id at Pa_Initialize, and Windows RENUMBERS those ids when an
+        endpoint appears or disappears. After the desk mic dropped out, the
+        frozen row for the headset mic still named its OLD id, one past the
+        end of the shrunken list: 'A device ID has been used that is out of
+        range for your system.' [MME error 2], PaErrorCode -9999 (live log
+        15:24:59). An id that shifts but stays in range is worse -- it opens
+        the WRONG microphone. So an endpoint-set change since the last
+        re-enumeration means the frozen indices are stale.
+
+    Cost: EnumAudioEndpoints(eAll, DEVICE_STATE_ACTIVE) + GetId per endpoint
+    -- no property store is opened (that is what makes a full
+    audio_switch.list_render() ~300 ms). Same per-thread enumerator and the
+    same failure policy as _win_default_endpoints."""
+    enum = _win_endpoint_enumerator()
+    if enum is None:
+        return None
+    try:
+        coll = enum.EnumAudioEndpoints(2, 1)   # eAll, DEVICE_STATE_ACTIVE
+        ids = set()
+        for i in range(int(coll.GetCount())):
+            did = coll.Item(i).GetId()
+            if did:
+                ids.add(str(did))
+        return frozenset(ids)
+    except Exception:
+        _win_endpoint_tls.enumerator = None
+        return None
+
+
+# Endpoint-id prefixes: {0.0.0. = render (playback), {0.0.1. = capture.
+_EP_RENDER_PREFIX = "{0.0.0."
+_EP_CAPTURE_PREFIX = "{0.0.1."
+
+
+def _endpoint_ids_of(ids, capture: bool) -> frozenset:
+    """The capture (or render) subset of an endpoint-id set."""
+    pfx = _EP_CAPTURE_PREFIX if capture else _EP_RENDER_PREFIX
+    return frozenset(i for i in (ids or ()) if str(i).startswith(pfx))
+
+
+def _audio_endpoint_label(endpoint_id: str) -> str:
+    """Speakable name for an endpoint in a flap sentence ('the Desk Mic',
+    'your headset'). Never raises; never opens a device."""
+    try:
+        raw = _win_endpoint_friendly_name(endpoint_id) or ""
+    except Exception:
+        raw = ""
+    name = _friendly_device_name(raw) if raw else ""
+    if not name:
+        return "an audio device"
+    if name.lower().startswith(("the ", "your ")):
+        return name
+    return f"the {name}"
+
+
+def _audio_endpoint_state_pass(active) -> tuple[bool, bool]:
+    """Feed endpoint-state changes to the flap governor and report whether
+    PortAudio's frozen enumeration is STALE, per direction: (capture_stale,
+    render_stale). ``active`` is _win_active_endpoint_ids()'s answer; None
+    (unreadable) changes nothing and reports nothing stale -- the pre-
+    2026-09-29 behaviour. Caller holds _device_refresh_lock. Never raises."""
+    try:
+        if active is None:
+            return (False, False)
+        prev = _device_cache.get("last_active_endpoints")
+        if prev is not None and prev != active:
+            for eid in sorted(set(active) ^ set(prev)):
+                state = "Active" if eid in active else "no longer Active"
+                label = _audio_endpoint_label(eid)
+                print(f"  [audio-flap] {label}: endpoint is {state}")
+                _audio_flap_note(f"endpoint:{eid}", label)
+        _device_cache["last_active_endpoints"] = active
+        pa = _device_cache.get("pa_active_endpoints")
+        if pa is None:
+            # First observation: BASELINE, the same rule as the default-
+            # endpoint baseline -- boot already enumerated.
+            _device_cache["pa_active_endpoints"] = pa = active
+        in_stale = _endpoint_ids_of(active, True) != _endpoint_ids_of(pa, True)
+        out_stale = (_endpoint_ids_of(active, False)
+                     != _endpoint_ids_of(pa, False))
+        if (in_stale or out_stale) and not _device_cache.get("pa_stale_logged"):
+            _device_cache["pa_stale_logged"] = True
+            print("  [audio] the Windows audio endpoint list changed since "
+                  "PortAudio last enumerated it — its device indices are stale "
+                  "(MME renumbers its devices), so JARVIS re-enumerates before "
+                  "re-picking and keeps its current device until then")
+        elif not (in_stale or out_stale):
+            _device_cache["pa_stale_logged"] = False
+        return (in_stale, out_stale)
+    except Exception as e:
+        print(f"  [audio] endpoint-state check failed: {e}")
+        return (False, False)
+
+
+def _audio_default_flip_pass(now_eps) -> None:
+    """Feed the Windows default moving between two devices to the flap
+    governor, keyed by the UNORDERED pair so A->B->A->B counts as one family.
+    Tracks what Windows SAYS, not what JARVIS follows (hysteresis can hold
+    those apart). Caller holds _device_refresh_lock. Never raises."""
+    try:
+        if now_eps is None or now_eps == (None, None):
+            return
+        seen = _device_cache.get("last_seen_default_endpoints")
+        _device_cache["last_seen_default_endpoints"] = now_eps
+        if seen is None or seen == now_eps:
+            return
+        for i, (what, verb) in ((1, ("the default microphone",
+                                     "keeps switching back and forth")),
+                                (0, ("the default speakers",
+                                     "keep switching back and forth"))):
+            a, b = seen[i], now_eps[i]
+            if a == b:
+                continue
+            pair = "|".join(sorted([str(a), str(b)]))
+            _audio_flap_note(f"default-{'in' if i == 1 else 'out'}:{pair}",
+                             what, verb)
+    except Exception as e:
+        print(f"  [audio-flap] default-move check failed: {e}")
+
+
+def _audio_endpoint_gone(endpoint_id, active) -> bool:
+    """True when JARVIS has nothing to stay on: no endpoint at all, or one
+    Windows no longer reports Active. Unknown (active=None) is NOT gone."""
+    if endpoint_id is None:
+        return True
+    return active is not None and endpoint_id not in active
 
 
 # ── Endpoint id → PortAudio index, WITHOUT a re-enumeration (2026-08-21) ───
@@ -10817,8 +11093,15 @@ def _refresh_devices(force: bool = False):
         # still deferred below if any mic/TTS stream is live, so this adds no
         # teardown-during-capture risk). 2026-07-14 bug-hunt (#4).
         last_sig = _device_cache["last_devices_signature"]
-        _reenum_due = (now - _device_cache.get("last_reenum_at", 0.0)
-                       >= DEVICE_REENUM_INTERVAL)
+        _since_reenum = now - _device_cache.get("last_reenum_at", 0.0)
+        _reenum_due = (_since_reenum >= DEVICE_REENUM_INTERVAL
+                       # A capture open failed on a resolved index (2026-09-29,
+                       # _note_input_open_failure): re-enumerate soon rather
+                       # than in up to DEVICE_REENUM_INTERVAL, but never more
+                       # often than _OPEN_FAIL_REENUM_MIN_S — a device that
+                       # keeps failing must not turn into a teardown loop.
+                       or (bool(_device_cache.get("reenum_requested"))
+                           and _since_reenum >= _OPEN_FAIL_REENUM_MIN_S))
         # FOLLOW-THE-DEFAULT TRIGGER (2026-08-20). The owner moves his mic and
         # speakers from a Stream Deck, i.e. by moving the WINDOWS DEFAULT — and
         # a moved default changes NEITHER current_sig (it is built from
@@ -10876,8 +11159,72 @@ def _refresh_devices(force: bool = False):
             # boot already enumerates, and announcing "switched" for the
             # endpoint JARVIS started on would be a lie.
             _device_cache["last_default_endpoints"] = _prev_eps = _now_eps
+        # ENDPOINT STATES (2026-09-29): which endpoints Windows reports Active
+        # right now. Feeds the flap governor (each Active <-> not-Active edge
+        # is one flip) and decides whether PortAudio's frozen indices are
+        # STALE: MME renumbers its devices when an endpoint comes or goes, so
+        # after such a change an index from the frozen list opens the wrong
+        # device or none at all (-9999 'device ID out of range', live
+        # 15:24:59). A stale direction is never re-picked from the frozen
+        # list; it is re-enumerated first. None (unreadable) = old behaviour.
+        _act = _win_active_endpoint_ids() if _have_eps else None
+        if _act is not None and any(e is not None and e not in _act
+                                    for e in _now_eps):
+            # A default endpoint is Active by definition, so a set that does
+            # not contain it was read across a change (or from a different
+            # source than the default). Never decide from two snapshots that
+            # disagree — unknown for this pass, the next pass re-reads.
+            _act = None
+        _in_stale, _out_stale = _audio_endpoint_state_pass(_act)
+        _audio_default_flip_pass(_now_eps if _have_eps else None)
         _default_moved = bool(_have_eps and _prev_eps is not None
                               and _now_eps != _prev_eps)
+        # HYSTERESIS (2026-09-29). A bouncing default must not drag the
+        # capture device along on every bounce: a move is FOLLOWED only once
+        # the new default has held for AUDIO_REPICK_STABLE_S -- UNLESS the
+        # device JARVIS is following is actually gone (no longer an Active
+        # endpoint), in which case anything Active beats staying on it and the
+        # move is followed at once. Until then JARVIS keeps following the old
+        # baseline (_follow_eps), which is still an Active endpoint.
+        # AUDIO_REPICK_STABLE_S <= 0 restores follow-on-the-first-pass.
+        try:
+            _stable_need = max(0.0, float(
+                globals().get("AUDIO_REPICK_STABLE_S", 8.0) or 0.0))
+        except (TypeError, ValueError):
+            _stable_need = 8.0
+        _move_pending = False
+        # The move being judged: {"eps", "since" (first seen), "waited"
+        # (the wait line was printed), "said" (the move line was printed)}.
+        # Kept while the move is still unapplied — a deferred re-enumeration
+        # must not restart its stability clock or re-print its line.
+        _cand = _device_cache.get("default_candidate")
+        if _default_moved:
+            if not isinstance(_cand, dict) or _cand.get("eps") != _now_eps:
+                _cand = {"eps": _now_eps, "since": now,
+                         "waited": False, "said": False}
+            _gone = any(_prev_eps[i] != _now_eps[i]
+                        and _audio_endpoint_gone(_prev_eps[i], _act)
+                        for i in (0, 1))
+            if not _gone and now - _cand["since"] < _stable_need:
+                _move_pending = True
+                if not _cand["waited"]:
+                    _cand["waited"] = True
+                    print(f"  [audio] the Windows default audio endpoint "
+                          f"moved — waiting until it has held for "
+                          f"{_stable_need:.0f}s before following it (the "
+                          f"device JARVIS is using is still present)")
+            _device_cache["default_candidate"] = _cand
+        elif _cand:
+            # Not moved any more: either the move was FOLLOWED (the baseline
+            # now IS the candidate) or the default went back before it held.
+            if isinstance(_cand, dict) and _cand.get("eps") != _now_eps:
+                print("  [audio] the Windows default moved back before it "
+                      "had held — JARVIS never left its device")
+            _device_cache["default_candidate"] = _cand = None
+        _move_ready = _default_moved and not _move_pending
+        # What JARVIS follows THIS pass: the new default once the move is
+        # ready, otherwise the baseline it was already following.
+        _follow_eps = _prev_eps if _move_pending else _now_eps
         # Can this move be followed CHEAPLY, from the existing enumeration?
         # A direction HARD-pinned by MICROPHONE_INDEX/SPEAKER_INDEX never
         # follows the default at all, so it can never be the reason a teardown
@@ -10890,24 +11237,44 @@ def _refresh_devices(force: bool = False):
         # on a move that was never actually applied, i.e. silently DROP a press.
         _follows_default = (MICROPHONE_INDEX is None or SPEAKER_INDEX is None)
         _default_adopted = True
-        if _default_moved and _follows_default:
+        _move_unenumerated = False
+        _move_stale = False
+        if _move_ready and _follows_default:
+            # A STALE direction is never adopted from the frozen list: its
+            # row may exist while its index points at another device (or past
+            # the end). It waits for the (spaced) re-enumeration that
+            # _stale_reinit asks for below instead. The move line is printed
+            # once per move, not once per deferred pass (2026-09-29).
+            _say_move = not (isinstance(_cand, dict) and _cand.get("said"))
+            if isinstance(_cand, dict):
+                _cand["said"] = True
             if MICROPHONE_INDEX is None:
-                _default_adopted &= (
+                _move_stale |= _in_stale
+                _move_unenumerated |= (
                     _endpoint_device_identity(_now_eps[1],
-                                              want_input=True)[0] is not None)
+                                              want_input=True)[0] is None)
             if SPEAKER_INDEX is None:
-                _default_adopted &= (
+                _move_stale |= _out_stale
+                _move_unenumerated |= (
                     _endpoint_device_identity(_now_eps[0],
-                                              want_input=False)[0] is not None)
-            if _default_adopted:
+                                              want_input=False)[0] is None)
+            _default_adopted = not (_move_stale or _move_unenumerated)
+            if not _say_move:
+                pass
+            elif _default_adopted:
                 print("  [audio] the Windows default audio endpoint moved — "
                       "re-picking from the current enumeration so JARVIS "
                       "follows it (no PortAudio teardown needed)")
+            elif _move_stale:
+                print("  [audio] the Windows default audio endpoint moved "
+                      "while the endpoint list changed — PortAudio's indices "
+                      "are stale, so JARVIS re-enumerates before following it "
+                      "(no stale index is opened)")
             else:
                 print("  [audio] the Windows default audio endpoint moved to a "
                       "device that is not in PortAudio's current enumeration — "
                       "a full re-enumeration is required to follow it")
-        if _default_moved and _default_adopted:
+        if _move_ready and _default_adopted:
             # REBASE NOW, not after a reinit. The 2026-08-20 rule ("rebase only
             # after a real re-enumeration, or a deferred pass would forget the
             # press") was right for a teardown-only mechanism and is exactly
@@ -10922,8 +11289,16 @@ def _refresh_devices(force: bool = False):
         # the cheap re-pick below is the whole response. A move that was NOT
         # adopted still does, because only a re-enumeration can reach a device
         # PortAudio has never seen.
+        # A stale enumeration wants a re-enumeration -- but not more often
+        # than _OPEN_FAIL_REENUM_MIN_S, so an endpoint flapping faster than
+        # the 4 s pass cannot turn into a teardown every pass. Until then the
+        # stale direction is simply not re-picked (_skip_in / _skip_out).
+        _stale_reinit = bool((_in_stale or _out_stale)
+                             and _since_reenum >= _OPEN_FAIL_REENUM_MIN_S)
         _reinit_wanted = bool(force or _reenum_due
-                              or (_default_moved and not _default_adopted)
+                              or (_move_ready and _move_unenumerated
+                                  and not _move_stale)
+                              or _stale_reinit
                               or last_sig is None or current_sig is None
                               or current_sig != last_sig)
         _sig_unchanged = not _reinit_wanted
@@ -10944,7 +11319,7 @@ def _refresh_devices(force: bool = False):
         # for it (no teardown is wanted — that is the point), so without this
         # term the early return below would swallow the Stream Deck press on
         # the very pass that was able to follow it. 2026-08-21.
-        _repick_due = _cache_cleared or (_default_moved and _default_adopted
+        _repick_due = _cache_cleared or (_move_ready and _default_adopted
                                          and _follows_default)
         if _sig_unchanged and not _repick_due:
             # Nothing to re-pick and no teardown wanted — so if a teardown was
@@ -11071,14 +11446,25 @@ def _refresh_devices(force: bool = False):
             # _mic_lock would put I/O inside the teardown-gate's critical
             # section (the lock discipline above forbids slow work there).
             _log_reinit_deferral(_defer_reason, _defer_message)
+            _reinit_ok = False
             if do_reinit:
                 try:
                     sd._terminate()
                     sd._initialize()
+                    _reinit_ok = True
                     # Only a REAL re-enumeration re-arms the periodic hotplug
                     # sweep — a deferred (mic-active) pass must retry soon, not
                     # wait another DEVICE_REENUM_INTERVAL. 2026-07-14 #4.
                     _device_cache["last_reenum_at"] = now
+                    _device_cache["reenum_requested"] = False
+                    # The fresh enumeration matches the endpoint set read on
+                    # this pass, so its indices are no longer stale
+                    # (2026-09-29). A change DURING the reinit shows up as a
+                    # mismatch on the next pass and re-enumerates again —
+                    # the safe direction.
+                    if _act is not None:
+                        _device_cache["pa_active_endpoints"] = _act
+                        _device_cache["pa_stale_logged"] = False
                     # The follow-the-default baseline is normally rebased the
                     # moment the move is ADOPTED (above), which is the common
                     # case. This rebases it for the OTHER case: a move to a
@@ -11086,8 +11472,12 @@ def _refresh_devices(force: bool = False):
                     # re-enumeration can reach — so it is rebased only once that
                     # re-enumeration has actually happened. Rebasing THAT on a
                     # deferred pass would forget the press.
+                    #
+                    # _follow_eps, not _now_eps (2026-09-29): a move still
+                    # inside its AUDIO_REPICK_STABLE_S hysteresis is not being
+                    # followed yet, so the baseline stays where JARVIS is.
                     if _have_eps:
-                        _device_cache["last_default_endpoints"] = _now_eps
+                        _device_cache["last_default_endpoints"] = _follow_eps
                 except Exception as e:
                     print(f"  [audio] PortAudio re-init failed: {e}")
                 finally:
@@ -11117,9 +11507,30 @@ def _refresh_devices(force: bool = False):
             # it falls back to None, i.e. precisely the previous behaviour.
             _resolved_in = (None, "")
             _resolved_out = (None, "")
+            # NEVER RE-PICK FROM A STALE ENUMERATION (2026-09-29). When the
+            # endpoint list changed and the re-enumeration above could not run
+            # (a stream is live), every index in the frozen list for that
+            # direction is suspect — it may name another device or one past
+            # the end (-9999). Keep the device JARVIS already has for that
+            # direction, untouched and unannounced, until a pass where the
+            # re-enumeration runs. A failed open clears the cache and releases
+            # its stream, which is exactly what lets that pass come.
+            _skip_in = bool(_in_stale and not _reinit_ok)
+            _skip_out = bool(_out_stale and not _reinit_ok)
+            # A followed endpoint must be one Windows reports ACTIVE; a
+            # not-Active one resolves to nothing (the device=None fallback).
+            _fe_in = (_follow_eps[1]
+                      if not _audio_endpoint_gone(_follow_eps[1], _act)
+                      else None)
+            _fe_out = (_follow_eps[0]
+                       if not _audio_endpoint_gone(_follow_eps[0], _act)
+                       else None)
 
             # Input
-            if MICROPHONE_INDEX is not None:
+            if _skip_in:
+                in_idx = _device_cache.get("in")
+                in_track = (None, "")      # nothing re-tracked this pass
+            elif MICROPHONE_INDEX is not None:
                 in_idx = MICROPHONE_INDEX
                 try: in_name = sd.query_devices(in_idx)["name"]
                 except Exception: in_name = ""
@@ -11134,7 +11545,7 @@ def _refresh_devices(force: bool = False):
                 # still passes check_input_settings — 90 minutes deaf,
                 # 2026-08-20).
                 if in_idx is None:
-                    _resolved_in = _endpoint_device_identity(_now_eps[1],
+                    _resolved_in = _endpoint_device_identity(_fe_in,
                                                              want_input=True)
                     in_idx, in_name = _resolved_in
                     in_track = (_resolved_in if in_idx is not None
@@ -11146,12 +11557,15 @@ def _refresh_devices(force: bool = False):
             # True both when the default was RESOLVED to an index and when it
             # was left to device=None — in both cases the tracked identity is
             # the default's.
-            in_from_default = (MICROPHONE_INDEX is None
+            in_from_default = (not _skip_in and MICROPHONE_INDEX is None
                                and (in_idx is None
                                     or _resolved_in[0] is not None))
 
             # Output
-            if SPEAKER_INDEX is not None:
+            if _skip_out:
+                out_idx = _device_cache.get("out")
+                out_track = (None, "")
+            elif SPEAKER_INDEX is not None:
                 out_idx = SPEAKER_INDEX
                 try: out_name = sd.query_devices(out_idx)["name"]
                 except Exception: out_name = ""
@@ -11161,14 +11575,14 @@ def _refresh_devices(force: bool = False):
                 # Same contract for playback: the default speakers follow the
                 # Stream Deck too.
                 if out_idx is None:
-                    _resolved_out = _endpoint_device_identity(_now_eps[0],
+                    _resolved_out = _endpoint_device_identity(_fe_out,
                                                               want_input=False)
                     out_idx, out_name = _resolved_out
                     out_track = (_resolved_out if out_idx is not None
                                  else _default_device_identity(want_input=False))
                 else:
                     out_track = (out_idx, out_name)
-            out_from_default = (SPEAKER_INDEX is None
+            out_from_default = (not _skip_out and SPEAKER_INDEX is None
                                 and (out_idx is None
                                      or _resolved_out[0] is not None))
 
@@ -11189,7 +11603,11 @@ def _refresh_devices(force: bool = False):
             # seen_in_batch / _speech_was_recently_spoken dedupe collapses them
             # to one spoken sentence; when the endpoints differ the owner gets
             # both, which is the information he asked for. Do NOT "fix" this by
-            # announcing only one direction.
+            # announcing only one direction. (2026-09-29: both now pass the
+            # audio flap governor — an identical repeat inside
+            # AUDIO_ANNOUNCE_MIN_GAP_S is dropped there, a different second
+            # line is held until the gap opens, and nothing is said while a
+            # device is flapping.)
             #
             # WHAT COUNTS AS A SWITCH, AND WHAT ONLY COUNTS AS A RE-KEY
             # (2026-08-20, second pass). Tracking the pair is right; ANNOUNCING
@@ -11215,8 +11633,8 @@ def _refresh_devices(force: bool = False):
             # MICROPHONE_INDEX/PREFERRED_* so the default endpoint describes a
             # different device) an index-only shift is TRACKED and LOGGED but
             # not spoken — silence beats a confident wrong sentence.
-            _ep_now = {"in": (_now_eps[1] if in_from_default else None),
-                       "out": (_now_eps[0] if out_from_default else None)}
+            _ep_now = {"in": (_follow_eps[1] if in_from_default else None),
+                       "out": (_follow_eps[0] if out_from_default else None)}
             for _kind, (_track_idx, _track_name) in (("in", in_track),
                                                      ("out", out_track)):
                 if not _track_name:
@@ -11260,6 +11678,57 @@ def _refresh_devices(force: bool = False):
         finally:
             if paused_det is not None:
                 _wake_word_resume_or_report(paused_det)
+
+
+# A capture open that fails on a resolved index most often means PortAudio's
+# frozen enumeration no longer matches Windows (live 2026-09-29 15:24:59:
+# -9999 'A device ID has been used that is out of range' [MME error 2] right
+# after the desk mic's endpoint dropped out). _note_input_open_failure asks for
+# a re-enumeration, no sooner than this after the last one.
+_OPEN_FAIL_REENUM_MIN_S = 10.0
+# Quiet logging for repeated identical open failures (one line, then a count).
+_OPEN_FAIL_RELOG_S = 60.0
+_open_fail_log: dict = {}
+
+
+def _note_input_open_failure(site: str, device, exc, then: str = "") -> None:
+    """A capture InputStream failed to OPEN on ``device``. Fail over cleanly
+    and quietly (2026-09-29):
+
+      * drop the cached index and force the next refresh to re-pick
+        (in=None, checked_at=0) — the same invalidation record_speech's retry
+        path always did, now shared with get_mic_buffer's Path B, which used
+        to leave the stale index cached and fail the same way on every call;
+      * REQUEST a re-enumeration (rate-limited by _OPEN_FAIL_REENUM_MIN_S in
+        _refresh_devices), because a stale MME index is not fixed by
+        re-reading the same frozen list;
+      * print the failure ONCE per (site, device, error) and then only a
+        count every _OPEN_FAIL_RELOG_S — never a line per attempt.
+
+    Never raises: it runs inside the capture paths."""
+    try:
+        _device_cache["in"] = None
+        _device_cache["checked_at"] = 0.0
+        _device_cache["reenum_requested"] = True
+    except Exception:
+        pass
+    try:
+        now = time.time()
+        key = (site, device, str(exc)[:160])
+        ent = _open_fail_log.get(key)
+        if ent is None or now - ent[0] >= _OPEN_FAIL_RELOG_S:
+            extra = (f" ({ent[1]} identical failure(s) since the last line)"
+                     if ent and ent[1] else "")
+            print(f"  [{site}] InputStream open failed on device {device!r}: "
+                  f"{exc}{extra} — dropped the cached mic and asked for a "
+                  f"PortAudio re-enumeration" + (f"; {then}" if then else ""))
+            _open_fail_log[key] = [now, 0]
+        else:
+            ent[1] += 1
+        if len(_open_fail_log) > 32:
+            _open_fail_log.clear()
+    except Exception:
+        pass
 
 
 def get_input_device() -> int | None:
@@ -12345,13 +12814,19 @@ def _report_silent_mic(silent_age: float, now: float) -> bool:
           f"Microphone, verify the active input device, and try unplug/replug "
           f"if USB. (threshold "
           f"MIC_SILENT_WARN_SECONDS={MIC_SILENT_WARN_SECONDS})")
+    msg = (f"Sir, {named} has been completely silent for "
+           f"{int(silent_age)} seconds — I can hear nothing at all from it. "
+           f"Check Windows microphone privacy, or switch input devices and "
+           f"I'll follow.")
     try:
-        proactive_announce(
-            f"Sir, {named} has been completely silent for "
-            f"{int(silent_age)} seconds — I can hear nothing at all from it. "
-            f"Check Windows microphone privacy, or switch input devices and "
-            f"I'll follow.",
-            source="audio")
+        # Kept quiet inside an audio flap storm (2026-09-29): a device that
+        # keeps dropping in and out lands JARVIS on a silent endpoint every
+        # cycle, and the single storm sentence already covers it. Outside a
+        # storm this is exactly the old call -- its own throttle above rules.
+        if _audio_flap.storm_active():
+            _audio_flap.submit(msg, "alert")      # logs the quiet sentence
+        else:
+            proactive_announce(msg, source="audio")
     except Exception as e:
         print(f"  [vad] silent-mic announcement failed: {e}")
     return True
@@ -13074,9 +13549,11 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
                 blocksize=CHUNK, device=_in_dev,
                 callback=_audio_cb)
         except sd.PortAudioError as e:  # pragma: no cover - live mic open-retry path (needs real device)
-            print(f"  [record_speech] InputStream open failed on cached mic ({e}); retrying with system default")
-            _device_cache["in"] = None
-            _device_cache["checked_at"] = 0.0
+            # Invalidate + request a re-enumeration (a stale MME index is not
+            # fixed by re-reading the same frozen list), logged once per
+            # distinct failure instead of per attempt. 2026-09-29.
+            _note_input_open_failure("record_speech", _in_dev, e,
+                                     then="retrying with the system default")
             _opened_dev = None
             _record_stream = sd.InputStream(
                 samplerate=SAMPLE_RATE, channels=1, dtype="float32",
@@ -13510,6 +13987,15 @@ def _get_mic_buffer_impl(seconds: float,
     # out). Either way: return None so the caller re-invokes and either taps
     # (A2) or skips this cycle — never double-opens, never opens into a
     # native teardown.
+    #
+    # Resolve the mic BEFORE claiming (2026-09-29), exactly as record_speech
+    # does: get_input_device() -> _refresh_devices() may need PortAudio's
+    # re-enumeration (the endpoint list changed and the frozen indices are
+    # stale), and that can only run while no owner flag is set. Resolved after
+    # the claim, it was deferred by Path B's OWN flag, so the stale index was
+    # opened anyway: -9999 'A device ID has been used that is out of range'
+    # [MME error 2], live 15:24:59.
+    _pathb_dev = get_input_device()
     if not _pa_claim_owner(_pathb_mic_active,
                            deny_if=lambda: bool(_record_speech_active[0])):
         return None
@@ -13520,9 +14006,11 @@ def _get_mic_buffer_impl(seconds: float,
         try:
             stream = sd.InputStream(samplerate=target_sr, channels=1,
                                     dtype="float32", blocksize=1024,
-                                    device=get_input_device(), callback=_cb)
+                                    device=_pathb_dev, callback=_cb)
         except Exception as e:
-            print(f"  [get_mic_buffer] InputStream open failed: {e}")
+            # Fail over cleanly and quietly: drop the cached index, ask for a
+            # re-enumeration, and log once per distinct failure (2026-09-29).
+            _note_input_open_failure("get_mic_buffer", _pathb_dev, e)
             return None
         try:
             stream.start()
@@ -29335,6 +29823,11 @@ def _speak_pending():
     reminder batch stranded by a mid-speak kill is spoken on the next
     pass instead of vanishing; re-speaks are bounded by the
     _speech_was_recently_spoken dedupe below."""
+    # Release an audio-device sentence the flap governor was holding for its
+    # one-per-AUDIO_ANNOUNCE_MIN_GAP_S gap (and announce a finished flap
+    # storm). Here, because this drain is the only place it could be spoken
+    # anyway. Never raises.
+    _audio_flap_flush()
     _recover_orphaned_queue_snapshot(PENDING_SPEECH_PATH, "pending")
     if not os.path.exists(PENDING_SPEECH_PATH):
         return False

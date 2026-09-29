@@ -354,6 +354,36 @@ SCHEMA: dict[str, dict] = {
         "default": True,
         "help": "Lower other apps' volume while JARVIS talks (Windows).",
     },
+    # 2026-09-29 audio-device flap damping (core/audio_flap.py).
+    "AUDIO_FLAP_WINDOW_S": {
+        "tab": "voice", "label": "Device flapping window (seconds)",
+        "type": "float", "default": 300.0,
+        "help": "A mic or speaker that changes the flapping number of times "
+                "within this many seconds is 'flapping': JARVIS says so once "
+                "and stays quiet about audio devices until it has been steady "
+                "for twice this long. Applies on the next start.",
+    },
+    "AUDIO_FLAP_THRESHOLD": {
+        "tab": "voice", "label": "Device changes that count as flapping",
+        "type": "int", "default": 3,
+        "help": "How many changes inside the window make a device 'flapping'. "
+                "Below 2 turns flap detection off. Applies on the next start.",
+    },
+    "AUDIO_ANNOUNCE_MIN_GAP_S": {
+        "tab": "voice", "label": "Min seconds between device announcements",
+        "type": "float", "default": 60.0,
+        "help": "At most one spoken audio-device announcement per this many "
+                "seconds; a newer one replaces one still waiting. 0 turns the "
+                "limit off. Applies on the next start.",
+    },
+    "AUDIO_REPICK_STABLE_S": {
+        "tab": "voice", "label": "Follow a new default mic after (seconds)",
+        "type": "float", "default": 8.0,
+        "help": "When Windows moves the default mic or speakers, JARVIS "
+                "follows once the new default has held this long -- at once "
+                "if the device it is using has gone. 0 = follow immediately. "
+                "Applies on the next start.",
+    },
     # 2026-07-08: surface the Whisper STT device/model so the v2.0.23 crash-
     # workaround is settable AND persisted — previously they lived only in
     # core/config.py, so a Settings save (which rewrites user_settings.json from

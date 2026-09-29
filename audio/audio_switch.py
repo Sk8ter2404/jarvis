@@ -1111,11 +1111,18 @@ class AudioAutoSwitch:
 
     def __init__(self, headset: str, fallback: str = "", poll_s: float = 3.0,
                  announce=None, mic_fallback: str = "", follow_mic: bool = False,
-                 mic_silent_s: float = 60.0):
+                 mic_silent_s: float = 60.0, announce_kind=None):
         self.headset = headset
         self.fallback = fallback           # name fragment, or "" = remember prior
         self.poll_s = max(1.0, float(poll_s))
         self.announce = announce or (lambda msg: _log(msg))
+        # Optional (message, kind) sink (2026-09-29). When set, every DEVICE
+        # sentence below goes here WITH its kind ("switch" / "deaf" /
+        # "deaf-clear") instead of through announce(), so the monolith's
+        # audio flap governor can damp a bouncing device (one sentence per
+        # storm, one per gap, hearing alerts at most every 10 minutes).
+        # None keeps the plain announce() path exactly as before.
+        self.announce_kind = announce_kind
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._prior_default: str | None = None
@@ -1325,7 +1332,7 @@ class AudioAutoSwitch:
             return None
         self._prior_default = cur
         if set_default_render(hs[0]):
-            self.announce(f"headset on — audio moved to {hs[1]}")
+            self._emit(f"headset on — audio moved to {hs[1]}", "switch")
             return "to_headset"
         _log(f"headset on but the switch to {hs[1]} FAILED — default left alone")
         return None
@@ -1349,7 +1356,7 @@ class AudioAutoSwitch:
                  f"leaving the default where Windows has it")
             return None
         if set_default_render(target):
-            self.announce(f"headset off — audio back to {tname}")
+            self._emit(f"headset off — audio back to {tname}", "switch")
             self._prior_default = None
             return "away"
         _log(f"headset off but the switch back to {tname} FAILED — default unchanged")
@@ -1719,14 +1726,25 @@ class AudioAutoSwitch:
     # That is why it is allowed to say "I have heard nothing at all" as fact
     # while everything here stays hedged.
 
-    def _speak(self, message: str) -> None:
+    def _emit(self, message: str, kind: str) -> None:
+        """Say a DEVICE sentence: through announce_kind(message, kind) when the
+        owner of this daemon supplied one (the monolith's flap governor),
+        otherwise through announce(message) exactly as before."""
+        fn = self.announce_kind
+        if fn is not None:
+            fn(message, kind)
+        else:
+            self.announce(message)
+
+    def _speak(self, message: str, kind: str = "deaf") -> None:
         """announce(), where a failure to speak can never break the rescue.
 
         Called only AFTER every device decision is made, so a raise here cannot
         leave a half-switch — but it must not vanish either, or the alert about
-        silence would fail silently."""
+        silence would fail silently. ``kind`` is "deaf" for an alert and
+        "deaf-clear" for its recovery line (see _emit)."""
         try:
-            self.announce(message)
+            self._emit(message, kind)
         except Exception as e:
             _log(f"could not SPEAK a deaf-risk alert ({e}) — it exists only as "
                  f"the printed line above, which is the failure mode this alert "
@@ -1816,7 +1834,7 @@ class AudioAutoSwitch:
             # unverified confidence as claiming the failure.
             self._speak("Windows' default microphone is off the powered-off "
                         "headset now, sir. I still cannot prove it is picking "
-                        "up sound until I hear you.")
+                        "up sound until I hear you.", kind="deaf-clear")
 
     def _mic_to_headset(self) -> str | None:
         """Headset just powered ON - move the WINDOWS DEFAULT recording device
@@ -1866,7 +1884,7 @@ class AudioAutoSwitch:
         # capture_claim is the only thing allowed to assert it. See
         # capture_override() for why the answer is currently "no".
         self._deaf_clear(say=False)    # capture_claim below IS the recovery line
-        self.announce(capture_claim(hs[1], "headset on"))
+        self._emit(capture_claim(hs[1], "headset on"), "switch")
         return "mic_to_headset"
 
     # ══════════════════════════════════════════════════════════════════════
@@ -1933,7 +1951,7 @@ class AudioAutoSwitch:
                 self._deaf_clear(say=False)
                 if said:
                     self._speak(f"My microphone is picking up sound again, sir "
-                                f"- {why}.")
+                                f"- {why}.", kind="deaf-clear")
             return None
 
         # MEASURED SILENT. Everything below is about whether that fact is about
@@ -2017,12 +2035,13 @@ class AudioAutoSwitch:
                  f"OFF does not.")
             if set_default_capture(cand[0]):
                 self._deaf_clear(say=False)   # the announce below IS the news
-                self.announce(
+                self._emit(
                     capture_claim(
                         cand[1],
                         f"the '{self.headset}' headset is powered on but I have "
                         f"heard nothing through its microphone")
-                    + " - I can't confirm the new one hears you either, sir")
+                    + " - I can't confirm the new one hears you either, sir",
+                    "switch")
                 self._prior_capture = None
                 self._mic_hold_clear()
                 return "mic_silent_rescue"
@@ -2299,7 +2318,7 @@ class AudioAutoSwitch:
             # say=False: capture_claim() is the recovery message and it is the
             # honest one - it reports what actually moved, and nothing more.
             self._deaf_clear(say=False)
-            self.announce(capture_claim(target[1], "headset off"))
+            self._emit(capture_claim(target[1], "headset off"), "switch")
             self._prior_capture = None
             self._mic_hold_clear()   # the world moved - never hold a stale verdict
             return "mic_away"
@@ -2358,9 +2377,9 @@ class AudioAutoSwitch:
                 # suffix covers this device, which is verified present and
                 # verified not-the-headset and is verified nothing else. He is
                 # told he was moved and told what that does and does not mean.
-                self.announce(capture_claim(cand[1], "headset off")
-                              + " - a last resort, sir; I can't confirm it "
-                                "hears you")
+                self._emit(capture_claim(cand[1], "headset off")
+                           + " - a last resort, sir; I can't confirm it "
+                             "hears you", "switch")
                 self._deaf_clear(say=False)   # the announce above IS the recovery
                 self._prior_capture = None
                 self._mic_hold_clear()   # the world moved - never hold a stale verdict

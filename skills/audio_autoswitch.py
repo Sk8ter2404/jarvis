@@ -103,6 +103,28 @@ def _announce(message: str) -> None:
     print(f"  [audio-switch] {message}")
 
 
+def _announce_kind(message: str, kind: str) -> None:
+    """Route a DEVICE sentence (kind "switch" / "deaf" / "deaf-clear")
+    through the monolith's audio flap governor (2026-09-29), so this daemon
+    and the monolith's own "Switched to ..." line share ONE flap detector and
+    ONE one-sentence-per-gap limit. A live 2026-09-29 flap produced 17
+    sentences in ten minutes from the two writers together.
+
+    Fails OPEN: with no governor (an older monolith, a stub) or if it raises,
+    the sentence goes out through _announce exactly as before, so a deaf
+    alert is never lost to a bug in the damping."""
+    try:
+        bc = importlib.import_module("bobert_companion")
+        gate = getattr(bc, "_audio_device_announce", None)
+        if callable(gate):
+            gate(message, kind)
+            return
+    except Exception as e:
+        print(f"  [audio-switch] announcement governor failed ({e}); "
+              f"announcing unfiltered")
+    _announce(message)
+
+
 def _capture_sentence(name: str) -> str:
     """"Listening on X now, sir." - but ONLY when that is actually true.
 
@@ -159,6 +181,9 @@ def _make_daemon():
         # the default matches core/config.py so a missing key still protects
         # him rather than silently restoring fire-once-and-never-look-again.
         mic_silent_s=_cfg_float("AUDIO_AUTOSWITCH_MIC_SILENT_S", 60.0),
+        # Device sentences go through the monolith's flap governor with their
+        # kind; the battery warning keeps the plain announce path.
+        announce_kind=_announce_kind,
     )
 
 

@@ -3740,7 +3740,11 @@ class _FollowTheDefaultFixtures:
         out = []
         for n in names:
             is_in = "microphone" in n.lower() or "mic" in n.lower()
-            out.append({"name": n,
+            # "hostapi": 0 — _endpoint_device_identity matches only rows of
+            # the DEFAULT host API (sd.default.hostapi is 0 in _sd below).
+            # Without it no row ever resolved and eight follow-the-default
+            # tests failed on HEAD (found 2026-09-29).
+            out.append({"name": n, "hostapi": 0,
                         "max_input_channels": 1 if is_in else 0,
                         "max_output_channels": 0 if is_in else 2,
                         "default_samplerate": 16000 if is_in else 48000})
@@ -3772,7 +3776,8 @@ class _FollowTheDefaultFixtures:
 
     def _refresh(self, sd, *, prefs_in=(), prefs_out=(), announced=None,
                  endpoints=(None, None), endpoint_names=None, printed=None,
-                 mic_live=False, tts_live=False, signature=None, force=True):
+                 mic_live=False, tts_live=False, signature=None, force=True,
+                 active=None, stable_s=0.0):
         """Drive one forced _refresh_devices pass against the stub.
 
         ``endpoints`` is the (render id, capture id) pair
@@ -3795,6 +3800,15 @@ class _FollowTheDefaultFixtures:
         device list did not change", so no teardown is wanted); the default
         None reproduces the old fixture, where a null signature forces the
         reinit chain on every pass. ``printed`` collects the [audio] log lines.
+
+        ``active`` (2026-09-29) is what _win_active_endpoint_ids() reports —
+        PATCHED for the same reason as ``endpoints``; the default None models
+        "endpoint states unreadable", which is exactly the pre-2026-09-29
+        behaviour these tests were written against. ``stable_s`` pins
+        AUDIO_REPICK_STABLE_S; the default 0.0 switches the follow-hysteresis
+        off (follow on the first pass), which is what the tests written before
+        it pin. proactive_announce is patched to a sink so nothing here can
+        reach the real pending_speech.json even if a flap storm is detected.
         """
         sink = announced.append if announced is not None else (lambda _m: None)
         names = dict(endpoint_names or {})
@@ -3802,6 +3816,12 @@ class _FollowTheDefaultFixtures:
         with mock.patch.object(self.bc, "sd", sd), \
                 mock.patch.object(self.bc, "_win_default_endpoints",
                                   return_value=tuple(endpoints)), \
+                mock.patch.object(self.bc, "_win_active_endpoint_ids",
+                                  return_value=active), \
+                mock.patch.object(self.bc, "AUDIO_REPICK_STABLE_S",
+                                  stable_s, create=True), \
+                mock.patch.object(self.bc, "proactive_announce",
+                                  return_value=True), \
                 mock.patch.object(self.bc, "_win_endpoint_friendly_name",
                                   side_effect=lambda eid: names.get(eid)), \
                 mock.patch.dict(self.bc.sys.modules, {}, clear=False), \
@@ -3847,6 +3867,10 @@ class _FollowTheDefaultFixtures:
             "last_in_endpoint": None, "last_out_endpoint": None,
             "last_default_endpoints": None,
             "last_devices_signature": signature, "last_reenum_at": reenum_at,
+            # 2026-09-29 flap / stale-index state.
+            "last_active_endpoints": None, "pa_active_endpoints": None,
+            "pa_stale_logged": False, "last_seen_default_endpoints": None,
+            "default_candidate": None, "reenum_requested": False,
         })
 
 
