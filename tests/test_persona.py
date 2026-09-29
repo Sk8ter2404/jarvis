@@ -76,5 +76,39 @@ class ToneModulationBlockTests(unittest.TestCase):
             self.assertIn(" → ", line)
 
 
+class OpenerFitRuleTests(unittest.TestCase):
+    """2026-09-29 live: rotation pressure made the model open a joke and a
+    dinner question with 'A bold choice, if I may say so, sir.' The prompt now
+    binds the situational openers to their situation; these tests keep that
+    rule in the prompt and keep every phrase it names inside the pool, so a
+    later edit of the pool can't leave the rule pointing at nothing."""
+
+    SITUATIONAL = ("A bold choice, if I may say so", "Are you quite sure",
+                   "I'm afraid that's inadvisable", "I'm obliged to point out",
+                   "Slight problem", "Rather concerning", "Shall I run the numbers",
+                   "Based on current trajectory", "Projecting now")
+
+    def setUp(self):
+        from core import prompts
+        self.prompt = prompts.BASE_SYSTEM_PROMPT
+        self.rule = self.prompt[self.prompt.index("MATCH THE OPENER TO THE CONTENT"):]
+        self.rule = self.rule[:self.rule.index("\n")]
+
+    def test_rule_is_in_the_prompt_after_the_pool(self):
+        self.assertLess(self.prompt.index(persona.render_signature_phrase_pool()),
+                        self.prompt.index("MATCH THE OPENER TO THE CONTENT"))
+
+    def test_every_situational_opener_named_is_in_the_pool(self):
+        for phrase in self.SITUATIONAL:
+            self.assertIn(phrase, self.rule)
+            self.assertTrue(any(p.startswith(phrase) for p in persona.JARVIS_SIGNATURE_PHRASES),
+                            f"{phrase!r} is no longer in the pool")
+
+    def test_neutral_openers_named_are_in_the_pool(self):
+        for phrase in ("Very good, sir.", "Certainly, sir.", "Of course, sir."):
+            self.assertIn(phrase, self.rule)
+            self.assertIn(phrase, persona.JARVIS_SIGNATURE_PHRASES)
+
+
 if __name__ == "__main__":
     unittest.main()
