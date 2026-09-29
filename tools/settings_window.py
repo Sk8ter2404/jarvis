@@ -459,6 +459,14 @@ SCHEMA: dict[str, dict] = {
                 "the rest is still generating (faster feel; action commands "
                 "are never voiced early).",
     },
+    "SENTENCE_TTS_ENABLED": {
+        "tab": "voice", "label": "Start speaking after the first sentence",
+        "type": "bool", "default": True,
+        "help": "Kokoro voice only: a long reply starts playing its first "
+                "sentence while the rest is still being rendered, instead of "
+                "rendering the whole reply first. Short replies are voiced "
+                "whole. Applies on the next start.",
+    },
     "PROCESSING_FILLER_ENABLED": {
         "tab": "voice", "label": "Say 'just a moment' while thinking",
         "type": "bool", "default": False,

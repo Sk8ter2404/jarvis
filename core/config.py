@@ -406,6 +406,19 @@ TTS_BACKEND       = "edge"
 XTTS_VOICE_SAMPLE = ""           # absolute path to a ~10 s WAV (mono, 24 kHz)
 XTTS_LANGUAGE     = "en"         # ISO-639-1 hint for XTTS-v2
 
+# ─── Per-sentence speech (Kokoro) ──────────────────────────────────────
+# When True and TTS_BACKEND is 'kokoro' (voice clone off), a long reply with
+# more than one sentence starts playing its first sentence as soon as that
+# sentence is rendered, while the rest renders in the background -- instead of
+# rendering the whole reply before the first word. Same voice, speed and
+# prosody preset for every sentence; an interrupt stops the remaining
+# sentences; muted stays silent. Short replies (under ~120 characters), single
+# sentences, 'wry' deliveries and every other backend are voiced whole, exactly
+# as before. Splitting is conservative (never inside "3.5", "e.g.", "Mr.",
+# "2:30 p.m." or an ellipsis) -- see core/sentence_tts.py. Changes apply on
+# the next start.
+SENTENCE_TTS_ENABLED = True
+
 
 # ─── Local voice-cloning backend (Chatterbox) ──────────────────────────
 # A SEPARATE, opt-in path from the XTTS backend above: Resemble AI's

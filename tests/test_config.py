@@ -180,6 +180,18 @@ class StructuralInvariantTests(unittest.TestCase):
         self.assertEqual(config.PROMPT_FREEZE_QUIET_S, 30.0)
         self.assertIs(config.LOCAL_PREFIX_REPRIME, True)
 
+    def test_sentence_tts_ships_on_and_says_next_start(self):
+        # 2026-09-29: per-sentence Kokoro speech is ON by default (a bool, so
+        # _apply_user_settings keeps a saved true/false), and its comment
+        # promises "next start" like every other import-time knob.
+        self.assertIs(config.SENTENCE_TTS_ENABLED, True)
+        with open(config.__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        block = src[src.index("Per-sentence speech (Kokoro)"):
+                    src.index("SENTENCE_TTS_ENABLED = True")]
+        self.assertIn("apply on", block)
+        self.assertIn("the next start", block)
+
 
 if __name__ == "__main__":
     unittest.main()

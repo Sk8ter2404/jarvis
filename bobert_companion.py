@@ -17356,20 +17356,56 @@ _voice_clone_inflight = [False]
 _voice_clone_inflight_lock = threading.Lock()
 
 
+# Per-sentence speech (core/sentence_tts.py, 2026-09-29): _speak resolves the
+# prosody preset ONCE for the whole reply and pins it here, per THREAD (the
+# caller's thread renders sentence 1, a worker renders the rest), so every
+# sentence gets the same preset -- _resolve_tts_preset reads the text, and
+# resolving it per sentence could voice one reply in two moods. A thread-local
+# (not a shared cell) so a worker left finishing a render after an interrupt
+# can never lend its pin to the next utterance's thread. Unset = synthesise
+# resolves the preset itself, exactly as before.
+#
+# _TTS_PRESET_PIN.mode (only read while .value is set) picks the engine:
+#   "kokoro_only" -- a single sentence: Kokoro or nothing. When Kokoro does not
+#                    return audio (its 30 s timeout, a render error) synthesise
+#                    raises core.sentence_tts.SentenceFallback instead of
+#                    dropping to edge-tts for that one sentence, and the player
+#                    voices the rest of the reply as one block (below).
+#   "skip_kokoro" -- that rest-of-reply block: straight to the edge-tts ->
+#                    pyttsx3 -> SAPI5 ladder, in one voice, without paying the
+#                    stuck engine's timeout a second time.
+_TTS_PRESET_PIN = threading.local()
+from core.sentence_tts import SentenceFallback as _SentenceFallback  # noqa: E402
+
+
+def _synth_user_tone() -> str | None:
+    """The user tone synthesise() feeds _resolve_tts_preset. Voice-mood router
+    output wins over raw detect_tone() output: the router fuses tone with
+    time-of-day, so its label is the one that should drive prosody. Falls back
+    to the fine-grained text tone (rushed/tired/playful/frustrated) when the
+    router said 'casual'."""
+    route = _last_voice_route[0]
+    mood = route["mood"] if route else "casual"
+    return mood if mood != "casual" else _last_user_tone[0]
+
+
 def synthesise(text: str) -> tuple[np.ndarray, int]:
-    # Voice-mood router output wins over raw detect_tone() output here:
-    # the router fuses tone with time-of-day, so its label is the one
-    # that should drive prosody. Fall back to the fine-grained text tone
-    # (rushed/tired/playful/frustrated) when the router said 'casual'.
     try:
-        route = _last_voice_route[0]
-        mood = route["mood"] if route else "casual"
-        user_tone = mood if mood != "casual" else _last_user_tone[0]
-        chosen, preset = _resolve_tts_preset(text, user_tone)
+        pinned = getattr(_TTS_PRESET_PIN, "value", None)
+        pin_mode = None
+        if pinned is not None:
+            # A per-sentence chunk: the reply's preset, already resolved and
+            # logged once by _speak.
+            user_tone = None
+            chosen, preset = pinned
+            pin_mode = getattr(_TTS_PRESET_PIN, "mode", None)
+        else:
+            user_tone = _synth_user_tone()
+            chosen, preset = _resolve_tts_preset(text, user_tone)
         rate  = str(preset.get("rate",  "+0%"))
         pitch = str(preset.get("pitch", "+0Hz"))
         gain  = float(preset.get("gain", 1.0))  # type: ignore[arg-type]
-        if chosen != "neutral" or gain != 1.0:
+        if pinned is None and (chosen != "neutral" or gain != 1.0):
             tone_tag = f" tone={user_tone}" if user_tone else ""
             mood_tag = f" mood={_last_mood[0]}" if _last_mood[0] else ""
             print(f"  [tts] preset={chosen}{tone_tag}{mood_tag} rate={rate} pitch={pitch} gain={gain:.2f}")
@@ -17492,7 +17528,7 @@ def synthesise(text: str) -> tuple[np.ndarray, int]:
             except Exception as e:
                 print(f"  [tts] pyttsx3 render failed ({e}); falling back to edge-tts")
 
-        if backend == "kokoro":
+        if backend == "kokoro" and pin_mode != "skip_kokoro":
             # CPU Kokoro (frees the 3090). Reached only when NO on-demand clone is
             # armed (the clone is Axis 1, handled above), so an explicit clone
             # request still wins. synthesize() is fail-closed (never raises,
@@ -17535,6 +17571,12 @@ def synthesise(text: str) -> tuple[np.ndarray, int]:
                 print(f"  [tts] kokoro render failed ({type(e).__name__}: {e}); "
                       f"falling back to edge-tts")
 
+        if pin_mode == "kokoro_only":
+            # One sentence of a per-sentence reply that Kokoro did not voice:
+            # hand the rest of the reply to the one-block fallback rather than
+            # voicing this sentence alone in the fallback voice.
+            raise _SentenceFallback("kokoro did not voice this sentence")
+
         try:
             # wry_split was computed once above the backend selection (shared
             # with the kokoro branch); (text, None) → single-pass render.
@@ -17557,6 +17599,8 @@ def synthesise(text: str) -> tuple[np.ndarray, int]:
             if gain != 1.0:
                 audio = np.clip(audio * gain, -1.0, 1.0).astype(np.float32)
             return audio, sr
+    except _SentenceFallback:
+        raise                     # handled by core.sentence_tts.play_pipelined
     except Exception as e:
         # Both backends are dead (e.g. edge-tts 503 + pyttsx3 not installed).
         # Returning silence keeps main() alive — losing one line of speech
@@ -17776,6 +17820,13 @@ _tts_interrupt = threading.Event()
 # reply's flush buffer was created. 2026-07-08.
 _tts_interrupt_seq: list[int] = [0]
 _tts_current_text: list[str] = [""]
+# True for the whole of a per-sentence reply (_speak_sentences), including the
+# silent waits between its sentences, when _tts_playback_active is off while
+# the next sentence finishes rendering. request_tts_interrupt accepts a STOP /
+# wake barge-in in that gap too (it only bumps the counters, which the
+# sentence player checks before every chunk) -- otherwise a stop that landed
+# between two sentences was refused and the rest of the reply played on.
+_tts_reply_active: list[bool] = [False]
 
 
 def _barge_in_wake_enabled() -> bool:
@@ -17825,7 +17876,9 @@ def request_tts_interrupt(source: str = "wake-word",
 
       * the core.config.BARGE_IN_ENABLED knob is off (zero behaviour change),
       * TTS playback isn't actually live (nothing to interrupt — the normal
-        wake path should proceed unchanged), or
+        wake path should proceed unchanged); the silent gap between two
+        sentences of a per-sentence reply (_tts_reply_active) counts as
+        live, or
       * the sentence currently being spoken contains "jarvis" — the
         echo-safety gate. The mic hears the speakers, so an engine hit
         during a self-referential sentence is treated as JARVIS's own voice
@@ -17850,7 +17903,7 @@ def request_tts_interrupt(source: str = "wake-word",
     can no longer stall the main loop (2026-08 barge-in-stall fix)."""
     if acoustic and not _barge_in_wake_enabled():
         return False
-    if not _tts_playback_active[0]:
+    if not (_tts_playback_active[0] or _tts_reply_active[0]):
         return False
     if (not acoustic
             and (time.time() - _session_start_time) < _BOOT_BARGE_IN_GRACE_S):
@@ -17940,6 +17993,23 @@ class _AudioDucker:
         self._worker_lock = threading.Lock()
         self._worker_thread: threading.Thread | None = None
         self._work_queue: queue.Queue = queue.Queue()
+        # hold()/release(): a per-sentence reply (_speak_sentences) keeps the
+        # duck across its chunks -- each chunk's play_with_lipsync still calls
+        # duck()/restore(), but restore() is a no-op while held, so the music
+        # does not swell back up (and restore's synchronous fade-up does not
+        # stall) between two sentences of one reply. release() restores.
+        self._holds = 0
+
+    def hold(self) -> None:
+        with self._lock:
+            self._holds += 1
+
+    def release(self) -> None:
+        with self._lock:
+            self._holds = max(0, self._holds - 1)
+            last = self._holds == 0
+        if last:
+            self.restore()
 
     @classmethod
     def _check_available(cls) -> bool:
@@ -18097,7 +18167,7 @@ class _AudioDucker:
 
     def restore(self) -> None:
         with self._lock:
-            if not self._saved:
+            if self._holds > 0 or not self._saved:
                 return
             saved = list(self._saved)
             self._fade_cancel.set()
@@ -26800,6 +26870,158 @@ def _strip_markdown_for_speech(text: str) -> str:
     return text
 
 
+def _sentence_tts_plan(spoken_text: str):
+    """(chunks, pinned_preset) when _speak should voice this reply sentence by
+    sentence, else None (today's whole-text path). Called inside _SPEAK_LOCK
+    after the reply's prosody cells are published. Never raises.
+
+    Per-sentence only when ALL hold: SENTENCE_TTS_ENABLED; the Kokoro backend
+    with no voice clone armed and Kokoro available (edge-tts keeps its
+    whole-text render cache, the clone its GPU path); not env-muted
+    (MUTE_TTS -- the muted path stays byte-identical); the reply is long
+    enough and has more than one sentence (core.sentence_tts.plan_chunks);
+    and the reply's preset is not 'wry' (the wry beat is spliced before the
+    FINAL clause of the whole reply, so a wry line renders whole)."""
+    try:
+        if not globals().get("SENTENCE_TTS_ENABLED", True):
+            return None
+        backend = str(globals().get("TTS_BACKEND", "edge") or "edge").lower()
+        if backend != "kokoro" or globals().get("VOICE_CLONE_ENABLED", False):
+            return None
+        if _tts_layer is not None and _tts_layer.is_muted():
+            return None
+        from core import sentence_tts as _st
+        chunks = _st.plan_chunks(spoken_text)
+        if len(chunks) < 2:
+            return None
+        from core import kokoro_tts as _kokoro
+        if not _kokoro.is_available():
+            return None
+        user_tone = _synth_user_tone()
+        chosen, preset = _resolve_tts_preset(spoken_text, user_tone)
+        if chosen == "wry":
+            return None
+        gain = float(preset.get("gain", 1.0))  # type: ignore[arg-type]
+        tone_tag = f" tone={user_tone}" if user_tone else ""
+        mood_tag = f" mood={_last_mood[0]}" if _last_mood[0] else ""
+        print(f"  [tts] {len(chunks)} sentences preset={chosen}{tone_tag}"
+              f"{mood_tag} rate={preset.get('rate', '+0%')} gain={gain:.2f}")
+        return chunks, (chosen, preset)
+    except Exception as e:
+        print(f"  [tts] sentence split skipped ({type(e).__name__}: {e})")
+        return None
+
+
+# Bound on each wait for the next sentence's render (the house rule: nothing
+# unbounded under _SPEAK_LOCK). It must sit above the slowest render the
+# ladder can legitimately take, or a working fallback would be cut off: a
+# sentence's Kokoro timeout (core/kokoro_tts._SYNTH_TIMEOUT_S, 30 s), then the
+# rest-of-reply block on edge-tts (3 attempts x 30 s + 1.5 s backoff), then
+# pyttsx3 (_PYTTSX3_TIMEOUT_S, 15 s), then the subprocess-bounded SAPI5 rung
+# -- about 137 s plus SAPI5. A STOP is still honoured within ~50 ms while
+# waiting (play_pipelined polls should_stop), so the cap is only the
+# last-resort bound on a render wedged past every rung.
+_SENTENCE_TTS_WAIT_S = 300.0
+
+
+def _speak_sentences(chunks, pinned, volume_scale: float = 1.0,
+                     on_first_play=None):
+    """Voice `chunks` through core.sentence_tts.play_pipelined: sentence 1 is
+    rendered and played on THIS thread (the _SPEAK_LOCK holder) while one
+    worker renders the rest; every play_with_lipsync call is made here, one
+    per sentence, one at a time, so there is never more than one playback
+    stream.
+
+    * Same prosody for every chunk: `pinned` (the reply's resolved preset) is
+      pinned on each rendering thread (_TTS_PRESET_PIN), mode "kokoro_only".
+      A sentence Kokoro misses raises SentenceFallback and the rest of the
+      reply is rendered as ONE block on the edge-tts ladder (mode
+      "skip_kokoro") -- one fallback voice, one fallback render.
+    * Every sentence but the last is followed by SENTENCE_GAP_S of silence
+      (Kokoro trims each render, so the pause a whole-text render keeps at a
+      full stop would otherwise be lost).
+    * Stops before the next chunk -- and while waiting for its render -- on
+      an accepted interrupt (_tts_interrupt_seq moved: play_with_lipsync's
+      finally clears the _tts_interrupt Event itself, so the counter is the
+      signal that survives the chunk; _tts_reply_active lets
+      request_tts_interrupt accept one in the silent gap between chunks), on
+      a still-set interrupt, on the legacy RMS barge-in having fired during
+      the last chunk, or on the tray mute being switched on.
+    * The music duck is held across the chunks and restored once at the end.
+    * An error before sentence 1 was heard propagates to _speak's
+      device-hiccup handler, as for one play. An error after it (a later
+      render/play failure, the wait cap) is logged here and the reply counts
+      as spoken -- those sentences WERE heard, so the streaming flush ledger
+      must not voice them again.
+    * A render in flight on the worker when the reply is stopped finishes
+      after this returns (it cannot be cancelled) and is discarded; see
+      core/sentence_tts.py."""
+    global _barge_in_interrupted
+    from core import sentence_tts as _st
+    seq0 = _tts_interrupt_seq[0]
+    barged = [False]
+
+    def _render(text, mode):
+        _TTS_PRESET_PIN.value = pinned
+        _TTS_PRESET_PIN.mode = mode
+        try:
+            audio, sr = synthesise(text)
+        finally:
+            _TTS_PRESET_PIN.value = None
+            _TTS_PRESET_PIN.mode = None
+        if volume_scale != 1.0:
+            try:
+                audio = (audio.astype(np.float32)
+                         * float(volume_scale)).astype(audio.dtype)
+            except Exception:
+                pass
+        return audio, sr
+
+    def _pad(audio, sr):
+        a = np.asarray(audio)
+        gap = np.zeros(int(sr * _st.SENTENCE_GAP_S), dtype=a.dtype)
+        return np.concatenate([a, gap], axis=0)
+
+    def _play(audio, sr):
+        play_with_lipsync(audio, sr)
+        if _barge_in_interrupted:
+            barged[0] = True
+
+    def _should_stop():
+        return (_tts_interrupt_seq[0] != seq0 or _tts_interrupt.is_set()
+                or barged[0] or bool(_tts_muted[0]))
+
+    # The legacy RMS barge-in listener (BARGE_IN_ENABLED + headset) only
+    # raises _barge_in_interrupted during a play, and nothing reads it outside
+    # one, so clearing it here makes "True after a chunk" mean "the user
+    # barged in during THIS reply" -- a stale True left by an older reply can
+    # never cut this one. (Read directly rather than having _barge_watch bump
+    # _tts_interrupt_seq, which would also trip the streaming-flush and
+    # processing-filler gates.)
+    _barge_in_interrupted = False
+    _audio_ducker.hold()
+    _tts_reply_active[0] = True
+    try:
+        res = _st.play_pipelined(
+            chunks, lambda t: _render(t, "kokoro_only"), _play, _should_stop,
+            synth_rest=lambda t: _render(t, "skip_kokoro"), pad=_pad,
+            on_first_play=on_first_play, wait_timeout=_SENTENCE_TTS_WAIT_S)
+    finally:
+        _tts_reply_active[0] = False
+        _audio_ducker.release()
+    if res.fell_back:
+        print("  [tts] Kokoro missed a sentence; voiced the rest of the reply "
+              "in one block on the fallback engine")
+    if res.error is not None:
+        print(f"  [speak] playback failed after {res.sentences_played}/"
+              f"{len(chunks)} sentences: {type(res.error).__name__}: "
+              f"{res.error}")
+    elif res.stopped:
+        print(f"  [tts] reply stopped after {res.sentences_played}/"
+              f"{len(chunks)} sentences")
+    return res
+
+
 def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
     """Run a string through TTS + lip-sync + state changes. Used by both
     reactive responses and proactive idle comments.
@@ -26939,7 +27161,7 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
     # utterances reach here (mute / empty / staging returned above).
     _filler_note_speech()
     with _SPEAK_LOCK:
-        _speak_ok = False   # set True only on a completed play (#18 ledger)
+        _speak_ok = False   # set True only once the line was heard (#18 ledger)
         try:
             _last_intent_override[0] = intent
             _last_wry[0] = wry_flag
@@ -26954,14 +27176,27 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
             # currently owning the audio device; cleared in the finally.
             _tts_current_text[0] = (spoken_text or "").lower()
             _tt("mark", "synth_start")
-            audio_out, sr = synthesise(spoken_text)
-            if volume_scale != 1.0:
-                try:
-                    audio_out = (audio_out.astype(np.float32) * float(volume_scale)).astype(audio_out.dtype)
-                except Exception:
-                    pass
-            _tt("mark", "first_play")   # first audio of the turn's answer
-            play_with_lipsync(audio_out, sr)
+            # Per-sentence speech (SENTENCE_TTS_ENABLED, Kokoro only): a long
+            # multi-sentence reply starts playing sentence 1 while the rest
+            # renders. None -> today's whole-text synthesise + one play.
+            _sentence_plan = _sentence_tts_plan(spoken_text)
+            if _sentence_plan is not None:
+                # Raises only when nothing was heard yet (the handler below
+                # then reports the line unspoken, as for one play); a failure
+                # after sentence 1 is logged inside and counts as spoken.
+                _speak_sentences(
+                    _sentence_plan[0], _sentence_plan[1], volume_scale,
+                    # first audio of the turn's answer = sentence 1's play
+                    on_first_play=lambda: _tt("mark", "first_play"))
+            else:
+                audio_out, sr = synthesise(spoken_text)
+                if volume_scale != 1.0:
+                    try:
+                        audio_out = (audio_out.astype(np.float32) * float(volume_scale)).astype(audio_out.dtype)
+                    except Exception:
+                        pass
+                _tt("mark", "first_play")   # first audio of the turn's answer
+                play_with_lipsync(audio_out, sr)
             last_speech_time = time.time()
             set_state("idle")
             _speak_ok = True   # signalled to the streaming flush ledger (#18)
