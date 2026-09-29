@@ -965,6 +965,16 @@ class SickCameraReopenIsNotGatedTests(MonolithGlobalsTestCase):
     resolved to a different index than the one the loop is benching (test 4),
     which is the whole reason resolve-by-name exists.
 
+    2026-09-29: THE REOPEN IS NOW GATED - by the camera open gate
+    (core/camera_gate.py), not by the fingerprint. A failed tile read is a
+    DROP to the gate, the next open of that device is a RECOVERY that spends a
+    backoff rung (30 -> 60 -> 120 -> 300 -> 600 s), and the gate keys by the
+    device's NAME, so the reshuffle hole in test 4 is closed too. The sick
+    camera therefore costs the first open plus ONE recovery, then nothing until
+    the backoff elapses. The arithmetic above describes the ungated loop these
+    tests were written against, and stays as the record of what the gate
+    removes. The gate here runs on this class's frozen clock.
+
     Like the rest of this file, these tests count CALLS, never threads."""
 
     class _SickCap:
@@ -1083,7 +1093,14 @@ class SickCameraReopenIsNotGatedTests(MonolithGlobalsTestCase):
             return list(devices)
 
         shim = self._Cv2Shim(opens, self._SickCap)
-        with mock.patch.object(bc, "_enumerate_dshow_input_devices", _enumerate), \
+        # The production camera gate, on THIS test's frozen clock.
+        gate = bc._make_camera_gate(clock=lambda: t[0])
+        # The sick camera is PRESENT on the bus (it opens, then fails reads):
+        # say so, rather than let the gate ask this machine's real device list,
+        # which has never heard of "Left Cam" and would call it ABSENT.
+        with mock.patch.object(bc, "_camera_gate", gate), \
+             mock.patch.object(bc, "_camera_gate_presence", return_value=True), \
+             mock.patch.object(bc, "_enumerate_dshow_input_devices", _enumerate), \
              mock.patch.object(bc, "_video_device_fingerprint", return_value=_fp()), \
              mock.patch.object(bc, "cv2", shim), \
              mock.patch.object(bc.time, "time", side_effect=lambda: t[0]):
@@ -1092,21 +1109,19 @@ class SickCameraReopenIsNotGatedTests(MonolithGlobalsTestCase):
                 t[0] += step
         return len(enums), len(opens)
 
-    def test_the_gate_removes_the_enumeration_but_not_the_reopen(self):
-        """THE HEADLINE CORRECTION. 40 ticks of a sick camera: the fingerprint
-        gate does its job (one enumeration, not forty) and the reopen storm is
-        completely untouched (forty). One enumeration removed, forty reopens
-        left - which is why the interleaved A/B above measures a ~24% reduction
-        in the regime that actually killed v2.0.100, not 54x."""
+    def test_the_gate_removes_the_enumeration_and_the_camera_gate_the_reopen(self):
+        """40 ticks (10 s) of a sick camera: the fingerprint gate still does
+        its job (one enumeration, not forty), and since 2026-09-29 the camera
+        open gate bounds the reopen storm too - the first open plus ONE
+        recovery, then the device's 30 s backoff holds every later tick.
+        Before the camera gate this was forty opens for forty failed reads,
+        which is why the interleaved A/B above measured only ~24%."""
         enums, opens = self._drive(40)
         self.assertEqual(enums, 1,
                          "the gate stopped working: %d enumerations" % enums)
-        self.assertEqual(opens, 40,
-                         "this test is no longer measuring the ungated reopen "
-                         "(%d opens for 40 failed reads). If the reopen really "
-                         "did get gated, that is good news - but the module "
-                         "docstring's arithmetic and the fix report's headline "
-                         "both have to be rewritten with it." % opens)
+        self.assertEqual(opens, 2,
+                         "the camera gate no longer bounds the sick camera's "
+                         "reopen loop (%d opens for 40 failed reads)" % opens)
 
     def test_a_failed_read_scores_no_quarantine_strike(self):
         """The side-tile path cannot bench a camera on its own. The three
@@ -1117,7 +1132,8 @@ class SickCameraReopenIsNotGatedTests(MonolithGlobalsTestCase):
         bc = self.bc
         with mock.patch.object(bc, "_camera_note_sick_cycle") as strike:
             _enums, opens = self._drive(50)
-        self.assertEqual(opens, 50)
+        # Bounded by the camera gate's backoff, not by a strike (2026-09-29).
+        self.assertEqual(opens, 2)
         self.assertEqual(strike.call_count, 0,
                          "the tile path now scores its own strikes - good, but "
                          "the docstring above says it does not")
@@ -1145,12 +1161,14 @@ class SickCameraReopenIsNotGatedTests(MonolithGlobalsTestCase):
                          "expected exactly the cold-start enumeration, got %d" % enums)
 
     def test_a_bench_misses_a_tile_whose_name_resolved_elsewhere(self):
-        """THE HOLE IN THE BACKSTOP, and the reason it is a backstop and not a
-        fix. The loop benches cam['index']; the tile opens whatever the NAME
+        """THE HOLE IN THE QUARANTINE BACKSTOP - still there, and now covered.
+        The loop benches cam['index']; the tile opens whatever the NAME
         resolved to. A bus reshuffle makes those differ - which is the entire
         reason _resolve_webcam_indices_by_name() exists - and the bench then
-        protects an index nobody is opening while the storm continues on the one
-        that moved."""
+        protects an index nobody is opening. The camera gate (2026-09-29) keys
+        by the device NAME, not the index, so the moved device's reopens are
+        bounded exactly like an unmoved one's: the first open plus one
+        recovery."""
         bc = self.bc
         for _ in range(bc._CAMERA_QUARANTINE_STRIKES):
             bc._camera_note_sick_cycle(0, "Left webcam", "soft wake", 1000.0)
@@ -1158,10 +1176,9 @@ class SickCameraReopenIsNotGatedTests(MonolithGlobalsTestCase):
         # The device is now second on the bus, so the name resolves to index 1.
         enums, opens = self._drive(20, devices=("Other Cam", "Left Cam"))
         self.assertEqual(enums, 1)
-        self.assertEqual(opens, 20,
-                         "the reshuffled tile was benched after all - if that is "
-                         "a real fix rather than an accident of this fixture, "
-                         "say so here")
+        self.assertEqual(opens, 2,
+                         "the camera gate did not follow the device to its new "
+                         "index (%d opens for 20 failed reads)" % opens)
 
 
 if __name__ == "__main__":

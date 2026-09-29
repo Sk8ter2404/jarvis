@@ -116,6 +116,8 @@ __all__ = [
     "msmf_device_names",
     "msmf_index_for_name",
     "msmf_index_for_dshow_index",
+    "PREFERRED_FOURCC",
+    "webcam_users_now",
     "resolve_capture_target",
     "default_retries",
     "open_camera",
@@ -126,6 +128,88 @@ __all__ = [
 # NOT a ration on a leak the way the DirectShow gate must be. Losing it would
 # cost milliseconds, not correctness.
 MSMF_ENUM_TTL_SEC = 10.0
+
+# The pixel format open_camera requests before the size (see there).
+PREFERRED_FOURCC = "MJPG"
+
+# Windows' camera privacy log: per app, when it last STARTED and STOPPED using
+# a webcam. An app with a start stamp and a zero stop stamp is using one NOW.
+_CONSENT_WEBCAM_KEY = (r"Software\Microsoft\Windows\CurrentVersion"
+                       r"\CapabilityAccessManager\ConsentStore\webcam")
+
+
+def webcam_users_now(exclude_dir: "str | None" = None,
+                     reg=None) -> "list[str] | None":
+    """Apps Windows' camera privacy log says are using a webcam RIGHT NOW, or
+    None when that log cannot be read (not Windows, no key, access error).
+
+    WHY THIS AND NOT "IS THE MEETING APP RUNNING" (measured 2026-09-29). The old lock
+    hint came from find_camera_locking_processes(), which only knows which
+    known camera apps are RUNNING. On the owner's desk a meeting app and a
+    chat app run all day, so it said "appears LOCKED by <meeting app>, <chat
+    app>" 23 times that day - and was wrong 23 of 23 times: this log showed
+    NOTHING but JARVIS using a webcam, and every one of those lines followed a
+    USB hub reset that had made the camera vanish. A camera the camera gate
+    calls LOCKED is not retried on a timer, so that false positive would keep
+    the owner's cameras off whenever the meeting app is open.
+
+    ``exclude_dir``: executables in this directory are ignored (JARVIS's own
+    interpreter shows up here while it streams). ``reg`` is winreg, injectable
+    for tests. Reads only; NEVER raises."""
+    if reg is None:
+        if os.name != "nt":
+            return None
+        try:
+            import winreg as reg  # type: ignore
+        except Exception:
+            return None
+    try:
+        root = reg.OpenKey(reg.HKEY_CURRENT_USER, _CONSENT_WEBCAM_KEY)
+    except Exception:
+        return None
+    ex = os.path.normcase(os.path.abspath(exclude_dir)) if exclude_dir else None
+    users: list = []
+
+    def _in_use(key) -> bool:
+        try:
+            start, _t = reg.QueryValueEx(key, "LastUsedTimeStart")
+            stop, _t = reg.QueryValueEx(key, "LastUsedTimeStop")
+            return int(start or 0) > 0 and int(stop or 0) == 0
+        except Exception:
+            return False
+
+    def _subkeys(key):
+        i = 0
+        while True:
+            try:
+                yield reg.EnumKey(key, i)
+            except Exception:
+                return
+            i += 1
+
+    try:
+        for name in list(_subkeys(root)):
+            try:
+                sub = reg.OpenKey(root, name)
+            except Exception:
+                continue
+            if name == "NonPackaged":
+                for exe in list(_subkeys(sub)):
+                    path = exe.replace("#", "\\")
+                    if ex and os.path.normcase(os.path.dirname(path)) == ex:
+                        continue
+                    try:
+                        k = reg.OpenKey(sub, exe)
+                    except Exception:
+                        continue
+                    if _in_use(k):
+                        users.append(os.path.basename(path) or path)
+                continue
+            if _in_use(sub):
+                users.append(name.split("_")[0] or name)
+    except Exception:
+        return None
+    return users
 
 _enum_lock = threading.Lock()
 # [names, symlinks, stamped_at]
@@ -422,7 +506,7 @@ def default_retries(backend: str) -> int:
 def open_camera(index, *, backend: str = "msmf", width=None, height=None,
                 buffersize: bool = True, require_frame: float = 0.0,
                 retries: "int | None" = None, retry_sleep: float = 0.25,
-                cv2_mod=None, log=None, release_hook=None):
+                cv2_mod=None, log=None, release_hook=None, outcome=None):
     """Open ``index`` on ``backend`` and hand back an opened capture, or None.
 
     This is the ONE place that knows the two MSMF hazards measured on this rig:
@@ -459,7 +543,28 @@ def open_camera(index, *, backend: str = "msmf", width=None, height=None,
     outside the lock the live threads now use, overlapping their camera I/O —
     which is the DirectShow heap corruption (0xc0000374) the whole locking
     scheme exists to prevent. The hook re-enters through the CURRENT lock
-    object, so a late release is serialised after all."""
+    object, so a late release is serialised after all.
+
+    ``outcome``, when a dict, is filled with ``{"result": ...}``: "opened",
+    "not-opened" (isOpened() was False on the last attempt), "no-frame"
+    (opened, then no frame within ``require_frame``) or "error" (the open
+    raised). The distinction matters to the camera gate (2026-09-29): on MSMF
+    "no-frame" is the measured signature of a device ANOTHER PROCESS is
+    holding, while "not-opened" is what a device that is absent or dropping
+    off a resetting USB hub looks like - only the first should ever be read
+    as "locked by that meeting app"."""
+    def _outcome(result):
+        if isinstance(outcome, dict):
+            outcome["result"] = result
+    # OPEN ONCE, IN THE FINAL FORMAT (2026-09-29). When a size is requested
+    # the pixel format is set FIRST, then width, then height, all before the
+    # first read - so the device is configured once, as MJPG, instead of
+    # starting in its default (usually uncompressed YUY2) mode and being
+    # renegotiated. MJPG is a fraction of YUY2's USB2 bandwidth, and on the
+    # owner's rig two webcams and a stream deck share one USB2 link whose
+    # periodic budget they exceed on paper. Escape hatch: JARVIS_CAMERA_FOURCC
+    # ("none" = do not request a format; any other 4 chars = that format).
+    fourcc = (os.environ.get("JARVIS_CAMERA_FOURCC") or PREFERRED_FOURCC).strip()
     if cv2_mod is None:
         try:
             import cv2 as cv2_mod  # type: ignore
@@ -488,8 +593,15 @@ def open_camera(index, *, backend: str = "msmf", width=None, height=None,
                 if attempt + 1 < attempts:
                     time.sleep(max(0.0, retry_sleep))
                     continue
+                _outcome("not-opened")
                 return None
             if width and height:
+                if len(fourcc) == 4 and fourcc.lower() != "none":
+                    try:
+                        cap.set(cv2_mod.CAP_PROP_FOURCC,
+                                cv2_mod.VideoWriter_fourcc(*fourcc))
+                    except Exception:
+                        pass        # a driver without that format keeps its own
                 try:
                     cap.set(cv2_mod.CAP_PROP_FRAME_WIDTH, int(width))
                     cap.set(cv2_mod.CAP_PROP_FRAME_HEIGHT, int(height))
@@ -509,13 +621,16 @@ def open_camera(index, *, backend: str = "msmf", width=None, height=None,
                           "device held by another process looks like on MSMF)"
                           % (backend, index, require_frame))
                     _safe_release(cap, release_hook)
+                    _outcome("no-frame")
                     return None
+            _outcome("opened")
             return cap
         except Exception:
             _safe_release(cap, release_hook)
             if attempt + 1 < attempts:
                 time.sleep(max(0.0, retry_sleep))
                 continue
+            _outcome("error")
             return None
     return None
 

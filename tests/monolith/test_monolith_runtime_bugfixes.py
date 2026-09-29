@@ -2840,42 +2840,88 @@ class CameraReopenBackoffTests(MonolithGlobalsTestCase):
         self.bc._camera_locker_cache[0] = 0.0
         self.bc._camera_locker_cache[1] = []
 
+    # 2026-09-29: THE YIELD'S NUMBERS NOW BELONG TO THE CAMERA GATE
+    # (core/camera_gate.py). The flat 30 s contention yield is gone: a camera
+    # the gate calls LOCKED (a failed open while Windows' camera privacy log
+    # shows another app using a webcam) is not retried on a timer at all - each
+    # ask re-reads that log every LOCKED_POLL_S and the gate lets ONE open
+    # through once the app stops, or after LOCKED_RETRY_S. What these pinned -
+    # contention is re-evaluated on every attempt, the hint is one-shot, and
+    # leaving the degraded state is logged - is pinned against that contract.
+
+    def _gate(self, t):
+        return self.bc._make_camera_gate(clock=lambda: t[0])
+
+    def _fail_locked(self, gate, key, lockers):
+        d = gate.begin(key, "face-track")
+        self.assertTrue(d.allowed, d)
+        gate.end(key, "face-track", False, lockers=lockers)
+
     def test_f_every_failed_reopen_re_evaluates_contention(self):
-        entry = {"next_reopen_at": 0.0, "contention_logged": False}
-        wide = self.bc.CAMERA_CONTENTION_BACKOFF_SEC
-        for attempt, now in enumerate((100.0, 130.0, 160.0)):
-            backoff, _lockers = self.bc._schedule_camera_reopen(
-                entry, "emeet", 0, now, lockers=["Teams.exe"])
-            self.assertEqual(backoff, wide, f"attempt {attempt}")
-            self.assertAlmostEqual(
-                entry["next_reopen_at"], now + wide, places=6,
-                msg=f"attempt {attempt}: the contention yield decayed back to "
-                    f"the flat reopen spacing — that is the defect")
+        t = [100.0]
+        gate = self._gate(t)
+        entry = {"cam": {"index": 0, "label": "synth cam", "name": "synthcam one"},
+                 "next_reopen_at": 0.0, "contention_logged": False}
+        key = self.bc._camera_gate_key(entry["cam"])
+        # A HELD camera is still on the bus (a vanished one is ABSENT).
+        with mock.patch.object(self.bc, "_camera_gate", gate), \
+             mock.patch.object(self.bc, "_camera_gate_presence",
+                               return_value=True), \
+             mock.patch.object(self.bc, "camera_users_now",
+                               return_value=["SynthMeet.exe"]):
+            self._fail_locked(gate, key, ["SynthMeet.exe"])
+            for attempt, now in enumerate((100.0, 130.0, 160.0)):
+                t[0] = now
+                backoff, lockers = self.bc._schedule_camera_reopen(
+                    entry, "synth cam", 0, now)
+                self.assertEqual(lockers, ["SynthMeet.exe"], f"attempt {attempt}")
+                self.assertAlmostEqual(
+                    entry["next_reopen_at"], now + backoff, places=6)
+                # Asked again at next_reopen_at, the gate must still refuse:
+                # a locked camera is POLLED, never reopened on a timer.
+                d = gate.begin(key, "face-track", now=entry["next_reopen_at"])
+                self.assertFalse(d.allowed, f"attempt {attempt}: {d}")
+                self.assertEqual(d.reason, "locked")
 
     def test_f_hint_is_logged_once_and_recovery_is_logged_too(self):
         import contextlib
         import io as _io
-        entry = {"next_reopen_at": 0.0, "contention_logged": False}
+        t = [100.0]
+        gate = self._gate(t)
+        entry = {"cam": {"index": 0, "label": "synth cam", "name": "synthcam one"},
+                 "next_reopen_at": 0.0, "contention_logged": False}
+        key = self.bc._camera_gate_key(entry["cam"])
+        running = [["SynthMeet.exe"]]
         buf = _io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            self.bc._schedule_camera_reopen(entry, "emeet", 0, 100.0,
-                                            lockers=["Teams.exe"])
-            self.bc._schedule_camera_reopen(entry, "emeet", 0, 130.0,
-                                            lockers=["Teams.exe"])
-        self.assertEqual(buf.getvalue().count("appears LOCKED"), 1,
-                         "the actionable hint must be one-shot per episode")
-        self.assertTrue(entry["contention_logged"])
+        with mock.patch.object(self.bc, "_camera_gate", gate), \
+             mock.patch.object(self.bc, "_camera_gate_presence",
+                               return_value=True), \
+             mock.patch.object(self.bc, "camera_users_now",
+                               side_effect=lambda *a: list(running[0])):
+            self._fail_locked(gate, key, ["SynthMeet.exe"])
+            with contextlib.redirect_stdout(buf):
+                self.bc._schedule_camera_reopen(entry, "synth cam", 0, 100.0)
+                t[0] = 130.0
+                self.bc._schedule_camera_reopen(entry, "synth cam", 0, 130.0)
+            self.assertEqual(buf.getvalue().count("appears to be IN USE"), 1,
+                             "the actionable hint must be one-shot per episode")
+            self.assertIn("NOT retrying it on a timer", buf.getvalue())
+            self.assertTrue(entry["contention_logged"])
 
-        buf2 = _io.StringIO()
-        with contextlib.redirect_stdout(buf2):
-            backoff, _ = self.bc._schedule_camera_reopen(
-                entry, "emeet", 0, 200.0, lockers=[])
-        self.assertEqual(backoff, self.bc.CAMERA_REOPEN_BACKOFF_SEC)
+            running[0] = []                      # the locking app closed
+            t[0] = 200.0
+            buf2 = _io.StringIO()
+            with contextlib.redirect_stdout(buf2):
+                backoff, _ = self.bc._schedule_camera_reopen(
+                    entry, "synth cam", 0, 200.0)
+        self.assertEqual(backoff, self.bc.CAMERA_REOPEN_BACKOFF_SEC,
+                         "with the locker gone the camera may be asked about "
+                         "again at the floor spacing")
         self.assertAlmostEqual(entry["next_reopen_at"],
                                200.0 + self.bc.CAMERA_REOPEN_BACKOFF_SEC,
                                places=6)
         self.assertFalse(entry["contention_logged"])
-        self.assertIn("no longer appears", buf2.getvalue(),
+        self.assertIn("is no longer in use", buf2.getvalue(),
                       "leaving the degraded state must LOG, not silently speed "
                       "back up")
 

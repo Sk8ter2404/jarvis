@@ -131,22 +131,45 @@ class FailedReopenNeverRequarantinesTests(MonolithGlobalsTestCase):
     attempt per bench, and every "per minute" number in these files stops being
     true. Whoever makes that change should have to update them on purpose
     rather than discover it in a soak.
+
+    2026-09-29 - UPDATED ON PURPOSE. A failed reopen still scores no quarantine
+    strike, but the retry RATE is no longer ~29/min: every open now reports its
+    outcome to the camera gate (core/camera_gate.py), and a failure arms that
+    device's backoff, 30 -> 60 -> 120 -> 300 -> 600 s. The "per minute"
+    numbers elsewhere in these files describe the loop before the gate. The
+    failure handling driven below is the recovery branch's REAL one: the
+    gate's begin/end around the open (what _open_capture does), then
+    _schedule_camera_reopen, which now arms the gate's answer.
     """
+
+    def _fail_one_reopen(self, bc, gate, entry, now):
+        """One pass of the recovery branch with an open that fails cleanly.
+        Returns True iff the gate let the open happen at all."""
+        key = bc._camera_gate_key(entry["cam"])
+        d = gate.begin(key, "face-track", now=now)
+        if d.allowed:
+            gate.end(key, "face-track", False, now=now)
+        bc._schedule_camera_reopen(entry, "ghost", self.IDX, now)
+        return d.allowed
 
     IDX = 4242
 
     def test_a_cleanly_failed_reopen_scores_no_quarantine_strike(self):
         bc = self.bc
         t = [1000.0]
-        entry = {"next_reopen_at": 0.0, "contention_logged": False}
+        gate = bc._make_camera_gate(clock=lambda: t[0])
+        entry = {"cam": {"index": self.IDX, "label": "ghost",
+                         "name": "synthcam ghost"},
+                 "next_reopen_at": 0.0, "contention_logged": False}
+        # The ghost camera is present on the bus and simply fails to open.
         with mock.patch.object(bc.time, "time", side_effect=lambda: t[0]), \
+             mock.patch.object(bc, "_camera_gate", gate), \
+             mock.patch.object(bc, "_camera_gate_presence", return_value=True), \
              mock.patch.object(bc, "find_camera_locking_processes",
                                return_value=[]):
             for _ in range(50):
-                # This IS the entire failure handling of the recovery branch:
-                # _open_capture returned None, so re-arm the backoff and move on.
-                bc._schedule_camera_reopen(entry, "ghost", self.IDX, t[0])
-                t[0] += bc.CAMERA_REOPEN_BACKOFF_SEC
+                self._fail_one_reopen(bc, gate, entry, t[0])
+                t[0] = max(t[0] + 0.1, entry["next_reopen_at"])
             q = bc.get_camera_quarantine().get(self.IDX, {})
         self.assertFalse(q.get("quarantined", False))
         self.assertEqual(q.get("quarantine_strikes", 0), 0,
@@ -170,27 +193,36 @@ class FailedReopenNeverRequarantinesTests(MonolithGlobalsTestCase):
             self.assertTrue(benched["quarantined"], "precondition: benched")
 
             t[0] = benched["quarantine_until"] + 0.1
-            entry = {"next_reopen_at": 0.0, "contention_logged": False}
-            attempts = 0
+            gate = bc._make_camera_gate(clock=lambda: t[0])
+            entry = {"cam": {"index": self.IDX, "label": "ghost",
+                             "name": "synthcam ghost"},
+                     "next_reopen_at": 0.0, "contention_logged": False}
+            opens = 0
             rebenched = 0
             end = t[0] + 30 * 60.0
-            while t[0] < end:
-                if bc._camera_is_quarantined(self.IDX, t[0]):
-                    rebenched += 1
-                    t[0] += 1.0
-                    continue
-                if t[0] < entry["next_reopen_at"]:
+            with mock.patch.object(bc, "_camera_gate", gate), \
+                 mock.patch.object(bc, "_camera_gate_presence",
+                                   return_value=True):
+                while t[0] < end:
+                    if bc._camera_is_quarantined(self.IDX, t[0]):
+                        rebenched += 1
+                        t[0] += 1.0
+                        continue
+                    if t[0] < entry["next_reopen_at"]:
+                        t[0] += 0.1
+                        continue
+                    if self._fail_one_reopen(bc, gate, entry, t[0]):
+                        opens += 1
                     t[0] += 0.1
-                    continue
-                bc._schedule_camera_reopen(entry, "ghost", self.IDX, t[0])
-                attempts += 1
-                t[0] += 0.1
         self.assertEqual(rebenched, 0,
                          "the bench re-armed — good, but the leak arithmetic in "
                          "these files assumes it does not; update it")
-        # 30 virtual minutes at the 2.0 s spacing (plus 0.1 s of loop each).
-        self.assertGreater(attempts, 800,
-                           f"only {attempts} reopen attempts in 30 minutes")
+        # 30 virtual minutes on the gate's ladder: opens at +0, +30, +90,
+        # +210, +510, +1110, +1710 s. Before the gate this loop made >800
+        # attempts at the flat 2.0 s spacing - the reopen storm.
+        self.assertEqual(opens, 7,
+                         f"{opens} reopen attempts in 30 minutes; the camera "
+                         f"gate's 30->60->120->300->600 s ladder allows 7")
 
 
 @requires_monolith

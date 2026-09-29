@@ -521,6 +521,30 @@ def _act_session_resume(_: str = "") -> str:
     return text
 
 
+def _successor_env(bc):
+    """The environment for a self-restart's successor: ours, plus the owner's
+    REAL power plan (2026-09-29).
+
+    The restart path hard-exits without restoring the power plan (it must not
+    block before the successor exists - see _act_restart), so the successor
+    boots with High Performance already active and used to record THAT as the
+    plan to restore: a self-restart left the PC on High Performance
+    (verified live). Handing the plan down lets
+    bobert_companion._activate_high_performance_plan adopt it. None (inherit
+    unchanged) when there is nothing to hand down. NEVER raises."""
+    try:
+        prior = getattr(bc, "_prior_power_plan_guid", None)
+        hp = str(getattr(bc, "_HIGH_PERF_GUID", "") or "")
+        var = getattr(bc, "_PRIOR_POWER_PLAN_ENV", "JARVIS_PRIOR_POWER_PLAN")
+        if not prior or str(prior).lower() == hp.lower():
+            return None
+        env = dict(os.environ)
+        env[var] = str(prior)
+        return env
+    except Exception:
+        return None
+
+
 def _act_restart(_: str = "") -> str:
     """Relaunch bobert_companion.py in a fresh process and exit this one."""
     import threading
@@ -573,6 +597,7 @@ def _act_restart(_: str = "") -> str:
                 [sys.executable, script],
                 creationflags=_flags,
                 close_fds=True,
+                env=_successor_env(bc),
             )
             spawned = True
             print("  [restart] successor spawned; releasing native resources")

@@ -470,11 +470,17 @@ class BoundedCameraIoTests(MonolithGlobalsTestCase):
                         "abandoned open worker leaked its capture handle")
 
     def test_repeated_wedges_bench_the_camera(self):
+        """The quarantine BEHIND the camera gate (2026-09-29): with the gate in
+        place the second wedging attempt is refused outright (the first wedge
+        arms the device's backoff - see test_monolith_camera_storm.py), so the
+        attempts here run with the gate removed to pin that the bench still
+        holds for any attempt the gate lets through."""
         gate = threading.Event()
         try:
             with mock.patch.object(self.bc.cv2, "VideoCapture",
                                    side_effect=lambda *a, **k: _FakeCap(block_event=gate)), \
-                 mock.patch.object(self.bc, "_CAMERA_OPEN_TIMEOUT_S", 0.1):
+                 mock.patch.object(self.bc, "_CAMERA_OPEN_TIMEOUT_S", 0.1), \
+                 mock.patch.object(self.bc, "_camera_gate", None):
                 for _ in range(self.bc._CAMERA_QUARANTINE_STRIKES):
                     self.bc._open_tile_capture(0)
             self.assertTrue(self.bc._camera_is_quarantined(0))
@@ -905,7 +911,10 @@ class AnOpenedLineMeansTheProducerHoldsThatCameraTests(MonolithGlobalsTestCase):
             create=True)
 
     def _claims(self):
-        return [ln for ln in self.printed if _CLAIMS_AN_OPEN.search(ln)]
+        # Camera lines carry a " @HH:MM:SS.mmm" suffix since 2026-09-29 (the
+        # session log only stamps whole seconds); compare without it.
+        return [re.sub(r" @\d\d:\d\d:\d\d\.\d{3}$", "", ln)
+                for ln in self.printed if _CLAIMS_AN_OPEN.search(ln)]
 
     def test_a_kept_handle_is_announced_exactly_once(self):
         """The honest half: an open the loop goes on to USE is still reported,

@@ -623,6 +623,120 @@ AUDIO_DUCKING_TARGETS = (
 # value at boot.)
 _itunes_bridge.set_auto_launch(ITUNES_AUTO_LAUNCH)
 
+# ── THE CAMERA OPEN GATE (2026-09-29) ─────────────────────────────────────
+# ONE process-wide gate in front of every camera and Kinect open: per-device
+# backoff (30 -> 60 -> 120 -> 300 -> 600 s), no timer retries for a device a
+# locking app holds, a minimum gap between two components opening the same
+# device, a boot stagger, and the USB-storm circuit breaker. Why it exists -
+# the owner's hub chain resetting ~once a minute while JARVIS's cameras were
+# recovering, and never while they were not - is in core/camera_gate.py.
+#
+# Built HERE, at import, and handed to the Kinect bridge BEFORE set_enabled()
+# below: that call starts the body pump, whose very first open is one of the
+# opens the boot stagger has to space out.
+try:
+    from core import camera_gate as _camera_gate_mod
+except Exception:          # pragma: no cover - core/ always ships with the monolith
+    _camera_gate_mod = None
+
+
+def _cam_ms(t: "float | None" = None) -> str:
+    """" @HH:MM:SS.mmm" for camera open/close/failure lines (2026-09-29).
+
+    The session log stamps whole seconds, and the owner's USB diagnosis could
+    not order 5 of 16 "camera open -> hub reset" pairs at that resolution. The
+    suffix goes at the END so every existing line still starts, and reads, as
+    it did. NEVER raises."""
+    try:
+        t = time.time() if t is None else float(t)
+        return (" @" + time.strftime("%H:%M:%S", time.localtime(t))
+                + ".%03d" % (int(t * 1000.0) % 1000))
+    except Exception:
+        return ""
+
+
+def _camera_gate_log(line: str) -> None:
+    """Gate lines go to stdout: the daemon Tees stdout into the session log and
+    configures no logging handler (see _drain_camera_backend_notes)."""
+    try:
+        print(line + _cam_ms())
+    except Exception:       # pragma: no cover - defensive
+        pass
+
+
+def _usb_storm_announce(message: str) -> None:
+    """The breaker's ONE spoken line, through the pending-announcement queue.
+    proactive_announce is resolved at CALL time (it is defined much later in
+    this module). NEVER raises."""
+    try:
+        proactive_announce(message, source="usb-storm")
+    except Exception:
+        logging.exception("[usb-storm] could not queue the announcement")
+
+
+def _camera_gate_lockers() -> list:
+    """Who is USING a webcam right now, per Windows' camera privacy log (see
+    camera_users_now). NOT "which camera apps are running": that was the old
+    lock heuristic, and it was wrong 23 of 23 times on 2026-09-29."""
+    return camera_users_now() or []
+
+
+def _camera_gate_presence(key: str):
+    """Is device ``key`` on the bus right now? True / False / None (cannot
+    tell). Read from the Media Foundation device list - measured free (+0
+    threads, +0 handles, ~1.2 ms) and opens nothing - so the gate can poll it
+    every few seconds while a camera is absent. Only NAMED cameras and the
+    Kinect can be placed in that list; anything else is None. NEVER raises."""
+    try:
+        if _camera_backend is None:
+            return None
+        if key == "kinect":
+            needle = "kinect"
+        elif key.startswith("name:"):
+            needle = key[5:]
+        else:
+            return None
+        if not needle or _camera_backend.configured_backend() != "msmf":
+            return None
+        names = _camera_backend.msmf_device_names(force=True)
+        if names is None:
+            return None
+        return any(needle in str(n or "").lower() for n in names)
+    except Exception:
+        return None
+
+
+def _make_camera_gate(clock=None):
+    """The production gate, from the three owner knobs. None only if
+    core/camera_gate.py cannot import, in which case every opener behaves
+    exactly as it did before the gate existed. ``clock`` exists for tests that
+    freeze time; production uses the gate's default (time.time). NEVER
+    raises."""
+    if _camera_gate_mod is None:
+        return None
+    try:
+        return _camera_gate_mod.CameraGate(
+            min_gap_s=CAMERA_OPEN_MIN_GAP_S,
+            max_backoff_s=CAMERA_REOPEN_MAX_BACKOFF_S,
+            storm_cooldown_s=USB_STORM_COOLDOWN_S,
+            log=_camera_gate_log,
+            announce=_usb_storm_announce,
+            # Looked up at CALL time, so the live function is always the one
+            # asked (and a test can substitute it).
+            lockers=lambda: _camera_gate_lockers(),
+            presence=lambda key: _camera_gate_presence(key),
+            clock=clock)
+    except Exception:       # pragma: no cover - defensive
+        logging.exception("[camera-gate] could not build the camera gate")
+        return None
+
+
+_camera_gate = _make_camera_gate()
+try:
+    _kinect_bridge.set_open_gate(_camera_gate)
+except Exception:          # pragma: no cover - an older bridge without the hook
+    logging.exception("[camera-gate] could not hand the gate to the Kinect bridge")
+
 # (KINECT_ENABLED lives in core/config.py. This set_enabled() call MUST stay
 # here so the Kinect bridge picks up the live opt-in value at boot; when False
 # — the default — the bridge never opens the sensor.)
@@ -5244,7 +5358,78 @@ def _report_video_fingerprint_gate(fp, names, now: float) -> bool:
         return False
 
 
+# Hard cap on ONE DirectShow device-name enumeration (2026-09-29). It is a
+# ~46 ms COM call when healthy; on the owner's rig a hub reset came ~5 s after
+# a failed DirectShow probe, and a COM call into a device that is mid-reset has
+# no timeout of its own - on the producer thread that would be an unbounded
+# stall. A lookup that has not answered in this long is abandoned (its worker
+# is left to finish on its own) and the caller treats the name as unresolved,
+# exactly as when pygrabber is missing.
+_DSHOW_ENUM_TIMEOUT_S = 5.0
+_dshow_enum_timeout_noted = [0.0]
+
+
 def _enumerate_dshow_input_devices() -> "list[str] | None":
+    """The DirectShow device-name enumeration, GATED and BOUNDED.
+
+    Refused (None - "could not tell", the same answer as pygrabber being
+    absent) while the camera gate is in a USB-storm cool-down or an open is
+    stuck inside the camera driver: the enumeration walks the very
+    kernel-streaming devices that are resetting. Otherwise it runs on a
+    throwaway worker (COM initialised for that thread) and is abandoned after
+    _DSHOW_ENUM_TIMEOUT_S. The leak arithmetic above still applies to every
+    call that does run - this only stops the ones that should not. NEVER
+    raises."""
+    gate = _camera_gate
+    if gate is not None:
+        try:
+            if gate.storm_active() or gate.wedged():
+                return None
+        except Exception:
+            pass
+    box: dict = {"names": None}
+
+    def _work():
+        co = None
+        try:
+            import comtypes  # type: ignore
+            try:
+                comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+                co = comtypes
+            except Exception:
+                co = None
+        except Exception:
+            co = None
+        try:
+            box["names"] = _enumerate_dshow_input_devices_raw()
+        except Exception:
+            box["names"] = None
+        finally:
+            if co is not None:
+                try:
+                    co.CoUninitialize()
+                except Exception:
+                    pass
+
+    t = threading.Thread(target=_work, daemon=True, name="dshow-enum")
+    t.start()
+    t.join(_DSHOW_ENUM_TIMEOUT_S)
+    if t.is_alive():
+        try:
+            now = time.time()
+            if (now - _dshow_enum_timeout_noted[0]) >= 300.0:
+                _dshow_enum_timeout_noted[0] = now
+                print(f"  [camera] the DirectShow device-name lookup did not "
+                      f"answer within {_DSHOW_ENUM_TIMEOUT_S:.0f}s - abandoned; "
+                      f"cameras resolve by their Media Foundation name instead."
+                      f"{_cam_ms(now)}")
+        except Exception:
+            pass
+        return None
+    return box["names"]
+
+
+def _enumerate_dshow_input_devices_raw() -> "list[str] | None":
     """The DirectShow VIDEO input-device friendly names, by INDEX (list position
     == the index cv2.VideoCapture(idx, CAP_DSHOW) uses), via pygrabber. Returns
     None when pygrabber is unavailable or the COM enumeration fails — callers
@@ -5507,9 +5692,87 @@ except Exception:      # pragma: no cover - core/ always ships with the monolith
 # capped by call sites x indices, not by time or frame count.
 _camera_backend_notes: dict = {}
 
+# Gate keys (_camera_gate_key) of every device that has RESOLVED TO MEDIA
+# FOUNDATION this process - what tells "DirectShow-only" from "was MSMF, now
+# gone" in _camera_open's no-fallback rule (2026-09-29). Bounded by the number
+# of physical devices, not by time.
+_camera_msmf_seen: set = set()
+# Gate key -> how that device's LAST _camera_open() ended ("opened" /
+# "not-opened" / "no-frame" / "error"), from core.camera_backend.open_camera's
+# outcome report. Bounded by the number of physical devices.
+_camera_open_last_result: dict = {}
+
+
+# Who is using a webcam per Windows' camera privacy log, behind a short TTL:
+# the locked-state poll can ask every few seconds per camera. [stamp, users].
+_CAMERA_USERS_TTL_S = 5.0
+_camera_users_cache: list = [0.0, None]
+
+
+def camera_users_now() -> "list[str] | None":
+    """Apps OTHER than JARVIS that Windows' camera privacy log says are using a
+    webcam right now; None when that log cannot be read. See
+    core.camera_backend.webcam_users_now for why this, and not "which camera
+    apps are running", is the evidence a camera is held. NEVER raises."""
+    try:
+        now = time.time()
+        if (_camera_users_cache[0]
+                and (now - _camera_users_cache[0]) < _CAMERA_USERS_TTL_S):
+            v = _camera_users_cache[1]
+            return list(v) if v is not None else None
+        users = None
+        if _camera_backend is not None:
+            users = _camera_backend.webcam_users_now(
+                exclude_dir=os.path.dirname(os.path.abspath(sys.executable)))
+        _camera_users_cache[0] = now
+        _camera_users_cache[1] = list(users) if users is not None else None
+        return list(users) if users is not None else None
+    except Exception:
+        return None
+
+
+def _camera_lockers_if_held(key: str) -> "list | None":
+    """The apps to blame for a failed open of ``key`` - or None when there is
+    no EVIDENCE the camera is held. (2026-09-29)
+
+    Before this, "held" meant "a known camera app is RUNNING"
+    (find_camera_locking_processes). On the owner's desk a meeting app and a
+    chat app run all day; the storm log said "appears LOCKED by <meeting app>,
+    <chat app>" 23 times, and Windows' camera privacy log showed neither had
+    used a camera that day - every one of those lines followed a USB hub reset
+    that had made the camera VANISH. A camera the gate calls locked is not
+    retried on a timer, so that false positive would keep the cameras off
+    whenever the meeting app is open.
+
+    Now it takes BOTH: the open failed the way a held device fails ("opened,
+    no frame" - the measured MSMF signature of a device another process
+    streams - or a plain refusal) while the device is still ON the device list,
+    AND the privacy log shows another app using a webcam right now. A device
+    that has vanished is ABSENT, which the gate handles separately (it waits
+    for the device to come back). NEVER raises."""
+    try:
+        if _camera_open_last_result.get(key) not in ("no-frame", "not-opened"):
+            return None
+        if _camera_gate_presence(key) is False:
+            return None
+        users = camera_users_now()
+        return list(users) if users else None
+    except Exception:
+        return None
+
+
 # Lines _camera_open() wants said, waiting for a thread that is allowed to say
 # them. See _drain_camera_backend_notes for why this queue exists at all.
 _camera_backend_pending: deque = deque(maxlen=32)
+
+
+def _queue_camera_note(line: str) -> None:
+    """Queue a camera line for the joiner to print, stamped to the millisecond
+    at the moment it happened (not when it is drained). NEVER raises."""
+    try:
+        _camera_backend_pending.append(str(line) + _cam_ms())
+    except Exception:
+        pass
 
 
 def _drain_camera_backend_notes() -> None:
@@ -5543,6 +5806,233 @@ def _drain_camera_backend_notes() -> None:
             print(line)
         except Exception:       # pragma: no cover - defensive
             return
+
+
+# ── camera-gate plumbing (the gate itself is built at import, near the Kinect
+# bridge's set_enabled; the rules live in core/camera_gate.py) ──────────────
+#
+# WHO OPENS CAMERAS IN THIS PROCESS, and the component name each one uses with
+# the gate. Keep this list true: an opener that bypasses the gate is how the
+# 2026-09-29 storm was fed by five independent retry clocks.
+#   face-track   _face_tracking_thread_body._open_capture (initial open,
+#                recovery reopen, soft wake)
+#   side-tile    _open_tile_capture (Kinect composite side tiles)
+#   cam-probe    _probe_camera_index (boot preflight, boot probe, by-name
+#                rescue)
+#   self-diag    skills/self_diagnostic.py webcam scan + soft wake
+#   kinect-bridge  audio/kinect_bridge._open_runtime_locked (body pump,
+#                KinectCapture, presence/air-mouse/gestures via get_bodies)
+# NOT gated, deliberately: list_cameras() (the --list-cameras CLI, a separate
+# process the owner runs by hand - an in-memory gate cannot span processes).
+_CAMERA_GATE_REFUSAL_NOTE_GAP_S = 300.0
+_camera_gate_refusal_noted: dict = {}
+# The boot probe reuses its own verdict instead of re-opening a device it
+# proved seconds ago (preflight, then probe_cameras_and_update_config, used to
+# open every healthy camera twice inside one boot).
+_CAMERA_PROBE_VERDICT_REUSE_S = 120.0
+# How long a boot probe may WAIT for a timing refusal (stagger / min-gap /
+# in-flight) before giving up. Covers one full min-gap plus the stagger of the
+# other cameras; the probe callers' join budgets include it.
+_CAMERA_PROBE_GATE_PATIENCE_S = 12.0
+# After a camera first crosses the soft-wake threshold, hold its wake this long
+# so a hub reset that took SEVERAL cameras at once is recognised (the breaker
+# needs the second drop) before the first camera reopens into it.
+_CAMERA_DROP_SETTLE_S = 2.0
+
+
+def _camera_gate_key(cam=None, *, index=None, name=None) -> str:
+    """The gate's name for a PHYSICAL device. NEVER raises.
+
+    Named CAMERAS entries key by their name (the same needle every opener
+    derives from CAMERAS, so the producer, the side tiles and the boot probe
+    agree); a Kinect slot is "kinect" (the same key the bridge uses - it is
+    one device whichever API reaches it); an unnamed configured entry is
+    "cfg:<index>"; an unconfigured bare index (an index sweep) is
+    "dshow:<index>", which the gate does not stagger."""
+    try:
+        if isinstance(cam, dict):
+            nm = str(cam.get("name") or "").strip().lower()
+            if cam.get("type") == "kinect" or (KINECT_AS_CAMERA and not nm):
+                return "kinect"
+            if nm:
+                return "name:" + nm
+            return f"cfg:{cam.get('index')}"
+        nm = str(name or "").strip().lower()
+        if nm:
+            return "name:" + nm
+        if index is not None:
+            for c in CAMERAS:
+                if isinstance(c, dict) and c.get("index") == index:
+                    return _camera_gate_key(c)
+            return f"dshow:{index}"
+    except Exception:
+        pass
+    return f"dshow:{index}"
+
+
+def camera_gate_key_for_scan(idx, backend: str) -> str:
+    """Gate key for index ``idx`` IN ``backend``'s index space - what the
+    self-diagnostic's scan opens. Media Foundation indices are mapped back to
+    a device NAME (the Kinect's MSMF interface is the same USB device the
+    bridge streams). NEVER raises."""
+    try:
+        if backend == "msmf" and _camera_backend is not None:
+            names = _camera_backend.msmf_device_names()
+            i = int(idx)
+            if names and 0 <= i < len(names):
+                full = str(names[i] or "").strip().lower()
+                if "kinect" in full:
+                    return "kinect"
+                for c in CAMERAS:
+                    if not isinstance(c, dict):
+                        continue
+                    nm = str(c.get("name") or "").strip().lower()
+                    if nm and nm in full:
+                        return _camera_gate_key(c)
+                return "msmf:" + full
+            return f"msmf-index:{idx}"
+        return _camera_gate_key(index=idx)
+    except Exception:
+        return f"{backend}-index:{idx}"
+
+
+def camera_gate_begin(key: str, component: str, *, wait_budget_s: float = 0.0,
+                      beat=None):
+    """Ask the gate to open ``key`` for ``component``. Returns the Decision,
+    or None when there is no gate (then the caller proceeds as before).
+
+    ``wait_budget_s`` > 0 WAITS OUT timing refusals (stagger / min-gap /
+    in-flight) up to that long, in slices, calling ``beat()`` if given. Hold
+    refusals (usb-storm / held / locked / backoff) return at once - they mean
+    "not now", not "in a moment". Never waits while holding a camera lock:
+    callers must ask BEFORE they take _camera_io_lock. NEVER raises."""
+    gate = _camera_gate
+    if gate is None:
+        return None
+    try:
+        deadline = time.monotonic() + max(0.0, float(wait_budget_s or 0.0))
+        while True:
+            d = gate.begin(key, component)
+            if d.allowed or d.reason not in _camera_gate_mod.TIMING_REASONS:
+                return d
+            left = deadline - time.monotonic()
+            if left <= 0.0 or float(d.wait_s) > left + 0.05:
+                return d
+            end_wait = time.monotonic() + max(0.05, min(float(d.wait_s), left))
+            while True:
+                rem = end_wait - time.monotonic()
+                if rem <= 0.0:
+                    break
+                if beat is not None:
+                    try:
+                        beat()
+                    except Exception:
+                        pass
+                time.sleep(min(rem, 1.0))
+    except Exception:
+        logging.exception("[camera-gate] begin failed for %s", key)
+        return None
+
+
+def camera_gate_end(key: str, component: str, ok: bool, **kwargs) -> None:
+    """Report an open's outcome to the gate. NEVER raises."""
+    gate = _camera_gate
+    if gate is None:
+        return
+    try:
+        gate.end(key, component, bool(ok), **kwargs)
+    except Exception:
+        logging.exception("[camera-gate] end failed for %s", key)
+
+
+def camera_gate_note_wedged(key: str, component: str):
+    """An open of ``key`` is stuck inside the camera driver; returns the token
+    for camera_gate_note_unwedged, or None. NEVER raises."""
+    gate = _camera_gate
+    if gate is None:
+        return None
+    try:
+        return gate.note_wedged(key, component)
+    except Exception:
+        return None
+
+
+def camera_gate_note_unwedged(token) -> None:
+    gate = _camera_gate
+    if gate is None or token is None:
+        return
+    try:
+        gate.note_unwedged(token)
+    except Exception:
+        pass
+
+
+def camera_gate_cancel(key: str, component: str) -> None:
+    """Drop a reservation whose opener never reached the device. NEVER raises."""
+    gate = _camera_gate
+    if gate is None:
+        return
+    try:
+        gate.cancel(key, component)
+    except Exception:
+        pass
+
+
+def _camera_gate_note_drop(key: str, component: str, kind: str = "camera") -> bool:
+    gate = _camera_gate
+    if gate is None:
+        return False
+    try:
+        return bool(gate.note_drop(key, component, kind))
+    except Exception:
+        return False
+
+
+def _usb_storm_note_audio_drop(direction: str) -> None:
+    """An AUDIO endpoint just vanished under JARVIS (a cached device index that
+    no longer queries, or a stream open that failed on it). One input to the
+    USB-storm breaker: a camera AND an audio device dropping within ~10 s is
+    the signature of the owner's shared hub chain resetting. Audio alone never
+    trips it. NEVER raises."""
+    _camera_gate_note_drop(f"audio:{direction}", "audio", "audio")
+
+
+def get_camera_gate_status() -> dict:
+    """Plain-data snapshot of the camera gate (storm state, per-device backoff
+    levels, locks, holds, refusal counts). NEVER raises."""
+    gate = _camera_gate
+    if gate is None:
+        return {"storm_active": False, "devices": {}, "refusals": {},
+                "gate": "unavailable"}
+    try:
+        return gate.snapshot()
+    except Exception:
+        return {"storm_active": False, "devices": {}, "refusals": {}}
+
+
+def _note_camera_gate_refusal(label: str, key: str, component: str, d) -> bool:
+    """ONE line per (device, component, reason) per 5 minutes when the gate
+    HOLDS a device (a reopen backoff, another component streaming it). A hold
+    is the gate working, so it must be visible - but the producer asks every
+    few seconds and the tiles on every composite, and the per-attempt spam is
+    exactly what the gate exists to end. Silent for the routine timing
+    refusals (stagger / min-gap / in-flight: seconds, and the eventual open
+    says what happened) and for the two holds that already have their OWN
+    one-shot line (usb-storm: the [usb-storm] line; locked: the "appears
+    LOCKED" hint). Returns True when it printed. NEVER raises."""
+    try:
+        if getattr(d, "reason", "") not in ("backoff", "held"):
+            return False
+        now = time.time()
+        k = (key, component, d.reason)
+        if (now - _camera_gate_refusal_noted.get(k, 0.0)) < _CAMERA_GATE_REFUSAL_NOTE_GAP_S:
+            return False
+        _camera_gate_refusal_noted[k] = now
+        print(f"  [camera-gate] {label}: {component} open held - {d.reason} "
+              f"({d.detail}); asking again in {float(d.wait_s):.0f}s.")
+        return True
+    except Exception:
+        return False
 
 
 def _camera_open(idx, *, name: "str | None" = None,
@@ -5625,6 +6115,47 @@ def _camera_open(idx, *, name: "str | None" = None,
         if names:
             open_idx, backend, why = _camera_backend.resolve_capture_target(
                 idx, name=name, dshow_names=names)
+    # NO MSMF -> DIRECTSHOW FALLBACK FOR A DEVICE THAT IS MERELY GONE
+    # (2026-09-29). resolve_capture_target() falls back to (static index,
+    # DirectShow) whenever Media Foundation has no match - right for a device
+    # that never had an MF presence (a software virtual camera), wrong for one that
+    # resolved on MSMF earlier this session and has just dropped off a
+    # resetting hub. Measured live that day, mid-storm: "'<webcam>' did not
+    # resolve by name ... falling back to static index 2", "opening with DSHOW
+    # at index 2 - ... (device is DirectShow-only)", "dshow index 2 did not
+    # open": a leaky DirectShow open (+~4.6 threads, +~480 handles) aimed at
+    # whatever DirectShow now listed at index 2, fired into the bus event
+    # itself. So a device this process has seen on Media Foundation is never
+    # handed to DirectShow; it waits (on the camera gate's schedule) to come
+    # back. Also refused outright during a USB-storm cool-down. A backend
+    # PINNED to dshow by the owner is not a fallback and is untouched, and a
+    # genuinely DirectShow-only device keeps its only way in.
+    _fb_key = _camera_gate_key(index=idx, name=name)
+    if backend == "msmf":
+        _camera_msmf_seen.add(_fb_key)
+    elif _camera_backend.configured_backend() == "msmf":
+        _was_msmf = _fb_key in _camera_msmf_seen
+        _storm = False
+        try:
+            _storm = bool(_camera_gate is not None
+                          and _camera_gate.storm_active())
+        except Exception:
+            _storm = False
+        if _was_msmf or _storm:
+            key = (idx, name, label, "no-dshow-fallback")
+            if _camera_backend_notes.get(key) != (_was_msmf, _storm):
+                _camera_backend_notes[key] = (_was_msmf, _storm)
+                _queue_camera_note(
+                    f"  [camera] {label or ('index ' + str(idx))}: NOT falling "
+                    f"back to DirectShow at index {idx} - "
+                    + ("this camera opened on Media Foundation earlier and is "
+                       "missing from that list now (off the bus?)"
+                       if _was_msmf else
+                       "a USB-storm cool-down is running")
+                    + "; waiting for it to come back rather than paying a "
+                      "leaky DirectShow open on whatever sits at that index.")
+            _camera_open_last_result[_fb_key] = "absent"
+            return None
     # QUEUED, not printed and not logged. This runs on the throwaway open
     # worker, which may not narrate itself; and logging goes nowhere in the
     # daemon. See _drain_camera_backend_notes, which a joiner calls.
@@ -5635,7 +6166,7 @@ def _camera_open(idx, *, name: "str | None" = None,
     key = (idx, name, label)
     if _camera_backend_notes.get(key) != (open_idx, backend):
         _camera_backend_notes[key] = (open_idx, backend)
-        _camera_backend_pending.append(
+        _queue_camera_note(
             f"  [camera] {label or ('index ' + str(idx))}: opening with "
             f"{backend.upper()} at index {open_idx} — {why}")
     # cv2_mod=cv2 hands the shared opener THIS module's cv2 reference rather
@@ -5649,11 +6180,17 @@ def _camera_open(idx, *, name: "str | None" = None,
     # therefore release through the CURRENT lock object rather than bare, or a
     # late release from an abandoned worker overlaps live camera I/O — the
     # 0xc0000374 heap corruption this whole locking scheme exists to prevent.
-    return _camera_backend.open_camera(
+    # outcome: WHY a failed open failed, kept per device for the camera gate's
+    # lock classification - see _camera_lockers_if_held.
+    _oc: dict = {}
+    cap = _camera_backend.open_camera(
         open_idx, backend=backend, width=width, height=height,
         require_frame=require_frame, cv2_mod=cv2,
         release_hook=_release_on_current_camera_lock,
-        log=_camera_backend_pending.append)
+        log=_queue_camera_note, outcome=_oc)
+    _camera_open_last_result[_fb_key] = _oc.get("result") or (
+        "opened" if cap is not None else "unknown")
+    return cap
 
 
 def _resolve_webcam_indices_by_name() -> dict[str, int]:
@@ -6273,6 +6810,17 @@ def _open_tile_capture(idx: int, name: "str | None" = None) -> "cv2.VideoCapture
     here (measured, 25 cycles, fresh process); MSMF cost -0.21 and +0.97."""
     if _camera_is_quarantined(idx):
         return None
+    # THE CAMERA GATE (2026-09-29). The tile only ever opens a camera the
+    # producer has LET GO of - which is precisely a camera in its backoff, its
+    # lock wait, or a storm cool-down. Without this the tile re-opened such a
+    # device on its own clock (every tile read interval after a failed read),
+    # which made it one of the independent retry loops behind the storm.
+    _gkey = _camera_gate_key(index=idx, name=name)
+    _gd = camera_gate_begin(_gkey, "side-tile")
+    if _gd is not None and not _gd.allowed:
+        _note_camera_gate_refusal(f"side tile index {idx}", _gkey,
+                                  "side-tile", _gd)
+        return None
 
     def _do_open():
         with _camera_io_lock:
@@ -6291,11 +6839,19 @@ def _open_tile_capture(idx: int, name: "str | None" = None) -> "cv2.VideoCapture
                 return None
             return cap
 
+    _got = None
     try:
-        return _open_capture_bounded(idx, _do_open, label=f"side tile index {idx}")
+        _got = _open_capture_bounded(idx, _do_open, label=f"side tile index {idx}",
+                                     gate_key=_gkey)
+        return _got
     except Exception:
         logging.exception("[face-track] _open_tile_capture failed for index %s", idx)
         return None
+    finally:
+        if _gd is not None:
+            camera_gate_end(_gkey, "side-tile", _got is not None,
+                            lockers=(None if _got is not None
+                                     else _camera_lockers_if_held(_gkey)))
 
 
 # ── FAST PATH: reuse the face-track loop's frames, never re-open the device ──
@@ -6424,6 +6980,32 @@ def _producer_holds_side(slot: str) -> bool:
     return False
 
 
+def _producer_first_open_pending(slot: str) -> bool:
+    """True iff the face-track producer has a camera for side-tile ``slot``
+    whose FIRST open it has not made yet (2026-09-29).
+
+    The camera gate defers first opens at boot (the stagger, the min-gap after
+    the boot probe), so for a few seconds the producer holds no handle on a
+    camera it is about to open - which _producer_holds_side reads as "let
+    go". A tile that opened the camera in that window would make the
+    producer's own open, moments later, the in-process SECOND handle measured
+    to wreck a stream (see _TILE_PRODUCER_OWNED_MAX_AGE). The tile waits for
+    the producer instead; if the producer never manages the open, the tile
+    would not have either. NEVER raises."""
+    try:
+        for entry in (_face_track_caps[0] or []):
+            if not isinstance(entry, dict):
+                continue
+            if not entry.get("never_opened") or entry.get("cap") is not None:
+                continue
+            cam = entry.get("cam")
+            if isinstance(cam, dict) and _percam_side(cam) == slot:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _face_track_frame_for_slot(slot: str, now: float,
                                max_age: "float | None" = None):
     """Return the face-tracking loop's freshest frame for side-tile ``slot``
@@ -6538,6 +7120,21 @@ def _read_side_tile_webcams(now: float) -> dict:
                     _side_tile_gate_counts["producer_owned"] += 1
                     _note_tile_open_declined(slot, now)
                 continue
+            # USB-STORM COOL-DOWN (2026-09-29): nothing may be opened, so do
+            # not even resolve the slot - the resolver is where the leaky
+            # DirectShow enumeration lives, and a bus that is resetting is
+            # exactly when its fingerprint keeps changing and forcing one.
+            if _camera_gate is not None and _camera_gate.storm_active():
+                cap = _kinect_tile_caps.get(slot)
+                if cap is None:
+                    _kinect_tile_frames[slot] = None
+                    continue
+            # The producer is about to make this camera's FIRST open (the
+            # gate deferred it): do not take the device out from under it.
+            if (_kinect_tile_caps.get(slot) is None
+                    and _producer_first_open_pending(slot)):
+                _kinect_tile_frames[slot] = None
+                continue
             if name_idx is None:
                 name_idx = _resolve_webcam_indices_by_name()
             idx = name_idx.get(slot)
@@ -6597,11 +7194,22 @@ def _read_side_tile_webcams(now: float) -> dict:
             if ret and frame is not None:
                 _kinect_tile_frames[slot] = frame
                 out[slot] = frame
+                if _camera_gate is not None:
+                    _camera_gate.note_frame(_camera_gate_key(
+                        index=idx, name=_kinect_preview_webcam_names().get(slot)))
             else:
                 # Read failed — release so the next tick re-opens; placeholder now.
                 _release_capture_guarded(cap, idx, f"side tile {slot}")
                 _kinect_tile_caps[slot] = None
                 _kinect_tile_frames[slot] = None
+                # A handle that proved a frame at open and now fails is a DROP
+                # to the camera gate: the tile's next open of this device is a
+                # recovery and spends a backoff rung, instead of re-opening it
+                # every _KINECT_PREVIEW_TILE_READ_INTERVAL forever.
+                _camera_gate_note_drop(
+                    _camera_gate_key(index=idx,
+                                     name=_kinect_preview_webcam_names().get(slot)),
+                    "side-tile")
                 # A failing read is the classic symptom of a bus re-enumeration
                 # that MOVED the device. Invalidate the name→index memo so the
                 # next tick re-resolves by NAME instead of re-opening whatever
@@ -6726,6 +7334,14 @@ def _kinect_preview_color_none_logged() -> None:
     while then stopped'). Logged so it's visible in the session log next time.
     NEVER raises."""
     try:
+        # The bridge has already said, ONCE, that the Kinect runtime service is
+        # stopped - every frame is None until someone starts it, so repeating
+        # that here (1,253 lines on 2026-09-29) says nothing new.
+        try:
+            if _kinect_bridge.service_down():
+                return
+        except Exception:
+            pass
         now = time.monotonic()
         if (now - _kinect_preview_color_none_log_last[0]
                 ) >= _KINECT_PREVIEW_SKIP_LOG_INTERVAL:
@@ -7287,22 +7903,35 @@ def _note_preview_failover(cam: dict, now: float) -> None:
         pass
 
 
-def _note_preview_starved(now: float) -> None:
+# "The HUD camera tile is going stale" gets its OWN throttle, per tile, at
+# five minutes (2026-09-29). It used to share _preview_failover_log with the
+# failover note, whose state key flips every time a substitute camera comes
+# and goes - and each flip reset the throttle, so a camera storm printed this
+# line 16 times in ~10 minutes, on top of the storm's own lines.
+_PREVIEW_STARVED_LOG_GAP_S = 300.0
+_preview_starved_log: dict = {"shared": 0.0}
+
+
+def _note_preview_starved(now: float, tile: str = "shared") -> None:
     """No camera produced a frame this iteration, so the shared HUD preview is
-    going stale. Say WHY rather than letting the tile just go dark. Throttled;
-    never raises."""
+    going stale. Say WHY rather than letting the tile just go dark. Throttled
+    to once per _PREVIEW_STARVED_LOG_GAP_S per tile; never raises."""
     try:
-        key = "starved"
-        if (key == _preview_failover_log[1]
-                and (now - _preview_failover_log[0]) < _PREVIEW_FAILOVER_LOG_GAP_S):
+        last = _preview_starved_log.get(tile, 0.0)
+        if last and (now - last) < _PREVIEW_STARVED_LOG_GAP_S:
             return
-        _preview_failover_log[0] = now
-        _preview_failover_log[1] = key
+        _preview_starved_log[tile] = now
         benched = [f"{e.get('label') or idx} (index {idx})"
                    for idx, e in get_camera_quarantine().items()
                    if e.get("quarantined")]
         why = (f"benched: {', '.join(benched)}" if benched
                else "no camera delivered a frame this iteration")
+        try:
+            if _camera_gate is not None and _camera_gate.storm_active():
+                why += ("; the USB-storm cool-down is holding every camera "
+                        "open (see the [usb-storm] line)")
+        except Exception:
+            pass
         msg = (f"  [face-track] the HUD camera tile is going stale - no camera "
                f"could publish a frame ({why}). This is JARVIS reporting a "
                f"camera problem, NOT the HUD failing.")
@@ -8063,6 +8692,14 @@ def _release_capture_guarded(cap, idx, label: str = "",
                 cap.release()
             except Exception:
                 logging.exception("[face-track] release raised for index %s", idx)
+            # CLOSES are logged too (2026-09-29): a hub reset landed during a
+            # teardown that day, and ordering a release against a reset needs
+            # the millisecond, not the second.
+            try:
+                print(f"  [camera] released {label or 'camera'} (index {idx})"
+                      f"{_cam_ms()}")
+            except Exception:
+                pass
             return True
     except Exception:
         logging.exception("[face-track] guarded release failed for index %s", idx)
@@ -8096,7 +8733,7 @@ def _release_capture_guarded(cap, idx, label: str = "",
 
 def _open_capture_bounded(idx, opener, label: str = "",
                           timeout: float | None = None,
-                          beat=None):
+                          beat=None, gate_key: "str | None" = None):
     """Run `opener()` - which MUST do its own ``with _camera_io_lock:`` - on a
     throwaway daemon worker and give up after `timeout` seconds.
 
@@ -8116,6 +8753,12 @@ def _open_capture_bounded(idx, opener, label: str = "",
 
     NEVER raises.
 
+    ``gate_key`` (2026-09-29): the camera gate's key for this device. When the
+    worker is abandoned while it OWNS the camera I/O lock (i.e. it is proven
+    stuck inside the driver), the gate is told, and it opens NOTHING else until
+    that worker returns - a hub reset landed during exactly such a stuck
+    open's teardown on 2026-09-29. The worker clears it when it finishes.
+
     CALL COUNT, HONESTLY (updated 2026-09-05): this wrapper itself performs no
     camera traffic at all - `opener` does, exactly once per invocation of this
     function. What `opener` costs changed when the openers moved to
@@ -8130,6 +8773,10 @@ def _open_capture_bounded(idx, opener, label: str = "",
     timeout = _CAMERA_OPEN_TIMEOUT_S if timeout is None else timeout
     box: dict = {"cap": None}
     abandoned = [False]
+    # Wedge bookkeeping shared by the joiner and the worker, so the token is
+    # registered only while the worker is still out, and always cleared.
+    wedge = {"token": None, "done": False}
+    wedge_lock = threading.Lock()
 
     def _run():
         cap = None
@@ -8138,6 +8785,11 @@ def _open_capture_bounded(idx, opener, label: str = "",
         except Exception:
             logging.exception("[face-track] bounded open raised for index %s", idx)
             cap = None
+        with wedge_lock:
+            wedge["done"] = True
+            _tok, wedge["token"] = wedge["token"], None
+        if _tok is not None and _camera_gate is not None:
+            _camera_gate.note_unwedged(_tok)
         if abandoned[0]:
             # Our joiner gave up long ago. Tear the handle down ourselves,
             # inside the lock, so the late success doesn't leak a device.
@@ -8236,10 +8888,16 @@ def _open_capture_bounded(idx, opener, label: str = "",
             msg = (f"  [face-track] {label or 'camera'} (index {idx}) did not "
                    f"finish opening within {timeout:.1f}s - DirectShow is wedged "
                    f"inside the open. Abandoning the attempt so the preview "
-                   f"producer keeps running for every other camera.")
+                   f"producer keeps running for every other camera."
+                   f"{_cam_ms()}")
             print(msg)
             logging.warning(msg.strip())
             _camera_note_sick_cycle(idx, label, f"open wedged >{timeout:.1f}s")
+            if gate_key and _camera_gate is not None:
+                with wedge_lock:
+                    if not wedge["done"]:
+                        wedge["token"] = _camera_gate.note_wedged(
+                            gate_key, str(label or "camera"))
         else:
             msg = (f"  [face-track] {label or 'camera'} (index {idx}) gave up "
                    f"after {timeout:.1f}s without EVER being shown to reach "
@@ -8334,8 +8992,50 @@ def _probe_camera_index(idx: int, timeout_sec: float = CAMERA_PROBE_TIMEOUT_SEC)
               f"a worker inside the camera driver and retires the camera I/O "
               f"lock. It re-tests itself when the bench expires.")
         return False
+    # THE CAMERA GATE (2026-09-29). Two things, both BEFORE the worker - a
+    # probe must never wait on the gate while it owns _camera_io_lock.
+    #   1. A verdict this probe proved moments ago is REUSED, not re-measured:
+    #      boot used to open every healthy camera twice inside one boot
+    #      (_preflight_cameras, then probe_cameras_and_update_config), and a
+    #      burst of boot opens is one of the patterns the hub resets followed.
+    #   2. Otherwise ask. Timing refusals (the boot stagger, another
+    #      component's min-gap) are WAITED OUT, up to
+    #      _CAMERA_PROBE_GATE_PATIENCE_S; a hold (storm / backoff / lock)
+    #      means "NOT probed", said out loud, and the device is not touched.
+    _gkey = _camera_gate_key(index=idx)
+    if _camera_gate is not None:
+        _age = _camera_gate.recent_success(_gkey, "cam-probe",
+                                           _CAMERA_PROBE_VERDICT_REUSE_S)
+        if _age is not None:
+            print(f"  [cam-probe] index {idx}: proven working {_age:.0f}s ago "
+                  f"by the previous probe — not opened again")
+            return True
+    _gd = camera_gate_begin(_gkey, "cam-probe",
+                            wait_budget_s=_CAMERA_PROBE_GATE_PATIENCE_S)
+    if _gd is not None and not _gd.allowed:
+        print(f"  [cam-probe] index {idx}: NOT probed — the camera gate holds "
+              f"it ({_gd.reason}: {_gd.detail})")
+        return False
+    _gate_open = [_gd is not None]
+
+    def _gate_done(ok: bool, **kw) -> None:
+        # Exactly once per allowed begin(), on every exit path.
+        if _gate_open[0]:
+            _gate_open[0] = False
+            camera_gate_end(_gkey, "cam-probe", ok, **kw)
+
     result = {"ok": False}
     started = threading.Event()      # set the instant the worker OWNS the lock
+    _gave_up = [False]               # the caller stopped waiting for the lock
+    _wedge = {"token": None, "done": False}   # see _open_capture_bounded
+    _wedge_lock = threading.Lock()
+
+    def _worker_done() -> None:
+        with _wedge_lock:
+            _wedge["done"] = True
+            tok, _wedge["token"] = _wedge["token"], None
+        if tok is not None and _camera_gate is not None:
+            _camera_gate.note_unwedged(tok)
 
     def _open():
         # Hold the camera I/O lock across the whole open+release so an
@@ -8358,6 +9058,11 @@ def _probe_camera_index(idx: int, timeout_sec: float = CAMERA_PROBE_TIMEOUT_SEC)
             # and why the by-name rescue — a SERIAL re-probe — appeared to
             # "fix" them: it wasn't the name, it was finally getting the lock.
             started.set()
+            if _gave_up[0]:
+                # The caller stopped waiting for the lock and cancelled this
+                # probe's camera-gate reservation. Opening now would be an
+                # UNGATED open nobody is waiting for (2026-09-29).
+                return
             # ONE BUDGET FOR THE WHOLE WORKER, STAMPED HERE (2026-09-06).
             # The read loop below used to start ITS deadline after the open
             # returned, so the worker's real cost was open + (timeout_sec-0.2)
@@ -8419,6 +9124,7 @@ def _probe_camera_index(idx: int, timeout_sec: float = CAMERA_PROBE_TIMEOUT_SEC)
                 # was retired must not release outside the lock live threads
                 # use. See _release_on_current_camera_lock.
                 _release_on_current_camera_lock(cap)
+                _worker_done()
 
     t = threading.Thread(target=_open, daemon=True)
     t.start()
@@ -8431,6 +9137,11 @@ def _probe_camera_index(idx: int, timeout_sec: float = CAMERA_PROBE_TIMEOUT_SEC)
     if not started.wait(timeout=lock_budget):
         print(f"  [cam-probe] index {idx}: still queued for the camera lock "
               f"after {lock_budget:.1f}s — treating as unavailable")
+        # Never reached the device: nothing to count, nothing to back off.
+        _gave_up[0] = True
+        if _gate_open[0]:
+            _gate_open[0] = False
+            camera_gate_cancel(_gkey, "cam-probe")
         return False
     # PHASE 2 — now the worker is doing real work; give it its full budget.
     # +0.5s over the worker's own read deadline so a worker that succeeds at
@@ -8488,8 +9199,57 @@ def _probe_camera_index(idx: int, timeout_sec: float = CAMERA_PROBE_TIMEOUT_SEC)
                 _lbl = ""
             _camera_note_sick_cycle(idx, _lbl,
                                     f"probe open wedged >{timeout_sec:.1f}s")
+            # ...and while it is stuck in the driver, nothing else opens.
+            if _camera_gate is not None:
+                with _wedge_lock:
+                    if not _wedge["done"]:
+                        _wedge["token"] = _camera_gate.note_wedged(
+                            _gkey, "cam-probe")
+        # A wedge is the one probe outcome that DOES earn a backoff rung: the
+        # device took a worker into the driver and did not give it back.
+        _gate_done(False, escalate=bool(retired))
         return False
+    # A clean failure counts toward the storm breaker but arms no backoff and
+    # no lock state: the boot probes are one-shot verdicts with their OWN
+    # bounded retry (the preflight retry pass and the by-name rescue), which a
+    # 30 s ladder - or a lock wait armed merely because a chat app was running
+    # - would silently cancel, dropping a camera that was only slow to wake.
+    _gate_done(bool(result["ok"]), escalate=False)
     return result["ok"]
+
+
+def _camera_boot_presence(idx) -> "bool | None":
+    """True when configured camera ``idx`` has a NAME and that name is on the
+    Media Foundation device list right now; None when that cannot be said
+    (unnamed entry, Kinect slot, MF unavailable, name not listed). Opens
+    nothing. (2026-09-29)
+
+    WHY THE BOOT PROBE NO LONGER STREAM-TESTS A LISTED CAMERA. A stream START
+    is what tripped the owner's hub resets (16 of 37 starts of one webcam reset
+    the hub within 6 s), and boot used to start every healthy camera twice -
+    the preflight probe, then the face tracker - ten seconds apart. The probe's
+    job is to keep a PHANTOM device out of CAMERAS; the device list answers
+    that without touching the camera, and the face tracker's one open is the
+    real test (its failures back off on the camera gate). A camera that is NOT
+    listed still gets the real probe, exactly as before. NEVER raises."""
+    try:
+        cam = next((c for c in CAMERAS if isinstance(c, dict)
+                    and c.get("index") == idx), None)
+        if cam is None:
+            return None
+        nm = str(cam.get("name") or "").strip().lower()
+        if not nm or cam.get("type") == "kinect" or _camera_backend is None:
+            return None
+        if _camera_backend.configured_backend() != "msmf":
+            return None
+        names = _camera_backend.msmf_device_names()
+        if not names:
+            return None
+        if any(nm in str(n or "").lower() for n in names):
+            return True
+    except Exception:
+        pass
+    return None
 
 
 def _camera_rescued_by_name(cam: dict, static_idx: int,
@@ -8593,8 +9353,18 @@ def find_camera_locking_processes() -> list[str]:
 # Now every scheduling decision goes through here, contention is re-evaluated on
 # EVERY attempt, and the number the caller logs is the number that was stored.
 # 2026-08-20 audit (stale-duplicate + honest-failure).
-CAMERA_REOPEN_BACKOFF_SEC     = 2.0    # normal "don't hammer reopen" spacing
-CAMERA_CONTENTION_BACKOFF_SEC = 30.0   # a known webcam-locking app holds it
+#
+# 2026-09-29: THE SPACING ITSELF NOW BELONGS TO THE CAMERA GATE. The flat 2 s
+# retry and the 30 s contention yield were two more private retry clocks -
+# and a hub-reset storm is exactly the case where 2 s is wrong: every failed
+# reopen landed on a bus that was still re-enumerating and reset it again,
+# about once a minute for half an hour (Kernel-PnP 1010 on the top hub of the
+# owner's chain, 2026-09-29 15:20-15:48). The gate's rules - 30 -> 60 -> 120
+# -> 300 -> 600 s after a failure, NO timer retries while a locking app holds
+# the device (it is polled instead), the USB-storm cool-down - are in
+# core/camera_gate.py. This function is still the ONE writer of
+# next_reopen_at; it now writes the gate's answer.
+CAMERA_REOPEN_BACKOFF_SEC     = 2.0    # floor: never re-ask faster than this
 # find_camera_locking_processes() walks every process, and the reopen path can
 # now ask up to once per backoff window per camera; a short shared TTL keeps
 # that off the face-track loop's critical path without ever serving an answer
@@ -8624,30 +9394,89 @@ def _schedule_camera_reopen(entry: dict, label: str, index,
                             ) -> tuple[float, list[str]]:
     """Arm this camera entry's next reopen attempt and say what was armed.
 
-    Returns ``(backoff_seconds, lockers)``. Callers MUST NOT write
+    Returns ``(seconds_until_next_ask, lockers)``. Callers MUST NOT write
     ``entry["next_reopen_at"]`` themselves - a second writer is exactly how the
     contention yield rotted. Both state transitions LOG once: entering the
-    widened backoff, and leaving it again.
+    locked state, and leaving it again.
+
+    THE NUMBER IS THE CAMERA GATE'S (2026-09-29). The failure itself is
+    recorded where it happened (_open_capture reports every open's outcome to
+    the gate); this asks the gate when this camera may next be ASKED about and
+    arms that. For a LOCKED camera that is the cheap poll interval, not an
+    open: each ask re-reads the cached locker list and the gate only lets an
+    open through once the locking app is gone, or LOCKED_RETRY_S has passed.
     """
     now = time.time() if now is None else now
+    cam = entry.get("cam") if isinstance(entry, dict) else None
+    key = (_camera_gate_key(cam) if isinstance(cam, dict)
+           else _camera_gate_key(index=index))
+    gate = _camera_gate
+    backoff, reason = 0.0, "ok"
+    locked_by: list = []
+    if gate is not None:
+        try:
+            backoff, reason = gate.retry_in(key, "face-track", now)
+            if reason == "locked":
+                locked_by = gate.locked_by(key)
+        except Exception:
+            backoff, reason = 0.0, "ok"
     if lockers is None:
-        lockers = _camera_lockers_cached(now)
-    if lockers:
-        backoff = CAMERA_CONTENTION_BACKOFF_SEC
+        lockers = locked_by
+    backoff = max(CAMERA_REOPEN_BACKOFF_SEC, float(backoff or 0.0))
+    if reason == "locked" and locked_by:
         if not entry.get("contention_logged"):
             entry["contention_logged"] = True
-            print(f"  [face-track] {label} (index {index}) appears LOCKED by "
-                  f"{', '.join(lockers)} — backing off reopen to "
-                  f"{backoff:.0f}s. Close {lockers[0]} to free the camera.")
-    else:
-        backoff = CAMERA_REOPEN_BACKOFF_SEC
-        if entry.get("contention_logged"):
-            # Degraded -> recovered must be LOGGED, not a silent speed-up.
-            entry["contention_logged"] = False
-            print(f"  [face-track] {label} (index {index}) no longer appears "
-                  f"locked — reopen backoff restored to {backoff:.0f}s.")
+            _poll = _camera_gate_mod.LOCKED_POLL_S if _camera_gate_mod else 5.0
+            _cap_s = _camera_gate_mod.LOCKED_RETRY_S if _camera_gate_mod else 600.0
+            print(f"  [face-track] {label} (index {index}) appears to be IN "
+                  f"USE by {', '.join(locked_by)} (Windows' camera privacy log "
+                  f"shows it using a webcam right now) — NOT retrying it on a "
+                  f"timer: JARVIS re-reads that log every {_poll:.0f}s and "
+                  f"reopens the camera once {locked_by[0]} stops using it "
+                  f"(every {_cap_s / 60.0:.0f} min at most otherwise)."
+                  f"{_cam_ms(now)}")
+    elif entry.get("contention_logged"):
+        # Degraded -> recovered must be LOGGED, not a silent speed-up.
+        entry["contention_logged"] = False
+        print(f"  [face-track] {label} (index {index}) is no longer in use "
+              f"by another app — next reopen attempt in {backoff:.0f}s "
+              f"({reason}).{_cam_ms(now)}")
     entry["next_reopen_at"] = now + backoff
     return backoff, list(lockers)
+
+
+def _face_track_wake_permitted(entry: dict, cam: dict, now: float) -> bool:
+    """May the producer's soft wake (release + REOPEN) run for this camera
+    right now? Called only once the wake thresholds are met. NEVER raises.
+
+    The first time an episode gets here it is a DROP: reported to the camera
+    gate (one input to the USB-storm breaker) and held for
+    _CAMERA_DROP_SETTLE_S, so that when a hub reset has taken several cameras
+    at once the breaker sees the second drop BEFORE the first camera reopens
+    into a bus that is still re-enumerating. After that the gate decides:
+    a storm cool-down, a backoff rung or a lock means no wake - the handle is
+    left alone and, if reads keep failing, the MAX_READ_FAILURES branch
+    releases it and the recovery path reopens it on the gate's schedule."""
+    try:
+        key = _camera_gate_key(cam)
+        if not entry.get("drop_noted"):
+            entry["drop_noted"] = True
+            _camera_gate_note_drop(key, "face-track")
+            entry["next_wake_at"] = max(float(entry.get("next_wake_at") or 0.0),
+                                        now + _CAMERA_DROP_SETTLE_S)
+            return False
+        gate = _camera_gate
+        if gate is None:
+            return True
+        d = gate.check(key, "face-track")
+        if d.allowed:
+            return True
+        entry["next_wake_at"] = now + max(3.0, min(float(d.wait_s), 30.0))
+        _note_camera_gate_refusal(str(cam.get("label") or key), key,
+                                  "face-track wake", d)
+        return False
+    except Exception:
+        return True
 
 
 def probe_cameras_and_update_config() -> tuple[list[int], list[int]]:
@@ -8670,6 +9499,12 @@ def probe_cameras_and_update_config() -> tuple[list[int], list[int]]:
         threads = []
         def _runner(i):
             try:
+                if _camera_boot_presence(i):
+                    print(f"  [cam-probe] index {i}: on the device list - kept "
+                          f"without a boot stream test (the face tracker's "
+                          f"open is the test)")
+                    results[i] = True
+                    return
                 results[i] = _probe_camera_index(i)
             except Exception:
                 logging.exception("[cam-probe] _runner failed for index %s", i)
@@ -8688,7 +9523,12 @@ def probe_cameras_and_update_config() -> tuple[list[int], list[int]]:
         # global deadline scaled by batch size so the batch honours the same
         # lock-queue reasoning PHASE-1 does, and wait for ALL runners (so a late
         # runner can't mutate `results` while the caller iterates it).
-        _deadline = time.monotonic() + (CAMERA_PROBE_TIMEOUT_SEC + 0.5) * max(1, len(indices))
+        # + _CAMERA_PROBE_GATE_PATIENCE_S: each probe may first WAIT OUT a
+        # camera-gate timing refusal (the boot stagger / another component's
+        # min-gap) before its worker starts - see _probe_camera_index.
+        _deadline = (time.monotonic()
+                     + (CAMERA_PROBE_TIMEOUT_SEC + 0.5) * max(1, len(indices))
+                     + _CAMERA_PROBE_GATE_PATIENCE_S)
         for t in threads:
             _remaining = _deadline - time.monotonic()
             if _remaining <= 0:
@@ -8738,11 +9578,19 @@ def probe_cameras_and_update_config() -> tuple[list[int], list[int]]:
     # Step 3: short-circuit — if a known webcam-locking app (Teams / Zoom /
     # OBS / Snap Camera) is running, don't bother sweeping. The cameras
     # aren't going to appear no matter how many indices we try.
-    suspects = find_camera_locking_processes()
+    # WHO HOLDS A WEBCAM comes from Windows' camera privacy log when it can be
+    # read (2026-09-29): "a camera app is RUNNING" blamed a meeting app and a
+    # chat app 23 times in one day for cameras that had in fact dropped off a
+    # resetting hub. The running-process list is only the fallback.
+    _users = camera_users_now()
+    suspects = _users if _users is not None else find_camera_locking_processes()
     if suspects:
         print(f"  [cam-probe] no configured cameras worked — and "
-              f"{', '.join(suspects)} is holding the webcam lock. "
-              f"Skipping fallback sweep.")
+              f"{', '.join(suspects)} "
+              + ("is using a webcam right now (Windows' camera privacy log)."
+                 if _users is not None else
+                 "is running and may be holding the webcam.")
+              + " Skipping fallback sweep.")
         print(f"  [cam-probe] close {suspects[0]} and restart, or run "
               f"`python bobert_companion.py --list-cameras`")
         return [], configured
@@ -9077,6 +9925,13 @@ def _face_track_release_all(caps) -> None:
 # The producer's live capture list, published so the supervisor's `finally` can
 # tear it down even when the body never returns normally.
 _face_track_caps: list = [None]
+# What the producer's LAST _open_capture() call decided: {"refused": Decision}
+# when the camera gate said "not now" (nothing was opened, nothing may be
+# counted as a failure), else {"refused": None}. Written and read only on the
+# producer thread. A module cell rather than a closure variable because the
+# tests run the shipped _open_capture code object standalone, which requires
+# it to have no free variables.
+_face_track_open_verdict: dict = {"refused": None}
 
 
 def _face_tracking_thread():
@@ -9199,6 +10054,26 @@ def _face_tracking_thread_body():
         # windows and be reported as a wedge. _open_capture is a closure inside
         # the producer body, so this only ever runs on the producer thread.
         _face_track_beat(f"opening camera index {idx}")
+        # THE CAMERA GATE (2026-09-29) is asked FIRST for a webcam - before the
+        # by-name DirectShow resolution below (whose enumeration is the leaky
+        # one), before any lock - so a refused open costs a dict lookup and
+        # touches no device and no enumerator. A Kinect slot is gated inside
+        # the bridge itself, under the same "kinect" key, so it is not asked
+        # twice here. _face_track_open_verdict tells the caller "the gate said
+        # not now" (nothing opened, nothing to count) from "the open failed".
+        _face_track_open_verdict["refused"] = None
+        _gkey = None if want_kinect else _camera_gate_key(
+            cam if isinstance(cam, dict) else None,
+            index=None if isinstance(cam, dict) else idx)
+        _gd = None
+        if _gkey is not None:
+            _gd = camera_gate_begin(_gkey, "face-track")
+            if _gd is not None and not _gd.allowed:
+                _face_track_open_verdict["refused"] = _gd
+                _note_camera_gate_refusal(
+                    str((cam.get("label") if isinstance(cam, dict) else None)
+                        or _gkey), _gkey, "face-track", _gd)
+                return None
         # NAME-BASED RESOLUTION (P0-1, the mic-shuffle bug class): if the entry
         # carries a "name", resolve the LIVE DirectShow index by that friendly-
         # name substring at OPEN time and PREFER it over the static "index". A USB
@@ -9230,6 +10105,18 @@ def _face_tracking_thread_body():
             except Exception as e:  # pragma: no cover - defensive: bridge import/open glitch
                 print(f"  [face-track] Kinect open failed ({e}); "
                       f"falling back to webcam index {idx}")
+            # The webcam FALLBACK is an open too. A {"type": "kinect"} slot
+            # falls back to an index that is the Kinect's own video interface,
+            # so it shares the Kinect's key (one physical device).
+            _gkey = ("kinect" if (isinstance(cam, dict)
+                                  and cam.get("type") == "kinect")
+                     else f"cfg:{idx}")
+            _gd = camera_gate_begin(_gkey, "face-track")
+            if _gd is not None and not _gd.allowed:
+                _face_track_open_verdict["refused"] = _gd
+                _note_camera_gate_refusal(f"index {idx}", _gkey,
+                                          "face-track", _gd)
+                return None
         # Serialize against probe-sweep / list-cameras / snapshot opens &
         # releases. Without this, an abandoned probe worker's eventual
         # release() can collide with this open or its failure-path
@@ -9264,9 +10151,20 @@ def _face_tracking_thread_body():
         # beat= is what lets _FACE_TRACK_STALL_WARN_S (30 s) legally sit BELOW
         # this 35 s cap - see _CAMERA_OPEN_BEAT_INTERVAL_S. Only the producer
         # thread may pass it, and this closure only ever runs there.
-        c = _open_capture_bounded(idx, _backend_open, label=_label,
-                                  timeout=_CAMERA_LOOP_OPEN_TIMEOUT_S,
-                                  beat=_face_track_beat)
+        c = None
+        try:
+            c = _open_capture_bounded(idx, _backend_open, label=_label,
+                                      timeout=_CAMERA_LOOP_OPEN_TIMEOUT_S,
+                                      beat=_face_track_beat,
+                                      gate_key=_gkey)
+        finally:
+            # Every allowed gate reservation is closed, on every path: the
+            # outcome feeds the per-device backoff, the lock state (a failure
+            # while a known locking app runs) and the USB-storm breaker.
+            if _gd is not None and _gd.allowed:
+                camera_gate_end(_gkey, "face-track", c is not None,
+                                lockers=(None if c is not None
+                                         else _camera_lockers_if_held(_gkey)))
         if c is not None:
             # ANNOUNCED HERE, BY THE JOINER, AND ONLY FOR A HANDLE THIS CALL
             # HANDS BACK TO THE LOOP. It used to be printed inside _dshow_open,
@@ -9282,7 +10180,7 @@ def _face_tracking_thread_body():
             # all come through _open_capture), which the one-shot 'Opened …'
             # line below does not, and still reads back the index we actually
             # opened so a name→index shuffle stays VISIBLE.
-            print(f"  [face-track] opened {_label} at index {idx}")
+            print(f"  [face-track] opened {_label} at index {idx}{_cam_ms()}")
         return c
 
     # Open all configured cameras at HD. Each entry is a mutable dict so
@@ -9294,18 +10192,41 @@ def _face_tracking_thread_body():
     _face_track_caps[0] = caps
     for cam in CAMERAS:
         c = _open_capture(cam)
+        entry = {"cam": cam, "cap": c, "fails": 0,
+                 "next_reopen_at": 0.0, "next_wake_at": 0.0,
+                 # P1-3 camera-contention yield: True once we've logged
+                 # the actionable "a locker holds this cam" hint for this
+                 # entry, so it stays one-time until the locker clears.
+                 "contention_logged": False,
+                 # True once this failure episode has been reported to the
+                 # camera gate as a DROP (cleared by the next real frame).
+                 "drop_noted": False}
+        caps.append(entry)
         if c is not None:
-            caps.append({"cam": cam, "cap": c, "fails": 0,
-                         "next_reopen_at": 0.0, "next_wake_at": 0.0,
-                         # P1-3 camera-contention yield: True once we've logged
-                         # the actionable "a locker holds this cam" hint for this
-                         # entry, so it stays one-time until the locker clears.
-                         "contention_logged": False})
             w = int(c.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(c.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            print(f"  [face-track] Opened {cam['label']} (index {cam['index']}) at {w}x{h}")
+            print(f"  [face-track] Opened {cam['label']} (index {cam['index']}) at {w}x{h}{_cam_ms()}")
+            continue
+        # NOT OPENED - AND NO LONGER DROPPED FOR THE SESSION (2026-09-29).
+        # This used to print "Could not open ... - skipping" and forget the
+        # camera until a restart, so a camera that failed its first open during
+        # a hub reset stayed dark all session. It now stays in `caps` with no
+        # handle and comes back through the recovery path below, on the camera
+        # gate's schedule: a boot STAGGER or min-gap refusal opens it a few
+        # seconds later; a real failure retries at 30 -> 60 -> 120 -> 300 ->
+        # 600 s; a USB-storm cool-down opens nothing until it ends.
+        refused = _face_track_open_verdict.get("refused")
+        entry["never_opened"] = True
+        wait, _lk = _schedule_camera_reopen(entry, cam["label"], cam["index"])
+        if refused is not None:
+            print(f"  [face-track] {cam['label']} (index {cam['index']}): first "
+                  f"open {'staggered' if refused.reason in ('stagger', 'min-gap', 'in-flight') else 'held'} "
+                  f"{wait:.0f}s by the camera gate - {refused.reason} "
+                  f"({refused.detail}){_cam_ms()}")
         else:
-            print(f"  [face-track] Could not open {cam['label']} (index {cam['index']}) — skipping")
+            print(f"  [face-track] Could not open {cam['label']} (index "
+                  f"{cam['index']}) - retrying on the camera gate's schedule "
+                  f"(next attempt in {wait:.0f}s){_cam_ms()}")
 
     if not caps:
         print(f"  [face-track] No cameras available. Try: --list-cameras")
@@ -9413,7 +10334,15 @@ def _face_tracking_thread_body():
                     entry["fails"] = 0
                     entry["next_reopen_at"] = 0.0
                     entry["contention_logged"] = False
-                    print(f"  [face-track] Reopened {cam['label']} (index {cam['index']}) after recovery")
+                    if entry.pop("never_opened", False):
+                        # A first open the camera gate DEFERRED (the boot
+                        # stagger, a min-gap after the boot probe, a failed
+                        # first attempt) - not a recovery, and it must not
+                        # read as one in a timeline.
+                        print(f"  [face-track] Opened {cam['label']} (index "
+                              f"{cam['index']}) - deferred first open{_cam_ms()}")
+                    else:
+                        print(f"  [face-track] Reopened {cam['label']} (index {cam['index']}) after recovery{_cam_ms()}")
                     c = new_c
 
                 _face_track_beat(f"read camera {cam['index']}")
@@ -9468,15 +10397,24 @@ def _face_tracking_thread_body():
                         gap_str = (f"{time_since_good:.1f}s since last frame"
                                    if time_since_good >= 0 else "no good frame yet")
                         print(f"  [face-track] {cam['label']} (index {cam['index']}) "
-                              f"read failure #{entry['fails']} — {gap_str}")
+                              f"read failure #{entry['fails']} — {gap_str}{_cam_ms()}")
                     # Try a soft wake before escalating to the full reopen.
                     # Gate on BOTH consecutive-fail count AND wall-clock silence
                     # so a transient USB power-save blip (resolves in ~1 s) is
                     # tolerated without churning the driver.
-                    if (entry["fails"] >= WAKE_AFTER
-                            and time_since_good >= WAKE_AFTER_SEC
-                            and now_loop >= entry["next_wake_at"]
-                            and entry["fails"] < MAX_READ_FAILURES):
+                    _wake_due = (entry["fails"] >= WAKE_AFTER
+                                 and time_since_good >= WAKE_AFTER_SEC
+                                 and now_loop >= entry["next_wake_at"]
+                                 and entry["fails"] < MAX_READ_FAILURES)
+                    # THE CAMERA GATE decides whether this wake may REOPEN the
+                    # device at all (2026-09-29): the first crossing of an
+                    # episode is reported as a DROP and held for a short
+                    # settle, so a hub reset that took several cameras trips
+                    # the USB-storm breaker before any of them reopens into it.
+                    if _wake_due:
+                        _wake_due = _face_track_wake_permitted(entry, cam,
+                                                               now_loop)
+                    if _wake_due:
                         with _camera_state_lock:
                             _camera_wake_attempts[cam["index"]] = (
                                 _camera_wake_attempts.get(cam["index"], 0) + 1)
@@ -9589,7 +10527,7 @@ def _face_tracking_thread_body():
                                 _camera_last_read_error.pop(cam["index"], None)
                                 _camera_last_read_error_at.pop(cam["index"], None)
                             print(f"  [face-track] {cam['label']} (index {cam['index']}) "
-                                  f"woke via release+reopen")
+                                  f"woke via release+reopen{_cam_ms()}")
                             # Use the wake's frame for this iteration so we
                             # don't waste a tick.
                             frame = woke_frame
@@ -9634,6 +10572,13 @@ def _face_tracking_thread_body():
                                 cam["index"], cam["label"],
                                 f"capture wedged after {entry['fails']} "
                                 f"failed reads", now_loop)
+                            # ...and a DROP to the camera gate, if the wake
+                            # path has not already reported this episode (the
+                            # wake is skipped when the gate holds the device).
+                            if not entry.get("drop_noted"):
+                                entry["drop_noted"] = True
+                                _camera_gate_note_drop(_camera_gate_key(cam),
+                                                       "face-track")
                             # LIVE CAMERA-CONTENTION YIELD (P1-3) — the decision
                             # (and the one-time "appears LOCKED by ..." hint) lives
                             # in _schedule_camera_reopen so the recovery and
@@ -9650,7 +10595,7 @@ def _face_tracking_thread_body():
                                     + (f" (locked by {', '.join(lockers)})" if lockers else ""))
                                 _camera_last_read_error_at[cam["index"]] = now_loop
                             print(f"  [face-track] {cam['label']} (index {cam['index']}) "
-                                  f"dead after {entry['fails']} failed reads; will reopen in {_backoff:.1f}s")
+                                  f"dead after {entry['fails']} failed reads; will reopen in {_backoff:.1f}s{_cam_ms()}")
                         # PREVIEW-KEEP-ALIVE FIX: a Kinect read MISS must NOT skip
                         # the skeleton preview write. The Kinect IS the primary
                         # "camera" on the owner's rig, so a transient color miss
@@ -9680,11 +10625,16 @@ def _face_tracking_thread_body():
                                     "[face-track] kinect preview write on read-miss failed")
                         continue
                 entry["fails"] = 0
+                entry["drop_noted"] = False
                 _note_camera_read_attempt(cam["index"], ok=True)
                 # A real frame is the only proof of health there is - the sick
                 # camera OPENED fine every 10 s and still delivered nothing, so
                 # nothing short of a frame may clear the strikes.
                 _camera_note_healthy(cam["index"], cam["label"])
+                # ...and the only thing that may reset the camera gate's reopen
+                # backoff, after HEALTHY_RESET_S of it without a break.
+                if _camera_gate is not None:
+                    _camera_gate.note_frame(_camera_gate_key(cam))
                 # Cache frame for see_user action regardless of face detection
                 with _camera_state_lock:
                     _camera_latest_frame[cam["index"]] = frame.copy()
@@ -11906,6 +12856,7 @@ def get_input_device() -> int | None:
         return idx
     except Exception as e:
         print(f"  [audio] cached mic index {idx} no longer queryable ({e}); using system default")
+        _usb_storm_note_audio_drop("input")
         _device_cache["in"] = None
         _device_cache["checked_at"] = 0.0
         return None
@@ -11921,6 +12872,7 @@ def get_output_device() -> int | None:
         return idx
     except Exception as e:
         print(f"  [audio] cached speaker index {idx} no longer queryable ({e}); using system default")
+        _usb_storm_note_audio_drop("output")
         _device_cache["out"] = None
         _device_cache["checked_at"] = 0.0
         return None
@@ -13709,6 +14661,7 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
             # distinct failure instead of per attempt. 2026-09-29.
             _note_input_open_failure("record_speech", _in_dev, e,
                                      then="retrying with the system default")
+            _usb_storm_note_audio_drop("input")
             _opened_dev = None
             _record_stream = sd.InputStream(
                 samplerate=SAMPLE_RATE, channels=1, dtype="float32",
@@ -19448,6 +20401,7 @@ def play_with_lipsync(audio: np.ndarray, sr: int):
             # -9999 / endpoint vanished mid-open: drop to the live system default.
             print(f"  [speak] playback open failed on device {out_dev} ({e}); "
                   f"retrying on system default")
+            _usb_storm_note_audio_drop("output")
             _device_cache["out"] = None
             _device_cache["checked_at"] = 0.0
             sd.play(audio, sr, device=None)
@@ -29198,6 +30152,11 @@ def _move_console_to_monitor(monitor_name: str):
 _HIGH_PERF_GUID = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
 # Captured at boot so shutdown can restore whatever the user had before.
 _prior_power_plan_guid: str | None = None
+# How a self-restart hands that plan to its successor (see
+# _activate_high_performance_plan and core/actions._act_restart).
+_PRIOR_POWER_PLAN_ENV = "JARVIS_PRIOR_POWER_PLAN"
+_POWER_GUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                            r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
 def _get_active_power_plan_guid() -> str | None:
@@ -29236,6 +30195,21 @@ def _activate_high_performance_plan() -> None:
             print("  [power] could not read active plan — skipping switch")
             return
         if prior.lower() == _HIGH_PERF_GUID.lower():
+            # A SELF-RESTART hands its predecessor's "prior" plan down
+            # (2026-09-29): the predecessor switched to High Performance, the
+            # restart path hard-exits without restoring (by design - see
+            # core/actions._act_restart), so without this the successor
+            # recorded High Performance as the owner's plan and never put the
+            # real one back. Verified live: a restart left the PC on High
+            # Performance.
+            inherited = (os.environ.get(_PRIOR_POWER_PLAN_ENV) or "").strip()
+            if (_POWER_GUID_RE.fullmatch(inherited)
+                    and inherited.lower() != _HIGH_PERF_GUID.lower()):
+                _prior_power_plan_guid = inherited
+                print(f"  [power] already on High Performance (set by the "
+                      f"previous JARVIS) — will restore {inherited[:8]}… on "
+                      f"shutdown")
+                return
             print("  [power] already on High Performance")
             _prior_power_plan_guid = prior
             return
@@ -29474,6 +30448,12 @@ def _preflight_cameras(timeout_sec: float = 2.0) -> None:
 
     def _check(i: int):
         try:
+            if _camera_boot_presence(i):
+                print(f"  [preflight] camera index {i}: on the device list - "
+                      f"kept without a boot stream test (the face tracker's "
+                      f"open is the test)")
+                results[i] = True
+                return
             results[i] = _probe_camera_index(i, timeout_sec=timeout_sec)
         except Exception as e:
             print(f"  [preflight] camera index {i}: probe raised "
@@ -29488,8 +30468,12 @@ def _preflight_cameras(timeout_sec: float = 2.0) -> None:
         t = threading.Thread(target=_check, args=(idx,), daemon=True)
         t.start()
         threads.append(t)
+    # + the camera gate's probe patience: a probe may wait out the boot
+    # stagger (the cameras and the Kinect are opened a few seconds apart)
+    # before its worker even starts. One shared deadline, like _probe_many.
+    _pf_deadline = time.monotonic() + timeout_sec + 0.5 + _CAMERA_PROBE_GATE_PATIENCE_S
     for t in threads:
-        t.join(timeout=timeout_sec + 0.5)
+        t.join(timeout=max(0.0, _pf_deadline - time.monotonic()))
 
     # RETRY PASS — a camera can fail the first quick probe not because it is
     # absent but because a bandwidth-heavy neighbour transiently starved it: at
@@ -29524,8 +30508,10 @@ def _preflight_cameras(timeout_sec: float = 2.0) -> None:
             rt = threading.Thread(target=_recheck, args=(i,), daemon=True)
             rt.start()
             rthreads.append(rt)
+        _rt_deadline = (time.monotonic() + retry_timeout + 0.5
+                        + _CAMERA_PROBE_GATE_PATIENCE_S)
         for rt in rthreads:
-            rt.join(timeout=retry_timeout + 0.5)
+            rt.join(timeout=max(0.0, _rt_deadline - time.monotonic()))
 
     bad: list[int] = []
     for cam in list(CAMERAS):

@@ -134,7 +134,17 @@ class SharedPreviewKeepAliveTests(MonolithGlobalsTestCase):
         def _bounded(idx, opener, *args, **kwargs):
             return caps.get(idx)
 
+        # ONE ITERATION NEEDS BOTH CAMERAS OPEN IN IT (2026-09-29). The camera
+        # gate's boot stagger now opens the second camera a few seconds after
+        # the first, which one iteration can never reach - and the stagger is
+        # not what this file tests (it is pinned in
+        # test_monolith_camera_storm.py). Every other gate rule stays at its
+        # production value.
+        gate = bc._make_camera_gate()
+        gate.stagger_s = 0.0
+
         with mock.patch.object(bc, "CAMERAS", self.cams), \
+             mock.patch.object(bc, "_camera_gate", gate), \
              mock.patch.object(bc, "_face_track_stop", _OneShotStop()), \
              mock.patch.object(bc, "_dshow_name_to_index",
                                side_effect=lambda n: 2 if "emeet" in n else 0), \

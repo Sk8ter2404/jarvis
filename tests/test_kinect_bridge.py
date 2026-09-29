@@ -238,6 +238,28 @@ def _patch_loader(test, runtime):
 
 class _BridgeBase(unittest.TestCase):
     def setUp(self):
+        # No camera open gate in these tests (2026-09-29). Importing the
+        # monolith (any earlier monolith test in the same process) installs
+        # its process-wide gate here; these tests pin the bridge's OWN open
+        # path, and the gate's rules are pinned in tests/test_camera_gate.py
+        # and tests/monolith/test_monolith_camera_storm.py.
+        _saved_gate = kb._open_gate[0]
+        kb._open_gate[0] = None
+        kb._gate_hold_until[0] = 0.0
+
+        def _restore_gate():
+            kb._open_gate[0] = _saved_gate
+            kb._gate_hold_until[0] = 0.0
+        self.addCleanup(_restore_gate)
+        # ...and the runtime-SERVICE check reads THIS machine's Service Control
+        # Manager; these tests must not pass or fail on whether the box they
+        # run on has the Kinect runtime service started. Unknown = proceed.
+        _svc = mock.patch.object(kb, "_query_kinect_service_state",
+                                 return_value=None)
+        _svc.start()
+        self.addCleanup(_svc.stop)
+        kb._service_down[0] = False
+        kb._service_said[0] = False
         # Reset module singletons + flags so state never leaks across tests.
         self.addCleanup(self._reset)
         kb._runtime[0] = None

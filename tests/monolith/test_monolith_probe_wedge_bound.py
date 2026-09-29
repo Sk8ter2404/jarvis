@@ -209,7 +209,34 @@ class RealWedgeIsStillReportedTests(_ProbeWedgeTestBase):
 @requires_monolith
 class RetirementsAreBoundedByTheCodeTests(_ProbeWedgeTestBase):
     """Symptom 2 + 3, and the whole point: the count must stop because the
-    CODE stops it, not because the caller ran out of calls."""
+    CODE stops it, not because the caller ran out of calls.
+
+    TWO BOUNDS NOW (2026-09-29). The camera gate stands in front of this call
+    site: a wedge arms that device's reopen backoff, so the SECOND attempt is
+    refused before any worker starts (pinned by
+    test_with_the_camera_gate_the_first_wedge_is_the_last). The quarantine
+    these tests pin is the bound BEHIND it - for any attempt the gate does let
+    through once a backoff has elapsed - so they run with the gate removed, to
+    prove it still holds on its own."""
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(self.bc, "_camera_gate", None)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_with_the_camera_gate_the_first_wedge_is_the_last(self):
+        """With the production gate in place the count stops at ONE: the
+        wedge escalates the device's backoff, and every later probe inside it
+        is 'NOT probed' without a worker, a lock or a retirement."""
+        gate = self.bc._make_camera_gate()
+        self.assertIsNotNone(gate)
+        with mock.patch.object(self.bc, "_camera_gate", gate):
+            calls = self._hammer(self.bc._CAMERA_QUARANTINE_STRIKES * 4)
+        self.assertEqual(len(calls), 1,
+                         "the gate let a wedged index be opened again inside "
+                         "its backoff")
+        self.assertEqual(self.lock.retired_count(), 1)
 
     def _hammer(self, attempts: int, timeout: float = 0.3):
         opener, calls = self._never_returns()

@@ -260,6 +260,17 @@ _MONOLITH_RESTORE_NAMES = (
     # "declined N own-handle open(s)" line silently not print, so a test
     # asserting the line fails for a reason unrelated to its own code.
     "_tile_open_declined_note",
+    # ...and the camera-gate refusal-note throttle + the stale-tile throttle
+    # (2026-09-29). Same edge-triggered hazard as the decline note above.
+    "_camera_gate_refusal_noted", "_preview_starved_log",
+    "_face_track_open_verdict",
+    # ...and which devices have resolved to Media Foundation this process,
+    # which decides _camera_open's no-DirectShow-fallback rule, and how each
+    # device's last open ended (the gate's lock classification reads it).
+    "_camera_msmf_seen", "_camera_open_last_result",
+    # ...and the privacy-log "who is using a webcam" cache (a leaked entry
+    # would make the next test's lock decision depend on this one's).
+    "_camera_users_cache",
     # ...and the camera-OPEN path's slot of the same gate, which
     # _dshow_name_to_index() owns. Same hazard as the resolver's cells above and
     # then some: this one is consulted by _open_capture and by the boot rescue,
@@ -360,6 +371,7 @@ def _restore_monolith_pristine(bc) -> None:
             # Best-effort: a single stubborn slot must not abort the rest.
             pass
     _reset_filler_state(bc)
+    _reset_camera_gate(bc)
     try:
         bc._turn_timing.reset()
     except Exception:
@@ -376,6 +388,25 @@ def _restore_monolith_pristine(bc) -> None:
     # device announcements quiet (green or red for the wrong reason).
     try:
         bc._audio_flap.reset()
+    except Exception:
+        pass
+
+
+def _reset_camera_gate(bc) -> None:
+    """Give the NEXT test a camera gate with no history (2026-09-29).
+
+    The gate is one process-wide object (bc._camera_gate, also installed in
+    audio.kinect_bridge), and its whole job is to REMEMBER: a backoff rung, a
+    lock, a USB-storm cool-down, the last open for the min-gap and the boot
+    stagger. A test that fails an open would otherwise make every later test's
+    open of that device a refusal - pass or fail on execution order. The same
+    object is kept (only its state is cleared) so the bridge's reference stays
+    valid, and it keeps its PRODUCTION rule values: tests that need a different
+    rule build their own gate. Never raises."""
+    try:
+        gate = getattr(bc, "_camera_gate", None)
+        if gate is not None:
+            gate.reset()
     except Exception:
         pass
 
@@ -446,6 +477,10 @@ class MonolithGlobalsTestCase(unittest.TestCase):
         _saved_force = _cfg.AMBIENT_LEARNING_FORCE_LOCAL
         _cfg.MODEL_ROUTING = {"chat": "auto", "vision": "auto", "ambient": "auto"}
         _cfg.AMBIENT_LEARNING_FORCE_LOCAL = False
+        # Start clean too, not only end clean: anything that ran before the
+        # first monolith test (an import-time Kinect pump, a light-tier test)
+        # may have left history in the process-wide camera gate.
+        _reset_camera_gate(bc)
         try:
             return super().run(result)
         finally:

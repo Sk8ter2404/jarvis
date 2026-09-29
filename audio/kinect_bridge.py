@@ -142,6 +142,171 @@ def get_enabled() -> bool:
     return _ENABLED
 
 
+# ─── the process-wide camera open gate (core/camera_gate.py) ──────────────
+# The monolith builds ONE CameraGate and hands it here before set_enabled().
+# Every PyKinectRuntime() open asks it first, so the Kinect obeys the same
+# per-device backoff, boot stagger and USB-storm cool-down as the webcams:
+# the sensor sits behind the same chained hubs, and the stale-stream reopen
+# below (every BODY_STALE_RESET_SEC while both streams are quiet) was one of
+# the openers hammering them during the 2026-09-29 hub-reset storm.
+# None (the default, and every unit test of this module) means no gate: the
+# bridge behaves exactly as it did before the gate existed.
+_open_gate: list = [None]
+_GATE_KEY = "kinect"
+_GATE_COMPONENT = "kinect-bridge"
+# A refused open is remembered until the gate said to ask again, so the 30 Hz
+# pump does not re-ask every tick. Monotonic, like the negative cache.
+_gate_hold_until = [0.0]
+_GATE_ERR_PREFIX = "Kinect open held by the camera gate"
+# note_frame is a dict update, but the pump runs at 30 Hz; once a second is
+# plenty for a 60 s "sustained healthy" rule.
+_gate_frame_noted_at = [0.0]
+
+
+def _ms() -> str:
+    """" @HH:MM:SS.mmm" suffix for sensor open/reset lines (the session log
+    stamps whole seconds; ordering an open against a USB hub reset needs the
+    millisecond). NEVER raises."""
+    try:
+        t = time.time()
+        return (" @" + time.strftime("%H:%M:%S", time.localtime(t))
+                + ".%03d" % (int(t * 1000.0) % 1000))
+    except Exception:
+        return ""
+
+
+# ─── the Kinect runtime SERVICE (2026-09-29) ──────────────────────────────
+# The Kinect v2 runtime delivers frames through a Windows service,
+# "KinectMonitor". On the owner's desk it has been Stopped / Manual since
+# 2026-09-04, so every open "succeeded" into a runtime that never streamed and
+# the preview logged "color frame was None" 1,253 times in one day. The bridge
+# now asks the Service Control Manager (read-only: SC_MANAGER_CONNECT +
+# SERVICE_QUERY_STATUS) before opening; when the service is stopped it says so
+# ONCE and does not touch the sensor until the service runs again. It NEVER
+# starts the service itself - that is the owner's call (no watchdogs).
+_KINECT_SERVICE_NAME = "KinectMonitor"
+_SERVICE_RECHECK_S = 60.0
+_SERVICE_DOWN_PREFIX = "the Kinect runtime service"
+_service_down = [False]
+_service_said = [False]
+
+
+def _query_kinect_service_state() -> Optional[str]:
+    """'running' / 'stopped' / 'pending' / 'missing', or None when it cannot
+    be asked (not Windows, no advapi32, access error). Read-only. NEVER
+    raises."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        adv = ctypes.WinDLL("advapi32", use_last_error=True)
+    except Exception:
+        return None
+    try:
+        class _SS(ctypes.Structure):
+            _fields_ = [(n, wintypes.DWORD) for n in (
+                "type", "state", "controls", "exit", "svc_exit", "check",
+                "wait")]
+        adv.OpenSCManagerW.restype = ctypes.c_void_p
+        adv.OpenSCManagerW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p,
+                                       wintypes.DWORD]
+        adv.OpenServiceW.restype = ctypes.c_void_p
+        adv.OpenServiceW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                                     wintypes.DWORD]
+        adv.QueryServiceStatus.argtypes = [ctypes.c_void_p,
+                                           ctypes.POINTER(_SS)]
+        adv.CloseServiceHandle.argtypes = [ctypes.c_void_p]
+        scm = adv.OpenSCManagerW(None, None, 0x0001)        # CONNECT
+        if not scm:
+            return None
+        try:
+            svc = adv.OpenServiceW(scm, _KINECT_SERVICE_NAME, 0x0004)  # QUERY
+            if not svc:
+                return "missing" if ctypes.get_last_error() == 1060 else None
+            try:
+                st = _SS()
+                if not adv.QueryServiceStatus(svc, ctypes.byref(st)):
+                    return None
+                return {1: "stopped", 4: "running"}.get(int(st.state),
+                                                          "pending")
+            finally:
+                adv.CloseServiceHandle(svc)
+        finally:
+            adv.CloseServiceHandle(scm)
+    except Exception:
+        return None
+
+
+def service_down() -> bool:
+    """True while the bridge knows the Kinect runtime service is stopped (so
+    callers can stay quiet instead of logging every missing frame)."""
+    return bool(_service_down[0])
+
+
+def _service_blocks_open() -> Optional[str]:
+    """The error to return instead of opening, or None to go ahead. Logs the
+    stopped state ONCE, and its end once. NEVER raises."""
+    try:
+        state = _query_kinect_service_state()
+    except Exception:
+        state = None
+    if state == "stopped":
+        _service_down[0] = True
+        if not _service_said[0]:
+            _service_said[0] = True
+            print(f"  [kinect] {_SERVICE_DOWN_PREFIX} '{_KINECT_SERVICE_NAME}' "
+                  f"is STOPPED, so the sensor cannot deliver any frames. JARVIS "
+                  f"is not opening the Kinect and will not start the service "
+                  f"itself; it re-checks quietly every "
+                  f"{_SERVICE_RECHECK_S:.0f}s.{_ms()}")
+        return (f"{_SERVICE_DOWN_PREFIX} '{_KINECT_SERVICE_NAME}' is not "
+                f"running (Stopped) - no Kinect frames until it is started")
+    if _service_down[0]:
+        _service_down[0] = False
+        _service_said[0] = False
+        print(f"  [kinect] {_SERVICE_DOWN_PREFIX} '{_KINECT_SERVICE_NAME}' is "
+              f"{state or 'no longer reported stopped'} - opening the sensor "
+              f"again.{_ms()}")
+    return None
+
+
+def set_open_gate(gate) -> None:
+    """Install (or, with None, remove) the camera open gate. NEVER raises."""
+    _open_gate[0] = gate
+    _gate_hold_until[0] = 0.0
+
+
+def _gate_call(method: str, *args, **kwargs):
+    """Call ``method`` on the installed gate; None when there is no gate or it
+    raised. The gate never raises by contract - this is belt and braces."""
+    g = _open_gate[0]
+    if g is None:
+        return None
+    try:
+        return getattr(g, method)(*args, **kwargs)
+    except Exception:
+        return None
+
+
+def _gate_note_frame() -> None:
+    """Tell the gate the sensor is delivering (throttled to 1/s)."""
+    if _open_gate[0] is None:
+        return
+    now = time.monotonic()
+    if (now - _gate_frame_noted_at[0]) < 1.0:
+        return
+    _gate_frame_noted_at[0] = now
+    _gate_call("note_frame", _GATE_KEY)
+
+
+def _gate_held_error() -> Optional[str]:
+    """The remembered refusal while it still stands, else None."""
+    if _gate_hold_until[0] and time.monotonic() < _gate_hold_until[0]:
+        err = _open_error[0]
+        if err and err.startswith(_GATE_ERR_PREFIX):
+            return err
+    return None
+
+
 # ─── joint-name map (PyKinectV2.JointType_* indices → friendly names) ─────
 # Hard-coded so get_bodies() can return readable joint keys without importing
 # PyKinectV2 just to read its constants. Index order matches the SDK enum
@@ -431,6 +596,10 @@ def _publish_runtime(rt) -> Any:
         # held twice. Outside the lock — close() can block on a half-dead handle.
         _safe_close_runtime(rt)
     else:
+        # The bridge is now STREAMING the sensor: tell the camera gate, so no
+        # other in-process opener (the self-diagnostic's Media Foundation scan
+        # reaches the Kinect as MSMF index 0) takes a second handle on it.
+        _gate_call("hold", _GATE_KEY, _GATE_COMPONENT)
         # Fresh open → make sure the always-on body pump is running so the body pipe
         # is kept warm (it only flows while something reads it). start_body_pump is
         # singleton-guarded + no-ops when disabled, so this is safe to call here as
@@ -489,23 +658,46 @@ def _open_runtime_locked():
             return None, "pykinect2 not installed — pip install pykinect2"
         except Exception as e:   # pragma: no cover - patch-loader compile/exec failure
             return None, f"pykinect2 failed to load: {type(e).__name__}: {e}"
-        last = None
-        for _attempt in range(_OPEN_STREAM_RETRIES):
-            try:
-                rt = rt_mod.PyKinectRuntime(_frame_source_flags(pk2))
-            except Exception as e:
-                return None, f"could not open Kinect sensor: {type(e).__name__}: {e}"
-            if _runtime_streams(rt):
-                winner = _publish_runtime(rt)
-                if _attempt:
-                    print(f"  [kinect] sensor live after {_attempt + 1} open attempts")
-                return winner, None
-            last = "opened but no frames streaming"
-            _safe_close_runtime(rt)
-            time.sleep(_OPEN_STREAM_RETRY_SEC)
-        return None, (f"Kinect opened but streamed no frames after "
-                      f"{_OPEN_STREAM_RETRIES} attempts ({last}); sensor may be "
-                      f"held by another process")
+        # THE RUNTIME SERVICE: a stopped KinectMonitor means no frames can ever
+        # arrive, so do not open (and do not count a failure) - see
+        # _service_blocks_open. Said once; re-checked every _SERVICE_RECHECK_S.
+        _svc_err = _service_blocks_open()
+        if _svc_err:
+            return None, _svc_err
+        # THE CAMERA OPEN GATE, asked only now: past the cached-runtime fast
+        # path, past the enabled check, holding the open-attempt lock and with
+        # the SDK importable - i.e. only when a PyKinectRuntime() is really
+        # about to touch the sensor. A refusal is remembered until the gate's
+        # wait_s so the 30 Hz pump does not re-ask every tick.
+        if _open_gate[0] is not None:
+            d = _gate_call("begin", _GATE_KEY, _GATE_COMPONENT)
+            if d is not None and not d.allowed:
+                _gate_hold_until[0] = time.monotonic() + max(0.5, float(d.wait_s))
+                return None, (f"{_GATE_ERR_PREFIX} ({d.reason}: {d.detail}); "
+                              f"asking again in {max(0.5, float(d.wait_s)):.0f}s")
+        opened = False
+        try:
+            last = None
+            for _attempt in range(_OPEN_STREAM_RETRIES):
+                try:
+                    rt = rt_mod.PyKinectRuntime(_frame_source_flags(pk2))
+                except Exception as e:
+                    return None, f"could not open Kinect sensor: {type(e).__name__}: {e}"
+                if _runtime_streams(rt):
+                    winner = _publish_runtime(rt)
+                    opened = winner is not None
+                    if _attempt:
+                        print(f"  [kinect] sensor live after {_attempt + 1} open attempts{_ms()}")
+                    return winner, None
+                last = "opened but no frames streaming"
+                _safe_close_runtime(rt)
+                time.sleep(_OPEN_STREAM_RETRY_SEC)
+            return None, (f"Kinect opened but streamed no frames after "
+                          f"{_OPEN_STREAM_RETRIES} attempts ({last}); sensor may be "
+                          f"held by another process")
+        finally:
+            if _open_gate[0] is not None:
+                _gate_call("end", _GATE_KEY, _GATE_COMPONENT, opened)
     finally:
         _open_attempt_lock.release()
 
@@ -529,6 +721,9 @@ def get_runtime() -> tuple[Any, Optional[str]]:
     rt0 = _runtime[0]
     if rt0 is not None:
         return rt0, None
+    held = _gate_held_error()
+    if held:
+        return None, held
     now = time.monotonic()
     if now < _negative_until[0] and _open_error[0]:
         return None, _open_error[0]
@@ -555,6 +750,16 @@ def _publish_open_failure(err: str) -> None:
     _open_error[0] = err
     if "disabled" in err:
         return
+    if err.startswith(_GATE_ERR_PREFIX):
+        # The gate already said when to ask again (_gate_hold_until). Laying
+        # the 5 s negative cache over a 2 s stagger would only delay the
+        # sensor for no reason.
+        return
+    if err.startswith(_SERVICE_DOWN_PREFIX):
+        # The runtime service is stopped: nothing changes until someone starts
+        # it, so re-check at the service cadence, not every 5 s.
+        _negative_until[0] = time.monotonic() + _SERVICE_RECHECK_S
+        return
     cool = _WEDGED_CACHE_SEC if "no frames" in err else _NEGATIVE_CACHE_SEC
     _negative_until[0] = time.monotonic() + cool
 
@@ -571,6 +776,9 @@ def available() -> tuple[bool, str]:
         # runtime whose body stream silently quiesced with nothing reading it (H2).
         _ensure_pump_alive()
         return True, ""
+    held = _gate_held_error()
+    if held:
+        return False, held
     now = time.monotonic()
     if now < _negative_until[0] and _open_error[0]:
         return False, _open_error[0]
@@ -2138,6 +2346,7 @@ def note_body_frame_seen(now: Optional[float] = None) -> None:
     Called by get_bodies() on a real frame AND by the pump, so a healthy stream
     keeps the clock current and never trips the stale-reset."""
     _last_body_frame_at[0] = time.monotonic() if now is None else now
+    _gate_note_frame()
 
 
 def note_color_frame_seen(now: Optional[float] = None) -> None:
@@ -2146,6 +2355,7 @@ def note_color_frame_seen(now: Optional[float] = None) -> None:
     tick, so a healthy color stream keeps this current and the stale-reset can tell
     "body quiet but color live" (a body dropout) from "the whole runtime is dead"."""
     _last_color_frame_at[0] = time.monotonic() if now is None else now
+    _gate_note_frame()
 
 
 def _color_frame_is_stale(now: Optional[float] = None) -> bool:
@@ -2227,7 +2437,14 @@ def reset_if_body_stale(now: Optional[float] = None) -> bool:
         _last_depth_frame_at[0] = stamp
         print("  [kinect] body AND color streams stale > "
               f"{BODY_STALE_RESET_SEC:.0f}s - resetting runtime to reopen a live "
-              "stream")
+              f"stream{_ms()}")
+    # A sensor that WAS streaming just went quiet on both planes: that is a
+    # device DROP to the camera gate (one input to the USB-storm breaker), and
+    # the reopen the pump is about to try is a RECOVERY, which spends a backoff
+    # rung - so a sensor that keeps dying is reopened at 30/60/120/300/600 s,
+    # not every BODY_STALE_RESET_SEC. Outside _lock: the gate may log.
+    _gate_call("unhold", _GATE_KEY, _GATE_COMPONENT)
+    _gate_call("note_drop", _GATE_KEY, _GATE_COMPONENT)
     # We already nulled the cached cell under the lock; explicitly release the
     # old handle (outside the lock) so the sensor frees promptly before the next
     # get_runtime() reopens it. Same best-effort close idiom close() uses; older
@@ -2391,6 +2608,7 @@ def close(final: bool = False) -> None:
     if final:
         _ENABLED = False
     stop_body_pump()
+    _gate_call("unhold", _GATE_KEY, _GATE_COMPONENT)
     with _lock:
         rt = _runtime[0]
         _runtime[0] = None

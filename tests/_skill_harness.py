@@ -91,6 +91,26 @@ def no_background_threads():
         yield
 
 
+def _reset_process_camera_gate() -> None:
+    """Clear the monolith's process-wide camera open gate, if it is loaded.
+
+    Skills reach the gate through ``sys.modules['bobert_companion']`` (the
+    self-diagnostic's webcam scan and wake ask it before opening). Once any
+    monolith test has imported bobert_companion in this process, every later
+    skill test shares that one gate - and its whole job is to REMEMBER device
+    history (a backoff rung, the last open for the stagger), so a skill test
+    would pass or fail on what an earlier test happened to open. Each isolated
+    skill load starts from a gate with no history, like a fresh process.
+    Never raises; a no-op when the monolith is not loaded."""
+    try:
+        bc = sys.modules.get("bobert_companion")
+        gate = getattr(bc, "_camera_gate", None) if bc is not None else None
+        if gate is not None:
+            gate.reset()
+    except Exception:
+        pass
+
+
 def load_skill_isolated(name, *, utils=None, actions=None, register=True,
                         neuter_threads=True, capture_output=True,
                         skip_if_missing_dep=True):
@@ -106,6 +126,7 @@ def load_skill_isolated(name, *, utils=None, actions=None, register=True,
     path, search_locs = skill_path(name)
     utils = make_fake_skill_utils() if utils is None else utils
     actions = {} if actions is None else actions
+    _reset_process_camera_gate()
 
     spec = importlib.util.spec_from_file_location(
         f"skill_{name}", path, submodule_search_locations=search_locs)

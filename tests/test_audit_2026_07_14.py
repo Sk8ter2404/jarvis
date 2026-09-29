@@ -347,6 +347,15 @@ class CameraProbeBudgetTests(unittest.TestCase):
     def setUpClass(cls):
         cls.bc = load_monolith()
 
+    def setUp(self):
+        # The process-wide camera gate remembers device history (2026-09-29):
+        # without a reset, the sibling test's successful probe of index 7 is
+        # REUSED by the next probe of index 7 instead of opening it.
+        gate = getattr(self.bc, "_camera_gate", None)
+        if gate is not None:
+            gate.reset()
+            self.addCleanup(gate.reset)
+
     def test_queued_worker_is_not_charged_for_lock_wait(self):
         import threading
         import time as _t
@@ -438,8 +447,13 @@ class CameraProbeBudgetTests(unittest.TestCase):
                     "a camera-probe worker outlived the test while holding "
                     "_camera_io_lock — it will hit REAL DirectShow once the "
                     "patch unwinds")
-                # It DID run, against the mock, exactly once.
-                mcap.assert_called_once_with(7, bc.cv2.CAP_DSHOW)
+                # 2026-09-29: and it did NOT open anything. When it finally got
+                # the lock it saw that its caller had given up (and cancelled
+                # the probe's camera-gate reservation), so it left without
+                # touching the device - a late open nobody is waiting for is
+                # an UNGATED open. It used to run the open, against the mock,
+                # exactly once.
+                mcap.assert_not_called()
         finally:
             forever.set()
         # The lock must be free for every later camera test in the process.

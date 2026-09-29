@@ -30,6 +30,9 @@ _IMPORT_LIGHT_CORE = (
     "core.followup_window", "core.ollama_opts", "core.processing_filler",
     "core.owner_turn",
     "core.audio_flap",
+    # The camera open gate (2026-09-29): stdlib-only, imported at monolith
+    # import time before the Kinect bridge is enabled.
+    "core.camera_gate",
 )
 
 

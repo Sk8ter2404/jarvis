@@ -181,7 +181,14 @@ class SideTileAmplifierCounterTests(MonolithGlobalsTestCase):
 
         shim = _Cv2Shim(opens, _SickCap)
         buf = io.StringIO()
-        with mock.patch.object(bc, "_enumerate_dshow_input_devices", _enumerate), \
+        # WITHOUT THE CAMERA GATE (2026-09-29). The gate now bounds the sick
+        # tile's reopen loop to the first open plus one recovery per backoff
+        # rung (pinned in test_monolith_dshow_enum_leak.py), so with it in
+        # place the amplifier this file counts could fire only twice here.
+        # What is pinned below is the ACCOUNTING, which must stay honest for
+        # every failed read the gate does let through.
+        with mock.patch.object(bc, "_camera_gate", None), \
+             mock.patch.object(bc, "_enumerate_dshow_input_devices", _enumerate), \
              mock.patch.object(bc, "_video_device_fingerprint",
                                return_value=_fp()), \
              mock.patch.object(bc, "cv2", shim), \

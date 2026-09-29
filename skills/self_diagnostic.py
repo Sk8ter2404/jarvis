@@ -256,6 +256,9 @@ _UNVERIFIED_SHORT_CAUSES: dict[str, str] = {
     "mic_speaking":    "JARVIS was speaking at the time",
     "mic_disagree":    "the two microphone readings disagreed",
     "camera_busy":     "the face tracker had the camera",
+    # 2026-09-29: the camera open gate held the device (USB-storm cool-down,
+    # a reopen backoff, the Kinect bridge streaming it). Marker-free, spoken.
+    "camera_gate":     "JARVIS was giving the cameras a rest",
     "stt_busy":        "a transcription was already in flight",
     "host_not_loaded": "the host module was not loaded",
 }
@@ -502,6 +505,18 @@ def _camera_lock_suspects() -> list[str]:
     standalone unit tests). Returns [] when psutil is missing.
     """
     bc = _bc()
+    # Windows' camera privacy log first (2026-09-29): it says who is USING a
+    # webcam, where the running-process list only says who is RUNNING - and
+    # that blamed a meeting app and a chat app 23 of 23 times one day for
+    # cameras that had dropped off a resetting USB hub.
+    users_fn = getattr(bc, "camera_users_now", None) if bc else None
+    if callable(users_fn):
+        try:
+            users = users_fn()
+            if isinstance(users, list):
+                return users
+        except Exception:
+            pass
     finder = getattr(bc, "find_camera_locking_processes", None) if bc else None
     if callable(finder):
         try:
@@ -711,6 +726,71 @@ def _camera_backend_name() -> str:
         return "msmf"
 
 
+# ─── the monolith's camera open gate (core/camera_gate.py, 2026-09-29) ────
+# This probe is one of the in-process camera openers the gate coordinates:
+# during the 2026-09-29 hub-reset storm the scan below is exactly what runs
+# (no producer camera has a fresh frame, so it opens MSMF indices itself -
+# and MSMF index 0 is the Kinect). Every open here asks first and reports
+# back. With no monolith loaded (CI, a bare skill import) there is no gate and
+# nothing changes. The probe never WAITS on the gate: it asks while holding
+# _camera_io_lock, and waiting there would stall every other camera thread.
+_GATE_COMPONENT = "self-diag"
+
+
+def _camera_gate_key(idx, backend: str):
+    bc = _bc()
+    fn = getattr(bc, "camera_gate_key_for_scan", None) if bc else None
+    if not callable(fn):
+        return None
+    try:
+        return fn(idx, backend)
+    except Exception:
+        return None
+
+
+def _camera_gate_begin(key):
+    """The gate's Decision, or None when there is no gate. NEVER raises."""
+    if key is None:
+        return None
+    bc = _bc()
+    fn = getattr(bc, "camera_gate_begin", None) if bc else None
+    if not callable(fn):
+        return None
+    try:
+        return fn(key, _GATE_COMPONENT)
+    except Exception:
+        return None
+
+
+def _camera_gate_end(key, decision, ok: bool) -> None:
+    """Report an ALLOWED open's outcome. A diagnostic failure counts toward
+    the storm breaker but arms no backoff - one spot check every 30 minutes
+    must not bench a camera the producer is about to reopen. NEVER raises."""
+    if key is None or decision is None or not getattr(decision, "allowed", False):
+        return
+    bc = _bc()
+    fn = getattr(bc, "camera_gate_end", None) if bc else None
+    if not callable(fn):
+        return
+    try:
+        fn(key, _GATE_COMPONENT, bool(ok), escalate=False)
+    except Exception:
+        pass
+
+
+def _camera_gate_cancel(key, decision) -> None:
+    """Drop an allowed reservation that never reached the device."""
+    if key is None or decision is None or not getattr(decision, "allowed", False):
+        return
+    bc = _bc()
+    fn = getattr(bc, "camera_gate_cancel", None) if bc else None
+    if callable(fn):
+        try:
+            fn(key, _GATE_COMPONENT)
+        except Exception:
+            pass
+
+
 def _open_probe_capture(idx: int, backend: str,
                         require_frame: float = 0.0):
     """Open ``idx`` on ``backend``, or None. Never raises.
@@ -773,12 +853,25 @@ def _attempt_camera_wake(idx: int, timeout_s: float = 2.5,
     backend = backend or _camera_backend_name()
     box: dict[str, Any] = {"ok": False, "note": ""}
 
+    # THE CAMERA GATE (2026-09-29): a wake is a REOPEN. Asked on the caller's
+    # thread, before the worker, and never waited on.
+    gkey = _camera_gate_key(idx, backend)
+    gdec = _camera_gate_begin(gkey)
+    if gdec is not None and not gdec.allowed:
+        return False, (f"wake skipped — the camera gate holds this device "
+                       f"({gdec.reason}: {gdec.detail})")
+
     bc = _bc()
     io_lock = getattr(bc, "_camera_io_lock", None) if bc else None
+    # A wake worker abandoned INSIDE the driver is reported to the camera gate
+    # as a wedge (nothing else opens until it returns) and clears it itself.
+    wedge = {"token": None, "done": False, "in_driver": False}
+    wedge_lock = threading.Lock()
 
     def _do_wake():
         cap = None
         acquired = False
+        attempted = False
         try:
             if io_lock is not None:
                 # BOUNDED ACQUIRE (2026-07-14 audit). This was a plain
@@ -810,6 +903,8 @@ def _attempt_camera_wake(idx: int, timeout_s: float = 2.5,
                 # reads the device itself two lines down, and proving a frame
                 # inside the open as well would consume one to learn the same
                 # thing twice.)
+                attempted = True
+                wedge["in_driver"] = True
                 cap = _open_probe_capture(idx, backend)
                 if cap is None:
                     box["note"] = f"wake reopen failed — device refused open ({backend})"
@@ -839,6 +934,20 @@ def _attempt_camera_wake(idx: int, timeout_s: float = 2.5,
                     io_lock.release()
                 except Exception:
                     pass
+            if attempted:
+                _camera_gate_end(gkey, gdec, bool(box["ok"]))
+            else:
+                _camera_gate_cancel(gkey, gdec)
+            with wedge_lock:
+                wedge["done"] = True
+                tok, wedge["token"] = wedge["token"], None
+            if tok is not None:
+                _unwedge = getattr(bc, "camera_gate_note_unwedged", None) if bc else None
+                if callable(_unwedge):
+                    try:
+                        _unwedge(tok)
+                    except Exception:
+                        pass
 
     t = threading.Thread(target=_do_wake, name=f"diag-wake-{idx}", daemon=True)
     t.start()
@@ -848,6 +957,14 @@ def _attempt_camera_wake(idx: int, timeout_s: float = 2.5,
     # reporting the generic "timed out". 2026-07-14 audit.
     t.join(timeout=timeout_s + 0.5)
     if t.is_alive():
+        _wedged = getattr(bc, "camera_gate_note_wedged", None) if bc else None
+        if gkey is not None and callable(_wedged):
+            with wedge_lock:
+                if wedge["in_driver"] and not wedge["done"]:
+                    try:
+                        wedge["token"] = _wedged(gkey, _GATE_COMPONENT)
+                    except Exception:
+                        pass
         return False, f"wake attempt timed out after {timeout_s:.1f}s"
     return bool(box["ok"]), str(box["note"] or "unknown wake outcome")
 
@@ -1418,9 +1535,19 @@ def _probe_webcam_locked(start: float, hold: _CameraLockHold) -> dict:
     skip = set(owned["indices"])
     if skip:
         details["skipped_indices"] = sorted(skip)
+    gate_held: dict = {}
     for idx in (0, 1, 2):
         if idx in skip:
             continue                 # the producer is streaming this device
+        # ASK THE CAMERA GATE FIRST (2026-09-29). A refusal (USB-storm
+        # cool-down, the device's reopen backoff, the Kinect bridge streaming
+        # it, another component's min-gap) means this index is not opened.
+        gkey = _camera_gate_key(idx, cam_backend)
+        gdec = _camera_gate_begin(gkey)
+        if gdec is not None and not gdec.allowed:
+            gate_held[idx] = f"{gdec.reason}: {gdec.detail}"
+            continue
+        c = None
         try:
             c = _open_probe_capture(idx, cam_backend,
                                     require_frame=_CAMERA_PROBE_WARMUP_S)
@@ -1430,6 +1557,35 @@ def _probe_webcam_locked(start: float, hold: _CameraLockHold) -> dict:
                 break
         except Exception:
             continue
+        finally:
+            _camera_gate_end(gkey, gdec, c is not None)
+    if gate_held:
+        details["camera_gate_held"] = {str(k): v for k, v in gate_held.items()}
+        _bcm = _bc()
+        _status = getattr(_bcm, "get_camera_gate_status", None) if _bcm else None
+        if callable(_status):
+            try:
+                _st = _status() or {}
+                details["usb_storm_active"] = bool(_st.get("storm_active"))
+                if _st.get("storm_active"):
+                    details["usb_storm_reason"] = _st.get("storm_reason")
+            except Exception:
+                pass
+    if cap is None and gate_held:
+        # We did not look at every device - the gate told us not to touch
+        # some of them. That is not "no webcam found", and a repair task for
+        # a device we were forbidden to open would be a lie; UNVERIFIED keeps
+        # it out of the self-heal pipeline, exactly like the busy-lock case.
+        return _unverified(
+            (_now() - start) * 1000.0,
+            reason=("the camera gate held "
+                    + ", ".join(f"index {k} ({v})" for k, v in sorted(gate_held.items()))
+                    + ", so the probe did not open "
+                    + ("them" if len(gate_held) > 1 else "it")),
+            details=dict(details,
+                         skipped="camera gate refused the open"),
+            short_cause=_UNVERIFIED_SHORT_CAUSES["camera_gate"],
+            transient=True)
     if cap is None and skip:
         # Nothing left to open, because the only cameras that could have
         # answered are the ones the producer holds and none of them is

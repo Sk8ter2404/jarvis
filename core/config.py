@@ -781,6 +781,29 @@ CAMERA_PROBE_ENABLED      = True
 CAMERA_PROBE_MAX          = 12     # probe indices 0..MAX-1
 CAMERA_PROBE_TIMEOUT_SEC  = 3.0    # per-index hard timeout
 
+# THE CAMERA OPEN GATE (core/camera_gate.py, 2026-09-29). Every camera and
+# Kinect open in JARVIS asks one gate first. Measured live 2026-09-29: the
+# owner's chained USB hubs reset ~once a minute while JARVIS kept reopening
+# cameras after failures, and not once while nothing opened a camera or after
+# JARVIS stopped. All three are floats on purpose (an int default would make
+# _apply_user_settings truncate a saved 12.5 to 12). Apply on the next start.
+#
+# CAMERA_REOPEN_MAX_BACKOFF_S — ceiling of the per-camera retry ladder after a
+#   failed open or a read-failure recovery: 30 -> 60 -> 120 -> 300 -> 600 s.
+#   The ladder resets only after 60 s of uninterrupted healthy frames.
+#   0 disables the ladder (not recommended).
+CAMERA_REOPEN_MAX_BACKOFF_S = 600.0
+# USB_STORM_COOLDOWN_S — the circuit breaker. When >=2 cameras (or a camera and
+#   an audio device) drop within ~10 s, or >=3 camera opens fail across >=2
+#   devices within 60 s, JARVIS treats it as a USB bus event and opens NO
+#   camera and NO Kinect for this long (doubling on a repeat within the hour,
+#   capped at 60 min). Streams already running are left alone. 0 disables it.
+USB_STORM_COOLDOWN_S        = 600.0
+# CAMERA_OPEN_MIN_GAP_S — two different JARVIS components (face tracker, boot
+#   probe, self-diagnostic, side tiles, Kinect bridge) never open the same
+#   device less than this far apart. 0 disables the gap.
+CAMERA_OPEN_MIN_GAP_S       = 10.0
+
 # Processes that commonly hold exclusive locks on webcams. If the probe
 # finds zero cameras, we scan for these and surface them so the user
 # knows what to close.

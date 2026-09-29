@@ -1192,8 +1192,11 @@ class FaceTrackingThreadTests(_MonolithSec2Base):
             raise exc
 
     def test_no_cameras_returns_immediately(self):
-        # _open_capture returns None for every configured cam -> caps empty ->
-        # the thread prints "No cameras available" and returns without looping.
+        # _open_capture returns None for every configured cam. Since 2026-09-29
+        # that camera is NOT dropped for the session: it stays in the loop with
+        # no handle and is retried on the camera gate's schedule (a camera that
+        # failed its first open during a USB hub reset used to stay dark until
+        # a restart). With the stop event armed the loop still does not run.
         cv2 = mock.Mock()
         bad_cap = mock.Mock()
         bad_cap.isOpened.return_value = False
@@ -1208,14 +1211,25 @@ class FaceTrackingThreadTests(_MonolithSec2Base):
                 contextlib.redirect_stdout(buf):
             # Should return quickly with no surviving thread/loop.
             self._run_face_tracking_bounded()
-        # PROVE the early-return branch actually ran. Asserting only "it
+        # PROVE the failed-open branch actually ran. Asserting only "it
         # returned" was what let the balloon hide: with the stop event armed the
         # thread ALSO returns quickly after opening a real camera, so the branch
         # itself has to be observed.
-        self.assertIn("No cameras available", buf.getvalue())
+        self.assertIn("Could not open X (index 0) - retrying on the camera "
+                      "gate's schedule", buf.getvalue())
+        self.assertNotIn("No cameras available", buf.getvalue())
         # ...and the mocked webcam is what was tried, not the Kinect.
         cv2.VideoCapture.assert_called_once_with(0, 700)
         self.assertEqual(self.bc._kinect_bridge.capture_requests, 0)
+
+    def test_an_empty_camera_list_still_returns_immediately(self):
+        # Nothing configured at all is the one case that still returns at once.
+        self.bc._face_track_stop.set()
+        buf = io.StringIO()
+        with mock.patch.object(self.bc, "CAMERAS", []), \
+                contextlib.redirect_stdout(buf):
+            self._run_face_tracking_bounded()
+        self.assertIn("No cameras available", buf.getvalue())
 
     def test_kinect_as_camera_cannot_hijack_a_named_camera(self):
         # REGRESSION GUARD for the 144 GB balloon. With KINECT_AS_CAMERA ON, a

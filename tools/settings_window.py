@@ -831,6 +831,31 @@ SCHEMA: dict[str, dict] = {
         "default": True,
         "help": "Allow launching apps, opening URLs, etc.",
     },
+    # ── Camera open gate (core/camera_gate.py, 2026-09-29) ──────────────
+    "CAMERA_REOPEN_MAX_BACKOFF_S": {
+        "tab": "advanced", "label": "Camera retry ceiling (seconds)",
+        "type": "float", "default": 600.0,
+        "help": "After a camera fails to open or keeps dropping frames, JARVIS "
+                "waits 30, 60, 120, 300, then this many seconds between "
+                "retries, and only resets after a minute of healthy video. "
+                "Applies on the next start.",
+    },
+    "USB_STORM_COOLDOWN_S": {
+        "tab": "advanced", "label": "USB trouble: leave cameras alone for (seconds)",
+        "type": "float", "default": 600.0,
+        "help": "When several cameras (or a camera and an audio device) drop "
+                "at once, JARVIS stops opening every camera and the Kinect for "
+                "this long, doubling if it happens again within the hour (max "
+                "an hour). Running streams are left alone. 0 = off. Applies on "
+                "the next start.",
+    },
+    "CAMERA_OPEN_MIN_GAP_S": {
+        "tab": "advanced", "label": "Gap between two parts opening one camera (seconds)",
+        "type": "float", "default": 10.0,
+        "help": "The face tracker, start-up checks, self-diagnostic, preview "
+                "tiles and Kinect never open the same device closer together "
+                "than this. 0 = off. Applies on the next start.",
+    },
     # ── Live web interface (tools/web_interface.py) ─────────────────────
     # A local-LAN dashboard to watch JARVIS and type commands to him. The
     # typed command runs through the SAME inject channel as a spoken one, so
