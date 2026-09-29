@@ -307,10 +307,19 @@ class BambuCameraGrabberTests(unittest.TestCase):
     def test_start_is_idempotent_and_stoppable(self):
         # Patch the poll loop to a no-op so no real network/cv2 is touched;
         # we're only asserting the thread lifecycle + idempotency here.
+        # The two config readers are patched on the module itself: they
+        # re-import sys.modules["bobert_companion"] on EVERY call, and in a full
+        # coverage run a thread leaked by another test can swap that entry
+        # between the two start_grabber() calls, so the second one saw "not
+        # configured" and returned False (CI flake at the second assert, v2.0.108).
+        # Config resolution is covered by the tests above.
         with _fake_bobert(HUD_BAMBU_CAMERA=True,
                           BAMBU_PRINTER_IP="192.0.2.1",
                           BAMBU_ACCESS_CODE="12345678",
                           BAMBU_SERIAL="0309ABC"), \
+             mock.patch.object(self.mod, "_camera_enabled", return_value=True), \
+             mock.patch.object(self.mod, "_read_config",
+                               return_value=("192.0.2.1", "12345678", "0309ABC")), \
              mock.patch.object(self.mod, "_poll_loop",
                                side_effect=lambda evt: evt.wait()):
             self.assertTrue(self.mod.start_grabber())
