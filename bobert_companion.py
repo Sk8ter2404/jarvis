@@ -29550,6 +29550,11 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         except Exception as e:
             print(f"  [startup] cam-status speak failed: {e}")
 
+    # Processing filler: render its clips now, after the greeting, so the FIRST
+    # voice turn already gets "Processing, sir." (single-flight, yields
+    # _SPEAK_LOCK between lines, a no-op when the feature is off or suppressed).
+    _filler_warm_if_needed()
+
     # Suit-up cinematic: on the day's first warm-restart, play the
     # holographic boot sequence (arc-reactor spin-up + diagnostics readout +
     # 'Welcome back, sir. Systems are yours.') instead of the plain

@@ -59,10 +59,12 @@ __all__ = [
 #   * each line is at most 7 words, and short enough that its Kokoro render
 #     fits ClipCache's max_secs (a longer render is refused, so the line
 #     would simply never play).
+# Stage 1 is the "I heard you" line. The owner's own wording (2026-09-29): he
+# wants to hear "processing" or "thinking about that" right after he speaks.
 FIRST_LINES: tuple[str, ...] = (
-    "Just a moment, sir.",
-    "Allow me a moment, sir.",
-    "Looking into it now, sir.",
+    "Processing, sir.",
+    "Thinking about that, sir.",
+    "Let me think about that, sir.",
 )
 STILL_LINES: tuple[str, ...] = (
     "Still working on it, sir.",

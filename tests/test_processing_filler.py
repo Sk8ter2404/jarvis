@@ -849,3 +849,27 @@ class ModuleHygieneTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BootWarmTests(unittest.TestCase):
+    """The owner wants the "I heard you" line from the FIRST voice turn, so the
+    clips must be rendered at startup, not only after a turn (2026-09-29)."""
+
+    def test_main_warms_the_clips_after_the_greeting(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        src = open(os.path.join(root, "bobert_companion.py"), encoding="utf-8").read()
+        tree = ast.parse(src)
+        main = next(n for n in tree.body
+                    if isinstance(n, ast.FunctionDef) and n.name == "main")
+        calls = [n for n in ast.walk(main)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                 and n.func.id == "_filler_warm_if_needed"]
+        self.assertTrue(calls, "main() must call _filler_warm_if_needed() at boot")
+        greet = src.index('greeting = "J.A.R.V.I.S. online and ready."')
+        warm = src.index("_filler_warm_if_needed()", greet)
+        self.assertGreater(warm, greet)
+
+    def test_first_lines_carry_the_owners_wording(self):
+        joined = " ".join(pf.FIRST_LINES).lower()
+        self.assertIn("processing", joined)
+        self.assertIn("thinking about that", joined)
