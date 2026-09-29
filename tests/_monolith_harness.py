@@ -184,6 +184,11 @@ _MONOLITH_RESTORE_NAMES = (
     # _reset_filler_state. Tests that need filler state should still patch in
     # a FRESH ProcessingFiller / ClipCache rather than mutate these.
     "_processing_filler", "_filler_clips",
+    # Per-turn timing line (2026-09-29): rebind-restored, and its active turn
+    # dropped in _restore_monolith_pristine — a turn left open by a test that
+    # drove a capture would make a LATER test's dispatch print a stray
+    # [turn-timing] line into output it asserts on.
+    "_turn_timing",
     # H-6 (2026-08-20): the abandoned-native-close count. A leaked non-zero
     # value would make every later _refresh_devices test silently defer its
     # reinit — the exact "green for the wrong reason" shape.
@@ -328,6 +333,10 @@ def _restore_monolith_pristine(bc) -> None:
             # Best-effort: a single stubborn slot must not abort the rest.
             pass
     _reset_filler_state(bc)
+    try:
+        bc._turn_timing.reset()
+    except Exception:
+        pass
 
 
 def _reset_filler_state(bc) -> None:

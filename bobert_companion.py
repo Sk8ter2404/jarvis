@@ -11727,6 +11727,63 @@ def _prof_ollama(r):
     except Exception:
         return "unparsed"
 
+
+# ── PER-TURN TIMING LINE (2026-09-29, speed plan rank 1) ──────────────────
+# Always on, print-only: ONE "[turn-timing]" line per voice / injected turn
+# with millisecond offsets from the turn's t0 (the record_speech VAD break, or
+# the inject drain) plus the main local-LLM call's prompt_eval / eval counters,
+# and "pe=<count>/<ms> ev=<count> caller=<tag>" on every
+# "[local-llm] served via" line. The whole-second log stamps could not prove
+# any latency claim; this can. The JARVIS_PERF_PROBE TSV above is unchanged
+# and independent. Logic + contracts: core/turn_timing.py. Every call goes
+# through _tt() / _tt_stats() / _served_via_suffix(), which swallow any
+# fault, so timing can never raise into, or change, a turn.
+from core import turn_timing as _tt_mod  # noqa: E402
+
+_turn_timing = _tt_mod.TurnTiming()
+
+
+def _tt(op: str, *args, **kwargs):
+    """Call one _turn_timing method; swallow anything. Never raises."""
+    try:
+        return getattr(_turn_timing, op)(*args, **kwargs)
+    except Exception:
+        return None
+
+
+def _tt_stats(r):
+    """Ollama's counters from an /api/chat response for the timing lines;
+    None on any fault. Never raises."""
+    try:
+        return _tt_mod.response_stats(r)
+    except Exception:
+        return None
+
+
+def _served_via_suffix(stats) -> str:
+    """'pe=<count>/<ms> ev=<count> caller=<tag>' for a "[local-llm] served
+    via" line. Called ONLY from _call_local_llm's body, so frame 2 is whoever
+    asked for the call (a background _llm_quick names its own caller too).
+    Never raises."""
+    try:
+        caller = _tt_mod.caller_tag(sys._getframe(2))
+    except Exception:
+        caller = "?"
+    try:
+        return _tt_mod.served_via_suffix(stats, caller)
+    except Exception:
+        return "pe=?/? ev=?"
+
+
+def _tt_loop_top(injected_text) -> None:
+    """Top of each main-loop iteration: drop any turn that never reached an
+    emit (a filtered / gated utterance), and start an injected turn at the
+    drain. Voice turns start in _capture_utterance at the VAD break."""
+    _tt("discard")
+    if injected_text is not None:
+        _tt("begin", "inject")
+
+
 _last_recording_peak = 0.0   # set by record_speech, read by callers
 
 # ── SPECULATIVE TRANSCRIPTION (2026-09-06 latency work) ───────────────────
@@ -12916,6 +12973,7 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
                             peak_rms, len(chunks))
                     if silence_n >= silence_lim:
                         _prof("vad_break")
+                        _tt("note_vad_break")
                         break
                 elif timeout is not None and (time.time() - start_time) >= timeout:
                     if _debug_mode[0]:
@@ -14916,6 +14974,10 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
     # position — addresses the hallucinated-execution / verbose / moralising
     # replies the giant Claude prompt produced on a 14B model.
     sys_prompt = sys_prompt + _LOCAL_MODE_DIRECTIVE
+    # The last _generate's Ollama counters (prompt_eval / eval), for the
+    # served-via line below. All-None until a response arrives.
+    _gen_stats = [None]
+
     def _generate(model_tag: str) -> tuple[str | None, str]:
         """One /api/chat round-trip. Returns (text, kind):
           'ok'    → text is the non-empty reply
@@ -14961,17 +15023,28 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
         if _think is not None:
             payload["think"] = _think
         _prof("llm_post", f"sys={len(sys_prompt)}")
+        _tt("mark", "llm_post", owner_only=True)
+        r = None
         try:
             r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat", json=payload,
                               timeout=_LOCAL_GENERATE_TIMEOUT)
-            _prof("llm_resp", _prof_ollama(r))
+            if _PROF_ON:
+                _prof("llm_resp", _prof_ollama(r))
+            # Ollama's own counters for the served-via line and the turn's
+            # [turn-timing] line. Every response counts toward llm_calls; only
+            # one that ANSWERED (non-empty text) sets llm_done + the stats, so
+            # an HTTP error or an empty reply before a failover can't.
+            _gen_stats[0] = _tt_stats(r)
             if not r.ok:
                 print(f"  [local-llm] HTTP {r.status_code}: {r.text[:200]}")
+                _tt("llm_response", _gen_stats[0], served=False)
                 return (None, "fail")
             text = ((r.json().get("message") or {}).get("content") or "").strip()
             if not text:
+                _tt("llm_response", _gen_stats[0], served=False)
                 return (None, "empty")
             _text_wedge_note_ok()
+            _tt("llm_response", _gen_stats[0], served=True)
             return (text, "ok")
         except _RequestsTimeout as _e:
             # The runner accepted the POST but never produced a reply within the
@@ -14990,11 +15063,14 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
             return (None, "fail")
         except Exception as _e:
             print(f"  [local-llm] call failed: {_e}")
+            if r is not None:   # a response arrived but was unusable
+                _tt("llm_response", _gen_stats[0], served=False)
             return (None, "fail")
 
     text, kind = _generate(model)
     if kind == "ok":
-        print(f"  [local-llm] served via {model}")
+        print(f"  [local-llm] served via {model} "
+              f"{_served_via_suffix(_gen_stats[0])}")
         return text
     if kind == "empty":
         # 200-OK-but-EMPTY = the model ran but a broken quant / template
@@ -15014,7 +15090,8 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
                 # Sticky: pin the working model for the rest of the session so
                 # every later turn skips the broken one (no repeated empty+retry).
                 _RESOLVED_LOCAL_LLM_MODEL[0] = alt
-                print(f"  [local-llm] served via {alt} (failed over from {model})")
+                print(f"  [local-llm] served via {alt} (failed over from {model}) "
+                      f"{_served_via_suffix(_gen_stats[0])}")
                 return text2
             print(f"  [local-llm] failover model `{alt}` returned {kind2} too "
                   f"— treating local as unavailable")
@@ -16086,6 +16163,10 @@ class _SentenceFlushBuffer:
 
         t = threading.Thread(target=_run, name="stream-tts-flush", daemon=True)
         self._thread = t
+        # [turn-timing]: this sentence is part of the turn's answer, so its
+        # audio may be the turn's first_play. Adopted BEFORE start so the
+        # thread's first mark can't race it; a no-op off the turn's thread.
+        _tt("adopt", t)
         t.start()
 
     def join(self, timeout: float = 60.0) -> None:
@@ -16307,6 +16388,8 @@ def _call_llm(user_text: str) -> str:
     _last_stable_sys_prompt[0] = sys_prompt_now if _stable_split else ""
 
     _prof("prompt_end", f"sys={len(sys_prompt_now)} ctx={len(_turn_ctx)}")
+    _tt("set_first", "turn_ctx_chars", len(_turn_ctx))
+    _tt("set_first", "sys_chars", len(sys_prompt_now))
     if _chat_route == "local":
         # LOCAL-routed turn: local model is primary. On local failure, fall
         # back to Claude if reachable, else speak an HONEST unavailability line
@@ -26097,12 +26180,14 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
             # Set inside _SPEAK_LOCK, so it always describes THE utterance
             # currently owning the audio device; cleared in the finally.
             _tts_current_text[0] = (spoken_text or "").lower()
+            _tt("mark", "synth_start")
             audio_out, sr = synthesise(spoken_text)
             if volume_scale != 1.0:
                 try:
                     audio_out = (audio_out.astype(np.float32) * float(volume_scale)).astype(audio_out.dtype)
                 except Exception:
                     pass
+            _tt("mark", "first_play")   # first audio of the turn's answer
             play_with_lipsync(audio_out, sr)
             last_speech_time = time.time()
             set_state("idle")
@@ -26376,6 +26461,7 @@ def _filler_play(turn, stage: int) -> str:
         audio, sr = clip
         print(f"  [filler] stage {stage}: {text}")
         _prof("filler_play", f"stage={stage}")
+        _tt("note_filler")
         try:
             _tts_current_text[0] = text.lower()
             play_with_lipsync(audio, sr)
@@ -28187,6 +28273,9 @@ def _capture_utterance(injected_text, memory):
                     _do_proactive_turn(memory)
                 set_state("idle")
                 return None
+            # [turn-timing]: the realtime pipeline endpoints on its own
+            # thread, so t0 here is the hand-over, not a VAD break.
+            _tt("begin", "realtime")
             return _rt_cap
 
     _heartbeat()
@@ -28194,7 +28283,11 @@ def _capture_utterance(injected_text, memory):
     resume_face_tracking()
 
     # Wait for speech, but only briefly — so we can check proactive
+    _tt_rec_since = _tt("now")
     audio = record_speech(timeout=20)
+    if audio is not None:
+        # [turn-timing] t0 = this recording's VAD break (see _turn_timing).
+        _tt("begin_voice", _tt_rec_since)
 
     if audio is None:
         # First check if any timers/reminders fired and need speaking
@@ -28233,10 +28326,12 @@ def _capture_utterance(injected_text, memory):
 
     print("  Transcribing…")
     _prof("stt_start")
+    _tt("mark", "stt_start")
     # _transcribe_capture, not transcribe: when record_speech already ran a
     # speculative decode for this exact utterance inside the VAD hangover,
     # this collects it instead of paying for Whisper twice.
     text, conf = _transcribe_capture(audio)
+    _tt("mark", "stt_end")
     _prof("stt_end", text[:40].replace("\t", " "))
     return text, conf
 
@@ -28731,11 +28826,17 @@ def _run_llm_dispatch(text: str, *, voice: bool = False) -> str:
                 _pf_turn = _processing_filler.arm()
         except Exception:
             _pf_turn = None
+    _tt_outcome = "error"
     try:
-        return _run_llm_dispatch_body(text)
+        _reply = _run_llm_dispatch_body(text)
+        _tt_outcome = "ok"
+        return _reply
     finally:
         if voice:
             _filler_end_turn(_pf_turn)
+        # [turn-timing]: the turn's one line, partial when the body raised.
+        # A no-op when no turn is active or on another thread's dispatch.
+        _tt("emit", _tt_outcome)
 
 
 def _run_llm_dispatch_body(text: str) -> str:
@@ -28795,6 +28896,7 @@ def _run_llm_dispatch_body(text: str) -> str:
 
     # Execute any [ACTION: ...] tokens, get the cleaned text for TTS
     spoken_text, action_results = parse_and_run_actions(reply)
+    _tt("mark", "actions_done", owner_only=True)
     # Sentence-flush streaming TTS: the leading sentence(s) may already have
     # been voiced while the reply streamed (_call_llm's flush buffer). Strip
     # exactly that prefix so they aren't spoken twice; if the whole reply was
@@ -28917,6 +29019,7 @@ def _run_llm_dispatch_body(text: str) -> str:
         print(f"  Reading results (depth {depth+1})…")
         _heartbeat()   # follow-up LLM call can be slow on local — keep watchdog fresh
         set_state("thinking")
+        _tt("followup_round")
         followup = get_followup_response(informative)
         if not followup:
             break
@@ -29769,6 +29872,7 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 # branch on `_injected_text is not None` to skip record_speech
                 # + transcribe and synthesise safe pass-through metadata.
                 _injected_text = _drain_injected_command()
+                _tt_loop_top(_injected_text)   # [turn-timing] turn scope
 
                 # ── SLEEP / STANDBY MODE — only listen for the wake phrase ────────
                 if _sleep_mode[0]:
@@ -29843,6 +29947,7 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                     continue
 
                 print(f"  You:    {text}")
+                _tt("mark", "you")
                 # Rolling 5-line history feeds the holographic HUD v2
                 # scrolling transcript panel. Cap at 5 entries here so the
                 # JSON file stays small.
@@ -29944,6 +30049,7 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                     continue
 
                 if _run_voice_shortcuts(text):
+                    _tt("emit", "shortcut")
                     continue
 
                 reply = _run_llm_dispatch(text, voice=_injected_text is None)
@@ -29995,6 +30101,9 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 # continue so one malformed turn can no longer take the assistant
                 # permanently offline. KeyboardInterrupt is NOT an Exception, so
                 # Ctrl-C still falls through to the clean-shutdown handler below.
+                # [turn-timing]: a turn that died before its dispatch still
+                # gets its (partial) line; a no-op once the line printed.
+                _tt("emit", "error")
                 _recover_from_main_loop_error(_loop_exc)
                 continue
     except KeyboardInterrupt:
