@@ -173,6 +173,10 @@ _MONOLITH_RESTORE_NAMES = (
     "_device_cache", "_recent_spoken_messages", "_record_speech_taps",
     "_record_speech_active", "_pathb_mic_active", "_tts_playback_active",
     "_ambient_stream_active",
+    # What record_speech's stream really opened on (2026-09-29). A record left
+    # by a test that drove record_speech would make a later what_microphone
+    # test answer from THAT test's fake device instead of its own fixture.
+    "_live_capture_device",
     # PortAudio teardown-gate cells (2026-08-14): the diag/enroll owner
     # refcounts and the reinit latch. A leaked non-zero cell would make every
     # later _refresh_devices test silently defer its reinit; a leaked latch

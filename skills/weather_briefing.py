@@ -23,9 +23,15 @@ Public API (called by morning_briefing / evening_briefing):
       "" if nothing significant is incoming.
 
 Actions registered:
-  weather_briefing   — manual: returns a single short forecast sentence
-                       (umbrella alert if any, otherwise the "looks dry"
-                       confirmation).
+  weather_briefing   — manual: answers for the day that was ASKED ABOUT.
+                       No day (or "today"/"now"): current conditions plus
+                       any umbrella / two-hour alert. "tomorrow", "tonight",
+                       "this weekend", a weekday: that day's forecast (high /
+                       low, conditions, precipitation chance) from Open-Meteo's
+                       daily endpoint. The day comes from the action argument
+                       ([ACTION: weather_briefing, tomorrow]) or, when the
+                       model passed none, from the owner's own words for this
+                       turn (core.owner_turn) — see _resolve_when.
   weather_forecast   — alias of weather_briefing.
 
 Scheduler:
@@ -51,12 +57,13 @@ import importlib
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 _PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _STATE_FILE   = os.path.join(_PROJECT_DIR, "weather_briefing_state.json")
@@ -67,6 +74,7 @@ if _PROJECT_DIR not in sys.path:
     sys.path.insert(0, _PROJECT_DIR)
 
 from core.atomic_io import _atomic_write_json  # noqa: E402
+from core.owner_turn import current_owner_utterance  # noqa: E402
 
 _OPEN_METEO_URL     = "https://api.open-meteo.com/v1/forecast"
 _OPEN_METEO_TIMEOUT = 6.0
@@ -498,20 +506,254 @@ def _current_conditions_line() -> str:
     return f"Currently {temp_f} degrees, sir."
 
 
+# ─── which day was asked about ───────────────────────────────────────────
+# 2026-09-29, live: "what's the weather going to be like tomorrow" →
+# [ACTION: weather_briefing] → "Currently 87 degrees and clear, sir." The
+# handler ignored its argument and only ever knew how to describe NOW, so a
+# question about tomorrow got a confident answer about today. The day is now
+# read from the argument first and, when the model passed none, from the
+# owner's own words for this turn — so a bare token on a "tomorrow" question
+# still answers for tomorrow.
+
+_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday",
+             "friday", "saturday", "sunday")
+
+# Up to "next <weekday>" = 7 days out, i.e. 8 local days including today.
+_DAILY_FORECAST_DAYS = 8
+
+
+def _weekday_name(d: date) -> str:
+    # Not strftime('%A'): that is locale-dependent, and this is spoken English.
+    return _WEEKDAYS[d.weekday()].capitalize()
+
+
+def _resolve_when(text: str, today: date):
+    """Which day is `text` asking about?
+
+    Returns one of
+        ("now", None)                    today / now / currently: current conditions
+        ("tonight", None)                tonight / this evening / overnight
+        ("days", (label, [date, ...]))   tomorrow, the weekend, a weekday
+        None                             no day reference at all
+    The most specific phrase wins: 'the day after tomorrow' before 'tomorrow',
+    and 'tomorrow night' is tomorrow's forecast, not tonight's. A weekday that
+    IS today counts as today unless it says 'next'. Pure; never raises."""
+    t = " ".join((text or "").lower().split())
+    if not t:
+        return None
+    if re.search(r"\bday after tomorrow\b", t):
+        d = today + timedelta(days=2)
+        return ("days", (_weekday_name(d), [d]))
+    if re.search(r"\btomorrow\b", t):
+        return ("days", ("tomorrow", [today + timedelta(days=1)]))
+    if re.search(r"\b(?:tonight|this evening|overnight)\b", t):
+        return ("tonight", None)
+    if re.search(r"\bweekend\b", t):
+        wd = today.weekday()
+        if wd == 5:                                    # Saturday
+            dates = [today, today + timedelta(days=1)]
+        elif wd == 6:                                  # Sunday: what is left of it
+            dates = [today]
+        else:
+            sat = today + timedelta(days=5 - wd)
+            dates = [sat, sat + timedelta(days=1)]
+        return ("days", ("this weekend", dates))
+    for i, name in enumerate(_WEEKDAYS):
+        m = re.search(rf"\b(next\s+)?{name}\b", t)
+        if not m:
+            continue
+        delta = (i - today.weekday()) % 7
+        if delta == 0:
+            if not m.group(1):
+                return ("now", None)
+            delta = 7
+        d = today + timedelta(days=delta)
+        return ("days", (_weekday_name(d), [d]))
+    if re.search(r"\b(?:today|now|currently|at the moment)\b", t):
+        return ("now", None)
+    return None
+
+
+# ─── Open-Meteo daily fetch ──────────────────────────────────────────────
+
+def _fetch_daily_forecast(days: int = _DAILY_FORECAST_DAYS) -> dict:
+    """{local date: {date, hi_c, lo_c, precip_prob, weather_code, desc,
+    category}} for the next `days` days, or {} on any error. Same provider,
+    location plumbing and timeout as the hourly fetch; precip_prob is None when
+    Open-Meteo has no probability for that day (never invented as 0)."""
+    loc = _resolve_location()
+    if loc is None:
+        return {}
+    lat, lon = loc
+    qs = urllib.parse.urlencode({
+        "latitude":  f"{lat:.4f}",
+        "longitude": f"{lon:.4f}",
+        "daily":     ("weather_code,temperature_2m_max,temperature_2m_min,"
+                      "precipitation_probability_max"),
+        "forecast_days": str(days),
+        "timezone":  "auto",
+    })
+    req = urllib.request.Request(f"{_OPEN_METEO_URL}?{qs}",
+                                 headers={"User-Agent": "jarvis/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=_OPEN_METEO_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"  [weather] open-meteo daily fetch failed: {e}")
+        return {}
+    daily = (data.get("daily") if isinstance(data, dict) else None) or {}
+    if not isinstance(daily, dict):
+        return {}
+
+    def _at(key, i, cast):
+        vals = daily.get(key) or []
+        try:
+            v = vals[i]
+            return cast(v) if v is not None else None
+        except (IndexError, TypeError, ValueError):
+            return None
+
+    out = {}
+    for i, tstr in enumerate(daily.get("time") or []):
+        try:
+            d = date.fromisoformat(str(tstr)[:10])
+        except ValueError:
+            continue
+        code = _at("weather_code", i, int)
+        code = -1 if code is None else code
+        out[d] = {
+            "date":         d,
+            "hi_c":         _at("temperature_2m_max", i, float),
+            "lo_c":         _at("temperature_2m_min", i, float),
+            "precip_prob":  _at("precipitation_probability_max", i, int),
+            "weather_code": code,
+            "desc":         _WMO_DESCRIPTIONS.get(code, ""),
+            "category":     _weather_category(code),
+        }
+    return out
+
+
+def _f(temp_c: float) -> int:
+    """Celsius → whole Fahrenheit (sir's preference, as everywhere here)."""
+    return int(round(temp_c * 9 / 5 + 32))
+
+
+def _precip_word(category: str) -> str:
+    if category == "snow":
+        return "snow"
+    if category == "thunderstorm":
+        return "thunderstorms"
+    return "rain"
+
+
+def _day_phrase(day: dict | None) -> str:
+    """'partly cloudy, a high of 72 and a low of 55, with a 40% chance of rain'
+    — only the parts the forecast actually carries. '' when it carries none."""
+    if not day:
+        return ""
+    bits = []
+    if day.get("desc"):
+        bits.append(day["desc"])
+    hi, lo = day.get("hi_c"), day.get("lo_c")
+    if hi is not None and lo is not None:
+        bits.append(f"a high of {_f(hi)} and a low of {_f(lo)}")
+    elif hi is not None:
+        bits.append(f"a high of {_f(hi)}")
+    elif lo is not None:
+        bits.append(f"a low of {_f(lo)}")
+    if not bits:
+        return ""
+    prob = day.get("precip_prob")
+    if prob is not None:
+        bits.append(f"with a {prob}% chance of {_precip_word(day.get('category', ''))}")
+    return ", ".join(bits)
+
+
+def _days_line(label: str, dates: list) -> str:
+    """The spoken forecast for one or more whole days. Honest when the forecast
+    could not be fetched or does not reach that far — never falls back to
+    today's conditions, which is the answer to a different question."""
+    forecast = _fetch_daily_forecast()
+    parts = []
+    for d in dates:
+        phrase = _day_phrase(forecast.get(d))
+        if not phrase:
+            return f"I couldn't reach the forecast for {label}, sir."
+        parts.append((d, phrase))
+    head = label[:1].upper() + label[1:]
+    if len(parts) == 1:
+        return f"{head}, sir: {parts[0][1]}."
+    joined = "; ".join(f"{_weekday_name(d)}, {p}" for d, p in parts)
+    return f"{head}, sir — {joined}."
+
+
+# Worst-first, for naming tonight's conditions by the most significant hour.
+_SEVERITY = {"thunderstorm": 6, "snow": 5, "rain": 4, "fog": 3,
+             "overcast": 2, "cloudy": 1, "clear": 0}
+
+
+def _tonight_line() -> str:
+    """Tonight (18:00 → 06:00, or now → 06:00 in the small hours) from the
+    hourly forecast: the most significant conditions, the overnight low, and
+    the highest precipitation chance."""
+    now = datetime.now()
+    top = now.replace(minute=0, second=0, microsecond=0)
+    if now.hour >= 6:
+        start = max(top, now.replace(hour=18, minute=0, second=0, microsecond=0))
+        end = (now + timedelta(days=1)).replace(hour=6, minute=0, second=0,
+                                                microsecond=0)
+    else:
+        start = top
+        end = now.replace(hour=6, minute=0, second=0, microsecond=0)
+    window = [h for h in _fetch_hourly_forecast() if start <= h["dt"] < end]
+    if not window:
+        return "I couldn't reach tonight's forecast, sir."
+    worst = max(window, key=lambda h: (_SEVERITY.get(h.get("category"), -1),
+                                       h.get("precip_prob") or 0))
+    bits = [worst["desc"]] if worst.get("desc") else []
+    temps = [h["temp_c"] for h in window if h.get("temp_c") is not None]
+    if temps:
+        bits.append(f"down to a low of {_f(min(temps))}")
+    prob = max((h.get("precip_prob") or 0) for h in window)
+    bits.append(f"with a {prob}% chance of {_precip_word(worst.get('category', ''))}")
+    return f"Tonight, sir: {', '.join(bits)}."
+
+
+def _current_briefing() -> str:
+    """What 'what's the weather' has always answered: the ACTUAL current
+    conditions (temp + sky), then any notable upcoming change. Before
+    2026-06-04 this only reported a change and said "unremarkable" when calm —
+    never the real temp."""
+    current = _current_conditions_line()
+    alert = get_umbrella_alert("today") or get_two_hour_alert()
+    parts = [p for p in (current, alert) if p]
+    if parts:
+        return " ".join(parts)
+    return "Forecast looks unremarkable for the rest of the day, sir."
+
+
+def _when_for_this_turn(arg: str):
+    """The argument first (the model named the day), then the owner's own words
+    for this turn, then 'now'. The argument wins so a two-day question the
+    model split into two tokens ('today' and 'tomorrow') gets both answers."""
+    today = datetime.now().date()
+    return (_resolve_when(arg, today)
+            or _resolve_when(current_owner_utterance(), today)
+            or ("now", None))
+
+
 # ─── action registration ─────────────────────────────────────────────────
 
 def register(actions):
-    def weather_briefing(_: str = "") -> str:
+    def weather_briefing(arg: str = "") -> str:
         try:
-            # Lead with the ACTUAL current conditions (temp + sky), then append
-            # any notable upcoming change. Previously this only reported a
-            # change and said "unremarkable" when calm — never the real temp.
-            current = _current_conditions_line()
-            alert = get_umbrella_alert("today") or get_two_hour_alert()
-            parts = [p for p in (current, alert) if p]
-            if parts:
-                return " ".join(parts)
-            return "Forecast looks unremarkable for the rest of the day, sir."
+            kind, detail = _when_for_this_turn(arg)
+            if kind == "tonight":
+                return _tonight_line()
+            if kind == "days":
+                label, dates = detail
+                return _days_line(label, dates)
+            return _current_briefing()
         except Exception as e:
             return f"weather briefing failed: {e}"
 

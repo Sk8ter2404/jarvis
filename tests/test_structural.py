@@ -28,6 +28,7 @@ _IMPORT_LIGHT_CORE = (
     "core.speech_filter", "core.voice_emotion", "core.memory_guards",
     "core.legacy_memory", "core.stream_speech",
     "core.followup_window", "core.ollama_opts", "core.processing_filler",
+    "core.owner_turn",
 )
 
 

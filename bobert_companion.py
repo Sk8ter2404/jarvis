@@ -11187,6 +11187,97 @@ def get_current_mic_name() -> str:
         return f"[{idx}] (unknown)"
 
 
+def _note_live_capture(stream, requested) -> None:
+    """Record the device a just-started capture stream is reading. Never raises.
+
+    `stream.device` is sounddevice's RESOLVED index (device=None has already
+    become a concrete default index by then), so it names the endpoint the
+    stream really opened rather than the one that was requested. The name comes
+    from the same PortAudio enumeration the open used; whether Windows still
+    reports that endpoint present is the reader's question (skills/
+    audio_devices.py asks it), because PortAudio's list is frozen until a
+    re-enumeration and can still carry an unplugged device."""
+    try:
+        idx = getattr(stream, "device", None)
+        if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0:
+            idx = requested if (isinstance(requested, int)
+                                and not isinstance(requested, bool)
+                                and requested >= 0) else None
+        name = ""
+        if idx is not None:
+            try:
+                info = sd.query_devices(idx)
+                name = (info.get("name", "") if isinstance(info, dict) else "") or ""
+            except Exception:
+                name = ""
+        _live_capture_device[0] = {
+            "index": idx, "name": name, "requested": requested,
+            "via_default": requested is None, "at": time.time(),
+        }
+    except Exception:
+        pass
+
+
+def get_live_capture_device() -> dict | None:
+    """The device the voice-capture stream actually opened on, or None when no
+    capture stream has opened yet this session.
+
+    A COPY of the record _note_live_capture() published — {"index", "name",
+    "requested", "via_default", "at"} — plus "live": whether record_speech holds
+    the stream at this moment (between captures it is the last one opened,
+    which is also what the next capture will reopen unless the selection
+    changes). Pure read: no refresh, no PortAudio call, no re-enumeration —
+    unlike get_current_mic_name(), which force-refreshes and reports the
+    SELECTED device, i.e. what the next open would ASK for."""
+    rec = _live_capture_device[0]
+    if not isinstance(rec, dict):
+        return None
+    out = dict(rec)
+    out["live"] = bool(_record_speech_active[0])
+    return out
+
+
+def get_capture_endpoints() -> list | None:
+    """[(endpoint id, friendly name, state)] for every Windows RECORDING
+    endpoint — NotPresent / Unplugged / Disabled ones included, so a reader can
+    tell "unplugged" from "never existed" — or None when Windows cannot be
+    asked (no MMDevice API / comtypes, a non-Windows host, an enumeration
+    error). An EMPTY enumeration is also None: a box running a capture stream
+    has at least one recording endpoint, so [] means the query failed, never
+    "nothing is plugged in".
+
+    WHY: PortAudio's device list is frozen until a re-enumeration, and the
+    re-enumeration is deferred while any stream is live — so a device name out
+    of sd.query_devices() can belong to a microphone Windows already reports
+    NotPresent (2026-09-29, live). Windows' own endpoint state is the check.
+
+    Opens no device. COM is initialised for the calling thread through the
+    same per-thread, sticky-failure enumerator the default-endpoint poll uses,
+    and the rows come from audio/audio_switch.list_render(), the enumeration
+    the audio-autoswitch skill already relies on."""
+    if _win_endpoint_enumerator() is None:
+        return None
+    try:
+        import importlib
+        _as = importlib.import_module("audio.audio_switch")
+        prefix = getattr(_as, "CAPTURE_PREFIX", "{0.0.1.")
+        rows = [(i, n, s) for (i, n, s) in _as.list_render()
+                if isinstance(i, str) and i.startswith(prefix)]
+    except Exception:
+        return None
+    return rows or None
+
+
+def get_default_capture_name() -> str | None:
+    """Windows' CURRENT default recording endpoint, by friendly name, or None.
+    Live (MMDevice), not PortAudio's boot-time default. Never raises."""
+    try:
+        _render, capture = _win_default_endpoints()
+        return _win_endpoint_friendly_name(capture) if capture else None
+    except Exception:
+        return None
+
+
 def get_current_speaker_name() -> str:
     """Friendly name of whatever output device is currently selected.
 
@@ -12389,6 +12480,13 @@ def _safe_close_stream(stream, timeout_sec: float = 2.0) -> None:
 _record_speech_active = [False]          # True while record_speech holds the mic
 _tts_playback_active  = [False]          # True while play_with_lipsync owns the speakers + barge-in stream
 _record_speech_sr     = [SAMPLE_RATE]    # sample rate of the live stream
+# What record_speech's InputStream ACTUALLY opened on, published the moment it
+# starts: {"index", "name", "requested", "via_default", "at"} or None before the
+# first open. This — not _device_cache["in"], which is what the NEXT open would
+# ask for — is the answer to "what microphone are you using". 2026-09-29, live:
+# what_microphone named a configured mic that Windows reported NotPresent while
+# the capture was running on another device. Read via get_live_capture_device().
+_live_capture_device: list = [None]
 # True while a get_mic_buffer Path-B temporary InputStream is live. SEPARATE from
 # _record_speech_active (which record_speech owns exclusively) so Path B never has
 # to save+restore record_speech's flag — the old save+restore was a lost-update
@@ -12818,6 +12916,7 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
     while _pathb_mic_active[0] and time.time() < _pathb_wait_deadline:
         time.sleep(0.02)
     _record_stream = None
+    _opened_dev = _in_dev
     # Defense-in-depth against a stale cached mic index: even after
     # get_input_device() validates, the device can disappear between
     # that query and InputStream open. Catch PortAudioError and retry
@@ -12832,6 +12931,7 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
             print(f"  [record_speech] InputStream open failed on cached mic ({e}); retrying with system default")
             _device_cache["in"] = None
             _device_cache["checked_at"] = 0.0
+            _opened_dev = None
             _record_stream = sd.InputStream(
                 samplerate=SAMPLE_RATE, channels=1, dtype="float32",
                 blocksize=CHUNK, device=None,
@@ -12841,6 +12941,10 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
         # watchdog-driven exits and early returns. Start the stream and route
         # teardown through _safe_close_stream so close runs on a daemon thread.
         _record_stream.start()
+        # Publish what this stream REALLY opened on (after the retry, which can
+        # silently swap the cached mic for the system default) — the source of
+        # truth for "what microphone are you using".
+        _note_live_capture(_record_stream, _opened_dev)
     except Exception:
         # Open (incl. the system-default retry) or start() failed: we never
         # got a RUNNING stream, so drop the ownership flag we claimed above

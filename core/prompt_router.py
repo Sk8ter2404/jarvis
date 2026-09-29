@@ -254,6 +254,12 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "SESSION MEMORY RECALL": [
         "remember", "recall", "what did", "earlier", "last time", "before",
         "you said", "we talked", "memory", "forget", "note that", "keep in mind",
+        # 2026-09-29, live: "summarize what we talked about today" got a false
+        # "I can only recall specific past conversations" decline, and 'recap
+        # our conversation' / 'what have we discussed' loaded no recall section
+        # at all ("recap" alone reaches only DAILY RECAP, an app-usage summary).
+        # session_memory_recall summarises THIS session too — see its body.
+        "talked about", "discussed", "our conversation", "this conversation",
     ],
     "SESSION RESUME": [
         "resume", "continue", "where were we", "pick up", "carry on",
@@ -513,6 +519,9 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "WEATHER BRIEFING": [
         "weather", "forecast", "is it going to rain", "raining", "sunny",
         "snow", "how hot", "how cold", "umbrella", "outside today",
+        # 2026-09-29: the section's own future-day example ('will it rain
+        # tomorrow') loaded only EVENING / DAILY BRIEFING via "tomorrow".
+        "will it rain", "going to rain", "chance of rain",
     ],
     "PATTERN LEARNING": [
         "my patterns", "my habits", "learned about me", "my routine",

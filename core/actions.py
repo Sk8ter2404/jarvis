@@ -2197,6 +2197,105 @@ def _act_which_monitor(_: str = "") -> str:
 
 # ─── Session memory recall (Phase 4I) ──────────────────────────────────
 
+# "Summarise / recap what we talked about", "what have we discussed" — a request
+# about THIS conversation, which is in memory (conversation_history), not in the
+# prior-session index. 2026-09-29, live: "summarize what we talked about today"
+# got "I can only recall specific past conversations if you ask me about them
+# directly" — a false decline for a conversation JARVIS was holding.
+_CONVO_SUMMARY_RE = re.compile(
+    r"\b(?:summari[sz]e|summary|recap|sum\s+up|go\s+over|run\s+(?:me\s+)?through)\b"
+    r".{0,40}?\b(?:talk(?:ed|ing)?|discuss(?:ed|ing)?|conversation|chat(?:ted)?|"
+    r"said|covered)\b"
+    r"|\bwhat\s+(?:have|did)\s+we\s+(?:been\s+)?"
+    r"(?:talk(?:ed|ing)?\s+about|discuss(?:ed|ing)?|cover(?:ed)?)\b",
+    re.IGNORECASE)
+
+# A window BEFORE this session — those questions stay on the summary index.
+_PAST_WINDOW_RE = re.compile(
+    r"\b(?:yesterday|last\s+(?:night|week|time|session)|days?\s+ago|"
+    r"the\s+other\s+day|monday|tuesday|wednesday|thursday|friday|saturday|"
+    r"sunday|this\s+week|previous\s+session)\b",
+    re.IGNORECASE)
+
+_ACTION_TOKEN_RE = re.compile(r"\[\s*ACTION\s*:[^\]]*\]", re.IGNORECASE)
+
+
+def _conversation_summary_requested(*texts: str) -> bool:
+    """True when any of `texts` asks for a summary of the CURRENT
+    conversation — a summary request with no reference to an earlier window."""
+    joined = " ".join(t for t in texts if t)
+    return (bool(joined) and any(_CONVO_SUMMARY_RE.search(t) for t in texts if t)
+            and not _PAST_WINDOW_RE.search(joined))
+
+
+def _summarise_current_conversation(bc, texts: tuple) -> str:
+    """Summarise this session's conversation_history in JARVIS voice.
+
+    The request that produced this action is dropped from the transcript first
+    (its own user line and the assistant reply carrying the token), so "we just
+    started" is judged on what came BEFORE it. When he says "today" (or "this
+    morning", "earlier"), earlier session summaries from today are folded in,
+    because a restart empties conversation_history but not his day.
+
+    Same LLM path as every other recall here and as the in-session checkpoint
+    (bc._llm_quick — local-first per model_route('ambient')), which already
+    summarises this same transcript every 10 minutes; nothing new leaves the box."""
+    hist = getattr(bc, "conversation_history", None)
+    msgs = [m for m in (list(hist) if isinstance(hist, list) else [])
+            if isinstance(m, dict) and m.get("role") in ("user", "assistant")
+            and isinstance(m.get("content"), str) and m["content"].strip()]
+    if msgs and msgs[-1]["role"] == "assistant" \
+            and "session_memory_recall" in msgs[-1]["content"]:
+        msgs.pop()
+    if msgs and msgs[-1]["role"] == "user" and (
+            msgs[-1]["content"].strip() in texts
+            or _conversation_summary_requested(msgs[-1]["content"])):
+        msgs.pop()
+
+    earlier: list = []
+    if any(re.search(r"\b(?:today|this\s+(?:morning|afternoon)|earlier)\b",
+                     t or "", re.IGNORECASE) for t in texts):
+        try:
+            got = bc.pattern_memory.get_session_summaries("today", limit=8)
+            earlier = [s for s in got if isinstance(s, dict)
+                       and isinstance(s.get("summary"), str)
+                       and s["summary"].strip()] if isinstance(got, list) else []
+        except Exception:
+            earlier = []
+
+    if not any(m["role"] == "user" for m in msgs) and not earlier:
+        return ("We've only just started this session, sir — there's nothing "
+                "to summarise yet.")
+
+    lines = []
+    for m in msgs:
+        text = " ".join(_ACTION_TOKEN_RE.sub("", m["content"]).split())
+        if text:
+            lines.append(f"{m['role'].title()}: {text[:500]}")
+    context = "Conversation so far this session (oldest first):\n" + (
+        "\n".join(lines) if lines else "(nothing yet — this session just started)")
+    if earlier:
+        context += "\n\nEarlier sessions today (summaries, newest first):\n" + \
+            "\n".join(f"- {s['summary'].strip()}" for s in earlier)
+
+    system = (
+        "You are J.A.R.V.I.S. summarising, for the user (sir), the conversation "
+        "you have had with him. Two to four sentences in JARVIS voice — "
+        "composed, British, dry. Cover the main topics in order and anything "
+        "decided or left open. Use ONLY what is in the transcript and notes "
+        "provided; never invent a topic. If there is very little, say so in one "
+        "sentence. No preamble, no bullet points, no closing question."
+    )
+    try:
+        reply = (bc._llm_quick(system=system, user=context, max_tokens=220)
+                 or "").strip()
+    except Exception as e:
+        return f"conversation summary LLM call failed: {e}"
+    if not reply:
+        return "I couldn't produce a summary of our conversation just now, sir."
+    return reply
+
+
 def _act_session_memory_recall(args: str = "") -> str:
     """Query the session_summaries.json index and return a one-line
     JARVIS-voice answer about what the user was doing in a given time window.
@@ -2205,9 +2304,22 @@ def _act_session_memory_recall(args: str = "") -> str:
     was working on last night', 'what happened this morning'. The free-text
     query (typically the user's full utterance) is parsed for a time
     reference; matching session summaries are then handed to the LLM with a
-    JARVIS-voice prompt for a 1-2 sentence reply."""
+    JARVIS-voice prompt for a 1-2 sentence reply.
+
+    SUMMARY MODE (2026-09-29): 'summarize what we talked about (today)',
+    'recap our conversation', 'what have we discussed' summarise THIS
+    session's conversation_history instead (see
+    _summarise_current_conversation). Decided from the argument AND the
+    owner's own words for this turn, so a bare token still gets it right."""
     bc = _bc()
+    from core.owner_turn import current_owner_utterance
     query = (args or "").strip()
+    utterance = current_owner_utterance(bc)
+    if _conversation_summary_requested(query, utterance):
+        return _summarise_current_conversation(bc, (query, utterance))
+    if not query:
+        # A bare token: his own words carry the time reference.
+        query = utterance
     try:
         sessions = bc.pattern_memory.get_session_summaries(query, limit=8)
     except Exception as e:
