@@ -2826,5 +2826,170 @@ class DeepWorkerArmTests(_TmpDirMixin, unittest.TestCase):
         sd.wait.assert_not_called()
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Known-device speech (core/device_speech_filter.py, R3 2026-09-29)
+# ─────────────────────────────────────────────────────────────────────────
+class DeviceSpeechTests(_TmpDirMixin, unittest.TestCase):
+    """A line a known device speaks can never wake JARVIS through the ambient
+    nudge and is never buffered for the learners. GENERIC fixture only (a
+    made-up "desk speaker"); the phrase dir is redirected via JARVIS_DATA_DIR."""
+
+    _LINE = "Jarvis, desk speaker ready to play."
+
+    def setUp(self):
+        import shutil
+        from core import device_speech_filter as dsf
+        self.mod, self.actions = load_skill_isolated("ambient_listen")
+        self._redirect_paths()
+        self.mod._buffer.clear()
+        self.mod._last_error = None
+        dsf._reset_cache_for_tests()
+        self.addCleanup(dsf._reset_cache_for_tests)
+        self.pdir = tempfile.mkdtemp(prefix="ambient_dsf_")
+        self.addCleanup(shutil.rmtree, self.pdir, True)
+        os.makedirs(os.path.join(self.pdir, "device_phrases"))
+        with open(os.path.join(self.pdir, "device_phrases", "desk.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"source": "desk speaker",
+                       "phrases": [self._LINE, "Jarvis"]}, f)
+        env = mock.patch.dict(os.environ, {"JARVIS_DATA_DIR": self.pdir})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def _bc(self, **extra):
+        bc = mock.MagicMock()
+        bc._sleep_mode = [False]
+        bc._standby_mode = [True]
+        bc._tts_playback_active = [False]
+        bc.WAKE_PHRASES = {"jarvis", "hey jarvis"}
+        bc.DEVICE_SPEECH_FILTER_ENABLED = True
+        for k, v in extra.items():
+            setattr(bc, k, v)
+        return bc
+
+    def _nudge(self, bc, text):
+        import re
+        self.mod._wake_pattern = re.compile(r"\bjarvis\b", re.I)
+        self.mod._last_wake_at = 0.0
+        self.mod._tts_last_active[0] = 0.0
+        buf = io.StringIO()
+        with mock.patch.object(self.mod, "_get_bobert", return_value=bc), \
+             contextlib.redirect_stdout(buf):
+            self.mod._maybe_nudge_wake(text)
+        return buf.getvalue()
+
+    def test_device_line_never_nudges_a_wake(self):
+        bc = self._bc()
+        log = self._nudge(bc, self._LINE)
+        bc.proactive_announce.assert_not_called()
+        self.assertIn("device speech ignored (desk speaker)", log)
+        self.assertNotIn("ready to play", log.lower())
+
+    def test_misheard_device_line_never_nudges(self):
+        bc = self._bc()
+        self._nudge(bc, "jarvis the speaker ready to play")
+        bc.proactive_announce.assert_not_called()
+
+    def test_owner_wake_still_nudges(self):
+        bc = self._bc()
+        self._nudge(bc, "hey jarvis you there")
+        bc.proactive_announce.assert_called_once()
+
+    def test_bare_wake_word_still_nudges_even_if_a_device_says_it(self):
+        bc = self._bc()
+        self._nudge(bc, "Jarvis.")
+        bc.proactive_announce.assert_called_once()
+
+    def test_stop_word_line_still_nudges(self):
+        bc = self._bc()
+        self._nudge(bc, "stop jarvis desk speaker ready to play")
+        bc.proactive_announce.assert_called_once()
+
+    def test_disabled_flag_restores_the_old_nudge(self):
+        bc = self._bc(DEVICE_SPEECH_FILTER_ENABLED=False)
+        self._nudge(bc, self._LINE)
+        bc.proactive_announce.assert_called_once()
+
+    def _source(self, bc, fn, *a, **k):
+        with mock.patch.object(self.mod, "_get_bobert", return_value=bc), \
+             contextlib.redirect_stdout(io.StringIO()):
+            return fn(*a, **k)
+
+    def _write_phrases(self, phrases):
+        from core import device_speech_filter as dsf
+        with open(os.path.join(self.pdir, "device_phrases", "desk.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"source": "desk speaker", "phrases": phrases}, f)
+        dsf._reset_cache_for_tests()
+
+    def test_owner_vocabulary_is_never_a_device_line(self):
+        # A device list holding generic owner words ("yes", a sleep phrase)
+        # never swallows the owner's own reply, exactly like the monolith.
+        self._write_phrases([self._LINE, "Yes.", "Next track", "Go to sleep."])
+        bc = self._bc(SLEEP_PHRASES={"go to sleep"})
+        for text in ("Yes.", "next track", "Go to sleep."):
+            self.assertIsNone(
+                self._source(bc, self.mod._device_speech_source, text), text)
+        self.assertEqual(
+            self._source(bc, self.mod._device_speech_source, self._LINE),
+            "desk speaker")
+
+    def test_line_split_across_two_batches_is_caught_on_the_join(self):
+        # The mic worker cuts fixed 2.5 s batches, so a device line can
+        # straddle a boundary: neither fragment matches alone.
+        self.mod._prev_mic_batch[:] = [None, 0.0]
+        self.addCleanup(self.mod._prev_mic_batch.__setitem__,
+                        slice(None), [None, 0.0])
+        bc = self._bc()
+        src = self.mod._device_speech_batch_source
+        self.assertIsNone(self._source(bc, src, "Jarvis, desk", now=100.0))
+        self.assertEqual(
+            self._source(bc, src, "speaker ready to play.", now=102.6),
+            "desk speaker")
+        # Batches far apart (or split by silence) are never joined.
+        self.assertIsNone(self._source(bc, src, "Jarvis, desk", now=200.0))
+        self.assertIsNone(
+            self._source(bc, src, "speaker ready to play.", now=220.0))
+        # An owner sentence after a whole device line is not swallowed.
+        self.assertEqual(self._source(bc, src, self._LINE, now=300.0),
+                         "desk speaker")
+        self.assertIsNone(
+            self._source(bc, src, "what time is it", now=302.5))
+
+    def test_worker_silence_clears_the_previous_batch(self):
+        bc = _FakeBobert(WAKE_PHRASES={"jarvis"},
+                         DEVICE_SPEECH_FILTER_ENABLED=True)
+        bc.transcribe = mock.MagicMock(return_value=("x", _good_conf()))
+        self.mod._prev_mic_batch[:] = ["Jarvis, desk", time.time()]
+        self.addCleanup(self.mod._prev_mic_batch.__setitem__,
+                        slice(None), [None, 0.0])
+        block = np.zeros(16000 * 3, dtype=np.float32)
+        MicWorkerLoopTests._run_worker(self, bc, feed_block=block,
+                                       wait_returns=[True])
+        self.assertIsNone(self.mod._prev_mic_batch[0])
+
+    def test_worker_never_buffers_or_nudges_a_device_line(self):
+        import re
+        bc = _FakeBobert(WAKE_PHRASES={"jarvis"},
+                         DEVICE_SPEECH_FILTER_ENABLED=True)
+        bc._sleep_mode = [False]
+        bc._standby_mode = [True]
+        bc.proactive_announce = mock.MagicMock()
+        bc.transcribe = mock.MagicMock(return_value=(self._LINE, _good_conf()))
+        bc.is_valid_speech = mock.MagicMock(return_value=(True, "ok"))
+        self.mod._wake_pattern = re.compile(r"\bjarvis\b", re.I)
+        self.mod._last_wake_at = 0.0
+        self.mod._tts_last_active[0] = 0.0
+        block = np.ones(16000 * 3, dtype=np.float32) * 0.2
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            MicWorkerLoopTests._run_worker(self, bc, feed_block=block,
+                                           wait_returns=[True])
+        self.assertEqual(len(self.mod._buffer), 0)
+        self.assertFalse(os.path.exists(self.mod._AUDIO_JSONL))
+        bc.proactive_announce.assert_not_called()
+        self.assertIn("device speech ignored (desk speaker)", buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

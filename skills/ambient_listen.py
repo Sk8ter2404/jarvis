@@ -115,6 +115,11 @@ _wake_pattern: Optional[re.Pattern] = None
 # reply) can't echo back through the mic and trip "I heard my name".
 _tts_last_active: list[float] = [0.0]
 _TTS_ECHO_COOLDOWN_S = 3.0
+# [text, wall-clock] of the previous mic batch transcript, for the device-
+# speech check on a line split across two fixed 2.5 s batches. Cleared on a
+# silent batch; joined only when the batches are this close together.
+_prev_mic_batch: list = [None, 0.0]
+_SPLIT_JOIN_MAX_GAP_S = 6.0
 
 # System-audio daemon
 _audio_thread: Optional[threading.Thread] = None
@@ -454,6 +459,51 @@ def _tts_recently_active(b) -> bool:
     return (time.time() - _tts_last_active[0]) < _TTS_ECHO_COOLDOWN_S
 
 
+def _device_speech_source(text: str) -> Optional[str]:
+    """Source name when ``text`` is a line a known device in the room speaks
+    (core/device_speech_filter.py, phrase lists in the gitignored
+    data/device_phrases/), else None. Such a line must never wake JARVIS and
+    is never buffered for the learners. Honours DEVICE_SPEECH_FILTER_ENABLED
+    and protects the wake, sleep and shutdown-prompt phrases (plus the
+    filter's own owner vocabulary), exactly like the monolith's
+    _device_speech_ignored. Never raises — fails OPEN (None)."""
+    try:
+        if not text or not _get_config("DEVICE_SPEECH_FILTER_ENABLED", True):
+            return None
+        _ensure_project_on_path()
+        from core import device_speech_filter as _dsf
+        wake = set(_get_config("WAKE_PHRASES", {"jarvis", "hey jarvis"}) or ())
+        protected = set(wake)
+        for name in ("SLEEP_PHRASES", "SHUTDOWN_PROMPT_YES_PHRASES",
+                     "SHUTDOWN_PROMPT_NO_PHRASES"):
+            protected |= set(_get_config(name, ()) or ())
+        hit = _dsf.match(text, never_match=protected, wake_phrases=wake)
+        return hit[0] if hit else None
+    except Exception:
+        return None
+
+
+def _device_speech_batch_source(text: str, now: Optional[float] = None
+                                ) -> Optional[str]:
+    """Device check for ONE fixed-length mic batch. The mic worker cuts audio
+    into fixed 2.5 s batches (not speech segments), so a device line can
+    straddle a boundary and arrive as two fragments that match nothing on
+    their own; this also checks the previous batch joined with this one, so
+    the SECOND fragment is never buffered / learned / a wake nudge. (The
+    first fragment is already processed by then — a known residual.) Records
+    ``text`` as the new previous batch. Never raises."""
+    try:
+        now = time.time() if now is None else float(now)
+        prev, prev_ts = _prev_mic_batch[0], _prev_mic_batch[1]
+        _prev_mic_batch[0], _prev_mic_batch[1] = text, now
+        src = _device_speech_source(text)
+        if src or not prev or now - prev_ts > _SPLIT_JOIN_MAX_GAP_S:
+            return src
+        return _device_speech_source(f"{prev} {text}")
+    except Exception:
+        return None
+
+
 def _maybe_nudge_wake(text: str) -> None:
     """If text contains a wake phrase AND JARVIS is asleep / in standby,
     fire proactive_announce so the main loop greets the user on its next
@@ -474,6 +524,12 @@ def _maybe_nudge_wake(text: str) -> None:
     if not _wake_pattern or not text:
         return
     if not _wake_pattern.search(text):
+        return
+    # A known device's line (e.g. a boot announcement led by the wake word)
+    # can never wake JARVIS. Source name only in the log — never the text.
+    _dev = _device_speech_source(text)
+    if _dev:
+        print(f"  [ambient-listen] device speech ignored ({_dev})")
         return
     now = time.time()
     if now - _last_wake_at < 4.0:
@@ -958,6 +1014,7 @@ def _worker_loop() -> None:
             rms = float(np.sqrt(np.mean(audio * audio))) if audio.size else 0.0
             _heartbeat = time.time()
             if rms < 0.003:
+                _prev_mic_batch[0] = None   # silence ends any split line
                 continue
 
             # Apply the three-layer cleanup (AEC → NS → AGC) so
@@ -974,12 +1031,20 @@ def _worker_loop() -> None:
 
             if not text:
                 continue
+            # Known-device speech: checked on EVERY transcript (so the
+            # split-line join below always sees the previous fragment), acted
+            # on after the existing gates. Never buffered (so never learned
+            # from) and never a wake nudge. Source name only in the log.
+            _dev = _device_speech_batch_source(text)
             if is_ambient_music(text):
                 continue
             if callable(is_valid_speech):
                 ok, _reason = is_valid_speech(text, conf, peak_rms=rms)
                 if not ok:
                     continue
+            if _dev:
+                print(f"  [ambient-listen] device speech ignored ({_dev})")
+                continue
 
             # Identify the speaker for this batch BEFORE persisting so
             # downstream consumers (anticipation, banter, per-speaker

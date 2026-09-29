@@ -496,6 +496,14 @@ REQUIRE_WAKE_MODE = False
 # core/followup_window.py. Set via user_settings.json.
 FOLLOWUP_WINDOW_S = 0.0
 
+# Known-device speech filter (core/device_speech_filter.py). When True, an
+# utterance that matches a line a known device speaks (phrase lists in the
+# gitignored data/device_phrases/*.json) is ignored before the wake gate, the
+# LLM and any learning, and can never wake JARVIS. A stop word always gets
+# through. No phrase files = no filtering. Set via user_settings.json; applies
+# on the next start.
+DEVICE_SPEECH_FILTER_ENABLED = True
+
 
 # ─── Whisper STT (faster-whisper preferred, GPU when present) ──────────
 # `WHISPER_DEVICE = 'auto'` lets ctranslate2 + torch decide; 'cuda'

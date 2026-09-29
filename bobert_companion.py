@@ -23837,6 +23837,46 @@ def _bg_gate_for_turn(text: str, injected: bool) -> "tuple[bool, str]":
     return _should_refuse_background_audio(text)
 
 
+def _device_speech_ignored(text: str, injected: bool = False) -> bool:
+    """Known-device speech gate (core/device_speech_filter.py).
+
+    True when ``text`` matches a line a known device in the room speaks (the
+    gitignored data/device_phrases/*.json lists) — the caller must then drop
+    the turn ENTIRELY: no wake, no background-audio gate, no LLM, no learning.
+    Live 2026-09-29: a device's boot line led by the wake word was obeyed as
+    the owner (wrong actions for ~18 s), and with wake-word mode off a misheard
+    device line got a spoken reply and was learned as a topic.
+
+    ``injected``: typed / injected input (the LAN web page, tray,
+    tools/say_to_jarvis.py, the driver) is never checked — it is explicit
+    local input, not overheard room audio, exactly like _bg_gate_for_turn.
+
+    Protected: the wake, sleep and shutdown-prompt yes/no phrases (plus the
+    filter's own owner vocabulary — "yes", "next track", ...) are always the
+    owner's, even if a device list holds the same line. Logs the SOURCE name
+    only — never the utterance or the matched phrase (the phrase lists are
+    private). A stop word never matches (the filter's own rule). Off when
+    DEVICE_SPEECH_FILTER_ENABLED is False. Never raises — any error fails
+    OPEN (False) so this gate can never silence the owner.
+    """
+    try:
+        if injected or not DEVICE_SPEECH_FILTER_ENABLED:
+            return False
+        from core import device_speech_filter as _dsf
+        hit = _dsf.match(
+            text,
+            never_match=(set(WAKE_PHRASES) | set(SLEEP_PHRASES)
+                         | set(SHUTDOWN_PROMPT_YES_PHRASES)
+                         | set(SHUTDOWN_PROMPT_NO_PHRASES)),
+            wake_phrases=WAKE_PHRASES)
+        if not hit:
+            return False
+        print(f"  [device-speech] ignored ({hit[0]})")
+        return True
+    except Exception:
+        return False
+
+
 # Standby auto-engage bridge. The background lyric-detection thread in
 # skills/standby_audio_detect calls this when it's seen sustained vocal
 # music while the headset is the active output — flipping standby state
@@ -29213,6 +29253,13 @@ def _handle_sleep_standby(injected_text: str | None) -> None:
             text, _ = _transcribe_capture(audio)
         else:
             text = "jarvis" if _wake_hit else ""
+    # Known-device speech (core/device_speech_filter.py): a line a device in
+    # the room speaks can never wake JARVIS and is never fed to the ambient
+    # learner. Checked BEFORE the wake match — a device boot line led by the
+    # wake word was waking JARVIS (live 2026-09-29). Mic captures only (an
+    # inject is typed operator input). Logs the source only.
+    if _device_speech_ignored(text, injected_text is not None):
+        return
     tl = text.strip().lower()
     # Word-boundary wake match (2026-07-14 bug-hunt). Was `any(wp in tl ...)` —
     # a raw substring test that fires on "awakened"/"jar visit"; the ambient
@@ -30424,6 +30471,17 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 if _cap is None:
                     continue
                 text, conf = _cap
+
+                # ── KNOWN-DEVICE SPEECH (core/device_speech_filter.py) ──────────
+                # A line a known device in the room speaks is not the owner:
+                # drop the turn BEFORE the background/wake gate, the LLM and any
+                # learning (no _ambient_learn_from_gated, no learn_from_turn).
+                # Mic turns only: an inject (typed / LAN page / say_to_jarvis)
+                # is explicit operator input, never overheard room audio.
+                # Logs the device name only. See _device_speech_ignored.
+                if _device_speech_ignored(text, _injected_text is not None):
+                    set_state("idle")
+                    continue
 
                 # ── AMBIENT MUSIC DETECTION → auto-standby ────────────────────────
                 # Whisper emits markers like [Music] / ♪ when the mic picks up
