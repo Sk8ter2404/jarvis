@@ -436,6 +436,22 @@ SCHEMA: dict[str, dict] = {
                 "each turn (local embedder, ~0.2 GB VRAM). Off = JARVIS "
                 "remembers nothing new between sessions.",
     },
+    "PROMPT_FREEZE_QUIET_S": {
+        "tab": "ai", "label": "Hold prompt updates while talking (seconds)",
+        "type": "float", "default": 30.0,
+        "help": "Local brain only: newly learned facts reach the prompt after "
+                "this many seconds of quiet instead of between turns, so each "
+                "reply starts warm (0 = update between turns). Applies on the "
+                "next start.",
+    },
+    "LOCAL_PREFIX_REPRIME": {
+        "tab": "ai", "label": "Re-warm the local brain after prompt updates",
+        "type": "bool", "default": True,
+        "help": "After a held-back prompt update, quietly send the new prompt "
+                "to the already-loaded local model so your next turn is fast. "
+                "Never loads a model, never in game mode or mid-turn. Applies "
+                "on the next start.",
+    },
     "STREAMING_TTS_ENABLED": {
         "tab": "voice", "label": "Speak while replies stream", "type": "bool",
         "default": True,

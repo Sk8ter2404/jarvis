@@ -191,5 +191,52 @@ class NoUnpinnedGenerationCallsTests(unittest.TestCase):
             "core.ollama_opts.chat_options(). Offenders: " + ", ".join(offenders))
 
 
+class ModelResidentExactTests(unittest.TestCase):
+    """model_resident(exact=True) is the gate for callers whose request would
+    itself BE the load (the idle re-prime). The default family match is too
+    loose for that: two tags of one family ("fam:big" vs "fam:small") share a
+    base name, so a request for the big one while only the small one is
+    loaded passed the gate and evicted it for a cold load (2026-09-29)."""
+
+    @staticmethod
+    def _ps(*names):
+        body = json.dumps({"models": [{"name": n} for n in names]}).encode()
+
+        class _Resp:
+            def read(self):
+                return body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        return lambda req, timeout=None: _Resp()
+
+    def _resident(self, model, names, **kw):
+        import urllib.request
+        with mock.patch.object(urllib.request, "urlopen", self._ps(*names)):
+            return ollama_opts.model_resident(model, **kw)
+
+    def test_default_family_match_is_unchanged(self):
+        self.assertTrue(self._resident("fam:big-q4", ["fam:small"]))
+
+    def test_exact_rejects_another_tag_of_the_same_family(self):
+        self.assertFalse(self._resident("fam:big-q4", ["fam:small"],
+                                        exact=True))
+
+    def test_exact_accepts_the_same_tag(self):
+        self.assertTrue(self._resident("fam:big-q4", ["other:1", "fam:big-q4"],
+                                       exact=True))
+
+    def test_exact_normalises_a_bare_name_to_latest_only(self):
+        self.assertTrue(self._resident("fam", ["fam:latest"], exact=True))
+        self.assertTrue(self._resident("fam:latest", ["fam"], exact=True))
+        self.assertFalse(self._resident("fam", ["fam:small"], exact=True))
+
+    def test_exact_nothing_loaded(self):
+        self.assertFalse(self._resident("fam:big-q4", [], exact=True))
+
+
 if __name__ == "__main__":
     unittest.main()

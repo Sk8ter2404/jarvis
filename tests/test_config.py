@@ -167,6 +167,14 @@ class StructuralInvariantTests(unittest.TestCase):
         self.assertGreater(config.PROCESSING_FILLER_STILL_DELAY,
                            config.PROCESSING_FILLER_DELAY)
 
+    def test_prompt_freeze_settings_ship_on_with_a_float_window(self):
+        # 2026-09-29 local prompt-prefix stability: the quiet window is a
+        # float literal (an int default would make _apply_user_settings
+        # truncate a saved 12.5 to 12) and the idle re-prime ships ON.
+        self.assertIsInstance(config.PROMPT_FREEZE_QUIET_S, float)
+        self.assertEqual(config.PROMPT_FREEZE_QUIET_S, 30.0)
+        self.assertIs(config.LOCAL_PREFIX_REPRIME, True)
+
 
 if __name__ == "__main__":
     unittest.main()

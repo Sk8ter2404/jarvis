@@ -118,6 +118,30 @@ def render_phrasebook_block(last_used_by_intent: dict | None = None) -> str:
     return "\n".join(lines)
 
 
+def render_rotation_hint(last_used_by_intent: dict | None = None) -> str:
+    """The per-turn "last used" rotation hint, WITHOUT the phrasebook itself.
+
+    The phrasebook (render_phrasebook_block() with no argument) is constant and
+    belongs in the system prompt. Which line was used last changes almost every
+    turn, so it rides in the volatile per-turn context instead: in the system
+    prompt it changed the local model's cached prefix on every rotation and
+    forced a full prompt re-evaluation (2026-09-29). Returns '' when nothing
+    has been used yet (or the input is not a dict). Intents are listed in
+    MCU_PHRASES order so the text is deterministic.
+    """
+    if not isinstance(last_used_by_intent, dict):
+        return ""
+    parts: list[str] = []
+    for intent in MCU_PHRASES:
+        last = last_used_by_intent.get(intent)
+        if isinstance(last, str) and last:
+            parts.append(f"{intent}: '{last}'")
+    if not parts:
+        return ""
+    return ("Phrasebook rotation - last used: " + "; ".join(parts)
+            + ". Pick a different line from each of those buckets this turn.")
+
+
 def total_phrase_count() -> int:
     return sum(len(v) for v in MCU_PHRASES.values())
 

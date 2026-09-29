@@ -227,6 +227,23 @@ _SHIPPED_LOCAL_LLM_MODEL = LOCAL_LLM_MODEL
 # to every other 11434 reference in the tree.
 LOCAL_LLM_BASE_URL = "http://127.0.0.1:11434"
 
+# ─── Local prompt-prefix stability (2026-09-29) ────────────────────────
+# The local model re-evaluates the WHOLE prompt (~3 s for ~12k tokens,
+# measured) whenever the system prompt changes between turns; an unchanged
+# prefix costs only the new turn (~1.25 s). LOCAL chat route only — the cloud
+# route is unaffected.
+# PROMPT_FREEZE_QUIET_S — while you and JARVIS are talking (a turn or reply
+#   within this many seconds), the post-turn system-prompt rebuild (newly
+#   learned facts / topics) is held back and applied ONCE after this much
+#   quiet. Float; 0.0 applies every rebuild immediately (the old behaviour).
+# LOCAL_PREFIX_REPRIME — after such a held-back rebuild changed the prompt,
+#   send the model the new prefix while you are quiet (one tiny request,
+#   only if the model is already loaded, never in game mode or mid-turn), so
+#   your next turn starts warm.
+# Changes apply on the next start.
+PROMPT_FREEZE_QUIET_S = 30.0
+LOCAL_PREFIX_REPRIME = True
+
 # When True, every ambient/background one-shot LLM call (memory extraction,
 # proactive comments, the ambient extractor — everything routed through
 # `_llm_quick`) runs on the LOCAL model ONLY and never touches Claude, so

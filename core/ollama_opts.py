@@ -114,7 +114,7 @@ def local_num_ctx(model: str) -> int:
 
 
 def model_resident(model: str, base_url: str = "http://127.0.0.1:11434",
-                   timeout_s: float = 1.5) -> bool:
+                   timeout_s: float = 1.5, *, exact: bool = False) -> bool:
     """True iff ``model`` is ALREADY loaded in Ollama right now.
 
     The guard for optional, latency-sensitive extras (autocorrect embeddings,
@@ -127,6 +127,12 @@ def model_resident(model: str, base_url: str = "http://127.0.0.1:11434",
     So: nice-to-have callers must ask this FIRST and skip themselves when the
     answer is False, rather than firing a request that costs a brain reload.
     Cheap GET of /api/ps; never raises.
+
+    ``exact=True`` (for a caller whose own request would BE the load, e.g.
+    the idle re-prime): only the same tag counts, or a bare name against its
+    ":latest" form. The default family match ("fam:12b" loaded satisfies
+    "fam:26b") is fine for a nice-to-have ping but not as a no-cold-load
+    gate — two tags of one family are two different ~GB loads.
     """
     tag = (model or "").strip()
     if not tag:
@@ -142,6 +148,13 @@ def model_resident(model: str, base_url: str = "http://127.0.0.1:11434",
     for m in (payload.get("models") or []):
         name = (m or {}).get("name") or (m or {}).get("model") or ""
         if not name:
+            continue
+        if exact:
+            # Mirrors skills/game_mode.py _keep_warm._same.
+            if (name == tag
+                    or (":" not in tag and name == f"{tag}:latest")
+                    or (":" not in name and tag == f"{name}:latest")):
+                return True
             continue
         # Ollama reports fully-qualified tags ("nomic-embed-text:latest");
         # accept a bare-name configuration too.

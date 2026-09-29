@@ -340,15 +340,16 @@ class StagingAndHistoryTests(_MonolithTestBase):
     def test_trim_keeps_pairs_and_user_first(self):
         hist = self._restore_attr_after("conversation_history")
         hist.clear()
-        # 12 messages (6 user/assistant pairs); trim to 8 should drop 2 oldest
-        # pairs from the front and leave a user message first.
+        # 12 messages (6 user/assistant pairs), cap 8. The trim is CHUNKED
+        # (2026-09-29): over the cap it lands at max(cap - 6, cap // 2) = 4 in
+        # one step — whole pairs from the front, a user message first.
         for i in range(6):
             hist.append({"role": "user", "content": f"u{i}"})
             hist.append({"role": "assistant", "content": f"a{i}"})
         self.bc._trim_conversation_history(max_history=8)
-        self.assertEqual(len(hist), 8)
+        self.assertEqual(len(hist), 4)
         self.assertEqual(hist[0]["role"], "user")
-        self.assertEqual(hist[0]["content"], "u2")
+        self.assertEqual(hist[0]["content"], "u4")
 
     def test_trim_noop_when_under_cap(self):
         hist = self._restore_attr_after("conversation_history")

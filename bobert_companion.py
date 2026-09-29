@@ -1191,25 +1191,56 @@ _system_prompt = BASE_SYSTEM_PROMPT   # extended with memory at startup
 # first message to be 'user') can't drift between them.
 MAX_CONVERSATION_HISTORY = 20
 
+# Chunked trim (2026-09-29). Trimming one pair per turn once the history was
+# full changed the FRONT of the message list on every turn, which is the front
+# of the local model's cached prefix: every full-history turn paid a complete
+# prompt re-evaluation (~3.2 s for ~12k tokens, measured). Once over the cap,
+# the trim now drops enough of the oldest pairs to land at (cap - this many
+# messages) in one step, so the prefix only moves every few turns.
+_HISTORY_TRIM_CHUNK = 6
+
+
+def _history_trim_count(history: list,
+                        max_history: int = MAX_CONVERSATION_HISTORY) -> int:
+    """How many LEADING messages the trim drops from `history` (pure).
+
+    Over `max_history`: drop the oldest user+assistant PAIRS until at most
+    max(max_history - _HISTORY_TRIM_CHUNK, max_history // 2) messages remain
+    (the floor keeps a small cap from emptying the history). Then drop any
+    leading non-'user' messages: the follow-up loop and boot-time appends can
+    produce consecutive-assistant runs, and a pair-trim that lands inside one
+    leaves a LEADING 'assistant' message, which the Claude API rejects with
+    400 'first message must use the user role' (2026-07-08)."""
+    n = len(history)
+    i = 0
+    if n > max_history:
+        target = max(max_history - _HISTORY_TRIM_CHUNK, max_history // 2)
+        while n - i > target:
+            i += 1
+            if i < n and isinstance(history[i], dict) \
+                    and history[i].get("role") == "assistant":
+                i += 1
+    while i < n and not (isinstance(history[i], dict)
+                         and history[i].get("role") == "user"):
+        i += 1
+    return i
+
+
+def _trimmed_history(history: list,
+                     max_history: int = MAX_CONVERSATION_HISTORY) -> list:
+    """`history` as the trim would leave it — a new list, input untouched.
+    The idle re-prime uses this to predict the next turn's exact messages."""
+    return list(history[_history_trim_count(history, max_history):])
+
 
 def _trim_conversation_history(max_history: int = MAX_CONVERSATION_HISTORY) -> None:
-    """Trim conversation_history to at most `max_history` messages, removing the
-    oldest user+assistant PAIR from the front so role alternation is preserved.
-
-    The pop-in-pairs scheme only keeps the history 'user'-first when roles
-    strictly alternate. The follow-up loop (and boot-time appends) can append
-    assistant-only turns with no interleaving user message, producing
-    consecutive-assistant runs; when such a run lands at the front a pair-trim
-    can leave a LEADING 'assistant' message, which the Claude API rejects with
-    400 'first message must use the user role'. After trimming, drop any leading
-    non-'user' messages so the history always begins with a user turn (or is
-    empty). 2026-07-08."""
-    while len(conversation_history) > max_history:
-        conversation_history.pop(0)
-        if conversation_history and conversation_history[0]["role"] == "assistant":
-            conversation_history.pop(0)
-    while conversation_history and conversation_history[0].get("role") != "user":
-        conversation_history.pop(0)
+    """Trim conversation_history IN PLACE (other modules hold the same list):
+    chunked, pair-wise, user-first — see _history_trim_count. EVERY trim site
+    goes through here, so the chunking and the user-first invariant cannot
+    drift between them."""
+    n = _history_trim_count(conversation_history, max_history)
+    if n:
+        del conversation_history[:n]
 
 
 def _append_turn(user: str, assistant: str) -> None:
@@ -1631,17 +1662,17 @@ def build_system_prompt(memory: dict) -> str:
     # everything below is derived from `memory` and churns on ambient learning.
     _system_prompt_stable_len[0] = len(prompt)
 
-    # Inject the canonical JARVIS phrasebook with per-intent rotation hints.
-    # The phrases themselves live in mcu_phrases.py so the prompt stays the
-    # single source of voice instruction while the lines stay editable in a
-    # dedicated module. last_used_by_intent may be absent on legacy memory
-    # files — load_memory() backfills via _empty_memory(), so .get() suffices.
-    # Lives in the MEMORY half because the rotation hints come from memory's
-    # last_used_phrase_by_intent — in the stable half every phrase rotation
-    # would invalidate the whole cached core. (The standing-rules comment only
-    # requires rules-before-phrasebook, which still holds.)
-    last_used = memory.get("last_used_phrase_by_intent") or {}
-    prompt += "\n\n" + _mcu_phrases.render_phrasebook_block(last_used)
+    # Inject the canonical JARVIS phrasebook. The phrases themselves live in
+    # mcu_phrases.py so the prompt stays the single source of voice instruction
+    # while the lines stay editable in a dedicated module. (The standing-rules
+    # comment only requires rules-before-phrasebook, which still holds.)
+    # The per-intent "last used" ROTATION HINT is deliberately NOT rendered
+    # here any more (2026-09-29): it changes almost every turn, and in the
+    # system prompt every rotation changed the local model's cached prefix and
+    # cost a full prompt re-evaluation. _call_llm adds it per turn via
+    # _phrase_rotation_hint() — in the turn context on the cache-stable local
+    # layout, in the uncached addenda tail everywhere else.
+    prompt += "\n\n" + _mcu_phrases.render_phrasebook_block()
 
     days_known = 0
     try:
@@ -12836,6 +12867,7 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
             if _watchdog_reset_signal.is_set():
                 print("  [record_speech] watchdog reset signalled — "
                       "closing InputStream and returning")
+                _utterance_in_progress[0] = False
                 return None
             try:
                 data = audio_q.get(timeout=0.1)
@@ -12844,6 +12876,7 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
                 if _watchdog_reset_signal.is_set():
                     print("  [record_speech] watchdog reset signalled — "
                           "closing InputStream and returning")
+                    _utterance_in_progress[0] = False
                     return None
                 if (not recording and timeout is not None and
                         (time.time() - start_time) >= timeout):
@@ -12937,6 +12970,11 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
             if rms > VAD_THRESHOLD:
                 if not recording:
                     recording = True
+                    # A real utterance is now in progress (cleared when its
+                    # transcript is accepted or dropped) — the idle re-prime
+                    # gate. _record_speech_active cannot serve: it is True
+                    # for the whole idle listen.
+                    _utterance_in_progress[0] = True
                     record_start_ts = time.time()
                     chunks.extend(pre_ring)
                     _heartbeat()
@@ -13030,6 +13068,7 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
     global _last_recording_peak
     _last_recording_peak = peak_rms
     if not chunks:
+        _utterance_in_progress[0] = False  # pragma: no cover - defensive
         return None  # pragma: no cover - defensive: the loop only breaks after recording began, so chunks is never empty here
     return np.concatenate(chunks).flatten()
 
@@ -14910,19 +14949,15 @@ def _local_cheatsheet() -> str:
     return out
 
 
-def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str | None:
-    """POST to Ollama /api/chat. Returns the assistant text or None on any
-    failure (no Ollama running, no model pulled, HTTP error, timeout)."""
-    if not LOCAL_LLM_FALLBACK:
-        return None
-    if not _ollama_alive():
-        _ollama_selfheal_async()   # mid-session death: restart in background
-        _ollama_install_async()    # (no-op when the binary is present+installed)
-        return None
-    model = _get_local_llm_model()
-    if not _ollama_has_model(model):
-        _ollama_pull_async(model)
-        return None
+def _local_chat_prompt(system: str, messages: list) -> tuple:
+    """The local call's final (system prompt, messages): the cheatsheet swap,
+    the web-search anti-fabrication guard and the _LOCAL_MODE_DIRECTIVE tail.
+
+    Factored out of _call_local_llm (2026-09-29) so the idle re-prime
+    (_build_reprime_payload) shapes its prompt with the SAME code as a real
+    turn — a re-prime whose prefix differed by one byte would warm nothing.
+    Pure: `messages` is never mutated (the guard goes through
+    _with_turn_context, which copies)."""
     # Anti-hallucination guard: if the recent conversation shows a web_search
     # was fired but no subsequent see_screen read the results, the local LLM
     # tends to fabricate source attributions ("from census data…"). Scan the
@@ -14974,6 +15009,64 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
     # position — addresses the hallucinated-execution / verbose / moralising
     # replies the giant Claude prompt produced on a 14B model.
     sys_prompt = sys_prompt + _LOCAL_MODE_DIRECTIVE
+    return sys_prompt, messages
+
+
+def _local_chat_payload(model_tag: str, sys_prompt: str, messages: list,
+                        max_tokens: int = 500) -> dict:
+    """The /api/chat body for one local call — the ONE builder shared by
+    _call_local_llm and the idle re-prime, so both send identical options,
+    keep_alive and think (Ollama keys a warm runner on them).
+
+    Options come from core.ollama_opts.chat_options; num_ctx is pinned via
+    _local_num_ctx (the same resolver, so a patched resolver still wins).
+    Cap context (was the model-default 32k): with the compact prompt the real
+    prompt is ~8k, so even 12k leaves ample room for history + generation
+    while keeping the KV cache small enough that the model fits 100% on the
+    GPU. Model-aware because the 32B needs the tighter window: MEASURED on
+    the 3090, 32B@12k = 100% GPU / ~49 tok/s, 32B@16k spills ~5% to CPU /
+    ~28 tok/s. 14B/8B keep 16k.
+    temperature 0.4 (below Ollama's 0.8) → more focused, better at the exact
+    action-token grammar; a small repeat penalty curbs phrase loops and
+    top_k=40 trims the long tail — kept gentle so behaviour stays close to
+    the tuning the cheatsheet/persona were validated against."""
+    from core.ollama_opts import chat_options as _chat_options
+    options = _chat_options(
+        model_tag, num_predict=max_tokens, temperature=0.4,
+        extra={"num_ctx": _local_num_ctx(model_tag), "top_p": 0.9,
+               "repeat_penalty": 1.05, "top_k": 40})
+    payload = {
+        "model": model_tag,
+        "messages": [{"role": "system", "content": sys_prompt}] + list(messages),
+        "stream": False,
+        "options": options,
+        # Keep the model resident between turns so a voice burst doesn't pay
+        # the ~3-5s reload each time (it competes with whisper on reload).
+        "keep_alive": "20m",
+    }
+    # Thinking models MUST have thinking disabled/minimised for voice —
+    # computed per model_tag because the empty-response failover can land
+    # on a different family than the primary. None = omit (pure instruct).
+    _think = _local_think_param(model_tag)
+    if _think is not None:
+        payload["think"] = _think
+    return payload
+
+
+def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str | None:
+    """POST to Ollama /api/chat. Returns the assistant text or None on any
+    failure (no Ollama running, no model pulled, HTTP error, timeout)."""
+    if not LOCAL_LLM_FALLBACK:
+        return None
+    if not _ollama_alive():
+        _ollama_selfheal_async()   # mid-session death: restart in background
+        _ollama_install_async()    # (no-op when the binary is present+installed)
+        return None
+    model = _get_local_llm_model()
+    if not _ollama_has_model(model):
+        _ollama_pull_async(model)
+        return None
+    sys_prompt, messages = _local_chat_prompt(system, messages)
     # The last _generate's Ollama counters (prompt_eval / eval), for the
     # served-via line below. All-None until a response arrives.
     _gen_stats = [None]
@@ -14986,42 +15079,14 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
                     yet produced no content (exactly what gemma4:26b-a4b-it-qat's
                     Q4_0 build did, muting the local brain on 2026-07-09).
           'fail'  → HTTP error, read timeout, or exception (treat as down)."""
-        payload = {
-            "model": model_tag,
-            "messages": [{"role": "system", "content": sys_prompt}] + messages,
-            "stream": False,
-            "options": {
-                "num_predict": max_tokens,
-                # Cap context (was the model-default 32k). With the compact
-                # prompt the real prompt is ~8k, so even 12k leaves ample room
-                # for history + generation while keeping the KV cache small
-                # enough that the model fits 100% on the GPU (no CPU spill →
-                # much faster). Model-aware because the 32B needs the tighter
-                # window: MEASURED on the 3090, 32B@12k = 100% GPU / ~49 tok/s,
-                # but 32B@16k spills ~5% to CPU / ~28 tok/s. 14B/8B keep 16k.
-                "num_ctx": _local_num_ctx(model_tag),
-                # Lower than Ollama's 0.8 default → more focused, less rambly,
-                # better at emitting the exact action-token grammar.
-                "temperature": 0.4,
-                "top_p": 0.9,
-                # Light, deliberately conservative tuning: a small repeat
-                # penalty curbs the local model's tendency to loop a phrase,
-                # and top_k=40 trims the long tail without hurting the
-                # action-grammar. Kept gentle so behaviour stays close to the
-                # tuning the cheatsheet/persona were validated against.
-                "repeat_penalty": 1.05,
-                "top_k": 40,
-            },
-            # Keep the model resident between turns so a voice burst doesn't pay
-            # the ~3-5s reload each time (it competes with whisper on reload).
-            "keep_alive": "20m",
-        }
-        # Thinking models MUST have thinking disabled/minimised for voice —
-        # computed per model_tag because the empty-response failover can land
-        # on a different family than the primary. None = omit (pure instruct).
-        _think = _local_think_param(model_tag)
-        if _think is not None:
-            payload["think"] = _think
+        # One builder for this call AND the idle re-prime: options via
+        # core.ollama_opts.chat_options with num_ctx pinned by _local_num_ctx,
+        # keep_alive "20m", think per model family. See _local_chat_payload.
+        payload = _local_chat_payload(model_tag, sys_prompt, messages,
+                                      max_tokens)
+        # Did an idle re-prime warm exactly this prefix? Logs
+        # "[reprime] stale" when it did not (owner turns only).
+        _reprime_check_stale(payload)
         _prof("llm_post", f"sys={len(sys_prompt)}")
         _tt("mark", "llm_post", owner_only=True)
         r = None
@@ -16199,6 +16264,450 @@ def _strip_stream_spoken_prefix(text: str) -> str:
         return text
 
 
+# ──────────────────────────────────────────────────────────────────────────
+#  LOCAL PROMPT-PREFIX STABILITY (R2, 2026-09-29)
+# ──────────────────────────────────────────────────────────────────────────
+#
+# MEASURED (live probe 2026-09-29): a cold main call spent 3,200 ms evaluating
+# 12,393 prompt tokens against 288 ms of generation; a turn on a warm prefix
+# takes ~1.25 s. The cold turns lined up with the SYSTEM PROMPT CHANGING
+# between turns — the post-turn rebuild Timer picked up newly learned topics
+# and the phrasebook's "last used" hint, and the history trim popped one pair
+# off the front every turn once full — not with background calls. Ollama runs
+# ONE slot, so any change near the front re-evaluates everything after it.
+#
+# So (1 and 4 on the LOCAL route only; 2 and 3 are shared helpers every
+# route goes through — on the cloud route the hint lands in the uncached
+# tail block of _cached_system_param and the history cycles ~13..20):
+#   1. the post-turn rebuild is DEFERRED while a conversation is active and
+#      applied once, PROMPT_FREEZE_QUIET_S after the last owner turn / reply;
+#   2. the phrase-rotation hint rides the per-turn context
+#      (_phrase_rotation_hint, primary AND follow-up rounds), never the
+#      system prompt;
+#   3. the history trims in chunks (_HISTORY_TRIM_CHUNK);
+#   4. after a deferred rebuild actually changed the prompt, an idle RE-PRIME
+#      posts the exact next-turn prefix with num_predict=1 so the next real
+#      turn only evaluates its own new tail (LOCAL_PREFIX_REPRIME).
+
+
+def _chat_takes_local_branch() -> bool:
+    """THE route predicate _call_llm uses to take its local branch. The idle
+    re-prime and the prompt freeze ask exactly this, never a copy of it."""
+    from core.config import model_route
+    return model_route("chat") == "local"
+
+
+def _local_stable_system_prompt(base: str | None = None) -> str | None:
+    """The cache-stable local system prompt for `base` (default: the live
+    _system_prompt): PC_CONTROL_PROMPT replaced by the local never-guess guard
+    + prompt_router.stable_pc_block(). None when the stable layout does not
+    apply (flags off, or no PC_CONTROL_PROMPT in the prompt). Shared by
+    _call_llm and _build_reprime_payload so both produce the same bytes."""
+    base = _system_prompt if base is None else base
+    if not (_DYNAMIC_LOCAL_PROMPT and _STABLE_LOCAL_PREFIX
+            and PC_CONTROL_PROMPT and PC_CONTROL_PROMPT in base):
+        return None
+    from core import prompt_router as _pr
+    _stable_pc = (_LOCAL_NEVER_GUESS_GUARD + "\n"
+                  + _pr.stable_pc_block(PC_CONTROL_PROMPT))
+    return base.replace(PC_CONTROL_PROMPT, _stable_pc, 1)
+
+
+# In-process copy of memory['last_used_phrase_by_intent'] (None = not loaded
+# yet). Updated where _call_llm records a reply's phrases, so the per-turn
+# hint needs no disk read after the first turn.
+_phrase_rotation_last: list = [None]
+
+
+def _phrase_rotation_hint() -> str:
+    """Blank line + the phrasebook rotation hint for THIS turn, or ''. Never
+    raises — a hint is never worth a failed turn."""
+    try:
+        last = _phrase_rotation_last[0]
+        if last is None:
+            try:
+                last = dict((load_memory() or {}).get(
+                    "last_used_phrase_by_intent") or {})
+            except Exception:
+                last = {}
+            _phrase_rotation_last[0] = last
+        hint = _mcu_phrases.render_rotation_hint(last)
+        return ("\n\n" + hint) if isinstance(hint, str) and hint else ""
+    except Exception:
+        return ""
+
+
+# ── conversation activity (drives the freeze and the re-prime gates) ──────
+# Single-element lists: the GIL-atomic cross-thread slot idiom of this file.
+_last_convo_activity = [0.0]     # time.monotonic() of the last owner turn / reply
+_turn_in_progress = [False]      # "You:" accepted -> the loop's next iteration
+# True from the moment record_speech trips into recording until that capture's
+# transcript is accepted ("You:") or dropped (next loop top). NOT
+# _record_speech_active: that is True the whole time JARVIS idles listening
+# (record_speech(timeout=20)), so a gate on it would never open.
+_utterance_in_progress = [False]
+
+
+def _note_conversation_activity(now: float | None = None) -> None:
+    """Stamp an owner turn or a JARVIS reply (restarts the quiet window)."""
+    _last_convo_activity[0] = time.monotonic() if now is None else float(now)
+
+
+def _note_owner_turn() -> None:
+    """Main loop: a transcript was accepted ("You:"), voice or typed.
+
+    ORDER MATTERS: stamp + mark the turn BEFORE releasing the capture flag.
+    The deferred-rebuild waiter polls _conversation_active() from another
+    thread; releasing the capture first opened a window where it saw "no
+    capture, no turn, last activity > window ago" and applied the pending
+    rebuild at the very start of this turn (a cold turn + a re-prime)."""
+    _note_conversation_activity()
+    _turn_in_progress[0] = True
+    _utterance_in_progress[0] = False
+
+
+def _note_turn_boundary() -> None:
+    """Main loop, top of every iteration: the previous turn (if any) is over,
+    and any capture that did not become a turn was dropped."""
+    if _turn_in_progress[0]:
+        _turn_in_progress[0] = False
+        _note_conversation_activity()
+    _utterance_in_progress[0] = False
+
+
+def _prompt_freeze_quiet_s() -> float:
+    try:
+        return max(0.0, float(PROMPT_FREEZE_QUIET_S))
+    except Exception:
+        return 30.0
+
+
+def _conversation_active(now: float | None = None) -> bool:
+    """A turn or capture is in progress, or the last owner turn / reply was
+    under PROMPT_FREEZE_QUIET_S ago."""
+    if _turn_in_progress[0] or _utterance_in_progress[0]:
+        return True
+    last = _last_convo_activity[0]
+    if not last:
+        return False
+    now = time.monotonic() if now is None else float(now)
+    return (now - last) < _prompt_freeze_quiet_s()
+
+
+# ── 1. deferred system-prompt rebuild ─────────────────────────────────────
+_prompt_rebuild_lock = threading.Lock()
+_prompt_rebuild_pending = [False]
+_prompt_rebuild_waiter: list = [None]   # the one waiter thread, or None
+_PROMPT_REBUILD_POLL_S = 1.0
+
+
+def _apply_prompt_rebuild() -> bool:
+    """Rebuild _system_prompt from FRESH memory (learn_from_turn's worker
+    writes new facts to disk under _memory_lock, not into main()'s stale
+    `memory` local). Returns True when the prompt actually changed."""
+    global _system_prompt
+    new = build_system_prompt(load_memory())
+    changed = new != _system_prompt
+    _system_prompt = new
+    return changed
+
+
+def _request_prompt_rebuild(now: float | None = None) -> str:
+    """The post-turn rebuild Timer's entry point. Returns 'applied' (rebuilt
+    now: cloud route, or the owner has been quiet for the whole window) or
+    'deferred' (local route mid-conversation: ONE pending rebuild, applied by
+    the waiter once the quiet window has elapsed — however many turns asked
+    for it in between). 'error' when the rebuild itself raised."""
+    try:
+        try:
+            # A 0.0 window is documented as the old behaviour (every rebuild
+            # applies at once): it must ignore the turn / capture flags too,
+            # or the 2 s Timer landing after the owner started the NEXT
+            # capture would still defer it (and later schedule a re-prime).
+            _freeze = (_prompt_freeze_quiet_s() > 0.0
+                       and _chat_takes_local_branch())
+        except Exception:
+            _freeze = False
+        if not (_freeze and _conversation_active(now)):
+            _apply_prompt_rebuild()
+            return "applied"
+        with _prompt_rebuild_lock:
+            _prompt_rebuild_pending[0] = True
+        _ensure_prompt_rebuild_waiter()
+        return "deferred"
+    except Exception as _e:
+        print(f"  [prompt-freeze] rebuild failed: {_e}")
+        return "error"
+
+
+def _poll_deferred_prompt_rebuild(now: float | None = None) -> bool:
+    """Apply the pending rebuild if the quiet window has elapsed. True when it
+    was applied. After a rebuild that CHANGED the prompt, schedules the idle
+    re-prime (its only trigger)."""
+    with _prompt_rebuild_lock:
+        if not _prompt_rebuild_pending[0] or _conversation_active(now):
+            return False
+        _prompt_rebuild_pending[0] = False
+    changed = _apply_prompt_rebuild()
+    print(f"  [prompt-freeze] deferred rebuild applied "
+          f"({'changed' if changed else 'unchanged'})")
+    if changed:
+        _schedule_local_reprime()
+    return True
+
+
+def _prompt_rebuild_waiter_loop() -> None:
+    while True:
+        with _prompt_rebuild_lock:
+            if not _prompt_rebuild_pending[0]:
+                _prompt_rebuild_waiter[0] = None
+                return
+        try:
+            _poll_deferred_prompt_rebuild()
+        except Exception as _e:
+            print(f"  [prompt-freeze] deferred rebuild failed: {_e}")
+        time.sleep(_PROMPT_REBUILD_POLL_S)
+
+
+def _ensure_prompt_rebuild_waiter() -> bool:
+    """Start the single waiter thread unless one is already running."""
+    with _prompt_rebuild_lock:
+        t = _prompt_rebuild_waiter[0]
+        if t is not None and t.is_alive():
+            return False
+        t = threading.Thread(target=_prompt_rebuild_waiter_loop,
+                             name="prompt-rebuild-deferred", daemon=True)
+        _prompt_rebuild_waiter[0] = t
+    try:
+        t.start()
+    except Exception:
+        with _prompt_rebuild_lock:
+            _prompt_rebuild_waiter[0] = None
+        return False
+    return True
+
+
+# ── 4. idle re-prime of the local prefix ──────────────────────────────────
+_reprime_lock = threading.Lock()
+_reprime_running = [False]      # a worker exists (debouncing or posting)
+_reprime_again = [False]        # a trigger arrived while the POST ran
+_reprime_prefix_hash = [""]     # hash of the last primed prefix ('' = none)
+_REPRIME_DEBOUNCE_S = 1.0
+
+
+def _game_mode_active() -> bool:
+    try:
+        return bool(getattr(getattr(sys.modules.get("skill_game_mode"), "_st",
+                                    None), "active", False))
+    except Exception:
+        return False
+
+
+def _local_prefix_hash(payload: dict, *, drop_last: bool) -> str:
+    """Hash of what a local call's prompt cache is keyed on: model, the
+    message list (minus the final user message when `drop_last`), options
+    other than num_predict, keep_alive and think."""
+    msgs = list(payload.get("messages") or [])
+    if drop_last and msgs:
+        msgs = msgs[:-1]
+    opts = {k: v for k, v in (payload.get("options") or {}).items()
+            if k != "num_predict"}
+    blob = json.dumps({"model": payload.get("model"), "messages": msgs,
+                       "options": opts, "keep_alive": payload.get("keep_alive"),
+                       "think": payload.get("think")},
+                      sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+
+
+def _build_reprime_payload() -> dict | None:
+    """The EXACT next local turn's /api/chat body minus its (unknown) final
+    user message, with num_predict=1. Built by the same code as the real call:
+    _local_stable_system_prompt -> _local_chat_prompt -> _local_chat_payload,
+    over the history _call_llm will send once it has appended the next user
+    message and trimmed (_trimmed_history — so a turn that triggers the
+    chunked trim is predicted too). None when the cache-stable layout does not
+    apply (the legacy layout's system prompt depends on the user's words)."""
+    system = _local_stable_system_prompt()
+    if system is None:
+        return None
+    model = _get_local_llm_model()
+    placeholder = {"role": "user", "content": ""}
+    hist = _trimmed_history(list(conversation_history) + [placeholder])
+    if not hist or hist[-1] is not placeholder:
+        return None
+    sys_prompt, msgs = _local_chat_prompt(system, hist)
+    return _local_chat_payload(model, sys_prompt, list(msgs)[:-1], max_tokens=1)
+
+
+def _reprime_skip_reason() -> str | None:
+    """Why an idle re-prime must not run right now (None = go). Deliberately
+    NOT gated on _record_speech_active — see _utterance_in_progress."""
+    if not LOCAL_PREFIX_REPRIME:
+        return "disabled"
+    if not LOCAL_LLM_FALLBACK:
+        return "local-off"
+    try:
+        if not _chat_takes_local_branch():
+            return "route"
+    except Exception:
+        return "route"
+    if _utterance_in_progress[0]:
+        return "utterance"
+    # VOICE_MODE='realtime' (experimental, off by default) captures on the
+    # streaming STT pipeline's own thread and never goes through
+    # record_speech, so _utterance_in_progress cannot see the owner
+    # mid-sentence there: never prime while such a session is live.
+    try:
+        if (_realtime_session[0] is not None
+                and not _realtime_disabled_for_session[0]):
+            return "utterance"
+    except Exception:
+        return "utterance"
+    if _turn_in_progress[0]:
+        return "turn"
+    if _game_mode_active():
+        return "game"
+    return None
+
+
+def _reprime_once() -> str:
+    """One gated re-prime POST. Returns 'primed', 'failed' or the skip reason.
+    Touches NOTHING that marks the prefix dirty or schedules work: no rebuild
+    request, no activity stamp, no turn-timing mark, no re-prime trigger."""
+    reason = _reprime_skip_reason()
+    if reason:
+        print(f"  [reprime] skip {reason}")
+        return reason
+    payload = _build_reprime_payload()
+    if payload is None:
+        print("  [reprime] skip layout")
+        return "layout"
+    # NEVER cold-load: with OLLAMA_MAX_LOADED_MODELS=1 a request naming a
+    # non-resident model evicts whatever is resident (the game-mode brain, or
+    # whatever the out-of-process VRAM yield guard left) and loads ~15 GB.
+    # exact=True: the chat brain and the game-mode brain are two tags of ONE
+    # family, and the default family match would call the big one resident
+    # while only the small one is loaded (same reason as game_mode._same).
+    from core import ollama_opts as _oo
+    if not _oo.model_resident(payload["model"], base_url=LOCAL_LLM_BASE_URL,
+                              timeout_s=_oo.probe_timeout(LOCAL_LLM_BASE_URL),
+                              exact=True):
+        print("  [reprime] skip not-resident")
+        return "not-resident"
+    # Stamp the primed prefix BEFORE the POST: an owner turn that starts
+    # while it is in flight queues behind it on Ollama's single slot and must
+    # be compared against THIS prefix (a stamp after the POST returned was
+    # consumed by the NEXT turn instead, a different prefix -> false stale).
+    primed = _local_prefix_hash(payload, drop_last=False)
+    with _reprime_lock:
+        _reprime_prefix_hash[0] = primed
+
+    def _unstamp() -> None:
+        # Failed: nothing was warmed. Clear only our own stamp (a turn may
+        # already have consumed it; never clobber anything newer).
+        with _reprime_lock:
+            if _reprime_prefix_hash[0] == primed:
+                _reprime_prefix_hash[0] = ""
+
+    t0 = time.perf_counter()
+    try:
+        # Same endpoint + timeout as a real turn; num_ctx is pinned by the
+        # shared builder (_local_chat_payload -> chat_options / _local_num_ctx),
+        # so this can never reload the runner under a different context.
+        r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat", json=payload,
+                          timeout=_LOCAL_GENERATE_TIMEOUT)
+        ms = int((time.perf_counter() - t0) * 1000)
+        if not r.ok:
+            _unstamp()
+            print(f"  [reprime] failed {ms} status={r.status_code}")
+            return "failed"
+        try:
+            pe = int((r.json() or {}).get("prompt_eval_count"))
+        except Exception:
+            pe = -1
+    except Exception as _e:
+        _unstamp()
+        print(f"  [reprime] failed {type(_e).__name__}")
+        return "failed"
+    print(f"  [reprime] {ms} pe={pe}")
+    return "primed"
+
+
+def _reprime_worker() -> None:
+    try:
+        while True:
+            time.sleep(_REPRIME_DEBOUNCE_S)
+            with _reprime_lock:
+                _reprime_again[0] = False
+            _reprime_once()
+            with _reprime_lock:
+                if not _reprime_again[0]:
+                    _reprime_running[0] = False
+                    return
+    except Exception as _e:
+        print(f"  [reprime] worker failed: {type(_e).__name__}")
+        with _reprime_lock:
+            _reprime_running[0] = False
+
+
+def _schedule_local_reprime() -> bool:
+    """Single-flight, debounced (_REPRIME_DEBOUNCE_S) idle re-prime. True when
+    a worker was started; a trigger while one exists only asks it to run once
+    more after its current POST (a trigger during the debounce is absorbed:
+    the payload is built after the debounce, from the newest prompt)."""
+    if not LOCAL_PREFIX_REPRIME:
+        return False
+    with _reprime_lock:
+        if _reprime_running[0]:
+            _reprime_again[0] = True
+            return False
+        _reprime_running[0] = True
+        _reprime_again[0] = False
+    try:
+        threading.Thread(target=_reprime_worker, name="local-reprime",
+                         daemon=True).start()
+    except Exception:
+        with _reprime_lock:
+            _reprime_running[0] = False
+        return False
+    return True
+
+
+# Thread-local marker: set ONLY around _call_llm's local-route chat call, so
+# the stale check is taken by the owner turn's primary call and never by a
+# background _llm_quick / learn call, a skill's local call, or the follow-up
+# round (all of which also run through _call_local_llm while
+# _turn_in_progress is True, on a different prefix).
+_owner_chat_call = threading.local()
+
+
+def _in_owner_chat_call() -> bool:
+    return bool(getattr(_owner_chat_call, "active", False))
+
+
+def _reprime_check_stale(payload: dict) -> bool | None:
+    """On the owner turn's primary local chat call after a re-prime: did the
+    prime warm this exact prefix? Logs '[reprime] stale' when not. One
+    comparison per prime (compare-and-clear under _reprime_lock). The hash is
+    stamped before the prime's POST, so a turn that starts while the prime is
+    still in flight (it just queues behind it on Ollama's single slot — no
+    cancellation needed) is compared against it too."""
+    try:
+        if not _in_owner_chat_call():
+            return None
+        with _reprime_lock:
+            primed = _reprime_prefix_hash[0]
+            if not primed:
+                return None
+            _reprime_prefix_hash[0] = ""
+        stale = _local_prefix_hash(payload, drop_last=True) != primed
+        if stale:
+            print("  [reprime] stale")
+        return stale
+    except Exception:
+        return None
+
+
 def _call_llm(user_text: str) -> str:
     # New reply, new early-speech ledger: whatever the flush buffer voiced
     # last turn was already consumed by the downstream speaker, and a stale
@@ -16299,8 +16808,9 @@ def _call_llm(user_text: str) -> str:
     except Exception:
         pass
 
-    from core.config import model_route
-    _chat_route = model_route("chat")
+    # The ONE route predicate — the idle re-prime asks the very same question
+    # (_chat_takes_local_branch) before it warms the local prefix.
+    _chat_route = "local" if _chat_takes_local_branch() else "cloud"
 
     # DYNAMIC LOCAL PROMPT: on the local path, swap the full PC_CONTROL block for
     # a per-turn slim version (only the sections this text implicates) so the
@@ -16322,10 +16832,11 @@ def _call_llm(user_text: str) -> str:
         # section BODIES this turn implicates move to the user message.
         try:
             from core import prompt_router as _pr
-            _stable_pc = (_LOCAL_NEVER_GUESS_GUARD + "\n"
-                          + _pr.stable_pc_block(PC_CONTROL_PROMPT))
-            _base_prompt = _system_prompt.replace(
-                PC_CONTROL_PROMPT, _stable_pc, 1)
+            # Shared with the idle re-prime (_build_reprime_payload), so the
+            # prefix it warms is byte-for-byte the one this turn sends.
+            _base_prompt = _local_stable_system_prompt(_system_prompt)
+            if _base_prompt is None:
+                raise RuntimeError("stable layout unavailable")
             _turn_ctx = _pr.turn_pc_block(user_text, PC_CONTROL_PROMPT)
             _stable_split = True
         except Exception as _pr_err:
@@ -16360,6 +16871,10 @@ def _call_llm(user_text: str) -> str:
         # VOLATILE tail so it never invalidates the cached stable prefix
         # (see _cached_system_param); '' when disabled / cold / slow.
         + _ltm_context(user_text)
+        # Phrasebook "last used" rotation hint (2026-09-29): per-turn by
+        # nature, so it lives here with the other volatile material and never
+        # in the system prompt, where each rotation changed the cached prefix.
+        + _phrase_rotation_hint()
     )
 
     if _stable_split:
@@ -16395,8 +16910,16 @@ def _call_llm(user_text: str) -> str:
         # back to Claude if reachable, else speak an HONEST unavailability line
         # (SAC-specific when we have evidence) — never a fabricated answer and
         # never a silent freeze (the generate read-timeout trips the fallback).
-        reply = _local_then_cloud_or_honest(
-            sys_prompt_now, _with_turn_context(conversation_history, _turn_ctx))
+        # Mark this thread's call as the owner turn's primary chat call: the
+        # only one allowed to take the idle re-prime's stale verdict
+        # (_reprime_check_stale).
+        _owner_chat_call.active = True
+        try:
+            reply = _local_then_cloud_or_honest(
+                sys_prompt_now,
+                _with_turn_context(conversation_history, _turn_ctx))
+        finally:
+            _owner_chat_call.active = False
     elif AI_BACKEND == "claude":
         import anthropic
         try:
@@ -16538,11 +17061,15 @@ def _call_llm(user_text: str) -> str:
 
     _prof("reply_ready", reply[:40].replace("\t", " "))
     conversation_history.append({"role": "assistant", "content": reply})
+    # A JARVIS reply is conversation activity: it (re)starts the prompt-freeze
+    # quiet window (see _request_prompt_rebuild).
+    _note_conversation_activity()
     _ltm_enqueue("assistant", reply)
 
     # Update phrasebook rotation state — scan the reply for any canonical MCU
-    # lines and record them in memory so the next turn's system prompt asks
-    # the LLM to rotate to a different phrase in each matched intent bucket.
+    # lines and record them in memory so the next turn's rotation hint
+    # (_phrase_rotation_hint, per-turn context) asks the LLM to rotate to a
+    # different phrase in each matched intent bucket.
     try:
         hits = _mcu_phrases.detect_phrases_in_reply(reply)
         if hits:
@@ -16551,6 +17078,7 @@ def _call_llm(user_text: str) -> str:
                 _last = _mem.setdefault("last_used_phrase_by_intent", {})
                 _last.update(hits)
                 save_memory(_mem)
+                _phrase_rotation_last[0] = dict(_last)
     except Exception as _phr_err:
         print(f"  [phrase-rotation] update failed: {_phr_err}")
 
@@ -25495,6 +26023,12 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
         _tone_system_addendum(_last_user_tone[0])
         + _route.get("addendum", "")
         + _mode_add
+        # Phrasebook rotation hint: it used to ride _system_prompt, so the
+        # follow-up round (often the reply actually spoken after an action)
+        # saw which lines were used last. Now per-turn, it rides with the
+        # other addenda: _local_ctx on the stable local layout, the uncached
+        # tail of sys_prompt_now everywhere else.
+        + _phrase_rotation_hint()
     )
     # LEGACY (full-prompt) layout — what every non-local branch below uses, and
     # what _cached_system_param is built to split. The cache-stable layout is
@@ -29873,6 +30407,9 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 # + transcribe and synthesise safe pass-through metadata.
                 _injected_text = _drain_injected_command()
                 _tt_loop_top(_injected_text)   # [turn-timing] turn scope
+                # Prompt freeze / re-prime gates: the previous turn (if any)
+                # is over and an unaccepted capture was dropped.
+                _note_turn_boundary()
 
                 # ── SLEEP / STANDBY MODE — only listen for the wake phrase ────────
                 if _sleep_mode[0]:
@@ -29948,6 +30485,9 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
 
                 print(f"  You:    {text}")
                 _tt("mark", "you")
+                # An owner turn (voice or typed): freezes the local prompt
+                # prefix for PROMPT_FREEZE_QUIET_S (_request_prompt_rebuild).
+                _note_owner_turn()
                 # Rolling 5-line history feeds the holographic HUD v2
                 # scrolling transcript panel. Cap at 5 entries here so the
                 # JSON file stays small.
@@ -30076,17 +30616,18 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                     print("  [ambient-learning] reply delivered — back to silent "
                           "standby (say 'JARVIS' for more)")
 
-                # Rebuild prompt with any newly-learned facts after a short delay
-                # so the very next turn already has them. Daemon so Ctrl-C exits
-                # cleanly even if a Timer is pending. Reload memory FRESH from disk
-                # — learn_from_turn's background worker writes new facts via
+                # Rebuild prompt with any newly-learned facts after a short delay.
+                # Daemon so Ctrl-C exits cleanly even if a Timer is pending.
+                # _request_prompt_rebuild reloads memory FRESH from disk —
+                # learn_from_turn's background worker writes new facts via
                 # merge_memory() under _memory_lock, NOT into the main loop's
-                # stale `memory` local; building from that local meant this rebuild
-                # never actually saw the new facts (the whole point of the delay).
-                # 2026-05-30 deep audit.
-                _t = threading.Timer(2.0, lambda: globals().__setitem__(
-                    "_system_prompt", build_system_prompt(load_memory())
-                ))
+                # stale `memory` local (2026-05-30 deep audit). On the LOCAL
+                # route mid-conversation it DEFERS the swap until the owner has
+                # been quiet for PROMPT_FREEZE_QUIET_S (one pending rebuild, not
+                # one per turn): swapping _system_prompt between turns changed
+                # the cached prefix and cost every next turn a full ~3 s prompt
+                # re-evaluation (2026-09-29).
+                _t = threading.Timer(2.0, _request_prompt_rebuild)
                 _t.daemon = True
                 _t.start()
 

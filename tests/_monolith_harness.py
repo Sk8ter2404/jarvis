@@ -189,6 +189,17 @@ _MONOLITH_RESTORE_NAMES = (
     # drove a capture would make a LATER test's dispatch print a stray
     # [turn-timing] line into output it asserts on.
     "_turn_timing",
+    # Local prompt-prefix stability (2026-09-29): the conversation-activity
+    # gates, the deferred-rebuild and re-prime single-flight cells and the
+    # phrase-rotation cache. A leaked _turn_in_progress / pending rebuild /
+    # running re-prime would make a LATER test's freeze or re-prime decision
+    # pass or fail for the wrong reason. _system_prompt is rebind-restored so
+    # a test that applied a rebuild cannot leak its prompt.
+    "_system_prompt",
+    "_phrase_rotation_last", "_last_convo_activity", "_turn_in_progress",
+    "_utterance_in_progress", "_prompt_rebuild_pending",
+    "_prompt_rebuild_waiter", "_reprime_running", "_reprime_again",
+    "_reprime_prefix_hash",
     # H-6 (2026-08-20): the abandoned-native-close count. A leaked non-zero
     # value would make every later _refresh_devices test silently defer its
     # reinit — the exact "green for the wrong reason" shape.
