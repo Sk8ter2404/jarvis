@@ -244,6 +244,25 @@ LOCAL_LLM_BASE_URL = "http://127.0.0.1:11434"
 PROMPT_FREEZE_QUIET_S = 30.0
 LOCAL_PREFIX_REPRIME = True
 
+# ─── Local background traffic (2026-09-29) ─────────────────────────────
+# The local model keeps only its most recent request warm, so ANY background
+# request (memory extraction after a turn, the ambient extractor, a Teams
+# screenshot read by the vision model) between two of your turns makes the
+# next turn re-read the whole ~12k-token prompt (~2.2 s measured). LOCAL chat
+# route only.
+# LOCAL_BACKGROUND_MAX_DEFER_S — while you and JARVIS are talking (the
+#   PROMPT_FREEZE_QUIET_S window), non-urgent background local work waits,
+#   queued in order, until you go quiet — but never longer than this many
+#   seconds (then it runs between turns). Your own requests never wait.
+#   Float; 0.0 turns the waiting off (the old behaviour).
+# LOCAL_REPRIME_AFTER_BACKGROUND_WINDOW_S — after such background work ran,
+#   quietly re-send your conversation's prompt to the already-loaded model
+#   (the same small re-prime as above, same safeguards) if you spoke within
+#   this many seconds, so your next turn starts warm. Float; 0.0 turns it off.
+# Changes apply on the next start.
+LOCAL_BACKGROUND_MAX_DEFER_S = 120.0
+LOCAL_REPRIME_AFTER_BACKGROUND_WINDOW_S = 600.0
+
 # When True, every ambient/background one-shot LLM call (memory extraction,
 # proactive comments, the ambient extractor — everything routed through
 # `_llm_quick`) runs on the LOCAL model ONLY and never touches Claude, so

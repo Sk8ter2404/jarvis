@@ -72,6 +72,10 @@ def _ensure_project_on_path() -> None:
         sys.path.insert(0, _PROJECT_DIR)
 
 
+_ensure_project_on_path()
+from core import local_traffic as _local_traffic  # noqa: E402
+
+
 def _get_bobert():
     return (sys.modules.get("bobert_companion")
             or sys.modules.get("__main__"))
@@ -308,7 +312,15 @@ def _loop() -> None:
     print(f"  [ambient-extract] daemon online, interval={int(interval)}s")
     while not _stop_evt.is_set():
         try:
-            _run_once()
+            # A periodic pass is NON-URGENT background work: on the local
+            # route its LLM call waits (bounded) while the owner is talking
+            # to the local brain, so it can't evict the warm conversation
+            # prefix mid-chat. Stopping the daemon ends the wait at once. The
+            # on-demand ambient_extract_now action is the owner's and never
+            # waits. See core/local_traffic.py.
+            with _local_traffic.background_work(
+                    "ambient-extract", cancel=_stop_evt.is_set):
+                _run_once()
         except Exception as e:
             _last_error = f"extraction failed: {e}"
             print(f"  [ambient-extract] {_last_error}")

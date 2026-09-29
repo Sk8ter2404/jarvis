@@ -470,6 +470,39 @@ class AmbientExtractLoopTests(unittest.TestCase):
             self.mod._loop()
         self.assertIn("extraction failed", self.mod._last_error)
 
+    def test_periodic_pass_is_tagged_background_work(self):
+        # 2026-09-29: the periodic pass must not evict the local brain's warm
+        # conversation prefix mid-chat, so it runs as tagged background work
+        # (its LLM call then waits, bounded, in core.local_traffic's gate)
+        # and a stop ends that wait.
+        from core import local_traffic as lt
+        self.mod._stop_evt = self.mod.threading.Event()
+        seen = []
+
+        def _pass():
+            job = lt.current_job()
+            seen.append((job.tag, job.cancel()) if job else None)
+            self.mod._stop_evt.set()
+            seen.append(job.cancel() if job else None)
+        with mock.patch.object(self.mod, "_get_config", return_value=300.0), \
+             mock.patch.object(self.mod, "_run_once", side_effect=_pass), \
+             mock.patch.object(self.mod._stop_evt, "wait", return_value=True):
+            self.mod._loop()
+        self.assertEqual(seen, [("ambient-extract", False), True])
+        self.assertIsNone(lt.current_job())
+
+    def test_on_demand_pass_is_the_owners_and_untagged(self):
+        from core import local_traffic as lt
+        seen = []
+        with mock.patch.object(self.mod, "_run_once",
+                               side_effect=lambda: seen.append(
+                                   lt.current_job()) or {
+                                   "mic_entries": 0, "audio_entries": 0,
+                                   "screen_entries": 0, "facts_added": 0,
+                                   "projects_added": 0}):
+            self.actions["ambient_extract_now"]("")
+        self.assertEqual(seen, [None])
+
     def test_loop_skips_body_when_already_stopped(self):
         # _stop_evt already set → while-condition false → body never runs.
         self.mod._stop_evt = self.mod.threading.Event()

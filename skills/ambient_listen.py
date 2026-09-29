@@ -1462,6 +1462,18 @@ def _summarize_screen_via_vlm(png_bytes: bytes) -> Optional[dict]:
     }
 
 
+def _background_work(tag: str, cancel=None):
+    """core.local_traffic.background_work(tag, cancel), or a no-op context
+    if it can't be imported. Never raises."""
+    try:
+        _ensure_project_on_path()
+        from core import local_traffic as _lt
+        return _lt.background_work(tag, cancel=cancel)
+    except Exception:
+        import contextlib
+        return contextlib.nullcontext()
+
+
 def _screen_worker_loop() -> None:
     """Periodic screen-snapshot daemon. Honours blocklist, dedupes via
     pHash, and respects the daily vision budget."""
@@ -1566,7 +1578,12 @@ def _screen_worker_loop() -> None:
                 continue
         _screen_last_phash = h
 
-        result = _summarize_screen_via_vlm(png_bytes)
+        # NON-URGENT background work: on the local route the VLM call waits
+        # (bounded) while the owner is talking to the local brain, so a
+        # periodic screen summary never evicts the warm conversation prefix
+        # mid-chat; stopping the daemon ends the wait (core/local_traffic.py).
+        with _background_work("ambient-screen", _screen_stop_evt.is_set):
+            result = _summarize_screen_via_vlm(png_bytes)
         if not result:
             with _lock:
                 _screen_skipped_total += 1

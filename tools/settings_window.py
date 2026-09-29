@@ -460,6 +460,23 @@ SCHEMA: dict[str, dict] = {
                 "exactly, without the AI model. Anything else still goes to "
                 "the model. Applies on the next start.",
     },
+    "LOCAL_BACKGROUND_MAX_DEFER_S": {
+        "tab": "ai", "label": "Hold background brain work while talking (max seconds)",
+        "type": "float", "default": 120.0,
+        "help": "Local brain only: memory extraction, the ambient extractor "
+                "and the Teams check wait until you go quiet, so they don't "
+                "make your next reply re-read the whole prompt — but never "
+                "longer than this. Your own requests never wait (0 = don't "
+                "hold them). Applies on the next start.",
+    },
+    "LOCAL_REPRIME_AFTER_BACKGROUND_WINDOW_S": {
+        "tab": "ai", "label": "Re-warm after background work (seconds since you spoke)",
+        "type": "float", "default": 600.0,
+        "help": "After background work used the local brain, quietly re-warm "
+                "your conversation if you spoke within this many seconds, so "
+                "your next turn is fast. Same safeguards as the re-warm above "
+                "(0 = off). Applies on the next start.",
+    },
     "STREAMING_TTS_ENABLED": {
         "tab": "voice", "label": "Speak while replies stream", "type": "bool",
         "default": True,

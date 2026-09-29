@@ -614,6 +614,67 @@ def _abnormal_reasons(pulse: dict) -> list[tuple[str, str]]:
     return reasons
 
 
+# ─── JARVIS's own GPU load (2026-09-29) ─────────────────────────────────
+# The pulse read "GPU pinned at 99 percent" while the load was JARVIS's OWN
+# local model answering a turn / reading a screenshot / re-priming, and spoke
+# it as an abnormal event. core.local_traffic tracks every local-model POST
+# the monolith makes; while one is in flight or finished within
+# OWN_INFERENCE_GRACE_S, a high GPU reading is presumed ours. The pulse then
+# waits (bounded) for our inference to settle and samples again, so genuine
+# sustained external load (a game, a render) is still reported.
+OWN_INFERENCE_GRACE_S   = 10.0
+OWN_INFERENCE_SETTLE_S  = 60.0    # max wait for our own inference to stop
+
+
+def _own_inference_recent(window_s: float = OWN_INFERENCE_GRACE_S) -> bool:
+    """Is JARVIS's own local model running, or did it finish < window_s ago?
+    False when the tracker is unavailable. Never raises."""
+    try:
+        from core import local_traffic as _lt
+        return bool(_lt.own_inference_recent(window_s))
+    except Exception:
+        return False
+
+
+def _drop_self_inflicted_gpu(pulse: dict, reasons: list, *,
+                             own_busy=None, regather=None, sleep=None,
+                             clock=None, settle_s: float | None = None
+                             ) -> tuple[dict, list]:
+    """Return (pulse, reasons) with a 'gpu' reason removed when the GPU load
+    is JARVIS's own inference. Other reasons are untouched.
+
+    When the gpu reason fires while our own inference is recent: wait (up to
+    settle_s, polling) until it has been idle for OWN_INFERENCE_GRACE_S, then
+    re-gather ONCE. Still pinned with our inference idle -> it is someone
+    else's load: keep a fresh gpu reason (and the fresh pulse). Otherwise, or
+    if ours never settled, drop it -- a later tick re-checks (the cooldown is
+    only stamped for reasons actually spoken). Never raises."""
+    try:
+        if not any(k == "gpu" for k, _ in reasons):
+            return pulse, reasons
+        own_busy = own_busy or _own_inference_recent
+        if not own_busy():
+            return pulse, reasons
+        regather = regather or _gather_pulse
+        sleep = sleep or time.sleep
+        clock = clock or time.monotonic
+        limit = OWN_INFERENCE_SETTLE_S if settle_s is None else settle_s
+        deadline = clock() + max(0.0, limit)
+        while own_busy() and clock() < deadline:
+            sleep(1.0)
+        others = [(k, lead) for (k, lead) in reasons if k != "gpu"]
+        if not own_busy():
+            fresh = regather()
+            fresh_gpu = [(k, lead) for (k, lead) in _abnormal_reasons(fresh)
+                         if k == "gpu"]
+            if fresh_gpu:
+                return fresh, fresh_gpu + others
+        print("  [pulse] gpu reading suppressed (JARVIS's own local model)")
+        return pulse, others
+    except Exception:
+        return pulse, reasons
+
+
 # ─── background threads ──────────────────────────────────────────────────
 
 def _hud_publish_loop() -> None:
@@ -639,6 +700,8 @@ def _proactive_loop() -> None:
         try:
             pulse = _gather_pulse()
             reasons = _abnormal_reasons(pulse)
+            # A pinned GPU during JARVIS's own inference is not news.
+            pulse, reasons = _drop_self_inflicted_gpu(pulse, reasons)
             now = time.time()
             with _alert_lock:
                 fresh_reasons = [

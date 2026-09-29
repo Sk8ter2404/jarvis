@@ -180,6 +180,24 @@ class StructuralInvariantTests(unittest.TestCase):
         self.assertEqual(config.PROMPT_FREEZE_QUIET_S, 30.0)
         self.assertIs(config.LOCAL_PREFIX_REPRIME, True)
 
+    def test_background_traffic_settings_ship_on_with_float_windows(self):
+        # 2026-09-29 (r6): both knobs are float literals (an int default would
+        # make _apply_user_settings truncate a saved 90.5 to 90), both ship
+        # ON (a positive window), 0.0 is documented as "off", and the comment
+        # promises "next start" like the other import-time knobs.
+        self.assertIsInstance(config.LOCAL_BACKGROUND_MAX_DEFER_S, float)
+        self.assertEqual(config.LOCAL_BACKGROUND_MAX_DEFER_S, 120.0)
+        self.assertIsInstance(config.LOCAL_REPRIME_AFTER_BACKGROUND_WINDOW_S,
+                              float)
+        self.assertEqual(config.LOCAL_REPRIME_AFTER_BACKGROUND_WINDOW_S, 600.0)
+        with open(config.__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        block = src[src.index("Local background traffic (2026-09-29)"):
+                    src.index("LOCAL_BACKGROUND_MAX_DEFER_S = 120.0")]
+        self.assertIn("0.0 turns the waiting off", block)
+        self.assertIn("0.0 turns it off", block)
+        self.assertIn("apply on the next start", block)
+
     def test_sentence_tts_ships_on_and_says_next_start(self):
         # 2026-09-29: per-sentence Kokoro speech is ON by default (a bool, so
         # _apply_user_settings keeps a saved true/false), and its comment

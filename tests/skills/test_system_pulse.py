@@ -1296,5 +1296,92 @@ class PulseSingleHwinfoReadTests(unittest.TestCase):
             self.assertEqual(self.mod._read_hwinfo_summary(), {})
 
 
+class PulseOwnGpuLoadTests(unittest.TestCase):
+    """2026-09-29, live: a proactive pulse fired reasons ['gpu'] and said
+    "GPU pinned at 99 percent, sir" while the load was JARVIS's own local
+    model. A pinned reading during (or within OWN_INFERENCE_GRACE_S of) our
+    own inference is dropped; genuine sustained external load, still pinned
+    once ours has settled, is reported."""
+
+    PINNED = {"gpu_util_pct": 99.0, "ram_pct": 95.0}
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("system_pulse")
+        self.sleeps = []
+
+    def _run(self, busy_seq, regathered=None, settle_s=5.0):
+        seq = list(busy_seq)
+
+        def _busy():
+            return seq.pop(0) if len(seq) > 1 else seq[0]
+        clock = [0.0]
+
+        def _sleep(s):
+            self.sleeps.append(s)
+            clock[0] += s
+        regather = mock.MagicMock(return_value=regathered or {})
+        reasons = self.mod._abnormal_reasons(self.PINNED)
+        with mock.patch("builtins.print"):
+            pulse, out = self.mod._drop_self_inflicted_gpu(
+                dict(self.PINNED), reasons, own_busy=_busy, regather=regather,
+                sleep=_sleep, clock=lambda: clock[0], settle_s=settle_s)
+        return pulse, dict(out), regather
+
+    def test_own_inference_drops_the_gpu_reason_only(self):
+        # ours never settles within the bound -> dropped, RAM kept
+        pulse, out, regather = self._run([True], settle_s=3.0)
+        self.assertNotIn("gpu", out)
+        self.assertIn("ram", out)
+        regather.assert_not_called()
+        self.assertEqual(len(self.sleeps), 3, "the settle wait is bounded")
+
+    def test_our_load_gone_after_settling_is_dropped(self):
+        pulse, out, regather = self._run(
+            [True, True, False], regathered={"gpu_util_pct": 12.0})
+        self.assertNotIn("gpu", out)
+        regather.assert_called_once_with()
+
+    def test_sustained_external_load_is_still_reported(self):
+        fresh = {"gpu_util_pct": 98.0}
+        pulse, out, regather = self._run([True, False], regathered=fresh)
+        self.assertIn("gpu", out)
+        self.assertIn("98 percent", out["gpu"])
+        self.assertIs(pulse, fresh, "the report must use the fresh sample")
+
+    def test_no_own_inference_leaves_everything_alone(self):
+        pulse, out, regather = self._run([False])
+        self.assertIn("gpu", out)
+        self.assertIn("99 percent", out["gpu"])
+        regather.assert_not_called()
+        self.assertEqual(self.sleeps, [])
+
+    def test_no_gpu_reason_never_consults_the_tracker(self):
+        busy = mock.MagicMock(return_value=True)
+        reasons = self.mod._abnormal_reasons({"ram_pct": 95.0})
+        pulse, out = self.mod._drop_self_inflicted_gpu(
+            {"ram_pct": 95.0}, reasons, own_busy=busy)
+        busy.assert_not_called()
+        self.assertEqual(out, reasons)
+
+    def test_default_predicate_reads_the_shared_tracker(self):
+        from core import local_traffic as lt
+        lt.TRACKER.reset()
+        self.addCleanup(lt.TRACKER.reset)
+        self.assertFalse(self.mod._own_inference_recent())
+        with lt.TRACKER.track():
+            self.assertTrue(self.mod._own_inference_recent())
+        self.assertTrue(self.mod._own_inference_recent(),
+                        "a POST that just finished is still ours")
+        self.assertFalse(self.mod._own_inference_recent(window_s=0.0))
+
+    def test_the_proactive_loop_filters_before_speaking(self):
+        import inspect
+        src = inspect.getsource(self.mod._proactive_loop)
+        self.assertLess(src.index("_abnormal_reasons(pulse)"),
+                        src.index("_drop_self_inflicted_gpu(pulse, reasons)"))
+        self.assertLess(src.index("_drop_self_inflicted_gpu(pulse, reasons)"),
+                        src.index("_enqueue_speech(message)"))
+
+
 if __name__ == "__main__":
     unittest.main()

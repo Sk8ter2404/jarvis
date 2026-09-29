@@ -204,6 +204,15 @@ _MONOLITH_RESTORE_NAMES = (
     "_utterance_in_progress", "_prompt_rebuild_pending",
     "_prompt_rebuild_waiter", "_reprime_running", "_reprime_again",
     "_reprime_prefix_hash",
+    # Local background traffic control (2026-09-29, r6): the owner-turn stamp
+    # that opens the re-prime-after-eviction window, the prime's age / POST
+    # mark (the hit / evicted diagnostic) and learn_from_turn's queue + worker
+    # flag. A leaked owner stamp would make a LATER test's background call
+    # schedule a real re-prime thread; a leaked worker flag would make every
+    # later learn_from_turn queue a turn nobody drains. The shared gate in
+    # core.local_traffic is reset in _restore_monolith_pristine.
+    "_last_owner_turn_at", "_reprime_primed_at", "_reprime_posts_mark",
+    "_learn_pending", "_learn_worker_live",
     # H-6 (2026-08-20): the abandoned-native-close count. A leaked non-zero
     # value would make every later _refresh_devices test silently defer its
     # reinit — the exact "green for the wrong reason" shape.
@@ -350,6 +359,12 @@ def _restore_monolith_pristine(bc) -> None:
     _reset_filler_state(bc)
     try:
         bc._turn_timing.reset()
+    except Exception:
+        pass
+    # A test that failed while a background job held the shared gate must
+    # not make every later tagged call wait out the deferral cap.
+    try:
+        bc._lt.GATE.reset()
     except Exception:
         pass
 

@@ -1378,6 +1378,31 @@ class ScreenWorkerLoopTests(_TmpDirMixin, unittest.TestCase):
                              "sensitive": False, "sensitive_reason": ""})
         self.assertEqual(self.mod._screen_entries_total, 1)
 
+    def test_screen_summary_runs_as_tagged_background_work(self):
+        # 2026-09-29: the periodic VLM summary must not evict the local
+        # brain's warm conversation prefix mid-chat, so it runs as tagged
+        # background work (core.local_traffic's gate then defers its local
+        # POST, bounded) and the daemon's stop event ends that wait.
+        from core import local_traffic as lt
+        bc = _FakeBobert()
+        bc.AMBIENT_SCREEN_INTERVAL_S = 60.0
+        bc.AMBIENT_VISION_BUDGET_USD = 1.0
+        bc.take_all_monitor_screenshots = mock.MagicMock(
+            return_value={"mon1": self._png(80)})
+        seen = []
+
+        def _summ(png):
+            job = lt.current_job()
+            seen.append((job.tag, job.cancel()) if job else None)
+            return {"summary": "code", "entities": [], "sensitive": False,
+                    "sensitive_reason": ""}
+        with mock.patch.object(self.mod, "_summarize_screen_via_vlm",
+                               side_effect=_summ):
+            self._run(bc, wait_returns=[True])
+        self.assertEqual(seen, [("ambient-screen", False)])
+        self.assertIsNone(lt.current_job())
+        self.assertEqual(self.mod._screen_entries_total, 1)
+
     def test_screen_bobert_absent(self):
         evt = _ScriptedEvent([True])
         with mock.patch.object(self.mod, "_get_bobert", return_value=None), \

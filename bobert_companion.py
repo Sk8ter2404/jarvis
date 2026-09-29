@@ -1748,6 +1748,40 @@ def _anthropic_client(timeout: float | None = None,
     )
 
 
+# ── Local-LLM traffic control (2026-09-29, r6) ───────────────────────────
+# Ollama serves the local brain from ONE slot whose KV cache holds only the
+# most recent request, so any background local call between two owner turns
+# evicts the ~12.5k-token prefix and the next turn pays a full ~2.2 s prompt
+# re-evaluation (measured live on every turn). NON-URGENT background work is
+# tagged with _lt.background_work(tag) and waits in _lt.GATE -- bounded by
+# LOCAL_BACKGROUND_MAX_DEFER_S -- while the owner is in a conversation; the
+# gate's predicate and the re-prime-after-eviction trigger live beside the
+# idle re-prime (search "_background_defer_reason"). Logic + contracts:
+# core/local_traffic.py.
+from core import local_traffic as _lt  # noqa: E402
+
+
+def _llm_quick_goes_local() -> bool:
+    """Will _llm_quick's one-shot run on the local model (no cloud first)?
+    Mirrors _llm_quick's own branch order; False on any doubt. Never raises."""
+    try:
+        from core.config import AMBIENT_LEARNING_FORCE_LOCAL, model_route
+        return bool(AMBIENT_LEARNING_FORCE_LOCAL
+                    or model_route("ambient") == "local"
+                    or AI_BACKEND == "ollama")
+    except Exception:
+        return False
+
+
+def _bg_local_slot(applies: bool = True):
+    """The background slot for this thread's tagged job (_lt.slot()), or a
+    no-op context when `applies` is False (the call will not touch the local
+    model). _lt.slot() itself is a no-op for untagged threads and the main
+    thread, so owner calls pass straight through."""
+    import contextlib as _cl
+    return _lt.slot() if applies else _cl.nullcontext()
+
+
 def _llm_quick(system: str, user: str, max_tokens: int = 200) -> str:
     """One-shot LLM call for memory extraction / proactive comments.
 
@@ -1759,73 +1793,80 @@ def _llm_quick(system: str, user: str, max_tokens: int = 200) -> str:
 
     When AMBIENT_LEARNING_FORCE_LOCAL is set, this one-shot ALWAYS uses the local
     model and never touches Claude, so ambient/background learning is free."""
-    from core.config import AMBIENT_LEARNING_FORCE_LOCAL, model_route
-    if AMBIENT_LEARNING_FORCE_LOCAL or model_route("ambient") == "local":
-        # Ambient/background is forced to LOCAL ONLY (never touches Claude, so
-        # learning is free). When local can't answer we deliberately skip this
-        # one-shot (return "") rather than fabricating — but we LOG clearly so a
-        # wedged/blocked runner isn't a silent every-turn no-op. SAC-specific
-        # when we have evidence the runner was blocked this boot.
-        local = _call_local_llm(
-            system, [{"role": "user", "content": user}], max_tokens=max_tokens)
-        if local:
-            return local
-        if _sac_blocked_local_recently():
-            print("  [llm_quick] ambient forced-local but Smart App Control "
-                  "blocked the local runner this boot — skipping this one-shot")
-        else:
-            print("  [llm_quick] ambient forced-local; local model unavailable "
-                  "— skipping this one-shot (no cloud fallback by design)")
+    # Background traffic control (2026-09-29): a NON-URGENT caller tagged
+    # with core.local_traffic.background_work waits here, bounded, while the
+    # owner is in a conversation -- but only when this one-shot will run on
+    # the local model (the one-slot cache the next turn needs). Untagged
+    # callers (the owner's actions) and the main thread never wait. The
+    # cloud-first branch's local FALLBACK is gated inside _call_local_llm.
+    with _bg_local_slot(_llm_quick_goes_local()):
+        from core.config import AMBIENT_LEARNING_FORCE_LOCAL, model_route
+        if AMBIENT_LEARNING_FORCE_LOCAL or model_route("ambient") == "local":
+            # Ambient/background is forced to LOCAL ONLY (never touches Claude, so
+            # learning is free). When local can't answer we deliberately skip this
+            # one-shot (return "") rather than fabricating — but we LOG clearly so a
+            # wedged/blocked runner isn't a silent every-turn no-op. SAC-specific
+            # when we have evidence the runner was blocked this boot.
+            local = _call_local_llm(
+                system, [{"role": "user", "content": user}], max_tokens=max_tokens)
+            if local:
+                return local
+            if _sac_blocked_local_recently():
+                print("  [llm_quick] ambient forced-local but Smart App Control "
+                      "blocked the local runner this boot — skipping this one-shot")
+            else:
+                print("  [llm_quick] ambient forced-local; local model unavailable "
+                      "— skipping this one-shot (no cloud fallback by design)")
+            return ""
+        if AI_BACKEND == "claude":
+            import anthropic
+            try:
+                msg = _anthropic_client().messages.create(
+                    model=CLAUDE_MODEL, max_tokens=max_tokens,
+                    system=system,
+                    messages=[{"role": "user", "content": user}],
+                )
+                return msg.content[0].text
+            except Exception as e:
+                # Cloud unavailable — route this one-shot through the local
+                # model so learning doesn't stall while the cap is active.
+                local = _call_local_llm(
+                    system, [{"role": "user", "content": user}],
+                    max_tokens=max_tokens,
+                )
+                if local:
+                    return local
+                print(f"  [llm_quick] cloud failed and no local fallback "
+                      f"({type(e).__name__}: {e})")
+                return ""
+        elif AI_BACKEND == "ollama":
+            # Route through the bounded wrapper (wall-clock timeout) inside a
+            # try/except so a wedged runner raises instead of blocking this
+            # background one-shot FOREVER — matches _call_llm's hot path and the
+            # claude branch above, degrading to the local fallback then "" rather
+            # than the old unbounded ollama.chat that could hang the caller. 2026-07-08.
+            try:
+                # Resolve the model — the raw OLLAMA_MODEL default is the retired
+                # "llama3" tag (2026-07-14 audit).
+                resp = _ollama_chat_bounded(
+                    _get_local_llm_model(),
+                    [
+                        {"role": "system", "content": system},
+                        {"role": "user",   "content": user},
+                    ],
+                )
+                return resp["message"]["content"]
+            except Exception as e:
+                local = _call_local_llm(
+                    system, [{"role": "user", "content": user}],
+                    max_tokens=max_tokens,
+                )
+                if local:
+                    return local
+                print(f"  [llm_quick] ollama failed and no local fallback "
+                      f"({type(e).__name__}: {e})")
+                return ""
         return ""
-    if AI_BACKEND == "claude":
-        import anthropic
-        try:
-            msg = _anthropic_client().messages.create(
-                model=CLAUDE_MODEL, max_tokens=max_tokens,
-                system=system,
-                messages=[{"role": "user", "content": user}],
-            )
-            return msg.content[0].text
-        except Exception as e:
-            # Cloud unavailable — route this one-shot through the local
-            # model so learning doesn't stall while the cap is active.
-            local = _call_local_llm(
-                system, [{"role": "user", "content": user}],
-                max_tokens=max_tokens,
-            )
-            if local:
-                return local
-            print(f"  [llm_quick] cloud failed and no local fallback "
-                  f"({type(e).__name__}: {e})")
-            return ""
-    elif AI_BACKEND == "ollama":
-        # Route through the bounded wrapper (wall-clock timeout) inside a
-        # try/except so a wedged runner raises instead of blocking this
-        # background one-shot FOREVER — matches _call_llm's hot path and the
-        # claude branch above, degrading to the local fallback then "" rather
-        # than the old unbounded ollama.chat that could hang the caller. 2026-07-08.
-        try:
-            # Resolve the model — the raw OLLAMA_MODEL default is the retired
-            # "llama3" tag (2026-07-14 audit).
-            resp = _ollama_chat_bounded(
-                _get_local_llm_model(),
-                [
-                    {"role": "system", "content": system},
-                    {"role": "user",   "content": user},
-                ],
-            )
-            return resp["message"]["content"]
-        except Exception as e:
-            local = _call_local_llm(
-                system, [{"role": "user", "content": user}],
-                max_tokens=max_tokens,
-            )
-            if local:
-                return local
-            print(f"  [llm_quick] ollama failed and no local fallback "
-                  f"({type(e).__name__}: {e})")
-            return ""
-    return ""
 
 
 def _parse_json_array(text: str) -> list:
@@ -1839,6 +1880,18 @@ def _parse_json_array(text: str) -> list:
         return []
 
 
+# learn_from_turn's queue (2026-09-29, r6): turns waiting for extraction.
+# ONE worker drains it. On the local route the worker waits (bounded) in the
+# background gate while the owner is in a conversation, so the turns that
+# arrive meanwhile are extracted by ONE call when it goes quiet instead of one
+# prefix-evicting call per turn. At most _LEARN_BATCH_MAX turns per call; the
+# rest go in the next call.
+_learn_lock = threading.Lock()
+_learn_pending: list = []          # [(user_msg, ai_reply), ...] oldest first
+_learn_worker_live = [False]       # a worker thread owns the queue
+_LEARN_BATCH_MAX = 6
+
+
 def learn_from_turn(user_msg: str, ai_reply: str, memory: dict):
     """Background: extract new facts/projects/topic from this exchange.
 
@@ -1848,82 +1901,168 @@ def learn_from_turn(user_msg: str, ai_reply: str, memory: dict):
     and the extractor's 'do not duplicate' block went stale after the first
     learned fact — it kept re-proposing paraphrases all session (2026-07-21
     audit). The worker below builds the block from a FRESH load_memory()
-    instead, the same fix the prompt-rebuild Timer already got."""
+    instead, the same fix the prompt-rebuild Timer already got.
+
+    Queued, never dropped (2026-09-29): the turn joins _learn_pending and the
+    one live worker extracts it; see _learn_worker for the coalescing."""
     if not LEARN_EVERY_TURN:
         return
+    with _learn_lock:
+        _learn_pending.append((user_msg, ai_reply))
+        if _learn_worker_live[0]:
+            return          # the live worker picks this turn up
+        _learn_worker_live[0] = True
+    try:
+        threading.Thread(target=_learn_worker, name="learn-from-turn",
+                         daemon=True).start()
+    except Exception as e:
+        with _learn_lock:
+            _learn_worker_live[0] = False
+        print(f"  [learn] worker start failed: {type(e).__name__}")
 
-    def _worker():
-        try:
-            # Snapshot existing facts/projects FRESH from disk so the
-            # extractor's dedupe list includes everything learned this
-            # session, not just what was known at boot.
-            with _memory_lock:
-                _mem = load_memory()
-            existing_facts_str    = "\n".join(
-                f"- {f}" for f in _mem.get("facts", []))
-            existing_projects_str = "\n".join(
-                f"- {p}" for p in _mem.get("projects", []))
-            system = (
-                "You extract long-term memory items from a conversation turn. "
-                "Output ONLY valid JSON in this exact shape, nothing else:\n"
-                '{"new_facts": ["..."], "new_projects": ["..."], "topic": "..."}\n\n'
-                "STRICT RULES — follow exactly:\n\n"
-                "new_facts:\n"
-                "  - ONLY add facts that are CLEARLY and EXPLICITLY stated by the user.\n"
-                "  - For names: ONLY add a name fact if user says 'my name is X' or 'I'm X'\n"
-                "    or similar EXPLICIT self-introduction. Never infer a name from a "
-                "    garbled phrase. If unsure, DO NOT add it.\n"
-                "  - Skip facts that are already in memory (listed below). Don't add\n"
-                "    near-duplicates either (e.g. if 'User uses Apple Music' exists,\n"
-                "    don't add 'User listens to music on Apple Music').\n"
-                "  - Skip facts about THIS conversation/session (e.g. 'user asked X'\n"
-                "    or 'user wanted Y to happen' — those are transient, not durable).\n"
-                "  - Empty list [] if no genuinely-new durable facts.\n\n"
-                "new_projects:\n"
-                "  - Only ongoing real-world projects the user is actually working on\n"
-                "    (e.g. 'Building a robot'). Not session-level requests.\n"
-                "  - Skip if similar already in memory.\n\n"
-                "topic: 2–5 word label for what THIS turn was about.\n\n"
-                "Existing facts (do NOT duplicate these or paraphrase them):\n"
-                f"{existing_facts_str or '(none yet)'}\n\n"
-                "Existing projects (do NOT duplicate):\n"
-                f"{existing_projects_str or '(none yet)'}"
-            )
-            user = f"User said: {user_msg}\nAssistant said: {ai_reply}"
-            text = _llm_quick(system, user, max_tokens=250)
 
-            # Extract the FIRST complete JSON object from the response.
-            # Using raw_decode instead of a regex so we never accidentally
-            # capture two objects (which produces JSONDecodeError: Extra data).
-            start = text.find("{")
-            if start == -1:
-                return
-            try:
-                data, _ = json.JSONDecoder().raw_decode(text, start)
-            except json.JSONDecodeError:
-                return
+def _learn_prompt(batch: list) -> tuple:
+    """(system, user, max_tokens) for one extraction over `batch` turns. A
+    single turn gets exactly the pre-2026-09-29 prompt."""
+    # Snapshot existing facts/projects FRESH from disk so the
+    # extractor's dedupe list includes everything learned this
+    # session, not just what was known at boot.
+    with _memory_lock:
+        _mem = load_memory()
+    existing_facts_str    = "\n".join(
+        f"- {f}" for f in _mem.get("facts", []))
+    existing_projects_str = "\n".join(
+        f"- {p}" for p in _mem.get("projects", []))
+    system = (
+        "You extract long-term memory items from a conversation turn. "
+        "Output ONLY valid JSON in this exact shape, nothing else:\n"
+        '{"new_facts": ["..."], "new_projects": ["..."], "topic": "..."}\n\n'
+        "STRICT RULES — follow exactly:\n\n"
+        "new_facts:\n"
+        "  - ONLY add facts that are CLEARLY and EXPLICITLY stated by the user.\n"
+        "  - For names: ONLY add a name fact if user says 'my name is X' or 'I'm X'\n"
+        "    or similar EXPLICIT self-introduction. Never infer a name from a "
+        "    garbled phrase. If unsure, DO NOT add it.\n"
+        "  - Skip facts that are already in memory (listed below). Don't add\n"
+        "    near-duplicates either (e.g. if 'User uses Apple Music' exists,\n"
+        "    don't add 'User listens to music on Apple Music').\n"
+        "  - Skip facts about THIS conversation/session (e.g. 'user asked X'\n"
+        "    or 'user wanted Y to happen' — those are transient, not durable).\n"
+        "  - Empty list [] if no genuinely-new durable facts.\n\n"
+        "new_projects:\n"
+        "  - Only ongoing real-world projects the user is actually working on\n"
+        "    (e.g. 'Building a robot'). Not session-level requests.\n"
+        "  - Skip if similar already in memory.\n\n"
+        "topic: 2–5 word label for what THIS turn was about.\n\n"
+        "Existing facts (do NOT duplicate these or paraphrase them):\n"
+        f"{existing_facts_str or '(none yet)'}\n\n"
+        "Existing projects (do NOT duplicate):\n"
+        f"{existing_projects_str or '(none yet)'}"
+    )
+    if len(batch) == 1:
+        user_msg, ai_reply = batch[0]
+        return system, f"User said: {user_msg}\nAssistant said: {ai_reply}", 250
+    system += (
+        "\n\nThe input below holds several consecutive turns of ONE "
+        "conversation. Apply the rules to every turn, return ONE JSON object "
+        "covering all of them, and make the topic label the most recent turn.")
+    user = "\n\n".join(
+        f"Turn {i}:\nUser said: {u}\nAssistant said: {a}"
+        for i, (u, a) in enumerate(batch, 1))
+    return system, user, 400
 
-            raw_topic = data.get("topic", "")
-            topic = raw_topic.strip() if isinstance(raw_topic, str) else ""
 
-            # Atomic load → dedupe → trim → save under _memory_lock so we
-            # cannot lose writes that race with the ambient extractor.
-            added_facts, added_projects = merge_memory(
-                new_facts=data.get("new_facts"),
-                new_projects=data.get("new_projects"),
-                new_topic=topic,
-            )
+def _learn_apply(text: str) -> None:
+    """Parse one extraction reply and merge it into memory."""
+    # Extract the FIRST complete JSON object from the response.
+    # Using raw_decode instead of a regex so we never accidentally
+    # capture two objects (which produces JSONDecodeError: Extra data).
+    start = text.find("{")
+    if start == -1:
+        return
+    try:
+        data, _ = json.JSONDecoder().raw_decode(text, start)
+    except json.JSONDecodeError:
+        return
 
-            added = [f"fact: {f}" for f in added_facts] \
-                  + [f"project: {p}" for p in added_projects]
-            if added:
-                print(f"  [learned] {'; '.join(added)}")
+    raw_topic = data.get("topic", "")
+    topic = raw_topic.strip() if isinstance(raw_topic, str) else ""
 
-        except Exception as e:
-            # Log to console (which logs to file too) but don't break the chat
-            print(f"  [learn] failed: {type(e).__name__}: {e}")
+    # Atomic load → dedupe → trim → save under _memory_lock so we
+    # cannot lose writes that race with the ambient extractor.
+    added_facts, added_projects = merge_memory(
+        new_facts=data.get("new_facts"),
+        new_projects=data.get("new_projects"),
+        new_topic=topic,
+    )
 
-    threading.Thread(target=_worker, daemon=True).start()
+    added = [f"fact: {f}" for f in added_facts] \
+          + [f"project: {p}" for p in added_projects]
+    if added:
+        print(f"  [learned] {'; '.join(added)}")
+    _rebuild_after_learning()
+
+
+def _rebuild_after_learning() -> None:
+    """New facts / a new topic just reached disk. On the local route the
+    extraction now runs AFTER the post-turn rebuild Timer (it waited for the
+    conversation to go quiet), so fold them into the prompt here: at once when
+    quiet (then re-warm the prefix), or via the usual deferred rebuild when a
+    forced run landed mid-conversation. The cloud route is untouched (the
+    Timer still sees them). Never raises."""
+    try:
+        if not _chat_takes_local_branch():
+            return
+        if _request_prompt_rebuild() == "applied":
+            _reprime_after_background("learn_from_turn")
+    except Exception as e:
+        print(f"  [learn] prompt rebuild failed: {type(e).__name__}")
+
+
+def _learn_worker() -> None:
+    """Drain _learn_pending until it is empty, one extraction per batch.
+
+    When the one-shot will run on the local model, the batch is taken INSIDE
+    the background slot -- i.e. after the (bounded) wait for the owner to go
+    quiet -- so every turn that arrived during the wait rides the same call.
+    The slot is released before the merge, so a re-prime scheduled by the
+    POST's completion never finds this job still holding it."""
+    clean = False
+    try:
+        with _lt.background_work("learn_from_turn"):
+            while True:
+                # Only this worker drains the queue, so an empty peek means
+                # done (and a turn queued after it starts a fresh worker).
+                with _learn_lock:
+                    if not _learn_pending:
+                        _learn_worker_live[0] = False
+                        clean = True
+                        return
+                text = None
+                try:
+                    with _bg_local_slot(_llm_quick_goes_local()):
+                        with _learn_lock:
+                            batch = _learn_pending[:_LEARN_BATCH_MAX]
+                            del _learn_pending[:len(batch)]
+                        if not batch:
+                            continue
+                        if len(batch) > 1:
+                            print(f"  [learn] extracting {len(batch)} "
+                                  f"queued turns in one call")
+                        system, user, max_tokens = _learn_prompt(batch)
+                        text = _llm_quick(system, user, max_tokens=max_tokens)
+                    _learn_apply(text or "")
+                except Exception as e:
+                    # Log to console (which logs to file too) but don't break
+                    # the chat -- and keep draining the queue.
+                    print(f"  [learn] failed: {type(e).__name__}: {e}")
+    finally:
+        if not clean:
+            # Never strand the queue behind a dead worker: an unexpected
+            # escape frees the flag, so the next learn_from_turn starts a
+            # fresh worker for whatever is still pending.
+            with _learn_lock:
+                _learn_worker_live[0] = False
 
 
 # Content heuristic for the voice-ID-unavailable fallback: a transcript shorter
@@ -2040,8 +2179,11 @@ def _ambient_content_is_media(snippet: str) -> bool:
             "one word: MEDIA or PERSON. No punctuation, no explanation."
         )
         user = f"Transcript: {text!r}\nAnswer (MEDIA or PERSON):"
-        out = _call_local_llm(
-            system, [{"role": "user", "content": user}], max_tokens=4)
+        # Non-urgent background work: waits (bounded) while the owner is in a
+        # conversation (never on the main thread) -- see core/local_traffic.py.
+        with _lt.background_work("ambient-learn"):
+            out = _call_local_llm(
+                system, [{"role": "user", "content": user}], max_tokens=4)
         if not out:
             # Local judge unavailable/empty — fail open (treat as not-media so
             # real conversation still learns). Logged by the caller's decision.
@@ -2600,11 +2742,15 @@ def _session_summary_checkpoint_thread():
                     for m in _hist
                 )
                 try:
-                    text = _llm_quick(
-                        system=("Summarise this conversation in ONE sentence. "
-                                "Just the sentence, nothing else."),
-                        user=transcript, max_tokens=80,
-                    )
+                    # Non-urgent: waits (bounded) while the owner is in a
+                    # conversation when it would run on the local model.
+                    with _lt.background_work("session-checkpoint"):
+                        text = _llm_quick(
+                            system=("Summarise this conversation in ONE "
+                                    "sentence. Just the sentence, nothing "
+                                    "else."),
+                            user=transcript, max_tokens=80,
+                        )
                     summary = (text or "").strip().split("\n")[0]
                     if summary:
                         pattern_memory.record_session_summary(
@@ -15176,6 +15322,8 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
     # The last _generate's Ollama counters (prompt_eval / eval), for the
     # served-via line below. All-None until a response arrives.
     _gen_stats = [None]
+    # Did any _generate reach the POST? (drives _after_local_post below)
+    _did_post = [False]
 
     def _generate(model_tag: str) -> tuple[str | None, str]:
         """One /api/chat round-trip. Returns (text, kind):
@@ -15197,8 +15345,13 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
         _tt("mark", "llm_post", owner_only=True)
         r = None
         try:
-            r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat", json=payload,
-                              timeout=_LOCAL_GENERATE_TIMEOUT)
+            _did_post[0] = True
+            # JARVIS's own GPU work (system-pulse) + one more request that
+            # replaced the one-slot cache (the re-prime's evicted check).
+            with _lt.TRACKER.track():
+                r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat",
+                                  json=payload,
+                                  timeout=_LOCAL_GENERATE_TIMEOUT)
             if _PROF_ON:
                 _prof("llm_resp", _prof_ollama(r))
             # Ollama's own counters for the served-via line and the turn's
@@ -15238,35 +15391,46 @@ def _call_local_llm(system: str, messages: list, max_tokens: int = 500) -> str |
                 _tt("llm_response", _gen_stats[0], served=False)
             return (None, "fail")
 
-    text, kind = _generate(model)
-    if kind == "ok":
-        print(f"  [local-llm] served via {model} "
-              f"{_served_via_suffix(_gen_stats[0])}")
-        return text
-    if kind == "empty":
-        # 200-OK-but-EMPTY = the model ran but a broken quant / template
-        # mismatch produced nothing. Do NOT report "down" (which muted JARVIS
-        # for a full outage on 2026-07-09) — fail over ONCE to the best
-        # DIFFERENT installed model so one bad quant can't take out the local
-        # brain. Only the empty case retries; a timeout ('fail') already spent
-        # the read budget, so retrying a wedged runner would just double the
-        # wait for nothing.
-        alt = _next_local_llm_fallback(exclude=model)
-        print(f"  [local-llm] `{model}` returned EMPTY (likely a broken quant)"
-              + (f" — failing over to `{alt}`" if alt
-                 else " — no alternate model to fail over to"))
-        if alt:
-            text2, kind2 = _generate(alt)
-            if kind2 == "ok":
-                # Sticky: pin the working model for the rest of the session so
-                # every later turn skips the broken one (no repeated empty+retry).
-                _RESOLVED_LOCAL_LLM_MODEL[0] = alt
-                print(f"  [local-llm] served via {alt} (failed over from {model}) "
+    # Background traffic control: a TAGGED background job waits here
+    # (bounded) while the owner is in a conversation and holds the one
+    # background slot across the POST and its failover; an untagged call
+    # (the owner's turn, follow-ups, owner actions) passes straight
+    # through. Afterwards a request made outside a turn schedules the idle
+    # re-prime: it just replaced Ollama's one-slot cache.
+    try:
+        with _lt.slot():
+            text, kind = _generate(model)
+            if kind == "ok":
+                print(f"  [local-llm] served via {model} "
                       f"{_served_via_suffix(_gen_stats[0])}")
-                return text2
-            print(f"  [local-llm] failover model `{alt}` returned {kind2} too "
-                  f"— treating local as unavailable")
-    return None
+                return text
+            if kind == "empty":
+                # 200-OK-but-EMPTY = the model ran but a broken quant / template
+                # mismatch produced nothing. Do NOT report "down" (which muted JARVIS
+                # for a full outage on 2026-07-09) — fail over ONCE to the best
+                # DIFFERENT installed model so one bad quant can't take out the local
+                # brain. Only the empty case retries; a timeout ('fail') already spent
+                # the read budget, so retrying a wedged runner would just double the
+                # wait for nothing.
+                alt = _next_local_llm_fallback(exclude=model)
+                print(f"  [local-llm] `{model}` returned EMPTY (likely a broken quant)"
+                      + (f" — failing over to `{alt}`" if alt
+                         else " — no alternate model to fail over to"))
+                if alt:
+                    text2, kind2 = _generate(alt)
+                    if kind2 == "ok":
+                        # Sticky: pin the working model for the rest of the session so
+                        # every later turn skips the broken one (no repeated empty+retry).
+                        _RESOLVED_LOCAL_LLM_MODEL[0] = alt
+                        print(f"  [local-llm] served via {alt} (failed over from {model}) "
+                              f"{_served_via_suffix(_gen_stats[0])}")
+                        return text2
+                    print(f"  [local-llm] failover model `{alt}` returned {kind2} too "
+                          f"— treating local as unavailable")
+        return None
+    finally:
+        if _did_post[0]:
+            _after_local_post()
 
 
 def _local_fallback_or(sys_prompt: str, default_reply: str) -> str:
@@ -15494,8 +15658,10 @@ def _warm_up_local_llm_async() -> None:
                 "options": {"num_predict": 1, "num_ctx": _local_num_ctx(model)},
                 "keep_alive": "20m",
             }
-            r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat", json=payload,
-                              timeout=_LOCAL_GENERATE_TIMEOUT)
+            with _lt.TRACKER.track():   # JARVIS's own GPU load (system-pulse)
+                r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat",
+                                  json=payload,
+                                  timeout=_LOCAL_GENERATE_TIMEOUT)
             dt = time.monotonic() - t0
             if r.ok:
                 print(f"  [local-llm] warm-up OK — `{model}` generated in "
@@ -15664,6 +15830,22 @@ def _local_vision_usable() -> bool:
         return False
 
 
+def _vision_shares_chat_model() -> bool:
+    """Is LOCAL_VISION_MODEL the same Ollama tag as the local chat brain
+    (the resolved tag, else the configured one)? No network. Never raises."""
+    try:
+        vis = str(LOCAL_VISION_MODEL or "").strip()
+        chat = str(_RESOLVED_LOCAL_LLM_MODEL[0] or LOCAL_LLM_MODEL or "").strip()
+        if not vis or not chat:
+            return False
+
+        def _norm(t: str) -> str:
+            return t if ":" in t else t + ":latest"
+        return _norm(vis) == _norm(chat)
+    except Exception:
+        return False
+
+
 def _call_local_vision(question: str, png_images: list[bytes],
                        max_tokens: int = 600) -> str | None:
     """POST a vision request to Ollama's /api/chat with one or more PNGs.
@@ -15683,6 +15865,11 @@ def _call_local_vision(question: str, png_images: list[bytes],
     if not _ollama_has_model(LOCAL_VISION_MODEL):
         _ollama_pull_vision_async(LOCAL_VISION_MODEL)
         return None
+    # A TAGGED background caller waits for the owner to go quiet HERE, before
+    # the residency / free-VRAM checks below, so they (and the warm/cold
+    # timeout) describe the moment of the POST, not the moment it queued.
+    # A no-op for the owner's own request and on the main thread.
+    _lt.wait_for_quiet()
     # VRAM brick guard (REVIEW_FINDINGS_2 P0-2/P0-3): if the big 30B-class brain
     # is already pinned in VRAM, loading the VLM on top co-loads a 2nd model and
     # over-commits the 24 GB card (CUDA-OOM bricks the GPU). The canonical fix is
@@ -15737,90 +15924,113 @@ def _call_local_vision(question: str, png_images: list[bytes],
                   f"rest. Set JARVIS_ALLOW_VLM_COLOAD=1 to override.")
             return None
     _log_gpu_state(LOCAL_VISION_MODEL)
+    # Background traffic control (2026-09-29): a TAGGED background caller
+    # (the Teams nudger, the ambient screen observer) waits here, bounded,
+    # while the owner is in a conversation; the owner's own vision request
+    # is untagged and never waits. A request made outside a turn then
+    # schedules the idle re-prime (this POST replaced the one-slot cache
+    # when chat and vision share the model).
+    _vis_posted = [False]
     try:
-        b64_images = [base64.standard_b64encode(p).decode("utf-8") for p in png_images]
-        payload = {
-            "model": LOCAL_VISION_MODEL,
-            "messages": [{
-                "role": "user",
-                "content": question,
-                "images": b64_images,
-            }],
-            "stream": False,
-            # num_ctx MUST be pinned here, and MUST match the value the chat
-            # path sends (_local_num_ctx) — Ollama keys a loaded runner by
-            # (model, options), so an options set that differs by so much as
-            # the context length is a DIFFERENT runner: it EVICTS the warm one
-            # and reloads the weights. Since the v2.0.33 overhaul chat and
-            # vision are the SAME multimodal tag, so omitting num_ctx here made
-            # every vision call silently reload the brain at the model's own
-            # default context — 262144 for gemma4:26b-a4b. PROVEN live
-            # 2026-07-21 (ollama server.log): `llama_context: n_ctx = 262144`,
-            # `ollama ps` → `16 GB  6%/94% CPU/GPU  CONTEXT 262144`, the 3090
-            # pinned at 24147/24576 MiB, and the next chat turn died on the 50 s
-            # read timeout → "My local model isn't responding and I can't reach
-            # the cloud either, sir." The ambient-extract daemon fires a vision
-            # call every 300 s, so this bricked the local brain on a 5-minute
-            # cycle. It also silently falsified the ALREADY-RESIDENT EXEMPTION
-            # above, whose whole premise is that a vision call needs ZERO new
-            # VRAM because the weights are already on the card — true only when
-            # the runner is actually REUSED, which requires matching options.
-            "options": {"num_predict": max_tokens,
-                        "num_ctx": _local_num_ctx(LOCAL_VISION_MODEL)},
-        }
-        # Thinking-capable multimodal models (qwen3.x / gemma4) must not spend
-        # seconds reasoning before describing a screen; pure VLMs (qwen2.5vl)
-        # get no think param at all (400 otherwise).
-        _think = _local_think_param(LOCAL_VISION_MODEL)
-        if _think is not None:
-            payload["think"] = _think
-        # RESIDENCY-ADAPTIVE TIMEOUT (2026-07-14 audit). This was a flat
-        # timeout=180 — and ask_vision runs on the MAIN VOICE THREAD for every
-        # caller but _glance (which wraps it in its own 12 s bounded join). So a
-        # wedged runner could mute JARVIS for three solid minutes: he'd stop
-        # answering, stop hearing, and look dead. The 180 s only ever existed to
-        # cover a COLD weight load (Ollama pulls the weights off disk on first
-        # hit). Now that we can ask /api/ps whether the model is already loaded,
-        # a warm call — the steady-state case — gets a bound sized to what a warm
-        # 12B VLM actually costs (2-11 s measured on the 3090), with 5x headroom.
-        # A cold load still gets the long rope, because there is nothing to do
-        # but wait for the disk.
-        _vis_timeout = (_LOCAL_VISION_TIMEOUT_WARM_S if _resident
-                        else _LOCAL_VISION_TIMEOUT_COLD_S)
-        r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat", json=payload,
-                          timeout=_vis_timeout)
-        if not r.ok:
-            print(f"  [local-vision] HTTP {r.status_code}: {r.text[:200]}")
-            return None
-        try:
-            body = r.json()
-        except ValueError as _je:
-            print(f"  [local-vision] non-JSON response: {_je}; body={r.text[:200]!r}")
-            return None
-        msg = body.get("message")
-        if not isinstance(msg, dict):
-            print(f"  [local-vision] unexpected response shape (no message dict): keys={list(body.keys())}")
-            return None
-        text = (msg.get("content") or "").strip()
-        if not text:
-            print(f"  [local-vision] empty content; done_reason={body.get('done_reason')!r}")
-            return None
-        print(f"  [local-vision] served via {LOCAL_VISION_MODEL}")
-        _vision_wedge_note_ok()
-        return text
-    except requests.RequestException as _e:
-        print(f"  [local-vision] HTTP call failed: {_e}")
-        # A TIMEOUT here (not a connection refusal) is the signature of a
-        # VISION-WEDGED runner: the server still answers /api/tags and text
-        # chat in ~1s while the multimodal path never returns. _ollama_alive()
-        # therefore reads HEALTHY, so _ollama_selfheal_async's
-        # _ensure_ollama_running() no-ops and nothing ever reaps the wedge —
-        # it survived until a human killed ollama.exe by hand, TWICE
-        # (2026-07-12 and 2026-07-13). Count consecutive timeouts and escalate
-        # to a full reap+restart once the pattern is unmistakable.
-        if isinstance(_e, requests.Timeout):
-            _vision_wedge_note_timeout()
-        return None
+        with _lt.slot():
+            try:
+                b64_images = [base64.standard_b64encode(p).decode("utf-8") for p in png_images]
+                payload = {
+                    "model": LOCAL_VISION_MODEL,
+                    "messages": [{
+                        "role": "user",
+                        "content": question,
+                        "images": b64_images,
+                    }],
+                    "stream": False,
+                    # num_ctx MUST be pinned here, and MUST match the value the chat
+                    # path sends (_local_num_ctx) — Ollama keys a loaded runner by
+                    # (model, options), so an options set that differs by so much as
+                    # the context length is a DIFFERENT runner: it EVICTS the warm one
+                    # and reloads the weights. Since the v2.0.33 overhaul chat and
+                    # vision are the SAME multimodal tag, so omitting num_ctx here made
+                    # every vision call silently reload the brain at the model's own
+                    # default context — 262144 for gemma4:26b-a4b. PROVEN live
+                    # 2026-07-21 (ollama server.log): `llama_context: n_ctx = 262144`,
+                    # `ollama ps` → `16 GB  6%/94% CPU/GPU  CONTEXT 262144`, the 3090
+                    # pinned at 24147/24576 MiB, and the next chat turn died on the 50 s
+                    # read timeout → "My local model isn't responding and I can't reach
+                    # the cloud either, sir." The ambient-extract daemon fires a vision
+                    # call every 300 s, so this bricked the local brain on a 5-minute
+                    # cycle. It also silently falsified the ALREADY-RESIDENT EXEMPTION
+                    # above, whose whole premise is that a vision call needs ZERO new
+                    # VRAM because the weights are already on the card — true only when
+                    # the runner is actually REUSED, which requires matching options.
+                    "options": {"num_predict": max_tokens,
+                                "num_ctx": _local_num_ctx(LOCAL_VISION_MODEL)},
+                }
+                # keep_alive (2026-09-29): a request WITHOUT one resets the resident
+                # model's expiry to Ollama's default (5 min), so when chat and vision
+                # are the SAME tag (the shipped default) every screenshot read cut the
+                # brain's 20 min residency to 5 -- a quiet spell after a background
+                # vision call then cold-loaded the next turn. Match the chat path's
+                # value for the shared model; a separate VLM keeps Ollama's default
+                # (it should not linger in VRAM beside the brain).
+                if _vision_shares_chat_model():
+                    payload["keep_alive"] = "20m"
+                # Thinking-capable multimodal models (qwen3.x / gemma4) must not spend
+                # seconds reasoning before describing a screen; pure VLMs (qwen2.5vl)
+                # get no think param at all (400 otherwise).
+                _think = _local_think_param(LOCAL_VISION_MODEL)
+                if _think is not None:
+                    payload["think"] = _think
+                # RESIDENCY-ADAPTIVE TIMEOUT (2026-07-14 audit). This was a flat
+                # timeout=180 — and ask_vision runs on the MAIN VOICE THREAD for every
+                # caller but _glance (which wraps it in its own 12 s bounded join). So a
+                # wedged runner could mute JARVIS for three solid minutes: he'd stop
+                # answering, stop hearing, and look dead. The 180 s only ever existed to
+                # cover a COLD weight load (Ollama pulls the weights off disk on first
+                # hit). Now that we can ask /api/ps whether the model is already loaded,
+                # a warm call — the steady-state case — gets a bound sized to what a warm
+                # 12B VLM actually costs (2-11 s measured on the 3090), with 5x headroom.
+                # A cold load still gets the long rope, because there is nothing to do
+                # but wait for the disk.
+                _vis_timeout = (_LOCAL_VISION_TIMEOUT_WARM_S if _resident
+                                else _LOCAL_VISION_TIMEOUT_COLD_S)
+                _vis_posted[0] = True
+                with _lt.TRACKER.track():
+                    r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat", json=payload,
+                                      timeout=_vis_timeout)
+                if not r.ok:
+                    print(f"  [local-vision] HTTP {r.status_code}: {r.text[:200]}")
+                    return None
+                try:
+                    body = r.json()
+                except ValueError as _je:
+                    print(f"  [local-vision] non-JSON response: {_je}; body={r.text[:200]!r}")
+                    return None
+                msg = body.get("message")
+                if not isinstance(msg, dict):
+                    print(f"  [local-vision] unexpected response shape (no message dict): keys={list(body.keys())}")
+                    return None
+                text = (msg.get("content") or "").strip()
+                if not text:
+                    print(f"  [local-vision] empty content; done_reason={body.get('done_reason')!r}")
+                    return None
+                print(f"  [local-vision] served via {LOCAL_VISION_MODEL}")
+                _vision_wedge_note_ok()
+                return text
+            except requests.RequestException as _e:
+                print(f"  [local-vision] HTTP call failed: {_e}")
+                # A TIMEOUT here (not a connection refusal) is the signature of a
+                # VISION-WEDGED runner: the server still answers /api/tags and text
+                # chat in ~1s while the multimodal path never returns. _ollama_alive()
+                # therefore reads HEALTHY, so _ollama_selfheal_async's
+                # _ensure_ollama_running() no-ops and nothing ever reaps the wedge —
+                # it survived until a human killed ollama.exe by hand, TWICE
+                # (2026-07-12 and 2026-07-13). Count consecutive timeouts and escalate
+                # to a full reap+restart once the pattern is unmistakable.
+                if isinstance(_e, requests.Timeout):
+                    _vision_wedge_note_timeout()
+                return None
+    finally:
+        if _vis_posted[0]:
+            _after_local_post()
 
 
 # ── ollama wedge detector (2026-07-14) ──────────────────────────────────────
@@ -16043,13 +16253,15 @@ def _ltm_boot_warm() -> None:
         # on the ltm-queue worker thread — never the voice thread.
         try:
             def _ltm_reflector_llm(prompt, ctx):
-                return _llm_quick(
-                    system=prompt,
-                    user="\n".join(
-                        f"{m.get('role', '')}: {m.get('text', '')}"
-                        for m in (ctx or [])),
-                    max_tokens=60,
-                )
+                # Non-urgent background work (see core/local_traffic.py).
+                with _lt.background_work("ltm-reflect"):
+                    return _llm_quick(
+                        system=prompt,
+                        user="\n".join(
+                            f"{m.get('role', '')}: {m.get('text', '')}"
+                            for m in (ctx or [])),
+                        max_tokens=60,
+                    )
             ltm.set_reflector_llm(_ltm_reflector_llm)
         except Exception as e:
             print(f"  [ltm] reflector wiring failed: {e}")
@@ -16452,6 +16664,10 @@ _turn_in_progress = [False]      # "You:" accepted -> the loop's next iteration
 # _record_speech_active: that is True the whole time JARVIS idles listening
 # (record_speech(timeout=20)), so a gate on it would never open.
 _utterance_in_progress = [False]
+# time.monotonic() of the last ACCEPTED owner turn (voice or typed) -- not a
+# reply, not a turn boundary. Drives the re-prime-after-eviction window
+# (LOCAL_REPRIME_AFTER_BACKGROUND_WINDOW_S). 0.0 = none yet this process.
+_last_owner_turn_at = [0.0]
 
 
 def _note_conversation_activity(now: float | None = None) -> None:
@@ -16467,6 +16683,7 @@ def _note_owner_turn() -> None:
     thread; releasing the capture first opened a window where it saw "no
     capture, no turn, last activity > window ago" and applied the pending
     rebuild at the very start of this turn (a cold turn + a re-prime)."""
+    _last_owner_turn_at[0] = time.monotonic()
     _note_conversation_activity()
     _turn_in_progress[0] = True
     _utterance_in_progress[0] = False
@@ -16598,6 +16815,11 @@ _reprime_lock = threading.Lock()
 _reprime_running = [False]      # a worker exists (debouncing or posting)
 _reprime_again = [False]        # a trigger arrived while the POST ran
 _reprime_prefix_hash = [""]     # hash of the last primed prefix ('' = none)
+# When that prefix was stamped (time.monotonic()) and _lt.TRACKER.posts at the
+# stamp: an owner turn whose prefix MATCHES can still find the cache gone if
+# another local request ran in between (the "[reprime] evicted" diagnostic).
+_reprime_primed_at = [0.0]
+_reprime_posts_mark = [0]
 _REPRIME_DEBOUNCE_S = 1.0
 
 
@@ -16707,6 +16929,8 @@ def _reprime_once() -> str:
     primed = _local_prefix_hash(payload, drop_last=False)
     with _reprime_lock:
         _reprime_prefix_hash[0] = primed
+        _reprime_primed_at[0] = time.monotonic()
+        _reprime_posts_mark[0] = _lt.TRACKER.posts
 
     def _unstamp() -> None:
         # Failed: nothing was warmed. Clear only our own stamp (a turn may
@@ -16720,8 +16944,11 @@ def _reprime_once() -> str:
         # Same endpoint + timeout as a real turn; num_ctx is pinned by the
         # shared builder (_local_chat_payload -> chat_options / _local_num_ctx),
         # so this can never reload the runner under a different context.
-        r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat", json=payload,
-                          timeout=_LOCAL_GENERATE_TIMEOUT)
+        # Tracked as JARVIS's own GPU work (the pulse must not report it) but
+        # NOT counted as an eviction: it is the prefix the next turn wants.
+        with _lt.TRACKER.track(count=False):
+            r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat", json=payload,
+                              timeout=_LOCAL_GENERATE_TIMEOUT)
         ms = int((time.perf_counter() - t0) * 1000)
         if not r.ok:
             _unstamp()
@@ -16793,11 +17020,23 @@ def _in_owner_chat_call() -> bool:
 
 def _reprime_check_stale(payload: dict) -> bool | None:
     """On the owner turn's primary local chat call after a re-prime: did the
-    prime warm this exact prefix? Logs '[reprime] stale' when not. One
-    comparison per prime (compare-and-clear under _reprime_lock). The hash is
-    stamped before the prime's POST, so a turn that starts while the prime is
-    still in flight (it just queues behind it on Ollama's single slot — no
-    cancellation needed) is compared against it too."""
+    prime warm this exact prefix? One comparison per prime (compare-and-clear
+    under _reprime_lock). The hash is stamped before the prime's POST, so a
+    turn that starts while the prime is still in flight (it just queues behind
+    it on Ollama's single slot — no cancellation needed) is compared against
+    it too.
+
+    Logs ONE line (numbers only) whenever a stamp existed:
+      "[reprime] hit age=<s>s"      the prefix matches and no other local
+                                    request ran since the prime -> warm;
+      "[reprime] evicted age=<s>s by=<n>"  the prefix matches but <n> other
+                                    local requests (background work, vision,
+                                    a proactive line) ran since the prime and
+                                    replaced Ollama's one-slot cache -> cold;
+      "[reprime] stale age=<s>s"    the prefix itself moved after the prime.
+    Typed / injected turns count: they run _call_llm on the main loop like a
+    spoken turn. Returns the stale verdict (None = no stamp / not an owner
+    call)."""
     try:
         if not _in_owner_chat_call():
             return None
@@ -16806,12 +17045,143 @@ def _reprime_check_stale(payload: dict) -> bool | None:
             if not primed:
                 return None
             _reprime_prefix_hash[0] = ""
+            at = _reprime_primed_at[0]
+            mark = _reprime_posts_mark[0]
         stale = _local_prefix_hash(payload, drop_last=True) != primed
+        age = int(max(0.0, time.monotonic() - at)) if at else -1
         if stale:
-            print("  [reprime] stale")
+            print(f"  [reprime] stale age={age}s")
+        else:
+            others = _lt.TRACKER.posts - mark
+            if others > 0:
+                print(f"  [reprime] evicted age={age}s by={others}")
+            else:
+                print(f"  [reprime] hit age={age}s")
         return stale
     except Exception:
         return None
+
+
+# ── 5. background traffic control + re-prime after eviction (2026-09-29) ──
+# Ollama has ONE slot, so ANY local request between two owner turns replaces
+# the cached prefix the idle re-prime (and the previous turn) warmed. Live:
+# learn_from_turn's extraction after every turn, a Teams-nudger screenshot
+# read by the vision model a few seconds after a re-prime -> every owner turn
+# paid a full ~2.2 s prompt re-evaluation. Two halves:
+#   a. NON-URGENT background work (tagged with _lt.background_work) waits in
+#      _lt.GATE while the owner is in a conversation (_conversation_active --
+#      the prompt-freeze notion), bounded by LOCAL_BACKGROUND_MAX_DEFER_S,
+#      queued in arrival order, never on the main thread. Owner calls are
+#      untagged and never wait.
+#   b. After any NON-owner local request completes, the idle re-prime is
+#      scheduled (all of its own gates still apply) when an owner turn
+#      happened within LOCAL_REPRIME_AFTER_BACKGROUND_WINDOW_S, so the next
+#      turn finds its prefix warm again.
+
+
+def _local_bg_max_defer_s() -> float:
+    try:
+        return max(0.0, float(LOCAL_BACKGROUND_MAX_DEFER_S))
+    except Exception:
+        return 120.0
+
+
+def _background_defer_reason() -> str | None:
+    """Why a tagged background local request must wait right now (None = it
+    may run). 'utterance' / 'turn' are hard (the owner is mid-sentence or
+    mid-turn); 'conversation' is the quiet window after the last owner turn or
+    reply. Local chat route only: on the cloud route nothing a background job
+    sends to Ollama can evict a prefix the next turn needs. Never raises."""
+    try:
+        if _local_bg_max_defer_s() <= 0:
+            return None
+        if not _chat_takes_local_branch():
+            return None
+        if _utterance_in_progress[0]:
+            return "utterance"
+        if _turn_in_progress[0]:
+            return "turn"
+        if _conversation_active():
+            return "conversation"
+    except Exception:
+        return None
+    return None
+
+
+_lt.GATE.configure(defer_reason=_background_defer_reason,
+                   max_defer_s=_local_bg_max_defer_s)
+
+# Public for skills (they may also import core.local_traffic directly).
+background_local_work = _lt.background_work
+
+
+def _vision_goes_local() -> bool:
+    """Will ask_vision / ask_vision_multi go to the local VLM first? Mirrors
+    their branch order; False on any doubt. Never raises."""
+    try:
+        if not _local_vision_usable():
+            return False
+        from core.config import model_route
+        return model_route("vision") == "local" or AI_BACKEND != "claude"
+    except Exception:
+        return False
+
+
+def wait_for_local_quiet(kind: str = "chat") -> str:
+    """For a TAGGED background job about to capture the input of a local call
+    (a screenshot): wait, bounded, until a background request may run, so the
+    capture is fresh when the POST goes out. `kind` is 'vision' or 'chat'.
+    Returns the gate outcome, 'cloud' when the call will not go local first,
+    or 'none' for an untagged / main-thread caller. Never raises."""
+    try:
+        local = (_vision_goes_local() if kind == "vision"
+                 else _llm_quick_goes_local())
+        if not local:
+            return "cloud"
+        return _lt.wait_for_quiet()
+    except Exception:
+        return "none"
+
+
+def _reprime_after_background(tag: str) -> bool:
+    """Schedule the idle re-prime after a NON-owner local request replaced the
+    one-slot cache, when an owner turn happened within
+    LOCAL_REPRIME_AFTER_BACKGROUND_WINDOW_S (0 disables). The re-prime keeps
+    every gate of its own (not mid-utterance / mid-turn / game mode, never a
+    cold load, single-flight + debounced). True when a worker was started."""
+    try:
+        window = float(LOCAL_REPRIME_AFTER_BACKGROUND_WINDOW_S)
+    except Exception:
+        window = 600.0
+    try:
+        if window <= 0 or not (LOCAL_PREFIX_REPRIME and LOCAL_LLM_FALLBACK):
+            return False
+        last = _last_owner_turn_at[0]
+        if not last or (time.monotonic() - last) > window:
+            return False
+        if not _chat_takes_local_branch():
+            return False
+        started = _schedule_local_reprime()
+        print(f"  [reprime] after {_lt._clean_tag(tag)}"
+              + ("" if started else " (coalesced)"))
+        return started
+    except Exception:
+        return False
+
+
+def _after_local_post() -> bool:
+    """Called once a local chat / vision request has been POSTed (whatever its
+    outcome). The owner's own turn -- its primary call, its follow-up rounds,
+    an action it runs -- re-warms the prefix itself, so only a request made
+    outside a turn counts. Never raises."""
+    try:
+        if _in_owner_chat_call() or _turn_in_progress[0]:
+            return False
+        job = _lt.current_job()
+        tag = job.tag if job is not None else threading.current_thread().name
+        return _reprime_after_background(tag)
+    except Exception:
+        return False
 
 
 def _call_llm(user_text: str) -> str:

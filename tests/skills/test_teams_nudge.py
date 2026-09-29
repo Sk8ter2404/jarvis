@@ -262,5 +262,150 @@ class TeamsActionTests(unittest.TestCase):
         self.assertIn("No unread Teams messages", out)
 
 
+class TeamsSenderValidationTests(unittest.TestCase):
+    """2026-09-29, live: the local vision model answered with a description of
+    the screen instead of a name, and JARVIS spoke it as the sender. Only a
+    short, name-like string may be spoken; anything else falls back to the
+    plain count. Fake vision outputs only."""
+
+    LIVE = ("[local-vision] UNREAD: 2 | none found in windows, but there are "
+            "icons for various channels and people in the sidebar on Image #4;"
+            " how…")
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("teams_nudge")
+        self.mod._last_alert_at[0] = 0.0
+        self.mod._last_alert_text[0] = ""
+
+    def _ask(self, answer):
+        bc = _fake_companion(answer=answer)
+        with mock.patch.object(self.mod, "_import_companion", return_value=bc):
+            return self.mod._ask_vision_for_teams_state()
+
+    def test_the_live_garbage_falls_back_to_the_plain_count(self):
+        has, count, sender = self._ask(self.LIVE)
+        self.assertTrue(has)
+        self.assertEqual(count, 2)
+        self.assertEqual(sender, "")
+        self.assertEqual(self.mod._build_message(count, sender),
+                         "You have 2 unread messages on Teams, sir.")
+
+    def test_check_once_speaks_the_plain_count_for_the_live_answer(self):
+        bc = _fake_companion(answer=self.LIVE)
+        with mock.patch.object(self.mod, "_import_companion", return_value=bc):
+            has, payload = self.mod._check_once()
+        self.assertTrue(has)
+        self.assertEqual(payload, "You have 2 unread messages on Teams, sir.")
+
+    def test_a_local_vision_tagged_name_still_parses(self):
+        has, count, sender = self._ask("[local-vision] UNREAD: 3 | Alex Morgan")
+        self.assertEqual((has, count, sender), (True, 3, "Alex Morgan"))
+
+    def test_a_local_vision_tagged_none_is_clear(self):
+        has, count, _ = self._ask("[local-vision] NONE")
+        self.assertFalse(has)
+        self.assertEqual(count, 0)
+
+    def test_real_names_are_kept(self):
+        for raw, want in (("Alex Morgan", "Alex Morgan"),
+                          ("\"Alex Morgan\"", "Alex Morgan"),
+                          ("Alex Morgan.", "Alex Morgan"),
+                          ("Alex Morgan (External)", "Alex Morgan"),
+                          ("J. R. Smith", "J. R. Smith"),
+                          ("Dr. Jane Doe", "Dr. Jane Doe"),
+                          ("Mary-Jane O'Neil", "Mary-Jane O'Neil"),
+                          ("Chloé Dupont", "Chloé Dupont"),
+                          ("Project Phoenix", "Project Phoenix")):
+            with self.subTest(raw=raw):
+                self.assertEqual(self.mod._clean_sender(raw), want)
+
+    def test_descriptions_and_junk_are_rejected(self):
+        for raw in ("NONE", "none", "", None, "N/A", "Unknown",
+                    "none found in windows",
+                    "Image #4",
+                    "the sidebar",
+                    "icons for various channels",
+                    "Alex Morgan, and 3 others",
+                    "Alex; Sam",
+                    "not visible",
+                    "Alex Morgan? maybe",
+                    "a b c d e f",                    # too many words
+                    "A" * 41,                         # too long
+                    "Alex. The rest is unclear",      # sentence period
+                    "3 people",
+                    "#general"):
+            with self.subTest(raw=raw):
+                self.assertEqual(self.mod._clean_sender(raw), "")
+
+    def test_rejected_sender_never_reaches_the_spoken_line(self):
+        for bad in ("none found in windows", "Image #4", "sidebar icons"):
+            with self.subTest(bad=bad):
+                _, count, sender = self._ask(f"UNREAD: 2 | {bad}")
+                msg = self.mod._build_message(count, sender)
+                self.assertNotIn("from", msg)
+                self.assertNotIn(bad.split()[0], msg)
+
+
+class TeamsBackgroundCheckTests(unittest.TestCase):
+    """The PERIODIC check is non-urgent background work (it must not evict
+    the local brain's warm prefix mid-conversation); the owner's check_teams
+    is not."""
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("teams_nudge")
+        self.mod._last_alert_at[0] = 0.0
+        self.mod._last_alert_text[0] = ""
+
+    def _companion_recording(self, events):
+        from core import local_traffic as lt
+        bc = _fake_companion()
+
+        def _wait(kind):
+            job = lt.current_job()
+            events.append(("wait", kind, job.tag if job else None))
+            return "go"
+
+        def _shots():
+            job = lt.current_job()
+            events.append(("capture", job.tag if job else None))
+            return ["img1"]
+
+        def _vision(q, images):
+            job = lt.current_job()
+            events.append(("vision", job.tag if job else None))
+            return "UNREAD: 2 | Alex Morgan"
+        bc.wait_for_local_quiet = mock.MagicMock(side_effect=_wait)
+        bc.take_all_monitor_screenshots = mock.MagicMock(side_effect=_shots)
+        bc.ask_vision_multi = mock.MagicMock(side_effect=_vision)
+        return bc
+
+    def test_periodic_check_waits_before_capturing_and_is_tagged(self):
+        from core import local_traffic as lt
+        events = []
+        bc = self._companion_recording(events)
+        with mock.patch.object(self.mod, "_import_companion", return_value=bc):
+            has, payload = self.mod._check_once(background=True)
+        self.assertTrue(has)
+        self.assertIn("Alex Morgan", payload)
+        self.assertEqual(events, [("wait", "vision", "teams-nudge"),
+                                  ("capture", "teams-nudge"),
+                                  ("vision", "teams-nudge")])
+        self.assertIsNone(lt.current_job(), "tag leaked past the check")
+
+    def test_owner_check_teams_never_waits_and_is_untagged(self):
+        events = []
+        bc = self._companion_recording(events)
+        with mock.patch.object(self.mod, "_import_companion", return_value=bc):
+            out = self.actions["check_teams"]("")
+        self.assertIn("Alex Morgan", out)
+        bc.wait_for_local_quiet.assert_not_called()
+        self.assertEqual(events, [("capture", None), ("vision", None)])
+
+    def test_monitor_loop_runs_the_background_check(self):
+        import inspect
+        src = inspect.getsource(self.mod._monitor_loop)
+        self.assertIn("_check_once(background=True)", src)
+
+
 if __name__ == "__main__":
     unittest.main()
