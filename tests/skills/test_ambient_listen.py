@@ -2144,23 +2144,68 @@ class ResidualEdgeTests(_TmpDirMixin, unittest.TestCase):
             self.skipTest("Windows-only")
         user32 = mock.MagicMock()
         user32.GetForegroundWindow.return_value = 77
+
+        def _pid(_hwnd, pid_ref):
+            pid_ref._obj.value = 4242
+            return 1
+        user32.GetWindowThreadProcessId.side_effect = _pid
         kernel32 = mock.MagicMock()
         kernel32.OpenProcess.return_value = 555
+
+        def _image(h, flags, buf, size_ref):
+            buf.value = "C:\\Program Files\\Google\\Chrome\\Application\\Chrome.exe"
+            return 1
+        kernel32.QueryFullProcessImageNameW.side_effect = _image
         psapi = mock.MagicMock()
-
-        def _basename(h, _none, buf, n):
-            buf.value = "Chrome.exe"
-            return 10
-        psapi.GetModuleBaseNameW.side_effect = _basename
-
-        def _windll(name):
-            return {"user32": user32, "kernel32": kernel32, "psapi": psapi}[name]
         with mock.patch("ctypes.windll") as windll:
             windll.user32 = user32
             windll.kernel32 = kernel32
             windll.psapi = psapi
             out = self.mod._focused_proc_name()
         self.assertEqual(out, "chrome.exe")
+        self.assertEqual(kernel32.OpenProcess.call_args[0], (0x1000, False, 4242))
+        kernel32.CloseHandle.assert_called_once_with(555)
+        # psapi.GetModuleBaseNameW is ACCESS_DENIED on a limited handle: never used.
+        psapi.GetModuleBaseNameW.assert_not_called()
+
+    def test_focused_proc_name_query_fails_returns_empty(self):
+        if sys.platform != "win32":
+            self.skipTest("Windows-only")
+        user32 = mock.MagicMock()
+        user32.GetForegroundWindow.return_value = 77
+
+        def _pid(_hwnd, pid_ref):
+            pid_ref._obj.value = 4242
+            return 1
+        user32.GetWindowThreadProcessId.side_effect = _pid
+        kernel32 = mock.MagicMock()
+        kernel32.OpenProcess.return_value = 555
+        kernel32.QueryFullProcessImageNameW.return_value = 0
+        with mock.patch("ctypes.windll") as windll:
+            windll.user32 = user32
+            windll.kernel32 = kernel32
+            self.assertEqual(self.mod._focused_proc_name(), "")
+        kernel32.CloseHandle.assert_called_once_with(555)
+
+    def test_proc_image_basename_resolves_a_live_process(self):
+        # LIVE, no mocks: the old psapi lookup returned '' for every process
+        # (146/146 ambient log entries had proc:""), so this fails on it.
+        if sys.platform != "win32":
+            self.skipTest("Windows-only")
+        name = self.mod._proc_image_basename(os.getpid())
+        self.assertTrue(name.endswith(".exe"), name)
+        self.assertEqual(name, name.lower())
+        self.assertIn("python", name)
+
+    def test_proc_image_basename_rejects_bad_pids(self):
+        self.assertEqual(self.mod._proc_image_basename(0), "")
+        self.assertEqual(self.mod._proc_image_basename(None), "")
+        with mock.patch.object(self.mod.sys, "platform", "linux"):
+            self.assertEqual(self.mod._proc_image_basename(os.getpid()), "")
+
+    def test_no_getmodulebasename_call_remains(self):
+        src = open(self.mod.__file__, encoding="utf-8").read()
+        self.assertNotIn("GetModuleBaseNameW(", src)
 
     def test_focused_proc_name_no_hwnd(self):
         if sys.platform != "win32":
@@ -2176,12 +2221,19 @@ class ResidualEdgeTests(_TmpDirMixin, unittest.TestCase):
             self.skipTest("Windows-only")
         user32 = mock.MagicMock()
         user32.GetForegroundWindow.return_value = 77
+
+        def _pid(_hwnd, pid_ref):
+            pid_ref._obj.value = 4242
+            return 1
+        user32.GetWindowThreadProcessId.side_effect = _pid
         kernel32 = mock.MagicMock()
         kernel32.OpenProcess.return_value = 0  # → returns ""
         with mock.patch("ctypes.windll") as windll:
             windll.user32 = user32
             windll.kernel32 = kernel32
             self.assertEqual(self.mod._focused_proc_name(), "")
+        kernel32.OpenProcess.assert_called_once()     # reached, not a vacuous pass
+        kernel32.QueryFullProcessImageNameW.assert_not_called()
 
     # ── register autostart exception swallow ────────────────────────────
     def test_register_autostart_exception_swallowed(self):

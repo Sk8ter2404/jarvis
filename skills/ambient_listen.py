@@ -571,6 +571,40 @@ def _focused_window_title() -> str:
         return ""
 
 
+def _proc_image_basename(pid) -> str:
+    """Lower-cased image basename of process `pid` (e.g. 'chrome.exe'), or ''.
+
+    kernel32 QueryFullProcessImageNameW, NOT psapi GetModuleBaseNameW: on a
+    PROCESS_QUERY_LIMITED_INFORMATION handle GetModuleBaseNameW fails with
+    ACCESS_DENIED for every process, so the old lookup returned '' 146/146
+    times live and the process-name arm of the screenshot privacy blocklist
+    never matched. Same call as skills/game_mode.py::_foreground_exe_basename().
+    PROCESS_QUERY_LIMITED_INFORMATION only — never VM_READ."""
+    if sys.platform != "win32":
+        return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        pid = int(getattr(pid, "value", pid) or 0)
+        if pid <= 0:
+            return ""
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h:
+            return ""
+        try:
+            size = wintypes.DWORD(32768)
+            buf = ctypes.create_unicode_buffer(size.value)
+            if not kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                return ""
+            return os.path.basename(buf.value or "").strip().lower()
+        finally:
+            kernel32.CloseHandle(h)
+    except Exception:
+        return ""
+
+
 def _focused_proc_name() -> str:
     """Return foreground-window process name (e.g. 'chrome.exe'), or ''."""
     try:
@@ -579,23 +613,12 @@ def _focused_proc_name() -> str:
         import ctypes
         from ctypes import wintypes
         user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-        psapi = ctypes.windll.psapi
         hwnd = user32.GetForegroundWindow()
         if not hwnd:
             return ""
         pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not h:
-            return ""
-        try:
-            buf = ctypes.create_unicode_buffer(260)
-            psapi.GetModuleBaseNameW(h, None, buf, 260)
-            return (buf.value or "").lower()
-        finally:
-            kernel32.CloseHandle(h)
+        return _proc_image_basename(pid.value)
     except Exception:
         return ""
 
