@@ -229,5 +229,53 @@ class LateNightBandTests(unittest.TestCase):
         self.assertFalse(et._in_late_night_band(21))   # just before the 22 start
 
 
+class ContextGatedStillTests(unittest.TestCase):
+    """2026-09-29: the bare word 'still' was a frustration phrase, so a fault
+    REPORT ("I'm still having USB issues") was classified frustrated and the
+    turn carried "Do NOT explain. Act." -- pushing the model to guess an action
+    instead of asking or diagnosing. 'still' now counts only after a failed
+    JARVIS turn or while the owner is restating himself."""
+
+    REPORT = "I'm still having USB issues"
+
+    def test_bare_still_report_is_not_frustrated(self):
+        r = et.classify_emotion(self.REPORT, DAY)
+        self.assertNotEqual(r.label, "frustrated", r.reason)
+
+    def test_still_after_a_failed_turn_is_frustrated(self):
+        r = et.classify_emotion(self.REPORT, DAY, prev_turn_failed=True)
+        self.assertEqual(r.label, "frustrated", r.reason)
+
+    def test_repeated_complaint_after_failed_turn_is_frustrated(self):
+        r = et.classify_emotion(self.REPORT, DAY, prev_turn_failed=True,
+                                prev_user_text="I'm having USB issues")
+        self.assertEqual(r.label, "frustrated", r.reason)
+
+    def test_still_while_restating_is_frustrated(self):
+        # No failure flag -- the restatement alone is the context.
+        r = et.classify_emotion("the usb hub is still dropping out", DAY,
+                                prev_user_text="the usb hub keeps dropping out")
+        self.assertEqual(r.label, "frustrated", r.reason)
+
+    def test_unrelated_previous_line_does_not_arm_still(self):
+        r = et.classify_emotion(self.REPORT, DAY,
+                                prev_user_text="what's the weather today")
+        self.assertNotEqual(r.label, "frustrated", r.reason)
+
+    def test_other_frustration_triggers_are_unchanged(self):
+        # No context supplied: every non-'still' trigger still fires alone.
+        for text in ("I said open the file", "open it again",
+                     "you keep getting it wrong", "that's wrong",
+                     "for the last time open the file"):
+            self.assertEqual(et.classify_emotion(text, DAY).label,
+                             "frustrated", text)
+
+    def test_frustrated_addendum_asks_or_diagnoses_instead_of_guessing(self):
+        add = et.system_prompt_addendum("frustrated")
+        self.assertNotIn("Do NOT explain. Act.", add)
+        self.assertIn("clarifying question", add)
+        self.assertIn("diagnostic", add)
+
+
 if __name__ == "__main__":
     unittest.main()

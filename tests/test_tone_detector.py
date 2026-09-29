@@ -97,6 +97,75 @@ class AddendumTests(unittest.TestCase):
         self.assertIn("USER_TONE: stressed", out)
         self.assertIn("[Per-turn tone hint]", out)
 
+    def test_frustrated_hint_asks_or_diagnoses_instead_of_guessing(self):
+        out = td._tone_system_addendum("frustrated")
+        self.assertIn("USER_TONE: frustrated", out)
+        self.assertNotIn("Do NOT explain. Act.", out)
+        self.assertIn("clarifying question", out)
+        self.assertIn("diagnostic", out)
+
+
+class ContextGatedStillTests(unittest.TestCase):
+    """2026-09-29: 'still' was an urgency word, so a fault REPORT ("I'm still
+    having USB issues") came out 'rushed', and 'frustrated' with any swear
+    word attached. It now counts only after a failed turn or while the owner
+    restates himself. The clock is pinned to daytime so a neutral result
+    cannot flake to 'late_night' on a CI box running at a late UTC hour."""
+
+    REPORT = "I'm still having USB issues"
+
+    def setUp(self):
+        p = mock.patch.object(td, "_is_late_night_hour", return_value=False)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_bare_still_report_is_neutral(self):
+        self.assertIsNone(td.detect_tone(self.REPORT))
+
+    def test_swear_plus_bare_still_is_not_frustrated(self):
+        # Swearing alone is 'stressed'; 'still' no longer upgrades it.
+        self.assertEqual(td.detect_tone("damn, I'm still having USB issues"),
+                         "stressed")
+
+    def test_still_after_a_failed_turn_is_frustrated(self):
+        self.assertEqual(td.detect_tone(self.REPORT, prev_turn_failed=True),
+                         "frustrated")
+
+    def test_repeated_complaint_after_failed_turn_is_frustrated(self):
+        self.assertEqual(
+            td.detect_tone(self.REPORT, prev_user_text="I'm having USB issues",
+                           prev_turn_failed=True),
+            "frustrated")
+
+    def test_other_triggers_are_unchanged(self):
+        self.assertEqual(td.detect_tone("it's still not working"),
+                         "frustrated")          # "still not" phrase, untouched
+        self.assertEqual(td.detect_tone("I said turn it off"), "frustrated")
+        self.assertEqual(td.detect_tone("do it now please"), "rushed")
+
+
+class IsRestatementTests(unittest.TestCase):
+    def test_majority_overlap_is_a_restatement(self):
+        self.assertTrue(td.is_restatement("turn off the lights",
+                                          "turn off the lights now"))
+
+    def test_identical_line_is_not_a_restatement(self):
+        # The caller's "previous" may be the current turn itself.
+        self.assertFalse(td.is_restatement("turn off the lights",
+                                           "Turn off the lights!"))
+
+    def test_unrelated_or_missing_previous_is_not(self):
+        self.assertFalse(td.is_restatement("open the notes",
+                                           "what's the weather today"))
+        self.assertFalse(td.is_restatement("open the notes", None))
+        self.assertFalse(td.is_restatement("", "open the notes"))
+
+    def test_unreadable_previous_is_not_and_does_not_raise(self):
+        class Boom:
+            def __str__(self):
+                raise ValueError("cannot stringify")
+        self.assertFalse(td.is_restatement("open the notes", Boom()))
+
 
 if __name__ == "__main__":
     unittest.main()

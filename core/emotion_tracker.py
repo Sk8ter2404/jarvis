@@ -35,6 +35,10 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
+# One definition of "repeating himself", shared with the tone detector so the
+# two classifiers cannot drift apart on it. Stdlib-only, import-light.
+from core.tone_detector import is_restatement
+
 
 # ──────────────────────────────────────────────────────────────────────────
 #  WORD-CHOICE LEXICONS
@@ -60,11 +64,21 @@ _STRESS_WORDS: tuple[str, ...] = _SWEAR_WORDS + _STRESS_INTENSIFIERS
 # Frustration markers: phrases that indicate the user is repeating themselves
 # or pushing back on a prior failure.
 _FRUSTRATION_PHRASES: tuple[str, ...] = (
-    "i said", "i told you", "again", "still", "you keep", "you're not",
+    "i said", "i told you", "again", "you keep", "you're not",
     "you are not listening", "not listening", "just do", "for the last time",
     "we already", "i already", "you missed", "you didn't", "you did not",
     "that's not what", "that is not what", "wrong", "incorrect",
 )
+
+# Frustration markers that only count IN CONTEXT. 'still' used to sit in the
+# list above, so "I'm still having USB issues" -- the owner reporting a
+# lingering fault, often the first time he raises it -- was classified
+# frustrated and the turn carried "Do NOT explain. Act.", which pushed the
+# model to guess an action instead of asking or diagnosing. It now counts only
+# when the previous JARVIS turn failed or the owner is restating himself
+# (classify_emotion's prev_turn_failed / prev_user_text). Kept in step with
+# core.tone_detector._CONTEXT_GATED_FRUSTRATION_WORDS.
+_CONTEXT_GATED_FRUSTRATION_PHRASES: tuple[str, ...] = ("still",)
 
 # Excitement markers: positive, high-energy vocabulary.
 _EXCITEMENT_PHRASES: tuple[str, ...] = (
@@ -149,12 +163,18 @@ _SYSTEM_PROMPT_HINTS: dict[str, str] = {
         "doesn't land naturally. Lead with the action, not the "
         "acknowledgement. Stay calm; do not match the panic."
     ),
+    # Rewritten 2026-09-29: the old text ended "Do NOT explain. Act." -- an
+    # order to guess. Same terseness, but the next move is a question or the
+    # diagnostic that would find the cause, never a random neighbouring action.
     "frustrated": (
         "USER_EMOTION: frustrated — sir appears to be repeating "
-        "themselves or pushing back on a prior failure. Briefly "
-        "acknowledge the misfire ('Apologies, sir — trying again.') "
-        "and immediately try a different approach. Do NOT defend the "
-        "previous attempt. Do NOT explain. Act."
+        "themselves or pushing back on a prior failure. Acknowledge the "
+        "misfire in a few words ('Apologies, sir.') and do NOT defend the "
+        "previous attempt. Do NOT guess at a different action: if the "
+        "request is unclear, ask ONE short clarifying question; if sir is "
+        "describing a fault, run the matching diagnostic or status check "
+        "and report what it shows. Act directly only when the request is "
+        "unambiguous."
     ),
     "excited": (
         "USER_EMOTION: excited — match sir's energy without losing the "
@@ -256,12 +276,21 @@ def _current_hour() -> int:
 def classify_emotion(
     text: str,
     prosody: Optional[ProsodyHints] = None,
+    *,
+    prev_turn_failed: bool = False,
+    prev_user_text: Optional[str] = None,
 ) -> EmotionResult:
     """Classify the emotional state of one user utterance.
 
     Returns an EmotionResult. When no emotion is detected, the result's
     `label` is None and both addendum and tts_preset are empty — the
     caller should fall through to the default register.
+
+    `prev_turn_failed` (JARVIS's previous turn did not do what was asked) and
+    `prev_user_text` (the owner's previous utterance, used to spot him
+    restating himself) are the context that turns a bare 'still' into
+    frustration. Both are optional and default to "no evidence", so without
+    them "I'm still having USB issues" is a report, not a complaint.
 
     Priority order (first match wins):
         frustrated > stressed > excited > tired > focused > (late_night→tired)
@@ -292,11 +321,16 @@ def classify_emotion(
     slow_rate  = (p.speech_rate_wps is not None and p.speech_rate_wps <= 1.6)
 
     # ── frustrated ────────────────────────────────────────────────
-    # Word-choice signal: repetition/blame phrases ("I said", "still", etc.)
+    # Word-choice signal: repetition/blame phrases ("I said", "again", etc.)
     # OR actual profanity combined with a clipped imperative. Generic
     # emphatic words ("stop", "wait") are NOT enough on their own — those
-    # fall through to the stressed branch below.
+    # fall through to the stressed branch below. 'still' counts only after a
+    # failed turn or while sir is restating himself (see
+    # _CONTEXT_GATED_FRUSTRATION_PHRASES).
     frust_phrase  = _has_any_phrase(clean, _FRUSTRATION_PHRASES)
+    if not frust_phrase and (
+            prev_turn_failed or is_restatement(clean, prev_user_text)):
+        frust_phrase = _has_any_phrase(clean, _CONTEXT_GATED_FRUSTRATION_PHRASES)
     swear_phrase  = _has_any_phrase(clean, _SWEAR_WORDS)
     stress_phrase = _has_any_phrase(clean, _STRESS_WORDS)
     clipped = (n_words <= 3) and (_has_any_phrase(clean, _CLIPPED_IMPERATIVES) is not None)

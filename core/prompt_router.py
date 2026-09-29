@@ -201,6 +201,16 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         # BRIEFING, so the wrong section loaded while the right one did not.
         "graphics card", "graphics", "video card", "how hot", "hot", "degrees",
         "celsius", "throttl", "overheat", "running hot",
+        # 2026-09-29: check_system reads C: free space, but 'how much space is
+        # left on my C drive' selected NOTHING beyond the always-on launcher
+        # ("disk" is the only storage word above). The leading space on
+        # " c drive" is deliberate: bare "c drive" is a substring of "musiC
+        # DRIVE". "usb" rides here because a USB fault report ("I'm still
+        # having USB issues") needs a hardware diagnostic in front of the
+        # model, and this is the section that owns one.
+        " c drive", " c: drive", "disk space", "drive space", "free space",
+        "space left", "space is left", "much space", "storage", "hard drive",
+        "ssd", "usb",
     ],
     "BAMBU 3D PRINTER": [
         "print", "printer", "printing", "bambu", "3d", "filament", "nozzle",
@@ -396,9 +406,14 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "are you ok", "run diagnostics", "check yourself",
     ],
     "STABILITY GATE": ["stability", "safe to upgrade", "stability gate"],
+    # 2026-09-29: bare "wake word" used to live here, so every WAKE-WORD MODE
+    # turn ('turn off wake word mode', 'require the wake word') also shipped
+    # wake_listener_start/stop -- a different subsystem one token away. The
+    # engine-shaped phrasings below are what this section's body documents.
     "WAKE LISTENER": [
-        "wake word", "hey jarvis", "porcupine", "stop listening",
-        "start listening", "listen for",
+        "wake listener", "wake word listener", "wake word detector",
+        "wake word engine", "hotword", "hey jarvis", "porcupine",
+        "stop listening", "start listening", "listen for",
     ],
     "CODE EXECUTOR": ["run python", "execute python", "code executor"],
     "CUSTOM TTS / XTTS": ["custom voice", "xtts", "clone a voice", "custom tts"],
@@ -416,9 +431,14 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     # as the sole power-related section pulled the model toward shutdown_jarvis
     # for a restart request (2026-07-21 audit). TASK QUEUE (which documents
     # `restart`) now carries those keywords.
+    # Bare "turn off" is deliberately NOT here (2026-09-29): it matched EVERY
+    # "turn off the lights / the web dashboard / wake word mode" turn and put
+    # turn_off_jarvis -- a power-off of JARVIS himself -- next to the action
+    # the owner meant. Only the self-directed forms route here.
     "SHUTDOWN ALIASES": [
-        "shut down", "shutdown", "turn off", "go offline", "power down",
-        "sign off",
+        "shut down", "shutdown", "go offline", "power down", "sign off",
+        "turn off jarvis", "turn jarvis off", "turn yourself off",
+        "turn off yourself",
     ],
     # --- Sections surfaced by the 2026-07-15 wrapped-header + char-class fix.
     # These 17 were folded into their neighbours (invisible to routing) until the
@@ -475,6 +495,8 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "FOCUS MODE / DO-NOT-DISTURB": [
         "focus mode", "do not disturb", "hold my notifications", "heads down",
         "what did i miss", "recap what i missed",
+        # documented trigger that used to route only on the header word "mode"
+        "quiet mode",
     ],
     "WEB INTERFACE": [
         "web interface", "dashboard", "control panel", "web ui", "web dashboard",
@@ -503,6 +525,14 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "SUIT DIAGNOSTICS": [
         "suit diagnostics", "full system readout", "full diagnostics",
         "full readout", "complete diagnostics", "detailed diagnostics",
+        # 2026-09-29: the trigger phrases this body prints for status_panel and
+        # system_pulse. 'JARVIS, system status' -> status_panel used to reach
+        # the model only because the 6.7k-char STATUS READ-BACKS section loaded
+        # on the bare header word "status" and happens to cross-reference
+        # status_panel; with "status" generic, route the home section instead.
+        "system status", "status report", "quick status", "pulse check",
+        "give me a pulse", "how are the systems", "system readout",
+        "bring up the diagnostics", "full diagnostic", "everything looking",
     ],
     "MULTI-STEP TASKS": [
         "add to cart", "find and add", "and add to", "buy me", "order online",
@@ -520,10 +550,18 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "SMART HOME — PER-BRAND LIST": [
         "list my lights", "list plugs", "which lights", "hue list", "govee list",
         "kasa list", "per brand", "brand list", "list smart",
+        # documented triggers that used to route only on the header word
+        # "list" (now generic -- " list" also matched " listener")
+        "list my hue", "list my tuya", "list my govee", "list my kasa",
+        "list my lifx", "list my plugs",
     ],
     "WAKE-WORD MODE": [
         "wake word mode", "wake-word mode", "require my name", "require your name",
         "always listening", "manual wake", "gate on wake",
+        # documented triggers: 'music mode' routed only on the header word
+        # "mode"; the rest never routed here at all.
+        "music mode", "require the wake word", "only answer when i say",
+        "normal listening", "always listen",
     ],
     "AMBIENT-LEARNING MODE": [
         "ambient learning", "listen and learn", "go quiet", "keep learning",
@@ -633,6 +671,37 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     ],
 }
 
+# Header words that must NOT pull a section in on their own. select_sections
+# falls back to a section's header words when no curated keyword fires, and the
+# fallback is a loose prefix/suffix test (" mode" also matches " model"). These
+# words sit in many headers without saying WHICH capability is meant, so one of
+# them in a turn loaded every section that carried it. Measured on the live
+# prompt 2026-09-29 before this set existed:
+#   'turn off wake word mode'  -> 9 sections / ~8.5k chars of volatile tail:
+#                                 GUARD, FOCUS x2, NIGHT-OWL and AMBIENT-LEARNING
+#                                 MODE all loaded on the one word "mode".
+#   'Jarvis now has full control over the robot'
+#                              -> AIR CONTROL + POINT-TO-CONTROL on "control",
+#                                 i.e. Kinect mouse / pointing grammar handed to
+#                                 the model for a sentence about a robot.
+#   'which model are you using' -> every *MODE section (" mode" in " model").
+# Only the HEADER-WORD fallback ignores these. An explicit _SECTION_KEYWORDS
+# entry is curated and still matches ("system" still routes SYSTEM HEALTH, "wake
+# word mode" still routes WAKE-WORD MODE), so a section that needs one of these
+# words gets it as a keyword phrase, never as a bare header word.
+_GENERIC_HEADER_WORDS = frozenset({
+    "mode", "control", "project", "status", "system", "list", "check",
+    # Plural of the above; only MUSIC CONTROLS carries it, and "music" is its
+    # real header trigger.
+    "controls",
+    # Not generic English, but ambiguous in THIS prompt: it heads both WAKE
+    # LISTENER (the porcupine hotword engine) and WAKE-WORD MODE (require a
+    # leading 'JARVIS'), and "wake me up at seven" is a TIMERS turn. Routing
+    # on it alone put wake_listener_stop next to wake_word_mode_off for
+    # 'turn off wake word mode'; the two keyword lists tell them apart.
+    "wake",
+})
+
 # Sections always kept even with no keyword hit. Deliberately MINIMAL: only
 # app-launching (small — 1.3k chars — and the single most fundamental PC-control
 # capability). MUSIC (12k chars) and TIMERS (4.5k chars) are large and have
@@ -699,8 +768,10 @@ def select_sections(user_text: str, sections: List[Tuple[str, str]]) -> Tuple[Li
         upper = name.upper()
         hit = name.upper() in _ALWAYS
         if not hit:
-            # header words present in the query?
-            words = [w for w in re.split(r"[^a-z0-9]+", name.lower()) if len(w) > 3]
+            # header words present in the query? (generic ones never count
+            # on their own -- see _GENERIC_HEADER_WORDS)
+            words = [w for w in re.split(r"[^a-z0-9]+", name.lower())
+                     if len(w) > 3 and w not in _GENERIC_HEADER_WORDS]
             if any(f" {w}" in low or f"{w} " in low for w in words):
                 hit = True
         if not hit:
