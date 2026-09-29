@@ -1336,27 +1336,36 @@ def run_pipeline_on_task(task_line: str, *, claude_path: str,
 # string) makes it grep-able, testable, and trivial to extend.
 
 def _import_from_project(project_dir: str, module: str):
-    """Import ``module`` with ``project_dir`` first on sys.path only for the
-    duration of the import.
+    """Return ``module`` -- the already-imported one if there is one (tests
+    inject fakes that way), else exactly ``<project_dir>/<module>.py`` loaded
+    by path. sys.path is never touched.
 
-    Both call sites used to ``sys.path.insert(0, project_dir)`` and never take
-    it back out, so every caller's project dir stayed on the process's import
-    path. In the test suite that dir is a temp tree holding a stub
-    ``bobert_companion.py``: a later ``import bobert_companion`` on any thread
-    could resolve to the stub (and write a ``__pycache__`` into the tree while
-    it was being removed -- CI 2026-09-29, "Directory not empty")."""
-    import importlib
-    added = project_dir not in sys.path
-    if added:
-        sys.path.insert(0, project_dir)
+    History: both call sites used to ``sys.path.insert(0, project_dir)`` and
+    never take it back out (v2.0.118 scoped it to the import). Either way the
+    project dir sat on the PROCESS-WIDE import path while it was there. In the
+    test suite that dir is a temp tree holding a stub ``bobert_companion.py``,
+    so any other thread's ``import bobert_companion`` in that window could
+    resolve to the stub, register it in sys.modules and write a ``__pycache__``
+    into the tree while it was being removed -- CI 2026-09-29 (twice),
+    "Directory not empty". Loading by path has no such window."""
+    import importlib.util
+    loaded = sys.modules.get(module)
+    if loaded is not None:
+        return loaded
+    path = os.path.join(project_dir, module + ".py")
+    if not os.path.isfile(path):
+        raise ImportError(f"No module named {module!r} in {project_dir}")
+    spec = importlib.util.spec_from_file_location(module, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {module!r} from {path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module] = mod
     try:
-        return importlib.import_module(module)
-    finally:
-        if added:
-            try:
-                sys.path.remove(project_dir)
-            except ValueError:
-                pass
+        spec.loader.exec_module(mod)
+    except BaseException:
+        sys.modules.pop(module, None)
+        raise
+    return mod
 
 
 def run_pipeline_loop_driver(*, project_dir: str, claude_path: str,

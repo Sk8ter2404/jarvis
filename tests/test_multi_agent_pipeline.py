@@ -1838,6 +1838,26 @@ class LoopDriverTests(LoopDriverBase):
         self.assertEqual(sys.path, before)
         self.assertNotIn("stability-gate helper unavailable", out)   # import still resolves
 
+    def test_import_from_project_never_puts_the_dir_on_sys_path(self):
+        # CI red twice on 2026-09-29: while project_dir sat on sys.path (even
+        # just for the duration of the import), another thread's lazy
+        # `import bobert_companion` could resolve to the temp tree's stub and
+        # write a __pycache__ into it mid-cleanup. The probe module records
+        # sys.path at the moment it is executed.
+        name = "probe_mod_zz_pipeline"
+        self.write(f"{name}.py", "import sys\nSEEN_PATH = list(sys.path)\nVALUE = 42\n")
+        self.addCleanup(sys.modules.pop, name, None)
+        mod = P._import_from_project(self.tmp, name)
+        self.assertEqual(mod.VALUE, 42)
+        self.assertNotIn(self.tmp, mod.SEEN_PATH)
+        self.assertNotIn(self.tmp, sys.path)
+        self.assertIs(P._import_from_project(self.tmp, name), mod)   # cached
+
+    def test_import_from_project_prefers_an_already_imported_module(self):
+        fake = mock.MagicMock()
+        with mock.patch.dict(sys.modules, {"probe_mod_zz_fake": fake}):
+            self.assertIs(P._import_from_project(self.tmp, "probe_mod_zz_fake"), fake)
+
     def test_import_from_project_restores_path_on_failure(self):
         before = list(sys.path)
         with self.assertRaises(ImportError):
