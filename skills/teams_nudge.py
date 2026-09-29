@@ -298,6 +298,17 @@ def register(actions):
 
     actions["check_teams"] = check_teams
 
+    # The background loop is opt-in (core.config.TEAMS_NUDGE_ENABLED, default
+    # False since 2026-09-29); the on-demand check_teams action above stays.
+    try:
+        from core import config as _cfg
+        enabled = bool(getattr(_cfg, "TEAMS_NUDGE_ENABLED", False))
+    except Exception:
+        enabled = False
+    if not enabled:
+        print("  [teams] background nudger off (TEAMS_NUDGE_ENABLED); "
+              "'check Teams' still works on request")
+        return
     t = threading.Thread(target=_monitor_loop, daemon=True)
     t.start()
     print(

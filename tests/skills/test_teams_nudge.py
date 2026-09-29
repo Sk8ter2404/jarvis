@@ -409,3 +409,36 @@ class TeamsBackgroundCheckTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TeamsNudgerOptInTests(unittest.TestCase):
+    """2026-09-29: the owner asked for the background Teams monitor to go away
+    ("its never worked"). The loop is opt-in via core.config.TEAMS_NUDGE_ENABLED
+    (default False); the on-demand check_teams action is always registered."""
+
+    def _register_with(self, enabled):
+        from core import config as cfg
+        mod, _ = load_skill_isolated("teams_nudge", register=False)
+        actions = {}
+        fake_thread = mock.Mock()
+        with mock.patch.object(cfg, "TEAMS_NUDGE_ENABLED", enabled, create=True), \
+                mock.patch.object(mod.threading, "Thread", fake_thread), \
+                mock.patch("builtins.print"):
+            mod.register(actions)
+        return mod, actions, fake_thread
+
+    def test_default_is_off(self):
+        from core import config as cfg
+        self.assertIs(cfg.TEAMS_NUDGE_ENABLED, False)
+
+    def test_disabled_registers_check_teams_but_starts_no_loop(self):
+        _, actions, fake_thread = self._register_with(False)
+        self.assertIn("check_teams", actions)
+        fake_thread.assert_not_called()
+
+    def test_enabled_starts_the_background_loop(self):
+        mod, actions, fake_thread = self._register_with(True)
+        self.assertIn("check_teams", actions)
+        fake_thread.assert_called_once()
+        self.assertIs(fake_thread.call_args.kwargs.get("target"), mod._monitor_loop)
+        fake_thread.return_value.start.assert_called_once()

@@ -490,6 +490,14 @@ SCHEMA: dict[str, dict] = {
                 "exactly, without the AI model. Anything else still goes to "
                 "the model. Applies on the next start.",
     },
+    "TEAMS_NUDGE_ENABLED": {
+        "tab": "ai", "label": "Teams unread-message nudger (background)",
+        "type": "bool", "default": False,
+        "help": "Every 10 minutes, read the screen with the vision model and "
+                "say when Teams shows unread messages. Off by default; "
+                "'check Teams' on request still works. Applies on the next "
+                "start.",
+    },
     "LOCAL_BACKGROUND_MAX_DEFER_S": {
         "tab": "ai", "label": "Hold background brain work while talking (max seconds)",
         "type": "float", "default": 120.0,

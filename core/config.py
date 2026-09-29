@@ -633,6 +633,16 @@ ANSWER_FIRST_ENABLED = True
 # user_settings.json; applies on the next start.
 FAST_PATHS_ENABLED = True
 
+# ─── Teams unread-message nudger (skills/teams_nudge.py) ──────────────────
+# The background loop screenshots the screen every 10 minutes and asks the
+# vision model whether Teams shows an unread badge. Off by default
+# (2026-09-29): it never worked reliably for the owner, it cost a full-screen
+# vision call on the shared local model, and a mis-read once produced a
+# garbage spoken nudge. The on-demand check_teams action still works when
+# asked. Set true in user_settings.json to bring the loop back; applies on the
+# next start.
+TEAMS_NUDGE_ENABLED = False
+
 
 # ─── Focus mode / do-not-disturb (skills/focus_mode.py) ────────────────
 # FOCUS_MODE_ENABLED — makes the do-not-disturb "focus mode" FEATURE available
