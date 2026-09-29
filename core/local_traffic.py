@@ -218,6 +218,10 @@ class BackgroundGate:
         self._log = log
         self._queue: list = []
         self._seq = 0
+        # The holding Thread OBJECT, never threading.get_ident(): idents are
+        # reused as soon as a thread exits (at once on Linux), so a new thread
+        # could pass the holder check and release someone else's slot (CI
+        # 2026-09-29, test_quiet_gate_goes_at_once_and_holds_until_release).
         self._holder = None
         self._depth = 0
 
@@ -263,8 +267,18 @@ class BackgroundGate:
             return False
 
     # -- public ------------------------------------------------------------
+    def _drop_dead_holder(self) -> None:
+        """Caller holds _cond. A holder thread that exited without releasing
+        (killed daemon, an unexpected BaseException) must not keep the slot:
+        clear it so the queue moves instead of every job sitting out the cap."""
+        h = self._holder
+        if h is not None and not h.is_alive():
+            self._holder = None
+            self._depth = 0
+
     def busy(self) -> bool:
         with self._cond:
+            self._drop_dead_holder()
             return self._holder is not None or bool(self._queue)
 
     def waiting(self) -> int:
@@ -276,9 +290,10 @@ class BackgroundGate:
         tag = _clean_tag(tag)
         if _is_main_thread():
             return Pass("off", tag=tag)
-        me = threading.get_ident()
+        me = threading.current_thread()
         with self._cond:
-            if self._holder == me:
+            self._drop_dead_holder()
+            if self._holder is me:
                 self._depth += 1
                 return Pass("reentrant", holds=True, tag=tag)
         cap = self._cap()
@@ -298,6 +313,7 @@ class BackgroundGate:
                     waited = now - start
                     cap = self._cap()
                     reason = self._reason()
+                    self._drop_dead_holder()
                     head_free = (self._holder is None
                                  and self._queue and self._queue[0] == ticket)
                     if cap <= 0:
@@ -346,9 +362,9 @@ class BackgroundGate:
     def release(self, p) -> None:
         if p is None or not getattr(p, "holds", False):
             return
-        me = threading.get_ident()
+        me = threading.current_thread()
         with self._cond:
-            if self._holder != me:
+            if self._holder is not me:
                 return
             self._depth -= 1
             if self._depth <= 0:

@@ -29,6 +29,7 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+from unittest import mock
 
 from core import local_traffic as lt
 
@@ -97,9 +98,18 @@ class GateBasicsTests(unittest.TestCase):
     def test_quiet_gate_goes_at_once_and_holds_until_release(self):
         box = [None]
         g = _gate(box)
-        th, out = _run_in_thread(g.acquire, "job")
-        th.join(5)
-        p = out["value"]
+        held, done, out = threading.Event(), threading.Event(), {}
+
+        def holder():
+            out["p"] = g.acquire("job")
+            held.set()
+            done.wait(5)                # a LIVE holder keeps the slot
+            g.release(out["p"])
+
+        th = threading.Thread(target=holder, daemon=True)
+        th.start()
+        self.assertTrue(held.wait(5))
+        p = out["p"]
         self.assertEqual(p.outcome, "go")
         self.assertTrue(p.holds)
         self.assertTrue(g.busy())
@@ -107,6 +117,48 @@ class GateBasicsTests(unittest.TestCase):
         th2, _ = _run_in_thread(g.release, p)
         th2.join(5)
         self.assertTrue(g.busy(), "a foreign thread released the slot")
+        done.set()
+        th.join(5)
+        self.assertFalse(g.busy(), "the holder's own release must free it")
+
+    def test_reused_thread_ident_cannot_release_the_slot(self):
+        # CI 2026-09-29: the gate keyed its holder on threading.get_ident(),
+        # which Linux hands to the next thread as soon as one exits, so the
+        # "foreign thread" in the test above sometimes WAS the holder by ident.
+        # Force the reuse deterministically: every thread gets the same ident.
+        box = [None]
+        g = _gate(box)
+        with mock.patch.object(lt.threading, "get_ident", lambda: 4242):
+            hold = threading.Event()
+            done = threading.Event()
+            out = {}
+
+            def holder():
+                out["p"] = g.acquire("job")
+                hold.set()
+                done.wait(5)            # keep holding (thread stays alive)
+
+            th = threading.Thread(target=holder, daemon=True)
+            th.start()
+            self.assertTrue(hold.wait(5))
+            th2, _ = _run_in_thread(g.release, out["p"])
+            th2.join(5)
+            self.assertTrue(g.busy(), "a thread with a reused ident released the slot")
+            done.set()
+            th.join(5)
+
+    def test_a_holder_that_died_without_releasing_frees_the_slot(self):
+        box = [None]
+        g = _gate(box, cap=30.0, grace=30.0)
+        th, out = _run_in_thread(g.acquire, "job")     # acquires, never releases
+        th.join(5)
+        self.assertTrue(out["value"].holds)
+        self.assertFalse(g.busy(), "a dead holder kept the slot")
+        t0 = time.monotonic()
+        th2, out2 = _run_in_thread(g.acquire, "next")
+        th2.join(5)
+        self.assertEqual(out2["value"].outcome, "go")
+        self.assertLess(time.monotonic() - t0, 2.0)    # no waiting out the 30 s cap
 
     def test_main_thread_never_waits(self):
         box = ["turn"]
