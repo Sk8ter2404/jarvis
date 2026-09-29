@@ -530,6 +530,27 @@ MID_TASK_STATUS_ENABLED = True
 MID_TASK_STATUS_DELAY   = 8.0      # seconds before the dry status line fires
 
 
+# ─── Processing filler ("Just a moment, sir." while a voice turn thinks) ──
+# Owner request 2026-09-06. When a SPOKEN command is still being processed
+# PROCESSING_FILLER_DELAY seconds after the transcript was accepted and
+# nothing has been said yet, JARVIS says one short pre-rendered butler line.
+# After PROCESSING_FILLER_STILL_DELAY seconds of turn silence he says one
+# "still working" line (once per turn). Typed / web / injected turns never get
+# one; nor do muted, standby, focus / DND, night-owl or game mode, stop /
+# cancel commands, a live in-turn mic capture or a running wake-word
+# barge-in listener. Clips are rendered on the CPU Kokoro backend only
+# (TTS_BACKEND='kokoro', voice clone off); on any other backend the filler is
+# simply unavailable. The first voice turn after a start renders the clips.
+# All logic: core/processing_filler.py. OFF by default until proven by ear.
+# Delays are floats (an int default would make _apply_user_settings truncate
+# a saved 2.5 to 2) and are clamped in processing_filler.sanitize_delays; a
+# STILL_DELAY at or below the DELAY turns the "still working" line off.
+# Changes apply on the next start.
+PROCESSING_FILLER_ENABLED     = False
+PROCESSING_FILLER_DELAY       = 2.5    # s after the transcript before stage 1
+PROCESSING_FILLER_STILL_DELAY = 12.0   # s of turn silence before stage 2
+
+
 # ─── Focus mode / do-not-disturb (skills/focus_mode.py) ────────────────
 # FOCUS_MODE_ENABLED — makes the do-not-disturb "focus mode" FEATURE available
 #   (the voice actions focus_mode_on / focus_mode_off / whats_missed and the

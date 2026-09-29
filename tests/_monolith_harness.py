@@ -178,6 +178,12 @@ _MONOLITH_RESTORE_NAMES = (
     # later _refresh_devices test silently defer its reinit; a leaked latch
     # would time out every claim.
     "_diag_capture_active", "_enroll_capture_active", "_pa_reinit_active",
+    # Processing filler (2026-09-29): the two module objects, rebind-restored.
+    # Rebinding alone would put back the SAME (possibly latched) instance, so
+    # _restore_monolith_pristine also resets their internal state — see
+    # _reset_filler_state. Tests that need filler state should still patch in
+    # a FRESH ProcessingFiller / ClipCache rather than mutate these.
+    "_processing_filler", "_filler_clips",
     # H-6 (2026-08-20): the abandoned-native-close count. A leaked non-zero
     # value would make every later _refresh_devices test silently defer its
     # reinit — the exact "green for the wrong reason" shape.
@@ -321,6 +327,37 @@ def _restore_monolith_pristine(bc) -> None:
         except Exception:
             # Best-effort: a single stubborn slot must not abort the rest.
             pass
+    _reset_filler_state(bc)
+
+
+def _reset_filler_state(bc) -> None:
+    """Reset the shared processing-filler objects to their import-time state.
+
+    The rebind restore above puts back the same ProcessingFiller / ClipCache
+    INSTANCES, so a test that ran a real teardown entry (the tray restart
+    branch, the blue/green teardown, _release_native_resources) would leave
+    the shared filler latched off (closed) for the rest of the process — and
+    every later test using it would pass or fail for the wrong reason. Never
+    raises."""
+    try:
+        f = bc._processing_filler
+        with f._lock:
+            f._closed = False
+            f._current = None
+            f._playing = 0
+            f._captures = 0
+            f.last_reason = ""
+        f._idle.set()
+    except Exception:
+        pass
+    try:
+        c = bc._filler_clips
+        with c._mu:
+            c._clips.clear()
+            c._rejected = set()
+        c._warming = False
+    except Exception:
+        pass
 
 
 @requires_monolith

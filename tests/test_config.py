@@ -157,6 +157,16 @@ class StructuralInvariantTests(unittest.TestCase):
         primaries = [c for c in config.CAMERAS if c.get("primary")]
         self.assertEqual(len(primaries), 1)
 
+    def test_processing_filler_ships_off_with_float_delays(self):
+        # 2026-09-29: the filler is OFF until proven by ear; both delays are
+        # float literals (an int default would make _apply_user_settings
+        # truncate a saved 2.5 to 2) and stage 2 comes after stage 1.
+        self.assertIs(config.PROCESSING_FILLER_ENABLED, False)
+        self.assertIsInstance(config.PROCESSING_FILLER_DELAY, float)
+        self.assertIsInstance(config.PROCESSING_FILLER_STILL_DELAY, float)
+        self.assertGreater(config.PROCESSING_FILLER_STILL_DELAY,
+                           config.PROCESSING_FILLER_DELAY)
+
 
 if __name__ == "__main__":
     unittest.main()

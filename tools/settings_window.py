@@ -443,6 +443,27 @@ SCHEMA: dict[str, dict] = {
                 "the rest is still generating (faster feel; action commands "
                 "are never voiced early).",
     },
+    "PROCESSING_FILLER_ENABLED": {
+        "tab": "voice", "label": "Say 'just a moment' while thinking",
+        "type": "bool", "default": False,
+        "help": "Spoken turns only: a short butler line when a reply is slow. "
+                "Never when muted, in standby, focus/DND, night-owl or game "
+                "mode, or while the wake-word listener runs. Needs the Kokoro "
+                "voice. Applies on the next start.",
+    },
+    "PROCESSING_FILLER_DELAY": {
+        "tab": "voice", "label": "Filler delay (seconds)", "type": "float",
+        "default": 2.5,
+        "help": "Seconds of silence after you speak before 'Just a moment, "
+                "sir.' (0.5-60). Applies on the next start.",
+    },
+    "PROCESSING_FILLER_STILL_DELAY": {
+        "tab": "voice", "label": "'Still working' after (seconds of silence)",
+        "type": "float", "default": 12.0,
+        "help": "Seconds of silence in a long turn before one 'still working' "
+                "line. Set at or below the filler delay to turn it off. "
+                "Applies on the next start.",
+    },
     "STREAMING_AUTO_FULLSCREEN": {
         "tab": "ai", "label": "Auto-fullscreen TV shows & movies", "type": "bool",
         "default": True,

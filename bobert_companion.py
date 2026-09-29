@@ -3491,6 +3491,10 @@ def _dispatch_tray_command(cmd: str, entry: dict) -> None:
         # it is meant to repair. This channel is drained by the main loop before
         # any LLM call, so it works while the brain is face-down.
         print(f"  [tray] {cmd} — running the hardened teardown (no LLM involved)")
+        # Latch the processing filler off first: the tray control plane exists
+        # for wedged, silent turns — exactly where a 'still working' stage is
+        # pending — and a clip must not hold the speakers during teardown.
+        _filler_teardown("tray:" + cmd)
         try:
             # Call the MODULE-LEVEL names, not a function-local
             # `from core.actions import _act_restart, _act_shutdown_jarvis`.
@@ -12656,6 +12660,13 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
     if _mic_input_disabled():
         time.sleep(0.5 if timeout is None else min(0.5, max(0.1, timeout)))
         return None
+    # Processing filler (2026-09-29): a capture STARTING inside an armed voice
+    # turn (an action asking the owner something) cancels stage 1 and restarts
+    # stage 2's silence clock (only on the turn's own thread), then waits
+    # (bounded, pure Event) for a clip claimed before the mark so it is never
+    # recorded. The filler is also suppressed for as long as
+    # _record_speech_active is set. Never raises.
+    _filler_capture_mark(wait=True)
     CHUNK       = 1024
     PRE_BUFFER  = 12
     silence_lim = int(SILENCE_SECS * SAMPLE_RATE / CHUNK)
@@ -12946,6 +12957,12 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
         try:
             _safe_close_stream(_record_stream)
         finally:
+            # Processing filler (2026-09-29): an in-turn capture (bambu setup
+            # wizard, draft confirm) ending is turn activity — restart the
+            # filler's 'still working' silence clock. Marked BEFORE the flag
+            # drops, so a poll can never see the capture over while the clock
+            # still counts from its start. Never raises.
+            _filler_capture_mark()
             _record_speech_active[0] = False
 
     if _debug_mode[0]:
@@ -13012,6 +13029,25 @@ def apply_capture_auto_gain(audio_f32, peak_rms):
 
 def get_mic_buffer(seconds: float,
                    sample_rate: int | None = None) -> np.ndarray | None:
+    """Capture `seconds` of float32 mono audio (see _get_mic_buffer_impl).
+
+    Thin wrapper (2026-09-29, processing filler): registers the capture
+    with the filler for its whole length (any thread), so no filler clip can
+    START inside it, and first waits (bounded, pure Event) for a clip claimed
+    BEFORE it began, so a voice enrolment / speaker-ID capture never records
+    JARVIS saying "Allow me a moment, sir." into the owner's voiceprint. A
+    capture on the armed voice turn's own thread also counts as turn activity
+    (restarting the 'still working' silence clock); a background one (the
+    standby-audio loop) does not. Both hooks can never raise."""
+    _filler_capture_begin()
+    try:
+        return _get_mic_buffer_impl(seconds, sample_rate)
+    finally:
+        _filler_capture_end()
+
+
+def _get_mic_buffer_impl(seconds: float,
+                         sample_rate: int | None = None) -> np.ndarray | None:
     """Capture `seconds` of float32 mono audio for skills that need a fixed
     chunk of mic input (voice enrollment, speaker ID, etc.).
 
@@ -25143,6 +25179,17 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
         # feel frozen during 15-30 s sequences. Canceled the moment fn(arg)
         # returns; joined briefly so a mid-speech status line finishes
         # before the main loop's follow-up TTS starts.
+        # Processing filler (2026-09-29): a mid-task-bridged long action owns
+        # its silence (the 8 s status line), and a restart / shutdown /
+        # upgrade must never get a filler during teardown — cancel the
+        # turn's remaining filler stages. Deliberately NOT for web_search /
+        # see_screen / run_python: those are the silences the filler is for.
+        if (name in _FIRE_AND_EXIT_ACTIONS
+                or (MID_TASK_STATUS_ENABLED and name in LONG_RUNNING_ACTIONS)):
+            try:
+                _processing_filler.cancel("action:" + name)
+            except Exception:
+                pass
         _mid_task_timer = None
         _mid_task_fired = [False]
         if (MID_TASK_STATUS_ENABLED
@@ -26029,6 +26076,12 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
     # the lock, immediately before synthesise()/_resolve_tts_preset read them,
     # so set + consume is atomic w.r.t. any concurrent _speak. The finally
     # clears them again so the next utterance starts clean.
+    #
+    # Processing-filler mark (a), 2026-09-29: BEFORE taking _SPEAK_LOCK, so a
+    # filler that grabs the lock after this point sees the turn has spoken and
+    # its claim() returns 'gone' (stage 1) / 'not-yet' (stage 2). Only audible
+    # utterances reach here (mute / empty / staging returned above).
+    _filler_note_speech()
     with _SPEAK_LOCK:
         _speak_ok = False   # set True only on a completed play (#18 ledger)
         try:
@@ -26088,10 +26141,312 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
             # the end of playback so it can't leak into the next utterance.
             _tts_current_text[0] = ""
             _tts_interrupt.clear()
+            # Processing-filler mark (b), 2026-09-29: end-of-speech, still
+            # INSIDE _SPEAK_LOCK (lock order _SPEAK_LOCK -> filler lock). A
+            # stage-2 poll can only claim after this release, so it always
+            # sees the fresh mark — marking after the with-block let a poll
+            # land between release and mark and say 'still working' right
+            # after a long answer. Never raises.
+            _filler_note_speech()
     # Report whether the line was actually voiced. Most callers ignore this;
     # the streaming flush ledger uses it so a TTS-failed sentence is NOT
     # recorded as spoken (which would strip it from the tail). 2026-07-14 (#18).
     return _speak_ok
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  PROCESSING FILLER (2026-09-29) — "Just a moment, sir." while a slow VOICE
+#  turn thinks. OFF by default (core.config.PROCESSING_FILLER_ENABLED).
+#  All scheduling / cancel / cache logic lives in core/processing_filler.py;
+#  this block is the monolith glue. Rules that must hold:
+#    * the filler plays ONLY under _SPEAK_LOCK, via play_with_lipsync (still
+#      the only sd.play site), and decides INSIDE the lock via claim();
+#    * it is never cut (no sd.stop off the reaper, no _tts_interrupt, never a
+#      _tts_interrupt_seq bump) — cancel-if-not-started, finish-if-started;
+#    * it never speaks while any in-turn mic capture is live, while a barge-in
+#      detector is running, or in any quiet mode (see _filler_suppressed);
+#    * the dispatch wrapper waits (bounded, pure Event) for a playing clip
+#      before the main loop reopens the mic.
+# ──────────────────────────────────────────────────────────────────────────
+from core import processing_filler as _pf_mod  # noqa: E402
+
+# Upper bound for the dispatch wrapper's end-of-turn wait on a playing clip.
+_FILLER_END_WAIT_S = 3.0
+
+
+def _filler_note_speech() -> None:
+    """Speech activity mark from ANY thread (called from _speak). Captures
+    use _filler_capture_mark / _filler_capture_begin instead, which count
+    only on the voice turn's own thread. Never raises."""
+    try:
+        _processing_filler.note_speech()
+    except Exception:
+        pass
+
+
+def _filler_capture_mark(wait: bool = False) -> None:
+    """record_speech entry / exit mark: turn activity only on the armed voice
+    turn's own thread. With ``wait`` (entry), then a BOUNDED pure-Event wait
+    for a clip claimed before the mark (every later claim is refused by it).
+    Never raises."""
+    try:
+        _processing_filler.note_speech(owner_only=True)
+        if wait and _processing_filler.playing():
+            _processing_filler.wait_idle(_FILLER_END_WAIT_S)
+    except Exception:
+        pass
+
+
+def _filler_capture_begin() -> None:
+    """get_mic_buffer entry: register the capture (claims now answer 'busy'),
+    then wait (bounded, pure Event — no PortAudio call) for a clip claimed
+    before it. Never raises."""
+    try:
+        if _processing_filler.begin_capture():
+            if not _processing_filler.wait_idle(_FILLER_END_WAIT_S):
+                print(f"  [filler] clip still playing after "
+                      f"{_FILLER_END_WAIT_S:.0f}s; capturing anyway")
+    except Exception:
+        pass
+
+
+def _filler_capture_end() -> None:
+    """get_mic_buffer exit: mark (turn thread only) and release atomically.
+    Never raises."""
+    try:
+        _processing_filler.end_capture()
+    except Exception:
+        pass
+
+
+def _filler_teardown(reason: str = "") -> None:
+    """Cancel the filler and latch it off for the rest of the process. Called
+    on every restart / shutdown / blue-green entry. Never raises."""
+    try:
+        _processing_filler.shutdown(reason)
+    except Exception:
+        pass
+
+
+def _filler_mic_capture_live() -> bool:
+    """True while any IN-TURN mic capture is live. Deliberately excludes
+    _ambient_stream_active: skills/ambient_listen holds its streams for
+    minutes at a time, so counting it would silence the filler for good.
+    Plain reads (no _mic_lock) — this is a gate, not a PortAudio claim."""
+    return bool(_record_speech_active[0] or _pathb_mic_active[0]
+                or _enroll_capture_active[0] or _diag_capture_active[0]
+                or _processing_filler.capturing())
+
+
+def _filler_barge_in_live() -> bool:
+    """True while a barge-in source could fire during a filler clip. A wake
+    hit accepted during the clip would bump _tts_interrupt_seq and the
+    dispatch's _barge_seq0 gates would then silence the WHOLE answer."""
+    wl = sys.modules.get("skill_wake_listener")
+    det = getattr(wl, "_detector", None) if wl is not None else None
+    if det is not None:
+        try:
+            if det.is_running():
+                return True
+        except Exception:
+            return True
+    if (_GESTURE_BARGE_IN_ENABLED
+            and sys.modules.get("skill_kinect_gestures") is not None):
+        return True
+    return False
+
+
+def _filler_suppressed(transient_ok: bool = False) -> str | None:
+    """First reason the filler must stay silent, or None. Checked at arm time
+    AND again inside _SPEAK_LOCK right before claim(). With ``transient_ok``
+    (arm time, warm) a live mic capture is not a reason: at arm time the only
+    capture that can be live is a BACKGROUND one (the standby-audio loop holds
+    the mic ~3 s of every ~8 s), and refusing the whole turn for it would lose
+    the filler on a third of all turns — the in-lock check and claim() still
+    keep every clip out of every capture. Uses sys.modules.get
+    only — skills load as skill_<name>, and importing skills.x would create a
+    second, stale copy. Never raises (an error is itself a reason)."""
+    try:
+        if not globals().get("PROCESSING_FILLER_ENABLED", False):
+            return "disabled"
+        if _tts_muted[0]:
+            return "tray-mute"
+        if _tts_layer is not None and _tts_layer.is_muted():
+            return "env-mute"
+        if _is_staging():
+            return "staging"
+        if _sleep_mode[0] or _standby_mode[0]:
+            return "standby"
+        # Raw read on purpose: focus_mode_active() self-heals and fires a recap.
+        if _focus_mode[0]:
+            return "focus"
+        backend = str(globals().get("TTS_BACKEND", "edge") or "edge").lower()
+        if backend != "kokoro" or globals().get("VOICE_CLONE_ENABLED", False):
+            # Clips are rendered on CPU Kokoro only; anything else (network
+            # edge-tts under the lock, the GPU clone) makes the filler
+            # unavailable rather than risky.
+            return "backend"
+        if _realtime_session[0] is not None:
+            return "realtime"
+        _dnd = sys.modules.get("skill_dnd_focus_mode")
+        if _dnd is not None and getattr(_dnd, "is_focus_mode_active",
+                                        lambda: False)():
+            return "dnd"
+        _owl = sys.modules.get("skill_night_owl_mode")
+        if _owl is not None and getattr(_owl, "is_night_owl_active",
+                                        lambda: False)():
+            return "night-owl"
+        if getattr(getattr(sys.modules.get("skill_game_mode"), "_st", None),
+                   "active", False):
+            return "game"
+        if _filler_barge_in_live():
+            return "barge-in"
+        if not transient_ok and _filler_mic_capture_live():
+            return "mic-capture"
+    except Exception:
+        return "error"
+    return None
+
+
+def _filler_arm_suppressed() -> str | None:
+    return _filler_suppressed(transient_ok=True)
+
+
+def _filler_voice_key() -> tuple:
+    """Cache key: a backend / voice / clone change invalidates every clip."""
+    return (str(globals().get("TTS_BACKEND", "edge") or "edge").lower(),
+            str(getattr(sys.modules.get("core.kokoro_tts"), "_VOICE", "")),
+            bool(globals().get("VOICE_CLONE_ENABLED", False)))
+
+
+def _filler_render(text: str):
+    """Render one filler line with CPU Kokoro at neutral speed. Called only by
+    ClipCache.warm while it holds _SPEAK_LOCK. Returns (float32 audio, sr) or
+    None — never falls back to another backend, never raises."""
+    try:
+        backend = str(globals().get("TTS_BACKEND", "edge") or "edge").lower()
+        if backend != "kokoro" or globals().get("VOICE_CLONE_ENABLED", False):
+            return None
+        from core import kokoro_tts as _k
+        if not _k.is_available():
+            return None
+        res = _k.synthesize(text, speed=1.0)
+        if res is None:
+            return None
+        audio, sr = res
+        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if int(sr) <= 0 or audio.size == 0:
+            return None
+        if float(np.max(np.abs(audio))) < 1e-3:
+            return None   # the silent-clip fallback shape
+        return audio, int(sr)
+    except Exception:
+        return None
+
+
+def _filler_play(turn, stage: int) -> str:
+    """Play one cached filler clip for `stage`. Returns 'played' | 'retry' |
+    'skipped'. Never renders, never calls set_state / _write_hud_state
+    (last_spoken) / conversation_history, never prints the reply prefix (web
+    chat, say_to_jarvis and the staging smoke scrape it)."""
+    lines = _pf_mod.FIRST_LINES if stage == 1 else _pf_mod.STILL_LINES
+    avail = _filler_clips.available(lines)
+    if not avail:
+        return "skipped"
+    reason = _filler_suppressed()
+    if reason:
+        return "retry" if reason == "mic-capture" else "skipped"
+    if not _SPEAK_LOCK.acquire(blocking=False):
+        return "retry"
+    claimed = False
+    try:
+        reason = _filler_suppressed()
+        if reason:
+            return "retry" if reason == "mic-capture" else "skipped"
+        verdict = _processing_filler.claim(turn, stage)
+        if verdict in ("not-yet", "busy"):
+            return "retry"
+        if verdict != "ok":
+            return "skipped"
+        claimed = True
+        text = random.choice(avail)
+        clip = _filler_clips.get(text)
+        if clip is None:
+            return "played"   # the stage is consumed either way
+        audio, sr = clip
+        print(f"  [filler] stage {stage}: {text}")
+        _prof("filler_play", f"stage={stage}")
+        try:
+            _tts_current_text[0] = text.lower()
+            play_with_lipsync(audio, sr)
+        except Exception as _fe:
+            print(f"  [filler] playback failed: {type(_fe).__name__}: {_fe}")
+        finally:
+            # Mirror _speak's finally: nothing owns the speakers any more.
+            _tts_playback_active[0] = False
+            _tts_current_text[0] = ""
+            _tts_interrupt.clear()
+        return "played"
+    finally:
+        _SPEAK_LOCK.release()
+        if claimed:
+            _processing_filler.play_done()
+
+
+def _filler_warm_stop() -> bool:
+    return _processing_filler.armed() or _processing_filler.closed()
+
+
+def _filler_warm_if_needed() -> bool:
+    """Start the single-flight 'filler-warm' daemon when clips are missing.
+    Runs after a voice turn, never on the hot path. Never raises."""
+    try:
+        if (_filler_suppressed(transient_ok=True) is not None
+                or _processing_filler.closed()):
+            return False
+        return _filler_clips.warm_async(
+            _pf_mod.FIRST_LINES + _pf_mod.STILL_LINES,
+            stop_fn=_filler_warm_stop)
+    except Exception:
+        return False
+
+
+def _filler_should_arm(text: str) -> bool:
+    """Voice-turn gate on top of _filler_suppressed: never for a stop /
+    cancel / quiet command (the owner asked for silence), never on the
+    realtime voice path (its always-open mic would transcribe the clip)."""
+    if not globals().get("PROCESSING_FILLER_ENABLED", False):
+        return False
+    if _realtime_session[0] is not None:
+        return False
+    clipped = getattr(_tone_detector, "_CLIPPED_IMPERATIVES", None)
+    return not _pf_mod.is_quiet_command(text, clipped)
+
+
+def _filler_end_turn(turn) -> None:
+    """Dispatch-wrapper epilogue: disarm, then a BOUNDED pure-Event wait so a
+    clip claimed just before the turn ended finishes before the main loop
+    reopens the mic (it would otherwise be recorded as the next utterance),
+    then warm the cache. Never raises."""
+    try:
+        _processing_filler.disarm(turn)
+        if turn is not None and _processing_filler.playing():
+            if not _processing_filler.wait_idle(_FILLER_END_WAIT_S):
+                print(f"  [filler] clip still playing after "
+                      f"{_FILLER_END_WAIT_S:.0f}s; continuing")
+    except Exception:
+        pass
+    _filler_warm_if_needed()
+
+
+_filler_clips = _pf_mod.ClipCache(render_fn=_filler_render, lock=_SPEAK_LOCK,
+                                  key_fn=_filler_voice_key)
+_processing_filler = _pf_mod.ProcessingFiller(
+    play_fn=_filler_play,
+    suppressed_fn=_filler_arm_suppressed,
+    delays_fn=lambda: (globals().get("PROCESSING_FILLER_DELAY", 2.5),
+                       globals().get("PROCESSING_FILLER_STILL_DELAY", 12.0)),
+)
 
 
 def _do_proactive_turn(memory: dict):
@@ -28058,6 +28413,8 @@ def _blue_green_teardown_and_exit() -> None:   # pragma: no cover - process-term
     burn the remaining grace window and record a session that is still running.
     """
     print("  [blue-green] hardened teardown: releasing singleton + port, then natives")
+    # 0. No processing-filler clip may start during the handoff. Never raises.
+    _filler_teardown("blue-green")
     # 1. Declare intent so the watchdog handshake flag is legitimate.
     try:
         mark_intentional_exit()
@@ -28355,7 +28712,33 @@ def _handle_sleep_triggers(text: str) -> bool:
     return False
 
 
-def _run_llm_dispatch(text: str) -> str:
+def _run_llm_dispatch(text: str, *, voice: bool = False) -> str:
+    """One LLM turn (see _run_llm_dispatch_body), optionally wrapped in the
+    processing filler (2026-09-29).
+
+    `voice` is True only for a spoken turn (main() passes
+    `_injected_text is None`), so typed / injected / staging turns never get a
+    filler. The arm covers the glance fast path, the LLM wait, every action and
+    every follow-up round; the finally disarms, waits a bounded moment for a
+    clip still playing (so the next capture never records it) and warms the
+    clip cache. With PROCESSING_FILLER_ENABLED off nothing is armed and no
+    thread is created. Filler failures can never break the turn.
+    """
+    _pf_turn = None
+    if voice:
+        try:
+            if _filler_should_arm(text):
+                _pf_turn = _processing_filler.arm()
+        except Exception:
+            _pf_turn = None
+    try:
+        return _run_llm_dispatch_body(text)
+    finally:
+        if voice:
+            _filler_end_turn(_pf_turn)
+
+
+def _run_llm_dispatch_body(text: str) -> str:
     """Single-utterance LLM turn: the glance fast-path or a full LLM
     response, execution of any [ACTION:] tokens, then the informative /
     failure follow-up loop. Speaks each reply and appends follow-ups to
@@ -29558,7 +29941,7 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 if _run_voice_shortcuts(text):
                     continue
 
-                reply = _run_llm_dispatch(text)
+                reply = _run_llm_dispatch(text, voice=_injected_text is None)
 
                 # Real-time learning: extract facts in background (non-blocking)
                 learn_from_turn(text, reply, memory)

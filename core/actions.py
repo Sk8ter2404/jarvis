@@ -525,6 +525,10 @@ def _act_restart(_: str = "") -> str:
     """Relaunch bobert_companion.py in a fresh process and exit this one."""
     import threading
     bc = _bc()
+    # No processing-filler clip may start once a restart is decided (the
+    # 1.5 s spawn delay and the native release below would otherwise race a
+    # pending 'still working' stage). Latches it off. 2026-09-29.
+    _filler_teardown_via_bc(bc, "restart")
     script = os.path.abspath(bc.__file__)
 
     def _do_restart():
@@ -2890,6 +2894,18 @@ def _release_audio_streams(bc, budget_s: float = 3.0) -> None:
         print(f"  [teardown] audio streams released ({', '.join(sorted(done))})")
 
 
+def _filler_teardown_via_bc(bc, reason: str) -> None:
+    """Latch the monolith's processing filler off (bc._filler_teardown) on a
+    restart / shutdown / teardown entry. Tolerates a host without the hook
+    (older monoliths, test doubles). Never raises. 2026-09-29."""
+    try:
+        fn = getattr(bc, "_filler_teardown", None)
+        if callable(fn):
+            fn(reason)
+    except Exception:
+        pass
+
+
 def _release_native_resources(bc) -> None:
     """Best-effort release of every native/driver resource BEFORE process
     termination. TerminateProcess (v2.0.51) prevents the ExitProcess
@@ -2901,6 +2917,9 @@ def _release_native_resources(bc) -> None:
     local brain into 50s generate timeouts. Releasing the drivers first
     gives termination nothing to snag on. Every step is guarded; the
     caller's failsafe Timer still guarantees death regardless."""
+    # Ctrl-C / every hardened path: no processing-filler clip may start while
+    # the natives are being released. 2026-09-29.
+    _filler_teardown_via_bc(bc, "teardown")
     # WAIT FOR IN-FLIGHT GPU WORK FIRST (2026-07-14). unload() drops the cached
     # model and empties the CUDA cache — but it cannot release a model that is
     # still LOADING. TerminateProcess then lands while a thread sits inside the
@@ -2976,6 +2995,7 @@ def _act_shutdown_jarvis(_: str = "") -> str:
     import threading
     bc = _bc()
     bc._sleep_mode[0] = True
+    _filler_teardown_via_bc(bc, "shutdown")
 
     try:
         line = random.choice(bc.SHUTDOWN_GOODBYE_LINES)
