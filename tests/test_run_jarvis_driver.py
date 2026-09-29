@@ -117,5 +117,64 @@ class DriverLivenessTests(unittest.TestCase):
             self.assertEqual(json.load(f), [{"cmd": "force_wake"}])
 
 
+@unittest.skipUnless(os.path.exists(_DRIVER), "run-jarvis driver not present")
+class DriverReplyCaptureTests(unittest.TestCase):
+    """The quality sweep of 2026-09-29 lost every informative action's real
+    answer: the driver returned 2 s after the [action] line, but the follow-up
+    round prints 'Reading results' up to ~4 s later and answers after that.
+    And a plain reply with no action sat out the full 75 s timeout."""
+
+    def setUp(self):
+        self.d = _load_driver()
+
+    def test_plain_reply_completes_after_quiet(self):
+        lines = ["[t]   JARVIS: Canberra, sir."]
+        self.assertFalse(self.d._reply_complete(lines, False, 1.0))
+        self.assertTrue(self.d._reply_complete(lines, False, self.d.QUIET_S))
+
+    def test_action_tag_waits_for_its_result(self):
+        lines = ["[t]   JARVIS: [ACTION: get_time] One moment, sir."]
+        self.assertFalse(self.d._reply_complete(lines, False, 60.0))
+        lines.append("[t]   [action] get_time: current time is 03:21 PM")
+        self.assertFalse(self.d._reply_complete(lines, False, self.d.QUIET_S))
+        self.assertTrue(self.d._reply_complete(lines, False, self.d.ACTION_QUIET_S))
+
+    def test_pending_followup_never_completes(self):
+        lines = ["[t]   JARVIS: [ACTION: get_time] One moment, sir.",
+                 "[t]   [action] get_time: current time is 03:21 PM"]
+        self.assertFalse(self.d._reply_complete(lines, True, 600.0))
+
+    def test_wait_for_reply_captures_the_followup_answer(self):
+        tmp = tempfile.mkdtemp(prefix="drv_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        log = os.path.join(tmp, "session_x.log")
+        open(log, "w", encoding="utf-8").close()
+        script = [  # (fake seconds after start, line) -- as seen live
+            (0.5, "[15:21:17]   [inject] what time is it"),
+            (4.0, "[15:21:21]   JARVIS: [ACTION: get_time] One moment, sir."),
+            (4.0, "[15:21:21]   [action] get_time: current time is 03:21 PM"),
+            (8.0, "[15:21:25]   Reading results (depth 1)…"),
+            (9.0, "[15:21:26]   JARVIS: It is 3:21 PM, sir."),
+        ]
+        clock = [1000.0]
+
+        def fake_sleep(s):
+            before = clock[0] - 1000.0
+            clock[0] += s
+            now = clock[0] - 1000.0
+            with open(log, "a", encoding="utf-8") as f:
+                for t, line in script:
+                    if before < t <= now:
+                        f.write(line + "\n")
+
+        with mock.patch.object(self.d, "latest_log", return_value=log), \
+                mock.patch.object(self.d.time, "sleep", fake_sleep), \
+                mock.patch.object(self.d.time, "time", lambda: clock[0]):
+            res = self.d.wait_for_reply("what time is it", timeout=75.0)
+        self.assertEqual(res["status"], "ok")
+        self.assertIn("It is 3:21 PM, sir.", res["lines"][-1])
+        self.assertLess(clock[0] - 1000.0, 20.0)   # nowhere near the 75 s timeout
+
+
 if __name__ == "__main__":
     unittest.main()

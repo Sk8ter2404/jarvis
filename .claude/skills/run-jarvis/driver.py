@@ -187,9 +187,33 @@ def inject(text: str) -> None:
     _write_atomic(INJECT, json.dumps(items, indent=2))
 
 
+QUIET_S = 3.0          # a plain reply is complete after this much log silence
+ACTION_QUIET_S = 6.0   # after an [action] line: the informative follow-up round
+                       # prints "Reading results" up to ~4 s later (seen live)
+
+
+def _reply_complete(lines: list[str], pending_followup: bool, quiet_for: float) -> bool:
+    """Has this turn finished talking? Never while a follow-up round is running
+    or an [ACTION: …] tag still waits for its [action] result; otherwise after
+    QUIET_S of log silence (ACTION_QUIET_S when the last line was a result)."""
+    if not lines or pending_followup:
+        return False
+    last_reply = next((l for l in reversed(lines) if "jarvis:" in l.lower()), "")
+    if "[action:" in last_reply.lower():
+        after = lines[lines.index(last_reply) + 1:]
+        if not any("[action]" in l.lower() for l in after):
+            return False
+    need = ACTION_QUIET_S if "[action]" in lines[-1].lower() else QUIET_S
+    return quiet_for >= need
+
+
 def wait_for_reply(text: str, timeout: float = 75.0) -> dict:
     """Tail the live log from the current end, return the JARVIS reply + the
-    [action] result line(s) for this utterance."""
+    [action] result line(s) for this utterance -- including the answer of an
+    informative action's follow-up round, which lands several seconds after
+    the [action] line. (It used to return 2 s after the first [action] line,
+    before that answer, and to sit out the whole timeout on replies with no
+    action at all.)"""
     lg = latest_log()
     if not lg:
         return {"status": "no_log", "lines": []}
@@ -197,10 +221,11 @@ def wait_for_reply(text: str, timeout: float = 75.0) -> dict:
     snippet = text[:30].lower()
     saw_inject = False
     lines: list[str] = []
-    got_action = False
+    pending_followup = False
+    last_new = time.time()
     deadline = time.time() + timeout
     while time.time() < deadline:
-        time.sleep(1.0)
+        time.sleep(0.5)
         try:
             with open(lg, encoding="utf-8", errors="replace") as f:
                 f.seek(pos)
@@ -212,26 +237,22 @@ def wait_for_reply(text: str, timeout: float = 75.0) -> dict:
             low = line.lower()
             if "[inject]" in low and snippet in low:
                 saw_inject = True
+                last_new = time.time()
                 if "(standby)" in low:
                     # standby will drop it — caller should --wake and retry.
                     return {"status": "standby_ignored", "lines": []}
                 continue
             if not saw_inject:
                 continue
+            if "reading results" in low:
+                pending_followup = True
+                last_new = time.time()
             if "jarvis:" in low or "[action]" in low:
                 lines.append(line.rstrip())
-            if "[action]" in low:
-                got_action = True
-        if got_action:
-            time.sleep(2.0)          # let the spoken follow-up land
-            try:
-                with open(lg, encoding="utf-8", errors="replace") as f:
-                    f.seek(pos)
-                    for line in f.read().splitlines():
-                        if "jarvis:" in line.lower() or "[action]" in line.lower():
-                            lines.append(line.rstrip())
-            except Exception:
-                pass
+                last_new = time.time()
+                if "jarvis:" in low:
+                    pending_followup = False
+        if _reply_complete(lines, pending_followup, time.time() - last_new):
             return {"status": "ok", "lines": lines}
     return {"status": "timeout" if not lines else "partial", "lines": lines}
 
