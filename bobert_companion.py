@@ -18243,6 +18243,11 @@ class _SentenceFlushBuffer:
                         and _joke_fallback.is_joke_request(_turn_user_text())):
                     self._stopped = True
                     return
+                # Likewise a dodged request for a suggestion ("A bold
+                # choice, sir") — _advice_fallback_line replaces or trims it.
+                if _advice_fallback.early_hold(piece, _turn_user_text()):
+                    self._stopped = True
+                    return
             except Exception:
                 self._stopped = True   # fail closed: don't early-speak
                 return
@@ -27145,6 +27150,7 @@ def _emit_mid_task_status(name: str, arg: str, fired_flag: list[bool]) -> None:
 from core import claim_validator as _claim_validator  # noqa: E402
 from core import units as _units  # noqa: E402
 from core import joke_fallback as _joke_fallback  # noqa: E402
+from core import advice_fallback as _advice_fallback  # noqa: E402
 
 
 # ── Turn grounding ledger (2026-09-29) ──────────────────────────────────────
@@ -27244,6 +27250,33 @@ def _joke_fallback_line(spoken: str, user_text: str, raw_reply: str = "") -> str
     except Exception:
         pass
     return joke
+
+
+def _advice_fallback_line(spoken: str, user_text: str, raw_reply: str = "") -> str:
+    """The text to speak instead of ``spoken`` when the owner asked for a
+    suggestion and the reply dodged it ("A bold choice, if I may say so, sir —
+    though my culinary expertise is somewhat limited"); "" otherwise.
+    core/advice_fallback.py has the rules. Like _joke_fallback_line, the
+    dodge in conversation_history is replaced so the next turn doesn't copy
+    it. Never raises."""
+    try:
+        out = _advice_fallback.apply(spoken, user_text)
+    except Exception:
+        return ""
+    if not out or out == spoken:
+        return ""
+    print("  [advice-fallback] reply dodged a request for a suggestion — "
+          "speaking a suggestion instead")
+    try:
+        if raw_reply:
+            for msg in reversed(conversation_history):
+                if msg.get("role") == "assistant":
+                    if msg.get("content") == raw_reply:
+                        msg["content"] = out
+                    break
+    except Exception:
+        pass
+    return out
 
 
 # Actions that ground the same preemptive claim category as the action the
@@ -32589,6 +32622,12 @@ def _run_llm_dispatch_body(text: str) -> str:
         _joke = _joke_fallback_line(_full_spoken, text, reply)
         if _joke:
             spoken_text = _joke
+        else:
+            # "what should I have for dinner" answered with "A bold choice,
+            # sir" and no suggestion gets a suggestion (2026-09-29, v2.0.135).
+            _advice = _advice_fallback_line(_full_spoken, text, reply)
+            if _advice:
+                spoken_text = _advice
     # Barge gate: if a wake-word barge was accepted while the reply streamed,
     # the seq advanced — honour the interrupt and don't speak the tail. 2026-07-08.
     _barged = False
