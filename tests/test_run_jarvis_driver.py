@@ -100,6 +100,31 @@ class DriverLivenessTests(unittest.TestCase):
             self.assertEqual(self.d.main(), 0)
         boot.assert_not_called()
 
+    def _main_with(self, argv, results):
+        fw, inj = mock.Mock(), mock.Mock()
+        waits = iter(results)
+        with self._psutil([_Proc(4242, "python.exe", ["python", "bobert_companion.py"])]),                 mock.patch.object(self.d, "force_wake", fw),                 mock.patch.object(self.d, "inject", inj),                 mock.patch.object(self.d, "wait_for_reply", lambda *a, **k: next(waits)),                 mock.patch.object(sys, "argv", ["driver.py"] + argv),                 mock.patch("builtins.print"):
+            rc = self.d.main()
+        return rc, fw, inj
+
+    def test_driving_a_turn_does_not_wake_an_awake_jarvis(self):
+        # Live 2026-09-29: an unconditional force_wake made JARVIS say "At your
+        # service, sir." before every driven turn; his mic heard it and he
+        # answered himself.
+        rc, fw, inj = self._main_with(["what time is it"],
+                                      [{"status": "ok", "lines": ["JARVIS: 3 PM"]}])
+        self.assertEqual(rc, 0)
+        fw.assert_not_called()
+        inj.assert_called_once_with("what time is it")
+
+    def test_standby_drop_wakes_once_and_retries(self):
+        rc, fw, inj = self._main_with(["what time is it"],
+                                      [{"status": "standby_ignored", "lines": []},
+                                       {"status": "ok", "lines": ["JARVIS: 3 PM"]}])
+        self.assertEqual(rc, 0)
+        fw.assert_called_once()
+        self.assertEqual(inj.call_count, 2)
+
     def test_force_wake_appends_to_pending_tray_commands(self):
         with open(self.d.TRAY, "w", encoding="utf-8") as f:
             json.dump([{"cmd": "restart"}], f)

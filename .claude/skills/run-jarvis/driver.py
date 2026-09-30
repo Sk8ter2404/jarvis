@@ -279,7 +279,12 @@ def main() -> int:
         if not boot():
             return 1
 
-    force_wake()
+    # Wake only when asked (--wake) or when standby actually dropped the
+    # command (handled below). An unconditional force_wake made JARVIS say
+    # "At your service, sir." before EVERY driven turn, and his desk mic heard
+    # it and answered it as the owner (live 2026-09-29 quality sweep).
+    if args.wake:
+        force_wake()
 
     if args.wake and not args.utterance:
         print("[driver] force-woke JARVIS.")

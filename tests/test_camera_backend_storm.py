@@ -74,6 +74,20 @@ class WebcamUsersNowTests(unittest.TestCase):
         reg = self._reg({}, {"C:#SynthPython#pythonw.exe": _app(1000, 0)})
         self.assertEqual(cb.webcam_users_now(exclude_dir=here, reg=reg), [])
 
+    def test_windows_paths_parse_the_same_on_a_posix_host(self):
+        # CI 2026-09-29 (v2.0.131/132, Linux runner): the privacy log holds
+        # WINDOWS paths, but they were split with os.path = posixpath there, so
+        # basename() returned the whole path and the exclude-dir check never
+        # matched. Force posixpath here so the Windows box catches it too.
+        import posixpath
+        with mock.patch.object(cb.os, "path", posixpath):
+            reg = self._reg(
+                {"SynthMeet_8wekyb3d8bbwe": _app(1000, 0)},
+                {"C:#Tools#SynthCap#synthcap.exe": _app(1200, 0),
+                 "C:#SynthPython#pythonw.exe": _app(1000, 0)})
+            self.assertEqual(sorted(cb.webcam_users_now(exclude_dir=r"C:\SynthPython", reg=reg)),
+                             ["SynthMeet", "synthcap.exe"])
+
     def test_nobody_using_a_webcam_is_an_empty_list_not_none(self):
         reg = self._reg({"SynthMeet_x": _app(10, 20)})
         self.assertEqual(cb.webcam_users_now(reg=reg), [])

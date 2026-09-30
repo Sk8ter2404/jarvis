@@ -31236,6 +31236,10 @@ def _run_fast_paths(text: str) -> bool:
     if hit is None:
         return False
     print(f"  [fast-path] {hit.kind}")
+    # The same "JARVIS:" transcript line every other reply prints, so the
+    # session log (and anything reading it: the HUD, the run-jarvis driver,
+    # quality sweeps) shows what was said. Live 2026-09-29 it was missing.
+    print(f"  JARVIS: {hit.reply}")
     _append_turn(text, hit.reply)
     _speak(hit.reply)
     set_state("idle")

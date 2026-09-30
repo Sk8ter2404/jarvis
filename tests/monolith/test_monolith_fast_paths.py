@@ -85,6 +85,13 @@ class FastPathAnswersTests(_Base):
         # One line, the kind only.
         self.assertEqual(log.count("[fast-path]"), 1)
 
+    def test_the_reply_is_in_the_transcript_log(self):
+        # Live 2026-09-29: fast-path replies were spoken but never printed as
+        # a "JARVIS:" line, so the session log (and the run-jarvis driver)
+        # showed no answer at all for them.
+        _handled, log = self._turn("what's the date tomorrow")
+        self.assertIn("JARVIS: Tomorrow is Wednesday, September 30, 2026, sir.", log)
+
     def test_days_until_christmas_and_friday(self):
         for text, reply in (
                 ("how many days until Christmas",

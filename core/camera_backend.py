@@ -105,6 +105,7 @@ is a real cost of MSMF — just a small and fully recoverable one.
 from __future__ import annotations
 
 import ctypes
+import ntpath  # the webcam privacy log stores WINDOWS paths on every host
 import os
 import threading
 import time
@@ -167,7 +168,7 @@ def webcam_users_now(exclude_dir: "str | None" = None,
         root = reg.OpenKey(reg.HKEY_CURRENT_USER, _CONSENT_WEBCAM_KEY)
     except Exception:
         return None
-    ex = os.path.normcase(os.path.abspath(exclude_dir)) if exclude_dir else None
+    ex = ntpath.normcase(ntpath.abspath(exclude_dir)) if exclude_dir else None
     users: list = []
 
     def _in_use(key) -> bool:
@@ -196,14 +197,14 @@ def webcam_users_now(exclude_dir: "str | None" = None,
             if name == "NonPackaged":
                 for exe in list(_subkeys(sub)):
                     path = exe.replace("#", "\\")
-                    if ex and os.path.normcase(os.path.dirname(path)) == ex:
+                    if ex and ntpath.normcase(ntpath.dirname(path)) == ex:
                         continue
                     try:
                         k = reg.OpenKey(sub, exe)
                     except Exception:
                         continue
                     if _in_use(k):
-                        users.append(os.path.basename(path) or path)
+                        users.append(ntpath.basename(path) or path)
                 continue
             if _in_use(sub):
                 users.append(name.split("_")[0] or name)
