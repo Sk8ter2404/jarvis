@@ -1,52 +1,78 @@
 #!/usr/bin/env python3
 """JARVIS Settings — the GUI behind the tray's Settings submenu.
 
-`tray.py` launches this with ``subprocess.Popen([sys.executable,
-SETTINGS_WINDOW, "--tab", <name>])`` from each Settings menu item
-(Voice/Audio, AI/Models, Privacy/Ambient, Integrations, Advanced) and from the
-Audio "Voice / Audio Settings…" item. Until this file existed those six menu
-items were silent no-ops — this is the surface they open.
+``tray.py`` launches this with ``subprocess.Popen([sys.executable,
+SETTINGS_WINDOW, "--tab", <name>])``. Run as a SCRIPT, Python puts ``tools\\``
+(this file's folder) first on ``sys.path``, not the project root — so the
+first thing below puts the project root back, or every lazy ``from core
+import …`` (the VRAM panel, the chat↔vision lockstep) quietly fails.
+``--selftest`` proves the imports resolve without opening a window.
 
 Design notes
 ────────────
-* Dark theme matching the existing tray dialogs (bg ``#0d1117``, fg
-  ``#c9d1d9``, Consolas) — see tray.py's `_run_about_dialog`.
-* Reads/writes ``data/user_settings.json`` (data/ is gitignored — the schema
-  ships as ``tools/user_settings.example.json``). On first run the GUI creates
-  ``data/user_settings.json`` from the built-in defaults, which mirror
-  ``core/config.py``'s current values.
-* The live consumer of these knobs (bobert_companion / core.voice_pipeline._cfg
-  etc.) is a SEPARATE, parallel task. This file's only job is to persist a
-  valid JSON document; it never imports the monolith.
-* Writes use the same atomic temp-file + ``os.replace`` pattern as tray.py's
-  ``_send_command`` so a crash mid-save can't corrupt the settings file.
+* Dark theme matching the tray dialogs (bg ``#0d1117``, fg ``#c9d1d9``,
+  Consolas), including the read-only dropdowns and their lists.
+* Reads/writes ``data/user_settings.json`` (gitignored; the shipped template is
+  ``tools/user_settings.example.json``). ``core/config.py`` applies that file
+  ONCE, when JARVIS starts — so almost every change here takes effect on the
+  next start. The window says so, and offers "Save & restart JARVIS" (through
+  the same tray command inbox the tray's Restart item uses).
+* Save writes ONLY the fields you changed, merged into the file as it is on
+  disk at that moment. A voice command that changed a setting while the window
+  was open keeps its value, untouched defaults are never frozen into the file,
+  and keys this window does not show (CAMERAS, calibration, …) are preserved.
+* A settings file that exists but cannot be parsed (a UTF-8 BOM is accepted; a
+  trailing comma is not) is REPORTED, and nothing will write over it until it
+  is fixed — the old behaviour read it as empty and the next save deleted
+  every key the window does not manage.
+* Writes use the atomic temp-file + ``os.replace`` pattern, so a crash
+  mid-save can't corrupt the file.
 * SECURITY: integration secrets are NEVER read from or written to the repo.
-  The Integrations tab shows only PRESENT / not-set status for each key (probed
-  from the OS environment) and never displays a secret's value. The three
+  The Integrations tab shows only presence for each env var and never a
+  secret's value; the web-interface token field is masked. The three
   plain-text rows there (OBS_HOST_HINT / OBS_PORT_HINT / HUE_BRIDGE_IP_HINT)
   are OWNER NOTES: they persist to the user (gitignored) settings file and are
-  read by NOTHING at runtime. Their labels and help say so, because a Settings
-  row that looks like configuration and is not is a defect regardless of what
-  the docs say. See the block comment above them for why they are neither
-  wired nor deleted.
+  read by NOTHING at runtime. Their labels and help say so. See the block
+  comment above them for why they are neither wired nor deleted.
+* ``tools/web_interface.py`` serves this module's ``SCHEMA`` as its settings
+  panel, so a row added here appears there too.
 
 Everything above the ``# ── GUI ──`` divider is import-safe with no GUI
-dependency, so the test-suite can exercise the schema, defaults, load/save
-round-trip and CLI parsing on a bare CI runner where tkinter is absent.
+dependency (and imports nothing from ``core`` at import time), so the tests can
+exercise the schema, validation, load/save and the device/theme helpers on a
+bare CI runner where tkinter is absent.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib
+import importlib.util
 import json
+import math
 import os
+import re
 import sys
 import tempfile
+import threading
+import time
 
 # ──────────────────────────────────────────────────────────────────────────
 #  Paths
 # ──────────────────────────────────────────────────────────────────────────
 # tools/settings_window.py → project root is one level up.
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Opened from the tray this file runs as a SCRIPT, so sys.path[0] is tools\ and
+# the project root is NOT importable: the lazy `from core import …` below
+# (VRAM budget, vision lockstep, config defaults) all failed, the VRAM panel
+# read "unavailable" and a chat-model change stopped moving LOCAL_VISION_MODEL
+# with it. Same fix as tools/jarvis_watchdog.py. Importing this module from the
+# project (tests, web_interface) already has the root on the path — skip then.
+if not any(os.path.normcase(os.path.abspath(p or os.curdir))
+           == os.path.normcase(PROJECT_DIR) for p in sys.path):
+    sys.path.insert(0, PROJECT_DIR)
+
 DATA_DIR = os.path.join(PROJECT_DIR, "data")
 # Default on-disk location of the live settings document. The actual path used
 # by load/save is resolved at CALL time via ``settings_path()`` so a redirect
@@ -56,6 +82,10 @@ DATA_DIR = os.path.join(PROJECT_DIR, "data")
 SETTINGS_PATH = os.path.join(DATA_DIR, "user_settings.json")
 # Shipped, tracked template (data/ is fully gitignored).
 EXAMPLE_PATH = os.path.join(PROJECT_DIR, "tools", "user_settings.example.json")
+# The tray's command inbox, drained by the running JARVIS twice a second (see
+# bobert_companion._drain_tray_commands_once). "Save & restart" appends
+# {"cmd": "restart"} here exactly the way tray.py's Restart item does.
+TRAY_COMMANDS_FILE = os.path.join(PROJECT_DIR, "tray_commands.json")
 
 # Env var that redirects BOTH load and save away from ``SETTINGS_PATH``. When
 # set and non-empty, every read/write (and the atomic temp file derived from it)
@@ -91,24 +121,34 @@ def settings_path() -> str:
 BG = "#0d1117"
 FG = "#c9d1d9"
 FIELD_BG = "#161b22"
+BORDER = "#30363d"
 ACCENT = "#1f6feb"
 MUTED = "#8b949e"
+WARN = "#d29922"
+ERROR = "#f85149"
+OK_GREEN = "#3fb950"
 FONT = ("Consolas", 10)
 FONT_BOLD = ("Consolas", 11, "bold")
+FONT_SECTION = ("Consolas", 10, "bold")
 FONT_SMALL = ("Consolas", 9)
 
-RESTART_NOTE = "Some changes apply on the next restart."
+# The honest caveat. core/config.py applies data/user_settings.json ONCE, at
+# import, when JARVIS starts; a few features also re-read their own keys, and
+# some voice commands change a setting live — but the only thing that is true
+# of EVERY row is "on the next start".
+RESTART_NOTE = ("Saved settings take effect the next time JARVIS starts — "
+                "use Save & restart.")
 
 # Local Ollama endpoint + a STATIC fallback list of common chat tags, used to
-# seed the "Local LLM model" dropdown when Ollama is unreachable at GUI-open
-# time (so the field still offers sensible choices offline). The live list is
-# probed by `installed_ollama_models()`.
+# seed the "Local LLM model" dropdown until (or when) the background probe of
+# the installed models answers. The live list is `installed_ollama_models()`.
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 OLLAMA_MODEL_FALLBACK = [
-    "gemma4:12b",                           # default: 7/7 bake-off, 8.4GB, multimodal
-    "qwen2.5:14b-instruct-q5_K_M",          # proven failover: works + fits
+    "gemma4:26b-a4b-it-qat",                # the default brain (core/config.py):
+                                            # ~16 GB, multimodal — vision shares it
+    "gemma4:12b",                           # game-mode brain: ~9 GB, multimodal
+    "qwen2.5:14b-instruct-q5_K_M",          # proven text-only failover
     "qwen3:14b",                            # needs think:false (handled in-app)
-    "gemma4:latest",                        # small E4B fallback
     "llama3.1:8b-instruct-q5_K_M",
 ]
 # Tag substrings that are NOT chat models (embedding / vision) — excluded from
@@ -117,49 +157,59 @@ _NON_CHAT_MARKERS = (
     "nomic-embed", "embed-text", "-embed", "bge-", "all-minilm",
     "vl:", "-vl", "vision", "llava", "moondream", "bakllava",
 )
+# Embedding-only markers: the ONLY tags the vision-model dropdown leaves out
+# (a dedicated VLM is a legitimate vision choice).
+_EMBED_ONLY_MARKERS = ("nomic-embed", "embed-text", "-embed", "bge-",
+                       "all-minilm")
 
 
-def installed_ollama_models(base_url: str = OLLAMA_BASE_URL) -> list[str]:
-    """Installed Ollama CHAT tags via GET /api/tags (embedding + vision models
-    excluded), or the static OLLAMA_MODEL_FALLBACK list if Ollama is
-    unreachable. Import-safe: ``requests`` is imported lazily so importing this
-    module (for the tests / schema) never requires it or a network call."""
+def installed_ollama_models(base_url: str = OLLAMA_BASE_URL,
+                            include_vision: bool = False) -> list[str]:
+    """Installed Ollama tags via GET /api/tags, or the static
+    OLLAMA_MODEL_FALLBACK list if Ollama is unreachable.
+
+    ``include_vision=False`` (the chat dropdown) drops embedding AND vision
+    models; ``True`` (the vision dropdown) drops embedding models only.
+    Import-safe: ``requests`` is imported lazily so importing this module (for
+    the tests / schema) never requires it or a network call. The GUI calls this
+    on a background thread — a slow Ollama must not hold the window closed."""
+    markers = _EMBED_ONLY_MARKERS if include_vision else _NON_CHAT_MARKERS
     try:
         import requests  # lazy: keep module import dependency-free
         r = requests.get(f"{base_url}/api/tags", timeout=(2, 3))
         if not r.ok:
             return list(OLLAMA_MODEL_FALLBACK)
         names = [m.get("name", "") for m in r.json().get("models", []) if m.get("name")]
-        chat = [n for n in names
-                if not any(mk in n.lower() for mk in _NON_CHAT_MARKERS)]
-        return chat or list(OLLAMA_MODEL_FALLBACK)
+        keep = [n for n in names if not any(mk in n.lower() for mk in markers)]
+        return keep or list(OLLAMA_MODEL_FALLBACK)
     except Exception:
         return list(OLLAMA_MODEL_FALLBACK)
 
 
-# Synthetic mic-picker choices that don't map to a real device index. They are
-# part of the MICROPHONE_INDEX contract the monolith already honours (None =
-# auto / PREFERRED_INPUT_DEVICES lookup; a NEGATIVE index = hard-off, no capture
-# stream is opened — see bobert_companion._mic_input_disabled). The label text
-# is what the user sees; the value is what persists to user_settings.json.
+# ──────────────────────────────────────────────────────────────────────────
+#  Audio devices
+# ──────────────────────────────────────────────────────────────────────────
+# Synthetic mic-picker choices that don't map to a real device. They are part
+# of the MICROPHONE_INDEX contract the monolith already honours (None = auto /
+# PREFERRED_INPUT_DEVICES lookup; a NEGATIVE index = hard-off, no capture
+# stream is opened — see bobert_companion._mic_input_disabled).
 MIC_AUTO_LABEL = "System default (auto)"
 MIC_OFF_LABEL = "Off (no mic)"
 MIC_AUTO_INDEX = None
 MIC_OFF_INDEX = -1
 
 
+# -- legacy index helpers ---------------------------------------------------
+# The picker used to persist the raw PortAudio INDEX, which renumbers whenever
+# a USB device comes or goes (the same mic is #1 today and #4 tomorrow). The
+# picker now saves the device NAME (see audio_device_choices below); these
+# index helpers remain for an old file that still pins a number, and for the
+# callers/tests that use them.
 def list_input_devices() -> list[tuple[str, int]]:
     """Available audio INPUT devices as ``(label, index)`` tuples, e.g.
-    ``("[2] Microphone (Realtek)", 2)``.
-
-    Import-safe and never raises: ``sounddevice`` is imported lazily (it pulls
-    in PortAudio), so importing this module for the tests / schema never needs
-    it. Mirrors ``installed_ollama_models()``'s lazy-and-tolerant pattern — any
-    failure (no sounddevice, no PortAudio, headless CI) returns ``[]`` so the
-    picker still renders with only the synthetic auto/off choices.
-
-    Only the device NAME + its query index are read; no stream is opened.
-    """
+    ``("[2] Microphone (Realtek)", 2)``. Unfiltered, one row per PortAudio
+    index. Import-safe and never raises; only the device list is read — no
+    stream is opened."""
     out: list[tuple[str, int]] = []
     try:
         import sounddevice as sd  # lazy: PortAudio dependency, GUI-only
@@ -176,15 +226,8 @@ def list_input_devices() -> list[tuple[str, int]]:
 
 
 def mic_choices(saved_index=MIC_AUTO_INDEX) -> list[tuple[str, int]]:
-    """The full ordered ``(label, index)`` list for the mic picker combobox:
-    the two synthetic choices (auto / off) followed by every live input device.
-
-    If ``saved_index`` is a real device index that is NOT currently present
-    (e.g. a USB mic that's unplugged right now), a synthetic
-    ``"[idx] (saved device, not connected)"`` row is appended so the saved
-    selection stays visible and round-trips — mirroring how the ``combo`` branch
-    keeps an unknown saved Ollama tag visible rather than silently dropping it.
-    """
+    """Legacy ``(label, index)`` list: auto, off, then every live input device;
+    a saved index that is not present right now is kept visible."""
     choices: list[tuple[str, int]] = [
         (MIC_AUTO_LABEL, MIC_AUTO_INDEX),
         (MIC_OFF_LABEL, MIC_OFF_INDEX),
@@ -199,7 +242,7 @@ def mic_choices(saved_index=MIC_AUTO_INDEX) -> list[tuple[str, int]]:
 
 
 def mic_index_to_label(index, choices: list[tuple[str, int]]) -> str:
-    """Resolve a stored MICROPHONE_INDEX to the combobox label to preselect."""
+    """Resolve a stored MICROPHONE_INDEX to the legacy label to preselect."""
     for label, idx in choices:
         if idx == index:
             return label
@@ -207,18 +250,281 @@ def mic_index_to_label(index, choices: list[tuple[str, int]]) -> str:
 
 
 def mic_label_to_index(label: str, choices: list[tuple[str, int]]):
-    """Translate a chosen combobox label back to the int (or None) to persist."""
+    """Translate a legacy label back to the int (or None) it stands for."""
     for lbl, idx in choices:
         if lbl == label:
             return idx
     return MIC_AUTO_INDEX
 
+
+# -- name-based picker (2026-09-30) -----------------------------------------
+# Host-API names as PortAudio reports them on Windows → the short form shown.
+_HOSTAPI_SHORT = {
+    "MME": "MME",
+    "Windows DirectSound": "DirectSound",
+    "Windows WASAPI": "WASAPI",
+    "Windows WDM-KS": "WDM-KS",
+}
+# Not devices: the aliases PortAudio adds on top of the real endpoints.
+_ALIAS_DEVICE_MARKERS = ("sound mapper", "primary sound capture driver",
+                         "primary sound driver")
+# Loopback / virtual endpoints nobody means when they pick "my microphone".
+_VIRTUAL_DEVICE_MARKERS = ("steam streaming", "vb-audio", "cable output",
+                           "cable input", "voicemeeter", "virtual")
+# Input endpoints that are sockets, not microphones.
+_NOT_A_MIC_PREFIXES = ("line", "analog connector", "spdif", "s/pdif",
+                       "stereo mix", "what u hear", "wave out mix",
+                       "digital input")
+# MME (WAVEINCAPS/WAVEOUTCAPS szPname[32]) truncates names to 31 characters, so
+# the MME row of a long-named device is a PREFIX of its DirectSound/WASAPI row.
+_MME_NAME_LIMIT = 31
+
+DIRECTION_KEYS = {
+    # direction -> (index key, preferred-names key)
+    "input": ("MICROPHONE_INDEX", "PREFERRED_INPUT_DEVICES"),
+    "output": ("SPEAKER_INDEX", "PREFERRED_OUTPUT_DEVICES"),
+}
+
+
+def _norm_device_name(name: str) -> str:
+    n = " ".join(str(name or "").split()).lower()
+    n = re.sub(r"\(\s+", "(", n)
+    return re.sub(r"\s+\)", ")", n)
+
+
+def is_real_audio_device(name: str, direction: str = "input") -> bool:
+    """False for the rows a person never means: blank names, "Microphone ()"
+    (an endpoint with nothing behind it), the Sound Mapper / Primary Sound
+    Driver aliases, loopback/virtual devices, and — for inputs — line-level
+    sockets ("Line", "Analog Connector", "Stereo Mix")."""
+    n = _norm_device_name(name)
+    if not n or re.search(r"\(\s*\)", n):
+        return False
+    if any(m in n for m in _ALIAS_DEVICE_MARKERS):
+        return False
+    if any(m in n for m in _VIRTUAL_DEVICE_MARKERS):
+        return False
+    if direction == "input" and n.startswith(_NOT_A_MIC_PREFIXES):
+        return False
+    return True
+
+
+def _query_audio_devices():
+    """(devices, hostapis) from sounddevice, or ([], []) when unavailable.
+    Reads the device LIST only — never opens a stream. Never raises."""
+    try:
+        import sounddevice as sd  # lazy: PortAudio dependency, GUI-only
+        return list(sd.query_devices()), list(sd.query_hostapis())
+    except Exception:
+        return [], []
+
+
+def list_audio_devices(direction: str = "input", devices=None,
+                       hostapis=None) -> list[dict]:
+    """The real audio devices for ``direction`` ("input" | "output"), ONE row
+    per physical device however many host APIs expose it.
+
+    Each row: ``{"name", "label", "apis", "indices", "names"}``.
+      * ``name`` is what the picker SAVES — the raw name of the device's
+        lowest-index row (MME on Windows, whose 31-character truncation is a
+        prefix of the other APIs' full name). bobert_companion._pick_device
+        matches PREFERRED_*_DEVICES entries as case-insensitive SUBSTRINGS in
+        index order, so this name finds the same device under every API.
+      * ``label`` is what the owner sees: the full name plus the host APIs.
+
+    ``devices``/``hostapis`` default to a live sounddevice query (the device
+    list only; no stream is opened). Never raises."""
+    if devices is None:
+        devices, queried_apis = _query_audio_devices()
+        if hostapis is None:
+            hostapis = queried_apis
+    hostapis = list(hostapis or [])
+    chan_key = "max_input_channels" if direction == "input" \
+        else "max_output_channels"
+    # group key -> [(index, raw name, short host-API name), ...]
+    groups: dict[str, list] = {}
+    order: list[str] = []
+    for idx, dev in enumerate(devices or []):
+        try:
+            if int(dev.get(chan_key, 0) or 0) <= 0:
+                continue
+            raw = str(dev.get("name", "") or "")
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if not is_real_audio_device(raw, direction):
+            continue
+        api = ""
+        try:
+            api_i = int(dev.get("hostapi", -1))
+            if 0 <= api_i < len(hostapis):
+                api_name = str(hostapis[api_i].get("name", ""))
+                api = _HOSTAPI_SHORT.get(api_name, api_name)
+        except (AttributeError, TypeError, ValueError):
+            api = ""
+        key = _norm_device_name(raw)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append((idx, raw, api))
+    # Fold an MME-truncated group into the ONE full-named group it prefixes.
+    for key in list(order):
+        members = groups.get(key)
+        if not members or not any(len(n.strip()) >= _MME_NAME_LIMIT - 1
+                                  for _i, n, _a in members):
+            continue
+        longer = [k for k in order
+                  if k != key and k in groups and len(k) > len(key)
+                  and k.startswith(key)]
+        if len(longer) == 1:
+            groups[longer[0]] = members + groups[longer[0]]
+            del groups[key]
+            order.remove(key)
+    out = []
+    for key in order:
+        members = sorted(groups[key])
+        apis = list(dict.fromkeys(a for _i, _n, a in members if a))
+        save_name = members[0][1].strip() or members[0][1]
+        display = max((n for _i, n, _a in members),
+                      key=lambda n: len(n.strip())).strip()
+        if apis == ["WDM-KS"]:
+            api_txt = "WDM-KS only — may not open"
+        else:
+            api_txt = " · ".join(apis) if apis else "unknown API"
+        out.append({"name": save_name, "label": f"{display}  [{api_txt}]",
+                    "apis": apis, "indices": [i for i, _n, _a in members],
+                    "names": [n for _i, n, _a in members]})
+    return out
+
+
+def _auto_label(direction: str) -> str:
+    what = "mic" if direction == "input" else "speakers"
+    return f"Automatic — Windows default {what} (or the preferred list)"
+
+
+def audio_device_choices(direction: str, saved_index, preferred,
+                         devices=None, hostapis=None) -> tuple[list[dict], dict]:
+    """The picker rows for ``direction`` and the row to preselect.
+
+    Returns ``(choices, initial)``; every choice is
+    ``{"label", "kind", "value"}`` with kind one of:
+      "auto"  — MICROPHONE_INDEX/SPEAKER_INDEX None: the preferred-name list,
+                else the Windows default (the owner's normal setup);
+      "off"   — input only: MICROPHONE_INDEX -1, no capture stream at all;
+      "name"  — a device, saved by NAME as the first PREFERRED_*_DEVICES entry
+                (bobert_companion._pick_device's existing name match), so it
+                survives the renumbering that broke the old index picker;
+      "index" — an old file that still pins a raw index: shown so it
+                round-trips, and replaced as soon as a device is picked.
+
+    The picker OWNS the first entry of the preferred list: when the saved index
+    is None and the list is non-empty, the device matching its first entry is
+    preselected (a "(saved, not connected)" row when nothing matches)."""
+    preferred = [str(p) for p in (preferred or []) if str(p).strip()]
+    if devices is None:
+        devices, queried_apis = _query_audio_devices()
+        if hostapis is None:
+            hostapis = queried_apis
+    rows = list_audio_devices(direction, devices=devices, hostapis=hostapis)
+    choices: list[dict] = [{"label": _auto_label(direction), "kind": "auto",
+                            "value": None}]
+    if direction == "input":
+        choices.append({"label": "Off — no microphone", "kind": "off",
+                        "value": MIC_OFF_INDEX})
+    for r in rows:
+        choices.append({"label": r["label"], "kind": "name",
+                        "value": r["name"], "names": r["names"]})
+    initial = choices[0]
+    saved = saved_index
+    if isinstance(saved, bool):
+        saved = None
+    if isinstance(saved, int) and saved < 0 and direction == "input":
+        initial = choices[1]
+    elif isinstance(saved, int) and saved >= 0:
+        here = ""
+        for r in rows:
+            if saved in r["indices"]:
+                here = r["names"][r["indices"].index(saved)].strip()
+        if not here:
+            try:
+                here = str(devices[saved].get("name", "")).strip()
+            except Exception:
+                here = ""
+        initial = {"label": f"Device #{saved} — pinned by number "
+                            f"({here or 'not connected'}; renumbers)",
+                   "kind": "index", "value": saved}
+        choices.append(initial)
+    elif preferred:
+        head = preferred[0].strip()
+        low = head.lower()
+        match = None
+        for c in choices:
+            if c["kind"] == "name" and c["value"].strip().lower() == low:
+                match = c
+                break
+        if match is None:
+            for c in choices:
+                if c["kind"] == "name" and any(
+                        low in n.lower() for n in c.get("names", [])):
+                    match = c
+                    break
+        if match is None:
+            match = {"label": f"{head}  [saved — not connected]",
+                     "kind": "name", "value": head, "names": [head]}
+            choices.append(match)
+        initial = match
+    # Labels must be unique — the combobox hands back a label.
+    seen: dict[str, int] = {}
+    for c in choices:
+        n = seen.get(c["label"], 0)
+        seen[c["label"]] = n + 1
+        if n:
+            c["label"] = f"{c['label']} ({n + 1})"
+    return choices, initial
+
+
+def device_choice_index(choice: dict):
+    """The MICROPHONE_INDEX / SPEAKER_INDEX value a picker row stands for."""
+    kind = (choice or {}).get("kind")
+    if kind in ("off", "index"):
+        return choice.get("value")
+    return None
+
+
+def device_choice_list(choice: dict, owned_head, current_list) -> list[str]:
+    """The PREFERRED_*_DEVICES list after picking ``choice``.
+
+    ``owned_head`` is the name the picker currently owns at the head of the
+    list (the device it showed or last put there), or None. That one entry is
+    replaced; every other name the owner typed is kept in order. "auto" drops
+    the owned entry (back to the rest of the list, else the Windows default);
+    "off"/"index" leave the list alone."""
+    cur = [str(p) for p in (current_list or []) if str(p).strip()]
+    kind = (choice or {}).get("kind")
+    if kind not in ("auto", "name"):
+        return cur
+    rest = cur
+    if owned_head:
+        low = str(owned_head).strip().lower()
+        rest = [p for p in cur if p.strip().lower() != low]
+    if kind == "auto":
+        return rest
+    name = str(choice.get("value") or "").strip()
+    if not name:
+        return rest
+    return [name] + [p for p in rest if p.strip().lower() != name.lower()]
+
+
 # Order matters — drives both the Notebook tab order and `--tab` resolution.
-TAB_ORDER = ["voice", "ai", "privacy", "integrations", "advanced"]
+# The tray's Settings menu opens voice / ai / privacy / integrations /
+# advanced; hearing and cameras are new (2026-09-30) and reachable by tab.
+TAB_ORDER = ["voice", "hearing", "ai", "cameras", "privacy", "integrations",
+             "advanced"]
 TAB_LABELS = {
-    "voice": "Voice / Audio",
-    "ai": "AI / Models",
-    "privacy": "Privacy / Ambient",
+    "voice": "Voice",
+    "hearing": "Hearing & Mic",
+    "ai": "AI & Models",
+    "cameras": "Cameras & Kinect",
+    "privacy": "Privacy",
     "integrations": "Integrations",
     "advanced": "Advanced",
 }
@@ -227,29 +533,44 @@ TAB_LABELS = {
 #  Settings schema
 # ──────────────────────────────────────────────────────────────────────────
 # A flat dict of JSON-key → field-spec. Each spec is a dict with:
-#   tab      one of TAB_ORDER
+#   tab      one of TAB_ORDER (the sub-headings and row order inside each tab
+#            live in TAB_SECTIONS below, so this dict keeps its historical
+#            order — tools/web_interface.py lists tabs in first-seen order)
 #   label    human label for the control
-#   type     "bool" | "enum" | "str" | "int" | "float" | "text"
+#   type     "bool" | "enum" | "str" | "combo" | "int" | "float" | "text" |
+#            "routing" | "device" (persisted) — or "status" / "view"
+#            (read-only rows whose keys start with "_")
 #   default  default value (matches core/config.py's current default)
-#   help     (optional) one-line hint shown under the control
-#   choices  (enum only) list of allowed string values
-#   secret_env (integration status rows only) the OS env var probed for
-#              PRESENT/not-set; its VALUE is never read into a control
+#   help     (optional) hint shown under the control
+#   choices  (enum/combo/routing) allowed / suggested string values
+#   min/max  (int/float) inclusive range; min_exclusive=True makes min strict.
+#            Numbers are non-negative unless a row says otherwise. forbid maps
+#            a value to the reason it is refused.
+#   nonblank (str/combo) an empty value is refused
+#   secret   (str) masked in the GUI
+#   suggest  (combo) "ollama" / "ollama-vision" / "monitors": where the live
+#            suggestions come from
+#   direction/names_key (device) "input"|"output" and the preferred-name list
+#            the picker writes
+#   secret_env (status rows) the OS env vars probed for PRESENT/not-set; their
+#            VALUES are never read into a control
 #
 # Keeping the schema as plain data (no tkinter) lets the tests assert on
 # defaults / coverage and lets `default_settings()` build the template file
-# without ever importing the GUI.
+# without ever importing the GUI. tools/web_interface.py renders this SCHEMA
+# as its settings panel.
 #
-# This is a SAFE, curated subset of core/config.py — destructive or
-# hardware-pinning knobs (CAMERAS, MONITORS, CONFIRM_KEYWORDS, robot IPs) are
-# intentionally omitted.
+# This is a curated subset of core/config.py — hardware-pinning structures
+# (CAMERAS, MONITORS, CONFIRM_KEYWORDS, robot IPs) are not editable here;
+# CAMERAS is SHOWN read-only.
 SCHEMA: dict[str, dict] = {
     # ── Voice / Audio ──────────────────────────────────────────────────
     "VOICE_MODE": {
         "tab": "voice", "label": "Voice pipeline", "type": "enum",
         "choices": ["turn_based", "realtime"], "default": "turn_based",
-        "help": "realtime = low-latency streaming (needs optional deps; "
-                "falls back to turn_based).",
+        "help": "realtime = low-latency streaming; it needs RealtimeSTT, "
+                "RealtimeTTS and PyAudio, and falls back to turn_based "
+                "without them.",
     },
     "WAKE_WORD_AUTOSTART": {
         "tab": "voice", "label": "Neural wake-word in standby", "type": "bool",
@@ -278,8 +599,53 @@ SCHEMA: dict[str, dict] = {
                 "handy when an external TV the media session can't see is "
                 "playing.",
     },
+    "FOLLOWUP_WINDOW_S": {
+        "tab": "voice", "label": "Follow-ups without the wake word for (seconds)",
+        "type": "float", "default": 0.0, "max": 600,
+        "help": "In wake-word mode, after you say 'JARVIS', follow-ups within "
+                "this many seconds need no wake word, and each one extends "
+                "the window. 0 = strict (every command needs 'JARVIS'). A TV "
+                "talking in the room can hold the window open. Applies on the "
+                "next start.",
+    },
+    # Device dialogues (core/dialogue.py). DIALOGUE_LOST_HOLD_S deliberately has
+    # NO row: as of 2026-09-30 nothing reads it, and a row for a dead constant
+    # is the dead-toggle bug tests/test_settings_schema_wiring.py catches.
+    "SKILL_ROUTES_ENABLED": {
+        "tab": "voice", "label": "Let skills claim exact requests before the AI",
+        "type": "bool", "default": True,
+        "help": "A skill can recognise an exact request (e.g. 'talk to the "
+                "<device> about pizza') and run its action directly instead "
+                "of leaving the choice to the AI model. Off sends every "
+                "request to the model. Applies on the next start.",
+    },
+    "DIALOGUE_ENABLED": {
+        "tab": "voice", "label": "Scripted back-and-forth with talking devices",
+        "type": "bool", "default": True,
+        "help": "Let a skill that owns a talking device run a short scripted "
+                "exchange between JARVIS and it. Off refuses every dialogue. "
+                "Applies on the next start.",
+    },
+    "DIALOGUE_MAX_S": {
+        "tab": "voice", "label": "Longest dialogue (seconds)", "type": "int",
+        "default": 40, "min": 1, "max": 600,
+        "help": "Hard cap on one dialogue's length. Applies on the next start.",
+    },
+    "DIALOGUE_STOP_LISTEN": {
+        "tab": "voice", "label": "Listen for 'stop' after each device line",
+        "type": "bool", "default": True,
+        "help": "Off = no stop-listening after device lines (the tray, the "
+                "wake word and the device itself still stop a dialogue). "
+                "Applies on the next start.",
+    },
+    "DIALOGUE_BEAT_S": {
+        "tab": "voice", "label": "Pause after each device line (seconds)",
+        "type": "float", "default": 0.6, "max": 10,
+        "help": "Comic timing, and the window in which your 'stop' is heard. "
+                "Applies on the next start.",
+    },
     "SELF_ECHO_FILTER_ENABLED": {
-        "tab": "voice", "label": "Never answer his own voice",
+        "tab": "hearing", "label": "Never answer his own voice",
         "type": "bool", "default": True,
         "help": "Ignore anything the mic hears while JARVIS is speaking (or "
                 "just after), and anything that repeats a line he said "
@@ -287,20 +653,20 @@ SCHEMA: dict[str, dict] = {
                 "never checked. Applies on the next start.",
     },
     "SELF_ECHO_WINDOW_S": {
-        "tab": "voice", "label": "Remember his own lines for (seconds)",
-        "type": "float", "default": 20.0,
+        "tab": "hearing", "label": "Remember his own lines for (seconds)",
+        "type": "float", "default": 20.0, "max": 600,
         "help": "How long a line JARVIS spoke is remembered, so the mic "
                 "hearing it again is ignored. Applies on the next start.",
     },
     "SELF_ECHO_TAIL_S": {
-        "tab": "voice", "label": "Ignore the mic just after he speaks (seconds)",
-        "type": "float", "default": 0.8,
+        "tab": "hearing", "label": "Ignore the mic just after he speaks (seconds)",
+        "type": "float", "default": 0.8, "max": 10,
         "help": "Speech that starts this soon after one of his own lines "
                 "ends (while the mic was already listening) counts as his "
                 "echo. Applies on the next start.",
     },
     "NOISE_FILTER_ENABLED": {
-        "tab": "voice", "label": "Ignore noise heard as 'Bye.' / 'Thank you.'",
+        "tab": "hearing", "label": "Ignore noise heard as 'Bye.' / 'Thank you.'",
         "type": "bool", "default": True,
         "help": "Whisper turns room noise into 'Bye.', 'Thank you.' or 'You'. "
                 "Ignore a transcript that is only one of those when it was "
@@ -310,32 +676,35 @@ SCHEMA: dict[str, dict] = {
                 "Applies on the next start.",
     },
     "MICROPHONE_INDEX": {
-        "tab": "voice", "label": "Microphone", "type": "device",
+        "tab": "hearing", "label": "Microphone", "type": "device",
         "default": None,
-        "help": "Which mic to use. 'System default (auto)' follows the "
-                "preferred-device list below and auto-switches as devices come "
-                "and go; pick a specific device to pin it; 'Off (no mic)' "
-                "disables capture entirely. The list is your live input devices "
-                "(probed when this window opens).",
+        "direction": "input", "names_key": "PREFERRED_INPUT_DEVICES",
+        "help": "'Automatic' follows the Windows default mic (or the preferred "
+                "names below). Picking a device saves its NAME as the first "
+                "preferred mic, so it survives devices being renumbered; "
+                "'Off' disables capture entirely. The list is your real input "
+                "devices (read when this window opens).",
     },
     "PREFERRED_INPUT_DEVICES": {
-        "tab": "voice", "label": "Preferred mic names (auto mode)",
+        "tab": "hearing", "label": "Preferred mic names (automatic mode)",
         "type": "text", "default": [],
-        "help": "One device-name substring per line, most-preferred first. In "
-                "'System default (auto)' mode JARVIS picks the first connected "
-                "match and auto-switches when you plug/unplug. Ignored when a "
-                "specific mic is pinned above. Empty = use the OS default.",
+        "help": "One device-name fragment per line, most-preferred first. "
+                "JARVIS uses the first connected match that opens, and "
+                "switches as you plug and unplug. The picker above edits the "
+                "first line. Empty = the Windows default.",
     },
     "TTS_VOICE": {
         "tab": "voice", "label": "TTS voice", "type": "str",
-        "default": "en-GB-RyanNeural",
+        "default": "en-GB-RyanNeural", "nonblank": True,
         "help": "Edge neural voice name, e.g. en-GB-RyanNeural.",
     },
     "TTS_BACKEND": {
         "tab": "voice", "label": "TTS backend", "type": "enum",
         "choices": ["edge", "kokoro", "pyttsx3", "xtts"], "default": "edge",
         "help": "edge = online neural; kokoro = local CPU (offline, frees the GPU); "
-                "pyttsx3 = offline SAPI; xtts = clone.",
+                "pyttsx3 = offline SAPI; xtts = Coqui voice clone (needs the "
+                "TTS package). A backend that can't run falls back to another "
+                "voice.",
     },
     "VOICE_CLONE_ENABLED": {
         "tab": "voice", "label": "Local voice clone (Chatterbox)", "type": "bool",
@@ -358,58 +727,59 @@ SCHEMA: dict[str, dict] = {
         "help": "Local voice-cloning engine. Currently only 'chatterbox'.",
     },
     "AUDIO_PROCESSING_ENABLED": {
-        "tab": "voice", "label": "Audio processing (master)", "type": "bool",
+        "tab": "hearing", "label": "Audio processing (master)", "type": "bool",
         "default": True,
         "help": "Master switch for the mic-cleanup chain below.",
     },
     "AUDIO_ECHO_CANCEL": {
-        "tab": "voice", "label": "Echo cancellation (AEC)", "type": "bool",
+        "tab": "hearing", "label": "Echo cancellation (AEC)", "type": "bool",
         "default": True,
         "help": "Cancel JARVIS's own playback from the mic.",
     },
     "AUDIO_NOISE_SUPPRESS": {
-        "tab": "voice", "label": "Noise suppression (NS)", "type": "bool",
+        "tab": "hearing", "label": "Noise suppression (NS)", "type": "bool",
         "default": True, "help": "Suppress stationary background noise.",
     },
     "AUDIO_AGC": {
-        "tab": "voice", "label": "Auto gain control (AGC)", "type": "bool",
+        "tab": "hearing", "label": "Auto gain control (AGC)", "type": "bool",
         "default": True, "help": "Normalise mic level before STT.",
     },
     "VAD_THRESHOLD": {
-        "tab": "voice", "label": "VAD threshold", "type": "float",
-        "default": 0.008,
-        "help": "Mic RMS to treat as speech; raise to ignore more noise.",
+        "tab": "hearing", "label": "VAD threshold", "type": "float",
+        "default": 0.008, "min": 0, "min_exclusive": True, "max": 1,
+        "help": "Mic RMS to treat as speech; raise to ignore more noise "
+                "(typical 0.005-0.05).",
     },
     "AUDIO_DUCKING_ENABLED": {
-        "tab": "voice", "label": "Duck other apps while speaking", "type": "bool",
+        "tab": "hearing", "label": "Duck other apps while speaking", "type": "bool",
         "default": True,
         "help": "Lower other apps' volume while JARVIS talks (Windows).",
     },
     # 2026-09-29 audio-device flap damping (core/audio_flap.py).
     "AUDIO_FLAP_WINDOW_S": {
-        "tab": "voice", "label": "Device flapping window (seconds)",
-        "type": "float", "default": 300.0,
+        "tab": "hearing", "label": "Device flapping window (seconds)",
+        "type": "float", "default": 300.0, "max": 86400,
         "help": "A mic or speaker that changes the flapping number of times "
                 "within this many seconds is 'flapping': JARVIS says so once "
                 "and stays quiet about audio devices until it has been steady "
                 "for twice this long. Applies on the next start.",
     },
     "AUDIO_FLAP_THRESHOLD": {
-        "tab": "voice", "label": "Device changes that count as flapping",
-        "type": "int", "default": 3,
+        "tab": "hearing", "label": "Device changes that count as flapping",
+        "type": "int", "default": 3, "max": 100,
         "help": "How many changes inside the window make a device 'flapping'. "
                 "Below 2 turns flap detection off. Applies on the next start.",
     },
     "AUDIO_ANNOUNCE_MIN_GAP_S": {
-        "tab": "voice", "label": "Min seconds between device announcements",
-        "type": "float", "default": 60.0,
+        "tab": "hearing", "label": "Min seconds between device announcements",
+        "type": "float", "default": 60.0, "max": 3600,
         "help": "At most one spoken audio-device announcement per this many "
                 "seconds; a newer one replaces one still waiting. 0 turns the "
                 "limit off. Applies on the next start.",
     },
     "AUDIO_REPICK_STABLE_S": {
-        "tab": "voice", "label": "Follow a new default mic after (seconds)",
-        "type": "float", "default": 8.0,
+        "tab": "hearing", "label": "Follow a new default mic after (seconds)",
+        "type": "float", "default": 8.0, "max": 600,
         "help": "When Windows moves the default mic or speakers, JARVIS "
                 "follows once the new default has held this long -- at once "
                 "if the device it is using has gone. 0 = follow immediately. "
@@ -422,19 +792,80 @@ SCHEMA: dict[str, dict] = {
     # (v2.0.23 made auto crash-safe via the VRAM plan); this is persistence
     # plumbing only and does not touch the runtime whisper code.
     "WHISPER_DEVICE": {
-        "tab": "voice", "label": "Whisper STT device", "type": "enum",
+        "tab": "hearing", "label": "Whisper STT device", "type": "enum",
         "choices": ["auto", "cuda", "cuda:0", "cuda:1", "cpu"],
         "default": "auto",
-        "help": "Where speech-to-text runs. auto = let ctranslate2/torch decide "
-                "(crash-safe VRAM plan); cuda / cuda:N pin a GPU (e.g. cuda:1 to "
-                "keep the primary card free); cpu forces the legacy path.",
+        "help": "Where speech-to-text runs. auto / cuda / cuda:0 = the main "
+                "GPU; cuda:1 = the second card (keeps the main one free — the "
+                "VRAM budget then leaves Whisper off the main card); cpu = no "
+                "GPU. Applies on the next start.",
     },
     "WHISPER_MODEL_CUDA": {
-        "tab": "voice", "label": "Whisper GPU model", "type": "str",
-        "default": "large-v3-turbo",
-        "help": "faster-whisper model used on the GPU (~3.1 GB VRAM). "
-                "large-v3-turbo is ~8x faster than large-v3 at near-identical "
-                "accuracy.",
+        "tab": "hearing", "label": "Whisper GPU model", "type": "str",
+        "default": "large-v3-turbo", "nonblank": True,
+        "help": "faster-whisper model used on the GPU (large-v3-turbo: ~1.5 "
+                "GB VRAM on the card chosen above, ~8x faster than large-v3 "
+                "at near-identical accuracy). Applies on the next start.",
+    },
+    "SPEAKER_INDEX": {
+        "tab": "hearing", "label": "Speakers", "type": "device",
+        "default": None,
+        "direction": "output", "names_key": "PREFERRED_OUTPUT_DEVICES",
+        "help": "'Automatic' follows the Windows default speakers (or the "
+                "preferred names below). Picking a device saves its NAME as "
+                "the first preferred speaker.",
+    },
+    "PREFERRED_OUTPUT_DEVICES": {
+        "tab": "hearing", "label": "Preferred speaker names (automatic mode)",
+        "type": "text", "default": [],
+        "help": "One device-name fragment per line, most-preferred first. "
+                "JARVIS plays through the first connected match. The picker "
+                "above edits the first line. Empty = the Windows default.",
+    },
+    # Headset auto-switch (audio/audio_switch.py). The config defaults come
+    # from JARVIS_AUDIO_* env vars; the window shows the value in effect.
+    "AUDIO_AUTOSWITCH_ENABLED": {
+        "tab": "hearing", "label": "Move the default speakers with the headset's power",
+        "type": "bool", "default": False,
+        "help": "Watch the wireless headset's power (read from its dongle) and "
+                "make it the Windows default speakers when it turns on, and "
+                "put the previous default back when it turns off. Needs the "
+                "headset name below. Applies on the next start.",
+    },
+    "AUDIO_AUTOSWITCH_HEADSET": {
+        "tab": "hearing", "label": "Headset name (part of it)", "type": "str",
+        "default": "",
+        "help": "Part of the headset's Windows device name, e.g. CORSAIR VOID "
+                "ELITE. List candidates with: python -m audio.audio_switch "
+                "--list",
+    },
+    "AUDIO_AUTOSWITCH_FALLBACK": {
+        "tab": "hearing", "label": "Speakers when the headset turns off",
+        "type": "str", "default": "",
+        "help": "Used when there is no earlier default to go back to (part of "
+                "the device name).",
+    },
+    "AUDIO_AUTOSWITCH_MIC": {
+        "tab": "hearing", "label": "Move the default MIC with the headset too",
+        "type": "bool", "default": False,
+        "help": "Off by default: a wrong move of the default recording device "
+                "is how JARVIS goes deaf. Applies on the next start.",
+    },
+    "AUDIO_AUTOSWITCH_MIC_FALLBACK": {
+        "tab": "hearing", "label": "Mic when the headset turns off",
+        "type": "str", "default": "",
+        "help": "Desk mic to fall back to (part of its name; check with "
+                "python -m audio.audio_switch --list-mics). Blank = the mic is "
+                "not moved, and JARVIS says so.",
+    },
+    "DEVICE_SPEECH_FILTER_ENABLED": {
+        "tab": "hearing", "label": "Ignore what known talking devices say",
+        "type": "bool", "default": True,
+        "help": "A line that matches something a known device says (phrase "
+                "lists in data/device_phrases/*.json) is ignored before it can "
+                "wake JARVIS, be answered or be learned from. 'Stop' always "
+                "gets through; no phrase files = nothing filtered. Applies on "
+                "the next start.",
     },
 
     # ── AI / Models ────────────────────────────────────────────────────
@@ -456,12 +887,27 @@ SCHEMA: dict[str, dict] = {
     },
     "LOCAL_LLM_MODEL": {
         "tab": "ai", "label": "Local LLM model (Ollama, $0)", "type": "combo",
-        "default": "gemma4:26b-a4b-it-qat",
+        "default": "gemma4:26b-a4b-it-qat", "nonblank": True,
+        "suggest": "ollama",
         "choices": OLLAMA_MODEL_FALLBACK,
         "help": "Ollama tag for the always-on local brain — $0 per conversation. "
-                "The list is your installed Ollama chat models (probed when this "
-                "window opens); you can also type any tag. Switch by voice too: "
-                "'switch to the 32B'.",
+                "The list is your installed Ollama chat models (loaded in the "
+                "background when this window opens); you can also type any "
+                "tag, or switch by voice ('use the fast one').",
+    },
+    # 2026-09-30: a real row now. It used to be left out so a fresh install
+    # wouldn't pin it — Save no longer pins untouched defaults, so that reason
+    # is gone, and the vision brain deserves to be visible.
+    "LOCAL_VISION_MODEL": {
+        "tab": "ai", "label": "Local vision model", "type": "combo",
+        "default": "gemma4:26b-a4b-it-qat", "nonblank": True,
+        "suggest": "ollama-vision",
+        "choices": OLLAMA_MODEL_FALLBACK + ["off"],
+        "help": "The local model that looks at the screen. The SAME tag as the "
+                "chat model means the one multimodal brain does both at no "
+                "extra VRAM (the shipped setup); a different tag loads a "
+                "second model; 'off' disables local vision. Changing the chat "
+                "model moves this with it while the two are the same.",
     },
     "CLAUDE_OPTIONAL": {
         "tab": "ai", "label": "Claude is optional (never required)",
@@ -481,8 +927,10 @@ SCHEMA: dict[str, dict] = {
         # core.config literal.
         "tab": "ai", "label": "Local vision fallback", "type": "bool",
         "default": False,
-        "help": "Retry vision on the local VLM when the cloud call fails. "
-                "Loads the ~7.3 GB VLM on-demand — see the VRAM budget above.",
+        "help": "Retry a failed cloud vision call on the local vision model. "
+                "When that is the chat brain (the shipped setup) it costs no "
+                "extra VRAM; a separate vision model can load a second model "
+                "— see the VRAM budget above.",
     },
     "RAG_ENABLED": {
         "tab": "ai", "label": "Personal RAG (document memory)", "type": "bool",
@@ -494,12 +942,13 @@ SCHEMA: dict[str, dict] = {
         "tab": "ai", "label": "Long-term memory", "type": "bool",
         "default": True,
         "help": "Record every conversation turn and recall relevant facts "
-                "each turn (local embedder, ~0.2 GB VRAM). Off = JARVIS "
+                "each turn. The embedder runs on the CPU by default "
+                "(LTM_EMBED_DEVICE), so it uses no VRAM. Off = JARVIS "
                 "remembers nothing new between sessions.",
     },
     "PROMPT_FREEZE_QUIET_S": {
         "tab": "ai", "label": "Hold prompt updates while talking (seconds)",
-        "type": "float", "default": 30.0,
+        "type": "float", "default": 30.0, "max": 3600,
         "help": "Local brain only: newly learned facts reach the prompt after "
                 "this many seconds of quiet instead of between turns, so each "
                 "reply starts warm (0 = update between turns). Applies on the "
@@ -531,7 +980,7 @@ SCHEMA: dict[str, dict] = {
     },
     "LOCAL_BACKGROUND_MAX_DEFER_S": {
         "tab": "ai", "label": "Hold background brain work while talking (max seconds)",
-        "type": "float", "default": 120.0,
+        "type": "float", "default": 120.0, "max": 3600,
         "help": "Local brain only: memory extraction, the ambient extractor "
                 "and the Teams check wait until you go quiet, so they don't "
                 "make your next reply re-read the whole prompt — but never "
@@ -540,7 +989,7 @@ SCHEMA: dict[str, dict] = {
     },
     "LOCAL_REPRIME_AFTER_BACKGROUND_WINDOW_S": {
         "tab": "ai", "label": "Re-warm after background work (seconds since you spoke)",
-        "type": "float", "default": 600.0,
+        "type": "float", "default": 600.0, "max": 86400,
         "help": "After background work used the local brain, quietly re-warm "
                 "your conversation if you spoke within this many seconds, so "
                 "your next turn is fast. Same safeguards as the re-warm above "
@@ -548,7 +997,7 @@ SCHEMA: dict[str, dict] = {
     },
     "LOCAL_REPRIME_AT_BOOT_S": {
         "tab": "ai", "label": "Warm the local brain after start (seconds)",
-        "type": "float", "default": 20.0,
+        "type": "float", "default": 20.0, "max": 3600,
         "help": "This many seconds after JARVIS starts, quietly send your "
                 "conversation to the already-loaded local brain so your "
                 "FIRST question is as fast as the rest. Same safeguards as "
@@ -579,13 +1028,13 @@ SCHEMA: dict[str, dict] = {
     },
     "PROCESSING_FILLER_DELAY": {
         "tab": "voice", "label": "Filler delay (seconds)", "type": "float",
-        "default": 2.5,
+        "default": 2.5, "min": 0.5, "max": 60,
         "help": "Seconds of silence after you speak before 'Just a moment, "
                 "sir.' (0.5-60). Applies on the next start.",
     },
     "PROCESSING_FILLER_STILL_DELAY": {
         "tab": "voice", "label": "'Still working' after (seconds of silence)",
-        "type": "float", "default": 12.0,
+        "type": "float", "default": 12.0, "max": 600,
         "help": "Seconds of silence in a long turn before one 'still working' "
                 "line. Set at or below the filler delay to turn it off. "
                 "Applies on the next start.",
@@ -597,13 +1046,6 @@ SCHEMA: dict[str, dict] = {
                 "'One moment, sir.' said before it, so the answer comes "
                 "sooner. Lead-ins with numbers, questions or any real "
                 "content are still spoken. Applies on the next start.",
-    },
-    "STREAMING_AUTO_FULLSCREEN": {
-        "tab": "ai", "label": "Auto-fullscreen TV shows & movies", "type": "bool",
-        "default": True,
-        "help": "After a show or movie actually starts playing, send the "
-                "player fullscreen ('f' on YouTube / Netflix / Disney+ / "
-                "Prime / Hulu / Max). Off = playback starts windowed.",
     },
     "BARGE_IN_ENABLED": {
         "tab": "voice", "label": "Barge-in (interrupt him by voice)",
@@ -623,35 +1065,121 @@ SCHEMA: dict[str, dict] = {
                 "Wake-word and command replies always work. This only makes "
                 "the feature available — focus mode always starts OFF.",
     },
+    # Until 2026-09-30 THIS row was labelled "Air control auto-start (Kinect
+    # hand-mouse)" — but AIR_CONTROL_ENABLED is the other, dormant engine
+    # (core/air_control.py); the live hand-mouse is KINECT_AIR_MOUSE_ENABLED
+    # (skills/kinect_air_mouse.py), which had no row at all.
     "AIR_CONTROL_ENABLED": {
-        "tab": "ai", "label": "Air control auto-start (Kinect hand-mouse)",
+        "tab": "cameras",
+        "label": "Air control — the OTHER hand engine (dormant): auto-start",
         "type": "bool", "default": False,
-        "help": "Start the Kinect hand-mouse automatically at boot. Off "
-                "(default) still allows 'air control on' by voice — this "
-                "only controls unattended auto-start.",
+        "help": "NOT the air-mouse above: a separate, experimental engine "
+                "(reach toward the sensor to take the cursor, fist to drag, "
+                "point to scroll). Don't run it together with the air-mouse. "
+                "On = start it at boot; 'air control on' by voice starts it "
+                "for one session either way.",
     },
     "KINECT_ENABLED": {
-        "tab": "ai", "label": "Kinect sensor (presence / gestures)",
+        "tab": "cameras", "label": "Kinect sensor (master switch)",
         "type": "bool", "default": False,
-        "help": "Use the Kinect v2 for presence, gestures and pointing. "
-                "Runs on CPU/USB — no extra VRAM.",
+        "help": "Let JARVIS open the Kinect v2 (a camera + microphone array "
+                "pointed at the room). Every Kinect feature needs this. Runs "
+                "on CPU/USB — no extra VRAM.",
+    },
+    "KINECT_AS_CAMERA": {
+        "tab": "cameras", "label": "Use the Kinect as a face-tracking camera",
+        "type": "bool", "default": False,
+        "help": "Track faces on the Kinect's 1080p colour stream instead of "
+                "the USB webcams.",
+    },
+    "KINECT_PRESENCE_ENABLED": {
+        "tab": "cameras", "label": "Room presence from the skeleton",
+        "type": "bool", "default": False,
+        "help": "Count people and read head direction from the skeleton "
+                "stream (better than the webcam guesswork).",
+    },
+    "KINECT_PRESENCE_STANDBY": {
+        "tab": "cameras", "label": "Standby when the room is empty",
+        "type": "bool", "default": False,
+        "help": "Needs room presence. Off so the sensor never silences JARVIS "
+                "unless you ask it to.",
+    },
+    "KINECT_PRESENCE_WAKE": {
+        "tab": "cameras", "label": "Wake when someone walks in",
+        "type": "bool", "default": False, "help": "Needs room presence.",
+    },
+    "KINECT_GREET_ON_ENTRY": {
+        "tab": "cameras", "label": "Greet you when you come back",
+        "type": "bool", "default": False,
+        "help": "Needs room presence. A short greeting when you enter a room "
+                "that was empty for a while — at most once a minute, never "
+                "mid-conversation.",
+    },
+    "KINECT_POSTURE_NUDGE": {
+        "tab": "cameras", "label": "Posture / stand-up nudges",
+        "type": "bool", "default": False,
+        "help": "Needs room presence. One gentle nudge after a long hunch or a "
+                "long seated stretch, then a cool-down. Never nags.",
+    },
+    "KINECT_GAZE_ENABLED": {
+        "tab": "cameras",
+        "label": "Which monitor you're looking at (head direction)",
+        "type": "bool", "default": False,
+        "help": "The Kinect becomes the main 'which monitor' signal and works "
+                "with the webcams off; the webcam guess is the fallback. Tune "
+                "it with 'calibrate gaze'.",
+    },
+    "KINECT_GESTURES_ENABLED": {
+        "tab": "cameras", "label": "Gestures (wave, raise hand, swipe)",
+        "type": "bool", "default": False,
+        "help": "A wave wakes JARVIS from standby, a raised hand confirms like "
+                "'yes', a swipe cancels.",
+    },
+    "KINECT_POINT_CONTROL_ENABLED": {
+        "tab": "cameras", "label": "Point at a device to control it",
+        "type": "bool", "default": False,
+        "help": "Point at a calibrated lamp or fan and say 'turn that on'. "
+                "Calibrate each one with 'calibrate pointing for the desk "
+                "lamp' while pointing at it.",
+    },
+    "KINECT_GUARD_ENABLED": {
+        "tab": "cameras", "label": "Allow guard mode",
+        "type": "bool", "default": False,
+        "help": "Lets you arm guard mode by voice ('guard the room'): it "
+                "watches every camera and alerts once on motion. This only "
+                "allows arming — it never arms itself.",
+    },
+    "KINECT_SKELETON_OVERLAY_ENABLED": {
+        "tab": "cameras", "label": "Skeleton overlay in the HUD camera tile",
+        "type": "bool", "default": False,
+        "help": "Show the Kinect colour image with the tracked skeleton drawn "
+                "on it in the HUD preview.",
+    },
+    "KINECT_AIR_MOUSE_ENABLED": {
+        "tab": "cameras",
+        "label": "Kinect air-mouse (hand-mouse): raise a hand to take the cursor",
+        "type": "bool", "default": False,
+        "help": "Raise a hand above the shoulder to take the cursor; close the "
+                "left or right hand to click that button, hold it closed to "
+                "drag; lower the hand to let go. 'Air mouse on/off' by voice "
+                "does the same and saves it here.",
     },
     "AIR_MOUSE_REQUIRE_OPEN_PALM": {
-        "tab": "ai", "label": "Air-mouse: require an open palm to engage",
+        "tab": "cameras", "label": "Air-mouse: require an open palm to engage",
         "type": "bool", "default": True,
         "help": "Passive mode only takes the cursor on an OPEN palm raised + held "
                 "briefly (fewer false triggers from a closed/pointing hand "
                 "reaching or gesturing). Off = height alone can engage.",
     },
     "AIR_MOUSE_ARM_RELAXES_GATE": {
-        "tab": "ai", "label": "Air-mouse: 'take the cursor' relaxes the gate",
+        "tab": "cameras", "label": "Air-mouse: 'take the cursor' relaxes the gate",
         "type": "bool", "default": True,
         "help": "When you say 'take the cursor' / 'mouse control on' the strict "
                 "smart-pose gate relaxes to height-only so a raised hand engages "
                 "right away. Off = still needs the full open-palm hold even armed.",
     },
     "AIR_MOUSE_FIST_RELEASES": {
-        "tab": "ai", "label": "Air-mouse: a held fist releases the cursor",
+        "tab": "cameras", "label": "Air-mouse: a held fist releases the cursor",
         "type": "bool", "default": False,
         "help": "When ON, holding a closed fist for ~0.6 s lets go of the cursor "
                 "without lowering your hand. OFF by default because it fights the "
@@ -659,11 +1187,18 @@ SCHEMA: dict[str, dict] = {
                 "close to click/drag and lower your hand to let go.",
     },
     "AIR_MOUSE_PER_APP_DISABLE": {
-        "tab": "ai", "label": "Air-mouse: stand down over fullscreen games/video",
+        "tab": "cameras", "label": "Air-mouse: stand down over fullscreen games/video",
         "type": "bool", "default": True,
         "help": "Automatically disable the air-mouse when a fullscreen game or "
                 "video player is in the foreground (edit the app list in "
                 "data/user_settings.json → AIR_MOUSE_DISABLED_APP_HINTS).",
+    },
+    "KINECT_TWO_HAND_ENABLED": {
+        "tab": "cameras", "label": "Two-hand move / resize of the front window",
+        "type": "bool", "default": True,
+        "help": "Raise both hands and grab to move the foreground window; "
+                "spread or pinch to resize it. The one-hand cursor stands down "
+                "meanwhile.",
     },
     "ENABLE_ORCHESTRATOR": {
         "tab": "ai", "label": "Sub-agent orchestrator", "type": "bool",
@@ -675,6 +1210,15 @@ SCHEMA: dict[str, dict] = {
         "type": "bool", "default": False,
         "help": "Force ambient / background learning onto the local model so it "
                 "costs $0. Foreground conversation is unaffected.",
+    },
+    "GAME_MODE_ENABLED": {
+        "tab": "ai", "label": "Game mode watcher (smaller brain while gaming)",
+        "type": "bool", "default": False,
+        "help": "Start the game watcher at boot: when a listed game holds the "
+                "foreground, JARVIS swaps to the smaller game brain and pauses "
+                "the camera/gesture extras until the game exits. Off = only by "
+                "voice ('game mode on', 'low power mode'). Applies on the next "
+                "start.",
     },
 
     # ── Privacy / Ambient ──────────────────────────────────────────────
@@ -690,7 +1234,7 @@ SCHEMA: dict[str, dict] = {
         "help": "Periodically read the screen for ambient context.",
     },
     "STANDBY_LOOP_ENABLED": {
-        "tab": "privacy", "label": "Standby music auto-detect", "type": "bool",
+        "tab": "voice", "label": "Standby music auto-detect", "type": "bool",
         "default": True,
         "help": "Auto-enter wake-word-only mode when music with lyrics plays.",
     },
@@ -701,15 +1245,30 @@ SCHEMA: dict[str, dict] = {
                 "any window whose title matches (case-insensitive). Empty = "
                 "off. Try: 1password, bitwarden, keepass, banking.",
     },
+    "FACE_ID_ENABLED": {
+        "tab": "privacy", "label": "Face recognition (who is at the desk)",
+        "type": "bool", "default": False,
+        "help": "Recognise faces from the monitor webcams. Face data is "
+                "biometric: it stays in data/face_enroll.json on this PC, and "
+                "nothing is stored until you say 'learn my face'. Off = no "
+                "face recognition at all.",
+    },
+    "GREET_NEW_PEOPLE_ENABLED": {
+        "tab": "privacy", "label": "Say hello when new people arrive",
+        "type": "bool", "default": False,
+        "help": "When several faces JARVIS doesn't know appear, one short "
+                "hello (at most every ~10 minutes, never mid-conversation). "
+                "Needs face recognition. Voice: 'say hi to guests'.",
+    },
     "DAILY_BUDGET_USD": {
-        "tab": "privacy", "label": "Daily Claude $ cap", "type": "float",
-        "default": 1.0,
+        "tab": "ai", "label": "Daily Claude $ cap", "type": "float",
+        "default": 1.0, "max": 1000,
         "help": "Soft daily ceiling for the Chappie continuous-learning loop's "
                 "Claude API spend (USD).",
     },
     "DEEP_AUDIT_BUDGET_USD": {
-        "tab": "privacy", "label": "Deep-audit daily $ cap", "type": "float",
-        "default": 5.0,
+        "tab": "ai", "label": "Deep-audit daily $ cap", "type": "float",
+        "default": 5.0, "max": 1000,
         "help": "Daily ceiling for the background deep-audit diagnostic (USD). "
                 "The JARVIS_DEEP_AUDIT_BUDGET_USD env var overrides this.",
     },
@@ -748,12 +1307,20 @@ SCHEMA: dict[str, dict] = {
     },
     "_status_obs": {
         "tab": "integrations", "label": "OBS Studio", "type": "status",
-        "secret_env": ["OBS_HOST", "OBS_PASSWORD"],
+        # Every one of these is OPTIONAL (skills/obs_control._config defaults
+        # the host/port, and an OBS without auth needs no password), so the old
+        # all-required "not set" read as broken on a working setup. What CAN be
+        # missing is the client package.
+        "secret_env": [],
+        "optional_env": ["OBS_HOST", "OBS_PORT", "OBS_PASSWORD"],
+        "requires_module": "obswebsocket", "module_pip": "obs-websocket-py",
+        "defaults_note": "127.0.0.1:4455, no password",
         # Names the real source in the same tab, exactly as _status_hue does.
         # Its absence is why the note fields below could be mistaken for the
         # thing that configures OBS.
         "help": "Configured via OBS_HOST / OBS_PORT / OBS_PASSWORD in your "
-                ".env or OS environment (defaults 127.0.0.1:4455).",
+                ".env or OS environment — all optional (defaults "
+                "127.0.0.1:4455, no password).",
     },
     "_status_deco": {
         "tab": "integrations", "label": "TP-Link Deco router", "type": "status",
@@ -764,6 +1331,14 @@ SCHEMA: dict[str, dict] = {
         "secret_env": ["TELEGRAM_BOT_TOKEN", "NTFY_TOPIC", "PUSHOVER_TOKEN"],
         "help": "PRESENT if any one channel (Telegram / ntfy / Pushover) is set.",
         "match": "any",
+    },
+    # Moved from the AI tab, where it had nothing to do with models (P1-11).
+    "STREAMING_AUTO_FULLSCREEN": {
+        "tab": "integrations", "label": "Auto-fullscreen TV shows & movies",
+        "type": "bool", "default": True,
+        "help": "After a show or movie actually starts playing, send the "
+                "player fullscreen ('f' on YouTube / Netflix / Disney+ / "
+                "Prime / Hulu / Max). Off = playback starts windowed.",
     },
     # ── OWNER NOTES — persisted, but READ BY NOTHING ────────────────────
     # These three rows are a notepad, not configuration. Verified 2026-08-20:
@@ -823,6 +1398,14 @@ SCHEMA: dict[str, dict] = {
         "tab": "advanced", "label": "On-screen HUD", "type": "bool",
         "default": True, "help": "Drives the unified HUD at boot.",
     },
+    "HUD_MONITOR": {
+        "tab": "advanced", "label": "HUD monitor", "type": "combo",
+        "default": "top", "nonblank": True, "suggest": "monitors",
+        "choices": ["top", "left", "middle", "right"],
+        "help": "Which monitor the HUD first appears on (a name from MONITORS "
+                "in core/config.py). Once you drag the HUD, its saved position "
+                "wins. Applies on the next start.",
+    },
     "TRAY_ENABLED": {
         "tab": "advanced", "label": "System-tray applet", "type": "bool",
         "default": True,
@@ -870,18 +1453,30 @@ SCHEMA: dict[str, dict] = {
         "default": True,
         "help": "Allow launching apps, opening URLs, etc.",
     },
+    # ── Cameras (read-only view) ────────────────────────────────────────
+    # CAMERAS is a hardware-pinning structure (see the SCHEMA comment), so it
+    # is SHOWN, not edited. A "_" key: never persisted, never in the web panel.
+    "_view_cameras": {
+        "tab": "cameras", "label": "Cameras (read-only)", "type": "view",
+        "source_key": "CAMERAS",
+        "help": "Edit these in user_settings.json (CAMERAS) — use 'Open "
+                "user_settings.json' below. A camera with a name is found by "
+                "that name, so USB re-plugs can't swap them; the index is only "
+                "the fallback. Applies on the next start.",
+    },
     # ── Camera open gate (core/camera_gate.py, 2026-09-29) ──────────────
     "CAMERA_REOPEN_MAX_BACKOFF_S": {
-        "tab": "advanced", "label": "Camera retry ceiling (seconds)",
-        "type": "float", "default": 600.0,
+        "tab": "cameras", "label": "Camera retry ceiling (seconds)",
+        "type": "float", "default": 600.0, "max": 86400,
         "help": "After a camera fails to open or keeps dropping frames, JARVIS "
-                "waits 30, 60, 120, 300, then this many seconds between "
-                "retries, and only resets after a minute of healthy video. "
-                "Applies on the next start.",
+                "waits 30 s before retrying, then 60, 120, 300, 600 and "
+                "doubling — never longer than this ceiling — and resets after "
+                "a minute of healthy video. 0 = retry without waiting. Applies "
+                "on the next start.",
     },
     "USB_STORM_COOLDOWN_S": {
-        "tab": "advanced", "label": "USB trouble: leave cameras alone for (seconds)",
-        "type": "float", "default": 600.0,
+        "tab": "cameras", "label": "USB trouble: leave cameras alone for (seconds)",
+        "type": "float", "default": 600.0, "max": 86400,
         "help": "When several cameras (or a camera and an audio device) drop "
                 "at once, JARVIS stops opening every camera and the Kinect for "
                 "this long, doubling if it happens again within the hour (max "
@@ -889,8 +1484,8 @@ SCHEMA: dict[str, dict] = {
                 "the next start.",
     },
     "CAMERA_STORM_PROBATION_S": {
-        "tab": "advanced", "label": "USB trouble: probation after a cool-down (seconds)",
-        "type": "float", "default": 180.0,
+        "tab": "cameras", "label": "USB trouble: probation after a cool-down (seconds)",
+        "type": "float", "default": 180.0, "max": 86400,
         "help": "For this long after the cameras are allowed back (and for a "
                 "minute after any camera is reopened while the USB bus has "
                 "been unstable within the hour), a single camera dropping "
@@ -898,23 +1493,23 @@ SCHEMA: dict[str, dict] = {
                 "Applies on the next start.",
     },
     "CAMERA_CULPRIT_WINDOW_S": {
-        "tab": "advanced", "label": "USB trouble: blame a camera started this recently (seconds)",
-        "type": "float", "default": 5.0,
+        "tab": "cameras", "label": "USB trouble: blame a camera started this recently (seconds)",
+        "type": "float", "default": 5.0, "max": 600,
         "help": "When the USB bus drops out within this many seconds of one "
                 "camera starting its video, that camera gets the blame for "
                 "it. 0 = never blame a camera. Applies on the next start.",
     },
     "CAMERA_CULPRIT_THRESHOLD": {
-        "tab": "advanced", "label": "USB trouble: switch a camera off after this many strikes",
-        "type": "int", "default": 2,
+        "tab": "cameras", "label": "USB trouble: switch a camera off after this many strikes",
+        "type": "int", "default": 2, "max": 100,
         "help": "A camera blamed this many times within an hour is switched "
                 "off for the rest of the session (JARVIS tells you once; say "
                 "'use the left webcam again' after moving it to another "
                 "port). 0 = never switch one off. Applies on the next start.",
     },
     "CAMERA_DIES_ON_OPEN_RETRY_S": {
-        "tab": "advanced", "label": "Camera that drops out on every start: retry every (seconds)",
-        "type": "float", "default": 1800.0,
+        "tab": "cameras", "label": "Camera that drops out on every start: retry every (seconds)",
+        "type": "float", "default": 1800.0, "max": 86400,
         "help": "A camera or the Kinect whose video dies within seconds of "
                 "each of three starts in a row (it drops off USB as soon as "
                 "it streams, usually a power problem) is retried only this "
@@ -923,11 +1518,20 @@ SCHEMA: dict[str, dict] = {
                 "retries it now. 0 = off. Applies on the next start.",
     },
     "CAMERA_OPEN_MIN_GAP_S": {
-        "tab": "advanced", "label": "Gap between two parts opening one camera (seconds)",
-        "type": "float", "default": 10.0,
+        "tab": "cameras", "label": "Gap between two parts opening one camera (seconds)",
+        "type": "float", "default": 10.0, "max": 600,
         "help": "The face tracker, start-up checks, self-diagnostic, preview "
                 "tiles and Kinect never open the same device closer together "
                 "than this. 0 = off. Applies on the next start.",
+    },
+    "TV_DETECT_ENABLED": {
+        "tab": "cameras", "label": "Notice a lit TV (stops learning from TV chatter)",
+        "type": "bool", "default": False,
+        "help": "Look for a bright, flickering screen in the camera frame the "
+                "face tracker already has, and treat it as media playing so "
+                "JARVIS doesn't learn from what the TV says. It can only stop "
+                "learning, never trigger anything. Calibrate with 'calibrate "
+                "the tv region'; also 'turn on/off tv detection'.",
     },
     # ── Live web interface (tools/web_interface.py) ─────────────────────
     # A local-LAN dashboard to watch JARVIS and type commands to him. The
@@ -944,20 +1548,21 @@ SCHEMA: dict[str, dict] = {
     },
     "WEB_INTERFACE_PORT": {
         "tab": "advanced", "label": "Web interface port", "type": "int",
-        "default": 8766,
+        "default": 8766, "min": 1, "max": 65535,
+        "forbid": {8443: "8443 is the AirTag tracker's port"},
         "help": "TCP port for the dashboard (do not use 8443 — that's the "
                 "AirTag tracker).",
     },
     "WEB_INTERFACE_BIND": {
         "tab": "advanced", "label": "Web interface bind address", "type": "str",
-        "default": "127.0.0.1",
+        "default": "127.0.0.1", "nonblank": True,
         "help": "127.0.0.1 = localhost only (safe, nothing off-box can reach "
                 "it). 0.0.0.0 or a LAN IP EXPOSES it to your whole network and "
                 "REQUIRES a token below — the server refuses to start otherwise.",
     },
     "WEB_INTERFACE_TOKEN": {
         "tab": "advanced", "label": "Web interface token", "type": "str",
-        "default": "",
+        "default": "", "secret": True,
         "help": "Shared secret required on every request when set (and MANDATORY "
                 "for a non-localhost bind). Treat it like a password — anyone "
                 "with it can command JARVIS from any device on your LAN.",
@@ -965,40 +1570,166 @@ SCHEMA: dict[str, dict] = {
 }
 
 # Field types whose key is a real persisted setting (everything except the
-# read-only "status" rows, whose keys start with "_status_").
+# read-only "status" / "view" rows, whose keys start with "_").
 _PERSISTED_TYPES = {"bool", "enum", "str", "combo", "int", "float", "text",
                     "routing", "device"}
 
 
 def persisted_keys() -> list[str]:
-    """The schema keys that map to a stored value (excludes status rows)."""
+    """The schema keys that map to a stored value (excludes status/view rows)."""
     return [k for k, s in SCHEMA.items() if s.get("type") in _PERSISTED_TYPES]
+
+
+# The window's layout: per tab, (sub-heading, rows in display order). Every
+# SCHEMA row appears exactly once, under its own tab (pinned by the tests); a
+# row missing here would still render, under "Other" at the end of its tab.
+TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
+    "voice": [
+        ("Speaking", ["TTS_BACKEND", "TTS_VOICE", "STREAMING_TTS_ENABLED",
+                      "SENTENCE_TTS_ENABLED", "ANSWER_FIRST_ENABLED",
+                      "PROCESSING_FILLER_ENABLED", "PROCESSING_FILLER_DELAY",
+                      "PROCESSING_FILLER_STILL_DELAY"]),
+        ("Voice clone", ["VOICE_CLONE_ENABLED", "VOICE_CLONE_PROFILE",
+                         "VOICE_CLONE_MODEL"]),
+        ("Wake word & conversation", [
+            "VOICE_MODE", "WAKE_WORD_AUTOSTART", "START_IN_STANDBY",
+            "REQUIRE_WAKE_MODE", "FOLLOWUP_WINDOW_S",
+            "AMBIENT_MUSIC_REFUSE_WAKE", "STANDBY_LOOP_ENABLED",
+            "BARGE_IN_ENABLED", "FOCUS_MODE_ENABLED"]),
+        ("Device dialogues", ["SKILL_ROUTES_ENABLED", "DIALOGUE_ENABLED",
+                              "DIALOGUE_MAX_S", "DIALOGUE_STOP_LISTEN",
+                              "DIALOGUE_BEAT_S"]),
+    ],
+    "hearing": [
+        ("Microphone", ["MICROPHONE_INDEX", "PREFERRED_INPUT_DEVICES",
+                        "VAD_THRESHOLD", "AUDIO_PROCESSING_ENABLED",
+                        "AUDIO_ECHO_CANCEL", "AUDIO_NOISE_SUPPRESS",
+                        "AUDIO_AGC"]),
+        ("Speakers", ["SPEAKER_INDEX", "PREFERRED_OUTPUT_DEVICES",
+                      "AUDIO_DUCKING_ENABLED"]),
+        ("Headset auto-switch", ["AUDIO_AUTOSWITCH_ENABLED",
+                                 "AUDIO_AUTOSWITCH_HEADSET",
+                                 "AUDIO_AUTOSWITCH_FALLBACK",
+                                 "AUDIO_AUTOSWITCH_MIC",
+                                 "AUDIO_AUTOSWITCH_MIC_FALLBACK"]),
+        ("Device changes", ["AUDIO_FLAP_WINDOW_S", "AUDIO_FLAP_THRESHOLD",
+                            "AUDIO_ANNOUNCE_MIN_GAP_S",
+                            "AUDIO_REPICK_STABLE_S"]),
+        ("Speech recognition", ["WHISPER_DEVICE", "WHISPER_MODEL_CUDA"]),
+        ("What he ignores", ["SELF_ECHO_FILTER_ENABLED", "SELF_ECHO_WINDOW_S",
+                             "SELF_ECHO_TAIL_S", "NOISE_FILTER_ENABLED",
+                             "DEVICE_SPEECH_FILTER_ENABLED"]),
+    ],
+    "ai": [
+        ("Brain", ["AI_BACKEND", "CLAUDE_MODEL", "LOCAL_LLM_MODEL",
+                   "LOCAL_VISION_MODEL", "MODEL_ROUTING", "CLAUDE_OPTIONAL",
+                   "LOCAL_LLM_FALLBACK", "LOCAL_VISION_FALLBACK",
+                   "AMBIENT_LEARNING_FORCE_LOCAL", "GAME_MODE_ENABLED"]),
+        ("Memory", ["LTM_ENABLED", "RAG_ENABLED"]),
+        ("Speed", ["FAST_PATHS_ENABLED", "PROMPT_FREEZE_QUIET_S",
+                   "LOCAL_PREFIX_REPRIME", "LOCAL_BACKGROUND_MAX_DEFER_S",
+                   "LOCAL_REPRIME_AFTER_BACKGROUND_WINDOW_S",
+                   "LOCAL_REPRIME_AT_BOOT_S"]),
+        ("Background work", ["ENABLE_ORCHESTRATOR", "TEAMS_NUDGE_ENABLED"]),
+        ("Spending caps", ["DAILY_BUDGET_USD", "DEEP_AUDIT_BUDGET_USD"]),
+    ],
+    "cameras": [
+        ("Cameras", ["_view_cameras", "CAMERA_REOPEN_MAX_BACKOFF_S",
+                     "USB_STORM_COOLDOWN_S", "CAMERA_STORM_PROBATION_S",
+                     "CAMERA_CULPRIT_WINDOW_S", "CAMERA_CULPRIT_THRESHOLD",
+                     "CAMERA_DIES_ON_OPEN_RETRY_S", "CAMERA_OPEN_MIN_GAP_S",
+                     "TV_DETECT_ENABLED"]),
+        ("Kinect", ["KINECT_ENABLED", "KINECT_AS_CAMERA",
+                    "KINECT_PRESENCE_ENABLED", "KINECT_PRESENCE_STANDBY",
+                    "KINECT_PRESENCE_WAKE", "KINECT_GREET_ON_ENTRY",
+                    "KINECT_POSTURE_NUDGE", "KINECT_GAZE_ENABLED",
+                    "KINECT_GESTURES_ENABLED", "KINECT_POINT_CONTROL_ENABLED",
+                    "KINECT_GUARD_ENABLED",
+                    "KINECT_SKELETON_OVERLAY_ENABLED"]),
+        ("Kinect air-mouse", ["KINECT_AIR_MOUSE_ENABLED",
+                              "AIR_MOUSE_REQUIRE_OPEN_PALM",
+                              "AIR_MOUSE_ARM_RELAXES_GATE",
+                              "AIR_MOUSE_FIST_RELEASES",
+                              "AIR_MOUSE_PER_APP_DISABLE",
+                              "KINECT_TWO_HAND_ENABLED"]),
+        ("Experimental", ["AIR_CONTROL_ENABLED"]),
+    ],
+    "privacy": [
+        ("Listening & watching", ["AMBIENT_LISTEN_ENABLED",
+                                  "AMBIENT_SCREEN_ENABLED",
+                                  "SCREENSHOT_PRIVACY_BLOCKLIST"]),
+        ("Faces", ["FACE_ID_ENABLED", "GREET_NEW_PEOPLE_ENABLED"]),
+    ],
+    "integrations": [
+        ("Connections", ["_status_anthropic", "_status_porcupine",
+                         "_status_azure_tts", "_status_elevenlabs",
+                         "_status_bambu", "_status_govee", "_status_hue",
+                         "_status_obs", "_status_deco", "_status_phone"]),
+        ("Media", ["STREAMING_AUTO_FULLSCREEN"]),
+        ("Notes (not read by JARVIS)", ["OBS_HOST_HINT", "OBS_PORT_HINT",
+                                        "HUE_BRIDGE_IP_HINT"]),
+    ],
+    "advanced": [
+        ("On screen", ["HUD_ENABLED", "HUD_MONITOR", "TRAY_ENABLED",
+                       "RETICLE_OVERLAY_ENABLED"]),
+        ("Behaviour", ["PUSHBACK_ENABLED", "MISSION_NARRATION_ENABLED",
+                       "SCREEN_VISION_ENABLED", "PC_CONTROL_ENABLED",
+                       "OVERNIGHT_UPGRADE_ENABLED"]),
+        ("Debug", ["VAD_DEBUG"]),
+        ("Web interface", ["WEB_INTERFACE_ENABLED", "WEB_INTERFACE_PORT",
+                           "WEB_INTERFACE_BIND", "WEB_INTERFACE_TOKEN"]),
+    ],
+}
+
+
+def tab_layout(tab: str) -> list[tuple[str, list[str]]]:
+    """``[(section, [keys…]), …]`` for one tab: TAB_SECTIONS, plus an "Other"
+    section for any row of that tab the layout doesn't list."""
+    sections = [(name, [k for k in keys if SCHEMA.get(k, {}).get("tab") == tab])
+                for name, keys in TAB_SECTIONS.get(tab, [])]
+    listed = {k for _n, keys in sections for k in keys}
+    other = [k for k, s in SCHEMA.items()
+             if s.get("tab") == tab and k not in listed]
+    if other:
+        sections.append(("Other", other))
+    return [(n, keys) for n, keys in sections if keys]
+
+
+def row_section(key: str) -> str | None:
+    """The sub-heading a row is shown under, or None for an unknown key."""
+    tab = SCHEMA.get(key, {}).get("tab")
+    for name, keys in tab_layout(tab) if tab else []:
+        if key in keys:
+            return name
+    return None
+
+
+def _copy_value(value):
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, dict):
+        return dict(value)
+    return value
 
 
 def default_settings() -> dict:
     """The full template: every persisted key at its schema default.
 
-    Mirrors core/config.py's current defaults so a fresh install boots with a
-    valid file. Mutable defaults (lists) are deep-copied so callers can't
-    mutate the schema by editing the result.
-    """
-    out: dict = {}
-    for key in persisted_keys():
-        default = SCHEMA[key]["default"]
-        if isinstance(default, list):
-            default = list(default)
-        elif isinstance(default, dict):
-            default = dict(default)
-        out[key] = default
-    return out
+    Mirrors core/config.py's current defaults (tools/user_settings.example.json
+    is generated from this). Mutable defaults (lists/dicts) are copied so
+    callers can't mutate the schema by editing the result."""
+    return {key: _copy_value(SCHEMA[key]["default"]) for key in persisted_keys()}
 
 
 def coerce_value(spec: dict, raw):
     """Coerce a raw value to the type its schema spec declares.
 
     Never raises on bad input — falls back to the spec default so a hand-edited
-    settings file with a typo can't crash the GUI or a downstream reader.
+    settings file with a typo can't crash the GUI or a downstream reader. (The
+    GUI's Save does NOT rely on this: it runs validate_value, which REFUSES a
+    bad value and says why, instead of silently saving the default.)
     """
+    spec = spec or {}
     typ = spec.get("type")
     default = spec.get("default")
     try:
@@ -1025,11 +1756,8 @@ def coerce_value(spec: dict, raw):
         if typ == "device":
             # A device index: int | None, matching the MICROPHONE_INDEX
             # contract (None = auto / preferred-list lookup, a negative index =
-            # hard-off). Persist the INT (or None), never the friendly label —
-            # so what lands in user_settings.json is exactly what
-            # core.config._apply_user_settings coerces back. null / "" / None ->
-            # the default (None); 3 / "3" / -1 -> int; a non-numeric value falls
-            # through to the default rather than raising.
+            # hard-off). null / "" / None -> the default (None); 3 / "3" / -1
+            # -> int; a non-numeric value falls through to the default.
             if raw is None:
                 return default
             if isinstance(raw, bool):           # guard: bool is an int subclass
@@ -1056,37 +1784,174 @@ def coerce_value(spec: dict, raw):
             return base
         # str (and anything unknown) → string
         return str(raw)
-    except (TypeError, ValueError):
-        if isinstance(default, list):
-            return list(default)
-        if isinstance(default, dict):
-            return dict(default)
-        return default
+    except (TypeError, ValueError, OverflowError):
+        return _copy_value(default)
+
+
+def _fmt_num(value) -> str:
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def validate_value(spec: dict, raw) -> tuple[object, str | None]:
+    """STRICT parse of a value the owner entered: ``(value, None)`` when it is
+    acceptable, ``(None, reason)`` when it must be refused.
+
+    coerce_value is deliberately lenient (a hand-edited file must never crash a
+    reader), which made the GUI's Save report "Saved." while writing the
+    DEFAULT for "0,01", "20s", "nan", a negative VAD threshold or port 99999.
+    This refuses those and says why, next to the field."""
+    spec = spec or {}
+    typ = spec.get("type")
+    if typ in ("int", "float"):
+        return _validate_number(spec, raw)
+    if typ == "enum":
+        val = str(raw)
+        choices = [str(c) for c in (spec.get("choices") or [])]
+        if val not in choices:
+            return None, "choose one of: " + ", ".join(choices)
+        return val, None
+    if typ in ("str", "combo"):
+        val = "" if raw is None else str(raw).strip()
+        if spec.get("nonblank") and not val:
+            return None, "can't be blank"
+        return val, None
+    if typ == "device":
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return None, None
+        if isinstance(raw, bool):
+            return None, "pick a device"
+        try:
+            return int(raw), None
+        except (TypeError, ValueError):
+            return None, "pick a device"
+    return coerce_value(spec, raw), None
+
+
+def _validate_number(spec: dict, raw) -> tuple[object, str | None]:
+    typ = spec.get("type")
+    if isinstance(raw, bool):
+        return None, "enter a number"
+    if isinstance(raw, (int, float)):
+        num = raw
+    else:
+        s = "" if raw is None else str(raw).strip()
+        if not s:
+            return None, "enter a number"
+        if re.fullmatch(r"[+-]?\d+,\d+", s):
+            return None, "use a dot for decimals (0.5, not 0,5)"
+        try:
+            num = float(s)
+        except ValueError:
+            return None, f"'{s}' is not a number"
+    if isinstance(num, float) and (math.isnan(num) or math.isinf(num)):
+        return None, "must be a real number"
+    if typ == "int":
+        if float(num) != int(num):
+            return None, "must be a whole number"
+        num = int(num)
+    else:
+        num = float(num)
+    lo = spec.get("min", None if spec.get("allow_negative") else 0)
+    hi = spec.get("max")
+    if lo is not None:
+        if spec.get("min_exclusive"):
+            if num <= lo:
+                return None, f"must be more than {_fmt_num(lo)}"
+        elif num < lo:
+            return None, f"must be at least {_fmt_num(lo)}"
+    if hi is not None and num > hi:
+        return None, f"must be at most {_fmt_num(hi)}"
+    forbid = spec.get("forbid") or {}
+    if num in forbid:
+        return None, str(forbid[num])
+    return num, None
+
+
+def values_equal(a, b) -> bool:
+    """Equality for settings values (1 == 1.0 counts; True != 1 does not)."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a == b
+    return a == b
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Reading and writing the settings file
+# ──────────────────────────────────────────────────────────────────────────
+class SettingsFileError(ValueError):
+    """The settings file exists but is not a readable JSON object.
+
+    Raised by read_settings_file — and therefore by every WRITER here, which
+    reads the file first: nothing may be written over a document that could not
+    be read, because that write would replace every key it failed to see."""
+
+
+def _describe_read_error(exc: Exception) -> str:
+    if isinstance(exc, json.JSONDecodeError):
+        return f"line {exc.lineno}, column {exc.colno}: {exc.msg}"
+    if isinstance(exc, UnicodeDecodeError):
+        return "it is not UTF-8 text (saved as UTF-16?)"
+    return f"{type(exc).__name__}: {exc}"
+
+
+def read_settings_file(path: str | None = None) -> dict:
+    """STRICT read of the raw document on disk.
+
+    Missing or blank file → ``{}``. A JSON object → that dict, as written (no
+    defaults layered in). Anything else → ``SettingsFileError`` naming the
+    problem (line/column for a JSON error). Read as ``utf-8-sig``: PowerShell
+    5.1's ``Set-Content/Out-File -Encoding utf8`` writes a BOM, which plain
+    utf-8 rejected — and the old reader then treated the owner's whole file as
+    empty."""
+    if path is None:
+        path = settings_path()
+    if not os.path.exists(path):
+        return {}
+    name = os.path.basename(path) or path
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise SettingsFileError(
+            f"{name} could not be read — {_describe_read_error(exc)}") from exc
+    if not text.strip():
+        return {}
+    try:
+        decoded = json.loads(text)
+    except ValueError as exc:
+        raise SettingsFileError(
+            f"{name} is not valid JSON — {_describe_read_error(exc)}") from exc
+    if not isinstance(decoded, dict):
+        raise SettingsFileError(
+            f"{name} must hold a JSON object {{ … }}, not a "
+            f"{type(decoded).__name__}")
+    return decoded
+
+
+def settings_file_problem(path: str | None = None) -> str | None:
+    """Why the settings file can't be read, or None when it is fine/absent."""
+    try:
+        read_settings_file(path)
+        return None
+    except SettingsFileError as exc:
+        return str(exc)
 
 
 def load_settings(path: str | None = None) -> dict:
-    """Load settings, layering the on-disk file over the defaults.
+    """Load settings, layering the on-disk file over the schema defaults.
 
-    Missing file or missing keys fall back to defaults; every value is coerced
-    to its schema type. Unknown keys in the file are preserved untouched (so a
-    newer JARVIS that wrote extra keys isn't clobbered by an older GUI).
-
-    ``path`` defaults to ``settings_path()`` (honours ``JARVIS_SETTINGS_PATH``).
-    """
-    if path is None:
-        path = settings_path()
+    Missing file or missing keys fall back to defaults; every schema value is
+    coerced to its type; unknown keys are passed through untouched. TOLERANT:
+    an unreadable file loads as the defaults so a reader never crashes — but
+    save_settings then REFUSES to write over it (see read_settings_file), so
+    load-modify-save callers (the voice toggles) can no longer turn a typo
+    into a wiped file. ``path`` defaults to ``settings_path()``."""
     merged = default_settings()
-    raw: dict = {}
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                text = f.read().strip()
-            if text:
-                decoded = json.loads(text)
-                if isinstance(decoded, dict):
-                    raw = decoded
-        except (OSError, ValueError):
-            raw = {}
+    try:
+        raw = read_settings_file(path)
+    except SettingsFileError:
+        raw = {}
     # Coerce known keys; pass through unknown keys verbatim.
     for key, value in raw.items():
         spec = SCHEMA.get(key)
@@ -1098,8 +1963,8 @@ def atomic_write_json(path: str, data: dict) -> None:
     """Write `data` as pretty JSON via temp-file + os.replace.
 
     Same crash-safe pattern as tray.py's `_send_command`: write to a temp file
-    in the destination directory, fsync-free, then atomically rename over the
-    target so a reader never observes a half-written file.
+    in the destination directory, then atomically rename over the target so a
+    reader never observes a half-written file.
     """
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
@@ -1117,34 +1982,94 @@ def atomic_write_json(path: str, data: dict) -> None:
         raise
 
 
+def _is_schema_default(spec: dict, value) -> bool:
+    return values_equal(value, coerce_value(spec, spec.get("default")))
+
+
 def save_settings(values: dict, path: str | None = None) -> None:
-    """Persist `values` (coerced to schema types) to `path`, atomically.
+    """Persist a WHOLE settings document (the load → change one key → save
+    pattern the voice toggles use), atomically.
+
+    * Refuses (SettingsFileError) when the file on disk exists but can't be
+      read — writing would delete every key the caller never saw.
+    * A schema key that is ABSENT from the file and still at its schema
+      default is not written: every save used to freeze all ~90 keys at that
+      day's defaults, so a later release could never change a default the
+      owner had never touched. A key already in the file, or a non-default
+      value, is written as before.
+    * Unknown keys in ``values`` pass through verbatim (LOCAL_VISION_MODEL
+      used to rely on this; CAMERAS and calibration keys still do).
 
     ``path`` defaults to ``settings_path()`` so a ``JARVIS_SETTINGS_PATH``
-    redirect sends the write (and its atomic temp file, derived from this path's
-    directory) to the throwaway file instead of the real one.
-    """
+    redirect sends the write (and its temp file) to the throwaway file."""
     if path is None:
         path = settings_path()
-    out = default_settings()
+    on_disk = read_settings_file(path)
+    out: dict = {}
     for key, value in values.items():
         spec = SCHEMA.get(key)
-        out[key] = coerce_value(spec, value) if spec else value
+        if spec is None or spec.get("type") not in _PERSISTED_TYPES:
+            out[key] = value
+            continue
+        coerced = coerce_value(spec, value)
+        if key not in on_disk and _is_schema_default(spec, coerced):
+            continue
+        out[key] = coerced
     atomic_write_json(path, out)
 
 
-def _current_settings_base(snapshot: dict, path: str | None = None) -> dict:
-    """Return the base document the GUI's Save should overlay its fields onto.
+def update_settings(changes: dict, path: str | None = None) -> dict:
+    """MERGE ``changes`` into the document as it is on disk right now and write
+    it atomically; every other key is left exactly as found. Refuses
+    (SettingsFileError) when the file can't be read. Returns the written doc."""
+    if path is None:
+        path = settings_path()
+    out = dict(read_settings_file(path))
+    for key, value in changes.items():
+        spec = SCHEMA.get(key)
+        if spec is not None and spec.get("type") in _PERSISTED_TYPES:
+            out[key] = coerce_value(spec, value)
+        else:
+            out[key] = value
+    atomic_write_json(path, out)
+    return out
 
-    Re-reads the CURRENT on-disk settings rather than reusing the window-OPEN
-    snapshot, so a key that a runtime action (e.g. a voice command toggling a
-    setting) persisted while the Settings window was open survives Save instead
-    of being silently reverted to its open-time value. The GUI's own field
-    values are layered on top by the caller, so any key the user actually edits
-    still wins. Falls back to a copy of the open-time snapshot if the re-read
-    fails, so Save is never worse than the previous whole-snapshot behaviour.
-    2026-07-08.
-    """
+
+def save_changed_settings(changes: dict, path: str | None = None
+                          ) -> tuple[dict, tuple]:
+    """The Settings window's Save: write ONLY ``changes`` (the fields the owner
+    edited) into the file as it is on disk at this moment.
+
+    Nothing else is rewritten, so a setting a voice command changed while the
+    window was open keeps the voice's value (the window's Save used to write
+    EVERY field, reverting it), and untouched defaults stay out of the file.
+
+    Applies the chat↔vision lockstep with the on-disk document as the "before"
+    — unless the owner set LOCAL_VISION_MODEL in this same save, which wins.
+    Returns ``(written_document, (vision_tag_or_None, reason))``. Refuses
+    (SettingsFileError) when the file can't be read."""
+    if path is None:
+        path = settings_path()
+    base = dict(read_settings_file(path))
+    out = dict(base)
+    for key, value in changes.items():
+        spec = SCHEMA.get(key)
+        if spec is not None and spec.get("type") in _PERSISTED_TYPES:
+            out[key] = coerce_value(spec, value)
+        else:
+            out[key] = value
+    lockstep: tuple = (None, "")
+    if "LOCAL_LLM_MODEL" in changes and "LOCAL_VISION_MODEL" not in changes:
+        lockstep = apply_vision_lockstep(base, out)
+    atomic_write_json(path, out)
+    return out, lockstep
+
+
+def _current_settings_base(snapshot: dict, path: str | None = None) -> dict:
+    """The CURRENT on-disk settings (merged over defaults), falling back to a
+    copy of ``snapshot`` if the re-read fails. Kept for callers of the old
+    whole-document Save; the window itself now writes only changed fields
+    (save_changed_settings)."""
     try:
         return dict(load_settings(path))
     except Exception:
@@ -1152,29 +2077,116 @@ def _current_settings_base(snapshot: dict, path: str | None = None) -> dict:
 
 
 def ensure_settings_file(path: str | None = None) -> dict:
-    """Guarantee a valid settings file exists, creating it from defaults.
-
-    Returns the loaded settings. Called on GUI launch so a fresh install lands
-    a complete data/user_settings.json on first open. ``path`` defaults to
-    ``settings_path()`` (honours ``JARVIS_SETTINGS_PATH``).
-    """
+    """Make sure a settings file exists (an EMPTY object when it didn't — the
+    defaults live in core/config.py, and writing them all out would freeze
+    them) and return the loaded settings. Used by "Open user_settings.json"."""
     if path is None:
         path = settings_path()
     if not os.path.exists(path):
         try:
-            atomic_write_json(path, default_settings())
+            atomic_write_json(path, {})
         except OSError:
             pass
     return load_settings(path)
 
 
-def integration_status(spec: dict) -> tuple[bool, str]:
+# ──────────────────────────────────────────────────────────────────────────
+#  What is in effect
+# ──────────────────────────────────────────────────────────────────────────
+_MISSING = object()
+
+
+def _config_value(key: str):
+    """The value core/config.py has for ``key`` in THIS process (module default,
+    env overrides and the settings file applied), or _MISSING. Lazy — importing
+    this module never imports core."""
+    mod = _model_lockstep()
+    if mod is None:
+        return _MISSING
+    try:
+        return mod.config_default(key, _MISSING)
+    except Exception:
+        return _MISSING
+
+
+def effective_value(key: str, raw_doc: dict, config_lookup=None):
+    """What JARVIS will use for ``key``: the file's value when the file has
+    the key, else core/config.py's value (which may come from an env var —
+    e.g. AUDIO_AUTOSWITCH_* — and differ from the schema default), else the
+    schema default. Coerced to the row's type."""
+    spec = SCHEMA[key]
+    raw_doc = raw_doc if isinstance(raw_doc, dict) else {}
+    if key in raw_doc:
+        return coerce_value(spec, raw_doc[key])
+    lookup = config_lookup or _config_value
+    try:
+        cfg = lookup(key)
+    except Exception:
+        cfg = _MISSING
+    if cfg is not _MISSING and cfg is not None:
+        if spec.get("type") == "text" and isinstance(cfg, tuple):
+            cfg = list(cfg)
+        return coerce_value(spec, cfg)
+    return coerce_value(spec, _copy_value(spec.get("default")))
+
+
+def effective_settings(raw_doc: dict, config_lookup=None) -> dict:
+    """effective_value for every persisted key, plus the file's other keys."""
+    out = {k: v for k, v in (raw_doc or {}).items() if k not in SCHEMA}
+    for key in persisted_keys():
+        out[key] = effective_value(key, raw_doc, config_lookup)
+    return out
+
+
+def cameras_summary(cameras) -> list[str]:
+    """Human lines for the read-only CAMERAS view."""
+    if not isinstance(cameras, (list, tuple)) or not cameras:
+        return ["(no cameras configured)"]
+    lines = []
+    for i, cam in enumerate(cameras):
+        if not isinstance(cam, dict):
+            lines.append(f"• {cam!r}")
+            continue
+        label = str(cam.get("label") or cam.get("name") or f"camera {i + 1}")
+        bits = []
+        if cam.get("name"):
+            bits.append(f"found by name '{cam.get('name')}'")
+        if cam.get("type"):
+            bits.append(f"type {cam.get('type')}")
+        if cam.get("primary"):
+            bits.append("primary")
+        idx = cam.get("index", "?")
+        lines.append(f"• {label} — index {idx}"
+                     + (f" ({', '.join(bits)})" if bits else ""))
+    return lines
+
+
+def integration_status(spec: dict, find_spec=None) -> tuple[bool, str]:
     """Resolve a status row to (present, detail) WITHOUT exposing any secret.
 
     Only the PRESENCE of each env var (or config file) is checked — values are
     never read into the return. `match == "any"` means present if ANY listed
-    env var is set; otherwise ALL must be set.
+    env var is set; otherwise ALL must be set. A row whose env vars are all
+    OPTIONAL (``optional_env``, e.g. OBS) is ready once its client package is
+    installed, and says whether it runs on the defaults.
     """
+    module = spec.get("requires_module")
+    if module:
+        fs = find_spec or importlib.util.find_spec
+        try:
+            have = fs(module) is not None
+        except (ImportError, ValueError):
+            have = False
+        if not have:
+            return (False, f"{spec.get('module_pip') or module} not installed")
+    optional = spec.get("optional_env")
+    if optional is not None:
+        set_names = [e for e in optional if (os.environ.get(e) or "").strip()]
+        if set_names:
+            return (True, "ready — " + ", ".join(set_names) + " set")
+        note = spec.get("defaults_note")
+        return (True, f"ready — defaults ({note})" if note
+                else "ready — defaults")
     envs = spec.get("secret_env") or []
     present_flags = [bool((os.environ.get(e) or "").strip()) for e in envs]
     cfg_present = False
@@ -1185,7 +2197,7 @@ def integration_status(spec: dict) -> tuple[bool, str]:
     if not envs and cfg_file:
         return (cfg_present, "configured" if cfg_present else "not configured")
     if not envs and not cfg_file:
-        return (False, "not configured")
+        return (bool(module), "installed" if module else "not configured")
 
     if spec.get("match") == "any":
         present = any(present_flags) or cfg_present
@@ -1194,13 +2206,268 @@ def integration_status(spec: dict) -> tuple[bool, str]:
     return (present, "present" if present else "not set")
 
 
+# Python packages each choice needs, probed with find_spec (never imported).
+TTS_BACKEND_PACKAGES = {"edge": "edge_tts", "kokoro": "kokoro_onnx",
+                        "pyttsx3": "pyttsx3", "xtts": "TTS"}
+# RealtimeSTT imports pyaudio at import time, so without PyAudio the realtime
+# session fails to build and JARVIS silently stays turn-based.
+REALTIME_PACKAGES = ("RealtimeSTT", "RealtimeTTS", "pyaudio")
+WAKE_ENGINE_PACKAGES = ("openwakeword", "pvporcupine")
+
+
+def effective_warnings(values: dict, find_spec=None) -> dict[str, str]:
+    """Rows whose saved value is NOT what JARVIS will actually do, with why.
+
+    ``values`` maps setting → current value. Package presence is probed with
+    importlib.util.find_spec only (nothing is imported). Never raises."""
+    fs = find_spec or importlib.util.find_spec
+
+    def have(mod: str) -> bool:
+        try:
+            return fs(mod) is not None
+        except (ImportError, ValueError):
+            return False
+        except Exception:
+            return False
+
+    def truthy(v) -> bool:
+        return coerce_value({"type": "bool", "default": False}, v)
+
+    out: dict[str, str] = {}
+    try:
+        if str(values.get("VOICE_MODE", "")).strip().lower() == "realtime":
+            missing = [m for m in REALTIME_PACKAGES if not have(m)]
+            if missing:
+                out["VOICE_MODE"] = (
+                    "Not in effect: realtime needs " + ", ".join(missing)
+                    + " — JARVIS falls back to turn_based.")
+        if truthy(values.get("BARGE_IN_ENABLED")):
+            if not any(have(m) for m in WAKE_ENGINE_PACKAGES):
+                out["BARGE_IN_ENABLED"] = (
+                    "Not in effect: no wake-word engine is installed "
+                    "(openwakeword or pvporcupine).")
+            else:
+                out["BARGE_IN_ENABLED"] = (
+                    "Only while the wake-word detector runs — it never starts "
+                    "by itself; say 'start listening for the wake word' first.")
+        if truthy(values.get("WAKE_WORD_AUTOSTART")) and not any(
+                have(m) for m in WAKE_ENGINE_PACKAGES):
+            out["WAKE_WORD_AUTOSTART"] = (
+                "Not in effect: no wake-word engine is installed "
+                "(openwakeword or pvporcupine).")
+        backend = str(values.get("TTS_BACKEND", "")).strip().lower()
+        pkg = TTS_BACKEND_PACKAGES.get(backend)
+        if pkg and not have(pkg):
+            out["TTS_BACKEND"] = (
+                f"Not in effect: '{backend}' needs the {pkg} package, which "
+                f"isn't installed — JARVIS falls back to another voice.")
+        if truthy(values.get("VOICE_CLONE_ENABLED")) and not have("chatterbox"):
+            out["VOICE_CLONE_ENABLED"] = (
+                "Not in effect: chatterbox-tts isn't installed — the normal "
+                "voice is used.")
+        if truthy(values.get("AIR_CONTROL_ENABLED")) and truthy(
+                values.get("KINECT_AIR_MOUSE_ENABLED")):
+            out["AIR_CONTROL_ENABLED"] = (
+                "Both hand engines are on — they fight over the cursor. Turn "
+                "one off.")
+    except Exception:
+        pass
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Talking to the running JARVIS
+# ──────────────────────────────────────────────────────────────────────────
+def send_tray_command(cmd: str, path: str | None = None, **kwargs) -> bool:
+    """Append ``{"cmd": cmd, "ts": …}`` to the tray command inbox with the same
+    atomic temp+rename pattern as tray.py's ``_send_command`` (a copy of it —
+    this process can't import tray.py). The running JARVIS drains the inbox
+    every 0.5 s; "restart" runs its hardened teardown with no LLM involved.
+    Returns True when the command was written. Never raises."""
+    target = path or TRAY_COMMANDS_FILE
+    payload = {"cmd": cmd, "ts": time.time()}
+    payload.update(kwargs)
+    try:
+        existing = []
+        if os.path.exists(target):
+            try:
+                with open(target, "r", encoding="utf-8") as f:
+                    raw = f.read().strip()
+                if raw:
+                    decoded, _ = json.JSONDecoder().raw_decode(raw)
+                    if isinstance(decoded, list):
+                        existing = decoded
+            except Exception:
+                existing = []
+        existing.append(payload)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target) or ".",
+                                   suffix=".tmp", prefix="settings_")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(existing, f)
+            os.replace(tmp, target)
+        except Exception:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            raise
+        return True
+    except Exception as exc:
+        print(f"[settings] command write failed ({cmd}): {exc}",
+              file=sys.stderr)
+        return False
+
+
+def fetch_pending_restart(values: dict, timeout: float = 1.5,
+                          opener=None) -> set | None:
+    """Ask the running JARVIS's web interface which saved settings it is NOT
+    running with (GET /api/settings → rows flagged ``pending_restart``, i.e.
+    the file value differs from the live core.config constant).
+
+    Returns the set of setting names, or None when that can't be known (web
+    interface off / unreachable / refused). Loopback only, short timeout; the
+    GUI calls it on a background thread. Never raises."""
+    try:
+        if not coerce_value({"type": "bool", "default": False},
+                            values.get("WEB_INTERFACE_ENABLED")):
+            return None
+        port = int(values.get("WEB_INTERFACE_PORT") or 8766)
+        bind = str(values.get("WEB_INTERFACE_BIND") or "").strip()
+        host = "127.0.0.1" if bind in ("", "0.0.0.0", "::", "localhost",
+                                       "127.0.0.1") else bind
+        import urllib.request
+        req = urllib.request.Request(f"http://{host}:{port}/api/settings")
+        token = str(values.get("WEB_INTERFACE_TOKEN") or "").strip()
+        if token:
+            req.add_header("X-Auth-Token", token)
+        open_ = opener or urllib.request.urlopen
+        with open_(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        rows = data.get("settings") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            return None
+        return {str(r.get("name")) for r in rows
+                if isinstance(r, dict) and r.get("pending_restart")}
+    except Exception:
+        return None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  One window at a time
+# ──────────────────────────────────────────────────────────────────────────
+# Every tray click used to open ANOTHER always-on-top window. Now the first
+# window holds a named mutex; a second launch asks it to come to the front (a
+# small request file it polls) and exits.
+_ERROR_ALREADY_EXISTS = 183
+
+
+def instance_tag(path: str | None = None) -> str:
+    """A short id for the settings file this window edits (windows editing
+    different files — prod vs staging — don't block each other)."""
+    p = os.path.normcase(os.path.abspath(path or settings_path()))
+    return hashlib.sha1(p.encode("utf-8")).hexdigest()[:12]
+
+
+def acquire_single_instance(tag: str):
+    """Take the per-file named mutex. Returns a handle to keep for the
+    process's lifetime, or None when another settings window already holds it.
+    Off Windows (or on any error) returns a truthy placeholder — one-window is
+    best-effort, never a reason not to open."""
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        k32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                     ctypes.c_wchar_p]
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = k32.CreateMutexW(None, False,
+                                  f"Local\\JARVIS-SettingsWindow-{tag}")
+        err = ctypes.get_last_error()
+        if not handle:
+            return True
+        if err == _ERROR_ALREADY_EXISTS:
+            k32.CloseHandle(handle)
+            return None
+        return handle
+    except Exception:
+        return True
+
+
+def release_single_instance(handle) -> None:
+    if sys.platform != "win32" or handle in (None, True):
+        return
+    try:
+        import ctypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        k32.CloseHandle(handle)
+    except Exception:
+        pass
+
+
+def _focus_file(tag: str, directory: str | None = None) -> str:
+    return os.path.join(directory or tempfile.gettempdir(),
+                        f"jarvis_settings_{tag}.focus")
+
+
+def _pid_file(tag: str, directory: str | None = None) -> str:
+    return os.path.join(directory or tempfile.gettempdir(),
+                        f"jarvis_settings_{tag}.pid")
+
+
+def request_focus(tag: str, directory: str | None = None) -> bool:
+    """Second launch: ask the open window to come to the front. Also lets that
+    window take the foreground (Windows only grants it to the process the user
+    just clicked). Never raises."""
+    ok = False
+    try:
+        with open(_focus_file(tag, directory), "w", encoding="utf-8") as f:
+            f.write(str(time.time()))
+        ok = True
+    except OSError:
+        ok = False
+    if sys.platform == "win32":
+        try:
+            with open(_pid_file(tag, directory), "r", encoding="utf-8") as f:
+                pid = int(f.read().strip() or "0")
+            if pid > 0:
+                import ctypes
+                ctypes.windll.user32.AllowSetForegroundWindow(pid)
+        except Exception:
+            pass
+    return ok
+
+
+def consume_focus_request(tag: str, directory: str | None = None) -> bool:
+    """True (once) when a second launch asked this window to come forward."""
+    p = _focus_file(tag, directory)
+    try:
+        if os.path.exists(p):
+            os.remove(p)
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def write_pid_file(tag: str, directory: str | None = None) -> None:
+    try:
+        with open(_pid_file(tag, directory), "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
+
+
 # ──────────────────────────────────────────────────────────────────────────
 #  VRAM budget bridge  (import-safe: the engine is stdlib-only and never
 #  raises; the heavy work lives in core/vram_budget.py)
 # ──────────────────────────────────────────────────────────────────────────
 # Keys whose LIVE value feeds the VRAM budget — changing any of these re-runs
-# the prediction in the GUI. ``MODEL_ROUTING::vision`` is the flattened Tk var
-# name the routing combobox uses (see the routing widget + _collect()).
+# the prediction in the GUI. ``MODEL_ROUTING::vision`` is the flattened form
+# of the routing row's vision dropdown.
 VRAM_WATCH_KEYS = (
     "LOCAL_LLM_MODEL",
     "LOCAL_VISION_MODEL",
@@ -1209,6 +2476,9 @@ VRAM_WATCH_KEYS = (
     "SCREEN_VISION_ENABLED",
     "RAG_ENABLED",
     "KINECT_ENABLED",
+    # 2026-09-30: Whisper on cuda:1 lives on the SECOND card; the panel used to
+    # charge its 1.5 GB to the 3090 regardless.
+    "WHISPER_DEVICE",
 )
 
 
@@ -1247,10 +2517,10 @@ def _model_lockstep():
 def _config_default(key: str):
     """The value core/config.py ships for ``key``, or None.
 
-    A key with no SCHEMA row is still LIVE at its config value (core.config
-    only overrides keys the settings file actually contains), so anything
+    A key the settings document omits is still LIVE at its config value (core.
+    config only overrides keys the file actually contains), so anything
     reasoning about the EFFECTIVE settings has to consult config for the keys
-    the document omits — see _live_vram_values()."""
+    the document omits — see resolve_vram_values()."""
     mod = _model_lockstep()
     return None if mod is None else mod.config_default(key)
 
@@ -1268,12 +2538,7 @@ def apply_vision_lockstep(base: dict, out: dict) -> tuple[str | None, str]:
     Save that moved LOCAL_LLM_MODEL left LOCAL_VISION_MODEL pointing at the
     old tag — forking the one-multimodal-brain config into a genuine second
     VLM co-load, and permanently: the voice path then reads the mismatch as a
-    user-pinned VLM and refuses to repair it.
-
-    LOCAL_VISION_MODEL has no SCHEMA row on purpose (a persisted row would pin
-    it statically for every fresh install); save_settings passes unknown keys
-    through verbatim, so writing it here lands it in the file exactly like the
-    voice path's _persist_setting does. Never raises."""
+    user-pinned VLM and refuses to repair it. Never raises."""
     mod = _model_lockstep()
     if mod is None:
         return (None, "unavailable")
@@ -1310,19 +2575,15 @@ def _load_vram_budget():
 def resolve_vram_values(widget_values: dict, settings: dict) -> dict:
     """Resolve every VRAM_WATCH_KEYS entry to its EFFECTIVE value.
 
-    ``widget_values`` is what the live Tk vars currently hold (only the keys
+    ``widget_values`` is what the live widgets currently hold (only the keys
     whose widget exists); ``settings`` is the loaded settings document.
     Resolution order is widget → saved settings → core/config.py constant, so
     an unsaved edit beats a saved value which beats the shipped default.
 
-    The LAST fallback is load-bearing, not belt-and-braces. LOCAL_VISION_MODEL
-    is watched but has NO schema row, so it is in neither default_settings()
-    nor any widget — yet core.config._apply_user_settings leaves its constant
-    live. Without the config fallback the engine saw the key as ABSENT, took
-    its legacy branch, and charged a phantom flat 7.3 GB VLM: on the SHIPPED
-    default config the panel read 25702 MB / 111.6% and warned the owner to
-    pick a smaller brain, when the real figure is 18227 MB / 79.1% because
-    vision SHARES the resident chat model at 0 MB. 2026-08-20 audit.
+    The LAST fallback is load-bearing: a key the document omits is still live
+    at its core.config value. Without it the engine once saw LOCAL_VISION_MODEL
+    as ABSENT, took its legacy branch and charged a phantom flat 7.3 GB VLM on
+    the SHIPPED default config (2026-08-20 audit).
 
     Pure and Tk-free so the tests drive the same resolution the GUI does."""
     out: dict = {}
@@ -1352,11 +2613,8 @@ def budget_from_live_values(values: dict, total_mb=None) -> dict | None:
     """Run the VRAM prediction from a flat dict of CURRENT widget values.
 
     This is the value→budget function the live GUI callback calls (and the one
-    the tests exercise — no Tk/pixels involved). ``values`` is the raw widget
-    state: ``LOCAL_LLM_MODEL`` (tag string), the bool toggles, and the
-    flattened ``MODEL_ROUTING::vision`` route. Bools may arrive as real bools or
-    as strings/ints (Tk ``StringVar``), which the engine coerces. Returns the
-    predict_budget() dict, or None when the engine is unavailable. Never raises."""
+    the tests exercise — no Tk/pixels involved). Returns the predict_budget()
+    dict, or None when the engine is unavailable. Never raises."""
     vb = _load_vram_budget()
     if vb is None:
         return None
@@ -1365,6 +2623,132 @@ def budget_from_live_values(values: dict, total_mb=None) -> dict | None:
         return vb.predict_budget(settings, total_mb=total_mb)
     except Exception:
         return None
+
+
+def budget_parts_text(budget: dict) -> str:
+    """The per-component breakdown line under the VRAM bar, e.g.
+    "26B 16 · vision (shared with chat) 0 · Whisper (on cuda:1) · …"."""
+    parts = []
+    for c in (budget or {}).get("components", []):
+        if c.get("elsewhere"):
+            parts.append(str(c.get("label")))
+            continue
+        gb = c.get("mb", 0) / 1024.0
+        gb_s = f"{int(round(gb))}" if abs(gb - round(gb)) < 0.05 else f"{gb:.1f}"
+        tag = " (on-demand)" if c.get("ondemand") else ""
+        parts.append(f"{c.get('label')} {gb_s}{tag}")
+    return " · ".join(parts)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Small Tk-free helpers the GUI uses (tested directly)
+# ──────────────────────────────────────────────────────────────────────────
+WHEEL_NOTCH = 120
+
+
+def wheel_steps(accum: float, delta) -> tuple[int, float]:
+    """A mouse-wheel ``delta`` → whole scroll steps, carrying the remainder.
+
+    A mouse notch is 120 per step; a precision touchpad sends many small
+    deltas (8, 15, 30…), which ``int(delta / 120)`` rounded to 0 — the page
+    never scrolled. Returns ``(steps, new_accum)``; steps < 0 scrolls up."""
+    try:
+        accum = float(accum) + float(delta)
+    except (TypeError, ValueError):
+        return 0, float(accum or 0.0)
+    whole = int(accum / WHEEL_NOTCH)          # toward zero
+    accum -= whole * WHEEL_NOTCH
+    return -whole, accum
+
+
+def apply_dark_theme(style, root) -> None:
+    """Dark ttk styling, INCLUDING the read-only state and the dropdown lists.
+
+    clam draws a read-only combobox's field with its frame grey (#dcdad5); with
+    our light-grey text on top the chosen value was nearly invisible, and the
+    popdown list stayed white. ``style``/``root`` are a ttk.Style and the Tk
+    root (duck-typed so the tests can check the calls without a display)."""
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+    style.configure(".", background=BG, foreground=FG, font=FONT)
+    style.configure("TNotebook", background=BG, borderwidth=0)
+    style.configure("TNotebook.Tab", background=FIELD_BG, foreground=FG,
+                    padding=(12, 6), font=FONT)
+    style.map("TNotebook.Tab",
+              background=[("selected", ACCENT)],
+              foreground=[("selected", "#ffffff")])
+    style.configure("TFrame", background=BG)
+    style.configure("TLabel", background=BG, foreground=FG, font=FONT)
+    style.configure("Help.TLabel", background=BG, foreground=MUTED,
+                    font=FONT_SMALL)
+    style.configure("Head.TLabel", background=BG, foreground=FG, font=FONT_BOLD)
+    style.configure("Section.TLabel", background=BG, foreground=ACCENT,
+                    font=FONT_SECTION)
+    style.configure("TCheckbutton", background=BG, foreground=FG, font=FONT,
+                    indicatorbackground=FIELD_BG, indicatorforeground=FG)
+    style.map("TCheckbutton", background=[("active", BG)],
+              indicatorbackground=[("selected", ACCENT), ("active", FIELD_BG)])
+    style.configure("TCombobox", fieldbackground=FIELD_BG, background=FIELD_BG,
+                    foreground=FG, arrowcolor=FG, bordercolor=BORDER,
+                    lightcolor=FIELD_BG, darkcolor=FIELD_BG,
+                    selectbackground=ACCENT, selectforeground="#ffffff",
+                    insertcolor=FG, font=FONT)
+    # The fix: every STATE the field can be drawn in, not just the default.
+    style.map("TCombobox",
+              fieldbackground=[("readonly", FIELD_BG), ("disabled", BG),
+                               ("focus", FIELD_BG)],
+              foreground=[("readonly", FG), ("disabled", MUTED)],
+              background=[("readonly", FIELD_BG), ("active", FIELD_BG),
+                          ("pressed", FIELD_BG)],
+              selectbackground=[("readonly", FIELD_BG)],
+              selectforeground=[("readonly", FG)],
+              arrowcolor=[("disabled", MUTED), ("active", "#ffffff")])
+    style.configure("TButton", background=FIELD_BG, foreground=FG, font=FONT,
+                    padding=(10, 5), bordercolor=BORDER)
+    style.map("TButton", background=[("active", ACCENT), ("disabled", BG)],
+              foreground=[("disabled", MUTED)])
+    style.configure("Vertical.TScrollbar", background=FIELD_BG,
+                    troughcolor=BG, arrowcolor=FG, bordercolor=BORDER)
+    # The popdown LIST is a plain Tk listbox: styled via the option database.
+    for opt, val in (("background", FIELD_BG), ("foreground", FG),
+                     ("selectBackground", ACCENT),
+                     ("selectForeground", "#ffffff"), ("font", FONT)):
+        root.option_add(f"*TCombobox*Listbox.{opt}", val)
+
+
+def make_combo_wheel_guard(scroll_page):
+    """A <MouseWheel> handler for a combobox: the wheel changes the value ONLY
+    when the combobox has keyboard focus; otherwise it scrolls the page, as the
+    owner meant. (ttk binds the wheel on every combobox, so scrolling down a
+    tab silently changed whatever dropdown passed under the pointer.)"""
+    def _guard(event):
+        w = event.widget
+        try:
+            focused = str(w.focus_get()) == str(w)
+        except Exception:
+            focused = False
+        if not focused:
+            scroll_page(event)
+            return "break"
+        try:
+            values = list(w.cget("values") or ())
+            if values:
+                step = -1 if getattr(event, "delta", 0) > 0 else 1
+                cur = w.current()
+                cur = 0 if cur is None or cur < 0 else cur
+                new = max(0, min(len(values) - 1, cur + step))
+                if new != cur:
+                    w.current(new)
+                    try:
+                        w.event_generate("<<ComboboxSelected>>")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return "break"
+    return _guard
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -1377,6 +2761,11 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--tab", choices=TAB_ORDER, default=None,
         help="Which tab to open first (default: the first tab).",
     )
+    parser.add_argument(
+        "--selftest", action="store_true",
+        help="Check that the core modules this window needs import from here "
+             "(the way the tray launches it), print JSON, and exit — no window.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1387,10 +2776,997 @@ def resolve_start_tab(tab) -> int:
     return 0
 
 
+def selftest() -> dict:
+    """The --selftest report: can this process (started the way the tray
+    starts it) import what the window needs? No window, no file writes."""
+    report: dict = {
+        "project_dir_on_path": any(
+            os.path.normcase(os.path.abspath(p or os.curdir))
+            == os.path.normcase(PROJECT_DIR) for p in sys.path),
+        "imports": {},
+    }
+    for name in ("core.model_lockstep", "core.vram_budget"):
+        try:
+            importlib.import_module(name)
+            report["imports"][name] = "ok"
+        except Exception as exc:
+            report["imports"][name] = f"{type(exc).__name__}: {exc}"
+    report["vram_panel"] = _load_vram_budget() is not None
+    report["vision_lockstep"] = _model_lockstep() is not None
+    report["tkinter"] = importlib.util.find_spec("tkinter") is not None
+    report["ok"] = (all(v == "ok" for v in report["imports"].values())
+                    and report["vram_panel"] and report["vision_lockstep"])
+    return report
+
+
+def set_dpi_awareness() -> None:
+    """System-DPI-aware so Windows doesn't bitmap-stretch (blur) the window on
+    a scaled display. Tk then sizes its point-sized fonts for the real DPI; the
+    window's pixel sizes are scaled in run_gui. Never raises."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)   # SYSTEM_DPI_AWARE
+    except Exception:
+        try:
+            import ctypes
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
 # ──────────────────────────────────────────────────────────────────────────
 #  ── GUI ──   (everything below requires tkinter; kept out of import-time)
 # ──────────────────────────────────────────────────────────────────────────
-def run_gui(start_tab: int = 0) -> int:
+class _Field:
+    """One editable row: how to read its widget, the widget value it opened
+    with (a field whose widget still holds that is UNCHANGED and never saved),
+    and the labels that show its error / warning / restart badge."""
+
+    def __init__(self, key: str, spec: dict, get_raw, set_raw):
+        self.key = key
+        self.spec = spec
+        self.get_raw = get_raw
+        self.set_raw = set_raw
+        self.initial_raw = None
+        self.error_label = None
+        self.note_label = None
+        self.badge_label = None
+        self.combo = None
+
+
+class SettingsApp:
+    """The Settings window. ``tk``/``ttk``/``messagebox`` are the tkinter
+    modules (injected so the tests can drive the whole window with fakes and no
+    display); every other dependency with side effects — the settings file,
+    config lookups, the device list, the Ollama and web probes, the tray inbox,
+    opening a file — is injectable too."""
+
+    def __init__(self, tk, ttk, messagebox, *, start_tab: int = 0,
+                 path: str | None = None, config_lookup=None,
+                 audio_devices=None, model_probe=None, running_probe=None,
+                 find_spec=None, command_path: str | None = None,
+                 file_opener=None, focus_tag: str | None = None,
+                 focus_dir: str | None = None, poll_ms: int = 250,
+                 total_vram_mb=None):
+        self.tk, self.ttk, self.mb = tk, ttk, messagebox
+        self.path = path or settings_path()
+        self.config_lookup = config_lookup
+        self._audio_devices = audio_devices      # (devices, hostapis) or None
+        self._model_probe = model_probe or installed_ollama_models
+        self._running_probe = running_probe or fetch_pending_restart
+        self._find_spec = find_spec
+        self._command_path = command_path
+        self._file_opener = file_opener
+        self._focus_tag = focus_tag
+        self._focus_dir = focus_dir
+        self._poll_ms = poll_ms
+        self.file_error = settings_file_problem(self.path)
+        raw = {}
+        if not self.file_error:
+            try:
+                raw = read_settings_file(self.path)
+            except SettingsFileError as exc:
+                self.file_error = str(exc)
+        self.raw = raw
+        self.values = effective_settings(raw, config_lookup)
+        self.snapshot = {k: _copy_value(self.values[k]) for k in persisted_keys()}
+        self.fields: dict[str, _Field] = {}
+        self.device_pickers: dict[str, dict] = {}
+        self.help_labels: list = []
+        self.saved_this_session: set = set()
+        self.pending_running: set | None = None
+        self._async: dict = {}
+        self._wheel_accum = {"v": 0.0}
+        self.vram = _load_vram_budget()
+        self.vram_widgets: dict = {}
+        self.vram_total_mb = total_vram_mb
+        if self.vram is not None and self.vram_total_mb is None:
+            try:
+                self.vram_total_mb = self.vram.total_vram_mb()
+            except Exception:
+                self.vram_total_mb = None
+        self.closed = False
+        self._build(start_tab)
+
+    # ── construction ──────────────────────────────────────────────────
+    def _build(self, start_tab: int) -> None:
+        tk, ttk = self.tk, self.ttk
+        root = tk.Tk()
+        self.root = root
+        title = "JARVIS Settings"
+        if os.path.normcase(os.path.abspath(self.path)) != os.path.normcase(
+                os.path.abspath(SETTINGS_PATH)):
+            title += f" — {self.path}"
+        root.title(title)
+        root.configure(bg=BG)
+        scale = 1.0
+        try:
+            scale = max(1.0, float(root.winfo_fpixels("1i")) / 96.0)
+        except Exception:
+            scale = 1.0
+        self.scale = scale
+        root.geometry(f"{int(780 * scale)}x{int(720 * scale)}")
+        root.minsize(int(560 * scale), int(460 * scale))
+        root.protocol("WM_DELETE_WINDOW", self.close)
+        root.bind("<Control-s>", lambda e: (self.save(), "break")[1])
+        root.bind("<Control-S>", lambda e: (self.save(), "break")[1])
+        root.bind("<Escape>", lambda e: (self.close(), "break")[1])
+
+        style = ttk.Style()
+        apply_dark_theme(style, root)
+
+        # Banner: an unreadable settings file blocks saving, loudly. Packed
+        # only while there is something to say.
+        self.notebook = ttk.Notebook(root)
+        self.banner = tk.Label(root, text="", bg=BG, fg=ERROR, font=FONT,
+                               anchor="w", justify="left",
+                               wraplength=int(740 * scale))
+        self._banner_packed = False
+        self._refresh_banner()
+        self.notebook.pack(fill="both", expand=True, padx=10, pady=(6, 4))
+        self._notebook_packed = True
+        self._tab_scrollers: list = []
+        for tab_key in TAB_ORDER:
+            self._build_tab(tab_key)
+        root.bind_all("<MouseWheel>", self._on_wheel)
+
+        # Initial per-row notes (effective state) and the VRAM bar.
+        self._refresh_warnings()
+        if self.vram_widgets:
+            try:
+                root.after(0, self.update_budget)
+            except Exception:
+                self.update_budget()
+        try:
+            self.notebook.select(start_tab)
+        except Exception:
+            pass
+
+        # ── bottom bar ──
+        bar = ttk.Frame(root, style="TFrame")
+        bar.pack(fill="x", padx=10, pady=(0, 10))
+        self.status_var = tk.StringVar(value="")
+        note = ttk.Label(bar, text=RESTART_NOTE, style="Help.TLabel")
+        note.pack(side="top", anchor="w")
+        tk.Label(bar, textvariable=self.status_var, bg=BG, fg=FG,
+                 font=FONT_SMALL, anchor="w", justify="left",
+                 wraplength=int(740 * scale)).pack(side="top", fill="x")
+        buttons = ttk.Frame(bar, style="TFrame")
+        buttons.pack(side="top", fill="x", pady=(4, 0))
+        self.buttons = {}
+        self.buttons["close"] = ttk.Button(buttons, text="Close",
+                                           command=self.close)
+        self.buttons["close"].pack(side="right", padx=(6, 0))
+        self.buttons["restart"] = ttk.Button(
+            buttons, text="Save & restart JARVIS",
+            command=lambda: self.save(restart=True))
+        self.buttons["restart"].pack(side="right", padx=(6, 0))
+        self.buttons["save"] = ttk.Button(buttons, text="Save",
+                                          command=self.save)
+        self.buttons["save"].pack(side="right")
+        self.buttons["open"] = ttk.Button(buttons,
+                                          text="Open user_settings.json",
+                                          command=self.open_json)
+        self.buttons["open"].pack(side="right", padx=(0, 6))
+        self._sync_save_buttons()
+
+        # Background work, polled from the Tk thread (Tk isn't thread-safe).
+        self._start_async("models", lambda: (
+            self._model_probe(),
+            self._model_probe(include_vision=True)
+            if self._probe_takes_vision() else None))
+        self._start_async("running",
+                          lambda: self._running_probe(dict(self.values)))
+        self._tick()
+        self.raise_window()
+
+    def _probe_takes_vision(self) -> bool:
+        try:
+            import inspect
+            return "include_vision" in inspect.signature(
+                self._model_probe).parameters
+        except Exception:
+            return False
+
+    def _refresh_banner(self) -> None:
+        if not self.file_error:
+            self.banner.configure(text="")
+            return
+        self.banner.configure(
+            text=("⚠ Can't read the settings file, so Save is disabled "
+                  f"(saving would erase what it can't read): "
+                  f"{self.file_error}. Fix it with 'Open user_settings.json' "
+                  f"and reopen this window. File: {self.path}"))
+        if not self._banner_packed:
+            self._banner_packed = True
+            try:
+                if getattr(self, "_notebook_packed", False):
+                    self.banner.pack(fill="x", padx=10, pady=(8, 0),
+                                     before=self.notebook)
+                else:
+                    self.banner.pack(fill="x", padx=10, pady=(8, 0))
+            except Exception:
+                pass
+
+    def _sync_save_buttons(self) -> None:
+        state = "disabled" if self.file_error else "normal"
+        for name in ("save", "restart"):
+            b = getattr(self, "buttons", {}).get(name)
+            if b is not None:
+                try:
+                    b.configure(state=state)
+                except Exception:
+                    pass
+
+    def _scrollable(self, tab_key):
+        tk, ttk = self.tk, self.ttk
+        outer = ttk.Frame(self.notebook, style="TFrame")
+        canvas = tk.Canvas(outer, bg=BG, highlightthickness=0, bd=0)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical",
+                                  command=canvas.yview)
+        inner = ttk.Frame(canvas, style="TFrame")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        tab_help: list = []
+
+        def _on_canvas_resize(event):
+            # Stretch the content to the window width, and re-wrap the help.
+            try:
+                canvas.itemconfigure(win, width=event.width)
+                wrap = max(280, int(event.width) - 24)
+                for lbl in tab_help:
+                    lbl.configure(wraplength=wrap)
+            except Exception:
+                pass
+        canvas.bind("<Configure>", _on_canvas_resize)
+
+        def _scroll_page(event):
+            steps, self._wheel_accum["v"] = wheel_steps(
+                self._wheel_accum["v"], getattr(event, "delta", 0))
+            if steps:
+                canvas.yview_scroll(steps, "units")
+
+        # The page wheel is ONE application-wide binding that scrolls the
+        # SELECTED tab (see _on_wheel) — B17 was every tab scrolling the last
+        # one built, and the Enter/Leave rebinding that fixed it dropped the
+        # wheel whenever the pointer sat on a label (Tk sends the parent a
+        # <Leave> when the pointer moves onto a child).
+        self._tab_scrollers.append(_scroll_page)
+        inner.columnconfigure(1, weight=1)
+        return outer, inner, tab_help, _scroll_page
+
+    def _on_wheel(self, event):
+        try:
+            idx = int(self.notebook.index("current"))
+        except Exception:
+            idx = 0
+        if 0 <= idx < len(self._tab_scrollers):
+            self._tab_scrollers[idx](event)
+
+    def _help(self, parent, text, row, tab_help, color=MUTED):
+        lbl = self.tk.Label(parent, text=text, bg=BG, fg=color,
+                            font=FONT_SMALL, anchor="w", justify="left",
+                            wraplength=int(700 * self.scale))
+        lbl.grid(row=row, column=0, columnspan=3, sticky="we", padx=(2, 0),
+                 pady=(0, 2))
+        tab_help.append(lbl)
+        return lbl
+
+    def _row_labels(self, parent, field, row, tab_help) -> int:
+        """Error / effective-state / restart labels + help under a control."""
+        spec = field.spec
+        field.error_label = self.tk.Label(parent, text="", bg=BG, fg=ERROR,
+                                          font=FONT_SMALL, anchor="w",
+                                          justify="left")
+        field.error_label.grid(row=row, column=0, columnspan=3, sticky="we",
+                               padx=(2, 0))
+        field.error_label.grid_remove()
+        row += 1
+        field.note_label = self.tk.Label(parent, text="", bg=BG, fg=WARN,
+                                         font=FONT_SMALL, anchor="w",
+                                         justify="left",
+                                         wraplength=int(700 * self.scale))
+        field.note_label.grid(row=row, column=0, columnspan=3, sticky="we",
+                              padx=(2, 0))
+        field.note_label.grid_remove()
+        tab_help.append(field.note_label)
+        row += 1
+        if spec.get("help"):
+            self._help(parent, spec["help"], row, tab_help)
+        row += 1
+        return row
+
+    def _badge(self, parent, row):
+        lbl = self.tk.Label(parent, text="", bg=BG, fg=WARN, font=FONT_SMALL,
+                            anchor="e")
+        lbl.grid(row=row, column=2, sticky="e", padx=(6, 2))
+        return lbl
+
+    def _combo(self, parent, var, values, readonly, scroll_page):
+        combo = self.ttk.Combobox(parent, textvariable=var, values=values,
+                                  state="readonly" if readonly else "normal",
+                                  width=34)
+        combo.bind("<MouseWheel>", make_combo_wheel_guard(scroll_page))
+        return combo
+
+    def _build_tab(self, tab_key: str) -> None:
+        tk, ttk = self.tk, self.ttk
+        outer, inner, tab_help, scroll_page = self._scrollable(tab_key)
+        self.help_labels.append(tab_help)
+        row = 0
+        if tab_key == "ai":
+            row = self._build_vram_panel(inner, row, tab_help)
+        ordered = [(sec, key) for sec, keys in tab_layout(tab_key)
+                   for key in keys]
+        section = None
+        for sec, key in ordered:
+            spec = SCHEMA[key]
+            if sec != section:
+                section = sec
+                ttk.Label(inner, text=sec, style="Section.TLabel").grid(
+                    row=row, column=0, columnspan=3, sticky="w", padx=2,
+                    pady=(12 if row else 2, 2))
+                row += 1
+            typ = spec.get("type")
+            label = spec.get("label", key)
+
+            if typ == "status":
+                present, detail = integration_status(spec,
+                                                     find_spec=self._find_spec)
+                dot = "●" if present else "○"
+                color = OK_GREEN if present else MUTED
+                tk.Label(inner, text=f"{dot} {label}: {detail}", bg=BG,
+                         fg=color, font=FONT, anchor="w").grid(
+                    row=row, column=0, columnspan=3, sticky="w", padx=2,
+                    pady=(2, 0))
+                row += 1
+                if spec.get("help"):
+                    self._help(inner, spec["help"], row, tab_help)
+                row += 1
+                continue
+
+            if typ == "view":
+                src = spec.get("source_key")
+                val = self.raw.get(src, _MISSING) if isinstance(
+                    self.raw, dict) else _MISSING
+                if val is _MISSING:
+                    try:
+                        val = (self.config_lookup or _config_value)(src)
+                    except Exception:
+                        val = _MISSING
+                lines = cameras_summary(None if val is _MISSING else val)
+                ttk.Label(inner, text=label, style="TLabel").grid(
+                    row=row, column=0, columnspan=3, sticky="w", padx=2,
+                    pady=(4, 0))
+                row += 1
+                tk.Label(inner, text="\n".join(lines), bg=FIELD_BG, fg=FG,
+                         font=FONT_SMALL, anchor="w", justify="left").grid(
+                    row=row, column=0, columnspan=3, sticky="we", padx=2,
+                    pady=(0, 2))
+                row += 1
+                if spec.get("help"):
+                    self._help(inner, spec["help"], row, tab_help)
+                row += 1
+                continue
+
+            value = self.values.get(key)
+
+            if typ == "bool":
+                var = tk.BooleanVar(value=bool(value))
+                f = _Field(key, spec, var.get, var.set)
+                ttk.Checkbutton(inner, text=label, variable=var).grid(
+                    row=row, column=0, columnspan=2, sticky="w", padx=2,
+                    pady=(4, 0))
+                f.badge_label = self._badge(inner, row)
+                self._register(f, var)
+                row += 1
+                row = self._row_labels(inner, f, row, tab_help)
+                continue
+
+            if typ == "text":
+                ttk.Label(inner, text=label).grid(
+                    row=row, column=0, columnspan=2, sticky="w", padx=2,
+                    pady=(6, 2))
+                badge = self._badge(inner, row)
+                row += 1
+                txt = tk.Text(inner, height=4, width=48, bg=FIELD_BG, fg=FG,
+                              insertbackground=FG, font=FONT, relief="flat",
+                              padx=6, pady=4)
+                cur = value if isinstance(value, list) else []
+                txt.insert("1.0", "\n".join(str(x) for x in cur))
+                txt.grid(row=row, column=0, columnspan=3, sticky="we",
+                         padx=2, pady=(0, 2))
+
+                def _get(t=txt):
+                    return t.get("1.0", "end-1c")
+
+                def _set(v, t=txt):
+                    t.delete("1.0", "end")
+                    t.insert("1.0", "\n".join(v) if isinstance(v, list)
+                             else str(v))
+                f = _Field(key, spec, _get, _set)
+                f.badge_label = badge
+                self._register(f, None)
+                row += 1
+                row = self._row_labels(inner, f, row, tab_help)
+                continue
+
+            if typ == "routing":
+                ttk.Label(inner, text=label).grid(
+                    row=row, column=0, sticky="w", padx=2, pady=(6, 2))
+                badge = self._badge(inner, row)
+                row += 1
+                cur = value if isinstance(value, dict) else {}
+                opts = spec.get("choices") or ["auto", "local", "cloud"]
+                rvars = {}
+                for fn in spec.get("default", {}):
+                    ttk.Label(inner, text=f"    • {fn}").grid(
+                        row=row, column=0, sticky="w", padx=12, pady=(0, 2))
+                    rvar = tk.StringVar(
+                        value=str(cur.get(fn, spec["default"][fn])))
+                    rvars[fn] = rvar
+                    self._combo(inner, rvar, opts, True, scroll_page).grid(
+                        row=row, column=1, sticky="we", padx=2, pady=(0, 2))
+                    row += 1
+
+                def _get(rv=rvars):
+                    return {fn: v.get() for fn, v in rv.items()}
+
+                def _set(val, rv=rvars):
+                    for fn, v in rv.items():
+                        if isinstance(val, dict) and fn in val:
+                            v.set(val[fn])
+                f = _Field(key, spec, _get, _set)
+                f.badge_label = badge
+                f.routing_vars = rvars
+                self._register(f, None)
+                for fn, rvar in rvars.items():
+                    self._trace(rvar, lambda *_a, k=key: self._on_change(k))
+                    if f"{key}::{fn}" in VRAM_WATCH_KEYS:
+                        self._trace(rvar, lambda *_a: self.update_budget())
+                row = self._row_labels(inner, f, row, tab_help)
+                continue
+
+            if typ == "device":
+                row = self._build_device_row(inner, key, spec, row, tab_help,
+                                             scroll_page)
+                continue
+
+            # enum / combo / str / int / float → label + control on one row.
+            ttk.Label(inner, text=label).grid(
+                row=row, column=0, sticky="w", padx=2, pady=(6, 2))
+            if typ in ("enum", "combo"):
+                var = tk.StringVar(value="" if value is None else str(value))
+                values = list(spec.get("choices") or [])
+                cur_val = var.get()
+                if typ == "combo" and cur_val and cur_val not in values:
+                    values = [cur_val] + values   # keep a custom value visible
+                if spec.get("suggest") == "monitors":
+                    mons = self._monitor_names()
+                    if mons:
+                        values = ([cur_val] if cur_val and cur_val not in mons
+                                  else []) + mons
+                combo = self._combo(inner, var, values, typ == "enum",
+                                    scroll_page)
+                combo.grid(row=row, column=1, sticky="we", padx=2, pady=(6, 2))
+                f = _Field(key, spec, var.get, var.set)
+                f.combo = combo
+            else:
+                var = tk.StringVar(value="" if value is None else str(value))
+                entry_kw = {}
+                if spec.get("secret"):
+                    entry_kw["show"] = "•"
+                entry = tk.Entry(inner, textvariable=var, bg=FIELD_BG, fg=FG,
+                                 insertbackground=FG, font=FONT,
+                                 relief="flat", **entry_kw)
+                entry.grid(row=row, column=1, sticky="we", padx=2, pady=(6, 2))
+                f = _Field(key, spec, var.get, var.set)
+                if spec.get("secret"):
+                    show = tk.BooleanVar(value=False)
+                    ttk.Checkbutton(
+                        inner, text="show", variable=show,
+                        command=lambda e=entry, s=show: e.configure(
+                            show="" if s.get() else "•")).grid(
+                        row=row, column=2, sticky="w", padx=(6, 2))
+            if not spec.get("secret"):
+                f.badge_label = self._badge(inner, row)
+            self._register(f, var)
+            row += 1
+            row = self._row_labels(inner, f, row, tab_help)
+
+        self.notebook.add(outer, text=TAB_LABELS[tab_key])
+
+    def _monitor_names(self) -> list[str]:
+        try:
+            mons = (self.config_lookup or _config_value)("MONITORS")
+        except Exception:
+            return []
+        if isinstance(mons, dict):
+            return [str(k) for k in mons]
+        return []
+
+    def _trace(self, var, callback) -> None:
+        try:
+            var.trace_add("write", callback)
+        except Exception:
+            pass
+
+    def _register(self, field: _Field, var) -> None:
+        field.initial_raw = field.get_raw()
+        self.fields[field.key] = field
+        if var is not None:
+            self._trace(var, lambda *_a, k=field.key: self._on_change(k))
+            if field.key in VRAM_WATCH_KEYS:
+                self._trace(var, lambda *_a: self.update_budget())
+
+    def _build_device_row(self, parent, key, spec, row, tab_help,
+                          scroll_page) -> int:
+        tk, ttk = self.tk, self.ttk
+        direction = spec.get("direction", "input")
+        names_key = spec.get("names_key") or DIRECTION_KEYS[direction][1]
+        devices = hostapis = None
+        if self._audio_devices is not None:
+            devices, hostapis = self._audio_devices
+        preferred = self.values.get(names_key) or []
+        choices, initial = audio_device_choices(
+            direction, self.values.get(key), preferred,
+            devices=devices, hostapis=hostapis)
+        by_label = {c["label"]: c for c in choices}
+        ttk.Label(parent, text=spec.get("label", key)).grid(
+            row=row, column=0, sticky="w", padx=2, pady=(6, 2))
+        var = tk.StringVar(value=initial["label"])
+        combo = self._combo(parent, var, [c["label"] for c in choices], True,
+                            scroll_page)
+        combo.grid(row=row, column=1, sticky="we", padx=2, pady=(6, 2))
+        state = {"owned": initial["value"] if initial["kind"] == "name"
+                 else None, "choice": initial, "names_key": names_key,
+                 "by_label": by_label, "var": var}
+        self.device_pickers[key] = state
+
+        def _get(st=state):
+            return device_choice_index(st["by_label"].get(st["var"].get(),
+                                                          st["choice"]))
+
+        def _set(v, st=state):
+            for c in st["by_label"].values():
+                if device_choice_index(c) == v and c["kind"] != "name":
+                    st["var"].set(c["label"])
+                    return
+        f = _Field(key, spec, _get, _set)
+        f.combo = combo
+        f.badge_label = self._badge(parent, row)
+        self._register(f, None)
+
+        def _on_pick(*_a, st=state, k=key):
+            choice = st["by_label"].get(st["var"].get())
+            if choice is None:
+                return
+            names_field = self.fields.get(st["names_key"])
+            if names_field is not None:
+                cur = coerce_value(SCHEMA[st["names_key"]],
+                                   names_field.get_raw())
+                new = device_choice_list(choice, st["owned"], cur)
+                if new != cur:
+                    names_field.set_raw(new)
+            if choice["kind"] == "name":
+                st["owned"] = choice["value"]
+            elif choice["kind"] == "auto":
+                st["owned"] = None
+            st["choice"] = choice
+            self._on_change(k)
+        self._trace(var, _on_pick)
+        return self._row_labels(parent, f, row + 1, tab_help)
+
+    def _build_vram_panel(self, parent, row: int, tab_help) -> int:
+        tk, ttk = self.tk, self.ttk
+        ttk.Label(parent, text="GPU / VRAM budget", style="Head.TLabel").grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=2, pady=(2, 2))
+        row += 1
+        if self.vram is None:
+            self._help(parent, "(VRAM estimate unavailable — core.vram_budget "
+                               "could not load.)", row, tab_help)
+            return row + 1
+        bar = tk.Canvas(parent, height=18, bg=FIELD_BG, highlightthickness=1,
+                        highlightbackground=BORDER, bd=0)
+        bar.grid(row=row, column=0, columnspan=3, sticky="we", padx=2,
+                 pady=(0, 2))
+        fill = bar.create_rectangle(0, 0, 0, 18, fill=OK_GREEN, width=0)
+        self.vram_widgets["canvas"] = bar
+        self.vram_widgets["bar_fill"] = fill
+        bar.bind("<Configure>", lambda *_a: self.update_budget())
+        row += 1
+        num = tk.Label(parent, text="", bg=BG, fg=FG, font=FONT, anchor="w")
+        num.grid(row=row, column=0, columnspan=3, sticky="w", padx=2)
+        self.vram_widgets["num"] = num
+        row += 1
+        parts = tk.Label(parent, text="", bg=BG, fg=MUTED, font=FONT_SMALL,
+                         anchor="w", justify="left",
+                         wraplength=int(700 * self.scale))
+        parts.grid(row=row, column=0, columnspan=3, sticky="we", padx=2,
+                   pady=(0, 2))
+        tab_help.append(parts)
+        self.vram_widgets["parts"] = parts
+        row += 1
+        warn = tk.Label(parent, text="", bg=BG, fg=ERROR, font=FONT_SMALL,
+                        anchor="w", justify="left",
+                        wraplength=int(700 * self.scale))
+        warn.grid(row=row, column=0, columnspan=3, sticky="we", padx=2,
+                  pady=(0, 6))
+        warn.grid_remove()
+        tab_help.append(warn)
+        self.vram_widgets["warn"] = warn
+        return row + 1
+
+    # ── live behaviour ────────────────────────────────────────────────
+    def widget_values(self) -> dict:
+        """Current value of every field (the snapshot for fields that don't
+        parse yet), flattened MODEL_ROUTING::fn included — what the budget and
+        the effective-state notes are computed from."""
+        out = dict(self.values)
+        for key, f in self.fields.items():
+            try:
+                raw = f.get_raw()
+            except Exception:
+                continue
+            if raw == f.initial_raw:
+                out[key] = self.snapshot.get(key)
+                continue
+            val, err = validate_value(f.spec, raw)
+            out[key] = self.snapshot.get(key) if err else val
+        routing = out.get("MODEL_ROUTING")
+        if isinstance(routing, dict):
+            for fn, v in routing.items():
+                out[f"MODEL_ROUTING::{fn}"] = v
+        return out
+
+    def _on_change(self, key: str) -> None:
+        f = self.fields.get(key)
+        if f is not None and f.error_label is not None:
+            try:
+                f.error_label.configure(text="")
+                f.error_label.grid_remove()
+            except Exception:
+                pass
+        self._refresh_warnings()
+
+    def _refresh_warnings(self) -> None:
+        notes = effective_warnings(self.widget_values(),
+                                   find_spec=self._find_spec)
+        for key, f in self.fields.items():
+            if f.note_label is None:
+                continue
+            text = notes.get(key, "")
+            try:
+                f.note_label.configure(text=("⚠ " + text) if text else "")
+                if text:
+                    f.note_label.grid()
+                else:
+                    f.note_label.grid_remove()
+            except Exception:
+                pass
+
+    def _refresh_badges(self) -> None:
+        running = self.pending_running or set()
+        for key, f in self.fields.items():
+            if f.badge_label is None:
+                continue
+            if key in self.saved_this_session:
+                text = "saved · restart to apply"
+            elif key in running:
+                text = "saved · not running yet"
+            else:
+                text = ""
+            try:
+                f.badge_label.configure(text=text)
+            except Exception:
+                pass
+
+    def update_budget(self, *_a) -> None:
+        """Recompute the VRAM prediction from the live widget values and
+        repaint the bar, numbers, breakdown and warning. Never raises."""
+        if not self.vram_widgets:
+            return
+        try:
+            wv = self.widget_values()
+            widget = {k: wv[k] for k in VRAM_WATCH_KEYS if k in wv}
+            b = budget_from_live_values(resolve_vram_values(widget, self.values),
+                                        total_mb=self.vram_total_mb)
+            if b is None:
+                return
+            pct = b["pct"]
+            color = ERROR if (b["over"] or pct > 100.0) else (
+                WARN if pct >= 80.0 else OK_GREEN)
+            canvas = self.vram_widgets.get("canvas")
+            if canvas is not None:
+                try:
+                    cw = max(1, int(canvas.winfo_width() or 0))
+                except Exception:
+                    cw = 1
+                if cw <= 1:
+                    cw = int(700 * self.scale)
+                frac = 0.0
+                if b["budget_mb"] > 0:
+                    frac = min(1.0, b["total_mb"] / b["budget_mb"])
+                canvas.coords(self.vram_widgets["bar_fill"], 0, 0,
+                              int(cw * frac), 18)
+                canvas.itemconfigure(self.vram_widgets["bar_fill"], fill=color)
+            used = b["total_mb"] / 1024.0
+            cap = b["total_card_mb"] / 1024.0
+            self.vram_widgets["num"].configure(
+                text=f"{used:.1f} / {cap:.0f} GB peak  ({pct:.0f}%)", fg=color)
+            self.vram_widgets["parts"].configure(text=budget_parts_text(b))
+            warn = self.vram_widgets.get("warn")
+            if warn is not None:
+                if b["over"]:
+                    warn.configure(text=self.vram.over_warning(b))
+                    warn.grid()
+                else:
+                    warn.configure(text="")
+                    warn.grid_remove()
+        except Exception:
+            pass
+
+    def collect(self) -> tuple[dict, dict]:
+        """``(changes, errors)``: every field whose widget no longer holds the
+        value it opened with, validated. A field the owner did not touch is
+        never written — nor validated (a bad value already in the file must
+        not block saving an unrelated field)."""
+        changes: dict = {}
+        errors: dict = {}
+        for key, f in self.fields.items():
+            try:
+                raw = f.get_raw()
+            except Exception as exc:
+                errors[key] = str(exc)
+                continue
+            if raw == f.initial_raw:
+                continue
+            value, err = validate_value(f.spec, raw)
+            if err:
+                errors[key] = err
+                continue
+            if not values_equal(value, self.snapshot.get(key)):
+                changes[key] = value
+        return changes, errors
+
+    def _show_errors(self, errors: dict) -> None:
+        for key, f in self.fields.items():
+            if f.error_label is None:
+                continue
+            msg = errors.get(key)
+            try:
+                if msg:
+                    f.error_label.configure(
+                        text=f"✖ {f.spec.get('label', key)}: {msg}")
+                    f.error_label.grid()
+                else:
+                    f.error_label.configure(text="")
+                    f.error_label.grid_remove()
+            except Exception:
+                pass
+        if errors:
+            first = next(iter(errors))
+            tab = SCHEMA.get(first, {}).get("tab")
+            if tab in TAB_ORDER:
+                try:
+                    self.notebook.select(TAB_ORDER.index(tab))
+                except Exception:
+                    pass
+
+    def save(self, restart: bool = False) -> bool:
+        """Save the changed fields (and, with ``restart``, ask JARVIS to
+        restart). Returns True when nothing went wrong."""
+        if self.file_error:
+            self.status_var.set("Save disabled — the settings file can't be "
+                                "read (see the message at the top).")
+            return False
+        changes, errors = self.collect()
+        self._show_errors(errors)
+        if errors:
+            n = len(errors)
+            self.status_var.set(f"Not saved — fix the {n} field"
+                                f"{'s' if n != 1 else ''} marked ✖.")
+            return False
+        msg = "Nothing changed."
+        if changes:
+            try:
+                _doc, (tag, reason) = save_changed_settings(changes, self.path)
+            except SettingsFileError as exc:
+                self.file_error = str(exc)
+                self._refresh_banner()
+                self._sync_save_buttons()
+                self.status_var.set("Not saved — the settings file can't be "
+                                    "read.")
+                return False
+            except Exception as exc:
+                try:
+                    self.mb.showerror("JARVIS Settings",
+                                      f"Could not save settings:\n{exc}")
+                except Exception:
+                    pass
+                self.status_var.set("Save failed.")
+                return False
+            for key, value in changes.items():
+                self.snapshot[key] = _copy_value(value)
+                self.values[key] = _copy_value(value)
+                f = self.fields.get(key)
+                if f is not None:
+                    f.initial_raw = f.get_raw()
+                self.saved_this_session.add(key)
+            n = len(changes)
+            msg = f"Saved {n} change{'s' if n != 1 else ''}."
+            if tag:
+                vf = self.fields.get("LOCAL_VISION_MODEL")
+                if vf is not None:
+                    vf.set_raw(tag)
+                    vf.initial_raw = vf.get_raw()
+                self.snapshot["LOCAL_VISION_MODEL"] = tag
+                self.values["LOCAL_VISION_MODEL"] = tag
+                self.saved_this_session.add("LOCAL_VISION_MODEL")
+                msg += f" Vision model moved with the brain → {tag}."
+            elif reason == LOCKSTEP_TEXT_ONLY_REASON:
+                vis = self.values.get("LOCAL_VISION_MODEL") or "its own model"
+                msg += (f" Local vision stays on {vis} — the new chat model "
+                        f"isn't vision-capable.")
+            self._refresh_badges()
+            self._refresh_warnings()
+        if restart:
+            if send_tray_command("restart", path=self._command_path):
+                self.saved_this_session.clear()
+                self._refresh_badges()
+                msg += " Restart requested — JARVIS restarts within seconds " \
+                       "if it is running."
+            else:
+                msg += " Could not send the restart request."
+                self.status_var.set(msg)
+                return False
+        elif changes:
+            msg += " Takes effect when JARVIS restarts."
+        self.status_var.set(msg)
+        return True
+
+    def has_unsaved_changes(self) -> bool:
+        changes, errors = self.collect()
+        return bool(changes or errors)
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        if not self.file_error and self.has_unsaved_changes():
+            try:
+                ans = self.mb.askyesnocancel(
+                    "JARVIS Settings", "Save your changes before closing?",
+                    parent=self.root)
+            except Exception:
+                ans = False
+            if ans is None:
+                return
+            if ans and not self.save():
+                return
+        self.closed = True
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+    def open_json(self) -> None:
+        try:
+            if not os.path.exists(self.path):
+                ensure_settings_file(self.path)
+            opener = self._file_opener or getattr(os, "startfile", None)
+            if opener is None:
+                self.status_var.set(self.path)
+                return
+            opener(self.path)
+            self.status_var.set("Opened user_settings.json — reopen this "
+                                "window after editing it by hand.")
+        except Exception as exc:
+            self.status_var.set(f"Open failed: {exc}")
+
+    def raise_window(self) -> None:
+        """Bring the window to the front WITHOUT pinning it there (it used to
+        be always-on-top, which covered the editor "Open user_settings.json"
+        started)."""
+        root = self.root
+        try:
+            root.deiconify()
+            root.lift()
+            root.attributes("-topmost", True)
+            root.after(400, lambda: root.attributes("-topmost", False))
+            root.focus_force()
+        except Exception:
+            pass
+
+    # ── background work, polled on the Tk thread ──────────────────────
+    def _start_async(self, name: str, fn) -> None:
+        slot = {"done": False, "result": None}
+        self._async[name] = slot
+
+        def _run():
+            try:
+                slot["result"] = fn()
+            except Exception:
+                slot["result"] = None
+            slot["done"] = True
+        threading.Thread(target=_run, name=f"settings-{name}",
+                         daemon=True).start()
+
+    def _apply_async(self) -> None:
+        models = self._async.get("models")
+        if models and models["done"] and not models.get("applied"):
+            models["applied"] = True
+            chat, vision = (models["result"] or (None, None))
+            for key, spec in SCHEMA.items():
+                f = self.fields.get(key)
+                if f is None or f.combo is None:
+                    continue
+                src = spec.get("suggest")
+                if src == "ollama" and chat:
+                    vals = list(chat)
+                elif src == "ollama-vision":
+                    vals = list(vision or chat or [])
+                    if not vals:
+                        continue
+                    vals = vals + (["off"] if "off" not in vals else [])
+                else:
+                    continue
+                cur = str(f.get_raw() or "")
+                if cur and cur not in vals:
+                    vals = [cur] + vals
+                try:
+                    f.combo.configure(values=vals)
+                except Exception:
+                    pass
+        running = self._async.get("running")
+        if running and running["done"] and not running.get("applied"):
+            running["applied"] = True
+            if isinstance(running["result"], set):
+                self.pending_running = running["result"]
+                self._refresh_badges()
+
+    def _tick(self) -> None:
+        if self.closed:
+            return
+        try:
+            self._apply_async()
+            if self._focus_tag and consume_focus_request(self._focus_tag,
+                                                         self._focus_dir):
+                self.raise_window()
+        except Exception:
+            pass
+        try:
+            self.root.after(self._poll_ms, self._tick)
+        except Exception:
+            pass
+
+
+def run_gui(start_tab: int = 0, focus_tag: str | None = None) -> int:
     """Build and run the settings window. Returns a process exit code.
 
     Imports tkinter lazily so importing this module (for the tests, or for the
@@ -1402,505 +3778,17 @@ def run_gui(start_tab: int = 0) -> int:
     except Exception as exc:  # pragma: no cover - headless/no-Tk path
         sys.stderr.write(f"settings_window: tkinter unavailable ({exc})\n")
         return 2
-
-    settings = ensure_settings_file()
-
     try:
-        root = tk.Tk()
+        app = SettingsApp(tk, ttk, messagebox, start_tab=start_tab,
+                          focus_tag=focus_tag)
     except Exception as exc:  # pragma: no cover - no display
-        sys.stderr.write(f"settings_window: no display ({exc})\n")
+        sys.stderr.write(f"settings_window: could not open ({exc})\n")
         return 2
-
-    root.title("JARVIS Settings")
-    root.configure(bg=BG)
-    root.geometry("640x620")
-    root.minsize(560, 480)
     try:
-        root.attributes("-topmost", True)
-    except Exception:
-        pass
-
-    # ttk dark theme.
-    style = ttk.Style()
-    try:
-        style.theme_use("clam")
-    except Exception:
-        pass
-    style.configure("TNotebook", background=BG, borderwidth=0)
-    style.configure("TNotebook.Tab", background=FIELD_BG, foreground=FG,
-                    padding=(12, 6), font=FONT)
-    style.map("TNotebook.Tab",
-              background=[("selected", ACCENT)],
-              foreground=[("selected", "#ffffff")])
-    style.configure("TFrame", background=BG)
-    style.configure("Card.TFrame", background=BG)
-    style.configure("TLabel", background=BG, foreground=FG, font=FONT)
-    style.configure("Help.TLabel", background=BG, foreground=MUTED,
-                    font=FONT_SMALL)
-    style.configure("Head.TLabel", background=BG, foreground=FG, font=FONT_BOLD)
-    style.configure("TCheckbutton", background=BG, foreground=FG, font=FONT)
-    style.map("TCheckbutton", background=[("active", BG)])
-    style.configure("TCombobox", fieldbackground=FIELD_BG, background=FIELD_BG,
-                    foreground=FG, font=FONT)
-    style.configure("TButton", background=FIELD_BG, foreground=FG, font=FONT,
-                    padding=(10, 5))
-    style.map("TButton", background=[("active", ACCENT)])
-
-    notebook = ttk.Notebook(root)
-    notebook.pack(fill="both", expand=True, padx=10, pady=(10, 4))
-
-    # Tk variable per persisted key; widgets read/write these.
-    vars_by_key: dict = {}
-    text_widgets: dict = {}
-    # Mic-picker (type "device") widgets: key -> (StringVar of the chosen label,
-    # [(label, index)] choices). _collect() translates the label back to the int
-    # index to persist. Kept separate from vars_by_key because that path stores
-    # the var's raw string value, but a device must persist its int, not the
-    # friendly label.
-    device_widgets: dict = {}
-
-    # VRAM budget panel — widgets populated when the AI tab is built; the engine
-    # is loaded lazily and may be absent (no nvidia-smi / import error), in which
-    # case the panel shows a muted note and never blocks the window.
-    vram = _load_vram_budget()
-    vram_widgets: dict = {}
-    # Total card VRAM, probed ONCE here so the live recompute doesn't shell out
-    # to nvidia-smi on every keystroke. Falls back to the 24 GB default inside
-    # the engine when the probe fails.
-    vram_total_mb = None
-    if vram is not None:
-        try:
-            vram_total_mb = vram.total_vram_mb()
-        except Exception:
-            vram_total_mb = None
-
-    def _vram_color(pct: float, over: bool) -> str:
-        """Bar colour by load: green <80%, amber 80–100%, red >100% (over)."""
-        if over or pct > 100.0:
-            return "#f85149"   # red
-        if pct >= 80.0:
-            return "#d29922"   # amber
-        return "#3fb950"       # green
-
-    def _live_vram_values() -> dict:
-        """Snapshot the CURRENT widget values the budget depends on, as a flat
-        dict for budget_from_live_values(). Reads the live Tk vars so the bar
-        reflects unsaved edits, then hands them to resolve_vram_values() for
-        the saved-settings / config-default fallbacks. The resolution itself
-        lives at module level so the tests exercise the REAL chain instead of a
-        re-implementation of it (the previous regression test hand-built the
-        dict the GUI could not actually produce, and stayed green through the
-        whole phantom-VLM defect)."""
-        widget: dict = {}
-        for key in VRAM_WATCH_KEYS:
-            var = vars_by_key.get(key)
-            if var is None:
-                continue
-            try:
-                widget[key] = var.get()
-            except Exception:
-                pass          # var not usable yet → fall through to settings
-        return resolve_vram_values(widget, settings)
-
-    def update_budget(*_a) -> None:
-        """Recompute the prediction from live widget values and repaint the bar,
-        numeric readout, per-component breakdown and over-budget warning. Bound
-        to every VRAM_WATCH_KEYS var so any change updates it instantly. Never
-        raises — a failure just leaves the last drawn state."""
-        if not vram_widgets:
-            return
-        try:
-            b = budget_from_live_values(_live_vram_values(), total_mb=vram_total_mb)
-            if b is None:
-                return
-            pct = b["pct"]
-            color = _vram_color(pct, b["over"])
-            # Bar: redraw the filled rectangle to the clamped fraction.
-            canvas = vram_widgets.get("canvas")
-            if canvas is not None:
-                cw = max(1, int(canvas.winfo_width() or 0))
-                if cw <= 1:
-                    cw = 560  # not yet laid out — use the nominal width
-                frac = 0.0
-                if b["budget_mb"] > 0:
-                    frac = min(1.0, b["total_mb"] / b["budget_mb"])
-                canvas.coords(vram_widgets["bar_fill"], 0, 0, int(cw * frac), 18)
-                canvas.itemconfigure(vram_widgets["bar_fill"], fill=color)
-            # Numeric "20.6 / 24 GB peak (137%)".
-            used = b["total_mb"] / 1024.0
-            cap = b["total_card_mb"] / 1024.0
-            vram_widgets["num"].configure(
-                text=f"{used:.1f} / {cap:.0f} GB peak  ({pct:.0f}%)",
-                fg=color)
-            # Per-component breakdown: "32B 22 · vision 7.3 (on-demand) · …".
-            parts = []
-            for c in b["components"]:
-                gb = c["mb"] / 1024.0
-                gb_s = f"{int(round(gb))}" if abs(gb - round(gb)) < 0.05 else f"{gb:.1f}"
-                tag = " (on-demand)" if c.get("ondemand") else ""
-                parts.append(f"{c['label']} {gb_s}{tag}")
-            vram_widgets["parts"].configure(text=" · ".join(parts))
-            # Warning row — shown only when over budget.
-            warn = vram_widgets.get("warn")
-            if warn is not None:
-                if b["over"]:
-                    warn.configure(text=vram.over_warning(b))
-                    warn.grid()
-                else:
-                    warn.configure(text="")
-                    warn.grid_remove()
-        except Exception:
-            pass
-
-    def _build_vram_panel(parent, row: int) -> int:
-        """Build the 'GPU / VRAM budget' panel into ``parent`` at grid ``row``;
-        returns the next free row. When the engine is unavailable, drops a single
-        muted note instead so the rest of the tab still renders."""
-        head = ttk.Label(parent, text="GPU / VRAM budget", style="Head.TLabel")
-        head.grid(row=row, column=0, columnspan=2, sticky="w", padx=2,
-                  pady=(2, 2))
-        row += 1
-        if vram is None:
-            ttk.Label(parent,
-                      text="(VRAM estimate unavailable — core.vram_budget "
-                           "could not load.)",
-                      style="Help.TLabel", wraplength=560).grid(
-                row=row, column=0, columnspan=2, sticky="w", padx=2, pady=(0, 6))
-            return row + 1
-        # The bar — a thin Canvas with a background track + a coloured fill rect.
-        bar = tk.Canvas(parent, height=18, bg=FIELD_BG, highlightthickness=1,
-                        highlightbackground="#30363d", bd=0)
-        bar.grid(row=row, column=0, columnspan=2, sticky="we", padx=2, pady=(0, 2))
-        fill = bar.create_rectangle(0, 0, 0, 18, fill="#3fb950", width=0)
-        vram_widgets["canvas"] = bar
-        vram_widgets["bar_fill"] = fill
-        # Redraw the fill when the bar is first laid out / resized.
-        bar.bind("<Configure>", update_budget)
-        row += 1
-        # Numeric readout + per-component breakdown.
-        num = tk.Label(parent, text="", bg=BG, fg=FG, font=FONT, anchor="w")
-        num.grid(row=row, column=0, columnspan=2, sticky="w", padx=2, pady=(0, 0))
-        vram_widgets["num"] = num
-        row += 1
-        parts = tk.Label(parent, text="", bg=BG, fg=MUTED, font=FONT_SMALL,
-                         anchor="w", justify="left", wraplength=560)
-        parts.grid(row=row, column=0, columnspan=2, sticky="w", padx=2,
-                   pady=(0, 2))
-        vram_widgets["parts"] = parts
-        row += 1
-        # Over-budget warning (hidden until `over`).
-        warn = tk.Label(parent, text="", bg=BG, fg="#f85149", font=FONT_SMALL,
-                        anchor="w", justify="left", wraplength=560)
-        warn.grid(row=row, column=0, columnspan=2, sticky="w", padx=2,
-                  pady=(0, 6))
-        warn.grid_remove()
-        vram_widgets["warn"] = warn
-        row += 1
-        return row
-
-    def _add_help(parent, spec, row):
-        help_text = spec.get("help")
-        if help_text:
-            ttk.Label(parent, text=help_text, style="Help.TLabel",
-                      wraplength=560, justify="left").grid(
-                row=row, column=0, columnspan=2, sticky="w",
-                padx=(2, 0), pady=(0, 8))
-
-    def _build_tab(tab_key):
-        # Scrollable frame so long tabs (Advanced) don't clip.
-        outer = ttk.Frame(notebook, style="TFrame")
-        canvas = tk.Canvas(outer, bg=BG, highlightthickness=0, bd=0)
-        scrollbar = ttk.Scrollbar(outer, orient="vertical",
-                                  command=canvas.yview)
-        inner = ttk.Frame(canvas, style="TFrame")
-        inner.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=inner, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        # Mouse-wheel scrolling, scoped to the canvas the pointer is over.
-        # `bind_all` is application-wide and was re-bound per tab, so the LAST
-        # tab built (Advanced) captured the wheel for EVERY tab — on the other
-        # tabs the wheel scrolled the hidden Advanced canvas (B17). Binding the
-        # global wheel only while the pointer is inside THIS canvas (and
-        # releasing it on leave) makes each tab scroll its own content.
-        def _on_wheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        def _bind_wheel(_event):
-            canvas.bind_all("<MouseWheel>", _on_wheel)
-
-        def _unbind_wheel(_event):
-            canvas.unbind_all("<MouseWheel>")
-
-        for w in (canvas, inner):
-            w.bind("<Enter>", _bind_wheel)
-            w.bind("<Leave>", _unbind_wheel)
-
-        row = 0
-        inner.columnconfigure(1, weight=1)
-        # The VRAM budget panel lives at the top of the AI tab, beside the
-        # model dropdown — like a game's graphics-settings estimator.
-        if tab_key == "ai":
-            row = _build_vram_panel(inner, row)
-        for key, spec in SCHEMA.items():
-            if spec.get("tab") != tab_key:
-                continue
-            typ = spec.get("type")
-            label = spec.get("label", key)
-
-            if typ == "status":
-                present, detail = integration_status(spec)
-                dot = "●" if present else "○"
-                color = "#3fb950" if present else MUTED
-                badge = tk.Label(inner, text=f"{dot} {label}: {detail}",
-                                 bg=BG, fg=color, font=FONT, anchor="w")
-                badge.grid(row=row, column=0, columnspan=2, sticky="w",
-                           padx=2, pady=(2, 0))
-                row += 1
-                _add_help(inner, spec, row)
-                row += 1
-                continue
-
-            if typ == "bool":
-                var = tk.BooleanVar(value=bool(settings.get(key)))
-                vars_by_key[key] = var
-                ttk.Checkbutton(inner, text=label, variable=var).grid(
-                    row=row, column=0, columnspan=2, sticky="w",
-                    padx=2, pady=(4, 0))
-                row += 1
-                _add_help(inner, spec, row)
-                row += 1
-                continue
-
-            if typ == "text":
-                ttk.Label(inner, text=label, style="Head.TLabel").grid(
-                    row=row, column=0, columnspan=2, sticky="w",
-                    padx=2, pady=(6, 2))
-                row += 1
-                txt = tk.Text(inner, height=5, width=48, bg=FIELD_BG, fg=FG,
-                              insertbackground=FG, font=FONT,
-                              relief="flat", padx=6, pady=4)
-                cur = settings.get(key) or []
-                if isinstance(cur, list):
-                    txt.insert("1.0", "\n".join(str(x) for x in cur))
-                else:
-                    txt.insert("1.0", str(cur))
-                txt.grid(row=row, column=0, columnspan=2, sticky="we",
-                         padx=2, pady=(0, 2))
-                text_widgets[key] = txt
-                row += 1
-                _add_help(inner, spec, row)
-                row += 1
-                continue
-
-            if typ == "routing":
-                # one dropdown per function (vision/chat/ambient), composed back
-                # into the MODEL_ROUTING dict on save via the "::" sub-keys.
-                ttk.Label(inner, text=label).grid(
-                    row=row, column=0, sticky="w", padx=2, pady=(6, 2))
-                row += 1
-                cur = settings.get(key)
-                cur = cur if isinstance(cur, dict) else {}
-                opts = spec.get("choices") or ["auto", "local", "cloud"]
-                for fn in spec.get("default", {}):
-                    ttk.Label(inner, text=f"    • {fn}").grid(
-                        row=row, column=0, sticky="w", padx=12, pady=(0, 2))
-                    rvar = tk.StringVar(value=str(cur.get(fn, spec["default"][fn])))
-                    vars_by_key[f"{key}::{fn}"] = rvar
-                    ttk.Combobox(inner, textvariable=rvar, state="readonly",
-                                 values=opts, width=28).grid(
-                        row=row, column=1, sticky="we", padx=2, pady=(0, 2))
-                    row += 1
-                _add_help(inner, spec, row)
-                row += 1
-                continue
-
-            if typ == "combo":
-                # Editable dropdown: live-probed Ollama models as suggestions,
-                # but the user can still type any tag (not state="readonly").
-                ttk.Label(inner, text=label).grid(
-                    row=row, column=0, sticky="w", padx=2, pady=(6, 2))
-                values = list(spec.get("choices") or [])
-                try:
-                    values = installed_ollama_models()
-                except Exception:
-                    pass
-                cur_val = str(settings.get(key, ""))
-                if cur_val and cur_val not in values:
-                    values = [cur_val] + values  # keep a custom saved tag visible
-                var = tk.StringVar(value=cur_val)
-                vars_by_key[key] = var
-                ttk.Combobox(inner, textvariable=var, values=values,
-                             width=28).grid(
-                    row=row, column=1, sticky="we", padx=2, pady=(6, 2))
-                row += 1
-                _add_help(inner, spec, row)
-                row += 1
-                continue
-
-            if typ == "device":
-                # Readonly dropdown of live input devices + the synthetic
-                # auto/off choices. The combobox shows friendly LABELS; the int
-                # index (or None) is recovered in _collect() via device_widgets.
-                ttk.Label(inner, text=label).grid(
-                    row=row, column=0, sticky="w", padx=2, pady=(6, 2))
-                saved = settings.get(key, spec.get("default"))
-                try:
-                    saved = int(saved) if saved is not None else None
-                except (TypeError, ValueError):
-                    saved = None
-                choices = mic_choices(saved)
-                labels = [lbl for lbl, _ in choices]
-                var = tk.StringVar(value=mic_index_to_label(saved, choices))
-                device_widgets[key] = (var, choices)
-                ttk.Combobox(inner, textvariable=var, state="readonly",
-                             values=labels, width=28).grid(
-                    row=row, column=1, sticky="we", padx=2, pady=(6, 2))
-                row += 1
-                _add_help(inner, spec, row)
-                row += 1
-                continue
-
-            # enum / str / int / float → label + control on one row.
-            ttk.Label(inner, text=label).grid(
-                row=row, column=0, sticky="w", padx=2, pady=(6, 2))
-            if typ == "enum":
-                var = tk.StringVar(value=str(settings.get(key, "")))
-                vars_by_key[key] = var
-                ttk.Combobox(inner, textvariable=var, state="readonly",
-                             values=spec.get("choices", []), width=28).grid(
-                    row=row, column=1, sticky="we", padx=2, pady=(6, 2))
-            else:
-                var = tk.StringVar(value=str(settings.get(key, "")))
-                vars_by_key[key] = var
-                tk.Entry(inner, textvariable=var, bg=FIELD_BG, fg=FG,
-                         insertbackground=FG, font=FONT, relief="flat").grid(
-                    row=row, column=1, sticky="we", padx=2, pady=(6, 2))
-            row += 1
-            _add_help(inner, spec, row)
-            row += 1
-
-        notebook.add(outer, text=TAB_LABELS[tab_key])
-
-    for tab_key in TAB_ORDER:
-        _build_tab(tab_key)
-
-    # Live recompute: every VRAM-budget input re-runs the prediction the moment
-    # it changes — exactly like a game's graphics menu updating its estimate as
-    # you toggle settings. Bound here (after ALL tabs are built) so vars from
-    # other tabs (e.g. SCREEN_VISION_ENABLED on Advanced) are already created.
-    if vram_widgets:
-        for key in VRAM_WATCH_KEYS:
-            var = vars_by_key.get(key)
-            if var is None:
-                continue
-            try:
-                var.trace_add("write", update_budget)
-            except Exception:
-                pass
-        # Draw the initial state (deferred so the bar Canvas has its real width).
-        try:
-            root.after(0, update_budget)
-        except Exception:
-            update_budget()
-
-    try:
-        notebook.select(start_tab)
-    except Exception:
-        pass
-
-    # ── bottom bar: note + buttons ──
-    bar = ttk.Frame(root, style="TFrame")
-    bar.pack(fill="x", padx=10, pady=(0, 10))
-    ttk.Label(bar, text=RESTART_NOTE, style="Help.TLabel").pack(side="left")
-
-    status_var = tk.StringVar(value="")
-    ttk.Label(bar, textvariable=status_var, style="Help.TLabel").pack(
-        side="left", padx=10)
-
-    # Set by _collect() so _on_save can SAY what the vision lockstep did —
-    # a silent rewrite of a model tag would be exactly the kind of unreported
-    # side effect this codebase's honest-failure rule forbids.
-    lockstep_result: list = [(None, "")]
-
-    def _collect() -> dict:
-        # Seed from the CURRENT on-disk document (not the window-open snapshot)
-        # so a key a runtime action persisted while this window was open is kept
-        # rather than reverted; the GUI's own field values are layered on below.
-        # 2026-07-08.
-        out: dict = _current_settings_base(settings)  # keep unknown/passthrough keys
-        # The pre-overlay copy still holds the OLD chat tag — the vision
-        # lockstep below needs it to tell "the owner changed the brain" from
-        # "the owner pinned a separate VLM".
-        base: dict = dict(out)
-        for key, var in vars_by_key.items():
-            out[key] = var.get()
-        for key, widget in text_widgets.items():
-            out[key] = widget.get("1.0", "end")
-        # Device pickers persist the int index, not the chosen friendly label.
-        for key, (var, choices) in device_widgets.items():
-            out[key] = mic_label_to_index(var.get(), choices)
-        # Fold routing sub-keys ("MODEL_ROUTING::vision") into their nested dict.
-        for compound in [c for c in list(out) if "::" in c]:
-            root_key, fn = compound.split("::", 1)
-            val = out.pop(compound)
-            if not isinstance(out.get(root_key), dict):
-                out[root_key] = {}
-            out[root_key][fn] = val
-        # Vision LOCKSTEP: a chat-model change must carry LOCAL_VISION_MODEL
-        # with it (or say why it didn't) — the shared rule in
-        # core.model_lockstep, the same one the voice switch uses.
-        lockstep_result[0] = apply_vision_lockstep(base, out)
-        return out
-
-    def _on_save():
-        try:
-            doc = _collect()
-            save_settings(doc)
-            tag, reason = lockstep_result[0]
-            if tag:
-                status_var.set(f"Saved. Vision model moved with the brain "
-                               f"→ {tag}.")
-            elif reason == LOCKSTEP_TEXT_ONLY_REASON:
-                vis = doc.get("LOCAL_VISION_MODEL") or "its own model"
-                status_var.set(f"Saved. Local vision stays on {vis} — the new "
-                               f"chat model isn't vision-capable.")
-            else:
-                status_var.set("Saved.")
-        except Exception as exc:
-            try:
-                messagebox.showerror("JARVIS Settings",
-                                     f"Could not save settings:\n{exc}")
-            except Exception:
-                pass
-            status_var.set("Save failed.")
-
-    def _open_json():
-        try:
-            ensure_settings_file()
-            target = settings_path()
-            if hasattr(os, "startfile"):
-                os.startfile(target)  # noqa: S606 (Windows-only)
-            else:
-                status_var.set(target)
-        except Exception as exc:
-            status_var.set(f"Open failed: {exc}")
-
-    ttk.Button(bar, text="Close", command=root.destroy).pack(
-        side="right", padx=(6, 0))
-    ttk.Button(bar, text="Save", command=_on_save).pack(side="right")
-    ttk.Button(bar, text="Open user_settings.json",
-               command=_open_json).pack(side="right", padx=(0, 6))
-
-    try:
-        root.mainloop()
+        app.root.mainloop()
     finally:
         try:
-            root.destroy()
+            app.root.destroy()
         except Exception:
             pass
     return 0
@@ -1908,7 +3796,26 @@ def run_gui(start_tab: int = 0) -> int:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    return run_gui(resolve_start_tab(args.tab))
+    if args.selftest:
+        report = selftest()
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0 if report["ok"] else 1
+    tag = instance_tag()
+    handle = acquire_single_instance(tag)
+    if handle is None:
+        # Another window is already open: bring it forward instead.
+        request_focus(tag)
+        return 0
+    try:
+        write_pid_file(tag)
+        set_dpi_awareness()
+        return run_gui(resolve_start_tab(args.tab), focus_tag=tag)
+    finally:
+        try:
+            os.remove(_pid_file(tag))
+        except OSError:
+            pass
+        release_single_instance(handle)
 
 
 if __name__ == "__main__":

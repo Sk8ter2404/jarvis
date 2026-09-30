@@ -1665,23 +1665,53 @@ GAME_MODE_KEEP_WARM_SECONDS = 600.0
 GAME_MODE_ANNOUNCE = False
 
 
+# ── settings-window fixes 2026-09-30: an unreadable file is LOUD ──────────
+# A user_settings.json that exists but can't be applied used to be skipped in
+# silence, so JARVIS ran on the built-in defaults with nothing said. Now it is
+# printed at import (console) and kept here for bobert_companion.setup_logging
+# to repeat into the session log, which doesn't exist yet at import time.
+_USER_SETTINGS_ERROR = None
+
+
+def _report_user_settings_failure(path: str, why: str) -> None:
+    global _USER_SETTINGS_ERROR
+    _USER_SETTINGS_ERROR = (
+        f"{path} could not be applied ({why}) — EVERY saved setting is being "
+        f"ignored and JARVIS is running on the built-in defaults. Fix the file "
+        f"(the Settings window shows where) and restart.")
+    try:
+        import sys
+        print(f"[config] WARNING: {_USER_SETTINGS_ERROR}", file=sys.stderr,
+              flush=True)
+    except Exception:
+        pass
+
+
 # Safe + best-effort (the second import-time I/O in this file, after
 # RAG_INDEX_PATHS): we override ONLY a constant that already exists here — so the
 # GUI's schema, which is curated FROM this file, is the allow-list — coerce to
 # the existing constant's type, and leave the default on any error. A missing
-# file (fresh install, before the GUI ever ran) is a silent no-op.
+# file (fresh install, before the GUI ever ran) is a silent no-op; a file that
+# exists but can't be read is reported (above).
 def _apply_user_settings() -> None:
+    global _USER_SETTINGS_ERROR
+    _USER_SETTINGS_ERROR = None
     path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "data", "user_settings.json")
     try:
         if not os.path.exists(path):
             return
-        with open(path, "r", encoding="utf-8") as f:
+        # utf-8-sig: PowerShell 5.1's `Set-Content/Out-File -Encoding utf8`
+        # writes a BOM, which plain utf-8 json.load rejects.
+        with open(path, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
-    except Exception:
+    except Exception as exc:
+        _report_user_settings_failure(path, f"{type(exc).__name__}: {exc}")
         return
     if not isinstance(data, dict):
+        _report_user_settings_failure(
+            path, f"it holds a {type(data).__name__}, not a JSON object")
         return
     # Back-compat aliases: a config constant that was RENAMED still has saved
     # user_settings.json files (and Settings-GUI writes) carrying the OLD key.

@@ -18,12 +18,15 @@ KV cache at JARVIS's working context, not just the on-disk file):
     qwen2.5:14b-instruct-q5_K_M   ~13.0 GB   (16k ctx)
     llama3.1:8b-instruct-q5_K_M    ~6.0 GB
     qwen2.5vl:7b  (vision)         ~7.3 GB    (on-demand — loads when seeing)
-    large-v3-turbo (Whisper STT)   ~1.5 GB    (always, while listening)
+    large-v3-turbo (Whisper STT)   ~1.5 GB    (while listening — on the card
+                                              WHISPER_DEVICE names; cuda:1 or
+                                              cpu costs this card nothing)
     nomic-embed-text (RAG embed)   ~0.3 GB    (when RAG indexes / queries)
 
 Total card capacity is read once from ``nvidia-smi
---query-gpu=memory.total`` (24576 MiB on the 3090); a ~1.5 GB headroom is held
-back so the prediction's "budget" is the usable ceiling, not the raw total.
+--query-gpu=memory.total`` — the BIGGEST card, where the brain loads (24576
+MiB on the 3090); a ~1.5 GB headroom is held back so the prediction's
+"budget" is the usable ceiling, not the raw total.
 
 Design contract (mirrors core/gpu_state.py): stdlib only, import-light, and
 TOTAL — every public function degrades gracefully (missing nvidia-smi / ollama,
@@ -131,7 +134,16 @@ def _run(cmd: list[str], timeout: float = 2.0) -> Optional[str]:
 
 
 def total_vram_mb(force: bool = False) -> int:
-    """Total GPU VRAM in MB via ``nvidia-smi --query-gpu=memory.total``.
+    """Total VRAM in MB of the card the local brain runs on, via
+    ``nvidia-smi --query-gpu=memory.total``.
+
+    Multi-GPU hosts print one line per card, in PCI-bus order — which is NOT
+    CUDA's order (CUDA numbers the fastest card 0 by default) and not
+    necessarily the brain's card. Ollama loads the chat model onto the card
+    with room for it, i.e. the BIGGEST one, so that is the card this budget
+    describes: on this desk the 24 GB 3090, not the 4 GB 1650 SUPER beside it,
+    whichever order the driver lists them in. (2026-09-30: the old "take the
+    first line" was right here only by luck of the slot order.)
 
     Falls back to ``DEFAULT_TOTAL_MB`` (the 24 GB calibration card) when
     nvidia-smi is absent or unparseable, so the GUI always has a ceiling to draw
@@ -144,21 +156,42 @@ def total_vram_mb(force: bool = False) -> int:
     out = _run(["nvidia-smi", "--query-gpu=memory.total",
                 "--format=csv,noheader,nounits"])
     if out:
-        # Multi-GPU hosts print one line per card; take the first (JARVIS pins
-        # GPU 0). Strip a stray "MiB" unit if a driver emits it despite nounits.
+        cards = []
+        # Strip a stray "MiB" unit if a driver emits it despite nounits.
         for line in out.splitlines():
             digits = "".join(ch for ch in line if ch.isdigit())
             if digits:
                 try:
                     val = int(digits)
                     if val > 0:
-                        total = val
-                        break
+                        cards.append(val)
                 except ValueError:
                     pass
+        if cards:
+            total = max(cards)
     _TOTAL_CACHE[0] = total
     _TOTAL_CACHE[1] = now + _TOTAL_CACHE_TTL_S
     return total
+
+
+def whisper_on_budget_card(whisper_device) -> bool:
+    """Does Whisper (WHISPER_DEVICE) load onto the card this budget describes?
+
+    "auto" / "cuda" / "cuda:0" / unset → yes: bobert_companion's
+    _resolve_whisper_device turns "auto" into "cuda" = CUDA device 0, which
+    under CUDA's default FASTEST_FIRST order is the brain's card. "cuda:N" with
+    N ≥ 1 is ANOTHER card (on this desk cuda:1 is the 1650 SUPER, kept for
+    Whisper precisely so the 3090 stays free) and "cpu" is no card at all.
+    An unparseable "cuda:x" counts as this card (the conservative answer)."""
+    dev = str(whisper_device or "auto").strip().lower()
+    if dev == "cpu":
+        return False
+    if dev.startswith("cuda:"):
+        try:
+            return int(dev.split(":", 1)[1]) == 0
+        except ValueError:
+            return True
+    return True
 
 
 def _ollama_disk_sizes() -> dict[str, int]:
@@ -328,6 +361,7 @@ def predict_budget(settings: dict, total_mb: Optional[int] = None) -> dict:
       SCREEN_VISION_ENABLED  — gates whether vision can run at all
       RAG_ENABLED (or RAG_AUTOSTART) — adds the embedding model
       KINECT_ENABLED         — sensor/skeleton (no GPU model; informational)
+      WHISPER_DEVICE         — Whisper counts only when it loads on this card
 
     Components are summed into ``total_mb`` as a WORST-CASE peak: on-demand
     vision is included because it CAN co-load with the chat model (that co-load
@@ -389,12 +423,25 @@ def predict_budget(settings: dict, total_mb: Optional[int] = None) -> dict:
                 "ondemand": True,
             })
 
-    # 3) Whisper STT — always resident while JARVIS is listening.
-    components.append({
-        "label": "Whisper",
-        "mb": WHISPER_VRAM_MB,
-        "ondemand": False,
-    })
+    # 3) Whisper STT — resident while JARVIS is listening, on the card
+    #    WHISPER_DEVICE names. On another card (cuda:1) or the CPU it costs
+    #    THIS card nothing; it is still listed so the breakdown says where it
+    #    went ("elsewhere" rows carry no MB in the text renderings).
+    whisper_dev = str(settings.get("WHISPER_DEVICE") or "auto").strip()
+    if whisper_on_budget_card(whisper_dev):
+        components.append({
+            "label": "Whisper",
+            "mb": WHISPER_VRAM_MB,
+            "ondemand": False,
+        })
+    else:
+        where = "CPU" if whisper_dev.lower() == "cpu" else whisper_dev
+        components.append({
+            "label": f"Whisper (on {where}, not this card)",
+            "mb": 0,
+            "ondemand": False,
+            "elsewhere": True,
+        })
 
     # 4) RAG embeddings — only when RAG indexing/query is enabled.
     if _rag_enabled(settings):
@@ -461,6 +508,9 @@ def budget_lines(settings: dict, total_mb: Optional[int] = None) -> list[str]:
             f"{_fmt_gb(b['headroom_mb'])} GB reserved) — {b['pct']:.0f}%")
     parts = []
     for c in b["components"]:
+        if c.get("elsewhere"):
+            parts.append(str(c["label"]))
+            continue
         tag = " (on-demand)" if c.get("ondemand") else ""
         parts.append(f"{c['label']} {_fmt_gb(c['mb'])}{tag}")
     lines = [head, "  " + " · ".join(parts)]

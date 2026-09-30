@@ -3325,6 +3325,17 @@ def setup_logging():
     except Exception as _fh_e:
         print(f"  [faulthandler] not available: {_fh_e}")
 
+    # Settings-window fixes 2026-09-30: core.config reports an unreadable
+    # data/user_settings.json at IMPORT time, before this log exists — repeat
+    # it here, where it will be read.
+    try:
+        import core.config as _cfg_us
+        _us_err = getattr(_cfg_us, "_USER_SETTINGS_ERROR", None)
+        if _us_err:
+            print(f"  [config] WARNING: {_us_err}")
+    except Exception:
+        pass
+
 
 def close_log():
     """Called at clean shutdown to write a footer and close the file."""

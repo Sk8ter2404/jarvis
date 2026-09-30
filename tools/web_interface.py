@@ -1600,16 +1600,13 @@ def _read_saved_settings(path: str | None) -> dict:
         except Exception:
             return {}
     try:
-        if os.path.exists(path):
-            with open(path, encoding="utf-8") as f:
-                raw = f.read().strip()
-            if raw:
-                decoded = json.loads(raw)
-                if isinstance(decoded, dict):
-                    return decoded
+        # The Settings window's strict reader: utf-8-sig (a PowerShell BOM is
+        # fine), JSON errors named. This overlay is read-only, so any problem
+        # still degrades to {} here; the WRITE path refuses instead.
+        from tools import settings_window as sw
+        return sw.read_settings_file(path)
     except Exception:
-        pass
-    return {}
+        return {}
 
 
 # Knobs whose VALUE is a secret. We render a row for them (so the owner can SET
@@ -1903,17 +1900,17 @@ def _write_settings(updates: dict, path: str) -> dict:
     with _SETTINGS_WRITE_LOCK:
         # 2) Read the current file (tolerant: missing/corrupt → start from {}), so
         #    we MERGE over it and preserve keys we don't manage.
-        current: dict = {}
+        # A file that can't be read must never be "merged" over as if empty:
+        # that silently wiped every key this panel doesn't manage (CAMERAS,
+        # KINECT_*, AUDIO_AUTOSWITCH_*, ...). Same rule as the Settings window
+        # (2026-09-30): refuse, name the problem, leave the file alone.
         try:
-            if os.path.exists(path):
-                with open(path, encoding="utf-8") as f:
-                    raw = f.read().strip()
-                if raw:
-                    decoded = json.loads(raw)
-                    if isinstance(decoded, dict):
-                        current = decoded
-        except Exception:
-            current = {}      # a corrupt file is overwritten with a valid merge
+            from tools import settings_window as sw
+            current = sw.read_settings_file(path)
+        except Exception as exc:
+            raise SettingsWriteError(
+                f"user_settings.json can't be read ({exc}); fix or restore "
+                f"it first - nothing was saved") from exc
         # Vision LOCKSTEP — must happen HERE, inside the lock and BEFORE the
         # merge, because `current` is the only place the OLD chat tag still
         # exists (the rule's precondition is "vision currently denotes the old
@@ -4091,8 +4088,9 @@ const wakeSave = document.getElementById('wakeSave');
 const wakeSaved = document.getElementById('wakeSaved');
 
 // Friendly tab titles for the group headings (fallback to the raw key).
-const TAB_TITLES = { voice:'Voice / Audio', ai:'AI / Models',
-  privacy:'Privacy / Ambient', integrations:'Integrations', advanced:'Advanced' };
+const TAB_TITLES = { voice:'Voice', hearing:'Hearing & Mic', ai:'AI & Models',
+  cameras:'Cameras & Kinect', privacy:'Privacy', integrations:'Integrations',
+  advanced:'Advanced' };
 // The wake-word knob the banner switch drives — the headline control the owner
 // asked for. START_IN_STANDBY is the "Alexa-style wake-word mode" toggle;
 // WAKE_WORD_AUTOSTART (the neural detector) is surfaced as a normal row below.

@@ -197,6 +197,92 @@ class ApplyUserSettingsTests(unittest.TestCase):
             cfg.AMBIENT_LISTEN_ENABLED = orig
 
 
+class UnreadableFileTests(unittest.TestCase):
+    """2026-09-30 (settings-window P0-5): a UTF-8 BOM made json.load raise and
+    the whole file was ignored in SILENCE; any other parse failure likewise.
+    The file is now read as utf-8-sig and a failure is reported loudly (stderr
+    at import + core.config._USER_SETTINGS_ERROR for the session log)."""
+
+    def _apply_bytes(self, payload: bytes) -> str:
+        """Run the real loader on a real temp file holding ``payload`` (the
+        file's encoding handling is what's under test, so no mock_open).
+        Returns what it wrote to stderr."""
+        import contextlib
+        import io
+        import os
+        import tempfile
+        real_open = open
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "user_settings.json")
+            with real_open(p, "wb") as f:
+                f.write(payload)
+
+            def _open(_path, mode="r", *a, **kw):
+                return real_open(p, mode, *a, **kw)
+            err = io.StringIO()
+            with mock.patch("core.config.os.path.exists", return_value=True), \
+                    mock.patch("core.config.open", _open, create=True), \
+                    contextlib.redirect_stderr(err):
+                cfg._apply_user_settings()
+        return err.getvalue()
+
+    def test_bom_file_is_applied(self):
+        orig = cfg.AI_BACKEND
+        try:
+            cfg.AI_BACKEND = "claude"
+            self._apply_bytes(b"\xef\xbb\xbf" + json.dumps(
+                {"AI_BACKEND": "ollama"}).encode("utf-8"))
+            self.assertEqual(cfg.AI_BACKEND, "ollama",
+                             "a BOM-prefixed user_settings.json was ignored")
+            self.assertIsNone(cfg._USER_SETTINGS_ERROR)
+        finally:
+            cfg.AI_BACKEND = orig
+
+    def test_parse_failure_is_reported_not_silent(self):
+        orig = cfg.AI_BACKEND
+        try:
+            cfg.AI_BACKEND = "claude"
+            err = self._apply_bytes(b'{"AI_BACKEND": "ollama",}')
+            self.assertEqual(cfg.AI_BACKEND, "claude")      # nothing applied
+            self.assertIn("could not be applied", err)
+            self.assertIn("EVERY saved setting is being ignored",
+                          cfg._USER_SETTINGS_ERROR or "")
+        finally:
+            cfg.AI_BACKEND = orig
+            cfg._USER_SETTINGS_ERROR = None
+
+    def test_non_object_is_reported(self):
+        try:
+            err = self._apply_bytes(b"[1, 2]")
+            self.assertIn("not a JSON object", err)
+            self.assertTrue(cfg._USER_SETTINGS_ERROR)
+        finally:
+            cfg._USER_SETTINGS_ERROR = None
+
+    def test_a_good_file_clears_an_old_error(self):
+        self._apply_bytes(b"{")
+        self.assertTrue(cfg._USER_SETTINGS_ERROR)
+        self._apply_bytes(b"{}")
+        self.assertIsNone(cfg._USER_SETTINGS_ERROR)
+
+    def test_session_log_repeats_the_error(self):
+        # The warning is printed at config import, before setup_logging()
+        # opens the session log — so setup_logging must repeat it.
+        import ast
+        import os
+        path = os.path.join(os.path.dirname(os.path.dirname(cfg.__file__)),
+                            "bobert_companion.py")
+        with open(path, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                  and n.name == "setup_logging")
+        names = {getattr(n, "attr", None) or getattr(n, "value", None)
+                 for n in ast.walk(fn)}
+        self.assertIn("_USER_SETTINGS_ERROR", names,
+                      "setup_logging() never reports an unreadable "
+                      "user_settings.json into the session log")
+
+
 class ModelRoutingTests(unittest.TestCase):
     def test_model_route_default_and_lookup(self):
         self.assertEqual(cfg.model_route("nonexistent_fn"), "auto")

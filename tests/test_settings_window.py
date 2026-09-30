@@ -34,10 +34,16 @@ _HAS_TK = importlib.util.find_spec("tkinter") is not None
 
 class SchemaTests(unittest.TestCase):
     def test_tab_order_and_labels_consistent(self):
+        # 2026-09-30 (P1-11): Voice / Hearing & Mic / AI & Models / Cameras &
+        # Kinect / Privacy / Integrations / Advanced.
         self.assertEqual(sw.TAB_ORDER,
-                         ["voice", "ai", "privacy", "integrations", "advanced"])
+                         ["voice", "hearing", "ai", "cameras", "privacy",
+                          "integrations", "advanced"])
         for tab in sw.TAB_ORDER:
             self.assertIn(tab, sw.TAB_LABELS)
+        # The tray's Settings menu still passes the five original names.
+        for tab in ("voice", "ai", "privacy", "integrations", "advanced"):
+            self.assertEqual(sw.parse_args(["--tab", tab]).tab, tab)
 
     def test_every_field_has_a_known_tab(self):
         for key, spec in sw.SCHEMA.items():
@@ -251,14 +257,20 @@ class RoundTripTests(unittest.TestCase):
             self.assertEqual(loaded["SCREENSHOT_PRIVACY_BLOCKLIST"],
                              ["fakeapp", "vault"])
 
-    def test_saved_file_is_valid_json_with_all_keys(self):
+    def test_whole_document_save_does_not_pin_untouched_defaults(self):
+        # 2026-09-30 (P1-2): save_settings used to start from default_settings()
+        # and so froze every schema key at that day's default on every save. A
+        # key absent from the file and still at its default now stays absent
+        # (core/config.py keeps supplying it); explicit values are written.
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "user_settings.json")
-            sw.save_settings(sw.default_settings(), path)
+            doc = sw.default_settings()
+            doc["TTS_VOICE"] = "en-US-FakeVoice"
+            sw.save_settings(doc, path)
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            for key in sw.persisted_keys():
-                self.assertIn(key, data)
+            self.assertEqual(data, {"TTS_VOICE": "en-US-FakeVoice"})
+            self.assertEqual(sw.load_settings(path)["VOICE_MODE"], "turn_based")
 
     def test_load_missing_file_returns_defaults(self):
         with tempfile.TemporaryDirectory() as d:
@@ -518,7 +530,8 @@ class ExampleTemplateTests(unittest.TestCase):
         for key, typ in types.items():
             self.assertIn(key, sw.persisted_keys(), key)
             self.assertEqual(sw.SCHEMA[key]["type"], typ, key)
-            self.assertEqual(sw.SCHEMA[key]["tab"], "voice", key)
+            # Moved from "voice" to the Hearing & Mic tab (2026-09-30, P1-11).
+            self.assertEqual(sw.SCHEMA[key]["tab"], "hearing", key)
             self.assertIn(key, data, msg=f"{key} missing from the template")
         self.assertEqual(
             sw.coerce_value(sw.SCHEMA["AUDIO_FLAP_THRESHOLD"], "4"), 4)
@@ -632,11 +645,16 @@ class DeviceRoundTripTests(unittest.TestCase):
     def test_microphone_index_auto_persists_null(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "user_settings.json")
-            values = sw.default_settings()
+            # A file that pinned a mic: going back to auto must write null
+            # (clear the pin), not leave the stale index behind.
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"MICROPHONE_INDEX": 4}, f)
+            values = sw.load_settings(path)
             values["MICROPHONE_INDEX"] = None  # "System default (auto)"
             sw.save_settings(values, path)
             with open(path, "r", encoding="utf-8") as f:
                 self.assertIsNone(json.load(f)["MICROPHONE_INDEX"])
+            self.assertIsNone(sw.load_settings(path)["MICROPHONE_INDEX"])
 
 
 @unittest.skipUnless(_HAS_TK, "tkinter not available on this runner")

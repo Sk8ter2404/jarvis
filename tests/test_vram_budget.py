@@ -151,6 +151,13 @@ class TotalVramTests(_CacheResetBase):
         with mock.patch.object(vb, "_run", return_value="24576\n8192\n"):
             self.assertEqual(vb.total_vram_mb(force=True), 24576)
 
+    def test_multi_gpu_takes_the_brain_card_whatever_the_slot_order(self):
+        # 2026-09-30 (P1-8): nvidia-smi lists cards in PCI-bus order. With the
+        # 4 GB Whisper card in the first slot the budget used to be drawn
+        # against 4 GB; the brain loads on the big card.
+        with mock.patch.object(vb, "_run", return_value="4096\n24576\n"):
+            self.assertEqual(vb.total_vram_mb(force=True), 24576)
+
     def test_falls_back_to_default_when_absent(self):
         with mock.patch.object(vb, "_run", return_value=None):
             self.assertEqual(vb.total_vram_mb(force=True), vb.DEFAULT_TOTAL_MB)
@@ -171,6 +178,48 @@ class TotalVramTests(_CacheResetBase):
 # ──────────────────────────────────────────────────────────────────────────
 #  predict_budget  — the heart of the estimator
 # ──────────────────────────────────────────────────────────────────────────
+class WhisperDeviceBudgetTests(_CacheResetBase):
+    """2026-09-30 (P1-8): WHISPER_DEVICE=cuda:1 puts Whisper on the 1650
+    SUPER, yet the budget charged its 1.5 GB to the 3090 regardless."""
+
+    _BASE = {"LOCAL_LLM_MODEL": "qwen2.5:14b-instruct-q5_K_M",
+             "MODEL_ROUTING": {"vision": "cloud"},
+             "LOCAL_VISION_FALLBACK": False, "SCREEN_VISION_ENABLED": True}
+
+    def _total(self, dev):
+        s = dict(self._BASE)
+        if dev is not None:
+            s["WHISPER_DEVICE"] = dev
+        return vb.predict_budget(s, total_mb=_CARD_MB)
+
+    def test_second_card_and_cpu_cost_this_card_nothing(self):
+        for dev in ("cuda:1", "CUDA:2", "cpu"):
+            b = self._total(dev)
+            self.assertEqual(b["total_mb"], 13 * 1024, dev)
+            whisper = [c for c in b["components"]
+                       if c["label"].startswith("Whisper")]
+            self.assertEqual(len(whisper), 1, dev)
+            self.assertEqual(whisper[0]["mb"], 0, dev)
+            self.assertTrue(whisper[0].get("elsewhere"), dev)
+
+    def test_main_card_devices_still_count(self):
+        for dev in (None, "auto", "cuda", "cuda:0", "", "cuda:x"):
+            self.assertEqual(self._total(dev)["total_mb"],
+                             13 * 1024 + int(1.5 * 1024), dev)
+
+    def test_text_rendering_names_where_whisper_went(self):
+        lines = vb.budget_lines(dict(self._BASE, WHISPER_DEVICE="cuda:1"),
+                                total_mb=_CARD_MB)
+        self.assertIn("Whisper (on cuda:1, not this card)", lines[1])
+        self.assertNotIn("Whisper (on cuda:1, not this card) 0", lines[1])
+
+    def test_helper(self):
+        self.assertTrue(vb.whisper_on_budget_card("auto"))
+        self.assertTrue(vb.whisper_on_budget_card("cuda:0"))
+        self.assertFalse(vb.whisper_on_budget_card("cuda:1"))
+        self.assertFalse(vb.whisper_on_budget_card("cpu"))
+
+
 class PredictBudgetTests(_CacheResetBase):
     def test_14b_cloud_vision_whisper_fits(self):
         # 14B (13) + Whisper (1.5), vision routed to the cloud (excluded) →
@@ -505,6 +554,9 @@ class GuiBridgeTests(_CacheResetBase):
             "MODEL_ROUTING": {"chat": "local", "vision": "local"},
             "SCREEN_VISION_ENABLED": True,
             "RAG_ENABLED": True,
+            # Pinned: an absent key resolves from the LIVE core.config, and the
+            # owner's own file says cuda:1 (Whisper off this card).
+            "WHISPER_DEVICE": "auto",
             # Unwatched noise keys must be filtered out, not break anything.
             "TTS_VOICE": "en-GB-RyanNeural",
             "KINECT_ENABLED": False,
@@ -539,11 +591,19 @@ class GuiBridgeTests(_CacheResetBase):
         engine computes from the full effective settings, and must be green."""
         import core.config as cfg
         defaults = sw.default_settings()
-        self.assertNotIn("LOCAL_VISION_MODEL", defaults)   # no schema row
+        # LOCAL_VISION_MODEL gained a schema row on 2026-09-30 (P1-6/7); its
+        # default must BE the config default, or a fresh install's panel
+        # would charge a second model the config never loads.
+        self.assertEqual(defaults.get("LOCAL_VISION_MODEL"),
+                         cfg.LOCAL_VISION_MODEL)
         values = sw.resolve_vram_values({}, defaults)
-        # The config fallback resolved the key the document never carries.
         self.assertEqual(values.get("LOCAL_VISION_MODEL"),
                          cfg.LOCAL_VISION_MODEL)
+        # …and a document WITHOUT the key still resolves it from config.
+        without = {k: v for k, v in defaults.items()
+                   if k != "LOCAL_VISION_MODEL"}
+        self.assertEqual(sw.resolve_vram_values({}, without)
+                         .get("LOCAL_VISION_MODEL"), cfg.LOCAL_VISION_MODEL)
         gui = sw.budget_from_live_values(values, total_mb=_CARD_MB)
         full = vb.predict_budget(
             dict(defaults, LOCAL_VISION_MODEL=cfg.LOCAL_VISION_MODEL),
