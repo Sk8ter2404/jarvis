@@ -1,0 +1,151 @@
+"""DIES ON OPEN (R11), wired into the monolith.
+
+THE LIVE SEQUENCE (2026-09-29 19:39-19:59, v2.0.134): the Kinect dropped off
+USB within about a second of every open, and the camera gate's backoff ladder
+reopened it at 30/60/120/300/600 s and then every 10 minutes - a USB
+re-enumeration (and an audio device-list change) each time. The gate now puts
+such a device on a slow retry and says so once (tests/test_camera_gate_dies_
+on_open.py pins the rule). This file pins the WIRING: the owner knob is
+shipped, mirrored in the Settings schema and the template, and read by the
+gate the monolith builds; and the owner's "use the Kinect again"
+(camera_unquarantine) clears the slow retry, not only a culprit quarantine.
+
+Nothing opens a camera or the Kinect: the gate is driven by hand on a frozen
+clock, with a fake device list. Names are synthetic.
+"""
+from __future__ import annotations
+
+import ast
+import json
+import os
+import unittest
+from unittest import mock
+
+from tests._monolith_harness import requires_monolith
+from tests.monolith.test_monolith_camera_storm import _FakeBackend, _StormBase
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_KNOB = "CAMERA_DIES_ON_OPEN_RETRY_S"
+
+
+@requires_monolith
+class DiesOnOpenKnobTests(_StormBase):
+
+    def test_config_ships_it_as_a_float(self):
+        with open(os.path.join(_ROOT, "core", "config.py"),
+                  encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        lits = {}
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and isinstance(node.value,
+                                                           ast.Constant):
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name):
+                        lits[tgt.id] = node.value.value
+        self.assertIs(type(lits.get(_KNOB)), float, _KNOB)
+        self.assertEqual(lits[_KNOB], 1800.0)
+
+    def test_settings_window_and_template_mirror_it(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "jarvis_settings_window_dies_on_open",
+            os.path.join(_ROOT, "tools", "settings_window.py"))
+        sw = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sw)
+        with open(os.path.join(_ROOT, "tools", "user_settings.example.json"),
+                  encoding="utf-8") as fh:
+            example = json.load(fh)
+        self.assertTrue(_KNOB in sw.SCHEMA, f"{_KNOB} is not in the schema")
+        self.assertEqual(sw.SCHEMA[_KNOB]["type"], "float")
+        self.assertEqual(sw.SCHEMA[_KNOB]["default"], 1800.0)
+        self.assertEqual(example.get(_KNOB), 1800.0)
+        self.assertIs(type(example[_KNOB]), float)
+
+    def test_the_gate_the_monolith_builds_reads_it(self):
+        bc = self.bc
+        with mock.patch.object(bc, _KNOB, 900.0, create=True):
+            g = bc._make_camera_gate()
+        self.assertEqual(getattr(g, "dies_on_open_retry_s", None), 900.0)
+        self.assertEqual(getattr(bc._camera_gate, "dies_on_open_retry_s", None),
+                         getattr(bc, _KNOB, None))
+
+
+@requires_monolith
+class UseTheKinectAgainTests(_StormBase):
+    """camera_unquarantine -> camera_gate_lift_quarantine must reach a device
+    on the slow dies-on-open retry, which is not a quarantine."""
+
+    def _dies_on_open(self, g, times: int):
+        for _ in range(times):
+            for _i in range(500):
+                d = g.begin("kinect", "kinect-bridge")
+                if d.allowed:
+                    break
+                self.clock.advance(min(max(0.5, d.wait_s), 60.0))
+            self.assertTrue(d.allowed, d)
+            self.clock.advance(0.3)
+            g.end("kinect", "kinect-bridge", True)
+            g.hold("kinect", "kinect-bridge")
+            self.clock.advance(4.0)
+            g.unhold("kinect", "kinect-bridge")
+            g.note_drop("kinect", "kinect-bridge")
+
+    def test_use_the_kinect_again_clears_the_slow_retry(self):
+        bc = self.bc
+        g = bc._make_camera_gate(clock=self.clock.time)
+        backend = _FakeBackend(self.clock, names=lambda: (
+            "SynthCam One", "Synth Kinect Sensor"))
+        slow = getattr(g, "dies_on_open", lambda *_a: False)
+        with mock.patch.object(bc, "_camera_gate", g, create=True), \
+             mock.patch.object(bc, "_camera_backend", backend), \
+             mock.patch.object(bc, "proactive_announce",
+                               side_effect=lambda m, *a, **k:
+                               self.spoken.append(m) or True), \
+             mock.patch("builtins.print"):
+            self._dies_on_open(g, 3)
+            self.assertTrue(slow("kinect"), "three dies-on-open did not put "
+                                            "the Kinect on the slow retry")
+            self.assertEqual(g.begin("kinect", "kinect-bridge").reason,
+                             "backoff")
+            self.assertEqual(
+                self.spoken,
+                ["The Kinect drops off USB the moment it starts streaming, "
+                 "sir. That is usually its power supply. I'll only retry it "
+                 "every thirty minutes."])
+            self.assertEqual(bc.get_camera_gate_status()["dies_on_open"]
+                             ["kinect"]["label"], "the Kinect")
+            from skills import camera_system
+            with mock.patch.object(camera_system, "_bc", return_value=bc):
+                said = camera_system.camera_unquarantine("kinect")
+            self.assertIn("the Kinect is back in use", said)
+            self.assertFalse(slow("kinect"))
+            self.assertTrue(g.begin("kinect", "kinect-bridge").allowed,
+                            "the owner said to use it again; the slow "
+                            "retry still held it")
+            # Only the owner's words are said back: no second notice.
+            self.assertEqual(len(self.spoken), 1)
+
+    def test_a_webcam_quarantine_lift_is_unchanged(self):
+        bc = self.bc
+        g = bc._make_camera_gate(clock=self.clock.time)
+        g.culprit_threshold = 1
+        backend = _FakeBackend(self.clock)
+        with mock.patch.object(bc, "_camera_gate", g, create=True), \
+             mock.patch.object(bc, "_camera_backend", backend), \
+             mock.patch.object(bc, "proactive_announce", return_value=True), \
+             mock.patch("builtins.print"):
+            g.begin("name:synthcam one", "face-track")
+            g.end("name:synthcam one", "face-track", True)
+            self.clock.advance(0.5)
+            g.note_drop("name:synthcam one", "face-track")
+            g.note_drop("name:synthcam two", "face-track")
+            self.assertTrue(g.quarantined("name:synthcam one"))
+            self.assertEqual(bc.camera_gate_lift_quarantine("kinect"), [])
+            self.assertTrue(g.quarantined("name:synthcam one"))
+            lifted = bc.camera_gate_lift_quarantine("")
+            self.assertEqual(len(lifted), 1)
+            self.assertFalse(g.quarantined("name:synthcam one"))
+
+
+if __name__ == "__main__":   # pragma: no cover
+    unittest.main()

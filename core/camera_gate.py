@@ -64,7 +64,8 @@ reports back through :meth:`CameraGate.end`. The gate refuses when, in order:
              heuristic was wrong 23 of 23 times on 2026-09-29.)
   backoff    this device failed an open or needed a read-failure recovery:
              30 s -> 60 -> 120 -> 300 -> 600 s (cap = max_backoff_s). Reset
-             only after HEALTHY_RESET_S of sustained healthy frames.
+             only after HEALTHY_RESET_S of sustained healthy frames. A device
+             that DIES ON OPEN (below) waits dies_on_open_retry_s instead.
   min-gap    a DIFFERENT component opened this device less than min_gap_s ago.
              (A component's own retries are governed by its backoff, not this.)
   stagger    a DIFFERENT configured device was opened less than OPEN_STAGGER_S
@@ -110,6 +111,32 @@ starts reset the hub 8 of 10 times; its sibling on the same hub, 0 of 10.
              start into a resetting hub is not the thing that reset it.
              Nothing is persisted: a restart (or lift_quarantine) forgets it.
 
+────────────────────────────────────────────────────────────────────────────
+DIES ON OPEN (R11, from the 2026-09-29 19:39-19:59 live log)
+────────────────────────────────────────────────────────────────────────────
+A depth sensor dropped off USB (Kernel-PnP "surprise removed", with its mic
+array) within about a second of EVERY open, and each drop came exactly when
+the backoff ladder let its bridge reopen it: 30, 60, 120, 300, 600 s, then
+every 10 minutes for good. No other device was involved, so the breaker and
+the culprit rule (both about the SHARED bus) never fired. Each reopen cost a
+USB re-enumeration and an audio device-list change for nothing.
+
+  dies-on-open  a full drop whose ONSET is within dies_on_open_window_s
+             (DIES_ON_OPEN_WINDOW_S, 15 s) of that device's last SUCCESSFUL
+             open. A stream that delivers a frame (note_frame) later than the
+             window after its open, or whose drop begins after it, has
+             streamed normally: it is not counted and it ends the run.
+             dies_on_open_count (DIES_ON_OPEN_COUNT, 3) in a row raise the
+             device's reopen hold to dies_on_open_retry_s (owner knob
+             CAMERA_DIES_ON_OPEN_RETRY_S, 30 min; 0 = off), doubling on each
+             further one up to DIES_ON_OPEN_RETRY_MAX_S (60 min), instead of
+             the ladder's 10 min cap. One log line each time it is raised;
+             said ONCE per device per session through ``announce`` (what was
+             seen, what to check). NOT a quarantine: the device is still
+             retried on that slow timer, a reopen that streams normally puts
+             it back on the usual ladder, and lift_quarantine (the owner's
+             "use it again") clears it and allows an open at once.
+
 WHAT IT DELIBERATELY DOES NOT DO: it never closes a stream, never reads a
 frame, never touches a device. It is pure bookkeeping under one lock, with an
 injectable clock, so every rule here is unit-testable on a runner with no
@@ -133,7 +160,8 @@ __all__ = [
     "BACKOFF_STEPS_S", "Decision", "CameraGate", "TIMING_REASONS",
     "HOLD_REASONS", "KIND_CAMERA", "KIND_AUDIO", "minutes_phrase",
     "STORM_PROBATION_S", "REOPEN_PROBATION_S", "CULPRIT_WINDOW_S",
-    "CULPRIT_THRESHOLD",
+    "CULPRIT_THRESHOLD", "DIES_ON_OPEN_WINDOW_S", "DIES_ON_OPEN_COUNT",
+    "DIES_ON_OPEN_RETRY_S", "DIES_ON_OPEN_RETRY_MAX_S",
 ]
 
 # ── the numbers (the three owner knobs are in core/config.py) ──────────────
@@ -175,6 +203,17 @@ CULPRIT_WINDOW_S = 5.0
 # of the session (owner knob CAMERA_CULPRIT_THRESHOLD; 0 = off).
 CULPRIT_THRESHOLD = 2
 CULPRIT_MEMORY_S = 3600.0
+# DIES ON OPEN (R11): a full drop that begins within this long of the device's
+# last successful open means the stream died on arrival (the live case: gone
+# within ~1 s, reported by the stale-stream check ~4-5 s after the open)...
+DIES_ON_OPEN_WINDOW_S = 15.0
+# ...this many of them in a row, with no normal stream in between...
+DIES_ON_OPEN_COUNT = 3
+# ...hold the device's next reopen this long (owner knob
+# CAMERA_DIES_ON_OPEN_RETRY_S; 0 = off), doubling on each further one up to
+# the max (or the knob, when the owner set it higher).
+DIES_ON_OPEN_RETRY_S = 1800.0
+DIES_ON_OPEN_RETRY_MAX_S = 3600.0
 # How often a caller refused as "quarantined" should ask again. Asking costs a
 # dict lookup; the answer only changes when the owner lifts the quarantine.
 QUARANTINE_POLL_S = 600.0
@@ -276,7 +315,8 @@ class CameraGate:
                  a drop, and on every ask for a device in the absent state.
     ``labeler`` - one-argument callable: the SPOKEN name of device ``key``
                  ("the left webcam"). Only called when a device is
-                 quarantined; a fault falls back to a name built from the key.
+                 quarantined or put on the slow dies-on-open retry; a fault
+                 falls back to a name built from the key.
     """
 
     def __init__(self, *, min_gap_s: float = 10.0,
@@ -293,6 +333,9 @@ class CameraGate:
                  probation_s: float = STORM_PROBATION_S,
                  culprit_window_s: float = CULPRIT_WINDOW_S,
                  culprit_threshold: int = CULPRIT_THRESHOLD,
+                 dies_on_open_retry_s: float = DIES_ON_OPEN_RETRY_S,
+                 dies_on_open_window_s: float = DIES_ON_OPEN_WINDOW_S,
+                 dies_on_open_count: int = DIES_ON_OPEN_COUNT,
                  clock: "Callable[[], float] | None" = None,
                  log: "Callable[[str], None] | None" = None,
                  announce: "Callable[[str], None] | None" = None,
@@ -323,6 +366,16 @@ class CameraGate:
             self.culprit_threshold = max(0, int(culprit_threshold))
         except Exception:
             self.culprit_threshold = CULPRIT_THRESHOLD
+        self.dies_on_open_retry_s = self._num(dies_on_open_retry_s,
+                                              DIES_ON_OPEN_RETRY_S)
+        self.dies_on_open_retry_max_s = max(self.dies_on_open_retry_s,
+                                            DIES_ON_OPEN_RETRY_MAX_S)
+        self.dies_on_open_window_s = self._num(dies_on_open_window_s,
+                                               DIES_ON_OPEN_WINDOW_S)
+        try:
+            self.dies_on_open_count = max(1, int(dies_on_open_count))
+        except Exception:
+            self.dies_on_open_count = DIES_ON_OPEN_COUNT
         self._clock = clock or time.time
         self._log = log
         self._announce = announce
@@ -363,6 +416,7 @@ class CameraGate:
             self._wedge_others_released = False
             self._reopen_at = 0.0             # last successful RE-open ...
             self._reopen_key = ""             # ... of a recovering device
+            self._doo_said: set = set()       # keys told "dies on open" (R11)
 
     def _rec(self, key: str) -> dict:
         r = self._dev.get(key)
@@ -378,7 +432,13 @@ class CameraGate:
                  "stream_begin_at": 0.0, "stream_ok_at": 0.0, "opens_ok": 0,
                  "struck_open": -1, "strikes": [], "quarantined": False,
                  "quarantined_at": 0.0, "quarantine_why": "",
-                 "quarantine_label": ""}
+                 "quarantine_label": "",
+                 # dies-on-open bookkeeping (R11): the run length, the
+                 # opens_ok index of the last stream already judged (a drop
+                 # counted, or proven by a late frame), and the slow retry
+                 # interval armed (0.0 = on the normal ladder).
+                 "doo_count": 0, "doo_judged": -1, "doo_retry_s": 0.0,
+                 "doo_until": 0.0}
             self._dev[key] = r
         return r
 
@@ -578,6 +638,67 @@ class CameraGate:
                       f"whenever it starts, so I've stopped using it until "
                       f"it's moved to another port.")
 
+    # ── dies on open (R11) ────────────────────────────────────────────────
+    def _doo_on_locked(self) -> bool:
+        return self.dies_on_open_retry_s > 0.0 and self.dies_on_open_window_s > 0.0
+
+    def _doo_clear_locked(self, key: str, r: dict, why: str,
+                          lines: list) -> None:
+        """End a dies-on-open run: the device streamed normally."""
+        was_slow = r["doo_retry_s"] > 0.0
+        r["doo_count"] = 0
+        r["doo_retry_s"] = 0.0
+        if was_slow:
+            lines.append(
+                f"  [camera-gate] {key}: {why} - it no longer dies on open; "
+                f"back on the normal reopen ladder.")
+
+    def _dies_on_open_locked(self, key: str, r: dict, now: float,
+                             onset: float, lines: list,
+                             spoken: list) -> None:
+        """A FULL drop of ``key`` beginning at ``onset`` was just counted.
+        Judge its stream (once): died on arrival, or streamed normally."""
+        if not self._doo_on_locked() or r["quarantined"]:
+            return
+        ok_at = r["stream_ok_at"]
+        if not ok_at or r["doo_judged"] == r["opens_ok"]:
+            return              # never streamed, or this stream is judged
+        r["doo_judged"] = r["opens_ok"]
+        win = self.dies_on_open_window_s
+        lived = onset - ok_at
+        if lived > win:
+            self._doo_clear_locked(
+                key, r, f"its last stream ran {_fmt_s(lived)} before it "
+                        f"dropped", lines)
+            return
+        r["doo_count"] += 1
+        n = r["doo_count"]
+        if n < self.dies_on_open_count:
+            return
+        retry = min(self.dies_on_open_retry_s
+                    * (2.0 ** (n - self.dies_on_open_count)),
+                    self.dies_on_open_retry_max_s)
+        r["doo_retry_s"] = retry
+        r["hold_until"] = max(r["hold_until"], now + retry)
+        r["doo_until"] = r["hold_until"]
+        label = self._label_for(key)
+        ladder = (f" instead of every {_fmt_s(self.max_backoff_s)}"
+                  if self.max_backoff_s > 0.0 else "")
+        lines.append(
+            f"  [camera-gate] {key} ({label}): its stream died within "
+            f"{max(0.0, lived):.1f}s of opening - {n} opens in a row "
+            f"have died within {win:.0f}s, so it drops off as soon as it "
+            f"starts streaming (check its power supply). Retrying it every "
+            f"{_fmt_s(retry)}{ladder} until a reopen streams past "
+            f"{win:.0f}s; 'use {label} again' retries it now.")
+        if key not in self._doo_said:
+            # ONCE per device per session: a repeat is logged, not spoken.
+            self._doo_said.add(key)
+            spoken.append(f"{label[:1].upper()}{label[1:]} drops off USB the "
+                          f"moment it starts streaming, sir. That is usually "
+                          f"its power supply. I'll only retry it every "
+                          f"{minutes_phrase(retry)}.")
+
     def _evaluate_locked(self, now: float, lines: list, spoken: list) -> None:
         # drops: (t, key, kind, onset); fails: (t, key, onset)
         dw = self.storm_drop_window_s
@@ -688,6 +809,11 @@ class CameraGate:
                                     max(0.5, r["locked_until"] - now)),
                                 f"{', '.join(r['locked_by'])} appears to hold it")
         if r["hold_until"] and now < r["hold_until"]:
+            if r["doo_retry_s"] > 0.0 and r["hold_until"] == r["doo_until"]:
+                return Decision(False, "backoff", r["hold_until"] - now,
+                                f"its last {r['doo_count']} opens each died "
+                                f"within {self.dies_on_open_window_s:.0f}s - "
+                                f"retrying every {_fmt_s(r['doo_retry_s'])}")
             return Decision(False, "backoff", r["hold_until"] - now,
                             f"reopen backoff level {r['level']}")
         if (self.min_gap_s > 0.0 and r["last_open_at"]
@@ -911,6 +1037,19 @@ class CameraGate:
                 r = self._dev.get(key)
                 if r is None:
                     return
+                # DIES ON OPEN (R11): a frame later than the window after
+                # this stream's open proves it streamed normally - once per
+                # stream, and never for a stream whose drop was already
+                # judged (a frame between a drop and the next successful
+                # open belongs to no live stream).
+                if (self._doo_on_locked() and r["stream_ok_at"]
+                        and r["doo_judged"] != r["opens_ok"]
+                        and (now - r["stream_ok_at"])
+                        > self.dies_on_open_window_s):
+                    r["doo_judged"] = r["opens_ok"]
+                    self._doo_clear_locked(
+                        key, r, f"streaming {_fmt_s(now - r['stream_ok_at'])}"
+                                f" after its open", lines)
                 r["dropped"] = False
                 if r["locked_by"]:
                     r["locked_by"] = ()
@@ -939,11 +1078,14 @@ class CameraGate:
         vanished). Counted ONCE per stream per device - a camera failing for a
         minute is one drop, not 600, but a camera REOPENED since (a successful
         end()) that fails again is a new drop. The next open of that device is
-        a RECOVERY and spends a backoff rung.
+        a RECOVERY and spends a backoff rung. A full camera drop whose onset
+        is within dies_on_open_window_s of the device's last successful open
+        also counts toward DIES ON OPEN (the slow retry).
 
         ``onset``  when the trouble STARTED (the first failed read of the
-                   burst), if the caller knows; the culprit window is measured
-                   against it. Clamped to [now - 60 s, now].
+                   burst), if the caller knows; the culprit and dies-on-open
+                   windows are measured against it. Clamped to
+                   [now - 60 s, now].
         ``cause``  a few words for the log line ("read-failure burst").
         ``minor``  ONE failed read, not a burst (a side tile's read that
                    failed once): it still counts toward the two-device storm
@@ -986,6 +1128,12 @@ class CameraGate:
                         cause or ("read failures" if kind == KIND_CAMERA
                                   else "audio endpoint vanished"),
                         bool(gone), lines, spoken, minor=bool(minor))
+                    # DIES ON OPEN (R11): a FULL drop of a device judges the
+                    # stream it ended. One failed read of a camera still on
+                    # the device list is not a dead stream.
+                    if kind == KIND_CAMERA and (gone or not minor):
+                        self._dies_on_open_locked(key, r, now, o,
+                                                  lines, spoken)
             self._emit(lines, spoken)
             return tripped
         except Exception:
@@ -1101,28 +1249,58 @@ class CameraGate:
         except Exception:
             return False if key is not None else {}
 
+    def dies_on_open(self, key: "str | None" = None):
+        """With ``key``: is that device on the slow DIES-ON-OPEN retry? Without:
+        {key: spoken label} of every such device. NEVER raises."""
+        try:
+            with self._lock:
+                if key is not None:
+                    r = self._dev.get(key)
+                    return bool(r and r["doo_retry_s"] > 0.0)
+                return {k: self._label_for(k)
+                        for k, r in self._dev.items() if r["doo_retry_s"] > 0.0}
+        except Exception:
+            return False if key is not None else {}
+
     def lift_quarantine(self, key: str, now: "float | None" = None) -> bool:
-        """The OWNER says a quarantined device may be used again (it has been
-        moved to another port). Clears its strikes too, so it starts from
-        zero. True iff it was quarantined. NEVER raises."""
+        """The OWNER says a device may be used again: a QUARANTINED one (it has
+        been moved to another port) - its strikes are cleared too, so it
+        starts from zero - and/or one on the slow DIES-ON-OPEN retry (its
+        power has been seen to), whose run is cleared and whose long hold is
+        dropped so it may be opened at once. True iff either was lifted.
+        NEVER raises."""
         try:
             now = self._clock() if now is None else now
             lines: list = []
             with self._lock:
                 r = self._dev.get(key)
-                if not (r and r["quarantined"]):
+                if r is None:
                     return False
-                r["quarantined"] = False
-                r["quarantined_at"] = 0.0
-                r["quarantine_why"] = ""
-                r["strikes"] = []
-                r["struck_open"] = r["opens_ok"]
-                lines.append(
-                    f"  [camera-quarantine] {key}: lifted by the owner - it "
-                    f"may be opened again (through the usual gate, one "
-                    f"device at a time).")
+                lifted = False
+                if r["doo_retry_s"] > 0.0 or r["doo_count"]:
+                    slow = r["doo_retry_s"] > 0.0
+                    r["doo_count"] = 0
+                    r["doo_retry_s"] = 0.0
+                    if slow:
+                        lifted = True
+                        r["hold_until"] = 0.0
+                        lines.append(
+                            f"  [camera-gate] {key}: the owner asked to use it "
+                            f"again - the slow dies-on-open retry is cleared; "
+                            f"it may be opened now (through the usual gate).")
+                if r["quarantined"]:
+                    lifted = True
+                    r["quarantined"] = False
+                    r["quarantined_at"] = 0.0
+                    r["quarantine_why"] = ""
+                    r["strikes"] = []
+                    r["struck_open"] = r["opens_ok"]
+                    lines.append(
+                        f"  [camera-quarantine] {key}: lifted by the owner - it "
+                        f"may be opened again (through the usual gate, one "
+                        f"device at a time).")
             self._emit(lines, [])
-            return True
+            return lifted
         except Exception:
             return False
 
@@ -1165,8 +1343,14 @@ class CameraGate:
                         "culprit_strikes": len([
                             t for t in r["strikes"]
                             if (now - t) < CULPRIT_MEMORY_S]),
+                        "dies_on_open": r["doo_count"],
+                        "slow_retry_s": r["doo_retry_s"],
                     }
                 q_keys = [k for k, r in self._dev.items() if r["quarantined"]]
+                slow = {k: {"label": self._label_for(k),
+                            "count": r["doo_count"],
+                            "retry_s": r["doo_retry_s"]}
+                        for k, r in self._dev.items() if r["doo_retry_s"] > 0.0}
                 active = bool(self._storm_until and now < self._storm_until)
                 self._storm_tick_locked(now, lines)
                 probation = self._probation_locked(now)
@@ -1186,9 +1370,10 @@ class CameraGate:
                                       or self._label_for(k)),
                             "why": self._dev[k]["quarantine_why"]}
                         for k in q_keys},
+                    "dies_on_open": slow,
                 }
             self._emit(lines, [])
             return out
         except Exception:
             return {"storm_active": False, "devices": {}, "refusals": {},
-                    "quarantined": {}}
+                    "quarantined": {}, "dies_on_open": {}}

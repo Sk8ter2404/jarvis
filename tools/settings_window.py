@@ -894,6 +894,16 @@ SCHEMA: dict[str, dict] = {
                 "'use the left webcam again' after moving it to another "
                 "port). 0 = never switch one off. Applies on the next start.",
     },
+    "CAMERA_DIES_ON_OPEN_RETRY_S": {
+        "tab": "advanced", "label": "Camera that drops out on every start: retry every (seconds)",
+        "type": "float", "default": 1800.0,
+        "help": "A camera or the Kinect whose video dies within seconds of "
+                "each of three starts in a row (it drops off USB as soon as "
+                "it streams, usually a power problem) is retried only this "
+                "often, doubling to at most an hour, instead of every 10 "
+                "minutes. JARVIS tells you once; 'use the Kinect again' "
+                "retries it now. 0 = off. Applies on the next start.",
+    },
     "CAMERA_OPEN_MIN_GAP_S": {
         "tab": "advanced", "label": "Gap between two parts opening one camera (seconds)",
         "type": "float", "default": 10.0,

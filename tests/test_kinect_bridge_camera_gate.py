@@ -210,6 +210,68 @@ class KinectOpensGoThroughTheGateTests(unittest.TestCase):
         self.assertGreaterEqual(kb._negative_until[0] - kb.time.monotonic(),
                                 kb._SERVICE_RECHECK_S - 1.0)
 
+    def _dies_on_open(self):
+        """The 2026-09-29 19:39-19:59 pattern: the open verifies a frame,
+        then the sensor drops off USB; ~4 s later both streams are stale and
+        the bridge resets its runtime."""
+        rt, err = kb.get_runtime()
+        self.assertIsNotNone(rt, err)
+        self.clock.t += 4.5
+        kb._last_body_frame_at[0] = 1.0
+        kb._last_color_frame_at[0] = 1.0
+        self.assertTrue(kb.reset_if_body_stale(
+            now=1.0 + kb.BODY_STALE_RESET_SEC + 1))
+
+    def test_a_sensor_that_dies_on_every_open_is_retried_slowly(self):
+        """R11: three opens in a row that die within seconds put the sensor on
+        the gate's slow retry (30 min), not the 30/60/120/300/600 s ladder
+        that re-enumerated it every 10 minutes on 2026-09-29; the owner is
+        told once; "use the Kinect again" brings it straight back."""
+        spoken: list = []
+        self.gate = cg.CameraGate(clock=self.clock, log=self.logs.append,
+                                  announce=spoken.append)
+        kb.set_open_gate(self.gate)
+        self._dies_on_open()                   # boot open
+        self._dies_on_open()                   # first recovery: immediate
+        self.clock.t += 31.0                   # the 30 s rung
+        kb._gate_hold_until[0] = 0.0           # ...the bridge re-asks
+        self._dies_on_open()
+        self.assertEqual(len(self.opens), 3)
+        # The old ladder's next rung was 60 s: two minutes on, nothing opens.
+        self.clock.t += 120.0
+        kb._gate_hold_until[0] = 0.0
+        rt, err = kb.get_runtime()
+        self.assertIsNone(rt, "the sensor was reopened 2 min after its third "
+                              "die-on-open")
+        self.assertIn("backoff", err)
+        self.assertIn("each died within 15s", err)
+        self.assertEqual(len(self.opens), 3)
+        self.assertEqual(
+            spoken,
+            ["The Kinect drops off USB the moment it starts streaming, sir. "
+             "That is usually its power supply. I'll only retry it every "
+             "thirty minutes."])
+        # The owner has seen to its power: the lift reaches the sensor at the
+        # bridge's next re-ask (at most a minute away), not in 30 minutes.
+        self.assertLessEqual(kb._gate_hold_until[0] - kb.time.monotonic(),
+                             getattr(kb, "_GATE_REASK_MAX_S", 1e9) + 0.5)
+        self.assertTrue(self.gate.lift_quarantine("kinect"))
+        kb._gate_hold_until[0] = 0.0           # that re-ask comes round
+        rt, err = kb.get_runtime()
+        self.assertIsNotNone(rt, err)
+        self.assertEqual(len(self.opens), 4)
+
+    def test_a_long_refusal_is_re_asked_within_a_minute(self):
+        """A 10-minute storm cool-down (or a 30-minute slow retry) must not be
+        cached for its full length: the owner can lift it early."""
+        self._storm()
+        rt, err = kb.get_runtime()
+        self.assertIsNone(rt)
+        self.assertGreaterEqual(self.gate.retry_in("kinect", "kinect-bridge")[0],
+                                599.0)
+        self.assertLessEqual(kb._gate_hold_until[0] - kb.time.monotonic(), 60.5)
+        self.assertIn("asking again in 60s", err)
+
     def test_without_a_gate_nothing_changes(self):
         kb.set_open_gate(None)
         rt, err = kb.get_runtime()

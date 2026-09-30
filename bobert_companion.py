@@ -761,14 +761,20 @@ def _camera_gate_is_quarantined(key: str) -> bool:
 def camera_gate_lift_quarantine(which: str = "") -> list:
     """Lift the camera gate's session QUARANTINE (a device whose stream start
     kept knocking the USB hub offline) - the owner says it has been moved to
-    another port. ``which`` narrows it ("left", "right", "kinect", or part of
-    a spoken label); empty lifts every quarantined device. Returns the spoken
-    labels lifted. NEVER raises."""
+    another port - and its slow DIES-ON-OPEN retry (R11: a device that drops
+    off USB the moment it starts streaming, retried only every half hour; the
+    owner has seen to its power). ``which`` narrows it ("left", "right",
+    "kinect", or part of a spoken label); empty lifts every such device.
+    Returns the spoken labels lifted. NEVER raises."""
     gate = _camera_gate
     if gate is None:
         return []
     try:
-        benched = gate.quarantined() or {}
+        benched = dict(gate.quarantined() or {})
+        _slow = getattr(gate, "dies_on_open", None)
+        if callable(_slow):
+            for key, label in (_slow() or {}).items():
+                benched.setdefault(key, label)
         want = str(which or "").strip().lower()
         lifted = []
         for key, label in benched.items():
@@ -798,6 +804,7 @@ def _make_camera_gate(clock=None):
             probation_s=CAMERA_STORM_PROBATION_S,
             culprit_window_s=CAMERA_CULPRIT_WINDOW_S,
             culprit_threshold=CAMERA_CULPRIT_THRESHOLD,
+            dies_on_open_retry_s=CAMERA_DIES_ON_OPEN_RETRY_S,
             log=_camera_gate_log,
             announce=_usb_storm_announce,
             # Looked up at CALL time, so the live function is always the one

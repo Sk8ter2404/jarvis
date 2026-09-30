@@ -157,6 +157,12 @@ _GATE_COMPONENT = "kinect-bridge"
 # A refused open is remembered until the gate said to ask again, so the 30 Hz
 # pump does not re-ask every tick. Monotonic, like the negative cache.
 _gate_hold_until = [0.0]
+# ...but for at most this long (R11). The gate's answer can be half an hour or
+# more (a sensor that dies on every open, a doubled storm cool-down), and the
+# owner can lift it early ("use the Kinect again"): asking the gate once a
+# minute costs a dict lookup, and the gate - not this cache - still decides
+# when the sensor is actually opened.
+_GATE_REASK_MAX_S = 60.0
 _GATE_ERR_PREFIX = "Kinect open held by the camera gate"
 # note_frame is a dict update, but the pump runs at 30 Hz; once a second is
 # plenty for a 60 s "sustained healthy" rule.
@@ -672,9 +678,10 @@ def _open_runtime_locked():
         if _open_gate[0] is not None:
             d = _gate_call("begin", _GATE_KEY, _GATE_COMPONENT)
             if d is not None and not d.allowed:
-                _gate_hold_until[0] = time.monotonic() + max(0.5, float(d.wait_s))
+                _ask_in = min(max(0.5, float(d.wait_s)), _GATE_REASK_MAX_S)
+                _gate_hold_until[0] = time.monotonic() + _ask_in
                 return None, (f"{_GATE_ERR_PREFIX} ({d.reason}: {d.detail}); "
-                              f"asking again in {max(0.5, float(d.wait_s)):.0f}s")
+                              f"asking again in {_ask_in:.0f}s")
         opened = False
         try:
             last = None
@@ -2442,7 +2449,10 @@ def reset_if_body_stale(now: Optional[float] = None) -> bool:
     # device DROP to the camera gate (one input to the USB-storm breaker), and
     # the reopen the pump is about to try is a RECOVERY, which spends a backoff
     # rung - so a sensor that keeps dying is reopened at 30/60/120/300/600 s,
-    # not every BODY_STALE_RESET_SEC. Outside _lock: the gate may log.
+    # not every BODY_STALE_RESET_SEC. A sensor that dies within seconds of
+    # EVERY open (R11: it drops off USB as soon as it streams - measured
+    # 2026-09-29) is then put on the gate's slow dies-on-open retry (30 min,
+    # then hourly) and the owner is told once. Outside _lock: the gate may log.
     _gate_call("unhold", _GATE_KEY, _GATE_COMPONENT)
     _gate_call("note_drop", _GATE_KEY, _GATE_COMPONENT)
     # We already nulled the cached cell under the lock; explicitly release the
