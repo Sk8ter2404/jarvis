@@ -229,5 +229,55 @@ class WiredCallableRaisesTests(unittest.TestCase):
             svc.write_hud_state(x=1)
 
 
+
+class DialogueWrapperTests(unittest.TestCase):
+    """The device-dialogue wrappers (2026-09-29) delegate to the dict and
+    degrade to "no dialogue" when unwired."""
+
+    def test_delegates(self):
+        cm = object()
+        u = {
+            "dialogue_ready": mock.MagicMock(return_value=""),
+            "dialogue_session": mock.MagicMock(return_value=cm),
+            "speak_line": mock.MagicMock(return_value="spoken"),
+            "listen_for_stop": mock.MagicMock(return_value="cap"),
+            "local_complete": mock.MagicMock(return_value="{}"),
+            "register_self_voiced": mock.MagicMock(return_value=True),
+            "is_self_voiced": mock.MagicMock(return_value=True),
+        }
+        svc = JarvisServices.from_skill_utils(u)
+        self.assertEqual(svc.dialogue_ready(), "")
+        self.assertIs(svc.dialogue_session("desk device"), cm)
+        u["dialogue_session"].assert_called_with("desk device")
+        svc.dialogue_session("desk device", max_s=20)
+        u["dialogue_session"].assert_called_with("desk device", max_s=20)
+        self.assertEqual(svc.speak_line("Hi.", "wry"), "spoken")
+        u["speak_line"].assert_called_with("Hi.", "wry")
+        until = lambda: True  # noqa: E731
+        self.assertEqual(svc.listen_for_stop(until, beat_s=0.6), "cap")
+        u["listen_for_stop"].assert_called_with(until, beat_s=0.6)
+        self.assertEqual(svc.local_complete("s", [], max_tokens=9), "{}")
+        u["local_complete"].assert_called_with("s", [], max_tokens=9)
+        self.assertTrue(svc.register_self_voiced("x"))
+        self.assertTrue(svc.is_self_voiced("x"))
+
+    def test_unwired_degrades(self):
+        svc = JarvisServices.from_skill_utils({})
+        self.assertEqual(svc.dialogue_ready(), "disabled")
+        with self.assertRaises(RuntimeError):
+            svc.dialogue_session("desk device")
+        self.assertEqual(svc.speak_line("Hi."), "failed")
+        self.assertIsNone(svc.listen_for_stop(lambda: True))
+        self.assertIsNone(svc.local_complete("s", []))
+        self.assertFalse(svc.register_self_voiced("x"))
+        self.assertFalse(svc.is_self_voiced("x"))
+
+    def test_protocol_lists_the_dialogue_methods(self):
+        for name in ("dialogue_ready", "dialogue_session", "speak_line",
+                     "listen_for_stop", "local_complete",
+                     "register_self_voiced", "is_self_voiced"):
+            self.assertTrue(hasattr(JarvisServicesProtocol, name), name)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

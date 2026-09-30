@@ -435,9 +435,19 @@ def _looks_like_lyrics(text: str, onset: float) -> bool:
 
 def _suppress_due_to_state(bc) -> bool:
     """Don't trip auto-standby if JARVIS is already dormant or just played
-    music itself (the player audio is the source bleeding into the mic)."""
+    music itself (the player audio is the source bleeding into the mic).
+
+    Also skip the WHOLE tick (no get_mic_buffer at all) while a device
+    dialogue runs or is in its end tail: its stop-listen owns the mic between
+    lines, and the voices in the room are JARVIS and the device."""
     try:
         if getattr(bc, "_standby_mode")[0] or getattr(bc, "_sleep_mode")[0]:
+            return True
+    except Exception:
+        pass
+    try:
+        gate = getattr(bc, "_dialogue_gate_active", None)
+        if callable(gate) and gate():
             return True
     except Exception:
         pass

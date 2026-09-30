@@ -930,6 +930,57 @@ class RegisterTests(unittest.TestCase):
         self.assertIn("audio_music_status", actions)
         self.assertTrue(callable(actions["audio_music_status"]))
 
+class DialogueGateTests(unittest.TestCase):
+    """While a device dialogue runs (or is in its tail) the standby loop
+    skips the whole tick: no get_mic_buffer at all (2026-09-29)."""
+
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("standby_audio_detect")
+        self.mod._loop_consecutive[0] = 0
+        self.addCleanup(lambda: sys.modules.pop("bobert_companion", None))
+
+    def _bc(self, gate):
+        bc = types.ModuleType("bobert_companion")
+        bc.SAMPLE_RATE = 16000
+        bc._standby_mode = [False]
+        bc._sleep_mode = [False]
+        bc._jarvis_played_music_at = [0.0]
+        bc._dialogue_gate_active = lambda: gate
+        bc.get_mic_buffer = mock.MagicMock(return_value=None)
+        return bc
+
+    def test_suppressed_while_dialogue_gate_active(self):
+        self.assertTrue(self.mod._suppress_due_to_state(self._bc(True)))
+        self.assertFalse(self.mod._suppress_due_to_state(self._bc(False)))
+
+    def test_raising_gate_does_not_suppress(self):
+        bc = self._bc(False)
+
+        def boom():
+            raise RuntimeError("x")
+        bc._dialogue_gate_active = boom
+        self.assertFalse(self.mod._suppress_due_to_state(bc))
+
+    def _one_pass(self, bc):
+        state = {"i": 0}
+
+        def _wait(_interval):
+            state["i"] += 1
+            return state["i"] > 1
+        with inject_modules(bobert_companion=bc), \
+             mock.patch.object(self.mod._loop_stop, "wait", side_effect=_wait):
+            self.mod._background_loop()
+
+    def test_loop_never_captures_during_a_dialogue(self):
+        bc = self._bc(True)
+        self._one_pass(bc)
+        bc.get_mic_buffer.assert_not_called()
+
+    def test_loop_captures_otherwise(self):
+        bc = self._bc(False)
+        self._one_pass(bc)
+        bc.get_mic_buffer.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

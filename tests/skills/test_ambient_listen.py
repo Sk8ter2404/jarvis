@@ -3015,6 +3015,68 @@ class DeviceSpeechTests(_TmpDirMixin, unittest.TestCase):
         bc.proactive_announce.assert_not_called()
         self.assertIn("device speech ignored (desk speaker)", buf.getvalue())
 
+class DialogueHoldTests(_TmpDirMixin, unittest.TestCase):
+    """While a device dialogue runs (core/device_speech_filter
+    dialogue_active), both ambient workers drop their batches BEFORE
+    transcription: nothing is buffered, learned or a wake nudge."""
+
+    def setUp(self):
+        from core import device_speech_filter as dsf
+        self.dsf = dsf
+        dsf._reset_cache_for_tests()
+        self.addCleanup(dsf._reset_cache_for_tests)
+        self.mod, self.actions = load_skill_isolated("ambient_listen")
+        self._redirect_paths()
+        self.mod._buffer.clear()
+        self.mod._last_error = None
+        self.mod._audio_entries_total = 0
+        self.mod._audio_last_error = None
+
+    def _bc(self):
+        bc = _FakeBobert()
+        bc.transcribe = mock.MagicMock(return_value=("hello world",
+                                                     _good_conf()))
+        bc.is_valid_speech = mock.MagicMock(return_value=(True, "ok"))
+        bc.is_ambient_music = mock.MagicMock(return_value=False)
+        bc.AMBIENT_AUDIO_CHUNK_DURATION_SECONDS = 5.0
+        return bc
+
+    def test_helper_follows_the_dialogue_bracket(self):
+        self.assertFalse(self.mod._dialogue_holds_batches())
+        tok = self.dsf.begin_dialogue("desk device")
+        self.assertTrue(self.mod._dialogue_holds_batches())
+        self.dsf.end_dialogue(tok, tail_s=0.0)
+        self.assertFalse(self.mod._dialogue_holds_batches())
+
+    def test_mic_batch_dropped_during_dialogue(self):
+        self.dsf.begin_dialogue("desk device")
+        bc = self._bc()
+        self.mod._wake_pattern = None
+        block = np.ones(16000 * 3, dtype=np.float32) * 0.2
+        MicWorkerLoopTests._run_worker(self, bc, feed_block=block,
+                                       wait_returns=[True])
+        bc.transcribe.assert_not_called()
+        self.assertEqual(len(self.mod._buffer), 0)
+
+    def test_mic_batch_kept_without_dialogue(self):
+        bc = self._bc()
+        self.mod._wake_pattern = None
+        block = np.ones(16000 * 3, dtype=np.float32) * 0.2
+        MicWorkerLoopTests._run_worker(self, bc, feed_block=block,
+                                       wait_returns=[True])
+        bc.transcribe.assert_called_once()
+        self.assertEqual(len(self.mod._buffer), 1)
+
+    def test_loopback_batch_dropped_during_dialogue(self):
+        self.dsf.begin_dialogue("desk device")
+        bc = self._bc()
+        sd = AudioWorkerLoopTests._loopback_sd(self, native_sr=16000)
+        block = np.ones(16000 * 6, dtype=np.float32) * 0.2
+        AudioWorkerLoopTests._run(self, bc, sd=sd, feed_block=block,
+                                  wait_returns=[True])
+        bc.transcribe.assert_not_called()
+        self.assertEqual(self.mod._audio_entries_total, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

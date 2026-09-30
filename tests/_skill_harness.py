@@ -43,6 +43,9 @@ SKILL_UTILS_KEYS = (
     "press_key", "hotkey", "scroll", "sleep", "launch_app", "open_url",
     "write_hud_state", "make_promise", "register_promise_condition",
     "fulfil_promise",
+    # Device dialogues (core/dialogue.py, 2026-09-29).
+    "dialogue_ready", "dialogue_session", "speak_line", "listen_for_stop",
+    "local_complete", "register_self_voiced", "is_self_voiced",
 )
 
 # Top-level module names whose import failure indicates a REAL bug (a broken
@@ -63,6 +66,13 @@ def make_fake_skill_utils(**overrides):
     utils["register_promise_condition"].return_value = None
     utils["fulfil_promise"].return_value = False
     utils["sleep"].return_value = None  # never actually sleep in a test
+    # No dialogue unless a test opts in: the fake reports it disabled.
+    utils["dialogue_ready"].return_value = "disabled"
+    utils["speak_line"].return_value = "failed"
+    utils["listen_for_stop"].return_value = None
+    utils["local_complete"].return_value = None
+    utils["register_self_voiced"].return_value = True
+    utils["is_self_voiced"].return_value = False
     utils.update(overrides)
     return utils
 

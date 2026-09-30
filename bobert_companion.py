@@ -2201,6 +2201,9 @@ def learn_from_turn(user_msg: str, ai_reply: str, memory: dict, *,
     speech can still teach facts but never a topic or a project."""
     if not LEARN_EVERY_TURN:
         return
+    # Nothing heard during a device dialogue (or its tail) is learned.
+    if _dialogue_gate_active():
+        return
     with _learn_lock:
         _learn_pending.append((user_msg, ai_reply, bool(owner_directed), conf))
         if _learn_worker_live[0]:
@@ -2631,6 +2634,8 @@ def _ambient_learn_from_gated(text: str, memory: dict,
     a no-op when off. NEVER raises — a learning hiccup must not break the gate's
     drop-and-continue."""
     if not AMBIENT_LISTEN_ENABLED:
+        return
+    if _dialogue_gate_active():
         return
     try:
         snippet = (text or "").strip()
@@ -13365,6 +13370,9 @@ def should_be_proactive() -> bool:
     """Decide whether to fire a proactive comment right now."""
     if not PROACTIVE_ENABLED:
         return False
+    # A running device dialogue, or the quiet hold after one.
+    if _dialogue_active[0] or _speech_hold_active():
+        return False
 
     # FOCUS / DO-NOT-DISTURB gate. Spontaneous proactive comments take the
     # should_be_proactive() → _do_proactive_turn() → _speak() path, which
@@ -15247,8 +15255,14 @@ def _get_mic_buffer_impl(seconds: float,
     # opened anyway: -9999 'A device ID has been used that is out of range'
     # [MME error 2], live 15:24:59.
     _pathb_dev = get_input_device()
+    # deny_if also covers a Path-B capture ALREADY live (2026-09-29): a
+    # boolean claim does not look at its own cell, so two concurrent Path-B
+    # callers (the standby loop + a skill's capture) both opened a stream on
+    # the same WASAPI device, and the first one's release cleared the flag
+    # while the other stream was still live.
     if not _pa_claim_owner(_pathb_mic_active,
-                           deny_if=lambda: bool(_record_speech_active[0])):
+                           deny_if=lambda: bool(_record_speech_active[0]
+                                                or _pathb_mic_active[0])):
         return None
     try:
         # 2026-05-29 silent-crash fix: avoid `with sd.InputStream(...)`. Open the
@@ -20060,6 +20074,12 @@ _tts_current_text: list[str] = [""]
 # sentence player checks before every chunk) -- otherwise a stop that landed
 # between two sentences was refused and the rest of the reply played on.
 _tts_reply_active: list[bool] = [False]
+# True while a device dialogue (skill_utils "dialogue_session", core/dialogue)
+# is running. request_tts_interrupt treats it like live playback: a STOP, a
+# wake hit or the dialogue's own stop() between two lines (while the DEVICE is
+# talking and JARVIS is silent) must still be accepted, so the dialogue sees
+# the seq move and ends. Set/cleared only by _dialogue_session.
+_dialogue_active: list[bool] = [False]
 
 
 def _barge_in_wake_enabled() -> bool:
@@ -20111,7 +20131,8 @@ def request_tts_interrupt(source: str = "wake-word",
       * TTS playback isn't actually live (nothing to interrupt — the normal
         wake path should proceed unchanged); the silent gap between two
         sentences of a per-sentence reply (_tts_reply_active) counts as
-        live, or
+        live, and so does a running device dialogue (_dialogue_active: the
+        device may be talking while JARVIS is silent), or
       * the sentence currently being spoken contains "jarvis" — the
         echo-safety gate. The mic hears the speakers, so an engine hit
         during a self-referential sentence is treated as JARVIS's own voice
@@ -20136,7 +20157,8 @@ def request_tts_interrupt(source: str = "wake-word",
     can no longer stall the main loop (2026-08 barge-in-stall fix)."""
     if acoustic and not _barge_in_wake_enabled():
         return False
-    if not (_tts_playback_active[0] or _tts_reply_active[0]):
+    if not (_tts_playback_active[0] or _tts_reply_active[0]
+            or _dialogue_active[0]):
         return False
     if (not acoustic
             and (time.time() - _session_start_time) < _BOOT_BARGE_IN_GRACE_S):
@@ -25800,6 +25822,15 @@ skill_utils = {
     "make_promise":     (lambda *a, **kw: _promises.make_promise(*a, **kw)) if _promises else (lambda *a, **kw: None),
     "register_promise_condition": (lambda *a, **kw: _promises.register_condition(*a, **kw)) if _promises else (lambda *a, **kw: None),
     "fulfil_promise":   (lambda pid: _promises.fulfil_promise(pid)) if _promises else (lambda pid: False),
+    # Device dialogues (core/dialogue.py; see the DEVICE DIALOGUES block).
+    # Feature-detect these keys: an older JARVIS simply lacks them.
+    "dialogue_ready":   lambda: _dialogue_ready(),
+    "dialogue_session": lambda *a, **kw: _dialogue_session(*a, **kw),
+    "speak_line":       lambda *a, **kw: _speak_line(*a, **kw),
+    "listen_for_stop":  lambda *a, **kw: _listen_for_stop(*a, **kw),
+    "local_complete":   lambda *a, **kw: _local_complete(*a, **kw),
+    "register_self_voiced": lambda n: register_self_voiced(n),
+    "is_self_voiced":   lambda n: is_self_voiced(n),
 }
 
 # M2 Phase 1 (2026-06-02): typed capability seam. JarvisServices wraps the
@@ -25855,10 +25886,59 @@ def _collect_skill_prompt_examples(mod, name: str) -> None:
         pass
 
 
+# SELF-VOICED actions (2026-09-29): an action that does ALL of its own talking
+# (a device dialogue speaks every line itself, inside the action). When every
+# action of a reply is self-voiced, the main path speaks nothing else for it:
+# no inline prose, no answer-first / quip layer, no verbatim result, no
+# follow-up round (a result is never "informative" nor a "failure" to report).
+# Declared by a skill as a module-level SELF_VOICED_ACTIONS iterable (collected
+# below) or at run time with skill_utils["register_self_voiced"](name). The
+# set is DISJOINT from the two speak sets above: an overlap is refused.
+SELF_VOICED_ACTIONS: set[str] = set()
+
+
+def register_self_voiced(name: str) -> bool:
+    """Mark action ``name`` self-voiced (see SELF_VOICED_ACTIONS). False for a
+    blank name or one already in the verbatim / informative speak set."""
+    try:
+        n = str(name or "").strip()
+        if not n:
+            return False
+        if (n in SPEAK_RESULT_VERBATIM_ACTIONS or n in INFORMATIVE_ACTIONS
+                or n.lower() in SPEAK_RESULT_VERBATIM_ACTIONS
+                or n.lower() in INFORMATIVE_ACTIONS):
+            print("  [skill] REFUSED self-voiced routing for an action "
+                  "already in a speak set; the sets must stay disjoint")
+            return False
+        SELF_VOICED_ACTIONS.add(n.lower())
+        return True
+    except Exception:
+        return False
+
+
+def is_self_voiced(name) -> bool:
+    """True when action ``name`` does all of its own talking."""
+    try:
+        return str(name or "").strip().lower() in SELF_VOICED_ACTIONS
+    except Exception:
+        return False
+
+
+def _all_self_voiced(action_results) -> bool:
+    """True when ``action_results`` is non-empty and every action in it is
+    self-voiced (the reply's only job was to run them)."""
+    try:
+        return bool(action_results) and all(
+            is_self_voiced(r[0]) for r in action_results)
+    except Exception:
+        return False
+
+
 # Speak-set memberships contributed by skills at load time. A skill may define
-# a module-level ``SPEAK_VERBATIM_ACTIONS`` and/or ``INFORMATIVE_ACTIONS``
-# iterable of action names; the loader folds them into the two global sets so
-# the skill's own results are voiced.
+# a module-level ``SPEAK_VERBATIM_ACTIONS``, ``INFORMATIVE_ACTIONS`` and/or
+# ``SELF_VOICED_ACTIONS`` iterable of action names; the loader folds them into
+# the global sets so the skill's own results are voiced (or, self-voiced, left
+# alone).
 #
 # This exists for the GITIGNORED personal skills (vip_boss_mode, trip_planner,
 # vip_intercept, ...), the same reason _SKILL_PROMPT_EXAMPLES above exists.
@@ -25871,9 +25951,9 @@ def _collect_skill_prompt_examples(mod, name: str) -> None:
 # and an underscore), so the gate reported OK over a real leak. Declaring
 # the membership inside the private skill keeps the private name private.
 #
-# Fail-loud, never silent: the two sets must stay DISJOINT (there is a test for
+# Fail-loud, never silent: the sets must stay DISJOINT (there is a test for
 # it), so a name a skill tries to route into one set while it already sits in
-# the other is REFUSED and logged rather than silently corrupting the routing.
+# another is REFUSED and logged rather than silently corrupting the routing.
 # Counts only in the log -- the names are the sensitive part, and load_skills
 # already echoes registrations separately.
 def _collect_skill_speak_sets(mod, name: str) -> None:
@@ -25882,9 +25962,13 @@ def _collect_skill_speak_sets(mod, name: str) -> None:
     reported and skipped, never fatal to skill loading."""
     for attr, target, other, label in (
             ("SPEAK_VERBATIM_ACTIONS", SPEAK_RESULT_VERBATIM_ACTIONS,
-             INFORMATIVE_ACTIONS, "verbatim"),
+             (INFORMATIVE_ACTIONS, SELF_VOICED_ACTIONS), "verbatim"),
             ("INFORMATIVE_ACTIONS", INFORMATIVE_ACTIONS,
-             SPEAK_RESULT_VERBATIM_ACTIONS, "informative")):
+             (SPEAK_RESULT_VERBATIM_ACTIONS, SELF_VOICED_ACTIONS),
+             "informative"),
+            ("SELF_VOICED_ACTIONS", SELF_VOICED_ACTIONS,
+             (SPEAK_RESULT_VERBATIM_ACTIONS, INFORMATIVE_ACTIONS),
+             "self-voiced")):
         try:
             declared = getattr(mod, attr, None)
             if not declared or isinstance(declared, (str, bytes)):
@@ -25895,7 +25979,9 @@ def _collect_skill_speak_sets(mod, name: str) -> None:
                 if not isinstance(_an, str) or not _an.strip():
                     continue
                 _an = _an.strip()
-                if _an in other:
+                if target is SELF_VOICED_ACTIONS:
+                    _an = _an.lower()
+                if any(_an in o or _an.lower() in o for o in other):
                     refused.append(_an)
                     continue
                 if _an not in target:
@@ -25906,7 +25992,7 @@ def _collect_skill_speak_sets(mod, name: str) -> None:
                       f"{label} speak set")
             if refused:
                 print(f"  [skill] {name}: REFUSED {label} routing for "
-                      f"{len(refused)} action(s) already in the other speak "
+                      f"{len(refused)} action(s) already in another speak "
                       f"set — the sets must stay disjoint; fix the skill")
         except Exception as _sse:
             print(f"  [skill] {name}: {attr} could not be applied: {_sse}")
@@ -27240,6 +27326,8 @@ def _joke_fallback_line(spoken: str, user_text: str, raw_reply: str = "") -> str
         return ""
     print("  [joke-fallback] reply refused a joke request — speaking a "
           "bundled one-liner instead")
+    # The "JARVIS:" line above is the model's reply; this is what was SAID.
+    print(f"  JARVIS (spoken): {joke}")
     try:
         if raw_reply:
             for msg in reversed(conversation_history):
@@ -27267,6 +27355,8 @@ def _advice_fallback_line(spoken: str, user_text: str, raw_reply: str = "") -> s
         return ""
     print("  [advice-fallback] reply dodged a request for a suggestion — "
           "speaking a suggestion instead")
+    # The "JARVIS:" line above is the model's reply; this is what was SAID.
+    print(f"  JARVIS (spoken): {out}")
     try:
         if raw_reply:
             for msg in reversed(conversation_history):
@@ -30130,6 +30220,656 @@ _processing_filler = _pf_mod.ProcessingFiller(
 )
 
 
+# ──────────────────────────────────────────────────────────────────────────
+#  DEVICE DIALOGUES (core/dialogue.py) — the generic hooks a skill uses to run
+#  a short scripted back-and-forth between JARVIS and a talking device.
+#  skill_utils: "dialogue_ready", "dialogue_session", "speak_line",
+#  "listen_for_stop", "local_complete", "register_self_voiced",
+#  "is_self_voiced". Rules that must hold:
+#    * one dialogue at a time; it runs synchronously inside the skill's
+#      action, so the main loop does not listen while it runs;
+#    * a mic stream is open ONLY inside _listen_for_stop, which runs on the
+#      caller's thread between a device line and JARVIS's next line, and is
+#      closed and released before it returns; it is refused while any
+#      playback, reply, other Path-B capture, record_speech or ambient stream
+#      is live, and _speak_line never plays over a live capture;
+#    * handle.stop() is safe from ANY thread (a flag + the non-acoustic
+#      request_tts_interrupt, which is only an Event set and a seq bump), so a
+#      device watcher can cut JARVIS mid-line;
+#    * while the dialogue runs (and for its 4 s tail) the standby loop, the
+#      ambient daemon and both learners hold still (_dialogue_gate_active);
+#    * transcripts heard by the stop-listen are never logged or learned.
+# ──────────────────────────────────────────────────────────────────────────
+import contextlib  # noqa: E402
+from core import dialogue as _dlg  # noqa: E402
+
+_DIALOGUE_TAIL_S = 4.0
+_dialogue_lock = threading.Lock()
+_dialogue_current: list = [None]          # the active _DialogueHandle or None
+# Post-dialogue quiet holds (monotonic deadlines), set at session exit by
+# handle.hold_after(): proactive speech waits (queued items stay queued) and
+# non-wake mic turns are dropped until they pass.
+_speech_hold_until: list = [0.0]
+_turn_hold_until: list = [0.0]
+_turn_hold_reason: list = [""]
+
+
+class DialogueUnavailable(RuntimeError):
+    """Raised by _dialogue_session() on enter; ``.reason`` is one of the
+    _dialogue_ready() reasons."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = str(reason)
+
+
+def _dialogue_gate_active() -> bool:
+    """True while a dialogue runs or is in its end tail: the other listeners
+    (standby loop, ambient daemon, learners) hold still. Never raises."""
+    try:
+        if _dialogue_active[0]:
+            return True
+        from core import device_speech_filter as _dsf
+        return bool(_dsf.dialogue_active())
+    except Exception:
+        return False
+
+
+def _speech_hold_active() -> bool:
+    try:
+        return time.monotonic() < float(_speech_hold_until[0])
+    except Exception:
+        return False
+
+
+def _dialogue_hold_ignored(text: str, injected: bool = False) -> bool:
+    """True when a mic transcript must be dropped because a post-dialogue turn
+    hold is on (see handle.hold_after). A wake-prefixed utterance and every
+    typed / injected turn pass. Logs the reason only, never the text."""
+    try:
+        if injected:
+            return False
+        if time.monotonic() >= float(_turn_hold_until[0]):
+            return False
+        if _WAKE_RE.search((text or "").lower()):
+            return False
+        print(f"  [dialogue-hold] ignored ({_turn_hold_reason[0] or 'hold'})")
+        return True
+    except Exception:
+        return False
+
+
+def _dialogue_ready() -> str:
+    """"" when a device dialogue may start now, else why not: disabled,
+    staging, boot_grace, tts_muted, mic_muted, sleep, realtime_voice or
+    active. Never raises ("error" on an internal failure)."""
+    try:
+        if not globals().get("DIALOGUE_ENABLED", True):
+            return "disabled"
+        if _is_staging():
+            return "staging"
+        # Non-acoustic stops (tray, the dialogue's own stop) are refused by
+        # request_tts_interrupt during the boot grace, so no dialogue then.
+        if (time.time() - _session_start_time) < _BOOT_BARGE_IN_GRACE_S:
+            return "boot_grace"
+        if _tts_muted[0]:
+            return "tts_muted"
+        if _mic_muted[0] or _mic_input_disabled():
+            return "mic_muted"
+        if _sleep_mode[0] or _standby_mode[0]:
+            return "sleep"
+        if _realtime_session[0] is not None:
+            return "realtime_voice"
+        if _dialogue_active[0] or _dialogue_current[0] is not None:
+            return "active"
+        return ""
+    except Exception:
+        return "error"
+
+
+class _DialogueHandle:
+    """What ``with skill_utils["dialogue_session"](...) as ds`` yields."""
+
+    def __init__(self, source: str, max_s: float):
+        self.source = str(source or "device")
+        self.max_s = max(1.0, float(max_s))
+        self._t0 = time.monotonic()
+        self._lock = threading.Lock()
+        self._reason = None
+        self._seq0 = _tts_interrupt_seq[0]
+        self._hold_s = 0.0
+        self._hold_reason = ""
+        self._dsf_token = 0
+        # Set by _dialogue_session's exit. A stop() arriving later (a slow
+        # stop-listen verdict, a late device watcher) must never cut an
+        # UNRELATED reply that is playing by then.
+        self._closed = False
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self._t0
+
+    def stopped(self):
+        """The reason this dialogue must end, or None: the skill's own stop()
+        reason first, then an accepted interrupt (tray / web STOP, a wake
+        hit), Mute TTS, Mute Mic, sleep, and the max_s cap."""
+        if self._reason:
+            return self._reason
+        try:
+            if _tts_interrupt_seq[0] != self._seq0:
+                return "interrupted"
+            if _tts_muted[0]:
+                return "tts_muted"
+            if _mic_muted[0]:
+                return "mic_muted"
+            if _sleep_mode[0]:
+                return "sleep"
+        except Exception:
+            pass
+        if self.elapsed() > self.max_s:
+            return "expired"
+        return None
+
+    def stop(self, reason: str = "interrupted") -> bool:
+        """End the dialogue from ANY thread; cuts JARVIS mid-line when he is
+        speaking. True for the first stop, False when already stopped or
+        when the session has already ended (then nothing is interrupted)."""
+        # The interrupt is requested INSIDE the lock so it is atomic with
+        # _close(): once the session has ended no stop can reach the speakers.
+        # request_tts_interrupt takes no lock (an Event set + a seq bump).
+        with self._lock:
+            if self._reason or self._closed:
+                return False
+            self._reason = str(reason or "interrupted")
+            try:
+                request_tts_interrupt(source=f"dialogue:{self._reason}",
+                                      acoustic=False)
+            except Exception:
+                pass
+        return True
+
+    def _close(self) -> None:
+        """Mark the session ended (see _closed). Called once by the exit."""
+        with self._lock:
+            self._closed = True
+
+    def hold_after(self, seconds: float, reason: str = "") -> None:
+        """At session exit, hold proactive speech and non-wake mic turns for
+        ``seconds`` (the longest request wins)."""
+        try:
+            s = max(0.0, float(seconds))
+        except Exception:
+            return
+        with self._lock:
+            late = self._closed
+            if not late and s > self._hold_s:
+                self._hold_s = s
+                self._hold_reason = str(reason or "")
+        if late and s > 0:
+            # The session already ended (a watcher raced the exit): apply the
+            # hold from now instead of losing it.
+            _apply_dialogue_hold(s, str(reason or ""))
+
+    def handoff_turn(self, text: str) -> bool:
+        """Reserved for a later release (hand an owner reply heard inside a
+        dialogue to the main loop). Not available yet: always False."""
+        return False
+
+
+def _apply_dialogue_hold(seconds: float, reason: str = "") -> None:
+    """Hold proactive speech and non-wake mic turns for ``seconds`` from now
+    (an existing longer hold is kept). Never raises."""
+    try:
+        until = time.monotonic() + max(0.0, float(seconds))
+        _speech_hold_until[0] = max(float(_speech_hold_until[0]), until)
+        _turn_hold_until[0] = max(float(_turn_hold_until[0]), until)
+        _turn_hold_reason[0] = str(reason or "") or "dialogue"
+        print(f"  [dialogue] holding speech and non-wake turns for "
+              f"{float(seconds):.0f}s ({_turn_hold_reason[0]})")
+    except Exception:
+        pass
+
+
+@contextlib.contextmanager
+def _dialogue_session(source: str = "device", max_s: float | None = None):
+    """Context manager for one device dialogue. Raises DialogueUnavailable
+    (reason) on enter when _dialogue_ready() refuses. On enter: cancels the
+    processing filler, opens the device-speech-filter dialogue bracket and
+    sets _dialogue_active. On exit, ALWAYS: clears the flag, ends the bracket
+    with its 4 s tail, applies any hold_after() and schedules the local
+    re-prime (the script call replaced the model's one-slot cache)."""
+    if max_s is None:
+        max_s = globals().get("DIALOGUE_MAX_S", 40)
+    reason = _dialogue_ready()
+    if reason:
+        raise DialogueUnavailable(reason)
+    with _dialogue_lock:
+        if _dialogue_current[0] is not None:
+            raise DialogueUnavailable("active")
+        h = _DialogueHandle(source, max_s)
+        _dialogue_current[0] = h
+    try:
+        try:
+            _processing_filler.cancel("dialogue")
+        except Exception:
+            pass
+        try:
+            from core import device_speech_filter as _dsf
+            h._dsf_token = _dsf.begin_dialogue(h.source,
+                                               max_s=h.max_s + 10.0)
+        except Exception:
+            h._dsf_token = 0
+        _dialogue_active[0] = True
+        print("  [dialogue] started")
+        yield h
+    finally:
+        h._close()
+        _dialogue_active[0] = False
+        # A stop accepted while only the DEVICE was talking set the interrupt
+        # Event with no playback to consume it; drop it the way _speak's own
+        # finally drops one that raced the end of playback, so it cannot
+        # linger into the next utterance.
+        try:
+            if not (_tts_playback_active[0] or _tts_reply_active[0]):
+                _tts_interrupt.clear()
+        except Exception:
+            pass
+        with _dialogue_lock:
+            if _dialogue_current[0] is h:
+                _dialogue_current[0] = None
+        try:
+            from core import device_speech_filter as _dsf
+            _dsf.end_dialogue(h._dsf_token, tail_s=_DIALOGUE_TAIL_S)
+        except Exception:
+            pass
+        if h._hold_s > 0:
+            _apply_dialogue_hold(h._hold_s, h._hold_reason)
+        try:
+            _reprime_after_background("dialogue")
+        except Exception:
+            pass
+        print(f"  [dialogue] ended ({h._reason or 'done'}, "
+              f"{h.elapsed():.1f}s)")
+
+
+def _speak_line(text: str, mood: str | None = None) -> str:
+    """Speak one dialogue line. Returns "spoken", "interrupted" (an accepted
+    interrupt landed during it), "muted", "failed" or "staging".
+
+    Inside a dialogue it first waits (bounded, 1 s) for a stop-listen capture
+    to release the mic — it never plays over a live capture — and a stop()
+    that lands after this line began is re-asserted once playback is live,
+    so the line is cut even when the stop raced the start of playback."""
+    if _is_staging():
+        return "staging"
+    if _tts_muted[0]:
+        return "muted"
+    h = _dialogue_current[0] if _dialogue_active[0] else None
+    if h is not None:
+        deadline = time.monotonic() + 1.0
+        while _pathb_mic_active[0] and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if _pathb_mic_active[0]:
+            print("  [dialogue] mic capture still live; line not spoken")
+            return "failed"
+    # Read the stop state BEFORE the seq snapshot: a stop() landing between
+    # the two then always leaves stop_at_entry False, so the recut below
+    # covers it (reading them the other way round let a stop that bumped the
+    # seq before the snapshot play the whole line uncut).
+    stop_at_entry = h is not None and h._reason is not None
+    seq0 = _tts_interrupt_seq[0]
+    done_evt = threading.Event()
+    if h is not None and not stop_at_entry:
+        def _recut():
+            fired = False
+            while not done_evt.wait(0.05):
+                # Any stop after entry cuts this line. Re-asserted once, only
+                # while playback is live and the cut is not already pending
+                # (the play path clears a stop that raced its start).
+                if (not fired and h._reason is not None
+                        and _tts_playback_active[0]
+                        and not _tts_interrupt.is_set()):
+                    fired = True
+                    request_tts_interrupt(source="dialogue:recut",
+                                          acoustic=False)
+        try:
+            threading.Thread(target=_recut, name="dialogue-recut",
+                             daemon=True).start()
+        except Exception:
+            pass
+    try:
+        ok = _speak(text, mood=mood)
+    except Exception:
+        ok = False
+    finally:
+        done_evt.set()
+    if _tts_interrupt_seq[0] != seq0:
+        return "interrupted"
+    if h is not None and not stop_at_entry and h._reason is not None:
+        return "interrupted"       # stopped while this line was under way
+    if ok is None:
+        if _tts_muted[0]:
+            return "muted"
+        if _is_staging():
+            return "staging"
+        return "failed"
+    return "spoken" if ok else "failed"
+
+
+def _stop_listen_capture_denied() -> bool:
+    """deny_if for the stop-listen's Path-B claim (evaluated under _mic_lock):
+    never while another mic stream, playback or a reply is live."""
+    return bool(_pathb_mic_active[0] or _record_speech_active[0]
+                or _tts_playback_active[0] or _tts_reply_active[0]
+                or _ambient_stream_active[0] > 0)
+
+
+def _stop_listen_must_yield() -> bool:
+    """While the stop-listen's OWN stream is open: another thread began
+    playback, a reply or record_speech, so the capture closes now."""
+    return bool(_tts_playback_active[0] or _tts_reply_active[0]
+                or _record_speech_active[0])
+
+
+def _collect_frames(get_frame, until, beat_s: float, max_s: float,
+                    yield_if=None):
+    """Pull frames until ``until()`` is true plus ``beat_s``, or ``max_s``, or
+    the dialogue was stopped, or ``yield_if()`` is true (another thread
+    started playback / record_speech: an OWN stream then closes at once, so
+    no capture stream is ever open while JARVIS plays). Returns (frames,
+    index of the first frame after until() became true)."""
+    frames: list = []
+    t0 = time.monotonic()
+    done_at = None
+    beat_idx = None
+    h = _dialogue_current[0]
+    while True:
+        now = time.monotonic()
+        if now - t0 >= max_s:
+            break
+        if yield_if is not None:
+            try:
+                if yield_if():
+                    break
+            except Exception:
+                break
+        if done_at is None:
+            try:
+                is_done = bool(until())
+            except Exception:
+                is_done = True
+            if is_done:
+                done_at = now
+                beat_idx = len(frames)
+        if done_at is not None and now - done_at >= beat_s:
+            break
+        if h is not None and h._reason is not None:
+            break
+        f = get_frame(0.1)
+        if f is not None:
+            frames.append(f)
+    return frames, (len(frames) if beat_idx is None else beat_idx)
+
+
+def _voiced(audio) -> bool:
+    """Voice energy in ``audio``: the loudest 50 ms window's RMS above
+    WHISPER_TRUST_RMS."""
+    try:
+        if audio is None or audio.size == 0:
+            return False
+        win = max(1, int(SAMPLE_RATE * 0.05))
+        n = (audio.size // win) * win
+        if n == 0:
+            return float(np.sqrt(np.mean(audio * audio))) > WHISPER_TRUST_RMS
+        rms = np.sqrt(np.mean(audio[:n].reshape(-1, win) ** 2, axis=1))
+        return float(rms.max()) > WHISPER_TRUST_RMS
+    except Exception:
+        return False
+
+
+def _classify_stop_text(text: str) -> str:
+    """"stop" / "wake" / "" (the device's own line) / "speech"."""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    kind = _dlg.is_stop_utterance(t, WAKE_PHRASES)
+    if kind:
+        return kind
+    if _WAKE_RE.search(t.lower()):
+        return "wake"
+    try:
+        from core import device_speech_filter as _dsf
+        if _dsf.match(t, never_match=(set(WAKE_PHRASES) | set(SLEEP_PHRASES)),
+                      wake_phrases=WAKE_PHRASES):
+            return ""
+    except Exception:
+        pass
+    return "speech"
+
+
+def _stop_listen_worker(cap, audio, beat, beat_voiced: bool, h) -> None:
+    """Transcribe the capture (and its beat on its own when it held voice),
+    classify, publish on ``cap`` and stop the dialogue on stop / wake. The
+    transcript is never printed, stored or learned."""
+    kind, text = "", ""
+    try:
+        whole, _ = transcribe(audio)
+        kind = _classify_stop_text(whole)
+        text = whole
+        if kind in ("", "speech") and beat_voiced and beat is not None \
+                and beat.size > 0:
+            b_text, _ = transcribe(beat)
+            b_kind = _classify_stop_text(b_text)
+            if b_kind in ("stop", "wake"):
+                kind, text = b_kind, ""
+    except Exception:
+        kind, text = "", ""
+    if kind in ("stop", "wake") and h is not None:
+        print(f"  [dialogue] {'stop' if kind == 'stop' else 'wake word'} heard")
+        h.stop("owner_stop" if kind == "stop" else "wake")
+    cap.set_result(kind, text if kind == "speech" else "")
+
+
+def _listen_for_stop(until, *, beat_s: float | None = None,
+                     max_s: float = 12.0):
+    """The dialogue's stop-listen: a SYNCHRONOUS capture on the caller's
+    thread while the device talks, until ``until()`` is true plus ``beat_s``
+    (or ``max_s``). The stream is closed and its owner released BEFORE this
+    returns; transcription runs on a daemon worker and publishes on the
+    returned core.dialogue.ListenCapture. A stop word / phrase calls the
+    active handle's stop("owner_stop"), the wake word stop("wake").
+
+    Path A: taps the wake listener's stream when it runs (no new stream).
+    Otherwise a Path-B style claim of _pathb_mic_active that is DENIED while
+    playback, a reply, another Path-B capture, record_speech or an ambient
+    stream is live. Refused (available=False) outside an active dialogue,
+    with the mic muted / disabled, in staging or with DIALOGUE_STOP_LISTEN
+    off. Never raises."""
+    try:
+        h = _dialogue_current[0]
+        if (h is None or not _dialogue_active[0]
+                or not globals().get("DIALOGUE_STOP_LISTEN", True)
+                or _mic_muted[0] or _mic_input_disabled() or _is_staging()):
+            return _dlg.ListenCapture.unavailable()
+        if beat_s is None:
+            beat_s = globals().get("DIALOGUE_BEAT_S", 0.6)
+        beat_s = max(0.0, float(beat_s))
+        max_s = max(0.5, float(max_s))
+        sr = int(SAMPLE_RATE)
+        frames: list = []
+        beat_idx = 0
+        wl = sys.modules.get("skill_wake_listener")
+        det = getattr(wl, "_detector", None) if wl is not None else None
+        if (det is not None and getattr(det, "is_running", lambda: False)()
+                and int(getattr(det, "sample_rate", 0)) == sr
+                and hasattr(det, "add_tap")):
+            tap_q: queue.Queue = queue.Queue()
+            det.add_tap(tap_q)
+            try:
+                def _get(t):
+                    try:
+                        return tap_q.get(timeout=t)
+                    except queue.Empty:
+                        return None
+                frames, beat_idx = _collect_frames(_get, until, beat_s, max_s)
+            finally:
+                det.remove_tap(tap_q)
+        else:
+            q_local: queue.Queue = queue.Queue()
+
+            def _cb(indata, frames_n, time_info, status):  # noqa: ARG001
+                mono = indata[:, 0] if indata.ndim > 1 else indata
+                q_local.put(mono.astype(np.float32, copy=False).copy())
+
+            dev = get_input_device()     # resolved BEFORE the claim (Path B)
+            if not _pa_claim_owner(_pathb_mic_active,
+                                   deny_if=_stop_listen_capture_denied):
+                return _dlg.ListenCapture.unavailable()
+            try:
+                try:
+                    stream = sd.InputStream(samplerate=sr, channels=1,
+                                            dtype="float32", blocksize=1024,
+                                            device=dev, callback=_cb)
+                except Exception as e:
+                    _note_input_open_failure("dialogue stop-listen", dev, e)
+                    return _dlg.ListenCapture.unavailable()
+                try:
+                    stream.start()
+
+                    def _get(t):
+                        try:
+                            return q_local.get(timeout=t)
+                        except queue.Empty:
+                            return None
+                    frames, beat_idx = _collect_frames(
+                        _get, until, beat_s, max_s,
+                        yield_if=_stop_listen_must_yield)
+                except Exception as e:
+                    print(f"  [dialogue] stop-listen capture failed: "
+                          f"{type(e).__name__}")
+                    frames = []
+                finally:
+                    _safe_close_stream(stream)
+            finally:
+                # close-then-release: the flag covers the stream's whole
+                # native lifetime.
+                _pa_release_owner(_pathb_mic_active)
+        if not frames:
+            return _empty_capture()
+        audio = np.concatenate(frames).astype(np.float32, copy=False)
+        beat = (np.concatenate(frames[beat_idx:]).astype(np.float32,
+                                                         copy=False)
+                if beat_idx < len(frames) else None)
+        cap = _dlg.ListenCapture(available=True,
+                                 beat_voiced=_voiced(beat))
+        try:
+            threading.Thread(target=_stop_listen_worker,
+                             args=(cap, audio, beat, cap.beat_voiced, h),
+                             name="dialogue-stop-stt", daemon=True).start()
+        except Exception:
+            cap.set_result("", "")
+        return cap
+    except Exception:
+        return _dlg.ListenCapture.unavailable()
+
+
+def _empty_capture():
+    """A capture that ran but heard nothing (the verdict is already "")."""
+    cap = _dlg.ListenCapture(available=True, beat_voiced=False)
+    cap.set_result("", "")
+    return cap
+
+
+def _is_loopback_url(url: str) -> bool:
+    try:
+        host = (urllib.parse.urlparse(str(url)).hostname or "").lower()
+    except Exception:
+        return False
+    return host in ("localhost", "::1") or host.startswith("127.")
+
+
+def _is_ollama_cloud_tag(model: str) -> bool:
+    """True for an Ollama tag served by the cloud, not this box
+    ("name:size-cloud", "name:cloud")."""
+    tag = str(model or "").strip().lower()
+    return tag.endswith("-cloud") or tag.endswith(":cloud")
+
+
+def _local_complete(system: str, messages: list, *, max_tokens: int = 220,
+                    temperature: float | None = None,
+                    top_p: float | None = None,
+                    repeat_penalty: float | None = None,
+                    json_schema: dict | None = None,
+                    local_only: bool = True,
+                    timeout_s: float = 8.0) -> str | None:
+    """One plain completion from the local model for a skill: ``system`` is
+    sent AS IS (no local-mode directive, no cheatsheet swap, no search guard,
+    no [turn-timing] marks), with the given sampling options on top of the
+    chat call's model / num_ctx / keep_alive / think (so the warm runner is
+    reused) and, with ``json_schema``, Ollama's structured ``format``. An
+    HTTP 400 retries once without ``format`` (an older Ollama). With
+    ``local_only`` it refuses (None) unless the base URL is loopback and the
+    model is not a cloud tag. Untagged (owner-initiated) under the traffic
+    gate; afterwards the usual re-prime bookkeeping. Returns the text or
+    None; never raises."""
+    did_post = False
+    try:
+        if not LOCAL_LLM_FALLBACK:
+            return None
+        if local_only and not _is_loopback_url(LOCAL_LLM_BASE_URL):
+            print("  [local-complete] refused: the local LLM URL is not "
+                  "loopback")
+            return None
+        if not _ollama_alive():
+            return None
+        model = _get_local_llm_model()
+        if local_only and _is_ollama_cloud_tag(model):
+            print("  [local-complete] refused: the local model is a cloud tag")
+            return None
+        if not _ollama_has_model(model):
+            return None
+        payload = _local_chat_payload(model, system, list(messages or []),
+                                      int(max_tokens))
+        opts = payload.setdefault("options", {})
+        if temperature is not None:
+            opts["temperature"] = float(temperature)
+        if top_p is not None:
+            opts["top_p"] = float(top_p)
+        if repeat_penalty is not None:
+            opts["repeat_penalty"] = float(repeat_penalty)
+        if json_schema:
+            payload["format"] = json_schema
+        t = max(1.0, float(timeout_s))
+        timeout = (min(5.0, t), t)
+        with _lt.slot():
+            did_post = True
+            with _lt.TRACKER.track():
+                r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat",
+                                  json=payload, timeout=timeout)
+            if getattr(r, "status_code", 0) == 400 and "format" in payload:
+                print("  [local-complete] HTTP 400 with a format; retrying "
+                      "without it")
+                payload = dict(payload)
+                payload.pop("format", None)
+                with _lt.TRACKER.track():
+                    r = requests.post(f"{LOCAL_LLM_BASE_URL}/api/chat",
+                                      json=payload, timeout=timeout)
+            if not r.ok:
+                print(f"  [local-complete] HTTP {r.status_code}")
+                return None
+            text = ((r.json().get("message") or {}).get("content")
+                    or "").strip()
+            return text or None
+    except _RequestsTimeout:
+        print(f"  [local-complete] timed out after {float(timeout_s):.0f}s")
+        return None
+    except Exception as e:
+        print(f"  [local-complete] failed: {type(e).__name__}")
+        return None
+    finally:
+        if did_post:
+            _after_local_post()
+
+
 def _do_proactive_turn(memory: dict):
     """Generate and speak a JARVIS-style spontaneous comment."""
     pause_face_tracking()
@@ -30154,6 +30894,9 @@ def _do_proactive_turn(memory: dict):
     # budget so the cap is enforced independently of the last voice turn.
     _reset_see_screen_budget()
     spoken, _proactive_results = parse_and_run_actions(text)
+    # A self-voiced action has already spoken; never voice its result again.
+    _proactive_results = [r for r in _proactive_results
+                          if not is_self_voiced(r[0])]
     spoken = _apply_quip_layer(spoken, _proactive_results)
     _speak(spoken)
     resume_face_tracking()
@@ -31325,6 +32068,10 @@ def _speak_pending():
     # one-per-AUDIO_ANNOUNCE_MIN_GAP_S gap (and announce a finished flap
     # storm). Here, because this drain is the only place it could be spoken
     # anyway. Never raises.
+    # Post-dialogue speech hold (handle.hold_after): leave the queue on disk
+    # untouched; it is spoken once the hold passes.
+    if _speech_hold_active():
+        return False
     _audio_flap_flush()
     _recover_orphaned_queue_snapshot(PENDING_SPEECH_PATH, "pending")
     if not os.path.exists(PENDING_SPEECH_PATH):
@@ -31685,7 +32432,13 @@ def _run_voice_shortcuts(text: str) -> bool:
     # fall through to the normal LLM path below.
     try:
         from core.dispatcher import resolve_and_dispatch as _cc_resolve
-        _chain_reply = _cc_resolve(text, ACTIONS)
+        # A self-voiced action (a device dialogue) is never a chain step:
+        # hide it from the resolver (same effect as the dispatcher's own
+        # is_self_voiced hook, and the two-argument call stays unchanged).
+        _cc_actions = (ACTIONS if not SELF_VOICED_ACTIONS else
+                       {k: v for k, v in ACTIONS.items()
+                        if not is_self_voiced(k)})
+        _chain_reply = _cc_resolve(text, _cc_actions)
     except Exception as _e:
         print(f"  [chain] resolver failed: {_e}")
         _chain_reply = None
@@ -32377,6 +33130,10 @@ def _handle_sleep_standby(injected_text: str | None) -> None:
     # inject is typed operator input). Logs the source only.
     if _device_speech_ignored(text, injected_text is not None):
         return
+    # Post-dialogue turn hold: only a wake-prefixed utterance gets through.
+    # Same order as the main loop: device -> dialogue hold -> self-echo.
+    if _dialogue_hold_ignored(text, injected_text is not None):
+        return
     # Self-echo (core/self_echo.py): JARVIS's own voice can never wake him
     # and is never fed to the ambient learner. Mic captures only.
     if _self_echo_ignored(text, injected_text is not None):
@@ -32611,6 +33368,12 @@ def _run_llm_dispatch_body(text: str) -> str:
     # Applied BEFORE the quip layer so a quip attaches to the unspoken tail.
     _full_spoken = spoken_text
     spoken_text = _strip_stream_spoken_prefix(spoken_text)
+    # Self-voiced actions (a device dialogue) already said everything: no
+    # prose, answer-first, quip, verbatim result or follow-up for this reply.
+    _self_voiced_only = _all_self_voiced(action_results)
+    if _self_voiced_only:
+        print("  [self-voiced] the action did its own talking")
+        spoken_text = ""
     # "On it, sir. You asked about X." answering a question: the preface is
     # filler, not a promise — speak only the answer (2026-09-29). The quip
     # layer runs later, after the answer-first decision (v2.0.119).
@@ -32652,7 +33415,7 @@ def _run_llm_dispatch_body(text: str) -> str:
         print(f"  [answer-first] dropped lead-in ({_af_words} words)")
         _tt("note_lead_dropped")
         spoken_text = ""
-    else:
+    elif not _self_voiced_only:
         spoken_text = _apply_quip_layer(spoken_text, action_results)
     if spoken_text and not _barged:
         _speak(spoken_text)
@@ -32665,7 +33428,7 @@ def _run_llm_dispatch_body(text: str) -> str:
     # Skipped when barged so the interrupt silences the verbatim answer too.
     _spoke_verbatim = (
         _speak_verbatim_results(action_results, spoken_text)
-        if not _barged else False
+        if not (_barged or _self_voiced_only) else False
     )
 
     # If any informational actions ran (see_screen, etc.), feed the
@@ -32699,10 +33462,14 @@ def _run_llm_dispatch_body(text: str) -> str:
         _max_followup = _followup_depth(default=8)
     except Exception:
         _max_followup = 8
+    if _self_voiced_only:
+        current_results = []
     for depth in range(_max_followup):
+        # A self-voiced result is neither news to report nor a failure to
+        # explain: the action already said what it had to.
         informative = [
             (n, r) for (n, r, is_info) in current_results
-            if is_info or _is_failure(r)
+            if not is_self_voiced(n) and (is_info or _is_failure(r))
         ]
         if not informative:
             break
@@ -33644,6 +34411,11 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 # is explicit operator input, never overheard room audio.
                 # Logs the device name only. See _device_speech_ignored.
                 if _device_speech_ignored(text, _injected_text is not None):
+                    set_state("idle")
+                    continue
+                # Post-dialogue turn hold (handle.hold_after): a non-wake mic
+                # turn is dropped until it passes; typed turns always pass.
+                if _dialogue_hold_ignored(text, _injected_text is not None):
                     set_state("idle")
                     continue
 

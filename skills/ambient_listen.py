@@ -483,6 +483,19 @@ def _device_speech_source(text: str) -> Optional[str]:
         return None
 
 
+def _dialogue_holds_batches() -> bool:
+    """True while a device dialogue runs or is in its end tail
+    (core/device_speech_filter.dialogue_active): the batch is dropped before
+    transcription, so nothing heard then is buffered, learned or a wake
+    nudge. Never raises (False on error)."""
+    try:
+        _ensure_project_on_path()
+        from core import device_speech_filter as _dsf
+        return bool(_dsf.dialogue_active())
+    except Exception:
+        return False
+
+
 def _device_speech_batch_source(text: str, now: Optional[float] = None
                                 ) -> Optional[str]:
     """Device check for ONE fixed-length mic batch. The mic worker cuts audio
@@ -1016,6 +1029,9 @@ def _worker_loop() -> None:
             if rms < 0.003:
                 _prev_mic_batch[0] = None   # silence ends any split line
                 continue
+            if _dialogue_holds_batches():
+                _prev_mic_batch[0] = None
+                continue
 
             # Apply the three-layer cleanup (AEC → NS → AGC) so
             # whatever Whisper sees has JARVIS's own playback,
@@ -1306,6 +1322,8 @@ def _audio_worker_loop() -> None:
             # System audio gate is tighter than mic — we don't want to
             # Whisper near-silent menu hum or a paused video.
             if rms < 0.005:
+                continue
+            if _dialogue_holds_batches():
                 continue
 
             # Resample to Whisper's 16 kHz if the loopback ran natively

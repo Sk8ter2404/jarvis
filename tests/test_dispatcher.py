@@ -571,6 +571,52 @@ class ResolveAndDispatchTests(unittest.TestCase):
         out = d.resolve_and_dispatch("play jazz, take a screenshot", actions)
         self.assertIsNone(out)
 
+class SelfVoicedChainTests(unittest.TestCase):
+    """A self-voiced action (a device dialogue: it does all of its own
+    talking) is never run as a chain step (2026-09-29)."""
+
+    def setUp(self):
+        self.calls = []
+
+    def _action(self, name):
+        def fn(arg):
+            self.calls.append((name, arg))
+            return "ok"
+        return fn
+
+    def _actions(self):
+        return {n: self._action(n)
+                for n in ("play_music", "screenshot", "volume_up")}
+
+    def test_self_voiced_step_is_skipped(self):
+        out = d.resolve_and_dispatch(
+            "play jazz, then take a screenshot, also turn it up",
+            self._actions(), is_self_voiced=lambda n: n == "screenshot")
+        self.assertIsNotNone(out)
+        self.assertEqual([c[0] for c in self.calls],
+                         ["play_music", "volume_up"])
+
+    def test_default_treats_nothing_as_self_voiced(self):
+        d.resolve_and_dispatch(
+            "play jazz, then take a screenshot, also turn it up",
+            self._actions())
+        self.assertEqual([c[0] for c in self.calls],
+                         ["play_music", "screenshot", "volume_up"])
+
+    def test_too_few_survivors_runs_nothing(self):
+        out = d.resolve_and_dispatch(
+            "play jazz, take a screenshot", self._actions(),
+            is_self_voiced=lambda n: n == "screenshot")
+        self.assertIsNone(out)
+        self.assertEqual(self.calls, [])
+
+    def test_raising_predicate_counts_as_not_self_voiced(self):
+        def boom(_n):
+            raise RuntimeError("x")
+        d.resolve_and_dispatch("play jazz, take a screenshot",
+                               self._actions(), is_self_voiced=boom)
+        self.assertEqual(len(self.calls), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

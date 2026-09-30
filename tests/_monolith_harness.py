@@ -287,6 +287,12 @@ _MONOLITH_RESTORE_NAMES = (
     # clone worker (leaving _voice_clone_inflight True) or accepts a barge-in
     # (bumping _tts_interrupt_seq) can't poison the next test.
     "_voice_clone_inflight", "_tts_interrupt_seq",
+    # Device dialogues (2026-09-29): the running flag / handle, the
+    # post-dialogue holds and the self-voiced set. A leaked flag would make a
+    # later request_tts_interrupt test accept a stop with nothing playing; a
+    # leaked hold would silence a later _speak_pending test.
+    "_dialogue_active", "_dialogue_current", "_speech_hold_until",
+    "_turn_hold_until", "_turn_hold_reason", "SELF_VOICED_ACTIONS",
     "_hud_state_cache", "_focused_window_state", "CAMERAS",
     "last_speech_time", "last_face_seen", "_apple_music_last_seen",
     # ── STT / whisper model handles ────────────────────────────────────────

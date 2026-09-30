@@ -68,6 +68,36 @@ mishearing is listed literally in the phrase file; a device line split across
 two ambient-listen batches is only caught on the second fragment; the neural
 standby wake detector (WAKE_WORD_AUTOSTART) has no transcript to check.
 
+EXPECTED LINES / DIALOGUE (transient, in memory)
+  A caller that is about to make a device speak a line it composed at run
+  time (a scripted back-and-forth between JARVIS and a device) registers that
+  line first with ``expect(source, text, window_s=...)`` and marks it finished
+  with ``expect_done(handle)``. ``match`` then also filters those lines, but
+  only inside a SHORT time window, so the owner's own reply a few seconds
+  later is never swallowed:
+    * an entry is live until ``now + window_s + EXPECT_GRACE_S`` (the predicted
+      end of the line plus 4 s), never longer than EXPECT_HARD_TTL_S (30 s)
+      after it was registered; ``expect_done`` moves the expiry to
+      ``done + EXPECT_GRACE_S`` (still capped by the hard TTL);
+    * at most EXPECT_MAX entries (oldest dropped);
+    * the SAME bars as the phrase files (0.80 whole ratio, 0.90 for a short
+      line, <= 2 words exact-only, the verbatim-containment and word-count
+      guards), plus a FRAGMENT rule for a line Whisper only caught part of: an
+      utterance of at least EXPECTED_FRAGMENT_MIN_WORDS words scored against
+      every same-length word window of the line, at
+      EXPECTED_FRAGMENT_MIN_RATIO (0.85). Nothing is loosened during a
+      dialogue;
+    * protected owner phrases and stop words never match (the same early
+      returns as the file phrases).
+  ``begin_dialogue(source, max_s)`` / ``end_dialogue(token, tail_s)`` bracket
+  a dialogue; ``dialogue_active()`` is True from begin until ``tail_s`` after
+  end (or ``max_s`` after begin when nobody ends it), so the other listeners
+  (the standby loop, the ambient daemon, the learners) can hold still while
+  it runs. When the tail ends, every expected entry of that source is
+  dropped. A stale token (an older dialogue) can never end a newer one.
+  All of this uses the monotonic clock (``now=`` injects one in tests) and is
+  lock-protected; it never touches disk.
+
 FAILURE POSTURE: a missing directory, an unreadable or malformed file, or any
 internal error means "no filtering" for that file / call. Nothing here raises.
 Loaded lists are cached by each file's (mtime, size), so edits apply without a
@@ -76,7 +106,7 @@ restart of the matcher but the directory is only re-parsed when it changes.
 Log hygiene: callers print the SOURCE name only, never the utterance or the
 matched phrase (the phrase list is private).
 
-Pure stdlib (difflib, json, os, re, threading).
+Pure stdlib (difflib, json, os, re, threading, time).
 """
 from __future__ import annotations
 
@@ -85,6 +115,7 @@ import json
 import os
 import re
 import threading
+import time
 from typing import Optional
 
 from core import paths as _paths
@@ -107,6 +138,16 @@ EXACT_ONLY_MAX_WORDS = 2
 # whose "stop" token already counts.
 _STOP_WORDS = frozenset(
     ("stop", "halt", "freeze", "abort", "emergency", "estop", "cancel"))
+# Public alias: callers (core/dialogue.py, a skill's line checker) test their
+# own text against the SAME list the matcher protects.
+STOP_WORDS = _STOP_WORDS
+
+# Expected (transient) device lines: see "EXPECTED LINES / DIALOGUE" above.
+EXPECT_MAX = 32
+EXPECT_GRACE_S = 4.0
+EXPECT_HARD_TTL_S = 30.0
+EXPECTED_FRAGMENT_MIN_WORDS = 4
+EXPECTED_FRAGMENT_MIN_RATIO = 0.85
 
 # Owner vocabulary a device line can never shadow: confirmations, replies,
 # greetings and media transport. Matched as WHOLE utterances (normalised), so
@@ -309,10 +350,64 @@ def _contains_verbatim(utt_words: list, phrase_words: list) -> bool:
     return False
 
 
+def _whole_score(fz_words: list, u_wake: int, p_words: list, sm,
+                 n_words: int) -> Optional[float]:
+    """The fuzzy whole-utterance score of ``fz_words`` against one phrase, or
+    None when a guard rules it out or it misses its bar. The rules shared by
+    the phrase files and the expected lines (see the module docstring)."""
+    if n_words <= EXACT_ONLY_MAX_WORDS:
+        return None
+    if len(fz_words) <= EXACT_ONLY_MAX_WORDS:
+        return None
+    if len(fz_words) > n_words + max(1, n_words // 3):
+        return None
+    if _contains_verbatim(fz_words, p_words):
+        return None
+    a, b = fz_words, p_words
+    if u_wake and p_words[:u_wake] == fz_words[:u_wake]:
+        a, b = fz_words[u_wake:], p_words[u_wake:]
+    a_s, b_s = " ".join(a), " ".join(b)
+    short = (len(b) < SHORT_PHRASE_MIN_WORDS
+             or len(b_s) < SHORT_PHRASE_MIN_CHARS)
+    need = SHORT_FUZZY_MIN_RATIO if short else FUZZY_MIN_RATIO
+    sm.set_seqs(b_s, a_s)
+    if sm.real_quick_ratio() < need or sm.quick_ratio() < need:
+        return None
+    score = sm.ratio()
+    return score if score >= need else None
+
+
+def _fragment_score(fz_words: list, p_words: list, sm) -> Optional[float]:
+    """Best score of a SHORTER utterance (at least EXPECTED_FRAGMENT_MIN_WORDS
+    words) against every same-length word window of an expected line, or
+    None below EXPECTED_FRAGMENT_MIN_RATIO. Covers a device line Whisper only
+    caught part of (the capture started late, or the line was split)."""
+    k = len(fz_words)
+    if k < EXPECTED_FRAGMENT_MIN_WORDS or k >= len(p_words):
+        return None
+    a_s = " ".join(fz_words)
+    best = None
+    for i in range(len(p_words) - k + 1):
+        b_s = " ".join(p_words[i:i + k])
+        sm.set_seqs(b_s, a_s)
+        if sm.real_quick_ratio() < EXPECTED_FRAGMENT_MIN_RATIO:
+            continue
+        if sm.quick_ratio() < EXPECTED_FRAGMENT_MIN_RATIO:
+            continue
+        score = sm.ratio()
+        if score >= EXPECTED_FRAGMENT_MIN_RATIO and (best is None
+                                                     or score > best):
+            best = score
+    return best
+
+
 def match(utterance, directory: Optional[str] = None, never_match=(),
-          wake_phrases=()):
+          wake_phrases=(), *, now: Optional[float] = None):
     """``(source, phrase, score)`` when ``utterance`` is a known device line,
     else None. ``phrase`` is the NORMALISED phrase (never log it).
+
+    Checks the live EXPECTED lines (see expect()) first, then the phrase
+    files. ``now``: monotonic time for the expected-line windows (tests).
 
     ``never_match``: protected phrases on top of OWNER_PHRASES — an utterance
     that, normalised, equals one of them is never filtered. Callers pass the
@@ -333,42 +428,208 @@ def match(utterance, directory: Optional[str] = None, never_match=(),
         utt_words = utt.split()
         if any(tok in _STOP_WORDS for tok in utt_words):
             return None
+        expected = _expected_snapshot(now)
         phrases = load_phrases(directory)
-        if not phrases:
+        if not phrases and not expected:
             return None
         fz_words = _strip_whisper_noise(utt_words)
         fz_utt = " ".join(fz_words)
         wake_seqs = {tuple(w) for w in (normalise(p).split()
                                         for p in (wake_phrases or ())) if w}
         u_wake = _wake_prefix_len(fz_words, wake_seqs)
-        best = None
         sm = difflib.SequenceMatcher(autojunk=False)
+        best = None
+        for source, phrase, n_words in expected:
+            if utt == phrase or fz_utt == phrase:
+                return (source, phrase, 1.0)
+            p_words = phrase.split()
+            whole = _whole_score(fz_words, u_wake, p_words, sm, n_words)
+            frag = (_fragment_score(fz_words, p_words, sm)
+                    if n_words > EXACT_ONLY_MAX_WORDS else None)
+            scores = [x for x in (whole, frag) if x is not None]
+            score = max(scores) if scores else None
+            if score is not None and (best is None or score > best[2]):
+                best = (source, phrase, score)
+        if best is not None:
+            return best
         for source, phrase, n_words in phrases:
             if utt == phrase or fz_utt == phrase:
                 return (source, phrase, 1.0)
-            if n_words <= EXACT_ONLY_MAX_WORDS:
-                continue
-            if len(fz_words) <= EXACT_ONLY_MAX_WORDS:
-                continue
-            if len(fz_words) > n_words + max(1, n_words // 3):
-                continue
-            p_words = phrase.split()
-            if _contains_verbatim(fz_words, p_words):
-                continue
-            a, b = fz_words, p_words
-            if u_wake and p_words[:u_wake] == fz_words[:u_wake]:
-                a, b = fz_words[u_wake:], p_words[u_wake:]
-            a_s, b_s = " ".join(a), " ".join(b)
-            short = (len(b) < SHORT_PHRASE_MIN_WORDS
-                     or len(b_s) < SHORT_PHRASE_MIN_CHARS)
-            need = SHORT_FUZZY_MIN_RATIO if short else FUZZY_MIN_RATIO
-            sm.set_seqs(b_s, a_s)
-            if sm.real_quick_ratio() < need or sm.quick_ratio() < need:
-                continue
-            score = sm.ratio()
-            if score >= need and (best is None or score > best[2]):
+            score = _whole_score(fz_words, u_wake, phrase.split(), sm,
+                                 n_words)
+            if score is not None and (best is None or score > best[2]):
                 best = (source, phrase, score)
         return best
+    except Exception:
+        return None
+
+
+# ── expected lines + dialogue bracket (transient, in memory) ───────────────
+_exp_lock = threading.Lock()
+# handle -> {"source", "norm", "n", "expires", "hard"}; insertion-ordered, so
+# the first key is the oldest (EXPECT_MAX eviction).
+_expected: dict = {}
+_exp_next = [0]
+# The one dialogue bracket: {"token", "source", "until", "tail_until"} or None.
+_dialogue: list = [None]
+_dialogue_next = [0]
+
+
+def _clock(now) -> float:
+    return time.monotonic() if now is None else float(now)
+
+
+def _gc_locked(now: float) -> None:
+    """Drop expired entries, and an ended dialogue together with its source's
+    entries. Caller holds _exp_lock."""
+    d = _dialogue[0]
+    if d is not None:
+        limit = d["until"] if d["tail_until"] is None else d["tail_until"]
+        if now >= limit:
+            _dialogue[0] = None
+            for h in [h for h, e in _expected.items()
+                      if e["source"] == d["source"]]:
+                del _expected[h]
+    for h in [h for h, e in _expected.items() if now >= e["expires"]]:
+        del _expected[h]
+
+
+def _expected_snapshot(now=None) -> list:
+    """[(source, normalised line, word count), ...] of the live expected
+    lines, newest first. Never raises."""
+    try:
+        t = _clock(now)
+        with _exp_lock:
+            _gc_locked(t)
+            return [(e["source"], e["norm"], e["n"])
+                    for e in reversed(list(_expected.values()))]
+    except Exception:
+        return []
+
+
+def expect(source: str, text: str, *, window_s: float,
+           now: Optional[float] = None) -> Optional[int]:
+    """Register a line a device is ABOUT to speak. ``window_s`` is how long the
+    caller predicts the line takes; the entry stays live until then plus
+    EXPECT_GRACE_S, never past EXPECT_HARD_TTL_S. Returns a handle for
+    expect_done(), or None for an empty / non-printable text or a blank
+    source. Never raises."""
+    try:
+        if not isinstance(source, str) or not source.strip():
+            return None
+        if not isinstance(text, str) or not text.strip():
+            return None
+        if not text.strip().isprintable():
+            return None
+        norm = normalise(text)
+        if not norm:
+            return None
+        t = _clock(now)
+        try:
+            w = max(0.0, float(window_s))
+        except Exception:
+            w = 0.0
+        hard = t + EXPECT_HARD_TTL_S
+        with _exp_lock:
+            _gc_locked(t)
+            while len(_expected) >= EXPECT_MAX:
+                del _expected[next(iter(_expected))]
+            _exp_next[0] += 1
+            handle = _exp_next[0]
+            _expected[handle] = {
+                "source": source.strip(), "norm": norm,
+                "n": len(norm.split()),
+                "expires": min(hard, t + w + EXPECT_GRACE_S), "hard": hard}
+        return handle
+    except Exception:
+        return None
+
+
+def expect_done(handle, *, now: Optional[float] = None) -> None:
+    """The device finished the line: it stays filtered EXPECT_GRACE_S more
+    (the echo and a late transcript), capped by its hard TTL. An unknown or
+    expired handle is ignored. Never raises."""
+    try:
+        t = _clock(now)
+        with _exp_lock:
+            _gc_locked(t)          # an already-expired entry stays expired
+            e = _expected.get(handle)
+            if e is not None:
+                e["expires"] = min(e["hard"], t + EXPECT_GRACE_S)
+    except Exception:
+        pass
+
+
+def forget_expected(source: Optional[str] = None) -> int:
+    """Drop every expected line (of ``source`` only, when given). Returns how
+    many were dropped. Never raises."""
+    try:
+        want = None if source is None else str(source).strip()
+        with _exp_lock:
+            gone = [h for h, e in _expected.items()
+                    if want is None or e["source"] == want]
+            for h in gone:
+                del _expected[h]
+            return len(gone)
+    except Exception:
+        return 0
+
+
+def begin_dialogue(source: str, max_s: float = 60.0, *,
+                   now: Optional[float] = None) -> int:
+    """Open the dialogue bracket for ``source`` (it replaces any earlier
+    one). It lapses by itself ``max_s`` after begin if nobody ends it.
+    Returns the token end_dialogue() needs. Never raises (0 on error)."""
+    try:
+        t = _clock(now)
+        with _exp_lock:
+            _gc_locked(t)
+            _dialogue_next[0] += 1
+            tok = _dialogue_next[0]
+            _dialogue[0] = {"token": tok, "source": str(source or "").strip(),
+                            "until": t + max(0.0, float(max_s)),
+                            "tail_until": None}
+            return tok
+    except Exception:
+        return 0
+
+
+def end_dialogue(token: int, tail_s: float = 4.0, *,
+                 now: Optional[float] = None) -> None:
+    """Close the dialogue ``token`` opened: it stays active ``tail_s`` more
+    (the last echo), then its source's expected lines are dropped. A stale
+    token, or a second end, does nothing. Never raises."""
+    try:
+        t = _clock(now)
+        with _exp_lock:
+            d = _dialogue[0]
+            if d is None or d["token"] != token or d["tail_until"] is not None:
+                return
+            d["tail_until"] = min(d["until"], t + max(0.0, float(tail_s)))
+            _gc_locked(t)
+    except Exception:
+        pass
+
+
+def dialogue_active(*, now: Optional[float] = None) -> bool:
+    """True while a dialogue is open or in its end tail. Never raises."""
+    try:
+        t = _clock(now)
+        with _exp_lock:
+            _gc_locked(t)
+            return _dialogue[0] is not None
+    except Exception:
+        return False
+
+
+def dialogue_source(*, now: Optional[float] = None) -> Optional[str]:
+    """The active dialogue's source name, else None. Never raises."""
+    try:
+        t = _clock(now)
+        with _exp_lock:
+            _gc_locked(t)
+            d = _dialogue[0]
+            return d["source"] if d is not None else None
     except Exception:
         return None
 
@@ -378,3 +639,6 @@ def _reset_cache_for_tests() -> None:
         _cache["key"] = None
         _cache["phrases"] = []
     _reported_bad.clear()
+    with _exp_lock:
+        _expected.clear()
+        _dialogue[0] = None

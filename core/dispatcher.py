@@ -588,6 +588,7 @@ def _format_consolidated(steps: list[ChainStep], unknown: list[str]) -> str:
 def resolve_and_dispatch(
     utterance: str,
     actions: dict[str, Callable[[str], str]],
+    is_self_voiced: Callable[[str], bool] | None = None,
 ) -> str | None:
     """One-call entry point used by the main loop.
 
@@ -598,6 +599,10 @@ def resolve_and_dispatch(
     Action exceptions are caught per-step so one failing step never
     aborts the rest of the chain. A failed step is reported in the
     consolidated line as 'X failed'.
+
+    ``is_self_voiced(name)``: an action that does all of its own talking
+    (a device dialogue) is never run as a chain step: it is skipped with a
+    log line, like an unregistered action. Default: nothing is.
     """
     result = command_chain_resolver(utterance, actions.keys())
     if result is None:
@@ -612,6 +617,15 @@ def resolve_and_dispatch(
     # has run yet, so the LLM fall-through is safe.
     runnable: list[tuple[ChainStep, Callable[[str], str]]] = []
     for step in result.steps:
+        if is_self_voiced is not None:
+            try:
+                _sv = bool(is_self_voiced(step.action))
+            except Exception:
+                _sv = False
+            if _sv:
+                print(f"  [chain] skipped self-voiced action {step.action}")
+                result.unknown.append(step.source)
+                continue
         fn = actions.get(step.action)
         if fn is None:
             # Race: action was registered when we resolved but isn't now.

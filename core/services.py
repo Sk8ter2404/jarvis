@@ -48,6 +48,11 @@ skill sees identical semantics whether it goes through the dict or this object:
     ``register_promise_condition`` → ``None``, ``fulfil_promise`` → ``False``) —
     exactly the fallbacks the monolith installs when ``core.memory`` (the
     promise store) failed to import.
+  * **Device dialogues** (``dialogue_ready`` → ``"disabled"``,
+    ``dialogue_session`` raises ``RuntimeError``, ``speak_line`` →
+    ``"failed"``, ``listen_for_stop`` / ``local_complete`` → ``None``,
+    ``register_self_voiced`` / ``is_self_voiced`` → ``False``) — an older
+    monolith without the hooks simply never runs a dialogue.
 
 Stdlib-only by contract
 ------------------------
@@ -102,6 +107,15 @@ class JarvisServicesProtocol(Protocol):
     def make_promise(self, message: str, condition: str, **kwargs: Any) -> Optional[int]: ...
     def register_promise_condition(self, *args: Any, **kwargs: Any) -> None: ...
     def fulfil_promise(self, promise_id: int) -> bool: ...
+
+    # — device dialogues —
+    def dialogue_ready(self) -> str: ...
+    def dialogue_session(self, source: str, max_s: Optional[float] = None) -> Any: ...
+    def speak_line(self, text: str, mood: Optional[str] = None) -> str: ...
+    def listen_for_stop(self, until: Callable[[], bool], **kwargs: Any) -> Any: ...
+    def local_complete(self, system: str, messages: list, **kwargs: Any) -> Optional[str]: ...
+    def register_self_voiced(self, name: str) -> bool: ...
+    def is_self_voiced(self, name: str) -> bool: ...
 
 
 # Sentinel that means "no backing callable was wired for this key". Distinct from
@@ -250,3 +264,45 @@ class JarvisServices:
         """Force-fire a pending promise now. Returns ``True`` on success,
         ``False`` if it couldn't be fired or the store isn't loaded."""
         return bool(self._call("fulfil_promise", promise_id, _default=False))
+
+    # ── device dialogues (core/dialogue.py) ───────────────────────────────
+    # Unwired (an older monolith) degrades to "no dialogue": dialogue_ready
+    # reports "disabled", dialogue_session raises, the rest return their
+    # "nothing happened" value.
+    def dialogue_ready(self) -> str:
+        """"" when a device dialogue may start now, else the reason."""
+        return str(self._call("dialogue_ready", _default="disabled") or "")
+
+    def dialogue_session(self, source: str, max_s: Optional[float] = None) -> Any:
+        """The monolith's dialogue context manager (raises its
+        DialogueUnavailable on enter when refused). Raises RuntimeError when
+        unwired."""
+        fn = self._fn("dialogue_session")
+        if fn is None:
+            raise RuntimeError("disabled")
+        if max_s is None:
+            return fn(source)
+        return fn(source, max_s=max_s)
+
+    def speak_line(self, text: str, mood: Optional[str] = None) -> str:
+        """Speak one dialogue line: "spoken" | "interrupted" | "muted" |
+        "failed" | "staging". "failed" when unwired."""
+        return self._call("speak_line", text, mood, _default="failed")
+
+    def listen_for_stop(self, until: Callable[[], bool], **kwargs: Any) -> Any:
+        """The dialogue's synchronous stop-listen capture (a
+        core.dialogue.ListenCapture), or None when unwired."""
+        return self._call("listen_for_stop", until, _default=None, **kwargs)
+
+    def local_complete(self, system: str, messages: list, **kwargs: Any) -> Optional[str]:
+        """One plain local-model completion (no persona directive), or None."""
+        return self._call("local_complete", system, messages, _default=None,
+                          **kwargs)
+
+    def register_self_voiced(self, name: str) -> bool:
+        """Mark an action as doing all of its own talking. False when refused
+        or unwired."""
+        return bool(self._call("register_self_voiced", name, _default=False))
+
+    def is_self_voiced(self, name: str) -> bool:
+        return bool(self._call("is_self_voiced", name, _default=False))

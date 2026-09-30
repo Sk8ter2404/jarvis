@@ -549,6 +549,25 @@ SELF_ECHO_FILTER_ENABLED = True
 SELF_ECHO_WINDOW_S       = 20.0
 SELF_ECHO_TAIL_S         = 0.8
 
+# Device dialogues (core/dialogue.py): a skill that owns a talking device can
+# run a short scripted back-and-forth between JARVIS and it through the
+# skill_utils "dialogue_session" / "speak_line" / "listen_for_stop" hooks.
+#   DIALOGUE_ENABLED     False refuses every dialogue ("disabled").
+#   DIALOGUE_MAX_S       hard cap on one dialogue's length, seconds.
+#   DIALOGUE_STOP_LISTEN False = no stop-listen capture after device lines
+#                        (the tray, the wake word and the device still stop).
+#   DIALOGUE_BEAT_S      pause after each device line: comic timing, and the
+#                        window in which the owner's "stop" is heard.
+#   DIALOGUE_LOST_HOLD_S how long proactive speech and non-wake mic turns are
+#                        held after a dialogue ends because the device went
+#                        away (the owner is probably talking to the device).
+# Set via user_settings.json; applies on the next start.
+DIALOGUE_ENABLED = True
+DIALOGUE_MAX_S = 40
+DIALOGUE_STOP_LISTEN = True
+DIALOGUE_BEAT_S = 0.6
+DIALOGUE_LOST_HOLD_S = 12.0
+
 
 # ─── Whisper STT (faster-whisper preferred, GPU when present) ──────────
 # `WHISPER_DEVICE = 'auto'` lets ctranslate2 + torch decide; 'cuda'

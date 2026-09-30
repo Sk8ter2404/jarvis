@@ -67,6 +67,12 @@ class JokeFallbackDispatchTests(_Base):
         with contextlib.redirect_stdout(buf):
             bc._run_llm_dispatch("tell me a joke")
         self.assertIn("[joke-fallback]", buf.getvalue())
+        # v2.0.136: the transcript shows the joke that was SAID.
+        spoken = [ln for ln in buf.getvalue().splitlines()
+                  if "JARVIS (spoken):" in ln]
+        self.assertEqual(len(spoken), 1)
+        self.assertTrue(any(j in spoken[0] for j in joke_fallback.FALLBACK_JOKES),
+                        spoken)
 
     def test_history_keeps_the_joke_not_the_refusal(self):
         bc = self.bc

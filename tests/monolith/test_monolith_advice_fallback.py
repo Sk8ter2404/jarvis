@@ -50,6 +50,11 @@ class AdviceFallbackDispatchTests(_Base):
         with contextlib.redirect_stdout(buf):
             bc._run_llm_dispatch("what should I have for dinner")
         self.assertIn("[advice-fallback]", buf.getvalue())
+        # v2.0.136: the transcript shows what was SAID, not only the dodge.
+        spoken = [ln for ln in buf.getvalue().splitlines()
+                  if "JARVIS (spoken):" in ln]
+        self.assertEqual(len(spoken), 1)
+        self.assertTrue(any(s in spoken[0] for s in ALL_SUGGESTIONS), spoken)
 
     def test_history_keeps_the_suggestion_not_the_dodge(self):
         history = [{"role": "user", "content": "what should I have for dinner"},
