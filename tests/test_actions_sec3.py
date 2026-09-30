@@ -280,6 +280,29 @@ class ResetMemoryTests(unittest.TestCase):
             self.assertIn("long-term semantic store was NOT cleared", out)
             self.assertIn("chroma wedged", out)
 
+    def test_reset_clears_the_session_opening_record(self):
+        # Review F5: a full wipe also clears "the first thing I asked you".
+        with tempfile.TemporaryDirectory() as td:
+            bc, _ = self._bc_with_memory(td)
+            bc._forget_session_opening_since = mock.Mock(return_value=1)
+            with _patch_bc(bc), \
+                    mock.patch.object(LTM, "reset_all", return_value=0):
+                out = A._act_reset_memory()
+            bc._forget_session_opening_since.assert_called_once_with(None)
+            self.assertIn("memory reset (backup -> backups/", out)
+            self.assertNotIn("WARNING", out)
+
+    def test_reset_discloses_a_record_clear_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            bc, _ = self._bc_with_memory(td)
+            bc._forget_session_opening_since = mock.Mock(
+                side_effect=RuntimeError("record wedged"))
+            with _patch_bc(bc), \
+                    mock.patch.object(LTM, "reset_all", return_value=0):
+                out = A._act_reset_memory()
+            self.assertIn("opening-utterance record was NOT cleared", out)
+            self.assertIn("record wedged", out)
+
     def test_outer_exception_caught(self):
         bc = _base_bc()
         # _memory_lock that explodes on __enter__ triggers the outer except.
@@ -797,6 +820,100 @@ class ForgetLastHourTests(unittest.TestCase):
         self.assertTrue(out.startswith("nothing recent enough to forget"))
         self.assertIn("the voice-command log was NOT purged", out)
         self.assertIn("jsonl locked", out)
+
+    # ── Review F5: the session's opening-utterance record ("what was the
+    # first thing I asked you", v2.0.148) is an in-process conversation
+    # store too. forget_last_hour used to confirm the forget and leave it,
+    # so JARVIS recited the forgotten first request word for word. ──────
+
+    @staticmethod
+    def _purging_record(bc, stamps):
+        """bc._forget_session_opening_since with the monolith's semantics
+        (drop entries stamped at/after the cutoff; None = all; dropping the
+        first REAL utterance latches bc._session_opening_lost). The helper
+        itself is tested against the real monolith in
+        tests/monolith/test_monolith_fast_paths.py."""
+        from core import fast_paths as _fp
+        bc._session_opening_lost = [False]
+
+        def _forget(cutoff):
+            keep, dropped = [], []
+            for ts, t in zip(stamps, bc._session_opening_turns):
+                (keep if cutoff is not None and ts < cutoff
+                 else dropped).append((ts, t))
+            bc._session_opening_turns[:] = [t for _ts, t in keep]
+            stamps[:] = [ts for ts, _t in keep]
+            if _fp.first_owner_utterance([t for _ts, t in dropped]):
+                bc._session_opening_lost[0] = True
+            return len(dropped)
+        return mock.Mock(side_effect=_forget)
+
+    def test_forget_purges_the_session_opening_record(self):
+        now = 1_700_000_000.0
+        bc = self._bc({"topics": [], "sessions": []})
+        bc._session_opening_turns = ["book the dentist for the checkup"]
+        bc._forget_session_opening_since = self._purging_record(
+            bc, [now - 600])
+        with _patch_bc(bc), \
+                mock.patch.object(A.time, "time", return_value=now), \
+                self._patch_ltm({"episodes": 1, "facts": 0, "working": 1}):
+            out = A._act_forget_last_hour()
+            recall = A._act_session_memory_recall(
+                "what was the first thing I asked you")
+            # He goes on talking; the record may pick up a later turn.
+            bc._session_opening_turns.append("turn on the desk lamp")
+            later = A._act_session_memory_recall(
+                "what was the first thing I asked you")
+        bc._forget_session_opening_since.assert_called_once_with(now - 3600)
+        self.assertEqual(out, "forgot 1 logged turn(s) from the last hour")
+        self.assertNotIn("dentist", recall)
+        # Changed deliberately (second review, F5/F6 residual): this said
+        # "You haven't asked me anything else this session yet" — untrue,
+        # he had (it was forgotten), and the next turn then became "the
+        # first thing". The start is now reported as lost, and stays so.
+        self.assertEqual(recall, "I no longer have the start of this session "
+                                 "on record, sir.")
+        self.assertEqual(later, recall)
+
+    def test_forget_keeps_an_opening_older_than_the_hour(self):
+        now = 1_700_000_000.0
+        bc = self._bc({"topics": [], "sessions": []})
+        bc._session_opening_turns = ["what's 12 times 12"]
+        bc._forget_session_opening_since = self._purging_record(
+            bc, [now - 7200])
+        with _patch_bc(bc), \
+                mock.patch.object(A.time, "time", return_value=now), \
+                self._patch_ltm():
+            out = A._act_forget_last_hour()
+            recall = A._act_session_memory_recall(
+                "what was the first thing I asked you")
+        self.assertEqual(out, "nothing recent enough to forget")
+        self.assertIn('"what\'s 12 times 12"', recall)
+
+    def test_only_the_opening_record_had_the_hour(self):
+        now = 1_700_000_000.0
+        bc = self._bc({"topics": [], "sessions": []})
+        bc._forget_session_opening_since = mock.Mock(return_value=2)
+        with _patch_bc(bc), \
+                mock.patch.object(A.time, "time", return_value=now), \
+                self._patch_ltm():
+            out = A._act_forget_last_hour()
+        self.assertEqual(out, "forgot 2 recorded utterance(s) from the last "
+                              "hour")
+
+    def test_opening_record_purge_failure_is_disclosed(self):
+        now = 1_700_000_000.0
+        bc = self._bc({"topics": [], "sessions": []})
+        bc._forget_session_opening_since = mock.Mock(
+            side_effect=RuntimeError("record wedged"))
+        with _patch_bc(bc), \
+                mock.patch.object(A.time, "time", return_value=now), \
+                self._patch_ltm({"episodes": 1, "facts": 0, "working": 0}):
+            out = A._act_forget_last_hour()
+        self.assertTrue(out.startswith("forgot 1 logged turn(s)"))
+        self.assertIn("WARNING", out)
+        self.assertIn("opening-utterance record was NOT purged", out)
+        self.assertIn("record wedged", out)
 
     def test_exception_caught(self):
         bc = _base_bc()
@@ -1699,6 +1816,140 @@ class SessionMemoryRecallTests(unittest.TestCase):
         with _patch_bc(bc):
             out = A._act_session_memory_recall("what did I just say")
         self.assertEqual(out, 'You said: "open the project notes", sir.')
+
+    # ── "what was the first thing I asked you" (live v2.0.140) ──────────
+    # The action said it had no access. It now reads the session's opening
+    # owner utterances the monolith records (bc._session_opening_turns),
+    # never the trimmed / handoff-seeded conversation_history.
+
+    def test_first_thing_asked_comes_from_the_session_record(self):
+        bc = self._bc()
+        bc._session_opening_turns = ["Jarvis", "what's 12 times 12",
+                                     "open the project notes"]
+        bc.conversation_history = self._llm_path_history(
+            "what was the first thing I asked you in this conversation")
+        with _patch_bc(bc):
+            out = A._act_session_memory_recall(
+                "the first thing the user asked in this conversation")
+        self.assertEqual(out, 'The first thing you asked me this session '
+                              'was: "what\'s 12 times 12", sir.')
+        bc.pattern_memory.get_session_summaries.assert_not_called()
+        bc._llm_quick.assert_not_called()
+
+    def test_first_thing_from_his_own_words_with_a_bare_token(self):
+        bc = self._bc()
+        bc._session_opening_turns = ["what's 12 times 12"]
+        bc._turn_in_progress = [True]
+        bc._last_user_text = ["what did I ask you first"]
+        with _patch_bc(bc):
+            out = A._act_session_memory_recall("")
+        self.assertIn('"what\'s 12 times 12"', out)
+
+    def test_first_thing_with_nothing_earlier_says_so(self):
+        bc = self._bc()
+        bc._session_opening_turns = ["what was the first thing I asked"]
+        with _patch_bc(bc):
+            out = A._act_session_memory_recall(
+                "what was the first thing I asked")
+        self.assertEqual(out, "You haven't asked me anything else this "
+                              "session yet, sir.")
+
+    def test_first_thing_worked_on_today_still_uses_the_session_index(self):
+        # Review F3: any "first thing" in the argument took the utterance
+        # record, so work-history questions that reached the session index
+        # in v2.0.140 got the first spoken utterance instead. The second
+        # review found the same for what JARVIS or a third party said first
+        # (the asker could be "you" / "they" / anyone): the reply recited the
+        # OWNER's first utterance. Base v2.0.140 sent all of them here.
+        for q in ("what was the first thing I worked on today",
+                  "what was the first thing we did today",
+                  "the first thing you said to me today",
+                  "what did you tell me first",
+                  "what the doctor said first",
+                  "first question you asked me today"):
+            with self.subTest(q=q):
+                bc = self._bc()
+                bc._session_opening_turns = ["what's 12 times 12"]
+                bc.pattern_memory.get_session_summaries.return_value = [
+                    {"date": "2026-09-29", "summary": "sorted the garden "
+                                                      "planner"}]
+                bc._llm_quick.return_value = (
+                    "Earlier today, sir, you sorted the garden planner.")
+                with _patch_bc(bc):
+                    out = A._act_session_memory_recall(q)
+                self.assertEqual(out, "Earlier today, sir, you sorted the "
+                                      "garden planner.")
+                bc.pattern_memory.get_session_summaries.assert_called_once()
+                self.assertNotIn("12 times 12", out)
+
+    def test_first_thing_never_recalls_the_current_question(self):
+        # Review F4: main() records the turn BEFORE dispatch, so right after
+        # a start the question being asked can be the record's only real
+        # entry. Its own words slip past the recall detectors (the last
+        # phrasing below still does), the LLM's argument hits the loose one,
+        # and the action named the CURRENT question as the first thing.
+        for current in ("what did I ask you at the start of today",
+                        "what's the earliest thing I asked you today",
+                        "hmm, which thing did I bring up at the very "
+                        "beginning"):
+            with self.subTest(current=current):
+                bc = self._bc()
+                bc._session_opening_turns = ["Jarvis", current]
+                bc._turn_in_progress = [True]
+                bc._last_user_text = [current]
+                with _patch_bc(bc):
+                    out = A._act_session_memory_recall(
+                        "the first thing the user asked today")
+                self.assertEqual(out, "You haven't asked me anything else "
+                                      "this session yet, sir.")
+
+    def test_first_thing_after_a_handoff_never_claims_nothing_was_asked(self):
+        # Review F6 (action path): the record holds only the current
+        # question, the history a previous process's tail + this turn.
+        current = "what was the first thing I asked you today"
+        bc = self._bc()
+        bc._session_opening_turns = [current]
+        bc._turn_in_progress = [True]
+        bc._last_user_text = [current]
+        bc.conversation_history = [
+            {"role": "user", "content": "set a timer for ten minutes"},
+            {"role": "assistant", "content": "Timer set, sir."},
+        ] + self._llm_path_history(current)[3:]
+        with _patch_bc(bc):
+            out = A._act_session_memory_recall(current)
+        self.assertEqual(out, "I no longer have the start of this session "
+                              "on record, sir.")
+
+    def test_first_thing_after_the_start_was_lost_names_no_later_turn(self):
+        # Second review (F5/F6 residual): once a forget / reset purged the
+        # start (or a handoff came without it) the monolith latches
+        # bc._session_opening_lost; the record may hold a LATER utterance,
+        # which must never be recited as the first thing he asked.
+        bc = self._bc()
+        bc._session_opening_turns = ["turn on the desk lamp"]
+        bc._session_opening_lost = [True]
+        with _patch_bc(bc):
+            out = A._act_session_memory_recall(
+                "what was the first thing I asked you")
+        self.assertEqual(out, "I no longer have the start of this session "
+                              "on record, sir.")
+        # Only the real latch counts (a bare Mock attribute never does).
+        bc = self._bc()
+        bc._session_opening_turns = ["turn on the desk lamp"]
+        with _patch_bc(bc):
+            out = A._act_session_memory_recall(
+                "what was the first thing I asked you")
+        self.assertIn('"turn on the desk lamp"', out)
+
+    def test_first_thing_yesterday_still_uses_the_session_index(self):
+        bc = self._bc()
+        bc._session_opening_turns = ["what's 12 times 12"]
+        bc.pattern_memory.get_session_summaries.return_value = []
+        bc.pattern_memory.describe_window.return_value = "for yesterday"
+        with _patch_bc(bc):
+            out = A._act_session_memory_recall(
+                "what was the first thing I asked you yesterday")
+        self.assertIn("no recollection for yesterday", out)
 
     def test_earlier_sessions_still_use_the_session_index(self):
         bc = self._bc()

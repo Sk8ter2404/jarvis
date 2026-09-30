@@ -214,5 +214,88 @@ class IsRestatementTests(unittest.TestCase):
                 "turn on the desk lamp", prev_user_text="turn off the desk lamp"))
 
 
+class RepeatRequestTests(unittest.TestCase):
+    """v2.0.140 live: "say that again" was classified 'frustrated' (its
+    "again" is a repetition marker), so the reply turned terse and
+    apologetic. Asking JARVIS to repeat himself means the owner did not hear:
+    no tone, unless a real frustration marker is also present."""
+
+    REPEATS = ("say that again", "Say that again?", "say it again please",
+               "could you say that again, please", "can you repeat that",
+               "repeat that", "Jarvis, repeat that", "repeat that again",
+               "repeat what you just said", "come again?", "Pardon?",
+               "pardon me", "I beg your pardon", "what was that",
+               "what was that again", "what did you say",
+               "what did you just say", "Sorry, I missed that.",
+               "sorry, I didn't catch that", "I didn't hear you",
+               "I didn't catch that, say it again", "wait, say that again",
+               "Say that again!!")
+    # A real marker alongside it: classified as before.
+    STILL_FRUSTRATED = ("I said, say that again", "say that again, I told you",
+                        "why do I have to say that again",
+                        "say it again damn it", "I said turn it off",
+                        "open it again", "do that again")
+
+    def test_repeat_requests_are_neutral(self):
+        with mock.patch.object(td, "_is_late_night_hour", return_value=False):
+            for text in self.REPEATS:
+                with self.subTest(text=text):
+                    self.assertTrue(td.is_repeat_request(text))
+                    self.assertIsNone(td.detect_tone(text))
+                    # Nor is asking twice a "restatement".
+                    self.assertIsNone(td.detect_tone(
+                        text, prev_user_text="can you say that again"))
+
+    def test_late_night_fallback_still_applies(self):
+        # Neutral like any other line: only the time-of-day register.
+        with mock.patch.object(td, "_is_late_night_hour", return_value=True):
+            self.assertEqual(td.detect_tone("say that again"), "late_night")
+
+    def test_a_real_marker_still_counts(self):
+        with mock.patch.object(td, "_is_late_night_hour", return_value=False):
+            for text in self.STILL_FRUSTRATED:
+                with self.subTest(text=text):
+                    self.assertFalse(td.is_repeat_request(text))
+                    self.assertEqual(td.detect_tone(text), "frustrated")
+
+    def test_not_repeat_requests(self):
+        for text in ("what was that noise", "repeat after me",
+                     "say hello", "sorry", "what", "pardon the mess", "",
+                     None, 42, "louder", "slower please", "eh",
+                     "sorry I wasn't listening"):
+            with self.subTest(text=text):
+                self.assertFalse(td.is_repeat_request(text))
+
+    # Review TONE-2: common didn't-hear phrasings still came out
+    # 'frustrated' (router 'stressed': 15 min of proactive silence, a light
+    # dim, the deferential addendum), and the frustrated ones must stay so.
+    MORE_REPEATS = ("would you mind saying that again",
+                    "say that again, louder", "say that again slower",
+                    "can you say that again but slower",
+                    "say that last part again", "eh, say that again",
+                    "what'd you say again",
+                    "sorry I wasn't listening, say that again")
+    MORE_FRUSTRATED = ("say that again, you idiot",
+                       "that's wrong, say it again", "I said say that again",
+                       "do it again", "try again", "say it again damn it",
+                       "no, say it again", "ugh, say that again")
+
+    def test_more_didnt_hear_phrasings_are_neutral(self):
+        with mock.patch.object(td, "_is_late_night_hour", return_value=False), \
+                mock.patch.object(td, "TONE_DETECTION_ENABLED", True):
+            for text in self.MORE_REPEATS:
+                with self.subTest(text=text):
+                    self.assertTrue(td.is_repeat_request(text))
+                    self.assertIsNone(td.detect_tone(text))
+
+    def test_frustrated_repeats_stay_frustrated(self):
+        with mock.patch.object(td, "_is_late_night_hour", return_value=False), \
+                mock.patch.object(td, "TONE_DETECTION_ENABLED", True):
+            for text in self.MORE_FRUSTRATED:
+                with self.subTest(text=text):
+                    self.assertFalse(td.is_repeat_request(text))
+                    self.assertEqual(td.detect_tone(text), "frustrated")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -17,6 +17,9 @@ sounddevice          # audio I/O
 soundfile            # read/write audio for TTS
 numpy                # audio math
 requests             # HTTP to robot
+tzdata               # IANA time zones for zoneinfo: Windows has no system copy,
+#                      and without it "what time is it in London" (core/
+#                      world_clock.py) quietly falls back to the LLM turn.
 opencv-python<5      # face detection. PINNED BELOW 5: opencv-python 5.0.0.93 is
 #                      the current stable on PyPI (checked 2026-09-26), and 5.x
 #                      crashes JARVIS at startup. Unpinned, a fresh

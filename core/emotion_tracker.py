@@ -37,7 +37,7 @@ from typing import Optional
 
 # One definition of "repeating himself", shared with the tone detector so the
 # two classifiers cannot drift apart on it. Stdlib-only, import-light.
-from core.tone_detector import is_restatement
+from core.tone_detector import is_repeat_request, is_restatement
 # NIGHT_QUIET_ENABLED (read at call time) gates the time-only 'tired' read.
 from core.night_quiet import night_quiet_enabled
 
@@ -338,6 +338,16 @@ def classify_emotion(
     swear_phrase  = _has_any_phrase(clean, _SWEAR_WORDS)
     stress_phrase = _has_any_phrase(clean, _STRESS_WORDS)
     clipped = (n_words <= 3) and (_has_any_phrase(clean, _CLIPPED_IMPERATIVES) is not None)
+    # "Say that again" / "sorry, I missed that" (v2.0.148): he didn't hear.
+    # The words of a repeat request carry no emotion (its "again" is not the
+    # frustration marker, its "wait" not stress, "!!" not excitement); only
+    # prosody and the time of day still count. Same rule as
+    # core.tone_detector.is_repeat_request, which it shares.
+    repeat_request = is_repeat_request(clean)
+    if repeat_request:
+        frust_phrase = swear_phrase = stress_phrase = None
+        clipped = False
+        excl_count = 0
     if frust_phrase or (swear_phrase and clipped):
         return _build(
             "frustrated",

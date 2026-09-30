@@ -21,7 +21,9 @@ ignored):
   * days until a target: "how long until Friday", "how many days until
     Christmas", "how far away is Thanksgiving", "days until December 25";
   * the weekday / date of a target: "what day of the week is December 25",
-    "what day does Christmas fall on this year", "when is Thanksgiving".
+    "what day does Christmas fall on this year", "when is Thanksgiving",
+    "what's the date next Monday", "what date is it next Monday", "when is
+    next Monday", "what's next Monday's date".
 
 A target is a weekday, a named holiday (Christmas, Christmas Eve, New Year's
 Day, New Year's Eve, Halloween, Thanksgiving = the 4th Thursday of November,
@@ -35,8 +37,24 @@ Counting rules (the contract tests/test_date_math.py pins):
     matters (Tue Sep 29 -> Fri Dec 25 = 87; Tue -> Fri = 3).
   * A bare weekday always means the NEXT one, never today: asked on a
     Tuesday, "how long until Tuesday" is 7 days and the reply says today is
-    Tuesday. "next Friday" is ambiguous in speech (this week's or next
-    week's?) and returns None.
+    Tuesday.
+  * "next <weekday>" has two readings in speech: the coming one, or the one
+    in NEXT week. When the coming one already falls in next week, both
+    readings agree and that date is the answer (asked on a Tuesday, "next
+    Monday" is 6 days out; asked on a Monday, "next Monday" is 7 days out).
+    When the coming one is still in THIS week under EITHER week convention
+    (ISO Monday-to-Sunday, or the US calendar's Sunday-to-Saturday), the
+    phrase is ambiguous and the reply gives both, never a guess: asked on
+    Tue Sep 29, "next Friday" -> "This Friday is October 2, and the Friday
+    after is October 9, sir."; asked on Sun Oct 4 (a US week starts that
+    day), "next Monday" -> "This Monday is tomorrow, October 5, and the
+    Monday after is October 12, sir." (2026-09-29, live: "what's the date
+    next Monday" went to the LLM, which read back today's date.)
+  * A past-tense question about a bare weekday ("what was Monday's date",
+    "what date was it on Monday") is about the one GONE, which this module
+    does not compute: None, never the coming one a week off. The same holds
+    for a holiday or a date named without a year that has not happened yet
+    this year ("what day was Christmas" asked in September).
   * A holiday or a date without a year means its next occurrence, today
     included: Christmas asked on Dec 25 is "today", asked on Dec 26 it is next
     year's. "next Christmas" skips today. A trailing "this year" / "next year"
@@ -273,6 +291,11 @@ class _Target(NamedTuple):
     date: _dt.date
     label: str           # "Friday", "Christmas", ""
     explicit_year: bool  # the user named the year ("this year" counts)
+    # Weekdays only. ``nxt``: he said "next <weekday>". ``after``: set when
+    # that is ambiguous (the coming one is still this week) — the same
+    # weekday a week later, so the reply can give both readings.
+    nxt: bool = False
+    after: Optional[_dt.date] = None
 
 
 def _parse_target(w: str, today: _dt.date, qual: Optional[str]):
@@ -284,12 +307,25 @@ def _parse_target(w: str, today: _dt.date, qual: Optional[str]):
         nxt = m.group(0).strip() == "next"
         t = t[m.end():]
     if t in WEEKDAYS:
-        if nxt or qual:
+        if qual:
             return None
         wd = WEEKDAYS.index(t)
         ahead = (wd - today.weekday()) % 7 or 7
-        return _Target("weekday", today + _dt.timedelta(days=ahead),
-                       t.title(), False)
+        coming = today + _dt.timedelta(days=ahead)
+        if not nxt:
+            return _Target("weekday", coming, t.title(), False)
+        # "next <weekday>": the coming one, or next week's? The two readings
+        # agree only when the coming one is past the end of THIS week under
+        # BOTH conventions: ISO Monday-to-Sunday and the US calendar's
+        # Sunday-to-Saturday. They differ only when asked on a Sunday, which
+        # starts a US week (Mon..Sat still ahead in it) and ends an ISO one.
+        iso_week_end = today + _dt.timedelta(days=6 - today.weekday())
+        us_week_end = today + _dt.timedelta(
+            days=6 - (today.weekday() + 1) % 7)
+        if coming > max(iso_week_end, us_week_end):
+            return _Target("weekday", coming, t.title(), False, True)
+        return _Target("weekday", coming, t.title(), False, True,
+                       coming + _dt.timedelta(days=7))
     key = _HOLIDAY_ALIASES.get(t)
     if key is None and t.startswith("the "):
         key = _HOLIDAY_ALIASES.get(t[4:])
@@ -407,13 +443,21 @@ def _until_answer(tgt: _Target, today: _dt.date) -> DateAnswer:
     n = (tgt.date - today).days
     if tgt.kind == "weekday":
         on = _month_day(tgt.date, today)
-        if n == 7:
+        name = f"Next {tgt.label}" if tgt.nxt else tgt.label
+        if tgt.after is not None:
+            # Ambiguous "next <weekday>": both readings, never a guess.
+            first = f"tomorrow, {on}" if n == 1 else f"{n} days away, on {on}"
+            n2 = (tgt.after - today).days
+            reply = (f"This {tgt.label} is {first}, and the {tgt.label} "
+                     f"after is {n2} days away, on "
+                     f"{_month_day(tgt.after, today)}, sir.")
+        elif n == 7:
             reply = (f"Today is {tgt.label}, so next {tgt.label} is 7 days "
                      f"away, on {on}, sir.")
         elif n == 1:
-            reply = f"{tgt.label} is tomorrow, {on}, sir."
+            reply = f"{name} is tomorrow, {on}, sir."
         else:
-            reply = f"{tgt.label} is {n} days away, on {on}, sir."
+            reply = f"{name} is {n} days away, on {on}, sir."
         return DateAnswer("days-until", reply)
     if tgt.kind == "holiday":
         label = tgt.label
@@ -439,11 +483,19 @@ def _date_of_answer(tgt: _Target, today: _dt.date) -> DateAnswer:
     weekday = _WEEKDAY_TITLE[tgt.date.weekday()]
     md_y = _month_day(tgt.date, today, force_year=True)
     if tgt.kind == "weekday":
-        if n == 7:
+        if tgt.after is not None:
+            # Ambiguous "next <weekday>": both readings, never a guess.
+            first = _month_day(tgt.date, today)
+            if n == 1:
+                first = f"tomorrow, {first}"
+            reply = (f"This {tgt.label} is {first}, and the {tgt.label} "
+                     f"after is {_month_day(tgt.after, today)}, sir.")
+        elif n == 7:
             reply = (f"Today is {tgt.label}; next {tgt.label} is {md_y}, "
                      f"sir.")
         else:
-            reply = f"{tgt.label} is {md_y}, sir."
+            name = f"Next {tgt.label}" if tgt.nxt else tgt.label
+            reply = f"{name} is {md_y}, sir."
     elif tgt.kind == "holiday":
         full = _full(tgt.date)
         if n == 0:
@@ -497,6 +549,26 @@ _POSS_FRAMES = tuple(re.compile(p) for p in (
     rf"{_Q} {_BE} (?P<poss>todays|tomorrows|yesterdays) (?:date|day)",
     r"(?P<poss>todays|tomorrows|yesterdays) date",
 ))
+# "what's next Monday's date", "what's Friday's date" (normalize() has dropped
+# the apostrophe: "mondays"). Present / future only: "what was Monday's date"
+# is about the Monday gone, never the coming one (see _PAST_RE).
+_WEEKDAY_POSS_FRAMES = tuple(re.compile(p) for p in (
+    rf"(?:{_Q} (?:is|will be|would be) )?(?:the )?(?P<w>(?:(?:this coming|"
+    rf"the coming|coming|this|next) )?(?:{'|'.join(WEEKDAYS)}))s date",
+))
+# A past-tense question. Its target must not be one this module rolls
+# FORWARD to (a bare weekday is always the coming one; a holiday / date named
+# without a year is its next occurrence): "what was Monday's date" asked on a
+# Tuesday means yesterday, and answering next Monday is a week off.
+_PAST_RE = re.compile(r"\b(?:was|were|did|fell|landed)\b")
+
+
+def _contradicts_past(tgt: "_Target", today: _dt.date) -> bool:
+    """True when a past-tense question resolved to a target this module
+    rolled forward to (see _PAST_RE)."""
+    if tgt.kind == "weekday":
+        return True
+    return not tgt.explicit_year and tgt.date > today
 _FILL = (r"(?:is it|is there|are there|are there left|are left|is left|left|"
          r"remain|remaining|more|do i have|do we have|do i have left|"
          r"do we have left|have i got|have we got|do i have to wait|"
@@ -512,7 +584,8 @@ _UNTIL_FRAMES = tuple(re.compile(p) for p in (
 
 def _resolve_date_question(w: Optional[str], today: _dt.date,
                            qual: Optional[str],
-                           targets_only: bool = False) -> Optional[DateAnswer]:
+                           targets_only: bool = False,
+                           past: bool = False) -> Optional[DateAnswer]:
     if w is None:
         if targets_only or qual:
             return None
@@ -525,7 +598,9 @@ def _resolve_date_question(w: Optional[str], today: _dt.date,
         if off is not None:
             return _offset_answer(*off, today)
     tgt = _parse_target(w, today, qual)
-    return _date_of_answer(tgt, today) if tgt is not None else None
+    if tgt is None or (past and _contradicts_past(tgt, today)):
+        return None
+    return _date_of_answer(tgt, today)
 
 
 def _answer(text, now) -> Optional[DateAnswer]:
@@ -545,6 +620,7 @@ def _answer(text, now) -> Optional[DateAnswer]:
     m = re.fullmatch(r"(.+?) (this|next) year", t)
     if m:
         t, qual = m.group(1), m.group(2)
+    past = bool(_PAST_RE.search(t))
 
     for rx in _UNTIL_FRAMES:
         m = rx.fullmatch(t)
@@ -556,18 +632,26 @@ def _answer(text, now) -> Optional[DateAnswer]:
         m = rx.fullmatch(t)
         if m and not qual:
             return _rel_answer(_POSS[m.group("poss")], today)
+    for rx in _WEEKDAY_POSS_FRAMES:
+        m = rx.fullmatch(t)
+        if m and not qual:
+            tgt = _parse_target(m.group("w"), today, None)
+            if tgt is not None and not (past
+                                        and _contradicts_past(tgt, today)):
+                return _date_of_answer(tgt, today)
     frames = _DATE_FRAMES + (_ASKED_FRAMES if asked else ())
     for rx in frames:
         m = rx.fullmatch(t)
         if m:
-            got = _resolve_date_question(m.group("w"), today, qual)
+            got = _resolve_date_question(m.group("w"), today, qual,
+                                         past=past)
             if got is not None:
                 return got
     for rx in _WHEN_FRAMES:
         m = rx.fullmatch(t)
         if m:
             got = _resolve_date_question(m.group("w"), today, qual,
-                                         targets_only=True)
+                                         targets_only=True, past=past)
             if got is not None:
                 return got
     return None

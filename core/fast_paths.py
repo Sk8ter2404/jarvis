@@ -13,16 +13,37 @@ the local model is both slow and unreliable at them (live 2026-09-29):
     owner name (core.config.USER_NAME). The LLM route sent it to the camera
     (recognize_face -> "I don't see a face right now, sir."). With no name
     configured this does NOT match, so the turn falls through to the LLM and
-    nothing is ever invented. Identity/presence questions ("who am I", "who is
-    this", "who am I looking at", "do you recognize me") never match: those
-    stay a live camera look.
+    nothing is ever invented.
+  * "who am I" / "do you know who I am" (v2.0.148): the same configured name
+    ("You're Alex, sir."). Live v2.0.140 it ran recognize_face and answered
+    "I don't see a face right now, sir." These were camera looks since v1.55,
+    for a real reason: the owner stepped out of frame, asked "who am I" and
+    got his name back, i.e. JARVIS claimed to SEE someone it did not. That
+    reason is kept, not dropped: the reply names who JARVIS is set up for and
+    never claims a sighting, and every presence / recognition phrasing ("who
+    is this", "who's here", "who am I looking at", "do you recognize me",
+    "can you see me") still never matches, so it stays a live camera look
+    (and the prompts' camera rule still governs it). No name configured =
+    no match, as above.
+  * "what was the first thing I asked you (today / in this conversation)",
+    "what did I ask you first" (v2.0.148): the first owner utterance of THIS
+    process session. conversation_history cannot answer it (it is trimmed
+    from the front, and a blue-green handoff seeds it with the previous
+    process's tail), so the monolith keeps the session's opening utterances
+    itself (bobert_companion._session_opening_turns) and passes them in.
+  * "what time is it in London" (v2.0.148): core/world_clock.py. Live
+    v2.0.140 get_time (the LOCAL clock) was voiced as "It is 10:17 PM in
+    London, sir." when London was at 4:17 AM.
 
-``match(text, now=..., history=..., owner_name=...)`` returns a
-``FastAnswer(kind, reply)`` or None. The monolith calls it right before the LLM
-dispatch (bobert_companion._run_fast_paths, gated by FAST_PATHS_ENABLED) and
-speaks the reply itself. Every grammar is anchored on the whole utterance, so
-commands and other domains fall through untouched. Stdlib only, no I/O, never
-raises.
+Recall never returns a recall question itself or a bare wake phrase
+("Jarvis", "hey Jarvis, wake up"): both are skipped (_skip_for_recall).
+
+``match(text, now=..., history=..., owner_name=..., session_turns=...)``
+returns a ``FastAnswer(kind, reply)`` or None. The monolith calls it right
+before the LLM dispatch (bobert_companion._run_fast_paths, gated by
+FAST_PATHS_ENABLED) and speaks the reply itself. Every grammar is anchored on
+the whole utterance, so commands and other domains fall through untouched.
+Stdlib only, no I/O, never raises.
 
 The recall helpers are shared with core.actions._act_session_memory_recall so
 the LLM route can never recall the current utterance either.
@@ -32,12 +53,13 @@ from __future__ import annotations
 import re
 from typing import NamedTuple, Optional
 
-from core import date_math
+from core import date_math, world_clock
 from core.date_math import normalize
 
 
 class FastAnswer(NamedTuple):
-    kind: str    # "owner-name" | "last-utterance" | a date_math kind
+    kind: str    # "owner-name" | "owner-identity" | "last-utterance" |
+    #              "first-utterance" | "world-clock" | a date_math kind
     reply: str
 
 
@@ -54,8 +76,9 @@ _NAME_RES = tuple(re.compile(p) for p in (
 
 
 def is_name_question(text) -> bool:
-    """True for "what's my name" style questions only. "who am I", "who is
-    this", "do you recognize me" are identity looks and never match."""
+    """True for "what's my name" style questions only. "who am I" is
+    is_identity_question; "who is this", "do you recognize me" are camera
+    looks and never match either."""
     t = normalize(text)
     return any(rx.fullmatch(t) for rx in _NAME_RES)
 
@@ -67,13 +90,49 @@ def name_reply(owner_name) -> Optional[str]:
     return f"Your name is {name}, sir." if name else None
 
 
-# ── "what did I just ask you" ──────────────────────────────────────────────
-# <v> names what is being recalled; it picks the reply wording.
+# ── "who am I" ─────────────────────────────────────────────────────────────
+# Whole-utterance only. "who am I looking at / talking to / speaking with",
+# "who is this", "who's here", "do you recognize me", "can you see me" are
+# presence or recognition questions and stay a live camera look.
 
+_IDENTITY_RES = tuple(re.compile(p) for p in (
+    r"who am i",
+    r"(?:(?:can|could) you )?(?:tell me|remind me) who i am",
+))
+_KNOW_IDENTITY_RES = tuple(re.compile(p) for p in (
+    r"(?:do |did )?you (?:know|remember) who i am",
+))
+
+
+def is_identity_question(text) -> bool:
+    """True for "who am I" / "do you know who I am" (owner identity from the
+    configured name, never a camera look)."""
+    t = normalize(text)
+    return any(rx.fullmatch(t) for rx in _IDENTITY_RES + _KNOW_IDENTITY_RES)
+
+
+def identity_reply(text, owner_name) -> Optional[str]:
+    """ "You're Alex, sir." ("Of course, sir. You're Alex." to "do you know
+    who I am"), or None when no name is configured. Names who JARVIS is set
+    up for; never claims to see anyone."""
+    name = owner_name.strip() if isinstance(owner_name, str) else ""
+    if not name:
+        return None
+    t = normalize(text)
+    if any(rx.fullmatch(t) for rx in _KNOW_IDENTITY_RES):
+        return f"Of course, sir. You're {name}."
+    return f"You're {name}, sir."
+
+
+# ── "what did I just ask you" ──────────────────────────────────────────────
+# <v> names what is being recalled; it picks the reply wording. "what'd"
+# normalises to "whatd" (date_math.normalize drops the apostrophe).
+
+_WHAT_DID = r"(?:what did|whatd)"
 _RECALL_RES = tuple(re.compile(p) for p in (
-    r"what (?:did|do) i just (?P<v>ask|say|tell)(?: to)?(?: you| jarvis)?"
-    r"(?: to do)?",
-    r"what did i (?P<v>ask|say|tell)(?: you| to you)? (?:just now|"
+    r"(?:what (?:did|do)|whatd) i just (?P<v>ask|say|tell)(?: to)?"
+    r"(?: you| jarvis)?(?: to do)?",
+    _WHAT_DID + r" i (?P<v>ask|say|tell)(?: you| to you)? (?:just now|"
     r"a (?:moment|second|minute|sec) ago|last|previously)",
     r"what (?:was|is) (?:my|the) (?:last|previous|most recent|prior) "
     r"(?P<v>question|request|command)(?: i asked(?: you)?| to you)?",
@@ -89,6 +148,7 @@ _RECALL_RES = tuple(re.compile(p) for p in (
 ))
 _VERBS = {"ask": "ask", "asked": "ask", "asking": "ask",
           "say": "say", "said": "say", "saying": "say", "tell": "say",
+          "told": "say",
           "question": "question", "request": "request",
           "command": "command"}
 
@@ -107,6 +167,158 @@ _PAST_SESSION_RE = re.compile(
     r"this (?:morning|afternoon|evening|week)|earlier today|"
     r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
     r"\d+ (?:days?|weeks?|hours?) ago)\b")
+
+
+# "what was the first thing I asked you (today / in this conversation)".
+# <v> names what is being recalled, as in _RECALL_RES.
+_SCOPE = (r"(?: (?:today|tonight|so far|(?:in )?(?:this|our) "
+          r"(?:conversation|session|chat)|since you (?:started|started up|"
+          r"came up|came online|booted|booted up|woke up)))?")
+_YOU = r"(?: you| to you| of you)?"
+_FIRST_RES = tuple(re.compile(p + _SCOPE) for p in (
+    r"what (?:was|is) the (?:very )?first (?:thing|question) i "
+    r"(?P<v>asked|said)" + _YOU,
+    r"what (?:was|is) the (?:very )?first thing i (?P<v>told) you",
+    r"what (?:was|is) my (?:very )?first (?P<v>question|request|command)",
+    _WHAT_DID + r" i (?P<v>ask|say|tell)" + _YOU + r" first",
+    _WHAT_DID + r" i first (?P<v>ask|say|tell)" + _YOU,
+    r"(?:(?:can|could) you )?(?:tell me|remind me(?: of)?|repeat) "
+    r"(?:what i (?P<v>asked|said)" + _YOU + r" first|the (?:very )?first "
+    r"thing i (?P<v2>asked|said)" + _YOU + r"|my (?:very )?first "
+    r"(?P<v3>question|request))",
+    r"do you (?:remember|know) (?:what i (?P<v>asked|said)" + _YOU +
+    r" first|the (?:very )?first thing i (?P<v2>asked|said)" + _YOU +
+    r"|my (?:very )?first (?P<v3>question|request))",
+))
+# The action path's paraphrase detector (the LLM's argument): a "first thing
+# I asked" mention with no earlier-session time reference. It needs the
+# ASKING, BY THE OWNER, in every form: "the first thing the user asked", "his
+# first question", "what I asked you first", "what did the user say first".
+# A bare "first thing" is not enough — "what was the first thing I worked on
+# today" / "the first thing we did today" are work-history questions for the
+# session index, not the opening utterance — and neither is someone else
+# asking: "the first thing you said to me today" (JARVIS), "what did my mom
+# say first", "what the doctor said first", "the first message they sent".
+# "he" / "they" count only when the argument itself names the user as whom
+# they stand for ("user wants the first thing they asked").
+_OWNER = r"(?:i|the user|user|the owner|owner|sir)"
+_OWNER_PRONOUN = r"(?:he|they)"
+
+
+def _loose_first_re(asker: str):
+    return re.compile(
+        r"\b(?:first|earliest|opening) (?:thing|question|request|command|"
+        rf"message)s? (?:that )?{asker}(?: had| has| have)? (?:ever |just )?"
+        r"(?:asked|said|told|gave|sent|ask|say|tell)\b"
+        rf"|\b{asker} (?:ask|asked|say|said|tell|told)"
+        r"(?: you| to you| jarvis)? first\b"
+        rf"|\b{asker} first (?:ask|asked|say|said|tell|told)\b")
+
+
+_LOOSE_FIRST_RE = re.compile(
+    _loose_first_re(_OWNER).pattern
+    + r"|\b(?:my|his|users?|owners?|sirs?) (?:very )?(?:first|earliest|"
+    r"opening) (?:question|request|command)\b")
+_LOOSE_FIRST_PRONOUN_RE = _loose_first_re(_OWNER_PRONOUN)
+_USER_NAMED_RE = re.compile(r"\b(?:users?|owners?)\b")
+
+
+def first_recall_verb(text) -> Optional[str]:
+    """"ask" / "say" / "question" / "request" / "command" when ``text`` is a
+    "what was the first thing I asked" question (strict, whole-utterance),
+    else None."""
+    t = normalize(text)
+    for rx in _FIRST_RES:
+        m = rx.fullmatch(t)
+        if m:
+            g = m.groupdict()
+            v = g.get("v") or g.get("v2") or g.get("v3") or "ask"
+            return _VERBS.get(v, "ask")
+    return None
+
+
+def is_first_utterance_question(text, *, loose: bool = False) -> bool:
+    """True when ``text`` asks for the owner's FIRST utterance of this
+    session. ``loose`` also accepts a paraphrase that merely mentions "the
+    first thing I asked" (the action path), but never one with an earlier-
+    session time reference ("the first thing I asked you yesterday")."""
+    if first_recall_verb(text):
+        return True
+    if not loose:
+        return False
+    t = normalize(text)
+    asked = bool(_LOOSE_FIRST_RE.search(t)) or bool(
+        _LOOSE_FIRST_PRONOUN_RE.search(t) and _USER_NAMED_RE.search(t))
+    return asked and not _PAST_SESSION_RE.search(t)
+
+
+# A bare wake / attention phrase is not something he asked ("Jarvis", "hey
+# Jarvis", "Jarvis, wake up", "are you there"): recall skips it.
+_WAKE_ONLY_RE = re.compile(
+    r"(?:(?:hey|hi|hello|ok|okay|yo|oh) )*"
+    r"(?:jarvis(?: (?:wake up|are you (?:there|awake|up|listening)|"
+    r"you there))?|wake up(?: jarvis)?|are you (?:there|awake|listening)"
+    r"(?: jarvis)?)")
+
+
+def is_wake_only(text) -> bool:
+    """True when ``text`` is only a wake / attention phrase."""
+    if not isinstance(text, str):
+        return False
+    t = " ".join(re.sub(r"[^a-z' ]+", " ", text.lower()).split())
+    return bool(t) and bool(_WAKE_ONLY_RE.fullmatch(t))
+
+
+# A STORED owner utterance that was itself a recall question, for recall to
+# skip. Deliberately tighter than the loose ACTION-argument detectors above:
+# those see the LLM's paraphrase of the question being asked right now,
+# while these see every real thing he said. It needs a recall lead AND the
+# owner as the one who asked / said, so "what's the first thing on my
+# calendar today", "read me the first message in my inbox", "remind me to
+# call mom first thing in the morning", "read me my last message" and "what
+# did the caller just say" are real requests and ARE recalled (review F1 /
+# F2). The lead also takes "what'd" (normalised "whatd"), a yes/no "did I
+# ..." and "go back to ...": "what'd I just ask you", "did I just ask you
+# something" and "go back to my last question" are recall questions (the
+# base's loose skip caught them; the second review found them recalled
+# verbatim), while "cancel my last command" still has no lead and is a real
+# request.
+_RECALL_LEAD_RE = re.compile(
+    r"\b(?:what|whatd|which|remind|tell me|repeat|remember|recall|did i|"
+    r"go back|back to)\b")
+_SELF_RECALL_RE = re.compile(
+    r"\b(?:first|last|previous|prior|most recent|earliest|opening) "
+    r"(?:thing|question|request|command)s? (?:that )?i (?:had |have )?"
+    r"(?:ever |just )?(?:asked|said|told|gave|ask|say|tell)\b"
+    r"|\bi (?:just|first|last) (?:ask|asked|say|said|tell|told)\b"
+    r"|\bi (?:ask|asked|say|said|tell|told)(?: you| to you| jarvis)? "
+    r"(?:first|last|just now|earlier|before (?:this|that)|"
+    r"a (?:moment|second|minute|sec|while) ago|at the (?:start|beginning)|"
+    r"when you (?:started|started up|booted|booted up|came online|came up|"
+    r"woke up))\b"
+    r"|\bmy (?:very )?(?:first|last|previous|prior|most recent|earliest|"
+    r"opening) (?:question|request|command)\b"
+    r"|\bwhat (?:was|were) i (?:just )?(?:asking|saying)\b")
+
+
+def is_stored_recall_question(text) -> bool:
+    """True when a STORED owner utterance was itself a recall question ("what
+    did I just ask you", "what was the first thing I asked", "what's the
+    earliest thing I asked you today"): recall skips it. Never an ordinary
+    request that merely mentions "first thing" / "last message"."""
+    if recall_verb(text) or first_recall_verb(text):
+        return True
+    t = normalize(text)
+    return bool(_RECALL_LEAD_RE.search(t) and _SELF_RECALL_RE.search(t)
+                and not _PAST_SESSION_RE.search(t))
+
+
+def _skip_for_recall(text) -> bool:
+    """An owner utterance recall never returns: a recall question (last OR
+    first, see is_stored_recall_question) or a bare wake phrase. Stored
+    utterances are judged by the tight detector, never the loose action-
+    argument ones (those matched "the first thing on my calendar")."""
+    return is_stored_recall_question(text) or is_wake_only(text)
 
 
 def recall_verb(text) -> Optional[str]:
@@ -156,9 +368,10 @@ def prior_owner_utterance(history, *, skip_newest: bool = False
       * ``skip_newest`` drops the newest user entry — pass it when the current
         turn is already recorded (the LLM path appends the user message before
         any action runs; see recall_turn_recorded);
-      * an entry that is itself a "what did I just ask" question is skipped,
-        so asking twice recalls the same real question instead of the
-        previous recall question.
+      * an entry that is itself a recall question ("what did I just ask",
+        "what was the first thing I asked") is skipped, so asking twice
+        recalls the same real question instead of the previous recall
+        question; so is a bare wake phrase ("Jarvis", "hey Jarvis, wake up").
     """
     users = []
     for m in history or ():
@@ -169,12 +382,77 @@ def prior_owner_utterance(history, *, skip_newest: bool = False
     if skip_newest and users:
         users.pop()
     for c in reversed(users):
-        if is_last_utterance_question(c, loose=True):
+        if _skip_for_recall(c):
             continue
         cleaned = _clean_utterance(c)
         if cleaned:
             return cleaned
     return None
+
+
+def first_owner_utterance(session_turns) -> Optional[str]:
+    """The FIRST owner utterance of this session, cleaned for speech, or
+    None. ``session_turns`` is the monolith's record of the session's opening
+    owner utterances, oldest first (bobert_companion._session_opening_turns,
+    never conversation_history: that is trimmed and may hold a previous
+    process's tail). Recall questions and bare wake phrases are skipped, the
+    same rule as prior_owner_utterance."""
+    for c in session_turns if isinstance(session_turns, (list, tuple)) else ():
+        if not isinstance(c, str) or not c.strip() or _skip_for_recall(c):
+            continue
+        cleaned = _clean_utterance(c)
+        if cleaned:
+            return cleaned
+    return None
+
+
+_FIRST_FOUND = {
+    "ask": 'The first thing you asked me this session was: "{u}", sir.',
+    "say": 'The first thing you said to me this session was: "{u}", sir.',
+    "question": 'Your first question this session was: "{u}", sir.',
+    "request": 'Your first request this session was: "{u}", sir.',
+    "command": 'Your first command this session was: "{u}", sir.',
+}
+_FIRST_NONE = {
+    "ask": "You haven't asked me anything else this session yet, sir.",
+    "say": "You haven't said anything else to me this session yet, sir.",
+    "question": "There's no earlier question from you this session, sir.",
+    "request": "There's no earlier request from you this session, sir.",
+    "command": "There's no earlier command from you this session, sir.",
+}
+# The start of the session is gone: "forget the last hour" / "reset memory"
+# purged the recorded first utterance, or a blue-green handoff arrived
+# without a record of it while the conversation shows he DID say something
+# (the monolith latches this, _session_opening_lost, for the rest of the
+# session: every later utterance is NOT the first thing he asked). Or the
+# record holds nothing real, yet the history shows an earlier owner turn.
+# Never claim nothing was asked, never name a later turn as the first, and
+# never recite from the history either — it is only a tail (not the start),
+# and after a forget reciting it would undo the forget.
+_FIRST_UNKNOWN = ("I no longer have the start of this session on record, "
+                  "sir.")
+
+
+def first_utterance_reply(text, session_turns, history=None, *,
+                          skip_newest: bool = False,
+                          start_lost: bool = False) -> str:
+    """The spoken answer to "what was the first thing I asked" — the first
+    owner utterance of this session, or an honest line when there is none:
+    "nothing earlier", or, when ``start_lost`` (the monolith's latch: a
+    forget / reset purged the start, or a handoff came without it) or when
+    ``history`` (conversation_history; the current turn skipped as in
+    prior_owner_utterance) shows an earlier owner utterance the record does
+    not hold, that the start is not on record."""
+    if start_lost:
+        return _FIRST_UNKNOWN
+    verb = first_recall_verb(text) or _guess_verb(text)
+    first = first_owner_utterance(session_turns)
+    if first is None:
+        if history and prior_owner_utterance(
+                history, skip_newest=skip_newest) is not None:
+            return _FIRST_UNKNOWN
+        return _FIRST_NONE[verb]
+    return _FIRST_FOUND[verb].format(u=first)
 
 
 def recall_turn_recorded(history, action: str = "session_memory_recall"
@@ -238,22 +516,42 @@ def last_utterance_reply(text, history, *, skip_newest: bool = False) -> str:
 
 # ── the one entry point ────────────────────────────────────────────────────
 
-def match(text, *, now=None, history=(), owner_name="") -> Optional[FastAnswer]:
+def match(text, *, now=None, history=(), owner_name="",
+          session_turns=None, session_start_lost=False
+          ) -> Optional[FastAnswer]:
     """A deterministic answer for ``text``, or None to let the LLM answer.
 
-    ``now`` is the local datetime the date questions are answered from (None
-    skips them), ``history`` is conversation_history WITHOUT the current turn,
-    ``owner_name`` the configured USER_NAME ("" = unknown). Never raises."""
+    ``now`` is the local datetime the date and world-clock questions are
+    answered from (None skips them; a naive one is this machine's local
+    time), ``history`` is conversation_history WITHOUT the current turn,
+    ``owner_name`` the configured USER_NAME ("" = unknown), ``session_turns``
+    this session's opening owner utterances, oldest first (None = unknown:
+    "what was the first thing I asked" then falls through),
+    ``session_start_lost`` True when the start of the session is no longer
+    on record (see first_utterance_reply). Never raises."""
     if not isinstance(text, str) or not text.strip():
         return None
     try:
         if is_name_question(text):
             reply = name_reply(owner_name)
             return FastAnswer("owner-name", reply) if reply else None
+        if is_identity_question(text):
+            reply = identity_reply(text, owner_name)
+            return FastAnswer("owner-identity", reply) if reply else None
         if recall_verb(text):
             return FastAnswer("last-utterance",
                               last_utterance_reply(text, history))
+        if first_recall_verb(text):
+            if not isinstance(session_turns, (list, tuple)):
+                return None
+            return FastAnswer("first-utterance",
+                              first_utterance_reply(
+                                  text, session_turns, history,
+                                  start_lost=session_start_lost is True))
         if now is not None:
+            clock = world_clock.answer(text, now)
+            if clock is not None:
+                return FastAnswer(clock.kind, clock.reply)
             got = date_math.answer(text, now)
             if got is not None:
                 return FastAnswer(got.kind, got.reply)

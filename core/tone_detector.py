@@ -197,6 +197,62 @@ def is_restatement(user_text: str, prev_user_text) -> bool:
         return False
 
 
+# A request to hear JARVIS's last line again means the owner did not hear it;
+# it is not push-back. Live v2.0.140 "say that again" came out 'frustrated'
+# (the "again" marker), which makes the reply terse and apologetic. Matched on
+# the WHOLE utterance with nothing but courtesy around it, so a real marker
+# still counts: "I said, say that again", "for the last time, repeat that" and
+# "open it again" are classified exactly as before. Shared with
+# core.emotion_tracker and core.voice_emotion so all three classifiers agree.
+#
+# Courtesy and "I didn't hear" lead-ins carry no emotion of their own ("eh",
+# "sorry, I wasn't listening"); neither does asking for it louder or slower
+# ("say that again, louder", "... but slower"). Frustration markers ("ugh",
+# "no", "I said", "wrong", swears) are deliberately in NEITHER list.
+_REPEAT_FILLER = (r"(?:sorry|i'?m sorry|so sorry|excuse me|jarvis|hey|sir|um|"
+                  r"uh|er|erm|eh|huh|what|oh|please|ok|okay|wait|hold on|"
+                  r"thanks|thank you|for me|"
+                  r"i (?:wasn'?t|was not) (?:listening|paying attention)|"
+                  r"i (?:zoned|spaced) out)")
+_REPEAT_MODIFIER = (r"(?:(?:but |and )?(?:(?:a (?:bit|little) |much )?"
+                    r"(?:louder|slower|more slowly|slowly|more clearly|"
+                    r"clearer)|(?:a (?:bit|little) )?more (?:loudly|slowly)))")
+_REPEAT_ASK = (
+    r"(?:(?:(?:can|could|would|will) you )?(?:please )?"
+    r"(?:say (?:that|it|this) (?:again|one more time|once more)|say again|"
+    r"say (?:that|the) last (?:part|bit|line|sentence|thing|word|answer)"
+    r"(?: again| one more time| once more)|"
+    r"repeat(?: (?:that|it|this|yourself|what you (?:just )?said|"
+    r"the last (?:part|bit|line|sentence|thing|answer)))?"
+    r"(?: again| one more time| once more)?)"
+    r"|(?:(?:would|do) you mind )?(?:please )?(?:saying|repeating) "
+    r"(?:that|it|this)(?: again| one more time| once more)?"
+    r"|come again|(?:i )?beg your pardon|pardon(?: me)?"
+    r"|what (?:was|is) that(?: again)?"
+    r"|what(?:'d| did) you (?:just )?say(?: again)?"
+    r"|(?:i )?(?:missed|didn'?t catch|did not catch|didn'?t hear|"
+    r"did not hear|couldn'?t hear|could not hear|didn'?t get)"
+    r"(?: that| you| it| what you said)?)")
+_REPEAT_REQUEST_RE = re.compile(
+    rf"(?:(?:{_REPEAT_FILLER}|{_REPEAT_ASK}|{_REPEAT_MODIFIER}) )*"
+    rf"(?:{_REPEAT_FILLER}|{_REPEAT_ASK}|{_REPEAT_MODIFIER})")
+_REPEAT_ASK_RE = re.compile(rf"\b{_REPEAT_ASK}\b")
+
+
+def is_repeat_request(text) -> bool:
+    """True when the whole utterance asks JARVIS to repeat himself ("say that
+    again", "repeat that", "come again", "pardon", "what was that", "sorry,
+    I missed that"), with nothing else in it but courtesy. Never raises."""
+    try:
+        t = _clean(text)
+        if not t or len(t) > 120:
+            return False
+        return (bool(_REPEAT_REQUEST_RE.fullmatch(t))
+                and bool(_REPEAT_ASK_RE.search(t)))
+    except Exception:
+        return False
+
+
 def detect_tone(user_text: str, prev_user_text: str | None = None,
                 prev_turn_failed: bool = False) -> str | None:
     """Classify the emotional tone of a transcribed user utterance.
@@ -232,6 +288,11 @@ def detect_tone(user_text: str, prev_user_text: str | None = None,
         return None
 
     n_words = len(clean.split())
+
+    # "Say that again" / "sorry, I missed that": he didn't hear, which is no
+    # tone at all (only the time-of-day fallback below still applies).
+    if is_repeat_request(clean):
+        return "late_night" if _is_late_night_hour() else None
 
     def _has_any(phrases) -> bool:
         for p in phrases:

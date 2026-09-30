@@ -70,6 +70,31 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(r["mood"], "casual")
         self.assertEqual(r["addendum"], "")
 
+    def test_repeat_request_with_exclamations_is_not_excited(self):
+        # Review TONE-1: detect_tone / classify_emotion call "Say that
+        # again!!" neutral (he didn't hear), but _detect_excited still counted
+        # its '!!', so the router said 'excited' (a quip, the faster TTS
+        # preset). Before the batch it said 'stressed'. Same rule as the other
+        # two classifiers now: a daytime repeat request is 'casual'.
+        noon = datetime.datetime(2026, 9, 29, 12, 0).timestamp()
+        with mock.patch("core.tone_detector._is_late_night_hour",
+                        return_value=False), \
+                mock.patch("core.tone_detector.TONE_DETECTION_ENABLED", True), \
+                mock.patch.object(ve, "VOICE_EMOTION_ROUTER_ENABLED", True):
+            for text in ("Say that again!!", "What?! Say that again!",
+                         "say that again please!!", "Repeat that!!",
+                         "Sorry, I missed that!!"):
+                with self.subTest(text=text):
+                    self.assertFalse(ve._detect_excited(text))
+                    r = ve.route_voice_emotion(text, now=noon)
+                    self.assertEqual(r["mood"], "casual")
+                    self.assertEqual(r["addendum"], "")
+            # Control: real excitement with '!!' still routes to excited.
+            self.assertEqual(
+                ve.route_voice_emotion("This is amazing!!", now=noon)["mood"],
+                "excited")
+            self.assertTrue(ve._detect_excited("yes!! finally!!"))
+
     def test_disabled_router_returns_casual(self):
         # When the feature flag is off the router short-circuits to casual
         # regardless of the text. Flag restored after the test.

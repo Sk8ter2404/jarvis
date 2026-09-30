@@ -47,6 +47,9 @@ _IMPORT_LIGHT_CORE = (
     # core.emotion_tracker at import time (core.tts and core.tone_detector
     # import it lazily so both still run as scripts).
     "core.night_quiet",
+    # The world clock (v2.0.148): stdlib zoneinfo only, imported at monolith
+    # import time (fast paths + the reply guard).
+    "core.world_clock",
 )
 
 

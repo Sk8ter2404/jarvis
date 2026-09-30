@@ -45,6 +45,60 @@ class EmptyInputTests(unittest.TestCase):
             self.assertIsNone(r.tts_preset)
 
 
+class RepeatRequestTests(unittest.TestCase):
+    """v2.0.140 live: "say that again" read as frustration (the "again"
+    marker). A request to repeat means he did not hear: its words carry no
+    emotion, unless a real frustration marker is also present. Same rule as
+    core.tone_detector.is_repeat_request."""
+
+    def test_repeat_requests_are_not_frustrated(self):
+        for text in ("say that again", "Say that again?", "repeat that",
+                     "come again?", "Pardon?", "what was that",
+                     "Sorry, I missed that.", "could you say that again",
+                     "wait, say that again", "Say that again!!"):
+            with self.subTest(text=text):
+                r = et.classify_emotion(text, DAY)
+                self.assertIsNone(r.label, r.reason)
+                r = et.classify_emotion(
+                    text, DAY, prev_user_text="can you say that again")
+                self.assertIsNone(r.label, r.reason)
+
+    def test_prosody_and_time_of_day_still_count(self):
+        # Only the WORDS are neutral: a late hour is still the tired fallback.
+        r = et.classify_emotion("say that again", ProsodyHints(hour=23))
+        self.assertEqual(r.label, "tired")
+
+    def test_a_real_marker_still_counts(self):
+        for text in ("I said, say that again", "for the last time, repeat that",
+                     "say that again, you're not listening",
+                     "I said open the file", "open it again",
+                     "for the last time open the file"):
+            with self.subTest(text=text):
+                self.assertEqual(et.classify_emotion(text, DAY).label,
+                                 "frustrated")
+
+    def test_more_didnt_hear_phrasings_are_not_frustrated(self):
+        # Review TONE-2: these still came out 'frustrated' here too.
+        for text in ("would you mind saying that again",
+                     "say that again, louder", "say that again slower",
+                     "can you say that again but slower",
+                     "say that last part again", "eh, say that again",
+                     "what'd you say again",
+                     "sorry I wasn't listening, say that again"):
+            with self.subTest(text=text):
+                r = et.classify_emotion(text, DAY)
+                self.assertIsNone(r.label, r.reason)
+
+    def test_frustrated_repeats_stay_frustrated(self):
+        for text in ("say that again, you idiot",
+                     "that's wrong, say it again", "I said say that again",
+                     "do it again", "try again", "say it again damn it",
+                     "no, say it again", "ugh, say that again"):
+            with self.subTest(text=text):
+                self.assertEqual(et.classify_emotion(text, DAY).label,
+                                 "frustrated")
+
+
 class FrustratedTests(unittest.TestCase):
     def test_repetition_phrase(self):
         r = et.classify_emotion("I said open the file", DAY)

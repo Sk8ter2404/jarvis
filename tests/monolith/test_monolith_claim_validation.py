@@ -354,5 +354,216 @@ class TurnGroundingLedgerTests(_Base):
         self.assertEqual(bc._turn_user_text(), "")
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  (D) v2.0.148: a clock time stated for ANOTHER place is checked
+# ════════════════════════════════════════════════════════════════════════════
+# Live v2.0.140 (Tue 22:17 US Central): "what time is it in London" ran
+# get_time (the LOCAL clock) and the follow-up said "It is 10:17 PM in London,
+# sir." — grounded by get_time as far as the preemptive layer knew. London
+# was at 4:17 AM. The fast path answers the plain question first; this guard
+# covers everything that still reaches the LLM.
+LOCAL_TIME_RESULT = "current time is 10:17 PM on Tuesday, September 29, 2026"
+LIVE_LONDON = "It is 10:17 PM in London, sir."
+TRUE_LONDON = "It's 4:17 AM in London, sir. That's Wednesday there."
+
+
+class _InlineThread:
+    def __init__(self, target=None, args=(), kwargs=None, **_kw):
+        self._t, self._a, self._k = target, args, kwargs or {}
+
+    def start(self):
+        if self._t:
+            self._t(*self._a, **self._k)
+
+    def join(self, *_a, **_k):
+        return None
+
+    def is_alive(self):
+        return False
+
+
+class WorldClockGuardTests(_Base):
+    def setUp(self):
+        super().setUp()
+        try:
+            import datetime as dt
+            from zoneinfo import ZoneInfo
+            now = dt.datetime(2026, 9, 29, 22, 17,
+                              tzinfo=ZoneInfo("America/Chicago"))
+        except Exception:   # pragma: no cover - no zone data
+            self.skipTest("no IANA time zone data")
+        self._p(self.bc, "_fast_path_now", return_value=now)
+
+    def test_live_followup_is_corrected_not_read_back(self):
+        self._stub("get_time", LOCAL_TIME_RESULT)
+        self._dispatch("what time is it in London", "[ACTION: get_time]",
+                       [LIVE_LONDON, "Rather early there, sir."])
+        self.assertEqual(len(self.calls["get_time"]), 1)
+        self.gfr.assert_called_once()
+        self.assertIn(TRUE_LONDON, self.spoken)
+        self.assertFalse(any("10:17 PM in London" in s for s in self.spoken))
+
+    def test_wrong_time_from_memory_is_corrected_without_get_time(self):
+        self._stub("get_time", LOCAL_TIME_RESULT)
+        self._dispatch("what's it like in London now", LIVE_LONDON,
+                       ["Rather early there, sir."])
+        self.assertEqual(self.calls["get_time"], [])
+        self.gfr.assert_not_called()
+        self.assertEqual(self.spoken, [TRUE_LONDON])
+
+    def test_right_time_is_left_alone_and_grounded(self):
+        self._stub("get_time", LOCAL_TIME_RESULT)
+        reply = "It's 4:17 AM in London, sir."
+        cleaned, results = self._quiet(self.bc.parse_and_run_actions, reply)
+        self.assertEqual((cleaned, results), (reply, []))
+        self.assertEqual(self.calls["get_time"], [])
+
+    def test_other_actions_in_the_reply_still_run(self):
+        self._stub("get_time", LOCAL_TIME_RESULT)
+        self._stub("set_timer", "timer set for 5 minutes")
+        cleaned, results = self._quiet(
+            self.bc.parse_and_run_actions,
+            "[intent:confirmation] It is 10:17 PM in London, sir. "
+            "[ACTION: get_time] [ACTION: set_timer, 5 minutes]")
+        self.assertEqual(self.calls["get_time"], [])
+        self.assertEqual(self.calls["set_timer"], ["5 minutes"])
+        self.assertIn("It's 4:17 AM in London", cleaned)
+        self.assertNotIn("10:17 PM", cleaned)
+
+    def test_a_local_time_claim_is_judged_as_before(self):
+        # No place: the preemptive layer still injects get_time.
+        self._stub("get_time", LOCAL_TIME_RESULT)
+        _c, results = self._quiet(self.bc.parse_and_run_actions,
+                                  "It's 1:47 AM, sir.")
+        self.assertEqual([n for n, _r, _i in results], ["get_time"])
+
+    def test_the_early_speech_flush_holds_a_place_time_claim(self):
+        # "The time in London is ..." matches no preemptive pattern, so
+        # without the world-clock hold it would be voiced before the guard.
+        bc = self.bc
+        for first in ("The time in London is 10:17 PM, sir. ",
+                      "In London, it's 10:17 PM, sir. "):
+            with self.subTest(first=first):
+                spoken: list[str] = []
+                with mock.patch.object(bc, "threading", mock.Mock(
+                        Thread=_InlineThread)):
+                    buf = bc._SentenceFlushBuffer(speak_fn=spoken.append)
+                    for c in (first, "Rather early there. ", "tail"):
+                        buf.feed(c)
+                self.assertEqual(spoken, [])
+
+    def test_a_guard_failure_changes_nothing(self):
+        self._p(self.bc._world_clock, "check_time_claim",
+                side_effect=RuntimeError("boom"))
+        self._stub("get_time", LOCAL_TIME_RESULT)
+        _c, results = self._quiet(self.bc.parse_and_run_actions,
+                                  "It's 1:47 AM, sir.")
+        self.assertEqual([n for n, _r, _i in results], ["get_time"])
+
+    # ── Review WC-1: a conversion / plan / event time is not "now" ────────
+
+    def test_a_conversion_answer_is_spoken_not_replaced(self):
+        # "if it's 9 AM here what time is it in London" reaches the LLM (the
+        # fast path does not answer it); its right answer used to be thrown
+        # away for the current London time.
+        reply = "When it's 9 AM here, it's 3 PM in London, sir."
+        self._stub("get_time", LOCAL_TIME_RESULT)
+        self._dispatch("if it's 9 AM here what time is it in London", reply)
+        self.assertIn(reply, self.spoken)
+        self.assertFalse(any("4:17 AM in London" in s for s in self.spoken))
+
+    def test_a_reminder_confirmation_is_kept(self):
+        self._stub("set_reminder", "reminder set for 3 AM")
+        cleaned, results = self._quiet(
+            self.bc.parse_and_run_actions,
+            "[ACTION: set_reminder, 3 AM] I'll remind you when it's 9 AM in "
+            "London, sir.")
+        self.assertEqual(self.calls["set_reminder"], ["3 AM"])
+        self.assertIn("I'll remind you when it's 9 AM in London", cleaned)
+        self.assertNotIn("4:17 AM", cleaned)
+
+    def test_event_and_future_times_are_never_rewritten(self):
+        for reply in (
+                "If you call at 8 PM, it'll be 2 AM in London, sir.",
+                "When you land in London, it'll be 6 AM, sir.",
+                "The local time in Tokyo will be 3 PM when you land, sir.",
+                "It is 3 PM in London on Saturday when the match kicks off, "
+                "sir.",
+                "Your call with the Boston office? It's 3 PM Eastern time, "
+                "sir.",
+                "It's 9 AM Pacific time when the stream starts, sir."):
+            with self.subTest(reply=reply):
+                cleaned, _results = self._quiet(
+                    self.bc.parse_and_run_actions, reply)
+                self.assertTrue(cleaned.startswith(reply.split(",")[0]),
+                                cleaned)
+                self.assertNotIn("That's Wednesday there", cleaned)
+
+    # ── Review WC-2 / WC-3 / WC-4: a correct answer is never replaced ────
+
+    def test_correct_answers_for_unmapped_places_are_kept(self):
+        for reply in ("It's 6:17 AM in Eastern Europe, sir.",
+                      "It's 10:17 PM in Athens, Georgia, sir.",
+                      "It's 11:17 PM in London, Ontario, sir.",
+                      "It's 10:17 PM. In London, it's 4:17 AM."):
+            with self.subTest(reply=reply):
+                cleaned, _results = self._quiet(
+                    self.bc.parse_and_run_actions, reply)
+                self.assertEqual(cleaned, reply)
+
+    # ── Review WC-5: a right place-time never vouches for a wrong local one
+
+    def test_a_wrong_local_time_beside_a_right_london_time_gets_get_time(self):
+        self._stub("get_time", LOCAL_TIME_RESULT)
+        self._dispatch("what time is it here and in London",
+                       "It's 10:02 PM here, sir, and in London it's about "
+                       "4 AM.",
+                       ["It's 10:17 PM here, sir, and 4:17 AM in London."])
+        self.assertEqual(len(self.calls["get_time"]), 1)
+        self.gfr.assert_called_once()
+
+    # ── Second review: residual WC-1 / WC-3 / WC-4, end to end ────────────
+
+    def test_a_time_difference_answer_is_spoken_not_replaced(self):
+        # A sentence with a second clock time that is not the time here now
+        # is a conversion; "time difference" questions reach the LLM.
+        reply = ("Tokyo is 14 hours ahead of you, sir, so at 9 AM here it's "
+                 "11 PM in Tokyo.")
+        self._stub("get_time", LOCAL_TIME_RESULT)
+        self._dispatch("what is the time difference between here and Tokyo",
+                       reply)
+        self.assertIn(reply, self.spoken)
+        self.assertFalse(any("12:17 PM in Tokyo" in s for s in self.spoken))
+
+    def test_an_abbreviated_us_state_answer_is_kept(self):
+        reply = "It's 11:17 PM in Athens, GA, sir."
+        self._stub("get_time", LOCAL_TIME_RESULT)
+        self._dispatch("what time is it in Athens Georgia", reply)
+        self.assertIn(reply, self.spoken)
+        self.assertFalse(any("6:17 AM in Athens" in s for s in self.spoken))
+
+    def test_a_time_now_question_with_a_reason_is_still_corrected(self):
+        # The first fix's question blacklist ("call", "game", ...) switched
+        # the guard off here, and the live bug was voiced unchanged.
+        self._stub("get_time", LOCAL_TIME_RESULT)
+        self._dispatch("what time is it in London? I want to call my mom",
+                       "[ACTION: get_time]", [LIVE_LONDON])
+        self.assertEqual(len(self.calls["get_time"]), 1)
+        self.assertIn(TRUE_LONDON, self.spoken)
+        self.assertFalse(any("10:17 PM in London" in s for s in self.spoken))
+
+    def test_a_two_clause_answer_with_a_connective_is_kept(self):
+        reply = "It's 10:17 PM here, whereas in London, it's 4:17 AM."
+        cleaned, _results = self._quiet(self.bc.parse_and_run_actions, reply)
+        self.assertEqual(cleaned, reply)
+
+    def test_the_masked_scan_still_injects_for_the_local_clause(self):
+        self._stub("get_time", LOCAL_TIME_RESULT)
+        _c, results = self._quiet(
+            self.bc.parse_and_run_actions,
+            "It's 10:02 PM here, sir, and in London it's about 4 AM.")
+        self.assertEqual([n for n, _r, _i in results], ["get_time"])
+
+
 if __name__ == "__main__":
     unittest.main()

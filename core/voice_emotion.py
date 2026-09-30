@@ -22,6 +22,7 @@ import re
 from core.tone_detector import (
     detect_tone,
     _late_night_tone_applies,
+    is_repeat_request,
     _EXCITEMENT_PHRASES,
     _STRESS_SWEAR_WORDS,
 )
@@ -59,12 +60,19 @@ def _detect_excited(user_text: str) -> bool:
     """True when the utterance carries high-energy positive markers — at least
     one excitement phrase OR ≥2 exclamation marks without swearing. Kept
     separate from detect_tone() so the router can promote excitement above
-    'playful' (which is gentler than what an excited user wants)."""
+    'playful' (which is gentler than what an excited user wants).
+
+    A request to repeat ("Say that again!!", "What?! Say that again!") is
+    never excitement: he did not hear JARVIS, and its '!!' is emphasis, not
+    energy. Same rule as detect_tone / emotion_tracker.classify_emotion
+    (core.tone_detector.is_repeat_request), so all three agree and the
+    repeated line is not answered with a quip in the faster 'excited'
+    voice."""
     if not user_text:
         return False
     clean = re.sub(r"[^a-z' ]+", " ", user_text.lower())
     clean = re.sub(r"\s+", " ", clean).strip()
-    if not clean:
+    if not clean or is_repeat_request(clean):
         return False
     for phrase in _EXCITEMENT_PHRASES:
         if re.search(r'\b' + re.escape(phrase) + r'\b', clean):

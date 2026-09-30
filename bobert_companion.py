@@ -19110,8 +19110,11 @@ class _SentenceFlushBuffer:
         # the same permanent stop as '[' — the whole reply rides the
         # normal path, where the interceptor speaks the TRUE value.
         try:
-            if any(rx.search(piece) for rx, _a, _d
-                   in _PREEMPTIVE_HALLUCINATION_PATTERNS):
+            # A time stated for another place ("The time in London is ...")
+            # is checked by _world_clock_check before it is voiced (v2.0.148).
+            if (any(rx.search(piece) for rx, _a, _d
+                    in _PREEMPTIVE_HALLUCINATION_PATTERNS)
+                    or _world_clock.has_time_claim(piece)):
                 self._stopped = True
                 return True
             # A refusal of an explicit joke request is replaced by
@@ -29450,6 +29453,27 @@ def _detect_dropped_steps(reply_text: str,
     return dropped
 
 
+def _world_clock_check(reply: str):
+    """core.world_clock.check_time_claim at the fast-path clock, for the
+    owner's question this turn (a conversion / conditional / event question
+    is never checked). On a correction, the reply's [ACTION:] tokens other
+    than get_time (the LOCAL time is what went wrong) are kept after the true
+    line, in ``reply`` and in ``masked`` alike. None = the reply states no
+    time-now for a known place. Never raises."""
+    try:
+        got = _world_clock.check_time_claim(reply, _fast_path_now(),
+                                            question=_turn_user_text())
+        if got is None or not got.corrected:
+            return got
+        keep = [m.group(0) for m in _ACTION_RE.finditer(reply)
+                if m.group(1).strip().lower() != "get_time"]
+        return got._replace(reply=" ".join([got.reply] + keep),
+                            masked=" ".join([got.masked] + keep).strip())
+    except Exception as _e:
+        print(f"  [world-clock] check failed: {_e}")
+        return None
+
+
 def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]:
     """
     Find all [ACTION: ...] tokens, execute whitelisted ones, defer risky ones
@@ -29475,6 +29499,22 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
     # action is still injected, and a follow-up that reads back the time but
     # invents the weather still gets weather_briefing. 'refuse' patterns (no
     # real action exists) are never grounded.
+    #
+    # WORLD-CLOCK claims (v2.0.148): get_time reads the LOCAL clock, and live
+    # v2.0.140 "what time is it in London" was answered "It is 10:17 PM in
+    # London, sir." (London was at 4:17 AM). A time-now stated for a place
+    # core/world_clock.py knows is checked against that place's real time: a
+    # wrong one is replaced by the true line. Those claims (and the true
+    # lines) are blanked out of the text the preemptive layer scans, so they
+    # never inject get_time — but ONLY those clauses: a wrong LOCAL time in
+    # the same reply ("It's 10:02 PM here, sir, and in London it's about
+    # 4 AM") is still judged exactly as before and still injects get_time.
+    _wc = _world_clock_check(reply)
+    if _wc is not None and _wc.corrected:
+        print(f"  [world-clock] reply gave the wrong time for "
+              f"{', '.join(_wc.places)} — spoke the real time there")
+        reply = _wc.reply
+    _preempt_scan = _wc.masked if _wc is not None else reply
     _grounded_skips: dict[str, str] = {}
 
     def _preempt_is_grounded(action_name: str) -> bool:
@@ -29484,7 +29524,8 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
         return bool(_by)
 
     _preempt = _detect_preemptive_hallucination(
-        reply, is_grounded=_preempt_is_grounded, user_text=_turn_user_text())
+        _preempt_scan, is_grounded=_preempt_is_grounded,
+        user_text=_turn_user_text())
     for _g_action, _g_by in _grounded_skips.items():
         print(
             f"  [preemptive_hallucination] claim is grounded by {_g_by}, "
@@ -33545,6 +33586,7 @@ def _maybe_orchestrate(text: str) -> bool:
 
 
 from core import fast_paths as _fast_paths  # noqa: E402
+from core import world_clock as _world_clock  # noqa: E402
 
 
 def _fast_path_now():
@@ -33554,14 +33596,144 @@ def _fast_path_now():
     return _fp_datetime.datetime.now()
 
 
+# The owner's opening utterances of THIS process, oldest first, for "what was
+# the first thing I asked you" (core/fast_paths.first_owner_utterance; live
+# v2.0.140 the LLM route said it had no access). conversation_history cannot
+# answer it: it is trimmed from the front (MAX_CONVERSATION_HISTORY) and a
+# blue-green handoff seeds it with the PREVIOUS process's tail. Filled by
+# _note_session_owner_utterance from the main loop's accepted "You:" line;
+# it stops growing once it holds a recallable utterance, so it stays tiny.
+# _session_opening_ts holds each entry's time.time(), index for index, so
+# "forget the last hour" can purge it (_forget_session_opening_since). A
+# blue-green handoff carries both to the next process (the session goes on).
+#
+# _session_opening_lost[0] latches True once the start of the session is gone:
+# a forget / reset purged the recorded first utterance, or a handoff arrived
+# without one while its tail shows he had spoken. From then on the record
+# stops filling (every later utterance is NOT the first thing he asked) and
+# "what was the first thing I asked you" says the start is not on record.
+# Only a new session (a fresh process, no handoff) clears it; a handoff
+# carries it.
+_SESSION_OPENING_MAX = 8
+_session_opening_turns: list[str] = []
+_session_opening_ts: list[float] = []
+_session_opening_lost: list[bool] = [False]
+
+
+def _note_session_owner_utterance(text: str) -> None:
+    """Main loop, right after an owner turn is accepted (voice or typed):
+    record it until the session's first REAL utterance is on record. Recall
+    questions and bare wake phrases before it are kept but never recalled
+    (the fast-path skip rule); if the cap fills with nothing but those, the
+    oldest is dropped. Nothing is recorded once the start is lost
+    (_session_opening_lost). Never raises."""
+    try:
+        if not isinstance(text, str) or not text.strip():
+            return
+        if _session_opening_lost[0]:
+            return
+        if _fast_paths.first_owner_utterance(_session_opening_turns):
+            return
+        _align_session_opening_ts()
+        if len(_session_opening_turns) >= _SESSION_OPENING_MAX:
+            del _session_opening_turns[0]
+            del _session_opening_ts[0]
+        _session_opening_turns.append(text)
+        _session_opening_ts.append(time.time())
+    except Exception as _e:
+        print(f"  [fast-path] session record failed: {_e}")
+
+
+def _align_session_opening_ts() -> None:
+    """Keep the stamps index-aligned with the record. An entry with no stamp
+    (anything that filled the record another way) counts as NOW: a forget
+    drops it rather than keeping what it cannot date."""
+    now = time.time()
+    del _session_opening_ts[len(_session_opening_turns):]
+    while len(_session_opening_ts) < len(_session_opening_turns):
+        _session_opening_ts.append(now)
+
+
+def _forget_session_opening_since(cutoff) -> int:
+    """core.actions forget_last_hour / reset_memory: drop the recorded
+    opening utterances stamped at or after ``cutoff`` (epoch seconds), or
+    every one when ``cutoff`` is None. When a dropped entry was the
+    session's first REAL utterance, the start is lost for the rest of the
+    session (_session_opening_lost): the next thing he says must never be
+    recited as the first thing he asked. Dropping only wake phrases or
+    recall questions loses nothing. Returns how many were dropped. Raises
+    on a real fault so the caller DISCLOSES it (never a silent no-op)."""
+    _align_session_opening_ts()
+    keep, dropped = [], []
+    for ts, t in zip(_session_opening_ts, _session_opening_turns):
+        (keep if cutoff is not None and ts < cutoff else dropped).append(
+            (ts, t))
+    removed = len(dropped)
+    _session_opening_turns[:] = [t for _ts, t in keep]
+    _session_opening_ts[:] = [ts for ts, _t in keep]
+    if _fast_paths.first_owner_utterance([t for _ts, t in dropped]):
+        _session_opening_lost[0] = True
+    if removed:
+        print(f"  [fast-path] forgot {removed} recorded opening "
+              f"utterance(s)")
+    return removed
+
+
+def _seed_session_opening(turns, stamps, lost=False, tail=None) -> int:
+    """Blue-green handoff: seed the record from the previous process's
+    (the session did not end, so its first utterance is still the first).
+    Only strings, at most _SESSION_OPENING_MAX (the newest kept), and only
+    into an empty record. A stamp that is not a number counts as now.
+
+    The start is LOST (_session_opening_lost) when the previous process says
+    so (``lost``), when it sent no record at all (an older version) while
+    the resumed conversation ``tail`` holds an owner turn, or when the record
+    holds nothing real while the tail holds a real owner utterance: a later
+    turn must never be named as the first thing he asked.
+    Returns how many were seeded. Never raises."""
+    try:
+        seeded = 0
+        if not _session_opening_turns and isinstance(turns, list):
+            stamps = stamps if isinstance(stamps, list) else []
+            now = time.time()
+            pairs = []
+            for i, t in enumerate(turns):
+                if not isinstance(t, str) or not t.strip() or len(t) > 2000:
+                    continue
+                ts = stamps[i] if i < len(stamps) else None
+                if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+                    ts = now
+                pairs.append((float(ts), t))
+            pairs = pairs[-_SESSION_OPENING_MAX:]
+            _session_opening_turns[:] = [t for _ts, t in pairs]
+            _session_opening_ts[:] = [ts for ts, _t in pairs]
+            seeded = len(pairs)
+        tail = tail if isinstance(tail, list) else []
+        owner_spoke = any(isinstance(m, dict) and m.get("role") == "user"
+                          for m in tail)
+        if (lost is True
+                or (not isinstance(turns, list) and owner_spoke)
+                or (_fast_paths.first_owner_utterance(_session_opening_turns)
+                    is None
+                    and _fast_paths.prior_owner_utterance(tail)
+                    is not None)):
+            _session_opening_lost[0] = True
+        return seeded
+    except Exception as _e:
+        print(f"  [blue-green] session record seed failed: {_e}")
+        return 0
+
+
 def _run_fast_paths(text: str) -> bool:
     """Deterministic answers with no LLM (core/fast_paths.py, 2026-09-29):
     relative-date math ("what's the date tomorrow", "how many days until
-    Christmas", "how long until Friday"), "what did I just ask you" (the most
-    recent PRIOR owner utterance in conversation_history — the current one is
-    not in it yet) and "what's my name" (USER_NAME; blank = no match, so the
-    LLM answers and nothing is invented). The local model was wrong at all
-    three and slow.
+    Christmas", "how long until Friday", "what's the date next Monday"),
+    "what time is it in London" (core/world_clock.py), "what did I just ask
+    you" (the most recent PRIOR owner utterance in conversation_history — the
+    current one is not in it yet), "what was the first thing I asked you"
+    (_session_opening_turns) and "what's my name" / "who am I" (USER_NAME;
+    blank = no match, so the LLM answers and nothing is invented). The local
+    model was wrong at all of them and slow.
 
     Runs from _run_voice_shortcuts, i.e. for voice AND typed / injected turns,
     right before _run_llm_dispatch: no processing filler is ever armed and the
@@ -33577,6 +33749,8 @@ def _run_fast_paths(text: str) -> bool:
             now=_fast_path_now(),
             history=list(conversation_history),
             owner_name=globals().get("USER_NAME", "") or "",
+            session_turns=list(_session_opening_turns),
+            session_start_lost=bool(_session_opening_lost[0]),
         )
     except Exception as _e:
         print(f"  [fast-path] failed: {_e}")
@@ -34145,6 +34319,12 @@ def _blue_green_loop_tick() -> bool:
                     "active_timers":   _active_timers_snapshot,
                     "conversation_tail": conversation_history[-6:]
                         if isinstance(conversation_history, list) else [],
+                    # "What was the first thing I asked you" (v2.0.148):
+                    # the session goes on across the swap, so its opening
+                    # utterances (and their stamps, for a later forget) do.
+                    "session_opening_turns": list(_session_opening_turns),
+                    "session_opening_ts": list(_session_opening_ts),
+                    "session_opening_lost": bool(_session_opening_lost[0]),
                     "last_speech_time": last_speech_time,
                     "version_at_handoff": _bgm.read_version(),
                     "signaled_at": _signal.get("signaled_at", _now_bg),
@@ -34337,6 +34517,21 @@ def _consume_blue_green_handoff() -> tuple[float | None, list]:
                 print(f"  [blue-green] resumed {len(_tail)} message(s) from handoff")
             except Exception as _hxe:
                 print(f"  [blue-green] handoff replay failed: {_hxe}")
+        # The session's opening utterances (v2.0.148): seeded BEFORE the main
+        # loop records the first new turn, so "what was the first thing I
+        # asked you" still answers from the real start of the session rather
+        # than claiming nothing was asked while the tail above shows it was.
+        # A sender without a record (an older version) or one that had lost
+        # the start latches _session_opening_lost instead: nothing said after
+        # the swap is ever named as the first thing he asked.
+        _seeded = _seed_session_opening(
+            _handoff.get("session_opening_turns"),
+            _handoff.get("session_opening_ts"),
+            lost=_handoff.get("session_opening_lost") is True,
+            tail=_tail if isinstance(_tail, list) else [])
+        if _seeded:
+            print(f"  [blue-green] resumed {_seeded} session-opening "
+                  f"utterance(s) from handoff")
         # round5-M-5: pull the four other payload fields the previous consumer
         # silently dropped. last_speech_time + active_timers are applied later
         # (after the unconditional set_state('idle') resets them at the bottom
@@ -35861,6 +36056,9 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 # presence gate (should_be_proactive).
                 if _injected_text is None:
                     _note_owner_voice()
+                # "What was the first thing I asked you" reads this session's
+                # opening utterances, never the trimmed history.
+                _note_session_owner_utterance(text)
                 # Rolling 5-line history feeds the holographic HUD v2
                 # scrolling transcript panel. Cap at 5 entries here so the
                 # JSON file stays small.

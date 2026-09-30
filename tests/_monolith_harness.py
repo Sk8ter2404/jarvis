@@ -245,6 +245,12 @@ _MONOLITH_RESTORE_NAMES = (
     "_last_owner_voice_at", "_proactive_recent", "_proactive_remarks_at",
     "_proactive_last_attempt_at", "_proactive_hold_logged",
     "_face_detect_last", "_face_presence_trackers", "_face_presence_fp",
+    # "What was the first thing I asked" (v2.0.148): the session's opening
+    # owner utterances. A test that recorded one would make a LATER test's
+    # first-thing recall answer from THAT test's session. Its stamps (for
+    # "forget the last hour") and its "start lost" latch (a leaked True would
+    # silence every later test's record) are restored with it.
+    "_session_opening_turns", "_session_opening_ts", "_session_opening_lost",
     # H-6 (2026-08-20): the abandoned-native-close count. A leaked non-zero
     # value would make every later _refresh_devices test silently defer its
     # reinit — the exact "green for the wrong reason" shape.

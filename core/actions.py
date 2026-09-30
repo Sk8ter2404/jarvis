@@ -1487,6 +1487,16 @@ def _act_reset_memory(_: str = "") -> str:
             ltm_note = (f" — WARNING: the long-term semantic store was NOT "
                         f"cleared ({le}); recorded facts and the "
                         f"conversation log remain")
+        # This session's opening-utterance record ("what was the first thing
+        # I asked you", v2.0.148) is wiped with everything else.
+        try:
+            _forget_opening = getattr(bc, "_forget_session_opening_since",
+                                      None)
+            if callable(_forget_opening):
+                _forget_opening(None)
+        except Exception as oe:
+            ltm_note += (f" — WARNING: this session's opening-utterance "
+                         f"record was NOT cleared ({oe})")
         if existed:
             return (f"memory reset (backup -> backups/"
                     f"{os.path.basename(backup_path)}){ltm_note}")
@@ -1715,7 +1725,8 @@ def _act_forget_last_hour(_: str = "") -> str:
     """Drop the last hour's traces from EVERY conversation store:
     bobert_memory.json topics/sessions and hidden topic sightings, the tiered
     LTM store (verbatim episodes.jsonl turn log, semantic facts created in the
-    window, the in-process working turns) and the voice-command pattern log.
+    window, the in-process working turns), the voice-command pattern log and
+    the monolith's in-process record of this session's opening utterances.
     Facts/projects in bobert_memory are intentionally NOT touched — those
     are durable knowledge, not session traces. The bobert prune is held
     under _memory_lock so it can't race with learn_from_turn; the LTM
@@ -1770,6 +1781,23 @@ def _act_forget_last_hour(_: str = "") -> str:
                 bc.pattern_memory.forget_voice_commands_since(cutoff))
         except Exception as ve:
             failures.append(f"the voice-command log was NOT purged ({ve})")
+        # The in-process record of this session's opening utterances ("what
+        # was the first thing I asked you", v2.0.148) is a conversation store
+        # too, and it lives for the whole process: left alone, JARVIS would
+        # confirm the forget and then recite the forgotten first request word
+        # for word.
+        opening_removed = 0
+        try:
+            _forget_opening = getattr(bc, "_forget_session_opening_since",
+                                      None)
+            if callable(_forget_opening):
+                _n = _forget_opening(cutoff)
+                if isinstance(_n, int) and not isinstance(_n, bool):
+                    opening_removed = _n
+        except Exception as oe:
+            failures.append(
+                f"this session's opening-utterance record was NOT purged "
+                f"({oe})")
 
         bits = []
         if removed:
@@ -1782,6 +1810,10 @@ def _act_forget_last_hour(_: str = "") -> str:
             bits.append(f"{fcs} fact(s)")
         if vc_removed:
             bits.append(f"{vc_removed} voice command(s)")
+        if opening_removed and not bits:
+            # Normally the same utterances are already counted as logged
+            # turns; say so only when nothing else was.
+            bits.append(f"{opening_removed} recorded utterance(s)")
         warn = (" — WARNING: " + "; ".join(failures)) if failures else ""
         if not bits:
             return "nothing recent enough to forget" + warn
@@ -2381,6 +2413,37 @@ def _act_session_memory_recall(args: str = "") -> str:
         query = utterance
     try:
         from core import fast_paths as _fp
+        # "What was the first thing I asked you (today)" (v2.0.148): the
+        # session's opening utterances the monolith records, not the trimmed
+        # history (live v2.0.140 this route said it had no access). A
+        # paraphrase in the argument counts; so do his own words.
+        _turns = getattr(bc, "_session_opening_turns", None)
+        if isinstance(_turns, list) and (
+                _fp.is_first_utterance_question(query, loose=True)
+                or _fp.is_first_utterance_question(utterance)):
+            turns = [t for t in _turns if isinstance(t, str)]
+            # main() records THIS turn before dispatch, so on the LLM route
+            # the question being asked can sit in the record as its newest
+            # entry — and, right after a start, as the session's only real
+            # one ("what did I ask you at the start of today" slips past the
+            # recall detectors). Never recall the current question as the
+            # first thing he asked: drop it, the same rule as skip_newest for
+            # "what did I just ask you".
+            if (utterance and turns
+                    and _fp.normalize(turns[-1]) == _fp.normalize(utterance)):
+                turns = turns[:-1]
+            _hist = bc.conversation_history
+            _hist = list(_hist) if isinstance(_hist, list) else []
+            # The monolith's latch: a forget / reset purged the start, or a
+            # handoff came without it — no later turn is the first thing.
+            _lost = getattr(bc, "_session_opening_lost", None)
+            _lost = (isinstance(_lost, list) and bool(_lost)
+                     and _lost[0] is True)
+            return _fp.first_utterance_reply(
+                utterance if _fp.first_recall_verb(utterance) else query,
+                turns, _hist,
+                skip_newest=_fp.recall_turn_recorded(_hist),
+                start_lost=_lost)
         if _fp.is_last_utterance_question(query, loose=True):
             history = list(bc.conversation_history)
             return _fp.last_utterance_reply(
