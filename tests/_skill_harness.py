@@ -46,6 +46,8 @@ SKILL_UTILS_KEYS = (
     # Device dialogues (core/dialogue.py, 2026-09-29).
     "dialogue_ready", "dialogue_session", "speak_line", "listen_for_stop",
     "local_complete", "register_self_voiced", "is_self_voiced",
+    # Utterance routes (2026-09-29).
+    "register_utterance_route",
 )
 
 # Top-level module names whose import failure indicates a REAL bug (a broken
@@ -73,6 +75,9 @@ def make_fake_skill_utils(**overrides):
     utils["local_complete"].return_value = None
     utils["register_self_voiced"].return_value = True
     utils["is_self_voiced"].return_value = False
+    # A route registration is accepted but never called: the fake has no LLM
+    # dispatch, so a test that needs routing calls the route itself.
+    utils["register_utterance_route"].return_value = True
     utils.update(overrides)
     return utils
 

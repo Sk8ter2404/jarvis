@@ -53,6 +53,8 @@ skill sees identical semantics whether it goes through the dict or this object:
     ``"failed"``, ``listen_for_stop`` / ``local_complete`` → ``None``,
     ``register_self_voiced`` / ``is_self_voiced`` → ``False``) — an older
     monolith without the hooks simply never runs a dialogue.
+  * **Utterance routes** (``register_utterance_route`` → ``False``) — an older
+    monolith leaves every request to the LLM.
 
 Stdlib-only by contract
 ------------------------
@@ -116,6 +118,8 @@ class JarvisServicesProtocol(Protocol):
     def local_complete(self, system: str, messages: list, **kwargs: Any) -> Optional[str]: ...
     def register_self_voiced(self, name: str) -> bool: ...
     def is_self_voiced(self, name: str) -> bool: ...
+    def register_utterance_route(self, fn: Callable[[str], Optional[str]],
+                                 name: str = "") -> bool: ...
 
 
 # Sentinel that means "no backing callable was wired for this key". Distinct from
@@ -306,3 +310,11 @@ class JarvisServices:
 
     def is_self_voiced(self, name: str) -> bool:
         return bool(self._call("is_self_voiced", name, _default=False))
+
+    def register_utterance_route(self, fn: Callable[[str], Optional[str]],
+                                 name: str = "") -> bool:
+        """Claim exact requests before the LLM: ``fn(text)`` returns one
+        "[ACTION: name, arg]" token or None. False when refused or unwired
+        (an older monolith simply leaves routing to the LLM)."""
+        return bool(self._call("register_utterance_route", fn, name,
+                               _default=False))

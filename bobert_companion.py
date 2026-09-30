@@ -19304,35 +19304,29 @@ def _after_local_post() -> bool:
         return False
 
 
-def _call_llm(user_text: str) -> str:
-    # New reply, new early-speech ledger: whatever the flush buffer voiced
-    # last turn was already consumed by the downstream speaker, and a stale
-    # prefix must never strip text from THIS turn's reply.
-    _stream_spoken_prefix[0] = ""
-    conversation_history.append({"role": "user", "content": user_text})
-    # Trim BEFORE the API request, not just after (line ~9750). A boot-time /
-    # follow-up-loop assistant-only append can leave conversation_history
-    # LEADING with an 'assistant' message; sending that to Claude 400s ('first
-    # message must use the user role') and the whole first turn degrades to
-    # local. _trim_conversation_history drops leading non-'user' messages, so
-    # running it here guarantees the very first request is well-formed. 2026-07-08.
-    _trim_conversation_history()
-    _ltm_enqueue("user", user_text)
+def _classify_turn_mood(user_text: str) -> tuple:
+    """Classify THIS utterance's mood and stamp the per-turn cells TTS reads
+    (_last_user_tone, _last_voice_route, _last_emotion -- synthesise() picks
+    the prosody preset from them via _synth_user_tone / _resolve_tts_preset).
+    Returns ``(tone, route, emotion_addendum)`` for the system prompt.
 
-    # Classify mood from this utterance and (if non-default) extend the
-    # system prompt for this single turn. Cache the label so the follow-up
-    # call stays in the same register without re-running the detector.
-    # Guarded to a neutral default on any raise — like the voice-mood /
-    # emotion-tracker / mode-router adapters below — so a classifier glitch
-    # degrades the register for this turn instead of crashing the LLM turn
-    # (which the unguarded main loop would turn into a full crash).
+    _call_llm runs it first; a turn that bypasses the LLM (a skill's
+    utterance route) runs it too, or every line that turn speaks would carry
+    the PREVIOUS utterance's mood. Side-effect free apart from the three
+    cells: the voice-mood RESPONSE (lights, nudge suppression) and the prompt
+    addenda stay in _call_llm.
+
+    Each classifier is guarded to a neutral default on any raise, so a glitch
+    degrades the register for this turn instead of crashing the turn (which
+    the unguarded main loop would turn into a full crash)."""
+    # Text tone. Cached so the follow-up call stays in the same register
+    # without re-running the detector.
     try:
         tone = detect_tone(user_text)
     except Exception as _tone_err:
         print(f"  [tone] classifier failed: {_tone_err}")
         tone = None
     _last_user_tone[0] = tone
-    _last_user_text[0] = user_text
     if tone:
         print(f"  [tone] {tone}")
 
@@ -19340,8 +19334,7 @@ def _call_llm(user_text: str) -> str:
     # mood label and emits a per-turn system-prompt addendum (reply length
     # + register). TTS prosody for the same mood is picked downstream by
     # synthesise() via _USER_TONE_TTS. Cached so the follow-up call stays
-    # in the same register without re-classifying. Same neutral-default guard
-    # as the tone classifier above.
+    # in the same register without re-classifying.
     try:
         route = route_voice_emotion(user_text)
     except Exception as _route_err:
@@ -19350,24 +19343,6 @@ def _call_llm(user_text: str) -> str:
     _last_voice_route[0] = route
     if route["mood"] != "casual":
         print(f"  [voice-mood] {route['mood']}")
-
-    # Voice-mood response: closes the loop on a 'stressed' label by
-    # suppressing proactive nudges for 15 min, dimming Hue/Govee lights to
-    # warm 2700K on a daemon thread, and returning an extra-deferential
-    # addendum to stack onto sys_prompt_now. Returns '' for every other
-    # mood so non-stressed turns are unchanged.
-    voice_mood_addendum = ""
-    if _voice_mood_response is not None:
-        try:
-            voice_mood_addendum = _voice_mood_response.apply_voice_mood_response(
-                route,
-                user_text,
-                memory_lock=_memory_lock,
-                load_memory=load_memory,
-                save_memory=save_memory,
-            )
-        except Exception as _vm_err:
-            print(f"  [voice-mood] response adapter failed: {_vm_err}")
 
     # Five-label emotion tracker (core/emotion_tracker). Adds a 'focused'
     # bucket the legacy detector lacks and maps each label to a TTS preset
@@ -19391,6 +19366,46 @@ def _call_llm(user_text: str) -> str:
             _last_emotion[0] = None
     else:
         _last_emotion[0] = None
+    return tone, route, emotion_addendum
+
+
+def _call_llm(user_text: str) -> str:
+    # New reply, new early-speech ledger: whatever the flush buffer voiced
+    # last turn was already consumed by the downstream speaker, and a stale
+    # prefix must never strip text from THIS turn's reply.
+    _stream_spoken_prefix[0] = ""
+    conversation_history.append({"role": "user", "content": user_text})
+    # Trim BEFORE the API request, not just after (line ~9750). A boot-time /
+    # follow-up-loop assistant-only append can leave conversation_history
+    # LEADING with an 'assistant' message; sending that to Claude 400s ('first
+    # message must use the user role') and the whole first turn degrades to
+    # local. _trim_conversation_history drops leading non-'user' messages, so
+    # running it here guarantees the very first request is well-formed. 2026-07-08.
+    _trim_conversation_history()
+    _ltm_enqueue("user", user_text)
+
+    # Classify this utterance's tone / voice mood / emotion (stamps the
+    # _last_user_tone / _last_voice_route / _last_emotion cells TTS reads).
+    tone, route, emotion_addendum = _classify_turn_mood(user_text)
+    _last_user_text[0] = user_text
+
+    # Voice-mood response: closes the loop on a 'stressed' label by
+    # suppressing proactive nudges for 15 min, dimming Hue/Govee lights to
+    # warm 2700K on a daemon thread, and returning an extra-deferential
+    # addendum to stack onto sys_prompt_now. Returns '' for every other
+    # mood so non-stressed turns are unchanged.
+    voice_mood_addendum = ""
+    if _voice_mood_response is not None:
+        try:
+            voice_mood_addendum = _voice_mood_response.apply_voice_mood_response(
+                route,
+                user_text,
+                memory_lock=_memory_lock,
+                load_memory=load_memory,
+                save_memory=save_memory,
+            )
+        except Exception as _vm_err:
+            print(f"  [voice-mood] response adapter failed: {_vm_err}")
 
     # Agent-mode addendum: when the user is in agent mode, extend the
     # system prompt with a PLAN→EXECUTE→CRITIQUE→REPORT directive so the
@@ -26180,6 +26195,7 @@ skill_utils = {
     "local_complete":   lambda *a, **kw: _local_complete(*a, **kw),
     "register_self_voiced": lambda n: register_self_voiced(n),
     "is_self_voiced":   lambda n: is_self_voiced(n),
+    "register_utterance_route": lambda fn, name="": register_utterance_route(fn, name),
 }
 
 # M2 Phase 1 (2026-06-02): typed capability seam. JarvisServices wraps the
@@ -26273,12 +26289,82 @@ def is_self_voiced(name) -> bool:
         return False
 
 
+# UTTERANCE ROUTES (2026-09-29): a skill can claim an exact request BEFORE the
+# LLM. Live: "Jarvis, talk to the <device>" was answered with chat ("I'll see
+# if I can get him to cooperate, sir") and the action never ran; speech-to-text
+# also spelled the device's name three ways. A route is a callable(text) that
+# returns ONE action token -- "[ACTION: name]" or "[ACTION: name, arg]" -- or
+# None. The first route that returns a well-formed token for a REGISTERED
+# action wins: _run_llm_dispatch_body uses it as the turn's reply, so the
+# action runs through the normal path (self-voiced / verbatim / follow-up rules
+# all apply) and the LLM is never called. None, junk, an unknown action or an
+# exception falls through to the LLM. Registered by a skill at run time with
+# skill_utils["register_utterance_route"](fn, name). SKILL_ROUTES_ENABLED=False
+# (user_settings.json) turns every route off.
+_UTTERANCE_ROUTES: list = []
+_ROUTE_TOKEN_RE = re.compile(
+    r"^\[ACTION:\s*([A-Za-z0-9_]+)\s*(?:,\s*([^\]\n]{0,200}?))?\s*\]$")
+
+
+def register_utterance_route(fn, name: str = "") -> bool:
+    """Register ``fn(text) -> token | None`` (see _UTTERANCE_ROUTES). A route
+    with the same ``name`` is replaced (a skill reload re-registers). False
+    for a non-callable."""
+    try:
+        if not callable(fn):
+            return False
+        label = str(name or getattr(fn, "__name__", "") or "route")[:60]
+        _UTTERANCE_ROUTES[:] = [(lb, f) for (lb, f) in _UTTERANCE_ROUTES
+                                if lb != label]
+        _UTTERANCE_ROUTES.append((label, fn))
+        return True
+    except Exception:
+        return False
+
+
+def _utterance_route_reply(text: str) -> "str | None":
+    """The action token a registered route claims ``text`` with, or None.
+    Never raises; a failing or malformed route is logged and skipped.
+    PC control off (Settings) also turns routes off: parse_and_run_actions
+    then runs no action at all, so a claimed token would be SPOKEN as text
+    instead of run, and the LLM (which never sees the action grammar in that
+    mode) could not have produced it anyway."""
+    if (not globals().get("SKILL_ROUTES_ENABLED", True)
+            or not globals().get("PC_CONTROL_ENABLED", True) or not text):
+        return None
+    for label, fn in list(_UTTERANCE_ROUTES):
+        try:
+            out = fn(text)
+        except Exception as _e:
+            print(f"  [skill-route] {label} failed: {type(_e).__name__}")
+            continue
+        if not out:
+            continue
+        token = str(out).strip()
+        m = _ROUTE_TOKEN_RE.match(token)
+        if not m or m.group(1) not in ACTIONS:
+            print(f"  [skill-route] {label} returned an invalid route; ignored")
+            continue
+        print(f"  [skill-route] {label} -> {m.group(1)}")
+        return token
+    return None
+
+
 def _all_self_voiced(action_results) -> bool:
     """True when ``action_results`` is non-empty and every action in it is
-    self-voiced (the reply's only job was to run them)."""
+    self-voiced (the reply's only job was to run them) AND actually ran. A
+    self-voiced action that was DEFERRED instead (a CONFIRM_KEYWORDS prompt,
+    a pushback objection, an autocorrect ambiguity -- the
+    _ANSWER_FIRST_DEFERRED_PREFIXES results) has said nothing yet: the reply
+    then carries the "say 'yes' to proceed" question, which must be spoken,
+    or JARVIS waits silently for a confirmation it never asked for and the
+    owner's next sentence cancels it."""
     try:
         return bool(action_results) and all(
-            is_self_voiced(r[0]) for r in action_results)
+            is_self_voiced(r[0])
+            and not (isinstance(r[1], str)
+                     and r[1].startswith(_ANSWER_FIRST_DEFERRED_PREFIXES))
+            for r in action_results)
     except Exception:
         return False
 
@@ -33757,8 +33843,29 @@ def _run_llm_dispatch_body(text: str) -> str:
     # this?" / "should I worry?" / "wait, what?" / "explain"), grab
     # just that window and reply in one sentence — no [ACTION:
     # see_screen, …] round-trip needed.
-    _glance_reply = maybe_glance_response(text)
-    if _glance_reply is not None:
+    # A skill's utterance route (see _UTTERANCE_ROUTES) claims an exact request
+    # before the glance check and the LLM: its action token IS the reply.
+    _route_reply = _utterance_route_reply(text)
+    _glance_reply = (None if _route_reply is not None
+                     else maybe_glance_response(text))
+    if _route_reply is not None:
+        reply = _route_reply
+        # Same bypass as the glance path below: _call_llm never ran, so clear
+        # what it would have reset and record the turn ourselves.
+        _stream_spoken_prefix[0] = ""
+        _last_stable_sys_prompt[0] = ""
+        _last_turn_pc_block[0] = ""
+        # _call_llm is also what records the owner's words for skills that
+        # check the transcript before acting (a device dialogue refuses to
+        # start off any sentence but the one that asked for it), so a routed
+        # turn must record them too, or the skill judges the PREVIOUS turn.
+        _last_user_text[0] = text
+        # ... and this utterance's mood, or every line the action speaks is
+        # voiced with the PREVIOUS turn's prosody. Before _append_turn: the
+        # classifiers take the owner's previous sentence from the history.
+        _classify_turn_mood(text)
+        _append_turn(text, reply)
+    elif _glance_reply is not None:
         print("  [glance] one-shot reply (focused window auto-attached)")
         reply = _glance_reply
         # Reset the early-speech ledger here too (2026-07-14 bug-hunt). The

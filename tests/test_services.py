@@ -261,6 +261,17 @@ class DialogueWrapperTests(unittest.TestCase):
         self.assertTrue(svc.register_self_voiced("x"))
         self.assertTrue(svc.is_self_voiced("x"))
 
+    def test_utterance_route_is_forwarded_and_degrades(self):
+        route = lambda text: None  # noqa: E731
+        u = {"register_utterance_route": mock.MagicMock(return_value=True)}
+        svc = JarvisServices.from_skill_utils(u)
+        self.assertTrue(svc.register_utterance_route(route, "desk device"))
+        u["register_utterance_route"].assert_called_with(route, "desk device")
+        self.assertFalse(JarvisServices.from_skill_utils({})
+                         .register_utterance_route(route))
+        self.assertTrue(hasattr(JarvisServicesProtocol,
+                                "register_utterance_route"))
+
     def test_unwired_degrades(self):
         svc = JarvisServices.from_skill_utils({})
         self.assertEqual(svc.dialogue_ready(), "disabled")

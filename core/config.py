@@ -575,6 +575,13 @@ DIALOGUE_STOP_LISTEN = True
 DIALOGUE_BEAT_S = 0.6
 DIALOGUE_LOST_HOLD_S = 12.0
 
+# Skill utterance routes (bobert_companion._UTTERANCE_ROUTES): a skill can
+# claim an exact request ("talk to the <device> about pizza") BEFORE the LLM,
+# so the action runs instead of the model answering with chat. False sends
+# every request to the LLM again. Set via user_settings.json; applies on the
+# next start.
+SKILL_ROUTES_ENABLED = True
+
 # Noise heard as speech (core/speech_filter.hallucination_verdict, R10). When
 # True, a mic transcript that is ONLY a classic Whisper hallucination ("Bye.",
 # "Thank you.", "You", "Thanks for watching") is ignored as noise — logged
