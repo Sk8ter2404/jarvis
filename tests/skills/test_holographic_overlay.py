@@ -119,8 +119,9 @@ def _load_isolated(bobert=None):
       deferred ``import bobert_companion`` never boots the real monolith. By
       default the fake pins ``WORKSHOP_HUD_AUTO_LAUNCH=False`` so the default
       auto-launch is suppressed during the common setUp (no Popen, no real
-      control-file writes); the watcher-start flags are left absent so the
-      watchers still arm on their True defaults.
+      control-file writes); the watcher-start flags are left absent, so the
+      retired watchers stay off on their False fallbacks (core/config.py's
+      values) - tests that need one armed pin its flag True.
     • ``open``/``os.replace`` are stubbed during the load so that even if a
       surface does auto-launch, its atomic control-file write can't touch a real
       project file (paths aren't redirected until after the module exists).
@@ -325,14 +326,89 @@ class RegisterTests(_HoloBase):
         self.assertIsNone(mod._ARC_STATUS_PROCESS)
         self.assertIsNone(mod._STARK_STATUS_PROCESS)
 
-    def test_register_starts_watchers_when_enabled(self):
-        # The three watcher-starters should fire during register() on their
-        # default-True flags. With Thread.start no-op'd by the harness, the
-        # *_STARTED flags still flip. (setUp's load uses a fake bobert with the
-        # watcher flags absent → defaults True.)
-        self.assertTrue(self.mod._WATCHER_STARTED)
-        self.assertTrue(self.mod._BAMBU_WATCHER_STARTED)
-        self.assertTrue(self.mod._WORKSHOP_PRINT_MONITOR_WATCHER_STARTED)
+    def test_register_leaves_the_retired_watchers_dormant_by_default(self):
+        # setUp's load uses a fake bobert with the three watcher flags ABSENT,
+        # so the getattr fallbacks apply. They now match core/config.py
+        # (False: retired overlays) - they used to be True, so every load
+        # outside a running JARVIS armed three watchers that could put a
+        # real HUD window on screen.
+        self.assertFalse(self.mod._WATCHER_STARTED)
+        self.assertFalse(self.mod._BAMBU_WATCHER_STARTED)
+        self.assertFalse(self.mod._WORKSHOP_PRINT_MONITOR_WATCHER_STARTED)
+
+    def test_register_starts_watchers_when_the_owner_opts_in(self):
+        # With Thread.start no-op'd by the harness, the *_STARTED flags still
+        # flip when the owner turns a retired surface back on.
+        mod = self._load_with_flags(
+            WORKSHOP_HUD_AUTO_LAUNCH=False,
+            HOLO_WORKSHOP_AUTO_ON_THINK=True,
+            BAMBU_OVERLAY_AUTO_WHILE_PRINTING=True,
+            WORKSHOP_PRINT_MONITOR_AUTO_LAUNCH=True,
+        )
+        self.assertTrue(mod._WATCHER_STARTED)
+        self.assertTrue(mod._BAMBU_WATCHER_STARTED)
+        self.assertTrue(mod._WORKSHOP_PRINT_MONITOR_WATCHER_STARTED)
+
+
+class FallbackMatchesConfigTests(unittest.TestCase):
+    """Every ``getattr(_bc, "FLAG", fallback)`` in the skill must fall back to
+    core/config.py's own value for FLAG. A running JARVIS always carries the
+    attribute (the monolith re-exports core.config), so a fallback only ever
+    applies OUTSIDE it - test and smoke runs - where a stale True has twice
+    put a real HUD window on the owner's desktop (2026-09-30)."""
+
+    _SKILL = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))),
+        "skills", "holographic_overlay", "__init__.py")
+
+    @classmethod
+    def _fallbacks(cls):
+        import ast
+        with open(cls._SKILL, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        found = []
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "getattr"
+                    and len(node.args) == 3
+                    and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id == "_bc"
+                    and isinstance(node.args[1], ast.Constant)
+                    and isinstance(node.args[2], ast.Constant)):
+                found.append((node.args[1].value, node.args[2].value,
+                              node.lineno))
+        return found
+
+    def test_the_three_retired_watcher_flags_fall_back_to_config(self):
+        from core import config
+        by_name = {name: default for name, default, _ in self._fallbacks()}
+        for flag in ("HOLO_WORKSHOP_AUTO_ON_THINK",
+                     "BAMBU_OVERLAY_AUTO_WHILE_PRINTING",
+                     "WORKSHOP_PRINT_MONITOR_AUTO_LAUNCH"):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, by_name)
+                self.assertIs(by_name[flag], getattr(config, flag))
+                self.assertFalse(getattr(config, flag))
+
+    def test_every_flag_fallback_matches_core_config(self):
+        from core import config
+        fallbacks = self._fallbacks()
+        # Blindness floor: a broken extractor must not pass green.
+        self.assertGreaterEqual(len(fallbacks), 8)
+        checked = 0
+        for name, default, line in fallbacks:
+            if not hasattr(config, name):
+                continue    # not a config knob: the fallback IS the default
+            checked += 1
+            with self.subTest(flag=name, line=line):
+                self.assertEqual(
+                    default, getattr(config, name),
+                    f"skills/holographic_overlay line {line}: fallback for "
+                    f"{name} is {default!r} but core/config.py says "
+                    f"{getattr(config, name)!r}")
+        self.assertGreaterEqual(checked, 6)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1547,7 +1623,9 @@ class WatcherTests(_HoloBase):
 class WatcherStarterTests(_HoloBase):
     def test_auto_watcher_starts_once(self):
         self.mod._WATCHER_STARTED = False
-        with mock.patch.object(self.mod.threading, "Thread") as Thread:
+        bc = _fake_bobert(HOLO_WORKSHOP_AUTO_ON_THINK=True)
+        with inject_modules(bobert_companion=bc), \
+                mock.patch.object(self.mod.threading, "Thread") as Thread:
             self.mod._maybe_start_auto_watcher()
             self.mod._maybe_start_auto_watcher()   # second call is a no-op
         self.assertTrue(self.mod._WATCHER_STARTED)
@@ -1565,7 +1643,9 @@ class WatcherStarterTests(_HoloBase):
 
     def test_bambu_watcher_starts_once(self):
         self.mod._BAMBU_WATCHER_STARTED = False
-        with mock.patch.object(self.mod.threading, "Thread") as Thread:
+        bc = _fake_bobert(BAMBU_OVERLAY_AUTO_WHILE_PRINTING=True)
+        with inject_modules(bobert_companion=bc), \
+                mock.patch.object(self.mod.threading, "Thread") as Thread:
             self.mod._maybe_start_bambu_watcher()
             self.mod._maybe_start_bambu_watcher()
         Thread.assert_called_once()
@@ -1582,7 +1662,9 @@ class WatcherStarterTests(_HoloBase):
 
     def test_print_monitor_watcher_starts_once(self):
         self.mod._WORKSHOP_PRINT_MONITOR_WATCHER_STARTED = False
-        with mock.patch.object(self.mod.threading, "Thread") as Thread:
+        bc = _fake_bobert(WORKSHOP_PRINT_MONITOR_AUTO_LAUNCH=True)
+        with inject_modules(bobert_companion=bc), \
+                mock.patch.object(self.mod.threading, "Thread") as Thread:
             self.mod._maybe_start_workshop_print_monitor_watcher()
             self.mod._maybe_start_workshop_print_monitor_watcher()
         Thread.assert_called_once()
@@ -1597,11 +1679,28 @@ class WatcherStarterTests(_HoloBase):
             self.mod._maybe_start_workshop_print_monitor_watcher()
         Thread.assert_not_called()
 
-    def test_starters_default_enabled_when_bobert_import_fails(self):
+    def test_starters_stay_dormant_when_the_flags_are_absent(self):
+        # A bobert without the three flags → the getattr fallbacks (False,
+        # matching core/config.py) keep every retired watcher off.
+        cases = (
+            ("_maybe_start_auto_watcher", "_WATCHER_STARTED"),
+            ("_maybe_start_bambu_watcher", "_BAMBU_WATCHER_STARTED"),
+            ("_maybe_start_workshop_print_monitor_watcher",
+             "_WORKSHOP_PRINT_MONITOR_WATCHER_STARTED"),
+        )
+        for starter, flag in cases:
+            setattr(self.mod, flag, False)
+            with inject_modules(bobert_companion=_fake_bobert()), \
+                    mock.patch.object(self.mod.threading, "Thread") as Thread:
+                getattr(self.mod, starter)()
+            Thread.assert_not_called()
+            self.assertFalse(getattr(self.mod, flag))
+
+    def test_starters_default_disabled_when_bobert_import_fails(self):
         # With bobert_companion absent (None-sentinel → ImportError), each
         # starter's config-read raises and is swallowed, leaving ``enabled``
-        # at its True default → the watcher still arms. Covers the import-guard
-        # except path in all three starters.
+        # at its False default → the retired watcher stays off. Covers the
+        # import-guard except path in all three starters.
         cases = (
             ("_maybe_start_auto_watcher", "_WATCHER_STARTED"),
             ("_maybe_start_bambu_watcher", "_BAMBU_WATCHER_STARTED"),
@@ -1613,8 +1712,8 @@ class WatcherStarterTests(_HoloBase):
             with inject_modules(bobert_companion=None), \
                     mock.patch.object(self.mod.threading, "Thread") as Thread:
                 getattr(self.mod, starter)()
-            Thread.assert_called_once()
-            self.assertTrue(getattr(self.mod, flag))
+            Thread.assert_not_called()
+            self.assertFalse(getattr(self.mod, flag))
 
 
 # ═══════════════════════════════════════════════════════════════════════════

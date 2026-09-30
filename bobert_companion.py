@@ -31614,13 +31614,10 @@ _turn_hold_until: list = [0.0]
 _turn_hold_reason: list = [""]
 
 
-class DialogueUnavailable(RuntimeError):
-    """Raised by _dialogue_session() on enter; ``.reason`` is one of the
-    _dialogue_ready() reasons."""
-
-    def __init__(self, reason: str):
-        super().__init__(reason)
-        self.reason = str(reason)
+# Raised by _dialogue_session() on enter; ``.reason`` is one of the
+# _dialogue_ready() reasons. The ONE class core/dialogue.py defines, so an
+# unwired JarvisServices.dialogue_session raises the very same type.
+DialogueUnavailable = _dlg.DialogueUnavailable
 
 
 def _dialogue_gate_active() -> bool:
@@ -31828,6 +31825,20 @@ class _DialogueHandle:
         return False
 
 
+def _dialogue_lost_hold_s() -> float:
+    """DIALOGUE_LOST_HOLD_S, read at CALL time (like DIALOGUE_MAX_S): how
+    long speech and non-wake turns are held after a dialogue ends because the
+    device went away. Clamped to 0..120 s; 12 s when unset or unreadable.
+    Never raises."""
+    try:
+        v = float(globals().get("DIALOGUE_LOST_HOLD_S", 12.0))
+    except Exception:
+        return 12.0
+    if v != v:                       # NaN
+        return 12.0
+    return min(120.0, max(0.0, v))
+
+
 def _apply_dialogue_hold(seconds: float, reason: str = "") -> None:
     """Hold proactive speech and non-wake mic turns for ``seconds`` from now
     (an existing longer hold is kept). Never raises."""
@@ -31894,8 +31905,18 @@ def _dialogue_session(source: str = "device", max_s: float | None = None):
             _dsf.end_dialogue(h._dsf_token, tail_s=_DIALOGUE_TAIL_S)
         except Exception:
             pass
-        if h._hold_s > 0:
-            _apply_dialogue_hold(h._hold_s, h._hold_reason)
+        hold_s, hold_reason = h._hold_s, h._hold_reason
+        # A dialogue that ended because the device went away holds for the
+        # owner's DIALOGUE_LOST_HOLD_S (he is probably talking to the device
+        # now) even when the skill asked for no hold or a shorter one; a
+        # longer hold_after() still wins. The knob used to be read by nothing
+        # here, so the Settings value never reached this path.
+        if h._reason == "device_lost":
+            lost_s = _dialogue_lost_hold_s()
+            if lost_s > hold_s:
+                hold_s, hold_reason = lost_s, "device_lost"
+        if hold_s > 0:
+            _apply_dialogue_hold(hold_s, hold_reason)
         try:
             _reprime_after_background("dialogue")
         except Exception:

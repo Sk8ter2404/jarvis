@@ -2090,18 +2090,28 @@ class ReadChangelogTests(unittest.TestCase):
         self.assertIn("## v1", user)
 
     def test_long_entry_opens_file(self):
+        # BOTH launchers are faked: os.startfile (the win32 branch) and
+        # subprocess.Popen (the POSIX xdg-open branch, which ci-sim's Linux
+        # simulation takes). Only startfile used to be, so under ci-sim this
+        # test ran a REAL `xdg-open <file>` - absent on the Windows box, so it
+        # failed quietly and passed; the hermetic guard now refuses it.
         with tempfile.TemporaryDirectory() as td:
             big = "## v9\n" + ("detail line\n" * 1000)  # > 6000 chars
             self._write_changelog(td, big)
             bc = _base_bc(td)
             with _patch_bc(bc), \
-                    mock.patch.object(A.os, "startfile", create=True) as sf:
+                    mock.patch.object(A.os, "startfile", create=True) as sf, \
+                    mock.patch.object(A.subprocess, "Popen") as popen:
                 out = A._act_read_changelog()
-            # On the CI sim sys.platform == 'linux' -> the win32 branch is
-            # skipped and the POSIX xdg-open branch runs instead; either way
-            # the spoken pointer is returned. Guard both.
             self.assertIn("opened CHANGELOG.md", out)
-            del sf  # referenced to keep patch active
+            # Exactly one (faked) launch, of the changelog, on either branch.
+            self.assertEqual(sf.call_count + popen.call_count, 1)
+            if sf.called:
+                opened = sf.call_args[0][0]
+            else:
+                self.assertEqual(popen.call_args[0][0][0], "xdg-open")
+                opened = popen.call_args[0][0][1]
+            self.assertEqual(os.path.basename(opened), "CHANGELOG.md")
 
     def test_long_entry_posix_xdg_open(self):
         # On a non-win32 host the long-entry branch shells out to xdg-open.

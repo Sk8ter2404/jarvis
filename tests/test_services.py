@@ -283,6 +283,28 @@ class DialogueWrapperTests(unittest.TestCase):
         self.assertFalse(svc.register_self_voiced("x"))
         self.assertFalse(svc.is_self_voiced("x"))
 
+    def test_unwired_session_raises_dialogue_unavailable_with_a_reason(self):
+        # It used to be a plain RuntimeError("disabled"): a caller reading
+        # getattr(exc, "reason") - the way the monolith's refusal is read -
+        # got None. Now the same class the monolith raises, reason included.
+        from core.dialogue import DialogueUnavailable
+        svc = JarvisServices.from_skill_utils({})
+        with self.assertRaises(DialogueUnavailable) as cm:
+            svc.dialogue_session("desk device", max_s=20)
+        self.assertEqual(getattr(cm.exception, "reason", None), "disabled")
+        self.assertEqual(str(cm.exception), "disabled")
+        self.assertIsInstance(cm.exception, RuntimeError)   # old callers
+
+    def test_a_wired_refusal_passes_through_unchanged(self):
+        from core.dialogue import DialogueUnavailable
+
+        def refuse(source, max_s=None):
+            raise DialogueUnavailable("sleep")
+        svc = JarvisServices.from_skill_utils({"dialogue_session": refuse})
+        with self.assertRaises(DialogueUnavailable) as cm:
+            svc.dialogue_session("desk device")
+        self.assertEqual(cm.exception.reason, "sleep")
+
     def test_protocol_lists_the_dialogue_methods(self):
         for name in ("dialogue_ready", "dialogue_session", "speak_line",
                      "listen_for_stop", "local_complete",

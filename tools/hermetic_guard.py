@@ -87,8 +87,12 @@ live-service probe - ``PROBE_PROGRAMS`` (``nvidia-smi``, the ``ollama`` CLI,
 ``powercfg``, ``pnputil``, the audio-device switchers, ``shutdown``, the
 network probes, the ``claude`` CLI ...) directly or through a shell, a
 PowerShell command line that queries or changes devices
-(``SHELL_PROBE_PATTERNS``), and a python launch of one of the project's HUD
-overlays (``hud/*.py``: a real window on the owner's desktop).
+(``SHELL_PROBE_PATTERNS``), a python launch of one of the project's HUD
+overlays (``hud/*.py``: a real window on the owner's desktop), and a desktop
+file launcher - ``LAUNCHER_PROGRAMS`` (``xdg-open``, ``open``, ``explorer``
+...), ``start`` / ``Start-Process`` / ``Invoke-Item`` in command position of a
+shell command line (``SHELL_LAUNCHERS``), and ``os.startfile``: each opens a
+file in its registered app on the owner's desktop.
 
 REPORTING
 ---------
@@ -175,6 +179,25 @@ PROBE_PROGRAMS = frozenset({
     # bills the owner and edits files
     "claude",
 })
+
+# Desktop file launchers: each hands a file (or URL) to its registered app ON
+# THE OWNER'S DESKTOP - an editor, an image viewer, Explorer, a browser tab.
+# Found 2026-09-30: ReadChangelogTests ran `xdg-open CHANGELOG.md` under
+# ci-sim's Linux simulation; on this box xdg-open is simply absent, so the
+# launch failed quietly and the test passed. Matched on the basename, like
+# PROBE_PROGRAMS. (URL launches are the browser guard's too; it refuses those
+# first, above the audit hook.)
+LAUNCHER_PROGRAMS = frozenset({
+    "xdg-open", "open", "gnome-open", "kde-open", "kde-open5", "exo-open",
+    "wslview", "explorer",
+})
+# ... and the shell built-ins / cmdlets that do the same, refused only in
+# COMMAND position (the first word after -Command or /c, or after a ; & |),
+# so a bare "start" or "open" ARGUMENT is not mistaken for one.
+SHELL_LAUNCHERS = LAUNCHER_PROGRAMS | frozenset({
+    "start", "start-process", "saps", "invoke-item", "ii",
+})
+_SHELL_SEPARATORS = frozenset({"&", "&&", "|", "||", ";"})
 
 # The project's HUD overlays (hud/*.py) are separate Qt / tk processes that
 # draw on the owner's desktop; a test that launches one puts a real window on
@@ -294,6 +317,7 @@ _EVENTS = frozenset({
     "socket.connect", "socket.bind", "socket.sendto", "socket.sendmsg",
     "socket.getaddrinfo", "socket.gethostbyname", "socket.gethostbyaddr",
     "subprocess.Popen", "os.system", "os.spawn", "os.posix_spawn",
+    "os.startfile", "os.startfile/2",
     "ctypes.call_function",
 })
 
@@ -428,6 +452,28 @@ def _hud_script(tokens: list[str]) -> str:
     return ""
 
 
+def _shell_command_words(tokens: list[str]) -> list[str]:
+    """The program names in COMMAND position of a shell command line: the
+    first word after a ``-Command`` / ``/c`` switch, and the first after each
+    ``;`` ``&`` ``|`` separator (a separate token, or glued to the end of the
+    previous one)."""
+    words: list[str] = []
+    expect = False
+    for tok in tokens[1:]:
+        t = _as_text(tok).strip().strip('"').strip("'").strip()
+        low = t.lower()
+        if low in _CMDLINE_SWITCHES or low in _SHELL_SEPARATORS:
+            expect = True
+            continue
+        if expect and t:
+            # A quoted command string's first word ("Start-Process 'x.md'").
+            words.append(_program(t.split()[0].rstrip(";&|")))
+            expect = False
+        if t and t[-1] in ";&|":
+            expect = True
+    return words
+
+
 def probe_verdict(executable, args) -> str | None:
     """Why launching this command must be refused, or None."""
     tokens = _command_tokens(args)
@@ -436,6 +482,9 @@ def probe_verdict(executable, args) -> str | None:
     for name in (exe, first):
         if name in PROBE_PROGRAMS:
             return f"{name} is a live-hardware / live-service probe"
+        if name in LAUNCHER_PROGRAMS:
+            return (f"{name} is a desktop file launcher (it opens the file in "
+                    f"its app on the owner's desktop)")
     if _PYTHON_RE.match(first) or _PYTHON_RE.match(exe):
         hud = _hud_script(tokens)
         if hud:
@@ -445,6 +494,10 @@ def probe_verdict(executable, args) -> str | None:
             name = _program(tok)
             if name in PROBE_PROGRAMS:
                 return f"{name} (through {first or exe}) is a live probe"
+        for name in _shell_command_words(tokens):
+            if name in SHELL_LAUNCHERS:
+                return (f"{name} (through {first or exe}) is a desktop file "
+                        f"launcher")
         text = " ".join(tokens)
         for rx in SHELL_PROBE_PATTERNS:
             m = rx.search(text)
@@ -689,6 +742,15 @@ def _decide(event, args) -> None:
             _refuse("input", f"user32.{name}", name, why)
         return
     if not _active("probe"):
+        return
+    if event in ("os.startfile", "os.startfile/2"):
+        # (path, operation[, arguments, cwd, show_cmd]) - the Windows shell
+        # launch: raised BEFORE ShellExecute, so a refusal opens nothing.
+        target = _as_text(args[0]) if args else ""
+        op = _as_text(args[1]) if len(args) > 1 and args[1] else "open"
+        _refuse("probe", event, target[:160] or "<path>",
+                f"os.startfile ({op}) is a desktop file launcher (it opens "
+                f"the file in its app on the owner's desktop)")
         return
     if event == "subprocess.Popen":
         executable, cmd = (args + (None, None))[:2]

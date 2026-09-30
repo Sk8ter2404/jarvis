@@ -568,6 +568,8 @@ SELF_ECHO_TAIL_S         = 0.8
 #   DIALOGUE_LOST_HOLD_S how long proactive speech and non-wake mic turns are
 #                        held after a dialogue ends because the device went
 #                        away (the owner is probably talking to the device).
+#                        Read by the monolith's _dialogue_session at each
+#                        dialogue's end (0 = no hold, capped at 120).
 # Set via user_settings.json; applies on the next start.
 DIALOGUE_ENABLED = True
 DIALOGUE_MAX_S = 40

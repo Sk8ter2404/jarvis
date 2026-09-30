@@ -49,7 +49,8 @@ skill sees identical semantics whether it goes through the dict or this object:
     exactly the fallbacks the monolith installs when ``core.memory`` (the
     promise store) failed to import.
   * **Device dialogues** (``dialogue_ready`` → ``"disabled"``,
-    ``dialogue_session`` raises ``RuntimeError``, ``speak_line`` →
+    ``dialogue_session`` raises ``core.dialogue.DialogueUnavailable`` (a
+    ``RuntimeError``) with ``.reason == "disabled"``, ``speak_line`` →
     ``"failed"``, ``listen_for_stop`` / ``local_complete`` → ``None``,
     ``register_self_voiced`` / ``is_self_voiced`` → ``False``) — an older
     monolith without the hooks simply never runs a dialogue.
@@ -279,11 +280,16 @@ class JarvisServices:
 
     def dialogue_session(self, source: str, max_s: Optional[float] = None) -> Any:
         """The monolith's dialogue context manager (raises its
-        DialogueUnavailable on enter when refused). Raises RuntimeError when
-        unwired."""
+        DialogueUnavailable on enter when refused). Unwired, raises that same
+        class (core.dialogue.DialogueUnavailable, a RuntimeError) with
+        ``.reason == "disabled"`` - it used to be a plain RuntimeError, so a
+        caller reading ``getattr(exc, "reason")`` got nothing."""
         fn = self._fn("dialogue_session")
         if fn is None:
-            raise RuntimeError("disabled")
+            # Imported here, not at module top: this module stays
+            # stdlib-only at import (core.dialogue is stdlib + core-only).
+            from core.dialogue import DialogueUnavailable
+            raise DialogueUnavailable("disabled")
         if max_s is None:
             return fn(source)
         return fn(source, max_s=max_s)

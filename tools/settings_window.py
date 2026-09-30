@@ -608,9 +608,10 @@ SCHEMA: dict[str, dict] = {
                 "talking in the room can hold the window open. Applies on the "
                 "next start.",
     },
-    # Device dialogues (core/dialogue.py). DIALOGUE_LOST_HOLD_S deliberately has
-    # NO row: as of 2026-09-30 nothing reads it, and a row for a dead constant
-    # is the dead-toggle bug tests/test_settings_schema_wiring.py catches.
+    # Device dialogues (core/dialogue.py). DIALOGUE_LOST_HOLD_S got its row
+    # once the monolith's _dialogue_session read it (at each dialogue's end);
+    # until then nothing in the tree did, and a row for a dead constant is the
+    # dead-toggle bug tests/test_settings_schema_wiring.py catches.
     "SKILL_ROUTES_ENABLED": {
         "tab": "voice", "label": "Let skills claim exact requests before the AI",
         "type": "bool", "default": True,
@@ -643,6 +644,17 @@ SCHEMA: dict[str, dict] = {
         "type": "float", "default": 0.6, "max": 10,
         "help": "Comic timing, and the window in which your 'stop' is heard. "
                 "Applies on the next start.",
+    },
+    "DIALOGUE_LOST_HOLD_S": {
+        "tab": "voice",
+        "label": "Stay quiet after a device stops answering (seconds)",
+        "type": "float", "default": 12.0, "max": 120,
+        "help": "When a dialogue ends because the device stopped answering "
+                "(you are probably talking to it), JARVIS holds his own "
+                "unprompted speech and ignores what the mic hears without "
+                "the wake word for this long. Saying 'JARVIS' and typed "
+                "commands always get through. 0 = no hold. Applies on the "
+                "next start.",
     },
     "NIGHT_QUIET_ENABLED": {
         "tab": "voice", "label": "Quieter voice at night (by the clock)",
@@ -1622,7 +1634,7 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
             "BARGE_IN_ENABLED", "FOCUS_MODE_ENABLED"]),
         ("Device dialogues", ["SKILL_ROUTES_ENABLED", "DIALOGUE_ENABLED",
                               "DIALOGUE_MAX_S", "DIALOGUE_STOP_LISTEN",
-                              "DIALOGUE_BEAT_S"]),
+                              "DIALOGUE_BEAT_S", "DIALOGUE_LOST_HOLD_S"]),
         ("At night", ["NIGHT_QUIET_ENABLED", "NIGHT_OWL_AUTO"]),
     ],
     "hearing": [

@@ -1356,6 +1356,78 @@ class LiveStateWriteTests(unittest.TestCase):
         for name in live_data_guard.LIVE_LOG_FILES:
             self.assertIn(name.replace(".log.1", ".log"), src)
 
+    def test_the_workshop_hud_control_file_is_refused(self):
+        # workshop_hud_state.json: the retired workshop HUD's on/off control
+        # file, written at the project root by skills/holographic_overlay and
+        # read by hud/workshop_hud.py. It was not listed, so a test that
+        # reached the real writer rewrote the live file unrefused.
+        name = "workshop_hud_state.json"
+        self.assertIn(name, live_data_guard.LIVE_ROOT_STATE_FILES)
+        path = os.path.join(live_data_guard.PROJECT_ROOT, name)
+        self.assertTrue(live_data_guard._is_live_state(path))
+        with self.assertRaises(live_data_guard.LiveDataGuardError):
+            self._probe_open(path)
+        with self.assertRaises(live_data_guard.LiveDataGuardError):
+            os.replace(os.path.join(tempfile.gettempdir(),
+                                    "__jarvis_guard_probe_missing__.json"),
+                       path)
+        # The same name in a temp dir (where tests redirect it) stays open.
+        self.assertFalse(live_data_guard._is_live_state(
+            os.path.join(tempfile.gettempdir(), name)))
+
+    @staticmethod
+    def _root_state_joins():
+        """``{name: "file:line"}`` for every ``<x>.join(<project root>,
+        "<name>_state.json")`` in production source. The root is a named
+        root variable (``_ROOTISH``), or - in a file that sits AT the project
+        root only - the ``dirname(abspath(__file__))`` idiom."""
+        found = {}
+        for path in _py_files(_PROJECT_ROOT):
+            rel = os.path.relpath(path, _PROJECT_ROOT)
+            if rel.split(os.sep)[0] == "tests":
+                continue
+            src = _source(path)
+            if "_state.json" not in src:
+                continue
+            try:
+                tree = ast.parse(src)
+            except SyntaxError:
+                continue
+            at_root = os.path.dirname(rel) == ""
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "join"
+                        and len(node.args) == 2):
+                    continue
+                first, second = node.args
+                if not (isinstance(second, ast.Constant)
+                        and isinstance(second.value, str)
+                        and second.value.endswith("_state.json")):
+                    continue
+                if isinstance(first, ast.Call) and not at_root:
+                    continue    # dirname(__file__) of a subdir module
+                if _rootish_expr(first):
+                    found.setdefault(second.value, f"{rel}:{node.lineno}")
+        return found
+
+    def test_every_root_state_file_in_the_source_is_listed(self):
+        # The 2026-09-30 audit listed only what tests HAPPENED to write that
+        # day. This scans the writers instead, so a new root *_state.json -
+        # or one the audit missed (workshop_hud_state.json and twenty others
+        # were) - cannot sit unguarded.
+        found = self._root_state_joins()
+        # Blindness floor: a broken scan must not pass green.
+        for name in ("workshop_hud_state.json", "hud_state.json",
+                     "bambu_overlay_state.json", "banter_state.json"):
+            self.assertIn(name, found)
+        self.assertGreaterEqual(len(found), 20)
+        missing = {n: where for n, where in found.items()
+                   if n not in live_data_guard.LIVE_ROOT_STATE_FILES}
+        self.assertEqual(missing, {},
+                         "root *_state.json written by production code but "
+                         "not in LIVE_ROOT_STATE_FILES")
+
     def test_every_listed_file_is_still_live_state_in_the_source(self):
         # A name nothing writes any more is dead weight; a renamed file is a
         # hole. Each listed file must still be named by production source.

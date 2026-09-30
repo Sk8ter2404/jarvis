@@ -62,6 +62,15 @@ _DEVICE_REASON = {
     "no_answer": "device_no_answer", "heap": "device_heap",
     "refused": "error", "unsupported": "error",
 }
+# device_say() results that end the dialogue as "error" (Outcome.reason keeps
+# the contract's REASONS) but look up a FINER closing first, in this order,
+# before the "error" one: without them a refused say ended silently after the
+# opener. The caller supplies the wording under these keys in ``closings``;
+# none supplied = silence, as before.
+DEVICE_CLOSING_KEYS = {
+    "refused": ("device_refused",),
+    "unsupported": ("device_unsupported", "device_refused"),
+}
 # speak_self() result -> the reason (when the session has none of its own).
 _SPEAK_REASON = {
     "interrupted": "interrupted", "muted": "tts_muted", "failed": "error",
@@ -73,6 +82,22 @@ _LEAD_TAG_RE = re.compile(
 _SPACE_RE = re.compile(r"\s+")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 _FENCE_RE = re.compile(r"```(?:json)?", re.I)
+
+
+class DialogueUnavailable(RuntimeError):
+    """A device dialogue cannot start: raised on entering a dialogue session.
+    ``.reason`` is one word - the monolith's _dialogue_ready() reasons
+    (disabled, staging, boot_grace, tts_muted, mic_muted, sleep,
+    realtime_voice, active, error). ONE class for every raiser: the
+    monolith's ``_dialogue_session`` (``bobert_companion.DialogueUnavailable``
+    is this class) and an unwired ``JarvisServices.dialogue_session``
+    ("disabled"), so a skill can catch it, or read ``getattr(exc, "reason")``,
+    the same way whichever path it took. A RuntimeError, so older
+    ``except RuntimeError`` callers keep working."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = str(reason)
 
 
 @dataclass(frozen=True)
@@ -459,7 +484,9 @@ class Runner:
       device_say(chunk) -> "ok"|"busy"|"muted"|"no_answer"|"heap"|"refused"|
                            "unsupported"     (queue one device line)
       device_done() -> bool   non-blocking: has the device finished the
-                              chunk it was last told to say?
+                              chunk it was last told to say? (Answer for its
+                              speaker as a whole when it can: a "busy" say
+                              usually means it is talking.)
       listen(until, *, beat_s, max_s) -> ListenCapture   the synchronous
                               stop-listen: capture until until() is true,
                               then beat_s more (or max_s), mic closed on
@@ -469,7 +496,9 @@ class Runner:
     Guarantees: listen() runs after every successful device_say and before
     the next speak_self; the device has finished (device_done() true, or
     ``device_wait_s`` elapsed) before JARVIS speaks again and before run()
-    returns; the session's stop state is checked before every line.
+    returns - a closing after a failed say (a "busy" give-up, a stop during
+    the retries) included; the session's stop state is checked before every
+    line.
     """
 
     def __init__(self, *, speak_self, device_say, device_done, listen,
@@ -490,6 +519,9 @@ class Runner:
         self.voiced_wait_s = max(0.0, float(voiced_wait_s))
         self.device_wait_s = max(0.0, float(device_wait_s))
         self.done_poll_s = max(0.005, float(done_poll_s))
+        # The finer closing keys the last failed device say named (see
+        # DEVICE_CLOSING_KEYS); reset by every run().
+        self._closing_keys: tuple = ()
 
     # -- helpers -------------------------------------------------------
     def _stopped(self) -> Optional[str]:
@@ -523,9 +555,25 @@ class Runner:
         while not self._done() and self.clock() < deadline:
             self.sleep(self.done_poll_s)
 
+    def _say_failed(self, reason: str, closing_keys: tuple = ()) -> str:
+        """A chunk was not said: remember the finer closing keys, then hold
+        (bounded) until the device has finished. A "busy" answer means it
+        was talking a moment ago, and the closing that follows must not
+        talk over it. Returns ``reason`` - or the session's own stop reason
+        when one landed during that wait (a wake / tray stop then ends the
+        run with ITS closing, never the failed say's)."""
+        self._closing_keys = tuple(closing_keys)
+        self._wait_device_done()
+        r = self._stopped()
+        if r and r != reason:
+            self._closing_keys = ()
+            return r
+        return reason
+
     def _device_line(self, line: Line) -> str:
         """Say every chunk of ``line``; "" when all were said, else the
-        reason to end with. Always returns with the device finished."""
+        reason to end with. Always returns with the device finished (or
+        ``device_wait_s`` spent waiting for it) - a failed say included."""
         for chunk in (line.chunks or (line.text,)):
             r = self._stopped()
             if r:
@@ -535,16 +583,17 @@ class Runner:
                 try:
                     res = self.device_say(chunk)
                 except Exception:
-                    res = "refused"
+                    res = None          # a skill bug: plain "error"
                 if res == "ok":
                     break
                 if res == "busy" and self.clock() + self.busy_step_s <= give_up:
                     self.sleep(self.busy_step_s)
                     r = self._stopped()
                     if r:
-                        return r
+                        return self._say_failed(r)
                     continue
-                return _DEVICE_REASON.get(res, "error")
+                return self._say_failed(_DEVICE_REASON.get(res, "error"),
+                                        DEVICE_CLOSING_KEYS.get(res, ()))
             cap = None
             try:
                 # Keywords, so skill_utils["listen_for_stop"] (keyword-only
@@ -570,9 +619,15 @@ class Runner:
         return ""
 
     def _closing(self, closings, reason) -> None:
-        text = (closings or {}).get(reason)
-        if isinstance(text, str) and text.strip():
-            self._speak(text.strip(), True)
+        """Speak the caller's closing for ``reason``: a finer key a failed
+        say named (DEVICE_CLOSING_KEYS) first, then the reason's own; none
+        (missing / None / blank) = silence."""
+        keys = tuple(getattr(self, "_closing_keys", ())) + (reason,)
+        for key in keys:
+            text = (closings or {}).get(key)
+            if isinstance(text, str) and text.strip():
+                self._speak(text.strip(), True)
+                return
 
     # -- the run -------------------------------------------------------
     def run(self, opener: str, script, fallback, *, script_deadline: float,
@@ -585,8 +640,11 @@ class Runner:
         ``preflight``: a Future of "" (the device is ready) or a reason; a
         reason ends the run after the opener with that reason's closing.
         ``closings``: reason -> a JARVIS line spoken when the run ends that
-        way (missing / None = silence). Never raises."""
+        way (missing / None = silence); a refused / unsupported device say
+        looks up its DEVICE_CLOSING_KEYS first (e.g. "device_refused"), then
+        "error". Never raises."""
         spoken = 0
+        self._closing_keys = ()
         try:
             r = self._stopped()
             if r:

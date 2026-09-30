@@ -987,6 +987,83 @@ class HoldTests(_Base):
         self.assertFalse(self.bc._dialogue_gate_active())
 
 
+# ── DIALOGUE_LOST_HOLD_S (the Settings knob nothing used to read) ────────
+class LostHoldKnobTests(_Base):
+    """A dialogue that ends because the device went away (stop("device_lost"))
+    holds speech and non-wake turns for DIALOGUE_LOST_HOLD_S, read at the
+    dialogue's END. Before, nothing in the tree read the knob: the hold was
+    only whatever seconds a skill passed to hold_after(), so the Settings
+    value never reached this path."""
+
+    def _end_with(self, reason, *, hold=None):
+        bc = self.bc
+        with contextlib.redirect_stdout(io.StringIO()):
+            with bc._dialogue_session(_SRC) as h:
+                if hold is not None:
+                    h.hold_after(*hold)
+                if reason:
+                    h.stop(reason)
+        return time.monotonic()
+
+    def test_device_lost_holds_for_the_knob_without_a_hold_after(self):
+        bc = self.bc
+        self._p(bc, "DIALOGUE_LOST_HOLD_S", 7.0)
+        t = self._end_with("device_lost")
+        self.assertTrue(bc._speech_hold_active())
+        self.assertEqual(bc._turn_hold_reason[0], "device_lost")
+        self.assertAlmostEqual(bc._turn_hold_until[0] - t, 7.0, delta=0.5)
+        self.assertAlmostEqual(bc._speech_hold_until[0] - t, 7.0, delta=0.5)
+
+    def test_the_knob_is_read_at_each_dialogues_end(self):
+        bc = self.bc
+        self._p(bc, "DIALOGUE_LOST_HOLD_S", 3.0)
+        t = self._end_with("device_lost")
+        self.assertAlmostEqual(bc._turn_hold_until[0] - t, 3.0, delta=0.5)
+        bc._speech_hold_until[0] = bc._turn_hold_until[0] = 0.0
+        bc.DIALOGUE_LOST_HOLD_S = 20.0          # changed on the live module
+        t = self._end_with("device_lost")
+        self.assertAlmostEqual(bc._turn_hold_until[0] - t, 20.0, delta=0.5)
+
+    def test_a_longer_skill_hold_still_wins_and_a_shorter_one_is_raised(self):
+        bc = self.bc
+        self._p(bc, "DIALOGUE_LOST_HOLD_S", 5.0)
+        t = self._end_with("device_lost", hold=(30.0, "skill"))
+        self.assertAlmostEqual(bc._turn_hold_until[0] - t, 30.0, delta=0.5)
+        self.assertEqual(bc._turn_hold_reason[0], "skill")
+        bc._speech_hold_until[0] = bc._turn_hold_until[0] = 0.0
+        t = self._end_with("device_lost", hold=(1.0, "skill"))
+        self.assertAlmostEqual(bc._turn_hold_until[0] - t, 5.0, delta=0.5)
+        self.assertEqual(bc._turn_hold_reason[0], "device_lost")
+
+    def test_other_endings_and_a_zero_knob_hold_nothing(self):
+        bc = self.bc
+        self._p(bc, "DIALOGUE_LOST_HOLD_S", 9.0)
+        for reason in (None, "owner_stop", "wake", "device_busy"):
+            with self.subTest(reason=reason):
+                self._end_with(reason)
+                self.assertFalse(bc._speech_hold_active())
+                self.assertEqual(bc._turn_hold_until[0], 0.0)
+        bc.DIALOGUE_LOST_HOLD_S = 0
+        self._end_with("device_lost")
+        self.assertFalse(bc._speech_hold_active())
+        self.assertEqual(bc._turn_hold_until[0], 0.0)
+
+    def test_a_bad_knob_falls_back_and_is_capped(self):
+        bc = self.bc
+        for value, want in (("junk", 12.0), (float("nan"), 12.0),
+                            (-4.0, 0.0), (1e6, 120.0), (None, 12.0)):
+            with self.subTest(value=value):
+                self._p(bc, "DIALOGUE_LOST_HOLD_S", value)
+                self.assertEqual(bc._dialogue_lost_hold_s(), want)
+
+    def test_the_shipped_default_matches_the_settings_row(self):
+        from core import config
+        from tools import settings_window as sw
+        self.assertEqual(config.DIALOGUE_LOST_HOLD_S, 12.0)
+        self.assertEqual(sw.SCHEMA["DIALOGUE_LOST_HOLD_S"]["default"],
+                         config.DIALOGUE_LOST_HOLD_S)
+
+
 # ── self-voiced actions ──────────────────────────────────────────────────
 class SelfVoicedTests(_Base):
     def setUp(self):
@@ -1331,6 +1408,24 @@ class SkillUtilsKeysTests(_Base):
         self.assertFalse(empty.register_self_voiced("x"))
         with self.assertRaises(RuntimeError):
             empty.dialogue_session(_SRC)
+
+    def test_wired_and_unwired_refusals_are_one_class_with_a_reason(self):
+        # The monolith's refusal and the unwired wrapper's "disabled" are the
+        # SAME class (core.dialogue.DialogueUnavailable), so one except
+        # clause / one getattr(exc, "reason") serves both paths.
+        from core import dialogue as dlg
+        from core.services import JarvisServices
+        self.assertIs(self.bc.DialogueUnavailable, dlg.DialogueUnavailable)
+        caught = []
+        self.bc._tts_muted[0] = True
+        wired = JarvisServices.from_skill_utils(self.bc.skill_utils)
+        for svc in (wired, JarvisServices.from_skill_utils({})):
+            try:
+                with svc.dialogue_session(_SRC):
+                    self.fail("must not enter")
+            except dlg.DialogueUnavailable as exc:
+                caught.append(getattr(exc, "reason", None))
+        self.assertEqual(caught, ["tts_muted", "disabled"])
 
 
 if __name__ == "__main__":

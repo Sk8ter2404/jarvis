@@ -101,7 +101,8 @@ WHAT IS INTERCEPTED
   ``os.rename`` / ``os.replace`` onto (or off) one, and deleting one. The
   root-level files are named in ``LIVE_ROOT_STATE_FILES`` (the pending-speech
   queue, the HUD / overlay state files, the todo list, the morning-arrival
-  stamp, the notification rules). Until then only the flag was refused and
+  stamp, the notification rules, and - since a source scan the same day -
+  every other root ``*_state.json``). Until then only the flag was refused and
   other ``data/`` writes were merely RECORDED, because three suites wrote live
   ``data/`` through production code that hardcodes the path
   (``test_monolith_kinect_overlay`` -> ``.hud_camera_preview_kinect.jpg``,
@@ -151,6 +152,9 @@ CLEAN_SHUTDOWN_FLAG = os.path.join(LIVE_DATA_DIR, "clean_shutdown.flag")
 # overlay files the HUDs draw from, the owner's todo list, and the "morning
 # briefing already given" stamp. Writing, replacing onto, or deleting one is
 # REFUSED. Names only; add a file here when it becomes live root state.
+# Every ``os.path.join(<project root>, "*_state.json")`` in production source
+# must be listed - tests/test_live_data_guard.py scans for them (the second
+# block below was the gap that scan found, 2026-09-30).
 LIVE_ROOT_STATE_FILES = frozenset({
     "pending_speech.json",
     "pending_speech.json.consuming",
@@ -163,6 +167,33 @@ LIVE_ROOT_STATE_FILES = frozenset({
     "hud_state.json",
     "injected_commands.json",
     "tray_commands.json",
+    # Root *_state.json that were missing (all but the v2 HUD's and the
+    # overnight upgrade's exist in a live tree today): the retired overlays'
+    # on/off control files
+    # (holographic_overlay writes them), the skills' once-a-day / cooldown
+    # stamps (a clobbered stamp repeats or skips a briefing), the credits
+    # monitor's balance and the ambient listener's store.
+    "workshop_hud_state.json",
+    "workshop_print_monitor_state.json",
+    "holo_workshop_state.json",
+    "holographic_hud_v2_state.json",
+    "arc_reactor_status_state.json",
+    "stark_status_ring_state.json",
+    "bambu_camera_hud_state.json",
+    "hud_card_state.json",
+    "ambient_listen_state.json",
+    "anticipation_state.json",
+    "banter_state.json",
+    "credits_state.json",
+    "daily_briefing_state.json",
+    "daily_recap_state.json",
+    "dossier_state.json",
+    "evening_briefing_state.json",
+    "morning_arrival_state.json",
+    "morning_handoff_state.json",
+    "suit_up_state.json",
+    "weather_briefing_state.json",
+    ".overnight_state.json",
 })
 
 # Named LIVE LOGS under logs/ (2026-09-30). The rest of logs/ stays open (see

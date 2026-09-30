@@ -39,6 +39,7 @@ import sys
 import threading
 import unittest
 import urllib.request
+from unittest import mock
 
 from tools import browser_guard, hermetic_guard as hg
 
@@ -181,6 +182,47 @@ class ProbeVerdictTests(unittest.TestCase):
         self.assertIsNone(hg.probe_verdict(
             None, [sys.executable, os.path.join("core", "tts.py")]))
 
+    def test_desktop_file_launchers_are_refused(self):
+        # Each opens a file in its app on the owner's desktop. Found
+        # 2026-09-30: ReadChangelogTests ran `xdg-open CHANGELOG.md` under
+        # ci-sim's Linux simulation (absent here, so it failed quietly).
+        for exe, cmd in (
+                (None, ["xdg-open", "/tmp/CHANGELOG.md"]),
+                (None, "xdg-open /tmp/CHANGELOG.md"),
+                (None, ["open", "picture.png"]),
+                (None, ["explorer.exe", r"shell:AppsFolder\Some.App!App"]),
+                (r"C:\Windows\explorer.exe", r"/select,C:\x\y.txt"),
+                (None, ["kde-open5", "x.pdf"]), (None, ["wslview", "x.pdf"])):
+            with self.subTest(cmd=cmd):
+                why = hg.probe_verdict(exe, cmd)
+                self.assertIsNotNone(why)
+                self.assertIn("desktop file launcher", why)
+
+    def test_shell_launchers_are_refused_in_command_position(self):
+        for cmd in (["cmd", "/c", "start", "", r"C:\x\CHANGELOG.md"],
+                    # the string Windows audits for Popen(..., shell=True)
+                    r'C:\WINDOWS\system32\cmd.exe /c "start "" C:\x\a.md"',
+                    ["powershell", "-NoProfile", "-Command",
+                     r"Start-Process 'C:\x\a.md'"],
+                    ["powershell", "-Command", r"Get-Date; Invoke-Item C:\x"],
+                    'powershell -Command "ii ."',
+                    ["bash", "-c", "xdg-open ./a.md"]):
+            with self.subTest(cmd=cmd):
+                why = hg.probe_verdict(None, cmd)
+                self.assertIsNotNone(why)
+                self.assertIn("desktop file launcher", why)
+
+    def test_launcher_words_as_arguments_pass(self):
+        # "start" / "open" / "explorer" as an ARGUMENT is not a launch.
+        for cmd in (["cmd", "/c", "echo", "start"],
+                    "git log --format=open",
+                    ["powershell", "-Command",
+                     "Get-Service | Where-Object Status -eq 'open'"],
+                    'tasklist /FI "IMAGENAME eq explorer.exe"',
+                    ["notes-open-later.txt"]):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(hg.probe_verdict(None, cmd))
+
     def test_ordinary_commands_pass(self):
         for cmd in ("git ls-files -z", [sys.executable, "-c", "print(1)"],
                     "python -m pyflakes tests", "tasklist /FI \"IMAGENAME eq x.exe\"",
@@ -241,6 +283,37 @@ class HookTests(_Armed):
         with _ledger_restored(), self.assertRaises(FileNotFoundError) as cm:
             sys.audit("subprocess.Popen", None, "nvidia-smi -L", None, None)
         self.assertIsInstance(cm.exception, hg.ProbeGuardError)
+
+    def test_os_startfile_is_refused_before_it_launches(self):
+        # CPython raises both events BEFORE ShellExecute, so a refusal opens
+        # nothing. Synthetic here: a regressed guard must not open a file.
+        self.require_armed("probe")
+        target = os.path.join(_PROJECT_ROOT, "CHANGELOG.md")
+        for event, args in (("os.startfile", (target, "open")),
+                            ("os.startfile/2",
+                             (target, "open", "", None, 1))):
+            with self.subTest(event=event), _ledger_restored():
+                hg.reset()
+                with self.assertRaises(hg.ProbeGuardError) as cm:
+                    sys.audit(event, *args)
+                self.assertIsInstance(cm.exception, FileNotFoundError)
+                self.assertIn("desktop file launcher", str(cm.exception))
+                (r,) = hg.refusals("probe")
+                self.assertEqual((r.api, r.target), (event, target))
+                self.assertEqual(r.test_id, self.id())
+
+    def test_a_launcher_opt_in_lets_it_through(self):
+        self.require_armed("probe")
+        with _ledger_restored():
+            hg.reset()
+            with hg.allow("probe", reason="a test that opens a file"):
+                sys.audit("os.startfile", "x.md", "open")
+                sys.audit("subprocess.Popen", None, ["xdg-open", "x.md"],
+                          None, None)
+            self.assertEqual(hg.refusals(), ())
+            with self.assertRaises(hg.ProbeGuardError):
+                sys.audit("subprocess.Popen", None, ["xdg-open", "x.md"],
+                          None, None)
 
     def test_allowed_events_pass_straight_through(self):
         with _ledger_restored():
@@ -446,6 +519,31 @@ class RealCallTests(_Armed):
         self.require_armed("probe")
         with _ledger_restored(), self.assertRaises(FileNotFoundError):
             subprocess.run(["nvidia-smi", "-L"], capture_output=True, timeout=10)
+
+    def test_a_real_xdg_open_launch_is_refused_by_the_guard(self):
+        # Safe if the guard regresses: xdg-open does not exist on the Windows
+        # box (a plain FileNotFoundError, which fails the assertion below).
+        self.require_armed("probe")
+        with _ledger_restored(), self.assertRaises(hg.ProbeGuardError):
+            subprocess.Popen(["xdg-open", os.path.join(_PROJECT_ROOT,
+                                                       "CHANGELOG.md")],
+                             close_fds=True)
+
+    def test_the_changelog_test_launches_nothing_under_ci_sim(self):
+        # The offender itself, re-run the way ci-sim runs it (sys.platform
+        # "linux" -> the xdg-open branch): no refusal may be recorded.
+        test_id = ("tests.test_actions_sec3.ReadChangelogTests."
+                   "test_long_entry_opens_file")
+        with _ledger_restored(), \
+                mock.patch.object(sys, "platform", "linux"):
+            h0 = len(hg.refusals())
+            result = unittest.TestResult()
+            unittest.TestLoader().loadTestsFromName(test_id).run(result)
+            hits = hg.refusals()[h0:]
+        self.assertEqual([tb.splitlines()[-1] for _t, tb in
+                          result.errors + result.failures], [])
+        self.assertEqual(result.testsRun, 1)
+        self.assertEqual(hits, ())
 
     def test_an_ordinary_subprocess_still_runs(self):
         out = subprocess.run([sys.executable, "-c", "print('hermetic-ok')"],

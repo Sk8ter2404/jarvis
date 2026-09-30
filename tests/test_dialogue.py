@@ -79,6 +79,14 @@ class ConstantsTests(unittest.TestCase):
                 self.assertNotIn(m.lower(), r.replace("_", " "), (r, m))
 
 
+class DialogueUnavailableTests(unittest.TestCase):
+    def test_carries_its_reason_and_is_a_runtime_error(self):
+        exc = dlg.DialogueUnavailable("boot_grace")
+        self.assertEqual(exc.reason, "boot_grace")
+        self.assertEqual(str(exc), "boot_grace")
+        self.assertIsInstance(exc, RuntimeError)
+
+
 class ValidateScriptTests(unittest.TestCase):
     def test_good_script(self):
         lines = _v(GOOD)
@@ -540,6 +548,132 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(out.reason, "device_busy")
         self.assertEqual(rig.log[-1][1], "Lost interest.")
         self.assertTrue(rig.log[-1][2])
+
+    # -- a "busy" give-up never lets the closing talk over the device ------
+    @staticmethod
+    def _busy_with_its_own_audio(rig, seconds):
+        """The first say finds the device talking something of its own for
+        ``seconds`` (so it answers "busy"); device_done() tracks that."""
+        orig = rig.device_say
+        state = {"first": True}
+
+        def say(chunk):
+            if state["first"]:
+                state["first"] = False
+                rig.device_until = time.monotonic() + seconds
+            return orig(chunk)
+        rig.device_say = say
+
+    def test_busy_give_up_waits_for_the_device_before_the_closing(self):
+        # busy_retry_s is 0.1 in the rig: the Runner gives up long before the
+        # device's own 0.5 s of audio ends. It used to return at once, and
+        # the closing talked over the device.
+        rig = Rig(say_results=["busy"] * 50)
+        self._busy_with_its_own_audio(rig, 0.5)
+        t0 = time.monotonic()
+        out = self.run_rig(rig, closings={"device_busy": "Lost interest."})
+        self.assertEqual(out.reason, "device_busy")
+        self.assertEqual(rig.log[-1][:2], ("self", "Lost interest."))
+        self.assertFalse(rig.device_talking_during_self)
+        self.assertGreaterEqual(time.monotonic() - t0, 0.45)
+
+    def test_busy_give_up_wait_is_bounded(self):
+        # A device that never reports done: the wait ends at device_wait_s.
+        rig = Rig(say_results=["busy"] * 200)
+        self._busy_with_its_own_audio(rig, 30.0)
+        runner = rig.runner(device_wait_s=0.3)
+        t0 = time.monotonic()
+        out = runner.run("Opening line.", _ready(_lines()), lambda: [],
+                         script_deadline=time.monotonic() + 1.0,
+                         closings={"device_busy": "Lost interest."})
+        took = time.monotonic() - t0
+        self.assertEqual(out.reason, "device_busy")
+        self.assertGreaterEqual(took, 0.3)
+        self.assertLess(took, 2.0)
+
+    def test_a_stop_during_busy_retries_waits_before_its_closing(self):
+        rig = Rig(say_results=["busy"] * 50)
+        self._busy_with_its_own_audio(rig, 0.4)
+        threading.Timer(0.03, rig.session.stop, args=("owner_stop",)).start()
+        out = self.run_rig(rig, closings={"owner_stop": "Of course."})
+        self.assertEqual(out.reason, "owner_stop")
+        self.assertEqual(rig.log[-1][:2], ("self", "Of course."))
+        self.assertFalse(rig.device_talking_during_self)
+
+    def test_a_stop_during_the_busy_wait_ends_with_its_own_closing(self):
+        # The owner says the wake word while JARVIS waits out the device:
+        # the run ends "wake" (silent here), not with the busy closing.
+        rig = Rig(say_results=["busy"] * 50)
+        self._busy_with_its_own_audio(rig, 0.5)
+        threading.Timer(0.3, rig.session.stop, args=("wake",)).start()
+        out = self.run_rig(rig, closings={"device_busy": "Lost interest.",
+                                          "wake": None})
+        self.assertEqual(out.reason, "wake")
+        self.assertEqual([e[1] for e in rig.log if e[0] == "self"],
+                         ["Opening line."])
+
+    # -- refused / unsupported: a closing instead of silence ---------------
+    def test_refused_say_speaks_the_callers_refused_closing(self):
+        rig = Rig(say_results=["refused"])
+        out = self.run_rig(rig, closings={"device_refused": "It declined.",
+                                          "error": None})
+        self.assertEqual(out, dlg.Outcome(1, "error"))   # reason unchanged
+        self.assertEqual([e[1] for e in rig.log if e[0] == "self"],
+                         ["Opening line.", "It declined."])
+        self.assertTrue(rig.log[-1][2])                  # a final line
+
+    def test_unsupported_say_prefers_its_own_key_then_refused_then_error(self):
+        cases = (
+            ({"device_unsupported": "It can't.",
+              "device_refused": "It declined.", "error": "Oops."},
+             "It can't."),
+            ({"device_refused": "It declined.", "error": "Oops."},
+             "It declined."),
+            ({"error": "Oops."}, "Oops."),
+            ({"device_unsupported": "  ", "error": None}, None),
+            (None, None),
+        )
+        for closings, want in cases:
+            with self.subTest(closings=closings):
+                rig = Rig(say_results=["unsupported"])
+                out = self.run_rig(rig, closings=closings)
+                self.assertEqual(out.reason, "error")
+                said = [e[1] for e in rig.log if e[0] == "self"]
+                self.assertEqual(said, ["Opening line."] +
+                                 ([want] if want else []))
+
+    def test_refused_closing_applies_to_the_stall_line_too(self):
+        rig = Rig(say_results=["refused"])
+        fut = Future()
+        threading.Timer(0.3, fut.set_result, args=(_lines(),)).start()
+        out = self.run_rig(rig, script=fut, stall=lambda: "Thinking hard.",
+                           closings={"device_refused": "It declined."})
+        self.assertEqual(out.reason, "error")
+        self.assertEqual(rig.log[-1][:2], ("self", "It declined."))
+
+    def test_a_raising_device_say_is_a_plain_error_not_a_refusal(self):
+        rig = Rig()
+
+        def bad_say(_c):
+            raise RuntimeError("skill bug")
+        rig.device_say = bad_say
+        out = self.run_rig(rig, closings={"device_refused": "It declined."})
+        self.assertEqual(out.reason, "error")
+        self.assertEqual([e[1] for e in rig.log if e[0] == "self"],
+                         ["Opening line."])
+
+    def test_refused_keys_never_leak_into_other_closings(self):
+        # Busy / muted / preflight endings keep their own keys only.
+        rig = Rig(say_results=["muted"])
+        out = self.run_rig(rig, closings={"device_refused": "It declined.",
+                                          "device_muted": "It's muted."})
+        self.assertEqual(out.reason, "device_muted")
+        self.assertEqual(rig.log[-1][:2], ("self", "It's muted."))
+        rig = Rig()
+        out = self.run_rig(rig, preflight=_ready("device_heap"),
+                           closings={"device_refused": "It declined."})
+        self.assertEqual(out.reason, "device_heap")
+        self.assertEqual([e[1] for e in rig.log], ["Opening line."])
 
     def test_device_muted_and_heap(self):
         for res, reason in (("muted", "device_muted"),

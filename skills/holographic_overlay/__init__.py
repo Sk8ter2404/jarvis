@@ -38,7 +38,8 @@ Voice triggers — workshop canvas (compact reactor):
   • holo_workshop_canvas         → alias for arc_reactor on.
 
 Auto-show behavior:
-  HOLO_WORKSHOP_AUTO_ON_THINK (config flag, default True): a background
+  HOLO_WORKSHOP_AUTO_ON_THINK (config flag, default False - a retired
+  overlay; see core/config.py): when on, a background
   watcher thread polls hud_state.json and launches the workshop canvas
   the first time JARVIS enters thinking/speaking, then keeps it visible
   for the configured grace period after JARVIS goes idle. This gives the
@@ -556,14 +557,19 @@ def _auto_show_watcher():
 def _maybe_start_auto_watcher():
     """Start the auto-show watcher exactly once. Reads the config flag
     HOLO_WORKSHOP_AUTO_ON_THINK lazily so the skill module imports
-    cleanly even before bobert_companion finishes initialising."""
+    cleanly even before bobert_companion finishes initialising.
+
+    The fallback is core/config.py's own default, False (a RETIRED overlay,
+    superseded by the unified HUD). A running JARVIS always has the attribute,
+    so the fallback only applies outside it - where a stale True armed a
+    watcher that could put a real canvas window on screen."""
     global _WATCHER_STARTED
     if _WATCHER_STARTED:
         return
-    enabled = True
+    enabled = False
     try:
         import bobert_companion as _bc
-        enabled = bool(getattr(_bc, "HOLO_WORKSHOP_AUTO_ON_THINK", True))
+        enabled = bool(getattr(_bc, "HOLO_WORKSHOP_AUTO_ON_THINK", False))
     except Exception:
         pass
     if not enabled:
@@ -725,15 +731,16 @@ def _clear_user_off() -> None:
 
 def _maybe_start_bambu_watcher() -> None:
     """Start the bambu overlay watcher exactly once. Respects the
-    BAMBU_OVERLAY_AUTO_WHILE_PRINTING flag (default True)."""
+    BAMBU_OVERLAY_AUTO_WHILE_PRINTING flag (default False, matching
+    core/config.py: the corner overlay is retired)."""
     global _BAMBU_WATCHER_STARTED
     if _BAMBU_WATCHER_STARTED:
         return
-    enabled = True
+    enabled = False
     try:
         import bobert_companion as _bc
         enabled = bool(getattr(_bc, "BAMBU_OVERLAY_AUTO_WHILE_PRINTING",
-                               True))
+                               False))
     except Exception:
         pass
     if not enabled:
@@ -1376,15 +1383,16 @@ def _clear_workshop_print_monitor_user_off() -> None:
 
 def _maybe_start_workshop_print_monitor_watcher() -> None:
     """Start the watcher exactly once. Respects the
-    WORKSHOP_PRINT_MONITOR_AUTO_LAUNCH flag (default True)."""
+    WORKSHOP_PRINT_MONITOR_AUTO_LAUNCH flag (default False, matching
+    core/config.py: the print panel is retired)."""
     global _WORKSHOP_PRINT_MONITOR_WATCHER_STARTED
     if _WORKSHOP_PRINT_MONITOR_WATCHER_STARTED:
         return
-    enabled = True
+    enabled = False
     try:
         import bobert_companion as _bc
         enabled = bool(
-            getattr(_bc, "WORKSHOP_PRINT_MONITOR_AUTO_LAUNCH", True)
+            getattr(_bc, "WORKSHOP_PRINT_MONITOR_AUTO_LAUNCH", False)
         )
     except Exception:
         pass
