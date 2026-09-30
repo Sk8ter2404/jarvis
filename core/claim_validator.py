@@ -88,6 +88,10 @@ _TURN_OBJ = (r"(?:(?:it|them|that|this|those|these|everything|all\s+(?:of\s+)?"
 _TIMER_OBJ = r"(?:a|an|the|your)\s+(?:[\w-]+\s+){0,2}?"
 _LOOK_OBJ = r"(?:a|another)\s+(?:quick\s+|fresh\s+|closer\s+)?"
 _UP_OBJ = r"(?:(?:it|that|this|them)\s+)?"
+_CHECK_NOT = (r"(?!\s+(?:in|out)\b)"
+              r"(?!\s+(?:(?:my|the|that|this|your|our)\s+)?(?:math|maths|"
+              r"arithmetic|calculations?|conversion|sums|working|reasoning|"
+              r"spelling)\b)")
 
 _FAMILIES: tuple[tuple[str, str, str, str, frozenset[str]], ...] = (
     ("restart",
@@ -141,10 +145,23 @@ _FAMILIES: tuple[tuple[str, str, str, str, frozenset[str]], ...] = (
                 "input"})),
     ("search",
      r"searching|looking\s+" + _UP_OBJ + r"up\b",
-     r"searched|looked\s+" + _UP_OBJ + r"up\b|googled",
+     r"searched|looked\s+" + _UP_OBJ + r"up\b|googled|"
+     r"(?:done|ran|run|did)\s+(?:a|an)\s+(?:quick\s+|brief\s+)?(?:web\s+)?"
+     r"search\b",
      r"search|look\s+" + _UP_OBJ + r"up\b|google",
      frozenset({"search", "web", "google", "lookup", "look", "browser",
                 "browse", "find", "wiki", "wikipedia", "rag"})),
+    # "I've checked the logs" / "Checking now, sir." / "Let me check." What
+    # can be checked is open-ended (logs, calendar, weather, the printer), so
+    # ANY action that succeeded this turn grounds it (the "*" token).
+    # Re-checking its OWN arithmetic is not an action ("Let me double-check
+    # my math: 100 °F is 37.8 °C"), and "checking account" is a noun.
+    ("check",
+     r"(?:double[-\s]?)?checking" + _CHECK_NOT + r"(?!\s+accounts?\b)|"
+     r"verifying" + _CHECK_NOT,
+     r"(?:double[-\s]?)?checked" + _CHECK_NOT + r"|verified" + _CHECK_NOT,
+     r"(?:double[-\s]?)?check" + _CHECK_NOT + r"|verify" + _CHECK_NOT,
+     frozenset({"*"})),
     ("timer",
      r"setting\s+(?:up\s+)?" + _TIMER_OBJ + r"(?:timer|alarm|reminder)\b|"
      r"starting\s+" + _TIMER_OBJ + r"timer\b",
@@ -191,10 +208,15 @@ _ADVERBS = (r"(?:(?:now|just|currently|already|also|quickly|immediately|"
 def _compile_family(gerund: str, participle: str, base: str):
     progressive = re.compile(
         r"\b(?:i'?m|i\s+am)\s+" + _ADVERBS + r"(?:" + gerund + r")\b")
+    # "I've taken the liberty of searching ..." is the persona's initiative
+    # opener wrapped round a gerund: as much a claim as "I've searched".
     perfect = re.compile(
         r"\b(?:i'?ve|i\s+have|i)\s+"
         r"(?:(?:just|now|already|also|successfully|gone\s+ahead\s+and|"
-        r"went\s+ahead\s+and)\s+)?(?:" + participle + r")\b")
+        r"went\s+ahead\s+and)\s+)?(?:" + participle + r")\b"
+        r"|\b(?:i'?ve|i\s+have|i'?m|i\s+am|i)\s+(?:just\s+|already\s+)?"
+        r"(?:taken|took|taking)\s+the\s+liberty\s+of\s+" + _ADVERBS +
+        r"(?:" + gerund + r")\b")
     future = re.compile(
         r"\b(?:i'?ll|i\s+will|i'?m\s+going\s+to|i\s+am\s+going\s+to|"
         r"i'?m\s+about\s+to|let\s+me)\s+"
@@ -346,10 +368,19 @@ def _gerund_is_noun_use(core: str, end: int) -> bool:
     return False
 
 
+# First-person idioms that name a verb without claiming the act ("Last time I
+# checked, Pluto was a dwarf planet"). Blanked before the family scan.
+_IDIOM_RE = re.compile(
+    r"\b(?:(?:the\s+)?last\s+time\s+i\s+checked|when\s+i\s+last\s+checked)\b")
+
+
 def _clause_claim(core: str) -> Optional[tuple[str, str]]:
     """(family, matched text) for a first-person action claim in one clause
     (lead-ins already stripped), else None."""
     if core.endswith("?") or _OFFER_RE.search(core):
+        return None
+    core = _IDIOM_RE.sub(" ", core).strip(" ,")
+    if not core:
         return None
     # Narration may also open a later comma-separated part ("Excellent
     # choice, sir, playing it now."), but only with an explicit narration
@@ -478,7 +509,8 @@ def find_unverified_claim(text: str, *, ran_actions: Iterable[str] = (),
         claim = _clause_claim(core)
         if claim:
             fam, phrase = claim
-            if not (_family_tokens(fam) & ran):
+            tokens = _family_tokens(fam)
+            if not (tokens & ran or ("*" in tokens and any_ran)):
                 return phrase.strip()
             content.append(core)     # a grounded summary of a real result
             continue

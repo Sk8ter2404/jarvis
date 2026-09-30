@@ -1105,3 +1105,45 @@ class GenericHeaderWordRoutingRegressionTests(unittest.TestCase):
             self.assertIn(home, self.bodies, f"fixture drift: no {home!r}")
             inc, _ = pr.select_sections(phrase, self.sections)
             self.assertIn(home, inc, f"{phrase!r} must still load {home!r}")
+
+
+class UnitConversionRoutingRegressionTests(unittest.TestCase):
+    """2026-09-29 live (v2.0.131): "convert 100 degrees fahrenheit to celsius"
+    loaded SYSTEM HEALTH (gpu_usage / hardware-temperature grammar) on
+    "degrees" + "celsius" — arithmetic handed hardware and weather actions.
+    On a conversion turn the unit words no longer route; a real hardware or
+    weather question that names a unit still does."""
+
+    CONVERSIONS = ("convert 100 degrees fahrenheit to celsius",
+                   "what's 30 celsius in fahrenheit",
+                   "how many degrees celsius is 100 fahrenheit",
+                   "convert 20 degrees c to f")
+
+    def setUp(self):
+        _core, self.sections = pr.split_pc_control(FULL)
+
+    def test_conversion_turns_load_no_health_or_weather(self):
+        for text in self.CONVERSIONS:
+            with self.subTest(text=text):
+                inc, _ = pr.select_sections(text, self.sections)
+                self.assertNotIn("SYSTEM HEALTH", inc)
+                self.assertNotIn("WEATHER BRIEFING", inc)
+
+    def test_conversion_prompt_does_not_carry_the_weather_action(self):
+        slim = pr.slim_pc_control(self.CONVERSIONS[0], FULL)
+        weather_body = dict(self.sections)["WEATHER BRIEFING"]
+        self.assertNotIn(weather_body, slim)
+
+    def test_unit_words_still_route_real_questions(self):
+        for text, home in (("how hot is my graphics card", "SYSTEM HEALTH"),
+                           ("what's the gpu temperature in celsius",
+                            "SYSTEM HEALTH"),
+                           ("convert the gpu temperature to fahrenheit",
+                            "SYSTEM HEALTH"),
+                           ("how many degrees is it outside",
+                            "SYSTEM HEALTH"),
+                           ("what's the weather in celsius", "WEATHER BRIEFING"),
+                           ("will it rain tomorrow", "WEATHER BRIEFING")):
+            with self.subTest(text=text):
+                inc, _ = pr.select_sections(text, self.sections)
+                self.assertIn(home, inc)

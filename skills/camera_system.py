@@ -488,10 +488,65 @@ def camera_status(_: str = "") -> str:
         parts.append("the Kinect is off (disabled by default for privacy)")
         cam_total = len(health)   # don't count an off sensor in the headline
 
+    # Camera-gate quarantine (v2.0.132): a device JARVIS has switched off for
+    # the session because its stream start kept knocking the USB hub offline.
+    # Said here too, so "camera status" never reports it as merely "dark".
+    for label in _quarantined_labels():
+        parts.append(f"{label} is switched off - it kept knocking the USB hub "
+                     f"offline whenever it started (move it to another port, "
+                     f"then say 'use {label} again')")
+
     headline = {0: "No cameras", 1: "One camera", 2: "Two cameras",
                 3: "Three cameras"}.get(cam_total, f"{cam_total} cameras")
     body = "; ".join(parts) if parts else "none reporting"
     return f"{headline}, sir: {body}."
+
+
+def _quarantined_labels() -> list:
+    """Spoken labels of every camera the monolith's camera gate has
+    quarantined this session, in a stable order. [] when there is no monolith
+    or no gate. NEVER raises."""
+    try:
+        bc = _bc()
+        fn = getattr(bc, "get_camera_gate_status", None) if bc else None
+        if not callable(fn):
+            return []
+        q = (fn() or {}).get("quarantined") or {}
+        return [str((v or {}).get("label") or k) for k, v in sorted(q.items())]
+    except Exception:
+        return []
+
+
+# ─── action: camera_unquarantine ─────────────────────────────────────────
+
+def camera_unquarantine(arg: str = "") -> str:
+    """Lift the camera gate's session quarantine - the owner has moved the
+    camera to another USB port. ``arg`` narrows it ("left", "right",
+    "kinect"); empty lifts every quarantined camera. NEVER raises."""
+    bc = _bc()
+    fn = getattr(bc, "camera_gate_lift_quarantine", None) if bc else None
+    if not callable(fn):
+        return "I can't reach the camera gate right now, sir."
+    try:
+        lifted = list(fn(str(arg or "").strip()) or [])
+    except Exception:
+        lifted = []
+    if not lifted:
+        still = _quarantined_labels()
+        if still:
+            one = len(still) == 1
+            line = (f"{' and '.join(still)} {'is' if one else 'are'} the only "
+                    f"camera{'' if one else 's'} switched off, sir - say 'use "
+                    f"{still[0]} again' to put {'it' if one else 'them'} back.")
+            return line[:1].upper() + line[1:]
+        return ("No camera is switched off at the moment, sir - there is "
+                "nothing to put back.")
+    names = " and ".join(lifted)
+    verb = "is" if len(lifted) == 1 else "are"
+    return (f"Understood, sir - {names} {verb} back in use. I'll bring "
+            f"{'it' if len(lifted) == 1 else 'them'} up one at a time, and "
+            f"if the hub drops out again I'll switch "
+            f"{'it' if len(lifted) == 1 else 'them'} off again.")
 
 
 # ─── action 2: situational awareness ─────────────────────────────────────
@@ -778,5 +833,7 @@ def register(actions):
     actions["situational_awareness"]  = where_am_i
     actions["where_am_i"]             = where_am_i
     actions["look_around"]            = look_around
+    actions["camera_unquarantine"]    = camera_unquarantine
     print("  [camera-system] unified multi-camera actions registered "
-          "(camera_status, situational_awareness/where_am_i, look_around)")
+          "(camera_status, situational_awareness/where_am_i, look_around, "
+          "camera_unquarantine)")

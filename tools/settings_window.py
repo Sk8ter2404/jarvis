@@ -278,6 +278,27 @@ SCHEMA: dict[str, dict] = {
                 "handy when an external TV the media session can't see is "
                 "playing.",
     },
+    "SELF_ECHO_FILTER_ENABLED": {
+        "tab": "voice", "label": "Never answer his own voice",
+        "type": "bool", "default": True,
+        "help": "Ignore anything the mic hears while JARVIS is speaking (or "
+                "just after), and anything that repeats a line he said "
+                "moments ago. 'Stop' always gets through; typed commands are "
+                "never checked. Applies on the next start.",
+    },
+    "SELF_ECHO_WINDOW_S": {
+        "tab": "voice", "label": "Remember his own lines for (seconds)",
+        "type": "float", "default": 20.0,
+        "help": "How long a line JARVIS spoke is remembered, so the mic "
+                "hearing it again is ignored. Applies on the next start.",
+    },
+    "SELF_ECHO_TAIL_S": {
+        "tab": "voice", "label": "Ignore the mic just after he speaks (seconds)",
+        "type": "float", "default": 0.8,
+        "help": "Speech that starts this soon after one of his own lines "
+                "ends (while the mic was already listening) counts as his "
+                "echo. Applies on the next start.",
+    },
     "MICROPHONE_INDEX": {
         "tab": "voice", "label": "Microphone", "type": "device",
         "default": None,
@@ -848,6 +869,30 @@ SCHEMA: dict[str, dict] = {
                 "this long, doubling if it happens again within the hour (max "
                 "an hour). Running streams are left alone. 0 = off. Applies on "
                 "the next start.",
+    },
+    "CAMERA_STORM_PROBATION_S": {
+        "tab": "advanced", "label": "USB trouble: probation after a cool-down (seconds)",
+        "type": "float", "default": 180.0,
+        "help": "For this long after the cameras are allowed back (and for a "
+                "minute after any camera is reopened while the USB bus has "
+                "been unstable within the hour), a single camera dropping "
+                "stops every camera again, for twice as long. 0 = off. "
+                "Applies on the next start.",
+    },
+    "CAMERA_CULPRIT_WINDOW_S": {
+        "tab": "advanced", "label": "USB trouble: blame a camera started this recently (seconds)",
+        "type": "float", "default": 5.0,
+        "help": "When the USB bus drops out within this many seconds of one "
+                "camera starting its video, that camera gets the blame for "
+                "it. 0 = never blame a camera. Applies on the next start.",
+    },
+    "CAMERA_CULPRIT_THRESHOLD": {
+        "tab": "advanced", "label": "USB trouble: switch a camera off after this many strikes",
+        "type": "int", "default": 2,
+        "help": "A camera blamed this many times within an hour is switched "
+                "off for the rest of the session (JARVIS tells you once; say "
+                "'use the left webcam again' after moving it to another "
+                "port). 0 = never switch one off. Applies on the next start.",
     },
     "CAMERA_OPEN_MIN_GAP_S": {
         "tab": "advanced", "label": "Gap between two parts opening one camera (seconds)",

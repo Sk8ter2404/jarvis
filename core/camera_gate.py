@@ -33,6 +33,10 @@ WHAT THE GATE DOES
 Every opener asks :meth:`CameraGate.begin` before it touches a device and
 reports back through :meth:`CameraGate.end`. The gate refuses when, in order:
 
+  quarantined  this device's own stream START has been followed by a USB bus
+             event CULPRIT_THRESHOLD times within an hour (see CULPRIT
+             QUARANTINE below). Never opened again automatically this
+             session; only the owner lifts it (lift_quarantine).
   usb-storm  the circuit breaker is open: >=2 cameras (or a camera and an
              audio endpoint) dropped within ~10 s, or >=3 open failures across
              >=2 devices within 60 s. ALL camera and Kinect opens stop for a
@@ -70,6 +74,42 @@ reports back through :meth:`CameraGate.end`. The gate refuses when, in order:
 Only the last three are worth WAITING for (see TIMING_REASONS); the rest mean
 "not now - ask again at wait_s".
 
+────────────────────────────────────────────────────────────────────────────
+PROBATION AND CULPRIT QUARANTINE (v2.0.132, from the 2026-09-29 live log)
+────────────────────────────────────────────────────────────────────────────
+The first cool-down worked. Then, 18 s after it ended, the face tracker
+opened one webcam, the hub reset 0.8 s later and again 2.5 s after that, the
+other webcam's open found its device gone from the list, the first webcam
+went dead after 60 failed reads - and the breaker did NOT trip again, because
+a failed open of a vanished device was not a "drop" and one drop is not two.
+The webcam was reopened 21 s later and the hub reset 0.04 s after THAT. A
+read-only USB test the same day (no JARVIS) showed that webcam's plain stream
+starts reset the hub 8 of 10 times; its sibling on the same hub, 0 of 10.
+
+  probation  for probation_s (default 180 s) after a cool-down ends, and for
+             REOPEN_PROBATION_S after any successful reopen of a recovering
+             device while that storm chain is live (a cool-down ended within
+             the hour), ONE drop re-trips the breaker at once, with the
+             doubled cool-down. A drop is: a camera gone from the device list
+             (a drop report or a failed open whose device vanished), a camera
+             read-failure burst (note_drop), or an audio endpoint vanishing.
+             Open failures of a device that is still listed do not count.
+  bursts     a read-failure burst is counted once per STREAM, not once per
+             "episode since the last healthy frame": a device reopened after a
+             drop that fails again is a new drop. So bursts on >=2 cameras
+             within 10 s trip the breaker exactly like device-list drops.
+  culprit    a USB bus event (a breaker trip, or a camera vanishing from the
+             device list) whose ONSET falls inside a device's stream start -
+             from the begin() of an open that SUCCEEDED to culprit_window_s
+             (default 5 s) after it - is a strike against that device (the
+             latest such starter; one strike per stream). culprit_threshold
+             strikes (default 2) within an hour QUARANTINE it for the rest of
+             the session: said once through ``announce`` with the device's
+             friendly label, logged, and shown in snapshot(). A device whose
+             own open FAILED never earns a strike - a victim that tried to
+             start into a resetting hub is not the thing that reset it.
+             Nothing is persisted: a restart (or lift_quarantine) forgets it.
+
 WHAT IT DELIBERATELY DOES NOT DO: it never closes a stream, never reads a
 frame, never touches a device. It is pure bookkeeping under one lock, with an
 injectable clock, so every rule here is unit-testable on a runner with no
@@ -92,6 +132,8 @@ from typing import Callable, NamedTuple
 __all__ = [
     "BACKOFF_STEPS_S", "Decision", "CameraGate", "TIMING_REASONS",
     "HOLD_REASONS", "KIND_CAMERA", "KIND_AUDIO", "minutes_phrase",
+    "STORM_PROBATION_S", "REOPEN_PROBATION_S", "CULPRIT_WINDOW_S",
+    "CULPRIT_THRESHOLD",
 ]
 
 # ── the numbers (the three owner knobs are in core/config.py) ──────────────
@@ -119,6 +161,23 @@ STORM_DROP_WINDOW_S = 10.0
 STORM_FAIL_WINDOW_S = 60.0
 STORM_FAIL_COUNT = 3
 STORM_COOLDOWN_MAX_S = 3600.0
+# PROBATION (v2.0.132): after a cool-down ends, a SINGLE drop re-trips the
+# breaker for this long (owner knob CAMERA_STORM_PROBATION_S; 0 = off)...
+STORM_PROBATION_S = 180.0
+# ...and for this long after any successful reopen of a recovering device,
+# while the storm chain is live (a cool-down ended within the hour).
+REOPEN_PROBATION_S = 60.0
+# CULPRIT QUARANTINE (v2.0.132): a USB bus event whose onset falls within this
+# long of a device's stream start is a strike against that device (owner knob
+# CAMERA_CULPRIT_WINDOW_S; 0 = off)...
+CULPRIT_WINDOW_S = 5.0
+# ...and this many strikes within CULPRIT_MEMORY_S quarantine it for the rest
+# of the session (owner knob CAMERA_CULPRIT_THRESHOLD; 0 = off).
+CULPRIT_THRESHOLD = 2
+CULPRIT_MEMORY_S = 3600.0
+# How often a caller refused as "quarantined" should ask again. Asking costs a
+# dict lookup; the answer only changes when the owner lifts the quarantine.
+QUARANTINE_POLL_S = 600.0
 # How long an in-flight reservation may stand before it is presumed abandoned
 # (an opener that crashed between begin() and end()). Above the longest
 # bounded open in the monolith (_CAMERA_LOOP_OPEN_TIMEOUT_S = 35 s).
@@ -153,8 +212,8 @@ KIND_AUDIO = "audio"
 # Refusals a caller may reasonably WAIT out (seconds, not minutes).
 TIMING_REASONS = frozenset({"min-gap", "stagger", "in-flight"})
 # Refusals that mean "the device is being protected - do not open it now".
-HOLD_REASONS = frozenset({"usb-storm", "wedged", "absent", "settling",
-                          "held", "locked", "backoff"})
+HOLD_REASONS = frozenset({"quarantined", "usb-storm", "wedged", "absent",
+                          "settling", "held", "locked", "backoff"})
 
 
 class Decision(NamedTuple):
@@ -215,6 +274,9 @@ class CameraGate:
     ``presence`` - one-argument callable: is device ``key`` on the bus now?
                  True / False / None (cannot tell). Called after a failure or
                  a drop, and on every ask for a device in the absent state.
+    ``labeler`` - one-argument callable: the SPOKEN name of device ``key``
+                 ("the left webcam"). Only called when a device is
+                 quarantined; a fault falls back to a name built from the key.
     """
 
     def __init__(self, *, min_gap_s: float = 10.0,
@@ -228,11 +290,15 @@ class CameraGate:
                  storm_drop_window_s: float = STORM_DROP_WINDOW_S,
                  storm_fail_window_s: float = STORM_FAIL_WINDOW_S,
                  storm_fail_count: int = STORM_FAIL_COUNT,
+                 probation_s: float = STORM_PROBATION_S,
+                 culprit_window_s: float = CULPRIT_WINDOW_S,
+                 culprit_threshold: int = CULPRIT_THRESHOLD,
                  clock: "Callable[[], float] | None" = None,
                  log: "Callable[[str], None] | None" = None,
                  announce: "Callable[[str], None] | None" = None,
                  lockers: "Callable[[], list] | None" = None,
-                 presence: "Callable[[str], object] | None" = None) -> None:
+                 presence: "Callable[[str], object] | None" = None,
+                 labeler: "Callable[[str], str] | None" = None) -> None:
         self.min_gap_s = self._num(min_gap_s, 10.0)
         self.max_backoff_s = self._num(max_backoff_s, 600.0)
         self.storm_cooldown_s = self._num(storm_cooldown_s, 600.0)
@@ -251,11 +317,18 @@ class CameraGate:
             self.storm_fail_count = max(2, int(storm_fail_count))
         except Exception:
             self.storm_fail_count = STORM_FAIL_COUNT
+        self.probation_s = self._num(probation_s, STORM_PROBATION_S)
+        self.culprit_window_s = self._num(culprit_window_s, CULPRIT_WINDOW_S)
+        try:
+            self.culprit_threshold = max(0, int(culprit_threshold))
+        except Exception:
+            self.culprit_threshold = CULPRIT_THRESHOLD
         self._clock = clock or time.time
         self._log = log
         self._announce = announce
         self._lockers = lockers
         self._presence = presence
+        self._labeler = labeler
         self._lock = threading.RLock()
         self.reset()
 
@@ -288,6 +361,8 @@ class CameraGate:
             self._refusal_counts: dict = {}
             self._wedges: dict = {}           # token -> (key, component, since)
             self._wedge_others_released = False
+            self._reopen_at = 0.0             # last successful RE-open ...
+            self._reopen_key = ""             # ... of a recovering device
 
     def _rec(self, key: str) -> dict:
         r = self._dev.get(key)
@@ -298,7 +373,12 @@ class CameraGate:
                  "locked_until": 0.0, "healthy_since": 0.0,
                  "recovering": False, "dropped": False, "held_by": "",
                  "opens": 0, "fails": 0,
-                 "absent": False, "absent_since": 0.0, "arrived_at": 0.0}
+                 "absent": False, "absent_since": 0.0, "arrived_at": 0.0,
+                 # culprit bookkeeping (v2.0.132)
+                 "stream_begin_at": 0.0, "stream_ok_at": 0.0, "opens_ok": 0,
+                 "struck_open": -1, "strikes": [], "quarantined": False,
+                 "quarantined_at": 0.0, "quarantine_why": "",
+                 "quarantine_label": ""}
             self._dev[key] = r
         return r
 
@@ -349,8 +429,61 @@ class CameraGate:
             self._fails.clear()
         return False
 
+    def _chain_live_locked(self, now: float) -> bool:
+        """A cool-down ended within the hour: a trip now would be a REPEAT
+        (doubled, not spoken)."""
+        return bool(self._storm_last_end
+                    and self._storm_last_cooldown > 0.0
+                    and (now - self._storm_last_end) < self.storm_cooldown_max_s)
+
+    def _probation_locked(self, now: float) -> str:
+        """Why ONE drop would re-trip the breaker right now ('' when it would
+        not). Call after _storm_tick_locked."""
+        if self.probation_s <= 0.0 or self.storm_cooldown_s <= 0.0:
+            return ""
+        if self._storm_until and now < self._storm_until:
+            return ""                           # cooling down: nothing to trip
+        if self._storm_last_end:
+            since = now - self._storm_last_end
+            if 0.0 <= since < self.probation_s:
+                return (f"{since:.0f}s after the last cool-down ended "
+                        f"(probation {self.probation_s:.0f}s)")
+        if self._reopen_at and self._chain_live_locked(now):
+            since = now - self._reopen_at
+            if 0.0 <= since < REOPEN_PROBATION_S:
+                return (f"{since:.0f}s after {self._reopen_key} was reopened "
+                        f"(probation {REOPEN_PROBATION_S:.0f}s)")
+        return ""
+
+    def _count_drop_locked(self, now: float, key: str, kind: str,
+                           onset: float, cause: str, vanished: bool,
+                           lines: list, spoken: list,
+                           minor: bool = False) -> bool:
+        """One NEW drop (already de-duplicated by the caller). Trips the
+        breaker on probation or on the two-device rules, and treats a camera
+        that VANISHED from the device list as a hub-level event for the
+        culprit tally even when nothing trips. A MINOR drop (one failed read
+        of a camera still on the device list) counts toward the two-device
+        rules only: alone it is not evidence of a bus event, so it never
+        re-trips the breaker on probation. Returns True iff it tripped."""
+        before = self._storm_trips
+        self._storm_tick_locked(now, lines)
+        self._drops.append((now, key, kind, onset))
+        why = "" if (minor and not vanished) else self._probation_locked(now)
+        if why:
+            self._trip_locked(now, f"{key} dropped ({cause}) {why}",
+                              lines, spoken, onset=onset)
+        else:
+            self._evaluate_locked(now, lines, spoken)
+        tripped = self._storm_trips != before
+        if vanished and not tripped:
+            self._attribute_locked(now, onset,
+                                   f"{key} vanishing from the device list",
+                                   lines, spoken)
+        return tripped
+
     def _trip_locked(self, now: float, why: str, lines: list,
-                     spoken: list) -> None:
+                     spoken: list, onset: "float | None" = None) -> None:
         if self.storm_cooldown_s <= 0.0:
             return                              # breaker disabled by the owner
         if self._storm_tick_locked(now, lines):
@@ -382,32 +515,97 @@ class CameraGate:
             # noise, not information.
             spoken.append(f"Sir, the USB bus looks unstable, so I'm leaving "
                           f"the cameras alone for {minutes_phrase(cool)}.")
+        self._attribute_locked(now, now if onset is None else onset,
+                               f"USB storm trip #{self._storm_trips}",
+                               lines, spoken)
+
+    # ── the culprit ───────────────────────────────────────────────────────
+    def _label_for(self, key: str) -> str:
+        """The spoken name of ``key`` ("the left webcam")."""
+        try:
+            if self._labeler is not None:
+                got = str(self._labeler(key) or "").strip()
+                if got:
+                    return got
+        except Exception:
+            pass
+        if key == "kinect":
+            return "the Kinect"
+        name = key.split(":", 1)[1] if ":" in key else key
+        return f"the {name} camera"
+
+    def _attribute_locked(self, now: float, onset: float, why: str,
+                          lines: list, spoken: list) -> None:
+        """A USB bus event with this ONSET happened: strike the device whose
+        stream START it followed, and quarantine a repeat offender."""
+        if self.culprit_window_s <= 0.0 or self.culprit_threshold <= 0:
+            return
+        best, best_begin = None, 0.0
+        for k, r in self._dev.items():
+            if (not self._staggered(k) or r["quarantined"]
+                    or not r["stream_ok_at"]
+                    or r["struck_open"] == r["opens_ok"]):
+                continue
+            b = r["stream_begin_at"] or r["stream_ok_at"]
+            if b <= onset <= r["stream_ok_at"] + self.culprit_window_s:
+                if best is None or b > best_begin:
+                    best, best_begin = k, b
+        if best is None:
+            return
+        r = self._dev[best]
+        r["struck_open"] = r["opens_ok"]
+        r["strikes"] = [t for t in r["strikes"]
+                        if (now - t) < CULPRIT_MEMORY_S] + [now]
+        n = len(r["strikes"])
+        lines.append(
+            f"  [camera-culprit] {best}: {why} began "
+            f"{onset - r['stream_ok_at']:+.1f}s after its stream started - "
+            f"strike {n} of {self.culprit_threshold} within the hour.")
+        if n < self.culprit_threshold:
+            return
+        label = self._label_for(best)
+        r["quarantined"] = True
+        r["quarantined_at"] = now
+        r["quarantine_label"] = label
+        r["quarantine_why"] = (f"its stream start was followed by a USB bus "
+                               f"event {n} times within the hour")
+        lines.append(
+            f"  [camera-quarantine] {best} ({label}): {r['quarantine_why']} - "
+            f"QUARANTINED for the rest of this session. JARVIS will not open "
+            f"it again on its own; move it to a port on a different hub, then "
+            f"say 'use {label} again'.")
+        spoken.append(f"Sir, {label} keeps knocking the USB hub offline "
+                      f"whenever it starts, so I've stopped using it until "
+                      f"it's moved to another port.")
 
     def _evaluate_locked(self, now: float, lines: list, spoken: list) -> None:
+        # drops: (t, key, kind, onset); fails: (t, key, onset)
         dw = self.storm_drop_window_s
         while self._drops and (now - self._drops[0][0]) > dw:
             self._drops.popleft()
         fw = self.storm_fail_window_s
         while self._fails and (now - self._fails[0][0]) > fw:
             self._fails.popleft()
-        cams = sorted({k for _t, k, kind in self._drops if kind == KIND_CAMERA})
-        audio = sorted({k for _t, k, kind in self._drops if kind == KIND_AUDIO})
+        cams = sorted({d[1] for d in self._drops if d[2] == KIND_CAMERA})
+        audio = sorted({d[1] for d in self._drops if d[2] == KIND_AUDIO})
+        d_onset = min((d[3] for d in self._drops), default=now)
         if len(cams) >= 2:
             self._trip_locked(now, f"{len(cams)} cameras dropped within "
                                    f"{dw:.0f}s ({', '.join(cams)})",
-                              lines, spoken)
+                              lines, spoken, onset=d_onset)
             return
         if cams and audio:
             self._trip_locked(now, f"a camera and an audio endpoint dropped "
                                    f"within {dw:.0f}s ({cams[0]}, {audio[0]})",
-                              lines, spoken)
+                              lines, spoken, onset=d_onset)
             return
-        fkeys = sorted({k for _t, k in self._fails})
+        fkeys = sorted({f[1] for f in self._fails})
         if len(self._fails) >= self.storm_fail_count and len(fkeys) >= 2:
             self._trip_locked(now, f"{len(self._fails)} camera open failures "
                                    f"across {len(fkeys)} devices within "
                                    f"{fw:.0f}s ({', '.join(fkeys)})",
-                              lines, spoken)
+                              lines, spoken,
+                              onset=min(f[2] for f in self._fails))
 
     # ── the decision ──────────────────────────────────────────────────────
     def _decide_locked(self, key: str, component: str, now: float,
@@ -415,6 +613,9 @@ class CameraGate:
                        lines: "list | None" = None) -> Decision:
         r = self._rec(key)
         lines = [] if lines is None else lines
+        if r["quarantined"]:
+            return Decision(False, "quarantined", QUARANTINE_POLL_S,
+                            f"quarantined: {r['quarantine_why']}")
         if self._storm_until and now < self._storm_until:
             return Decision(False, "usb-storm", self._storm_until - now,
                             f"USB storm cool-down ({self._storm_reason})")
@@ -623,6 +824,11 @@ class CameraGate:
             spoken: list = []
             with self._lock:
                 r = self._rec(key)
+                # When THIS open started: the culprit window is measured from
+                # it, and a failed open's device-gone drop dates from it.
+                began = (r["in_flight_since"] if r["in_flight"] == component
+                         and r["in_flight_since"] else
+                         (r["last_open_at"] or now))
                 if r["in_flight"] == component:
                     r["in_flight"] = ""
                 if gone:
@@ -632,6 +838,16 @@ class CameraGate:
                     r["last_ok_by"] = component
                     r["locked_by"] = ()
                     r["locked_until"] = 0.0
+                    # A NEW STREAM (v2.0.132): its failures are a new drop,
+                    # not the tail of the last episode - a device reopened
+                    # after a drop that fails again must count again.
+                    r["dropped"] = False
+                    r["stream_begin_at"] = min(began, now)
+                    r["stream_ok_at"] = now
+                    r["opens_ok"] += 1
+                    if r["recovering"] and self._staggered(key):
+                        self._reopen_at = now
+                        self._reopen_key = key
                     if r["recovering"]:
                         # A read-failure RECOVERY that worked still spends a
                         # rung: if the device dies again soon, the next
@@ -650,7 +866,22 @@ class CameraGate:
                     r["level"] += 1
                     r["hold_until"] = now + self._step_s(r["level"])
                 if count:
-                    self._fails.append((now, key))
+                    self._fails.append((now, key, min(began, now)))
+                # A device that has STREAMED this session and whose open now
+                # fails with it gone from the device list has VANISHED - a
+                # drop, exactly like one reported from a running stream (the
+                # 2026-09-29 18:48:58 line), and counted once per open ATTEMPT
+                # (an absent device is not re-attempted, so this cannot
+                # repeat). One never seen streaming that is not listed is
+                # simply not plugged in: not a bus event.
+                if gone and r["opens_ok"] > 0:
+                    r["dropped"] = True
+                    r["recovering"] = True
+                    self._count_drop_locked(
+                        now, key, KIND_CAMERA, min(began, now),
+                        "its open failed and it is gone from the device list",
+                        True, lines, spoken)
+                elif count:
                     self._evaluate_locked(now, lines, spoken)
             self._emit(lines, spoken)
         except Exception:
@@ -700,15 +931,34 @@ class CameraGate:
 
     def note_drop(self, key: str, component: str = "",
                   kind: str = KIND_CAMERA,
-                  now: "float | None" = None) -> bool:
+                  now: "float | None" = None, *,
+                  onset: "float | None" = None, cause: str = "",
+                  minor: bool = False) -> bool:
         """A device that was delivering has stopped (a camera's read-failure
         escalation, the Kinect's stale-stream reset, an audio endpoint that
-        vanished). Counted ONCE per episode per device - a camera failing for a
-        minute is one drop, not 600. The next open of that device is a
-        RECOVERY and spends a backoff rung. Returns True iff this call tripped
-        the breaker. NEVER raises."""
+        vanished). Counted ONCE per stream per device - a camera failing for a
+        minute is one drop, not 600, but a camera REOPENED since (a successful
+        end()) that fails again is a new drop. The next open of that device is
+        a RECOVERY and spends a backoff rung.
+
+        ``onset``  when the trouble STARTED (the first failed read of the
+                   burst), if the caller knows; the culprit window is measured
+                   against it. Clamped to [now - 60 s, now].
+        ``cause``  a few words for the log line ("read-failure burst").
+        ``minor``  ONE failed read, not a burst (a side tile's read that
+                   failed once): it still counts toward the two-device storm
+                   rules, but unless the camera is also gone from the device
+                   list it never re-trips the breaker ALONE on probation. A
+                   later full burst on the same stream still counts.
+
+        Returns True iff this call tripped the breaker. NEVER raises."""
         try:
             now = self._clock() if now is None else now
+            try:
+                o = now if onset is None else float(onset)
+                o = max(now - 60.0, min(o, now)) if o == o else now
+            except Exception:
+                o = now
             gone = (kind == KIND_CAMERA and self._poll_presence(
                 key, only_if_absent=False) is False)
             lines: list = []
@@ -720,17 +970,22 @@ class CameraGate:
                 if kind == KIND_CAMERA:
                     if gone:
                         self._mark_absent_locked(key, now, lines)
-                    if r["dropped"]:
+                    # dropped: False / "minor" (one failed read counted) /
+                    # True (a full drop counted). A full drop on a stream
+                    # whose only report so far was minor still counts once.
+                    if r["dropped"] is True or (r["dropped"] and minor
+                                                and not gone):
                         already = True
                     else:
-                        r["dropped"] = True
+                        r["dropped"] = "minor" if (minor and not gone) else True
                         r["recovering"] = True
                         r["healthy_since"] = 0.0
                 if not already:
-                    before = self._storm_trips
-                    self._drops.append((now, key, kind))
-                    self._evaluate_locked(now, lines, spoken)
-                    tripped = self._storm_trips != before
+                    tripped = self._count_drop_locked(
+                        now, key, kind, o,
+                        cause or ("read failures" if kind == KIND_CAMERA
+                                  else "audio endpoint vanished"),
+                        bool(gone), lines, spoken, minor=bool(minor))
             self._emit(lines, spoken)
             return tripped
         except Exception:
@@ -833,6 +1088,44 @@ class CameraGate:
         except Exception:
             return []
 
+    def quarantined(self, key: "str | None" = None):
+        """With ``key``: is that device quarantined? Without: {key: spoken
+        label} of every quarantined device. NEVER raises."""
+        try:
+            with self._lock:
+                if key is not None:
+                    r = self._dev.get(key)
+                    return bool(r and r["quarantined"])
+                return {k: (r["quarantine_label"] or self._label_for(k))
+                        for k, r in self._dev.items() if r["quarantined"]}
+        except Exception:
+            return False if key is not None else {}
+
+    def lift_quarantine(self, key: str, now: "float | None" = None) -> bool:
+        """The OWNER says a quarantined device may be used again (it has been
+        moved to another port). Clears its strikes too, so it starts from
+        zero. True iff it was quarantined. NEVER raises."""
+        try:
+            now = self._clock() if now is None else now
+            lines: list = []
+            with self._lock:
+                r = self._dev.get(key)
+                if not (r and r["quarantined"]):
+                    return False
+                r["quarantined"] = False
+                r["quarantined_at"] = 0.0
+                r["quarantine_why"] = ""
+                r["strikes"] = []
+                r["struck_open"] = r["opens_ok"]
+                lines.append(
+                    f"  [camera-quarantine] {key}: lifted by the owner - it "
+                    f"may be opened again (through the usual gate, one "
+                    f"device at a time).")
+            self._emit(lines, [])
+            return True
+        except Exception:
+            return False
+
     def recent_success(self, key: str, component: str, within_s: float,
                        now: "float | None" = None) -> "float | None":
         """Age of the last SUCCESSFUL open of ``key`` by ``component``, if it
@@ -853,6 +1146,7 @@ class CameraGate:
         """Plain-data view for status lines and tests. NEVER raises."""
         try:
             now = self._clock() if now is None else now
+            lines: list = []
             with self._lock:
                 devs = {}
                 for k, r in self._dev.items():
@@ -867,18 +1161,34 @@ class CameraGate:
                         "last_open_by": r["last_open_by"],
                         "recovering": r["recovering"],
                         "absent": r["absent"],
+                        "quarantined": r["quarantined"],
+                        "culprit_strikes": len([
+                            t for t in r["strikes"]
+                            if (now - t) < CULPRIT_MEMORY_S]),
                     }
+                q_keys = [k for k, r in self._dev.items() if r["quarantined"]]
                 active = bool(self._storm_until and now < self._storm_until)
-                return {
+                self._storm_tick_locked(now, lines)
+                probation = self._probation_locked(now)
+                out = {
                     "storm_active": active,
                     "storm_remaining_s": (self._storm_until - now) if active else 0.0,
                     "storm_reason": self._storm_reason if active else "",
                     "storm_trips": self._storm_trips,
                     "wedged": [w[0] for w in self._wedges.values()],
                     "storm_last_cooldown_s": self._storm_last_cooldown,
+                    "storm_probation": probation,
                     "devices": devs,
                     "refusals": {f"{k}|{r}": n for (k, r), n
                                  in self._refusal_counts.items()},
+                    "quarantined": {
+                        k: {"label": (self._dev[k]["quarantine_label"]
+                                      or self._label_for(k)),
+                            "why": self._dev[k]["quarantine_why"]}
+                        for k in q_keys},
                 }
+            self._emit(lines, [])
+            return out
         except Exception:
-            return {"storm_active": False, "devices": {}, "refusals": {}}
+            return {"storm_active": False, "devices": {}, "refusals": {},
+                    "quarantined": {}}

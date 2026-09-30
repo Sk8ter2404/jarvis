@@ -241,6 +241,78 @@ class LooksLikeQuestionTests(unittest.TestCase):
                 self.assertFalse(cv.looks_like_question(text))
 
 
+class LibertyAndLookupClaimTests(unittest.TestCase):
+    """Live v2.0.131 (2026-09-29): "tell me something interesting" ->
+    "I've taken the liberty of searching for something truly fascinating,
+    but ..." with no [ACTION:] and no search. The persona's initiative opener
+    wrapped round an action gerund is a first-person claim; so are "I've
+    checked" / "I looked it up" / "I've done a quick search"."""
+
+    LIVE = ("[intent:dry_wit] I've taken the liberty of searching for "
+            "something truly fascinating, but I'm afraid your recent decision "
+            "to skip dinner is proving far more interesting, sir.")
+
+    def test_live_liberty_search_is_a_claim(self):
+        self.assertEqual(_flag(self.LIVE, user="tell me something interesting"),
+                         "i've taken the liberty of searching")
+
+    def test_liberty_and_lookup_claims_are_caught(self):
+        for text in (
+                "I've taken the liberty of checking the weather, sir.",
+                "I took the liberty of looking that up, sir.",
+                "I'm taking the liberty of opening Spotify.",
+                "I've checked the logs, sir. All clean.",
+                "I checked your calendar, sir.",
+                "I've double-checked the numbers.",
+                "Let me check.",
+                "Checked, sir.",
+                "Checking now, sir.",
+                "I've done a quick search, sir. Nothing of note.",
+                "I'm verifying it now."):
+            with self.subTest(text=text):
+                self.assertIsNotNone(
+                    _flag(text, user="tell me something interesting"))
+
+    def test_third_party_and_idiomatic_uses_still_pass(self):
+        for text in (
+                "Octopuses have three hearts, sir.",
+                "Scientists checked the data again in 1998.",
+                "The committee looked into the matter for a year.",
+                "Last time I checked, Pluto was a dwarf planet, sir.",
+                "Checking your tyre pressure monthly is wise, sir.",
+                "Checked in 1990, the records showed nothing.",
+                "You should check the oil before a long drive.",
+                "I've taken the liberty of assuming you'd like tea, sir.",
+                "Shall I check the forecast?",
+                "I can check if you'd like, sir.",
+                "Searching for water on Mars has been a priority for decades."):
+            with self.subTest(text=text):
+                self.assertIsNone(
+                    _flag(text, user="tell me something interesting"))
+
+    def test_checking_its_own_arithmetic_is_not_an_action(self):
+        # Review 2026-09-29: a conversion answer that re-checks its maths
+        # must not cost a correction round; nor is "checking account" a verb.
+        user = "convert 100 degrees fahrenheit to celsius"
+        for text in (
+                "Let me double-check my math: 100 degrees Fahrenheit is 37.8 "
+                "degrees Celsius, sir.",
+                "I've double-checked the arithmetic, sir: 37.8 degrees "
+                "Celsius.",
+                "I checked the conversion twice, sir: 37.8 degrees Celsius.",
+                "Checking accounts typically pay little interest, sir."):
+            with self.subTest(text=text):
+                self.assertIsNone(_flag(text, user=user))
+        self.assertIsNotNone(_flag("I checked the logs, sir.", user=user))
+
+    def test_a_check_is_grounded_by_any_action_that_ran(self):
+        self.assertIsNone(_flag("I've checked the logs, sir. All clean.",
+                                ran=("read_logs",)))
+        self.assertIsNone(_flag(self.LIVE, ran=("web_search",)))
+        # ...but a search claim is not grounded by an unrelated action.
+        self.assertIsNotNone(_flag(self.LIVE, ran=("get_time",)))
+
+
 class StripAckPrefaceTests(unittest.TestCase):
     def test_strips_the_live_preface_and_keeps_the_intent_tag(self):
         out = cv.strip_ack_preface(AcknowledgementTests.LIVE,

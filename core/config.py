@@ -536,6 +536,19 @@ FOLLOWUP_WINDOW_S = 0.0
 # on the next start.
 DEVICE_SPEECH_FILTER_ENABLED = True
 
+# Self-echo filter (core/self_echo.py): JARVIS never answers his own voice.
+# A mic transcript captured while one of his own lines was playing (a line
+# spoken from another thread — tray, timer, background announcement — while
+# the main loop was listening), or whose speech began within SELF_ECHO_TAIL_S
+# seconds after such a line ended, is ignored; so is a transcript that matches
+# a line he spoke in the last SELF_ECHO_WINDOW_S seconds. A stop word always
+# gets through, and so does the wake word unless his own line said it. Typed
+# commands are never checked. Set via user_settings.json; applies on the next
+# start.
+SELF_ECHO_FILTER_ENABLED = True
+SELF_ECHO_WINDOW_S       = 20.0
+SELF_ECHO_TAIL_S         = 0.8
+
 
 # ─── Whisper STT (faster-whisper preferred, GPU when present) ──────────
 # `WHISPER_DEVICE = 'auto'` lets ctranslate2 + torch decide; 'cuda'
@@ -799,6 +812,23 @@ CAMERA_REOPEN_MAX_BACKOFF_S = 600.0
 #   camera and NO Kinect for this long (doubling on a repeat within the hour,
 #   capped at 60 min). Streams already running are left alone. 0 disables it.
 USB_STORM_COOLDOWN_S        = 600.0
+# CAMERA_STORM_PROBATION_S — (v2.0.132) for this long after a cool-down ends
+#   (and for 60 s after any reopen while that storm chain is live), ONE camera
+#   drop - gone from the device list, a read-failure burst, or an audio device
+#   vanishing - re-trips the breaker at once with the doubled cool-down.
+#   Measured 2026-09-29: a webcam reopened 18 s after the first cool-down reset
+#   the hub twice and nothing re-tripped. 0 disables the probation.
+CAMERA_STORM_PROBATION_S    = 180.0
+# CAMERA_CULPRIT_WINDOW_S / CAMERA_CULPRIT_THRESHOLD — (v2.0.132) a USB bus
+#   event that begins within CAMERA_CULPRIT_WINDOW_S of ONE device's stream
+#   start is a strike against that device; CAMERA_CULPRIT_THRESHOLD strikes
+#   within an hour QUARANTINE it for the rest of the session (JARVIS says so
+#   once and never opens it on its own again; "use the left webcam again"
+#   lifts it). Measured 2026-09-29: one webcam's stream starts reset the hub
+#   8 of 10 times, its sibling on the same hub 0 of 10. Either one at 0
+#   disables the quarantine. The threshold is a count, so it is an int.
+CAMERA_CULPRIT_WINDOW_S     = 5.0
+CAMERA_CULPRIT_THRESHOLD    = 2
 # CAMERA_OPEN_MIN_GAP_S — two different JARVIS components (face tracker, boot
 #   probe, self-diagnostic, side tiles, Kinect bridge) never open the same
 #   device less than this far apart. 0 disables the gap.

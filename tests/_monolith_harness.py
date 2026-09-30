@@ -177,6 +177,10 @@ _MONOLITH_RESTORE_NAMES = (
     # by a test that drove record_speech would make a later what_microphone
     # test answer from THAT test's fake device instead of its own fixture.
     "_live_capture_device",
+    # Self-echo gate (2026-09-29): the last utterance's capture timing. A
+    # window left by a test that drove record_speech would make a LATER
+    # test's gate judge a different turn against it.
+    "_last_capture_window",
     # Capture open-failure log throttle (2026-09-29): a leaked entry would
     # silence the NEXT test's first open-failure line.
     "_open_fail_log",
@@ -388,6 +392,15 @@ def _restore_monolith_pristine(bc) -> None:
     # device announcements quiet (green or red for the wrong reason).
     try:
         bc._audio_flap.reset()
+    except Exception:
+        pass
+    # Self-echo registry (core/self_echo.py, 2026-09-29): every real _speak /
+    # play_with_lipsync a test runs is remembered there on the REAL monotonic
+    # clock, so a line spoken by one test would make a LATER test's mic
+    # transcript of the same words a "self-echo" (dropped for the wrong
+    # reason). Wiped in place.
+    try:
+        bc._self_echo._reset_for_tests()
     except Exception:
         pass
 

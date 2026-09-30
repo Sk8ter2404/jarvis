@@ -729,8 +729,61 @@ def _camera_gate_presence(key: str):
         return None
 
 
+def _camera_gate_friendly_label(key: str) -> str:
+    """The SPOKEN name of gate key ``key`` - "the left webcam", "the Kinect" -
+    for the one line the gate says when it quarantines a device. Derived from
+    CAMERAS at CALL time (the same entries every opener keys from); '' when
+    no configured camera owns the key, and the gate then builds a name from
+    the key itself. NEVER raises."""
+    try:
+        if key == "kinect":
+            return "the Kinect"
+        for c in CAMERAS:
+            if isinstance(c, dict) and _camera_gate_key(c) == key:
+                return f"the {_percam_side(c)} webcam"
+    except Exception:
+        pass
+    return ""
+
+
+def _camera_gate_is_quarantined(key: str) -> bool:
+    """Has the camera gate quarantined device ``key`` for this session?
+    False without a gate. NEVER raises."""
+    gate = _camera_gate
+    if gate is None:
+        return False
+    try:
+        return bool(gate.quarantined(key))
+    except Exception:
+        return False
+
+
+def camera_gate_lift_quarantine(which: str = "") -> list:
+    """Lift the camera gate's session QUARANTINE (a device whose stream start
+    kept knocking the USB hub offline) - the owner says it has been moved to
+    another port. ``which`` narrows it ("left", "right", "kinect", or part of
+    a spoken label); empty lifts every quarantined device. Returns the spoken
+    labels lifted. NEVER raises."""
+    gate = _camera_gate
+    if gate is None:
+        return []
+    try:
+        benched = gate.quarantined() or {}
+        want = str(which or "").strip().lower()
+        lifted = []
+        for key, label in benched.items():
+            if want and want not in str(label).lower() and want not in key:
+                continue
+            if gate.lift_quarantine(key):
+                lifted.append(str(label))
+        return lifted
+    except Exception:
+        logging.exception("[camera-gate] could not lift a quarantine")
+        return []
+
+
 def _make_camera_gate(clock=None):
-    """The production gate, from the three owner knobs. None only if
+    """The production gate, from the owner knobs. None only if
     core/camera_gate.py cannot import, in which case every opener behaves
     exactly as it did before the gate existed. ``clock`` exists for tests that
     freeze time; production uses the gate's default (time.time). NEVER
@@ -742,12 +795,16 @@ def _make_camera_gate(clock=None):
             min_gap_s=CAMERA_OPEN_MIN_GAP_S,
             max_backoff_s=CAMERA_REOPEN_MAX_BACKOFF_S,
             storm_cooldown_s=USB_STORM_COOLDOWN_S,
+            probation_s=CAMERA_STORM_PROBATION_S,
+            culprit_window_s=CAMERA_CULPRIT_WINDOW_S,
+            culprit_threshold=CAMERA_CULPRIT_THRESHOLD,
             log=_camera_gate_log,
             announce=_usb_storm_announce,
             # Looked up at CALL time, so the live function is always the one
             # asked (and a test can substitute it).
             lockers=lambda: _camera_gate_lockers(),
             presence=lambda key: _camera_gate_presence(key),
+            labeler=lambda key: _camera_gate_friendly_label(key),
             clock=clock)
     except Exception:       # pragma: no cover - defensive
         logging.exception("[camera-gate] could not build the camera gate")
@@ -6001,12 +6058,15 @@ def camera_gate_cancel(key: str, component: str) -> None:
         pass
 
 
-def _camera_gate_note_drop(key: str, component: str, kind: str = "camera") -> bool:
+def _camera_gate_note_drop(key: str, component: str, kind: str = "camera",
+                           **kwargs) -> bool:
+    """Report a drop to the gate (``onset=`` / ``cause=`` pass through).
+    NEVER raises."""
     gate = _camera_gate
     if gate is None:
         return False
     try:
-        return bool(gate.note_drop(key, component, kind))
+        return bool(gate.note_drop(key, component, kind, **kwargs))
     except Exception:
         return False
 
@@ -7229,10 +7289,14 @@ def _read_side_tile_webcams(now: float) -> dict:
                 # to the camera gate: the tile's next open of this device is a
                 # recovery and spends a backoff rung, instead of re-opening it
                 # every _KINECT_PREVIEW_TILE_READ_INTERVAL forever.
+                # ONE failed read (minor=True, v2.0.132): it counts toward the
+                # two-camera storm rule, but alone it never re-trips the
+                # breaker on post-cool-down probation unless the device has
+                # also left the device list.
                 _camera_gate_note_drop(
                     _camera_gate_key(index=idx,
                                      name=_kinect_preview_webcam_names().get(slot)),
-                    "side-tile")
+                    "side-tile", minor=True)
                 # A failing read is the classic symptom of a bus re-enumeration
                 # that MOVED the device. Invalidate the name→index memo so the
                 # next tick re-resolves by NAME instead of re-opening whatever
@@ -9484,7 +9548,9 @@ def _face_track_wake_permitted(entry: dict, cam: dict, now: float) -> bool:
         key = _camera_gate_key(cam)
         if not entry.get("drop_noted"):
             entry["drop_noted"] = True
-            _camera_gate_note_drop(key, "face-track")
+            _camera_gate_note_drop(key, "face-track",
+                                   onset=entry.get("fail_since"),
+                                   cause="read-failure burst")
             entry["next_wake_at"] = max(float(entry.get("next_wake_at") or 0.0),
                                         now + _CAMERA_DROP_SETTLE_S)
             return False
@@ -10222,7 +10288,8 @@ def _face_tracking_thread_body():
                  # entry, so it stays one-time until the locker clears.
                  "contention_logged": False,
                  # True once this failure episode has been reported to the
-                 # camera gate as a DROP (cleared by the next real frame).
+                 # camera gate as a DROP (cleared by the next real frame,
+                 # or by a successful recovery reopen - a NEW stream).
                  "drop_noted": False}
         caps.append(entry)
         if c is not None:
@@ -10357,6 +10424,11 @@ def _face_tracking_thread_body():
                     entry["fails"] = 0
                     entry["next_reopen_at"] = 0.0
                     entry["contention_logged"] = False
+                    # A NEW stream (v2.0.132): if it fails again that is a new
+                    # drop for the camera gate, not the tail of the last one.
+                    # Before this only a healthy FRAME cleared it, so a camera
+                    # reopened into a resetting hub never reported again.
+                    entry["drop_noted"] = False
                     if entry.pop("never_opened", False):
                         # A first open the camera gate DEFERRED (the boot
                         # stagger, a min-gap after the boot probe, a failed
@@ -10379,6 +10451,11 @@ def _face_tracking_thread_body():
                                            _read_ms, now_loop)
                 if not ret:
                     entry["fails"] += 1
+                    if entry["fails"] == 1:
+                        # When this burst BEGAN - the camera gate measures the
+                        # culprit window against it, not against the moment
+                        # the burst reached a threshold seconds later.
+                        entry["fail_since"] = now_loop
                     # Record the failure so see_user / self-diagnostic can
                     # surface "camera went silent N seconds ago" instead of
                     # just guessing. Single-line, throttled log so a stalled
@@ -10595,13 +10672,18 @@ def _face_tracking_thread_body():
                                 cam["index"], cam["label"],
                                 f"capture wedged after {entry['fails']} "
                                 f"failed reads", now_loop)
-                            # ...and a DROP to the camera gate, if the wake
-                            # path has not already reported this episode (the
-                            # wake is skipped when the gate holds the device).
-                            if not entry.get("drop_noted"):
-                                entry["drop_noted"] = True
-                                _camera_gate_note_drop(_camera_gate_key(cam),
-                                                       "face-track")
+                            # ...and a DROP to the camera gate, ALWAYS (v2.0.132):
+                            # the gate counts one drop per STREAM, so a burst
+                            # the wake threshold already reported for this
+                            # stream is ignored there, while a burst on a
+                            # stream the wake REOPENED is a new drop - which
+                            # is what lets two cameras' dead bursts within 10 s
+                            # trip the breaker, and one trip it on probation.
+                            entry["drop_noted"] = True
+                            _camera_gate_note_drop(_camera_gate_key(cam),
+                                                   "face-track",
+                                                   onset=entry.get("fail_since"),
+                                                   cause="read-failure burst")
                             # LIVE CAMERA-CONTENTION YIELD (P1-3) — the decision
                             # (and the one-time "appears LOCKED by ..." hint) lives
                             # in _schedule_camera_reopen so the recovery and
@@ -10617,8 +10699,18 @@ def _face_tracking_thread_body():
                                     f" + {_camera_wake_attempts.get(cam['index'], 0)} wake attempts"
                                     + (f" (locked by {', '.join(lockers)})" if lockers else ""))
                                 _camera_last_read_error_at[cam["index"]] = now_loop
-                            print(f"  [face-track] {cam['label']} (index {cam['index']}) "
-                                  f"dead after {entry['fails']} failed reads; will reopen in {_backoff:.1f}s{_cam_ms()}")
+                            if _camera_gate_is_quarantined(_camera_gate_key(cam)):
+                                # A QUARANTINED camera (v2.0.132) is not
+                                # reopened at all - "will reopen in 600s" (the
+                                # gate's re-ask interval) would be a lie.
+                                print(f"  [face-track] {cam['label']} (index {cam['index']}) "
+                                      f"dead after {entry['fails']} failed reads; NOT "
+                                      f"reopened - the camera gate has quarantined it "
+                                      f"for this session (the gate logged why when it "
+                                      f"did){_cam_ms()}")
+                            else:
+                                print(f"  [face-track] {cam['label']} (index {cam['index']}) "
+                                      f"dead after {entry['fails']} failed reads; will reopen in {_backoff:.1f}s{_cam_ms()}")
                         # PREVIEW-KEEP-ALIVE FIX: a Kinect read MISS must NOT skip
                         # the skeleton preview write. The Kinect IS the primary
                         # "camera" on the owner's rig, so a transient color miss
@@ -14230,6 +14322,16 @@ def _safe_close_stream(stream, timeout_sec: float = 2.0) -> None:
 # idle does get_mic_buffer fall back to opening its own stream.
 _record_speech_active = [False]          # True while record_speech holds the mic
 _tts_playback_active  = [False]          # True while play_with_lipsync owns the speakers + barge-in stream
+# Self-echo gate (core/self_echo.py, 2026-09-29): the timing of the LAST
+# utterance record_speech returned, on the self-echo clock —
+# (stream_open, vad_trip, capture_end, clip_start) — or None (no mic
+# utterance this turn: inject, realtime, timeout). clip_start is where the
+# returned audio begins: the VAD trip minus the pre-roll ring and the
+# tripping chunk, never before the stream opened. _self_echo_ignored checks it against every
+# audible playback play_with_lipsync registered. Reset by record_speech itself
+# and by the two main-loop capture phases.
+from core import self_echo as _self_echo  # noqa: E402
+_last_capture_window: list = [None]
 _record_speech_sr     = [SAMPLE_RATE]    # sample rate of the live stream
 # What record_speech's InputStream ACTUALLY opened on, published the moment it
 # starts: {"index", "name", "requested", "via_default", "at"} or None before the
@@ -14604,6 +14706,8 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
     # recorded. The filler is also suppressed for as long as
     # _record_speech_active is set. Never raises.
     _filler_capture_mark(wait=True)
+    # Self-echo gate: a fresh capture never inherits the previous one's timing.
+    _last_capture_window[0] = None
     CHUNK       = 1024
     PRE_BUFFER  = 12
     silence_lim = int(SILENCE_SECS * SAMPLE_RATE / CHUNK)
@@ -14668,6 +14772,10 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
         time.sleep(0.02)
     _record_stream = None
     _opened_dev = _in_dev
+    # Self-echo gate: when this capture started listening. Taken just BEFORE
+    # the open (conservative: an earlier open can only widen what counts as
+    # "heard while JARVIS was speaking").
+    _se_open_ts = _self_echo.now()
     # Defense-in-depth against a stale cached mic index: even after
     # get_input_device() validates, the device can disappear between
     # that query and InputStream open. Catch PortAudioError and retry
@@ -14715,6 +14823,8 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
         _record_speech_active[0] = False
         return None
     record_start_ts = 0.0   # set when recording actually begins (VAD trip)
+    _se_vad_ts = _se_open_ts  # the same instant on the self-echo clock
+    _se_clip_ts = _se_open_ts
     try:  # pragma: no cover - live mic capture loop (blocks on real audio frames until utterance ends)
         while True:
             # Watchdog-driven recovery: if the main-loop watchdog has
@@ -14834,6 +14944,13 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
                     # for the whole idle listen.
                     _utterance_in_progress[0] = True
                     record_start_ts = time.time()
+                    _se_vad_ts = _self_echo.now()
+                    # The returned clip starts with the pre-roll ring plus
+                    # this tripping chunk — that far before the trip.
+                    _se_clip_ts = max(
+                        _se_open_ts,
+                        _se_vad_ts - (len(pre_ring) + 1) * CHUNK
+                        / float(SAMPLE_RATE or 16000))
                     chunks.extend(pre_ring)
                     _heartbeat()
                     print("  🎙  Recording…")
@@ -14928,6 +15045,9 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
     if not chunks:
         _utterance_in_progress[0] = False  # pragma: no cover - defensive
         return None  # pragma: no cover - defensive: the loop only breaks after recording began, so chunks is never empty here
+    # Self-echo gate: publish this utterance's timing for _self_echo_ignored.
+    _last_capture_window[0] = (_se_open_ts, _se_vad_ts, _self_echo.now(),
+                               _se_clip_ts)
     return np.concatenate(chunks).flatten()
 
 
@@ -18117,6 +18237,12 @@ class _SentenceFlushBuffer:
                        in _PREEMPTIVE_HALLUCINATION_PATTERNS):
                     self._stopped = True
                     return
+                # A refusal of an explicit joke request is replaced by
+                # _joke_fallback_line downstream — don't voice it early.
+                if (_joke_fallback.looks_like_refusal(piece)
+                        and _joke_fallback.is_joke_request(_turn_user_text())):
+                    self._stopped = True
+                    return
             except Exception:
                 self._stopped = True   # fail closed: don't early-speak
                 return
@@ -20376,7 +20502,39 @@ def _reap_playback(stream, done_evt: threading.Event, audio_secs: float) -> None
         done_evt.set()
 
 
+def _self_echo_audible() -> bool:
+    """True when a play_with_lipsync call will actually be heard — i.e. not
+    core/tts's MUTE_TTS (the body then sleeps instead of writing the device).
+    A muted "playback" makes no sound, so it must never gate the owner.
+    Errors count as audible (the conservative side for an echo gate)."""
+    try:
+        return not (_tts_layer is not None and _tts_layer.is_muted())
+    except Exception:
+        return True
+
+
 def play_with_lipsync(audio: np.ndarray, sr: int):
+    """Play TTS audio through speakers — see _play_with_lipsync_body.
+
+    Self-echo gate (core/self_echo.py, 2026-09-29): every AUDIBLE playback is
+    registered for its whole duration (begin before the body, end in the
+    finally), so a mic capture running on another thread at the same time —
+    the main loop listening while the tray drainer, a timer or a background
+    announcement speaks — is recognised as JARVIS's own voice. This is the
+    ONE place every voiced clip passes (_speak, _speak_sentences' chunks, the
+    processing filler), so no speaker path can bypass it. The text published
+    in _tts_current_text is read only for the "jarvis" barge-in echo rule.
+    Registration never raises."""
+    _se_tok = (_self_echo.playback_begin(_tts_current_text[0])
+               if _self_echo_audible() else 0)
+    try:
+        return _play_with_lipsync_body(audio, sr)
+    finally:
+        if _se_tok:
+            _self_echo.playback_end(_se_tok)
+
+
+def _play_with_lipsync_body(audio: np.ndarray, sr: int):
     """Play TTS audio through speakers. If a robot is connected, also stream
     mouth-open values at ~30 fps so it lip-syncs. If barge-in is enabled and
     the user is on a headset, listen for interruptions during playback.
@@ -26050,6 +26208,78 @@ def _device_speech_ignored(text: str, injected: bool = False) -> bool:
         return False
 
 
+def _self_echo_ignored(text: str, injected: bool = False) -> bool:
+    """Self-echo gate (core/self_echo.py): True when a mic transcript is
+    JARVIS's OWN voice and the caller must drop the turn ENTIRELY — no wake,
+    no background-audio gate, no LLM, no learning.
+
+    Live 2026-09-29: the tray's force_wake said "At your service, sir." from
+    the tray-drain thread while the main loop was inside record_speech; the
+    desk mic heard it, Whisper transcribed it and the turn ran as the owner
+    (4 times in 2 minutes). record_speech had no notion of playback on
+    ANOTHER thread — the only separation was the main thread's own
+    speak-then-listen order.
+
+    Two layers, either one drops:
+      1. TIMING — the capture's utterance overlapped an audible playback, or
+         began within SELF_ECHO_TAIL_S after one ended while the capture was
+         already open (_last_capture_window vs play_with_lipsync's
+         registrations). Exempt, exactly as the barge-in rules: a transcript
+         naming the wake word passes unless the overlapping line itself said
+         "jarvis" (request_tts_interrupt's echo gate).
+      2. CONTENT — the transcript matches a line spoken (by any thread) in
+         the last SELF_ECHO_WINDOW_S seconds; wake / sleep /
+         shutdown-prompt phrases and the owner vocabulary never match. With
+         a mic capture window, a line that had finished before the clip
+         could hear it is not compared: before the stream opened (exact —
+         the ordinary speak-then-listen turn, so the owner re-issuing a
+         command JARVIS just acknowledged, or answering his question with
+         its own words, is never eaten), or more than SELF_ECHO_TAIL_S
+         before the clip's first frame (output latency / queue slack).
+
+    A stop word always passes both (core/device_speech_filter.has_stop_word,
+    the same rule the device filter uses). ``injected`` (typed / LAN page /
+    tray / say_to_jarvis) is never checked. Logs numbers only — never the
+    transcript or the remembered line. Off when SELF_ECHO_FILTER_ENABLED is
+    False. Never raises — any error fails OPEN (False)."""
+    try:
+        if injected or not SELF_ECHO_FILTER_ENABLED:
+            return False
+        if not (text or "").strip():
+            return False
+        from core import device_speech_filter as _dsf
+        if _dsf.has_stop_word(text):
+            return False
+        win = _last_capture_window[0]
+        tail = float(SELF_ECHO_TAIL_S)
+        clip_bound = None
+        if win is not None:
+            clip_bound = float(win[0])
+            if len(win) > 3:
+                clip_bound = max(clip_bound, float(win[3]) - tail)
+            hit = _self_echo.capture_overlap(
+                win[0], win[1], win[2], tail_s=tail)
+            if hit is not None:
+                woke = bool(_WAKE_RE.search(text.strip().lower()))
+                if not woke or hit["says_jarvis"]:
+                    print(f"  [self-echo] ignored (heard during playback, "
+                          f"gap {hit['gap']:+.2f} s)")
+                    return True
+        m = _self_echo.match(
+            text, float(SELF_ECHO_WINDOW_S),
+            protected=(set(WAKE_PHRASES) | set(SLEEP_PHRASES)
+                       | set(SHUTDOWN_PROMPT_YES_PHRASES)
+                       | set(SHUTDOWN_PROMPT_NO_PHRASES)),
+            clip_start=clip_bound)
+        if m is not None:
+            print(f"  [self-echo] ignored (score {m[0]:.2f}, "
+                  f"age {m[1]:.1f} s)")
+            return True
+        return False
+    except Exception:
+        return False
+
+
 # Standby auto-engage bridge. The background lyric-detection thread in
 # skills/standby_audio_detect calls this when it's seen sustained vocal
 # music while the headset is the active output — flipping standby state
@@ -26431,6 +26661,8 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     # live 2026-06-05: "you're not speaking for some actions still". All confirmed
     # during the test sweep to return ONE spoken-ready sentence.
     "camera_status", "kinect_status", "wellness_status", "music_taste",
+    # camera-gate quarantine lift (skills/camera_system.py, v2.0.132)
+    "camera_unquarantine",
     "deco_topology", "network_status", "is_device_online",
     "who_is_here", "where_am_i", "situational_awareness",
     "session_memory_recall", "rag_search", "search_files",
@@ -26911,6 +27143,8 @@ def _emit_mid_task_status(name: str, arg: str, fired_flag: list[bool]) -> None:
 #     matched "on it, sir" and the forced second round gave a second, wrong
 #     answer.
 from core import claim_validator as _claim_validator  # noqa: E402
+from core import units as _units  # noqa: E402
+from core import joke_fallback as _joke_fallback  # noqa: E402
 
 
 # ── Turn grounding ledger (2026-09-29) ──────────────────────────────────────
@@ -26984,6 +27218,32 @@ def _strip_ack_preface(spoken: str, user_text: str) -> str:
     if out != spoken:
         print("  [validation] dropped the acknowledgement preface on an answer")
     return out
+
+
+def _joke_fallback_line(spoken: str, user_text: str, raw_reply: str = "") -> str:
+    """The bundled one-liner to speak when the owner explicitly asked for a
+    joke and the reply refused without telling one ("I'm afraid I've run out
+    of material, sir"); "" otherwise. core/joke_fallback.py has the rules.
+    When it fires, the refusal in conversation_history is replaced by the
+    joke so the next turn does not copy the refusal. Never raises."""
+    try:
+        joke = _joke_fallback.apply(spoken, user_text)
+    except Exception:
+        return ""
+    if not joke:
+        return ""
+    print("  [joke-fallback] reply refused a joke request — speaking a "
+          "bundled one-liner instead")
+    try:
+        if raw_reply:
+            for msg in reversed(conversation_history):
+                if msg.get("role") == "assistant":
+                    if msg.get("content") == raw_reply:
+                        msg["content"] = joke
+                    break
+    except Exception:
+        pass
+    return joke
 
 
 # Actions that ground the same preemptive claim category as the action the
@@ -27242,6 +27502,7 @@ _LEADING_TAGS_RE = re.compile(r"^(?:\s*\[[^\]]*\]\s*)+")
 def _detect_preemptive_hallucination(
     reply: str,
     is_grounded=None,
+    user_text: str = "",
 ) -> tuple[str, str | None, str] | None:
     """Pre-flight scan for hallucinated execution claims.
 
@@ -27260,6 +27521,14 @@ def _detect_preemptive_hallucination(
     follow-up that reads back the time but invents the weather still gets
     weather_briefing injected. 'refuse' patterns are never skipped. Omitted
     (the stream gate, first-round semantics) → every match counts, as before.
+
+    ``user_text`` (optional) — the owner's utterance this turn. A temperature
+    in a UNIT-CONVERSION answer is arithmetic, not the weather stated from
+    memory: live v2.0.131, "convert 100 degrees fahrenheit to celsius" was
+    answered correctly and ALSO ran weather_briefing, because "37.8 degrees
+    Celsius" matched the weather pattern. The weather patterns are skipped
+    when the owner asked for a conversion, or when the reply states one
+    temperature in both scales with no weather cue (core/units.py).
     """
     if _ACTION_RE.search(reply):
         return None
@@ -27273,7 +27542,19 @@ def _detect_preemptive_hallucination(
     # [ACTION:] is already handled by the guard above, and third-party version
     # mentions ("Chrome version 120") still don't match the self-anchored pattern.
     scan = _LEADING_TAGS_RE.sub("", reply).lstrip() if reply else reply
+    try:
+        # A both-scales reply counts as a conversion only when the owner's
+        # turn is not a weather / temperature question: "what's the
+        # temperature" answered from memory with "68°F / 20°C" is still
+        # the weather stated from memory.
+        _conversion = (_units.is_unit_conversion_request(user_text)
+                       or (_units.reply_is_temperature_conversion(scan)
+                           and not _units.may_be_weather_request(user_text)))
+    except Exception:
+        _conversion = False
     for regex, action_name, desc in _PREEMPTIVE_HALLUCINATION_PATTERNS:
+        if _conversion and action_name == "weather_briefing":
+            continue
         if not regex.search(scan):
             continue
         if action_name and action_name in ACTIONS:
@@ -27969,7 +28250,7 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
         return bool(_by)
 
     _preempt = _detect_preemptive_hallucination(
-        reply, is_grounded=_preempt_is_grounded)
+        reply, is_grounded=_preempt_is_grounded, user_text=_turn_user_text())
     for _g_action, _g_by in _grounded_skips.items():
         print(
             f"  [preemptive_hallucination] claim is grounded by {_g_by}, "
@@ -29422,6 +29703,7 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
     _filler_note_speech()
     with _SPEAK_LOCK:
         _speak_ok = False   # set True only once the line was heard (#18 ledger)
+        _se_line = 0        # self-echo content token (core/self_echo.py)
         try:
             _last_intent_override[0] = intent
             _last_wry[0] = wry_flag
@@ -29435,6 +29717,13 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
             # Set inside _SPEAK_LOCK, so it always describes THE utterance
             # currently owning the audio device; cleared in the finally.
             _tts_current_text[0] = (spoken_text or "").lower()
+            # Self-echo content layer (2026-09-29): remember the line BEFORE
+            # it plays (a capture can be transcribed while a long reply is
+            # still playing); its window is restarted in the finally, so it
+            # counts from the END of the line. Any thread, any caller. Only
+            # when it will be audible (MUTE_TTS makes no sound). Never raises.
+            _se_line = (_self_echo.remember(spoken_text)
+                        if _self_echo_audible() else 0)
             _tt("mark", "synth_start")
             # Per-sentence speech (SENTENCE_TTS_ENABLED, Kokoro only): a long
             # multi-sentence reply starts playing sentence 1 while the rest
@@ -29494,6 +29783,8 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
             # the end of playback so it can't leak into the next utterance.
             _tts_current_text[0] = ""
             _tts_interrupt.clear()
+            # Self-echo: the line's window counts from here. Never raises.
+            _self_echo.refresh(_se_line)
             # Processing-filler mark (b), 2026-09-29: end-of-speech, still
             # INSIDE _SPEAK_LOCK (lock order _SPEAK_LOCK -> filler lock). A
             # stage-2 poll can only claim after this release, so it always
@@ -29730,6 +30021,8 @@ def _filler_play(turn, stage: int) -> str:
         print(f"  [filler] stage {stage}: {text}")
         _prof("filler_play", f"stage={stage}")
         _tt("note_filler")
+        # Self-echo content layer: the clip is JARVIS's voice too.
+        _se_line = _self_echo.remember(text) if _self_echo_audible() else 0
         try:
             _tts_current_text[0] = text.lower()
             play_with_lipsync(audio, sr)
@@ -29740,6 +30033,7 @@ def _filler_play(turn, stage: int) -> str:
             _tts_playback_active[0] = False
             _tts_current_text[0] = ""
             _tts_interrupt.clear()
+            _self_echo.refresh(_se_line)
         return "played"
     finally:
         _SPEAK_LOCK.release()
@@ -31562,6 +31856,8 @@ def _capture_utterance(injected_text, memory):
     # The mic path below overwrites this with the raw captured buffer.
     _last_capture_audio = None
     _last_capture_sr = 0
+    # Self-echo gate: only the mic path below publishes capture timing.
+    _last_capture_window[0] = None
     # Drain any speech queued between turns (timer reminders, device auto-switch
     # alerts, etc.) so they fire promptly instead of only after a 20s timeout.
     _speak_pending()
@@ -31992,6 +32288,7 @@ def _handle_sleep_standby(injected_text: str | None) -> None:
     normal turn, so its early-outs are plain returns.
     """
     _label = "Standby" if _standby_mode[0] else "Sleeping"
+    _last_capture_window[0] = None   # self-echo: no stale capture timing
     if injected_text is not None:
         # Honour the spec safety rule: injects only act on a sleeping JARVIS
         # if the text contains a wake phrase. We log + fall through to the
@@ -32046,6 +32343,10 @@ def _handle_sleep_standby(injected_text: str | None) -> None:
     # wake word was waking JARVIS (live 2026-09-29). Mic captures only (an
     # inject is typed operator input). Logs the source only.
     if _device_speech_ignored(text, injected_text is not None):
+        return
+    # Self-echo (core/self_echo.py): JARVIS's own voice can never wake him
+    # and is never fed to the ambient learner. Mic captures only.
+    if _self_echo_ignored(text, injected_text is not None):
         return
     tl = text.strip().lower()
     # Word-boundary wake match (2026-07-14 bug-hunt). Was `any(wp in tl ...)` —
@@ -32275,12 +32576,19 @@ def _run_llm_dispatch_body(text: str) -> str:
     # exactly that prefix so they aren't spoken twice; if the whole reply was
     # early-spoken the remainder is empty and the _speak below is skipped.
     # Applied BEFORE the quip layer so a quip attaches to the unspoken tail.
+    _full_spoken = spoken_text
     spoken_text = _strip_stream_spoken_prefix(spoken_text)
     # "On it, sir. You asked about X." answering a question: the preface is
     # filler, not a promise — speak only the answer (2026-09-29). The quip
     # layer runs later, after the answer-first decision (v2.0.119).
     if not action_results:
         spoken_text = _strip_ack_preface(spoken_text, text)
+        # "tell me a joke" answered with a refusal ("I've run out of
+        # material, sir") gets a bundled one-liner instead — judged on the
+        # WHOLE reply, spoken as the (unspoken) remainder (2026-09-29).
+        _joke = _joke_fallback_line(_full_spoken, text, reply)
+        if _joke:
+            spoken_text = _joke
     # Barge gate: if a wake-word barge was accepted while the reply streamed,
     # the seq advanced — honour the interrupt and don't speak the tail. 2026-07-08.
     _barged = False
@@ -33297,6 +33605,16 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 # is explicit operator input, never overheard room audio.
                 # Logs the device name only. See _device_speech_ignored.
                 if _device_speech_ignored(text, _injected_text is not None):
+                    set_state("idle")
+                    continue
+
+                # ── SELF-ECHO (core/self_echo.py) ───────────────────────────────
+                # JARVIS's own voice — a line another thread spoke while this
+                # capture was listening, or a repeat of a line he just said —
+                # is never the owner: drop it before the background/wake
+                # gate, the LLM and any learning. Mic turns only.
+                # Numbers-only log. See _self_echo_ignored.
+                if _self_echo_ignored(text, _injected_text is not None):
                     set_state("idle")
                     continue
 

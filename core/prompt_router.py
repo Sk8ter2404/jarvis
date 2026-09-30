@@ -26,6 +26,8 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Tuple
 
+from core.units import is_unit_conversion_request
+
 # A section header in PC_CONTROL_PROMPT: an ALL-CAPS "head" at column 0, ending
 # in ':', OPTIONALLY followed by a lowercase parenthetical BEFORE the colon.
 # The head is captured as the section name; the parenthetical is descriptive only.
@@ -775,9 +777,22 @@ def _keywords_for(header: str) -> List[str]:
     return []
 
 
+# Unit vocabulary that routes hardware / weather sections on an ordinary turn
+# ("how hot is the GPU in celsius") but is pure arithmetic on a unit-conversion
+# turn. 2026-09-29 live: "convert 100 degrees fahrenheit to celsius" loaded
+# SYSTEM HEALTH (gpu_usage / temperature grammar) on "degrees" + "celsius". On
+# a conversion turn these keywords do not count; any OTHER keyword still does
+# ("convert the gpu temperature to fahrenheit" keeps SYSTEM HEALTH via "gpu").
+_CONVERSION_NEUTRAL_KEYWORDS = frozenset({
+    "degrees", "celsius", "fahrenheit", "kelvin", "temperature", "temp",
+})
+
+
 def select_sections(user_text: str, sections: List[Tuple[str, str]]) -> Tuple[List[str], List[str]]:
     """Return (included_section_names, dropped_section_names) for `user_text`."""
     low = " " + (user_text or "").lower() + " "
+    neutral = (_CONVERSION_NEUTRAL_KEYWORDS
+               if is_unit_conversion_request(user_text) else frozenset())
     included: List[str] = []
     dropped: List[str] = []
     for header, _body in sections:
@@ -793,7 +808,7 @@ def select_sections(user_text: str, sections: List[Tuple[str, str]]) -> Tuple[Li
                 hit = True
         if not hit:
             for kw in _keywords_for(name):
-                if kw in low:
+                if kw in low and kw not in neutral:
                     hit = True
                     break
         (included if hit else dropped).append(name)

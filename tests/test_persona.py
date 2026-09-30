@@ -110,5 +110,49 @@ class OpenerFitRuleTests(unittest.TestCase):
             self.assertIn(phrase, persona.JARVIS_SIGNATURE_PHRASES)
 
 
+class DeliverWhatWasAskedRuleTests(unittest.TestCase):
+    """2026-09-29 live (v2.0.131): "tell me a short joke" got "I'm afraid I've
+    run out of material, sir", and "tell me something interesting" got an
+    invented remark about sir skipping dinner plus a search that never ran.
+    The persona's "I'm afraid" / "taken the liberty" / pick-a-stance pressure
+    beat the request. One short rule now binds open-ended requests to an
+    actual answer; these tests keep it in the prompt, in the right place, and
+    small (it sits in the cached prefix)."""
+
+    def setUp(self):
+        from core import prompts
+        self.prompt = prompts.BASE_SYSTEM_PROMPT
+        start = self.prompt.index("DELIVER WHAT WAS ASKED")
+        self.rule = self.prompt[start:self.prompt.index("\n", start)]
+
+    def test_rule_follows_the_opener_rule(self):
+        self.assertLess(self.prompt.index("MATCH THE OPENER TO THE CONTENT"),
+                        self.prompt.index("DELIVER WHAT WAS ASKED"))
+
+    def test_rule_names_every_open_ended_request(self):
+        for kind in ("joke", "fact", "story", "riddle", "recommendation",
+                     "trivia"):
+            self.assertIn(kind, self.rule)
+
+    def test_rule_forbids_the_live_non_answers(self):
+        low = self.rule.lower()
+        self.assertIn("never decline", low)
+        self.assertIn("run out", low)
+        self.assertIn("quip about sir", low)
+        self.assertIn("invent observations", low)
+        self.assertIn("search", low)
+
+    def test_rule_overrides_the_no_fun_facts_aside_rule(self):
+        # The adjacent-fact rule says "never 'fun facts'"; the new rule must
+        # say that applies to unrequested asides only, and precede it.
+        self.assertIn("unrequested asides only", self.rule)
+        self.assertLess(self.prompt.index("DELIVER WHAT WAS ASKED"),
+                        self.prompt.index("never 'fun facts'"))
+
+    def test_rule_is_one_short_line(self):
+        self.assertLess(len(self.rule), 450)
+        self.assertEqual(self.prompt.count("DELIVER WHAT WAS ASKED"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
