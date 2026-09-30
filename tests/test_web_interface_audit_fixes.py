@@ -43,7 +43,7 @@ from unittest import mock
 from tools import web_interface as wi
 from core import camera_tiles as ct
 from tests.test_web_interface import (_ServerBase, _get, _get_raw, _js_fn,
-                                      _post, _urlopen_retry)
+                                      _no_live_gpu, _post, _urlopen_retry)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PROJECT = os.path.dirname(_HERE)
@@ -269,6 +269,7 @@ def _fake_psutil():
 class CpuPercentTests(unittest.TestCase):
 
     def setUp(self):
+        _no_live_gpu(self)       # _system_info's live GPU probes (hermetic guard)
         self._saved = dict(wi._cpu_state)
         wi._cpu_state.update({"times": None, "at": 0.0, "pct": None})
         self.addCleanup(lambda: (wi._cpu_state.clear(), wi._cpu_state.update(self._saved)))

@@ -1549,6 +1549,13 @@ class StartupPreflightTests(SectionSevenBase):
         self._p(self.bc, "_preflight_cublas_check", return_value=True)
         self._p(self.bc, "_preflight_cameras")
         self._speak = self._p(self.bc, "_speak")
+        # ...and the local brain: step (0)'s _ensure_ollama_running self-heal
+        # and the _ollama_alive fallback probe both GET the LIVE Ollama's
+        # /api/tags (the hermetic guard caught test_subcheck_exceptions_are_
+        # swallowed doing it, 2026-09-30), and outside staging the self-heal
+        # may reap or spawn the owner's server. Tests re-patch as needed.
+        self._p(self.bc, "_ensure_ollama_running", return_value=True)
+        self._p(self.bc, "_ollama_alive", return_value=True)
 
     def test_claude_reachable_path(self):
         self._p(self.bc, "_preflight_api_key", return_value=(True, "ok"))

@@ -430,6 +430,127 @@ class PanelPageContractTests(_ServerBase):
             self.assertIn("'%s'" % t, widget, t)
 
 
+class PanelImagePlaceholderTests(_ServerBase):
+    """The generic image widget BEFORE its first frame (2026-09-30).
+
+    THE DEFECT: renderWidget pointed the <img> at the still URL the moment the
+    view opened and startPanelView re-requested it every refresh_ms. With no
+    frame yet the box showed the browser's broken-image icon and the page
+    fetched a 404 every 2 s, forever. Now the box starts as a neutral "No
+    picture yet" placeholder and nothing is requested until the panel's STATE
+    (the widget's `key`) or a USER ACTION says a frame exists (a keyless
+    widget also takes one look when the view opens). A 404 goes back to the
+    placeholder and stops asking; with a frame, snapshot mode refreshes every
+    refresh_ms as before. These pin that contract in the page source (the
+    page has no JS runtime in this suite)."""
+
+    def setUp(self):
+        super().setUp()
+        self.html = _get_raw(self.base + "/")[1]
+
+    def fn(self, name):
+        return _js_fn(self.html, name)
+
+    def image_branch(self):
+        widget = self.fn("renderWidget")
+        start = widget.index("if (t === 'image')")
+        return widget[start:widget.index("if (t === 'buttons')", start)]
+
+    def test_the_box_starts_as_a_neutral_placeholder(self):
+        branch = self.image_branch()
+        self.assertIn("empty.textContent = 'No picture yet'", branch)
+        self.assertIn("img.hidden = true", branch)
+        self.assertNotIn(".src", branch.replace("m.src", "").replace("src:", ""),
+                         "the widget must not request anything while it is built")
+        self.assertIn(".pw .pimg-empty {", self.html)
+        self.assertIn(".pw img[hidden] { display:none; }", self.html)
+
+    def test_opening_the_view_never_starts_a_blind_poll(self):
+        start = self.fn("startPanelView")
+        self.assertNotIn("?still=1", start)
+        self.assertNotIn(".src =", start)
+        self.assertIn("startPanelImage(m)", start)
+        img = self.fn("startPanelImage")
+        self.assertIn("setInterval(() => panelImageTick(m), m.refresh)", img)
+        self.assertIn("if (!m.key || !m.p.has_state) panelImageLoad(m);", img)
+
+    def test_the_poll_asks_only_with_a_frame_or_an_armed_action(self):
+        tick = self.fn("panelImageTick")
+        self.assertIn("if (m.has || Date.now() < m.armedUntil) panelImageFetch(m);", tick)
+        self.assertIn("pollsWanted()", tick)
+
+    def test_a_404_puts_the_placeholder_back_and_stops_asking(self):
+        fetch = self.fn("panelImageFetch")
+        self.assertIn("r.status === 404", fetch)
+        self.assertIn("panelImageEmpty(m)", fetch)
+        self.assertIn("{headers: hdr()}", fetch)
+        empty = self.fn("panelImageEmpty")
+        self.assertIn("m.has = false;", empty)
+        self.assertIn("m.empty.hidden = false", empty)
+        # ...which stops the poll: the tick asks only with a frame or an arm
+        self.assertIn("if (m.has || Date.now() < m.armedUntil) panelImageFetch(m);",
+                      self.fn("panelImageTick"))
+        self.assertIn("removeAttribute('src')", empty)
+        # a broken frame never shows the icon either
+        self.assertIn("img.addEventListener('error', () => { if (m.img.getAttribute('src')) "
+                      "panelImageEmpty(m); });", self.image_branch())
+
+    def test_snapshot_keeps_refreshing_once_a_frame_exists(self):
+        fetch = self.fn("panelImageFetch")
+        self.assertIn("m.url = url; m.has = true; m.armedUntil = 0;", fetch)
+        self.assertIn("q(m.src + '?still=1&t=' + Date.now())", fetch)
+        self.assertIn("m.has = true; m.img.hidden = false; m.empty.hidden = true;",
+                      self.fn("panelImageShown"))
+
+    def test_the_state_key_says_when_a_frame_exists(self):
+        self.assertIn("if (m.key) ups.push((s) => panelImageState(m, s[m.key]));",
+                      self.image_branch())
+        st = self.fn("panelImageState")
+        self.assertIn("if (!on) { if (m.has || m.img.getAttribute('src')) panelImageEmpty(m); return; }",
+                      st)
+        self.assertIn("if (changed || !m.has) panelImageLoad(m);", st)
+
+    def test_a_user_action_arms_the_panel_images(self):
+        act = self.fn("panelAction")
+        self.assertIn("if (res.ok && !opts.quiet) {", act)
+        self.assertIn("panelImagesArm(p);", act)
+        arm = self.fn("panelImagesArm")
+        self.assertIn("m.armedUntil = Date.now() + PANEL_IMAGE_ARM_MS;", arm)
+        self.assertIn("if (!m.active || (m.key && p.has_state)) continue;", arm)
+        # a hold's resends are quiet and never arm anything
+        self.assertIn("{quiet: true, noConfirm: true}", self.fn("bindHold"))
+
+    def test_leaving_the_view_stops_the_image_timers(self):
+        stop = self.fn("stopPanelMedia")
+        self.assertIn("m.active = false; m.armedUntil = 0;", stop)
+        self.assertIn("clearInterval(m.timer)", stop)
+
+    def test_a_keyed_image_widget_keeps_its_key_in_the_metadata(self):
+        reg = wp.PanelRegistry(clock=_Clock(), log=lambda _l: None)
+        dev = DeskDevice()
+        spec = dev.spec(layout=[{"type": "image", "stream": "cam", "mode": "snapshot",
+                                 "refresh_ms": 2000, "key": "picture"}])
+        self.assertTrue(reg.register(spec, owner="desk"))
+        widget = reg.list_meta()[0]["layout"][0]
+        self.assertEqual(widget, {"type": "image", "key": "picture", "stream": "cam",
+                                  "mode": "snapshot", "refresh_ms": 2000})
+
+
+class PanelStillRouteTests(_PanelServer):
+    """The server half the placeholder relies on: a still with no frame is a
+    JSON 404 (never an empty 200 image), and one with a frame is the JPEG."""
+
+    def test_still_without_a_frame_is_a_404(self):
+        self.dev.frame = None
+        code, body = _get_raw(self.base + "/api/panel/desk_device/stream/cam?still=1")
+        self.assertEqual(code, 404)
+        self.assertIn("no frame", body)
+        self.dev.frame = JPEG
+        req = urllib.request.Request(self.base + "/api/panel/desk_device/stream/cam?still=1")
+        with _urlopen_retry(req, timeout=5) as r:
+            self.assertEqual(r.read(), JPEG)
+
+
 class LoaderHookTests(unittest.TestCase):
 
     def test_load_skills_collects_web_panels(self):

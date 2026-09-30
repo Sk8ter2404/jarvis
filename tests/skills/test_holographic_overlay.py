@@ -281,10 +281,20 @@ class RegisterTests(_HoloBase):
             mod, _actions = load_skill_isolated("holographic_overlay")
         return mod
 
-    def test_workshop_hud_auto_launches_by_default(self):
-        # WORKSHOP_HUD_AUTO_LAUNCH defaults True → register() spawns it once.
-        # (Pass no flags → the getattr default of True applies.)
+    def test_workshop_hud_stays_retired_by_default(self):
+        # The fallback now matches core/config.py (WORKSHOP_HUD_AUTO_LAUNCH =
+        # False: a retired overlay). It used to be True, so any load OUTSIDE a
+        # running JARVIS - every skill-smoke run - launched a real widget
+        # window (2026-09-30). Pass no flags → the getattr default applies.
         mod = self._load_with_flags()
+        self.assertIsNone(mod._WORKSHOP_HUD_PROCESS)
+
+    def test_the_fallback_matches_core_config(self):
+        from core import config
+        self.assertFalse(config.WORKSHOP_HUD_AUTO_LAUNCH)
+
+    def test_workshop_hud_auto_launches_when_the_owner_opts_in(self):
+        mod = self._load_with_flags(WORKSHOP_HUD_AUTO_LAUNCH=True)
         self.assertIsNotNone(mod._WORKSHOP_HUD_PROCESS)
 
     def test_workshop_hud_auto_launch_suppressed_by_flag(self):
@@ -1614,8 +1624,9 @@ class RegisterConfigGuardTests(_HoloBase):
     def test_register_survives_bobert_import_failure(self):
         # Every auto-launch flag is read inside try/except import bobert. With
         # bobert absent (None-sentinel), all those reads raise+swallow and
-        # register() completes with the documented defaults: workshop_hud
-        # auto-launches (default True), the opt-in surfaces stay dormant.
+        # register() completes with the documented defaults: every surface
+        # stays dormant - the workshop HUD included (a retired overlay; its
+        # fallback matches core/config.py's False since 2026-09-30).
         with inject_modules(bobert_companion=None), \
                 mock.patch("os.path.exists", return_value=True), \
                 mock.patch("builtins.open", mock.mock_open()), \
@@ -1623,9 +1634,10 @@ class RegisterConfigGuardTests(_HoloBase):
                 mock.patch.object(subprocess, "Popen") as popen:
             popen.return_value = _fake_proc(alive=True)
             mod, actions = load_skill_isolated("holographic_overlay")
-        # Sanity: registration still happened and default auto-launch ran.
+        # Sanity: registration still happened and nothing auto-launched.
         self.assertIn("stark_status_ring", actions)
-        self.assertIsNotNone(mod._WORKSHOP_HUD_PROCESS)
+        self.assertIsNone(mod._WORKSHOP_HUD_PROCESS)
+        popen.assert_not_called()
         self.assertIsNone(mod._OVERLAY_PROCESS)
         self.assertIsNone(mod._STARK_STATUS_PROCESS)
 

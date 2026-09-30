@@ -51,6 +51,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from unittest import mock
 
 from tools import web_interface as wi
 
@@ -182,6 +183,23 @@ def _stop_server(httpd, thread=None, *, shutdown_timeout=5.0,
             pass
 
 
+def _no_live_gpu(case) -> None:
+    """Stand in for the dashboard's two LIVE GPU probes for one test.
+
+    Every /api/status and /api/system build calls _gpu_summary (core.gpu_usage:
+    the live Ollama's /api/ps, plus `ollama ps` and nvidia-smi) and
+    _nvidia_smi_gpus (a per-card nvidia-smi query). With a live JARVIS up the
+    hermetic guard caught these suites reaching the owner's Ollama and GPU on
+    every run (2026-09-30), from the server's request threads. The payloads
+    now have the GPU-less CI runner's shape: no gpu lines, no cards. A test
+    about those probes calls the real functions without this."""
+    for name, value in (("_gpu_summary", {"lines": [], "bar": ""}),
+                        ("_nvidia_smi_gpus", [])):
+        patcher = mock.patch.object(wi, name, return_value=value)
+        patcher.start()
+        case.addCleanup(patcher.stop)
+
+
 class _ServerBase(unittest.TestCase):
     """Spin up a real server on 127.0.0.1:0 in a temp dir; tear it down cleanly."""
 
@@ -193,6 +211,7 @@ class _ServerBase(unittest.TestCase):
         return {}
 
     def setUp(self):
+        _no_live_gpu(self)
         self.tmp = tempfile.TemporaryDirectory()
         self.d = self.tmp.name
         self.inject_path = os.path.join(self.d, "injected_commands.json")
@@ -943,6 +962,9 @@ class TokenAuthTests(_ServerBase):
 class BuildStatusGracefulTests(unittest.TestCase):
     """build_status must never raise when every source is missing."""
 
+    def setUp(self):
+        _no_live_gpu(self)
+
     def test_status_with_all_sources_absent(self):
         with tempfile.TemporaryDirectory() as d:
             status = wi.build_status(os.path.join(d, "nope.json"),
@@ -1082,7 +1104,8 @@ class DashboardTokenSerializationTests(unittest.TestCase):
     def _server(self, token):
         """A real 127.0.0.1:0 server with ``token``, torn down via addCleanup.
         All file sources point at a throwaway temp dir (same safety contract as
-        _ServerBase)."""
+        _ServerBase), and the live GPU probes are faked (see _no_live_gpu)."""
+        _no_live_gpu(self)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         d = tmp.name
@@ -1263,6 +1286,9 @@ class GuiOnlyKeyRoundTripTests(unittest.TestCase):
 class AirMouseStatusTests(unittest.TestCase):
     """_air_mouse_status reads the skill via sys.modules (no import) and OMITS the
     field when the skill isn't loaded — mirroring bobert's preview reader."""
+
+    def setUp(self):
+        _no_live_gpu(self)
 
     def tearDown(self):
         import sys as _sys
@@ -1477,6 +1503,9 @@ class ActionIndexParseTests(unittest.TestCase):
 class SystemInfoHelperTests(unittest.TestCase):
     """Unit-level: _system_info is always JSON-valid with the full key set even
     when every hardware source is unavailable (the CI degrade path)."""
+
+    def setUp(self):
+        _no_live_gpu(self)       # "unavailable" on this box too, not live
 
     def test_shape_is_stable(self):
         with tempfile.TemporaryDirectory() as d:

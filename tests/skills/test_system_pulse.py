@@ -506,6 +506,17 @@ class PulseGpuUtilTests(unittest.TestCase):
 class PulseGpuTempTests(unittest.TestCase):
     def setUp(self):
         self.mod, self.actions = load_skill_isolated("system_pulse")
+        # Step 2 of _read_gpu_temp_c reads HWiNFO's shared memory: a LIVE
+        # sensor. On the owner's PC it answered these "no source" tests with
+        # the real GPU temperature, so six of them failed there and passed on
+        # CI (2026-09-30). Fake it to "no reading", like the CI runner.
+        try:
+            from audio import hwinfo
+        except Exception:
+            return                      # not importable: the step is skipped
+        patcher = mock.patch.object(hwinfo, "summary", return_value={})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_nvidia_smi_hottest_gpu(self):
         proc = types.SimpleNamespace(stdout="61\n74\n")
@@ -820,8 +831,18 @@ class PulseGatherTests(unittest.TestCase):
     def setUp(self):
         self.mod, self.actions = load_skill_isolated("system_pulse")
 
+    # _gather_pulse's LIVE sensor readers that these tests used to leave real:
+    # _read_gpu_util_pct ran the real nvidia-smi on every run (the hermetic
+    # guard's catch, 2026-09-30) and _read_hwinfo_summary / _read_cpu_temp_c
+    # read this PC's HWiNFO shared memory. Every reader is faked now.
+    _LIVE_READERS = {"_read_hwinfo_summary": {}, "_read_gpu_util_pct": None,
+                     "_read_cpu_temp_c": None}
+
     def test_gather_assembles_all_fields_with_battery(self):
         patches = {
+            **self._LIVE_READERS,
+            "_read_gpu_util_pct": 30.0,
+            "_read_cpu_temp_c": 48.0,
             "_read_cpu_ram": (15.0, 40.0, 8.0),
             "_read_disk_free_gb": 300.0,
             "_read_gpu_temp_c": 55.0,
@@ -843,12 +864,15 @@ class PulseGatherTests(unittest.TestCase):
                 c.stop()
         self.assertEqual(pulse["cpu_pct"], 15.0)
         self.assertEqual(pulse["ram_used_gb"], 8.0)
+        self.assertEqual(pulse["gpu_util_pct"], 30.0)
+        self.assertEqual(pulse["cpu_temp_c"], 48.0)
         self.assertEqual(pulse["net_down_kbps"], 12.0)
         self.assertEqual(pulse["battery_pct"], 88.0)
         self.assertTrue(pulse["battery_plugged"])
 
     def test_gather_omits_battery_on_desktop(self):
-        cms = [
+        cms = [mock.patch.object(self.mod, name, return_value=val)
+               for name, val in self._LIVE_READERS.items()] + [
             mock.patch.object(self.mod, "_read_cpu_ram", return_value=(1.0, 2.0, 3.0)),
             mock.patch.object(self.mod, "_read_disk_free_gb", return_value=0.0),
             mock.patch.object(self.mod, "_read_gpu_temp_c", return_value=None),

@@ -1277,10 +1277,18 @@ class StreamingApplyPlayStrategyTests(MonolithGlobalsTestCase):
         dc.assert_not_called()
 
     def test_space_strategy(self):
-        with mock.patch.object(self.bc, "ui_press") as press:
-            attempted, _ = self.bc._streaming_apply_play_strategy("space", {}, None)
+        # _focus_music_window looks up a REAL window by title and activates it
+        # (then minimises + restores it when that fails): the owner's own
+        # music window, found live by the hermetic guard 2026-09-30. Fake it.
+        with mock.patch.object(self.bc, "ui_press") as press, \
+             mock.patch.object(self.bc, "_focus_music_window",
+                               return_value="Desk Radio - Player") as focus, \
+             mock.patch.object(self.bc.time, "sleep"):
+            attempted, desc = self.bc._streaming_apply_play_strategy("space", {}, None)
         self.assertTrue(attempted)
         press.assert_called_once_with("space")
+        focus.assert_called_once_with()
+        self.assertIn("focused 'Desk Radio - Player'", desc)
 
     def test_playpause_strategy(self):
         with mock.patch.object(self.bc, "ui_press") as press:
@@ -2931,6 +2939,24 @@ class StreamingAutoPlayBranchTests(MonolithGlobalsTestCase):
     def setUpClass(cls):
         cls.bc = load_monolith()
 
+    def setUp(self):
+        super().setUp()
+        # _streaming_auto_play's real-world boundaries (hermetic guard,
+        # 2026-09-30): _open_url_in_browser launches a REAL browser (these
+        # tests patched webbrowser.open, but the path is webbrowser.get();
+        # the browser guard blocked it 7 times per run);
+        # _find_browser_window_matching finds one of the OWNER's windows by
+        # title, then activates and maximises it; the iTunes / YouTube
+        # resolvers fetch the internet. A test that needs one of them
+        # re-patches it inside its own with-block.
+        for name, value in (("_open_url_in_browser", "chrome"),
+                            ("_find_browser_window_matching", None),
+                            ("_apple_music_resolve_track", None),
+                            ("_youtube_resolve_video", None)):
+            patcher = mock.patch.object(self.bc, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def _caps(self):
         """Enter the with-block having all auto-click capabilities enabled."""
         return [
@@ -3077,6 +3103,17 @@ class AppleMusicPlaylistSidebarTests(MonolithGlobalsTestCase):
     @classmethod
     def setUpClass(cls):
         cls.bc = load_monolith()
+
+    def setUp(self):
+        super().setUp()
+        # Same real-world boundaries as StreamingAutoPlayBranchTests: a REAL
+        # browser launch (webbrowser.get(), which these tests' webbrowser.open
+        # patch never covered) and a real window lookup by title.
+        for name, value in (("_open_url_in_browser", "chrome"),
+                            ("_find_browser_window_matching", None)):
+            patcher = mock.patch.object(self.bc, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def _caps(self):
         return mock.patch.multiple(
@@ -3788,6 +3825,18 @@ class AppleMusicAutoPlayNoVisionTests(MonolithGlobalsTestCase):
     @classmethod
     def setUpClass(cls):
         cls.bc = load_monolith()
+
+    def setUp(self):
+        super().setUp()
+        # Pinned for the WHOLE class (2026-09-30): test_no_ui_automation_
+        # degrades_clearly was the one test that forgot, and fetched
+        # itunes.apple.com on every run (the hermetic guard's catch). The
+        # window lookup by title is a real-desktop boundary too.
+        for name in ("_apple_music_resolve_track",
+                     "_find_browser_window_matching"):
+            patcher = mock.patch.object(self.bc, name, return_value=None)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_plays_without_vision_via_title(self):
         bc = self.bc

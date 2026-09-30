@@ -168,6 +168,10 @@ def main(argv: list[str]) -> int:
     import tests  # chokepoint: it arms all three, in order, idempotently
     from tools import browser_guard
     browser_guard.install()
+    # The network / real-input / live-probe sibling (tools/hermetic_guard.py);
+    # tests/__init__.py armed it already - idempotent.
+    from tools import hermetic_guard
+    hermetic_guard.install()
     # THEN THE TIME CEILING — the sibling of the memory ceiling above. mem_guard
     # bounds what a run may ALLOCATE; this bounds how long it may STALL, which
     # a memory ceiling structurally cannot see (a hang is not an allocation).

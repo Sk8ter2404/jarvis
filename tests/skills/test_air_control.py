@@ -214,7 +214,11 @@ class TestFailsafe(AirControlSkillTest):
     def test_pyautogui_missing_is_survivable(self):
         # Headless CI with no pyautogui at all: _release_mouse/_apply_op must
         # degrade silently rather than raise out of the actions.
-        sys.modules.pop("pyautogui", None)
+        # (No sys.modules.pop first: it left NO pyautogui entry once the block
+        # exited, so tearDown's _stop_loop -> _release_mouse imported the REAL
+        # pyautogui and injected a real left-button-up at the owner's cursor -
+        # the hermetic guard's catch, 2026-09-30. patch.dict alone restores the
+        # fake setUp pinned.)
         with mock.patch.dict(sys.modules, {"pyautogui": None}):
             mod, actions = self._load(_fake_bridge())
             self.assertIsNone(mod._pyautogui())

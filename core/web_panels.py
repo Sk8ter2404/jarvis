@@ -62,7 +62,15 @@ WIDGETS (``type`` + keys; ``label`` is optional everywhere)
   gauge    key, min?=0, max?=100, unit?
   text     key                          multi-line text
   events   key, max?=20                 list of str or {"ts", "text"}
-  image    stream, mode?="stream"|"snapshot", refresh_ms?=1000
+  image    stream, mode?="stream"|"snapshot", refresh_ms?=1000, key?
+                                        shows "No picture yet" and requests
+                                        nothing until a frame exists: state[key]
+                                        truthy (a new value = a new frame; falsy
+                                        = none), a user action on the panel, or
+                                        one look when the view opens (keyless);
+                                        a 404 goes back to the placeholder.
+                                        With a frame, snapshot mode refreshes
+                                        every refresh_ms
   buttons  buttons=[{"label", "action", "args"?}]
   input    action, arg?="text", placeholder?, button?="Send"
   toggle   key, action, arg?="on"       sends {arg: true|false}

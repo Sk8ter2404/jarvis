@@ -15500,6 +15500,13 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
     if _mic_input_disabled():
         time.sleep(0.5 if timeout is None else min(0.5, max(0.1, timeout)))
         return None
+    # A device dialogue running on ANOTHER thread (a web panel action) owns
+    # the microphone for its stop-listen: open nothing, idle briefly, and let
+    # the caller loop (None = nothing heard). See _dialogue_holds_mic.
+    if _dialogue_holds_mic():
+        _dialogue_mic_yield_wait(
+            0.5 if timeout is None else min(0.5, max(0.1, timeout)))
+        return None
     # Capture-open BACKOFF (2026-09-29, R10): while the microphone will not
     # open, attempts are paced 0.5 -> 5 s instead of retried ~200 times a
     # second; the wait yields to pending work and to a returning device.
@@ -15671,6 +15678,14 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
             if _mic_muted[0] and not _mute_at_open:
                 print("  [record_speech] mic muted mid-capture — stopping, "
                       "nothing kept")
+                _utterance_in_progress[0] = False
+                return None
+            # A dialogue started on another thread while this capture was
+            # listening (a web panel action): hand it the microphone now —
+            # the finally below closes the stream and drops the claim.
+            if _dialogue_holds_mic():
+                print("  [record_speech] a dialogue needs the microphone — "
+                      "stopping, nothing kept")
                 _utterance_in_progress[0] = False
                 return None
             try:
@@ -30231,6 +30246,13 @@ def handle_confirmation_response(user_text: str) -> bool:
         # voiced what it found. Collected here and spoken below. 2026-07-08.
         informative_results: list[tuple[str, str]] = []
         verbatim_results: list[tuple[str, str, bool]] = []
+        # SELF-VOICED actions that ran (a device dialogue): they did ALL of
+        # their own talking inside fn(), so — exactly as on the main path
+        # (_all_self_voiced) — their result is neither an answer to voice nor
+        # a failure to report, and they earn no "Done." either. Live
+        # 2026-09-30: a confirmed dialogue played every line and then JARVIS
+        # added "Done." on top of it.
+        self_voiced_ran: list[str] = []
         fail_markers = tuple(m.lower() for m in FAILURE_MARKERS)
         while _pending_confirmation:
             name, arg = _pending_confirmation.pop(0)
@@ -30240,6 +30262,14 @@ def handle_confirmation_response(user_text: str) -> bool:
             try:
                 res = fn(arg)
                 print(f"  [action] {name}: {res}")
+                # A deferral string (a pushback / confirmation / ambiguity
+                # prompt) has said nothing yet, so it takes the normal path
+                # below — the same carve-out _all_self_voiced makes.
+                if is_self_voiced(name) and not (
+                        isinstance(res, str)
+                        and res.startswith(_ANSWER_FIRST_DEFERRED_PREFIXES)):
+                    self_voiced_ran.append(name)
+                    continue
                 # A soft failure is signalled by a RETURNED marker substring, not
                 # by raising (core/failure_markers.py). Counting it as executed
                 # made JARVIS speak "Done." for an action that silently failed.
@@ -30288,6 +30318,11 @@ def handle_confirmation_response(user_text: str) -> bool:
             # Nothing succeeded — speak the first failure's own message (action
             # failure strings are already finished sentences).
             _speak(failures[0])
+        elif self_voiced_ran:
+            # Every confirmed action that ran was self-voiced: it already said
+            # everything, so JARVIS adds nothing (no "Done.").
+            print(f"  [self-voiced] {', '.join(self_voiced_ran)} did its own "
+                  f"talking; no confirmation feedback")
         else:
             _speak("Done.")
     else:
@@ -31600,6 +31635,53 @@ def _dialogue_gate_active() -> bool:
         return False
 
 
+def _dialogue_holds_mic() -> bool:
+    """True while a device dialogue running on ANOTHER thread owns the
+    microphone.
+
+    A dialogue started from a web panel action runs on a web-server thread,
+    not inside a voice turn, and the main loop may still be listening. The
+    dialogue's stop-listen (_listen_for_stop) is REFUSED while record_speech
+    holds the mic (_stop_listen_capture_denied), so without a yield the owner
+    could not stop a web-started dialogue by voice at all. While this is True
+    the main loop's capture yields: _capture_utterance starts none, and
+    record_speech returns None at entry or closes its stream mid-capture.
+    A dialogue on THIS thread (a voice turn, whose own action may capture)
+    never yields to itself. Never raises."""
+    try:
+        if not _dialogue_active[0]:
+            return False
+        h = _dialogue_current[0]
+        owner = getattr(h, "_thread", None) if h is not None else None
+        return owner is not threading.current_thread()
+    except Exception:
+        return False
+
+
+# The handle the "yields the microphone" line was last logged for (one line
+# per dialogue, not one per main-loop pass).
+_dialogue_mic_yield_logged = [None]
+# How long _listen_for_stop waits for record_speech to hand the mic over
+# (record_speech notices within ~0.1 s; the close is bounded separately).
+_DIALOGUE_MIC_YIELD_WAIT_S = 1.0
+
+
+def _dialogue_mic_yield_wait(max_s: float) -> None:
+    """Idle (bounded by ``max_s``) while _dialogue_holds_mic(); the caller then
+    returns "nothing heard". Logs once per dialogue. Never raises."""
+    try:
+        h = _dialogue_current[0]
+        if _dialogue_mic_yield_logged[0] is not h:
+            _dialogue_mic_yield_logged[0] = h
+            print("  [dialogue] the main loop yields the microphone to a "
+                  "dialogue running on another thread")
+        deadline = time.monotonic() + max(0.0, float(max_s))
+        while _dialogue_holds_mic() and time.monotonic() < deadline:
+            time.sleep(0.05)
+    except Exception:
+        pass
+
+
 def _speech_hold_active() -> bool:
     try:
         return time.monotonic() < float(_speech_hold_until[0])
@@ -31665,6 +31747,12 @@ class _DialogueHandle:
         self._hold_s = 0.0
         self._hold_reason = ""
         self._dsf_token = 0
+        # The thread the dialogue runs on (the handle is built inside
+        # _dialogue_session, on that thread). A web panel action runs it on a
+        # web-server thread while the main loop keeps listening, so the main
+        # loop's capture yields to it (_dialogue_holds_mic). The Thread
+        # object, never a reusable ident (v2.0.128).
+        self._thread = threading.current_thread()
         # Set by _dialogue_session's exit. A stop() arriving later (a slow
         # stop-listen verdict, a late device watcher) must never cut an
         # UNRELATED reply that is playing by then.
@@ -32045,6 +32133,14 @@ def _listen_for_stop(until, *, beat_s: float | None = None,
                 mono = indata[:, 0] if indata.ndim > 1 else indata
                 q_local.put(mono.astype(np.float32, copy=False).copy())
 
+            # A dialogue started OFF the main thread (a web panel action) can
+            # begin while the main loop is inside record_speech, which then
+            # yields (_dialogue_holds_mic) within ~0.1 s. Wait, bounded, for
+            # that hand-over instead of being refused by the capture that is
+            # about to close.
+            _yield_by = time.monotonic() + _DIALOGUE_MIC_YIELD_WAIT_S
+            while _record_speech_active[0] and time.monotonic() < _yield_by:
+                time.sleep(0.02)
             dev = get_input_device()     # resolved BEFORE the claim (Path B)
             if not _pa_claim_owner(_pathb_mic_active,
                                    deny_if=_stop_listen_capture_denied):
@@ -34141,6 +34237,15 @@ def _capture_utterance(injected_text, memory):
     if _mic_muted[0]:
         _heartbeat()
         time.sleep(0.3)
+        return None
+
+    # A device dialogue running on ANOTHER thread (started from a web panel
+    # action, not inside a voice turn) owns the microphone for its stop-listen:
+    # take no capture until it ends. Injected turns above still pass. See
+    # _dialogue_holds_mic.
+    if _dialogue_holds_mic():
+        _heartbeat()
+        _dialogue_mic_yield_wait(0.5)
         return None
 
     # ── EXPERIMENTAL: realtime streaming capture (VOICE_MODE='realtime') ──────

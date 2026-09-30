@@ -341,6 +341,8 @@ _MONOLITH_RESTORE_NAMES = (
     # leaked hold would silence a later _speak_pending test.
     "_dialogue_active", "_dialogue_current", "_speech_hold_until",
     "_turn_hold_until", "_turn_hold_reason", "SELF_VOICED_ACTIONS",
+    # (2026-09-30) the once-per-dialogue "yields the microphone" log latch.
+    "_dialogue_mic_yield_logged",
     "_hud_state_cache", "_focused_window_state", "CAMERAS",
     "last_speech_time", "last_face_seen", "_apple_music_last_seen",
     # ── STT / whisper model handles ────────────────────────────────────────

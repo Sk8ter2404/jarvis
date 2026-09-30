@@ -171,6 +171,10 @@ def main(argv: list[str]) -> int:
     import tests  # chokepoint: it arms all three, in order, idempotently
     from tools import browser_guard
     browser_guard.install()
+    # The network / real-input / live-probe sibling (tools/hermetic_guard.py);
+    # tests/__init__.py armed it already - idempotent.
+    from tools import hermetic_guard
+    hermetic_guard.install()
     # THEN THE TIME CEILING (tools/test_watchdog.py) — mem_guard bounds what a
     # run may ALLOCATE, this bounds how long it may STALL. Coverage instruments
     # every executed line, so this run is legitimately several times slower than

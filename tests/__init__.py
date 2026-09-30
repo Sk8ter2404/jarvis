@@ -76,3 +76,22 @@ except Exception as _exc:  # noqa: BLE001 - collection must survive anything
     print(f"[browser-guard] WARNING: not armed from tests/__init__.py "
           f"({type(_exc).__name__}: {_exc}) — this run CAN open REAL browsers",
           flush=True)
+
+# ── 4. HERMETIC GUARD (network / real input / live-hardware probes) ─────────
+# Found 2026-09-30 with a live JARVIS up: suites reached the live Ollama
+# (/api/ps, /api/tags), itunes.apple.com, the real nvidia-smi and `ollama ps`,
+# a real SetForegroundWindow, and a HUD overlay window - all through
+# production code, all green for the wrong reason. One sys.addaudithook hook
+# refuses and records each (a hook cannot be displaced by a test's
+# mock.patch); the atexit summary names the offending tests. Armed LAST: it
+# wraps nothing the other guards wrap. Escape hatches: JARVIS_ALLOW_REAL_NETWORK,
+# JARVIS_ALLOW_REAL_INPUT, JARVIS_ALLOW_HARDWARE_PROBES (=1). See
+# tools/hermetic_guard.py.
+try:  # never let a guard break test COLLECTION — an unguarded run beats no run
+    from tools import hermetic_guard as _hermetic_guard
+
+    _hermetic_guard.install()
+except Exception as _exc:  # noqa: BLE001 - collection must survive anything
+    print(f"[hermetic-guard] WARNING: not armed from tests/__init__.py "
+          f"({type(_exc).__name__}: {_exc}) — this run CAN reach the network, "
+          f"real input and live hardware", flush=True)

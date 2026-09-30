@@ -1938,10 +1938,16 @@ def register(actions: dict):
     # overwrite the main one and route 'hide the HUD' voice commands to the
     # workshop-HUD closer instead. The dedicated workshop alias is above.
 
-    workshop_hud_auto = True
+    # The fallback is core/config.py's own default, False: the workshop HUD is
+    # a RETIRED overlay (superseded by the unified HUD). A running JARVIS
+    # always has the attribute (the monolith re-exports core.config), so the
+    # fallback only ever applied OUTSIDE it - where a stale True put a real
+    # widget window on the owner's desktop from every skill-smoke test run
+    # (the hermetic guard's catch, 2026-09-30).
+    workshop_hud_auto = False
     try:
         import bobert_companion as _bc
-        workshop_hud_auto = bool(getattr(_bc, "WORKSHOP_HUD_AUTO_LAUNCH", True))
+        workshop_hud_auto = bool(getattr(_bc, "WORKSHOP_HUD_AUTO_LAUNCH", False))
     except Exception:
         pass
     if workshop_hud_auto:

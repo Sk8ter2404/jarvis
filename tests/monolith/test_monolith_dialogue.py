@@ -717,6 +717,212 @@ class PathBDoubleOpenTests(_Base):
 
 
 # ── holds + learners ─────────────────────────────────────────────────────
+# ── a dialogue started OFF the main thread vs the main loop's microphone ────
+class _LiveMic:
+    """A fake input stream that keeps delivering quiet frames from its own
+    thread until it is closed: a microphone somebody is listening on. Counts
+    how many are open at once (two open captures on one device is the WASAPI
+    double-open the rest of the capture code exists to prevent)."""
+    lock = threading.Lock()
+    open_now = 0
+    max_open = 0
+    instances: list = []
+
+    def __init__(self, samplerate=16000, channels=1, dtype="float32",
+                 blocksize=1024, device=None, callback=None):
+        self.callback = callback
+        self.closed = False
+        self.started = False
+        self._stop = threading.Event()
+        _LiveMic.instances.append(self)
+
+    @classmethod
+    def reset(cls):
+        cls.open_now = 0
+        cls.max_open = 0
+        cls.instances = []
+
+    def start(self):
+        import numpy as np
+        with _LiveMic.lock:
+            _LiveMic.open_now += 1
+            _LiveMic.max_open = max(_LiveMic.max_open, _LiveMic.open_now)
+        self.started = True
+        frame = np.full((1024, 1), 0.001, dtype=np.float32)
+
+        def feed():
+            while not self._stop.wait(0.02):
+                try:
+                    self.callback(frame, 1024, None, None)
+                except Exception:
+                    return
+        threading.Thread(target=feed, name="fake-mic", daemon=True).start()
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self._stop.set()
+        if self.started:
+            with _LiveMic.lock:
+                _LiveMic.open_now -= 1
+
+
+@requires_monolith
+class WebStartedDialogueMicTests(_Base):
+    """A dialogue started from a WEB PANEL action runs on a web-server thread,
+    not inside a voice turn, while the main loop may still be listening in
+    record_speech. The dialogue's stop-listen (_listen_for_stop) is refused
+    while record_speech holds the microphone, so before the fix the owner
+    could not stop a web-started dialogue by voice. The main loop's capture
+    now yields for as long as a dialogue on ANOTHER thread runs
+    (_dialogue_holds_mic). Fake microphone only; generic fixtures."""
+
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        _LiveMic.reset()
+        self.addCleanup(lambda: [m.close() for m in list(_LiveMic.instances)])
+        self.stream_cls = self._p(bc.sd, "InputStream", side_effect=_LiveMic)
+        self._p(bc, "get_input_device", return_value=0)
+        self._p(bc, "_safe_close_stream",
+                side_effect=lambda s, timeout_sec=2.0: (
+                    s.close() if s is not None else None))
+        self._p(bc, "_input_backoff_wait", return_value=False)
+        self._p(bc, "_filler_capture_mark")
+        self._p(bc, "_note_live_capture")
+        self._p(bc, "_input_open_succeeded")
+        self._p(bc, "_heartbeat")
+        self._p(bc, "HUD_ENABLED", False)
+        self._p(bc, "VAD_THRESHOLD", 0.5)          # quiet frames never trip
+        self._p(bc, "_process_capture_chunk",
+                side_effect=lambda data, sr, skip_ns=False: data)
+        from core import audio_processor as ap
+        for name in ("note_vad_poll", "note_raw_rms", "note_vad_active"):
+            self._p(ap, name)
+        self._p(ap, "seconds_since_audible_chunk", return_value=0.0)
+        self._p(bc, "_dialogue_mic_yield_logged", [None], create=True)
+        self._p(bc, "learn_from_turn")
+        self._p(bc, "_ambient_learn_from_gated")
+        self._p(bc, "_note_input_open_failure")
+        self._p(bc, "set_state")
+        self._hide_wake_listener()                 # Path B: a stream of its own
+        bc._watchdog_reset_signal.clear()
+
+    def _foreign_handle(self):
+        """A dialogue handle built on ANOTHER thread (a web-server thread)."""
+        box = []
+        t = threading.Thread(
+            target=lambda: box.append(self.bc._DialogueHandle(_SRC, 30)),
+            name="web-handler")
+        t.start()
+        t.join(5.0)
+        return box[0]
+
+    def _run_foreign_dialogue(self):
+        h = self._foreign_handle()
+        self.bc._dialogue_current[0] = h
+        self.bc._dialogue_active[0] = True
+        return h
+
+    def test_holds_mic_only_for_a_dialogue_on_another_thread(self):
+        bc = self.bc
+        self.assertFalse(bc._dialogue_holds_mic())             # no dialogue
+        bc._dialogue_current[0] = bc._DialogueHandle(_SRC, 30)  # this thread
+        bc._dialogue_active[0] = True
+        self.assertFalse(bc._dialogue_holds_mic(),
+                         "a dialogue must never yield the mic to itself")
+        bc._dialogue_current[0] = self._foreign_handle()
+        self.assertTrue(bc._dialogue_holds_mic())
+        bc._dialogue_active[0] = False
+        self.assertFalse(bc._dialogue_holds_mic())
+
+    def test_record_speech_opens_nothing_while_a_foreign_dialogue_runs(self):
+        bc = self.bc
+        self._run_foreign_dialogue()
+        out, log = self._quiet(bc.record_speech, timeout=0.2)
+        self.assertIsNone(out)
+        self.stream_cls.assert_not_called()
+        self.assertFalse(bc._record_speech_active[0])
+        self.assertIn("yields the microphone", log)
+
+    def test_capture_utterance_takes_no_capture_while_a_foreign_dialogue_runs(self):
+        bc = self.bc
+        rec = self._p(bc, "record_speech", return_value=None)
+        self._p(bc, "_speak_pending", return_value=False)
+        self._run_foreign_dialogue()
+        out, _ = self._quiet(bc._capture_utterance, None, {})
+        self.assertIsNone(out)
+        rec.assert_not_called()
+        # an injected (typed) turn still passes during the dialogue
+        out, _ = self._quiet(bc._capture_utterance, "what time is it", {})
+        self.assertEqual(out[0], "what time is it")
+
+    def test_a_voice_turn_dialogue_still_captures_on_its_own_thread(self):
+        bc = self.bc
+        bc._dialogue_current[0] = bc._DialogueHandle(_SRC, 30)
+        bc._dialogue_active[0] = True
+        out, _ = self._quiet(bc.record_speech, timeout=0.2)
+        self.assertIsNone(out)                       # quiet: timed out
+        self.assertEqual(self.stream_cls.call_count, 1)
+        self.assertTrue(_LiveMic.instances[0].closed)
+
+    def test_the_yield_is_logged_once_per_dialogue(self):
+        bc = self.bc
+        self._run_foreign_dialogue()
+        _, log = self._quiet(lambda: [bc._dialogue_mic_yield_wait(0.0)
+                                      for _ in range(5)])
+        self.assertEqual(log.count("yields the microphone"), 1)
+
+    def test_a_web_started_dialogue_gets_the_mic_from_a_listening_main_loop(self):
+        """THE BUG, end to end: the main loop is inside record_speech (the
+        fake mic is live) when a dialogue starts on another thread. The
+        capture hands the microphone over, the dialogue's stop-listen gets it,
+        and the owner's "stop" ends the dialogue. Never two streams at once."""
+        bc = self.bc
+        self._p(bc, "transcribe", return_value=("please stop", {}))
+        rec_out = {}
+
+        def main_loop_listen():
+            rec_out["audio"] = bc.record_speech(timeout=4.0)
+            rec_out["at"] = time.monotonic()
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            main = threading.Thread(target=main_loop_listen, name="main-loop")
+            main.start()
+            self.addCleanup(main.join, 6.0)
+            deadline = time.monotonic() + 3.0
+            while (not bc._record_speech_active[0]
+                   and time.monotonic() < deadline):
+                time.sleep(0.01)
+            self.assertTrue(bc._record_speech_active[0],
+                            "the fake main loop never started listening")
+            # This test thread plays the web-server thread.
+            t0 = time.monotonic()
+            with bc._dialogue_session(_SRC) as h:
+                cap = bc._listen_for_stop(lambda: True, beat_s=0.05,
+                                          max_s=1.0)
+                verdict = cap.result(3.0) if cap.available else None
+                stopped = h.stopped()
+            main.join(6.0)
+        self.assertTrue(cap.available,
+                        "the stop-listen could not get the microphone from "
+                        "the listening main loop")
+        self.assertEqual(verdict, ("stop", ""))
+        self.assertEqual(stopped, "owner_stop")
+        self.assertFalse(main.is_alive())
+        self.assertIsNone(rec_out.get("audio"))
+        self.assertLess(rec_out["at"] - t0, 2.0,
+                        "record_speech kept the mic after the dialogue began")
+        self.assertEqual(_LiveMic.max_open, 1,
+                         "two captures were open on the microphone at once")
+        self.assertEqual(len(_LiveMic.instances), 2)   # main loop, then listen
+        self.assertFalse(bc._record_speech_active[0])
+        self.assertFalse(bc._pathb_mic_active[0])
+        self.assertIn("a dialogue needs the microphone", buf.getvalue())
+
+
 class HoldTests(_Base):
     def test_speak_pending_keeps_the_queue_while_held(self):
         bc = self.bc
@@ -924,6 +1130,87 @@ class SelfVoicedTests(_Base):
         self.assertFalse(bc.SELF_VOICED_ACTIONS
                          & bc.SPEAK_RESULT_VERBATIM_ACTIONS)
         self.assertFalse(bc.SELF_VOICED_ACTIONS & bc.INFORMATIVE_ACTIONS)
+
+
+# ── a confirmed self-voiced action (the confirmation gate's "yes") ────────
+class ConfirmedSelfVoicedTests(_Base):
+    """A self-voiced action (a device dialogue) that went through the
+    confirmation gate: the owner says "yes", the action runs and speaks every
+    line itself — and handle_confirmation_response used to add "Done." on top
+    of it (live 2026-09-30). The accept path follows the main path's rule
+    (_all_self_voiced): nothing else is spoken for a self-voiced action."""
+
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        self._p(bc, "SELF_VOICED_ACTIONS", set())
+        self._p(bc, "SPEAK_RESULT_VERBATIM_ACTIONS",
+                set(bc.SPEAK_RESULT_VERBATIM_ACTIONS))
+        self._p(bc, "INFORMATIVE_ACTIONS", set(bc.INFORMATIVE_ACTIONS))
+        self.spoken = []
+        self._p(bc, "_speak",
+                side_effect=lambda t, *a, **k: self.spoken.append(t))
+        self.followup = self._p(bc, "get_followup_response",
+                                return_value="Following up.")
+        self.ran = []
+        acts = dict(bc.ACTIONS)
+        acts["desk_chat"] = lambda a="": (
+            self.ran.append("desk_chat")
+            or "Dialogue finished: 4 lines, done.")
+        acts["desk_lamp"] = lambda a="": self.ran.append("desk_lamp") or "ok"
+        self._p(bc, "ACTIONS", acts)
+        self._p(bc, "_pending_confirmation", [])
+        bc.register_self_voiced("desk_chat")
+
+    def _confirm(self, *names, answer="yes"):
+        for n in names:
+            self.bc._pending_confirmation.append((n, ""))
+        with contextlib.redirect_stdout(io.StringIO()):
+            return self.bc.handle_confirmation_response(answer)
+
+    def test_confirmed_self_voiced_action_gets_no_done(self):
+        self.assertTrue(self._confirm("desk_chat"))
+        self.assertEqual(self.ran, ["desk_chat"])
+        self.assertEqual(self.spoken, [],
+                         "JARVIS added feedback on top of a self-voiced "
+                         "action that already did its own talking")
+        self.followup.assert_not_called()
+        self.assertEqual(self.bc._pending_confirmation, [])
+
+    def test_a_failure_marker_result_is_not_reported_either(self):
+        self.bc.ACTIONS["desk_chat"] = lambda a="": (
+            "It failed and could not start.")
+        self._confirm("desk_chat")
+        self.assertEqual(self.spoken, [])
+
+    def test_mixed_confirmation_says_done_for_the_plain_action_only(self):
+        self._confirm("desk_chat", "desk_lamp")
+        self.assertEqual(self.ran, ["desk_chat", "desk_lamp"])
+        self.assertEqual(self.spoken, ["Done."])
+
+    def test_a_raising_self_voiced_action_is_still_reported(self):
+        def boom(_a=""):
+            raise RuntimeError("transport gone")
+        self.bc.ACTIONS["desk_chat"] = boom
+        self._confirm("desk_chat")
+        self.assertEqual(len(self.spoken), 1)
+        self.assertIn("ran into an error", self.spoken[0])
+
+    def test_a_deferral_result_is_not_swallowed(self):
+        prefix = self.bc._ANSWER_FIRST_DEFERRED_PREFIXES[0]
+        self.bc.ACTIONS["desk_chat"] = lambda a="": prefix + " not now"
+        self._confirm("desk_chat")
+        self.assertTrue(self.spoken)
+
+    def test_unregistered_action_still_says_done(self):
+        self.bc.SELF_VOICED_ACTIONS.clear()
+        self._confirm("desk_chat")
+        self.assertEqual(self.spoken, ["Done."])
+
+    def test_declining_still_says_cancelled(self):
+        self._confirm("desk_chat", answer="no")
+        self.assertEqual(self.ran, [])
+        self.assertEqual(self.spoken, ["Cancelled."])
 
 
 # ── _local_complete ──────────────────────────────────────────────────────

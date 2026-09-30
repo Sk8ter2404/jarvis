@@ -3616,6 +3616,12 @@ _DASHBOARD_PAGE = r"""<!doctype html>
   .pw pre { margin:0; white-space:pre-wrap; word-break:break-word; color:var(--text); font:inherit; }
   .pw ul { margin:0; padding-left:18px; max-height:220px; overflow:auto; }
   .pw img { width:100%; border-radius:6px; background:#04070c; }
+  .pw img[hidden] { display:none; }
+  /* An image widget before its first frame: a neutral box, never a broken-image icon. */
+  .pw .pimg-empty { display:flex; align-items:center; justify-content:center; min-height:120px;
+          border:1px dashed var(--edge); border-radius:6px; background:#04070c;
+          color:var(--muted); font-size:13px; }
+  .pw .pimg-empty[hidden] { display:none; }
   .pw .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
   .pw input[type=range] { width:100%; accent-color:var(--cyan); }
   .pw button { padding:8px 14px; }
@@ -4887,7 +4893,7 @@ async function loadMemory() {
 // dock visible on every tab, stop every hold first, and never ask to confirm.
 let PANELS = [];
 const panelUpdaters = {};        // panel id -> [fn(state)]
-const panelMedia = {};           // panel id -> [img] live stream widgets
+const panelMedia = {};           // panel id -> [image widget] (see PANEL IMAGES)
 const HOLD_STOPPERS = [];        // every hold button's release function
 const estopDock = document.getElementById('estopDock');
 
@@ -4909,6 +4915,12 @@ async function panelAction(p, name, args, opts) {
       else out.textContent = (meta.label || name) + ': ' + ((res.data && res.data.error) || res.status);
     } else if (!res.ok && res.status !== 429 && out) {
       out.textContent = (meta.label || name) + ': ' + ((res.data && res.data.error) || res.status);
+    }
+    // A deliberate action (never a hold's resend) may have produced a frame:
+    // arm the panel's image widgets and re-read the state now.
+    if (res.ok && !opts.quiet) {
+      panelImagesArm(p);
+      if (p.has_state && currentView === 'panel:' + p.id) loadPanelState(p);
     }
     return res;
   } catch (e) { if (out) out.textContent = (meta.label || name) + ': send failed'; return null; }
@@ -5011,12 +5023,21 @@ function renderWidget(p, w) {
     return box;
   }
   if (t === 'image') {
+    // Starts as the neutral placeholder: nothing is requested until a frame
+    // is known to exist (see PANEL IMAGES below).
     const box = pwBox(w, true);
-    const img = document.createElement('img'); img.alt = w.label || w.stream;
-    img.dataset.src = '/api/panel/' + encodeURIComponent(p.id) + '/stream/' + encodeURIComponent(w.stream);
-    img.dataset.mode = w.mode; img.dataset.refresh = String(w.refresh_ms || 1000);
-    box.appendChild(img);
-    panelMedia[p.id].push(img);
+    const empty = document.createElement('div'); empty.className = 'pimg-empty';
+    empty.textContent = 'No picture yet';
+    const img = document.createElement('img'); img.alt = w.label || w.stream; img.hidden = true;
+    const m = {p: p, img: img, empty: empty, mode: w.mode, key: w.key || '',
+               refresh: Math.max(100, +w.refresh_ms || 1000),
+               src: '/api/panel/' + encodeURIComponent(p.id) + '/stream/' + encodeURIComponent(w.stream),
+               active: false, has: false, armedUntil: 0, sig: null, timer: null, url: null, busy: false};
+    img.addEventListener('load', () => { if (m.active && m.img.getAttribute('src')) panelImageShown(m); });
+    img.addEventListener('error', () => { if (m.img.getAttribute('src')) panelImageEmpty(m); });
+    box.appendChild(empty); box.appendChild(img);
+    panelMedia[p.id].push(m);
+    if (m.key) ups.push((s) => panelImageState(m, s[m.key]));
     return box;
   }
   if (t === 'buttons') {
@@ -5123,22 +5144,98 @@ function startPanelView(p) {
     loadPanelState(p);
     panelTimer = setInterval(() => { if (pollsWanted()) loadPanelState(p); }, Math.max(250, p.poll_ms || 1000));
   }
-  for (const img of panelMedia[p.id] || []) {
-    if (img.dataset.mode === 'snapshot') {
-      const snap = () => { img.src = q(img.dataset.src + '?still=1&t=' + Date.now()); };
-      snap();
-      img._timer = setInterval(() => { if (pollsWanted()) snap(); }, +img.dataset.refresh || 1000);
-    } else {
-      img.src = q(img.dataset.src);
-    }
+  for (const m of panelMedia[p.id] || []) startPanelImage(m);
+}
+// ── PANEL IMAGES ─────────────────────────────────────────────────────────────
+// Before a panel's first frame exists its image box shows "No picture yet" and
+// the page requests NOTHING for it. (It used to point the <img> at the still
+// URL at once and re-request it every refresh_ms: a broken-image icon and a 404
+// every 2 s until something took a picture.) A frame is fetched only when:
+//   * the panel's STATE says one exists - the widget's optional `key`: a
+//     truthy value means "there is a frame", a new value means "a new one";
+//     falsy puts the placeholder back and stops asking;
+//   * the owner DID something on this panel - after an action (a Snapshot
+//     button, say) a keyless widget looks every refresh_ms for up to
+//     PANEL_IMAGE_ARM_MS, until a frame arrives;
+//   * the view OPENS - one look (keyless widgets only), so a picture taken
+//     earlier is shown when the owner comes back to the tab.
+// A 404 ("no frame") puts the placeholder back and stops the polling again
+// (once an action's window, if any, has run out). Once a frame exists,
+// snapshot mode refreshes every refresh_ms exactly as before, and stream mode
+// shows the live MJPEG.
+const PANEL_IMAGE_ARM_MS = 30000;
+function panelImageShown(m) {
+  m.has = true; m.img.hidden = false; m.empty.hidden = true;
+}
+function panelImageEmpty(m) {
+  // Keeps an action's arm (m.armedUntil): a Snapshot button's frame may land
+  // a few seconds after the click, so its window keeps looking until it ends.
+  m.has = false;
+  m.img.hidden = true; m.empty.hidden = false;
+  m.img.removeAttribute('src');             // frees a stream slot
+  if (m.url) { URL.revokeObjectURL(m.url); m.url = null; }
+}
+async function panelImageFetch(m) {
+  if (!m.active || m.busy) return;
+  m.busy = true;
+  try {
+    const r = await fetch(q(m.src + '?still=1&t=' + Date.now()), {headers: hdr()});
+    if (!m.active) return;
+    if (r.ok) {
+      const url = URL.createObjectURL(await r.blob());
+      if (m.url) URL.revokeObjectURL(m.url);
+      m.url = url; m.has = true; m.armedUntil = 0;
+      m.img.src = url;                      // shown on its 'load' event
+    } else if (r.status === 404) {
+      panelImageEmpty(m);                   // no frame (any more): stop asking,
+    }                                       // unless an action's arm still runs
+  } catch (e) {} finally { m.busy = false; }
+}
+function panelImageLoad(m) {
+  if (!m.active) return;
+  if (m.mode === 'snapshot') panelImageFetch(m);
+  else m.img.src = q(m.src);                // MJPEG; 'load' shows it, 'error' empties it
+}
+function panelImageTick(m) {
+  if (!m.active || !pollsWanted() || m.mode !== 'snapshot') return;
+  if (m.has || Date.now() < m.armedUntil) panelImageFetch(m);
+}
+function panelImageState(m, v) {
+  const on = !(v === undefined || v === null || v === false || v === '' || v === 0);
+  const sig = on ? JSON.stringify(v) : null;
+  const changed = sig !== m.sig;
+  m.sig = sig;
+  if (!m.active) return;
+  if (!on) { if (m.has || m.img.getAttribute('src')) panelImageEmpty(m); return; }
+  if (changed || !m.has) panelImageLoad(m);
+}
+function panelImagesArm(p) {
+  // A user action on this panel may have produced a frame.
+  for (const m of panelMedia[p.id] || []) {
+    if (!m.active || (m.key && p.has_state)) continue;   // keyed: the state decides
+    m.armedUntil = Date.now() + PANEL_IMAGE_ARM_MS;
+    if (m.mode === 'snapshot') panelImageFetch(m);
+    else if (!m.has) panelImageLoad(m);
   }
+}
+function startPanelImage(m) {
+  m.active = true;
+  if (m.mode === 'snapshot' && !m.timer)
+    m.timer = setInterval(() => panelImageTick(m), m.refresh);
+  // Opening the view is one look for a keyless widget; a keyed one waits
+  // for the state (startPanelView reads it straight away).
+  if (!m.key || !m.p.has_state) panelImageLoad(m);
 }
 function stopPanelMedia() {
   stopAllHolds();
   for (const id of Object.keys(panelMedia)) {
-    for (const img of panelMedia[id]) {
-      if (img._timer) { clearInterval(img._timer); img._timer = null; }
-      img.removeAttribute('src');           // frees the stream slot
+    for (const m of panelMedia[id]) {
+      m.active = false; m.armedUntil = 0;
+      if (m.timer) { clearInterval(m.timer); m.timer = null; }
+      // A stream holds a server slot for as long as the <img> keeps its src;
+      // a snapshot is a local blob and keeps showing until the next look.
+      if (m.mode !== 'snapshot') { m.has = false; m.img.removeAttribute('src');
+        m.img.hidden = true; m.empty.hidden = false; }
     }
   }
 }
