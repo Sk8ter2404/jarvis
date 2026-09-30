@@ -19,7 +19,9 @@ caches never leak between tests.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -29,7 +31,7 @@ import types
 import unittest
 from unittest import mock
 
-from tests._skill_harness import load_skill_isolated
+from tests._skill_harness import load_skill_isolated, no_background_threads
 
 
 # A realistic Unix epoch base. The content-dedup gate compares
@@ -142,7 +144,9 @@ class _AccessResult:
 
 class NotificationTriageTests(unittest.TestCase):
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("notification_triage")
+        # Same redirect-before-register() as _IsolatedTriageBase (below):
+        # register() seeds the rules file when it is absent.
+        self.mod, self.actions = _IsolatedTriageBase._load_redirected(self)
         # Start every test from a known, small rule set so ordering assertions
         # are deterministic regardless of what register()'s _load_rules read.
         with self.mod._state_lock:
@@ -473,25 +477,36 @@ class NotificationTriageTests(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────
 class _IsolatedTriageBase(unittest.TestCase):
     def setUp(self):
-        self.mod, self.actions = load_skill_isolated("notification_triage")
-        self.tmp = tempfile.mkdtemp(prefix="notif_triage_test_")
-        self.addCleanup(self._cleanup_tmp)
-
-        # Redirect every file the module writes.
-        self._patch_attr("_DEDUPE_FILE", os.path.join(self.tmp, "dedup.json"))
-        self._patch_attr("_CONTENT_DEDUPE_FILE",
-                         os.path.join(self.tmp, "content.json"))
-        self._patch_attr("_NOTIF_TS_DEDUPE_FILE", os.path.join(self.tmp, "ts.json"))
-        self._patch_attr("_ANNOUNCE_DEDUPE_FILE",
-                         os.path.join(self.tmp, "announce.json"))
-        self._patch_attr("_ANNOUNCE_SHA256_DEDUPE_FILE",
-                         os.path.join(self.tmp, "announce256.json"))
-        self._patch_attr("_RULES_FILE", os.path.join(self.tmp, "rules.json"))
-        self._patch_attr("_DATA_DIR", os.path.join(self.tmp, "notifications"))
-
+        self.mod, self.actions = self._load_redirected(self)
         # Snapshot + clear every mutable global cache.
         self._reset_state()
         self.addCleanup(self._reset_state)
+
+    @staticmethod
+    def _load_redirected(case):
+        """Load the skill, point every file it writes at a temp dir, THEN
+        register() it. register() runs _load_rules(), which SEEDS _RULES_FILE
+        when it is absent: loading with register=True first wrote the LIVE
+        project-root notification_rules.json on a fresh tree (found
+        2026-09-30 by a write audit). Sets ``case.tmp``."""
+        mod, _ = load_skill_isolated("notification_triage", register=False)
+        case.tmp = tempfile.mkdtemp(prefix="notif_triage_test_")
+        case.addCleanup(_IsolatedTriageBase._cleanup_dir, case.tmp)
+        for name, leaf in (("_DEDUPE_FILE", "dedup.json"),
+                           ("_CONTENT_DEDUPE_FILE", "content.json"),
+                           ("_NOTIF_TS_DEDUPE_FILE", "ts.json"),
+                           ("_ANNOUNCE_DEDUPE_FILE", "announce.json"),
+                           ("_ANNOUNCE_SHA256_DEDUPE_FILE", "announce256.json"),
+                           ("_RULES_FILE", "rules.json"),
+                           ("_DATA_DIR", "notifications")):
+            p = mock.patch.object(mod, name, os.path.join(case.tmp, leaf))
+            p.start()
+            case.addCleanup(p.stop)
+        actions: dict = {}
+        with no_background_threads(), \
+                contextlib.redirect_stdout(io.StringIO()):
+            mod.register(actions)
+        return mod, actions
 
     def _patch_attr(self, name, value):
         p = mock.patch.object(self.mod, name, value)
@@ -512,7 +527,11 @@ class _IsolatedTriageBase(unittest.TestCase):
         self.mod._last_dedupe_save[0] = 0.0
 
     def _cleanup_tmp(self):
-        for root, _dirs, files in os.walk(self.tmp, topdown=False):
+        self._cleanup_dir(self.tmp)
+
+    @staticmethod
+    def _cleanup_dir(tmp):
+        for root, _dirs, files in os.walk(tmp, topdown=False):
             for fn in files:
                 try:
                     os.unlink(os.path.join(root, fn))
@@ -1037,6 +1056,10 @@ class PersistToLogTests(_IsolatedTriageBase):
 # ─────────────────────────────────────────────────────────────────────────
 class RulePersistenceTests(_IsolatedTriageBase):
     def test_load_rules_seeds_defaults_when_missing(self):
+        # setUp's register() already seeded the (temp) rules file; start
+        # from "missing" again.
+        if os.path.exists(self.mod._RULES_FILE):
+            os.remove(self.mod._RULES_FILE)
         self.assertFalse(os.path.exists(self.mod._RULES_FILE))
         rules = self.mod._load_rules()
         # File seeded and the in-memory copy is sorted desc by priority.

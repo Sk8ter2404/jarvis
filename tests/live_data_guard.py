@@ -96,17 +96,28 @@ WHAT IS INTERCEPTED
   prose; a production ``_write_clean_shutdown_flag`` landing on it would
   overwrite that with a timestamp and lose the note.
 
+* **Writing ANY live ``data/`` file, or a live root state file** (2026-09-30)
+  — ``open`` in a writing mode, ``os.open`` with a write flag, ``os.truncate``,
+  ``os.rename`` / ``os.replace`` onto (or off) one, and deleting one. The
+  root-level files are named in ``LIVE_ROOT_STATE_FILES`` (the pending-speech
+  queue, the HUD / overlay state files, the todo list, the morning-arrival
+  stamp, the notification rules). Until then only the flag was refused and
+  other ``data/`` writes were merely RECORDED, because three suites wrote live
+  ``data/`` through production code that hardcodes the path
+  (``test_monolith_kinect_overlay`` -> ``.hud_camera_preview_kinect.jpg``,
+  ``test_monolith_update_check`` -> ``update_check.json``,
+  ``test_monolith_sec6`` -> ``bug_reports.jsonl``). A whole-suite write audit
+  that day (an audit hook on every write plus a before/after hash of the
+  tree) found those three and eight more suites writing live ROOT state -
+  one of them CLAIMED the pending-speech queue a running JARVIS speaks from,
+  another deleted the printer overlay state. All were pointed at temp paths,
+  and the guard now refuses the whole class instead of recording it.
+
 WHAT IS DELIBERATELY *NOT* INTERCEPTED
 --------------------------------------
-``os.replace`` and ``open(..., "w")`` onto OTHER live ``data/`` files. Three
-suites do this today through production code that hardcodes the live path —
-``test_monolith_kinect_overlay`` (``.hud_camera_preview_kinect.jpg``),
-``test_monolith_update_check`` (``update_check.json``) and
-``test_monolith_sec6`` (``bug_reports.jsonl``). That is real debt (see
-``tests/test_staging_data_isolation.py``'s N-arg ratchet), but it is a
-DIFFERENT defect from the one that killed the flag, and blocking it here would
-turn three green suites red without protecting the flag any further. They are
-RECORDED in ``violations()`` instead, so the debt stays visible.
+Other files at the project root (source, ``.coverage``, a tool's own output),
+``logs/``, and the STAGING tree (``data_staging/``): a test writing those
+damages no live state. ``tests/test_live_data_guard.py`` pins the list.
 
 Escape hatch for a human deliberately driving live state:
 ``JARVIS_ALLOW_LIVE_DATA=1``. It is announced by ``banner()``, which
@@ -129,6 +140,28 @@ import traceback
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LIVE_DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 CLEAN_SHUTDOWN_FLAG = os.path.join(LIVE_DATA_DIR, "clean_shutdown.flag")
+
+# Live runtime-state files that sit at the PROJECT ROOT, outside data/, and are
+# bound to their writer's __file__ (so no JARVIS_DATA_DIR / JARVIS_STAGING
+# redirect reaches them). A 2026-09-30 write audit of the whole suite caught
+# tests writing each of the first seven on a real run - the queue a running
+# JARVIS speaks from (and one test CLAIMED it, stealing queued speech), the
+# overlay files the HUDs draw from, the owner's todo list, and the "morning
+# briefing already given" stamp. Writing, replacing onto, or deleting one is
+# REFUSED. Names only; add a file here when it becomes live root state.
+LIVE_ROOT_STATE_FILES = frozenset({
+    "pending_speech.json",
+    "pending_speech.json.consuming",
+    "air_cursor_state.json",
+    "bambu_overlay_state.json",
+    "morning_arrival_v2_state.json",
+    "notification_rules.json",
+    "jarvis_todo.md",
+    "unified_hud_state.json",
+    "hud_state.json",
+    "injected_commands.json",
+    "tray_commands.json",
+})
 
 # Scripts whose execution IS a live JARVIS, plus the LAUNCHERS that start one.
 #
@@ -292,6 +325,24 @@ def _under_live_data(path) -> bool:
     return bool(p) and (p == _LIVE_N or p.startswith(_LIVE_N + os.sep))
 
 
+_ROOT_N = os.path.normcase(os.path.abspath(PROJECT_ROOT))
+_LIVE_ROOT_STATE_N = frozenset(
+    os.path.normcase(os.path.join(_ROOT_N, n)) for n in LIVE_ROOT_STATE_FILES)
+
+
+def _is_live_root_state(path) -> bool:
+    """One of the named live runtime-state files at the PROJECT ROOT (see
+    LIVE_ROOT_STATE_FILES)."""
+    p = _norm(path)
+    return bool(p) and p in _LIVE_ROOT_STATE_N
+
+
+def _is_live_state(path) -> bool:
+    """Anything a test must never write or delete: the live ``data/`` tree
+    or a named live state file at the project root."""
+    return _under_live_data(path) or _is_live_root_state(path)
+
+
 def _is_clean_flag(path) -> bool:
     return _norm(path) == _FLAG_N
 
@@ -426,7 +477,7 @@ def _guard_delete(op: str, real):
     def wrapper(path, *a, **k):
         dir_fd = k.get("dir_fd")
         if dir_fd is None:
-            if _under_live_data(path):
+            if _is_live_state(path):
                 _refuse(op, str(path))
         # `path` is relative to an open DIRECTORY FD, not to the CWD, so
         # _under_live_data()'s os.path.abspath() would resolve it against the
@@ -445,7 +496,7 @@ def _guard_delete(op: str, real):
 
 def _guard_path_method(op: str, real):
     def wrapper(self, *a, **k):
-        if _under_live_data(self):
+        if _is_live_state(self):
             _refuse(op, str(self))
         return real(self, *a, **k)
     return _mark(wrapper, real)
@@ -453,10 +504,10 @@ def _guard_path_method(op: str, real):
 
 def _guard_move(op: str, real):
     def wrapper(src, dst, *a, **k):
-        if _is_clean_flag(dst) or _is_clean_flag(src):
+        # Onto live state is a write; OFF it is a delete (the pending-speech
+        # drain claims the queue by renaming it away).
+        if _is_live_state(dst) or _is_live_state(src):
             _refuse(op, f"{src} -> {dst}")
-        if _under_live_data(dst):
-            _record(op, f"{src} -> {dst}", False)
         return real(src, dst, *a, **k)
     return _mark(wrapper, real)
 
@@ -470,8 +521,12 @@ def _check_write(op: str, file) -> None:
         base = ""
     if base == "clean_shutdown.flag" and _is_clean_flag(file):
         _refuse(op, str(file))
-    elif base and _under_live_data(file):
-        _record(op, str(file), False)
+    elif base and (_under_live_data(file) or (
+            base in LIVE_ROOT_STATE_FILES and _is_live_root_state(file))):
+        # Since 2026-09-30 a REFUSAL, not a record: the three suites that used
+        # to write live data/ (and the eight that wrote live root state) now
+        # write temp paths - see the module docstring.
+        _refuse(op, str(file))
 
 
 def _guard_open(real):

@@ -770,23 +770,46 @@ def camera_gate_lift_quarantine(which: str = "") -> list:
     off USB the moment it starts streaming, retried only every half hour; the
     owner has seen to its power). ``which`` narrows it ("left", "right",
     "kinect", or part of a spoken label); empty lifts every such device.
-    Returns the spoken labels lifted. NEVER raises."""
+    Returns the spoken labels lifted; camera_gate_lift() says which hold each
+    one was on. NEVER raises."""
+    return [label for label, _states in camera_gate_lift(which)]
+
+
+def camera_gate_lift(which: str = "") -> list:
+    """camera_gate_lift_quarantine, answering WHICH hold was lifted per device:
+    ``[(spoken_label, states), ...]`` where ``states`` holds
+    core.camera_gate.LIFT_QUARANTINE ("quarantine") and/or LIFT_SLOW_RETRY
+    ("dies-on-open"). camera_unquarantine words its reply from it. NEVER
+    raises."""
     gate = _camera_gate
     if gate is None:
         return []
     try:
-        benched = dict(gate.quarantined() or {})
+        quarantined = dict(gate.quarantined() or {})
+        benched = dict(quarantined)
+        slow_keys: set = set()
         _slow = getattr(gate, "dies_on_open", None)
         if callable(_slow):
             for key, label in (_slow() or {}).items():
+                slow_keys.add(key)
                 benched.setdefault(key, label)
         want = str(which or "").strip().lower()
         lifted = []
+        _lift = getattr(gate, "lift", None)
         for key, label in benched.items():
             if want and want not in str(label).lower() and want not in key:
                 continue
-            if gate.lift_quarantine(key):
-                lifted.append(str(label))
+            if callable(_lift):
+                states = tuple(_lift(key) or ())
+            elif gate.lift_quarantine(key):
+                states = tuple(s for s, on in (("quarantine",
+                                                key in quarantined),
+                                               ("dies-on-open",
+                                                key in slow_keys)) if on)
+            else:
+                states = ()
+            if states:
+                lifted.append((str(label), states))
         return lifted
     except Exception:
         logging.exception("[camera-gate] could not lift a quarantine")
@@ -9556,6 +9579,14 @@ def find_camera_locking_processes() -> list[str]:
 # core/camera_gate.py. This function is still the ONE writer of
 # next_reopen_at; it now writes the gate's answer.
 CAMERA_REOPEN_BACKOFF_SEC     = 2.0    # floor: never re-ask faster than this
+# CEILING on the re-ASK (2026-09-30): the gate's wait can be half an hour (the
+# slow dies-on-open retry), ten minutes (a quarantine poll) or an hour (a storm
+# cool-down), and the producer used to sleep through all of it - so the
+# owner's "use the left webcam again" (camera_unquarantine) took effect only at
+# the next scheduled ask. Asking the gate once a minute costs a dict lookup and
+# opens nothing: the gate, not this spacing, still decides when the camera is
+# actually opened. Same rule as audio/kinect_bridge.py's _GATE_REASK_MAX_S.
+_FACE_TRACK_GATE_REASK_MAX_S  = 60.0
 # find_camera_locking_processes() walks every process, and the reopen path can
 # now ask up to once per backoff window per camera; a short shared TTL keeps
 # that off the face-track loop's critical path without ever serving an answer
@@ -9585,7 +9616,11 @@ def _schedule_camera_reopen(entry: dict, label: str, index,
                             ) -> tuple[float, list[str]]:
     """Arm this camera entry's next reopen attempt and say what was armed.
 
-    Returns ``(seconds_until_next_ask, lockers)``. Callers MUST NOT write
+    Returns ``(seconds_until_the_gate_allows_an_open, lockers)`` - what a log
+    line may promise. ``entry["next_reopen_at"]`` (the next ASK) is armed at
+    most _FACE_TRACK_GATE_REASK_MAX_S out, so an owner lift of a quarantine
+    or of the slow dies-on-open retry is seen within a minute; an earlier ask
+    is simply refused again by the gate. Callers MUST NOT write
     ``entry["next_reopen_at"]`` themselves - a second writer is exactly how the
     contention yield rotted. Both state transitions LOG once: entering the
     locked state, and leaving it again.
@@ -9632,7 +9667,8 @@ def _schedule_camera_reopen(entry: dict, label: str, index,
         print(f"  [face-track] {label} (index {index}) is no longer in use "
               f"by another app — next reopen attempt in {backoff:.0f}s "
               f"({reason}).{_cam_ms(now)}")
-    entry["next_reopen_at"] = now + backoff
+    entry["next_reopen_at"] = now + max(
+        CAMERA_REOPEN_BACKOFF_SEC, min(backoff, _FACE_TRACK_GATE_REASK_MAX_S))
     return backoff, list(lockers)
 
 
@@ -18644,7 +18680,12 @@ def _ltm_context(user_text: str) -> str:
 #     over for this reply (the tail goes through the normal speak path,
 #     which parses/strips those markers properly);
 #   * at most 2 sentences flush early — the rest is one coherent utterance
-#     via the normal path, so prosody isn't chopped into single lines.
+#     via the normal path, so prosody isn't chopped into single lines;
+#   * a pure ACKNOWLEDGEMENT ("Right away, sir.") never flushes on its own:
+#     it waits for the next sentence and is released with it, so one that
+#     is followed straight by an [ACTION:] marker is only voiced after the
+#     actions ran, and not at all when one failed (2026-09-30, see
+#     _drop_ack_before_failure).
 # Kill switch: STREAMING_TTS_ENABLED in core/config.py (user_settings.json
 # overridable). Everything in here is best-effort: a raise inside feed()
 # is swallowed (stream_text also guards on_delta) so a TTS hiccup can
@@ -18721,54 +18762,84 @@ class _SentenceFlushBuffer:
         except Exception:
             pass   # defensive belt on top of stream_text's own guard
 
+    def _piece_end(self, start: int = 0):
+        """End of the next flushable piece starting at ``start``: the first
+        sentence boundary with ≥2 words since ``start`` (a short fragment,
+        "Sir. ", waits and flushes together with the next sentence as one
+        piece). None when no such boundary has streamed yet."""
+        for m in _SENTENCE_BOUNDARY_RE.finditer(self._buf, start):
+            if len(self._buf[start:m.end()].split()) >= 2:
+                return m.end()
+        return None
+
     def _try_flush(self) -> None:
         while not self._stopped and self._flushed < self.MAX_EARLY_SENTENCES:
-            end = None
-            for m in _SENTENCE_BOUNDARY_RE.finditer(self._buf):
-                # Require ≥2 words up to this boundary; a short fragment
-                # ("Sir. ") waits and flushes together with the next
-                # sentence as one piece.
-                if len(self._buf[:m.end()].split()) >= 2:
-                    end = m.end()
+            # ACKNOWLEDGEMENT HOLD (2026-09-30): a pure acknowledgement
+            # ("Right away, sir.") is never voiced ON ITS OWN. It is released
+            # only together with the next, non-acknowledgement sentence, once
+            # that sentence has also passed the gates below. So "Right away,
+            # sir. [ACTION: x]" latches the '[' stop with the acknowledgement
+            # still unflushed: it rides the normal path, which runs after the
+            # actions and drops it when one failed (_drop_ack_before_failure).
+            pieces = []
+            start = 0
+            while True:
+                end = self._piece_end(start)
+                if end is None:
+                    return
+                piece = self._buf[start:end]
+                if self._gate_stops(piece):
+                    return
+                pieces.append(piece)
+                start = end
+                if not _is_confident_ack(piece):
                     break
-            if end is None:
-                return
-            piece = self._buf[:end]
-            # Hallucinated-claim gate: parse_and_run_actions' preemptive
-            # interceptor (_detect_preemptive_hallucination) runs AFTER the
-            # stream completes — but by then an early-flushed sentence has
-            # already been SPOKEN. A fabricated "running version 4.2.3" /
-            # "it's 1:47 AM" in the opening sentence would be voiced before
-            # the corrective [ACTION:] injection could replace it (live
-            # near-miss 2026-07-07, saved only by a leading [intent:] tag).
-            # So: any flush candidate matching a preemptive pattern latches
-            # the same permanent stop as '[' — the whole reply rides the
-            # normal path, where the interceptor speaks the TRUE value.
-            try:
-                if any(rx.search(piece) for rx, _a, _d
-                       in _PREEMPTIVE_HALLUCINATION_PATTERNS):
-                    self._stopped = True
-                    return
-                # A refusal of an explicit joke request is replaced by
-                # _joke_fallback_line downstream — don't voice it early.
-                if (_joke_fallback.looks_like_refusal(piece)
-                        and _joke_fallback.is_joke_request(_turn_user_text())):
-                    self._stopped = True
-                    return
-                # Likewise a dodged request for a suggestion ("A bold
-                # choice, sir") — _advice_fallback_line replaces or trims it.
-                if _advice_fallback.early_hold(piece, _turn_user_text()):
-                    self._stopped = True
-                    return
-            except Exception:
-                self._stopped = True   # fail closed: don't early-speak
-                return
-            self._buf = self._buf[end:]
-            self._flushed += 1
-            # Pass the RAW piece (not .strip()) so spoken_prefix — accumulated in
-            # _dispatch only for sentences actually voiced — stays an exact
+            need = 2 if len(pieces) > 1 else 1
+            if self._flushed + need > self.MAX_EARLY_SENTENCES:
+                return   # no room for acknowledgement + sentence: normal path
+            self._buf = self._buf[start:]
+            # Pass the RAW pieces (not .strip()) so spoken_prefix - accumulated
+            # in _dispatch only for sentences actually voiced - stays an exact
             # leading substring of the reply for _strip_stream_spoken_prefix.
-            self._dispatch(piece)
+            if len(pieces) > 1:
+                self._flushed += 1
+                self._dispatch("".join(pieces[:-1]))
+            self._flushed += 1
+            self._dispatch(pieces[-1])
+
+    def _gate_stops(self, piece: str) -> bool:
+        """The early-speech gates for one flush candidate. True - with the
+        permanent stop latched - when ``piece`` must not be voiced early."""
+        # Hallucinated-claim gate: parse_and_run_actions' preemptive
+        # interceptor (_detect_preemptive_hallucination) runs AFTER the
+        # stream completes — but by then an early-flushed sentence has
+        # already been SPOKEN. A fabricated "running version 4.2.3" /
+        # "it's 1:47 AM" in the opening sentence would be voiced before
+        # the corrective [ACTION:] injection could replace it (live
+        # near-miss 2026-07-07, saved only by a leading [intent:] tag).
+        # So: any flush candidate matching a preemptive pattern latches
+        # the same permanent stop as '[' — the whole reply rides the
+        # normal path, where the interceptor speaks the TRUE value.
+        try:
+            if any(rx.search(piece) for rx, _a, _d
+                   in _PREEMPTIVE_HALLUCINATION_PATTERNS):
+                self._stopped = True
+                return True
+            # A refusal of an explicit joke request is replaced by
+            # _joke_fallback_line downstream — don't voice it early.
+            if (_joke_fallback.looks_like_refusal(piece)
+                    and _joke_fallback.is_joke_request(_turn_user_text())):
+                self._stopped = True
+                return True
+            # Likewise a dodged request for a suggestion ("A bold
+            # choice, sir") — _advice_fallback_line replaces or trims it.
+            if _advice_fallback.early_hold(piece, _turn_user_text()):
+                self._stopped = True
+                return True
+        except Exception:
+            self._stopped = True   # fail closed: don't early-speak
+            return True
+        return False
 
     def _dispatch(self, piece: str) -> None:
         """Speak one flushed sentence off-thread. Chained on the previous
@@ -29956,10 +30027,10 @@ def _answer_first_audible_lead(text) -> str:
         return ""
 
 
-def _answer_first_is_ack(lead) -> bool:
+def _answer_first_is_ack(lead, extra_words=frozenset()) -> bool:
     """True when every clause of ``lead`` is a pure acknowledgement (see
-    _ANSWER_FIRST_ACK_WORDS). False for content, and for a lead with no
-    words at all. Never raises."""
+    _ANSWER_FIRST_ACK_WORDS, widened by ``extra_words``). False for content,
+    and for a lead with no words at all. Never raises."""
     try:
         text = str(lead or "").replace("’", "'")
         seen = False
@@ -29968,7 +30039,8 @@ def _answer_first_is_ack(lead) -> bool:
             if not words:
                 continue
             seen = True
-            if all(w in _ANSWER_FIRST_ACK_WORDS for w in words):
+            if all(w in _ANSWER_FIRST_ACK_WORDS or w in extra_words
+                   for w in words):
                 continue
             joined = " ".join(words)
             tail = None
@@ -29982,6 +30054,158 @@ def _answer_first_is_ack(lead) -> bool:
                 continue
             return False
         return seen
+    except Exception:
+        return False
+
+
+# ── No acknowledgement before a failed action (2026-09-30) ─────────────────
+# Live 2026-09-29 21:58: "send the robot exploring for a minute" -> the model
+# replied "[ACTION: <robot>_explore, 60] Right away, sir.", the action REFUSED,
+# and the owner heard "Right away, sir." and THEN the failure follow-up's "I'm
+# afraid the firmware isn't capable ...". A pure acknowledgement is a promise:
+# when an action of the same reply FAILED (the result the failure follow-up
+# loop re-prompts on) or REFUSED (an honest "I won't ..." voiced verbatim), the
+# leading acknowledgement is not voiced - like answer-first, only the audio
+# goes; the reply stays in conversation_history. Two halves:
+#   * _SentenceFlushBuffer never voices a pure acknowledgement ON ITS OWN while
+#     the reply streams: it is released only together with the next sentence,
+#     so an acknowledgement followed straight by an [ACTION:] marker (or by the
+#     end of the reply) reaches the normal speak path, which runs AFTER the
+#     actions, where _drop_ack_before_failure decides;
+#   * _run_llm_dispatch_body (and each follow-up round whose failure will still
+#     be reported) drops it when an action failed or refused.
+# An acknowledgement that DID stream early (released with a content sentence
+# before the marker) cannot be unsaid: _note_early_ack_before_failure logs it,
+# and the failure follow-up then reports what happened, as it always has.
+# Words a CONFIDENT acknowledgement uses beyond answer-first's lexicon:
+# "Consider it done", "As you wish", "Will do", "Straight away", "Coming right
+# up", "Yes, sir", "All set", "Gladly".
+_CONFIDENT_ACK_EXTRA_WORDS = frozenset("""
+    all as coming consider do doing done gladly immediately set straight wish
+    yes
+""".split())
+# An honest refusal voiced verbatim that is deliberately NOT a FAILURE_MARKERS
+# failure (core/failure_markers.py excludes "won't" on purpose).
+_ACK_REFUSAL_MARKERS = ("won't", "will not", "cannot", "unable to",
+                        "not capable", "isn't capable", "not supported")
+# One sentence: up to terminal punctuation followed by whitespace / the end.
+_ACK_SENTENCE_RE = re.compile(r"\S.*?(?:[.!?]+(?=\s|$)|$)", re.S)
+
+
+def _is_confident_ack(text) -> bool:
+    """True when ``text`` is a pure acknowledgement ("Right away, sir.",
+    "Consider it done.", "On it."): answer-first's test widened by
+    _CONFIDENT_ACK_EXTRA_WORDS, never with a digit or a question mark.
+    Never raises."""
+    try:
+        s = str(text or "")
+        if "?" in s or _ANSWER_FIRST_DIGIT_RE.search(s):
+            return False
+        # "I'm afraid ..." is answer-first's acknowledgement, but it is the
+        # opening of a refusal, not a promise: never held back or dropped.
+        if "afraid" in _pf_mod.normalise_line(s.replace("’", "'")).split():
+            return False
+        return _answer_first_is_ack(s, _CONFIDENT_ACK_EXTRA_WORDS)
+    except Exception:
+        return False
+
+
+def _action_result_failed(result) -> bool:
+    """THE failure test of the follow-up loop (its _is_failure delegates
+    here): the result carries a FAILURE_MARKERS substring, case-insensitive.
+    Never raises."""
+    try:
+        if not isinstance(result, str):
+            return False
+        low = result.lower()
+        return any(m.lower() in low for m in FAILURE_MARKERS)
+    except Exception:
+        return False
+
+
+def _failed_or_refused_actions(action_results) -> list:
+    """Names of the real actions in ``action_results`` (name, result, info)
+    that FAILED (reported by the failure follow-up loop) or REFUSED (a
+    verbatim-voiced result carrying an _ACK_REFUSAL_MARKERS phrase). Synthetic
+    ("_"-prefixed), self-voiced and deliberately deferred results (pushback,
+    confirmation, ambiguity) are not counted. Never raises."""
+    out: list = []
+    try:
+        for name, result, _info in action_results or ():
+            n = str(name or "").strip().lower()
+            if not n or n.startswith("_") or is_self_voiced(n):
+                continue
+            if not isinstance(result, str) or result.startswith(
+                    _ANSWER_FIRST_DEFERRED_PREFIXES):
+                continue
+            if _action_result_failed(result):
+                out.append(n)
+                continue
+            text = _verbatim_result_text(n, result).lower()
+            if text and any(m in text for m in _ACK_REFUSAL_MARKERS):
+                out.append(n)
+    except Exception:
+        return out
+    return out
+
+
+def _drop_ack_before_failure(text, action_results) -> tuple:
+    """``(text, words_dropped)``: ``text`` without its leading pure-
+    acknowledgement sentence(s) when an action in ``action_results`` failed
+    or refused (see the section comment); unchanged otherwise. Leading
+    [intent:] / [mood:] / [wry] tags stay on whatever remains; an
+    all-acknowledgement text becomes "". Never raises."""
+    try:
+        s = str(text or "")
+        if not s.strip() or not _failed_or_refused_actions(action_results):
+            return text, 0
+        tags = ""
+        while True:
+            m = (_INTENT_TAG_RE.match(s) or _MOOD_TAG_RE.match(s)
+                 or _ANSWER_FIRST_WRY_TAG_RE.match(s))
+            if not m:
+                break
+            tags += s[:m.end()]
+            s = s[m.end():]
+        body = s.lstrip()
+        dropped = 0
+        while body:
+            m = _ACK_SENTENCE_RE.match(body)
+            sentence = m.group(0) if m else body
+            if not _is_confident_ack(sentence):
+                break
+            dropped += len(sentence.split())
+            body = body[len(sentence):].lstrip()
+        if not dropped:
+            return text, 0
+        if not body.strip():
+            return "", dropped
+        return tags + body, dropped
+    except Exception:
+        return text, 0
+
+
+def _note_early_ack_before_failure(action_results) -> bool:
+    """Log - honestly - when this reply's acknowledgement was ALREADY voiced
+    by the streaming flush (released together with a content sentence before
+    the [ACTION:] marker) and an action then failed or refused. It cannot be
+    unsaid; the failure follow-up reports what happened. True when it logged.
+    Never raises."""
+    try:
+        prefix = _stream_spoken_prefix[0]
+        if not prefix:
+            return False
+        m = _ACK_SENTENCE_RE.match(prefix.lstrip())
+        first = m.group(0) if m else ""
+        if not first or not _is_confident_ack(first):
+            return False
+        failed = _failed_or_refused_actions(action_results)
+        if not failed:
+            return False
+        print(f"  [ack-hold] '{first.strip()}' was already voiced while the "
+              f"reply streamed; {', '.join(failed)} then failed - the "
+              f"follow-up reports it")
+        return True
     except Exception:
         return False
 
@@ -34151,6 +34375,20 @@ def _run_llm_dispatch_body(text: str) -> str:
     if spoken_text and not _barged and not _stream_spoken_prefix[0]:
         _af_words = _answer_first_drop_count(
             reply, spoken_text, action_results, _answer_first_filler_state())
+    # No "Right away, sir." before a refusal (2026-09-30): an action of this
+    # reply failed or refused, so a leading pure acknowledgement is not voiced
+    # - the failure follow-up below says what happened. The streaming flush
+    # holds a lone acknowledgement back, so by now it has not been voiced;
+    # when one streamed early anyway, say so in the log.
+    # See _drop_ack_before_failure.
+    if spoken_text and not _af_words and not _self_voiced_only:
+        spoken_text, _ack_cut = _drop_ack_before_failure(spoken_text,
+                                                         action_results)
+        if _ack_cut:
+            print(f"  [ack-hold] dropped the acknowledgement ({_ack_cut} "
+                  f"words): an action in this reply failed")
+    if not _self_voiced_only:
+        _note_early_ack_before_failure(action_results)
     if _af_words:
         print(f"  [answer-first] dropped lead-in ({_af_words} words)")
         _tt("note_lead_dropped")
@@ -34177,10 +34415,10 @@ def _run_llm_dispatch_body(text: str) -> str:
     # action (e.g. screenshot → see_screen → final answer).
     # Also auto-trigger follow-up for any FAILED action so failures
     # don't go silently unreported to the user.
-    FAIL_MARKERS = FAILURE_MARKERS  # canonical list — see core/failure_markers.py
+    # canonical list — core/failure_markers.py, via _action_result_failed (the
+    # acknowledgement drop above asks the same question).
     def _is_failure(result: str) -> bool:
-        lower = result.lower()
-        return any(m.lower() in lower for m in FAIL_MARKERS)
+        return _action_result_failed(result)
 
     current_results = action_results
     _chain_seen: set[str] = set()   # loop-break: actions already fired this chain
@@ -34277,6 +34515,18 @@ def _run_llm_dispatch_body(text: str) -> str:
         f_spoken, current_results = parse_and_run_actions(followup)
         if not current_results:
             f_spoken = _strip_ack_preface(f_spoken, text)
+        elif (depth + 1 < _max_followup and not (
+                {(n, r) for (n, r, _i) in current_results
+                 if not is_self_voiced(n) and _is_failure(r)}
+                & _failed_seen)):
+            # Same rule as the first reply, but only while the next round
+            # will still REPORT the failure: a pair already seen this chain
+            # stops the loop above, and then this line is all that is said.
+            f_spoken, _ack_cut = _drop_ack_before_failure(f_spoken,
+                                                          current_results)
+            if _ack_cut:
+                print(f"  [ack-hold] dropped the follow-up's acknowledgement "
+                      f"({_ack_cut} words): an action in it failed")
         f_spoken = _apply_quip_layer(f_spoken, current_results)
         # Append follow-up to history so context carries forward
         conversation_history.append({"role": "assistant", "content": followup})

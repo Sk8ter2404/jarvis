@@ -566,7 +566,15 @@ class ConditionRegistryTests(SchedulerTestBase):
 # ── built-in condition predicates ───────────────────────────────────
 class BuiltinConditionTests(SchedulerTestBase):
     def _write_overlay(self, payload):
-        path = os.path.join(sched._PROJECT_DIR, "bambu_overlay_state.json")
+        # The bambu conditions read <_PROJECT_DIR>/bambu_overlay_state.json -
+        # the LIVE printer overlay state bambu_monitor writes. This fixture
+        # used to write that very file and then DELETE it in cleanup (found
+        # 2026-09-30 by a write audit), so point the conditions at a temp
+        # project dir instead.
+        p = mock.patch.object(sched, "_PROJECT_DIR", self._tmp)
+        p.start()
+        self.addCleanup(p.stop)
+        path = os.path.join(self._tmp, "bambu_overlay_state.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f)
         self.addCleanup(lambda: os.path.exists(path) and os.remove(path))

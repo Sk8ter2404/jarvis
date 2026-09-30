@@ -162,6 +162,7 @@ __all__ = [
     "STORM_PROBATION_S", "REOPEN_PROBATION_S", "CULPRIT_WINDOW_S",
     "CULPRIT_THRESHOLD", "DIES_ON_OPEN_WINDOW_S", "DIES_ON_OPEN_COUNT",
     "DIES_ON_OPEN_RETRY_S", "DIES_ON_OPEN_RETRY_MAX_S",
+    "LIFT_QUARANTINE", "LIFT_SLOW_RETRY",
 ]
 
 # ── the numbers (the three owner knobs are in core/config.py) ──────────────
@@ -253,6 +254,9 @@ TIMING_REASONS = frozenset({"min-gap", "stagger", "in-flight"})
 # Refusals that mean "the device is being protected - do not open it now".
 HOLD_REASONS = frozenset({"quarantined", "usb-storm", "wedged", "absent",
                           "settling", "held", "locked", "backoff"})
+# What CameraGate.lift() can lift (the owner's "use the Kinect again").
+LIFT_QUARANTINE = "quarantine"      # the culprit quarantine (hub knocked out)
+LIFT_SLOW_RETRY = "dies-on-open"    # the slow dies-on-open retry (R11)
 
 
 class Decision(NamedTuple):
@@ -1268,28 +1272,37 @@ class CameraGate:
         starts from zero - and/or one on the slow DIES-ON-OPEN retry (its
         power has been seen to), whose run is cleared and whose long hold is
         dropped so it may be opened at once. True iff either was lifted.
-        NEVER raises."""
+        NEVER raises. :meth:`lift` says WHICH was lifted."""
+        return bool(self.lift(key, now))
+
+    def lift(self, key: str, now: "float | None" = None) -> tuple:
+        """:meth:`lift_quarantine`, answering WHICH hold it lifted: a tuple of
+        LIFT_QUARANTINE ("quarantine") and/or LIFT_SLOW_RETRY
+        ("dies-on-open"), in that order; () when neither was set. The owner's
+        reply depends on it - a quarantine is switched off again if the hub
+        drops out, a slow retry goes back to half-hourly if the device still
+        dies on open. NEVER raises."""
         try:
             now = self._clock() if now is None else now
             lines: list = []
             with self._lock:
                 r = self._dev.get(key)
                 if r is None:
-                    return False
-                lifted = False
+                    return ()
+                lifted: list = []
                 if r["doo_retry_s"] > 0.0 or r["doo_count"]:
                     slow = r["doo_retry_s"] > 0.0
                     r["doo_count"] = 0
                     r["doo_retry_s"] = 0.0
                     if slow:
-                        lifted = True
+                        lifted.append(LIFT_SLOW_RETRY)
                         r["hold_until"] = 0.0
                         lines.append(
                             f"  [camera-gate] {key}: the owner asked to use it "
                             f"again - the slow dies-on-open retry is cleared; "
                             f"it may be opened now (through the usual gate).")
                 if r["quarantined"]:
-                    lifted = True
+                    lifted.insert(0, LIFT_QUARANTINE)
                     r["quarantined"] = False
                     r["quarantined_at"] = 0.0
                     r["quarantine_why"] = ""
@@ -1300,9 +1313,9 @@ class CameraGate:
                         f"may be opened again (through the usual gate, one "
                         f"device at a time).")
             self._emit(lines, [])
-            return lifted
+            return tuple(lifted)
         except Exception:
-            return False
+            return ()
 
     def recent_success(self, key: str, component: str, within_s: float,
                        now: "float | None" = None) -> "float | None":

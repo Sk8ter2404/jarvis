@@ -11,6 +11,9 @@ the light CI tier.
 """
 from __future__ import annotations
 
+import os
+import shutil
+import tempfile
 import unittest
 from unittest import mock
 
@@ -19,6 +22,21 @@ from tests._monolith_harness import MonolithGlobalsTestCase, requires_monolith
 
 @requires_monolith
 class UpdateCheckThreadTests(MonolithGlobalsTestCase):
+    def setUp(self):
+        super().setUp()
+        # boot_nudge stamps ``nudged_for`` into the update cache after an
+        # announcement, and the cache path is bound to core/update_checker's
+        # __file__ (no env redirect reaches it): without this the second test
+        # REWROTE the live data/update_check.json on every run (found
+        # 2026-09-30 by a write audit).
+        tmp = tempfile.mkdtemp(prefix="jarvis_update_check_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.cache = os.path.join(tmp, "update_check.json")
+        p = mock.patch("core.update_checker.default_cache_path",
+                       return_value=self.cache)
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_no_update_is_silent(self):
         with mock.patch.object(self.bc.time, "sleep", lambda *_a, **_k: None), \
              mock.patch("core.update_checker.cached_check",
@@ -37,6 +55,11 @@ class UpdateCheckThreadTests(MonolithGlobalsTestCase):
         pa.assert_called_once()
         self.assertIn("v1.3.0", pa.call_args.args[0])
         self.assertEqual(pa.call_args.kwargs.get("source"), "update_check")
+        # The stamp landed in the temp cache - proof the redirect is real.
+        from core import update_checker
+        self.assertEqual(
+            (update_checker.read_cache(self.cache) or {}).get("nudged_for"),
+            "v1.3.0")
 
 
 if __name__ == "__main__":

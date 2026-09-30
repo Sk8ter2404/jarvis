@@ -176,6 +176,20 @@ class _StormBase(MonolithGlobalsTestCase):
         self.gate = _mk(clock=self.clock.time) if _mk else None
         self.spoken: list = []
         self.lockers = lambda: []
+        # A storm trip SPEAKS: the gate's announce is _usb_storm_announce ->
+        # proactive_announce, which writes the LIVE project-root
+        # pending_speech.json (it is bound to the monolith's __file__, so no
+        # env redirect reaches it). Tests that assert on the line patch
+        # proactive_announce themselves, inside this default; any other trip
+        # lands here instead of in the owner's queue (found 2026-09-30 by a
+        # write audit: three storm tests queued real announcements).
+        self.stray_announcements: list = []
+        _pa = mock.patch.object(
+            bc, "proactive_announce",
+            side_effect=lambda m, *a, **k:
+            self.stray_announcements.append(m) or True)
+        _pa.start()
+        self.addCleanup(_pa.stop)
 
     def _producer(self, cams, *, iterations, opener=None, step=None,
                   bounded_real=False, backend=None):

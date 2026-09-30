@@ -1215,3 +1215,93 @@ class FdRelativeDeleteTests(unittest.TestCase):
                 os.rmdir(name, dir_fd=fd)
         finally:
             os.close(fd)
+
+
+class LiveStateWriteTests(unittest.TestCase):
+    """2026-09-30: writes to live ``data/`` and to the named live ROOT state
+    files are REFUSED, not recorded.
+
+    A whole-suite write audit (an audit hook on every write, plus a
+    before/after hash of the tree) caught tests writing the live
+    ``data/update_check.json``, ``data/bug_reports.jsonl``, the Kinect preview
+    JPEG, the project-root ``pending_speech.json`` (one test CLAIMED it -
+    renamed it to ``.consuming`` and spoke it), ``air_cursor_state.json``,
+    ``bambu_overlay_state.json`` (written, then DELETED), ``jarvis_todo.md``,
+    ``morning_arrival_v2_state.json``, ``notification_rules.json`` and
+    ``unified_hud_state.json``. Every probe below is harmless if the guard has
+    regressed: write-only opens WITHOUT O_CREAT / O_TRUNC (a regression opens
+    and closes an existing file unchanged, or raises FileNotFoundError), and
+    renames whose source does not exist."""
+
+    _AUDITED = ("pending_speech.json", "pending_speech.json.consuming",
+                "air_cursor_state.json", "bambu_overlay_state.json",
+                "morning_arrival_v2_state.json", "notification_rules.json",
+                "jarvis_todo.md", "unified_hud_state.json")
+
+    def setUp(self):
+        if not live_data_guard._INSTALLED:
+            self.skipTest("live-data guard not installed")
+
+    def _probe_open(self, path):
+        fd = os.open(path, os.O_WRONLY)       # no O_CREAT, no O_TRUNC
+        os.close(fd)
+
+    def test_every_audited_root_file_is_listed(self):
+        self.assertTrue(set(self._AUDITED)
+                        <= set(live_data_guard.LIVE_ROOT_STATE_FILES))
+
+    def test_a_write_to_a_live_root_state_file_is_refused(self):
+        for name in sorted(live_data_guard.LIVE_ROOT_STATE_FILES):
+            path = os.path.join(live_data_guard.PROJECT_ROOT, name)
+            with self.subTest(name=name):
+                with self.assertRaises(live_data_guard.LiveDataGuardError):
+                    self._probe_open(path)
+
+    def test_replacing_onto_or_off_a_live_root_state_file_is_refused(self):
+        missing = os.path.join(tempfile.gettempdir(),
+                               "__jarvis_guard_probe_missing__.json")
+        live = os.path.join(live_data_guard.PROJECT_ROOT, "pending_speech.json")
+        with self.assertRaises(live_data_guard.LiveDataGuardError):
+            os.replace(missing, live)
+        self.assertTrue(live_data_guard._is_live_state(live + ".consuming"))
+        # OFF it: the pending-speech drain's claim. Aimed at a SOURCE that is
+        # live state; with the guard gone this would move a real queue, so
+        # only the predicate is asserted for that direction.
+        self.assertTrue(live_data_guard._is_live_state(live))
+
+    def test_any_write_under_live_data_is_refused(self):
+        path = os.path.join(live_data_guard.LIVE_DATA_DIR,
+                            "__guard_probe_does_not_exist__.json")
+        with self.assertRaises(live_data_guard.LiveDataGuardError):
+            self._probe_open(path)
+        with self.assertRaises(live_data_guard.LiveDataGuardError):
+            os.replace(os.path.join(tempfile.gettempdir(),
+                                    "__jarvis_guard_probe_missing__.json"),
+                       path)
+
+    def test_unlisted_root_files_and_the_staging_tree_are_not_refused(self):
+        for rel in ("__guard_probe_unlisted__.json",
+                    os.path.join("data_staging", "hud_state.json.__probe__"),
+                    os.path.join("logs", "__guard_probe__.log")):
+            path = os.path.join(live_data_guard.PROJECT_ROOT, rel)
+            with self.subTest(rel=rel):
+                with self.assertRaises(OSError):   # FileNotFoundError, no refusal
+                    self._probe_open(path)
+        self.assertFalse(live_data_guard._is_live_state(
+            os.path.join(tempfile.gettempdir(), "pending_speech.json")))
+
+    def test_every_listed_file_is_still_live_state_in_the_source(self):
+        # A name nothing writes any more is dead weight; a renamed file is a
+        # hole. Each listed file must still be named by production source.
+        names = {n.replace(".consuming", "")
+                 for n in live_data_guard.LIVE_ROOT_STATE_FILES}
+        seen = set()
+        for path in _py_files(_PROJECT_ROOT):
+            rel = os.path.relpath(path, _PROJECT_ROOT)
+            if rel.split(os.sep)[0] in ("tests", ".claude", "backups"):
+                continue
+            src = _source(path)
+            seen |= {n for n in names if n in src}
+            if seen == names:
+                break
+        self.assertEqual(names - seen, set())

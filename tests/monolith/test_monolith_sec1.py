@@ -3375,11 +3375,19 @@ class DispatchTrayCommandEdgeTests(_MonolithTestBase):
     def test_open_hud_enables_flag_when_disabled(self):
         # HUD_ENABLED False → the `if not HUD_ENABLED: HUD_ENABLED = True` body
         # (2590-2591) runs before relaunch. mock.patch.object restores the flag.
+        # The show-HUD action it delegates to also clears the ✕ latch in the
+        # LIVE project-root unified_hud_state.json (bound to core/actions.py's
+        # __file__) - stubbed so a running HUD is never touched (found
+        # 2026-09-30 by a write audit).
+        import core.actions as _actions
         with mock.patch.object(self.bc, "HUD_ENABLED", False), \
              mock.patch.object(self.bc, "_shutdown_hud"), \
-             mock.patch.object(self.bc, "_launch_hud"):
+             mock.patch.object(self.bc, "_launch_hud"), \
+             mock.patch.object(_actions, "_set_unified_hud_hidden",
+                               return_value=True) as latch:
             self.bc._dispatch_tray_command("open_hud", {})
             self.assertTrue(self.bc.HUD_ENABLED)
+        latch.assert_called_once_with(False)
 
     def test_restart_action_failure_swallowed(self):
         with mock.patch.object(self.bc, "_act_restart",
@@ -3611,15 +3619,17 @@ class StreamingTtsTests(_MonolithTestBase):
 
     def test_flush_buffer_hard_stop_is_permanent(self):
         # A sentence flushed BEFORE the '[' stands; everything after — even
-        # bracket-free complete sentences — is never early-spoken.
+        # bracket-free complete sentences — is never early-spoken. (A content
+        # sentence: a lone pure acknowledgement such as "Right away, sir." is
+        # held back since 2026-09-30 - test_monolith_ack_before_failure.py.)
         spoken = []
         buf = self._make_buffer(spoken)
         with mock.patch.object(self.bc, "threading", self._inline_threading()):
-            buf.feed("Right away, sir. ")
+            buf.feed("Opening the page now, sir. ")
             buf.feed("[ACTION: open_url example.com] ")
             buf.feed("Done now. Plenty more words here. ")
-        self.assertEqual(spoken, ["Right away, sir."])
-        self.assertEqual(buf.spoken_prefix, "Right away, sir. ")
+        self.assertEqual(spoken, ["Opening the page now, sir."])
+        self.assertEqual(buf.spoken_prefix, "Opening the page now, sir. ")
 
     def test_flush_buffer_feed_swallows_speak_exceptions(self):
         def _boom(_):

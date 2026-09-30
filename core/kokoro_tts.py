@@ -168,6 +168,15 @@ def _engine():
             return _ENGINE[0]
         if _FAILED[0]:
             return None
+        # phonemizer's "words count mismatch on 100.0% of the lines (1/1)"
+        # warning fires on nearly every line this engine renders; drop ONLY
+        # that message (core/log_filters.py). Before the engine exists, so
+        # its very first line is already quiet.
+        try:
+            from core.log_filters import install_phonemizer_filter
+            install_phonemizer_filter()
+        except Exception:
+            pass
         try:
             if not _models_present():
                 raise FileNotFoundError(f"kokoro model missing: {_MODEL}")

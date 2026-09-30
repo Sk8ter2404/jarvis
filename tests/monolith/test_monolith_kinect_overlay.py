@@ -26,11 +26,48 @@ mocked, or a temp path is used).
 """
 from __future__ import annotations
 
+import os
+import shutil
+import tempfile
 import types
 import unittest
 from unittest import mock
 
-from tests._monolith_harness import MonolithGlobalsTestCase, requires_monolith
+from tests._monolith_harness import (MONOLITH_AVAILABLE,
+                                     MonolithGlobalsTestCase, load_monolith,
+                                     requires_monolith)
+
+# Every _compose_kinect_preview also PUBLISHES the Kinect tile through
+# _hud_percam_preview_write, whose path is bound to the monolith's __file__ -
+# the LIVE data/.hud_camera_preview_kinect.jpg the web Camera tab serves (no env
+# redirect reaches it; found 2026-09-30 by a write audit). Point the preview
+# files at a temp dir for the whole module.
+_PREVIEW_FIXTURE: list = []
+
+
+def setUpModule() -> None:
+    if not MONOLITH_AVAILABLE:
+        return
+    bc = load_monolith()
+    tmp = tempfile.mkdtemp(prefix="jarvis_kinect_preview_")
+    _PREVIEW_FIXTURE.append(tmp)
+    for p in (mock.patch.object(
+                  bc, "_hud_percam_preview_file",
+                  lambda key: os.path.join(tmp,
+                                           f".hud_camera_preview_{key}.jpg")),
+              mock.patch.object(bc, "_HUD_CAM_PREVIEW_FILE",
+                                os.path.join(tmp, ".hud_camera_preview.jpg"))):
+        p.start()
+        _PREVIEW_FIXTURE.append(p)
+
+
+def tearDownModule() -> None:
+    while _PREVIEW_FIXTURE:
+        item = _PREVIEW_FIXTURE.pop()
+        if isinstance(item, str):
+            shutil.rmtree(item, True)
+        else:
+            item.stop()
 
 
 def _np():

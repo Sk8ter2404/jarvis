@@ -70,6 +70,13 @@ class _Base(MonolithGlobalsTestCase):
         self.addCleanup(lambda: os.path.isdir(self.tmp) and os.rmdir(self.tmp))
         self._p(bc, "OVERNIGHT_FLAG_FILE",
                 os.path.join(self.tmp, "no_such_overnight_flag.json"))
+        # _capture_utterance drains the pending-speech queue first: without
+        # this it CLAIMED the LIVE project-root pending_speech.json (renamed to
+        # .consuming and spoke it) - a running JARVIS's queued announcements
+        # (found 2026-09-30 by a write audit). An absent temp queue: nothing
+        # is drained and nothing is created.
+        self._p(bc, "PENDING_SPEECH_PATH",
+                os.path.join(self.tmp, "no_such_pending_speech.json"))
         # The device body of play_with_lipsync: a fake 1.6 s playback that
         # holds until the capture has heard it (when a test asks for that).
         self.playing = threading.Event()

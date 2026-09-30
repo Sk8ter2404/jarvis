@@ -499,7 +499,10 @@ class TurnLineTests(_Base):
         self.timing.begin("inject")
         self.timing.mark("you")
         buf = bc._SentenceFlushBuffer()
-        self._quiet(buf.feed, "Right away, sir, checking now. ")
+        # A content sentence: a lone pure acknowledgement ("Right away, sir,
+        # checking now.") is held back until the next sentence since
+        # 2026-09-30 (tests/monolith/test_monolith_ack_before_failure.py).
+        self._quiet(buf.feed, "The report is on screen now, sir. ")
         buf.join(5)
         self.assertEqual(self.played, [24000])
         d = self.tt.parse_line(self.timing.emit())

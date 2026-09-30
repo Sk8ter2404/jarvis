@@ -197,10 +197,22 @@ class VerbatimAnswerFirstTests(_Base):
         self.assertEqual(self.spoken, [lead, _ANSWER])
 
     def test_failed_verbatim_result_keeps_lead(self):
-        self.bc.ACTIONS["weather_briefing"] = (
-            lambda a="": "could not reach the weather service")
-        self._run(f"{_LEAD} [ACTION: weather_briefing]")
-        self.assertEqual(self.spoken[0], _LEAD)
+        # A failed result is no answer, so ANSWER-FIRST keeps the lead-in.
+        # Since 2026-09-30 a pure acknowledgement before a FAILED action is
+        # not voiced anyway - by the other rule (tests/monolith/
+        # test_monolith_ack_before_failure.py) - and the failure follow-up
+        # speaks instead; answer-first itself still does not fire.
+        bc = self.bc
+        failed = "could not reach the weather service"
+        bc.ACTIONS["weather_briefing"] = lambda a="": failed
+        self.assertEqual(bc._answer_first_drop_count(
+            f"{_LEAD} [ACTION: weather_briefing]", _LEAD,
+            [("weather_briefing", failed, False)], "fired"), 0)
+        self.followup.side_effect = ["The weather service is down, sir.", ""]
+        printed = self._run(f"{_LEAD} [ACTION: weather_briefing]")
+        self.assertNotIn("[answer-first]", printed)
+        self.assertIn("[ack-hold]", printed)
+        self.assertEqual(self.spoken, ["The weather service is down, sir."])
 
     def test_blank_verbatim_result_keeps_lead(self):
         # "A non-empty spoken result": whitespace is no answer.

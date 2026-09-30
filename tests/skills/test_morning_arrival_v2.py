@@ -66,6 +66,13 @@ class MorningArrivalV2Tests(unittest.TestCase):
     def setUp(self):
         self.mod, self.actions = load_skill_isolated("morning_arrival_v2")
         self.addCleanup(lambda: self.mod._presence_first_seen_at.__setitem__(0, 0.0))
+        # A suppressed arrival still MARKS today as fired (_mark_fired), and
+        # _STATE_FILE is the LIVE project-root morning_arrival_v2_state.json:
+        # one test run silenced the owner's real morning briefing for the day
+        # (found 2026-09-30 by a write audit). Keep the state in a temp dir.
+        self.tmp = tempfile.mkdtemp(prefix="arrv2_tests_")
+        self.addCleanup(lambda: _rmtree(self.tmp))
+        self.mod._STATE_FILE = os.path.join(self.tmp, "state.json")
 
     # ── _within_morning_window (pure-ish) ────────────────────────────────
     def test_within_morning_window(self):

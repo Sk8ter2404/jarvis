@@ -519,34 +519,114 @@ def _quarantined_labels() -> list:
 
 # ─── action: camera_unquarantine ─────────────────────────────────────────
 
+def _slow_retry_labels() -> list:
+    """Spoken labels of every camera the camera gate has put on the slow
+    DIES-ON-OPEN retry (v2.0.137), in a stable order. NEVER raises."""
+    try:
+        bc = _bc()
+        fn = getattr(bc, "get_camera_gate_status", None) if bc else None
+        if not callable(fn):
+            return []
+        s = (fn() or {}).get("dies_on_open") or {}
+        return [str((v or {}).get("label") or k) for k, v in sorted(s.items())]
+    except Exception:
+        return []
+
+
+def _slow_retry_phrase(bc) -> str:
+    """'every thirty minutes' - the base slow-retry interval a device goes
+    back to after a lift (its run starts from zero). NEVER raises."""
+    try:
+        from core.camera_gate import DIES_ON_OPEN_RETRY_S, minutes_phrase
+        secs = float(getattr(bc, "CAMERA_DIES_ON_OPEN_RETRY_S",
+                             DIES_ON_OPEN_RETRY_S) or DIES_ON_OPEN_RETRY_S)
+        return "every " + minutes_phrase(secs)
+    except Exception:
+        return "only now and then"
+
+
+def _lift_reply(lifted: list, bc) -> str:
+    """The spoken reply for ``[(label, states), ...]`` - one sentence per
+    hold that was lifted, so the owner hears WHICH one: the culprit
+    QUARANTINE (the hub kept dropping out) and/or the slow DIES-ON-OPEN retry
+    (the device fell off USB whenever it started streaming)."""
+    names = [label for label, _s in lifted]
+    quarantined = [label for label, s in lifted if "quarantine" in s]
+    slow = [label for label, s in lifted if "dies-on-open" in s]
+    # Pronouns when a sentence is about everything lifted; names when the
+    # reply covers both holds on different cameras.
+    q_all = sorted(quarantined) == sorted(names)
+    s_all = sorted(slow) == sorted(names)
+
+    def _obj(group: list) -> str:
+        return "it" if len(group) == 1 else "them"
+
+    one = len(names) == 1
+    parts = [f"Understood, sir - {' and '.join(names)} "
+             f"{'is' if one else 'are'} back in use."]
+    if quarantined:
+        who = _obj(quarantined) if q_all else " and ".join(quarantined)
+        parts.append(f"I'll bring {who} up one at a time, and if the hub "
+                     f"drops out again I'll switch {_obj(quarantined)} off "
+                     f"again.")
+    if slow:
+        single = len(slow) == 1
+        pron = "it" if single else "they"
+        subj = pron if s_all else " and ".join(slow)
+        parts.append(
+            f"{subj[:1].upper()}{subj[1:]} {'was' if single else 'were'} on "
+            f"the slow retry for dropping off USB the moment {pron} started "
+            f"streaming, so I'll try {_obj(slow)} now; if {pron} still "
+            f"{'drops' if single else 'drop'} off, I'll go back to retrying "
+            f"{_obj(slow)} {_slow_retry_phrase(bc)}.")
+    return " ".join(parts)
+
+
 def camera_unquarantine(arg: str = "") -> str:
-    """Lift the camera gate's session quarantine - the owner has moved the
-    camera to another USB port. ``arg`` narrows it ("left", "right",
-    "kinect"); empty lifts every quarantined camera. NEVER raises."""
+    """Lift what the camera gate is holding a camera back with - the owner has
+    seen to it. Two holds: the session QUARANTINE (its stream start kept
+    knocking the USB hub offline; it has been moved to another port) and the
+    slow DIES-ON-OPEN retry (v2.0.137: it dropped off USB the moment it started
+    streaming; its power has been seen to). The reply says which one was
+    lifted. ``arg`` narrows it ("left", "right", "kinect"); empty lifts every
+    held camera. NEVER raises."""
     bc = _bc()
+    detailed = getattr(bc, "camera_gate_lift", None) if bc else None
     fn = getattr(bc, "camera_gate_lift_quarantine", None) if bc else None
-    if not callable(fn):
+    if not callable(detailed) and not callable(fn):
         return "I can't reach the camera gate right now, sir."
     try:
-        lifted = list(fn(str(arg or "").strip()) or [])
+        if callable(detailed):
+            lifted = [(str(label), tuple(states or ()))
+                      for label, states in (detailed(str(arg or "").strip())
+                                            or [])]
+        else:
+            # An older monolith: labels only, so the hold is unknown.
+            lifted = [(str(label), ())
+                      for label in (fn(str(arg or "").strip()) or [])]
     except Exception:
         lifted = []
     if not lifted:
         still = _quarantined_labels()
-        if still:
-            one = len(still) == 1
-            line = (f"{' and '.join(still)} {'is' if one else 'are'} the only "
-                    f"camera{'' if one else 's'} switched off, sir - say 'use "
-                    f"{still[0]} again' to put {'it' if one else 'them'} back.")
+        slow = [s for s in _slow_retry_labels() if s not in still]
+        held = still + slow
+        if held:
+            one = len(held) == 1
+            what = ("switched off" if not slow else
+                    "on the slow retry" if not still else
+                    "held back")
+            line = (f"{' and '.join(held)} {'is' if one else 'are'} the only "
+                    f"camera{'' if one else 's'} {what}, sir - say 'use "
+                    f"{held[0]} again' to put {'it' if one else 'them'} back.")
             return line[:1].upper() + line[1:]
         return ("No camera is switched off at the moment, sir - there is "
                 "nothing to put back.")
-    names = " and ".join(lifted)
-    verb = "is" if len(lifted) == 1 else "are"
-    return (f"Understood, sir - {names} {verb} back in use. I'll bring "
-            f"{'it' if len(lifted) == 1 else 'them'} up one at a time, and "
-            f"if the hub drops out again I'll switch "
-            f"{'it' if len(lifted) == 1 else 'them'} off again.")
+    if not any(states for _label, states in lifted):
+        names = " and ".join(label for label, _s in lifted)
+        verb = "is" if len(lifted) == 1 else "are"
+        return (f"Understood, sir - {names} {verb} back in use. I'll bring "
+                f"{'it' if len(lifted) == 1 else 'them'} up one at a time.")
+    return _lift_reply(lifted, bc)
 
 
 # ─── action 2: situational awareness ─────────────────────────────────────

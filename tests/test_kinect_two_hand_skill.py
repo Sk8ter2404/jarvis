@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import time
 import types
@@ -150,6 +151,17 @@ class _Base(unittest.TestCase):
         p_spawn = mock.patch.object(am, "_spawn_overlay", lambda *a, **k: None)
         p_spawn.start()
         self.addCleanup(p_spawn.stop)
+        # ...and never write the LIVE air-cursor overlay state: the reticle
+        # tests publish two-hand frames through am.AIR_CURSOR_STATE_FILE, the
+        # project-root air_cursor_state.json a running overlay draws from
+        # (found 2026-09-30 by a write audit: nine tests wrote it).
+        state_dir = tempfile.mkdtemp(prefix="jarvis_twohand_state_")
+        self.addCleanup(shutil.rmtree, state_dir, True)
+        p_state = mock.patch.object(
+            am, "AIR_CURSOR_STATE_FILE",
+            os.path.join(state_dir, "air_cursor_state.json"))
+        p_state.start()
+        self.addCleanup(p_state.stop)
         mod, _actions = load_skill_isolated("kinect_two_hand", register=False)
         return mod
 

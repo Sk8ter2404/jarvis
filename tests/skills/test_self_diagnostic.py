@@ -22,6 +22,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -3602,10 +3603,27 @@ class SummaryEdgeTests(_ProbeTestBase):
                           self.actions["diagnostic_history"]("notanumber"))
 
     def test_whats_broken_scan_error(self):
-        # _TODO_PATH exists but open() raises mid-scan.
-        with open(self.mod._TODO_PATH if os.path.isabs(str(self.mod._TODO_PATH))
-                  else os.devnull, "a"):
-            pass
+        # _TODO_PATH exists but open() raises mid-scan. On a TEMP todo file:
+        # this body used to append-open the module's real _TODO_PATH - the
+        # LIVE project-root jarvis_todo.md - and assert nothing (found
+        # 2026-09-30 by a write audit).
+        tmp = tempfile.mkdtemp(prefix="selfdiag_todo_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        todo = os.path.join(tmp, "jarvis_todo.md")
+        with open(todo, "w", encoding="utf-8") as f:
+            f.write("- [ ] something\n")
+        real_open = open
+
+        def _open(path, *a, **k):
+            if path == todo:
+                raise PermissionError("locked by another process")
+            return real_open(path, *a, **k)
+
+        with mock.patch.object(self.mod, "_TODO_PATH", todo), \
+             mock.patch("builtins.open", _open):
+            out = self.actions["whats_broken"]("")
+        self.assertIn("couldn't scan jarvis_todo.md", out)
+        self.assertIn("PermissionError", out)
 
 
 # ─── scheduling + register ───────────────────────────────────────────────

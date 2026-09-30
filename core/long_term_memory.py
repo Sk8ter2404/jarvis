@@ -239,6 +239,14 @@ def _try_import_embedder():
             return _embedder
         if _embedder_failed_until and _t.time() < _embedder_failed_until:
             return None
+        # The model pull draws huggingface_hub's "You are sending
+        # unauthenticated requests to the HF Hub" server warning on every
+        # load; drop ONLY that message (core/log_filters.py).
+        try:
+            from core.log_filters import install_hf_unauthenticated_filter
+            install_hf_unauthenticated_filter()
+        except Exception:
+            pass
         try:
             from sentence_transformers import SentenceTransformer
         except Exception:
