@@ -103,6 +103,11 @@ notification_rules.json
 mcp_servers.json
 pending_speech.json
 injected_commands*.json
+# Tray IPC (tray.py <-> bobert_companion.py). Results can hold personal
+# data (recent facts, diagnostics), so never commit them.
+tray_commands.json
+tray_commands.json.inflight
+tray_results.json
 
 # --- Per-user editor / agent settings (local, not shipped) -------------------
 .claude/settings.local.json

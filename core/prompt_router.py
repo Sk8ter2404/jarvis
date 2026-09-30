@@ -260,6 +260,8 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         "restart", "reboot", "relaunch", "start over", "hud", "overlay",
         "arc reactor", "reactor", "holo", "holographic", "workshop",
         "upgrade", "apply the changes", "doorless",
+        # show_tray (2026-09-30) — multi-word so "stray"/"portray" can't hit.
+        "tray icon", "the tray", "system tray",
     ],
     "SESSION MEMORY RECALL": [
         "remember", "recall", "what did", "earlier", "last time", "before",

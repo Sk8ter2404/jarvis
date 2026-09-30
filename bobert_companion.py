@@ -3480,8 +3480,13 @@ _last_mic_hud_write = [0.0]  # throttle audio→HUD writes to ~10Hz
 
 def _write_hud_state(**updates):
     """Merge updates into the HUD state cache and atomically write it.
-    Silent on any failure — HUD is a nice-to-have, not load-bearing."""
-    if not HUD_ENABLED:
+    Silent on any failure — HUD is a nice-to-have, not load-bearing.
+
+    hud_state.json is ALSO the tray's only view of JARVIS (checkmarks, the
+    listen tint, standby), so the write is skipped only when BOTH the HUD and
+    the tray are off. Gating it on HUD_ENABLED alone froze the tray the moment
+    the on-screen HUD was unticked in Settings (2026-09-30 audit)."""
+    if not (HUD_ENABLED or TRAY_ENABLED):
         return
     try:
         # Whole read-modify-write under the lock. Previously only the cache
@@ -3880,6 +3885,8 @@ TRAY_COMMANDS_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "tray_commands.json"
 )
 _tray_process = None
+# Set by _restore_tray_toggle_state once the persisted toggles are back.
+_tray_toggles_restored = [False]
 _tray_drain_stop = threading.Event()
 _tray_publisher_stop = threading.Event()
 # Last time the HUD calendar/unread-mail were published to hud_state.json.
@@ -3901,15 +3908,11 @@ def _launch_tray():
     if not os.path.exists(tray_path):
         print(f"  [tray] script missing at {tray_path} — skipping")
         return
-    # Reset the command inbox so commands from a previous session don't
-    # fire on startup of the new one. Also clear any .inflight file left
-    # behind by an unclean shutdown mid-drain.
+    # Drop commands from a previous session so they don't fire on startup of
+    # the new one — but only the STALE ones (see _prune_stale_tray_commands):
+    # a click made while the old JARVIS was tearing down is kept.
     for _stale in (TRAY_COMMANDS_FILE, TRAY_COMMANDS_FILE + ".inflight"):
-        try:
-            if os.path.exists(_stale):
-                os.remove(_stale)
-        except Exception:
-            pass
+        _prune_stale_tray_commands(_stale)
     try:
         _tray_process = subprocess.Popen(
             [sys.executable, tray_path,
@@ -3919,11 +3922,212 @@ def _launch_tray():
         )
         print(f"  [tray] launched (pid {_tray_process.pid})")
         # Seed hud_state.json with the current audio-processing flags so the
-        # tray's Audio Controls checkmarks reflect reality on first open.
-        _publish_audio_state()
+        # tray's Audio Controls checkmarks reflect reality on first open — but
+        # only once the persisted toggles are restored. The tray now launches
+        # EARLY in boot, before _restore_tray_toggle_state(); publishing the
+        # still-default cells then would overwrite the user's saved choices in
+        # the file for the rest of boot. Until then the cache (seeded from the
+        # file at import) already holds them.
+        if _tray_toggles_restored[0]:
+            _publish_audio_state()
+        _publish_tray_boot_info()
     except Exception as e:
         print(f"  [tray] launch failed: {e}")
         _tray_process = None
+
+
+# Commands the new session must never replay from the old one's inbox: each
+# ends or replaces the running process (or starts the overnight engine).
+_TRAY_LIFECYCLE_CMDS = frozenset({
+    "restart", "shutdown", "shutdown_jarvis", "trigger_overnight",
+    "start_overnight_upgrade",
+})
+# A leftover command younger than this was clicked while the previous JARVIS
+# was going down (or while this one boots) — keep it.
+_TRAY_CMD_KEEP_S = 120.0
+
+
+def _prune_stale_tray_commands(path: str, now: float | None = None) -> int:
+    """Filter a leftover tray inbox (tray_commands.json or its .inflight claim)
+    at launch: keep commands clicked in the last _TRAY_CMD_KEEP_S seconds,
+    drop older ones and every lifecycle command (a leftover 'restart' must not
+    restart the new session). Returns how many were kept. The old launch
+    deleted the whole inbox, so a toggle clicked during a restart's teardown
+    was silently lost. An unreadable file is removed as before. Never raises."""
+    now = time.time() if now is None else now
+    try:
+        if not os.path.exists(path):
+            return 0
+    except Exception:
+        return 0
+    kept: list = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+        cmds, _ = json.JSONDecoder().raw_decode(raw) if raw else ([], 0)
+        if isinstance(cmds, list):
+            for entry in cmds:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    age = now - float(entry.get("ts") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if (entry.get("cmd") not in _TRAY_LIFECYCLE_CMDS
+                        and -5.0 <= age <= _TRAY_CMD_KEEP_S):
+                    kept.append(entry)
+    except Exception:
+        kept = []
+    try:
+        if not kept:
+            os.remove(path)
+            return 0
+        from core.atomic_io import _atomic_write_json
+        _atomic_write_json(path, kept)
+        print(f"  [tray] kept {len(kept)} command(s) clicked during the "
+              f"last restart ({os.path.basename(path)})")
+    except Exception:
+        pass
+    return len(kept)
+
+
+def _publish_tray_boot_info() -> None:
+    """Facts the tray shows but can't know on its own: which JARVIS this is
+    (pid, boot time, the VERSION it booted with — About), whether overnight
+    upgrades are on (greys out 'Run Upgrade Now' and hides the queue badge).
+    Never raises."""
+    try:
+        try:
+            from core.version import version_string as _vs
+            _ver = str(_vs() or "")
+        except Exception:
+            _ver = ""
+        _write_hud_state(
+            jarvis_pid=os.getpid(),
+            boot_started_at=float(_session_start_time),
+            jarvis_version=_ver,
+            overnight_upgrade_enabled=bool(OVERNIGHT_UPGRADE_ENABLED),
+        )
+    except Exception:
+        pass
+
+
+# ── Tray request results (tray_results.json) ─────────────────────────────
+# A tray click that wants a visible answer carries a request id (rid). The
+# dispatcher publishes the handler's return value under that rid, and
+# _tray_async publishes the final result of work it spawned for it; the tray
+# shows each answer once. Written through the atomic JSON helper (shared-JSON
+# contract). Before this, ~18 tray items only printed to the session log.
+TRAY_RESULTS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "tray_results.json"
+)
+_TRAY_RESULTS_MAX = 20
+_TRAY_RESULT_TEXT_MAX = 20000
+_tray_results_lock = threading.Lock()
+_tray_result_seq = [0]
+# The request the CURRENT thread is serving (set by the dispatcher around a
+# handler call and by _tray_async inside the worker it spawns for a request).
+_tray_request_ctx = threading.local()
+# cids already dispatched (bounded) — _send_command in the tray can re-append
+# an already-claimed command; it must not run twice.
+from collections import OrderedDict as _OrderedDict
+_tray_seen_cids: "_OrderedDict[str, None]" = _OrderedDict()
+_TRAY_SEEN_CIDS_MAX = 512
+
+
+def _publish_tray_result(rid: str, cmd: str, text, final: bool = True) -> None:
+    """Record one answer for tray request ``rid``. No-op without a rid (a
+    voice-triggered action, an old tray). Keeps the newest _TRAY_RESULTS_MAX
+    entries. Never raises."""
+    if not rid:
+        return
+    try:
+        body = str(text if text is not None else "").strip() or "Done."
+        if len(body) > _TRAY_RESULT_TEXT_MAX:
+            body = body[:_TRAY_RESULT_TEXT_MAX] + "\n… (truncated)"
+        with _tray_results_lock:
+            _tray_result_seq[0] += 1
+            try:
+                with open(TRAY_RESULTS_FILE, "r", encoding="utf-8") as f:
+                    doc = json.load(f)
+                entries = doc.get("results") if isinstance(doc, dict) else None
+                if not isinstance(entries, list):
+                    entries = []
+            except Exception:
+                entries = []
+            entries.append({"rid": str(rid), "cmd": str(cmd or ""),
+                            "text": body, "final": bool(final),
+                            "seq": _tray_result_seq[0], "ts": time.time()})
+            from core.atomic_io import _atomic_write_json
+            _atomic_write_json(TRAY_RESULTS_FILE,
+                               {"results": entries[-_TRAY_RESULTS_MAX:]})
+    except Exception as e:
+        print(f"  [tray] result publish failed for {cmd!r}: {e}")
+
+
+def _tray_cid_seen(cid) -> bool:
+    """True if this command id was already dispatched (then skip it); records
+    it otherwise. Entries without a cid (older trays, the drive script) are
+    never deduplicated."""
+    if not cid:
+        return False
+    cid = str(cid)
+    if cid in _tray_seen_cids:
+        return True
+    _tray_seen_cids[cid] = None
+    while len(_tray_seen_cids) > _TRAY_SEEN_CIDS_MAX:
+        _tray_seen_cids.popitem(last=False)
+    return False
+
+
+def _ambient_listen_running():
+    """Is the ambient-listen mic daemon REALLY running? True/False, or None
+    when the skill isn't loaded. The tray's Ambient Mode checkmark and toggle
+    use this: _ambient_mode_active stays False while AMBIENT_LISTEN_ENABLED
+    auto-starts the daemon at boot."""
+    try:
+        mod = sys.modules.get("skill_ambient_listen")
+        if mod is None:
+            return None
+        t = getattr(mod, "_thread", None)
+        return bool(t is not None and t.is_alive())
+    except Exception:
+        return None
+
+
+def _web_dashboard_port() -> int:
+    """Port of the running web dashboard (0 when it is off). Never raises."""
+    try:
+        wi = sys.modules.get("skill_web_interface")
+        if wi is None or getattr(wi, "_httpd", None) is None:
+            return 0
+        return int((getattr(wi, "_bound", ("", 0)) or ("", 0))[1] or 0)
+    except Exception:
+        return 0
+
+
+def _act_show_tray(_: str = "") -> str:
+    """Bring the system-tray icon back after 'Quit Tray Only' (or a crash).
+    Voice: 'show the tray icon' / 'bring back the tray'."""
+    global _tray_process
+    if not TRAY_ENABLED:
+        return "The tray icon is switched off in Settings, sir."
+    proc = _tray_process
+    try:
+        alive = proc is not None and proc.poll() is None
+    except Exception:
+        alive = False
+    if alive:
+        return "The tray icon is already there, sir."
+    _tray_process = None
+    _launch_tray()
+    if _tray_process is None:
+        return "I couldn't bring the tray icon back, sir — see the log."
+    try:
+        _write_hud_state(tray_ready_pid=os.getpid())
+    except Exception:
+        pass
+    return "The tray icon is back, sir."
 
 
 def _shutdown_tray():
@@ -3980,11 +4184,18 @@ def _process_inflight(inflight_path: str) -> int:
         if not isinstance(entry, dict):
             continue
         cmd = entry.get("cmd", "")
+        if _tray_cid_seen(entry.get("cid")):
+            # The tray re-appended a command this drainer already claimed
+            # (its read raced our os.replace claim) — never run it twice.
+            print(f"  [tray] skipped duplicate {cmd!r}")
+            continue
+        rid = str(entry.get("rid") or "")
         try:
             _dispatch_tray_command(cmd, entry)
             n += 1
         except Exception as e:
             print(f"  [tray] dispatch failed for {cmd!r}: {e}")
+            _publish_tray_result(rid, cmd, f"That failed: {e}")
     return n
 
 
@@ -4142,9 +4353,12 @@ def _dispatch_tray_command(cmd: str, entry: dict) -> None:
     # tray-restart path.
     elif cmd == "trigger_overnight":
         print("  [tray] trigger_overnight — starting overnight engine")
-        try: _act_start_overnight_upgrade()
+        try:
+            _out = _act_start_overnight_upgrade()
         except Exception as e:
+            _out = f"The overnight engine failed to start: {e}"
             print(f"  [tray] overnight action failed: {e}")
+        _publish_tray_result(entry.get("rid"), cmd, _out)
     elif cmd == "audio_processing_toggle":
         _audio_master_enabled[0] = not _audio_master_enabled[0]
         _publish_audio_state()
@@ -4166,7 +4380,13 @@ def _dispatch_tray_command(cmd: str, entry: dict) -> None:
         _write_hud_state(tts_muted=bool(_tts_muted[0]))
         print(f"  [tray] mute_tts_toggle -> {_tts_muted[0]}")
     elif cmd == "ambient_mode_toggle":
-        _ambient_mode_active[0] = not _ambient_mode_active[0]
+        # Flip from what is REALLY running (the tray's checkmark shows the
+        # same): with AMBIENT_LISTEN_ENABLED the daemon auto-starts while this
+        # cell stays False, so flipping the cell would "start" an already
+        # running daemon and the click did nothing (2026-09-30 audit).
+        _running = _ambient_listen_running()
+        _current = bool(_ambient_mode_active[0]) if _running is None else _running
+        _ambient_mode_active[0] = not _current
         _write_hud_state(ambient_mode_active=bool(_ambient_mode_active[0]))
         # Actually start / stop the ambient_listen daemon so the toggle
         # has runtime effect. ACTIONS may not contain ambient_listen_*
@@ -4181,6 +4401,9 @@ def _dispatch_tray_command(cmd: str, entry: dict) -> None:
                 print(f"  [tray] ambient_mode_toggle action {action!r} raised: {e}")
         else:
             print(f"  [tray] ambient_mode_toggle: {action!r} not registered")
+        _running = _ambient_listen_running()
+        if _running is not None:
+            _write_hud_state(ambient_listening=_running)
         print(f"  [tray] ambient_mode_toggle -> {_ambient_mode_active[0]}")
     elif cmd == "pause_daemons_toggle":
         _daemons_paused[0] = not _daemons_paused[0]
@@ -4223,9 +4446,15 @@ def _dispatch_tray_command(cmd: str, entry: dict) -> None:
         # switch_llm carries its target in `backend`; everything else passes
         # whatever sits under `arg` (empty string when the tray sent no payload,
         # which matches the bare-string signature every _act_* helper uses).
+        # A request id (rid) means the tray wants to SHOW the answer: the
+        # handler's return value (and, for work it spawns via _tray_async,
+        # the final result) is published to tray_results.json.
+        rid = str(entry.get("rid") or "")
         fn = ACTIONS.get(cmd)
         if fn is None:
             print(f"  [tray] unknown command: {cmd!r}")
+            _publish_tray_result(rid, cmd,
+                                 "That isn't available in this JARVIS build.")
             return
         if cmd == "switch_llm":
             arg = entry.get("backend", "") or ""
@@ -4236,14 +4465,23 @@ def _dispatch_tray_command(cmd: str, entry: dict) -> None:
         # load_skills() ran. Spawn into a daemon so a 30–60s sweep can't
         # stall the 2 Hz drainer and back up other tray clicks.
         if cmd in _HEAVY_ACTIONS:
-            _tray_async(cmd, lambda f=fn, a=arg: f(a))
+            _tray_async(cmd, lambda f=fn, a=arg: f(a), rid=rid)
             print(f"  [tray] {cmd} dispatched async")
             return
+        ctx = {"rid": rid, "spawned": False}
+        _tray_request_ctx.current = ctx
         try:
             result = fn(arg)
         except Exception as e:
             print(f"  [tray] action {cmd!r} raised: {e}")
+            _publish_tray_result(rid, cmd, f"That failed: {e}")
             return
+        finally:
+            _tray_request_ctx.current = None
+        # Work handed to _tray_async publishes its own final answer; this
+        # return value ("backup started") is then only the interim line.
+        _publish_tray_result(rid, cmd, result if isinstance(result, str)
+                             else "Done.", final=not ctx["spawned"])
         head = result if isinstance(result, str) else ""
         if head:
             head = head.split("\n", 1)[0]
@@ -4277,6 +4515,9 @@ def _restore_tray_toggle_state() -> None:
     daemons were paused, push that into diagnostic_daemons + skill state.
     Silent on any failure — a missing or corrupt state file just means
     we boot with the in-file defaults."""
+    # From here on the cells hold the user's choices (or the defaults, which
+    # are right on a fresh install), so a tray (re)launch may publish them.
+    _tray_toggles_restored[0] = True
     try:
         if not os.path.exists(HUD_STATE_FILE):
             return
@@ -4477,13 +4718,24 @@ def _tray_state_publisher():
                     )
             except Exception:
                 pass
+            # The tray's view of the live cells it can't read itself: standby
+            # (set by voice, the wake word and auto-engage, not just the tray),
+            # whether ambient listening is REALLY running, and the web
+            # dashboard's port (its left-click). 2026-09-30 audit.
+            desired = {"alert_active": alert, "bambu_active": bambu,
+                       "sleep_mode": bool(_sleep_mode[0]),
+                       "standby_mode": bool(_standby_mode[0]),
+                       "web_port": _web_dashboard_port()}
+            _amb = _ambient_listen_running()
+            if _amb is not None:
+                desired["ambient_listening"] = _amb
             # Only write when something actually changed so we don't churn the
             # state file 1× per second.
             with _hud_state_lock:
-                stale_a = _hud_state_cache.get("alert_active")
-                stale_b = _hud_state_cache.get("bambu_active")
-            if stale_a != alert or stale_b != bambu:
-                _write_hud_state(alert_active=alert, bambu_active=bambu)
+                changed = {k: v for k, v in desired.items()
+                           if _hud_state_cache.get(k) != v}
+            if changed:
+                _write_hud_state(**changed)
         except Exception:
             logging.exception("[tray] state publisher iteration failed")
         _tray_publisher_stop.wait(1.0)
@@ -15357,6 +15609,14 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
     record_start_ts = 0.0   # set when recording actually begins (VAD trip)
     _se_vad_ts = _se_open_ts  # the same instant on the self-echo clock
     _se_clip_ts = _se_open_ts
+    # Mute Mic mid-capture (2026-09-30): the tray's mute used to be checked
+    # only BEFORE a listen started, so a capture already running — up to
+    # MAX_RECORDING_SECS — still recorded, transcribed and ACTED on what was
+    # said after the click. A capture that STARTED unmuted now stops the moment
+    # mute is set and returns nothing. (One that started muted — only the
+    # standby path does that — keeps its old behaviour, so muting never turns
+    # a listen into a tight open/close loop.)
+    _mute_at_open = bool(_mic_muted[0])
     try:  # pragma: no cover - live mic capture loop (blocks on real audio frames until utterance ends)
         while True:
             # Watchdog-driven recovery: if the main-loop watchdog has
@@ -15367,6 +15627,11 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
             if _watchdog_reset_signal.is_set():
                 print("  [record_speech] watchdog reset signalled — "
                       "closing InputStream and returning")
+                _utterance_in_progress[0] = False
+                return None
+            if _mic_muted[0] and not _mute_at_open:
+                print("  [record_speech] mic muted mid-capture — stopping, "
+                      "nothing kept")
                 _utterance_in_progress[0] = False
                 return None
             try:
@@ -26053,23 +26318,43 @@ def maybe_replay_last_action(utterance: str) -> str | None:
 # `_act_run_diagnostic_tray` with a blocking `run_diagnostic`), so the
 # generic dispatcher in _dispatch_tray_command routes any cmd in this
 # set through _tray_async to keep the 2 Hz drainer from stalling.
-_HEAVY_ACTIONS = {"run_diagnostic", "test_each_skill", "latency_benchmark"}
+_HEAVY_ACTIONS = {"run_diagnostic", "test_each_skill", "latency_benchmark",
+                  "show_recent_facts"}
 
 
-def _tray_async(name: str, fn) -> None:
+def _tray_async(name: str, fn, rid: str | None = None) -> None:
     """Run fn() in a daemon thread and print a single-line tray log entry
     when it returns. Used by every tray handler whose probe/wait could
-    stall the drainer."""
+    stall the drainer.
+
+    When the work serves a tray request (``rid``, or the request the calling
+    thread is dispatching — see _tray_request_ctx) its final result is also
+    published to tray_results.json, and the request context follows the work
+    into the worker, so a handler that itself calls _tray_async still reports
+    back. Voice-triggered calls have no request and publish nothing."""
+    ctx = getattr(_tray_request_ctx, "current", None)
+    if rid is None and ctx is not None:
+        rid = ctx.get("rid") or ""
+        ctx["spawned"] = bool(rid)
+    rid = rid or ""
+
     def _wrap():
         t0 = time.time()
+        inner = {"rid": rid, "spawned": False}
+        _tray_request_ctx.current = inner if rid else None
         try:
             out = fn() or ""
             head = str(out).split("\n", 1)[0] if out else "done"
             if len(head) > 120:
                 head = head[:117].rstrip() + "..."
             print(f"  [tray-async] {name} -> {head}  ({(time.time()-t0)*1000:.0f}ms)")
+            _publish_tray_result(rid, name, str(out) if out else "Done.",
+                                 final=not inner["spawned"])
         except Exception as exc:
             print(f"  [tray-async] {name} raised: {exc}")
+            _publish_tray_result(rid, name, f"That failed: {exc}")
+        finally:
+            _tray_request_ctx.current = None
     threading.Thread(target=_wrap, name=f"tray-{name}", daemon=True).start()
 
 
@@ -26351,6 +26636,8 @@ ACTIONS = {
     "hide_hud":              _act_hide_hud,
     "show_hud":              _act_show_hud,
     "toggle_hud":            _act_toggle_hud,
+    # The way back after the tray's "Quit Tray Only" (2026-09-30).
+    "show_tray":             _act_show_tray,
     # UI automation
     "click":           _act_click,
     "type":            _act_type,
@@ -27519,6 +27806,8 @@ INFORMATIVE_ACTIONS = {
 SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     # Version / last-upgrade readout (core.actions._act_version_info + aliases).
     "version_info", "what_version", "when_updated",
+    # Tray icon brought back (_act_show_tray) — one finished sentence.
+    "show_tray",
     # Single-sentence health/status aggregator (skills/system_pulse.py) and its
     # natural-phrasing aliases. Each returns one finished status sentence.
     "system_pulse", "check_system", "status_report",
@@ -33689,6 +33978,14 @@ def _capture_utterance(injected_text, memory):
         set_state("idle")
         return None
 
+    # Mute Mic landed between the capture ending and here: drop the clip
+    # unheard (record_speech itself stops a capture muted mid-way).
+    if _mic_muted[0]:
+        print("  [mic-mute] muted after the capture — clip dropped, not "
+              "transcribed")
+        set_state("idle")
+        return None
+
     # Keep the spectral music detector primed in normal mode too, so its
     # sustained-music state survives any sleep→standby transition triggered by
     # a music marker below. Feed it the RAW audio (pre auto-gain) so its
@@ -33718,6 +34015,13 @@ def _capture_utterance(injected_text, memory):
     text, conf = _transcribe_capture(audio)
     _tt("mark", "stt_end")
     _prof("stt_end", text[:40].replace("\t", " "))
+    # Muted WHILE Whisper ran: the owner said "don't listen" — the transcript
+    # is dropped, never acted on (numbers only in the log, never the text).
+    if _mic_muted[0]:
+        print(f"  [mic-mute] muted during transcription — transcript dropped "
+              f"({len(text or '')} chars)")
+        set_state("idle")
+        return None
     return text, conf
 
 
@@ -34798,6 +35102,13 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     if _log_file_path:
         print(f"Logging session to: {_log_file_path}")
 
+    # Launch the system-tray applet NOW, not at the end of boot: the icon used
+    # to be missing for the 11-56 s the rest of boot takes (preflight, Whisper,
+    # skills, cameras). It shows "starting…" until the command drainer starts
+    # below (tray_ready_pid); clicks made meanwhile wait in tray_commands.json.
+    if TRAY_ENABLED:
+        _launch_tray()
+
     # Snap Windows into High Performance for the duration of the session.
     # Wrapped + best-effort: any failure (locked-down machine, missing
     # powercfg, AC-only restriction) must not block boot. Restoration
@@ -35013,15 +35324,19 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     if RETICLE_OVERLAY_ENABLED:
         _launch_reticle_overlay()
 
-    # Launch the system-tray applet (animated arc-reactor icon + menu) and
-    # start its companion threads: a 2 Hz drainer that processes commands
-    # from the tray's right-click menu, and a 1 Hz publisher that bridges
-    # the system_monitor + bambu_monitor skills into hud_state.json so the
-    # tray subprocess can colour-code its icon (red on alert, orange on print).
+    # The system-tray applet was launched early in boot (see just after
+    # setup_logging). Start its companion threads now that ACTIONS is fully
+    # populated: a 2 Hz drainer that processes commands from the tray's
+    # right-click menu, and a 1 Hz publisher that bridges the system_monitor +
+    # bambu_monitor skills (and the standby / ambient / dashboard state) into
+    # hud_state.json so the tray subprocess can show them. tray_ready_pid ends
+    # the tray's "starting…".
     if TRAY_ENABLED:
-        _launch_tray()
+        if _tray_process is None:
+            _launch_tray()   # the early launch failed — one more try
         threading.Thread(target=_tray_command_drainer, daemon=True).start()
         threading.Thread(target=_tray_state_publisher, daemon=True).start()
+        _write_hud_state(tray_ready_pid=os.getpid())
 
     # Apple Music autostart + keep-alive (both opt-in, default off). When
     # APPLE_MUSIC_AUTOSTART is set, launch the UWP Apple Music app once; when

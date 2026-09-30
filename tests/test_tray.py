@@ -34,6 +34,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -263,6 +264,16 @@ finally:
     else:
         sys.modules.pop("pystray._base", None)
 
+# Real implementations, captured before TrayTestBase patches them per test (no
+# test may reach the live Ollama / media session / git by accident). getattr
+# so the module still imports against an older tray.py (fail-on-old proof).
+_REAL_GIT_COMMIT = getattr(tray, "_git_commit", None)
+_REAL_FETCH_LOCAL_MODELS = getattr(tray, "_fetch_local_models", None)
+_REAL_NOW_PLAYING_LOOKUP = getattr(tray, "_now_playing_lookup", None)
+_REAL_SETUP_TRAY_LOGGING = getattr(tray, "_setup_tray_logging", None)
+# The real repo root (TrayTestBase repoints tray.PROJECT_DIR at a temp dir).
+_REAL_PROJECT_DIR = tray.PROJECT_DIR
+
 
 # --------------------------------------------------------------------------- #
 # Shared base: redirect every path constant into a temp dir + reset globals.
@@ -275,7 +286,8 @@ class TrayTestBase(unittest.TestCase):
         "CHANGELOG_FILE", "RELEASE_VERSION_FILE", "VERSION_FILE",
         "INSTANCES_FILE", "PIPELINE_LOCK_FILE",
         "OVERNIGHT_FLAG", "MEMORY_FACTS_FILE", "SETTINGS_WINDOW", "SHOW_LOG_PS1",
-        "HUD_SCRIPT",
+        "HUD_SCRIPT", "TRAY_RESULTS_FILE", "TRAY_LOG_FILE",
+        "SETTINGS_LOG_FILE", "TRAY_RESULTS_DIR", "CRASH_TRACES_LOG",
     )
 
     def setUp(self):
@@ -285,9 +297,11 @@ class TrayTestBase(unittest.TestCase):
         # Map each path constant to a sibling under the temp dir, preserving the
         # original basename so behaviour that keys off the filename still holds.
         for attr in self._PATH_ATTRS:
-            orig = getattr(tray, attr)
+            # getattr/create=True: tolerate an older tray.py (fail-on-old proof).
+            orig = getattr(tray, attr, None)
             base = os.path.basename(orig) if orig else attr
-            patcher = mock.patch.object(tray, attr, os.path.join(self.dir, base))
+            patcher = mock.patch.object(tray, attr, os.path.join(self.dir, base),
+                                        create=True)
             patcher.start()
             self.addCleanup(patcher.stop)
         # PROJECT_DIR itself must be the temp dir (mkstemp(dir=PROJECT_DIR)).
@@ -317,6 +331,47 @@ class TrayTestBase(unittest.TestCase):
         tray._queue_cache.update({"count": 0, "at": 0.0})
         tray._parent_pid[0] = 0
         tray._stop_event = threading.Event()
+        self._reset_tray_runtime_state()
+        self.addCleanup(self._reset_tray_runtime_state)
+        # No test may reach the live Ollama or the OS media session: the model
+        # picker and the now-playing header refresh on background threads.
+        # And main() must never re-point THIS process's stdout/stderr at a tray
+        # log (the dedicated test calls the real one on private streams).
+        # create=True keeps this base usable against an older tray.py (the
+        # fail-on-old-code proof runs these tests there).
+        for name, value in (("_fetch_local_models", []),
+                            ("_now_playing_lookup", "Apple Music: closed"),
+                            ("_setup_tray_logging", False)):
+            p = mock.patch.object(tray, name, return_value=value, create=True)
+            p.start()
+            self.addCleanup(p.stop)
+
+    @staticmethod
+    def _reset_tray_runtime_state():
+        """Module-level runtime state added with the 2026-09-30 tray fixes.
+        Tolerant of its absence (older tray.py)."""
+        def _get(name):
+            return getattr(tray, name, None)
+        for name in ("_pending", "_confirm_armed"):
+            if _get(name) is not None:
+                _get(name).clear()
+        if _get("_results_state") is not None:
+            tray._results_state.update({"checked_at": 0.0, "mtime": None,
+                                        "read_at": 0.0, "shown": set()})
+        if _get("_menu_state") is not None:
+            tray._menu_state.update({"sig": None, "at": 0.0})
+        if _get("_menu_open") is not None:
+            tray._menu_open.clear()
+        if _get("_icon_state") is not None:
+            tray._icon_state.update({"key": None, "title": None})
+        if _get("_icon_ref") is not None:
+            tray._icon_ref[0] = None
+        if _get("_np_cache") is not None:
+            tray._np_cache.update({"text": "", "at": 0.0, "busy": False})
+        if _get("_models_cache") is not None:
+            tray._models_cache.update({"tags": [], "at": 0.0, "busy": False})
+        if _get("_hud_snapshot") is not None:
+            tray._hud_snapshot.data = None
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -977,10 +1032,29 @@ class CountPendingTasksTests(TrayTestBase):
 # Command-firing menu callbacks — each should write exactly one command.
 # --------------------------------------------------------------------------- #
 class CommandCallbackTests(TrayTestBase):
-    def _assert_cmd(self, fn, expected_cmd, **expected_kw):
+    # Items that answer visibly: the command carries a request id (rid).
+    _REQUESTS = {"trigger_overnight", "stop_pipeline", "force_backup",
+                 "reload_skills", "run_smoke_test", "switch_llm",
+                 "show_llm_stats", "show_recent_facts", "reset_memory",
+                 "export_memory", "forget_last_hour", "run_diagnostic",
+                 "show_last_diagnostic", "test_mic", "test_tts", "test_vision",
+                 "test_each_skill", "latency_benchmark"}
+
+    def _assert_cmd(self, fn, expected_cmd, confirm=False, **expected_kw):
+        if confirm:
+            # Destructive one-click: the FIRST click only arms the gate.
+            with mock.patch.object(tray, "_notify", create=True) as note:
+                fn(mock.Mock(), mock.Mock())
+            self.assertEqual(self._read_commands(), [],
+                             "a confirm-gated item fired on the first click")
+            note.assert_called_once()
         fn(mock.Mock(), mock.Mock())
         cmd = self._last_command()
         self.assertEqual(cmd["cmd"], expected_cmd)
+        self.assertTrue(cmd.get("cid"), "every command carries a cid")
+        if expected_cmd in self._REQUESTS:
+            self.assertTrue(cmd.get("rid"), f"{expected_cmd} must ask for an answer")
+            self.assertIn(cmd["rid"], tray._pending)
         for k, v in expected_kw.items():
             self.assertEqual(cmd[k], v)
 
@@ -988,7 +1062,7 @@ class CommandCallbackTests(TrayTestBase):
         self._assert_cmd(tray._on_open_hud, "open_hud")
 
     def test_restart(self):
-        self._assert_cmd(tray._on_restart, "restart")
+        self._assert_cmd(tray._on_restart, "restart", confirm=True)
 
     def test_mute_tts(self):
         self._assert_cmd(tray._on_mute_tts, "mute_tts_toggle")
@@ -1002,10 +1076,11 @@ class CommandCallbackTests(TrayTestBase):
         self._assert_cmd(tray._on_ambient_mode, "ambient_mode_toggle")
 
     def test_force_upgrade(self):
+        self._write_hud(overnight_upgrade_enabled=True)
         self._assert_cmd(tray._on_force_upgrade, "trigger_overnight")
 
     def test_shutdown(self):
-        self._assert_cmd(tray._on_shutdown_jarvis, "shutdown_jarvis")
+        self._assert_cmd(tray._on_shutdown_jarvis, "shutdown_jarvis", confirm=True)
 
     def test_stop_pipeline(self):
         self._assert_cmd(tray._on_stop_pipeline, "stop_pipeline")
@@ -1022,11 +1097,10 @@ class CommandCallbackTests(TrayTestBase):
     def test_pause_daemons(self):
         self._assert_cmd(tray._on_pause_daemons, "pause_daemons_toggle")
 
-    def test_reset_llm_cache(self):
-        self._assert_cmd(tray._on_reset_llm_cache, "reset_llm_cache")
-
     def test_switch_anthropic(self):
-        self._assert_cmd(tray._on_switch_anthropic, "switch_llm", backend="anthropic")
+        # Claude is the PAID backend — a second click is required.
+        self._assert_cmd(tray._on_switch_anthropic, "switch_llm", confirm=True,
+                         backend="anthropic")
 
     def test_switch_local(self):
         # 2026-07-21 audit: the tray sends the "ollama" sentinel and lets the
@@ -1051,17 +1125,17 @@ class CommandCallbackTests(TrayTestBase):
         self.assertEqual(offenders, [],
                          f"tray menu labels hard-code local model tags: {offenders}")
 
-    def test_switch_other(self):
-        self._assert_cmd(tray._on_switch_other_llm, "switch_llm_picker")
+    def test_picker_model_item_switches_to_that_tag(self):
+        # The "Local Model" picker replaces the dead "other…" item: each
+        # entry sends the exact installed tag.
+        self._assert_cmd(tray._switch_to_model("gemma4:12b"), "switch_llm",
+                         backend="gemma4:12b")
 
     def test_toggle_debug(self):
         self._assert_cmd(tray._on_toggle_debug_mode, "debug_mode_toggle")
 
     def test_show_llm_stats(self):
         self._assert_cmd(tray._on_show_llm_stats, "show_llm_stats")
-
-    def test_clear_llm_cache(self):
-        self._assert_cmd(tray._on_clear_llm_cache, "clear_llm_cache")
 
     def test_toggle_audio_processing(self):
         self._assert_cmd(tray._on_toggle_audio_processing, "audio_processing_toggle")
@@ -1079,13 +1153,14 @@ class CommandCallbackTests(TrayTestBase):
         self._assert_cmd(tray._on_recent_facts, "show_recent_facts")
 
     def test_reset_memory(self):
-        self._assert_cmd(tray._on_reset_memory, "reset_memory")
+        self._assert_cmd(tray._on_reset_memory, "reset_memory", confirm=True)
 
     def test_export_memory(self):
         self._assert_cmd(tray._on_export_memory, "export_memory")
 
     def test_forget_last_hour(self):
-        self._assert_cmd(tray._on_forget_last_hour, "forget_last_hour")
+        self._assert_cmd(tray._on_forget_last_hour, "forget_last_hour",
+                         confirm=True)
 
     def test_run_diagnostic(self):
         self._assert_cmd(tray._on_run_diagnostic, "run_diagnostic")
@@ -1362,15 +1437,28 @@ class OpenPathCallbackTests(TrayTestBase):
                                side_effect=OSError("x")):
             tray._on_open_project_folder(mock.Mock(), mock.Mock())
 
-    def test_open_changelog_present(self):
+    def test_open_changelog_opens_the_release_notes(self):
+        # CHANGELOG.md is the self-upgrade pipeline's log (stale since the last
+        # overnight run); the release notes are the GitHub releases page.
         self._write(tray.CHANGELOG_FILE, "## v1.0.0 — 2026-01-01 00:00\n")
-        with mock.patch.object(tray, "_open_path") as op:
+        with mock.patch("webbrowser.open", return_value=True) as wb, \
+             mock.patch.object(tray, "_open_path") as op:
+            tray._on_open_changelog(mock.Mock(), mock.Mock())
+        wb.assert_called_once()
+        self.assertTrue(wb.call_args.args[0].endswith("/jarvis/releases"))
+        op.assert_not_called()
+
+    def test_open_changelog_falls_back_to_the_file(self):
+        self._write(tray.CHANGELOG_FILE, "## v1.0.0 — 2026-01-01 00:00\n")
+        with mock.patch("webbrowser.open", return_value=False), \
+             mock.patch.object(tray, "_open_path") as op:
             tray._on_open_changelog(mock.Mock(), mock.Mock())
         op.assert_called_once()
         self.assertEqual(op.call_args.args[0], tray.CHANGELOG_FILE)
 
     def test_open_changelog_absent_no_open(self):
-        with mock.patch.object(tray, "_open_path") as op:
+        with mock.patch("webbrowser.open", side_effect=OSError("no browser")), \
+             mock.patch.object(tray, "_open_path") as op:
             tray._on_open_changelog(mock.Mock(), mock.Mock())
         op.assert_not_called()
 
@@ -1494,32 +1582,17 @@ class ThreadedCallbackTests(TrayTestBase):
 
 
 class SettingsCallbackTests(TrayTestBase):
-    """Each Settings tab callback spawns a daemon thread targeting
-    _open_settings_window with the tab name as a positional arg."""
+    """The top-level "Settings…" item spawns a daemon thread targeting
+    _open_settings_window on the window's first tab."""
 
-    def _assert_settings(self, fn, expected_tab):
+    def test_open_settings_targets_first_tab(self):
         with mock.patch.object(tray.threading, "Thread") as T:
             inst = T.return_value
-            fn(mock.Mock(), mock.Mock())
+            tray._on_open_settings(mock.Mock(), mock.Mock())
         inst.start.assert_called_once()
         self.assertEqual(T.call_args.kwargs.get("target"),
                          tray._open_settings_window)
-        self.assertEqual(T.call_args.kwargs.get("args"), (expected_tab,))
-
-    def test_voice(self):
-        self._assert_settings(tray._on_settings_voice, "voice")
-
-    def test_ai(self):
-        self._assert_settings(tray._on_settings_ai, "ai")
-
-    def test_privacy(self):
-        self._assert_settings(tray._on_settings_privacy, "privacy")
-
-    def test_integrations(self):
-        self._assert_settings(tray._on_settings_integrations, "integrations")
-
-    def test_advanced(self):
-        self._assert_settings(tray._on_settings_advanced, "advanced")
+        self.assertEqual(T.call_args.kwargs.get("args"), ("",))
 
 
 # --------------------------------------------------------------------------- #
@@ -1559,21 +1632,88 @@ class OpenEventViewerTests(TrayTestBase):
             tray._open_event_viewer_crashes()  # no raise
 
 
+class _FakeProc:
+    """Popen stand-in: .wait() returns ``rc`` or raises TimeoutExpired."""
+
+    def __init__(self, rc=None, pid=4242):
+        self.rc = rc
+        self.pid = pid
+        self.wait_timeouts = []
+
+    def wait(self, timeout=None):
+        self.wait_timeouts.append(timeout)
+        if self.rc is None:
+            raise subprocess.TimeoutExpired("settings", timeout)
+        return self.rc
+
+
 class OpenSettingsWindowTests(TrayTestBase):
-    def test_spawns_window_when_present(self):
+    def _launch(self, tab, proc=None, **patches):
         self._write(tray.SETTINGS_WINDOW, "# settings")
-        with mock.patch.object(tray.subprocess, "Popen") as P:
-            tray._open_settings_window("voice")
+        proc = proc or _FakeProc(rc=None)
+        with mock.patch.object(tray.subprocess, "Popen",
+                               return_value=proc) as P, \
+             mock.patch.object(tray, "_notify", create=True) as note:
+            tray._open_settings_window(tab)
+        return P, note, proc
+
+    def test_spawns_window_when_present(self):
+        P, note, _ = self._launch("voice")
         P.assert_called_once()
         argv = P.call_args.args[0]
-        self.assertIn(tray.SETTINGS_WINDOW, argv)
         self.assertIn("--tab", argv)
         self.assertIn("voice", argv)
+        note.assert_not_called()          # still running after the grace = OK
+
+    def test_launch_is_a_module_run_from_the_project_root(self):
+        # THE Settings bug: `pythonw tools\settings_window.py` put tools\ on
+        # sys.path[0] and gave no cwd, so the window's `from core import …`
+        # failed. A module launch from cwd=PROJECT_DIR resolves core.
+        P, _, _ = self._launch("ai")
+        argv = P.call_args.args[0]
+        self.assertEqual(argv[0], sys.executable)
+        self.assertEqual(argv[1:3], ["-m", "tools.settings_window"])
+        self.assertEqual(argv[3:], ["--tab", "ai"])
+        self.assertEqual(os.path.normcase(P.call_args.kwargs.get("cwd") or ""),
+                         os.path.normcase(tray.PROJECT_DIR))
+        self.assertEqual(argv, tray._settings_launch_argv("ai"))
+
+    def test_window_output_goes_to_the_settings_log(self):
+        P, _, _ = self._launch("voice")
+        kw = P.call_args.kwargs
+        self.assertIs(kw.get("stderr"), subprocess.STDOUT)
+        out = kw.get("stdout")
+        self.assertTrue(hasattr(out, "write"),
+                        "the window's stdout must go to a log file, not nowhere")
+        self.assertEqual(os.path.normcase(out.name),
+                         os.path.normcase(tray.SETTINGS_LOG_FILE))
+        with open(tray.SETTINGS_LOG_FILE, encoding="utf-8") as f:
+            self.assertIn("launch tab=voice", f.read())
+
+    def test_window_that_dies_at_start_raises_a_balloon(self):
+        log_path = tray.SETTINGS_LOG_FILE
+
+        class _DyingProc(_FakeProc):
+            def wait(self, timeout=None):
+                # The child's traceback lands in the log AFTER the launch banner.
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write("Traceback (most recent call last):\n"
+                            "ModuleNotFoundError: No module named 'core'\n")
+                return super().wait(timeout)
+        P, note, proc = self._launch("ai", proc=_DyingProc(rc=1))
+        note.assert_called_once()
+        msg = note.call_args.args[0]
+        self.assertIn("exit 1", msg)
+        self.assertIn("No module named 'core'", msg)
+        self.assertIn("settings_window.log", msg)
+        self.assertEqual(proc.wait_timeouts, [tray.SETTINGS_LAUNCH_GRACE_S])
+
+    def test_clean_exit_is_not_an_error(self):
+        _, note, _ = self._launch("ai", proc=_FakeProc(rc=0))
+        note.assert_not_called()
 
     def test_no_tab_arg_when_blank(self):
-        self._write(tray.SETTINGS_WINDOW, "# settings")
-        with mock.patch.object(tray.subprocess, "Popen") as P:
-            tray._open_settings_window("")
+        P, _, _ = self._launch("")
         argv = P.call_args.args[0]
         self.assertNotIn("--tab", argv)
 
@@ -1584,10 +1724,14 @@ class OpenSettingsWindowTests(TrayTestBase):
         self._write(fallback, "{}")
         with mock.patch.object(tray.subprocess, "Popen",
                                side_effect=OSError("spawn fail")), \
+             mock.patch.object(tray, "_notify", create=True) as note, \
              mock.patch.object(tray, "_open_path") as op:
             tray._open_settings_window("ai")
         op.assert_called_once()
         self.assertEqual(op.call_args.args[0], fallback)
+        # …and the failure is no longer silent.
+        note.assert_called_once()
+        self.assertIn("spawn fail", note.call_args.args[0])
 
     def test_fallback_to_user_settings_json(self):
         # No settings window installed; fall back to opening the JSON.
@@ -1611,6 +1755,13 @@ class OpenSettingsWindowTests(TrayTestBase):
 # About-dialog text builders
 # --------------------------------------------------------------------------- #
 class VersionAndUptimeTests(TrayTestBase):
+    def setUp(self):
+        super().setUp()
+        # About's Commit line shells out to git; tests that want it patch it.
+        p = mock.patch.object(tray, "_git_commit", return_value="", create=True)
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_version_parsed_from_changelog(self):
         self._write(tray.CHANGELOG_FILE,
                     "# Changelog\n\n## v1.2.3 — 2026-05-28 22:33\n- did stuff\n")
@@ -1632,29 +1783,72 @@ class VersionAndUptimeTests(TrayTestBase):
         self.assertEqual(ver, "unknown")
         self.assertEqual(at, "unknown")
 
-    def test_uptime_from_prod_instance(self):
-        os.makedirs(tray.DATA_DIR, exist_ok=True)
-        self._write(tray.INSTANCES_FILE, json.dumps({
-            "x": {"role": "prod", "started_at": tray.time.time() - 120},
-        }))
-        self.assertGreaterEqual(tray._read_uptime_seconds(), 100)
+    def _no_psutil_start(self):
+        return mock.patch.object(tray, "_parent_started_at", return_value=0.0, create=True)
 
-    def test_uptime_any_instance_when_no_prod(self):
+    def test_uptime_from_the_live_parent_process(self):
+        # The authority: the OS start time of the JARVIS this tray belongs to.
+        tray._parent_pid[0] = 4321
+        with mock.patch.object(tray, "_parent_started_at", create=True,
+                               return_value=tray.time.time() - 600):
+            self.assertGreaterEqual(tray._read_uptime_seconds(), 590)
+
+    def test_uptime_from_our_own_instance_entry(self):
+        tray._parent_pid[0] = 4321
         os.makedirs(tray.DATA_DIR, exist_ok=True)
         self._write(tray.INSTANCES_FILE, json.dumps({
-            "x": {"role": "dev", "started_at": tray.time.time() - 60},
+            "4321": {"pid": 4321, "role": "prod",
+                     "started_at": tray.time.time() - 120},
         }))
-        self.assertGreaterEqual(tray._read_uptime_seconds(), 50)
+        with self._no_psutil_start():
+            self.assertGreaterEqual(tray._read_uptime_seconds(), 100)
+
+    def test_uptime_ignores_a_dead_first_prod_entry(self):
+        # THE About bug: instances.json keeps dead PIDs and the FIRST prod entry
+        # (a JARVIS from weeks ago) was reported as the uptime.
+        tray._parent_pid[0] = 4321
+        now = tray.time.time()
+        os.makedirs(tray.DATA_DIR, exist_ok=True)
+        self._write(tray.INSTANCES_FILE, json.dumps({
+            "111": {"pid": 111, "role": "prod", "started_at": now - 30 * 86400},
+            "4321": {"pid": 4321, "role": "prod", "started_at": now - 300},
+        }))
+        with self._no_psutil_start():
+            up = tray._read_uptime_seconds()
+        self.assertGreaterEqual(up, 290)
+        self.assertLess(up, 3600)
+
+    def test_uptime_unknown_rather_than_a_stranger(self):
+        # Parent known, but no record of it anywhere: say unknown (0.0), never
+        # borrow another instance's start time.
+        tray._parent_pid[0] = 4321
+        os.makedirs(tray.DATA_DIR, exist_ok=True)
+        self._write(tray.INSTANCES_FILE, json.dumps({
+            "x": {"pid": 111, "role": "prod", "started_at": tray.time.time() - 60},
+        }))
+        with self._no_psutil_start():
+            self.assertEqual(tray._read_uptime_seconds(), 0.0)
 
     def test_uptime_skips_non_dict_entries(self):
         # A non-dict instance entry must be skipped (the `continue` branch) and
         # the scan must still find the dict entry that follows.
+        tray._parent_pid[0] = 77
         os.makedirs(tray.DATA_DIR, exist_ok=True)
         self._write(tray.INSTANCES_FILE, json.dumps({
             "bad": "not-a-dict",
-            "good": {"role": "prod", "started_at": tray.time.time() - 70},
+            "77": {"role": "prod", "started_at": tray.time.time() - 70},
         }))
-        self.assertGreaterEqual(tray._read_uptime_seconds(), 50)
+        with self._no_psutil_start():
+            self.assertGreaterEqual(tray._read_uptime_seconds(), 50)
+
+    def test_uptime_from_published_boot_when_it_is_ours(self):
+        tray._parent_pid[0] = 55
+        self._write_hud(boot_started_at=tray.time.time() - 45, jarvis_pid=55)
+        with self._no_psutil_start():
+            self.assertGreaterEqual(tray._read_uptime_seconds(), 40)
+        self._write_hud(boot_started_at=tray.time.time() - 45, jarvis_pid=56)
+        with self._no_psutil_start():
+            self.assertEqual(tray._read_uptime_seconds(), 0.0)
 
     def test_uptime_falls_back_to_hud_when_instances_lack_started_at(self):
         # instances.json present but no usable started_at -> hud boot fallback.
@@ -1757,6 +1951,65 @@ class VersionAndUptimeTests(TrayTestBase):
         self._write(tray.CHANGELOG_FILE, "## v1.0.0-beta.1 — 2026-06-01 10:00\n")
         joined = "\n".join(tray._about_lines())
         self.assertNotIn("Upgrade build", joined)
+
+    def test_about_shows_the_running_version_and_flags_a_newer_disk(self):
+        # After a `git pull` without a restart the VERSION file is ahead of the
+        # process. About reports what is RUNNING and says a restart applies it.
+        tray._parent_pid[0] = 900
+        self._write(tray.RELEASE_VERSION_FILE, "2.0.141\n")
+        self._write_hud(jarvis_version="2.0.140", jarvis_pid=900)
+        with mock.patch.object(tray, "_parent_started_at", create=True,
+                               return_value=tray.time.time() - 7200):
+            joined = "\n".join(tray._about_lines())
+        self.assertIn("Version:       2.0.140", joined)
+        self.assertIn("On disk:       2.0.141 (restart to apply)", joined)
+        self.assertIn("Uptime:        2h 0m", joined)
+
+    def test_about_ignores_another_jarvis_version(self):
+        tray._parent_pid[0] = 900
+        self._write(tray.RELEASE_VERSION_FILE, "2.0.141\n")
+        self._write_hud(jarvis_version="1.9.0", jarvis_pid=12)
+        joined = "\n".join(tray._about_lines())
+        self.assertIn("Version:       2.0.141", joined)
+        self.assertNotIn("1.9.0", joined)
+        self.assertIn("Uptime:        unknown", joined)
+
+    def test_about_shows_the_commit(self):
+        self._write(tray.RELEASE_VERSION_FILE, "2.0.141\n")
+        with mock.patch.object(tray, "_git_commit", return_value="b0dcd1c"):
+            self.assertIn("Commit:        b0dcd1c",
+                          "\n".join(tray._about_lines()))
+
+    def test_git_commit_failure_is_blank(self):
+        real = _REAL_GIT_COMMIT
+        with mock.patch.object(tray.subprocess, "run",
+                               side_effect=OSError("no git")):
+            self.assertEqual(real(), "")
+        fake = mock.Mock(returncode=128, stdout="")
+        with mock.patch.object(tray.subprocess, "run", return_value=fake):
+            self.assertEqual(real(), "")
+        ok = mock.Mock(returncode=0, stdout="abc1234\n")
+        with mock.patch.object(tray.subprocess, "run", return_value=ok):
+            self.assertEqual(real(), "abc1234")
+
+    def test_parent_started_at_reads_the_os(self):
+        tray._parent_pid[0] = os.getpid()
+        started = tray._parent_started_at()
+        if tray._HAS_PSUTIL:
+            self.assertGreater(started, 0)
+            self.assertLessEqual(started, tray.time.time())
+        tray._parent_pid[0] = 0
+        self.assertEqual(tray._parent_started_at(), 0.0)
+
+    def test_about_dialog_is_told_which_jarvis(self):
+        tray._parent_pid[0] = 31337
+        with mock.patch.object(tray.threading, "Thread") as T, \
+             mock.patch.object(tray, "_tracked_dialog_run") as run:
+            tray._on_about(mock.Mock(), mock.Mock())
+            T.call_args.kwargs["target"]()
+        argv = run.call_args.args[0]
+        self.assertIn("--about-dialog", argv)
+        self.assertEqual(argv[argv.index("--parent-pid") + 1], "31337")
 
 
 # --------------------------------------------------------------------------- #
@@ -2012,14 +2265,22 @@ class DialogEntryPointTests(TrayTestBase):
 class QuitTests(TrayTestBase):
     def test_quit_sets_stop_and_stops_icon(self):
         icon = mock.Mock()
-        tray._on_quit(icon, mock.Mock())
+        with mock.patch.object(tray, "_notify", create=True) as note:
+            tray._on_quit(icon, mock.Mock())      # first click only arms
+        self.assertFalse(tray._stop_event.is_set())
+        icon.stop.assert_not_called()
+        # The balloon tells the owner the way back (voice show_tray).
+        self.assertIn("show the tray icon", note.call_args.args[0])
+        tray._on_quit(icon, mock.Mock())          # second click quits
         self.assertTrue(tray._stop_event.is_set())
         icon.stop.assert_called_once()
 
     def test_quit_icon_stop_error_swallowed(self):
         icon = mock.Mock()
         icon.stop.side_effect = RuntimeError("already stopped")
-        tray._on_quit(icon, mock.Mock())  # must not raise
+        with mock.patch.object(tray, "_notify", create=True):
+            tray._on_quit(icon, mock.Mock())
+            tray._on_quit(icon, mock.Mock())  # must not raise
         self.assertTrue(tray._stop_event.is_set())
 
 
@@ -2045,14 +2306,17 @@ class AnimateTests(TrayTestBase):
              mock.patch.object(tray, "_read_hud_state",
                                return_value={"state": "speaking",
                                              "tts_amplitude": 0.5,
-                                             "bambu_active": True}), \
+                                             "bambu_active": True,
+                                             "tray_ready_pid": 1,
+                                             "overnight_upgrade_enabled": True}), \
              mock.patch.object(tray, "_count_pending_tasks", return_value=4):
             tray._animate(icon)
         self.assertIsNotNone(icon.icon)
-        self.assertIn("listen:awake", icon.title)
-        self.assertIn("tts:speaking", icon.title)
-        self.assertIn("queue:4", icon.title)
-        self.assertIn("bambu:printing", icon.title)
+        # Plain-English tooltip (P2): what the icon shows, in words.
+        self.assertIn("Listening", icon.title)
+        self.assertIn("speaking", icon.title)
+        self.assertIn("4 queued", icon.title)
+        self.assertIn("printing", icon.title)
 
     def test_title_reflects_muted_and_standby(self):
         icon = mock.Mock()
@@ -2061,11 +2325,12 @@ class AnimateTests(TrayTestBase):
              mock.patch.object(tray, "_parent_alive", return_value=True), \
              mock.patch.object(tray, "_read_hud_state",
                                return_value={"state": "standby",
-                                             "mic_muted": True}), \
+                                             "mic_muted": True,
+                                             "tray_ready_pid": 1}), \
              mock.patch.object(tray, "_count_pending_tasks", return_value=0):
             tray._animate(icon)
-        self.assertIn("listen:muted", icon.title)
-        self.assertIn("bambu:idle", icon.title)
+        self.assertIn("Mic muted", icon.title)
+        self.assertNotIn("printing", icon.title)
 
     def test_title_standby_label_when_not_muted(self):
         # Non-muted standby must reach the "standby" listen label branch.
@@ -2074,11 +2339,21 @@ class AnimateTests(TrayTestBase):
         with mock.patch.object(tray, "_stop_event", ev), \
              mock.patch.object(tray, "_parent_alive", return_value=True), \
              mock.patch.object(tray, "_read_hud_state",
-                               return_value={"state": "sleeping"}), \
+                               return_value={"state": "sleeping",
+                                             "tray_ready_pid": 1}), \
              mock.patch.object(tray, "_count_pending_tasks", return_value=0):
             tray._animate(icon)
-        self.assertIn("listen:standby", icon.title)
-        self.assertIn("tts:quiet", icon.title)
+        self.assertIn("Paused", icon.title)
+        self.assertNotIn("speaking", icon.title)
+
+    def test_title_says_starting_until_the_drainer_is_up(self):
+        icon = mock.Mock()
+        ev = self._one_shot_event()
+        with mock.patch.object(tray, "_stop_event", ev), \
+             mock.patch.object(tray, "_parent_alive", return_value=True), \
+             mock.patch.object(tray, "_read_hud_state", return_value={}):
+            tray._animate(icon)
+        self.assertIn("Starting", icon.title)
 
     def test_parent_dead_stops_immediately(self):
         icon = mock.Mock()
@@ -2175,13 +2450,20 @@ class MainMenuConstructionTests(TrayTestBase):
         menu = captured["kwargs"]["menu"]
         texts = [getattr(it, "text", None) for it in menu.items
                  if it is not tray.pystray.Menu.SEPARATOR]
-        for expected in ("Pause Listening", "Mute TTS", "Mute Mic",
+        for expected in ("Open Dashboard", "Settings…",
+                         "Pause Listening", "Mute TTS", "Mute Mic",
                          "Ambient Mode", "Open HUD",
-                         "Run Upgrade Now", "Restart JARVIS", "Shut Down JARVIS",
-                         "Power tools", "AI", "Audio", "Memory", "Diagnostics",
-                         "Settings", "About JARVIS", "Show Today's Summary",
+                         "Restart JARVIS", "Shut Down JARVIS",
+                         "Power tools", "AI", "Audio", "Apple Music", "Memory",
+                         "Diagnostics", "About JARVIS", "Show Today's Summary",
                          "Queue Task…", "Quit Tray Only"):
             self.assertIn(expected, texts, expected)
+        # "Run Upgrade Now" moved into Power tools (greyed while upgrades are off).
+        self.assertNotIn("Run Upgrade Now", texts)
+        power = next(it for it in menu.items
+                     if getattr(it, "text", None) == "Power tools")
+        self.assertIn("Run Upgrade Now",
+                      [getattr(it, "text", None) for it in power.submenu.items])
 
     def test_open_hud_menu_item_wired(self):
         # _on_open_hud used to be dead (defined, never put in a menu). Assert the
@@ -2232,7 +2514,8 @@ class MainMenuConstructionTests(TrayTestBase):
              mock.patch.object(tray.threading, "Thread"), \
              mock.patch.object(tray.os, "startfile", create=True), \
              mock.patch.object(tray.subprocess, "Popen"), \
-             mock.patch.object(tray.subprocess, "run"):
+             mock.patch.object(tray.subprocess, "run"), \
+             mock.patch("webbrowser.open", return_value=True):
             for it in items:
                 # pystray stores the supplied callback on the private _action
                 # attribute; the status-header items pass action=None.
@@ -2359,42 +2642,42 @@ class AppleMusicLabelTests(TrayTestBase):
     def test_label_prefers_smtc_session(self):
         with mock.patch("core.media_now_playing.now_playing_text",
                         return_value="The Lady in My Life — Michael Jackson"):
-            self.assertEqual(tray._status_text_apple_music(),
+            self.assertEqual(_REAL_NOW_PLAYING_LOOKUP(),
                              "♪ The Lady in My Life — Michael Jackson")
 
     def test_label_shows_now_playing_title(self):
         with self._patch_bridge(_FakeAppleMusicBridge(running=True,
                                                       now="Earth Song — MJ")):
-            self.assertEqual(tray._status_text_apple_music(),
+            self.assertEqual(_REAL_NOW_PLAYING_LOOKUP(),
                              "Apple Music: Earth Song — MJ")
 
     def test_label_idle_when_running_quiet(self):
         with self._patch_bridge(_FakeAppleMusicBridge(running=True, now=None)):
-            self.assertEqual(tray._status_text_apple_music(), "Apple Music: idle")
+            self.assertEqual(_REAL_NOW_PLAYING_LOOKUP(), "Apple Music: idle")
 
     def test_label_closed_when_not_running(self):
         with self._patch_bridge(_FakeAppleMusicBridge(running=False)):
-            self.assertEqual(tray._status_text_apple_music(), "Apple Music: closed")
+            self.assertEqual(_REAL_NOW_PLAYING_LOOKUP(), "Apple Music: closed")
 
     def test_label_unavailable_when_bridge_absent(self):
         with self._patch_bridge(None):
-            self.assertEqual(tray._status_text_apple_music(),
+            self.assertEqual(_REAL_NOW_PLAYING_LOOKUP(),
                              "Apple Music: unavailable")
 
     def test_label_truncates_long_title(self):
         long_title = "x" * 100
         with self._patch_bridge(_FakeAppleMusicBridge(running=True, now=long_title)):
-            out = tray._status_text_apple_music()
+            out = _REAL_NOW_PLAYING_LOOKUP()
         self.assertIn("…", out)
         self.assertLessEqual(len(out), len("Apple Music: ") + 60 + 1)
 
     def test_label_is_running_raise_degrades_to_closed(self):
         with self._patch_bridge(_FakeAppleMusicBridge(running_raises=True)):
-            self.assertEqual(tray._status_text_apple_music(), "Apple Music: closed")
+            self.assertEqual(_REAL_NOW_PLAYING_LOOKUP(), "Apple Music: closed")
 
     def test_label_now_playing_raise_degrades_to_idle(self):
         with self._patch_bridge(_FakeAppleMusicBridge(running=True, now_raises=True)):
-            self.assertEqual(tray._status_text_apple_music(), "Apple Music: idle")
+            self.assertEqual(_REAL_NOW_PLAYING_LOOKUP(), "Apple Music: idle")
 
     def test_bridge_accessor_caches_unavailable_on_import_failure(self):
         # When the bridge can't be resolved, the accessor remembers it (sentinel)
@@ -2451,8 +2734,26 @@ class AppleMusicCommandTests(TrayTestBase):
     def test_prev_sends_media_prev(self):
         self._assert_cmd(tray._on_apple_music_prev, "media_prev")
 
-    def test_open_sends_open_apple_music(self):
-        self._assert_cmd(tray._on_open_apple_music, "open_apple_music")
+    def test_open_opens_the_web_player_in_the_browser(self):
+        # The owner uses Apple Music in Chrome; the Store app (AUMID launch via
+        # open_apple_music) is not his player.
+        with mock.patch("webbrowser.open", return_value=True) as wb:
+            tray._on_open_apple_music(mock.Mock(), mock.Mock())
+        wb.assert_called_once_with("https://music.apple.com/")
+        self.assertEqual(self._read_commands(), [])
+
+    def test_open_url_is_configurable(self):
+        with mock.patch.dict(os.environ,
+                             {"JARVIS_APPLE_MUSIC_URL": "https://example.test/m"}), \
+             mock.patch("webbrowser.open", return_value=True) as wb:
+            tray._on_open_apple_music(mock.Mock(), mock.Mock())
+        wb.assert_called_once_with("https://example.test/m")
+
+    def test_open_failure_is_reported(self):
+        with mock.patch("webbrowser.open", return_value=False), \
+             mock.patch.object(tray, "_notify", create=True) as note:
+            tray._on_open_apple_music(mock.Mock(), mock.Mock())
+        note.assert_called_once()
 
 
 class AppleMusicMenuTests(TrayTestBase):
@@ -2519,18 +2820,29 @@ class AppleMusicMenuTests(TrayTestBase):
         items = {getattr(it, "text", None): it for it in self._flatten(menu)}
         for label, cmd in (("Play / Pause", "media_playpause"),
                            ("Next", "media_next"),
-                           ("Previous", "media_prev"),
-                           ("Open Apple Music", "open_apple_music")):
+                           ("Previous", "media_prev")):
             with mock.patch.object(tray, "_send_command") as sc:
                 items[label](mock.Mock())
             sc.assert_called_once_with(cmd)
+        with mock.patch("webbrowser.open", return_value=True) as wb, \
+             mock.patch.object(tray, "_send_command") as sc:
+            items["Open Apple Music"](mock.Mock())
+        wb.assert_called_once()
+        sc.assert_not_called()
+
+    def _prime_header(self):
+        """Run one real (off-thread, time-boxed) now-playing refresh."""
+        with mock.patch.object(tray, "_now_playing_lookup",
+                               side_effect=_REAL_NOW_PLAYING_LOOKUP):
+            tray._refresh_now_playing(timeout=5.0)
 
     def test_now_playing_header_present_and_dynamic(self):
-        # The header is a disabled item whose text comes from the now-playing
-        # builder; evaluating it with a fake bridge reflects the track.
+        # The header is a disabled item whose text is the CACHED now-playing
+        # label; a refresh with a fake bridge reflects the track.
         with mock.patch.object(tray, "_apple_music_app",
                                return_value=_FakeAppleMusicBridge(running=True,
                                                                   now="A Song")):
+            self._prime_header()
             menu = self._build_menu()
             am_item = next(it for it in menu.items
                            if getattr(it, "text", "") == "Apple Music")
@@ -2542,6 +2854,7 @@ class AppleMusicMenuTests(TrayTestBase):
         # With the bridge unavailable, the submenu must still build and its label
         # must render the 'unavailable' text without raising.
         with mock.patch.object(tray, "_apple_music_app", return_value=None):
+            self._prime_header()
             menu = self._build_menu()
             am_item = next(it for it in menu.items
                            if getattr(it, "text", "") == "Apple Music")
@@ -2642,7 +2955,10 @@ class SpawnedDialogTrackingTests(TrayTestBase):
         proc = mock.Mock(); proc.poll.return_value = None
         tray._dialog_procs[:] = [proc]
         self.addCleanup(tray._dialog_procs.clear)
-        tray._on_quit(mock.Mock(), mock.Mock())
+        with mock.patch.object(tray, "_notify", create=True):
+            tray._on_quit(mock.Mock(), mock.Mock())   # arm (second-click gate)
+            proc.terminate.assert_not_called()
+            tray._on_quit(mock.Mock(), mock.Mock())   # confirm
         proc.terminate.assert_called_once()
         self.assertEqual(tray._dialog_procs, [])
 
@@ -2655,6 +2971,783 @@ class SpawnedDialogTrackingTests(TrayTestBase):
             tray._animate(icon)
         proc.terminate.assert_called_once()
         icon.stop.assert_called_once()
+
+
+# =========================================================================== #
+# 2026-09-30 tray audit fixes.
+#
+# The fake pystray above evaluates every lambda LIVE on each access, which is
+# why the old suite never saw the stale-checkmark bug: the real win32 backend
+# freezes the whole menu into an HMENU at update_menu() time and rebuilds it
+# only (a) when Icon.run() marks itself ready and (b) right AFTER a click —
+# before the monolith's 2 Hz drainer has applied the toggle. _CachingFakeIcon
+# reproduces exactly that (proven against pystray 0.19.5 by the audit probe
+# probe_pystray_staleness.py).
+# =========================================================================== #
+class _CachingFakeIcon:
+    """pystray.Icon stand-in that CACHES the menu like the win32 backend."""
+
+    HAS_NOTIFICATION = True
+
+    def __init__(self, name, icon=None, title=None, menu=None, **_kw):
+        self.name = name
+        self.icon = icon
+        self.title = title
+        self.menu = menu
+        self.notifications = []
+        self.builds = 0
+        self._snapshot = []
+        self.update_menu()          # pystray's menu setter does this too
+
+    # -- what pystray does ------------------------------------------------- #
+    def update_menu(self):
+        self.builds += 1
+        self._snapshot = self._freeze(self.menu)
+
+    def _freeze(self, menu):
+        out = []
+        for item in menu:            # visible items only, like pystray
+            if item is tray.pystray.Menu.SEPARATOR:
+                out.append(None)
+                continue
+            sub = item.submenu
+            out.append({"text": item.text, "checked": bool(item.checked),
+                        "enabled": bool(item.enabled),
+                        "default": bool(item.default), "item": item,
+                        "sub": self._freeze(sub) if sub else None})
+        return out
+
+    def notify(self, message, title=None):
+        self.notifications.append((title, message))
+
+    def run(self, *a, **k):
+        pass
+
+    def stop(self, *a, **k):
+        pass
+
+    # -- what the owner sees / does --------------------------------------- #
+    def shown(self, *path):
+        """The FROZEN entry a right-click would display (by label path)."""
+        entries = self._snapshot
+        entry = None
+        for label in path:
+            entry = next(e for e in entries
+                         if e is not None and e["text"] == label)
+            entries = entry["sub"] or []
+        return entry
+
+    def click(self, *path):
+        """pystray win32 _on_notify: run the frozen item's callback, then
+        (via Icon._handler) rebuild the menu immediately."""
+        entry = self.shown(*path)
+        try:
+            entry["item"](self)
+        finally:
+            self.update_menu()
+
+
+class _TrayFixBase(TrayTestBase):
+    def _n_shot_event(self, n=1):
+        """An Event whose n-th .wait() sets it: _animate runs n iterations."""
+        ev = threading.Event()
+        real_wait = ev.wait
+        left = [n]
+
+        def wait(timeout=None):
+            left[0] -= 1
+            if left[0] <= 0:
+                ev.set()
+            return real_wait(0)
+        ev.wait = wait
+        return ev
+
+    def _tick(self, icon, n=1):
+        """Exactly n _animate iterations (the tray's 5 Hz loop)."""
+        with mock.patch.object(tray, "_stop_event", self._n_shot_event(n)), \
+             mock.patch.object(tray, "_parent_alive", return_value=True):
+            tray._animate(icon)
+
+    def _main_icon(self, argv=("tray.py",)):
+        """Run the REAL main() with the caching fake as pystray.Icon."""
+        made = {}
+
+        def factory(*a, **k):
+            made["icon"] = _CachingFakeIcon(*a, **k)
+            return made["icon"]
+        with mock.patch.object(sys, "argv", list(argv)), \
+             mock.patch.object(tray, "_load_base_icon"), \
+             mock.patch.object(tray.threading, "Thread",
+                               side_effect=lambda *a, **k: mock.Mock()), \
+             mock.patch.object(tray.pystray, "Icon", side_effect=factory):
+            tray.main()
+        return made["icon"]
+
+    def _ready_hud(self, **fields):
+        fields.setdefault("tray_ready_pid", 1)
+        self._write_hud(**fields)
+
+
+class StaleMenuTests(_TrayFixBase):
+    """P0: checkmarks ran one click behind."""
+
+    def _mute_then_drainer_applies(self):
+        self._ready_hud(mic_muted=False)
+        icon = self._main_icon()
+        self.assertFalse(icon.shown("Mute Mic")["checked"])
+        icon.click("Mute Mic")
+        self.assertEqual(self._last_command()["cmd"], "mic_mute_toggle")
+        # pystray rebuilt BEFORE the monolith applied the toggle:
+        self.assertFalse(icon.shown("Mute Mic")["checked"])
+        # ~0.5 s later the 2 Hz drainer applies it and republishes hud_state.
+        self._ready_hud(mic_muted=True)
+        return icon
+
+    def test_checkmark_catches_up_on_the_next_tick(self):
+        icon = self._mute_then_drainer_applies()
+        self._tick(icon)
+        self.assertTrue(icon.shown("Mute Mic")["checked"],
+                        "the menu still shows the state from before the click")
+
+    def test_status_line_catches_up_too(self):
+        icon = self._mute_then_drainer_applies()
+        self._tick(icon)
+        self.assertIn("● Listening: muted",
+                      [e["text"] for e in icon._snapshot if e])
+
+    def test_submenu_checkmark_catches_up(self):
+        self._ready_hud(daemons_paused=False)
+        icon = self._main_icon()
+        icon.click("Power tools", "Pause All Daemons")
+        self._ready_hud(daemons_paused=True)
+        self._tick(icon)
+        self.assertTrue(icon.shown("Power tools", "Pause All Daemons")["checked"])
+
+    def test_no_rebuild_when_nothing_changed(self):
+        self._ready_hud(mic_muted=False)
+        icon = self._main_icon()
+        self._tick(icon)                       # first tick records the sig
+        builds = icon.builds
+        tray._menu_state["at"] = 0.0           # debounce is not the reason
+        self._tick(icon)
+        self.assertEqual(icon.builds, builds)
+
+    def test_rebuilds_are_debounced(self):
+        self._ready_hud(mic_muted=False)
+        icon = self._main_icon()
+        self._tick(icon)
+        builds = icon.builds
+        self._ready_hud(mic_muted=True)
+        tray._menu_state["at"] = time.time()   # a rebuild just happened
+        self._tick(icon)
+        self.assertEqual(icon.builds, builds, "rebuilt inside the debounce")
+        tray._menu_state["at"] = time.time() - tray.MENU_REFRESH_MIN_S - 0.01
+        self._tick(icon)
+        self.assertEqual(icon.builds, builds + 1)
+        self.assertTrue(icon.shown("Mute Mic")["checked"])
+
+    def test_no_rebuild_while_the_menu_is_open(self):
+        self._ready_hud(mic_muted=False)
+        icon = self._main_icon()
+        self._tick(icon)
+        builds = icon.builds
+        self._ready_hud(mic_muted=True)
+        tray._menu_open.set()
+        self._tick(icon)
+        self.assertEqual(icon.builds, builds)
+        tray._menu_open.clear()
+        tray._menu_state["at"] = 0.0
+        self._tick(icon)
+        self.assertEqual(icon.builds, builds + 1)
+
+    def test_menu_lambdas_read_one_snapshot_per_tick(self):
+        # Evaluating the whole menu must not re-read hud_state.json per item.
+        self._ready_hud(mic_muted=True)
+        icon = self._main_icon()
+        real_open = open
+        reads = []
+
+        def counting_open(path, *a, **k):
+            if os.path.normcase(str(path)) == os.path.normcase(tray.HUD_STATE_FILE):
+                reads.append(path)
+            return real_open(path, *a, **k)
+        with mock.patch("builtins.open", side_effect=counting_open):
+            self._tick(icon)
+        self.assertLessEqual(len(reads), 1)
+
+    def test_menu_open_guard_wraps_the_win32_notify_handler(self):
+        seen = []
+
+        class _Win32ish:
+            def __init__(self):
+                self._message_handlers = {0x401: self._on_notify, 2: lambda *a: 0}
+
+            def _on_notify(self, wparam, lparam):
+                seen.append(tray._menu_open.is_set())
+                return 7
+        icon = _Win32ish()
+        self.assertTrue(tray._install_menu_open_guard(icon))
+        self.assertEqual(icon._message_handlers[0x401](0, 0), 7)
+        self.assertEqual(seen, [True])
+        self.assertFalse(tray._menu_open.is_set())
+        self.assertFalse(tray._install_menu_open_guard(mock.Mock()))
+
+    def test_signature_failure_forces_a_rebuild_not_a_crash(self):
+        bad = mock.Mock()
+        bad.__iter__ = mock.Mock(side_effect=RuntimeError("boom"))
+        sig = tray._menu_signature(bad)
+        self.assertEqual(sig[0][0], "error")
+
+
+class SettingsMenuTests(_TrayFixBase):
+    """Settings shortcut: (1) a real clickable item, no duplicate."""
+
+    def test_settings_is_a_clickable_top_level_item(self):
+        icon = self._main_icon()
+        entry = icon.shown("Settings…")
+        self.assertIsNone(entry["sub"], "Settings must not be a submenu header")
+        with mock.patch.object(tray, "_open_settings_window") as osw:
+            with mock.patch.object(tray.threading, "Thread",
+                                   side_effect=lambda target, args=(), **k:
+                                   mock.Mock(start=lambda: target(*args))):
+                icon.click("Settings…")
+        osw.assert_called_once_with("")
+
+    def test_no_settings_duplicate_left_in_audio(self):
+        icon = self._main_icon()
+        audio = [e["text"] for e in icon.shown("Audio")["sub"] if e]
+        self.assertFalse([t for t in audio if "settings" in t.lower()], audio)
+        top = [e["text"] for e in icon._snapshot if e]
+        self.assertEqual(sum(1 for t in top if t.lower().startswith("settings")), 1)
+
+
+class SettingsLaunchSubprocessTests(TrayTestBase):
+    """(2) Run the tray's EXACT launch command for real, window-free: the
+    module form must import and resolve `core` from the tray's cwd."""
+
+    def _captured_launch(self):
+        self._write(tray.SETTINGS_WINDOW, "# settings")
+        with mock.patch.object(tray.subprocess, "Popen",
+                               return_value=_FakeProc(rc=None)) as P, \
+             mock.patch.object(tray, "_notify", create=True):
+            tray._open_settings_window("ai")
+        return P.call_args.args[0], P.call_args.kwargs
+
+    def test_exact_launch_command_imports_from_the_project_root(self):
+        argv, kw = self._captured_launch()
+        self.assertEqual(os.path.normcase(kw.get("cwd") or ""),
+                         os.path.normcase(tray.PROJECT_DIR),
+                         "the launch must set cwd to the project root")
+        env = dict(os.environ)
+        env.pop("PYTHONPATH", None)            # the tray has none
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        # The same interpreter + launch form, with --help swapped in for the
+        # tab so argparse exits before any window could be built.
+        help_argv = [a for a in argv if a not in ("--tab", "ai")] + ["--help"]
+        r = subprocess.run(help_argv, cwd=_REAL_PROJECT_DIR, env=env,
+                           capture_output=True, text=True, timeout=60,
+                           creationflags=flags)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("--tab", r.stdout)
+        # And the window's lazy `from core import …` (what failed live) works
+        # under the same sys.path rule a module run gets (cwd first).
+        probe = ("import sys, runpy; sys.argv = ['settings_window', '--help'];\n"
+                 "import tools.settings_window as sw\n"
+                 "sys.exit(0 if sw._model_lockstep() is not None else 3)\n")
+        r2 = subprocess.run([argv[0], "-c", probe], cwd=_REAL_PROJECT_DIR,
+                            env=env, capture_output=True, text=True,
+                            timeout=60, creationflags=flags)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+
+
+class ResultRoundTripTests(_TrayFixBase):
+    """P0: ~18 items showed no result."""
+
+    def _write_results(self, *entries):
+        self._write(tray.TRAY_RESULTS_FILE, json.dumps({"results": list(entries)}))
+        tray._results_state["checked_at"] = 0.0
+        tray._results_state["mtime"] = None
+
+    def test_click_to_balloon(self):
+        self._ready_hud()
+        icon = self._main_icon()
+        icon.click("AI", "Show LLM Call Stats")
+        cmd = self._last_command()
+        self.assertEqual(cmd["cmd"], "show_llm_stats")
+        rid = cmd["rid"]
+        self._write_results({"rid": rid, "cmd": "show_llm_stats", "seq": 1,
+                             "final": True, "text": "backend=ollama model=x"})
+        self._tick(icon)
+        self.assertEqual(icon.notifications,
+                         [("JARVIS — LLM Call Stats", "backend=ollama model=x")])
+        self.assertNotIn(rid, tray._pending)
+        self._tick(icon)                       # shown once, never again
+        self.assertEqual(len(icon.notifications), 1)
+
+    def test_interim_then_final(self):
+        tray._icon_ref[0] = icon = _CachingFakeIcon("t", menu=tray.pystray.Menu())
+        rid = tray._send_request("force_backup", "Force Backup")
+        self._write_results({"rid": rid, "seq": 1, "final": False,
+                             "text": "backup started"})
+        tray._poll_results()
+        self.assertIn(rid, tray._pending)
+        self._write_results({"rid": rid, "seq": 1, "final": False,
+                             "text": "backup started"},
+                            {"rid": rid, "seq": 2, "final": True,
+                             "text": "backup -> 20260930_101500"})
+        tray._poll_results()
+        self.assertEqual([m for _, m in icon.notifications],
+                         ["backup started", "backup -> 20260930_101500"])
+        self.assertNotIn(rid, tray._pending)
+
+    def test_final_before_interim_shows_only_the_final(self):
+        # The monolith's worker can finish before the dispatcher files the
+        # interim "started" line; the late interim must not pop up after.
+        tray._icon_ref[0] = icon = _CachingFakeIcon("t", menu=tray.pystray.Menu())
+        rid = tray._send_request("force_backup", "Force Backup")
+        self._write_results({"rid": rid, "seq": 2, "final": True,
+                             "text": "backup -> X"},
+                            {"rid": rid, "seq": 1, "final": False,
+                             "text": "backup started"})
+        tray._poll_results()
+        self.assertEqual([m for _, m in icon.notifications], ["backup -> X"])
+
+    def test_a_second_write_with_the_same_mtime_is_still_read(self):
+        # Windows file times tick coarsely: interim + final can share an
+        # mtime. The size differs, and a pending request re-reads anyway.
+        tray._icon_ref[0] = icon = _CachingFakeIcon("t", menu=tray.pystray.Menu())
+        rid = tray._send_request("force_backup", "Force Backup")
+        self._write_results({"rid": rid, "seq": 1, "final": False,
+                             "text": "backup started"})
+        tray._poll_results()
+        st = os.stat(tray.TRAY_RESULTS_FILE)
+        self._write(tray.TRAY_RESULTS_FILE, json.dumps({"results": [
+            {"rid": rid, "seq": 1, "final": False, "text": "backup started"},
+            {"rid": rid, "seq": 2, "final": True, "text": "backup -> Y"}]}))
+        os.utime(tray.TRAY_RESULTS_FILE, ns=(st.st_atime_ns, st.st_mtime_ns))
+        tray._results_state["checked_at"] = 0.0      # next 5 Hz poll
+        tray._poll_results()
+        self.assertEqual([m for _, m in icon.notifications],
+                         ["backup started", "backup -> Y"])
+
+    def test_answers_to_other_requests_are_ignored(self):
+        tray._icon_ref[0] = icon = _CachingFakeIcon("t", menu=tray.pystray.Menu())
+        tray._send_request("test_mic", "Test Mic")
+        self._write_results({"rid": "r999-1", "seq": 1, "final": True,
+                             "text": "not ours"})
+        self.assertEqual(tray._poll_results(), 0)
+        self.assertEqual(icon.notifications, [])
+
+    def test_long_answer_opens_as_a_text_file(self):
+        tray._icon_ref[0] = icon = _CachingFakeIcon("t", menu=tray.pystray.Menu())
+        rid = tray._send_request("show_last_diagnostic", "Last Diagnostic Run")
+        body = "\n".join(f"probe {i}: OK" for i in range(40))
+        self._write_results({"rid": rid, "seq": 1, "final": True, "text": body})
+        with mock.patch.object(tray, "_open_path") as op:
+            tray._poll_results()
+        path = op.call_args.args[0]
+        self.assertTrue(path.endswith("show_last_diagnostic.txt"))
+        with open(path, encoding="utf-8") as f:
+            self.assertIn("probe 39: OK", f.read())
+        self.assertIn("full output opened", icon.notifications[0][1])
+
+    def test_balloon_text_is_clipped_to_the_shell_limit(self):
+        icon = _CachingFakeIcon("t", menu=tray.pystray.Menu())
+        tray._icon_ref[0] = icon
+        self.assertTrue(tray._notify("x" * 1000, "T" * 200))
+        title, msg = icon.notifications[0]
+        self.assertLessEqual(len(msg), 256)
+        self.assertLessEqual(len(title), 64)
+
+    def test_pending_requests_expire(self):
+        rid = tray._send_request("run_diagnostic", "Diagnostic")
+        tray._pending[rid]["sent_at"] = time.time() - tray.RESULT_WAIT_S - 1
+        tray._poll_results()
+        self.assertNotIn(rid, tray._pending)
+
+    def test_every_answering_item_sends_a_request(self):
+        # The 18 audit items: each must ask for an answer (rid).
+        self._ready_hud(overnight_upgrade_enabled=True)
+        icon = self._main_icon()
+        paths = [("Power tools", "Force Backup Now"),
+                 ("Power tools", "Reload All Skills"),
+                 ("Power tools", "Run Smoke Test"),
+                 ("AI", "Show LLM Call Stats"),
+                 ("AI", "Switch to Local LLM (default)"),
+                 ("Memory", "Recent Facts Learned (last 24h)"),
+                 ("Memory", "Export Memory (JSON)"),
+                 ("Diagnostics", "Run Diagnostic Now"),
+                 ("Diagnostics", "Show Last Diagnostic Run"),
+                 ("Diagnostics", "Test Mic"), ("Diagnostics", "Test TTS"),
+                 ("Diagnostics", "Test Vision"),
+                 ("Diagnostics", "Test Each Skill"),
+                 ("Diagnostics", "Latency Benchmark")]
+        for path in paths:
+            icon.click(*path)
+            self.assertTrue(self._last_command().get("rid"), path)
+        # Confirm-gated ones answer too (after the second click).
+        with mock.patch.object(tray, "_notify", create=True):
+            for path in (("Memory", "Forget Last Hour"), ("Memory", "Reset Memory…")):
+                icon.click(*path)
+                armed = "⚠ Click again: " + path[-1]
+                icon.click(path[0], armed)
+                self.assertTrue(self._last_command().get("rid"), path)
+
+
+class ConfirmGateTests(_TrayFixBase):
+    """P1: destructive one-clicks need a second click (no modal popups)."""
+
+    def test_first_click_arms_and_relabels(self):
+        icon = self._main_icon()
+        tray._icon_ref[0] = icon
+        icon.click("Restart JARVIS")
+        self.assertEqual(self._read_commands(), [])
+        self.assertIn("again", icon.notifications[-1][1])
+        # The rebuilt menu names the pending confirmation.
+        self.assertIsNotNone(icon.shown("⚠ Click again: Restart JARVIS"))
+        icon.click("⚠ Click again: Restart JARVIS")
+        self.assertEqual(self._last_command()["cmd"], "restart")
+        self.assertIsNotNone(icon.shown("Restart JARVIS"))   # disarmed
+
+    def test_confirmation_expires(self):
+        with mock.patch.object(tray, "_notify", create=True):
+            self.assertFalse(tray._confirmed("k", "Thing"))
+            tray._confirm_armed["k"] = time.time() - 1      # window passed
+            self.assertFalse(tray._confirmed("k", "Thing"))   # re-armed
+            self.assertTrue(tray._confirmed("k", "Thing"))
+
+    def test_gated_items(self):
+        # Every item the audit named needs the second click.
+        cases = [(tray._on_reset_memory, "reset_memory"),
+                 (tray._on_forget_last_hour, "forget_last_hour"),
+                 (tray._on_switch_anthropic, "switch_llm"),
+                 (tray._on_restart, "restart"),
+                 (tray._on_shutdown_jarvis, "shutdown_jarvis")]
+        for fn, cmd in cases:
+            with self.subTest(cmd=cmd), mock.patch.object(tray, "_notify", create=True):
+                before = len(self._read_commands())
+                fn(mock.Mock(), mock.Mock())
+                self.assertEqual(len(self._read_commands()), before, cmd)
+                fn(mock.Mock(), mock.Mock())
+                self.assertEqual(self._last_command()["cmd"], cmd)
+                tray._confirm_armed.clear()
+
+
+class UpgradeGatingTests(_TrayFixBase):
+    """P0: Run Upgrade Now + the queue badge while upgrades are off."""
+
+    def test_run_upgrade_greyed_when_upgrades_off(self):
+        self._ready_hud(overnight_upgrade_enabled=False)
+        icon = self._main_icon()
+        self.assertFalse(icon.shown("Power tools", "Run Upgrade Now")["enabled"])
+        self._ready_hud(overnight_upgrade_enabled=True)
+        self._tick(icon)
+        self.assertTrue(icon.shown("Power tools", "Run Upgrade Now")["enabled"])
+
+    def test_run_upgrade_callback_refuses_when_off(self):
+        self._ready_hud()
+        with mock.patch.object(tray, "_notify", create=True) as note:
+            tray._on_force_upgrade(mock.Mock(), mock.Mock())
+        self.assertEqual(self._read_commands(), [])
+        note.assert_called_once()
+
+    def test_queue_badge_and_line_hidden_when_upgrades_off(self):
+        self._write(tray.TODO_FILE, "".join(f"- [ ] t{i}\n" for i in range(150)))
+        self._bust_queue_cache()
+        self._ready_hud(overnight_upgrade_enabled=False)
+        icon = self._main_icon()
+        texts = [e["text"] for e in icon._snapshot if e]
+        self.assertFalse([t for t in texts if t.startswith("● Queue")])
+        captured = {}
+        real = tray._render_icon
+
+        def spy(*a, **k):
+            captured["queue_count"] = k.get("queue_count")
+            return real(*a, **k)
+        with mock.patch.object(tray, "_render_icon", side_effect=spy):
+            self._tick(icon)
+        self.assertEqual(captured.get("queue_count"), 0)
+        self.assertNotIn("queued", icon.title)
+
+    def test_queue_dialog_wording_follows_the_upgrade_switch(self):
+        seen = {}
+
+        def ask(title, prompt, parent=None):
+            seen["prompt"] = prompt
+            return None
+        fake_tk = mock.Mock()
+        with mock.patch.object(tray, "_HAS_TK", True), \
+             mock.patch.object(tray, "tk", fake_tk, create=True), \
+             mock.patch.object(tray, "simpledialog",
+                               mock.Mock(askstring=ask), create=True):
+            self._ready_hud(overnight_upgrade_enabled=False)
+            tray._run_queue_task_dialog()
+            self.assertNotIn("overnight upgrade:", seen["prompt"])
+            self.assertIn("Claude Code", seen["prompt"])
+            self._ready_hud(overnight_upgrade_enabled=True)
+            tray._run_queue_task_dialog()
+            self.assertIn("next overnight upgrade", seen["prompt"])
+
+
+class RealStateCheckmarkTests(_TrayFixBase):
+    """P1: Pause Listening + Ambient Mode read the real state."""
+
+    def test_pause_listening_reads_the_standby_flags(self):
+        # In standby the main loop keeps state='idle' — the label lies.
+        self._ready_hud(state="idle", sleep_mode=True, standby_mode=True)
+        icon = self._main_icon()
+        self.assertTrue(icon.shown("Pause Listening")["checked"])
+        self.assertIn("● Listening: standby", [e["text"] for e in icon._snapshot if e])
+        icon.click("Pause Listening")
+        self.assertEqual(self._last_command()["cmd"], "force_wake")
+
+    def test_pause_listening_unchecked_when_awake_even_if_label_says_standby(self):
+        self._ready_hud(state="standby", sleep_mode=False, standby_mode=False)
+        self.assertFalse(tray._is_listen_paused())
+
+    def test_state_label_is_only_a_fallback(self):
+        self._write_hud(state="standby")
+        self.assertTrue(tray._is_listen_paused())
+
+    def test_ambient_checkmark_reads_the_running_daemon(self):
+        self._ready_hud(ambient_mode_active=False, ambient_listening=True)
+        icon = self._main_icon()
+        self.assertTrue(icon.shown("Ambient Mode")["checked"])
+
+    def test_standby_icon_is_gray(self):
+        s = tray._classify_state({"state": "idle", "standby_mode": True})
+        self.assertEqual(s["state"], "standby")
+
+
+class LeftClickDashboardTests(_TrayFixBase):
+    """P1: a default (left-click) action."""
+
+    def test_dashboard_is_the_default_item(self):
+        icon = self._main_icon()
+        defaults = [e["text"] for e in icon._snapshot if e and e["default"]]
+        self.assertEqual(defaults, ["Open Dashboard"])
+
+    def test_left_click_opens_the_dashboard_when_it_runs(self):
+        self._ready_hud(web_port=8766)
+        icon = self._main_icon()
+        with mock.patch("webbrowser.open", return_value=True) as wb:
+            icon.menu(icon)                    # pystray: left-click = menu(icon)
+        wb.assert_called_once_with("http://127.0.0.1:8766/")
+
+    def test_left_click_shows_status_when_the_dashboard_is_off(self):
+        self._ready_hud(web_port=0, mic_muted=True)
+        icon = self._main_icon()
+        tray._icon_ref[0] = icon
+        with mock.patch("webbrowser.open") as wb:
+            icon.menu(icon)
+        wb.assert_not_called()
+        self.assertIn("Mic muted", icon.notifications[-1][1])
+
+
+class RemovedDeadItemsTests(_TrayFixBase):
+    def test_no_fake_cache_items_and_no_dead_picker(self):
+        icon = self._main_icon()
+
+        def walk(entries):
+            for e in entries:
+                if e is None:
+                    continue
+                yield e["text"]
+                if e["sub"]:
+                    yield from walk(e["sub"])
+        texts = list(walk(icon._snapshot))
+        for gone in ("Clear LLM Cache", "Reset Local LLM Cache",
+                     "Switch to Local LLM (other…)"):
+            self.assertNotIn(gone, texts)
+        self.assertIn("Open Logs Folder", texts)       # dead callback now wired
+
+
+class LocalModelPickerTests(_TrayFixBase):
+    def test_picker_lists_installed_models_with_the_active_one_checked(self):
+        tray._models_cache.update({"tags": ["gemma4:12b", "qwen3:8b"],
+                                   "at": time.time()})
+        self._ready_hud(llm_backend="qwen3:8b")
+        icon = self._main_icon()
+        sub = icon.shown("AI", "Local Model")["sub"]
+        self.assertEqual([e["text"] for e in sub], ["gemma4:12b", "qwen3:8b"])
+        self.assertEqual([e["checked"] for e in sub], [False, True])
+        icon.click("AI", "Local Model", "gemma4:12b")
+        cmd = self._last_command()
+        self.assertEqual((cmd["cmd"], cmd["backend"]), ("switch_llm", "gemma4:12b"))
+
+    def test_picker_says_so_when_ollama_is_down(self):
+        icon = self._main_icon()
+        sub = icon.shown("AI", "Local Model")["sub"]
+        self.assertEqual(len(sub), 1)
+        self.assertFalse(sub[0]["enabled"])
+
+    def test_fetch_parses_api_tags_and_skips_embedders(self):
+        body = json.dumps({"models": [{"name": "qwen3:8b"},
+                                      {"name": "nomic-embed-text:latest"},
+                                      {"model": "gemma4:12b"}]}).encode()
+        resp = mock.MagicMock()
+        resp.__enter__.return_value.read.return_value = body
+        with mock.patch("urllib.request.urlopen", return_value=resp) as uo:
+            self.assertEqual(_REAL_FETCH_LOCAL_MODELS(timeout=1),
+                             ["gemma4:12b", "qwen3:8b"])
+        self.assertEqual(uo.call_args.kwargs.get("timeout"), 1)
+        with mock.patch("urllib.request.urlopen", side_effect=OSError("down")):
+            self.assertEqual(_REAL_FETCH_LOCAL_MODELS(timeout=1), [])
+
+
+class NowPlayingCacheTests(_TrayFixBase):
+    """P1: the now-playing lookup inside every menu rebuild had no timeout."""
+
+    def test_a_hung_lookup_never_blocks_the_menu(self):
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+
+        def hang():
+            gate.wait(10)
+            return "never"
+        with mock.patch.object(tray, "_now_playing_lookup", side_effect=hang):
+            t0 = time.time()
+            label = tray._status_text_apple_music()     # menu path
+            self.assertLess(time.time() - t0, 0.5)
+            self.assertEqual(label, "♪ …")
+            t0 = time.time()
+            tray._refresh_now_playing(timeout=0.2)       # bounded refresh
+            self.assertLess(time.time() - t0, 2.0)
+
+    def test_label_is_cached_between_refreshes(self):
+        calls = []
+        with mock.patch.object(tray, "_now_playing_lookup",
+                               side_effect=lambda: calls.append(1) or "♪ Song"):
+            tray._refresh_now_playing(timeout=2)
+            for _ in range(20):
+                self.assertEqual(tray._status_text_apple_music(), "♪ Song")
+        self.assertEqual(len(calls), 1)
+
+
+class TrayLogTests(TrayTestBase):
+    """(3) The tray's output goes to logs\\tray.log."""
+
+    def test_prints_and_tracebacks_land_in_the_log(self):
+        path = os.path.join(self.dir, "logs", "tray.log")
+        saved = (sys.stdout, sys.stderr, threading.excepthook,
+                 list(tray.logging.getLogger().handlers))
+        self.addCleanup(tray.logging.getLogger().setLevel,
+                        tray.logging.getLogger().level)
+        orig_out, orig_err = io.StringIO(), io.StringIO()
+        sys.stdout, sys.stderr = orig_out, orig_err
+        try:
+            self.assertTrue(_REAL_SETUP_TRAY_LOGGING(path))
+            print("[tray] hello from the tray")
+            tray.logging.getLogger().error("boom %s", 42)
+        finally:
+            fh = tray._tray_log_handle[0]
+            sys.stdout, sys.stderr, threading.excepthook, handlers = saved
+            root = tray.logging.getLogger()
+            for h in list(root.handlers):
+                if h not in handlers:
+                    root.removeHandler(h)
+            if fh is not None:
+                fh.close()
+            tray._tray_log_handle[0] = None
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("[tray] hello from the tray", text)
+        self.assertIn("boom 42", text)
+        self.assertIn("hello from the tray", orig_out.getvalue())   # tee
+
+    def test_log_is_rolled_when_big(self):
+        path = os.path.join(self.dir, "logs", "tray.log")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("x" * (tray.TRAY_LOG_MAX_BYTES + 10))
+        saved = (sys.stdout, sys.stderr, threading.excepthook,
+                 list(tray.logging.getLogger().handlers))
+        self.addCleanup(tray.logging.getLogger().setLevel,
+                        tray.logging.getLogger().level)
+        sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+        try:
+            _REAL_SETUP_TRAY_LOGGING(path)
+        finally:
+            fh = tray._tray_log_handle[0]
+            sys.stdout, sys.stderr, threading.excepthook, handlers = saved
+            root = tray.logging.getLogger()
+            for h in list(root.handlers):
+                if h not in handlers:
+                    root.removeHandler(h)
+            if fh is not None:
+                fh.close()
+            tray._tray_log_handle[0] = None
+        self.assertTrue(os.path.exists(path + ".1"))
+        self.assertLess(os.path.getsize(path), 1000)
+
+    def test_main_attaches_the_log(self):
+        with mock.patch.object(sys, "argv", ["tray.py"]), \
+             mock.patch.object(tray, "_load_base_icon"), \
+             mock.patch.object(tray.threading, "Thread"), \
+             mock.patch.object(tray.pystray, "Icon"), \
+             mock.patch.object(tray, "_setup_tray_logging") as setup:
+            tray.main()
+        setup.assert_called_once()
+
+
+class IconRenderTests(_TrayFixBase):
+    """P2: unchanged icons aren't re-pushed; alert + voice-mute are shown."""
+
+    def test_static_icon_is_pushed_once(self):
+        icon = mock.MagicMock()
+        icon.menu = None
+        self._ready_hud(state="idle")
+        with mock.patch.object(tray, "_render_icon",
+                               wraps=tray._render_icon) as r:
+            self._tick(icon)
+            self._tick(icon)
+            self._tick(icon)
+        self.assertEqual(r.call_count, 1)
+
+    def test_speaking_still_animates(self):
+        icon = mock.MagicMock()
+        icon.menu = None
+        self._ready_hud(state="speaking", tts_amplitude=0.0)
+        with mock.patch.object(tray, "_render_icon",
+                               wraps=tray._render_icon) as r:
+            self._tick(icon, n=2)              # two frames of one loop
+        self.assertEqual(r.call_count, 2)
+
+    def test_alert_and_tts_mute_change_the_icon(self):
+        base = tray._render_icon("idle", 0).tobytes()
+        self.assertNotEqual(tray._render_icon("idle", 0, alert=True).tobytes(), base)
+        self.assertNotEqual(tray._render_icon("idle", 0, tts_muted=True).tobytes(),
+                            base)
+        s = tray._classify_state({"alert_active": True, "tts_muted": True})
+        self.assertTrue(s["alert"])
+        self.assertTrue(s["tts_muted"])
+
+
+class CrashReportsTests(TrayTestBase):
+    def test_opens_jarvis_crash_log_when_present(self):
+        os.makedirs(os.path.dirname(tray.CRASH_TRACES_LOG), exist_ok=True)
+        self._write(tray.CRASH_TRACES_LOG, "Fatal Python error\n")
+        with mock.patch.object(tray, "_open_path") as op, \
+             mock.patch.object(tray.os, "startfile", create=True) as sf:
+            tray._open_event_viewer_crashes()
+        op.assert_called_once_with(tray.CRASH_TRACES_LOG, "crash_traces.log")
+        sf.assert_not_called()
+
+
+class SendCommandConcurrencyTests(TrayTestBase):
+    """P2: concurrent tray writers must not lose a click."""
+
+    def test_parallel_senders_lose_nothing(self):
+        threads = [threading.Thread(target=tray._send_command, args=(f"c{i}",))
+                   for i in range(12)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        cmds = self._read_commands()
+        self.assertEqual(sorted(c["cmd"] for c in cmds),
+                         sorted(f"c{i}" for i in range(12)))
+        self.assertEqual(len({c["cid"] for c in cmds}), 12)
 
 
 if __name__ == "__main__":

@@ -981,33 +981,55 @@ class ReloadSkillsTests(_BaseActTest):
 
 # ── _act_show_recent_facts ───────────────────────────────────────────────────
 class ShowRecentFactsTests(_BaseActTest):
-    def setUp(self):
-        super().setUp()
-        # _memory_lock is used as a context manager: configure __enter__/__exit__.
-        self.bc._memory_lock = mock.MagicMock()
+    """Tray "Recent Facts (last 24h)": the LTM facts CREATED in the last 24 h,
+    newest first, returned as text (2026-09-30: it used to print "the last 10"
+    of bobert_memory's timeless strings to a console, whatever their age)."""
+
+    NOW = 1_800_000_000.0
+
+    def _run(self, facts):
+        with mock.patch("core.long_term_memory.list_facts", return_value=facts), \
+             mock.patch.object(A.time, "time", return_value=self.NOW):
+            return A._act_show_recent_facts("")
+
+    def _fact(self, text, age_h):
+        return {"id": text, "text": text, "created_at": self.NOW - age_h * 3600,
+                "updated_at": self.NOW}
 
     def test_no_facts(self):
-        self.bc.load_memory.return_value = {"facts": []}
-        self.assertEqual(A._act_show_recent_facts(""), "no facts in memory yet, sir")
+        out = self._run([])
+        self.assertIn("No new facts in the last 24 hours", out)
+        self.assertIn("0 on file", out)
 
-    def test_missing_facts_key(self):
-        self.bc.load_memory.return_value = {}
-        self.assertEqual(A._act_show_recent_facts(""), "no facts in memory yet, sir")
+    def test_only_the_last_24_hours(self):
+        out = self._run([self._fact("old one", 30), self._fact("fresh one", 2),
+                         self._fact("fresher one", 1)])
+        self.assertIn("2 fact(s) learned in the last 24 hours (3 on file)", out)
+        self.assertIn("fresh one", out)
+        self.assertNotIn("old one", out)
+        # newest first
+        self.assertLess(out.index("fresher one"), out.index("fresh one"))
 
-    def test_tails_last_ten(self):
-        facts = [f"fact {i}" for i in range(25)]
-        self.bc.load_memory.return_value = {"facts": facts}
-        out = A._act_show_recent_facts("")
-        self.assertIn("showed 10 recent fact(s) of 25 total", out)
+    def test_nothing_recent(self):
+        out = self._run([self._fact("ancient", 48)])
+        self.assertIn("No new facts in the last 24 hours (1 on file", out)
 
-    def test_fewer_than_ten(self):
-        self.bc.load_memory.return_value = {"facts": ["a", "b", "c"]}
-        out = A._act_show_recent_facts("")
-        self.assertIn("showed 3 recent fact(s) of 3 total", out)
+    def test_long_list_is_capped(self):
+        out = self._run([self._fact(f"f{i}", 0.01 * i) for i in range(60)])
+        self.assertIn("… and 20 more", out)
+
+    def test_garbage_entries_are_skipped(self):
+        out = self._run(["not a dict", {"text": "no time"},
+                         {"text": "bad", "created_at": "x"},
+                         self._fact("good", 1)])
+        self.assertIn("1 fact(s) learned", out)
 
     def test_exception_path(self):
-        self.bc.load_memory.side_effect = RuntimeError("disk error")
-        self.assertIn("show_recent_facts failed", A._act_show_recent_facts(""))
+        with mock.patch("core.long_term_memory.list_facts",
+                        side_effect=RuntimeError("disk error")):
+            out = A._act_show_recent_facts("")
+        self.assertIn("couldn't read the long-term memory store", out)
+        self.assertIn("disk error", out)
 
 
 # ── _act_export_memory ───────────────────────────────────────────────────────
@@ -1071,28 +1093,27 @@ class DiagnosticTrayTests(_BaseActTest):
         self.bc._selfdiag_module.return_value = sd
         self.assertEqual(A._act_show_last_diagnostic(""), "self_diagnostic skill not loaded")
 
-    def test_show_last_prints_summary(self):
+    def test_show_last_returns_the_whole_run(self):
+        # The tray shows it (long answers open as a text file) — it used to
+        # print one line to a console nobody sees.
         sd = mock.Mock()
-        sd.last_diagnostic_run = mock.Mock(return_value="line one\nline two\nline three")
+        sd.last_diagnostic_run = mock.Mock(return_value="line one\nline two\nline three\n")
         self.bc._selfdiag_module.return_value = sd
-        out = A._act_show_last_diagnostic("")
-        self.assertIn("printed last run", out)
-        self.assertIn("chars total", out)
+        self.assertEqual(A._act_show_last_diagnostic(""),
+                         "line one\nline two\nline three")
 
-    def test_show_last_long_first_line_truncated(self):
+    def test_show_last_long_output_is_not_truncated(self):
         sd = mock.Mock()
         sd.last_diagnostic_run = mock.Mock(return_value="z" * 500)
         self.bc._selfdiag_module.return_value = sd
-        # Should not raise; truncation happens internally.
-        out = A._act_show_last_diagnostic("")
-        self.assertIn("printed last run (500 chars total)", out)
+        self.assertEqual(A._act_show_last_diagnostic(""), "z" * 500)
 
     def test_show_last_none_return(self):
         sd = mock.Mock()
         sd.last_diagnostic_run = mock.Mock(return_value=None)
         self.bc._selfdiag_module.return_value = sd
-        out = A._act_show_last_diagnostic("")
-        self.assertIn("printed last run (0 chars total)", out)
+        self.assertEqual(A._act_show_last_diagnostic(""),
+                         "No diagnostic run on record yet.")
 
     def test_show_last_exception(self):
         sd = mock.Mock()

@@ -1400,7 +1400,10 @@ class RobotStateTests(_MonolithTestBase):
 # ──────────────────────────────────────────────────────────────────────────
 class HudStateTests(_MonolithTestBase):
     def test_write_hud_state_noop_when_disabled(self):
-        with mock.patch.object(self.bc, "HUD_ENABLED", False):
+        # Only when BOTH the HUD and the tray are off (hud_state.json is also
+        # the tray's view of JARVIS — see HudOffTrayStillLiveTests).
+        with mock.patch.object(self.bc, "HUD_ENABLED", False), \
+             mock.patch.object(self.bc, "TRAY_ENABLED", False):
             # Should return immediately without touching the cache.
             cache_before = dict(self.bc._hud_state_cache)
             self.bc._write_hud_state(state="ZZZ")
@@ -1962,6 +1965,7 @@ class LaunchPathTests(_MonolithTestBase):
         self.bc._hud_process = None
 
     def test_launch_tray_spawns_and_seeds_audio_state(self):
+        # A (re)launch after the toggles are restored seeds the audio flags.
         fake_proc = mock.Mock()
         fake_proc.pid = 99
         with mock.patch.object(self.bc, "TRAY_ENABLED", True), \
@@ -1970,10 +1974,31 @@ class LaunchPathTests(_MonolithTestBase):
              mock.patch.object(self.bc.subprocess, "Popen",
                                return_value=fake_proc) as mpop, \
              mock.patch.object(self.bc, "_publish_audio_state") as maudio, \
+             mock.patch.object(self.bc, "_publish_tray_boot_info"), \
+             mock.patch.object(self.bc, "_tray_toggles_restored", [True]), \
              mock.patch.object(self.bc, "_tray_process", None):
             self.bc._launch_tray()
             mpop.assert_called_once()
             maudio.assert_called_once()
+        self.bc._tray_process = None
+
+    def test_early_boot_launch_does_not_overwrite_saved_toggles(self):
+        # The tray now launches BEFORE _restore_tray_toggle_state(); publishing
+        # the still-default audio cells then would clobber the saved choices.
+        fake_proc = mock.Mock()
+        fake_proc.pid = 99
+        with mock.patch.object(self.bc, "TRAY_ENABLED", True), \
+             mock.patch.object(self.bc.os.path, "exists", return_value=True), \
+             mock.patch.object(self.bc.os, "remove"), \
+             mock.patch.object(self.bc.subprocess, "Popen",
+                               return_value=fake_proc), \
+             mock.patch.object(self.bc, "_publish_audio_state") as maudio, \
+             mock.patch.object(self.bc, "_publish_tray_boot_info") as mboot, \
+             mock.patch.object(self.bc, "_tray_toggles_restored", [False]), \
+             mock.patch.object(self.bc, "_tray_process", None):
+            self.bc._launch_tray()
+            maudio.assert_not_called()
+            mboot.assert_called_once()
         self.bc._tray_process = None
 
     def test_launch_tray_noop_when_disabled(self):

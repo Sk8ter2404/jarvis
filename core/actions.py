@@ -1215,23 +1215,41 @@ def _act_reload_skills(_: str = "") -> str:
 
 # ─── Memory introspection (Phase 4E) ───────────────────────────────────
 
+_RECENT_FACTS_WINDOW_S = 24 * 3600
+_RECENT_FACTS_MAX = 40
+
+
 def _act_show_recent_facts(_: str = "") -> str:
-    """Tail of bobert_memory.json facts list (newest are appended last)."""
-    bc = _bc()
+    """Facts learned in the LAST 24 HOURS, newest first, as text (the tray
+    shows it). Read from the tiered long-term store, whose facts carry a
+    created_at; bobert_memory.json's facts are bare strings with no time at
+    all, which is why this used to print "the last 10" whatever their age —
+    to a console nobody sees (2026-09-30 audit)."""
     try:
-        with bc._memory_lock:
-            mem = bc.load_memory()
-        facts = mem.get("facts") or []
-        if not facts:
-            return "no facts in memory yet, sir"
-        recent = facts[-10:]
-        lines = [f"  {i+1}. {f}" for i, f in enumerate(recent)]
-        print("\n[tray] recent facts:")
-        for ln in lines:
-            print(ln)
-        return f"showed {len(recent)} recent fact(s) of {len(facts)} total — see console"
+        from core import long_term_memory as ltm
+        facts = ltm.list_facts()
     except Exception as e:
-        return f"show_recent_facts failed: {e}"
+        return f"I couldn't read the long-term memory store: {e}"
+    cutoff = time.time() - _RECENT_FACTS_WINDOW_S
+
+    def _created(entry) -> float:
+        try:
+            return float(entry.get("created_at") or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            return 0.0
+    recent = [f for f in facts if isinstance(f, dict) and _created(f) >= cutoff]
+    recent.sort(key=_created, reverse=True)
+    if not recent:
+        return (f"No new facts in the last 24 hours ({len(facts)} on file "
+                "in total).")
+    lines = [f"{len(recent)} fact(s) learned in the last 24 hours "
+             f"({len(facts)} on file):", ""]
+    for entry in recent[:_RECENT_FACTS_MAX]:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(_created(entry)))
+        lines.append(f"  {when}  {str(entry.get('text') or '').strip()}")
+    if len(recent) > _RECENT_FACTS_MAX:
+        lines.append(f"  … and {len(recent) - _RECENT_FACTS_MAX} more")
+    return "\n".join(lines)
 
 
 def _act_export_memory(_: str = "") -> str:
@@ -1277,11 +1295,9 @@ def _act_show_last_diagnostic(_: str = "") -> str:
         return "self_diagnostic skill not loaded"
     try:
         out = sd.last_diagnostic_run("") or ""
-        head = out.split("\n", 1)[0]
-        if len(head) > 200:
-            head = head[:197] + "..."
-        print(f"\n[tray] last diagnostic run (first line): {head}")
-        return f"printed last run ({len(out)} chars total) — see console"
+        # Return the run itself (the tray opens long answers as a text file);
+        # it used to print one line to a console nobody sees.
+        return out.strip() or "No diagnostic run on record yet."
     except Exception as e:
         return f"show_last_diagnostic failed: {e}"
 
@@ -2568,6 +2584,22 @@ def _act_start_overnight_upgrade(_: str = "") -> str:
     overnight time."""
     bc = _bc()
     from core.config import OVERNIGHT_MODE_HOURS
+    # Switched off (OVERNIGHT_UPGRADE_ENABLED = False): the engine thread is
+    # never started at boot, so the run-now flag below would be set for
+    # nothing — yet JARVIS went to sleep and wrote an 8 h .overnight_active
+    # flag that re-armed sleep across restarts (2026-09-30 audit, tray "Run
+    # Upgrade Now"). Refuse plainly and change nothing. The monolith's own
+    # global is the authority (staging forces it off).
+    try:
+        from core import config as _cfg
+        enabled = bool(getattr(bc, "OVERNIGHT_UPGRADE_ENABLED",
+                               getattr(_cfg, "OVERNIGHT_UPGRADE_ENABLED", False)))
+    except Exception:
+        enabled = False
+    if not enabled:
+        return ("The overnight upgrade engine is switched off, sir "
+                "(OVERNIGHT_UPGRADE_ENABLED), so there's nothing to run — "
+                "I'm staying awake.")
     bc._overnight_run_now.set()
     bc._sleep_mode[0] = True
 

@@ -24,7 +24,9 @@ class TrayCommandContractTests(MonolithGlobalsTestCase):
         path = os.path.join(os.path.dirname(self.bc.__file__), "tray.py")
         with open(path, "r", encoding="utf-8") as f:
             src = f.read()
-        return set(re.findall(r'_send_command\(\s*["\']([a-z_]+)["\']', src))
+        # _send_request (2026-09-30) is _send_command plus a request id.
+        return set(re.findall(
+            r'_send_(?:command|request)\(\s*["\']([a-z_]+)["\']', src))
 
     def _explicit_handlers(self) -> set[str]:
         # _dispatch_tray_command's elif chain matches `cmd == "name"`. Parse them
@@ -106,6 +108,21 @@ class TrayStateFieldContractTests(MonolithGlobalsTestCase):
             # (_mic_muted), only the published field name.
             self.assertRegex(
                 src, rf"\b{field}\s*=",
+                f"tray reads hud_state['{field}'] but bobert never publishes it")
+
+    def test_fields_added_by_the_2026_09_30_fixes_have_writers(self):
+        """The tray now also reads these (starting…, upgrade gating, About,
+        dashboard left-click, real standby/ambient state). Each must be
+        published as a _write_hud_state kwarg or a dict key the publisher
+        passes to it."""
+        with open(self.bc.__file__, "r", encoding="utf-8") as f:
+            src = f.read()
+        for field in ("tray_ready_pid", "overnight_upgrade_enabled",
+                      "jarvis_version", "jarvis_pid", "boot_started_at",
+                      "web_port", "ambient_listening", "sleep_mode",
+                      "standby_mode", "alert_active"):
+            self.assertRegex(
+                src, rf'(\b{field}\s*=[^=]|["\']{field}["\']\s*:)',
                 f"tray reads hud_state['{field}'] but bobert never publishes it")
 
 

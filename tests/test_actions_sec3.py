@@ -1915,10 +1915,46 @@ class ReadChangelogTests(unittest.TestCase):
 # _act_start_overnight_upgrade
 # ===========================================================================
 class StartOvernightUpgradeTests(unittest.TestCase):
+    def test_refuses_and_stays_awake_when_upgrades_are_off(self):
+        # 2026-09-30 audit: with OVERNIGHT_UPGRADE_ENABLED = False the engine
+        # thread never starts, yet tray "Run Upgrade Now" slept JARVIS and wrote
+        # an 8 h .overnight_active flag that re-armed sleep across restarts.
+        with tempfile.TemporaryDirectory() as td:
+            flag = os.path.join(td, ".overnight_active")
+            bc = _base_bc(td)
+            bc.OVERNIGHT_UPGRADE_ENABLED = False
+            bc._overnight_run_now = mock.Mock()
+            bc._sleep_mode = [False]
+            bc.OVERNIGHT_FLAG_FILE = flag
+            with _patch_bc(bc):
+                out = A._act_start_overnight_upgrade()
+            self.assertIn("switched off", out)
+            self.assertIn("staying awake", out)
+            self.assertFalse(bc._sleep_mode[0])
+            bc._overnight_run_now.set.assert_not_called()
+            self.assertFalse(os.path.exists(flag))
+            bc._write_hud_state.assert_not_called()
+
+    def test_config_default_is_the_fallback(self):
+        # A monolith without the global falls back to core.config (shipped off).
+        import types
+        bc = types.SimpleNamespace(_overnight_run_now=mock.Mock(),
+                                   _sleep_mode=[False],
+                                   OVERNIGHT_FLAG_FILE=os.path.join(
+                                       tempfile.gettempdir(), "never_written"),
+                                   _write_hud_state=mock.Mock())
+        with _patch_bc(bc), \
+                mock.patch("core.config.OVERNIGHT_UPGRADE_ENABLED", False):
+            out = A._act_start_overnight_upgrade()
+        self.assertIn("switched off", out)
+        self.assertFalse(bc._sleep_mode[0])
+        bc._overnight_run_now.set.assert_not_called()
+
     def test_arms_engine_and_writes_flag(self):
         with tempfile.TemporaryDirectory() as td:
             flag = os.path.join(td, ".overnight_active")
             bc = _base_bc(td)
+            bc.OVERNIGHT_UPGRADE_ENABLED = True
             bc._overnight_run_now = mock.Mock()
             bc._sleep_mode = [False]
             bc.OVERNIGHT_FLAG_FILE = flag
@@ -1935,6 +1971,7 @@ class StartOvernightUpgradeTests(unittest.TestCase):
 
     def test_flag_write_failure_is_swallowed(self):
         bc = _base_bc()
+        bc.OVERNIGHT_UPGRADE_ENABLED = True
         bc._overnight_run_now = mock.Mock()
         bc._sleep_mode = [False]
         # Point the flag at a path that can't be opened for writing.
