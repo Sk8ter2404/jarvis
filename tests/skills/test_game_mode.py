@@ -758,6 +758,27 @@ class TestWiring(_Base):
                           f"{name} returns a finished sentence that would be "
                           f"computed, logged and dropped")
 
+    def test_every_alias_of_a_voiced_handler_is_voiced(self):
+        """2026-09-30: low_power_mode / normal_power / full_power are bound to
+        game_mode_on / game_mode_off but were declared in NEITHER speak set,
+        so saying the alias did the work and JARVIS said nothing (the H-5
+        shape). Only the monolith tier's ActionAliasSpeakSetDriftTests saw it,
+        and CI skips that tier - this is the light-tier copy of the rule, so
+        the next alias added to register() fails HERE, on CI."""
+        mod, actions = self._load()
+        declared = set(getattr(mod, "SPEAK_VERBATIM_ACTIONS", ()))
+        voiced_handlers = {actions[n] for n in declared if n in actions}
+        self.assertTrue(voiced_handlers, "no voiced handler found - the scan "
+                                         "would pass vacuously")
+        aliases = sorted(n for n, fn in actions.items()
+                         if fn in voiced_handlers)
+        # Not vacuous: the three aliases are among the names checked.
+        for alias in ("low_power_mode", "normal_power", "full_power"):
+            self.assertIn(alias, aliases)
+        self.assertEqual([n for n in aliases if n not in declared], [],
+                         "these names reach a voiced handler but are not "
+                         "voiced themselves")
+
     def test_every_setting_is_declared_in_core_config(self):
         """_apply_user_settings SKIPS any key not already in core.config's
         globals(), so an undeclared setting is silently dropped and the owner's

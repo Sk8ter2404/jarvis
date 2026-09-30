@@ -3,7 +3,11 @@ Face / gaze tracker skill for JARVIS.
 
 The existing _face_tracking_thread in bobert_companion.py already runs OpenCV
 face detection on every configured webcam and updates two shared dicts:
-  bobert_companion._camera_last_seen     — index -> last-detected timestamp
+  bobert_companion._camera_last_seen     — index -> last CONFIRMED-face
+                                           timestamp (a sustained, qualified
+                                           face on fresh frames, per
+                                           core/face_presence.py - never a
+                                           single-frame hit, since 2026-09-30)
   bobert_companion._camera_latest_frame  — index -> most recent BGR frame
 guarded by bobert_companion._camera_state_lock.
 

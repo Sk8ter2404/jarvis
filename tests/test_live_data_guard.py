@@ -38,6 +38,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from tests import live_data_guard
 
@@ -1289,6 +1290,71 @@ class LiveStateWriteTests(unittest.TestCase):
                     self._probe_open(path)
         self.assertFalse(live_data_guard._is_live_state(
             os.path.join(tempfile.gettempdir(), "pending_speech.json")))
+
+    # ── named live LOGS (2026-09-30) ─────────────────────────────────────
+    # Four unit tests reached core.gpu_state.log_gpu_state for real: each ran
+    # nvidia-smi and appended a snapshot, headed with a model the TEST named,
+    # to logs/gpu_snapshots.log - the owner's record of what JARVIS loaded.
+    def test_a_write_to_a_live_log_is_refused(self):
+        for name in sorted(live_data_guard.LIVE_LOG_FILES):
+            path = os.path.join(live_data_guard.PROJECT_ROOT, "logs", name)
+            with self.subTest(name=name):
+                with self.assertRaises(live_data_guard.LiveDataGuardError):
+                    self._probe_open(path)
+                self.assertTrue(live_data_guard._is_live_state(path))
+
+    def test_the_gpu_log_rotation_is_refused(self):
+        # core.gpu_state rotates with os.replace(log, log + ".1"). The source
+        # does not exist here, so a regressed guard fails harmlessly.
+        missing = os.path.join(tempfile.gettempdir(),
+                               "__jarvis_guard_probe_missing__.log")
+        live = os.path.join(live_data_guard.PROJECT_ROOT, "logs",
+                            "gpu_snapshots.log.1")
+        with self.assertRaises(live_data_guard.LiveDataGuardError):
+            os.replace(missing, live)
+
+    def test_the_gpu_logger_survives_a_refused_append(self):
+        # The real writer aimed at the live log, with nvidia-smi faked: the
+        # guard's refusal must not escape log_gpu_state (which never raises -
+        # it sits on every model-load path). The writer's open() goes through
+        # the guard's own DECISION function and then stops, so even a
+        # regressed guard cannot make this probe touch the real log.
+        from core import gpu_state as gs
+        live_dir = os.path.join(live_data_guard.PROJECT_ROOT, "logs")
+        opened = []
+
+        def _decide_then_stop(path, mode="r", *a, **k):
+            opened.append(os.path.normcase(os.path.abspath(path)))
+            live_data_guard._check_write(f"open({mode})", path)
+            raise AssertionError(f"the guard let {path} through")
+
+        with mock.patch.object(gs, "_LOG_DIR", live_dir), \
+                mock.patch.object(gs, "_OLLAMA_MODELS_LOGGED", set()), \
+                mock.patch.object(gs, "_run_nvidia_smi",
+                                  return_value="| synthetic smi |"), \
+                mock.patch.object(gs, "_rotate_log_if_large"), \
+                mock.patch.object(gs.os, "makedirs"), \
+                mock.patch.object(gs, "open", _decide_then_stop,
+                                  create=True), \
+                mock.patch("builtins.print") as printed:
+            gs.log_gpu_state("__guard_probe_model__")     # must not raise
+        self.assertEqual(opened, [os.path.normcase(os.path.join(
+            live_dir, "gpu_snapshots.log"))])
+        said = " ".join(str(c) for c in printed.call_args_list)
+        self.assertIn("BLOCKED", said)
+        self.assertNotIn("the guard let", said)
+
+    def test_other_logs_stay_open(self):
+        self.assertFalse(live_data_guard._is_live_state(
+            os.path.join(live_data_guard.PROJECT_ROOT, "logs",
+                         "session_2026-09-30_00-00-00.log")))
+        self.assertFalse(live_data_guard._is_live_state(
+            os.path.join(tempfile.gettempdir(), "gpu_snapshots.log")))
+
+    def test_every_listed_log_is_still_written_by_the_source(self):
+        src = _source(os.path.join(_PROJECT_ROOT, "core", "gpu_state.py"))
+        for name in live_data_guard.LIVE_LOG_FILES:
+            self.assertIn(name.replace(".log.1", ".log"), src)
 
     def test_every_listed_file_is_still_live_state_in_the_source(self):
         # A name nothing writes any more is dead weight; a renamed file is a

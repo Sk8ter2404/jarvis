@@ -39,6 +39,17 @@ class SynthesiseVoiceCloneTests(MonolithGlobalsTestCase):
         self._p(bc, "_last_voice_route", [{"addendum": "", "mood": "casual"}])
         self._p(bc, "_last_user_tone", [None])
         self._p(bc, "_last_mood", [None])
+        # ...and the preset itself, so the waveform comes back UNSCALED. These
+        # tests identify WHICH renderer produced the audio by its sentinel
+        # value; any preset gain != 1.0 rescales it and the identification
+        # fails for a reason that has nothing to do with the clone seam. The
+        # real resolver also reads state these three cells do not cover
+        # (core.audio_processor.recent_peak_rms, _TTS_PRESET_PIN) - and in the
+        # full tier it was a MagicMock leaked by test_monolith_sec3 returning
+        # ('amused', gain 2.0), which failed all seven tests here (2026-09-30).
+        self._p(bc, "_resolve_tts_preset",
+                return_value=("neutral",
+                              {"rate": "+0%", "pitch": "+0Hz", "gain": 1.0}))
         # A distinctive edge-tts sentinel so we can tell the ladder ran.
         self._edge_sentinel = (np.full(64, 0.25, dtype=np.float32), 24000)
         self._p(bc, "_render_edge_tts",

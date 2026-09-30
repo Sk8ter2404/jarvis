@@ -346,6 +346,8 @@ class FaceLoopPresenceTests(_Base):
             ev.clear()
             self.addCleanup(ev.clear)
         bc.last_face_seen = 0.0
+        bc._camera_last_seen.clear()
+        self.addCleanup(bc._camera_last_seen.clear)
         # Loose thresholds, so the ONLY reason not to confirm is the one
         # under test (the loop runs in milliseconds here, not seconds).
         mod = getattr(bc, "_face_presence", None)
@@ -445,6 +447,35 @@ class FaceLoopPresenceTests(_Base):
         self.assertGreaterEqual(self.bc.last_face_seen, before,
                                 "a sustained face was never confirmed")
 
+    # ── the PER-CAMERA stamp (_camera_last_seen) obeys the same rule ───────
+    # It feeds the face_tracker skill, and through it the wellness nudge, the
+    # briefings' presence wait and morning_arrival_v2. Until 2026-09-30 the
+    # loop stamped it on EVERY single-frame hit, so everything built on it
+    # kept the pre-v2.0.142 false presence.
+    def test_one_frame_hit_does_not_stamp_the_camera(self):
+        self._run(self._fresh(1), reads=1)
+        self.assertNotIn(0, self.bc._camera_last_seen,
+                         "a single-frame hit stamped _camera_last_seen")
+
+    def test_re_served_frames_do_not_stamp_the_camera(self):
+        same = self.np.zeros((720, 1280, 3), dtype=self.np.uint8)
+        self._run([same] * 20, reads=12)
+        self.assertNotIn(0, self.bc._camera_last_seen)
+
+    def test_relaxed_pass_hits_do_not_stamp_the_camera(self):
+        self._run(self._fresh(12), reads=12, relaxed_only=True)
+        self.assertNotIn(0, self.bc._camera_last_seen)
+
+    def test_a_face_across_the_room_does_not_stamp_the_camera(self):
+        self._run(self._fresh(12), reads=12, boxes=self.SMALL)
+        self.assertNotIn(0, self.bc._camera_last_seen)
+
+    def test_sustained_face_stamps_the_camera_that_saw_it(self):
+        before = time.time()
+        self._run(self._fresh(12), reads=12)
+        self.assertGreaterEqual(self.bc._camera_last_seen.get(0, 0.0), before)
+        self.assertEqual(set(self.bc._camera_last_seen), {0})
+
 
 class PresenceWiringTests(_Base):
     """Source-level: _face_presence_note is the ONLY writer of
@@ -473,6 +504,202 @@ class PresenceWiringTests(_Base):
                          'now_loop)')
         self.assertLess(det, note)
         self.assertLess(note, src.index("if not face:", det))
+
+    @staticmethod
+    def _camera_last_seen_writers(tree):
+        """Functions that write an item of a ``_camera_last_seen`` dict
+        (``x[i] = ..``, ``bc._camera_last_seen[i] = ..``, del, augmented, or
+        an update/setdefault/pop/clear-style mutator call)."""
+        def _is_cls(node):
+            return ((isinstance(node, ast.Name)
+                     and node.id == "_camera_last_seen")
+                    or (isinstance(node, ast.Attribute)
+                        and node.attr == "_camera_last_seen"))
+        writers = set()
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(fn):
+                targets = []
+                if isinstance(node, ast.Assign):
+                    targets = node.targets
+                elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+                    targets = [node.target]
+                elif isinstance(node, ast.Delete):
+                    targets = node.targets
+                if any(isinstance(t, ast.Subscript) and _is_cls(t.value)
+                       for t in targets):
+                    writers.add(fn.name)
+                if (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and _is_cls(node.func.value)
+                        and node.func.attr in ("update", "setdefault", "pop",
+                                               "popitem", "__setitem__")):
+                    writers.add(fn.name)
+        return writers
+
+    def test_only_the_presence_note_stamps_camera_last_seen(self):
+        # The monolith: exactly one writer, the sustained-presence verdict.
+        with open(self.bc.__file__, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        self.assertEqual(self._camera_last_seen_writers(tree),
+                         {"_face_presence_note"})
+        # ...and no production module writes it behind the monolith's back
+        # (the skills and core/actions only READ it).
+        import os
+        root = os.path.dirname(self.bc.__file__)
+        for sub in ("core", "skills"):
+            d = os.path.join(root, sub)
+            for fname in sorted(os.listdir(d)):
+                if not fname.endswith(".py"):
+                    continue
+                path = os.path.join(d, fname)
+                try:
+                    with open(path, encoding="utf-8") as fh:
+                        sub_tree = ast.parse(fh.read())
+                except (OSError, SyntaxError, UnicodeDecodeError):
+                    continue
+                self.assertEqual(self._camera_last_seen_writers(sub_tree),
+                                 set(), f"{sub}/{fname} writes "
+                                        f"_camera_last_seen")
+
+    def test_the_writer_scan_is_not_blind(self):
+        # A ratchet that cannot see a write passes forever. Feed it the
+        # pre-2026-09-30 loop shape.
+        tree = ast.parse(
+            "def loop():\n"
+            "    with _camera_state_lock:\n"
+            "        _camera_last_seen[cam['index']] = now_loop\n"
+            "def skill(bc):\n"
+            "    bc._camera_last_seen.update({0: 1.0})\n")
+        self.assertEqual(self._camera_last_seen_writers(tree),
+                         {"loop", "skill"})
+
+
+class PresenceConsumersTests(_Base):
+    """The chain the per-camera stamp feeds, end to end with the REAL
+    monolith, face_tracker, wellness, daily_briefing and morning_arrival_v2:
+    frames -> _face_presence_note -> _camera_last_seen -> face_tracker's
+    poller -> the three presence readers. Frames are synthetic arrays and the
+    detector's verdict is set directly (no camera, no cascade); the Kinect,
+    face-ID and keyboard-idle reads are faked. A single-frame hit - the
+    shape of the 04:02 "90 minutes" nudge and the 06:00 arrival briefing
+    with nobody at the desk - must make NONE of the readers see the owner;
+    a sustained face must make all of them see him."""
+
+    CAM = {"index": 0, "label": "Left webcam", "name": "Test Webcam 0",
+           "primary": True, "look_x": 0.5, "look_y": 0.5}
+
+    def setUp(self):
+        super().setUp()
+        import sys
+        import numpy as np
+        from tests._skill_harness import load_skill_isolated
+        bc = self.bc
+        self.np = np
+        self._p(bc, "CAMERAS", [dict(self.CAM)])
+        self._p(bc, "MONITORS", {"left": (0, 0, 1920, 1080),
+                                 "middle": (1920, 0, 1920, 1080)})
+        bc._camera_last_seen.clear()
+        self.addCleanup(bc._camera_last_seen.clear)
+        bc.last_face_seen = 0.0
+        saved = {k: sys.modules.get(k) for k in (
+            "skill_face_tracker", "skill_wellness", "skill_daily_briefing",
+            "skill_morning_arrival_v2")}
+
+        def _restore_modules():
+            for k, v in saved.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+        self.addCleanup(_restore_modules)
+        self.ft, _ = load_skill_isolated("face_tracker")
+        self.well, _ = load_skill_isolated("wellness")
+        self.brief, _ = load_skill_isolated("daily_briefing")
+        self.arrive, _ = load_skill_isolated("morning_arrival_v2")
+        ft = self.ft
+        self._p(ft, "_read_kinect_presence", return_value=None)
+        self._p(ft, "_kinect_gaze_monitor", return_value=None)
+        self._p(ft, "_apply_greet_new_people")
+        # Keyboard / mouse and workshop mode must not stand in for a face.
+        self._p(self.well, "_recent_input", return_value=False)
+        self._p(self.well, "_workshop_mode_active", return_value=False)
+        self.arrive._presence_first_seen_at[0] = 0.0
+        self.addCleanup(self.arrive._presence_first_seen_at.__setitem__, 0,
+                        0.0)
+
+    def _frames(self, n):
+        """n consecutive frames that are each NEW content (fresh)."""
+        out = []
+        for i in range(n):
+            f = self.np.zeros((72, 128, 3), dtype=self.np.uint8)
+            f[::8, ::8] = i + 1
+            out.append(f)
+        return out
+
+    def _feed(self, times):
+        """One qualified fresh detection per timestamp, through the real
+        _face_presence_note (the face-track producer's only presence call)."""
+        bc = self.bc
+        confirmed = []
+        for t, frame in zip(times, self._frames(len(times))):
+            bc._face_detect_last[0] = {"pass": "frontal", "w_frac": 0.25,
+                                       "h_frac": 0.4}
+            confirmed.append(bc._face_presence_note(0, frame, (0.5, 0.5), t))
+        return confirmed
+
+    def _readers(self):
+        """Poll face_tracker (twice: its hysteresis) and ask every reader."""
+        for _ in range(self.ft.HYSTERESIS_SAMPLES):
+            self.ft._poll_once(self.bc)
+        # The wellness poller's own tick: a presence reading starts (or
+        # extends) the 90-minute focus block.
+        self.well._poll_once()
+        self.arrive._sustained_presence_seconds()
+        return {
+            "face_visible": self.ft._snapshot_state()["face_visible"],
+            "wellness_present": self.well._user_present(),
+            "focus_block_started": self.well._block_started_at[0] > 0.0,
+            "briefing_at_desk": self.brief._user_at_desk(),
+            "arrival_armed": self.arrive._presence_first_seen_at[0] > 0.0,
+        }
+
+    def test_a_single_frame_hit_is_nobody_at_the_desk(self):
+        self.assertEqual(self._feed([time.time()]), [False])
+        self.assertNotIn(0, self.bc._camera_last_seen)
+        seen = self._readers()
+        self.assertFalse(seen["face_visible"], seen)
+        self.assertFalse(seen["wellness_present"], seen)
+        self.assertFalse(seen["focus_block_started"],
+                         "a one-frame blip started a 90-minute focus block")
+        self.assertIsNot(seen["briefing_at_desk"], True, seen)
+        self.assertFalse(seen["arrival_armed"],
+                         "a one-frame blip armed the morning arrival")
+
+    def test_scattered_blips_are_nobody_at_the_desk(self):
+        # One hit every 4 s for a minute: each would have held the old
+        # 3 s FACE_FRESH window open on its own.
+        now = time.time()
+        self._feed([now - 60 + 4 * i for i in range(15)])
+        self.assertNotIn(0, self.bc._camera_last_seen)
+        seen = self._readers()
+        self.assertFalse(seen["focus_block_started"], seen)
+        self.assertFalse(seen["arrival_armed"], seen)
+
+    def test_a_sustained_face_is_the_owner_at_the_desk(self):
+        now = time.time()
+        confirmed = self._feed([now - 2.5 + 0.5 * i for i in range(6)])
+        self.assertTrue(confirmed[-1], confirmed)
+        self.assertGreaterEqual(self.bc._camera_last_seen.get(0, 0.0),
+                                now - 0.01)
+        seen = self._readers()
+        self.assertTrue(seen["face_visible"], seen)
+        self.assertTrue(seen["wellness_present"], seen)
+        self.assertTrue(seen["focus_block_started"], seen)
+        self.assertTrue(seen["briefing_at_desk"], seen)
+        self.assertTrue(seen["arrival_armed"], seen)
+        self.assertEqual(self.ft._snapshot_state()["current_monitor"], "left")
 
 
 if __name__ == "__main__":

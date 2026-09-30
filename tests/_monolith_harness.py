@@ -255,6 +255,23 @@ _MONOLITH_RESTORE_NAMES = (
     # value would make every later _refresh_devices test silently defer its
     # reinit — the exact "green for the wrong reason" shape.
     "_pa_close_pending",
+    # ...and the deferral LOG latch (_log_reinit_deferral is edge-triggered:
+    # it prints only when the reason CHANGES). A test that ends deferred
+    # leaves the latch on that reason, so the NEXT test's identical deferral
+    # prints nothing and a "the deny line names its reason" assertion fails
+    # on execution order alone (PaAbandonedCloseGateTests, 2026-09-30).
+    "_pa_defer_logged",
+    # The last capture's peak RMS. Written by the real record_speech and by
+    # every INJECTED turn (floored at 2 x WHISPER_TRUST_RMS), read by
+    # apply_capture_auto_gain on the next capture - so a value left by one
+    # test boosted a LATER test's faked buffer into a different array
+    # (StandbyWakeWiringTests, 2026-09-30).
+    "_last_recording_peak",
+    # Per-camera "a face is here" stamps. Since 2026-09-30 written only by
+    # _face_presence_note on a SUSTAINED face; a stamp left by a test that
+    # drove the face-track loop would make a later presence / gaze test see
+    # the owner for the wrong reason.
+    "_camera_last_seen",
     "_camera_failure_summary",
     # Camera quarantine + producer-liveness state (2026-09-05). A test that
     # benches a camera or fakes a stalled heartbeat must not leak it: a
@@ -448,6 +465,52 @@ def _restore_monolith_pristine(bc) -> None:
         pass
 
 
+_MISSING = object()
+
+
+def _heal_leaked_mocks(bc, before: dict, test_id: str) -> list:
+    """Put back any bobert_companion attribute a test left as a mock.
+
+    The tracked-names list above cannot cover the module's FUNCTIONS, and a
+    function can be leaked as a mock: patch.dict(bc.__dict__) stopped AFTER a
+    sibling patch.object restores a snapshot that CONTAINS that sibling's mock
+    (the _tts_layer case in the header). On 2026-09-30 that left
+    _resolve_tts_preset as a MagicMock returning ('amused', gain 2.0), and
+    every later synthesise() in the process spoke through it - seven
+    test_monolith_voice_clone tests failed in the full tier and passed alone.
+
+    ``before`` is a shallow copy of the module dict taken as THIS test
+    started, so an attribute that was already a mock then (a class-level
+    patch from setUpClass) is left alone: only a mock this test introduced
+    and did not remove counts as its leak. The healed names are printed with
+    the test id, because a silent heal would hide the leaking test. Returns
+    them. Never raises."""
+    healed: list = []
+    try:
+        from unittest import mock as _mock
+        for name, val in list(vars(bc).items()):
+            if not isinstance(val, _mock.NonCallableMock):
+                continue
+            prev = before.get(name, _MISSING)
+            if isinstance(prev, _mock.NonCallableMock):
+                continue
+            try:
+                if prev is _MISSING:
+                    delattr(bc, name)
+                else:
+                    setattr(bc, name, prev)
+                healed.append(name)
+            except Exception:
+                pass
+        if healed:
+            print(f"[monolith-harness] {test_id} left a mock on "
+                  f"bobert_companion: {', '.join(sorted(healed))} - "
+                  f"restored; fix the test's patch order", file=sys.stderr)
+    except Exception:
+        pass
+    return healed
+
+
 def _reset_camera_gate(bc) -> None:
     """Give the NEXT test a camera gate with no history (2026-09-29).
 
@@ -537,9 +600,11 @@ class MonolithGlobalsTestCase(unittest.TestCase):
         # first monolith test (an import-time Kinect pump, a light-tier test)
         # may have left history in the process-wide camera gate.
         _reset_camera_gate(bc)
+        _before = dict(vars(bc))
         try:
             return super().run(result)
         finally:
             _restore_monolith_pristine(bc)
+            _heal_leaked_mocks(bc, _before, self.id())
             _cfg.MODEL_ROUTING = _saved_route
             _cfg.AMBIENT_LEARNING_FORCE_LOCAL = _saved_force

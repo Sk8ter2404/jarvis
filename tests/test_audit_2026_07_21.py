@@ -289,10 +289,23 @@ class TrayBackendTagInvariantTests(unittest.TestCase):
         from skills.model_picker import _same_model
         with open(os.path.join(_PROJECT, "tray.py"), encoding="utf-8") as f:
             src = f.read()
+        # v2.0.144 (2026-09-30, the tray overhaul) moved these sends from
+        # _send_command("switch_llm", backend=...) to
+        # _send_request("switch_llm", "<label>", backend=...), which this
+        # regex did not match, so the invariant failed with "no longer
+        # sends switch_llm". Both spellings are matched now.
         tags = re.findall(
-            r'_send_command\(\s*"switch_llm"\s*,\s*backend="([^"]+)"', src)
+            r'_send_(?:command|request)\(\s*"switch_llm"\s*,'
+            r'(?:\s*f?"[^"]*"\s*,)?\s*backend="([^"]+)"', src)
         self.assertTrue(
             tags, "tray.py no longer sends switch_llm — update this invariant")
+        # The one NON-literal backend is the model picker's, whose tag comes
+        # from Ollama's own /api/tags (always installed). Any other variable
+        # is a new, unchecked source of tags - make the invariant see it.
+        dynamic = re.findall(
+            r'_send_(?:command|request)\(\s*"switch_llm"\s*,'
+            r'(?:\s*f?"[^"]*"\s*,)?\s*backend=([A-Za-z_]\w*)\s*\)', src)
+        self.assertLessEqual(set(dynamic), {"tag"}, dynamic)
         for t in tags:
             if t in ("anthropic", "ollama"):
                 continue

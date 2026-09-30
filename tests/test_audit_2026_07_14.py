@@ -718,7 +718,10 @@ class VlmResidentExemptionTests(unittest.TestCase):
              mock.patch.object(bc, "_ollama_loaded_models",
                                return_value=self._ps("gemma4:12b")), \
              mock.patch.object(bc, "_cuda0_free_vram_mb", return_value=3976), \
+             mock.patch.object(bc, "_log_gpu_state"), \
              mock.patch.object(bc.requests, "post", side_effect=_fake_post):
+            # _log_gpu_state faked: its first real call per model runs the
+            # real nvidia-smi into logs/gpu_snapshots.log (2026-09-30).
             out = bc._call_local_vision("what is on screen?", [b"png"])
         self.assertEqual(out, "I see a terminal.",
                          "an ALREADY-RESIDENT VLM must not be refused for lack "
@@ -771,7 +774,10 @@ class LocalVisionTimeoutTests(unittest.TestCase):
              mock.patch.object(bc, "_ollama_has_model", return_value=True), \
              mock.patch.object(bc, "_ollama_loaded_models", return_value=models), \
              mock.patch.object(bc, "_cuda0_free_vram_mb", return_value=24000), \
+             mock.patch.object(bc, "_log_gpu_state"), \
              mock.patch.object(bc.requests, "post", side_effect=_fake_post):
+            # _log_gpu_state faked: its first real call per model runs the
+            # real nvidia-smi into logs/gpu_snapshots.log (2026-09-30).
             bc._call_local_vision("q", [b"png"])
         return seen["timeout"]
 
@@ -1952,8 +1958,12 @@ class OllamaBranchUsesInstrumentedFallbackTests(unittest.TestCase):
         # model_route("chat")=="local" is the FIRST branch of _call_llm (a
         # separate _call_local_llm path); force it off "local" so the
         # AI_BACKEND=="ollama" branch — the one this fix touches — is reached.
+        # _get_local_llm_model faked: its first real resolution asks the live
+        # Ollama for /api/tags and runs the real nvidia-smi into
+        # logs/gpu_snapshots.log (2026-09-30).
         with mock.patch.object(bc, "AI_BACKEND", "ollama"), \
              mock.patch("core.config.model_route", return_value="auto"), \
+             mock.patch.object(bc, "_get_local_llm_model", return_value="m"), \
              mock.patch.object(bc, "detect_tone", return_value=None), \
              mock.patch.object(bc, "route_voice_emotion",
                                return_value={"mood": "casual", "addendum": ""}), \

@@ -1747,8 +1747,13 @@ class CallLlmTests(MonolithGlobalsTestCase):
         # happens to be up, answers with a genuine model reply — the test then
         # fails for an environmental reason that has nothing to do with the
         # guard under test. Monolith tests must never touch the live runner.
+        # _get_local_llm_model is faked for the same reason: its first real
+        # resolution asks the live Ollama for /api/tags and runs the real
+        # nvidia-smi into logs/gpu_snapshots.log (2026-09-30).
         with mock.patch.object(self.bc, "AI_BACKEND", "ollama"), \
                 mock.patch.object(self.bc, "OLLAMA_MODEL", "m"), \
+                mock.patch.object(self.bc, "_get_local_llm_model",
+                                  return_value="m"), \
                 mock.patch.object(self.bc, "_ollama_chat_bounded",
                                   side_effect=RuntimeError("ollama down")), \
                 mock.patch.object(self.bc, "_call_local_llm", return_value=None), \
@@ -2035,7 +2040,7 @@ class SynthesiseTests(MonolithGlobalsTestCase):
         with mock.patch.object(self.bc, "_last_voice_route", [None]), \
                 mock.patch.object(self.bc, "_last_user_tone", [None]), \
                 mock.patch.object(self.bc, "_last_mood", [None]), \
-                mock.patch.dict(self.bc.__dict__, {"TTS_BACKEND": "edge"}), \
+                mock.patch.object(self.bc, "TTS_BACKEND", "edge"), \
                 mock.patch.object(self.bc, "_resolve_tts_preset",
                                   return_value=("amused",
                                                 {"rate": "+0%", "pitch": "+0Hz",
@@ -2056,7 +2061,7 @@ class SynthesiseTests(MonolithGlobalsTestCase):
                                   return_value=("neutral",
                                                 {"rate": "+0%", "pitch": "+0Hz",
                                                  "gain": 1.0})), \
-                mock.patch.dict(self.bc.__dict__, {"TTS_BACKEND": "xtts"}), \
+                mock.patch.object(self.bc, "TTS_BACKEND", "xtts"), \
                 mock.patch.object(self.bc, "_render_xtts_or_raise",
                                   side_effect=RuntimeError("xtts dead")), \
                 mock.patch.object(self.bc, "_render_edge_tts",
@@ -2074,7 +2079,7 @@ class SynthesiseTests(MonolithGlobalsTestCase):
                                   return_value=("neutral",
                                                 {"rate": "+0%", "pitch": "+0Hz",
                                                  "gain": 1.0})), \
-                mock.patch.dict(self.bc.__dict__, {"TTS_BACKEND": "edge"}), \
+                mock.patch.object(self.bc, "TTS_BACKEND", "edge"), \
                 mock.patch.object(self.bc, "_render_edge_tts",
                                   side_effect=RuntimeError("edge dead")), \
                 mock.patch.object(self.bc, "_pyttsx3_tts",
@@ -2633,24 +2638,56 @@ class CallLocalLlmWebSearchGuardTests(MonolithGlobalsTestCase):
     def setUpClass(cls):
         cls.bc = load_monolith()
 
-    def test_unread_web_search_prepends_no_fabricate_guard(self):
+    def _guarded_call(self, stable_prefix):
+        """One _call_local_llm turn whose history shows a web_search that was
+        never read back. Returns the POSTed messages."""
         captured = {}
         fake_req = mock.Mock()
 
         def _post(url, json=None, timeout=None):
-            captured["sys"] = json["messages"][0]["content"]
+            captured["messages"] = json["messages"]
             return _FakeResp(ok=True, json_data={"message": {"content": "ok sir"}})
         fake_req.post.side_effect = _post
-        # A web_search was fired but never followed by a see_screen read.
-        msgs = [{"role": "assistant", "content": "[ACTION: web_search, census]"}]
+        # A web_search was fired but never followed by a see_screen read, and
+        # the owner has since spoken again (the shape a real turn has).
+        msgs = [{"role": "user", "content": "search the census"},
+                {"role": "assistant", "content": "[ACTION: web_search, census]"},
+                {"role": "user", "content": "so what did it say"}]
         with mock.patch.object(self.bc, "LOCAL_LLM_FALLBACK", True), \
+                mock.patch.object(self.bc, "_STABLE_LOCAL_PREFIX",
+                                  stable_prefix), \
                 mock.patch.object(self.bc, "_ollama_alive", return_value=True), \
                 mock.patch.object(self.bc, "_get_local_llm_model",
                                   return_value="m:tag"), \
                 mock.patch.object(self.bc, "_ollama_has_model", return_value=True), \
                 mock.patch.object(self.bc, "requests", fake_req):
             self.bc._call_local_llm("BASE", msgs)
-        self.assertIn("Do NOT fabricate", captured["sys"])
+        self.assertEqual(msgs[-1]["content"], "so what did it say",
+                         "the caller's history must never be mutated")
+        return captured["messages"]
+
+    def test_unread_web_search_prepends_no_fabricate_guard(self):
+        # v2.0.116 (2026-09-29, cache-stable local prefix, the default) MOVED
+        # this guard: a per-turn prepend to the SYSTEM prompt put the
+        # divergence at token 0 and cost a full ~2.9 s re-evaluation, so the
+        # guard now rides at the head of the FINAL user message. This test
+        # used to read only the system prompt (and handed in a history with
+        # no user message at all), so it failed on the moved guard. It now
+        # pins where the guard goes under each layout.
+        out = self._guarded_call(stable_prefix=True)
+        self.assertNotIn("Do NOT fabricate", out[0]["content"],
+                         "a per-turn guard in the system prompt breaks the "
+                         "local KV-cache prefix")
+        self.assertEqual(out[-1]["role"], "user")
+        self.assertIn("Do NOT fabricate", out[-1]["content"])
+        self.assertTrue(out[-1]["content"].endswith("so what did it say"))
+
+    def test_unread_web_search_guard_legacy_layout_prepends_to_system(self):
+        # JARVIS_STABLE_LOCAL_PREFIX=0 keeps the pre-v2.0.116 layout.
+        out = self._guarded_call(stable_prefix=False)
+        self.assertTrue(out[0]["content"].startswith("IMPORTANT: a web search"))
+        self.assertIn("Do NOT fabricate", out[0]["content"])
+        self.assertNotIn("Do NOT fabricate", out[-1]["content"])
 
     def test_web_search_scan_exception_is_swallowed(self):
         # 5723-5724: the messages object passes isinstance(list) but raises when
@@ -2687,6 +2724,13 @@ class SynthesiseExtraPathsTests(MonolithGlobalsTestCase):
     def setUpClass(cls):
         cls.bc = load_monolith()
 
+    # TTS_BACKEND / VOICE_CLONE_ENABLED are patched with patch.object, NEVER
+    # patch.dict(bc.__dict__): these tests stop their patches in START order,
+    # and a patch.dict of the module dict started AFTER the
+    # _resolve_tts_preset mock restores a snapshot that CONTAINS that mock -
+    # so the mock outlived the test and every later synthesise() in the
+    # process spoke through it ('amused', gain 2.0: all seven
+    # test_monolith_voice_clone tests failed in the full tier, 2026-09-30).
     def _common_patches(self, preset_name, preset):
         return [
             mock.patch.object(self.bc, "_last_voice_route", [None]),
@@ -2705,7 +2749,7 @@ class SynthesiseExtraPathsTests(MonolithGlobalsTestCase):
         preset = {"rate": "+0%", "pitch": "+0Hz", "gain": 1.0}
         patches = self._common_patches("wry", preset)
         patches.append(mock.patch.object(self.bc, "_tts_layer", fake_layer))
-        patches.append(mock.patch.dict(self.bc.__dict__, {"TTS_BACKEND": "edge"}))
+        patches.append(mock.patch.object(self.bc, "TTS_BACKEND", "edge"))
         patches.append(mock.patch.object(
             self.bc, "_render_edge_tts",
             side_effect=[(head, 24000), (tail, 24000)]))
@@ -2724,8 +2768,7 @@ class SynthesiseExtraPathsTests(MonolithGlobalsTestCase):
         base = np.full(8, 0.25, dtype=np.float32)
         preset = {"rate": "+0%", "pitch": "+0Hz", "gain": 1.0}
         patches = self._common_patches("neutral", preset)
-        patches.append(mock.patch.dict(self.bc.__dict__,
-                                       {"TTS_BACKEND": "pyttsx3"}))
+        patches.append(mock.patch.object(self.bc, "TTS_BACKEND", "pyttsx3"))
         patches.append(mock.patch.object(self.bc, "_pyttsx3_tts",
                                          return_value=(base, 22050)))
         for p in patches:
@@ -2759,9 +2802,8 @@ class SynthesiseExtraPathsTests(MonolithGlobalsTestCase):
         base = np.ones(8, dtype=np.float32)
         preset = {"rate": "-15%", "pitch": "+0Hz", "gain": 1.0}
         patches = self._common_patches("neutral", preset)
-        patches.append(mock.patch.dict(
-            self.bc.__dict__,
-            {"TTS_BACKEND": "kokoro", "VOICE_CLONE_ENABLED": False}))
+        patches.append(mock.patch.object(self.bc, "TTS_BACKEND", "kokoro"))
+        patches.append(mock.patch.object(self.bc, "VOICE_CLONE_ENABLED", False))
         patches.append(mock.patch("core.kokoro_tts.is_available",
                                   return_value=True))
         for p in patches:
@@ -2780,9 +2822,8 @@ class SynthesiseExtraPathsTests(MonolithGlobalsTestCase):
         base = np.ones(8, dtype=np.float32)
         preset = {"rate": "+0%", "pitch": "+0Hz", "gain": 1.0}
         patches = self._common_patches("neutral", preset)
-        patches.append(mock.patch.dict(
-            self.bc.__dict__,
-            {"TTS_BACKEND": "kokoro", "VOICE_CLONE_ENABLED": False}))
+        patches.append(mock.patch.object(self.bc, "TTS_BACKEND", "kokoro"))
+        patches.append(mock.patch.object(self.bc, "VOICE_CLONE_ENABLED", False))
         patches.append(mock.patch("core.kokoro_tts.is_available",
                                   return_value=True))
         for p in patches:
@@ -2806,9 +2847,8 @@ class SynthesiseExtraPathsTests(MonolithGlobalsTestCase):
         preset = {"rate": "+3%", "pitch": "+0Hz", "gain": 1.0}
         patches = self._common_patches("wry", preset)
         patches.append(mock.patch.object(self.bc, "_tts_layer", fake_layer))
-        patches.append(mock.patch.dict(
-            self.bc.__dict__,
-            {"TTS_BACKEND": "kokoro", "VOICE_CLONE_ENABLED": False}))
+        patches.append(mock.patch.object(self.bc, "TTS_BACKEND", "kokoro"))
+        patches.append(mock.patch.object(self.bc, "VOICE_CLONE_ENABLED", False))
         patches.append(mock.patch("core.kokoro_tts.is_available",
                                   return_value=True))
         for p in patches:
@@ -2841,9 +2881,8 @@ class SynthesiseExtraPathsTests(MonolithGlobalsTestCase):
         preset = {"rate": "+0%", "pitch": "+0Hz", "gain": 1.0}
         patches = self._common_patches("wry", preset)
         patches.append(mock.patch.object(self.bc, "_tts_layer", fake_layer))
-        patches.append(mock.patch.dict(
-            self.bc.__dict__,
-            {"TTS_BACKEND": "kokoro", "VOICE_CLONE_ENABLED": False}))
+        patches.append(mock.patch.object(self.bc, "TTS_BACKEND", "kokoro"))
+        patches.append(mock.patch.object(self.bc, "VOICE_CLONE_ENABLED", False))
         patches.append(mock.patch("core.kokoro_tts.is_available",
                                   return_value=True))
         for p in patches:
@@ -3289,7 +3328,10 @@ class CallLlmClassifierSideTripsTests(MonolithGlobalsTestCase):
 
     def test_ollama_backend_success(self):
         # AI_BACKEND == "ollama" happy path now flows through the bounded helper.
+        # (_get_local_llm_model faked: see test_ollama_backend_failure_is_caught.)
         with mock.patch.object(self.bc, "AI_BACKEND", "ollama"), \
+                mock.patch.object(self.bc, "_get_local_llm_model",
+                                  return_value="m"), \
                 mock.patch.object(self.bc, "detect_tone", return_value=None), \
                 mock.patch.object(self.bc, "route_voice_emotion",
                                   return_value={"mood": "casual", "addendum": ""}), \
@@ -3980,7 +4022,7 @@ class SynthesiseGainPathTests(MonolithGlobalsTestCase):
         base = np.full(6, 0.8, dtype=np.float32)
         preset = {"rate": "+0%", "pitch": "+0Hz", "gain": 2.0}
         patches = self._common("amused", preset) + [
-            mock.patch.dict(self.bc.__dict__, {"TTS_BACKEND": "xtts"}),
+            mock.patch.object(self.bc, "TTS_BACKEND", "xtts"),
             mock.patch.object(self.bc, "_render_xtts_or_raise",
                               return_value=(base, 24000)),
         ]
@@ -3999,7 +4041,7 @@ class SynthesiseGainPathTests(MonolithGlobalsTestCase):
         base = np.full(6, 0.3, dtype=np.float32)
         preset = {"rate": "+0%", "pitch": "+0Hz", "gain": 2.0}
         patches = self._common("neutral", preset) + [
-            mock.patch.dict(self.bc.__dict__, {"TTS_BACKEND": "pyttsx3"}),
+            mock.patch.object(self.bc, "TTS_BACKEND", "pyttsx3"),
             mock.patch.object(self.bc, "_pyttsx3_tts",
                               return_value=(base, 22050)),
         ]
@@ -4018,7 +4060,7 @@ class SynthesiseGainPathTests(MonolithGlobalsTestCase):
         edge_audio = np.ones(4, dtype=np.float32)
         preset = {"rate": "+0%", "pitch": "+0Hz", "gain": 1.0}
         patches = self._common("neutral", preset) + [
-            mock.patch.dict(self.bc.__dict__, {"TTS_BACKEND": "pyttsx3"}),
+            mock.patch.object(self.bc, "TTS_BACKEND", "pyttsx3"),
             mock.patch.object(self.bc, "_pyttsx3_tts",
                               side_effect=RuntimeError("pyttsx3 dead")),
             mock.patch.object(self.bc, "_render_edge_tts",
@@ -4043,7 +4085,7 @@ class SynthesiseGainPathTests(MonolithGlobalsTestCase):
         preset = {"rate": "+0%", "pitch": "+0Hz", "gain": 1.0}
         patches = self._common("wry", preset) + [
             mock.patch.object(self.bc, "_tts_layer", fake_layer),
-            mock.patch.dict(self.bc.__dict__, {"TTS_BACKEND": "edge"}),
+            mock.patch.object(self.bc, "TTS_BACKEND", "edge"),
             mock.patch.object(self.bc, "_render_edge_tts",
                               return_value=(edge_audio, 24000)),
         ]
@@ -4061,7 +4103,7 @@ class SynthesiseGainPathTests(MonolithGlobalsTestCase):
         py_audio = np.full(5, 0.4, dtype=np.float32)
         preset = {"rate": "+0%", "pitch": "+0Hz", "gain": 2.0}
         patches = self._common("amused", preset) + [
-            mock.patch.dict(self.bc.__dict__, {"TTS_BACKEND": "edge"}),
+            mock.patch.object(self.bc, "TTS_BACKEND", "edge"),
             mock.patch.object(self.bc, "_render_edge_tts",
                               side_effect=RuntimeError("edge 503")),
             mock.patch.object(self.bc, "_pyttsx3_tts",
@@ -6193,6 +6235,8 @@ class OllamaChatBoundedTests(MonolithGlobalsTestCase):
         # the assertion failed for a purely environmental reason).
         with mock.patch.object(self.bc, "AI_BACKEND", "ollama"), \
                 mock.patch.object(self.bc, "OLLAMA_MODEL", "m"), \
+                mock.patch.object(self.bc, "_get_local_llm_model",
+                                  return_value="m"), \
                 mock.patch.object(self.bc, "_call_local_llm", return_value=None), \
                 mock.patch.object(self.bc, "detect_tone", return_value=None), \
                 mock.patch.object(self.bc, "route_voice_emotion",
@@ -6218,6 +6262,8 @@ class OllamaChatBoundedTests(MonolithGlobalsTestCase):
         # _call_local_llm fallback (the existing except arm), not hang/raise.
         with mock.patch.object(self.bc, "AI_BACKEND", "ollama"), \
                 mock.patch.object(self.bc, "OLLAMA_MODEL", "m"), \
+                mock.patch.object(self.bc, "_get_local_llm_model",
+                                  return_value="m"), \
                 mock.patch.object(self.bc, "_last_voice_route",
                                   [{"addendum": ""}]), \
                 mock.patch.object(self.bc, "_last_user_tone", [None]), \

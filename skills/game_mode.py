@@ -154,6 +154,12 @@ import urllib.request
 # was written to fix.
 SPEAK_VERBATIM_ACTIONS = (
     "game_mode_status", "game_mode_on", "game_mode_off", "game_mode_learn_this",
+    # The ALIASES register() binds to the same two handlers. They return the
+    # same finished sentence, so they are voiced the same way: until
+    # 2026-09-30 they sat in neither speak set, and "full power" /
+    # "normal power" / "low power mode" did the work and said NOTHING (caught
+    # by the monolith tier's ActionAliasSpeakSetDriftTests, which CI skips).
+    "low_power_mode", "normal_power", "full_power",
 )
 
 # Registering a handler does NOT teach the local brain the name. A name is only

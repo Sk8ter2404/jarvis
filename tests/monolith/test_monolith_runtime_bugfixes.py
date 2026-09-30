@@ -64,6 +64,7 @@ import io
 import os
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -974,6 +975,14 @@ class VlmCoLoadTrueFreeVramTests(MonolithGlobalsTestCase):
     VRAM (torch.cuda.mem_get_info / nvidia-smi) and refuses when free < needed +
     headroom, regardless of framework."""
 
+    def setUp(self):
+        # _call_local_vision logs a one-shot GPU snapshot before its POST.
+        # Left real, the first test here to get that far ran the real
+        # nvidia-smi and appended to logs/gpu_snapshots.log (2026-09-30).
+        p = mock.patch.object(self.bc, "_log_gpu_state")
+        self.gpu_log = p.start()
+        self.addCleanup(p.stop)
+
     def _patch_vision_ready(self, free_mb):
         """Common patches: local-vision enabled + reachable + model present, and
         NO big Ollama model resident, with a stubbed free-VRAM probe."""
@@ -1014,6 +1023,8 @@ class VlmCoLoadTrueFreeVramTests(MonolithGlobalsTestCase):
             out = bc._call_local_vision("what's on screen?", [b"\x89PNG..."])
         self.assertEqual(out, "a tidy desk")
         req.post.assert_called_once()
+        # The one-shot VRAM snapshot is still taken for the model it loads.
+        self.gpu_log.assert_called_once_with("llava:7b")
 
     def test_probe_unavailable_falls_back_to_ollama_check(self):
         # None (no torch, no nvidia-smi) must NOT block — preserves prior
@@ -1035,11 +1046,24 @@ class VlmCoLoadTrueFreeVramTests(MonolithGlobalsTestCase):
 
     def test_cuda0_free_vram_mb_never_raises(self):
         # Best-effort probe: torch absent AND nvidia-smi absent → returns None,
-        # never raises.
+        # never raises. nvidia-smi is made absent for real: this used to leave
+        # it installed, so on an NVIDIA box it ran the real binary and the
+        # assertion had to accept "None or any int" (2026-09-30).
         bc = self.bc
-        with mock.patch.dict("sys.modules", {"torch": None}):
+        with mock.patch.dict("sys.modules", {"torch": None}), \
+                mock.patch("subprocess.run",
+                           side_effect=FileNotFoundError("nvidia-smi")) as run:
             val = bc._cuda0_free_vram_mb()
-        self.assertTrue(val is None or isinstance(val, int))
+        self.assertIsNone(val)
+        run.assert_called_once()
+        self.assertEqual(run.call_args[0][0][0], "nvidia-smi")
+
+    def test_cuda0_free_vram_mb_parses_the_nvidia_smi_fallback(self):
+        bc = self.bc
+        done = mock.Mock(returncode=0, stdout="12345\n")
+        with mock.patch.dict("sys.modules", {"torch": None}), \
+                mock.patch("subprocess.run", return_value=done):
+            self.assertEqual(bc._cuda0_free_vram_mb(), 12345)
 
 
 @requires_monolith
@@ -1078,6 +1102,16 @@ class LlmQuickOllamaBoundedTests(MonolithGlobalsTestCase):
     no timeout/try-except, so a wedged runner blocked the background one-shot
     forever. It now routes through _ollama_chat_bounded inside try/except and
     degrades to the local fallback (then "") like the claude branch."""
+
+    def setUp(self):
+        # The model pick is not what these pin. Left real, _get_local_llm_model
+        # asked the LIVE Ollama for /api/tags and its first resolution ran the
+        # real nvidia-smi and appended a snapshot to logs/gpu_snapshots.log
+        # (core/gpu_state.py) - from a unit test (found 2026-09-30).
+        p = mock.patch.object(self.bc, "_get_local_llm_model",
+                              return_value="m:tag")
+        p.start()
+        self.addCleanup(p.stop)
 
     def test_ollama_branch_uses_bounded_wrapper(self):
         bc = self.bc
@@ -1908,16 +1942,25 @@ class PaAbandonedCloseGateTests(MonolithGlobalsTestCase):
         import numpy as np
         bc = self.bc
         release = threading.Event()
+        finished = threading.Event()
+        # Cleanups run LIFO: release the wedged reaper, THEN wait for it to
+        # retire its count. Without the wait a failure below left a live
+        # daemon that decremented _pa_close_pending inside the NEXT test
+        # (test_cheap_repick_... then saw the reinit run and failed too).
+        self.addCleanup(finished.wait, 5.0)
         self.addCleanup(release.set)
         entered = threading.Event()
 
         def _wedged_reaper(stream, done_evt, audio_secs):
             # Models a daemon stuck inside Pa_CloseStream: it neither retires
             # the count nor signals the caller.
-            entered.set()
-            release.wait(15.0)
-            bc._pa_close_done()
-            done_evt.set()
+            try:
+                entered.set()
+                release.wait(15.0)
+                bc._pa_close_done()
+                done_evt.set()
+            finally:
+                finished.set()
 
         # Only the caller's ~6 s abandon wait is shortened; every other wait
         # (the amp pump's 0.2 s join, the barge watcher's 0.02 s poll) is left
@@ -3321,14 +3364,25 @@ class FollowTheDefaultResponsivenessTests(MonolithGlobalsTestCase):
     RENDER_A, RENDER_B = "{0.0.0.}.{spk-A}", "{0.0.0.}.{spk-B}"
     CAPTURE_A, CAPTURE_B = "{0.0.1.}.{mic-A}", "{0.0.1.}.{mic-B}"
 
-    def _run_pass(self, endpoints, *, owners_busy=False, sig=("stable",)):
+    def _run_pass(self, endpoints, *, owners_busy=False, sig=("stable",),
+                  detector=None):
         """One _refresh_devices pass with an UNCHANGED device signature and the
         300 s sweep NOT due — so the only thing that can trigger a reinit is
-        the endpoint poll. Returns (terminate_called, printed)."""
+        the endpoint poll. Returns (terminate_called, printed).
+
+        The moved-to endpoints resolve to NO row of the frozen enumeration
+        (_endpoint_device_identity faked to (None, "")), i.e. the move is
+        true hotplug that only a re-enumeration can follow. Left real, that
+        lookup asked this machine's MMDevice store about the synthetic ids.
+        ``detector`` is installed as the wake-word listener's detector."""
         bc = self.bc
         printed = []
         terminated = {"n": 0}
+        wl = types.SimpleNamespace(_detector=detector)
         patches = [
+            mock.patch.object(bc, "_endpoint_device_identity",
+                              return_value=(None, "")),
+            mock.patch.dict(bc.sys.modules, {"skill_wake_listener": wl}),
             mock.patch.object(bc.sd, "_terminate",
                               side_effect=lambda: terminated.__setitem__(
                                   "n", terminated["n"] + 1)),
@@ -3411,22 +3465,48 @@ class FollowTheDefaultResponsivenessTests(MonolithGlobalsTestCase):
 
     def test_a_live_mic_defers_the_trigger_without_forgetting_it(self):
         """The press must not be dropped, and must not churn either: while an
-        owner holds a stream the trigger is not asserted at all (the gate would
-        deny it anyway, and pausing the wake-word stream for a guaranteed
-        deferral is pure churn on an un-retryable resume) — but the baseline is
-        NOT rebased, so the very next idle pass still follows the press."""
+        owner holds a stream the destructive reinit is deferred and the
+        wake-word stream is NOT paused for it (a guaranteed deferral would be
+        pure churn on an un-retryable resume) — but the baseline is NOT
+        rebased, so the very next idle pass still follows the press.
+
+        CHANGED ON PURPOSE in v2.0.97 (2026-09-04): this test was written for
+        v2.0.96, whose trigger stayed SILENT while an owner was live — and
+        since record_speech re-opens the mic continuously, it never fired on
+        a live session at all. v2.0.97 asserts the trigger regardless of a
+        live owner (the usual response, adopting an already-enumerated
+        endpoint, is not destructive; see _refresh_devices), so the move is
+        now ANNOUNCED once even while the mic is live, and only the
+        re-enumeration it needs here is deferred."""
         self._run_pass((self.RENDER_A, self.CAPTURE_A))          # baseline
+        det = mock.Mock()
+        det.is_running.return_value = True
         n, printed = self._run_pass((self.RENDER_B, self.CAPTURE_B),
-                                    owners_busy=True)
+                                    owners_busy=True, detector=det)
+        busy_log = "\n".join(printed)
         self.assertEqual(n, 0, "no reinit while a mic stream is live")
-        self.assertNotIn("Windows default audio endpoint moved",
-                         "\n".join(printed))
+        self.assertEqual(busy_log.count("Windows default audio endpoint moved"),
+                         1, "the move is announced once, live mic or not")
+        self.assertIn("mid-capture teardown", busy_log,
+                      "the deferral must say why the move is not followed yet")
+        det.pause.assert_not_called()
         self.assertEqual(
             self.bc._device_cache["last_default_endpoints"],
             (self.RENDER_A, self.CAPTURE_A),
             "rebasing here would FORGET the press — the 300 s lag returns")
-        n, _ = self._run_pass((self.RENDER_B, self.CAPTURE_B))
+        det2 = mock.Mock()
+        det2.is_running.return_value = True
+        n, printed = self._run_pass((self.RENDER_B, self.CAPTURE_B),
+                                    detector=det2)
         self.assertEqual(n, 1, "the next idle pass must follow the press")
+        self.assertNotIn("Windows default audio endpoint moved",
+                         "\n".join(printed),
+                         "one move, one announcement - not one per pass")
+        det2.pause.assert_called_once()     # idle: paused for the real reinit
+        self.assertEqual(
+            self.bc._device_cache["last_default_endpoints"],
+            (self.RENDER_B, self.CAPTURE_B),
+            "the baseline rebases once the re-enumeration really ran")
 
     def test_endpoint_poll_failures_disable_themselves_and_never_raise(self):
         bc = self.bc

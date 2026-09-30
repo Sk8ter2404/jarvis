@@ -116,8 +116,10 @@ WHAT IS INTERCEPTED
 WHAT IS DELIBERATELY *NOT* INTERCEPTED
 --------------------------------------
 Other files at the project root (source, ``.coverage``, a tool's own output),
-``logs/``, and the STAGING tree (``data_staging/``): a test writing those
-damages no live state. ``tests/test_live_data_guard.py`` pins the list.
+``logs/`` apart from the named ``LIVE_LOG_FILES`` (``gpu_snapshots.log`` and
+its rotation, refused since 2026-09-30), and the STAGING tree
+(``data_staging/``): a test writing those damages no live state.
+``tests/test_live_data_guard.py`` pins the list.
 
 Escape hatch for a human deliberately driving live state:
 ``JARVIS_ALLOW_LIVE_DATA=1``. It is announced by ``banner()``, which
@@ -161,6 +163,20 @@ LIVE_ROOT_STATE_FILES = frozenset({
     "hud_state.json",
     "injected_commands.json",
     "tray_commands.json",
+})
+
+# Named LIVE LOGS under logs/ (2026-09-30). The rest of logs/ stays open (see
+# the docstring), but these are the owner's EVIDENCE, not a tool's scratch:
+# gpu_snapshots.log is the one record of which models JARVIS actually put in
+# VRAM, and when (core/gpu_state.py). Four unit tests reached its real writer
+# - each ran the real nvidia-smi and appended a snapshot headed with a model
+# the TEST had named ("m", "llava:7b", ...), so the log claimed loads that
+# never happened. Writing, appending to, replacing onto / off (the .1
+# rotation) or deleting one is REFUSED. core.gpu_state.log_gpu_state never
+# raises, so a refused append degrades to its "could not write" line.
+LIVE_LOG_FILES = frozenset({
+    "gpu_snapshots.log",
+    "gpu_snapshots.log.1",
 })
 
 # Scripts whose execution IS a live JARVIS, plus the LAUNCHERS that start one.
@@ -337,10 +353,23 @@ def _is_live_root_state(path) -> bool:
     return bool(p) and p in _LIVE_ROOT_STATE_N
 
 
+_LOGS_N = os.path.normcase(os.path.join(_ROOT_N, "logs"))
+_LIVE_LOG_N = frozenset(
+    os.path.normcase(os.path.join(_LOGS_N, n)) for n in LIVE_LOG_FILES)
+
+
+def _is_live_log(path) -> bool:
+    """One of the named live logs under the project's logs/ (see
+    LIVE_LOG_FILES)."""
+    p = _norm(path)
+    return bool(p) and p in _LIVE_LOG_N
+
+
 def _is_live_state(path) -> bool:
-    """Anything a test must never write or delete: the live ``data/`` tree
-    or a named live state file at the project root."""
-    return _under_live_data(path) or _is_live_root_state(path)
+    """Anything a test must never write or delete: the live ``data/`` tree,
+    a named live state file at the project root, or a named live log."""
+    return (_under_live_data(path) or _is_live_root_state(path)
+            or _is_live_log(path))
 
 
 def _is_clean_flag(path) -> bool:
@@ -522,7 +551,8 @@ def _check_write(op: str, file) -> None:
     if base == "clean_shutdown.flag" and _is_clean_flag(file):
         _refuse(op, str(file))
     elif base and (_under_live_data(file) or (
-            base in LIVE_ROOT_STATE_FILES and _is_live_root_state(file))):
+            base in LIVE_ROOT_STATE_FILES and _is_live_root_state(file)) or (
+            base in LIVE_LOG_FILES and _is_live_log(file))):
         # Since 2026-09-30 a REFUSAL, not a record: the three suites that used
         # to write live data/ (and the eight that wrote live root state) now
         # write temp paths - see the module docstring.

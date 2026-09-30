@@ -617,13 +617,27 @@ class OllamaEmbedderTests(_RagBase):
     def setUp(self):
         super().setUp()
         # _embed_one best-effort calls core.gpu_state.log_gpu_state, which on a
-        # real host shells out to nvidia-smi. Swap in a no-op so the embedder
-        # unit tests stay offline and never spawn a subprocess.
+        # real host shells out to nvidia-smi. Swap in a recorder so the
+        # embedder unit tests stay offline and never spawn a subprocess.
+        self.gpu_calls = []
+        self._install_fake_gpu_state(lambda model: self.gpu_calls.append(model))
+
+    def _install_fake_gpu_state(self, log_fn):
+        """Swap core.gpu_state for a fake on BOTH import routes.
+
+        `from core import gpu_state` resolves the PACKAGE ATTRIBUTE once
+        core.gpu_state has been imported anywhere in the process, so the old
+        sys.modules-only patch was unseen in the full suite: the REAL
+        log_gpu_state ran nvidia-smi and appended a snapshot to
+        logs/gpu_snapshots.log, while the test passed alone (2026-09-30)."""
+        import core
         fake_gpu = types.ModuleType("core.gpu_state")
-        fake_gpu.log_gpu_state = lambda *a, **k: None
-        p = mock.patch.dict(sys.modules, {"core.gpu_state": fake_gpu})
-        p.start()
-        self.addCleanup(p.stop)
+        fake_gpu.log_gpu_state = log_fn
+        for p in (mock.patch.dict(sys.modules, {"core.gpu_state": fake_gpu}),
+                  mock.patch.object(core, "gpu_state", fake_gpu, create=True)):
+            p.start()
+            self.addCleanup(p.stop)
+        return fake_gpu
 
     def _patch_urlopen(self, payload=None, error=None, capture=None):
         """Patch urllib so no real socket is opened.
@@ -662,6 +676,8 @@ class OllamaEmbedderTests(_RagBase):
         with self._patch_urlopen(payload={"embedding": [1, 2, 3]}):
             out = emb._embed_one("hello")
         self.assertEqual(out, [1.0, 2.0, 3.0])
+        # The FAKE took the snapshot call - proof the real one did not.
+        self.assertEqual(self.gpu_calls, ["m"])
 
     def test_embed_one_empty_embedding_raises(self):
         emb = rag._OllamaEmbedder("m", "http://x")
@@ -722,15 +738,17 @@ class OllamaEmbedderTests(_RagBase):
         # The gpu_state import/log is best-effort; make it raise and confirm
         # the embedding still succeeds.
         emb = rag._OllamaEmbedder("m", "http://x")
-        fake_gpu = types.ModuleType("core.gpu_state")
+        raised = []
 
         def _boom(model):
+            raised.append(model)
             raise RuntimeError("no smi")
 
-        fake_gpu.log_gpu_state = _boom
-        with mock.patch.dict(sys.modules, {"core.gpu_state": fake_gpu}):
-            with self._patch_urlopen(payload={"embedding": [1.0]}):
-                self.assertEqual(emb._embed_one("x"), [1.0])
+        self._install_fake_gpu_state(_boom)
+        with self._patch_urlopen(payload={"embedding": [1.0]}):
+            self.assertEqual(emb._embed_one("x"), [1.0])
+        # Not vacuous: the raising fake really was the one called.
+        self.assertEqual(raised, ["m"])
 
     # ── reachability probe ────────────────────────────────────────────────
     # It must NOT embed. Embedding forces Ollama to evict the resident voice

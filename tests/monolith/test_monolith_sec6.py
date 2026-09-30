@@ -3174,10 +3174,15 @@ class GetFollowupResponseExtraTests(SectionSixBase):
             captured["messages"] = messages
             return {"message": {"content": "ollama follow-up"}}
 
+        # _get_local_llm_model faked: its first real resolution asks the live
+        # Ollama for /api/tags and runs the real nvidia-smi into
+        # logs/gpu_snapshots.log (2026-09-30).
         with mock.patch.object(bc, "AI_BACKEND", "ollama"), \
+             mock.patch.object(bc, "_get_local_llm_model", return_value="m"), \
              mock.patch.object(bc, "_ollama_chat_bounded", side_effect=_bounded):
             out = bc.get_followup_response([("get_time", "noon")])
         self.assertEqual(out, "ollama follow-up")
+        self.assertEqual(captured["model"], "m")
         # The system prompt is the first message and the action summary the last.
         self.assertEqual(captured["messages"][0]["role"], "system")
         self.assertIn("get_time", captured["messages"][-1]["content"])

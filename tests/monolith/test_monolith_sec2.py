@@ -393,16 +393,29 @@ class DeviceAccessorTests(_MonolithSec2Base):
                 mock.patch.object(self.bc, "sd", sd):
             self.assertEqual(self.bc.get_current_mic_name(), "[4] (unknown)")
 
+    # v2.0.103 (2026-09-06) made get_current_speaker_name() refresh FIRST,
+    # symmetrically with get_current_mic_name(). These two predate that and
+    # left _refresh_devices REAL, so on a machine with audio hardware the real
+    # PortAudio re-enumeration (sd._terminate/_initialize in the test process)
+    # overwrote the fixture with THIS box's speaker ("[3] Speakers (...)") or
+    # tripped over the fake sd. The refresh is faked like the mic siblings'
+    # and asserted, so they now pin the v2.0.103 order on any machine.
     def test_get_current_speaker_name_system_default(self):
         self.bc._device_cache["out"] = None
-        self.assertEqual(self.bc.get_current_speaker_name(), "(system default)")
+        with mock.patch.object(self.bc, "_refresh_devices") as refresh:
+            self.assertEqual(self.bc.get_current_speaker_name(),
+                             "(system default)")
+        refresh.assert_called_once_with(force=True)
 
     def test_get_current_speaker_name_with_index(self):
         sd = mock.Mock()
         sd.query_devices.return_value = {"name": "Realtek"}
         self.bc._device_cache["out"] = 1
-        with mock.patch.object(self.bc, "sd", sd):
+        with mock.patch.object(self.bc, "_refresh_devices") as refresh, \
+                mock.patch.object(self.bc, "sd", sd):
             self.assertEqual(self.bc.get_current_speaker_name(), "[1] Realtek")
+        refresh.assert_called_once_with(force=True)
+        sd.query_devices.assert_called_once_with(1)
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -3325,11 +3338,17 @@ class DeviceAccessorExtraTests(_MonolithSec2Base):
             self.assertIsNone(self.bc.get_output_device())
 
     def test_get_current_speaker_name_unknown_on_error(self):
+        # _refresh_devices faked: see DeviceAccessorTests (v2.0.103 refresh-
+        # first). Left real, the refresh re-picked against the fake sd (whose
+        # query_devices raises), found no output device and the answer read
+        # "(system default)".
         sd = mock.Mock()
         sd.query_devices.side_effect = RuntimeError("gone")
         self.bc._device_cache["out"] = 2
-        with mock.patch.object(self.bc, "sd", sd):
+        with mock.patch.object(self.bc, "_refresh_devices") as refresh, \
+                mock.patch.object(self.bc, "sd", sd):
             self.assertEqual(self.bc.get_current_speaker_name(), "[2] (unknown)")
+        refresh.assert_called_once_with(force=True)
 
 
 # ───────────────────────────────────────────────────────────────────────────

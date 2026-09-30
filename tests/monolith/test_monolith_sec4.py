@@ -1672,7 +1672,11 @@ class StreamingPlayAndVerifyTests(MonolithGlobalsTestCase):
                                side_effect=self.bc.UIFailsafeError("corner")), \
              mock.patch.object(self.bc.time, "sleep"):
             out = self.bc._streaming_play_and_verify(cfg, "Svc", "song")
-        self.assertIn("aborted", out)
+        # v2.0.67 (2026-07-14): "aborted" -> "failed", so the line carries a
+        # canonical FAILURE_MARKER and is voiced (see the keyboard hint test).
+        from core.failure_markers import FAILURE_MARKERS
+        self.assertEqual(out, "play attempt on Svc failed: corner")
+        self.assertTrue(any(m in out.lower() for m in FAILURE_MARKERS), out)
 
     def test_skipped_strategy_advances_without_verifying(self):
         # First strategy is a no-op (attempted=False) ⇒ loop should advance to
@@ -1759,21 +1763,51 @@ class StreamingAutoPlayTests(MonolithGlobalsTestCase):
             out = self.bc._streaming_auto_play("netflix", "the matrix")
         self.assertIn("auto-click needs", out)
 
-    def test_youtube_no_play_hint_path(self):
-        # YouTube has play_hint=None → after clicking the result it just
-        # full-screens and reports playing.
-        with mock.patch.object(self.bc, "_open_url_in_browser",
+    def _youtube_click_path(self, confirmed):
+        """The vision-CLICK path (the resolver found nothing), with every
+        real-resource edge faked: the results fetch, the screenshot + vision
+        confirm, the mouse and the keyboard."""
+        bc = self.bc
+        with mock.patch.object(bc, "_youtube_resolve_video",
+                               return_value=None), \
+             mock.patch.object(bc, "_open_url_in_browser",
                                return_value="chrome"), \
-             mock.patch.object(self.bc.time, "sleep"), \
-             mock.patch.object(self.bc, "SCREEN_VISION_ENABLED", True), \
-             mock.patch.object(self.bc, "UI_AUTOMATION_ENABLED", True), \
-             mock.patch.object(self.bc, "AI_BACKEND", "claude"), \
-             mock.patch.object(self.bc, "find_click_target", return_value=(100, 200)), \
-             mock.patch.object(self.bc, "ui_click"), \
-             mock.patch.object(self.bc, "_streaming_go_fullscreen") as fs:
-            out = self.bc._streaming_auto_play("youtube", "lofi beats")
+             mock.patch.object(bc.time, "sleep"), \
+             mock.patch.object(bc, "SCREEN_VISION_ENABLED", True), \
+             mock.patch.object(bc, "UI_AUTOMATION_ENABLED", True), \
+             mock.patch.object(bc, "AI_BACKEND", "claude"), \
+             mock.patch.object(bc, "find_click_target",
+                               return_value=(100, 200)), \
+             mock.patch.object(bc, "_streaming_confirm_playback",
+                               return_value=(confirmed, "vision: synthetic")
+                               ) as confirm, \
+             mock.patch.object(bc, "ui_click") as click, \
+             mock.patch.object(bc, "ui_press") as press, \
+             mock.patch.object(bc, "_streaming_go_fullscreen") as fs:
+            out = bc._streaming_auto_play("youtube", "lofi beats")
+        return out, confirm, click, press, fs
+
+    def test_youtube_no_play_hint_path(self):
+        # v2.0.46 (2026-07-10) ended YouTube's click-and-ASSUME: this test
+        # pinned "after clicking the result it just full-screens and reports
+        # playing", which the owner heard over an un-clicked search page.
+        # play_hint is still None (the watch page autoplays), but playback is
+        # now CONFIRMED before "playing" is said. The old version also left
+        # the resolver, the vision confirm and ui_press REAL, so on a real
+        # desktop it fetched youtube.com, screenshotted the screen, ran a
+        # local vision model and pressed the media play/pause key.
+        out, confirm, click, press, fs = self._youtube_click_path(True)
         self.assertEqual(out, "playing 'lofi beats' on YouTube")
+        click.assert_called_once_with(100, 200)
+        confirm.assert_called()
         fs.assert_called_once()
+        press.assert_not_called()      # confirmed first time: no play toggle
+
+    def test_youtube_unconfirmed_playback_is_never_reported_playing(self):
+        out, confirm, click, press, fs = self._youtube_click_path(False)
+        self.assertNotIn("playing 'lofi beats'", out)
+        self.assertIn("couldn't confirm", out)
+        fs.assert_not_called()
 
     def test_result_not_seen_returns_hint(self):
         with mock.patch.object(self.bc, "_open_url_in_browser",
@@ -2939,8 +2973,15 @@ class StreamingAutoPlayBranchTests(MonolithGlobalsTestCase):
              mock.patch.object(self.bc, "_streaming_keyboard_select_first_result",
                                return_value=False):
             out = self.bc._streaming_auto_play("apple_music", "some song")
-        self.assertIn("UI", out)
-        self.assertIn("click the first result yourself", out)
+        # v2.0.67 (2026-07-14) reworded this line on purpose: it must carry a
+        # canonical FAILURE_MARKER ("couldn't") or it sits in neither speak
+        # set and the owner hears nothing about why nothing played. The old
+        # "... click the first result yourself" wording is gone.
+        from core.failure_markers import FAILURE_MARKERS
+        self.assertIn("UI automation is unavailable", out)
+        self.assertIn("couldn't select the first result", out)
+        self.assertIn("click it yourself", out)
+        self.assertTrue(any(m in out.lower() for m in FAILURE_MARKERS), out)
 
     def test_keyboard_path_delegates_to_play_and_verify(self):
         # keyboard select succeeds, play_hint present, strict → delegates to

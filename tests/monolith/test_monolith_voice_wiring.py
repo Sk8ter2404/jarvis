@@ -320,6 +320,16 @@ class StandbyWakeWiringTests(_VoiceWiringBase):
         audio = np.zeros(sr, dtype=np.float32)
         return audio, [
             mock.patch.object(bc, "record_speech", return_value=audio),
+            # The standby path runs apply_capture_auto_gain(audio,
+            # _last_recording_peak) before either wake check. That peak is a
+            # process global the real record_speech (or an injected turn,
+            # which floors it at 2 x WHISPER_TRUST_RMS) leaves behind, and
+            # this record_speech is faked - so a value left by an EARLIER
+            # test (the injected-capture test in this file) boosted this
+            # test's buffer into a NEW array, and the wake assertion compared
+            # two different arrays (ValueError, 2026-09-30). 0.0 is below the
+            # auto-gain noise floor: the buffer is passed through unchanged.
+            mock.patch.object(bc, "_last_recording_peak", 0.0),
             mock.patch.object(bc, "_audio_music_feed"),
             mock.patch.object(bc, "set_state"),
             mock.patch.object(bc, "_heartbeat"),
@@ -343,7 +353,11 @@ class StandbyWakeWiringTests(_VoiceWiringBase):
                 p.start()
                 self.addCleanup(p.stop)
             bc._handle_sleep_standby(None)
-        wake.assert_called_once_with(audio)
+        # Identity, not ==: comparing two numpy arrays inside mock's call
+        # equality raises instead of answering.
+        self.assertEqual(wake.call_count, 1)
+        self.assertIs(wake.call_args[0][0], audio,
+                      "the wake check must judge the captured buffer")
         tx.assert_called_once()           # Whisper path taken (default)
 
     def test_neural_true_wakes_without_transcribe(self):

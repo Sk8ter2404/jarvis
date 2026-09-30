@@ -1846,8 +1846,15 @@ class AmbientLearnFromGatedTests(SectionFiveBase):
         src = inspect.getsource(self.bc.main)
         # Locate the bg-audio gate's drop block and assert the feed precedes its
         # `continue` (and the set_state("idle") that immediately precedes it).
-        marker = "_should_refuse_background_audio(text)"
+        # v1.77.0 (2026-07-04) routed the main loop's gate through
+        # _bg_gate_for_turn(text, injected) so injected turns bypass it; the
+        # old marker (the direct _should_refuse_background_audio(text) call)
+        # no longer appears in main(). Pin both hops: main() -> wrapper, and
+        # the wrapper still delegates every MIC turn to the real gate.
+        marker = "_bg_gate_for_turn("
         self.assertIn(marker, src)
+        wrapper = inspect.getsource(self.bc._bg_gate_for_turn)
+        self.assertIn("return _should_refuse_background_audio(text)", wrapper)
         after = src[src.index(marker):]
         feed_at = after.find("_ambient_learn_from_gated")
         cont_at = after.find("continue")

@@ -32,6 +32,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from unittest import mock
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PROJECT = os.path.dirname(_HERE)
@@ -95,10 +96,20 @@ class FollowupSeesActionReferenceTests(unittest.TestCase):
             bc.conversation_history.append(
                 {"role": "assistant", "content": "[ACTION: get_time]"})
             bc._local_then_cloud_or_honest = _fake_llm
-            bc.get_followup_response([
-                ("get_time", "3:14 PM"),
-                ("_dropped_step", "you promised a second step but emitted no token"),
-            ])
+            # The LOCAL route is the one under test (it is the only one that
+            # reuses _last_stable_sys_prompt). It used to come from this box's
+            # user_settings.json MODEL_ROUTING, so on a tree without it the
+            # round took the AI_BACKEND branch: a real POST to the live
+            # Ollama /api/chat, and a real nvidia-smi into
+            # logs/gpu_snapshots.log on the first model resolution
+            # (2026-09-30). Pinned, so every box drives the same branch.
+            import core.config as _cfg
+            with mock.patch.dict(_cfg.MODEL_ROUTING, {"chat": "local"}):
+                bc.get_followup_response([
+                    ("get_time", "3:14 PM"),
+                    ("_dropped_step",
+                     "you promised a second step but emitted no token"),
+                ])
         finally:
             (bc._last_stable_sys_prompt[0], bc._last_turn_pc_block[0],
              _hist, bc._local_then_cloud_or_honest) = saved

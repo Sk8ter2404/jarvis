@@ -4859,7 +4859,9 @@ _face_presence_trackers: dict = {}
 _face_presence_fp: dict = {}
 
 # Per-camera awareness — used by where_is_user / see_user actions so Bobert
-# can tell which monitor you're facing. Updated by the face-tracking thread.
+# can tell which monitor you're facing, and by the face_tracker skill (and
+# through it wellness, the briefings' presence wait and morning arrival).
+# Stamped ONLY by _face_presence_note, on a SUSTAINED face (2026-09-30).
 _camera_last_seen: dict[int, float]    = {}            # index → timestamp
 _camera_latest_frame: dict[int, "np.ndarray"] = {}     # index → most recent frame
 _camera_state_lock = threading.Lock()
@@ -9420,13 +9422,24 @@ def _detect_face(frame_bgr: np.ndarray) -> tuple[float, float] | None:
 
 def _face_presence_note(cam_index, frame, face, now: float | None = None) -> bool:
     """Face-track producer: feed ONE frame the detector just ran on to that
-    camera's sustained-presence tracker; stamp last_face_seen only when it
-    confirms a face (core/face_presence.py). Returns True when it stamped.
+    camera's sustained-presence tracker; stamp last_face_seen AND this
+    camera's _camera_last_seen entry only when it confirms a face
+    (core/face_presence.py). Returns True when it stamped.
 
     ``face`` is _detect_face's result for this frame; its detail is read from
     _face_detect_last. A frame identical to this camera's previous one (a
     re-served / cached buffer) is ignored — neither a hit nor a miss. This is
-    the ONLY writer of last_face_seen. Never raises."""
+    the ONLY writer of last_face_seen and of _camera_last_seen. Never raises.
+
+    The per-camera stamp joined the rule on 2026-09-30. v2.0.142 made
+    last_face_seen need a sustained face, but the loop still stamped
+    _camera_last_seen on EVERY single-frame hit, and that dict is what the
+    face_tracker skill turns into "the owner is at a monitor" — which the
+    wellness focus-block nudge, the daily / evening briefings' presence wait
+    and morning_arrival_v2's arrival edge all read. So one face-like blob
+    could still start a "90 minutes at the desk" block or an arrival
+    briefing in an empty room. Both stamps now come from the same tracker
+    verdict, so the proactive gate and the skills agree on who is there."""
     global last_face_seen
     try:
         now = time.time() if now is None else float(now)
@@ -9441,6 +9454,8 @@ def _face_presence_note(cam_index, frame, face, now: float | None = None) -> boo
             _face_presence_trackers[cam_index] = tracker
         if tracker.observe(now, fresh=fresh, qualified=qualified):
             last_face_seen = now
+            with _camera_state_lock:
+                _camera_last_seen[cam_index] = now
             return True
     except Exception:
         logging.exception("[face-track] presence note failed")
@@ -11229,17 +11244,17 @@ def _face_tracking_thread_body():
                     logging.exception("[face-track] _detect_face failed; skipping frame")
                     time.sleep(0.5)
                     continue
-                # PRESENCE (the proactive gate): every frame the detector ran
-                # on, hit or miss, feeds this camera's sustained-presence
-                # tracker; only a confirmed face stamps last_face_seen. A
-                # single-frame hit, a relaxed-pass hit, a small face or a
-                # re-served frame no longer counts (2026-09-30).
+                # PRESENCE: every frame the detector ran on, hit or miss,
+                # feeds this camera's sustained-presence tracker; only a
+                # confirmed face stamps last_face_seen (the proactive gate)
+                # and this camera's _camera_last_seen entry (the face_tracker
+                # skill -> wellness, briefings, morning arrival). A single-
+                # frame hit, a relaxed-pass hit, a small face or a re-served
+                # frame counts for neither (2026-09-30). The raw hit below
+                # still steers the eyes.
                 _face_presence_note(cam["index"], frame, face, now_loop)
                 if not face:
                     continue
-                # Record that this specific camera just saw a face
-                with _camera_state_lock:
-                    _camera_last_seen[cam["index"]] = now_loop
                 if cam["primary"]:
                     primary_face = face
                 else:

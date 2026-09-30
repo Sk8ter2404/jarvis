@@ -604,10 +604,23 @@ class ReprimeAfterBackgroundTriggerTests(_Base):
 
     def test_calls_inside_a_turn_never_schedule(self):
         # The turn's follow-ups / owner actions re-warm the prefix themselves.
+        # The second call is an UNTAGGED one on another thread (an owner
+        # action): owner work never waits, so it really POSTs inside the
+        # turn. It used to be _bg_chat() - a TAGGED background job, which the
+        # gate DEFERS for the whole turn: it never ran here (so this passed
+        # without testing it), outlived the test, was released ~10 s later
+        # once the harness cleared _turn_in_progress, and its POST scheduled
+        # a re-prime inside whichever test was running then -
+        # test_untagged_non_owner_call_outside_a_turn_also_schedules failed
+        # intermittently on "Called 2 times" (2026-09-29/30).
         bc = self.bc
         bc._turn_in_progress[0] = True
         bc._call_local_llm("sys", [{"role": "user", "content": "x"}])
-        self._bg_chat()
+        th, _ = self._in_thread(lambda: bc._call_local_llm(
+            "sys", [{"role": "user", "content": "y"}]))
+        th.join(5)
+        self.assertFalse(th.is_alive(), "an owner-side call waited")
+        self.assertEqual(len(self.posted), 2, "both calls must really POST")
         self.sched.assert_not_called()
 
     def test_the_owner_turns_primary_call_never_schedules(self):
