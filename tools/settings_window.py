@@ -299,6 +299,16 @@ SCHEMA: dict[str, dict] = {
                 "ends (while the mic was already listening) counts as his "
                 "echo. Applies on the next start.",
     },
+    "NOISE_FILTER_ENABLED": {
+        "tab": "voice", "label": "Ignore noise heard as 'Bye.' / 'Thank you.'",
+        "type": "bool", "default": True,
+        "help": "Whisper turns room noise into 'Bye.', 'Thank you.' or 'You'. "
+                "Ignore a transcript that is only one of those when it was "
+                "barely louder than silence, Whisper doubts it, or nobody has "
+                "talked to JARVIS for a while. A real reply ('thank you' right "
+                "after he answers) is kept; typed commands are never checked. "
+                "Applies on the next start.",
+    },
     "MICROPHONE_INDEX": {
         "tab": "voice", "label": "Microphone", "type": "device",
         "default": None,

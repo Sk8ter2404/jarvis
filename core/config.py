@@ -568,6 +568,18 @@ DIALOGUE_STOP_LISTEN = True
 DIALOGUE_BEAT_S = 0.6
 DIALOGUE_LOST_HOLD_S = 12.0
 
+# Noise heard as speech (core/speech_filter.hallucination_verdict, R10). When
+# True, a mic transcript that is ONLY a classic Whisper hallucination ("Bye.",
+# "Thank you.", "You", "Thanks for watching") is ignored as noise — logged
+# "[noise] ignored", never the text — when Whisper's own confidence is poor,
+# the capture was barely above the VAD threshold, or the owner has not spoken
+# for a while and it is not an answer to something JARVIS just asked. A real
+# short reply ("thank you" right after JARVIS answered, "bye" ending a
+# conversation) is kept. Typed commands are never checked. Thresholds:
+# SPEECH_FILTER_OVERRIDES (NOISE_*). Set via user_settings.json; applies on
+# the next start.
+NOISE_FILTER_ENABLED = True
+
 
 # ─── Whisper STT (faster-whisper preferred, GPU when present) ──────────
 # `WHISPER_DEVICE = 'auto'` lets ctranslate2 + torch decide; 'cuda'
@@ -583,7 +595,9 @@ WHISPER_MODEL_CPU   = "small"           # CPU-friendly default when no GPU
 # MICROPHONE, so an install whose mic differs from the desktop's overrides them
 # here (via user_settings.json) instead of editing core/speech_filter.py and
 # carrying a local patch. Allowed keys: WHISPER_MIN_WORDS, WHISPER_TRUST_RMS,
-# WHISPER_MIN_AVG_LOGPROB, WHISPER_MAX_NO_SPEECH_PROB; anything else is ignored.
+# WHISPER_MIN_AVG_LOGPROB, WHISPER_MAX_NO_SPEECH_PROB, and the noise gate's
+# NOISE_RMS_MARGIN, NOISE_OWNER_IDLE_S, NOISE_REPLY_WINDOW_S (R10); anything
+# else is ignored.
 # Empty (default) = the built-in thresholds. Example for a laptop mic:
 #   {"WHISPER_MIN_WORDS": 3, "WHISPER_MIN_AVG_LOGPROB": -1.15, "WHISPER_TRUST_RMS": 0.15}
 SPEECH_FILTER_OVERRIDES = {}

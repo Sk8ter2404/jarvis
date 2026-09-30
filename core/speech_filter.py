@@ -1,6 +1,6 @@
 """core/speech_filter.py — Whisper transcription gating.
 
-Two pure functions that run on every transcription BEFORE it reaches the LLM:
+Pure functions that run on every transcription BEFORE it reaches the LLM:
 
   is_ambient_music(text)  — True when Whisper emitted a [Music]/♪ marker instead
                             of words (the mic picked up music, not speech).
@@ -9,6 +9,9 @@ Two pure functions that run on every transcription BEFORE it reaches the LLM:
                             mumbles, and (optionally) anything missing the wake
                             word, while always accepting a small set of common
                             single-word commands.
+  hallucination_verdict(...) — (R10) for a transcript that is ONLY a known
+                            hallucination phrase: noise (drop), a genuine short
+                            reply (keep), or neither (is_valid_speech decides).
 
 Extracted verbatim from bobert_companion.py along with their tuning constants
 so the gate logic is testable in isolation (it had no coverage before) and the
@@ -91,9 +94,16 @@ def is_ambient_music(text: str) -> bool:
     return any(m in t for m in _MUSIC_MARKERS)
 
 
-def is_valid_speech(text: str, conf: dict, peak_rms: float = 0.0) -> tuple[bool, str]:
+def is_valid_speech(text: str, conf: dict, peak_rms: float = 0.0,
+                    reply: bool = False) -> tuple[bool, str]:
     """Decide if this transcription is real speech worth responding to.
-    Returns (is_valid, reason_if_filtered)."""
+    Returns (is_valid, reason_if_filtered).
+
+    ``reply``: the caller's hallucination_verdict() judged this transcript a
+    genuine short reply ("thank you" right after JARVIS answered). Only then
+    is a reply-able hallucination phrase (REPLY_PHRASES) accepted instead of
+    rejected as a hallucination match; every other transcript is judged
+    exactly as without it."""
     if not text:
         return False, "empty"
 
@@ -103,6 +113,11 @@ def is_valid_speech(text: str, conf: dict, peak_rms: float = 0.0) -> tuple[bool,
 
     # Always accept short common words even if MIN_WORDS would reject them
     if len(words) == 1 and normalized in WHISPER_ALWAYS_ACCEPT:
+        return True, ""
+
+    # A judged reply: the phrase is the owner's, not Whisper's. The verdict
+    # already required Whisper's own no-speech / confidence scores to pass.
+    if reply and _norm_phrase(text) in _reply_norms():
         return True, ""
 
     # Always reject known hallucinations regardless of anything else
@@ -137,6 +152,141 @@ def is_valid_speech(text: str, conf: dict, peak_rms: float = 0.0) -> tuple[bool,
     return True, ""
 
 
+# ── Hallucination-only transcripts: noise, or a real short reply? ──────────
+# (2026-09-29, R10)
+#
+# THE LIVE INCIDENT (session_2026-09-29_19-17-23.log, 19:18:55). Nobody home,
+# wake-word mode off, no media playing. Whisper turned room noise (peak RMS
+# 0.0119 against the 0.008 VAD threshold: 1.49x) into "Bye." and the main loop
+# answered it as an owner turn with a full LLM call. It got through because
+# "bye" is in BOTH lists above and is_valid_speech's single-word
+# WHISPER_ALWAYS_ACCEPT shortcut runs BEFORE the hallucination check — so
+# "bye" / "okay" / "ok" / "yeah" were accepted however they were heard, while
+# "thank you" was rejected however it was said, even right after JARVIS
+# answered the owner.
+#
+# hallucination_verdict() decides the phrase-ONLY transcripts on evidence
+# instead of on the word:
+#   "noise" — drop it, when ANY of:
+#     * Whisper itself says so: no_speech_prob above WHISPER_MAX_NO_SPEECH_PROB
+#       or avg_logprob below WHISPER_MIN_AVG_LOGPROB (is_valid_speech's own
+#       thresholds — and NOT bypassed by a loud peak here);
+#     * the capture was only marginally louder than the VAD trip: peak RMS
+#       under NOISE_RMS_MARGIN x the VAD threshold. Measured over every
+#       September session log on the owner's desk mic: 58% of hallucination-
+#       only transcripts peaked under 1.5x the threshold, against 11% of all
+#       other transcripts (his real speech sits at ~1.1-2x on that quiet mic,
+#       which is why the margin is not higher);
+#     * the owner has not spoken for NOISE_OWNER_IDLE_S and the phrase is not
+#       an answer to a question JARVIS asked in the last NOISE_REPLY_WINDOW_S.
+#   "reply" — keep it, when the phrase is one people answer with
+#     (REPLY_PHRASES) and the context makes it clearly a reply: the owner is
+#     in a conversation (spoke within NOISE_OWNER_IDLE_S) and JARVIS just
+#     spoke (within NOISE_REPLY_WINDOW_S) or is waiting on a confirmation /
+#     yes-no prompt. That context outranks the two CIRCUMSTANTIAL signals
+#     (level, idle owner) but never Whisper's own verdict.
+#   ""      — neither: is_valid_speech decides exactly as before (so a
+#     "thank you" that is not a reply is still a hallucination match).
+#
+# Pure: the caller supplies the context. The reason string is numbers only —
+# callers log it, never the transcript.
+NOISE_RMS_MARGIN     = 1.5    # x the VAD threshold = "only marginally above"
+NOISE_OWNER_IDLE_S   = 300.0  # owner silent this long = no conversation
+NOISE_REPLY_WINDOW_S = 20.0   # "right after JARVIS spoke"
+
+# Hallucination phrases a person really answers with. Everything else in
+# WHISPER_HALLUCINATIONS ("you", "thanks for watching", "subscribe", fillers,
+# music tags, punctuation) is never taken as a reply.
+REPLY_PHRASES = frozenset({
+    "thank you", "thanks", "bye", "bye bye", "okay", "ok", "yeah",
+})
+
+
+def _norm_phrase(text) -> str:
+    """Lower-case words only: 'Bye-bye!' -> 'bye bye', 'Thank you.' ->
+    'thank you'. Never raises."""
+    try:
+        return " ".join(re.sub(r"[^\w\s]", " ", str(text or "").lower()).split())
+    except Exception:
+        return ""
+
+
+def _hallucination_norms() -> frozenset:
+    # Derived from the live set at call time, so the two can never drift.
+    return frozenset(n for n in map(_norm_phrase, WHISPER_HALLUCINATIONS) if n)
+
+
+def _reply_norms() -> frozenset:
+    return (frozenset(map(_norm_phrase, REPLY_PHRASES))
+            & _hallucination_norms())
+
+
+def is_hallucination_only(text) -> bool:
+    """True when the WHOLE transcript is one known Whisper-hallucination
+    phrase (case and punctuation ignored): 'Bye.', 'Thank you!', 'You'."""
+    n = _norm_phrase(text)
+    return bool(n) and n in _hallucination_norms()
+
+
+def _conf_value(conf, key):
+    try:
+        v = conf.get(key) if isinstance(conf, dict) else None
+        if v is None or isinstance(v, bool):
+            return None
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def hallucination_verdict(text, conf, peak_rms, *, vad_threshold,
+                          owner_idle_s=None, since_jarvis_s=None,
+                          jarvis_asked=False,
+                          prompt_pending=False) -> tuple[str, str]:
+    """("noise" | "reply" | "", reason) for one mic transcript. See the block
+    comment above.
+
+    ``owner_idle_s``: seconds since the owner's last accepted turn (None: not
+    this session). ``since_jarvis_s``: seconds since JARVIS's last audible
+    line finished (None: none). ``jarvis_asked``: that line asked something.
+    ``prompt_pending``: a confirmation / yes-no prompt awaits an answer.
+    Never raises — an internal error returns ("", ""), the old behaviour."""
+    try:
+        if not is_hallucination_only(text):
+            return ("", "")
+        norm = _norm_phrase(text)
+        nsp = _conf_value(conf, "no_speech_prob")
+        alp = _conf_value(conf, "avg_logprob")
+        poor = []
+        if nsp is not None and nsp > WHISPER_MAX_NO_SPEECH_PROB:
+            poor.append(f"no_speech_prob {nsp:.2f}")
+        if alp is not None and alp < WHISPER_MIN_AVG_LOGPROB:
+            poor.append(f"avg_logprob {alp:.2f}")
+        if poor:
+            return ("noise", "whisper " + ", ".join(poor))
+        idle = None if owner_idle_s is None else max(0.0, float(owner_idle_s))
+        since = None if since_jarvis_s is None else float(since_jarvis_s)
+        owner_recent = idle is not None and idle < NOISE_OWNER_IDLE_S
+        jarvis_recent = (since is not None
+                         and 0.0 <= since <= NOISE_REPLY_WINDOW_S)
+        if norm in _reply_norms() and owner_recent:
+            if jarvis_recent:
+                return ("reply", f"JARVIS spoke {since:.0f} s ago, the owner "
+                                 f"{idle:.0f} s ago")
+            if prompt_pending:
+                return ("reply", "a prompt is waiting for an answer")
+        vad = float(vad_threshold)
+        peak = float(peak_rms or 0.0)
+        if vad > 0 and peak < vad * NOISE_RMS_MARGIN:
+            return ("noise", f"peak {peak / vad:.2f}x the VAD threshold")
+        if not owner_recent and not (jarvis_recent and jarvis_asked):
+            who = ("owner silent this session" if idle is None
+                   else f"owner silent {idle:.0f} s")
+            return ("noise", f"{who}, not a reply")
+        return ("", "")
+    except Exception:
+        return ("", "")
+
+
 # ── Per-install tuning ──────────────────────────────────────────────────────
 # These thresholds depend on the MICROPHONE: its gain decides what RMS "loud"
 # is, and its noise floor shapes Whisper's confidence. An install whose mic
@@ -145,14 +295,19 @@ def is_valid_speech(text: str, conf: dict, peak_rms: float = 0.0) -> tuple[bool,
 # calls apply_overrides() once at import. This module stays pure: it never
 # imports config and does no I/O.
 #
-# Only these four are overridable, each with a type and a sane range. Anything
+# Only these are overridable, each with a type and a sane range. Anything
 # else -- unknown names, wrong types, bools, out-of-range values, a
-# non-integral word count -- is skipped rather than half-applied.
+# non-integral word count -- is skipped rather than half-applied. The three
+# NOISE_* knobs (R10) belong here for the same reason: how far above the VAD
+# threshold real speech lands is a property of the microphone.
 _OVERRIDABLE = {
     "WHISPER_MIN_WORDS":          (int,   1,     10),
     "WHISPER_MAX_NO_SPEECH_PROB": (float, 0.0,   1.0),
     "WHISPER_MIN_AVG_LOGPROB":    (float, -10.0, 0.0),
     "WHISPER_TRUST_RMS":          (float, 0.0,   1.0),
+    "NOISE_RMS_MARGIN":           (float, 1.0,   10.0),
+    "NOISE_OWNER_IDLE_S":         (float, 0.0,   86400.0),
+    "NOISE_REPLY_WINDOW_S":       (float, 0.0,   600.0),
 }
 _DEFAULTS = {name: globals()[name] for name in _OVERRIDABLE}
 

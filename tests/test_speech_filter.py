@@ -88,5 +88,136 @@ class ValidSpeechTests(unittest.TestCase):
         self.assertTrue(ok)
 
 
+class HallucinationVerdictTests(unittest.TestCase):
+    """R10 (2026-09-29): a transcript that is ONLY a classic Whisper
+    hallucination is judged on evidence, not on the word. Live 19:18:55: with
+    nobody home, room noise at 1.49x the VAD threshold became "Bye." and was
+    answered with a full LLM call, because the single-word always-accept
+    shortcut ran before the hallucination check."""
+
+    VAD = 0.008
+    OK_CONF = {"no_speech_prob": 0.30, "avg_logprob": -0.60}
+
+    def _v(self, text, peak=0.05, conf=None, **ctx):
+        return sf.hallucination_verdict(
+            text, self.OK_CONF if conf is None else conf, peak,
+            vad_threshold=self.VAD, **ctx)
+
+    def test_phrase_only_detection_ignores_case_and_punctuation(self):
+        for t in ("Bye.", "bye", "Bye-bye!", "Thank you!", "You",
+                  "Thanks for watching!", "Okay?", "[Music]"):
+            self.assertTrue(sf.is_hallucination_only(t), t)
+        for t in ("", "...", "thank you, sir", "bye for now",
+                  "turn off the lights", "you know what"):
+            self.assertFalse(sf.is_hallucination_only(t), t)
+
+    def test_the_live_incident_is_noise(self):
+        # Fresh session (the owner never spoke), JARVIS's greeting asked a
+        # question 8 s earlier, peak 0.0119 on a 0.008 threshold.
+        verdict, why = self._v("Bye.", peak=0.0119, owner_idle_s=None,
+                               since_jarvis_s=8.0, jarvis_asked=True)
+        self.assertEqual(verdict, "noise")
+        self.assertIn("1.49x", why)
+        # Without the verdict, is_valid_speech ACCEPTS it — the bug.
+        self.assertTrue(sf.is_valid_speech("Bye.", self.OK_CONF, 0.0119)[0])
+
+    def test_owner_idle_and_no_question_is_noise_even_when_loud(self):
+        verdict, why = self._v("Thank you.", peak=0.05, owner_idle_s=900.0,
+                               since_jarvis_s=600.0)
+        self.assertEqual(verdict, "noise")
+        self.assertIn("owner silent 900 s", why)
+        self.assertEqual(self._v("Bye.", peak=0.05)[0], "noise",
+                         "no owner turn this session at all")
+
+    def test_poor_whisper_confidence_is_noise_even_in_a_reply(self):
+        for conf in ({"no_speech_prob": 0.95, "avg_logprob": -0.4},
+                     {"no_speech_prob": 0.10, "avg_logprob": -2.5}):
+            verdict, why = self._v("Thank you.", peak=0.2, conf=conf,
+                                   owner_idle_s=5.0, since_jarvis_s=2.0)
+            self.assertEqual(verdict, "noise", conf)
+            self.assertIn("whisper", why)
+
+    def test_thank_you_right_after_jarvis_answered_is_a_reply(self):
+        # The owner's quiet mic: 1.2x the threshold would be "marginal", but
+        # the conversation makes it clearly a reply.
+        verdict, _ = self._v("Thank you.", peak=0.0096, owner_idle_s=12.0,
+                             since_jarvis_s=2.5)
+        self.assertEqual(verdict, "reply")
+        self.assertTrue(sf.is_valid_speech("Thank you.", self.OK_CONF,
+                                           0.0096, reply=True)[0])
+        self.assertFalse(sf.is_valid_speech("Thank you.", self.OK_CONF,
+                                            0.0096)[0],
+                         "without the verdict it stays a hallucination match")
+
+    def test_bye_ending_a_conversation_is_a_reply(self):
+        for text in ("Bye.", "Bye bye!", "Okay.", "Yeah.", "Thanks."):
+            verdict, _ = self._v(text, peak=0.0090, owner_idle_s=40.0,
+                                 since_jarvis_s=4.0)
+            self.assertEqual(verdict, "reply", text)
+            self.assertTrue(sf.is_valid_speech(text, self.OK_CONF, 0.009,
+                                               reply=True)[0], text)
+
+    def test_a_pending_prompt_counts_only_while_the_owner_is_around(self):
+        self.assertEqual(self._v("Yeah.", peak=0.009, owner_idle_s=60.0,
+                                 since_jarvis_s=45.0,
+                                 prompt_pending=True)[0], "reply")
+        # A stale confirmation must not be answered by room noise.
+        self.assertEqual(self._v("Okay.", peak=0.009, owner_idle_s=3600.0,
+                                 since_jarvis_s=3000.0,
+                                 prompt_pending=True)[0], "noise")
+
+    def test_non_reply_phrases_are_never_a_reply(self):
+        for text in ("You", "Thanks for watching!", "Please subscribe", "Hmm"):
+            verdict, _ = self._v(text, peak=0.009, owner_idle_s=5.0,
+                                 since_jarvis_s=1.0)
+            self.assertEqual(verdict, "noise", text)   # marginal level
+            verdict, _ = self._v(text, peak=0.05, owner_idle_s=5.0,
+                                 since_jarvis_s=1.0)
+            self.assertEqual(verdict, "", text)        # is_valid_speech decides
+            self.assertFalse(sf.is_valid_speech(text, self.OK_CONF, 0.05,
+                                                reply=True)[0], text)
+
+    def test_answer_to_a_question_with_an_idle_owner_falls_through(self):
+        # Clear audio answering a question JARVIS just asked: not noise; the
+        # old is_valid_speech rule then decides ("bye" accepted).
+        verdict, _ = self._v("Bye.", peak=0.03, owner_idle_s=None,
+                             since_jarvis_s=3.0, jarvis_asked=True)
+        self.assertEqual(verdict, "")
+
+    def test_ordinary_speech_is_never_touched(self):
+        for text in ("turn off the lights", "what time is it", "thank you sir"):
+            self.assertEqual(self._v(text, peak=0.0081, owner_idle_s=None),
+                             ("", ""), text)
+
+    def test_reason_never_contains_the_transcript(self):
+        for kw in ({"peak": 0.0085}, {"owner_idle_s": 999.0},
+                   {"conf": {"no_speech_prob": 0.99, "avg_logprob": -3}}):
+            verdict, why = self._v("Thanks for watching!", **kw)
+            self.assertEqual(verdict, "noise")
+            self.assertNotIn("thank", why.lower())
+            self.assertNotIn("watching", why.lower())
+
+    def test_never_raises(self):
+        self.assertEqual(sf.hallucination_verdict("Bye.", None, None,
+                                                  vad_threshold="x"), ("", ""))
+        self.assertEqual(sf.hallucination_verdict(None, {}, 0.0,
+                                                  vad_threshold=0.008),
+                         ("", ""))
+
+    def test_knobs_are_overridable_and_consumed(self):
+        self.addCleanup(sf.reset_overrides)
+        ctx = {"owner_idle_s": 30.0, "since_jarvis_s": 60.0}
+        self.assertEqual(self._v("Bye.", peak=0.013, **ctx)[0], "")
+        self.assertEqual(sf.apply_overrides({"NOISE_RMS_MARGIN": 2.0}),
+                         {"NOISE_RMS_MARGIN": 2.0})
+        self.assertEqual(self._v("Bye.", peak=0.013, **ctx)[0], "noise")
+        sf.apply_overrides({"NOISE_REPLY_WINDOW_S": 90.0})
+        self.assertEqual(self._v("Bye.", peak=0.013, **ctx)[0], "reply")
+        sf.apply_overrides({"NOISE_OWNER_IDLE_S": 10.0})
+        self.assertEqual(self._v("Bye.", peak=0.05, **ctx)[0], "noise")
+        self.assertEqual(sf.apply_overrides({"NOISE_RMS_MARGIN": 0.5}), {},
+                         "a margin under 1x would drop nothing")
+
+
 if __name__ == "__main__":
     unittest.main()

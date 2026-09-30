@@ -184,6 +184,15 @@ _MONOLITH_RESTORE_NAMES = (
     # Capture open-failure log throttle (2026-09-29): a leaked entry would
     # silence the NEXT test's first open-failure line.
     "_open_fail_log",
+    # Capture-open backoff (R10, 2026-09-29): the unexpected-error traceback
+    # dedupe (a leaked entry would silence the NEXT test's traceback). The
+    # backoff object itself is reset in _restore_monolith_pristine — an
+    # episode left open by a test whose open failed would make the NEXT
+    # test's record_speech WAIT (really sleep) before it even tries.
+    "_input_open_tb_seen", "_input_backoff_clock", "_input_backoff_sleep",
+    # Noise gate (R10): when JARVIS's last heard line finished. A line
+    # spoken by one test would make a LATER test's "thank you" a reply.
+    "_last_jarvis_line",
     # PortAudio teardown-gate cells (2026-08-14): the diag/enroll owner
     # refcounts and the reinit latch. A leaked non-zero cell would make every
     # later _refresh_devices test silently defer its reinit; a leaked latch
@@ -407,6 +416,12 @@ def _restore_monolith_pristine(bc) -> None:
     # reason). Wiped in place.
     try:
         bc._self_echo._reset_for_tests()
+    except Exception:
+        pass
+    # Capture-open backoff (R10, 2026-09-29): one process-wide instance, so
+    # its episode is wiped in place (see _MONOLITH_RESTORE_NAMES).
+    try:
+        bc._input_open_backoff.reset()
     except Exception:
         pass
 

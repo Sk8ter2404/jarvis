@@ -12917,7 +12917,8 @@ _OPEN_FAIL_RELOG_S = 60.0
 _open_fail_log: dict = {}
 
 
-def _note_input_open_failure(site: str, device, exc, then: str = "") -> None:
+def _note_input_open_failure(site: str, device, exc, then: str = "",
+                             quiet: bool = False) -> None:
     """A capture InputStream failed to OPEN on ``device``. Fail over cleanly
     and quietly (2026-09-29):
 
@@ -12931,6 +12932,14 @@ def _note_input_open_failure(site: str, device, exc, then: str = "") -> None:
       * print the failure ONCE per (site, device, error) and then only a
         count every _OPEN_FAIL_RELOG_S — never a line per attempt.
 
+    ``quiet`` (R10): invalidate + request only, print nothing. record_speech
+    passes it when the failed open already WAS the system default (there is
+    no retry to announce): its open-failure BACKOFF logs that episode itself
+    (_input_open_failed). This per-(site, device, error) throttle attributed
+    counts to the wrong time there — live 18:51:31 printed "2299 identical
+    failure(s) since the last line", all 2,299 of which had happened in the
+    18:38 burst, thirteen minutes earlier.
+
     Never raises: it runs inside the capture paths."""
     try:
         _device_cache["in"] = None
@@ -12938,6 +12947,8 @@ def _note_input_open_failure(site: str, device, exc, then: str = "") -> None:
         _device_cache["reenum_requested"] = True
     except Exception:
         pass
+    if quiet:
+        return
     try:
         now = time.time()
         key = (site, device, str(exc)[:160])
@@ -12953,6 +12964,275 @@ def _note_input_open_failure(site: str, device, exc, then: str = "") -> None:
             ent[1] += 1
         if len(_open_fail_log) > 32:
             _open_fail_log.clear()
+    except Exception:
+        pass
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  CAPTURE-OPEN BACKOFF (2026-09-29, R10)
+# ──────────────────────────────────────────────────────────────────────────
+# THE LIVE INCIDENT (session_2026-09-29_18-32-31.log). A USB hub reset took
+# the desk mic's endpoint away, and the re-enumeration that followed left
+# PortAudio with NO input device at all. From then on every record_speech()
+# call failed at once — on the cached index (-9999 'A device ID has been used
+# that is out of range'), then on its retry with the system default ('Error
+# querying device -1', paNoDevice) — returned None, and the main loop called
+# it again immediately: ~200 failures a second, each written by
+# logging.exception as a two-part chained traceback. 5,859 failures and
+# 11,718 tracebacks in two 20-second bursts (18:38:33-53 and 18:51:31-51)
+# made a 20.7 MB log. Each burst ended only when the next spaced
+# re-enumeration (_OPEN_FAIL_REENUM_MIN_S) found the mic again.
+#
+# The fix, in record_speech:
+#   * a BACKOFF between open attempts (core/input_backoff.py: 0.5 -> 1 -> 2
+#     -> 5 s, reset by the first successful open), waited out in
+#     _INPUT_BACKOFF_SLICE_S steps so the loop stays responsive — see
+#     _input_backoff_wait;
+#   * no identical retry: when the failed open already WAS device=None, the
+#     "retry with the system default" is the same call;
+#   * PortAudioError on open/start is the KNOWN class: one line per episode,
+#     a summary every _input_open_backoff.summary_s, one line when it ends,
+#     never a traceback. Any other exception type keeps its full traceback
+#     (once per distinct error per summary period);
+#   * no input device at all -> record_speech runs the re-enumeration itself
+#     AFTER releasing its own owner claim (while the failed attempt still
+#     holds _record_speech_active, the deny chain would defer it for a stream
+#     that will never exist), through the one safe path, _refresh_devices:
+#     its spacing, its deny chain and its latch are unchanged.
+from core.input_backoff import InputOpenBackoff as _InputOpenBackoff  # noqa: E402
+
+_input_open_backoff = _InputOpenBackoff()
+_INPUT_BACKOFF_SLICE_S = 0.1   # granularity of the interruptible wait
+_INPUT_BACKOFF_POLL_S = 0.5    # device-return poll period during a wait
+# Clock + sleep hooks for the backoff (monotonic seconds). Module attributes,
+# so tests freeze the clock and advance it from the sleep instead of waiting.
+_input_backoff_clock = time.monotonic
+_input_backoff_sleep = time.sleep
+# Unexpected (non-PortAudio) open errors: {(type, message): last traceback}.
+_input_open_tb_seen: dict = {}
+
+
+def _input_backoff_now() -> float:
+    try:
+        return float(_input_backoff_clock())
+    except Exception:
+        return time.monotonic()
+
+
+def _input_backoff_quiet() -> bool:
+    """True while a capture-open backoff episode is open. The main loop's
+    per-attempt status lines ('Listening…', 'Standby…') are skipped then: they
+    would repeat, once per attempt for as long as the device is gone, what the
+    episode's own log line already said."""
+    return _input_open_backoff.active
+
+
+def _is_input_open_error(exc) -> bool:
+    """The KNOWN failure class: PortAudio refusing to open / start the capture
+    device (gone, renumbered, busy). Any other exception type is unexpected."""
+    pa = getattr(sd, "PortAudioError", None)
+    return isinstance(pa, type) and isinstance(exc, pa)
+
+
+def _input_device_absent(exc) -> bool:
+    """No input device AT ALL: sounddevice resolves device=None to PortAudio's
+    default input, and with none it raises 'Error querying device -1'
+    (paNoDevice) before any open is tried."""
+    return "querying device -1" in str(exc)
+
+
+def _pending_work_signature() -> tuple:
+    """What the main loop would act on if it had control: an injected / typed
+    command or queued speech waiting on disk (their mtimes) and the tray's
+    mute / standby flags. Compared, never tested for presence — see
+    _input_backoff_wait. Never raises."""
+    def _stamp(path):
+        try:
+            return os.stat(path).st_mtime_ns
+        except Exception:
+            return None
+    try:
+        return (_stamp(INJECTED_COMMANDS_PATH), _stamp(PENDING_SPEECH_PATH),
+                bool(_mic_muted[0]), bool(_sleep_mode[0]),
+                bool(_standby_mode[0]))
+    except Exception:
+        return ()
+
+
+def _default_capture_endpoint():
+    """Windows' live default capture endpoint id, or None. Never raises."""
+    try:
+        return _win_default_endpoints()[1]
+    except Exception:
+        return None
+
+
+def _input_backoff_wait(timeout: float | None = None) -> bool:
+    """record_speech's gate while the microphone will not open.
+
+    False = an open attempt may run NOW (no episode, or its next attempt is
+    due). True = return None WITHOUT trying. While waiting for the next
+    attempt it never holds the loop for the whole (up to 5 s) step when
+    something else needs it:
+
+      * work that APPEARS during the wait — an injected / typed command,
+        queued speech, a tray mute / standby / wake flip — returns True at
+        once, so the main loop drains it and comes back;
+      * the device coming back — Windows' default capture endpoint changing,
+        polled every _INPUT_BACKOFF_POLL_S — makes the attempt due at once;
+      * the caller's ``timeout`` is never exceeded;
+      * the heartbeat stays fresh, so the watchdog never reads a backoff as a
+        stall.
+
+    Work ALREADY pending when the wait began is not a reason to return: the
+    loop top just had its chance at it, and returning on a signal that does
+    not go away (an inject file that cannot be claimed) would be a new hot
+    loop. Never raises; on an internal error it sleeps one first step and
+    lets the attempt run, so the pacing survives a bug here."""
+    b = _input_open_backoff
+    try:
+        now = _input_backoff_now()
+        if b.due(now):
+            return False
+        deadline = (None if timeout is None
+                    else now + max(0.0, float(timeout)))
+        sig0 = _pending_work_signature()
+        ep0 = _default_capture_endpoint()
+        next_poll = now + _INPUT_BACKOFF_POLL_S
+        while True:
+            _heartbeat()
+            now = _input_backoff_now()
+            if b.due(now):
+                return False
+            if deadline is not None and now >= deadline:
+                return True
+            if _pending_work_signature() != sig0:
+                return True
+            if now >= next_poll:
+                next_poll = now + _INPUT_BACKOFF_POLL_S
+                ep = _default_capture_endpoint()
+                if ep is not None and ep != ep0:
+                    b.expedite()
+                    return False
+            # > 0 here: a due attempt / an expired deadline returned above.
+            step = min(_INPUT_BACKOFF_SLICE_S, b.remaining(now))
+            if deadline is not None:
+                step = min(step, deadline - now)
+            _input_backoff_sleep(step)
+    except Exception:
+        try:
+            time.sleep(b.first_step)
+        except Exception:
+            pass
+        return False
+
+
+def _input_absent_reenumerate() -> float:
+    """No input device at all: run PortAudio's re-enumeration NOW rather than
+    leave it to whichever refresh pass comes next — it is the only thing that
+    can find a returning device (PortAudio's list is frozen until then).
+
+    Through _refresh_devices, the same safe path as every re-enumeration: its
+    _OPEN_FAIL_REENUM_MIN_S spacing, its deny chain (a live capture, TTS, an
+    abandoned native close each DEFER it — the 0xc0000374 rules are
+    untouched) and its latch. record_speech calls this only after releasing
+    its own owner claim.
+
+    Returns the seconds until a re-enumeration becomes permissible when the
+    spacing held it (the caller pulls its next attempt in to then), else 0.0.
+    When it ran and found an input device, the next attempt is due at once.
+    Never raises."""
+    try:
+        _device_cache["reenum_requested"] = True
+        last = float(_device_cache.get("last_reenum_at", 0.0) or 0.0)
+        wait = _OPEN_FAIL_REENUM_MIN_S - (time.time() - last)
+        if wait > 0:
+            return wait
+        _device_cache["checked_at"] = 0.0
+        _refresh_devices()
+        if float(_device_cache.get("last_reenum_at", 0.0) or 0.0) != last:
+            try:
+                found = any(int(d.get("max_input_channels", 0) or 0) > 0
+                            for d in sd.query_devices()
+                            if isinstance(d, dict))
+            except Exception:
+                found = False
+            if found:
+                _input_open_backoff.expedite()
+        else:
+            # Deferred by an owner: the pass above stamped checked_at, which
+            # would let the next attempt's get_input_device() skip its refresh
+            # for DEVICE_CHECK_INTERVAL — and open device=None again, even
+            # after the owner released. Keep the next attempt's pass armed.
+            _device_cache["checked_at"] = 0.0
+        return 0.0
+    except Exception:
+        return 0.0
+
+
+def _log_unexpected_open_error(exc, now: float) -> None:
+    """Full traceback for an UNEXPECTED open error (not PortAudio's): once per
+    distinct error per summary period. The backoff already paces attempts;
+    this stops a persistent one from re-filling the log. Never raises."""
+    try:
+        key = (type(exc).__name__, str(exc)[:160])
+        last = _input_open_tb_seen.get(key)
+        if last is not None and now - last < _input_open_backoff.summary_s:
+            return
+        if len(_input_open_tb_seen) > 32:
+            _input_open_tb_seen.clear()
+        _input_open_tb_seen[key] = now
+        logging.error("[record_speech] InputStream open/start failed",
+                      exc_info=(type(exc), exc, exc.__traceback__))
+    except Exception:
+        pass
+
+
+def _input_open_failed(exc, device) -> None:
+    """Book ONE failed record_speech open attempt (the cached index plus, when
+    there was one, the system-default retry; ``exc`` is the last error) and
+    schedule the next. Called after the stream is closed and the owner claim
+    released. Never raises."""
+    try:
+        now = _input_backoff_now()
+        known = _is_input_open_error(exc)
+        absent = known and _input_device_absent(exc)
+        st = _input_open_backoff.note_failure(
+            now, f"{type(exc).__name__}: {exc}", no_device=absent)
+        if not known:
+            _log_unexpected_open_error(exc, now)
+        elif st["log"] == "first":
+            what = ("no input device" if absent
+                    else "the input device will not open")
+            print(f"  [record_speech] {what} — InputStream open failed on "
+                  f"device {device!r}: {exc}. Backing off between attempts "
+                  f"(0.5 s -> 5 s, reset when it opens); a summary each "
+                  f"minute, no traceback for this failure class"
+                  + ("; PortAudio re-enumerates as soon as no stream holds "
+                     "it" if absent else ""))
+        elif st["log"] == "summary":
+            what = ("still no input device" if absent
+                    else "the input device still will not open")
+            print(f"  [record_speech] {what}; {st['attempts']} attempts in "
+                  f"{st['elapsed']:.0f} s (next in {st['delay']:.1f} s)")
+        if absent:
+            wait = _input_absent_reenumerate()
+            if wait > 0:
+                _input_open_backoff.pull_in(_input_backoff_now(), wait)
+    except Exception:
+        pass
+
+
+def _input_open_succeeded() -> None:
+    """A capture stream opened and started: end the backoff episode (one line
+    says so). Never raises."""
+    try:
+        info = _input_open_backoff.note_success(_input_backoff_now())
+        if info is not None:
+            _input_open_tb_seen.clear()
+            print(f"  [record_speech] the input device opened again after "
+                  f"{info['attempts']} failed attempt(s) over "
+                  f"{info['elapsed']:.0f} s — backoff reset")
     except Exception:
         pass
 
@@ -14714,6 +14994,12 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
     if _mic_input_disabled():
         time.sleep(0.5 if timeout is None else min(0.5, max(0.1, timeout)))
         return None
+    # Capture-open BACKOFF (2026-09-29, R10): while the microphone will not
+    # open, attempts are paced 0.5 -> 5 s instead of retried ~200 times a
+    # second; the wait yields to pending work and to a returning device.
+    # Healthy (no episode) = returns False at once. See _input_backoff_wait.
+    if _input_backoff_wait(timeout):
+        return None
     # Processing filler (2026-09-29): a capture STARTING inside an armed voice
     # turn (an action asking the owner something) cancels stage 1 and restarts
     # stage 2's silence clock (only on the turn's own thread), then waits
@@ -14804,10 +15090,20 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
         except sd.PortAudioError as e:  # pragma: no cover - live mic open-retry path (needs real device)
             # Invalidate + request a re-enumeration (a stale MME index is not
             # fixed by re-reading the same frozen list), logged once per
-            # distinct failure instead of per attempt. 2026-09-29.
+            # distinct failure — unless this open already WAS the system
+            # default: then there is no retry to announce, and the backoff
+            # below logs the whole episode (R10, 2026-09-29).
             _note_input_open_failure("record_speech", _in_dev, e,
-                                     then="retrying with the system default")
+                                     then="retrying with the system default",
+                                     quiet=_in_dev is None)
             _usb_storm_note_audio_drop("input")
+            if _in_dev is None:
+                # The failed open already WAS the system default, so "retry
+                # with the system default" is the identical call: it can only
+                # fail the same way, and it doubled every failure plus its
+                # chained traceback (live 18:38, 'Error querying device -1'
+                # twice per attempt). R10.
+                raise
             _opened_dev = None
             _record_stream = sd.InputStream(
                 samplerate=SAMPLE_RATE, channels=1, dtype="float32",
@@ -14822,7 +15118,7 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
         # silently swap the cached mic for the system default) — the source of
         # truth for "what microphone are you using".
         _note_live_capture(_record_stream, _opened_dev)
-    except Exception:
+    except Exception as _open_exc:
         # Open (incl. the system-default retry) or start() failed: we never
         # got a RUNNING stream, so drop the ownership flag we claimed above
         # before bailing, otherwise _refresh_devices would defer reinits
@@ -14830,13 +15126,19 @@ def record_speech(timeout: float | None = None) -> np.ndarray | None:
         # SECOND (2026-08-14): a constructed-but-failed stream still holds
         # native state, and the flag must cover its close too or a reinit can
         # latch mid-teardown (same 0xc0000374 class as the main finally).
-        logging.exception("[record_speech] InputStream open/start failed")
         try:
             _safe_close_stream(_record_stream)
         except Exception:
             pass
         _record_speech_active[0] = False
+        # THEN book the failure (R10): back off before the next attempt, log
+        # the episode (a full traceback only for an unexpected error type)
+        # and, with no input device at all, re-enumerate — after the release
+        # above, so our own dead claim cannot defer it.
+        _input_open_failed(_open_exc, _in_dev)
         return None
+    # The stream is open and running: a backoff episode (if any) is over.
+    _input_open_succeeded()
     record_start_ts = 0.0   # set when recording actually begins (VAD trip)
     _se_vad_ts = _se_open_ts  # the same instant on the self-echo clock
     _se_clip_ts = _se_open_ts
@@ -26378,6 +26680,72 @@ def _self_echo_ignored(text: str, injected: bool = False) -> bool:
         return False
 
 
+# ── noise heard as speech (core/speech_filter.hallucination_verdict, R10) ──
+# When JARVIS's last AUDIBLE line finished (time.monotonic(), 0.0 = none this
+# session) and whether it asked something ('?' anywhere in it: "shall I
+# resume, or is there something else? At your service." asks). Stamped by
+# _speak once the line was actually heard. Read by _noise_verdict.
+_last_jarvis_line: list = [0.0, False]
+
+
+def _note_jarvis_line(text: str) -> None:
+    """_speak: a line was just heard. Never raises."""
+    try:
+        _last_jarvis_line[0] = time.monotonic()
+        _last_jarvis_line[1] = "?" in (text or "")
+    except Exception:
+        pass
+
+
+def _reply_prompt_pending() -> bool:
+    """A confirmation, an autocorrect 'did you mean' or the shutdown yes/no
+    prompt is waiting for the owner's answer. Never raises."""
+    try:
+        return bool(_pending_confirmation or _pending_autocorrect_choice
+                    or _shutdown_prompt_pending.get("armed"))
+    except Exception:
+        return False
+
+
+def _noise_verdict(text: str, conf, injected: bool = False,
+                   now: float | None = None) -> str:
+    """Hallucination-only noise gate for ONE main-loop turn: "noise" (the
+    caller drops the turn), "reply" (a genuine short reply — the caller tells
+    is_valid_speech to keep it) or "" (is_valid_speech decides, unchanged).
+
+    Live 2026-09-29 19:18:55: with nobody home and wake-word mode off, Whisper
+    heard room noise (peak 1.49x the VAD threshold) as "Bye." and the loop
+    answered it with a full LLM call — "bye" is in WHISPER_ALWAYS_ACCEPT, whose
+    single-word shortcut ran before the hallucination check. The rules live in
+    core/speech_filter.hallucination_verdict; this supplies the context: the
+    capture's peak RMS against VAD_THRESHOLD, the owner's last accepted turn
+    (_last_owner_turn_at), JARVIS's last heard line (_last_jarvis_line) and
+    whether a prompt awaits an answer.
+
+    Typed / injected turns are never checked (explicit operator input, like
+    the other mic gates). Logs "[noise] ignored (<numbers>)" — never the
+    transcript. Off when NOISE_FILTER_ENABLED is False. Never raises; any
+    error returns "" (the old behaviour)."""
+    try:
+        if injected or not NOISE_FILTER_ENABLED:
+            return ""
+        now = time.monotonic() if now is None else float(now)
+        owner_at = float(_last_owner_turn_at[0] or 0.0)
+        line_at = float(_last_jarvis_line[0] or 0.0)
+        verdict, why = _speech_filter_mod.hallucination_verdict(
+            text, conf, _last_recording_peak,
+            vad_threshold=VAD_THRESHOLD,
+            owner_idle_s=(now - owner_at) if owner_at else None,
+            since_jarvis_s=(now - line_at) if line_at else None,
+            jarvis_asked=bool(_last_jarvis_line[1]),
+            prompt_pending=_reply_prompt_pending())
+        if verdict == "noise":
+            print(f"  [noise] ignored ({why})")
+        return verdict
+    except Exception:
+        return ""
+
+
 # Standby auto-engage bridge. The background lyric-detection thread in
 # skills/standby_audio_detect calls this when it's seen sustained vocal
 # music while the headset is the active output — flipping standby state
@@ -29915,6 +30283,11 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
             _tts_interrupt.clear()
             # Self-echo: the line's window counts from here. Never raises.
             _self_echo.refresh(_se_line)
+            # Noise gate (R10): the owner may now answer this line — "thank
+            # you" right after it is a reply, not a hallucination. Only a line
+            # that was actually HEARD counts. Never raises.
+            if _speak_ok:
+                _note_jarvis_line(spoken_text)
             # Processing-filler mark (b), 2026-09-29: end-of-speech, still
             # INSIDE _SPEAK_LOCK (lock order _SPEAK_LOCK -> filler lock). A
             # stage-2 poll can only claim after this release, so it always
@@ -32729,7 +33102,10 @@ def _capture_utterance(injected_text, memory):
             return _rt_cap
 
     _heartbeat()
-    print("Listening…")
+    # Not once per attempt while the mic will not open (R10): the backoff
+    # episode has its own line and summary.
+    if not _input_backoff_quiet():
+        print("Listening…")
     resume_face_tracking()
 
     # Wait for speech, but only briefly — so we can check proactive
@@ -33092,7 +33468,8 @@ def _handle_sleep_standby(injected_text: str | None) -> None:
         text = injected_text
     else:
         _heartbeat()
-        print(f"{_label}… (say 'JARVIS' to wake)")
+        if not _input_backoff_quiet():   # R10: see _capture_utterance
+            print(f"{_label}… (say 'JARVIS' to wake)")
         set_state("idle")
         audio = record_speech(timeout=20)
         if audio is None or len(audio) < SAMPLE_RATE * 0.4:
@@ -34486,7 +34863,18 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                     set_state("idle")
                     continue
 
-                valid, reason = is_valid_speech(text, conf, peak_rms=_last_recording_peak)
+                # ── NOISE HEARD AS SPEECH (core/speech_filter.py, R10) ─────────
+                # A transcript that is ONLY a classic Whisper hallucination
+                # ("Bye.", "Thank you.", "You") is dropped as noise when the
+                # evidence says so, and kept when it is clearly a reply. Mic
+                # turns only; logs numbers, never the text. _noise_verdict.
+                _nv = _noise_verdict(text, conf, _injected_text is not None)
+                if _nv == "noise":
+                    set_state("idle")
+                    continue
+                valid, reason = is_valid_speech(text, conf,
+                                                peak_rms=_last_recording_peak,
+                                                reply=(_nv == "reply"))
                 if not valid:
                     # Show what got dropped so user can tune thresholds if needed
                     snippet = (text[:60] + "…") if len(text) > 60 else text

@@ -33,6 +33,9 @@ _IMPORT_LIGHT_CORE = (
     # The camera open gate (2026-09-29): stdlib-only, imported at monolith
     # import time before the Kinect bridge is enabled.
     "core.camera_gate",
+    # The capture-open backoff (R10, 2026-09-29): stdlib-only, imported at
+    # monolith import time.
+    "core.input_backoff",
 )
 
 
