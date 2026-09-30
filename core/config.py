@@ -240,9 +240,16 @@ LOCAL_LLM_BASE_URL = "http://127.0.0.1:11434"
 #   send the model the new prefix while you are quiet (one tiny request,
 #   only if the model is already loaded, never in game mode or mid-turn), so
 #   your next turn starts warm.
+# LOCAL_REPRIME_AT_BOOT_S — this many seconds after JARVIS starts, send
+#   the model the conversation's prompt once (the same small re-prime, same
+#   safeguards: only if the model is already loaded, never in game mode or
+#   mid-turn), so your FIRST turn after a restart is as quick as the rest
+#   (it re-read the whole ~13k-token prompt, ~3.3 s, measured 2026-09-29).
+#   Float; 0.0 turns it off.
 # Changes apply on the next start.
 PROMPT_FREEZE_QUIET_S = 30.0
 LOCAL_PREFIX_REPRIME = True
+LOCAL_REPRIME_AT_BOOT_S = 20.0
 
 # ─── Local background traffic (2026-09-29) ─────────────────────────────
 # The local model keeps only its most recent request warm, so ANY background

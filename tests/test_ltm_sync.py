@@ -144,6 +144,22 @@ class ReflectorWiringTests(unittest.TestCase):
         self._run_warm(fake)                      # must not raise
         fake.set_reflector_llm.assert_not_called()
 
+    def test_boot_warm_loads_the_embedder(self):
+        # v2.0.139 (2026-09-29, live): ensure_loaded() does not load the
+        # embedder, so it loaded inside the owner's FIRST turn after every
+        # start. The boot warm-up now loads it off the voice thread.
+        fake = mock.Mock()
+        fake.list_facts.return_value = []
+        self._run_warm(fake)
+        fake._try_import_embedder.assert_called_once_with()
+
+    def test_embedder_failure_is_swallowed(self):
+        fake = mock.Mock()
+        fake.list_facts.return_value = []
+        fake._try_import_embedder.side_effect = RuntimeError("no torch")
+        self._run_warm(fake)                      # must not raise
+        fake.set_reflector_llm.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

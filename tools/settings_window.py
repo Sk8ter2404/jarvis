@@ -546,6 +546,14 @@ SCHEMA: dict[str, dict] = {
                 "your next turn is fast. Same safeguards as the re-warm above "
                 "(0 = off). Applies on the next start.",
     },
+    "LOCAL_REPRIME_AT_BOOT_S": {
+        "tab": "ai", "label": "Warm the local brain after start (seconds)",
+        "type": "float", "default": 20.0,
+        "help": "This many seconds after JARVIS starts, quietly send your "
+                "conversation to the already-loaded local brain so your "
+                "FIRST question is as fast as the rest. Same safeguards as "
+                "the re-warm above (0 = off). Applies on the next start.",
+    },
     "STREAMING_TTS_ENABLED": {
         "tab": "voice", "label": "Speak while replies stream", "type": "bool",
         "default": True,

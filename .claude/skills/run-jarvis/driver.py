@@ -247,7 +247,9 @@ def wait_for_reply(text: str, timeout: float = 75.0) -> dict:
             if "reading results" in low:
                 pending_followup = True
                 last_new = time.time()
-            if "jarvis:" in low or "[action]" in low:
+            # "JARVIS (spoken): ..." is what was actually SAID when a fallback
+            # replaced the model's reply (v2.0.136) — keep it with the reply.
+            if "jarvis:" in low or "jarvis (spoken):" in low or "[action]" in low:
                 lines.append(line.rstrip())
                 last_new = time.time()
                 if "jarvis:" in low:

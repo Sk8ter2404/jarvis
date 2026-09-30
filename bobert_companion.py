@@ -18328,6 +18328,16 @@ def _ltm_boot_warm() -> None:
             ltm.set_reflector_llm(_ltm_reflector_llm)
         except Exception as e:
             print(f"  [ltm] reflector wiring failed: {e}")
+        # Load the embedder here too (2026-09-29): ensure_loaded() does not,
+        # so it loaded lazily inside the owner's FIRST turn after every start
+        # (~0.6 s of that turn, measured). Same loader the recall path uses:
+        # cached after this, with its own lock and failure cool-down.
+        try:
+            loader = getattr(ltm, "_try_import_embedder", None)
+            if callable(loader) and loader() is not None:
+                print("  [ltm] embedder ready")
+        except Exception as e:
+            print(f"  [ltm] embedder warm-up failed: {e}")
 
     threading.Thread(target=_warm, name="ltm-warm", daemon=True).start()
 
@@ -19061,6 +19071,36 @@ def _reprime_worker() -> None:
         print(f"  [reprime] worker failed: {type(_e).__name__}")
         with _reprime_lock:
             _reprime_running[0] = False
+
+
+def _start_boot_reprime(delay_s: "float | None" = None) -> bool:
+    """One idle re-prime LOCAL_REPRIME_AT_BOOT_S seconds after start, so the
+    owner's first turn after a restart finds the prompt prefix warm instead
+    of re-reading all of it (~3.3 s of a ~4.5 s first turn, measured
+    2026-09-29). Goes through _schedule_local_reprime, so every re-prime
+    safeguard holds (loaded model only, never mid-turn / in game mode /
+    while the owner is speaking; a skip is logged and costs nothing).
+    True when the timer thread started. Never raises."""
+    try:
+        delay = float(LOCAL_REPRIME_AT_BOOT_S if delay_s is None else delay_s)
+    except Exception:
+        return False
+    if delay <= 0.0 or not LOCAL_PREFIX_REPRIME:
+        return False
+
+    def _run() -> None:
+        try:
+            time.sleep(delay)
+            print("  [reprime] boot warm-up")
+            _schedule_local_reprime()
+        except Exception as _e:
+            print(f"  [reprime] boot warm-up failed: {type(_e).__name__}")
+
+    try:
+        threading.Thread(target=_run, name="boot-reprime", daemon=True).start()
+    except Exception:
+        return False
+    return True
 
 
 def _schedule_local_reprime() -> bool:
@@ -34751,6 +34791,9 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         # file persists across restarts, and a long boot would otherwise look
         # like a stall on the daemon's first sweep.
         _publish_main_loop_heartbeat(force=True, now=_main_loop_heartbeat[0])
+        # Warm the local model's prompt cache for the first turn (the boot is
+        # done: the system prompt has its final, post-skills shape).
+        _start_boot_reprime()
         while True:
             try:
                 if _blue_green_loop_tick():

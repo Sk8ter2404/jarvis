@@ -179,6 +179,9 @@ class StructuralInvariantTests(unittest.TestCase):
         self.assertIsInstance(config.PROMPT_FREEZE_QUIET_S, float)
         self.assertEqual(config.PROMPT_FREEZE_QUIET_S, 30.0)
         self.assertIs(config.LOCAL_PREFIX_REPRIME, True)
+        # v2.0.139: the boot warm-up delay is a float literal, ships ON.
+        self.assertIsInstance(config.LOCAL_REPRIME_AT_BOOT_S, float)
+        self.assertEqual(config.LOCAL_REPRIME_AT_BOOT_S, 20.0)
 
     def test_background_traffic_settings_ship_on_with_float_windows(self):
         # 2026-09-29 (r6): both knobs are float literals (an int default would

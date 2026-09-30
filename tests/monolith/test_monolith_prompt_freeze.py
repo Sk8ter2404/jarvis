@@ -1032,5 +1032,67 @@ class ConfigDefaultsTests(_Base):
         self.assertIs(bc.LOCAL_PREFIX_REPRIME, True)
 
 
+class _RunNow:
+    """threading.Thread stand-in that runs its target on start()."""
+
+    def __init__(self, target=None, name=None, daemon=None, **_):
+        self._target = target
+        self.name = name
+
+    def start(self):
+        if self._target is not None:
+            self._target()
+
+
+class BootReprimeTests(_Base):
+    """v2.0.139 (2026-09-29, live): the first turn after every restart
+    re-read the whole ~13k-token prompt (prompt_eval_ms=3328 of a 4547 ms
+    turn; the next turn 253 ms). _start_boot_reprime sends one idle re-prime
+    LOCAL_REPRIME_AT_BOOT_S after start, through _schedule_local_reprime so
+    every re-prime safeguard still applies."""
+
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        self.sched = self._p(bc, "_schedule_local_reprime", return_value=True)
+        self.slept: list = []
+        self._p(bc.time, "sleep", side_effect=self.slept.append)
+        self._p(bc.threading, "Thread", _RunNow)
+        self._p(bc, "LOCAL_PREFIX_REPRIME", True)
+
+    def test_one_reprime_after_the_boot_delay(self):
+        self._p(self.bc, "LOCAL_REPRIME_AT_BOOT_S", 20.0)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertTrue(self.bc._start_boot_reprime())
+        self.assertEqual(self.slept, [20.0])
+        self.sched.assert_called_once_with()
+        self.assertIn("[reprime] boot warm-up", buf.getvalue())
+
+    def test_zero_turns_it_off(self):
+        self._p(self.bc, "LOCAL_REPRIME_AT_BOOT_S", 0.0)
+        self.assertFalse(self.bc._start_boot_reprime())
+        self.sched.assert_not_called()
+
+    def test_reprime_off_means_no_boot_warm_up_either(self):
+        self._p(self.bc, "LOCAL_REPRIME_AT_BOOT_S", 20.0)
+        self._p(self.bc, "LOCAL_PREFIX_REPRIME", False)
+        self.assertFalse(self.bc._start_boot_reprime())
+        self.sched.assert_not_called()
+
+    def test_a_failing_schedule_never_escapes(self):
+        self._p(self.bc, "LOCAL_REPRIME_AT_BOOT_S", 5.0)
+        self.sched.side_effect = RuntimeError("boom")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(self.bc._start_boot_reprime())
+
+    def test_main_starts_it_just_before_the_turn_loop(self):
+        src = inspect.getsource(self.bc.main)
+        call = src.index("_start_boot_reprime()")
+        loop = src.index("while True:", src.index("_publish_main_loop_heartbeat(force=True"))
+        self.assertLess(call, loop)
+        self.assertGreater(call, src.index("_ltm_boot_warm()"))
+
+
 if __name__ == "__main__":
     unittest.main()

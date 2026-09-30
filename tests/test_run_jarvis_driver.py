@@ -200,6 +200,39 @@ class DriverReplyCaptureTests(unittest.TestCase):
         self.assertIn("It is 3:21 PM, sir.", res["lines"][-1])
         self.assertLess(clock[0] - 1000.0, 20.0)   # nowhere near the 75 s timeout
 
+    def test_wait_for_reply_keeps_the_spoken_fallback_line(self):
+        # v2.0.136 logs "JARVIS (spoken): ..." when a fallback replaced the
+        # model's reply; a sweep that only saw the "JARVIS:" line judged the
+        # dodge that was never said (2026-09-29).
+        tmp = tempfile.mkdtemp(prefix="drv_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        log = os.path.join(tmp, "session_x.log")
+        open(log, "w", encoding="utf-8").close()
+        script = [
+            (0.5, "[20:18:36]   [inject] what should I have for dinner"),
+            (3.0, "[20:18:39]   JARVIS: [intent:dry_wit] A bold choice, sir."),
+            (3.0, "[20:18:39]   [advice-fallback] reply dodged a request"),
+            (3.0, "[20:18:39]   JARVIS (spoken): A stir-fry, sir."),
+        ]
+        clock = [1000.0]
+
+        def fake_sleep(s):
+            before = clock[0] - 1000.0
+            clock[0] += s
+            now = clock[0] - 1000.0
+            with open(log, "a", encoding="utf-8") as f:
+                for t, line in script:
+                    if before < t <= now:
+                        f.write(line + "\n")
+
+        with mock.patch.object(self.d, "latest_log", return_value=log), \
+                mock.patch.object(self.d.time, "sleep", fake_sleep), \
+                mock.patch.object(self.d.time, "time", lambda: clock[0]):
+            res = self.d.wait_for_reply("what should I have for dinner",
+                                        timeout=75.0)
+        self.assertEqual(res["status"], "ok")
+        self.assertIn("JARVIS (spoken): A stir-fry, sir.", res["lines"][-1])
+
 
 if __name__ == "__main__":
     unittest.main()
